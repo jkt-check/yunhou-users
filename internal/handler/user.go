@@ -2,6 +2,8 @@ package handler
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -48,10 +50,21 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 
 	updated := *user
 	if req.Nickname != nil {
-		updated.Nickname = req.Nickname
+		trimmed := strings.TrimSpace(*req.Nickname)
+		if trimmed == "" || len(trimmed) > 100 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "nickname must be 1-100 characters"})
+			return
+		}
+		updated.Nickname = &trimmed
 	}
 	if req.AvatarURL != nil {
-		updated.AvatarURL = req.AvatarURL
+		u, err := url.Parse(*req.AvatarURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.Fragment != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "avatar_url must be a valid HTTPS URL without fragment"})
+			return
+		}
+		normalized := u.String()
+		updated.AvatarURL = &normalized
 	}
 
 	if err := h.userRepo.Update(c.Request.Context(), &updated); err != nil {

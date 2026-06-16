@@ -94,7 +94,7 @@ func TestCreateApp_Success(t *testing.T) {
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
 	r := setupAppRouter(h, &model.App{ID: "app1"})
 
-	body := `{"name":"myapp","redirect_uris":["http://localhost/cb"],"providers":["github"],"default_plan":"pro"}`
+	body := `{"name":"myapp","redirect_uris":["http://localhost/cb"],"providers":["github"],"default_plan":"paid"}`
 	w := performRequest(r, http.MethodPost, "/apps", body)
 	if w.Code != http.StatusCreated {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusCreated, w.Body.String())
@@ -129,8 +129,8 @@ func TestCreateApp_Success(t *testing.T) {
 	if createdApp.Name != "myapp" {
 		t.Errorf("created app Name = %q, want myapp", createdApp.Name)
 	}
-	if createdApp.DefaultPlan != "pro" {
-		t.Errorf("created app DefaultPlan = %q, want pro", createdApp.DefaultPlan)
+	if createdApp.DefaultPlan != "paid" {
+		t.Errorf("created app DefaultPlan = %q, want paid", createdApp.DefaultPlan)
 	}
 }
 
@@ -239,7 +239,7 @@ func TestUpdateApp_Found(t *testing.T) {
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
 	r := setupAppRouter(h, &model.App{ID: "app1"})
 
-	body := `{"name":"newname","default_plan":"pro"}`
+	body := `{"name":"newname","default_plan":"paid"}`
 	w := performRequest(r, http.MethodPatch, "/apps/app1", body)
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
@@ -251,8 +251,8 @@ func TestUpdateApp_Found(t *testing.T) {
 	if updatedApp.Name != "newname" {
 		t.Errorf("updated Name = %q, want newname", updatedApp.Name)
 	}
-	if updatedApp.DefaultPlan != "pro" {
-		t.Errorf("updated DefaultPlan = %q, want pro", updatedApp.DefaultPlan)
+	if updatedApp.DefaultPlan != "paid" {
+		t.Errorf("updated DefaultPlan = %q, want paid", updatedApp.DefaultPlan)
 	}
 }
 
@@ -482,7 +482,7 @@ func TestCreateSubscription_Success(t *testing.T) {
 		t.Fatal("subscription was not created")
 	}
 	if createdSub.Plan != "pro" {
-		t.Errorf("Plan = %q, want pro", createdSub.Plan)
+		t.Errorf("Plan = %q, want paid", createdSub.Plan)
 	}
 	if createdSub.Status != "active" {
 		t.Errorf("Status = %q, want active", createdSub.Status)
@@ -646,8 +646,8 @@ func TestCancelSubscription_UpdateStatusError(t *testing.T) {
 	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodPost, "/subscriptions/sub1/cancel", "")
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusInternalServerError, w.Body.String())
 	}
 }
 

@@ -22,7 +22,7 @@ import (
 type mockSessionRepo struct{}
 
 func (m *mockSessionRepo) Create(_ context.Context, _ *model.Session) error { return nil }
-func (m *mockSessionRepo) FindByRefreshToken(_ context.Context, _ string) (*model.Session, error) {
+func (m *mockSessionRepo) FindByRefreshToken(_ context.Context, _ string, _ string) (*model.Session, error) {
 	return nil, nil
 }
 func (m *mockSessionRepo) Revoke(_ context.Context, _ string) error { return nil }
@@ -31,6 +31,9 @@ func (m *mockSessionRepo) RevokeIfNotRevoked(_ context.Context, _ string) (bool,
 }
 func (m *mockSessionRepo) RotateRefresh(_ context.Context, _ string, _ *model.Session) error {
 	return nil
+}
+func (m *mockSessionRepo) ExchangeAuthCode(_ context.Context, _ string, _ *model.Session) (bool, error) {
+	return true, nil
 }
 
 type mockSubRepo struct{}

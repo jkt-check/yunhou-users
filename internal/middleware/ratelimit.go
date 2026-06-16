@@ -1,29 +1,31 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
 )
 
 type visitor struct {
-	last   time.Time
-	tokens int
+	limiter  *rate.Limiter
+	lastSeen time.Time
 }
 
 type rateLimiter struct {
 	mu       sync.Mutex
 	visitors map[string]*visitor
-	rate     int
+	rate     rate.Limit
 	burst    int
 }
 
-func newRateLimiter(rate, burst int) *rateLimiter {
+func newRateLimiter(r int, burst int) *rateLimiter {
 	return &rateLimiter{
 		visitors: make(map[string]*visitor),
-		rate:     rate,
+		rate:     rate.Limit(r),
 		burst:    burst,
 	}
 }
@@ -34,38 +36,41 @@ func (rl *rateLimiter) allow(key string) bool {
 
 	now := time.Now()
 	v, ok := rl.visitors[key]
-	if !ok || now.Sub(v.last) > time.Minute {
-		rl.visitors[key] = &visitor{last: now, tokens: rl.burst - 1}
-		return true
+	if !ok {
+		rl.visitors[key] = &visitor{
+			limiter:  rate.NewLimiter(rl.rate, rl.burst),
+			lastSeen: now,
+		}
+		return rl.visitors[key].limiter.Allow()
 	}
 
-	elapsed := now.Sub(v.last)
-	v.tokens += int(elapsed.Seconds()) * rl.rate
-	if v.tokens > rl.burst {
-		v.tokens = rl.burst
-	}
-	v.last = now
-
-	if v.tokens <= 0 {
-		return false
-	}
-	v.tokens--
-	return true
+	v.lastSeen = now
+	return v.limiter.Allow()
 }
 
-func RateLimit(rate, burst int) gin.HandlerFunc {
-	limiter := newRateLimiter(rate, burst)
+func (rl *rateLimiter) cleanup() {
+	rl.mu.Lock()
+	for k, v := range rl.visitors {
+		if time.Since(v.lastSeen) > 2*time.Minute {
+			delete(rl.visitors, k)
+		}
+	}
+	rl.mu.Unlock()
+}
+
+func RateLimit(ctx context.Context, r, burst int) gin.HandlerFunc {
+	limiter := newRateLimiter(r, burst)
 
 	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
 		for {
-			time.Sleep(time.Minute)
-			limiter.mu.Lock()
-			for k, v := range limiter.visitors {
-				if time.Since(v.last) > 2*time.Minute {
-					delete(limiter.visitors, k)
-				}
+			select {
+			case <-ticker.C:
+				limiter.cleanup()
+			case <-ctx.Done():
+				return
 			}
-			limiter.mu.Unlock()
 		}
 	}()
 

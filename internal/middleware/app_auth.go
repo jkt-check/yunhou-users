@@ -8,6 +8,8 @@ import (
 	"github.com/yunhou/users/internal/util"
 )
 
+const ContextApp = "app"
+
 func AppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		appID := c.GetHeader("X-App-ID")
@@ -22,9 +24,10 @@ func AppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 
 		app, err := appRepo.FindByID(c.Request.Context(), appID)
 		if err != nil {
+			util.CheckSecret(util.DummyBcryptHash, appSecret)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
-				"message": "invalid app_id",
+				"message": "invalid app credentials",
 			})
 			return
 		}
@@ -32,12 +35,12 @@ func AppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 		if !util.CheckSecret(app.Secret, appSecret) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
-				"message": "invalid app_secret",
+				"message": "invalid app credentials",
 			})
 			return
 		}
 
-		c.Set("app", app)
+		c.Set(ContextApp, app)
 		c.Next()
 	}
 }

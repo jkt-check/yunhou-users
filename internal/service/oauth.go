@@ -140,7 +140,7 @@ func (p *OAuthProvider) exchangeGitHubCode(ctx context.Context, code string) (st
 
 	var tokenResp githubTokenResponse
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return "", fmt.Errorf("invalid token response: %s", string(body))
+		return "", fmt.Errorf("invalid token response from github")
 	}
 	if tokenResp.Error != "" {
 		return "", fmt.Errorf("github token error: %s", tokenResp.Error)
@@ -172,7 +172,7 @@ func (p *OAuthProvider) getGitHubUser(ctx context.Context, token string) (*githu
 
 	var user githubUserResponse
 	if err := json.Unmarshal(body, &user); err != nil {
-		return nil, fmt.Errorf("invalid user response: %s", string(body))
+		return nil, fmt.Errorf("invalid user response from github")
 	}
 	return &user, nil
 }
@@ -198,7 +198,7 @@ func (p *OAuthProvider) getGitHubPrimaryEmail(ctx context.Context, token string)
 
 	var emails []githubEmailResponse
 	if err := json.Unmarshal(body, &emails); err != nil {
-		return "", fmt.Errorf("invalid email response: %s", string(body))
+		return "", fmt.Errorf("invalid email response from github")
 	}
 
 	for _, e := range emails {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/service"
@@ -112,7 +113,7 @@ func (h *AuthHandler) Authorize(c *gin.Context) {
 	}
 	oauthURL, err := h.oauth.BuildAuthorizeURL(provider, appID, redirectURI, oauthState)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to build authorization URL"})
 		return
 	}
 
@@ -154,11 +155,12 @@ func (h *AuthHandler) Callback(c *gin.Context) {
 
 	authCode, err := h.authSvc.AuthorizeOrCreate(c.Request.Context(), userInfo, p.AppID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal server error"})
 		return
 	}
 
-	c.Redirect(http.StatusTemporaryRedirect, p.RedirectURI+"?code="+authCode+"&state="+p.State)
+	redirectURL := p.RedirectURI + "?code=" + url.QueryEscape(authCode) + "&state=" + url.QueryEscape(p.State)
+	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
 }
 
 func (h *AuthHandler) ExchangeToken(c *gin.Context) {
@@ -174,7 +176,7 @@ func (h *AuthHandler) ExchangeToken(c *gin.Context) {
 
 	accessToken, refreshToken, err := h.authSvc.ExchangeCode(c.Request.Context(), req.Code, req.AppID, req.AppSecret)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": err.Error()})
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "invalid credentials or authorization code"})
 		return
 	}
 
@@ -201,17 +203,18 @@ func (h *AuthHandler) RefreshToken(c *gin.Context) {
 
 	app, err := h.oauth.FindApp(c.Request.Context(), req.AppID)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "invalid app_id"})
+		util.CheckSecret(util.DummyBcryptHash, req.AppSecret)
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "invalid app credentials"})
 		return
 	}
 	if !util.CheckSecret(app.Secret, req.AppSecret) {
-		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "invalid app secret"})
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "invalid app credentials"})
 		return
 	}
 
 	accessToken, refreshToken, err := h.tokenSvc.Refresh(c.Request.Context(), req.RefreshToken, req.AppID)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": err.Error()})
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "invalid or expired refresh token"})
 		return
 	}
 

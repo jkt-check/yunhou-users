@@ -424,6 +424,7 @@ func TestSubscriptionService_CheckActive(t *testing.T) {
 			appID:      "app-1",
 			setup:      func(sr *mockSubscriptionRepo) {},
 			wantActive: false,
+			wantErr:    true,
 		},
 		{
 			name:   "active subscription with future expiry",

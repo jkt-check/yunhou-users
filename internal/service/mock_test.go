@@ -307,7 +307,7 @@ func (m *mockSessionRepo) Create(_ context.Context, s *model.Session) error {
 	return nil
 }
 
-func (m *mockSessionRepo) FindByRefreshToken(_ context.Context, token string) (*model.Session, error) {
+func (m *mockSessionRepo) FindByRefreshToken(_ context.Context, token string, sessionType string) (*model.Session, error) {
 	if m.findErr != nil {
 		return nil, m.findErr
 	}
@@ -363,6 +363,24 @@ func (m *mockSessionRepo) RotateRefresh(_ context.Context, oldID string, newSess
 	m.sessions[newSession.ID] = newSession
 	m.byToken[newSession.RefreshToken] = newSession
 	return nil
+}
+
+func (m *mockSessionRepo) ExchangeAuthCode(_ context.Context, oldID string, newSession *model.Session) (bool, error) {
+	if m.createErr != nil {
+		return false, m.createErr
+	}
+	m.createCount++
+	if m.failAfter > 0 && m.createCount >= m.failAfter {
+		return false, fmt.Errorf("session create failed on call %d", m.createCount)
+	}
+	s, ok := m.sessions[oldID]
+	if !ok || s.Revoked {
+		return false, nil
+	}
+	s.Revoked = true
+	m.sessions[newSession.ID] = newSession
+	m.byToken[newSession.RefreshToken] = newSession
+	return true, nil
 }
 
 // --- Test RSA key pair helpers ---

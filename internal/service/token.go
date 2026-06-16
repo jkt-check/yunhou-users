@@ -88,7 +88,7 @@ func (s *TokenService) VerifyAccessToken(tokenStr string) (*TokenClaims, error) 
 }
 
 func (s *TokenService) Refresh(ctx context.Context, refreshToken, appID string) (string, string, error) {
-	session, err := s.SessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken))
+	session, err := s.SessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken), "refresh")
 	if err != nil {
 		return "", "", fmt.Errorf("invalid or expired refresh token")
 	}
@@ -97,14 +97,8 @@ func (s *TokenService) Refresh(ctx context.Context, refreshToken, appID string) 
 		return "", "", fmt.Errorf("refresh token not issued for this app")
 	}
 
-	sub, err := s.SubRepo.FindByUserApp(ctx, session.UserID, session.AppID)
-	if err != nil || sub == nil || sub.Status != "active" {
-		return "", "", fmt.Errorf("subscription not active")
-	}
-
-	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
-		_ = s.SubRepo.UpdateStatus(ctx, sub.ID, "expired")
-		return "", "", fmt.Errorf("subscription expired")
+	if err := ensureActiveSubscription(ctx, s.SubRepo, session.UserID, session.AppID); err != nil {
+		return "", "", err
 	}
 
 	newAccess, err := s.SignAccessToken(session.UserID, session.AppID, session.Scope)
@@ -120,6 +114,7 @@ func (s *TokenService) Refresh(ctx context.Context, refreshToken, appID string) 
 		ID:           GenerateUUID(),
 		UserID:       session.UserID,
 		AppID:        session.AppID,
+		SessionType:  "refresh",
 		RefreshToken: hashToken(newRefresh),
 		Scope:        session.Scope,
 		Revoked:      false,

@@ -83,7 +83,7 @@ type ProviderUserInfo struct {
 func (s *AuthService) AuthorizeOrCreate(ctx context.Context, info ProviderUserInfo, appID string) (string, error) {
 	app, err := s.appRepo.FindByID(ctx, appID)
 	if err != nil {
-		return "", fmt.Errorf("app not found: %w", err)
+		return "", fmt.Errorf("invalid app credentials")
 	}
 
 	// Check if identity already exists
@@ -165,6 +165,7 @@ func (s *AuthService) createAuthCode(ctx context.Context, userID string, app *mo
 		ID:           GenerateUUID(),
 		UserID:       userID,
 		AppID:        app.ID,
+		SessionType:  "auth_code",
 		RefreshToken: hashToken(code),
 		Scope:        scope,
 		Revoked:      false,
@@ -181,13 +182,14 @@ func (s *AuthService) createAuthCode(ctx context.Context, userID string, app *mo
 func (s *AuthService) ExchangeCode(ctx context.Context, code, appID, appSecret string) (accessToken, refreshToken string, err error) {
 	app, err := s.appRepo.FindByID(ctx, appID)
 	if err != nil {
-		return "", "", fmt.Errorf("app not found")
+		util.CheckSecret(util.DummyBcryptHash, appSecret)
+		return "", "", fmt.Errorf("invalid app credentials")
 	}
 	if !util.CheckSecret(app.Secret, appSecret) {
-		return "", "", fmt.Errorf("invalid app secret")
+		return "", "", fmt.Errorf("invalid app credentials")
 	}
 
-	session, err := s.sessionRepo.FindByRefreshToken(ctx, hashToken(code))
+	session, err := s.sessionRepo.FindByRefreshToken(ctx, hashToken(code), "auth_code")
 	if err != nil {
 		return "", "", fmt.Errorf("invalid or expired authorization code")
 	}
@@ -196,20 +198,11 @@ func (s *AuthService) ExchangeCode(ctx context.Context, code, appID, appSecret s
 	}
 
 	// Check active subscription before consuming the auth code
-	sub, err := s.subRepo.FindByUserApp(ctx, session.UserID, session.AppID)
-	if err != nil || sub == nil || sub.Status != "active" {
-		return "", "", fmt.Errorf("subscription not active")
+	if err := ensureActiveSubscription(ctx, s.subRepo, session.UserID, session.AppID); err != nil {
+		return "", "", err
 	}
 
-	// Atomically revoke the auth code session to prevent replay
-	revoked, err := s.sessionRepo.RevokeIfNotRevoked(ctx, session.ID)
-	if err != nil {
-		return "", "", fmt.Errorf("revoke auth code: %w", err)
-	}
-	if !revoked {
-		return "", "", fmt.Errorf("authorization code already used")
-	}
-
+	// Atomically exchange the auth code session in a transaction to prevent replay and crash-induced token loss
 	accessToken, err = s.tokenSvc.SignAccessToken(session.UserID, session.AppID, session.Scope)
 	if err != nil {
 		return "", "", err
@@ -224,12 +217,17 @@ func (s *AuthService) ExchangeCode(ctx context.Context, code, appID, appSecret s
 		ID:           GenerateUUID(),
 		UserID:       session.UserID,
 		AppID:        session.AppID,
+		SessionType:  "refresh",
 		RefreshToken: hashToken(refreshToken),
 		Scope:        defaultScope,
 		ExpiresAt:    time.Now().Add(parseDuration(s.tokenSvc.RefreshTTL)),
 	}
-	if err := s.sessionRepo.Create(ctx, newSession); err != nil {
-		return "", "", err
+	exchanged, err := s.sessionRepo.ExchangeAuthCode(ctx, session.ID, newSession)
+	if err != nil {
+		return "", "", fmt.Errorf("exchange auth code: %w", err)
+	}
+	if !exchanged {
+		return "", "", fmt.Errorf("authorization code already used")
 	}
 
 	return accessToken, refreshToken, nil

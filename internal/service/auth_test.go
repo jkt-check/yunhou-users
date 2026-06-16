@@ -193,7 +193,7 @@ func TestAuthorizeOrCreate(t *testing.T) {
 			appID:       "nonexistent-app",
 			setup:       func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {},
 			wantErr:     true,
-			errContains: "app not found",
+			errContains: "invalid app credentials",
 		},
 		{
 			name: "user creation failure",
@@ -368,6 +368,7 @@ func TestExchangeCode(t *testing.T) {
 			UserID:       "user-1",
 			AppID:        "app-1",
 			RefreshToken: validCodeHash,
+				SessionType:  "auth_code",
 			Scope:        []string{"app:read"},
 			Revoked:      false,
 			ExpiresAt:    timeNow().Add(10 * time.Minute),
@@ -409,7 +410,7 @@ func TestExchangeCode(t *testing.T) {
 				ar.apps["app-1"] = app
 			},
 			wantErr:     true,
-			errContains: "invalid app secret",
+			errContains: "invalid app credentials",
 		},
 		{
 			name:        "invalid code",
@@ -448,7 +449,7 @@ func TestExchangeCode(t *testing.T) {
 			appSecret:   plainSecret,
 			setup:       func(ar *mockAppRepo, ssr *mockSessionRepo, sr *mockSubscriptionRepo) {},
 			wantErr:     true,
-			errContains: "app not found",
+			errContains: "invalid app credentials",
 		},
 		{
 			name:        "new session creation failure during exchange",

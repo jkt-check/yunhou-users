@@ -77,7 +77,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 
 	engine := gin.New()
 	gin.SetMode(gin.TestMode)
-	router.Setup(engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, cfg.StateHMACKey)
+	router.Setup(context.Background(), engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, cfg.StateHMACKey)
 
 	return httptest.NewServer(engine)
 }

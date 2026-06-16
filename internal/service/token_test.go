@@ -394,7 +394,7 @@ func TestRefresh(t *testing.T) {
 		if err == nil {
 			t.Error("expected error for missing subscription")
 		}
-		if !strings.Contains(err.Error(), "subscription not active") {
+		if !strings.Contains(err.Error(), "check subscription:") {
 			t.Errorf("unexpected error: %q", err.Error())
 		}
 	})

@@ -74,14 +74,33 @@ func (s *SubscriptionService) Cancel(ctx context.Context, id string) error {
 func (s *SubscriptionService) CheckActive(ctx context.Context, userID, appID string) (bool, error) {
 	sub, err := s.subRepo.FindByUserApp(ctx, userID, appID)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("check subscription: %v", err)
 	}
-	if sub.Status != "active" {
+	if sub == nil || sub.Status != "active" {
 		return false, nil
 	}
 	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
-		_ = s.subRepo.UpdateStatus(ctx, sub.ID, "expired")
+		if err := s.subRepo.UpdateStatus(ctx, sub.ID, "expired"); err != nil {
+			return false, fmt.Errorf("mark subscription expired: %v", err)
+		}
 		return false, nil
 	}
 	return true, nil
+}
+
+func ensureActiveSubscription(ctx context.Context, subRepo repo.SubscriptionRepo, userID, appID string) error {
+	sub, err := subRepo.FindByUserApp(ctx, userID, appID)
+	if err != nil {
+		return fmt.Errorf("check subscription: %v", err)
+	}
+	if sub == nil || sub.Status != "active" {
+		return fmt.Errorf("subscription not active")
+	}
+	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
+		if err := subRepo.UpdateStatus(ctx, sub.ID, "expired"); err != nil {
+			return fmt.Errorf("mark subscription expired: %v", err)
+		}
+		return fmt.Errorf("subscription expired")
+	}
+	return nil
 }

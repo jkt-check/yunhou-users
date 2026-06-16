@@ -1,6 +1,8 @@
 package router
 
 import (
+	"context"
+
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/middleware"
@@ -9,6 +11,7 @@ import (
 )
 
 func Setup(
+	ctx context.Context,
 	engine *gin.Engine,
 	appRepo repo.AppRepo,
 	userRepo repo.UserRepo,
@@ -26,7 +29,7 @@ func Setup(
 	appHandler := handler.NewAppHandler(appRepo, subRepo, subSvc)
 
 	// Public routes (rate limited)
-	publicLimiter := middleware.RateLimit(10, 20)
+	publicLimiter := middleware.RateLimit(ctx, 10, 20)
 	engine.GET("/.well-known/jwks.json", publicLimiter, authHandler.JWKS)
 	engine.GET("/authorize", publicLimiter, authHandler.Authorize)
 	engine.GET("/callback/:provider", publicLimiter, authHandler.Callback)
@@ -45,9 +48,9 @@ func Setup(
 	}
 
 	// App management routes (app_id + app_secret auth required)
-	appLimiter := middleware.RateLimit(30, 60)
+	appLimiter := middleware.RateLimit(ctx, 30, 60)
 	appGroup := engine.Group("")
-	appGroup.Use(middleware.AppAuth(appRepo), appLimiter)
+	appGroup.Use(appLimiter, middleware.AppAuth(appRepo))
 	{
 		appGroup.POST("/apps", appHandler.CreateApp)
 		appGroup.GET("/apps/:id", appHandler.GetApp)

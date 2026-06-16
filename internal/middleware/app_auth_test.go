@@ -94,7 +94,7 @@ func TestAppAuth(t *testing.T) {
 			findFn:     func(_ context.Context, id string) (*model.App, error) { return nil, errors.New("not found") },
 			wantStatus: http.StatusUnauthorized,
 			wantCode:   401,
-			wantMsg:    "invalid app_id",
+			wantMsg:    "invalid app credentials",
 		},
 		{
 			name:       "valid app_id but invalid app_secret",
@@ -103,7 +103,7 @@ func TestAppAuth(t *testing.T) {
 			findFn:     func(_ context.Context, id string) (*model.App, error) { return &model.App{ID: id, Secret: hashed}, nil },
 			wantStatus: http.StatusUnauthorized,
 			wantCode:   401,
-			wantMsg:    "invalid app_secret",
+			wantMsg:    "invalid app credentials",
 		},
 		{
 			name:       "valid headers with correct app_id and app_secret",

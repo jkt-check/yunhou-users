@@ -183,10 +183,11 @@ func (m *mockSubscriptionRepo) Renew(ctx context.Context, id string, expiresAt *
 
 type mockSessionRepo struct {
 	createFn             func(ctx context.Context, s *model.Session) error
-	findByRefreshTokenFn func(ctx context.Context, token string) (*model.Session, error)
+	findByRefreshTokenFn func(ctx context.Context, token string, sessionType string) (*model.Session, error)
 	revokeFn             func(ctx context.Context, id string) error
 	revokeIfNotRevokedFn func(ctx context.Context, id string) (bool, error)
 	rotateRefreshFn      func(ctx context.Context, oldID string, newSession *model.Session) error
+	exchangeAuthCodeFn  func(ctx context.Context, oldID string, newSession *model.Session) (bool, error)
 }
 
 func (m *mockSessionRepo) Create(ctx context.Context, s *model.Session) error {
@@ -195,9 +196,9 @@ func (m *mockSessionRepo) Create(ctx context.Context, s *model.Session) error {
 	}
 	return nil
 }
-func (m *mockSessionRepo) FindByRefreshToken(ctx context.Context, token string) (*model.Session, error) {
+func (m *mockSessionRepo) FindByRefreshToken(ctx context.Context, token string, sessionType string) (*model.Session, error) {
 	if m.findByRefreshTokenFn != nil {
-		return m.findByRefreshTokenFn(ctx, token)
+		return m.findByRefreshTokenFn(ctx, token, sessionType)
 	}
 	return nil, nil
 }
@@ -218,6 +219,13 @@ func (m *mockSessionRepo) RotateRefresh(ctx context.Context, oldID string, newSe
 		return m.rotateRefreshFn(ctx, oldID, newSession)
 	}
 	return nil
+}
+
+func (m *mockSessionRepo) ExchangeAuthCode(ctx context.Context, oldID string, newSession *model.Session) (bool, error) {
+	if m.exchangeAuthCodeFn != nil {
+		return m.exchangeAuthCodeFn(ctx, oldID, newSession)
+	}
+	return true, nil
 }
 
 // compile-time interface checks
@@ -283,7 +291,7 @@ func setupAuthRouter(h *AuthHandler) *gin.Engine {
 	r.GET("/authorize", h.Authorize)
 	r.GET("/callback/:provider", h.Callback)
 	r.POST("/token", h.ExchangeToken)
-	r.POST("/refresh", h.RefreshToken)
+	r.POST("/token/refresh", h.RefreshToken)
 	r.GET("/.well-known/jwks.json", h.JWKS)
 	return r
 }
@@ -705,8 +713,8 @@ func TestExchangeToken_InvalidAppID(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "app not found") {
-		t.Errorf("body = %s, want containing 'app not found'", w.Body.String())
+	if !strings.Contains(w.Body.String(), "invalid credentials or authorization code") {
+		t.Errorf("body = %s, want containing 'invalid credentials or authorization code'", w.Body.String())
 	}
 }
 
@@ -741,8 +749,8 @@ func TestExchangeToken_InvalidAppSecret(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "invalid app secret") {
-		t.Errorf("body = %s, want containing 'invalid app secret'", w.Body.String())
+	if !strings.Contains(w.Body.String(), "invalid credentials or authorization code") {
+		t.Errorf("body = %s, want containing 'invalid credentials or authorization code'", w.Body.String())
 	}
 }
 
@@ -750,7 +758,7 @@ func TestExchangeToken_InvalidAuthCode(t *testing.T) {
 	t.Parallel()
 
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
 			return nil, errNotFound
 		},
 	}
@@ -781,8 +789,8 @@ func TestExchangeToken_InvalidAuthCode(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "invalid or expired authorization code") {
-		t.Errorf("body = %s, want containing 'invalid or expired authorization code'", w.Body.String())
+	if !strings.Contains(w.Body.String(), "invalid credentials or authorization code") {
+		t.Errorf("body = %s, want containing 'invalid credentials or authorization code'", w.Body.String())
 	}
 }
 
@@ -790,12 +798,13 @@ func TestExchangeToken_CodeIssuedForDifferentApp(t *testing.T) {
 	t.Parallel()
 
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
 			return &model.Session{
 				ID:     "sess1",
 				UserID: "user1",
 				AppID:  "app2", // Code was for app2
 				Scope:  []string{"app:read"},
+				SessionType:  "auth_code",
 			}, nil
 		},
 	}
@@ -825,8 +834,8 @@ func TestExchangeToken_CodeIssuedForDifferentApp(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "code was not issued for this app") {
-		t.Errorf("body = %s, want containing 'code was not issued for this app'", w.Body.String())
+	if !strings.Contains(w.Body.String(), "invalid credentials or authorization code") {
+		t.Errorf("body = %s, want containing 'invalid credentials or authorization code'", w.Body.String())
 	}
 }
 
@@ -834,12 +843,13 @@ func TestExchangeToken_Success(t *testing.T) {
 	t.Parallel()
 
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
 			return &model.Session{
 				ID:     "sess1",
 				UserID: "user1",
 				AppID:  "app1",
 				Scope:  []string{"app:read"},
+				SessionType:  "auth_code",
 			}, nil
 		},
 		createFn: func(ctx context.Context, s *model.Session) error { return nil },
@@ -886,9 +896,9 @@ func TestExchangeToken_Success(t *testing.T) {
 
 	// Set up findByRefreshTokenFn to return the session for the hashed auth code
 	storedHash2 := sha256Hex(authCode)
-	sessionRepo.findByRefreshTokenFn = func(ctx context.Context, token string) (*model.Session, error) {
+	sessionRepo.findByRefreshTokenFn = func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
 		if token == storedHash2 {
-			return &model.Session{ID: "sess-auth", UserID: "user1", AppID: "app1", Scope: []string{"app:read"}}, nil
+			return &model.Session{ID: "sess-auth", UserID: "user1", AppID: "app1", SessionType: "auth_code", Scope: []string{"app:read"}}, nil
 		}
 		return nil, errNotFound
 	}
@@ -928,7 +938,7 @@ func TestRefreshToken_InvalidBody(t *testing.T) {
 	h := NewAuthHandler(nil, tokenSvc, nil, "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", "")
+	w := performRequest(r, http.MethodPost, "/token/refresh", "")
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
 	}
@@ -937,7 +947,7 @@ func TestRefreshToken_InvalidBody(t *testing.T) {
 	}
 
 	// Missing required fields
-	w = performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"x"}`)
+	w = performRequest(r, http.MethodPost, "/token/refresh", `{"refresh_token":"x"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
 	}
@@ -954,7 +964,7 @@ func TestRefreshToken_InvalidRefreshToken(t *testing.T) {
 		return &model.App{ID: "a1", Secret: storedHash}, nil
 	}}
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
 			return nil, errNotFound
 		},
 	}
@@ -962,7 +972,7 @@ func TestRefreshToken_InvalidRefreshToken(t *testing.T) {
 	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"bad-token","app_id":"a1","app_secret":"app-secret"}`)
+	w := performRequest(r, http.MethodPost, "/token/refresh", `{"refresh_token":"bad-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
@@ -982,8 +992,8 @@ func TestRefreshToken_InactiveSubscription(t *testing.T) {
 		return &model.App{ID: "a1", Secret: storedHash}, nil
 	}}
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
-			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", Scope: []string{"app:read"}}, nil
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
+			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", SessionType: "refresh", Scope: []string{"app:read"}}, nil
 		},
 	}
 	subRepo := &mockSubscriptionRepo{
@@ -995,12 +1005,12 @@ func TestRefreshToken_InactiveSubscription(t *testing.T) {
 	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
+	w := performRequest(r, http.MethodPost, "/token/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "subscription not active") {
-		t.Errorf("body = %s, want containing 'subscription not active'", w.Body.String())
+	if !strings.Contains(w.Body.String(), "invalid or expired refresh token") {
+		t.Errorf("body = %s, want containing 'invalid or expired refresh token'", w.Body.String())
 	}
 }
 
@@ -1015,8 +1025,8 @@ func TestRefreshToken_SubscriptionNotFound(t *testing.T) {
 		return &model.App{ID: "a1", Secret: storedHash}, nil
 	}}
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
-			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", Scope: []string{"app:read"}}, nil
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
+			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", SessionType: "refresh", Scope: []string{"app:read"}}, nil
 		},
 	}
 	subRepo := &mockSubscriptionRepo{
@@ -1028,7 +1038,7 @@ func TestRefreshToken_SubscriptionNotFound(t *testing.T) {
 	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
+	w := performRequest(r, http.MethodPost, "/token/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
@@ -1043,8 +1053,8 @@ func TestRefreshToken_SessionCreateError(t *testing.T) {
 		return &model.App{ID: "a1", Secret: storedHash}, nil
 	}}
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
-			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", Scope: []string{"app:read"}}, nil
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
+			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", SessionType: "refresh", Scope: []string{"app:read"}}, nil
 		},
 		rotateRefreshFn: func(ctx context.Context, oldID string, newSession *model.Session) error {
 			return errors.New("db error")
@@ -1059,7 +1069,7 @@ func TestRefreshToken_SessionCreateError(t *testing.T) {
 	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
+	w := performRequest(r, http.MethodPost, "/token/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
@@ -1074,12 +1084,13 @@ func TestRefreshToken_Success(t *testing.T) {
 		return &model.App{ID: "app1", Secret: storedHash}, nil
 	}}
 	sessionRepo := &mockSessionRepo{
-		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
+		findByRefreshTokenFn: func(ctx context.Context, token string, sessionType string) (*model.Session, error) {
 			return &model.Session{
 				ID:     "sess1",
 				UserID: "user1",
 				AppID:  "app1",
 				Scope:  []string{"app:read"},
+				SessionType:  "refresh",
 			}, nil
 		},
 		createFn: func(ctx context.Context, s *model.Session) error {
@@ -1098,7 +1109,7 @@ func TestRefreshToken_Success(t *testing.T) {
 	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-refresh-token","app_id":"app1","app_secret":"app-secret"}`)
+	w := performRequest(r, http.MethodPost, "/token/refresh", `{"refresh_token":"valid-refresh-token","app_id":"app1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
 	}

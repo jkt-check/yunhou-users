@@ -57,6 +57,7 @@ CREATE TABLE sessions (
     id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     app_id        UUID NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+    session_type  TEXT NOT NULL DEFAULT 'refresh' CHECK (session_type IN ('auth_code', 'refresh')),
     refresh_token TEXT NOT NULL,
     scope         TEXT[] NOT NULL DEFAULT '{}',
     revoked       BOOLEAN NOT NULL DEFAULT false,

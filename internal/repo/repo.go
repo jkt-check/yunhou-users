@@ -42,10 +42,11 @@ type SubscriptionRepo interface {
 
 type SessionRepo interface {
 	Create(ctx context.Context, s *model.Session) error
-	FindByRefreshToken(ctx context.Context, token string) (*model.Session, error)
+	FindByRefreshToken(ctx context.Context, token, sessionType string) (*model.Session, error)
 	Revoke(ctx context.Context, id string) error
 	RevokeIfNotRevoked(ctx context.Context, id string) (bool, error)
 	RotateRefresh(ctx context.Context, oldID string, newSession *model.Session) error
+	ExchangeAuthCode(ctx context.Context, oldID string, newSession *model.Session) (bool, error)
 }
 
 // Concrete implementations
@@ -246,17 +247,17 @@ func (r *subscriptionRepo) Renew(ctx context.Context, id string, expiresAt *time
 
 func (r *sessionRepo) Create(ctx context.Context, s *model.Session) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO sessions (id, user_id, app_id, refresh_token, scope, revoked, expires_at)
-		VALUES (:id, :user_id, :app_id, :refresh_token, :scope, :revoked, :expires_at)
+		INSERT INTO sessions (id, user_id, app_id, session_type, refresh_token, scope, revoked, expires_at)
+		VALUES (:id, :user_id, :app_id, :session_type, :refresh_token, :scope, :revoked, :expires_at)
 	`, s)
 	return err
 }
 
-func (r *sessionRepo) FindByRefreshToken(ctx context.Context, token string) (*model.Session, error) {
+func (r *sessionRepo) FindByRefreshToken(ctx context.Context, token, sessionType string) (*model.Session, error) {
 	var s model.Session
 	err := r.db.GetContext(ctx, &s, `
-		SELECT * FROM sessions WHERE refresh_token = $1 AND revoked = false AND expires_at > $2
-	`, token, time.Now())
+		SELECT * FROM sessions WHERE refresh_token = $1 AND session_type = $2 AND revoked = false AND expires_at > $3
+	`, token, sessionType, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -297,18 +298,57 @@ func (r *sessionRepo) RotateRefresh(ctx context.Context, oldID string, newSessio
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check rows affected: %w", err)
+	}
 	if n == 0 {
 		return fmt.Errorf("session already revoked")
 	}
 
 	_, err = tx.NamedExecContext(ctx, `
-		INSERT INTO sessions (id, user_id, app_id, refresh_token, scope, revoked, expires_at)
-		VALUES (:id, :user_id, :app_id, :refresh_token, :scope, :revoked, :expires_at)
+		INSERT INTO sessions (id, user_id, app_id, session_type, refresh_token, scope, revoked, expires_at)
+		VALUES (:id, :user_id, :app_id, :session_type, :refresh_token, :scope, :revoked, :expires_at)
 	`, newSession)
 	if err != nil {
 		return err
 	}
 
 	return tx.Commit()
+}
+
+func (r *sessionRepo) ExchangeAuthCode(ctx context.Context, oldID string, newSession *model.Session) (bool, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE sessions SET revoked = true WHERE id = $1 AND revoked = false
+	`, oldID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check rows affected: %w", err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+
+	_, err = tx.NamedExecContext(ctx, `
+		INSERT INTO sessions (id, user_id, app_id, session_type, refresh_token, scope, revoked, expires_at)
+		VALUES (:id, :user_id, :app_id, :session_type, :refresh_token, :scope, :revoked, :expires_at)
+	`, newSession)
+	if err != nil {
+		return false, err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return false, fmt.Errorf("commit exchange: %w", err)
+	}
+	return true, nil
 }

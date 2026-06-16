@@ -10,6 +10,7 @@ type Session struct {
 	ID           string         `db:"id" json:"id"`
 	UserID       string         `db:"user_id" json:"user_id"`
 	AppID        string         `db:"app_id" json:"app_id"`
+	SessionType  string         `db:"session_type" json:"-"`
 	RefreshToken string         `db:"refresh_token" json:"-"`
 	Scope        pq.StringArray `db:"scope" json:"scope"`
 	Revoked      bool           `db:"revoked" json:"revoked"`

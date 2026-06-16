@@ -2,9 +2,12 @@ package handler
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/service"
@@ -21,6 +24,23 @@ func NewAppHandler(appRepo repo.AppRepo, subRepo repo.SubscriptionRepo, subSvc *
 	return &AppHandler{appRepo: appRepo, subRepo: subRepo, subSvc: subSvc}
 }
 
+func validateRedirectURIs(uris []string) (string, bool) {
+	for _, u := range uris {
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Fragment != "" {
+			return "redirect_uri must be a valid URL without fragment: " + u, false
+		}
+		if parsed.Scheme != "https" && !isLocalhost(parsed) {
+			return "redirect_uri must use HTTPS (http://localhost allowed for dev): " + u, false
+		}
+	}
+	return "", true
+}
+
+func isLocalhost(u *url.URL) bool {
+	return u.Scheme == "http" && (u.Host == "localhost" || strings.HasPrefix(u.Host, "localhost:") || u.Host == "127.0.0.1" || strings.HasPrefix(u.Host, "127.0.0.1:"))
+}
+
 func (h *AppHandler) CreateApp(c *gin.Context) {
 	var req struct {
 		Name         string   `json:"name" binding:"required"`
@@ -33,11 +53,20 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		return
 	}
 
+	if msg, ok := validateRedirectURIs(req.RedirectURIs); !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
+		return
+	}
+
 	if len(req.Providers) == 0 {
 		req.Providers = []string{"github", "google", "wechat"}
 	}
 	if req.DefaultPlan == "" {
 		req.DefaultPlan = "free"
+	}
+	if req.DefaultPlan != "free" && req.DefaultPlan != "trial" && req.DefaultPlan != "paid" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "default_plan must be one of: free, trial, paid"})
+		return
 	}
 
 	plainSecret, err := service.GenerateRefreshToken()
@@ -76,12 +105,17 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 }
 
 func getAuthedApp(c *gin.Context) (*model.App, bool) {
-	authedApp, exists := c.Get("app")
+	authedApp, exists := c.Get(middleware.ContextApp)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "app authentication required"})
 		return nil, false
 	}
-	return authedApp.(*model.App), true
+	app, ok := authedApp.(*model.App)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "invalid app context"})
+		return nil, false
+	}
+	return app, true
 }
 
 func (h *AppHandler) GetApp(c *gin.Context) {
@@ -130,6 +164,13 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 		return
 	}
 
+	if req.RedirectURIs != nil {
+		if msg, ok := validateRedirectURIs(req.RedirectURIs); !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
+			return
+		}
+	}
+
 	updated := *app
 	if req.Name != nil {
 		updated.Name = *req.Name
@@ -141,6 +182,10 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 		updated.Providers = req.Providers
 	}
 	if req.DefaultPlan != nil {
+		if *req.DefaultPlan != "free" && *req.DefaultPlan != "trial" && *req.DefaultPlan != "paid" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "default_plan must be one of: free, trial, paid"})
+			return
+		}
 		updated.DefaultPlan = *req.DefaultPlan
 	}
 
@@ -185,7 +230,12 @@ func (h *AppHandler) CreateSubscription(c *gin.Context) {
 
 	sub, err := h.subSvc.Create(c.Request.Context(), req.UserID, req.AppID, req.Plan, expiresAt)
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": err.Error()})
+		msg := err.Error()
+		if strings.Contains(msg, "already exists") {
+			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": msg})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create subscription"})
+		}
 		return
 	}
 
@@ -226,7 +276,12 @@ func (h *AppHandler) CancelSubscription(c *gin.Context) {
 		return
 	}
 	if err := h.subSvc.Cancel(c.Request.Context(), id); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		msg := err.Error()
+		if msg == "subscription not found" || msg == "already cancelled" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to cancel subscription"})
+		}
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "cancelled"})

@@ -9,7 +9,7 @@ A shared user management API for multi-app ecosystems. One user identity across 
 - **RSA256 JWT** access tokens with JWKS public key endpoint
 - **Subscription gating** — tokens only issued for active subscriptions
 - **Refresh token rotation** — one-time-use refresh tokens
-- **Rate limiting** — per-IP token bucket on all endpoints
+- **Rate limiting** — per-IP token bucket (10/s burst 20 on public, 30/s burst 60 on app management)
 
 ## Quick Start
 
@@ -78,11 +78,11 @@ All configuration is via environment variables (or `.env` file):
 | POST | `/apps` | Register a new application |
 | GET | `/apps/:id` | Get app details |
 | PATCH | `/apps/:id` | Update app settings |
-| POST | `/subscriptions` | Createsubscription |
+| POST | `/subscriptions` | Create subscription |
 | GET | `/subscriptions/:id` | Get subscription details |
 | DELETE | `/subscriptions/:id` | Cancel subscription |
 
-All endpoints use `X-App-ID` and `X-App-Secret` headers for app authentication.
+App management endpoints require `X-App-ID` and `X-App-Secret` headers. Public and user endpoints do not.
 
 ## Authentication Flow
 
@@ -106,7 +106,8 @@ Consumer App        Yunhou Users API        OAuth Provider
 
 ```bash
 make build          # Compile binary
-make test           # Run tests with race detection
+make test           # Run unit tests with race detection
+make e2e            # Run E2E tests (requires local PostgreSQL)
 make lint           # Run go vet
 make deps           # Tidy dependencies
 ```

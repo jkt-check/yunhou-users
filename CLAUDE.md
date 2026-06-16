@@ -33,7 +33,8 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 
 - `make build` — compile to `bin/server`
 - `make run` — run dev server (default :8080)
-- `make test` — run all tests with race detection and coverage
+- `make test` — run unit tests with race detection and coverage (`./internal/...`)
+- `make e2e` — run E2E tests against local PostgreSQL (`./tests/e2e/`)
 - `make lint` — run `go vet`
 - `make deps` — tidy go.mod
 - `make generate-keys` — generate RSA key pair in `keys/`
@@ -44,6 +45,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
+| `PORT` | No | `8080` | |
 | `STATE_HMAC_KEY` | **Yes** | — | App exits if not set |
 | `GITHUB_CLIENT_ID` | Yes (for GitHub auth) | — | |
 | `GITHUB_CLIENT_SECRET` | Yes (for GitHub auth) | — | |
@@ -67,13 +69,13 @@ All endpoints return:
 
 ## Endpoints
 
-**Public** (rate-limited 10/s per IP):
+**Public** (rate-limited 10/s burst 20 per IP):
 - `GET /.well-known/jwks.json`, `GET /authorize`, `GET /callback/:provider`, `POST /token`, `POST /token/refresh`
 
 **User** (JWT Bearer auth):
 - `GET /user/profile`, `PATCH /user/profile`, `GET /user/identities`, `DELETE /user/identities/:id`, `GET /user/apps`
 
-**App management** (`X-App-ID` + `X-App-Secret` headers, rate-limited 30/s per IP):
+**App management** (`X-App-ID` + `X-App-Secret` headers, rate-limited 30/s burst 60 per IP):
 - `POST /apps`, `GET /apps/:id`, `PATCH /apps/:id`, `POST /subscriptions`, `GET /subscriptions/:id`, `DELETE /subscriptions/:id`
 
 ## Design Principles

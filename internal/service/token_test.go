@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"net/http"
@@ -288,7 +289,7 @@ func TestRefresh(t *testing.T) {
 			ExpiresAt:    expiresAt,
 		}
 		ssr.sessions[s.ID] = s
-		ssr.byToken[refreshToken] = s // key by raw token because Refresh passes it raw
+		ssr.byToken[hashToken(refreshToken)] = s // key by hashed token since FindByRefreshToken receives the hash
 	}
 
 	t.Run("valid refresh", func(t *testing.T) {
@@ -306,7 +307,7 @@ func TestRefresh(t *testing.T) {
 		sub := &model.Subscription{ID: GenerateUUID(), UserID: userID, AppID: appID, Plan: "pro", Status: "active"}
 		sr.Create(ctx, sub)
 
-		newAccess, newRefresh, err := ts.Refresh(ctx, refreshToken)
+		newAccess, newRefresh, err := ts.Refresh(ctx, refreshToken, appID)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -326,7 +327,7 @@ func TestRefresh(t *testing.T) {
 		}
 
 		// Old session should be revoked
-		oldSess := ssr.byToken[refreshToken]
+		oldSess := ssr.byToken[hashToken(refreshToken)]
 		if oldSess != nil && !oldSess.Revoked {
 			t.Error("expected old session to be revoked")
 		}
@@ -350,7 +351,7 @@ func TestRefresh(t *testing.T) {
 
 		createSession(ssr, "user-2", "app-2", "expired-refresh", []string{"app:read"}, timeNow().Add(-1*time.Hour))
 
-		_, _, err := ts.Refresh(ctx, "expired-refresh")
+		_, _, err := ts.Refresh(ctx, "expired-refresh", "app-2")
 		if err == nil {
 			t.Error("expected error for expired session")
 		}
@@ -373,7 +374,7 @@ func TestRefresh(t *testing.T) {
 		sub := &model.Subscription{ID: GenerateUUID(), UserID: userID, AppID: appID, Plan: "pro", Status: "cancelled"}
 		sr.Create(ctx, sub)
 
-		_, _, err := ts.Refresh(ctx, refreshToken)
+		_, _, err := ts.Refresh(ctx, refreshToken, appID)
 		if err == nil {
 			t.Error("expected error for inactive subscription")
 		}
@@ -389,7 +390,7 @@ func TestRefresh(t *testing.T) {
 
 		createSession(ssr, "user-4", "app-4", "no-sub-refresh", []string{"app:read"}, timeNow().Add(7*24*time.Hour))
 
-		_, _, err := ts.Refresh(ctx, "no-sub-refresh")
+		_, _, err := ts.Refresh(ctx, "no-sub-refresh", "app-4")
 		if err == nil {
 			t.Error("expected error for missing subscription")
 		}
@@ -414,9 +415,25 @@ func TestRefresh(t *testing.T) {
 
 		ssr.failAfter = 1 // the next Create call will fail
 
-		_, _, err := ts.Refresh(ctx, refreshToken)
+		_, _, err := ts.Refresh(ctx, refreshToken, appID)
 		if err == nil {
 			t.Error("expected error for session creation failure")
+		}
+	})
+
+	t.Run("wrong app", func(t *testing.T) {
+		ssr := newMockSessionRepo()
+		sr := newMockSubscriptionRepo()
+		ts := newTokenServiceWithKeys(ssr, sr)
+
+		createSession(ssr, "user-6", "app-6", "wrong-app-refresh", []string{"app:read"}, timeNow().Add(7*24*time.Hour))
+
+		_, _, err := ts.Refresh(ctx, "wrong-app-refresh", "other-app")
+		if err == nil {
+			t.Error("expected error for wrong app")
+		}
+		if !strings.Contains(err.Error(), "not issued for this app") {
+			t.Errorf("unexpected error: %q", err.Error())
 		}
 	})
 }
@@ -456,9 +473,9 @@ func TestJWKS(t *testing.T) {
 		t.Errorf("expected non-empty n, got %v", jwk["n"])
 	}
 
-	expectedN := ts.PublicKey.N.Text(16)
+	expectedN := base64.RawURLEncoding.EncodeToString(ts.PublicKey.N.Bytes())
 	if n != expectedN {
-		t.Errorf("n mismatch")
+		t.Errorf("n mismatch: got %s, want %s", n, expectedN)
 	}
 }
 
@@ -552,7 +569,7 @@ func TestOAuthHTTPClient(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{Port: "8080"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	client := p.httpClient()
 	if client == nil {
@@ -564,7 +581,7 @@ func TestExchangeGitHubCode_NetworkError(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{Port: "8080", GitHubClientID: "id", GitHubClientSecret: "secret"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
@@ -579,7 +596,7 @@ func TestGetGitHubUser_NetworkError(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{Port: "8080"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
@@ -594,7 +611,7 @@ func TestGetGitHubPrimaryEmail_NetworkError(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{Port: "8080"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
@@ -609,7 +626,7 @@ func TestGetGitHubPrimaryEmail_NetworkError(t *testing.T) {
 
 func TestGetGitHubPrimaryEmail_NoPrimaryFallback(t *testing.T) {
 	cfg := &config.Config{Port: "8080"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	emailServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -636,7 +653,7 @@ func TestGetGitHubPrimaryEmail_NoPrimaryFallback(t *testing.T) {
 
 func TestGetGitHubPrimaryEmail_EmptyList(t *testing.T) {
 	cfg := &config.Config{Port: "8080"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	emailServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -663,7 +680,7 @@ func TestGetGitHubPrimaryEmail_EmptyList(t *testing.T) {
 
 func TestExchangeGitHubCode_InvalidResponse(t *testing.T) {
 	cfg := &config.Config{Port: "8080", GitHubClientID: "id", GitHubClientSecret: "secret"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -690,7 +707,7 @@ func TestExchangeGitHubCode_InvalidResponse(t *testing.T) {
 
 func TestGetGitHubUser_InvalidResponse(t *testing.T) {
 	cfg := &config.Config{Port: "8080"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	userServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -717,7 +734,7 @@ func TestGetGitHubUser_InvalidResponse(t *testing.T) {
 
 func TestExchangeGitHubCode_EmptyAccessToken(t *testing.T) {
 	cfg := &config.Config{Port: "8080", GitHubClientID: "id", GitHubClientSecret: "secret"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -744,7 +761,7 @@ func TestExchangeGitHubCode_EmptyAccessToken(t *testing.T) {
 
 func TestGetGitHubPrimaryEmail_InvalidResponse(t *testing.T) {
 	cfg := &config.Config{Port: "8080"}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	emailServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -40,7 +40,12 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		req.DefaultPlan = "free"
 	}
 
-	plainSecret := service.GenerateRefreshToken()[:24]
+	plainSecret, err := service.GenerateRefreshToken()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to generate app secret"})
+		return
+	}
+	plainSecret = plainSecret[:24]
 	hashedSecret, err := util.HashSecret(plainSecret)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to generate app secret"})
@@ -70,11 +75,28 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 	})
 }
 
+func getAuthedApp(c *gin.Context) (*model.App, bool) {
+	authedApp, exists := c.Get("app")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "app authentication required"})
+		return nil, false
+	}
+	return authedApp.(*model.App), true
+}
+
 func (h *AppHandler) GetApp(c *gin.Context) {
 	id := c.Param("id")
 	app, err := h.appRepo.FindByID(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+		return
+	}
+	authed, ok := getAuthedApp(c)
+	if !ok {
+		return
+	}
+	if authed.ID != app.ID {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to access this app"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
@@ -85,6 +107,15 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 	app, err := h.appRepo.FindByID(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+		return
+	}
+
+	authed, ok := getAuthedApp(c)
+	if !ok {
+		return
+	}
+	if authed.ID != app.ID {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to modify this app"})
 		return
 	}
 
@@ -99,25 +130,26 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 		return
 	}
 
+	updated := *app
 	if req.Name != nil {
-		app.Name = *req.Name
+		updated.Name = *req.Name
 	}
 	if req.RedirectURIs != nil {
-		app.RedirectURIs = req.RedirectURIs
+		updated.RedirectURIs = req.RedirectURIs
 	}
 	if req.Providers != nil {
-		app.Providers = req.Providers
+		updated.Providers = req.Providers
 	}
 	if req.DefaultPlan != nil {
-		app.DefaultPlan = *req.DefaultPlan
+		updated.DefaultPlan = *req.DefaultPlan
 	}
 
-	if err := h.appRepo.Update(c.Request.Context(), app); err != nil {
+	if err := h.appRepo.Update(c.Request.Context(), &updated); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update app"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": updated})
 }
 
 func (h *AppHandler) CreateSubscription(c *gin.Context) {
@@ -129,6 +161,15 @@ func (h *AppHandler) CreateSubscription(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	authed, ok := getAuthedApp(c)
+	if !ok {
+		return
+	}
+	if authed.ID != req.AppID {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to create subscriptions for this app"})
 		return
 	}
 
@@ -158,11 +199,32 @@ func (h *AppHandler) GetSubscription(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "subscription not found"})
 		return
 	}
+	authed, ok := getAuthedApp(c)
+	if !ok {
+		return
+	}
+	if authed.ID != sub.AppID {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to access this subscription"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": sub})
 }
 
 func (h *AppHandler) CancelSubscription(c *gin.Context) {
 	id := c.Param("id")
+	sub, err := h.subRepo.FindByID(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "subscription not found"})
+		return
+	}
+	authed, ok := getAuthedApp(c)
+	if !ok {
+		return
+	}
+	if authed.ID != sub.AppID {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to cancel this subscription"})
+		return
+	}
 	if err := h.subSvc.Cancel(c.Request.Context(), id); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return

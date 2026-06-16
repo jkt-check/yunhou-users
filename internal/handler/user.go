@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/middleware"
@@ -45,19 +46,22 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 		return
 	}
 
+	updated := *user
 	if req.Nickname != nil {
-		user.Nickname = req.Nickname
+		updated.Nickname = req.Nickname
 	}
 	if req.AvatarURL != nil {
-		user.AvatarURL = req.AvatarURL
+		updated.AvatarURL = req.AvatarURL
 	}
 
-	if err := h.userRepo.Update(c.Request.Context(), user); err != nil {
+	if err := h.userRepo.Update(c.Request.Context(), &updated); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update profile"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": user})
+	now := time.Now()
+	updated.UpdatedAt = now
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": updated})
 }
 
 func (h *UserHandler) ListIdentities(c *gin.Context) {
@@ -74,18 +78,13 @@ func (h *UserHandler) UnbindIdentity(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	identityID := c.Param("id")
 
-	count, err := h.identityRepo.CountByUserID(c.Request.Context(), userID)
+	deleted, err := h.identityRepo.DeleteIfNotLast(c.Request.Context(), identityID, userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to check identities"})
-		return
-	}
-	if count <= 1 {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "must keep at least one social account"})
-		return
-	}
-
-	if err := h.identityRepo.Delete(c.Request.Context(), identityID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to unbind identity"})
+		return
+	}
+	if !deleted {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "must keep at least one social account"})
 		return
 	}
 

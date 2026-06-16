@@ -1,4 +1,4 @@
-.PHONY: build run test migrate lint
+.PHONY: build run test e2e migrate lint deps generate-keys
 
 build:
 	go build -o bin/server ./cmd/server
@@ -7,7 +7,10 @@ run:
 	go run ./cmd/server
 
 test:
-	go test -race -cover ./...
+	go test -race -cover ./internal/...
+
+e2e:
+	go test -race -count=1 -v ./tests/e2e/
 
 migrate:
 	@echo "Run migration manually:"

@@ -58,6 +58,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 		RSAPublic:      projectDir + "/keys/public.pem",
 		JWTAccessTTL:   "15m",
 		JWTRefreshTTL:  "168h",
+		StateHMACKey:   "integration-test-hmac-key",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -72,11 +73,11 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	}
 	authSvc := service.NewAuthService(userRepo, identityRepo, appRepo, subRepo, sessionRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo)
-	oauth := service.NewOAuthProvider(cfg)
+	oauth := service.NewOAuthProvider(cfg, appRepo)
 
 	engine := gin.New()
 	gin.SetMode(gin.TestMode)
-	router.Setup(engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth)
+	router.Setup(engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, cfg.StateHMACKey)
 
 	return httptest.NewServer(engine)
 }
@@ -109,9 +110,14 @@ func doJSON(t *testing.T, method, url string, body interface{}) *http.Response {
 func parseJSON(t *testing.T, resp *http.Response) map[string]interface{} {
 	t.Helper()
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
 	var result map[string]interface{}
-	json.Unmarshal(b, &result)
+	if err := json.Unmarshal(b, &result); err != nil {
+		t.Fatalf("parse JSON response: %v, body: %s", err, string(b))
+	}
 	return result
 }
 
@@ -143,7 +149,8 @@ func doWithAuth(t *testing.T, method, url, appID, appSecret string, body interfa
 func bootstrapApp(t *testing.T, db *sqlx.DB) (appID, plainSecret string) {
 	t.Helper()
 	appID = newUUID()
-	plainSecret = service.GenerateRefreshToken()[:24]
+	raw, _ := service.GenerateRefreshToken()
+	plainSecret = raw[:24]
 	hashed, _ := util.HashSecret(plainSecret)
 	_, err := db.ExecContext(context.Background(), `
 		INSERT INTO apps (id, secret, name, redirect_uris, providers, default_plan)
@@ -212,8 +219,8 @@ func TestAppCRUD(t *testing.T) {
 	newAppID := data["app_id"].(string)
 	newAppSecret := data["app_secret"].(string)
 
-	// Get the new app
-	resp = doWithAuth(t, http.MethodGet, srv.URL+"/apps/"+newAppID, appID, appSecret, nil)
+	// Get the new app using its own credentials
+	resp = doWithAuth(t, http.MethodGet, srv.URL+"/apps/"+newAppID, newAppID, newAppSecret, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("get app: status %d", resp.StatusCode)
 	}
@@ -483,7 +490,9 @@ func TestAuthorizeRedirectsToGitHub(t *testing.T) {
 	srv := setupServer(db)
 	defer srv.Close()
 
-	resp := doJSON(t, http.MethodGet, srv.URL+"/authorize?app_id=any&provider=github&redirect_uri=http://localhost:3000/cb&state=test", nil)
+	appID, _ := bootstrapApp(t, db)
+
+	resp := doJSON(t, http.MethodGet, srv.URL+"/authorize?app_id="+appID+"&provider=github&redirect_uri=http://localhost:3000/callback&state=test", nil)
 	if resp.StatusCode != http.StatusTemporaryRedirect {
 		t.Fatalf("authorize: status %d", resp.StatusCode)
 	}
@@ -525,6 +534,8 @@ func TestTokenRefreshWithInvalidToken(t *testing.T) {
 
 	resp := doJSON(t, http.MethodPost, srv.URL+"/token/refresh", map[string]interface{}{
 		"refresh_token": "totally-invalid",
+		"app_id":        "nonexistent",
+		"app_secret":    "wrong",
 	})
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401 for invalid refresh, got %d", resp.StatusCode)

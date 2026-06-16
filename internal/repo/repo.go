@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -21,6 +22,7 @@ type SocialIdentityRepo interface {
 	ListByUserID(ctx context.Context, userID string) ([]model.SocialIdentity, error)
 	Delete(ctx context.Context, id string) error
 	CountByUserID(ctx context.Context, userID string) (int, error)
+	DeleteIfNotLast(ctx context.Context, id, userID string) (bool, error)
 }
 
 type AppRepo interface {
@@ -35,13 +37,15 @@ type SubscriptionRepo interface {
 	FindByID(ctx context.Context, id string) (*model.Subscription, error)
 	ListByUserID(ctx context.Context, userID string) ([]model.Subscription, error)
 	UpdateStatus(ctx context.Context, id, status string) error
-	Renew(ctx context.Context, id string, expiresAt interface{}) error
+	Renew(ctx context.Context, id string, expiresAt *time.Time) error
 }
 
 type SessionRepo interface {
 	Create(ctx context.Context, s *model.Session) error
 	FindByRefreshToken(ctx context.Context, token string) (*model.Session, error)
 	Revoke(ctx context.Context, id string) error
+	RevokeIfNotRevoked(ctx context.Context, id string) (bool, error)
+	RotateRefresh(ctx context.Context, oldID string, newSession *model.Session) error
 }
 
 // Concrete implementations
@@ -143,6 +147,21 @@ func (r *socialIdentityRepo) CountByUserID(ctx context.Context, userID string) (
 	return count, err
 }
 
+func (r *socialIdentityRepo) DeleteIfNotLast(ctx context.Context, id, userID string) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		DELETE FROM social_identities WHERE id = $1 AND user_id = $2
+		AND (SELECT COUNT(*) FROM social_identities WHERE user_id = $2) > 1
+	`, id, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // AppRepo implementation
 
 func (r *appRepo) Create(ctx context.Context, a *model.App) error {
@@ -216,7 +235,7 @@ func (r *subscriptionRepo) UpdateStatus(ctx context.Context, id, status string) 
 	return err
 }
 
-func (r *subscriptionRepo) Renew(ctx context.Context, id string, expiresAt interface{}) error {
+func (r *subscriptionRepo) Renew(ctx context.Context, id string, expiresAt *time.Time) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE subscriptions SET status = 'active', expires_at = $1, updated_at = now() WHERE id = $2
 	`, expiresAt, id)
@@ -249,4 +268,47 @@ func (r *sessionRepo) Revoke(ctx context.Context, id string) error {
 		UPDATE sessions SET revoked = true WHERE id = $1
 	`, id)
 	return err
+}
+
+func (r *sessionRepo) RevokeIfNotRevoked(ctx context.Context, id string) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE sessions SET revoked = true WHERE id = $1 AND revoked = false
+	`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (r *sessionRepo) RotateRefresh(ctx context.Context, oldID string, newSession *model.Session) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE sessions SET revoked = true WHERE id = $1 AND revoked = false
+	`, oldID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("session already revoked")
+	}
+
+	_, err = tx.NamedExecContext(ctx, `
+		INSERT INTO sessions (id, user_id, app_id, refresh_token, scope, revoked, expires_at)
+		VALUES (:id, :user_id, :app_id, :refresh_token, :scope, :revoked, :expires_at)
+	`, newSession)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }

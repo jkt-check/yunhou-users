@@ -393,6 +393,10 @@ func TestExchangeCode(t *testing.T) {
 				sess := newValidSession()
 				ssr.sessions[sess.ID] = sess
 				ssr.byToken[validCodeHash] = sess
+				// Seed active subscription for the user+app pair
+				activeSub := &model.Subscription{ID: "sub-valid", UserID: "user-1", AppID: "app-1", Plan: "free", Status: "active"}
+				sr.subs["sub-valid"] = activeSub
+				sr.byUserApp["user-1:app-1"] = activeSub
 			},
 			wantErr: false,
 		},
@@ -456,6 +460,10 @@ func TestExchangeCode(t *testing.T) {
 				sess := newValidSession()
 				ssr.sessions[sess.ID] = sess
 				ssr.byToken[validCodeHash] = sess
+				// Seed active subscription so exchange passes the subscription check
+				activeSub := &model.Subscription{ID: "sub-valid", UserID: "user-1", AppID: "app-1", Plan: "free", Status: "active"}
+				sr.subs["sub-valid"] = activeSub
+				sr.byUserApp["user-1:app-1"] = activeSub
 				// The auth code session was pre-seeded (not via Create). The next Create
 				// call will be for the new refresh token session — make that fail.
 				ssr.failAfter = 1
@@ -587,7 +595,10 @@ func TestGenerateRefreshToken_Unique(t *testing.T) {
 
 	tokens := make(map[string]bool)
 	for i := 0; i < 100; i++ {
-		tok := GenerateRefreshToken()
+		tok, err := GenerateRefreshToken()
+		if err != nil {
+			t.Fatalf("GenerateRefreshToken: %v", err)
+		}
 		if tok == "" {
 			t.Error("expected non-empty refresh token")
 		}

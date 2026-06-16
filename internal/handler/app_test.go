@@ -17,10 +17,16 @@ import (
 
 // ---------- app handler test setup ----------
 
-// setupAppRouter creates a gin.Engine with app routes.
-func setupAppRouter(h *AppHandler) *gin.Engine {
+// setupAppRouter creates a gin.Engine with app routes and a middleware that sets the "app" context value.
+func setupAppRouter(h *AppHandler, authedApp *model.App) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		if authedApp != nil {
+			c.Set("app", authedApp)
+		}
+		c.Next()
+	})
 	r.POST("/apps", h.CreateApp)
 	r.GET("/apps/:id", h.GetApp)
 	r.PATCH("/apps/:id", h.UpdateApp)
@@ -36,7 +42,7 @@ func TestCreateApp_MissingName(t *testing.T) {
 	t.Parallel()
 
 	h := NewAppHandler(&mockAppRepo{}, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	// Missing name (required field)
 	w := performRequest(r, http.MethodPost, "/apps", `{"redirect_uris":["http://localhost/cb"]}`)
@@ -63,7 +69,7 @@ func TestCreateApp_RepoError(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	body := `{"name":"myapp","redirect_uris":["http://localhost/cb"]}`
 	w := performRequest(r, http.MethodPost, "/apps", body)
@@ -86,7 +92,7 @@ func TestCreateApp_Success(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	body := `{"name":"myapp","redirect_uris":["http://localhost/cb"],"providers":["github"],"default_plan":"pro"}`
 	w := performRequest(r, http.MethodPost, "/apps", body)
@@ -139,7 +145,7 @@ func TestCreateApp_DefaultValues(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	// No providers or default_plan — should get defaults
 	body := `{"name":"myapp","redirect_uris":["http://localhost/cb"]}`
@@ -170,7 +176,7 @@ func TestGetApp_Found(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodGet, "/apps/app1", "")
 	if w.Code != http.StatusOK {
@@ -199,7 +205,7 @@ func TestGetApp_NotFound(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodGet, "/apps/nonexistent", "")
 	if w.Code != http.StatusNotFound {
@@ -231,7 +237,7 @@ func TestUpdateApp_Found(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	body := `{"name":"newname","default_plan":"pro"}`
 	w := performRequest(r, http.MethodPatch, "/apps/app1", body)
@@ -299,7 +305,7 @@ func TestUpdateApp_PartialUpdate(t *testing.T) {
 				},
 			}
 			h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-			r := setupAppRouter(h)
+			r := setupAppRouter(h, &model.App{ID: "app1"})
 
 			w := performRequest(r, http.MethodPatch, "/apps/app1", tt.body)
 			if w.Code != http.StatusOK {
@@ -334,7 +340,7 @@ func TestUpdateApp_NotFound(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	body := `{"name":"newname"}`
 	w := performRequest(r, http.MethodPatch, "/apps/nonexistent", body)
@@ -352,7 +358,7 @@ func TestUpdateApp_InvalidBody(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodPatch, "/apps/app1", "not-json")
 	if w.Code != http.StatusBadRequest {
@@ -373,7 +379,7 @@ func TestUpdateApp_UpdateError(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(appRepo, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	body := `{"name":"newname"}`
 	w := performRequest(r, http.MethodPatch, "/apps/app1", body)
@@ -391,7 +397,7 @@ func TestCreateSubscription_InvalidBody(t *testing.T) {
 	t.Parallel()
 
 	h := NewAppHandler(&mockAppRepo{}, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	// Empty body
 	w := performRequest(r, http.MethodPost, "/subscriptions", "")
@@ -410,9 +416,9 @@ func TestCreateSubscription_InvalidExpiresAt(t *testing.T) {
 	t.Parallel()
 
 	h := NewAppHandler(&mockAppRepo{}, &mockSubscriptionRepo{}, service.NewSubscriptionService(&mockSubscriptionRepo{}))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
-	body := `{"user_id":"u1","app_id":"a1","plan":"pro","expires_at":"not-a-date"}`
+	body := `{"user_id":"u1","app_id":"app1","plan":"pro","expires_at":"not-a-date"}`
 	w := performRequest(r, http.MethodPost, "/subscriptions", body)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
@@ -426,20 +432,19 @@ func TestCreateSubscription_Duplicate(t *testing.T) {
 	t.Parallel()
 
 	subRepo := &mockSubscriptionRepo{
-		findByUserAppFn: func(ctx context.Context, userID, appID string) (*model.Subscription, error) {
-			return &model.Subscription{ID: "existing", UserID: userID, AppID: appID}, nil
+		createFn: func(ctx context.Context, s *model.Subscription) error {
+			return &duplicateKeyError{}
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
-	body := `{"user_id":"u1","app_id":"a1","plan":"pro"}`
+	body := `{"user_id":"u1","app_id":"app1","plan":"pro"}`
 	w := performRequest(r, http.MethodPost, "/subscriptions", body)
 	if w.Code != http.StatusConflict {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusConflict, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "subscription already exists") {
-		t.Errorf("body = %s, want containing 'subscription already exists'", w.Body.String())
+	if !strings.Contains(w.Body.String(), "subscription already exists") {		t.Errorf("body = %s, want containing 'subscription already exists'", w.Body.String())
 	}
 }
 
@@ -448,18 +453,15 @@ func TestCreateSubscription_Success(t *testing.T) {
 
 	var createdSub *model.Subscription
 	subRepo := &mockSubscriptionRepo{
-		findByUserAppFn: func(ctx context.Context, userID, appID string) (*model.Subscription, error) {
-			return nil, errNotFound // No existing subscription
-		},
 		createFn: func(ctx context.Context, s *model.Subscription) error {
 			createdSub = s
 			return nil
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
-	body := `{"user_id":"u1","app_id":"a1","plan":"pro"}`
+	body := `{"user_id":"u1","app_id":"app1","plan":"pro"}`
 	w := performRequest(r, http.MethodPost, "/subscriptions", body)
 	if w.Code != http.StatusCreated {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusCreated, w.Body.String())
@@ -492,19 +494,16 @@ func TestCreateSubscription_WithExpiresAt(t *testing.T) {
 
 	var createdSub *model.Subscription
 	subRepo := &mockSubscriptionRepo{
-		findByUserAppFn: func(ctx context.Context, userID, appID string) (*model.Subscription, error) {
-			return nil, errNotFound
-		},
 		createFn: func(ctx context.Context, s *model.Subscription) error {
 			createdSub = s
 			return nil
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	expiresAt := time.Now().Add(24 * time.Hour).Format(time.RFC3339)
-	body := `{"user_id":"u1","app_id":"a1","plan":"pro","expires_at":"` + expiresAt + `"}`
+	body := `{"user_id":"u1","app_id":"app1","plan":"pro","expires_at":"` + expiresAt + `"}`
 	w := performRequest(r, http.MethodPost, "/subscriptions", body)
 	if w.Code != http.StatusCreated {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusCreated, w.Body.String())
@@ -525,11 +524,11 @@ func TestGetSubscription_Found(t *testing.T) {
 
 	subRepo := &mockSubscriptionRepo{
 		findFn: func(ctx context.Context, id string) (*model.Subscription, error) {
-			return &model.Subscription{ID: id, UserID: "u1", AppID: "a1", Plan: "pro", Status: "active"}, nil
+			return &model.Subscription{ID: id, UserID: "u1", AppID: "app1", Plan: "pro", Status: "active"}, nil
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodGet, "/subscriptions/sub1", "")
 	if w.Code != http.StatusOK {
@@ -558,7 +557,7 @@ func TestGetSubscription_NotFound(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodGet, "/subscriptions/nonexistent", "")
 	if w.Code != http.StatusNotFound {
@@ -576,14 +575,14 @@ func TestCancelSubscription_Found(t *testing.T) {
 
 	subRepo := &mockSubscriptionRepo{
 		findFn: func(ctx context.Context, id string) (*model.Subscription, error) {
-			return &model.Subscription{ID: id, Status: "active"}, nil
+			return &model.Subscription{ID: id, AppID: "app1", Status: "active"}, nil
 		},
 		updateStatusFn: func(ctx context.Context, id, status string) error {
 			return nil
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodPost, "/subscriptions/sub1/cancel", "")
 	if w.Code != http.StatusOK {
@@ -599,11 +598,11 @@ func TestCancelSubscription_AlreadyCancelled(t *testing.T) {
 
 	subRepo := &mockSubscriptionRepo{
 		findFn: func(ctx context.Context, id string) (*model.Subscription, error) {
-			return &model.Subscription{ID: id, Status: "cancelled"}, nil
+			return &model.Subscription{ID: id, AppID: "app1", Status: "cancelled"}, nil
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodPost, "/subscriptions/sub1/cancel", "")
 	if w.Code != http.StatusBadRequest {
@@ -623,11 +622,11 @@ func TestCancelSubscription_NotFound(t *testing.T) {
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodPost, "/subscriptions/nonexistent/cancel", "")
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusNotFound, w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), "subscription not found") {
 		t.Errorf("body = %s, want containing 'subscription not found'", w.Body.String())
@@ -637,14 +636,14 @@ func TestCancelSubscription_NotFound(t *testing.T) {
 func TestCancelSubscription_UpdateStatusError(t *testing.T) {
 	subRepo := &mockSubscriptionRepo{
 		findFn: func(ctx context.Context, id string) (*model.Subscription, error) {
-			return &model.Subscription{ID: id, Status: "active"}, nil
+			return &model.Subscription{ID: id, AppID: "app1", Status: "active"}, nil
 		},
 		updateStatusFn: func(ctx context.Context, id, status string) error {
 			return errors.New("db error")
 		},
 	}
 	h := NewAppHandler(&mockAppRepo{}, subRepo, service.NewSubscriptionService(subRepo))
-	r := setupAppRouter(h)
+	r := setupAppRouter(h, &model.App{ID: "app1"})
 
 	w := performRequest(r, http.MethodPost, "/subscriptions/sub1/cancel", "")
 	if w.Code != http.StatusBadRequest {

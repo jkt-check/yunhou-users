@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -52,8 +54,9 @@ type TokenClaims struct {
 func (s *TokenService) SignAccessToken(userID, appID string, scope []string) (string, error) {
 	claims := TokenClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject: userID,
-			Issuer:  "yunhou-users",
+			Subject:   userID,
+			Issuer:    "yunhou-users",
+			Audience:  jwt.ClaimStrings{appID},
 		},
 		AppID: appID,
 		Scope: scope,
@@ -69,6 +72,9 @@ func (s *TokenService) SignAccessToken(userID, appID string, scope []string) (st
 
 func (s *TokenService) VerifyAccessToken(tokenStr string) (*TokenClaims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &TokenClaims{}, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
 		return s.PublicKey, nil
 	})
 	if err != nil {
@@ -81,15 +87,24 @@ func (s *TokenService) VerifyAccessToken(tokenStr string) (*TokenClaims, error) 
 	return claims, nil
 }
 
-func (s *TokenService) Refresh(ctx context.Context, refreshToken string) (string, string, error) {
-	session, err := s.SessionRepo.FindByRefreshToken(ctx, refreshToken)
+func (s *TokenService) Refresh(ctx context.Context, refreshToken, appID string) (string, string, error) {
+	session, err := s.SessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken))
 	if err != nil {
 		return "", "", fmt.Errorf("invalid or expired refresh token")
 	}
 
+	if session.AppID != appID {
+		return "", "", fmt.Errorf("refresh token not issued for this app")
+	}
+
 	sub, err := s.SubRepo.FindByUserApp(ctx, session.UserID, session.AppID)
-	if err != nil || sub.Status != "active" {
+	if err != nil || sub == nil || sub.Status != "active" {
 		return "", "", fmt.Errorf("subscription not active")
+	}
+
+	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
+		_ = s.SubRepo.UpdateStatus(ctx, sub.ID, "expired")
+		return "", "", fmt.Errorf("subscription expired")
 	}
 
 	newAccess, err := s.SignAccessToken(session.UserID, session.AppID, session.Scope)
@@ -97,19 +112,22 @@ func (s *TokenService) Refresh(ctx context.Context, refreshToken string) (string
 		return "", "", err
 	}
 
-	newRefresh := GenerateRefreshToken()
+	newRefresh, err := GenerateRefreshToken()
+	if err != nil {
+		return "", "", fmt.Errorf("generate refresh token: %w", err)
+	}
 	newSession := &model.Session{
 		ID:           GenerateUUID(),
 		UserID:       session.UserID,
 		AppID:        session.AppID,
 		RefreshToken: hashToken(newRefresh),
 		Scope:        session.Scope,
+		Revoked:      false,
 		ExpiresAt:    time.Now().Add(parseDuration(s.RefreshTTL)),
 	}
-	if err := s.SessionRepo.Create(ctx, newSession); err != nil {
-		return "", "", err
+	if err := s.SessionRepo.RotateRefresh(ctx, session.ID, newSession); err != nil {
+		return "", "", fmt.Errorf("rotate refresh token: %w", err)
 	}
-	_ = s.SessionRepo.Revoke(ctx, session.ID)
 
 	return newAccess, newRefresh, nil
 }
@@ -121,12 +139,23 @@ func (s *TokenService) JWKS() map[string]interface{} {
 		"kid": kid,
 		"alg": "RS256",
 		"use": "sig",
-		"n":   s.PublicKey.N.Text(16),
-		"e":   "AQAB",
+		"n":   base64.RawURLEncoding.EncodeToString(s.PublicKey.N.Bytes()),
+		"e":   encodeExponent(s.PublicKey.E),
 	}
 	return map[string]interface{}{
 		"keys": []map[string]interface{}{jwk},
 	}
+}
+
+func encodeExponent(e int) string {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, uint32(e))
+	// Trim leading zero bytes
+	i := 0
+	for i < 3 && buf[i] == 0 {
+		i++
+	}
+	return base64.RawURLEncoding.EncodeToString(buf[i:])
 }
 
 func loadPrivateKey(path string) (*rsa.PrivateKey, error) {

@@ -5,9 +5,20 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
+
+func isDuplicateKey(err error) bool {
+	if pgErr, ok := err.(*pgconn.PgError); ok {
+		return pgErr.Code == "23505"
+	}
+	if _, ok := err.(interface{ DuplicateKey() bool }); ok {
+		return true
+	}
+	return false
+}
 
 type SubscriptionService struct {
 	subRepo repo.SubscriptionRepo
@@ -18,11 +29,6 @@ func NewSubscriptionService(subRepo repo.SubscriptionRepo) *SubscriptionService 
 }
 
 func (s *SubscriptionService) Create(ctx context.Context, userID, appID, plan string, expiresAt *time.Time) (*model.Subscription, error) {
-	existing, err := s.subRepo.FindByUserApp(ctx, userID, appID)
-	if err == nil && existing != nil {
-		return nil, fmt.Errorf("subscription already exists for this user and app")
-	}
-
 	sub := &model.Subscription{
 		ID:        GenerateUUID(),
 		UserID:    userID,
@@ -32,6 +38,9 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, appID, plan st
 		ExpiresAt: expiresAt,
 	}
 	if err := s.subRepo.Create(ctx, sub); err != nil {
+		if isDuplicateKey(err) {
+			return nil, fmt.Errorf("subscription already exists for this user and app")
+		}
 		return nil, err
 	}
 	return sub, nil

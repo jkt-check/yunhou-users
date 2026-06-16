@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/config"
@@ -50,12 +51,13 @@ func (m *mockUserRepo) Update(ctx context.Context, u *model.User) error {
 }
 
 type mockSocialIdentityRepo struct {
-	createFn            func(ctx context.Context, si *model.SocialIdentity) error
-	findByProviderUIDFn func(ctx context.Context, provider, providerUID string) (*model.SocialIdentity, error)
-	findByEmailFn       func(ctx context.Context, email string) ([]model.SocialIdentity, error)
-	listByUserIDFn      func(ctx context.Context, userID string) ([]model.SocialIdentity, error)
-	deleteFn            func(ctx context.Context, id string) error
-	countByUserIDFn     func(ctx context.Context, userID string) (int, error)
+	createFn             func(ctx context.Context, si *model.SocialIdentity) error
+	findByProviderUIDFn  func(ctx context.Context, provider, providerUID string) (*model.SocialIdentity, error)
+	findByEmailFn        func(ctx context.Context, email string) ([]model.SocialIdentity, error)
+	listByUserIDFn       func(ctx context.Context, userID string) ([]model.SocialIdentity, error)
+	deleteFn             func(ctx context.Context, id string) error
+	countByUserIDFn      func(ctx context.Context, userID string) (int, error)
+	deleteIfNotLastFn    func(ctx context.Context, id, userID string) (bool, error)
 }
 
 func (m *mockSocialIdentityRepo) Create(ctx context.Context, si *model.SocialIdentity) error {
@@ -94,6 +96,19 @@ func (m *mockSocialIdentityRepo) CountByUserID(ctx context.Context, userID strin
 	}
 	return 0, nil
 }
+func (m *mockSocialIdentityRepo) DeleteIfNotLast(ctx context.Context, id, userID string) (bool, error) {
+	if m.deleteIfNotLastFn != nil {
+		return m.deleteIfNotLastFn(ctx, id, userID)
+	}
+	if m.deleteFn != nil {
+		err := m.deleteFn(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
 
 type mockAppRepo struct {
 	createFn func(ctx context.Context, a *model.App) error
@@ -126,7 +141,7 @@ type mockSubscriptionRepo struct {
 	findFn          func(ctx context.Context, id string) (*model.Subscription, error)
 	listFn          func(ctx context.Context, userID string) ([]model.Subscription, error)
 	updateStatusFn  func(ctx context.Context, id, status string) error
-	renewFn         func(ctx context.Context, id string, expiresAt interface{}) error
+	renewFn         func(ctx context.Context, id string, expiresAt *time.Time) error
 }
 
 func (m *mockSubscriptionRepo) Create(ctx context.Context, s *model.Subscription) error {
@@ -159,7 +174,7 @@ func (m *mockSubscriptionRepo) UpdateStatus(ctx context.Context, id, status stri
 	}
 	return nil
 }
-func (m *mockSubscriptionRepo) Renew(ctx context.Context, id string, expiresAt interface{}) error {
+func (m *mockSubscriptionRepo) Renew(ctx context.Context, id string, expiresAt *time.Time) error {
 	if m.renewFn != nil {
 		return m.renewFn(ctx, id, expiresAt)
 	}
@@ -170,6 +185,8 @@ type mockSessionRepo struct {
 	createFn             func(ctx context.Context, s *model.Session) error
 	findByRefreshTokenFn func(ctx context.Context, token string) (*model.Session, error)
 	revokeFn             func(ctx context.Context, id string) error
+	revokeIfNotRevokedFn func(ctx context.Context, id string) (bool, error)
+	rotateRefreshFn      func(ctx context.Context, oldID string, newSession *model.Session) error
 }
 
 func (m *mockSessionRepo) Create(ctx context.Context, s *model.Session) error {
@@ -190,6 +207,18 @@ func (m *mockSessionRepo) Revoke(ctx context.Context, id string) error {
 	}
 	return nil
 }
+func (m *mockSessionRepo) RevokeIfNotRevoked(ctx context.Context, id string) (bool, error) {
+	if m.revokeIfNotRevokedFn != nil {
+		return m.revokeIfNotRevokedFn(ctx, id)
+	}
+	return true, nil
+}
+func (m *mockSessionRepo) RotateRefresh(ctx context.Context, oldID string, newSession *model.Session) error {
+	if m.rotateRefreshFn != nil {
+		return m.rotateRefreshFn(ctx, oldID, newSession)
+	}
+	return nil
+}
 
 // compile-time interface checks
 var (
@@ -199,6 +228,12 @@ var (
 	_ repo.SubscriptionRepo   = (*mockSubscriptionRepo)(nil)
 	_ repo.SessionRepo        = (*mockSessionRepo)(nil)
 )
+
+// duplicateKeyError satisfies service.isDuplicateKey for test doubles.
+type duplicateKeyError struct{}
+
+func (d *duplicateKeyError) Error() string      { return "duplicate key" }
+func (d *duplicateKeyError) DuplicateKey() bool { return true }
 
 // ---------- helpers ----------
 
@@ -213,7 +248,12 @@ func sha256Hex(s string) string {
 
 // encodeTestState creates a valid OAuth state parameter for callback tests.
 func encodeTestState(appID, redirectURI, state string) string {
-	return encodeState(appID, redirectURI, state)
+	h := &AuthHandler{hmacKey: "test-hmac-key"}
+	s, err := h.encodeState(appID, redirectURI, state)
+	if err != nil {
+		panic(fmt.Sprintf("encodeTestState: %v", err))
+	}
+	return s
 }
 
 // testConfig returns a *config.Config pointing to test RSA keys (PKCS1 format).
@@ -267,8 +307,10 @@ func performRequest(r *gin.Engine, method, path, body string) *httptest.Response
 func TestAuthorize(t *testing.T) {
 	t.Parallel()
 
-	oauth := service.NewOAuthProvider(testConfig())
-	h := NewAuthHandler(nil, nil, oauth)
+	oauth := service.NewOAuthProvider(testConfig(), &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: id, RedirectURIs: []string{"http://localhost/cb"}, Providers: []string{"github"}}, nil
+	}})
+	h := NewAuthHandler(nil, nil, oauth, "test-hmac-key")
 
 	tests := []struct {
 		name     string
@@ -301,10 +343,10 @@ func TestAuthorize(t *testing.T) {
 			wantBody: "missing required parameters",
 		},
 		{
-			name:     "unsupported provider",
+			name:     "provider not allowed for app",
 			query:    "app_id=app1&provider=facebook&redirect_uri=http://localhost/cb",
 			wantCode: http.StatusBadRequest,
-			wantBody: "unsupported provider",
+			wantBody: "provider not allowed for this app",
 		},
 		{
 			name:     "success redirect for github",
@@ -342,7 +384,7 @@ func TestAuthorize(t *testing.T) {
 func TestCallback_MissingCode(t *testing.T) {
 	t.Parallel()
 
-	h := NewAuthHandler(nil, nil, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(nil, nil, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	w := performRequest(r, http.MethodGet, "/callback/github", "")
@@ -357,7 +399,7 @@ func TestCallback_MissingCode(t *testing.T) {
 func TestCallback_InvalidState(t *testing.T) {
 	t.Parallel()
 
-	h := NewAuthHandler(nil, nil, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(nil, nil, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 
 	tests := []struct {
 		name        string
@@ -407,7 +449,10 @@ func TestCallback_UnsupportedProviderError(t *testing.T) {
 	// Encode a valid state for the callback
 	encodedState := encodeTestState("app1", "http://localhost/cb", "xyz")
 
-	h := NewAuthHandler(nil, nil, service.NewOAuthProvider(testConfig()))
+	callbackAppRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: id, RedirectURIs: []string{"http://localhost/cb"}}, nil
+	}}
+	h := NewAuthHandler(nil, nil, service.NewOAuthProvider(testConfig(), callbackAppRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	w := performRequest(r, http.MethodGet, "/callback/facebook?code=some-code&state="+encodedState, "")
@@ -455,8 +500,11 @@ func TestCallback_Success(t *testing.T) {
 	}
 	oauthClient := &http.Client{Transport: redirectTransport}
 
-	// Create an OAuth provider with the custom HTTP client
-	oauth := service.NewOAuthProvider(testConfig())
+	callbackAppRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: id, RedirectURIs: []string{"http://localhost/cb"}, DefaultPlan: "free"}, nil
+	}}
+	// Create an OAuth provider with a custom HTTP client and mock AppRepo for redirect_uri validation
+	oauth := service.NewOAuthProvider(testConfig(), callbackAppRepo)
 	oauth.Client = oauthClient
 
 	// Set up service repos for successful AuthorizeOrCreate
@@ -486,7 +534,7 @@ func TestCallback_Success(t *testing.T) {
 
 	authSvc := service.NewAuthService(userRepo, identityRepo, appRepo, subRepo, sessionRepo, tokenSvc)
 
-	h := NewAuthHandler(authSvc, tokenSvc, oauth)
+	h := NewAuthHandler(authSvc, tokenSvc, oauth, "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	// Call the callback with a valid code and properly encoded state
@@ -554,7 +602,10 @@ func TestCallback_AuthorizeOrCreateError(t *testing.T) {
 		JWTRefreshTTL:      "168h",
 	}
 
-	oauth := service.NewOAuthProvider(mockCfg)
+	callbackAppRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: id, RedirectURIs: []string{"http://localhost/cb"}, DefaultPlan: "free"}, nil
+	}}
+	oauth := service.NewOAuthProvider(mockCfg, callbackAppRepo)
 	oauth.Client = &http.Client{Transport: &redirectTransport{
 		url:       mockGitHub.URL,
 		transport: http.DefaultTransport,
@@ -583,7 +634,7 @@ func TestCallback_AuthorizeOrCreateError(t *testing.T) {
 		tokenSvc,
 	)
 
-	h := NewAuthHandler(authSvc, tokenSvc, oauth)
+	h := NewAuthHandler(authSvc, tokenSvc, oauth, "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	encodedState := encodeTestState("app1", "http://localhost/cb", "xyz")
@@ -605,7 +656,7 @@ func TestExchangeToken_InvalidBody(t *testing.T) {
 	tokenSvc := newTestTokenService(sessionRepo, &mockSubscriptionRepo{})
 	authSvc := service.NewAuthService(&mockUserRepo{}, &mockSocialIdentityRepo{}, &mockAppRepo{}, &mockSubscriptionRepo{}, sessionRepo, tokenSvc)
 
-	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	// Empty body
@@ -646,7 +697,7 @@ func TestExchangeToken_InvalidAppID(t *testing.T) {
 		tokenSvc,
 	)
 
-	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	body := `{"code":"some-code","app_id":"nonexistent","app_secret":"secret"}`
@@ -682,7 +733,7 @@ func TestExchangeToken_InvalidAppSecret(t *testing.T) {
 		tokenSvc,
 	)
 
-	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	body := `{"code":"some-code","app_id":"app1","app_secret":"wrong-secret"}`
@@ -722,7 +773,7 @@ func TestExchangeToken_InvalidAuthCode(t *testing.T) {
 		tokenSvc,
 	)
 
-	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	body := `{"code":"bad-auth-code","app_id":"app1","app_secret":"correct-secret"}`
@@ -766,7 +817,7 @@ func TestExchangeToken_CodeIssuedForDifferentApp(t *testing.T) {
 		tokenSvc,
 	)
 
-	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	body := `{"code":"some-code","app_id":"app1","app_secret":"correct-secret"}`
@@ -794,7 +845,11 @@ func TestExchangeToken_Success(t *testing.T) {
 		createFn: func(ctx context.Context, s *model.Session) error { return nil },
 		revokeFn: func(ctx context.Context, id string) error { return nil },
 	}
-	subRepo := &mockSubscriptionRepo{}
+	subRepo := &mockSubscriptionRepo{
+		findByUserAppFn: func(ctx context.Context, userID, appID string) (*model.Subscription, error) {
+			return &model.Subscription{ID: "sub1", UserID: userID, AppID: appID, Status: "active"}, nil
+		},
+	}
 	tokenSvc := newTestTokenService(sessionRepo, subRepo)
 
 	// Create a bcrypt hash for "correct-secret"
@@ -809,12 +864,12 @@ func TestExchangeToken_Success(t *testing.T) {
 		&mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
 			return &model.App{ID: "app1", Secret: storedHash}, nil
 		}},
-		&mockSubscriptionRepo{},
+		subRepo,
 		sessionRepo,
 		tokenSvc,
 	)
 
-	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig()))
+	h := NewAuthHandler(authSvc, tokenSvc, service.NewOAuthProvider(testConfig(), nil), "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	// Get a valid auth code by using AuthorizeOrCreate
@@ -870,7 +925,7 @@ func TestRefreshToken_InvalidBody(t *testing.T) {
 
 	sessionRepo := &mockSessionRepo{}
 	tokenSvc := newTestTokenService(sessionRepo, &mockSubscriptionRepo{})
-	h := NewAuthHandler(nil, tokenSvc, nil)
+	h := NewAuthHandler(nil, tokenSvc, nil, "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	w := performRequest(r, http.MethodPost, "/refresh", "")
@@ -881,8 +936,8 @@ func TestRefreshToken_InvalidBody(t *testing.T) {
 		t.Errorf("body = %s, want containing 'invalid request body'", w.Body.String())
 	}
 
-	// Missing refresh_token field
-	w = performRequest(r, http.MethodPost, "/refresh", `{"other":"field"}`)
+	// Missing required fields
+	w = performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"x"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
 	}
@@ -891,16 +946,23 @@ func TestRefreshToken_InvalidBody(t *testing.T) {
 func TestRefreshToken_InvalidRefreshToken(t *testing.T) {
 	t.Parallel()
 
+	storedHash, err := util.HashSecret("app-secret")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	appRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: "a1", Secret: storedHash}, nil
+	}}
 	sessionRepo := &mockSessionRepo{
 		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
 			return nil, errNotFound
 		},
 	}
 	tokenSvc := newTestTokenService(sessionRepo, &mockSubscriptionRepo{})
-	h := NewAuthHandler(nil, tokenSvc, nil)
+	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"bad-token"}`)
+	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"bad-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
@@ -912,6 +974,13 @@ func TestRefreshToken_InvalidRefreshToken(t *testing.T) {
 func TestRefreshToken_InactiveSubscription(t *testing.T) {
 	t.Parallel()
 
+	storedHash, err := util.HashSecret("app-secret")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	appRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: "a1", Secret: storedHash}, nil
+	}}
 	sessionRepo := &mockSessionRepo{
 		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
 			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", Scope: []string{"app:read"}}, nil
@@ -923,10 +992,10 @@ func TestRefreshToken_InactiveSubscription(t *testing.T) {
 		},
 	}
 	tokenSvc := newTestTokenService(sessionRepo, subRepo)
-	h := NewAuthHandler(nil, tokenSvc, nil)
+	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token"}`)
+	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
@@ -938,6 +1007,13 @@ func TestRefreshToken_InactiveSubscription(t *testing.T) {
 func TestRefreshToken_SubscriptionNotFound(t *testing.T) {
 	t.Parallel()
 
+	storedHash, err := util.HashSecret("app-secret")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	appRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: "a1", Secret: storedHash}, nil
+	}}
 	sessionRepo := &mockSessionRepo{
 		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
 			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", Scope: []string{"app:read"}}, nil
@@ -949,21 +1025,28 @@ func TestRefreshToken_SubscriptionNotFound(t *testing.T) {
 		},
 	}
 	tokenSvc := newTestTokenService(sessionRepo, subRepo)
-	h := NewAuthHandler(nil, tokenSvc, nil)
+	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token"}`)
+	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
 }
 
 func TestRefreshToken_SessionCreateError(t *testing.T) {
+	storedHash, err := util.HashSecret("app-secret")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	appRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: "a1", Secret: storedHash}, nil
+	}}
 	sessionRepo := &mockSessionRepo{
 		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
 			return &model.Session{ID: "s1", UserID: "u1", AppID: "a1", Scope: []string{"app:read"}}, nil
 		},
-		createFn: func(ctx context.Context, s *model.Session) error {
+		rotateRefreshFn: func(ctx context.Context, oldID string, newSession *model.Session) error {
 			return errors.New("db error")
 		},
 	}
@@ -973,16 +1056,23 @@ func TestRefreshToken_SessionCreateError(t *testing.T) {
 		},
 	}
 	tokenSvc := newTestTokenService(sessionRepo, subRepo)
-	h := NewAuthHandler(nil, tokenSvc, nil)
+	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token"}`)
+	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-token","app_id":"a1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
 }
 
 func TestRefreshToken_Success(t *testing.T) {
+	storedHash, err := util.HashSecret("app-secret")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	appRepo := &mockAppRepo{findFn: func(ctx context.Context, id string) (*model.App, error) {
+		return &model.App{ID: "app1", Secret: storedHash}, nil
+	}}
 	sessionRepo := &mockSessionRepo{
 		findByRefreshTokenFn: func(ctx context.Context, token string) (*model.Session, error) {
 			return &model.Session{
@@ -1005,10 +1095,10 @@ func TestRefreshToken_Success(t *testing.T) {
 		},
 	}
 	tokenSvc := newTestTokenService(sessionRepo, subRepo)
-	h := NewAuthHandler(nil, tokenSvc, nil)
+	h := NewAuthHandler(nil, tokenSvc, service.NewOAuthProvider(testConfig(), appRepo), "test-hmac-key")
 	r := setupAuthRouter(h)
 
-	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-refresh-token"}`)
+	w := performRequest(r, http.MethodPost, "/refresh", `{"refresh_token":"valid-refresh-token","app_id":"app1","app_secret":"app-secret"}`)
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
 	}
@@ -1036,7 +1126,7 @@ func TestRefreshToken_Success(t *testing.T) {
 
 func TestJWKS(t *testing.T) {
 	tokenSvc := newTestTokenService(&mockSessionRepo{}, &mockSubscriptionRepo{})
-	h := NewAuthHandler(nil, tokenSvc, nil)
+	h := NewAuthHandler(nil, tokenSvc, nil, "test-hmac-key")
 	r := setupAuthRouter(h)
 
 	w := performRequest(r, http.MethodGet, "/.well-known/jwks.json", "")

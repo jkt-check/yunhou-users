@@ -120,6 +120,34 @@ func (m *mockSocialIdentityRepo) CountByUserID(_ context.Context, userID string)
 	return len(m.byUserID[userID]), nil
 }
 
+func (m *mockSocialIdentityRepo) DeleteIfNotLast(_ context.Context, id, userID string) (bool, error) {
+	if m.deleteErr != nil {
+		return false, m.deleteErr
+	}
+	identities := m.byUserID[userID]
+	if len(identities) <= 1 {
+		return false, nil
+	}
+	// Remove the identity from all indexes
+	for i, si := range identities {
+		if si.ID == id {
+			m.byUserID[userID] = append(identities[:i], identities[i+1:]...)
+			break
+		}
+	}
+	key := ""
+	for k, v := range m.identities {
+		if v.ID == id {
+			key = k
+			break
+		}
+	}
+	if key != "" {
+		delete(m.identities, key)
+	}
+	return true, nil
+}
+
 // --- AppRepo mock ---
 
 type mockAppRepo struct {
@@ -180,8 +208,12 @@ func (m *mockSubscriptionRepo) Create(_ context.Context, s *model.Subscription) 
 	if m.createErr != nil {
 		return m.createErr
 	}
+	key := s.UserID + ":" + s.AppID
+	if _, exists := m.byUserApp[key]; exists {
+		return &duplicateKeyError{}
+	}
 	m.subs[s.ID] = s
-	m.byUserApp[s.UserID+":"+s.AppID] = s
+	m.byUserApp[key] = s
 	return nil
 }
 
@@ -230,7 +262,7 @@ func (m *mockSubscriptionRepo) UpdateStatus(_ context.Context, id, status string
 	return nil
 }
 
-func (m *mockSubscriptionRepo) Renew(_ context.Context, id string, expiresAt interface{}) error {
+func (m *mockSubscriptionRepo) Renew(_ context.Context, id string, expiresAt *time.Time) error {
 	if m.renewErr != nil {
 		return m.renewErr
 	}
@@ -239,9 +271,7 @@ func (m *mockSubscriptionRepo) Renew(_ context.Context, id string, expiresAt int
 		return fmt.Errorf("not found")
 	}
 	s.Status = "active"
-	if t, ok := expiresAt.(*time.Time); ok {
-		s.ExpiresAt = t
-	}
+	s.ExpiresAt = expiresAt
 	return nil
 }
 
@@ -305,6 +335,36 @@ func (m *mockSessionRepo) Revoke(_ context.Context, id string) error {
 	return nil
 }
 
+func (m *mockSessionRepo) RevokeIfNotRevoked(_ context.Context, id string) (bool, error) {
+	if m.revokeErr != nil {
+		return false, m.revokeErr
+	}
+	s, ok := m.sessions[id]
+	if !ok || s.Revoked {
+		return false, nil
+	}
+	s.Revoked = true
+	return true, nil
+}
+
+func (m *mockSessionRepo) RotateRefresh(_ context.Context, oldID string, newSession *model.Session) error {
+	if m.createErr != nil {
+		return m.createErr
+	}
+	m.createCount++
+	if m.failAfter > 0 && m.createCount >= m.failAfter {
+		return fmt.Errorf("session create failed on call %d", m.createCount)
+	}
+	s, ok := m.sessions[oldID]
+	if !ok || s.Revoked {
+		return fmt.Errorf("session already revoked")
+	}
+	s.Revoked = true
+	m.sessions[newSession.ID] = newSession
+	m.byToken[newSession.RefreshToken] = newSession
+	return nil
+}
+
 // --- Test RSA key pair helpers ---
 
 func generateTestRSAKeyPair() (*rsa.PrivateKey, *rsa.PublicKey) {
@@ -335,3 +395,9 @@ var timeNow = func() time.Time { return time.Now() }
 
 // Ensure util package is referenced (used in auth_test.go)
 var _ = util.HashSecret
+
+// duplicateKeyError is a test double that satisfies isDuplicateKey.
+type duplicateKeyError struct{}
+
+func (d *duplicateKeyError) Error() string   { return "duplicate key" }
+func (d *duplicateKeyError) DuplicateKey() bool { return true }

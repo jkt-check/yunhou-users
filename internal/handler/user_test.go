@@ -377,8 +377,8 @@ func TestUnbindIdentity_LastIdentityProtection(t *testing.T) {
 	t.Parallel()
 
 	identityRepo := &mockSocialIdentityRepo{
-		countByUserIDFn: func(ctx context.Context, userID string) (int, error) {
-			return 1, nil // Only one identity left
+		deleteIfNotLastFn: func(ctx context.Context, id, userID string) (bool, error) {
+			return false, nil // Not deleted — last identity
 		},
 	}
 
@@ -397,12 +397,12 @@ func TestUnbindIdentity_LastIdentityProtection(t *testing.T) {
 	}
 }
 
-func TestUnbindIdentity_CountError(t *testing.T) {
+func TestUnbindIdentity_DeleteIfNotLastError(t *testing.T) {
 	t.Parallel()
 
 	identityRepo := &mockSocialIdentityRepo{
-		countByUserIDFn: func(ctx context.Context, userID string) (int, error) {
-			return 0, errors.New("db error")
+		deleteIfNotLastFn: func(ctx context.Context, id, userID string) (bool, error) {
+			return false, errors.New("db error")
 		},
 	}
 
@@ -416,8 +416,8 @@ func TestUnbindIdentity_CountError(t *testing.T) {
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusInternalServerError, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "failed to check identities") {
-		t.Errorf("body = %s, want containing 'failed to check identities'", w.Body.String())
+	if !strings.Contains(w.Body.String(), "failed to unbind identity") {
+		t.Errorf("body = %s, want containing 'failed to unbind identity'", w.Body.String())
 	}
 }
 
@@ -425,11 +425,8 @@ func TestUnbindIdentity_DeleteError(t *testing.T) {
 	t.Parallel()
 
 	identityRepo := &mockSocialIdentityRepo{
-		countByUserIDFn: func(ctx context.Context, userID string) (int, error) {
-			return 2, nil // More than one identity
-		},
-		deleteFn: func(ctx context.Context, id string) error {
-			return errors.New("db error")
+		deleteIfNotLastFn: func(ctx context.Context, id, userID string) (bool, error) {
+			return false, errors.New("db error")
 		},
 	}
 
@@ -452,11 +449,8 @@ func TestUnbindIdentity_Success(t *testing.T) {
 	t.Parallel()
 
 	identityRepo := &mockSocialIdentityRepo{
-		countByUserIDFn: func(ctx context.Context, userID string) (int, error) {
-			return 2, nil
-		},
-		deleteFn: func(ctx context.Context, id string) error {
-			return nil
+		deleteIfNotLastFn: func(ctx context.Context, id, userID string) (bool, error) {
+			return true, nil // Successfully deleted
 		},
 	}
 

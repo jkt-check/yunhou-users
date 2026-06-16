@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -18,11 +19,19 @@ func main() {
 
 	cfg := config.Load()
 
+	if cfg.StateHMACKey == "" {
+		log.Fatal("STATE_HMAC_KEY environment variable is required")
+	}
+
 	db, err := sqlx.Connect("postgres", cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("failed to connect to database: %v", err)
 	}
 	defer db.Close()
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err := db.Ping(); err != nil {
 		log.Fatalf("failed to ping database: %v", err)
@@ -41,10 +50,10 @@ func main() {
 
 	authSvc := service.NewAuthService(userRepo, identityRepo, appRepo, subRepo, sessionRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo)
-	oauth := service.NewOAuthProvider(cfg)
+	oauth := service.NewOAuthProvider(cfg, appRepo)
 
 	engine := gin.Default()
-	router.Setup(engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth)
+	router.Setup(engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, cfg.StateHMACKey)
 
 	log.Printf("starting server on :%s", cfg.Port)
 	if err := engine.Run(":" + cfg.Port); err != nil {

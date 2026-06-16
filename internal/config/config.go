@@ -16,6 +16,7 @@ type Config struct {
 	WeChatClientID     string
 	WeChatClientSecret string
 
+	StateHMACKey  string
 	JWTAccessTTL  string
 	JWTRefreshTTL string
 }
@@ -35,6 +36,7 @@ func Load() *Config {
 		WeChatClientID:     os.Getenv("WECHAT_CLIENT_ID"),
 		WeChatClientSecret: os.Getenv("WECHAT_CLIENT_SECRET"),
 
+		StateHMACKey:  os.Getenv("STATE_HMAC_KEY"),
 		JWTAccessTTL:  envOr("JWT_ACCESS_TTL", "15m"),
 		JWTRefreshTTL: envOr("JWT_REFRESH_TTL", "168h"),
 	}

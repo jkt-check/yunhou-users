@@ -8,29 +8,41 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/model"
+	"github.com/yunhou/users/internal/repo"
 )
 
 type OAuthProvider struct {
-	cfg    *config.Config
-	Client *http.Client // defaults to http.DefaultClient if nil
+	cfg     *config.Config
+	AppRepo repo.AppRepo
+	Client  *http.Client // defaults to http.DefaultClient if nil
 }
 
-func NewOAuthProvider(cfg *config.Config) *OAuthProvider {
-	return &OAuthProvider{cfg: cfg}
+func NewOAuthProvider(cfg *config.Config, appRepo repo.AppRepo) *OAuthProvider {
+	return &OAuthProvider{cfg: cfg, AppRepo: appRepo}
+}
+
+func (p *OAuthProvider) FindApp(ctx context.Context, appID string) (*model.App, error) {
+	if p.AppRepo == nil {
+		return nil, fmt.Errorf("app repository not configured")
+	}
+	return p.AppRepo.FindByID(ctx, appID)
 }
 
 func (p *OAuthProvider) httpClient() *http.Client {
 	if p.Client != nil {
 		return p.Client
 	}
-	return http.DefaultClient
+	return &http.Client{Timeout: 10 * time.Second}
 }
 
 type githubTokenResponse struct {
 	AccessToken string `json:"access_token"`
 	TokenType   string `json:"token_type"`
+	Error       string `json:"error,omitempty"`
 }
 
 type githubUserResponse struct {
@@ -121,7 +133,7 @@ func (p *OAuthProvider) exchangeGitHubCode(ctx context.Context, code string) (st
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", err
 	}
@@ -129,6 +141,9 @@ func (p *OAuthProvider) exchangeGitHubCode(ctx context.Context, code string) (st
 	var tokenResp githubTokenResponse
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return "", fmt.Errorf("invalid token response: %s", string(body))
+	}
+	if tokenResp.Error != "" {
+		return "", fmt.Errorf("github token error: %s", tokenResp.Error)
 	}
 	if tokenResp.AccessToken == "" {
 		return "", fmt.Errorf("no access token in response")
@@ -150,7 +165,7 @@ func (p *OAuthProvider) getGitHubUser(ctx context.Context, token string) (*githu
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +191,7 @@ func (p *OAuthProvider) getGitHubPrimaryEmail(ctx context.Context, token string)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", err
 	}

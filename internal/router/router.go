@@ -19,17 +19,19 @@ func Setup(
 	authSvc *service.AuthService,
 	subSvc *service.SubscriptionService,
 	oauth *service.OAuthProvider,
+	stateHMACKey string,
 ) {
-	authHandler := handler.NewAuthHandler(authSvc, tokenSvc, oauth)
+	authHandler := handler.NewAuthHandler(authSvc, tokenSvc, oauth, stateHMACKey)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo, subRepo)
 	appHandler := handler.NewAppHandler(appRepo, subRepo, subSvc)
 
-	// Public routes
-	engine.GET("/.well-known/jwks.json", authHandler.JWKS)
-	engine.GET("/authorize", authHandler.Authorize)
-	engine.GET("/callback/:provider", authHandler.Callback)
-	engine.POST("/token", authHandler.ExchangeToken)
-	engine.POST("/token/refresh", authHandler.RefreshToken)
+	// Public routes (rate limited)
+	publicLimiter := middleware.RateLimit(10, 20)
+	engine.GET("/.well-known/jwks.json", publicLimiter, authHandler.JWKS)
+	engine.GET("/authorize", publicLimiter, authHandler.Authorize)
+	engine.GET("/callback/:provider", publicLimiter, authHandler.Callback)
+	engine.POST("/token", publicLimiter, authHandler.ExchangeToken)
+	engine.POST("/token/refresh", publicLimiter, authHandler.RefreshToken)
 
 	// User routes (JWT auth required)
 	userGroup := engine.Group("/user")
@@ -43,8 +45,9 @@ func Setup(
 	}
 
 	// App management routes (app_id + app_secret auth required)
+	appLimiter := middleware.RateLimit(30, 60)
 	appGroup := engine.Group("")
-	appGroup.Use(middleware.AppAuth(appRepo))
+	appGroup.Use(middleware.AppAuth(appRepo), appLimiter)
 	{
 		appGroup.POST("/apps", appHandler.CreateApp)
 		appGroup.GET("/apps/:id", appHandler.GetApp)

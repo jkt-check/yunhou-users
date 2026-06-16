@@ -22,7 +22,7 @@ func TestBuildAuthorizeURL(t *testing.T) {
 		GitHubClientSecret: "test-github-client-secret",
 	}
 
-	provider := NewOAuthProvider(cfg)
+	provider := NewOAuthProvider(cfg, nil)
 
 	tests := []struct {
 		name         string
@@ -158,7 +158,7 @@ func TestFetchUser_GitHubWithProfileEmail(t *testing.T) {
 		GitHubClientID:    "test-client-id",
 		GitHubClientSecret: "test-client-secret",
 	}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	transport := &multiTestTransport{
 		routes: map[string]http.Handler{
@@ -228,7 +228,7 @@ func TestFetchUser_GitHubWithEmailEndpoint(t *testing.T) {
 		GitHubClientID:    "test-client-id",
 		GitHubClientSecret: "test-client-secret",
 	}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	transport := &multiTestTransport{
 		routes: map[string]http.Handler{
@@ -258,7 +258,7 @@ func TestFetchUser_UnsupportedProvider(t *testing.T) {
 		GitHubClientID:     "test-client-id",
 		GitHubClientSecret: "test-client-secret",
 	}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	_, err := p.FetchUser(context.Background(), "twitter", "some-code")
 	if err == nil {
@@ -285,7 +285,7 @@ func TestFetchUser_TokenExchangeFailure(t *testing.T) {
 		GitHubClientID:    "test-client-id",
 		GitHubClientSecret: "test-client-secret",
 	}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	transport := &multiTestTransport{
 		routes: map[string]http.Handler{
@@ -328,7 +328,7 @@ func TestFetchUser_InvalidUserResponse(t *testing.T) {
 		GitHubClientID:    "test-client-id",
 		GitHubClientSecret: "test-client-secret",
 	}
-	p := NewOAuthProvider(cfg)
+	p := NewOAuthProvider(cfg, nil)
 
 	transport := &multiTestTransport{
 		routes: map[string]http.Handler{

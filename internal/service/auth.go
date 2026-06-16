@@ -18,16 +18,20 @@ func GenerateUUID() string {
 	return uuid.New().String()
 }
 
-func GenerateRefreshToken() string {
+func GenerateRefreshToken() (string, error) {
 	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate refresh token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
 }
+
+var defaultScope = []string{"app:read", "app:write"}
 
 func parseDuration(s string) time.Duration {
 	d, err := time.ParseDuration(s)
@@ -85,7 +89,6 @@ func (s *AuthService) AuthorizeOrCreate(ctx context.Context, info ProviderUserIn
 	// Check if identity already exists
 	existing, err := s.identityRepo.FindByProviderUID(ctx, info.Provider, info.ProviderUID)
 	if err == nil && existing != nil {
-		// User exists — login
 		return s.createAuthCode(ctx, existing.UserID, app)
 	}
 
@@ -112,7 +115,7 @@ func (s *AuthService) AuthorizeOrCreate(ctx context.Context, info ProviderUserIn
 		userID = user.ID
 	}
 
-	// Create social identity
+	// Create social identity — catch duplicate key (race with concurrent login)
 	identity := &model.SocialIdentity{
 		ID:          GenerateUUID(),
 		UserID:      userID,
@@ -121,21 +124,26 @@ func (s *AuthService) AuthorizeOrCreate(ctx context.Context, info ProviderUserIn
 		Email:       &info.Email,
 	}
 	if err := s.identityRepo.Create(ctx, identity); err != nil {
+		if isDuplicateKey(err) {
+			existing, retryErr := s.identityRepo.FindByProviderUID(ctx, info.Provider, info.ProviderUID)
+			if retryErr == nil && existing != nil {
+				return s.createAuthCode(ctx, existing.UserID, app)
+			}
+		}
 		return "", fmt.Errorf("create identity: %w", err)
 	}
 
 	// Auto-create free subscription if app has free default plan
 	if app.DefaultPlan == "free" {
-		_, err := s.subRepo.FindByUserApp(ctx, userID, appID)
-		if err != nil {
-			sub := &model.Subscription{
-				ID:     GenerateUUID(),
-				UserID: userID,
-				AppID: appID,
-				Plan:   "free",
-				Status: "active",
-			}
-			_ = s.subRepo.Create(ctx, sub)
+		sub := &model.Subscription{
+			ID:     GenerateUUID(),
+			UserID: userID,
+			AppID:  appID,
+			Plan:   "free",
+			Status: "active",
+		}
+		if err := s.subRepo.Create(ctx, sub); err != nil && !isDuplicateKey(err) {
+			return "", fmt.Errorf("auto-create free subscription: %w", err)
 		}
 	}
 
@@ -144,11 +152,15 @@ func (s *AuthService) AuthorizeOrCreate(ctx context.Context, info ProviderUserIn
 
 func (s *AuthService) createAuthCode(ctx context.Context, userID string, app *model.App) (string, error) {
 	// Generate a short-lived authorization code
-	code := GenerateRefreshToken()[:16]
+	raw, err := GenerateRefreshToken()
+	if err != nil {
+		return "", fmt.Errorf("generate code: %w", err)
+	}
+	code := raw[:32]
 
 	// Store as temporary session to be exchanged later
 	// In production, use Redis with TTL; here we store in sessions table with short expiry
-	scope := []string{"app:read"}
+	scope := defaultScope
 	session := &model.Session{
 		ID:           GenerateUUID(),
 		UserID:       userID,
@@ -183,21 +195,37 @@ func (s *AuthService) ExchangeCode(ctx context.Context, code, appID, appSecret s
 		return "", "", fmt.Errorf("code was not issued for this app")
 	}
 
-	// Revoke the auth code session
-	_ = s.sessionRepo.Revoke(ctx, session.ID)
+	// Check active subscription before consuming the auth code
+	sub, err := s.subRepo.FindByUserApp(ctx, session.UserID, session.AppID)
+	if err != nil || sub == nil || sub.Status != "active" {
+		return "", "", fmt.Errorf("subscription not active")
+	}
+
+	// Atomically revoke the auth code session to prevent replay
+	revoked, err := s.sessionRepo.RevokeIfNotRevoked(ctx, session.ID)
+	if err != nil {
+		return "", "", fmt.Errorf("revoke auth code: %w", err)
+	}
+	if !revoked {
+		return "", "", fmt.Errorf("authorization code already used")
+	}
 
 	accessToken, err = s.tokenSvc.SignAccessToken(session.UserID, session.AppID, session.Scope)
 	if err != nil {
 		return "", "", err
 	}
 
-	refreshToken = GenerateRefreshToken()
+	var tokenErr error
+	refreshToken, tokenErr = GenerateRefreshToken()
+	if tokenErr != nil {
+		return "", "", fmt.Errorf("generate refresh token: %w", tokenErr)
+	}
 	newSession := &model.Session{
 		ID:           GenerateUUID(),
 		UserID:       session.UserID,
 		AppID:        session.AppID,
 		RefreshToken: hashToken(refreshToken),
-		Scope:        session.Scope,
+		Scope:        defaultScope,
 		ExpiresAt:    time.Now().Add(parseDuration(s.tokenSvc.RefreshTTL)),
 	}
 	if err := s.sessionRepo.Create(ctx, newSession); err != nil {

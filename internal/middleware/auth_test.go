@@ -26,6 +26,12 @@ func (m *mockSessionRepo) FindByRefreshToken(_ context.Context, _ string) (*mode
 	return nil, nil
 }
 func (m *mockSessionRepo) Revoke(_ context.Context, _ string) error { return nil }
+func (m *mockSessionRepo) RevokeIfNotRevoked(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+func (m *mockSessionRepo) RotateRefresh(_ context.Context, _ string, _ *model.Session) error {
+	return nil
+}
 
 type mockSubRepo struct{}
 
@@ -38,7 +44,7 @@ func (m *mockSubRepo) ListByUserID(_ context.Context, _ string) ([]model.Subscri
 	return nil, nil
 }
 func (m *mockSubRepo) UpdateStatus(_ context.Context, _, _ string) error                   { return nil }
-func (m *mockSubRepo) Renew(_ context.Context, _ string, _ interface{}) error              { return nil }
+func (m *mockSubRepo) Renew(_ context.Context, _ string, _ *time.Time) error              { return nil }
 
 // compile-time interface check
 var (

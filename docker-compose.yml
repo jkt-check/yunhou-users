@@ -1,0 +1,24 @@
+services:
+  app:
+    build: .
+    image: yunhou-users:latest
+    container_name: yunhou-users
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"   # loopback only; Nginx reaches it via 127.0.0.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # resolves to host's docker bridge gateway
+    volumes:
+      - ./keys:/keys:ro         # RSA keys, read-only
+    healthcheck:
+      test: ["CMD", "/server", "-healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

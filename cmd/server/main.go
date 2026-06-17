@@ -54,7 +54,7 @@ func main() {
 	oauth := service.NewOAuthProvider(cfg, appRepo)
 
 	engine := gin.Default()
-	router.Setup(context.Background(), engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, cfg.StateHMACKey)
+	router.Setup(context.Background(), engine, db, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, cfg.StateHMACKey)
 
 	log.Printf("starting server on :%s", cfg.Port)
 	if err := engine.Run(":" + cfg.Port); err != nil {

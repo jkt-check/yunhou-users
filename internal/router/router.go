@@ -13,6 +13,7 @@ import (
 func Setup(
 	ctx context.Context,
 	engine *gin.Engine,
+	healthPinger handler.Pinger,
 	appRepo repo.AppRepo,
 	userRepo repo.UserRepo,
 	identityRepo repo.SocialIdentityRepo,
@@ -24,6 +25,11 @@ func Setup(
 	oauth *service.OAuthProvider,
 	stateHMACKey string,
 ) {
+	// Health check — registered before the public rate limit so monitors
+	// are never throttled.
+	healthHandler := handler.NewHealthHandler(healthPinger)
+	engine.GET("/healthz", healthHandler.Handle)
+
 	authHandler := handler.NewAuthHandler(authSvc, tokenSvc, oauth, stateHMACKey)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo, subRepo)
 	appHandler := handler.NewAppHandler(appRepo, subRepo, subSvc)

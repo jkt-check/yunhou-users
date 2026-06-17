@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,12 @@ func main() {
 
 	if err := db.Ping(); err != nil {
 		log.Fatalf("failed to ping database: %v", err)
+	}
+
+	// Docker HEALTHCHECK calls the binary with `-healthcheck`. We handle it
+	// here, after DB is ready, and exit before the HTTP server starts.
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		runHealthcheck(db)
 	}
 
 	userRepo := repo.NewUserRepo(db)

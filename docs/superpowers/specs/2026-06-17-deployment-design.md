@@ -95,8 +95,9 @@ Stage 1 — `golang:1.25-alpine`:
 
 - `WORKDIR /src`
 - Copy `go.mod`, `go.sum`, run `go mod download`
-- Copy source, `go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server`
-- Run `go test ./...` (fail build on test failure) — this gates image quality
+- Copy source, run `go test -race ./internal/...` (unit tests only — e2e
+  needs a live DB and is run separately, not at image build time)
+- `go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server`
 
 Stage 2 — `gcr.io/distroless/static-debian12:nonroot`:
 
@@ -192,58 +193,72 @@ Run from `/opt/yunhou-users` after `cd`-ing in.
 
 ### 3.6 deploy/nginx.conf (template)
 
+The in-repo template is the **no-domain** form: port 80 proxies directly
+to the app, port 443 block is commented out. When a real domain is added
+(see §9), the operator replaces the 80 block with a 301-to-https block
+and uncomments the 443 block.
+
 ```nginx
-server_tokens off;
+http {
+    server_tokens off;
+    limit_req_zone $binary_remote_addr zone=api:10m rate=30r/s;
 
-# Rate limit at the edge (app has its own IP bucket too)
-limit_req_zone $binary_remote_addr zone=api:10m rate=30r/s;
+    # --- Pre-domain: serve API over plain HTTP on port 80 ---
+    server {
+        listen 80 default_server;
+        server_name _;
 
-# --- HTTP: redirect to HTTPS only when DOMAIN is set, else serve directly ---
-server {
-    listen 80 default_server;
-    server_name _;
-
-    # ACME http-01 challenge passthrough (Certbot)
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
+        location / {
+            limit_req zone=api burst=60 nodelay;
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 30s;
+        }
     }
 
-    location / {
-        # If DOMAIN env is set on the host, redirect to https; else proxy directly
-        if ($http_x_no_redirect = "1") { return 200 "ok\n"; }
-        return 301 https://$host$request_uri;
-    }
-}
-
-# --- HTTPS: only meaningful once a real domain + cert exist ---
-server {
-    listen 443 ssl http2;
-    server_name api.yh.com;          # placeholder, replaced by sed at deploy
-
-    ssl_certificate     /etc/letsencrypt/live/api.yh.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/api.yh.com/privkey.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-Frame-Options        "DENY"   always;
-    add_header Referrer-Policy        "no-referrer" always;
-
-    location / {
-        limit_req zone=api burst=60 nodelay;
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 30s;
-    }
+    # --- Post-domain: enable by uncommenting and setting server_name ---
+    # server {
+    #     listen 443 ssl http2;
+    #     server_name api.yh.com;
+    #
+    #     ssl_certificate     /etc/letsencrypt/live/api.yh.com/fullchain.pem;
+    #     ssl_certificate_key /etc/letsencrypt/live/api.yh.com/privkey.pem;
+    #     ssl_protocols       TLSv1.2 TLSv1.3;
+    #
+    #     add_header X-Content-Type-Options "nosniff" always;
+    #     add_header X-Frame-Options        "DENY"   always;
+    #     add_header Referrer-Policy        "no-referrer" always;
+    #
+    #     location / {
+    #         limit_req zone=api burst=60 nodelay;
+    #         proxy_pass http://127.0.0.1:8080;
+    #         proxy_set_header Host              $host;
+    #         proxy_set_header X-Real-IP         $remote_addr;
+    #         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    #         proxy_set_header X-Forwarded-Proto $scheme;
+    #         proxy_read_timeout 30s;
+    #     }
+    # }
 }
 ```
 
-The 443 server block is **commented out** in the in-repo template. It is
-uncommented (and `server_name` / cert paths templated) by the operator on
-the host after a real domain is pointed at the VPS. Until then, port 80
-serves the API directly — fine for staging and pre-launch.
+When the domain upgrade (§9) is performed, the 80 server block is replaced
+with the standard "challenge passthrough + 301 redirect" form:
+
+```nginx
+server {
+    listen 80;
+    server_name api.yh.com;
+
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://$host$request_uri; }
+}
+```
+
+…and the 443 block above is uncommented with the real `server_name`.
 
 ### 3.7 ops/backup.sh
 
@@ -339,7 +354,7 @@ curl -fsS http://127.0.0.1:8080/.well-known/jwks.json | jq .
 curl -fsS -I http://<VPS-IP>/              # 80 reachable
 curl -fsS -I https://api.yh.com/healthz    # (after domain) 200
 PGPASSWORD=... psql -h 127.0.0.1 -U yunhou -d yunhou_users -c '\dt'
-DATABASE_URL=... make e2e                  # full suite green
+E2E_DATABASE_URL=postgres://yunhou:...@127.0.0.1:5432/yunhou_users_e2e?sslmode=disable make e2e
 bash ops/backup.sh && ls /var/backups/yunhou-users/   # db-*.sql.gz present
 sudo certbot renew --dry-run               # (after domain) success
 ```
@@ -454,9 +469,11 @@ chmod 600 keys/private.pem
 cp .env.example .env && $EDITOR .env
 
 # --- DB role + database (one-time, as postgres superuser) ---
+# Note: replace '<strong-password>' below with a unique strong password,
+# and put the same value into .env as DATABASE_URL.
 sudo -u postgres psql <<'SQL'
 CREATE DATABASE yunhou_users;
-CREATE USER yunhou WITH PASSWORD '<strong>';
+CREATE USER yunhou WITH PASSWORD '<strong-password>';
 GRANT CONNECT ON DATABASE yunhou_users TO yunhou;
 \c yunhou_users
 GRANT USAGE ON SCHEMA public TO yunhou;

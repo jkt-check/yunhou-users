@@ -22,7 +22,7 @@ INSERT INTO plans (id, name, price, interval_days, apps, is_default) VALUES
     ('quarterly','按季订阅', 79.9,  90,  ARRAY['yundian', 'yundash'],       false),
     ('yearly',   '按年订阅', 299,   365, ARRAY['yundian', 'yundash'],       false);
 
--- 2. 修改 subscriptions 表（先删外键，因为它们依赖 apps_pkey）
+-- 2. 修改 subscriptions 表（先删外键和索引，因为它们依赖 apps_pkey）
 -- 删除旧外键
 ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_app_id_fkey;
 ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_app_id_fkey;
@@ -34,9 +34,6 @@ DROP INDEX IF EXISTS idx_sessions_app_id;
 -- 添加新列
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_id TEXT;
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT now();
-
--- 添加新 app_id 列到 sessions
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS app_id TEXT;
 
 -- 迁移数据：plan -> plan_id, 设置 started_at
 UPDATE subscriptions SET plan_id = plan, started_at = created_at;
@@ -84,14 +81,11 @@ ALTER TABLE apps DROP COLUMN IF EXISTS providers;
 ALTER TABLE apps DROP COLUMN IF EXISTS default_plan;
 
 -- 4. 修改 sessions 表
--- 迁移数据
-UPDATE sessions SET app_id = app_id::TEXT;
-
--- 删除旧 app_id 列（UUID 类型）
-ALTER TABLE sessions DROP COLUMN IF EXISTS app_id;
-
--- 确保新 app_id 列是 TEXT 类型
-ALTER TABLE sessions ALTER COLUMN app_id TYPE TEXT USING app_id::TEXT;
+-- 重命名旧列并添加新列（避免类型冲突）
+ALTER TABLE sessions RENAME COLUMN app_id TO app_id_old;
+ALTER TABLE sessions ADD COLUMN app_id TEXT;
+UPDATE sessions SET app_id = app_id_old::TEXT;
+ALTER TABLE sessions DROP COLUMN app_id_old;
 
 -- 重建索引
 CREATE INDEX idx_sessions_user_id ON sessions(user_id);

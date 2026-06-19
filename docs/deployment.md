@@ -61,7 +61,7 @@ on the host terminate TLS.
 6. **Apply migrations**
 
    ```bash
-   psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/001_init.sql
+   psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
    ```
 
 7. **Install Nginx config**
@@ -173,7 +173,7 @@ gunzip -c /var/backups/yunhou-users/db-20260617T030000Z.sql.gz \
 | Symptom | First check |
 |---|---|
 | 502 from Nginx | `docker compose ps` — container not running? `docker compose logs --tail=200 app` |
-| `/healthz` 503 | Postgres down. `psql "$(grep ^DATABASE_URL /opt/younhou-users/.env \| cut -d= -f2-)" -c 'select 1'` |
+| `/healthz` 503 | Postgres down. `psql "$(grep ^DATABASE_URL /opt/yunhou-users/.env | cut -d= -f2-)" -c 'select 1'` |
 | Cert expired | `sudo certbot certificates` then `sudo certbot renew --dry-run` |
 | Disk full | `df -h` and `du -sh /var/lib/docker /var/backups/yunhou-users /var/log` |
 | OAuth callback fails | Check `GITHUB_CALLBACK_URL` matches the registered GitHub OAuth app callback |

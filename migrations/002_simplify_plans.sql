@@ -30,6 +30,7 @@ ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_app_id_fkey;
 -- 删除旧索引
 DROP INDEX IF EXISTS idx_subscriptions_app_id;
 DROP INDEX IF EXISTS idx_sessions_app_id;
+DROP INDEX IF EXISTS idx_sessions_user_id;
 
 -- 添加新列
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_id TEXT;

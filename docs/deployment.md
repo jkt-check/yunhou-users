@@ -49,6 +49,7 @@ on the host terminate TLS.
    GRANT CONNECT ON DATABASE yunhou_users TO yunhou;
    \c yunhou_users
    GRANT USAGE ON SCHEMA public TO yunhou;
+   GRANT CREATE ON SCHEMA public TO yunhou;
    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO yunhou;
    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO yunhou;
    ALTER DEFAULT PRIVILEGES IN SCHEMA public

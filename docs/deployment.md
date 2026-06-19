@@ -57,7 +57,8 @@ on the host terminate TLS.
 6. **Apply migrations**
 
    ```bash
-   psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
+   # Run as postgres superuser (migration modifies tables that may be owned by postgres)
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
    ```
 
 7. **Install Nginx config**
@@ -128,8 +129,9 @@ sudo systemctl status nginx
 ### Restore from backup
 
 ```bash
+# Run as postgres superuser to ensure proper ownership
 gunzip -c /var/backups/yunhou-users/db-20260617T030000Z.sql.gz \
-  | psql "$(grep ^DATABASE_URL /opt/yunhou-users/.env | cut -d= -f2-)"
+  | sudo -u postgres psql "$(grep ^DATABASE_URL /opt/yunhou-users/.env | cut -d= -f2-)"
 ```
 
 ## Domain upgrade (later)

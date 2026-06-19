@@ -43,20 +43,15 @@ on the host terminate TLS.
 5. **Create the Postgres role and database** (one-time, as `postgres` superuser)
 
    ```bash
-   sudo -u postgres psql <<'SQL'
-   CREATE DATABASE yunhou_users;
-   CREATE USER yunhou WITH PASSWORD '<strong-password>';
-   GRANT CONNECT ON DATABASE yunhou_users TO yunhou;
-   \c yunhou_users
-   GRANT USAGE ON SCHEMA public TO yunhou;
-   GRANT CREATE ON SCHEMA public TO yunhou;
-   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO yunhou;
-   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO yunhou;
-   ALTER DEFAULT PRIVILEGES IN SCHEMA public
-     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yunhou;
-   ALTER DEFAULT PRIVILEGES IN SCHEMA public
-     GRANT USAGE, SELECT ON SEQUENCES TO yunhou;
-   SQL
+   sudo -u postgres psql -c "CREATE DATABASE yunhou_users"
+   sudo -u postgres psql -c "CREATE USER yunhou WITH PASSWORD '<strong-password>'"
+   sudo -u postgres psql -c "GRANT CONNECT ON DATABASE yunhou_users TO yunhou"
+   sudo -u postgres psql -d yunhou_users -c "GRANT USAGE ON SCHEMA public TO yunhou"
+   sudo -u postgres psql -d yunhou_users -c "GRANT CREATE ON SCHEMA public TO yunhou"
+   sudo -u postgres psql -d yunhou_users -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO yunhou"
+   sudo -u postgres psql -d yunhou_users -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO yunhou"
+   sudo -u postgres psql -d yunhou_users -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yunhou"
+   sudo -u postgres psql -d yunhou_users -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO yunhou"
    ```
 
 6. **Apply migrations**

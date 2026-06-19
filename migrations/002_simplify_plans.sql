@@ -88,7 +88,7 @@ UPDATE sessions SET app_id = app_id_old::TEXT;
 ALTER TABLE sessions DROP COLUMN app_id_old;
 
 -- 重建索引
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
-CREATE INDEX idx_sessions_app_id ON sessions(app_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_app_id ON sessions(app_id);
 
 COMMIT;

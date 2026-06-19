@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"strings"
@@ -8,16 +9,30 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/middleware"
-	"github.com/yunhou/users/internal/repo"
+	"github.com/yunhou/users/internal/model"
 )
 
-type UserHandler struct {
-	userRepo    repo.UserRepo
-	identityRepo repo.SocialIdentityRepo
-	subRepo     repo.SubscriptionRepo
+type UserRepoInterface interface {
+	FindByID(ctx context.Context, id string) (*model.User, error)
+	Update(ctx context.Context, u *model.User) error
 }
 
-func NewUserHandler(userRepo repo.UserRepo, identityRepo repo.SocialIdentityRepo, subRepo repo.SubscriptionRepo) *UserHandler {
+type IdentityRepoInterface interface {
+	ListByUserID(ctx context.Context, userID string) ([]model.SocialIdentity, error)
+	DeleteIfNotLast(ctx context.Context, id, userID string) (bool, error)
+}
+
+type SubscriptionRepoInterface interface {
+	ListByUserID(ctx context.Context, userID string) ([]model.Subscription, error)
+}
+
+type UserHandler struct {
+	userRepo     UserRepoInterface
+	identityRepo IdentityRepoInterface
+	subRepo      SubscriptionRepoInterface
+}
+
+func NewUserHandler(userRepo UserRepoInterface, identityRepo IdentityRepoInterface, subRepo SubscriptionRepoInterface) *UserHandler {
 	return &UserHandler{userRepo: userRepo, identityRepo: identityRepo, subRepo: subRepo}
 }
 

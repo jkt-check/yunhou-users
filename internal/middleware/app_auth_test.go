@@ -2,217 +2,123 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/model"
-	"github.com/yunhou/users/internal/repo"
-	"github.com/yunhou/users/internal/util"
 )
 
-// ---------- mock AppRepo ----------
-
-type mockAppRepo struct {
-	findFn func(ctx context.Context, id string) (*model.App, error)
+type mockAppRepoForMiddleware struct {
+	app  *model.App
+	err  error
 }
 
-func (m *mockAppRepo) Create(_ context.Context, _ *model.App) error { return nil }
-func (m *mockAppRepo) Update(_ context.Context, _ *model.App) error { return nil }
-func (m *mockAppRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
-	if m.findFn != nil {
-		return m.findFn(ctx, id)
+func (m *mockAppRepoForMiddleware) List(ctx context.Context) ([]model.App, error) {
+	if m.app != nil {
+		return []model.App{*m.app}, nil
 	}
-	return nil, errors.New("not found")
+	return []model.App{}, nil
 }
 
-// compile-time check
-var _ repo.AppRepo = (*mockAppRepo)(nil)
+func (m *mockAppRepoForMiddleware) FindByID(ctx context.Context, id string) (*model.App, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.app, nil
+}
 
-// ---------- tests ----------
+func (m *mockAppRepoForMiddleware) Create(ctx context.Context, a *model.App) error {
+	return nil
+}
 
-func TestAppAuth(t *testing.T) {
+func (m *mockAppRepoForMiddleware) Update(ctx context.Context, a *model.App) error {
+	return nil
+}
+
+func TestInternalAppAuth(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Pre-hash a known secret so we can use it in test cases.
-	secret := "test-secret-123"
-	hashed, err := util.HashSecret(secret)
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
+	t.Run("missing X-App-ID header", func(t *testing.T) {
+		appRepo := &mockAppRepoForMiddleware{}
+		handler := InternalAppAuth(appRepo)
 
-	tests := []struct {
-		name       string
-		method     string
-		headers    map[string]string
-		form       map[string]string
-		findFn     func(ctx context.Context, id string) (*model.App, error)
-		wantStatus int
-		wantCode   float64
-		wantMsg    string
-	}{
-		{
-			name:       "missing app_id and app_secret in headers and form",
-			method:     http.MethodGet,
-			headers:    map[string]string{},
-			findFn:     nil,
-			wantStatus: http.StatusUnauthorized,
-			wantCode:   401,
-			wantMsg:    "missing app_id or app_secret",
-		},
-		{
-			name:   "missing app_id only in headers",
-			method: http.MethodGet,
-			headers: map[string]string{
-				"X-App-Secret": secret,
-			},
-			findFn:     nil,
-			wantStatus: http.StatusUnauthorized,
-			wantCode:   401,
-			wantMsg:    "missing app_id or app_secret",
-		},
-		{
-			name:   "missing app_secret only in headers",
-			method: http.MethodGet,
-			headers: map[string]string{
-				"X-App-ID": "app-1",
-			},
-			findFn:     nil,
-			wantStatus: http.StatusUnauthorized,
-			wantCode:   401,
-			wantMsg:    "missing app_id or app_secret",
-		},
-		{
-			name:       "valid headers but invalid app_id",
-			method:     http.MethodGet,
-			headers:    map[string]string{"X-App-ID": "bad-app", "X-App-Secret": secret},
-			findFn:     func(_ context.Context, id string) (*model.App, error) { return nil, errors.New("not found") },
-			wantStatus: http.StatusUnauthorized,
-			wantCode:   401,
-			wantMsg:    "invalid app credentials",
-		},
-		{
-			name:       "valid app_id but invalid app_secret",
-			method:     http.MethodGet,
-			headers:    map[string]string{"X-App-ID": "app-1", "X-App-Secret": "wrong-secret"},
-			findFn:     func(_ context.Context, id string) (*model.App, error) { return &model.App{ID: id, Secret: hashed}, nil },
-			wantStatus: http.StatusUnauthorized,
-			wantCode:   401,
-			wantMsg:    "invalid app credentials",
-		},
-		{
-			name:       "valid headers with correct app_id and app_secret",
-			method:     http.MethodGet,
-			headers:    map[string]string{"X-App-ID": "app-1", "X-App-Secret": secret},
-			findFn:     func(_ context.Context, id string) (*model.App, error) { return &model.App{ID: id, Secret: hashed}, nil },
-			wantStatus: http.StatusOK,
-			wantCode:   0,
-			wantMsg:    "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			repo := &mockAppRepo{findFn: tt.findFn}
-
-			r := gin.New()
-			r.Use(AppAuth(repo))
-			r.Any("/", func(c *gin.Context) {
-				app, exists := c.Get("app")
-				if !exists {
-					c.Status(http.StatusInternalServerError)
-					return
-				}
-				c.JSON(http.StatusOK, gin.H{"app_id": app.(*model.App).ID})
-			})
-
-			var req *http.Request
-			if tt.method == http.MethodPost && len(tt.form) > 0 {
-				form := url.Values{}
-				for k, v := range tt.form {
-					form.Set(k, v)
-				}
-				req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(form.Encode()))
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			} else {
-				req = httptest.NewRequest(tt.method, "/", nil)
-			}
-
-			for k, v := range tt.headers {
-				req.Header.Set(k, v)
-			}
-
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-
-			if w.Code != tt.wantStatus {
-				t.Fatalf("status: got %d, want %d; body: %s", w.Code, tt.wantStatus, w.Body.String())
-			}
-
-			if tt.wantMsg != "" {
-				var body map[string]interface{}
-				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-					t.Fatalf("unmarshal: %v", err)
-				}
-				if body["code"] != tt.wantCode {
-					t.Errorf("code: got %v, want %v", body["code"], tt.wantCode)
-				}
-				if body["message"] != tt.wantMsg {
-					t.Errorf("message: got %v, want %v", body["message"], tt.wantMsg)
-				}
-			}
+		router := gin.New()
+		router.Use(handler)
+		router.GET("/test", func(c *gin.Context) {
+			c.Status(http.StatusOK)
 		})
-	}
-}
 
-func TestAppAuth_ContextSetsApp(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	t.Parallel()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
 
-	secret := "ctx-secret"
-	hashed, err := util.HashSecret(secret)
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
-
-	repo := &mockAppRepo{
-		findFn: func(_ context.Context, id string) (*model.App, error) {
-			return &model.App{ID: id, Secret: hashed, Name: "TestApp"}, nil
-		},
-	}
-
-	var gotApp *model.App
-	r := gin.New()
-	r.Use(AppAuth(repo))
-	r.GET("/", func(c *gin.Context) {
-		val, _ := c.Get("app")
-		gotApp = val.(*model.App)
-		c.Status(http.StatusOK)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", w.Code)
+		}
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-App-ID", "app-ctx")
-	req.Header.Set("X-App-Secret", secret)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
+	t.Run("invalid app_id", func(t *testing.T) {
+		appRepo := &mockAppRepoForMiddleware{err: errors.New("not found")}
+		handler := InternalAppAuth(appRepo)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status: got %d, want %d", w.Code, http.StatusOK)
-	}
-	if gotApp == nil {
-		t.Fatal("app in context is nil")
-	}
-	if gotApp.ID != "app-ctx" {
-		t.Errorf("app.ID: got %q, want %q", gotApp.ID, "app-ctx")
-	}
-	if gotApp.Name != "TestApp" {
-		t.Errorf("app.Name: got %q, want %q", gotApp.Name, "TestApp")
-	}
+		router := gin.New()
+		router.Use(handler)
+		router.GET("/test", func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("X-App-ID", "invalid-app")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", w.Code)
+		}
+	})
+
+	t.Run("app is inactive", func(t *testing.T) {
+		app := &model.App{AppID: "test-app", Name: "Test", IsActive: false}
+		appRepo := &mockAppRepoForMiddleware{app: app}
+		handler := InternalAppAuth(appRepo)
+
+		router := gin.New()
+		router.Use(handler)
+		router.GET("/test", func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("X-App-ID", "test-app")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Errorf("expected 403, got %d", w.Code)
+		}
+	})
+
+	t.Run("valid active app", func(t *testing.T) {
+		app := &model.App{AppID: "test-app", Name: "Test", IsActive: true}
+		appRepo := &mockAppRepoForMiddleware{app: app}
+		handler := InternalAppAuth(appRepo)
+
+		router := gin.New()
+		router.Use(handler)
+		router.GET("/test", func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("X-App-ID", "test-app")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
 }

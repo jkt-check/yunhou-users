@@ -1,13 +1,13 @@
 # Yunhou Users
 
-A shared user management API for multi-app ecosystems. One user identity across all consumer applications, with per-app subscriptions and scopes.
+A shared user management API for multi-app ecosystems. One user identity across all consumer applications, with plan-based subscriptions.
 
 ## Features
 
-- **Social OAuth only** — GitHub (implemented), Google and WeChat (planned)
-- **OAuth 2.0 Authorization Code flow** with HMAC-signed state parameter
+- **Social OAuth only** — GitHub, Google (provider token sent directly)
+- **Plan-based access** — Plans define which apps a user can access
 - **RSA256 JWT** access tokens with JWKS public key endpoint
-- **Subscription gating** — tokens only issued for active subscriptions
+- **Subscription gating** — tokens only issued for active subscriptions based on plan
 - **Refresh token rotation** — one-time-use refresh tokens
 - **Rate limiting** — per-IP token bucket (10/s burst 20 on public, 30/s burst 60 on app management)
 
@@ -16,18 +16,18 @@ A shared user management API for multi-app ecosystems. One user identity across 
 ```bash
 # 1. Set up PostgreSQL
 createdb yunhou_users
-psql -d yunhou_users -f migrations/001_init.sql
+psql -d yunhou_users -f migrations/002_simplify_plans.sql
 
 # 2. Generate RSA keys
 make generate-keys
 
-# 3. Set required env vars
-export STATE_HMAC_KEY="your-random-secret-at-least-32-chars"
-export GITHUB_CLIENT_ID="your-github-client-id"
-export GITHUB_CLIENT_SECRET="your-github-client-secret"
-
-# 4. Run
+# 3. Run
 make run
+
+# 4. Login (example with GitHub token)
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"github","provider_token":"your-github-token","app_id":"yundian"}'
 ```
 
 ## Configuration
@@ -36,18 +36,12 @@ All configuration is via environment variables (or `.env` file):
 
 | Variable | Required | Default |
 |---|---|---|
-| `STATE_HMAC_KEY` | **Yes** | — |
-| `GITHUB_CLIENT_ID` | Yes* | — |
-| `GITHUB_CLIENT_SECRET` | Yes* | — |
-| `GITHUB_CALLBACK_URL` | No | `http://localhost:{PORT}/callback/github` |
 | `DATABASE_URL` | No | `postgres://localhost/yunhou_users?sslmode=disable` |
 | `PORT` | No | `8080` |
 | `RSA_PRIVATE_KEY_PATH` | No | `keys/private.pem` |
 | `RSA_PUBLIC_KEY_PATH` | No | `keys/public.pem` |
 | `JWT_ACCESS_TTL` | No | `15m` |
 | `JWT_REFRESH_TTL` | No | `168h` |
-
-*Required when using GitHub as an OAuth provider.
 
 ## API Overview
 
@@ -56,10 +50,9 @@ All configuration is via environment variables (or `.env` file):
 | Method | Path | Description |
 |---|---|---|
 | GET | `/.well-known/jwks.json` | RSA public key (JWK format) |
-| GET | `/authorize` | Start OAuth flow (redirects to provider) |
-| GET | `/callback/:provider` | OAuth callback (redirects to consumer app with auth code) |
-| POST | `/token` | Exchange auth code for access + refresh tokens |
-| POST | `/token/refresh` | Refresh tokens (requires app credentials) |
+| POST | `/auth/login` | Login with provider token |
+| POST | `/auth/refresh` | Refresh tokens |
+| POST | `/auth/logout` | Logout (revoke refresh token) |
 
 ### User Endpoints (JWT Bearer)
 
@@ -69,37 +62,38 @@ All configuration is via environment variables (or `.env` file):
 | PATCH | `/user/profile` | Update profile fields |
 | GET | `/user/identities` | List linked social identities |
 | DELETE | `/user/identities/:id` | Unbind a social identity |
-| GET | `/user/apps` | List subscribed apps |
+| GET | `/user/subscriptions` | List user's subscriptions |
+| POST | `/user/subscriptions` | Create subscription |
+| DELETE | `/user/subscriptions/:id` | Cancel subscription |
 
-### App Management Endpoints (App Credentials)
+### App/Plan Management Endpoints (Internal Auth)
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/apps` | Register a new application |
+| GET | `/apps` | List all apps |
 | GET | `/apps/:id` | Get app details |
-| PATCH | `/apps/:id` | Update app settings |
-| POST | `/subscriptions` | Create subscription |
-| GET | `/subscriptions/:id` | Get subscription details |
-| DELETE | `/subscriptions/:id` | Cancel subscription |
+| GET | `/admin/plans` | List all plans |
+| GET | `/admin/plans/:id` | Get plan details |
+| POST | `/admin/plans` | Create plan |
+| PATCH | `/admin/plans/:id` | Update plan |
+| DELETE | `/admin/plans/:id` | Delete plan |
+| POST | `/admin/apps` | Create app |
+| PATCH | `/admin/apps/:id` | Update app |
 
-App management endpoints require `X-App-ID` and `X-App-Secret` headers. Public and user endpoints do not.
+App management endpoints require `X-App-ID` header. Public and user endpoints do not.
 
 ## Authentication Flow
 
 ```
 Consumer App        Yunhou Users API        OAuth Provider
     |                      |                      |
-    |-- GET /authorize --->|                      |
-    |                      |-- redirect ---------->|
-    |                      |                      |-- user consents
-    |                      |<-- callback ----------|
-    |<-- redirect + code --|                      |
-    |-- POST /token ------>|                      |
-    |                      |-- exchange code ------>|
-    |                      |<-- provider token ----|
-    |                      |-- fetch user info ---->|
-    |                      |<-- user profile -------|
+    |-- POST /auth/login -->|                      |
+    |  {provider_token}     |-- verify token ------>|
+    |                      |<-- user info ---------|
     |<-- JWT + refresh ----|                      |
+    |                      |                      |
+    |-- POST /auth/refresh->|                      |
+    |<-- new JWT + refresh-| (with token rotation) |
 ```
 
 ## Development
@@ -114,7 +108,12 @@ make deps           # Tidy dependencies
 
 Run a single test:
 ```bash
-go test -race -run TestExchangeCode ./internal/service/
+go test -race -run TestAuthService_Login ./internal/service/
+```
+
+Database migration:
+```bash
+psql -d yunhou_users -f migrations/002_simplify_plans.sql
 ```
 
 ## Tech Stack
@@ -122,5 +121,4 @@ go test -race -run TestExchangeCode ./internal/service/
 - Go 1.25 + Gin
 - PostgreSQL + sqlx (no ORM)
 - RSA256 JWT + JWKS
-- bcrypt app secret hashing
 - SHA-256 token hashing

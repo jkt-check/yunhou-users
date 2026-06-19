@@ -21,10 +21,6 @@ func main() {
 
 	cfg := config.Load()
 
-	if cfg.StateHMACKey == "" {
-		log.Fatal("STATE_HMAC_KEY environment variable is required")
-	}
-
 	db, err := sqlx.Connect("postgres", cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("failed to connect to database: %v", err)
@@ -45,23 +41,28 @@ func main() {
 		runHealthcheck(db)
 	}
 
+	// Repos
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
+	planRepo := repo.NewPlanRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
 
+	// Services
 	tokenSvc, err := service.NewTokenService(cfg, sessionRepo, subRepo)
 	if err != nil {
 		log.Fatalf("failed to initialize token service: %v", err)
 	}
 
-	authSvc := service.NewAuthService(userRepo, identityRepo, appRepo, subRepo, sessionRepo, tokenSvc)
-	subSvc := service.NewSubscriptionService(subRepo)
-	oauth := service.NewOAuthProvider(cfg, appRepo)
+	planSvc := service.NewPlanService(planRepo)
+	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, tokenSvc)
+	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
 	engine := gin.Default()
-	router.Setup(context.Background(), engine, db, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, cfg.StateHMACKey)
+	router.Setup(context.Background(), engine, db,
+		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		tokenSvc, authSvc, subSvc, planSvc)
 
 	log.Printf("starting server on :%s", cfg.Port)
 	if err := engine.Run(":" + cfg.Port); err != nil {

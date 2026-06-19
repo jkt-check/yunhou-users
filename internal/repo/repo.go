@@ -25,15 +25,25 @@ type SocialIdentityRepo interface {
 	DeleteIfNotLast(ctx context.Context, id, userID string) (bool, error)
 }
 
+type PlanRepo interface {
+	FindAll(ctx context.Context) ([]model.Plan, error)
+	FindByID(ctx context.Context, id string) (*model.Plan, error)
+	FindDefault(ctx context.Context) (*model.Plan, error)
+	Create(ctx context.Context, p *model.Plan) error
+	Update(ctx context.Context, p *model.Plan) error
+	Delete(ctx context.Context, id string) error
+}
+
 type AppRepo interface {
 	Create(ctx context.Context, a *model.App) error
 	FindByID(ctx context.Context, id string) (*model.App, error)
 	Update(ctx context.Context, a *model.App) error
+	List(ctx context.Context) ([]model.App, error)
 }
 
 type SubscriptionRepo interface {
 	Create(ctx context.Context, s *model.Subscription) error
-	FindByUserApp(ctx context.Context, userID, appID string) (*model.Subscription, error)
+	FindActiveByUserID(ctx context.Context, userID string) (*model.Subscription, error)
 	FindByID(ctx context.Context, id string) (*model.Subscription, error)
 	ListByUserID(ctx context.Context, userID string) ([]model.Subscription, error)
 	UpdateStatus(ctx context.Context, id, status string) error
@@ -53,23 +63,26 @@ type SessionRepo interface {
 
 type userRepo struct{ db *sqlx.DB }
 type socialIdentityRepo struct{ db *sqlx.DB }
+type planRepo struct{ db *sqlx.DB }
 type appRepo struct{ db *sqlx.DB }
 type subscriptionRepo struct{ db *sqlx.DB }
 type sessionRepo struct{ db *sqlx.DB }
 
 var (
-	_ UserRepo            = (*userRepo)(nil)
-	_ SocialIdentityRepo  = (*socialIdentityRepo)(nil)
-	_ AppRepo             = (*appRepo)(nil)
-	_ SubscriptionRepo    = (*subscriptionRepo)(nil)
-	_ SessionRepo         = (*sessionRepo)(nil)
+	_ UserRepo           = (*userRepo)(nil)
+	_ SocialIdentityRepo = (*socialIdentityRepo)(nil)
+	_ PlanRepo           = (*planRepo)(nil)
+	_ AppRepo            = (*appRepo)(nil)
+	_ SubscriptionRepo   = (*subscriptionRepo)(nil)
+	_ SessionRepo        = (*sessionRepo)(nil)
 )
 
-func NewUserRepo(db *sqlx.DB) *userRepo             { return &userRepo{db: db} }
+func NewUserRepo(db *sqlx.DB) *userRepo                { return &userRepo{db: db} }
 func NewSocialIdentityRepo(db *sqlx.DB) *socialIdentityRepo { return &socialIdentityRepo{db: db} }
-func NewAppRepo(db *sqlx.DB) *appRepo               { return &appRepo{db: db} }
+func NewPlanRepo(db *sqlx.DB) *planRepo                { return &planRepo{db: db} }
+func NewAppRepo(db *sqlx.DB) *appRepo                  { return &appRepo{db: db} }
 func NewSubscriptionRepo(db *sqlx.DB) *subscriptionRepo { return &subscriptionRepo{db: db} }
-func NewSessionRepo(db *sqlx.DB) *sessionRepo        { return &sessionRepo{db: db} }
+func NewSessionRepo(db *sqlx.DB) *sessionRepo           { return &sessionRepo{db: db} }
 
 // UserRepo implementation
 
@@ -163,19 +176,67 @@ func (r *socialIdentityRepo) DeleteIfNotLast(ctx context.Context, id, userID str
 	return n > 0, nil
 }
 
+// PlanRepo implementation
+
+func (r *planRepo) FindAll(ctx context.Context) ([]model.Plan, error) {
+	var list []model.Plan
+	err := r.db.SelectContext(ctx, &list, `SELECT * FROM plans ORDER BY created_at`)
+	return list, err
+}
+
+func (r *planRepo) FindByID(ctx context.Context, id string) (*model.Plan, error) {
+	var p model.Plan
+	err := r.db.GetContext(ctx, &p, `SELECT * FROM plans WHERE id = $1`, id)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (r *planRepo) FindDefault(ctx context.Context) (*model.Plan, error) {
+	var p model.Plan
+	err := r.db.GetContext(ctx, &p, `SELECT * FROM plans WHERE is_default = true LIMIT 1`)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (r *planRepo) Create(ctx context.Context, p *model.Plan) error {
+	_, err := r.db.NamedExecContext(ctx, `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active, is_default)
+		VALUES (:id, :name, :price, :interval_days, :apps, :is_active, :is_default)
+	`, p)
+	return err
+}
+
+func (r *planRepo) Update(ctx context.Context, p *model.Plan) error {
+	_, err := r.db.NamedExecContext(ctx, `
+		UPDATE plans SET name = :name, price = :price, interval_days = :interval_days,
+		apps = :apps, is_active = :is_active, is_default = :is_default
+		WHERE id = :id
+	`, p)
+	return err
+}
+
+func (r *planRepo) Delete(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM plans WHERE id = $1`, id)
+	return err
+}
+
 // AppRepo implementation
 
 func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO apps (id, secret, name, redirect_uris, providers, default_plan)
-		VALUES (:id, :secret, :name, :redirect_uris, :providers, :default_plan)
+		INSERT INTO apps (app_id, name, description, config, is_active)
+		VALUES (:app_id, :name, :description, :config, :is_active)
 	`, a)
 	return err
 }
 
 func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
 	var a model.App
-	err := r.db.GetContext(ctx, &a, `SELECT * FROM apps WHERE id = $1`, id)
+	err := r.db.GetContext(ctx, &a, `SELECT * FROM apps WHERE app_id = $1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -184,28 +245,33 @@ func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
 
 func (r *appRepo) Update(ctx context.Context, a *model.App) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		UPDATE apps SET name = :name, secret = :secret, redirect_uris = :redirect_uris,
-		providers = :providers, default_plan = :default_plan, updated_at = now()
-		WHERE id = :id
+		UPDATE apps SET name = :name, description = :description, config = :config,
+		is_active = :is_active WHERE app_id = :app_id
 	`, a)
 	return err
+}
+
+func (r *appRepo) List(ctx context.Context) ([]model.App, error) {
+	var list []model.App
+	err := r.db.SelectContext(ctx, &list, `SELECT * FROM apps ORDER BY created_at`)
+	return list, err
 }
 
 // SubscriptionRepo implementation
 
 func (r *subscriptionRepo) Create(ctx context.Context, s *model.Subscription) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO subscriptions (id, user_id, app_id, plan, status, expires_at)
-		VALUES (:id, :user_id, :app_id, :plan, :status, :expires_at)
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (:id, :user_id, :plan_id, :status, :started_at, :expires_at)
 	`, s)
 	return err
 }
 
-func (r *subscriptionRepo) FindByUserApp(ctx context.Context, userID, appID string) (*model.Subscription, error) {
+func (r *subscriptionRepo) FindActiveByUserID(ctx context.Context, userID string) (*model.Subscription, error) {
 	var s model.Subscription
 	err := r.db.GetContext(ctx, &s, `
-		SELECT * FROM subscriptions WHERE user_id = $1 AND app_id = $2
-	`, userID, appID)
+		SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'
+	`, userID)
 	if err != nil {
 		return nil, err
 	}

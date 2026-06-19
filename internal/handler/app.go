@@ -1,121 +1,37 @@
 package handler
 
 import (
+	"context"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
-	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/service"
-	"github.com/yunhou/users/internal/util"
 )
 
+type AppRepoInterface interface {
+	List(context.Context) ([]model.App, error)
+	FindByID(context.Context, string) (*model.App, error)
+	Create(context.Context, *model.App) error
+	Update(context.Context, *model.App) error
+}
+
 type AppHandler struct {
-	appRepo repo.AppRepo
-	subRepo repo.SubscriptionRepo
-	subSvc  *service.SubscriptionService
+	appRepo AppRepoInterface
 }
 
-func NewAppHandler(appRepo repo.AppRepo, subRepo repo.SubscriptionRepo, subSvc *service.SubscriptionService) *AppHandler {
-	return &AppHandler{appRepo: appRepo, subRepo: subRepo, subSvc: subSvc}
+func NewAppHandler(appRepo AppRepoInterface) *AppHandler {
+	return &AppHandler{appRepo: appRepo}
 }
 
-func validateRedirectURIs(uris []string) (string, bool) {
-	for _, u := range uris {
-		parsed, err := url.Parse(u)
-		if err != nil || parsed.Fragment != "" {
-			return "redirect_uri must be a valid URL without fragment: " + u, false
-		}
-		if parsed.Scheme != "https" && !isLocalhost(parsed) {
-			return "redirect_uri must use HTTPS (http://localhost allowed for dev): " + u, false
-		}
-	}
-	return "", true
-}
-
-func isLocalhost(u *url.URL) bool {
-	return u.Scheme == "http" && (u.Host == "localhost" || strings.HasPrefix(u.Host, "localhost:") || u.Host == "127.0.0.1" || strings.HasPrefix(u.Host, "127.0.0.1:"))
-}
-
-func (h *AppHandler) CreateApp(c *gin.Context) {
-	var req struct {
-		Name         string   `json:"name" binding:"required"`
-		RedirectURIs []string `json:"redirect_uris" binding:"required"`
-		Providers    []string `json:"providers"`
-		DefaultPlan  string   `json:"default_plan"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
-		return
-	}
-
-	if msg, ok := validateRedirectURIs(req.RedirectURIs); !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
-		return
-	}
-
-	if len(req.Providers) == 0 {
-		req.Providers = []string{"github", "google", "wechat"}
-	}
-	if req.DefaultPlan == "" {
-		req.DefaultPlan = "free"
-	}
-	if req.DefaultPlan != "free" && req.DefaultPlan != "trial" && req.DefaultPlan != "paid" {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "default_plan must be one of: free, trial, paid"})
-		return
-	}
-
-	plainSecret, err := service.GenerateRefreshToken()
+func (h *AppHandler) ListApps(c *gin.Context) {
+	apps, err := h.appRepo.List(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to generate app secret"})
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list apps"})
 		return
 	}
-	plainSecret = plainSecret[:24]
-	hashedSecret, err := util.HashSecret(plainSecret)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to generate app secret"})
-		return
-	}
-
-	app := &model.App{
-		ID:           service.GenerateUUID(),
-		Secret:       hashedSecret,
-		Name:         req.Name,
-		RedirectURIs: req.RedirectURIs,
-		Providers:    req.Providers,
-		DefaultPlan:  req.DefaultPlan,
-	}
-	if err := h.appRepo.Create(c.Request.Context(), app); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create app"})
-		return
-	}
-
-	c.JSON(http.StatusCreated, gin.H{
-		"code": 0,
-		"data": gin.H{
-			"app_id":     app.ID,
-			"app_secret": plainSecret,
-			"name":       app.Name,
-		},
-	})
-}
-
-func getAuthedApp(c *gin.Context) (*model.App, bool) {
-	authedApp, exists := c.Get(middleware.ContextApp)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "app authentication required"})
-		return nil, false
-	}
-	app, ok := authedApp.(*model.App)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "invalid app context"})
-		return nil, false
-	}
-	return app, true
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": apps})
 }
 
 func (h *AppHandler) GetApp(c *gin.Context) {
@@ -125,15 +41,32 @@ func (h *AppHandler) GetApp(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
 		return
 	}
-	authed, ok := getAuthedApp(c)
-	if !ok {
-		return
-	}
-	if authed.ID != app.ID {
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to access this app"})
-		return
-	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
+}
+
+func (h *AppHandler) CreateApp(c *gin.Context) {
+	var req struct {
+		AppID       string `json:"app_id" binding:"required"`
+		Name        string `json:"name" binding:"required"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	app := &model.App{
+		AppID:       req.AppID,
+		Name:        req.Name,
+		Description: req.Description,
+		IsActive:    true,
+	}
+	if err := h.appRepo.Create(c.Request.Context(), app); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create app"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": app})
 }
 
 func (h *AppHandler) UpdateApp(c *gin.Context) {
@@ -144,64 +77,55 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 		return
 	}
 
-	authed, ok := getAuthedApp(c)
-	if !ok {
-		return
-	}
-	if authed.ID != app.ID {
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to modify this app"})
-		return
-	}
-
 	var req struct {
-		Name         *string  `json:"name"`
-		RedirectURIs []string `json:"redirect_uris"`
-		Providers    []string `json:"providers"`
-		DefaultPlan  *string  `json:"default_plan"`
+		Name        *string `json:"name"`
+		Description *string `json:"description"`
+		IsActive    *bool   `json:"is_active"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
 	}
 
-	if req.RedirectURIs != nil {
-		if msg, ok := validateRedirectURIs(req.RedirectURIs); !ok {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
-			return
-		}
-	}
-
-	updated := *app
 	if req.Name != nil {
-		updated.Name = *req.Name
+		app.Name = *req.Name
 	}
-	if req.RedirectURIs != nil {
-		updated.RedirectURIs = req.RedirectURIs
+	if req.Description != nil {
+		app.Description = *req.Description
 	}
-	if req.Providers != nil {
-		updated.Providers = req.Providers
-	}
-	if req.DefaultPlan != nil {
-		if *req.DefaultPlan != "free" && *req.DefaultPlan != "trial" && *req.DefaultPlan != "paid" {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "default_plan must be one of: free, trial, paid"})
-			return
-		}
-		updated.DefaultPlan = *req.DefaultPlan
+	if req.IsActive != nil {
+		app.IsActive = *req.IsActive
 	}
 
-	if err := h.appRepo.Update(c.Request.Context(), &updated); err != nil {
+	if err := h.appRepo.Update(c.Request.Context(), app); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update app"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": updated})
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
 }
 
-func (h *AppHandler) CreateSubscription(c *gin.Context) {
+type SubscriptionHandler struct {
+	subSvc service.SubscriptionServiceInterface
+}
+
+func NewSubscriptionHandler(subSvc service.SubscriptionServiceInterface) *SubscriptionHandler {
+	return &SubscriptionHandler{subSvc: subSvc}
+}
+
+func (h *SubscriptionHandler) ListUserSubscriptions(c *gin.Context) {
+	userID := c.GetString("user_id")
+	subs, err := h.subSvc.ListUserSubscriptions(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list subscriptions"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": subs})
+}
+
+func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 	var req struct {
-		UserID    string  `json:"user_id" binding:"required"`
-		AppID     string  `json:"app_id" binding:"required"`
-		Plan      string  `json:"plan" binding:"required"`
+		PlanID    string  `json:"plan_id" binding:"required"`
 		ExpiresAt *string `json:"expires_at"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -209,14 +133,7 @@ func (h *AppHandler) CreateSubscription(c *gin.Context) {
 		return
 	}
 
-	authed, ok := getAuthedApp(c)
-	if !ok {
-		return
-	}
-	if authed.ID != req.AppID {
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to create subscriptions for this app"})
-		return
-	}
+	userID := c.GetString("user_id")
 
 	var expiresAt *time.Time
 	if req.ExpiresAt != nil {
@@ -228,61 +145,137 @@ func (h *AppHandler) CreateSubscription(c *gin.Context) {
 		expiresAt = &t
 	}
 
-	sub, err := h.subSvc.Create(c.Request.Context(), req.UserID, req.AppID, req.Plan, expiresAt)
+	sub, err := h.subSvc.Create(c.Request.Context(), userID, req.PlanID, expiresAt)
 	if err != nil {
-		msg := err.Error()
-		if strings.Contains(msg, "already exists") {
-			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": msg})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create subscription"})
-		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": sub})
 }
 
-func (h *AppHandler) GetSubscription(c *gin.Context) {
+func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 	id := c.Param("id")
-	sub, err := h.subRepo.FindByID(c.Request.Context(), id)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "subscription not found"})
+
+	if err := h.subSvc.Cancel(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
 	}
-	authed, ok := getAuthedApp(c)
-	if !ok {
-		return
-	}
-	if authed.ID != sub.AppID {
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to access this subscription"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": sub})
+
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "cancelled"})
 }
 
-func (h *AppHandler) CancelSubscription(c *gin.Context) {
-	id := c.Param("id")
-	sub, err := h.subRepo.FindByID(c.Request.Context(), id)
+type PlanHandler struct {
+	planSvc service.PlanServiceInterface
+}
+
+func NewPlanHandler(planSvc service.PlanServiceInterface) *PlanHandler {
+	return &PlanHandler{planSvc: planSvc}
+}
+
+func (h *PlanHandler) ListPlans(c *gin.Context) {
+	plans, err := h.planSvc.ListPlans(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "subscription not found"})
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list plans"})
 		return
 	}
-	authed, ok := getAuthedApp(c)
-	if !ok {
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": plans})
+}
+
+func (h *PlanHandler) GetPlan(c *gin.Context) {
+	id := c.Param("id")
+	plan, err := h.planSvc.GetPlan(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
 		return
 	}
-	if authed.ID != sub.AppID {
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "not authorized to cancel this subscription"})
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": plan})
+}
+
+func (h *PlanHandler) CreatePlan(c *gin.Context) {
+	var req struct {
+		ID           string   `json:"id" binding:"required"`
+		Name         string   `json:"name" binding:"required"`
+		Price        float64  `json:"price"`
+		IntervalDays int      `json:"interval_days"`
+		Apps         []string `json:"apps"`
+		IsDefault    bool     `json:"is_default"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
 	}
-	if err := h.subSvc.Cancel(c.Request.Context(), id); err != nil {
-		msg := err.Error()
-		if msg == "subscription not found" || msg == "already cancelled" {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to cancel subscription"})
-		}
+
+	plan := &model.Plan{
+		ID:           req.ID,
+		Name:         req.Name,
+		Price:        req.Price,
+		IntervalDays: req.IntervalDays,
+		Apps:         req.Apps,
+		IsActive:     true,
+		IsDefault:    req.IsDefault,
+	}
+	if err := h.planSvc.CreatePlan(c.Request.Context(), plan); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create plan"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "cancelled"})
+
+	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": plan})
+}
+
+func (h *PlanHandler) UpdatePlan(c *gin.Context) {
+	id := c.Param("id")
+	plan, err := h.planSvc.GetPlan(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
+		return
+	}
+
+	var req struct {
+		Name         *string  `json:"name"`
+		Price        *float64 `json:"price"`
+		IntervalDays *int     `json:"interval_days"`
+		Apps         []string `json:"apps"`
+		IsActive     *bool    `json:"is_active"`
+		IsDefault    *bool    `json:"is_default"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	if req.Name != nil {
+		plan.Name = *req.Name
+	}
+	if req.Price != nil {
+		plan.Price = *req.Price
+	}
+	if req.IntervalDays != nil {
+		plan.IntervalDays = *req.IntervalDays
+	}
+	if req.Apps != nil {
+		plan.Apps = req.Apps
+	}
+	if req.IsActive != nil {
+		plan.IsActive = *req.IsActive
+	}
+	if req.IsDefault != nil {
+		plan.IsDefault = *req.IsDefault
+	}
+
+	if err := h.planSvc.UpdatePlan(c.Request.Context(), plan); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update plan"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": plan})
+}
+
+func (h *PlanHandler) DeletePlan(c *gin.Context) {
+	id := c.Param("id")
+	if err := h.planSvc.DeletePlan(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to delete plan"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "deleted"})
 }

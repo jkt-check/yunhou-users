@@ -10,36 +10,33 @@ import (
 	"github.com/yunhou/users/internal/repo"
 )
 
-func isDuplicateKey(err error) bool {
-	if pgErr, ok := err.(*pgconn.PgError); ok {
-		return pgErr.Code == "23505"
-	}
-	if _, ok := err.(interface{ DuplicateKey() bool }); ok {
-		return true
-	}
-	return false
-}
-
 type SubscriptionService struct {
-	subRepo repo.SubscriptionRepo
+	subRepo  repo.SubscriptionRepo
+	planSvc  *PlanService
 }
 
-func NewSubscriptionService(subRepo repo.SubscriptionRepo) *SubscriptionService {
-	return &SubscriptionService{subRepo: subRepo}
+func NewSubscriptionService(subRepo repo.SubscriptionRepo, planSvc *PlanService) *SubscriptionService {
+	return &SubscriptionService{subRepo: subRepo, planSvc: planSvc}
 }
 
-func (s *SubscriptionService) Create(ctx context.Context, userID, appID, plan string, expiresAt *time.Time) (*model.Subscription, error) {
+func (s *SubscriptionService) Create(ctx context.Context, userID, planID string, expiresAt *time.Time) (*model.Subscription, error) {
+	// Check if user already has an active subscription
+	existing, err := s.subRepo.FindActiveByUserID(ctx, userID)
+	if err == nil && existing != nil {
+		return nil, fmt.Errorf("user already has an active subscription")
+	}
+
 	sub := &model.Subscription{
 		ID:        GenerateUUID(),
 		UserID:    userID,
-		AppID:     appID,
-		Plan:      plan,
+		PlanID:    planID,
 		Status:    "active",
+		StartedAt: time.Now(),
 		ExpiresAt: expiresAt,
 	}
 	if err := s.subRepo.Create(ctx, sub); err != nil {
 		if isDuplicateKey(err) {
-			return nil, fmt.Errorf("subscription already exists for this user and app")
+			return nil, fmt.Errorf("subscription already exists for this user")
 		}
 		return nil, err
 	}
@@ -71,36 +68,46 @@ func (s *SubscriptionService) Cancel(ctx context.Context, id string) error {
 	return s.subRepo.UpdateStatus(ctx, id, "cancelled")
 }
 
-func (s *SubscriptionService) CheckActive(ctx context.Context, userID, appID string) (bool, error) {
-	sub, err := s.subRepo.FindByUserApp(ctx, userID, appID)
+// GetUserSubscription returns the user's active subscription with plan info.
+func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID string) (*model.Subscription, *model.Plan, error) {
+	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
 	if err != nil {
-		return false, fmt.Errorf("check subscription: %v", err)
-	}
-	if sub == nil || sub.Status != "active" {
-		return false, nil
-	}
-	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
-		if err := s.subRepo.UpdateStatus(ctx, sub.ID, "expired"); err != nil {
-			return false, fmt.Errorf("mark subscription expired: %v", err)
+		// If "not found", user has no subscription - use default plan
+		if err.Error() == "not found" {
+			plan, planErr := s.planSvc.planRepo.FindDefault(ctx)
+			if planErr != nil {
+				return nil, nil, fmt.Errorf("get default plan: %w", planErr)
+			}
+			return nil, plan, nil
 		}
-		return false, nil
+		return nil, nil, fmt.Errorf("get subscription: %w", err)
 	}
-	return true, nil
+	if sub == nil {
+		// Return default plan
+		plan, err := s.planSvc.planRepo.FindDefault(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("get default plan: %w", err)
+		}
+		return nil, plan, nil
+	}
+	plan, err := s.planSvc.planRepo.FindByID(ctx, sub.PlanID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get plan: %w", err)
+	}
+	return sub, plan, nil
 }
 
-func ensureActiveSubscription(ctx context.Context, subRepo repo.SubscriptionRepo, userID, appID string) error {
-	sub, err := subRepo.FindByUserApp(ctx, userID, appID)
-	if err != nil {
-		return fmt.Errorf("check subscription: %v", err)
+// ListUserSubscriptions returns all subscriptions for a user.
+func (s *SubscriptionService) ListUserSubscriptions(ctx context.Context, userID string) ([]model.Subscription, error) {
+	return s.subRepo.ListByUserID(ctx, userID)
+}
+
+func isDuplicateKey(err error) bool {
+	if pgErr, ok := err.(*pgconn.PgError); ok {
+		return pgErr.Code == "23505"
 	}
-	if sub == nil || sub.Status != "active" {
-		return fmt.Errorf("subscription not active")
+	if _, ok := err.(interface{ DuplicateKey() bool }); ok {
+		return true
 	}
-	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
-		if err := subRepo.UpdateStatus(ctx, sub.ID, "expired"); err != nil {
-			return fmt.Errorf("mark subscription expired: %v", err)
-		}
-		return fmt.Errorf("subscription expired")
-	}
-	return nil
+	return false
 }

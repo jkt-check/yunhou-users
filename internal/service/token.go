@@ -17,6 +17,31 @@ import (
 	"github.com/yunhou/users/internal/repo"
 )
 
+func parseDuration(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 15 * time.Minute
+	}
+	return d
+}
+
+func ensureActiveSubscription(ctx context.Context, subRepo repo.SubscriptionRepo, userID string) error {
+	sub, err := subRepo.FindActiveByUserID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("check subscription: %v", err)
+	}
+	if sub == nil {
+		return fmt.Errorf("subscription not active")
+	}
+	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
+		if err := subRepo.UpdateStatus(ctx, sub.ID, "expired"); err != nil {
+			return fmt.Errorf("mark subscription expired: %v", err)
+		}
+		return fmt.Errorf("subscription expired")
+	}
+	return nil
+}
+
 type TokenService struct {
 	PrivateKey  *rsa.PrivateKey
 	PublicKey   *rsa.PublicKey
@@ -93,11 +118,7 @@ func (s *TokenService) Refresh(ctx context.Context, refreshToken, appID string) 
 		return "", "", fmt.Errorf("invalid or expired refresh token")
 	}
 
-	if session.AppID != appID {
-		return "", "", fmt.Errorf("refresh token not issued for this app")
-	}
-
-	if err := ensureActiveSubscription(ctx, s.SubRepo, session.UserID, session.AppID); err != nil {
+	if err := ensureActiveSubscription(ctx, s.SubRepo, session.UserID); err != nil {
 		return "", "", err
 	}
 

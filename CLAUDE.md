@@ -9,10 +9,10 @@ Yunhou Users is a **shared user management API** serving multiple consumer appli
 ## Architecture
 
 - **Shared identity**: One user account across all consumer apps
-- **App-level isolation**: Different apps may have different scopes and subscription tiers on top of the shared identity
+- **Plan-based access**: Apps are accessible based on the user's subscribed plan (free/monthly/quarterly/yearly)
 - **API-first**: Consumer apps integrate via REST; no server-rendered UI
-- **OAuth 2.0 Authorization Code flow**: Provider → callback → auth code → token exchange → JWT access token + opaque refresh token
-- **Subscription gate**: Both token exchange and token refresh check active subscription before issuing tokens
+- **Direct login**: Consumer app sends provider token directly to `/auth/login` (no OAuth redirect flow for internal apps)
+- **Subscription gate**: Login and token refresh check active subscription and plan app list before issuing tokens
 - **Refresh token rotation**: Every refresh invalidates the old refresh token and issues a new one
 
 ### Layering
@@ -23,11 +23,12 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 
 ### Auth Flow
 
-1. `GET /authorize?app_id&provider&redirect_uri&state` — HMAC-signs state, redirects to OAuth provider
-2. `GET /callback/:provider?code&state` — verifies state, re-validates redirect_uri, fetches provider user info, find-or-creates user + identity, issues auth code, redirects to consumer app
-3. `POST /token` — exchanges `{code, app_id, app_secret}` for access + refresh tokens (checks subscription, atomically revokes auth code)
-4. `POST /token/refresh` — exchanges `{refresh_token, app_id, app_secret}` for new tokens (checks subscription including expiration, rotates refresh token)
-5. Consumer apps verify access tokens locally via `GET /.well-known/jwks.json` (RSA256 JWK, kid=`yunhou-users-rsa`)
+1. `POST /auth/login` — receives `{provider, provider_token, app_id}`, returns access + refresh tokens + subscription info with `has_access`
+2. `POST /auth/refresh` — exchanges refresh token for new tokens (checks subscription, rotates refresh token)
+3. `POST /auth/logout` — revokes refresh token
+4. Consumer apps verify access tokens locally via `GET /.well-known/jwks.json` (RSA256 JWK, kid=`yunhou-users-rsa`)
+
+**Plan-based access**: Each plan contains a list of accessible apps. When a user logs in, the response includes `has_access: true/false` for the requested app based on their subscribed plan.
 
 ## Development Commands
 
@@ -39,17 +40,13 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 - `make deps` — tidy go.mod
 - `make generate-keys` — generate RSA key pair in `keys/`
 - `go test -race -run TestFoo ./internal/service/` — run a single test
-- Database migration: `psql -d yunhou_users -f migrations/001_init.sql`
+- Database migration: `psql -d yunhou_users -f migrations/002_simplify_plans.sql`
 
 ## Required Environment Variables
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `PORT` | No | `8080` | |
-| `STATE_HMAC_KEY` | **Yes** | — | App exits if not set |
-| `GITHUB_CLIENT_ID` | Yes (for GitHub auth) | — | |
-| `GITHUB_CLIENT_SECRET` | Yes (for GitHub auth) | — | |
-| `GITHUB_CALLBACK_URL` | No | `http://localhost:{PORT}/callback/github` | |
 | `DATABASE_URL` | No | `postgres://localhost/yunhou_users?sslmode=disable` | |
 | `RSA_PRIVATE_KEY_PATH` | No | `keys/private.pem` | File path |
 | `RSA_PUBLIC_KEY_PATH` | No | `keys/public.pem` | File path |
@@ -70,13 +67,15 @@ All endpoints return:
 ## Endpoints
 
 **Public** (rate-limited 10/s burst 20 per IP):
-- `GET /.well-known/jwks.json`, `GET /authorize`, `GET /callback/:provider`, `POST /token`, `POST /token/refresh`
+- `GET /.well-known/jwks.json`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`
 
 **User** (JWT Bearer auth):
-- `GET /user/profile`, `PATCH /user/profile`, `GET /user/identities`, `DELETE /user/identities/:id`, `GET /user/apps`
+- `GET /user/profile`, `PATCH /user/profile`, `GET /user/identities`, `DELETE /user/identities/:id`, `GET /user/subscriptions`, `POST /user/subscriptions`, `DELETE /user/subscriptions/:id`
 
-**App management** (`X-App-ID` + `X-App-Secret` headers, rate-limited 30/s burst 60 per IP):
-- `POST /apps`, `GET /apps/:id`, `PATCH /apps/:id`, `POST /subscriptions`, `GET /subscriptions/:id`, `DELETE /subscriptions/:id`
+**App management** (internal service auth via `X-App-ID` header, rate-limited 30/s burst 60 per IP):
+- `GET /apps`, `GET /apps/:id`
+- `GET /admin/plans`, `GET /admin/plans/:id`, `POST /admin/plans`, `PATCH /admin/plans/:id`, `DELETE /admin/plans/:id`
+- `POST /admin/apps`, `PATCH /admin/apps/:id`
 
 ## Design Principles
 
@@ -84,4 +83,4 @@ All endpoints return:
 - Input validation at system boundaries
 - No hardcoded secrets — all from env vars
 - Parameterized queries only — no string interpolation
-- App secrets stored as bcrypt hashes, tokens as SHA-256 hashes
+- Tokens stored as SHA-256 hashes

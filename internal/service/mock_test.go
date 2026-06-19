@@ -163,7 +163,7 @@ func (m *mockAppRepo) Create(_ context.Context, a *model.App) error {
 	if m.err != nil {
 		return m.err
 	}
-	m.apps[a.ID] = a
+	m.apps[a.AppID] = a
 	return nil
 }
 
@@ -182,7 +182,91 @@ func (m *mockAppRepo) Update(_ context.Context, a *model.App) error {
 	if m.err != nil {
 		return m.err
 	}
-	m.apps[a.ID] = a
+	m.apps[a.AppID] = a
+	return nil
+}
+
+func (m *mockAppRepo) List(_ context.Context) ([]model.App, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	var result []model.App
+	for _, a := range m.apps {
+		result = append(result, *a)
+	}
+	return result, nil
+}
+
+// --- PlanRepo mock ---
+
+type mockPlanRepo struct {
+	plans       map[string]*model.Plan
+	defaultPlan *model.Plan
+	err         error
+}
+
+func newMockPlanRepo() *mockPlanRepo {
+	return &mockPlanRepo{plans: make(map[string]*model.Plan)}
+}
+
+func (m *mockPlanRepo) FindAll(_ context.Context) ([]model.Plan, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	var result []model.Plan
+	for _, p := range m.plans {
+		result = append(result, *p)
+	}
+	return result, nil
+}
+
+func (m *mockPlanRepo) FindByID(_ context.Context, id string) (*model.Plan, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	p, ok := m.plans[id]
+	if !ok {
+		return nil, fmt.Errorf("not found")
+	}
+	return p, nil
+}
+
+func (m *mockPlanRepo) FindDefault(_ context.Context) (*model.Plan, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.defaultPlan != nil {
+		return m.defaultPlan, nil
+	}
+	for _, p := range m.plans {
+		if p.IsDefault {
+			return p, nil
+		}
+	}
+	return nil, fmt.Errorf("no default plan")
+}
+
+func (m *mockPlanRepo) Create(_ context.Context, p *model.Plan) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.plans[p.ID] = p
+	return nil
+}
+
+func (m *mockPlanRepo) Update(_ context.Context, p *model.Plan) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.plans[p.ID] = p
+	return nil
+}
+
+func (m *mockPlanRepo) Delete(_ context.Context, id string) error {
+	if m.err != nil {
+		return m.err
+	}
+	delete(m.plans, id)
 	return nil
 }
 
@@ -190,7 +274,7 @@ func (m *mockAppRepo) Update(_ context.Context, a *model.App) error {
 
 type mockSubscriptionRepo struct {
 	subs      map[string]*model.Subscription // key: id
-	byUserApp map[string]*model.Subscription // key: userID:appID
+	byUserID  map[string]*model.Subscription // key: userID (only active)
 	createErr error
 	findErr   error
 	updateErr error
@@ -199,8 +283,8 @@ type mockSubscriptionRepo struct {
 
 func newMockSubscriptionRepo() *mockSubscriptionRepo {
 	return &mockSubscriptionRepo{
-		subs:      make(map[string]*model.Subscription),
-		byUserApp: make(map[string]*model.Subscription),
+		subs:     make(map[string]*model.Subscription),
+		byUserID: make(map[string]*model.Subscription),
 	}
 }
 
@@ -208,23 +292,24 @@ func (m *mockSubscriptionRepo) Create(_ context.Context, s *model.Subscription) 
 	if m.createErr != nil {
 		return m.createErr
 	}
-	key := s.UserID + ":" + s.AppID
-	if _, exists := m.byUserApp[key]; exists {
-		return &duplicateKeyError{}
-	}
 	m.subs[s.ID] = s
-	m.byUserApp[key] = s
+	if s.Status == "active" {
+		m.byUserID[s.UserID] = s
+	}
 	return nil
 }
 
-func (m *mockSubscriptionRepo) FindByUserApp(_ context.Context, userID, appID string) (*model.Subscription, error) {
+func (m *mockSubscriptionRepo) FindActiveByUserID(_ context.Context, userID string) (*model.Subscription, error) {
 	if m.findErr != nil {
 		return nil, m.findErr
 	}
-	key := userID + ":" + appID
-	s, ok := m.byUserApp[key]
+	s, ok := m.byUserID[userID]
 	if !ok {
 		return nil, fmt.Errorf("not found")
+	}
+	// Check if expired
+	if s.ExpiresAt != nil && s.ExpiresAt.Before(time.Now()) {
+		return nil, fmt.Errorf("subscription expired")
 	}
 	return s, nil
 }
@@ -259,6 +344,9 @@ func (m *mockSubscriptionRepo) UpdateStatus(_ context.Context, id, status string
 		return fmt.Errorf("not found")
 	}
 	s.Status = status
+	if status != "active" {
+		delete(m.byUserID, s.UserID)
+	}
 	return nil
 }
 
@@ -272,6 +360,7 @@ func (m *mockSubscriptionRepo) Renew(_ context.Context, id string, expiresAt *ti
 	}
 	s.Status = "active"
 	s.ExpiresAt = expiresAt
+	m.byUserID[s.UserID] = s
 	return nil
 }
 
@@ -394,6 +483,18 @@ func generateTestRSAKeyPair() (*rsa.PrivateKey, *rsa.PublicKey) {
 }
 
 func newTokenServiceWithKeys(sessionRepo *mockSessionRepo, subRepo *mockSubscriptionRepo) *TokenService {
+	priv, pub := generateTestRSAKeyPair()
+	return &TokenService{
+		PrivateKey:  priv,
+		PublicKey:   pub,
+		AccessTTL:   "15m",
+		RefreshTTL:  "168h",
+		SessionRepo: sessionRepo,
+		SubRepo:     subRepo,
+	}
+}
+
+func newTokenServiceWithMocks(sessionRepo *mockSessionRepo, subRepo *mockSubscriptionRepo) *TokenService {
 	priv, pub := generateTestRSAKeyPair()
 	return &TokenService{
 		PrivateKey:  priv,

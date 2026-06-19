@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,25 +21,16 @@ import (
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
 	"github.com/yunhou/users/internal/service"
-	"github.com/yunhou/users/internal/util"
 )
 
 const (
 	defaultDBURL   = "postgres://postgres@localhost/yunhou_users?sslmode=disable"
-	hmacKey        = "e2e-test-hmac-key-at-least-32-characters-long"
 	mockGitHubCode = "mock-github-auth-code"
 	mockGitHubUID  = "999888777"
 	mockGitHubUser = "e2e_test_user"
 	mockGitHubMail = "e2e@test.example.com"
-	superAppID     = "00000000-0000-0000-0000-000000000001"
-	superAppSecret = "e2e-super-secret"
+	superAppID     = "yundian"
 )
-
-type testApp struct {
-	ID     string
-	Secret string
-	Name   string
-}
 
 func connectDB(t *testing.T) *sqlx.DB {
 	t.Helper()
@@ -57,7 +47,7 @@ func connectDB(t *testing.T) *sqlx.DB {
 
 func cleanupDB(t *testing.T, db *sqlx.DB) {
 	t.Helper()
-	tables := []string{"sessions", "subscriptions", "social_identities", "apps", "users"}
+	tables := []string{"sessions", "subscriptions", "social_identities", "plans", "apps", "users"}
 	for _, tbl := range tables {
 		if _, err := db.Exec(fmt.Sprintf("DELETE FROM %s", tbl)); err != nil {
 			t.Fatalf("cleanup %s: %v", tbl, err)
@@ -65,16 +55,36 @@ func cleanupDB(t *testing.T, db *sqlx.DB) {
 	}
 }
 
-func seedSuperApp(t *testing.T, db *sqlx.DB) {
+func seedTestData(t *testing.T, db *sqlx.DB) {
 	t.Helper()
-	secret, err := util.HashSecret(superAppSecret)
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
+	// Seed plans
+	plans := []struct {
+		id, name string
+		price    float64
+		days     int
+		apps     string
+		isDef    bool
+	}{
+		{"free", "免费", 0, 0, "{yundian}", true},
+		{"monthly", "按月订阅", 29.9, 30, "{yundian,yundash}", false},
 	}
-	_, err = db.ExecContext(context.Background(), `
-		INSERT INTO apps (id, secret, name, redirect_uris, providers, default_plan)
-		VALUES ($1, $2, 'E2E Super App', '{}', '{github,google,wechat}', 'free')
-	`, superAppID, secret)
+	for _, p := range plans {
+		_, err := db.ExecContext(context.Background(), `
+			INSERT INTO plans (id, name, price, interval_days, apps, is_default)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (id) DO NOTHING
+		`, p.id, p.name, p.price, p.days, p.apps, p.isDef)
+		if err != nil {
+			t.Fatalf("seed plan %s: %v", p.id, err)
+		}
+	}
+
+	// Seed super app
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO apps (app_id, name, is_active)
+		VALUES ($1, 'E2E Test App', true)
+		ON CONFLICT (app_id) DO NOTHING
+	`, superAppID)
 	if err != nil {
 		t.Fatalf("seed super app: %v", err)
 	}
@@ -86,7 +96,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	db := connectDB(t)
 	t.Cleanup(func() { db.Close() })
 	cleanupDB(t, db)
-	seedSuperApp(t, db)
+	seedTestData(t, db)
 
 	keyDir := t.TempDir()
 	privPath := keyDir + "/private.pem"
@@ -102,38 +112,34 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		GitHubClientSecret: "e2e-fake-client-secret",
 		JWTAccessTTL:       "15m",
 		JWTRefreshTTL:      "168h",
-		StateHMACKey:       hmacKey,
 	}
 
+	// Repos
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
+	planRepo := repo.NewPlanRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
 
+	// Services
 	tokenSvc, err := service.NewTokenService(cfg, sessionRepo, subRepo)
 	if err != nil {
 		t.Fatalf("new token service: %v", err)
 	}
 
-	authSvc := service.NewAuthService(userRepo, identityRepo, appRepo, subRepo, sessionRepo, tokenSvc)
-	subSvc := service.NewSubscriptionService(subRepo)
-
-	mockGitHub := newMockGitHubServer(t)
-	t.Cleanup(func() { mockGitHub.Close() })
-
-	oauth := service.NewOAuthProvider(cfg, appRepo)
-	oauth.Client = &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: &redirectTransport{url: mockGitHub.URL, transport: http.DefaultTransport},
-	}
+	planSvc := service.NewPlanService(planRepo)
+	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, tokenSvc)
+	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
-	router.Setup(context.Background(), engine, appRepo, userRepo, identityRepo, subRepo, sessionRepo, tokenSvc, authSvc, subSvc, oauth, hmacKey)
+	router.Setup(context.Background(), engine, db,
+		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		tokenSvc, authSvc, subSvc, planSvc)
 
-	return engine, mockGitHub, db
+	return engine, nil, db
 }
 
 func newMockGitHubServer(t *testing.T) *httptest.Server {
@@ -152,10 +158,6 @@ func newMockGitHubServer(t *testing.T) *httptest.Server {
 	})
 
 	mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ghu_mock_token") {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"id":%s,"login":"%s","avatar_url":"https://avatars.test/u/%s","email":"%s"}`,
 			mockGitHubUID, mockGitHubUser, mockGitHubUID, mockGitHubMail)
@@ -167,24 +169,6 @@ func newMockGitHubServer(t *testing.T) *httptest.Server {
 	})
 
 	return httptest.NewServer(mux)
-}
-
-type redirectTransport struct {
-	url       string
-	transport http.RoundTripper
-}
-
-func (t *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	target := t.url + req.URL.Path
-	if req.URL.RawQuery != "" {
-		target += "?" + req.URL.RawQuery
-	}
-	newReq, err := http.NewRequestWithContext(req.Context(), req.Method, target, req.Body)
-	if err != nil {
-		return nil, err
-	}
-	newReq.Header = req.Header
-	return t.transport.RoundTrip(newReq)
 }
 
 func genRSAKeys(t *testing.T, privPath, pubPath string) {
@@ -229,10 +213,6 @@ func (r *httpResponse) JSON(t *testing.T, v any) {
 	}
 }
 
-func (r *httpResponse) Location() string {
-	return r.Headers.Get("Location")
-}
-
 func extractQuery(t *testing.T, rawURL, key string) string {
 	t.Helper()
 	u, err := url.Parse(rawURL)
@@ -247,47 +227,4 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func createAppViaHTTP(t *testing.T, engine *gin.Engine, name string, redirectURIs []string) testApp {
-	t.Helper()
-	urisJSON, _ := json.Marshal(redirectURIs)
-	body := fmt.Sprintf(`{"name":"%s","redirect_uris":%s,"default_plan":"free"}`, name, urisJSON)
-	headers := map[string]string{
-		"X-App-ID":    superAppID,
-		"X-App-Secret": superAppSecret,
-	}
-	resp := doRequest(t, engine, http.MethodPost, "/apps", body, headers)
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create app: expected 201, got %d — body: %s", resp.StatusCode, string(resp.Body))
-	}
-	var result struct {
-		Data struct {
-			AppID     string `json:"app_id"`
-			AppSecret string `json:"app_secret"`
-			Name      string `json:"name"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &result)
-	return testApp{ID: result.Data.AppID, Secret: result.Data.AppSecret, Name: result.Data.Name}
-}
-
-func createSubscriptionViaHTTP(t *testing.T, engine *gin.Engine, app testApp, userID, plan string) string {
-	t.Helper()
-	body := fmt.Sprintf(`{"user_id":"%s","app_id":"%s","plan":"%s"}`, userID, app.ID, plan)
-	headers := map[string]string{
-		"X-App-ID":    app.ID,
-		"X-App-Secret": app.Secret,
-	}
-	resp := doRequest(t, engine, http.MethodPost, "/subscriptions", body, headers)
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create subscription: expected 201, got %d — body: %s", resp.StatusCode, string(resp.Body))
-	}
-	var result struct {
-		Data struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &result)
-	return result.Data.ID
 }

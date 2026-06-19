@@ -2,306 +2,133 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yunhou/users/internal/model"
-	"github.com/yunhou/users/internal/util"
 )
 
-func TestAuthorizeOrCreate(t *testing.T) {
+func TestAuthService_Login(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 
-	hashedSecret, err := util.HashSecret("app-secret-123")
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
-
-	appFree := &model.App{
-		ID:          "app-free",
-		Secret:      hashedSecret,
-		Name:        "FreeApp",
-		DefaultPlan: "free",
-	}
-	appNoFree := &model.App{
-		ID:          "app-paid",
-		Secret:      hashedSecret,
-		Name:        "PaidApp",
-		DefaultPlan: "pro",
-	}
-
-	existingIdentity := &model.SocialIdentity{
-		ID:          "ident-1",
-		UserID:      "user-existing",
-		Provider:    "github",
-		ProviderUID: "12345",
-		Email:       stringPtr("existing@example.com"),
-	}
-
-	existingUser := &model.User{
-		ID:     "user-existing",
-		Status: "active",
-	}
-
-	mergeIdentity := &model.SocialIdentity{
-		ID:          "ident-2",
-		UserID:      "user-merge",
-		Provider:    "github",
-		ProviderUID: "99999",
-		Email:       stringPtr("merge@example.com"),
+	plans := map[string]*model.Plan{
+		"free":    {ID: "free", Name: "免费", Apps: []string{"yundian"}},
+		"monthly": {ID: "monthly", Name: "按月订阅", Apps: []string{"yundian", "yundash"}},
 	}
 
 	tests := []struct {
 		name        string
-		info        ProviderUserInfo
-		appID       string
-		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockAppRepo, *mockSubscriptionRepo, *mockSessionRepo)
+		req         LoginRequest
+		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo)
 		wantErr     bool
 		errContains string
-		validate    func(t *testing.T, code string, ur *mockUserRepo, sir *mockSocialIdentityRepo, sr *mockSubscriptionRepo)
+		validate    func(t *testing.T, resp *LoginResponse)
 	}{
 		{
-			name: "existing identity login",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "12345",
-				Email:       "existing@example.com",
-				Nickname:    "existinguser",
-				AvatarURL:   "https://img.example.com/avatar.png",
+			name: "new user login with free plan",
+			req: LoginRequest{
+				Provider:      "github",
+				ProviderToken: "newuser1",
+				AppID:        "yundian",
 			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-				sir.identities["github:12345"] = existingIdentity
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+			},
+			wantErr: false,
+			validate: func(t *testing.T, resp *LoginResponse) {
+				if resp.AccessToken == "" {
+					t.Error("expected access token")
+				}
+				if resp.RefreshToken == "" {
+					t.Error("expected refresh token")
+				}
+				if resp.Subscription.PlanID != "free" {
+					t.Errorf("expected plan free, got %s", resp.Subscription.PlanID)
+				}
+				if !resp.Subscription.HasAccess {
+					t.Error("expected has_access=true for yundian on free plan")
+				}
+			},
+		},
+		{
+			name: "new user login to paid app without subscription",
+			req: LoginRequest{
+				Provider:      "github",
+				ProviderToken: "newuser2",
+				AppID:        "yundash",
+			},
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+			},
+			wantErr: false,
+			validate: func(t *testing.T, resp *LoginResponse) {
+				if resp.Subscription.HasAccess {
+					t.Error("expected has_access=false for yundash on free plan")
+				}
+			},
+		},
+		{
+			name: "existing user with paid subscription",
+			req: LoginRequest{
+				Provider:      "github",
+				ProviderToken: "existing",  // yields ProviderUID "github_existing"
+				AppID:        "yundash",
+			},
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.plans["monthly"] = plans["monthly"]
+				pr.defaultPlan = plans["free"]
+
+				existingUser := &model.User{ID: "user-existing", Status: "active"}
 				ur.users["user-existing"] = existingUser
-			},
-			wantErr: false,
-			validate: func(t *testing.T, code string, ur *mockUserRepo, sir *mockSocialIdentityRepo, sr *mockSubscriptionRepo) {
-				if code == "" {
-					t.Error("expected non-empty auth code")
+
+				existingIdentity := &model.SocialIdentity{
+					ID:          "ident-1",
+					UserID:      "user-existing",
+					Provider:    "github",
+					ProviderUID: "github_existing",
 				}
-				if len(ur.users) != 1 {
-					t.Errorf("expected 1 user, got %d", len(ur.users))
-				}
-			},
-		},
-		{
-			name: "new user creation with free subscription",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "67890",
-				Email:       "newuser@example.com",
-				Nickname:    "newuser",
-				AvatarURL:   "https://img.example.com/new.png",
-			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-			},
-			wantErr: false,
-			validate: func(t *testing.T, code string, ur *mockUserRepo, sir *mockSocialIdentityRepo, sr *mockSubscriptionRepo) {
-				if code == "" {
-					t.Error("expected non-empty auth code")
-				}
-				if len(ur.users) != 1 {
-					t.Errorf("expected 1 user, got %d", len(ur.users))
-				}
-				if len(sir.identities) != 1 {
-					t.Errorf("expected 1 identity, got %d", len(sir.identities))
-				}
-				if len(sr.subs) != 1 {
-					t.Errorf("expected 1 subscription, got %d", len(sr.subs))
-				}
-				for _, sub := range sr.subs {
-					if sub.Plan != "free" || sub.Status != "active" {
-						t.Errorf("expected free active subscription, got plan=%s status=%s", sub.Plan, sub.Status)
-					}
-				}
-			},
-		},
-		{
-			name: "new user no free plan no subscription created",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "67891",
-				Email:       "newuser2@example.com",
-				Nickname:    "newuser2",
-				AvatarURL:   "https://img.example.com/new2.png",
-			},
-			appID: "app-paid",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-paid"] = appNoFree
-			},
-			wantErr: false,
-			validate: func(t *testing.T, code string, ur *mockUserRepo, sir *mockSocialIdentityRepo, sr *mockSubscriptionRepo) {
-				if code == "" {
-					t.Error("expected non-empty auth code")
-				}
-				if len(ur.users) != 1 {
-					t.Errorf("expected 1 user, got %d", len(ur.users))
-				}
-				if len(sr.subs) != 0 {
-					t.Errorf("expected 0 subscriptions, got %d", len(sr.subs))
-				}
-			},
-		},
-		{
-			name: "email merge with existing identity",
-			info: ProviderUserInfo{
-				Provider:    "google",
-				ProviderUID: "google-111",
-				Email:       "merge@example.com",
-				Nickname:    "mergeduser",
-				AvatarURL:   "https://img.example.com/merge.png",
-			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-				sir.identities["github:99999"] = mergeIdentity
-				sir.byEmail["merge@example.com"] = []model.SocialIdentity{*mergeIdentity}
-				sir.byUserID["user-merge"] = []model.SocialIdentity{*mergeIdentity}
-			},
-			wantErr: false,
-			validate: func(t *testing.T, code string, ur *mockUserRepo, sir *mockSocialIdentityRepo, sr *mockSubscriptionRepo) {
-				if code == "" {
-					t.Error("expected non-empty auth code")
-				}
-				if len(ur.users) != 0 {
-					t.Errorf("expected 0 new users (merged), got %d", len(ur.users))
-				}
-				ident, ok := sir.identities["google:google-111"]
-				if !ok {
-					t.Error("expected new identity to be created")
-				} else if ident.UserID != "user-merge" {
-					t.Errorf("expected identity linked to user-merge, got %s", ident.UserID)
-				}
-			},
-		},
-		{
-			name: "app not found",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "00000",
-				Email:       "notfound@example.com",
-				Nickname:    "notfound",
-				AvatarURL:   "",
-			},
-			appID:       "nonexistent-app",
-			setup:       func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {},
-			wantErr:     true,
-			errContains: "invalid app credentials",
-		},
-		{
-			name: "user creation failure",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "54321",
-				Email:       "fail@example.com",
-				Nickname:    "failuser",
-				AvatarURL:   "",
-			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-				ur.err = fmt.Errorf("db connection failed")
-			},
-			wantErr:     true,
-			errContains: "create user",
-		},
-		{
-			name: "identity creation failure",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "55555",
-				Email:       "identfail@example.com",
-				Nickname:    "identfail",
-				AvatarURL:   "",
-			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-				sir.createErr = fmt.Errorf("identity insert failed")
-			},
-			wantErr:     true,
-			errContains: "create identity",
-		},
-		{
-			name: "session creation failure",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "88888",
-				Email:       "sessionfail@example.com",
-				Nickname:    "sessionfail",
-				AvatarURL:   "",
-			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-				ssr.createErr = fmt.Errorf("session insert failed")
-			},
-			wantErr:     true,
-			errContains: "create session",
-		},
-		{
-			name: "no email provided — skip email merge",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "noemail-1",
-				Email:       "",
-				Nickname:    "noemailuser",
-				AvatarURL:   "",
-			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-			},
-			wantErr: false,
-			validate: func(t *testing.T, code string, ur *mockUserRepo, sir *mockSocialIdentityRepo, sr *mockSubscriptionRepo) {
-				if code == "" {
-					t.Error("expected non-empty auth code")
-				}
-				if len(ur.users) != 1 {
-					t.Errorf("expected 1 user, got %d", len(ur.users))
-				}
-			},
-		},
-		{
-			name: "free subscription already exists for existing identity user",
-			info: ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "12345",
-				Email:       "existing@example.com",
-				Nickname:    "existinguser",
-				AvatarURL:   "https://img.example.com/avatar.png",
-			},
-			appID: "app-free",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, ar *mockAppRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
-				ar.apps["app-free"] = appFree
-				sir.identities["github:12345"] = existingIdentity
-				ur.users["user-existing"] = existingUser
+				sir.identities["github:github_existing"] = existingIdentity
+
+				expiresAt := time.Now().Add(30 * 24 * time.Hour)
 				existingSub := &model.Subscription{
-					ID:     "sub-1",
-					UserID: "user-existing",
-					AppID:  "app-free",
-					Plan:   "free",
-					Status: "active",
+					ID:        "sub-1",
+					UserID:    "user-existing",
+					PlanID:    "monthly",
+					Status:    "active",
+					ExpiresAt: &expiresAt,
 				}
 				sr.subs["sub-1"] = existingSub
-				sr.byUserApp["user-existing:app-free"] = existingSub
+				sr.byUserID["user-existing"] = existingSub
 			},
 			wantErr: false,
-			validate: func(t *testing.T, code string, ur *mockUserRepo, sir *mockSocialIdentityRepo, sr *mockSubscriptionRepo) {
-				if code == "" {
-					t.Error("expected non-empty auth code")
+			validate: func(t *testing.T, resp *LoginResponse) {
+				if resp.Subscription.PlanID != "monthly" {
+					t.Errorf("expected plan monthly, got %s", resp.Subscription.PlanID)
 				}
-				if len(sr.subs) != 1 {
-					t.Errorf("expected 1 subscription (existing), got %d", len(sr.subs))
+				if !resp.Subscription.HasAccess {
+					t.Error("expected has_access=true for yundash on monthly plan")
 				}
 			},
+		},
+		{
+			name: "unsupported provider",
+			req: LoginRequest{
+				Provider:      "unknown",
+				ProviderToken: "token",
+				AppID:        "yundian",
+			},
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+			},
+			wantErr:     true,
+			errContains: "unsupported provider",
 		},
 	}
 
@@ -309,16 +136,16 @@ func TestAuthorizeOrCreate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ur := newMockUserRepo()
 			sir := newMockSocialIdentityRepo()
-			ar := newMockAppRepo()
+			pr := newMockPlanRepo()
 			sr := newMockSubscriptionRepo()
 			ssr := newMockSessionRepo()
 
-			tc.setup(ur, sir, ar, sr, ssr)
+			tc.setup(ur, sir, pr, sr, ssr)
 
-			tokenSvc := newTokenServiceWithKeys(ssr, sr)
-			authSvc := NewAuthService(ur, sir, ar, sr, ssr, tokenSvc)
+			tokenSvc := newTokenServiceWithMocks(ssr, sr)
+			authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
 
-			code, err := authSvc.AuthorizeOrCreate(ctx, tc.info, tc.appID)
+			resp, err := authSvc.Login(ctx, tc.req)
 
 			if tc.wantErr {
 				if err == nil {
@@ -334,244 +161,66 @@ func TestAuthorizeOrCreate(t *testing.T) {
 			}
 
 			if tc.validate != nil {
-				tc.validate(t, code, ur, sir, sr)
+				tc.validate(t, resp)
 			}
 		})
 	}
 }
 
-func TestExchangeCode(t *testing.T) {
+func TestAuthService_Logout(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 
-	plainSecret := "app-secret-xyz"
-	hashedSecret, err := util.HashSecret(plainSecret)
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
+	t.Run("valid logout", func(t *testing.T) {
+		ur := newMockUserRepo()
+		sir := newMockSocialIdentityRepo()
+		pr := newMockPlanRepo()
+		sr := newMockSubscriptionRepo()
+		ssr := newMockSessionRepo()
 
-	app := &model.App{
-		ID:          "app-1",
-		Secret:      hashedSecret,
-		Name:        "TestApp",
-		DefaultPlan: "free",
-	}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
 
-	validCode := "valid-auth-code-1"
-	validCodeHash := hashToken(validCode)
-
-	// Helper to create a fresh session copy for each test (avoids shared pointer mutation)
-	newValidSession := func() *model.Session {
-		return &model.Session{
-			ID:           "sess-auth-1",
+		// Create a session first
+		sess := &model.Session{
+			ID:           "sess-1",
 			UserID:       "user-1",
-			AppID:        "app-1",
-			RefreshToken: validCodeHash,
-				SessionType:  "auth_code",
-			Scope:        []string{"app:read"},
+			AppID:        "yundian",
+			SessionType:  "refresh",
+			RefreshToken: hashToken("valid-refresh-token"),
 			Revoked:      false,
-			ExpiresAt:    timeNow().Add(10 * time.Minute),
+			ExpiresAt:    time.Now().Add(time.Hour),
 		}
-	}
+		ssr.sessions[sess.ID] = sess
+		ssr.byToken[hashToken("valid-refresh-token")] = sess
 
-	tests := []struct {
-		name        string
-		code        string
-		appID       string
-		appSecret   string
-		setup       func(*mockAppRepo, *mockSessionRepo, *mockSubscriptionRepo)
-		wantErr     bool
-		errContains string
-	}{
-		{
-			name:      "valid exchange",
-			code:      validCode,
-			appID:     "app-1",
-			appSecret: plainSecret,
-			setup: func(ar *mockAppRepo, ssr *mockSessionRepo, sr *mockSubscriptionRepo) {
-				ar.apps["app-1"] = app
-				sess := newValidSession()
-				ssr.sessions[sess.ID] = sess
-				ssr.byToken[validCodeHash] = sess
-				// Seed active subscription for the user+app pair
-				activeSub := &model.Subscription{ID: "sub-valid", UserID: "user-1", AppID: "app-1", Plan: "free", Status: "active"}
-				sr.subs["sub-valid"] = activeSub
-				sr.byUserApp["user-1:app-1"] = activeSub
-			},
-			wantErr: false,
-		},
-		{
-			name:        "wrong app secret",
-			code:        validCode,
-			appID:       "app-1",
-			appSecret:   "wrong-secret",
-			setup: func(ar *mockAppRepo, ssr *mockSessionRepo, sr *mockSubscriptionRepo) {
-				ar.apps["app-1"] = app
-			},
-			wantErr:     true,
-			errContains: "invalid app credentials",
-		},
-		{
-			name:        "invalid code",
-			code:        "nonexistent-code",
-			appID:       "app-1",
-			appSecret:   plainSecret,
-			setup: func(ar *mockAppRepo, ssr *mockSessionRepo, sr *mockSubscriptionRepo) {
-				ar.apps["app-1"] = app
-			},
-			wantErr:     true,
-			errContains: "invalid or expired authorization code",
-		},
-		{
-			name:        "code for wrong app",
-			code:        validCode,
-			appID:       "app-other",
-			appSecret:   plainSecret,
-			setup: func(ar *mockAppRepo, ssr *mockSessionRepo, sr *mockSubscriptionRepo) {
-				ar.apps["app-1"] = app
-				ar.apps["app-other"] = &model.App{
-					ID:     "app-other",
-					Secret: hashedSecret,
-					Name:   "OtherApp",
-				}
-				sess := newValidSession()
-				ssr.sessions[sess.ID] = sess
-				ssr.byToken[validCodeHash] = sess
-			},
-			wantErr:     true,
-			errContains: "code was not issued for this app",
-		},
-		{
-			name:        "app not found",
-			code:        validCode,
-			appID:       "nonexistent",
-			appSecret:   plainSecret,
-			setup:       func(ar *mockAppRepo, ssr *mockSessionRepo, sr *mockSubscriptionRepo) {},
-			wantErr:     true,
-			errContains: "invalid app credentials",
-		},
-		{
-			name:        "new session creation failure during exchange",
-			code:        validCode,
-			appID:       "app-1",
-			appSecret:   plainSecret,
-			setup: func(ar *mockAppRepo, ssr *mockSessionRepo, sr *mockSubscriptionRepo) {
-				ar.apps["app-1"] = app
-				sess := newValidSession()
-				ssr.sessions[sess.ID] = sess
-				ssr.byToken[validCodeHash] = sess
-				// Seed active subscription so exchange passes the subscription check
-				activeSub := &model.Subscription{ID: "sub-valid", UserID: "user-1", AppID: "app-1", Plan: "free", Status: "active"}
-				sr.subs["sub-valid"] = activeSub
-				sr.byUserApp["user-1:app-1"] = activeSub
-				// The auth code session was pre-seeded (not via Create). The next Create
-				// call will be for the new refresh token session — make that fail.
-				ssr.failAfter = 1
-			},
-			wantErr:     true,
-			errContains: "session create failed",
-		},
-	}
+		err := authSvc.Logout(ctx, "valid-refresh-token")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ar := newMockAppRepo()
-			ssr := newMockSessionRepo()
-			sr := newMockSubscriptionRepo()
+		// Verify session is revoked
+		if !ssr.sessions["sess-1"].Revoked {
+			t.Error("expected session to be revoked")
+		}
+	})
 
-			tc.setup(ar, ssr, sr)
+	t.Run("invalid token", func(t *testing.T) {
+		ur := newMockUserRepo()
+		sir := newMockSocialIdentityRepo()
+		pr := newMockPlanRepo()
+		sr := newMockSubscriptionRepo()
+		ssr := newMockSessionRepo()
 
-			tokenSvc := newTokenServiceWithKeys(ssr, sr)
-			authSvc := NewAuthService(newMockUserRepo(), newMockSocialIdentityRepo(), ar, sr, ssr, tokenSvc)
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
 
-			accessToken, refreshToken, err := authSvc.ExchangeCode(ctx, tc.code, tc.appID, tc.appSecret)
-
-			if tc.wantErr {
-				if err == nil {
-					t.Errorf("expected error containing %q, got nil", tc.errContains)
-				} else if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
-					t.Errorf("expected error containing %q, got %q", tc.errContains, err.Error())
-				}
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if accessToken == "" {
-				t.Error("expected non-empty access token")
-			}
-			if refreshToken == "" {
-				t.Error("expected non-empty refresh token")
-			}
-
-			// Verify the access token is valid
-			claims, err := tokenSvc.VerifyAccessToken(accessToken)
-			if err != nil {
-				t.Errorf("access token verification failed: %v", err)
-			}
-			if claims.Subject != "user-1" {
-				t.Errorf("expected subject user-1, got %s", claims.Subject)
-			}
-			if claims.AppID != "app-1" {
-				t.Errorf("expected app_id app-1, got %s", claims.AppID)
-			}
-		})
-	}
-}
-
-func TestAuthorizeOrCreate_FreeSubDuplicateNotCreated(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	hashedSecret, _ := util.HashSecret("secret")
-	app := &model.App{ID: "app-1", Secret: hashedSecret, Name: "Test", DefaultPlan: "free"}
-
-	ur := newMockUserRepo()
-	sir := newMockSocialIdentityRepo()
-	ar := newMockAppRepo()
-	sr := newMockSubscriptionRepo()
-	ssr := newMockSessionRepo()
-
-	ar.apps["app-1"] = app
-
-	userID := "user-known"
-	ur.users[userID] = &model.User{ID: userID, Status: "active"}
-	existingSub := &model.Subscription{ID: "sub-exist", UserID: userID, AppID: "app-1", Plan: "free", Status: "active"}
-	sr.subs["sub-exist"] = existingSub
-	sr.byUserApp[userID+":app-1"] = existingSub
-
-	sir.identities["github:known-uid"] = &model.SocialIdentity{
-		ID:          "ident-known",
-		UserID:      userID,
-		Provider:    "github",
-		ProviderUID: "known-uid",
-		Email:       stringPtr("known@example.com"),
-	}
-
-	tokenSvc := newTokenServiceWithKeys(ssr, sr)
-	authSvc := NewAuthService(ur, sir, ar, sr, ssr, tokenSvc)
-
-	code, err := authSvc.AuthorizeOrCreate(ctx, ProviderUserInfo{
-		Provider:    "github",
-		ProviderUID: "known-uid",
-		Email:       "known@example.com",
-		Nickname:    "known",
-		AvatarURL:   "",
-	}, "app-1")
-
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if code == "" {
-		t.Error("expected non-empty auth code")
-	}
-
-	if len(sr.subs) != 1 {
-		t.Errorf("expected 1 subscription, got %d", len(sr.subs))
-	}
+		err := authSvc.Logout(ctx, "invalid-token")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }
 
 func TestHashToken_Deterministic(t *testing.T) {
@@ -591,6 +240,195 @@ func TestHashToken_Deterministic(t *testing.T) {
 	}
 }
 
+func TestAuthService_RefreshToken(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	plans := map[string]*model.Plan{
+		"free":    {ID: "free", Name: "免费", Apps: []string{"yundian"}},
+		"monthly": {ID: "monthly", Name: "按月订阅", Apps: []string{"yundian", "yundash"}},
+	}
+
+	tests := []struct {
+		name        string
+		refreshToken string
+		appID       string
+		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo)
+		wantErr     bool
+		errContains string
+		validate    func(t *testing.T, resp *LoginResponse)
+	}{
+		{
+			name: "refresh with valid token",
+			refreshToken: "valid-refresh-token",
+			appID:       "yundian",
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+
+				user := &model.User{ID: "user-1", Status: "active"}
+				ur.users["user-1"] = user
+
+				session := &model.Session{
+					ID:           "sess-1",
+					UserID:       "user-1",
+					AppID:        "yundian",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("valid-refresh-token"),
+					Scope:        []string{"yundian"},
+					Revoked:      false,
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+				ssr.sessions[session.ID] = session
+				ssr.byToken[session.RefreshToken] = session
+			},
+			wantErr: false,
+			validate: func(t *testing.T, resp *LoginResponse) {
+				if resp.AccessToken == "" {
+					t.Error("expected access token")
+				}
+				if resp.RefreshToken == "" {
+					t.Error("expected refresh token")
+				}
+				if resp.Subscription.PlanID != "free" {
+					t.Errorf("expected plan free, got %s", resp.Subscription.PlanID)
+				}
+			},
+		},
+		{
+			name: "refresh with expired session token",
+			refreshToken: "expired-token",
+			appID:       "yundian",
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+
+				user := &model.User{ID: "user-2", Status: "active"}
+				ur.users["user-2"] = user
+
+				session := &model.Session{
+					ID:           "sess-2",
+					UserID:       "user-2",
+					AppID:        "yundian",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("expired-token"),
+					Scope:        []string{"yundian"},
+					Revoked:      false,
+					ExpiresAt:    time.Now().Add(-time.Hour), // expired
+				}
+				ssr.sessions[session.ID] = session
+				ssr.byToken[session.RefreshToken] = session
+			},
+			wantErr:     true,
+			errContains: "invalid refresh token",
+		},
+		{
+			name: "refresh with revoked token",
+			refreshToken: "revoked-token",
+			appID:       "yundian",
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+
+				user := &model.User{ID: "user-3", Status: "active"}
+				ur.users["user-3"] = user
+
+				session := &model.Session{
+					ID:           "sess-3",
+					UserID:       "user-3",
+					AppID:        "yundian",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("revoked-token"),
+					Scope:        []string{"yundian"},
+					Revoked:      true, // revoked
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+				ssr.sessions[session.ID] = session
+				ssr.byToken[session.RefreshToken] = session
+			},
+			wantErr:     true,
+			errContains: "invalid refresh token",
+		},
+		{
+			name: "refresh for paid app with subscription",
+			refreshToken: "paid-user-token",
+			appID:       "yundash",
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.plans["monthly"] = plans["monthly"]
+
+				user := &model.User{ID: "user-paid", Status: "active"}
+				ur.users["user-paid"] = user
+
+				expiresAt := time.Now().Add(30 * 24 * time.Hour)
+				sr.subs["sub-paid"] = &model.Subscription{
+					ID:        "sub-paid",
+					UserID:    "user-paid",
+					PlanID:    "monthly",
+					Status:    "active",
+					ExpiresAt: &expiresAt,
+				}
+				sr.byUserID["user-paid"] = sr.subs["sub-paid"]
+
+				session := &model.Session{
+					ID:           "sess-paid",
+					UserID:       "user-paid",
+					AppID:        "yundash",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("paid-user-token"),
+					Scope:        []string{"yundian", "yundash"},
+					Revoked:      false,
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+				ssr.sessions[session.ID] = session
+				ssr.byToken[session.RefreshToken] = session
+			},
+			wantErr: false,
+			validate: func(t *testing.T, resp *LoginResponse) {
+				if resp.Subscription.PlanID != "monthly" {
+					t.Errorf("expected plan monthly, got %s", resp.Subscription.PlanID)
+				}
+				if !resp.Subscription.HasAccess {
+					t.Error("expected has_access=true for yundash on monthly plan")
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ur := newMockUserRepo()
+			sir := newMockSocialIdentityRepo()
+			pr := newMockPlanRepo()
+			sr := newMockSubscriptionRepo()
+			ssr := newMockSessionRepo()
+
+			tc.setup(ur, sir, pr, sr, ssr)
+
+			tokenSvc := newTokenServiceWithMocks(ssr, sr)
+			authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
+
+			resp, err := authSvc.RefreshToken(ctx, tc.refreshToken, tc.appID)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error containing %q, got nil", tc.errContains)
+				} else if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+					t.Errorf("expected error containing %q, got %q", tc.errContains, err.Error())
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tc.validate != nil {
+				tc.validate(t, resp)
+			}
+		})
+	}
+}
+
 func TestGenerateRefreshToken_Unique(t *testing.T) {
 	t.Parallel()
 
@@ -607,29 +445,5 @@ func TestGenerateRefreshToken_Unique(t *testing.T) {
 			t.Error("generated duplicate refresh token")
 		}
 		tokens[tok] = true
-	}
-}
-
-func TestParseDuration(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		input string
-		want  time.Duration
-	}{
-		{"15m", 15 * time.Minute},
-		{"1h", 1 * time.Hour},
-		{"168h", 168 * time.Hour},
-		{"invalid", 15 * time.Minute},
-		{"", 15 * time.Minute},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			got := parseDuration(tc.input)
-			if got != tc.want {
-				t.Errorf("parseDuration(%q) = %v, want %v", tc.input, got, tc.want)
-			}
-		})
 	}
 }

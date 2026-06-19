@@ -17,30 +17,31 @@ func Setup(
 	appRepo repo.AppRepo,
 	userRepo repo.UserRepo,
 	identityRepo repo.SocialIdentityRepo,
+	planRepo repo.PlanRepo,
 	subRepo repo.SubscriptionRepo,
 	sessionRepo repo.SessionRepo,
 	tokenSvc *service.TokenService,
 	authSvc *service.AuthService,
 	subSvc *service.SubscriptionService,
-	oauth *service.OAuthProvider,
-	stateHMACKey string,
+	planSvc *service.PlanService,
 ) {
-	// Health check — registered before the public rate limit so monitors
-	// are never throttled.
+	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
 	engine.GET("/healthz", healthHandler.Handle)
 
-	authHandler := handler.NewAuthHandler(authSvc, tokenSvc, oauth, stateHMACKey)
+	// Handlers
+	authHandler := handler.NewAuthHandler(authSvc, tokenSvc)
+	appHandler := handler.NewAppHandler(appRepo)
+	subHandler := handler.NewSubscriptionHandler(subSvc)
+	planHandler := handler.NewPlanHandler(planSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo, subRepo)
-	appHandler := handler.NewAppHandler(appRepo, subRepo, subSvc)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
 	engine.GET("/.well-known/jwks.json", publicLimiter, authHandler.JWKS)
-	engine.GET("/authorize", publicLimiter, authHandler.Authorize)
-	engine.GET("/callback/:provider", publicLimiter, authHandler.Callback)
-	engine.POST("/token", publicLimiter, authHandler.ExchangeToken)
-	engine.POST("/token/refresh", publicLimiter, authHandler.RefreshToken)
+	engine.POST("/auth/login", publicLimiter, authHandler.Login)
+	engine.POST("/auth/refresh", publicLimiter, authHandler.RefreshToken)
+	engine.POST("/auth/logout", publicLimiter, authHandler.Logout)
 
 	// User routes (JWT auth required)
 	userGroup := engine.Group("/user")
@@ -50,19 +51,34 @@ func Setup(
 		userGroup.PATCH("/profile", userHandler.UpdateProfile)
 		userGroup.GET("/identities", userHandler.ListIdentities)
 		userGroup.DELETE("/identities/:id", userHandler.UnbindIdentity)
-		userGroup.GET("/apps", userHandler.ListApps)
+		userGroup.GET("/subscriptions", subHandler.ListUserSubscriptions)
+		userGroup.POST("/subscriptions", subHandler.CreateSubscription)
+		userGroup.DELETE("/subscriptions/:id", subHandler.CancelSubscription)
 	}
 
-	// App management routes (app_id + app_secret auth required)
+	// App routes (internal service auth)
 	appLimiter := middleware.RateLimit(ctx, 30, 60)
-	appGroup := engine.Group("")
-	appGroup.Use(appLimiter, middleware.AppAuth(appRepo))
+	appGroup := engine.Group("/apps")
+	appGroup.Use(appLimiter, middleware.InternalAppAuth(appRepo))
 	{
-		appGroup.POST("/apps", appHandler.CreateApp)
-		appGroup.GET("/apps/:id", appHandler.GetApp)
-		appGroup.PATCH("/apps/:id", appHandler.UpdateApp)
-		appGroup.POST("/subscriptions", appHandler.CreateSubscription)
-		appGroup.GET("/subscriptions/:id", appHandler.GetSubscription)
-		appGroup.DELETE("/subscriptions/:id", appHandler.CancelSubscription)
+		appGroup.GET("", appHandler.ListApps)
+		appGroup.GET("/:id", appHandler.GetApp)
+	}
+
+	// Admin routes for plan management (internal service auth)
+	adminLimiter := middleware.RateLimit(ctx, 30, 60)
+	adminGroup := engine.Group("/admin")
+	adminGroup.Use(adminLimiter, middleware.InternalAppAuth(appRepo))
+	{
+		// Plan management
+		adminGroup.GET("/plans", planHandler.ListPlans)
+		adminGroup.GET("/plans/:id", planHandler.GetPlan)
+		adminGroup.POST("/plans", planHandler.CreatePlan)
+		adminGroup.PATCH("/plans/:id", planHandler.UpdatePlan)
+		adminGroup.DELETE("/plans/:id", planHandler.DeletePlan)
+
+		// App management
+		adminGroup.POST("/apps", appHandler.CreateApp)
+		adminGroup.PATCH("/apps/:id", appHandler.UpdateApp)
 	}
 }

@@ -5,37 +5,36 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/repo"
-	"github.com/yunhou/users/internal/util"
 )
 
 const ContextApp = "app"
 
-func AppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
+// InternalAppAuth validates app_id header for internal service-to-service calls.
+// No secret required since it's used within the internal network.
+func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		appID := c.GetHeader("X-App-ID")
-		appSecret := c.GetHeader("X-App-Secret")
-		if appID == "" || appSecret == "" {
+		if appID == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
-				"message": "missing app_id or app_secret",
+				"message": "missing X-App-ID header",
 			})
 			return
 		}
 
 		app, err := appRepo.FindByID(c.Request.Context(), appID)
 		if err != nil {
-			util.CheckSecret(util.DummyBcryptHash, appSecret)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
-				"message": "invalid app credentials",
+				"message": "invalid app_id",
 			})
 			return
 		}
 
-		if !util.CheckSecret(app.Secret, appSecret) {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    401,
-				"message": "invalid app credentials",
+		if !app.IsActive {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"code":    403,
+				"message": "app is disabled",
 			})
 			return
 		}

@@ -4,7 +4,7 @@ This file provides guidance to kscc (claude.ai/code) when working with code in t
 
 ## Project Overview
 
-Yunhou Users is a **shared user management API** serving multiple consumer applications via RESTful APIs. All apps share the same user identity — one account per person across all consumers. Authentication is **social OAuth only** (GitHub, Google, WeChat); there is no email/password registration.
+Yunhou Users is a **shared user management API** serving multiple consumer applications via RESTful APIs. All apps share the same user identity — one account per person across all consumers. Authentication is **social OAuth only** (GitHub, Google); there is no email/password registration.
 
 ## Architecture
 

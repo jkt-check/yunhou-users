@@ -98,7 +98,7 @@ type SubscriptionInfo struct {
 
 // Login authenticates a user via provider token and returns tokens + subscription info.
 func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginResponse, error) {
-	// 1. Get user info from provider (GitHub/Google/WeChat)
+	// 1. Get user info from provider (GitHub/Google)
 	providerUser, err := s.getProviderUser(req.Provider, req.ProviderToken)
 	if err != nil {
 		return nil, fmt.Errorf("invalid provider token: %w", err)
@@ -308,6 +308,11 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		if err != nil {
 			return nil, fmt.Errorf("get plan: %w", err)
 		}
+	}
+
+	// Fall back to session's app_id if not provided
+	if appID == "" {
+		appID = session.AppID
 	}
 
 	hasAccess := slices.Contains(plan.Apps, appID)

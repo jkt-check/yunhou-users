@@ -108,6 +108,42 @@ curl https://your-yunhou-domain/user/profile \
 
 ### 公共接口
 
+#### GET /healthz
+
+健康检查（用于负载均衡器或 K8s 探针）。
+
+**响应（200）**：
+```json
+{"code": 0, "data": {"status": "ok"}}
+```
+
+**响应（503）**—— 数据库不可用时：
+```json
+{"code": 503, "message": "db unavailable"}
+```
+
+#### GET /.well-known/jwks.json
+
+获取 RSA 公钥，用于本地验证 JWT 签名。
+
+**响应（200）**：
+```json
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "yunhou-users-rsa",
+      "alg": "RS256",
+      "use": "sig",
+      "n": "<base64url-encoded-modulus>",
+      "e": "AQAB"
+    }
+  ]
+}
+```
+
+> 建议缓存此响应，TTL 建议 1 小时。
+
 #### POST /auth/login
 
 登录接口。
@@ -157,9 +193,15 @@ curl https://your-yunhou-domain/user/profile \
 **请求体**：
 ```json
 {
-  "refresh_token": "a1b2c3d4e5f6..."
+  "refresh_token": "a1b2c3d4e5f6...",
+  "app_id": "yundian"
 }
 ```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `refresh_token` | 是 | 刷新令牌 |
+| `app_id` | 否 | 要访问的 App ID，不填则使用登录时的 App ID |
 
 **响应（200）**：
 ```json
@@ -259,6 +301,16 @@ Authorization: Bearer <access_token>
 
 > 用户必须至少保留一个社交账号绑定。
 
+**响应（200）**：
+```json
+{"code": 0, "message": "unbound"}
+```
+
+**响应（400）**—— 最后一个身份无法解绑：
+```json
+{"code": 400, "message": "must keep at least one social account"}
+```
+
 #### GET /user/subscriptions
 
 查看用户的订阅历史。
@@ -287,13 +339,74 @@ Authorization: Bearer <access_token>
 **请求体**：
 ```json
 {
-  "plan_id": "monthly"
+  "plan_id": "monthly",
+  "expires_at": "2025-07-19T00:00:00Z"
 }
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `plan_id` | 是 | 订阅的 Plan ID |
+| `expires_at` | 否 | 订阅过期时间（RFC3339 格式），用于测试或管理员代操作 |
 ```
 
 #### DELETE /user/subscriptions/:id
 
 取消订阅。
+
+**响应（200）**：
+```json
+{"code": 0, "message": "cancelled"}
+```
+
+---
+
+### App 接口
+
+App 列表接口，查询可用的应用（公开，限流）。
+
+#### GET /apps
+
+查看所有已注册的应用。
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": [
+    {
+      "app_id": "yundian",
+      "name": "云店",
+      "description": "电商应用",
+      "is_active": true,
+      "created_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+#### GET /apps/:id
+
+查看指定应用详情。
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": {
+    "app_id": "yundian",
+    "name": "云店",
+    "description": "电商应用",
+    "is_active": true,
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+}
+```
+
+**响应（404）**：
+```json
+{"code": 404, "message": "app not found"}
+```
 
 ---
 
@@ -348,13 +461,86 @@ Authorization: Bearer <access_token>
 }
 ```
 
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `id` | 是 | Plan 唯一标识 |
+| `name` | 是 | Plan 显示名称 |
+| `price` | 否 | 价格，默认 0 |
+| `interval_days` | 否 | 订阅周期（天），默认 0（永久） |
+| `apps` | 否 | 可访问的 App 列表，默认空 |
+| `is_default` | 否 | 是否为默认 Plan，默认 false |
+
+> `is_active` 在创建时默认设为 `true`。
+
 #### PATCH /admin/plans/:id
 
 更新 Plan。
 
+**请求体**：
+```json
+{
+  "name": "新名称",
+  "price": 39.9,
+  "interval_days": 30,
+  "apps": ["yundian", "yundash", "yundown"],
+  "is_active": true,
+  "is_default": false
+}
+```
+
+所有字段均为可选，仅更新提供的字段。
+
 #### DELETE /admin/plans/:id
 
 删除 Plan（仅当无用户订阅时）。
+
+#### POST /admin/apps
+
+创建 App。
+
+**请求体**：
+```json
+{
+  "app_id": "yundash",
+  "name": "云dash",
+  "description": "Dashboard 应用"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `app_id` | 是 | App 唯一标识 |
+| `name` | 是 | App 显示名称 |
+| `description` | 否 | App 描述 |
+
+**响应（201）**：
+```json
+{
+  "code": 0,
+  "data": {
+    "app_id": "yundash",
+    "name": "云dash",
+    "description": "Dashboard 应用",
+    "is_active": true,
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+}
+```
+
+#### PATCH /admin/apps/:id
+
+更新 App。
+
+**请求体**：
+```json
+{
+  "name": "新名称",
+  "description": "新描述",
+  "is_active": false
+}
+```
+
+所有字段均为可选。
 
 ---
 
@@ -418,6 +604,7 @@ GET /.well-known/jwks.json
 | `apps` | string[] | 该 Plan 可访问的 App 列表 |
 | `is_active` | bool | 是否启用 |
 | `is_default` | bool | 是否为默认 Plan |
+| `created_at` | datetime | 创建时间 |
 
 ### App
 
@@ -426,8 +613,9 @@ GET /.well-known/jwks.json
 | `app_id` | string | App ID（如 `yundian`） |
 | `name` | string | App 名称 |
 | `description` | string | 描述 |
-| `config` | jsonb | 扩展配置 |
+| `config` | jsonb | 扩展配置（可选） |
 | `is_active` | bool | 是否启用 |
+| `created_at` | datetime | 创建时间 |
 
 ### Subscription
 
@@ -439,6 +627,8 @@ GET /.well-known/jwks.json
 | `status` | string | 状态：`active` / `expired` / `cancelled` |
 | `started_at` | datetime | 开始时间 |
 | `expires_at` | datetime? | 过期时间，null 表示永不过期 |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
 
 ### User
 
@@ -446,8 +636,11 @@ GET /.well-known/jwks.json
 |------|------|------|
 | `id` | string | 用户 ID（UUID） |
 | `nickname` | string? | 昵称 |
+| `email` | string? | 邮箱 |
 | `avatar_url` | string? | 头像 URL |
 | `status` | string | 状态：`active` / `suspended` / `deleted` |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
 
 ### SocialIdentity
 
@@ -458,6 +651,7 @@ GET /.well-known/jwks.json
 | `provider` | string | 提供方：`github` / `google` |
 | `provider_uid` | string | 提供方用户 ID |
 | `email` | string? | 关联邮箱 |
+| `created_at` | datetime | 创建时间 |
 
 ### Session
 
@@ -470,6 +664,7 @@ GET /.well-known/jwks.json
 | `scope` | string[] | 权限范围（Plan 的 apps） |
 | `revoked` | bool | 是否已撤销 |
 | `expires_at` | datetime | 过期时间 |
+| `created_at` | datetime | 创建时间 |
 
 ---
 

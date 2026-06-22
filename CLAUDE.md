@@ -40,7 +40,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 - `make deps` — tidy go.mod
 - `make generate-keys` — generate RSA key pair in `keys/`
 - `go test -race -run TestFoo ./internal/service/` — run a single test
-- Database migration: `psql -d yunhou_users -f migrations/002_simplify_plans.sql`
+- Database migration: apply `001_init.sql` first, then `002_simplify_plans.sql` (002 alters tables created by 001).
 
 ## Required Environment Variables
 
@@ -67,7 +67,7 @@ All endpoints return:
 ## Endpoints
 
 **Public** (rate-limited 10/s burst 20 per IP):
-- `GET /.well-known/jwks.json`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`
+- `GET /healthz`, `GET /.well-known/jwks.json`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`
 
 **User** (JWT Bearer auth):
 - `GET /user/profile`, `PATCH /user/profile`, `GET /user/identities`, `DELETE /user/identities/:id`, `GET /user/subscriptions`, `POST /user/subscriptions`, `DELETE /user/subscriptions/:id`

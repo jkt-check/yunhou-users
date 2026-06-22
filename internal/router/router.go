@@ -34,7 +34,7 @@ func Setup(
 	appHandler := handler.NewAppHandler(appRepo)
 	subHandler := handler.NewSubscriptionHandler(subSvc)
 	planHandler := handler.NewPlanHandler(planSvc)
-	userHandler := handler.NewUserHandler(userRepo, identityRepo, subRepo)
+	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)

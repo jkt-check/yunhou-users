@@ -499,7 +499,7 @@ func TestSubscriptionHandler_ListUserSubscriptions(t *testing.T) {
 		handler := NewSubscriptionHandler(subSvc)
 
 		router := gin.New()
-		router.GET("/user/subscriptions", handler.ListUserSubscriptions)
+		router.GET("/user/subscriptions", func(c *gin.Context) { c.Set("user_id", "user-123") }, handler.ListUserSubscriptions)
 
 		req := httptest.NewRequest(http.MethodGet, "/user/subscriptions", nil)
 		w := httptest.NewRecorder()
@@ -519,7 +519,7 @@ func TestSubscriptionHandler_CreateSubscription(t *testing.T) {
 		handler := NewSubscriptionHandler(subSvc)
 
 		router := gin.New()
-		router.POST("/user/subscriptions", handler.CreateSubscription)
+		router.POST("/user/subscriptions", func(c *gin.Context) { c.Set("user_id", "user-123") }, handler.CreateSubscription)
 
 		body := `{"plan_id":"monthly"}`
 		req := httptest.NewRequest(http.MethodPost, "/user/subscriptions", bytes.NewBufferString(body))
@@ -541,7 +541,7 @@ func TestSubscriptionHandler_CancelSubscription(t *testing.T) {
 		handler := NewSubscriptionHandler(subSvc)
 
 		router := gin.New()
-		router.DELETE("/user/subscriptions/:id", handler.CancelSubscription)
+		router.DELETE("/user/subscriptions/:id", func(c *gin.Context) { c.Set("user_id", "user-123") }, handler.CancelSubscription)
 
 		req := httptest.NewRequest(http.MethodDelete, "/user/subscriptions/sub-1", nil)
 		w := httptest.NewRecorder()
@@ -770,7 +770,7 @@ func TestUserHandler_GetProfile(t *testing.T) {
 		nickname := "testuser"
 		user := &model.User{ID: userID, Nickname: &nickname}
 		userRepo := &mockUserRepo{user: user}
-		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
 
 		router := gin.New()
 		router.GET("/profile", func(c *gin.Context) { c.Set("user_id", userID) }, handler.GetProfile)
@@ -786,7 +786,7 @@ func TestUserHandler_GetProfile(t *testing.T) {
 
 	t.Run("user not found", func(t *testing.T) {
 		userRepo := &mockUserRepo{findErr: sql.ErrNoRows}
-		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
 
 		router := gin.New()
 		router.GET("/profile", func(c *gin.Context) { c.Set("user_id", "nonexistent") }, handler.GetProfile)
@@ -809,7 +809,7 @@ func TestUserHandler_UpdateProfile(t *testing.T) {
 		oldNickname := "oldname"
 		user := &model.User{ID: userID, Nickname: &oldNickname}
 		userRepo := &mockUserRepo{user: user}
-		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
 
 		router := gin.New()
 		router.PATCH("/profile", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UpdateProfile)
@@ -830,7 +830,7 @@ func TestUserHandler_UpdateProfile(t *testing.T) {
 		nickname := "testuser"
 		user := &model.User{ID: userID, Nickname: &nickname}
 		userRepo := &mockUserRepo{user: user}
-		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
 
 		router := gin.New()
 		router.PATCH("/profile", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UpdateProfile)
@@ -851,7 +851,7 @@ func TestUserHandler_UpdateProfile(t *testing.T) {
 		nickname := "testuser"
 		user := &model.User{ID: userID, Nickname: &nickname}
 		userRepo := &mockUserRepo{user: user}
-		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
 
 		router := gin.New()
 		router.PATCH("/profile", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UpdateProfile)
@@ -869,7 +869,7 @@ func TestUserHandler_UpdateProfile(t *testing.T) {
 
 	t.Run("user not found", func(t *testing.T) {
 		userRepo := &mockUserRepo{findErr: sql.ErrNoRows}
-		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
 
 		router := gin.New()
 		router.PATCH("/profile", func(c *gin.Context) { c.Set("user_id", "nonexistent") }, handler.UpdateProfile)
@@ -896,7 +896,7 @@ func TestUserHandler_ListIdentities(t *testing.T) {
 			{ID: "id2", UserID: userID, Provider: "google"},
 		}
 		identityRepo := &mockIdentityRepo{identities: identities}
-		handler := NewUserHandler(&mockUserRepo{}, identityRepo, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(&mockUserRepo{}, identityRepo)
 
 		router := gin.New()
 		router.GET("/identities", func(c *gin.Context) { c.Set("user_id", userID) }, handler.ListIdentities)
@@ -913,7 +913,7 @@ func TestUserHandler_ListIdentities(t *testing.T) {
 	t.Run("list identities error", func(t *testing.T) {
 		userID := "user-123"
 		identityRepo := &mockIdentityRepo{listErr: errors.New("db error")}
-		handler := NewUserHandler(&mockUserRepo{}, identityRepo, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(&mockUserRepo{}, identityRepo)
 
 		router := gin.New()
 		router.GET("/identities", func(c *gin.Context) { c.Set("user_id", userID) }, handler.ListIdentities)
@@ -935,7 +935,7 @@ func TestUserHandler_UnbindIdentity(t *testing.T) {
 		userID := "user-123"
 		identityID := "id1"
 		identityRepo := &mockIdentityRepo{deleteResult: true}
-		handler := NewUserHandler(&mockUserRepo{}, identityRepo, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(&mockUserRepo{}, identityRepo)
 
 		router := gin.New()
 		router.DELETE("/identities/:id", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UnbindIdentity)
@@ -952,7 +952,7 @@ func TestUserHandler_UnbindIdentity(t *testing.T) {
 	t.Run("unbind - last identity", func(t *testing.T) {
 		userID := "user-123"
 		identityRepo := &mockIdentityRepo{deleteResult: false}
-		handler := NewUserHandler(&mockUserRepo{}, identityRepo, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(&mockUserRepo{}, identityRepo)
 
 		router := gin.New()
 		router.DELETE("/identities/:id", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UnbindIdentity)
@@ -969,7 +969,7 @@ func TestUserHandler_UnbindIdentity(t *testing.T) {
 	t.Run("unbind error", func(t *testing.T) {
 		userID := "user-123"
 		identityRepo := &mockIdentityRepo{deleteErr: errors.New("db error")}
-		handler := NewUserHandler(&mockUserRepo{}, identityRepo, &mockSubscriptionRepoForUser{})
+		handler := NewUserHandler(&mockUserRepo{}, identityRepo)
 
 		router := gin.New()
 		router.DELETE("/identities/:id", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UnbindIdentity)
@@ -984,43 +984,11 @@ func TestUserHandler_UnbindIdentity(t *testing.T) {
 	})
 }
 
-func TestUserHandler_ListApps(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	t.Run("list apps success", func(t *testing.T) {
-		userID := "user-123"
-		subs := []model.Subscription{{ID: "sub1", UserID: userID, PlanID: "monthly"}}
-		subRepo := &mockSubscriptionRepoForUser{subs: subs}
-		handler := NewUserHandler(&mockUserRepo{}, &mockIdentityRepo{}, subRepo)
-
-		router := gin.New()
-		router.GET("/apps", func(c *gin.Context) { c.Set("user_id", userID) }, handler.ListApps)
-
-		req := httptest.NewRequest(http.MethodGet, "/apps", nil)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", w.Code)
-		}
-	})
-
-	t.Run("list apps error", func(t *testing.T) {
-		userID := "user-123"
-		subRepo := &mockSubscriptionRepoForUser{listErr: errors.New("db error")}
-		handler := NewUserHandler(&mockUserRepo{}, &mockIdentityRepo{}, subRepo)
-
-		router := gin.New()
-		router.GET("/apps", func(c *gin.Context) { c.Set("user_id", userID) }, handler.ListApps)
-
-		req := httptest.NewRequest(http.MethodGet, "/apps", nil)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusInternalServerError {
-			t.Errorf("expected 500, got %d", w.Code)
-		}
-	})
+func TestUserHandler_ListAppsRemoved(t *testing.T) {
+	// UserHandler.ListApps was removed: subscriptions live under the
+	// SubscriptionHandler (`GET /user/subscriptions`), so this test exists
+	// only as a placeholder documenting the deletion.
+	_ = (*UserHandler)(nil)
 }
 
 // --- Mock implementations for UserHandler tests ---
@@ -1065,16 +1033,4 @@ func (m *mockIdentityRepo) DeleteIfNotLast(ctx context.Context, id, userID strin
 		return false, m.deleteErr
 	}
 	return m.deleteResult, nil
-}
-
-type mockSubscriptionRepoForUser struct {
-	subs    []model.Subscription
-	listErr error
-}
-
-func (m *mockSubscriptionRepoForUser) ListByUserID(ctx context.Context, userID string) ([]model.Subscription, error) {
-	if m.listErr != nil {
-		return nil, m.listErr
-	}
-	return m.subs, nil
 }

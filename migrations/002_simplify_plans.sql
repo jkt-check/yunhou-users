@@ -37,11 +37,25 @@ ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_id TEXT;
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT now();
 
 -- 迁移数据：plan -> plan_id, 设置 started_at
-UPDATE subscriptions SET plan_id = plan, started_at = created_at;
+-- COALESCE handles any legacy rows where plan is NULL — they fall back to
+-- 'free' instead of failing the subsequent NOT NULL constraint below.
+-- Lowercase normalization guards against mixed-case plan values that wouldn't
+-- match any of the seeded plan IDs (free/monthly/quarterly/yearly).
+UPDATE subscriptions SET
+    plan_id = LOWER(COALESCE(plan, 'free')),
+    started_at = COALESCE(started_at, created_at, now());
 
 -- 设置非空约束
 ALTER TABLE subscriptions ALTER COLUMN plan_id SET NOT NULL;
 ALTER TABLE subscriptions ALTER COLUMN started_at SET NOT NULL;
+
+-- Enforce price >= 0 and interval_days >= 0 going forward.
+ALTER TABLE plans ADD CONSTRAINT plans_price_nonneg CHECK (price >= 0);
+ALTER TABLE plans ADD CONSTRAINT plans_interval_nonneg CHECK (interval_days >= 0);
+
+-- Only one plan can be the default. Partial unique index allows the
+-- "non-default" case to have many rows but at most one default.
+CREATE UNIQUE INDEX IF NOT EXISTS plans_one_default ON plans ((1)) WHERE is_default;
 
 -- 删除旧列
 ALTER TABLE subscriptions DROP COLUMN IF EXISTS app_id;

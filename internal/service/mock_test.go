@@ -149,55 +149,6 @@ func (m *mockSocialIdentityRepo) DeleteIfNotLast(_ context.Context, id, userID s
 	return true, nil
 }
 
-// --- AppRepo mock ---
-
-type mockAppRepo struct {
-	apps map[string]*model.App
-	err  error
-}
-
-func newMockAppRepo() *mockAppRepo {
-	return &mockAppRepo{apps: make(map[string]*model.App)}
-}
-
-func (m *mockAppRepo) Create(_ context.Context, a *model.App) error {
-	if m.err != nil {
-		return m.err
-	}
-	m.apps[a.AppID] = a
-	return nil
-}
-
-func (m *mockAppRepo) FindByID(_ context.Context, id string) (*model.App, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	a, ok := m.apps[id]
-	if !ok {
-		return nil, sql.ErrNoRows
-	}
-	return a, nil
-}
-
-func (m *mockAppRepo) Update(_ context.Context, a *model.App) error {
-	if m.err != nil {
-		return m.err
-	}
-	m.apps[a.AppID] = a
-	return nil
-}
-
-func (m *mockAppRepo) List(_ context.Context) ([]model.App, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	var result []model.App
-	for _, a := range m.apps {
-		result = append(result, *a)
-	}
-	return result, nil
-}
-
 // --- PlanRepo mock ---
 
 type mockPlanRepo struct {
@@ -475,6 +426,78 @@ func (m *mockSessionRepo) ExchangeAuthCode(_ context.Context, oldID string, newS
 	return true, nil
 }
 
+func (m *mockSessionRepo) RevokeFamilyByUserApp(_ context.Context, userID, appID string) error {
+	for _, s := range m.sessions {
+		if s.UserID == userID && s.AppID == appID && !s.Revoked {
+			s.Revoked = true
+		}
+	}
+	return nil
+}
+
+// --- AppRepo mock ---
+//
+// The AuthService now verifies the requested app exists and is active before
+// issuing tokens. Tests need to seed apps for the requests they drive.
+
+type mockAppRepo struct {
+	apps      map[string]*model.App
+	findErr   error
+	listErr   error
+	createErr error
+	updateErr error
+}
+
+func newMockAppRepo() *mockAppRepo {
+	return &mockAppRepo{apps: make(map[string]*model.App)}
+}
+
+func (m *mockAppRepo) seedActive(appID, name string) {
+	m.apps[appID] = &model.App{AppID: appID, Name: name, IsActive: true}
+}
+
+func (m *mockAppRepo) seedInactive(appID, name string) {
+	m.apps[appID] = &model.App{AppID: appID, Name: name, IsActive: false}
+}
+
+func (m *mockAppRepo) FindByID(_ context.Context, id string) (*model.App, error) {
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+	a, ok := m.apps[id]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	return a, nil
+}
+
+func (m *mockAppRepo) Create(_ context.Context, a *model.App) error {
+	if m.createErr != nil {
+		return m.createErr
+	}
+	m.apps[a.AppID] = a
+	return nil
+}
+
+func (m *mockAppRepo) Update(_ context.Context, a *model.App) error {
+	if m.updateErr != nil {
+		return m.updateErr
+	}
+	m.apps[a.AppID] = a
+	return nil
+}
+
+func (m *mockAppRepo) List(_ context.Context) ([]model.App, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	out := make([]model.App, 0, len(m.apps))
+	for _, a := range m.apps {
+		out = append(out, *a)
+	}
+	return out, nil
+}
+
 // --- Test RSA key pair helpers ---
 
 func generateTestRSAKeyPair() (*rsa.PrivateKey, *rsa.PublicKey) {
@@ -490,8 +513,8 @@ func newTokenServiceWithKeys(sessionRepo *mockSessionRepo, subRepo *mockSubscrip
 	return &TokenService{
 		PrivateKey:  priv,
 		PublicKey:   pub,
-		AccessTTL:   "15m",
-		RefreshTTL:  "168h",
+		AccessTTL:   15 * time.Minute,
+		RefreshTTL: 168 * time.Hour,
 		SessionRepo: sessionRepo,
 		SubRepo:     subRepo,
 	}
@@ -502,8 +525,8 @@ func newTokenServiceWithMocks(sessionRepo *mockSessionRepo, subRepo *mockSubscri
 	return &TokenService{
 		PrivateKey:  priv,
 		PublicKey:   pub,
-		AccessTTL:   "15m",
-		RefreshTTL:  "168h",
+		AccessTTL:   15 * time.Minute,
+		RefreshTTL: 168 * time.Hour,
 		SessionRepo: sessionRepo,
 		SubRepo:     subRepo,
 	}

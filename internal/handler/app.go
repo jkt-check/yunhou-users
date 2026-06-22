@@ -6,9 +6,12 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
+	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
 )
@@ -103,7 +106,12 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 	}
 
 	if req.Name != nil {
-		app.Name = *req.Name
+		trimmed := strings.TrimSpace(*req.Name)
+		if trimmed == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "name must not be empty"})
+			return
+		}
+		app.Name = trimmed
 	}
 	if req.Description != nil {
 		app.Description = *req.Description
@@ -130,7 +138,11 @@ func NewSubscriptionHandler(subSvc service.SubscriptionServiceInterface) *Subscr
 }
 
 func (h *SubscriptionHandler) ListUserSubscriptions(c *gin.Context) {
-	userID := c.GetString("user_id")
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 	subs, err := h.subSvc.ListUserSubscriptions(c.Request.Context(), userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list subscriptions"})
@@ -149,7 +161,11 @@ func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 		return
 	}
 
-	userID := c.GetString("user_id")
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 
 	var expiresAt *time.Time
 	if req.ExpiresAt != nil {
@@ -168,17 +184,21 @@ func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrPlanNotFound):
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan not found"})
+			return
 		case errors.Is(err, service.ErrPlanInactive):
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is inactive"})
+			return
 		case errors.Is(err, service.ErrPaidPlanForbidden):
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "paid plans require payment, cannot self-subscribe"})
+			return
 		case errors.Is(err, service.ErrUserHasActiveSub), errors.Is(err, service.ErrSubscriptionExists):
 			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
+			return
 		default:
 			log.Printf("create subscription error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create subscription"})
+			return
 		}
-		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": sub})
@@ -186,7 +206,11 @@ func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 
 func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 	id := c.Param("id")
-	userID := c.GetString("user_id")
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 
 	if err := h.subSvc.Cancel(c.Request.Context(), id, userID); err != nil {
 		// Service intentionally returns ErrSubscriptionNotFound for both
@@ -194,13 +218,15 @@ func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrSubscriptionNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "subscription not found"})
+			return
 		case errors.Is(err, service.ErrAlreadyCancelled):
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "already cancelled"})
+			return
 		default:
 			log.Printf("cancel subscription error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to cancel subscription"})
+			return
 		}
-		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "cancelled"})
@@ -251,6 +277,14 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
 	}
+	if req.Price < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "price must be >= 0"})
+		return
+	}
+	if req.IntervalDays < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be >= 0"})
+		return
+	}
 
 	plan := &model.Plan{
 		ID:           req.ID,
@@ -299,9 +333,17 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 		plan.Name = *req.Name
 	}
 	if req.Price != nil {
+		if *req.Price < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "price must be >= 0"})
+			return
+		}
 		plan.Price = *req.Price
 	}
 	if req.IntervalDays != nil {
+		if *req.IntervalDays < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be >= 0"})
+			return
+		}
 		plan.IntervalDays = *req.IntervalDays
 	}
 	if req.Apps != nil {
@@ -325,8 +367,26 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 func (h *PlanHandler) DeletePlan(c *gin.Context) {
 	id := c.Param("id")
 	if err := h.planSvc.DeletePlan(c.Request.Context(), id); err != nil {
+		// Postgres returns SQLSTATE 23503 when a FK reference prevents the
+		// delete; surface that as a 409 Conflict with a clear message.
+		if isFKViolation(err) {
+			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is in use by existing subscriptions"})
+			return
+		}
+		log.Printf("delete plan error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to delete plan"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "deleted"})
+}
+
+// isFKViolation returns true for lib/pq *pq.Error whose SQLSTATE is 23503
+// (foreign_key_violation). Used by DeletePlan to map DB-level errors to a
+// meaningful HTTP status code.
+func isFKViolation(err error) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "23503"
+	}
+	return false
 }

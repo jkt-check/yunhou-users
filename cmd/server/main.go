@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +24,9 @@ func main() {
 	_ = godotenv.Load()
 
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config validation failed: %v", err)
+	}
 
 	db, err := sqlx.Connect("postgres", cfg.DatabaseURL)
 	if err != nil {
@@ -56,16 +63,69 @@ func main() {
 	}
 
 	planSvc := service.NewPlanService(planRepo)
-	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, tokenSvc)
+	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
-	engine := gin.Default()
-	router.Setup(context.Background(), engine, db,
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+	// Bound how long any handler can run before the client disconnects, to
+	// limit the blast radius of a slow downstream call (e.g. the OAuth
+	// provider timeout is 10s; we leave a little headroom here).
+	engine.Use(timeoutMiddleware(15 * time.Second))
+
+	// A cancelable context so the rate-limiter cleanup goroutines exit
+	// on shutdown (see internal/middleware/ratelimit.go).
+	rootCtx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	router.Setup(rootCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc)
 
-	log.Printf("starting server on :%s", cfg.Port)
-	if err := engine.Run(":" + cfg.Port); err != nil {
-		log.Fatalf("failed to start server: %v", err)
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           engine,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// Run the server in a goroutine so we can wait for SIGINT/SIGTERM
+	// in this one and shut down gracefully.
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("starting server on :%s", cfg.Port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatalf("server failed: %v", err)
+		}
+	case <-rootCtx.Done():
+		log.Printf("shutdown signal received, draining...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
+	}
+}
+
+// timeoutMiddleware caps each request's total wall-clock time. Without it
+// a slow upstream (e.g. provider userinfo) can hold a goroutine past
+// proxy_read_timeout and result in a partial response.
+func timeoutMiddleware(d time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), d)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
 	}
 }

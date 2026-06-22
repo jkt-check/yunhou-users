@@ -57,7 +57,9 @@ on the host terminate TLS.
 6. **Apply migrations**
 
    ```bash
-   # Run as postgres superuser (migration modifies tables that may be owned by postgres)
+   # Apply BOTH migrations in order. 002 alters tables created by 001 and
+   # will fail if 001 hasn't been applied yet.
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/001_init.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
    ```
 

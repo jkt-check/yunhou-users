@@ -43,10 +43,12 @@ psql -h localhost -U postgres -c "SELECT datname FROM pg_database WHERE datname 
 ## 第三步：执行数据库迁移（建表）
 
 ```bash
+# 必须按顺序执行：001 创建表，002 简化订阅系统（依赖 001 的结构）
 psql -h localhost -U postgres -d yunhou_users -f migrations/001_init.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/002_simplify_plans.sql
 ```
 
-这会创建 5 张表：`users`、`social_identities`、`apps`、`subscriptions`、`sessions`。
+这会创建 6 张表：`users`、`social_identities`、`apps`、`plans`、`subscriptions`、`sessions`。
 
 验证表是否创建成功：
 
@@ -58,6 +60,7 @@ psql -h localhost -U postgres -d yunhou_users -c "\dt"
 
 ```
  apps
+ plans
  sessions
  social_identities
  subscriptions

@@ -56,6 +56,7 @@ type SessionRepo interface {
 	Revoke(ctx context.Context, id string) error
 	RevokeIfNotRevoked(ctx context.Context, id string) (bool, error)
 	RotateRefresh(ctx context.Context, oldID string, newSession *model.Session) error
+	RevokeFamilyByUserApp(ctx context.Context, userID, appID string) error
 	ExchangeAuthCode(ctx context.Context, oldID string, newSession *model.Session) (bool, error)
 }
 
@@ -316,6 +317,17 @@ func (r *sessionRepo) Create(ctx context.Context, s *model.Session) error {
 		INSERT INTO sessions (id, user_id, app_id, session_type, refresh_token, scope, revoked, expires_at)
 		VALUES (:id, :user_id, :app_id, :session_type, :refresh_token, :scope, :revoked, :expires_at)
 	`, s)
+	return err
+}
+
+// RevokeFamilyByUserApp marks every active session for (user_id, app_id) as
+// revoked. Used as a security response when refresh-token reuse is detected:
+// revoking the whole family limits the blast radius of a stolen token.
+func (r *sessionRepo) RevokeFamilyByUserApp(ctx context.Context, userID, appID string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE sessions SET revoked = true
+		WHERE user_id = $1 AND app_id = $2 AND revoked = false
+	`, userID, appID)
 	return err
 }
 

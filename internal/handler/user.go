@@ -25,18 +25,13 @@ type IdentityRepoInterface interface {
 	DeleteIfNotLast(ctx context.Context, id, userID string) (bool, error)
 }
 
-type SubscriptionRepoInterface interface {
-	ListByUserID(ctx context.Context, userID string) ([]model.Subscription, error)
-}
-
 type UserHandler struct {
 	userRepo     UserRepoInterface
 	identityRepo IdentityRepoInterface
-	subRepo      SubscriptionRepoInterface
 }
 
-func NewUserHandler(userRepo UserRepoInterface, identityRepo IdentityRepoInterface, subRepo SubscriptionRepoInterface) *UserHandler {
-	return &UserHandler{userRepo: userRepo, identityRepo: identityRepo, subRepo: subRepo}
+func NewUserHandler(userRepo UserRepoInterface, identityRepo IdentityRepoInterface) *UserHandler {
+	return &UserHandler{userRepo: userRepo, identityRepo: identityRepo}
 }
 
 func (h *UserHandler) GetProfile(c *gin.Context) {
@@ -87,8 +82,10 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 	}
 	if req.AvatarURL != nil {
 		u, err := url.Parse(*req.AvatarURL)
-		if err != nil || u.Scheme != "https" || u.Host == "" || u.Fragment != "" {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "avatar_url must be a valid HTTPS URL without fragment"})
+		// Reject anything that isn't a clean HTTPS URL. userinfo (`https://x:y@evil.com`)
+		// would otherwise sneak a different host into the displayed link.
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.Fragment != "" || u.User != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "avatar_url must be a valid HTTPS URL without userinfo or fragment"})
 			return
 		}
 		normalized := u.String()
@@ -133,15 +130,4 @@ func (h *UserHandler) UnbindIdentity(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "unbound"})
-}
-
-func (h *UserHandler) ListApps(c *gin.Context) {
-	userID := c.GetString(middleware.ContextUserID)
-	list, err := h.subRepo.ListByUserID(c.Request.Context(), userID)
-	if err != nil {
-		log.Printf("list apps error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list apps"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list})
 }

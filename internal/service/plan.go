@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"slices"
 
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
@@ -43,21 +44,12 @@ func (s *PlanService) CheckAppAccess(ctx context.Context, sub *model.Subscriptio
 		if err != nil {
 			return false
 		}
-		return containsString(defaultPlan.Apps, appID)
+		return slices.Contains(defaultPlan.Apps, appID)
 	}
 
 	plan, err := s.planRepo.FindByID(ctx, sub.PlanID)
 	if err != nil {
 		return false
 	}
-	return containsString(plan.Apps, appID)
-}
-
-func containsString(arr []string, s string) bool {
-	for _, v := range arr {
-		if v == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(plan.Apps, appID)
 }

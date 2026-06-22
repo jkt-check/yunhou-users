@@ -53,7 +53,7 @@ func TestAuthService_Login(t *testing.T) {
 	tests := []struct {
 		name        string
 		req         LoginRequest
-		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo)
+		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo, *mockAppRepo)
 		wantErr     bool
 		errContains string
 		validate    func(t *testing.T, resp *LoginResponse)
@@ -65,9 +65,10 @@ func TestAuthService_Login(t *testing.T) {
 				ProviderToken: "newuser1",
 				AppID:        "yundian",
 			},
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.defaultPlan = plans["free"]
+				ar.seedActive("yundian", "云店")
 			},
 			wantErr: false,
 			validate: func(t *testing.T, resp *LoginResponse) {
@@ -92,9 +93,10 @@ func TestAuthService_Login(t *testing.T) {
 				ProviderToken: "newuser2",
 				AppID:        "yundash",
 			},
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.defaultPlan = plans["free"]
+				ar.seedActive("yundash", "云dash")
 			},
 			wantErr: false,
 			validate: func(t *testing.T, resp *LoginResponse) {
@@ -110,7 +112,7 @@ func TestAuthService_Login(t *testing.T) {
 				ProviderToken: "existing",  // yields ProviderUID "github_existing"
 				AppID:        "yundash",
 			},
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.plans["monthly"] = plans["monthly"]
 				pr.defaultPlan = plans["free"]
@@ -136,6 +138,7 @@ func TestAuthService_Login(t *testing.T) {
 				}
 				sr.subs["sub-1"] = existingSub
 				sr.byUserID["user-existing"] = existingSub
+				ar.seedActive("yundash", "云dash")
 			},
 			wantErr: false,
 			validate: func(t *testing.T, resp *LoginResponse) {
@@ -154,12 +157,44 @@ func TestAuthService_Login(t *testing.T) {
 				ProviderToken: "token",
 				AppID:        "yundian",
 			},
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.defaultPlan = plans["free"]
+				ar.seedActive("yundian", "云店")
 			},
 			wantErr:     true,
 			errContains: "unsupported provider",
+		},
+		{
+			name: "unknown app is rejected",
+			req: LoginRequest{
+				Provider:      "github",
+				ProviderToken: "no-such-app",
+				AppID:        "no-such-app",
+			},
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+				ar.seedActive("yundian", "云店")
+				// "no-such-app" intentionally not seeded
+			},
+			wantErr:     true,
+			errContains: "app not found",
+		},
+		{
+			name: "inactive app is rejected",
+			req: LoginRequest{
+				Provider:      "github",
+				ProviderToken: "inactive-app",
+				AppID:        "yundash",
+			},
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+				ar.seedInactive("yundash", "云dash (off)")
+			},
+			wantErr:     true,
+			errContains: "app is inactive",
 		},
 	}
 
@@ -170,11 +205,12 @@ func TestAuthService_Login(t *testing.T) {
 			pr := newMockPlanRepo()
 			sr := newMockSubscriptionRepo()
 			ssr := newMockSessionRepo()
+			ar := newMockAppRepo()
 
-			tc.setup(ur, sir, pr, sr, ssr)
+			tc.setup(ur, sir, pr, sr, ssr, ar)
 
 			tokenSvc := newTokenServiceWithMocks(ssr, sr)
-			authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
+			authSvc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
 			resp, err := authSvc.Login(ctx, tc.req)
 
@@ -209,9 +245,10 @@ func TestAuthService_Logout(t *testing.T) {
 		pr := newMockPlanRepo()
 		sr := newMockSubscriptionRepo()
 		ssr := newMockSessionRepo()
+		ar := newMockAppRepo()
 
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
-		authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
+		authSvc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
 		// Create a session first
 		sess := &model.Session{
@@ -243,9 +280,10 @@ func TestAuthService_Logout(t *testing.T) {
 		pr := newMockPlanRepo()
 		sr := newMockSubscriptionRepo()
 		ssr := newMockSessionRepo()
+		ar := newMockAppRepo()
 
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
-		authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
+		authSvc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
 		err := authSvc.Logout(ctx, "invalid-token")
 		if err != nil {
@@ -285,7 +323,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 		name        string
 		refreshToken string
 		appID       string
-		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo)
+		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo, *mockAppRepo)
 		wantErr     bool
 		errContains string
 		validate    func(t *testing.T, resp *LoginResponse)
@@ -294,7 +332,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			name: "refresh with valid token",
 			refreshToken: "valid-refresh-token",
 			appID:       "yundian",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.defaultPlan = plans["free"]
 
@@ -313,6 +351,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 				}
 				ssr.sessions[session.ID] = session
 				ssr.byToken[session.RefreshToken] = session
+				ar.seedActive("yundian", "云店")
 			},
 			wantErr: false,
 			validate: func(t *testing.T, resp *LoginResponse) {
@@ -331,7 +370,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			name: "refresh with expired session token",
 			refreshToken: "expired-token",
 			appID:       "yundian",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 
 				user := &model.User{ID: "user-2", Status: "active"}
@@ -349,6 +388,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 				}
 				ssr.sessions[session.ID] = session
 				ssr.byToken[session.RefreshToken] = session
+				ar.seedActive("yundian", "云店")
 			},
 			wantErr:     true,
 			errContains: "invalid refresh token",
@@ -357,7 +397,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			name: "refresh with revoked token",
 			refreshToken: "revoked-token",
 			appID:       "yundian",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 
 				user := &model.User{ID: "user-3", Status: "active"}
@@ -375,6 +415,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 				}
 				ssr.sessions[session.ID] = session
 				ssr.byToken[session.RefreshToken] = session
+				ar.seedActive("yundian", "云店")
 			},
 			wantErr:     true,
 			errContains: "invalid refresh token",
@@ -383,7 +424,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			name: "refresh for paid app with subscription",
 			refreshToken: "paid-user-token",
 			appID:       "yundash",
-			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo) {
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.plans["monthly"] = plans["monthly"]
 
@@ -412,6 +453,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 				}
 				ssr.sessions[session.ID] = session
 				ssr.byToken[session.RefreshToken] = session
+				ar.seedActive("yundash", "云dash")
 			},
 			wantErr: false,
 			validate: func(t *testing.T, resp *LoginResponse) {
@@ -423,6 +465,63 @@ func TestAuthService_RefreshToken(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "refresh rejects suspended user",
+			refreshToken: "suspended-user-token",
+			appID:       "yundian",
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+				ur.users["user-susp"] = &model.User{ID: "user-susp", Status: "suspended"}
+				session := &model.Session{
+					ID:           "sess-susp",
+					UserID:       "user-susp",
+					AppID:        "yundian",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("suspended-user-token"),
+					Revoked:      false,
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+				ssr.sessions[session.ID] = session
+				ssr.byToken[session.RefreshToken] = session
+				ar.seedActive("yundian", "云店")
+			},
+			wantErr:     true,
+			errContains: "suspended",
+		},
+		{
+			name: "refresh rejects expired subscription",
+			refreshToken: "expired-sub-token",
+			appID:       "yundian",
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+				ur.users["user-x"] = &model.User{ID: "user-x", Status: "active"}
+				pastExpiry := time.Now().Add(-time.Hour)
+				sr.subs["sub-x"] = &model.Subscription{
+					ID:        "sub-x",
+					UserID:    "user-x",
+					PlanID:    "free",
+					Status:    "active",
+					ExpiresAt: &pastExpiry,
+				}
+				sr.byUserID["user-x"] = sr.subs["sub-x"]
+				session := &model.Session{
+					ID:           "sess-x",
+					UserID:       "user-x",
+					AppID:        "yundian",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("expired-sub-token"),
+					Revoked:      false,
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+				ssr.sessions[session.ID] = session
+				ssr.byToken[session.RefreshToken] = session
+				ar.seedActive("yundian", "云店")
+			},
+			wantErr:     true,
+			errContains: "expired",
+		},
 	}
 
 	for _, tc := range tests {
@@ -432,11 +531,12 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			pr := newMockPlanRepo()
 			sr := newMockSubscriptionRepo()
 			ssr := newMockSessionRepo()
+			ar := newMockAppRepo()
 
-			tc.setup(ur, sir, pr, sr, ssr)
+			tc.setup(ur, sir, pr, sr, ssr, ar)
 
 			tokenSvc := newTokenServiceWithMocks(ssr, sr)
-			authSvc := NewAuthService(ur, sir, pr, sr, ssr, tokenSvc)
+			authSvc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
 			resp, err := authSvc.RefreshToken(ctx, tc.refreshToken, tc.appID)
 

@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,8 +20,8 @@ func TestTokenService_SignAndVerify(t *testing.T) {
 	tokenSvc := &TokenService{
 		PrivateKey: priv,
 		PublicKey:  pub,
-		AccessTTL:  "15m",
-		RefreshTTL: "168h",
+		AccessTTL:  15 * time.Minute,
+		RefreshTTL: 168 * time.Hour,
 	}
 
 	t.Run("sign and verify access token", func(t *testing.T) {
@@ -64,8 +65,8 @@ func TestTokenService_SignAndVerify(t *testing.T) {
 		otherSvc := &TokenService{
 			PrivateKey: otherPriv,
 			PublicKey:  pub,
-			AccessTTL:  "15m",
-			RefreshTTL: "168h",
+			AccessTTL:  15 * time.Minute,
+			RefreshTTL: 168 * time.Hour,
 		}
 
 		token, _ := otherSvc.SignAccessToken("user", "app", nil)
@@ -147,7 +148,7 @@ func TestTokenService_Refresh(t *testing.T) {
 
 	ctx := context.Background()
 
-	t.Run("refresh with valid session", func(t *testing.T) {
+	t.Run("refresh is deprecated — use AuthService", func(t *testing.T) {
 		priv, pub := generateTestRSAKeyPair()
 		sessionRepo := newMockSessionRepo()
 		subRepo := newMockSubscriptionRepo()
@@ -155,13 +156,16 @@ func TestTokenService_Refresh(t *testing.T) {
 		tokenSvc := &TokenService{
 			PrivateKey:  priv,
 			PublicKey:   pub,
-			AccessTTL:   "15m",
-			RefreshTTL:  "168h",
+			AccessTTL:   15 * time.Minute,
+			RefreshTTL:  168 * time.Hour,
 			SessionRepo: sessionRepo,
 			SubRepo:     subRepo,
 		}
 
-		// Create active session
+		// Seed a valid session; TokenService.Refresh is now a thin
+		// deprecation stub and must refuse to mint new tokens even when
+		// everything else looks correct. Real refresh logic lives in
+		// AuthService.RefreshToken (see auth_test.go).
 		refreshToken := "valid-refresh-token"
 		session := &model.Session{
 			ID:           "session-1",
@@ -176,31 +180,12 @@ func TestTokenService_Refresh(t *testing.T) {
 		sessionRepo.sessions[session.ID] = session
 		sessionRepo.byToken[hashToken(refreshToken)] = session
 
-		// Add active subscription
-		expiresAt := time.Now().Add(30 * 24 * time.Hour)
-		subRepo.subs["sub-1"] = &model.Subscription{
-			ID:        "sub-1",
-			UserID:    "user-1",
-			PlanID:    "monthly",
-			Status:    "active",
-			ExpiresAt: &expiresAt,
+		_, _, err := tokenSvc.Refresh(ctx, refreshToken, "yundian")
+		if err == nil {
+			t.Fatal("expected deprecation error, got nil")
 		}
-		subRepo.byUserID["user-1"] = subRepo.subs["sub-1"]
-
-		newAccess, newRefresh, err := tokenSvc.Refresh(ctx, refreshToken, "yundian")
-		if err != nil {
-			t.Fatalf("refresh: %v", err)
-		}
-		if newAccess == "" {
-			t.Error("new access token is empty")
-		}
-		if newRefresh == "" {
-			t.Error("new refresh token is empty")
-		}
-
-		// Old session should be revoked
-		if !sessionRepo.sessions["session-1"].Revoked {
-			t.Error("expected old session to be revoked")
+		if !strings.Contains(err.Error(), "deprecated") {
+			t.Errorf("expected deprecation message, got %q", err.Error())
 		}
 	})
 
@@ -212,8 +197,8 @@ func TestTokenService_Refresh(t *testing.T) {
 		tokenSvc := &TokenService{
 			PrivateKey:  priv,
 			PublicKey:   pub,
-			AccessTTL:   "15m",
-			RefreshTTL:  "168h",
+			AccessTTL:  15 * time.Minute,
+			RefreshTTL: 168 * time.Hour,
 			SessionRepo: sessionRepo,
 			SubRepo:     subRepo,
 		}
@@ -232,8 +217,8 @@ func TestTokenService_Refresh(t *testing.T) {
 		tokenSvc := &TokenService{
 			PrivateKey:  priv,
 			PublicKey:   pub,
-			AccessTTL:   "15m",
-			RefreshTTL:  "168h",
+			AccessTTL:  15 * time.Minute,
+			RefreshTTL: 168 * time.Hour,
 			SessionRepo: sessionRepo,
 			SubRepo:     subRepo,
 		}

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
@@ -25,7 +26,7 @@ func TestMain(m *testing.M) {
 	// Short-circuit real GitHub/Google calls for the whole integration suite.
 	// The tests pass arbitrary provider_token strings; we use the token as the
 	// stable provider UID so each unique token = unique user.
-	service.SetProviderVerifier(func(_ context.Context, provider, token string) (*service.ProviderUserInfo, error) {
+	restore := service.SetProviderVerifier(func(_ context.Context, provider, token string) (*service.ProviderUserInfo, error) {
 		switch provider {
 		case "github":
 			return &service.ProviderUserInfo{
@@ -45,7 +46,11 @@ func TestMain(m *testing.M) {
 			return nil, fmt.Errorf("unsupported provider: %s", provider)
 		}
 	})
-	os.Exit(m.Run())
+	code := m.Run()
+	// Restore so a later test binary run (or the same binary running
+	// other suites) doesn't leak the stub into production code paths.
+	restore()
+	os.Exit(code)
 }
 
 func dbURL() string {
@@ -110,8 +115,8 @@ func setupDB(t *testing.T) *sqlx.DB {
 func setupServer(db *sqlx.DB) *httptest.Server {
 	cfg := &config.Config{
 		Port:          "8080",
-		JWTAccessTTL:  "15m",
-		JWTRefreshTTL: "168h",
+		JWTAccessTTL:   15 * time.Minute,
+		JWTRefreshTTL: 168 * time.Hour,
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -126,7 +131,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 		panic(fmt.Sprintf("failed to init token service: %v", err))
 	}
 	planSvc := service.NewPlanService(planRepo)
-	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, tokenSvc)
+	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
 	engine := gin.New()

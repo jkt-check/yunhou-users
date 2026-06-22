@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestLoad_Defaults(t *testing.T) {
@@ -12,7 +13,6 @@ func TestLoad_Defaults(t *testing.T) {
 		"JWT_ACCESS_TTL", "JWT_REFRESH_TTL",
 		"GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
 		"GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
-		"WECHAT_CLIENT_ID", "WECHAT_CLIENT_SECRET",
 	}
 	for _, k := range envVars {
 		orig, had := os.LookupEnv(k)
@@ -40,11 +40,11 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.RSAPublic != "keys/public.pem" {
 		t.Errorf("RSAPublic: got %q, want %q", cfg.RSAPublic, "keys/public.pem")
 	}
-	if cfg.JWTAccessTTL != "15m" {
-		t.Errorf("JWTAccessTTL: got %q, want %q", cfg.JWTAccessTTL, "15m")
+	if cfg.JWTAccessTTL != 15*time.Minute {
+		t.Errorf("JWTAccessTTL: got %v, want %v", cfg.JWTAccessTTL, 15*time.Minute)
 	}
-	if cfg.JWTRefreshTTL != "168h" {
-		t.Errorf("JWTRefreshTTL: got %q, want %q", cfg.JWTRefreshTTL, "168h")
+	if cfg.JWTRefreshTTL != 168*time.Hour {
+		t.Errorf("JWTRefreshTTL: got %v, want %v", cfg.JWTRefreshTTL, 168*time.Hour)
 	}
 	// OAuth fields should be empty when env vars are unset
 	if cfg.GitHubClientID != "" {
@@ -58,12 +58,6 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.GoogleClientSecret != "" {
 		t.Errorf("GoogleClientSecret: got %q, want empty", cfg.GoogleClientSecret)
-	}
-	if cfg.WeChatClientID != "" {
-		t.Errorf("WeChatClientID: got %q, want empty", cfg.WeChatClientID)
-	}
-	if cfg.WeChatClientSecret != "" {
-		t.Errorf("WeChatClientSecret: got %q, want empty", cfg.WeChatClientSecret)
 	}
 }
 
@@ -79,8 +73,6 @@ func TestLoad_EnvVarsOverride(t *testing.T) {
 		"GITHUB_CLIENT_SECRET": "gh-secret",
 		"GOOGLE_CLIENT_ID":    "go-id",
 		"GOOGLE_CLIENT_SECRET": "go-secret",
-		"WECHAT_CLIENT_ID":    "wc-id",
-		"WECHAT_CLIENT_SECRET": "wc-secret",
 	}
 
 	for k, v := range envVars {
@@ -109,11 +101,11 @@ func TestLoad_EnvVarsOverride(t *testing.T) {
 	if cfg.RSAPublic != "/tmp/pub.pem" {
 		t.Errorf("RSAPublic: got %q, want %q", cfg.RSAPublic, "/tmp/pub.pem")
 	}
-	if cfg.JWTAccessTTL != "30m" {
-		t.Errorf("JWTAccessTTL: got %q, want %q", cfg.JWTAccessTTL, "30m")
+	if cfg.JWTAccessTTL != 30*time.Minute {
+		t.Errorf("JWTAccessTTL: got %v, want %v", cfg.JWTAccessTTL, 30*time.Minute)
 	}
-	if cfg.JWTRefreshTTL != "72h" {
-		t.Errorf("JWTRefreshTTL: got %q, want %q", cfg.JWTRefreshTTL, "72h")
+	if cfg.JWTRefreshTTL != 72*time.Hour {
+		t.Errorf("JWTRefreshTTL: got %v, want %v", cfg.JWTRefreshTTL, 72*time.Hour)
 	}
 	if cfg.GitHubClientID != "gh-id" {
 		t.Errorf("GitHubClientID: got %q, want %q", cfg.GitHubClientID, "gh-id")
@@ -126,12 +118,6 @@ func TestLoad_EnvVarsOverride(t *testing.T) {
 	}
 	if cfg.GoogleClientSecret != "go-secret" {
 		t.Errorf("GoogleClientSecret: got %q, want %q", cfg.GoogleClientSecret, "go-secret")
-	}
-	if cfg.WeChatClientID != "wc-id" {
-		t.Errorf("WeChatClientID: got %q, want %q", cfg.WeChatClientID, "wc-id")
-	}
-	if cfg.WeChatClientSecret != "wc-secret" {
-		t.Errorf("WeChatClientSecret: got %q, want %q", cfg.WeChatClientSecret, "wc-secret")
 	}
 }
 

@@ -16,6 +16,9 @@ A shared user management API for multi-app ecosystems. One user identity across 
 ```bash
 # 1. Set up PostgreSQL
 createdb yunhou_users
+# Run BOTH migrations in order — 002 alters tables created by 001 and
+# will fail if 001 hasn't been applied yet.
+psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 
 # 2. Generate RSA keys
@@ -49,6 +52,7 @@ All configuration is via environment variables (or `.env` file):
 
 | Method | Path | Description |
 |---|---|---|
+| GET | `/healthz` | Liveness / readiness probe |
 | GET | `/.well-known/jwks.json` | RSA public key (JWK format) |
 | POST | `/auth/login` | Login with provider token |
 | POST | `/auth/refresh` | Refresh tokens |

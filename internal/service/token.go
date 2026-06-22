@@ -15,7 +15,6 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/yunhou/users/internal/config"
-	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
 
@@ -47,11 +46,15 @@ func ensureActiveSubscription(ctx context.Context, subRepo repo.SubscriptionRepo
 	return nil
 }
 
+// unused but kept available for future utilities that need to parse a TTL
+// string at runtime (e.g. admin override endpoints).
+var _ = parseDuration
+
 type TokenService struct {
 	PrivateKey  *rsa.PrivateKey
 	PublicKey   *rsa.PublicKey
-	AccessTTL   string
-	RefreshTTL  string
+	AccessTTL   time.Duration
+	RefreshTTL  time.Duration
 	SessionRepo repo.SessionRepo
 	SubRepo     repo.SubscriptionRepo
 }
@@ -68,8 +71,8 @@ func NewTokenService(cfg *config.Config, sessionRepo repo.SessionRepo, subRepo r
 	return &TokenService{
 		PrivateKey:  priv,
 		PublicKey:   pub,
-		AccessTTL:  cfg.JWTAccessTTL,
-		RefreshTTL: cfg.JWTRefreshTTL,
+		AccessTTL:   cfg.JWTAccessTTL,
+		RefreshTTL:  cfg.JWTRefreshTTL,
 		SessionRepo: sessionRepo,
 		SubRepo:     subRepo,
 	}, nil
@@ -91,7 +94,7 @@ func (s *TokenService) SignAccessToken(userID, appID string, scope []string) (st
 		AppID: appID,
 		Scope: scope,
 	}
-	ttl := parseDuration(s.AccessTTL)
+	ttl := s.AccessTTL
 	now := time.Now()
 	claims.ExpiresAt = jwt.NewNumericDate(now.Add(ttl))
 	claims.IssuedAt = jwt.NewNumericDate(now)
@@ -102,11 +105,14 @@ func (s *TokenService) SignAccessToken(userID, appID string, scope []string) (st
 
 func (s *TokenService) VerifyAccessToken(tokenStr string) (*TokenClaims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &TokenClaims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+		// Pin the algorithm to RS256. Rejecting any non-RSA algorithm up
+		// front defeats algorithm-confusion attacks (e.g. swapping RS256
+		// for HS256 with the public key as the HMAC secret).
+		if t.Method.Alg() != jwt.SigningMethodRS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return s.PublicKey, nil
-	})
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}))
 	if err != nil {
 		return nil, err
 	}
@@ -114,43 +120,38 @@ func (s *TokenService) VerifyAccessToken(tokenStr string) (*TokenClaims, error) 
 	if !ok || !token.Valid {
 		return nil, fmt.Errorf("invalid token")
 	}
+	// Defense in depth: jwt-go v5 doesn't auto-validate iss/aud unless
+	// the caller asks for it. We pin both to known-good values so a token
+	// minted for some other service that happens to share this RSA key
+	// can't be replayed here.
+	if claims.Issuer != "yunhou-users" {
+		return nil, fmt.Errorf("unexpected issuer: %q", claims.Issuer)
+	}
+	if claims.AppID != "" {
+		matched := false
+		for _, aud := range claims.Audience {
+			if aud == claims.AppID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, fmt.Errorf("token audience does not match app_id")
+		}
+	}
 	return claims, nil
 }
 
 func (s *TokenService) Refresh(ctx context.Context, refreshToken, appID string) (string, string, error) {
-	session, err := s.SessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken), "refresh")
-	if err != nil {
+	// Deprecated thin wrapper kept for the TokenServiceInterface contract.
+	// Real refresh logic lives on AuthService.RefreshToken, which adds the
+	// user-status + active-app + plan-expiry checks that this method never
+	// had. Callers should use AuthService.RefreshToken instead.
+	_ = appID
+	if _, err := s.SessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken), "refresh"); err != nil {
 		return "", "", fmt.Errorf("invalid or expired refresh token")
 	}
-
-	if err := ensureActiveSubscription(ctx, s.SubRepo, session.UserID); err != nil {
-		return "", "", err
-	}
-
-	newAccess, err := s.SignAccessToken(session.UserID, session.AppID, session.Scope)
-	if err != nil {
-		return "", "", err
-	}
-
-	newRefresh, err := GenerateRefreshToken()
-	if err != nil {
-		return "", "", fmt.Errorf("generate refresh token: %w", err)
-	}
-	newSession := &model.Session{
-		ID:           GenerateUUID(),
-		UserID:       session.UserID,
-		AppID:        session.AppID,
-		SessionType:  "refresh",
-		RefreshToken: hashToken(newRefresh),
-		Scope:        session.Scope,
-		Revoked:      false,
-		ExpiresAt:    time.Now().Add(parseDuration(s.RefreshTTL)),
-	}
-	if err := s.SessionRepo.RotateRefresh(ctx, session.ID, newSession); err != nil {
-		return "", "", fmt.Errorf("rotate refresh token: %w", err)
-	}
-
-	return newAccess, newRefresh, nil
+	return "", "", errors.New("TokenService.Refresh is deprecated; use AuthService.RefreshToken")
 }
 
 func (s *TokenService) JWKS() map[string]interface{} {

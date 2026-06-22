@@ -2,6 +2,11 @@ package service
 
 import "errors"
 
+// ErrSessionAlreadyRevoked is returned by the repo layer when a refresh-token
+// rotation is attempted on a session that was already revoked. The caller is
+// expected to treat this as possible token reuse and revoke the family.
+var ErrSessionAlreadyRevoked = errors.New("session already revoked")
+
 // Sentinel errors returned by services. Handlers and other callers should
 // match these with errors.Is(), not by comparing err.Error() strings — that
 // coupling is exactly the bug class fixed in the auth/subscription work.
@@ -15,6 +20,8 @@ var (
 
 	ErrInvalidRefreshToken = errors.New("invalid refresh token")
 	ErrUserNotFound        = errors.New("user not found")
+	ErrUserSuspended       = errors.New("user is suspended")
+	ErrUserDeleted         = errors.New("user is deleted")
 
 	ErrSubscriptionNotActive = errors.New("subscription not active")
 	ErrSubscriptionExpired   = errors.New("subscription expired")
@@ -23,6 +30,8 @@ var (
 	ErrCannotRenewCancelled  = errors.New("cannot renew a cancelled subscription")
 	ErrUserHasActiveSub      = errors.New("user already has an active subscription")
 	ErrSubscriptionExists    = errors.New("subscription already exists for this user")
+	ErrAppNotFound           = errors.New("app not found")
+	ErrAppInactive           = errors.New("app is inactive")
 
 	ErrPlanNotFound    = errors.New("plan not found")
 	ErrPlanInactive    = errors.New("plan is inactive")

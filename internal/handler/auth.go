@@ -26,8 +26,12 @@ var expectedAuthErrors = []error{
 	service.ErrUnsupportedProvider,
 	service.ErrInvalidRefreshToken,
 	service.ErrUserNotFound,
+	service.ErrUserSuspended,
+	service.ErrUserDeleted,
 	service.ErrSubscriptionNotActive,
 	service.ErrSubscriptionExpired,
+	service.ErrAppNotFound,
+	service.ErrAppInactive,
 }
 
 func isExpectedAuthErr(err error) bool {

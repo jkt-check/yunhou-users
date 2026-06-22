@@ -12,16 +12,17 @@ ENV GOSUMDB=sum.golang.org
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source and run unit tests (e2e excluded — needs a live DB)
+# Copy source
 COPY . .
 
 # Build a static, stripped binary
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -extldflags=-static" -o /out/server ./cmd/server
 
 # ---- Stage 2: runtime ----
-FROM alpine:latest
+FROM alpine:3.20
 RUN adduser -D -u 65532 appuser
 COPY --from=builder /out/server /server
 USER appuser
 EXPOSE 8080
+HEALTHCHECK CMD ["/server", "-healthcheck"]
 ENTRYPOINT ["/server"]

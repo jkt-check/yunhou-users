@@ -88,6 +88,16 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 	if err != nil {
 		t.Fatalf("seed super app: %v", err)
 	}
+
+	// Seed a paid-tier app used by tests that exercise the no-access path.
+	_, err = db.ExecContext(context.Background(), `
+		INSERT INTO apps (app_id, name, is_active)
+		VALUES ('yundash', 'E2E Paid App', true)
+		ON CONFLICT (app_id) DO NOTHING
+	`)
+	if err != nil {
+		t.Fatalf("seed paid app: %v", err)
+	}
 }
 
 func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
@@ -116,8 +126,8 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		RSAPublic:          pubPath,
 		GitHubClientID:     "e2e-fake-client-id",
 		GitHubClientSecret: "e2e-fake-client-secret",
-		JWTAccessTTL:       "15m",
-		JWTRefreshTTL:      "168h",
+		JWTAccessTTL:   15 * time.Minute,
+		JWTRefreshTTL: 168 * time.Hour,
 	}
 
 	// Repos
@@ -135,7 +145,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	}
 
 	planSvc := service.NewPlanService(planRepo)
-	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, tokenSvc)
+	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
 	gin.SetMode(gin.ReleaseMode)

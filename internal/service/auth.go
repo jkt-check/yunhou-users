@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"time"
 
@@ -35,12 +36,13 @@ func hashToken(token string) string {
 
 // AuthService handles simplified login with provider tokens.
 type AuthService struct {
-	userRepo    repo.UserRepo
+	userRepo     repo.UserRepo
 	identityRepo repo.SocialIdentityRepo
-	planRepo    repo.PlanRepo
-	subRepo     repo.SubscriptionRepo
-	sessionRepo repo.SessionRepo
-	tokenSvc    *TokenService
+	planRepo     repo.PlanRepo
+	subRepo      repo.SubscriptionRepo
+	sessionRepo  repo.SessionRepo
+	appRepo      repo.AppRepo
+	tokenSvc     *TokenService
 }
 
 func NewAuthService(
@@ -49,16 +51,42 @@ func NewAuthService(
 	planRepo repo.PlanRepo,
 	subRepo repo.SubscriptionRepo,
 	sessionRepo repo.SessionRepo,
+	appRepo repo.AppRepo,
 	tokenSvc *TokenService,
 ) *AuthService {
 	return &AuthService{
-		userRepo:    userRepo,
+		userRepo:     userRepo,
 		identityRepo: identityRepo,
-		planRepo:    planRepo,
-		subRepo:     subRepo,
-		sessionRepo: sessionRepo,
-		tokenSvc:    tokenSvc,
+		planRepo:     planRepo,
+		subRepo:      subRepo,
+		sessionRepo:  sessionRepo,
+		appRepo:      appRepo,
+		tokenSvc:     tokenSvc,
 	}
+}
+
+// findUsableSubscription returns the user's currently-active, non-expired
+// subscription, marking expired subscriptions as such along the way. It is
+// the single source of truth for "is this user allowed to mint tokens?"
+// across login and refresh paths.
+func (s *AuthService) findUsableSubscription(ctx context.Context, userID string) (*model.Subscription, error) {
+	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get subscription: %w", err)
+	}
+	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
+		// Lazy expiry: mark this one row expired so subsequent reads skip it.
+		// We don't fail the request if the update itself errors — log it via
+		// the wrapped error and continue with the expired state.
+		if updateErr := s.subRepo.UpdateStatus(ctx, sub.ID, "expired"); updateErr != nil {
+			return nil, fmt.Errorf("mark subscription expired: %w", updateErr)
+		}
+		return nil, ErrSubscriptionExpired
+	}
+	return sub, nil
 }
 
 type ProviderUserInfo struct {
@@ -107,25 +135,58 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		return nil, err
 	}
 
-	// 2. Find or create user + identity
+	// 2. Verify the requested app exists and is active before issuing tokens.
+	//    Without this, a user could log in for a disabled or unknown app and
+	//    still receive a signed access token with that app_id in the audience.
+	app, err := s.appRepo.FindByID(ctx, req.AppID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAppNotFound
+		}
+		return nil, fmt.Errorf("find app: %w", err)
+	}
+	if !app.IsActive {
+		return nil, ErrAppInactive
+	}
+
+	// 3. Find or create user + identity
 	user, err := s.getOrCreateUser(ctx, providerUser)
 	if err != nil {
 		return nil, fmt.Errorf("get or create user: %w", err)
 	}
 
-	// Get email from identity
+	// 4. Enforce account status. A suspended or deleted user must not be able
+	//    to mint fresh tokens even if they still hold an active subscription.
+	if user.Status == "suspended" {
+		return nil, ErrUserSuspended
+	}
+	if user.Status == "deleted" {
+		return nil, ErrUserDeleted
+	}
+
+	// 5. Resolve the identity for this login so the response reflects the
+	//    email of the account the user just signed in with, not a stale one.
 	identities, err := s.identityRepo.ListByUserID(ctx, user.ID)
-	if err == nil && len(identities) > 0 {
-		user.Email = identities[0].Email // Use first identity's email
+	if err == nil {
+		for i := range identities {
+			if identities[i].Provider == providerUser.Provider &&
+				identities[i].ProviderUID == providerUser.ProviderUID {
+				user.Email = identities[i].Email
+				break
+			}
+		}
+		if user.Email == nil && len(identities) > 0 {
+			user.Email = identities[0].Email
+		}
 	}
 
-	// 3. Get user's active subscription (no row → no subscription, use default plan)
-	sub, err := s.subRepo.FindActiveByUserID(ctx, user.ID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("get subscription: %w", err)
+	// 6. Get user's active subscription (no row → no subscription, use default plan)
+	sub, err := s.findUsableSubscription(ctx, user.ID)
+	if err != nil {
+		return nil, err
 	}
 
-	// 4. Determine plan and app access
+	// 7. Determine plan and app access
 	var plan *model.Plan
 	if sub == nil {
 		// No subscription, use default (free) plan
@@ -161,7 +222,7 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		RefreshToken: hashToken(refreshTokenRaw),
 		Scope:        plan.Apps,
 		Revoked:      false,
-		ExpiresAt:    time.Now().Add(parseDuration(s.tokenSvc.RefreshTTL)),
+		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
 	}
 	if err := s.sessionRepo.Create(ctx, session); err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
@@ -303,9 +364,36 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		return nil, fmt.Errorf("find user: %w", err)
 	}
 
-	sub, err := s.subRepo.FindActiveByUserID(ctx, user.ID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("get subscription: %w", err)
+	// Enforce account status — don't keep issuing tokens to suspended/deleted users.
+	if user.Status == "suspended" {
+		return nil, ErrUserSuspended
+	}
+	if user.Status == "deleted" {
+		return nil, ErrUserDeleted
+	}
+
+	// Fall back to session's app_id if not provided
+	if appID == "" {
+		appID = session.AppID
+	}
+
+	// Verify the resolved app still exists and is active. Without this, a
+	// refresh issued while the app was active could keep working after the
+	// app is disabled.
+	app, err := s.appRepo.FindByID(ctx, appID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAppNotFound
+		}
+		return nil, fmt.Errorf("find app: %w", err)
+	}
+	if !app.IsActive {
+		return nil, ErrAppInactive
+	}
+
+	sub, err := s.findUsableSubscription(ctx, user.ID)
+	if err != nil {
+		return nil, err
 	}
 
 	var plan *model.Plan
@@ -319,11 +407,6 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		if err != nil {
 			return nil, fmt.Errorf("get plan: %w", err)
 		}
-	}
-
-	// Fall back to session's app_id if not provided
-	if appID == "" {
-		appID = session.AppID
 	}
 
 	hasAccess := slices.Contains(plan.Apps, appID)
@@ -346,9 +429,20 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		RefreshToken: hashToken(newRefreshTokenRaw),
 		Scope:        plan.Apps,
 		Revoked:      false,
-		ExpiresAt:    time.Now().Add(parseDuration(s.tokenSvc.RefreshTTL)),
+		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
 	}
 	if err := s.sessionRepo.RotateRefresh(ctx, session.ID, newSession); err != nil {
+		// Refresh-token reuse detection: if RotateRefresh reports the old
+		// session was already revoked, the token we're holding has either
+		// been replayed or stolen. Revoke the entire (user, app) family so
+		// any other outstanding refresh tokens for this user become useless,
+		// then surface a generic 401.
+		if errors.Is(err, ErrSessionAlreadyRevoked) {
+			if revErr := s.sessionRepo.RevokeFamilyByUserApp(ctx, user.ID, appID); revErr != nil {
+				log.Printf("refresh: family revoke failed: %v", revErr)
+			}
+			return nil, ErrInvalidRefreshToken
+		}
 		return nil, fmt.Errorf("rotate refresh token: %w", err)
 	}
 

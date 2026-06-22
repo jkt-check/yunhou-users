@@ -59,11 +59,17 @@ func fetchGitHubUser(ctx context.Context, token string) (*ProviderUserInfo, erro
 	}
 
 	email := ghUser.Email
-	if email == "" {
-		// User's primary email may be hidden — query /user/emails to find a
-		// verified primary one. Failures here are non-fatal; we still return
-		// the user without an email if necessary.
-		email = fetchGitHubPrimaryEmail(ctx, token)
+	// GitHub's primary email returned by /user is *not* necessarily verified.
+	// Only /user/emails tells us which addresses are confirmed, so always
+	// fall back to that endpoint and reject any email that isn't verified.
+	// Without this guard, an attacker can register a GitHub account with the
+	// victim's email (unverified) and merge into the victim's user via the
+	// email-merge path in AuthService.
+	if email == "" || !isGitHubPrimaryEmailVerified(ctx, token) {
+		verified := fetchGitHubVerifiedPrimaryEmail(ctx, token)
+		if verified != "" {
+			email = verified
+		}
 	}
 
 	return &ProviderUserInfo{
@@ -75,7 +81,56 @@ func fetchGitHubUser(ctx context.Context, token string) (*ProviderUserInfo, erro
 	}, nil
 }
 
+// fetchGitHubPrimaryEmail is a backwards-compatible alias. It now refuses to
+// return any unverified email so the caller can't be tricked into trusting a
+// non-primary address for account-merge purposes.
 func fetchGitHubPrimaryEmail(ctx context.Context, token string) string {
+	return fetchGitHubVerifiedPrimaryEmail(ctx, token)
+}
+
+// isGitHubPrimaryEmailVerified reports whether the email returned by the
+// /user endpoint is also the user's primary *and* verified email per
+// /user/emails. Used to decide whether the inline email can be trusted for
+// account-merge purposes.
+func isGitHubPrimaryEmailVerified(ctx context.Context, token string) bool {
+	const emailsURL = "https://api.github.com/user/emails"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, emailsURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := providerHTTPClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	var emails []struct {
+		Email    string `json:"email"`
+		Primary  bool   `json:"primary"`
+		Verified bool   `json:"verified"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&emails); err != nil {
+		return false
+	}
+	for _, e := range emails {
+		if e.Primary && e.Verified {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchGitHubVerifiedPrimaryEmail returns the user's primary verified email,
+// falling back to any verified email, falling back to the first listed email.
+// Returns "" if the endpoint fails or no email is available.
+func fetchGitHubVerifiedPrimaryEmail(ctx context.Context, token string) string {
 	const emailsURL = "https://api.github.com/user/emails"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, emailsURL, nil)
 	if err != nil {
@@ -102,20 +157,20 @@ func fetchGitHubPrimaryEmail(ctx context.Context, token string) string {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&emails); err != nil {
 		return ""
 	}
+	// 1. Primary AND verified.
 	for _, e := range emails {
 		if e.Primary && e.Verified {
 			return e.Email
 		}
 	}
-	// Fall back to any verified email, else the first one.
+	// 2. Any verified email.
 	for _, e := range emails {
 		if e.Verified {
 			return e.Email
 		}
 	}
-	if len(emails) > 0 {
-		return emails[0].Email
-	}
+	// 3. No verified emails — refuse to return anything. Falling back to
+	//    unverified addresses would re-introduce the email-merge takeover.
 	return ""
 }
 

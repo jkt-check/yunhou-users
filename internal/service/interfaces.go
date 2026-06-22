@@ -19,7 +19,6 @@ type TokenServiceInterface interface {
 	JWKS() map[string]interface{}
 	SignAccessToken(userID, appID string, scope []string) (string, error)
 	VerifyAccessToken(token string) (*TokenClaims, error)
-	Refresh(ctx context.Context, refreshToken, appID string) (string, string, error)
 }
 
 // SubscriptionServiceInterface defines the interface for subscription operations

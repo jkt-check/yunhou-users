@@ -143,14 +143,13 @@ func (s *TokenService) VerifyAccessToken(tokenStr string) (*TokenClaims, error) 
 }
 
 func (s *TokenService) Refresh(ctx context.Context, refreshToken, appID string) (string, string, error) {
-	// Deprecated thin wrapper kept for the TokenServiceInterface contract.
-	// Real refresh logic lives on AuthService.RefreshToken, which adds the
-	// user-status + active-app + plan-expiry checks that this method never
-	// had. Callers should use AuthService.RefreshToken instead.
+	// Deprecated: real refresh logic lives on AuthService.RefreshToken
+	// (which enforces user status, active app, and plan expiry). Kept as
+	// a hard error so any caller using this method gets a clear failure
+	// instead of silently minting tokens under weaker guarantees.
+	_ = ctx
+	_ = refreshToken
 	_ = appID
-	if _, err := s.SessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken), "refresh"); err != nil {
-		return "", "", fmt.Errorf("invalid or expired refresh token")
-	}
 	return "", "", errors.New("TokenService.Refresh is deprecated; use AuthService.RefreshToken")
 }
 

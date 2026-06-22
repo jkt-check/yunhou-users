@@ -21,6 +21,33 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
+func TestMain(m *testing.M) {
+	// Short-circuit real GitHub/Google calls for the whole integration suite.
+	// The tests pass arbitrary provider_token strings; we use the token as the
+	// stable provider UID so each unique token = unique user.
+	service.SetProviderVerifier(func(_ context.Context, provider, token string) (*service.ProviderUserInfo, error) {
+		switch provider {
+		case "github":
+			return &service.ProviderUserInfo{
+				Provider:    "github",
+				ProviderUID: "github_" + token,
+				Email:       fmt.Sprintf("%s@github.test", token),
+				Nickname:    "GitHub " + token,
+			}, nil
+		case "google":
+			return &service.ProviderUserInfo{
+				Provider:    "google",
+				ProviderUID: "google_" + token,
+				Email:       fmt.Sprintf("%s@google.test", token),
+				Nickname:    "Google " + token,
+			}, nil
+		default:
+			return nil, fmt.Errorf("unsupported provider: %s", provider)
+		}
+	})
+	os.Exit(m.Run())
+}
+
 func dbURL() string {
 	if u := os.Getenv("DATABASE_URL"); u != "" {
 		return u

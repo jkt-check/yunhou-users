@@ -26,7 +26,7 @@ type TokenServiceInterface interface {
 type SubscriptionServiceInterface interface {
 	Create(ctx context.Context, userID, planID string, expiresAt *time.Time) (*model.Subscription, error)
 	Renew(ctx context.Context, id string, expiresAt *time.Time) (*model.Subscription, error)
-	Cancel(ctx context.Context, id string) error
+	Cancel(ctx context.Context, id, userID string) error
 	GetUserSubscription(ctx context.Context, userID string) (*model.Subscription, *model.Plan, error)
 	ListUserSubscriptions(ctx context.Context, userID string) ([]model.Subscription, error)
 }

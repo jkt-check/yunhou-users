@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -98,10 +100,11 @@ type SubscriptionInfo struct {
 
 // Login authenticates a user via provider token and returns tokens + subscription info.
 func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginResponse, error) {
-	// 1. Get user info from provider (GitHub/Google)
-	providerUser, err := s.getProviderUser(req.Provider, req.ProviderToken)
+	// 1. Get user info from provider (GitHub/Google) — calls the provider's
+	//    userinfo API to verify the token belongs to a real account.
+	providerUser, err := s.getProviderUser(ctx, req.Provider, req.ProviderToken)
 	if err != nil {
-		return nil, fmt.Errorf("invalid provider token: %w", err)
+		return nil, err
 	}
 
 	// 2. Find or create user + identity
@@ -116,9 +119,9 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		user.Email = identities[0].Email // Use first identity's email
 	}
 
-	// 3. Get user's active subscription (ignore "not found" - means no subscription)
+	// 3. Get user's active subscription (no row → no subscription, use default plan)
 	sub, err := s.subRepo.FindActiveByUserID(ctx, user.ID)
-	if err != nil && err.Error() != "not found" {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("get subscription: %w", err)
 	}
 
@@ -158,7 +161,7 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		RefreshToken: hashToken(refreshTokenRaw),
 		Scope:        plan.Apps,
 		Revoked:      false,
-		ExpiresAt:    time.Now().Add(168 * time.Hour), // 7 days
+		ExpiresAt:    time.Now().Add(parseDuration(s.tokenSvc.RefreshTTL)),
 	}
 	if err := s.sessionRepo.Create(ctx, session); err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
@@ -187,35 +190,32 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 	}, nil
 }
 
-func (s *AuthService) getProviderUser(provider, token string) (*ProviderUserInfo, error) {
-	// In production, this calls the OAuth provider's API.
-	// For testing, we use tokens that encode the provider uid:
-	// "github_<provider_uid>" or "google_<provider_uid>"
+// providerVerifierOverride, when non-nil, replaces real OAuth provider calls.
+// Production never sets it. Tests (including E2E in other packages) install a
+// stub via SetProviderVerifier so they can drive auth without hitting real
+// GitHub/Google. Not safe for concurrent reconfiguration mid-test.
+var providerVerifierOverride func(ctx context.Context, provider, token string) (*ProviderUserInfo, error)
+
+// SetProviderVerifier installs a stub OAuth verifier for tests. The returned
+// function restores the previous value — callers should defer it (or wire it
+// into t.Cleanup) so other tests aren't affected.
+func SetProviderVerifier(fn func(ctx context.Context, provider, token string) (*ProviderUserInfo, error)) func() {
+	prev := providerVerifierOverride
+	providerVerifierOverride = fn
+	return func() { providerVerifierOverride = prev }
+}
+
+func (s *AuthService) getProviderUser(ctx context.Context, provider, token string) (*ProviderUserInfo, error) {
+	if providerVerifierOverride != nil {
+		return providerVerifierOverride(ctx, provider, token)
+	}
 	switch provider {
 	case "github":
-		uid := token
-		if len(token) > 8 {
-			uid = token[:8]
-		}
-		return &ProviderUserInfo{
-			Provider:    "github",
-			ProviderUID: "github_" + uid,
-			Email:       "user@example.com",
-			Nickname:    "GitHub User",
-		}, nil
+		return fetchGitHubUser(ctx, token)
 	case "google":
-		uid := token
-		if len(token) > 8 {
-			uid = token[:8]
-		}
-		return &ProviderUserInfo{
-			Provider:    "google",
-			ProviderUID: "google_" + uid,
-			Email:       "user@gmail.com",
-			Nickname:    "Google User",
-		}, nil
+		return fetchGoogleUser(ctx, token)
 	default:
-		return nil, fmt.Errorf("unsupported provider: %s", provider)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProvider, provider)
 	}
 }
 
@@ -271,11 +271,16 @@ func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInf
 	return s.userRepo.FindByID(ctx, userID)
 }
 
-// Logout revokes the refresh token.
+// Logout revokes the refresh token. Idempotent: a missing/expired session
+// is treated as success. Other DB errors are propagated so the caller can
+// distinguish "nothing to revoke" from "DB unreachable".
 func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 	session, err := s.sessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken), "refresh")
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // already invalid / expired
+	}
 	if err != nil {
-		return nil // Already invalid
+		return fmt.Errorf("find session: %w", err)
 	}
 	return s.sessionRepo.Revoke(ctx, session.ID)
 }
@@ -283,17 +288,23 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 // RefreshToken refreshes access token using refresh token.
 func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID string) (*LoginResponse, error) {
 	session, err := s.sessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken), "refresh")
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrInvalidRefreshToken
+	}
 	if err != nil {
-		return nil, fmt.Errorf("invalid refresh token")
+		return nil, fmt.Errorf("find session: %w", err)
 	}
 
 	user, err := s.userRepo.FindByID(ctx, session.UserID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
 	if err != nil {
-		return nil, fmt.Errorf("user not found")
+		return nil, fmt.Errorf("find user: %w", err)
 	}
 
 	sub, err := s.subRepo.FindActiveByUserID(ctx, user.ID)
-	if err != nil && err.Error() != "not found" {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("get subscription: %w", err)
 	}
 
@@ -335,7 +346,7 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		RefreshToken: hashToken(newRefreshTokenRaw),
 		Scope:        plan.Apps,
 		Revoked:      false,
-		ExpiresAt:    time.Now().Add(168 * time.Hour),
+		ExpiresAt:    time.Now().Add(parseDuration(s.tokenSvc.RefreshTTL)),
 	}
 	if err := s.sessionRepo.RotateRefresh(ctx, session.ID, newSession); err != nil {
 		return nil, fmt.Errorf("rotate refresh token: %w", err)

@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -27,17 +29,20 @@ func parseDuration(s string) time.Duration {
 
 func ensureActiveSubscription(ctx context.Context, subRepo repo.SubscriptionRepo, userID string) error {
 	sub, err := subRepo.FindActiveByUserID(ctx, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrSubscriptionNotActive
+	}
 	if err != nil {
-		return fmt.Errorf("check subscription: %v", err)
+		return fmt.Errorf("check subscription: %w", err)
 	}
 	if sub == nil {
-		return fmt.Errorf("subscription not active")
+		return ErrSubscriptionNotActive
 	}
 	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
 		if err := subRepo.UpdateStatus(ctx, sub.ID, "expired"); err != nil {
-			return fmt.Errorf("mark subscription expired: %v", err)
+			return fmt.Errorf("mark subscription expired: %w", err)
 		}
-		return fmt.Errorf("subscription expired")
+		return ErrSubscriptionExpired
 	}
 	return nil
 }

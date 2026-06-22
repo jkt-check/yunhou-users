@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -85,7 +86,7 @@ func (m *mockSubSvc) Renew(ctx context.Context, id string, expiresAt *time.Time)
 	return nil, nil
 }
 
-func (m *mockSubSvc) Cancel(ctx context.Context, id string) error {
+func (m *mockSubSvc) Cancel(ctx context.Context, id, userID string) error {
 	return m.cancelErr
 }
 
@@ -180,7 +181,7 @@ func TestAuthHandler_Login(t *testing.T) {
 	})
 
 	t.Run("login unauthorized", func(t *testing.T) {
-		authSvc := &mockAuthSvc{loginErr: errors.New("invalid token")}
+		authSvc := &mockAuthSvc{loginErr: service.ErrInvalidProviderToken}
 		tokenSvc := &mockTokenSvc{}
 		handler := NewAuthHandler(authSvc, tokenSvc)
 
@@ -428,7 +429,7 @@ func TestPlanHandler_GetPlan(t *testing.T) {
 	})
 
 	t.Run("get plan not found", func(t *testing.T) {
-		planSvc := &mockPlanSvc{getErr: errors.New("not found")}
+		planSvc := &mockPlanSvc{getErr: sql.ErrNoRows}
 		handler := NewPlanHandler(planSvc)
 
 		router := gin.New()
@@ -467,7 +468,7 @@ func TestPlanHandler_UpdatePlan(t *testing.T) {
 	})
 
 	t.Run("update plan not found", func(t *testing.T) {
-		planSvc := &mockPlanSvc{getErr: errors.New("not found")}
+		planSvc := &mockPlanSvc{getErr: sql.ErrNoRows}
 		handler := NewPlanHandler(planSvc)
 
 		router := gin.New()
@@ -577,7 +578,7 @@ func (m *mockAppRepo) FindByID(ctx context.Context, id string) (*model.App, erro
 			return &a, nil
 		}
 	}
-	return nil, errors.New("not found")
+	return nil, sql.ErrNoRows
 }
 
 func (m *mockAppRepo) Create(ctx context.Context, a *model.App) error {
@@ -784,7 +785,7 @@ func TestUserHandler_GetProfile(t *testing.T) {
 	})
 
 	t.Run("user not found", func(t *testing.T) {
-		userRepo := &mockUserRepo{findErr: errors.New("not found")}
+		userRepo := &mockUserRepo{findErr: sql.ErrNoRows}
 		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
 
 		router := gin.New()
@@ -867,7 +868,7 @@ func TestUserHandler_UpdateProfile(t *testing.T) {
 	})
 
 	t.Run("user not found", func(t *testing.T) {
-		userRepo := &mockUserRepo{findErr: errors.New("not found")}
+		userRepo := &mockUserRepo{findErr: sql.ErrNoRows}
 		handler := NewUserHandler(userRepo, &mockIdentityRepo{}, &mockSubscriptionRepoForUser{})
 
 		router := gin.New()

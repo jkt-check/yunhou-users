@@ -28,7 +28,7 @@ func TestSubscriptionService_Create(t *testing.T) {
 			userID: "user-1",
 			planID: "free",
 			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
-				pr.plans["free"] = &model.Plan{ID: "free", Name: "免费"}
+				pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true}
 			},
 			expiresAt: timePtr(time.Now().Add(30 * 24 * time.Hour)),
 			wantErr:   false,
@@ -36,8 +36,9 @@ func TestSubscriptionService_Create(t *testing.T) {
 		{
 			name:   "user already has active subscription",
 			userID: "user-2",
-			planID: "monthly",
+			planID: "free",
 			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
+				pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true}
 				expiresAt := time.Now().Add(30 * 24 * time.Hour)
 				sr.subs["existing-sub"] = &model.Subscription{
 					ID:        "existing-sub",
@@ -50,6 +51,34 @@ func TestSubscriptionService_Create(t *testing.T) {
 			},
 			wantErr:     true,
 			errContains: "already has an active subscription",
+		},
+		{
+			name:   "paid plan rejected — must use admin/payment",
+			userID: "user-3",
+			planID: "monthly",
+			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
+				pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Price: 9.99, IsActive: true}
+			},
+			wantErr:     true,
+			errContains: "paid plan",
+		},
+		{
+			name:   "inactive plan rejected",
+			userID: "user-4",
+			planID: "legacy",
+			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
+				pr.plans["legacy"] = &model.Plan{ID: "legacy", Name: "停用", IsActive: false}
+			},
+			wantErr:     true,
+			errContains: "plan is inactive",
+		},
+		{
+			name:        "unknown plan rejected",
+			userID:      "user-5",
+			planID:      "ghost",
+			setup:       func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {},
+			wantErr:     true,
+			errContains: "plan not found",
 		},
 	}
 
@@ -185,13 +214,15 @@ func TestSubscriptionService_Cancel(t *testing.T) {
 	tests := []struct {
 		name        string
 		subID       string
+		userID      string
 		setup       func(*mockSubscriptionRepo)
 		wantErr     bool
 		errContains string
 	}{
 		{
-			name:  "cancel active subscription",
-			subID: "sub-1",
+			name:   "cancel active subscription",
+			subID:  "sub-1",
+			userID: "user-1",
 			setup: func(sr *mockSubscriptionRepo) {
 				sr.subs["sub-1"] = &model.Subscription{
 					ID:     "sub-1",
@@ -206,13 +237,30 @@ func TestSubscriptionService_Cancel(t *testing.T) {
 		{
 			name:        "subscription not found",
 			subID:       "nonexistent",
+			userID:      "user-1",
 			setup:       func(sr *mockSubscriptionRepo) {},
 			wantErr:     true,
 			errContains: "not found",
 		},
 		{
-			name:  "already cancelled",
-			subID: "sub-cancelled",
+			name:   "wrong user cannot cancel — surfaces as not found",
+			subID:  "sub-other",
+			userID: "attacker",
+			setup: func(sr *mockSubscriptionRepo) {
+				sr.subs["sub-other"] = &model.Subscription{
+					ID:     "sub-other",
+					UserID: "victim",
+					PlanID: "free",
+					Status: "active",
+				}
+			},
+			wantErr:     true,
+			errContains: "not found",
+		},
+		{
+			name:   "already cancelled",
+			subID:  "sub-cancelled",
+			userID: "user-2",
 			setup: func(sr *mockSubscriptionRepo) {
 				sr.subs["sub-cancelled"] = &model.Subscription{
 					ID:     "sub-cancelled",
@@ -237,7 +285,7 @@ func TestSubscriptionService_Cancel(t *testing.T) {
 				tc.setup(sr)
 			}
 
-			err := subSvc.Cancel(ctx, tc.subID)
+			err := subSvc.Cancel(ctx, tc.subID, tc.userID)
 
 			if tc.wantErr {
 				if err == nil {

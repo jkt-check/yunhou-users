@@ -2,6 +2,9 @@ package handler
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"log"
 	"net/http"
 	"time"
 
@@ -28,6 +31,7 @@ func NewAppHandler(appRepo AppRepoInterface) *AppHandler {
 func (h *AppHandler) ListApps(c *gin.Context) {
 	apps, err := h.appRepo.List(c.Request.Context())
 	if err != nil {
+		log.Printf("list apps error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list apps"})
 		return
 	}
@@ -37,8 +41,13 @@ func (h *AppHandler) ListApps(c *gin.Context) {
 func (h *AppHandler) GetApp(c *gin.Context) {
 	id := c.Param("id")
 	app, err := h.appRepo.FindByID(c.Request.Context(), id)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("get app error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load app"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
@@ -62,6 +71,7 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		IsActive:    true,
 	}
 	if err := h.appRepo.Create(c.Request.Context(), app); err != nil {
+		log.Printf("create app error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create app"})
 		return
 	}
@@ -72,8 +82,13 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 func (h *AppHandler) UpdateApp(c *gin.Context) {
 	id := c.Param("id")
 	app, err := h.appRepo.FindByID(c.Request.Context(), id)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("update app lookup error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load app"})
 		return
 	}
 
@@ -98,6 +113,7 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 	}
 
 	if err := h.appRepo.Update(c.Request.Context(), app); err != nil {
+		log.Printf("update app error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update app"})
 		return
 	}
@@ -126,7 +142,7 @@ func (h *SubscriptionHandler) ListUserSubscriptions(c *gin.Context) {
 func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 	var req struct {
 		PlanID    string  `json:"plan_id" binding:"required"`
-		ExpiresAt *string `json:"expires_at"`
+		ExpiresAt *string `json:"expires_at"` // accepted for backward compat; ignored by the service
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
@@ -147,7 +163,21 @@ func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 
 	sub, err := h.subSvc.Create(c.Request.Context(), userID, req.PlanID, expiresAt)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		// Map known service sentinels to HTTP codes; everything else is
+		// treated as internal and surfaces only as a generic 500.
+		switch {
+		case errors.Is(err, service.ErrPlanNotFound):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan not found"})
+		case errors.Is(err, service.ErrPlanInactive):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is inactive"})
+		case errors.Is(err, service.ErrPaidPlanForbidden):
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "paid plans require payment, cannot self-subscribe"})
+		case errors.Is(err, service.ErrUserHasActiveSub), errors.Is(err, service.ErrSubscriptionExists):
+			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
+		default:
+			log.Printf("create subscription error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create subscription"})
+		}
 		return
 	}
 
@@ -156,9 +186,20 @@ func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 
 func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 	id := c.Param("id")
+	userID := c.GetString("user_id")
 
-	if err := h.subSvc.Cancel(c.Request.Context(), id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+	if err := h.subSvc.Cancel(c.Request.Context(), id, userID); err != nil {
+		// Service intentionally returns ErrSubscriptionNotFound for both
+		// missing and not-owned-by-caller; surface that as 404.
+		switch {
+		case errors.Is(err, service.ErrSubscriptionNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "subscription not found"})
+		case errors.Is(err, service.ErrAlreadyCancelled):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "already cancelled"})
+		default:
+			log.Printf("cancel subscription error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to cancel subscription"})
+		}
 		return
 	}
 
@@ -185,8 +226,13 @@ func (h *PlanHandler) ListPlans(c *gin.Context) {
 func (h *PlanHandler) GetPlan(c *gin.Context) {
 	id := c.Param("id")
 	plan, err := h.planSvc.GetPlan(c.Request.Context(), id)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("get plan error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load plan"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": plan})
@@ -226,8 +272,13 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 	id := c.Param("id")
 	plan, err := h.planSvc.GetPlan(c.Request.Context(), id)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("update plan lookup error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load plan"})
 		return
 	}
 

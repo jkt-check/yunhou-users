@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -9,8 +10,38 @@ import (
 	"github.com/yunhou/users/internal/model"
 )
 
+// stubProviderVerifier matches the legacy stub semantics: token is used as a
+// stable identifier so tests can refer to "the user whose token is X".
+func stubProviderVerifier(_ context.Context, provider, token string) (*ProviderUserInfo, error) {
+	switch provider {
+	case "github":
+		return &ProviderUserInfo{
+			Provider:    "github",
+			ProviderUID: "github_" + token,
+			Email:       fmt.Sprintf("%s@github.test", token),
+			Nickname:    "GitHub " + token,
+		}, nil
+	case "google":
+		return &ProviderUserInfo{
+			Provider:    "google",
+			ProviderUID: "google_" + token,
+			Email:       fmt.Sprintf("%s@google.test", token),
+			Nickname:    "Google " + token,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported provider: %s", provider)
+	}
+}
+
+func withStubProvider(t *testing.T) {
+	t.Helper()
+	restore := SetProviderVerifier(stubProviderVerifier)
+	t.Cleanup(restore)
+}
+
 func TestAuthService_Login(t *testing.T) {
 	t.Parallel()
+	withStubProvider(t)
 
 	ctx := context.Background()
 

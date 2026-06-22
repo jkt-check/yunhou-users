@@ -2,6 +2,9 @@ package handler
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -39,8 +42,13 @@ func NewUserHandler(userRepo UserRepoInterface, identityRepo IdentityRepoInterfa
 func (h *UserHandler) GetProfile(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	user, err := h.userRepo.FindByID(c.Request.Context(), userID)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "user not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("get profile error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load profile"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": user})
@@ -49,8 +57,13 @@ func (h *UserHandler) GetProfile(c *gin.Context) {
 func (h *UserHandler) UpdateProfile(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	user, err := h.userRepo.FindByID(c.Request.Context(), userID)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "user not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("update profile lookup error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load profile"})
 		return
 	}
 
@@ -83,6 +96,7 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 	}
 
 	if err := h.userRepo.Update(c.Request.Context(), &updated); err != nil {
+		log.Printf("update profile error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update profile"})
 		return
 	}
@@ -96,6 +110,7 @@ func (h *UserHandler) ListIdentities(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	list, err := h.identityRepo.ListByUserID(c.Request.Context(), userID)
 	if err != nil {
+		log.Printf("list identities error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list identities"})
 		return
 	}
@@ -108,6 +123,7 @@ func (h *UserHandler) UnbindIdentity(c *gin.Context) {
 
 	deleted, err := h.identityRepo.DeleteIfNotLast(c.Request.Context(), identityID, userID)
 	if err != nil {
+		log.Printf("unbind identity error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to unbind identity"})
 		return
 	}
@@ -123,6 +139,7 @@ func (h *UserHandler) ListApps(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	list, err := h.subRepo.ListByUserID(c.Request.Context(), userID)
 	if err != nil {
+		log.Printf("list apps error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list apps"})
 		return
 	}

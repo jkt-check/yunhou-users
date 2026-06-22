@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -173,7 +174,7 @@ func (m *mockAppRepo) FindByID(_ context.Context, id string) (*model.App, error)
 	}
 	a, ok := m.apps[id]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, sql.ErrNoRows
 	}
 	return a, nil
 }
@@ -226,7 +227,7 @@ func (m *mockPlanRepo) FindByID(_ context.Context, id string) (*model.Plan, erro
 	}
 	p, ok := m.plans[id]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, sql.ErrNoRows
 	}
 	return p, nil
 }
@@ -243,7 +244,7 @@ func (m *mockPlanRepo) FindDefault(_ context.Context) (*model.Plan, error) {
 			return p, nil
 		}
 	}
-	return nil, fmt.Errorf("no default plan")
+	return nil, sql.ErrNoRows
 }
 
 func (m *mockPlanRepo) Create(_ context.Context, p *model.Plan) error {
@@ -305,7 +306,7 @@ func (m *mockSubscriptionRepo) FindActiveByUserID(_ context.Context, userID stri
 	}
 	s, ok := m.byUserID[userID]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, sql.ErrNoRows
 	}
 	// Check if expired
 	if s.ExpiresAt != nil && s.ExpiresAt.Before(time.Now()) {
@@ -320,7 +321,7 @@ func (m *mockSubscriptionRepo) FindByID(_ context.Context, id string) (*model.Su
 	}
 	s, ok := m.subs[id]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, sql.ErrNoRows
 	}
 	return s, nil
 }
@@ -402,13 +403,15 @@ func (m *mockSessionRepo) FindByRefreshToken(_ context.Context, token string, se
 	}
 	s, ok := m.byToken[token]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, sql.ErrNoRows
 	}
+	// Real SQL filters `WHERE revoked = false AND expires_at > now()`, so
+	// revoked or expired sessions surface as sql.ErrNoRows.
 	if s.Revoked {
-		return nil, fmt.Errorf("revoked")
+		return nil, sql.ErrNoRows
 	}
 	if s.ExpiresAt.Before(time.Now()) {
-		return nil, fmt.Errorf("expired")
+		return nil, sql.ErrNoRows
 	}
 	return s, nil
 }

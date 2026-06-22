@@ -93,6 +93,12 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	t.Helper()
 
+	// Short-circuit real OAuth provider HTTP calls — e2e drives login with
+	// arbitrary provider_token strings that need stable, deterministic UIDs
+	// rather than real GitHub user IDs.
+	restoreVerifier := service.SetProviderVerifier(stubE2EProviderVerifier)
+	t.Cleanup(restoreVerifier)
+
 	db := connectDB(t)
 	t.Cleanup(func() { db.Close() })
 	cleanupDB(t, db)
@@ -220,6 +226,30 @@ func extractQuery(t *testing.T, rawURL, key string) string {
 		t.Fatalf("parse url %q: %v", rawURL, err)
 	}
 	return u.Query().Get(key)
+}
+
+// stubE2EProviderVerifier mirrors the legacy in-process provider stub: the
+// provider_token doubles as a stable user identifier so e2e tests can drive
+// login flows without standing up a fake GitHub/Google HTTP server.
+func stubE2EProviderVerifier(_ context.Context, provider, token string) (*service.ProviderUserInfo, error) {
+	switch provider {
+	case "github":
+		return &service.ProviderUserInfo{
+			Provider:    "github",
+			ProviderUID: "github_" + token,
+			Email:       fmt.Sprintf("%s@github.test", token),
+			Nickname:    "GitHub " + token,
+		}, nil
+	case "google":
+		return &service.ProviderUserInfo{
+			Provider:    "google",
+			ProviderUID: "google_" + token,
+			Email:       fmt.Sprintf("%s@google.test", token),
+			Nickname:    "Google " + token,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported provider: %s", provider)
+	}
 }
 
 func envOr(key, fallback string) string {

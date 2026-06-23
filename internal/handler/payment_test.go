@@ -334,6 +334,56 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		}
 	})
 
+	t.Run("Idempotency-Key too short → 400", func(t *testing.T) {
+		t.Parallel()
+		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/refunds",
+			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "short")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("Idempotency-Key with invalid chars → 400", func(t *testing.T) {
+		t.Parallel()
+		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/refunds",
+			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "has spaces here!")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("Idempotency-Key valid: letters/digits/separators", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			refundResult: &service.RefundResult{
+				Refund: &model.Refund{ID: "r-1", PaymentID: "p-1", Amount: 5.0, Status: "pending"},
+			},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/refunds",
+			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "uuid_abc-123.def:42")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
 	t.Run("success returns 200", func(t *testing.T) {
 		t.Parallel()
 		svc := &mockPaymentSvc{

@@ -428,8 +428,10 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 		return nil, ErrRefundAmountInvalid
 	}
 
-	// Caller-retry gate: same key → same row, no channel call.
-	if existing, err := s.refundRepo.FindByIdempotencyKey(ctx, in.IdempotencyKey); err == nil && existing != nil {
+	// Caller-retry gate: same (user, key) → same row, no channel call.
+// Scoped to in.UserID — a global key lookup would let user B see user
+// A's refund response by reusing the same key (IDOR).
+	if existing, err := s.refundRepo.FindByIdempotencyKey(ctx, in.UserID, in.IdempotencyKey); err == nil && existing != nil {
 		return &RefundResult{Refund: existing, Existing: true}, nil
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("check idempotency: %w", err)
@@ -442,12 +444,14 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 		}
 		return nil, fmt.Errorf("find payment: %w", err)
 	}
+	// Load the order for ownership + user_id propagation. For internal-app
+	// callers, in.UserID may be empty — we adopt the order's user_id as
+	// the canonical owner for the refund row.
+	o, oerr := s.orderRepo.FindByID(ctx, payment.OrderID)
+	if oerr != nil {
+		return nil, fmt.Errorf("load order: %w", oerr)
+	}
 	if !in.InternalApp {
-		// Ownership check: the payment's user must match caller.
-		o, oerr := s.orderRepo.FindByID(ctx, payment.OrderID)
-		if oerr != nil {
-			return nil, fmt.Errorf("load order for ownership: %w", oerr)
-		}
 		if o.UserID != in.UserID {
 			return nil, ErrPaymentNotFound // hide existence from non-owner
 		}
@@ -503,6 +507,7 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 		ID:               GenerateUUID(),
 		PaymentID:        payment.ID,
 		Channel:          payment.Channel,
+		UserID:           o.UserID,
 		Amount:           in.Amount,
 		Reason:           in.Reason,
 		IdempotencyKey:   in.IdempotencyKey,
@@ -510,8 +515,8 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 		Status:           "pending",
 	}
 	if _, err := tx.NamedExecContext(ctx, `
-		INSERT INTO refunds (id, payment_id, channel, amount, reason, idempotency_key, external_refund_id, status)
-		VALUES (:id, :payment_id, :channel, :amount, :reason, :idempotency_key, :external_refund_id, :status)
+		INSERT INTO refunds (id, payment_id, channel, user_id, amount, reason, idempotency_key, external_refund_id, status)
+		VALUES (:id, :payment_id, :channel, :user_id, :amount, :reason, :idempotency_key, :external_refund_id, :status)
 	`, refund); err != nil {
 		return nil, fmt.Errorf("insert refund: %w", err)
 	}
@@ -850,6 +855,13 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		}
 		return fmt.Errorf("find payment: %w", err)
 	}
+	// Load the order to get user_id for the refunds row. The webhook
+	// path needs to populate refunds.user_id since the user didn't
+	// pass an Idempotency-Key here (the channel drives the event).
+	var order model.Order
+	if err := tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, payment.OrderID); err != nil {
+		return fmt.Errorf("load order: %w", err)
+	}
 
 	// Find or insert the refund row keyed on (channel, external_refund_id).
 	// ON CONFLICT DO NOTHING absorbs webhook retries; re-read for the
@@ -857,11 +869,11 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	extID := e.ExternalRefundID
 	var refundID string
 	err = tx.QueryRowxContext(ctx, `
-		INSERT INTO refunds (payment_id, channel, amount, idempotency_key, external_refund_id, status)
-		VALUES ($1, $2, $3, $4, $5, 'paid')
+		INSERT INTO refunds (payment_id, channel, user_id, amount, idempotency_key, external_refund_id, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'paid')
 		ON CONFLICT (channel, external_refund_id) DO NOTHING
 		RETURNING id
-	`, payment.ID, e.Channel, e.RefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
+	`, payment.ID, e.Channel, order.UserID, e.RefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
 	switch {
 	case err == nil:
 		// inserted

@@ -11,6 +11,24 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
+// isValidIdempotencyKey enforces the Idempotency-Key character set. We
+// allow only ASCII letters, digits, and a few separators commonly used
+// by SDK-generated keys (UUID, Stripe-style). Anything else risks silent
+// truncation or encoding bugs at the DB boundary.
+func isValidIdempotencyKey(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '_', r == '.', r == ':', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // PaymentHandler exposes the v1 payment data flow endpoints.
 // All endpoints require JWT auth (set by middleware.JWTAuth) except where
 // noted; ownership is enforced via the service layer (a caller can only
@@ -153,6 +171,17 @@ func (h *PaymentHandler) CreateRefund(c *gin.Context) {
 	idemKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
 	if idemKey == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "missing Idempotency-Key header"})
+		return
+	}
+	// Length + charset validation. Without these, a caller could supply
+	// an 8KB key (bloat the unique index) or a non-ASCII key (silent
+	// truncation/encoding issues across the boundary).
+	if len(idemKey) < 8 || len(idemKey) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "Idempotency-Key must be 8-128 characters"})
+		return
+	}
+	if !isValidIdempotencyKey(idemKey) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "Idempotency-Key must match [A-Za-z0-9_.:-]+"})
 		return
 	}
 

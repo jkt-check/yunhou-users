@@ -8,7 +8,9 @@ import "time"
 // in Postgres).
 //
 // Idempotency:
-//   - idempotency_key (caller HTTP Idempotency-Key) blocks caller retry
+//   - (user_id, idempotency_key) blocks caller retry per-user (scoped to
+//     prevent cross-user IDOR — a global UNIQUE(key) would let user B see
+//     user A's refund by guessing/reusing a key)
 //   - (channel, external_refund_id) blocks the same refund event being
 //     recorded twice from different sources
 //
@@ -17,6 +19,7 @@ type Refund struct {
 	ID               string    `db:"id" json:"id"`
 	PaymentID        string    `db:"payment_id" json:"payment_id"`
 	Channel          string    `db:"channel" json:"channel"` // denormalized from payments.channel for UNIQUE
+	UserID           string    `db:"user_id" json:"user_id"` // denormalized from orders.user_id; scopes idempotency_key
 	Amount           float64   `db:"amount" json:"amount"`
 	Reason           *string   `db:"reason" json:"reason,omitempty"`
 	IdempotencyKey   string    `db:"idempotency_key" json:"idempotency_key"`

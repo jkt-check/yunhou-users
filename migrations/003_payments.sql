@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS refunds (
     channel           TEXT NOT NULL CHECK (channel IN ('stripe', 'wechat_pay', 'alipay')),
     amount            DECIMAL(10,2) NOT NULL CHECK (amount > 0),
     reason            TEXT,
+    -- Denormalized from orders.user_id via payment_id → order_id → user_id
+    -- join at INSERT time. Required so Idempotency-Key can be scoped per
+    -- user (UNIQUE(user_id, idempotency_key)) — without this, two users
+    -- picking the same key would collide and one would see the other's
+    -- refund response (IDOR / data exposure).
+    user_id           UUID NOT NULL,
     -- 调用方 HTTP header Idempotency-Key（设计文档 POST /refunds）
     idempotency_key   TEXT NOT NULL,
     -- channel 返回前为 NULL；PG 的 UNIQUE 默认把 NULL 视为 distinct，
@@ -111,8 +117,10 @@ CREATE TABLE IF NOT EXISTS refunds (
                       CHECK (status IN ('pending', 'paid', 'failed')),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- 调用方幂等：相同 key 的 POST /refunds 命中已有行
-    UNIQUE (idempotency_key),
+    -- 调用方幂等：相同 (user, key) 的 POST /refunds 命中已有行。
+    -- 范围是 (user_id, idempotency_key) 而非 (idempotency_key) 全局，
+    -- 防止 cross-user IDOR；handler 同时会做长度 / 字符集校验。
+    UNIQUE (user_id, idempotency_key),
     -- 业务幂等：同一通道不会给同一个退款事件两个外部 ID
     UNIQUE (channel, external_refund_id)
 );
@@ -121,6 +129,8 @@ CREATE TABLE IF NOT EXISTS refunds (
 CREATE INDEX IF NOT EXISTS idx_refunds_payment_id ON refunds(payment_id);
 -- 状态过滤（admin 列表）
 CREATE INDEX IF NOT EXISTS idx_refunds_status ON refunds(status);
+-- user 历史退款查询（GET /user/refunds 等）；也是 scoped idempotency lookup 的支撑索引
+CREATE INDEX IF NOT EXISTS idx_refunds_user_id ON refunds(user_id);
 
 -- ============================================================================
 -- 4. webhook_events — 每个事件的审计行，handler 先 INSERT 再业务操作（webhook doc §5.1）

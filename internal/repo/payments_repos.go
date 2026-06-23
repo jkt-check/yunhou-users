@@ -230,9 +230,9 @@ func (r *paymentRepo) ClearDisputed(ctx context.Context, id string) error {
 
 type RefundRepo interface {
 	// FindByIdempotencyKey is the caller-retry gate. POST /refunds MUST
-	// call this before invoking the channel refund API; if a row exists,
-	// return it without calling the channel.
-	FindByIdempotencyKey(ctx context.Context, key string) (*model.Refund, error)
+	// call this (scoped to userID) before invoking the channel refund API;
+	// if a row exists, return it without calling the channel.
+	FindByIdempotencyKey(ctx context.Context, userID, key string) (*model.Refund, error)
 	InsertPending(ctx context.Context, r *model.Refund) error
 	FindByID(ctx context.Context, id string) (*model.Refund, error)
 	// FindByChannelRefundID matches a webhook refund event to its row.
@@ -247,9 +247,11 @@ type refundRepo struct{ db *sqlx.DB }
 
 func NewRefundRepo(db *sqlx.DB) *refundRepo { return &refundRepo{db: db} }
 
-func (r *refundRepo) FindByIdempotencyKey(ctx context.Context, key string) (*model.Refund, error) {
+func (r *refundRepo) FindByIdempotencyKey(ctx context.Context, userID, key string) (*model.Refund, error) {
+	// Scoped to user_id — global UNIQUE(key) would let one user see
+	// another's refund response (IDOR) by guessing/reusing a key.
 	var ref model.Refund
-	err := r.db.GetContext(ctx, &ref, `SELECT * FROM refunds WHERE idempotency_key = $1`, key)
+	err := r.db.GetContext(ctx, &ref, `SELECT * FROM refunds WHERE user_id = $1 AND idempotency_key = $2`, userID, key)
 	if err != nil {
 		return nil, err
 	}
@@ -258,8 +260,8 @@ func (r *refundRepo) FindByIdempotencyKey(ctx context.Context, key string) (*mod
 
 func (r *refundRepo) InsertPending(ctx context.Context, ref *model.Refund) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO refunds (id, payment_id, channel, amount, reason, idempotency_key, external_refund_id, status)
-		VALUES (:id, :payment_id, :channel, :amount, :reason, :idempotency_key, :external_refund_id, :status)
+		INSERT INTO refunds (id, payment_id, channel, user_id, amount, reason, idempotency_key, external_refund_id, status)
+		VALUES (:id, :payment_id, :channel, :user_id, :amount, :reason, :idempotency_key, :external_refund_id, :status)
 	`, ref)
 	return err
 }

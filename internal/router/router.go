@@ -24,6 +24,9 @@ func Setup(
 	authSvc *service.AuthService,
 	subSvc *service.SubscriptionService,
 	planSvc *service.PlanService,
+	paymentSvc *service.PaymentService,
+	webhookVerifier middleware.ChannelSignatureVerifier,
+	wechatAPIv3Key []byte,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -35,6 +38,8 @@ func Setup(
 	subHandler := handler.NewSubscriptionHandler(subSvc)
 	planHandler := handler.NewPlanHandler(planSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
+	paymentHandler := handler.NewPaymentHandler(paymentSvc)
+	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
@@ -80,5 +85,41 @@ func Setup(
 		// App management
 		adminGroup.POST("/apps", appHandler.CreateApp)
 		adminGroup.PATCH("/apps/:id", appHandler.UpdateApp)
+	}
+
+	// Payment routes (JWT auth, user-scoped).
+	// Per design doc + webhook doc §3, webhooks have their own rate limit
+	// bucket (looser) and signature verification instead of JWT.
+	paymentGroup := engine.Group("/payments")
+	paymentGroup.Use(middleware.JWTAuth(tokenSvc), middleware.RateLimit(ctx, 30, 60))
+	{
+		// Order lifecycle
+		paymentGroup.POST("/orders", paymentHandler.CreateOrder)
+		paymentGroup.GET("/orders/:id", paymentHandler.GetOrder)
+		paymentGroup.DELETE("/orders/:id", paymentHandler.CancelOrder)
+		paymentGroup.POST("/orders/:order_id/confirm", paymentHandler.ConfirmOrder)
+
+		// Payment reads
+		paymentGroup.GET("", paymentHandler.ListPayments)
+		paymentGroup.GET("/:id", paymentHandler.GetPayment)
+		paymentGroup.GET("/:id/refunds", paymentHandler.ListPaymentRefunds)
+	}
+
+	// Refund routes (separate prefix per design doc).
+	// /refunds is also JWT-protected; ownership is enforced in service.
+	refundGroup := engine.Group("/refunds")
+	refundGroup.Use(middleware.JWTAuth(tokenSvc), middleware.RateLimit(ctx, 30, 60))
+	{
+		refundGroup.POST("", paymentHandler.CreateRefund)
+		refundGroup.GET("/:id", paymentHandler.GetRefund)
+	}
+
+	// Webhook endpoints — separate rate limit bucket (looser), signature
+	// verification instead of JWT. See webhook doc §3 / §4.
+	webhookLimiter := middleware.RateLimit(ctx, 200, 400)
+	webhookGroup := engine.Group("/webhooks/payment")
+	webhookGroup.Use(webhookLimiter, middleware.WebhookSignature(webhookVerifier))
+	{
+		webhookGroup.POST("/:channel", webhookHandler.Handle)
 	}
 }

@@ -1,0 +1,504 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/model"
+	"github.com/yunhou/users/internal/service"
+)
+
+// mockPaymentSvc is the test double for service.PaymentServiceInterface.
+// Each method has a configurable error + return value, which is the pattern
+// used elsewhere in this package (auth_test.go, app handler tests).
+type mockPaymentSvc struct {
+	createOrderResp *model.Order
+	createOrderErr  error
+	cancelOrderErr  error
+	confirmResult   *service.ConfirmResult
+	confirmErr      error
+	refundResult    *service.RefundResult
+	refundErr       error
+	getOrderResp    *model.Order
+	getOrderErr     error
+	listPayments    []model.Payment
+	listPaymentsErr error
+	getPaymentResp  *model.Payment
+	getPaymentErr   error
+	listRefunds     []model.Refund
+	listRefundsErr  error
+	getRefundResp   *model.Refund
+	getRefundErr    error
+	onWebhookResult *service.OnWebhookResult
+	onWebhookErr    error
+}
+
+func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _ string) (*model.Order, error) {
+	return m.createOrderResp, m.createOrderErr
+}
+func (m *mockPaymentSvc) CancelOrder(_ context.Context, _, _ string) error {
+	return m.cancelOrderErr
+}
+func (m *mockPaymentSvc) Confirm(_ context.Context, _ service.ConfirmInput) (*service.ConfirmResult, error) {
+	return m.confirmResult, m.confirmErr
+}
+func (m *mockPaymentSvc) Refund(_ context.Context, _ service.RefundInput) (*service.RefundResult, error) {
+	return m.refundResult, m.refundErr
+}
+func (m *mockPaymentSvc) OnWebhook(_ context.Context, _ service.WebhookEvent) (*service.OnWebhookResult, error) {
+	return m.onWebhookResult, m.onWebhookErr
+}
+func (m *mockPaymentSvc) GetOrder(_ context.Context, _, _ string) (*model.Order, error) {
+	return m.getOrderResp, m.getOrderErr
+}
+func (m *mockPaymentSvc) ListUserPayments(_ context.Context, _ string) ([]model.Payment, error) {
+	return m.listPayments, m.listPaymentsErr
+}
+func (m *mockPaymentSvc) GetPayment(_ context.Context, _, _ string) (*model.Payment, error) {
+	return m.getPaymentResp, m.getPaymentErr
+}
+func (m *mockPaymentSvc) ListPaymentRefunds(_ context.Context, _, _ string) ([]model.Refund, error) {
+	return m.listRefunds, m.listRefundsErr
+}
+func (m *mockPaymentSvc) GetRefund(_ context.Context, _, _ string) (*model.Refund, error) {
+	return m.getRefundResp, m.getRefundErr
+}
+
+// Compile-time check: mockPaymentSvc must satisfy the interface.
+var _ service.PaymentServiceInterface = (*mockPaymentSvc)(nil)
+
+// paymentTestEngine builds a Gin engine with /payments and /refunds routes
+// wired up against the supplied mock service, with a fake user_id injected
+// (bypassing JWT verification — the JWT path is exercised in e2e tests).
+func paymentTestEngine(svc service.PaymentServiceInterface, userID string) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	h := NewPaymentHandler(svc)
+
+	// Inject fake user_id for every request.
+	engine.Use(func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, userID)
+		c.Next()
+	})
+
+	engine.POST("/payments/orders", h.CreateOrder)
+	engine.GET("/payments/orders/:id", h.GetOrder)
+	engine.DELETE("/payments/orders/:id", h.CancelOrder)
+	engine.POST("/payments/orders/:order_id/confirm", h.ConfirmOrder)
+	engine.GET("/payments", h.ListPayments)
+	engine.GET("/payments/:id", h.GetPayment)
+	engine.GET("/payments/:id/refunds", h.ListPaymentRefunds)
+	engine.POST("/refunds", h.CreateRefund)
+	engine.GET("/refunds/:id", h.GetRefund)
+	return engine
+}
+
+func doRequest(engine *gin.Engine, method, path string, body any) *httptest.ResponseRecorder {
+	var buf bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&buf).Encode(body)
+	}
+	req := httptest.NewRequest(method, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	return rec
+}
+
+// ============================================================================
+// CreateOrder
+// ============================================================================
+
+func TestPaymentHandler_CreateOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success returns 201 with order", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			createOrderResp: &model.Order{
+				ID:     "o-1",
+				UserID: "user-1",
+				PlanID: "monthly",
+				Amount: 29.9,
+				Status: "pending",
+			},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly"})
+
+		if rec.Code != http.StatusCreated {
+			t.Errorf("status: got %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("bad plan → 400", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: service.ErrPlanNotFound}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "ghost"})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400", rec.Code)
+		}
+	})
+
+	t.Run("already has active sub → 409", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: service.ErrUserHasActiveSub}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly"})
+
+		if rec.Code != http.StatusConflict {
+			t.Errorf("status: got %d, want 409", rec.Code)
+		}
+	})
+
+	t.Run("missing plan_id → 400 (binding)", func(t *testing.T) {
+		t.Parallel()
+		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 (binding error)", rec.Code)
+		}
+	})
+}
+
+// ============================================================================
+// GetOrder
+// ============================================================================
+
+func TestPaymentHandler_GetOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success returns 200", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			getOrderResp: &model.Order{ID: "o-1", UserID: "user-1", Status: "pending"},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodGet, "/payments/orders/o-1", nil)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200", rec.Code)
+		}
+	})
+
+	t.Run("not found → 404", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{getOrderErr: service.ErrOrderNotFound}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodGet, "/payments/orders/o-1", nil)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status: got %d, want 404", rec.Code)
+		}
+	})
+}
+
+// ============================================================================
+// CancelOrder
+// ============================================================================
+
+func TestPaymentHandler_CancelOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success returns 200", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodDelete, "/payments/orders/o-1", nil)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200", rec.Code)
+		}
+	})
+
+	t.Run("not pending → 409", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{cancelOrderErr: service.ErrOrderNotPending}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodDelete, "/payments/orders/o-1", nil)
+
+		if rec.Code != http.StatusConflict {
+			t.Errorf("status: got %d, want 409", rec.Code)
+		}
+	})
+
+	t.Run("not found → 404", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{cancelOrderErr: service.ErrOrderNotFound}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodDelete, "/payments/orders/o-1", nil)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status: got %d, want 404", rec.Code)
+		}
+	})
+}
+
+// ============================================================================
+// ConfirmOrder
+// ============================================================================
+
+func TestPaymentHandler_ConfirmOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success returns 200", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			confirmResult: &service.ConfirmResult{
+				PaymentID:             "p-1",
+				OrderID:               "o-1",
+				Status:                "paid",
+				ActivatedSubscription: true,
+			},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders/o-1/confirm", map[string]any{
+			"channel":         "stripe",
+			"external_txn_id": "pi_xxx",
+		})
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("channel mismatch → 409", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{confirmErr: service.ErrOrderChannelMismatch}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders/o-1/confirm", map[string]any{
+			"channel":         "wechat_pay",
+			"external_txn_id": "wx_1",
+		})
+
+		if rec.Code != http.StatusConflict {
+			t.Errorf("status: got %d, want 409", rec.Code)
+		}
+	})
+
+	t.Run("terminal-non-recoverable → 409", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{confirmErr: service.ErrOrderAlreadyTerminal}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders/o-1/confirm", map[string]any{
+			"channel":         "stripe",
+			"external_txn_id": "pi_xxx",
+		})
+
+		if rec.Code != http.StatusConflict {
+			t.Errorf("status: got %d, want 409", rec.Code)
+		}
+	})
+
+	t.Run("missing channel → 400 binding", func(t *testing.T) {
+		t.Parallel()
+		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders/o-1/confirm", map[string]any{
+			"external_txn_id": "pi_xxx",
+		})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400", rec.Code)
+		}
+	})
+}
+
+// ============================================================================
+// CreateRefund — Idempotency-Key is REQUIRED
+// ============================================================================
+
+func TestPaymentHandler_CreateRefund(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing Idempotency-Key → 400", func(t *testing.T) {
+		t.Parallel()
+		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/refunds", map[string]any{
+			"payment_id": "p-1",
+			"amount":     5.0,
+		})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400", rec.Code)
+		}
+	})
+
+	t.Run("success returns 200", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			refundResult: &service.RefundResult{
+				Refund: &model.Refund{ID: "r-1", PaymentID: "p-1", Amount: 5.0, Status: "pending"},
+			},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/refunds",
+			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "idem-001")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("invalid amount → 400", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{refundErr: service.ErrRefundAmountInvalid}
+		engine := paymentTestEngine(svc, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/refunds",
+			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":-1}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "idem-bad")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400", rec.Code)
+		}
+	})
+
+	t.Run("channel API failure → 502", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{refundErr: service.ErrRefundChannelFailed}
+		engine := paymentTestEngine(svc, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/refunds",
+			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "idem-channel-fail")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Errorf("status: got %d, want 502", rec.Code)
+		}
+	})
+
+	t.Run("sum exceeds payment → 400", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{refundErr: service.ErrRefundSumExceedsPayment}
+		engine := paymentTestEngine(svc, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/refunds",
+			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":1000.0}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "idem-sum")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400", rec.Code)
+		}
+	})
+}
+
+// ============================================================================
+// GetRefund
+// ============================================================================
+
+func TestPaymentHandler_GetRefund(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			getRefundResp: &model.Refund{ID: "r-1", PaymentID: "p-1", Amount: 5.0, Status: "paid"},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodGet, "/refunds/r-1", nil)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200", rec.Code)
+		}
+	})
+
+	t.Run("not found → 404", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{getRefundErr: service.ErrRefundNotFound}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodGet, "/refunds/r-1", nil)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status: got %d, want 404", rec.Code)
+		}
+	})
+}
+
+// ============================================================================
+// ListPayments / GetPayment / ListPaymentRefunds (smoke)
+// ============================================================================
+
+func TestPaymentHandler_ListPayments(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			listPayments: []model.Payment{{ID: "p-1", OrderID: "o-1", Status: "paid"}},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodGet, "/payments", nil)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200", rec.Code)
+		}
+	})
+}
+
+func TestPaymentHandler_GetPayment_NotFound(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockPaymentSvc{getPaymentErr: service.ErrPaymentNotFound}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, http.MethodGet, "/payments/p-1", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", rec.Code)
+	}
+}
+
+func TestPaymentHandler_ListPaymentRefunds_PropagatesOwnershipErr(t *testing.T) {
+	t.Parallel()
+
+	// Service returns ErrPaymentNotFound when caller doesn't own the
+	// payment — handler should surface 404.
+	svc := &mockPaymentSvc{listRefundsErr: service.ErrPaymentNotFound}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, http.MethodGet, "/payments/p-1/refunds", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", rec.Code)
+	}
+}
+
+// ============================================================================
+// Internal error → 500
+// ============================================================================
+
+func TestPaymentHandler_InternalError_500(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockPaymentSvc{
+		getOrderErr: errors.New("db unreachable"),
+	}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, http.MethodGet, "/payments/orders/o-1", nil)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status: got %d, want 500 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// unused import shims so go vet stays quiet when the file is partially edited
+var _ = time.Now
+var _ = mockPaymentSvc{}
+var _ = service.PaymentServiceInterface(nil)

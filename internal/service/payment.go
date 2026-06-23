@@ -154,6 +154,84 @@ func (s *PaymentService) CancelOrder(ctx context.Context, orderID, userID string
 }
 
 // ============================================================================
+// Reads (with ownership check)
+// ============================================================================
+
+// GetOrder returns an order by ID, or ErrOrderNotFound if missing or
+// not owned by the caller. Internal-app callers (via SetOrderInternal)
+// bypass the ownership check.
+func (s *PaymentService) GetOrder(ctx context.Context, orderID, userID string) (*model.Order, error) {
+	o, err := s.orderRepo.FindByID(ctx, orderID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrOrderNotFound
+		}
+		return nil, fmt.Errorf("find order: %w", err)
+	}
+	if o.UserID != userID {
+		return nil, ErrOrderNotFound // hide existence from non-owner
+	}
+	return o, nil
+}
+
+// ListUserPayments returns payments for orders owned by userID.
+func (s *PaymentService) ListUserPayments(ctx context.Context, userID string) ([]model.Payment, error) {
+	return s.paymentRepo.ListByUserID(ctx, userID)
+}
+
+// GetPayment returns a payment by ID, or ErrPaymentNotFound if missing or
+// not owned by the caller.
+func (s *PaymentService) GetPayment(ctx context.Context, paymentID, userID string) (*model.Payment, error) {
+	p, err := s.paymentRepo.FindByID(ctx, paymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrPaymentNotFound
+		}
+		return nil, fmt.Errorf("find payment: %w", err)
+	}
+	o, oerr := s.orderRepo.FindByID(ctx, p.OrderID)
+	if oerr != nil {
+		return nil, fmt.Errorf("find order: %w", oerr)
+	}
+	if o.UserID != userID {
+		return nil, ErrPaymentNotFound
+	}
+	return p, nil
+}
+
+// ListPaymentRefunds returns refunds for a payment, with ownership check.
+func (s *PaymentService) ListPaymentRefunds(ctx context.Context, paymentID, userID string) ([]model.Refund, error) {
+	p, err := s.GetPayment(ctx, paymentID, userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.refundRepo.ListByPaymentID(ctx, p.ID)
+}
+
+// GetRefund returns a refund by ID, with ownership check via payment → order.
+func (s *PaymentService) GetRefund(ctx context.Context, refundID, userID string) (*model.Refund, error) {
+	r, err := s.refundRepo.FindByID(ctx, refundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrRefundNotFound
+		}
+		return nil, fmt.Errorf("find refund: %w", err)
+	}
+	p, perr := s.paymentRepo.FindByID(ctx, r.PaymentID)
+	if perr != nil {
+		return nil, fmt.Errorf("find payment: %w", perr)
+	}
+	o, oerr := s.orderRepo.FindByID(ctx, p.OrderID)
+	if oerr != nil {
+		return nil, fmt.Errorf("find order: %w", oerr)
+	}
+	if o.UserID != userID {
+		return nil, ErrRefundNotFound
+	}
+	return r, nil
+}
+
+// ============================================================================
 // Confirm (frontend SDK callback fast-track)
 // ============================================================================
 

@@ -18,10 +18,20 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
 	"github.com/yunhou/users/internal/service"
 )
+
+// stubRefundAPI is the e2e placeholder for the channel refund API. Returns
+// a fake external_refund_id so tests can assert the row insertion path.
+// Real Stripe/WeChat/Alipay HTTP clients land in v2.
+type stubRefundAPI struct{}
+
+func (stubRefundAPI) Refund(_ context.Context, _, _ string, _ float64, _ string) (string, error) {
+	return "re_e2e_stub", nil
+}
 
 const (
 	defaultDBURL   = "postgres://postgres@localhost/yunhou_users?sslmode=disable"
@@ -128,6 +138,8 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		GitHubClientSecret: "e2e-fake-client-secret",
 		JWTAccessTTL:   15 * time.Minute,
 		JWTRefreshTTL: 168 * time.Hour,
+		OrderExpiryDuration: 30 * time.Minute,
+		SweeperInterval:     1 * time.Minute,
 	}
 
 	// Repos
@@ -137,6 +149,11 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
+	orderRepo := repo.NewOrderRepo(db)
+	paymentRepo := repo.NewPaymentRepo(db)
+	refundRepo := repo.NewRefundRepo(db)
+	webhookEventRepo := repo.NewWebhookEventRepo(db)
+	auditLogRepo := repo.NewAuditLogRepo(db)
 
 	// Services
 	tokenSvc, err := service.NewTokenService(cfg, sessionRepo, subRepo)
@@ -148,12 +165,23 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
+	// Payment service with stub refund API — e2e tests for /refunds land in M5.
+	paymentSvc := service.NewPaymentService(
+		db,
+		orderRepo, paymentRepo, refundRepo,
+		subRepo, planRepo, userRepo,
+		webhookEventRepo, auditLogRepo,
+		&stubRefundAPI{},
+		cfg.OrderExpiryDuration,
+	)
+
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
-		tokenSvc, authSvc, subSvc, planSvc)
+		tokenSvc, authSvc, subSvc, planSvc,
+		paymentSvc, &middleware.MultiChannelVerifier{}, nil)
 
 	return engine, nil, db
 }

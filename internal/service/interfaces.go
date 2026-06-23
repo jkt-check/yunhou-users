@@ -38,3 +38,23 @@ type PlanServiceInterface interface {
 	UpdatePlan(ctx context.Context, p *model.Plan) error
 	DeletePlan(ctx context.Context, id string) error
 }
+
+// PaymentServiceInterface is the v1 payment data flow surface that handlers
+// depend on. See docs/plans/2026-06-16-user-system-design.md and
+// docs/plans/2026-06-23-payment-webhook-mechanism.md for full semantics.
+//
+// RefundRequest is the request shape for POST /refunds; PaymentService.Refund
+// returns the (idempotent) refund row and whether it was newly inserted or
+// resolved from a previous Idempotency-Key match.
+type PaymentServiceInterface interface {
+	CreateOrder(ctx context.Context, userID, planID string) (*model.Order, error)
+	CancelOrder(ctx context.Context, orderID, userID string) error
+	Confirm(ctx context.Context, in ConfirmInput) (*ConfirmResult, error)
+	Refund(ctx context.Context, in RefundInput) (*RefundResult, error)
+	OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebhookResult, error)
+	GetOrder(ctx context.Context, orderID, userID string) (*model.Order, error)
+	ListUserPayments(ctx context.Context, userID string) ([]model.Payment, error)
+	GetPayment(ctx context.Context, paymentID, userID string) (*model.Payment, error)
+	ListPaymentRefunds(ctx context.Context, paymentID, userID string) ([]model.Refund, error)
+	GetRefund(ctx context.Context, refundID, userID string) (*model.Refund, error)
+}

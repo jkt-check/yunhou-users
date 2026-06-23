@@ -1,0 +1,246 @@
+package handler
+
+import (
+	"errors"
+	"log"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/service"
+)
+
+// PaymentHandler exposes the v1 payment data flow endpoints.
+// All endpoints require JWT auth (set by middleware.JWTAuth) except where
+// noted; ownership is enforced via the service layer (a caller can only
+// read/write their own orders / payments / refunds).
+type PaymentHandler struct {
+	svc service.PaymentServiceInterface
+}
+
+func NewPaymentHandler(svc service.PaymentServiceInterface) *PaymentHandler {
+	return &PaymentHandler{svc: svc}
+}
+
+// ============================================================================
+// Order endpoints
+// ============================================================================
+
+// CreateOrder — POST /payments/orders
+func (h *PaymentHandler) CreateOrder(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+	var req struct {
+		PlanID string `json:"plan_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	order, err := h.svc.CreateOrder(c.Request.Context(), userID, req.PlanID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": order})
+}
+
+// GetOrder — GET /payments/orders/:id
+func (h *PaymentHandler) GetOrder(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	order, err := h.svc.GetOrder(c.Request.Context(), c.Param("id"), userID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": order})
+}
+
+// CancelOrder — DELETE /payments/orders/:id
+func (h *PaymentHandler) CancelOrder(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if err := h.svc.CancelOrder(c.Request.Context(), c.Param("id"), userID); err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "cancelled"})
+}
+
+// ConfirmOrder — POST /payments/orders/:order_id/confirm
+func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+
+	var req struct {
+		Channel       string  `json:"channel" binding:"required"`
+		ExternalTxnID string  `json:"external_txn_id" binding:"required"`
+		Amount        *float64 `json:"amount"`
+		Currency      *string  `json:"currency"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	in := service.ConfirmInput{
+		OrderID:       c.Param("order_id"),
+		UserID:        userID,
+		Channel:       req.Channel,
+		ExternalTxnID: req.ExternalTxnID,
+		Amount:        req.Amount,
+		Currency:      req.Currency,
+	}
+	res, err := h.svc.Confirm(c.Request.Context(), in)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": res})
+}
+
+// ============================================================================
+// Payment endpoints
+// ============================================================================
+
+// ListPayments — GET /payments
+func (h *PaymentHandler) ListPayments(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+	list, err := h.svc.ListUserPayments(c.Request.Context(), userID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list})
+}
+
+// GetPayment — GET /payments/:id
+func (h *PaymentHandler) GetPayment(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	payment, err := h.svc.GetPayment(c.Request.Context(), c.Param("id"), userID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": payment})
+}
+
+// ============================================================================
+// Refund endpoints
+// ============================================================================
+
+// CreateRefund — POST /refunds
+//
+// Requires Idempotency-Key header (caller retry → no double-refund).
+func (h *PaymentHandler) CreateRefund(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+
+	idemKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if idemKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "missing Idempotency-Key header"})
+		return
+	}
+
+	var req struct {
+		PaymentID string  `json:"payment_id" binding:"required"`
+		Amount    float64 `json:"amount" binding:"required"`
+		Reason    *string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	in := service.RefundInput{
+		PaymentID:      req.PaymentID,
+		UserID:         userID,
+		IdempotencyKey: idemKey,
+		Amount:         req.Amount,
+		Reason:         req.Reason,
+	}
+	res, err := h.svc.Refund(c.Request.Context(), in)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": res.Refund})
+}
+
+// GetRefund — GET /refunds/:id
+func (h *PaymentHandler) GetRefund(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	refund, err := h.svc.GetRefund(c.Request.Context(), c.Param("id"), userID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": refund})
+}
+
+// ListPaymentRefunds — GET /payments/:id/refunds
+func (h *PaymentHandler) ListPaymentRefunds(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	list, err := h.svc.ListPaymentRefunds(c.Request.Context(), c.Param("id"), userID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list})
+}
+
+// ============================================================================
+// Error mapping
+// ============================================================================
+
+// writePaymentError translates service-layer sentinel errors to HTTP status
+// codes. Internal errors (anything not on this list) are logged and surfaced
+// as a generic 500 — see the responsibility boundary memory.
+func writePaymentError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, service.ErrPlanNotFound):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan not found"})
+	case errors.Is(err, service.ErrPlanInactive):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is inactive"})
+	case errors.Is(err, service.ErrUserHasActiveSub):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
+	case errors.Is(err, service.ErrOrderNotFound), errors.Is(err, service.ErrPaymentNotFound), errors.Is(err, service.ErrRefundNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "not found"})
+	case errors.Is(err, service.ErrOrderNotPending):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "order is not in pending status"})
+	case errors.Is(err, service.ErrOrderChannelMismatch):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "order already has a paid payment on a different channel"})
+	case errors.Is(err, service.ErrOrderAlreadyTerminal):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "order is in a non-recoverable terminal state"})
+	case errors.Is(err, service.ErrPaymentNotPaid):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "payment is not in paid status"})
+	case errors.Is(err, service.ErrRefundAmountInvalid):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "refund amount must be > 0 and <= payment amount"})
+	case errors.Is(err, service.ErrRefundSumExceedsPayment):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "sum of refunds would exceed payment amount"})
+	case errors.Is(err, service.ErrRefundChannelFailed):
+		// 502 — upstream channel rejected the refund request
+		c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "channel refund API call failed"})
+	case errors.Is(err, service.ErrMissingIdempotencyKey):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "missing Idempotency-Key header"})
+	case errors.Is(err, service.ErrInvalidChannel):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid channel"})
+	default:
+		log.Printf("payment handler error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
+	}
+}

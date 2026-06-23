@@ -12,8 +12,10 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/service"
 )
 
@@ -31,11 +33,12 @@ import (
 //               total_amount is in major units (no conversion)
 type WebhookHandler struct {
 	svc       service.PaymentServiceInterface
-	wechatKey []byte // WECHAT_PAY_API_V3_KEY — needed for resource decryption
+	wechatKey []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
+	verifier  middleware.ChannelSignatureVerifier
 }
 
-func NewWebhookHandler(svc service.PaymentServiceInterface, wechatAPIv3Key []byte) *WebhookHandler {
-	return &WebhookHandler{svc: svc, wechatKey: wechatAPIv3Key}
+func NewWebhookHandler(svc service.PaymentServiceInterface, wechatAPIv3Key []byte, verifier middleware.ChannelSignatureVerifier) *WebhookHandler {
+	return &WebhookHandler{svc: svc, wechatKey: wechatAPIv3Key, verifier: verifier}
 }
 
 // Handle is the single entrypoint for /webhooks/payment/:channel. The
@@ -76,11 +79,17 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 	// Always 200 on success — duplicates, uninteresting event types, and
 	// real domain actions all converge to the same shape. The channel stops
 	// retrying on 2xx (per its own contract).
+	// Per CLAUDE.md envelope, `domain_action` and `duplicate` live INSIDE
+	// `data` (not as top-level keys). Channels parse this body, not the
+	// envelope itself, so they don't notice either way; the in-shape keys
+	// keep consumer apps that parse `data.*` working uniformly.
 	c.JSON(http.StatusOK, gin.H{
-		"code":          0,
-		"data":          gin.H{"received": true},
-		"domain_action": result.DomainAction,
-		"duplicate":     result.DuplicateEvent,
+		"code": 0,
+		"data": gin.H{
+			"received":     true,
+			"domain_action": result.DomainAction,
+			"duplicate":    result.DuplicateEvent,
+		},
 	})
 }
 
@@ -123,7 +132,8 @@ func (h *WebhookHandler) parseStripe(raw []byte) (*service.WebhookEvent, error) 
 				Amount   int64  `json:"amount"`
 				Currency string `json:"currency"`
 				Metadata struct {
-					OrderID string `json:"order_id"`
+					OrderID    string `json:"order_id"`
+					SubExpires string `json:"sub_expires_at"`
 				} `json:"metadata"`
 			} `json:"object"`
 		} `json:"data"`
@@ -133,7 +143,7 @@ func (h *WebhookHandler) parseStripe(raw []byte) (*service.WebhookEvent, error) 
 	}
 
 	pi := evt.Data.Object
-	return &service.WebhookEvent{
+	we := &service.WebhookEvent{
 		Channel:       "stripe",
 		EventID:       evt.ID,
 		EventType:     evt.Type,
@@ -141,7 +151,15 @@ func (h *WebhookHandler) parseStripe(raw []byte) (*service.WebhookEvent, error) 
 		OrderID:       pi.Metadata.OrderID,
 		Amount:        float64(pi.Amount) / 100, // cents → major units
 		Currency:      strings.ToUpper(pi.Currency),
-	}, nil
+	}
+	if pi.Metadata.SubExpires != "" {
+		// RFC3339 — frontend product decision sets this from plan.interval_days
+		// + business rules (rollover, grace, trial). nil/absent → never expires.
+		if t, err := time.Parse(time.RFC3339, pi.Metadata.SubExpires); err == nil {
+			we.SubExpiresAt = &t
+		}
+	}
+	return we, nil
 }
 
 // parseWeChat decrypts the resource block and reads transaction_id / out_trade_no
@@ -169,11 +187,12 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 	}
 
 	// decrypted resource shape:
-	//   TRANSACTION.SUCCESS: { "transaction_id": "...", "amount": { "total": 100, ... }, "out_trade_no": "..." }
+	//   TRANSACTION.SUCCESS: { "transaction_id": "...", "amount": { "total": 100, ... }, "out_trade_no": "...", "sub_expires_at": "..." }
 	//   TRANSACTION.REFUND:  { "transaction_id": "...", "amount": { "refund": 100, ... }, "out_trade_no": "..." }
 	var resource struct {
 		TransactionID string `json:"transaction_id"`
 		OutTradeNo    string `json:"out_trade_no"`
+		SubExpires    string `json:"sub_expires_at"`
 		Amount        struct {
 			Total  int64 `json:"total"`
 			Refund int64 `json:"refund"`
@@ -192,21 +211,41 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 		Amount:        float64(resource.Amount.Total) / 100, // fen → major units
 		Currency:      "CNY",                                 // WeChat is always CNY in v1
 	}
+	if resource.SubExpires != "" {
+		if t, err := time.Parse(time.RFC3339, resource.SubExpires); err == nil {
+			we.SubExpiresAt = &t
+		}
+	}
 	if resource.Amount.Refund > 0 {
 		we.RefundAmount = float64(resource.Amount.Refund) / 100
 	}
 	return we, nil
 }
 
-// decryptWeChatResource AES-256-GCM decrypts the resource.ciphertext using
-// the WECHAT_PAY_API_V3_KEY. The nonce and associated_data are passed
-// through to the GCM open call.
+// decryptWeChatResource AES-256-GCM decrypts the resource.ciphertext.
+// Delegates to the WeChatPayV3Verifier when available so the crypto
+// implementation lives in exactly one place (middleware/webhook_sig.go).
+// Falls back to the local implementation if the verifier isn't a
+// WeChatPayV3Verifier (test stubs). The typed-nil check guards against
+// a `var v *WeChatPayV3Verifier; NewWebhookHandler(..., v)` misuse — a
+// typed nil passes the type assertion as `ok=true` but would panic on
+// the first method call.
 func (h *WebhookHandler) decryptWeChatResource(ciphertextB64, nonce, associatedData string) ([]byte, error) {
+	if v, ok := h.verifier.(*middleware.WeChatPayV3Verifier); ok && v != nil {
+		return v.DecryptResource(ciphertextB64, nonce, associatedData)
+	}
+	return localWeChatDecrypt(string(h.wechatKey), ciphertextB64, nonce, associatedData)
+}
+
+// localWeChatDecrypt is the in-package fallback used only when the
+// WeChatPayV3Verifier isn't wired (handler-level tests). The production
+// path goes through the verifier's DecryptResource method.
+func localWeChatDecrypt(key, ciphertextB64, nonce, associatedData string) ([]byte, error) {
 	ciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)
 	}
-	block, err := aes.NewCipher(h.wechatKey)
+	block, err := aes.NewCipher([]byte(key))
 	if err != nil {
 		return nil, fmt.Errorf("new cipher: %w", err)
 	}
@@ -214,9 +253,6 @@ func (h *WebhookHandler) decryptWeChatResource(ciphertextB64, nonce, associatedD
 	if err != nil {
 		return nil, fmt.Errorf("new gcm: %w", err)
 	}
-	// GCM requires exactly 12-byte nonce (Go stdlib hardcodes NonceSize()=12).
-	// Without this guard, gcm.Open panics on wrong-length nonces — Gin
-	// recovers the panic as a 500, which is a DoS vector.
 	if len(nonce) != gcm.NonceSize() {
 		return nil, fmt.Errorf("invalid nonce length: got %d, want %d", len(nonce), gcm.NonceSize())
 	}
@@ -236,6 +272,7 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 	tradeNo := values.Get("trade_no")
 	totalAmount := values.Get("total_amount")
 	refundAmount := values.Get("refund_amount")
+	subExpires := values.Get("sub_expires_at")
 	notifyID := values.Get("notify_id")
 	notifyType := values.Get("notify_type")
 
@@ -270,6 +307,11 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 			return nil, fmt.Errorf("alipay refund_amount: %w", err)
 		}
 		event.RefundAmount = v
+	}
+	if subExpires != "" {
+		if t, err := time.Parse(time.RFC3339, subExpires); err == nil {
+			event.SubExpiresAt = &t
+		}
 	}
 
 	// Alipay doesn't echo its own refund ID; the service generates an

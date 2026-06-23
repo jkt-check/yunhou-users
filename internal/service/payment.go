@@ -479,12 +479,15 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 		return nil, fmt.Errorf("lock payment: %w", err)
 	}
 
-	// Sum invariant under lock. Only count refunds that actually settled
-	// against the channel — failed refunds must not block a successful
-	// retry of the same logical amount.
+	// Sum invariant under lock. Count both `paid` and `pending` so two
+	// concurrent refunds serialized by the FOR UPDATE lock can't each pass
+	// the check (the prior version excluded `pending` rows and let 4×$10
+	// slip past on a $30 payment when all 4 were still pending).
+	// `failed` rows are excluded — those are terminal denials, not
+	// reservations, and don't block a retry of the same logical amount.
 	var currentSum float64
 	if err := tx.GetContext(ctx, &currentSum,
-		`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status = 'paid'`, payment.ID); err != nil {
+		`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status IN ('paid', 'pending')`, payment.ID); err != nil {
 		return nil, fmt.Errorf("sum refunds: %w", err)
 	}
 	if currentSum+in.Amount > paymentAmount {
@@ -563,7 +566,13 @@ type WebhookEvent struct {
 // OnWebhookResult reports what the handler did.
 type OnWebhookResult struct {
 	DuplicateEvent bool // true if event_id was already seen (handler should ack 200)
-	DomainAction   string // "payment_paid" / "payment_failed" / "refund_paid" / "none"
+	DomainAction string // set only when an action ran. Values:
+		//   "payment_paid" / "payment_failed" / "refund_paid"
+		//   / "payment_disputed" / "payment_dispute_closed" / "none"
+		// Empty string ("") means no action ran — either a dedupe hit
+		// (DuplicateEvent=true) or an uninteresting event type. Consumers
+		// should branch on `duplicate` for the dedupe case, not on
+		// `domain_action == "none"`.
 }
 
 // OnWebhook dispatches the (already signature-verified) event to the right
@@ -864,20 +873,25 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	}
 
 	// Find or insert the refund row keyed on (channel, external_refund_id).
+	// Insert as `pending` first so the sum-invariant (which counts pending
+	// rows in Refund) holds even when this path creates a refund row that
+	// wasn't initiated via POST /refunds. The follow-up UPDATE flips
+	// pending → paid atomically; re-runs of the same webhook are no-ops
+	// because the second pass sees `paid` and skips.
 	// ON CONFLICT DO NOTHING absorbs webhook retries; re-read for the
 	// (channel, external_refund_id) → id mapping.
 	extID := e.ExternalRefundID
 	var refundID string
 	err = tx.QueryRowxContext(ctx, `
 		INSERT INTO refunds (payment_id, channel, user_id, amount, idempotency_key, external_refund_id, status)
-		VALUES ($1, $2, $3, $4, $5, $6, 'paid')
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending')
 		ON CONFLICT (channel, external_refund_id) DO NOTHING
 		RETURNING id
 	`, payment.ID, e.Channel, order.UserID, e.RefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
 	switch {
 	case err == nil:
-		// inserted
-	case err.Error() == "sql: no rows in result set":
+		// inserted (new pending row — will be flipped below)
+	case errors.Is(err, sql.ErrNoRows):
 		// already inserted by a prior webhook delivery — look it up
 		if lerr := tx.GetContext(ctx, &refundID, `
 			SELECT id FROM refunds WHERE channel = $1 AND external_refund_id = $2
@@ -1002,7 +1016,7 @@ func insertPaymentOnTx(ctx context.Context, tx *sqlx.Tx, p *model.Payment) (stri
 		RETURNING id
 	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, p.Status, paidAt, rawPayload).Scan(&id)
 	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
+		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil
 		}
 		return "", false, err
@@ -1016,7 +1030,7 @@ func insertPaymentOnTx(ctx context.Context, tx *sqlx.Tx, p *model.Payment) (stri
 // an existing row).
 func activateSubscriptionOnTx(ctx context.Context, tx *sqlx.Tx, userID, planID string, expiresAt *time.Time) (bool, error) {
 	// Step 1: UPDATE the target row (active first, else most recent).
-	_, err := tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET
 			plan_id = $1,
 			started_at = now(),
@@ -1033,14 +1047,11 @@ func activateSubscriptionOnTx(ctx context.Context, tx *sqlx.Tx, userID, planID s
 		return false, fmt.Errorf("update subscription: %w", err)
 	}
 
-	// Check whether the UPDATE hit a row (vs no rows existed at all).
-	var count int
-	if err := tx.GetContext(ctx, &count,
-		`SELECT COUNT(*) FROM subscriptions WHERE user_id = $1`, userID); err != nil {
-		return false, fmt.Errorf("count subs: %w", err)
-	}
+	// RowsAffected tells us whether the UPDATE hit a row (vs no rows
+	// existed at all) — no need for the follow-up COUNT(*) round-trip.
+	n, _ := res.RowsAffected()
 
-	if count == 0 {
+	if n == 0 {
 		// Step 2: INSERT a new active row.
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)

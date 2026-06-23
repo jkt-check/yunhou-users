@@ -79,14 +79,14 @@ We respond **fast** (target < 500ms). DB errors are surfaced as `500` so the cha
 
 | Channel outcome                  | Our HTTP response                |
 |----------------------------------|----------------------------------|
-| Signature valid, dedupe hit      | `200 OK` `{"received": true, "duplicate": true, "domain_action": "..."}` |
-| Signature valid, processed       | `200 OK` `{"received": true, "duplicate": false, "domain_action": "payment_paid"}` |
+| Signature valid, dedupe hit      | `200 OK` `{"code":0, "data":{"received":true,"domain_action":"...","duplicate":true}}` |
+| Signature valid, processed       | `200 OK` `{"code":0, "data":{"received":true,"domain_action":"payment_paid","duplicate":false}}` |
 | Signature valid, transient DB error | `500` (channel retries)       |
 | Signature **invalid**            | `400` (channel logs; no retry)   |
 | Timestamp outside tolerance window | `400` (replay protection)     |
 | Unknown channel                  | `404` (path is checked before signature middleware) |
 
-The webhook response adds top-level `domain_action` (`"payment_paid"` / `"payment_failed"` / `"refund_paid"` / `"payment_disputed"` / `"payment_dispute_closed"` / `"none"`) and `duplicate` (`true` on dedupe hit) keys alongside `code` and `data` for ops/dashboard introspection. This is a deliberate exception to the standard envelope — webhook consumers are channels, not end users.
+The webhook response uses the standard CLAUDE.md envelope (`{"code": int, "data": object|null, "message": string|null}`); `domain_action` (`"payment_paid"` / `"payment_failed"` / `"refund_paid"` / `"payment_disputed"` / `"payment_dispute_closed"` / `"none"` when an action ran, **empty string on dedupe hit**) and `duplicate` (`true` on dedupe hit) are nested under `data` for ops/dashboard introspection. Consumers should branch on `duplicate === true` to identify dedupe hits; `domain_action === ""` is the dedupe signature (an uninteresting event type with `duplicate: false` reports `"none"` instead). Channels ignore the envelope body and only check the HTTP status code, so this matches the standard surface for human-facing consumers.
 
 **Transaction boundary**: every webhook handler does its work inside a single SQL transaction (event-level insert + payment upsert + subscription upsert + order update). The HTTP response is sent **only after** `COMMIT` returns. If the transaction fails for any reason, we return `500`; the channel retries; on retry we re-run the same idempotent INSERTs/UPDATEs.
 
@@ -356,13 +356,17 @@ Refund creation must serialize per-payment to enforce the sum-≤-original invar
 -- Inside the refund service
 BEGIN;
 SELECT amount FROM payments WHERE id = $payment_id FOR UPDATE;   -- lock the payment row
-SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $payment_id;  -- under lock
+-- Count both `paid` and `pending` rows: the prior version excluded
+-- `pending` and let N concurrent refunds each pass the check before any
+-- of them flipped to `paid`. With pending counted, the next tx waits
+-- for the prior lock release and sees the new row in its sum.
+SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $payment_id AND status IN ('paid', 'pending');  -- under lock
 -- application-level check: SUM + new_amount ≤ payments.amount
 INSERT INTO refunds (...) VALUES (...);
 COMMIT;
 ```
 
-The `SELECT FOR UPDATE` on the payment row blocks concurrent refund attempts until our transaction commits; they then see the new sum and validate against it. Webhook-driven refunds (channel-initiated) take the same path — they also `SELECT FOR UPDATE` the payment row before inserting a refund.
+The `SELECT FOR UPDATE` on the payment row blocks concurrent refund attempts until our transaction commits; they then see the new sum (including our `pending` insert) and validate against it. Webhook-driven refunds (channel-initiated) take the same path — they also `SELECT FOR UPDATE` the payment row before inserting a refund. `failed` rows are excluded from the sum so a denied refund attempt doesn't permanently block a retry of the same amount.
 
 **Known performance trade-off**: POST /refunds holds the payment row lock for the duration of the channel refund API call (step 4). Stripe's typical latency is <2s but occasionally 30s+. Concurrent refund attempts on the same payment are serialized for that duration. Acceptable for v1 — a primitive service should not introduce async coordination for a low-volume, eventually-consistent flow. If refund throughput becomes a bottleneck, the fix is to release the lock after validation, call the channel API, then re-acquire for INSERT — but that introduces a window where two refunds can both pass the sum check before either INSERTs. We'd then rely on retry-on-unique-violation. Documented as a known constraint; not addressed in v1.
 
@@ -486,6 +490,19 @@ These rules describe the **data side effects** only. **Who triggers a refund, wh
 - **Partial refund** → no subscription change. We do NOT prorate (subtract N days from `expires_at`). Out of scope for v1; explicitly a known limitation.
 - **Refund after subscription already expired/cancelled** → still record the refund on the payment row; do NOT touch the (already terminal) subscription.
 - **Multiple partial refunds on the same payment** are allowed as separate rows; the sum-≤-original invariant is enforced in the service layer before insert (see design doc Refund table note).
+
+### Subscription expiry (`sub_expires_at`)
+
+The `subscriptions.expires_at` value is a **frontend product decision** (rollover rules, grace periods, trial handling, plan-upgrade stacking) and yunhou-users MUST NOT compute it from `plans.interval_days`. The caller supplies it on each activation path:
+
+| Activation path        | Where the caller sets `expires_at`                                                                                                          |
+|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `POST /payments/orders/:id/confirm` | JSON body field `expires_at` (RFC3339, optional). Omit → never expires.                                                          |
+| Stripe webhook         | `data.object.metadata.sub_expires_at` (RFC3339 string). Omit → never expires.                                                              |
+| WeChat webhook         | Decrypted `resource.sub_expires_at` (RFC3339 string). Omit → never expires.                                                                |
+| Alipay webhook         | Form field `sub_expires_at` (RFC3339 string). Omit → never expires.                                                                         |
+
+A malformed (unparseable) `sub_expires_at` is silently dropped to nil rather than failing the webhook — the activation proceeds with `expires_at = NULL` and the subscription never expires. This is a known loud-failure surface: a paid plan with `expires_at = NULL` should never ship; CI / staging tests must assert the field round-trips for monthly/quarterly/yearly plans.
 
 ## 8. Failure modes and how we handle them
 

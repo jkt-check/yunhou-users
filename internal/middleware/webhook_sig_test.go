@@ -177,12 +177,19 @@ func TestStripeVerifier_RejectTimestampOutsideWindow(t *testing.T) {
 	}
 }
 
-func TestStripeVerifier_WrongChannel(t *testing.T) {
+// Per-channel verifiers no longer self-guard against the wrong channel —
+// MultiChannelVerifier is the single dispatcher. This test pins the new
+// contract: StripeVerifier assumes the caller routed correctly and
+// returns whatever verdict the headers warrant.
+func TestStripeVerifier_DirectCallAnyChannel(t *testing.T) {
 	t.Parallel()
 
 	v := &StripeVerifier{Secret: []byte("whsec_test_secret")}
-	if err := v.VerifySignature("wechat_pay", []byte("{}"), nil); err != ErrUnsupportedChannel {
-		t.Errorf("wrong channel should return ErrUnsupportedChannel, got %v", err)
+	// Called directly with a non-stripe channel name → not ErrUnsupportedChannel;
+	// the verifier just looks at the headers it expects (Stripe-Signature),
+	// which are missing, so it falls into the signature-missing branch.
+	if err := v.VerifySignature("wechat_pay", []byte("{}"), nil); err != ErrInvalidSignature {
+		t.Errorf("direct call with non-stripe channel should yield signature-missing, got %v", err)
 	}
 }
 

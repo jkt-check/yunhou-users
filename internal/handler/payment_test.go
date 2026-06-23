@@ -25,6 +25,7 @@ type mockPaymentSvc struct {
 	cancelOrderErr  error
 	confirmResult   *service.ConfirmResult
 	confirmErr      error
+	gotConfirmInput *service.ConfirmInput // captures the input Confirm was called with
 	refundResult    *service.RefundResult
 	refundErr       error
 	getOrderResp    *model.Order
@@ -47,7 +48,8 @@ func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _ string) (*model.Ord
 func (m *mockPaymentSvc) CancelOrder(_ context.Context, _, _ string) error {
 	return m.cancelOrderErr
 }
-func (m *mockPaymentSvc) Confirm(_ context.Context, _ service.ConfirmInput) (*service.ConfirmResult, error) {
+func (m *mockPaymentSvc) Confirm(_ context.Context, in service.ConfirmInput) (*service.ConfirmResult, error) {
+	m.gotConfirmInput = &in
 	return m.confirmResult, m.confirmErr
 }
 func (m *mockPaymentSvc) Refund(_ context.Context, _ service.RefundInput) (*service.RefundResult, error) {
@@ -270,6 +272,60 @@ func TestPaymentHandler_ConfirmOrder(t *testing.T) {
 
 		if rec.Code != http.StatusOK {
 			t.Errorf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	// TestPaymentHandler_ConfirmOrder_PropagatesExpiresAt asserts the
+	// handler forwards the caller's `expires_at` to ConfirmInput. Without
+	// this, the subscription activation writes expires_at=NULL and
+	// monthly/quarterly/yearly plans never expire (regression of round-5
+	// fix #1).
+	t.Run("forwards expires_at to ConfirmInput", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			confirmResult: &service.ConfirmResult{PaymentID: "p-x", OrderID: "o-x", Status: "paid"},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		want := "2027-06-01T00:00:00Z"
+		rec := doRequest(engine, http.MethodPost, "/payments/orders/o-x/confirm", map[string]any{
+			"channel":         "stripe",
+			"external_txn_id": "pi_x",
+			"expires_at":      want,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if svc.gotConfirmInput == nil {
+			t.Fatal("Confirm not called")
+		}
+		if svc.gotConfirmInput.ExpiresAt == nil {
+			t.Fatal("ConfirmInput.ExpiresAt should be populated from request body")
+		}
+		gotStr := svc.gotConfirmInput.ExpiresAt.Format(time.RFC3339)
+		if gotStr != want {
+			t.Errorf("ExpiresAt: got %s, want %s", gotStr, want)
+		}
+	})
+
+	// omits-ExpiresAt is allowed (free plan / explicit no-end).
+	t.Run("nil expires_at is allowed", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			confirmResult: &service.ConfirmResult{PaymentID: "p-y", OrderID: "o-y", Status: "paid"},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders/o-y/confirm", map[string]any{
+			"channel":         "stripe",
+			"external_txn_id": "pi_y",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status: got %d, want 200", rec.Code)
+		}
+		if svc.gotConfirmInput == nil {
+			t.Fatal("Confirm not called")
+		}
+		if svc.gotConfirmInput.ExpiresAt != nil {
+			t.Errorf("ExpiresAt should be nil when omitted, got %v", svc.gotConfirmInput.ExpiresAt)
 		}
 	})
 

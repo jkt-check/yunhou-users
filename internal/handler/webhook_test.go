@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
 )
@@ -56,7 +58,11 @@ func (m *mockWebhookSvc) GetRefund(_ context.Context, _, _ string) (*model.Refun
 func webhookTestEngine(svc service.PaymentServiceInterface) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	h := NewWebhookHandler(svc, []byte("01234567890123456789012345678901")) // 32-byte test key
+	verifier := &middleware.WeChatPayV3Verifier{
+		APIv3Key:     []byte("01234567890123456789012345678901"), // 32-byte test key
+		ReplayWindow: 5 * time.Minute,
+	}
+	h := NewWebhookHandler(svc, []byte("01234567890123456789012345678901"), verifier)
 	engine.POST("/webhooks/payment/:channel", h.Handle)
 	return engine
 }
@@ -75,6 +81,89 @@ func postRaw(engine *gin.Engine, path string, body []byte) *httptest.ResponseRec
 // ============================================================================
 // Stripe parsing
 // ============================================================================
+
+// TestWebhookHandler_Stripe_SubExpiresAt asserts the parser populates
+// SubExpiresAt from Stripe metadata.sub_expires_at (RFC3339). Without
+// this, monthly/quarterly/yearly Stripe-activated subs never expire.
+func TestWebhookHandler_Stripe_SubExpiresAt(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{
+		result: &service.OnWebhookResult{DomainAction: "payment_paid"},
+	}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "evt_sub",
+		"type": "payment_intent.succeeded",
+		"data": {"object": {
+			"id": "pi_sub",
+			"amount": 2990,
+			"currency": "cny",
+			"metadata": {"order_id": "order-uuid-2", "sub_expires_at": "2027-01-15T00:00:00Z"}
+		}}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/stripe", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotEvent == nil {
+		t.Fatal("expected OnWebhook to be called")
+	}
+	if svc.gotEvent.SubExpiresAt == nil {
+		t.Fatal("SubExpiresAt should be populated from metadata.sub_expires_at")
+	}
+	want := time.Date(2027, 1, 15, 0, 0, 0, 0, time.UTC)
+	if !svc.gotEvent.SubExpiresAt.Equal(want) {
+		t.Errorf("SubExpiresAt: got %v, want %v", svc.gotEvent.SubExpiresAt, want)
+	}
+}
+
+// TestWebhookHandler_Stripe_EnvelopeCompliance asserts the 200 response
+// puts `domain_action` and `duplicate` INSIDE `data` per the CLAUDE.md
+// envelope (no top-level keys).
+func TestWebhookHandler_Stripe_EnvelopeCompliance(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{
+		result: &service.OnWebhookResult{DomainAction: "payment_paid", DuplicateEvent: false},
+	}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{"id":"evt_env","type":"payment_intent.succeeded","data":{"object":{"id":"pi_env","amount":100,"currency":"cny","metadata":{"order_id":"o-env"}}}}`)
+	rec := postRaw(engine, "/webhooks/payment/stripe", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+	// Unmarshal into a generic map to detect any top-level keys that
+	// shouldn't be there per the CLAUDE.md envelope.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rec.Body.String())
+	}
+	for _, allowed := range []string{"code", "data"} {
+		if _, ok := raw[allowed]; !ok {
+			t.Errorf("envelope key %q missing in body: %s", allowed, rec.Body.String())
+		}
+	}
+	// `message` is allowed to be absent on success (it's set on error
+	// envelopes only). Don't assert it must be present.
+	for _, banned := range []string{"domain_action", "duplicate", "received"} {
+		if _, ok := raw[banned]; ok {
+			t.Errorf("envelope key %q must be NESTED in data, not top-level: %s", banned, rec.Body.String())
+		}
+	}
+	// And confirm the nested keys are there.
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(raw["data"], &data); err != nil {
+		t.Fatalf("data unmarshal: %v", err)
+	}
+	for _, nested := range []string{"received", "domain_action", "duplicate"} {
+		if _, ok := data[nested]; !ok {
+			t.Errorf("data.%s missing: %s", nested, rec.Body.String())
+		}
+	}
+}
 
 func TestWebhookHandler_Stripe_Success(t *testing.T) {
 	t.Parallel()

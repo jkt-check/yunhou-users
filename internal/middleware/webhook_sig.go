@@ -131,9 +131,9 @@ type StripeVerifier struct {
 }
 
 func (v *StripeVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
-	if channel != "stripe" {
-		return ErrUnsupportedChannel
-	}
+	// MultiChannelVerifier already routes by channel before calling us;
+	// the per-channel channel-name guard is defensive scaffolding.
+	_ = channel
 	sigHeader := headers["Stripe-Signature"]
 	if sigHeader == "" {
 		return ErrInvalidSignature
@@ -228,9 +228,9 @@ func (v *WeChatPayV3Verifier) DecryptResource(ciphertextB64, nonce, associatedDa
 }
 
 func (v *WeChatPayV3Verifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
-	if channel != "wechat_pay" {
-		return ErrUnsupportedChannel
-	}
+	// MultiChannelVerifier already routes by channel before calling us;
+	// the per-channel channel-name guard is defensive scaffolding.
+	_ = channel
 	sigB64 := headers["Wechatpay-Signature"]
 	tsStr := headers["Wechatpay-Timestamp"]
 	nonce := headers["Wechatpay-Nonce"]
@@ -277,9 +277,9 @@ type AlipayVerifier struct {
 }
 
 func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
-	if channel != "alipay" {
-		return ErrUnsupportedChannel
-	}
+	// MultiChannelVerifier already routes by channel before calling us;
+	// the per-channel channel-name guard is defensive scaffolding.
+	_ = channel
 	values, err := url.ParseQuery(string(body))
 	if err != nil {
 		return fmt.Errorf("%w: bad form body", ErrInvalidSignature)

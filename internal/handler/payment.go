@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/middleware"
@@ -71,6 +72,10 @@ func (h *PaymentHandler) CreateOrder(c *gin.Context) {
 // GetOrder — GET /payments/orders/:id
 func (h *PaymentHandler) GetOrder(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 	order, err := h.svc.GetOrder(c.Request.Context(), c.Param("id"), userID)
 	if err != nil {
 		writePaymentError(c, err)
@@ -82,6 +87,10 @@ func (h *PaymentHandler) GetOrder(c *gin.Context) {
 // CancelOrder — DELETE /payments/orders/:id
 func (h *PaymentHandler) CancelOrder(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 	if err := h.svc.CancelOrder(c.Request.Context(), c.Param("id"), userID); err != nil {
 		writePaymentError(c, err)
 		return
@@ -98,8 +107,14 @@ func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
 	}
 
 	var req struct {
-		Channel       string `json:"channel" binding:"required"`
-		ExternalTxnID string `json:"external_txn_id" binding:"required"`
+		Channel       string     `json:"channel" binding:"required"`
+		ExternalTxnID string     `json:"external_txn_id" binding:"required"`
+		// ExpiresAt is the subscription expiry the frontend computed from
+		// plan.interval_days + business rules (rollover, grace, trial).
+		// yunhou-users MUST NOT compute this server-side — see the
+		// WebhookEvent.SubExpiresAt doc comment in service/payment.go.
+		// nil = frontend declined to set one (free plan / explicit no-end).
+		ExpiresAt *time.Time `json:"expires_at,omitempty"`
 		// Amount and Currency are NOT accepted from the caller — the order
 		// row is the authoritative source. A caller-supplied amount lets a
 		// user claim they paid $100 on a $1 order; the webhook will later
@@ -115,6 +130,7 @@ func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
 		UserID:        userID,
 		Channel:       req.Channel,
 		ExternalTxnID: req.ExternalTxnID,
+		ExpiresAt:     req.ExpiresAt,
 	}
 	res, err := h.svc.Confirm(c.Request.Context(), in)
 	if err != nil {
@@ -146,6 +162,10 @@ func (h *PaymentHandler) ListPayments(c *gin.Context) {
 // GetPayment — GET /payments/:id
 func (h *PaymentHandler) GetPayment(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 	payment, err := h.svc.GetPayment(c.Request.Context(), c.Param("id"), userID)
 	if err != nil {
 		writePaymentError(c, err)
@@ -213,6 +233,10 @@ func (h *PaymentHandler) CreateRefund(c *gin.Context) {
 // GetRefund — GET /refunds/:id
 func (h *PaymentHandler) GetRefund(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 	refund, err := h.svc.GetRefund(c.Request.Context(), c.Param("id"), userID)
 	if err != nil {
 		writePaymentError(c, err)
@@ -224,6 +248,10 @@ func (h *PaymentHandler) GetRefund(c *gin.Context) {
 // ListPaymentRefunds — GET /payments/:id/refunds
 func (h *PaymentHandler) ListPaymentRefunds(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
 	list, err := h.svc.ListPaymentRefunds(c.Request.Context(), c.Param("id"), userID)
 	if err != nil {
 		writePaymentError(c, err)

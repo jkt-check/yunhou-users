@@ -39,7 +39,7 @@ func Setup(
 	planHandler := handler.NewPlanHandler(planSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
-	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key)
+	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)

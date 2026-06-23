@@ -544,6 +544,161 @@ App 列表接口，查询可用的应用（公开，限流）。
 
 ---
 
+### 支付接口
+
+支付接口需要 JWT Bearer Token。所有订单、支付、退款只能由本人访问；所有权由服务端强制校验。
+
+#### POST /payments/orders
+
+创建订单（用户选择 plan 后发起支付）。
+
+**请求体**：
+```json
+{"plan_id": "monthly"}
+```
+
+**响应（201）**：
+```json
+{
+  "code": 0,
+  "data": {
+    "id": "order-uuid",
+    "user_id": "user-uuid",
+    "plan_id": "monthly",
+    "amount": 29.9,
+    "currency": "CNY",
+    "status": "pending",
+    "expires_at": "2026-06-23T08:30:00Z"
+  }
+}
+```
+
+订单默认 30 分钟后过期（`ORDER_EXPIRY_DURATION`），过期后由 sweeper 翻转为 `expired`。如果此后 webhook 到达，仍会"honor the payment"激活订阅（参见 webhook 文档 §8）。
+
+#### GET /payments/orders/:id
+
+查询订单详情。
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": {"id":"...", "plan_id":"monthly", "amount":29.9, "currency":"CNY", "status":"pending|paid|expired|cancelled|failed|refunded"}
+}
+```
+
+#### DELETE /payments/orders/:id
+
+取消未支付订单。
+
+**响应（200）**：
+```json
+{"code": 0, "message": "cancelled"}
+```
+
+#### POST /payments/orders/:order_id/confirm
+
+前端 SDK 在收到 channel 回调后调用此接口做"快通道确认"。后端会与随后到达的 webhook 互为幂等。
+
+**请求体**：
+```json
+{
+  "channel": "stripe",
+  "external_txn_id": "pi_xxx",
+  "expires_at": "2026-07-23T00:00:00Z"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` |
+| `external_txn_id` | 是 | 渠道侧交易 ID |
+| `expires_at` | 否 | RFC3339 时间，订阅过期时刻。**前端必须从 `plan.interval_days` + 业务规则（rollover/grace/trial）计算**；yunhou-users 不做服务端推导。省略 = 永不过期。 |
+
+`amount` / `currency` **不接受 caller 输入**；订单行是权威来源。caller 输入金额会让用户把 $1 订单声称 $100。
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": {
+    "payment_id": "payment-uuid",
+    "order_id": "order-uuid",
+    "status": "paid",
+    "activated_subscription": true,
+    "was_late_payment": false
+  }
+}
+```
+
+#### GET /payments
+
+列出当前用户的所有支付记录（无分页，按时间倒序）。
+
+**响应（200）**：
+```json
+{"code": 0, "data": [{"id":"pi_xxx", "order_id":"...", "channel":"stripe", "amount":29.9, "currency":"CNY", "status":"paid|pending|failed|refunded", "paid_at":"..."}]}
+```
+
+#### GET /payments/:id
+
+查询支付详情。
+
+#### GET /payments/:id/refunds
+
+列出某支付的所有退款记录。
+
+#### POST /refunds
+
+发起退款。需要 `Idempotency-Key` 头（8-128 字符，`[A-Za-z0-9_.:-]+`）做 caller-retry 保护。
+
+**请求体**：
+```json
+{"payment_id": "payment-uuid", "amount": 10.0, "reason": "用户申请"}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `payment_id` | 是 | 支付 ID |
+| `amount` | 是 | 退款金额，> 0 且 ≤ 该支付已 paid 的剩余可退额度 |
+| `reason` | 否 | 退款原因 |
+
+**响应（200）**：
+```json
+{"code": 0, "data": {"id":"refund-uuid", "payment_id":"payment-uuid", "amount":10.0, "status":"pending", "external_refund_id":"re_xxx"}}
+```
+
+退款 `status` 流转：`pending → paid`（渠道 webhook 确认）或 `pending → failed`（渠道拒绝）。完整退款会同步把 `payment.status` 翻成 `refunded` 并取消对应订阅；部分退款不影响订阅。
+
+#### GET /refunds/:id
+
+查询退款详情。
+
+---
+
+### 渠道 Webhook 回调
+
+POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走签名校验。响应永远在事务提交后返回；签名失败 → 400，临时错误 → 500（渠道自动重试）。
+
+成功响应统一格式（标准 envelope）：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "received": true,
+    "duplicate": false,
+    "domain_action": "payment_paid"
+  }
+}
+```
+
+`domain_action` 取值（事件被处理时填）：`payment_paid` / `payment_failed` / `refund_paid` / `payment_disputed` / `payment_dispute_closed` / `none`。**dedupe 命中时为空字符串**——判别 dedupe 请用 `duplicate: true`，不要用 `domain_action == "none"`（`"none"` 仅表示"事件类型不在我们关心的范围内"，不代表已处理）。
+
+订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
+
+---
+
 ## JWT 验证
 
 应用可以在本地验证 Access Token，无需每次都调用 Yunhou Users 服务端。

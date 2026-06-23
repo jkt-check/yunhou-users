@@ -71,7 +71,7 @@ func main() {
 	// Bound how long any handler can run before the client disconnects, to
 	// limit the blast radius of a slow downstream call (e.g. the OAuth
 	// provider timeout is 10s; we leave a little headroom here).
-	engine.Use(timeoutMiddleware(15 * time.Second))
+	engine.Use(timeoutMiddleware(20 * time.Second))
 
 	// A cancelable context so the rate-limiter cleanup goroutines exit
 	// on shutdown (see internal/middleware/ratelimit.go).
@@ -87,8 +87,8 @@ func main() {
 		Addr:              ":" + cfg.Port,
 		Handler:           engine,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		ReadTimeout:       25 * time.Second,
+		WriteTimeout:      25 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 

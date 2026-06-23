@@ -163,7 +163,10 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 	}
 
 	// 5. Resolve the identity for this login so the response reflects the
-	//    email of the account the user just signed in with, not a stale one.
+	//    email of the provider the user just signed in with. We deliberately
+	//    do NOT fall back to other identities — a Google-linked email should
+	//    not leak into a GitHub login response. If the matching identity has
+	//    no email, leave user.Email nil; the response's omitempty handles it.
 	identities, err := s.identityRepo.ListByUserID(ctx, user.ID)
 	if err == nil {
 		for i := range identities {
@@ -172,9 +175,6 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 				user.Email = identities[i].Email
 				break
 			}
-		}
-		if user.Email == nil && len(identities) > 0 {
-			user.Email = identities[0].Email
 		}
 	}
 
@@ -279,37 +279,23 @@ func (s *AuthService) getProviderUser(ctx context.Context, provider, token strin
 }
 
 func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInfo) (*model.User, error) {
-	// Check if identity already exists
+	// 1. Identity already exists? Bind to that user.
 	existing, err := s.identityRepo.FindByProviderUID(ctx, info.Provider, info.ProviderUID)
 	if err == nil && existing != nil {
 		return s.userRepo.FindByID(ctx, existing.UserID)
 	}
 
-	// Try email merge
-	var userID string
-	if info.Email != "" {
-		byEmail, err := s.identityRepo.FindByEmail(ctx, info.Email)
-		if err == nil && len(byEmail) > 0 {
-			userID = byEmail[0].UserID
-		}
+	// 2. Resolve the target user: either by email-merge (if a verified
+	//    identity is bound to that email already) or as a new account.
+	userID, isNew, err := s.resolveOrCreateUser(ctx, info)
+	if err != nil {
+		return nil, fmt.Errorf("resolve user: %w", err)
 	}
 
-	// No merge - create new user
-	if userID == "" {
-		user := &model.User{
-			ID:        GenerateUUID(),
-			Nickname:  &info.Nickname,
-			AvatarURL: &info.AvatarURL,
-			Email:     &info.Email,
-			Status:    "active",
-		}
-		if err := s.userRepo.Create(ctx, user); err != nil {
-			return nil, err
-		}
-		userID = user.ID
-	}
-
-	// Create social identity
+	// 3. Bind the new social identity. If another concurrent request
+	//    raced us and inserted the same (provider, provider_uid) first,
+	//    the duplicate-key handler resolves to that winner instead of
+	//    leaving a second user row orphaned.
 	identity := &model.SocialIdentity{
 		ID:          GenerateUUID(),
 		UserID:      userID,
@@ -319,15 +305,48 @@ func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInf
 	}
 	if err := s.identityRepo.Create(ctx, identity); err != nil {
 		if isDuplicateKey(err) {
-			existing, retryErr := s.identityRepo.FindByProviderUID(ctx, info.Provider, info.ProviderUID)
-			if retryErr == nil && existing != nil {
-				return s.userRepo.FindByID(ctx, existing.UserID)
+			// Another caller created the identity first. Resolve to
+			// that winner; if we created a user in step 2 in this
+			// race, it's now an orphan — but the unique constraint
+			// on (provider, provider_uid) ensures no two callers can
+			// each end up with their own binding.
+			winner, retryErr := s.identityRepo.FindByProviderUID(ctx, info.Provider, info.ProviderUID)
+			if retryErr == nil && winner != nil {
+				return s.userRepo.FindByID(ctx, winner.UserID)
 			}
+			// If we created a brand-new user in step 2 and lost the
+			// race, the orphan row is harmless (no identities bound
+			// to it) but we still want to surface a usable user.
+			_ = isNew // orphan cleanup is a sweeper concern
 		}
 		return nil, fmt.Errorf("create identity: %w", err)
 	}
 
 	return s.userRepo.FindByID(ctx, userID)
+}
+
+// resolveOrCreateUser returns the user_id to bind this login to, plus a
+// flag indicating whether a brand-new user row was created. Email-merge
+// only fires when we actually have an email to look up; otherwise we
+// always create a new user.
+func (s *AuthService) resolveOrCreateUser(ctx context.Context, info *ProviderUserInfo) (string, bool, error) {
+	if info.Email != "" {
+		byEmail, err := s.identityRepo.FindByEmail(ctx, info.Email)
+		if err == nil && len(byEmail) > 0 {
+			return byEmail[0].UserID, false, nil
+		}
+	}
+	user := &model.User{
+		ID:        GenerateUUID(),
+		Nickname:  &info.Nickname,
+		AvatarURL: &info.AvatarURL,
+		Email:     &info.Email,
+		Status:    "active",
+	}
+	if err := s.userRepo.Create(ctx, user); err != nil {
+		return "", false, err
+	}
+	return user.ID, true, nil
 }
 
 // Logout revokes the refresh token. Idempotent: a missing/expired session

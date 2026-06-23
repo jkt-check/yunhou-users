@@ -208,10 +208,10 @@ Consumer app frontend                yunhou-users                  Provider (Git
 ```
 
 ### Auto-merge on same email
-When a new social login returns an email that matches an existing User's SocialIdentity, bind to that User instead of creating a new one. For providers without email (WeChat), manual binding only.
+When a new social login returns an email that matches an existing User's SocialIdentity, bind to that User instead of creating a new one. (WeChat mentioned here is a hypothetical future login provider; v1 only supports `github` and `google`.)
 
 ### Token details
-- **access_token**: JWT, RSA256 signed, 15min TTL. Payload: `sub` (user_id), `app_id`, `scope`, `iat`, `exp`.
+- **access_token**: JWT, RSA256 signed, 15min TTL. Payload: `sub` (user_id), `iss` (`"yunhou-users"`), `aud` (array containing `app_id`), `app_id`, `scope` (array of plan apps), `iat`, `exp`.
 - **refresh_token**: opaque, 7d TTL, stored hashed in Session table. Used to get new access_token.
 - **JWKS endpoint**: `GET /.well-known/jwks.json` serves RSA public key. Apps fetch on startup and cache.
 - **Revocation**: not implemented in v1. Expired tokens naturally expire in 15min. Add Redis blocklist later if needed.
@@ -306,7 +306,9 @@ A JWT-authenticated caller can only read/write their own orders/payments/refunds
 | GET    | /user/subscriptions           | List user's subscriptions (active + historical)            |
 | DELETE | /user/subscriptions/:id       | Cancel an active subscription — `active → cancelled`. **Primitive only**: does not refund; the caller (frontend) decides whether to issue a refund alongside the cancel. |
 
-### App Management (requires app_id + app_secret, server-to-server)
+### App Management (requires X-App-ID header, server-to-server)
+
+> **Note**: an `app_secret` was originally planned but never implemented. v1 uses a single `X-App-ID` header to identify the calling internal app; all app management endpoints run on the internal network and rely on network-level isolation. If per-app secret enforcement becomes necessary, it lands as a separate change with explicit migration of existing apps.
 
 | Method | Path                     | Description                      |
 |--------|--------------------------|----------------------------------|

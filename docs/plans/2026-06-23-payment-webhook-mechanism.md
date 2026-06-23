@@ -595,7 +595,7 @@ When we add this code, the work splits roughly as:
 6. **Router**: separate `/webhooks/payment/:channel` group with own rate limiter and signature middleware
 7. **Signature middleware**: one per channel (`stripe.go`, `wechat.go`, `alipay.go`) registered as middleware factory
 8. **Tests**: unit tests for each signature verifier with golden vectors from the channels' docs; integration test that fires a webhook and asserts subscription activation
-9. **Env vars**: `STRIPE_WEBHOOK_SECRET`, `WECHAT_PAY_API_V3_KEY`, `ALIPAY_PUBLIC_KEY` (and per-channel merchant IDs / mch certs)
+9. **Env vars**: `STRIPE_WEBHOOK_SECRET`, `WECHAT_PAY_API_V3_KEY`, `ALIPAY_PUBLIC_KEY_PATH` (and per-channel merchant IDs / mch certs)
 
 ## 11. What this document deliberately does NOT cover
 

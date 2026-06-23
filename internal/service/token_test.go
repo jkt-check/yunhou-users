@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/yunhou/users/internal/model"
 )
 
@@ -75,6 +76,76 @@ func TestTokenService_SignAndVerify(t *testing.T) {
 			t.Error("expected error for token signed with different key")
 		}
 	})
+
+	t.Run("rejects token signed with non-RS256 algorithm", func(t *testing.T) {
+		// Forge an HS256-signed token using the *public* key bytes as the
+		// HMAC secret. If the verifier accepts any RSA-shaped method, this
+		// is the classic algorithm-confusion attack.
+		// x509.MarshalPKIXPublicKey + pem encode so we have []byte to pass.
+		pubPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "PUBLIC KEY",
+			Bytes: mustMarshalPKIX(t, pub),
+		})
+		hackedToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub":    "attacker",
+			"iss":    "yunhou-users",
+			"aud":    []string{"yundian"},
+			"app_id": "yundian",
+			"exp":    time.Now().Add(time.Hour).Unix(),
+		})
+		signed, err := hackedToken.SignedString(pubPEM)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		if _, err := tokenSvc.VerifyAccessToken(signed); err == nil {
+			t.Error("expected error for HS256 token, got nil")
+		}
+	})
+
+	t.Run("rejects token with unexpected issuer", func(t *testing.T) {
+		// Mint a valid token but rewrite the issuer claim to something
+		// other than "yunhou-users". The verifier must refuse it.
+		claims := TokenClaims{
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:   "user-1",
+				Issuer:    "some-other-service",
+				Audience:  jwt.ClaimStrings{"yundian"},
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			},
+			AppID: "yundian",
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		signed, err := token.SignedString(priv)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		if _, err := tokenSvc.VerifyAccessToken(signed); err == nil {
+			t.Error("expected error for unexpected issuer, got nil")
+		}
+	})
+
+	t.Run("rejects token whose audience doesn't match its app_id", func(t *testing.T) {
+		// Token claims app_id=yundian but audience is something else.
+		// Verifier must refuse — otherwise a token issued for one consumer
+		// could be replayed at another.
+		claims := TokenClaims{
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:   "user-1",
+				Issuer:    "yunhou-users",
+				Audience:  jwt.ClaimStrings{"yundash"},
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			},
+			AppID: "yundian",
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		signed, err := token.SignedString(priv)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		if _, err := tokenSvc.VerifyAccessToken(signed); err == nil {
+			t.Error("expected error for audience mismatch, got nil")
+		}
+	})
 }
 
 func TestTokenService_JWKS(t *testing.T) {
@@ -119,29 +190,10 @@ func TestTokenService_JWKS(t *testing.T) {
 	})
 }
 
-func TestParseDuration(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		input    string
-		expected time.Duration
-	}{
-		{"15m", 15 * time.Minute},
-		{"1h", 1 * time.Hour},
-		{"168h", 168 * time.Hour},
-		{"invalid", 15 * time.Minute}, // fallback
-		{"", 15 * time.Minute},        // fallback
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			result := parseDuration(tc.input)
-			if result != tc.expected {
-				t.Errorf("parseDuration(%q): expected %v, got %v", tc.input, tc.expected, result)
-			}
-		})
-	}
-}
+// TestParseDuration was removed: the helper it tested (`parseDuration` in
+// token.go) was deleted along with `ensureActiveSubscription` and its tests.
+// TTL parsing now happens once in config.Load via `parseDurationOr`, which
+// has its own test in internal/config/config_test.go.
 
 func TestTokenService_Refresh(t *testing.T) {
 	t.Parallel()
@@ -256,57 +308,6 @@ func TestTokenService_Refresh(t *testing.T) {
 	})
 }
 
-func TestEnsureActiveSubscription(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	t.Run("active subscription passes", func(t *testing.T) {
-		subRepo := newMockSubscriptionRepo()
-		expiresAt := time.Now().Add(30 * 24 * time.Hour)
-		subRepo.subs["sub-1"] = &model.Subscription{
-			ID:        "sub-1",
-			UserID:    "user-1",
-			PlanID:    "monthly",
-			Status:    "active",
-			ExpiresAt: &expiresAt,
-		}
-		subRepo.byUserID["user-1"] = subRepo.subs["sub-1"]
-
-		err := ensureActiveSubscription(ctx, subRepo, "user-1")
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-	})
-
-	t.Run("no subscription returns error", func(t *testing.T) {
-		subRepo := newMockSubscriptionRepo()
-
-		err := ensureActiveSubscription(ctx, subRepo, "user-with-no-sub")
-		if err == nil {
-			t.Error("expected error when no subscription")
-		}
-	})
-
-	t.Run("expired subscription returns error", func(t *testing.T) {
-		subRepo := newMockSubscriptionRepo()
-		expiresAt := time.Now().Add(-1 * time.Hour) // expired
-		subRepo.subs["sub-expired"] = &model.Subscription{
-			ID:        "sub-expired",
-			UserID:    "user-expired",
-			PlanID:    "monthly",
-			Status:    "active",
-			ExpiresAt: &expiresAt,
-		}
-		subRepo.byUserID["user-expired"] = subRepo.subs["sub-expired"]
-
-		err := ensureActiveSubscription(ctx, subRepo, "user-expired")
-		if err == nil {
-			t.Error("expected error for expired subscription")
-		}
-	})
-}
-
 func TestLoadPrivateKey(t *testing.T) {
 	t.Run("load valid PKCS1 private key", func(t *testing.T) {
 		priv, _ := generateTestRSAKeyPair()
@@ -373,4 +374,15 @@ func writePublicKeyToFile(t *testing.T, path string, key *rsa.PublicKey) {
 	if err := os.WriteFile(path, pemData, 0644); err != nil {
 		t.Fatalf("failed to write public key: %v", err)
 	}
+}
+
+// mustMarshalPKIX returns the PKIX-marshaled bytes for a public key, failing
+// the test if marshaling fails. Used by the algorithm-confusion test.
+func mustMarshalPKIX(t *testing.T, key *rsa.PublicKey) []byte {
+	t.Helper()
+	b, err := x509.MarshalPKIXPublicKey(key)
+	if err != nil {
+		t.Fatalf("marshal public key: %v", err)
+	}
+	return b
 }

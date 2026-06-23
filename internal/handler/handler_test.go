@@ -867,6 +867,72 @@ func TestUserHandler_UpdateProfile(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid avatar_url - userinfo phishing", func(t *testing.T) {
+		// https://x:y@evil.com is parsed as having Host=evil.com and would
+		// display as a link to evil.com while looking like "x" in the URL.
+		// The handler must reject this.
+		userID := "user-123"
+		nickname := "testuser"
+		user := &model.User{ID: userID, Nickname: &nickname}
+		userRepo := &mockUserRepo{user: user}
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
+
+		router := gin.New()
+		router.PATCH("/profile", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UpdateProfile)
+
+		body := `{"avatar_url":"https://victim.example.com:pw@evil.com/x.png"}`
+		req := httptest.NewRequest(http.MethodPatch, "/profile", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for userinfo URL, got %d", w.Code)
+		}
+	})
+
+	t.Run("invalid avatar_url - has fragment", func(t *testing.T) {
+		userID := "user-123"
+		nickname := "testuser"
+		user := &model.User{ID: userID, Nickname: &nickname}
+		userRepo := &mockUserRepo{user: user}
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
+
+		router := gin.New()
+		router.PATCH("/profile", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UpdateProfile)
+
+		body := `{"avatar_url":"https://example.com/x.png#frag"}`
+		req := httptest.NewRequest(http.MethodPatch, "/profile", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for fragment URL, got %d", w.Code)
+		}
+	})
+
+	t.Run("invalid nickname - empty after trim", func(t *testing.T) {
+		userID := "user-123"
+		nickname := "testuser"
+		user := &model.User{ID: userID, Nickname: &nickname}
+		userRepo := &mockUserRepo{user: user}
+		handler := NewUserHandler(userRepo, &mockIdentityRepo{})
+
+		router := gin.New()
+		router.PATCH("/profile", func(c *gin.Context) { c.Set("user_id", userID) }, handler.UpdateProfile)
+
+		body := `{"nickname":"   "}`
+		req := httptest.NewRequest(http.MethodPatch, "/profile", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for whitespace-only nickname, got %d", w.Code)
+		}
+	})
+
 	t.Run("user not found", func(t *testing.T) {
 		userRepo := &mockUserRepo{findErr: sql.ErrNoRows}
 		handler := NewUserHandler(userRepo, &mockIdentityRepo{})

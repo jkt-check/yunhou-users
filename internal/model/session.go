@@ -1,10 +1,17 @@
 package model
 
 import (
+	"errors"
 	"time"
 
 	"github.com/lib/pq"
 )
+
+// ErrSessionAlreadyRevoked is returned by the repo layer when a
+// refresh-token rotation is attempted on a session that was already revoked.
+// It lives in the model package so both repo and service can import it
+// without creating an import cycle.
+var ErrSessionAlreadyRevoked = errors.New("session already revoked")
 
 type Session struct {
 	ID           string         `db:"id" json:"id"`

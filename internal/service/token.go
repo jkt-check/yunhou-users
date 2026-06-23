@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
-	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/pem"
@@ -17,38 +16,6 @@ import (
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/repo"
 )
-
-func parseDuration(s string) time.Duration {
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 15 * time.Minute
-	}
-	return d
-}
-
-func ensureActiveSubscription(ctx context.Context, subRepo repo.SubscriptionRepo, userID string) error {
-	sub, err := subRepo.FindActiveByUserID(ctx, userID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrSubscriptionNotActive
-	}
-	if err != nil {
-		return fmt.Errorf("check subscription: %w", err)
-	}
-	if sub == nil {
-		return ErrSubscriptionNotActive
-	}
-	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
-		if err := subRepo.UpdateStatus(ctx, sub.ID, "expired"); err != nil {
-			return fmt.Errorf("mark subscription expired: %w", err)
-		}
-		return ErrSubscriptionExpired
-	}
-	return nil
-}
-
-// unused but kept available for future utilities that need to parse a TTL
-// string at runtime (e.g. admin override endpoints).
-var _ = parseDuration
 
 type TokenService struct {
 	PrivateKey  *rsa.PrivateKey

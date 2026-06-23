@@ -535,9 +535,6 @@ func newTokenServiceWithMocks(sessionRepo *mockSessionRepo, subRepo *mockSubscri
 // stringPtr returns a pointer to the given string.
 func stringPtr(s string) *string { return &s }
 
-// timeNow returns the current time. Can be overridden for deterministic tests if needed.
-var timeNow = func() time.Time { return time.Now() }
-
 // Ensure util package is referenced (used in auth_test.go)
 var _ = util.HashSecret
 

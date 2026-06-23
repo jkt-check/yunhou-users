@@ -144,7 +144,7 @@ func (r *socialIdentityRepo) FindByEmail(ctx context.Context, email string) ([]m
 func (r *socialIdentityRepo) ListByUserID(ctx context.Context, userID string) ([]model.SocialIdentity, error) {
 	var list []model.SocialIdentity
 	err := r.db.SelectContext(ctx, &list, `
-		SELECT * FROM social_identities WHERE user_id = $1 ORDER BY created_at
+		SELECT * FROM social_identities WHERE user_id = $1 ORDER BY created_at, id
 	`, userID)
 	return list, err
 }
@@ -381,7 +381,11 @@ func (r *sessionRepo) RotateRefresh(ctx context.Context, oldID string, newSessio
 		return fmt.Errorf("check rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("session already revoked")
+		// Return the sentinel directly so AuthService can match with
+		// errors.Is and trigger the family-revoke response. A plain
+		// fmt.Errorf here would silently break refresh-token reuse
+		// detection (errors.Is only matches via %w).
+		return model.ErrSessionAlreadyRevoked
 	}
 
 	_, err = tx.NamedExecContext(ctx, `
@@ -413,6 +417,9 @@ func (r *sessionRepo) ExchangeAuthCode(ctx context.Context, oldID string, newSes
 		return false, fmt.Errorf("check rows affected: %w", err)
 	}
 	if n == 0 {
+		// ExchangeAuthCode is a best-effort exchange — the caller treats
+		// a false return the same as "no row matched" and the failure is
+		// not security-critical like RotateRefresh, so plain false is fine.
 		return false, nil
 	}
 

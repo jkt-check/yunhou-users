@@ -1,11 +1,16 @@
 package service
 
-import "errors"
+import (
+	"errors"
 
-// ErrSessionAlreadyRevoked is returned by the repo layer when a refresh-token
-// rotation is attempted on a session that was already revoked. The caller is
-// expected to treat this as possible token reuse and revoke the family.
-var ErrSessionAlreadyRevoked = errors.New("session already revoked")
+	"github.com/yunhou/users/internal/model"
+)
+
+// ErrSessionAlreadyRevoked is re-exported from the model package so service
+// code can keep referring to it without an explicit model import at every
+// call site. The canonical definition lives in model/session.go to avoid an
+// import cycle (repo → service would otherwise happen).
+var ErrSessionAlreadyRevoked = model.ErrSessionAlreadyRevoked
 
 // Sentinel errors returned by services. Handlers and other callers should
 // match these with errors.Is(), not by comparing err.Error() strings — that

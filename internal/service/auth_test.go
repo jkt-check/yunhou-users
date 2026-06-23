@@ -522,6 +522,48 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			wantErr:     true,
 			errContains: "expired",
 		},
+		{
+			// Refresh-token reuse detection: rotating then replaying the
+			// same refresh token must trigger the family-revoke response.
+			// This is the security-critical test that would have caught
+			// the earlier bug where RotateRefresh returned a plain error
+			// that errors.Is could not match.
+			name:        "refresh reuse revokes the family",
+			refreshToken: "reuse-token",
+			appID:       "yundian",
+			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
+				pr.plans["free"] = plans["free"]
+				pr.defaultPlan = plans["free"]
+				ur.users["user-reuse"] = &model.User{ID: "user-reuse", Status: "active"}
+				// Two siblings in the (user, app) family so we can verify
+				// both are revoked when reuse is detected.
+				sibling := &model.Session{
+					ID:           "sess-sibling",
+					UserID:       "user-reuse",
+					AppID:        "yundian",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("sibling-token"),
+					Revoked:      false,
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+				target := &model.Session{
+					ID:           "sess-target",
+					UserID:       "user-reuse",
+					AppID:        "yundian",
+					SessionType:  "refresh",
+					RefreshToken: hashToken("reuse-token"),
+					Revoked:      true, // already revoked by a prior rotation
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+				ssr.sessions[sibling.ID] = sibling
+				ssr.sessions[target.ID] = target
+				ssr.byToken[sibling.RefreshToken] = sibling
+				ssr.byToken[target.RefreshToken] = target
+				ar.seedActive("yundian", "云店")
+			},
+			wantErr:     true,
+			errContains: "invalid refresh token",
+		},
 	}
 
 	for _, tc := range tests {

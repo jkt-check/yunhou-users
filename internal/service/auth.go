@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -66,9 +67,12 @@ func NewAuthService(
 }
 
 // findUsableSubscription returns the user's currently-active, non-expired
-// subscription, marking expired subscriptions as such along the way. It is
-// the single source of truth for "is this user allowed to mint tokens?"
-// across login and refresh paths.
+// subscription. Expiry is determined by the `expires_at` timestamp; the
+// repo's `FindActiveByUserID` already filters `status = 'active'`, and a
+// periodic sweeper is responsible for marking expired rows as such.
+// We deliberately do NOT write here: writing in a read path holds row locks
+// and serializes concurrent logins for the same user. The status update is
+// the sweeper's job.
 func (s *AuthService) findUsableSubscription(ctx context.Context, userID string) (*model.Subscription, error) {
 	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
 	if err != nil {
@@ -78,12 +82,6 @@ func (s *AuthService) findUsableSubscription(ctx context.Context, userID string)
 		return nil, fmt.Errorf("get subscription: %w", err)
 	}
 	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
-		// Lazy expiry: mark this one row expired so subsequent reads skip it.
-		// We don't fail the request if the update itself errors — log it via
-		// the wrapped error and continue with the expired state.
-		if updateErr := s.subRepo.UpdateStatus(ctx, sub.ID, "expired"); updateErr != nil {
-			return nil, fmt.Errorf("mark subscription expired: %w", updateErr)
-		}
 		return nil, ErrSubscriptionExpired
 	}
 	return sub, nil
@@ -254,21 +252,21 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 // providerVerifierOverride, when non-nil, replaces real OAuth provider calls.
 // Production never sets it. Tests (including E2E in other packages) install a
 // stub via SetProviderVerifier so they can drive auth without hitting real
-// GitHub/Google. Not safe for concurrent reconfiguration mid-test.
-var providerVerifierOverride func(ctx context.Context, provider, token string) (*ProviderUserInfo, error)
+// GitHub/Google. Stored in an atomic.Value so test setup/teardown is safe
+// to call from goroutines and t.Parallel subtests.
+var providerVerifierOverride atomic.Value // holds func(ctx, provider, token) (*ProviderUserInfo, error)
 
 // SetProviderVerifier installs a stub OAuth verifier for tests. The returned
 // function restores the previous value — callers should defer it (or wire it
 // into t.Cleanup) so other tests aren't affected.
 func SetProviderVerifier(fn func(ctx context.Context, provider, token string) (*ProviderUserInfo, error)) func() {
-	prev := providerVerifierOverride
-	providerVerifierOverride = fn
-	return func() { providerVerifierOverride = prev }
+	prev, _ := providerVerifierOverride.Swap(fn).(func(ctx context.Context, provider, token string) (*ProviderUserInfo, error))
+	return func() { providerVerifierOverride.Store(prev) }
 }
 
 func (s *AuthService) getProviderUser(ctx context.Context, provider, token string) (*ProviderUserInfo, error) {
-	if providerVerifierOverride != nil {
-		return providerVerifierOverride(ctx, provider, token)
+	if v := providerVerifierOverride.Load(); v != nil {
+		return v.(func(ctx context.Context, provider, token string) (*ProviderUserInfo, error))(ctx, provider, token)
 	}
 	switch provider {
 	case "github":

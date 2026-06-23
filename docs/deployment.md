@@ -36,7 +36,7 @@ on the host terminate TLS.
 
    ```bash
    cp .env.example .env
-   $EDITOR .env   # set STATE_HMAC_KEY, DATABASE_URL, GITHUB_*, etc.
+   $EDITOR .env   # set DATABASE_URL, RSA key paths; add channel webhook secrets if you accept those channels
    chmod 600 .env
    ```
 
@@ -57,10 +57,11 @@ on the host terminate TLS.
 6. **Apply migrations**
 
    ```bash
-   # Apply BOTH migrations in order. 002 alters tables created by 001 and
-   # will fail if 001 hasn't been applied yet.
+   # Apply migrations in order. 002 alters tables created by 001 and will
+   # fail if 001 hasn't been applied yet. 003 adds payment/webhook tables.
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/001_init.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/003_payments.sql
    ```
 
 7. **Install Nginx config**
@@ -139,9 +140,7 @@ gunzip -c /var/backups/yunhou-users/db-20260617T030000Z.sql.gz \
 ## Domain upgrade (later)
 
 1. Buy a domain, point an A record at the VPS IP, wait for DNS to propagate.
-2. Edit `/opt/yunhou-users/.env`: set `DOMAIN=api.yh.com`, update
-   `GITHUB_CALLBACK_URL=https://api.yh.com/callback/github` (and any other
-   provider callback URLs).
+2. v1 uses **direct provider-token login** (consumer apps call `POST /auth/login` with `provider_token`), so there are no provider OAuth callback URLs to maintain. The server itself has no `DOMAIN` env var — the hostname is consumed only by the Nginx config (`server_name`).
 3. Edit `/etc/nginx/sites-available/yunhou-users`:
    - Replace the 80 `server` block with:
 
@@ -176,4 +175,5 @@ gunzip -c /var/backups/yunhou-users/db-20260617T030000Z.sql.gz \
 | `/healthz` 503 | Postgres down. `psql "$(grep ^DATABASE_URL /opt/yunhou-users/.env | cut -d= -f2-)" -c 'select 1'` |
 | Cert expired | `sudo certbot certificates` then `sudo certbot renew --dry-run` |
 | Disk full | `df -h` and `du -sh /var/lib/docker /var/backups/yunhou-users /var/log` |
-| OAuth callback fails | Check `GITHUB_CALLBACK_URL` matches the registered GitHub OAuth app callback |
+| `401 invalid provider token` from `/auth/login` | The token sent by the consumer app is expired/revoked; the OAuth provider's userinfo endpoint rejected it. Refresh the provider token on the consumer app and retry. |
+| Webhook `400 invalid signature` | Check the channel's secret env var matches the value registered in the channel's merchant console |

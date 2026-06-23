@@ -56,7 +56,7 @@ curl -X POST https://your-yunhou-domain/auth/login \
       "plan_id": "monthly",
       "plan_name": "按月订阅",
       "has_access": true,
-      "expires_at": "2025-07-19T00:00:00Z"
+      "expires_at": "2026-12-19T00:00:00Z"
     }
   }
 }
@@ -181,7 +181,7 @@ curl https://your-yunhou-domain/user/profile \
       "plan_id": "monthly",
       "plan_name": "按月订阅",
       "has_access": true,
-      "expires_at": "2025-07-19T00:00:00Z"
+      "expires_at": "2026-12-19T00:00:00Z"
     }
   }
 }

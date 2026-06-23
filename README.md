@@ -16,10 +16,12 @@ A shared user management API for multi-app ecosystems. One user identity across 
 ```bash
 # 1. Set up PostgreSQL
 createdb yunhou_users
-# Run BOTH migrations in order — 002 alters tables created by 001 and
-# will fail if 001 hasn't been applied yet.
+# Run ALL migrations in order — 002 alters tables created by 001, 003
+# adds payment/webhook tables. Each depends on the prior; running out of
+# order will fail.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
+psql -d yunhou_users -f migrations/003_payments.sql
 
 # 2. Generate RSA keys
 make generate-keys
@@ -37,14 +39,21 @@ curl -X POST http://localhost:8080/auth/login \
 
 All configuration is via environment variables (or `.env` file):
 
-| Variable | Required | Default |
-|---|---|---|
-| `DATABASE_URL` | No | `postgres://localhost/yunhou_users?sslmode=disable` |
-| `PORT` | No | `8080` |
-| `RSA_PRIVATE_KEY_PATH` | No | `keys/private.pem` |
-| `RSA_PUBLIC_KEY_PATH` | No | `keys/public.pem` |
-| `JWT_ACCESS_TTL` | No | `15m` |
-| `JWT_REFRESH_TTL` | No | `168h` |
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `DATABASE_URL` | No | `postgres://localhost/yunhou_users?sslmode=disable` | |
+| `PORT` | No | `8080` | |
+| `RSA_PRIVATE_KEY_PATH` | No | `keys/private.pem` | |
+| `RSA_PUBLIC_KEY_PATH` | No | `keys/public.pem` | |
+| `JWT_ACCESS_TTL` | No | `15m` | Must be positive |
+| `JWT_REFRESH_TTL` | No | `168h` (7 days) | Must be > access TTL; ≤ 365 days |
+| `ORDER_EXPIRY_DURATION` | No | `30m` | Pending order expiry; sweeper flips to `expired` after this |
+| `SWEEPER_INTERVAL` | No | `1m` | Must be strictly < `ORDER_EXPIRY_DURATION` |
+| `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
+| `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
+| `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM file path; empty = Alipay webhooks return 404 |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
 
 ## API Overview
 
@@ -117,7 +126,10 @@ go test -race -run TestAuthService_Login ./internal/service/
 
 Database migration:
 ```bash
+# Run in order. Each migration depends on the prior.
+psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
+psql -d yunhou_users -f migrations/003_payments.sql
 ```
 
 ## Tech Stack

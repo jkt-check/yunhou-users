@@ -13,8 +13,10 @@ e2e:
 	go test -race -count=1 -v ./tests/e2e/
 
 migrate:
-	@echo "Run migration manually:"
+	@echo "Run migrations manually (in order):"
 	@echo "  psql -d yunhou_users -f migrations/001_init.sql"
+	@echo "  psql -d yunhou_users -f migrations/002_simplify_plans.sql"
+	@echo "  psql -d yunhou_users -f migrations/003_payments.sql"
 
 lint:
 	go vet ./...

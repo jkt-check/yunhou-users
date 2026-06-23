@@ -43,12 +43,17 @@ psql -h localhost -U postgres -c "SELECT datname FROM pg_database WHERE datname 
 ## 第三步：执行数据库迁移（建表）
 
 ```bash
-# 必须按顺序执行：001 创建表，002 简化订阅系统（依赖 001 的结构）
+# 必须按顺序执行：001 创建核心表，002 简化订阅系统（依赖 001），003 添加支付/退款/Webhook 表
 psql -h localhost -U postgres -d yunhou_users -f migrations/001_init.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/002_simplify_plans.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/003_payments.sql
 ```
 
-这会创建 6 张表：`users`、`social_identities`、`apps`、`plans`、`subscriptions`、`sessions`。
+这会创建 11 张表：
+
+- 核心（001）：`users`、`social_identities`、`apps`、`subscriptions`、`sessions`
+- 订阅（002）：`plans`
+- 支付/退款/Webhook（003）：`orders`、`payments`、`refunds`、`webhook_events`、`audit_log`
 
 验证表是否创建成功：
 
@@ -60,11 +65,16 @@ psql -h localhost -U postgres -d yunhou_users -c "\dt"
 
 ```
  apps
+ audit_log
+ orders
+ payments
  plans
+ refunds
  sessions
  social_identities
  subscriptions
  users
+ webhook_events
 ```
 
 ---
@@ -95,22 +105,20 @@ ls -la keys/
 nano .env
 ```
 
-填入以下内容（`STATE_HMAC_KEY` 必须自己设一个随机字符串）：
+填入以下内容（必需项）：
 
 ```env
-STATE_HMAC_KEY=这里填一个随机字符串至少32个字符
-GITHUB_CLIENT_ID=你的GitHubOAuthAppID
-GITHUB_CLIENT_SECRET=你的GitHubOAuthAppSecret
 DATABASE_URL=postgres://postgres@localhost/yunhou_users?sslmode=disable
 ```
 
-> **STATE_HMAC_KEY 怎么生成？** 随便一个足够长的随机字符串就行，例如：
-> ```bash
-> openssl rand -hex 24
-> ```
-> 把输出的字符串填进去。
-
-> **GITHUB_CLIENT_ID / SECRET 怎么获取？** 去 https://github.com/settings/developers 创建一个 OAuth App，Callback URL 填 `http://localhost:8080/callback/github`。
+> `DATABASE_URL` 是唯一必需的变量。其他都有合理默认值（详见 README.md）：
+> - `PORT` 默认 `8080`
+> - `RSA_PRIVATE_KEY_PATH` 默认 `keys/private.pem`
+> - `RSA_PUBLIC_KEY_PATH` 默认 `keys/public.pem`
+> - `JWT_ACCESS_TTL` 默认 `15m`
+> - `JWT_REFRESH_TTL` 默认 `168h`（7 天）
+>
+> 支付渠道的 Webhook 密钥（`STRIPE_WEBHOOK_SECRET`、`WECHAT_PAY_API_V3_KEY`、`ALIPAY_PUBLIC_KEY_PATH`）只在接入对应渠道时才需要配置。`GITHUB_*` / `GOOGLE_*` 是**预留**配置项，当前直接登录模式不消费它们。
 
 ---
 
@@ -166,6 +174,8 @@ PostgreSQL 要求密码。两种解决方式：
 
 ```bash
 psql -h localhost -U postgres -d yunhou_users -f migrations/001_init.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/002_simplify_plans.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/003_payments.sql
 # 会提示输入密码，输入你设定的 postgres 密码
 ```
 
@@ -244,15 +254,14 @@ psql -h localhost -U postgres -c "SELECT 1 FROM pg_database WHERE datname = 'yun
 
 echo "检查表..."
 TABLE_COUNT=$(psql -h localhost -U postgres -d yunhou_users -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")
-echo "  公共表数量: $TABLE_COUNT (需要 5 张)"
+echo "  公共表数量: $TABLE_COUNT (需要 11 张：001_init + 002_simplify_plans + 003_payments)"
 
 echo "检查密钥..."
 [ -f keys/private.pem ] && echo "✓ private.pem 存在" || echo "✗ 缺少 private.pem，请执行: make generate-keys"
 [ -f keys/public.pem ] && echo "✓ public.pem 存在" || echo "✗ 缺少 public.pem，请执行: make generate-keys"
 
 echo "检查环境变量..."
-[ -n "$STATE_HMAC_KEY" ] && echo "✓ STATE_HMAC_KEY 已设置" || echo "✗ STATE_HMAC_KEY 未设置，程序将无法启动"
-[ -n "$GITHUB_CLIENT_ID" ] && echo "✓ GITHUB_CLIENT_ID 已设置" || echo "⚠ GITHUB_CLIENT_ID 未设置（GitHub 登录不可用）"
+[ -n "$DATABASE_URL" ] && echo "✓ DATABASE_URL 已设置" || echo "✗ DATABASE_URL 未设置，程序将无法启动"
 
 echo ""
 echo "如果全部 ✓，运行集成测试:"

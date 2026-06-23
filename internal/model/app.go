@@ -12,4 +12,5 @@ type App struct {
 	Config      json.RawMessage `db:"config" json:"config"`
 	IsActive    bool            `db:"is_active" json:"is_active"`
 	CreatedAt   time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt   time.Time       `db:"updated_at" json:"updated_at"`
 }

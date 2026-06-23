@@ -944,13 +944,18 @@ func (s *PaymentService) onDisputeClosed(ctx context.Context, e WebhookEvent) er
 // existing transaction. Returns (paymentID, true) if inserted, (_, false)
 // if a row already exists for (channel, external_txn_id).
 func insertPaymentOnTx(ctx context.Context, tx *sqlx.Tx, p *model.Payment) (string, bool, error) {
+	rawPayload := p.RawPayload
+	if rawPayload == nil {
+		rawPayload = json.RawMessage(`{}`)
+	}
+	var paidAt *time.Time = p.PaidAt
 	var id string
 	err := tx.QueryRowxContext(ctx, `
 		INSERT INTO payments (order_id, channel, external_txn_id, amount, currency, status, paid_at, raw_payload)
-		VALUES (:order_id, :channel, :external_txn_id, :amount, :currency, :status, :paid_at, :raw_payload)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (channel, external_txn_id) DO NOTHING
 		RETURNING id
-	`, p).Scan(&id)
+	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, p.Status, paidAt, rawPayload).Scan(&id)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
 			return "", false, nil
@@ -1092,7 +1097,8 @@ func validateChannel(channel string) error {
 
 func isPaymentSuccess(eventType string) bool {
 	switch eventType {
-	case "payment_intent.succeeded", "TRANSACTION.SUCCESS", "TRADE_SUCCESS":
+	case "payment_intent.succeeded", "TRANSACTION.SUCCESS",
+		"TRADE_SUCCESS", "trade_status_sync":
 		return true
 	}
 	return false
@@ -1109,7 +1115,8 @@ func isPaymentFailed(eventType string) bool {
 
 func isRefundEvent(eventType string) bool {
 	switch eventType {
-	case "charge.refunded", "TRANSACTION.REFUND", "TRADE_CLOSED":
+	case "charge.refunded", "TRANSACTION.REFUND",
+		"TRADE_CLOSED", "trade_closed":
 		return true
 	}
 	return false

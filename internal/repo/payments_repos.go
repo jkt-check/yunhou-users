@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -324,13 +325,17 @@ type webhookEventRepo struct{ db *sqlx.DB }
 func NewWebhookEventRepo(db *sqlx.DB) *webhookEventRepo { return &webhookEventRepo{db: db} }
 
 func (r *webhookEventRepo) InsertOnConflictDoNothing(ctx context.Context, e *model.WebhookEvent) (string, bool, error) {
+	rawPayload := e.RawPayload
+	if rawPayload == nil {
+		rawPayload = json.RawMessage(`{}`)
+	}
 	var id string
 	err := r.db.QueryRowxContext(ctx, `
 		INSERT INTO webhook_events (channel, event_id, event_type, raw_payload)
-		VALUES (:channel, :event_id, :event_type, :raw_payload)
+		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (channel, event_id) DO NOTHING
 		RETURNING id
-	`, e).Scan(&id)
+	`, e.Channel, e.EventID, e.EventType, rawPayload).Scan(&id)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
 			return "", false, nil

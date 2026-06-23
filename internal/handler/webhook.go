@@ -57,6 +57,11 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 		return
 	}
 
+	// Wrap the raw payload for storage. JSONB columns require valid JSON;
+	// Alipay's form-encoded body would fail a direct cast. We wrap it as a
+	// JSON string so the channel-specific shape stays queryable later.
+	event.RawPayload = wrapRawPayload(channel, raw)
+
 	result, err := h.svc.OnWebhook(c.Request.Context(), *event)
 	if err != nil {
 		// Internal errors: 500 so the channel retries per its schedule.
@@ -95,6 +100,8 @@ func (h *WebhookHandler) parseEvent(channel string, raw []byte) (*service.Webhoo
 }
 
 // parseStripe extracts the fields OnWebhook needs from a Stripe event.
+// RawPayload is left nil — the handler wraps the original raw bytes via
+// wrapRawPayload after this returns.
 //
 //	{
 //	  "id":   "evt_xxx",
@@ -130,7 +137,6 @@ func (h *WebhookHandler) parseStripe(raw []byte) (*service.WebhookEvent, error) 
 		Channel:       "stripe",
 		EventID:       evt.ID,
 		EventType:     evt.Type,
-		RawPayload:    raw,
 		TransactionID: pi.ID,
 		OrderID:       pi.Metadata.OrderID,
 		Amount:        float64(pi.Amount) / 100, // cents → major units
@@ -181,7 +187,6 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 		Channel:       "wechat_pay",
 		EventID:       evt.ID,
 		EventType:     evt.EventType,
-		RawPayload:    raw,
 		TransactionID: resource.TransactionID,
 		OrderID:       resource.OutTradeNo,
 		Amount:        float64(resource.Amount.Total) / 100, // fen → major units
@@ -232,7 +237,6 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 		Channel:       "alipay",
 		EventID:       notifyID,
 		EventType:     notifyType,
-		RawPayload:    raw,
 		TransactionID: tradeNo,
 		OrderID:       outTradeNo,
 		Currency:      "CNY", // v1 assumption
@@ -255,4 +259,18 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 func isAlipayRefundEvent(notifyType string) bool {
 	// Alipay event types: trade_status_sync (paid), trade_closed (closed/refunded).
 	return notifyType == "trade_closed"
+}
+
+// wrapRawPayload produces a JSONB-safe representation of the raw webhook
+// body. We always emit a JSON string (the body escaped). For channels
+// whose body IS JSON (Stripe, WeChat), this means a JSON string containing
+// JSON. For form-encoded channels (Alipay), it means a JSON string
+// containing form-encoded text. Either way it's a valid JSONB string.
+func wrapRawPayload(channel string, raw []byte) json.RawMessage {
+	encoded, err := json.Marshal(string(raw))
+	if err != nil {
+		// Fall back to an empty JSON object — should never happen.
+		return json.RawMessage(`{}`)
+	}
+	return encoded
 }

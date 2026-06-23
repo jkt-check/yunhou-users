@@ -62,7 +62,15 @@ CREATE TABLE IF NOT EXISTS payments (
     failed_reason   TEXT,
     disputed        BOOLEAN NOT NULL DEFAULT false,
     disputed_at     TIMESTAMPTZ,
-    -- 原始 webhook body（webhook doc §"raw_payload" 永不删，forensic 用）
+    -- 原始 webhook body（webhook doc §"raw_payload" 永不删，forensic 用）。
+    -- JSONB 列要求 valid JSON；handler 必须保证写入值合法。
+    -- 存储策略：
+    --   * Stripe / WeChat：body 本身就是 JSON，作为 JSON 字符串存储
+    --     (`"<escaped json>"` — 由 handler.wrapRawPayload 统一处理)。
+    --   * Alipay：body 是 form-encoded key=value&... 文本，handler 把
+    --     它 escape 成 JSON 字符串后存入本列：
+    --     `{"raw":"<escaped form body>"}`。
+    -- 任何后续 forensic / 审计查询要按 channel 取对应的反序列化方式。
     raw_payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),

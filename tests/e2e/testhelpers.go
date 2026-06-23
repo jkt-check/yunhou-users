@@ -318,6 +318,10 @@ func extractQuery(t *testing.T, rawURL, key string) string {
 // stubE2EProviderVerifier mirrors the legacy in-process provider stub: the
 // provider_token doubles as a stable user identifier so e2e tests can drive
 // login flows without standing up a fake GitHub/Google HTTP server.
+//
+// Unknown providers return the sentinel ErrUnsupportedProvider so the
+// auth handler's error mapping kicks in (and TestUnsupportedProvider sees
+// the expected 400). Returning a plain error here would surface as 500.
 func stubE2EProviderVerifier(_ context.Context, provider, token string) (*service.ProviderUserInfo, error) {
 	switch provider {
 	case "github":
@@ -335,7 +339,7 @@ func stubE2EProviderVerifier(_ context.Context, provider, token string) (*servic
 			Nickname:    "Google " + token,
 		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported provider: %s", provider)
+		return nil, fmt.Errorf("%w: %s", service.ErrUnsupportedProvider, provider)
 	}
 }
 

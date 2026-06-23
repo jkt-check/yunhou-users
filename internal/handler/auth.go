@@ -52,6 +52,12 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	resp, err := h.authSvc.Login(c.Request.Context(), req)
 	if err != nil {
+		// ErrUnsupportedProvider is a malformed request (caller sent an
+		// unknown provider name) — surface as 400, not 401.
+		if errors.Is(err, service.ErrUnsupportedProvider) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
 		if isExpectedAuthErr(err) {
 			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": err.Error()})
 			return

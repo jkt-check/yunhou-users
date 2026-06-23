@@ -461,11 +461,19 @@ Implications for us:
 
 ### Alipay
 
-| Notification type           | Action                                              |
-|-----------------------------|-----------------------------------------------------|
-| `TRADE_SUCCESS`             | payment → `paid`, activate sub                       |
-| `TRADE_CLOSED` (full refund)| payment → `refunded`, subscription → `cancelled`     |
-| `TRADE_CLOSED` (partial refund) | payment stays `paid`, no subscription change     |
+| Notification type                  | Action                                              |
+|------------------------------------|-----------------------------------------------------|
+| `trade_status_sync` (or `TRADE_SUCCESS` legacy) | payment → `paid`, activate sub           |
+| `trade_closed` (full refund, or `TRADE_CLOSED` legacy) | payment → `refunded`, subscription → `cancelled` |
+| `trade_closed` (partial refund)    | payment stays `paid`, no subscription change         |
+
+**Note on event_type casing**: real Alipay production traffic uses lowercase
+`trade_status_sync` for paid notifications and `trade_closed` for refunds.
+The capitalized forms (`TRADE_SUCCESS`, `TRADE_CLOSED`) are accepted as
+legacy aliases — both are normalized to the same handler dispatch in
+`service.isPaymentSuccess` / `service.isRefundEvent`. When in doubt, match
+what the actual channel sends: lowercase for current Alipay, uppercase
+for older docs / sample payloads.
 
 ### Refund → subscription semantics (primitive, v1)
 

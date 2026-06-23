@@ -583,7 +583,9 @@ Webhook endpoints have **separate, looser rate limits** (so retry storms from a 
 
 **Transport**: TLS / mTLS is terminated at the reverse proxy (Caddy / nginx / cloud LB) in front of yunhou-users. We do not manage certs in the Go process.
 
-**Anomaly note**: a webhook arriving for an order that doesn't exist in our DB is an attack / configuration error / test artifact. We return 404 in this case; the channel will retry per its schedule. Normal operation always has the order row created **before** the channel is invoked, so this race should not occur in production.
+**Anomaly note**: a webhook arriving for an order that doesn't exist in our DB is an attack / configuration error / test artifact. We **return 200** and write an `audit_log` row tagged `webhook_for_unknown_order` (or `webhook_refund_unknown_payment` for refund events). The 200 stops the channel's retry loop — retrying an event for an order that will never exist just creates noise; the audit_log row gives ops the signal to investigate. **Normal operation always has the order row created before the channel is invoked**, so this branch should not fire in production.
+
+(An earlier draft of this doc said "return 404" — the policy was changed to 200+audit after M5 e2e exercise showed that 404 makes the channel retry the same unresolvable event, which is operationally noisier than a silent ack + audit. See `TestWebhook_Stripe_UnknownOrder_Audited` in `tests/e2e/webhooks_test.go` for the asserted behavior.)
 
 ## Project Structure
 

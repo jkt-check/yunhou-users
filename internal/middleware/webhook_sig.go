@@ -218,6 +218,12 @@ func (v *WeChatPayV3Verifier) DecryptResource(ciphertextB64, nonce, associatedDa
 	if err != nil {
 		return nil, fmt.Errorf("new gcm: %w", err)
 	}
+	// GCM requires exactly 12-byte nonce (Go stdlib hardcodes NonceSize()=12).
+	// Without this guard, gcm.Open panics on wrong-length nonces, which Gin
+	// recovers as a 500 — a DoS vector under crafted input.
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("invalid nonce length: got %d, want %d", len(nonce), gcm.NonceSize())
+	}
 	return gcm.Open(nil, []byte(nonce), ciphertext, []byte(associatedData))
 }
 
@@ -314,12 +320,17 @@ func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers ma
 		return ErrInvalidSignature
 	}
 
-	if v.ReplayWindow > 0 {
-		if notifyTime := values.Get("notify_time"); notifyTime != "" {
-			if t, err := time.Parse("2006-01-02 15:04:05", notifyTime); err == nil {
-				if delta := time.Since(t); delta > v.ReplayWindow || delta < -v.ReplayWindow {
-					return ErrTimestampOutOfRange
-				}
+	// Replay window defaults to 5 min (matches Stripe/WeChat). Alipay retries
+	// notifications for ~24h, so without this guard a captured notification
+	// could be replayed well outside the legitimate retry schedule.
+	replayWindow := v.ReplayWindow
+	if replayWindow == 0 {
+		replayWindow = 5 * time.Minute
+	}
+	if notifyTime := values.Get("notify_time"); notifyTime != "" {
+		if t, err := time.Parse("2006-01-02 15:04:05", notifyTime); err == nil {
+			if delta := time.Since(t); delta > replayWindow || delta < -replayWindow {
+				return ErrTimestampOutOfRange
 			}
 		}
 	}

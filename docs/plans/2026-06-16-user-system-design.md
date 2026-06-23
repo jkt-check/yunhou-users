@@ -171,7 +171,7 @@ One row per refund event. A payment can be refunded multiple times (partial refu
 | amount             | decimal(10,2) | refund amount; sum of all refunds per payment must not exceed payment.amount |
 | reason             | text          | nullable                                    |
 | idempotency_key    | text          | caller-supplied unique key (HTTP `Idempotency-Key` header); **UNIQUE** so duplicate POST /refunds requests with the same key resolve to the same row |
-| external_refund_id | text          | channel's refund ID; **UNIQUE (channel, external_refund_id)** |
+| external_refund_id | text          | channel's refund ID (nullable; populated only after the channel's refund API returns). **UNIQUE (channel, external_refund_id)** — Postgres treats NULLs as distinct, so the column being nullable does not weaken the uniqueness guarantee. |
 | status             | enum          | `pending` / `paid` / `failed` — see "Refund status semantics" below |
 | created_at         | timestamp     |                                            |
 | updated_at         | timestamp     |                                            |
@@ -278,6 +278,10 @@ yunhou-users exposes **raw primitive operations** that the consumer-app frontend
 - **Fraud / risk decisions** — device fingerprinting, velocity checks, chargeback history lookups.
 
 The test for whether something belongs in this service: **can it be expressed as a state transition on a row in our database?** If yes, primitive. If it requires cross-row reasoning, role-based authorization, or user-facing UX decisions, it does NOT belong here.
+
+### Ownership → 404 (not 403)
+
+A JWT-authenticated caller can only read/write their own orders/payments/refunds. The service layer returns **404** (not 403) on ownership mismatch so non-owners cannot enumerate the existence of resource IDs. This applies uniformly across `GET / DELETE / POST` endpoints — when you see "403 not owner" in the per-endpoint error lists below, the actual HTTP response is 404 with the same code/message envelope. Internal-app-auth callers bypass the ownership check entirely.
 
 ## API Endpoints
 
@@ -400,9 +404,9 @@ Frontend SDK callback after a successful in-SDK payment. The `:order_id` is the 
 Request:
   {
     "channel": "stripe",          // required
-    "external_txn_id": "pi_xxx",  // required — channel's transaction ID
-    "amount": "29.90",            // optional; if absent, defaults to orders.amount
-    "currency": "CNY"             // optional; if absent, defaults to orders.currency
+    "external_txn_id": "pi_xxx"   // required — channel's transaction ID
+    // amount and currency are intentionally NOT accepted; the order row
+    // is the authoritative source for both.
   }
 
 Response 200:
@@ -410,8 +414,11 @@ Response 200:
     "payment_id": "<payment_uuid>",
     "order_id": "<order_uuid>",
     "status": "paid",
-    "activated_subscription": true
+    "activated_subscription": true,
+    "was_late_payment": false   // true when the order was 'expired' and we honored the payment per "Late payment" below
   }
+
+> Note: `amount` and `currency` in the request body are NOT honored by this endpoint — the order row is the authoritative source. (Previously accepted and superseded in this revision.)
 
 Errors:
   404 order not found

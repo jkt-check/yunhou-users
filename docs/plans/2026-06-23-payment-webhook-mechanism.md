@@ -79,11 +79,14 @@ We respond **fast** (target < 500ms). DB errors are surfaced as `500` so the cha
 
 | Channel outcome                  | Our HTTP response                |
 |----------------------------------|----------------------------------|
-| Signature valid, dedupe hit      | `200 OK` `{"received": true}`    |
-| Signature valid, processed       | `200 OK` `{"received": true}`    |
+| Signature valid, dedupe hit      | `200 OK` `{"received": true, "duplicate": true, "domain_action": "..."}` |
+| Signature valid, processed       | `200 OK` `{"received": true, "duplicate": false, "domain_action": "payment_paid"}` |
 | Signature valid, transient DB error | `500` (channel retries)       |
 | Signature **invalid**            | `400` (channel logs; no retry)   |
 | Timestamp outside tolerance window | `400` (replay protection)     |
+| Unknown channel                  | `404` (path is checked before signature middleware) |
+
+The webhook response adds top-level `domain_action` (`"payment_paid"` / `"payment_failed"` / `"refund_paid"` / `"payment_disputed"` / `"payment_dispute_closed"` / `"none"`) and `duplicate` (`true` on dedupe hit) keys alongside `code` and `data` for ops/dashboard introspection. This is a deliberate exception to the standard envelope — webhook consumers are channels, not end users.
 
 **Transaction boundary**: every webhook handler does its work inside a single SQL transaction (event-level insert + payment upsert + subscription upsert + order update). The HTTP response is sent **only after** `COMMIT` returns. If the transaction fails for any reason, we return `500`; the channel retries; on retry we re-run the same idempotent INSERTs/UPDATEs.
 
@@ -479,7 +482,7 @@ for older docs / sample payloads.
 
 These rules describe the **data side effects** only. **Who triggers a refund, when it's allowed, how much can be refunded, and whether approval is needed** are all decided by the caller (frontend / admin tooling / payment-service) — not by us. We just provide the primitive operation; the caller composes business policy on top.
 
-- **Full refund** → cancel the subscription immediately. User reverts to the default plan; their JWT scope shrinks on next refresh. The threshold for "full" is `refund.amount == payment.amount`; we don't enforce any other definition.
+- **Full refund** → cancel the subscription immediately. User reverts to the default plan; their JWT scope shrinks on next refresh. The threshold for "full" is `refund.amount == payment.amount`; we don't enforce any other definition. The comparison is done in **integer cents** (DECIMAL(10,2) → int64 × 100) to avoid float64 round-trip drift — an epsilon-based comparison silently mis-classified fee-inclusive refunds.
 - **Partial refund** → no subscription change. We do NOT prorate (subtract N days from `expires_at`). Out of scope for v1; explicitly a known limitation.
 - **Refund after subscription already expired/cancelled** → still record the refund on the payment row; do NOT touch the (already terminal) subscription.
 - **Multiple partial refunds on the same payment** are allowed as separate rows; the sum-≤-original invariant is enforced in the service layer before insert (see design doc Refund table note).

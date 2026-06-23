@@ -293,9 +293,10 @@ func (r *refundRepo) ListByPaymentID(ctx context.Context, paymentID string) ([]m
 }
 
 func (r *refundRepo) SumByPaymentID(ctx context.Context, paymentID string) (float64, error) {
+	// Only count settled refunds — failed ones must not block retries.
 	var sum float64
 	err := r.db.GetContext(ctx, &sum, `
-		SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1
+		SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status = 'paid'
 	`, paymentID)
 	return sum, err
 }
@@ -317,7 +318,15 @@ type WebhookEventRepo interface {
 	// exists for (channel, event_id), returns (uuid.Zero, false) — the
 	// handler should ack 200 and stop.
 	InsertOnConflictDoNothing(ctx context.Context, e *model.WebhookEvent) (string, bool, error)
+	// FindByChannelEventID is used on a dedupe hit to check whether the
+	// prior run finished (processed_at IS NOT NULL) or crashed mid-action
+	// (processed_at IS NULL — caller must re-run business action).
+	FindByChannelEventID(ctx context.Context, channel, eventID string) (*model.WebhookEvent, error)
 	MarkProcessed(ctx context.Context, id string) error
+	// MarkProcessedOnTx folds the processed_at write into the same tx as
+	// the business action, so a crash between action-commit and
+	// MarkProcessed no longer leaves processed_at=NULL with side effects done.
+	MarkProcessedOnTx(ctx context.Context, tx *sqlx.Tx, id string) error
 }
 
 type webhookEventRepo struct{ db *sqlx.DB }
@@ -350,6 +359,24 @@ func (r *webhookEventRepo) MarkProcessed(ctx context.Context, id string) error {
 		UPDATE webhook_events SET processed_at = now() WHERE id = $1
 	`, id)
 	return err
+}
+
+func (r *webhookEventRepo) MarkProcessedOnTx(ctx context.Context, tx *sqlx.Tx, id string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE webhook_events SET processed_at = now() WHERE id = $1
+	`, id)
+	return err
+}
+
+func (r *webhookEventRepo) FindByChannelEventID(ctx context.Context, channel, eventID string) (*model.WebhookEvent, error) {
+	var ev model.WebhookEvent
+	err := r.db.GetContext(ctx, &ev, `
+		SELECT * FROM webhook_events WHERE channel = $1 AND event_id = $2
+	`, channel, eventID)
+	if err != nil {
+		return nil, err
+	}
+	return &ev, nil
 }
 
 // ============================================================================

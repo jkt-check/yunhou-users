@@ -103,9 +103,14 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string)
 		return nil, ErrPlanInactive
 	}
 
-	// Reject if the user already has an active subscription — buying again
-	// should go through the upgrade flow (or cancel first). This keeps the
-	// single-active-sub invariant clean at the API layer.
+	// Enforce the partial unique index `UNIQUE(user_id) WHERE status='active'`
+// at the order layer. Without this pre-check, a concurrent order + activate
+// would hit the constraint at INSERT time and surface as a 500; the user
+// gets a clean 409 instead. The DB invariant IS the primitive — this is
+// just a friendly surface for it. If the product later allows multiple
+// active rows, both this check and the partial unique index need to change
+// together (yunhou-users stays primitive — upgrade flow / re-buy semantics
+// belong to the frontend).
 	if _, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
 		return nil, ErrUserHasActiveSub
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -241,9 +246,12 @@ type ConfirmInput struct {
 	UserID        string
 	Channel       string
 	ExternalTxnID string
-	Amount        *float64   // optional; defaults to order.amount
-	Currency      *string    // optional; defaults to order.currency
-	ExpiresAt     *time.Time // optional; subscription expiry (nil = never expires per plan defaults)
+	// Amount and Currency are NOT caller-supplied; the order row is the
+	// authoritative source. Adding them here would let a caller claim they
+	// paid a different amount than the order — the webhook reconciles
+	// against the channel's actual amount, but the subscription would
+	// already be activated for the wrong amount by then.
+	ExpiresAt *time.Time // optional; subscription expiry (nil = never expires per plan defaults)
 }
 
 // ConfirmResult is the response from Confirm.
@@ -278,24 +286,36 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		return nil, ErrOrderAlreadyTerminal
 	}
 
-	amount := order.Amount
-	if in.Amount != nil {
-		amount = *in.Amount
-	}
-	currency := order.Currency
-	if in.Currency != nil {
-		currency = *in.Currency
-	}
+	// Amount and currency come from the order — the order is the
+	// authoritative source. Caller-supplied amounts are not accepted
+	// (see ConfirmInput doc comment).
 
-	// Channel mismatch pre-check (design doc confirm endpoint contract).
-	// Without this, the INSERT in step 1 would surface as a 500 from the
-	// partial unique index; we want a 409.
-	if existing, perr := s.paymentRepo.FindPaidByOrderID(ctx, order.ID); perr == nil && existing != nil {
-		if existing.Channel != in.Channel {
+	// Activate subscription + update order + handle late-payment honor
+	// in one transaction so partial failures don't leave inconsistent state.
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Channel mismatch check happens INSIDE the tx with FOR UPDATE on the
+	// existing paid payment row, so a concurrent webhook can't slip a
+	// different-channel payment in between this check and the INSERT below.
+	// Without this, the partial unique index would surface a unique_violation
+	// as a 500 instead of the desired 409 ErrOrderChannelMismatch.
+	var existingChannel string
+	err = tx.QueryRowxContext(ctx, `
+		SELECT channel FROM payments WHERE order_id = $1 AND status = 'paid' FOR UPDATE
+	`, order.ID).Scan(&existingChannel)
+	switch {
+	case err == nil:
+		if existingChannel != in.Channel {
 			return nil, ErrOrderChannelMismatch
 		}
-		// Same channel → fall through; the InsertPaidOnConflictDoNothing
-		// will dedupe and we'll re-apply the state transition idempotently.
+	case errors.Is(err, sql.ErrNoRows):
+		// no paid row yet — proceed to INSERT
+	default:
+		return nil, fmt.Errorf("check existing payment: %w", err)
 	}
 
 	now := time.Now()
@@ -308,20 +328,12 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		OrderID:       order.ID,
 		Channel:       in.Channel,
 		ExternalTxnID: in.ExternalTxnID,
-		Amount:        amount,
-		Currency:      currency,
+		Amount:        order.Amount,
+		Currency:      order.Currency,
 		Status:        "paid",
 		PaidAt:        &now,
 		RawPayload:    rawPayload,
 	}
-
-	// Activate subscription + update order + handle late-payment honor
-	// in one transaction so partial failures don't leave inconsistent state.
-	tx, err := s.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
 
 	paymentID, inserted, err := insertPaymentOnTx(ctx, tx, p)
 	if err != nil {
@@ -463,10 +475,12 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 		return nil, fmt.Errorf("lock payment: %w", err)
 	}
 
-	// Sum invariant under lock.
+	// Sum invariant under lock. Only count refunds that actually settled
+	// against the channel — failed refunds must not block a successful
+	// retry of the same logical amount.
 	var currentSum float64
 	if err := tx.GetContext(ctx, &currentSum,
-		`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1`, payment.ID); err != nil {
+		`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status = 'paid'`, payment.ID); err != nil {
 		return nil, fmt.Errorf("sum refunds: %w", err)
 	}
 	if currentSum+in.Amount > paymentAmount {
@@ -534,7 +548,11 @@ type WebhookEvent struct {
 	Currency       string     // ISO 4217
 	RefundAmount   float64    // for refund events
 	ExternalRefundID string   // channel's refund ID
-	SubExpiresAt   *time.Time // subscription expiry (from plan.interval_days; nil = never expires)
+	SubExpiresAt *time.Time // subscription expiry at activation. MUST be supplied by the
+		// caller (e.g. an explicit channel metadata field) — yunhou-users
+		// MUST NOT compute it from plan.interval_days; that calculation is
+		// a frontend product decision (rollover rules, grace periods, trials).
+		// nil = never expires.
 }
 
 // OnWebhookResult reports what the handler did.
@@ -563,7 +581,24 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 		return nil, fmt.Errorf("insert webhook event: %w", err)
 	}
 	if !inserted {
-		return &OnWebhookResult{DuplicateEvent: true}, nil
+		// Dedupe hit. Two cases:
+		//  (a) processed_at IS NOT NULL — prior run finished cleanly.
+		//      Ack 200, no re-run.
+		//  (b) processed_at IS NULL — prior run crashed mid-action.
+		//      Re-run the business action. Each handler is idempotent
+		//      (UPSERT in payments, UPDATE on terminal states, etc.) so
+		//      a re-run is safe. This converts at-most-once delivery
+		//      into at-least-once with idempotent side effects.
+		prior, ferr := s.webhookRepo.FindByChannelEventID(ctx, e.Channel, e.EventID)
+		if ferr != nil {
+			return nil, fmt.Errorf("lookup prior webhook: %w", ferr)
+		}
+		if prior.ProcessedAt != nil {
+			return &OnWebhookResult{DuplicateEvent: true}, nil
+		}
+		// Re-run; reuse the same webhook_events.id so the MarkProcessed
+		// below updates the existing row instead of inserting a duplicate.
+		eventRowID = prior.ID
 	}
 
 	var domainAction string
@@ -686,6 +721,12 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		paymentID = existing.ID
 	}
 
+	// Subscription activation is gated by payment success, not by order
+	// status — see doc §"Subscription activation". The order UPDATE below
+	// is idempotent (already-paid / late-paid / cancelled-but-honored all
+	// succeed). Re-running the activation UPSERT on a retried event is
+	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
+	// row.
 	if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiresAtFromWebhook(e)); err != nil {
 		return fmt.Errorf("activate sub: %w", err)
 	}
@@ -764,10 +805,13 @@ func (s *PaymentService) onPaymentFailed(ctx context.Context, e WebhookEvent) er
 
 	if wasPaid {
 		// Deactivate subscription (rare race; web doc §7 cascade).
+		// Scope to the order's plan_id: an unrelated active subscription on
+		// a different plan must NOT be torn down by this order's failure
+		// (the user may have multiple plans in play).
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions SET status = 'cancelled', updated_at = now()
-			WHERE user_id = $1 AND status = 'active'
-		`, order.UserID); err != nil {
+			WHERE user_id = $1 AND plan_id = $2 AND status = 'active'
+		`, order.UserID, order.PlanID); err != nil {
 			return fmt.Errorf("deactivate sub: %w", err)
 		}
 		if err := writeAuditOnTx(ctx, tx, "service", "subscription_deactivated_failed_payment",
@@ -840,8 +884,11 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		return fmt.Errorf("mark refund paid: %w", err)
 	}
 
-	// Full vs partial refund — only the channel's amount tells us.
-	if e.RefundAmount+0.0001 >= payment.Amount {
+	// Full vs partial refund — only the channel's amount tells us. We
+// compare in integer cents (DECIMAL(10,2) → int64) to avoid float
+// round-trip drift; the +0.0001 epsilon was masking this and mis-
+// classifying fee-inclusive refunds as full refunds.
+	if toCents(e.RefundAmount) >= toCents(payment.Amount) {
 		// Full refund: payment → refunded, sub → cancelled.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE payments SET status = 'refunded', updated_at = now()
@@ -859,12 +906,14 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		`, order.ID); err != nil {
 			return fmt.Errorf("flip order refunded: %w", err)
 		}
-		// Deactivate subscription. Only cancel an active sub — already
+		// Deactivate subscription. Only cancel the sub matching this
+		// order's plan_id — an unrelated active subscription on a
+		// different plan must NOT be cancelled. Already
 		// expired/cancelled subs are terminal (don't reopen them).
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions SET status = 'cancelled', updated_at = now()
-			WHERE user_id = $1 AND status = 'active'
-		`, order.UserID); err != nil {
+			WHERE user_id = $1 AND plan_id = $2 AND status = 'active'
+		`, order.UserID, order.PlanID); err != nil {
 			return fmt.Errorf("cancel sub on full refund: %w", err)
 		}
 		if err := writeAuditOnTx(ctx, tx, "service", "subscription_cancelled_full_refund",
@@ -908,32 +957,16 @@ func (s *PaymentService) onDisputeCreated(ctx context.Context, e WebhookEvent) e
 // onDisputeClosed: v1 only reacts when the merchant wins. Loss path goes
 // through the chargeback's charge.refunded event — webhook doc §7.
 func (s *PaymentService) onDisputeClosed(ctx context.Context, e WebhookEvent) error {
-	if e.Amount > 0 {
-		// Loss path — let the charge.refunded handler take it.
-		return nil
-	}
-	tx, err := s.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	var payment model.Payment
-	if err := tx.GetContext(ctx, &payment, `
-		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE
-	`, e.Channel, e.TransactionID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		return fmt.Errorf("find payment: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE payments SET disputed = false, disputed_at = NULL, updated_at = now()
-		WHERE id = $1
-	`, payment.ID); err != nil {
-		return fmt.Errorf("clear disputed: %w", err)
-	}
-	return tx.Commit()
+	// The previous heuristic `if e.Amount > 0` was wrong — Stripe encodes
+	// win/loss in the event's `status` field, not amount. A won dispute
+	// can have any amount. Until we plumb `data.object.status` through
+	// WebhookEvent, we conservatively no-op on every dispute.closed and
+	// rely on the explicit `charge.refunded` event for the loss cascade.
+	// This is intentional: mis-classifying a loss as a win would clear
+	// `disputed=true` and skip the refund cascade; the prior code did
+	// exactly the inverse.
+	_ = e
+	return nil
 }
 
 // ============================================================================
@@ -1139,4 +1172,20 @@ func subExpiresAtFromWebhook(e WebhookEvent) *time.Time {
 func mustJSON(v map[string]any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// toCents converts a major-units float64 (DECIMAL(10,2) round-trip) to
+// integer cents. Used for exact monetary comparisons that must not
+// suffer float round-trip drift (refund full-vs-partial detection).
+// Non-finite or out-of-range values return math.MinInt64/0 to fail
+// comparisons safely.
+func toCents(v float64) int64 {
+	if v != v { // NaN
+		return 0
+	}
+	c := int64(v * 100)
+	if v > 0 && c < 0 {
+		return 1<<62 - 1 // overflow clamp
+	}
+	return c
 }

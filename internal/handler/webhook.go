@@ -214,6 +214,12 @@ func (h *WebhookHandler) decryptWeChatResource(ciphertextB64, nonce, associatedD
 	if err != nil {
 		return nil, fmt.Errorf("new gcm: %w", err)
 	}
+	// GCM requires exactly 12-byte nonce (Go stdlib hardcodes NonceSize()=12).
+	// Without this guard, gcm.Open panics on wrong-length nonces — Gin
+	// recovers the panic as a 500, which is a DoS vector.
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("invalid nonce length: got %d, want %d", len(nonce), gcm.NonceSize())
+	}
 	return gcm.Open(nil, []byte(nonce), ciphertext, []byte(associatedData))
 }
 
@@ -233,6 +239,16 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 	notifyID := values.Get("notify_id")
 	notifyType := values.Get("notify_type")
 
+	// Reject malformed webhooks — notify_id and notify_type are the dedupe
+	// key + dispatch key. Empty values would collapse every malformed
+	// notification into the same row and silently no-op the dispatch.
+	if notifyID == "" {
+		return nil, fmt.Errorf("alipay missing notify_id")
+	}
+	if notifyType == "" {
+		return nil, fmt.Errorf("alipay missing notify_type")
+	}
+
 	event := &service.WebhookEvent{
 		Channel:       "alipay",
 		EventID:       notifyID,
@@ -242,10 +258,18 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 		Currency:      "CNY", // v1 assumption
 	}
 	if totalAmount != "" {
-		event.Amount, _ = strconv.ParseFloat(totalAmount, 64)
+		v, err := strconv.ParseFloat(totalAmount, 64)
+		if err != nil {
+			return nil, fmt.Errorf("alipay total_amount: %w", err)
+		}
+		event.Amount = v
 	}
 	if refundAmount != "" {
-		event.RefundAmount, _ = strconv.ParseFloat(refundAmount, 64)
+		v, err := strconv.ParseFloat(refundAmount, 64)
+		if err != nil {
+			return nil, fmt.Errorf("alipay refund_amount: %w", err)
+		}
+		event.RefundAmount = v
 	}
 
 	// Alipay doesn't echo its own refund ID; the service generates an

@@ -80,10 +80,12 @@ func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
 	}
 
 	var req struct {
-		Channel       string  `json:"channel" binding:"required"`
-		ExternalTxnID string  `json:"external_txn_id" binding:"required"`
-		Amount        *float64 `json:"amount"`
-		Currency      *string  `json:"currency"`
+		Channel       string `json:"channel" binding:"required"`
+		ExternalTxnID string `json:"external_txn_id" binding:"required"`
+		// Amount and Currency are NOT accepted from the caller — the order
+		// row is the authoritative source. A caller-supplied amount lets a
+		// user claim they paid $100 on a $1 order; the webhook will later
+		// reconcile but the subscription would already be activated.
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
@@ -95,8 +97,6 @@ func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
 		UserID:        userID,
 		Channel:       req.Channel,
 		ExternalTxnID: req.ExternalTxnID,
-		Amount:        req.Amount,
-		Currency:      req.Currency,
 	}
 	res, err := h.svc.Confirm(c.Request.Context(), in)
 	if err != nil {

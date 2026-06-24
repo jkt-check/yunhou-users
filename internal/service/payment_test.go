@@ -67,6 +67,7 @@ func TestValidateChannel(t *testing.T) {
 		{"stripe", false},
 		{"wechat_pay", false},
 		{"alipay", false},
+		{"lemonsqueezy", false},
 		{"paypal", true},
 		{"", true},
 		{"STRIPE", true},    // case-sensitive
@@ -105,6 +106,10 @@ func TestIsPaymentSuccess(t *testing.T) {
 		// Alipay
 		{"trade_status_sync", true},
 		{"TRADE_SUCCESS", true},
+		// LemonSqueezy
+		{"order_created", true},
+		{"subscription_created", true},
+		{"subscription_payment_success", false}, // renewal — v1 ack-200 no-op
 		// unrelated
 		{"charge.refunded", false},
 		{"", false},
@@ -150,6 +155,10 @@ func TestIsRefundEvent(t *testing.T) {
 		{"TRANSACTION.REFUND", true},
 		{"trade_closed", true},
 		{"TRADE_CLOSED", true},
+		// LemonSqueezy
+		{"order_refunded", true},
+		{"subscription_payment_refunded", true},
+		{"subscription_updated", false},
 		{"payment_intent.succeeded", false},
 		{"payment_intent.payment_failed", false},
 		{"", false},

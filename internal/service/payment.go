@@ -1144,17 +1144,20 @@ func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx *sqlx.T
 
 func validateChannel(channel string) error {
 	switch channel {
-	case "stripe", "wechat_pay", "alipay":
+	case "stripe", "wechat_pay", "alipay", "lemonsqueezy":
 		return nil
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidChannel, channel)
 	}
 }
 
+// TODO: refactor to per-channel predicate maps at 5+ channels — the flat
+// switch lists are getting hard to scan as channels multiply.
 func isPaymentSuccess(eventType string) bool {
 	switch eventType {
 	case "payment_intent.succeeded", "TRANSACTION.SUCCESS",
-		"TRADE_SUCCESS", "trade_status_sync":
+		"TRADE_SUCCESS", "trade_status_sync",
+		"order_created", "subscription_created":
 		return true
 	}
 	return false
@@ -1172,7 +1175,8 @@ func isPaymentFailed(eventType string) bool {
 func isRefundEvent(eventType string) bool {
 	switch eventType {
 	case "charge.refunded", "TRANSACTION.REFUND",
-		"TRADE_CLOSED", "trade_closed":
+		"TRADE_CLOSED", "trade_closed",
+		"order_refunded", "subscription_payment_refunded":
 		return true
 	}
 	return false

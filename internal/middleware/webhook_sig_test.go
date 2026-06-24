@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -194,6 +195,70 @@ func TestStripeVerifier_DirectCallAnyChannel(t *testing.T) {
 }
 
 // ============================================================================
+// LemonsqueezyVerifier — raw-body HMAC-SHA256, hex digest, X-Signature header
+// ============================================================================
+
+func TestLemonsqueezyVerifier_Accept(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("ls_test_secret")
+	body := []byte(`{"meta":{"event_name":"order_created"},"data":{"id":"1","type":"orders"}}`)
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	v := &LemonsqueezyVerifier{Secret: secret}
+	headers := map[string]string{"X-Signature": sig}
+	if err := v.VerifySignature("lemonsqueezy", body, headers); err != nil {
+		t.Errorf("valid signature rejected: %v", err)
+	}
+}
+
+func TestLemonsqueezyVerifier_RejectBadSignature(t *testing.T) {
+	t.Parallel()
+
+	v := &LemonsqueezyVerifier{Secret: []byte("ls_test_secret")}
+	body := []byte(`{}`)
+	// All-zeros digest — wrong but valid hex. Forces a real signature mismatch
+	// rather than a hex-decode failure (the latter is a separate test below).
+	headers := map[string]string{"X-Signature": strings.Repeat("0", 64)}
+
+	if err := v.VerifySignature("lemonsqueezy", body, headers); err != ErrInvalidSignature {
+		t.Errorf("bad signature should return ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestLemonsqueezyVerifier_RejectMissingHeader(t *testing.T) {
+	t.Parallel()
+
+	v := &LemonsqueezyVerifier{Secret: []byte("ls_test_secret")}
+	body := []byte(`{}`)
+
+	// Empty headers — no X-Signature at all.
+	if err := v.VerifySignature("lemonsqueezy", body, map[string]string{}); err != ErrInvalidSignature {
+		t.Errorf("missing header should return ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestLemonsqueezyVerifier_RejectBadHex(t *testing.T) {
+	t.Parallel()
+
+	v := &LemonsqueezyVerifier{Secret: []byte("ls_test_secret")}
+	body := []byte(`{}`)
+
+	// Non-hex characters in the signature — should fail at hex.DecodeString
+	// and surface as ErrInvalidSignature (wrapped).
+	headers := map[string]string{"X-Signature": "not-hex-z"}
+	err := v.VerifySignature("lemonsqueezy", body, headers)
+	if err == nil {
+		t.Fatal("bad-hex signature should produce an error")
+	}
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("bad-hex signature should wrap ErrInvalidSignature, got %v", err)
+	}
+}
+
+// ============================================================================
 // WeChatPayV3Verifier — HMAC + AES-GCM resource decrypt
 // ============================================================================
 
@@ -364,6 +429,34 @@ func TestMultiChannelVerifier_UnknownChannel(t *testing.T) {
 	mv := &MultiChannelVerifier{}
 	if err := mv.VerifySignature("paypal", nil, nil); err != ErrUnsupportedChannel {
 		t.Errorf("unknown channel should return ErrUnsupportedChannel, got %v", err)
+	}
+}
+
+// TestMultiChannelVerifier_LemonSqueezyFanOut verifies the dispatch wires
+// the LemonSqueezy field correctly: channel="lemonsqueezy" routes to the
+// configured Lemonsqueezy verifier; channel="stripe" routes to Stripe; an
+// unconfigured channel returns ErrUnsupportedChannel.
+func TestMultiChannelVerifier_LemonSqueezyFanOut(t *testing.T) {
+	t.Parallel()
+
+	stripeErr := errors.New("stripe-stub-error")
+	lsErr := errors.New("ls-stub-error")
+	mv := &MultiChannelVerifier{
+		Stripe:       &stubVerifier{errByChannel: map[string]error{"stripe": stripeErr}},
+		LemonSqueezy: &stubVerifier{errByChannel: map[string]error{"lemonsqueezy": lsErr}},
+	}
+
+	// channel="lemonsqueezy" should hit the LS verifier → lsErr
+	if err := mv.VerifySignature("lemonsqueezy", nil, nil); err != lsErr {
+		t.Errorf("LS dispatch: got %v, want %v", err, lsErr)
+	}
+	// channel="stripe" should hit the Stripe verifier → stripeErr
+	if err := mv.VerifySignature("stripe", nil, nil); err != stripeErr {
+		t.Errorf("Stripe dispatch: got %v, want %v", err, stripeErr)
+	}
+	// channel="alipay" is unset on this mv → ErrUnsupportedChannel
+	if err := mv.VerifySignature("alipay", nil, nil); err != ErrUnsupportedChannel {
+		t.Errorf("unset channel: got %v, want ErrUnsupportedChannel", err)
 	}
 }
 

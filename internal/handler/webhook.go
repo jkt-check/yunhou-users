@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -26,11 +27,11 @@ import (
 //
 // Channel parsing rules:
 //   - Stripe  : application/json, `data.object.{id, metadata.order_id, amount, currency}`
-//               amount is in cents → divide by 100 to major units (design doc §"Amount unit convention")
+//     amount is in cents → divide by 100 to major units (design doc §"Amount unit convention")
 //   - WeChat  : application/json, AES-256-GCM-decrypt resource.ciphertext;
-//               metadata.order_id = out_trade_no (set at order creation)
+//     metadata.order_id = out_trade_no (set at order creation)
 //   - Alipay  : application/x-www-form-urlencoded, out_trade_no IS the order_id,
-//               total_amount is in major units (no conversion)
+//     total_amount is in major units (no conversion)
 type WebhookHandler struct {
 	svc       service.PaymentServiceInterface
 	wechatKey []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
@@ -86,9 +87,9 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": gin.H{
-			"received":     true,
+			"received":      true,
 			"domain_action": result.DomainAction,
-			"duplicate":    result.DuplicateEvent,
+			"duplicate":     result.DuplicateEvent,
 		},
 	})
 }
@@ -103,6 +104,8 @@ func (h *WebhookHandler) parseEvent(channel string, raw []byte) (*service.Webhoo
 		return h.parseWeChat(raw)
 	case "alipay":
 		return h.parseAlipay(raw)
+	case "lemonsqueezy":
+		return h.parseLemonsqueezy(raw)
 	default:
 		return nil, fmt.Errorf("unsupported channel: %s", channel)
 	}
@@ -209,7 +212,7 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 		TransactionID: resource.TransactionID,
 		OrderID:       resource.OutTradeNo,
 		Amount:        float64(resource.Amount.Total) / 100, // fen → major units
-		Currency:      "CNY",                                 // WeChat is always CNY in v1
+		Currency:      "CNY",                                // WeChat is always CNY in v1
 	}
 	if resource.SubExpires != "" {
 		if t, err := time.Parse(time.RFC3339, resource.SubExpires); err == nil {
@@ -260,8 +263,9 @@ func localWeChatDecrypt(key, ciphertextB64, nonce, associatedData string) ([]byt
 }
 
 // parseAlipay reads the form-encoded body. Alipay sends:
-//   out_trade_no (order_id), trade_no (transaction_id), total_amount,
-//   refund_amount (if refund event), notify_id (event_id), notify_type (event_type).
+//
+//	out_trade_no (order_id), trade_no (transaction_id), total_amount,
+//	refund_amount (if refund event), notify_id (event_id), notify_type (event_type).
 func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) {
 	values, err := url.ParseQuery(string(raw))
 	if err != nil {
@@ -325,6 +329,98 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 func isAlipayRefundEvent(notifyType string) bool {
 	// Alipay event types: trade_status_sync (paid), trade_closed (closed/refunded).
 	return notifyType == "trade_closed"
+}
+
+// parseLemonsqueezy extracts fields from a LemonSqueezy JSON:API webhook.
+//
+// LS payloads carry no top-level unique event ID, so we synthesize one as
+// `<event_name>:<data.id>`. For subscription-invoice events (refunds, payment
+// success/failed) the resource is the invoice itself — `data.id` is the
+// invoice ID, not the subscription ID. Two distinct renewal invoices on the
+// same subscription thus dedupe independently, which is what we want.
+//
+//	{
+//	  "meta": { "event_name": "order_created", "custom_data": { "order_id": "<uuid>", "sub_expires_at": "..." } },
+//	  "data": { "type": "orders|subscriptions|subscription-invoices", "id": "1", "attributes": { "total": 2990, "currency": "usd", ... } }
+//	}
+//
+// custom_data is ABSENT on subscription-invoice events (per LS docs). For
+// those, the refund path looks up the payment by (channel, external_txn_id),
+// which we set to data.attributes.subscription_id (matches the originating
+// subscription_created payment row).
+func (h *WebhookHandler) parseLemonsqueezy(raw []byte) (*service.WebhookEvent, error) {
+	var evt struct {
+		Meta struct {
+			EventName  string                 `json:"event_name"`
+			CustomData map[string]interface{} `json:"custom_data"`
+		} `json:"meta"`
+		Data struct {
+			Type       string `json:"type"`
+			ID         string `json:"id"`
+			Attributes struct {
+				Total          json.Number `json:"total"`
+				RefundedAmount json.Number `json:"refunded_amount"`
+				Currency       string      `json:"currency"`
+				SubscriptionID string      `json:"subscription_id"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &evt); err != nil {
+		return nil, fmt.Errorf("lemonsqueezy body: %w", err)
+	}
+	if evt.Meta.EventName == "" || evt.Data.ID == "" {
+		return nil, fmt.Errorf("lemonsqueezy missing meta.event_name or data.id")
+	}
+
+	we := &service.WebhookEvent{
+		Channel:   "lemonsqueezy",
+		EventID:   evt.Meta.EventName + ":" + evt.Data.ID,
+		EventType: evt.Meta.EventName,
+	}
+
+	// external_txn_id mapping — invoice events use the parent subscription id
+	// (so the refund's lookup matches the originating subscription_created
+	// payment row); order/subscription events use the resource's own id.
+	if evt.Data.Type == "subscription-invoices" && evt.Data.Attributes.SubscriptionID != "" {
+		we.TransactionID = evt.Data.Attributes.SubscriptionID
+	} else {
+		we.TransactionID = evt.Data.ID
+	}
+
+	// custom_data absent on subscription-invoice events; that's fine.
+	if cd := evt.Meta.CustomData; cd != nil {
+		if v, ok := cd["order_id"].(string); ok {
+			we.OrderID = v
+		}
+		if v, ok := cd["sub_expires_at"].(string); ok {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				we.SubExpiresAt = &t
+			}
+		}
+	}
+
+	// LS amounts may be decimal cents (e.g. 1499.985). json.Number preserves
+	// precision; Round to 2dp before converting to float64 major units.
+	if evt.Data.Attributes.Total != "" {
+		if cents, err := evt.Data.Attributes.Total.Float64(); err == nil {
+			we.Amount = math.Round(cents) / 100
+		}
+	}
+	if evt.Data.Attributes.RefundedAmount != "" {
+		if cents, err := evt.Data.Attributes.RefundedAmount.Float64(); err == nil {
+			we.RefundAmount = math.Round(cents) / 100
+		}
+	}
+	we.Currency = strings.ToUpper(evt.Data.Attributes.Currency)
+
+	if isLSRefundEvent(evt.Meta.EventName) {
+		we.ExternalRefundID = "ls-" + evt.Data.ID
+	}
+	return we, nil
+}
+
+func isLSRefundEvent(eventName string) bool {
+	return eventName == "order_refunded" || eventName == "subscription_payment_refunded"
 }
 
 // wrapRawPayload produces a JSONB-safe representation of the raw webhook

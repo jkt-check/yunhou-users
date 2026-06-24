@@ -29,8 +29,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/lib/pq"
 	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
@@ -42,8 +42,9 @@ import (
 // Defined as constants so the matching helpers (signStripe, signWeChat) can
 // produce real signatures the verifier will accept.
 const (
-	e2eStripeSecret = "whsec_e2e_test_secret"
-	e2eWeChatKey    = "01234567890123456789012345678901" // 32 bytes
+	e2eStripeSecret       = "whsec_e2e_test_secret"
+	e2eWeChatKey          = "01234567890123456789012345678901" // 32 bytes
+	e2eLemonSqueezySecret = "ls_e2e_test_secret"
 	// Alipay uses RSA2 with a real key pair; generated in setupE2EServerWithVerifier.
 )
 
@@ -179,14 +180,14 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:               "0",
-		DatabaseURL:        envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:         privPath,
-		RSAPublic:          pubPath,
-		GitHubClientID:     "e2e-fake-client-id",
-		GitHubClientSecret: "e2e-fake-client-secret",
-		JWTAccessTTL:   15 * time.Minute,
-		JWTRefreshTTL: 168 * time.Hour,
+		Port:                "0",
+		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:          privPath,
+		RSAPublic:           pubPath,
+		GitHubClientID:      "e2e-fake-client-id",
+		GitHubClientSecret:  "e2e-fake-client-secret",
+		JWTAccessTTL:        15 * time.Minute,
+		JWTRefreshTTL:       168 * time.Hour,
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     1 * time.Minute,
 	}
@@ -362,6 +363,8 @@ type E2EServer struct {
 	// AlipayPublicKey is exposed so tests can verify they emit only
 	// payloads whose signature the verifier would accept.
 	AlipayPublicPEM []byte
+	// LemonSqueezySecret is the shared HMAC secret for signing test bodies.
+	LemonSqueezySecret string
 }
 
 // setupE2EServerWithVerifier returns a server wired with real signature
@@ -384,14 +387,14 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:               "0",
-		DatabaseURL:        envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:         privPath,
-		RSAPublic:          pubPath,
-		GitHubClientID:     "e2e-fake-client-id",
-		GitHubClientSecret: "e2e-fake-client-secret",
-		JWTAccessTTL:       15 * time.Minute,
-		JWTRefreshTTL:      168 * time.Hour,
+		Port:                "0",
+		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:          privPath,
+		RSAPublic:           pubPath,
+		GitHubClientID:      "e2e-fake-client-id",
+		GitHubClientSecret:  "e2e-fake-client-secret",
+		JWTAccessTTL:        15 * time.Minute,
+		JWTRefreshTTL:       168 * time.Hour,
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     1 * time.Minute,
 	}
@@ -431,9 +434,10 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	// and the verifier checks with the corresponding public key.
 	alipayPriv, alipayPubPEM := genAlipayRSAKeyPair(t)
 	mv := &middleware.MultiChannelVerifier{
-		Stripe: &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
-		WeChat: &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey)},
-		Alipay: &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
+		Stripe:       &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
+		WeChat:       &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey)},
+		Alipay:       &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
+		LemonSqueezy: &middleware.LemonsqueezyVerifier{Secret: []byte(e2eLemonSqueezySecret)},
 	}
 
 	gin.SetMode(gin.ReleaseMode)
@@ -450,11 +454,12 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	alipayPrivHolder.Store(alipayPriv)
 
 	return &E2EServer{
-		Engine:          engine,
-		DB:              db,
-		StripeSecret:    e2eStripeSecret,
-		WeChatKey:       []byte(e2eWeChatKey),
-		AlipayPublicPEM: alipayPubPEM,
+		Engine:             engine,
+		DB:                 db,
+		StripeSecret:       e2eStripeSecret,
+		WeChatKey:          []byte(e2eWeChatKey),
+		AlipayPublicPEM:    alipayPubPEM,
+		LemonSqueezySecret: e2eLemonSqueezySecret,
 	}
 }
 
@@ -512,7 +517,7 @@ func authHeader(token string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + token}
 }
 
-// --- Webhook signing helpers (Stripe / WeChat / Alipay) ---
+// --- Webhook signing helpers (Stripe / WeChat / Alipay / LemonSqueezy) ---
 
 // signStripe produces a Stripe-Signature header for body at unix ts.
 func signStripe(secret string, ts int64, body []byte) string {
@@ -520,6 +525,14 @@ func signStripe(secret string, ts int64, body []byte) string {
 	mac.Write([]byte(fmt.Sprintf("%d.", ts)))
 	mac.Write(body)
 	return fmt.Sprintf("t=%d,v1=%s", ts, hex.EncodeToString(mac.Sum(nil)))
+}
+
+// signLS produces the X-Signature header value: hex(hmac_sha256(secret, body)).
+// No timestamp — LS relies on event_id dedup, not a replay window.
+func signLS(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // signWeChat produces the four headers WeChat sends, given the body.

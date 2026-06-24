@@ -51,6 +51,76 @@ func goldenAlipayRefund(orderID, txnID, refundAmount string) string {
 	)
 }
 
+// goldenLSOrderCreated builds an `order_created` LemonSqueezy webhook body.
+// amountCents is in the LS convention (cents; 2990 = $29.90).
+func goldenLSOrderCreated(orderID, txnID string, amountCents int64) []byte {
+	body := map[string]any{
+		"meta": map[string]any{
+			"event_name": "order_created",
+			"custom_data": map[string]any{
+				"order_id": orderID,
+			},
+		},
+		"data": map[string]any{
+			"type": "orders",
+			"id":   txnID,
+			"attributes": map[string]any{
+				"total":    amountCents,
+				"currency": "usd",
+			},
+		},
+	}
+	b, _ := json.Marshal(body)
+	return b
+}
+
+// goldenLSSubscriptionCreated builds a `subscription_created` body with an
+// optional sub_expires_at (RFC3339). Empty string → no custom_data sub_expires_at.
+func goldenLSSubscriptionCreated(orderID, subID string, amountCents int64, subExpiresAt string) []byte {
+	customData := map[string]any{"order_id": orderID}
+	if subExpiresAt != "" {
+		customData["sub_expires_at"] = subExpiresAt
+	}
+	body := map[string]any{
+		"meta": map[string]any{
+			"event_name":  "subscription_created",
+			"custom_data": customData,
+		},
+		"data": map[string]any{
+			"type": "subscriptions",
+			"id":   subID,
+			"attributes": map[string]any{
+				"total":    amountCents,
+				"currency": "usd",
+			},
+		},
+	}
+	b, _ := json.Marshal(body)
+	return b
+}
+
+// goldenLSOrderRefunded builds an `order_refunded` body. refundAmountCents
+// is the partial-or-full refund amount; total stays at 2990 for assertion
+// convenience (matches the seed monthly plan price in testhelpers).
+func goldenLSOrderRefunded(orderID, txnID string, refundAmountCents int64) []byte {
+	body := map[string]any{
+		"meta": map[string]any{
+			"event_name": "order_refunded",
+		},
+		"data": map[string]any{
+			"type": "orders",
+			"id":   txnID,
+			"attributes": map[string]any{
+				"total":           2990,
+				"refunded_amount": refundAmountCents,
+				"currency":        "usd",
+			},
+		},
+	}
+	b, _ := json.Marshal(body)
+	return b
+}
+
 // goldenWeChatPaid generates an encrypted WeChat Pay v3 webhook payload.
 // Returns the raw JSON body (envelope + AES-256-GCM-encrypted resource).
 func goldenWeChatPaid(t *testing.T, orderID, txnID string, amountFen int64) []byte {
@@ -68,8 +138,8 @@ func goldenWeChatPaid(t *testing.T, orderID, txnID string, amountFen int64) []by
 	ciphertext, nonce, aad := encryptForWeChat(t, []byte(e2eWeChatKey), resourcePlaintext)
 
 	body := map[string]any{
-		"id":           "evt_e2e_wechat_" + orderID,
-		"create_time":  "2024-01-01T12:00:00+08:00",
+		"id":            "evt_e2e_wechat_" + orderID,
+		"create_time":   "2024-01-01T12:00:00+08:00",
 		"resource_type": "encrypt-resource",
 		"event_type":    "TRANSACTION.SUCCESS",
 		"summary":       "支付成功",
@@ -98,7 +168,9 @@ func TestWebhook_Stripe_PaymentSucceeded(t *testing.T) {
 		t.Fatalf("create: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -196,7 +268,9 @@ func TestWebhook_Stripe_DuplicateEvent(t *testing.T) {
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly"}`, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -265,7 +339,9 @@ func TestWebhook_Alipay_PaymentSucceeded(t *testing.T) {
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly"}`, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -310,7 +386,9 @@ func TestWebhook_Alipay_FullRefund(t *testing.T) {
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly"}`, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -371,7 +449,9 @@ func TestWebhook_WeChat_PaymentSucceeded(t *testing.T) {
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly"}`, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID

@@ -110,7 +110,7 @@ Payment channel transaction, one Order can have at most one successful Payment (
 |-----------------|---------------|--------------------------------------------------|
 | id              | uuid          | PK                                               |
 | order_id        | uuid          | FK → Order                                       |
-| channel         | text          | stripe / wechat_pay / alipay                     |
+| channel         | text          | stripe / wechat_pay / alipay / lemonsqueezy      |
 | external_txn_id | text          | channel's transaction ID; UNIQUE (channel, external_txn_id) |
 | amount          | decimal(10,2) | actual settled amount (may differ from order amount on partial capture) |
 | currency        | text          | NOT NULL; **source of truth at INSERT time** — webhook handler reads from the decrypted channel payload (with fallback to `orders.currency` if absent); confirm endpoint reads from `orders.currency` |
@@ -129,7 +129,7 @@ Per-event audit row. The webhook handler inserts here **before** any business ac
 | Field        | Type        | Notes                                            |
 |--------------|-------------|--------------------------------------------------|
 | id           | uuid        | PK                                               |
-| channel      | text        | stripe / wechat_pay / alipay                     |
+| channel      | text        | stripe / wechat_pay / alipay / lemonsqueezy      |
 | event_id     | text        | channel's event ID (Stripe `event.id`, WeChat `notify_id`, Alipay `notify_id`); UNIQUE (channel, event_id) |
 | event_type   | text        | channel's event type string (e.g. `payment_intent.succeeded`) |
 | received_at  | timestamp   | when we got the bytes                            |

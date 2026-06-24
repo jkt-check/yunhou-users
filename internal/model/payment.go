@@ -14,7 +14,7 @@ import (
 type Payment struct {
 	ID            string          `db:"id" json:"id"`
 	OrderID       string          `db:"order_id" json:"order_id"`
-	Channel       string          `db:"channel" json:"channel"` // stripe / wechat_pay / alipay
+	Channel       string          `db:"channel" json:"channel"` // stripe / wechat_pay / alipay / lemonsqueezy
 	ExternalTxnID string          `db:"external_txn_id" json:"external_txn_id"`
 	Amount        float64         `db:"amount" json:"amount"`     // major currency units
 	Currency      string          `db:"currency" json:"currency"` // ISO 4217

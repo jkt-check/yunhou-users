@@ -241,6 +241,28 @@ if err != nil { return 400 }
 - **Verify timestamp window** before the HMAC; reject replays cheaply.
 - **Per-channel secret** stored in env vars, loaded at startup. No hot-reload needed.
 
+### 4.5 LemonSqueezy
+
+LemonSqueezy is the only channel that does **not** include a timestamp in the body or headers — its signature scheme is a raw-body HMAC only.
+
+- Header: `X-Signature: <hex_hmac_sha256>`
+- Algorithm: `HMAC-SHA256` with `LEMONSQUEEZY_WEBHOOK_SECRET`
+- Signed payload: **raw request body** (no `t.` prefix, no timestamp)
+- Output: hex digest (lowercase, no prefix)
+
+**No replay window.** LS doesn't give us a timestamp to anchor a window. We rely on `webhook_events.UNIQUE(channel, event_id)` for replay protection (see §5.7) — that UNIQUE constraint catches the same event whether replayed 30 seconds or 30 days later. The 5-minute window used by Stripe/WeChat/Alipay is therefore an artifact of those channels' signature specs, not a baseline we must mirror.
+
+If we ever need to add a window (e.g. for compliance with a channel change), the only safe source would be `data.attributes.created_at` on the resource — but that's the resource-creation time, not the delivery time, so catch-up deliveries would falsely look stale. Don't add a window without confirming LS's stance on delivery timing.
+
+```go
+// internal/middleware/webhook_sig.go: ~LemonsqueezyVerifier
+mac := hmac.New(sha256.New, v.Secret)
+mac.Write(body) // raw body — DO NOT re-serialize
+if !hmac.Equal(expectedHex, mac.Sum(nil)) {
+    return ErrInvalidSignature
+}
+```
+
 ## 5. Idempotency
 
 A single payment event will arrive multiple times. Channels retry on non-2xx, network glitches, our own restart mid-processing, etc. We must dedupe at **two distinct layers**:
@@ -426,6 +448,27 @@ The state machines in §9 are intentionally strict. When the handler encounters 
 
 In particular: `failed → paid` is a transition the SQL guard disallows. Stripe does not send `.succeeded` after `.failed` / `.canceled` for the same PaymentIntent. If we observe this pattern, it's an attack (someone forged a webhook) or a channel bug. We log it via `audit_log` with action `unexpected_state_transition` and proceed.
 
+### 5.7 LemonSqueezy event-level dedup
+
+LemonSqueezy payloads **do not carry a top-level unique event ID** — the same subscription emits multiple events (`subscription_created`, `subscription_updated`, `subscription_payment_success`, etc.) and there's no field that uniquely identifies each delivery.
+
+To fit the `webhook_events.UNIQUE(channel, event_id)` invariant, the parser synthesizes an event_id:
+
+```
+<event_name>:<data.id>
+```
+
+For invoice events (`subscription_payment_*`), `data.id` is the **invoice** ID, not the subscription ID — this is intentional. Two distinct renewal invoices on the same subscription get distinct event_ids, so legitimate follow-on events dedupe independently instead of collapsing.
+
+| Event                                | Resource                  | Synthesized event_id                          |
+|--------------------------------------|---------------------------|-----------------------------------------------|
+| `order_created`                      | orders                    | `order_created:<LS order ID>`                 |
+| `subscription_created`               | subscriptions             | `subscription_created:<LS subscription ID>`   |
+| `order_refunded`                     | orders                    | `order_refunded:<LS order ID>`                |
+| `subscription_payment_refunded`      | subscription-invoices     | `subscription_payment_refunded:<invoice ID>`  |
+| `subscription_payment_failed`        | subscription-invoices     | `subscription_payment_failed:<invoice ID>`    |
+| `subscription_payment_success` etc.  | (varied)                  | `<event_name>:<data.id>`                      |
+
 ## 6. Retry semantics
 
 | Channel   | Retry policy                                                          |
@@ -482,6 +525,24 @@ legacy aliases — both are normalized to the same handler dispatch in
 what the actual channel sends: lowercase for current Alipay, uppercase
 for older docs / sample payloads.
 
+### LemonSqueezy
+
+LemonSqueezy sends JSON:API-shaped payloads with `meta.event_name` (also echoed in the `X-Event-Name` header) and the resource under `data.{type,id,attributes}`. Order/Subscription events carry a `meta.custom_data` block we use to receive the Yunhou order_id and the frontend-computed `sub_expires_at`. Subscription-Invoice events (`subscription_payment_*`) do NOT echo `custom_data` — refund lookup happens via `(channel, external_txn_id)` instead.
+
+| Event                                  | Action                                                                          |
+|----------------------------------------|---------------------------------------------------------------------------------|
+| `order_created`                        | payment → `paid`, order → `paid`, activate sub                                    |
+| `subscription_created`                 | payment → `paid`, order → `paid`, activate sub. **Paired with a same-day `order_created` event** (LS docs: *"An `order_created` event will always be sent alongside a `subscription_created` event"*). The first event to arrive inserts the payment row; the second collides on `UNIQUE(channel, external_txn_id)` and is absorbed by `ON CONFLICT DO NOTHING`. Two `webhook_events` rows + one `payments` row is the expected shape — audit-log readers must understand this is by design, not a duplicate. |
+| `order_refunded` (full)                | payment → `refunded`, subscription → `cancelled`. Refund row keyed on `data.id` (LS order ID) — matches the originating `order_created` payment row. |
+| `order_refunded` (partial)             | payment stays `paid`, no subscription change. New `refunds` row. |
+| `subscription_payment_refunded` (full) | payment → `refunded`, subscription → `cancelled`. Refund row keyed on `data.attributes.subscription_id` (LS subscription ID) — matches the originating `subscription_created` payment row. |
+| `subscription_payment_refunded` (partial) | payment stays `paid`, no subscription change. |
+| `subscription_payment_failed`          | **log to `webhook_events` only, no domain action.** Renewal-failure policy lives in the frontend. |
+| `subscription_payment_success`         | **log only, no domain action.** Yunhou never extends `expires_at` from a renewal event — that would require yunhou to implement renewal-window logic, which is product policy. The frontend mirrors renewals via `POST /payments/orders` + `/confirm` (or its own sweeper). |
+| `subscription_updated` / `subscription_cancelled` / `subscription_resumed` / `subscription_expired` / `subscription_paused` / `subscription_unpaused` / `customer_updated` / `license_key_*` / `affiliate_activated` | log to `webhook_events` only. The honor-payment policy on orders (already-paid honored even past `expires_at`) provides natural grace; cancelling subscriptions here would be a business-policy violation. |
+
+**Note on `data.attributes.ends_at`**: the Subscription object carries an `ends_at` field (LS's idea of when the subscription period ends). **Do NOT map this to `sub_expires_at`.** The frontend computes `sub_expires_at` from `plan.interval_days` plus business rules (rollover, grace, trial) and embeds it in `meta.custom_data.sub_expires_at` at LS checkout creation. Yunhou records what the frontend told it — never what LS thinks the subscription period should be. Mapping `ends_at` directly would lock yunhou-users into LS's notion of subscription period and prevent frontend business rules (e.g. "monthly = 30 days from activation, not from LS's period start").
+
 ### Refund → subscription semantics (primitive, v1)
 
 These rules describe the **data side effects** only. **Who triggers a refund, when it's allowed, how much can be refunded, and whether approval is needed** are all decided by the caller (frontend / admin tooling / payment-service) — not by us. We just provide the primitive operation; the caller composes business policy on top.
@@ -501,6 +562,7 @@ The `subscriptions.expires_at` value is a **frontend product decision** (rollove
 | Stripe webhook         | `data.object.metadata.sub_expires_at` (RFC3339 string). Omit → never expires.                                                              |
 | WeChat webhook         | Decrypted `resource.sub_expires_at` (RFC3339 string). Omit → never expires.                                                                |
 | Alipay webhook         | Form field `sub_expires_at` (RFC3339 string). Omit → never expires.                                                                         |
+| LemonSqueezy webhook   | `meta.custom_data.sub_expires_at` (RFC3339 string, set by frontend at LS checkout). Omit → never expires. ABSENT on `subscription_payment_*` events (refund path doesn't activate subscriptions, so it doesn't need it). |
 
 A malformed (unparseable) `sub_expires_at` is silently dropped to nil rather than failing the webhook — the activation proceeds with `expires_at = NULL` and the subscription never expires. This is a known loud-failure surface: a paid plan with `expires_at = NULL` should never ship; CI / staging tests must assert the field round-trips for monthly/quarterly/yearly plans.
 

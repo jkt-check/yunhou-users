@@ -22,6 +22,7 @@ createdb yunhou_users
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
+psql -d yunhou_users -f migrations/004_ls_channel.sql
 
 # 2. Generate RSA keys
 make generate-keys
@@ -52,6 +53,7 @@ All configuration is via environment variables (or `.env` file):
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM file path; empty = Alipay webhooks return 404 |
+| `LEMONSQUEEZY_WEBHOOK_SECRET` | No | (empty) | Empty = LemonSqueezy webhooks return 404 |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
 
@@ -130,6 +132,7 @@ Database migration:
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
+psql -d yunhou_users -f migrations/004_ls_channel.sql
 ```
 
 ## Tech Stack

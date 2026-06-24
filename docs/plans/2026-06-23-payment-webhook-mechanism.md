@@ -471,11 +471,12 @@ For invoice events (`subscription_payment_*`), `data.id` is the **invoice** ID, 
 
 ## 6. Retry semantics
 
-| Channel   | Retry policy                                                          |
-|-----------|-----------------------------------------------------------------------|
-| Stripe    | Up to 3 days, exponential backoff (~hours); can manually retry via dashboard |
-| WeChat    | Up to 4 retries over ~24h with backoff; if all fail, merchant must re-initiate |
-| Alipay    | Up to 24h with backoff; same notification URL reused                  |
+| Channel      | Retry policy                                                          |
+|--------------|-----------------------------------------------------------------------|
+| Stripe       | Up to 3 days, exponential backoff (~hours); can manually retry via dashboard |
+| WeChat       | Up to 4 retries over ~24h with backoff; if all fail, merchant must re-initiate |
+| Alipay       | Up to 24h with backoff; same notification URL reused                  |
+| LemonSqueezy | Up to 5 retries over ~24h with exponential backoff; same URL reused. Configurable per-store in the LS dashboard. |
 
 Implications for us:
 

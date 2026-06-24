@@ -29,9 +29,10 @@ type Config struct {
 	// at startup — if a channel's secret is empty, webhooks for that channel
 	// return 404 (signature verifier is nil for that channel). Operators
 	// who don't accept a particular channel can leave its secret blank.
-	StripeWebhookSecret string
-	WeChatAPIv3Key      string // 32 bytes, used for both signature + AES-GCM resource decrypt
-	AlipayPublicKeyPath string
+	StripeWebhookSecret       string
+	WeChatAPIv3Key            string // 32 bytes, used for both signature + AES-GCM resource decrypt
+	AlipayPublicKeyPath       string
+	LemonSqueezyWebhookSecret string
 
 	// Order expiry: how long a pending order is valid before the sweeper
 	// flips it to 'expired'. Default 30 min per design doc §"v1 decisions".
@@ -57,9 +58,10 @@ func Load() *Config {
 		JWTAccessTTL:  parseDurationOr(envOr("JWT_ACCESS_TTL", "15m"), 15*time.Minute),
 		JWTRefreshTTL: parseDurationOr(envOr("JWT_REFRESH_TTL", "168h"), 168*time.Hour),
 
-		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
-		WeChatAPIv3Key:      os.Getenv("WECHAT_PAY_API_V3_KEY"),
-		AlipayPublicKeyPath: os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
+		StripeWebhookSecret:       os.Getenv("STRIPE_WEBHOOK_SECRET"),
+		WeChatAPIv3Key:            os.Getenv("WECHAT_PAY_API_V3_KEY"),
+		AlipayPublicKeyPath:       os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
+		LemonSqueezyWebhookSecret: os.Getenv("LEMONSQUEEZY_WEBHOOK_SECRET"),
 
 		OrderExpiryDuration: parseDurationOr(envOr("ORDER_EXPIRY_DURATION", "30m"), 30*time.Minute),
 		SweeperInterval:     parseDurationOr(envOr("SWEEPER_INTERVAL", "1m"), 1*time.Minute),

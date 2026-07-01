@@ -486,7 +486,17 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 		we.ExternalSubscriptionID = evt.Resource.BillingAgreementID
 	}
 
-	if v, err := strconv.ParseFloat(evt.Resource.Amount.Value, 64); err == nil {
+	if isPaypalLifecycleEvent(evt.EventType) {
+		// BILLING.SUBSCRIPTION.CREATED / UPDATED / CANCELLED: PayPal does
+		// not include resource.amount in lifecycle events. Skip parsing;
+		// Amount = 0 is fine for these (no payment row is created).
+	} else if evt.Resource.Amount.Value == "" {
+		// For PAYMENT.* events, amount.value is mandatory; an empty value
+		// is malformed and would silently propagate as a paid $0 payment.
+		return nil, fmt.Errorf("paypal missing amount.value")
+	} else if v, err := strconv.ParseFloat(evt.Resource.Amount.Value, 64); err != nil {
+		return nil, fmt.Errorf("paypal amount.value %q: %w", evt.Resource.Amount.Value, err)
+	} else {
 		we.Amount = v
 	}
 
@@ -512,6 +522,12 @@ func isPaypalRefundEvent(eventType string) bool {
 // in service/payment.go because it's part of the OnWebhook dispatch table.
 func isPaypalSubscriptionEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "BILLING.SUBSCRIPTION.")
+}
+
+// isPaypalLifecycleEvent — PAYMENT.* events carry amount; BILLING.* events
+// do not. Use this to drive amount-parsing strictness in parsePaypal.
+func isPaypalLifecycleEvent(eventType string) bool {
+	return strings.HasPrefix(eventType, "BILLING.")
 }
 
 // wrapRawPayload produces a JSONB-safe representation of the raw webhook

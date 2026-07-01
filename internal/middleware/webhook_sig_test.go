@@ -659,6 +659,24 @@ func TestPaypalVerifier_VerifyEndpoint5xxIsTransient(t *testing.T) {
 	}
 }
 
+// TestPaypalVerifier_EmptyAPIBaseReturnsUnsupported covers the bug-1 fix:
+// previously a missing apiBase silently fell back to LIVE PayPal. Now it
+// returns ErrUnsupportedChannel so an operator notices via 404 instead of
+// accidentally routing sandbox events to production.
+func TestPaypalVerifier_EmptyAPIBaseReturnsUnsupported(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
+		SandboxWebhookID: "wbh_sbx",
+		Env:              "sandbox",
+		// SandboxAPIBase intentionally empty
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrUnsupportedChannel) {
+		t.Fatalf("want ErrUnsupportedChannel, got %v", err)
+	}
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================

@@ -728,3 +728,49 @@ func TestWebhookHandler_Paypal_ChannelUnknownToVerifier_404(t *testing.T) {
 		t.Errorf("status: got %d, want 200", rec.Code)
 	}
 }
+
+// TestWebhookHandler_Paypal_MalformedAmount_400 covers bug-8 fix: a
+// PAYMENT.* event with unparseable amount.value used to silently coerce to
+// 0. Now it returns a parse error → 400 (channel will not retry).
+func TestWebhookHandler_Paypal_MalformedAmount_400(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{}}
+	engine := webhookTestEngine(svc)
+	body := []byte(`{
+		"id": "WH-PP-7",
+		"event_type": "PAYMENT.CAPTURE.COMPLETED",
+		"resource": {
+			"id": "CAP-Y",
+			"custom_id": "order-y",
+			"amount": {"value": "not-a-number", "currency_code": "USD"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+	if svc.gotEvent != nil {
+		t.Errorf("OnWebhook should not be called when amount is malformed")
+	}
+}
+
+// TestWebhookHandler_Paypal_EmptyAmount_400 ensures we also reject the empty
+// value case (already malformed; treated as 400 not silent-coerce).
+func TestWebhookHandler_Paypal_EmptyAmount_400(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{}}
+	engine := webhookTestEngine(svc)
+	body := []byte(`{
+		"id": "WH-PP-8",
+		"event_type": "PAYMENT.CAPTURE.COMPLETED",
+		"resource": {
+			"id": "CAP-Z",
+			"custom_id": "order-z",
+			"amount": {"value": "", "currency_code": "USD"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+}

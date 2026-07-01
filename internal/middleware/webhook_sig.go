@@ -476,9 +476,11 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 		return ErrUnsupportedChannel
 	}
 	if apiBase == "" {
-		// Default to live if empty — matches the operational intent of
-		// the env. Sandbox must be explicit.
-		apiBase = "https://api-m.paypal.com"
+		// Misconfigured: Env says sandbox/live but the matching API base
+		// is unset. Rather than silently fall through to a hardcoded
+		// default (which used to default to LIVE, a footgun), treat as
+		// unsupported so the operator notices via 404.
+		return ErrUnsupportedChannel
 	}
 
 	payload, err := json.Marshal(map[string]any{

@@ -1064,6 +1064,35 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		return fmt.Errorf("find subscription by external sub id: %w", err)
 	}
 
+	// Dedupe BEFORE minting the synthetic order: if a payment row already
+	// exists for (channel, external_txn_id), this is a webhook retry. The
+	// event-level webhook_events.UNIQUE(channel, event_id) catch in OnWebhook
+	// handles the happy path; this catches the rare case where the event
+	// signature changed (e.g. PayPal rotates IDs) but the payment ID
+	// matched a prior delivery.
+	var existingPaymentID string
+	err = tx.QueryRowxContext(ctx, `
+		SELECT id FROM payments WHERE channel = $1 AND external_txn_id = $2 LIMIT 1
+	`, e.Channel, e.TransactionID).Scan(&existingPaymentID)
+	switch {
+	case err == nil:
+		// Already processed — skip the renew side-effects, audit-log only,
+		// ack 200. The webhook_events table earlier should have made this
+		// impossible, but if we got here it's a defensive guard.
+		return s.writeAudit(ctx, "service", "paypal_renewal_payment_already_exists",
+			fmt.Sprintf("event:%s", e.EventID),
+			[]string{"webhook", "paypal", "renewal", "duplicate"},
+			map[string]any{
+				"event_id":                 e.EventID,
+				"existing_payment_id":     existingPaymentID,
+				"external_subscription_id": e.ExternalSubscriptionID,
+			})
+	case errors.Is(err, sql.ErrNoRows):
+		// expected: this is a new renewal
+	default:
+		return fmt.Errorf("dedupe-check existing renewal payment: %w", err)
+	}
+
 	var orderID string
 	err = tx.QueryRowxContext(ctx, `
 		INSERT INTO orders (user_id, plan_id, amount, currency, status)
@@ -1090,12 +1119,30 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	}
 
 	if e.SubExpiresAt != nil {
-		if _, err := tx.ExecContext(ctx, `
+		// The sub may be cancelled/expired since activation; in that case
+		// we still INSERT the payment row (PayPal did charge) but we must
+		// NOT extend expires_at. We audit-log when the UPDATE didn't fire
+		// so operators see the "PayPal charging a sub our DB says is dead"
+		// mismatch.
+		res, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
 			SET expires_at = $1, updated_at = now()
 			WHERE id = $2 AND status = 'active'
-		`, *e.SubExpiresAt, sub.ID); err != nil {
+		`, *e.SubExpiresAt, sub.ID)
+		if err != nil {
 			return fmt.Errorf("extend expires_at on renewal: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 && sub.Status != "active" {
+			_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_sub_not_active",
+				fmt.Sprintf("subscription:%s", sub.ID),
+				[]string{"webhook", "paypal", "renewal", "sub_not_active"},
+				map[string]any{
+					"payment_id":               p.ID,
+					"order_id":                 orderID,
+					"external_subscription_id": e.ExternalSubscriptionID,
+					"sub_status":               sub.Status,
+				})
 		}
 	}
 

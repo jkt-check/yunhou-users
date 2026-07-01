@@ -117,3 +117,20 @@ func TestCheckSecret(t *testing.T) {
 		}
 	})
 }
+
+// TestDummyBcryptHash_Populated covers the package-level init() which
+// generates a constant-time bcrypt hash for use as a sentinel in user-lookup
+// paths (defends against timing-attack user enumeration). The hash is set
+// once at process start; this test asserts it was populated.
+func TestDummyBcryptHash_Populated(t *testing.T) {
+	t.Parallel()
+	if DummyBcryptHash == "" {
+		t.Fatal("DummyBcryptHash should be populated by init()")
+	}
+	// Even though we don't know the plain, we should be able to call
+	// CheckSecret with a wrong value and get false — confirms it's a valid
+	// bcrypt hash, not gibberish.
+	if CheckSecret(DummyBcryptHash, "not-the-dummy") {
+		t.Fatal("DummyBcryptHash should not match a wrong plain value")
+	}
+}

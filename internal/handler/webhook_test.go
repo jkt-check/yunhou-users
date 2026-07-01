@@ -3,6 +3,9 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -501,6 +504,95 @@ func TestWebhookHandler_WeChat_BadResourceJSON(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWebhookHandler_WeChat_Decryption_Success exercises parseWeChat happy
+// path: builds an AES-GCM-encrypted WeChat resource payload, sends it
+// through the handler, and asserts the parsed event reaches OnWebhook.
+//
+// This is the single test that exercises parseWeChat's body-parse + AES-GCM
+// decryption + nested-resource extraction in one go. Without it the entire
+// parseWeChat function (the only one we DON'T generate through the existing
+// LS/PayPal test paths) sits at low coverage.
+func TestWebhookHandler_WeChat_Decryption_Success(t *testing.T) {
+	t.Parallel()
+
+	// Build the inner resource (decrypted JSON) and encrypt it with the
+	// same 32-byte key + 12-byte nonce that webhookTestEngine uses.
+	innerJSON := []byte(`{
+		"transaction_id":"4200001234567890",
+		"out_trade_no":"order-uuid-wx-1",
+		"amount":{"total":9990,"refund":0},
+		"sub_expires_at":"2026-12-31T23:59:59Z"
+	}`)
+	key := []byte("01234567890123456789012345678901") // 32 bytes, matches webhookTestEngine
+	nonce := []byte("0123456789ab")                   // 12 bytes for GCM
+	associatedData := "order-id"
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	ciphertext := gcm.Seal(nil, nonce, innerJSON, []byte(associatedData))
+	ciphertextB64 := base64.StdEncoding.EncodeToString(ciphertext)
+
+	// Wrap in the WeChat outer envelope.
+	outer := []byte(`{
+		"id":"WH-WX-1",
+		"event_type":"TRANSACTION.SUCCESS",
+		"resource":{
+			"ciphertext":"` + ciphertextB64 + `",
+			"nonce":"` + string(nonce) + `",
+			"associated_data":"` + associatedData + `"
+		}
+	}`)
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+	rec := postRaw(engine, "/webhooks/payment/wechat_pay", outer)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotEvent == nil {
+		t.Fatal("OnWebhook was not called")
+	}
+	if svc.gotEvent.OrderID != "order-uuid-wx-1" {
+		t.Errorf("OrderID: got %q", svc.gotEvent.OrderID)
+	}
+	if svc.gotEvent.TransactionID != "4200001234567890" {
+		t.Errorf("TransactionID: got %q", svc.gotEvent.TransactionID)
+	}
+	if svc.gotEvent.Amount != 99.90 {
+		t.Errorf("Amount: got %v, want 99.90", svc.gotEvent.Amount)
+	}
+	if svc.gotEvent.SubExpiresAt == nil {
+		t.Error("SubExpiresAt should be populated")
+	}
+}
+
+// TestWebhookHandler_WeChat_BadNonceLength covers parseWeChat's nonce-mismatch
+// branch — localWeChatDecrypt rejects short/long nonces before even calling
+// gcm.Open (which would panic on wrong sizes).
+func TestWebhookHandler_WeChat_BadNonceLength(t *testing.T) {
+	t.Parallel()
+	// Use the real 32-byte key + wrong-size nonce.
+	ciphertextB64 := base64.StdEncoding.EncodeToString([]byte("not-really-cipher"))
+	outer := []byte(`{
+		"id":"WH-WX-2",
+		"event_type":"TRANSACTION.SUCCESS",
+		"resource":{"ciphertext":"` + ciphertextB64 + `","nonce":"short","associated_data":""}
+	}`)
+	svc := &mockWebhookSvc{}
+	engine := webhookTestEngine(svc)
+	rec := postRaw(engine, "/webhooks/payment/wechat_pay", outer)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", rec.Code)
 	}
 }
 

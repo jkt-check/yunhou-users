@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -677,3 +678,117 @@ func TestPaymentHandler_InternalError_500(t *testing.T) {
 var _ = time.Now
 var _ = mockPaymentSvc{}
 var _ = service.PaymentServiceInterface(nil)
+
+// ============================================================================
+// writePaymentError — drives every branch in the central error mapper by
+// invoking CreateRefund / CancelOrder / ConfirmOrder with the matching sentinels.
+// ============================================================================
+
+func TestWritePaymentError_Branches(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		svc         *mockPaymentSvc
+		method      string // GET / POST / PATCH
+		path        string
+		body        string
+		headers     map[string]string
+		wantStatus  int
+		wantMessage string
+	}{
+		// Confirms drive writePaymentError via createOrderErr + confirmErr
+		{"ConfirmOrder_ErrPlanNotFound_400",
+			&mockPaymentSvc{confirmErr: service.ErrPlanNotFound},
+			http.MethodPost, "/payments/orders/o-1/confirm",
+			`{"channel":"stripe","external_txn_id":"t-1"}`, nil,
+			http.StatusBadRequest, "plan not found"},
+		{"ConfirmOrder_ErrUserHasActiveSub_409",
+			&mockPaymentSvc{confirmErr: service.ErrUserHasActiveSub},
+			http.MethodPost, "/payments/orders/o-1/confirm",
+			`{"channel":"stripe","external_txn_id":"t-1"}`, nil,
+			http.StatusConflict, "already has an active"},
+		{"ConfirmOrder_ErrOrderAlreadyTerminal_409",
+			&mockPaymentSvc{confirmErr: service.ErrOrderAlreadyTerminal},
+			http.MethodPost, "/payments/orders/o-1/confirm",
+			`{"channel":"stripe","external_txn_id":"t-1"}`, nil,
+			http.StatusConflict, "terminal"},
+		{"ConfirmOrder_ErrOrderChannelMismatch_409",
+			&mockPaymentSvc{confirmErr: service.ErrOrderChannelMismatch},
+			http.MethodPost, "/payments/orders/o-1/confirm",
+			`{"channel":"paypal","external_txn_id":"t-1"}`, nil,
+			http.StatusConflict, "channel"},
+		{"ConfirmOrder_ErrMissingIdempotencyKey_400",
+			&mockPaymentSvc{confirmErr: service.ErrMissingIdempotencyKey},
+			http.MethodPost, "/payments/orders/o-1/confirm",
+			`{"channel":"stripe","external_txn_id":"t-1"}`, nil,
+			http.StatusBadRequest, "Idempotency-Key"},
+
+		// CancelOrder via cancelOrderErr
+		{"CancelOrder_ErrOrderNotFound_404",
+			&mockPaymentSvc{cancelOrderErr: service.ErrOrderNotFound},
+			http.MethodDelete, "/payments/orders/o-1", "", nil,
+			http.StatusNotFound, "not found"},
+		{"CancelOrder_ErrOrderNotPending_409",
+			&mockPaymentSvc{cancelOrderErr: service.ErrOrderNotPending},
+			http.MethodDelete, "/payments/orders/o-1", "", nil,
+			http.StatusConflict, "not in pending"},
+
+		// Refund branches (need Idempotency-Key header to pass entry guard)
+		{"CreateRefund_ErrRefundAmountInvalid_400",
+			&mockPaymentSvc{refundErr: service.ErrRefundAmountInvalid},
+			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":-1}`,
+			map[string]string{"Idempotency-Key": "test-key-12345"},
+			http.StatusBadRequest, "refund amount"},
+		{"CreateRefund_ErrRefundSumExceedsPayment_400",
+			&mockPaymentSvc{refundErr: service.ErrRefundSumExceedsPayment},
+			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			map[string]string{"Idempotency-Key": "test-key-12345"},
+			http.StatusBadRequest, "sum of refunds"},
+		{"CreateRefund_ErrRefundChannelFailed_502",
+			&mockPaymentSvc{refundErr: service.ErrRefundChannelFailed},
+			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			map[string]string{"Idempotency-Key": "test-key-12345"},
+			http.StatusBadGateway, "channel refund"},
+		{"CreateRefund_ErrPaymentNotFound_404",
+			&mockPaymentSvc{refundErr: service.ErrPaymentNotFound},
+			http.MethodPost, "/refunds", `{"payment_id":"missing","amount":1}`,
+			map[string]string{"Idempotency-Key": "test-key-12345"},
+			http.StatusNotFound, "not found"},
+		{"CreateRefund_ErrPaymentNotPaid_409",
+			&mockPaymentSvc{refundErr: service.ErrPaymentNotPaid},
+			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			map[string]string{"Idempotency-Key": "test-key-12345"},
+			http.StatusConflict, "not in paid"},
+		{"CreateRefund_unknown_500",
+			&mockPaymentSvc{refundErr: errors.New("db exploded")},
+			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			map[string]string{"Idempotency-Key": "test-key-12345"},
+			http.StatusInternalServerError, "internal"},
+
+		// GetRefund
+		{"GetRefund_ErrRefundNotFound_404",
+			&mockPaymentSvc{getRefundErr: service.ErrRefundNotFound},
+			http.MethodGet, "/refunds/r-1", "", nil,
+			http.StatusNotFound, "not found"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := paymentTestEngine(tc.svc, "user-1")
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}

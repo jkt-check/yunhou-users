@@ -211,6 +211,32 @@ func TestIsDisputeClosed(t *testing.T) {
 }
 
 // ============================================================================
+// isPaypalRenewal — handles PAYMENT.SALE.COMPLETED (subscription auto-renewal)
+// ============================================================================
+
+func TestIsPaypalRenewal(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		eventType string
+		want      bool
+	}{
+		{"PAYMENT.SALE.COMPLETED", true},
+		{"PAYMENT.CAPTURE.COMPLETED", false},
+		{"BILLING.SUBSCRIPTION.CREATED", false},
+		{"order_created", false}, // LS, not PayPal
+		{"", false},
+	}
+	for _, c := range cases {
+		t.Run(c.eventType, func(t *testing.T) {
+			t.Parallel()
+			if got := isPaypalRenewal(c.eventType); got != c.want {
+				t.Errorf("isPaypalRenewal(%q) = %v, want %v", c.eventType, got, c.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
 // toCents — full-vs-partial refund detection
 // ============================================================================
 

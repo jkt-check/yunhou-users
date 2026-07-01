@@ -1145,7 +1145,7 @@ func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx *sqlx.T
 
 func validateChannel(channel string) error {
 	switch channel {
-	case "stripe", "wechat_pay", "alipay", "lemonsqueezy":
+	case "stripe", "wechat_pay", "alipay", "lemonsqueezy", "paypal":
 		return nil
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidChannel, channel)
@@ -1158,7 +1158,8 @@ func isPaymentSuccess(eventType string) bool {
 	switch eventType {
 	case "payment_intent.succeeded", "TRANSACTION.SUCCESS",
 		"TRADE_SUCCESS", "trade_status_sync",
-		"order_created", "subscription_created":
+		"order_created", "subscription_created",
+		"PAYMENT.CAPTURE.COMPLETED", "BILLING.SUBSCRIPTION.CREATED":
 		return true
 	}
 	return false
@@ -1167,7 +1168,8 @@ func isPaymentSuccess(eventType string) bool {
 func isPaymentFailed(eventType string) bool {
 	switch eventType {
 	case "payment_intent.payment_failed", "payment_intent.canceled",
-		"TRANSACTION.PAY_FAILED", "TRANSACTION.REVOKED":
+		"TRANSACTION.PAY_FAILED", "TRANSACTION.REVOKED",
+		"PAYMENT.CAPTURE.DENIED", "PAYMENT.CAPTURE.FAILED":
 		return true
 	}
 	return false
@@ -1177,7 +1179,8 @@ func isRefundEvent(eventType string) bool {
 	switch eventType {
 	case "charge.refunded", "TRANSACTION.REFUND",
 		"TRADE_CLOSED", "trade_closed",
-		"order_refunded", "subscription_payment_refunded":
+		"order_refunded", "subscription_payment_refunded",
+		"PAYMENT.CAPTURE.REFUNDED":
 		return true
 	}
 	return false

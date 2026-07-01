@@ -68,7 +68,7 @@ func TestValidateChannel(t *testing.T) {
 		{"wechat_pay", false},
 		{"alipay", false},
 		{"lemonsqueezy", false},
-		{"paypal", true},
+		{"paypal", false},
 		{"", true},
 		{"STRIPE", true},    // case-sensitive
 		{" stripe ", true},  // whitespace

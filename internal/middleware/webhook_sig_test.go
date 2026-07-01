@@ -12,8 +12,11 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -477,6 +480,182 @@ func TestMultiChannelVerifier_PaypalFanOut(t *testing.T) {
 	mv2 := &MultiChannelVerifier{}
 	if err := mv2.VerifySignature("paypal", nil, nil); err != ErrUnsupportedChannel {
 		t.Errorf("unset paypal: got %v, want ErrUnsupportedChannel", err)
+	}
+}
+
+// ============================================================================
+// PaypalVerifier — HTTP verify-webhook-signature
+// ============================================================================
+
+// paypalHarness spins up an httptest server that mimics PayPal's
+// verify-webhook-signature endpoint. Tests configure the server's response
+// (record what arrived, return what the test wants PayPal to say).
+type paypalHarness struct {
+	server    *httptest.Server
+	seenBody  []byte
+	seenHeader http.Header
+}
+
+func newPaypalHarness(t *testing.T, respond func(h *paypalHarness, w http.ResponseWriter, r *http.Request)) *paypalHarness {
+	t.Helper()
+	h := &paypalHarness{}
+	h.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.seenHeader = r.Header.Clone()
+		b, _ := io.ReadAll(r.Body)
+		h.seenBody = b
+		respond(h, w, r)
+	}))
+	t.Cleanup(h.server.Close)
+	return h
+}
+
+func newHarnessVerifier(h *paypalHarness, env string) *PaypalVerifier {
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 2 * time.Second},
+		SandboxWebhookID: "wbh_sbx",
+		LiveWebhookID:    "wbh_live",
+		Env:              env,
+	}
+	v.SandboxAPIBase = h.server.URL
+	v.LiveAPIBase = h.server.URL
+	return v
+}
+
+func paypalHeaders(transmissionID, sig string) map[string]string {
+	return map[string]string{
+		"PAYPAL-AUTH-ALGO":         "SHA256withRSA",
+		"PAYPAL-CERT-URL":          "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-360caa42-fca2ab1b-7ce9e4e3-abc",
+		"PAYPAL-TRANSMISSION-ID":   transmissionID,
+		"PAYPAL-TRANSMISSION-SIG":  sig,
+		"PAYPAL-TRANSMISSION-TIME": "2026-06-30T12:00:00Z",
+	}
+}
+
+func TestPaypalVerifier_HappyPath(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		// Validate the verifier forwarded our headers + webhook_id.
+		var sent map[string]any
+		if err := json.Unmarshal(h.seenBody, &sent); err != nil {
+			t.Errorf("verify request not JSON: %v", err)
+		}
+		if sent["webhook_id"] != "wbh_sbx" {
+			t.Errorf("webhook_id: got %v, want wbh_sbx", sent["webhook_id"])
+		}
+		if sent["transmission_id"] != "tid-1" {
+			t.Errorf("transmission_id: got %v", sent["transmission_id"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"verification_status":"SUCCESS"}`)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+
+	body := []byte(`{"id":"WH-1","event_type":"PAYMENT.CAPTURE.COMPLETED"}`)
+	if err := v.VerifySignature("paypal", body, paypalHeaders("tid-1", "sig-1")); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_FailureMapsToInvalidSignature(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `{"verification_status":"FAILURE"}`)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("want ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_MalformedJSONResponseIsTransient(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `not json`)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("malformed response should NOT be 400-class, got %v", err)
+	}
+	if err == nil {
+		t.Fatalf("malformed response should error, got nil")
+	}
+}
+
+func TestPaypalVerifier_MissingHeaderIsInvalidSignature(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
+		SandboxWebhookID: "wbh_sbx",
+		SandboxAPIBase:   "http://127.0.0.1:1",
+		Env:              "sandbox",
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), map[string]string{
+		// PAYPAL-AUTH-ALGO missing on purpose
+		"PAYPAL-CERT-URL":          "x",
+		"PAYPAL-TRANSMISSION-ID":   "x",
+		"PAYPAL-TRANSMISSION-SIG":  "x",
+		"PAYPAL-TRANSMISSION-TIME": "x",
+	})
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("want ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_EnvSelectsLive(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		var sent map[string]any
+		_ = json.Unmarshal(h.seenBody, &sent)
+		if sent["webhook_id"] != "wbh_live" {
+			t.Errorf("env=live should forward wbh_live, got %v", sent["webhook_id"])
+		}
+		fmt.Fprintln(w, `{"verification_status":"SUCCESS"}`)
+	})
+	v := newHarnessVerifier(h, "live")
+	if err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1")); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_NoWebhookIDForActiveEnvIsUnsupported(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:     &http.Client{Timeout: 1 * time.Second},
+		SandboxAPIBase: "https://api-m.sandbox.paypal.com",
+		Env:            "sandbox",
+		// SandboxWebhookID intentionally empty
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrUnsupportedChannel) {
+		t.Fatalf("want ErrUnsupportedChannel, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_UnknownEnvIsUnsupported(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
+		SandboxWebhookID: "wbh",
+		SandboxAPIBase:   "https://api-m.sandbox.paypal.com",
+		Env:              "qa",
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrUnsupportedChannel) {
+		t.Fatalf("want ErrUnsupportedChannel, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_VerifyEndpoint5xxIsTransient(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal", http.StatusInternalServerError)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if err == nil || errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("5xx should be transient non-sentinel error, got %v", err)
 	}
 }
 

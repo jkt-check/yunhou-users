@@ -507,10 +507,9 @@ func isPaypalRefundEvent(eventType string) bool {
 	return eventType == "PAYMENT.CAPTURE.REFUNDED"
 }
 
-func isPaypalRenewal(eventType string) bool {
-	return eventType == "PAYMENT.SALE.COMPLETED"
-}
-
+// isPaypalSubscriptionEvent is local to the handler — it covers BILLING.SUBSCRIPTION.*
+// (created/updated/cancelled). The renewal predicate `isPaypalRenewal` lives
+// in service/payment.go because it's part of the OnWebhook dispatch table.
 func isPaypalSubscriptionEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "BILLING.SUBSCRIPTION.")
 }

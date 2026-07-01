@@ -624,6 +624,11 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 		if err := s.onPaymentSucceeded(ctx, e); err != nil {
 			return nil, err
 		}
+	case isPaypalRenewal(e.EventType):
+		domainAction = "payment_paid"
+		if err := s.onPaypalRenewalSucceeded(ctx, e); err != nil {
+			return nil, err
+		}
 	case isPaymentFailed(e.EventType):
 		domainAction = "payment_failed"
 		if err := s.onPaymentFailed(ctx, e); err != nil {
@@ -744,6 +749,25 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// row.
 	if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiresAtFromWebhook(e)); err != nil {
 		return fmt.Errorf("activate sub: %w", err)
+	}
+
+	// PayPal: stamp the PayPal subscription ID on the active row so renewal
+	// webhooks (PAYMENT.SALE.COMPLETED) can find the user's subscription
+	// via external_subscription_id. The partial UNIQUE index
+	// subs_external_sub_id makes re-runs a no-op, so retries are safe.
+	// Skipped silently when e.ExternalSubscriptionID is empty (one-time
+	// capture without a subscription context).
+	if e.ExternalSubscriptionID != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE subscriptions
+			SET external_subscription_id = $1
+			WHERE user_id = $2
+			  AND plan_id = $3
+			  AND status = 'active'
+			  AND external_subscription_id IS NULL
+		`, e.ExternalSubscriptionID, order.UserID, order.PlanID); err != nil {
+			return fmt.Errorf("set external_subscription_id: %w", err)
+		}
 	}
 
 	wasLate := order.Status == "expired"
@@ -996,6 +1020,101 @@ func (s *PaymentService) onDisputeClosed(ctx context.Context, e WebhookEvent) er
 	return nil
 }
 
+// onPaypalRenewalSucceeded handles PAYMENT.SALE.COMPLETED — the renewal
+// charge that PayPal fires automatically when a PayPal subscription
+// auto-renews. We don't have an `orders` row for renewals (the original
+// order was months ago); instead we mint a synthetic orders row keyed to
+// the renewal payment, INSERT the payments row, and extend
+// subscriptions.expires_at from resource.billing_info.next_billing_time.
+//
+// Refund of a renewal payment uses the same charge.refunded path on
+// Stripe / WeChat / Alipay; PayPal uses PAYMENT.SALE.REFUNDED. We
+// currently don't see renewal-refund events in scope — if/when PayPal
+// adds one, routing it to isRefundEvent + onRefundSucceeded will Just
+// Work because the channel=paypal + external_txn_id are populated the
+// same way.
+func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e WebhookEvent) error {
+	if e.ExternalSubscriptionID == "" {
+		return s.writeAudit(ctx, "service", "paypal_renewal_missing_external_sub_id",
+			fmt.Sprintf("event:%s", e.EventID),
+			[]string{"webhook", "paypal", "renewal", "missing_field"},
+			map[string]any{"event_id": e.EventID})
+	}
+
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin renewal tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var sub model.Subscription
+	err = tx.GetContext(ctx, &sub,
+		`SELECT * FROM subscriptions WHERE external_subscription_id = $1 LIMIT 1`,
+		e.ExternalSubscriptionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return s.writeAudit(ctx, "service", "paypal_renewal_unknown_subscription",
+				fmt.Sprintf("event:%s", e.EventID),
+				[]string{"webhook", "paypal", "renewal", "unknown_sub"},
+				map[string]any{
+					"event_id":                e.EventID,
+					"external_subscription_id": e.ExternalSubscriptionID,
+				})
+		}
+		return fmt.Errorf("find subscription by external sub id: %w", err)
+	}
+
+	var orderID string
+	err = tx.QueryRowxContext(ctx, `
+		INSERT INTO orders (user_id, plan_id, amount, currency, status)
+		VALUES ($1, $2, $3, $4, 'paid')
+		RETURNING id
+	`, sub.UserID, sub.PlanID, e.Amount, e.Currency).Scan(&orderID)
+	if err != nil {
+		return fmt.Errorf("insert synthetic renewal order: %w", err)
+	}
+
+	now := time.Now()
+	p := &model.Payment{
+		OrderID:       orderID,
+		Channel:       e.Channel,
+		ExternalTxnID: e.TransactionID,
+		Amount:        e.Amount,
+		Currency:      e.Currency,
+		Status:        "paid",
+		PaidAt:        &now,
+		RawPayload:    e.RawPayload,
+	}
+	if _, _, err := insertPaymentOnTx(ctx, tx, p); err != nil {
+		return fmt.Errorf("insert renewal payment: %w", err)
+	}
+
+	if e.SubExpiresAt != nil {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE subscriptions
+			SET expires_at = $1, updated_at = now()
+			WHERE id = $2 AND status = 'active'
+		`, *e.SubExpiresAt, sub.ID); err != nil {
+			return fmt.Errorf("extend expires_at on renewal: %w", err)
+		}
+	}
+
+	if err := writeAuditOnTx(ctx, tx, "service", "paypal_subscription_renewed",
+		fmt.Sprintf("subscription:%s", sub.ID),
+		[]string{"payment", "paypal", "renewal"},
+		map[string]any{
+			"payment_id":              p.ID,
+			"order_id":                orderID,
+			"external_subscription_id": e.ExternalSubscriptionID,
+			"amount":                  e.Amount,
+			"currency":                e.Currency,
+		}); err != nil {
+		return fmt.Errorf("audit renewal: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 // ============================================================================
 // Internal helpers — transaction-scoped SQL for cross-repo atomicity.
 // ============================================================================
@@ -1192,6 +1311,14 @@ func isDisputeCreated(eventType string) bool {
 
 func isDisputeClosed(eventType string) bool {
 	return eventType == "charge.dispute.closed"
+}
+
+// isPaypalRenewal — handler-implementation detail lifted here because the
+// OnWebhook dispatch table is in service. PAYMENT.SALE.COMPLETED is the
+// auto-renewal charge PayPal fires when a subscription's billing period
+// completes.
+func isPaypalRenewal(eventType string) bool {
+	return eventType == "PAYMENT.SALE.COMPLETED"
 }
 
 // subExpiresAtFromWebhook forwards the webhook payload's expires_at to the

@@ -1047,6 +1047,17 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	}
 	defer tx.Rollback() //nolint:errcheck
 
+	// Advisory xact lock on (channel, external_txn_id) so two concurrent
+	// deliveries of the same PAYMENT.SALE.COMPLETED can't both pass the
+	// dedup SELECT and each mint a fresh synthetic order row. The lock
+	// auto-releases on COMMIT/ROLLBACK — no manual unlock needed.
+	// hashtext converts the 2-tuple into a single int8 key.
+	if _, err := tx.ExecContext(ctx, `
+		SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2))
+	`, e.Channel, e.TransactionID); err != nil {
+		return fmt.Errorf("acquire renewal lock: %w", err)
+	}
+
 	var sub model.Subscription
 	err = tx.GetContext(ctx, &sub,
 		`SELECT * FROM subscriptions WHERE external_subscription_id = $1 LIMIT 1`,

@@ -950,3 +950,29 @@ func TestWebhookHandler_Paypal_EmptyAmount_400(t *testing.T) {
 		t.Errorf("status: got %d, want 400", rec.Code)
 	}
 }
+
+// TestWebhookHandler_Paypal_MissingResourceID_400 covers the bug-find from
+// the second code-review pass. Without this guard, an empty resource.id
+// silently produces TransactionID=""/ExternalSubscriptionID="" and
+// (channel="paypal", external_txn_id="") collisions on the
+// payments.external_txn_id UNIQUE.
+func TestWebhookHandler_Paypal_MissingResourceID_400(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{}}
+	engine := webhookTestEngine(svc)
+	body := []byte(`{
+		"id": "WH-PP-9",
+		"event_type": "PAYMENT.CAPTURE.COMPLETED",
+		"resource": {
+			"custom_id": "order-x",
+			"amount": {"value": "1.00", "currency_code": "USD"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+	if svc.gotEvent != nil {
+		t.Errorf("OnWebhook should not be called when resource.id is empty")
+	}
+}

@@ -467,6 +467,13 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 	if evt.Resource.CustomID == "" {
 		return nil, fmt.Errorf("paypal missing resource.custom_id")
 	}
+	if evt.Resource.ID == "" {
+		// resource.id is the channel-side transaction/subscription ID. An
+		// empty value would store ExternalSubscriptionID="" or TransactionID="",
+		// and the payments.external_txn_id UNIQUE constraint would then dedup
+		// every malformed event onto one row.
+		return nil, fmt.Errorf("paypal missing resource.id")
+	}
 
 	we := &service.WebhookEvent{
 		Channel:       "paypal",

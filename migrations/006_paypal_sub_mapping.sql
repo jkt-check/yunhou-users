@@ -4,7 +4,7 @@
 
 BEGIN;
 
-ALTER TABLE subscriptions ADD COLUMN external_subscription_id TEXT;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS external_subscription_id TEXT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_external_sub_id
     ON subscriptions (external_subscription_id)

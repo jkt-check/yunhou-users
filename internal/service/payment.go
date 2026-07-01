@@ -556,6 +556,7 @@ type WebhookEvent struct {
 	Currency       string     // ISO 4217
 	RefundAmount   float64    // for refund events
 	ExternalRefundID string   // channel's refund ID
+	ExternalSubscriptionID string // PayPal: subscription ID (`I-...`) — used by renewal branch to find the active sub
 	SubExpiresAt *time.Time // subscription expiry at activation. MUST be supplied by the
 		// caller (e.g. an explicit channel metadata field) — yunhou-users
 		// MUST NOT compute it from plan.interval_days; that calculation is

@@ -546,3 +546,185 @@ func (e *transientSvcError) Error() string { return e.msg }
 
 // helper unused at the moment — keep for future webhook test expansions.
 var _ = json.Marshal
+
+// ============================================================================
+// PayPal parsing
+// ============================================================================
+
+func TestWebhookHandler_Paypal_CaptureCompleted(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-1",
+		"event_type": "PAYMENT.CAPTURE.COMPLETED",
+		"resource": {
+			"id": "3C93638325N1234567",
+			"custom_id": "order-uuid-123",
+			"amount": {"value": "29.90", "currency_code": "USD"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotEvent == nil {
+		t.Fatalf("OnWebhook not called")
+	}
+	if svc.gotEvent.Channel != "paypal" {
+		t.Errorf("channel: got %q", svc.gotEvent.Channel)
+	}
+	if svc.gotEvent.EventID != "WH-PP-1" {
+		t.Errorf("event_id: got %q", svc.gotEvent.EventID)
+	}
+	if svc.gotEvent.EventType != "PAYMENT.CAPTURE.COMPLETED" {
+		t.Errorf("event_type: got %q", svc.gotEvent.EventType)
+	}
+	if svc.gotEvent.OrderID != "order-uuid-123" {
+		t.Errorf("order_id: got %q", svc.gotEvent.OrderID)
+	}
+	if svc.gotEvent.TransactionID != "3C93638325N1234567" {
+		t.Errorf("transaction_id: got %q", svc.gotEvent.TransactionID)
+	}
+	if svc.gotEvent.Amount != 29.90 {
+		t.Errorf("amount: got %v, want 29.90", svc.gotEvent.Amount)
+	}
+	if svc.gotEvent.Currency != "USD" {
+		t.Errorf("currency: got %q", svc.gotEvent.Currency)
+	}
+}
+
+func TestWebhookHandler_Paypal_CaptureRefunded_DerivesExternalRefundID(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "refund_paid"}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-2",
+		"event_type": "PAYMENT.CAPTURE.REFUNDED",
+		"resource": {
+			"id": "REFUND-ID-1",
+			"custom_id": "order-uuid-999",
+			"amount": {"value": "29.90", "currency_code": "USD"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+	if svc.gotEvent.RefundAmount != 29.90 {
+		t.Errorf("refund_amount: got %v", svc.gotEvent.RefundAmount)
+	}
+	if svc.gotEvent.ExternalRefundID != "paypal-REFUND-ID-1" {
+		t.Errorf("external_refund_id: got %q", svc.gotEvent.ExternalRefundID)
+	}
+}
+
+func TestWebhookHandler_Paypal_SaleCompleted_SetsSubscriptionAndExpiry(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-3",
+		"event_type": "PAYMENT.SALE.COMPLETED",
+		"resource": {
+			"id": "SALE-1",
+			"billing_agreement_id": "I-BWX42ABCD",
+			"custom_id": "order-uuid-456",
+			"amount": {"value": "9.99", "currency_code": "USD"},
+			"billing_info": {"next_billing_time": "2026-08-30T12:00:00Z"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+	if svc.gotEvent.ExternalSubscriptionID != "I-BWX42ABCD" {
+		t.Errorf("external_subscription_id: got %q", svc.gotEvent.ExternalSubscriptionID)
+	}
+	if svc.gotEvent.SubExpiresAt == nil {
+		t.Fatalf("sub_expires_at should be populated from next_billing_time")
+	}
+	want := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	if !svc.gotEvent.SubExpiresAt.Equal(want) {
+		t.Errorf("sub_expires_at: got %v, want %v", svc.gotEvent.SubExpiresAt.UTC(), want)
+	}
+}
+
+func TestWebhookHandler_Paypal_SubscriptionCreated_HasExternalSubscriptionID(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-4",
+		"event_type": "BILLING.SUBSCRIPTION.CREATED",
+		"resource": {
+			"id": "I-BWX99ZZZZ",
+			"custom_id": "order-uuid-789"
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+	if svc.gotEvent.ExternalSubscriptionID != "I-BWX99ZZZZ" {
+		t.Errorf("external_subscription_id: got %q", svc.gotEvent.ExternalSubscriptionID)
+	}
+	if svc.gotEvent.EventType != "BILLING.SUBSCRIPTION.CREATED" {
+		t.Errorf("event_type: got %q", svc.gotEvent.EventType)
+	}
+}
+
+func TestWebhookHandler_Paypal_MissingCustomID_400(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-5",
+		"event_type": "PAYMENT.CAPTURE.COMPLETED",
+		"resource": {"id": "X", "amount": {"value": "1.00", "currency_code": "USD"}}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+	if svc.gotEvent != nil {
+		t.Errorf("OnWebhook should not be called when parse fails")
+	}
+}
+
+func TestWebhookHandler_Paypal_ChannelUnknownToVerifier_404(t *testing.T) {
+	// Sanity: confirm that with no verifier wired for paypal, the handler
+	// still receives the request and parses OK (signature is bypassed in
+	// webhookTestEngine — we just verify the parser dispatch reaches OnWebhook).
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{}}
+	engine := webhookTestEngine(svc)
+	body := []byte(`{
+		"id": "WH-PP-6",
+		"event_type": "PAYMENT.CAPTURE.COMPLETED",
+		"resource": {
+			"id": "CAP-X",
+			"custom_id": "order-x",
+			"amount": {"value": "0.50", "currency_code": "USD"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+}

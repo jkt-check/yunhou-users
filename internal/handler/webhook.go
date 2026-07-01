@@ -106,6 +106,8 @@ func (h *WebhookHandler) parseEvent(channel string, raw []byte) (*service.Webhoo
 		return h.parseAlipay(raw)
 	case "lemonsqueezy":
 		return h.parseLemonsqueezy(raw)
+	case "paypal":
+		return h.parsePaypal(raw)
 	default:
 		return nil, fmt.Errorf("unsupported channel: %s", channel)
 	}
@@ -421,6 +423,96 @@ func (h *WebhookHandler) parseLemonsqueezy(raw []byte) (*service.WebhookEvent, e
 
 func isLSRefundEvent(eventName string) bool {
 	return eventName == "order_refunded" || eventName == "subscription_payment_refunded"
+}
+
+// parsePaypal extracts fields from a PayPal webhook. PayPal's webhook event
+// shape is:
+//
+//	{
+//	  "id":         "WH-...",
+//	  "event_type": "PAYMENT.CAPTURE.COMPLETED" | ...,
+//	  "resource":   { "id": "...", "custom_id": "<our order uuid>",
+//	                  "amount": { "value": "29.90", "currency_code": "USD" },
+//	                  "billing_agreement_id": "I-..." (subscription events),
+//	                  "billing_info": { "next_billing_time": "..." } (renewal only) }
+//	}
+//
+// Order binding uses resource.custom_id, which the frontend sets to our
+// order UUID at PayPal Order / Subscription creation time. Subscription and
+// renewal events also carry resource.billing_agreement_id — we map that to
+// WebhookEvent.ExternalSubscriptionID for the renewal branch.
+func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) {
+	var evt struct {
+		ID        string `json:"id"`
+		EventType string `json:"event_type"`
+		Resource  struct {
+			ID                 string `json:"id"`
+			CustomID           string `json:"custom_id"`
+			BillingAgreementID string `json:"billing_agreement_id"`
+			Amount             struct {
+				Value        string `json:"value"`
+				CurrencyCode string `json:"currency_code"`
+			} `json:"amount"`
+			BillingInfo *struct {
+				NextBillingTime string `json:"next_billing_time"`
+			} `json:"billing_info"`
+		} `json:"resource"`
+	}
+	if err := json.Unmarshal(raw, &evt); err != nil {
+		return nil, fmt.Errorf("paypal body: %w", err)
+	}
+	if evt.ID == "" || evt.EventType == "" {
+		return nil, fmt.Errorf("paypal missing id or event_type")
+	}
+	if evt.Resource.CustomID == "" {
+		return nil, fmt.Errorf("paypal missing resource.custom_id")
+	}
+
+	we := &service.WebhookEvent{
+		Channel:       "paypal",
+		EventID:       evt.ID,
+		EventType:     evt.EventType,
+		OrderID:       evt.Resource.CustomID,
+		TransactionID: evt.Resource.ID,
+		Currency:      strings.ToUpper(evt.Resource.Amount.CurrencyCode),
+	}
+
+	// Subscription events: BILLING.SUBSCRIPTION.* events have their `id` AS
+	// the subscription ID (`I-...`). Renewal events (PAYMENT.SALE.*) have
+	// it under `billing_agreement_id`. So we pick whichever is present.
+	if isPaypalSubscriptionEvent(evt.EventType) {
+		we.ExternalSubscriptionID = evt.Resource.ID
+	} else if evt.Resource.BillingAgreementID != "" {
+		we.ExternalSubscriptionID = evt.Resource.BillingAgreementID
+	}
+
+	if v, err := strconv.ParseFloat(evt.Resource.Amount.Value, 64); err == nil {
+		we.Amount = v
+	}
+
+	if evt.Resource.BillingInfo != nil && evt.Resource.BillingInfo.NextBillingTime != "" {
+		if t, err := time.Parse(time.RFC3339, evt.Resource.BillingInfo.NextBillingTime); err == nil {
+			we.SubExpiresAt = &t
+		}
+	}
+
+	if isPaypalRefundEvent(evt.EventType) {
+		we.RefundAmount = we.Amount
+		we.ExternalRefundID = "paypal-" + evt.Resource.ID
+	}
+	return we, nil
+}
+
+func isPaypalRefundEvent(eventType string) bool {
+	return eventType == "PAYMENT.CAPTURE.REFUNDED"
+}
+
+func isPaypalRenewal(eventType string) bool {
+	return eventType == "PAYMENT.SALE.COMPLETED"
+}
+
+func isPaypalSubscriptionEvent(eventType string) bool {
+	return strings.HasPrefix(eventType, "BILLING.SUBSCRIPTION.")
 }
 
 // wrapRawPayload produces a JSONB-safe representation of the raw webhook

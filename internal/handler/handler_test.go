@@ -348,6 +348,19 @@ func TestPlanHandler_ListPlans(t *testing.T) {
 			t.Errorf("expected 200, got %d", w.Code)
 		}
 	})
+
+	t.Run("empty plan list → 200 with empty array", func(t *testing.T) {
+		planSvc := &mockPlanSvc{plans: nil}
+		handler := NewPlanHandler(planSvc)
+		router := gin.New()
+		router.GET("/admin/plans", handler.ListPlans)
+		req := httptest.NewRequest(http.MethodGet, "/admin/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
 }
 
 func TestPlanHandler_CreatePlan(t *testing.T) {
@@ -509,6 +522,19 @@ func TestSubscriptionHandler_ListUserSubscriptions(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
+
+	t.Run("missing auth → 401", func(t *testing.T) {
+		subSvc := &mockSubSvc{}
+		handler := NewSubscriptionHandler(subSvc)
+		router := gin.New()
+		router.GET("/user/subscriptions", handler.ListUserSubscriptions)
+		req := httptest.NewRequest(http.MethodGet, "/user/subscriptions", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", w.Code)
 		}
 	})
 }

@@ -225,6 +225,31 @@ func TestPaymentHandler_CancelOrder(t *testing.T) {
 		}
 	})
 
+	t.Run("missing auth → 401", func(t *testing.T) {
+		t.Parallel()
+		gin.SetMode(gin.TestMode)
+		svc := &mockPaymentSvc{}
+		h := NewPaymentHandler(svc)
+		engine := gin.New()
+		engine.DELETE("/payments/orders/:id", h.CancelOrder)
+		req := httptest.NewRequest(http.MethodDelete, "/payments/orders/o-1", nil)
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("missing auth: got %d, want 401", rec.Code)
+		}
+	})
+
+	t.Run("internal error → 500", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{cancelOrderErr: errors.New("db exploded")}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodDelete, "/payments/orders/o-1", nil)
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("internal error: got %d, want 500", rec.Code)
+		}
+	})
+
 	t.Run("not pending → 409", func(t *testing.T) {
 		t.Parallel()
 		svc := &mockPaymentSvc{cancelOrderErr: service.ErrOrderNotPending}

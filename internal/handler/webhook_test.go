@@ -252,6 +252,46 @@ func TestWebhookHandler_Alipay_Success(t *testing.T) {
 	}
 }
 
+// TestWebhookHandler_Alipay_WithSubExpires covers the sub_expires_at
+// RFC3339 parse path in parseAlipay.
+func TestWebhookHandler_Alipay_WithSubExpires(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{}}
+	engine := webhookTestEngine(svc)
+	body := []byte("out_trade_no=order-x&trade_no=t-1&total_amount=9.99&notify_id=n-9&notify_type=trade_status_sync&sub_expires_at=2026-12-31T23:59:59Z&sign=xx")
+	rec := postRaw(engine, "/webhooks/payment/alipay", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if svc.gotEvent.SubExpiresAt == nil {
+		t.Errorf("SubExpiresAt should be populated")
+	}
+}
+
+// TestWebhookHandler_Alipay_MissingNotifyID covers the validation branch.
+func TestWebhookHandler_Alipay_MissingNotifyID(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{}
+	engine := webhookTestEngine(svc)
+	body := []byte("out_trade_no=order-x&trade_no=t-1&total_amount=9.99&notify_type=trade_status_sync&sign=xx")
+	rec := postRaw(engine, "/webhooks/payment/alipay", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400 (no notify_id)", rec.Code)
+	}
+}
+
+// TestWebhookHandler_Alipay_BadTotalAmount covers the strconv error path.
+func TestWebhookHandler_Alipay_BadTotalAmount(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{}
+	engine := webhookTestEngine(svc)
+	body := []byte("out_trade_no=order-x&trade_no=t-1&total_amount=notanumber&notify_id=n-1&notify_type=trade_status_sync&sign=xx")
+	rec := postRaw(engine, "/webhooks/payment/alipay", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+}
+
 func TestWebhookHandler_Alipay_RefundEvent_DerivesExternalRefundID(t *testing.T) {
 	t.Parallel()
 
@@ -593,6 +633,50 @@ func TestWebhookHandler_WeChat_BadNonceLength(t *testing.T) {
 	rec := postRaw(engine, "/webhooks/payment/wechat_pay", outer)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+}
+
+// TestWebhookHandler_WeChat_LocalDecryptPath exercises the localWeChatDecrypt
+// fallback used when the verifier is NOT a *middleware.WeChatPayV3Verifier.
+// Without this test the in-package fallback is 0% covered.
+func TestWebhookHandler_WeChat_LocalDecryptPath(t *testing.T) {
+	t.Parallel()
+	// Build the inner resource and encrypt with the production key.
+	innerJSON := []byte(`{"transaction_id":"tx-x","out_trade_no":"order-x","amount":{"total":100,"refund":0}}`)
+	key := []byte("01234567890123456789012345678901") // 32 bytes
+	nonce := []byte("0123456789ab")                   // 12 bytes
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := gcm.Seal(nil, nonce, innerJSON, nil)
+	ciphertextB64 := base64.StdEncoding.EncodeToString(ct)
+	outer := []byte(`{
+		"id":"WH-WX-3",
+		"event_type":"TRANSACTION.SUCCESS",
+		"resource":{"ciphertext":"` + ciphertextB64 + `","nonce":"` + string(nonce) + `","associated_data":""}
+	}`)
+
+	// Construct a WebhookHandler with wechatKey set but verifier type that
+	// is NOT *middleware.WeChatPayV3Verifier (use middleware.LemonSqueezyVerifier
+	// to force the fallback).
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	h := NewWebhookHandler(svc, key, &middleware.LemonsqueezyVerifier{Secret: []byte("x")})
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.POST("/webhooks/payment/:channel", h.Handle)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/payment/wechat_pay", bytes.NewReader(outer))
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotEvent == nil || svc.gotEvent.OrderID != "order-x" {
+		t.Errorf("localWeChatDecrypt fallback did not populate event: %+v", svc.gotEvent)
 	}
 }
 

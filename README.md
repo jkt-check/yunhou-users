@@ -23,6 +23,8 @@ psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
 psql -d yunhou_users -f migrations/004_ls_channel.sql
+psql -d yunhou_users -f migrations/005_paypal_channel.sql
+psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
 
 # 2. Generate RSA keys
 make generate-keys
@@ -138,6 +140,8 @@ psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
 psql -d yunhou_users -f migrations/004_ls_channel.sql
+psql -d yunhou_users -f migrations/005_paypal_channel.sql
+psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
 ```
 
 ## Tech Stack

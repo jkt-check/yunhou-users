@@ -311,6 +311,7 @@ Every retry of the same logical event must produce no extra work. We achieve thi
 | Stripe  | `event.id` (e.g. `evt_xxx`)  | Identical across retries of the same event                             |
 | WeChat  | `notify_id`                  | **Per-event, stable across WeChat's own retries.** Different from `transaction_id`, which is per-payment (see §5.2). |
 | Alipay  | `notify_id`                  | Stable per event; sent as a top-level form param                       |
+| PayPal  | `id` (e.g. `WH-xxx`)        | Top-level event ID; PayPal guarantees stable across retries. The LemonSqueezy path is the **only** channel that lacks a top-level event id and needs §5.7's special handling. |
 
 **Schema**:
 
@@ -338,6 +339,7 @@ Once we've decided to process the event, we need to find or create the `payments
 | Stripe  | `payment_intent.id` (e.g. `pi_xxx`)            | Multiple events per PaymentIntent (succeeded / refunded / dispute) — all link to the same row |
 | WeChat  | `transaction_id`                               | Read from inside the AES-256-GCM decrypted `resource` block, NOT the top-level body    |
 | Alipay  | `trade_no`                                     | Top-level form param; equivalent to Stripe's PaymentIntent ID                          |
+| PayPal  | `resource.id` (capture / sale / subscription)  | For `PAYMENT.CAPTURE.*` events this is the capture ID; for `BILLING.SUBSCRIPTION.*` it is the subscription ID; for `PAYMENT.SALE.*` (renewal) `service/onPaypalRenewalSucceeded` mints a synthetic orders row so the payment maps to a real row. |
 
 **Schema constraint**: `UNIQUE (channel, external_txn_id)` on `payments`. The handler does:
 
@@ -580,6 +582,21 @@ LemonSqueezy sends JSON:API-shaped payloads with `meta.event_name` (also echoed 
 
 **Note on `data.attributes.ends_at`**: the Subscription object carries an `ends_at` field (LS's idea of when the subscription period ends). **Do NOT map this to `sub_expires_at`.** The frontend computes `sub_expires_at` from `plan.interval_days` plus business rules (rollover, grace, trial) and embeds it in `meta.custom_data.sub_expires_at` at LS checkout creation. Yunhou records what the frontend told it — never what LS thinks the subscription period should be. Mapping `ends_at` directly would lock yunhou-users into LS's notion of subscription period and prevent frontend business rules (e.g. "monthly = 30 days from activation, not from LS's period start").
 
+### PayPal
+
+PayPal sends JSON payloads with a top-level `id` (event id, `WH-...`), `event_type`, and a `resource` block. Order binding uses `resource.custom_id`, which the frontend sets to the Yunhou order UUID at PayPal Order / Subscription creation time. Subscription lifecycle and renewal events also carry `resource.billing_agreement_id` (or, for `BILLING.SUBSCRIPTION.CREATED`, `resource.id` itself is the `I-...` subscription id), which the renewal branch uses to look up the active subscription row.
+
+| Event                              | Action                                                                                                                                      |
+|------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `PAYMENT.CAPTURE.COMPLETED`        | payment → `paid`, order → `paid`, activate sub. Same path as Confirm.                                                                       |
+| `PAYMENT.CAPTURE.REFUNDED`        | Falls into the refund branch (`service.isRefundEvent` matches). Full/partial logic identical to Stripe/WeChat/Alipay refund path.       |
+| `PAYMENT.CAPTURE.DENIED` / `.FAILED` | `isPaymentFailed` predicate → `onPaymentFailed`.                                                                                          |
+| `BILLING.SUBSCRIPTION.CREATED`     | `isPaymentSuccess` predicate → `onPaymentSucceeded`. The active subscription row is stamped with `external_subscription_id = resource.id` (non-overwriting on retry thanks to the partial UNIQUE index). |
+| `BILLING.SUBSCRIPTION.UPDATED` / `.CANCELLED` | Acknowledge only (no domain action). Lifecycle events that don't carry an `amount` block must not be parsed as paid events. |
+| `PAYMENT.SALE.COMPLETED`           | **Renewal branch** (`service.isPaypalRenewal`): locates the active subscription by `external_subscription_id`, mints a synthetic `orders` row (`uuid_generate_v4()`), INSERTs a `payments` row keyed on `(channel='paypal', external_txn_id=resource.id)`, then extends `subscriptions.expires_at` from `resource.billing_info.next_billing_time` if present. Concurrency guard: a `pg_advisory_xact_lock(hashtext(channel||':'||external_txn_id))` serializes concurrent renewals on the same payment. |
+
+**Note on `resource.id` vs `billing_agreement_id`**: for `BILLING.SUBSCRIPTION.*` events PayPal uses `resource.id` AS the subscription id; for `PAYMENT.SALE.*` events the subscription id is under `resource.billing_agreement_id`. The handler picks whichever is present (and falls back to `resource.id` as a last resort). All bindings go through the partial UNIQUE index `idx_subscriptions_external_sub_id` so a duplicate is impossible by construction.
+
 ### Refund → subscription semantics (primitive, v1)
 
 These rules describe the **data side effects** only. **Who triggers a refund, when it's allowed, how much can be refunded, and whether approval is needed** are all decided by the caller (frontend / admin tooling / payment-service) — not by us. We just provide the primitive operation; the caller composes business policy on top.
@@ -600,6 +617,7 @@ The `subscriptions.expires_at` value is a **frontend product decision** (rollove
 | WeChat webhook         | Decrypted `resource.sub_expires_at` (RFC3339 string). Omit → never expires.                                                                |
 | Alipay webhook         | Form field `sub_expires_at` (RFC3339 string). Omit → never expires.                                                                         |
 | LemonSqueezy webhook   | `meta.custom_data.sub_expires_at` (RFC3339 string, set by frontend at LS checkout). Omit → never expires. ABSENT on `subscription_payment_*` events (refund path doesn't activate subscriptions, so it doesn't need it). |
+| PayPal webhook         | `resource.billing_info.next_billing_time` for renewal events (RFC3339 string); absent on `PAYMENT.CAPTURE.*` and one-time subscription events, where expiration is computed by the frontend business rules and embedded in `custom_data.sub_expires_at` instead. Omit → never expires. **Frontend must derive from `plan.interval_days` + business rules**; yunhou-users does not derive server-side. |
 
 A malformed (unparseable) `sub_expires_at` is silently dropped to nil rather than failing the webhook — the activation proceeds with `expires_at = NULL` and the subscription never expires. This is a known loud-failure surface: a paid plan with `expires_at = NULL` should never ship; CI / staging tests must assert the field round-trips for monthly/quarterly/yearly plans.
 

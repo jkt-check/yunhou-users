@@ -40,7 +40,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 - `make deps` — tidy go.mod
 - `make generate-keys` — generate RSA key pair in `keys/`
 - `go test -race -run TestFoo ./internal/service/` — run a single test
-- Database migration: apply `001_init.sql`, then `002_simplify_plans.sql`, then `003_payments.sql`, then `004_ls_channel.sql` (each depends on the prior; running out of order fails).
+- Database migration: apply `001_init.sql`, then `002_simplify_plans.sql`, then `003_payments.sql`, then `004_ls_channel.sql`, then `005_paypal_channel.sql`, then `006_paypal_sub_mapping.sql` (each depends on the prior; running out of order fails).
 
 ## Required Environment Variables
 
@@ -58,6 +58,11 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM path; empty = Alipay webhooks return 404 |
 | `LEMONSQUEEZY_WEBHOOK_SECRET` | No | (empty) | Empty = LemonSqueezy webhooks return 404 |
+| `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which webhook_id/API base is active |
+| `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | PayPal sandbox webhook ID; empty = sandbox disabled |
+| `PAYPAL_WEBHOOK_ID_LIVE` | No | (empty) | PayPal live webhook ID; empty = live disabled |
+| `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |
+| `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
 

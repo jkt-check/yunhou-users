@@ -263,6 +263,41 @@ if !hmac.Equal(expectedHex, mac.Sum(nil)) {
 }
 ```
 
+### 4.6 PayPal
+
+PayPal verifies signatures **server-side** via an HTTPS POST to PayPal's REST API. We forward five PayPal headers + the raw body + our `webhook_id` to `POST {apiBase}/v1/notifications/verify-webhook-signature`; PayPal returns `{ "verification_status": "SUCCESS" | "FAILURE" }`.
+
+**Required headers (all five must be present; missing → `ErrInvalidSignature` 400):**
+
+```
+PAYPAL-AUTH-ALGO          (typically "SHA256withRSA")
+PAYPAL-CERT-URL           (URL to download PayPal's certificate)
+PAYPAL-TRANSMISSION-ID    (event ID — distinct from resource.id)
+PAYPAL-TRANSMISSION-SIG   (base64-encoded signature)
+PAYPAL-TRANSMISSION-TIME  (RFC3339 timestamp; PayPal checks this for us)
+```
+
+**Env vars:** Both `PAYPAL_API_BASE_SANDBOX` and `PAYPAL_API_BASE_LIVE` are loaded at startup; `PAYPAL_ENV=sandbox|live` selects which is active. Production deployments flip environments by changing only `PAYPAL_ENV` — the `(webhook_id, api_base)` pair is selected atomically inside the verifier on every request.
+
+**No local replay window** — PayPal's `transmission_time` is meant only for PayPal's own server-side check. Replay protection is via `webhook_events.UNIQUE(channel, event_id)`, identical to LemonSqueezy. A captured body replayed hours later still hits the UNIQUE constraint and is dropped.
+
+**Error mapping:**
+
+| Verifier behavior                 | HTTP from us | Effect on channel   |
+|----------------------------------|--------------|---------------------|
+| Missing PayPal header            | 400          | Channel logs, no retry |
+| `verification_status=FAILURE`    | 400          | Channel logs, no retry |
+| Verify endpoint 5xx or network   | 500          | Channel retries per §6 |
+| Unknown `PAYPAL_ENV` at runtime  | 404          | Treat channel as unconfigured |
+
+```go
+// internal/middleware/webhook_sig.go: PaypalVerifier.VerifySignature
+req, _ := http.NewRequest("POST", apiBase+"/v1/notifications/verify-webhook-signature",
+    bytes.NewReader(payload))
+resp, err := httpClient.Do(req)
+// any non-2xx → wrap as transient (500); FAILURE → ErrInvalidSignature (400)
+```
+
 ## 5. Idempotency
 
 A single payment event will arrive multiple times. Channels retry on non-2xx, network glitches, our own restart mid-processing, etc. We must dedupe at **two distinct layers**:
@@ -477,6 +512,7 @@ For invoice events (`subscription_payment_*`), `data.id` is the **invoice** ID, 
 | WeChat       | Up to 4 retries over ~24h with backoff; if all fail, merchant must re-initiate |
 | Alipay       | Up to 24h with backoff; same notification URL reused                  |
 | LemonSqueezy | Up to 5 retries over ~24h with exponential backoff; same URL reused. Configurable per-store in the LS dashboard. |
+| PayPal       | 25 retries over ~3 days with exponential backoff; same URL reused. PayPal will continue retrying until explicit `verify-webhook-signature` returns SUCCESS and our HTTP status is 2xx. See §4.6. |
 
 Implications for us:
 

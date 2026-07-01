@@ -837,7 +837,7 @@ App 列表接口，查询可用的应用（**需 `X-App-ID` 内部服务头**，
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `lemonsqueezy` |
+| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `lemonsqueezy` / `paypal` |
 | `external_txn_id` | 是 | 渠道侧交易 ID |
 | `expires_at` | 否 | RFC3339 时间，订阅过期时刻。**前端必须从 `plan.interval_days` + 业务规则（rollover/grace/trial）计算**；yunhou-users 不做服务端推导。省略 = 永不过期。 |
 
@@ -863,7 +863,7 @@ App 列表接口，查询可用的应用（**需 `X-App-ID` 内部服务头**，
 
 | HTTP | message | 触发条件 |
 |------|---------|----------|
-| 400 | `invalid channel` | `channel` 取值不在 `stripe` / `wechat_pay` / `alipay` / `lemonsqueezy` 之内 |
+| 400 | `invalid channel` | `channel` 取值不在 `stripe` / `wechat_pay` / `alipay` / `lemonsqueezy` / `paypal` 之内 |
 | 400 | `invalid request body` | 请求体缺失或字段类型错误 |
 | 404 | `not found` | 订单不存在或不属于当前用户 |
 | 409 | `order is in a non-recoverable terminal state` | 订单已是 `failed` / `refunded` 终态 |
@@ -1061,7 +1061,7 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 
 `domain_action` 取值（事件被处理时填）：`payment_paid` / `payment_failed` / `refund_paid` / `payment_disputed` / `payment_dispute_closed` / `none`。**dedupe 命中时为空字符串**——判别 dedupe 请用 `duplicate: true`，不要用 `domain_action == "none"`（`"none"` 仅表示"事件类型不在我们关心的范围内"，不代表已处理）。
 
-订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、LemonSqueezy `meta.custom_data.sub_expires_at`（在 LS checkout 创建时由前端嵌入；`subscription_payment_*` 事件缺省时不携带此字段）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
+订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、LemonSqueezy `meta.custom_data.sub_expires_at`（在 LS checkout 创建时由前端嵌入；`subscription_payment_*` 事件缺省时不携带此字段）、PayPal `resource.billing_info.next_billing_time`（renewal `PAYMENT.SALE.COMPLETED` 事件携带；其他事件若无则忽略）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
 
 ---
 

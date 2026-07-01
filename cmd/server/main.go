@@ -176,6 +176,18 @@ func buildWebhookVerifier(cfg *config.Config) middleware.ChannelSignatureVerifie
 	if cfg.LemonSqueezyWebhookSecret != "" {
 		mv.LemonSqueezy = &middleware.LemonsqueezyVerifier{Secret: []byte(cfg.LemonSqueezyWebhookSecret)}
 	}
+	if cfg.PaypalEnv == "sandbox" || cfg.PaypalEnv == "live" {
+		mv.Paypal = &middleware.PaypalVerifier{
+			HTTPClient:       &http.Client{Timeout: 5 * time.Second},
+			SandboxWebhookID: cfg.PaypalWebhookIDSandbox,
+			LiveWebhookID:    cfg.PaypalWebhookIDLive,
+			SandboxAPIBase:   cfg.PaypalAPIBaseSandbox,
+			LiveAPIBase:      cfg.PaypalAPIBaseLive,
+			Env:              cfg.PaypalEnv,
+		}
+	} else if cfg.PaypalEnv != "" {
+		log.Printf("paypal: PAYPAL_ENV=%q is not sandbox|live, channel will return 404", cfg.PaypalEnv)
+	}
 	return mv
 }
 

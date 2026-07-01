@@ -460,6 +460,26 @@ func TestMultiChannelVerifier_LemonSqueezyFanOut(t *testing.T) {
 	}
 }
 
+// TestMultiChannelVerifier_PaypalFanOut verifies the dispatch wires the
+// Paypal field correctly: channel="paypal" routes to the configured Paypal
+// verifier; "paypal" with no slot returns ErrUnsupportedChannel.
+func TestMultiChannelVerifier_PaypalFanOut(t *testing.T) {
+	t.Parallel()
+
+	paypalErr := errors.New("paypal-stub-error")
+	mv := &MultiChannelVerifier{
+		Paypal: &stubVerifier{errByChannel: map[string]error{"paypal": paypalErr}},
+	}
+	if err := mv.VerifySignature("paypal", nil, nil); err != paypalErr {
+		t.Errorf("Paypal dispatch: got %v, want %v", err, paypalErr)
+	}
+
+	mv2 := &MultiChannelVerifier{}
+	if err := mv2.VerifySignature("paypal", nil, nil); err != ErrUnsupportedChannel {
+		t.Errorf("unset paypal: got %v, want ErrUnsupportedChannel", err)
+	}
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================

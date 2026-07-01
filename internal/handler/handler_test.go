@@ -8,11 +8,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
 )
@@ -1056,6 +1058,718 @@ func TestUserHandler_ListAppsRemoved(t *testing.T) {
 	// only as a placeholder documenting the deletion.
 	_ = (*UserHandler)(nil)
 }
+
+// ============================================================================
+// Error-path coverage for the handlers most under-tested above.
+// Each section targets a handler whose function coverage is below ~75%.
+// ============================================================================
+
+func newUserEngine(userRepo *mockUserRepo, identityRepo *mockIdentityRepo) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	h := NewUserHandler(userRepo, identityRepo)
+	engine.GET("/user/profile", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "user-1")
+		h.GetProfile(c)
+	})
+	engine.PATCH("/user/profile", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "user-1")
+		h.UpdateProfile(c)
+	})
+	return engine
+}
+
+func TestUserHandler_GetProfile_DBError_500(t *testing.T) {
+	t.Parallel()
+	userRepo := &mockUserRepo{findErr: errors.New("db down")}
+	engine := newUserEngine(userRepo, &mockIdentityRepo{})
+	req := httptest.NewRequest(http.MethodGet, "/user/profile", nil)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("DB error: got %d, want 500", rec.Code)
+	}
+}
+
+func TestUserHandler_UpdateProfile_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	user := &model.User{ID: "user-1", Nickname: ptr("Old")}
+
+	cases := []struct {
+		name        string
+		userRepo    *mockUserRepo
+		body        string
+		wantStatus  int
+		wantMessage string
+	}{
+		{
+			name:        "user not found → 404",
+			userRepo:    &mockUserRepo{findErr: sql.ErrNoRows},
+			body:        `{"nickname":"new"}`,
+			wantStatus:  http.StatusNotFound,
+			wantMessage: "user not found",
+		},
+		{
+			name:        "DB error on lookup → 500",
+			userRepo:    &mockUserRepo{findErr: errors.New("db down")},
+			body:        `{"nickname":"new"}`,
+			wantStatus:  http.StatusInternalServerError,
+			wantMessage: "failed to load profile",
+		},
+		{
+			name:        "bad JSON → 400",
+			userRepo:    &mockUserRepo{user: user},
+			body:        `{`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "invalid request body",
+		},
+		{
+			name:        "empty nickname → 400",
+			userRepo:    &mockUserRepo{user: user},
+			body:        `{"nickname":"   "}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "nickname must be 1-100 characters",
+		},
+		{
+			name:        "too-long nickname → 400",
+			userRepo:    &mockUserRepo{user: user},
+			body:        `{"nickname":"` + strings.Repeat("x", 101) + `"}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "nickname must be 1-100 characters",
+		},
+		{
+			name:        "non-https avatar_url → 400",
+			userRepo:    &mockUserRepo{user: user},
+			body:        `{"avatar_url":"http://example.com/x.png"}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "avatar_url must be a valid HTTPS URL",
+		},
+		{
+			name:        "avatar_url with fragment → 400",
+			userRepo:    &mockUserRepo{user: user},
+			body:        `{"avatar_url":"https://example.com/x.png#y"}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "avatar_url must be a valid HTTPS URL",
+		},
+		{
+			name:        "avatar_url with userinfo → 400",
+			userRepo:    &mockUserRepo{user: user},
+			body:        `{"avatar_url":"https://u:p@example.com/x.png"}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "avatar_url must be a valid HTTPS URL",
+		},
+		{
+			name:        "DB error on update → 500",
+			userRepo:    &mockUserRepo{user: user, updateErr: errors.New("db down")},
+			body:        `{"nickname":"new-name"}`,
+			wantStatus:  http.StatusInternalServerError,
+			wantMessage: "failed to update profile",
+		},
+		{
+			name:       "valid update → 200",
+			userRepo:   &mockUserRepo{user: user},
+			body:       `{"nickname":"  new-name  ","avatar_url":"https://example.com/x.png"}`,
+			wantStatus: http.StatusOK,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := newUserEngine(tc.userRepo, &mockIdentityRepo{})
+			req := httptest.NewRequest(http.MethodPatch, "/user/profile", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}
+
+// ==== SubscriptionHandler.CreateSubscription — error paths ====
+
+func newSubEngine(subSvc *mockSubSvc) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	sh := NewSubscriptionHandler(subSvc)
+	engine.POST("/user/subscriptions", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "user-1")
+		sh.CreateSubscription(c)
+	})
+	engine.DELETE("/user/subscriptions/:id", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "user-1")
+		sh.CancelSubscription(c)
+	})
+	return engine
+}
+
+func TestSubscriptionHandler_CreateSubscription_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		subSvc      *mockSubSvc
+		body        string
+		wantStatus  int
+		wantMessage string
+	}{
+		{
+			name:        "bad JSON → 400",
+			subSvc:      &mockSubSvc{},
+			body:        `{`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "invalid request body",
+		},
+		{
+			name:        "missing plan_id → 400",
+			subSvc:      &mockSubSvc{},
+			body:        `{}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "invalid request body",
+		},
+		{
+			name:        "invalid expires_at → 400",
+			subSvc:      &mockSubSvc{},
+			body:        `{"plan_id":"monthly","expires_at":"not-rfc3339"}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "invalid expires_at format",
+		},
+		{
+			name:        "ErrPlanNotFound → 400",
+			subSvc:      &mockSubSvc{createErr: service.ErrPlanNotFound},
+			body:        `{"plan_id":"unknown"}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "plan not found",
+		},
+		{
+			name:        "ErrPlanInactive → 400",
+			subSvc:      &mockSubSvc{createErr: service.ErrPlanInactive},
+			body:        `{"plan_id":"disabled"}`,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "plan is inactive",
+		},
+		{
+			name:        "ErrPaidPlanForbidden → 403",
+			subSvc:      &mockSubSvc{createErr: service.ErrPaidPlanForbidden},
+			body:        `{"plan_id":"paid"}`,
+			wantStatus:  http.StatusForbidden,
+			wantMessage: "paid plans require payment",
+		},
+		{
+			name:        "ErrUserHasActiveSub → 409",
+			subSvc:      &mockSubSvc{createErr: service.ErrUserHasActiveSub},
+			body:        `{"plan_id":"monthly"}`,
+			wantStatus:  http.StatusConflict,
+			wantMessage: "user already has an active subscription",
+		},
+		{
+			name:        "unknown error → 500",
+			subSvc:      &mockSubSvc{createErr: errors.New("db exploded")},
+			body:        `{"plan_id":"monthly"}`,
+			wantStatus:  http.StatusInternalServerError,
+			wantMessage: "failed to create",
+		},
+		{
+			name:       "valid subscription success → 201",
+			subSvc:     &mockSubSvc{},
+			body:       `{"plan_id":"monthly","expires_at":"2026-12-31T23:59:59Z"}`,
+			wantStatus: http.StatusCreated,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := newSubEngine(tc.subSvc)
+			req := httptest.NewRequest(http.MethodPost, "/user/subscriptions", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestSubscriptionHandler_CreateSubscription_NoAuth_401(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	sh := NewSubscriptionHandler(&mockSubSvc{})
+	engine := gin.New()
+	// No middleware that sets ContextUserID → handler sees empty userID.
+	engine.POST("/user/subscriptions", sh.CreateSubscription)
+	req := httptest.NewRequest(http.MethodPost, "/user/subscriptions",
+		strings.NewReader(`{"plan_id":"monthly"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing auth: got %d, want 401", rec.Code)
+	}
+}
+
+// ==== SubscriptionHandler.CancelSubscription — error paths ====
+
+func TestSubscriptionHandler_CancelSubscription_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		subSvc      *mockSubSvc
+		wantStatus  int
+		wantMessage string
+	}{
+		{"ErrSubscriptionNotFound → 404",
+			&mockSubSvc{cancelErr: service.ErrSubscriptionNotFound},
+			http.StatusNotFound, "subscription not found"},
+		{"ErrAlreadyCancelled → 400",
+			&mockSubSvc{cancelErr: service.ErrAlreadyCancelled},
+			http.StatusBadRequest, "already cancelled"},
+		{"unknown error → 500",
+			&mockSubSvc{cancelErr: errors.New("db exploded")},
+			http.StatusInternalServerError, "failed to cancel"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := newSubEngine(tc.subSvc)
+			req := httptest.NewRequest(http.MethodDelete, "/user/subscriptions/sub-1", nil)
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestSubscriptionHandler_CancelSubscription_NoAuth_401(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	sh := NewSubscriptionHandler(&mockSubSvc{})
+	engine := gin.New()
+	engine.DELETE("/user/subscriptions/:id", sh.CancelSubscription)
+	req := httptest.NewRequest(http.MethodDelete, "/user/subscriptions/sub-1", nil)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing auth: got %d, want 401", rec.Code)
+	}
+}
+
+// ==== PlanHandler.DeletePlan / UpdatePlan error paths ====
+
+func TestPlanHandler_DeletePlan_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		svc        *mockPlanSvc
+		wantStatus int
+		wantMessage string
+	}{
+		{"PlanNotFound → 500",
+			&mockPlanSvc{deleteErr: sql.ErrNoRows},
+			http.StatusInternalServerError, "failed to delete plan"},
+		{"unknown error → 500",
+			&mockPlanSvc{deleteErr: errors.New("db exploded")},
+			http.StatusInternalServerError, "failed to delete plan"},
+		{"success → 200",
+			&mockPlanSvc{},
+			http.StatusOK, "deleted"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gin.SetMode(gin.TestMode)
+			h := NewPlanHandler(tc.svc)
+			engine := gin.New()
+			engine.DELETE("/admin/plans/:id", h.DeletePlan)
+			req := httptest.NewRequest(http.MethodDelete, "/admin/plans/x", nil)
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPlanHandler_UpdatePlan_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	existingPlan := &model.Plan{ID: "monthly", Name: "Monthly", Price: 9.99}
+	cases := []struct {
+		name        string
+		svc         *mockPlanSvc
+		body        string
+		wantStatus  int
+		wantMessage string
+	}{
+		{"bad JSON → 400", &mockPlanSvc{plan: existingPlan}, `{`,
+			http.StatusBadRequest, "invalid request body"},
+		{"plan not found → 404",
+			&mockPlanSvc{getErr: sql.ErrNoRows},
+			`{"name":"x"}`, http.StatusNotFound, "plan not found"},
+		{"DB lookup error → 500",
+			&mockPlanSvc{getErr: errors.New("db exploded")},
+			`{"name":"x"}`, http.StatusInternalServerError, "failed to load plan"},
+		{"negative price → 400",
+			&mockPlanSvc{plan: existingPlan},
+			`{"price":-1}`, http.StatusBadRequest, "price must be"},
+		{"negative interval_days → 400",
+			&mockPlanSvc{plan: existingPlan},
+			`{"interval_days":-1}`, http.StatusBadRequest, "interval_days must be"},
+		{"update repo error → 500",
+			&mockPlanSvc{plan: existingPlan, updateErr: errors.New("db exploded")},
+			`{"name":"updated"}`, http.StatusInternalServerError, "failed to update plan"},
+		{"success → 200",
+			&mockPlanSvc{plan: existingPlan},
+			`{"name":"updated"}`, http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gin.SetMode(gin.TestMode)
+			h := NewPlanHandler(tc.svc)
+			engine := gin.New()
+			engine.PATCH("/admin/plans/:id", h.UpdatePlan)
+			req := httptest.NewRequest(http.MethodPatch, "/admin/plans/x",
+				strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPlanHandler_CreatePlan_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		name       string
+		svc        *mockPlanSvc
+		body       string
+		wantStatus int
+	}{
+		{"bad JSON → 400", &mockPlanSvc{}, `{`, http.StatusBadRequest},
+		{"unknown error → 500",
+			&mockPlanSvc{createErr: errors.New("db exploded")},
+			`{"id":"monthly","name":"m"}`, http.StatusInternalServerError},
+		{"success → 201", &mockPlanSvc{},
+			`{"id":"monthly","name":"m"}`, http.StatusCreated},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := NewPlanHandler(tc.svc)
+			engine := gin.New()
+			engine.POST("/admin/plans", h.CreatePlan)
+			req := httptest.NewRequest(http.MethodPost, "/admin/plans",
+				strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+		})
+	}
+}
+
+// ==== Auth handler error paths ====
+
+func TestAuthHandler_Login_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		svc         *mockAuthSvc
+		body        string
+		wantStatus  int
+		wantMessage string
+	}{
+		{"bad JSON → 400", &mockAuthSvc{}, `{`,
+			http.StatusBadRequest, "invalid request body"},
+		{"ErrInvalidProviderToken → 401",
+			&mockAuthSvc{loginErr: service.ErrInvalidProviderToken},
+			`{"provider":"x","provider_token":"y","app_id":"a"}`,
+			http.StatusUnauthorized, "invalid provider"},
+		{"ErrUnsupportedProvider → 400",
+			&mockAuthSvc{loginErr: service.ErrUnsupportedProvider},
+			`{"provider":"x","provider_token":"y","app_id":"a"}`,
+			http.StatusBadRequest, "unsupported provider"},
+		{"ErrAppNotFound → 401",
+			&mockAuthSvc{loginErr: service.ErrAppNotFound},
+			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			http.StatusUnauthorized, "app not found"},
+		{"ErrAppInactive → 401",
+			&mockAuthSvc{loginErr: service.ErrAppInactive},
+			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			http.StatusUnauthorized, "app is inactive"},
+		{"ErrUserNotFound → 401",
+			&mockAuthSvc{loginErr: service.ErrUserNotFound},
+			`{"provider":"github","provider_token":"bad","app_id":"a"}`,
+			http.StatusUnauthorized, "user not found"},
+		{"ErrUserSuspended → 401",
+			&mockAuthSvc{loginErr: service.ErrUserSuspended},
+			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			http.StatusUnauthorized, "user is suspended"},
+		{"unknown error → 500",
+			&mockAuthSvc{loginErr: errors.New("db exploded")},
+			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			http.StatusInternalServerError, "login failed"},
+		{"success → 200",
+			&mockAuthSvc{loginResp: &service.LoginResponse{}},
+			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gin.SetMode(gin.TestMode)
+			h := NewAuthHandler(tc.svc, &mockTokenSvc{})
+			engine := gin.New()
+			engine.POST("/auth/login", h.Login)
+			req := httptest.NewRequest(http.MethodPost, "/auth/login",
+				strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAuthHandler_RefreshToken_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		svc         *mockAuthSvc
+		body        string
+		wantStatus  int
+		wantMessage string
+	}{
+		{"bad JSON → 400", &mockAuthSvc{}, `{`,
+			http.StatusBadRequest, "invalid request body"},
+		{"ErrInvalidRefreshToken → 401",
+			&mockAuthSvc{refreshErr: service.ErrInvalidRefreshToken},
+			`{"refresh_token":"bad","app_id":"a"}`,
+			http.StatusUnauthorized, "invalid refresh token"},
+		{"unknown error → 500",
+			&mockAuthSvc{refreshErr: errors.New("db exploded")},
+			`{"refresh_token":"x","app_id":"a"}`,
+			http.StatusInternalServerError, "refresh failed"},
+		{"success → 200",
+			&mockAuthSvc{refreshResp: &service.LoginResponse{}},
+			`{"refresh_token":"x","app_id":"a"}`,
+			http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gin.SetMode(gin.TestMode)
+			h := NewAuthHandler(tc.svc, &mockTokenSvc{})
+			engine := gin.New()
+			engine.POST("/auth/refresh", h.RefreshToken)
+			req := httptest.NewRequest(http.MethodPost, "/auth/refresh",
+				strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
+				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAuthHandler_Logout_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		svc        *mockAuthSvc
+		wantStatus int
+	}{
+		{"bad JSON → 400",
+			&mockAuthSvc{},
+			http.StatusBadRequest},
+		{"unknown error → 500",
+			&mockAuthSvc{logoutErr: errors.New("db exploded")},
+			http.StatusInternalServerError},
+		{"success → 200",
+			&mockAuthSvc{},
+			http.StatusOK},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gin.SetMode(gin.TestMode)
+			h := NewAuthHandler(tc.svc, &mockTokenSvc{})
+			engine := gin.New()
+			engine.POST("/auth/logout", h.Logout)
+			body := `{"refresh_token":"x"}`
+			if tc.name == "bad JSON → 400" {
+				body = `{`
+			}
+			req := httptest.NewRequest(http.MethodPost, "/auth/logout", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+		})
+	}
+}
+
+// ==== App handler error paths ====
+
+func newAppEngine(repo *mockAppRepo) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	h := NewAppHandler(repo)
+	engine.GET("/apps/:id", h.GetApp)
+	engine.POST("/admin/apps", h.CreateApp)
+	engine.PATCH("/admin/apps/:id", h.UpdateApp)
+	return engine
+}
+
+func TestAppHandler_GetApp_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		repo       *mockAppRepo
+		wantStatus int
+	}{
+		{"ErrAppNotFound → 404",
+			&mockAppRepo{findErr: sql.ErrNoRows}, http.StatusNotFound},
+		{"DB error → 500",
+			&mockAppRepo{findErr: errors.New("db exploded")},
+			http.StatusInternalServerError},
+		{"success → 200",
+			&mockAppRepo{apps: []model.App{{AppID: "yundian", Name: "云店"}}},
+			http.StatusOK},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := newAppEngine(tc.repo)
+			req := httptest.NewRequest(http.MethodGet, "/apps/yundian", nil)
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d", rec.Code, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestAppHandler_CreateApp_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		name       string
+		repo       *mockAppRepo
+		body       string
+		wantStatus int
+	}{
+		{"bad JSON → 400", &mockAppRepo{}, `{`, http.StatusBadRequest},
+		{"unknown error → 500",
+			&mockAppRepo{createErr: errors.New("db exploded")},
+			`{"app_id":"yundian","name":"云店"}`, http.StatusInternalServerError},
+		{"success → 201",
+			&mockAppRepo{},
+			`{"app_id":"yundian","name":"云店"}`, http.StatusCreated},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := newAppEngine(tc.repo)
+			req := httptest.NewRequest(http.MethodPost, "/admin/apps",
+				strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d", rec.Code, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestAppHandler_UpdateApp_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		name       string
+		repo       *mockAppRepo
+		body       string
+		wantStatus int
+	}{
+		{"bad JSON → 400", &mockAppRepo{apps: []model.App{{AppID: "yundian"}}}, `{`, http.StatusBadRequest},
+		{"ErrAppNotFound → 404",
+			&mockAppRepo{updateErr: service.ErrAppNotFound},
+			`{"name":"new"}`, http.StatusNotFound},
+		{"unknown error → 500",
+			&mockAppRepo{apps: []model.App{{AppID: "yundian"}}, updateErr: errors.New("db exploded")},
+			`{"name":"new"}`, http.StatusInternalServerError},
+		{"success → 200",
+			&mockAppRepo{apps: []model.App{{AppID: "yundian"}}},
+			`{"name":"new"}`, http.StatusOK},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := newAppEngine(tc.repo)
+			req := httptest.NewRequest(http.MethodPatch, "/admin/apps/yundian",
+				strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status: got %d, want %d", rec.Code, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// ptr is a tiny helper so test case declarations stay one-liners.
+func ptr(s string) *string { return &s }
 
 // --- Mock implementations for UserHandler tests ---
 

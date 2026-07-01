@@ -586,6 +586,75 @@ func TestPaymentHandler_ListPaymentRefunds_PropagatesOwnershipErr(t *testing.T) 
 	}
 }
 
+func TestPaymentHandler_ListPayments_NoAuth_401(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	svc := &mockPaymentSvc{}
+	h := NewPaymentHandler(svc)
+	engine := gin.New()
+	engine.GET("/payments", h.ListPayments)
+	rec := doRequest(engine, http.MethodGet, "/payments", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing auth: got %d, want 401", rec.Code)
+	}
+}
+
+func TestPaymentHandler_ListPayments_Error_500(t *testing.T) {
+	t.Parallel()
+	svc := &mockPaymentSvc{listPaymentsErr: errors.New("db exploded")}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, http.MethodGet, "/payments", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("DB error: got %d, want 500", rec.Code)
+	}
+}
+
+func TestPaymentHandler_GetPayment_NoAuth_401(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	svc := &mockPaymentSvc{}
+	h := NewPaymentHandler(svc)
+	engine := gin.New()
+	engine.GET("/payments/:id", h.GetPayment)
+	rec := doRequest(engine, http.MethodGet, "/payments/p-1", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing auth: got %d, want 401", rec.Code)
+	}
+}
+
+func TestPaymentHandler_GetPayment_InternalErr_500(t *testing.T) {
+	t.Parallel()
+	svc := &mockPaymentSvc{getPaymentErr: errors.New("db exploded")}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, http.MethodGet, "/payments/p-1", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("DB error: got %d, want 500", rec.Code)
+	}
+}
+
+func TestPaymentHandler_ListPaymentRefunds_NoAuth_401(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	svc := &mockPaymentSvc{}
+	h := NewPaymentHandler(svc)
+	engine := gin.New()
+	engine.GET("/payments/:id/refunds", h.ListPaymentRefunds)
+	rec := doRequest(engine, http.MethodGet, "/payments/p-1/refunds", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing auth: got %d, want 401", rec.Code)
+	}
+}
+
+func TestPaymentHandler_ListPaymentRefunds_InternalErr_500(t *testing.T) {
+	t.Parallel()
+	svc := &mockPaymentSvc{listRefundsErr: errors.New("db exploded")}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, http.MethodGet, "/payments/p-1/refunds", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("DB error: got %d, want 500", rec.Code)
+	}
+}
+
 // ============================================================================
 // Internal error → 500
 // ============================================================================

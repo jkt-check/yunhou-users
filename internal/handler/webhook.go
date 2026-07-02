@@ -456,6 +456,13 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 			BillingInfo *struct {
 				NextBillingTime string `json:"next_billing_time"`
 			} `json:"billing_info"`
+			// PayPal refund events point at the parent capture via the
+			// "up" relation in links[]. We need that ID (not resource.id,
+			// which is the refund id) to find the original payment row.
+			Links []struct {
+				Href string `json:"href"`
+				Rel  string `json:"rel"`
+			} `json:"links"`
 		} `json:"resource"`
 	}
 	if err := json.Unmarshal(raw, &evt); err != nil {
@@ -484,6 +491,21 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 		Currency:      strings.ToUpper(evt.Resource.Amount.CurrencyCode),
 	}
 
+	// Refund events: resource.id is the refund ID, not the capture ID we
+	// stored when the original CAPTURE.COMPLETED arrived. PayPal publishes
+	// the parent capture as links[rel="up"]; extract the trailing path
+	// segment so the refund handler can find the original payment row.
+	if isPaypalRefundEvent(evt.EventType) {
+		for _, l := range evt.Resource.Links {
+			if l.Rel == "up" {
+				if id := lastPathSegment(l.Href); id != "" {
+					we.TransactionID = id
+				}
+				break
+			}
+		}
+	}
+
 	// Subscription events: BILLING.SUBSCRIPTION.* events have their `id` AS
 	// the subscription ID (`I-...`). Renewal events (PAYMENT.SALE.*) have
 	// it under `billing_agreement_id`. So we pick whichever is present.
@@ -491,6 +513,15 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 		we.ExternalSubscriptionID = evt.Resource.ID
 	} else if evt.Resource.BillingAgreementID != "" {
 		we.ExternalSubscriptionID = evt.Resource.BillingAgreementID
+	} else if strings.HasPrefix(evt.EventType, "PAYMENT.CAPTURE.COMPLETED") {
+		// PAYMENT.CAPTURE.COMPLETED for a subscription first charge normally
+		// carries resource.billing_agreement_id. If it's missing we can't link
+		// this capture to a subscription, so the upcoming PAYMENT.SALE.COMPLETED
+		// renewal will hit `paypal_renewal_unknown_subscription` and silently
+		// no-op. Surface this loudly so the operator can investigate PayPal's
+		// delivery (or pair it with the BILLING.SUBSCRIPTION.CREATED event).
+		log.Printf("paypal: PAYMENT.CAPTURE.COMPLETED %s missing resource.billing_agreement_id; "+
+			"renewal lookup will fail until BILLING.SUBSCRIPTION.CREATED arrives", evt.ID)
 	}
 
 	if isPaypalLifecycleEvent(evt.EventType) {
@@ -510,6 +541,12 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 	if evt.Resource.BillingInfo != nil && evt.Resource.BillingInfo.NextBillingTime != "" {
 		if t, err := time.Parse(time.RFC3339, evt.Resource.BillingInfo.NextBillingTime); err == nil {
 			we.SubExpiresAt = &t
+		} else {
+			// Don't fail the whole event for a malformed renewal hint —
+			// the renewal handler falls back to "skip UPDATE" if SubExpiresAt
+			// is nil. Surface the parse error to the operator's logs.
+			log.Printf("paypal: invalid next_billing_time %q for event %s: %v",
+				evt.Resource.BillingInfo.NextBillingTime, evt.ID, err)
 		}
 	}
 
@@ -535,6 +572,16 @@ func isPaypalSubscriptionEvent(eventType string) bool {
 // do not. Use this to drive amount-parsing strictness in parsePaypal.
 func isPaypalLifecycleEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "BILLING.")
+}
+
+// lastPathSegment returns the trailing non-empty path segment of a URL.
+// Used to extract the parent capture id from a PayPal refund event's
+// `links[rel="up"].href` (e.g. ".../captures/<id>" → "<id>").
+func lastPathSegment(rawURL string) string {
+	if i := strings.LastIndex(rawURL, "/"); i >= 0 && i+1 < len(rawURL) {
+		return rawURL[i+1:]
+	}
+	return ""
 }
 
 // wrapRawPayload produces a JSONB-safe representation of the raw webhook

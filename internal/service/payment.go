@@ -761,10 +761,15 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
 			SET external_subscription_id = $1
-			WHERE user_id = $2
-			  AND plan_id = $3
-			  AND status = 'active'
-			  AND external_subscription_id IS NULL
+			WHERE id = (
+				SELECT id FROM subscriptions
+				WHERE user_id = $2
+				  AND plan_id = $3
+				  AND status = 'active'
+				  AND external_subscription_id IS NULL
+				ORDER BY created_at DESC
+				LIMIT 1
+			)
 		`, e.ExternalSubscriptionID, order.UserID, order.PlanID); err != nil {
 			return fmt.Errorf("set external_subscription_id: %w", err)
 		}
@@ -1060,7 +1065,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 
 	var sub model.Subscription
 	err = tx.GetContext(ctx, &sub,
-		`SELECT * FROM subscriptions WHERE external_subscription_id = $1 LIMIT 1`,
+		`SELECT * FROM subscriptions WHERE external_subscription_id = $1 LIMIT 1 FOR UPDATE`,
 		e.ExternalSubscriptionID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1125,7 +1130,8 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		PaidAt:        &now,
 		RawPayload:    e.RawPayload,
 	}
-	if _, _, err := insertPaymentOnTx(ctx, tx, p); err != nil {
+	paymentID, _, err := insertPaymentOnTx(ctx, tx, p)
+	if err != nil {
 		return fmt.Errorf("insert renewal payment: %w", err)
 	}
 
@@ -1149,7 +1155,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 				fmt.Sprintf("subscription:%s", sub.ID),
 				[]string{"webhook", "paypal", "renewal", "sub_not_active"},
 				map[string]any{
-					"payment_id":               p.ID,
+					"payment_id":               paymentID,
 					"order_id":                 orderID,
 					"external_subscription_id": e.ExternalSubscriptionID,
 					"sub_status":               sub.Status,
@@ -1161,7 +1167,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		fmt.Sprintf("subscription:%s", sub.ID),
 		[]string{"payment", "paypal", "renewal"},
 		map[string]any{
-			"payment_id":              p.ID,
+			"payment_id":              paymentID,
 			"order_id":                orderID,
 			"external_subscription_id": e.ExternalSubscriptionID,
 			"amount":                  e.Amount,
@@ -1357,7 +1363,7 @@ func isRefundEvent(eventType string) bool {
 	case "charge.refunded", "TRANSACTION.REFUND",
 		"TRADE_CLOSED", "trade_closed",
 		"order_refunded", "subscription_payment_refunded",
-		"PAYMENT.CAPTURE.REFUNDED":
+		"PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED":
 		return true
 	}
 	return false

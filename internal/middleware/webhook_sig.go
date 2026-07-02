@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -428,6 +429,46 @@ func (v *LemonsqueezyVerifier) VerifySignature(channel string, body []byte, head
 // UNIQUE(channel, event_id)) — same approach as LemonSqueezy. PayPal's
 // transmission_time is meant only for PayPal's own verification, not for
 // our dedup, so we don't enforce a local replay window.
+//
+// verifyCache is a tiny in-process cache that absorbs PayPal's retry bursts.
+// PayPal retries on transient errors within seconds; without the cache every
+// retry pays a full DNS+TCP+TLS+RTT to api-m.paypal.com. Key is the unique
+// (transmission_id, transmission_time) tuple so a genuine second delivery at
+// a different time isn't suppressed.
+const paypalVerifyCacheTTL = 60 * time.Second
+
+type paypalVerifyCacheEntry struct {
+	status    string // "SUCCESS" | "FAILURE" | other (mirrors verification_status)
+	expiresAt time.Time
+	err       error // first-call verdict; subsequent calls return the same
+}
+
+var paypalVerifyCache sync.Map // map[paypalVerifyCacheKey]paypalVerifyCacheEntry
+
+type paypalVerifyCacheKey struct {
+	transmissionID   string
+	transmissionTime string
+}
+
+func lookupVerifyCache(k paypalVerifyCacheKey) (paypalVerifyCacheEntry, bool) {
+	if v, ok := paypalVerifyCache.Load(k); ok {
+		entry := v.(paypalVerifyCacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			return entry, true
+		}
+		paypalVerifyCache.Delete(k)
+	}
+	return paypalVerifyCacheEntry{}, false
+}
+
+func storeVerifyCache(k paypalVerifyCacheKey, status string, err error) {
+	paypalVerifyCache.Store(k, paypalVerifyCacheEntry{
+		status:    status,
+		expiresAt: time.Now().Add(paypalVerifyCacheTTL),
+		err:       err,
+	})
+}
+
 type PaypalVerifier struct {
 	HTTPClient       *http.Client // nil → http.DefaultClient; production should set Timeout.
 	SandboxWebhookID string
@@ -464,6 +505,17 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 	if authAlgo == "" || certURL == "" || transmissionID == "" ||
 		transmissionSIG == "" || transmissionTime == "" {
 		return ErrInvalidSignature
+	}
+
+	// Cache hit: short-circuit the upstream call. PayPal retries on
+	// transient errors within seconds; the (transmission_id, transmission_time)
+	// tuple uniquely identifies a delivery, so a cached SUCCESS applies to
+	// the genuine retry burst only.
+	if entry, ok := lookupVerifyCache(paypalVerifyCacheKey{
+		transmissionID:   transmissionID,
+		transmissionTime: transmissionTime,
+	}); ok {
+		return entry.err
 	}
 
 	webhookID, apiBase, err := v.activeConfig()
@@ -533,8 +585,16 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 		return fmt.Errorf("paypal verify decode: %w", err)
 	}
 	if out.VerificationStatus != "SUCCESS" {
+		storeVerifyCache(paypalVerifyCacheKey{
+			transmissionID:   transmissionID,
+			transmissionTime: transmissionTime,
+		}, out.VerificationStatus, ErrInvalidSignature)
 		return ErrInvalidSignature
 	}
+	storeVerifyCache(paypalVerifyCacheKey{
+		transmissionID:   transmissionID,
+		transmissionTime: transmissionTime,
+	}, out.VerificationStatus, nil)
 	return nil
 }
 

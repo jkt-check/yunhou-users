@@ -9,7 +9,6 @@ import { SandboxEnv } from './env';
 export interface PayPalAccessToken {
   access_token: string;
   expires_in: number;
-  issued_at: string; // heuristic; PayPal returns absolute exp
 }
 
 let cachedToken: { token: string; expiresAt: number } | null = null;

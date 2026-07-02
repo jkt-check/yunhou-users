@@ -47,6 +47,9 @@ func Setup(
 	engine.POST("/auth/login", publicLimiter, authHandler.Login)
 	engine.POST("/auth/refresh", publicLimiter, authHandler.RefreshToken)
 	engine.POST("/auth/logout", publicLimiter, authHandler.Logout)
+	// Dev-only login endpoint for the L3 e2e-ui suite. Returns 404 unless
+	// PAYPAL_L3_E2E_MODE=1 is set; the env check is inside the handler.
+	engine.POST("/test/login", authHandler.TestLogin)
 
 	// User routes (JWT auth required)
 	userGroup := engine.Group("/user")

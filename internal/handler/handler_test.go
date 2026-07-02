@@ -22,11 +22,13 @@ import (
 // --- Mocks implementing service interfaces ---
 
 type mockAuthSvc struct {
-	loginResp    *service.LoginResponse
-	loginErr     error
-	logoutErr    error
-	refreshResp  *service.LoginResponse
-	refreshErr   error
+	loginResp     *service.LoginResponse
+	loginErr      error
+	logoutErr     error
+	refreshResp   *service.LoginResponse
+	refreshErr    error
+	testLoginResp *service.LoginResponse
+	testLoginErr  error
 }
 
 func (m *mockAuthSvc) Login(ctx context.Context, req service.LoginRequest) (*service.LoginResponse, error) {
@@ -45,6 +47,13 @@ func (m *mockAuthSvc) RefreshToken(ctx context.Context, refreshToken, appID stri
 		return nil, m.refreshErr
 	}
 	return m.refreshResp, nil
+}
+
+func (m *mockAuthSvc) TestLogin(ctx context.Context, req service.TestLoginRequest) (*service.LoginResponse, error) {
+	if m.testLoginErr != nil {
+		return nil, m.testLoginErr
+	}
+	return m.testLoginResp, nil
 }
 
 type mockTokenSvc struct {

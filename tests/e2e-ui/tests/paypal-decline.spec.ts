@@ -35,6 +35,7 @@ test.describe('@decline Sandbox error paths', () => {
       const { accessToken, userId } = await backend.login(env.buyerEmail);
       // Create an order so the decline path has a unique order_id to watch.
       const orderId = await backend.createOrder(accessToken, 'monthly');
+      console.log(`DEBUG orderId=${orderId} userId=${userId}`);
 
       // Sandbox runner setup: previous test runs may have logged PayPal
       // webhook events for unrelated orders. Clear only those tied to

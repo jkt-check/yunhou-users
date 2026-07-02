@@ -12,6 +12,7 @@ type AuthServiceInterface interface {
 	Login(ctx context.Context, req LoginRequest) (*LoginResponse, error)
 	Logout(ctx context.Context, refreshToken string) error
 	RefreshToken(ctx context.Context, refreshToken, appID string) (*LoginResponse, error)
+	TestLogin(ctx context.Context, req TestLoginRequest) (*LoginResponse, error)
 }
 
 // TokenServiceInterface defines the interface for token operations

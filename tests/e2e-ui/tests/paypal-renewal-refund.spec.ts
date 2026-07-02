@@ -56,13 +56,15 @@ test.describe('Renewal + Refund simulation paths', () => {
       );
 
       // Fire a synthetic renewal webhook (no sandbox UI flow required).
+      // The renewal handler onPaypalRenewalSucceeded mints its own
+      // synthetic orders row — the custom_id here is informational only
+      // (mirrors what PayPal sends in a real event but isn't required).
       await fireSimulatedWebhook(
         env,
         'PAYMENT.SALE.COMPLETED',
         {
           id: 'SALE-E2E-1',
           billing_agreement_id: fakeSubId,
-          custom_id: orderId,
           amount: { total: '4.99', currency: 'USD' },
           billing_info: {
             next_billing_time: new Date(Date.now() + 60 * 86_400_000).toISOString(),

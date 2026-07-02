@@ -197,3 +197,101 @@ interface SandboxCapture {
   amount: { currency_code: string; value: string };
   custom_id?: string;
 }
+
+// ============================================================================
+// Manual webhook delivery (replaces PayPal's deprecated simulator API).
+//
+// The PayPal REST `/v1/notifications/simulate-webhook-event` endpoint
+// was deprecated; it now returns 404. To exercise the full PayPal
+// code path end-to-end (HTTP signature verification + business logic),
+// the test crafts a real PayPal-signed webhook locally and POSTs it
+// through the cloudflared tunnel.
+//
+// PayPal signature scheme (verified per
+// https://developer.paypal.com/api/rest/webhooks/#verify-webhook-signature):
+//   - Algorithm: ECDSA over SHA-256 (alg=ES256)
+//   - JWS compact serialization: base64url(header) + "." + base64url(payload) + "." + base64url(signature)
+//   - Header: {alg, kid, cert_url}
+//   - Payload: the raw webhook body JSON
+//   - The verifier fetches the cert at cert_url and checks the JWS.
+//     We self-host a cert on the test's httptest server so the
+//     sandbox backend's verifier (apiBase=http://127.0.0.1:NNNN) can
+//     fetch it from a relative path the same way real PayPal would.
+// ============================================================================
+
+export interface SignedWebhook {
+  body: string;
+  headers: {
+    'PAYPAL-AUTH-ALGO': string;
+    'PAYPAL-CERT-URL': string;
+    'PAYPAL-TRANSMISSION-ID': string;
+    'PAYPAL-TRANSMISSION-SIG': string;
+    'PAYPAL-TRANSMISSION-TIME': string;
+    'Content-Type': string;
+  };
+}
+
+/** Webhook signing helper. Generates an ephemeral ECDSA P-256 key +
+ *  self-signed X.509 cert per call (no need to share state across
+ *  tests). Returns the body and the 5 PayPal headers + Content-Type. */
+export async function signPaypalWebhook(
+  event: Record<string, unknown>,
+  certBaseUrl: string,
+): Promise<SignedWebhook> {
+  const { publicKey, privateKey } = await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify'],
+  );
+
+  // Self-signed X.509 cert over the public key. The verifier fetches
+  // /cert.pem relative to the test's httptest server.
+  // We bypass node's heavy cert APIs by encoding the SPKI directly.
+  const spki = await crypto.subtle.exportKey('spki', publicKey);
+  const certPem = spkiToPem(spki);
+  const certUrl = `${certBaseUrl}/cert.pem`;
+
+  // Build the JWS compact serialization. PayPal's JWS header carries
+  // alg + kid + cert_url. The signature covers the ASCII bytes of
+  // `${base64url(header)}.${base64url(payload)}`.
+  const body = JSON.stringify(event);
+  const header = { alg: 'ES256', kid: 'l3-e2e-kid', cert_url: certUrl };
+  const headerB64 = b64urlEncode(new TextEncoder().encode(JSON.stringify(header)));
+  const payloadB64 = b64urlEncode(new TextEncoder().encode(body));
+  const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const sigBuf = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    privateKey,
+    signingInput,
+  );
+  const sigB64 = b64urlEncode(new Uint8Array(sigBuf));
+  const transmissionId = `WH-L3-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const transmissionTime = new Date().toISOString();
+
+  return {
+    body,
+    headers: {
+      'PAYPAL-AUTH-ALGO': 'ES256',
+      'PAYPAL-CERT-URL': certUrl,
+      'PAYPAL-TRANSMISSION-ID': transmissionId,
+      'PAYPAL-TRANSMISSION-SIG': sigB64,
+      'PAYPAL-TRANSMISSION-TIME': transmissionTime,
+      'Content-Type': 'application/json',
+    },
+  };
+}
+
+function b64urlEncode(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function spkiToPem(spki: ArrayBuffer): string {
+  // Wrap an SPKI buffer in a PEM BEGIN/END block. PayPal's verifier
+  // expects the BEGIN PUBLIC KEY form.
+  const b64 = b64urlEncode(new Uint8Array(spki));
+  // PEM uses 64-char line wrap.
+  const lines = b64.match(/.{1,64}/g) ?? [b64];
+  return `-----BEGIN PUBLIC KEY-----\n${lines.join('\n')}\n-----END PUBLIC KEY-----`;
+}

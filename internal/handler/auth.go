@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/service"
@@ -114,4 +115,49 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 
 func (h *AuthHandler) JWKS(c *gin.Context) {
 	c.JSON(http.StatusOK, h.tokenSvc.JWKS())
+}
+
+// TestLogin is a dev-only login endpoint that returns a real JWT
+// without going through any OAuth provider. It exists so the L3
+// PayPal integration suite (tests/e2e-ui) can issue authenticated
+// requests against a locally-running backend whose GitHub OAuth
+// verifier is wired to the real api.github.com (which 401s on
+// forged tokens).
+//
+// Gated by PAYPAL_L3_E2E_MODE=1: if unset, every call returns 404.
+// This keeps the endpoint off in production. The route is also
+// never registered in router.Setup when the env is missing.
+//
+// POST /test/login  body: {"email":"...","app_id":"yundian"}
+// 200:        {access_token, refresh_token, user: {id, ...}}
+//
+// Side-effects: if the email has no matching user, creates one with
+// the default 'free' plan (so the L3 tests have a user + sub to
+// operate on). Refresh token row inserted via the same path as
+// production /auth/login.
+func (h *AuthHandler) TestLogin(c *gin.Context) {
+	if os.Getenv("PAYPAL_L3_E2E_MODE") != "1" {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "not found"})
+		return
+	}
+
+	var req struct {
+		Email string `json:"email" binding:"required"`
+		AppID string `json:"app_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	resp, err := h.authSvc.TestLogin(c.Request.Context(), service.TestLoginRequest{
+		Email: req.Email,
+		AppID: req.AppID,
+	})
+	if err != nil {
+		log.Printf("test login internal error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "test login failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": resp})
 }

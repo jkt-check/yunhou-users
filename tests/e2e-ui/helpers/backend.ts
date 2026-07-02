@@ -27,21 +27,16 @@ export async function initBackend(opts: {
   const db = new Pool({ connectionString: opts.dbUrl, max: 3 });
 
   async function login(email: string, appId = 'yundian'): Promise<{ accessToken: string; userId: string }> {
-    // E2E: yunhou's POST /auth/login takes GitHub provider_token. We use
-    // the sandbox-test buyer email as the GitHub user — yunhou-side, this
-    // hits the mockable OAuth provider. In the e2e-UI test, the mock provider
-    // is wired to accept any token and map it to a user.
-    const res = await fetch(`${opts.baseUrl}/auth/login`, {
+    // L3 e2e uses the dev-only /test/login endpoint. The backend bakes
+    // a real JWT (no GitHub OAuth round-trip), creating the user on
+    // first call. Requires PAYPAL_L3_E2E_MODE=1 on the backend.
+    const res = await fetch(`${opts.baseUrl}/test/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider: 'github',
-        provider_token: `paypal-e2e-${email}-${Date.now()}`,
-        app_id: appId,
-      }),
+      body: JSON.stringify({ email, app_id: appId }),
     });
     if (!res.ok) {
-      throw new Error(`login: ${res.status} ${await res.text()}`);
+      throw new Error(`test/login: ${res.status} ${await res.text()}`);
     }
     const json = await res.json();
     return {

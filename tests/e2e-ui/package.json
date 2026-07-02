@@ -17,6 +17,8 @@
   "devDependencies": {
     "@playwright/test": "1.45.0",
     "@types/node": "20.11.30",
+    "@types/pg": "8.11.6",
+    "pg": "8.13.0",
     "typescript": "5.4.5"
   },
   "engines": {

@@ -180,12 +180,7 @@ export async function refundCapture(
 }
 
 /** Get sandbox sale details (for renewal tests). */
-export async function getCapture(env: SandboxEnv, captureId: string): Promise<{
-  id: string;
-  status: string;
-  amount: { currency_code: string; value: string };
-  custom_id?: string;
-}> {
+export async function getCapture(env: SandboxEnv, captureId: string): Promise<SandboxCapture> {
   const token = await getAccessToken(env);
   const res = await fetch(`${env.apiBase}/v2/payments/captures/${captureId}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -193,5 +188,12 @@ export async function getCapture(env: SandboxEnv, captureId: string): Promise<{
   if (!res.ok) {
     throw new Error(`GetCapture: ${res.status} ${await res.text()}`);
   }
-  return (await res.json()) as any;
+  return (await res.json()) as SandboxCapture;
+}
+
+interface SandboxCapture {
+  id: string;
+  status: string;
+  amount: { currency_code: string; value: string };
+  custom_id?: string;
 }

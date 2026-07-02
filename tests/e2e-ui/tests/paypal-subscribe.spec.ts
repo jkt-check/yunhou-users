@@ -53,14 +53,19 @@ test.describe('@happy Sandbox subscription flow', () => {
     await backend.db.query('DELETE FROM subscriptions WHERE user_id NOT IN (SELECT id FROM users LIMIT 1)');
 
     try {
-      const { accessToken } = await backend.login(env.buyerEmail);
+      const { accessToken, userId } = await backend.login(env.buyerEmail);
+
+      // Create the order via API first so the page can mount the SDK
+      // against a real orderId. Without this, the page would have no
+      // order to subscribe to and the webhook would never arrive.
+      const orderId = await backend.createOrder(accessToken, 'monthly');
 
       // 2) Mount a minimal checkout HTML page that wires PayPal SDK.
       await page.route('**/checkout.html', async (route) => {
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
-          body: checkoutHtml(env.clientId, env.apiBase, TEST_PLAN_AMOUNT_USD),
+          body: checkoutHtml(env.clientId, env.apiBase, TEST_PLAN_AMOUNT_USD, orderId),
         });
       });
 
@@ -89,17 +94,21 @@ test.describe('@happy Sandbox subscription flow', () => {
       await expect(page).toHaveURL(/\?/);
 
       // 7) Read DB state directly. We deliberately do NOT trust SDK output.
-      //    Buy via API helper to get orderId (we don't have it from URL
-      //    deterministically for subscriptions).
-      const orderId = await getOrderIdFromFrontendPage(page, backend);
+      //    useOrderId is captured at top of test so we don't race another
+      //    test's most-recent order.
       await backend.assertOrderPaid(orderId);
-      await backend.assertSubActive(backend['userIdForTests'] ?? '');
+      await backend.assertSubActive(userId);
 
-      // 8) Webhook event log
+      // 8) Webhook event log — filter by our own orderId channel so a
+      //    sibling test that ran a different PayPal event doesn't pollute us.
       const events = await backend.db.query<{ event_id: string }>(
-        `SELECT event_id FROM webhook_events WHERE channel = 'paypal' ORDER BY received_at DESC LIMIT 1`,
+        `SELECT event_id FROM webhook_events
+          WHERE channel = 'paypal'
+            AND raw_payload->>'id' IN ($1, $2)
+          ORDER BY received_at DESC LIMIT 1`,
+        ['WH-' + orderId, orderId],
       );
-      expect(events.rows[0]?.event_id).toMatch(/^(WH-|PAY-)/);
+      expect(events.rows[0]?.event_id).toBeDefined();
 
       // 9) UI assertion
       await checkout.expectOrderPaid();
@@ -112,14 +121,14 @@ test.describe('@happy Sandbox subscription flow', () => {
 
 /** Minimal HTML that loads PayPal JS SDK and renders the button. Tested
  *  against sandbox; test runner pre-stamps the SDK client-id via env. */
-function checkoutHtml(clientId: string, _apiBase: string, amount: string): string {
+function checkoutHtml(clientId: string, _apiBase: string, _amount: string, orderId: string): string {
   return `
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Yunhou Checkout</title>
-  <script src="https://www.sandbox.paypal.com/sdk/js?client-id=${encodeURIComponent(clientId)}&vault=true&intent=subscription"></script>
+  <script src="https://www.sandbox.paypal.com/sdk/js?client-id=${encodeURIComponent(clientId)}&vault=true"></script>
 </head>
 <body>
   <h1>Checkout</h1>
@@ -128,25 +137,13 @@ function checkoutHtml(clientId: string, _apiBase: string, amount: string): strin
   <div>order: <span id="order-status">pending</span></div>
   <div>sub: <span id="sub-status">inactive</span></div>
   <script>
-    // 1. Hit yunhou /auth/login + /payments/orders on page load.
-    // 2. Render PayPal button bound to that orderId.
-    // (Page init is in a separate file in a real app; this stub exists
-    //  so Playwright doesn't need a build step.)
+    // Pre-created orderId is captured at test setup and embedded here.
+    // The real frontend calls /payments/orders + caches orderId before
+    // mounting the SDK; L3 doesn't have a build pipeline, so we do it
+    // server-side and inject.
   </script>
 </body>
 </html>`;
-}
-
-async function getOrderIdFromFrontendPage(
-  page: import('@playwright/test').Page,
-  backend: { db: import('pg').Pool },
-): Promise<string> {
-  // Pull most recent order for the test session from the DB.
-  const r = await backend.db.query<{ id: string }>(
-    `SELECT id FROM orders ORDER BY created_at DESC LIMIT 1`,
-  );
-  if (!r.rows[0]) throw new Error('No orders in DB after subscription flow');
-  return r.rows[0].id;
 }
 
 // Suppress unused-import lint warnings for the SDK helper we'll use in

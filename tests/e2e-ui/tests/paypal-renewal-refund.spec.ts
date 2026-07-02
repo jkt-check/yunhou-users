@@ -32,10 +32,13 @@ test.describe('Renewal + Refund simulation paths', () => {
     });
 
     try {
-      const { accessToken, userId } = await backend.login(env.buyerEmail);
-      const orderId = await backend.createOrder(accessToken, 'monthly', {
-        expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
-      });
+      const { userId } = await backend.login(env.buyerEmail);
+      // NB: we don't call backend.createOrder() because the renewal
+      // handler onPaypalRenewalSucceeded mints its own synthetic orders
+      // row keyed by (channel, external_txn_id) — the user-created order
+      // would never be touched by the renewal path. So this test
+      // simulates a renewal against an existing active subscription
+      // directly.
 
       // Pre-stamp the active subscription with a fake PayPal subscription id.
       const fakeSubId = `I-E2E-${Date.now()}`;

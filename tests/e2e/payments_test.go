@@ -261,7 +261,7 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	// First refund of 25 — OK.
 	refund1 := fmt.Sprintf(`{"payment_id":%q,"amount":25.0}`, paymentID)
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1,
-		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-1"})
+		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-1-key-1"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first refund: %d %s", resp.StatusCode, string(resp.Body))
 	}
@@ -269,7 +269,7 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	// Second refund of 10 — would push total to 35, exceeding 29.90. Must fail.
 	refund2 := fmt.Sprintf(`{"payment_id":%q,"amount":10.0}`, paymentID)
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund2,
-		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-2"})
+		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-2-key-2"})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400 (sum invariant), got %d — body: %s", resp.StatusCode, string(resp.Body))
 	}

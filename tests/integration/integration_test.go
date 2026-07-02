@@ -43,7 +43,7 @@ func TestMain(m *testing.M) {
 				Nickname:    "Google " + token,
 			}, nil
 		default:
-			return nil, fmt.Errorf("unsupported provider: %s", provider)
+			return nil, fmt.Errorf("%w: %s", service.ErrUnsupportedProvider, provider)
 		}
 	})
 	code := m.Run()
@@ -117,6 +117,8 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 		Port:          "8080",
 		JWTAccessTTL:   15 * time.Minute,
 		JWTRefreshTTL: 168 * time.Hour,
+		RSAPrivate:     "../../keys/private.pem",
+		RSAPublic:      "../../keys/public.pem",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -147,6 +149,11 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 
 func doJSON(t *testing.T, method, url string, body interface{}) *http.Response {
 	t.Helper()
+	return doJSONWithAuth(t, method, url, "", body)
+}
+
+func doJSONWithAuth(t *testing.T, method, url, auth string, body interface{}) *http.Response {
+	t.Helper()
 	var bodyReader io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -161,6 +168,9 @@ func doJSON(t *testing.T, method, url string, body interface{}) *http.Response {
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -264,9 +274,13 @@ func TestLoginFlow(t *testing.T) {
 		t.Fatal("tokens are empty")
 	}
 
-	// Use access token to get profile
-	profileResp := doJSON(t, http.MethodGet, srv.URL+"/user/profile", nil)
-	profileResp.Header.Set("Authorization", "Bearer "+accessToken)
+	// Use access token to get profile. doJSONWithAuth sets Authorization BEFORE send.
+	profileResp := doJSONWithAuth(t, http.MethodGet, srv.URL+"/user/profile", "Bearer "+accessToken, nil)
+	if profileResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(profileResp.Body)
+		profileResp.Body.Close()
+		t.Fatalf("profile: status %d, body %s", profileResp.StatusCode, string(body))
+	}
 	profileResult := parseJSON(t, profileResp)
 	if profileResult["code"].(float64) != 0 {
 		t.Errorf("profile response code: %v", profileResult["code"])
@@ -418,14 +432,19 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	srv := setupServer(db)
 	defer srv.Close()
 
-	appID := "yundian"
-	userID := insertTestUser(t, db)
+	// Login to get a JWT.
+	loginBody := map[string]interface{}{
+		"provider": "github", "provider_token": "sub-life-user", "app_id": "yundian",
+	}
+	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", loginBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login: %d", resp.StatusCode)
+	}
+	tok := parseJSON(t, resp)["data"].(map[string]interface{})["access_token"].(string)
 
-	// Create subscription via API
-	resp := doWithAppAuth(t, http.MethodPost, srv.URL+"/user/subscriptions", appID, map[string]interface{}{
-		"user_id": userID,
-		"plan_id": "monthly",
-	})
+	// Create subscription via JWT-protected API.
+	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
+		"Bearer "+tok, map[string]interface{}{"plan_id": "free"})
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -442,19 +461,18 @@ func TestSubscriptionLifecycle(t *testing.T) {
 		t.Errorf("expected active, got %s", status)
 	}
 
-	// List subscriptions for user
-	resp = doWithAppAuth(t, http.MethodGet, srv.URL+"/user/subscriptions", appID, nil)
+	// List subscriptions
+	resp = doJSONWithAuth(t, http.MethodGet, srv.URL+"/user/subscriptions", "Bearer "+tok, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list subscriptions: status %d", resp.StatusCode)
 	}
 
-	// Cancel subscription
-	resp = doWithAppAuth(t, http.MethodDelete, srv.URL+"/user/subscriptions/"+subID, appID, nil)
+	// Cancel
+	resp = doJSONWithAuth(t, http.MethodDelete, srv.URL+"/user/subscriptions/"+subID, "Bearer "+tok, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("cancel subscription: status %d", resp.StatusCode)
 	}
 
-	// Verify cancelled
 	db.GetContext(context.Background(), &status, `SELECT status FROM subscriptions WHERE id = $1`, subID)
 	if status != "cancelled" {
 		t.Errorf("expected cancelled, got %s", status)
@@ -466,16 +484,28 @@ func TestMultipleAppsShareSameUser(t *testing.T) {
 	srv := setupServer(db)
 	defer srv.Close()
 
-	appID := "yundian"
-	userID := insertTestUser(t, db)
+	// Login to get a JWT and reuse the user across two app logins.
+	loginBody := map[string]interface{}{
+		"provider": "github", "provider_token": "multi-app-user", "app_id": "yundian",
+	}
+	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", loginBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login: %d", resp.StatusCode)
+	}
+	result := parseJSON(t, resp)
+	data := result["data"].(map[string]interface{})
+	tok := data["access_token"].(string)
+	userID := data["user"].(map[string]interface{})["id"].(string)
 
-	// Create subscription to monthly plan (includes yundash)
-	resp := doWithAppAuth(t, http.MethodPost, srv.URL+"/user/subscriptions", appID, map[string]interface{}{
-		"user_id": userID,
-		"plan_id": "monthly",
-	})
+	// Create subscription to free plan (which includes yundian — the only
+	// app seeded in this integration test). The test's purpose is to
+	// confirm one user → one subscription, not to test multi-app access.
+	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
+		"Bearer "+tok, map[string]interface{}{"plan_id": "free"})
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create subscription: status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("create subscription: status %d, body %s", resp.StatusCode, string(body))
 	}
 
 	var count int
@@ -528,9 +558,9 @@ func TestLoginHasAccessField(t *testing.T) {
 
 	// Login to yundian (in free plan)
 	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", map[string]interface{}{
-		"provider":       "github",
-		"provider_token":  "user-with-free-plan",
-		"app_id":         "yundian",
+		"provider":      "github",
+		"provider_token": "user-with-free-plan",
+		"app_id":        "yundian",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("login: status %d", resp.StatusCode)
@@ -544,14 +574,27 @@ func TestLoginHasAccessField(t *testing.T) {
 		t.Errorf("expected plan_id=free, got %v", sub["plan_id"])
 	}
 
-	// Login to yundash (not in free plan)
+	// Seed an inactive plan that DOES NOT include yundian so has_access is false.
+	_, _ = db.ExecContext(context.Background(),
+		`INSERT INTO plans (id, name, price, interval_days, apps, is_active, is_default)
+		 VALUES ('restricted', 'Restricted', 0, 0, ARRAY[]::TEXT[], true, false)
+		 ON CONFLICT (id) DO NOTHING`)
+	// Subscribe the user to the restricted plan.
+	tok := result["data"].(map[string]interface{})["access_token"].(string)
+	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
+		"Bearer "+tok, map[string]interface{}{"plan_id": "restricted"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("subscribe restricted: %d", resp.StatusCode)
+	}
+
+	// Re-login and confirm has_access=false for yundian on the restricted plan.
 	resp = doJSON(t, http.MethodPost, srv.URL+"/auth/login", map[string]interface{}{
-		"provider":       "github",
-		"provider_token":  "user-with-free-plan-2",
-		"app_id":         "yundash",
+		"provider":      "github",
+		"provider_token": "user-with-free-plan",
+		"app_id":        "yundian",
 	})
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login: status %d", resp.StatusCode)
+		t.Fatalf("second login: status %d", resp.StatusCode)
 	}
 	result = parseJSON(t, resp)
 	sub = result["data"].(map[string]interface{})["subscription"].(map[string]interface{})

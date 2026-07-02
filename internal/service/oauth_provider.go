@@ -16,13 +16,22 @@ import (
 // caps how long an /auth/login request can block on a slow OAuth provider.
 var providerHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
+// githubUserURL and googleUserURL are package vars so tests can point the
+// fetcher at an httptest server. Production leaves them at the canonical
+// endpoints. Each const-style value lives behind a var so a single test
+// can swap both endpoints to a stub server in one place.
+var (
+	githubUserURL   = "https://api.github.com/user"
+	githubEmailsURL = "https://api.github.com/user/emails"
+	googleUserURL   = "https://www.googleapis.com/oauth2/v3/userinfo"
+)
+
 // fetchGitHubUser verifies a GitHub OAuth access token by calling api.github.com
 // /user and /user/emails. It returns the canonical user info or an error wrapping
 // the cause. Returns ErrInvalidProviderToken (via "invalid provider token" prefix)
 // for 401/403 from GitHub so the caller can map it to a 401.
 func fetchGitHubUser(ctx context.Context, token string) (*ProviderUserInfo, error) {
-	const userURL = "https://api.github.com/user"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubUserURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build github user request: %w", err)
 	}
@@ -93,8 +102,7 @@ func fetchGitHubPrimaryEmail(ctx context.Context, token string) string {
 // /user/emails. Used to decide whether the inline email can be trusted for
 // account-merge purposes.
 func isGitHubPrimaryEmailVerified(ctx context.Context, token string) bool {
-	const emailsURL = "https://api.github.com/user/emails"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, emailsURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubEmailsURL, nil)
 	if err != nil {
 		return false
 	}
@@ -131,8 +139,7 @@ func isGitHubPrimaryEmailVerified(ctx context.Context, token string) bool {
 // falling back to any verified email, falling back to the first listed email.
 // Returns "" if the endpoint fails or no email is available.
 func fetchGitHubVerifiedPrimaryEmail(ctx context.Context, token string) string {
-	const emailsURL = "https://api.github.com/user/emails"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, emailsURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubEmailsURL, nil)
 	if err != nil {
 		return ""
 	}
@@ -177,8 +184,7 @@ func fetchGitHubVerifiedPrimaryEmail(ctx context.Context, token string) string {
 // fetchGoogleUser verifies a Google OAuth access token by calling the v3
 // userinfo endpoint. Same error-classification contract as fetchGitHubUser.
 func fetchGoogleUser(ctx context.Context, token string) (*ProviderUserInfo, error) {
-	const userURL = "https://www.googleapis.com/oauth2/v3/userinfo"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, googleUserURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build google user request: %w", err)
 	}

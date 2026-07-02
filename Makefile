@@ -17,6 +17,7 @@ migrate:
 	@echo "  psql -d yunhou_users -f migrations/001_init.sql"
 	@echo "  psql -d yunhou_users -f migrations/002_simplify_plans.sql"
 	@echo "  psql -d yunhou_users -f migrations/003_payments.sql"
+	@echo "  psql -d yunhou_users -f migrations/004_ls_channel.sql"
 
 lint:
 	go vet ./...

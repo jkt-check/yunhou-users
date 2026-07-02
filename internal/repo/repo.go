@@ -237,7 +237,11 @@ func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 
 func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
 	var a model.App
-	err := r.db.GetContext(ctx, &a, `SELECT * FROM apps WHERE app_id = $1`, id)
+	// COALESCE handles the case where config is NULL (Postgres JSONB) —
+	// sqlx can't scan nil into json.RawMessage.
+	err := r.db.GetContext(ctx, &a,
+		`SELECT app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, created_at, updated_at FROM apps WHERE app_id = $1`,
+		id)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +258,10 @@ func (r *appRepo) Update(ctx context.Context, a *model.App) error {
 
 func (r *appRepo) List(ctx context.Context) ([]model.App, error) {
 	var list []model.App
-	err := r.db.SelectContext(ctx, &list, `SELECT * FROM apps ORDER BY created_at`)
+	// COALESCE handles NULL config (Postgres JSONB) — sqlx can't scan nil
+	// into json.RawMessage. Matches the FindByID fix.
+	err := r.db.SelectContext(ctx, &list,
+		`SELECT app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, created_at, updated_at FROM apps ORDER BY created_at`)
 	return list, err
 }
 

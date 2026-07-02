@@ -291,7 +291,7 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 		Name:         req.Name,
 		Price:        req.Price,
 		IntervalDays: req.IntervalDays,
-		Apps:         req.Apps,
+		Apps:         pq.StringArray(req.Apps),
 		IsActive:     true,
 		IsDefault:    req.IsDefault,
 	}

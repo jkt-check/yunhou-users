@@ -113,13 +113,17 @@ type paymentRepo struct{ db *sqlx.DB }
 func NewPaymentRepo(db *sqlx.DB) *paymentRepo { return &paymentRepo{db: db} }
 
 func (r *paymentRepo) InsertPaidOnConflictDoNothing(ctx context.Context, p *model.Payment) (string, bool, error) {
+	rawPayload := p.RawPayload
+	if rawPayload == nil {
+		rawPayload = json.RawMessage(`{}`)
+	}
 	var id string
 	err := r.db.QueryRowxContext(ctx, `
 		INSERT INTO payments (order_id, channel, external_txn_id, amount, currency, status, paid_at, raw_payload)
-		VALUES (:order_id, :channel, :external_txn_id, :amount, :currency, 'paid', now(), :raw_payload)
+		VALUES ($1, $2, $3, $4, $5, 'paid', now(), $6)
 		ON CONFLICT (channel, external_txn_id) DO NOTHING
 		RETURNING id
-	`, p).Scan(&id)
+	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, rawPayload).Scan(&id)
 	if err != nil {
 		// sql.ErrNoRows means the ON CONFLICT absorbed a duplicate. The
 		// payment row already exists; caller should re-read it.

@@ -43,10 +43,11 @@ psql -h localhost -U postgres -c "SELECT datname FROM pg_database WHERE datname 
 ## 第三步：执行数据库迁移（建表）
 
 ```bash
-# 必须按顺序执行：001 创建核心表，002 简化订阅系统（依赖 001），003 添加支付/退款/Webhook 表
+# 必须按顺序执行：001 创建核心表，002 简化订阅系统（依赖 001），003 添加支付/退款/Webhook 表，004 扩展 CHECK 约束支持 lemonsqueezy 渠道
 psql -h localhost -U postgres -d yunhou_users -f migrations/001_init.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/003_payments.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/004_ls_channel.sql
 ```
 
 这会创建 11 张表：
@@ -54,6 +55,7 @@ psql -h localhost -U postgres -d yunhou_users -f migrations/003_payments.sql
 - 核心（001）：`users`、`social_identities`、`apps`、`subscriptions`、`sessions`
 - 订阅（002）：`plans`
 - 支付/退款/Webhook（003）：`orders`、`payments`、`refunds`、`webhook_events`、`audit_log`
+- 004 仅扩展 `payments` / `refunds` / `webhook_events` 的 channel CHECK 约束（增加 `lemonsqueezy`），不新增表
 
 验证表是否创建成功：
 
@@ -254,7 +256,7 @@ psql -h localhost -U postgres -c "SELECT 1 FROM pg_database WHERE datname = 'yun
 
 echo "检查表..."
 TABLE_COUNT=$(psql -h localhost -U postgres -d yunhou_users -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")
-echo "  公共表数量: $TABLE_COUNT (需要 11 张：001_init + 002_simplify_plans + 003_payments)"
+echo "  公共表数量: $TABLE_COUNT (需要 11 张：001_init + 002_simplify_plans + 003_payments；004 仅修改约束、不加表)"
 
 echo "检查密钥..."
 [ -f keys/private.pem ] && echo "✓ private.pem 存在" || echo "✗ 缺少 private.pem，请执行: make generate-keys"

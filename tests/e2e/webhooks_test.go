@@ -293,10 +293,12 @@ func TestWebhook_Stripe_DuplicateEvent(t *testing.T) {
 		t.Fatalf("second delivery: %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
 	var dup struct {
-		Duplicate bool `json:"duplicate"`
+		Data struct {
+			Duplicate bool `json:"duplicate"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &dup)
-	if !dup.Duplicate {
+	if !dup.Data.Duplicate {
 		t.Error("expected duplicate=true on second delivery")
 	}
 

@@ -59,9 +59,13 @@ on the host terminate TLS.
    ```bash
    # Apply migrations in order. 002 alters tables created by 001 and will
    # fail if 001 hasn't been applied yet. 003 adds payment/webhook tables.
+   # 004 extends CHECK constraints to allow channel='lemonsqueezy' (required
+   # before any LemonSqueezy webhook can be accepted — without it, the
+   # webhook_events INSERT would fail SQLSTATE 23514).
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/001_init.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/003_payments.sql
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/004_ls_channel.sql
    ```
 
 7. **Install Nginx config**

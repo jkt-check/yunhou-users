@@ -68,21 +68,20 @@ test.describe('@decline Sandbox error paths', () => {
         `SELECT status FROM orders WHERE id = $1`,
         [orderId],
       );
-      expect(['pending', 'expired', 'cancelled', 'failed']).toContain(
-        orderRowAfter.rows[0]?.status ?? 'none',
-      );
-      expect(orderRowBefore.rows[0]?.status).toEqual(orderRowAfter.rows[0]?.status);
+      // The only acceptable pre/post state for a no-event decline is
+      // 'pending'. Anything else means a stray webhook flipped the order
+      // — which would be exactly the bug we want to catch.
+      expect(orderRowBefore.rows[0]?.status).toBe('pending');
+      expect(orderRowAfter.rows[0]?.status).toBe('pending');
 
-      // And no active subscription was created for this user as a
-      // side effect.
+      // No active subscription was created for this user as a side effect
+      // — log in tokens are timestamped fresh per test run, so any active
+      // sub for this userId must be a side-effect of THIS run.
       const subs = await backend.db.query<{ count: number }>(
         `SELECT COUNT(*)::int as count FROM subscriptions WHERE user_id = $1 AND status = 'active'`,
         [userId],
       );
-      // Subscriptions from earlier tests may exist; just assert the test
-      // user is not MORE active than before. Pure baseline at 0 means no
-      // any side-effect happened.
-      expect(subs.rows[0].count).toBeLessThanOrEqual(1);
+      expect(subs.rows[0].count).toBe(0);
     } finally {
       await backend.close();
     }

@@ -113,18 +113,22 @@ jobs:
             sleep 1
           done
 
+          # Cleanup runs unconditionally (set +e), so processes die even
+          # if the test exits non-zero. Without this `set -e` would skip
+          # the kill on failure and leak ngrok + the backend.
+          cleanup() {
+            local exit_code=$?
+            kill "$BACKEND_PID" "$NGROK_PID" 2>/dev/null || true
+            return "$exit_code"
+          }
+          trap cleanup EXIT
+
           # 3) playwright (foreground, the point-of-failure step).
           cd tests/e2e-ui
           npm install --no-audit --no-fund
           npx playwright install --with-deps chromium
           WEBHOOK_BASE_URL="$NGROK_URL" npm run all
-          TEST_EXIT=$?
-
-          # 4) Cleanup daemons before the step's shell exits so we don't
-          # leak them; the GH runner tears down everything at job end
-          # anyway, but explicit kill is cleaner.
-          kill "$BACKEND_PID" "$NGROK_PID" 2>/dev/null || true
-          exit "$TEST_EXIT"
+          # DON'T set exit; the trap runs cleanup and exits with the test code.
 
       - name: Upload report on failure
         if: failure()

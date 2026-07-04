@@ -235,12 +235,20 @@ func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 	return err
 }
 
+// appSelectColumns is the canonical SELECT list for the apps table. It must
+// stay in sync with the column order produced by migration 002_simplify_plans
+// (app_id, name, description, config, is_active, created_at, updated_at) and
+// with model.App's field order so sqlx can scan rows into the struct.
+//
+// COALESCE(config, '{}'::jsonb) guards against sqlx's inability to scan a
+// NULL JSONB value into json.RawMessage. Keep the alias name (config) so
+// the `db:"config"` tag on model.App.Config still matches.
+const appSelectColumns = `app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, created_at, updated_at`
+
 func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
 	var a model.App
-	// COALESCE handles the case where config is NULL (Postgres JSONB) —
-	// sqlx can't scan nil into json.RawMessage.
 	err := r.db.GetContext(ctx, &a,
-		`SELECT app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, created_at, updated_at FROM apps WHERE app_id = $1`,
+		`SELECT `+appSelectColumns+` FROM apps WHERE app_id = $1`,
 		id)
 	if err != nil {
 		return nil, err
@@ -258,10 +266,8 @@ func (r *appRepo) Update(ctx context.Context, a *model.App) error {
 
 func (r *appRepo) List(ctx context.Context) ([]model.App, error) {
 	var list []model.App
-	// COALESCE handles NULL config (Postgres JSONB) — sqlx can't scan nil
-	// into json.RawMessage. Matches the FindByID fix.
 	err := r.db.SelectContext(ctx, &list,
-		`SELECT app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, created_at, updated_at FROM apps ORDER BY created_at`)
+		`SELECT `+appSelectColumns+` FROM apps ORDER BY created_at`)
 	return list, err
 }
 

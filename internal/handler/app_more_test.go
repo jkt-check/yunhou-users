@@ -16,17 +16,6 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
-// We need a unique mockPlanSvc field for our FK-violation test.
-type planSvcForDelete struct {
-	*mockPlanSvc
-	deleteErr error
-}
-
-// Ensure imports stay in use even when tests are edited down.
-var _ = sql.ErrNoRows
-var _ = errors.New
-var _ = (*MockAppRepo)(nil)
-
 // --- additional subscription handler tests ---
 
 func TestSubscriptionHandler_ListUserSubscriptions_OK(t *testing.T) {
@@ -422,14 +411,6 @@ func TestPlanHandler_DeletePlan_Success(t *testing.T) {
 		t.Errorf("status=%d", w.Code)
 	}
 }
-
-// fakePQError implements *pq.Error for the FK-violation code path.
-type fakePQError struct{ code string }
-
-func (e *fakePQError) Error() string             { return "fake pq error " + e.code }
-func (e *fakePQError) Code() string              { return e.code }
-func (e *fakePQError) SQLState() string          { return e.code }
-func (e *fakePQError) Message() string           { return "" }
 
 // newFKViolation returns a real *pq.Error whose Code() == "23503".
 func newFKViolation() error {

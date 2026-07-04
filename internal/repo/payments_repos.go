@@ -113,17 +113,13 @@ type paymentRepo struct{ db *sqlx.DB }
 func NewPaymentRepo(db *sqlx.DB) *paymentRepo { return &paymentRepo{db: db} }
 
 func (r *paymentRepo) InsertPaidOnConflictDoNothing(ctx context.Context, p *model.Payment) (string, bool, error) {
-	rawPayload := p.RawPayload
-	if rawPayload == nil {
-		rawPayload = json.RawMessage(`{}`)
-	}
 	var id string
 	err := r.db.QueryRowxContext(ctx, `
 		INSERT INTO payments (order_id, channel, external_txn_id, amount, currency, status, paid_at, raw_payload)
 		VALUES ($1, $2, $3, $4, $5, 'paid', now(), $6)
 		ON CONFLICT (channel, external_txn_id) DO NOTHING
 		RETURNING id
-	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, rawPayload).Scan(&id)
+	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, nonNilRawPayload(p.RawPayload)).Scan(&id)
 	if err != nil {
 		// sql.ErrNoRows means the ON CONFLICT absorbed a duplicate. The
 		// payment row already exists; caller should re-read it.
@@ -226,6 +222,18 @@ func (r *paymentRepo) ClearDisputed(ctx context.Context, id string) error {
 		WHERE id = $1
 	`, id)
 	return err
+}
+
+// nonNilRawPayload returns p unchanged when non-nil, otherwise an empty
+// JSON object. Postgres JSONB columns in this package have a DEFAULT '{}' on
+// the schema side, but sqlx's positional binding cannot represent a nil
+// json.RawMessage, so we coerce here at the single boundary used by every
+// INSERT that binds a raw payload.
+func nonNilRawPayload(p json.RawMessage) json.RawMessage {
+	if p == nil {
+		return json.RawMessage(`{}`)
+	}
+	return p
 }
 
 // ============================================================================
@@ -340,17 +348,13 @@ type webhookEventRepo struct{ db *sqlx.DB }
 func NewWebhookEventRepo(db *sqlx.DB) *webhookEventRepo { return &webhookEventRepo{db: db} }
 
 func (r *webhookEventRepo) InsertOnConflictDoNothing(ctx context.Context, e *model.WebhookEvent) (string, bool, error) {
-	rawPayload := e.RawPayload
-	if rawPayload == nil {
-		rawPayload = json.RawMessage(`{}`)
-	}
 	var id string
 	err := r.db.QueryRowxContext(ctx, `
 		INSERT INTO webhook_events (channel, event_id, event_type, raw_payload)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (channel, event_id) DO NOTHING
 		RETURNING id
-	`, e.Channel, e.EventID, e.EventType, rawPayload).Scan(&id)
+	`, e.Channel, e.EventID, e.EventType, nonNilRawPayload(e.RawPayload)).Scan(&id)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
 			return "", false, nil

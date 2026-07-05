@@ -166,6 +166,35 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
 }
 
+// GetProviderToken handles GET /apps/:id/provider-token/:channel.
+//
+// Auth is via the existing InternalAppAuth middleware (X-App-ID header) —
+// mounted in router.go on the same group as the other /apps routes. The
+// middleware verifies the caller's app_id matches an active app; the service
+// layer additionally loads apps.config.payment_providers.<channel> to read
+// the credentials before calling the provider.
+func (h *AppHandler) GetProviderToken(c *gin.Context) {
+	appID := c.Param("id")
+	channel := c.Param("channel")
+	tok, err := h.providerToken.Get(c.Request.Context(), appID, channel)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrUnsupportedChannel):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "unsupported channel"})
+		case errors.Is(err, service.ErrAppNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+		case errors.Is(err, service.ErrAppInactive):
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "app is disabled"})
+		case errors.Is(err, service.ErrProviderNotConfigured):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "provider not configured for app"})
+		default:
+			c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "provider upstream error"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": tok})
+}
+
 // validateAppConfig ensures any configured payment provider has all required
 // fields. Operators can leave payment_providers entirely absent (no providers
 // configured) or include only the providers they intend to use; missing or

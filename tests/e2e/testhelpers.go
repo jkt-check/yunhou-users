@@ -228,10 +228,16 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+	// providerTokenSvc is wired with nil paypal/ls so the route works but
+	// any call would fail at the provider layer; e2e tests for /provider-token
+	// in tests/e2e/provider_token_test.go set up apps.config with lemonsqueezy
+	// only, which doesn't touch the nil paypal fetcher.
+	providerTokenSvc := service.NewProviderTokenService(appRepo, nil, nil)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
-		paymentSvc, &middleware.MultiChannelVerifier{}, nil)
+		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
+		providerTokenSvc)
 
 	return engine, nil, db
 }
@@ -443,10 +449,12 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+	providerTokenSvc := service.NewProviderTokenService(appRepo, nil, nil)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
-		paymentSvc, mv, []byte(e2eWeChatKey))
+		paymentSvc, mv, []byte(e2eWeChatKey),
+		providerTokenSvc)
 
 	// Stash the private key in a closure-accessible holder so signing helpers
 	// can produce valid signatures. (We don't expose the priv directly to

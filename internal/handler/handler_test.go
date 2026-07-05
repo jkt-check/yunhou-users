@@ -1193,3 +1193,124 @@ func (m *mockIdentityRepo) DeleteIfNotLast(ctx context.Context, id, userID strin
 	}
 	return m.deleteResult, nil
 }
+
+// --- GetProviderToken tests ---
+
+type fakeProviderToken struct {
+	result *model.ProviderToken
+	err    error
+	calls  int
+}
+
+func (f *fakeProviderToken) Get(ctx context.Context, appID, channel string) (*model.ProviderToken, error) {
+	f.calls++
+	return f.result, f.err
+}
+
+func TestAppHandler_GetProviderToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("paypal success", func(t *testing.T) {
+		appRepo := &mockAppRepo{apps: []model.App{{AppID: "site", IsActive: true}}}
+		pt := &fakeProviderToken{result: &model.ProviderToken{Channel: "paypal", AccessToken: "AT", ExpiresIn: 3600}}
+		handler := NewAppHandler(appRepo, pt)
+		router := gin.New()
+		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code int                  `json:"code"`
+			Data *model.ProviderToken `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Data == nil || resp.Data.AccessToken != "AT" {
+			t.Errorf("data = %+v", resp.Data)
+		}
+		if pt.calls != 1 {
+			t.Errorf("service calls = %d, want 1", pt.calls)
+		}
+	})
+
+	t.Run("unsupported channel returns 400", func(t *testing.T) {
+		pt := &fakeProviderToken{err: service.ErrUnsupportedChannel}
+		handler := NewAppHandler(&mockAppRepo{}, pt)
+		router := gin.New()
+		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/stripe", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", w.Code)
+		}
+	})
+
+	t.Run("provider not configured returns 400", func(t *testing.T) {
+		pt := &fakeProviderToken{err: service.ErrProviderNotConfigured}
+		handler := NewAppHandler(&mockAppRepo{}, pt)
+		router := gin.New()
+		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", w.Code)
+		}
+	})
+
+	t.Run("app inactive returns 403", func(t *testing.T) {
+		pt := &fakeProviderToken{err: service.ErrAppInactive}
+		handler := NewAppHandler(&mockAppRepo{}, pt)
+		router := gin.New()
+		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", w.Code)
+		}
+	})
+
+	t.Run("app not found returns 404", func(t *testing.T) {
+		pt := &fakeProviderToken{err: service.ErrAppNotFound}
+		handler := NewAppHandler(&mockAppRepo{}, pt)
+		router := gin.New()
+		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/missing/provider-token/paypal", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
+		}
+	})
+
+	t.Run("upstream error returns 502", func(t *testing.T) {
+		pt := &fakeProviderToken{err: errors.New("upstream failed")}
+		handler := NewAppHandler(&mockAppRepo{}, pt)
+		router := gin.New()
+		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("status = %d, want 502", w.Code)
+		}
+	})
+}

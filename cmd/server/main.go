@@ -14,6 +14,8 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/jmoiron/sqlx"
+	"github.com/yunhou/users/internal/billing/lemonsqueezy"
+	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
@@ -88,6 +90,18 @@ func main() {
 	// means that channel returns 404 (not configured).
 	webhookVerifier := buildWebhookVerifier(cfg)
 
+	// Provider-token plumbing. PayPal uses a live base URL by default; the
+	// cache collapses repeat fetches within the same client_id's TTL window.
+	// LS credential is per-request from apps.config, so we pass a nil-backed
+	// credential here — the service only calls APIKey() on the lemonsqueezy
+	// path, which it never reaches for the paypal-only apps we ship today.
+	paypalHTTPClient := &http.Client{Timeout: 5 * time.Second}
+	paypalOAuth := paypal.NewOAuthClient(paypalHTTPClient, paypal.ModeLive.BaseURL())
+	paypalCache := paypal.NewTokenCache(60 * time.Second)
+	paypalFetcher := paypal.NewCachedClient(paypalOAuth, paypalCache)
+	lsCredential := lemonsqueezy.NewCredential(nil)
+	providerTokenSvc := service.NewProviderTokenService(appRepo, paypalFetcher, lsCredential)
+
 	// Order expiry sweeper (in-process goroutine).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)
 
@@ -109,7 +123,8 @@ func main() {
 	router.Setup(rootCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
-		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key))
+		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
+		providerTokenSvc)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

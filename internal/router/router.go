@@ -27,6 +27,7 @@ func Setup(
 	paymentSvc *service.PaymentService,
 	webhookVerifier middleware.ChannelSignatureVerifier,
 	wechatAPIv3Key []byte,
+	providerTokenSvc *service.ProviderTokenService,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -34,10 +35,7 @@ func Setup(
 
 	// Handlers
 	authHandler := handler.NewAuthHandler(authSvc, tokenSvc)
-	// providerToken is nil here — Task 8 (GET /apps/:id/provider-token/:channel)
-	// wires the real *service.ProviderTokenService into the handler. Until then
-	// calls to GetProviderToken panic, but no route invokes it yet.
-	appHandler := handler.NewAppHandler(appRepo, nil)
+	appHandler := handler.NewAppHandler(appRepo, providerTokenSvc)
 	subHandler := handler.NewSubscriptionHandler(subSvc)
 	planHandler := handler.NewPlanHandler(planSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
@@ -71,6 +69,7 @@ func Setup(
 	{
 		appGroup.GET("", appHandler.ListApps)
 		appGroup.GET("/:id", appHandler.GetApp)
+		appGroup.GET("/:id/provider-token/:channel", appHandler.GetProviderToken)
 	}
 
 	// Admin routes for plan management (internal service auth)

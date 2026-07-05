@@ -68,6 +68,7 @@ All configuration is via environment variables (or `.env` file):
 | POST | `/auth/login` | Login with provider token |
 | POST | `/auth/refresh` | Refresh tokens |
 | POST | `/auth/logout` | Logout (revoke refresh token) |
+| GET | `/apps/:id/plans` | Public plan catalog (price + provider plan IDs + cycle) |
 
 ### User Endpoints (JWT Bearer)
 
@@ -80,6 +81,7 @@ All configuration is via environment variables (or `.env` file):
 | GET | `/user/subscriptions` | List user's subscriptions |
 | POST | `/user/subscriptions` | Create subscription |
 | DELETE | `/user/subscriptions/:id` | Cancel subscription |
+| POST | `/apps/:id/quote` | Quote a plan for an app (amount, sub_expires_at, per-channel provider_data) |
 
 ### App/Plan Management Endpoints (Internal Auth)
 
@@ -87,6 +89,7 @@ All configuration is via environment variables (or `.env` file):
 |---|---|---|
 | GET | `/apps` | List all apps |
 | GET | `/apps/:id` | Get app details |
+| GET | `/apps/:id/provider-token/:channel` | Fetch upstream credential for `paypal` / `lemonsqueezy` (PayPal OAuth is cached in-process ~1h, LS returns the static api_key) |
 | GET | `/admin/plans` | List all plans |
 | GET | `/admin/plans/:id` | Get plan details |
 | POST | `/admin/plans` | Create plan |
@@ -95,7 +98,17 @@ All configuration is via environment variables (or `.env` file):
 | POST | `/admin/apps` | Create app |
 | PATCH | `/admin/apps/:id` | Update app |
 
+**Auth flavors**
+
+- `GET /apps/:id/plans` — **public**, no header, no JWT.
+- `POST /apps/:id/quote` — **JWT Bearer**. The quote is computed per-user (JWT identifies `user_id`); mounted at the engine level so it does not collide with the `X-App-ID` wrapper around the other `/apps/:id/*` routes.
+- `GET /apps/:id/provider-token/:channel` — **internal service auth** (`X-App-ID` header). BFF calls this with its own service credentials; never expose to end users.
+
 App management endpoints require `X-App-ID` header. Public and user endpoints do not.
+
+### v2 known limitations
+
+- `POST /apps/:id/quote` response hardcodes `currency = "USD"` (multi-currency is not supported in v1; the `plans` table has no currency column today).
 
 ## Authentication Flow
 

@@ -50,8 +50,8 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `DATABASE_URL` | No | `postgres://localhost/yunhou_users?sslmode=disable` | |
 | `RSA_PRIVATE_KEY_PATH` | No | `keys/private.pem` | File path |
 | `RSA_PUBLIC_KEY_PATH` | No | `keys/public.pem` | File path |
-| `JWT_ACCESS_TTL` | No | `15m` | |
-| `JWT_REFRESH_TTL` | No | `168h` (7 days) | |
+| `JWT_ACCESS_TTL` | No | `15m` | Must be positive |
+| `JWT_REFRESH_TTL` | No | `168h` (7 days) | Must be > access TTL; ≤ 365 days |
 | `ORDER_EXPIRY_DURATION` | No | `30m` | Pending order TTL; sweeper flips to `expired` after this |
 | `SWEEPER_INTERVAL` | No | `1m` | Must be < `ORDER_EXPIRY_DURATION` |
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
@@ -75,15 +75,18 @@ All endpoints return:
 ## Endpoints
 
 **Public** (rate-limited 10/s burst 20 per IP):
-- `GET /healthz`, `GET /.well-known/jwks.json`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`
+- `GET /healthz`, `GET /.well-known/jwks.json`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /apps/:id/plans`
 
 **User** (JWT Bearer auth):
 - `GET /user/profile`, `PATCH /user/profile`, `GET /user/identities`, `DELETE /user/identities/:id`, `GET /user/subscriptions`, `POST /user/subscriptions`, `DELETE /user/subscriptions/:id`
+- `POST /apps/:id/quote` — JWT-authed quote endpoint mounted at the engine level (NOT under `/user`) so the URL stays `/apps/:id/quote`; the handler reads `user_id` from JWT context. `currency` is hardcoded `"USD"` in v1.
 
 **App management** (internal service auth via `X-App-ID` header, rate-limited 30/s burst 60 per IP):
-- `GET /apps`, `GET /apps/:id`
+- `GET /apps`, `GET /apps/:id`, `GET /apps/:id/provider-token/:channel`
 - `GET /admin/plans`, `GET /admin/plans/:id`, `POST /admin/plans`, `PATCH /admin/plans/:id`, `DELETE /admin/plans/:id`
 - `POST /admin/apps`, `PATCH /admin/apps/:id`
+
+**Cycle precedence**: when both PayPal and LemonSqueezy are configured for the same `plan_id`, the resolved cycle (and therefore `sub_expires_at`) uses PayPal's `trial_days + billing_cycle_days`. Keep PayPal's billing-cycle definition in sync with operator config or the computed `sub_expires_at` will diverge from what PayPal actually bills.
 
 ## Design Principles
 

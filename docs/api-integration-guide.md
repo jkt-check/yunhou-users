@@ -256,6 +256,52 @@ curl https://your-yunhou-domain/user/profile \
 {"code": 0, "message": "logged out"}
 ```
 
+#### GET /apps/:id/plans
+
+公共的 Plan 目录接口，**无需鉴权**（无需 `X-App-ID`、无需 JWT）。返回指定 App 当前启用的 Plans，每个 Plan 附带上游渠道的 plan_id / variant_id 与解析后的 trial / billing cycle，方便营销页直接渲染价格 + "前 X 天免费，之后每 Y 天 $Z"。
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": [
+    {
+      "id": "free",
+      "name": "免费",
+      "price": 0,
+      "interval_days": 0,
+      "is_default": true,
+      "provider_ids": {},
+      "cycle": null
+    },
+    {
+      "id": "monthly",
+      "name": "按月订阅",
+      "price": 29.9,
+      "interval_days": 30,
+      "is_default": false,
+      "provider_ids": {"paypal": "P-MONTHLY-7D", "lemonsqueezy": "var-MONTHLY"},
+      "cycle": {"trial_days": 7, "billing_cycle_days": 30}
+    }
+  ]
+}
+```
+
+**响应字段**：
+
+| 字段 | 说明 |
+|------|------|
+| `provider_ids` | 该 Plan 在每个已配置渠道下对应的 provider plan/variant ID。未配置渠道不出现在 map 中。无任何渠道配置时为 `{}`（BFF 即可判定"当前 App 该 Plan 暂无可下单渠道"）。 |
+| `cycle` | 解析后的试用 + 计费周期；用于营销页文案。未配置任何渠道时为 `null`（BFF 应回退到 `interval_days`）。 |
+
+**cycle 解析规则**：当 PayPal 和 LemonSqueezy 都为同一 `plan_id` 配置了 plan 记录时，**PayPal 的 `trial_days` + `billing_cycle_days` 胜出**。运营侧需保证 PayPal 控制台上的账单周期与这里写下的值一致，否则营销页展示的 "X 天免费 / Y 天周期" 跟实际结算会不一致。
+
+**错误响应**：
+
+| HTTP | message | 触发条件 |
+|------|---------|----------|
+| 404 | `app not found` | `app_id` 不存在 |
+
 ---
 
 ### 用户接口
@@ -457,7 +503,56 @@ Authorization: Bearer <access_token>
 
 ### App 接口
 
-App 列表接口，查询可用的应用（**需 `X-App-ID` 内部服务头**，限流）。
+App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
+
+| 路径 | 鉴权 | 用途 |
+|------|------|------|
+| `GET /apps/:id/plans` | **无需鉴权**（公共） | 营销页拉取 Plan 目录 |
+| `GET /apps/:id/provider-token/:channel` | **`X-App-ID`**（内部服务） | BFF 拉取 PayPal/LS 凭据再调用上游 |
+| `POST /apps/:id/quote` | **JWT Bearer**（终端用户） | 给定 (app, plan) 给出下单报价 |
+
+#### apps.config JSONB 结构
+
+`apps.config` 是 JSONB 列，下游 schema 演进不会触发 DB migration。本节给出当前形态；新增可选 provider 块时，旧配置行缺该字段即视为"未配置"，无需回填。
+
+```json
+{
+  "brand": { "name": "云店" },
+  "payment_providers": {
+    "paypal": {
+      "client_id": "...",
+      "client_secret": "...",
+      "webhook_id": "W-...",
+      "mode": "live",
+      "plans": {
+        "monthly": {
+          "plan_id": "P-MONTHLY-7D",
+          "trial_days": 7,
+          "billing_cycle_days": 30
+        }
+      }
+    },
+    "lemonsqueezy": {
+      "api_key": "lsq_...",
+      "store_id": "12345",
+      "plans": {
+        "monthly": {
+          "variant_id": "var-MONTHLY",
+          "trial_days": 0,
+          "billing_cycle_days": 30
+        }
+      }
+    }
+  }
+}
+```
+
+要点：
+
+- 每个 `<channel>.plans` 是 `plan_id -> 配置对象` 的 map；`plan_id` 与业务 `plans.id` 同名（运营侧负责对齐）。
+- `trial_days` / `billing_cycle_days` 决定 `sub_expires_at = now + trial + cycle` 的计算结果；务必与渠道控制台账单周期同步。`billing_cycle_days` 缺省时回退到 `plans.interval_days`。
+- `brand.name` 缺省回退到 `apps.name`，对应 PayPal `application_context.brand_name` 与 LS `checkout_data.custom.brand`。
+- v2 schema 把早期"扁平的 `{plan_id: "P-…"}` map" 改成了嵌套对象形；现存配置行如果有旧形态，需通过 `PATCH /admin/apps/:id` 重写为新形态，否则该 plan 在 quote / catalog 接口里查不到。
 
 #### GET /apps
 
@@ -505,6 +600,129 @@ App 列表接口，查询可用的应用（**需 `X-App-ID` 内部服务头**，
 ```json
 {"code": 404, "message": "app not found"}
 ```
+
+#### GET /apps/:id/provider-token/:channel
+
+为 BFF 拉取 PayPal / LemonSqueezy 上游凭据，避免敏感凭据下沉到消费方代码（`BFF fetch upstream with short-lived PayPal token` / `BFF sign LS requests with api_key`，不需要在 BFF 端做长期凭据托管）。**鉴权为 `X-App-ID` 内部服务头**——BFF 后端用其内部服务身份调用，绝不下发给终端用户。
+
+**路径参数**：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `id` | 是 | App ID |
+| `channel` | 是 | `paypal` 或 `lemonsqueezy` |
+
+**响应（200）**—— PayPal：
+```json
+{
+  "code": 0,
+  "data": {
+    "channel": "paypal",
+    "access_token": "A21AAG.xxx",
+    "expires_in": 3600
+  }
+}
+```
+
+**响应（200）**—— LemonSqueezy：
+```json
+{
+  "code": 0,
+  "data": {
+    "channel": "lemonsqueezy",
+    "api_key": "lsq_xxxxx"
+  }
+}
+```
+
+行为差异：
+
+- PayPal：yunhou-users 真正去 PayPal OAuth `client_credentials` 接口拿 access token，并在进程内缓存约 1 小时（TTL = `expires_in - safety_margin`）。并发去重（同一 `client_id` 同时只有一次上游调用）；单 Yunhou 实例维度缓存，多实例各自刷新（PayPal 的 `client_credentials` 对相同凭据幂等）。
+- LemonSqueezy：仅返回 `apps.config.payment_providers.lemonsqueezy.api_key`（LS webhook-only，不消耗 access token）。
+
+**错误响应**：
+
+| HTTP | message | 触发条件 |
+|------|---------|----------|
+| 400 | `unsupported channel` | `channel` 取值不在 `paypal` / `lemonsqueezy` |
+| 400 | `provider not configured for app` | App 未配置对应 provider 块 |
+| 403 | `app is disabled` | App 已停用 |
+| 404 | `app not found` | App 不存在 |
+| 500 | `provider token service unavailable` | 服务依赖未注入（理论上不会发生；防御性兜底） |
+| 502 | `provider upstream error` | PayPal OAuth 调用失败（网络、认证、配额）；LemonSqueezy 路径目前只返回静态 `api_key`，不产生 502 |
+
+#### POST /apps/:id/quote
+
+下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal/LS 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**，终端用户身份触发；handler 读 JWT 上下文中的 `user_id`（当前不强制 gating，仅用于未来审计日志）。
+
+**路径参数**：`id` 是 App ID。
+
+**请求体**：
+```json
+{ "plan_id": "monthly" }
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `plan_id` | 是 | 计划 ID。必须是该 App 所属的 Plan（`plan.apps` 包含 `app_id`） |
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": {
+    "plan_id": "monthly",
+    "amount": 29.9,
+    "currency": "USD",
+    "sub_expires_at": "2026-08-04T00:00:00Z",
+    "cycle_config": {
+      "trial_days": 7,
+      "billing_cycle_days": 30,
+      "base": "now + trial + cycle"
+    },
+    "provider_data": {
+      "paypal": {
+        "plan_id": "P-MONTHLY-7D",
+        "application_context": {
+          "brand_name": "云店",
+          "shipping_preference": "NO_SHIPPING",
+          "user_action": "SUBSCRIBE_NOW"
+        }
+      },
+      "lemonsqueezy": {
+        "variant_id": "var-MONTHLY",
+        "checkout_data": {
+          "custom": { "brand": "云店" }
+        }
+      }
+    }
+  }
+}
+```
+
+**响应字段**：
+
+| 字段 | 说明 |
+|------|------|
+| `amount` | 透传 `plans.price` |
+| `currency` | **v1 硬编码 `"USD"`**，与 `/payments/orders` 的 `currency` 字段无关。多币种尚不支持 |
+| `sub_expires_at` | `now + trial_days + billing_cycle_days`（服务器时间）。Webhook 回调时 Yunhou 直接把它写入订阅过期时间，所以 BFF 不必自己算 |
+| `cycle_config.base` | 恒为 `"now + trial + cycle"`，给审计/排查时一眼看出计算方式 |
+| `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK |
+
+**Cycle 解析规则**：当同一 `plan_id` 下 PayPal 与 LemonSqueezy 都配置了 plan 记录，**PayPal 的 `trial_days + billing_cycle_days` 胜出**，LemonSqueezy 的同名字段仅出现在 `provider_data.lemonsqueezy.checkout_data.custom` 中、不会影响 `sub_expires_at`。运营侧必须保证 PayPal 控制台的账单周期跟 `provider_data.paypal.plan_id` 对应的 product 一致，否则报价跟实际结算对不上。
+
+**错误响应**：
+
+| HTTP | message | 触发条件 |
+|------|---------|----------|
+| 400 | `invalid request body` | 请求体缺失或字段类型错误 |
+| 400 | `plan is inactive` | Plan 已停用 |
+| 400 | `plan does not include this app` | `plan.apps` 不包含该 `app_id` |
+| 403 | `app is disabled` | App 已停用 |
+| 404 | `plan not found` | `plan_id` 不存在 |
+| 404 | `app not found` | App 不存在 |
+| 500 | `failed to compute quote` | 服务端异常（DB 或 `apps.config` JSON 解析失败） |
 
 ---
 

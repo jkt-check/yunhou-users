@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/yunhou/users/internal/model"
 )
@@ -83,5 +86,109 @@ func TestE2E_GetAppPlans_AppNotFound(t *testing.T) {
 	resp := doRequest(t, engine, http.MethodGet, "/apps/no-such-app/plans", "", nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestE2E_PostQuote_HappyPath(t *testing.T) {
+	engine, _, db := setupE2EServer(t)
+
+	appID := "e2e-quote-" + randomSuffix()
+	createBody := `{"app_id":"` + appID + `","name":"Quote E2E","config":{"brand":{"name":"E2E Brand"},"payment_providers":{"paypal":{"client_id":"cid","client_secret":"cs","webhook_id":"W","mode":"sandbox","plans":{"qp":{"plan_id":"P-Q","trial_days":7,"billing_cycle_days":30}}},"lemonsqueezy":{"api_key":"lsq_k","store_id":"12345","plans":{"qp":{"variant_id":"var-Q","trial_days":0,"billing_cycle_days":30}}}}}}`
+	createResp := doRequest(t, engine, http.MethodPost, "/admin/apps", createBody, map[string]string{"X-App-ID": "yundian"})
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
+	}
+
+	// Seed a plan whose apps include our new app_id. setupE2EServer would
+	// wipe the app we just created if called again, so we reuse the db handle.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO plans (id, name, price, interval_days, apps, is_active)
+		 VALUES ('qp', 'Quote Plan', 29.9, 30, ARRAY[$1], true)`, appID); err != nil {
+		t.Fatalf("seed plan: %v", err)
+	}
+
+	token, _ := loginAndGetToken(t, engine, "e2e-quote-user-"+randomSuffix(), appID)
+
+	body := `{"plan_id":"qp"}`
+	req, _ := http.NewRequest(http.MethodPost, "/apps/"+appID+"/quote", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Code int          `json:"code"`
+		Data *model.Quote `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp.Data == nil {
+		t.Fatalf("nil data; body = %s", w.Body.String())
+	}
+	if resp.Data.PlanID != "qp" {
+		t.Errorf("plan_id = %q", resp.Data.PlanID)
+	}
+	if resp.Data.Amount != 29.9 {
+		t.Errorf("amount = %v, want 29.9", resp.Data.Amount)
+	}
+	if resp.Data.Currency != "USD" {
+		t.Errorf("currency = %q", resp.Data.Currency)
+	}
+	if resp.Data.CycleConfig.TrialDays != 7 || resp.Data.CycleConfig.BillingCycleDays != 30 {
+		t.Errorf("cycle_config = %+v, want {7,30}", resp.Data.CycleConfig)
+	}
+	delta := time.Until(resp.Data.SubExpiresAt)
+	wantDelta := 37 * 24 * time.Hour
+	if delta < wantDelta-time.Hour || delta > wantDelta+time.Hour {
+		t.Errorf("sub_expires_at delta = %v, want ~%v", delta, wantDelta)
+	}
+	if _, ok := resp.Data.ProviderData["paypal"]; !ok {
+		t.Error("provider_data missing paypal")
+	}
+	if _, ok := resp.Data.ProviderData["lemonsqueezy"]; !ok {
+		t.Error("provider_data missing lemonsqueezy")
+	}
+}
+
+func TestE2E_PostQuote_NoAuthReturns401(t *testing.T) {
+	engine, _, _ := setupE2EServer(t)
+	req, _ := http.NewRequest(http.MethodPost, "/apps/yundian/quote", strings.NewReader(`{"plan_id":"monthly"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401; body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestE2E_PostQuote_PlanNotFound(t *testing.T) {
+	engine, _, _ := setupE2EServer(t)
+	token, _ := loginAndGetToken(t, engine, "e2e-quote-user-"+randomSuffix(), "yundian")
+	req, _ := http.NewRequest(http.MethodPost, "/apps/yundian/quote", strings.NewReader(`{"plan_id":"no-such-plan"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestE2E_PostQuote_PlanAppMismatch(t *testing.T) {
+	engine, _, _ := setupE2EServer(t)
+	// monthly plan apps={yundian, yundash}; free plan apps={yundian}.
+	// Requesting "free" plan for app yundash — free doesn't include yundash.
+	token, _ := loginAndGetToken(t, engine, "e2e-mismatch-"+randomSuffix(), "yundash")
+	req, _ := http.NewRequest(http.MethodPost, "/apps/yundash/quote", strings.NewReader(`{"plan_id":"free"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body = %s", w.Code, w.Body.String())
 	}
 }

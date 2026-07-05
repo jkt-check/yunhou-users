@@ -28,6 +28,7 @@ type SocialIdentityRepo interface {
 type PlanRepo interface {
 	FindAll(ctx context.Context) ([]model.Plan, error)
 	FindByID(ctx context.Context, id string) (*model.Plan, error)
+	FindByApp(ctx context.Context, appID string) ([]model.Plan, error)
 	FindDefault(ctx context.Context) (*model.Plan, error)
 	Create(ctx context.Context, p *model.Plan) error
 	Update(ctx context.Context, p *model.Plan) error
@@ -201,6 +202,20 @@ func (r *planRepo) FindDefault(ctx context.Context) (*model.Plan, error) {
 		return nil, err
 	}
 	return &p, nil
+}
+
+// FindByApp returns active plans whose `apps` array contains appID, ordered
+// by created_at so listing is stable across calls. Used by the public
+// GET /apps/:id/plans endpoint (M2) to surface plans available for an app.
+func (r *planRepo) FindByApp(ctx context.Context, appID string) ([]model.Plan, error) {
+	var list []model.Plan
+	err := r.db.SelectContext(ctx, &list,
+		`SELECT * FROM plans WHERE $1 = ANY(apps) AND is_active = true ORDER BY created_at, id`,
+		appID)
+	if err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 func (r *planRepo) Create(ctx context.Context, p *model.Plan) error {

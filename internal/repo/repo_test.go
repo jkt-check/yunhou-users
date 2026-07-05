@@ -346,6 +346,62 @@ func TestPlanRepo_FindDefault(t *testing.T) {
 	}
 }
 
+func TestPlanRepo_FindByApp(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	// Seed apps: yundian (existing) and yundash (new). Plans from setupDB
+	// already cover both — free for yundian only, monthly for both.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO apps (app_id, name, is_active) VALUES ('yundash', 'Yundash', true)
+		 ON CONFLICT (app_id) DO NOTHING`); err != nil {
+		t.Fatalf("seed yundash: %v", err)
+	}
+
+	got, err := r.FindByApp(context.Background(), "yundian")
+	if err != nil {
+		t.Fatalf("FindByApp(yundian): %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("yundian plans = %d, want 2 (free+monthly); got %+v", len(got), got)
+	}
+
+	got, err = r.FindByApp(context.Background(), "yundash")
+	if err != nil {
+		t.Fatalf("FindByApp(yundash): %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "monthly" {
+		t.Errorf("yundash plans = %+v, want [monthly]", got)
+	}
+
+	// Unknown app returns empty (not an error).
+	got, err = r.FindByApp(context.Background(), "no-such-app")
+	if err != nil {
+		t.Errorf("unknown app: err = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("unknown app: got %d plans, want 0", len(got))
+	}
+}
+
+func TestPlanRepo_FindByApp_ExcludesInactive(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE plans SET is_active = false WHERE id = 'monthly'`); err != nil {
+		t.Fatalf("deactivate monthly: %v", err)
+	}
+
+	got, err := r.FindByApp(context.Background(), "yundian")
+	if err != nil {
+		t.Fatalf("FindByApp: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "free" {
+		t.Errorf("after deactivating monthly: got %+v, want only [free]", got)
+	}
+}
+
 func TestPlanRepo_CreateUpdateDelete(t *testing.T) {
 	db := setupDB(t)
 	r := NewPlanRepo(db)

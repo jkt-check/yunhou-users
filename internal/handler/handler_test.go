@@ -725,7 +725,7 @@ func TestAppHandler_CreateApp(t *testing.T) {
 		router := gin.New()
 		router.POST("/apps", handler.CreateApp)
 
-		body := `{"app_id":"site","name":"Site","config":{"payment_providers":{"paypal":{"client_id":"cid","client_secret":"cs","webhook_id":"W","mode":"live","plan_ids":{"m":"P"}}}}}`
+		body := `{"app_id":"site","name":"Site","config":{"payment_providers":{"paypal":{"client_id":"cid","client_secret":"cs","webhook_id":"W","mode":"live","plans":{"m":{"plan_id":"P","trial_days":0,"billing_cycle_days":30}}}}}}`
 		req := httptest.NewRequest(http.MethodPost, "/apps", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()

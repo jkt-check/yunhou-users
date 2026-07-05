@@ -138,11 +138,12 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 
 	engine := gin.New()
 	gin.SetMode(gin.TestMode)
-	// Webhook routes are not exercised by integration_test.go; pass nil
-	// for the verifier/wechat-key args so the wiring still compiles.
+	// Webhook routes + v2 M1/M3 endpoints are not exercised by integration_test.go;
+	// pass nil for the webhook verifier/wechat-key and the two new v2 services so
+	// the wiring still compiles.
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
-		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil)
+		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil)
 
 	return httptest.NewServer(engine)
 }

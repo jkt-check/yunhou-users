@@ -14,7 +14,6 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/jmoiron/sqlx"
-	"github.com/yunhou/users/internal/billing/lemonsqueezy"
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/middleware"
@@ -92,15 +91,13 @@ func main() {
 
 	// Provider-token plumbing. PayPal uses a live base URL by default; the
 	// cache collapses repeat fetches within the same client_id's TTL window.
-	// LS credential is per-request from apps.config, so we pass a nil-backed
-	// credential here — the service only calls APIKey() on the lemonsqueezy
-	// path, which it never reaches for the paypal-only apps we ship today.
+	// LS is webhook-only in Yunhou — no outbound HTTP, the service reads the
+	// api_key directly from apps.config.payment_providers.lemonsqueezy.
 	paypalHTTPClient := &http.Client{Timeout: 5 * time.Second}
 	paypalOAuth := paypal.NewOAuthClient(paypalHTTPClient, paypal.ModeLive.BaseURL())
 	paypalCache := paypal.NewTokenCache(60 * time.Second)
 	paypalFetcher := paypal.NewCachedClient(paypalOAuth, paypalCache)
-	lsCredential := lemonsqueezy.NewCredential(nil)
-	providerTokenSvc := service.NewProviderTokenService(appRepo, paypalFetcher, lsCredential)
+	providerTokenSvc := service.NewProviderTokenService(appRepo, paypalFetcher)
 
 	// Order expiry sweeper (in-process goroutine).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)

@@ -228,11 +228,11 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
-	// providerTokenSvc is wired with nil paypal/ls so the route works but
-	// any call would fail at the provider layer; e2e tests for /provider-token
-	// in tests/e2e/provider_token_test.go set up apps.config with lemonsqueezy
-	// only, which doesn't touch the nil paypal fetcher.
-	providerTokenSvc := service.NewProviderTokenService(appRepo, nil, nil)
+	// providerTokenSvc is wired with nil paypal fetcher; the e2e tests for
+	// /provider-token in provider_token_test.go only exercise the lemonsqueezy
+	// path which doesn't touch the paypal fetcher. Adding paypal e2e later
+	// requires wiring a stub upstream.
+	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
@@ -449,7 +449,7 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
-	providerTokenSvc := service.NewProviderTokenService(appRepo, nil, nil)
+	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,

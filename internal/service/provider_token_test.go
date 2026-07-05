@@ -40,13 +40,6 @@ func (s *stubPaypal) FetchToken(ctx context.Context, clientID, clientSecret stri
 	return s.returnTok, s.returnErr
 }
 
-type stubLS struct {
-	returnKey string
-	returnErr error
-}
-
-func (s *stubLS) APIKey() (string, error) { return s.returnKey, s.returnErr }
-
 func mustJSONRaw(t *testing.T, s string) json.RawMessage {
 	t.Helper()
 	if !json.Valid([]byte(s)) {
@@ -62,7 +55,7 @@ func TestProviderToken_Get_Paypal(t *testing.T) {
 		Config:   mustJSONRaw(t, `{"payment_providers":{"paypal":{"client_id":"cid","client_secret":"cs","webhook_id":"W","mode":"live"}}}`),
 	}
 	pp := &stubPaypal{returnTok: &model.ProviderToken{Channel: "paypal", AccessToken: "AT", ExpiresIn: 3600}}
-	svc := NewProviderTokenService(&stubAppRepo{app: app}, pp, &stubLS{})
+	svc := NewProviderTokenService(&stubAppRepo{app: app}, pp)
 
 	got, err := svc.Get(context.Background(), "site", "paypal")
 	if err != nil {
@@ -79,7 +72,7 @@ func TestProviderToken_Get_LemonSqueezy(t *testing.T) {
 		IsActive: true,
 		Config:   mustJSONRaw(t, `{"payment_providers":{"lemonsqueezy":{"api_key":"lsq_k","store_id":"s"}}}`),
 	}
-	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{}, &stubLS{returnKey: "lsq_k"})
+	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{})
 
 	got, err := svc.Get(context.Background(), "site", "lemonsqueezy")
 	if err != nil {
@@ -92,14 +85,14 @@ func TestProviderToken_Get_LemonSqueezy(t *testing.T) {
 
 func TestProviderToken_Get_UnsupportedChannel(t *testing.T) {
 	app := &model.App{AppID: "site", IsActive: true}
-	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{}, &stubLS{})
+	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{})
 	if _, err := svc.Get(context.Background(), "site", "stripe"); !errors.Is(err, ErrUnsupportedChannel) {
 		t.Errorf("err = %v, want ErrUnsupportedChannel", err)
 	}
 }
 
 func TestProviderToken_Get_AppNotFound(t *testing.T) {
-	svc := NewProviderTokenService(&stubAppRepo{err: errors.New("missing")}, &stubPaypal{}, &stubLS{})
+	svc := NewProviderTokenService(&stubAppRepo{err: errors.New("missing")}, &stubPaypal{})
 	_, err := svc.Get(context.Background(), "missing", "paypal")
 	if !errors.Is(err, ErrAppNotFound) {
 		t.Errorf("err = %v, want ErrAppNotFound", err)
@@ -108,7 +101,7 @@ func TestProviderToken_Get_AppNotFound(t *testing.T) {
 
 func TestProviderToken_Get_AppInactive(t *testing.T) {
 	app := &model.App{AppID: "site", IsActive: false}
-	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{}, &stubLS{})
+	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{})
 	_, err := svc.Get(context.Background(), "site", "paypal")
 	if !errors.Is(err, ErrAppInactive) {
 		t.Errorf("err = %v, want ErrAppInactive", err)
@@ -117,7 +110,7 @@ func TestProviderToken_Get_AppInactive(t *testing.T) {
 
 func TestProviderToken_Get_ProviderNotConfigured_Paypal(t *testing.T) {
 	app := &model.App{AppID: "site", IsActive: true, Config: mustJSONRaw(t, `{}`)}
-	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{}, &stubLS{})
+	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{})
 	_, err := svc.Get(context.Background(), "site", "paypal")
 	if !errors.Is(err, ErrProviderNotConfigured) {
 		t.Errorf("err = %v, want ErrProviderNotConfigured", err)

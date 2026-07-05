@@ -15,23 +15,19 @@ type AppLookup interface {
 }
 
 // PaypalTokenFetcher abstracts the PayPal CachedClient (composes OAuth + cache).
+// PayPal is the one channel that needs an outbound HTTP call (OAuth client_credentials
+// grant); the rest just return data we already have in apps.config.
 type PaypalTokenFetcher interface {
 	FetchToken(ctx context.Context, clientID, clientSecret string) (*model.ProviderToken, error)
-}
-
-// LSCredential abstracts the LemonSqueezy credential lookup.
-type LSCredential interface {
-	APIKey() (string, error)
 }
 
 type ProviderTokenService struct {
 	apps   AppLookup
 	paypal PaypalTokenFetcher
-	ls     LSCredential
 }
 
-func NewProviderTokenService(apps AppLookup, paypal PaypalTokenFetcher, ls LSCredential) *ProviderTokenService {
-	return &ProviderTokenService{apps: apps, paypal: paypal, ls: ls}
+func NewProviderTokenService(apps AppLookup, paypal PaypalTokenFetcher) *ProviderTokenService {
+	return &ProviderTokenService{apps: apps, paypal: paypal}
 }
 
 // Sentinel errors mapped to HTTP codes by the handler. ErrAppNotFound and
@@ -68,11 +64,9 @@ func (s *ProviderTokenService) Get(ctx context.Context, appID, channel string) (
 		if cfg.PaymentProviders == nil || cfg.PaymentProviders.Lemonsqueezy == nil {
 			return nil, ErrProviderNotConfigured
 		}
-		key, err := s.ls.APIKey()
-		if err != nil {
-			return nil, ErrProviderNotConfigured
-		}
-		return &model.ProviderToken{Channel: "lemonsqueezy", APIKey: key}, nil
+		// LS is webhook-only in Yunhou — no outbound HTTP, just return the
+		// static api_key stored in apps.config.
+		return &model.ProviderToken{Channel: "lemonsqueezy", APIKey: cfg.PaymentProviders.Lemonsqueezy.APIKey}, nil
 	default:
 		return nil, ErrUnsupportedChannel
 	}

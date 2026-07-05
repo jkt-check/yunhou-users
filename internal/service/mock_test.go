@@ -183,6 +183,25 @@ func (m *mockPlanRepo) FindByID(_ context.Context, id string) (*model.Plan, erro
 	return p, nil
 }
 
+func (m *mockPlanRepo) FindByApp(_ context.Context, appID string) ([]model.Plan, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	var out []model.Plan
+	for _, p := range m.plans {
+		if !p.IsActive {
+			continue
+		}
+		for _, a := range p.Apps {
+			if a == appID {
+				out = append(out, *p)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 func (m *mockPlanRepo) FindDefault(_ context.Context) (*model.Plan, error) {
 	if m.err != nil {
 		return nil, m.err

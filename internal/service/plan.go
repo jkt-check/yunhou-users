@@ -24,6 +24,14 @@ func (s *PlanService) GetPlan(ctx context.Context, id string) (*model.Plan, erro
 	return s.planRepo.FindByID(ctx, id)
 }
 
+// FindByApp returns active plans whose `apps` array contains appID. Used by
+// the public GET /apps/:id/plans endpoint (M2) to enumerate plans available
+// for a given app — including their provider_ids sourced from
+// apps.config.payment_providers.
+func (s *PlanService) FindByApp(ctx context.Context, appID string) ([]model.Plan, error) {
+	return s.planRepo.FindByApp(ctx, appID)
+}
+
 func (s *PlanService) CreatePlan(ctx context.Context, p *model.Plan) error {
 	return s.planRepo.Create(ctx, p)
 }

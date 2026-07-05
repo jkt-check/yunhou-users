@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/lib/pq"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
 )
@@ -109,6 +110,19 @@ type mockPlanSvc struct {
 
 func (m *mockPlanSvc) ListPlans(ctx context.Context) ([]model.Plan, error) {
 	return m.plans, nil
+}
+
+func (m *mockPlanSvc) FindByApp(ctx context.Context, appID string) ([]model.Plan, error) {
+	var out []model.Plan
+	for _, p := range m.plans {
+		for _, a := range p.Apps {
+			if a == appID {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 func (m *mockPlanSvc) GetPlan(ctx context.Context, id string) (*model.Plan, error) {
@@ -333,7 +347,7 @@ func TestPlanHandler_ListPlans(t *testing.T) {
 			{ID: "monthly", Name: "Monthly", Apps: []string{"yundian", "yundash"}},
 		}
 		planSvc := &mockPlanSvc{plans: plans}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.GET("/admin/plans", handler.ListPlans)
@@ -353,7 +367,7 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 
 	t.Run("create plan success", func(t *testing.T) {
 		planSvc := &mockPlanSvc{}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.POST("/admin/plans", handler.CreatePlan)
@@ -371,7 +385,7 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 
 	t.Run("create plan invalid body", func(t *testing.T) {
 		planSvc := &mockPlanSvc{}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.POST("/admin/plans", handler.CreatePlan)
@@ -393,7 +407,7 @@ func TestPlanHandler_DeletePlan(t *testing.T) {
 
 	t.Run("delete plan success", func(t *testing.T) {
 		planSvc := &mockPlanSvc{}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.DELETE("/admin/plans/:id", handler.DeletePlan)
@@ -414,7 +428,7 @@ func TestPlanHandler_GetPlan(t *testing.T) {
 	t.Run("get plan success", func(t *testing.T) {
 		plan := &model.Plan{ID: "monthly", Name: "Monthly Plan"}
 		planSvc := &mockPlanSvc{plan: plan}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.GET("/admin/plans/:id", handler.GetPlan)
@@ -430,7 +444,7 @@ func TestPlanHandler_GetPlan(t *testing.T) {
 
 	t.Run("get plan not found", func(t *testing.T) {
 		planSvc := &mockPlanSvc{getErr: sql.ErrNoRows}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.GET("/admin/plans/:id", handler.GetPlan)
@@ -451,7 +465,7 @@ func TestPlanHandler_UpdatePlan(t *testing.T) {
 	t.Run("update plan success", func(t *testing.T) {
 		plan := &model.Plan{ID: "monthly", Name: "Monthly", Price: 9.99}
 		planSvc := &mockPlanSvc{plan: plan}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.PATCH("/admin/plans/:id", handler.UpdatePlan)
@@ -469,7 +483,7 @@ func TestPlanHandler_UpdatePlan(t *testing.T) {
 
 	t.Run("update plan not found", func(t *testing.T) {
 		planSvc := &mockPlanSvc{getErr: sql.ErrNoRows}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil)
 
 		router := gin.New()
 		router.PATCH("/admin/plans/:id", handler.UpdatePlan)
@@ -1311,6 +1325,117 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 
 		if w.Code != http.StatusBadGateway {
 			t.Errorf("status = %d, want 502", w.Code)
+		}
+	})
+}
+
+// --- PlanHandler.GetAppPlans tests ---
+
+func TestPlanHandler_GetAppPlans(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("happy path with paypal + ls configured", func(t *testing.T) {
+		plans := []model.Plan{
+			{ID: "free", Name: "Free", Price: 0, IntervalDays: 0, Apps: pq.StringArray{"yundian"}, IsActive: true, IsDefault: true},
+			{ID: "monthly", Name: "Monthly", Price: 29.9, IntervalDays: 30, Apps: pq.StringArray{"yundian"}, IsActive: true},
+		}
+		app := model.App{
+			AppID:    "yundian",
+			Name:     "Yundian",
+			IsActive: true,
+			Config: json.RawMessage(`{
+				"brand": {"name": "Yundian Brand"},
+				"payment_providers": {
+					"paypal": {"plans": {"monthly": {"plan_id": "P-1", "trial_days": 7, "billing_cycle_days": 30}}},
+					"lemonsqueezy": {"plans": {"monthly": {"variant_id": "var-1", "trial_days": 0, "billing_cycle_days": 30}}}
+				}
+			}`),
+		}
+		appRepo := &mockAppRepo{apps: []model.App{app}}
+		planSvc := &mockPlanSvc{plans: plans}
+		handler := NewPlanHandler(planSvc, appRepo)
+
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code int                `json:"code"`
+			Data []model.PublicPlan `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Data) != 2 {
+			t.Fatalf("got %d plans, want 2", len(resp.Data))
+		}
+		// free plan: no provider entries, no cycle
+		if resp.Data[0].ID != "free" {
+			t.Errorf("first plan id = %q, want free", resp.Data[0].ID)
+		}
+		if len(resp.Data[0].ProviderIDs) != 0 {
+			t.Errorf("free plan provider_ids = %+v, want empty", resp.Data[0].ProviderIDs)
+		}
+		// monthly plan: both channels populated, cycle from paypal (precedence)
+		if resp.Data[1].ID != "monthly" {
+			t.Errorf("second plan id = %q, want monthly", resp.Data[1].ID)
+		}
+		ppID := resp.Data[1].ProviderIDs["paypal"]
+		if ppID != "P-1" {
+			t.Errorf("monthly.paypal = %q, want P-1", ppID)
+		}
+		lsID := resp.Data[1].ProviderIDs["lemonsqueezy"]
+		if lsID != "var-1" {
+			t.Errorf("monthly.lemonsqueezy = %q, want var-1", lsID)
+		}
+		if resp.Data[1].Cycle == nil || resp.Data[1].Cycle.TrialDays != 7 || resp.Data[1].Cycle.BillingCycleDays != 30 {
+			t.Errorf("monthly.cycle = %+v, want {7, 30}", resp.Data[1].Cycle)
+		}
+	})
+
+	t.Run("app not found returns 404", func(t *testing.T) {
+		appRepo := &mockAppRepo{findErr: sql.ErrNoRows}
+		handler := NewPlanHandler(&mockPlanSvc{}, appRepo)
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/missing/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
+		}
+	})
+
+	t.Run("app with no payment_providers returns plans with empty provider_ids", func(t *testing.T) {
+		plans := []model.Plan{{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}}}
+		appRepo := &mockAppRepo{apps: []model.App{{AppID: "yundian", IsActive: true}}}
+		planSvc := &mockPlanSvc{plans: plans}
+		handler := NewPlanHandler(planSvc, appRepo)
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d", w.Code)
+		}
+		var resp struct {
+			Code int                `json:"code"`
+			Data []model.PublicPlan `json:"data"`
+		}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		if len(resp.Data) != 1 || len(resp.Data[0].ProviderIDs) != 0 {
+			t.Errorf("expected 1 plan with empty provider_ids, got %+v", resp.Data)
 		}
 	})
 }

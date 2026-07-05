@@ -37,7 +37,7 @@ func Setup(
 	authHandler := handler.NewAuthHandler(authSvc, tokenSvc)
 	appHandler := handler.NewAppHandler(appRepo, providerTokenSvc)
 	subHandler := handler.NewSubscriptionHandler(subSvc)
-	planHandler := handler.NewPlanHandler(planSvc)
+	planHandler := handler.NewPlanHandler(planSvc, appRepo)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier)
@@ -48,6 +48,11 @@ func Setup(
 	engine.POST("/auth/login", publicLimiter, authHandler.Login)
 	engine.POST("/auth/refresh", publicLimiter, authHandler.RefreshToken)
 	engine.POST("/auth/logout", publicLimiter, authHandler.Logout)
+
+	// Public plan listing — unauthenticated so marketing pages and the BFF
+	// can fetch the catalog without holding admin credentials. Plan IDs and
+	// prices are public info (they appear on the marketing site).
+	engine.GET("/apps/:id/plans", publicLimiter, planHandler.GetAppPlans)
 
 	// User routes (JWT auth required)
 	userGroup := engine.Group("/user")

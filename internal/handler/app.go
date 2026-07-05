@@ -323,10 +323,11 @@ func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 
 type PlanHandler struct {
 	planSvc service.PlanServiceInterface
+	appRepo AppRepoInterface
 }
 
-func NewPlanHandler(planSvc service.PlanServiceInterface) *PlanHandler {
-	return &PlanHandler{planSvc: planSvc}
+func NewPlanHandler(planSvc service.PlanServiceInterface, appRepo AppRepoInterface) *PlanHandler {
+	return &PlanHandler{planSvc: planSvc, appRepo: appRepo}
 }
 
 func (h *PlanHandler) ListPlans(c *gin.Context) {
@@ -478,4 +479,100 @@ func isFKViolation(err error) bool {
 		return pqErr.Code == "23503"
 	}
 	return false
+}
+
+// GetAppPlans handles GET /apps/:id/plans. It is intentionally unauthenticated
+// — plan IDs and prices are already public (the marketing page needs them).
+// The handler loads the app to read apps.config.payment_providers for the
+// per-channel provider IDs and cycle summary, then assembles a PublicPlan
+// per active plan.
+func (h *PlanHandler) GetAppPlans(c *gin.Context) {
+	appID := c.Param("id")
+	app, err := h.appRepo.FindByID(c.Request.Context(), appID)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("get app error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load app"})
+		return
+	}
+
+	plans, err := h.planSvc.FindByApp(c.Request.Context(), appID)
+	if err != nil {
+		log.Printf("list plans by app error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list plans"})
+		return
+	}
+
+	var cfg model.AppConfig
+	if len(app.Config) > 0 {
+		if err := json.Unmarshal(app.Config, &cfg); err != nil {
+			log.Printf("decode app config: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to decode app config"})
+			return
+		}
+	}
+
+	out := make([]model.PublicPlan, 0, len(plans))
+	for _, p := range plans {
+		out = append(out, buildPublicPlan(p, cfg))
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": out})
+}
+
+// buildPublicPlan assembles a PublicPlan DTO from the canonical Plan row and
+// the app's typed config. Resolves provider_ids for every configured channel
+// and picks the first configured channel's cycle as the authoritative cycle
+// summary (PayPal precedes LemonSqueezy).
+func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
+	out := model.PublicPlan{
+		ID:           p.ID,
+		Name:         p.Name,
+		Price:        p.Price,
+		IntervalDays: p.IntervalDays,
+		IsDefault:    p.IsDefault,
+		ProviderIDs:  map[string]string{},
+	}
+	if cfg.PaymentProviders == nil {
+		return out
+	}
+	if pp := cfg.PaymentProviders.Paypal; pp != nil {
+		if pc, ok := pp.Plans[p.ID]; ok && pc.PlanID != "" {
+			out.ProviderIDs["paypal"] = pc.PlanID
+		}
+	}
+	if ls := cfg.PaymentProviders.Lemonsqueezy; ls != nil {
+		if pc, ok := ls.Plans[p.ID]; ok && pc.VariantID != "" {
+			out.ProviderIDs["lemonsqueezy"] = pc.VariantID
+		}
+	}
+	// Authoritative cycle = first configured channel. PayPal wins by convention.
+	switch {
+	case cfg.PaymentProviders.Paypal != nil:
+		if pc, ok := cfg.PaymentProviders.Paypal.Plans[p.ID]; ok {
+			out.Cycle = &model.CycleSummary{
+				TrialDays:        pc.TrialDays,
+				BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
+			}
+		}
+	case cfg.PaymentProviders.Lemonsqueezy != nil:
+		if pc, ok := cfg.PaymentProviders.Lemonsqueezy.Plans[p.ID]; ok {
+			out.Cycle = &model.CycleSummary{
+				TrialDays:        pc.TrialDays,
+				BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
+			}
+		}
+	}
+	return out
+}
+
+// resolveBillingCycleDays returns the configured billing_cycle_days if set,
+// otherwise falls back to plan.interval_days so a partial config still works.
+func resolveBillingCycleDays(configured, planInterval int) int {
+	if configured > 0 {
+		return configured
+	}
+	return planInterval
 }

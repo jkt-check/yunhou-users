@@ -99,6 +99,9 @@ func main() {
 	paypalFetcher := paypal.NewCachedClient(paypalOAuth, paypalCache)
 	providerTokenSvc := service.NewProviderTokenService(appRepo, paypalFetcher)
 
+	// Quote service — assembles price + cycle + provider_data for BFF checkout.
+	quoteSvc := service.NewQuoteService(planRepo, appRepo)
+
 	// Order expiry sweeper (in-process goroutine).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)
 
@@ -121,7 +124,7 @@ func main() {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
-		providerTokenSvc)
+		providerTokenSvc, quoteSvc)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

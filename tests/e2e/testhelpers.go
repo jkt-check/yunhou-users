@@ -233,11 +233,12 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	// path which doesn't touch the paypal fetcher. Adding paypal e2e later
 	// requires wiring a stub upstream.
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
+	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc)
+		providerTokenSvc, quoteSvc)
 
 	return engine, nil, db
 }
@@ -450,11 +451,12 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
+	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc)
+		providerTokenSvc, quoteSvc)
 
 	// Stash the private key in a closure-accessible holder so signing helpers
 	// can produce valid signatures. (We don't expose the priv directly to

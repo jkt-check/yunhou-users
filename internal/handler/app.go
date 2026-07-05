@@ -324,10 +324,17 @@ func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 type PlanHandler struct {
 	planSvc service.PlanServiceInterface
 	appRepo AppRepoInterface
+	quoteSvc QuoteLookup
 }
 
-func NewPlanHandler(planSvc service.PlanServiceInterface, appRepo AppRepoInterface) *PlanHandler {
-	return &PlanHandler{planSvc: planSvc, appRepo: appRepo}
+// QuoteLookup is the subset of QuoteService the handler uses. Defined here so
+// handler tests can plug in a fake without standing up the full service stack.
+type QuoteLookup interface {
+	Get(ctx context.Context, appID, planID, userID string) (*model.Quote, error)
+}
+
+func NewPlanHandler(planSvc service.PlanServiceInterface, appRepo AppRepoInterface, quoteSvc QuoteLookup) *PlanHandler {
+	return &PlanHandler{planSvc: planSvc, appRepo: appRepo, quoteSvc: quoteSvc}
 }
 
 func (h *PlanHandler) ListPlans(c *gin.Context) {
@@ -575,4 +582,38 @@ func resolveBillingCycleDays(configured, planInterval int) int {
 		return configured
 	}
 	return planInterval
+}
+
+// PostQuote handles POST /apps/:id/quote. JWT-authenticated (mounted in
+// router.go). The user_id is read from the JWT context for future audit
+// logging; the handler does not gate on subscription status — that's the
+// orders endpoint's job.
+func (h *PlanHandler) PostQuote(c *gin.Context) {
+	appID := c.Param("id")
+	var req struct {
+		PlanID string `json:"plan_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body: " + err.Error()})
+		return
+	}
+
+	userID := c.GetString(middleware.ContextUserID)
+	quote, err := h.quoteSvc.Get(c.Request.Context(), appID, req.PlanID, userID)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrPlanNotFound),
+			errors.Is(err, service.ErrPlanInactive),
+			errors.Is(err, service.ErrPlanAppMismatch),
+			errors.Is(err, service.ErrAppInactive):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		case errors.Is(err, service.ErrAppNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+		default:
+			log.Printf("quote error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to compute quote"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": quote})
 }

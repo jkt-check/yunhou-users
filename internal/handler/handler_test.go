@@ -347,7 +347,7 @@ func TestPlanHandler_ListPlans(t *testing.T) {
 			{ID: "monthly", Name: "Monthly", Apps: []string{"yundian", "yundash"}},
 		}
 		planSvc := &mockPlanSvc{plans: plans}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.GET("/admin/plans", handler.ListPlans)
@@ -367,7 +367,7 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 
 	t.Run("create plan success", func(t *testing.T) {
 		planSvc := &mockPlanSvc{}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.POST("/admin/plans", handler.CreatePlan)
@@ -385,7 +385,7 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 
 	t.Run("create plan invalid body", func(t *testing.T) {
 		planSvc := &mockPlanSvc{}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.POST("/admin/plans", handler.CreatePlan)
@@ -407,7 +407,7 @@ func TestPlanHandler_DeletePlan(t *testing.T) {
 
 	t.Run("delete plan success", func(t *testing.T) {
 		planSvc := &mockPlanSvc{}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.DELETE("/admin/plans/:id", handler.DeletePlan)
@@ -428,7 +428,7 @@ func TestPlanHandler_GetPlan(t *testing.T) {
 	t.Run("get plan success", func(t *testing.T) {
 		plan := &model.Plan{ID: "monthly", Name: "Monthly Plan"}
 		planSvc := &mockPlanSvc{plan: plan}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.GET("/admin/plans/:id", handler.GetPlan)
@@ -444,7 +444,7 @@ func TestPlanHandler_GetPlan(t *testing.T) {
 
 	t.Run("get plan not found", func(t *testing.T) {
 		planSvc := &mockPlanSvc{getErr: sql.ErrNoRows}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.GET("/admin/plans/:id", handler.GetPlan)
@@ -465,7 +465,7 @@ func TestPlanHandler_UpdatePlan(t *testing.T) {
 	t.Run("update plan success", func(t *testing.T) {
 		plan := &model.Plan{ID: "monthly", Name: "Monthly", Price: 9.99}
 		planSvc := &mockPlanSvc{plan: plan}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.PATCH("/admin/plans/:id", handler.UpdatePlan)
@@ -483,7 +483,7 @@ func TestPlanHandler_UpdatePlan(t *testing.T) {
 
 	t.Run("update plan not found", func(t *testing.T) {
 		planSvc := &mockPlanSvc{getErr: sql.ErrNoRows}
-		handler := NewPlanHandler(planSvc, nil)
+		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
 		router.PATCH("/admin/plans/:id", handler.UpdatePlan)
@@ -1353,7 +1353,7 @@ func TestPlanHandler_GetAppPlans(t *testing.T) {
 		}
 		appRepo := &mockAppRepo{apps: []model.App{app}}
 		planSvc := &mockPlanSvc{plans: plans}
-		handler := NewPlanHandler(planSvc, appRepo)
+		handler := NewPlanHandler(planSvc, appRepo, nil)
 
 		router := gin.New()
 		router.GET("/apps/:id/plans", handler.GetAppPlans)
@@ -1401,7 +1401,7 @@ func TestPlanHandler_GetAppPlans(t *testing.T) {
 
 	t.Run("app not found returns 404", func(t *testing.T) {
 		appRepo := &mockAppRepo{findErr: sql.ErrNoRows}
-		handler := NewPlanHandler(&mockPlanSvc{}, appRepo)
+		handler := NewPlanHandler(&mockPlanSvc{}, appRepo, nil)
 		router := gin.New()
 		router.GET("/apps/:id/plans", handler.GetAppPlans)
 
@@ -1418,7 +1418,7 @@ func TestPlanHandler_GetAppPlans(t *testing.T) {
 		plans := []model.Plan{{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}}}
 		appRepo := &mockAppRepo{apps: []model.App{{AppID: "yundian", IsActive: true}}}
 		planSvc := &mockPlanSvc{plans: plans}
-		handler := NewPlanHandler(planSvc, appRepo)
+		handler := NewPlanHandler(planSvc, appRepo, nil)
 		router := gin.New()
 		router.GET("/apps/:id/plans", handler.GetAppPlans)
 
@@ -1436,6 +1436,113 @@ func TestPlanHandler_GetAppPlans(t *testing.T) {
 		json.Unmarshal(w.Body.Bytes(), &resp)
 		if len(resp.Data) != 1 || len(resp.Data[0].ProviderIDs) != 0 {
 			t.Errorf("expected 1 plan with empty provider_ids, got %+v", resp.Data)
+		}
+	})
+}
+
+// --- PostQuote handler tests ---
+
+type fakeQuoteSvc struct {
+	result *model.Quote
+	err    error
+}
+
+func (f *fakeQuoteSvc) Get(ctx context.Context, appID, planID, userID string) (*model.Quote, error) {
+	return f.result, f.err
+}
+
+func TestPlanHandler_PostQuote(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("happy path", func(t *testing.T) {
+		appRepo := &mockAppRepo{apps: []model.App{{AppID: "yundian", IsActive: true}}}
+		quote := &model.Quote{
+			PlanID: "monthly", Amount: 29.9, Currency: "USD",
+			SubExpiresAt: time.Now().Add(30 * 24 * time.Hour),
+			CycleConfig:  model.CycleConfig{TrialDays: 0, BillingCycleDays: 30, Base: "now + trial + cycle"},
+			ProviderData: map[string]any{"paypal": map[string]any{"plan_id": "P-1"}},
+		}
+		planSvc := &mockPlanSvc{}
+		handler := NewPlanHandler(planSvc, appRepo, &fakeQuoteSvc{result: quote})
+		router := gin.New()
+		// Single registration with a middleware that simulates the JWT-auth
+		// setting user_id in context (the real router mounts JWTAuth here).
+		router.POST("/apps/:id/quote", func(c *gin.Context) {
+			c.Set("user_id", "user-123")
+			c.Next()
+		}, handler.PostQuote)
+
+		body := `{"plan_id":"monthly"}`
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code int          `json:"code"`
+			Data *model.Quote `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Data == nil || resp.Data.PlanID != "monthly" || resp.Data.Amount != 29.9 {
+			t.Errorf("data = %+v", resp.Data)
+		}
+	})
+
+	t.Run("invalid body returns 400", func(t *testing.T) {
+		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{})
+		router := gin.New()
+		router.POST("/apps/:id/quote", handler.PostQuote)
+
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString("not json"))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", w.Code)
+		}
+	})
+
+	t.Run("missing plan_id returns 400", func(t *testing.T) {
+		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{})
+		router := gin.New()
+		router.POST("/apps/:id/quote", handler.PostQuote)
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", w.Code)
+		}
+	})
+
+	t.Run("plan not found returns 400", func(t *testing.T) {
+		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrPlanNotFound})
+		router := gin.New()
+		router.POST("/apps/:id/quote", handler.PostQuote)
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"missing"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", w.Code)
+		}
+	})
+
+	t.Run("plan/app mismatch returns 400", func(t *testing.T) {
+		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrPlanAppMismatch})
+		router := gin.New()
+		router.POST("/apps/:id/quote", handler.PostQuote)
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", w.Code)
 		}
 	})
 }

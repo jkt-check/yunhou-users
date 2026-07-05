@@ -28,6 +28,7 @@ func Setup(
 	webhookVerifier middleware.ChannelSignatureVerifier,
 	wechatAPIv3Key []byte,
 	providerTokenSvc *service.ProviderTokenService,
+	quoteSvc *service.QuoteService,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -37,7 +38,7 @@ func Setup(
 	authHandler := handler.NewAuthHandler(authSvc, tokenSvc)
 	appHandler := handler.NewAppHandler(appRepo, providerTokenSvc)
 	subHandler := handler.NewSubscriptionHandler(subSvc)
-	planHandler := handler.NewPlanHandler(planSvc, appRepo)
+	planHandler := handler.NewPlanHandler(planSvc, appRepo, quoteSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier)
@@ -76,6 +77,12 @@ func Setup(
 		appGroup.GET("/:id", appHandler.GetApp)
 		appGroup.GET("/:id/provider-token/:channel", appHandler.GetProviderToken)
 	}
+
+	// JWT-authenticated quote endpoint — user must be logged in to ask for a
+	// subscription price. Mounted at engine level (not under appGroup) so the
+	// path stays /apps/:id/quote without colliding with InternalAppAuth that
+	// wraps the other /apps/:id routes.
+	engine.POST("/apps/:id/quote", appLimiter, middleware.JWTAuth(tokenSvc), planHandler.PostQuote)
 
 	// Admin routes for plan management (internal service auth)
 	adminLimiter := middleware.RateLimit(ctx, 30, 60)

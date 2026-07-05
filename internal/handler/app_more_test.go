@@ -262,7 +262,7 @@ func TestPlanHandler_ListPlans_OK(t *testing.T) {
 	svc := &mockPlanSvc{plans: []model.Plan{
 		{ID: "free", Name: "Free", Price: 0, IsActive: true},
 	}}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.GET("/admin/plans", h.ListPlans)
 	req := httptest.NewRequest(http.MethodGet, "/admin/plans", nil)
@@ -279,7 +279,7 @@ func TestPlanHandler_ListPlans_OK(t *testing.T) {
 func TestPlanHandler_GetPlan_OK(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{plan: &model.Plan{ID: "free", Name: "Free"}}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.GET("/admin/plans/:id", h.GetPlan)
 	req := httptest.NewRequest(http.MethodGet, "/admin/plans/free", nil)
@@ -293,7 +293,7 @@ func TestPlanHandler_GetPlan_OK(t *testing.T) {
 func TestPlanHandler_CreatePlan_BadJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.POST("/admin/plans", h.CreatePlan)
 	req := httptest.NewRequest(http.MethodPost, "/admin/plans", bytes.NewBufferString("not json"))
@@ -308,7 +308,7 @@ func TestPlanHandler_CreatePlan_BadJSON(t *testing.T) {
 func TestPlanHandler_CreatePlan_NegativePrice(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.POST("/admin/plans", h.CreatePlan)
 	body := `{"id":"bad","name":"Bad","price":-1}`
@@ -324,7 +324,7 @@ func TestPlanHandler_CreatePlan_NegativePrice(t *testing.T) {
 func TestPlanHandler_CreatePlan_NegativeInterval(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.POST("/admin/plans", h.CreatePlan)
 	body := `{"id":"bad","name":"Bad","interval_days":-1}`
@@ -340,7 +340,7 @@ func TestPlanHandler_CreatePlan_NegativeInterval(t *testing.T) {
 func TestPlanHandler_CreatePlan_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.POST("/admin/plans", h.CreatePlan)
 	body := `{"id":"new","name":"New","price":1.0,"interval_days":30}`
@@ -356,7 +356,7 @@ func TestPlanHandler_CreatePlan_Success(t *testing.T) {
 func TestPlanHandler_UpdatePlan_BadJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.PATCH("/admin/plans/:id", h.UpdatePlan)
 	req := httptest.NewRequest(http.MethodPatch, "/admin/plans/free", bytes.NewBufferString("not json"))
@@ -371,7 +371,7 @@ func TestPlanHandler_UpdatePlan_BadJSON(t *testing.T) {
 func TestPlanHandler_UpdatePlan_NegativePrice(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{plan: &model.Plan{ID: "free", Name: "Free", IsActive: true}}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.PATCH("/admin/plans/:id", h.UpdatePlan)
 	body := `{"price":-1}`
@@ -387,7 +387,7 @@ func TestPlanHandler_UpdatePlan_NegativePrice(t *testing.T) {
 func TestPlanHandler_DeletePlan_FKViolation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{deleteErr: newFKViolation()}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.DELETE("/admin/plans/:id", h.DeletePlan)
 	req := httptest.NewRequest(http.MethodDelete, "/admin/plans/in-use", nil)
@@ -401,7 +401,7 @@ func TestPlanHandler_DeletePlan_FKViolation(t *testing.T) {
 func TestPlanHandler_DeletePlan_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{}
-	h := NewPlanHandler(svc, nil)
+	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.DELETE("/admin/plans/:id", h.DeletePlan)
 	req := httptest.NewRequest(http.MethodDelete, "/admin/plans/free", nil)

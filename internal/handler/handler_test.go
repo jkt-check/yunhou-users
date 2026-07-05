@@ -611,7 +611,7 @@ func TestAppHandler_ListApps(t *testing.T) {
 			{AppID: "yundash", Name: "Yundash"},
 		}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.GET("/apps", handler.ListApps)
@@ -627,7 +627,7 @@ func TestAppHandler_ListApps(t *testing.T) {
 
 	t.Run("list apps error", func(t *testing.T) {
 		appRepo := &mockAppRepo{findErr: errors.New("db error")}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.GET("/apps", handler.ListApps)
@@ -648,7 +648,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 	t.Run("get existing app", func(t *testing.T) {
 		apps := []model.App{{AppID: "yundian", Name: "Yundian"}}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.GET("/apps/:id", handler.GetApp)
@@ -664,7 +664,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 
 	t.Run("get nonexistent app", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.GET("/apps/:id", handler.GetApp)
@@ -684,7 +684,7 @@ func TestAppHandler_CreateApp(t *testing.T) {
 
 	t.Run("create app success", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.POST("/apps", handler.CreateApp)
@@ -702,7 +702,7 @@ func TestAppHandler_CreateApp(t *testing.T) {
 
 	t.Run("create app invalid body", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.POST("/apps", handler.CreateApp)
@@ -717,6 +717,49 @@ func TestAppHandler_CreateApp(t *testing.T) {
 			t.Errorf("expected 400, got %d", w.Code)
 		}
 	})
+
+	t.Run("create app with payment_providers config", func(t *testing.T) {
+		appRepo := &mockAppRepo{}
+		handler := NewAppHandler(appRepo, nil)
+
+		router := gin.New()
+		router.POST("/apps", handler.CreateApp)
+
+		body := `{"app_id":"site","name":"Site","config":{"payment_providers":{"paypal":{"client_id":"cid","client_secret":"cs","webhook_id":"W","mode":"live","plan_ids":{"m":"P"}}}}}`
+		req := httptest.NewRequest(http.MethodPost, "/apps", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+		}
+		if len(appRepo.apps) != 1 {
+			t.Fatalf("expected 1 app stored, got %d", len(appRepo.apps))
+		}
+		if !bytes.Contains(appRepo.apps[0].Config, []byte(`"paypal"`)) {
+			t.Errorf("config not persisted; got %s", string(appRepo.apps[0].Config))
+		}
+	})
+
+	t.Run("create app rejects invalid paypal config", func(t *testing.T) {
+		appRepo := &mockAppRepo{}
+		handler := NewAppHandler(appRepo, nil)
+
+		router := gin.New()
+		router.POST("/apps", handler.CreateApp)
+
+		// missing secret + webhook_id + mode
+		body := `{"app_id":"site","name":"Site","config":{"payment_providers":{"paypal":{"client_id":"cid"}}}}`
+		req := httptest.NewRequest(http.MethodPost, "/apps", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+		}
+	})
 }
 
 func TestAppHandler_UpdateApp(t *testing.T) {
@@ -725,7 +768,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 	t.Run("update app success", func(t *testing.T) {
 		apps := []model.App{{AppID: "test", Name: "Old Name"}}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.PATCH("/apps/:id", handler.UpdateApp)
@@ -743,7 +786,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 
 	t.Run("update nonexistent app", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo)
+		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
 		router.PATCH("/apps/:id", handler.UpdateApp)

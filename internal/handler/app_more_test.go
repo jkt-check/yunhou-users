@@ -423,7 +423,7 @@ func TestAppHandler_UpdateApp_BadJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := NewMockAppRepo()
 	r.apps["yundian"] = &model.App{AppID: "yundian", Name: "Yundian", IsActive: true}
-	h := NewAppHandler(r)
+	h := NewAppHandler(r, nil)
 	g := gin.New()
 	g.PATCH("/admin/apps/:id", h.UpdateApp)
 	req := httptest.NewRequest(http.MethodPatch, "/admin/apps/yundian", bytes.NewBufferString("not json"))
@@ -439,7 +439,7 @@ func TestAppHandler_UpdateApp_EmptyName(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := NewMockAppRepo()
 	r.apps["yundian"] = &model.App{AppID: "yundian", Name: "Yundian", IsActive: true}
-	h := NewAppHandler(r)
+	h := NewAppHandler(r, nil)
 	g := gin.New()
 	g.PATCH("/admin/apps/:id", h.UpdateApp)
 	body := `{"name":"   "}`

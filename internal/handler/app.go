@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -16,6 +17,14 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
+// ProviderTokenLookup is the subset of ProviderTokenService the handler uses.
+// Defined here so the handler can be tested without spinning up the full
+// service stack. NewAppHandler accepts nil for callers that don't exercise
+// GetProviderToken (e.g. CreateApp / UpdateApp tests).
+type ProviderTokenLookup interface {
+	Get(ctx context.Context, appID, channel string) (*model.ProviderToken, error)
+}
+
 type AppRepoInterface interface {
 	List(context.Context) ([]model.App, error)
 	FindByID(context.Context, string) (*model.App, error)
@@ -24,11 +33,12 @@ type AppRepoInterface interface {
 }
 
 type AppHandler struct {
-	appRepo AppRepoInterface
+	appRepo       AppRepoInterface
+	providerToken ProviderTokenLookup
 }
 
-func NewAppHandler(appRepo AppRepoInterface) *AppHandler {
-	return &AppHandler{appRepo: appRepo}
+func NewAppHandler(appRepo AppRepoInterface, providerToken ProviderTokenLookup) *AppHandler {
+	return &AppHandler{appRepo: appRepo, providerToken: providerToken}
 }
 
 func (h *AppHandler) ListApps(c *gin.Context) {
@@ -58,13 +68,26 @@ func (h *AppHandler) GetApp(c *gin.Context) {
 
 func (h *AppHandler) CreateApp(c *gin.Context) {
 	var req struct {
-		AppID       string `json:"app_id" binding:"required"`
-		Name        string `json:"name" binding:"required"`
-		Description string `json:"description"`
+		AppID       string          `json:"app_id" binding:"required"`
+		Name        string          `json:"name" binding:"required"`
+		Description string          `json:"description"`
+		Config      json.RawMessage `json:"config,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
+	}
+
+	if req.Config != nil {
+		var cfg model.AppConfig
+		if err := json.Unmarshal(req.Config, &cfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid config: " + err.Error()})
+			return
+		}
+		if err := validateAppConfig(&cfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
 	}
 
 	app := &model.App{
@@ -72,6 +95,7 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		Name:        req.Name,
 		Description: req.Description,
 		IsActive:    true,
+		Config:      req.Config, // empty RawMessage when absent — repo COALESCE handles NULL
 	}
 	if err := h.appRepo.Create(c.Request.Context(), app); err != nil {
 		log.Printf("create app error: %v", err)
@@ -96,9 +120,10 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 	}
 
 	var req struct {
-		Name        *string `json:"name"`
-		Description *string `json:"description"`
-		IsActive    *bool   `json:"is_active"`
+		Name        *string          `json:"name"`
+		Description *string          `json:"description"`
+		IsActive    *bool            `json:"is_active"`
+		Config      *json.RawMessage `json:"config,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
@@ -119,6 +144,18 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 	if req.IsActive != nil {
 		app.IsActive = *req.IsActive
 	}
+	if req.Config != nil {
+		var cfg model.AppConfig
+		if err := json.Unmarshal(*req.Config, &cfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid config: " + err.Error()})
+			return
+		}
+		if err := validateAppConfig(&cfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
+		app.Config = *req.Config
+	}
 
 	if err := h.appRepo.Update(c.Request.Context(), app); err != nil {
 		log.Printf("update app error: %v", err)
@@ -127,6 +164,28 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
+}
+
+// validateAppConfig ensures any configured payment provider has all required
+// fields. Operators can leave payment_providers entirely absent (no providers
+// configured) or include only the providers they intend to use; missing or
+// malformed fields surface as 400 from the handler.
+func validateAppConfig(cfg *model.AppConfig) error {
+	if cfg.PaymentProviders == nil {
+		return nil
+	}
+	if p := cfg.PaymentProviders.Paypal; p != nil {
+		if p.ClientID == "" || p.ClientSecret == "" || p.WebhookID == "" {
+			return errors.New("paypal: client_id, client_secret, webhook_id are required")
+		}
+		if p.Mode != "live" && p.Mode != "sandbox" {
+			return errors.New("paypal.mode must be live or sandbox")
+		}
+	}
+	if l := cfg.PaymentProviders.Lemonsqueezy; l != nil && (l.APIKey == "" || l.StoreID == "") {
+		return errors.New("lemonsqueezy: api_key and store_id are required")
+	}
+	return nil
 }
 
 type SubscriptionHandler struct {
@@ -145,6 +204,7 @@ func (h *SubscriptionHandler) ListUserSubscriptions(c *gin.Context) {
 	}
 	subs, err := h.subSvc.ListUserSubscriptions(c.Request.Context(), userID)
 	if err != nil {
+		log.Printf("list subscriptions error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list subscriptions"})
 		return
 	}

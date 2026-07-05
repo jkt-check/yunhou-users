@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/yunhou/users/internal/model"
@@ -22,7 +24,7 @@ func (s *stubAppRepo) FindByID(ctx context.Context, id string) (*model.App, erro
 	if s.app != nil && s.app.AppID == id {
 		return s.app, nil
 	}
-	return nil, errors.New("not found")
+	return nil, sql.ErrNoRows
 }
 // Create/Update/List unused by ProviderTokenService; if the test file's
 // package-level interface requires them, add stubs that panic.
@@ -92,10 +94,25 @@ func TestProviderToken_Get_UnsupportedChannel(t *testing.T) {
 }
 
 func TestProviderToken_Get_AppNotFound(t *testing.T) {
-	svc := NewProviderTokenService(&stubAppRepo{err: errors.New("missing")}, &stubPaypal{})
+	svc := NewProviderTokenService(&stubAppRepo{err: sql.ErrNoRows}, &stubPaypal{})
 	_, err := svc.Get(context.Background(), "missing", "paypal")
 	if !errors.Is(err, ErrAppNotFound) {
 		t.Errorf("err = %v, want ErrAppNotFound", err)
+	}
+}
+
+// TestProviderToken_Get_DBError verifies that a non-NotFound repo error is
+// wrapped and propagated rather than collapsed to ErrAppNotFound, which
+// would surface a DB outage as a misleading 404.
+func TestProviderToken_Get_DBError(t *testing.T) {
+	dbErr := errors.New("connection refused")
+	svc := NewProviderTokenService(&stubAppRepo{err: dbErr}, &stubPaypal{})
+	_, err := svc.Get(context.Background(), "site", "paypal")
+	if errors.Is(err, ErrAppNotFound) {
+		t.Errorf("DB error collapsed to ErrAppNotFound; expected wrap, got %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "find app") {
+		t.Errorf("expected wrapped DB error, got %v", err)
 	}
 }
 

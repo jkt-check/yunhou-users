@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,8 +42,11 @@ var (
 // "paypal" or "lemonsqueezy"; other values return ErrUnsupportedChannel.
 func (s *ProviderTokenService) Get(ctx context.Context, appID, channel string) (*model.ProviderToken, error) {
 	app, err := s.apps.FindByID(ctx, appID)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrAppNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find app: %w", err)
 	}
 	if !app.IsActive {
 		return nil, ErrAppInactive

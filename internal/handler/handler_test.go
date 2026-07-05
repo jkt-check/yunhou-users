@@ -801,6 +801,56 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 			t.Errorf("expected 404, got %d", w.Code)
 		}
 	})
+
+	t.Run("update app replaces config", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		existing := []model.App{
+			{AppID: "site", Name: "x", Config: json.RawMessage(`{"old":"value"}`)},
+		}
+		appRepo := &mockAppRepo{apps: existing}
+		handler := NewAppHandler(appRepo, nil)
+		router := gin.New()
+		router.PATCH("/apps/:id", handler.UpdateApp)
+
+		body := `{"config":{"payment_providers":{"lemonsqueezy":{"api_key":"k","store_id":"s"}}}}`
+		req := httptest.NewRequest(http.MethodPatch, "/apps/site", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+		}
+		updated, err := appRepo.FindByID(context.Background(), "site")
+		if err != nil {
+			t.Fatalf("find after update: %v", err)
+		}
+		if !bytes.Contains(updated.Config, []byte(`"lemonsqueezy"`)) {
+			t.Errorf("config not replaced; got %s", string(updated.Config))
+		}
+		if bytes.Contains(updated.Config, []byte(`"old"`)) {
+			t.Errorf("old config not fully replaced; got %s", string(updated.Config))
+		}
+	})
+
+	t.Run("update app with invalid config returns 400", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		existing := []model.App{{AppID: "site", Name: "x"}}
+		appRepo := &mockAppRepo{apps: existing}
+		handler := NewAppHandler(appRepo, nil)
+		router := gin.New()
+		router.PATCH("/apps/:id", handler.UpdateApp)
+
+		body := `{"config":{"payment_providers":{"paypal":{"client_id":"only"}}}}`
+		req := httptest.NewRequest(http.MethodPatch, "/apps/site", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", w.Code)
+		}
+	})
 }
 
 // --- UserHandler tests ---

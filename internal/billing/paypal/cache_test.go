@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,5 +95,80 @@ func TestCachedClient_FetchToken_ComposestOAuthAndCache(t *testing.T) {
 	}
 	if upstreamHits != 1 {
 		t.Errorf("upstream hits = %d, want 1 (cache should absorb repeats)", upstreamHits)
+	}
+}
+
+// TestTokenCache_GetOrFetch_ConcurrentMissesDeduped verifies the singleflight
+// behavior: a burst of concurrent misses for the same key results in exactly
+// one fetch call. Without this, a cold cache under burst load would issue
+// N parallel upstream POSTs (regression guard for the thundering-herd bug).
+func TestTokenCache_GetOrFetch_ConcurrentMissesDeduped(t *testing.T) {
+	var calls int32
+	gate := make(chan struct{}) // releases the sleeping fetcher
+	fetcher := func() (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		<-gate
+		return &Token{AccessToken: "AT", ExpiresIn: 3600}, nil
+	}
+	cache := NewTokenCache(60 * time.Second)
+
+	const n = 32
+	var wg sync.WaitGroup
+	results := make([]*Token, n)
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = cache.GetOrFetch("cid-shared", fetcher)
+		}()
+	}
+	// Let all goroutines pile up before letting the fetcher proceed.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("fetch calls = %d, want 1 (singleflight should collapse %d concurrent misses)", got, n)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: err = %v", i, err)
+		}
+		if results[i] == nil || results[i].AccessToken != "AT" {
+			t.Errorf("goroutine %d: token = %+v", i, results[i])
+		}
+	}
+}
+
+// TestTokenCache_GetOrFetch_DistinctKeysStayIndependent verifies singleflight
+// doesn't incorrectly collapse misses for distinct keys.
+func TestTokenCache_GetOrFetch_DistinctKeysStayIndependent(t *testing.T) {
+	var calls int32
+	mkFetcher := func(_ string) func() (*Token, error) {
+		return func() (*Token, error) {
+			atomic.AddInt32(&calls, 1)
+			time.Sleep(10 * time.Millisecond) // window for races
+			return &Token{AccessToken: "AT", ExpiresIn: 3600}, nil
+		}
+	}
+	cache := NewTokenCache(60 * time.Second)
+
+	var wg sync.WaitGroup
+	keys := []string{"a", "b", "c"}
+	wg.Add(len(keys))
+	for _, k := range keys {
+		k := k
+		go func() {
+			defer wg.Done()
+			if _, err := cache.GetOrFetch(k, mkFetcher(k)); err != nil {
+				t.Errorf("%s: %v", k, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(&calls); got != int32(len(keys)) {
+		t.Fatalf("fetch calls = %d, want %d (one per key)", got, len(keys))
 	}
 }

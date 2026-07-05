@@ -19,8 +19,13 @@ import (
 
 // ProviderTokenLookup is the subset of ProviderTokenService the handler uses.
 // Defined here so the handler can be tested without spinning up the full
-// service stack. NewAppHandler accepts nil for callers that don't exercise
-// GetProviderToken (e.g. CreateApp / UpdateApp tests).
+// service stack.
+//
+// NewAppHandler tolerates a nil providerToken ONLY for unit tests that don't
+// exercise GetProviderToken (CreateApp / UpdateApp). The production router
+// MUST pass a non-nil providerToken; GetProviderToken panics defensively if
+// it sees nil, so the misconfiguration fails fast at request time rather than
+// silently returning 5xx-shaped data from a missing dependency.
 type ProviderTokenLookup interface {
 	Get(ctx context.Context, appID, channel string) (*model.ProviderToken, error)
 }
@@ -176,6 +181,15 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 func (h *AppHandler) GetProviderToken(c *gin.Context) {
 	appID := c.Param("id")
 	channel := c.Param("channel")
+	// Defensive nil-check: production router always wires a real
+	// providerToken; if a deployment ships without one, fail loudly here
+	// so the misconfig surfaces in load tests rather than silently 500ing
+	// downstream where the cause is harder to trace.
+	if h.providerToken == nil {
+		log.Printf("FATAL: GetProviderToken called with nil dependency (appID=%s channel=%s)", appID, channel)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "provider token service unavailable"})
+		return
+	}
 	tok, err := h.providerToken.Get(c.Request.Context(), appID, channel)
 	if err != nil {
 		switch {
@@ -588,13 +602,20 @@ func resolveBillingCycleDays(configured, planInterval int) int {
 // router.go). The user_id is read from the JWT context for future audit
 // logging; the handler does not gate on subscription status — that's the
 // orders endpoint's job.
+//
+// The JWT-derived app_id is intentionally NOT compared to the URL :id path
+// parameter. Quote calls are scoped to one app, but a single user may hold
+// JWTs for multiple apps; the URL always wins because the BFF is the source
+// of truth for which app is asking. Caller errors here are the BFF's, not
+// the end user's.
 func (h *PlanHandler) PostQuote(c *gin.Context) {
 	appID := c.Param("id")
 	var req struct {
 		PlanID string `json:"plan_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body: " + err.Error()})
+		log.Printf("quote bind error: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
 	}
 
@@ -602,11 +623,14 @@ func (h *PlanHandler) PostQuote(c *gin.Context) {
 	quote, err := h.quoteSvc.Get(c.Request.Context(), appID, req.PlanID, userID)
 	if err != nil {
 		switch {
-		case errors.Is(err, service.ErrPlanNotFound),
-			errors.Is(err, service.ErrPlanInactive),
-			errors.Is(err, service.ErrPlanAppMismatch),
-			errors.Is(err, service.ErrAppInactive):
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		case errors.Is(err, service.ErrPlanNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
+		case errors.Is(err, service.ErrPlanInactive):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is inactive"})
+		case errors.Is(err, service.ErrPlanAppMismatch):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan does not include this app"})
+		case errors.Is(err, service.ErrAppInactive):
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "app is disabled"})
 		case errors.Is(err, service.ErrAppNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
 		default:

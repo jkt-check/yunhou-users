@@ -1520,7 +1520,7 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 		}
 	})
 
-	t.Run("plan not found returns 400", func(t *testing.T) {
+	t.Run("plan not found returns 404", func(t *testing.T) {
 		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrPlanNotFound})
 		router := gin.New()
 		router.POST("/apps/:id/quote", handler.PostQuote)
@@ -1528,8 +1528,47 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
+		}
+	})
+
+	t.Run("app inactive returns 403", func(t *testing.T) {
+		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrAppInactive})
+		router := gin.New()
+		router.POST("/apps/:id/quote", handler.PostQuote)
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", w.Code)
+		}
+	})
+
+	t.Run("plan inactive returns 400", func(t *testing.T) {
+		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrPlanInactive})
+		router := gin.New()
+		router.POST("/apps/:id/quote", handler.PostQuote)
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want 400", w.Code)
+		}
+	})
+
+	t.Run("app not found returns 404", func(t *testing.T) {
+		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrAppNotFound})
+		router := gin.New()
+		router.POST("/apps/:id/quote", handler.PostQuote)
+		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
 		}
 	})
 

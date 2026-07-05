@@ -129,6 +129,66 @@ func TestQuote_Get_BothChannelsConfigured(t *testing.T) {
 	}
 }
 
+// TestQuote_Get_PayPalCycleWinsOverLemonSqueezy verifies the cycle-precedence
+// rule documented in resolveCycle: when both channels are configured for the
+// same plan_id, PayPal's trial+cycle wins, and the LemonSqueezy values are
+// surfaced only as ls.provider_data — they don't influence sub_expires_at.
+func TestQuote_Get_PayPalCycleWinsOverLemonSqueezy(t *testing.T) {
+	plan := &model.Plan{ID: "monthly", Price: 29.9, IntervalDays: 30, Apps: pq.StringArray{"yundian"}, IsActive: true}
+	app := &model.App{
+		AppID: "yundian", Name: "Yundian", IsActive: true,
+		Config: mustJSONRawQuote(t, `{
+			"payment_providers": {
+				"paypal": {"plans": {"monthly": {"plan_id": "P-1", "trial_days": 7, "billing_cycle_days": 30}}},
+				"lemonsqueezy": {"plans": {"monthly": {"variant_id": "var-1", "trial_days": 0, "billing_cycle_days": 60}}}
+			}
+		}`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.CycleConfig.TrialDays != 7 || quote.CycleConfig.BillingCycleDays != 30 {
+		t.Errorf("cycle = %+v, want PayPal values {7, 30}", quote.CycleConfig)
+	}
+	// sub_expires_at must reflect the PayPal cycle (7+30=37 days), not LS (0+60=60 days).
+	wantDelta := 37 * 24 * time.Hour
+	gotDelta := time.Until(quote.SubExpiresAt)
+	if gotDelta < wantDelta-time.Hour || gotDelta > wantDelta+time.Hour {
+		t.Errorf("sub_expires_at delta = %v, want ~%v (PayPal cycle, not LS)", gotDelta, wantDelta)
+	}
+}
+
+// TestQuote_Get_LemonSqueezyFallbackWhenPayPalMissing verifies that if only
+// LemonSqueezy is configured for the plan, its cycle drives sub_expires_at.
+func TestQuote_Get_LemonSqueezyFallbackWhenPayPalMissing(t *testing.T) {
+	plan := &model.Plan{ID: "monthly", Price: 29.9, IntervalDays: 30, Apps: pq.StringArray{"yundian"}, IsActive: true}
+	app := &model.App{
+		AppID: "yundian", Name: "Yundian", IsActive: true,
+		Config: mustJSONRawQuote(t, `{
+			"payment_providers": {
+				"lemonsqueezy": {"plans": {"monthly": {"variant_id": "var-1", "trial_days": 3, "billing_cycle_days": 60}}}
+			}
+		}`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.CycleConfig.TrialDays != 3 || quote.CycleConfig.BillingCycleDays != 60 {
+		t.Errorf("cycle = %+v, want LS values {3, 60}", quote.CycleConfig)
+	}
+	wantDelta := 63 * 24 * time.Hour
+	gotDelta := time.Until(quote.SubExpiresAt)
+	if gotDelta < wantDelta-time.Hour || gotDelta > wantDelta+time.Hour {
+		t.Errorf("sub_expires_at delta = %v, want ~%v (LS fallback cycle)", gotDelta, wantDelta)
+	}
+}
+
 func TestQuote_Get_PlanNotFound(t *testing.T) {
 	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{}}, &stubQuoteAppRepo{})
 	_, err := svc.Get(context.Background(), "yundian", "missing", "u")

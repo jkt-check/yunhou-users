@@ -173,8 +173,8 @@ func TestE2E_PostQuote_PlanNotFound(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 	engine.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404; body = %s", w.Code, w.Body.String())
 	}
 }
 

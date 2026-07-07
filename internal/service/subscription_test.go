@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -444,3 +445,27 @@ func containsHelper(substr, s string) bool {
 func timePtr(t time.Time) *time.Time {
 	return &t
 }
+
+// TestIsDuplicateKey covers the postgres 23505 / driver DuplicateKey()
+// detection used to map unique-constraint errors to friendly service
+// sentinels (ErrUserHasActiveSub, ErrSubscriptionExists).
+func TestIsDuplicateKey(t *testing.T) {
+	t.Parallel()
+	t.Run("plain non-DB error → false", func(t *testing.T) {
+		t.Parallel()
+		if isDuplicateKey(errors.New("plain error")) {
+			t.Error("plain error should not classify as duplicate-key")
+		}
+	})
+	t.Run("DuplicateKey() interface impl → true", func(t *testing.T) {
+		t.Parallel()
+		if !isDuplicateKey(fakeDupKeyErr{}) {
+			t.Error("Duck-typed DuplicateKey impl should be detected")
+		}
+	})
+}
+
+type fakeDupKeyErr struct{}
+
+func (fakeDupKeyErr) Error() string           { return "fake dup" }
+func (fakeDupKeyErr) DuplicateKey() bool       { return true }

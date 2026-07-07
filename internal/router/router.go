@@ -49,6 +49,9 @@ func Setup(
 	engine.POST("/auth/login", publicLimiter, authHandler.Login)
 	engine.POST("/auth/refresh", publicLimiter, authHandler.RefreshToken)
 	engine.POST("/auth/logout", publicLimiter, authHandler.Logout)
+	// Dev-only login endpoint for the L3 e2e-ui suite. Returns 404 unless
+	// PAYPAL_L3_E2E_MODE=1 is set; the env check is inside the handler.
+	engine.POST("/test/login", authHandler.TestLogin)
 
 	// Public plan listing — unauthenticated so marketing pages and the BFF
 	// can fetch the catalog without holding admin credentials. Plan IDs and

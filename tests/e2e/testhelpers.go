@@ -449,15 +449,32 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		cfg.OrderExpiryDuration,
 	)
 
-	// Build the multi-channel verifier with all three channels configured.
+	// Build the multi-channel verifier with all five channels configured.
 	// Alipay uses a generated RSA key pair — tests sign with the private key
-	// and the verifier checks with the corresponding public key.
+	// and the verifier checks with the corresponding public key. PayPal's
+	// HTTPS verify endpoint is mocked via a httptest server that always
+	// returns verification_status=SUCCESS; the verifier's HTTP client points
+	// at that server URL.
 	alipayPriv, alipayPubPEM := genAlipayRSAKeyPair(t)
+	paypalVerifySrv := newMockPaypalVerifyServer(t)
+	cfg.PaypalEnv = "sandbox"
+	cfg.PaypalWebhookIDSandbox = "wbh_e2e_paypal"
+	cfg.PaypalAPIBaseSandbox = paypalVerifySrv.URL // verifier appends /v1/...
+	cfg.PaypalWebhookIDLive = ""
+	cfg.PaypalAPIBaseLive = ""
 	mv := &middleware.MultiChannelVerifier{
 		Stripe:       &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
 		WeChat:       &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey)},
 		Alipay:       &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
 		LemonSqueezy: &middleware.LemonsqueezyVerifier{Secret: []byte(e2eLemonSqueezySecret)},
+		Paypal: &middleware.PaypalVerifier{
+			HTTPClient:       &http.Client{Timeout: 2 * time.Second},
+			SandboxWebhookID: cfg.PaypalWebhookIDSandbox,
+			LiveWebhookID:    cfg.PaypalWebhookIDLive,
+			SandboxAPIBase:   cfg.PaypalAPIBaseSandbox,
+			LiveAPIBase:      cfg.PaypalAPIBaseLive,
+			Env:              cfg.PaypalEnv,
+		},
 	}
 
 	gin.SetMode(gin.ReleaseMode)
@@ -676,4 +693,69 @@ func encryptForWeChat(t *testing.T, key []byte, plaintext []byte) (ciphertextB64
 	}
 	ciphertext := gcm.Seal(nil, []byte(nonce), plaintext, []byte(aadStr))
 	return base64.StdEncoding.EncodeToString(ciphertext), nonce, aadStr
+}
+
+// ============================================================================
+// PayPal webhook harness
+// ============================================================================
+
+// newMockPaypalVerifyServer spins up a local httptest server that mimics
+// PayPal's verify-webhook-signature endpoint. We can't unit-test against
+// PayPal's real API; the verifier only cares that the response payload
+// parses as JSON with verification_status=SUCCESS, so a stub is enough.
+func newMockPaypalVerifyServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		t.Logf("mock-paypal-verify hit: %s %s body=%d bytes", r.Method, r.URL.Path, len(body))
+		// Drain body so the request is fully consumed before returning —
+		// matches PayPal's behavior and lets httptest close cleanly.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `{"verification_status":"SUCCESS"}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// paypalHeaders builds the 5 signature headers PayPal would have sent.
+// The verifier only checks for non-empty values; actual signature
+// validation is delegated to PayPal's verify endpoint (mocked above).
+func paypalHeaders(transmissionID, sigStub string) map[string]string {
+	return map[string]string{
+		"PAYPAL-AUTH-ALGO":         "SHA256withRSA",
+		"PAYPAL-CERT-URL":          "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-test",
+		"PAYPAL-TRANSMISSION-ID":   transmissionID,
+		"PAYPAL-TRANSMISSION-SIG":  sigStub,
+		"PAYPAL-TRANSMISSION-TIME": time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// paypalCaptureCompletedBody builds a typical PAYMENT.CAPTURE.COMPLETED
+// JSON body for a one-time capture.
+func paypalCaptureCompletedBody(eventID, captureID, customID string, amount string) []byte {
+	return []byte(fmt.Sprintf(`{
+		"id": %q,
+		"event_type": "PAYMENT.CAPTURE.COMPLETED",
+		"resource": {
+			"id": %q,
+			"custom_id": %q,
+			"amount": {"value": %q, "currency_code": "USD"}
+		}
+	}`, eventID, captureID, customID, amount))
+}
+
+// paypalSaleCompletedBody builds a PAYMENT.SALE.COMPLETED renewal body.
+func paypalSaleCompletedBody(eventID, saleID, billingAgreementID, customID, nextBillingTime string) []byte {
+	return []byte(fmt.Sprintf(`{
+		"id": %q,
+		"event_type": "PAYMENT.SALE.COMPLETED",
+		"resource": {
+			"id": %q,
+			"billing_agreement_id": %q,
+			"custom_id": %q,
+			"amount": {"value": "9.99", "currency_code": "USD"},
+			"billing_info": {"next_billing_time": %q}
+		}
+	}`, eventID, saleID, billingAgreementID, customID, nextBillingTime))
 }

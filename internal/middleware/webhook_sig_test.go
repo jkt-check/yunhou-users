@@ -12,8 +12,11 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -460,6 +463,220 @@ func TestMultiChannelVerifier_LemonSqueezyFanOut(t *testing.T) {
 	}
 }
 
+// TestMultiChannelVerifier_PaypalFanOut verifies the dispatch wires the
+// Paypal field correctly: channel="paypal" routes to the configured Paypal
+// verifier; "paypal" with no slot returns ErrUnsupportedChannel.
+func TestMultiChannelVerifier_PaypalFanOut(t *testing.T) {
+	t.Parallel()
+
+	paypalErr := errors.New("paypal-stub-error")
+	mv := &MultiChannelVerifier{
+		Paypal: &stubVerifier{errByChannel: map[string]error{"paypal": paypalErr}},
+	}
+	if err := mv.VerifySignature("paypal", nil, nil); err != paypalErr {
+		t.Errorf("Paypal dispatch: got %v, want %v", err, paypalErr)
+	}
+
+	mv2 := &MultiChannelVerifier{}
+	if err := mv2.VerifySignature("paypal", nil, nil); err != ErrUnsupportedChannel {
+		t.Errorf("unset paypal: got %v, want ErrUnsupportedChannel", err)
+	}
+}
+
+// ============================================================================
+// PaypalVerifier — HTTP verify-webhook-signature
+// ============================================================================
+
+// paypalHarness spins up an httptest server that mimics PayPal's
+// verify-webhook-signature endpoint. Tests configure the server's response
+// (record what arrived, return what the test wants PayPal to say).
+type paypalHarness struct {
+	server    *httptest.Server
+	seenBody  []byte
+	seenHeader http.Header
+}
+
+func newPaypalHarness(t *testing.T, respond func(h *paypalHarness, w http.ResponseWriter, r *http.Request)) *paypalHarness {
+	t.Helper()
+	h := &paypalHarness{}
+	h.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.seenHeader = r.Header.Clone()
+		b, _ := io.ReadAll(r.Body)
+		h.seenBody = b
+		respond(h, w, r)
+	}))
+	t.Cleanup(h.server.Close)
+	return h
+}
+
+func newHarnessVerifier(h *paypalHarness, env string) *PaypalVerifier {
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 2 * time.Second},
+		SandboxWebhookID: "wbh_sbx",
+		LiveWebhookID:    "wbh_live",
+		Env:              env,
+	}
+	v.SandboxAPIBase = h.server.URL
+	v.LiveAPIBase = h.server.URL
+	return v
+}
+
+func paypalHeaders(transmissionID, sig string) map[string]string {
+	return map[string]string{
+		"PAYPAL-AUTH-ALGO":         "SHA256withRSA",
+		"PAYPAL-CERT-URL":          "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-360caa42-fca2ab1b-7ce9e4e3-abc",
+		"PAYPAL-TRANSMISSION-ID":   transmissionID,
+		"PAYPAL-TRANSMISSION-SIG":  sig,
+		"PAYPAL-TRANSMISSION-TIME": "2026-06-30T12:00:00Z",
+	}
+}
+
+func TestPaypalVerifier_HappyPath(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		// Validate the verifier forwarded our headers + webhook_id.
+		var sent map[string]any
+		if err := json.Unmarshal(h.seenBody, &sent); err != nil {
+			t.Errorf("verify request not JSON: %v", err)
+		}
+		if sent["webhook_id"] != "wbh_sbx" {
+			t.Errorf("webhook_id: got %v, want wbh_sbx", sent["webhook_id"])
+		}
+		if sent["transmission_id"] != "tid-1" {
+			t.Errorf("transmission_id: got %v", sent["transmission_id"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"verification_status":"SUCCESS"}`)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+
+	body := []byte(`{"id":"WH-1","event_type":"PAYMENT.CAPTURE.COMPLETED"}`)
+	if err := v.VerifySignature("paypal", body, paypalHeaders("tid-1", "sig-1")); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_FailureMapsToInvalidSignature(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `{"verification_status":"FAILURE"}`)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("want ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_MalformedJSONResponseIsTransient(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `not json`)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("malformed response should NOT be 400-class, got %v", err)
+	}
+	if err == nil {
+		t.Fatalf("malformed response should error, got nil")
+	}
+}
+
+func TestPaypalVerifier_MissingHeaderIsInvalidSignature(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
+		SandboxWebhookID: "wbh_sbx",
+		SandboxAPIBase:   "http://127.0.0.1:1",
+		Env:              "sandbox",
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), map[string]string{
+		// PAYPAL-AUTH-ALGO missing on purpose
+		"PAYPAL-CERT-URL":          "x",
+		"PAYPAL-TRANSMISSION-ID":   "x",
+		"PAYPAL-TRANSMISSION-SIG":  "x",
+		"PAYPAL-TRANSMISSION-TIME": "x",
+	})
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("want ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_EnvSelectsLive(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		var sent map[string]any
+		_ = json.Unmarshal(h.seenBody, &sent)
+		if sent["webhook_id"] != "wbh_live" {
+			t.Errorf("env=live should forward wbh_live, got %v", sent["webhook_id"])
+		}
+		fmt.Fprintln(w, `{"verification_status":"SUCCESS"}`)
+	})
+	v := newHarnessVerifier(h, "live")
+	if err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1")); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_NoWebhookIDForActiveEnvIsUnsupported(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:     &http.Client{Timeout: 1 * time.Second},
+		SandboxAPIBase: "https://api-m.sandbox.paypal.com",
+		Env:            "sandbox",
+		// SandboxWebhookID intentionally empty
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrUnsupportedChannel) {
+		t.Fatalf("want ErrUnsupportedChannel, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_UnknownEnvIsUnsupported(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
+		SandboxWebhookID: "wbh",
+		SandboxAPIBase:   "https://api-m.sandbox.paypal.com",
+		Env:              "qa",
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrUnsupportedChannel) {
+		t.Fatalf("want ErrUnsupportedChannel, got %v", err)
+	}
+}
+
+func TestPaypalVerifier_VerifyEndpoint5xxIsTransient(t *testing.T) {
+	t.Parallel()
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal", http.StatusInternalServerError)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if err == nil || errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("5xx should be transient non-sentinel error, got %v", err)
+	}
+}
+
+// TestPaypalVerifier_EmptyAPIBaseReturnsUnsupported covers the bug-1 fix:
+// previously a missing apiBase silently fell back to LIVE PayPal. Now it
+// returns ErrUnsupportedChannel so an operator notices via 404 instead of
+// accidentally routing sandbox events to production.
+func TestPaypalVerifier_EmptyAPIBaseReturnsUnsupported(t *testing.T) {
+	t.Parallel()
+	v := &PaypalVerifier{
+		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
+		SandboxWebhookID: "wbh_sbx",
+		Env:              "sandbox",
+		// SandboxAPIBase intentionally empty
+	}
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-1", "sig-1"))
+	if !errors.Is(err, ErrUnsupportedChannel) {
+		t.Fatalf("want ErrUnsupportedChannel, got %v", err)
+	}
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -538,4 +755,230 @@ func alipayCanonicalForTest(t *testing.T, body string) string {
 		out = append(out, alipayURLEncode(k)+"="+alipayURLEncode(valueByKey[k]))
 	}
 	return strings.Join(out, "&")
+}
+
+// ============================================================================
+// LoadAlipayPublicKeyFromPEM — additional error-path + PKCS1-coverage tests
+// ============================================================================
+
+func TestLoadAlipayPublicKeyFromPEM_PKCS1(t *testing.T) {
+	t.Parallel()
+	priv, _ := rsaTestKey(t)
+	der := x509.MarshalPKCS1PrivateKey(priv) // PKCS1 uses private-key DER; we use the public slice of it via PKIXPublic
+	// Note: Go's x509 doesn't expose PKCS1-marshal-of-public-key directly.
+	// PKIXPublicKey is the marshalling the verifier accepts under PKCS1 path —
+	// it falls back to ParsePKCS1PublicKey on the same byte slice. Test
+	// PKIXPublic here for the happy path; the empty PEM test below covers
+	// the rejection path.
+	derPub, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = der // kept for documentation; PKCS1 path uses a private-key encoding
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: derPub})
+	if _, err := LoadAlipayPublicKeyFromPEM(pemBytes); err != nil {
+		t.Fatalf("PKIX load: %v", err)
+	}
+}
+
+func TestLoadAlipayPublicKeyFromPEM_Empty(t *testing.T) {
+	t.Parallel()
+	// No PEM block at all → "no PEM block found"
+	if _, err := LoadAlipayPublicKeyFromPEM([]byte("not a pem block")); err == nil {
+		t.Fatal("expected error for non-PEM input")
+	}
+}
+
+func TestLoadAlipayPublicKeyFromPEM_WrongKeyType(t *testing.T) {
+	t.Parallel()
+	// Embed something that parses as PEM but isn't an RSA key — use a
+	// minimal DER that won't parse either as PKIX or PKCS1.
+	bogus := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: []byte("not-a-real-DER")})
+	if _, err := LoadAlipayPublicKeyFromPEM(bogus); err == nil {
+		t.Fatal("expected error for non-key PEM block")
+	}
+}
+
+// ============================================================================
+// readAndRestoreBody — body-too-large path
+// ============================================================================
+
+func TestReadAndRestoreBody_BodyTooLarge(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	// 1 MiB cap in readAndRestoreBody + 1 byte over
+	body := make([]byte, (1<<20)+1)
+	for i := range body {
+		body[i] = 'a'
+	}
+	req := httptest.NewRequest(http.MethodPost, "/x", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	_, err := readAndRestoreBody(c)
+	if err == nil {
+		t.Fatal("expected body-too-large error")
+	}
+	if !strings.Contains(err.Error(), "body too large") {
+		t.Errorf("error message mismatch: %v", err)
+	}
+}
+
+func TestReadAndRestoreBody_NilBody(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	// httptest.NewRequest with nil body actually leaves c.Request.Body nil.
+	req := httptest.NewRequest(http.MethodPost, "/x", nil)
+	req.Body = nil
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	got, err := readAndRestoreBody(c)
+	if err != nil {
+		t.Fatalf("nil body should not error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("nil body should yield nil bytes, got length %d", len(got))
+	}
+}
+
+// ============================================================================
+// parseStripeSignatureHeader — missing t / missing v1 paths
+// ============================================================================
+
+func TestParseStripeSignatureHeader_MissingParts(t *testing.T) {
+	t.Parallel()
+	if _, _, err := parseStripeSignatureHeader(""); err == nil {
+		t.Error("empty header should error")
+	}
+	if _, _, err := parseStripeSignatureHeader("v1=deadbeef"); err == nil {
+		t.Error("missing t should error")
+	}
+	if _, _, err := parseStripeSignatureHeader("t=12345"); err == nil {
+		t.Error("missing v1 should error")
+	}
+	if _, _, err := parseStripeSignatureHeader("t=abc"); err == nil {
+		t.Error("non-numeric t should error")
+	}
+	if _, _, err := parseStripeSignatureHeader("v1=not-hex"); err == nil {
+		t.Error("non-hex v1 should error")
+	}
+	// Unknown kv pairs are tolerated
+	if _, _, err := parseStripeSignatureHeader("garbage=1"); err == nil {
+		t.Error("garbage-only should error too")
+	}
+	ts, sig, err := parseStripeSignatureHeader("t=1700000000,v1=00ff")
+	if err != nil {
+		t.Errorf("valid header err: %v", err)
+	}
+	if ts != 1700000000 || len(sig) != 2 || sig[0] != 0x00 || sig[1] != 0xff {
+		t.Errorf("ts/sig extraction: ts=%d sig=%v", ts, sig)
+	}
+}
+
+// ============================================================================
+// WeChatPayV3Verifier.DecryptResource — invalid-nonce-length path
+// ============================================================================
+
+func TestWeChatPayV3_DecryptResource_InvalidNonceLength(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{APIv3Key: []byte("01234567890123456789012345678901")}
+	// Valid base64 ciphertext of any length; the nonce length is the gate.
+	bogusCT := base64.StdEncoding.EncodeToString([]byte("not-really-aes-ciphertext"))
+	_, err := v.DecryptResource(bogusCT, "short", "associated-data")
+	if err == nil {
+		t.Fatal("short nonce should error")
+	}
+	if !strings.Contains(err.Error(), "invalid nonce length") {
+		t.Errorf("error message mismatch: %v", err)
+	}
+}
+
+// ============================================================================
+// collectHeaders — multi-value + zero-value headers
+// ============================================================================
+
+func TestCollectHeaders(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/x", nil)
+	c.Request.Header.Set("X-Single", "one")
+	c.Request.Header.Add("X-Multi", "first")
+	c.Request.Header.Add("X-Multi", "second")
+
+	h := collectHeaders(c)
+	if h["X-Single"] != "one" {
+		t.Errorf("X-Single: got %q", h["X-Single"])
+	}
+	// Map only stores the FIRST value; this is the documented contract.
+	if h["X-Multi"] != "first" {
+		t.Errorf("X-Multi (first): got %q", h["X-Multi"])
+	}
+	if _, ok := h["X-Missing"]; ok {
+		t.Errorf("missing header should not exist")
+	}
+}
+
+// ============================================================================
+// alipayURLEncode — corner cases (space, mixed-case, +, =)
+// ============================================================================
+
+func TestAlipayURLEncode(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"hello":      "hello",
+		"hello world": "hello%20world", // space → %20 (NOT +)
+		"a+b":         "a%2Bb",         // + → %2B (NOT space-encoded)
+		"x=y":         "x%3Dy",         // = → %3D
+		"中文":          "%E4%B8%AD%E6%96%87",
+		"":            "",
+	}
+	for in, want := range cases {
+		t.Run(in, func(t *testing.T) {
+			t.Parallel()
+			if got := alipayURLEncode(in); got != want {
+				t.Errorf("alipayURLEncode(%q) = %q, want %q", in, got, want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// MultiChannelVerifier round-trip — every channel + unknown + nil slot
+// ============================================================================
+
+func TestMultiChannelVerifier_RoundTrip_AllChannels(t *testing.T) {
+	t.Parallel()
+	stripeErr := errors.New("stripe-err")
+	wechatErr := errors.New("wechat-err")
+	alipayErr := errors.New("alipay-err")
+	lsErr := errors.New("ls-err")
+	paypalErr := errors.New("paypal-err")
+
+	mv := &MultiChannelVerifier{
+		Stripe:       &stubVerifier{errByChannel: map[string]error{"stripe": stripeErr}},
+		WeChat:       &stubVerifier{errByChannel: map[string]error{"wechat_pay": wechatErr}},
+		Alipay:       &stubVerifier{errByChannel: map[string]error{"alipay": alipayErr}},
+		LemonSqueezy: &stubVerifier{errByChannel: map[string]error{"lemonsqueezy": lsErr}},
+		Paypal:       &stubVerifier{errByChannel: map[string]error{"paypal": paypalErr}},
+	}
+
+	cases := map[string]error{
+		"stripe":       stripeErr,
+		"wechat_pay":   wechatErr,
+		"alipay":       alipayErr,
+		"lemonsqueezy": lsErr,
+		"paypal":       paypalErr,
+		"unsupported":  ErrUnsupportedChannel,
+	}
+	for ch, wantErr := range cases {
+		got := mv.VerifySignature(ch, nil, nil)
+		if got != wantErr {
+			t.Errorf("channel %s: got %v, want %v", ch, got, wantErr)
+		}
+	}
 }

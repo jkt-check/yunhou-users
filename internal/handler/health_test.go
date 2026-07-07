@@ -61,3 +61,16 @@ func TestHealth_DBDownReturns503(t *testing.T) {
 		t.Fatalf("expected 503, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestHealth_NewHealthHandlerConstructor covers the wrapper the router
+// calls into — without it the constructor is 0% covered.
+func TestHealth_NewHealthHandlerConstructor(t *testing.T) {
+	t.Parallel()
+	h := NewHealthHandler(&stubPinger{err: nil})
+	if h == nil {
+		t.Fatal("NewHealthHandler returned nil")
+	}
+	if h.Pinger == nil {
+		t.Fatal("Pinger not set")
+	}
+}

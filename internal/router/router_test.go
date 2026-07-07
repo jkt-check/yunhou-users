@@ -202,3 +202,71 @@ func TestRoutePathVariables(t *testing.T) {
 		}
 	})
 }
+
+// TestSetup_RegistersAllRoutes calls the actual router.Setup() with
+// nil-tilings for every repo/service dependency. Setup() only stores
+// pointers in handler structs and registers routes — it does NOT
+// dereference the deps at registration time — so this is safe.
+//
+// We use gin's Routes() introspection rather than ServeHTTP() because
+// the latter would invoke handlers and middleware that dereference nil
+// deps and panic. Routes() just returns the route tree Setup() built.
+func TestSetup_RegistersAllRoutes(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+
+	Setup(t.Context(), engine,
+		nil, // healthPinger
+		nil, nil, nil, nil, nil, nil, // repos
+		nil, // tokenSvc
+		nil, // authSvc
+		nil, nil, nil, // subSvc, planSvc, paymentSvc
+		nil, // webhookVerifier
+		nil, // wechatAPIv3Key
+	)
+
+	routes := engine.Routes()
+	have := make(map[string]bool, len(routes))
+	for _, r := range routes {
+		have[r.Method+":"+r.Path] = true
+	}
+	want := []string{
+		"GET:/healthz",
+		"GET:/.well-known/jwks.json",
+		"POST:/auth/login",
+		"POST:/auth/refresh",
+		"POST:/auth/logout",
+		"GET:/user/profile",
+		"PATCH:/user/profile",
+		"GET:/user/identities",
+		"DELETE:/user/identities/:id",
+		"GET:/user/subscriptions",
+		"POST:/user/subscriptions",
+		"DELETE:/user/subscriptions/:id",
+		"GET:/apps",
+		"GET:/apps/:id",
+		"GET:/admin/plans",
+		"GET:/admin/plans/:id",
+		"POST:/admin/plans",
+		"PATCH:/admin/plans/:id",
+		"DELETE:/admin/plans/:id",
+		"POST:/admin/apps",
+		"PATCH:/admin/apps/:id",
+		"POST:/payments/orders",
+		"GET:/payments/orders/:id",
+		"DELETE:/payments/orders/:id",
+		"POST:/payments/orders/:order_id/confirm",
+		"GET:/payments",
+		"GET:/payments/:id",
+		"GET:/payments/:id/refunds",
+		"POST:/refunds",
+		"GET:/refunds/:id",
+		"POST:/webhooks/payment/:channel",
+	}
+	for _, w := range want {
+		if !have[w] {
+			t.Errorf("Setup did not register route %s", w)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -159,6 +160,168 @@ func TestEnvOr(t *testing.T) {
 		defer os.Unsetenv(key)
 		if got := envOr(key, ""); got != "has-value" {
 			t.Errorf("envOr: got %q, want %q", got, "has-value")
+		}
+	})
+}
+
+// TestValidate_HappyPath confirms a fully-populated Config passes validation.
+func TestValidate_HappyPath(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		DatabaseURL:        "postgres://x",
+		RSAPrivate:         "priv",
+		RSAPublic:          "pub",
+		JWTAccessTTL:       15 * time.Minute,
+		JWTRefreshTTL:      168 * time.Hour,
+		OrderExpiryDuration: 30 * time.Minute,
+		SweeperInterval:     1 * time.Minute,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+}
+
+// TestValidate_ErrorPaths walks every Validate() rejection branch.
+func TestValidate_ErrorPaths(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		mutate    func(c *Config)
+		needleSub string // substring the error message should contain
+	}{
+		{"missing database_url",
+			func(c *Config) { c.DatabaseURL = "" },
+			"DATABASE_URL",
+		},
+		{"missing rsa_private",
+			func(c *Config) { c.RSAPrivate = "" },
+			"RSA_PRIVATE_KEY_PATH",
+		},
+		{"missing rsa_public",
+			func(c *Config) { c.RSAPublic = "" },
+			"RSA_PUBLIC_KEY_PATH",
+		},
+		{"zero jwt_access_ttl",
+			func(c *Config) { c.JWTAccessTTL = 0 },
+			"JWT_ACCESS_TTL",
+		},
+		{"refresh_ttl <= access_ttl",
+			func(c *Config) {
+				c.JWTAccessTTL = 10 * time.Minute
+				c.JWTRefreshTTL = 10 * time.Minute
+			},
+			"JWT_REFRESH_TTL must be strictly greater",
+		},
+		{"refresh_ttl > 365 days",
+			func(c *Config) {
+				c.JWTAccessTTL = 24 * time.Hour
+				c.JWTRefreshTTL = 400 * 24 * time.Hour
+			},
+			"JWT_REFRESH_TTL must be at most 365 days",
+		},
+		{"zero order_expiry",
+			func(c *Config) { c.OrderExpiryDuration = 0 },
+			"ORDER_EXPIRY_DURATION",
+		},
+		{"zero sweeper_interval",
+			func(c *Config) { c.SweeperInterval = 0 },
+			"SWEEPER_INTERVAL",
+		},
+		{"sweeper_interval >= order_expiry",
+			func(c *Config) {
+				c.OrderExpiryDuration = 5 * time.Minute
+				c.SweeperInterval = 5 * time.Minute
+			},
+			"SWEEPER_INTERVAL must be strictly less",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &Config{
+				DatabaseURL:        "postgres://x",
+				RSAPrivate:         "priv",
+				RSAPublic:          "pub",
+				JWTAccessTTL:       15 * time.Minute,
+				JWTRefreshTTL:      168 * time.Hour,
+				OrderExpiryDuration: 30 * time.Minute,
+				SweeperInterval:     1 * time.Minute,
+			}
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("want error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.needleSub) {
+				t.Errorf("error message missing %q: %v", tc.needleSub, err)
+			}
+		})
+	}
+}
+
+// TestLoad_PaypalDefaults verifies the new PAYPAL_* defaults.
+func TestLoad_PaypalDefaults(t *testing.T) {
+	for _, k := range []string{
+		"PAYPAL_ENV", "PAYPAL_WEBHOOK_ID_SANDBOX", "PAYPAL_WEBHOOK_ID_LIVE",
+		"PAYPAL_API_BASE_SANDBOX", "PAYPAL_API_BASE_LIVE",
+	} {
+		orig, had := os.LookupEnv(k)
+		os.Unsetenv(k)
+		if had {
+			t.Cleanup(func() { os.Setenv(k, orig) })
+		} else {
+			t.Cleanup(func() { os.Unsetenv(k) })
+		}
+	}
+
+	cfg := Load()
+	if cfg.PaypalEnv != "live" {
+		t.Errorf("PaypalEnv default: got %q, want live", cfg.PaypalEnv)
+	}
+	if cfg.PaypalAPIBaseSandbox != "https://api-m.sandbox.paypal.com" {
+		t.Errorf("PaypalAPIBaseSandbox default: got %q", cfg.PaypalAPIBaseSandbox)
+	}
+	if cfg.PaypalAPIBaseLive != "https://api-m.paypal.com" {
+		t.Errorf("PaypalAPIBaseLive default: got %q", cfg.PaypalAPIBaseLive)
+	}
+	if cfg.PaypalWebhookIDSandbox != "" || cfg.PaypalWebhookIDLive != "" {
+		t.Errorf("webhook IDs should default to empty, got %q / %q",
+			cfg.PaypalWebhookIDSandbox, cfg.PaypalWebhookIDLive)
+	}
+}
+
+// TestLoad_PaypalEnvOverride confirms PAYPAL_ENV=sandbox flows through Load.
+func TestLoad_PaypalEnvOverride(t *testing.T) {
+	os.Setenv("PAYPAL_ENV", "sandbox")
+	defer os.Unsetenv("PAYPAL_ENV")
+	cfg := Load()
+	if cfg.PaypalEnv != "sandbox" {
+		t.Errorf("PaypalEnv override: got %q, want sandbox", cfg.PaypalEnv)
+	}
+}
+
+func TestParseDurationOr(t *testing.T) {
+	t.Parallel()
+	t.Run("valid → parsed value", func(t *testing.T) {
+		t.Parallel()
+		got := parseDurationOr("5m", 99*time.Minute)
+		if got != 5*time.Minute {
+			t.Errorf("got %v, want 5m", got)
+		}
+	})
+	t.Run("invalid → fallback", func(t *testing.T) {
+		t.Parallel()
+		got := parseDurationOr("not-a-duration", 7*time.Second)
+		if got != 7*time.Second {
+			t.Errorf("got %v, want fallback", got)
+		}
+	})
+	t.Run("empty → fallback", func(t *testing.T) {
+		t.Parallel()
+		got := parseDurationOr("", 99*time.Hour)
+		if got != 99*time.Hour {
+			t.Errorf("got %v, want fallback", got)
 		}
 	})
 }

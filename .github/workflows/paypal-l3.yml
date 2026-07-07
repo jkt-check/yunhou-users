@@ -1,0 +1,152 @@
+# L3 PayPal sandbox UI integration suite.
+#
+# NOT a default PR gate — runs nightly + on demand. Trigger via the
+# Actions tab (workflow_dispatch) or as the nightlies schedule.
+#
+# Required secrets:
+#   PAYPAL_SANDBOX_CLIENT_ID       - sandbox REST app client id
+#   PAYPAL_SANDBOX_SECRET          - sandbox REST app secret
+#   PAYPAL_SANDBOX_WEBHOOK_ID      - registered webhook id
+#   PAYPAL_BUYER_ACCOUNT_EMAIL     - sandbox personal buyer
+#   PAYPAL_BUYER_ACCOUNT_PASSWORD  - sandbox personal buyer
+#   PAYPAL_TEST_PLAN_ID            - pre-created Plan id (P-xxx)
+#   PAYPAL_NGROK_AUTHTOKEN         - ngrok authtoken
+
+name: paypal-l3-sandbox
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * *'   # nightly 07:00 UTC
+
+jobs:
+  paypal-l3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BACKEND_BIN: /tmp/yunhou-server
+      NGROK_BIN: /tmp/ngrok
+      ARTIFACTS_DIR: /tmp/paypal-l3-artifacts
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go (for backend)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Start Postgres
+        run: |
+          sudo service postgresql start
+          sudo -u postgres createdb yunhou_users_e2e
+          sudo -u postgres psql -d yunhou_users_e2e -f migrations/001_init.sql
+          sudo -u postgres psql -d yunhou_users_e2e -f migrations/002_simplify_plans.sql
+          sudo -u postgres psql -d yunhou_users_e2e -f migrations/003_payments.sql
+          sudo -u postgres psql -d yunhou_users_e2e -f migrations/004_ls_channel.sql
+          sudo -u postgres psql -d yunhou_users_e2e -f migrations/005_paypal_channel.sql
+          sudo -u postgres psql -d yunhou_users_e2e -f migrations/006_paypal_sub_mapping.sql
+
+      # All long-running daemons (ngrok, backend) live in a single step
+      # that runs to completion before the test step. This avoids the
+      # background-process-killed-between-steps bug: in bash-mode each
+      # GitHub Actions step gets its own shell, so '&' background processes
+      # are SIGKILL'd when the step exits. The single-step-with-flags
+      # pattern below keeps both alive for the whole workflow.
+      - name: Run ngrok + backend + Playwright
+        env:
+          DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          PAYPAL_ENV: sandbox
+          PAYPAL_WEBHOOK_ID_SANDBOX: ${{ secrets.PAYPAL_SANDBOX_WEBHOOK_ID }}
+          PAYPAL_API_BASE_SANDBOX: https://api-m.sandbox.paypal.com
+          PAYPAL_SANDBOX_CLIENT_ID: ${{ secrets.PAYPAL_SANDBOX_CLIENT_ID }}
+          PAYPAL_SANDBOX_SECRET: ${{ secrets.PAYPAL_SANDBOX_SECRET }}
+          PAYPAL_SANDBOX_WEBHOOK_ID: ${{ secrets.PAYPAL_SANDBOX_WEBHOOK_ID }}
+          PAYPAL_BUYER_ACCOUNT_EMAIL: ${{ secrets.PAYPAL_BUYER_ACCOUNT_EMAIL }}
+          PAYPAL_BUYER_ACCOUNT_PASSWORD: ${{ secrets.PAYPAL_BUYER_ACCOUNT_PASSWORD }}
+          PAYPAL_TEST_PLAN_ID: ${{ secrets.PAYPAL_TEST_PLAN_ID }}
+          E2E_DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          BACKEND_URL: http://localhost:8080
+          NGROK_AUTHTOKEN: ${{ secrets.PAYPAL_NGROK_AUTHTOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Persist transient artifacts to a durable location so the
+          # same step's later commands can read them.
+          mkdir -p "$ARTIFACTS_DIR"
+
+          # 1) ngrok
+          curl -sSL https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.tgz | tar xz -C /tmp/
+          "$NGROK_BIN" authtoken "$NGROK_AUTHTOKEN"
+          "$NGROK_BIN" http 8080 --log "$ARTIFACTS_DIR/ngrok.log" > "$ARTIFACTS_DIR/ngrok.out" 2>&1 &
+          NGROK_PID=$!
+          echo "ngrok pid=$NGROK_PID"
+
+          # Wait for ngrok to assign a public URL; tunnel is ready when
+          # the admin API responds with at least one tunnel entry.
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:4040/api/tunnels > "$ARTIFACTS_DIR/tunnels.json" 2>/dev/null; then
+              if jq -e '.tunnels | length > 0' "$ARTIFACTS_DIR/tunnels.json" >/dev/null 2>&1; then
+                break
+              fi
+            fi
+            sleep 1
+          done
+          NGROK_URL=$(jq -r '.tunnels[] | select(.public_url|startswith("https://")) | .public_url' "$ARTIFACTS_DIR/tunnels.json" | head -1)
+          echo "ngrok url=$NGROK_URL"
+          echo "$NGROK_URL" > "$ARTIFACTS_DIR/ngrok-url"
+
+          # 2) backend
+          go build -o "$BACKEND_BIN" ./cmd/server
+          "$BACKEND_BIN" > "$ARTIFACTS_DIR/backend.log" 2>&1 &
+          BACKEND_PID=$!
+          echo "backend pid=$BACKEND_PID"
+          for _ in $(seq 1 20); do
+            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "backend healthy"
+              break
+            fi
+            sleep 1
+          done
+
+          # Cleanup runs unconditionally (set +e), so processes die even
+          # if the test exits non-zero. Without this `set -e` would skip
+          # the kill on failure and leak ngrok + the backend.
+          cleanup() {
+            local exit_code=$?
+            kill "$BACKEND_PID" "$NGROK_PID" 2>/dev/null || true
+            return "$exit_code"
+          }
+          trap cleanup EXIT
+
+          # 3) playwright (foreground, the point-of-failure step).
+          cd tests/e2e-ui
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          WEBHOOK_BASE_URL="$NGROK_URL" npm run all
+          # DON'T set exit; the trap runs cleanup and exits with the test code.
+
+      - name: Upload report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/e2e-ui/playwright-report/
+
+      - name: Upload trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-trace
+          path: tests/e2e-ui/test-results/
+
+      - name: Upload backend + ngrok logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paypal-l3-logs
+          path: /tmp/paypal-l3-artifacts/

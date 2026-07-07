@@ -102,6 +102,15 @@ type LoginRequest struct {
 	AppID         string `json:"app_id" binding:"required"`
 }
 
+// TestLoginRequest is the body for POST /test/login. Dev-only — gated by
+// PAYPAL_L3_E2E_MODE=1. L3 Playwright suite uses this to mint a real JWT
+// against a locally-running backend that has its GitHub OAuth verifier
+// wired to api.github.com (which 401s on fake tokens).
+type TestLoginRequest struct {
+	Email string `json:"email" binding:"required"`
+	AppID string `json:"app_id" binding:"required"`
+}
+
 // LoginResponse is the response for POST /auth/login
 type LoginResponse struct {
 	AccessToken  string           `json:"access_token"`
@@ -347,6 +356,136 @@ func (s *AuthService) resolveOrCreateUser(ctx context.Context, info *ProviderUse
 		return "", false, err
 	}
 	return user.ID, true, nil
+}
+
+// TestLogin mints a real JWT for an email without going through any
+// OAuth provider. Bypasses GitHub/Google entirely — the caller's
+// identity is the email itself. Creates the user (no real social
+// identity attached) if it doesn't exist; otherwise reuses the
+// existing user. Used by the L3 e2e-ui suite (which can't drive
+// the real GitHub popup for fake sandbox emails).
+func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*LoginResponse, error) {
+	// Verify the requested app is real + active (mirrors Login's gate).
+	app, err := s.appRepo.FindByID(ctx, req.AppID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAppNotFound
+		}
+		return nil, fmt.Errorf("find app: %w", err)
+	}
+	if !app.IsActive {
+		return nil, ErrAppInactive
+	}
+
+	// Find or create the user. Email is the lookup key — but in the
+	// production schema emails live on social_identities, not on the
+	// users table. So we look up by identity, fall back to creating
+	// both a user + a synthetic identity.
+	identities, err := s.identityRepo.FindByEmail(ctx, req.Email)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("find identity: %w", err)
+	}
+	var user *model.User
+	if len(identities) > 0 {
+		user, err = s.userRepo.FindByID(ctx, identities[0].UserID)
+		if err != nil {
+			return nil, fmt.Errorf("find user: %w", err)
+		}
+	} else {
+		// Create a fresh user + a synthetic identity so future /auth/login
+		// flows can also find this user.
+		nick := req.Email
+		user = &model.User{
+			ID:       GenerateUUID(),
+			Nickname: &nick,
+			Status:   "active",
+		}
+		if err := s.userRepo.Create(ctx, user); err != nil {
+			return nil, fmt.Errorf("create user: %w", err)
+		}
+		email := req.Email
+		if err := s.identityRepo.Create(ctx, &model.SocialIdentity{
+			ID:          GenerateUUID(),
+			UserID:      user.ID,
+			Provider:    "github",
+			ProviderUID: "l3-e2e-" + user.ID,
+			Email:       &email,
+		}); err != nil {
+			return nil, fmt.Errorf("create identity: %w", err)
+		}
+	}
+
+	// Account-status guard.
+	if user.Status == "suspended" {
+		return nil, ErrUserSuspended
+	}
+	if user.Status == "deleted" {
+		return nil, ErrUserDeleted
+	}
+
+	// Resolve the user's plan for the response. Falls back to the
+	// default plan if the user has no active sub (matches Login).
+	var plan *model.Plan
+	active, err := s.subRepo.FindActiveByUserID(ctx, user.ID)
+	if err == nil && active != nil {
+		plan, err = s.planRepo.FindByID(ctx, active.PlanID)
+		if err != nil {
+			return nil, fmt.Errorf("get plan: %w", err)
+		}
+	} else {
+		plan, err = s.planRepo.FindDefault(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get default plan: %w", err)
+		}
+	}
+	hasAccess := slices.Contains(plan.Apps, req.AppID)
+
+	// Issue tokens through the same path production uses so the refresh
+	// rotation, JWT signing, etc. are byte-for-byte identical to /auth/login.
+	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, req.AppID, plan.Apps)
+	if err != nil {
+		return nil, fmt.Errorf("sign access token: %w", err)
+	}
+	refreshTokenRaw, err := GenerateRefreshToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate refresh token: %w", err)
+	}
+	session := &model.Session{
+		ID:           GenerateUUID(),
+		UserID:       user.ID,
+		AppID:        req.AppID,
+		SessionType:  "refresh",
+		RefreshToken: hashToken(refreshTokenRaw),
+		Scope:        plan.Apps,
+		Revoked:      false,
+		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
+	}
+	if err := s.sessionRepo.Create(ctx, session); err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
+	}
+
+	var expiresAt *time.Time
+	if active != nil {
+		expiresAt = active.ExpiresAt
+	}
+
+	email := req.Email
+	return &LoginResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshTokenRaw,
+		User: UserInfo{
+			ID:        user.ID,
+			Nickname:  user.Nickname,
+			Email:     &email,
+			AvatarURL: user.AvatarURL,
+		},
+		Subscription: &SubscriptionInfo{
+			PlanID:    plan.ID,
+			PlanName:  plan.Name,
+			HasAccess: hasAccess,
+			ExpiresAt: expiresAt,
+		},
+	}, nil
 }
 
 // Logout revokes the refresh token. Idempotent: a missing/expired session

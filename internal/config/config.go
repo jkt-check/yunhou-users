@@ -34,6 +34,14 @@ type Config struct {
 	AlipayPublicKeyPath       string
 	LemonSqueezyWebhookSecret string
 
+	// PayPal sandbox + live both loaded; PaypalEnv selects which is active.
+	// Empty webhook ID for the active env → channel returns 404 for that env.
+	PaypalEnv              string // "sandbox" | "live"
+	PaypalWebhookIDSandbox string
+	PaypalWebhookIDLive    string
+	PaypalAPIBaseSandbox   string // default https://api-m.sandbox.paypal.com
+	PaypalAPIBaseLive      string // default https://api-m.paypal.com
+
 	// Order expiry: how long a pending order is valid before the sweeper
 	// flips it to 'expired'. Default 30 min per design doc §"v1 decisions".
 	OrderExpiryDuration time.Duration
@@ -62,6 +70,12 @@ func Load() *Config {
 		WeChatAPIv3Key:            os.Getenv("WECHAT_PAY_API_V3_KEY"),
 		AlipayPublicKeyPath:       os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
 		LemonSqueezyWebhookSecret: os.Getenv("LEMONSQUEEZY_WEBHOOK_SECRET"),
+
+		PaypalEnv:              envOr("PAYPAL_ENV", "live"),
+		PaypalWebhookIDSandbox: os.Getenv("PAYPAL_WEBHOOK_ID_SANDBOX"),
+		PaypalWebhookIDLive:    os.Getenv("PAYPAL_WEBHOOK_ID_LIVE"),
+		PaypalAPIBaseSandbox:   envOr("PAYPAL_API_BASE_SANDBOX", "https://api-m.sandbox.paypal.com"),
+		PaypalAPIBaseLive:      envOr("PAYPAL_API_BASE_LIVE", "https://api-m.paypal.com"),
 
 		OrderExpiryDuration: parseDurationOr(envOr("ORDER_EXPIRY_DURATION", "30m"), 30*time.Minute),
 		SweeperInterval:     parseDurationOr(envOr("SWEEPER_INTERVAL", "1m"), 1*time.Minute),

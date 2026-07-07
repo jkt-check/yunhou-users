@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -414,6 +416,189 @@ func (v *LemonsqueezyVerifier) VerifySignature(channel string, body []byte, head
 }
 
 // ============================================================================
+// PayPal — HTTP verify-webhook-signature (sandbox + live both loaded)
+// ============================================================================
+
+// PaypalVerifier verifies PayPal webhooks by POSTing the request body + the
+// five PayPal signature headers to PayPal's verify-webhook-signature REST
+// endpoint. The endpoint base URL is selected from Env ("sandbox" | "live");
+// both webhook IDs and API bases are loaded at startup so deployments don't
+// need to restart to flip environments.
+//
+// Replay protection is provided by the event-level dedupe (webhook_events
+// UNIQUE(channel, event_id)) — same approach as LemonSqueezy. PayPal's
+// transmission_time is meant only for PayPal's own verification, not for
+// our dedup, so we don't enforce a local replay window.
+//
+// verifyCache is a tiny in-process cache that absorbs PayPal's retry bursts.
+// PayPal retries on transient errors within seconds; without the cache every
+// retry pays a full DNS+TCP+TLS+RTT to api-m.paypal.com. Key is the unique
+// (transmission_id, transmission_time) tuple so a genuine second delivery at
+// a different time isn't suppressed.
+const paypalVerifyCacheTTL = 60 * time.Second
+
+type paypalVerifyCacheEntry struct {
+	status    string // "SUCCESS" | "FAILURE" | other (mirrors verification_status)
+	expiresAt time.Time
+	err       error // first-call verdict; subsequent calls return the same
+}
+
+var paypalVerifyCache sync.Map // map[paypalVerifyCacheKey]paypalVerifyCacheEntry
+
+type paypalVerifyCacheKey struct {
+	transmissionID   string
+	transmissionTime string
+}
+
+func lookupVerifyCache(k paypalVerifyCacheKey) (paypalVerifyCacheEntry, bool) {
+	if v, ok := paypalVerifyCache.Load(k); ok {
+		entry := v.(paypalVerifyCacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			return entry, true
+		}
+		paypalVerifyCache.Delete(k)
+	}
+	return paypalVerifyCacheEntry{}, false
+}
+
+func storeVerifyCache(k paypalVerifyCacheKey, status string, err error) {
+	paypalVerifyCache.Store(k, paypalVerifyCacheEntry{
+		status:    status,
+		expiresAt: time.Now().Add(paypalVerifyCacheTTL),
+		err:       err,
+	})
+}
+
+type PaypalVerifier struct {
+	HTTPClient       *http.Client // nil → http.DefaultClient; production should set Timeout.
+	SandboxWebhookID string
+	LiveWebhookID    string
+	SandboxAPIBase   string // default https://api-m.sandbox.paypal.com
+	LiveAPIBase      string // default https://api-m.paypal.com
+	Env              string // "sandbox" | "live"
+}
+
+// activeConfig resolves which (webhookID, apiBase) pair the verifier should
+// use for the current Env. Unknown Env or empty base returns defaults /
+// errors so they surface as ErrUnsupportedChannel at the middleware.
+func (v *PaypalVerifier) activeConfig() (webhookID, apiBase string, err error) {
+	switch v.Env {
+	case "sandbox":
+		return v.SandboxWebhookID, v.SandboxAPIBase, nil
+	case "live":
+		return v.LiveWebhookID, v.LiveAPIBase, nil
+	default:
+		return "", "", fmt.Errorf("%w: unknown PAYPAL_ENV %q", ErrUnsupportedChannel, v.Env)
+	}
+}
+
+func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
+	// MultiChannelVerifier already routes by channel before calling us; the
+	// per-channel channel-name guard is defensive scaffolding.
+	_ = channel
+
+	authAlgo := headers["PAYPAL-AUTH-ALGO"]
+	certURL := headers["PAYPAL-CERT-URL"]
+	transmissionID := headers["PAYPAL-TRANSMISSION-ID"]
+	transmissionSIG := headers["PAYPAL-TRANSMISSION-SIG"]
+	transmissionTime := headers["PAYPAL-TRANSMISSION-TIME"]
+	if authAlgo == "" || certURL == "" || transmissionID == "" ||
+		transmissionSIG == "" || transmissionTime == "" {
+		return ErrInvalidSignature
+	}
+
+	// Cache hit: short-circuit the upstream call. PayPal retries on
+	// transient errors within seconds; the (transmission_id, transmission_time)
+	// tuple uniquely identifies a delivery, so a cached SUCCESS applies to
+	// the genuine retry burst only.
+	if entry, ok := lookupVerifyCache(paypalVerifyCacheKey{
+		transmissionID:   transmissionID,
+		transmissionTime: transmissionTime,
+	}); ok {
+		return entry.err
+	}
+
+	webhookID, apiBase, err := v.activeConfig()
+	if err != nil {
+		return err
+	}
+	if webhookID == "" {
+		// Channel was requested but no webhook ID is configured for the
+		// active env → treat as unsupported so middleware returns 404.
+		return ErrUnsupportedChannel
+	}
+	if apiBase == "" {
+		// Misconfigured: Env says sandbox/live but the matching API base
+		// is unset. Rather than silently fall through to a hardcoded
+		// default (which used to default to LIVE, a footgun), treat as
+		// unsupported so the operator notices via 404.
+		return ErrUnsupportedChannel
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"auth_algo":         authAlgo,
+		"cert_url":          certURL,
+		"transmission_id":   transmissionID,
+		"transmission_sig":  transmissionSIG,
+		"transmission_time": transmissionTime,
+		"webhook_id":        webhookID,
+		"webhook_event":     json.RawMessage(body),
+	})
+	if err != nil {
+		return fmt.Errorf("paypal verify marshal: %w", err)
+	}
+
+	httpClient := v.HTTPClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	req, err := http.NewRequest(http.MethodPost,
+		apiBase+"/v1/notifications/verify-webhook-signature",
+		bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("paypal verify request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		// Network error → transient (500), let PayPal retry.
+		return fmt.Errorf("paypal verify http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("paypal verify read: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		// PayPal's verify endpoint rarely returns 4xx; treat any non-2xx
+		// as transient so PayPal retries per its schedule.
+		return fmt.Errorf("paypal verify status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var out struct {
+		VerificationStatus string `json:"verification_status"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return fmt.Errorf("paypal verify decode: %w", err)
+	}
+	if out.VerificationStatus != "SUCCESS" {
+		storeVerifyCache(paypalVerifyCacheKey{
+			transmissionID:   transmissionID,
+			transmissionTime: transmissionTime,
+		}, out.VerificationStatus, ErrInvalidSignature)
+		return ErrInvalidSignature
+	}
+	storeVerifyCache(paypalVerifyCacheKey{
+		transmissionID:   transmissionID,
+		transmissionTime: transmissionTime,
+	}, out.VerificationStatus, nil)
+	return nil
+}
+
+// ============================================================================
 // MultiChannelVerifier — fan-out for production wiring
 // ============================================================================
 
@@ -424,6 +609,7 @@ type MultiChannelVerifier struct {
 	WeChat       ChannelSignatureVerifier
 	Alipay       ChannelSignatureVerifier
 	LemonSqueezy ChannelSignatureVerifier
+	Paypal       ChannelSignatureVerifier
 }
 
 func (m *MultiChannelVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
@@ -437,6 +623,8 @@ func (m *MultiChannelVerifier) VerifySignature(channel string, body []byte, head
 		v = m.Alipay
 	case "lemonsqueezy":
 		v = m.LemonSqueezy
+	case "paypal":
+		v = m.Paypal
 	default:
 		return ErrUnsupportedChannel
 	}

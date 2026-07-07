@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -40,6 +41,11 @@ type AppRepo interface {
 	FindByID(ctx context.Context, id string) (*model.App, error)
 	Update(ctx context.Context, a *model.App) error
 	List(ctx context.Context) ([]model.App, error)
+	// RotateSecretHash writes a freshly-generated bcrypt hash for an existing
+	// app. The plaintext never enters this layer — handler / util produces
+	// both values and hands the hash here. Returns sql.ErrNoRows if the app
+	// doesn't exist (handler maps to 404).
+	RotateSecretHash(ctx context.Context, appID, newHash string) error
 }
 
 type SubscriptionRepo interface {
@@ -244,21 +250,22 @@ func (r *planRepo) Delete(ctx context.Context, id string) error {
 
 func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO apps (app_id, name, description, config, is_active)
-		VALUES (:app_id, :name, :description, :config, :is_active)
+		INSERT INTO apps (app_id, name, description, config, is_active, secret_hash)
+		VALUES (:app_id, :name, :description, :config, :is_active, :secret_hash)
 	`, a)
 	return err
 }
 
 // appSelectColumns is the canonical SELECT list for the apps table. It must
 // stay in sync with the column order produced by migration 002_simplify_plans
-// (app_id, name, description, config, is_active, created_at, updated_at) and
-// with model.App's field order so sqlx can scan rows into the struct.
+// (app_id, name, description, config, is_active, created_at, updated_at) plus
+// 005_app_secret (secret_hash) and with model.App's field order so sqlx can
+// scan rows into the struct.
 //
 // COALESCE(config, '{}'::jsonb) guards against sqlx's inability to scan a
 // NULL JSONB value into json.RawMessage. Keep the alias name (config) so
 // the `db:"config"` tag on model.App.Config still matches.
-const appSelectColumns = `app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, created_at, updated_at`
+const appSelectColumns = `app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, COALESCE(secret_hash, '') AS secret_hash, created_at, updated_at`
 
 func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
 	var a model.App
@@ -272,6 +279,9 @@ func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
 }
 
 func (r *appRepo) Update(ctx context.Context, a *model.App) error {
+	// Update explicitly excludes secret_hash — rotation goes through
+	// RotateSecretHash so it has its own audit trail and bypasses the
+	// general "patch any field" handler.
 	_, err := r.db.NamedExecContext(ctx, `
 		UPDATE apps SET name = :name, description = :description, config = :config,
 		is_active = :is_active WHERE app_id = :app_id
@@ -284,6 +294,23 @@ func (r *appRepo) List(ctx context.Context) ([]model.App, error) {
 	err := r.db.SelectContext(ctx, &list,
 		`SELECT `+appSelectColumns+` FROM apps ORDER BY created_at`)
 	return list, err
+}
+
+func (r *appRepo) RotateSecretHash(ctx context.Context, appID, newHash string) error {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE apps SET secret_hash = $1, updated_at = now() WHERE app_id = $2`,
+		newHash, appID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // SubscriptionRepo implementation

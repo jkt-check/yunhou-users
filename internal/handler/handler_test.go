@@ -16,6 +16,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
+	"github.com/yunhou/users/internal/util"
 )
 
 // --- Mocks implementing service interfaces ---
@@ -616,6 +617,16 @@ func (m *mockAppRepo) Update(ctx context.Context, a *model.App) error {
 	return nil
 }
 
+func (m *mockAppRepo) RotateSecretHash(ctx context.Context, appID, newHash string) error {
+	for i, app := range m.apps {
+		if app.AppID == appID {
+			m.apps[i].SecretHash = newHash
+			return nil
+		}
+	}
+	return sql.ErrNoRows
+}
+
 func TestAppHandler_ListApps(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -712,6 +723,28 @@ func TestAppHandler_CreateApp(t *testing.T) {
 		if w.Code != http.StatusCreated {
 			t.Errorf("expected 201, got %d: %s", w.Code, w.Body.String())
 		}
+		// Plaintext secret must be in the response (one-time) and the row's
+		// SecretHash must verify against that plaintext via bcrypt.
+		var resp struct {
+			Code int `json:"code"`
+			Data struct {
+				App    *model.App `json:"app"`
+				Secret string     `json:"secret"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.Data.Secret == "" {
+			t.Fatal("data.secret must be populated on create")
+		}
+		if len(appRepo.apps) != 1 || !util.CheckSecret(appRepo.apps[0].SecretHash, resp.Data.Secret) {
+			t.Errorf("stored hash does not verify against returned plaintext; stored hash = %q", appRepo.apps[0].SecretHash)
+		}
+		// Hash field must never leak in JSON responses (json:"-").
+		if resp.Data.App.SecretHash != "" {
+			t.Errorf("app.secret_hash leaked in response: %q", resp.Data.App.SecretHash)
+		}
 	})
 
 	t.Run("create app invalid body", func(t *testing.T) {
@@ -772,6 +805,71 @@ func TestAppHandler_CreateApp(t *testing.T) {
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+func TestAppHandler_RotateSecret(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("rotate secret success", func(t *testing.T) {
+		// Pre-seed an app with a known old hash. After rotation, the old
+		// plaintext must no longer verify against the stored hash and the
+		// new plaintext returned in the response must verify.
+		oldHash, err := util.HashSecret("old-secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		appRepo := &mockAppRepo{apps: []model.App{{AppID: "test", Name: "Test", IsActive: true, SecretHash: oldHash}}}
+		handler := NewAppHandler(appRepo, nil)
+
+		router := gin.New()
+		router.POST("/apps/:id/rotate-secret", handler.RotateSecret)
+
+		req := httptest.NewRequest(http.MethodPost, "/apps/test/rotate-secret", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code int `json:"code"`
+			Data struct {
+				Secret string `json:"secret"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		newPlain := resp.Data.Secret
+		if newPlain == "" {
+			t.Fatal("data.secret must be populated on rotate")
+		}
+		if newPlain == "old-secret" {
+			t.Error("rotated secret reused the old plaintext")
+		}
+		if !util.CheckSecret(appRepo.apps[0].SecretHash, newPlain) {
+			t.Errorf("stored hash does not verify against the new plaintext; hash = %q", appRepo.apps[0].SecretHash)
+		}
+		if util.CheckSecret(appRepo.apps[0].SecretHash, "old-secret") {
+			t.Error("old plaintext still verifies — rotation didn't actually replace the hash")
+		}
+	})
+
+	t.Run("rotate secret for unknown app", func(t *testing.T) {
+		appRepo := &mockAppRepo{}
+		handler := NewAppHandler(appRepo, nil)
+
+		router := gin.New()
+		router.POST("/apps/:id/rotate-secret", handler.RotateSecret)
+
+		req := httptest.NewRequest(http.MethodPost, "/apps/missing/rotate-secret", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", w.Code)
 		}
 	})
 }

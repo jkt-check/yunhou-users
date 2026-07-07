@@ -11,6 +11,7 @@ type App struct {
 	Description string          `db:"description" json:"description"`
 	Config      json.RawMessage `db:"config" json:"config"`
 	IsActive    bool            `db:"is_active" json:"is_active"`
+	SecretHash  string          `db:"secret_hash" json:"-"` // bcrypt hash; never serialize (plaintext is returned once at create / rotate time)
 	CreatedAt   time.Time       `db:"created_at" json:"created_at"`
 	UpdatedAt   time.Time       `db:"updated_at" json:"updated_at"`
 }

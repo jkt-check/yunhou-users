@@ -102,6 +102,26 @@ func TestQuote_Get_HappyPath_LemonSqueezyConfigured(t *testing.T) {
 	if pd["variant_id"] != "var-1" {
 		t.Errorf("ls.variant_id = %v", pd["variant_id"])
 	}
+	// sub_expires_at must surface inside checkout_data.custom so the BFF
+	// can pass provider_data through to the LS checkout-creation call
+	// without reformatting. The webhook reads meta.custom_data.sub_expires_at
+	// back and yunhou does NOT recompute (see service/payment.go).
+	cd, ok := pd["checkout_data"].(map[string]any)
+	if !ok {
+		t.Fatalf("ls.checkout_data missing: %+v", pd)
+	}
+	custom, ok := cd["custom"].(map[string]any)
+	if !ok {
+		t.Fatalf("ls.checkout_data.custom missing: %+v", cd)
+	}
+	subExp, ok := custom["sub_expires_at"].(string)
+	if !ok || subExp == "" {
+		t.Fatalf("ls.checkout_data.custom.sub_expires_at missing/empty: %+v", custom)
+	}
+	wantExp := quote.SubExpiresAt.UTC().Format(time.RFC3339)
+	if subExp != wantExp {
+		t.Errorf("ls.custom.sub_expires_at = %q, want %q (matches top-level Quote.SubExpiresAt)", subExp, wantExp)
+	}
 }
 
 func TestQuote_Get_BothChannelsConfigured(t *testing.T) {

@@ -17,17 +17,20 @@ A shared user management API for multi-app ecosystems. One user identity across 
 # 1. Set up PostgreSQL
 createdb yunhou_users
 # Run ALL migrations in order — 002 alters tables created by 001, 003
-# adds payment/webhook tables. Each depends on the prior; running out of
-# order will fail.
+# adds payment/webhook tables, 005 adds apps.secret_hash. Each depends on
+# the prior; running out of order will fail.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
 psql -d yunhou_users -f migrations/004_ls_channel.sql
+psql -d yunhou_users -f migrations/005_app_secret.sql
 
 # 2. Generate RSA keys
 make generate-keys
 
-# 3. Run
+# 3. Run — startup backfills apps.secret_hash for any pre-existing rows
+#    and prints the plaintexts to stdout (capture them, then rotate each
+#    app's secret via POST /admin/apps/:id/rotate-secret).
 make run
 
 # 4. Login (example with GitHub token)
@@ -63,7 +66,7 @@ All configuration is via environment variables (or `.env` file):
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/healthz` | Liveness / readiness probe |
+| GET | `/healthz` | Liveness / readiness probe. **Not rate-limited.** Returns 200 `{"code":0,"data":{"status":"ok"}}` or 503 `{"code":503,"message":"db unavailable"}` |
 | GET | `/.well-known/jwks.json` | RSA public key (JWK format) |
 | POST | `/auth/login` | Login with provider token |
 | POST | `/auth/refresh` | Refresh tokens |
@@ -95,20 +98,27 @@ All configuration is via environment variables (or `.env` file):
 | POST | `/admin/plans` | Create plan |
 | PATCH | `/admin/plans/:id` | Update plan |
 | DELETE | `/admin/plans/:id` | Delete plan |
-| POST | `/admin/apps` | Create app |
-| PATCH | `/admin/apps/:id` | Update app |
+| POST | `/admin/apps` | Create app (returns plaintext `secret` once — only bcrypt hash is persisted) |
+| PATCH | `/admin/apps/:id` | Update app (cannot change `secret` — use rotate-secret) |
+| POST | `/admin/apps/:id/rotate-secret` | Generate a new shared secret, invalidate the old one immediately |
 
 **Auth flavors**
 
 - `GET /apps/:id/plans` — **public**, no header, no JWT.
 - `POST /apps/:id/quote` — **JWT Bearer**. The quote is computed per-user (JWT identifies `user_id`); mounted at the engine level so it does not collide with the `X-App-ID` wrapper around the other `/apps/:id/*` routes.
-- `GET /apps/:id/provider-token/:channel` — **internal service auth** (`X-App-ID` header). BFF calls this with its own service credentials; never expose to end users.
+- `GET /apps/:id/provider-token/:channel` and every `/admin/*` route — **internal service auth** (`X-App-ID` + `X-App-Secret` headers). BFF calls these with its own service credentials; never expose to end users. `X-App-Secret` is the bcrypt-hashed value returned once by `POST /admin/apps` or `POST /admin/apps/:id/rotate-secret` — losing it requires a rotation.
 
-App management endpoints require `X-App-ID` header. Public and user endpoints do not.
+User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 
 ### v2 known limitations
 
-- `POST /apps/:id/quote` response hardcodes `currency = "USD"` (multi-currency is not supported in v1; the `plans` table has no currency column today).
+- `POST /apps/:id/quote` response hardcodes `currency = "USD"` (`internal/service/quote.go`); `POST /payments/orders` hardcodes `currency = "CNY"` (`internal/service/payment.go:125`); WeChat/Alipay webhooks default `CNY`. Multi-currency is not supported in v1; the `plans` table has no currency column today.
+- Channel webhooks carry `sub_expires_at` via `payment.metadata.sub_expires_at` / `resource.sub_expires_at` / `meta.custom_data.sub_expires_at`. yunhou-users does not derive it server-side — the BFF computes it from `plan.interval_days` + business rules and embeds it into checkout creation.
+- `POST /apps/:id/quote` requires JWT but does **not** enforce `has_access` against the user's subscription. Any authenticated user can quote any plan any app exposes.
+
+### Cycle precedence (PayPal vs LemonSqueezy)
+
+When both providers are configured for the same `plan_id`, the resolved cycle (and therefore `sub_expires_at`) uses **PayPal's `trial_days + billing_cycle_days`**. LemonSqueezy's `trial_days` / `billing_cycle_days` in the quote response are ignored — only its `variant_id` flows downstream. Keep PayPal's billing-cycle definition in sync with operator config or `sub_expires_at` will diverge from what PayPal actually bills.
 
 ## Authentication Flow
 
@@ -146,6 +156,7 @@ psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
 psql -d yunhou_users -f migrations/004_ls_channel.sql
+psql -d yunhou_users -f migrations/005_app_secret.sql
 ```
 
 ## Tech Stack
@@ -153,4 +164,4 @@ psql -d yunhou_users -f migrations/004_ls_channel.sql
 - Go 1.25 + Gin
 - PostgreSQL + sqlx (no ORM)
 - RSA256 JWT + JWKS
-- SHA-256 token hashing
+- SHA-256 token hashing (refresh tokens); bcrypt app-secret hashing (`apps.secret_hash`)

@@ -82,7 +82,7 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 		Currency:     "USD",
 		SubExpiresAt: subExpires,
 		CycleConfig:  cycle,
-		ProviderData: buildProviderData(cfg, planID),
+		ProviderData: buildProviderData(cfg, planID, subExpires),
 	}, nil
 }
 
@@ -123,8 +123,13 @@ func resolveCycle(cfg model.AppConfig, planID string, planInterval int) model.Cy
 
 // buildProviderData assembles the per-channel payloads BFF hands to PayPal
 // and LS to create checkout sessions. brand_name comes from
-// apps.config.brand.name (fallback to apps.name).
-func buildProviderData(cfg model.AppConfig, planID string) map[string]any {
+// apps.config.brand.name (fallback to apps.name). subExpires is the
+// subscription expiry computed from the resolved cycle and is surfaced both
+// at the top of the Quote (sub_expires_at) and inside the LS
+// checkout_data.custom block so the BFF can pass provider_data straight
+// through to the LS checkout-creation call without reformatting. PayPal
+// computes its own billing cycle from plan_id and ignores this value.
+func buildProviderData(cfg model.AppConfig, planID string, subExpires time.Time) map[string]any {
 	out := map[string]any{}
 	brandName := ""
 	if cfg.Brand != nil {
@@ -149,7 +154,15 @@ func buildProviderData(cfg model.AppConfig, planID string) map[string]any {
 					"variant_id": v.VariantID,
 					"checkout_data": map[string]any{
 						"custom": map[string]any{
-							"brand": brandName,
+							"brand":          brandName,
+							// BFF should pass this block straight through to the
+							// LS checkout creation call. Yunhou reads it back from
+							// meta.custom_data.sub_expires_at in the webhook and
+							// writes it to subscriptions.expires_at — yunhou does
+							// NOT recompute, so whatever we put here is what
+							// sticks. RFC3339 matches the rest of the webhook
+							// surface (Stripe metadata, WeChat resource, etc.).
+							"sub_expires_at": subExpires.UTC().Format(time.RFC3339),
 						},
 					},
 				}

@@ -36,6 +36,7 @@ import (
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
 	"github.com/yunhou/users/internal/service"
+	"github.com/yunhou/users/internal/util"
 )
 
 // e2eWebhookSecrets holds the in-test secrets used to sign webhook bodies.
@@ -65,6 +66,11 @@ const (
 	mockGitHubUser = "e2e_test_user"
 	mockGitHubMail = "e2e@test.example.com"
 	superAppID     = "yundian"
+	// e2eAppSecret is the plaintext secret every seeded app uses. The
+	// bcrypt-hashed form lives in apps.secret_hash; tests set the matching
+	// X-App-Secret header via appAuthHeaders to authenticate against the
+	// InternalAppAuth middleware.
+	e2eAppSecret = "e2e-test-app-secret-do-not-use-in-prod"
 )
 
 func connectDB(t *testing.T) *sqlx.DB {
@@ -140,21 +146,28 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 		}
 	}
 
-	// Seed super app (idempotent on app_id PK).
-	_, err := db.ExecContext(context.Background(), `
-		INSERT INTO apps (app_id, name, is_active)
-		VALUES ($1, 'E2E Test App', true)
-		ON CONFLICT (app_id) DO NOTHING
-	`, superAppID)
+	// Seed super app (idempotent on app_id PK). Apps carry a bcrypt-hashed
+	// secret_hash so InternalAppAuth can verify X-App-Secret. The plaintext
+	// (e2eAppSecret) lives at the top of this file; tests authenticate via
+	// appAuthHeaders(appID).
+	secretHash, err := util.HashSecret(e2eAppSecret)
+	if err != nil {
+		t.Fatalf("hash e2e app secret: %v", err)
+	}
+	_, err = db.ExecContext(context.Background(), `
+		INSERT INTO apps (app_id, name, is_active, secret_hash)
+		VALUES ($1, 'E2E Test App', true, $2)
+		ON CONFLICT (app_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash
+	`, superAppID, secretHash)
 	if err != nil {
 		t.Fatalf("seed super app: %v", err)
 	}
 
 	_, err = db.ExecContext(context.Background(), `
-		INSERT INTO apps (app_id, name, is_active)
-		VALUES ('yundash', 'E2E Paid App', true)
-		ON CONFLICT (app_id) DO NOTHING
-	`)
+		INSERT INTO apps (app_id, name, is_active, secret_hash)
+		VALUES ('yundash', 'E2E Paid App', true, $1)
+		ON CONFLICT (app_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash
+	`, secretHash)
 	if err != nil {
 		t.Fatalf("seed paid app: %v", err)
 	}
@@ -525,6 +538,16 @@ func loginAndGetToken(t *testing.T, engine *gin.Engine, token, appID string) (st
 
 func authHeader(token string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + token}
+}
+
+// appAuthHeaders returns the X-App-ID + X-App-Secret pair required to pass
+// InternalAppAuth on the /apps/*, /admin/*, and rotate-secret routes. The
+// secret must match the bcrypt hash seeded by seedTestData.
+func appAuthHeaders(appID string) map[string]string {
+	return map[string]string{
+		"X-App-ID":     appID,
+		"X-App-Secret": e2eAppSecret,
+	}
 }
 
 // --- Webhook signing helpers (Stripe / WeChat / Alipay / LemonSqueezy) ---

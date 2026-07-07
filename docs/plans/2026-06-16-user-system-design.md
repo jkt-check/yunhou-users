@@ -306,9 +306,9 @@ A JWT-authenticated caller can only read/write their own orders/payments/refunds
 | GET    | /user/subscriptions           | List user's subscriptions (active + historical)            |
 | DELETE | /user/subscriptions/:id       | Cancel an active subscription — `active → cancelled`. **Primitive only**: does not refund; the caller (frontend) decides whether to issue a refund alongside the cancel. |
 
-### App Management (requires X-App-ID header, server-to-server)
+### App Management (requires X-App-ID + X-App-Secret headers, server-to-server)
 
-> **Note**: an `app_secret` was originally planned but never implemented. v1 uses a single `X-App-ID` header to identify the calling internal app; all app management endpoints run on the internal network and rely on network-level isolation. If per-app secret enforcement becomes necessary, it lands as a separate change with explicit migration of existing apps.
+> **Note (v2)**: v1 used a single `X-App-ID` header under network-layer isolation. v2 added `X-App-Secret` (bcrypt-hashed in `apps.secret_hash`) since the public deploy has no VPC / IP whitelist. See `migrations/005_app_secret.sql` + §"内部服务鉴权" in `docs/api-integration-guide.md`. Plaintext secret is returned once at `POST /admin/apps` and at `POST /admin/apps/:id/rotate-secret`; only the bcrypt hash is persisted.
 
 | Method | Path                     | Description                      |
 |--------|--------------------------|----------------------------------|

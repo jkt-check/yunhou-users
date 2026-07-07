@@ -517,6 +517,15 @@ func (m *mockAppRepo) List(_ context.Context) ([]model.App, error) {
 	return out, nil
 }
 
+func (m *mockAppRepo) RotateSecretHash(_ context.Context, appID, newHash string) error {
+	a, ok := m.apps[appID]
+	if !ok {
+		return sql.ErrNoRows
+	}
+	a.SecretHash = newHash
+	return nil
+}
+
 // --- Test RSA key pair helpers ---
 
 func generateTestRSAKeyPair() (*rsa.PrivateKey, *rsa.PublicKey) {

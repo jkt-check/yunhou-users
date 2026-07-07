@@ -105,6 +105,17 @@ func main() {
 	// Order expiry sweeper (in-process goroutine).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)
 
+	// One-shot secret backfill for rows created before migration 005_app_secret
+	// added the secret_hash column. Idempotent — once every row has a hash,
+	// subsequent restarts are no-ops. Plaintext is logged exactly once per row
+	// to stdout; capture it from the deploy log and rotate via the dedicated
+	// endpoint so the backfill secret never lives past the next deploy.
+	if n, err := service.BackfillAppSecrets(context.Background(), appRepo); err != nil {
+		log.Printf("app secret backfill error: %v (continuing startup)", err)
+	} else if n > 0 {
+		log.Printf("app secret backfill: %d row(s) initialised — capture plaintexts from the lines above and rotate via POST /admin/apps/:id/rotate-secret", n)
+	}
+
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 	// Bound how long any handler can run before the client disconnects, to

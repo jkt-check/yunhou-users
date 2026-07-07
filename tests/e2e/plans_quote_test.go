@@ -48,7 +48,7 @@ func TestE2E_GetAppPlans_WithProviderConfig(t *testing.T) {
 	// public endpoint and verify both provider IDs surface.
 	appID := "e2e-plans-" + randomSuffix()
 	createBody := `{"app_id":"` + appID + `","name":"Plans E2E","config":{"brand":{"name":"E2E Brand"},"payment_providers":{"paypal":{"client_id":"cid","client_secret":"cs","webhook_id":"W","mode":"sandbox","plans":{"mp":{"plan_id":"P-M","trial_days":7,"billing_cycle_days":30}}},"lemonsqueezy":{"api_key":"lsq_k","store_id":"12345","plans":{"mp":{"variant_id":"var-M","trial_days":0,"billing_cycle_days":30}}}}}}`
-	createResp := doRequest(t, engine, http.MethodPost, "/admin/apps", createBody, map[string]string{"X-App-ID": "yundian"})
+	createResp := doRequest(t, engine, http.MethodPost, "/admin/apps", createBody, appAuthHeaders(superAppID))
 	if createResp.StatusCode != http.StatusCreated {
 		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
 	}
@@ -94,7 +94,7 @@ func TestE2E_PostQuote_HappyPath(t *testing.T) {
 
 	appID := "e2e-quote-" + randomSuffix()
 	createBody := `{"app_id":"` + appID + `","name":"Quote E2E","config":{"brand":{"name":"E2E Brand"},"payment_providers":{"paypal":{"client_id":"cid","client_secret":"cs","webhook_id":"W","mode":"sandbox","plans":{"qp":{"plan_id":"P-Q","trial_days":7,"billing_cycle_days":30}}},"lemonsqueezy":{"api_key":"lsq_k","store_id":"12345","plans":{"qp":{"variant_id":"var-Q","trial_days":0,"billing_cycle_days":30}}}}}}`
-	createResp := doRequest(t, engine, http.MethodPost, "/admin/apps", createBody, map[string]string{"X-App-ID": "yundian"})
+	createResp := doRequest(t, engine, http.MethodPost, "/admin/apps", createBody, appAuthHeaders(superAppID))
 	if createResp.StatusCode != http.StatusCreated {
 		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
 	}

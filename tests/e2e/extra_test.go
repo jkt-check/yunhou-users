@@ -100,10 +100,11 @@ func TestE2E_HealthEndpoint(t *testing.T) {
 // TestE2E_AppAndPlanCRUD exercises the admin endpoints.
 func TestE2E_AppAndPlanCRUD(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
+	hdrs := appAuthHeaders(superAppID)
 	// Create app.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/admin/apps",
 		`{"app_id":"e2e-extra","name":"E2E Extra"}`,
-		map[string]string{"X-App-ID": "yundian"})
+		hdrs)
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := readBody(resp)
 		t.Fatalf("create app: %d %s", resp.StatusCode, body)
@@ -111,7 +112,7 @@ func TestE2E_AppAndPlanCRUD(t *testing.T) {
 
 	// List apps — should include the new one.
 	resp = doRequest(t, srv.Engine, http.MethodGet, "/apps",
-		``, map[string]string{"X-App-ID": "yundian"})
+		``, hdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list apps: %d", resp.StatusCode)
 	}
@@ -121,14 +122,14 @@ func TestE2E_AppAndPlanCRUD(t *testing.T) {
 
 	// Get specific app.
 	resp = doRequest(t, srv.Engine, http.MethodGet, "/apps/e2e-extra",
-		``, map[string]string{"X-App-ID": "yundian"})
+		``, hdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("get app: %d", resp.StatusCode)
 	}
 
 	// Update app.
 	resp = doRequest(t, srv.Engine, http.MethodPatch, "/admin/apps/e2e-extra",
-		`{"description":"updated"}`, map[string]string{"X-App-ID": "yundian"})
+		`{"description":"updated"}`, hdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("update app: %d", resp.StatusCode)
 	}
@@ -136,7 +137,7 @@ func TestE2E_AppAndPlanCRUD(t *testing.T) {
 	// Create plan.
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/admin/plans",
 		`{"id":"e2e-extra","name":"E2E Extra","price":1.0,"interval_days":30,"apps":["yundian"]}`,
-		map[string]string{"X-App-ID": "yundian"})
+		hdrs)
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := readBody(resp)
 		t.Fatalf("create plan: %d %s", resp.StatusCode, body)
@@ -144,21 +145,21 @@ func TestE2E_AppAndPlanCRUD(t *testing.T) {
 
 	// Get plan.
 	resp = doRequest(t, srv.Engine, http.MethodGet, "/admin/plans/e2e-extra",
-		``, map[string]string{"X-App-ID": "yundian"})
+		``, hdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("get plan: %d", resp.StatusCode)
 	}
 
 	// Update plan.
 	resp = doRequest(t, srv.Engine, http.MethodPatch, "/admin/plans/e2e-extra",
-		`{"name":"Renamed"}`, map[string]string{"X-App-ID": "yundian"})
+		`{"name":"Renamed"}`, hdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("update plan: %d", resp.StatusCode)
 	}
 
 	// Delete plan.
 	resp = doRequest(t, srv.Engine, http.MethodDelete, "/admin/plans/e2e-extra",
-		``, map[string]string{"X-App-ID": "yundian"})
+		``, hdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("delete plan: %d", resp.StatusCode)
 	}
@@ -169,7 +170,7 @@ func TestE2E_PlanCreateBadJSON(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/admin/plans",
 		`{"id":"x","name":"X","price":-1}`,
-		map[string]string{"X-App-ID": "yundian"})
+		appAuthHeaders(superAppID))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("negative price: %d, want 400", resp.StatusCode)
 	}

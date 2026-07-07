@@ -487,6 +487,15 @@ func (m *MockAppRepo) Update(_ context.Context, a *model.App) error {
 	return nil
 }
 
+func (m *MockAppRepo) RotateSecretHash(_ context.Context, appID, newHash string) error {
+	a, ok := m.apps[appID]
+	if !ok {
+		return errors.New("not found")
+	}
+	a.SecretHash = newHash
+	return nil
+}
+
 // --- additional auth handler tests ---
 
 func TestAuthHandler_Login_UnsupportedProvider(t *testing.T) {

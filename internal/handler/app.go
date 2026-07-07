@@ -15,6 +15,7 @@ import (
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
+	"github.com/yunhou/users/internal/util"
 )
 
 // ProviderTokenLookup is the subset of ProviderTokenService the handler uses.
@@ -35,6 +36,7 @@ type AppRepoInterface interface {
 	FindByID(context.Context, string) (*model.App, error)
 	Create(context.Context, *model.App) error
 	Update(context.Context, *model.App) error
+	RotateSecretHash(ctx context.Context, appID, newHash string) error
 }
 
 type AppHandler struct {
@@ -95,12 +97,23 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		}
 	}
 
+	// Generate a fresh shared secret BEFORE the DB write so a util error
+	// never leaves a half-initialised app row behind. The plaintext is
+	// returned to the caller exactly once; only the bcrypt hash is persisted.
+	plaintext, hash, err := util.GenerateSecret()
+	if err != nil {
+		log.Printf("generate app secret error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to generate app secret"})
+		return
+	}
+
 	app := &model.App{
 		AppID:       req.AppID,
 		Name:        req.Name,
 		Description: req.Description,
 		IsActive:    true,
 		Config:      req.Config, // empty RawMessage when absent — repo COALESCE handles NULL
+		SecretHash:  hash,
 	}
 	if err := h.appRepo.Create(c.Request.Context(), app); err != nil {
 		log.Printf("create app error: %v", err)
@@ -108,7 +121,39 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": app})
+	// data.secret is the only place the plaintext ever appears — capture it
+	// client-side. After this response the server only has the bcrypt hash.
+	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": gin.H{
+		"app":    app,
+		"secret": plaintext,
+	}})
+}
+
+// RotateSecret handles POST /admin/apps/:id/rotate-secret. The auth middleware
+// (X-App-ID + X-App-Secret) has already verified the caller's existing secret
+// before this handler runs — this endpoint is gated by the admin group. We
+// hand the caller a fresh plaintext, hash it, and persist. The old secret
+// stops working the moment the UPDATE commits.
+func (h *AppHandler) RotateSecret(c *gin.Context) {
+	id := c.Param("id")
+
+	plaintext, hash, err := util.GenerateSecret()
+	if err != nil {
+		log.Printf("generate app secret error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to generate app secret"})
+		return
+	}
+	if err := h.appRepo.RotateSecretHash(c.Request.Context(), id, hash); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
+			return
+		}
+		log.Printf("rotate secret error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to rotate app secret"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"secret": plaintext}})
 }
 
 func (h *AppHandler) UpdateApp(c *gin.Context) {
@@ -173,9 +218,10 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 
 // GetProviderToken handles GET /apps/:id/provider-token/:channel.
 //
-// Auth is via the existing InternalAppAuth middleware (X-App-ID header) —
-// mounted in router.go on the same group as the other /apps routes. The
-// middleware verifies the caller's app_id matches an active app; the service
+// Auth is via the InternalAppAuth middleware (X-App-ID + X-App-Secret
+// headers) — mounted in router.go on the same group as the other /apps
+// routes. The middleware verifies the caller's app_id matches an active app
+// AND the X-App-Secret bcrypt-verifies against apps.secret_hash; the service
 // layer additionally loads apps.config.payment_providers.<channel> to read
 // the credentials before calling the provider.
 func (h *AppHandler) GetProviderToken(c *gin.Context) {

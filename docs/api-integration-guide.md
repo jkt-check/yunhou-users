@@ -508,8 +508,10 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 | 路径 | 鉴权 | 用途 |
 |------|------|------|
 | `GET /apps/:id/plans` | **无需鉴权**（公共） | 营销页拉取 Plan 目录 |
-| `GET /apps/:id/provider-token/:channel` | **`X-App-ID`**（内部服务） | BFF 拉取 PayPal/LS 凭据再调用上游 |
+| `GET /apps/:id/provider-token/:channel` | **`X-App-ID` + `X-App-Secret`**（内部服务） | BFF 拉取 PayPal/LS 凭据再调用上游 |
 | `POST /apps/:id/quote` | **JWT Bearer**（终端用户） | 给定 (app, plan) 给出下单报价 |
+
+> 同样的 `X-App-ID` + `X-App-Secret` 头对适用于所有 `/admin/*` 路由（plan 管理 + app 管理 + rotate-secret）。详见下文 §"内部服务鉴权"。
 
 #### apps.config JSONB 结构
 
@@ -603,7 +605,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### GET /apps/:id/provider-token/:channel
 
-为 BFF 拉取 PayPal / LemonSqueezy 上游凭据，避免敏感凭据下沉到消费方代码（`BFF fetch upstream with short-lived PayPal token` / `BFF sign LS requests with api_key`，不需要在 BFF 端做长期凭据托管）。**鉴权为 `X-App-ID` 内部服务头**——BFF 后端用其内部服务身份调用，绝不下发给终端用户。
+为 BFF 拉取 PayPal / LemonSqueezy 上游凭据，避免敏感凭据下沉到消费方代码（`BFF fetch upstream with short-lived PayPal token` / `BFF sign LS requests with api_key`，不需要在 BFF 端做长期凭据托管）。**鉴权为 `X-App-ID` + `X-App-Secret` 内部服务头对**——BFF 后端用其内部服务身份调用，绝不下发给终端用户；`X-App-Secret` 是每个 app 创建时一次性返回的 64 位十六进制串，仅 bcrypt 哈希存库，丢失后必须通过 `POST /admin/apps/:id/rotate-secret` 重新生成。
 
 **路径参数**：
 
@@ -653,7 +655,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### POST /apps/:id/quote
 
-下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal/LS 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**，终端用户身份触发；handler 读 JWT 上下文中的 `user_id`（当前不强制 gating，仅用于未来审计日志）。
+下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal/LS 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**（终端用户身份触发；调用方必须先 `/auth/login`），handler 读 JWT 上下文中的 `user_id`。**注意**：当前**不强制 `has_access` gating**——任何已登录用户都可以对任意 app/plan 发起 quote，前端必须自己根据 `has_access` 决定是否展示下单按钮。
 
 **路径参数**：`id` 是 App ID。
 
@@ -692,7 +694,10 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
       "lemonsqueezy": {
         "variant_id": "var-MONTHLY",
         "checkout_data": {
-          "custom": { "brand": "云店" }
+          "custom": {
+            "brand": "云店",
+            "sub_expires_at": "2026-08-04T00:00:00Z"
+          }
         }
       }
     }
@@ -706,11 +711,11 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 |------|------|
 | `amount` | 透传 `plans.price` |
 | `currency` | **v1 硬编码 `"USD"`**，与 `/payments/orders` 的 `currency` 字段无关。多币种尚不支持 |
-| `sub_expires_at` | `now + trial_days + billing_cycle_days`（服务器时间）。Webhook 回调时 Yunhou 直接把它写入订阅过期时间，所以 BFF 不必自己算 |
+| `sub_expires_at` | `now + trial_days + billing_cycle_days`（服务器时间）。同时被嵌入 `provider_data.lemonsqueezy.checkout_data.custom.sub_expires_at`（LemonSqueezy 流程下 BFF 可一把 `provider_data.lemonsqueezy` 透传给 LS checkout 创建）；其他渠道由 channel 自己计算 billing cycle，yunhou 不参与 |
 | `cycle_config.base` | 恒为 `"now + trial + cycle"`，给审计/排查时一眼看出计算方式 |
-| `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK |
+| `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK。LemonSqueezy 的 `custom.sub_expires_at` 已经预先填好，BFF 不必从顶层字段二次组装 |
 
-**Cycle 解析规则**：当同一 `plan_id` 下 PayPal 与 LemonSqueezy 都配置了 plan 记录，**PayPal 的 `trial_days + billing_cycle_days` 胜出**，LemonSqueezy 的同名字段仅出现在 `provider_data.lemonsqueezy.checkout_data.custom` 中、不会影响 `sub_expires_at`。运营侧必须保证 PayPal 控制台的账单周期跟 `provider_data.paypal.plan_id` 对应的 product 一致，否则报价跟实际结算对不上。
+**Cycle 解析规则**：当同一 `plan_id` 下 PayPal 与 LemonSqueezy 都配置了 plan 记录，**PayPal 的 `trial_days + billing_cycle_days` 胜出**——它既决定顶层 `sub_expires_at`，也决定 LS `provider_data.lemonsqueezy.checkout_data.custom.sub_expires_at`（两个值一致）。LemonSqueezy 配置里的 `trial_days` / `billing_cycle_days` 会被忽略，**只用其 `variant_id` 走 LS 链路**。运营侧必须保证 PayPal 控制台的账单周期跟 `provider_data.paypal.plan_id` 对应的 product 一致，否则报价跟实际结算对不上。
 
 **错误响应**：
 
@@ -728,7 +733,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 ### 管理接口
 
-管理接口需要 `X-App-ID` 头（内部服务调用）。
+管理接口需要 `X-App-ID` + `X-App-Secret` 头（内部服务调用；详见下文 §"内部服务鉴权"）。
 
 #### GET /admin/plans
 
@@ -899,22 +904,27 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 {
   "code": 0,
   "data": {
-    "app_id": "yundash",
-    "name": "云dash",
-    "description": "Dashboard 应用",
-    "config": null,
-    "is_active": true,
-    "created_at": "2026-01-01T00:00:00Z",
-    "updated_at": "2026-01-01T00:00:00Z"
+    "app": {
+      "app_id": "yundash",
+      "name": "云dash",
+      "description": "Dashboard 应用",
+      "config": null,
+      "is_active": true,
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z"
+    },
+    "secret": "a3f9...64-hex-chars..."
   }
 }
 ```
 
 > 注意：POST 创建时 `config` 字段为 `null`（in-memory 写入未读取 DB 默认值）。通过 GET 读取时会回填为 DB 默认 `{}`。
+>
+> `data.secret` 是 64 位十六进制随机串，**仅本次响应返回**——服务端只存 bcrypt 哈希，无法再次读出。客户端必须立即把 `secret` 配置到 BFF 环境变量里，下一次 admin 调用时携带 `X-App-Secret` 头才能通过 `InternalAppAuth`。丢失后只能走 `POST /admin/apps/:id/rotate-secret` 重新生成。
 
 #### PATCH /admin/apps/:id
 
-更新 App。所有字段均为可选；`name` 不可为空。
+更新 App。所有字段均为可选；`name` 不可为空。**不能通过此接口改 `secret`——secret 走专用 rotation endpoint。**
 
 **请求体**：
 ```json
@@ -950,6 +960,42 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 ```json
 {"code": 400, "message": "name must not be empty"}
 ```
+
+#### POST /admin/apps/:id/rotate-secret
+
+轮换 App 的内部服务密钥。**调用前必须先用现有 secret 通过 `InternalAppAuth` 才能进入此 endpoint**（admin group 上的 middleware 校验）。轮换后旧 secret 立即失效，下次 admin 调用必须改用新返回的 secret。
+
+**路径参数**：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `id` | 是 | App ID |
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": {
+    "secret": "b7e2...新的 64 位十六进制串..."
+  }
+}
+```
+
+**错误响应**：
+
+| HTTP | message | 触发条件 |
+|------|---------|----------|
+| 401 | `missing X-App-Secret header` | 调用方没带 secret |
+| 401 | `invalid app_secret` | 旧 secret 错误 |
+| 404 | `app not found` | app_id 不存在 |
+
+**轮换后必做**：
+
+1. 把新 `secret` 写入 BFF 环境变量（替换旧值）
+2. BFF 重启 / 热加载，从下一次请求开始带新 `X-App-Secret`
+3. 旧 secret 立即失效，中间没有 grace period
+
+如果怀疑旧 secret 泄漏（例如 BFF 容器镜像被 pull 过），立即 rotate 即可，无需改 `app_id`。
 
 ---
 
@@ -1281,6 +1327,57 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 
 订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、LemonSqueezy `meta.custom_data.sub_expires_at`（在 LS checkout 创建时由前端嵌入；`subscription_payment_*` 事件缺省时不携带此字段）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
 
+### Quote 路径 vs Confirm 路径：sub_expires_at 来源冲突
+
+订单可能通过两条独立路径被标记为已支付：
+
+- **Quote 路径**：`/quote` 返回 `sub_expires_at`，BFF 把它嵌入 LS `meta.custom_data.sub_expires_at`（Stripe/WeChat/Alipay 等价字段）；channel webhook 到达后 yunhou 直接写入 `subscriptions.expires_at`
+- **Confirm 路径**：`POST /payments/orders/:order_id/confirm` 由 BFF 在前端检测到 channel 支付成功时主动调用，`expires_at` 由 BFF 自己算后透传
+
+两条路径在 `subscriptions.expires_at` 这一列是**最后写入胜出**（`activateSubscriptionOnTx` 是一个盲 UPSERT，没有"哪个值更权威"的判断逻辑；见 `internal/service/payment.go`）。如果两条路径在同一订单上前后到达且 `expires_at` 计算口径不一致，**先到的被覆盖，结果不可预测**。
+
+**推荐契约**（避免 last-write-wins 模糊性）：
+
+1. **有 channel webhook 携带 `sub_expires_at` 的渠道**（Stripe / WeChat / Alipay / LemonSqueezy）：webhook 是权威源。`/confirm` 调用时**不要传 `expires_at`**——保持 `nil`，让 webhook 的值留下
+2. **没有 channel webhook 的渠道**（理论上不存在；当前四个渠道都支持）：BFF 必须在 `/confirm` 里提供 `expires_at`
+3. **`/quote` 的输出仅作为 webhook metadata 的来源**，不作为最终值——BFF 在 webhook 到达前可以展示它给用户，但订阅激活一律以 webhook payload 为准
+
+如果你们的 LS / Stripe / WeChat / Alipay 流程会**并发触发** webhook 与 `/confirm`（前端轮询订单状态 + channel 同时回调的常见 race），请务必遵守契约 (1)，否则会出现"前端显示 7 天试用，但实际订阅 30 天"之类的对账漂移。
+
+---
+
+## 内部服务鉴权
+
+`/apps/*`（除 `/apps/:id/plans` 与 `/apps/:id/quote` 外）和所有 `/admin/*` 路径走 `InternalAppAuth` 中间件，要求 BFF 调用方带两个头：
+
+| Header | 说明 |
+|---|---|
+| `X-App-ID` | 调用的目标 app 的 `app_id`（必须存在、`is_active = true`） |
+| `X-App-Secret` | 该 app 的 64 位十六进制共享密钥。**仅 `POST /admin/apps` 创建响应或 `POST /admin/apps/:id/rotate-secret` 响应里的 `data.secret` 一次性返回**——服务端只存 bcrypt 哈希，无法再读出 |
+
+错误响应：
+
+| HTTP | message | 触发条件 |
+|------|---------|----------|
+| 401 | `missing X-App-ID header` | 调用方没带 `X-App-ID` |
+| 401 | `invalid app_id` | `X-App-ID` 不存在 |
+| 401 | `missing X-App-Secret header` | 调用方没带 `X-App-Secret` |
+| 401 | `invalid app_secret` | `X-App-Secret` 不匹配（**不会**区分"app 不存在" vs "secret 错"——避免枚举攻击） |
+| 401 | `app secret not initialized` | 该 app 行 `secret_hash` 为空（migration 005 之后未跑 `BackfillAppSecrets` 的过渡态）。建议：跑一次 server 启动 backfill，或者直接调 `POST /admin/apps/:id/rotate-secret` 重新生成 |
+| 403 | `app is disabled` | app 已停用 |
+
+**Rotation 流程**：怀疑 `X-App-Secret` 泄漏（例如 BFF 容器镜像被 pull 过、CI 缓存里出现过）时，立即调：
+
+```bash
+curl -X POST https://yunhou.ai/api/admin/apps/yundian/rotate-secret \
+  -H "X-App-ID: yundian" \
+  -H "X-App-Secret: <当前 secret>"
+```
+
+响应里 `data.secret` 是新的 64 位 hex，旧 secret 立即失效（**无 grace period**）。把新值部署到 BFF 后，下一次调用即生效。
+
+**部署侧建议**：除了 `X-App-Secret` 服务端校验，部署侧也建议对 `POST /admin/*` 与 `GET /apps/:id/provider-token/:channel` 做 nginx IP 白名单 / VPC 限制，把 BFF 出口段固定下来。两层防御互不替代——服务端 secret 防的是凭据泄漏，IP 白名单防的是 endpoint 暴露面。
+
 ---
 
 ## JWT 验证
@@ -1417,7 +1514,7 @@ GET /.well-known/jwks.json
 | 200 | 0 | 请求成功 |
 | 201 | 0 | 创建成功 |
 | 400 | 400 | 请求参数错误（含签名/Idempotency-Key 不合法） |
-| 401 | 401 | 未认证（Token 无效或过期、Provider 验证失败、未提供 `X-App-ID`） |
+| 401 | 401 | 未认证（Token 无效或过期、Provider 验证失败、未提供 `X-App-ID` / `X-App-Secret`、内部服务 secret 不匹配） |
 | 403 | 403 | 无权限（如试图自助订阅付费 Plan、App 已停用） |
 | 404 | 404 | 资源不存在 |
 | 409 | 409 | 资源冲突（已存在活跃订阅、订单非 pending 等） |
@@ -1430,11 +1527,13 @@ GET /.well-known/jwks.json
 
 ## 频率限制
 
+> 不同接口挂的鉴权中间件不一样，**先看清鉴权列再对照本表**——「App 接口」一节有完整对照（路径 ↔ 鉴权 ↔ 用途）。本表只列限频策略；鉴权要求以接口章节为准。
+
 | 接口类别 | 限制 | 说明 |
 |---------|------|------|
-| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/login`, `/auth/refresh`, `/auth/logout`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内 |
-| App/Admin 接口（`/apps/*`, `/admin/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 `X-App-ID` 头 |
-| 支付/退款接口（`/payments/*`, `/refunds/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 JWT |
+| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内；`/apps/:id/plans` 公共可访问（无需鉴权） |
+| 内部服务接口（`/apps`, `/apps/:id`, `/apps/:id/provider-token/:channel`, `/admin/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 `X-App-ID` 头 + `X-App-Secret` 头 |
+| 用户态接口（`POST /apps/:id/quote`, `/payments/*`, `/refunds/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 JWT（终端用户身份） |
 | 用户接口（`/user/*`） | 无显式限制 | 仅要求 JWT |
 | 渠道 Webhook（`/webhooks/payment/*`） | 200 次/秒，突发 400 | 走签名校验，不限 IP 业务速率 |
 
@@ -1442,7 +1541,8 @@ GET /.well-known/jwks.json
 
 ## 快速接入清单
 
-- [ ] 获取应用的 `app_id`
+- [ ] 获取应用的 `app_id` + `app_secret`（`POST /admin/apps` 响应里 `data.secret`，仅一次性返回，需立即落地）
+- [ ] BFF 调 `/apps/:id/plans`、`/apps/:id/provider-token/:channel`、所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`
 - [ ] 实现 OAuth 登录，获取用户的 provider token
 - [ ] 调用 `POST /auth/login` 登录
 - [ ] 解析响应中的 `has_access` 字段，判断用户是否有权限访问
@@ -1450,3 +1550,4 @@ GET /.well-known/jwks.json
 - [ ] 使用 `access_token` 调用用户接口
 - [ ] 实现 Token 刷新逻辑，处理 Refresh Token 轮转
 - [ ] 获取 JWKS 配置本地 JWT 验证（可选）
+- [ ] 怀疑 `app_secret` 泄漏时调 `POST /admin/apps/:id/rotate-secret`，旧 secret 立即失效

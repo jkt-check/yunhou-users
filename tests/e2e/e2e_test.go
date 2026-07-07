@@ -265,7 +265,7 @@ func TestJWKSEndpoint(t *testing.T) {
 func TestAppManagement(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
-	appHeaders := map[string]string{"X-App-ID": superAppID}
+	appHeaders := appAuthHeaders(superAppID)
 
 	// List apps
 	resp := doRequest(t, engine, http.MethodGet, "/apps", "", appHeaders)
@@ -294,7 +294,7 @@ func TestAppManagement(t *testing.T) {
 func TestPlanManagement(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
-	appHeaders := map[string]string{"X-App-ID": superAppID}
+	appHeaders := appAuthHeaders(superAppID)
 
 	// List plans
 	resp := doRequest(t, engine, http.MethodGet, "/admin/plans", "", appHeaders)

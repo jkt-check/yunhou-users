@@ -99,6 +99,9 @@ func Setup(
 		// App management
 		adminGroup.POST("/apps", appHandler.CreateApp)
 		adminGroup.PATCH("/apps/:id", appHandler.UpdateApp)
+		// Secret rotation: dedicated endpoint so it has its own audit trail
+		// and a response shape that always returns the new plaintext once.
+		adminGroup.POST("/apps/:id/rotate-secret", appHandler.RotateSecret)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

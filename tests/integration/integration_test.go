@@ -13,13 +13,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/lib/pq"
-	"github.com/jmoiron/sqlx"
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
 	"github.com/yunhou/users/internal/service"
+	"github.com/yunhou/users/internal/util"
 )
 
 func TestMain(m *testing.M) {
@@ -64,6 +65,12 @@ func newUUID() string {
 	return uuid.New().String()
 }
 
+// integrationAppSecret is the plaintext that matches the bcrypt hash seeded
+// onto the yundian app row by setupDB. httpDo (which runs as a closure in
+// each test goroutine) sets the matching X-App-Secret header on every admin
+// /apps request.
+const integrationAppSecret = "integration-test-app-secret"
+
 func setupDB(t *testing.T) *sqlx.DB {
 	t.Helper()
 	db, err := sqlx.Connect("postgres", dbURL())
@@ -99,12 +106,18 @@ func setupDB(t *testing.T) *sqlx.DB {
 		}
 	}
 
-	// Seed super app
+	// Seed super app with a bcrypt-hashed secret_hash so InternalAppAuth can
+	// verify the matching X-App-Secret. The plaintext is the package-level
+	// integrationAppSecret constant above.
+	hash, err := util.HashSecret(integrationAppSecret)
+	if err != nil {
+		t.Fatalf("hash integration app secret: %v", err)
+	}
 	_, err = db.ExecContext(context.Background(), `
-		INSERT INTO apps (app_id, name, is_active)
-		VALUES ($1, 'E2E Test App', true)
-		ON CONFLICT (app_id) DO NOTHING
-	`, "yundian")
+		INSERT INTO apps (app_id, name, is_active, secret_hash)
+		VALUES ($1, 'E2E Test App', true, $2)
+		ON CONFLICT (app_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash
+	`, "yundian", hash)
 	if err != nil {
 		t.Fatalf("seed super app: %v", err)
 	}
@@ -209,6 +222,7 @@ func doWithAppAuth(t *testing.T, method, url, appID string, body interface{}) *h
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("X-App-ID", appID)
+	req.Header.Set("X-App-Secret", integrationAppSecret)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {

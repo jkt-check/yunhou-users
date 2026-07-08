@@ -128,8 +128,8 @@ func (h *AuthHandler) JWKS(c *gin.Context) {
 //
 // Side-effects: if the email has no matching user, creates one with
 // the default 'free' plan (so the L3 tests have a user + sub to
-// operate on). Refresh token row inserted via the same path as
-// production /auth/login.
+// operate on). Refresh token row inserted via the same path the
+// production GitHub OAuth callback uses (`AuthService.LoginWithProfile`).
 func (h *AuthHandler) TestLogin(c *gin.Context) {
 	if os.Getenv("PAYPAL_L3_E2E_MODE") != "1" {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "not found"})

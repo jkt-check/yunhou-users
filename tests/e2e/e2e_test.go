@@ -3,6 +3,8 @@ package e2e
 import (
 	"net/http"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 // TestLoginFlow exercises the complete login flow:
@@ -10,61 +12,27 @@ import (
 func TestLoginFlow(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
-	// Login with GitHub provider token
+	// Login with test endpoint (PAYPAL_L3_E2E_MODE=1, see setupE2EServer).
 	t.Run("login", func(t *testing.T) {
-		loginBody := `{"provider":"github","provider_token":"test-user-token","app_id":"yundian"}`
-		resp := doRequest(t, engine, http.MethodPost, "/auth/login", loginBody, nil)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("login: expected 200, got %d — body: %s", resp.StatusCode, string(resp.Body))
-		}
-		var loginResp struct {
-			Data struct {
-				AccessToken  string `json:"access_token"`
-				RefreshToken string `json:"refresh_token"`
-				User         struct {
-					ID string `json:"id"`
-				} `json:"user"`
-				Subscription struct {
-					PlanID    string `json:"plan_id"`
-					HasAccess bool   `json:"has_access"`
-				} `json:"subscription"`
-			} `json:"data"`
-		}
-		resp.JSON(t, &loginResp)
-		if loginResp.Data.AccessToken == "" {
+		access, refresh, sub := testLoginFull(t, engine, "test-user-token", "yundian")
+		if access == "" {
 			t.Fatal("access token is empty")
 		}
-		if loginResp.Data.RefreshToken == "" {
+		if refresh == "" {
 			t.Fatal("refresh token is empty")
 		}
-		if loginResp.Data.User.ID == "" {
-			t.Fatal("user id is empty")
+		if sub.PlanID != "free" {
+			t.Fatalf("expected free plan, got %s", sub.PlanID)
 		}
-		if loginResp.Data.Subscription.PlanID != "free" {
-			t.Fatalf("expected free plan, got %s", loginResp.Data.Subscription.PlanID)
-		}
-		if !loginResp.Data.Subscription.HasAccess {
+		if !sub.HasAccess {
 			t.Error("expected has_access=true for yundian on free plan")
 		}
 	})
 
 	// Login to app not in free plan
 	t.Run("login_paid_app_no_subscription", func(t *testing.T) {
-		loginBody := `{"provider":"github","provider_token":"another-user-token","app_id":"yundash"}`
-		resp := doRequest(t, engine, http.MethodPost, "/auth/login", loginBody, nil)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("login: expected 200, got %d — body: %s", resp.StatusCode, string(resp.Body))
-		}
-		var loginResp struct {
-			Data struct {
-				Subscription struct {
-					PlanID    string `json:"plan_id"`
-					HasAccess bool   `json:"has_access"`
-				} `json:"subscription"`
-			} `json:"data"`
-		}
-		resp.JSON(t, &loginResp)
-		if loginResp.Data.Subscription.HasAccess {
+		_, _, sub := testLoginFull(t, engine, "another-user-token", "yundash")
+		if sub.HasAccess {
 			t.Error("expected has_access=false for yundash on free plan")
 		}
 	})
@@ -75,22 +43,11 @@ func TestAuthRefresh(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
 	// Login first
-	loginBody := `{"provider":"github","provider_token":"refresh-test-user","app_id":"yundian"}`
-	resp := doRequest(t, engine, http.MethodPost, "/auth/login", loginBody, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login: expected 200, got %d", resp.StatusCode)
-	}
-	var loginResp struct {
-		Data struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &loginResp)
+	_, refresh := loginAndGetRefresh(t, engine, "refresh-test-user", "yundian")
 
 	// Refresh tokens
-	refreshBody := `{"refresh_token":"` + loginResp.Data.RefreshToken + `"}`
-	resp = doRequest(t, engine, http.MethodPost, "/auth/refresh", refreshBody, nil)
+	refreshBody := `{"refresh_token":"` + refresh + `"}`
+	resp := doRequest(t, engine, http.MethodPost, "/auth/refresh", refreshBody, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("refresh: expected 200, got %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
@@ -106,7 +63,7 @@ func TestAuthRefresh(t *testing.T) {
 	}
 
 	// Old refresh token should be revoked
-	oldRefreshBody := `{"refresh_token":"` + loginResp.Data.RefreshToken + `"}`
+	oldRefreshBody := `{"refresh_token":"` + refresh + `"}`
 	resp = doRequest(t, engine, http.MethodPost, "/auth/refresh", oldRefreshBody, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("reuse old refresh token: expected 401, got %d", resp.StatusCode)
@@ -125,27 +82,17 @@ func TestAuthLogout(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
 	// Login first
-	loginBody := `{"provider":"github","provider_token":"logout-test-user","app_id":"yundian"}`
-	resp := doRequest(t, engine, http.MethodPost, "/auth/login", loginBody, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login: expected 200, got %d", resp.StatusCode)
-	}
-	var loginResp struct {
-		Data struct {
-			RefreshToken string `json:"refresh_token"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &loginResp)
+	_, refresh := loginAndGetRefresh(t, engine, "logout-test-user", "yundian")
 
 	// Logout
-	logoutBody := `{"refresh_token":"` + loginResp.Data.RefreshToken + `"}`
-	resp = doRequest(t, engine, http.MethodPost, "/auth/logout", logoutBody, nil)
+	logoutBody := `{"refresh_token":"` + refresh + `"}`
+	resp := doRequest(t, engine, http.MethodPost, "/auth/logout", logoutBody, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("logout: expected 200, got %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
 
 	// Refresh token should be revoked
-	refreshBody := `{"refresh_token":"` + loginResp.Data.RefreshToken + `"}`
+	refreshBody := `{"refresh_token":"` + refresh + `"}`
 	resp = doRequest(t, engine, http.MethodPost, "/auth/refresh", refreshBody, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("refresh after logout: expected 401, got %d", resp.StatusCode)
@@ -157,22 +104,11 @@ func TestUserProfileWithJWT(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
 	// Login to get token
-	loginBody := `{"provider":"github","provider_token":"profile-test-user","app_id":"yundian"}`
-	resp := doRequest(t, engine, http.MethodPost, "/auth/login", loginBody, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login: expected 200, got %d", resp.StatusCode)
-	}
-	var loginResp struct {
-		Data struct {
-			AccessToken string `json:"access_token"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &loginResp)
-
-	authHeaders := map[string]string{"Authorization": "Bearer " + loginResp.Data.AccessToken}
+	access, _ := loginAndGetToken(t, engine, "profile-test-user", "yundian")
+	authHeaders := map[string]string{"Authorization": "Bearer " + access}
 
 	// Get profile
-	resp = doRequest(t, engine, http.MethodGet, "/user/profile", "", authHeaders)
+	resp := doRequest(t, engine, http.MethodGet, "/user/profile", "", authHeaders)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("get profile: expected 200, got %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
@@ -204,9 +140,6 @@ func TestUserProfileWithJWT(t *testing.T) {
 	resp.JSON(t, &identities)
 	if len(identities.Data) != 1 {
 		t.Fatalf("expected 1 identity, got %d", len(identities.Data))
-	}
-	if identities.Data[0].Provider != "github" {
-		t.Fatalf("expected github, got %s", identities.Data[0].Provider)
 	}
 
 	// List subscriptions
@@ -303,9 +236,9 @@ func TestPlanManagement(t *testing.T) {
 	}
 	var plans struct {
 		Data []struct {
-			ID    string   `json:"id"`
-			Name  string   `json:"name"`
-			Apps  []string `json:"apps"`
+			ID   string   `json:"id"`
+			Name string   `json:"name"`
+			Apps []string `json:"apps"`
 		} `json:"data"`
 	}
 	resp.JSON(t, &plans)
@@ -320,8 +253,8 @@ func TestPlanManagement(t *testing.T) {
 	}
 	var freePlan struct {
 		Data struct {
-			ID    string   `json:"id"`
-			Apps  []string `json:"apps"`
+			ID   string   `json:"id"`
+			Apps []string `json:"apps"`
 		} `json:"data"`
 	}
 	resp.JSON(t, &freePlan)
@@ -330,13 +263,49 @@ func TestPlanManagement(t *testing.T) {
 	}
 }
 
-// TestUnsupportedProvider verifies unsupported provider is rejected.
-func TestUnsupportedProvider(t *testing.T) {
+// TestTestLoginMalformed verifies /test/login rejects a request missing the
+// required email field. Replaces the old TestUnsupportedProvider which
+// drove /auth/login (removed by commit 5ef27ce).
+func TestTestLoginMalformed(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
-	loginBody := `{"provider":"facebook","provider_token":"test","app_id":"yundian"}`
-	resp := doRequest(t, engine, http.MethodPost, "/auth/login", loginBody, nil)
+	resp := doRequest(t, engine, http.MethodPost, "/test/login",
+		`{"app_id":"yundian"}`, nil)
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unsupported provider, got %d", resp.StatusCode)
+		t.Fatalf("expected 400 for missing email, got %d", resp.StatusCode)
 	}
+}
+
+// loginResp mirrors service.LoginResponse for test-side unmarshalling.
+type loginResp struct {
+	Data struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		User         struct {
+			ID string `json:"id"`
+		} `json:"user"`
+		Subscription struct {
+			PlanID    string `json:"plan_id"`
+			HasAccess bool   `json:"has_access"`
+		} `json:"subscription"`
+	} `json:"data"`
+}
+
+// testLoginFull mints a JWT pair via /test/login and returns access token,
+// refresh token, and the embedded subscription view. The first `token`
+// argument is reused as the email prefix (with "@e2e.test" appended) so
+// call sites read like the legacy provider_token API.
+func testLoginFull(t *testing.T, engine *gin.Engine, token, appID string) (string, string, struct {
+	PlanID    string `json:"plan_id"`
+	HasAccess bool   `json:"has_access"`
+}) {
+	t.Helper()
+	body := `{"email":"` + token + `@e2e.test","app_id":"` + appID + `"}`
+	resp := doRequest(t, engine, http.MethodPost, "/test/login", body, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("test login failed: %d %s", resp.StatusCode, string(resp.Body))
+	}
+	var lr loginResp
+	resp.JSON(t, &lr)
+	return lr.Data.AccessToken, lr.Data.RefreshToken, lr.Data.Subscription
 }

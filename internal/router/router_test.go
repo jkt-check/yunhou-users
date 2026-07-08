@@ -36,8 +36,9 @@ func TestSetupRoutes(t *testing.T) {
 	t.Run("public routes are registered", func(t *testing.T) {
 		engine := gin.New()
 
-		// Register mock handlers for route existence check
-		engine.POST("/auth/login", func(c *gin.Context) { c.Status(http.StatusOK) })
+		// Register mock handlers for route existence check. /auth/login was
+		// removed by commit 5ef27ce (GitHub is the only login provider now);
+		// /test/login is the dev-only JWT mint endpoint, not a public route.
 		engine.POST("/auth/refresh", func(c *gin.Context) { c.Status(http.StatusOK) })
 		engine.POST("/auth/logout", func(c *gin.Context) { c.Status(http.StatusOK) })
 		engine.GET("/.well-known/jwks.json", func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -46,7 +47,6 @@ func TestSetupRoutes(t *testing.T) {
 			method string
 			path   string
 		}{
-			{"POST", "/auth/login"},
 			{"POST", "/auth/refresh"},
 			{"POST", "/auth/logout"},
 			{"GET", "/.well-known/jwks.json"},

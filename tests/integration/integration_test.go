@@ -24,13 +24,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// NOTE: /auth/login was removed (GitHub is the only login provider now
-	// and uses the redirect flow). The legacy integration tests that drove
-	// /auth/login with arbitrary provider_token strings no longer apply;
-	// they need to be rewritten to drive the GitHub callback flow. The
-	// new flow has no equivalent of the per-token ProviderUserInfo stub —
-	// the stub used to be installed here via SetProviderVerifier, which
-	// was removed when the direct-login path was deleted.
+	// NOTE: /auth/login was removed (commit 5ef27ce — GitHub is the only
+	// login provider now via the /auth/github/redirect → /auth/github/callback
+	// flow). This file uses POST /test/login (gated by PAYPAL_L3_E2E_MODE=1,
+	// set in setupServer) to mint JWTs without going through OAuth. Don't
+	// reintroduce /auth/login calls — use the testLogin helper instead.
 	os.Exit(m.Run())
 }
 
@@ -106,6 +104,12 @@ func setupDB(t *testing.T) *sqlx.DB {
 }
 
 func setupServer(db *sqlx.DB) *httptest.Server {
+	// Enable the dev-only /test/login endpoint (PAYPAL_L3_E2E_MODE=1). The
+	// handler returns 404 unless this is set; integration tests use it to
+	// mint JWTs without going through the GitHub OAuth redirect flow.
+	if err := os.Setenv("PAYPAL_L3_E2E_MODE", "1"); err != nil {
+		panic(fmt.Sprintf("set PAYPAL_L3_E2E_MODE: %v", err))
+	}
 	cfg := &config.Config{
 		Port:          "8080",
 		JWTAccessTTL:   15 * time.Minute,
@@ -146,6 +150,26 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 func doJSON(t *testing.T, method, url string, body interface{}) *http.Response {
 	t.Helper()
 	return doJSONWithAuth(t, method, url, "", body)
+}
+
+// testLogin mints a JWT pair via the dev-only /test/login endpoint. The
+// endpoint is gated by PAYPAL_L3_E2E_MODE=1 (set in setupServer). Each call
+// uses a fresh email derived from the supplied seed so tests stay isolated.
+func testLogin(t *testing.T, srv *httptest.Server, email, appID string) (access, refresh string) {
+	t.Helper()
+	body := map[string]interface{}{
+		"email":  email,
+		"app_id": appID,
+	}
+	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login", body)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("test login: status %d, body %s", resp.StatusCode, string(b))
+	}
+	result := parseJSON(t, resp)
+	data := result["data"].(map[string]interface{})
+	return data["access_token"].(string), data["refresh_token"].(string)
 }
 
 func doJSONWithAuth(t *testing.T, method, url, auth string, body interface{}) *http.Response {
@@ -251,22 +275,7 @@ func TestLoginFlow(t *testing.T) {
 	defer srv.Close()
 
 	// Login
-	loginBody := map[string]interface{}{
-		"provider":       "github",
-		"provider_token": "test-user-123",
-		"app_id":         "yundian",
-	}
-	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", loginBody)
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		t.Fatalf("login: status %d, body %s", resp.StatusCode, string(body))
-	}
-	result := parseJSON(t, resp)
-	data := result["data"].(map[string]interface{})
-
-	accessToken := data["access_token"].(string)
-	refreshToken := data["refresh_token"].(string)
+	accessToken, refreshToken := testLogin(t, srv, "test-user-123@yundian.test", "yundian")
 	if accessToken == "" || refreshToken == "" {
 		t.Fatal("tokens are empty")
 	}
@@ -290,14 +299,7 @@ func TestTokenRefresh(t *testing.T) {
 	defer srv.Close()
 
 	// Login first
-	loginBody := map[string]interface{}{
-		"provider":       "github",
-		"provider_token": "refresh-test-user",
-		"app_id":         "yundian",
-	}
-	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", loginBody)
-	result := parseJSON(t, resp)
-	refreshToken := result["data"].(map[string]interface{})["refresh_token"].(string)
+	_, refreshToken := testLogin(t, srv, "refresh-test-user@yundian.test", "yundian")
 
 	// Refresh
 	refreshResp := doJSON(t, http.MethodPost, srv.URL+"/auth/refresh", map[string]interface{}{
@@ -430,17 +432,10 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	defer srv.Close()
 
 	// Login to get a JWT.
-	loginBody := map[string]interface{}{
-		"provider": "github", "provider_token": "sub-life-user", "app_id": "yundian",
-	}
-	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", loginBody)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login: %d", resp.StatusCode)
-	}
-	tok := parseJSON(t, resp)["data"].(map[string]interface{})["access_token"].(string)
+	tok, _ := testLogin(t, srv, "sub-life-user@yundian.test", "yundian")
 
 	// Create subscription via JWT-protected API.
-	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
+	resp := doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
 		"Bearer "+tok, map[string]interface{}{"plan_id": "free"})
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
@@ -482,22 +477,15 @@ func TestMultipleAppsShareSameUser(t *testing.T) {
 	defer srv.Close()
 
 	// Login to get a JWT and reuse the user across two app logins.
-	loginBody := map[string]interface{}{
-		"provider": "github", "provider_token": "multi-app-user", "app_id": "yundian",
-	}
-	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", loginBody)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login: %d", resp.StatusCode)
-	}
-	result := parseJSON(t, resp)
-	data := result["data"].(map[string]interface{})
-	tok := data["access_token"].(string)
-	userID := data["user"].(map[string]interface{})["id"].(string)
+	tok, _ := testLogin(t, srv, "multi-app-user@yundian.test", "yundian")
+	profileResp := doJSONWithAuth(t, http.MethodGet, srv.URL+"/user/profile", "Bearer "+tok, nil)
+	profileResult := parseJSON(t, profileResp)
+	userID := profileResult["data"].(map[string]interface{})["id"].(string)
 
 	// Create subscription to free plan (which includes yundian — the only
 	// app seeded in this integration test). The test's purpose is to
 	// confirm one user → one subscription, not to test multi-app access.
-	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
+	resp := doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
 		"Bearer "+tok, map[string]interface{}{"plan_id": "free"})
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
@@ -533,18 +521,21 @@ func TestUnauthorizedAccess(t *testing.T) {
 	}
 }
 
-func TestUnsupportedProvider(t *testing.T) {
+// TestTestLoginMalformedBody covers the dev-only /test/login endpoint's
+// input validation. The "unsupported provider" test that lived here was
+// retired when /auth/login was removed (commit 5ef27ce); /test/login has
+// no provider concept — it mints a JWT directly from email + app_id.
+func TestTestLoginMalformedBody(t *testing.T) {
 	db := setupDB(t)
 	srv := setupServer(db)
 	defer srv.Close()
 
-	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", map[string]interface{}{
-		"provider":       "facebook",
-		"provider_token": "test",
-		"app_id":         "yundian",
+	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login", map[string]interface{}{
+		// missing required "email" field
+		"app_id": "yundian",
 	})
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("expected 400 for unsupported provider, got %d", resp.StatusCode)
+		t.Errorf("expected 400 for missing email, got %d", resp.StatusCode)
 	}
 }
 
@@ -553,49 +544,52 @@ func TestLoginHasAccessField(t *testing.T) {
 	srv := setupServer(db)
 	defer srv.Close()
 
-	// Login to yundian (in free plan)
-	resp := doJSON(t, http.MethodPost, srv.URL+"/auth/login", map[string]interface{}{
-		"provider":      "github",
-		"provider_token": "user-with-free-plan",
-		"app_id":        "yundian",
-	})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login: status %d", resp.StatusCode)
+	const email = "user-with-free-plan@yundian.test"
+
+	// First login: yundian on the default 'free' plan → has_access=true.
+	subView := testLoginSub(t, srv, email, "yundian")
+	if subView["has_access"] != true {
+		t.Errorf("expected has_access=true for yundian on free plan, got %v", subView["has_access"])
 	}
-	result := parseJSON(t, resp)
-	sub := result["data"].(map[string]interface{})["subscription"].(map[string]interface{})
-	if sub["has_access"] != true {
-		t.Errorf("expected has_access=true for yundian on free plan, got %v", sub["has_access"])
-	}
-	if sub["plan_id"] != "free" {
-		t.Errorf("expected plan_id=free, got %v", sub["plan_id"])
+	if subView["plan_id"] != "free" {
+		t.Errorf("expected plan_id=free, got %v", subView["plan_id"])
 	}
 
-	// Seed an inactive plan that DOES NOT include yundian so has_access is false.
+	// Seed a restricted plan (yundian NOT in its apps list) and switch the user to it.
 	_, _ = db.ExecContext(context.Background(),
 		`INSERT INTO plans (id, name, price, interval_days, apps, is_active, is_default)
 		 VALUES ('restricted', 'Restricted', 0, 0, ARRAY[]::TEXT[], true, false)
 		 ON CONFLICT (id) DO NOTHING`)
-	// Subscribe the user to the restricted plan.
-	tok := result["data"].(map[string]interface{})["access_token"].(string)
-	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
+	tok, _ := testLogin(t, srv, email, "yundian")
+	resp := doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
 		"Bearer "+tok, map[string]interface{}{"plan_id": "restricted"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("subscribe restricted: %d", resp.StatusCode)
 	}
 
-	// Re-login and confirm has_access=false for yundian on the restricted plan.
-	resp = doJSON(t, http.MethodPost, srv.URL+"/auth/login", map[string]interface{}{
-		"provider":      "github",
-		"provider_token": "user-with-free-plan",
-		"app_id":        "yundian",
-	})
+	// Second login: same user, now on the restricted plan → has_access=false.
+	subView2 := testLoginSub(t, srv, email, "yundian")
+	if subView2["has_access"] != false {
+		t.Errorf("expected has_access=false for yundian on restricted plan, got %v", subView2["has_access"])
+	}
+}
+
+// testLoginSub calls /test/login and returns the embedded subscription view
+// (plan_id, plan_name, has_access) from the response.
+func testLoginSub(t *testing.T, srv *httptest.Server, email, appID string) map[string]interface{} {
+	t.Helper()
+	body := map[string]interface{}{"email": email, "app_id": appID}
+	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login", body)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("second login: status %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("test login: status %d, body %s", resp.StatusCode, string(b))
 	}
-	result = parseJSON(t, resp)
-	sub = result["data"].(map[string]interface{})["subscription"].(map[string]interface{})
-	if sub["has_access"] != false {
-		t.Errorf("expected has_access=false for yundash on free plan, got %v", sub["has_access"])
+	result := parseJSON(t, resp)
+	data := result["data"].(map[string]interface{})
+	sub, ok := data["subscription"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("test login response missing subscription field: %v", data)
 	}
+	return sub
 }

@@ -84,8 +84,9 @@ CI: `@happy` is the gate. `@renewal` is run manually monthly.
 1. Test boots a backend (`go run ./cmd/server`) listening on :8080.
 2. ngrok exposes :8080 on `https://abc.ngrok.io`. PayPal webhook URL
    registered against this public URL.
-3. `setupE2E` helpers log in via `POST /auth/login` (mock OAuth provider),
-   create a Yunhou order via `POST /payments/orders`.
+3. `setupE2E` helpers log in via `POST /test/login` (dev-only JWT mint endpoint;
+   requires `PAYPAL_L3_E2E_MODE=1`), then create a Yunhou order via
+   `POST /payments/orders`.
 4. The test mounts a minimal checkout HTML that loads the PayPal JS SDK
    against the sandbox endpoint and renders the Buttons.
 5. Buyer popup: Playwright drives the iframe/popup flow with the

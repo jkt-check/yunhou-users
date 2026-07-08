@@ -1187,10 +1187,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 // existing transaction. Returns (paymentID, true) if inserted, (_, false)
 // if a row already exists for (channel, external_txn_id).
 func insertPaymentOnTx(ctx context.Context, tx *sqlx.Tx, p *model.Payment) (string, bool, error) {
-	rawPayload := p.RawPayload
-	if rawPayload == nil {
-		rawPayload = json.RawMessage(`{}`)
-	}
+	rawPayload := repo.NonNilRawPayload(p.RawPayload)
 	var paidAt *time.Time = p.PaidAt
 	var id string
 	err := tx.QueryRowxContext(ctx, `

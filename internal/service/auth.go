@@ -112,7 +112,8 @@ type TestLoginRequest struct {
 	AppID string `json:"app_id" binding:"required"`
 }
 
-// LoginResponse is the response for POST /auth/login
+// LoginResponse is the response returned by every successful login path
+// (the GitHub OAuth redirect flow's callback and the dev-only /test/login).
 type LoginResponse struct {
 	AccessToken  string           `json:"access_token"`
 	RefreshToken string           `json:"refresh_token"`
@@ -367,8 +368,8 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 			return nil, fmt.Errorf("find user: %w", err)
 		}
 	} else {
-		// Create a fresh user + a synthetic identity so future /auth/login
-		// flows can also find this user.
+		// Create a fresh user + a synthetic identity so future logins
+		// (GitHub OAuth or /test/login) can also find this user.
 		nick := req.Email
 		user = &model.User{
 			ID:       GenerateUUID(),
@@ -416,7 +417,8 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 	hasAccess := slices.Contains(plan.Apps, req.AppID)
 
 	// Issue tokens through the same path production uses so the refresh
-	// rotation, JWT signing, etc. are byte-for-byte identical to /auth/login.
+	// rotation, JWT signing, etc. are byte-for-byte identical to the
+	// GitHub OAuth callback's token issuance.
 	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, req.AppID, plan.Apps)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)

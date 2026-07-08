@@ -175,6 +175,13 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	t.Helper()
 
+	// Enable the dev-only /test/login endpoint (PAYPAL_L3_E2E_MODE=1) so the
+	// e2e suite can mint JWTs without going through the GitHub OAuth redirect
+	// flow. The handler returns 404 unless this is set.
+	if err := os.Setenv("PAYPAL_L3_E2E_MODE", "1"); err != nil {
+		t.Fatalf("set PAYPAL_L3_E2E_MODE: %v", err)
+	}
+
 	db := connectDB(t)
 	t.Cleanup(func() { db.Close() })
 	cleanupDB(t, db)
@@ -493,15 +500,21 @@ func mustParseAlipayPubKey(t *testing.T, pemBytes []byte) *rsa.PublicKey {
 	return pub
 }
 
-// loginAndGetToken performs a login and returns the access token + user id.
-// Tokens are JWTs verified by the same JWKS in production — here the server
-// signs with the e2e RSA key pair so tokens round-trip.
+// loginAndGetToken mints a JWT pair via the dev-only /test/login endpoint
+// (gated by PAYPAL_L3_E2E_MODE=1, set by TestMain) and returns the access
+// token + user id. The legacy /auth/login direct-token path was removed
+// by commit 5ef27ce; tests that need a JWT should call this helper.
+//
+// `token` is reused as the user email (with "@e2e.test" appended) so tests
+// can mint distinct users per call while keeping the call-site signature
+// close to the legacy helper.
 func loginAndGetToken(t *testing.T, engine *gin.Engine, token, appID string) (string, string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"provider":"github","provider_token":%q,"app_id":%q}`, token, appID)
-	resp := doRequest(t, engine, http.MethodPost, "/auth/login", body, nil)
+	email := token + "@e2e.test"
+	body := fmt.Sprintf(`{"email":%q,"app_id":%q}`, email, appID)
+	resp := doRequest(t, engine, http.MethodPost, "/test/login", body, nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login failed: %d %s", resp.StatusCode, string(resp.Body))
+		t.Fatalf("test login failed: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var lr struct {
 		Data struct {
@@ -513,6 +526,26 @@ func loginAndGetToken(t *testing.T, engine *gin.Engine, token, appID string) (st
 	}
 	resp.JSON(t, &lr)
 	return lr.Data.AccessToken, lr.Data.User.ID
+}
+
+// loginAndGetRefresh mints a JWT pair via /test/login and returns both
+// access and refresh tokens. Used by tests that exercise the refresh-rotation
+// contract.
+func loginAndGetRefresh(t *testing.T, engine *gin.Engine, token, appID string) (access, refresh string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"email":%q,"app_id":%q}`, token+"@e2e.test", appID)
+	resp := doRequest(t, engine, http.MethodPost, "/test/login", body, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("test login failed: %d %s", resp.StatusCode, string(resp.Body))
+	}
+	var lr struct {
+		Data struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &lr)
+	return lr.Data.AccessToken, lr.Data.RefreshToken
 }
 
 func authHeader(token string) map[string]string {

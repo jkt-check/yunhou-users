@@ -4,9 +4,11 @@
  *
  * For tests we don't actually need a real consumer-app install — we mount
  * a minimal checkout HTML page that loads the PayPal SDK directly and
- * hits the yunhou backend's /auth/login + /payments/orders endpoints
+ * hits the yunhou backend's /test/login + /payments/orders endpoints
  * inline. Each test starts its own server. This is the lightest-weight
  * way to exercise the real PayPal SDK + buyer popup + webhook chain.
+ * /test/login is the dev-only JWT mint endpoint; production uses
+ * /auth/github/redirect → /auth/github/callback.
  */
 
 import { Page, expect } from '@playwright/test';

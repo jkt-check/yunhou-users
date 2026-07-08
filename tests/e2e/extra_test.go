@@ -2,13 +2,10 @@ package e2e
 
 import (
 	"bytes"
-	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/gin-gonic/gin"
 )
 
 // TestE2E_AuthLogout_Roundtrip covers the full logout → re-login cycle.
@@ -78,13 +75,15 @@ func TestE2E_JWKS_ContentType(t *testing.T) {
 	}
 }
 
-// TestE2E_LoginInvalidJSON covers the 400 path on malformed body.
-func TestE2E_LoginInvalidJSON(t *testing.T) {
+// TestE2E_TestLoginInvalidJSON covers the 400 path on malformed body for the
+// dev-only /test/login endpoint. Replaces TestE2E_LoginInvalidJSON which
+// drove /auth/login (removed by commit 5ef27ce).
+func TestE2E_TestLoginInvalidJSON(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	resp := doRequest(t, srv.Engine, http.MethodPost, "/auth/login",
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/test/login",
 		"not-json", nil)
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("invalid json login: %d, want 400", resp.StatusCode)
+		t.Errorf("invalid json test-login: %d, want 400", resp.StatusCode)
 	}
 }
 
@@ -239,24 +238,6 @@ func TestE2E_ProfilePatch(t *testing.T) {
 			t.Errorf("long nickname: %d, want 400", resp.StatusCode)
 		}
 	})
-}
-
-// loginAndGetRefresh logs in and returns access + refresh tokens.
-func loginAndGetRefresh(t *testing.T, engine *gin.Engine, token, appID string) (string, string) {
-	t.Helper()
-	body := fmt.Sprintf(`{"provider":"github","provider_token":%q,"app_id":%q}`, token, appID)
-	resp := doRequest(t, engine, http.MethodPost, "/auth/login", body, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("login failed: %d %s", resp.StatusCode, string(resp.Body))
-	}
-	var lr struct {
-		Data struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &lr)
-	return lr.Data.AccessToken, lr.Data.RefreshToken
 }
 
 // TestE2E_RefreshReuseFamilyRevoke tests the security response.

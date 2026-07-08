@@ -391,9 +391,9 @@ func LoadAlipayPublicKeyFromPEM(pemBytes []byte) (*rsa.PublicKey, error) {
 // need to restart to flip environments.
 //
 // Replay protection is provided by the event-level dedupe (webhook_events
-// UNIQUE(channel, event_id)) — same approach as LemonSqueezy. PayPal's
-// transmission_time is meant only for PayPal's own verification, not for
-// our dedup, so we don't enforce a local replay window.
+// UNIQUE(channel, event_id)). PayPal's transmission_time is meant only for
+// PayPal's own verification, not for our dedup, so we don't enforce a local
+// replay window.
 //
 // verifyCache is a tiny in-process cache that absorbs PayPal's retry bursts.
 // PayPal retries on transient errors within seconds; without the cache every

@@ -4,8 +4,10 @@ import { defineConfig, devices } from '@playwright/test';
  * Playwright config for yunhou-users PayPal L3 integration tests.
  *
  * Two-tier baseURL pattern:
- *   - BACKEND_URL (used by API helpers like /auth/login, /payments/orders,
+ *   - BACKEND_URL (used by API helpers like /test/login, /payments/orders,
  *     /user/subscriptions): the **direct** backend URL — usually localhost.
+ *     Note: /test/login is dev-only (gated by PAYPAL_L3_E2E_MODE=1); production
+ *     uses the /auth/github/redirect → /auth/github/callback flow instead.
  *   - WEBHOOK_BASE_URL: the **tunnel** URL PayPal sees (e.g. ngrok). This must
  *     be reachable from PayPal's webhook dispatchers. The backend reads this
  *     to discover its own public URL.

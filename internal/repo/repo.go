@@ -268,14 +268,19 @@ func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 }
 
 // appSelectColumns is the canonical SELECT list for the apps table. It must
-// stay in sync with the column order produced by migration 002_simplify_plans
-// (app_id, name, description, config, is_active, created_at, updated_at) plus
-// 007_app_secret (secret_hash) and with model.App's field order so sqlx can
-// scan rows into the struct.
+// stay in sync with the column order produced by migration 001_init (app_id,
+// name, description, config, is_active, created_at, updated_at) plus
+// 007_app_secret (secret_hash inserted between is_active and created_at) and
+// with model.App's field order so sqlx can scan rows into the struct.
 //
-// COALESCE(config, '{}'::jsonb) guards against sqlx's inability to scan a
-// NULL JSONB value into json.RawMessage. Keep the alias name (config) so
-// the `db:"config"` tag on model.App.Config still matches.
+// Two COALESCEs are needed because sqlx cannot scan a NULL column into the
+// corresponding Go type:
+//   - config → json.RawMessage (NULL would error). Coerce to '{}'.
+//   - secret_hash → string (NULL would error). Coerce to ''.
+//
+// Pre-007 rows have secret_hash=NULL; without the COALESCE those rows would
+// fail to load. Keep both alias names (config, secret_hash) so the `db:"..."`
+// tags on model.App still match.
 const appSelectColumns = `app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, COALESCE(secret_hash, '') AS secret_hash, created_at, updated_at`
 
 func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {

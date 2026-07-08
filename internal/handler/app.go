@@ -572,7 +572,7 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 		plan.IntervalDays = *req.IntervalDays
 	}
 	if req.Apps != nil {
-		plan.Apps = req.Apps
+		plan.Apps = pq.StringArray(req.Apps)
 	}
 	if req.IsActive != nil {
 		plan.IsActive = *req.IsActive
@@ -660,7 +660,7 @@ func (h *PlanHandler) GetAppPlans(c *gin.Context) {
 // buildPublicPlan assembles a PublicPlan DTO from the canonical Plan row and
 // the app's typed config. Resolves provider_ids for every configured channel
 // and picks the first configured channel's cycle as the authoritative cycle
-// summary (PayPal precedes LemonSqueezy).
+// summary.
 func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 	out := model.PublicPlan{
 		ID:           p.ID,

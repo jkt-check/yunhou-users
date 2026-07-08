@@ -39,7 +39,7 @@ type githubOAuthDeps struct {
 // /auth/github/callback to the engine. Called from router.Setup().
 //
 // Both endpoints are public (no JWT) — same posture as the existing
-// /auth/login and /auth/refresh. Rate-limited via the public limiter.
+// /auth/refresh and /auth/logout. Rate-limited via the public limiter.
 func RegisterGitHubOAuthRoutes(engine gin.IRouter, svc *service.GitHubOAuthService, appRepo appLoader, authSvc service.AuthServiceInterface, tokenSvc service.TokenServiceInterface) {
 	d := &githubOAuthDeps{svc: svc, appRepo: appRepo, authSvc: authSvc, tokenSvc: tokenSvc}
 	engine.GET("/auth/github/redirect", d.Redirect)
@@ -113,8 +113,8 @@ func (d *githubOAuthDeps) Redirect(c *gin.Context) {
 //  3. Exchange the code for a GitHub access_token (server-side only).
 //  4. Fetch /user + /user/emails using that token, then drop it.
 //  5. Call AuthService.Login with provider="github" + the access_token
-//     — same path the v1 /auth/login used, so identity binding stays in
-//     one place.
+//     — same path the GitHub-only flow always used, so identity binding
+//     stays in one place.
 //  6. Redirect to the BFF's callback URL with the yunhou JWT in the
 //     URL fragment (not query — fragments don't leak via referer /
 //     server logs).

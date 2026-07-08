@@ -3,9 +3,7 @@ package e2e
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/yunhou/users/internal/util"
 )
@@ -124,64 +122,8 @@ func TestE2E_CreateApp_ReturnsSecret(t *testing.T) {
 	}
 }
 
-// TestE2E_Quote_IncludesSubExpiresAtInLSCustomData asserts that the LS
-// provider_data block carries a sub_expires_at value so the BFF can pass
-// provider_data.lemonsqueezy straight through to the LS checkout-creation
-// call without reformatting.
-func TestE2E_Quote_IncludesSubExpiresAtInLSCustomData(t *testing.T) {
-	engine, _, db := setupE2EServer(t)
-	hdrs := appAuthHeaders(superAppID)
-
-	appID := "e2e-quote-subexp-" + randomSuffix()
-	createBody := `{"app_id":"` + appID + `","name":"SubExp E2E","config":{"payment_providers":{"lemonsqueezy":{"api_key":"lsq_k","store_id":"12345","plans":{"qp":{"variant_id":"var-Q","trial_days":0,"billing_cycle_days":30}}}}}}`
-	createResp := doRequest(t, engine, http.MethodPost, "/admin/apps", createBody, hdrs)
-	if createResp.StatusCode != http.StatusCreated {
-		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
-	}
-	if _, err := db.ExecContext(t.Context(),
-		`INSERT INTO plans (id, name, price, interval_days, apps, is_active) VALUES ('qp', 'Quote Plan', 29.9, 30, ARRAY[$1], true)`, appID); err != nil {
-		t.Fatalf("seed plan: %v", err)
-	}
-
-	token, _ := loginAndGetToken(t, engine, "e2e-quote-subexp-"+randomSuffix(), appID)
-
-	resp := doRequest(t, engine, http.MethodPost, "/apps/"+appID+"/quote", `{"plan_id":"qp"}`, authHeader(token))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("quote: %d %s", resp.StatusCode, string(resp.Body))
-	}
-	var body struct {
-		Data struct {
-			ProviderData map[string]any `json:"provider_data"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(resp.Body, &body); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	ls, ok := body.Data.ProviderData["lemonsqueezy"].(map[string]any)
-	if !ok {
-		t.Fatalf("provider_data.lemonsqueezy missing: %+v", body.Data.ProviderData)
-	}
-	cd, ok := ls["checkout_data"].(map[string]any)
-	if !ok {
-		t.Fatalf("lemonsqueezy.checkout_data missing")
-	}
-	custom, ok := cd["custom"].(map[string]any)
-	if !ok {
-		t.Fatalf("checkout_data.custom missing")
-	}
-	subExp, ok := custom["sub_expires_at"].(string)
-	if !ok || subExp == "" {
-		t.Fatalf("checkout_data.custom.sub_expires_at missing/empty: %+v", custom)
-	}
-	// Must round-trip through time.RFC3339 — the LS webhook parser uses the
-	// same parser on this value at activation time, so anything it can't
-	// parse here will also fail silently in production.
-	if _, err := time.Parse(time.RFC3339, subExp); err != nil {
-		t.Errorf("sub_expires_at = %q; not a valid RFC3339 timestamp: %v", subExp, err)
-	}
-	// Spot-check the year-prefix check too — keeps the error message helpful
-	// when the value is empty / non-date.
-	if !strings.HasPrefix(subExp, "20") {
-		t.Errorf("sub_expires_at = %q; expected RFC3339 timestamp starting with 20xx", subExp)
-	}
-}
+// TestE2E_Quote_PayPalPlanId was removed with the LemonSqueezy removal
+// (commit d8f333d). The PayPal provider_data shape does not carry
+// sub_expires_at — PayPal computes its own billing cycle from plan_id, and
+// subExpires lives at the top-level Quote.sub_expires_at instead. See
+// internal/service/quote.go:buildProviderData for the current shape.

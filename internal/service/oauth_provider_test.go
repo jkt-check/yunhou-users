@@ -2,17 +2,17 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 )
 
 // withProviderHTTPClient swaps providerHTTPClient with a function returning
 // the supplied *http.Client for the duration of the test, restoring on
-// cleanup. This lets tests stub both GitHub and Google's userinfo API in one
+// cleanup. This lets tests stub GitHub's userinfo + emails API in one
 // process without spinning up an internal registry.
 func withProviderHTTPClient(t *testing.T, c *http.Client) {
 	t.Helper()
@@ -291,7 +291,10 @@ func TestFetchGitHubUser_MissingID(t *testing.T) {
 	}
 }
 
-// errorIs is a small alias for errors.Is to keep imports minimal in this file.
+// errorIs is a thin alias kept for the test-table call sites below.
+// Implementation walks the wrap chain via errors.Is — do NOT regress to a
+// substring match on Error() strings (would falsely match unrelated errors
+// that happen to contain the sentinel's text).
 func errorIs(err, target error) bool {
-	return err != nil && (err == target || (err != nil && strings.Contains(err.Error(), target.Error())))
+	return errors.Is(err, target)
 }

@@ -2,7 +2,9 @@ package repo
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -119,11 +121,11 @@ func (r *paymentRepo) InsertPaidOnConflictDoNothing(ctx context.Context, p *mode
 		VALUES ($1, $2, $3, $4, $5, 'paid', now(), $6)
 		ON CONFLICT (channel, external_txn_id) DO NOTHING
 		RETURNING id
-	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, nonNilRawPayload(p.RawPayload)).Scan(&id)
+	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, NonNilRawPayload(p.RawPayload)).Scan(&id)
 	if err != nil {
 		// sql.ErrNoRows means the ON CONFLICT absorbed a duplicate. The
 		// payment row already exists; caller should re-read it.
-		if err.Error() == "sql: no rows in result set" {
+		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil
 		}
 		return "", false, err
@@ -224,13 +226,20 @@ func (r *paymentRepo) ClearDisputed(ctx context.Context, id string) error {
 	return err
 }
 
-// nonNilRawPayload returns p unchanged when non-nil, otherwise an empty
-// JSON object. Postgres JSONB columns in this package have a DEFAULT '{}' on
-// the schema side, but sqlx's positional binding cannot represent a nil
-// json.RawMessage, so we coerce here at the single boundary used by every
-// INSERT that binds a raw payload.
-func nonNilRawPayload(p json.RawMessage) json.RawMessage {
-	if p == nil {
+// NonNilRawPayload returns p unchanged when it holds valid JSON, otherwise
+// an empty JSON object. Two cases are coerced to `'{}'`:
+//   - nil — sqlx's positional binding cannot represent a nil json.RawMessage.
+//   - empty (len==0, non-nil) — a zero-length json.RawMessage binds to '' which
+//     Postgres rejects as invalid JSON (SQLSTATE 22023/22P02).
+//
+// All Postgres JSONB raw_payload columns in this package have a DEFAULT '{}'
+// on the schema side, but the schema default is bypassed by an explicit bind.
+//
+// Exported (capital N) so callers in other packages (e.g. service/payment.go's
+// insertPaymentOnTx) can share the same coercion at every INSERT that binds
+// a raw payload.
+func NonNilRawPayload(p json.RawMessage) json.RawMessage {
+	if len(p) == 0 {
 		return json.RawMessage(`{}`)
 	}
 	return p
@@ -354,9 +363,9 @@ func (r *webhookEventRepo) InsertOnConflictDoNothing(ctx context.Context, e *mod
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (channel, event_id) DO NOTHING
 		RETURNING id
-	`, e.Channel, e.EventID, e.EventType, nonNilRawPayload(e.RawPayload)).Scan(&id)
+	`, e.Channel, e.EventID, e.EventType, NonNilRawPayload(e.RawPayload)).Scan(&id)
 	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
+		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil
 		}
 		return "", false, err

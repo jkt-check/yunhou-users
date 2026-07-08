@@ -105,7 +105,6 @@ func TestIsPaymentSuccess(t *testing.T) {
 		// Alipay
 		{"trade_status_sync", true},
 		{"TRADE_SUCCESS", true},
-		// LemonSqueezy
 		{"order_created", true},
 		{"subscription_created", true},
 		{"subscription_payment_success", false}, // renewal — v1 ack-200 no-op
@@ -154,7 +153,6 @@ func TestIsRefundEvent(t *testing.T) {
 		{"TRANSACTION.REFUND", true},
 		{"trade_closed", true},
 		{"TRADE_CLOSED", true},
-		// LemonSqueezy
 		{"order_refunded", true},
 		{"subscription_payment_refunded", true},
 		{"subscription_updated", false},

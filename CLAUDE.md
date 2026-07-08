@@ -4,7 +4,7 @@ This file provides guidance to kscc (claude.ai/code) when working with code in t
 
 ## Project Overview
 
-Yunhou Users is a **shared user management API** serving multiple consumer applications via RESTful APIs. All apps share the same user identity — one account per person across all consumers. Authentication is **social OAuth only** (GitHub, Google); there is no email/password registration.
+Yunhou Users is a **shared user management API** serving multiple consumer applications via RESTful APIs. All apps share the same user identity — one account per person across all consumers. Authentication is **GitHub OAuth only** (via the `/auth/github/*` redirect flow); there is no email/password registration, no `POST /auth/login`, and no other social provider.
 
 ## Architecture
 
@@ -23,7 +23,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 
 ### Auth Flow
 
-1. `POST /auth/login` — receives `{provider, provider_token, app_id}`, returns access + refresh tokens + subscription info with `has_access`
+1. `GET /auth/github/redirect` → `GET /auth/github/callback` — the GitHub OAuth Authorization Code redirect flow. Yunhou holds each app's GitHub OAuth App `client_secret` and runs the code exchange server-side. The callback redirects to the BFF with the JWT in the URL fragment.
 2. `POST /auth/refresh` — exchanges refresh token for new tokens (checks subscription, rotates refresh token)
 3. `POST /auth/logout` — revokes refresh token
 4. Consumer apps verify access tokens locally via `GET /.well-known/jwks.json` (RSA256 JWK, kid=`yunhou-users-rsa`)
@@ -52,7 +52,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 - `make deps` — tidy go.mod
 - `make generate-keys` — generate RSA key pair in `keys/`
 - `go test -race -run TestFoo ./internal/service/` — run a single test
-- Database migration: apply `001_init.sql`, then `002_simplify_plans.sql`, then `003_payments.sql`, then `004_ls_channel.sql`, then `005_paypal_channel.sql`, then `006_paypal_sub_mapping.sql`, then `007_app_secret.sql` (each depends on the prior; running out of order fails). After applying 007, run the server once so `BackfillAppSecrets` populates `secret_hash` for pre-existing app rows; capture the plaintexts from the deploy log and rotate them via `POST /admin/apps/:id/rotate-secret`.
+- Database migration: apply `001_init.sql`, then `002_simplify_plans.sql`, then `003_payments.sql`, then `004_ls_channel.sql`, then `005_paypal_channel.sql`, then `006_paypal_sub_mapping.sql`, then `007_app_secret.sql`, then `008_drop_lemonsqueezy.sql` (each depends on the prior; running out of order fails). After applying 007, run the server once so `BackfillAppSecrets` populates `secret_hash` for pre-existing app rows; capture the plaintexts from the deploy log and rotate them via `POST /admin/apps/:id/rotate-secret`. Migration 008 removes `lemonsqueezy` from the channel CHECK constraint after LemonSqueezy was removed from the codebase.
 
 ## Required Environment Variables
 
@@ -92,9 +92,9 @@ All endpoints return:
 ## Endpoints
 
 **Public** (rate-limited 10/s burst 20 per IP):
-- `GET /.well-known/jwks.json`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /apps/:id/plans`
+- `GET /.well-known/jwks.json`, `POST /auth/refresh`, `POST /auth/logout`, `GET /apps/:id/plans`
 - `GET /auth/github/redirect` and `GET /auth/github/callback` — the GitHub OAuth Authorization Code flow. Yunhou holds the OAuth App's `client_secret` and runs the code exchange server-side; the BFF supplies only `client_id` (via redirect URL) and a `redirect_uri` matching an entry in `apps.config.oauth_providers.github.callback_urls`. See "Boundary" below.
-- `POST /test/login` — **dev-only** (gated by `PAYPAL_L3_E2E_MODE=1`, otherwise returns 404). Used by `tests/e2e-ui/` to mint JWTs without going through OAuth. Never exposed in production.
+- `POST /test/login` — **dev-only** (gated by `PAYPAL_L3_E2E_MODE=1`, otherwise returns 404). Used by `tests/e2e-ui/` and `tests/integration/` to mint JWTs without going through OAuth. Never exposed in production.
 
 **Health probe** (NOT rate-limited — registered before the public limiter in `internal/router/router.go:35`):
 - `GET /healthz` — DB-backed liveness/readiness. Returns 200 `{"code":0,"data":{"status":"ok"}}` or 503 `{"code":503,"message":"db unavailable"}` if the DB ping fails.
@@ -110,14 +110,12 @@ All endpoints return:
 - New orders write `currency = "CNY"` hardcoded in `internal/service/payment.go:125`. Channel webhooks carry `sub_expires_at` through `payment.metadata`/`resource.sub_expires_at`/`meta.custom_data.sub_expires_at` — yunhou-users does not derive it server-side.
 
 **App management** (internal service auth via `X-App-ID` + `X-App-Secret` headers, rate-limited 30/s burst 60 per IP):
-- `GET /apps`, `GET /apps/:id`, `GET /apps/:id/provider-token/:channel` (PayPal OAuth token cached in-process for `expires_in − 60s` — typically ~9h, never shorter than the safety margin; singleflight dedupe avoids N concurrent fetches per `client_id`; LemonSqueezy returns the static `api_key`)
+- `GET /apps`, `GET /apps/:id`, `GET /apps/:id/provider-token/:channel` (PayPal OAuth token cached in-process for `expires_in − 60s` — typically ~9h, never shorter than the safety margin; singleflight dedupe avoids N concurrent fetches per `client_id`)
 - `GET /admin/plans`, `GET /admin/plans/:id`, `POST /admin/plans`, `PATCH /admin/plans/:id`, `DELETE /admin/plans/:id`
 - `POST /admin/apps` (returns plaintext `secret` once — only bcrypt hash is persisted), `PATCH /admin/apps/:id`, `POST /admin/apps/:id/rotate-secret` (returns new plaintext, invalidates the old one immediately)
 
 **Channel webhooks** (signature verification, NOT JWT; rate-limited 200/s burst 400 per IP — looser bucket because traffic is upstream-driven):
-- `POST /webhooks/payment/:channel` — `:channel` is `stripe` / `wechat_pay` / `alipay` / `lemonsqueezy`. Returns 404 when the corresponding webhook secret env var is empty.
-
-**Cycle precedence**: when both PayPal and LemonSqueezy are configured for the same `plan_id`, the resolved cycle (and therefore `sub_expires_at`) uses PayPal's `trial_days + billing_cycle_days`. LemonSqueezy's `trial_days` / `billing_cycle_days` are ignored in the quote response — only its `variant_id` is used downstream. Keep PayPal's billing-cycle definition in sync with operator config or the computed `sub_expires_at` will diverge from what PayPal actually bills.
+- `POST /webhooks/payment/:channel` — `:channel` is `stripe` / `wechat_pay` / `alipay` / `paypal`. Returns 404 when the corresponding webhook secret env var is empty. Unknown channels also return 404 (defence-in-depth — the CHECK constraint is the backstop).
 
 ## Design Principles
 

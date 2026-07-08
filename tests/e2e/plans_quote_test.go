@@ -73,9 +73,6 @@ func TestE2E_GetAppPlans_WithProviderConfig(t *testing.T) {
 	if got.ProviderIDs["paypal"] != "P-M" {
 		t.Errorf("paypal id = %q, want P-M", got.ProviderIDs["paypal"])
 	}
-	if got.ProviderIDs["lemonsqueezy"] != "var-M" {
-		t.Errorf("ls id = %q, want var-M", got.ProviderIDs["lemonsqueezy"])
-	}
 	if got.Cycle == nil || got.Cycle.TrialDays != 7 || got.Cycle.BillingCycleDays != 30 {
 		t.Errorf("cycle = %+v, want {7,30}", got.Cycle)
 	}
@@ -148,9 +145,6 @@ func TestE2E_PostQuote_HappyPath(t *testing.T) {
 	}
 	if _, ok := resp.Data.ProviderData["paypal"]; !ok {
 		t.Error("provider_data missing paypal")
-	}
-	if _, ok := resp.Data.ProviderData["lemonsqueezy"]; !ok {
-		t.Error("provider_data missing lemonsqueezy")
 	}
 }
 

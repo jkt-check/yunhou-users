@@ -13,7 +13,7 @@ import (
 
 // providerHTTPClient is the HTTP client used to call provider userinfo APIs.
 // It's a package var so tests can swap it for a stub. The default 10s timeout
-// caps how long an /auth/login request can block on a slow OAuth provider.
+// caps how long a /auth/github/callback can block on a slow OAuth provider.
 var providerHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 // githubUserURL and githubEmailsURL are package vars so tests can point the

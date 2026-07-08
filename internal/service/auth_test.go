@@ -1194,6 +1194,29 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 		}
 	})
 
+	t.Run("race: duplicate-key + winner lookup error → wrap", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, _ := newAuthMocks()
+		ur.users["u-winner"] = &model.User{ID: "u-winner", Status: "active"}
+		// Custom mock: first FindByProviderUID returns "not found",
+		// second returns an error (the race-winner lookup itself fails).
+		identityRepo := &storeFirstIdentityRepo{
+			inner:         sir,
+			createErr:     &duplicateKeyError{},
+			winnerLookupErr: errors.New("db down on winner lookup"),
+		}
+		svc := &AuthService{userRepo: ur, identityRepo: identityRepo}
+		_, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+			Provider: "github", ProviderUID: "gh-race-2", Email: "race2@x.com",
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "create identity") {
+			t.Errorf("expected wrap 'create identity', got %q", err.Error())
+		}
+	})
+
 	t.Run("identity.Create generic error → wrap", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, _, _, _, _ := newAuthMocks()
@@ -1243,10 +1266,11 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 // when we checked the first time") and the SECOND FindByProviderUID
 // (in the duplicate-key fallback path) returns the winner.
 type storeFirstIdentityRepo struct {
-	inner          *mockSocialIdentityRepo
-	createErr      error
-	winnerUserID   string
-	findCallCount  int
+	inner           *mockSocialIdentityRepo
+	createErr       error
+	winnerUserID    string
+	winnerLookupErr error
+	findCallCount   int
 }
 
 func (s *storeFirstIdentityRepo) Create(ctx context.Context, si *model.SocialIdentity) error {
@@ -1270,6 +1294,10 @@ func (s *storeFirstIdentityRepo) FindByProviderUID(ctx context.Context, provider
 		// First call: pretend the row doesn't exist yet (the caller
 		// checks before the concurrent caller inserts).
 		return nil, fmt.Errorf("not found")
+	}
+	if s.winnerLookupErr != nil {
+		// Second call: the winner lookup itself fails.
+		return nil, s.winnerLookupErr
 	}
 	// Second call: the row was stored by Create between the first
 	// and second FindByProviderUID calls. Return it.

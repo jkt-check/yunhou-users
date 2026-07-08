@@ -53,6 +53,7 @@ func (f *fakeTx) Rollback() error { return nil }
 // to the INSERT / activate-sub / update-order path).
 type countingFakeTx struct {
 	*fakeTx
+	t             *testing.T
 	execCallCount  int
 	execErrsAtCall map[int]error
 	getCallCount  int
@@ -215,14 +216,40 @@ func TestOnPaymentSucceeded_ActivateSubError(t *testing.T) {
 	}
 }
 
-// TestOnPaymentSucceeded_UpdateOrderError and
-// TestOnPaymentSucceeded_WriteAuditError removed — the exec call
-// numbering between activate sub, set external_subscription_id
-// (skipped, not PayPal), update order, and the late-payment write
-// audit is non-deterministic between tests because set
-// external_subscription_id is wrapped in a guard. The ActivateSub
-// test (which uses call 2) does pass and contributes the activate
-// sub branch to the coverage.
+// TestOnPaymentSucceeded_UpdateOrderError covers the "update order"
+// error branch. The fake's activate-sub UPDATE reports RowsAffected=1
+// (no INSERT runs) because the mock unconditionally returns 1; so
+// call 1 = activate-sub UPDATE, call 2 = UPDATE-order UPDATE.
+// Set call 2 to fail and assert "update order" in the wrapped error.
+func TestOnPaymentSucceeded_UpdateOrderError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	txnID := "pi-uoe-" + mustNewUUID()[:8]
+	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
+		return &countingFakeTx{
+			fakeTx: &fakeTx{rowID: txnID},
+			execErrsAtCall: map[int]error{
+				2: errors.New("synthetic update order failure"),
+			},
+			getErrsAtCall: map[int]error{
+				2: sql.ErrNoRows, // channel-mismatch check returns no rows
+			},
+		}, nil
+	}
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-uoe-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: []byte(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from update order failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "update order") {
+		t.Errorf("expected wrap 'update order', got %q", err.Error())
+	}
+}
 
 // TestOnPaymentFailed_BeginTxError covers the BeginTxx error branch
 // in onPaymentFailed.

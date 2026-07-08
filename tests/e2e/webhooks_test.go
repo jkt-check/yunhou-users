@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // --- Golden sample webhook payloads ---
@@ -429,5 +431,64 @@ func TestWebhook_UnsupportedChannel_404(t *testing.T) {
 		"/webhooks/payment/lemonsqueezy", `{}`, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected 404 for unsupported channel, got %d", resp.StatusCode)
+	}
+}
+
+// TestWebhook_Stripe_DisputeCreated exercises the onDisputeCreated
+// branch of OnWebhook end-to-end. A charge.dispute.created event
+// arrives for an already-paid payment; the handler must flip the
+// payment's `disputed` flag without touching the order or
+// subscription state.
+func TestWebhook_Stripe_DisputeCreated(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token, _ := loginAndGetToken(t, srv.Engine, "dispute", "yundian")
+
+	// Create the order + confirm so a paid payment row exists.
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"monthly"}`, authHeader(token))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", resp.StatusCode, string(resp.Body))
+	}
+	var r struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+	payBody := goldenStripePaid(orderID, "pi_e2e_dispute_1", 2990)
+	ts := time.Now().Unix()
+	sig := signStripe(e2eStripeSecret, ts, payBody)
+	resp = doRequest(t, srv.Engine, http.MethodPost,
+		"/webhooks/payment/stripe", string(payBody),
+		map[string]string{"Stripe-Signature": sig, "Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("paid webhook: %d %s", resp.StatusCode, string(resp.Body))
+	}
+
+	// Now send a charge.dispute.created event with the same pi id so
+	// the handler finds the paid payment and marks it disputed.
+	disputeBody := []byte(fmt.Sprintf(`{
+		"id": "evt_dispute_%s",
+		"type": "charge.dispute.created",
+		"data": {"object": {"id": "pi_e2e_dispute_1", "amount": 2990}}
+	}`, uuid.NewString()))
+	ts2 := time.Now().Unix()
+	sig2 := signStripe(e2eStripeSecret, ts2, disputeBody)
+	resp = doRequest(t, srv.Engine, http.MethodPost,
+		"/webhooks/payment/stripe", string(disputeBody),
+		map[string]string{"Stripe-Signature": sig2, "Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("dispute webhook: %d %s", resp.StatusCode, string(resp.Body))
+	}
+
+	// Payment row's `disputed` flag must be true.
+	var disputed bool
+	if err := srv.DB.GetContext(context.Background(), &disputed,
+		`SELECT disputed FROM payments WHERE order_id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if !disputed {
+		t.Error("expected payments.disputed = true after dispute webhook")
 	}
 }

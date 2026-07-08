@@ -11,7 +11,7 @@ Yunhou Users is a **shared user management API** serving multiple consumer appli
 - **Shared identity**: One user account across all consumer apps
 - **Plan-based access**: Apps are accessible based on the user's subscribed plan (free/monthly/quarterly/yearly)
 - **API-first**: Consumer apps integrate via REST; no server-rendered UI
-- **Direct login**: Consumer app sends provider token directly to `/auth/login` (no OAuth redirect flow for internal apps)
+- **Direct login (Google only)**: Google accepts `POST /auth/login` with `provider=google` + `provider_token`. **GitHub** was moved to the redirect flow (`/auth/github/redirect` → `/auth/github/callback`); `POST /auth/login` with `provider=github` returns 400.
 - **Subscription gate**: Login and token refresh check active subscription and plan app list before issuing tokens
 - **Refresh token rotation**: Every refresh invalidates the old refresh token and issues a new one
 
@@ -77,7 +77,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
-| `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the GitHub OAuth state parameter (`/auth/github/redirect` + `/auth/github/callback`). Server-side only — multi-instance deployments must share the same value. Operators who don't enable GitHub login can set any non-empty value. |
+| `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the GitHub OAuth `state` parameter (`/auth/github/redirect` + `/auth/github/callback`). Server-side only — multi-instance deployments must share the same value. **Minimum 32 characters** — `Validate()` (`internal/config/config.go:127`) rejects shorter values. Generate with `openssl rand -hex 32`. |
 | `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login`. `1` enables the endpoint; any other value (or unset) makes the handler return 404. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 
 ## API Response Format

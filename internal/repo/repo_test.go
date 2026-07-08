@@ -506,6 +506,88 @@ func TestAppRepo_FindByID_NotFound(t *testing.T) {
 	}
 }
 
+// TestAppRepo_ListUnhashedFiltersAtSQLLayer confirms ListUnhashed only
+// returns rows whose secret_hash is NULL or empty. After backfill, every
+// row has a hash and the SELECT returns an empty slice — not the whole
+// table.
+func TestAppRepo_ListUnhashedFiltersAtSQLLayer(t *testing.T) {
+	db := setupDB(t)
+	r := NewAppRepo(db)
+
+	// All apps seeded by setupDB are unhashed at this point.
+	got, err := r.ListUnhashed(context.Background())
+	if err != nil {
+		t.Fatalf("ListUnhashed: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("expected at least one unhashed app after seed")
+	}
+	for _, a := range got {
+		if a.SecretHash != "" {
+			t.Errorf("ListUnhashed returned app with non-empty hash: %q", a.SecretHash)
+		}
+	}
+
+	// Write a hash on the seeded row; ListUnhashed should now return empty.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE apps SET secret_hash = '$2a$10$test' WHERE app_id = 'yundian'`); err != nil {
+		t.Fatalf("seed hash: %v", err)
+	}
+	got, err = r.ListUnhashed(context.Background())
+	if err != nil {
+		t.Fatalf("ListUnhashed (after hash): %v", err)
+	}
+	for _, a := range got {
+		if a.AppID == "yundian" {
+			t.Errorf("yundian still appears in ListUnhashed after UPDATE")
+		}
+	}
+}
+
+// TestAppRepo_BackfillSecretHashRespectsConcurrentRotate guards the TOCTOU
+// between BackfillAppSecrets' ListUnhashed-then-UPDATE and an admin's
+// POST /admin/apps/:id/rotate-secret. The guard is "secret_hash IS NULL OR
+// = ''" on the UPDATE; without it a concurrent rotate would be silently
+// overwritten by the backfill and the operator's captured plaintext
+// would no longer authenticate.
+func TestAppRepo_BackfillSecretHashRespectsConcurrentRotate(t *testing.T) {
+	db := setupDB(t)
+	r := NewAppRepo(db)
+
+	// 1. Unhashed row → backfill succeeds (skipped=false).
+	skipped, err := r.BackfillSecretHash(context.Background(), "yundian", "H_BACKFILL")
+	if err != nil {
+		t.Fatalf("backfill (unhashed): %v", err)
+	}
+	if skipped {
+		t.Fatalf("backfill (unhashed): skipped=true, want false")
+	}
+	got, err := r.FindByID(context.Background(), "yundian")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SecretHash != "H_BACKFILL" {
+		t.Fatalf("after backfill hash = %q, want H_BACKFILL", got.SecretHash)
+	}
+
+	// 2. Now simulate a concurrent admin rotate landing first — the row
+	//    already has a hash, so a follow-up backfill call must skip.
+	skipped, err = r.BackfillSecretHash(context.Background(), "yundian", "H_OVERWRITE")
+	if err != nil {
+		t.Fatalf("backfill (concurrent rotate): %v", err)
+	}
+	if !skipped {
+		t.Fatalf("backfill (concurrent rotate): skipped=false, want true (guard did not fire)")
+	}
+	got, err = r.FindByID(context.Background(), "yundian")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SecretHash != "H_BACKFILL" {
+		t.Fatalf("after concurrent rotate, hash = %q, want H_BACKFILL (backfill must NOT overwrite)", got.SecretHash)
+	}
+}
+
 // ============================================================================
 // subscriptionRepo
 // ============================================================================

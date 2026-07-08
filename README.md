@@ -4,7 +4,7 @@ A shared user management API for multi-app ecosystems. One user identity across 
 
 ## Features
 
-- **Social OAuth only** — GitHub, Google (provider token sent directly)
+- **Social OAuth** — Google (provider token sent directly); GitHub uses the OAuth Authorization Code flow (`/auth/github/redirect` → `/auth/github/callback`)
 - **Plan-based access** — Plans define which apps a user can access
 - **RSA256 JWT** access tokens with JWKS public key endpoint
 - **Subscription gating** — tokens only issued for active subscriptions based on plan
@@ -17,8 +17,10 @@ A shared user management API for multi-app ecosystems. One user identity across 
 # 1. Set up PostgreSQL
 createdb yunhou_users
 # Run ALL migrations in order — 002 alters tables created by 001, 003
-# adds payment/webhook tables, 005 adds apps.secret_hash. Each depends on
-# the prior; running out of order will fail.
+# adds payment/webhook tables, 005 adds the paypal channel CHECK
+# constraint, 006 adds subscriptions.external_subscription_id for PayPal
+# renewal webhooks, 007 adds apps.secret_hash. Each depends on the prior;
+# running out of order will fail.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
@@ -35,10 +37,15 @@ make generate-keys
 #    app's secret via POST /admin/apps/:id/rotate-secret).
 make run
 
-# 4. Login (example with GitHub token)
+# 4a. Google login (direct provider token)
 curl -X POST http://localhost:8080/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"provider":"github","provider_token":"your-github-token","app_id":"yundian"}'
+  -d '{"provider":"google","provider_token":"ya29.your-google-token","app_id":"yundian"}'
+
+# 4b. GitHub login uses the redirect flow — open in a browser:
+#   GET /auth/github/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/callback
+# After consent GitHub redirects to /auth/github/callback which 302s back
+# to https://yundian.com/auth/callback#token=...&refresh_token=...&user_id=...
 ```
 
 ## Configuration
@@ -51,6 +58,7 @@ All configuration is via environment variables (or `.env` file):
 | `PORT` | No | `8080` | |
 | `RSA_PRIVATE_KEY_PATH` | No | `keys/private.pem` | |
 | `RSA_PUBLIC_KEY_PATH` | No | `keys/public.pem` | |
+| `OAUTH_STATE_SECRET` | **Yes** | (required) | HMAC key for the GitHub OAuth `state` parameter. **Minimum 32 characters** — server startup rejects shorter values. Generate with `openssl rand -hex 32`. Multi-instance must share the same value. |
 | `JWT_ACCESS_TTL` | No | `15m` | Must be positive |
 | `JWT_REFRESH_TTL` | No | `168h` (7 days) | Must be > access TTL; ≤ 365 days |
 | `ORDER_EXPIRY_DURATION` | No | `30m` | Pending order expiry; sweeper flips to `expired` after this |
@@ -64,8 +72,7 @@ All configuration is via environment variables (or `.env` file):
 | `PAYPAL_WEBHOOK_ID_LIVE` | No | (empty) | Empty = PayPal live webhooks return 404 |
 | `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
+| `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login`. Set to `1` to enable; any other value (or unset) makes the handler return 404. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 
 ## API Overview
 
@@ -75,9 +82,12 @@ All configuration is via environment variables (or `.env` file):
 |---|---|---|
 | GET | `/healthz` | Liveness / readiness probe. **Not rate-limited.** Returns 200 `{"code":0,"data":{"status":"ok"}}` or 503 `{"code":503,"message":"db unavailable"}` |
 | GET | `/.well-known/jwks.json` | RSA public key (JWK format) |
-| POST | `/auth/login` | Login with provider token |
+| POST | `/auth/login` | Login with a direct provider token. **Google only** — `provider=github` returns 400; use the redirect flow below. |
+| GET | `/auth/github/redirect` | Begin the GitHub OAuth Authorization Code flow (302 to GitHub). Requires `app_id` + `redirect_uri` matching the app's configured whitelist. |
+| GET | `/auth/github/callback` | GitHub redirects here after consent. Yunhou exchanges the code server-side and returns its JWT in the **URL fragment** (`#token=...&refresh_token=...&user_id=...`) so the access token never leaves the browser. |
 | POST | `/auth/refresh` | Refresh tokens |
 | POST | `/auth/logout` | Logout (revoke refresh token) |
+| POST | `/test/login` | **Dev-only** — returns 404 unless `PAYPAL_L3_E2E_MODE=1`. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 | GET | `/apps/:id/plans` | Public plan catalog (price + provider plan IDs + cycle) |
 
 ### User Endpoints (JWT Bearer)
@@ -99,7 +109,7 @@ All configuration is via environment variables (or `.env` file):
 |---|---|---|
 | GET | `/apps` | List all apps |
 | GET | `/apps/:id` | Get app details |
-| GET | `/apps/:id/provider-token/:channel` | Fetch upstream credential for `paypal` / `lemonsqueezy` (PayPal OAuth is cached in-process ~1h, LS returns the static api_key) |
+| GET | `/apps/:id/provider-token/:channel` | Fetch upstream credential for `paypal` / `lemonsqueezy` (PayPal OAuth token is cached in-process for `expires_in − 60s`; LS returns the static api_key) |
 | GET | `/admin/plans` | List all plans |
 | GET | `/admin/plans/:id` | Get plan details |
 | POST | `/admin/plans` | Create plan |
@@ -129,8 +139,9 @@ When both providers are configured for the same `plan_id`, the resolved cycle (a
 
 ## Authentication Flow
 
+Google (direct-token path):
 ```
-Consumer App        Yunhou Users API        OAuth Provider
+Consumer App        Yunhou Users API        Google
     |                      |                      |
     |-- POST /auth/login -->|                      |
     |  {provider_token}     |-- verify token ------>|
@@ -139,6 +150,19 @@ Consumer App        Yunhou Users API        OAuth Provider
     |                      |                      |
     |-- POST /auth/refresh->|                      |
     |<-- new JWT + refresh-| (with token rotation) |
+```
+
+GitHub (redirect flow — direct `POST /auth/login` with `provider=github` returns 400):
+```
+Browser            Yunhou Users API               GitHub            Consumer App (BFF)
+    |-- GET /auth/github/redirect?app_id=...&redirect_uri=... --> |
+    |<-- 302 to github.com/login/oauth/authorize?... --------- |
+    |-- consent on github.com ---------------------------> |
+    |<-- 302 to /auth/github/callback?code=...&state=... -- |
+    |                                              |-- exchange code (server-side, uses apps.config.oauth_providers.github.client_secret) --> GitHub
+    |                                              |<-- access_token, user, emails
+    |<-- 302 to redirect_uri#token=...&refresh_token=...&user_id=...&has_access=...
+    |     (fragment never reaches the server; the BFF parses it client-side)
 ```
 
 ## Development

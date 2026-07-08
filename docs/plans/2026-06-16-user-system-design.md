@@ -308,7 +308,7 @@ A JWT-authenticated caller can only read/write their own orders/payments/refunds
 
 ### App Management (requires X-App-ID + X-App-Secret headers, server-to-server)
 
-> **Note (v2)**: v1 used a single `X-App-ID` header under network-layer isolation. v2 added `X-App-Secret` (bcrypt-hashed in `apps.secret_hash`) since the public deploy has no VPC / IP whitelist. See `migrations/005_app_secret.sql` + §"内部服务鉴权" in `docs/api-integration-guide.md`. Plaintext secret is returned once at `POST /admin/apps` and at `POST /admin/apps/:id/rotate-secret`; only the bcrypt hash is persisted.
+> **Note (v2)**: v1 used a single `X-App-ID` header under network-layer isolation. v2 added `X-App-Secret` (bcrypt-hashed in `apps.secret_hash`) since the public deploy has no VPC / IP whitelist. See `migrations/007_app_secret.sql` + §"内部服务鉴权" in `docs/api-integration-guide.md`. Plaintext secret is returned once at `POST /admin/apps` and at `POST /admin/apps/:id/rotate-secret`; only the bcrypt hash is persisted.
 
 | Method | Path                     | Description                      |
 |--------|--------------------------|----------------------------------|
@@ -647,7 +647,11 @@ yunhou-users/
 ├── migrations/
 │   ├── 001_init.sql
 │   ├── 002_simplify_plans.sql
-│   └── 003_payments.sql         — planned: orders, payments, refunds, webhook_events
+│   ├── 003_payments.sql
+│   ├── 004_ls_channel.sql
+│   ├── 005_paypal_channel.sql
+│   ├── 006_paypal_sub_mapping.sql
+│   └── 007_app_secret.sql
 ├── go.mod
 ├── go.sum
 ├── Makefile

@@ -24,6 +24,13 @@ func (m *mockAppRepoForMiddleware) List(ctx context.Context) ([]model.App, error
 	return []model.App{}, nil
 }
 
+func (m *mockAppRepoForMiddleware) ListUnhashed(ctx context.Context) ([]model.App, error) {
+	if m.app != nil && m.app.SecretHash == "" {
+		return []model.App{*m.app}, nil
+	}
+	return []model.App{}, nil
+}
+
 func (m *mockAppRepoForMiddleware) FindByID(ctx context.Context, id string) (*model.App, error) {
 	if m.err != nil {
 		return nil, m.err
@@ -44,6 +51,16 @@ func (m *mockAppRepoForMiddleware) RotateSecretHash(ctx context.Context, appID, 
 		m.app.SecretHash = newHash
 	}
 	return nil
+}
+
+func (m *mockAppRepoForMiddleware) BackfillSecretHash(ctx context.Context, appID, newHash string) (bool, error) {
+	if m.app != nil && m.app.SecretHash != "" {
+		return true, nil
+	}
+	if m.app != nil {
+		m.app.SecretHash = newHash
+	}
+	return false, nil
 }
 
 // hashedApp builds a mock app whose SecretHash matches the given plaintext.
@@ -126,7 +143,7 @@ func TestInternalAppAuth(t *testing.T) {
 
 	t.Run("valid active app with X-App-ID only", func(t *testing.T) {
 		// pre-migration state — secret_hash empty because the app row predates
-		// 005_app_secret backfill. Refuse rather than fall through to the
+		// 007_app_secret backfill. Refuse rather than fall through to the
 		// network-trust model: that is the exact gap X-App-Secret closes.
 		app := hashedApp("test-app", "")
 		appRepo := &mockAppRepoForMiddleware{app: app}

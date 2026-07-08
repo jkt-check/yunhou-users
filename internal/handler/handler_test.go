@@ -709,6 +709,19 @@ func (m *mockAppRepo) RotateSecretHash(ctx context.Context, appID, newHash strin
 	return sql.ErrNoRows
 }
 
+func (m *mockAppRepo) BackfillSecretHash(ctx context.Context, appID, newHash string) (bool, error) {
+	for i, app := range m.apps {
+		if app.AppID == appID {
+			if m.apps[i].SecretHash != "" {
+				return true, nil // mimic production guard
+			}
+			m.apps[i].SecretHash = newHash
+			return false, nil
+		}
+	}
+	return false, sql.ErrNoRows
+}
+
 func TestAppHandler_ListApps(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2292,6 +2305,59 @@ func TestPlanHandler_GetAppPlans(t *testing.T) {
 		}
 		if resp.Data[1].Cycle == nil || resp.Data[1].Cycle.TrialDays != 7 || resp.Data[1].Cycle.BillingCycleDays != 30 {
 			t.Errorf("monthly.cycle = %+v, want {7, 30}", resp.Data[1].Cycle)
+		}
+	})
+
+	t.Run("ls cycle takes over when paypal lacks the per-plan entry", func(t *testing.T) {
+		// Mirrors TestQuote_Get_LemonSqueezyFallbackWhenPayPalLacksPlanEntry:
+		// PayPal is configured app-wide but only for "yearly" — for the
+		// requested plan "monthly" PayPal has no entry. The marketing
+		// endpoint must fall through to LemonSqueezy for the cycle instead
+		// of leaving Cycle=nil on the public plan.
+		plans := []model.Plan{
+			{ID: "monthly", Name: "Monthly", Price: 29.9, IntervalDays: 30, Apps: pq.StringArray{"yundian"}, IsActive: true},
+		}
+		app := model.App{
+			AppID: "yundian", Name: "Yundian", IsActive: true,
+			Config: json.RawMessage(`{
+				"payment_providers": {
+					"paypal": {"plans": {"yearly": {"plan_id": "P-Y", "trial_days": 0, "billing_cycle_days": 365}}},
+					"lemonsqueezy": {"plans": {"monthly": {"variant_id": "var-M", "trial_days": 3, "billing_cycle_days": 60}}}
+				}
+			}`),
+		}
+		appRepo := &mockAppRepo{apps: []model.App{app}}
+		planSvc := &mockPlanSvc{plans: plans}
+		handler := NewPlanHandler(planSvc, appRepo, nil)
+
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code int                `json:"code"`
+			Data []model.PublicPlan `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Data) != 1 || resp.Data[0].ID != "monthly" {
+			t.Fatalf("got %d plans, want 1 monthly", len(resp.Data))
+		}
+		if resp.Data[0].Cycle == nil {
+			t.Fatal("monthly.cycle = nil, want LS fallback values {3, 60}")
+		}
+		if resp.Data[0].Cycle.TrialDays != 3 || resp.Data[0].Cycle.BillingCycleDays != 60 {
+			t.Errorf("monthly.cycle = %+v, want LS {3, 60}", resp.Data[0].Cycle)
+		}
+		if resp.Data[0].ProviderIDs["lemonsqueezy"] != "var-M" {
+			t.Errorf("monthly.lemonsqueezy = %q, want var-M", resp.Data[0].ProviderIDs["lemonsqueezy"])
 		}
 	})
 

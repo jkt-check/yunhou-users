@@ -241,7 +241,7 @@ Three places to update:
 
 ## 11. Acceptance criteria
 
-- [ ] `migrations/005_paypal_channel.sql`, `migrations/006_paypal_sub_mapping.sql` apply without manual intervention.
+- [ ] `migrations/005_paypal_channel.sql`, `migrations/006_paypal_sub_mapping.sql` apply without manual intervention. (Scope is the PayPal channel — `migrations/007_app_secret.sql` is unrelated and tracked separately.)
 - [ ] `go test ./...` passes (unit).
 - [ ] `make e2e` passes (Playbook mock verify covers happy path + renewal + refund + bad signature).
 - [ ] `make lint` clean (`go vet`).

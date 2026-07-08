@@ -239,6 +239,10 @@ func TestValidate_ErrorPaths(t *testing.T) {
 			func(c *Config) { c.OAuthStateSecret = "" },
 			"OAUTH_STATE_SECRET",
 		},
+		{"oauth_state_secret too short",
+			func(c *Config) { c.OAuthStateSecret = "short" },
+			"OAUTH_STATE_SECRET",
+		},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -263,6 +267,92 @@ func TestValidate_ErrorPaths(t *testing.T) {
 				t.Errorf("error message missing %q: %v", tc.needleSub, err)
 			}
 		})
+	}
+}
+
+// TestLoad_PaymentChannelDefaults confirms that when the payment-channel
+// env vars are unset, the corresponding Config fields are empty (the docs
+// promise "Empty = <channel> webhooks return 404") and ORDER_EXPIRY_*
+// fall back to the documented defaults. Without this, a typo in
+// config.go:77-80 would silently drop every channel secret and turn all
+// four webhook endpoints into 404s at runtime — no Validate() catches it
+// because the fields are allowed to be empty.
+func TestLoad_PaymentChannelDefaults(t *testing.T) {
+	for _, k := range []string{
+		"STRIPE_WEBHOOK_SECRET", "WECHAT_PAY_API_V3_KEY",
+		"ALIPAY_PUBLIC_KEY_PATH", "LEMONSQUEEZY_WEBHOOK_SECRET",
+		"ORDER_EXPIRY_DURATION", "SWEEPER_INTERVAL",
+	} {
+		orig, had := os.LookupEnv(k)
+		os.Unsetenv(k)
+		if had {
+			t.Cleanup(func() { os.Setenv(k, orig) })
+		} else {
+			t.Cleanup(func() { os.Unsetenv(k) })
+		}
+	}
+
+	cfg := Load()
+	if cfg.StripeWebhookSecret != "" {
+		t.Errorf("StripeWebhookSecret default: got %q, want empty", cfg.StripeWebhookSecret)
+	}
+	if cfg.WeChatAPIv3Key != "" {
+		t.Errorf("WeChatAPIv3Key default: got %q, want empty", cfg.WeChatAPIv3Key)
+	}
+	if cfg.AlipayPublicKeyPath != "" {
+		t.Errorf("AlipayPublicKeyPath default: got %q, want empty", cfg.AlipayPublicKeyPath)
+	}
+	if cfg.LemonSqueezyWebhookSecret != "" {
+		t.Errorf("LemonSqueezyWebhookSecret default: got %q, want empty", cfg.LemonSqueezyWebhookSecret)
+	}
+	if cfg.OrderExpiryDuration != 30*time.Minute {
+		t.Errorf("OrderExpiryDuration default: got %v, want 30m", cfg.OrderExpiryDuration)
+	}
+	if cfg.SweeperInterval != 1*time.Minute {
+		t.Errorf("SweeperInterval default: got %v, want 1m", cfg.SweeperInterval)
+	}
+}
+
+// TestLoad_PaymentChannelOverrides confirms the same six env vars override
+// the defaults when set. Pairs with TestLoad_PaymentChannelDefaults — the
+// two together cover the Load() path for every payment-channel field.
+func TestLoad_PaymentChannelOverrides(t *testing.T) {
+	envVars := map[string]string{
+		"STRIPE_WEBHOOK_SECRET":      "whsec_x",
+		"WECHAT_PAY_API_V3_KEY":      "12345678901234567890123456789012", // 32 bytes
+		"ALIPAY_PUBLIC_KEY_PATH":     "/etc/alipay.pem",
+		"LEMONSQUEEZY_WEBHOOK_SECRET": "lssec_x",
+		"ORDER_EXPIRY_DURATION":      "5m",
+		"SWEEPER_INTERVAL":           "30s",
+	}
+	for k, v := range envVars {
+		orig, had := os.LookupEnv(k)
+		os.Setenv(k, v)
+		if had {
+			t.Cleanup(func() { os.Setenv(k, orig) })
+		} else {
+			t.Cleanup(func() { os.Unsetenv(k) })
+		}
+	}
+
+	cfg := Load()
+	if cfg.StripeWebhookSecret != "whsec_x" {
+		t.Errorf("StripeWebhookSecret override: got %q", cfg.StripeWebhookSecret)
+	}
+	if cfg.WeChatAPIv3Key != "12345678901234567890123456789012" {
+		t.Errorf("WeChatAPIv3Key override: got %q", cfg.WeChatAPIv3Key)
+	}
+	if cfg.AlipayPublicKeyPath != "/etc/alipay.pem" {
+		t.Errorf("AlipayPublicKeyPath override: got %q", cfg.AlipayPublicKeyPath)
+	}
+	if cfg.LemonSqueezyWebhookSecret != "lssec_x" {
+		t.Errorf("LemonSqueezyWebhookSecret override: got %q", cfg.LemonSqueezyWebhookSecret)
+	}
+	if cfg.OrderExpiryDuration != 5*time.Minute {
+		t.Errorf("OrderExpiryDuration override: got %v, want 5m", cfg.OrderExpiryDuration)
+	}
+	if cfg.SweeperInterval != 30*time.Second {
+		t.Errorf("SweeperInterval override: got %v, want 30s", cfg.SweeperInterval)
 	}
 }
 

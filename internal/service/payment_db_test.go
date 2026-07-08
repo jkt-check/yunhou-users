@@ -334,7 +334,7 @@ func TestPaymentService_Confirm_InvalidChannel(t *testing.T) {
 	uid := seedUser(t, db)
 	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
 	_, err := svc.Confirm(context.Background(), ConfirmInput{
-		OrderID: order.ID, UserID: uid, Channel: "paypal", ExternalTxnID: "x",
+		OrderID: order.ID, UserID: uid, Channel: "bogus_channel", ExternalTxnID: "x",
 	})
 	if !errors.Is(err, ErrInvalidChannel) {
 		t.Errorf("err = %v, want ErrInvalidChannel", err)
@@ -888,7 +888,7 @@ func TestPaymentService_OnWebhook_InvalidChannel(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
-		Channel: "paypal", EventID: "evt-pp", EventType: "x",
+		Channel: "bogus_channel", EventID: "evt-pp", EventType: "x",
 		RawPayload: json.RawMessage(`{}`),
 	})
 	if !errors.Is(err, ErrInvalidChannel) {

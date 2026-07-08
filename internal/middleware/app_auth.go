@@ -14,7 +14,7 @@ const ContextApp = "app"
 // service-to-service calls. v1 dropped the secret in favour of network-layer
 // isolation (apps.secret was removed in 002_simplify_plans), but v2's public
 // deploy has no VPC / IP whitelist — see deploy/nginx.conf — so we bring
-// secret auth back. See migrations/005_app_secret.sql + the integration guide
+// secret auth back. See migrations/007_app_secret.sql + the integration guide
 // §"App 接口" / §"频率限制" for context.
 func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -45,7 +45,7 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 		}
 
 		// secret_hash empty == app hasn't been backfilled yet (or row created
-		// before migration 005). Refuse to authenticate rather than fall
+		// before migration 007). Refuse to authenticate rather than fall
 		// through to the network-trust model — that is exactly the gap we
 		// are closing here.
 		if app.SecretHash == "" {

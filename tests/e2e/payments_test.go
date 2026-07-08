@@ -80,9 +80,9 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 		}
 		var cr struct {
 			Data struct {
-				PaymentID             string `json:"PaymentID"`
-				Status                string `json:"Status"`
-				ActivatedSubscription bool   `json:"ActivatedSubscription"`
+				PaymentID             string `json:"payment_id"`
+				Status                string `json:"status"`
+				ActivatedSubscription bool   `json:"activated_subscription"`
 			} `json:"data"`
 		}
 		resp.JSON(t, &cr)
@@ -176,7 +176,7 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var cr struct {
-		Data struct{ PaymentID string `json:"PaymentID"` } `json:"data"`
+		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
@@ -253,7 +253,7 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	resp = doRequest(t, srv.Engine, http.MethodPost,
 		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
 	var cr struct {
-		Data struct{ PaymentID string `json:"PaymentID"` } `json:"data"`
+		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
@@ -303,7 +303,7 @@ func TestPayments_OwnershipIsolation(t *testing.T) {
 		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var cr struct {
-		Data struct{ PaymentID string `json:"PaymentID"` } `json:"data"`
+		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
@@ -467,7 +467,7 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	resp = doRequest(t, srv.Engine, http.MethodPost,
 		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
 	var cr struct {
-		Data struct{ PaymentID string `json:"PaymentID"` } `json:"data"`
+		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID

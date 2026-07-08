@@ -469,6 +469,16 @@ func (m *MockAppRepo) List(_ context.Context) ([]model.App, error) {
 	return out, nil
 }
 
+func (m *MockAppRepo) ListUnhashed(_ context.Context) ([]model.App, error) {
+	out := make([]model.App, 0, len(m.apps))
+	for _, a := range m.apps {
+		if a.SecretHash == "" {
+			out = append(out, *a)
+		}
+	}
+	return out, nil
+}
+
 func (m *MockAppRepo) FindByID(_ context.Context, id string) (*model.App, error) {
 	a, ok := m.apps[id]
 	if !ok {
@@ -496,6 +506,18 @@ func (m *MockAppRepo) RotateSecretHash(_ context.Context, appID, newHash string)
 	return nil
 }
 
+func (m *MockAppRepo) BackfillSecretHash(_ context.Context, appID, newHash string) (bool, error) {
+	a, ok := m.apps[appID]
+	if !ok {
+		return false, errors.New("not found")
+	}
+	if a.SecretHash != "" {
+		return true, nil // mimic production guard
+	}
+	a.SecretHash = newHash
+	return false, nil
+}
+
 // --- additional auth handler tests ---
 
 func TestAuthHandler_Login_UnsupportedProvider(t *testing.T) {
@@ -520,7 +542,7 @@ func TestAuthHandler_Login_SuspendedUser(t *testing.T) {
 	h := NewAuthHandler(svc, &mockTokenSvc{})
 	r := gin.New()
 	r.POST("/auth/login", h.Login)
-	body := `{"provider":"github","provider_token":"x","app_id":"yundian"}`
+	body := `{"provider":"google","provider_token":"x","app_id":"yundian"}`
 	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -536,7 +558,7 @@ func TestAuthHandler_Login_InternalServerError(t *testing.T) {
 	h := NewAuthHandler(svc, &mockTokenSvc{})
 	r := gin.New()
 	r.POST("/auth/login", h.Login)
-	body := `{"provider":"github","provider_token":"x","app_id":"yundian"}`
+	body := `{"provider":"google","provider_token":"x","app_id":"yundian"}`
 	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

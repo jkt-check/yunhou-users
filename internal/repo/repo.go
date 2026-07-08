@@ -41,11 +41,22 @@ type AppRepo interface {
 	FindByID(ctx context.Context, id string) (*model.App, error)
 	Update(ctx context.Context, a *model.App) error
 	List(ctx context.Context) ([]model.App, error)
+	// ListUnhashed returns apps whose secret_hash is NULL or empty — used by
+	// the one-shot startup backfill so we don't load the entire apps table
+	// on every restart. After every row has been backfilled, this returns
+	// an empty slice and the backfill is a no-op.
+	ListUnhashed(ctx context.Context) ([]model.App, error)
 	// RotateSecretHash writes a freshly-generated bcrypt hash for an existing
 	// app. The plaintext never enters this layer — handler / util produces
 	// both values and hands the hash here. Returns sql.ErrNoRows if the app
 	// doesn't exist (handler maps to 404).
 	RotateSecretHash(ctx context.Context, appID, newHash string) error
+	// BackfillSecretHash is the startup-time counterpart to RotateSecretHash.
+	// It only fires when the row's secret_hash is still empty; if a manual
+	// rotate raced with the backfill, the WHERE clause matches zero rows and
+	// skipped=true so the caller can avoid logging a plaintext that doesn't
+	// reflect what's actually in the DB.
+	BackfillSecretHash(ctx context.Context, appID, newHash string) (skipped bool, err error)
 }
 
 type SubscriptionRepo interface {
@@ -259,7 +270,7 @@ func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 // appSelectColumns is the canonical SELECT list for the apps table. It must
 // stay in sync with the column order produced by migration 002_simplify_plans
 // (app_id, name, description, config, is_active, created_at, updated_at) plus
-// 005_app_secret (secret_hash) and with model.App's field order so sqlx can
+// 007_app_secret (secret_hash) and with model.App's field order so sqlx can
 // scan rows into the struct.
 //
 // COALESCE(config, '{}'::jsonb) guards against sqlx's inability to scan a
@@ -296,6 +307,19 @@ func (r *appRepo) List(ctx context.Context) ([]model.App, error) {
 	return list, err
 }
 
+// ListUnhashed returns only apps whose secret_hash is NULL or empty. The
+// migration that adds secret_hash (007_app_secret.sql) leaves it NULL for
+// pre-existing rows; this method lets the one-shot startup backfill touch
+// only those rows instead of re-reading the whole table on every restart.
+func (r *appRepo) ListUnhashed(ctx context.Context) ([]model.App, error) {
+	var list []model.App
+	err := r.db.SelectContext(ctx, &list,
+		`SELECT `+appSelectColumns+` FROM apps
+		 WHERE secret_hash IS NULL OR secret_hash = ''
+		 ORDER BY created_at`)
+	return list, err
+}
+
 func (r *appRepo) RotateSecretHash(ctx context.Context, appID, newHash string) error {
 	res, err := r.db.ExecContext(ctx,
 		`UPDATE apps SET secret_hash = $1, updated_at = now() WHERE app_id = $2`,
@@ -311,6 +335,36 @@ func (r *appRepo) RotateSecretHash(ctx context.Context, appID, newHash string) e
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// BackfillSecretHash is the one-shot startup path used by service.BackfillAppSecrets.
+// Unlike RotateSecretHash (which always overwrites — used by admin rotate),
+// this UPDATE only fires when the row's secret_hash is still empty. If a
+// manual rotate happened between ListUnhashed and this UPDATE, the WHERE
+// clause matches zero rows and we report the skip via a sentinel so the
+// caller does NOT log a plaintext that doesn't reflect what's actually in
+// the DB. Without this guard, a concurrent admin rotate would be silently
+// overwritten by the backfill and the operator's captured plaintext would
+// no longer authenticate.
+func (r *appRepo) BackfillSecretHash(ctx context.Context, appID, newHash string) (skipped bool, err error) {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE apps SET secret_hash = $1, updated_at = now()
+		 WHERE app_id = $2 AND (secret_hash IS NULL OR secret_hash = '')`,
+		newHash, appID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		// Row missing OR already hashed by a concurrent rotate. Either way
+		// we did not overwrite an existing hash — caller skips the plaintext
+		// log line and moves on.
+		return true, nil
+	}
+	return false, nil
 }
 
 // SubscriptionRepo implementation

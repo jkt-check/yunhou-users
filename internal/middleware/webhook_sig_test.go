@@ -58,6 +58,21 @@ func newTestEngine(v ChannelSignatureVerifier) *gin.Engine {
 	return engine
 }
 
+// resetPaypalVerifyCache clears the package-level verify cache before a
+// test runs. The cache is keyed on (transmissionID, transmissionTime);
+// tests share a hardcoded pair ("tid-1" / "2026-06-30T12:00:00Z"), so the
+// first test to store a result would poison every subsequent test that
+// tries to exercise the harness. Each PayPal test calls this in its setup
+// (NOT via t.Cleanup — the cache is global, so cleanup-then-rebuild has
+// the same race; clearing on entry is the only safe ordering).
+func resetPaypalVerifyCache(t *testing.T) {
+	t.Helper()
+	paypalVerifyCache.Range(func(k, _ any) bool {
+		paypalVerifyCache.Delete(k)
+		return true
+	})
+}
+
 func TestWebhookSignature_Mapping(t *testing.T) {
 	t.Parallel()
 
@@ -532,7 +547,8 @@ func paypalHeaders(transmissionID, sig string) map[string]string {
 }
 
 func TestPaypalVerifier_HappyPath(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
 		// Validate the verifier forwarded our headers + webhook_id.
 		var sent map[string]any
@@ -557,7 +573,8 @@ func TestPaypalVerifier_HappyPath(t *testing.T) {
 }
 
 func TestPaypalVerifier_FailureMapsToInvalidSignature(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"verification_status":"FAILURE"}`)
 	})
@@ -569,7 +586,8 @@ func TestPaypalVerifier_FailureMapsToInvalidSignature(t *testing.T) {
 }
 
 func TestPaypalVerifier_MalformedJSONResponseIsTransient(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `not json`)
 	})
@@ -584,7 +602,8 @@ func TestPaypalVerifier_MalformedJSONResponseIsTransient(t *testing.T) {
 }
 
 func TestPaypalVerifier_MissingHeaderIsInvalidSignature(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	v := &PaypalVerifier{
 		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
 		SandboxWebhookID: "wbh_sbx",
@@ -604,7 +623,8 @@ func TestPaypalVerifier_MissingHeaderIsInvalidSignature(t *testing.T) {
 }
 
 func TestPaypalVerifier_EnvSelectsLive(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
 		var sent map[string]any
 		_ = json.Unmarshal(h.seenBody, &sent)
@@ -620,7 +640,8 @@ func TestPaypalVerifier_EnvSelectsLive(t *testing.T) {
 }
 
 func TestPaypalVerifier_NoWebhookIDForActiveEnvIsUnsupported(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	v := &PaypalVerifier{
 		HTTPClient:     &http.Client{Timeout: 1 * time.Second},
 		SandboxAPIBase: "https://api-m.sandbox.paypal.com",
@@ -634,7 +655,8 @@ func TestPaypalVerifier_NoWebhookIDForActiveEnvIsUnsupported(t *testing.T) {
 }
 
 func TestPaypalVerifier_UnknownEnvIsUnsupported(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	v := &PaypalVerifier{
 		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
 		SandboxWebhookID: "wbh",
@@ -648,7 +670,8 @@ func TestPaypalVerifier_UnknownEnvIsUnsupported(t *testing.T) {
 }
 
 func TestPaypalVerifier_VerifyEndpoint5xxIsTransient(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal", http.StatusInternalServerError)
 	})
@@ -664,7 +687,8 @@ func TestPaypalVerifier_VerifyEndpoint5xxIsTransient(t *testing.T) {
 // returns ErrUnsupportedChannel so an operator notices via 404 instead of
 // accidentally routing sandbox events to production.
 func TestPaypalVerifier_EmptyAPIBaseReturnsUnsupported(t *testing.T) {
-	t.Parallel()
+	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
+	resetPaypalVerifyCache(t)
 	v := &PaypalVerifier{
 		HTTPClient:       &http.Client{Timeout: 1 * time.Second},
 		SandboxWebhookID: "wbh_sbx",

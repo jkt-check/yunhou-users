@@ -25,7 +25,7 @@ Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一
 
 用户在你的应用中点击登录后：
 
-1. 你的前端通过 OAuth 获取用户的 GitHub/Google access token
+1. 你的前端通过 OAuth 获取用户的 Google access token（GitHub 登录请使用 §"GitHub OAuth 授权码流程"，本接口不接受 `provider=github`）
 2. 你的后端调用 `/auth/login`，传入 provider token
 3. 系统返回 JWT access token + refresh token，以及用户的订阅信息
 
@@ -33,8 +33,8 @@ Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一
 curl -X POST https://your-yunhou-domain/auth/login \
   -H "Content-Type: application/json" \
   -d '{
-    "provider": "github",
-    "provider_token": "gho_xxxxxxxxxxxx",
+    "provider": "google",
+    "provider_token": "ya29.xxxxxxxxxxxx",
     "app_id": "yundian"
   }'
 ```

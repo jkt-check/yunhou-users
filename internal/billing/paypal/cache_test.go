@@ -2,6 +2,7 @@ package paypal
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -170,5 +171,60 @@ func TestTokenCache_GetOrFetch_DistinctKeysStayIndependent(t *testing.T) {
 	wg.Wait()
 	if got := atomic.LoadInt32(&calls); got != int32(len(keys)) {
 		t.Fatalf("fetch calls = %d, want %d (one per key)", got, len(keys))
+	}
+}
+
+// sentinelErr is the distinct error the leader fetch returns in the
+// failure-propagation test. Using a package-level sentinel lets us assert
+// errors.Is walks the chain on followers.
+var sentinelErr = errors.New("upstream paypal 503")
+
+// TestTokenCache_GetOrFetch_LeaderFailurePropagatesToFollowers verifies the
+// singleflight's failure semantics: when the leader's fetch fails, every
+// concurrent follower receives the same error (wrapped with ErrUpstreamFailed)
+// and does NOT retry. Without this, a PayPal 5xx incident under burst load
+// would re-create the thundering-herd the singleflight is designed to
+// prevent — N followers each fanning out their own retry.
+func TestTokenCache_GetOrFetch_LeaderFailurePropagatesToFollowers(t *testing.T) {
+	var calls int32
+	gate := make(chan struct{}) // releases the failing fetcher
+	fetcher := func() (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		<-gate
+		return nil, sentinelErr
+	}
+	cache := NewTokenCache(60 * time.Second)
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			_, errs[i] = cache.GetOrFetch("cid-fail", fetcher)
+		}()
+	}
+	// Let all goroutines pile up on the inflight wait before letting the
+	// fetcher return its error.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("fetch calls = %d, want 1 (followers must NOT each retry on leader error)", got)
+	}
+	for i, err := range errs {
+		if err == nil {
+			t.Errorf("goroutine %d: nil error, want wrapped sentinel", i)
+			continue
+		}
+		if !errors.Is(err, ErrUpstreamFailed) {
+			t.Errorf("goroutine %d: err = %v, want errors.Is(_, ErrUpstreamFailed)", i, err)
+		}
+		if !errors.Is(err, sentinelErr) {
+			t.Errorf("goroutine %d: err = %v, want errors.Is(_, sentinelErr) (inner must stay in the chain)", i, err)
+		}
 	}
 }

@@ -9,7 +9,7 @@ import (
 )
 
 // BackfillAppSecrets fills in secret_hash for any app row created before
-// migration 005_app_secret.sql where the column was added NULL. Idempotent —
+// migration 007_app_secret.sql where the column was added NULL. Idempotent —
 // rows that already have a non-empty hash are skipped. Returns the number of
 // rows whose hash was newly written this call.
 //
@@ -30,21 +30,32 @@ import (
 // Postgres's pgcrypt crypt() uses an incompatible format we can't verify
 // against from the auth middleware.
 func BackfillAppSecrets(ctx context.Context, appRepo repo.AppRepo) (int, error) {
-	apps, err := appRepo.List(ctx)
+	// Only touch rows that need it (added NULL by migration 007 and not yet
+	// backfilled). Once every row has a hash, this returns an empty slice
+	// and the loop is a no-op — every restart after the first one pays only
+	// the cost of the empty SELECT.
+	apps, err := appRepo.ListUnhashed(ctx)
 	if err != nil {
 		return 0, err
 	}
 	n := 0
 	for _, a := range apps {
-		if a.SecretHash != "" {
-			continue
-		}
 		plaintext, hash, err := util.GenerateSecret()
 		if err != nil {
 			return n, err
 		}
-		if err := appRepo.RotateSecretHash(ctx, a.AppID, hash); err != nil {
+		// BackfillSecretHash has a WHERE-secret_hash-empty guard so a manual
+		// rotate that lands between ListUnhashed and this UPDATE won't be
+		// silently overwritten. skipped=true means a concurrent rotate won;
+		// we do NOT log the plaintext in that case — it doesn't reflect what
+		// the DB holds, and operators capturing it would lose auth on the
+		// manual rotate.
+		skipped, err := appRepo.BackfillSecretHash(ctx, a.AppID, hash)
+		if err != nil {
 			return n, err
+		}
+		if skipped {
+			continue
 		}
 		// Plaintext surfaces here exactly once. Operators MUST scrape this
 		// from the deploy log and rotate immediately after — see caveat above.

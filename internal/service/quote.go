@@ -86,29 +86,34 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 	}, nil
 }
 
-// resolveCycle picks the first configured channel's cycle (PayPal takes
-// precedence). Falls back to plan.interval_days if billing_cycle_days is not
-// set on the chosen channel. Mirrors the logic in handler.buildPublicPlan
+// resolveCycle picks the first configured channel that has a per-plan entry
+// (PayPal takes precedence over LemonSqueezy). Falls back to
+// plan.interval_days if no channel has a matching plan entry or the chosen
+// channel lacks billing_cycle_days. Mirrors the logic in handler.buildPublicPlan
 // — keeping them in sync prevents the marketing page and the quote from
 // showing different cycle values.
 func resolveCycle(cfg model.AppConfig, planID string, planInterval int) model.CycleConfig {
 	providers := cfg.PaymentProviders
 	if providers == nil {
-		return model.CycleConfig{BillingCycleDays: planInterval, Base: "now + trial + cycle"}
+		return model.CycleConfig{BillingCycleDays: planInterval, Base: cycleBaseFormula}
 	}
 	var pc *model.LSPlanConfig // either PayPal or LS plan config; we only need cycle fields
-	switch {
-	case providers.Paypal != nil:
+	// PayPal-precedence: try PayPal first; if it doesn't have an entry for
+	// planID, fall through to LemonSqueezy. Guarding only on `providers.Paypal
+	// != nil` (the previous bug) made us skip LS whenever PayPal was
+	// configured app-wide but lacked the per-plan entry.
+	if providers.Paypal != nil {
 		if v, ok := providers.Paypal.Plans[planID]; ok {
 			pc = &model.LSPlanConfig{TrialDays: v.TrialDays, BillingCycleDays: v.BillingCycleDays}
 		}
-	case providers.Lemonsqueezy != nil:
+	}
+	if pc == nil && providers.Lemonsqueezy != nil {
 		if v, ok := providers.Lemonsqueezy.Plans[planID]; ok {
 			pc = &v
 		}
 	}
 	if pc == nil {
-		return model.CycleConfig{BillingCycleDays: planInterval, Base: "now + trial + cycle"}
+		return model.CycleConfig{BillingCycleDays: planInterval, Base: cycleBaseFormula}
 	}
 	billing := pc.BillingCycleDays
 	if billing <= 0 {
@@ -117,9 +122,14 @@ func resolveCycle(cfg model.AppConfig, planID string, planInterval int) model.Cy
 	return model.CycleConfig{
 		TrialDays:        pc.TrialDays,
 		BillingCycleDays: billing,
-		Base:             "now + trial + cycle",
+		Base:             cycleBaseFormula,
 	}
 }
+
+// cycleBaseFormula is the human-readable description of how SubExpiresAt is
+// computed. Surfaced in the Quote / PublicPlan response so callers can audit
+// the value without re-implementing the math.
+const cycleBaseFormula = "now + trial + cycle"
 
 // buildProviderData assembles the per-channel payloads BFF hands to PayPal
 // and LS to create checkout sessions. brand_name comes from

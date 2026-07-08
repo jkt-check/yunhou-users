@@ -18,9 +18,11 @@ migrate:
 	@echo "  psql -d yunhou_users -f migrations/002_simplify_plans.sql"
 	@echo "  psql -d yunhou_users -f migrations/003_payments.sql"
 	@echo "  psql -d yunhou_users -f migrations/004_ls_channel.sql"
-	@echo "  psql -d yunhou_users -f migrations/005_app_secret.sql"
+	@echo "  psql -d yunhou_users -f migrations/005_paypal_channel.sql"
+	@echo "  psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql"
+	@echo "  psql -d yunhou_users -f migrations/007_app_secret.sql"
 	@echo ""
-	@echo "After 005, run the server once so internal/service.BackfillAppSecrets"
+	@echo "After 007, run the server once so internal/service.BackfillAppSecrets"
 	@echo "populates secret_hash for existing app rows. Capture plaintexts from"
 	@echo "the deploy log and rotate each via POST /admin/apps/:id/rotate-secret."
 

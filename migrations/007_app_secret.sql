@@ -1,4 +1,4 @@
--- Migration: 005_app_secret
+-- Migration: 007_app_secret
 -- Description: 给 apps 表加 secret_hash 列；引入 X-App-Secret 内部服务鉴权。
 -- 设计文档: docs/api-integration-guide.md §"App 接口" + §"频率限制"
 --

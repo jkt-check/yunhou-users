@@ -50,6 +50,7 @@ jobs:
           sudo -u postgres psql -d yunhou_users_e2e -f migrations/004_ls_channel.sql
           sudo -u postgres psql -d yunhou_users_e2e -f migrations/005_paypal_channel.sql
           sudo -u postgres psql -d yunhou_users_e2e -f migrations/006_paypal_sub_mapping.sql
+          sudo -u postgres psql -d yunhou_users_e2e -f migrations/007_app_secret.sql
 
       # All long-running daemons (ngrok, backend) live in a single step
       # that runs to completion before the test step. This avoids the

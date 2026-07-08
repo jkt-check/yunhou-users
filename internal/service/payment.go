@@ -256,11 +256,11 @@ type ConfirmInput struct {
 
 // ConfirmResult is the response from Confirm.
 type ConfirmResult struct {
-	PaymentID             string
-	OrderID               string
-	Status                string
-	ActivatedSubscription bool
-	WasLatePayment        bool // true if order was expired and we honored
+	PaymentID             string `json:"payment_id"`
+	OrderID               string `json:"order_id"`
+	Status                string `json:"status"`
+	ActivatedSubscription bool   `json:"activated_subscription"`
+	WasLatePayment        bool   `json:"was_late_payment"` // true if order was expired and we honored
 }
 
 func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*ConfirmResult, error) {
@@ -1314,8 +1314,8 @@ func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx *sqlx.T
 		UpdatedAt:     now,
 	}
 	if _, err := tx.NamedExecContext(ctx, `
-		INSERT INTO payments (order_id, channel, external_txn_id, amount, currency, status, raw_payload)
-		VALUES (:order_id, :channel, :external_txn_id, :amount, :currency, :status, :raw_payload)
+		INSERT INTO payments (id, order_id, channel, external_txn_id, amount, currency, status, raw_payload)
+		VALUES (:id, :order_id, :channel, :external_txn_id, :amount, :currency, :status, :raw_payload)
 	`, &p); err != nil {
 		return nil, fmt.Errorf("insert pending payment: %w", err)
 	}

@@ -209,6 +209,40 @@ func TestQuote_Get_LemonSqueezyFallbackWhenPayPalMissing(t *testing.T) {
 	}
 }
 
+// TestQuote_Get_LemonSqueezyFallbackWhenPayPalLacksPlanEntry covers the
+// specific bug the resolveCycle diff closed: when PayPal is configured
+// APP-WIDE but lacks an entry for this plan, the old `switch` skipped
+// LemonSqueezy entirely and the quote fell back to plan.interval_days
+// (wrong). The fix must fall through to LS so its cycle drives
+// sub_expires_at. Without this test, a future refactor that re-introduces
+// the early-Paypal-return bug ships silently.
+func TestQuote_Get_LemonSqueezyFallbackWhenPayPalLacksPlanEntry(t *testing.T) {
+	plan := &model.Plan{ID: "monthly", Price: 29.9, IntervalDays: 30, Apps: pq.StringArray{"yundian"}, IsActive: true}
+	app := &model.App{
+		AppID: "yundian", Name: "Yundian", IsActive: true,
+		Config: mustJSONRawQuote(t, `{
+			"payment_providers": {
+				"paypal": {"plans": {"yearly": {"plan_id": "P-Y", "trial_days": 0, "billing_cycle_days": 365}}},
+				"lemonsqueezy": {"plans": {"monthly": {"variant_id": "var-M", "trial_days": 3, "billing_cycle_days": 60}}}
+			}
+		}`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.CycleConfig.TrialDays != 3 || quote.CycleConfig.BillingCycleDays != 60 {
+		t.Errorf("cycle = %+v, want LS values {3, 60} (PayPal lacks the per-plan entry; must fall through)", quote.CycleConfig)
+	}
+	wantDelta := 63 * 24 * time.Hour
+	gotDelta := time.Until(quote.SubExpiresAt)
+	if gotDelta < wantDelta-time.Hour || gotDelta > wantDelta+time.Hour {
+		t.Errorf("sub_expires_at delta = %v, want ~%v (LS fallback cycle)", gotDelta, wantDelta)
+	}
+}
+
 func TestQuote_Get_PlanNotFound(t *testing.T) {
 	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{}}, &stubQuoteAppRepo{})
 	_, err := svc.Get(context.Background(), "yundian", "missing", "u")

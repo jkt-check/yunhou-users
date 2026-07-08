@@ -61,11 +61,18 @@ on the host terminate TLS.
    # fail if 001 hasn't been applied yet. 003 adds payment/webhook tables.
    # 004 extends CHECK constraints to allow channel='lemonsqueezy' (required
    # before any LemonSqueezy webhook can be accepted — without it, the
-   # webhook_events INSERT would fail SQLSTATE 23514).
+   # webhook_events INSERT would fail SQLSTATE 23514). 005 adds the PayPal
+   # channel CHECK constraint. 006 adds subscriptions.external_subscription_id
+   # for PayPal renewal webhooks. 007 adds apps.secret_hash; after applying,
+   # start the server once so BackfillAppSecrets populates secret_hash for
+   # pre-existing rows (capture plaintexts from the deploy log and rotate).
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/001_init.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/003_payments.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/004_ls_channel.sql
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/005_paypal_channel.sql
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/006_paypal_sub_mapping.sql
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/007_app_secret.sql
    ```
 
 7. **Install Nginx config**
@@ -144,7 +151,7 @@ gunzip -c /var/backups/yunhou-users/db-20260617T030000Z.sql.gz \
 ## Domain upgrade (later)
 
 1. Buy a domain, point an A record at the VPS IP, wait for DNS to propagate.
-2. v1 uses **direct provider-token login** (consumer apps call `POST /auth/login` with `provider_token`), so there are no provider OAuth callback URLs to maintain. The server itself has no `DOMAIN` env var — the hostname is consumed only by the Nginx config (`server_name`).
+2. v1 splits login by provider: **Google** still uses direct-token login (`POST /auth/login` with `provider=google` + `provider_token`); **GitHub** uses the OAuth Authorization Code flow (`/auth/github/redirect` + `/auth/github/callback`). Callback URLs are stored per app in `apps.config.oauth_providers.github.callback_urls` (HTTPS only, except `http://localhost` / `http://127.0.0.1` / `http://[::1]` for dev). When you point a new domain at the API, you must add the corresponding `redirect_uri` to that whitelist before the BFF can issue a successful GitHub login. The server itself has no `DOMAIN` env var — the hostname is consumed only by the Nginx config (`server_name`).
 3. Edit `/etc/nginx/sites-available/yunhou-users`:
    - Replace the 80 `server` block with:
 

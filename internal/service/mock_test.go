@@ -517,6 +517,16 @@ func (m *mockAppRepo) List(_ context.Context) ([]model.App, error) {
 	return out, nil
 }
 
+func (m *mockAppRepo) ListUnhashed(_ context.Context) ([]model.App, error) {
+	out := make([]model.App, 0, len(m.apps))
+	for _, a := range m.apps {
+		if a.SecretHash == "" {
+			out = append(out, *a)
+		}
+	}
+	return out, nil
+}
+
 func (m *mockAppRepo) RotateSecretHash(_ context.Context, appID, newHash string) error {
 	a, ok := m.apps[appID]
 	if !ok {
@@ -524,6 +534,20 @@ func (m *mockAppRepo) RotateSecretHash(_ context.Context, appID, newHash string)
 	}
 	a.SecretHash = newHash
 	return nil
+}
+
+func (m *mockAppRepo) BackfillSecretHash(_ context.Context, appID, newHash string) (bool, error) {
+	a, ok := m.apps[appID]
+	if !ok {
+		return false, sql.ErrNoRows
+	}
+	if a.SecretHash != "" {
+		// Mimic the production guard: a concurrent rotate already populated
+		// the hash; skip rather than overwrite.
+		return true, nil
+	}
+	a.SecretHash = newHash
+	return false, nil
 }
 
 // --- Test RSA key pair helpers ---

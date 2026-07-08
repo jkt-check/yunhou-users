@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1169,18 +1170,19 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 	t.Run("race: duplicate-key on identity.Create falls back to winner", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, _, _, _, _ := newAuthMocks()
-		// Seed a "winner" identity that the duplicate-key path will
-		// resolve to. The mock's Create rejects with a duplicateKeyError
-		// when the identity already exists.
 		ur.users["u-winner"] = &model.User{ID: "u-winner", Status: "active"}
-		email := "race@x.com"
-		sir.identities["github:gh-race"] = &model.SocialIdentity{
-			ID: "ident-winner", UserID: "u-winner", Provider: "github",
-			ProviderUID: "gh-race", Email: &email,
+		// No pre-seeded identity. We need the mock to:
+		//   1. Return "not found" on the first FindByProviderUID
+		//      (so the function proceeds to create a new user + identity)
+		//   2. Return the identity on subsequent FindByProviderUID
+		//      (so the duplicate-key fallback finds the winner)
+		// Use a custom mock that does this.
+		identityRepo := &storeFirstIdentityRepo{
+			inner:        sir,
+			createErr:    &duplicateKeyError{},
+			winnerUserID: "u-winner",
 		}
-		sir.createErr = &duplicateKeyError{}
-		defer func() { sir.createErr = nil }()
-		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		svc := &AuthService{userRepo: ur, identityRepo: identityRepo}
 		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-race", Email: "race@x.com",
 		})
@@ -1227,6 +1229,66 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 			t.Errorf("expected wrap 'resolve user', got %q", err.Error())
 		}
 	})
+}
+
+// storeFirstIdentityRepo is a tiny wrapper around *mockSocialIdentityRepo
+// that mirrors what a real DB does on a duplicate-key INSERT: it
+// persists the row first, then raises the UNIQUE-check error. The
+// default mock's Create short-circuits on createErr and never stores —
+// which doesn't reflect production. This wrapper drives the
+// "duplicate key + winner found" branch in getOrCreateUser.
+//
+// IMPORTANT: it tracks the call count so the FIRST FindByProviderUID
+// returns "not found" (simulating "we hadn't created the row yet
+// when we checked the first time") and the SECOND FindByProviderUID
+// (in the duplicate-key fallback path) returns the winner.
+type storeFirstIdentityRepo struct {
+	inner          *mockSocialIdentityRepo
+	createErr      error
+	winnerUserID   string
+	findCallCount  int
+}
+
+func (s *storeFirstIdentityRepo) Create(ctx context.Context, si *model.SocialIdentity) error {
+	// Simulate "DB persists, then errors on UNIQUE check" — the row
+	// is visible to subsequent lookups even though Create returned an
+	// error. This is the core invariant the test relies on.
+	// We override the UserID to be the "winner" — simulating a
+	// concurrent caller that inserted first.
+	si.UserID = s.winnerUserID
+	key := si.Provider + ":" + si.ProviderUID
+	s.inner.identities[key] = si
+	if si.Email != nil {
+		s.inner.byEmail[*si.Email] = append(s.inner.byEmail[*si.Email], *si)
+	}
+	s.inner.byUserID[si.UserID] = append(s.inner.byUserID[si.UserID], *si)
+	return s.createErr
+}
+func (s *storeFirstIdentityRepo) FindByProviderUID(ctx context.Context, provider, providerUID string) (*model.SocialIdentity, error) {
+	s.findCallCount++
+	if s.findCallCount == 1 {
+		// First call: pretend the row doesn't exist yet (the caller
+		// checks before the concurrent caller inserts).
+		return nil, fmt.Errorf("not found")
+	}
+	// Second call: the row was stored by Create between the first
+	// and second FindByProviderUID calls. Return it.
+	return s.inner.FindByProviderUID(ctx, provider, providerUID)
+}
+func (s *storeFirstIdentityRepo) FindByEmail(ctx context.Context, email string) ([]model.SocialIdentity, error) {
+	return s.inner.FindByEmail(ctx, email)
+}
+func (s *storeFirstIdentityRepo) ListByUserID(ctx context.Context, userID string) ([]model.SocialIdentity, error) {
+	return s.inner.ListByUserID(ctx, userID)
+}
+func (s *storeFirstIdentityRepo) Delete(ctx context.Context, id string) error {
+	return s.inner.Delete(ctx, id)
+}
+func (s *storeFirstIdentityRepo) CountByUserID(ctx context.Context, userID string) (int, error) {
+	return s.inner.CountByUserID(ctx, userID)
+}
+func (s *storeFirstIdentityRepo) DeleteIfNotLast(ctx context.Context, id, userID string) (bool, error) {
+	return s.inner.DeleteIfNotLast(ctx, id, userID)
 }
 
 // TestAuthService_resolveOrCreateUser covers the inner resolve helper that

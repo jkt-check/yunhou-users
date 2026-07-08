@@ -90,7 +90,11 @@ func NewPaymentService(
 		refundAPI:   refundAPI,
 		orderExpiry: orderExpiry,
 		dbBeginTx: func(ctx context.Context) (dbTx, error) {
-			return db.BeginTxx(ctx, nil)
+			tx, err := db.BeginTxx(ctx, nil)
+			if err != nil {
+				return nil, err
+			}
+			return &sqlxTx{Tx: tx}, nil
 		},
 	}
 }
@@ -105,9 +109,30 @@ type dbTx interface {
 	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 	QueryRowxContext(ctx context.Context, query string, args ...interface{}) *sqlx.Row
+	// QueryRowID runs a single-row query that returns a single
+	// string column (e.g. INSERT … RETURNING id) and returns the
+	// column value. The interface wraps the QueryRowxContext + Scan
+	// dance so production code (which has a real *sqlx.Tx) and
+	// tests (which have a fake tx returning a pre-configured string)
+	// both satisfy the contract without leaking *sqlx.Row across
+	// the boundary.
+	QueryRowID(ctx context.Context, query string, args ...interface{}) (string, error)
 	NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error)
 	Commit() error
 	Rollback() error
+}
+
+// sqlxTx wraps *sqlx.Tx to implement the dbTx interface. The
+// QueryRowID method does the QueryRowxContext + Scan and returns
+// the first column as a string.
+type sqlxTx struct{ *sqlx.Tx }
+
+func (s *sqlxTx) QueryRowID(ctx context.Context, query string, args ...interface{}) (string, error) {
+	var id string
+	if err := s.QueryRowxContext(ctx, query, args...).Scan(&id); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // ============================================================================
@@ -1260,13 +1285,12 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 func insertPaymentOnTx(ctx context.Context, tx dbTx, p *model.Payment) (string, bool, error) {
 	rawPayload := repo.NonNilRawPayload(p.RawPayload)
 	var paidAt *time.Time = p.PaidAt
-	var id string
-	err := tx.QueryRowxContext(ctx, `
+	id, err := tx.QueryRowID(ctx, `
 		INSERT INTO payments (order_id, channel, external_txn_id, amount, currency, status, paid_at, raw_payload)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (channel, external_txn_id) DO NOTHING
 		RETURNING id
-	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, p.Status, paidAt, rawPayload).Scan(&id)
+	`, p.OrderID, p.Channel, p.ExternalTxnID, p.Amount, p.Currency, p.Status, paidAt, rawPayload)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil

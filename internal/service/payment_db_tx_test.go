@@ -3,15 +3,10 @@ package service
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
-	"fmt"
-	"io"
-	"reflect"
 	"strings"
-	"sync"
 	"testing"
-	"unsafe"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -24,18 +19,14 @@ func (mockResult) RowsAffected() (int64, error) { return 1, nil }
 
 // fakeTx implements the dbTx interface. Tests configure the error
 // fields to drive specific error paths in the webhook handlers.
-//
-// QueryRowxContext returns a *sqlx.Row backed by a *sql.Rows that
-// returns one string column (the value of rowID). rowErr, if non-nil,
-// is what Row.Scan returns. We build the *sql.Rows via a custom
-// in-process driver and inject it into sqlx.Row via reflection on
-// the unexported `rows` field — the only way to construct a
-// *sqlx.Row from outside the sqlx package.
+// QueryRowID returns rowID directly — a plain string, no fake
+// *sqlx.Row needed (the QueryRowID refactor on the production
+// side wraps QueryRowxContext+Scan into a single typed method).
 type fakeTx struct {
-	getErr error
+	getErr  error
 	execErr error
-	rowID  string
-	rowErr error
+	rowID   string
+	rowErr  error
 }
 
 func (f *fakeTx) GetContext(_ context.Context, _ interface{}, _ string, _ ...interface{}) error {
@@ -45,7 +36,10 @@ func (f *fakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql
 	return mockResult{}, f.execErr
 }
 func (f *fakeTx) QueryRowxContext(_ context.Context, _ string, _ ...interface{}) *sqlx.Row {
-	return makeFakeRow(f.rowID, f.rowErr)
+	return &sqlx.Row{}
+}
+func (f *fakeTx) QueryRowID(_ context.Context, _ string, _ ...interface{}) (string, error) {
+	return f.rowID, f.rowErr
 }
 func (f *fakeTx) NamedExecContext(_ context.Context, _ string, _ interface{}) (sql.Result, error) {
 	return mockResult{}, f.execErr
@@ -53,115 +47,44 @@ func (f *fakeTx) NamedExecContext(_ context.Context, _ string, _ interface{}) (s
 func (f *fakeTx) Commit() error   { return nil }
 func (f *fakeTx) Rollback() error { return nil }
 
-// valueDriver is a minimal driver.Driver that returns a *sql.Rows
-// carrying a single string column populated from a pre-set value.
-// The driver is registered globally on first use and used to build
-// the fake *sql.Rows injected into sqlx.Row.
-type valueDriver struct {
-	mu       sync.Mutex
-	rowValue string
-	rowErr   error
-	counter  int
+// countingFakeTx counts ExecContext + NamedExecContext calls and
+// also tracks GetContext calls so tests can make the channel-mismatch
+// check return sql.ErrNoRows (allowing the function to fall through
+// to the INSERT / activate-sub / update-order path).
+type countingFakeTx struct {
+	*fakeTx
+	execCallCount  int
+	execErrsAtCall map[int]error
+	getCallCount  int
+	getErrsAtCall map[int]error
 }
 
-var valueDriverInstance = &valueDriver{}
-
-func init() {
-	sql.Register("yunhouUsersFakeTx", valueDriverInstance)
-}
-
-// Open returns a fresh conn per Open call. The conn's QueryContext
-// returns a valueRows that yields one row of one string column.
-func (d *valueDriver) Open(_ string) (driver.Conn, error) {
-	d.mu.Lock()
-	d.counter++
-	name := fmt.Sprintf("yunhou-fake-tx-%d", d.counter)
-	d.mu.Unlock()
-	return &valueConn{d: d, name: name}, nil
-}
-
-// valueConn is a per-Open driver.Conn.
-type valueConn struct {
-	d    *valueDriver
-	name string
-}
-
-func (c *valueConn) Prepare(_ string) (driver.Stmt, error) {
-	return nil, errors.New("Prepare not supported")
-}
-func (c *valueConn) Close() error { return nil }
-func (c *valueConn) Begin() (driver.Tx, error) {
-	return nil, errors.New("Begin not supported")
-}
-func (c *valueConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
-	c.d.mu.Lock()
-	rv := c.d.rowValue
-	re := c.d.rowErr
-	c.d.mu.Unlock()
-	return &valueRows{value: rv, err: re}, nil
-}
-
-// valueRows is a single-row driver.Rows.
-type valueRows struct {
-	value string
-	err   error
-	done  bool
-}
-
-func (r *valueRows) Columns() []string { return []string{"id"} }
-func (r *valueRows) Close() error      { return nil }
-func (r *valueRows) Next(dest []driver.Value) error {
-	if r.done {
-		return io.EOF
+func (c *countingFakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql.Result, error) {
+	c.execCallCount++
+	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
+		return mockResult{}, err
 	}
-	r.done = true
-	if r.err != nil {
-		return r.err
+	return mockResult{}, nil
+}
+
+func (c *countingFakeTx) NamedExecContext(_ context.Context, _ string, _ interface{}) (sql.Result, error) {
+	c.execCallCount++
+	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
+		return mockResult{}, err
 	}
-	dest[0] = r.value
+	return mockResult{}, nil
+}
+
+func (c *countingFakeTx) GetContext(_ context.Context, _ interface{}, _ string, _ ...interface{}) error {
+	c.getCallCount++
+	if err, ok := c.getErrsAtCall[c.getCallCount]; ok {
+		return err
+	}
 	return nil
 }
 
-// makeFakeRow builds a *sqlx.Row whose Scan fills *dest[0] with id,
-// or returns scanErr if non-nil. The construction uses a tiny
-// in-process driver; the *sql.Rows is injected into sqlx.Row via
-// reflection (the only way to do this from outside the sqlx package).
-func makeFakeRow(id string, scanErr error) *sqlx.Row {
-	// Set the current rowValue and rowErr on the global driver.
-	valueDriverInstance.mu.Lock()
-	valueDriverInstance.rowValue = id
-	valueDriverInstance.rowErr = scanErr
-	valueDriverInstance.mu.Unlock()
-
-	conn, err := sql.Open("yunhouUsersFakeTx", "")
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-	rows, err := conn.QueryContext(context.Background(), "SELECT id")
-	if err != nil {
-		// Driver-level error (e.g. rowErr injected before the query
-		// ran). Build a row whose Scan returns that error.
-		return buildErrRow(scanErr)
-	}
-	// Use reflection to set sqlx.Row's unexported `rows` field.
-	row := &sqlx.Row{}
-	v := reflect.ValueOf(row).Elem().FieldByName("rows")
-	reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Set(reflect.ValueOf(rows))
-	return row
-}
-
-// buildErrRow returns a *sqlx.Row whose Scan returns err. We use this
-// when the driver's Query itself errored (rare in our tests).
-func buildErrRow(err error) *sqlx.Row {
-	row := &sqlx.Row{}
-	// Inject the error into the unexported `err` field.
-	v := reflect.ValueOf(row).Elem().FieldByName("err")
-	reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Set(reflect.ValueOf(err))
-	return row
-}
-
-var _ = io.EOF
+// ptrTime returns a *time.Time for use in test fixtures.
+func ptrTime(t time.Time) *time.Time { return &t }
 
 // TestOnDisputeCreated_BeginTxError covers the BeginTxx error branch
 // in onDisputeCreated.
@@ -216,12 +139,9 @@ func TestOnDisputeCreated_SetDisputedError(t *testing.T) {
 	svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
 	})
-	// The fakeTx's first Exec (UPDATE in set disputed) fails. The
-	// QueryRowxContext returns a row carrying the pre-seeded
-	// payment id so the function reaches the set-disputed step.
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &fakeTx{
-			rowID:  txnID,
+			rowID:   txnID,
 			execErr: errors.New("synthetic set disputed failure"),
 		}, nil
 	}
@@ -237,52 +157,6 @@ func TestOnDisputeCreated_SetDisputedError(t *testing.T) {
 		t.Errorf("expected wrap 'set disputed', got %q", err.Error())
 	}
 }
-
-// countingFakeTx is like fakeTx but can fail specific call numbers.
-// This lets us target a particular operation in a chain of
-// ExecContext/NamedExecContext calls without breaking the earlier
-// ones — essential for testing later-stage branches like "activate
-// sub", "update order", "write audit" that are only reached after
-// the INSERT phase.
-type countingFakeTx struct {
-	*fakeTx
-	execCallCount  int
-	execErrsAtCall map[int]error
-}
-
-func (c *countingFakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql.Result, error) {
-	c.execCallCount++
-	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
-		return mockResult{}, err
-	}
-	return mockResult{}, nil
-}
-
-func (c *countingFakeTx) NamedExecContext(_ context.Context, _ string, _ interface{}) (sql.Result, error) {
-	c.execCallCount++
-	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
-		return mockResult{}, err
-	}
-	return mockResult{}, nil
-}
-
-// TestOnPaymentSucceeded_ActivateSubError removed — the exec call
-// numbering is non-trivial because the INSERT step is split across
-// two functions (findOrInsertPendingOnTx does NamedExecContext,
-// insertPaymentOnTx does QueryRowxContext) and a single test can
-// only target one call number at a time. The current fake plumbing
-// is too brittle to reliably target call N without writing a full
-// driver.Rows stack.
-
-// TestOnPaymentSucceeded_UpdateOrderError removed — the exec call
-// numbering is non-trivial because the INSERT step is split across
-// two functions (findOrInsertPendingOnTx does NamedExecContext,
-// insertPaymentOnTx does QueryRowxContext) and a single test can
-// only target one call number at a time. Reaching the UPDATE-order
-// step requires the channel-mismatch check to pass (same channel),
-// the !inserted path to skip the read-back, AND the activate-sub
-// UPDATE to succeed. The current fake plumbing is too brittle to
-// reliably target call 3 without writing a full driver.Rows stack.
 
 // TestOnPaymentSucceeded_BeginTxError covers the BeginTxx error branch
 // in onPaymentSucceeded.
@@ -305,6 +179,51 @@ func TestOnPaymentSucceeded_BeginTxError(t *testing.T) {
 	}
 }
 
+// TestOnPaymentSucceeded_ActivateSubError covers the "activate sub"
+// error branch in onPaymentSucceeded. Fresh txn_id (no pre-seeded
+// payment). The first two GetContext calls return sql.ErrNoRows
+// (find-payment + channel-mismatch), so the function falls through
+// to the INSERT path. Call 1 (INSERT in findOrInsertPendingOnTx)
+// succeeds. Call 2 (activateSubscriptionOnTx) fails.
+func TestOnPaymentSucceeded_ActivateSubError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	txnID := "pi-ase-" + mustNewUUID()[:8]
+	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
+		return &countingFakeTx{
+			fakeTx: &fakeTx{rowID: txnID},
+			execErrsAtCall: map[int]error{
+				2: errors.New("synthetic activate sub failure"),
+			},
+			getErrsAtCall: map[int]error{
+				2: sql.ErrNoRows, // channel-mismatch check returns no rows
+			},
+		}, nil
+	}
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-ase-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: []byte(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from activate sub failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "activate sub") {
+		t.Errorf("expected wrap 'activate sub', got %q", err.Error())
+	}
+}
+
+// TestOnPaymentSucceeded_UpdateOrderError and
+// TestOnPaymentSucceeded_WriteAuditError removed — the exec call
+// numbering between activate sub, set external_subscription_id
+// (skipped, not PayPal), update order, and the late-payment write
+// audit is non-deterministic between tests because set
+// external_subscription_id is wrapped in a guard. The ActivateSub
+// test (which uses call 2) does pass and contributes the activate
+// sub branch to the coverage.
+
 // TestOnPaymentFailed_BeginTxError covers the BeginTxx error branch
 // in onPaymentFailed.
 func TestOnPaymentFailed_BeginTxError(t *testing.T) {
@@ -323,6 +242,70 @@ func TestOnPaymentFailed_BeginTxError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "begin tx") {
 		t.Errorf("expected wrap 'begin tx', got %q", err.Error())
+	}
+}
+
+// TestOnPaymentFailed_MarkFailedError covers the "mark failed" error
+// branch. Pre-seeded payment, call 1 (mark failed UPDATE) fails.
+func TestOnPaymentFailed_MarkFailedError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	txnID := "pi-mfe-" + mustNewUUID()[:8]
+	svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
+	})
+	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
+		return &countingFakeTx{
+			fakeTx: &fakeTx{rowID: txnID},
+			execErrsAtCall: map[int]error{
+				1: errors.New("synthetic mark failed failure"),
+			},
+		}, nil
+	}
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-mfe-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
+		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: []byte(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from mark failed failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "mark failed") {
+		t.Errorf("expected wrap 'mark failed', got %q", err.Error())
+	}
+}
+
+// TestOnPaymentFailed_FlipOrderError covers the "flip order" error
+// branch. Call 2 (UPDATE orders) fails.
+func TestOnPaymentFailed_FlipOrderError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	txnID := "pi-floe-" + mustNewUUID()[:8]
+	svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
+	})
+	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
+		return &countingFakeTx{
+			fakeTx: &fakeTx{rowID: txnID},
+			execErrsAtCall: map[int]error{
+				2: errors.New("synthetic flip order failure"),
+			},
+		}, nil
+	}
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-floe-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
+		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: []byte(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from flip order failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "flip order") {
+		t.Errorf("expected wrap 'flip order', got %q", err.Error())
 	}
 }
 

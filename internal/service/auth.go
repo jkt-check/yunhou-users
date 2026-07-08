@@ -22,9 +22,14 @@ func GenerateUUID() string {
 	return uuid.New().String()
 }
 
+// refreshTokenReader is a package-level indirection for rand.Read.
+// Tests can override it (via refreshTokenReader = failingReader) to
+// drive the error path without touching the system entropy source.
+var refreshTokenReader = rand.Read
+
 func GenerateRefreshToken() (string, error) {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := refreshTokenReader(b); err != nil {
 		return "", fmt.Errorf("generate refresh token: %w", err)
 	}
 	return hex.EncodeToString(b), nil

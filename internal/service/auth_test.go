@@ -420,6 +420,25 @@ func TestGenerateRefreshToken_Unique(t *testing.T) {
 	}
 }
 
+// TestGenerateRefreshToken_RandReadError covers the rand.Read error
+// path in GenerateRefreshToken. The production code goes through a
+// package-level indirection (refreshTokenReader) so tests can
+// inject a failing reader without touching system entropy.
+func TestGenerateRefreshToken_RandReadError(t *testing.T) {
+	orig := refreshTokenReader
+	defer func() { refreshTokenReader = orig }()
+	refreshTokenReader = func([]byte) (int, error) {
+		return 0, errors.New("synthetic rand.Read failure")
+	}
+	_, err := GenerateRefreshToken()
+	if err == nil {
+		t.Fatal("expected error from failing reader, got nil")
+	}
+	if !strings.Contains(err.Error(), "generate refresh token") {
+		t.Errorf("expected wrap 'generate refresh token', got %q", err.Error())
+	}
+}
+
 // TestAuthService_RefreshToken_RarePaths fills in branches the table-driven
 // TestAuthService_RefreshToken doesn't reach: deleted user, missing user
 // row, appID fallback to session.AppID, ErrAppNotFound, ErrAppInactive,

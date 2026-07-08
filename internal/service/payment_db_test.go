@@ -1340,6 +1340,34 @@ func TestPaymentService_OnWebhook_Refund_MissingPayment(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnWebhook_Refund_ZeroAmount covers the
+// "insert refund" error path in onRefundSucceeded. The refunds table
+// has CHECK (amount > 0); a RefundAmount of 0 violates this and
+// the INSERT fails with a check_violation error. The handler must
+// surface the wrapped error.
+func TestPaymentService_OnWebhook_Refund_ZeroAmount(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	res, _ := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-rf-zero",
+	})
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-rf-zero-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-rf-zero", RefundAmount: 0, ExternalRefundID: "re_zero",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from zero-amount refund insert, got nil")
+	}
+	if !strings.Contains(err.Error(), "insert refund") {
+		t.Errorf("expected wrap 'insert refund', got %q", err.Error())
+	}
+	_ = res // silence unused
+}
+
 // TestPaymentService_OnWebhook_PaymentFailed_TerminalState covers the
 // "n == 0" branch in onPaymentFailed: a payment_failed arrives for a
 // payment that's already in a terminal state (e.g. 'failed'). The SQL

@@ -444,6 +444,30 @@ func TestPaymentService_Confirm_ExistingFailedPayment(t *testing.T) {
 // Refund
 // ============================================================================
 
+// TestPaymentService_Refund_NotOwner covers the "user doesn't own the
+// payment" branch in Refund — the function returns ErrPaymentNotFound
+// to hide existence from non-owners (consistent with GetPayment).
+func TestPaymentService_Refund_NotOwner(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	ownerID := seedUser(t, db)
+	otherID := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), ownerID, "monthly")
+	res, _ := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: ownerID, Channel: "stripe", ExternalTxnID: "pi-other-owner",
+	})
+	// otherID tries to refund owner's payment — must be denied.
+	_, err := svc.Refund(context.Background(), RefundInput{
+		PaymentID:      res.PaymentID,
+		UserID:         otherID,
+		IdempotencyKey: "k-other-owner-" + mustNewUUID()[:8],
+		Amount:         10,
+	})
+	if !errors.Is(err, ErrPaymentNotFound) {
+		t.Errorf("err = %v, want ErrPaymentNotFound", err)
+	}
+}
+
 func TestPaymentService_Refund_Success(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)

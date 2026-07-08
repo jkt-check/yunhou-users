@@ -832,6 +832,150 @@ func newAuthMocks() (*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *moc
 // paths in the shared token-issuance tail. The function is private but
 // reachable through LoginWithProfile / TestLogin / RefreshToken — these
 // tests focus on branches those callers do not directly hit.
+
+// TestAuthService_TestLogin_RarePaths fills in branches the table-driven
+// TestLogin doesn't reach: identityRepo.FindByEmail generic error,
+// userRepo.FindByID error on existing identity, userRepo.Create error
+// on the new-user path, identityRepo.Create error, and the "deleted
+// user" account-status guard.
+func TestAuthService_TestLogin_RarePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("FindByEmail generic error", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		sir.findByEmailErr = errors.New("db down")
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), newMockSubscriptionRepo())
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), newMockSubscriptionRepo(), newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.TestLogin(ctx, TestLoginRequest{Email: "x@y.com", AppID: "yundian"})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "find identity") {
+			t.Errorf("expected wrap 'find identity', got %q", err.Error())
+		}
+	})
+
+	t.Run("userRepo.FindByID error on existing identity", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		email := "found@x.com"
+		sir.byEmail[email] = []model.SocialIdentity{
+			{ID: "ident-x", UserID: "u-missing", Provider: "github", ProviderUID: "gh-x", Email: &email},
+		}
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), newMockSubscriptionRepo())
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), newMockSubscriptionRepo(), newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.TestLogin(ctx, TestLoginRequest{Email: email, AppID: "yundian"})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "find user") {
+			t.Errorf("expected wrap 'find user', got %q", err.Error())
+		}
+	})
+
+	t.Run("userRepo.Create error on new user", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		ur.err = errors.New("db down on create")
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), newMockSubscriptionRepo())
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), newMockSubscriptionRepo(), newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.TestLogin(ctx, TestLoginRequest{Email: "fresh@x.com", AppID: "yundian"})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "create user") {
+			t.Errorf("expected wrap 'create user', got %q", err.Error())
+		}
+	})
+
+	t.Run("identityRepo.Create error", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		sir.createErr = errors.New("db down on identity create")
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), newMockSubscriptionRepo())
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), newMockSubscriptionRepo(), newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.TestLogin(ctx, TestLoginRequest{Email: "fresh2@x.com", AppID: "yundian"})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "create identity") {
+			t.Errorf("expected wrap 'create identity', got %q", err.Error())
+		}
+	})
+
+	t.Run("deleted user is rejected", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		email := "del@x.com"
+		ur.users["u-deleted"] = &model.User{ID: "u-deleted", Status: "deleted"}
+		sir.identities["github:gh-del"] = &model.SocialIdentity{
+			ID: "ident-del", UserID: "u-deleted", Provider: "github", ProviderUID: "gh-del", Email: &email,
+		}
+		sir.byEmail[email] = []model.SocialIdentity{
+			{ID: "ident-del", UserID: "u-deleted", Provider: "github", ProviderUID: "gh-del", Email: &email},
+		}
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), newMockSubscriptionRepo())
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), newMockSubscriptionRepo(), newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.TestLogin(ctx, TestLoginRequest{Email: email, AppID: "yundian"})
+		if !errors.Is(err, ErrUserDeleted) {
+			t.Errorf("expected ErrUserDeleted, got %v", err)
+		}
+	})
+}
+
+// TestAuthService_LoginWithProfile_RarePaths fills in branches the
+// table-driven LoginWithProfile test doesn't reach: appRepo.FindByID
+// generic error, getOrCreateUser error, ErrUserDeleted, and
+// findUsableSubscription error.
+func TestAuthService_LoginWithProfile_RarePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("appRepo.FindByID generic error", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, ar := newAuthMocks()
+		ar.findErr = errors.New("db down on app lookup")
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), newMockSubscriptionRepo())
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), newMockSubscriptionRepo(), newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.LoginWithProfile(ctx, LoginWithProfileRequest{
+			Profile: &ProviderUserInfo{Provider: "github", ProviderUID: "gh-1", Email: "x@y.com"},
+			AppID:   "yundian",
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "find app") {
+			t.Errorf("expected wrap 'find app', got %q", err.Error())
+		}
+	})
+
+	t.Run("deleted user is rejected", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		ur.users["u-deleted"] = &model.User{ID: "u-deleted", Status: "deleted"}
+		sir.identities["github:gh-del"] = &model.SocialIdentity{
+			ID: "ident-del", UserID: "u-deleted", Provider: "github", ProviderUID: "gh-del",
+		}
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), newMockSubscriptionRepo())
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), newMockSubscriptionRepo(), newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.LoginWithProfile(ctx, LoginWithProfileRequest{
+			Profile: &ProviderUserInfo{Provider: "github", ProviderUID: "gh-del", Email: "del@x.com"},
+			AppID:   "yundian",
+		})
+		if !errors.Is(err, ErrUserDeleted) {
+			t.Errorf("expected ErrUserDeleted, got %v", err)
+		}
+	})
+}
+
 func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

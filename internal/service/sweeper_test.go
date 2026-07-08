@@ -192,6 +192,25 @@ func TestOrderSweeper_TickViaStart(t *testing.T) {
 	}
 }
 
+// TestOrderSweeper_TickerFires covers the "ticker.C" branch of run().
+// Uses a very short interval so the second tick fires before Stop
+// is called.
+func TestOrderSweeper_TickerFires(t *testing.T) {
+	t.Parallel()
+	repo := &mockOrderRepo{}
+	s := NewOrderSweeper(repo, 30*time.Millisecond)
+	s.Start(context.Background())
+	// Wait for initial tick + at least one ticker-driven tick.
+	time.Sleep(100 * time.Millisecond)
+	s.Stop()
+
+	// We expect at least 2 calls: the initial one + at least one from
+	// the ticker. Use a generous lower bound for CI flakiness.
+	if got := repo.callCount.Load(); got < 2 {
+		t.Errorf("expected >= 2 sweep calls (initial + ticker), got %d", got)
+	}
+}
+
 // TestOrderSweeper_TickLogsFlippedCount exercises the n > 0 branch of tick
 // (the "flipped N pending orders to expired" log line). Drives Start+Stop
 // with a mock that returns a non-zero count; the assertion is the same

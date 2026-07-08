@@ -411,6 +411,35 @@ func TestPaymentService_Confirm_Idempotent(t *testing.T) {
 	}
 }
 
+// TestPaymentService_Confirm_ExistingFailedPayment covers the
+// "existing payment is in 'failed' state" branch in Confirm. The
+// dedup hit returns a payment row but it's in a terminal state —
+// Confirm must refuse with ErrOrderAlreadyTerminal.
+func TestPaymentService_Confirm_ExistingFailedPayment(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	// Pre-insert a payment row in 'failed' state for the same
+	// (channel, external_txn_id) the Confirm is about to use. This
+	// drives the "dedupe hit + status=failed" branch in Confirm.
+	txnID := "pi-failed-confirm-" + mustNewUUID()[:8]
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO payments (id, order_id, channel, external_txn_id, amount, currency, status, raw_payload)
+		VALUES ($1, $2, 'stripe', $3, 29.9, 'CNY', 'failed', '{}')
+	`, mustNewUUID(), order.ID, txnID); err != nil {
+		t.Fatalf("seed failed payment: %v", err)
+	}
+
+	_, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
+	})
+	if !errors.Is(err, ErrOrderAlreadyTerminal) {
+		t.Errorf("err = %v, want ErrOrderAlreadyTerminal", err)
+	}
+}
+
 // ============================================================================
 // Refund
 // ============================================================================

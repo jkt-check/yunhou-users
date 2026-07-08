@@ -982,6 +982,29 @@ func TestPaymentService_OnWebhook_PaymentFailed_InsertPending(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnPaymentSucceeded_ClosedDBError covers an
+// error-from-closed-db branch in the OnWebhook call chain. After
+// the DB is closed, any subsequent call returns an error — the test
+// just asserts the error is non-nil.
+func TestPaymentService_OnPaymentSucceeded_ClosedDBError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	// Close the DB to force the call chain to fail.
+	_ = db.Close()
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-closed-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-closed-" + mustNewUUID()[:8], OrderID: order.ID,
+		Amount: 29.9, Currency: "CNY", RawPayload: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from closed db, got nil")
+	}
+}
+
 // TestPaymentService_OnWebhook_ChannelMismatch covers the "webhook arrives
 // for a different channel than the one that already paid" path. The handler
 // must NOT touch the existing paid payment, must NOT insert a second paid

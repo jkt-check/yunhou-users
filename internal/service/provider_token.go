@@ -39,7 +39,7 @@ var (
 )
 
 // Get returns the token/credential for (appID, channel). Channel must be
-// "paypal" or "lemonsqueezy"; other values return ErrUnsupportedChannel.
+// "paypal"; other values return ErrUnsupportedChannel.
 func (s *ProviderTokenService) Get(ctx context.Context, appID, channel string) (*model.ProviderToken, error) {
 	app, err := s.apps.FindByID(ctx, appID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -57,21 +57,12 @@ func (s *ProviderTokenService) Get(ctx context.Context, appID, channel string) (
 			return nil, fmt.Errorf("decode app config: %w", err)
 		}
 	}
-	switch channel {
-	case "paypal":
-		if cfg.PaymentProviders == nil || cfg.PaymentProviders.Paypal == nil {
-			return nil, ErrProviderNotConfigured
-		}
-		p := cfg.PaymentProviders.Paypal
-		return s.paypal.FetchToken(ctx, p.ClientID, p.ClientSecret)
-	case "lemonsqueezy":
-		if cfg.PaymentProviders == nil || cfg.PaymentProviders.Lemonsqueezy == nil {
-			return nil, ErrProviderNotConfigured
-		}
-		// LS is webhook-only in Yunhou — no outbound HTTP, just return the
-		// static api_key stored in apps.config.
-		return &model.ProviderToken{Channel: "lemonsqueezy", APIKey: cfg.PaymentProviders.Lemonsqueezy.APIKey}, nil
-	default:
+	if channel != "paypal" {
 		return nil, ErrUnsupportedChannel
 	}
+	if cfg.PaymentProviders == nil || cfg.PaymentProviders.Paypal == nil {
+		return nil, ErrProviderNotConfigured
+	}
+	p := cfg.PaymentProviders.Paypal
+	return s.paypal.FetchToken(ctx, p.ClientID, p.ClientSecret)
 }

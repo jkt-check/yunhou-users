@@ -208,7 +208,7 @@ Consumer app frontend                yunhou-users                  Provider (Git
 ```
 
 ### Auto-merge on same email
-When a new social login returns an email that matches an existing User's SocialIdentity, bind to that User instead of creating a new one. (WeChat mentioned here is a hypothetical future login provider; v1 only supports `github` and `google`.)
+When a new social login returns an email that matches an existing User's SocialIdentity, bind to that User instead of creating a new one. (WeChat mentioned here is a hypothetical future login provider; v1 only supports `github`.)
 
 ### Token details
 - **access_token**: JWT, RSA256 signed, 15min TTL. Payload: `sub` (user_id), `iss` (`"yunhou-users"`), `aud` (array containing `app_id`), `app_id`, `scope` (array of plan apps), `iat`, `exp`.

@@ -43,9 +43,8 @@ import (
 // Defined as constants so the matching helpers (signStripe, signWeChat) can
 // produce real signatures the verifier will accept.
 const (
-	e2eStripeSecret       = "whsec_e2e_test_secret"
-	e2eWeChatKey          = "01234567890123456789012345678901" // 32 bytes
-	e2eLemonSqueezySecret = "ls_e2e_test_secret"
+	e2eStripeSecret = "whsec_e2e_test_secret"
+	e2eWeChatKey    = "01234567890123456789012345678901" // 32 bytes
 	// Alipay uses RSA2 with a real key pair; generated in setupE2EServerWithVerifier.
 )
 
@@ -176,12 +175,6 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	t.Helper()
 
-	// Short-circuit real OAuth provider HTTP calls — e2e drives login with
-	// arbitrary provider_token strings that need stable, deterministic UIDs
-	// rather than real GitHub user IDs.
-	restoreVerifier := service.SetProviderVerifier(stubE2EProviderVerifier)
-	t.Cleanup(restoreVerifier)
-
 	db := connectDB(t)
 	t.Cleanup(func() { db.Close() })
 	cleanupDB(t, db)
@@ -243,9 +236,9 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 	// providerTokenSvc is wired with nil paypal fetcher; the e2e tests for
-	// /provider-token in provider_token_test.go only exercise the lemonsqueezy
-	// path which doesn't touch the paypal fetcher. Adding paypal e2e later
-	// requires wiring a stub upstream.
+	// /provider-token in provider_token_test.go don't currently exercise the
+	// paypal upstream path. Adding paypal e2e later requires wiring a stub
+	// upstream.
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
@@ -338,34 +331,6 @@ func extractQuery(t *testing.T, rawURL, key string) string {
 	return u.Query().Get(key)
 }
 
-// stubE2EProviderVerifier mirrors the legacy in-process provider stub: the
-// provider_token doubles as a stable user identifier so e2e tests can drive
-// login flows without standing up a fake GitHub/Google HTTP server.
-//
-// Unknown providers return the sentinel ErrUnsupportedProvider so the
-// auth handler's error mapping kicks in (and TestUnsupportedProvider sees
-// the expected 400). Returning a plain error here would surface as 500.
-func stubE2EProviderVerifier(_ context.Context, provider, token string) (*service.ProviderUserInfo, error) {
-	switch provider {
-	case "github":
-		return &service.ProviderUserInfo{
-			Provider:    "github",
-			ProviderUID: "github_" + token,
-			Email:       fmt.Sprintf("%s@github.test", token),
-			Nickname:    "GitHub " + token,
-		}, nil
-	case "google":
-		return &service.ProviderUserInfo{
-			Provider:    "google",
-			ProviderUID: "google_" + token,
-			Email:       fmt.Sprintf("%s@google.test", token),
-			Nickname:    "Google " + token,
-		}, nil
-	default:
-		return nil, fmt.Errorf("%w: %s", service.ErrUnsupportedProvider, provider)
-	}
-}
-
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -385,8 +350,6 @@ type E2EServer struct {
 	// AlipayPublicKey is exposed so tests can verify they emit only
 	// payloads whose signature the verifier would accept.
 	AlipayPublicPEM []byte
-	// LemonSqueezySecret is the shared HMAC secret for signing test bodies.
-	LemonSqueezySecret string
 }
 
 // setupE2EServerWithVerifier returns a server wired with real signature
@@ -394,9 +357,6 @@ type E2EServer struct {
 // payloads. Alipay's key pair is generated in-memory per test.
 func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	t.Helper()
-
-	restoreVerifier := service.SetProviderVerifier(stubE2EProviderVerifier)
-	t.Cleanup(restoreVerifier)
 
 	db := connectDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -468,8 +428,7 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	mv := &middleware.MultiChannelVerifier{
 		Stripe:       &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
 		WeChat:       &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey)},
-		Alipay:       &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
-		LemonSqueezy: &middleware.LemonsqueezyVerifier{Secret: []byte(e2eLemonSqueezySecret)},
+		Alipay: &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
 		Paypal: &middleware.PaypalVerifier{
 			HTTPClient:       &http.Client{Timeout: 2 * time.Second},
 			SandboxWebhookID: cfg.PaypalWebhookIDSandbox,
@@ -498,12 +457,11 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	alipayPrivHolder.Store(alipayPriv)
 
 	return &E2EServer{
-		Engine:             engine,
-		DB:                 db,
-		StripeSecret:       e2eStripeSecret,
-		WeChatKey:          []byte(e2eWeChatKey),
-		AlipayPublicPEM:    alipayPubPEM,
-		LemonSqueezySecret: e2eLemonSqueezySecret,
+		Engine:          engine,
+		DB:              db,
+		StripeSecret:    e2eStripeSecret,
+		WeChatKey:       []byte(e2eWeChatKey),
+		AlipayPublicPEM: alipayPubPEM,
 	}
 }
 

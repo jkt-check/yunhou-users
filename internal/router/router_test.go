@@ -236,7 +236,6 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 	want := []string{
 		"GET:/healthz",
 		"GET:/.well-known/jwks.json",
-		"POST:/auth/login",
 		"POST:/auth/refresh",
 		"POST:/auth/logout",
 		"GET:/user/profile",

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -104,8 +103,6 @@ func (h *WebhookHandler) parseEvent(channel string, raw []byte) (*service.Webhoo
 		return h.parseWeChat(raw)
 	case "alipay":
 		return h.parseAlipay(raw)
-	case "lemonsqueezy":
-		return h.parseLemonsqueezy(raw)
 	case "paypal":
 		return h.parsePaypal(raw)
 	default:
@@ -333,97 +330,7 @@ func isAlipayRefundEvent(notifyType string) bool {
 	return notifyType == "trade_closed"
 }
 
-// parseLemonsqueezy extracts fields from a LemonSqueezy JSON:API webhook.
-//
-// LS payloads carry no top-level unique event ID, so we synthesize one as
-// `<event_name>:<data.id>`. For subscription-invoice events (refunds, payment
-// success/failed) the resource is the invoice itself — `data.id` is the
-// invoice ID, not the subscription ID. Two distinct renewal invoices on the
-// same subscription thus dedupe independently, which is what we want.
-//
-//	{
-//	  "meta": { "event_name": "order_created", "custom_data": { "order_id": "<uuid>", "sub_expires_at": "..." } },
-//	  "data": { "type": "orders|subscriptions|subscription-invoices", "id": "1", "attributes": { "total": 2990, "currency": "usd", ... } }
-//	}
-//
-// custom_data is ABSENT on subscription-invoice events (per LS docs). For
-// those, the refund path looks up the payment by (channel, external_txn_id),
-// which we set to data.attributes.subscription_id (matches the originating
-// subscription_created payment row).
-func (h *WebhookHandler) parseLemonsqueezy(raw []byte) (*service.WebhookEvent, error) {
-	var evt struct {
-		Meta struct {
-			EventName  string                 `json:"event_name"`
-			CustomData map[string]interface{} `json:"custom_data"`
-		} `json:"meta"`
-		Data struct {
-			Type       string `json:"type"`
-			ID         string `json:"id"`
-			Attributes struct {
-				Total          json.Number `json:"total"`
-				RefundedAmount json.Number `json:"refunded_amount"`
-				Currency       string      `json:"currency"`
-				SubscriptionID string      `json:"subscription_id"`
-			} `json:"attributes"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &evt); err != nil {
-		return nil, fmt.Errorf("lemonsqueezy body: %w", err)
-	}
-	if evt.Meta.EventName == "" || evt.Data.ID == "" {
-		return nil, fmt.Errorf("lemonsqueezy missing meta.event_name or data.id")
-	}
-
-	we := &service.WebhookEvent{
-		Channel:   "lemonsqueezy",
-		EventID:   evt.Meta.EventName + ":" + evt.Data.ID,
-		EventType: evt.Meta.EventName,
-	}
-
-	// external_txn_id mapping — invoice events use the parent subscription id
-	// (so the refund's lookup matches the originating subscription_created
-	// payment row); order/subscription events use the resource's own id.
-	if evt.Data.Type == "subscription-invoices" && evt.Data.Attributes.SubscriptionID != "" {
-		we.TransactionID = evt.Data.Attributes.SubscriptionID
-	} else {
-		we.TransactionID = evt.Data.ID
-	}
-
-	// custom_data absent on subscription-invoice events; that's fine.
-	if cd := evt.Meta.CustomData; cd != nil {
-		if v, ok := cd["order_id"].(string); ok {
-			we.OrderID = v
-		}
-		if v, ok := cd["sub_expires_at"].(string); ok {
-			if t, err := time.Parse(time.RFC3339, v); err == nil {
-				we.SubExpiresAt = &t
-			}
-		}
-	}
-
-	// LS amounts may be decimal cents (e.g. 1499.985). json.Number preserves
-	// precision; Round to 2dp before converting to float64 major units.
-	if evt.Data.Attributes.Total != "" {
-		if cents, err := evt.Data.Attributes.Total.Float64(); err == nil {
-			we.Amount = math.Round(cents) / 100
-		}
-	}
-	if evt.Data.Attributes.RefundedAmount != "" {
-		if cents, err := evt.Data.Attributes.RefundedAmount.Float64(); err == nil {
-			we.RefundAmount = math.Round(cents) / 100
-		}
-	}
-	we.Currency = strings.ToUpper(evt.Data.Attributes.Currency)
-
-	if isLSRefundEvent(evt.Meta.EventName) {
-		we.ExternalRefundID = "ls-" + evt.Data.ID
-	}
-	return we, nil
-}
-
-func isLSRefundEvent(eventName string) bool {
-	return eventName == "order_refunded" || eventName == "subscription_payment_refunded"
-}
+// parsePaypal — kept below
 
 // parsePaypal extracts fields from a PayPal webhook. PayPal's webhook event
 // shape is:

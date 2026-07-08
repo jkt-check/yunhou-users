@@ -26,8 +26,6 @@ type Config struct {
 	// in the env so operators can pre-provision credentials.
 	GitHubClientID     string
 	GitHubClientSecret string
-	GoogleClientID     string
-	GoogleClientSecret string
 
 	JWTAccessTTL  time.Duration
 	JWTRefreshTTL time.Duration
@@ -36,10 +34,9 @@ type Config struct {
 	// at startup — if a channel's secret is empty, webhooks for that channel
 	// return 404 (signature verifier is nil for that channel). Operators
 	// who don't accept a particular channel can leave its secret blank.
-	StripeWebhookSecret       string
-	WeChatAPIv3Key            string // 32 bytes, used for both signature + AES-GCM resource decrypt
-	AlipayPublicKeyPath       string
-	LemonSqueezyWebhookSecret string
+	StripeWebhookSecret string
+	WeChatAPIv3Key      string // 32 bytes, used for both signature + AES-GCM resource decrypt
+	AlipayPublicKeyPath string
 
 	// PayPal sandbox + live both loaded; PaypalEnv selects which is active.
 	// Empty webhook ID for the active env → channel returns 404 for that env.
@@ -68,16 +65,13 @@ func Load() *Config {
 		OAuthStateSecret:   os.Getenv("OAUTH_STATE_SECRET"),
 		GitHubClientID:     os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
-		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
-		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 
 		JWTAccessTTL:  parseDurationOr(envOr("JWT_ACCESS_TTL", "15m"), 15*time.Minute),
 		JWTRefreshTTL: parseDurationOr(envOr("JWT_REFRESH_TTL", "168h"), 168*time.Hour),
 
-		StripeWebhookSecret:       os.Getenv("STRIPE_WEBHOOK_SECRET"),
-		WeChatAPIv3Key:            os.Getenv("WECHAT_PAY_API_V3_KEY"),
-		AlipayPublicKeyPath:       os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
-		LemonSqueezyWebhookSecret: os.Getenv("LEMONSQUEEZY_WEBHOOK_SECRET"),
+		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
+		WeChatAPIv3Key:      os.Getenv("WECHAT_PAY_API_V3_KEY"),
+		AlipayPublicKeyPath: os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
 
 		PaypalEnv:              envOr("PAYPAL_ENV", "live"),
 		PaypalWebhookIDSandbox: os.Getenv("PAYPAL_WEBHOOK_ID_SANDBOX"),

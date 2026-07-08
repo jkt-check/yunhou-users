@@ -4,7 +4,7 @@ A shared user management API for multi-app ecosystems. One user identity across 
 
 ## Features
 
-- **Social OAuth** — Google (provider token sent directly); GitHub uses the OAuth Authorization Code flow (`/auth/github/redirect` → `/auth/github/callback`)
+- **Social OAuth** — GitHub uses the OAuth Authorization Code flow (`/auth/github/redirect` → `/auth/github/callback`). Yunhou holds the GitHub OAuth App's `client_secret` and runs the code exchange server-side.
 - **Plan-based access** — Plans define which apps a user can access
 - **RSA256 JWT** access tokens with JWKS public key endpoint
 - **Subscription gating** — tokens only issued for active subscriptions based on plan
@@ -17,10 +17,13 @@ A shared user management API for multi-app ecosystems. One user identity across 
 # 1. Set up PostgreSQL
 createdb yunhou_users
 # Run ALL migrations in order — 002 alters tables created by 001, 003
-# adds payment/webhook tables, 005 adds the paypal channel CHECK
-# constraint, 006 adds subscriptions.external_subscription_id for PayPal
-# renewal webhooks, 007 adds apps.secret_hash. Each depends on the prior;
-# running out of order will fail.
+# adds payment/webhook tables, 004 adds the lemonsqueezy channel CHECK
+# constraint (dead-but-allowed — LemonSqueezy code was removed but the
+# migration is kept so the schema stays backward-compatible), 005 adds
+# the paypal channel CHECK constraint, 006 adds
+# subscriptions.external_subscription_id for PayPal renewal webhooks,
+# 007 adds apps.secret_hash. Each depends on the prior; running out of
+# order will fail.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
@@ -37,12 +40,7 @@ make generate-keys
 #    app's secret via POST /admin/apps/:id/rotate-secret).
 make run
 
-# 4a. Google login (direct provider token)
-curl -X POST http://localhost:8080/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"provider":"google","provider_token":"ya29.your-google-token","app_id":"yundian"}'
-
-# 4b. GitHub login uses the redirect flow — open in a browser:
+# 4. GitHub login uses the redirect flow — open in a browser:
 #   GET /auth/github/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/callback
 # After consent GitHub redirects to /auth/github/callback which 302s back
 # to https://yundian.com/auth/callback#token=...&refresh_token=...&user_id=...
@@ -66,7 +64,6 @@ All configuration is via environment variables (or `.env` file):
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM file path; empty = Alipay webhooks return 404 |
-| `LEMONSQUEEZY_WEBHOOK_SECRET` | No | (empty) | Empty = LemonSqueezy webhooks return 404 |
 | `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which PayPal webhook_id/base URL is active |
 | `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | Empty = PayPal sandbox webhooks return 404 |
 | `PAYPAL_WEBHOOK_ID_LIVE` | No | (empty) | Empty = PayPal live webhooks return 404 |
@@ -82,7 +79,6 @@ All configuration is via environment variables (or `.env` file):
 |---|---|---|
 | GET | `/healthz` | Liveness / readiness probe. **Not rate-limited.** Returns 200 `{"code":0,"data":{"status":"ok"}}` or 503 `{"code":503,"message":"db unavailable"}` |
 | GET | `/.well-known/jwks.json` | RSA public key (JWK format) |
-| POST | `/auth/login` | Login with a direct provider token. **Google only** — `provider=github` returns 400; use the redirect flow below. |
 | GET | `/auth/github/redirect` | Begin the GitHub OAuth Authorization Code flow (302 to GitHub). Requires `app_id` + `redirect_uri` matching the app's configured whitelist. |
 | GET | `/auth/github/callback` | GitHub redirects here after consent. Yunhou exchanges the code server-side and returns its JWT in the **URL fragment** (`#token=...&refresh_token=...&user_id=...`) so the access token never leaves the browser. |
 | POST | `/auth/refresh` | Refresh tokens |
@@ -109,7 +105,7 @@ All configuration is via environment variables (or `.env` file):
 |---|---|---|
 | GET | `/apps` | List all apps |
 | GET | `/apps/:id` | Get app details |
-| GET | `/apps/:id/provider-token/:channel` | Fetch upstream credential for `paypal` / `lemonsqueezy` (PayPal OAuth token is cached in-process for `expires_in − 60s`; LS returns the static api_key) |
+| GET | `/apps/:id/provider-token/:channel` | Fetch upstream credential for `paypal` (OAuth token cached in-process for `expires_in − 60s`) |
 | GET | `/admin/plans` | List all plans |
 | GET | `/admin/plans/:id` | Get plan details |
 | POST | `/admin/plans` | Create plan |
@@ -130,7 +126,7 @@ User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 ### v2 known limitations
 
 - `POST /apps/:id/quote` response hardcodes `currency = "USD"` (`internal/service/quote.go`); `POST /payments/orders` hardcodes `currency = "CNY"` (`internal/service/payment.go:125`); WeChat/Alipay webhooks default `CNY`. Multi-currency is not supported in v1; the `plans` table has no currency column today.
-- Channel webhooks carry `sub_expires_at` via `payment.metadata.sub_expires_at` / `resource.sub_expires_at` / `meta.custom_data.sub_expires_at`. yunhou-users does not derive it server-side — the BFF computes it from `plan.interval_days` + business rules and embeds it into checkout creation.
+- Channel webhooks carry `sub_expires_at` via `payment.metadata.sub_expires_at` / `resource.sub_expires_at`. yunhou-users does not derive it server-side — the BFF computes it from `plan.interval_days` + business rules and embeds it into checkout creation.
 - `POST /apps/:id/quote` requires JWT but does **not** enforce `has_access` against the user's subscription. Any authenticated user can quote any plan any app exposes.
 
 ### Cycle precedence (PayPal vs LemonSqueezy)
@@ -139,20 +135,7 @@ When both providers are configured for the same `plan_id`, the resolved cycle (a
 
 ## Authentication Flow
 
-Google (direct-token path):
-```
-Consumer App        Yunhou Users API        Google
-    |                      |                      |
-    |-- POST /auth/login -->|                      |
-    |  {provider_token}     |-- verify token ------>|
-    |                      |<-- user info ---------|
-    |<-- JWT + refresh ----|                      |
-    |                      |                      |
-    |-- POST /auth/refresh->|                      |
-    |<-- new JWT + refresh-| (with token rotation) |
-```
-
-GitHub (redirect flow — direct `POST /auth/login` with `provider=github` returns 400):
+GitHub (redirect flow — there is no `/auth/login` endpoint; GitHub is the only login path):
 ```
 Browser            Yunhou Users API               GitHub            Consumer App (BFF)
     |-- GET /auth/github/redirect?app_id=...&redirect_uri=... --> |

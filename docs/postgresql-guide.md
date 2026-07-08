@@ -43,7 +43,7 @@ psql -h localhost -U postgres -c "SELECT datname FROM pg_database WHERE datname 
 ## 第三步：执行数据库迁移（建表）
 
 ```bash
-# 必须按顺序执行：001 创建核心表，002 简化订阅系统（依赖 001），003 添加支付/退款/Webhook 表，004 扩展 CHECK 约束支持 lemonsqueezy 渠道，005 增加 paypal 渠道 CHECK 约束，006 添加 subscriptions.external_subscription_id，007 给 apps 表添加 secret_hash 列
+# 必须按顺序执行：001 创建核心表，002 简化订阅系统（依赖 001），003 添加支付/退款/Webhook 表，004 扩展 CHECK 约束支持 lemonsqueezy 渠道（代码已删除但 schema 保留），005 增加 paypal 渠道 CHECK 约束，006 添加 subscriptions.external_subscription_id，007 给 apps 表添加 secret_hash 列
 psql -h localhost -U postgres -d yunhou_users -f migrations/001_init.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/003_payments.sql
@@ -125,7 +125,7 @@ DATABASE_URL=postgres://postgres@localhost/yunhou_users?sslmode=disable
 > - `JWT_ACCESS_TTL` 默认 `15m`
 > - `JWT_REFRESH_TTL` 默认 `168h`（7 天）
 >
-> 支付渠道的 Webhook 密钥（`STRIPE_WEBHOOK_SECRET`、`WECHAT_PAY_API_V3_KEY`、`ALIPAY_PUBLIC_KEY_PATH`）只在接入对应渠道时才需要配置。`OAUTH_STATE_SECRET` 是 GitHub OAuth state HMAC 的密钥，必需配置（多实例部署必须共享同一值）。`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` 是**预留**配置项，当前不消费（Google 走直传路径，GitHub 凭据由 `apps.config.oauth_providers.github` 持有）。
+> 支付渠道的 Webhook 密钥（`STRIPE_WEBHOOK_SECRET`、`WECHAT_PAY_API_V3_KEY`、`ALIPAY_PUBLIC_KEY_PATH`）只在接入对应渠道时才需要配置。`OAUTH_STATE_SECRET` 是 GitHub OAuth state HMAC 的密钥，必需配置（多实例部署必须共享同一值）。`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` 是**预留**配置项，当前不消费（GitHub 凭据由 `apps.config.oauth_providers.github` 持有）。
 
 ---
 

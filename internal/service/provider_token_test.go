@@ -68,23 +68,6 @@ func TestProviderToken_Get_Paypal(t *testing.T) {
 	}
 }
 
-func TestProviderToken_Get_LemonSqueezy(t *testing.T) {
-	app := &model.App{
-		AppID:    "site",
-		IsActive: true,
-		Config:   mustJSONRaw(t, `{"payment_providers":{"lemonsqueezy":{"api_key":"lsq_k","store_id":"s"}}}`),
-	}
-	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{})
-
-	got, err := svc.Get(context.Background(), "site", "lemonsqueezy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.APIKey != "lsq_k" {
-		t.Errorf("api_key = %q", got.APIKey)
-	}
-}
-
 func TestProviderToken_Get_UnsupportedChannel(t *testing.T) {
 	app := &model.App{AppID: "site", IsActive: true}
 	svc := NewProviderTokenService(&stubAppRepo{app: app}, &stubPaypal{})

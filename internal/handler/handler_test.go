@@ -33,13 +33,6 @@ type mockAuthSvc struct {
 	testLoginErr  error
 }
 
-func (m *mockAuthSvc) Login(ctx context.Context, req service.LoginRequest) (*service.LoginResponse, error) {
-	if m.loginErr != nil {
-		return nil, m.loginErr
-	}
-	return m.loginResp, nil
-}
-
 func (m *mockAuthSvc) LoginWithProfile(ctx context.Context, req service.LoginWithProfileRequest) (*service.LoginResponse, error) {
 	if m.loginErr != nil {
 		return nil, m.loginErr
@@ -173,93 +166,6 @@ func (m *mockPlanSvc) DeletePlan(ctx context.Context, id string) error {
 }
 
 // --- AuthHandler Tests ---
-
-func TestAuthHandler_Login(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	t.Run("login success", func(t *testing.T) {
-		nickname := "testuser"
-		resp := &service.LoginResponse{
-			AccessToken:  "access-token",
-			RefreshToken: "refresh-token",
-			User:         service.UserInfo{ID: "user-123", Nickname: &nickname},
-			Subscription: &service.SubscriptionInfo{PlanID: "free", HasAccess: true},
-		}
-		authSvc := &mockAuthSvc{loginResp: resp}
-		tokenSvc := &mockTokenSvc{}
-		handler := NewAuthHandler(authSvc, tokenSvc)
-
-		router := gin.New()
-		router.POST("/auth/login", handler.Login)
-
-		body := `{"provider":"google","provider_token":"tok","app_id":"yundian"}`
-		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", w.Code)
-		}
-	})
-
-	t.Run("login rejects github direct token", func(t *testing.T) {
-		authSvc := &mockAuthSvc{}
-		tokenSvc := &mockTokenSvc{}
-		handler := NewAuthHandler(authSvc, tokenSvc)
-
-		router := gin.New()
-		router.POST("/auth/login", handler.Login)
-
-		body := `{"provider":"github","provider_token":"tok","app_id":"yundian"}`
-		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("expected 400, got %d", w.Code)
-		}
-	})
-
-	t.Run("login invalid body", func(t *testing.T) {
-		authSvc := &mockAuthSvc{}
-		tokenSvc := &mockTokenSvc{}
-		handler := NewAuthHandler(authSvc, tokenSvc)
-
-		router := gin.New()
-		router.POST("/auth/login", handler.Login)
-
-		body := `invalid json`
-		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("expected 400, got %d", w.Code)
-		}
-	})
-
-	t.Run("login unauthorized", func(t *testing.T) {
-		authSvc := &mockAuthSvc{loginErr: service.ErrInvalidProviderToken}
-		tokenSvc := &mockTokenSvc{}
-		handler := NewAuthHandler(authSvc, tokenSvc)
-
-		router := gin.New()
-		router.POST("/auth/login", handler.Login)
-
-		body := `{"provider":"google","provider_token":"bad","app_id":"yundian"}`
-		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", w.Code)
-		}
-	})
-}
 
 func TestAuthHandler_RefreshToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1019,7 +925,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 		router := gin.New()
 		router.PATCH("/apps/:id", handler.UpdateApp)
 
-		body := `{"config":{"payment_providers":{"lemonsqueezy":{"api_key":"k","store_id":"s"}}}}`
+		body := `{"config":{"payment_providers":{"paypal":{"client_id":"c","client_secret":"s","webhook_id":"w","mode":"live"}}}}`
 		req := httptest.NewRequest(http.MethodPatch, "/apps/site", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -1032,7 +938,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 		if err != nil {
 			t.Fatalf("find after update: %v", err)
 		}
-		if !bytes.Contains(updated.Config, []byte(`"lemonsqueezy"`)) {
+		if !bytes.Contains(updated.Config, []byte(`"paypal"`)) {
 			t.Errorf("config not replaced; got %s", string(updated.Config))
 		}
 		if bytes.Contains(updated.Config, []byte(`"old"`)) {
@@ -1798,77 +1704,6 @@ func TestPlanHandler_CreatePlan_ErrorPaths(t *testing.T) {
 
 // ==== Auth handler error paths ====
 
-func TestAuthHandler_Login_ErrorPaths(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name        string
-		svc         *mockAuthSvc
-		body        string
-		wantStatus  int
-		wantMessage string
-	}{
-		{"bad JSON → 400", &mockAuthSvc{}, `{`,
-			http.StatusBadRequest, "invalid request body"},
-		{"ErrInvalidProviderToken → 401",
-			&mockAuthSvc{loginErr: service.ErrInvalidProviderToken},
-			`{"provider":"x","provider_token":"y","app_id":"a"}`,
-			http.StatusUnauthorized, "invalid provider"},
-		{"ErrUnsupportedProvider → 400",
-			&mockAuthSvc{loginErr: service.ErrUnsupportedProvider},
-			`{"provider":"x","provider_token":"y","app_id":"a"}`,
-			http.StatusBadRequest, "unsupported provider"},
-		{"github provider rejected → 400 (use redirect flow)",
-			&mockAuthSvc{},
-			`{"provider":"github","provider_token":"y","app_id":"a"}`,
-			http.StatusBadRequest, "requires /auth/github/redirect"},
-		{"ErrAppNotFound → 401",
-			&mockAuthSvc{loginErr: service.ErrAppNotFound},
-			`{"provider":"google","provider_token":"y","app_id":"a"}`,
-			http.StatusUnauthorized, "app not found"},
-		{"ErrAppInactive → 401",
-			&mockAuthSvc{loginErr: service.ErrAppInactive},
-			`{"provider":"google","provider_token":"y","app_id":"a"}`,
-			http.StatusUnauthorized, "app is inactive"},
-		{"ErrUserNotFound → 401",
-			&mockAuthSvc{loginErr: service.ErrUserNotFound},
-			`{"provider":"google","provider_token":"bad","app_id":"a"}`,
-			http.StatusUnauthorized, "user not found"},
-		{"ErrUserSuspended → 401",
-			&mockAuthSvc{loginErr: service.ErrUserSuspended},
-			`{"provider":"google","provider_token":"y","app_id":"a"}`,
-			http.StatusUnauthorized, "user is suspended"},
-		{"unknown error → 500",
-			&mockAuthSvc{loginErr: errors.New("db exploded")},
-			`{"provider":"google","provider_token":"y","app_id":"a"}`,
-			http.StatusInternalServerError, "login failed"},
-		{"success → 200",
-			&mockAuthSvc{loginResp: &service.LoginResponse{}},
-			`{"provider":"google","provider_token":"y","app_id":"a"}`,
-			http.StatusOK, ""},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			gin.SetMode(gin.TestMode)
-			h := NewAuthHandler(tc.svc, &mockTokenSvc{})
-			engine := gin.New()
-			engine.POST("/auth/login", h.Login)
-			req := httptest.NewRequest(http.MethodPost, "/auth/login",
-				strings.NewReader(tc.body))
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			engine.ServeHTTP(rec, req)
-			if rec.Code != tc.wantStatus {
-				t.Errorf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
-			}
-			if tc.wantMessage != "" && !strings.Contains(rec.Body.String(), tc.wantMessage) {
-				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
-			}
-		})
-	}
-}
-
 func TestAuthHandler_RefreshToken_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -2243,123 +2078,6 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 func TestPlanHandler_GetAppPlans(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	t.Run("happy path with paypal + ls configured", func(t *testing.T) {
-		plans := []model.Plan{
-			{ID: "free", Name: "Free", Price: 0, IntervalDays: 0, Apps: pq.StringArray{"yundian"}, IsActive: true, IsDefault: true},
-			{ID: "monthly", Name: "Monthly", Price: 29.9, IntervalDays: 30, Apps: pq.StringArray{"yundian"}, IsActive: true},
-		}
-		app := model.App{
-			AppID:    "yundian",
-			Name:     "Yundian",
-			IsActive: true,
-			Config: json.RawMessage(`{
-				"brand": {"name": "Yundian Brand"},
-				"payment_providers": {
-					"paypal": {"plans": {"monthly": {"plan_id": "P-1", "trial_days": 7, "billing_cycle_days": 30}}},
-					"lemonsqueezy": {"plans": {"monthly": {"variant_id": "var-1", "trial_days": 0, "billing_cycle_days": 30}}}
-				}
-			}`),
-		}
-		appRepo := &mockAppRepo{apps: []model.App{app}}
-		planSvc := &mockPlanSvc{plans: plans}
-		handler := NewPlanHandler(planSvc, appRepo, nil)
-
-		router := gin.New()
-		router.GET("/apps/:id/plans", handler.GetAppPlans)
-
-		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-		}
-		var resp struct {
-			Code int                `json:"code"`
-			Data []model.PublicPlan `json:"data"`
-		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatal(err)
-		}
-		if len(resp.Data) != 2 {
-			t.Fatalf("got %d plans, want 2", len(resp.Data))
-		}
-		// free plan: no provider entries, no cycle
-		if resp.Data[0].ID != "free" {
-			t.Errorf("first plan id = %q, want free", resp.Data[0].ID)
-		}
-		if len(resp.Data[0].ProviderIDs) != 0 {
-			t.Errorf("free plan provider_ids = %+v, want empty", resp.Data[0].ProviderIDs)
-		}
-		// monthly plan: both channels populated, cycle from paypal (precedence)
-		if resp.Data[1].ID != "monthly" {
-			t.Errorf("second plan id = %q, want monthly", resp.Data[1].ID)
-		}
-		ppID := resp.Data[1].ProviderIDs["paypal"]
-		if ppID != "P-1" {
-			t.Errorf("monthly.paypal = %q, want P-1", ppID)
-		}
-		lsID := resp.Data[1].ProviderIDs["lemonsqueezy"]
-		if lsID != "var-1" {
-			t.Errorf("monthly.lemonsqueezy = %q, want var-1", lsID)
-		}
-		if resp.Data[1].Cycle == nil || resp.Data[1].Cycle.TrialDays != 7 || resp.Data[1].Cycle.BillingCycleDays != 30 {
-			t.Errorf("monthly.cycle = %+v, want {7, 30}", resp.Data[1].Cycle)
-		}
-	})
-
-	t.Run("ls cycle takes over when paypal lacks the per-plan entry", func(t *testing.T) {
-		// Mirrors TestQuote_Get_LemonSqueezyFallbackWhenPayPalLacksPlanEntry:
-		// PayPal is configured app-wide but only for "yearly" — for the
-		// requested plan "monthly" PayPal has no entry. The marketing
-		// endpoint must fall through to LemonSqueezy for the cycle instead
-		// of leaving Cycle=nil on the public plan.
-		plans := []model.Plan{
-			{ID: "monthly", Name: "Monthly", Price: 29.9, IntervalDays: 30, Apps: pq.StringArray{"yundian"}, IsActive: true},
-		}
-		app := model.App{
-			AppID: "yundian", Name: "Yundian", IsActive: true,
-			Config: json.RawMessage(`{
-				"payment_providers": {
-					"paypal": {"plans": {"yearly": {"plan_id": "P-Y", "trial_days": 0, "billing_cycle_days": 365}}},
-					"lemonsqueezy": {"plans": {"monthly": {"variant_id": "var-M", "trial_days": 3, "billing_cycle_days": 60}}}
-				}
-			}`),
-		}
-		appRepo := &mockAppRepo{apps: []model.App{app}}
-		planSvc := &mockPlanSvc{plans: plans}
-		handler := NewPlanHandler(planSvc, appRepo, nil)
-
-		router := gin.New()
-		router.GET("/apps/:id/plans", handler.GetAppPlans)
-
-		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-		}
-		var resp struct {
-			Code int                `json:"code"`
-			Data []model.PublicPlan `json:"data"`
-		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatal(err)
-		}
-		if len(resp.Data) != 1 || resp.Data[0].ID != "monthly" {
-			t.Fatalf("got %d plans, want 1 monthly", len(resp.Data))
-		}
-		if resp.Data[0].Cycle == nil {
-			t.Fatal("monthly.cycle = nil, want LS fallback values {3, 60}")
-		}
-		if resp.Data[0].Cycle.TrialDays != 3 || resp.Data[0].Cycle.BillingCycleDays != 60 {
-			t.Errorf("monthly.cycle = %+v, want LS {3, 60}", resp.Data[0].Cycle)
-		}
-		if resp.Data[0].ProviderIDs["lemonsqueezy"] != "var-M" {
-			t.Errorf("monthly.lemonsqueezy = %q, want var-M", resp.Data[0].ProviderIDs["lemonsqueezy"])
-		}
-	})
 
 	t.Run("app not found returns 404", func(t *testing.T) {
 		appRepo := &mockAppRepo{findErr: sql.ErrNoRows}

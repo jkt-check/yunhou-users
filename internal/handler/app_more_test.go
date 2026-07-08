@@ -520,54 +520,6 @@ func (m *MockAppRepo) BackfillSecretHash(_ context.Context, appID, newHash strin
 
 // --- additional auth handler tests ---
 
-func TestAuthHandler_Login_UnsupportedProvider(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	svc := &mockAuthSvc{loginErr: service.ErrUnsupportedProvider}
-	h := NewAuthHandler(svc, &mockTokenSvc{})
-	r := gin.New()
-	r.POST("/auth/login", h.Login)
-	body := `{"provider":"facebook","provider_token":"x","app_id":"yundian"}`
-	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status=%d, want 400", w.Code)
-	}
-}
-
-func TestAuthHandler_Login_SuspendedUser(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	svc := &mockAuthSvc{loginErr: service.ErrUserSuspended}
-	h := NewAuthHandler(svc, &mockTokenSvc{})
-	r := gin.New()
-	r.POST("/auth/login", h.Login)
-	body := `{"provider":"google","provider_token":"x","app_id":"yundian"}`
-	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status=%d, want 401", w.Code)
-	}
-}
-
-func TestAuthHandler_Login_InternalServerError(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	svc := &mockAuthSvc{loginErr: errors.New("db boom")}
-	h := NewAuthHandler(svc, &mockTokenSvc{})
-	r := gin.New()
-	r.POST("/auth/login", h.Login)
-	body := `{"provider":"google","provider_token":"x","app_id":"yundian"}`
-	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status=%d, want 500", w.Code)
-	}
-}
-
 func TestAuthHandler_Refresh_InvalidToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockAuthSvc{refreshErr: service.ErrInvalidRefreshToken}

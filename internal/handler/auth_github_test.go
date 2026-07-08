@@ -26,21 +26,14 @@ func (s *stubAppLoader) FindByID(_ context.Context, _ string) (*model.App, error
 	return s.app, s.err
 }
 
-// stubAuthSvc captures the Login call so the callback handler's downstream
-// service invocation can be exercised.
+// stubAuthSvc captures the LoginWithProfile call so the callback handler's
+// downstream service invocation can be exercised.
 type stubAuthSvc struct {
 	loginResp *service.LoginResponse
 	loginErr  error
 	calls     int
 }
 
-func (s *stubAuthSvc) Login(_ context.Context, _ service.LoginRequest) (*service.LoginResponse, error) {
-	s.calls++
-	if s.loginErr != nil {
-		return nil, s.loginErr
-	}
-	return s.loginResp, nil
-}
 func (s *stubAuthSvc) LoginWithProfile(_ context.Context, _ service.LoginWithProfileRequest) (*service.LoginResponse, error) {
 	s.calls++
 	if s.loginErr != nil {

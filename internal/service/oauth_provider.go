@@ -16,14 +16,12 @@ import (
 // caps how long an /auth/login request can block on a slow OAuth provider.
 var providerHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// githubUserURL and googleUserURL are package vars so tests can point the
+// githubUserURL and githubEmailsURL are package vars so tests can point the
 // fetcher at an httptest server. Production leaves them at the canonical
-// endpoints. Each const-style value lives behind a var so a single test
-// can swap both endpoints to a stub server in one place.
+// endpoints.
 var (
 	githubUserURL   = "https://api.github.com/user"
 	githubEmailsURL = "https://api.github.com/user/emails"
-	googleUserURL   = "https://www.googleapis.com/oauth2/v3/userinfo"
 )
 
 // fetchGitHubUser verifies a GitHub OAuth access token by calling api.github.com
@@ -179,58 +177,6 @@ func fetchGitHubVerifiedPrimaryEmail(ctx context.Context, token string) string {
 	// 3. No verified emails — refuse to return anything. Falling back to
 	//    unverified addresses would re-introduce the email-merge takeover.
 	return ""
-}
-
-// fetchGoogleUser verifies a Google OAuth access token by calling the v3
-// userinfo endpoint. Same error-classification contract as fetchGitHubUser.
-func fetchGoogleUser(ctx context.Context, token string) (*ProviderUserInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, googleUserURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build google user request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := providerHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("call google userinfo api: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("%w: google returned %d", ErrInvalidProviderToken, resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("google userinfo api: status %d", resp.StatusCode)
-	}
-
-	var gUser struct {
-		Sub           string `json:"sub"`
-		Email         string `json:"email"`
-		EmailVerified bool   `json:"email_verified"`
-		Name          string `json:"name"`
-		Picture       string `json:"picture"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&gUser); err != nil {
-		return nil, fmt.Errorf("decode google user: %w", err)
-	}
-	if gUser.Sub == "" {
-		return nil, fmt.Errorf("%w: google user payload missing sub", ErrInvalidProviderToken)
-	}
-
-	// Only trust email if Google verified it; otherwise leave empty so the
-	// email-merge path in getOrCreateUser doesn't link unverified emails.
-	email := ""
-	if gUser.EmailVerified {
-		email = gUser.Email
-	}
-
-	return &ProviderUserInfo{
-		Provider:    "google",
-		ProviderUID: "google_" + gUser.Sub,
-		Email:       normalizeEmail(email),
-		Nickname:    firstNonEmpty(gUser.Name, gUser.Email),
-		AvatarURL:   gUser.Picture,
-	}, nil
 }
 
 // normalizeEmail trims and lowercases an email so case differences across

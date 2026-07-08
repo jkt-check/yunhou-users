@@ -41,41 +41,6 @@ func TestAppConfig_UnmarshalJSON_PaypalOnly(t *testing.T) {
 	if plan.PlanID != "P-1" || plan.TrialDays != 7 || plan.BillingCycleDays != 30 {
 		t.Errorf("monthly plan = %+v", plan)
 	}
-	if cfg.PaymentProviders.Lemonsqueezy != nil {
-		t.Error("lemonsqueezy should be nil when not in JSON")
-	}
-}
-
-func TestAppConfig_UnmarshalJSON_LemonSqueezyOnly(t *testing.T) {
-	raw := []byte(`{
-		"payment_providers": {
-			"lemonsqueezy": {
-				"api_key": "lsq_abc",
-				"store_id": "12345",
-				"plans": {
-					"monthly": {
-						"variant_id": "var_xyz",
-						"trial_days": 0,
-						"billing_cycle_days": 30
-					}
-				}
-			}
-		}
-	}`)
-	var cfg AppConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if cfg.PaymentProviders == nil || cfg.PaymentProviders.Lemonsqueezy == nil {
-		t.Fatal("lemonsqueezy config nil")
-	}
-	if cfg.PaymentProviders.Lemonsqueezy.APIKey != "lsq_abc" {
-		t.Errorf("api_key = %q", cfg.PaymentProviders.Lemonsqueezy.APIKey)
-	}
-	plan := cfg.PaymentProviders.Lemonsqueezy.Plans["monthly"]
-	if plan.VariantID != "var_xyz" || plan.TrialDays != 0 || plan.BillingCycleDays != 30 {
-		t.Errorf("monthly plan = %+v", plan)
-	}
 }
 
 func TestAppConfig_UnmarshalJSON_Empty(t *testing.T) {

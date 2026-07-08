@@ -2,41 +2,10 @@ package e2e
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"io"
 	"net/http"
 	"testing"
-
-	"github.com/yunhou/users/internal/model"
 )
-
-func TestE2E_ProviderToken_LemonSqueezy(t *testing.T) {
-	engine, _, _ := setupE2EServer(t)
-
-	appID := "e2e-ls-" + randomSuffix()
-	createBody := `{"app_id":"` + appID + `","name":"e2e","config":{"payment_providers":{"lemonsqueezy":{"api_key":"lsq_e2e_key","store_id":"12345"}}}}`
-	createResp := doRequest(t, engine, http.MethodPost, "/admin/apps", createBody, appAuthHeaders(superAppID))
-	if createResp.StatusCode != http.StatusCreated {
-		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
-	}
-
-	resp := doRequest(t, engine, http.MethodGet,
-		"/apps/"+appID+"/provider-token/lemonsqueezy",
-		"", appAuthHeaders(superAppID))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("get provider token: %d %s", resp.StatusCode, string(resp.Body))
-	}
-	var body struct {
-		Code int                  `json:"code"`
-		Data *model.ProviderToken `json:"data"`
-	}
-	if err := json.Unmarshal(resp.Body, &body); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if body.Data == nil || body.Data.APIKey != "lsq_e2e_key" {
-		t.Errorf("data = %+v", body.Data)
-	}
-}
 
 func TestE2E_ProviderToken_UnsupportedChannel(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)

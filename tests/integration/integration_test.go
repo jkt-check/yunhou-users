@@ -24,34 +24,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// Short-circuit real GitHub/Google calls for the whole integration suite.
-	// The tests pass arbitrary provider_token strings; we use the token as the
-	// stable provider UID so each unique token = unique user.
-	restore := service.SetProviderVerifier(func(_ context.Context, provider, token string) (*service.ProviderUserInfo, error) {
-		switch provider {
-		case "github":
-			return &service.ProviderUserInfo{
-				Provider:    "github",
-				ProviderUID: "github_" + token,
-				Email:       fmt.Sprintf("%s@github.test", token),
-				Nickname:    "GitHub " + token,
-			}, nil
-		case "google":
-			return &service.ProviderUserInfo{
-				Provider:    "google",
-				ProviderUID: "google_" + token,
-				Email:       fmt.Sprintf("%s@google.test", token),
-				Nickname:    "Google " + token,
-			}, nil
-		default:
-			return nil, fmt.Errorf("%w: %s", service.ErrUnsupportedProvider, provider)
-		}
-	})
-	code := m.Run()
-	// Restore so a later test binary run (or the same binary running
-	// other suites) doesn't leak the stub into production code paths.
-	restore()
-	os.Exit(code)
+	// NOTE: /auth/login was removed (GitHub is the only login provider now
+	// and uses the redirect flow). The legacy integration tests that drove
+	// /auth/login with arbitrary provider_token strings no longer apply;
+	// they need to be rewritten to drive the GitHub callback flow. The
+	// new flow has no equivalent of the per-token ProviderUserInfo stub —
+	// the stub used to be installed here via SetProviderVerifier, which
+	// was removed when the direct-login path was deleted.
+	os.Exit(m.Run())
 }
 
 func dbURL() string {

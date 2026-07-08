@@ -25,19 +25,9 @@ Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一
 
 用户在你的应用中点击登录后：
 
-1. 你的前端通过 OAuth 获取用户的 Google access token（GitHub 登录请使用 §"GitHub OAuth 授权码流程"，本接口不接受 `provider=github`）
-2. 你的后端调用 `/auth/login`，传入 provider token
-3. 系统返回 JWT access token + refresh token，以及用户的订阅信息
-
-```bash
-curl -X POST https://your-yunhou-domain/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{
-    "provider": "google",
-    "provider_token": "ya29.xxxxxxxxxxxx",
-    "app_id": "yundian"
-  }'
-```
+1. 你的前端引导用户进入 §"GitHub OAuth 授权码流程" 完成登录
+2. GitHub 回调成功后 Yunhou 把 JWT 通过 URL 片段返回给 BFF（见 §"GitHub OAuth 授权码流程"）
+3. BFF 用 JWT 调后续接口，refresh token 用于延长会话
 
 响应：
 ```json
@@ -80,17 +70,18 @@ curl https://your-yunhou-domain/user/profile \
 ### 登录时序图
 
 ```
-用户          你的应用           Yunhou Users         OAuth 提供方
+用户          你的应用           Yunhou Users         GitHub
  │              │                     │                    │
- │──登录───→│                     │                    │
- │              │──获取 provider ───→│                    │
- │              │   token            │                    │
- │←──token──│                     │                    │
- │              │──POST /auth/login →│                    │
- │              │  {provider_token}  │──验证 token ─────→│
- │              │                    │←──用户信息─────────│
- │              │←─JWT + refresh ──│                    │
- │←──完成───│                     │                    │
+ │──点击登录→│                     │                    │
+ │              │──GET /auth/github/redirect?app_id=...&redirect_uri=... ─→│
+ │              │                     │── 302 to github.com/login/oauth/authorize?... ─→│
+ │              │                     │←── consent ─────────│
+ │              │←─302 /auth/github/callback?code=...&state=... ─────│
+ │              │                     │── exchange code (server-side) ─→│
+ │              │                     │←── user info ───────│
+ │              │←─302 redirect_uri#token=...&refresh_token=...&user_id=... ─│
+ │              │  (fragment 由 BFF 前端解析；不上行)         │
+ │              │──后续用 JWT 调其它接口──→│
 ```
 
 ### Token 刷新时序图
@@ -144,61 +135,6 @@ curl https://your-yunhou-domain/user/profile \
 ```
 
 > 建议缓存此响应，TTL 建议 1 小时。
-
-#### POST /auth/login
-
-> **GitHub 登录已迁移到 redirect 流程（见 §"GitHub OAuth 授权码流程"）。本接口不再接受 `provider=github`**——直接传 `provider_token` 的设计违反了"凭据由 yunhou 持有"的边界（详见 CLAUDE.md §"GitHub OAuth Boundary"）。Google 登录仍可走直传路径，未来会同步迁移。
-
-登录接口（仅 Google provider；GitHub 请用 redirect 流程）。
-
-**请求体**：
-```json
-{
-  "provider": "google",
-  "provider_token": "ya29.xxx",
-  "app_id": "yundian"
-}
-```
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `provider` | 是 | 登录方式：当前仅支持 `google`（`github` 见下方 redirect 流程） |
-| `provider_token` | 是 | OAuth provider 的 access token |
-| `app_id` | 是 | 要访问的应用 ID |
-
-**响应（200）**：
-```json
-{
-  "code": 0,
-  "data": {
-    "access_token": "eyJhbGciOiJSUzI1NiIs...",
-    "refresh_token": "a1b2c3d4...",
-    "user": {
-      "id": "uuid",
-      "nickname": "张三",
-      "email": "user@example.com",
-      "avatar_url": "https://..."
-    },
-    "subscription": {
-      "plan_id": "monthly",
-      "plan_name": "按月订阅",
-      "has_access": true,
-      "expires_at": "2026-12-19T00:00:00Z"
-    }
-  }
-}
-```
-
-**错误响应**：
-
-| HTTP | message | 触发条件 |
-|------|---------|----------|
-| 400 | `unsupported provider: <name>` | `provider` 取值不在 `github` / `google` 之内 |
-| 400 | `invalid request body` | 请求体缺失或字段类型错误 |
-| 401 | `invalid provider token` | OAuth provider 拒绝该 token |
-| 401 | `app not found` / `app is inactive` | `app_id` 不存在或已停用 |
-| 401 | `user is suspended` / `user is deleted` | 用户账号被停用或已删除 |
-| 401 | `subscription expired` | 用户有订阅但已过期 |
 
 #### POST /auth/refresh
 
@@ -282,7 +218,7 @@ curl https://your-yunhou-domain/user/profile \
       "price": 29.9,
       "interval_days": 30,
       "is_default": false,
-      "provider_ids": {"paypal": "P-MONTHLY-7D", "lemonsqueezy": "var-MONTHLY"},
+      "provider_ids": {"paypal": "P-MONTHLY-7D"},
       "cycle": {"trial_days": 7, "billing_cycle_days": 30}
     }
   ]
@@ -293,10 +229,10 @@ curl https://your-yunhou-domain/user/profile \
 
 | 字段 | 说明 |
 |------|------|
-| `provider_ids` | 该 Plan 在每个已配置渠道下对应的 provider plan/variant ID。未配置渠道不出现在 map 中。无任何渠道配置时为 `{}`（BFF 即可判定"当前 App 该 Plan 暂无可下单渠道"）。 |
-| `cycle` | 解析后的试用 + 计费周期；用于营销页文案。未配置任何渠道时为 `null`（BFF 应回退到 `interval_days`）。 |
+| `provider_ids` | 该 Plan 在 PayPal 上对应的 subscription plan ID。未配置 PayPal 时为 `{}`（BFF 即可判定"当前 App 该 Plan 暂无可下单渠道"）。 |
+| `cycle` | 解析后的试用 + 计费周期；用于营销页文案。PayPal 未配置此 plan 的 `trial_days` / `billing_cycle_days` 时为 `null`（BFF 应回退到 `interval_days`）。 |
 
-**cycle 解析规则**：当 PayPal 和 LemonSqueezy 都为同一 `plan_id` 配置了 plan 记录时，**PayPal 的 `trial_days` + `billing_cycle_days` 胜出**。运营侧需保证 PayPal 控制台上的账单周期与这里写下的值一致，否则营销页展示的 "X 天免费 / Y 天周期" 跟实际结算会不一致。
+**cycle 解析规则**：使用 PayPal 的 `trial_days` + `billing_cycle_days`。运营侧需保证 PayPal 控制台上的账单周期与这里写下的值一致，否则营销页展示的 "X 天免费 / Y 天周期" 跟实际结算会不一致。
 
 **错误响应**：
 
@@ -535,17 +471,6 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
           "billing_cycle_days": 30
         }
       }
-    },
-    "lemonsqueezy": {
-      "api_key": "lsq_...",
-      "store_id": "12345",
-      "plans": {
-        "monthly": {
-          "variant_id": "var-MONTHLY",
-          "trial_days": 0,
-          "billing_cycle_days": 30
-        }
-      }
     }
   }
 }
@@ -553,9 +478,9 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 要点：
 
-- 每个 `<channel>.plans` 是 `plan_id -> 配置对象` 的 map；`plan_id` 与业务 `plans.id` 同名（运营侧负责对齐）。
-- `trial_days` / `billing_cycle_days` 决定 `sub_expires_at = now + trial + cycle` 的计算结果；务必与渠道控制台账单周期同步。`billing_cycle_days` 缺省时回退到 `plans.interval_days`。
-- `brand.name` 缺省回退到 `apps.name`，对应 PayPal `application_context.brand_name` 与 LS `checkout_data.custom.brand`。
+- `paypal.plans` 是 `plan_id -> 配置对象` 的 map；`plan_id` 与业务 `plans.id` 同名（运营侧负责对齐）。
+- `trial_days` / `billing_cycle_days` 决定 `sub_expires_at = now + trial + cycle` 的计算结果；务必与 PayPal 控制台账单周期同步。`billing_cycle_days` 缺省时回退到 `plans.interval_days`。
+- `brand.name` 缺省回退到 `apps.name`，对应 PayPal `application_context.brand_name`。
 - v2 schema 把早期"扁平的 `{plan_id: "P-…"}` map" 改成了嵌套对象形；现存配置行如果有旧形态，需通过 `PATCH /admin/apps/:id` 重写为新形态，否则该 plan 在 quote / catalog 接口里查不到。
 
 #### GET /apps
@@ -607,14 +532,14 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### GET /apps/:id/provider-token/:channel
 
-为 BFF 拉取 PayPal / LemonSqueezy 上游凭据，避免敏感凭据下沉到消费方代码（`BFF fetch upstream with short-lived PayPal token` / `BFF sign LS requests with api_key`，不需要在 BFF 端做长期凭据托管）。**鉴权为 `X-App-ID` + `X-App-Secret` 内部服务头对**——BFF 后端用其内部服务身份调用，绝不下发给终端用户；`X-App-Secret` 是每个 app 创建时一次性返回的 64 位十六进制串，仅 bcrypt 哈希存库，丢失后必须通过 `POST /admin/apps/:id/rotate-secret` 重新生成。
+为 BFF 拉取 PayPal 上游凭据，避免敏感凭据下沉到消费方代码。**鉴权为 `X-App-ID` + `X-App-Secret` 内部服务头对**——BFF 后端用其内部服务身份调用，绝不下发给终端用户；`X-App-Secret` 是每个 app 创建时一次性返回的 64 位十六进制串，仅 bcrypt 哈希存库，丢失后必须通过 `POST /admin/apps/:id/rotate-secret` 重新生成。
 
 **路径参数**：
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
 | `id` | 是 | App ID |
-| `channel` | 是 | `paypal` 或 `lemonsqueezy` |
+| `channel` | 是 | `paypal` |
 
 **响应（200）**—— PayPal：
 ```json
@@ -628,32 +553,20 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 }
 ```
 
-**响应（200）**—— LemonSqueezy：
-```json
-{
-  "code": 0,
-  "data": {
-    "channel": "lemonsqueezy",
-    "api_key": "lsq_xxxxx"
-  }
-}
-```
+行为说明：
 
-行为差异：
-
-- PayPal：yunhou-users 真正去 PayPal OAuth `client_credentials` 接口拿 access token，并在进程内缓存 `expires_in − 60s`（即 PayPal 实际返回的剩余有效期减去 60 秒安全余量；典型 ~9 小时，最短不会低于 60 秒）。并发去重（同一 `client_id` 同时只有一次上游调用）；单 Yunhou 实例维度缓存，多实例各自刷新（PayPal 的 `client_credentials` 对相同凭据幂等）。
-- LemonSqueezy：仅返回 `apps.config.payment_providers.lemonsqueezy.api_key`（LS webhook-only，不消耗 access token）。
+- yunhou-users 真正去 PayPal OAuth `client_credentials` 接口拿 access token，并在进程内缓存 `expires_in − 60s`（即 PayPal 实际返回的剩余有效期减去 60 秒安全余量；典型 ~9 小时，最短不会低于 60 秒）。并发去重（同一 `client_id` 同时只有一次上游调用）；单 Yunhou 实例维度缓存，多实例各自刷新（PayPal 的 `client_credentials` 对相同凭据幂等）。
 
 **错误响应**：
 
 | HTTP | message | 触发条件 |
 |------|---------|----------|
-| 400 | `unsupported channel` | `channel` 取值不在 `paypal` / `lemonsqueezy` |
-| 400 | `provider not configured for app` | App 未配置对应 provider 块 |
+| 400 | `unsupported channel` | `channel` 不是 `paypal` |
+| 400 | `provider not configured for app` | App 未配置 PayPal provider 块 |
 | 403 | `app is disabled` | App 已停用 |
 | 404 | `app not found` | App 不存在 |
 | 500 | `provider token service unavailable` | 服务依赖未注入（理论上不会发生；防御性兜底） |
-| 502 | `provider upstream error` | PayPal OAuth 调用失败（网络、认证、配额）；LemonSqueezy 路径目前只返回静态 `api_key`，不产生 502 |
+| 502 | `provider upstream error` | PayPal OAuth 调用失败（网络、认证、配额） |
 
 #### POST /apps/:id/quote
 

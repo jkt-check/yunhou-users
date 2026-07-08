@@ -344,10 +344,8 @@ GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
 GITHUB_CALLBACK_URL=https://CHANGE_ME/callback/github
 
-# Google OAuth (https://console.cloud.google.com/apis/credentials)
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
-GOOGLE_CALLBACK_URL=https://CHANGE_ME/callback/google
+# Google OAuth (no longer needed — Google direct-token login was removed)
+# (kept here as a placeholder so operators know not to add it back)
 
 # WeChat OAuth
 WECHAT_CLIENT_ID=

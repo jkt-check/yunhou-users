@@ -66,48 +66,6 @@ func authErrReason(err error) string {
 	}
 }
 
-func (h *AuthHandler) Login(c *gin.Context) {
-	var req service.LoginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
-		return
-	}
-
-	// GitHub login must use the OAuth redirect flow (/auth/github/redirect
-	// → /auth/github/callback) — the boundary contract is that Yunhou
-	// holds the OAuth App's client_secret and runs the code exchange
-	// server-side. Accepting a BFF-supplied access_token here would let
-	// the BFF bypass that contract. Google keeps the direct-token path
-	// for backward compatibility; that path will be deprecated in a
-	// follow-up so it lines up with the GitHub boundary.
-	if req.Provider == "github" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"code":    400,
-			"message": "github login requires /auth/github/redirect + /auth/github/callback; direct provider_token is not accepted",
-		})
-		return
-	}
-
-	resp, err := h.authSvc.Login(c.Request.Context(), req)
-	if err != nil {
-		// ErrUnsupportedProvider is a malformed request (caller sent an
-		// unknown provider name) — surface as 400, not 401.
-		if errors.Is(err, service.ErrUnsupportedProvider) {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
-			return
-		}
-		if isExpectedAuthErr(err) {
-			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": err.Error()})
-			return
-		}
-		log.Printf("login internal error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "login failed"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": resp})
-}
-
 func (h *AuthHandler) RefreshToken(c *gin.Context) {
 	var req struct {
 		RefreshToken string `json:"refresh_token" binding:"required"`

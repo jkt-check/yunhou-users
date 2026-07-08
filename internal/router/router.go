@@ -47,7 +47,6 @@ func Setup(
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
 	engine.GET("/.well-known/jwks.json", publicLimiter, authHandler.JWKS)
-	engine.POST("/auth/login", publicLimiter, authHandler.Login)
 	engine.POST("/auth/refresh", publicLimiter, authHandler.RefreshToken)
 	engine.POST("/auth/logout", publicLimiter, authHandler.Logout)
 	// GitHub OAuth redirect flow — see handler.RegisterGitHubOAuthRoutes

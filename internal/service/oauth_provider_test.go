@@ -25,14 +25,12 @@ func withProviderHTTPClient(t *testing.T, c *http.Client) {
 // supplied httptest server. Restored on cleanup.
 func withProviderURLs(t *testing.T, base string) {
 	t.Helper()
-	prevUser, prevEmails, prevGoogle := githubUserURL, githubEmailsURL, googleUserURL
+	prevUser, prevEmails := githubUserURL, githubEmailsURL
 	githubUserURL = base + "/user"
 	githubEmailsURL = base + "/user/emails"
-	googleUserURL = base + "/userinfo"
 	t.Cleanup(func() {
 		githubUserURL = prevUser
 		githubEmailsURL = prevEmails
-		googleUserURL = prevGoogle
 	})
 }
 
@@ -290,126 +288,6 @@ func TestFetchGitHubUser_MissingID(t *testing.T) {
 	_, err := fetchGitHubUser(context.Background(), "tok")
 	if !errorIs(err, ErrInvalidProviderToken) {
 		t.Errorf("missing id should map to ErrInvalidProviderToken, got %v", err)
-	}
-}
-
-// ============================================================================
-// fetchGoogleUser
-// ============================================================================
-
-func TestFetchGoogleUser_Success(t *testing.T) {
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-			t.Errorf("missing bearer")
-		}
-		fmt.Fprintf(w, `{"sub": "google-uid-1", "email": "alice@example.com", "email_verified": true, "name": "Alice", "picture": "https://example.com/a.png"}`)
-	}))
-	t.Cleanup(server.Close)
-	withProviderURLs(t, server.URL)
-	withProviderHTTPClient(t, server.Client())
-
-	got, err := fetchGoogleUser(context.Background(), "tok")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if got.Provider != "google" {
-		t.Errorf("Provider = %q", got.Provider)
-	}
-	if got.ProviderUID != "google_google-uid-1" {
-		t.Errorf("ProviderUID = %q", got.ProviderUID)
-	}
-	if got.Email != "alice@example.com" {
-		t.Errorf("Email = %q", got.Email)
-	}
-	if got.Nickname != "Alice" {
-		t.Errorf("Nickname = %q", got.Nickname)
-	}
-	if got.AvatarURL != "https://example.com/a.png" {
-		t.Errorf("AvatarURL = %q", got.AvatarURL)
-	}
-}
-
-func TestFetchGoogleUser_UnverifiedEmailDropped(t *testing.T) {
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// email_verified=false — must be dropped to avoid email-merge takeover.
-		fmt.Fprintf(w, `{"sub": "x", "email": "evil@example.com", "email_verified": false, "name": "Evil"}`)
-	}))
-	t.Cleanup(server.Close)
-	withProviderURLs(t, server.URL)
-	withProviderHTTPClient(t, server.Client())
-
-	got, err := fetchGoogleUser(context.Background(), "tok")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if got.Email != "" {
-		t.Errorf("Email = %q, want empty (unverified dropped)", got.Email)
-	}
-}
-
-func TestFetchGoogleUser_NicknameFallbackToEmail(t *testing.T) {
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// No name; should fall back to email.
-		fmt.Fprintf(w, `{"sub": "x", "email": "x@example.com", "email_verified": true}`)
-	}))
-	t.Cleanup(server.Close)
-	withProviderURLs(t, server.URL)
-	withProviderHTTPClient(t, server.Client())
-
-	got, err := fetchGoogleUser(context.Background(), "tok")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if got.Nickname != "x@example.com" {
-		t.Errorf("Nickname = %q, want x@example.com (email fallback)", got.Nickname)
-	}
-}
-
-func TestFetchGoogleUser_401(t *testing.T) {
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-	}))
-	t.Cleanup(server.Close)
-	withProviderURLs(t, server.URL)
-	withProviderHTTPClient(t, server.Client())
-
-	_, err := fetchGoogleUser(context.Background(), "tok")
-	if !errorIs(err, ErrInvalidProviderToken) {
-		t.Errorf("err = %v, want ErrInvalidProviderToken", err)
-	}
-}
-
-func TestFetchGoogleUser_500(t *testing.T) {
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	t.Cleanup(server.Close)
-	withProviderURLs(t, server.URL)
-	withProviderHTTPClient(t, server.Client())
-
-	_, err := fetchGoogleUser(context.Background(), "tok")
-	if err == nil || errorIs(err, ErrInvalidProviderToken) {
-		t.Errorf("500 should not be ErrInvalidProviderToken, got %v", err)
-	}
-}
-
-func TestFetchGoogleUser_MissingSub(t *testing.T) {
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"email": "x@x.com", "email_verified": true}`)
-	}))
-	t.Cleanup(server.Close)
-	withProviderURLs(t, server.URL)
-	withProviderHTTPClient(t, server.Client())
-
-	_, err := fetchGoogleUser(context.Background(), "tok")
-	if !errorIs(err, ErrInvalidProviderToken) {
-		t.Errorf("missing sub should be ErrInvalidProviderToken, got %v", err)
 	}
 }
 

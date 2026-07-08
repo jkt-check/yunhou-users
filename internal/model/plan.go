@@ -29,10 +29,10 @@ type PublicPlan struct {
 	// ProviderIDs maps channel → provider plan/variant ID. Empty when the
 	// app has no payment provider configured.
 	ProviderIDs  map[string]string `json:"provider_ids"`
-	// Cycle is the resolved cycle for this plan under the first configured
-	// channel (PayPal takes precedence over LemonSqueezy). The marketing
-	// page uses this to display "first X days free, then $Y" — for the
-	// quote endpoint, the same logic is recomputed server-side from the
+	// Cycle is the resolved cycle for this plan when PayPal is configured
+	// for it; nil when no per-plan cycle is available. The marketing page
+	// uses this to display "first X days free, then $Y" — for the quote
+	// endpoint, the same logic is recomputed server-side from the
 	// authoritative config.
 	Cycle        *CycleSummary     `json:"cycle,omitempty"`
 }

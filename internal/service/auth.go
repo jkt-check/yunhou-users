@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"slices"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -95,13 +94,6 @@ type ProviderUserInfo struct {
 	AvatarURL   string
 }
 
-// LoginRequest is the request body for POST /auth/login
-type LoginRequest struct {
-	Provider      string `json:"provider" binding:"required"`
-	ProviderToken string `json:"provider_token" binding:"required"`
-	AppID         string `json:"app_id" binding:"required"`
-}
-
 // LoginWithProfileRequest is the input for AuthService.LoginWithProfile:
 // identity binding uses a pre-fetched ProviderUserInfo instead of re-calling
 // the provider's userinfo API. Used by /auth/github/callback after the
@@ -142,25 +134,11 @@ type SubscriptionInfo struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
-// Login authenticates a user via provider token and returns tokens + subscription info.
-func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginResponse, error) {
-	// 1. Get user info from provider (GitHub/Google) — calls the provider's
-	//    userinfo API to verify the token belongs to a real account.
-	providerUser, err := s.getProviderUser(ctx, req.Provider, req.ProviderToken)
-	if err != nil {
-		return nil, err
-	}
-	return s.LoginWithProfile(ctx, LoginWithProfileRequest{
-		Profile: providerUser,
-		AppID:   req.AppID,
-	})
-}
-
 // LoginWithProfile is the Login flow that accepts a pre-fetched
 // ProviderUserInfo instead of re-calling the provider userinfo API.
 // Used by /auth/github/callback after the handler has already exchanged
-// the code and fetched the profile — calling Login would do a second
-// upstream /user round-trip per callback.
+// the code and fetched the profile — the callback only does a single
+// upstream /user round-trip.
 func (s *AuthService) LoginWithProfile(ctx context.Context, req LoginWithProfileRequest) (*LoginResponse, error) {
 	if req.Profile == nil {
 		return nil, errors.New("nil profile")
@@ -282,35 +260,6 @@ func (s *AuthService) LoginWithProfile(ctx context.Context, req LoginWithProfile
 			ExpiresAt: expiresAt,
 		},
 	}, nil
-}
-
-// providerVerifierOverride, when non-nil, replaces real OAuth provider calls.
-// Production never sets it. Tests (including E2E in other packages) install a
-// stub via SetProviderVerifier so they can drive auth without hitting real
-// GitHub/Google. Stored in an atomic.Value so test setup/teardown is safe
-// to call from goroutines and t.Parallel subtests.
-var providerVerifierOverride atomic.Value // holds func(ctx, provider, token) (*ProviderUserInfo, error)
-
-// SetProviderVerifier installs a stub OAuth verifier for tests. The returned
-// function restores the previous value — callers should defer it (or wire it
-// into t.Cleanup) so other tests aren't affected.
-func SetProviderVerifier(fn func(ctx context.Context, provider, token string) (*ProviderUserInfo, error)) func() {
-	prev, _ := providerVerifierOverride.Swap(fn).(func(ctx context.Context, provider, token string) (*ProviderUserInfo, error))
-	return func() { providerVerifierOverride.Store(prev) }
-}
-
-func (s *AuthService) getProviderUser(ctx context.Context, provider, token string) (*ProviderUserInfo, error) {
-	if v := providerVerifierOverride.Load(); v != nil {
-		return v.(func(ctx context.Context, provider, token string) (*ProviderUserInfo, error))(ctx, provider, token)
-	}
-	switch provider {
-	case "github":
-		return fetchGitHubUser(ctx, token)
-	case "google":
-		return fetchGoogleUser(ctx, token)
-	default:
-		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProvider, provider)
-	}
 }
 
 func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInfo) (*model.User, error) {

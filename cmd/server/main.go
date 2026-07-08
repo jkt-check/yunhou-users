@@ -212,9 +212,6 @@ func buildWebhookVerifier(cfg *config.Config) middleware.ChannelSignatureVerifie
 			log.Printf("alipay: could not read public key file: %v", err)
 		}
 	}
-	if cfg.LemonSqueezyWebhookSecret != "" {
-		mv.LemonSqueezy = &middleware.LemonsqueezyVerifier{Secret: []byte(cfg.LemonSqueezyWebhookSecret)}
-	}
 	if cfg.PaypalEnv == "sandbox" || cfg.PaypalEnv == "live" {
 		mv.Paypal = &middleware.PaypalVerifier{
 			HTTPClient:       &http.Client{Timeout: 5 * time.Second},

@@ -1328,7 +1328,7 @@ func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx *sqlx.T
 
 func validateChannel(channel string) error {
 	switch channel {
-	case "stripe", "wechat_pay", "alipay", "lemonsqueezy", "paypal":
+	case "stripe", "wechat_pay", "alipay", "paypal":
 		return nil
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidChannel, channel)

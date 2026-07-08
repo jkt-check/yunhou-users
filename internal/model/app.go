@@ -33,16 +33,15 @@ type BrandConfig struct {
 }
 
 type PaymentProvidersConfig struct {
-	Paypal       *PaypalConfig       `json:"paypal,omitempty"`
-	Lemonsqueezy *LemonsqueezyConfig `json:"lemonsqueezy,omitempty"`
+	Paypal *PaypalConfig `json:"paypal,omitempty"`
 }
 
 type PaypalConfig struct {
-	ClientID     string                       `json:"client_id"`
-	ClientSecret string                       `json:"client_secret"`
-	WebhookID    string                       `json:"webhook_id"`
-	Mode         string                       `json:"mode"` // "live" | "sandbox"
-	Plans        map[string]PaypalPlanConfig  `json:"plans"`
+	ClientID     string                      `json:"client_id"`
+	ClientSecret string                      `json:"client_secret"`
+	WebhookID    string                      `json:"webhook_id"`
+	Mode         string                      `json:"mode"` // "live" | "sandbox"
+	Plans        map[string]PaypalPlanConfig `json:"plans"`
 }
 
 // PaypalPlanConfig is the per-plan record under paypal.plans. It carries the
@@ -55,32 +54,17 @@ type PaypalPlanConfig struct {
 	BillingCycleDays int    `json:"billing_cycle_days,omitempty"`
 }
 
-type LemonsqueezyConfig struct {
-	APIKey  string                  `json:"api_key"`
-	StoreID string                  `json:"store_id"`
-	Plans   map[string]LSPlanConfig `json:"plans"`
-}
-
-// LSPlanConfig mirrors PaypalPlanConfig for LemonSqueezy — same cycle fields,
-// different ID field name (variant_id instead of plan_id).
-type LSPlanConfig struct {
-	VariantID        string `json:"variant_id"`
-	TrialDays        int    `json:"trial_days,omitempty"`
-	BillingCycleDays int    `json:"billing_cycle_days,omitempty"`
-}
-
 // ProviderToken is the response shape for GET /apps/:id/provider-token/:channel.
-// Exactly one of AccessToken (PayPal) or APIKey (LS) is populated per channel.
+// Only PayPal is supported; AccessToken + ExpiresIn are populated per response.
 type ProviderToken struct {
 	Channel     string `json:"channel"`
 	AccessToken string `json:"access_token,omitempty"`
 	ExpiresIn   int    `json:"expires_in,omitempty"`
-	APIKey      string `json:"api_key,omitempty"`
 }
 
 // OAuthProvidersConfig groups all OAuth providers configured for an app.
 // Today only GitHub is supported; the block is structured so future
-// providers (Google, Microsoft, ...) slot in alongside.
+// providers slot in alongside.
 type OAuthProvidersConfig struct {
 	GitHub *GitHubOAuthConfig `json:"github,omitempty"`
 }

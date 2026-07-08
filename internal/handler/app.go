@@ -271,9 +271,6 @@ func validateAppConfig(cfg *model.AppConfig) error {
 				return errors.New("paypal.mode must be live or sandbox")
 			}
 		}
-		if l := cfg.PaymentProviders.Lemonsqueezy; l != nil && (l.APIKey == "" || l.StoreID == "") {
-			return errors.New("lemonsqueezy: api_key and store_id are required")
-		}
 	}
 	if gh := cfg.OAuthProviders; gh != nil {
 		if g := gh.GitHub; g != nil {
@@ -681,32 +678,14 @@ func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 			out.ProviderIDs["paypal"] = pc.PlanID
 		}
 	}
-	if ls := cfg.PaymentProviders.Lemonsqueezy; ls != nil {
-		if pc, ok := ls.Plans[p.ID]; ok && pc.VariantID != "" {
-			out.ProviderIDs["lemonsqueezy"] = pc.VariantID
-		}
-	}
-	// Authoritative cycle = first configured channel that has a per-plan
-	// entry. PayPal wins by convention; if PayPal is configured app-wide but
-	// lacks an entry for this plan, fall through to LemonSqueezy. (Guard on
-	// `Paypal != nil` alone would skip LS whenever PayPal was configured
-	// but lacked this plan — leaving LS plans with cycle:null on the
-	// marketing endpoint.)
+	// Authoritative cycle = PayPal's per-plan entry when present; nil when
+	// PayPal is unconfigured for this plan (the marketing page renders
+	// cycle:null in that case so callers don't infer a fake cycle).
 	if pp := cfg.PaymentProviders.Paypal; pp != nil {
 		if pc, ok := pp.Plans[p.ID]; ok {
 			out.Cycle = &model.CycleSummary{
 				TrialDays:        pc.TrialDays,
 				BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
-			}
-		}
-	}
-	if out.Cycle == nil {
-		if ls := cfg.PaymentProviders.Lemonsqueezy; ls != nil {
-			if pc, ok := ls.Plans[p.ID]; ok {
-				out.Cycle = &model.CycleSummary{
-					TrialDays:        pc.TrialDays,
-					BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
-				}
 			}
 		}
 	}

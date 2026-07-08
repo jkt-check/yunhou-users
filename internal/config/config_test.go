@@ -13,7 +13,6 @@ func TestLoad_Defaults(t *testing.T) {
 		"PORT", "DATABASE_URL", "RSA_PRIVATE_KEY_PATH", "RSA_PUBLIC_KEY_PATH",
 		"JWT_ACCESS_TTL", "JWT_REFRESH_TTL",
 		"GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
-		"GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
 	}
 	for _, k := range envVars {
 		orig, had := os.LookupEnv(k)
@@ -54,13 +53,7 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.GitHubClientSecret != "" {
 		t.Errorf("GitHubClientSecret: got %q, want empty", cfg.GitHubClientSecret)
 	}
-	if cfg.GoogleClientID != "" {
-		t.Errorf("GoogleClientID: got %q, want empty", cfg.GoogleClientID)
 	}
-	if cfg.GoogleClientSecret != "" {
-		t.Errorf("GoogleClientSecret: got %q, want empty", cfg.GoogleClientSecret)
-	}
-}
 
 func TestLoad_EnvVarsOverride(t *testing.T) {
 	envVars := map[string]string{
@@ -72,8 +65,6 @@ func TestLoad_EnvVarsOverride(t *testing.T) {
 		"JWT_REFRESH_TTL":     "72h",
 		"GITHUB_CLIENT_ID":    "gh-id",
 		"GITHUB_CLIENT_SECRET": "gh-secret",
-		"GOOGLE_CLIENT_ID":    "go-id",
-		"GOOGLE_CLIENT_SECRET": "go-secret",
 	}
 
 	for k, v := range envVars {
@@ -113,12 +104,6 @@ func TestLoad_EnvVarsOverride(t *testing.T) {
 	}
 	if cfg.GitHubClientSecret != "gh-secret" {
 		t.Errorf("GitHubClientSecret: got %q, want %q", cfg.GitHubClientSecret, "gh-secret")
-	}
-	if cfg.GoogleClientID != "go-id" {
-		t.Errorf("GoogleClientID: got %q, want %q", cfg.GoogleClientID, "go-id")
-	}
-	if cfg.GoogleClientSecret != "go-secret" {
-		t.Errorf("GoogleClientSecret: got %q, want %q", cfg.GoogleClientSecret, "go-secret")
 	}
 }
 
@@ -280,7 +265,7 @@ func TestValidate_ErrorPaths(t *testing.T) {
 func TestLoad_PaymentChannelDefaults(t *testing.T) {
 	for _, k := range []string{
 		"STRIPE_WEBHOOK_SECRET", "WECHAT_PAY_API_V3_KEY",
-		"ALIPAY_PUBLIC_KEY_PATH", "LEMONSQUEEZY_WEBHOOK_SECRET",
+		"ALIPAY_PUBLIC_KEY_PATH",
 		"ORDER_EXPIRY_DURATION", "SWEEPER_INTERVAL",
 	} {
 		orig, had := os.LookupEnv(k)
@@ -302,9 +287,6 @@ func TestLoad_PaymentChannelDefaults(t *testing.T) {
 	if cfg.AlipayPublicKeyPath != "" {
 		t.Errorf("AlipayPublicKeyPath default: got %q, want empty", cfg.AlipayPublicKeyPath)
 	}
-	if cfg.LemonSqueezyWebhookSecret != "" {
-		t.Errorf("LemonSqueezyWebhookSecret default: got %q, want empty", cfg.LemonSqueezyWebhookSecret)
-	}
 	if cfg.OrderExpiryDuration != 30*time.Minute {
 		t.Errorf("OrderExpiryDuration default: got %v, want 30m", cfg.OrderExpiryDuration)
 	}
@@ -318,12 +300,11 @@ func TestLoad_PaymentChannelDefaults(t *testing.T) {
 // two together cover the Load() path for every payment-channel field.
 func TestLoad_PaymentChannelOverrides(t *testing.T) {
 	envVars := map[string]string{
-		"STRIPE_WEBHOOK_SECRET":      "whsec_x",
-		"WECHAT_PAY_API_V3_KEY":      "12345678901234567890123456789012", // 32 bytes
-		"ALIPAY_PUBLIC_KEY_PATH":     "/etc/alipay.pem",
-		"LEMONSQUEEZY_WEBHOOK_SECRET": "lssec_x",
-		"ORDER_EXPIRY_DURATION":      "5m",
-		"SWEEPER_INTERVAL":           "30s",
+		"STRIPE_WEBHOOK_SECRET":  "whsec_x",
+		"WECHAT_PAY_API_V3_KEY":  "12345678901234567890123456789012", // 32 bytes
+		"ALIPAY_PUBLIC_KEY_PATH": "/etc/alipay.pem",
+		"ORDER_EXPIRY_DURATION":  "5m",
+		"SWEEPER_INTERVAL":       "30s",
 	}
 	for k, v := range envVars {
 		orig, had := os.LookupEnv(k)
@@ -344,9 +325,6 @@ func TestLoad_PaymentChannelOverrides(t *testing.T) {
 	}
 	if cfg.AlipayPublicKeyPath != "/etc/alipay.pem" {
 		t.Errorf("AlipayPublicKeyPath override: got %q", cfg.AlipayPublicKeyPath)
-	}
-	if cfg.LemonSqueezyWebhookSecret != "lssec_x" {
-		t.Errorf("LemonSqueezyWebhookSecret override: got %q", cfg.LemonSqueezyWebhookSecret)
 	}
 	if cfg.OrderExpiryDuration != 5*time.Minute {
 		t.Errorf("OrderExpiryDuration override: got %v, want 5m", cfg.OrderExpiryDuration)

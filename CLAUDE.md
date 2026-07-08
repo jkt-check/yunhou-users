@@ -11,7 +11,7 @@ Yunhou Users is a **shared user management API** serving multiple consumer appli
 - **Shared identity**: One user account across all consumer apps
 - **Plan-based access**: Apps are accessible based on the user's subscribed plan (free/monthly/quarterly/yearly)
 - **API-first**: Consumer apps integrate via REST; no server-rendered UI
-- **Direct login (Google only)**: Google accepts `POST /auth/login` with `provider=google` + `provider_token`. **GitHub** was moved to the redirect flow (`/auth/github/redirect` → `/auth/github/callback`); `POST /auth/login` with `provider=github` returns 400.
+- **GitHub OAuth redirect flow**: Login is via `/auth/github/redirect` → `/auth/github/callback`. Yunhou holds each app's GitHub OAuth App `client_secret` and runs the code exchange server-side. There is no `POST /auth/login` endpoint.
 - **Subscription gate**: Login and token refresh check active subscription and plan app list before issuing tokens
 - **Refresh token rotation**: Every refresh invalidates the old refresh token and issues a new one
 
@@ -69,14 +69,12 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM path; empty = Alipay webhooks return 404 |
-| `LEMONSQUEEZY_WEBHOOK_SECRET` | No | (empty) | Empty = LemonSqueezy webhooks return 404 |
 | `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which webhook_id/API base is active |
 | `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | PayPal sandbox webhook ID; empty = sandbox disabled |
 | `PAYPAL_WEBHOOK_ID_LIVE` | No | (empty) | PayPal live webhook ID; empty = live disabled |
 | `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Not consumed by the running redirect flow — `/auth/github/*` reads each app's GitHub OAuth App credentials from `apps.config.oauth_providers.github` in the DB. Safe to leave blank. |
 | `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the GitHub OAuth `state` parameter (`/auth/github/redirect` + `/auth/github/callback`). Server-side only — multi-instance deployments must share the same value. **Minimum 32 characters** — `Validate()` (`internal/config/config.go:127`) rejects shorter values. Generate with `openssl rand -hex 32`. |
 | `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login`. `1` enables the endpoint; any other value (or unset) makes the handler return 404. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 
@@ -143,4 +141,4 @@ The design principle for user/identity/payment key information: **Yunhou holds i
 | `state` token (CSRF + open-redirect defence) | yunhou-users | HMAC-signed (`OAUTH_STATE_SECRET`); stateless — multi-instance deployment shares the secret. Binds `(app_id, callback_index)`. Expiry 5 min. |
 | yunhou's own JWT | yunhou-users | Returned to the BFF via the redirect URL's **fragment** (`#token=...`) — fragment is not sent to servers, so the access_token doesn't leak via referer / logs. |
 
-The legacy `POST /auth/login` direct-token path (`{provider: "github", provider_token: <token>}`) is **removed**: the HTTP handler now rejects `provider=github` with 400 and instructs the caller to use the redirect flow. Google's direct-token path remains for backward compatibility.
+The legacy `POST /auth/login` direct-token path has been **removed entirely** — GitHub is the only login provider and uses the redirect flow described above.

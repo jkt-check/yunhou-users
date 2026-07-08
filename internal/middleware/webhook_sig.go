@@ -381,41 +381,6 @@ func LoadAlipayPublicKeyFromPEM(pemBytes []byte) (*rsa.PublicKey, error) {
 }
 
 // ============================================================================
-// LemonSqueezy — raw-body HMAC-SHA256, hex digest, X-Signature header
-// ============================================================================
-
-// LemonsqueezyVerifier verifies LemonSqueezy webhooks. HMAC-SHA256 of the
-// raw request body, hex-encoded, sent in the X-Signature header.
-//
-// NO replay window — LS sends no timestamp in body or headers. Event-level
-// dedup via webhook_events.UNIQUE(channel, event_id) provides equivalent
-// (and stronger) replay protection: a stolen body replayed N days later
-// still hits the UNIQUE constraint and is dropped. See design doc §4.5.
-type LemonsqueezyVerifier struct {
-	Secret []byte
-}
-
-func (v *LemonsqueezyVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
-	// MultiChannelVerifier already routes by channel before calling us;
-	// the per-channel channel-name guard is defensive scaffolding.
-	_ = channel
-	sigHex := headers["X-Signature"]
-	if sigHex == "" {
-		return ErrInvalidSignature
-	}
-	expected, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return fmt.Errorf("%w: bad hex sig", ErrInvalidSignature)
-	}
-	mac := hmac.New(sha256.New, v.Secret)
-	mac.Write(body)
-	if !hmac.Equal(expected, mac.Sum(nil)) {
-		return ErrInvalidSignature
-	}
-	return nil
-}
-
-// ============================================================================
 // PayPal — HTTP verify-webhook-signature (sandbox + live both loaded)
 // ============================================================================
 
@@ -607,9 +572,8 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 type MultiChannelVerifier struct {
 	Stripe       ChannelSignatureVerifier
 	WeChat       ChannelSignatureVerifier
-	Alipay       ChannelSignatureVerifier
-	LemonSqueezy ChannelSignatureVerifier
-	Paypal       ChannelSignatureVerifier
+	Alipay ChannelSignatureVerifier
+	Paypal ChannelSignatureVerifier
 }
 
 func (m *MultiChannelVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
@@ -621,8 +585,6 @@ func (m *MultiChannelVerifier) VerifySignature(channel string, body []byte, head
 		v = m.WeChat
 	case "alipay":
 		v = m.Alipay
-	case "lemonsqueezy":
-		v = m.LemonSqueezy
 	case "paypal":
 		v = m.Paypal
 	default:

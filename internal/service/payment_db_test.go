@@ -1059,6 +1059,45 @@ func TestPaymentService_OnWebhook_PaypalStampsExternalSubID(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnWebhook_UnexpectedStateTransition covers the
+// "existing.Status != paid" branch in onPaymentSucceeded: a (channel,
+// external_txn_id) dedupe hit whose existing row is in a non-paid
+// state (e.g. 'failed'). The function should write an
+// unexpected_state_transition audit row and return nil (no escalation).
+func TestPaymentService_OnWebhook_UnexpectedStateTransition(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	// Pre-insert a payment row that's already 'failed' for a txn_id
+	// we're about to redeliver as payment_succeeded.
+	txnID := "pi-failed-then-succeeded-" + mustNewUUID()[:8]
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO payments (id, order_id, channel, external_txn_id, amount, currency, status, raw_payload)
+		VALUES ($1, $2, 'stripe', $3, 29.9, 'CNY', 'failed', '{}')
+	`, mustNewUUID(), order.ID, txnID); err != nil {
+		t.Fatalf("seed payment: %v", err)
+	}
+
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-ust-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook unexpected-state: %v", err)
+	}
+	_ = res
+	// Audit row for unexpected_state_transition.
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'unexpected_state_transition'`)
+	if n == 0 {
+		t.Error("expected audit_log row for unexpected_state_transition")
+	}
+}
+
 // TestPaymentService_OnWebhook_DisputeCreated_NoPayment covers the
 // "no matching payment row" early-return in onDisputeCreated. The handler
 // should not error; it just no-ops because there's nothing to flag.

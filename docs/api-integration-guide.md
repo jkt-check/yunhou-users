@@ -147,20 +147,22 @@ curl https://your-yunhou-domain/user/profile \
 
 #### POST /auth/login
 
-登录接口。
+> **GitHub 登录已迁移到 redirect 流程（见 §"GitHub OAuth 授权码流程"）。本接口不再接受 `provider=github`**——直接传 `provider_token` 的设计违反了"凭据由 yunhou 持有"的边界（详见 CLAUDE.md §"GitHub OAuth Boundary"）。Google 登录仍可走直传路径，未来会同步迁移。
+
+登录接口（仅 Google provider；GitHub 请用 redirect 流程）。
 
 **请求体**：
 ```json
 {
-  "provider": "github",
-  "provider_token": "gho_xxxx",
+  "provider": "google",
+  "provider_token": "ya29.xxx",
   "app_id": "yundian"
 }
 ```
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `provider` | 是 | 登录方式：`github` / `google` |
+| `provider` | 是 | 登录方式：当前仅支持 `google`（`github` 见下方 redirect 流程） |
 | `provider_token` | 是 | OAuth provider 的 access token |
 | `app_id` | 是 | 要访问的应用 ID |
 
@@ -639,7 +641,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 行为差异：
 
-- PayPal：yunhou-users 真正去 PayPal OAuth `client_credentials` 接口拿 access token，并在进程内缓存约 1 小时（TTL = `expires_in - safety_margin`）。并发去重（同一 `client_id` 同时只有一次上游调用）；单 Yunhou 实例维度缓存，多实例各自刷新（PayPal 的 `client_credentials` 对相同凭据幂等）。
+- PayPal：yunhou-users 真正去 PayPal OAuth `client_credentials` 接口拿 access token，并在进程内缓存 `expires_in − 60s`（即 PayPal 实际返回的剩余有效期减去 60 秒安全余量；典型 ~9 小时，最短不会低于 60 秒）。并发去重（同一 `client_id` 同时只有一次上游调用）；单 Yunhou 实例维度缓存，多实例各自刷新（PayPal 的 `client_credentials` 对相同凭据幂等）。
 - LemonSqueezy：仅返回 `apps.config.payment_providers.lemonsqueezy.api_key`（LS webhook-only，不消耗 access token）。
 
 **错误响应**：
@@ -999,6 +1001,146 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 ---
 
+### GitHub OAuth 授权码流程
+
+> **设计原则**：所有 OAuth provider 凭据（client_secret、access_token）由 yunhou 持有并使用，BFF 不接触任何长期秘密。BFF 端只持有 `client_id`（明文）+ 一次性 redirect_uri 白名单条目。
+
+适用场景：消费 app 需要让终端用户用 GitHub 账号登录。`POST /auth/login` 不再支持 `provider=github`（会返回 400），所有 GitHub 登录必须走下方流程。
+
+#### 配置（运营侧）
+
+1. 在 GitHub 后台（https://github.com/settings/developers）注册一个 OAuth App。
+2. 把 `client_id` 和 `client_secret` 写入 `apps.config.oauth_providers.github`：
+
+   ```json
+   {
+     "oauth_providers": {
+       "github": {
+         "client_id": "Iv1.xxxxxxxxxxxxxxx",
+         "client_secret": "<plaintext — server-side only>",
+         "callback_urls": [
+           "https://yundian.com/auth/callback",
+           "https://yundian.com/mobile/auth/callback"
+         ]
+       }
+     }
+   }
+   ```
+
+   - `client_secret` 仅 yunhou-users 使用，永不下发到 BFF
+   - `callback_urls` 必须全部是 `https://`，或 `http://localhost` / `http://127.0.0.1` / `http://[::1]`（本地开发用）
+   - 一份 OAuth App 多个 callback URL 是合法的（如 web / iOS / Android 共用）
+
+3. 设置环境变量 `OAUTH_STATE_SECRET`（必需，任意 32 字节以上随机串）—— 用于 state token 的 HMAC 签名。多实例部署必须共享同一个值。
+
+#### 流程
+
+```
+终端用户           BFF               yunhou-users            GitHub
+   │                │                    │                    │
+   │ 点登录按钮      │                    │                    │
+   │ ────────────→ │                    │                    │
+   │                │ GET /auth/github/redirect?app_id=yundian  │
+   │                │   &redirect_uri=... │                    │
+   │                │ ───────────────→   │                    │
+   │                │                    │ 验证 app_id +      │
+   │                │                    │ redirect_uri 白名单│
+   │                │                    │ 签 HMAC state      │
+   │                │ ← 302 ─────────────│                    │
+   │                │     Location:     │                    │
+   │                │     https://github.com/login/oauth/authorize?│
+   │                │       client_id=Iv1.x&redirect_uri=...&    │
+   │                │       state=HMAC(...)|                   │
+   │ ← 浏览器跳 ──→│                    │                    │
+   │                │                    │                    │
+   │ 用户在 GitHub 授权                       │                    │
+   │                │                    │                    │
+   │                │ ← GitHub 回调 ─────────────────────→│
+   │                │   /auth/github/callback              │
+   │                │   ?code=...&state=...&app_id=yundian │
+   │                │                    │                    │
+   │                │                    │ 验证 state HMAC   │
+   │                │                    │ client_secret 换   │
+   │                │                    │ GitHub access_token│
+   │                │                    │ 调 /user + /user/   │
+   │                │                    │   emails            │
+   │                │                    │ 丢弃 access_token │
+   │                │                    │ 签发 yunhou JWT    │
+   │ ← 302 跳 BFF ──│                    │                    │
+   │   #token=...   │                    │                    │
+   │ ←──────────────│                    │                    │
+   │                │                    │                    │
+   │ BFF 从 URL     │                    │                    │
+   │ fragment 读    │                    │                    │
+   │ yunhou JWT     │                    │                    │
+```
+
+#### GET /auth/github/redirect
+
+发起登录的入口。**不需要鉴权**。
+
+**查询参数**：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `app_id` | 是 | Yunhou app 标识 |
+| `redirect_uri` | 是 | GitHub 授权完成后的回调 URL，必须命中 `apps.config.oauth_providers.github.callback_urls` 中的某一项 |
+
+**响应（302）**：跳转 `https://github.com/login/oauth/authorize?...&state=<HMAC>`。
+
+**错误响应**：
+
+| HTTP | 触发条件 |
+|---|---|
+| 400 | `app_id` 或 `redirect_uri` 缺失 |
+| 400 | `redirect_uri` 不在 callback_urls 白名单 |
+| 404 | `app_id` 不存在 |
+| 404 | app 未配置 GitHub OAuth |
+| 500 | 其他内部错误 |
+
+#### GET /auth/github/callback
+
+GitHub 回调入口。**不需要鉴权**，但 `state` 必须有效。
+
+**查询参数**：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `code` | 是 | GitHub 授权码 |
+| `state` | 是 | `/redirect` 签发的 HMAC state |
+| `app_id` | 是 | 与 `/redirect` 时一致 |
+
+yunhou 完成 code 换 token、拉用户信息、签发 yunhou JWT，然后 302 跳回 BFF 的 callback URL，yunhou JWT 放在 URL fragment 里：
+
+```
+https://yundian.com/auth/callback#token=<yunhou_access>&refresh_token=<yunhou_refresh>&user_id=<uuid>&has_access=<bool>
+```
+
+BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏览器发送到服务器或 referer 头**，所以 access_token 不会泄漏。
+
+**错误响应**：
+
+| HTTP | 触发条件 |
+|---|---|
+| 400 | `code` / `state` / `app_id` 缺失 |
+| 400 | state 无效或过期（5 分钟） |
+| 400 | app_id 对应的 app 没有配置 GitHub OAuth |
+| 400 | GitHub `?error=access_denied` 等授权失败参数 |
+| 404 | app_id 不存在 |
+| 502 | GitHub 上游调用失败（网络、过期、配额） |
+
+#### 边界总结
+
+| 信息 | yunhou 持有？ | BFF 能拿到？ |
+|---|---|---|
+| GitHub `client_id` | ✓ | ✓（明文） |
+| GitHub `client_secret` | ✓ | ✗ |
+| `callback_urls` 白名单 | ✓ | ✗ |
+| GitHub `access_token`（回调后） | ✓（用即丢） | ✗ |
+| yunhou `access_token` | yunhou 签发 | ✓（fragment 里） |
+
+---
+
 ### 支付接口
 
 支付接口需要 JWT Bearer Token。所有订单、支付、退款只能由本人访问；所有权由服务端强制校验。
@@ -1323,7 +1465,7 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 }
 ```
 
-`domain_action` 取值（事件被处理时填）：`payment_paid` / `payment_failed` / `refund_paid` / `payment_disputed` / `payment_dispute_closed` / `none`。**dedupe 命中时为空字符串**——判别 dedupe 请用 `duplicate: true`，不要用 `domain_action == "none"`（`"none"` 仅表示"事件类型不在我们关心的范围内"，不代表已处理）。
+`domain_action` 取值（事件被处理时填）：`payment_paid` / `payment_failed` / `refund_paid` / `payment_disputed` / `payment_dispute_closed` / `none`。**判别 dedupe 请用 `duplicate: true`，不要用 `domain_action == "none"`**（`"none"` 仅表示"事件类型不在我们关心的范围内"，不代表已处理；dedupe 命中时 `domain_action` 仍会照常填写——只要看到 `duplicate: true` 就是已处理过的事件）。
 
 订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、LemonSqueezy `meta.custom_data.sub_expires_at`（在 LS checkout 创建时由前端嵌入；`subscription_payment_*` 事件缺省时不携带此字段）、PayPal `resource.billing_info.next_billing_time`（renewal `PAYMENT.SALE.COMPLETED` 事件携带；其他事件若无则忽略）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
 
@@ -1363,7 +1505,7 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 | 401 | `invalid app_id` | `X-App-ID` 不存在 |
 | 401 | `missing X-App-Secret header` | 调用方没带 `X-App-Secret` |
 | 401 | `invalid app_secret` | `X-App-Secret` 不匹配（**不会**区分"app 不存在" vs "secret 错"——避免枚举攻击） |
-| 401 | `app secret not initialized` | 该 app 行 `secret_hash` 为空（migration 005 之后未跑 `BackfillAppSecrets` 的过渡态）。建议：跑一次 server 启动 backfill，或者直接调 `POST /admin/apps/:id/rotate-secret` 重新生成 |
+| 401 | `app secret not initialized` | 该 app 行 `secret_hash` 为空（migration 007 之后未跑 `BackfillAppSecrets` 的过渡态）。建议：跑一次 server 启动 backfill，或者直接调 `POST /admin/apps/:id/rotate-secret` 重新生成 |
 | 403 | `app is disabled` | app 已停用 |
 
 **Rotation 流程**：怀疑 `X-App-Secret` 泄漏（例如 BFF 容器镜像被 pull 过、CI 缓存里出现过）时，立即调：

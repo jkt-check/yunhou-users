@@ -261,20 +261,91 @@ func (h *AppHandler) GetProviderToken(c *gin.Context) {
 // malformed fields surface as 400 from the handler.
 func validateAppConfig(cfg *model.AppConfig) error {
 	if cfg.PaymentProviders == nil {
-		return nil
-	}
-	if p := cfg.PaymentProviders.Paypal; p != nil {
-		if p.ClientID == "" || p.ClientSecret == "" || p.WebhookID == "" {
-			return errors.New("paypal: client_id, client_secret, webhook_id are required")
+		// fall through — OAuthProviders is a separate block
+	} else {
+		if p := cfg.PaymentProviders.Paypal; p != nil {
+			if p.ClientID == "" || p.ClientSecret == "" || p.WebhookID == "" {
+				return errors.New("paypal: client_id, client_secret, webhook_id are required")
+			}
+			if p.Mode != "live" && p.Mode != "sandbox" {
+				return errors.New("paypal.mode must be live or sandbox")
+			}
 		}
-		if p.Mode != "live" && p.Mode != "sandbox" {
-			return errors.New("paypal.mode must be live or sandbox")
+		if l := cfg.PaymentProviders.Lemonsqueezy; l != nil && (l.APIKey == "" || l.StoreID == "") {
+			return errors.New("lemonsqueezy: api_key and store_id are required")
 		}
 	}
-	if l := cfg.PaymentProviders.Lemonsqueezy; l != nil && (l.APIKey == "" || l.StoreID == "") {
-		return errors.New("lemonsqueezy: api_key and store_id are required")
+	if gh := cfg.OAuthProviders; gh != nil {
+		if g := gh.GitHub; g != nil {
+			if err := validateGitHubOAuthConfig(g); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// validateGitHubOAuthConfig enforces the boundary contract for a GitHub
+// OAuth App stored in apps.config.oauth_providers.github. Required when the
+// block is present; absence of the block means "GitHub login disabled for
+// this app" and is allowed.
+func validateGitHubOAuthConfig(g *model.GitHubOAuthConfig) error {
+	if g.ClientID == "" {
+		return errors.New("oauth_providers.github.client_id is required")
+	}
+	if g.ClientSecret == "" {
+		return errors.New("oauth_providers.github.client_secret is required")
+	}
+	if len(g.CallbackURLs) == 0 {
+		return errors.New("oauth_providers.github.callback_urls must list at least one URL")
+	}
+	seen := make(map[string]struct{}, len(g.CallbackURLs))
+	for _, u := range g.CallbackURLs {
+		if u == "" {
+			return errors.New("oauth_providers.github.callback_urls entries must not be empty")
+		}
+		// Restrict to https (callback URLs go over the wire carrying tokens);
+		// http is allowed only on loopback for local dev.
+		if !isAcceptableCallbackURL(u) {
+			return errors.New("oauth_providers.github.callback_urls entries must be https:// or http://127.0.0.1 / http://localhost")
+		}
+		if _, dup := seen[u]; dup {
+			return errors.New("oauth_providers.github.callback_urls must not contain duplicates")
+		}
+		seen[u] = struct{}{}
+	}
+	return nil
+}
+
+// isAcceptableCallbackURL permits https URLs in production and loopback
+// http URLs for local development. Anything else is rejected to prevent
+// tokens being shipped to a non-localhost cleartext endpoint by accident.
+func isAcceptableCallbackURL(u string) bool {
+	if len(u) >= 8 && u[:8] == "https://" {
+		return true
+	}
+	if len(u) >= 7 && u[:7] == "http://" {
+		rest := u[7:]
+		// strip path/port. IPv6 hosts (e.g. "[::1]:3000") start with "["
+		// and end with "]" — handle them as a special case so we don't
+		// trip on the embedded ":" separator.
+		if len(rest) > 0 && rest[0] == '[' {
+			end := strings.IndexByte(rest, ']')
+			if end < 0 {
+				return false
+			}
+			host := rest[1:end]
+			return host == "::1" || host == "127.0.0.1"
+		}
+		for i := 0; i < len(rest); i++ {
+			if rest[i] == '/' || rest[i] == ':' {
+				rest = rest[:i]
+				break
+			}
+		}
+		return rest == "127.0.0.1" || rest == "localhost"
+	}
+	return false
 }
 
 type SubscriptionHandler struct {
@@ -615,20 +686,27 @@ func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 			out.ProviderIDs["lemonsqueezy"] = pc.VariantID
 		}
 	}
-	// Authoritative cycle = first configured channel. PayPal wins by convention.
-	switch {
-	case cfg.PaymentProviders.Paypal != nil:
-		if pc, ok := cfg.PaymentProviders.Paypal.Plans[p.ID]; ok {
+	// Authoritative cycle = first configured channel that has a per-plan
+	// entry. PayPal wins by convention; if PayPal is configured app-wide but
+	// lacks an entry for this plan, fall through to LemonSqueezy. (Guard on
+	// `Paypal != nil` alone would skip LS whenever PayPal was configured
+	// but lacked this plan — leaving LS plans with cycle:null on the
+	// marketing endpoint.)
+	if pp := cfg.PaymentProviders.Paypal; pp != nil {
+		if pc, ok := pp.Plans[p.ID]; ok {
 			out.Cycle = &model.CycleSummary{
 				TrialDays:        pc.TrialDays,
 				BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
 			}
 		}
-	case cfg.PaymentProviders.Lemonsqueezy != nil:
-		if pc, ok := cfg.PaymentProviders.Lemonsqueezy.Plans[p.ID]; ok {
-			out.Cycle = &model.CycleSummary{
-				TrialDays:        pc.TrialDays,
-				BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
+	}
+	if out.Cycle == nil {
+		if ls := cfg.PaymentProviders.Lemonsqueezy; ls != nil {
+			if pc, ok := ls.Plans[p.ID]; ok {
+				out.Cycle = &model.CycleSummary{
+					TrialDays:        pc.TrialDays,
+					BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
+				}
 			}
 		}
 	}

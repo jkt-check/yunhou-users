@@ -40,6 +40,13 @@ func (m *mockAuthSvc) Login(ctx context.Context, req service.LoginRequest) (*ser
 	return m.loginResp, nil
 }
 
+func (m *mockAuthSvc) LoginWithProfile(ctx context.Context, req service.LoginWithProfileRequest) (*service.LoginResponse, error) {
+	if m.loginErr != nil {
+		return nil, m.loginErr
+	}
+	return m.loginResp, nil
+}
+
 func (m *mockAuthSvc) Logout(ctx context.Context, refreshToken string) error {
 	return m.logoutErr
 }
@@ -141,7 +148,16 @@ func (m *mockPlanSvc) GetPlan(ctx context.Context, id string) (*model.Plan, erro
 	if m.getErr != nil {
 		return nil, m.getErr
 	}
-	return m.plan, nil
+	// Return a copy so callers writing back via UpdatePlan can't race with
+	// other parallel subtests that share the same mock fixture.
+	if m.plan == nil {
+		return nil, nil
+	}
+	cp := *m.plan
+	if m.plan.Apps != nil {
+		cp.Apps = append([]string(nil), m.plan.Apps...)
+	}
+	return &cp, nil
 }
 
 func (m *mockPlanSvc) CreatePlan(ctx context.Context, p *model.Plan) error {
@@ -176,7 +192,7 @@ func TestAuthHandler_Login(t *testing.T) {
 		router := gin.New()
 		router.POST("/auth/login", handler.Login)
 
-		body := `{"provider":"github","provider_token":"tok","app_id":"yundian"}`
+		body := `{"provider":"google","provider_token":"tok","app_id":"yundian"}`
 		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -184,6 +200,25 @@ func TestAuthHandler_Login(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
+
+	t.Run("login rejects github direct token", func(t *testing.T) {
+		authSvc := &mockAuthSvc{}
+		tokenSvc := &mockTokenSvc{}
+		handler := NewAuthHandler(authSvc, tokenSvc)
+
+		router := gin.New()
+		router.POST("/auth/login", handler.Login)
+
+		body := `{"provider":"github","provider_token":"tok","app_id":"yundian"}`
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400, got %d", w.Code)
 		}
 	})
 
@@ -214,7 +249,7 @@ func TestAuthHandler_Login(t *testing.T) {
 		router := gin.New()
 		router.POST("/auth/login", handler.Login)
 
-		body := `{"provider":"github","provider_token":"bad","app_id":"yundian"}`
+		body := `{"provider":"google","provider_token":"bad","app_id":"yundian"}`
 		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -375,7 +410,7 @@ func TestPlanHandler_ListPlans(t *testing.T) {
 
 	t.Run("empty plan list → 200 with empty array", func(t *testing.T) {
 		planSvc := &mockPlanSvc{plans: nil}
-		handler := NewPlanHandler(planSvc)
+		handler := NewPlanHandler(planSvc, nil, nil)
 		router := gin.New()
 		router.GET("/admin/plans", handler.ListPlans)
 		req := httptest.NewRequest(http.MethodGet, "/admin/plans", nil)
@@ -619,6 +654,16 @@ func (m *mockAppRepo) List(ctx context.Context) ([]model.App, error) {
 		return nil, m.findErr
 	}
 	return m.apps, nil
+}
+
+func (m *mockAppRepo) ListUnhashed(ctx context.Context) ([]model.App, error) {
+	var out []model.App
+	for _, a := range m.apps {
+		if a.SecretHash == "" {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 func (m *mockAppRepo) FindByID(ctx context.Context, id string) (*model.App, error) {
@@ -1633,7 +1678,7 @@ func TestPlanHandler_DeletePlan_ErrorPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			gin.SetMode(gin.TestMode)
-			h := NewPlanHandler(tc.svc)
+			h := NewPlanHandler(tc.svc, nil, nil)
 			engine := gin.New()
 			engine.DELETE("/admin/plans/:id", h.DeletePlan)
 			req := httptest.NewRequest(http.MethodDelete, "/admin/plans/x", nil)
@@ -1685,7 +1730,7 @@ func TestPlanHandler_UpdatePlan_ErrorPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			gin.SetMode(gin.TestMode)
-			h := NewPlanHandler(tc.svc)
+			h := NewPlanHandler(tc.svc, nil, nil)
 			engine := gin.New()
 			engine.PATCH("/admin/plans/:id", h.UpdatePlan)
 			req := httptest.NewRequest(http.MethodPatch, "/admin/plans/x",
@@ -1723,7 +1768,7 @@ func TestPlanHandler_CreatePlan_ErrorPaths(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			h := NewPlanHandler(tc.svc)
+			h := NewPlanHandler(tc.svc, nil, nil)
 			engine := gin.New()
 			engine.POST("/admin/plans", h.CreatePlan)
 			req := httptest.NewRequest(http.MethodPost, "/admin/plans",
@@ -1759,29 +1804,33 @@ func TestAuthHandler_Login_ErrorPaths(t *testing.T) {
 			&mockAuthSvc{loginErr: service.ErrUnsupportedProvider},
 			`{"provider":"x","provider_token":"y","app_id":"a"}`,
 			http.StatusBadRequest, "unsupported provider"},
+		{"github provider rejected → 400 (use redirect flow)",
+			&mockAuthSvc{},
+			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			http.StatusBadRequest, "requires /auth/github/redirect"},
 		{"ErrAppNotFound → 401",
 			&mockAuthSvc{loginErr: service.ErrAppNotFound},
-			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			`{"provider":"google","provider_token":"y","app_id":"a"}`,
 			http.StatusUnauthorized, "app not found"},
 		{"ErrAppInactive → 401",
 			&mockAuthSvc{loginErr: service.ErrAppInactive},
-			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			`{"provider":"google","provider_token":"y","app_id":"a"}`,
 			http.StatusUnauthorized, "app is inactive"},
 		{"ErrUserNotFound → 401",
 			&mockAuthSvc{loginErr: service.ErrUserNotFound},
-			`{"provider":"github","provider_token":"bad","app_id":"a"}`,
+			`{"provider":"google","provider_token":"bad","app_id":"a"}`,
 			http.StatusUnauthorized, "user not found"},
 		{"ErrUserSuspended → 401",
 			&mockAuthSvc{loginErr: service.ErrUserSuspended},
-			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			`{"provider":"google","provider_token":"y","app_id":"a"}`,
 			http.StatusUnauthorized, "user is suspended"},
 		{"unknown error → 500",
 			&mockAuthSvc{loginErr: errors.New("db exploded")},
-			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			`{"provider":"google","provider_token":"y","app_id":"a"}`,
 			http.StatusInternalServerError, "login failed"},
 		{"success → 200",
 			&mockAuthSvc{loginResp: &service.LoginResponse{}},
-			`{"provider":"github","provider_token":"y","app_id":"a"}`,
+			`{"provider":"google","provider_token":"y","app_id":"a"}`,
 			http.StatusOK, ""},
 	}
 	for _, tc := range cases {
@@ -1899,7 +1948,7 @@ func TestAuthHandler_Logout_ErrorPaths(t *testing.T) {
 func newAppEngine(repo *mockAppRepo) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	h := NewAppHandler(repo)
+	h := NewAppHandler(repo, nil)
 	engine.GET("/apps/:id", h.GetApp)
 	engine.POST("/admin/apps", h.CreateApp)
 	engine.PATCH("/admin/apps/:id", h.UpdateApp)
@@ -2431,4 +2480,33 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 			t.Errorf("status = %d, want 400", w.Code)
 		}
 	})
+}
+
+// =========================================================================
+// authErrReason — maps service-layer auth sentinels to URL-fragment-safe
+// tokens. Used by the GitHub OAuth callback to encode failure reason in
+// the redirect.
+// =========================================================================
+
+func TestAuthErrReason(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{service.ErrAppNotFound, "app_not_found"},
+		{service.ErrAppInactive, "app_disabled"},
+		{service.ErrUserNotFound, "user_not_found"},
+		{service.ErrUserDeleted, "user_not_found"},
+		{service.ErrUserSuspended, "user_suspended"},
+		{service.ErrSubscriptionExpired, "subscription_expired"},
+		{service.ErrSubscriptionNotActive, "subscription_expired"},
+		{errors.New("some other error"), "auth_failed"},
+		{nil, "auth_failed"},
+	}
+	for _, tc := range cases {
+		if got := authErrReason(tc.err); got != tc.want {
+			t.Errorf("authErrReason(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
 }

@@ -44,10 +44,47 @@ func isExpectedAuthErr(err error) bool {
 	return false
 }
 
+// authErrReason maps the service-layer auth sentinels to a short token
+// safe to put in a URL fragment. Used by the GitHub OAuth callback to
+// tell the BFF which class of failure occurred without stranding the
+// browser on a JSON error page. Returns "auth_failed" for anything we
+// don't recognise.
+func authErrReason(err error) string {
+	switch {
+	case errors.Is(err, service.ErrAppNotFound):
+		return "app_not_found"
+	case errors.Is(err, service.ErrAppInactive):
+		return "app_disabled"
+	case errors.Is(err, service.ErrUserNotFound), errors.Is(err, service.ErrUserDeleted):
+		return "user_not_found"
+	case errors.Is(err, service.ErrUserSuspended):
+		return "user_suspended"
+	case errors.Is(err, service.ErrSubscriptionExpired), errors.Is(err, service.ErrSubscriptionNotActive):
+		return "subscription_expired"
+	default:
+		return "auth_failed"
+	}
+}
+
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req service.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	// GitHub login must use the OAuth redirect flow (/auth/github/redirect
+	// → /auth/github/callback) — the boundary contract is that Yunhou
+	// holds the OAuth App's client_secret and runs the code exchange
+	// server-side. Accepting a BFF-supplied access_token here would let
+	// the BFF bypass that contract. Google keeps the direct-token path
+	// for backward compatibility; that path will be deprecated in a
+	// follow-up so it lines up with the GitHub boundary.
+	if req.Provider == "github" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "github login requires /auth/github/redirect + /auth/github/callback; direct provider_token is not accepted",
+		})
 		return
 	}
 

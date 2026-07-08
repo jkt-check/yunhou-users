@@ -203,6 +203,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		JWTRefreshTTL:       168 * time.Hour,
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     1 * time.Minute,
+		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
 	}
 
 	// Repos
@@ -247,11 +248,12 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	// requires wiring a stub upstream.
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
+	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc)
 
 	return engine, nil, db
 }
@@ -417,6 +419,7 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		JWTRefreshTTL:       168 * time.Hour,
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     1 * time.Minute,
+		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
 	}
 
 	// Repos
@@ -482,11 +485,12 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	engine.Use(gin.Recovery())
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
+	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc)
 
 	// Stash the private key in a closure-accessible holder so signing helpers
 	// can produce valid signatures. (We don't expose the priv directly to

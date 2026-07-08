@@ -22,6 +22,7 @@ type App struct {
 type AppConfig struct {
 	Brand            *BrandConfig            `json:"brand,omitempty"`
 	PaymentProviders *PaymentProvidersConfig `json:"payment_providers,omitempty"`
+	OAuthProviders   *OAuthProvidersConfig   `json:"oauth_providers,omitempty"`
 }
 
 // BrandConfig carries app-level display strings (e.g. brand name for the
@@ -75,4 +76,35 @@ type ProviderToken struct {
 	AccessToken string `json:"access_token,omitempty"`
 	ExpiresIn   int    `json:"expires_in,omitempty"`
 	APIKey      string `json:"api_key,omitempty"`
+}
+
+// OAuthProvidersConfig groups all OAuth providers configured for an app.
+// Today only GitHub is supported; the block is structured so future
+// providers (Google, Microsoft, ...) slot in alongside.
+type OAuthProvidersConfig struct {
+	GitHub *GitHubOAuthConfig `json:"github,omitempty"`
+}
+
+// GitHubOAuthConfig stores the GitHub OAuth App credentials Yunhou uses to
+// run the /auth/github/redirect + /auth/github/callback flow on behalf of a
+// consumer app.
+//
+// Boundary (design doc §"GitHub OAuth boundary"):
+//
+//   - ClientID is public — Yunhou may echo it back to the BFF (it appears in
+//     the redirect URL anyway).
+//   - ClientSecret is server-side only. It must NEVER appear in any response
+//     body returned to the BFF or end-user; the handler maps ErrAppNotConfigured
+//     or similar without surfacing the secret. Stored plaintext on disk
+//     because Yunhou needs it to call GitHub's token endpoint — there is no
+//     "hash this and never use it again" pattern available.
+//   - CallbackURLs is the whitelist the callback handler matches the incoming
+//     redirect_uri against. Multiple entries are allowed because a single
+//     consumer app may have multiple client surfaces (web, iOS, Android)
+//     sharing one GitHub OAuth App. Each callback must match exactly one
+//     entry; no prefix or suffix matching.
+type GitHubOAuthConfig struct {
+	ClientID     string   `json:"client_id"`
+	ClientSecret string   `json:"client_secret"`
+	CallbackURLs []string `json:"callback_urls"`
 }

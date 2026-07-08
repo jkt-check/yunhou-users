@@ -43,11 +43,14 @@ psql -h localhost -U postgres -c "SELECT datname FROM pg_database WHERE datname 
 ## 第三步：执行数据库迁移（建表）
 
 ```bash
-# 必须按顺序执行：001 创建核心表，002 简化订阅系统（依赖 001），003 添加支付/退款/Webhook 表，004 扩展 CHECK 约束支持 lemonsqueezy 渠道
+# 必须按顺序执行：001 创建核心表，002 简化订阅系统（依赖 001），003 添加支付/退款/Webhook 表，004 扩展 CHECK 约束支持 lemonsqueezy 渠道，005 增加 paypal 渠道 CHECK 约束，006 添加 subscriptions.external_subscription_id，007 给 apps 表添加 secret_hash 列
 psql -h localhost -U postgres -d yunhou_users -f migrations/001_init.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/003_payments.sql
 psql -h localhost -U postgres -d yunhou_users -f migrations/004_ls_channel.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/005_paypal_channel.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
+psql -h localhost -U postgres -d yunhou_users -f migrations/007_app_secret.sql
 ```
 
 这会创建 11 张表：
@@ -55,7 +58,9 @@ psql -h localhost -U postgres -d yunhou_users -f migrations/004_ls_channel.sql
 - 核心（001）：`users`、`social_identities`、`apps`、`subscriptions`、`sessions`
 - 订阅（002）：`plans`
 - 支付/退款/Webhook（003）：`orders`、`payments`、`refunds`、`webhook_events`、`audit_log`
-- 004 仅扩展 `payments` / `refunds` / `webhook_events` 的 channel CHECK 约束（增加 `lemonsqueezy`），不新增表
+- 004/005 仅扩展 `payments` / `refunds` / `webhook_events` 的 channel CHECK 约束（增加 `lemonsqueezy` 和 `paypal`），不新增表
+- 006 给 `subscriptions` 加 `external_subscription_id` 列（PayPal 续费 webhook 用），不新增表
+- 007 给 `apps` 加 `secret_hash` 列（`X-App-Secret` 内部服务鉴权用），不新增表
 
 验证表是否创建成功：
 
@@ -120,7 +125,7 @@ DATABASE_URL=postgres://postgres@localhost/yunhou_users?sslmode=disable
 > - `JWT_ACCESS_TTL` 默认 `15m`
 > - `JWT_REFRESH_TTL` 默认 `168h`（7 天）
 >
-> 支付渠道的 Webhook 密钥（`STRIPE_WEBHOOK_SECRET`、`WECHAT_PAY_API_V3_KEY`、`ALIPAY_PUBLIC_KEY_PATH`）只在接入对应渠道时才需要配置。`GITHUB_*` / `GOOGLE_*` 是**预留**配置项，当前直接登录模式不消费它们。
+> 支付渠道的 Webhook 密钥（`STRIPE_WEBHOOK_SECRET`、`WECHAT_PAY_API_V3_KEY`、`ALIPAY_PUBLIC_KEY_PATH`）只在接入对应渠道时才需要配置。`OAUTH_STATE_SECRET` 是 GitHub OAuth state HMAC 的密钥，必需配置（多实例部署必须共享同一值）。`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` 是**预留**配置项，当前不消费（Google 走直传路径，GitHub 凭据由 `apps.config.oauth_providers.github` 持有）。
 
 ---
 
@@ -256,7 +261,7 @@ psql -h localhost -U postgres -c "SELECT 1 FROM pg_database WHERE datname = 'yun
 
 echo "检查表..."
 TABLE_COUNT=$(psql -h localhost -U postgres -d yunhou_users -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")
-echo "  公共表数量: $TABLE_COUNT (需要 11 张：001_init + 002_simplify_plans + 003_payments；004 仅修改约束、不加表)"
+echo "  公共表数量: $TABLE_COUNT (需要 11 张：001_init + 002_simplify_plans + 003_payments；004/005/006/007 仅修改约束/加列、不加表)"
 
 echo "检查密钥..."
 [ -f keys/private.pem ] && echo "✓ private.pem 存在" || echo "✗ 缺少 private.pem，请执行: make generate-keys"

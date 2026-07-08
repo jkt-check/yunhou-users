@@ -14,6 +14,13 @@ type Config struct {
 	RSAPrivate  string
 	RSAPublic   string
 
+	// OAuthStateSecret signs the state parameter on the GitHub OAuth
+	// redirect flow (CSRF + replay + open-redirect defence). Required at
+	// startup — operators who don't enable GitHub login can set it to any
+	// non-empty value (the handler returns 404 when no apps carry the
+	// github provider config, regardless of the secret).
+	OAuthStateSecret string
+
 	// GitHubClientID/Secret are reserved for a future OAuth redirect flow.
 	// They are not used by the current direct-login implementation but kept
 	// in the env so operators can pre-provision credentials.
@@ -58,6 +65,7 @@ func Load() *Config {
 		RSAPrivate:  envOr("RSA_PRIVATE_KEY_PATH", "keys/private.pem"),
 		RSAPublic:   envOr("RSA_PUBLIC_KEY_PATH", "keys/public.pem"),
 
+		OAuthStateSecret:   os.Getenv("OAUTH_STATE_SECRET"),
 		GitHubClientID:     os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
 		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
@@ -109,6 +117,15 @@ func (c *Config) Validate() error {
 	}
 	if c.SweeperInterval >= c.OrderExpiryDuration {
 		return errors.New("SWEEPER_INTERVAL must be strictly less than ORDER_EXPIRY_DURATION")
+	}
+	if c.OAuthStateSecret == "" {
+		return errors.New("OAUTH_STATE_SECRET is required")
+	}
+	// 32 bytes minimum — 1-byte secrets are brute-forceable in
+	// microseconds against the HMAC-SHA256 state token. Operators should
+	// generate via `openssl rand -hex 32`.
+	if len(c.OAuthStateSecret) < 32 {
+		return errors.New("OAUTH_STATE_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
 	}
 	return nil
 }

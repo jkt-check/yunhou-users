@@ -89,12 +89,23 @@ func main() {
 	// means that channel returns 404 (not configured).
 	webhookVerifier := buildWebhookVerifier(cfg)
 
-	// Provider-token plumbing. PayPal uses a live base URL by default; the
-	// cache collapses repeat fetches within the same client_id's TTL window.
-	// LS is webhook-only in Yunhou — no outbound HTTP, the service reads the
-	// api_key directly from apps.config.payment_providers.lemonsqueezy.
+	// Provider-token plumbing. PayPal's base URL tracks PAYPAL_ENV so the
+	// /apps/:id/provider-token/paypal endpoint hits the same environment as
+	// the webhook verifier (api-m.sandbox.paypal.com for sandbox,
+	// api-m.paypal.com for live). The cache collapses repeat fetches within
+	// the same client_id's TTL window. LS is webhook-only in Yunhou — no
+	// outbound HTTP, the service reads the api_key directly from
+	// apps.config.payment_providers.lemonsqueezy.
+	//
+	// config.PaypalEnv defaults to "live" when unset, so cfg.PaypalEnv == ""
+	// is unreachable. Anything other than "sandbox" or "live" is a typo —
+	// we crash loud rather than silently misrouting OAuth tokens.
 	paypalHTTPClient := &http.Client{Timeout: 5 * time.Second}
-	paypalOAuth := paypal.NewOAuthClient(paypalHTTPClient, paypal.ModeLive.BaseURL())
+	paypalMode := paypal.Mode(cfg.PaypalEnv)
+	if paypalMode != paypal.ModeSandbox && paypalMode != paypal.ModeLive {
+		log.Fatalf("paypal: PAYPAL_ENV=%q is invalid; must be sandbox or live", cfg.PaypalEnv)
+	}
+	paypalOAuth := paypal.NewOAuthClient(paypalHTTPClient, paypalMode.BaseURL())
 	paypalCache := paypal.NewTokenCache(60 * time.Second)
 	paypalFetcher := paypal.NewCachedClient(paypalOAuth, paypalCache)
 	providerTokenSvc := service.NewProviderTokenService(appRepo, paypalFetcher)
@@ -105,7 +116,7 @@ func main() {
 	// Order expiry sweeper (in-process goroutine).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)
 
-	// One-shot secret backfill for rows created before migration 005_app_secret
+	// One-shot secret backfill for rows created before migration 007_app_secret
 	// added the secret_hash column. Idempotent — once every row has a hash,
 	// subsequent restarts are no-ops. Plaintext is logged exactly once per row
 	// to stdout; capture it from the deploy log and rotate via the dedicated
@@ -131,11 +142,13 @@ func main() {
 
 	sweeper.Start(rootCtx)
 
+	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
+
 	router.Setup(rootCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
-		providerTokenSvc, quoteSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

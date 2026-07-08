@@ -65,7 +65,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `JWT_ACCESS_TTL` | No | `15m` | Must be positive |
 | `JWT_REFRESH_TTL` | No | `168h` (7 days) | Must be > access TTL; ≤ 365 days |
 | `ORDER_EXPIRY_DURATION` | No | `30m` | Pending order TTL; sweeper flips to `expired` after this |
-| `SWEEPER_INTERVAL` | No | `1m` | Must be < `ORDER_EXPIRY_DURATION` |
+| `SWEEPER_INTERVAL` | No | `1m` | Must be strictly < `ORDER_EXPIRY_DURATION` |
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM path; empty = Alipay webhooks return 404 |
@@ -77,6 +77,8 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | (empty) | Reserved for future OAuth redirect flow; not consumed in v1 |
+| `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the GitHub OAuth state parameter (`/auth/github/redirect` + `/auth/github/callback`). Server-side only — multi-instance deployments must share the same value. Operators who don't enable GitHub login can set any non-empty value. |
+| `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login`. `1` enables the endpoint; any other value (or unset) makes the handler return 404. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 
 ## API Response Format
 
@@ -93,6 +95,8 @@ All endpoints return:
 
 **Public** (rate-limited 10/s burst 20 per IP):
 - `GET /.well-known/jwks.json`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /apps/:id/plans`
+- `GET /auth/github/redirect` and `GET /auth/github/callback` — the GitHub OAuth Authorization Code flow. Yunhou holds the OAuth App's `client_secret` and runs the code exchange server-side; the BFF supplies only `client_id` (via redirect URL) and a `redirect_uri` matching an entry in `apps.config.oauth_providers.github.callback_urls`. See "Boundary" below.
+- `POST /test/login` — **dev-only** (gated by `PAYPAL_L3_E2E_MODE=1`, otherwise returns 404). Used by `tests/e2e-ui/` to mint JWTs without going through OAuth. Never exposed in production.
 
 **Health probe** (NOT rate-limited — registered before the public limiter in `internal/router/router.go:35`):
 - `GET /healthz` — DB-backed liveness/readiness. Returns 200 `{"code":0,"data":{"status":"ok"}}` or 503 `{"code":503,"message":"db unavailable"}` if the DB ping fails.
@@ -108,7 +112,7 @@ All endpoints return:
 - New orders write `currency = "CNY"` hardcoded in `internal/service/payment.go:125`. Channel webhooks carry `sub_expires_at` through `payment.metadata`/`resource.sub_expires_at`/`meta.custom_data.sub_expires_at` — yunhou-users does not derive it server-side.
 
 **App management** (internal service auth via `X-App-ID` + `X-App-Secret` headers, rate-limited 30/s burst 60 per IP):
-- `GET /apps`, `GET /apps/:id`, `GET /apps/:id/provider-token/:channel` (PayPal OAuth cached in-process ~1h with `singleflight` dedupe; LemonSqueezy returns the static `api_key`)
+- `GET /apps`, `GET /apps/:id`, `GET /apps/:id/provider-token/:channel` (PayPal OAuth token cached in-process for `expires_in − 60s` — typically ~9h, never shorter than the safety margin; singleflight dedupe avoids N concurrent fetches per `client_id`; LemonSqueezy returns the static `api_key`)
 - `GET /admin/plans`, `GET /admin/plans/:id`, `POST /admin/plans`, `PATCH /admin/plans/:id`, `DELETE /admin/plans/:id`
 - `POST /admin/apps` (returns plaintext `secret` once — only bcrypt hash is persisted), `PATCH /admin/apps/:id`, `POST /admin/apps/:id/rotate-secret` (returns new plaintext, invalidates the old one immediately)
 
@@ -125,3 +129,18 @@ All endpoints return:
 - Parameterized queries only — no string interpolation
 - Tokens stored as SHA-256 hashes; app shared secrets (`apps.secret_hash`) stored as bcrypt hashes — bcrypt is slow on purpose to defend against DB leaks
 - Server-side secrets (X-App-Secret, refresh tokens) are returned to the caller **exactly once** at create/rotate/login time; only hashes persist. Rotation invalidates the prior value immediately — no grace period.
+
+## GitHub OAuth Boundary
+
+The design principle for user/identity/payment key information: **Yunhou holds it; the website (BFF / consumer app) only handles lightweight business logic and never sees the raw secrets.**
+
+| Key information | Held by | Reachable by |
+|---|---|---|
+| GitHub OAuth App `client_id` | yunhou-users | Echoed in the upstream `/login/oauth/authorize` URL the BFF redirects to. Public by design (appears in OAuth redirects anyway). |
+| GitHub OAuth App `client_secret` | yunhou-users only | **Never** sent to the BFF. Used only inside `/auth/github/callback` to exchange the auth code for an access token. |
+| `callback_urls` whitelist | yunhou-users | Compared against the BFF-supplied `redirect_uri` on every callback. Stored as plaintext array in `apps.config.oauth_providers.github.callback_urls` because Yunhou needs the values to construct the upstream URL. Multiple entries allowed (web/iOS/Android sharing one GitHub OAuth App). |
+| GitHub `access_token` (after code exchange) | yunhou-users (transient) | Used exactly twice — `/user` then `/user/emails` — then dropped. Never written to DB. Never returned to the BFF. |
+| `state` token (CSRF + open-redirect defence) | yunhou-users | HMAC-signed (`OAUTH_STATE_SECRET`); stateless — multi-instance deployment shares the secret. Binds `(app_id, callback_index)`. Expiry 5 min. |
+| yunhou's own JWT | yunhou-users | Returned to the BFF via the redirect URL's **fragment** (`#token=...`) — fragment is not sent to servers, so the access_token doesn't leak via referer / logs. |
+
+The legacy `POST /auth/login` direct-token path (`{provider: "github", provider_token: <token>}`) is **removed**: the HTTP handler now rejects `provider=github` with 400 and instructs the caller to use the redirect flow. Google's direct-token path remains for backward compatibility.

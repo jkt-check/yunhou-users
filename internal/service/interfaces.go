@@ -10,6 +10,7 @@ import (
 // AuthServiceInterface defines the interface for authentication operations
 type AuthServiceInterface interface {
 	Login(ctx context.Context, req LoginRequest) (*LoginResponse, error)
+	LoginWithProfile(ctx context.Context, req LoginWithProfileRequest) (*LoginResponse, error)
 	Logout(ctx context.Context, refreshToken string) error
 	RefreshToken(ctx context.Context, refreshToken, appID string) (*LoginResponse, error)
 	TestLogin(ctx context.Context, req TestLoginRequest) (*LoginResponse, error)

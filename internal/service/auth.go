@@ -102,6 +102,15 @@ type LoginRequest struct {
 	AppID         string `json:"app_id" binding:"required"`
 }
 
+// LoginWithProfileRequest is the input for AuthService.LoginWithProfile:
+// identity binding uses a pre-fetched ProviderUserInfo instead of re-calling
+// the provider's userinfo API. Used by /auth/github/callback after the
+// handler has already exchanged the code and fetched the profile once.
+type LoginWithProfileRequest struct {
+	Profile *ProviderUserInfo
+	AppID   string
+}
+
 // TestLoginRequest is the body for POST /test/login. Dev-only — gated by
 // PAYPAL_L3_E2E_MODE=1. L3 Playwright suite uses this to mint a real JWT
 // against a locally-running backend that has its GitHub OAuth verifier
@@ -141,11 +150,28 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 	if err != nil {
 		return nil, err
 	}
+	return s.LoginWithProfile(ctx, LoginWithProfileRequest{
+		Profile: providerUser,
+		AppID:   req.AppID,
+	})
+}
 
-	// 2. Verify the requested app exists and is active before issuing tokens.
+// LoginWithProfile is the Login flow that accepts a pre-fetched
+// ProviderUserInfo instead of re-calling the provider userinfo API.
+// Used by /auth/github/callback after the handler has already exchanged
+// the code and fetched the profile — calling Login would do a second
+// upstream /user round-trip per callback.
+func (s *AuthService) LoginWithProfile(ctx context.Context, req LoginWithProfileRequest) (*LoginResponse, error) {
+	if req.Profile == nil {
+		return nil, errors.New("nil profile")
+	}
+	providerUser := req.Profile
+	appID := req.AppID
+
+	// 1. Verify the requested app exists and is active before issuing tokens.
 	//    Without this, a user could log in for a disabled or unknown app and
 	//    still receive a signed access token with that app_id in the audience.
-	app, err := s.appRepo.FindByID(ctx, req.AppID)
+	app, err := s.appRepo.FindByID(ctx, appID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrAppNotFound
@@ -156,13 +182,13 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		return nil, ErrAppInactive
 	}
 
-	// 3. Find or create user + identity
+	// 2. Find or create user + identity
 	user, err := s.getOrCreateUser(ctx, providerUser)
 	if err != nil {
 		return nil, fmt.Errorf("get or create user: %w", err)
 	}
 
-	// 4. Enforce account status. A suspended or deleted user must not be able
+	// 3. Enforce account status. A suspended or deleted user must not be able
 	//    to mint fresh tokens even if they still hold an active subscription.
 	if user.Status == "suspended" {
 		return nil, ErrUserSuspended
@@ -171,7 +197,7 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		return nil, ErrUserDeleted
 	}
 
-	// 5. Resolve the identity for this login so the response reflects the
+	// 4. Resolve the identity for this login so the response reflects the
 	//    email of the provider the user just signed in with. We deliberately
 	//    do NOT fall back to other identities — a Google-linked email should
 	//    not leak into a GitHub login response. If the matching identity has
@@ -187,13 +213,13 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		}
 	}
 
-	// 6. Get user's active subscription (no row → no subscription, use default plan)
+	// 5. Get user's active subscription (no row → no subscription, use default plan)
 	sub, err := s.findUsableSubscription(ctx, user.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	// 7. Determine plan and app access
+	// 6. Determine plan and app access
 	var plan *model.Plan
 	if sub == nil {
 		// No subscription, use default (free) plan
@@ -208,10 +234,10 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 		}
 	}
 
-	hasAccess := slices.Contains(plan.Apps, req.AppID)
+	hasAccess := slices.Contains(plan.Apps, appID)
 
-	// 5. Generate tokens
-	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, req.AppID, plan.Apps)
+	// 7. Generate tokens
+	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, plan.Apps)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -224,7 +250,7 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*LoginRespon
 	session := &model.Session{
 		ID:           GenerateUUID(),
 		UserID:       user.ID,
-		AppID:        req.AppID,
+		AppID:        appID,
 		SessionType:  "refresh",
 		RefreshToken: hashToken(refreshTokenRaw),
 		Scope:        plan.Apps,

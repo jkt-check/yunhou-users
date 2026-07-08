@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/yunhou/users/internal/model"
@@ -227,6 +228,33 @@ func TestPlanService_CheckAppAccess(t *testing.T) {
 		canAccess = svc.CheckAppAccess(ctx, nil, "yundash")
 		if canAccess {
 			t.Error("expected false for yundash on default free plan")
+		}
+	})
+}
+
+// TestPlanService_CheckAppAccess_RarePaths covers the "find default
+// plan error" and "find plan by id error" branches the table-driven
+// test doesn't reach.
+func TestPlanService_CheckAppAccess_RarePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("FindDefault error when no subscription", func(t *testing.T) {
+		planRepo := newMockPlanRepo()
+		planRepo.err = errors.New("db down")
+		svc := NewPlanService(planRepo)
+		if svc.CheckAppAccess(ctx, nil, "yundian") {
+			t.Error("expected false when FindDefault errors")
+		}
+	})
+
+	t.Run("FindByID error when subscription exists", func(t *testing.T) {
+		planRepo := newMockPlanRepo()
+		planRepo.err = errors.New("db down")
+		svc := NewPlanService(planRepo)
+		sub := &model.Subscription{ID: "sub-1", UserID: "user-1", PlanID: "missing"}
+		if svc.CheckAppAccess(ctx, sub, "yundian") {
+			t.Error("expected false when FindByID errors")
 		}
 	})
 }

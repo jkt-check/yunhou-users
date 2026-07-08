@@ -278,6 +278,11 @@ func (m *mockSubscriptionRepo) FindActiveByUserID(_ context.Context, userID stri
 	if !ok {
 		return nil, sql.ErrNoRows
 	}
+	// Defensive: a nil entry in byUserID returns (nil, nil) — drives
+	// the "sub == nil" defensive branch in callers.
+	if s == nil {
+		return nil, nil
+	}
 	// Check if expired
 	if s.ExpiresAt != nil && s.ExpiresAt.Before(time.Now()) {
 		return nil, fmt.Errorf("subscription expired")

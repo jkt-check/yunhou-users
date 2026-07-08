@@ -448,6 +448,36 @@ func timePtr(t time.Time) *time.Time {
 	return &t
 }
 
+// TestSubscriptionService_GetUserSubscription_NilSub covers the
+// "sub == nil" branch in GetUserSubscription. The mock's
+// FindActiveByUserID returns (nil, nil) when byUserID has a nil
+// entry for the user — this drives the "sub == nil" defensive
+// path. In production this is rare (a real DB would return an
+// error or a real row) but the defensive check exists.
+func TestSubscriptionService_GetUserSubscription_NilSub(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	sr := newMockSubscriptionRepo()
+	pr := newMockPlanRepo()
+	pr.defaultPlan = &model.Plan{ID: "free", Name: "免费"}
+	// Pre-seed byUserID with a nil entry — simulates "DB returned
+	// nil without an error" (defensive branch).
+	var nilSub *model.Subscription
+	sr.byUserID["u-nilsub"] = nilSub
+	planSvc := &PlanService{planRepo: pr}
+	subSvc := NewSubscriptionService(sr, planSvc)
+	sub, plan, err := subSvc.GetUserSubscription(ctx, "u-nilsub")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sub != nil {
+		t.Errorf("expected nil subscription, got %v", sub)
+	}
+	if plan == nil || plan.ID != "free" {
+		t.Errorf("expected default plan 'free', got %v", plan)
+	}
+}
+
 // TestSubscriptionService_GetUserSubscription_RarePaths fills in branches
 // the table-driven test doesn't reach: subRepo returning a non-ErrNoRows
 // error (e.g. connection failure), and the "get plan" error path when

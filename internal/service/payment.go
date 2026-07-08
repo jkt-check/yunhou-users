@@ -32,6 +32,14 @@ type PaymentService struct {
 	webhookRepo repo.WebhookEventRepo
 	auditRepo   repo.AuditLogRepo
 
+	// dbBeginTx is the indirection used by the webhook handlers to
+	// start a transaction. The default delegates to s.db.BeginTxx;
+	// tests override it to inject a fake transaction that returns
+	// configured errors, driving otherwise-unreachable
+	// `return fmt.Errorf("...: %w", err)` branches in onPaymentSucceeded,
+	// onPaymentFailed, onRefundSucceeded, and onDisputeCreated.
+	dbBeginTx func(ctx context.Context) (dbTx, error)
+
 	// refundAPI is the channel-side refund caller. Production wires
 	// real Stripe/WeChat/Alipay HTTP clients here; tests inject stubs.
 	refundAPI RefundAPI
@@ -81,7 +89,25 @@ func NewPaymentService(
 		auditRepo:   auditRepo,
 		refundAPI:   refundAPI,
 		orderExpiry: orderExpiry,
+		dbBeginTx: func(ctx context.Context) (dbTx, error) {
+			return db.BeginTxx(ctx, nil)
+		},
 	}
+}
+
+// dbTx is a minimal interface for the transaction operations the
+// webhook handlers use. Production code wraps *sqlx.Tx; tests wrap
+// a custom in-memory struct that returns configured errors. The
+// surface is the union of methods called by the four webhook
+// handlers and the three helper functions (insertPaymentOnTx,
+// activateSubscriptionOnTx, writeAuditOnTx).
+type dbTx interface {
+	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryRowxContext(ctx context.Context, query string, args ...interface{}) *sqlx.Row
+	NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error)
+	Commit() error
+	Rollback() error
 }
 
 // ============================================================================
@@ -292,7 +318,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 
 	// Activate subscription + update order + handle late-payment honor
 	// in one transaction so partial failures don't leave inconsistent state.
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
@@ -466,7 +492,7 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 	// Serialize per-payment to enforce sum invariant. Single tx: lock + validate
 	// + call channel + insert refund. The lock is held for the duration of
 	// the channel API call — known trade-off, see webhook doc §5.4.
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
@@ -672,7 +698,7 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 // Mirrors Confirm but driven by the channel — the cross-table transaction
 // must hold event-insert + payment-insert + sub-activate + order-update.
 func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent) error {
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -819,7 +845,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 // was previously paid (rare race with Confirm), also cascades to deactivate
 // subscription (webhook doc §7).
 func (s *PaymentService) onPaymentFailed(ctx context.Context, e WebhookEvent) error {
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -889,7 +915,7 @@ func (s *PaymentService) onPaymentFailed(ctx context.Context, e WebhookEvent) er
 // Full refund → payment → refunded, sub → cancelled. Partial refund →
 // payment stays paid, no sub change.
 func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) error {
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -1001,7 +1027,7 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 }
 
 func (s *PaymentService) onDisputeCreated(ctx context.Context, e WebhookEvent) error {
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -1061,7 +1087,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 			map[string]any{"event_id": e.EventID})
 	}
 
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin renewal tx: %w", err)
 	}
@@ -1231,7 +1257,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 // insertPaymentOnTx does the business-level idempotency INSERT inside an
 // existing transaction. Returns (paymentID, true) if inserted, (_, false)
 // if a row already exists for (channel, external_txn_id).
-func insertPaymentOnTx(ctx context.Context, tx *sqlx.Tx, p *model.Payment) (string, bool, error) {
+func insertPaymentOnTx(ctx context.Context, tx dbTx, p *model.Payment) (string, bool, error) {
 	rawPayload := repo.NonNilRawPayload(p.RawPayload)
 	var paidAt *time.Time = p.PaidAt
 	var id string
@@ -1254,7 +1280,7 @@ func insertPaymentOnTx(ctx context.Context, tx *sqlx.Tx, p *model.Payment) (stri
 // Returns whether activation actually happened (true if the user just got
 // a new active sub this call; false if they already had one or we reactivated
 // an existing row).
-func activateSubscriptionOnTx(ctx context.Context, tx *sqlx.Tx, userID, planID string, expiresAt *time.Time) (bool, error) {
+func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID string, expiresAt *time.Time) (bool, error) {
 	// Step 1: UPDATE the target row (active first, else most recent).
 	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET
@@ -1292,7 +1318,7 @@ func activateSubscriptionOnTx(ctx context.Context, tx *sqlx.Tx, userID, planID s
 }
 
 // writeAuditOnTx inserts an audit_log row within an existing transaction.
-func writeAuditOnTx(ctx context.Context, tx *sqlx.Tx, actor, action, target string, tags []string, ctxData map[string]any) error {
+func writeAuditOnTx(ctx context.Context, tx dbTx, actor, action, target string, tags []string, ctxData map[string]any) error {
 	data, _ := json.Marshal(ctxData)
 	_, err := tx.NamedExecContext(ctx, `
 		INSERT INTO audit_log (actor, action, target, tags, context)
@@ -1323,7 +1349,7 @@ func (s *PaymentService) writeAudit(ctx context.Context, actor, action, target s
 // findOrInsertPendingOnTx: helper for onPaymentFailed — the payment row
 // may not exist yet if `.payment_failed` arrives before any INSERT (rare but
 // possible). We insert a `pending` row first, then mark it failed.
-func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx *sqlx.Tx, e WebhookEvent) (*model.Payment, error) {
+func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx dbTx, e WebhookEvent) (*model.Payment, error) {
 	var p model.Payment
 	err := tx.GetContext(ctx, &p, `
 		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE

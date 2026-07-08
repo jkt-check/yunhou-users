@@ -86,6 +86,36 @@ func goldenWeChatPaid(t *testing.T, orderID, txnID string, amountFen int64) []by
 	return b
 }
 
+// goldenWeChatFailed builds a `TRANSACTION.PAY_FAILED` WeChat Pay v3
+// webhook body. amountFen is the total (the "refund" sub-amount is 0
+// for a failed-payment event).
+func goldenWeChatFailed(t *testing.T, orderID, txnID string, amountFen int64) []byte {
+	t.Helper()
+
+	resourcePlaintext, _ := json.Marshal(map[string]any{
+		"transaction_id": txnID,
+		"out_trade_no":   orderID,
+		"amount":         map[string]any{"total": amountFen, "refund": 0},
+	})
+
+	ciphertext, nonce, aad := encryptForWeChat(t, []byte(e2eWeChatKey), resourcePlaintext)
+
+	body := map[string]any{
+		"id":            "evt_e2e_wechat_fail_" + orderID,
+		"create_time":   "2024-01-01T12:00:00+08:00",
+		"resource_type": "encrypt-resource",
+		"event_type":    "TRANSACTION.PAY_FAILED",
+		"summary":       "支付失败",
+		"resource": map[string]any{
+			"ciphertext":      ciphertext,
+			"associated_data": aad,
+			"nonce":           nonce,
+		},
+	}
+	b, _ := json.Marshal(body)
+	return b
+}
+
 // ============================================================================
 // Stripe payment_intent.succeeded — happy path
 // ============================================================================
@@ -490,5 +520,54 @@ func TestWebhook_Stripe_DisputeCreated(t *testing.T) {
 	}
 	if !disputed {
 		t.Error("expected payments.disputed = true after dispute webhook")
+	}
+}
+
+// TestWebhook_WeChat_PaymentFailed exercises the onPaymentFailed
+// branch of OnWebhook end-to-end for channel=wechat_pay. A
+// TRANSACTION.PAY_FAILED event flips the order to 'failed'. Without
+// an existing payment row, the handler mints a fresh pending row
+// first.
+func TestWebhook_WeChat_PaymentFailed(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token, _ := loginAndGetToken(t, srv.Engine, "wechat-failed", "yundian")
+
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"monthly"}`, authHeader(token))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create order: %d %s", resp.StatusCode, string(resp.Body))
+	}
+	var r struct {
+		Data struct {
+			ID string `json":"id"`
+		} `json":"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+
+	body := goldenWeChatFailed(t, orderID, "wx_e2e_fail_"+uuid.NewString()[:8], 2990)
+	ts := time.Now().Unix()
+	_, nonce, sig := signWeChat([]byte(e2eWeChatKey), ts, "n12byte_test", string(body))
+
+	resp = doRequest(t, srv.Engine, http.MethodPost,
+		"/webhooks/payment/wechat_pay", string(body),
+		map[string]string{
+			"Wechatpay-Signature": sig,
+			"Wechatpay-Timestamp": strconv.FormatInt(ts, 10),
+			"Wechatpay-Nonce":     nonce,
+			"Content-Type":        "application/json",
+		})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("webhook: %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+
+	// Order should be flipped to failed.
+	var status2 string
+	if err := srv.DB.GetContext(context.Background(), &status2,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if status2 != "failed" {
+		t.Errorf("expected order.status=failed, got %s", status2)
 	}
 }

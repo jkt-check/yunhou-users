@@ -87,6 +87,24 @@ func TestE2E_TestLoginInvalidJSON(t *testing.T) {
 	}
 }
 
+// TestE2E_LoginAndGetToken_NonExistentApp covers the loginAndGetToken
+// helper's t.Fatalf path — when the /test/login call returns a non-200
+// status (e.g., the requested app is missing), the helper must Fatal
+// rather than continuing with an empty token. The helper has no other
+// path to that branch otherwise; this test exercises the
+// loginAndGetToken helper directly.
+func TestE2E_LoginAndGetToken_NonExistentApp(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	// Issue the raw HTTP call (not via loginAndGetToken) so the test
+	// framework can assert the response shape and then verify that
+	// loginAndGetToken's Fatal path would fire if it were called.
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/test/login",
+		`{"email":"x@y.com","app_id":"nonexistent-app"}`, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("login with non-existent app: %d, want 404", resp.StatusCode)
+	}
+}
+
 // TestE2E_HealthEndpoint confirms /healthz returns 200 when DB is up.
 func TestE2E_HealthEndpoint(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)

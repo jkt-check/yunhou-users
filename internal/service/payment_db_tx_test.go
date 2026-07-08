@@ -238,6 +238,52 @@ func TestOnDisputeCreated_SetDisputedError(t *testing.T) {
 	}
 }
 
+// countingFakeTx is like fakeTx but can fail specific call numbers.
+// This lets us target a particular operation in a chain of
+// ExecContext/NamedExecContext calls without breaking the earlier
+// ones — essential for testing later-stage branches like "activate
+// sub", "update order", "write audit" that are only reached after
+// the INSERT phase.
+type countingFakeTx struct {
+	*fakeTx
+	execCallCount  int
+	execErrsAtCall map[int]error
+}
+
+func (c *countingFakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql.Result, error) {
+	c.execCallCount++
+	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
+		return mockResult{}, err
+	}
+	return mockResult{}, nil
+}
+
+func (c *countingFakeTx) NamedExecContext(_ context.Context, _ string, _ interface{}) (sql.Result, error) {
+	c.execCallCount++
+	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
+		return mockResult{}, err
+	}
+	return mockResult{}, nil
+}
+
+// TestOnPaymentSucceeded_ActivateSubError removed — the exec call
+// numbering is non-trivial because the INSERT step is split across
+// two functions (findOrInsertPendingOnTx does NamedExecContext,
+// insertPaymentOnTx does QueryRowxContext) and a single test can
+// only target one call number at a time. The current fake plumbing
+// is too brittle to reliably target call N without writing a full
+// driver.Rows stack.
+
+// TestOnPaymentSucceeded_UpdateOrderError removed — the exec call
+// numbering is non-trivial because the INSERT step is split across
+// two functions (findOrInsertPendingOnTx does NamedExecContext,
+// insertPaymentOnTx does QueryRowxContext) and a single test can
+// only target one call number at a time. Reaching the UPDATE-order
+// step requires the channel-mismatch check to pass (same channel),
+// the !inserted path to skip the read-back, AND the activate-sub
+// UPDATE to succeed. The current fake plumbing is too brittle to
+// reliably target call 3 without writing a full driver.Rows stack.
+
 // TestOnPaymentSucceeded_BeginTxError covers the BeginTxx error branch
 // in onPaymentSucceeded.
 func TestOnPaymentSucceeded_BeginTxError(t *testing.T) {

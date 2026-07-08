@@ -599,13 +599,9 @@ func signStripe(secret string, ts int64, body []byte) string {
 	return fmt.Sprintf("t=%d,v1=%s", ts, hex.EncodeToString(mac.Sum(nil)))
 }
 
-// signLS produces the X-Signature header value: hex(hmac_sha256(secret, body)).
-// No timestamp — LS relies on event_id dedup, not a replay window.
-func signLS(secret string, body []byte) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(body)
-	return hex.EncodeToString(mac.Sum(nil))
-}
+// signLS removed — LemonSqueezy channel was deleted in commit d8f333d
+// and the helper is no longer used. (signStripe / signAlipay / signWeChat
+// below remain active.)
 
 // signWeChat produces the four headers WeChat sends, given the body.
 func signWeChat(key []byte, ts int64, nonce, body string) (timestamp, nonceStr, signature string) {

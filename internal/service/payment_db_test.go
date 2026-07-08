@@ -1169,6 +1169,50 @@ func TestPaymentService_OnWebhook_Refund_MissingPayment(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnWebhook_PaymentFailed_TerminalState covers the
+// "n == 0" branch in onPaymentFailed: a payment_failed arrives for a
+// payment that's already in a terminal state (e.g. 'failed'). The SQL
+// guard refuses to transition, the function commits the empty tx and
+// returns nil — no-op.
+func TestPaymentService_OnWebhook_PaymentFailed_TerminalState(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	orderID := mustNewUUID()
+	txnID := "pi-failed-term-" + mustNewUUID()[:8]
+	eventID := "evt-failed-term-" + mustNewUUID()[:8]
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
+		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'failed', now() + INTERVAL '30 minutes')
+	`, orderID, uid); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	// Pre-insert a payment row that's already 'failed' (terminal).
+	paymentID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO payments (id, order_id, channel, external_txn_id, amount, currency, status, raw_payload)
+		VALUES ($1, $2, 'stripe', $3, 29.9, 'CNY', 'failed', '{}')
+	`, paymentID, orderID, txnID); err != nil {
+		t.Fatalf("seed payment: %v", err)
+	}
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: eventID, EventType: "payment_intent.payment_failed",
+		TransactionID: txnID, OrderID: orderID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook terminal-state: %v", err)
+	}
+	// Payment should still be 'failed' (no transition, no change).
+	var pStatus string
+	_ = db.GetContext(context.Background(), &pStatus,
+		`SELECT status FROM payments WHERE id = $1`, paymentID)
+	if pStatus != "failed" {
+		t.Errorf("payment.Status = %q, want failed (unchanged)", pStatus)
+	}
+}
+
 // TestPaymentService_OnWebhook_UnknownEventType covers the default
 // branch in OnWebhook's switch: event types that match no domain
 // action (e.g. "ping" or any other uninteresting type). The handler
@@ -1404,5 +1448,132 @@ func TestPaymentService_OnWebhook_PaypalRenewal_UnknownSubscription(t *testing.T
 		`SELECT COUNT(*) FROM orders WHERE user_id = $1`, uid)
 	if orderCount != 0 {
 		t.Errorf("expected 0 orders, got %d", orderCount)
+	}
+}
+
+// TestPaymentService_OnWebhook_PaypalRenewal_DuplicatePayment covers
+// the "dedupe-check existing renewal payment" branch in
+// onPaypalRenewalSucceeded: a payment row already exists for the same
+// (channel, external_txn_id). The handler must short-circuit with an
+// audit log, NOT create a new order or payment.
+func TestPaymentService_OnWebhook_PaypalRenewal_DuplicatePayment(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := mustNewUUID()
+	expAt := time.Now().Add(15 * 24 * time.Hour)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'active', $3, 'I-PP-DUP')
+	`, subID, uid, expAt); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	txnID := "txn-pp-dup-" + mustNewUUID()[:8]
+	// First, fire the renewal normally to create a payment row.
+	first := WebhookEvent{
+		Channel: "paypal", EventID: "evt-pp-dup-first-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
+		TransactionID: txnID, ExternalSubscriptionID: "I-PP-DUP",
+		Amount: 29.9, Currency: "USD",
+		SubExpiresAt: &expAt,
+		RawPayload:   json.RawMessage(`{}`),
+	}
+	if _, err := svc.OnWebhook(context.Background(), first); err != nil {
+		t.Fatalf("first OnWebhook: %v", err)
+	}
+	// Now fire a second webhook with a NEW event_id (so the top-level
+	// dedup at webhook_events doesn't catch it) but the same (channel,
+	// external_txn_id). This drives the "existing payment" branch in
+	// onPaypalRenewalSucceeded.
+	second := first
+	second.EventID = "evt-pp-dup-second-" + mustNewUUID()[:8]
+	if _, err := svc.OnWebhook(context.Background(), second); err != nil {
+		t.Fatalf("second OnWebhook: %v", err)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'paypal_renewal_payment_already_exists'`)
+	if n == 0 {
+		t.Error("expected audit_log row for paypal_renewal_payment_already_exists")
+	}
+}
+
+// TestPaymentService_OnWebhook_PaypalRenewal_NoExpiryHint covers the
+// "SubExpiresAt is nil" branch in onPaypalRenewalSucceeded: PayPal
+// charged but didn't ship a next_billing_time hint. The handler must
+// still record the payment (PayPal did charge) and write a
+// paypal_renewal_no_expiry_hint audit row.
+func TestPaymentService_OnWebhook_PaypalRenewal_NoExpiryHint(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := mustNewUUID()
+	expAt := time.Now().Add(15 * 24 * time.Hour)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'active', $3, 'I-PP-NOEXP')
+	`, subID, uid, expAt); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "evt-pp-noexp-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
+		TransactionID: "txn-pp-noexp-" + mustNewUUID()[:8], ExternalSubscriptionID: "I-PP-NOEXP",
+		Amount: 29.9, Currency: "USD",
+		// No SubExpiresAt — drives the "no expiry hint" branch.
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook no-expiry: %v", err)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'paypal_renewal_no_expiry_hint'`)
+	if n == 0 {
+		t.Error("expected audit_log row for paypal_renewal_no_expiry_hint")
+	}
+}
+
+// TestPaymentService_OnWebhook_PaypalRenewal_SubNotActive covers the
+// "sub.Status != active but UPDATE didn't fire" branch in
+// onPaypalRenewalSucceeded. Pre-cancel the sub, then fire a renewal —
+// the handler records the payment (PayPal did charge) but does NOT
+// extend expires_at, and writes a paypal_renewal_sub_not_active audit.
+func TestPaymentService_OnWebhook_PaypalRenewal_SubNotActive(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := mustNewUUID()
+	expAt := time.Now().Add(15 * 24 * time.Hour)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'cancelled', $3, 'I-PP-CANCEL')
+	`, subID, uid, expAt); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	newExpAt := time.Now().Add(45 * 24 * time.Hour)
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "evt-pp-cancel-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
+		TransactionID: "txn-pp-cancel-" + mustNewUUID()[:8], ExternalSubscriptionID: "I-PP-CANCEL",
+		Amount: 29.9, Currency: "USD",
+		SubExpiresAt: &newExpAt,
+		RawPayload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook sub-cancelled: %v", err)
+	}
+	// Sub's expires_at must NOT have been extended (still the original).
+	var gotExp time.Time
+	_ = db.GetContext(context.Background(), &gotExp,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID)
+	if gotExp.Unix() != expAt.Unix() {
+		t.Errorf("sub.expires_at was extended despite cancelled status: got %v, want %v", gotExp, expAt)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'paypal_renewal_sub_not_active'`)
+	if n == 0 {
+		t.Error("expected audit_log row for paypal_renewal_sub_not_active")
 	}
 }

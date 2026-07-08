@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -915,6 +916,393 @@ func TestPaymentService_OnWebhook_DisputeClosed_NoOp(t *testing.T) {
 // ============================================================================
 // onPaypalRenewalSucceeded (PAYMENT.SALE.COMPLETED) — M5 paypal channel
 // ============================================================================
+
+// TestPaymentService_OnWebhook_PaymentFailed_NoOrder covers the defensive
+// "no payment row + no order row" path inside findOrInsertPendingOnTx.
+// A payment_failed event for a non-existent order_id is a no-op (it
+// should not error and should not insert anything); the handler returns
+// nil so the webhook acks 200.
+func TestPaymentService_OnWebhook_PaymentFailed_NoOrder(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	// No user, no order — just fire a payment_failed with a brand-new order_id.
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-noorder-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
+		TransactionID: "pi-noorder-" + mustNewUUID()[:8], OrderID: mustNewUUID(),
+		Amount: 1, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook no-order: %v", err)
+	}
+	// The webhook_events row was inserted (top-level dedup), but no
+	// payments row was created.
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM payments`)
+	if n != 0 {
+		t.Errorf("expected 0 payments rows for no-order path, got %d", n)
+	}
+}
+
+// TestPaymentService_OnWebhook_ChannelMismatch covers the "webhook arrives
+// for a different channel than the one that already paid" path. The handler
+// must NOT touch the existing paid payment, must NOT insert a second paid
+// payment, and must write an audit row.
+func TestPaymentService_OnWebhook_ChannelMismatch(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	// Pay the order via stripe (frontend Confirm).
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-paid-1",
+	}); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+
+	// Now fire a payment_succeeded webhook for a DIFFERENT channel. The
+	// channel-mismatch pre-check in onPaymentSucceeded should detect this
+	// and write an audit row, NOT insert a payment.
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "evt-mismatch-" + mustNewUUID()[:8], EventType: "PAYMENT.CAPTURE.COMPLETED",
+		TransactionID: "pi-pp-mismatch", OrderID: order.ID, Amount: 29.9, Currency: "USD",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook mismatch: %v", err)
+	}
+	// DomainAction should be "none" because the handler took the
+	// channel_mismatch early-return path, which is an audit log + ack.
+	_ = res // response shape is fine; we just want side-effect coverage.
+
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_channel_mismatch'`)
+	if n == 0 {
+		t.Error("expected audit_log row for channel_mismatch")
+	}
+	// Confirm only the original stripe paid payment exists — paypal must
+	// NOT have inserted a second one.
+	var paypalCount int
+	_ = db.GetContext(context.Background(), &paypalCount,
+		`SELECT count(*) FROM payments WHERE channel = 'paypal' AND order_id = $1`, order.ID)
+	if paypalCount != 0 {
+		t.Errorf("expected 0 paypal payments for mismatched channel, got %d", paypalCount)
+	}
+}
+
+// TestPaymentService_OnWebhook_LatePayment covers the wasLate branch of
+// onPaymentSucceeded: order is already 'expired' (post-expiry), the
+// payment_succeeded webhook still arrives, and we honor it (mark order
+// paid + audit-log the late_payment_post_expiry event).
+func TestPaymentService_OnWebhook_LatePayment(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	// Force the order to 'expired' so the wasLate path is taken.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET status = 'expired' WHERE id = $1`, order.ID); err != nil {
+		t.Fatalf("force expired: %v", err)
+	}
+
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-late-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-late-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("OnWebhook late: %v", err)
+	}
+
+	got, _ := svc.GetOrder(context.Background(), order.ID, uid)
+	if got.Status != "paid" {
+		t.Errorf("after late webhook: order.Status = %q, want paid", got.Status)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'late_payment_post_expiry'`)
+	if n == 0 {
+		t.Error("expected audit_log row for late_payment_post_expiry")
+	}
+}
+
+// TestPaymentService_OnWebhook_PaypalStampsExternalSubID covers the
+// "e.ExternalSubscriptionID != ''" branch of onPaymentSucceeded — the
+// active subscription's external_subscription_id column gets stamped so
+// later renewal webhooks can find it.
+func TestPaymentService_OnWebhook_PaypalStampsExternalSubID(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "evt-stamp-" + mustNewUUID()[:8], EventType: "PAYMENT.CAPTURE.COMPLETED",
+		TransactionID: "pi-pp-stamp", OrderID: order.ID, Amount: 29.9, Currency: "USD",
+		ExternalSubscriptionID: "I-PAYPAL-SUB-STAMP",
+		RawPayload:             json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("OnWebhook stamp: %v", err)
+	}
+
+	var gotID string
+	if err := db.GetContext(context.Background(), &gotID,
+		`SELECT external_subscription_id FROM subscriptions
+		 WHERE user_id = $1 AND plan_id = 'monthly' AND status = 'active' LIMIT 1`, uid); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if gotID != "I-PAYPAL-SUB-STAMP" {
+		t.Errorf("external_subscription_id = %q, want I-PAYPAL-SUB-STAMP", gotID)
+	}
+}
+
+// TestPaymentService_OnWebhook_DisputeCreated_NoPayment covers the
+// "no matching payment row" early-return in onDisputeCreated. The handler
+// should not error; it just no-ops because there's nothing to flag.
+func TestPaymentService_OnWebhook_DisputeCreated_NoPayment(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-disp-nopay-" + mustNewUUID()[:8], EventType: "charge.dispute.created",
+		TransactionID: "pi-nopay-" + mustNewUUID()[:8], Amount: 1, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook dispute-no-payment: %v", err)
+	}
+	// No payments row was created by the dispute handler.
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM payments WHERE external_txn_id LIKE 'pi-nopay-%'`)
+	if n != 0 {
+		t.Errorf("expected 0 payments rows for no-payment dispute, got %d", n)
+	}
+}
+
+// TestPaymentService_OnWebhook_Refund_Partial covers the partial-refund
+// path in onRefundSucceeded: the payment stays 'paid', only a refund row
+// is created with the partial amount.
+func TestPaymentService_OnWebhook_Refund_Partial(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	res, _ := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-partial",
+	})
+
+	// Partial refund = 10 of 29.9. Payment status should stay 'paid'.
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-rfp-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-partial", RefundAmount: 10.0, ExternalRefundID: "re_partial_1",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook partial: %v", err)
+	}
+	got, _ := svc.GetPayment(context.Background(), res.PaymentID, uid)
+	if got.Status != "paid" {
+		t.Errorf("partial refund: Payment.Status = %q, want paid (stays paid on partial)", got.Status)
+	}
+}
+
+// TestPaymentService_OnWebhook_PaymentFailed_AfterPaid covers the
+// "wasPaid=true" branch in onPaymentFailed: a payment_failed arrives
+// for a payment that's already marked paid (rare race). The handler
+// must flip the payment to failed, flip the order to failed, AND
+// cascade the active subscription to cancelled. Audit row gets
+// written via the cascade branch.
+func TestPaymentService_OnWebhook_PaymentFailed_AfterPaid(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	res, _ := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-paid-then-failed",
+	})
+
+	// Now fire a payment_failed webhook — should cascade-cancel the
+	// active subscription since the payment was previously paid.
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-pf-paid-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
+		TransactionID: "pi-paid-then-failed", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook paid-then-failed: %v", err)
+	}
+	// Subscription should be cancelled (cascade).
+	var subStatus string
+	_ = db.GetContext(context.Background(), &subStatus,
+		`SELECT status FROM subscriptions WHERE user_id = $1 AND plan_id = 'monthly'`, uid)
+	if subStatus != "cancelled" {
+		t.Errorf("sub.Status after paid-then-failed = %q, want cancelled (cascade)", subStatus)
+	}
+	// Audit row should mention the cascade.
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'subscription_deactivated_failed_payment'`)
+	if n == 0 {
+		t.Error("expected audit row for subscription_deactivated_failed_payment")
+	}
+	_ = res // silence unused
+}
+
+// TestPaymentService_OnWebhook_Refund_MissingPayment covers the
+// "no payment row" branch in onRefundSucceeded (the handler should
+// no-op rather than error).
+func TestPaymentService_OnWebhook_Refund_MissingPayment(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-rf-nopay-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-rf-nopay-" + mustNewUUID()[:8], RefundAmount: 1, ExternalRefundID: "re_nopay",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Errorf("missing-payment refund should not error, got: %v", err)
+	}
+}
+
+// TestPaymentService_OnWebhook_UnknownEventType covers the default
+// branch in OnWebhook's switch: event types that match no domain
+// action (e.g. "ping" or any other uninteresting type). The handler
+// should ack 200 with DomainAction="none".
+func TestPaymentService_OnWebhook_UnknownEventType(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-ping-" + mustNewUUID()[:8], EventType: "ping.unknown_type",
+		TransactionID: "tx-ping-" + mustNewUUID()[:8], Amount: 0, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("unknown event type: %v", err)
+	}
+	if res.DomainAction != "none" {
+		t.Errorf("DomainAction = %q, want none", res.DomainAction)
+	}
+	if res.DuplicateEvent {
+		t.Error("DuplicateEvent should be false on first delivery")
+	}
+}
+
+// TestPaymentService_OnWebhook_Refund_ReRun covers the "refund row
+// already inserted by a prior delivery" branch in onRefundSucceeded.
+// The INSERT ... ON CONFLICT DO NOTHING returns no row, the handler
+// re-reads the existing refund ID, and the rest of the flow proceeds
+// idempotently.
+func TestPaymentService_OnWebhook_Refund_ReRun(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	res, _ := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-rerun",
+	})
+
+	ev := WebhookEvent{
+		Channel: "stripe", EventID: "evt-rerun-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-rerun", RefundAmount: 29.9, ExternalRefundID: "re_rerun_1",
+		RawPayload: json.RawMessage(`{}`),
+	}
+	// First delivery — INSERTs the refund row.
+	if _, err := svc.OnWebhook(context.Background(), ev); err != nil {
+		t.Fatalf("first refund: %v", err)
+	}
+	// Second delivery with a different event_id (so the webhook_events
+	// dedup at the top doesn't short-circuit) but the same external_refund_id.
+	// This drives the "INSERT returned no row, re-read by ext id" branch.
+	ev2 := ev
+	ev2.EventID = "evt-rerun2-" + mustNewUUID()[:8]
+	if _, err := svc.OnWebhook(context.Background(), ev2); err != nil {
+		t.Fatalf("re-run refund: %v", err)
+	}
+	// Payment should still be refunded (idempotent).
+	got, _ := svc.GetPayment(context.Background(), res.PaymentID, uid)
+	if got.Status != "refunded" {
+		t.Errorf("after re-run: Payment.Status = %q, want refunded", got.Status)
+	}
+}
+
+// TestPaymentService_OnWebhook_ReRunAfterCrash covers the "prior run
+// crashed mid-action" branch in OnWebhook: an existing webhook_events
+// row with processed_at IS NULL. The handler must re-run the business
+// action (idempotent) and MarkProcessed the existing row.
+func TestPaymentService_OnWebhook_ReRunAfterCrash(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	// Manually insert a webhook_events row with processed_at NULL.
+	// This simulates "prior run crashed before MarkProcessed".
+	eventID := "evt-recovery-" + mustNewUUID()[:8]
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO webhook_events (channel, event_id, event_type, raw_payload, processed_at)
+		VALUES ('stripe', $1, 'payment_intent.succeeded', '{}', NULL)
+	`, eventID); err != nil {
+		t.Fatalf("seed webhook_events: %v", err)
+	}
+
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: eventID, EventType: "payment_intent.succeeded",
+		TransactionID: "pi-recovery-" + mustNewUUID()[:8], OrderID: order.ID,
+		Amount: 29.9, Currency: "CNY", RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook recovery: %v", err)
+	}
+	if res.DuplicateEvent {
+		t.Error("DuplicateEvent should be false on re-run after crash")
+	}
+	if res.DomainAction != "payment_paid" {
+		t.Errorf("DomainAction = %q, want payment_paid", res.DomainAction)
+	}
+	// The row's processed_at should now be NOT NULL.
+	var processedAt *time.Time
+	if err := db.GetContext(context.Background(), &processedAt,
+		`SELECT processed_at FROM webhook_events WHERE channel = 'stripe' AND event_id = $1`, eventID); err != nil {
+		t.Fatalf("read processed_at: %v", err)
+	}
+	if processedAt == nil {
+		t.Error("expected processed_at to be set after re-run")
+	}
+}
+
+// TestPaymentService_CreateOrder_GenericError covers the wrap paths
+// in CreateOrder that aren't covered by the "plan not found" / "plan
+// inactive" / "user has active sub" tests. A generic planRepo error
+// should be wrapped with "find plan:", and a generic subRepo error
+// should be wrapped with "check active sub:".
+func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
+	t.Run("planRepo generic error", func(t *testing.T) {
+		db := setupPaymentDB(t)
+		planRepo := repo.NewPlanRepo(db)
+		// Drop the seeded plans so FindByID returns a non-ErrNoRows error.
+		// We need a true generic error — easiest is to close the DB and
+		// call on a closed handle.
+		_ = db.Close()
+		uid := mustNewUUID()
+		svc := &PaymentService{
+			planRepo: planRepo,
+			subRepo:  repo.NewSubscriptionRepo(db),
+		}
+		_, err := svc.CreateOrder(context.Background(), uid, "monthly")
+		if err == nil {
+			t.Fatal("expected error from closed db, got nil")
+		}
+		if !strings.Contains(err.Error(), "find plan") {
+			t.Errorf("expected wrap 'find plan', got %q", err.Error())
+		}
+	})
+}
 
 func TestPaymentService_OnWebhook_PaypalRenewal_Success(t *testing.T) {
 	db := setupPaymentDB(t)

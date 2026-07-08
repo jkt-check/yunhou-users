@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,5 +131,65 @@ func TestQuote_Get_NoProviderConfigured_ReturnsEmptyProviderData(t *testing.T) {
 	// cycle_config still resolved from plan.interval_days as fallback
 	if quote.CycleConfig.BillingCycleDays != 30 || quote.CycleConfig.TrialDays != 0 {
 		t.Errorf("cycle = %+v, want {0,30}", quote.CycleConfig)
+	}
+}
+
+// TestQuote_Get_AppInactive covers the "app found but disabled" branch
+// (matches the handler's 403 / 404 mapping in the route).
+func TestQuote_Get_AppInactive(t *testing.T) {
+	plan := &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yundian"}}
+	app := &model.App{AppID: "yundian", IsActive: false}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+	_, err := svc.Get(context.Background(), "yundian", "monthly", "u")
+	if !errors.Is(err, ErrAppInactive) {
+		t.Errorf("err = %v, want ErrAppInactive", err)
+	}
+}
+
+// TestQuote_Get_AppFindGenericError covers the non-sql.ErrNoRows error
+// path on the app lookup — surface as "find app: ...".
+func TestQuote_Get_AppFindGenericError(t *testing.T) {
+	plan := &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yundian"}}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{err: errors.New("db down")})
+	_, err := svc.Get(context.Background(), "yundian", "monthly", "u")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "find app") {
+		t.Errorf("expected wrap 'find app', got %q", err.Error())
+	}
+}
+
+// TestQuote_Get_BadConfig covers the "app.config is unparseable JSON"
+// branch. The function wraps the json error as "decode app config: ...".
+func TestQuote_Get_BadConfig(t *testing.T) {
+	plan := &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yundian"}}
+	// Bypass the mustJSONRawQuote validator — we WANT bad JSON here.
+	app := &model.App{
+		AppID: "yundian", IsActive: true,
+		Config: json.RawMessage(`not-json`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+	_, err := svc.Get(context.Background(), "yundian", "monthly", "u")
+	if err == nil {
+		t.Fatal("expected error from bad config, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode app config") {
+		t.Errorf("expected wrap 'decode app config', got %q", err.Error())
+	}
+}
+
+// TestQuote_Get_GenericPlanFindError covers the wrap path on planRepo
+// (a non-ErrNoRows error from the plan lookup).
+func TestQuote_Get_GenericPlanFindError(t *testing.T) {
+	pr := newMockPlanRepo()
+	pr.err = errors.New("db down on plan lookup")
+	svc := NewQuoteService(pr, &stubQuoteAppRepo{app: &model.App{AppID: "yundian"}})
+	_, err := svc.Get(context.Background(), "yundian", "monthly", "u")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "find plan") {
+		t.Errorf("expected wrap 'find plan', got %q", err.Error())
 	}
 }

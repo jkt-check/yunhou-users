@@ -397,6 +397,143 @@ func TestGenerateRefreshToken_Unique(t *testing.T) {
 	}
 }
 
+// TestAuthService_RefreshToken_RarePaths fills in branches the table-driven
+// TestAuthService_RefreshToken doesn't reach: deleted user, missing user
+// row, appID fallback to session.AppID, ErrAppNotFound, ErrAppInactive,
+// and a generic (non-ErrNoRows) session-lookup error.
+func TestAuthService_RefreshToken_RarePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	plans := map[string]*model.Plan{
+		"free": {ID: "free", Name: "免费", Apps: []string{"yundian"}},
+	}
+
+	// helper: build a session for a user with a given status.
+	seed := func(t *testing.T, ur *mockUserRepo, ssr *mockSessionRepo, userID, status, token string) {
+		t.Helper()
+		ur.users[userID] = &model.User{ID: userID, Status: status}
+		ssr.sessions["sess-"+userID] = &model.Session{
+			ID:           "sess-" + userID,
+			UserID:       userID,
+			AppID:        "yundian",
+			SessionType:  "refresh",
+			RefreshToken: hashToken(token),
+			Revoked:      false,
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}
+		ssr.byToken[hashToken(token)] = ssr.sessions["sess-"+userID]
+	}
+
+	t.Run("deleted user is rejected", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seed(t, ur, ssr, "u-deleted", "deleted", "t-deleted")
+		pr.plans["free"] = plans["free"]
+		pr.defaultPlan = plans["free"]
+		ar.seedActive("yundian", "云店")
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+		_, err := svc.RefreshToken(ctx, "t-deleted", "yundian")
+		if !errors.Is(err, ErrUserDeleted) {
+			t.Errorf("expected ErrUserDeleted, got %v", err)
+		}
+	})
+
+	t.Run("missing user row → wrapped error", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		// Seed a session whose user_id is NOT in ur.users. The mock's
+		// FindByID returns a generic "not found" (not sql.ErrNoRows), so
+		// production code wraps it via the second branch
+		// (fmt.Errorf("find user: %w", err)). We assert on the wrap.
+		ssr.sessions["sess-orphan"] = &model.Session{
+			ID: "sess-orphan", UserID: "u-orphan", AppID: "yundian",
+			SessionType: "refresh", RefreshToken: hashToken("t-orphan"),
+			Revoked: false, ExpiresAt: time.Now().Add(time.Hour),
+		}
+		ssr.byToken[hashToken("t-orphan")] = ssr.sessions["sess-orphan"]
+		pr.plans["free"] = plans["free"]
+		pr.defaultPlan = plans["free"]
+		ar.seedActive("yundian", "云店")
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+		_, err := svc.RefreshToken(ctx, "t-orphan", "yundian")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "find user") {
+			t.Errorf("expected wrap 'find user', got %q", err.Error())
+		}
+	})
+
+	t.Run("appID empty falls back to session.AppID", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seed(t, ur, ssr, "u-fb", "active", "t-fb")
+		// Session is for yundian; the call passes appID="" so it must
+		// fall back to yundian.
+		pr.plans["free"] = plans["free"]
+		pr.defaultPlan = plans["free"]
+		ar.seedActive("yundian", "云店")
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+		resp, err := svc.RefreshToken(ctx, "t-fb", "")
+		if err != nil {
+			t.Fatalf("expected success on appID fallback, got %v", err)
+		}
+		if resp.User.ID != "u-fb" {
+			t.Errorf("user.ID = %q, want u-fb", resp.User.ID)
+		}
+	})
+
+	t.Run("app not found (ErrAppNotFound)", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seed(t, ur, ssr, "u-anf", "active", "t-anf")
+		pr.plans["free"] = plans["free"]
+		pr.defaultPlan = plans["free"]
+		// No app seeded for "nonexistent" — FindByID returns sql.ErrNoRows.
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+		_, err := svc.RefreshToken(ctx, "t-anf", "nonexistent")
+		if !errors.Is(err, ErrAppNotFound) {
+			t.Errorf("expected ErrAppNotFound, got %v", err)
+		}
+	})
+
+	t.Run("app inactive (ErrAppInactive)", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seed(t, ur, ssr, "u-ai", "active", "t-ai")
+		pr.plans["free"] = plans["free"]
+		pr.defaultPlan = plans["free"]
+		ar.seedInactive("yundian", "云店")
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+		_, err := svc.RefreshToken(ctx, "t-ai", "yundian")
+		if !errors.Is(err, ErrAppInactive) {
+			t.Errorf("expected ErrAppInactive, got %v", err)
+		}
+	})
+
+	t.Run("session lookup generic error", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		// Inject a generic (non-ErrNoRows) error into the session lookup.
+		ssr.findErr = errTest
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+		_, err := svc.RefreshToken(ctx, "t-anything", "yundian")
+		if err == nil {
+			t.Fatal("expected error from session lookup, got nil")
+		}
+		if !strings.Contains(err.Error(), "find session") {
+			t.Errorf("expected wrap 'find session', got %q", err.Error())
+		}
+	})
+}
+
 // TestIsTestIdentityProviderUID guards the prefix filter that protects
 // real OAuth logins from being merged into the dev-only /test/login
 // identities. The filter is the defence-in-depth backstop in case the
@@ -779,6 +916,123 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 			t.Error("Subscription.ExpiresAt is nil; expected sub's ExpiresAt to be carried")
 		} else if !resp.Subscription.ExpiresAt.Equal(expAt) {
 			t.Errorf("ExpiresAt: got %v, want %v", resp.Subscription.ExpiresAt, expAt)
+		}
+	})
+}
+
+// TestAuthService_getOrCreateUser covers the internal helper that
+// LoginWithProfile / TestLogin share for the "find existing identity or
+// create new user + bind new identity" dance. The function has three
+// exit paths:
+//   1. existing identity → return that user
+//   2. brand-new user + identity
+//   3. race: a concurrent caller bound the same (provider, uid) first
+//      (mock this by seeding the identity BEFORE the call, but in the
+//      wrong order to force the duplicate-key path on Create)
+func TestAuthService_getOrCreateUser(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("existing identity → return that user", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, _ := newAuthMocks()
+		ur.users["u-existing"] = &model.User{ID: "u-existing", Status: "active"}
+		email := "ex@x.com"
+		sir.identities["github:gh-1"] = &model.SocialIdentity{
+			ID: "ident-1", UserID: "u-existing", Provider: "github",
+			ProviderUID: "gh-1", Email: &email,
+		}
+		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+			Provider: "github", ProviderUID: "gh-1", Email: "ex@x.com",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if u.ID != "u-existing" {
+			t.Errorf("user.ID = %q, want u-existing", u.ID)
+		}
+	})
+
+	t.Run("new user + new identity", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, _ := newAuthMocks()
+		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+			Provider: "github", ProviderUID: "gh-fresh", Email: "fresh@x.com",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if u.ID == "" {
+			t.Error("expected non-empty user.ID for new user")
+		}
+		// The mock's Create stores by provider+uid key, so the new
+		// identity should be retrievable.
+		if _, ok := sir.identities["github:gh-fresh"]; !ok {
+			t.Error("expected identity to be created")
+		}
+	})
+
+	t.Run("race: duplicate-key on identity.Create falls back to winner", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, _ := newAuthMocks()
+		// Seed a "winner" identity that the duplicate-key path will
+		// resolve to. The mock's Create rejects with a duplicateKeyError
+		// when the identity already exists.
+		ur.users["u-winner"] = &model.User{ID: "u-winner", Status: "active"}
+		email := "race@x.com"
+		sir.identities["github:gh-race"] = &model.SocialIdentity{
+			ID: "ident-winner", UserID: "u-winner", Provider: "github",
+			ProviderUID: "gh-race", Email: &email,
+		}
+		sir.createErr = &duplicateKeyError{}
+		defer func() { sir.createErr = nil }()
+		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+			Provider: "github", ProviderUID: "gh-race", Email: "race@x.com",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if u.ID != "u-winner" {
+			t.Errorf("user.ID = %q, want u-winner (winner of the race)", u.ID)
+		}
+	})
+
+	t.Run("identity.Create generic error → wrap", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, _ := newAuthMocks()
+		// Inject a non-duplicate-key error on Create.
+		sir.createErr = errors.New("db down")
+		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		_, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+			Provider: "github", ProviderUID: "gh-wrap", Email: "wrap@x.com",
+		})
+		if err == nil {
+			t.Fatal("expected wrapped error, got nil")
+		}
+		if !strings.Contains(err.Error(), "create identity") {
+			t.Errorf("expected wrap 'create identity', got %q", err.Error())
+		}
+	})
+
+	t.Run("resolveOrCreateUser error → wrap", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, _, _, _ := newAuthMocks()
+		// Inject an error into userRepo.Create. resolveOrCreateUser calls
+		// it on the new-user path; that error propagates up and is wrapped
+		// as "resolve user: ..." inside getOrCreateUser.
+		ur.err = errors.New("db down on create user")
+		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		_, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+			Provider: "github", ProviderUID: "gh-resolve", Email: "resolve@x.com",
+		})
+		if err == nil {
+			t.Fatal("expected wrapped error, got nil")
+		}
+		if !strings.Contains(err.Error(), "resolve user") {
+			t.Errorf("expected wrap 'resolve user', got %q", err.Error())
 		}
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -406,6 +407,7 @@ func TestSubscriptionService_ListUserSubscriptions(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("list user subscriptions", func(t *testing.T) {
+		t.Parallel()
 		sr := newMockSubscriptionRepo()
 		pr := newMockPlanRepo()
 		planSvc := &PlanService{planRepo: pr}
@@ -444,6 +446,125 @@ func containsHelper(substr, s string) bool {
 
 func timePtr(t time.Time) *time.Time {
 	return &t
+}
+
+// TestSubscriptionService_GetUserSubscription_RarePaths fills in branches
+// the table-driven test doesn't reach: subRepo returning a non-ErrNoRows
+// error (e.g. connection failure), and the "get plan" error path when
+// the user's active sub exists but the plan lookup fails.
+func TestSubscriptionService_GetUserSubscription_RarePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("subRepo FindActiveByUserID generic error", func(t *testing.T) {
+		t.Parallel()
+		sr := newMockSubscriptionRepo()
+		sr.findErr = errors.New("db down")
+		planSvc := &PlanService{planRepo: newMockPlanRepo()}
+		subSvc := NewSubscriptionService(sr, planSvc)
+		_, _, err := subSvc.GetUserSubscription(ctx, "user-x")
+		if err == nil {
+			t.Fatal("expected error from subRepo, got nil")
+		}
+		if !strings.Contains(err.Error(), "get subscription") {
+			t.Errorf("expected wrap 'get subscription', got %q", err.Error())
+		}
+	})
+
+	t.Run("get plan by id errors out", func(t *testing.T) {
+		t.Parallel()
+		sr := newMockSubscriptionRepo()
+		expiresAt := time.Now().Add(30 * 24 * time.Hour)
+		sr.subs["sub-x"] = &model.Subscription{
+			ID: "sub-x", UserID: "user-x", PlanID: "missing-plan",
+			Status: "active", ExpiresAt: &expiresAt,
+		}
+		sr.byUserID["user-x"] = sr.subs["sub-x"]
+		// planRepo.FindByID returns the injected error
+		pr := newMockPlanRepo()
+		pr.err = errors.New("db down")
+		planSvc := &PlanService{planRepo: pr}
+		subSvc := NewSubscriptionService(sr, planSvc)
+		_, _, err := subSvc.GetUserSubscription(ctx, "user-x")
+		if err == nil {
+			t.Fatal("expected error from plan lookup, got nil")
+		}
+		if !strings.Contains(err.Error(), "get plan") {
+			t.Errorf("expected wrap 'get plan', got %q", err.Error())
+		}
+	})
+}
+
+// TestSubscriptionService_Create_RarePaths covers error paths the
+// table-driven Create test doesn't reach: generic planRepo / subRepo
+// errors, and subRepo.Create's generic (non-duplicate) error path.
+func TestSubscriptionService_Create_RarePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("planRepo FindByID generic error", func(t *testing.T) {
+		t.Parallel()
+		sr := newMockSubscriptionRepo()
+		pr := newMockPlanRepo()
+		pr.err = errors.New("db down on plan lookup")
+		planSvc := &PlanService{planRepo: pr}
+		subSvc := NewSubscriptionService(sr, planSvc)
+		_, err := subSvc.Create(ctx, "user-x", "free", nil)
+		if err == nil {
+			t.Fatal("expected error from plan lookup, got nil")
+		}
+		if !strings.Contains(err.Error(), "find plan") {
+			t.Errorf("expected wrap 'find plan', got %q", err.Error())
+		}
+	})
+
+	t.Run("subRepo FindActiveByUserID generic error", func(t *testing.T) {
+		t.Parallel()
+		sr := newMockSubscriptionRepo()
+		sr.findErr = errors.New("db down on active sub lookup")
+		pr := newMockPlanRepo()
+		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true}
+		planSvc := &PlanService{planRepo: pr}
+		subSvc := NewSubscriptionService(sr, planSvc)
+		_, err := subSvc.Create(ctx, "user-x", "free", nil)
+		if err == nil {
+			t.Fatal("expected error from subRepo lookup, got nil")
+		}
+		if !strings.Contains(err.Error(), "check existing") {
+			t.Errorf("expected wrap 'check existing', got %q", err.Error())
+		}
+	})
+
+	t.Run("subRepo.Create generic error", func(t *testing.T) {
+		t.Parallel()
+		sr := newMockSubscriptionRepo()
+		sr.createErr = errors.New("db down on create")
+		pr := newMockPlanRepo()
+		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true}
+		planSvc := &PlanService{planRepo: pr}
+		subSvc := NewSubscriptionService(sr, planSvc)
+		_, err := subSvc.Create(ctx, "user-x", "free", nil)
+		if err == nil {
+			t.Fatal("expected error from subRepo.Create, got nil")
+		}
+		if !strings.Contains(err.Error(), "create subscription") {
+			t.Errorf("expected wrap 'create subscription', got %q", err.Error())
+		}
+	})
+
+	t.Run("subRepo.Create duplicate-key → ErrSubscriptionExists", func(t *testing.T) {
+		t.Parallel()
+		sr := newMockSubscriptionRepo()
+		sr.createErr = &duplicateKeyError{}
+		pr := newMockPlanRepo()
+		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true}
+		planSvc := &PlanService{planRepo: pr}
+		subSvc := NewSubscriptionService(sr, planSvc)
+		_, err := subSvc.Create(ctx, "user-x", "free", nil)
+		if !errors.Is(err, ErrSubscriptionExists) {
+			t.Errorf("expected ErrSubscriptionExists, got %v", err)
+		}
+	})
 }
 
 // TestIsDuplicateKey covers the postgres 23505 / driver DuplicateKey()

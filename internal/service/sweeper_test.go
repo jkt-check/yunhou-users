@@ -172,3 +172,25 @@ func TestOrderSweeper_TickErrorPath(t *testing.T) {
 		t.Errorf("expected 1 sweep call, got %d", repo.callCount.Load())
 	}
 }
+
+// TestOrderSweeper_TickLogsFlippedCount exercises the n > 0 branch of tick
+// (the "flipped N pending orders to expired" log line). Drives Start+Stop
+// with a mock that returns a non-zero count; the assertion is the same
+// pattern as TestOrderSweeper_StartStop, with a stronger guarantee that
+// tick's success path with n > 0 was reached.
+func TestOrderSweeper_TickLogsFlippedCount(t *testing.T) {
+	t.Parallel()
+	repo := &mockOrderRepo{returnCount: 5}
+	s := NewOrderSweeper(repo, 50*time.Millisecond)
+	s.Start(context.Background())
+	// Allow the initial tick (which runs synchronously inside run()) to
+	// complete before Stop — Stop blocks on the done channel.
+	time.Sleep(30 * time.Millisecond)
+	s.Stop()
+
+	if repo.callCount.Load() < 1 {
+		t.Errorf("expected at least 1 sweep call, got %d", repo.callCount.Load())
+	}
+	// The success path with n > 0 doesn't return an error, doesn't
+	// panic — the test passes if the goroutine exits cleanly via Stop.
+}

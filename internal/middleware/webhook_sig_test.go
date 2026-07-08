@@ -994,3 +994,28 @@ func TestPaypalVerifyCache_LookupStore(t *testing.T) {
 		}
 	})
 }
+
+// TestClearPaypalVerifyCache_EmptiesEntries seeds a few entries, then calls
+// ClearPaypalVerifyCache and verifies the map is empty. The test exists
+// purely for the line coverage of the function (it's an exported
+// package-level helper used by e2e tests but otherwise untested).
+func TestClearPaypalVerifyCache_EmptiesEntries(t *testing.T) {
+	resetPaypalVerifyCache(t)
+	for i := 0; i < 3; i++ {
+		k := paypalVerifyCacheKey{transmissionID: "seed", transmissionTime: "2026-01-01T00:00:00Z"}
+		paypalVerifyCache.Store(k, paypalVerifyCacheEntry{
+			status:    "SUCCESS",
+			expiresAt: time.Now().Add(time.Hour),
+		})
+	}
+	ClearPaypalVerifyCache()
+
+	count := 0
+	paypalVerifyCache.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Errorf("expected cache to be empty after Clear, got %d entries", count)
+	}
+}

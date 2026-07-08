@@ -19,8 +19,8 @@ func (mockResult) RowsAffected() (int64, error) { return 1, nil }
 // fakeTx implements the dbTx interface. Tests configure the error
 // fields to drive specific error paths in the webhook handlers.
 type fakeTx struct {
-	getErr   error
-	execErr  error
+	getErr error
+	execErr error
 }
 
 func (f *fakeTx) GetContext(_ context.Context, _ interface{}, _ string, _ ...interface{}) error {

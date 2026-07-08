@@ -1491,6 +1491,58 @@ func TestPaymentService_OnWebhook_ReRunAfterCrash(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnWebhook_ReRunSameTxnID covers the "dedup hit
+// on (channel, external_txn_id) with status=paid" branch in
+// onPaymentSucceeded. A pre-existing paid payment with the SAME
+// (channel, external_txn_id) causes the INSERT to be a no-op, and
+// the function reads back the existing payment ID.
+func TestPaymentService_OnWebhook_ReRunSameTxnID(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	// Pre-insert a paid payment + a webhook_events row that
+	// references the same (channel, external_txn_id). When the new
+	// webhook fires, the InsertOnConflictDoNothing on webhook_events
+	// returns inserted=false (since the event_id is the same), and
+	// the onPaymentSucceeded handler's INSERT into payments also
+	// returns inserted=false (ON CONFLICT on channel, external_txn_id).
+	txnID := "pi-dedup-" + mustNewUUID()[:8]
+	eventID := "evt-dedup-" + mustNewUUID()[:8]
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO webhook_events (channel, event_id, event_type, raw_payload, processed_at)
+		VALUES ('stripe', $1, 'payment_intent.succeeded', '{}', NULL)
+	`, eventID); err != nil {
+		t.Fatalf("seed webhook_events: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO payments (id, order_id, channel, external_txn_id, amount, currency, status, paid_at, raw_payload)
+		VALUES ($1, $2, 'stripe', $3, 29.9, 'CNY', 'paid', now(), '{}')
+	`, mustNewUUID(), order.ID, txnID); err != nil {
+		t.Fatalf("seed payment: %v", err)
+	}
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: eventID, EventType: "payment_intent.succeeded",
+		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook dedup: %v", err)
+	}
+
+	// The order's status should still be 'paid' (it was paid before).
+	var status string
+	if err := db.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "paid" {
+		t.Errorf("order.Status = %q, want paid (unchanged after dedup)", status)
+	}
+}
+
 // TestPaymentService_CreateOrder_GenericError covers the wrap paths
 // in CreateOrder that aren't covered by the "plan not found" / "plan
 // inactive" / "user has active sub" tests. A generic planRepo error

@@ -18,8 +18,23 @@ import (
 // Concurrent fetches for the same cacheKey are collapsed into a single
 // upstream call (per-key inflight dedup) — without this, a cold cache
 // under burst load would issue N parallel POSTs to PayPal and risk hitting
-// rate limits during deploys / TTL expiry. This is the standard
-// singleflight pattern inlined to avoid the golang.org/x/sync dependency.
+// rate limits during deploys / TTL expiry.
+//
+// This is the standard singleflight pattern inlined to avoid the
+// golang.org/x/sync dependency (which would otherwise be a transitive
+// dep). The inlined version preserves the two contract guarantees the
+// upstream singleflight.Group provides that matter here:
+//
+//   1. Leader-error propagation: a single fetch failure surfaces to every
+//      follower as ErrUpstreamFailed. Followers do NOT each retry —
+//      retrying would re-create the thundering-herd the dedup prevents
+//      (see TestTokenCache_GetOrFetch_ConcurrentMissesDeduped).
+//   2. No-leader-window: the inflight entry is deleted AND the done
+//      channel is closed while holding c.mu, so a caller that missed the
+//      inflight slot never becomes a duplicate leader mid-flight.
+//
+// Neither guarantee relies on x/sync internals; both are enforced in the
+// loop below. Switching to singleflight.Group would not change behaviour.
 type TokenCache struct {
 	// safetyMargin is subtracted from expires_in so we don't hand out a
 	// token that's about to expire.
@@ -67,9 +82,15 @@ func (c *TokenCache) GetOrFetch(cacheKey string, fetch func() (*Token, error)) (
 		c.mu.Unlock()
 		<-call.done
 		// Either the leader stored an entry (call.tok non-nil) or it errored
-		// (call.err). Return whichever it set; do not retry.
+		// (call.err). Return whichever it set; do not retry. A nil token
+		// alongside a nil error means the fetch callback returned (nil, nil)
+		// — treat as upstream failure rather than dereferencing nil and
+		// panicking in the caller's AccessToken read.
 		if call.err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrUpstreamFailed, call.err)
+		}
+		if call.tok == nil {
+			return nil, fmt.Errorf("%w: leader returned nil token", ErrUpstreamFailed)
 		}
 		return call.tok, nil
 	}
@@ -84,6 +105,15 @@ func (c *TokenCache) GetOrFetch(cacheKey string, fetch func() (*Token, error)) (
 		ttl := time.Duration(call.tok.ExpiresIn)*time.Second - c.safetyMargin
 		if ttl <= 0 {
 			ttl = 30 * time.Second
+		}
+		// PayPal's documented expires_in is ~3h; an anomalously large
+		// value (proxy replay, misconfigured upstream) would otherwise
+		// pin a token for days, widening the window for any leaked
+		// cache key. Cap at 1h — generous over the documented value
+		// but bounded.
+		const maxTTL = 1 * time.Hour
+		if ttl > maxTTL {
+			ttl = maxTTL
 		}
 		c.mu.Lock()
 		c.entries[cacheKey] = cachedToken{token: call.tok, expiresAt: time.Now().Add(ttl)}
@@ -104,6 +134,9 @@ func (c *TokenCache) GetOrFetch(cacheKey string, fetch func() (*Token, error)) (
 
 	if call.err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUpstreamFailed, call.err)
+	}
+	if call.tok == nil {
+		return nil, fmt.Errorf("%w: leader returned nil token", ErrUpstreamFailed)
 	}
 	return call.tok, nil
 }

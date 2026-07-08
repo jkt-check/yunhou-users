@@ -549,7 +549,15 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		return fmt.Errorf("paypal verify decode: %w", err)
 	}
-	if out.VerificationStatus != "SUCCESS" {
+	// PayPal documents two verification_status values: "SUCCESS" and
+	// "FAILURE". Treat anything else ("PENDING", empty, future-draft) as
+	// transient — refuse to cache it so PayPal's own retries don't hit a
+	// cache that would lock out a legitimate retry under a different
+	// upstream verdict. Cache only on the two known terminal values.
+	if out.VerificationStatus != "SUCCESS" && out.VerificationStatus != "FAILURE" {
+		return fmt.Errorf("paypal verify unexpected status %q", out.VerificationStatus)
+	}
+	if out.VerificationStatus == "FAILURE" {
 		storeVerifyCache(paypalVerifyCacheKey{
 			transmissionID:   transmissionID,
 			transmissionTime: transmissionTime,

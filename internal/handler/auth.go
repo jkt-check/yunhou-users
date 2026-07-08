@@ -100,6 +100,16 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	}
 
 	if err := h.authSvc.Logout(c.Request.Context(), req.RefreshToken); err != nil {
+		// Logout is idempotent at the service layer (missing/expired
+		// session returns nil). Any error that reaches us is either an
+		// expected sentinel (e.g. ErrInvalidRefreshToken) — treat as
+		// already-logged-out, return 200 — or an unexpected DB failure
+		// worth a 500. Mirrors RefreshToken's mapping so the two
+		// sibling endpoints don't disagree on the same input shape.
+		if isExpectedAuthErr(err) {
+			c.JSON(http.StatusOK, gin.H{"code": 0, "message": "logged out"})
+			return
+		}
 		log.Printf("logout internal error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "logout failed"})
 		return

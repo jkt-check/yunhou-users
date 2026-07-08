@@ -265,17 +265,18 @@ func fetchGitHubUserWithURLs(ctx context.Context, httpClient *http.Client, userU
 		return nil, err
 	}
 	email := ghUser.Email
-	// Email-merge safety: if the email from /user is empty OR not
-	// verified primary per /user/emails, drop it entirely and fall
-	// back to whichever verified primary /user/emails reports (if any).
-	// Without this drop, an attacker could register a GitHub account
+	// Email-merge safety: /user's email is not necessarily verified.
+	// Cross-check with /user/emails ONCE per login (was 2x in the prior
+	// implementation). If /user returned no email, use the verified
+	// primary. If /user/emails says /user's email isn't primary+verified,
+	// drop it and use the verified primary.
+	//
+	// Without this guard, an attacker can register a GitHub account
 	// with the victim's email (unverified) and merge into the victim
 	// via the email-merge path in AuthService.
-	if email == "" || !isPrimaryEmailVerified(ctx, httpClient, emailsURL, token) {
-		email = ""
-		if verified := verifiedPrimaryEmail(ctx, httpClient, emailsURL, token); verified != "" {
-			email = verified
-		}
+	primaryIsVerified, verifiedPrimary := fetchGitHubEmails(ctx, httpClient, emailsURL, token)
+	if email == "" || !primaryIsVerified {
+		email = verifiedPrimary
 	}
 	return &ProviderUserInfo{
 		Provider:    "github",
@@ -286,56 +287,43 @@ func fetchGitHubUserWithURLs(ctx context.Context, httpClient *http.Client, userU
 	}, nil
 }
 
-// isPrimaryEmailVerified checks /user/emails to determine whether the
-// email GitHub returned from /user is also the user's primary AND
-// verified email. URL-injectable so tests can stub it.
+// isPrimaryEmailVerified is a one-line wrapper over fetchGitHubEmails
+// kept for the existing tests that target it directly. Production code
+// path uses fetchGitHubEmails once and branches on both return values
+// (see fetchGitHubUserWithURLs above).
 func isPrimaryEmailVerified(ctx context.Context, httpClient *http.Client, emailsURL, token string) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, emailsURL, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var emails []struct {
-		Email    string `json:"email"`
-		Primary  bool   `json:"primary"`
-		Verified bool   `json:"verified"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&emails); err != nil {
-		return false
-	}
-	for _, e := range emails {
-		if e.Primary && e.Verified {
-			return true
-		}
-	}
-	return false
+	primary, _ := fetchGitHubEmails(ctx, httpClient, emailsURL, token)
+	return primary
 }
 
-// verifiedPrimaryEmail returns the primary verified email from
-// /user/emails. URL-injectable for tests.
+// verifiedPrimaryEmail is a one-line wrapper over fetchGitHubEmails kept
+// for the existing tests that target it directly. Production code path
+// uses fetchGitHubEmails once and branches on both return values.
 func verifiedPrimaryEmail(ctx context.Context, httpClient *http.Client, emailsURL, token string) string {
+	_, email := fetchGitHubEmails(ctx, httpClient, emailsURL, token)
+	return email
+}
+
+// fetchGitHubEmails decodes /user/emails once and returns both the
+// (primaryIsVerified) flag and the (verifiedPrimary) email string.
+// Single fetch — the previous implementation called /user/emails twice
+// per login (once for the bool, once for the string), doubling GitHub's
+// RTT cost on every /auth/github/callback. URL-injectable so tests
+// stub it.
+func fetchGitHubEmails(ctx context.Context, httpClient *http.Client, emailsURL, token string) (primaryIsVerified bool, verifiedPrimary string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, emailsURL, nil)
 	if err != nil {
-		return ""
+		return false, ""
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return ""
+		return false, ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return false, ""
 	}
 	var emails []struct {
 		Email    string `json:"email"`
@@ -343,14 +331,23 @@ func verifiedPrimaryEmail(ctx context.Context, httpClient *http.Client, emailsUR
 		Verified bool   `json:"verified"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&emails); err != nil {
-		return ""
+		return false, ""
 	}
+	// First pass: primary + verified (the strongest signal).
 	for _, e := range emails {
 		if e.Primary && e.Verified {
-			return e.Email
+			return true, e.Email
 		}
 	}
-	return ""
+	// Second pass: any verified (legitimate non-primary case).
+	for _, e := range emails {
+		if e.Verified {
+			return false, e.Email
+		}
+	}
+	// No verified emails — refuse to return anything. Falling back to
+	// unverified addresses would re-introduce the email-merge takeover.
+	return false, ""
 }
 
 // fetchUserJSON performs the /user call against an injectable URL and HTTP

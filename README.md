@@ -18,12 +18,14 @@ A shared user management API for multi-app ecosystems. One user identity across 
 createdb yunhou_users
 # Run ALL migrations in order — 002 alters tables created by 001, 003
 # adds payment/webhook tables, 004 adds the lemonsqueezy channel CHECK
-# constraint (dead-but-allowed — LemonSqueezy code was removed but the
-# migration is kept so the schema stays backward-compatible), 005 adds
-# the paypal channel CHECK constraint, 006 adds
+# constraint (historical — superseded by 008), 005 adds the paypal
+# channel CHECK constraint, 006 adds
 # subscriptions.external_subscription_id for PayPal renewal webhooks,
-# 007 adds apps.secret_hash. Each depends on the prior; running out of
-# order will fail.
+# 007 adds apps.secret_hash, 008 drops lemonsqueezy from the
+# payments / refunds / webhook_events channel CHECK constraints (the
+# LemonSqueezy code path was removed in commit d8f333d; the migration
+# keeps the schema in sync with the handler, which 404s unknown
+# channels). Each depends on the prior; running out of order will fail.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
@@ -31,6 +33,7 @@ psql -d yunhou_users -f migrations/004_ls_channel.sql
 psql -d yunhou_users -f migrations/005_paypal_channel.sql
 psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
 psql -d yunhou_users -f migrations/007_app_secret.sql
+psql -d yunhou_users -f migrations/008_drop_lemonsqueezy.sql
 
 # 2. Generate RSA keys
 make generate-keys
@@ -129,9 +132,9 @@ User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 - Channel webhooks carry `sub_expires_at` via `payment.metadata.sub_expires_at` / `resource.sub_expires_at`. yunhou-users does not derive it server-side — the BFF computes it from `plan.interval_days` + business rules and embeds it into checkout creation.
 - `POST /apps/:id/quote` requires JWT but does **not** enforce `has_access` against the user's subscription. Any authenticated user can quote any plan any app exposes.
 
-### Cycle precedence (PayPal vs LemonSqueezy)
+### Cycle precedence
 
-When both providers are configured for the same `plan_id`, the resolved cycle (and therefore `sub_expires_at`) uses **PayPal's `trial_days + billing_cycle_days`**. LemonSqueezy's `trial_days` / `billing_cycle_days` in the quote response are ignored — only its `variant_id` flows downstream. Keep PayPal's billing-cycle definition in sync with operator config or `sub_expires_at` will diverge from what PayPal actually bills.
+When both providers are configured for the same `plan_id`, the resolved cycle (and therefore `sub_expires_at`) uses **PayPal's `trial_days + billing_cycle_days`**. Keep PayPal's billing-cycle definition in sync with operator config or `sub_expires_at` will diverge from what PayPal actually bills.
 
 ## Authentication Flow
 
@@ -173,6 +176,7 @@ psql -d yunhou_users -f migrations/004_ls_channel.sql
 psql -d yunhou_users -f migrations/005_paypal_channel.sql
 psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
 psql -d yunhou_users -f migrations/007_app_secret.sql
+psql -d yunhou_users -f migrations/008_drop_lemonsqueezy.sql
 ```
 
 ## Tech Stack

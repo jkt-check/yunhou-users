@@ -152,8 +152,30 @@ func TestIssueOAuthState_NegativeCallbackIndex(t *testing.T) {
 
 func TestIssueOAuthState_OverflowCallbackIndex(t *testing.T) {
 	t.Parallel()
-	if _, err := IssueOAuthState(testStateSecret, "yundian", 1<<32, time.Unix(1_700_000_000, 0)); err == nil {
-		t.Error("expected error for overflowing callback index")
+	// 1<<32 = 0x100000000 — one past the uint32 ceiling. Must be rejected.
+	if _, err := IssueOAuthState(testStateSecret, "yundian", 1<<32, time.Unix(1_700_000_000, 0)); !errIs(err, ErrInvalidState) {
+		t.Errorf("1<<32 err = %v, want ErrInvalidState", err)
+	}
+	// 0xFFFFFFFF is the max-valid uint32; regression-proof the bound is `>`
+	// (not `>=`). A flip from `>` to `>=` here would silently fail for the
+	// largest legitimate callback index.
+	if _, err := IssueOAuthState(testStateSecret, "yundian", 0xFFFFFFFF, time.Unix(1_700_000_000, 0)); err != nil {
+		t.Errorf("0xFFFFFFFF should be accepted: %v", err)
+	}
+	// Negative indices are out of range too.
+	if _, err := IssueOAuthState(testStateSecret, "yundian", -1, time.Unix(1_700_000_000, 0)); !errIs(err, ErrInvalidState) {
+		t.Errorf("negative err = %v, want ErrInvalidState", err)
+	}
+}
+
+func TestIssueOAuthState_EmptyInputs(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	if _, err := IssueOAuthState(nil, "yundian", 0, now); !errIs(err, ErrInvalidState) {
+		t.Errorf("empty-secret err = %v, want ErrInvalidState", err)
+	}
+	if _, err := IssueOAuthState(testStateSecret, "", 0, now); !errIs(err, ErrInvalidState) {
+		t.Errorf("empty-appID err = %v, want ErrInvalidState", err)
 	}
 }
 

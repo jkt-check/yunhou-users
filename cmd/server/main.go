@@ -85,6 +85,17 @@ func main() {
 		cfg.OrderExpiryDuration,
 	)
 
+	// Validate PayPal environment BEFORE building anything that depends on it.
+	// config.PaypalEnv defaults to "live" when unset, so cfg.PaypalEnv == ""
+	// is unreachable. Anything other than "sandbox" or "live" is a typo —
+	// we crash loud rather than silently misrouting OAuth tokens. Doing this
+	// before buildWebhookVerifier prevents the verifier from logging a stale
+	// "channel will return 404" right before the process exits on a typo.
+	paypalMode := paypal.Mode(cfg.PaypalEnv)
+	if paypalMode != paypal.ModeSandbox && paypalMode != paypal.ModeLive {
+		log.Fatalf("paypal: PAYPAL_ENV=%q is invalid; must be sandbox or live", cfg.PaypalEnv)
+	}
+
 	// Webhook signature verifier. Each channel is optional — empty secret
 	// means that channel returns 404 (not configured).
 	webhookVerifier := buildWebhookVerifier(cfg)
@@ -96,15 +107,7 @@ func main() {
 	// the same client_id's TTL window. LS is webhook-only in Yunhou — no
 	// outbound HTTP, the service reads the api_key directly from
 	// apps.config.payment_providers.lemonsqueezy.
-	//
-	// config.PaypalEnv defaults to "live" when unset, so cfg.PaypalEnv == ""
-	// is unreachable. Anything other than "sandbox" or "live" is a typo —
-	// we crash loud rather than silently misrouting OAuth tokens.
 	paypalHTTPClient := &http.Client{Timeout: 5 * time.Second}
-	paypalMode := paypal.Mode(cfg.PaypalEnv)
-	if paypalMode != paypal.ModeSandbox && paypalMode != paypal.ModeLive {
-		log.Fatalf("paypal: PAYPAL_ENV=%q is invalid; must be sandbox or live", cfg.PaypalEnv)
-	}
 	paypalOAuth := paypal.NewOAuthClient(paypalHTTPClient, paypalMode.BaseURL())
 	paypalCache := paypal.NewTokenCache(60 * time.Second)
 	paypalFetcher := paypal.NewCachedClient(paypalOAuth, paypalCache)

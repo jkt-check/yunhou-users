@@ -83,6 +83,25 @@ func TestE2E_Paypal_CaptureCompleted_HappyPath(t *testing.T) {
 	if eventID == "" {
 		t.Error("expected webhook_events row for PayPal channel")
 	}
+
+	// Capture-completed activates the user's subscription — guard the
+	// activateSubscriptionOnTx branch end-to-end. Without this, a regression
+	// that drops the activation (or ties it to a wrong plan_id) still passes
+	// the test because only the order/payment rows above are checked.
+	var subStatus string
+	var subPlanID string
+	if err := srv.DB.QueryRowxContext(context.Background(),
+		`SELECT status, plan_id FROM subscriptions WHERE user_id = (SELECT user_id FROM orders WHERE id = $1) ORDER BY created_at DESC LIMIT 1`,
+		orderID,
+	).Scan(&subStatus, &subPlanID); err != nil {
+		t.Fatalf("read subscription: %v", err)
+	}
+	if subStatus != "active" {
+		t.Errorf("expected subscription.status=active, got %s", subStatus)
+	}
+	if subPlanID != "monthly" {
+		t.Errorf("expected subscription.plan_id=monthly, got %s", subPlanID)
+	}
 }
 
 // ============================================================================
@@ -117,16 +136,6 @@ func TestE2E_Paypal_MissingHeaders_400(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400 on missing headers, got %d (body: %s)", resp.StatusCode, string(resp.Body))
 	}
-}
-
-// ============================================================================
-// PayPal webhook — channel disabled would return 404, but our harness
-// always wires all five channels. Covered by middleware unit tests; the
-// e2e is left as a stub.
-// ============================================================================
-
-func TestE2E_Paypal_ChannelDisabled_404(t *testing.T) {
-	t.Skip("E2E server always configures all five channels; covered by middleware unit tests")
 }
 
 // ============================================================================

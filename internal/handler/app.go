@@ -85,14 +85,28 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		return
 	}
 
+	// Re-marshal the validated config rather than persisting the raw bytes
+	// the caller sent. The typed unmarshal above silently drops unknown
+	// fields; persisting the original raw bytes would let operator typos
+	// (or future-deprecated keys) linger in the DB un-rendered. Round-
+	// tripping through AppConfig also normalises key ordering, which
+	// keeps config equality checks stable across deployments.
+	var configBytes json.RawMessage
 	if req.Config != nil {
 		var cfg model.AppConfig
-		if err := json.Unmarshal(req.Config, &cfg); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid config: " + err.Error()})
+		if uerr := json.Unmarshal(req.Config, &cfg); uerr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid config: " + uerr.Error()})
 			return
 		}
-		if err := validateAppConfig(&cfg); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		if verr := validateAppConfig(&cfg); verr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": verr.Error()})
+			return
+		}
+		var merr error
+		configBytes, merr = json.Marshal(cfg)
+		if merr != nil {
+			log.Printf("marshal validated app config: %v", merr)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to canonicalise config"})
 			return
 		}
 	}
@@ -112,7 +126,7 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		Name:        req.Name,
 		Description: req.Description,
 		IsActive:    true,
-		Config:      req.Config, // empty RawMessage when absent — repo COALESCE handles NULL
+		Config:      configBytes, // canonical JSONB; repo COALESCE handles NULL
 		SecretHash:  hash,
 	}
 	if err := h.appRepo.Create(c.Request.Context(), app); err != nil {
@@ -325,14 +339,22 @@ func isAcceptableCallbackURL(u string) bool {
 		rest := u[7:]
 		// strip path/port. IPv6 hosts (e.g. "[::1]:3000") start with "["
 		// and end with "]" — handle them as a special case so we don't
-		// trip on the embedded ":" separator.
+		// trip on the embedded ":" separator. IPv4-mapped IPv6 loopback
+		// ("[::ffff:127.0.0.1]") is also loopback, just spelled with the
+		// RFC 4291 §2.5.5.2 mapping form — accept it for parity.
 		if len(rest) > 0 && rest[0] == '[' {
 			end := strings.IndexByte(rest, ']')
 			if end < 0 {
 				return false
 			}
 			host := rest[1:end]
-			return host == "::1" || host == "127.0.0.1"
+			if host == "::1" || host == "127.0.0.1" {
+				return true
+			}
+			if strings.HasPrefix(host, "::ffff:") && host[len("::ffff:"):] == "127.0.0.1" {
+				return true
+			}
+			return false
 		}
 		for i := 0; i < len(rest); i++ {
 			if rest[i] == '/' || rest[i] == ':' {
@@ -659,8 +681,8 @@ func (h *PlanHandler) GetAppPlans(c *gin.Context) {
 
 // buildPublicPlan assembles a PublicPlan DTO from the canonical Plan row and
 // the app's typed config. Resolves provider_ids for every configured channel
-// and picks the first configured channel's cycle as the authoritative cycle
-// summary.
+// and delegates cycle resolution to model.ResolveCycle (single source of
+// truth shared with QuoteService — keeps marketing page and /quote in sync).
 func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 	out := model.PublicPlan{
 		ID:           p.ID,
@@ -670,35 +692,26 @@ func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 		IsDefault:    p.IsDefault,
 		ProviderIDs:  map[string]string{},
 	}
-	if cfg.PaymentProviders == nil {
-		return out
-	}
-	if pp := cfg.PaymentProviders.Paypal; pp != nil {
-		if pc, ok := pp.Plans[p.ID]; ok && pc.PlanID != "" {
-			out.ProviderIDs["paypal"] = pc.PlanID
+	if cfg.PaymentProviders != nil {
+		if pp := cfg.PaymentProviders.Paypal; pp != nil {
+			if pc, ok := pp.Plans[p.ID]; ok && pc.PlanID != "" {
+				out.ProviderIDs["paypal"] = pc.PlanID
+			}
 		}
 	}
 	// Authoritative cycle = PayPal's per-plan entry when present; nil when
 	// PayPal is unconfigured for this plan (the marketing page renders
 	// cycle:null in that case so callers don't infer a fake cycle).
-	if pp := cfg.PaymentProviders.Paypal; pp != nil {
-		if pc, ok := pp.Plans[p.ID]; ok {
+	if cfg.PaymentProviders != nil && cfg.PaymentProviders.Paypal != nil {
+		if _, ok := cfg.PaymentProviders.Paypal.Plans[p.ID]; ok {
+			cycle := model.ResolveCycle(cfg, p.ID, p.IntervalDays)
 			out.Cycle = &model.CycleSummary{
-				TrialDays:        pc.TrialDays,
-				BillingCycleDays: resolveBillingCycleDays(pc.BillingCycleDays, p.IntervalDays),
+				TrialDays:        cycle.TrialDays,
+				BillingCycleDays: cycle.BillingCycleDays,
 			}
 		}
 	}
 	return out
-}
-
-// resolveBillingCycleDays returns the configured billing_cycle_days if set,
-// otherwise falls back to plan.interval_days so a partial config still works.
-func resolveBillingCycleDays(configured, planInterval int) int {
-	if configured > 0 {
-		return configured
-	}
-	return planInterval
 }
 
 // PostQuote handles POST /apps/:id/quote. JWT-authenticated (mounted in
@@ -723,6 +736,14 @@ func (h *PlanHandler) PostQuote(c *gin.Context) {
 	}
 
 	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		// Defensive: the route is mounted with JWTAuth so this should be
+		// impossible today, but a future re-mount or middleware reorder
+		// must not silently let /quote fire with an empty user_id —
+		// quoteSvc.Get would then INSERT a quote row tied to no user.
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing user identity"})
+		return
+	}
 	quote, err := h.quoteSvc.Get(c.Request.Context(), appID, req.PlanID, userID)
 	if err != nil {
 		switch {

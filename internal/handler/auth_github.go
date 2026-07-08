@@ -277,12 +277,35 @@ func lookupGitHubConfig(app *model.App, redirectURI string) (cfg *model.GitHubOA
 	if redirectURI == "" {
 		return cfg, 0, nil
 	}
+	// Compare after percent-decoding both sides. c.Query has already
+	// decoded the request's redirect_uri, but the operator-supplied
+	// cfg entries may carry their own percent-encoding (e.g. "%2F" vs
+	// "/") that needs normalising before string-equality works. Without
+	// this, a BFF that percent-encodes its callback URL would 400 here
+	// even though both URLs are semantically the same.
+	want := normalizeCallbackURLForCompare(redirectURI)
 	for i, u := range cfg.CallbackURLs {
-		if u == redirectURI {
+		if normalizeCallbackURLForCompare(u) == want {
 			return cfg, i, nil
 		}
 	}
 	return nil, 0, service.ErrCallbackURLMismatch
+}
+
+// normalizeCallbackURLForCompare returns a canonical string for whitelist
+// comparison. We intentionally only decode — not re-encode with a fixed
+// scheme/host case — because the goal is "do these two strings mean the
+// same URL", not "is this URL well-formed". A malformed entry still
+// surfaces as ErrCallbackURLMismatch downstream because its decoded form
+// will not match the BFF's request.
+func normalizeCallbackURLForCompare(s string) string {
+	// url.PathUnescape handles "%XX" sequences in the path; for full URL
+	// decoding we'd want url.QueryUnescape, but the redirect_uri is a
+	// single value (no query string) so PathUnescape is sufficient.
+	if decoded, err := url.PathUnescape(s); err == nil {
+		return decoded
+	}
+	return s
 }
 
 // attachYunhouJWTToURL adds the standard post-login params to the BFF's

@@ -228,3 +228,20 @@ func TestTokenCache_GetOrFetch_LeaderFailurePropagatesToFollowers(t *testing.T) 
 		}
 	}
 }
+
+// TestTokenCache_GetOrFetch_NilTokenNoPanic guards the (nil, nil) fetch
+// callback contract: a future fetch implementation that returns nil token
+// alongside nil error must NOT panic when followers dereference
+// tok.AccessToken. Followers should observe ErrUpstreamFailed instead.
+func TestTokenCache_GetOrFetch_NilTokenNoPanic(t *testing.T) {
+	t.Parallel()
+	cache := NewTokenCache(60 * time.Second)
+	fetcher := func() (*Token, error) { return nil, nil }
+	_, err := cache.GetOrFetch("cid-nil", fetcher)
+	if err == nil {
+		t.Fatal("expected error from nil-token fetch, got nil")
+	}
+	if !errors.Is(err, ErrUpstreamFailed) {
+		t.Errorf("err = %v, want errors.Is(_, ErrUpstreamFailed)", err)
+	}
+}

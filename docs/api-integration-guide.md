@@ -605,15 +605,6 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
           "shipping_preference": "NO_SHIPPING",
           "user_action": "SUBSCRIBE_NOW"
         }
-      },
-      "lemonsqueezy": {
-        "variant_id": "var-MONTHLY",
-        "checkout_data": {
-          "custom": {
-            "brand": "云店",
-            "sub_expires_at": "2026-08-04T00:00:00Z"
-          }
-        }
       }
     }
   }
@@ -626,11 +617,11 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 |------|------|
 | `amount` | 透传 `plans.price` |
 | `currency` | **v1 硬编码 `"USD"`**，与 `/payments/orders` 的 `currency` 字段无关。多币种尚不支持 |
-| `sub_expires_at` | `now + trial_days + billing_cycle_days`（服务器时间）。同时被嵌入 `provider_data.lemonsqueezy.checkout_data.custom.sub_expires_at`（LemonSqueezy 流程下 BFF 可一把 `provider_data.lemonsqueezy` 透传给 LS checkout 创建）；其他渠道由 channel 自己计算 billing cycle，yunhou 不参与 |
+| `sub_expires_at` | `now + trial_days + billing_cycle_days`（服务器时间）。BFF 在创建 PayPal checkout 时将其写入 `metadata.sub_expires_at`；PayPal 自己的 renewal webhook 会通过 `resource.billing_info.next_billing_time` 回传，yunhou 不参与续费的周期计算 |
 | `cycle_config.base` | 恒为 `"now + trial + cycle"`，给审计/排查时一眼看出计算方式 |
-| `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK。LemonSqueezy 的 `custom.sub_expires_at` 已经预先填好，BFF 不必从顶层字段二次组装 |
+| `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK |
 
-**Cycle 解析规则**：当同一 `plan_id` 下 PayPal 与 LemonSqueezy 都配置了 plan 记录，**PayPal 的 `trial_days + billing_cycle_days` 胜出**——它既决定顶层 `sub_expires_at`，也决定 LS `provider_data.lemonsqueezy.checkout_data.custom.sub_expires_at`（两个值一致）。LemonSqueezy 配置里的 `trial_days` / `billing_cycle_days` 会被忽略，**只用其 `variant_id` 走 LS 链路**。运营侧必须保证 PayPal 控制台的账单周期跟 `provider_data.paypal.plan_id` 对应的 product 一致，否则报价跟实际结算对不上。
+**Cycle 解析规则**：PayPal 是当前唯一受支持的支付渠道；`sub_expires_at` 完全由 `app.config.payment_providers.paypal.plans[plan_id].trial_days + billing_cycle_days` 决定。运营侧必须保证 PayPal 控制台的账单周期跟 `provider_data.paypal.plan_id` 对应的 product 一致，否则报价跟实际结算对不上。
 
 **错误响应**：
 
@@ -1156,7 +1147,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `lemonsqueezy` / `paypal` |
+| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `paypal` |
 | `external_txn_id` | 是 | 渠道侧交易 ID |
 | `expires_at` | 否 | RFC3339 时间，订阅过期时刻。**前端必须从 `plan.interval_days` + 业务规则（rollover/grace/trial）计算**；yunhou-users 不做服务端推导。省略 = 永不过期。 |
 
@@ -1182,7 +1173,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 | HTTP | message | 触发条件 |
 |------|---------|----------|
-| 400 | `invalid channel` | `channel` 取值不在 `stripe` / `wechat_pay` / `alipay` / `lemonsqueezy` / `paypal` 之内 |
+| 400 | `invalid channel` | `channel` 取值不在 `stripe` / `wechat_pay` / `alipay` / `paypal` 之内 |
 | 400 | `invalid request body` | 请求体缺失或字段类型错误 |
 | 404 | `not found` | 订单不存在或不属于当前用户 |
 | 409 | `order is in a non-recoverable terminal state` | 订单已是 `failed` / `refunded` 终态 |
@@ -1380,24 +1371,24 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 
 `domain_action` 取值（事件被处理时填）：`payment_paid` / `payment_failed` / `refund_paid` / `payment_disputed` / `payment_dispute_closed` / `none`。**判别 dedupe 请用 `duplicate: true`，不要用 `domain_action == "none"`**（`"none"` 仅表示"事件类型不在我们关心的范围内"，不代表已处理；dedupe 命中时 `domain_action` 仍会照常填写——只要看到 `duplicate: true` 就是已处理过的事件）。
 
-订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、LemonSqueezy `meta.custom_data.sub_expires_at`（在 LS checkout 创建时由前端嵌入；`subscription_payment_*` 事件缺省时不携带此字段）、PayPal `resource.billing_info.next_billing_time`（renewal `PAYMENT.SALE.COMPLETED` 事件携带；其他事件若无则忽略）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
+订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、PayPal `resource.billing_info.next_billing_time`（renewal `PAYMENT.SALE.COMPLETED` 事件携带；其他事件若无则忽略）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
 
 ### Quote 路径 vs Confirm 路径：sub_expires_at 来源冲突
 
 订单可能通过两条独立路径被标记为已支付：
 
-- **Quote 路径**：`/quote` 返回 `sub_expires_at`，BFF 把它嵌入 LS `meta.custom_data.sub_expires_at`（Stripe/WeChat/Alipay 等价字段）；channel webhook 到达后 yunhou 直接写入 `subscriptions.expires_at`
+- **Quote 路径**：`/quote` 返回 `sub_expires_at`，BFF 把它嵌入 channel checkout metadata（PayPal `metadata.sub_expires_at`，Stripe/WeChat/Alipay 等价字段）；channel webhook 到达后 yunhou 直接写入 `subscriptions.expires_at`
 - **Confirm 路径**：`POST /payments/orders/:order_id/confirm` 由 BFF 在前端检测到 channel 支付成功时主动调用，`expires_at` 由 BFF 自己算后透传
 
 两条路径在 `subscriptions.expires_at` 这一列是**最后写入胜出**（`activateSubscriptionOnTx` 是一个盲 UPSERT，没有"哪个值更权威"的判断逻辑；见 `internal/service/payment.go`）。如果两条路径在同一订单上前后到达且 `expires_at` 计算口径不一致，**先到的被覆盖，结果不可预测**。
 
 **推荐契约**（避免 last-write-wins 模糊性）：
 
-1. **有 channel webhook 携带 `sub_expires_at` 的渠道**（Stripe / WeChat / Alipay / LemonSqueezy）：webhook 是权威源。`/confirm` 调用时**不要传 `expires_at`**——保持 `nil`，让 webhook 的值留下
+1. **有 channel webhook 携带 `sub_expires_at` 的渠道**（Stripe / WeChat / Alipay / PayPal）：webhook 是权威源。`/confirm` 调用时**不要传 `expires_at`**——保持 `nil`，让 webhook 的值留下
 2. **没有 channel webhook 的渠道**（理论上不存在；当前四个渠道都支持）：BFF 必须在 `/confirm` 里提供 `expires_at`
 3. **`/quote` 的输出仅作为 webhook metadata 的来源**，不作为最终值——BFF 在 webhook 到达前可以展示它给用户，但订阅激活一律以 webhook payload 为准
 
-如果你们的 LS / Stripe / WeChat / Alipay 流程会**并发触发** webhook 与 `/confirm`（前端轮询订单状态 + channel 同时回调的常见 race），请务必遵守契约 (1)，否则会出现"前端显示 7 天试用，但实际订阅 30 天"之类的对账漂移。
+如果你们的 Stripe / WeChat / Alipay / PayPal 流程会**并发触发** webhook 与 `/confirm`（前端轮询订单状态 + channel 同时回调的常见 race），请务必遵守契约 (1)，否则会出现"前端显示 7 天试用，但实际订阅 30 天"之类的对账漂移。
 
 ---
 

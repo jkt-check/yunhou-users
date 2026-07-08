@@ -17,6 +17,38 @@ type Plan struct {
 	CreatedAt    time.Time      `db:"created_at" json:"created_at"`
 }
 
+// CycleBaseFormula is the human-readable description of how SubExpiresAt is
+// computed. Surfaced in Quote / PublicPlan responses so callers can audit the
+// value without re-implementing the math.
+const CycleBaseFormula = "now + trial + cycle"
+
+// ResolveCycle returns the cycle configured for this plan under PayPal, or
+// the plan.IntervalDays fallback when no PayPal per-plan entry exists.
+//
+// Single source of truth — both the marketing-page PublicPlan builder and
+// the BFF quote endpoint must show identical cycle values, so the resolution
+// logic lives here in model (not in handler or service). Adding a new
+// payment channel means extending AppConfig and this function together.
+func ResolveCycle(cfg AppConfig, planID string, planInterval int) CycleConfig {
+	providers := cfg.PaymentProviders
+	if providers == nil || providers.Paypal == nil {
+		return CycleConfig{BillingCycleDays: planInterval, Base: CycleBaseFormula}
+	}
+	v, ok := providers.Paypal.Plans[planID]
+	if !ok {
+		return CycleConfig{BillingCycleDays: planInterval, Base: CycleBaseFormula}
+	}
+	billing := v.BillingCycleDays
+	if billing <= 0 {
+		billing = planInterval
+	}
+	return CycleConfig{
+		TrialDays:        v.TrialDays,
+		BillingCycleDays: billing,
+		Base:             CycleBaseFormula,
+	}
+}
+
 // PublicPlan is the DTO for GET /apps/:id/plans. It extends Plan with the
 // per-channel provider IDs and resolved cycle config so the marketing page
 // can render checkout buttons that point at the right provider subscription.

@@ -2203,7 +2203,12 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 	t.Run("plan not found returns 404", func(t *testing.T) {
 		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrPlanNotFound})
 		router := gin.New()
-		router.POST("/apps/:id/quote", handler.PostQuote)
+		// PostQuote defends on a non-empty user_id; simulate the JWT-auth
+		// middleware that production mounts on this route.
+		router.POST("/apps/:id/quote", func(c *gin.Context) {
+			c.Set(middleware.ContextUserID, "user-1")
+			c.Next()
+		}, handler.PostQuote)
 		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"missing"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2216,7 +2221,10 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 	t.Run("app inactive returns 403", func(t *testing.T) {
 		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrAppInactive})
 		router := gin.New()
-		router.POST("/apps/:id/quote", handler.PostQuote)
+		router.POST("/apps/:id/quote", func(c *gin.Context) {
+			c.Set(middleware.ContextUserID, "user-1")
+			c.Next()
+		}, handler.PostQuote)
 		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2229,7 +2237,10 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 	t.Run("plan inactive returns 400", func(t *testing.T) {
 		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrPlanInactive})
 		router := gin.New()
-		router.POST("/apps/:id/quote", handler.PostQuote)
+		router.POST("/apps/:id/quote", func(c *gin.Context) {
+			c.Set(middleware.ContextUserID, "user-1")
+			c.Next()
+		}, handler.PostQuote)
 		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2242,7 +2253,10 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 	t.Run("app not found returns 404", func(t *testing.T) {
 		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrAppNotFound})
 		router := gin.New()
-		router.POST("/apps/:id/quote", handler.PostQuote)
+		router.POST("/apps/:id/quote", func(c *gin.Context) {
+			c.Set(middleware.ContextUserID, "user-1")
+			c.Next()
+		}, handler.PostQuote)
 		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2255,7 +2269,10 @@ func TestPlanHandler_PostQuote(t *testing.T) {
 	t.Run("plan/app mismatch returns 400", func(t *testing.T) {
 		handler := NewPlanHandler(&mockPlanSvc{}, &mockAppRepo{}, &fakeQuoteSvc{err: service.ErrPlanAppMismatch})
 		router := gin.New()
-		router.POST("/apps/:id/quote", handler.PostQuote)
+		router.POST("/apps/:id/quote", func(c *gin.Context) {
+			c.Set(middleware.ContextUserID, "user-1")
+			c.Next()
+		}, handler.PostQuote)
 		req := httptest.NewRequest(http.MethodPost, "/apps/yundian/quote", bytes.NewBufferString(`{"plan_id":"monthly"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()

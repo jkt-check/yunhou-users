@@ -52,15 +52,21 @@ var ErrInvalidState = errors.New("invalid oauth state")
 // (the index into apps.config.oauth_providers.github.callback_urls the caller
 // intends to redirect to after GitHub's callback). secret is the server-side
 // HMAC key (OAUTH_STATE_SECRET). now is injectable for tests.
+//
+// Empty secret and out-of-range callback_index both surface as ErrInvalidState
+// so callers can use errors.Is uniformly across the Issue/Verify pair. The
+// config layer's Validate() rejects empty secrets up front, so reaching this
+// path implies a programming error — the sentinel lets tests and admin code
+// distinguish "bad input" from "everything else" without parsing messages.
 func IssueOAuthState(secret []byte, appID string, callbackIndex int, now time.Time) (string, error) {
 	if len(secret) == 0 {
-		return "", errors.New("oauth state: empty secret")
+		return "", ErrInvalidState
 	}
 	if appID == "" {
-		return "", errors.New("oauth state: empty appID")
+		return "", ErrInvalidState
 	}
 	if callbackIndex < 0 || callbackIndex > 0xFFFFFFFF {
-		return "", errors.New("oauth state: callback index out of range")
+		return "", ErrInvalidState
 	}
 
 	nonce := make([]byte, 16)

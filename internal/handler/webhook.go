@@ -378,15 +378,26 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 	if evt.ID == "" || evt.EventType == "" {
 		return nil, fmt.Errorf("paypal missing id or event_type")
 	}
-	if evt.Resource.CustomID == "" {
-		return nil, fmt.Errorf("paypal missing resource.custom_id")
-	}
 	if evt.Resource.ID == "" {
 		// resource.id is the channel-side transaction/subscription ID. An
 		// empty value would store ExternalSubscriptionID="" or TransactionID="",
 		// and the payments.external_txn_id UNIQUE constraint would then dedup
 		// every malformed event onto one row.
 		return nil, fmt.Errorf("paypal missing resource.id")
+	}
+	// resource.custom_id is required only for events that need to map back
+	// to a Yunhou order row. Subscription renewals (PAYMENT.SALE.*) and
+	// lifecycle events (BILLING.SUBSCRIPTION.*) don't carry custom_id —
+	// they identify the subscription via resource.billing_agreement_id
+	// (renewals) or resource.id (lifecycle). Requiring custom_id globally
+	// would silently drop every renewal webhook, leaving paid customers
+	// without an extended subscription. PAYMENT.CAPTURE.COMPLETED for
+	// one-time purchases still requires custom_id (it's the only link
+	// back to the order).
+	needsCustomID := evt.EventType == "PAYMENT.CAPTURE.COMPLETED" ||
+		evt.EventType == "PAYMENT.CAPTURE.REFUNDED"
+	if needsCustomID && evt.Resource.CustomID == "" {
+		return nil, fmt.Errorf("paypal missing resource.custom_id for %s", evt.EventType)
 	}
 
 	we := &service.WebhookEvent{

@@ -141,6 +141,11 @@ func TestUserProfileWithJWT(t *testing.T) {
 	if len(identities.Data) != 1 {
 		t.Fatalf("expected 1 identity, got %d", len(identities.Data))
 	}
+	// Provider must be "github" — a regression that drops the GitHub
+	// identity (e.g. sets Provider="" or "test") would otherwise pass.
+	if identities.Data[0].Provider != "github" {
+		t.Errorf("identity provider: expected github, got %q", identities.Data[0].Provider)
+	}
 
 	// List subscriptions
 	resp = doRequest(t, engine, http.MethodGet, "/user/subscriptions", "", authHeaders)

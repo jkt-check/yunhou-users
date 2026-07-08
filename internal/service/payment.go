@@ -757,6 +757,12 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// subs_external_sub_id makes re-runs a no-op, so retries are safe.
 	// Skipped silently when e.ExternalSubscriptionID is empty (one-time
 	// capture without a subscription context).
+	//
+	// Without the "external_subscription_id IS NULL" guard, re-activation
+	// after a previous PayPal sub was cancelled would leave the stale
+	// "I-OLD" ID on the row — subsequent renewals for the NEW subscription
+	// would fail to find the row, hitting paypal_renewal_unknown_subscription
+	// and silently dropping paid charges.
 	if e.ExternalSubscriptionID != "" {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
@@ -766,7 +772,6 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 				WHERE user_id = $2
 				  AND plan_id = $3
 				  AND status = 'active'
-				  AND external_subscription_id IS NULL
 				ORDER BY created_at DESC
 				LIMIT 1
 			)
@@ -1110,9 +1115,14 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	}
 
 	var orderID string
+	// expires_at = NULL: the schema default is now() + ORDER_EXPIRY_DURATION,
+	// which only makes sense for pending orders. A synthetic renewal order
+	// is paid immediately and never transitions through the expiry sweeper,
+	// but consumers that filter "expires_at < now() AND status='paid'" for
+	// reconciliation would otherwise mis-classify renewals as expired.
 	err = tx.QueryRowxContext(ctx, `
-		INSERT INTO orders (user_id, plan_id, amount, currency, status)
-		VALUES ($1, $2, $3, $4, 'paid')
+		INSERT INTO orders (user_id, plan_id, amount, currency, status, expires_at)
+		VALUES ($1, $2, $3, $4, 'paid', NULL)
 		RETURNING id
 	`, sub.UserID, sub.PlanID, e.Amount, e.Currency).Scan(&orderID)
 	if err != nil {
@@ -1161,6 +1171,23 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 					"sub_status":               sub.Status,
 				})
 		}
+	} else {
+		// PayPal charged the customer but didn't ship a next_billing_time
+		// hint. Recording the payment without extending the subscription
+		// would leave a paying customer without access — silently fail and
+		// let the operator investigate. Audit-log loudly so the
+		// reconciliation job (or ops) can match the payment to a manual
+		// subscription fix-up.
+		_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_no_expiry_hint",
+			fmt.Sprintf("subscription:%s", sub.ID),
+			[]string{"webhook", "paypal", "renewal", "no_expiry_hint"},
+			map[string]any{
+				"payment_id":               paymentID,
+				"order_id":                 orderID,
+				"external_subscription_id": e.ExternalSubscriptionID,
+				"amount":                   e.Amount,
+				"currency":                 e.Currency,
+			})
 	}
 
 	if err := writeAuditOnTx(ctx, tx, "service", "paypal_subscription_renewed",

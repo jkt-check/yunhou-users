@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -197,70 +198,12 @@ func (s *AuthService) LoginWithProfile(ctx context.Context, req LoginWithProfile
 	if err != nil {
 		return nil, err
 	}
+	_ = sub // sub's ExpiresAt is fetched inside issueTokensForUser
 
-	// 6. Determine plan and app access
-	var plan *model.Plan
-	if sub == nil {
-		// No subscription, use default (free) plan
-		plan, err = s.planRepo.FindDefault(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("get default plan: %w", err)
-		}
-	} else {
-		plan, err = s.planRepo.FindByID(ctx, sub.PlanID)
-		if err != nil {
-			return nil, fmt.Errorf("get plan: %w", err)
-		}
-	}
-
-	hasAccess := slices.Contains(plan.Apps, appID)
-
-	// 7. Generate tokens
-	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, plan.Apps)
-	if err != nil {
-		return nil, fmt.Errorf("sign access token: %w", err)
-	}
-
-	refreshTokenRaw, err := GenerateRefreshToken()
-	if err != nil {
-		return nil, fmt.Errorf("generate refresh token: %w", err)
-	}
-
-	session := &model.Session{
-		ID:           GenerateUUID(),
-		UserID:       user.ID,
-		AppID:        appID,
-		SessionType:  "refresh",
-		RefreshToken: hashToken(refreshTokenRaw),
-		Scope:        plan.Apps,
-		Revoked:      false,
-		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
-	}
-	if err := s.sessionRepo.Create(ctx, session); err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
-	}
-
-	var expiresAt *time.Time
-	if sub != nil {
-		expiresAt = sub.ExpiresAt
-	}
-
-	return &LoginResponse{
-		AccessToken:  accessToken,
-		RefreshToken: refreshTokenRaw,
-		User: UserInfo{
-			ID:        user.ID,
-			Nickname:  user.Nickname,
-			Email:     user.Email,
-			AvatarURL: user.AvatarURL,
-		},
-		Subscription: &SubscriptionInfo{
-			PlanID:    plan.ID,
-			PlanName:  plan.Name,
-			HasAccess: hasAccess,
-			ExpiresAt: expiresAt,
-		},
-	}, nil
+	// 6+7. Plan + access + token issuance via the shared tail so the
+	// GitHub flow and /test/login are byte-for-byte identical at the
+	// bottom.
+	return s.issueTokensForUser(ctx, user, appID, nil)
 }
 
 func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInfo) (*model.User, error) {
@@ -314,11 +257,25 @@ func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInf
 // flag indicating whether a brand-new user row was created. Email-merge
 // only fires when we actually have an email to look up; otherwise we
 // always create a new user.
+//
+// Security: identities whose provider_uid carries the dev-only TestLogin
+// marker (l3-e2e-...) are excluded from the merge set. Otherwise an
+// attacker who can reach the gated /test/login endpoint could
+// pre-emptively register a victim's email as a synthetic github identity
+// and absorb the victim's real GitHub login into their account on the
+// victim's next OAuth round-trip. The TestLogin endpoint stays gated
+// behind PAYPAL_L3_E2E_MODE=1 in production; this filter is defence in
+// depth in case the env is set by mistake.
 func (s *AuthService) resolveOrCreateUser(ctx context.Context, info *ProviderUserInfo) (string, bool, error) {
 	if info.Email != "" {
 		byEmail, err := s.identityRepo.FindByEmail(ctx, info.Email)
-		if err == nil && len(byEmail) > 0 {
-			return byEmail[0].UserID, false, nil
+		if err == nil {
+			for _, ident := range byEmail {
+				if isTestIdentityProviderUID(ident.ProviderUID) {
+					continue
+				}
+				return ident.UserID, false, nil
+			}
 		}
 	}
 	user := &model.User{
@@ -332,6 +289,13 @@ func (s *AuthService) resolveOrCreateUser(ctx context.Context, info *ProviderUse
 		return "", false, err
 	}
 	return user.ID, true, nil
+}
+
+// isTestIdentityProviderUID reports whether a social_identities row was
+// minted by the dev-only /test/login endpoint. Those rows must never be
+// used as merge targets for real OAuth logins.
+func isTestIdentityProviderUID(providerUID string) bool {
+	return strings.HasPrefix(providerUID, "l3-e2e-")
 }
 
 // TestLogin mints a real JWT for an email without going through any
@@ -399,8 +363,23 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 		return nil, ErrUserDeleted
 	}
 
+	return s.issueTokensForUser(ctx, user, req.AppID, &req.Email)
+}
+
+// issueTokensForUser is the shared token-issuance tail used by every
+// login path (LoginWithProfile for the GitHub OAuth callback, TestLogin
+// for the dev-only /test/login endpoint). Keeping a single implementation
+// guarantees refresh-token rotation, JWT claims, session schema, and the
+// (plan, has_access) view all stay byte-for-byte identical across paths —
+// a /test/login user holds a JWT indistinguishable from one minted by the
+// real GitHub flow.
+//
+// Callers are responsible for app existence/active check + user account
+// status guard + email binding (the response UserInfo.Email). This tail
+// starts at "we have a verified user, give them tokens for this app".
+func (s *AuthService) issueTokensForUser(ctx context.Context, user *model.User, appID string, overrideEmail *string) (*LoginResponse, error) {
 	// Resolve the user's plan for the response. Falls back to the
-	// default plan if the user has no active sub (matches Login).
+	// default plan if the user has no active sub.
 	var plan *model.Plan
 	active, err := s.subRepo.FindActiveByUserID(ctx, user.ID)
 	if err == nil && active != nil {
@@ -414,12 +393,9 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 			return nil, fmt.Errorf("get default plan: %w", err)
 		}
 	}
-	hasAccess := slices.Contains(plan.Apps, req.AppID)
+	hasAccess := slices.Contains(plan.Apps, appID)
 
-	// Issue tokens through the same path production uses so the refresh
-	// rotation, JWT signing, etc. are byte-for-byte identical to the
-	// GitHub OAuth callback's token issuance.
-	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, req.AppID, plan.Apps)
+	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, plan.Apps)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -430,7 +406,7 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 	session := &model.Session{
 		ID:           GenerateUUID(),
 		UserID:       user.ID,
-		AppID:        req.AppID,
+		AppID:        appID,
 		SessionType:  "refresh",
 		RefreshToken: hashToken(refreshTokenRaw),
 		Scope:        plan.Apps,
@@ -446,14 +422,23 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 		expiresAt = active.ExpiresAt
 	}
 
-	email := req.Email
+	// Pick the email for the response. LoginWithProfile leaves it as
+	// user.Email (already set from the matching identity). TestLogin
+	// passes the email it looked up via overrideEmail because the
+	// synthetic identity's email column is what /test/login's caller
+	// actually authenticated against.
+	respEmail := user.Email
+	if overrideEmail != nil {
+		respEmail = overrideEmail
+	}
+
 	return &LoginResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshTokenRaw,
 		User: UserInfo{
 			ID:        user.ID,
 			Nickname:  user.Nickname,
-			Email:     &email,
+			Email:     respEmail,
 			AvatarURL: user.AvatarURL,
 		},
 		Subscription: &SubscriptionInfo{

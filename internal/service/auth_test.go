@@ -395,3 +395,30 @@ func TestGenerateRefreshToken_Unique(t *testing.T) {
 		tokens[tok] = true
 	}
 }
+
+// TestIsTestIdentityProviderUID guards the prefix filter that protects
+// real OAuth logins from being merged into the dev-only /test/login
+// identities. The filter is the defence-in-depth backstop in case the
+// PAYPAL_L3_E2E_MODE env gate is set in production by mistake — without
+// it, an attacker could pre-claim a victim's email as a synthetic github
+// identity and absorb the victim's real GitHub login into their account.
+func TestIsTestIdentityProviderUID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		uid  string
+		want bool
+	}{
+		{"l3-e2e-deadbeef", true},
+		{"l3-e2e-", true},
+		{"github_12345", false},
+		{"wechat_openid_abc", false},
+		{"", false},
+		{"l3-e2e", false}, // prefix must include the trailing dash
+		{"L3-E2E-X", false}, // case-sensitive: GitHub IDs are case-different
+	}
+	for _, c := range cases {
+		if got := isTestIdentityProviderUID(c.uid); got != c.want {
+			t.Errorf("isTestIdentityProviderUID(%q) = %v, want %v", c.uid, got, c.want)
+		}
+	}
+}

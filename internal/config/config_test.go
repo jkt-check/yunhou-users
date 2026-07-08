@@ -241,7 +241,7 @@ func TestValidate_ErrorPaths(t *testing.T) {
 				JWTRefreshTTL:      168 * time.Hour,
 				OrderExpiryDuration: 30 * time.Minute,
 				SweeperInterval:     1 * time.Minute,
-				OAuthStateSecret:    "test-state-secret",
+				OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
 			}
 			tc.mutate(cfg)
 			err := cfg.Validate()

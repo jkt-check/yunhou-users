@@ -21,6 +21,7 @@ migrate:
 	@echo "  psql -d yunhou_users -f migrations/005_paypal_channel.sql"
 	@echo "  psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql"
 	@echo "  psql -d yunhou_users -f migrations/007_app_secret.sql"
+	@echo "  psql -d yunhou_users -f migrations/008_drop_lemonsqueezy.sql"
 	@echo ""
 	@echo "After 007, run the server once so internal/service.BackfillAppSecrets"
 	@echo "populates secret_hash for existing app rows. Capture plaintexts from"

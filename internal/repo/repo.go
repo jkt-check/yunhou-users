@@ -270,8 +270,8 @@ func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 // appSelectColumns is the canonical SELECT list for the apps table. It must
 // stay in sync with the column order produced by migration 001_init (app_id,
 // name, description, config, is_active, created_at, updated_at) plus
-// 007_app_secret (secret_hash inserted between is_active and created_at) and
-// with model.App's field order so sqlx can scan rows into the struct.
+// 007_app_secret (secret_hash inserted between is_active and created_at) —
+// the COALESCE aliases preserve db-tag matching.
 //
 // Two COALESCEs are needed because sqlx cannot scan a NULL column into the
 // corresponding Go type:
@@ -281,6 +281,12 @@ func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 // Pre-007 rows have secret_hash=NULL; without the COALESCE those rows would
 // fail to load. Keep both alias names (config, secret_hash) so the `db:"..."`
 // tags on model.App still match.
+//
+// Future migration note: sqlx scans by db tag name (not column position),
+// so adding a column to apps and forgetting to extend this string does NOT
+// break existing readers — the new column simply stays at its zero value
+// in returned structs. Adding the column here is what makes the new field
+// observable to callers; until that update lands, the field is opaque.
 const appSelectColumns = `app_id, name, description, COALESCE(config, '{}'::jsonb) AS config, is_active, COALESCE(secret_hash, '') AS secret_hash, created_at, updated_at`
 
 func (r *appRepo) FindByID(ctx context.Context, id string) (*model.App, error) {

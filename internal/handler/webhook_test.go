@@ -671,6 +671,46 @@ func TestWebhookHandler_Paypal_MissingCustomID_400(t *testing.T) {
 	}
 }
 
+// TestWebhookHandler_Paypal_SaleCompleted_NoCustomID_OK guards the renewal
+// path: PAYMENT.SALE.COMPLETED is the PayPal auto-renewal event and
+// PayPal does not always echo custom_id on renewal deliveries (the
+// original subscription's custom_id is reused by the SUBSCRIPTION.CREATED
+// path). Requiring custom_id globally would silently drop every renewal
+// webhook, leaving a paid customer without an extended subscription.
+// Resource.billing_agreement_id is sufficient to route the renewal —
+// ExternalSubscriptionID is set from it on the service side.
+func TestWebhookHandler_Paypal_SaleCompleted_NoCustomID_OK(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-RENEW",
+		"event_type": "PAYMENT.SALE.COMPLETED",
+		"resource": {
+			"id": "SALE-RENEW",
+			"billing_agreement_id": "I-BWX42RENEW",
+			"amount": {"value": "9.99", "currency_code": "USD"},
+			"billing_info": {"next_billing_time": "2026-09-30T12:00:00Z"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200; renewal must not require custom_id", rec.Code)
+	}
+	if svc.gotEvent == nil {
+		t.Fatalf("OnWebhook was not called")
+	}
+	if svc.gotEvent.ExternalSubscriptionID != "I-BWX42RENEW" {
+		t.Errorf("external_subscription_id: got %q, want %q", svc.gotEvent.ExternalSubscriptionID, "I-BWX42RENEW")
+	}
+	if svc.gotEvent.SubExpiresAt == nil {
+		t.Errorf("sub_expires_at should be populated from next_billing_time")
+	}
+}
+
 func TestWebhookHandler_Paypal_ChannelUnknownToVerifier_404(t *testing.T) {
 	// Sanity: confirm that with no verifier wired for paypal, the handler
 	// still receives the request and parses OK (signature is bypassed in

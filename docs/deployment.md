@@ -59,13 +59,13 @@ on the host terminate TLS.
    ```bash
    # Apply migrations in order. 002 alters tables created by 001 and will
    # fail if 001 hasn't been applied yet. 003 adds payment/webhook tables.
-   # 004 extends CHECK constraints to allow channel='lemonsqueezy' (required
-   # for schema backward-compat — code paths that produced LS rows are
-   # removed but the constraint stays so existing DBs don't break). 005 adds
-   # the PayPal channel CHECK constraint. 006 adds subscriptions.external_subscription_id
-   # for PayPal renewal webhooks. 007 adds apps.secret_hash; after applying,
-   # start the server once so BackfillAppSecrets populates secret_hash for
-   # pre-existing rows (capture plaintexts from the deploy log and rotate).
+   # 004 historically extended CHECK constraints to allow channel='lemonsqueezy';
+   # 008 drops that value (the LS code path was removed in d8f333d).
+   # 005 adds the PayPal channel CHECK constraint. 006 adds
+   # subscriptions.external_subscription_id for PayPal renewal webhooks.
+   # 007 adds apps.secret_hash; after applying, start the server once so
+   # BackfillAppSecrets populates secret_hash for pre-existing rows
+   # (capture plaintexts from the deploy log and rotate).
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/001_init.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/003_payments.sql
@@ -73,6 +73,7 @@ on the host terminate TLS.
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/005_paypal_channel.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/006_paypal_sub_mapping.sql
    sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/007_app_secret.sql
+   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/008_drop_lemonsqueezy.sql
    ```
 
 7. **Install Nginx config**

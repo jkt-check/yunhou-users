@@ -365,6 +365,13 @@ type E2EServer struct {
 func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	t.Helper()
 
+	// Mirror setupE2EServer's env gate: /test/login is the path loginAndGetToken
+	// uses, and without this env the handler returns 404 regardless of which
+	// helper set up the server. Idempotent across calls.
+	if err := os.Setenv("PAYPAL_L3_E2E_MODE", "1"); err != nil {
+		t.Fatalf("set PAYPAL_L3_E2E_MODE: %v", err)
+	}
+
 	db := connectDB(t)
 	t.Cleanup(func() { db.Close() })
 	cleanupDB(t, db)

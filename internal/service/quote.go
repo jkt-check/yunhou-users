@@ -73,7 +73,7 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 		}
 	}
 
-	cycle := resolveCycle(cfg, planID, plan.IntervalDays)
+	cycle := model.ResolveCycle(cfg, planID, plan.IntervalDays)
 	subExpires := time.Now().Add(time.Duration(cycle.TrialDays+cycle.BillingCycleDays) * 24 * time.Hour)
 
 	return &model.Quote{
@@ -85,36 +85,6 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 		ProviderData: buildProviderData(cfg, planID, subExpires),
 	}, nil
 }
-
-// resolveCycle returns the cycle configured for this plan under PayPal, or
-// the plan.interval_days fallback when no PayPal per-plan entry exists.
-// Mirrors the logic in handler.buildPublicPlan — keeping them in sync
-// prevents the marketing page and the quote from showing different cycle
-// values.
-func resolveCycle(cfg model.AppConfig, planID string, planInterval int) model.CycleConfig {
-	providers := cfg.PaymentProviders
-	if providers == nil || providers.Paypal == nil {
-		return model.CycleConfig{BillingCycleDays: planInterval, Base: cycleBaseFormula}
-	}
-	v, ok := providers.Paypal.Plans[planID]
-	if !ok {
-		return model.CycleConfig{BillingCycleDays: planInterval, Base: cycleBaseFormula}
-	}
-	billing := v.BillingCycleDays
-	if billing <= 0 {
-		billing = planInterval
-	}
-	return model.CycleConfig{
-		TrialDays:        v.TrialDays,
-		BillingCycleDays: billing,
-		Base:             cycleBaseFormula,
-	}
-}
-
-// cycleBaseFormula is the human-readable description of how SubExpiresAt is
-// computed. Surfaced in the Quote / PublicPlan response so callers can audit
-// the value without re-implementing the math.
-const cycleBaseFormula = "now + trial + cycle"
 
 // buildProviderData assembles the per-channel payload BFF hands to PayPal
 // to create a checkout session. brand_name comes from apps.config.brand.name

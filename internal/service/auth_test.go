@@ -66,6 +66,28 @@ func TestAuthService_Logout(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+
+	t.Run("session lookup generic error", func(t *testing.T) {
+		ur := newMockUserRepo()
+		sir := newMockSocialIdentityRepo()
+		pr := newMockPlanRepo()
+		sr := newMockSubscriptionRepo()
+		ssr := newMockSessionRepo()
+		ar := newMockAppRepo()
+
+		// Inject a non-ErrNoRows error.
+		ssr.findErr = errors.New("db down")
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		authSvc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		err := authSvc.Logout(ctx, "any-token")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "find session") {
+			t.Errorf("expected wrap 'find session', got %q", err.Error())
+		}
+	})
 }
 
 func TestHashToken_Deterministic(t *testing.T) {
@@ -972,6 +994,32 @@ func TestAuthService_LoginWithProfile_RarePaths(t *testing.T) {
 		})
 		if !errors.Is(err, ErrUserDeleted) {
 			t.Errorf("expected ErrUserDeleted, got %v", err)
+		}
+	})
+
+	t.Run("findUsableSubscription error", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, _, sr, _, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		// Pre-seed a user + identity so getOrCreateUser finds the existing
+		// user. Inject a generic error on the subRepo lookup.
+		ur.users["u-fus"] = &model.User{ID: "u-fus", Status: "active"}
+		email := "fus@x.com"
+		sir.identities["github:gh-fus"] = &model.SocialIdentity{
+			ID: "ident-fus", UserID: "u-fus", Provider: "github", ProviderUID: "gh-fus", Email: &email,
+		}
+		sr.findErr = errors.New("db down on sub lookup")
+		tokenSvc := newTokenServiceWithMocks(newMockSessionRepo(), sr)
+		svc := NewAuthService(ur, sir, newMockPlanRepo(), sr, newMockSessionRepo(), ar, tokenSvc)
+		_, err := svc.LoginWithProfile(ctx, LoginWithProfileRequest{
+			Profile: &ProviderUserInfo{Provider: "github", ProviderUID: "gh-fus", Email: email},
+			AppID:   "yundian",
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "get subscription") {
+			t.Errorf("expected wrap 'get subscription', got %q", err.Error())
 		}
 	})
 }

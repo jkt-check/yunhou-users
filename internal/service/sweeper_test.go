@@ -173,6 +173,25 @@ func TestOrderSweeper_TickErrorPath(t *testing.T) {
 	}
 }
 
+// TestOrderSweeper_TickViaStart covers the actual `tick` function path
+// reached through Start+Stop with an error-injecting repo. Drives the
+// tick()'s error log + early return branch (not just SweepOnce's
+// return-error path). Without this, the `tick` function's error
+// branch is uncovered.
+func TestOrderSweeper_TickViaStart(t *testing.T) {
+	t.Parallel()
+	repo := &mockOrderRepo{err: errors.New("db down on sweep")}
+	s := NewOrderSweeper(repo, 50*time.Millisecond)
+	s.Start(context.Background())
+	// Allow the initial tick to run.
+	time.Sleep(30 * time.Millisecond)
+	s.Stop()
+
+	if repo.callCount.Load() < 1 {
+		t.Errorf("expected at least 1 sweep call, got %d", repo.callCount.Load())
+	}
+}
+
 // TestOrderSweeper_TickLogsFlippedCount exercises the n > 0 branch of tick
 // (the "flipped N pending orders to expired" log line). Drives Start+Stop
 // with a mock that returns a non-zero count; the assertion is the same

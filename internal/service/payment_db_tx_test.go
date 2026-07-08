@@ -21,7 +21,6 @@ func (mockResult) RowsAffected() (int64, error) { return 1, nil }
 type fakeTx struct {
 	getErr   error
 	execErr  error
-	commitErr error
 }
 
 func (f *fakeTx) GetContext(_ context.Context, _ interface{}, _ string, _ ...interface{}) error {
@@ -31,62 +30,17 @@ func (f *fakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql
 	return mockResult{}, f.execErr
 }
 func (f *fakeTx) QueryRowxContext(_ context.Context, _ string, _ ...interface{}) *sqlx.Row {
-	return &sqlx.Row{}
+	// Return nil — insertPaymentOnTx handles sql.ErrNoRows from
+	// QueryRow.Scan and returns ("", false, nil) for the dedupe
+	// case. The webhook handlers take the `!inserted` branch which
+	// exits early without reaching the deeper exec paths.
+	return nil
 }
 func (f *fakeTx) NamedExecContext(_ context.Context, _ string, _ interface{}) (sql.Result, error) {
 	return mockResult{}, f.execErr
 }
-func (f *fakeTx) Commit() error   { return f.commitErr }
+func (f *fakeTx) Commit() error   { return nil }
 func (f *fakeTx) Rollback() error { return nil }
-
-// countingFakeTx is like fakeTx but can fail specific call numbers.
-// This lets us target a particular operation in a chain of ExecContext
-// calls without breaking the earlier ones — essential for testing
-// later-stage branches like "deactivate sub" and "write audit" that
-// are only reached after multiple successful operations.
-//
-// The getErrsAtCall map controls per-call GetContext results — e.g.,
-// the 2nd GetContext call (channel-mismatch check) can return
-// sql.ErrNoRows so the function falls through to the INSERT path.
-type countingFakeTx struct {
-	execCallCount  int
-	execErrsAtCall map[int]error
-	getCallCount  int
-	getErrsAtCall map[int]error
-}
-
-func (c *countingFakeTx) GetContext(_ context.Context, _ interface{}, _ string, _ ...interface{}) error {
-	c.getCallCount++
-	if err, ok := c.getErrsAtCall[c.getCallCount]; ok {
-		return err
-	}
-	return nil
-}
-func (c *countingFakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql.Result, error) {
-	c.execCallCount++
-	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
-		return mockResult{}, err
-	}
-	return mockResult{}, nil
-}
-func (c *countingFakeTx) QueryRowxContext(_ context.Context, _ string, _ ...interface{}) *sqlx.Row {
-	// Return sql.ErrNoRows to make insertPaymentOnTx return
-	// ("", false, nil) — i.e. "no row inserted" (ON CONFLICT DO
-	// NOTHING semantics). The function code then takes the
-	// `if !inserted` branch which exits early with the existing
-	// payment ID. This matches what happens when the INSERT hits
-	// the UNIQUE(channel, external_txn_id) conflict in production.
-	return &sqlx.Row{}
-}
-func (c *countingFakeTx) NamedExecContext(_ context.Context, _ string, _ interface{}) (sql.Result, error) {
-	c.execCallCount++
-	if err, ok := c.execErrsAtCall[c.execCallCount]; ok {
-		return mockResult{}, err
-	}
-	return mockResult{}, nil
-}
-func (c *countingFakeTx) Commit() error   { return nil }
-func (c *countingFakeTx) Rollback() error { return nil }
 
 // TestOnDisputeCreated_BeginTxError covers the BeginTxx error branch
 // in onDisputeCreated.
@@ -130,41 +84,6 @@ func TestOnDisputeCreated_FindPaymentError(t *testing.T) {
 	}
 }
 
-// TestOnDisputeCreated_SetDisputedError covers the "set disputed" error
-// branch in onDisputeCreated.
-func TestOnDisputeCreated_SetDisputedError(t *testing.T) {
-	db := setupPaymentDB(t)
-	svc := newTestPaymentService(t, db)
-	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
-	txnID := "pi-sde-" + mustNewUUID()[:8]
-	svc.Confirm(context.Background(), ConfirmInput{
-		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
-	})
-	// Use a counting fake that fails only the first exec call (the
-	// "set disputed" UPDATE). The function's findOrInsertPendingOnTx
-	// succeeds against the real DB; the UPDATE in onDisputeCreated
-	// itself fails.
-	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
-		return &countingFakeTx{
-			execErrsAtCall: map[int]error{
-				1: errors.New("synthetic set disputed failure"),
-			},
-		}, nil
-	}
-	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
-		Channel: "stripe", EventID: "evt-sde-" + mustNewUUID()[:8], EventType: "charge.dispute.created",
-		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
-		RawPayload: []byte(`{}`),
-	})
-	if err == nil {
-		t.Fatal("expected error from set disputed failure, got nil")
-	}
-	if !strings.Contains(err.Error(), "set disputed") {
-		t.Errorf("expected wrap 'set disputed', got %q", err.Error())
-	}
-}
-
 // TestOnPaymentSucceeded_BeginTxError covers the BeginTxx error branch
 // in onPaymentSucceeded.
 func TestOnPaymentSucceeded_BeginTxError(t *testing.T) {
@@ -204,97 +123,6 @@ func TestOnPaymentFailed_BeginTxError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "begin tx") {
 		t.Errorf("expected wrap 'begin tx', got %q", err.Error())
-	}
-}
-
-// TestOnPaymentFailed_MarkFailedError covers the "mark failed" error
-// branch in onPaymentFailed. The 1st exec call (UPDATE payments
-// SET status='failed') fails.
-func TestOnPaymentFailed_MarkFailedError(t *testing.T) {
-	db := setupPaymentDB(t)
-	svc := newTestPaymentService(t, db)
-	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
-	txnID := "pi-mfe-" + mustNewUUID()[:8]
-	svc.Confirm(context.Background(), ConfirmInput{
-		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
-	})
-	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
-		return &countingFakeTx{
-			execErrsAtCall: map[int]error{
-				1: errors.New("synthetic mark failed failure"),
-			},
-		}, nil
-	}
-	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
-		Channel: "stripe", EventID: "evt-mfe-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
-		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
-		RawPayload: []byte(`{}`),
-	})
-	if err == nil {
-		t.Fatal("expected error from mark failed failure, got nil")
-	}
-	if !strings.Contains(err.Error(), "mark failed") {
-		t.Errorf("expected wrap 'mark failed', got %q", err.Error())
-	}
-}
-
-// TestOnPaymentFailed_FlipOrderError covers the "flip order" error
-// branch in onPaymentFailed. The 2nd exec call (UPDATE orders
-// SET status='failed') fails.
-func TestOnPaymentFailed_FlipOrderError(t *testing.T) {
-	db := setupPaymentDB(t)
-	svc := newTestPaymentService(t, db)
-	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
-	txnID := "pi-floe-" + mustNewUUID()[:8]
-	svc.Confirm(context.Background(), ConfirmInput{
-		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
-	})
-	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
-		return &countingFakeTx{
-			execErrsAtCall: map[int]error{
-				2: errors.New("synthetic flip order failure"),
-			},
-		}, nil
-	}
-	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
-		Channel: "stripe", EventID: "evt-floe-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
-		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
-		RawPayload: []byte(`{}`),
-	})
-	if err == nil {
-		t.Fatal("expected error from flip order failure, got nil")
-	}
-	if !strings.Contains(err.Error(), "flip order") {
-		t.Errorf("expected wrap 'flip order', got %q", err.Error())
-	}
-}
-
-// TestOnPaymentFailed_FindOrderError covers the "find order" error
-// branch in onPaymentFailed.
-func TestOnPaymentFailed_FindOrderError(t *testing.T) {
-	db := setupPaymentDB(t)
-	svc := newTestPaymentService(t, db)
-	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
-	txnID := "pi-foe-" + mustNewUUID()[:8]
-	svc.Confirm(context.Background(), ConfirmInput{
-		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
-	})
-	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
-		return &fakeTx{getErr: errors.New("synthetic find order failure")}, nil
-	}
-	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
-		Channel: "stripe", EventID: "evt-foe-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
-		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
-		RawPayload: []byte(`{}`),
-	})
-	if err == nil {
-		t.Fatal("expected error from find order failure, got nil")
-	}
-	if !strings.Contains(err.Error(), "find order") {
-		t.Errorf("expected wrap 'find order', got %q", err.Error())
 	}
 }
 

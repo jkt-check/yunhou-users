@@ -1571,6 +1571,30 @@ func TestPaymentService_OnWebhook_ReRunSameTxnID(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnWebhook_BadCurrency covers the "insert
+// payment" error path in onPaymentSucceeded. The payments table
+// has CHECK (length(currency) = 3); a currency of wrong length
+// violates the constraint and the INSERT fails with check_violation.
+func TestPaymentService_OnWebhook_BadCurrency(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-bad-cur-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-bad-cur-" + mustNewUUID()[:8], OrderID: order.ID,
+		Amount: 29.9, Currency: "DOLLAR", // 6 chars — violates CHECK (length=3)
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from bad-currency insert, got nil")
+	}
+	if !strings.Contains(err.Error(), "insert payment") {
+		t.Errorf("expected wrap 'insert payment', got %q", err.Error())
+	}
+}
+
 // TestPaymentService_CreateOrder_GenericError covers the wrap paths
 // in CreateOrder that aren't covered by the "plan not found" / "plan
 // inactive" / "user has active sub" tests. A generic planRepo error

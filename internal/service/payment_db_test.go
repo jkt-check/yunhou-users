@@ -946,6 +946,42 @@ func TestPaymentService_OnWebhook_PaymentFailed_NoOrder(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnWebhook_PaymentFailed_InsertPending covers the
+// "no payment row, order exists, INSERT pending" path inside
+// findOrInsertPendingOnTx. The handler must mint a fresh pending
+// payment row and link it to the order.
+func TestPaymentService_OnWebhook_PaymentFailed_InsertPending(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	orderID := mustNewUUID()
+	txnID := "pi-insert-pending-" + mustNewUUID()[:8]
+	eventID := "evt-insert-pending-" + mustNewUUID()[:8]
+	// Seed an order with NO payment row.
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
+		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes')
+	`, orderID, uid); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: eventID, EventType: "payment_intent.payment_failed",
+		TransactionID: txnID, OrderID: orderID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook insert-pending: %v", err)
+	}
+	// A pending payment row should have been inserted.
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM payments WHERE order_id = $1 AND status = 'failed'`, orderID)
+	if n != 1 {
+		t.Errorf("expected 1 payment row in failed state, got %d", n)
+	}
+}
+
 // TestPaymentService_OnWebhook_ChannelMismatch covers the "webhook arrives
 // for a different channel than the one that already paid" path. The handler
 // must NOT touch the existing paid payment, must NOT insert a second paid

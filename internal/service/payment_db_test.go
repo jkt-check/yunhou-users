@@ -764,6 +764,26 @@ func TestPaymentService_ListPaymentRefunds(t *testing.T) {
 	}
 }
 
+// TestPaymentService_ListPaymentRefunds_PaymentNotFound covers the
+// error-propagation path in ListPaymentRefunds — when GetPayment
+// returns ErrPaymentNotFound (non-owner or missing payment),
+// ListPaymentRefunds must surface the same error.
+func TestPaymentService_ListPaymentRefunds_PaymentNotFound(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	res, _ := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-lpr-nf",
+	})
+	// List with a different user — non-owner → ErrPaymentNotFound.
+	other := seedUser(t, db)
+	_, err := svc.ListPaymentRefunds(context.Background(), res.PaymentID, other)
+	if !errors.Is(err, ErrPaymentNotFound) {
+		t.Errorf("err = %v, want ErrPaymentNotFound", err)
+	}
+}
+
 // ============================================================================
 // OnWebhook
 // ============================================================================

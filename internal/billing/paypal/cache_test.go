@@ -245,3 +245,55 @@ func TestTokenCache_GetOrFetch_NilTokenNoPanic(t *testing.T) {
 		t.Errorf("err = %v, want errors.Is(_, ErrUpstreamFailed)", err)
 	}
 }
+func TestMode_BaseURL(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sandbox returns sandbox URL", func(t *testing.T) {
+		t.Parallel()
+		got := ModeSandbox.BaseURL()
+		if got != "https://api-m.sandbox.paypal.com" {
+			t.Errorf("ModeSandbox.BaseURL() = %q, want https://api-m.sandbox.paypal.com", got)
+		}
+	})
+
+	t.Run("live returns live URL", func(t *testing.T) {
+		t.Parallel()
+		got := ModeLive.BaseURL()
+		if got != "https://api-m.paypal.com" {
+			t.Errorf("ModeLive.BaseURL() = %q, want https://api-m.paypal.com", got)
+		}
+	})
+
+	t.Run("unknown mode falls through to live URL", func(t *testing.T) {
+		t.Parallel()
+		got := Mode("weird").BaseURL()
+		if got != "https://api-m.paypal.com" {
+			t.Errorf("unexpected base URL for unknown mode: %q", got)
+		}
+	})
+
+	t.Run("empty mode falls through to live URL", func(t *testing.T) {
+		t.Parallel()
+		got := Mode("").BaseURL()
+		if got != "https://api-m.paypal.com" {
+			t.Errorf("unexpected base URL for empty mode: %q", got)
+		}
+	})
+}
+
+// TestCachedClient_FetchToken_OAuthError — exercise the err != nil branch
+// in FetchToken (so far only the happy path was covered).
+func TestCachedClient_FetchToken_OAuthError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad creds", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	oauth := NewOAuthClient(srv.Client(), srv.URL)
+	cache := NewTokenCache(60 * time.Second)
+	cc := NewCachedClient(oauth, cache)
+
+	if _, err := cc.FetchToken(context.Background(), "cid", "cs"); err == nil {
+		t.Error("expected error on OAuth 401, got nil")
+	}
+}

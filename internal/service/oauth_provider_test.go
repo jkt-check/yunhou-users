@@ -298,3 +298,93 @@ func TestFetchGitHubUser_MissingID(t *testing.T) {
 func errorIs(err, target error) bool {
 	return errors.Is(err, target)
 }
+
+// ============================================================================
+// Wrapper coverage — fetchGitHubPrimaryEmail / isGitHubPrimaryEmailVerified
+// / fetchGitHubVerifiedPrimaryEmail each call fetchGitHubEmails under the
+// hood; ensure every wrapper path is exercised.
+// ============================================================================
+
+func TestFetchGitHubPrimaryEmail(t *testing.T) {
+	t.Run("returns verified primary email", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/user/emails" {
+				fmt.Fprintf(w, `[{"email": "primary@example.com", "primary": true, "verified": true}]`)
+			}
+		}))
+		t.Cleanup(server.Close)
+		withProviderURLs(t, server.URL)
+		withProviderHTTPClient(t, server.Client())
+
+		got := fetchGitHubPrimaryEmail(context.Background(), "tok")
+		if got != "primary@example.com" {
+			t.Errorf("got %q, want primary@example.com", got)
+		}
+	})
+
+	t.Run("returns empty for unverified primary", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/user/emails" {
+				fmt.Fprintf(w, `[{"email": "unverified@example.com", "primary": true, "verified": false}]`)
+			}
+		}))
+		t.Cleanup(server.Close)
+		withProviderURLs(t, server.URL)
+		withProviderHTTPClient(t, server.Client())
+
+		got := fetchGitHubPrimaryEmail(context.Background(), "tok")
+		if got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+}
+
+func TestIsGitHubPrimaryEmailVerified(t *testing.T) {
+	t.Run("verified primary → true", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/user/emails" {
+				fmt.Fprintf(w, `[{"email": "p@x.com", "primary": true, "verified": true}]`)
+			}
+		}))
+		t.Cleanup(server.Close)
+		withProviderURLs(t, server.URL)
+		withProviderHTTPClient(t, server.Client())
+
+		if !isGitHubPrimaryEmailVerified(context.Background(), "tok") {
+			t.Error("expected true for verified primary")
+		}
+	})
+
+	t.Run("unverified primary → false", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/user/emails" {
+				fmt.Fprintf(w, `[{"email": "p@x.com", "primary": true, "verified": false}]`)
+			}
+		}))
+		t.Cleanup(server.Close)
+		withProviderURLs(t, server.URL)
+		withProviderHTTPClient(t, server.Client())
+
+		if isGitHubPrimaryEmailVerified(context.Background(), "tok") {
+			t.Error("expected false for unverified primary")
+		}
+	})
+}
+
+func TestFetchGitHubVerifiedPrimaryEmail(t *testing.T) {
+	t.Run("returns email when verified", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/user/emails" {
+				fmt.Fprintf(w, `[{"email": "p@x.com", "primary": true, "verified": true}]`)
+			}
+		}))
+		t.Cleanup(server.Close)
+		withProviderURLs(t, server.URL)
+		withProviderHTTPClient(t, server.Client())
+
+		got := fetchGitHubVerifiedPrimaryEmail(context.Background(), "tok")
+		if got != "p@x.com" {
+			t.Errorf("got %q, want p@x.com", got)
+		}
+	})
+}

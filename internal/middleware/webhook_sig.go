@@ -115,6 +115,14 @@ func collectHeaders(c *gin.Context) map[string]string {
 	for k, v := range c.Request.Header {
 		if len(v) > 0 {
 			h[k] = v[0]
+			// Also store the uppercase form so per-channel verifiers can
+			// do case-insensitive lookups. http.Header.Set canonicalises
+			// to title-case (e.g. "PAYPAL-AUTH-ALGO" → "Paypal-Auth-Algo"),
+			// but PayPal's spec documents the header names in all-caps
+			// and the unit tests construct map[string]string literals in
+			// the canonical form too. Storing both keys means the same
+			// verifier code works for both code paths.
+			h[strings.ToUpper(k)] = v[0]
 		}
 	}
 	return h
@@ -431,6 +439,16 @@ func storeVerifyCache(k paypalVerifyCacheKey, status string, err error) {
 		status:    status,
 		expiresAt: time.Now().Add(paypalVerifyCacheTTL),
 		err:       err,
+	})
+}
+
+// ClearPaypalVerifyCache empties the package-level verify cache. Exported
+// for test setup (e2e/ integration suites) so they don't share a poisoned
+// FAILURE entry with earlier unit-test runs in the same process.
+func ClearPaypalVerifyCache() {
+	paypalVerifyCache.Range(func(k, _ any) bool {
+		paypalVerifyCache.Delete(k)
+		return true
 	})
 }
 

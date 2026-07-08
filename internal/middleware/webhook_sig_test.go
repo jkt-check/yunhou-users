@@ -936,3 +936,61 @@ func TestMultiChannelVerifier_RoundTrip_AllChannels(t *testing.T) {
 		}
 	}
 }
+
+func TestPaypalVerifyCache_LookupStore(t *testing.T) {
+	resetPaypalVerifyCache(t)
+
+	t.Run("miss returns false", func(t *testing.T) {
+		k := paypalVerifyCacheKey{transmissionID: "miss-1", transmissionTime: "2026-01-01T00:00:00Z"}
+		entry, ok := lookupVerifyCache(k)
+		if ok {
+			t.Errorf("expected miss, got entry=%+v", entry)
+		}
+	})
+
+	t.Run("store then lookup returns true with status", func(t *testing.T) {
+		k := paypalVerifyCacheKey{transmissionID: "hit-1", transmissionTime: "2026-01-01T00:00:00Z"}
+		storeVerifyCache(k, "SUCCESS", nil)
+		entry, ok := lookupVerifyCache(k)
+		if !ok {
+			t.Fatal("expected hit, got miss")
+		}
+		if entry.status != "SUCCESS" {
+			t.Errorf("status: got %q, want SUCCESS", entry.status)
+		}
+		if entry.err != nil {
+			t.Errorf("err: got %v, want nil", entry.err)
+		}
+	})
+
+	t.Run("store then lookup with err preserves err", func(t *testing.T) {
+		k := paypalVerifyCacheKey{transmissionID: "hit-err", transmissionTime: "2026-01-01T00:00:00Z"}
+		storeVerifyCache(k, "FAILURE", ErrInvalidSignature)
+		entry, ok := lookupVerifyCache(k)
+		if !ok {
+			t.Fatal("expected hit, got miss")
+		}
+		if entry.status != "FAILURE" {
+			t.Errorf("status: got %q, want FAILURE", entry.status)
+		}
+		if entry.err == nil {
+			t.Error("err: got nil, want ErrInvalidSignature")
+		}
+	})
+
+	t.Run("expired entry → miss + auto-delete", func(t *testing.T) {
+		k := paypalVerifyCacheKey{transmissionID: "expired", transmissionTime: "2026-01-01T00:00:00Z"}
+		paypalVerifyCache.Store(k, paypalVerifyCacheEntry{
+			status:    "SUCCESS",
+			expiresAt: time.Now().Add(-1 * time.Minute), // already expired
+		})
+		_, ok := lookupVerifyCache(k)
+		if ok {
+			t.Error("expected miss for expired entry, got hit")
+		}
+		// Auto-delete: subsequent direct sync.Map lookup should also miss.
+		if _, still := paypalVerifyCache.Load(k); still {
+			t.Error("expected entry to be deleted after expired lookup")
+		}
+	})
+}

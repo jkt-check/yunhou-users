@@ -249,7 +249,11 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
-	router.Setup(context.Background(), engine, db,
+	// Cancellable context so rate-limit cleanup goroutines die at test end
+	// (see setupE2EServerWithVerifier for the full rationale).
+	setupCtx, cancelSetup := context.WithCancel(context.Background())
+	t.Cleanup(cancelSetup)
+	router.Setup(setupCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
@@ -284,7 +288,9 @@ func newMockGitHubServer(t *testing.T) *httptest.Server {
 		fmt.Fprintf(w, `[{"email":"%s","primary":true,"verified":true}]`, mockGitHubMail)
 	})
 
-	return httptest.NewServer(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func genRSAKeys(t *testing.T, privPath, pubPath string) {
@@ -371,6 +377,13 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	if err := os.Setenv("PAYPAL_L3_E2E_MODE", "1"); err != nil {
 		t.Fatalf("set PAYPAL_L3_E2E_MODE: %v", err)
 	}
+
+	// The paypal-verify cache is package-global (sync.Map) inside
+	// internal/middleware. Earlier unit tests in the same `go test`
+	// invocation may have stored FAILURE entries; clearing it here
+	// guarantees a clean slate per e2e test without forcing every
+	// helper to mint unique (transmissionID, transmissionTime) pairs.
+	middleware.ClearPaypalVerifyCache()
 
 	db := connectDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -459,7 +472,14 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
-	router.Setup(context.Background(), engine, db,
+	// Use a cancellable context so the rate-limit cleanup goroutines
+	// spawned by middleware.RateLimit die at test end — without this
+	// every setup leaks a goroutine and the test runner eventually
+	// blocks on goroutine drain (visible as "FAIL ... 30s" hangs on
+	// the final test of any batch).
+	setupCtx, cancelSetup := context.WithCancel(context.Background())
+	t.Cleanup(cancelSetup)
+	router.Setup(setupCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),

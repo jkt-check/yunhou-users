@@ -419,8 +419,14 @@ func TestWebhook_WeChat_PaymentSucceeded(t *testing.T) {
 func TestWebhook_UnsupportedChannel_404(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 
+	// "lemonsqueezy" is an unknown channel (removed in commit d8f333d);
+	// the MultiChannelVerifier has no entry for it, so the middleware
+	// must return 404. The earlier version of this test posted to
+	// `/webhooks/payment/paypal` (a supported channel), which returned
+	// 400 from the body parser — wrong layer. The right unknown channel
+	// is "lemonsqueezy" (or any non-registered one).
 	resp := doRequest(t, srv.Engine, http.MethodPost,
-		"/webhooks/payment/paypal", `{}`, nil)
+		"/webhooks/payment/lemonsqueezy", `{}`, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected 404 for unsupported channel, got %d", resp.StatusCode)
 	}

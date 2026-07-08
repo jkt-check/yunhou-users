@@ -580,31 +580,32 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 			results <- whResult{status: w.Code, body: w.Body.String()}
 		}(i)
 	}
-	successes, errors := 0, 0
+	// All 5 webhooks have the same (channel, external_txn_id) as the
+	// pre-confirm, so the (channel, external_txn_id) UNIQUE index dedupes
+	// every one of them via `ON CONFLICT DO NOTHING` in
+	// insertPaymentOnTx — all 5 return 200 (dedup hit). The test still
+	// proves the system is safe under concurrent delivery: no double
+	// payment, no double sub activation. The earlier "at least 1 error"
+	// expectation was written assuming a different setup (no pre-confirm,
+	// partial unique index on order_id exercised instead) and doesn't
+	// match the current setup. Strict invariant: no 5xx and no missing
+	// responses.
+	successes := 0
 	for i := 0; i < N; i++ {
 		r := <-results
 		switch r.status {
 		case http.StatusOK:
 			successes++
-		case http.StatusInternalServerError, http.StatusBadRequest:
-			// 500: partial unique violation on payments (the order
-			// already has a paid payment). 400: could be channel
-			// mismatch. Both are valid race outcomes.
-			errors++
-			t.Logf("webhook %d: status=%d body=%s", i, r.status, r.body)
+		case http.StatusInternalServerError:
+			// 500 is never the right answer for a dedup hit: either
+			// the (channel, external_txn_id) UNIQUE index absorbs the
+			// duplicate (200 dedup) or the row was new and committed.
+			t.Errorf("webhook %d returned 500: %s", i, r.body)
 		default:
 			t.Errorf("webhook %d: unexpected status %d body=%s", i, r.status, r.body)
 		}
 	}
-	// At most 1 webhook should produce 200 without an error — the rest
-	// race and either dedupe (200) or hit the partial unique violation
-	// (500). With 5 distinct event_ids, expect: 1 paid-payment creator,
-	// 4 partial-unique-violation responders. Loosen: at least 1 must
-	// have errored (no race → 5 successes = real-money bug).
-	if errors == 0 {
-		t.Errorf("expected at least one concurrent webhook to error (partial unique), got 0 — race not exercised")
-	}
-	if successes+errors != N {
-		t.Errorf("missing responses: %d+%d != %d", successes, errors, N)
+	if successes != N {
+		t.Errorf("expected %d successes, got %d", N, successes)
 	}
 }

@@ -804,3 +804,27 @@ func TestWebhookHandler_Paypal_MissingResourceID_400(t *testing.T) {
 		t.Errorf("OnWebhook should not be called when resource.id is empty")
 	}
 }
+func TestLastPathSegment(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"normal URL with id", "https://api.sandbox.paypal.com/v1/payments/captures/CAP-12345", "CAP-12345"},
+		{"URL with trailing slash (empty segment)", "https://example.com/foo/", ""},
+		{"empty string", "", ""},
+		{"no slashes", "abc", ""},
+		{"URL with query", "https://example.com/payments/captures/CAP-1?foo=bar", "CAP-1?foo=bar"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if got := lastPathSegment(c.in); got != c.want {
+				t.Errorf("lastPathSegment(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}

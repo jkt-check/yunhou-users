@@ -237,3 +237,48 @@ var errTest = errTestType{}
 type errTestType struct{}
 
 func (e errTestType) Error() string { return "test error" }
+
+func TestPlanService_FindByApp(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	t.Run("returns plans from repo", func(t *testing.T) {
+		t.Parallel()
+		planRepo := newMockPlanRepo()
+		planRepo.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true, Apps: []string{"yundian"}}
+		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", IsActive: true, Apps: []string{"yundian", "yundash"}}
+		svc := NewPlanService(planRepo)
+		plans, err := svc.FindByApp(ctx, "yundian")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(plans) != 2 {
+			t.Errorf("expected 2 plans, got %d", len(plans))
+		}
+	})
+
+	t.Run("propagates repo error", func(t *testing.T) {
+		t.Parallel()
+		planRepo := newMockPlanRepo()
+		planRepo.err = errTest
+		svc := NewPlanService(planRepo)
+		_, err := svc.FindByApp(ctx, "yundian")
+		if err == nil {
+			t.Error("expected error, got nil")
+		}
+	})
+
+	t.Run("empty result for unknown app", func(t *testing.T) {
+		t.Parallel()
+		planRepo := newMockPlanRepo()
+		svc := NewPlanService(planRepo)
+		plans, err := svc.FindByApp(ctx, "nonexistent")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(plans) != 0 {
+			t.Errorf("expected 0 plans, got %d", len(plans))
+		}
+	})
+}

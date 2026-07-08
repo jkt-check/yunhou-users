@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -385,6 +386,8 @@ func TestToCents(t *testing.T) {
 		{-1.50, -150},
 		// large
 		{99999.99, 9999999},
+		// NaN
+		{math.NaN(), 0},
 	}
 	for _, c := range cases {
 		t.Run("", func(t *testing.T) {

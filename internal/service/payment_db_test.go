@@ -912,3 +912,109 @@ func TestPaymentService_OnWebhook_DisputeClosed_NoOp(t *testing.T) {
 		t.Errorf("DomainAction = %q", res.DomainAction)
 	}
 }
+// ============================================================================
+// onPaypalRenewalSucceeded (PAYMENT.SALE.COMPLETED) — M5 paypal channel
+// ============================================================================
+
+func TestPaymentService_OnWebhook_PaypalRenewal_Success(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+
+	// Seed a user with an active subscription that has a PayPal
+	// external_subscription_id, so the renewal webhook can find it.
+	subID := mustNewUUID()
+	expAt := time.Now().Add(15 * 24 * time.Hour)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'active', $3, $4)
+	`, subID, uid, expAt, "I-PAYPAL-SUB-1"); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+
+	txnID := "PAYMENT-SALE-" + mustNewUUID()[:8]
+	eventID := "evt-renewal-" + mustNewUUID()[:8]
+	newExpAt := time.Now().Add(45 * 24 * time.Hour)
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: eventID, EventType: "PAYMENT.SALE.COMPLETED",
+		TransactionID: txnID, ExternalSubscriptionID: "I-PAYPAL-SUB-1",
+		Amount: 29.9, Currency: "USD",
+		SubExpiresAt: &newExpAt,
+		RawPayload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook renewal: %v", err)
+	}
+
+	// 1. Subscription expires_at should be extended to newExpAt.
+	var newExp time.Time
+	if err := db.GetContext(context.Background(), &newExp,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if newExp.Unix() != newExpAt.Unix() {
+		t.Errorf("expires_at: got %v, want %v", newExp, newExpAt)
+	}
+}
+
+func TestPaymentService_OnWebhook_PaypalRenewal_MissingExternalSubID(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at)
+		VALUES ($1, $2, 'monthly', 'active', now() + INTERVAL '30 days')
+	`, subID, uid); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	// No ExternalSubscriptionID on the event → audit-log path, not a real
+	// renewal. Order should NOT be created.
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "evt-missing-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
+		TransactionID: "txn-missing-" + mustNewUUID()[:8], Amount: 29.9, Currency: "USD",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook: %v", err)
+	}
+	var orderCount int
+	_ = db.GetContext(context.Background(), &orderCount,
+		`SELECT COUNT(*) FROM orders WHERE user_id = $1`, uid)
+	if orderCount != 0 {
+		t.Errorf("expected 0 orders, got %d", orderCount)
+	}
+}
+
+func TestPaymentService_OnWebhook_PaypalRenewal_UnknownSubscription(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at)
+		VALUES ($1, $2, 'monthly', 'active', now() + INTERVAL '30 days')
+	`, subID, uid); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	// ExternalSubscriptionID does not match any row → audit-log "unknown
+	// subscription" path.
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "evt-unk-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
+		TransactionID: "txn-unk-" + mustNewUUID()[:8],
+		ExternalSubscriptionID: "I-DOES-NOT-EXIST",
+		Amount: 29.9, Currency: "USD",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook: %v", err)
+	}
+	var orderCount int
+	_ = db.GetContext(context.Background(), &orderCount,
+		`SELECT COUNT(*) FROM orders WHERE user_id = $1`, uid)
+	if orderCount != 0 {
+		t.Errorf("expected 0 orders, got %d", orderCount)
+	}
+}

@@ -940,3 +940,29 @@ func TestSessionRepo_ExchangeAuthCode(t *testing.T) {
 		t.Fatalf("second exchange: ok=%v err=%v", ok2, err)
 	}
 }
+
+func TestAppRepo_RotateSecretHash(t *testing.T) {
+	db := setupDB(t)
+	r := NewAppRepo(db)
+
+	// Pre-condition: app already has a hash (from previous test or seed).
+	_, _ = r.BackfillSecretHash(context.Background(), "yundian", "H_INITIAL")
+
+	// Rotate: should overwrite the hash.
+	if err := r.RotateSecretHash(context.Background(), "yundian", "H_ROTATED"); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	got, err := r.FindByID(context.Background(), "yundian")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SecretHash != "H_ROTATED" {
+		t.Errorf("after rotate hash = %q, want H_ROTATED", got.SecretHash)
+	}
+
+	// Unknown app_id → ErrNoRows (no row updated).
+	err = r.RotateSecretHash(context.Background(), "nonexistent-app", "H_X")
+	if err == nil {
+		t.Error("expected ErrNoRows for unknown app, got nil")
+	}
+}

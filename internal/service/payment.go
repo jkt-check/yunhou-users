@@ -693,8 +693,18 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		return fmt.Errorf("find order: %w", err)
 	}
 
-	// Channel mismatch pre-check (same as Confirm).
-	if existing, perr := s.paymentRepo.FindPaidByOrderID(ctx, order.ID); perr == nil && existing != nil {
+	// Channel mismatch pre-check (same as Confirm). Inlined as a tx
+	// query (instead of calling paymentRepo.FindPaidByOrderID) so the
+	// lookup reuses the same connection as the surrounding transaction.
+	// Calling the repo here would acquire a fresh connection from the
+	// pool, and under load (MaxOpenConns capped in tests) 5 concurrent
+	// webhooks each holding 1 tx connection would deadlock waiting for
+	// the second connection — the original bug that surfaced in
+	// TestPayments_ConcurrentWebhookSameOrder.
+	var existing model.Payment
+	if err := tx.GetContext(ctx, &existing,
+		`SELECT * FROM payments WHERE order_id = $1 AND status = 'paid' LIMIT 1`,
+		order.ID); err == nil {
 		if existing.Channel != e.Channel {
 			// Log and skip — webhook for a payment on a different channel that already paid.
 			return s.writeAudit(ctx, "service", "webhook_channel_mismatch",
@@ -1115,16 +1125,24 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	}
 
 	var orderID string
-	// expires_at = NULL: the schema default is now() + ORDER_EXPIRY_DURATION,
-	// which only makes sense for pending orders. A synthetic renewal order
-	// is paid immediately and never transitions through the expiry sweeper,
-	// but consumers that filter "expires_at < now() AND status='paid'" for
-	// reconciliation would otherwise mis-classify renewals as expired.
+	// expires_at is NOT NULL on the orders schema (003_payments.sql).
+	// A synthetic renewal order is paid immediately and never transitions
+	// through the expiry sweeper, so its expires_at is purely cosmetic —
+	// reconciliation queries that filter "expires_at < now() AND
+	// status='paid'" would mis-classify a renewal as expired if we used
+	// the schema default (now() + 30m). Use a far-future sentinel so the
+	// row is unambiguously "not expired". When the webhook carries a
+	// sub_expires_at hint, mirror it on the order so any operator query
+	// joining orders→subscriptions sees a consistent timeline.
+	orderExpiresAt := time.Now().AddDate(100, 0, 0) // +100y sentinel
+	if e.SubExpiresAt != nil {
+		orderExpiresAt = *e.SubExpiresAt
+	}
 	err = tx.QueryRowxContext(ctx, `
 		INSERT INTO orders (user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, $3, $4, 'paid', NULL)
+		VALUES ($1, $2, $3, $4, 'paid', $5)
 		RETURNING id
-	`, sub.UserID, sub.PlanID, e.Amount, e.Currency).Scan(&orderID)
+	`, sub.UserID, sub.PlanID, e.Amount, e.Currency, orderExpiresAt).Scan(&orderID)
 	if err != nil {
 		return fmt.Errorf("insert synthetic renewal order: %w", err)
 	}

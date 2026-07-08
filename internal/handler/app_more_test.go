@@ -738,3 +738,82 @@ func TestUserHandler_UnbindIdentity_OK(t *testing.T) {
 // --- mocks needed for user handler tests ---
 // (mockUserRepo and mockIdentityRepo are defined in handler_test.go; we
 // only consume them here.)
+
+// buildPublicPlan coverage — pure function, easy to exercise.
+func TestBuildPublicPlan(t *testing.T) {
+	t.Parallel()
+	t.Run("plan with no providers", func(t *testing.T) {
+		t.Parallel()
+		p := model.Plan{ID: "free", Name: "Free", IsDefault: true, IntervalDays: 0}
+		out := buildPublicPlan(p, model.AppConfig{})
+		if out.ID != "free" {
+			t.Errorf("ID: got %q, want free", out.ID)
+		}
+		if out.Cycle != nil {
+			t.Errorf("Cycle: got %+v, want nil", out.Cycle)
+		}
+		if len(out.ProviderIDs) != 0 {
+			t.Errorf("ProviderIDs: got %v, want empty", out.ProviderIDs)
+		}
+	})
+	t.Run("plan with paypal configured", func(t *testing.T) {
+		t.Parallel()
+		p := model.Plan{ID: "monthly", Name: "Monthly", IntervalDays: 30}
+		cfg := model.AppConfig{
+			PaymentProviders: &model.PaymentProvidersConfig{
+				Paypal: &model.PaypalConfig{
+					ClientID: "cid",
+					Plans: map[string]model.PaypalPlanConfig{
+						"monthly": {PlanID: "P-1", TrialDays: 7, BillingCycleDays: 31},
+					},
+				},
+			},
+		}
+		out := buildPublicPlan(p, cfg)
+		if out.ProviderIDs["paypal"] != "P-1" {
+			t.Errorf("ProviderIDs[paypal]: got %q, want P-1", out.ProviderIDs["paypal"])
+		}
+		if out.Cycle == nil {
+			t.Fatal("Cycle: got nil, want non-nil")
+		}
+		if out.Cycle.BillingCycleDays != 31 {
+			t.Errorf("Cycle.BillingCycleDays: got %d, want 31", out.Cycle.BillingCycleDays)
+		}
+		if out.Cycle.TrialDays != 7 {
+			t.Errorf("Cycle.TrialDays: got %d, want 7", out.Cycle.TrialDays)
+		}
+	})
+	t.Run("plan with paypal but no per-plan entry", func(t *testing.T) {
+		t.Parallel()
+		p := model.Plan{ID: "monthly", Name: "Monthly", IntervalDays: 30}
+		cfg := model.AppConfig{
+			PaymentProviders: &model.PaymentProvidersConfig{
+				Paypal: &model.PaypalConfig{
+					ClientID: "cid",
+					Plans:    map[string]model.PaypalPlanConfig{},
+				},
+			},
+		}
+		out := buildPublicPlan(p, cfg)
+		if out.ProviderIDs["paypal"] != "" {
+			t.Errorf("ProviderIDs[paypal]: got %q, want empty (no per-plan entry)", out.ProviderIDs["paypal"])
+		}
+		if out.Cycle != nil {
+			t.Errorf("Cycle: got %+v, want nil (no per-plan entry)", out.Cycle)
+		}
+	})
+	t.Run("payment providers present but paypal nil", func(t *testing.T) {
+		t.Parallel()
+		p := model.Plan{ID: "monthly", Name: "Monthly"}
+		cfg := model.AppConfig{
+			PaymentProviders: &model.PaymentProvidersConfig{Paypal: nil},
+		}
+		out := buildPublicPlan(p, cfg)
+		if out.ProviderIDs["paypal"] != "" {
+			t.Errorf("ProviderIDs[paypal]: got %q, want empty (paypal nil)", out.ProviderIDs["paypal"])
+		}
+		if out.Cycle != nil {
+			t.Errorf("Cycle: got %+v, want nil (paypal nil)", out.Cycle)
+		}
+	})
+}

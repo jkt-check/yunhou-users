@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -112,12 +113,13 @@ func (m *mockSubSvc) ListUserSubscriptions(ctx context.Context, userID string) (
 }
 
 type mockPlanSvc struct {
-	plans     []model.Plan
-	plan      *model.Plan
-	getErr    error
-	createErr error
-	updateErr error
-	deleteErr error
+	plans        []model.Plan
+	plan         *model.Plan
+	getErr       error
+	findByAppErr error
+	createErr    error
+	updateErr    error
+	deleteErr    error
 }
 
 func (m *mockPlanSvc) ListPlans(ctx context.Context) ([]model.Plan, error) {
@@ -125,6 +127,9 @@ func (m *mockPlanSvc) ListPlans(ctx context.Context) ([]model.Plan, error) {
 }
 
 func (m *mockPlanSvc) FindByApp(ctx context.Context, appID string) ([]model.Plan, error) {
+	if m.findByAppErr != nil {
+		return nil, m.findByAppErr
+	}
 	var out []model.Plan
 	for _, p := range m.plans {
 		for _, a := range p.Apps {
@@ -2310,4 +2315,223 @@ func TestAuthErrReason(t *testing.T) {
 			t.Errorf("authErrReason(%v) = %q, want %q", tc.err, got, tc.want)
 		}
 	}
+}
+
+func TestAuthHandler_TestLogin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("mode not set → 404", func(t *testing.T) {
+		prev := os.Getenv("PAYPAL_L3_E2E_MODE")
+		os.Unsetenv("PAYPAL_L3_E2E_MODE")
+		t.Cleanup(func() { os.Setenv("PAYPAL_L3_E2E_MODE", prev) })
+
+		authSvc := &mockAuthSvc{}
+		tokenSvc := &mockTokenSvc{}
+		handler := NewAuthHandler(authSvc, tokenSvc)
+		router := gin.New()
+		router.POST("/test/login", handler.TestLogin)
+
+		req := httptest.NewRequest(http.MethodPost, "/test/login",
+			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("mode enabled + success → 200", func(t *testing.T) {
+		prev := os.Getenv("PAYPAL_L3_E2E_MODE")
+		os.Setenv("PAYPAL_L3_E2E_MODE", "1")
+		t.Cleanup(func() { os.Setenv("PAYPAL_L3_E2E_MODE", prev) })
+
+		authSvc := &mockAuthSvc{
+			testLoginResp: &service.LoginResponse{
+				AccessToken:  "at",
+				RefreshToken: "rt",
+			},
+		}
+		tokenSvc := &mockTokenSvc{}
+		handler := NewAuthHandler(authSvc, tokenSvc)
+		router := gin.New()
+		router.POST("/test/login", handler.TestLogin)
+
+		req := httptest.NewRequest(http.MethodPost, "/test/login",
+			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d body=%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("malformed body → 400", func(t *testing.T) {
+		prev := os.Getenv("PAYPAL_L3_E2E_MODE")
+		os.Setenv("PAYPAL_L3_E2E_MODE", "1")
+		t.Cleanup(func() { os.Setenv("PAYPAL_L3_E2E_MODE", prev) })
+
+		authSvc := &mockAuthSvc{}
+		tokenSvc := &mockTokenSvc{}
+		handler := NewAuthHandler(authSvc, tokenSvc)
+		router := gin.New()
+		router.POST("/test/login", handler.TestLogin)
+
+		req := httptest.NewRequest(http.MethodPost, "/test/login",
+			bytes.NewBufferString(`not-json`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("service error → 500", func(t *testing.T) {
+		prev := os.Getenv("PAYPAL_L3_E2E_MODE")
+		os.Setenv("PAYPAL_L3_E2E_MODE", "1")
+		t.Cleanup(func() { os.Setenv("PAYPAL_L3_E2E_MODE", prev) })
+
+		authSvc := &mockAuthSvc{testLoginErr: errors.New("service down")}
+		tokenSvc := &mockTokenSvc{}
+		handler := NewAuthHandler(authSvc, tokenSvc)
+		router := gin.New()
+		router.POST("/test/login", handler.TestLogin)
+
+		req := httptest.NewRequest(http.MethodPost, "/test/login",
+			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("expected 500, got %d", w.Code)
+		}
+	})
+
+	t.Run("mode not 1 → 404", func(t *testing.T) {
+		prev := os.Getenv("PAYPAL_L3_E2E_MODE")
+		os.Setenv("PAYPAL_L3_E2E_MODE", "0")
+		t.Cleanup(func() { os.Setenv("PAYPAL_L3_E2E_MODE", prev) })
+
+		authSvc := &mockAuthSvc{}
+		tokenSvc := &mockTokenSvc{}
+		handler := NewAuthHandler(authSvc, tokenSvc)
+		router := gin.New()
+		router.POST("/test/login", handler.TestLogin)
+
+		req := httptest.NewRequest(http.MethodPost, "/test/login",
+			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+}
+
+func TestPlanHandler_GetAppPlans_FullCoverage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("app with paypal config returns cycle + provider_id", func(t *testing.T) {
+		plans := []model.Plan{
+			{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}, IsDefault: true},
+			{ID: "monthly", Name: "Monthly", IsActive: true, Apps: pq.StringArray{"yundian"}, IntervalDays: 30, Price: 29.9},
+		}
+		app := model.App{
+			AppID: "yundian", IsActive: true,
+			Config: json.RawMessage(`{"payment_providers":{"paypal":{"client_id":"cid","plans":{"monthly":{"plan_id":"P-1","trial_days":7,"billing_cycle_days":31}}}}}`),
+		}
+		appRepo := &mockAppRepo{apps: []model.App{app}}
+		planSvc := &mockPlanSvc{plans: plans}
+		handler := NewPlanHandler(planSvc, appRepo, nil)
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code int                `json:"code"`
+			Data []model.PublicPlan `json:"data"`
+		}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		if len(resp.Data) != 2 {
+			t.Fatalf("expected 2 plans, got %d", len(resp.Data))
+		}
+		// monthly plan should have paypal provider_id + cycle
+		var monthly *model.PublicPlan
+		for i := range resp.Data {
+			if resp.Data[i].ID == "monthly" {
+				monthly = &resp.Data[i]
+				break
+			}
+		}
+		if monthly == nil {
+			t.Fatal("monthly plan not in response")
+		}
+		if monthly.ProviderIDs["paypal"] != "P-1" {
+			t.Errorf("ProviderIDs[paypal] = %q, want P-1", monthly.ProviderIDs["paypal"])
+		}
+		if monthly.Cycle == nil {
+			t.Fatal("expected cycle to be non-nil")
+		}
+		if monthly.Cycle.BillingCycleDays != 31 {
+			t.Errorf("Cycle.BillingCycleDays = %d, want 31", monthly.Cycle.BillingCycleDays)
+		}
+	})
+
+	t.Run("planSvc error returns 500", func(t *testing.T) {
+		appRepo := &mockAppRepo{apps: []model.App{{AppID: "yundian", IsActive: true}}}
+		// planSvc errors on FindByApp — handler must surface 500.
+		planSvc := &mockPlanSvc{findByAppErr: errors.New("db down")}
+		handler := NewPlanHandler(planSvc, appRepo, nil)
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want 500", w.Code)
+		}
+	})
+
+	t.Run("malformed app config returns 500", func(t *testing.T) {
+		appRepo := &mockAppRepo{apps: []model.App{{AppID: "yundian", IsActive: true, Config: json.RawMessage(`not-json`)}}}
+		planSvc := &mockPlanSvc{plans: nil}
+		handler := NewPlanHandler(planSvc, appRepo, nil)
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want 500", w.Code)
+		}
+	})
+
+	t.Run("FindByID db error returns 500", func(t *testing.T) {
+		appRepo := &mockAppRepo{findErr: errors.New("db down")}
+		handler := NewPlanHandler(&mockPlanSvc{}, appRepo, nil)
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want 500", w.Code)
+		}
+	})
 }

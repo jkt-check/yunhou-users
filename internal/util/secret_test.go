@@ -134,3 +134,72 @@ func TestDummyBcryptHash_Populated(t *testing.T) {
 		t.Fatal("DummyBcryptHash should not match a wrong plain value")
 	}
 }
+
+func TestGenerateSecret(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns non-empty plaintext and hash", func(t *testing.T) {
+		t.Parallel()
+		plain, hash, err := GenerateSecret()
+		if err != nil {
+			t.Fatalf("GenerateSecret: %v", err)
+		}
+		if plain == "" {
+			t.Error("plaintext is empty")
+		}
+		if hash == "" {
+			t.Error("hash is empty")
+		}
+		if plain == hash {
+			t.Error("plaintext equals hash")
+		}
+		// 32 bytes → 64 hex chars
+		if len(plain) != 64 {
+			t.Errorf("plaintext length: got %d, want 64", len(plain))
+		}
+		// hash should be a valid bcrypt hash
+		if !CheckSecret(hash, plain) {
+			t.Error("hash does not verify the plaintext")
+		}
+	})
+
+	t.Run("produces unique plaintexts across calls", func(t *testing.T) {
+		t.Parallel()
+		seen := make(map[string]bool)
+		for i := 0; i < 50; i++ {
+			plain, _, err := GenerateSecret()
+			if err != nil {
+				t.Fatalf("GenerateSecret: %v", err)
+			}
+			if seen[plain] {
+				t.Errorf("duplicate plaintext on iter %d: %s", i, plain)
+			}
+			seen[plain] = true
+		}
+	})
+}
+
+func TestDummyBcryptHash(t *testing.T) {
+	t.Parallel()
+	// DummyBcryptHash should be a valid bcrypt hash that does NOT match
+	// common test secrets. Used to make CheckSecret take constant time
+	// even for non-existent app IDs.
+	if DummyBcryptHash == "" {
+		t.Fatal("DummyBcryptHash is empty")
+	}
+	// It must verify against its own dummy value.
+	if !CheckSecret(DummyBcryptHash, "dummy-timing-mitigation-value") {
+		t.Error("DummyBcryptHash does not match the dummy plaintext")
+	}
+	// It must NOT verify against an attacker-chosen guess.
+	if CheckSecret(DummyBcryptHash, "guess") {
+		t.Error("DummyBcryptHash incorrectly matches 'guess'")
+	}
+	if CheckSecret(DummyBcryptHash, "") {
+		t.Error("DummyBcryptHash incorrectly matches empty string")
+	}
+	// Cheap heuristic: ensure the hash isn't obviously the plaintext.
+	if !strings.HasPrefix(DummyBcryptHash, "$2") {
+		t.Errorf("DummyBcryptHash doesn't look like a bcrypt hash: %q", DummyBcryptHash)
+	}
+}

@@ -55,3 +55,79 @@ func TestAppConfig_UnmarshalJSON_Empty(t *testing.T) {
 		t.Error("brand should be nil for empty config")
 	}
 }
+func TestResolveCycle(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no payment_providers → plan.IntervalDays fallback", func(t *testing.T) {
+		t.Parallel()
+		cfg := AppConfig{}
+		got := ResolveCycle(cfg, "monthly", 30)
+		if got.BillingCycleDays != 30 {
+			t.Errorf("BillingCycleDays: got %d, want 30", got.BillingCycleDays)
+		}
+		if got.TrialDays != 0 {
+			t.Errorf("TrialDays: got %d, want 0", got.TrialDays)
+		}
+		if got.Base != CycleBaseFormula {
+			t.Errorf("Base: got %q, want %q", got.Base, CycleBaseFormula)
+		}
+	})
+
+	t.Run("paypal present but no entry for plan → fallback", func(t *testing.T) {
+		t.Parallel()
+		cfg := AppConfig{
+			PaymentProviders: &PaymentProvidersConfig{
+				Paypal: &PaypalConfig{
+					ClientID: "cid",
+					Plans:    map[string]PaypalPlanConfig{}, // empty
+				},
+			},
+		}
+		got := ResolveCycle(cfg, "monthly", 30)
+		if got.BillingCycleDays != 30 {
+			t.Errorf("BillingCycleDays: got %d, want 30", got.BillingCycleDays)
+		}
+	})
+
+	t.Run("paypal present with plan entry → use entry's billing_cycle_days", func(t *testing.T) {
+		t.Parallel()
+		cfg := AppConfig{
+			PaymentProviders: &PaymentProvidersConfig{
+				Paypal: &PaypalConfig{
+					ClientID: "cid",
+					Plans: map[string]PaypalPlanConfig{
+						"monthly": {PlanID: "P-1", TrialDays: 7, BillingCycleDays: 31},
+					},
+				},
+			},
+		}
+		got := ResolveCycle(cfg, "monthly", 30)
+		if got.BillingCycleDays != 31 {
+			t.Errorf("BillingCycleDays: got %d, want 31", got.BillingCycleDays)
+		}
+		if got.TrialDays != 7 {
+			t.Errorf("TrialDays: got %d, want 7", got.TrialDays)
+		}
+	})
+
+	t.Run("paypal entry with non-positive billing → plan.IntervalDays", func(t *testing.T) {
+		t.Parallel()
+		cfg := AppConfig{
+			PaymentProviders: &PaymentProvidersConfig{
+				Paypal: &PaypalConfig{
+					ClientID: "cid",
+					Plans: map[string]PaypalPlanConfig{
+						"monthly": {PlanID: "P-1", TrialDays: 7, BillingCycleDays: 0},
+					},
+				},
+			},
+		}
+		got := ResolveCycle(cfg, "monthly", 30)
+		if got.BillingCycleDays != 30 {
+			t.Errorf("BillingCycleDays: got %d, want 30 (fallback to plan.IntervalDays)", got.BillingCycleDays)
+		}
+		if got.TrialDays != 7 {
+			t.Errorf("TrialDays: got %d, want 7 (entry value still applies)", got.TrialDays)
+		}
+	})
+}

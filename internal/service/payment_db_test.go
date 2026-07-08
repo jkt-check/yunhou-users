@@ -1387,6 +1387,47 @@ func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 	})
 }
 
+// TestPaymentService_OnPaymentFailed_BeginTxError covers an
+// error-from-closed-db branch in the OnWebhook call chain. After
+// the DB is closed, any subsequent call returns an error — the test
+// just asserts the error is non-nil and surfaced. The exact wrap
+// depends on which tx-bound call the runtime hits first.
+func TestPaymentService_OnPaymentFailed_BeginTxError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	orderID := mustNewUUID()
+	txnID := "pi-begin-tx-fail-" + mustNewUUID()[:8]
+	eventID := "evt-begin-tx-fail-" + mustNewUUID()[:8]
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
+		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes')
+	`, orderID, uid); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	paymentID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO payments (id, order_id, channel, external_txn_id, amount, currency, status, raw_payload)
+		VALUES ($1, $2, 'stripe', $3, 29.9, 'CNY', 'pending', '{}')
+	`, paymentID, orderID, txnID); err != nil {
+		t.Fatalf("seed payment: %v", err)
+	}
+
+	// Close the DB to force the call chain to fail.
+	_ = db.Close()
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: eventID, EventType: "payment_intent.payment_failed",
+		TransactionID: txnID, OrderID: orderID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected error from closed db, got nil")
+	}
+	// We don't assert on the exact wrap — closed-db errors vary by
+	// driver / Go version. The point is that the failure surfaces.
+}
+
 func TestPaymentService_OnWebhook_PaypalRenewal_Success(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)

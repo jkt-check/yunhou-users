@@ -148,7 +148,7 @@ func (v *StripeVerifier) VerifySignature(channel string, body []byte, headers ma
 	if sigHeader == "" {
 		return ErrInvalidSignature
 	}
-	ts, expectedHMAC, err := parseStripeSignatureHeader(sigHeader)
+	ts, expectedHMACs, err := parseStripeSignatureHeader(sigHeader)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSignature, err)
 	}
@@ -163,15 +163,26 @@ func (v *StripeVerifier) VerifySignature(channel string, body []byte, headers ma
 	mac.Write([]byte(strconv.FormatInt(ts, 10)))
 	mac.Write([]byte("."))
 	mac.Write(body)
-	if !hmac.Equal(expectedHMAC, mac.Sum(nil)) {
-		return ErrInvalidSignature
+	sum := mac.Sum(nil)
+	// Stripe sends multiple v1= values during signing-secret rotation (one
+	// per active secret). Accept ANY that matches — the verifier only holds
+	// one secret, so on rotation we still recognise signatures produced
+	// with the secret Stripe just rotated AWAY from.
+	for _, expectedHMAC := range expectedHMACs {
+		if hmac.Equal(expectedHMAC, sum) {
+			return nil
+		}
 	}
-	return nil
+	return ErrInvalidSignature
 }
 
-func parseStripeSignatureHeader(h string) (int64, []byte, error) {
+// parseStripeSignatureHeader returns the timestamp and ALL v1 signatures.
+// The caller (StripeVerifier) must try each v1 because Stripe sends
+// multiple v1= values during signing-secret rotation — only the verifier
+// has the secret list, and it must accept any match.
+func parseStripeSignatureHeader(h string) (int64, [][]byte, error) {
 	var ts int64
-	var sigHex string
+	var sigHexes []string
 	for _, kv := range strings.Split(h, ",") {
 		kv = strings.TrimSpace(kv)
 		eq := strings.IndexByte(kv, '=')
@@ -186,15 +197,19 @@ func parseStripeSignatureHeader(h string) (int64, []byte, error) {
 			}
 			ts = n
 		case "v1":
-			sigHex = kv[eq+1:]
+			sigHexes = append(sigHexes, kv[eq+1:])
 		}
 	}
-	if ts == 0 || sigHex == "" {
+	if ts == 0 || len(sigHexes) == 0 {
 		return 0, nil, fmt.Errorf("missing t or v1")
 	}
-	decoded, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return 0, nil, fmt.Errorf("bad hex: %w", err)
+	decoded := make([][]byte, 0, len(sigHexes))
+	for _, sh := range sigHexes {
+		b, err := hex.DecodeString(sh)
+		if err != nil {
+			return 0, nil, fmt.Errorf("bad hex: %w", err)
+		}
+		decoded = append(decoded, b)
 	}
 	return ts, decoded, nil
 }
@@ -338,7 +353,15 @@ func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers ma
 		replayWindow = 5 * time.Minute
 	}
 	if notifyTime := values.Get("notify_time"); notifyTime != "" {
-		if t, err := time.Parse("2006-01-02 15:04:05", notifyTime); err == nil {
+		// Alipay sends notify_time in Beijing time (UTC+8) without a timezone
+		// suffix. Without an explicit location, time.Parse returns UTC, so a
+		// 20:00:00 Beijing notify would be compared against a 12:00:00 UTC
+		// "now" — an 8h negative delta that always trips the replay window.
+		beijing, err := time.LoadLocation("Asia/Shanghai")
+		if err != nil {
+			beijing = time.FixedZone("CST", 8*3600)
+		}
+		if t, err := time.ParseInLocation("2006-01-02 15:04:05", notifyTime, beijing); err == nil {
 			if delta := time.Since(t); delta > replayWindow || delta < -replayWindow {
 				return ErrTimestampOutOfRange
 			}
@@ -417,6 +440,36 @@ type paypalVerifyCacheEntry struct {
 }
 
 var paypalVerifyCache sync.Map // map[paypalVerifyCacheKey]paypalVerifyCacheEntry
+
+// startPaypalVerifyCacheJanitor deletes expired entries from paypalVerifyCache
+// on a fixed cadence. Without this, entries whose (transmission_id,
+// transmission_time) is never re-looked-up linger in the map forever —
+// every unique PayPal delivery leaks ~2 small allocations, and over
+// multi-week uptimes the map grows without bound.
+//
+// The janitor runs until process exit; the runtime runs a final cleanup on
+// each cache hit via lookupVerifyCache, so a missed janitor tick only costs
+// a bit of memory until the next hit.
+func startPaypalVerifyCacheJanitor() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			paypalVerifyCache.Range(func(k, v any) bool {
+				entry, ok := v.(paypalVerifyCacheEntry)
+				if !ok {
+					return true
+				}
+				if !now.Before(entry.expiresAt) {
+					paypalVerifyCache.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
+}
+
+func init() { startPaypalVerifyCacheJanitor() }
 
 type paypalVerifyCacheKey struct {
 	transmissionID   string

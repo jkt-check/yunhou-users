@@ -805,6 +805,31 @@ func TestReadAndRestoreBody_NilBody(t *testing.T) {
 // parseStripeSignatureHeader — missing t / missing v1 paths
 // ============================================================================
 
+// TestParseStripeSignatureHeader_MultiV1DuringRotation locks in the fix for
+// the secret-rotation window: Stripe sends multiple v1= values (one per
+// active secret) and the verifier must accept any of them. The previous
+// implementation overwrote sigHex on each iteration and only checked the
+// last one, silently dropping events during the rotation window.
+func TestParseStripeSignatureHeader_MultiV1DuringRotation(t *testing.T) {
+	t.Parallel()
+	// Two v1 signatures — the second is a stand-in for the rotated-away
+	// secret, the first for the current secret. parseStripeSignatureHeader
+	// must return BOTH so the verifier can try each.
+	ts, sigs, err := parseStripeSignatureHeader("t=1700000000,v1=aabb,v1=ccdd")
+	if err != nil {
+		t.Fatalf("multi-v1 header should parse: %v", err)
+	}
+	if ts != 1700000000 {
+		t.Errorf("ts: got %d want 1700000000", ts)
+	}
+	if len(sigs) != 2 {
+		t.Fatalf("expected 2 v1 sigs, got %d", len(sigs))
+	}
+	if hex.EncodeToString(sigs[0]) != "aabb" || hex.EncodeToString(sigs[1]) != "ccdd" {
+		t.Errorf("v1 ordering lost: got %x %x", sigs[0], sigs[1])
+	}
+}
+
 func TestParseStripeSignatureHeader_MissingParts(t *testing.T) {
 	t.Parallel()
 	if _, _, err := parseStripeSignatureHeader(""); err == nil {
@@ -826,12 +851,12 @@ func TestParseStripeSignatureHeader_MissingParts(t *testing.T) {
 	if _, _, err := parseStripeSignatureHeader("garbage=1"); err == nil {
 		t.Error("garbage-only should error too")
 	}
-	ts, sig, err := parseStripeSignatureHeader("t=1700000000,v1=00ff")
+	ts, sigs, err := parseStripeSignatureHeader("t=1700000000,v1=00ff")
 	if err != nil {
 		t.Errorf("valid header err: %v", err)
 	}
-	if ts != 1700000000 || len(sig) != 2 || sig[0] != 0x00 || sig[1] != 0xff {
-		t.Errorf("ts/sig extraction: ts=%d sig=%v", ts, sig)
+	if ts != 1700000000 || len(sigs) != 1 || len(sigs[0]) != 2 || sigs[0][0] != 0x00 || sigs[0][1] != 0xff {
+		t.Errorf("ts/sig extraction: ts=%d sigs=%v", ts, sigs)
 	}
 }
 

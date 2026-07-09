@@ -218,7 +218,19 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 			return
 		}
-		app.Config = *req.Config
+		// Re-marshal the validated config (same canonicalisation as CreateApp)
+		// so an operator typo or future-deprecated key that the typed unmarshal
+		// silently dropped cannot linger in the DB through a PATCH. Persisting
+		// the raw bytes here would mean the same logical config can have two
+		// different on-disk shapes depending on whether the row was POSTed or
+		// later PATCHed.
+		canonical, merr := json.Marshal(cfg)
+		if merr != nil {
+			log.Printf("marshal validated app config: %v", merr)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to canonicalise config"})
+			return
+		}
+		app.Config = canonical
 	}
 
 	if err := h.appRepo.Update(c.Request.Context(), app); err != nil {

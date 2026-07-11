@@ -4,7 +4,7 @@ A shared user management API for multi-app ecosystems. One user identity across 
 
 ## Features
 
-- **Social OAuth** — GitHub uses the OAuth Authorization Code flow (`/auth/github/redirect` → `/auth/github/callback`). Yunhou holds the GitHub OAuth App's `client_secret` and runs the code exchange server-side.
+- **Social OAuth** — GitHub uses the OAuth Authorization Code flow (`/auth/github/redirect` → `/auth/github/callback`). WeChat Open Platform 网站应用 uses QR-code login (`/auth/wechat/redirect` → `/auth/wechat/callback`, via `open.weixin.qq.com/connect/qrconnect`). Yunhou holds each app's GitHub `client_secret` / WeChat `app_secret` and runs the code exchange server-side. State tokens are shared between providers — `(app_id, callback_index)` HMAC binding.
 - **Plan-based access** — Plans define which apps a user can access
 - **RSA256 JWT** access tokens with JWKS public key endpoint
 - **Subscription gating** — tokens only issued for active subscriptions based on plan
@@ -43,10 +43,16 @@ make generate-keys
 #    app's secret via POST /admin/apps/:id/rotate-secret).
 make run
 
-# 4. GitHub login uses the redirect flow — open in a browser:
-#   GET /auth/github/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/callback
-# After consent GitHub redirects to /auth/github/callback which 302s back
-# to https://yundian.com/auth/callback#token=...&refresh_token=...&user_id=...
+# 4. Login uses the redirect flow. Open in a browser:
+#   GitHub: GET /auth/github/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/callback
+#     After consent GitHub redirects to /auth/github/callback which 302s back
+#     to https://yundian.com/auth/callback#token=...&refresh_token=...&user_id=...
+#   WeChat: GET /auth/wechat/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/wechat-callback
+#     Renders a QR code from open.weixin.qq.com/connect/qrconnect. After
+#     the user scans + confirms on the WeChat mobile app, yunhou fetches
+#     /sns/userinfo (requires unionid), then 302s back with the same
+#     fragment shape. Rejected as #error=auth_failed&reason=wechat_no_unionid
+#     if the userinfo response lacks unionid.
 ```
 
 ## Configuration
@@ -59,7 +65,7 @@ All configuration is via environment variables (or `.env` file):
 | `PORT` | No | `8080` | |
 | `RSA_PRIVATE_KEY_PATH` | No | `keys/private.pem` | |
 | `RSA_PUBLIC_KEY_PATH` | No | `keys/public.pem` | |
-| `OAUTH_STATE_SECRET` | **Yes** | (required) | HMAC key for the GitHub OAuth `state` parameter. **Minimum 32 characters** — server startup rejects shorter values. Generate with `openssl rand -hex 32`. Multi-instance must share the same value. |
+| `OAUTH_STATE_SECRET` | **Yes** | (required) | HMAC key for the OAuth `state` parameter (provider-agnostic — both `/auth/github/*` and `/auth/wechat/*` share it). Binds `(app_id, callback_index)`. **Minimum 32 characters** — server startup rejects shorter values. Generate with `openssl rand -hex 32`. Multi-instance must share the same value. |
 | `JWT_ACCESS_TTL` | No | `15m` | Must be positive |
 | `JWT_REFRESH_TTL` | No | `168h` (7 days) | Must be > access TTL; ≤ 365 days |
 | `ORDER_EXPIRY_DURATION` | No | `30m` | Pending order expiry; sweeper flips to `expired` after this |
@@ -84,6 +90,8 @@ All configuration is via environment variables (or `.env` file):
 | GET | `/.well-known/jwks.json` | RSA public key (JWK format) |
 | GET | `/auth/github/redirect` | Begin the GitHub OAuth Authorization Code flow (302 to GitHub). Requires `app_id` + `redirect_uri` matching the app's configured whitelist. |
 | GET | `/auth/github/callback` | GitHub redirects here after consent. Yunhou exchanges the code server-side and returns its JWT in the **URL fragment** (`#token=...&refresh_token=...&user_id=...`) so the access token never leaves the browser. |
+| GET | `/auth/wechat/redirect` | Begin the WeChat Open Platform 网站应用 QR-code login (302 to `open.weixin.qq.com/connect/qrconnect`). Same `app_id` + `redirect_uri` shape as GitHub. |
+| GET | `/auth/wechat/callback` | WeChat redirects here after the user scans + confirms in the WeChat mobile app. Yunhou exchanges the code at `/sns/oauth2/access_token`, fetches `/sns/userinfo` (requires `unionid`), then returns its JWT in the URL fragment. Rejected with `#error=auth_failed&reason=wechat_no_unionid` if unionid is missing. |
 | POST | `/auth/refresh` | Refresh tokens |
 | POST | `/auth/logout` | Logout (revoke refresh token) |
 | POST | `/test/login` | **Dev-only** — returns 404 unless `PAYPAL_L3_E2E_MODE=1`. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
@@ -138,7 +146,9 @@ When both providers are configured for the same `plan_id`, the resolved cycle (a
 
 ## Authentication Flow
 
-GitHub (redirect flow — there is no `/auth/login` endpoint; GitHub is the only login path):
+Two providers, both via the OAuth redirect flow (there is no `/auth/login` endpoint):
+
+**GitHub** (`/auth/github/redirect` → `/auth/github/callback`):
 ```
 Browser            Yunhou Users API               GitHub            Consumer App (BFF)
     |-- GET /auth/github/redirect?app_id=...&redirect_uri=... --> |
@@ -150,6 +160,24 @@ Browser            Yunhou Users API               GitHub            Consumer App
     |<-- 302 to redirect_uri#token=...&refresh_token=...&user_id=...&has_access=...
     |     (fragment never reaches the server; the BFF parses it client-side)
 ```
+
+**WeChat** (`/auth/wechat/redirect` → `/auth/wechat/callback`) — QR-code login:
+```
+Browser            Yunhou Users API              WeChat Open           Consumer App (BFF)
+    |-- GET /auth/wechat/redirect?app_id=...&redirect_uri=... --> |
+    |<-- 302 to open.weixin.qq.com/connect/qrconnect?...#wechat_redirect -- |
+    |-- render QR code; user scans + confirms on WeChat mobile app ---> |
+    |<-- 302 to /auth/wechat/callback?code=...&state=...&app_id=... -- |
+    |                                              |-- exchange code at /sns/oauth2/access_token (uses apps.config.oauth_providers.wechat.app_secret) --> WeChat
+    |                                              |-- fetch profile at /sns/userinfo; REQUIRE unionid --> WeChat
+    |                                              |<-- openid, unionid, nickname, headimgurl
+    |<-- 302 to redirect_uri#token=...&refresh_token=...&user_id=...&has_access=...
+    |     (same fragment shape as GitHub; or #error=auth_failed&reason=wechat_no_unionid if unionid missing)
+```
+
+> State tokens are shared between providers (`util.IssueOAuthState` binds `(app_id, callback_index)`, 5-minute expiry). `OAUTH_STATE_SECRET` is provider-agnostic.
+> 
+> **Cross-app unionid unification** requires all Yunhou consumer apps to register their WeChat 网站应用 under the **same** 微信开放平台 account (Tencent-side requirement, not enforced in code).
 
 ## Development
 

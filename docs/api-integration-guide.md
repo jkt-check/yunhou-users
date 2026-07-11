@@ -4,7 +4,7 @@
 
 ## 概述
 
-Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一套用户身份——每个用户只需一个账号即可使用所有接入应用。系统支持 GitHub OAuth 重定向流程（唯一登录渠道）。
+Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一套用户身份——每个用户只需一个账号即可使用所有接入应用。系统支持两种 OAuth 重定向登录：GitHub OAuth 和 WeChat Open Platform 网站应用（扫码登录）。`POST /auth/login` 已下线，所有登录必须走下方对应的重定向流程。
 
 核心概念：
 - **Plan（订阅计划）**：定义可访问的 App 列表。Plan ID 由运营侧自由定义（例：`free` / `monthly` / `quarterly`）
@@ -492,6 +492,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 - `payment_providers.paypal`：`client_id` / `client_secret` / `webhook_id` 必填；`mode` 必须 `live` 或 `sandbox`
 - `oauth_providers.github`：`client_id` / `client_secret` 必填；`callback_urls` 必须非空且全部为 `https://`，或 `http://localhost` / `http://127.0.0.1` / `http://[::1]`（含 `::ffff:127.0.0.1` 映射形式）；不允许重复项
+- `oauth_providers.wechat`：`app_id` 必须匹配正则 `^wx[0-9a-fA-F]{16}$`（`wx` 前缀严格小写，16 位十六进制区分大小写）；`app_secret` 必须恰好 32 字符；`callback_urls` 校验规则与 GitHub 一致（`https://` 或 loopback，不允许重复项）
 - 整个 `config` 在保存前会被 canonicalize（按 struct 字段顺序重写），所以 PATCH 后 JSONB 字节布局可能与入参不完全一致——语义不变但 byte-equal diff 会失真。运营侧如果做"配置变更审计"应比对语义而非字节
 
 #### GET /apps
@@ -946,7 +947,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
    - `callback_urls` 必须全部是 `https://`，或 `http://localhost` / `http://127.0.0.1` / `http://[::1]`（本地开发用）
    - 一份 OAuth App 多个 callback URL 是合法的（如 web / iOS / Android 共用）
 
-3. 设置环境变量 `OAUTH_STATE_SECRET`（必需，任意 32 字节以上随机串）—— 用于 state token 的 HMAC 签名。多实例部署必须共享同一个值。
+3. 设置环境变量 `OAUTH_STATE_SECRET`（必需，至少 32 个字符的随机串，建议 `openssl rand -hex 32` 生成）—— 用于 state token 的 HMAC 签名。state token 由 `/auth/{github,wechat}/*` 两个 provider 共用（provider-agnostic），多实例部署必须共享同一个值。启动时 `Validate()` 会拒绝过短的值。
 
 #### 流程
 
@@ -1058,6 +1059,189 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | `callback_urls` 白名单 | ✓ | ✗ |
 | GitHub `access_token`（回调后） | ✓（用即丢） | ✗ |
 | yunhou `access_token` | yunhou 签发 | ✓（fragment 里） |
+
+---
+
+### WeChat OAuth 扫码登录流程
+
+> **设计原则**：与 GitHub 流程同构——所有 OAuth provider 凭据（app_secret、access_token、refresh_token）由 yunhou 持有并使用，BFF 不接触任何长期秘密。BFF 端只持有 `app_id`（明文）+ 一次性 redirect_uri 白名单条目。
+
+适用场景：消费 app 需要让终端用户用微信扫码登录（PC 浏览器场景）。Yunhou 通过 `open.weixin.qq.com/connect/qrconnect` 渲染二维码，用户用手机微信扫码并在手机上确认授权后，微信回调 yunhou 完成登录。所有 WeChat 登录必须走下方流程。
+
+> **与 GitHub 的差异**：
+> - 用户授权方式不同——GitHub 是浏览器内点同意，WeChat 是 PC 浏览器展示二维码 + 手机微信扫码
+> - WeChat 多了一次 `/sns/userinfo` 调用，且**必须**返回 `unionid`，否则拒绝登录（`reason=wechat_no_unionid`）
+> - state token 完全共用 GitHub 那套——`(app_id, callback_index)` 绑定，HMAC 签名，5 分钟过期
+
+#### 配置（运营侧）
+
+1. 在[微信开放平台](https://open.weixin.qq.com)注册一个**网站应用**（注意：不是公众号 / 小程序 / 移动应用；只有「网站应用」走 `qrconnect` 扫码登录流程）。审核通过后获得 `AppID` 和 `AppSecret`。
+2. 把 `app_id` 和 `app_secret` 写入 `apps.config.oauth_providers.wechat`：
+
+   ```json
+   {
+     "oauth_providers": {
+       "wechat": {
+         "app_id": "wx0123456789abcdef",
+         "app_secret": "<32 chars plaintext — server-side only>",
+         "callback_urls": [
+           "https://yundian.com/auth/wechat-callback",
+           "https://yundian.com/mobile/auth/wechat-callback"
+         ]
+       }
+     }
+   }
+   ```
+
+   - `app_id` 必须匹配正则 `^wx[0-9a-fA-F]{16}$`——`wx` 前缀严格小写，16 位十六进制区分大小写（Tencent 偶发分配大写 A-F）
+   - `app_secret` 必须是恰好 32 字符
+   - `app_secret` 仅 yunhou-users 使用，永不下发到 BFF
+   - `callback_urls` 必须全部是 `https://`，或 `http://localhost` / `http://127.0.0.1` / `http://[::1]`（本地开发用）
+   - 一份网站应用多个 callback URL 是合法的（如 web / iOS / Android 共用）
+
+3. **跨 app unionid 统一**：所有 Yunhou 消费 app 的「网站应用」必须注册在**同一个微信开放平台账号**下。这是 Tencent 侧要求，不在代码层校验。运营侧在 app 上线手册里说明。
+
+4. 设置环境变量 `OAUTH_STATE_SECRET`（必需，至少 32 个字符的随机串，建议 `openssl rand -hex 32` 生成）—— 与 GitHub 流程共用同一个变量。启动时 `Validate()` 会拒绝过短的值。
+
+#### 流程
+
+```
+终端用户        BFF           yunhou-users                  微信
+   │             │                 │                        │
+   │ 点登录      │                 │                        │
+   │ ──────────→│                 │                        │
+   │             │ GET /auth/wechat/redirect?app_id=yundian │
+   │             │   &redirect_uri=... │                   │
+   │             │ ─────────────→   │                        │
+   │             │                 │ 验证 app_id +           │
+   │             │                 │ redirect_uri 白名单     │
+   │             │                 │ 签 HMAC state           │
+   │             │ ← 302 ──────────│                        │
+   │             │   Location:     │                        │
+   │             │   https://open.weixin.qq.com/connect/qrconnect?│
+   │             │     appid=wx...&redirect_uri=...&         │
+   │             │     state=HMAC(...)#wechat_redirect       │
+   │             │                 │                        │
+   │ 浏览器展示     │                 │                        │
+   │ 二维码        │                 │                        │
+   │             │                 │                        │
+   │ 用手机微信                       │                        │
+   │ 扫码 + 确认 ─────────────────→│                        │
+   │             │                 │                        │
+   │             │ ← 微信回调 ──────────────────────────────│
+   │             │   /auth/wechat/callback                   │
+   │             │   ?code=...&state=...&app_id=yundian    │
+   │             │                 │                        │
+   │             │                 │ 验证 state HMAC        │
+   │             │                 │ 拿 app_secret 换        │
+   │             │                 │   WeChat access_token  │
+   │             │                 │   (GET /sns/oauth2/access_token)
+   │             │                 │ 拿 access_token+openid │
+   │             │                 │   拉用户信息            │
+   │             │                 │   (GET /sns/userinfo)   │
+   │             │                 │ 校验 unionid 必非空 ──→│
+   │             │                 │ 丢弃 access_token       │
+   │             │                 │ 丢弃 WeChat refresh_token │
+   │             │                 │ 签发 yunhou JWT         │
+   │ ← 302 跳 BFF ─│                 │                        │
+   │   #token=... │                 │                        │
+   │ ←──────────│                 │                        │
+   │             │                 │                        │
+   │ BFF 从 URL  │                 │                        │
+   │ fragment 读 │                 │                        │
+   │ yunhou JWT  │                 │                        │
+```
+
+> **WeChat `?error=access_denied` 等授权失败参数走另一条路径**：state + app 校验通过后会**直接 302 跳回 BFF**，在 URL fragment 里塞 `error=...&error_description=...`（不返回 JSON）。BFF 端需在 `redirect_uri` 落地的回调页同时处理 fragment 里的 `token` 和 `error`。
+>
+> **缺失 unionid 的拒绝路径**：`/sns/userinfo` 未返回 `unionid`（典型原因：网站应用未申请 `snsapi_userinfo` 权限，或用户在手机上拒绝了授权）→ yunhou 不会签发 yunhou JWT，而是直接 302 跳回 BFF，`#error=auth_failed&reason=wechat_no_unionid`。BFF 必须在回调页识别这个 reason 并展示对应文案。
+
+#### GET /auth/wechat/redirect
+
+发起扫码登录的入口。**不需要鉴权**。
+
+**查询参数**：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `app_id` | 是 | Yunhou app 标识 |
+| `redirect_uri` | 是 | 微信回调完成后跳转的 BFF URL，必须命中 `apps.config.oauth_providers.wechat.callback_urls` 中的某一项 |
+
+**响应（302）**：跳转 `https://open.weixin.qq.com/connect/qrconnect?appid=...&redirect_uri=...&response_type=code&scope=snsapi_login,snsapi_userinfo&state=<HMAC>#wechat_redirect`。`#wechat_redirect` 片段是腾讯侧要求的，缺失会导致「该链接无法访问」。
+
+**错误响应**：
+
+| HTTP | message | 触发条件 |
+|---|---|---|
+| 400 | `app_id and redirect_uri are required` | `app_id` 或 `redirect_uri` 缺失 |
+| 400 | `redirect_uri not in callback_urls whitelist` | `redirect_uri` 不在 callback_urls 白名单 |
+| 403 | `app is inactive` | app 已停用 |
+| 404 | `app not found` | `app_id` 不存在 |
+| 404 | `wechat oauth not configured for app` | app 未配置 WeChat OAuth 块 |
+| 500 | `invalid app config` | config JSON 解析失败或块结构异常 |
+| 500 | `build authorize url` | state 签发等内部异常 |
+
+#### GET /auth/wechat/callback
+
+微信扫码授权完成后的回调入口。**不需要鉴权**，但 `state` 必须有效。
+
+**查询参数**：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `code` | 是 | 微信授权码 |
+| `state` | 是 | `/redirect` 签发的 HMAC state |
+| `app_id` | 是 | 与 `/redirect` 时一致 |
+
+yunhou 完成 code 换 token、调用 `/sns/userinfo` 拿 unionid、签发 yunhou JWT，然后 302 跳回 BFF 的 callback URL，yunhou JWT 放在 URL fragment 里：
+
+```
+https://yundian.com/auth/wechat-callback#token=<yunhou_access>&refresh_token=<yunhou_refresh>&user_id=<uuid>&has_access=<bool>
+```
+
+BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏览器发送到服务器或 referer 头**，所以 access_token 不会泄漏。
+
+**错误响应（JSON 路径）**：
+
+| HTTP | message | 触发条件 |
+|---|---|---|
+| 400 | `app_id, code, state are required` | 必填参数缺失 |
+| 400 | `invalid state` | state 无效或过期（5 分钟） |
+| 400 | `invalid callback index` | state 里绑定的 callback 索引越界 |
+| 400 | `<error>: <error_description>` | 微信侧授权失败（state 验证失败的 JSON fallback） |
+| 404 | `app not found` | `app_id` 不存在 |
+| 404 | `wechat oauth not configured for app` | app 未配置 WeChat OAuth |
+| 500 | `invalid app config` | config JSON 解析失败 |
+| 500 | `exchange code` | code 换 token 失败（非上游错误的兜底） |
+| 500 | `fetch profile` | `/sns/userinfo` 失败（非上游错误的兜底） |
+| 500 | `login` | auth service 内部异常 |
+
+**错误响应（BFF fragment 路径，302 跳转）**：
+
+> 以下错误**不返回 JSON**，而是 302 跳回 BFF 的 `redirect_uri` 并在 URL fragment 里塞 `error=auth_failed&reason=<reason>`：
+
+| reason | 触发条件 |
+|---|---|
+| `wechat_upstream` | 微信上游调用失败（`/sns/oauth2/access_token` 或 `/sns/userinfo` 返回非 2xx / errcode ≠ 0 / 网络错误 / 解码失败 / 空 openid 等） |
+| `wechat_no_unionid` | `/sns/userinfo` 响应中 `unionid` 字段为空（用户拒绝授权 snsapi_userinfo 或 app 未申请该权限） |
+| `user_not_found` | 防御性：JWT 主题无法解析到用户行（理论上不应发生）；`ErrUserDeleted` 也归并到此 reason |
+| `user_suspended` | 用户账号被停用 |
+| `subscription_expired` | 订阅过期；`ErrSubscriptionNotActive`（被 sweeper 翻成非 active）也归并到此 reason |
+| `app_not_found` / `app_disabled` | `app_id` 不存在或已停用 |
+
+#### 边界总结
+
+| 信息 | yunhou 持有？ | BFF 能拿到？ |
+|---|---|---|
+| WeChat `app_id` | ✓ | ✓（明文，会出现在 `qrconnect` URL 里） |
+| WeChat `app_secret` | ✓ | ✗ |
+| `callback_urls` 白名单 | ✓ | ✗ |
+| WeChat `access_token`（回调后） | ✓（用即丢——仅调一次 `/sns/userinfo`） | ✗ |
+| WeChat `refresh_token`（回调后） | ✓（立即丢弃，无后续用途） | ✗ |
+| `unionid`（用户身份锚） | ✓（DB 持久化：`social_identities.provider_uid = "wechat_" + unionid`） | ✗ |
+| yunhou `access_token` | yunhou 签发 | ✓（fragment 里） |
+
+> **跨 app unionid 统一**：yunhou 要求所有消费 app 的微信「网站应用」必须注册在**同一个微信开放平台账号**下。这样同一微信用户在不同 Yunhou 消费 app 上登录时，`unionid` 相同 → `provider_uid` 相同 → 落到同一个 Yunhou 用户行。如果违反这条（运营侧把不同 app 注册在不同的开放平台账号下），同一个微信用户会在 Yunhou 产生多个独立账号，跨 app 身份统一这条产品原则会失效。这是 Tencent 侧要求，代码层不强制。
 
 ---
 
@@ -1568,7 +1752,7 @@ GET /.well-known/jwks.json
 |------|------|------|
 | `id` | string | 身份 ID |
 | `user_id` | string | 所属用户 |
-| `provider` | string | 提供方：`github` |
+| `provider` | string | 提供方：`github` / `wechat`（DB CHECK 约束还允许 `google`，但当前代码未启用） |
 | `provider_uid` | string | 提供方用户 ID |
 | `email` | string? | 关联邮箱 |
 | `created_at` | datetime | 创建时间 |
@@ -1612,7 +1796,7 @@ GET /.well-known/jwks.json
 
 | 接口类别 | 限制 | 说明 |
 |---------|------|------|
-| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/refresh`, `/auth/logout`, `/auth/github/*`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内（最早期注册，绕过 limiter）；`/apps/:id/plans` 公共可访问（无需鉴权） |
+| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/refresh`, `/auth/logout`, `/auth/github/*`, `/auth/wechat/*`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内（最早期注册，绕过 limiter）；`/apps/:id/plans` 公共可访问（无需鉴权）；`/auth/wechat/redirect` 与 `/auth/wechat/callback` 与 `/auth/github/*` 共用同一 limiter |
 | 内部服务接口（`/apps`, `/apps/:id`, `/apps/:id/provider-token/:channel`, `/admin/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 `X-App-ID` 头 + `X-App-Secret` 头 |
 | 用户态接口（`POST /apps/:id/quote`, `/payments/*`, `/refunds/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 JWT（终端用户身份） |
 | 用户接口（`/user/*`） | 无显式限制 | 仅要求 JWT |
@@ -1625,6 +1809,7 @@ GET /.well-known/jwks.json
 - [ ] 获取应用的 `app_id` + `app_secret`（`POST /admin/apps` 响应里 `data.secret`，仅一次性返回，需立即落地）
 - [ ] BFF 调 `/apps/:id/plans`、`/apps/:id/provider-token/:channel`、所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`
 - [ ] 实现 GitHub OAuth 重定向登录：BFF 302 到 `/auth/github/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，让浏览器走完 GitHub 授权；回调页从 URL fragment 解析 `token` / `refresh_token` / `user_id` / `has_access`（注意 fragment 不会上行到服务器，BFF 必须前端 JS 解析）
+- [ ] （可选）实现 WeChat OAuth 扫码登录：BFF 302 到 `/auth/wechat/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，PC 浏览器展示二维码；用户手机微信扫码后在回调页同样从 URL fragment 解析 token；需要识别 fragment 里的 `error=auth_failed&reason=wechat_no_unionid` 并展示对应文案；所有 Yunhou 消费 app 的「网站应用」必须注册在**同一个微信开放平台账号**下才能跨 app unionid 统一
 - [ ] 解析响应中的 `has_access` 字段，判断用户是否有权限访问
 - [ ] 如果 `has_access` 为 `false`，提示用户订阅/升级
 - [ ] 使用 `access_token` 调用用户接口

@@ -203,3 +203,83 @@ func (s *WeChatOAuthService) ExchangeCode(ctx context.Context, cfg *model.WeChat
 	}
 	return &parsed, nil
 }
+
+// FetchWeChatProfile calls /sns/userinfo using the access_token + openid
+// returned by ExchangeCode. Returns a ProviderUserInfo with
+// provider="wechat" and provider_uid="wechat_<unionid>". The
+// access_token is used exactly once; the caller MUST drop it after this
+// returns.
+//
+// Email is always "" — WeChat's /sns/userinfo does NOT expose email.
+// This means WeChat identities can never trigger the cross-provider
+// email-merge in AuthService.resolveOrCreateUser; a WeChat-only user
+// always gets a fresh Yunhou account on first login. (Design doc §4.)
+func (s *WeChatOAuthService) FetchWeChatProfile(ctx context.Context, accessToken, openID string) (*ProviderUserInfo, error) {
+	if accessToken == "" {
+		return nil, errors.New("empty access token")
+	}
+	if openID == "" {
+		return nil, errors.New("empty openid")
+	}
+
+	q := url.Values{}
+	q.Set("access_token", accessToken)
+	q.Set("openid", openID)
+	q.Set("lang", "zh_CN")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.userInfoURL+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build userinfo request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrWeChatUpstream, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%w: userinfo endpoint returned %d", ErrWeChatUpstream, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read body: %v", ErrWeChatUpstream, err)
+	}
+
+	var errResp struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	if err := json.Unmarshal(body, &errResp); err == nil && errResp.ErrCode != 0 {
+		return nil, fmt.Errorf("%w: errcode=%d errmsg=%s", ErrWeChatUpstream, errResp.ErrCode, errResp.ErrMsg)
+	}
+
+	var parsed struct {
+		OpenID     string `json:"openid"`
+		UnionID    string `json:"unionid"`
+		Nickname   string `json:"nickname"`
+		HeadImgURL string `json:"headimgurl"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("%w: decode: %v", ErrWeChatUpstream, err)
+	}
+
+	if parsed.UnionID == "" {
+		// Design decision: we REQUIRE unionid. A userinfo response
+		// without it means snsapi_userinfo was not granted (e.g. the
+		// operator forgot to register the scope, or the user denied
+		// it). Reject the login rather than silently creating a
+		// per-app identity.
+		return nil, ErrWeChatNoUnionID
+	}
+
+	return &ProviderUserInfo{
+		Provider:    "wechat",
+		ProviderUID: "wechat_" + parsed.UnionID,
+		Email:       "",
+		Nickname:    parsed.Nickname,
+		AvatarURL:   parsed.HeadImgURL,
+	}, nil
+}

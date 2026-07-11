@@ -253,6 +253,103 @@ func TestWeChatOAuthService_ExchangeCode_EmptyAccessToken(t *testing.T) {
 	}
 }
 
+// --- FetchWeChatProfile tests ----------------------------------------
+
+func TestWeChatOAuthService_FetchWeChatProfile_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("access_token") != "AT" {
+			t.Errorf("access_token = %q", q.Get("access_token"))
+		}
+		if q.Get("openid") != "oid" {
+			t.Errorf("openid = %q", q.Get("openid"))
+		}
+		if q.Get("lang") != "zh_CN" {
+			t.Errorf("lang = %q", q.Get("lang"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"openid":"oid","nickname":"nick","sex":1,"headimgurl":"http://img","unionid":"uid"}`)
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetUserInfoURL(srv.URL)
+
+	got, err := svc.FetchWeChatProfile(context.Background(), "AT", "oid")
+	if err != nil {
+		t.Fatalf("FetchWeChatProfile: %v", err)
+	}
+	if got.Provider != "wechat" {
+		t.Errorf("Provider = %q, want wechat", got.Provider)
+	}
+	if got.ProviderUID != "wechat_uid" {
+		t.Errorf("ProviderUID = %q, want wechat_uid", got.ProviderUID)
+	}
+	if got.Email != "" {
+		t.Errorf("Email = %q, want empty", got.Email)
+	}
+	if got.Nickname != "nick" {
+		t.Errorf("Nickname = %q", got.Nickname)
+	}
+	if got.AvatarURL != "http://img" {
+		t.Errorf("AvatarURL = %q", got.AvatarURL)
+	}
+}
+
+func TestWeChatOAuthService_FetchWeChatProfile_MissingUnionID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"openid":"oid","nickname":"nick","headimgurl":"http://img"}`)
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetUserInfoURL(srv.URL)
+
+	_, err := svc.FetchWeChatProfile(context.Background(), "AT", "oid")
+	if !errors.Is(err, ErrWeChatNoUnionID) {
+		t.Fatalf("err = %v, want ErrWeChatNoUnionID", err)
+	}
+}
+
+func TestWeChatOAuthService_FetchWeChatProfile_UpstreamErrcode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"errcode":40001,"errmsg":"invalid credential"}`)
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetUserInfoURL(srv.URL)
+
+	_, err := svc.FetchWeChatProfile(context.Background(), "AT", "oid")
+	if !errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, want ErrWeChatUpstream", err)
+	}
+}
+
+func TestWeChatOAuthService_FetchWeChatProfile_MissingOptionalFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"openid":"oid","unionid":"uid"}`)
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetUserInfoURL(srv.URL)
+
+	got, err := svc.FetchWeChatProfile(context.Background(), "AT", "oid")
+	if err != nil {
+		t.Fatalf("FetchWeChatProfile: %v", err)
+	}
+	if got.Nickname != "" || got.AvatarURL != "" {
+		t.Errorf("expected empty nickname/avatar, got %+v", got)
+	}
+	if got.ProviderUID != "wechat_uid" {
+		t.Errorf("ProviderUID = %q, want wechat_uid", got.ProviderUID)
+	}
+}
+
 func TestWeChatOAuthService_VerifyCallbackState_Expired(t *testing.T) {
 	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
 	cfg := &model.WeChatOAuthConfig{

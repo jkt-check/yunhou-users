@@ -54,6 +54,10 @@ Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一
 
 **关键字段**：`has_access` 表示用户是否可以访问当前 App。如果为 `false`，用户可能需要升级订阅。
 
+**字段约束（重要）**：`data.user.nickname` / `data.user.email` / `data.user.avatar_url` 都是 optional（GitHub 没返回 email、用户没设头像时整个字段**缺失**而不是 `null`）；`data.subscription.expires_at` 同理（订阅永不过期时缺失）。集成方用 TypeScript / Go struct 等静态类型时需把这些字段标为 `?:` / `*string` / `*time.Time`，否则会编译失败或 runtime 报错。
+
+`POST /auth/refresh` 与 `POST /auth/logout` 返回相同 envelope，所以同样的 optional 字段约定适用。
+
 ### 3. 调用用户信息接口
 
 使用 `access_token` 调用用户接口：
@@ -175,8 +179,10 @@ curl https://your-yunhou-domain/user/profile \
 | 400 | `invalid request body` | 请求体缺少 `refresh_token` |
 | 401 | `invalid refresh token` | refresh token 不存在、已撤销、已轮换、已过期 |
 | 401 | `user is suspended` / `user is deleted` | 用户账号被停用或已删除 |
+| 401 | `user not found` | refresh token 对应的 user 行已被删除（理论不应发生；防御性兜底） |
 | 401 | `app not found` / `app is inactive` | 解析得到的 `app_id` 不存在或已停用 |
-| 401 | `subscription expired` | 用户有订阅但已过期 |
+| 401 | `subscription expired` | 用户有订阅但 `expires_at` 已过 |
+| 401 | `subscription not active` | 用户订阅已被 sweeper 翻成非 active（如 cancelled/expired 状态，但 `expires_at` 字段还没推进） |
 
 #### POST /auth/logout
 
@@ -481,6 +487,12 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 - `trial_days` / `billing_cycle_days` 决定 `sub_expires_at = now + trial + cycle` 的计算结果；务必与 PayPal 控制台账单周期同步。`billing_cycle_days` 缺省时回退到 `plans.interval_days`。
 - `brand.name` 缺省回退到 `apps.name`，对应 PayPal `application_context.brand_name`。
 - `apps.config` 中 PayPal 段当前 schema 是嵌套对象形：`{ plan_id, trial_days, billing_cycle_days }`。配置行若缺少 `payment_providers.paypal.plans` 或对应 plan_id 的条目，quote / catalog 接口会视该 plan 为未配置。
+
+**字段校验**（`POST /admin/apps` 与 `PATCH /admin/apps/:id` 时执行；违反会得到 400 + 具体字段 message）：
+
+- `payment_providers.paypal`：`client_id` / `client_secret` / `webhook_id` 必填；`mode` 必须 `live` 或 `sandbox`
+- `oauth_providers.github`：`client_id` / `client_secret` 必填；`callback_urls` 必须非空且全部为 `https://`，或 `http://localhost` / `http://127.0.0.1` / `http://[::1]`（含 `::ffff:127.0.0.1` 映射形式）；不允许重复项
+- 整个 `config` 在保存前会被 canonicalize（按 struct 字段顺序重写），所以 PATCH 后 JSONB 字节布局可能与入参不完全一致——语义不变但 byte-equal diff 会失真。运营侧如果做"配置变更审计"应比对语义而非字节
 
 #### GET /apps
 
@@ -823,7 +835,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 }
 ```
 
-> 注意：POST 创建时 `config` 字段为 `null`（in-memory 写入未读取 DB 默认值）。通过 GET 读取时会回填为 DB 默认 `{}`。
+> 如果请求体未传 `config`，POST 响应里 `data.app.config` 为 `null`（handler 返回的是 in-memory 入参对象，未读 DB 默认值）；如果传了 `config`，则返回 canonicalize 后的值。`GET /admin/apps/:id` 读取时若 DB 列实际为 NULL，会回填为 `{}`。
 >
 > `data.secret` 是 64 位十六进制随机串，**仅本次响应返回**——服务端只存 bcrypt 哈希，无法再次读出。客户端必须立即把 `secret` 配置到 BFF 环境变量里，下一次 admin 调用时携带 `X-App-Secret` 头才能通过 `InternalAppAuth`。丢失后只能走 `POST /admin/apps/:id/rotate-secret` 重新生成。
 
@@ -1309,7 +1321,9 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 }
 ```
 
-退款 `status` 流转：`pending → paid`（渠道 webhook 确认）。**v1 不会产生 `failed` 状态**：渠道侧拒绝会直接以 `502 channel refund API call failed` 返回，发生在 INSERT 之前，不会留下 `failed` 记录。完整退款会同步把 `payment.status` 翻成 `refunded`，并取消该订单 plan 上的活跃订阅（不影响其他 plan 的订阅）；部分退款不影响订阅。
+退款 `status` 流转：`pending → paid`（渠道 webhook 确认）。**v1 不会产生 `failed` 状态**：渠道侧拒绝会直接以 `502 channel refund API call failed` 返回，发生在 INSERT 之前，不会留下 `failed` 记录。
+
+> **不要把 `POST /refunds` 当成同步接口**——handler 调用 channel 退款 API 成功后立刻返回 `status: pending`，**不**会同步翻 `payment.status` 也不会立刻取消订阅。完整退款的 `payment.status → refunded` 与"取消该订单 plan 的活跃订阅"（不影响其他 plan 的订阅）由**随后的 channel webhook** 异步完成；部分退款不影响订阅。集成方需要通过 `GET /payments/:id` 或订阅查询接口跟踪最终结果，不要在 `POST /refunds` 返回 200 后立刻假设订阅已停。
 
 **错误响应**：
 
@@ -1358,7 +1372,13 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 ### 渠道 Webhook 回调
 
-POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走签名校验。响应永远在事务提交后返回；签名失败 → 400，临时错误 → 500（渠道自动重试）。
+POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走签名校验。响应永远在事务提交后返回。错误响应分类：
+
+| HTTP | message | 触发条件 | 渠道是否会重试 |
+|------|---------|----------|---------------|
+| 400 | `invalid signature` | 签名 / 时间戳 / replay window 校验失败 | 否（重试也是同样结果） |
+| 404 | `unknown channel` | 该 channel 对应的 webhook secret/key 未配置（如 `STRIPE_WEBHOOK_SECRET` 空时 Stripe 收 404；`WECHAT_PAY_API_V3_KEY` 空时 WeChat 收 404；`ALIPAY_PUBLIC_KEY_PATH` 空时 Alipay 收 404；`PAYPAL_WEBHOOK_ID_SANDBOX` / `PAYPAL_WEBHOOK_ID_LIVE` 空时 PayPal 收 404）。这是"channel 没启用"语义，运营侧需检查对应 env 是否漏配 | 否（重试同样 404） |
+| 500 | `signature verification failed` / `handler error` | 临时错误（DB 抖动、PayPal 上游 verify 接口超时等） | 是（渠道按其重试策略） |
 
 成功响应统一格式（标准 envelope）：
 
@@ -1373,13 +1393,17 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 }
 ```
 
-`domain_action` 取值（事件被处理时填）：`payment_paid` / `payment_failed` / `refund_paid` / `payment_disputed` / `payment_dispute_closed` / `none`。**判别 dedupe 请用 `duplicate: true`，不要用 `domain_action == "none"`**（`"none"` 仅表示"事件类型不在我们关心的范围内"，不代表已处理；dedupe 命中时 `domain_action` 仍会照常填写——只要看到 `duplicate: true` 就是已处理过的事件）。
+`domain_action` 取值：`payment_paid` / `payment_failed` / `refund_paid` / `payment_disputed` / `payment_dispute_closed` / `none`。其中 `none` 表示"事件类型不在我们关心的范围内"（被记账但不触发业务动作）。
+
+**重要**：
+- **判别 dedupe 请用 `duplicate: true`**，不要用 `domain_action == "none"`——后者只是"事件被记录但未触发业务动作"，不代表已处理。
+- **dedupe 命中时 `domain_action` 字段为空字符串**（**不是** `none` 也不是某个已知值）——handler 在 dedupe 命中路径上不会经过 switch 分支直接返回。所以重复事件的真实 payload 是 `{"received": true, "domain_action": "", "duplicate": true}`。做 retry 决策时只信 `duplicate` 字段。
 
 订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、PayPal `resource.billing_info.next_billing_time`（renewal `PAYMENT.SALE.COMPLETED` 事件携带；其他事件若无则忽略）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
 
 ### Quote 路径 vs Confirm 路径：sub_expires_at 来源冲突
 
-订单可能通过两条独立路径被标记为已支付：
+订单可能通过两条路径被标记为已支付——生产环境更常见的场景是 **race**（同一笔订单的 webhook 与前端 `/confirm` 几乎同时到达），而不是"业务上选哪条都行"：
 
 - **Quote 路径**：`/quote` 返回 `sub_expires_at`，BFF 把它嵌入 channel checkout metadata（PayPal `metadata.sub_expires_at`，Stripe/WeChat/Alipay 等价字段）；channel webhook 到达后 yunhou 直接写入 `subscriptions.expires_at`
 - **Confirm 路径**：`POST /payments/orders/:order_id/confirm` 由 BFF 在前端检测到 channel 支付成功时主动调用，`expires_at` 由 BFF 自己算后透传
@@ -1522,6 +1546,7 @@ GET /.well-known/jwks.json
 | `status` | string | 状态：`active` / `expired` / `cancelled` |
 | `started_at` | datetime | 开始时间 |
 | `expires_at` | datetime? | 过期时间，null 表示永不过期 |
+| `external_subscription_id` | string? | 渠道侧订阅 ID（当前仅 PayPal 的 `I-...`）；非 PayPal 渠道为 `null`。用于 webhook 续费事件反查订阅 |
 | `created_at` | datetime | 创建时间 |
 | `updated_at` | datetime | 更新时间 |
 

@@ -26,13 +26,17 @@ type wechatOAuthDeps struct {
 	authSvc service.AuthServiceInterface
 }
 
-// RegisterWeChatOAuthRoutes attaches /auth/wechat/redirect and
-// /auth/wechat/callback to the engine. Both endpoints are public (no
-// JWT) — same posture as /auth/github/* and /auth/refresh.
+// RegisterWeChatOAuthRoutes attaches /redirect and /callback to the
+// given router. Called from router.Setup() with an
+// `engine.Group("/auth/wechat", ...)` so the routes resolve at
+// /auth/wechat/redirect + /auth/wechat/callback.
+//
+// Both endpoints are public (no JWT) — same posture as /auth/github/* and
+// /auth/refresh.
 func RegisterWeChatOAuthRoutes(engine gin.IRouter, svc *service.WeChatOAuthService, appRepo appLoader, authSvc service.AuthServiceInterface) {
 	d := &wechatOAuthDeps{svc: svc, appRepo: appRepo, authSvc: authSvc}
-	engine.GET("/auth/wechat/redirect", d.Redirect)
-	engine.GET("/auth/wechat/callback", d.Callback)
+	engine.GET("/redirect", d.Redirect)
+	engine.GET("/callback", d.Callback)
 }
 
 // Redirect handles GET /auth/wechat/redirect?app_id=...&redirect_uri=...

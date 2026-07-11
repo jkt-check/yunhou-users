@@ -81,7 +81,7 @@ func TestGitHubOAuth_Redirect_HappyPath(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://yundian.com/auth/callback")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fyundian.com%2Fauth%2Fcallback", nil)
@@ -105,7 +105,7 @@ func TestGitHubOAuth_Redirect_MissingAppID(t *testing.T) {
 	appRepo := &stubAppLoader{}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/redirect?redirect_uri=https%3A%2F%2Fx", nil)
 	w := httptest.NewRecorder()
@@ -121,7 +121,7 @@ func TestGitHubOAuth_Redirect_MissingRedirectURI(t *testing.T) {
 	appRepo := &stubAppLoader{}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/redirect?app_id=yundian", nil)
 	w := httptest.NewRecorder()
@@ -137,7 +137,7 @@ func TestGitHubOAuth_Redirect_AppNotFound(t *testing.T) {
 	appRepo := &stubAppLoader{err: errors.New("db down")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=missing&redirect_uri=https%3A%2F%2Fx", nil)
@@ -154,7 +154,7 @@ func TestGitHubOAuth_Redirect_GitHubNotConfigured(t *testing.T) {
 	appRepo := &stubAppLoader{app: &model.App{AppID: "yundian", Name: "Yundian", IsActive: true}}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fx", nil)
@@ -171,7 +171,7 @@ func TestGitHubOAuth_Redirect_CallbackURLMismatch(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://yundian.com/auth/callback")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fevil.com%2Fcb", nil)
@@ -192,7 +192,7 @@ func TestGitHubOAuth_Redirect_MalformedConfig(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fx", nil)
@@ -211,7 +211,7 @@ func TestGitHubOAuth_Redirect_InactiveApp(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	// Inactive apps must not get a real GitHub authorize URL — the user
 	// would complete OAuth consent only to be rejected at /callback.
@@ -310,7 +310,7 @@ func TestGitHubOAuth_Callback_HappyPath(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	url := "/auth/github/callback?app_id=yundian&code=auth-code&state=" + state
@@ -353,7 +353,7 @@ func TestGitHubOAuth_Callback_ExchangeCodeFailure(t *testing.T) {
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	svc.SetAccessTokenURL(upstream.URL + "/login/oauth/access_token")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -395,7 +395,7 @@ func TestGitHubOAuth_Callback_ProfileFetchError(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -439,7 +439,7 @@ func TestGitHubOAuth_Callback_AuthServiceError(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -482,7 +482,7 @@ func TestGitHubOAuth_Callback_AuthServiceUnknownError(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -501,7 +501,7 @@ func TestGitHubOAuth_Callback_GitHubErrorParam(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth(cbURL)}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	// Sign a valid state so the handler can identify which callback
 	// URL the user started from. Mirrors the production flow.
@@ -536,7 +536,7 @@ func TestGitHubOAuth_Callback_GitHubErrorParamNoAppID(t *testing.T) {
 	appRepo := &stubAppLoader{}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/callback?error=access_denied&state=x", nil)
@@ -577,7 +577,7 @@ func TestGitHubOAuth_Callback_AppInactiveRedirects(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -625,7 +625,7 @@ func TestGitHubOAuth_Callback_UserSuspendedRedirects(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -647,7 +647,7 @@ func TestGitHubOAuth_Callback_MissingCodeOrState(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://x")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/callback?app_id=yundian", nil)
 	w := httptest.NewRecorder()
@@ -663,7 +663,7 @@ func TestGitHubOAuth_Callback_MissingAppID(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://x")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=c&state=s", nil)
 	w := httptest.NewRecorder()
@@ -679,7 +679,7 @@ func TestGitHubOAuth_Callback_InvalidState(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://x")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/callback?app_id=yundian&code=c&state=not-a-valid-state", nil)
@@ -696,7 +696,7 @@ func TestGitHubOAuth_Callback_AppNotFound(t *testing.T) {
 	appRepo := &stubAppLoader{err: errors.New("not found")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, "https://yundian.com/auth/callback")
 	req := httptest.NewRequest(http.MethodGet,
@@ -715,7 +715,7 @@ func TestGitHubOAuth_Callback_GitHubNotConfigured(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	// Need a valid state for "yundian" so state-verify passes and we
 	// exercise the GitHubNotConfigured branch that follows.
@@ -740,7 +740,7 @@ func TestGitHubOAuth_Callback_MalformedAppConfig(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, "https://x")
 	req := httptest.NewRequest(http.MethodGet,

@@ -54,7 +54,7 @@ func TestWeChatOAuth_Redirect_HappyPath(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fbff.example.com%2Fauth%2Fwechat-callback", nil)
@@ -83,7 +83,7 @@ func TestWeChatOAuth_Redirect_MissingAppID(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?redirect_uri=https%3A%2F%2Fb", nil)
@@ -100,7 +100,7 @@ func TestWeChatOAuth_Redirect_MissingRedirectURI(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?app_id=yundian", nil)
@@ -117,7 +117,7 @@ func TestWeChatOAuth_Redirect_AppNotFound(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?app_id=missing&redirect_uri=https%3A%2F%2Fb", nil)
@@ -136,7 +136,7 @@ func TestWeChatOAuth_Redirect_InactiveApp(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fbff.example.com%2Fauth%2Fwechat-callback", nil)
@@ -154,7 +154,7 @@ func TestWeChatOAuth_Redirect_WeChatNotConfigured(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fb", nil)
@@ -171,7 +171,7 @@ func TestWeChatOAuth_Redirect_CallbackURLMismatch(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fattacker.example.com%2Fcb", nil)
@@ -247,7 +247,7 @@ func TestWeChatOAuth_Callback_HappyPath(t *testing.T) {
 	}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	uri := wechatCallbackURIFor(t, svc, "yundian", cbURL)
 	w := httptest.NewRecorder()
@@ -291,7 +291,7 @@ func TestWeChatOAuth_Callback_MissingUnionID(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	uri := wechatCallbackURIFor(t, svc, "yundian", cbURL)
 	w := httptest.NewRecorder()
@@ -323,7 +323,7 @@ func TestWeChatOAuth_Callback_UpstreamErrcode(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	uri := wechatCallbackURIFor(t, svc, "yundian", cbURL)
 	w := httptest.NewRecorder()
@@ -347,7 +347,7 @@ func TestWeChatOAuth_Callback_InvalidState(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/callback?app_id=yundian&code=x&state=garbage", nil)
@@ -364,7 +364,7 @@ func TestWeChatOAuth_Callback_MissingCodeOrState(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/callback?app_id=yundian", nil)
@@ -385,7 +385,7 @@ func TestWeChatOAuth_Callback_WeChatErrorParam(t *testing.T) {
 	authSvc := &stubAuthSvc{}
 
 	r := gin.New()
-	RegisterWeChatOAuthRoutes(r, svc, appRepo, authSvc)
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
 
 	// Build a valid state via the service so the error-param branch
 	// can resolve the BFF's redirect_uri and produce a 302.

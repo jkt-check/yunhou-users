@@ -125,8 +125,8 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 	// Mirror the GitHub error-param pattern — redirect to the BFF with
 	// the error echoed in the fragment so the BFF can show a localized
 	// message.
-	if ghErr := c.Query("error"); ghErr != "" {
-		ghErrDesc := c.Query("error_description")
+	if upstreamErr := c.Query("error"); upstreamErr != "" {
+		upstreamErrDesc := c.Query("error_description")
 		state := c.Query("state")
 		appID := c.Query("app_id")
 		if state != "" && appID != "" {
@@ -135,9 +135,9 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 					cfg, _, lerr := lookupWeChatConfig(app, "")
 					if lerr == nil && idx >= 0 && idx < len(cfg.CallbackURLs) {
 						frag := url.Values{}
-						frag.Set("error", ghErr)
-						if ghErrDesc != "" {
-							frag.Set("error_description", ghErrDesc)
+						frag.Set("error", upstreamErr)
+						if upstreamErrDesc != "" {
+							frag.Set("error_description", upstreamErrDesc)
 						}
 						c.Redirect(http.StatusFound, redirectWithFragment(cfg.CallbackURLs[idx], frag))
 						return
@@ -145,7 +145,14 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 				}
 			}
 		}
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": ghErr + ": " + ghErrDesc})
+		// Fallback when state verify / app lookup fails — surface the
+		// upstream error verbatim. Drop the trailing ": " that would
+		// otherwise appear when error_description is empty.
+		msg := upstreamErr
+		if upstreamErrDesc != "" {
+			msg = upstreamErr + ": " + upstreamErrDesc
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
 		return
 	}
 

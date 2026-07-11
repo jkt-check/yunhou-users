@@ -35,10 +35,9 @@ import (
 // per-app identity splits.
 
 var (
-	wechatAuthorizeURL    = "https://open.weixin.qq.com/connect/qrconnect"
-	wechatAccessTokenURL  = "https://api.weixin.qq.com/sns/oauth2/access_token"
-	wechatUserInfoURL     = "https://api.weixin.qq.com/sns/userinfo"
-	wechatOAuthHTTPClient = &http.Client{Timeout: 10 * time.Second}
+	wechatAuthorizeURL   = "https://open.weixin.qq.com/connect/qrconnect"
+	wechatAccessTokenURL = "https://api.weixin.qq.com/sns/oauth2/access_token"
+	wechatUserInfoURL    = "https://api.weixin.qq.com/sns/userinfo"
 )
 
 // WeChatOAuthService is the entry point Yunhou's redirect handler uses
@@ -134,10 +133,14 @@ func (s *WeChatOAuthService) VerifyCallbackState(state, expectedAppID string, no
 }
 
 // wechatAccessToken is the parsed shape of /sns/oauth2/access_token's
-// success body. unionid is intentionally NOT included here — the handler
+// body. Includes ErrCode/ErrMsg alongside the success fields so a
+// single json.Unmarshal detects both success and the upstream error
+// envelope. unionid is intentionally NOT included here — the handler
 // reads unionid from FetchWeChatProfile's response so there's a single
 // source of truth and a single missing-unionid sentinel path.
 type wechatAccessToken struct {
+	ErrCode      int    `json:"errcode"`
+	ErrMsg       string `json:"errmsg"`
 	AccessToken  string `json:"access_token"`
 	ExpiresIn    int    `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"`
@@ -184,19 +187,15 @@ func (s *WeChatOAuthService) ExchangeCode(ctx context.Context, cfg *model.WeChat
 		return nil, fmt.Errorf("%w: read body: %v", ErrWeChatUpstream, err)
 	}
 
-	// Inspect for errcode BEFORE decoding as access_token — a 200 body
-	// with errcode is a failure, not a token.
-	var errResp struct {
-		ErrCode int    `json:"errcode"`
-		ErrMsg  string `json:"errmsg"`
-	}
-	if err := json.Unmarshal(body, &errResp); err == nil && errResp.ErrCode != 0 {
-		return nil, fmt.Errorf("%w: errcode=%d errmsg=%s", ErrWeChatUpstream, errResp.ErrCode, errResp.ErrMsg)
-	}
-
+	// Single-struct decode — includes both success and errcode/errmsg
+	// fields so we surface upstream errors without a second json pass.
+	// Mirrors github_oauth.go ExchangeCode.
 	var parsed wechatAccessToken
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("%w: decode: %v", ErrWeChatUpstream, err)
+	}
+	if parsed.ErrCode != 0 {
+		return nil, fmt.Errorf("%w: errcode=%d errmsg=%s", ErrWeChatUpstream, parsed.ErrCode, parsed.ErrMsg)
 	}
 	if parsed.AccessToken == "" {
 		return nil, fmt.Errorf("%w: empty access_token in response", ErrWeChatUpstream)
@@ -216,10 +215,15 @@ func (s *WeChatOAuthService) ExchangeCode(ctx context.Context, cfg *model.WeChat
 // always gets a fresh Yunhou account on first login. (Design doc §4.)
 func (s *WeChatOAuthService) FetchWeChatProfile(ctx context.Context, accessToken, openID string) (*ProviderUserInfo, error) {
 	if accessToken == "" {
-		return nil, errors.New("empty access token")
+		return nil, fmt.Errorf("%w: empty access token", ErrWeChatUpstream)
 	}
 	if openID == "" {
-		return nil, errors.New("empty openid")
+		// Caller passed an empty openid (e.g. ExchangeCode returned a
+		// 200 body without an openid field). Wrap as upstream so the
+		// handler routes to the BFF fragment (#error=auth_failed
+		// &reason=wechat_upstream) instead of stranding the user on a
+		// 500 JSON page.
+		return nil, fmt.Errorf("%w: empty openid", ErrWeChatUpstream)
 	}
 
 	q := url.Values{}
@@ -248,15 +252,12 @@ func (s *WeChatOAuthService) FetchWeChatProfile(ctx context.Context, accessToken
 		return nil, fmt.Errorf("%w: read body: %v", ErrWeChatUpstream, err)
 	}
 
-	var errResp struct {
-		ErrCode int    `json:"errcode"`
-		ErrMsg  string `json:"errmsg"`
-	}
-	if err := json.Unmarshal(body, &errResp); err == nil && errResp.ErrCode != 0 {
-		return nil, fmt.Errorf("%w: errcode=%d errmsg=%s", ErrWeChatUpstream, errResp.ErrCode, errResp.ErrMsg)
-	}
-
+	// Single-struct decode — ErrCode/ErrMsg share the body with the
+	// success fields so we surface upstream errors without a second
+	// json pass.
 	var parsed struct {
+		ErrCode    int    `json:"errcode"`
+		ErrMsg     string `json:"errmsg"`
 		OpenID     string `json:"openid"`
 		UnionID    string `json:"unionid"`
 		Nickname   string `json:"nickname"`
@@ -264,6 +265,9 @@ func (s *WeChatOAuthService) FetchWeChatProfile(ctx context.Context, accessToken
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("%w: decode: %v", ErrWeChatUpstream, err)
+	}
+	if parsed.ErrCode != 0 {
+		return nil, fmt.Errorf("%w: errcode=%d errmsg=%s", ErrWeChatUpstream, parsed.ErrCode, parsed.ErrMsg)
 	}
 
 	if parsed.UnionID == "" {

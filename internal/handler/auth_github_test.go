@@ -979,6 +979,46 @@ func TestValidateWeChatOAuthConfig_InvalidAppIDFormat(t *testing.T) {
 	}
 }
 
+func TestValidateWeChatOAuthConfig_AppIDUppercase(t *testing.T) {
+	// Tencent website-app AppIDs can be issued with uppercase A-F in
+	// the hex tail; the validator must accept either case so operators
+	// aren't locked out by a case mismatch on a real assignment. The
+	// "wx" prefix is anchored lowercase per Tencent's convention.
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789ABCDEF",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err != nil {
+		t.Errorf("expected uppercase hex AppID to be accepted, got %v", err)
+	}
+}
+
+func TestValidateWeChatOAuthConfig_AppIDUppercasePrefix(t *testing.T) {
+	// The "wx" prefix is anchored lowercase — operators who typo it as
+	// uppercase get rejected at admin time rather than discovering the
+	// mismatch via a confusing errcode=40013 in production.
+	w := &model.WeChatOAuthConfig{
+		AppID:        "WX0123456789ABCDEF",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for uppercase 'WX' prefix")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_AppIDMixedCase(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789AbCdEf",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err != nil {
+		t.Errorf("expected mixed-case hex AppID to be accepted, got %v", err)
+	}
+}
+
 func TestValidateWeChatOAuthConfig_InvalidAppSecretLength(t *testing.T) {
 	w := &model.WeChatOAuthConfig{
 		AppID:        "wx0123456789abcdef",

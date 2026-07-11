@@ -347,10 +347,14 @@ func validateGitHubOAuthConfig(g *model.GitHubOAuthConfig) error {
 }
 
 // wechatAppIDPattern matches WeChat Open Platform 网站应用 AppID format:
-// "wx" + 16 hex chars. Validating the pattern catches typos before they
-// hit the live WeChat endpoint and surface as a confusing
-// errcode=40013.
-var wechatAppIDPattern = regexp.MustCompile(`^wx[0-9a-f]{16}$`)
+// "wx" + 16 hex chars. The "wx" prefix is always lowercase per Tencent's
+// assignment convention, so we anchor it as case-sensitive; the hex
+// tail is accepted case-insensitively because operators have
+// reported real assignments issued with uppercase A-F, and a case
+// mismatch would otherwise lock them out at admin time. Validating
+// the pattern catches typos before they hit the live WeChat endpoint
+// and surface as a confusing errcode=40013.
+var wechatAppIDPattern = regexp.MustCompile(`^wx[0-9a-fA-F]{16}$`)
 
 // validateWeChatOAuthConfig enforces the boundary contract for a WeChat
 // Open Platform 网站应用 stored in apps.config.oauth_providers.wechat.
@@ -361,7 +365,7 @@ func validateWeChatOAuthConfig(w *model.WeChatOAuthConfig) error {
 		return errors.New("oauth_providers.wechat.app_id is required")
 	}
 	if !wechatAppIDPattern.MatchString(w.AppID) {
-		return errors.New("oauth_providers.wechat.app_id must match ^wx[0-9a-f]{16}$")
+		return errors.New("oauth_providers.wechat.app_id must match ^wx[0-9a-fA-F]{16}$")
 	}
 	if len(w.AppSecret) != 32 {
 		return errors.New("oauth_providers.wechat.app_secret must be 32 chars")

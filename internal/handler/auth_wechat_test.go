@@ -529,3 +529,44 @@ func TestWeChatOAuth_Callback_UpstreamErrcode_FragmentFormat(t *testing.T) {
 		t.Errorf("location = %q contains leading-`&` fragment bug", loc)
 	}
 }
+
+// TestWeChatOAuth_Callback_ErrorParamNoDescription_NoTrailingColon
+// asserts that the JSON 400 fallback (state verify / app lookup failed,
+// so the BFF fragment path is unreachable) does NOT emit a trailing
+// ": " when error_description is empty. The previous code assembled
+//
+//	message: upstreamErr + ": " + upstreamErrDesc
+//
+// which produced "access_denied: " for access_denied-with-no-description
+// callbacks — a malformed message that breaks BFF-side parsing.
+func TestWeChatOAuth_Callback_ErrorParamNoDescription_NoTrailingColon(t *testing.T) {
+	r := gin.New()
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"),
+		&service.WeChatOAuthService{}, // state verify will fail (empty secret) → fallback JSON path
+		&stubAppLoader{},
+		&stubAuthSvc{},
+	)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"/auth/wechat/callback?error=access_denied&state=&app_id=",
+		nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v; body=%s", err, w.Body.String())
+	}
+	if strings.HasSuffix(resp.Message, ": ") || strings.HasSuffix(resp.Message, ":") {
+		t.Errorf("message = %q has trailing colon / colon-space", resp.Message)
+	}
+	if resp.Message != "access_denied" {
+		t.Errorf("message = %q, want exactly %q", resp.Message, "access_denied")
+	}
+}

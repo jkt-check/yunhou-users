@@ -328,6 +328,30 @@ func TestWeChatOAuthService_FetchWeChatProfile_UpstreamErrcode(t *testing.T) {
 	}
 }
 
+func TestWeChatOAuthService_FetchWeChatProfile_EmptyAccessToken(t *testing.T) {
+	// An empty access_token at the API boundary is an upstream failure
+	// (the BFF's redirect chain fed us nothing usable). The handler maps
+	// ErrWeChatUpstream to a BFF fragment, so wrapping this sentinel
+	// avoids stranding the user on a 500 JSON page.
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	_, err := svc.FetchWeChatProfile(context.Background(), "", "oid")
+	if !errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, want ErrWeChatUpstream", err)
+	}
+}
+
+func TestWeChatOAuthService_FetchWeChatProfile_EmptyOpenID(t *testing.T) {
+	// If ExchangeCode somehow returned a 200 body without an openid
+	// field, FetchWeChatProfile must surface that as ErrWeChatUpstream
+	// (not a bare errors.New) so the handler routes to the BFF
+	// fragment rather than a 500 JSON page.
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	_, err := svc.FetchWeChatProfile(context.Background(), "AT", "")
+	if !errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, want ErrWeChatUpstream", err)
+	}
+}
+
 func TestWeChatOAuthService_FetchWeChatProfile_MissingOptionalFields(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

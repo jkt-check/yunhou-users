@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -304,6 +305,11 @@ func validateAppConfig(cfg *model.AppConfig) error {
 				return err
 			}
 		}
+		if w := gh.WeChat; w != nil {
+			if err := validateWeChatOAuthConfig(w); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -334,6 +340,45 @@ func validateGitHubOAuthConfig(g *model.GitHubOAuthConfig) error {
 		}
 		if _, dup := seen[u]; dup {
 			return errors.New("oauth_providers.github.callback_urls must not contain duplicates")
+		}
+		seen[u] = struct{}{}
+	}
+	return nil
+}
+
+// wechatAppIDPattern matches WeChat Open Platform 网站应用 AppID format:
+// "wx" + 16 hex chars. Validating the pattern catches typos before they
+// hit the live WeChat endpoint and surface as a confusing
+// errcode=40013.
+var wechatAppIDPattern = regexp.MustCompile(`^wx[0-9a-f]{16}$`)
+
+// validateWeChatOAuthConfig enforces the boundary contract for a WeChat
+// Open Platform 网站应用 stored in apps.config.oauth_providers.wechat.
+// Required when the block is present; absence of the block means
+// "WeChat login disabled for this app" and is allowed.
+func validateWeChatOAuthConfig(w *model.WeChatOAuthConfig) error {
+	if w.AppID == "" {
+		return errors.New("oauth_providers.wechat.app_id is required")
+	}
+	if !wechatAppIDPattern.MatchString(w.AppID) {
+		return errors.New("oauth_providers.wechat.app_id must match ^wx[0-9a-f]{16}$")
+	}
+	if len(w.AppSecret) != 32 {
+		return errors.New("oauth_providers.wechat.app_secret must be 32 chars")
+	}
+	if len(w.CallbackURLs) == 0 {
+		return errors.New("oauth_providers.wechat.callback_urls must list at least one URL")
+	}
+	seen := make(map[string]struct{}, len(w.CallbackURLs))
+	for _, u := range w.CallbackURLs {
+		if u == "" {
+			return errors.New("oauth_providers.wechat.callback_urls entries must not be empty")
+		}
+		if !isAcceptableCallbackURL(u) {
+			return errors.New("oauth_providers.wechat.callback_urls entries must be https:// or http://127.0.0.1 / http://localhost")
+		}
+		if _, dup := seen[u]; dup {
+			return errors.New("oauth_providers.wechat.callback_urls must not contain duplicates")
 		}
 		seen[u] = struct{}{}
 	}

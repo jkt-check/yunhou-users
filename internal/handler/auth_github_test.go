@@ -944,6 +944,100 @@ func TestValidateGitHubOAuthConfig_DuplicateURL(t *testing.T) {
 }
 
 // =========================================================================
+// validateWeChatOAuthConfig tests — mirror the GitHub set
+// =========================================================================
+
+func TestValidateWeChatOAuthConfig_HappyPath(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://bff.example.com/auth/wechat-callback"},
+	}
+	if err := validateWeChatOAuthConfig(w); err != nil {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestValidateWeChatOAuthConfig_MissingAppID(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for missing app_id")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_InvalidAppIDFormat(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "not-a-wechat-appid",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for invalid app_id format")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_InvalidAppSecretLength(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "tooshort",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for invalid app_secret length")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_NoCallbackURLs(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:     "wx0123456789abcdef",
+		AppSecret: "0123456789abcdef0123456789abcdef",
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for empty callback_urls")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_InsecureURL(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"http://attacker.example.com/cb"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for non-https callback URL")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_DuplicateURL(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://x/cb", "https://x/cb"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for duplicate URLs")
+	}
+}
+
+func TestValidateAppConfig_WeChatBranch(t *testing.T) {
+	cfg := &model.AppConfig{
+		OAuthProviders: &model.OAuthProvidersConfig{
+			WeChat: &model.WeChatOAuthConfig{
+				AppID:        "wx0123456789abcdef",
+				AppSecret:    "0123456789abcdef0123456789abcdef",
+				CallbackURLs: []string{"https://b"},
+			},
+		},
+	}
+	if err := validateAppConfig(cfg); err != nil {
+		t.Errorf("err: %v", err)
+	}
+}
+
+// =========================================================================
 // validateAppConfig — covers the GitHub OAuth branch
 // =========================================================================
 

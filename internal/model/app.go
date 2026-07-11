@@ -63,10 +63,11 @@ type ProviderToken struct {
 }
 
 // OAuthProvidersConfig groups all OAuth providers configured for an app.
-// Today only GitHub is supported; the block is structured so future
+// Today GitHub and WeChat are supported; the block is structured so future
 // providers slot in alongside.
 type OAuthProvidersConfig struct {
 	GitHub *GitHubOAuthConfig `json:"github,omitempty"`
+	WeChat *WeChatOAuthConfig `json:"wechat,omitempty"`
 }
 
 // GitHubOAuthConfig stores the GitHub OAuth App credentials Yunhou uses to
@@ -90,5 +91,27 @@ type OAuthProvidersConfig struct {
 type GitHubOAuthConfig struct {
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret"`
+	CallbackURLs []string `json:"callback_urls"`
+}
+
+// WeChatOAuthConfig stores the WeChat Open Platform 网站应用 credentials
+// Yunhou uses to run the /auth/wechat/redirect + /auth/wechat/callback
+// flow on behalf of a consumer app. Same boundary contract as the GitHub
+// block:
+//
+//   - AppID is the 微信开放平台 网站应用 AppID (public — appears in the
+//     authorize URL anyway).
+//   - AppSecret is server-side only. Never returned in any response body;
+//     the handler maps ErrWeChatNotConfigured without surfacing the secret.
+//   - CallbackURLs is the whitelist the callback handler matches the
+//     incoming redirect_uri against. Multiple entries allowed (web / iOS /
+//     Android sharing one WeChat 网站应用 registration).
+//
+// All Yunhou consumer apps that want cross-app unionid unification MUST
+// register their 网站应用 under the SAME 微信开放平台 account — this is a
+// Tencent-side requirement, not enforced in code.
+type WeChatOAuthConfig struct {
+	AppID        string   `json:"app_id"`
+	AppSecret    string   `json:"app_secret"`
 	CallbackURLs []string `json:"callback_urls"`
 }

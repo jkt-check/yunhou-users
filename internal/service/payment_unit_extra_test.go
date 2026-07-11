@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,6 +148,130 @@ func newPaymentServiceForLookup(orderRepo repo.OrderRepo, paymentRepo repo.Payme
 		&stubRefundAPI{},
 		0,
 	)
+}
+
+// stubPlanRepo satisfies repo.PlanRepo with a single active plan for CreateOrder.
+type stubPlanRepo struct {
+	plan *model.Plan
+	err  error
+}
+
+func (s *stubPlanRepo) FindAll(_ context.Context) ([]model.Plan, error) { return nil, nil }
+func (s *stubPlanRepo) FindByID(_ context.Context, id string) (*model.Plan, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.plan == nil {
+		return nil, sql.ErrNoRows
+	}
+	return s.plan, nil
+}
+func (s *stubPlanRepo) FindByApp(_ context.Context, _ string) ([]model.Plan, error) { return nil, nil }
+func (s *stubPlanRepo) FindDefault(_ context.Context) (*model.Plan, error) { return nil, nil }
+func (s *stubPlanRepo) Create(_ context.Context, _ *model.Plan) error { return nil }
+func (s *stubPlanRepo) Update(_ context.Context, _ *model.Plan) error { return nil }
+func (s *stubPlanRepo) Delete(_ context.Context, _ string) error { return nil }
+
+// stubSubRepo satisfies repo.SubscriptionRepo with configurable FindActiveByUserID error.
+type stubSubRepo struct {
+	activeSub *model.Subscription
+	findErr   error
+}
+
+func (s *stubSubRepo) Create(_ context.Context, _ *model.Subscription) error { return nil }
+func (s *stubSubRepo) FindActiveByUserID(_ context.Context, _ string) (*model.Subscription, error) {
+	if s.findErr != nil {
+		return nil, s.findErr
+	}
+	if s.activeSub == nil {
+		return nil, sql.ErrNoRows
+	}
+	return s.activeSub, nil
+}
+func (s *stubSubRepo) FindByID(_ context.Context, _ string) (*model.Subscription, error) { return nil, nil }
+func (s *stubSubRepo) ListByUserID(_ context.Context, _ string) ([]model.Subscription, error) { return nil, nil }
+func (s *stubSubRepo) UpdateStatus(_ context.Context, _ string, _ string) error { return nil }
+func (s *stubSubRepo) Renew(_ context.Context, _ string, _ *time.Time) error { return nil }
+
+// ============================================================================
+// CreateOrder — subRepo error branch
+// ============================================================================
+
+func TestPaymentService_Unit_CreateOrder_SubRepoError(t *testing.T) {
+	t.Parallel()
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		&stubOrderRepoLookup{},
+		nil, nil,
+		&stubSubRepo{findErr: errors.New("db connection lost")},
+		&stubPlanRepo{plan: &model.Plan{ID: "monthly", IsActive: true}},
+		nil, nil, nil,
+		&stubRefundAPI{},
+		0,
+	)
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly")
+	if err == nil {
+		t.Fatal("expected error from subRepo.FindActiveByUserID")
+	}
+	if !strings.Contains(err.Error(), "check active sub") {
+		t.Errorf("expected 'check active sub' error, got: %v", err)
+	}
+}
+
+func TestPaymentService_Unit_CreateOrder_PlanNotFound(t *testing.T) {
+	t.Parallel()
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		&stubOrderRepoLookup{},
+		nil, nil,
+		&stubSubRepo{},
+		&stubPlanRepo{err: sql.ErrNoRows},
+		nil, nil, nil,
+		&stubRefundAPI{},
+		0,
+	)
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly")
+	if !errors.Is(err, ErrPlanNotFound) {
+		t.Errorf("expected ErrPlanNotFound, got %v", err)
+	}
+}
+
+func TestPaymentService_Unit_CreateOrder_PlanInactive(t *testing.T) {
+	t.Parallel()
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		&stubOrderRepoLookup{},
+		nil, nil,
+		&stubSubRepo{},
+		&stubPlanRepo{plan: &model.Plan{ID: "monthly", IsActive: false}},
+		nil, nil, nil,
+		&stubRefundAPI{},
+		0,
+	)
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly")
+	if !errors.Is(err, ErrPlanInactive) {
+		t.Errorf("expected ErrPlanInactive, got %v", err)
+	}
+}
+
+// ============================================================================
+// CancelOrder — re-read error branch
+// ============================================================================
+
+func TestPaymentService_Unit_CancelOrder_ReReadError(t *testing.T) {
+	t.Parallel()
+	orderRepo := &stubOrderRepoLookup{
+		cancelOK:  false,        // triggers re-read path
+		findErr:   errors.New("db connection lost"), // non-ErrNoRows error on re-read
+	}
+	svc := newPaymentServiceForLookup(orderRepo, nil, nil)
+	err := svc.CancelOrder(context.Background(), "ord_1", "u_1")
+	if err == nil {
+		t.Fatal("expected error from re-read")
+	}
+	if !strings.Contains(err.Error(), "re-read order") {
+		t.Errorf("expected 're-read order' error, got: %v", err)
+	}
 }
 
 // ============================================================================

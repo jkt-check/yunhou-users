@@ -450,23 +450,30 @@ var paypalVerifyCache sync.Map // map[paypalVerifyCacheKey]paypalVerifyCacheEntr
 // The janitor runs until process exit; the runtime runs a final cleanup on
 // each cache hit via lookupVerifyCache, so a missed janitor tick only costs
 // a bit of memory until the next hit.
+// startPaypalVerifyCacheJanitor launches the janitor goroutine that runs
+// for the lifetime of the process. Extracted from the per-tick body so tests
+// can drive runPaypalVerifyCacheJanitor with a synthetic channel without
+// waiting 5 minutes per tick.
 func startPaypalVerifyCacheJanitor() {
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for now := range ticker.C {
-			paypalVerifyCache.Range(func(k, v any) bool {
-				entry, ok := v.(paypalVerifyCacheEntry)
-				if !ok {
-					return true
-				}
-				if !now.Before(entry.expiresAt) {
-					paypalVerifyCache.Delete(k)
-				}
+	go runPaypalVerifyCacheJanitor(time.NewTicker(5 * time.Minute).C)
+}
+
+// runPaypalVerifyCacheJanitor processes one deletion pass per tick. Closes
+// naturally when the channel drains / is closed. Production wires this to
+// time.NewTicker; tests pass a buffered channel they close after one tick.
+func runPaypalVerifyCacheJanitor(tickC <-chan time.Time) {
+	for now := range tickC {
+		paypalVerifyCache.Range(func(k, v any) bool {
+			entry, ok := v.(paypalVerifyCacheEntry)
+			if !ok {
 				return true
-			})
-		}
-	}()
+			}
+			if !now.Before(entry.expiresAt) {
+				paypalVerifyCache.Delete(k)
+			}
+			return true
+		})
+	}
 }
 
 func init() { startPaypalVerifyCacheJanitor() }

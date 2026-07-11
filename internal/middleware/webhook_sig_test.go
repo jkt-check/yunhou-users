@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -19,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -697,14 +699,21 @@ func alipayCanonicalForTest(t *testing.T, body string) string {
 			}
 		}
 	}
-	// Rebuild with sorted keys + original values.
+	// Rebuild with sorted keys + values, URL-decoded first (matching what
+	// the verifier does via url.ParseQuery). Without this, spaces and other
+	// percent-encoded chars would be double-encoded by alipayURLEncode and
+	// the helper's canonical string wouldn't match the verifier's.
 	valueByKey := map[string]string{}
 	for _, p := range parts {
 		eq := strings.IndexByte(p, '=')
 		if eq < 0 {
 			valueByKey[p] = ""
 		} else {
-			valueByKey[p[:eq]] = p[eq+1:]
+			if decoded, err := url.QueryUnescape(p[eq+1:]); err == nil {
+				valueByKey[p[:eq]] = decoded
+			} else {
+				valueByKey[p[:eq]] = p[eq+1:]
+			}
 		}
 	}
 	out := make([]string, 0, len(keys))
@@ -1042,5 +1051,391 @@ func TestClearPaypalVerifyCache_EmptiesEntries(t *testing.T) {
 	})
 	if count != 0 {
 		t.Errorf("expected cache to be empty after Clear, got %d entries", count)
+	}
+}
+
+// ============================================================================
+// WeChat DecryptResource / VerifySignature error paths
+// ============================================================================
+
+// TestWeChatPayV3_DecryptResource_BadBase64 covers the base64-decode failure
+// branch (line 235). The GCM layer never gets a chance to run because the
+// ciphertext isn't valid base64 to begin with.
+func TestWeChatPayV3_DecryptResource_BadBase64(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	_, err := v.DecryptResource("!!!not-base64!!!", "nonce_123456", "aad")
+	if err == nil {
+		t.Fatal("invalid base64 should error")
+	}
+	if !strings.Contains(err.Error(), "base64 decode") {
+		t.Errorf("expected base64-decode error, got %v", err)
+	}
+}
+
+// TestWeChatPayV3_DecryptResource_BadKeyLength covers the cipher-construction
+// failure paths when the configured key isn't 16/24/32 bytes (line 239 + 243).
+func TestWeChatPayV3_DecryptResource_BadKeyLength(t *testing.T) {
+	t.Parallel()
+	ct := base64.StdEncoding.EncodeToString([]byte("x"))
+	cases := []int{1, 8, 15, 17, 31, 33, 64}
+	for _, n := range cases {
+		key := bytes.Repeat([]byte("k"), n)
+		v := &WeChatPayV3Verifier{APIv3Key: key}
+		_, err := v.DecryptResource(ct, "nonce_123456", "aad")
+		if err == nil {
+			t.Errorf("key length %d: expected error", n)
+		}
+	}
+}
+
+// TestWeChatPayV3_VerifySignature_MissingHeaders covers the sentinel-return
+// path when one or more required headers (sig/ts/nonce) are empty.
+func TestWeChatPayV3_VerifySignature_MissingHeaders(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	cases := map[string]map[string]string{
+		"missing sig":   {"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10), "Wechatpay-Nonce": "n"},
+		"missing ts":    {"Wechatpay-Signature": "x", "Wechatpay-Nonce": "n"},
+		"missing nonce": {"Wechatpay-Signature": "x", "Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10)},
+	}
+	for name, hdr := range cases {
+		hdr := hdr
+		t.Run(name, func(t *testing.T) {
+			if err := v.VerifySignature("wechat_pay", []byte("{}"), hdr); !errors.Is(err, ErrInvalidSignature) {
+				t.Errorf("expected ErrInvalidSignature, got %v", err)
+			}
+		})
+	}
+}
+
+// TestWeChatPayV3_VerifySignature_BadTimestamp covers the strconv error branch
+// when the timestamp header doesn't parse as int.
+func TestWeChatPayV3_VerifySignature_BadTimestamp(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	headers := map[string]string{
+		"Wechatpay-Signature": base64.StdEncoding.EncodeToString([]byte("x")),
+		"Wechatpay-Timestamp": "NaN",
+		"Wechatpay-Nonce":     "n",
+	}
+	err := v.VerifySignature("wechat_pay", []byte("{}"), headers)
+	if !errors.Is(err, ErrInvalidSignature) || !strings.Contains(err.Error(), "bad timestamp") {
+		t.Errorf("expected ErrInvalidSignature/bad-timestamp, got %v", err)
+	}
+}
+
+// TestWeChatPayV3_VerifySignature_ReplayWindowOut covers the timestamp-
+// outside-window branch.
+func TestWeChatPayV3_VerifySignature_ReplayWindowOut(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	tsStr := strconv.FormatInt(time.Now().Add(-1*time.Hour).Unix(), 10)
+	headers := map[string]string{
+		"Wechatpay-Signature": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		"Wechatpay-Timestamp": tsStr,
+		"Wechatpay-Nonce":     "n",
+	}
+	if err := v.VerifySignature("wechat_pay", []byte("{}"), headers); !errors.Is(err, ErrTimestampOutOfRange) {
+		t.Errorf("expected ErrTimestampOutOfRange, got %v", err)
+	}
+}
+
+// TestWeChatPayV3_VerifySignature_BadBase64Sig covers the base64-decode
+// failure on the signature header.
+func TestWeChatPayV3_VerifySignature_BadBase64Sig(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	headers := map[string]string{
+		"Wechatpay-Signature": "!!!not-base64!!!",
+		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
+		"Wechatpay-Nonce":     "n",
+	}
+	err := v.VerifySignature("wechat_pay", []byte("{}"), headers)
+	if !errors.Is(err, ErrInvalidSignature) || !strings.Contains(err.Error(), "bad base64") {
+		t.Errorf("expected ErrInvalidSignature/bad-base64, got %v", err)
+	}
+}
+
+// TestWeChatPayV3_VerifySignature_HMACMismatch covers the final equality-fail
+// path when the signature decoded successfully but didn't match the recomputed
+// HMAC.
+func TestWeChatPayV3_VerifySignature_HMACMismatch(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	headers := map[string]string{
+		"Wechatpay-Signature": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAA}, 32)),
+		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
+		"Wechatpay-Nonce":     "n",
+	}
+	if err := v.VerifySignature("wechat_pay", []byte("{}"), headers); !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature on HMAC mismatch, got %v", err)
+	}
+}
+
+// ============================================================================
+// AlipayVerifier — error / edge paths
+// ============================================================================
+
+// TestAlipayVerifier_BadFormBody covers the url.ParseQuery failure branch —
+// the body must be syntactically valid application/x-www-form-urlencoded.
+func TestAlipayVerifier_BadFormBody(t *testing.T) {
+	t.Parallel()
+	_, pub := rsaTestKey(t)
+	v := &AlipayVerifier{PublicKey: pub}
+	// "%ZZ" is invalid percent-encoding — ParseQuery rejects it.
+	if err := v.VerifySignature("alipay", []byte("%ZZ"), nil); !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature for bad form body, got %v", err)
+	}
+}
+
+// TestAlipayVerifier_MissingSign covers the empty-sign branch (no sign field
+// at all in the form body).
+func TestAlipayVerifier_MissingSign(t *testing.T) {
+	t.Parallel()
+	_, pub := rsaTestKey(t)
+	v := &AlipayVerifier{PublicKey: pub}
+	body := "out_trade_no=order_1&total_amount=29.90"
+	if err := v.VerifySignature("alipay", []byte(body), nil); !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature when sign is missing, got %v", err)
+	}
+}
+
+// TestAlipayVerifier_DefaultSignType covers the "sign_type omitted" branch —
+// the verifier must default to RSA2. We supply a valid RSA2 signature but
+// omit sign_type so the default kicks in.
+func TestAlipayVerifier_DefaultSignType(t *testing.T) {
+	t.Parallel()
+	priv, pub := rsaTestKey(t)
+	body := "out_trade_no=order_1&total_amount=29.90"
+	canonical := alipayCanonicalForTest(t, body)
+	hashed := sha256.Sum256([]byte(canonical))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hashed[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB64 := base64.StdEncoding.EncodeToString(sig)
+	bodySigned := body + "&sign=" + urlEncodeFormValue(sigB64) // no sign_type
+
+	v := &AlipayVerifier{PublicKey: pub, ReplayWindow: 0}
+	if err := v.VerifySignature("alipay", []byte(bodySigned), nil); err != nil {
+		t.Errorf("default-sign-type RSA2 should succeed, got %v", err)
+	}
+}
+
+// TestAlipayVerifier_BadBase64Sig covers the base64-decode failure path on
+// the sign value.
+func TestAlipayVerifier_BadBase64Sig(t *testing.T) {
+	t.Parallel()
+	_, pub := rsaTestKey(t)
+	v := &AlipayVerifier{PublicKey: pub}
+	body := "out_trade_no=order_1&total_amount=29.90&sign=!!!not-base64!!!&sign_type=RSA2"
+	if err := v.VerifySignature("alipay", []byte(body), nil); !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature on bad base64 sign, got %v", err)
+	}
+}
+
+// TestAlipayVerifier_ReplayWindowFreshNotify covers the notify_time in-range
+// case (verifier accepts) so the replay-window delta calc is exercised.
+func TestAlipayVerifier_ReplayWindowFreshNotify(t *testing.T) {
+	t.Parallel()
+	priv, pub := rsaTestKey(t)
+	body := "out_trade_no=order_1&notify_time=" + urlEncodeFormValue(time.Now().In(
+		time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"))
+	canonical := alipayCanonicalForTest(t, body)
+	hashed := sha256.Sum256([]byte(canonical))
+	sig, _ := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hashed[:])
+	sigB64 := base64.StdEncoding.EncodeToString(sig)
+	bodySigned := body + "&sign=" + urlEncodeFormValue(sigB64) + "&sign_type=RSA2"
+
+	v := &AlipayVerifier{PublicKey: pub}
+	if err := v.VerifySignature("alipay", []byte(bodySigned), nil); err != nil {
+		t.Errorf("fresh notify_time should accept, got %v", err)
+	}
+}
+
+// TestAlipayVerifier_ReplayWindowExpiredNotify covers the notify_time
+// out-of-window path. We send a notify_time well in the past so the delta
+// exceeds the 5-minute replay window.
+func TestAlipayVerifier_ReplayWindowExpiredNotify(t *testing.T) {
+	t.Parallel()
+	priv, pub := rsaTestKey(t)
+	past := time.Now().Add(-24 * time.Hour).In(time.FixedZone("CST", 8*3600))
+	notify := past.Format("2006-01-02 15:04:05")
+	body := "out_trade_no=order_1&notify_time=" + urlEncodeFormValue(notify)
+	canonical := alipayCanonicalForTest(t, body)
+	hashed := sha256.Sum256([]byte(canonical))
+	sig, _ := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hashed[:])
+	sigB64 := base64.StdEncoding.EncodeToString(sig)
+	bodySigned := body + "&sign=" + urlEncodeFormValue(sigB64) + "&sign_type=RSA2"
+
+	v := &AlipayVerifier{PublicKey: pub}
+	if err := v.VerifySignature("alipay", []byte(bodySigned), nil); !errors.Is(err, ErrTimestampOutOfRange) {
+		t.Errorf("expected ErrTimestampOutOfRange for expired notify_time, got %v", err)
+	}
+}
+
+// TestAlipayVerifier_GarbledNotifyTime covers the time-parse failure path.
+// An unparseable notify_time MUST NOT prevent signature verification — the
+// timestamp is informational, not the source of truth (that's HMAC).
+func TestAlipayVerifier_GarbledNotifyTime(t *testing.T) {
+	t.Parallel()
+	priv, pub := rsaTestKey(t)
+	body := "out_trade_no=order_1&notify_time=garbage"
+	canonical := alipayCanonicalForTest(t, body)
+	hashed := sha256.Sum256([]byte(canonical))
+	sig, _ := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hashed[:])
+	sigB64 := base64.StdEncoding.EncodeToString(sig)
+	bodySigned := body + "&sign=" + urlEncodeFormValue(sigB64) + "&sign_type=RSA2"
+
+	v := &AlipayVerifier{PublicKey: pub}
+	if err := v.VerifySignature("alipay", []byte(bodySigned), nil); err != nil {
+		t.Errorf("garbled notify_time should still accept valid signature, got %v", err)
+	}
+}
+
+// ============================================================================
+// LoadAlipayPublicKeyFromPEM — non-PEM input + PKCS#1 fallback
+// ============================================================================
+
+// TestLoadAlipayPublicKeyFromPEM_NotPEM covers the empty-PEM-block branch
+// when the input isn't valid PEM at all.
+func TestLoadAlipayPublicKeyFromPEM_NotPEM(t *testing.T) {
+	t.Parallel()
+	if _, err := LoadAlipayPublicKeyFromPEM([]byte("not a pem block")); err == nil {
+		t.Error("non-PEM input should error")
+	}
+}
+
+// TestLoadAlipayPublicKeyFromPEM_PKCS1Fallback covers the PKCS#1 fallback
+// path (PKIX parse fails → PKCS#1 succeeds). We marshal a public key with
+// x509.MarshalPKCS1PublicKey and feed it as a "RSA PUBLIC KEY" PEM block.
+func TestLoadAlipayPublicKeyFromPEM_PKCS1Fallback(t *testing.T) {
+	t.Parallel()
+	priv, _ := rsaTestKey(t)
+	der := x509.MarshalPKCS1PublicKey(&priv.PublicKey)
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PUBLIC KEY", Bytes: der})
+
+	pub, err := LoadAlipayPublicKeyFromPEM(pemBytes)
+	if err != nil {
+		t.Fatalf("PKCS#1 PEM should load via fallback: %v", err)
+	}
+	if pub.N.Cmp(priv.PublicKey.N) != 0 {
+		t.Error("loaded pubkey does not match original")
+	}
+}
+
+// TestLoadAlipayPublicKeyFromPEM_NonRSA covers the "decoded OK as some key
+// type but not RSA" branch.
+func TestLoadAlipayPublicKeyFromPEM_NonRSA(t *testing.T) {
+	t.Parallel()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Encode an ed25519 public key with a "PUBLIC KEY" PEM header. PKIX
+	// decode will succeed, but the type assertion to *rsa.PublicKey fails.
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+	if _, err := LoadAlipayPublicKeyFromPEM(pemBytes); err == nil {
+		t.Error("ed25519 PEM should not parse as RSA")
+	}
+}
+
+// TestLoadAlipayPublicKeyFromPEM_BothParsersFail covers the final fallback
+// error when neither PKIX nor PKCS#1 succeed (random bytes).
+func TestLoadAlipayPublicKeyFromPEM_BothParsersFail(t *testing.T) {
+	t.Parallel()
+	garbage := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: []byte("definitely not a der key")})
+	if _, err := LoadAlipayPublicKeyFromPEM(garbage); err == nil {
+		t.Error("garbage PEM should error")
+	}
+}
+
+// ============================================================================
+// runPaypalVerifyCacheJanitor — synthetic-channel driver for the 5-min tick
+// ============================================================================
+
+// TestRunPaypalVerifyCacheJanitor_DeletesExpired covers the body of the
+// janitor using a synthetic channel. startPaypalVerifyCacheJanitor spawns
+// the real one (5 min cadence); this exercises the same loop body with a
+// 1-tick channel and verifies it deletes only-expired entries.
+func TestRunPaypalVerifyCacheJanitor_DeletesExpired(t *testing.T) {
+	resetPaypalVerifyCache(t)
+	keep := paypalVerifyCacheKey{transmissionID: "keep", transmissionTime: "2026-01-01T00:00:00Z"}
+	drop := paypalVerifyCacheKey{transmissionID: "drop", transmissionTime: "2026-01-01T00:00:01Z"}
+	// "now" is well past drop.expiresAt, before keep.expiresAt.
+	now := time.Now()
+	paypalVerifyCache.Store(keep, paypalVerifyCacheEntry{status: "SUCCESS", expiresAt: now.Add(time.Hour)})
+	paypalVerifyCache.Store(drop, paypalVerifyCacheEntry{status: "SUCCESS", expiresAt: now.Add(-time.Minute)})
+	// Seed a wrong-type value too so the type-assert-fail branch executes.
+	paypalVerifyCache.Store(paypalVerifyCacheKey{transmissionID: "bad-type", transmissionTime: "x"}, "not-a-cache-entry")
+
+	tickC := make(chan time.Time, 1)
+	tickC <- now
+	close(tickC)
+	runPaypalVerifyCacheJanitor(tickC)
+
+	if _, ok := paypalVerifyCache.Load(keep); !ok {
+		t.Error("non-expired entry should survive")
+	}
+	if _, ok := paypalVerifyCache.Load(drop); ok {
+		t.Error("expired entry should be deleted")
+	}
+	// Wrong-type entry is silently skipped, not deleted.
+	if _, ok := paypalVerifyCache.Load(paypalVerifyCacheKey{transmissionID: "bad-type", transmissionTime: "x"}); !ok {
+		t.Error("wrong-type entry should be skipped, not deleted")
+	}
+}
+
+// ============================================================================
+// readAndRestoreBody — explicit read error path
+// ============================================================================
+
+// TestReadAndRestoreBody_ReadError covers the io.ReadAll error branch by
+// feeding in a body that errors immediately. We use a reader that always
+// returns an error to make ReadAll fail after the size check.
+type errBody struct{}
+
+func (errBody) Read(_ []byte) (int, error) { return 0, fmt.Errorf("synthetic read failure") }
+
+func TestReadAndRestoreBody_ReadError(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	req := httptest.NewRequest(http.MethodPost, "/x", errBody{})
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+	if _, err := readAndRestoreBody(c); err == nil {
+		t.Fatal("expected error from failing body reader")
+	}
+}
+
+// ============================================================================
+// Stripe — wrap-on-parse-error branch in VerifySignature
+// ============================================================================
+
+// TestStripeVerifier_ParseErrorWrapped covers the path where
+// parseStripeSignatureHeader returns an error and VerifySignature wraps it
+// with ErrInvalidSignature.
+func TestStripeVerifier_ParseErrorWrapped(t *testing.T) {
+	t.Parallel()
+	v := &StripeVerifier{Secret: []byte("k")}
+	// "v1=deadbeef" is missing t → parseStripeSignatureHeader returns error.
+	err := v.VerifySignature("stripe", []byte("{}"), map[string]string{"Stripe-Signature": "v1=deadbeef"})
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature wrapped, got %v", err)
+	}
+}
+
+// TestStripeVerifier_EmptySigHeader covers the empty-header branch (line 148).
+func TestStripeVerifier_EmptySigHeader(t *testing.T) {
+	t.Parallel()
+	v := &StripeVerifier{Secret: []byte("k")}
+	if err := v.VerifySignature("stripe", []byte("{}"), map[string]string{}); !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature on empty sig header, got %v", err)
 	}
 }

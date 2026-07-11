@@ -20,13 +20,13 @@ func buildCallbackRedirectURL(base string, resp *service.LoginResponse) string {
 	if err != nil {
 		return base
 	}
-	fragment := url.Values{}
 	if resp == nil {
 		// Empty response — still emit the # marker so the BFF's
 		// client-side handler can route on "is there a token".
 		s := u.String()
 		return s + "#"
 	}
+	fragment := url.Values{}
 	if resp.AccessToken != "" {
 		fragment.Set("token", resp.AccessToken)
 	}
@@ -45,4 +45,36 @@ func buildCallbackRedirectURL(base string, resp *service.LoginResponse) string {
 	}
 	u.Fragment = fragment.Encode()
 	return u.String()
+}
+
+// redirectWithFragment attaches a url.Values-encoded fragment to base.
+// Lower-level primitive than buildCallbackRedirectURL — used by the
+// OAuth error and denial paths (provider error_param, upstream
+// failure, missing unionid, AuthService rejection) to surface a small
+// set of error/reason params to the BFF without leaking anything into
+// the query string. Goes through url.Parse so badly-formed bases are
+// returned as-is instead of producing "<base>#key=value" by string
+// concatenation (which would mis-separate an existing query string).
+func redirectWithFragment(base string, fragment url.Values) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	u.Fragment = fragment.Encode()
+	return u.String()
+}
+
+// redirectWithErrorFragment is the convenience form used by the
+// post-login error paths (exchange upstream failure, profile fetch
+// failure, AuthService rejection): builds a fragment with
+// `error=<errCode>&reason=<reason>` and returns the BFF redirect URL.
+// Used by /auth/wechat/callback sites that surface a Yunhou-mapped
+// reason to the BFF; the GitHub callback uses inline
+// `target.Fragment = frag.Encode()` instead because its error vocabulary
+// diverges.
+func redirectWithErrorFragment(base, errCode, reason string) string {
+	frag := url.Values{}
+	frag.Set("error", errCode)
+	frag.Set("reason", reason)
+	return redirectWithFragment(base, frag)
 }

@@ -431,3 +431,101 @@ func mustExtractQueryValue(t *testing.T, raw, key string) string {
 	}
 	return v
 }
+
+// TestWeChatOAuth_Callback_WeChatErrorParam_MultiBFF asserts that when
+// an app registers multiple callback URLs (web + iOS + Android sharing
+// one WeChat 网站应用), the provider's `?error=...` branch routes the
+// error fragment to the BFF the user STARTED FROM, not to the first
+// entry. State was issued for callback index 1 (mobile); the error
+// branch must 302 to cfg.CallbackURLs[1], not [0]. Catches the
+// regression where the ghErr branch discarded the verified idx and
+// hard-coded [0].
+func TestWeChatOAuth_Callback_WeChatErrorParam_MultiBFF(t *testing.T) {
+	installWeChatFixedClock(t)
+	webCB := "https://bff.example.com/auth/wechat-callback"
+	mobileCB := "https://mobile.example.com/auth/wechat-callback"
+	svc := service.NewWeChatOAuthService("01234567890123456789012345678901")
+
+	// Issue the state for the MOBILE callback (index 1) so the test
+	// requires the handler to honour the verified idx rather than
+	// falling back to index 0.
+	cfg := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "01234567890123456789012345678901",
+		CallbackURLs: []string{webCB, mobileCB},
+	}
+	authURL, err := svc.BuildAuthorizeURL("yundian", cfg, 1, wechatTestClock())
+	if err != nil {
+		t.Fatalf("BuildAuthorizeURL: %v", err)
+	}
+	state := mustExtractQueryValue(t, authURL, "state")
+
+	appRepo := &stubAppLoader{app: wechatAppWithOAuth(webCB, mobileCB)}
+	authSvc := &stubAuthSvc{}
+	r := gin.New()
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"/auth/wechat/callback?app_id=yundian&error=access_denied&error_description=user+denied&state="+state,
+		nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302; body=%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, mobileCB+"#") {
+		t.Fatalf("location = %q, want prefix %s# (mobile BFF, NOT web)", loc, mobileCB)
+	}
+	if strings.HasPrefix(loc, webCB+"#") {
+		t.Errorf("location = %q routed to web BFF; must use cfg.CallbackURLs[verified idx]", loc)
+	}
+	if !strings.Contains(loc, "error=access_denied") {
+		t.Errorf("location missing error=access_denied fragment: %s", loc)
+	}
+}
+
+// TestWeChatOAuth_Callback_UpstreamErrcode_FragmentFormat locks in
+// the canonical fragment shape (no leading `&`) for the post-login
+// error redirect. The earlier code assembled
+//
+//	buildCallbackRedirectURL(base, nil) + "&" + "error=..."
+//
+// which produced "<base>#&error=..." — the leading `&` is a parser
+// trap and was the same shape across all four call sites. The fix
+// introduced redirectWithErrorFragment / redirectWithFragment
+// helpers; this test asserts the redirect URL starts with "<base>#"
+// rather than "<base>#&".
+func TestWeChatOAuth_Callback_UpstreamErrcode_FragmentFormat(t *testing.T) {
+	installWeChatFixedClock(t)
+	cbURL := "https://bff.example.com/auth/wechat-callback"
+	svc, cleanup := newWeChatStubService(t,
+		`{"errcode":40029,"errmsg":"invalid code"}`,
+		``,
+	)
+	defer cleanup()
+
+	appRepo := &stubAppLoader{app: wechatAppWithOAuth(cbURL)}
+	authSvc := &stubAuthSvc{}
+	r := gin.New()
+	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"), svc, appRepo, authSvc)
+
+	uri := wechatCallbackURIFor(t, svc, "yundian", cbURL)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, uri, nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302; body=%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	// Canonical fragment starts immediately with the first param,
+	// not a leading `&` that breaks BFF-side parsing.
+	if !strings.HasPrefix(loc, cbURL+"#error=") {
+		t.Fatalf("location = %q, want prefix %q (no leading &)", loc, cbURL+"#error=")
+	}
+	if strings.Contains(loc, "#&") {
+		t.Errorf("location = %q contains leading-`&` fragment bug", loc)
+	}
+}

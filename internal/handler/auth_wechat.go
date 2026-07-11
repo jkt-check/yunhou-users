@@ -130,17 +130,16 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 		state := c.Query("state")
 		appID := c.Query("app_id")
 		if state != "" && appID != "" {
-			if _, err := d.svc.VerifyCallbackState(state, appID, wechatOAuthClock()); err == nil {
+			if idx, err := d.svc.VerifyCallbackState(state, appID, wechatOAuthClock()); err == nil {
 				if app, err := d.appRepo.FindByID(c.Request.Context(), appID); err == nil {
 					cfg, _, lerr := lookupWeChatConfig(app, "")
-					if lerr == nil && len(cfg.CallbackURLs) > 0 {
-						redirect := cfg.CallbackURLs[0]
+					if lerr == nil && idx >= 0 && idx < len(cfg.CallbackURLs) {
 						frag := url.Values{}
 						frag.Set("error", ghErr)
 						if ghErrDesc != "" {
 							frag.Set("error_description", ghErrDesc)
 						}
-						c.Redirect(http.StatusFound, buildCallbackRedirectURL(redirect, nil)+"&"+frag.Encode())
+						c.Redirect(http.StatusFound, redirectWithFragment(cfg.CallbackURLs[idx], frag))
 						return
 					}
 				}
@@ -158,8 +157,12 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 		return
 	}
 
-	// First verify: gate on signature + expiry.
-	if _, err := d.svc.VerifyCallbackState(state, appID, wechatOAuthClock()); err != nil {
+	// Verify state once and reuse the verified index below. A second
+	// verify call would re-run the HMAC + nonce lookup for nothing
+	// (and can disagree across the expiry boundary because the two
+	// reads of wechatOAuthClock() see slightly different times).
+	verifiedIdx, err := d.svc.VerifyCallbackState(state, appID, wechatOAuthClock())
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid state"})
 		return
 	}
@@ -180,11 +183,12 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 		return
 	}
 
-	// Pick the verified callback URL from state so the BFF's
-	// redirect_uri matches what WeChat registered.
-	verifiedIdx, verr := d.svc.VerifyCallbackState(state, appID, wechatOAuthClock())
-	if verr != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid state index"})
+	// Bounds-check before indexing. An operator can shorten the
+	// callback_urls list between state-issue and callback; the state
+	// token's index would then be out of range, and a bare indexing
+	// would panic the request. Mirrors auth_github.go:204-206.
+	if verifiedIdx < 0 || verifiedIdx >= len(cfg.CallbackURLs) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid callback index"})
 		return
 	}
 	redirectURI := cfg.CallbackURLs[verifiedIdx]
@@ -192,7 +196,7 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 	tok, err := d.svc.ExchangeCode(c.Request.Context(), cfg, code, redirectURI)
 	if err != nil {
 		if errors.Is(err, service.ErrWeChatUpstream) {
-			c.Redirect(http.StatusFound, buildCallbackRedirectURL(redirectURI, nil)+"&error=auth_failed&reason=wechat_upstream")
+			c.Redirect(http.StatusFound, redirectWithErrorFragment(redirectURI, "auth_failed", "wechat_upstream"))
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "exchange code"})
@@ -202,11 +206,11 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 	profile, err := d.svc.FetchWeChatProfile(c.Request.Context(), tok.AccessToken, tok.OpenID)
 	if err != nil {
 		if errors.Is(err, service.ErrWeChatNoUnionID) {
-			c.Redirect(http.StatusFound, buildCallbackRedirectURL(redirectURI, nil)+"&error=auth_failed&reason=wechat_no_unionid")
+			c.Redirect(http.StatusFound, redirectWithErrorFragment(redirectURI, "auth_failed", "wechat_no_unionid"))
 			return
 		}
 		if errors.Is(err, service.ErrWeChatUpstream) {
-			c.Redirect(http.StatusFound, buildCallbackRedirectURL(redirectURI, nil)+"&error=auth_failed&reason=wechat_upstream")
+			c.Redirect(http.StatusFound, redirectWithErrorFragment(redirectURI, "auth_failed", "wechat_upstream"))
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "fetch profile"})
@@ -219,7 +223,7 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 	})
 	if err != nil {
 		if isExpectedAuthErr(err) {
-			c.Redirect(http.StatusFound, buildCallbackRedirectURL(redirectURI, nil)+"&error=auth_failed&reason="+url.QueryEscape(authErrReason(err)))
+			c.Redirect(http.StatusFound, redirectWithErrorFragment(redirectURI, "auth_failed", authErrReason(err)))
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "login"})

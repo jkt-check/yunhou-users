@@ -57,9 +57,9 @@ type WeChatOAuthService struct {
 func NewWeChatOAuthService(stateSecret string) *WeChatOAuthService {
 	return &WeChatOAuthService{
 		stateSecret:    []byte(stateSecret),
-		authorizeURL:   "https://open.weixin.qq.com/connect/qrconnect",
-		accessTokenURL: "https://api.weixin.qq.com/sns/oauth2/access_token",
-		userInfoURL:    "https://api.weixin.qq.com/sns/userinfo",
+		authorizeURL:   wechatAuthorizeURL,
+		accessTokenURL: wechatAccessTokenURL,
+		userInfoURL:    wechatUserInfoURL,
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
 	}
 }

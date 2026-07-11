@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 
@@ -58,5 +59,48 @@ func TestBuildCallbackRedirectURL_BadURL(t *testing.T) {
 	got := buildCallbackRedirectURL("://bad-url", resp)
 	if got != "://bad-url" {
 		t.Errorf("bad URL should be returned as-is, got %q", got)
+	}
+}
+
+func TestRedirectWithFragment_EncodesValues(t *testing.T) {
+	frag := url.Values{}
+	frag.Set("error", "auth_failed")
+	frag.Set("reason", "wechat_upstream")
+	got := redirectWithFragment("https://bff.example.com/cb", frag)
+	want := "https://bff.example.com/cb#error=auth_failed&reason=wechat_upstream"
+	if got != want {
+		t.Errorf("got = %q, want %q", got, want)
+	}
+}
+
+func TestRedirectWithFragment_BadURL(t *testing.T) {
+	frag := url.Values{}
+	frag.Set("error", "x")
+	got := redirectWithFragment("://bad-url", frag)
+	if got != "://bad-url" {
+		t.Errorf("bad URL should be returned as-is, got %q", got)
+	}
+}
+
+// TestRedirectWithFragment_NoLeadingAmpersand pins the contract that
+// the post-login error redirect produces the canonical fragment shape
+// (`<base>#error=...&reason=...`). The pre-fix code assembled
+// "buildCallbackRedirectURL(base, nil) + \"&\" + encoded", which
+// produced `<base>#&error=...` — the leading `&` is a parser trap.
+func TestRedirectWithFragment_NoLeadingAmpersand(t *testing.T) {
+	frag := url.Values{}
+	frag.Set("error", "auth_failed")
+	frag.Set("reason", "wechat_no_unionid")
+	got := redirectWithFragment("https://bff.example.com/cb", frag)
+	if strings.Contains(got, "#&") {
+		t.Errorf("got %q contains leading-`&` (the bug we're guarding against)", got)
+	}
+}
+
+func TestRedirectWithErrorFragment_BuildsAuthFailedShape(t *testing.T) {
+	got := redirectWithErrorFragment("https://bff.example.com/cb", "auth_failed", "user_suspended")
+	want := "https://bff.example.com/cb#error=auth_failed&reason=user_suspended"
+	if got != want {
+		t.Errorf("got = %q, want %q", got, want)
 	}
 }

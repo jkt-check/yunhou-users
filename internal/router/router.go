@@ -30,6 +30,7 @@ func Setup(
 	providerTokenSvc *service.ProviderTokenService,
 	quoteSvc *service.QuoteService,
 	githubOAuthSvc *service.GitHubOAuthService,
+	wechatOAuthSvc *service.WeChatOAuthService,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -55,6 +56,11 @@ func Setup(
 	// they sit behind the public limiter like the other /auth/* routes.
 	githubOAuthGroup := engine.Group("/auth/github", publicLimiter)
 	handler.RegisterGitHubOAuthRoutes(githubOAuthGroup, githubOAuthSvc, appRepo, authSvc, tokenSvc)
+	// WeChat OAuth redirect flow — same shape as GitHub. Both endpoints
+	// are public (no JWT — WeChat calls /callback directly); they sit
+	// behind the public limiter like the other /auth/* routes.
+	wechatOAuthGroup := engine.Group("/auth/wechat", publicLimiter)
+	handler.RegisterWeChatOAuthRoutes(wechatOAuthGroup, wechatOAuthSvc, appRepo, authSvc)
 	// Dev-only login endpoint for the L3 e2e-ui suite. Returns 404 unless
 	// PAYPAL_L3_E2E_MODE=1 is set; the env check is inside the handler.
 	engine.POST("/test/login", authHandler.TestLogin)

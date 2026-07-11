@@ -249,6 +249,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
+	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	// Cancellable context so rate-limit cleanup goroutines die at test end
 	// (see setupE2EServerWithVerifier for the full rationale).
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
@@ -257,7 +258,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, githubOAuthSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc)
 
 	return engine, nil, db
 }
@@ -472,6 +473,7 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
+	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	// Use a cancellable context so the rate-limit cleanup goroutines
 	// spawned by middleware.RateLimit die at test end — without this
 	// every setup leaks a goroutine and the test runner eventually
@@ -483,7 +485,7 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, githubOAuthSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc)
 
 	// Stash the private key in a closure-accessible holder so signing helpers
 	// can produce valid signatures. (We don't expose the priv directly to

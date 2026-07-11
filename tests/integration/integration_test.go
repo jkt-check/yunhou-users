@@ -140,9 +140,10 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	// pass nil for the webhook verifier/wechat-key and the two new v2 services so
 	// the wiring still compiles.
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
+	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
-		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, githubOAuthSvc)
+		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc)
 
 	return httptest.NewServer(engine)
 }

@@ -146,12 +146,13 @@ func main() {
 	sweeper.Start(rootCtx)
 
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
+	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 
 	router.Setup(rootCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
-		providerTokenSvc, quoteSvc, githubOAuthSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

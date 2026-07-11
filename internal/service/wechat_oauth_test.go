@@ -1,7 +1,11 @@
 package service
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
@@ -139,6 +143,114 @@ func extractWeChatState(t *testing.T, raw string) string {
 		t.Fatalf("parse: %v", err)
 	}
 	return parsed.Query().Get("state")
+}
+
+// --- ExchangeCode tests ------------------------------------------------
+
+func TestWeChatOAuthService_ExchangeCode_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		q := r.URL.Query()
+		if q.Get("appid") != "wx0123456789abcdef" {
+			t.Errorf("appid = %q", q.Get("appid"))
+		}
+		if q.Get("secret") != "0123456789abcdef0123456789abcdef" {
+			t.Errorf("secret mismatch")
+		}
+		if q.Get("code") != "auth-code" {
+			t.Errorf("code = %q", q.Get("code"))
+		}
+		if q.Get("grant_type") != "authorization_code" {
+			t.Errorf("grant_type = %q", q.Get("grant_type"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"AT","expires_in":7200,"refresh_token":"RT","openid":"oid","scope":"snsapi_login,snsapi_userinfo"}`)
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetAccessTokenURL(srv.URL)
+
+	cfg := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://bff.example.com/auth/wechat-callback"},
+	}
+	tok, err := svc.ExchangeCode(context.Background(), cfg, "auth-code", "https://bff.example.com/auth/wechat-callback")
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if tok.AccessToken != "AT" {
+		t.Errorf("AccessToken = %q", tok.AccessToken)
+	}
+	if tok.OpenID != "oid" {
+		t.Errorf("OpenID = %q", tok.OpenID)
+	}
+	if tok.RefreshToken != "RT" {
+		t.Errorf("RefreshToken = %q", tok.RefreshToken)
+	}
+}
+
+func TestWeChatOAuthService_ExchangeCode_UpstreamErrcode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"errcode":40029,"errmsg":"invalid code"}`)
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetAccessTokenURL(srv.URL)
+	cfg := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://bff.example.com/auth/wechat-callback"},
+	}
+	_, err := svc.ExchangeCode(context.Background(), cfg, "bad", "https://bff.example.com/auth/wechat-callback")
+	if !errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, want ErrWeChatUpstream", err)
+	}
+}
+
+func TestWeChatOAuthService_ExchangeCode_Non200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "boom")
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetAccessTokenURL(srv.URL)
+	cfg := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://bff.example.com/auth/wechat-callback"},
+	}
+	_, err := svc.ExchangeCode(context.Background(), cfg, "x", "https://bff.example.com/auth/wechat-callback")
+	if !errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, want ErrWeChatUpstream", err)
+	}
+}
+
+func TestWeChatOAuthService_ExchangeCode_EmptyAccessToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"expires_in":7200,"openid":"oid"}`)
+	}))
+	defer srv.Close()
+
+	svc := NewWeChatOAuthService(newWeChatTestSecret(t))
+	svc.SetAccessTokenURL(srv.URL)
+	cfg := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://bff.example.com/auth/wechat-callback"},
+	}
+	_, err := svc.ExchangeCode(context.Background(), cfg, "x", "https://bff.example.com/auth/wechat-callback")
+	if !errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, want ErrWeChatUpstream", err)
+	}
 }
 
 func TestWeChatOAuthService_VerifyCallbackState_Expired(t *testing.T) {

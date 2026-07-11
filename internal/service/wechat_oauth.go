@@ -1,8 +1,11 @@
 package service
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -128,4 +131,75 @@ func (s *WeChatOAuthService) BuildAuthorizeURL(appID string, cfg *model.WeChatOA
 // from our /auth/wechat/redirect handler. Returns callbackIndex.
 func (s *WeChatOAuthService) VerifyCallbackState(state, expectedAppID string, now time.Time) (int, error) {
 	return util.VerifyOAuthState(s.stateSecret, state, expectedAppID, now)
+}
+
+// wechatAccessToken is the parsed shape of /sns/oauth2/access_token's
+// success body. unionid is intentionally NOT included here — the handler
+// reads unionid from FetchWeChatProfile's response so there's a single
+// source of truth and a single missing-unionid sentinel path.
+type wechatAccessToken struct {
+	AccessToken  string `json:"access_token"`
+	ExpiresIn    int    `json:"expires_in"`
+	RefreshToken string `json:"refresh_token"`
+	OpenID       string `json:"openid"`
+	Scope        string `json:"scope"`
+}
+
+// ExchangeCode trades the auth code WeChat returned for an access token
+// + openid. WeChat's code-exchange endpoint is GET (not POST like
+// GitHub's). Returns the parsed token struct — caller is responsible for
+// using access_token immediately and not retaining it.
+func (s *WeChatOAuthService) ExchangeCode(ctx context.Context, cfg *model.WeChatOAuthConfig, code, redirectURI string) (*wechatAccessToken, error) {
+	if cfg == nil || cfg.AppID == "" || cfg.AppSecret == "" {
+		return nil, ErrWeChatNotConfigured
+	}
+	if code == "" {
+		return nil, errors.New("empty code")
+	}
+
+	q := url.Values{}
+	q.Set("appid", cfg.AppID)
+	q.Set("secret", cfg.AppSecret)
+	q.Set("code", code)
+	q.Set("grant_type", "authorization_code")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.accessTokenURL+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build access_token request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrWeChatUpstream, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%w: access_token endpoint returned %d", ErrWeChatUpstream, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read body: %v", ErrWeChatUpstream, err)
+	}
+
+	// Inspect for errcode BEFORE decoding as access_token — a 200 body
+	// with errcode is a failure, not a token.
+	var errResp struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	if err := json.Unmarshal(body, &errResp); err == nil && errResp.ErrCode != 0 {
+		return nil, fmt.Errorf("%w: errcode=%d errmsg=%s", ErrWeChatUpstream, errResp.ErrCode, errResp.ErrMsg)
+	}
+
+	var parsed wechatAccessToken
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("%w: decode: %v", ErrWeChatUpstream, err)
+	}
+	if parsed.AccessToken == "" {
+		return nil, fmt.Errorf("%w: empty access_token in response", ErrWeChatUpstream)
+	}
+	return &parsed, nil
 }

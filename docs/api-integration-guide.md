@@ -4,10 +4,10 @@
 
 ## 概述
 
-Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一套用户身份——每个用户只需一个账号即可使用所有接入应用。系统支持社交账号 OAuth 登录（GitHub、Google）。
+Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一套用户身份——每个用户只需一个账号即可使用所有接入应用。系统支持 GitHub OAuth 重定向流程（唯一登录渠道）。
 
 核心概念：
-- **Plan（订阅计划）**：定义可访问的 App 列表（free/monthly/quarterly/yearly）
+- **Plan（订阅计划）**：定义可访问的 App 列表。Plan ID 由运营侧自由定义（例：`free` / `monthly` / `quarterly`）
 - **App（应用）**：接入的系统，如 yundian、yundash
 - **Subscription（订阅）**：用户订阅某个 Plan
 
@@ -209,8 +209,7 @@ curl https://your-yunhou-domain/user/profile \
       "price": 0,
       "interval_days": 0,
       "is_default": true,
-      "provider_ids": {},
-      "cycle": null
+      "provider_ids": {}
     },
     {
       "id": "monthly",
@@ -230,7 +229,7 @@ curl https://your-yunhou-domain/user/profile \
 | 字段 | 说明 |
 |------|------|
 | `provider_ids` | 该 Plan 在 PayPal 上对应的 subscription plan ID。未配置 PayPal 时为 `{}`（BFF 即可判定"当前 App 该 Plan 暂无可下单渠道"）。 |
-| `cycle` | 解析后的试用 + 计费周期；用于营销页文案。PayPal 未配置此 plan 的 `trial_days` / `billing_cycle_days` 时为 `null`（BFF 应回退到 `interval_days`）。 |
+| `cycle` | 解析后的试用 + 计费周期；用于营销页文案。PayPal 未配置此 plan 时**字段被省略**（不是 `null`，BFF 集成时应用 `cycle === undefined` 判空而非 `=== null`）；缺失时回退到 `interval_days`。 |
 
 **cycle 解析规则**：使用 PayPal 的 `trial_days` + `billing_cycle_days`。运营侧需保证 PayPal 控制台上的账单周期与这里写下的值一致，否则营销页展示的 "X 天免费 / Y 天周期" 跟实际结算会不一致。
 
@@ -446,7 +445,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 | 路径 | 鉴权 | 用途 |
 |------|------|------|
 | `GET /apps/:id/plans` | **无需鉴权**（公共） | 营销页拉取 Plan 目录 |
-| `GET /apps/:id/provider-token/:channel` | **`X-App-ID` + `X-App-Secret`**（内部服务） | BFF 拉取 PayPal/LS 凭据再调用上游 |
+| `GET /apps/:id/provider-token/:channel` | **`X-App-ID` + `X-App-Secret`**（内部服务） | BFF 拉取 PayPal 凭据再调用上游 |
 | `POST /apps/:id/quote` | **JWT Bearer**（终端用户） | 给定 (app, plan) 给出下单报价 |
 
 > 同样的 `X-App-ID` + `X-App-Secret` 头对适用于所有 `/admin/*` 路由（plan 管理 + app 管理 + rotate-secret）。详见下文 §"内部服务鉴权"。
@@ -481,7 +480,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 - `paypal.plans` 是 `plan_id -> 配置对象` 的 map；`plan_id` 与业务 `plans.id` 同名（运营侧负责对齐）。
 - `trial_days` / `billing_cycle_days` 决定 `sub_expires_at = now + trial + cycle` 的计算结果；务必与 PayPal 控制台账单周期同步。`billing_cycle_days` 缺省时回退到 `plans.interval_days`。
 - `brand.name` 缺省回退到 `apps.name`，对应 PayPal `application_context.brand_name`。
-- v2 schema 把早期"扁平的 `{plan_id: "P-…"}` map" 改成了嵌套对象形；现存配置行如果有旧形态，需通过 `PATCH /admin/apps/:id` 重写为新形态，否则该 plan 在 quote / catalog 接口里查不到。
+- `apps.config` 中 PayPal 段当前 schema 是嵌套对象形：`{ plan_id, trial_days, billing_cycle_days }`。配置行若缺少 `payment_providers.paypal.plans` 或对应 plan_id 的条目，quote / catalog 接口会视该 plan 为未配置。
 
 #### GET /apps
 
@@ -555,7 +554,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 行为说明：
 
-- yunhou-users 真正去 PayPal OAuth `client_credentials` 接口拿 access token，并在进程内缓存 `expires_in − 60s`（即 PayPal 实际返回的剩余有效期减去 60 秒安全余量；典型 ~9 小时，最短不会低于 60 秒）。并发去重（同一 `client_id` 同时只有一次上游调用）；单 Yunhou 实例维度缓存，多实例各自刷新（PayPal 的 `client_credentials` 对相同凭据幂等）。
+- yunhou-users 真正去 PayPal OAuth `client_credentials` 接口拿 access token，并在进程内缓存 `expires_in − 60s`（即 PayPal 实际返回的剩余有效期减去 60 秒安全余量；典型 ~9 小时；若上游返回的 `expires_in` 异常小，最短回退到 30 秒；若异常大则封顶 1 小时，防止代理重放把 token 钉死数天）。并发去重（同一 `client_id` 同时只有一次上游调用）；单 Yunhou 实例维度缓存，多实例各自刷新（PayPal 的 `client_credentials` 对相同凭据幂等）。
 
 **错误响应**：
 
@@ -570,7 +569,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### POST /apps/:id/quote
 
-下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal/LS 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**（终端用户身份触发；调用方必须先 `/auth/login`），handler 读 JWT 上下文中的 `user_id`。**注意**：当前**不强制 `has_access` gating**——任何已登录用户都可以对任意 app/plan 发起 quote，前端必须自己根据 `has_access` 决定是否展示下单按钮。
+下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**（终端用户身份触发；调用方必须先完成 GitHub OAuth 登录并拿到 JWT），handler 读 JWT 上下文中的 `user_id`。**注意**：当前**不强制 `has_access` gating**——任何已登录用户都可以对任意 app/plan 发起 quote，前端必须自己根据 `has_access` 决定是否展示下单按钮。
 
 **路径参数**：`id` 是 App ID。
 
@@ -909,7 +908,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 > **设计原则**：所有 OAuth provider 凭据（client_secret、access_token）由 yunhou 持有并使用，BFF 不接触任何长期秘密。BFF 端只持有 `client_id`（明文）+ 一次性 redirect_uri 白名单条目。
 
-适用场景：消费 app 需要让终端用户用 GitHub 账号登录。`POST /auth/login` 不再支持 `provider=github`（会返回 400），所有 GitHub 登录必须走下方流程。
+适用场景：消费 app 需要让终端用户用 GitHub 账号登录。Yunhou 仅支持 GitHub OAuth 重定向流程——**`POST /auth/login` 已下线**（任何请求会得到 404），所有 GitHub 登录必须走下方流程。
 
 #### 配置（运营侧）
 
@@ -994,13 +993,14 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 **错误响应**：
 
-| HTTP | 触发条件 |
-|---|---|
-| 400 | `app_id` 或 `redirect_uri` 缺失 |
-| 400 | `redirect_uri` 不在 callback_urls 白名单 |
-| 404 | `app_id` 不存在 |
-| 404 | app 未配置 GitHub OAuth |
-| 500 | 其他内部错误 |
+| HTTP | message | 触发条件 |
+|---|---|---|
+| 400 | `missing app_id` / `missing redirect_uri` | `app_id` 或 `redirect_uri` 缺失 |
+| 400 | `redirect_uri not in callback_urls whitelist` | `redirect_uri` 不在 callback_urls 白名单 |
+| 403 | `app is disabled` | app 已停用 |
+| 404 | `app not found` | `app_id` 不存在 |
+| 404 | `github login not configured` | app 未配置 GitHub OAuth |
+| 500 | `failed to read app config` / `failed to build authorize url` | 内部错误 |
 
 #### GET /auth/github/callback
 
@@ -1024,14 +1024,18 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 **错误响应**：
 
-| HTTP | 触发条件 |
-|---|---|
-| 400 | `code` / `state` / `app_id` 缺失 |
-| 400 | state 无效或过期（5 分钟） |
-| 400 | app_id 对应的 app 没有配置 GitHub OAuth |
-| 400 | GitHub `?error=access_denied` 等授权失败参数 |
-| 404 | app_id 不存在 |
-| 502 | GitHub 上游调用失败（网络、过期、配额） |
+| HTTP | message | 触发条件 |
+|---|---|---|
+| 400 | `missing app_id` / `missing code or state` | `code` / `state` / `app_id` 缺失 |
+| 400 | `invalid state` | state 无效或过期（5 分钟） |
+| 400 | `invalid callback index` | callback 索引越界 |
+| 400 | `github login not configured` | app 未配置 GitHub OAuth（少数 fallback 路径） |
+| 404 | `app not found` | `app_id` 不存在 |
+| 404 | `github login not configured` | app 未配置 GitHub OAuth |
+| 500 | `login failed` | 内部错误（auth service 未预期异常） |
+| 502 | `github upstream error` | GitHub 上游调用失败（网络、过期、配额） |
+
+> GitHub `?error=access_denied` 等授权失败参数走另一条路径：state + app 校验通过后会**直接 302 跳回 BFF**，在 URL fragment 里塞 `error=...&error_description=...`（不返回 JSON）。BFF 端需在 `redirect_uri` 落地的回调页同时处理 fragment 里的 `token` 和 `error`。
 
 #### 边界总结
 
@@ -1415,14 +1419,20 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 **Rotation 流程**：怀疑 `X-App-Secret` 泄漏（例如 BFF 容器镜像被 pull 过、CI 缓存里出现过）时，立即调：
 
 ```bash
-curl -X POST https://yunhou.ai/api/admin/apps/yundian/rotate-secret \
+curl -X POST https://<YOUR_YUNHOU_HOST>/admin/apps/yundian/rotate-secret \
   -H "X-App-ID: yundian" \
   -H "X-App-Secret: <当前 secret>"
 ```
 
 响应里 `data.secret` 是新的 64 位 hex，旧 secret 立即失效（**无 grace period**）。把新值部署到 BFF 后，下一次调用即生效。
 
-**部署侧建议**：除了 `X-App-Secret` 服务端校验，部署侧也建议对 `POST /admin/*` 与 `GET /apps/:id/provider-token/:channel` 做 nginx IP 白名单 / VPC 限制，把 BFF 出口段固定下来。两层防御互不替代——服务端 secret 防的是凭据泄漏，IP 白名单防的是 endpoint 暴露面。
+**部署侧建议**：除了 `X-App-Secret` 服务端校验，部署侧也建议对所有走 `InternalAppAuth` 的端点做 nginx IP 白名单 / VPC 限制：
+- `GET /apps`、`GET /apps/:id`
+- `GET /apps/:id/provider-token/:channel`
+- `GET /admin/plans`、`GET /admin/plans/:id`、`POST/PATCH/DELETE /admin/plans/:id`
+- `POST /admin/apps`、`PATCH /admin/apps/:id`、`POST /admin/apps/:id/rotate-secret`
+
+把 BFF 出口段固定下来。两层防御互不替代——服务端 secret 防的是凭据泄漏，IP 白名单防的是 endpoint 暴露面。
 
 ---
 
@@ -1533,7 +1543,7 @@ GET /.well-known/jwks.json
 |------|------|------|
 | `id` | string | 身份 ID |
 | `user_id` | string | 所属用户 |
-| `provider` | string | 提供方：`github` / `google` |
+| `provider` | string | 提供方：`github` |
 | `provider_uid` | string | 提供方用户 ID |
 | `email` | string? | 关联邮箱 |
 | `created_at` | datetime | 创建时间 |
@@ -1577,7 +1587,7 @@ GET /.well-known/jwks.json
 
 | 接口类别 | 限制 | 说明 |
 |---------|------|------|
-| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内；`/apps/:id/plans` 公共可访问（无需鉴权） |
+| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/refresh`, `/auth/logout`, `/auth/github/*`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内（最早期注册，绕过 limiter）；`/apps/:id/plans` 公共可访问（无需鉴权） |
 | 内部服务接口（`/apps`, `/apps/:id`, `/apps/:id/provider-token/:channel`, `/admin/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 `X-App-ID` 头 + `X-App-Secret` 头 |
 | 用户态接口（`POST /apps/:id/quote`, `/payments/*`, `/refunds/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 JWT（终端用户身份） |
 | 用户接口（`/user/*`） | 无显式限制 | 仅要求 JWT |
@@ -1589,11 +1599,10 @@ GET /.well-known/jwks.json
 
 - [ ] 获取应用的 `app_id` + `app_secret`（`POST /admin/apps` 响应里 `data.secret`，仅一次性返回，需立即落地）
 - [ ] BFF 调 `/apps/:id/plans`、`/apps/:id/provider-token/:channel`、所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`
-- [ ] 实现 OAuth 登录，获取用户的 provider token
-- [ ] 调用 `POST /auth/login` 登录
+- [ ] 实现 GitHub OAuth 重定向登录：BFF 302 到 `/auth/github/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，让浏览器走完 GitHub 授权；回调页从 URL fragment 解析 `token` / `refresh_token` / `user_id` / `has_access`（注意 fragment 不会上行到服务器，BFF 必须前端 JS 解析）
 - [ ] 解析响应中的 `has_access` 字段，判断用户是否有权限访问
 - [ ] 如果 `has_access` 为 `false`，提示用户订阅/升级
 - [ ] 使用 `access_token` 调用用户接口
-- [ ] 实现 Token 刷新逻辑，处理 Refresh Token 轮转
-- [ ] 获取 JWKS 配置本地 JWT 验证（可选）
+- [ ] 实现 Token 刷新逻辑，处理 Refresh Token 轮转（每次 refresh 必须使用返回的新 refresh_token，旧 token 立即失效）
+- [ ] 获取 JWKS 配置本地 JWT 验证（**必须**，不要每次请求都把 token 回传给 yunhou-users 校验）
 - [ ] 怀疑 `app_secret` 泄漏时调 `POST /admin/apps/:id/rotate-secret`，旧 secret 立即失效

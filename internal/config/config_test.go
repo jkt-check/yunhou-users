@@ -161,6 +161,7 @@ func TestValidate_HappyPath(t *testing.T) {
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     1 * time.Minute,
 		OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+		WeChatPayMchID:      "1900000001",
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("want nil, got %v", err)
@@ -242,6 +243,7 @@ func TestValidate_ErrorPaths(t *testing.T) {
 				OrderExpiryDuration: 30 * time.Minute,
 				SweeperInterval:     1 * time.Minute,
 				OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+				WeChatPayMchID:      "1900000001",
 			}
 			tc.mutate(cfg)
 			err := cfg.Validate()
@@ -458,6 +460,80 @@ func TestLoad_WeChatPayMock(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoad_WeChatPayMchID covers WECHAT_PAY_MCH_ID resolution: empty
+// by default, populated when set. The Validate()-level guard is
+// exercised in TestValidate_WeChatPayMchID.
+func TestLoad_WeChatPayMchID(t *testing.T) {
+	orig, had := os.LookupEnv("WECHAT_PAY_MCH_ID")
+	os.Unsetenv("WECHAT_PAY_MCH_ID")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("WECHAT_PAY_MCH_ID", orig)
+		} else {
+			os.Unsetenv("WECHAT_PAY_MCH_ID")
+		}
+	})
+
+	if got := Load().WeChatPayMchID; got != "" {
+		t.Errorf("default WeChatPayMchID = %q, want empty", got)
+	}
+
+	os.Setenv("WECHAT_PAY_MCH_ID", "1900000001")
+	if got := Load().WeChatPayMchID; got != "1900000001" {
+		t.Errorf("WeChatPayMchID override: got %q, want 1900000001", got)
+	}
+}
+
+// TestValidate_WeChatPayMchID exercises the production guard:
+// WECHAT_PAY_MCH_ID is required when WECHAT_PAY_MOCK is unset / "0",
+// but mock mode is allowed to leave it blank.
+func TestValidate_WeChatPayMchID(t *testing.T) {
+	t.Parallel()
+	base := func() *Config {
+		return &Config{
+			DatabaseURL:        "postgres://x",
+			RSAPrivate:         "priv",
+			RSAPublic:          "pub",
+			JWTAccessTTL:       15 * time.Minute,
+			JWTRefreshTTL:      168 * time.Hour,
+			OrderExpiryDuration: 30 * time.Minute,
+			SweeperInterval:     1 * time.Minute,
+			OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+		}
+	}
+
+	t.Run("real mode, empty MCH_ID → error", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatPayMock = false
+		cfg.WeChatPayMchID = ""
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_PAY_MCH_ID") {
+			t.Errorf("err = %v, want one mentioning WECHAT_PAY_MCH_ID", err)
+		}
+	})
+
+	t.Run("real mode, populated MCH_ID → ok", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatPayMock = false
+		cfg.WeChatPayMchID = "1900000001"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("mock mode, empty MCH_ID → ok", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatPayMock = true
+		cfg.WeChatPayMchID = ""
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("mock mode should allow empty MCH_ID, got: %v", err)
+		}
+	})
 }
 
 func TestParseDurationOr(t *testing.T) {

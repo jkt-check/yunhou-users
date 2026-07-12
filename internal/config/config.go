@@ -41,6 +41,13 @@ type Config struct {
 	// Production MUST leave this false.
 	WeChatPayMock bool
 
+	// WeChatPayMchID is the 微信支付商户号. Required when WeChatPayMock
+	// is false (production); ignored otherwise. Per-app overrides live
+	// in apps.config.payment_providers.wechat_pay.mch_id — this top-level
+	// field is the server-wide fallback for deployments that haven't
+	// registered multiple merchants yet.
+	WeChatPayMchID string
+
 	// GitHubClientID/Secret are reserved for a future OAuth redirect flow.
 	// They are not used by the current direct-login implementation but kept
 	// in the env so operators can pre-provision credentials.
@@ -87,6 +94,7 @@ func Load() *Config {
 		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
 		WeChatOAuthMock:    os.Getenv("WECHAT_OAUTH_MOCK") == "1",
 		WeChatPayMock:     os.Getenv("WECHAT_PAY_MOCK") == "1",
+		WeChatPayMchID:   os.Getenv("WECHAT_PAY_MCH_ID"),
 
 		JWTAccessTTL:  parseDurationOr(envOr("JWT_ACCESS_TTL", "15m"), 15*time.Minute),
 		JWTRefreshTTL: parseDurationOr(envOr("JWT_REFRESH_TTL", "168h"), 168*time.Hour),
@@ -142,6 +150,13 @@ func (c *Config) Validate() error {
 	// generate via `openssl rand -hex 32`.
 	if len(c.OAuthStateSecret) < 32 {
 		return errors.New("OAUTH_STATE_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
+	}
+	if !c.WeChatPayMock && c.WeChatPayMchID == "" {
+		// Production deployments (WECHAT_PAY_MOCK unset / "0") MUST set
+		// WECHAT_PAY_MCH_ID. The per-app apps.config.payment_providers
+		// .wechat_pay.mch_id override lands in A2.c's real client;
+		// until then this top-level env is the only signal.
+		return errors.New("WECHAT_PAY_MCH_ID is required when WECHAT_PAY_MOCK is not enabled")
 	}
 	return nil
 }

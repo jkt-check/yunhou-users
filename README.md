@@ -74,6 +74,9 @@ All configuration is via environment variables (or `.env` file):
 | `SWEEPER_INTERVAL` | No | `1m` | Must be strictly < `ORDER_EXPIRY_DURATION` |
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
+| `WECHAT_PAY_MOCK` | No | (empty) | `1` enables WeChat Pay v3 webhook plaintext mode (skips HMAC match + AES decrypt); empty / `0` = production. Pairs with `WECHAT_PAY_MCH_ID` (required when not in mock mode). |
+| `WECHAT_PAY_MCH_ID` | No (mock) / **Yes (prod)** | (empty) | 微信支付商户号. Required when `WECHAT_PAY_MOCK` is not `1`. |
+| `WECHAT_OAUTH_MOCK` | No | (empty) | `1` short-circuits `/auth/wechat/*` (no upstream `open.weixin.qq.com` call); empty / `0` = production. Never enable in prod. |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM file path; empty = Alipay webhooks return 404 |
 | `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which PayPal webhook_id/base URL is active |
 | `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | Empty = PayPal sandbox webhooks return 404 |

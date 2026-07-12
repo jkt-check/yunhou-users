@@ -418,6 +418,48 @@ func TestLoad_WeChatOAuthMock(t *testing.T) {
 	}
 }
 
+// TestLoad_WeChatPayMock mirrors TestLoad_WeChatOAuthMock for the
+// pay-channel toggle. Same strict "1" semantics; no string-true alias
+// (operators who write WECHAT_PAY_MOCK=true by accident must NOT enable
+// mock mode).
+func TestLoad_WeChatPayMock(t *testing.T) {
+	cases := []struct {
+		name, set, want string
+	}{
+		{"unset → false", "", "false"},
+		{"=1 → true", "1", "true"},
+		{"=0 → false", "0", "false"},
+		{"=true (literal) → false", "true", "false"},
+		{"=random → false", "xxx", "false"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			orig, had := os.LookupEnv("WECHAT_PAY_MOCK")
+			if tc.set != "" {
+				os.Setenv("WECHAT_PAY_MOCK", tc.set)
+			} else {
+				os.Unsetenv("WECHAT_PAY_MOCK")
+			}
+			t.Cleanup(func() {
+				if had {
+					os.Setenv("WECHAT_PAY_MOCK", orig)
+				} else {
+					os.Unsetenv("WECHAT_PAY_MOCK")
+				}
+			})
+			cfg := Load()
+			got := "false"
+			if cfg.WeChatPayMock {
+				got = "true"
+			}
+			if got != tc.want {
+				t.Errorf("WeChatPayMock with %q: got %s, want %s", tc.set, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseDurationOr(t *testing.T) {
 	t.Parallel()
 	t.Run("valid → parsed value", func(t *testing.T) {

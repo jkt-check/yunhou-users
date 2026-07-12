@@ -21,6 +21,10 @@ Set `WECHAT_OAUTH_MOCK=1` to short-circuit the WeChat OAuth redirect and callbac
 
 **Never enable in production**; the constant unionid means anyone with knowledge of the mock sentinel can impersonate a fixed account.
 
+Set `WECHAT_PAY_MOCK=1` to drive the WeChat Pay v3 webhook flow without a registered merchant. The `WeChatPayV3Verifier` short-circuits the HMAC check (still requires all three headers + a fresh timestamp), and the webhook handler accepts plaintext JSON (no AES-GCM resource decryption). The downstream `PaymentService.OnWebhook` path is identical to prod, so the order-paid → subscription-activated flow can be exercised end-to-end.
+
+**Never enable in production** — anyone could POST a fake paid event for any order.
+
 ## Quick Start
 
 ```bash

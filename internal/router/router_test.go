@@ -227,6 +227,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		nil, nil, // providerTokenSvc, quoteSvc
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
 		false, // wechatOAuthMock
+		false, // wechatPayMock
 	)
 
 	routes := engine.Routes()

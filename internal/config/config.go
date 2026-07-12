@@ -31,6 +31,16 @@ type Config struct {
 	// Real WeChat apps MUST leave this false.
 	WeChatOAuthMock bool
 
+	// WeChatPayMock short-circuits the WeChat Pay v3 webhook signature
+	// verification + AES-GCM resource decryption. When true,
+	// /webhooks/payment/wechat_pay accepts a plaintext JSON body (no
+	// HMAC match required, no resource block to decrypt) so e2e suites
+	// and dev environments can drive the order-paid → subscription
+	// activated flow without a registered merchant. Pair with the
+	// mock-mode NATIVE UnifiedOrder in internal/billing/wechat/.
+	// Production MUST leave this false.
+	WeChatPayMock bool
+
 	// GitHubClientID/Secret are reserved for a future OAuth redirect flow.
 	// They are not used by the current direct-login implementation but kept
 	// in the env so operators can pre-provision credentials.
@@ -76,6 +86,7 @@ func Load() *Config {
 		GitHubClientID:     os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
 		WeChatOAuthMock:    os.Getenv("WECHAT_OAUTH_MOCK") == "1",
+		WeChatPayMock:     os.Getenv("WECHAT_PAY_MOCK") == "1",
 
 		JWTAccessTTL:  parseDurationOr(envOr("JWT_ACCESS_TTL", "15m"), 15*time.Minute),
 		JWTRefreshTTL: parseDurationOr(envOr("JWT_REFRESH_TTL", "168h"), 168*time.Hour),

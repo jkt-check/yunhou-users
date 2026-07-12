@@ -32,6 +32,7 @@ func Setup(
 	githubOAuthSvc *service.GitHubOAuthService,
 	wechatOAuthSvc *service.WeChatOAuthService,
 	wechatOAuthMock bool,
+	wechatPayMock bool,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -44,7 +45,7 @@ func Setup(
 	planHandler := handler.NewPlanHandler(planSvc, appRepo, quoteSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
-	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier)
+	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)

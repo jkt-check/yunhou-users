@@ -571,3 +571,94 @@ func TestWebhook_WeChat_PaymentFailed(t *testing.T) {
 		t.Errorf("expected order.status=failed, got %s", status2)
 	}
 }
+
+// ============================================================================
+// WECHAT_PAY_MOCK=1 — plaintext JSON path, no signature check, no AES decrypt
+// ============================================================================
+
+// TestWebhook_WeChat_MockMode_OrderPaid_SubscriptionActivated walks the
+// full mock-mode flow:
+//   1. login → mint a JWT
+//   2. POST /payments/orders → create pending order
+//   3. POST /webhooks/payment/wechat_pay with a PLAINTEXT JSON body
+//      (no resource block, no AES, no real signature) → the mock
+//      verifier short-circuits, the mock-aware handler decodes the
+//      body, the order is flipped to paid, and the user's subscription
+//      is activated.
+//
+// In real prod (WECHAT_PAY_MOCK=0) the same webhook would 400 because
+// the signature wouldn't match — confirmed by TestWebhook_WeChat_MockMode_RealVerifierRejects.
+func TestWebhook_WeChat_MockMode_OrderPaid_SubscriptionActivated(t *testing.T) {
+	srv := setupE2EServerWithMockWeChatPay(t)
+	token, _ := loginAndGetToken(t, srv.Engine, "wechat-mock-paid", "yundian")
+
+	// Create an order.
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"monthly"}`, authHeader(token))
+	var r struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+
+	// Mock-mode webhook body — plaintext, no resource wrapper.
+	body := []byte(fmt.Sprintf(
+		`{"id":"evt_mock_%s","event_type":"TRANSACTION.SUCCESS","resource":{"transaction_id":"wx_mock_%s","out_trade_no":"%s","amount":{"total":2990},"sub_expires_at":"2030-01-01T00:00:00Z"}}`,
+		orderID, orderID, orderID,
+	))
+	ts := time.Now().Unix()
+	resp = doRequest(t, srv.Engine, http.MethodPost,
+		"/webhooks/payment/wechat_pay", string(body),
+		map[string]string{
+			"Wechatpay-Signature": "mock-bypass-not-validated",
+			"Wechatpay-Timestamp": strconv.FormatInt(ts, 10),
+			"Wechatpay-Nonce":     "mocknonce",
+			"Content-Type":        "application/json",
+		})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mock webhook: %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+
+	// Order flipped to paid.
+	var status string
+	if err := srv.DB.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "paid" {
+		t.Errorf("expected order.status=paid, got %s", status)
+	}
+
+	// Subscription activated. user_id comes from the JWT; reuse loginAndGetToken's lookup.
+	// (We don't pull user_id directly here — easier to assert "subscription exists for some user on plan=monthly".)
+	var subCount int
+	if err := srv.DB.GetContext(context.Background(), &subCount,
+		`SELECT COUNT(*) FROM subscriptions WHERE plan_id = 'monthly' AND status = 'active'`); err != nil {
+		t.Fatal(err)
+	}
+	if subCount < 1 {
+		t.Errorf("expected at least one active monthly subscription, got %d", subCount)
+	}
+}
+
+// TestWebhook_WeChat_MockMode_RealVerifierRejects confirms the
+// WECHAT_PAY_MOCK=0 path is unaffected: a plaintext JSON body (no
+// signature) is rejected with 400 from the middleware.
+func TestWebhook_WeChat_MockMode_RealVerifierRejects(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t) // WECHAT_PAY_MOCK=false
+
+	body := []byte(`{"event_type":"TRANSACTION.SUCCESS","resource":{"out_trade_no":"ord-x","amount":{"total":100}}}`)
+	resp := doRequest(t, srv.Engine, http.MethodPost,
+		"/webhooks/payment/wechat_pay", string(body),
+		map[string]string{
+			"Wechatpay-Signature": "wrong-sig",
+			"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
+			"Wechatpay-Nonce":     "n",
+			"Content-Type":        "application/json",
+		})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("real-mode wechat webhook with bad sig: status = %d, want 400; body=%s", resp.StatusCode, string(resp.Body))
+	}
+}

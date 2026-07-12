@@ -258,7 +258,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, false)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, false, false)
 
 	return engine, nil, db
 }
@@ -368,8 +368,32 @@ type E2EServer struct {
 
 // setupE2EServerWithVerifier returns a server wired with real signature
 // verifiers (Stripe + WeChat + Alipay) so webhook tests can sign their own
-// payloads. Alipay's key pair is generated in-memory per test.
+// payloads. Alipay's key pair is generated in-memory per test. WeChat
+// pay is in REAL mode — pass wechatPayMock=true via
+// setupE2EServerWithMockWeChatPay to flip the mock branch on.
 func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
+	return setupE2EServerWithVerifierOpts(t, false /* wechatPayMock */)
+}
+
+// setupE2EServerWithMockWeChatPay mirrors setupE2EServerWithVerifier but
+// turns on the wechat_pay mock branch end-to-end:
+//   - WeChatPayV3Verifier.MockMode = true (skip HMAC match)
+//   - WebhookHandler.mockWechatPay = true (skip AES-GCM decrypt, accept plaintext)
+//   - router.Setup(wechatPayMock=true)
+//
+// The Stripe / Alipay / PayPal verifiers stay at their default (real)
+// configs so non-wechat webhook tests continue to work unmodified. The
+// mock branch only affects wechat_pay.
+func setupE2EServerWithMockWeChatPay(t *testing.T) *E2EServer {
+	return setupE2EServerWithVerifierOpts(t, true /* wechatPayMock */)
+}
+
+// setupE2EServerWithVerifierOpts is the shared implementation behind
+// setupE2EServerWithVerifier (mock off) and setupE2EServerWithMockWeChatPay
+// (mock on). Passing wechatPayMock=true wires the WeChatPayV3Verifier's
+// MockMode, the handler's mockWechatPay, and router.Setup's wechatPayMock
+// in lockstep — there's no way to get them out of sync.
+func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer {
 	t.Helper()
 
 	// Mirror setupE2EServer's env gate: /test/login is the path loginAndGetToken
@@ -379,11 +403,6 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		t.Fatalf("set PAYPAL_L3_E2E_MODE: %v", err)
 	}
 
-	// The paypal-verify cache is package-global (sync.Map) inside
-	// internal/middleware. Earlier unit tests in the same `go test`
-	// invocation may have stored FAILURE entries; clearing it here
-	// guarantees a clean slate per e2e test without forcing every
-	// helper to mint unique (transmissionID, transmissionTime) pairs.
 	middleware.ClearPaypalVerifyCache()
 
 	db := connectDB(t)
@@ -402,7 +421,7 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		RSAPrivate:          privPath,
 		RSAPublic:           pubPath,
 		GitHubClientID:      "e2e-fake-client-id",
-		GitHubClientSecret:  "e2e-fake-client-secret",
+		GitHubClientSecret:  "e2e-fake-fake-client-secret",
 		JWTAccessTTL:        15 * time.Minute,
 		JWTRefreshTTL:       168 * time.Hour,
 		OrderExpiryDuration: 30 * time.Minute,
@@ -410,7 +429,6 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
 	}
 
-	// Repos
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
 	planRepo := repo.NewPlanRepo(db)
@@ -440,22 +458,16 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		cfg.OrderExpiryDuration,
 	)
 
-	// Build the multi-channel verifier with all five channels configured.
-	// Alipay uses a generated RSA key pair — tests sign with the private key
-	// and the verifier checks with the corresponding public key. PayPal's
-	// HTTPS verify endpoint is mocked via a httptest server that always
-	// returns verification_status=SUCCESS; the verifier's HTTP client points
-	// at that server URL.
 	alipayPriv, alipayPubPEM := genAlipayRSAKeyPair(t)
 	paypalVerifySrv := newMockPaypalVerifyServer(t)
 	cfg.PaypalEnv = "sandbox"
 	cfg.PaypalWebhookIDSandbox = "wbh_e2e_paypal"
-	cfg.PaypalAPIBaseSandbox = paypalVerifySrv.URL // verifier appends /v1/...
+	cfg.PaypalAPIBaseSandbox = paypalVerifySrv.URL
 	cfg.PaypalWebhookIDLive = ""
 	cfg.PaypalAPIBaseLive = ""
 	mv := &middleware.MultiChannelVerifier{
 		Stripe:       &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
-		WeChat:       &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey)},
+		WeChat:       &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey), MockMode: wechatPayMock},
 		Alipay: &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
 		Paypal: &middleware.PaypalVerifier{
 			HTTPClient:       &http.Client{Timeout: 2 * time.Second},
@@ -474,22 +486,14 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
-	// Use a cancellable context so the rate-limit cleanup goroutines
-	// spawned by middleware.RateLimit die at test end — without this
-	// every setup leaks a goroutine and the test runner eventually
-	// blocks on goroutine drain (visible as "FAIL ... 30s" hangs on
-	// the final test of any batch).
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, false)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock)
 
-	// Stash the private key in a closure-accessible holder so signing helpers
-	// can produce valid signatures. (We don't expose the priv directly to
-	// avoid leaking it through the test struct unnecessarily.)
 	alipayPrivHolder.Store(alipayPriv)
 
 	return &E2EServer{

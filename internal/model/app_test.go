@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -130,4 +131,55 @@ func TestResolveCycle(t *testing.T) {
 			t.Errorf("TrialDays: got %d, want 7 (entry value still applies)", got.TrialDays)
 		}
 	})
+}
+
+// TestAppConfig_UnmarshalJSON_WeChatPayOnly covers the payment_providers
+// .wechat_pay block introduced by A2.c (production credentials skeleton).
+// The block must round-trip without the paypal block being present, and
+// must not steal the oauth_providers.wechat block (different schemas).
+func TestAppConfig_UnmarshalJSON_WeChatPayOnly(t *testing.T) {
+	raw := []byte(`{
+		"payment_providers": {
+			"wechat_pay": {
+				"mch_id": "1900000001",
+				"api_v3_key": "01234567890123456789012345678901",
+				"cert_path": "/keys/wechatpay/apiclient_cert.pem",
+				"key_path": "/keys/wechatpay/apiclient_key.pem",
+				"notify_url": "https://api.yunhouai.com/webhooks/payment/wechat_pay",
+				"plan_mapping": {"monthly": "MONTHLY_PLAN_CODE"}
+			}
+		}
+	}`)
+	var cfg AppConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.PaymentProviders == nil || cfg.PaymentProviders.WeChatPay == nil {
+		t.Fatal("WeChatPay block not populated")
+	}
+	wp := cfg.PaymentProviders.WeChatPay
+	if wp.MchID != "1900000001" {
+		t.Errorf("MchID = %q, want 1900000001", wp.MchID)
+	}
+	if wp.APIv3Key != "01234567890123456789012345678901" {
+		t.Errorf("APIv3Key not round-tripped")
+	}
+	if wp.CertPath != "/keys/wechatpay/apiclient_cert.pem" {
+		t.Errorf("CertPath = %q", wp.CertPath)
+	}
+	if wp.PlanMapping["monthly"] != "MONTHLY_PLAN_CODE" {
+		t.Errorf("PlanMapping[monthly] = %q", wp.PlanMapping["monthly"])
+	}
+	// paypal block must NOT be populated (independent fields).
+	if cfg.PaymentProviders.Paypal != nil {
+		t.Errorf("Paypal block should be nil when only wechat_pay is set")
+	}
+	// Re-marshal roundtrip preserves the block.
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `"wechat_pay"`) {
+		t.Errorf("re-marshalled JSON missing wechat_pay key: %s", out)
+	}
 }

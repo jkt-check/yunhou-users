@@ -1,0 +1,78 @@
+// cmd/migrate is the standalone migration-ledger runner. It exists
+// separately from cmd/server so a deploy image can run migrations
+// before the server image starts (avoids race conditions where two
+// replicas both try to migrate at startup).
+//
+// Usage:
+//   migrate            # apply pending migrations (default)
+//   migrate -status    # print ledger status
+//
+// Env:
+//   DATABASE_URL     (required) Postgres connection URL
+//   MIGRATIONS_DIR   (optional) directory of *.sql files
+//                    default /migrations (production), ./migrations (dev)
+//
+// Exit code 0 on success, 1 on any migration failure or misconfiguration.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
+
+	"github.com/yunhou/users/internal/migrate"
+)
+
+func main() {
+	status := flag.Bool("status", false, "print migration ledger status instead of applying")
+	flag.Parse()
+
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	dir := os.Getenv("MIGRATIONS_DIR")
+	if dir == "" {
+		dir = "/migrations"
+		if _, err := os.Stat(dir); err != nil {
+			// Fall back to ./migrations for local dev where the binary
+			// is run from the repo root.
+			dir = "./migrations"
+		}
+	}
+
+	files, err := migrate.LoadFiles(dir)
+	if err != nil {
+		log.Fatalf("load migrations from %s: %v", dir, err)
+	}
+	log.Printf("[migrate] %d migration file(s) discovered in %s", len(files), dir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	db, err := sqlx.ConnectContext(ctx, "postgres", dsn)
+	if err != nil {
+		log.Fatalf("connect: %v", err)
+	}
+	defer db.Close()
+
+	if *status {
+		if err := migrate.Status(ctx, db, files); err != nil {
+			log.Fatalf("status: %v", err)
+		}
+		return
+	}
+
+	applied, skipped, err := migrate.Apply(ctx, db, files)
+	if err != nil {
+		log.Fatalf("apply: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "[migrate] applied=%d skipped=%d\n", applied, skipped)
+}

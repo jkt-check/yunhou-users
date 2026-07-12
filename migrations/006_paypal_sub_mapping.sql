@@ -14,13 +14,8 @@
 -- onPaymentSucceeded (payment.go:769-779), which uses a subquery filtered
 -- by user_id + plan_id + status='active', so the partial index cannot
 -- collide there either.
-
-BEGIN;
-
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS external_subscription_id TEXT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_external_sub_id
     ON subscriptions (external_subscription_id)
     WHERE external_subscription_id IS NOT NULL;
-
-COMMIT;

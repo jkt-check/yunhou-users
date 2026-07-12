@@ -16,34 +16,22 @@ A shared user management API for multi-app ecosystems. One user identity across 
 ```bash
 # 1. Set up PostgreSQL
 createdb yunhou_users
-# Run ALL migrations in order — 002 alters tables created by 001, 003
-# adds payment/webhook tables, 004 adds the lemonsqueezy channel CHECK
-# constraint (historical — superseded by 008), 005 adds the paypal
-# channel CHECK constraint, 006 adds
-# subscriptions.external_subscription_id for PayPal renewal webhooks,
-# 007 adds apps.secret_hash, 008 drops lemonsqueezy from the
-# payments / refunds / webhook_events channel CHECK constraints (the
-# LemonSqueezy code path was removed in commit d8f333d; the migration
-# keeps the schema in sync with the handler, which 404s unknown
-# channels). Each depends on the prior; running out of order will fail.
-psql -d yunhou_users -f migrations/001_init.sql
-psql -d yunhou_users -f migrations/002_simplify_plans.sql
-psql -d yunhou_users -f migrations/003_payments.sql
-psql -d yunhou_users -f migrations/004_ls_channel.sql
-psql -d yunhou_users -f migrations/005_paypal_channel.sql
-psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
-psql -d yunhou_users -f migrations/007_app_secret.sql
-psql -d yunhou_users -f migrations/008_drop_lemonsqueezy.sql
 
-# 2. Generate RSA keys
+# 2. Apply migrations. The cmd/migrate binary owns the _migrations
+#    ledger so re-running is a no-op. See migrations/README.md for the
+#    naming + DDL rules each migration must follow.
+make migrate           # apply pending
+make migrate-status    # inspect ledger (✅ applied / ⏳ pending)
+
+# 3. Generate RSA keys
 make generate-keys
 
-# 3. Run — startup backfills apps.secret_hash for any pre-existing rows
+# 4. Run — startup backfills apps.secret_hash for any pre-existing rows
 #    and prints the plaintexts to stdout (capture them, then rotate each
 #    app's secret via POST /admin/apps/:id/rotate-secret).
 make run
 
-# 4. Login uses the redirect flow. Open in a browser:
+# 5. Login uses the redirect flow. Open in a browser:
 #   GitHub: GET /auth/github/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/callback
 #     After consent GitHub redirects to /auth/github/callback which 302s back
 #     to https://yundian.com/auth/callback#token=...&refresh_token=...&user_id=...

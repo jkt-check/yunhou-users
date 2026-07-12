@@ -31,3 +31,30 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # One-shot migration runner. Activated by the `migrate` profile so it
+  # doesn't auto-start alongside `app`:
+  #   docker compose run --rm migrate         # apply
+  #   docker compose run --rm migrate -status # inspect ledger
+  migrate:
+    build: .
+    image: yunhou-users:latest
+    profiles: ["migrate"]
+    command: ["/migrate"]
+    env_file: .env
+    # Read-only root + no cap_drop override — the runtime image is already
+    # hardened for the long-running server, and a one-shot migrate run
+    # benefits from the same posture (no DB writes beyond SQL).
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

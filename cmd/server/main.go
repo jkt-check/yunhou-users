@@ -152,7 +152,8 @@ func main() {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
-		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc,
+		cfg.WeChatOAuthMock)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

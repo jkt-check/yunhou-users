@@ -18,12 +18,23 @@ import (
 // installWeChatFixedClock.
 var wechatOAuthClock = time.Now
 
+// wechatOAuthMockCode is the deterministic code that /auth/wechat/redirect
+// emits when mock mode is enabled. /auth/wechat/callback detects it and
+// short-circuits the upstream exchange + userinfo fetch.
+const wechatOAuthMockCode = "mock-code"
+
+// wechatOAuthMockUnionID is the deterministic unionid embedded in the
+// mock ProviderUserInfo. Same shape as the real unionid, prefixed with
+// "wechat_" so the identity-key composition matches the production path.
+const wechatOAuthMockUnionID = "wechat_mock-unionid-001"
+
 // wechatOAuthDeps bundles the service-layer dependencies for the WeChat
 // redirect flow. Same shape as githubOAuthDeps.
 type wechatOAuthDeps struct {
 	svc     *service.WeChatOAuthService
 	appRepo appLoader
 	authSvc service.AuthServiceInterface
+	mock    bool
 }
 
 // RegisterWeChatOAuthRoutes attaches /redirect and /callback to the
@@ -33,8 +44,16 @@ type wechatOAuthDeps struct {
 //
 // Both endpoints are public (no JWT) — same posture as /auth/github/* and
 // /auth/refresh.
-func RegisterWeChatOAuthRoutes(engine gin.IRouter, svc *service.WeChatOAuthService, appRepo appLoader, authSvc service.AuthServiceInterface) {
-	d := &wechatOAuthDeps{svc: svc, appRepo: appRepo, authSvc: authSvc}
+//
+// The mock parameter enables the dev-only short-circuit
+// (WECHAT_OAUTH_MOCK=1). When true, /redirect emits a BFF redirect
+// with code=mock-code (no open.weixin.qq.com round-trip), and /callback
+// constructs a fixed ProviderUserInfo with unionid=wechat_mock-unionid-001
+// without calling /sns/oauth2/access_token or /sns/userinfo. State
+// issuance + verification still runs unmodified — mock mode only
+// bypasses the upstream WeChat HTTP calls, not the HMAC defence.
+func RegisterWeChatOAuthRoutes(engine gin.IRouter, svc *service.WeChatOAuthService, appRepo appLoader, authSvc service.AuthServiceInterface, mock bool) {
+	d := &wechatOAuthDeps{svc: svc, appRepo: appRepo, authSvc: authSvc, mock: mock}
 	engine.GET("/redirect", d.Redirect)
 	engine.GET("/callback", d.Callback)
 }
@@ -71,6 +90,23 @@ func (d *wechatOAuthDeps) Redirect(c *gin.Context) {
 		// Malformed config — operators need to fix
 		// apps.config.oauth_providers.wechat.
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "invalid app config"})
+		return
+	}
+
+	if d.mock {
+		// Mock-mode redirect: issue a real HMAC-signed state (so the
+		// callback's VerifyCallbackState still runs unmodified) and
+		// redirect straight back to the BFF with the mock code. No
+		// upstream WeChat HTTP call.
+		state, err := d.svc.IssueState(appID, callbackIdx, wechatOAuthClock())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "issue mock state"})
+			return
+		}
+		c.Redirect(http.StatusFound, redirectWithFragment(redirectURI, url.Values{
+			"code":  {wechatOAuthMockCode},
+			"state": {state},
+		}))
 		return
 	}
 
@@ -199,6 +235,34 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 		return
 	}
 	redirectURI := cfg.CallbackURLs[verifiedIdx]
+
+	if d.mock && code == wechatOAuthMockCode {
+		// Mock-mode callback: skip /sns/oauth2/access_token and
+		// /sns/userinfo. Build a deterministic ProviderUserInfo that
+		// reuses the production identity-key shape (wechat_<unionid>)
+		// so the rest of the login pipeline doesn't see a special case.
+		profile := &service.ProviderUserInfo{
+			Provider:    "wechat",
+			ProviderUID: wechatOAuthMockUnionID,
+			Email:       "",
+			Nickname:    "mock-user",
+			AvatarURL:   "",
+		}
+		loginResp, err := d.authSvc.LoginWithProfile(c.Request.Context(), service.LoginWithProfileRequest{
+			Profile: profile,
+			AppID:   appID,
+		})
+		if err != nil {
+			if isExpectedAuthErr(err) {
+				c.Redirect(http.StatusFound, redirectWithErrorFragment(redirectURI, "auth_failed", authErrReason(err)))
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "login"})
+			return
+		}
+		c.Redirect(http.StatusFound, buildCallbackRedirectURL(redirectURI, loginResp))
+		return
+	}
 
 	tok, err := d.svc.ExchangeCode(c.Request.Context(), cfg, code, redirectURI)
 	if err != nil {

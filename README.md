@@ -11,6 +11,16 @@ A shared user management API for multi-app ecosystems. One user identity across 
 - **Refresh token rotation** — one-time-use refresh tokens
 - **Rate limiting** — per-IP token bucket (10/s burst 20 on public, 30/s burst 60 on app management)
 
+## Dev mock mode
+
+Set `WECHAT_OAUTH_MOCK=1` to short-circuit the WeChat OAuth redirect and callback without contacting `open.weixin.qq.com`. Useful for local dev and CI e2e suites that don't have a registered WeChat 网站应用.
+
+- `GET /auth/wechat/redirect` returns a 302 to `redirect_uri#code=mock-code&state=<real-HMAC-state>` (no upstream call).
+- `GET /auth/wechat/callback?code=mock-code&state=<...>` constructs a fixed `ProviderUserInfo` (unionid `wechat_mock-unionid-001`) and runs the normal login pipeline.
+- Mock mode does **not** bypass the HMAC state defence — only the upstream WeChat HTTP round-trip is skipped.
+
+**Never enable in production**; the constant unionid means anyone with knowledge of the mock sentinel can impersonate a fixed account.
+
 ## Quick Start
 
 ```bash

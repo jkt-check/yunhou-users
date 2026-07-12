@@ -132,6 +132,17 @@ func (s *WeChatOAuthService) VerifyCallbackState(state, expectedAppID string, no
 	return util.VerifyOAuthState(s.stateSecret, state, expectedAppID, now)
 }
 
+// IssueState signs and returns the OAuth state token for an
+// (appID, callbackIndex) pair. Used by the mock-mode redirect handler,
+// which builds its own BFF redirect URL with code=mock-code instead of
+// an upstream WeChat authorize URL. Returning a real HMAC-signed state
+// keeps the callback's VerifyCallbackState working unchanged — mock
+// mode doesn't bypass security checks, it only short-circuits the
+// upstream WeChat round-trip.
+func (s *WeChatOAuthService) IssueState(appID string, callbackIndex int, now time.Time) (string, error) {
+	return util.IssueOAuthState(s.stateSecret, appID, callbackIndex, now)
+}
+
 // wechatAccessToken is the parsed shape of /sns/oauth2/access_token's
 // body. Includes ErrCode/ErrMsg alongside the success fields so a
 // single json.Unmarshal detects both success and the upstream error

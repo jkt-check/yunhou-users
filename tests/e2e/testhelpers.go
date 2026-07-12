@@ -258,7 +258,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, false)
 
 	return engine, nil, db
 }
@@ -485,7 +485,7 @@ func setupE2EServerWithVerifier(t *testing.T) *E2EServer {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc)
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, false)
 
 	// Stash the private key in a closure-accessible holder so signing helpers
 	// can produce valid signatures. (We don't expose the priv directly to

@@ -151,12 +151,23 @@ func (c *Config) Validate() error {
 	if len(c.OAuthStateSecret) < 32 {
 		return errors.New("OAUTH_STATE_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
 	}
-	if !c.WeChatPayMock && c.WeChatPayMchID == "" {
-		// Production deployments (WECHAT_PAY_MOCK unset / "0") MUST set
-		// WECHAT_PAY_MCH_ID. The per-app apps.config.payment_providers
-		// .wechat_pay.mch_id override lands in A2.c's real client;
-		// until then this top-level env is the only signal.
-		return errors.New("WECHAT_PAY_MCH_ID is required when WECHAT_PAY_MOCK is not enabled")
+	// Real WeChat Pay requires both WECHAT_PAY_API_V3_KEY (HMAC + AES
+	// material) and WECHAT_PAY_MCH_ID (outgoing request signing). The
+	// guard is asymmetric: if APIv3Key is set without MCH_ID, we refuse
+	// startup (real-mode webhooks would 401 upstream); the inverse —
+	// MCH_ID set without APIv3Key — also refuses startup, because the
+	// server would happily start, then every /webhooks/payment/wechat_pay
+	// would 404 (the verifier is gated on APIv3Key presence in
+	// cmd/server/main.go), and the operator has no log line to diagnose.
+	// Deployments that don't accept WeChat Pay at all should leave BOTH
+	// vars unset (channel returns 404, the WeChat webhook route is
+	// simply unconfigured). Mock-mode deployments set WECHAT_PAY_MOCK=1
+	// and may leave MCH_ID blank.
+	switch {
+	case c.WeChatPayMchID == "" && c.WeChatAPIv3Key != "" && !c.WeChatPayMock:
+		return errors.New("WECHAT_PAY_MCH_ID is required when WECHAT_PAY_API_V3_KEY is set and WECHAT_PAY_MOCK is not enabled")
+	case c.WeChatPayMchID != "" && c.WeChatAPIv3Key == "" && !c.WeChatPayMock:
+		return errors.New("WECHAT_PAY_API_V3_KEY is required when WECHAT_PAY_MCH_ID is set and WECHAT_PAY_MOCK is not enabled")
 	}
 	return nil
 }

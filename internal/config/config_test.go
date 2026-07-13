@@ -161,6 +161,7 @@ func TestValidate_HappyPath(t *testing.T) {
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     1 * time.Minute,
 		OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+		WeChatAPIv3Key:      "0123456789abcdef0123456789abcdef", // 32 bytes
 		WeChatPayMchID:      "1900000001",
 	}
 	if err := cfg.Validate(); err != nil {
@@ -243,6 +244,7 @@ func TestValidate_ErrorPaths(t *testing.T) {
 				OrderExpiryDuration: 30 * time.Minute,
 				SweeperInterval:     1 * time.Minute,
 				OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+				WeChatAPIv3Key:      "0123456789abcdef0123456789abcdef",
 				WeChatPayMchID:      "1900000001",
 			}
 			tc.mutate(cfg)
@@ -504,11 +506,12 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 		}
 	}
 
-	t.Run("real mode, empty MCH_ID → error", func(t *testing.T) {
+	t.Run("real mode, empty MCH_ID + APIv3Key set → error (symmetric rule)", func(t *testing.T) {
 		t.Parallel()
 		cfg := base()
 		cfg.WeChatPayMock = false
 		cfg.WeChatPayMchID = ""
+		cfg.WeChatAPIv3Key = "0123456789abcdef0123456789abcdef"
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "WECHAT_PAY_MCH_ID") {
 			t.Errorf("err = %v, want one mentioning WECHAT_PAY_MCH_ID", err)
@@ -519,6 +522,30 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 		t.Parallel()
 		cfg := base()
 		cfg.WeChatPayMock = false
+		cfg.WeChatAPIv3Key = ""
+		cfg.WeChatPayMchID = ""
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("deployments without WeChat Pay should pass, got: %v", err)
+		}
+	})
+
+	t.Run("real mode + MCH_ID set, empty APIv3Key → error", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatPayMock = false
+		cfg.WeChatAPIv3Key = ""
+		cfg.WeChatPayMchID = "1900000001"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_PAY_API_V3_KEY") {
+			t.Errorf("MCH_ID-without-APIv3Key should be rejected, got: %v", err)
+		}
+	})
+
+	t.Run("real mode + APIv3Key, populated MCH_ID → ok", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatPayMock = false
+		cfg.WeChatAPIv3Key = "0123456789abcdef0123456789abcdef"
 		cfg.WeChatPayMchID = "1900000001"
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("unexpected error: %v", err)

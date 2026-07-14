@@ -1,0 +1,29 @@
+name: deploy-cn-staging
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cn-staging
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@main
+    with:
+      image-name: yunhou-users
+
+  bump:
+    needs: build
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@main
+    with:
+      service: users
+      digest: ${{ needs.build.outputs.digest }}
+    secrets:
+      app-id:   ${{ secrets.BUMP_APP_ID }}
+      app-key:  ${{ secrets.BUMP_APP_PRIVATE_KEY }}
+      bump-pat: ${{ secrets.DEPLOY_BOT_PAT }}

@@ -1,0 +1,16 @@
+name: pr-ci
+on:
+  pull_request:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'docs/**'
+
+permissions:
+  contents: read
+
+jobs:
+  go-ci:
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@main
+    with:
+      go-version: "1.25"

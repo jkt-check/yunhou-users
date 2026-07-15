@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +133,63 @@ func TestOrderRepo_SweepExpired(t *testing.T) {
 	got, _ = r.FindByID(context.Background(), fresh.ID)
 	if got.Status != "pending" {
 		t.Errorf("fresh.Status = %q, want pending (untouched)", got.Status)
+	}
+}
+
+// TestOrderRepo_UpdateProviderIntent_RoundTrip verifies that the bytes written
+// via UpdateProviderIntent land in the orders.provider_intent JSONB column and
+// survive a SELECT cast to text. Uses a direct INSERT to bypass the NamedExec
+// path so the test isolates the UPDATE behaviour.
+func TestOrderRepo_UpdateProviderIntent_RoundTrip(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	if err := u.Create(context.Background(), alice); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	orderID := newUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
+		VALUES ($1, $2, 'monthly', 1.00, 'CNY', 'pending', now() + interval '30 minutes')
+	`, orderID, alice.ID); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+
+	r := NewOrderRepo(db)
+	payload := []byte(`{"code_url":"weixin://wxpay/bizpayurl?pr=test","out_trade_no":"o-123","mch_id":"1900000001"}`)
+	if err := r.UpdateProviderIntent(context.Background(), orderID, payload); err != nil {
+		t.Fatalf("UpdateProviderIntent: %v", err)
+	}
+
+	// Read back as text so we don't depend on sqlx's json.RawMessage binding
+	// shape — we just want to confirm the bytes landed.
+	var got string
+	if err := db.GetContext(context.Background(), &got,
+		`SELECT provider_intent::text FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatalf("select provider_intent: %v", err)
+	}
+	if !strings.Contains(got, "weixin://wxpay/bizpayurl?pr=test") {
+		t.Errorf("provider_intent round-trip mismatch: %s", got)
+	}
+	if !strings.Contains(got, `"out_trade_no": "o-123"`) && !strings.Contains(got, `"out_trade_no":"o-123"`) {
+		t.Errorf("provider_intent missing out_trade_no: %s", got)
+	}
+
+	// Confirm a second write overwrites the first.
+	payload2 := []byte(`{"code_url":"weixin://wxpay/bizpayurl?pr=second"}`)
+	if err := r.UpdateProviderIntent(context.Background(), orderID, payload2); err != nil {
+		t.Fatalf("UpdateProviderIntent (overwrite): %v", err)
+	}
+	if err := db.GetContext(context.Background(), &got,
+		`SELECT provider_intent::text FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatalf("select (overwrite): %v", err)
+	}
+	if !strings.Contains(got, "bizpayurl?pr=second") {
+		t.Errorf("after overwrite: provider_intent = %s", got)
+	}
+	if strings.Contains(got, "bizpayurl?pr=test") {
+		t.Errorf("after overwrite: old payload leaked: %s", got)
 	}
 }
 

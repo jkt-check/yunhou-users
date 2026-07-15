@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -24,6 +25,12 @@ type OrderRepo interface {
 	// Returns number of rows flipped (for sweeper observability).
 	// Sweeper interval must be < expiry window (design doc §"v1 decisions").
 	SweepExpired(ctx context.Context, now time.Time) (int64, error)
+	// UpdateProviderIntent writes a raw JSON payload into orders.provider_intent.
+	// The caller is responsible for marshalling the struct; the repo writes the
+	// bytes verbatim into the JSONB column ($1::jsonb cast). Used by
+	// channel-specific pre-auth flows (wechat_pay writes code_url / out_trade_no
+	// / mch_id; paypal reserves the slot for future use).
+	UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error
 }
 
 type orderRepo struct{ db *sqlx.DB }
@@ -86,6 +93,21 @@ func (r *orderRepo) SweepExpired(ctx context.Context, now time.Time) (int64, err
 		return 0, err
 	}
 	return n, nil
+}
+
+// UpdateProviderIntent writes payload verbatim into orders.provider_intent.
+// The `$1::jsonb` cast lets sqlx bind []byte (Postgres `bytea`) and converts
+// to JSONB server-side; if payload is not valid JSON, Postgres rejects with
+// SQLSTATE 22P02 and we surface the wrap below.
+func (r *orderRepo) UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE orders SET provider_intent = $1::jsonb, updated_at = now() WHERE id = $2`,
+		payload, orderID,
+	)
+	if err != nil {
+		return fmt.Errorf("update provider_intent: %w", err)
+	}
+	return nil
 }
 
 // ============================================================================

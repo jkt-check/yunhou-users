@@ -26,11 +26,14 @@ import (
 // the lookup-heavy service functions. Unused methods panic — those code
 // paths have separate coverage elsewhere.
 type stubOrderRepoLookup struct {
-	byID       map[string]*model.Order
-	findErr    error
-	cancelOK   bool
-	cancelErr  error
-	cancelSeen string
+	byID              map[string]*model.Order
+	findErr           error
+	cancelOK          bool
+	cancelErr         error
+	cancelSeen        string
+	updateIntentCalled bool   // set when UpdateProviderIntent is invoked
+	updateIntentPayload []byte // last payload passed to UpdateProviderIntent
+	updateIntentErr    error  // optional error to return from UpdateProviderIntent
 }
 
 func (s *stubOrderRepoLookup) Create(_ context.Context, _ *model.Order) error {
@@ -58,6 +61,11 @@ func (s *stubOrderRepoLookup) CancelPending(_ context.Context, id, _ string) (bo
 }
 func (s *stubOrderRepoLookup) SweepExpired(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
+}
+func (s *stubOrderRepoLookup) UpdateProviderIntent(_ context.Context, _ string, payload []byte) error {
+	s.updateIntentCalled = true
+	s.updateIntentPayload = payload
+	return s.updateIntentErr
 }
 
 // stubPaymentRepoLookup — minimal PaymentRepo for GetPayment / GetRefund.

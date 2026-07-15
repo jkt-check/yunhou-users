@@ -41,6 +41,9 @@ func (m *mockOrderRepo) SweepExpired(_ context.Context, now time.Time) (int64, e
 	}
 	return m.returnCount, nil
 }
+func (m *mockOrderRepo) UpdateProviderIntent(_ context.Context, _ string, _ []byte) error {
+	return nil
+}
 
 func TestOrderSweeper_SweepOnce(t *testing.T) {
 	t.Parallel()

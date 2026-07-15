@@ -34,8 +34,9 @@ POST /payments/orders  (channel=wechat_pay)
   └─ service.PaymentService.CreateOrder
        ├─ orderRepo.Create(order)                         ← existing
        ├─ [wechat_pay + real mode] wechat.Client.UnifiedOrder(ctx, req)
-       │     ├─ JSON body: { appid/mch_id, description, out_trade_no,
-       │     │              notify_url, amount:{total,currency} }
+       │     ├─ JSON body: { mch_id, description, out_trade_no,
+       │     │              notify_url, amount:{total,currency}, trade_type }
+       │     │   (`appid` omitted — NATIVE does not need it)
        │     ├─ sign.BuildAuthHeader(method, path, body)
        │     │     └─ sign string = METHOD\nPATH\nTS\nNONCE\nBODY\n
        │     │     └─ SHA256withRSA(privateKey) → base64
@@ -47,7 +48,7 @@ POST /payments/orders  (channel=wechat_pay)
 ```
 
 **Dependencies on entry path:**
-- `cmd/server/main.go` at startup reads `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` → parses RSA private key (PKCS#1 or PKCS#8); reads `WECHAT_PAY_MCH_CERT_PATH` → parses X.509 cert, extracts `SerialNumber.String()` for `serial_no`. Builds `Signer{MchID, SerialNo, PrivateKey}`. Builds `Client{MockMode: cfg.WeChatPayMock, MchID, Signer, NotifyURL, BaseURL, HTTPDoer}`. (APIv3Key lives on the `Signer` struct too if we ever need it for outbound signing — but v1 outbound signing uses the RSA private key, so APIv3Key stays only for inbound webhook HMAC + decrypt and is read directly from cfg in `cmd/server/main.go`.) Passes the client into `PaymentService` via the constructor — **new constructor parameter** added in this PR.
+- `cmd/server/main.go` at startup reads `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` → parses RSA private key (PKCS#1 or PKCS#8); reads `WECHAT_PAY_MCH_CERT_PATH` → parses X.509 cert, extracts `SerialNumber.String()` for `serial_no`. Builds `Signer{MchID, SerialNo, PrivateKey}`. Builds `Client{MockMode: cfg.WeChatPayMock, MchID, Signer, NotifyURL, BaseURL, HTTPDoer}`. **APIv3Key is only used for inbound webhook HMAC + AES-GCM** — it is read directly from cfg by `cmd/server/main.go` and is NOT stored on `Signer` or `Client`. Outbound signing uses the merchant RSA private key, never APIv3Key. Passes the client into `PaymentService` via the constructor — **new constructor parameter** added in this PR.
 - HTTPDoer in production: thin adapter over `*http.Client` (with timeout). In tests: stub returns canned body or error.
 - `PaymentService.CreateOrder` is channel-aware: when `Channel="wechat_pay"` AND the client is in real mode, it calls `UnifiedOrder` and persists `provider_intent`. Otherwise it returns the order unchanged (existing behavior for all other channels and for wechat_pay mock mode).
 
@@ -60,11 +61,13 @@ POST /payments/orders  (channel=wechat_pay)
 | 3 | `internal/billing/wechat/sign_test.go` | **new** | Fixed test vector: known RSA key + body → known Authorization string. Catches drift in sign-string format |
 | 4 | `internal/billing/wechat/wechat.go` | **extend** | (a) Replace `ErrUnimplemented` stub with real `UnifiedOrder` branch: build request JSON, call Signer, HTTPDoer, parse response. Mock branch stays byte-for-byte identical. New typed errors: `ErrWeChatUnifiedOrderRejected`, `ErrWeChatNetwork`. (b) Replace `CertPath`/`KeyPath` string fields on `Client` with a single `Signer *Signer` field. (c) Add `MchID() string` getter on `*Client` to satisfy the service-layer interface |
 | 5 | `internal/billing/wechat/wechat_test.go` | **extend** | HTTPDoer stub tests: 200 happy / 4xx envelope / 5xx / network error / bad base64 cert / bad key / mock-mode still works. Existing mock-mode tests untouched |
-| 6 | `internal/billing/wechat/cert.go` | **new** | `LoadPrivateKey(path string) (*rsa.PrivateKey, error)` and `LoadCertSerial(path string) (string, error)`. PEM parse + serial decimal-string extraction. Pure helpers; no I/O outside file read |
+| 6 | `internal/billing/wechat/cert.go` | **new** | `LoadPrivateKey(path string) (*rsa.PrivateKey, error)` and `LoadCertSerial(path string) (string, error)`. PEM parse + serial decimal-string extraction. Pure helpers; no I/O outside file read. The test helper `GenerateTestKeyPair(t *testing.T) (*rsa.PrivateKey, []byte /*cert PEM*/)` is exported only via `_test.go` files (`export_test.go` pattern) so `sign_test.go` can build a deterministic fixture |
 | 7 | `internal/billing/wechat/cert_test.go` | **new** | Test vectors: generated 2048-bit RSA key + self-signed cert, assert key parses, serial extracted matches expected format |
 | 8 | `internal/config/config.go` | **extend** | +3 fields: `WeChatPayMchPrivateKeyPath`, `WeChatPayMchCertPath`, `WeChatPayNotifyURL`. `Load()` parses them. `Validate()` extends the asymmetric WECHAT_PAY_MCH_ID ↔ APIv3_KEY rule (existing) to require the 5-tuple when real mode |
 | 9 | `internal/config/config_test.go` | **extend** | `TestValidate_WeChatReal_AllFiveRequired` (5 missing permutations fail), `TestValidate_WeChatMock_AllowsEmptyPartial` (mock + any subset of new envs still passes) |
-| 10 | `internal/service/payment.go` | **extend** | `PaymentService` gets a new constructor field `wechat *wechat.Client`. `CreateOrder` adds a `wechat_pay`-and-real-mode branch: after `orderRepo.Create`, call `wechat.UnifiedOrder`, then `orderRepo.UpdateProviderIntent(orderID, providerIntentJSON)`. Other channels unchanged |
+| 10 | `internal/service/payment.go` | **extend** | (a) `PaymentService` gets a new constructor field `wechat wechatClient` (interface, see §9). (b) `CreateOrder` adds a `wechat_pay`-and-real-mode branch: after `orderRepo.Create`, call `wechat.UnifiedOrder`, then `orderRepo.UpdateProviderIntent(orderID, providerIntentJSON)`. Other channels unchanged |
+| 10a | `internal/model/payment.go` | **extend** | Add `ProviderIntent []byte \`json:"-" db:"provider_intent"\`` to the `Order` struct so the column round-trips (json tag "-" keeps it out of HTTP responses; db tag wires the sqlx scan). |
+| 10b | `internal/repo/orders.go` (or wherever orders repo lives) | **extend** | Add `UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error` — UPDATE orders SET provider_intent = $payload::jsonb WHERE id = $1. Standard sqlx pattern matching existing repo methods. |
 | 11 | `internal/service/payment_test.go` | **extend** | Stub `wechat.Client` via the existing interface seam (or wrap into a small `wechatClient` interface so tests can stub). Cover: real-mode CreateOrder persists `code_url`; mock-mode CreateOrder doesn't touch client; non-wechat channels don't touch client |
 | 12 | `cmd/server/main.go` | **extend** | After `cfg, err := config.Load()`, call `wechat.LoadPrivateKey(...)` and `wechat.LoadCertSerial(...)`. Fail-fast if real mode + any load error. Build `wechat.Client`. Pass into `PaymentService` constructor. Adapt `*http.Client` → `wechat.HTTPDoer` (one-line adapter) |
 | 13 | `PROGRESS.md` | **update** | Mark A2.c follow-up as ✅ shipped. Reference new commit hash. Note deferred items remain: refund API, plan_mapping, per-app overrides |
@@ -167,9 +170,14 @@ type Signer struct {
 //   sign = base64( RSA-SHA256(message, PrivateKey) )
 //   Authorization = scheme + ' ' + kv pairs (mchid, nonce_str, timestamp, serial_no, signature)
 //
-// NOTE: WeChat also signs SOME success responses with their platform
-// cert (not the APIv3Key). v1 does not verify those — we rely on TLS
-// for transport-level integrity. Future PR.
+// NOTE: APIv3Key is NOT used for outbound signing — it is reserved for
+// inbound webhook HMAC + AES-GCM resource decryption (handled by
+// WeChatPayV3Verifier in middleware/webhook_sig.go). Outbound requests
+// to api.mch.weixin.qq.com are signed with the merchant RSA private key
+// only; WeChat's successful responses (e.g. UnifiedOrder) carry the
+// result in the body and are NOT response-signed. Transport-level
+// integrity relies on TLS. Verifying WeChat's platform-cert response
+// signatures (a v3 feature for refund/close-order flows) is deferred.
 func (s *Signer) BuildAuthHeader(method, path string, body []byte) (string, error) {
     ts := strconv.FormatInt(time.Now().Unix(), 10)
     nonceBytes := make([]byte, 16)
@@ -210,16 +218,28 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
         }, nil
     }
 
-    // Real mode
-    body, err := json.Marshal(map[string]interface{}{
-        "appid":        "", // optional for sub-merchant, omit in v1
-        "mch_id":       c.MchID,
-        "description":  req.Description,
-        "out_trade_no": req.OutTradeNo,
-        "notify_url":   c.NotifyURL,
-        "amount":       map[string]interface{}{"total": req.Amount.Total, "currency": req.Amount.Currency},
-        "trade_type":   string(req.TradeType),
-    })
+    // Real mode. NATIVE only needs mch_id — the `appid` field is
+    // reserved for in-app / JSAPI flows and is intentionally omitted.
+    type unifiedOrderBody struct {
+        MchID       string `json:"mch_id"`
+        Description string `json:"description"`
+        OutTradeNo  string `json:"out_trade_no"`
+        NotifyURL   string `json:"notify_url"`
+        Amount      struct {
+            Total    int64  `json:"total"`
+            Currency string `json:"currency"`
+        } `json:"amount"`
+        TradeType string `json:"trade_type"`
+    }
+    var bodyBytes unifiedOrderBody
+    bodyBytes.MchID = c.MchID
+    bodyBytes.Description = req.Description
+    bodyBytes.OutTradeNo = req.OutTradeNo
+    bodyBytes.NotifyURL = c.NotifyURL
+    bodyBytes.Amount.Total = req.Amount.Total
+    bodyBytes.Amount.Currency = req.Amount.Currency
+    bodyBytes.TradeType = string(req.TradeType)
+    body, err := json.Marshal(bodyBytes)
     if err != nil {
         return nil, fmt.Errorf("marshal body: %w", err)
     }
@@ -304,7 +324,21 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string)
     // Other channels skip this step; their code_url equivalents land
     // in their own follow-up PRs.
     if s.wechat != nil && !s.wechat.IsMockMode() {
-        amountFen := int64(order.Amount * 100) // CNY → fen
+        // Convert order.Amount (CNY, decimal) → fen (int64) WITHOUT
+        // float multiplication. `order.Amount` is scanned from
+        // DECIMAL(10,2) into Go via sqlx; if it lands in float64,
+        // `x * 100` can introduce drift on non-.50 amounts (e.g.
+        // 0.29 → 28.999... → 28). Use a string-roundtrip path so the
+        // value WeChat sees is the exact CNY amount the user
+        // authorized. Implementation: parse the decimal as a string,
+        // shift the dot two places, parse back to int64. For example,
+        // "0.07" → "007" → 7; "12.34" → "1234" → 1234.
+        amountStr := order.Amount.StringFixed(2) // or fmt.Sprintf("%.2f", order.Amount)
+        normalized := strings.ReplaceAll(amountStr, ".", "")
+        amountFen, err := strconv.ParseInt(normalized, 10, 64)
+        if err != nil {
+            return order, fmt.Errorf("amount to fen: %w", err)
+        }
         resp, err := s.wechat.UnifiedOrder(ctx, wechat.UnifiedOrderRequest{
             OutTradeNo:  order.ID,
             Description: fmt.Sprintf("plan-%s", planID),
@@ -347,7 +381,7 @@ Stored on `PaymentService` as `wechat wechatClient` (interface, not concrete typ
 
 | File | Test | Covers |
 |---|---|---|
-| `sign_test.go` | `TestBuildAuthHeader_FixedVector` | Known RSA key + body → assert exact Authorization string matches a fixture captured from WeChat docs. Locks sign-string format |
+| `sign_test.go` | `TestBuildAuthHeader_FixedVector` | Generate a deterministic RSA-2048 test key (committed `testdata/sign_test_key.pem`, regenerated by `make regen-test-keys` if rotated), pass a fixed body → assert Authorization header matches a fixture string captured by running the test once and committing the output (`testdata/sign_test_vector.json`). Locking the sign-string format this way catches off-by-one `\n` drift and kv-pair ordering. The key is committed (test-only) so the fixture is reproducible across CI runs |
 | `sign_test.go` | `TestBuildAuthHeader_NonceUniqueness` | Two consecutive calls produce different `nonce_str` |
 | `sign_test.go` | `TestBuildAuthHeader_TimestampFresh` | `timestamp` is within ±2s of `time.Now().Unix()` |
 | `cert_test.go` | `TestLoadPrivateKey_PKCS1` | Generate PKCS#1 PEM, load, assert usable for sign |

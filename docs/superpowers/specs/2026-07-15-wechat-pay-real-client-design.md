@@ -30,10 +30,10 @@ The webhook-side plumbing (signature verification, AES-GCM resource decryption, 
 ## 3. Architecture
 
 ```
-POST /payments/orders  (channel=wechat_pay)
-  └─ service.PaymentService.CreateOrder
+POST /payments/orders  (body: {plan_id, channel})
+  └─ service.PaymentService.CreateOrder(ctx, userID, planID, channel)
        ├─ orderRepo.Create(order)                         ← existing
-       ├─ [wechat_pay + real mode] wechat.Client.UnifiedOrder(ctx, req)
+       ├─ [channel == "wechat_pay" + real mode] wechat.Client.UnifiedOrder(ctx, req)
        │     ├─ JSON body: { mch_id, description, out_trade_no,
        │     │              notify_url, amount:{total,currency}, trade_type }
        │     │   (`appid` omitted — NATIVE does not need it)
@@ -46,6 +46,8 @@ POST /payments/orders  (channel=wechat_pay)
        │     └─ parse 200 → {code_url}; map 4xx/5xx → typed errors
        └─ orderRepo.UpdateProviderIntent(orderID, {code_url, out_trade_no, mch_id})
 ```
+
+**Channel awareness at CreateOrder:** the existing `CreateOrder` signature is `(ctx, userID, planID)` and only `plan_id` is in the request body. This PR adds `channel` to both (handler request body + service signature) so the wechat pre-auth branch fires only for `channel == "wechat_pay"`. Without this, a Stripe order would mint a WeChat `code_url` and write it into `provider_intent` for the wrong channel — silent bug. The `channel` field is part of the request DTO and is validated via `validateChannel()` (the same allowlist `ConfirmOrder` already uses).
 
 **Dependencies on entry path:**
 - `cmd/server/main.go` at startup reads `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` → parses RSA private key (PKCS#1 or PKCS#8); reads `WECHAT_PAY_MCH_CERT_PATH` → parses X.509 cert, extracts `SerialNumber.String()` for `serial_no`. Builds `Signer{MchID, SerialNo, PrivateKey}`. Builds `Client{MockMode: cfg.WeChatPayMock, MchID, Signer, NotifyURL, BaseURL, HTTPDoer}`. **APIv3Key is only used for inbound webhook HMAC + AES-GCM** — it is read directly from cfg by `cmd/server/main.go` and is NOT stored on `Signer` or `Client`. Outbound signing uses the merchant RSA private key, never APIv3Key. Passes the client into `PaymentService` via the constructor — **new constructor parameter** added in this PR.
@@ -68,7 +70,7 @@ POST /payments/orders  (channel=wechat_pay)
 | 10 | `internal/service/payment.go` | **extend** | (a) `PaymentService` gets a new constructor field `wechat wechatClient` (interface, see §9). (b) `CreateOrder` adds a `wechat_pay`-and-real-mode branch: after `orderRepo.Create`, call `wechat.UnifiedOrder`, then `orderRepo.UpdateProviderIntent(orderID, providerIntentJSON)`. Other channels unchanged |
 | 10a | `internal/model/payment.go` | **extend** | Add `ProviderIntent []byte \`json:"-" db:"provider_intent"\`` to the `Order` struct so the column round-trips (json tag "-" keeps it out of HTTP responses; db tag wires the sqlx scan). |
 | 10b | `internal/repo/orders.go` (or wherever orders repo lives) | **extend** | Add `UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error` — UPDATE orders SET provider_intent = $payload::jsonb WHERE id = $1. Standard sqlx pattern matching existing repo methods. |
-| 11 | `internal/service/payment_test.go` | **extend** | Stub `wechat.Client` via the existing interface seam (or wrap into a small `wechatClient` interface so tests can stub). Cover: real-mode CreateOrder persists `code_url`; mock-mode CreateOrder doesn't touch client; non-wechat channels don't touch client |
+| 11 | `internal/service/payment_test.go` | **extend** | Stub `wechatClient` interface (defined in service/payment.go per §9). Cover: real-mode + `channel=wechat_pay` persists `code_url`; mock-mode + `channel=wechat_pay` doesn't touch client; `channel=stripe` doesn't touch wechat client even when wired |
 | 12 | `cmd/server/main.go` | **extend** | After `cfg, err := config.Load()`, call `wechat.LoadPrivateKey(...)` and `wechat.LoadCertSerial(...)`. Fail-fast if real mode + any load error. Build `wechat.Client`. Pass into `PaymentService` constructor. Adapt `*http.Client` → `wechat.HTTPDoer` (one-line adapter) |
 | 13 | `PROGRESS.md` | **update** | Mark A2.c follow-up as ✅ shipped. Reference new commit hash. Note deferred items remain: refund API, plan_mapping, per-app overrides |
 | 14 | `Makefile` | **extend** | Add `regen-test-keys` target — regenerates `internal/billing/wechat/testdata/sign_test_key.pem` + the fixedvector JSON fixture. Used only when the test vector in `sign_test.go` needs to be re-derived (e.g. after intentional sign-string format change) |
@@ -245,19 +247,20 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
         return nil, fmt.Errorf("marshal body: %w", err)
     }
 
-    path := "/v3/pay/transactions/native"
-    auth, err := c.Signer.BuildAuthHeader("POST", path, body)
+    reqPath := "/v3/pay/transactions/native"
+    auth, err := c.Signer.BuildAuthHeader("POST", reqPath, body)
     if err != nil {
         return nil, fmt.Errorf("build auth: %w", err)
     }
 
     resp, err := c.HTTPDoer.Do(&HTTPRequest{
         Method:  "POST",
-        URL:     c.BaseURL + path,
+        URL:     c.BaseURL + reqPath,
         Headers: map[string]string{
             "Authorization": auth,
             "Content-Type":  "application/json",
             "Accept":        "application/json",
+            "User-Agent":    "yunhou-users/dev", // required by WeChat Pay v3 docs; some endpoints reject empty UA. v1 uses a constant; ldflags-injected version is v2 work.
         },
         Body: body,
     })
@@ -302,7 +305,16 @@ var (
 ```go
 // CreateOrder mints an order row + (for wechat_pay real mode) mints the
 // upstream code_url and persists it in orders.provider_intent.
-func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string) (*model.Order, error) {
+//
+// `channel` is supplied by the caller (BFF picks it at order creation
+// time — wechat_pay needs pre-auth because the BFF must render a QR
+// before redirecting; Stripe / PayPal may choose to defer channel-
+// specific work to confirm). The channel allowlist is enforced via
+// validateChannel (same one ConfirmOrder uses).
+func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channel string) (*model.Order, error) {
+    if err := validateChannel(channel); err != nil {
+        return nil, err
+    }
     // ... existing pre-checks (FindByID, active-sub check) ...
 
     order := &model.Order{
@@ -319,12 +331,12 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string)
     }
 
     // WeChat Pay NATIVE: mint code_url so the BFF can render a QR.
-    // Only fires when the channel is wechat_pay AND the client is in
-    // real mode (mock mode skips the upstream call entirely — the
-    // handler-side mock code_url is enough for BFF development).
-    // Other channels skip this step; their code_url equivalents land
-    // in their own follow-up PRs.
-    if s.wechat != nil && !s.wechat.IsMockMode() {
+    // Only fires when channel == "wechat_pay" AND the client is in real
+    // mode. Mock mode skips the upstream call (handler-side mock
+    // code_url is enough for BFF development). Other channels skip
+    // this step; their pre-auth equivalents land in their own
+    // follow-up PRs (Stripe Checkout session, PayPal order create, etc.).
+    if channel == "wechat_pay" && s.wechat != nil && !s.wechat.IsMockMode() {
         // Convert order.Amount (CNY, decimal) → fen (int64) WITHOUT
         // float multiplication. `order.Amount` is `float64` (scanned
         // from DECIMAL(10,2) by sqlx). `x * 100` introduces drift on
@@ -413,6 +425,7 @@ Plus a smoke build check: `make build` succeeds, `make lint` passes (go vet clea
 | Merchant cert expires (~5y) | Cert loaded once at startup; expiry check is the operator's responsibility (deploy-runbook tracks renewal). A mis-rotated cert fails `LoadCertSerial` fast, so the server won't boot with a stale one |
 | Migration 009 fails on a DB that already has `provider_intent` (rare) | `IF NOT EXISTS` makes it replay-safe |
 | Wrong sign-string format (off-by-one `\n`, missing trailing `\n`) | Fixed test vector in `sign_test.go` captures the canonical example from WeChat docs; any drift fails the test |
+| `Client` struct field rename (`CertPath`/`KeyPath` → `Signer *Signer`) breaks any test that constructs `Client` directly | The only in-tree caller is `cmd/server/main.go` (this PR). `wechat_test.go` only constructs `Client{MockMode: true}` for mock-mode tests — these keep working since they never touch the removed fields. Grep confirms no other `Client{...}` literals |
 
 Rollback: revert the commit. Migration 009 with `IF NOT EXISTS` cannot be un-applied without manual `ALTER TABLE ... DROP COLUMN` — acceptable since the column is harmless empty JSONB on rollback.
 

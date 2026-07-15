@@ -69,7 +69,7 @@ type stubDoer struct {
 	got  *HTTPRequest // captured for assertion
 }
 
-func (s *stubDoer) Do(req *HTTPRequest) (*HTTPResponse, error) {
+func (s *stubDoer) Do(_ context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	s.got = req
 	return s.resp, s.err
 }
@@ -85,11 +85,12 @@ func newRealClient(t *testing.T, doer HTTPDoer) *Client {
 		t.Fatalf("load cert: %v", err)
 	}
 	return &Client{
-		MockMode:  false,
-		Signer:    &Signer{MchID: "1900000109", SerialNo: serial, PrivateKey: key},
-		NotifyURL: "https://example.com/webhooks/payment/wechat_pay",
-		BaseURL:   "https://api.mch.weixin.qq.com",
-		HTTPDoer:  doer,
+		MockMode:   false,
+		Signer:     &Signer{MchID: "1900000109", SerialNo: serial, PrivateKey: key},
+		AppIDValue: "wx1900000109",
+		NotifyURL:  "https://example.com/webhooks/payment/wechat_pay",
+		BaseURL:    "https://api.mch.weixin.qq.com",
+		HTTPDoer:   doer,
 	}
 }
 
@@ -111,14 +112,16 @@ func TestUnifiedOrder_Real_200(t *testing.T) {
 	if stub.got == nil || !strings.HasPrefix(stub.got.Headers["Authorization"], "WECHATPAY2-SHA256-RSA2048 ") {
 		t.Fatalf("Authorization header missing or wrong: %v", stub.got)
 	}
-	if !strings.Contains(string(stub.got.Body), `"mch_id":"1900000109"`) {
-		t.Fatalf("body missing mch_id: %s", stub.got.Body)
+	// v3 protocol uses "mchid", NOT "mch_id" — see spec §"Architecture".
+	if !strings.Contains(string(stub.got.Body), `"mchid":"1900000109"`) {
+		t.Fatalf("body missing mchid: %s", stub.got.Body)
+	}
+	// v3 also requires "appid" alongside "mchid".
+	if !strings.Contains(string(stub.got.Body), `"appid":"wx1900000109"`) {
+		t.Fatalf("body missing appid: %s", stub.got.Body)
 	}
 	if !strings.Contains(string(stub.got.Body), `"out_trade_no":"order-1"`) {
 		t.Fatalf("body missing out_trade_no: %s", stub.got.Body)
-	}
-	if strings.Contains(string(stub.got.Body), `"appid"`) {
-		t.Fatalf("body unexpectedly contains appid: %s", stub.got.Body)
 	}
 }
 
@@ -133,6 +136,11 @@ func TestUnifiedOrder_Real_4xx(t *testing.T) {
 	if !errors.Is(err, ErrWeChatUnifiedOrderRejected) {
 		t.Fatalf("err = %v, want ErrWeChatUnifiedOrderRejected", err)
 	}
+	// And the 4xx path must NOT be classified as ErrWeChatUpstream —
+	// otherwise callers would auto-retry a terminal rejection.
+	if errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, should NOT match ErrWeChatUpstream", err)
+	}
 }
 
 func TestUnifiedOrder_Real_5xx(t *testing.T) {
@@ -143,8 +151,13 @@ func TestUnifiedOrder_Real_5xx(t *testing.T) {
 		Amount:    Amount{Total: 100, Currency: "CNY"},
 		TradeType: TradeTypeNative,
 	})
-	if !errors.Is(err, ErrWeChatUnifiedOrderRejected) {
-		t.Fatalf("err = %v, want ErrWeChatUnifiedOrderRejected", err)
+	if !errors.Is(err, ErrWeChatUpstream) {
+		t.Fatalf("err = %v, want ErrWeChatUpstream", err)
+	}
+	// And the 5xx path must NOT be classified as ErrWeChatUnifiedOrderRejected
+	// — otherwise callers would surface a "terminal" error for a transient one.
+	if errors.Is(err, ErrWeChatUnifiedOrderRejected) {
+		t.Fatalf("err = %v, should NOT match ErrWeChatUnifiedOrderRejected", err)
 	}
 }
 

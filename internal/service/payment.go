@@ -18,12 +18,21 @@ import (
 
 // wechatClient is the surface PaymentService needs from the wechat.Client.
 // Defined here so tests can replace the concrete billing client with a
-// hand-rolled stub.
+// hand-rolled stub. AppID() echoes into provider_intent.appid; MchID()
+// echoes into provider_intent.mchid; both are required for the BFF to
+// render the right QR + audit-log the upstream merchant.
 type wechatClient interface {
 	IsMockMode() bool
 	MchID() string
+	AppID() string
 	UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
 }
+
+// ErrWechatPayNotConfigured is returned by CreateOrder when channel="wechat_pay"
+// but no wechat client is wired (deployment chose not to accept WeChat Pay).
+// Without this, the user would get a 201 pending order with no code_url and
+// no way to pay — we surface a 4xx instead (mapped in handler/payment.go).
+var ErrWechatPayNotConfigured = errors.New("wechat pay not configured on this deployment")
 
 // PaymentService implements the v1 payment data flow primitives:
 // order creation, frontend confirm, refund creation, channel webhook reception.
@@ -205,6 +214,15 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 
 	// WeChat Pay NATIVE: mint code_url so the BFF can render a QR. Mock
 	// mode and non-WeChat channels do not need an upstream pre-auth call.
+	if channel == "wechat_pay" {
+		// nil wechat client + wechat_pay = deployment doesn't accept WeChat
+		// Pay. Surface a typed error so the handler returns 4xx instead of
+		// silently creating a pending order with no code_url.
+		if s.wechat == nil {
+			return nil, ErrWechatPayNotConfigured
+		}
+	}
+
 	if channel == "wechat_pay" && s.wechat != nil && !s.wechat.IsMockMode() {
 		// Convert CNY decimal to fen without float multiplication: format to
 		// two decimal places, strip the decimal point, then parse the integer.
@@ -215,8 +233,13 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 			return order, fmt.Errorf("amount to fen: %w", err)
 		}
 
+		// WeChat's out_trade_no max length is 32 chars; our UUIDs are 36
+		// chars. Strip hyphens + truncate to 32 — still globally unique
+		// (UUIDs are hex digits and the prefix keeps the lexicographic
+		// ordering for human-readable logs / database inspection).
+		outTradeNo := strings.ReplaceAll(order.ID, "-", "")[:32]
 		resp, err := s.wechat.UnifiedOrder(ctx, wechat.UnifiedOrderRequest{
-			OutTradeNo:  order.ID,
+			OutTradeNo:  outTradeNo,
 			Description: fmt.Sprintf("plan-%s", planID),
 			Amount:      wechat.Amount{Total: amountFen, Currency: "CNY"},
 			TradeType:   wechat.TradeTypeNative,
@@ -227,14 +250,22 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 			return order, fmt.Errorf("wechat unified order: %w", err)
 		}
 
+		// v3 NATIVE body fields are `appid` + `mchid` (no underscores) —
+		// the BFF uses mchid to audit-log which merchant handled each
+		// payment, and appid to cross-reference WeChat Open Platform info.
 		intent, _ := json.Marshal(map[string]string{
+			"appid":        s.wechat.AppID(),
+			"mchid":        s.wechat.MchID(),
 			"code_url":     resp.CodeURL,
-			"out_trade_no": order.ID,
-			"mch_id":       s.wechat.MchID(),
+			"out_trade_no": outTradeNo,
 		})
 		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intent); err != nil {
 			return order, fmt.Errorf("persist provider intent: %w", err)
 		}
+		// ProviderIntent is json.RawMessage (a []byte under the hood) — the
+		// marshalled intent flows in directly so the handler response can
+		// echo the code_url back to the BFF in the same response as the
+		// order row.
 		order.ProviderIntent = intent
 	}
 

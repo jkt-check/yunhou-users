@@ -10,8 +10,12 @@ import (
 // HTTPDoer is the minimal HTTP interface the real Client needs. Pulled
 // out so tests can inject a stub without dragging in a full transport
 // (and so cmd/server can wire *http.Client via a one-line adapter).
+// The ctx parameter lets callers propagate cancellation / deadlines into
+// the outbound request — production wires *http.Client (via
+// http.NewRequestWithContext); tests can capture the ctx to verify
+// cancellation behaviour without spinning up a real server.
 type HTTPDoer interface {
-	Do(req *HTTPRequest) (*HTTPResponse, error)
+	Do(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error)
 }
 
 // HTTPRequest / HTTPResponse are the minimal shapes the real-mode
@@ -35,12 +39,13 @@ type HTTPResponse struct {
 const userAgent = "yunhou-users/0.1"
 
 // unifiedOrderBody is the v3 /pay/transactions/native request body.
-// NATIVE needs only mch_id + amount + trade_type; the `appid` field is
-// reserved for in-app / JSAPI flows and is intentionally omitted.
-// Amount reuses types.Amount (not an anonymous nested struct) so the
-// JSON shape stays in one place.
+// NATIVE requires BOTH `appid` and `mchid` in v3 (the field name is
+// `mchid`, NOT `mch_id` — JSON-tag drift here caused the prior
+// mch_id = "" mismatch wechat reject). Amount reuses types.Amount
+// (not an anonymous nested struct) so the JSON shape stays in one place.
 type unifiedOrderBody struct {
-	MchID       string `json:"mch_id"`
+	AppID       string `json:"appid"`
+	MchID       string `json:"mchid"`
 	Description string `json:"description"`
 	OutTradeNo  string `json:"out_trade_no"`
 	NotifyURL   string `json:"notify_url"`
@@ -67,14 +72,15 @@ type Client struct {
 	// the Authorization header and the JSON body cannot drift apart.
 	// APIv3Key is NOT stored on Client — it lives on cfg and is used
 	// by the inbound webhook verifier only.
-	Signer    *Signer
-	NotifyURL string
-	BaseURL   string // https://api.mch.weixin.qq.com
-	HTTPDoer  HTTPDoer
+	Signer      *Signer
+	AppIDValue  string // WeChat Open Platform 网站应用 appid; required in v3 NATIVE body. Stored as AppIDValue so the AppID() getter (used by the service layer to echo into provider_intent.appid) doesn't collide with the field name.
+	NotifyURL   string
+	BaseURL     string // https://api.mch.weixin.qq.com
+	HTTPDoer    HTTPDoer
 }
 
 // MchID exposes the merchant ID to callers (e.g. PaymentService writes
-// it into orders.provider_intent.mch_id). Required by the service-
+// it into orders.provider_intent.mchid). Required by the service-
 // layer wechatClient interface. Returns "" when no Signer is wired so
 // callers see a sentinel rather than a panic.
 func (c *Client) MchID() string {
@@ -82,6 +88,14 @@ func (c *Client) MchID() string {
 		return ""
 	}
 	return c.Signer.MchID
+}
+
+// AppID exposes the WeChat Open Platform appid to callers (e.g.
+// PaymentService writes it into orders.provider_intent.appid).
+// Required by the service-layer wechatClient interface. Returns ""
+// when no AppID is wired so callers see a sentinel rather than a panic.
+func (c *Client) AppID() string {
+	return c.AppIDValue
 }
 
 // IsMockMode is a small accessor for handlers / services that need to
@@ -106,20 +120,21 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 			CodeURL:    fmt.Sprintf("weixin://wxpay/bizpayurl?pr=mock_%s", req.OutTradeNo),
 		}, nil
 	}
-	_ = ctx
 
-	// Real mode. NATIVE only needs mch_id — the `appid` field is
-	// reserved for in-app / JSAPI flows and is intentionally omitted.
-	// Amount reuses types.Amount (not an anonymous nested struct) so
-	// the JSON shape stays in one place.
-	body, err := json.Marshal(unifiedOrderBody{
-		MchID:       c.Signer.MchID,
-		Description: req.Description,
-		OutTradeNo:  req.OutTradeNo,
-		NotifyURL:   c.NotifyURL,
-		Amount:      req.Amount,
-		TradeType:   string(req.TradeType),
-	})
+	// Real mode. NATIVE requires BOTH `appid` and `mchid` (v3 protocol).
+	// Body is built field-by-field from a fresh struct (rather than
+	// reusing a single object literal) so future field additions stay
+	// reviewable.
+	var bodyBytes unifiedOrderBody
+	bodyBytes.AppID = c.AppIDValue
+	bodyBytes.MchID = c.Signer.MchID
+	bodyBytes.Description = req.Description
+	bodyBytes.OutTradeNo = req.OutTradeNo
+	bodyBytes.NotifyURL = c.NotifyURL
+	bodyBytes.Amount.Total = req.Amount.Total
+	bodyBytes.Amount.Currency = req.Amount.Currency
+	bodyBytes.TradeType = string(req.TradeType)
+	body, err := json.Marshal(bodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
@@ -130,7 +145,7 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 		return nil, fmt.Errorf("build auth: %w", err)
 	}
 
-	resp, err := c.HTTPDoer.Do(&HTTPRequest{
+	resp, err := c.HTTPDoer.Do(ctx, &HTTPRequest{
 		Method:  "POST",
 		URL:     c.BaseURL + reqPath,
 		Headers: map[string]string{
@@ -145,6 +160,15 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 		return nil, fmt.Errorf("%w: %v", ErrWeChatNetwork, err)
 	}
 
+	if resp.StatusCode >= 500 {
+		var errEnv struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(resp.Body, &errEnv)
+		return nil, fmt.Errorf("%w: %d %s: %s", ErrWeChatUpstream,
+			resp.StatusCode, errEnv.Code, errEnv.Message)
+	}
 	if resp.StatusCode >= 400 {
 		var errEnv struct {
 			Code    string `json:"code"`
@@ -167,15 +191,20 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 	return &UnifiedOrderResponse{OutTradeNo: req.OutTradeNo, CodeURL: out.CodeURL}, nil
 }
 
-// ErrWeChatUnifiedOrderRejected — WeChat returned a 4xx / 5xx response
-// (or a 200 with no code_url). This package makes a single attempt and
-// returns; the caller's retry policy decides whether to retry (e.g.
-// 5xx is transient and could be retried, 4xx is terminal). The order
-// row remains in 'pending' on error so the sweeper eventually flips it
-// to 'expired' if the caller doesn't clean up.
-var ErrWeChatUnifiedOrderRejected = errors.New("wechat unified order rejected")
+// ErrWeChatUnifiedOrderRejected — WeChat returned a 4xx response (or a
+// 200 with no code_url). This is a terminal rejection: retrying the
+// same payload will fail again. Caller should surface a user-visible
+// error and not auto-retry.
+var ErrWeChatUnifiedOrderRejected = errors.New("wechat unified order rejected (4xx)")
+
+// ErrWeChatUpstream — WeChat returned a 5xx response (transient upstream
+// failure). The order may or may not have been processed out-of-band;
+// callers MAY retry with the same OutTradeNo after a backoff. This
+// package does not retry itself (see spec §"5xx retry" — deferred to v2).
+var ErrWeChatUpstream = errors.New("wechat upstream 5xx")
 
 // ErrWeChatNetwork — outbound HTTP failure (timeout, DNS, connection
-// refused). Distinct from ErrWeChatUnifiedOrderRejected so callers can
-// classify transient vs terminal failures.
+// refused, ctx cancellation). Distinct from ErrWeChatUnifiedOrderRejected
+// and ErrWeChatUpstream so callers can classify transient vs terminal
+// failures.
 var ErrWeChatNetwork = errors.New("wechat network error")

@@ -25,21 +25,7 @@ else
   echo "(skipping backup — DATABASE_URL or ops/backup.sh unavailable)"
 fi
 
-echo "[3/5] run migrations"
-if [[ -n "${DATABASE_URL:-}" ]]; then
-  # Run the standalone migrate binary; it owns the _migrations ledger
-  # and re-applies nothing that's already recorded. See
-  # internal/migrate/migrate.go for the contract and migrations/README.md
-  # for the file naming + DDL rules.
-  docker compose run --rm migrate || {
-    echo "!! migrate failed — aborting deploy"
-    exit 1
-  }
-else
-  echo "(skipping migrations — DATABASE_URL not set)"
-fi
-
-echo "[4/5] build + restart image"
+echo "[3/5] build + restart image"
 docker compose build
 docker compose up -d
 # Poll for the container to reach 'running' state with a 60s ceiling.
@@ -55,6 +41,26 @@ if [[ "$running" != "true" ]]; then
   echo "!! container not running, recent logs:"
   docker compose logs --tail=200 app
   exit 1
+fi
+
+echo "[4/5] run migrations"
+if [[ -n "${DATABASE_URL:-}" ]]; then
+  # Run the standalone migrate binary; it owns the _migrations ledger
+  # and re-applies nothing that's already recorded. See
+  # internal/migrate/migrate.go for the contract and migrations/README.md
+  # for the file naming + DDL rules.
+  #
+  # Migrations run AFTER the new image is up so that, if a migration fails,
+  # we boot the previous binary against the unchanged schema instead of
+  # having the old binary try to hit a new-column schema it doesn't know
+  # about. (Build before migrate means: old code stays up if migrations
+  # fail; new code never starts if migrations fail.)
+  docker compose run --rm migrate || {
+    echo "!! migrate failed — aborting deploy"
+    exit 1
+  }
+else
+  echo "(skipping migrations — DATABASE_URL not set)"
 fi
 
 echo "[5/5] healthcheck"

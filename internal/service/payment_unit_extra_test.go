@@ -214,6 +214,7 @@ func (s *stubSubRepo) Renew(_ context.Context, _ string, _ *time.Time) error    
 type stubWechat struct {
 	mockMode  bool
 	mchID     string
+	appID     string
 	unifiedFn func(context.Context, wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
 	called    int
 	gotReq    wechat.UnifiedOrderRequest
@@ -221,13 +222,14 @@ type stubWechat struct {
 
 func (s *stubWechat) IsMockMode() bool { return s.mockMode }
 func (s *stubWechat) MchID() string    { return s.mchID }
+func (s *stubWechat) AppID() string    { return s.appID }
 func (s *stubWechat) UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
 	s.called++
 	s.gotReq = req
 	return s.unifiedFn(ctx, req)
 }
 
-func newPaymentServiceForCreateOrder(client *stubWechat) (*PaymentService, *stubOrderRepoLookup) {
+func newPaymentServiceForCreateOrder(client wechatClient) (*PaymentService, *stubOrderRepoLookup) {
 	orderRepo := &stubOrderRepoLookup{}
 	return NewPaymentService(
 		(*sqlx.DB)(nil),
@@ -245,6 +247,17 @@ func newPaymentServiceForCreateOrder(client *stubWechat) (*PaymentService, *stub
 	), orderRepo
 }
 
+// asWechatClient narrows a *stubWechat into a wechatClient interface —
+// keeps the call-sites readable while letting newPaymentServiceForCreateOrder
+// accept an untyped nil (which behaves correctly under channel=="wechat_pay"
+// branch: `s.wechat == nil` evaluates to true).
+func asWechatClient(s *stubWechat) wechatClient {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
 // ============================================================================
 // CreateOrder — channel-aware WeChat Pay pre-auth
 // ============================================================================
@@ -252,11 +265,12 @@ func newPaymentServiceForCreateOrder(client *stubWechat) (*PaymentService, *stub
 func TestCreateOrder_WeChat_Real_PersistsIntent(t *testing.T) {
 	stub := &stubWechat{
 		mchID: "1900000109",
+		appID: "wx1900000109",
 		unifiedFn: func(_ context.Context, _ wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
 			return &wechat.UnifiedOrderResponse{OutTradeNo: "order-1", CodeURL: "weixin://abc"}, nil
 		},
 	}
-	svc, orderRepo := newPaymentServiceForCreateOrder(stub)
+	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 
 	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
 	if err != nil {
@@ -265,8 +279,10 @@ func TestCreateOrder_WeChat_Real_PersistsIntent(t *testing.T) {
 	if stub.called != 1 {
 		t.Fatalf("UnifiedOrder called %d times, want 1", stub.called)
 	}
-	if stub.gotReq.OutTradeNo != order.ID {
-		t.Errorf("UnifiedOrder OutTradeNo = %q, want %q", stub.gotReq.OutTradeNo, order.ID)
+	// OutTradeNo now derives a short form from the order ID (strip
+	// hyphens + truncate to 32 chars) to satisfy WeChat's v3 length cap.
+	if len(stub.gotReq.OutTradeNo) != 32 {
+		t.Errorf("UnifiedOrder OutTradeNo len = %d, want 32 (short form of %q)", len(stub.gotReq.OutTradeNo), order.ID)
 	}
 	if stub.gotReq.Amount.Total != 29 {
 		t.Errorf("UnifiedOrder amount = %d fen, want 29", stub.gotReq.Amount.Total)
@@ -280,11 +296,72 @@ func TestCreateOrder_WeChat_Real_PersistsIntent(t *testing.T) {
 	if !strings.Contains(string(orderRepo.updateIntentPayload), `"code_url":"weixin://abc"`) {
 		t.Fatalf("UpdateProviderIntent payload = %s", orderRepo.updateIntentPayload)
 	}
-	if !strings.Contains(string(orderRepo.updateIntentPayload), `"mch_id":"1900000109"`) {
-		t.Fatalf("UpdateProviderIntent payload missing mch_id: %s", orderRepo.updateIntentPayload)
+	// v3 NATIVE body fields use `mchid` (no underscore) + `appid`
+	// alongside the code_url. Both echo onto provider_intent so the BFF
+	// and audit-log tooling see the merchant pair.
+	if !strings.Contains(string(orderRepo.updateIntentPayload), `"mchid":"1900000109"`) {
+		t.Fatalf("UpdateProviderIntent payload missing mchid: %s", orderRepo.updateIntentPayload)
+	}
+	if !strings.Contains(string(orderRepo.updateIntentPayload), `"appid":"wx1900000109"`) {
+		t.Fatalf("UpdateProviderIntent payload missing appid: %s", orderRepo.updateIntentPayload)
 	}
 	if string(order.ProviderIntent) != string(orderRepo.updateIntentPayload) {
 		t.Errorf("order.ProviderIntent = %s, persisted payload = %s", order.ProviderIntent, orderRepo.updateIntentPayload)
+	}
+}
+
+// TestCreateOrder_WeChat_NilClient_Fourxx confirms that a deployment
+// without a WeChat Pay client surfaces ErrWechatPayNotConfigured instead
+// of silently creating a pending order with no code_url (and no path to
+// pay). The handler maps this to 400.
+func TestCreateOrder_WeChat_NilClient_Fourxx(t *testing.T) {
+	svc, orderRepo := newPaymentServiceForCreateOrder(nil)
+
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	if !errors.Is(err, ErrWechatPayNotConfigured) {
+		t.Fatalf("expected ErrWechatPayNotConfigured, got %v (order=%+v)", err, order)
+	}
+	if orderRepo.updateIntentCalled {
+		t.Fatal("UpdateProviderIntent must not be called when wechat is nil")
+	}
+}
+
+// TestCreateOrder_ShortOutTradeNo pins the new short OutTradeNo derivation:
+// strip hyphens + truncate to 32 chars, regardless of UUID shape.
+func TestCreateOrder_ShortOutTradeNo(t *testing.T) {
+	cases := []struct {
+		name    string
+		orderID string
+		want    string
+	}{
+		{
+			"canonical uuid — strips hyphens, no truncation needed",
+			"12345678-1234-1234-1234-123456789012",
+			"12345678123412341234123456789012",
+		},
+		{
+			"hex-only — no hyphens, identity",
+			"abcdef0123456789abcdef0123456789",
+			"abcdef0123456789abcdef0123456789",
+		},
+		{
+			"long uuid → first 32 hex digits",
+			"abcdef0123456789abcdef-0123456789012345",
+			"abcdef0123456789abcdef0123456789",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := strings.ReplaceAll(tc.orderID, "-", "")[:32]
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+			if len(got) > 32 {
+				t.Errorf("len = %d, want <= 32", len(got))
+			}
+		})
 	}
 }
 
@@ -294,7 +371,7 @@ func TestCreateOrder_WeChat_Real_UnifiedOrderErr(t *testing.T) {
 			return nil, errors.New("wechat down")
 		},
 	}
-	svc, orderRepo := newPaymentServiceForCreateOrder(stub)
+	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 
 	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
 	if err == nil {
@@ -310,7 +387,7 @@ func TestCreateOrder_WeChat_Real_UnifiedOrderErr(t *testing.T) {
 
 func TestCreateOrder_WeChat_Mock_NoClientCall(t *testing.T) {
 	stub := &stubWechat{mockMode: true}
-	svc, orderRepo := newPaymentServiceForCreateOrder(stub)
+	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 
 	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay"); err != nil {
 		t.Fatalf("CreateOrder mock: %v", err)

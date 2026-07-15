@@ -297,6 +297,12 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "missing Idempotency-Key header"})
 	case errors.Is(err, service.ErrInvalidChannel):
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid channel"})
+	case errors.Is(err, service.ErrWechatPayNotConfigured):
+		// 400 — the deployment chose not to wire a WeChat Pay client, so
+		// the channel can't be served. Not a 404 (the route exists; the
+		// channel on this deployment just isn't enabled) and not a 503
+		// (we're not temporarily down — we never wire this channel).
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "wechat pay not configured on this deployment"})
 	default:
 		log.Printf("payment handler error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})

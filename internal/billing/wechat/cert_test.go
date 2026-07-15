@@ -52,7 +52,7 @@ func TestLoadPrivateKey_BadPEM(t *testing.T) {
 	}
 }
 
-func TestLoadCertSerial_DecimalString(t *testing.T) {
+func TestLoadCertSerial_UppercaseHex(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "cert.pem")
 	writeSelfSignedCert(t, certPath)
@@ -64,10 +64,17 @@ func TestLoadCertSerial_DecimalString(t *testing.T) {
 	if serial == "" {
 		t.Fatalf("LoadCertSerial: empty serial")
 	}
-	// Must be all decimal digits (no "0x", no sign, no hex letters).
+	// 1234567890 → "499602D2" in uppercase hex. We use the canonical
+	// big-endian big.Int.Bytes() → %X round-trip result to lock the format.
+	want := "499602D2"
+	if serial != want {
+		t.Fatalf("LoadCertSerial: got %q, want %q", serial, want)
+	}
+	// Belt-and-braces: every char must be 0-9 or A-F (no lowercase, no
+	// "0x" prefix, no sign, no spaces).
 	for _, r := range serial {
-		if r < '0' || r > '9' {
-			t.Fatalf("LoadCertSerial: non-decimal char %q in %q", r, serial)
+		if !((r >= '0' && r <= '9') || (r >= 'A' && r <= 'F')) {
+			t.Fatalf("LoadCertSerial: non-uppercase-hex char %q in %q", r, serial)
 		}
 	}
 }

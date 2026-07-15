@@ -57,7 +57,7 @@ func loadSignerForTest(t *testing.T) *Signer {
 	if err != nil {
 		t.Fatalf("parse test cert: %v", err)
 	}
-	return &Signer{MchID: "test_mch", SerialNo: serialToDecimal(cert.SerialNumber), PrivateKey: rsaKey}
+	return &Signer{MchID: "test_mch", SerialNo: serialToHexUpper(cert.SerialNumber.Bytes()), PrivateKey: rsaKey}
 }
 
 func TestBuildAuthHeader_FixedVector(t *testing.T) {

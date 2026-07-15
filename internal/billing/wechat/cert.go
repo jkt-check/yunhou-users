@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"math/big"
 	"os"
 )
 
@@ -44,9 +43,11 @@ func LoadPrivateKey(path string) (*rsa.PrivateKey, error) {
 }
 
 // LoadCertSerial reads a PEM-encoded X.509 certificate from disk and
-// returns the certificate's serial number as a decimal string — the
-// format WeChat Pay v3 expects in the `serial_no` field of the
-// Authorization header. Big-endian byte representation, decimal-encoded.
+// returns the certificate's serial number as an UPPERCASE HEX string —
+// the format WeChat Pay v3 expects in the `serial_no` field of the
+// Authorization header. Big-endian byte representation, hex-encoded
+// (no `0x` prefix, no sign), uppercase letters per the official
+// wechatpay-go SDK's `utils.GetCertificateSerialNumber` reference.
 func LoadCertSerial(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -63,16 +64,19 @@ func LoadCertSerial(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse cert: %w", err)
 	}
-	return serialToDecimal(cert.SerialNumber), nil
+	return serialToHexUpper(cert.SerialNumber.Bytes()), nil
 }
 
-// serialToDecimal converts a big.Int serial number to WeChat's expected
-// decimal string form. cert.SerialNumber.String() (the natural big.Int
-// representation) does NOT match what WeChat expects — WeChat requires
-// the byte representation interpreted as a positive integer with no
-// sign prefix. For positive serials (the common case), this is the same
-// as .String(); for serials whose high bit is set, .String() prepends a
-// sign and breaks WeChat's parser.
-func serialToDecimal(serial *big.Int) string {
-	return fmt.Sprintf("%d", new(big.Int).Abs(serial))
+// serialToHexUpper returns the cert's serial number as the WeChat Pay v3
+// "serial_no" field expects: uppercase hex of the big-endian byte
+// representation. Matches the official wechatpay-go SDK's
+// utils.GetCertificateSerialNumber. We use `%X` (uppercase) because
+// wechatpay-apiv3 merchants sometimes register their cert with the
+// platform using the upper-case form, and the auth lookup is
+// case-sensitive on the merchant side.
+//
+// (Previously the helper returned decimal — that was wrong; WeChat
+// does NOT accept decimal serial numbers in the Authorization header.)
+func serialToHexUpper(serial []byte) string {
+	return fmt.Sprintf("%X", serial)
 }

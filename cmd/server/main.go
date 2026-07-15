@@ -52,11 +52,12 @@ func main() {
 			log.Fatalf("wechat: load cert %q: %v", cfg.WeChatPayMchCertPath, err)
 		}
 		wechatClient = &wechat.Client{
-			MockMode:  false,
-			Signer:    &wechat.Signer{MchID: cfg.WeChatPayMchID, SerialNo: serial, PrivateKey: pk},
-			NotifyURL: cfg.WeChatPayNotifyURL,
-			BaseURL:   "https://api.mch.weixin.qq.com",
-			HTTPDoer:  newWechatHTTPAdapter(10 * time.Second),
+			MockMode:   false,
+			Signer:     &wechat.Signer{MchID: cfg.WeChatPayMchID, SerialNo: serial, PrivateKey: pk},
+			AppIDValue: cfg.WeChatPayAppID,
+			NotifyURL:  cfg.WeChatPayNotifyURL,
+			BaseURL:    "https://api.mch.weixin.qq.com",
+			HTTPDoer:   newWechatHTTPAdapter(10 * time.Second),
 		}
 	} else {
 		// Real mode + no private key path = the deployment chose not to
@@ -290,10 +291,13 @@ func timeoutMiddleware(d time.Duration) gin.HandlerFunc {
 
 // httpDoerAdapter wraps a real *http.Client in the wechat.HTTPDoer
 // interface. Used in production only — tests inject their own stub.
+// The ctx is propagated into http.NewRequestWithContext so a Gin
+// request timeout (timeoutMiddleware) cancels the in-flight WeChat
+// outbound call at the same lifecycle boundary.
 type httpDoerAdapter struct{ c *http.Client }
 
-func (a *httpDoerAdapter) Do(req *wechat.HTTPRequest) (*wechat.HTTPResponse, error) {
-	httpReq, err := http.NewRequest(req.Method, req.URL, bytes.NewReader(req.Body))
+func (a *httpDoerAdapter) Do(ctx context.Context, req *wechat.HTTPRequest) (*wechat.HTTPResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
 		return nil, err
 	}

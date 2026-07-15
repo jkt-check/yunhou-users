@@ -163,6 +163,7 @@ func TestValidate_HappyPath(t *testing.T) {
 		OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
 		WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef", // 32 bytes
 		WeChatPayMchID:             "1900000001",
+		WeChatPayAppID:             "wx1900000109",
 		WeChatPayMchPrivateKeyPath: "/etc/wechat/apiclient_key.pem",
 		WeChatPayMchCertPath:       "/etc/wechat/apiclient_cert.pem",
 		WeChatPayNotifyURL:         "https://example.com/webhooks/payment/wechat_pay",
@@ -493,28 +494,36 @@ func TestLoad_WeChatPayMchID(t *testing.T) {
 	}
 }
 
-// TestValidate_WeChatReal_AllFiveRequired covers the 5-tuple guard for
+// TestValidate_WeChatReal_AllSixRequired covers the 6-tuple guard for
 // real-mode WeChat Pay: in real mode (mock=false), the configuration must
-// provide all five env vars — MCH_ID, APIv3_KEY, MCH_PRIVATE_KEY_PATH,
-// MCH_CERT_PATH, NOTIFY_URL. Each row omits exactly one of the 3 new envs
+// provide all six env vars — MCH_ID, APIv3_KEY, APP_ID, MCH_PRIVATE_KEY_PATH,
+// MCH_CERT_PATH, NOTIFY_URL. Each row omits exactly one of the 4 newer envs
 // and expects Validate() to error. The two existing MCH_ID/APIv3_KEY rules
-// are also covered elsewhere; this test pins the third arm.
-func TestValidate_WeChatReal_AllFiveRequired(t *testing.T) {
+// are also covered elsewhere; this test pins the partial-tuple arm.
+func TestValidate_WeChatReal_AllSixRequired(t *testing.T) {
 	cases := []struct {
 		name string
 		env  map[string]string
 	}{
+		{"missing app id", map[string]string{
+			"WECHAT_PAY_MCH_ID": "123", "WECHAT_PAY_API_V3_KEY": "k",
+			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k", "WECHAT_PAY_MCH_CERT_PATH": "/c",
+			"WECHAT_PAY_NOTIFY_URL": "https://x/cb",
+		}},
 		{"missing private key path", map[string]string{
 			"WECHAT_PAY_MCH_ID": "123", "WECHAT_PAY_API_V3_KEY": "k",
-			"WECHAT_PAY_MCH_CERT_PATH": "/c", "WECHAT_PAY_NOTIFY_URL": "https://x/cb",
+			"WECHAT_PAY_APP_ID": "wxabc", "WECHAT_PAY_MCH_CERT_PATH": "/c",
+			"WECHAT_PAY_NOTIFY_URL": "https://x/cb",
 		}},
 		{"missing cert path", map[string]string{
 			"WECHAT_PAY_MCH_ID": "123", "WECHAT_PAY_API_V3_KEY": "k",
-			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k", "WECHAT_PAY_NOTIFY_URL": "https://x/cb",
+			"WECHAT_PAY_APP_ID": "wxabc", "WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k",
+			"WECHAT_PAY_NOTIFY_URL": "https://x/cb",
 		}},
 		{"missing notify url", map[string]string{
 			"WECHAT_PAY_MCH_ID": "123", "WECHAT_PAY_API_V3_KEY": "k",
-			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k", "WECHAT_PAY_MCH_CERT_PATH": "/c",
+			"WECHAT_PAY_APP_ID": "wxabc", "WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k",
+			"WECHAT_PAY_MCH_CERT_PATH": "/c",
 		}},
 		{"only private key path, all else empty", map[string]string{
 			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k",
@@ -535,11 +544,11 @@ func TestValidate_WeChatReal_AllFiveRequired(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			// Wipe any leftover WeChat + state-secret env vars so the test
-			// isolates the new 3-env check (otherwise Validate fails on
+			// isolates the new 4-env check (otherwise Validate fails on
 			// OAUTH_STATE_SECRET first and the test "passes" for the wrong
 			// reason).
 			for _, k := range []string{
-				"WECHAT_PAY_MCH_ID", "WECHAT_PAY_API_V3_KEY",
+				"WECHAT_PAY_MCH_ID", "WECHAT_PAY_API_V3_KEY", "WECHAT_PAY_APP_ID",
 				"WECHAT_PAY_MCH_PRIVATE_KEY_PATH", "WECHAT_PAY_MCH_CERT_PATH",
 				"WECHAT_PAY_NOTIFY_URL", "WECHAT_PAY_MOCK",
 				"OAUTH_STATE_SECRET",
@@ -564,25 +573,26 @@ func TestValidate_WeChatReal_AllFiveRequired(t *testing.T) {
 	}
 }
 
-// TestValidate_WeChatReal_AllFiveSet_OK guards the all-five-set side of the
-// real-mode tuple rule. All five fields together are a valid configuration.
-func TestValidate_WeChatReal_AllFiveSet_OK(t *testing.T) {
+// TestValidate_WeChatReal_AllSixSet_OK guards the all-six-set side of the
+// real-mode tuple rule. All six fields together are a valid configuration.
+func TestValidate_WeChatReal_AllSixSet_OK(t *testing.T) {
 	t.Setenv("OAUTH_STATE_SECRET", "test-state-secret-thirty-two-bytes-min-len")
 	t.Setenv("WECHAT_PAY_MOCK", "0")
 	t.Setenv("WECHAT_PAY_MCH_ID", "1900000001")
 	t.Setenv("WECHAT_PAY_API_V3_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("WECHAT_PAY_APP_ID", "wx1900000109")
 	t.Setenv("WECHAT_PAY_MCH_PRIVATE_KEY_PATH", "/k")
 	t.Setenv("WECHAT_PAY_MCH_CERT_PATH", "/c")
 	t.Setenv("WECHAT_PAY_NOTIFY_URL", "https://x/cb")
 
 	c := Load()
 	if err := c.Validate(); err != nil {
-		t.Fatalf("Validate with all 5 set: got %v, want nil", err)
+		t.Fatalf("Validate with all 6 set: got %v, want nil", err)
 	}
 }
 
 // TestValidate_WeChatMock_AllowsEmpty confirms that mock-mode deployments
-// (WECHAT_PAY_MOCK=1) may leave all five WeChat Pay env vars unset — the
+// (WECHAT_PAY_MOCK=1) may leave all six WeChat Pay env vars unset — the
 // mock short-circuits both the inbound webhook verification and the
 // outbound signing path, so there is no material to load.
 func TestValidate_WeChatMock_AllowsEmpty(t *testing.T) {
@@ -592,6 +602,61 @@ func TestValidate_WeChatMock_AllowsEmpty(t *testing.T) {
 	c := Load()
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate in mock mode: %v", err)
+	}
+}
+
+// TestValidate_WeChatReal_APIv3KeyWrongLength confirms that when real mode
+// is enabled AND the APIv3 key is set, it must be exactly 32 bytes.
+// Used for AES-GCM (16/24/32-byte keys) and as an HMAC-SHA256 key in the
+// inbound webhook signature verifier. Wrong-sized values would silently
+// misalign AES block boundaries at request time.
+func TestValidate_WeChatReal_APIv3KeyWrongLength(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{"too short", "short"},
+		{"too long", strings.Repeat("a", 33)},
+		{"31 bytes", strings.Repeat("a", 31)},
+		{"33 bytes", strings.Repeat("a", 33)},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validRealWeChatConfig()
+			cfg.WeChatAPIv3Key = tc.key
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected error for APIv3Key=%q (len %d)", tc.key, len(tc.key))
+			}
+			if !strings.Contains(err.Error(), "exactly 32 bytes") {
+				t.Errorf("error message missing 'exactly 32 bytes': %v", err)
+			}
+		})
+	}
+}
+
+// validRealWeChatConfig builds a baseline Config that satisfies every
+// required field for real-mode WeChat Pay. Tests then mutate one field
+// at a time to exercise Validate()'s error branches.
+func validRealWeChatConfig() *Config {
+	return &Config{
+		DatabaseURL:                "postgres://x",
+		RSAPrivate:                 "priv",
+		RSAPublic:                  "pub",
+		JWTAccessTTL:               15 * time.Minute,
+		JWTRefreshTTL:              168 * time.Hour,
+		OrderExpiryDuration:        30 * time.Minute,
+		SweeperInterval:            1 * time.Minute,
+		OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
+		WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef", // 32 bytes
+		WeChatPayMchID:             "1900000001",
+		WeChatPayAppID:             "wx1900000109",
+		WeChatPayMchPrivateKeyPath: "/k",
+		WeChatPayMchCertPath:       "/c",
+		WeChatPayNotifyURL:         "https://x/cb",
 	}
 }
 
@@ -654,6 +719,7 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 		cfg.WeChatPayMock = false
 		cfg.WeChatAPIv3Key = "0123456789abcdef0123456789abcdef"
 		cfg.WeChatPayMchID = "1900000001"
+		cfg.WeChatPayAppID = "wx1900000109"
 		cfg.WeChatPayMchPrivateKeyPath = "/k"
 		cfg.WeChatPayMchCertPath = "/c"
 		cfg.WeChatPayNotifyURL = "https://x/cb"

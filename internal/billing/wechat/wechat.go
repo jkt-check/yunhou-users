@@ -2,32 +2,10 @@ package wechat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
-
-// Client is the WeChat Pay v3 entry point. Two modes:
-//
-//   - MockMode=true: UnifiedOrder returns a deterministic code_url
-//     derived from OutTradeNo so a BFF can render a "fake" QR. No
-//     outbound HTTP call.
-//
-//   - MockMode=false: the real v3 client (lands with A2.c). v1 returns
-//     an explicit ErrUnimplemented so production-like callers get a
-//     loud failure instead of a silently missing order.
-type Client struct {
-	MockMode bool
-	// Real-mode fields (used when MockMode=false). Wired by cmd/server
-	// from cfg in A2.c. Left as zero-value stubs in v1 because the
-	// real signing / certificate plumbing is A2.c's scope.
-	MchID       string
-	APIv3Key    []byte
-	CertPath    string
-	KeyPath     string
-	NotifyURL   string
-	BaseURL     string // https://api.mch.weixin.qq.com
-	HTTPDoer    HTTPDoer
-}
 
 // HTTPDoer is the minimal HTTP interface the real Client needs. Pulled
 // out so tests can inject a stub without dragging in a full transport
@@ -37,10 +15,8 @@ type HTTPDoer interface {
 }
 
 // HTTPRequest / HTTPResponse are the minimal shapes the real-mode
-// UnifiedOrder path will need. Kept here as opaque structs to avoid
-// pulling net/http into the package's public surface — the A2.c
-// landing will replace them with concrete types or remove them if a
-// direct net/http dependency is acceptable.
+// UnifiedOrder path needs. Kept here as opaque structs to avoid pulling
+// net/http into the package's public surface.
 type HTTPRequest struct {
 	Method  string
 	URL     string
@@ -53,16 +29,70 @@ type HTTPResponse struct {
 	Body       []byte
 }
 
-// ErrUnimplemented signals the real WeChat Pay v3 client hasn't landed
-// yet (scheduled for A2.c — production credentials). Production callers
-// that hit this path get a loud 500 with a clear next-action message
-// instead of a silently broken flow.
-var ErrUnimplemented = errors.New("wechat pay v3 real client not yet implemented (A2.c)")
+// userAgent identifies this service in the User-Agent header on
+// outbound WeChat Pay requests. Package-level so tests can compare
+// against a stable constant.
+const userAgent = "yunhou-users/0.1"
 
-// UnifiedOrder mints a code_url for the given request. In mock mode
-// the URL is deterministic from OutTradeNo so tests can assert exact
-// values without flakiness; in real mode it returns ErrUnimplemented
-// until A2.c lands.
+// unifiedOrderBody is the v3 /pay/transactions/native request body.
+// NATIVE needs only mch_id + amount + trade_type; the `appid` field is
+// reserved for in-app / JSAPI flows and is intentionally omitted.
+// Amount reuses types.Amount (not an anonymous nested struct) so the
+// JSON shape stays in one place.
+type unifiedOrderBody struct {
+	MchID       string `json:"mch_id"`
+	Description string `json:"description"`
+	OutTradeNo  string `json:"out_trade_no"`
+	NotifyURL   string `json:"notify_url"`
+	Amount      Amount `json:"amount"`
+	TradeType   string `json:"trade_type"`
+}
+
+// Client is the WeChat Pay v3 entry point. Two modes:
+//
+//   - MockMode=true: UnifiedOrder returns a deterministic code_url
+//     derived from OutTradeNo so a BFF can render a "fake" QR. No
+//     outbound HTTP call.
+//
+//   - MockMode=false: the real v3 client. Signs outbound requests with
+//     the merchant RSA private key (via Signer), calls
+//     api.mch.weixin.qq.com/v3/pay/transactions/native for NATIVE
+//     payments, returns the parsed code_url.
+type Client struct {
+	MockMode bool
+
+	// Real-mode fields (used when MockMode=false). Signer is the
+	// single source of truth for the merchant ID: MchID() returns
+	// c.Signer.MchID and UnifiedOrder's body also reads from there, so
+	// the Authorization header and the JSON body cannot drift apart.
+	// APIv3Key is NOT stored on Client — it lives on cfg and is used
+	// by the inbound webhook verifier only.
+	Signer    *Signer
+	NotifyURL string
+	BaseURL   string // https://api.mch.weixin.qq.com
+	HTTPDoer  HTTPDoer
+}
+
+// MchID exposes the merchant ID to callers (e.g. PaymentService writes
+// it into orders.provider_intent.mch_id). Required by the service-
+// layer wechatClient interface. Returns "" when no Signer is wired so
+// callers see a sentinel rather than a panic.
+func (c *Client) MchID() string {
+	if c.Signer == nil {
+		return ""
+	}
+	return c.Signer.MchID
+}
+
+// IsMockMode is a small accessor for handlers / services that need to
+// know whether to skip real-mode code paths (e.g. mock payloads are
+// plaintext, no resource block; mock code_url is enough for BFF dev).
+func (c *Client) IsMockMode() bool { return c.MockMode }
+
+// UnifiedOrder mints a code_url for the given request. In mock mode the
+// URL is deterministic from OutTradeNo so tests can assert exact values
+// without flakiness; in real mode it POSTs to
+// /v3/pay/transactions/native and parses the response.
 func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*UnifiedOrderResponse, error) {
 	if req.OutTradeNo == "" {
 		return nil, errors.New("OutTradeNo is required")
@@ -77,10 +107,75 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 		}, nil
 	}
 	_ = ctx
-	return nil, ErrUnimplemented
+
+	// Real mode. NATIVE only needs mch_id — the `appid` field is
+	// reserved for in-app / JSAPI flows and is intentionally omitted.
+	// Amount reuses types.Amount (not an anonymous nested struct) so
+	// the JSON shape stays in one place.
+	body, err := json.Marshal(unifiedOrderBody{
+		MchID:       c.Signer.MchID,
+		Description: req.Description,
+		OutTradeNo:  req.OutTradeNo,
+		NotifyURL:   c.NotifyURL,
+		Amount:      req.Amount,
+		TradeType:   string(req.TradeType),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal body: %w", err)
+	}
+
+	reqPath := "/v3/pay/transactions/native"
+	auth, err := c.Signer.BuildAuthHeader("POST", reqPath, body)
+	if err != nil {
+		return nil, fmt.Errorf("build auth: %w", err)
+	}
+
+	resp, err := c.HTTPDoer.Do(&HTTPRequest{
+		Method:  "POST",
+		URL:     c.BaseURL + reqPath,
+		Headers: map[string]string{
+			"Authorization": auth,
+			"Content-Type":  "application/json",
+			"Accept":        "application/json",
+			"User-Agent":    userAgent,
+		},
+		Body: body,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrWeChatNetwork, err)
+	}
+
+	if resp.StatusCode >= 400 {
+		var errEnv struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(resp.Body, &errEnv)
+		return nil, fmt.Errorf("%w: %d %s: %s", ErrWeChatUnifiedOrderRejected,
+			resp.StatusCode, errEnv.Code, errEnv.Message)
+	}
+
+	var out struct {
+		CodeURL string `json:"code_url"`
+	}
+	if err := json.Unmarshal(resp.Body, &out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if out.CodeURL == "" {
+		return nil, fmt.Errorf("%w: empty code_url", ErrWeChatUnifiedOrderRejected)
+	}
+	return &UnifiedOrderResponse{OutTradeNo: req.OutTradeNo, CodeURL: out.CodeURL}, nil
 }
 
-// IsMockMode is a small accessor for handlers that need to know whether
-// to skip AES-GCM resource decryption (mock payloads are plaintext
-// JSON, no resource block).
-func (c *Client) IsMockMode() bool { return c.MockMode }
+// ErrWeChatUnifiedOrderRejected — WeChat returned a 4xx / 5xx response
+// (or a 200 with no code_url). This package makes a single attempt and
+// returns; the caller's retry policy decides whether to retry (e.g.
+// 5xx is transient and could be retried, 4xx is terminal). The order
+// row remains in 'pending' on error so the sweeper eventually flips it
+// to 'expired' if the caller doesn't clean up.
+var ErrWeChatUnifiedOrderRejected = errors.New("wechat unified order rejected")
+
+// ErrWeChatNetwork — outbound HTTP failure (timeout, DNS, connection
+// refused). Distinct from ErrWeChatUnifiedOrderRejected so callers can
+// classify transient vs terminal failures.
+var ErrWeChatNetwork = errors.New("wechat network error")

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/yunhou/users/internal/billing/paypal"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
@@ -28,6 +31,37 @@ func main() {
 	cfg := config.Load()
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config validation failed: %v", err)
+	}
+
+	// WeChat Pay client: real mode loads cert + key from disk and builds a
+	// Signer + Client. Mock mode skips both file loads and returns a
+	// stub Client that mints deterministic code_urls. Real-mode production
+	// deployments must have all 5 WECHAT_PAY_* envs set (gated by
+	// config.Validate); dev/mock environments with WECHAT_PAY_MOCK=1 get
+	// a non-functional mock client.
+	var wechatClient *wechat.Client
+	if cfg.WeChatPayMock {
+		wechatClient = &wechat.Client{MockMode: true}
+	} else if cfg.WeChatPayMchPrivateKeyPath != "" {
+		pk, err := wechat.LoadPrivateKey(cfg.WeChatPayMchPrivateKeyPath)
+		if err != nil {
+			log.Fatalf("wechat: load private key %q: %v", cfg.WeChatPayMchPrivateKeyPath, err)
+		}
+		serial, err := wechat.LoadCertSerial(cfg.WeChatPayMchCertPath)
+		if err != nil {
+			log.Fatalf("wechat: load cert %q: %v", cfg.WeChatPayMchCertPath, err)
+		}
+		wechatClient = &wechat.Client{
+			MockMode:  false,
+			Signer:    &wechat.Signer{MchID: cfg.WeChatPayMchID, SerialNo: serial, PrivateKey: pk},
+			NotifyURL: cfg.WeChatPayNotifyURL,
+			BaseURL:   "https://api.mch.weixin.qq.com",
+			HTTPDoer:  newWechatHTTPAdapter(10 * time.Second),
+		}
+	} else {
+		// Real mode + no private key path = the deployment chose not to
+		// enable WeChat Pay at all (wechat endpoints return 404).
+		wechatClient = nil
 	}
 
 	db, err := sqlx.Connect("postgres", cfg.DatabaseURL)
@@ -82,7 +116,7 @@ func main() {
 		subRepo, planRepo, userRepo,
 		webhookEventRepo, auditLogRepo,
 		&noChannelRefundAPI{},
-		nil,
+		wechatClient,
 		cfg.OrderExpiryDuration,
 	)
 
@@ -252,4 +286,32 @@ func timeoutMiddleware(d time.Duration) gin.HandlerFunc {
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
+}
+
+// httpDoerAdapter wraps a real *http.Client in the wechat.HTTPDoer
+// interface. Used in production only — tests inject their own stub.
+type httpDoerAdapter struct{ c *http.Client }
+
+func (a *httpDoerAdapter) Do(req *wechat.HTTPRequest) (*wechat.HTTPResponse, error) {
+	httpReq, err := http.NewRequest(req.Method, req.URL, bytes.NewReader(req.Body))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+	httpResp, err := a.c.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &wechat.HTTPResponse{StatusCode: httpResp.StatusCode, Body: body}, nil
+}
+
+func newWechatHTTPAdapter(timeout time.Duration) wechat.HTTPDoer {
+	return &httpDoerAdapter{c: &http.Client{Timeout: timeout}}
 }

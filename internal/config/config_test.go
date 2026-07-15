@@ -53,17 +53,17 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.GitHubClientSecret != "" {
 		t.Errorf("GitHubClientSecret: got %q, want empty", cfg.GitHubClientSecret)
 	}
-	}
+}
 
 func TestLoad_EnvVarsOverride(t *testing.T) {
 	envVars := map[string]string{
-		"PORT":                "3000",
-		"DATABASE_URL":        "postgres://user:pass@host/db",
+		"PORT":                 "3000",
+		"DATABASE_URL":         "postgres://user:pass@host/db",
 		"RSA_PRIVATE_KEY_PATH": "/tmp/priv.pem",
 		"RSA_PUBLIC_KEY_PATH":  "/tmp/pub.pem",
-		"JWT_ACCESS_TTL":      "30m",
-		"JWT_REFRESH_TTL":     "72h",
-		"GITHUB_CLIENT_ID":    "gh-id",
+		"JWT_ACCESS_TTL":       "30m",
+		"JWT_REFRESH_TTL":      "72h",
+		"GITHUB_CLIENT_ID":     "gh-id",
 		"GITHUB_CLIENT_SECRET": "gh-secret",
 	}
 
@@ -153,16 +153,19 @@ func TestEnvOr(t *testing.T) {
 func TestValidate_HappyPath(t *testing.T) {
 	t.Parallel()
 	cfg := &Config{
-		DatabaseURL:        "postgres://x",
-		RSAPrivate:         "priv",
-		RSAPublic:          "pub",
-		JWTAccessTTL:       15 * time.Minute,
-		JWTRefreshTTL:      168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     1 * time.Minute,
-		OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
-		WeChatAPIv3Key:      "0123456789abcdef0123456789abcdef", // 32 bytes
-		WeChatPayMchID:      "1900000001",
+		DatabaseURL:                "postgres://x",
+		RSAPrivate:                 "priv",
+		RSAPublic:                  "pub",
+		JWTAccessTTL:               15 * time.Minute,
+		JWTRefreshTTL:              168 * time.Hour,
+		OrderExpiryDuration:        30 * time.Minute,
+		SweeperInterval:            1 * time.Minute,
+		OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
+		WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef", // 32 bytes
+		WeChatPayMchID:             "1900000001",
+		WeChatPayMchPrivateKeyPath: "/etc/wechat/apiclient_key.pem",
+		WeChatPayMchCertPath:       "/etc/wechat/apiclient_cert.pem",
+		WeChatPayNotifyURL:         "https://example.com/webhooks/payment/wechat_pay",
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("want nil, got %v", err)
@@ -236,11 +239,11 @@ func TestValidate_ErrorPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			cfg := &Config{
-				DatabaseURL:        "postgres://x",
-				RSAPrivate:         "priv",
-				RSAPublic:          "pub",
-				JWTAccessTTL:       15 * time.Minute,
-				JWTRefreshTTL:      168 * time.Hour,
+				DatabaseURL:         "postgres://x",
+				RSAPrivate:          "priv",
+				RSAPublic:           "pub",
+				JWTAccessTTL:        15 * time.Minute,
+				JWTRefreshTTL:       168 * time.Hour,
 				OrderExpiryDuration: 30 * time.Minute,
 				SweeperInterval:     1 * time.Minute,
 				OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
@@ -380,7 +383,9 @@ func TestLoad_PaypalEnvOverride(t *testing.T) {
 }
 
 // TestLoad_WeChatOAuthMock covers the WECHAT_OAUTH_MOCK toggle:
-//   "1" → true (handler short-circuits); any other value or unset → false
+//
+//	"1" → true (handler short-circuits); any other value or unset → false
+//
 // (production behaviour). The boolean must NOT be a string-true; an
 // operator setting "true" by accident should NOT enable mock mode.
 func TestLoad_WeChatOAuthMock(t *testing.T) {
@@ -488,6 +493,108 @@ func TestLoad_WeChatPayMchID(t *testing.T) {
 	}
 }
 
+// TestValidate_WeChatReal_AllFiveRequired covers the 5-tuple guard for
+// real-mode WeChat Pay: in real mode (mock=false), the configuration must
+// provide all five env vars — MCH_ID, APIv3_KEY, MCH_PRIVATE_KEY_PATH,
+// MCH_CERT_PATH, NOTIFY_URL. Each row omits exactly one of the 3 new envs
+// and expects Validate() to error. The two existing MCH_ID/APIv3_KEY rules
+// are also covered elsewhere; this test pins the third arm.
+func TestValidate_WeChatReal_AllFiveRequired(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"missing private key path", map[string]string{
+			"WECHAT_PAY_MCH_ID": "123", "WECHAT_PAY_API_V3_KEY": "k",
+			"WECHAT_PAY_MCH_CERT_PATH": "/c", "WECHAT_PAY_NOTIFY_URL": "https://x/cb",
+		}},
+		{"missing cert path", map[string]string{
+			"WECHAT_PAY_MCH_ID": "123", "WECHAT_PAY_API_V3_KEY": "k",
+			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k", "WECHAT_PAY_NOTIFY_URL": "https://x/cb",
+		}},
+		{"missing notify url", map[string]string{
+			"WECHAT_PAY_MCH_ID": "123", "WECHAT_PAY_API_V3_KEY": "k",
+			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k", "WECHAT_PAY_MCH_CERT_PATH": "/c",
+		}},
+		{"only private key path, all else empty", map[string]string{
+			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k",
+		}},
+		{"only cert path, all else empty", map[string]string{
+			"WECHAT_PAY_MCH_CERT_PATH": "/c",
+		}},
+		{"only notify url, all else empty", map[string]string{
+			"WECHAT_PAY_NOTIFY_URL": "https://x/cb",
+		}},
+		{"private key + cert set, no MCH_ID/APIv3Key", map[string]string{
+			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH": "/k",
+			"WECHAT_PAY_MCH_CERT_PATH":        "/c",
+			"WECHAT_PAY_NOTIFY_URL":           "https://x/cb",
+		}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Wipe any leftover WeChat + state-secret env vars so the test
+			// isolates the new 3-env check (otherwise Validate fails on
+			// OAUTH_STATE_SECRET first and the test "passes" for the wrong
+			// reason).
+			for _, k := range []string{
+				"WECHAT_PAY_MCH_ID", "WECHAT_PAY_API_V3_KEY",
+				"WECHAT_PAY_MCH_PRIVATE_KEY_PATH", "WECHAT_PAY_MCH_CERT_PATH",
+				"WECHAT_PAY_NOTIFY_URL", "WECHAT_PAY_MOCK",
+				"OAUTH_STATE_SECRET",
+			} {
+				orig, had := os.LookupEnv(k)
+				os.Unsetenv(k)
+				if had {
+					t.Cleanup(func() { os.Setenv(k, orig) })
+				} else {
+					t.Cleanup(func() { os.Unsetenv(k) })
+				}
+			}
+			t.Setenv("OAUTH_STATE_SECRET", "test-state-secret-thirty-two-bytes-min-len")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			c := Load()
+			if err := c.Validate(); err == nil {
+				t.Fatalf("Validate: expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
+// TestValidate_WeChatReal_AllFiveSet_OK guards the all-five-set side of the
+// real-mode tuple rule. All five fields together are a valid configuration.
+func TestValidate_WeChatReal_AllFiveSet_OK(t *testing.T) {
+	t.Setenv("OAUTH_STATE_SECRET", "test-state-secret-thirty-two-bytes-min-len")
+	t.Setenv("WECHAT_PAY_MOCK", "0")
+	t.Setenv("WECHAT_PAY_MCH_ID", "1900000001")
+	t.Setenv("WECHAT_PAY_API_V3_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("WECHAT_PAY_MCH_PRIVATE_KEY_PATH", "/k")
+	t.Setenv("WECHAT_PAY_MCH_CERT_PATH", "/c")
+	t.Setenv("WECHAT_PAY_NOTIFY_URL", "https://x/cb")
+
+	c := Load()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate with all 5 set: got %v, want nil", err)
+	}
+}
+
+// TestValidate_WeChatMock_AllowsEmpty confirms that mock-mode deployments
+// (WECHAT_PAY_MOCK=1) may leave all five WeChat Pay env vars unset — the
+// mock short-circuits both the inbound webhook verification and the
+// outbound signing path, so there is no material to load.
+func TestValidate_WeChatMock_AllowsEmpty(t *testing.T) {
+	t.Setenv("OAUTH_STATE_SECRET", "test-state-secret-thirty-two-bytes-min-len")
+	t.Setenv("WECHAT_PAY_MOCK", "1")
+	// No wechat pay envs at all — mock mode must not block boot.
+	c := Load()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate in mock mode: %v", err)
+	}
+}
+
 // TestValidate_WeChatPayMchID exercises the production guard:
 // WECHAT_PAY_MCH_ID is required when WECHAT_PAY_MOCK is unset / "0",
 // but mock mode is allowed to leave it blank.
@@ -495,11 +602,11 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
 		return &Config{
-			DatabaseURL:        "postgres://x",
-			RSAPrivate:         "priv",
-			RSAPublic:          "pub",
-			JWTAccessTTL:       15 * time.Minute,
-			JWTRefreshTTL:      168 * time.Hour,
+			DatabaseURL:         "postgres://x",
+			RSAPrivate:          "priv",
+			RSAPublic:           "pub",
+			JWTAccessTTL:        15 * time.Minute,
+			JWTRefreshTTL:       168 * time.Hour,
 			OrderExpiryDuration: 30 * time.Minute,
 			SweeperInterval:     1 * time.Minute,
 			OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
@@ -547,6 +654,9 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 		cfg.WeChatPayMock = false
 		cfg.WeChatAPIv3Key = "0123456789abcdef0123456789abcdef"
 		cfg.WeChatPayMchID = "1900000001"
+		cfg.WeChatPayMchPrivateKeyPath = "/k"
+		cfg.WeChatPayMchCertPath = "/c"
+		cfg.WeChatPayNotifyURL = "https://x/cb"
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}

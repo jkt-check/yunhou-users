@@ -47,6 +47,22 @@ type Config struct {
 	// field is the server-wide fallback for deployments that haven't
 	// registered multiple merchants yet.
 	WeChatPayMchID string
+	// WeChatPayMchPrivateKeyPath is the path to the merchant's RSA
+	// private key (PKCS#1 or PKCS#8 PEM). Required for the outbound
+	// signing path — every native/JSAPI/etc. UnifiedOrder request is
+	// signed with this key. Real mode only; ignored in mock mode.
+	WeChatPayMchPrivateKeyPath string
+	// WeChatPayMchCertPath is the path to the merchant's X.509
+	// certificate (PEM). The cert's serial number is extracted at startup
+	// and put in the outbound Authorization header as `serial_no` (WeChat
+	// uses it to look up the merchant's public key for verifying our
+	// request signature). Real mode only; ignored in mock mode.
+	WeChatPayMchCertPath string
+	// WeChatPayNotifyURL is the public callback URL
+	// (e.g. https://host/webhooks/payment/wechat_pay) passed to
+	// UnifiedOrder so WeChat knows where to POST async payment
+	// notifications. Real mode only; ignored in mock mode.
+	WeChatPayNotifyURL string
 
 	// GitHubClientID/Secret are reserved for a future OAuth redirect flow.
 	// They are not used by the current direct-login implementation but kept
@@ -89,12 +105,15 @@ func Load() *Config {
 		RSAPrivate:  envOr("RSA_PRIVATE_KEY_PATH", "keys/private.pem"),
 		RSAPublic:   envOr("RSA_PUBLIC_KEY_PATH", "keys/public.pem"),
 
-		OAuthStateSecret:   os.Getenv("OAUTH_STATE_SECRET"),
-		GitHubClientID:     os.Getenv("GITHUB_CLIENT_ID"),
-		GitHubClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
-		WeChatOAuthMock:    os.Getenv("WECHAT_OAUTH_MOCK") == "1",
-		WeChatPayMock:     os.Getenv("WECHAT_PAY_MOCK") == "1",
-		WeChatPayMchID:   os.Getenv("WECHAT_PAY_MCH_ID"),
+		OAuthStateSecret:           os.Getenv("OAUTH_STATE_SECRET"),
+		GitHubClientID:             os.Getenv("GITHUB_CLIENT_ID"),
+		GitHubClientSecret:         os.Getenv("GITHUB_CLIENT_SECRET"),
+		WeChatOAuthMock:            os.Getenv("WECHAT_OAUTH_MOCK") == "1",
+		WeChatPayMock:              os.Getenv("WECHAT_PAY_MOCK") == "1",
+		WeChatPayMchID:             os.Getenv("WECHAT_PAY_MCH_ID"),
+		WeChatPayMchPrivateKeyPath: os.Getenv("WECHAT_PAY_MCH_PRIVATE_KEY_PATH"),
+		WeChatPayMchCertPath:       os.Getenv("WECHAT_PAY_MCH_CERT_PATH"),
+		WeChatPayNotifyURL:         os.Getenv("WECHAT_PAY_NOTIFY_URL"),
 
 		JWTAccessTTL:  parseDurationOr(envOr("JWT_ACCESS_TTL", "15m"), 15*time.Minute),
 		JWTRefreshTTL: parseDurationOr(envOr("JWT_REFRESH_TTL", "168h"), 168*time.Hour),
@@ -151,23 +170,28 @@ func (c *Config) Validate() error {
 	if len(c.OAuthStateSecret) < 32 {
 		return errors.New("OAUTH_STATE_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
 	}
-	// Real WeChat Pay requires both WECHAT_PAY_API_V3_KEY (HMAC + AES
-	// material) and WECHAT_PAY_MCH_ID (outgoing request signing). The
-	// guard is asymmetric: if APIv3Key is set without MCH_ID, we refuse
-	// startup (real-mode webhooks would 401 upstream); the inverse —
-	// MCH_ID set without APIv3Key — also refuses startup, because the
-	// server would happily start, then every /webhooks/payment/wechat_pay
-	// would 404 (the verifier is gated on APIv3Key presence in
-	// cmd/server/main.go), and the operator has no log line to diagnose.
-	// Deployments that don't accept WeChat Pay at all should leave BOTH
-	// vars unset (channel returns 404, the WeChat webhook route is
-	// simply unconfigured). Mock-mode deployments set WECHAT_PAY_MOCK=1
-	// and may leave MCH_ID blank.
+	// Real-mode WeChat Pay credentials are a five-field all-or-none tuple:
+	// WECHAT_PAY_API_V3_KEY and WECHAT_PAY_MCH_ID are used for webhook
+	// verification and outgoing request signing, while the private key,
+	// certificate, and notify URL complete the real client configuration.
+	// The first two cases keep the MCH_ID/APIv3Key error messages explicit;
+	// the final case rejects any other partial tuple while allowing all five
+	// fields to remain empty when WeChat Pay is not enabled. Mock-mode
+	// deployments may leave all five fields empty or partially populated.
 	switch {
 	case c.WeChatPayMchID == "" && c.WeChatAPIv3Key != "" && !c.WeChatPayMock:
 		return errors.New("WECHAT_PAY_MCH_ID is required when WECHAT_PAY_API_V3_KEY is set and WECHAT_PAY_MOCK is not enabled")
 	case c.WeChatPayMchID != "" && c.WeChatAPIv3Key == "" && !c.WeChatPayMock:
 		return errors.New("WECHAT_PAY_API_V3_KEY is required when WECHAT_PAY_MCH_ID is set and WECHAT_PAY_MOCK is not enabled")
+	case !c.WeChatPayMock &&
+		((c.WeChatPayMchID != "" || c.WeChatAPIv3Key != "" ||
+			c.WeChatPayMchPrivateKeyPath != "" || c.WeChatPayMchCertPath != "" ||
+			c.WeChatPayNotifyURL != "") &&
+			(c.WeChatPayMchID == "" || c.WeChatAPIv3Key == "" ||
+				c.WeChatPayMchPrivateKeyPath == "" || c.WeChatPayMchCertPath == "" ||
+				c.WeChatPayNotifyURL == "")):
+		return errors.New("real WeChat Pay mode requires ALL of: WECHAT_PAY_MCH_ID, WECHAT_PAY_API_V3_KEY, " +
+			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH, WECHAT_PAY_MCH_CERT_PATH, WECHAT_PAY_NOTIFY_URL")
 	}
 	return nil
 }

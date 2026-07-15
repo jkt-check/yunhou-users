@@ -25,8 +25,12 @@ type Order struct {
 	// out_trade_no}; paypal/alipay populate their own keys). Exposed via
 	// json with omitempty so orders without a pre-auth payload don't
 	// carry an empty field in the response; the BFF reads `code_url`
-	// from here for the WeChat QR render. json.RawMessage is a []byte
-	// under the hood, so sqlx scans the JSONB column directly into it
-	// without an extra Unmarshal round-trip.
-	ProviderIntent json.RawMessage `db:"provider_intent" json:"provider_intent,omitempty"`
+	// from here for the WeChat QR render.
+	//
+	// Pointer so a SQL NULL column (set after migration
+	// 010_provider_intent_nullable) scans into a nil *json.RawMessage,
+	// and omitempty on a nil pointer fires — without the pointer, sqlx
+	// can't scan NULL into a []byte (would error with "unsupported
+	// Scan, storing driver.Value type <nil> into type *json.RawMessage").
+	ProviderIntent *json.RawMessage `db:"provider_intent" json:"provider_intent,omitempty"`
 }

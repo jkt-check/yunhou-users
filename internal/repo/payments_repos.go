@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,8 +29,8 @@ type OrderRepo interface {
 	// UpdateProviderIntent writes a raw JSON payload into orders.provider_intent.
 	// The caller is responsible for marshalling the struct; the repo writes the
 	// bytes verbatim into the JSONB column ($1::jsonb cast). Used by
-	// channel-specific pre-auth flows (wechat_pay writes code_url / out_trade_no
-	// / mch_id; paypal reserves the slot for future use).
+	// channel-specific pre-auth flows (wechat_pay writes appid / mchid /
+	// code_url / out_trade_no; paypal reserves the slot for future use).
 	UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error
 }
 
@@ -38,11 +39,78 @@ type orderRepo struct{ db *sqlx.DB }
 func NewOrderRepo(db *sqlx.DB) *orderRepo { return &orderRepo{db: db} }
 
 func (r *orderRepo) Create(ctx context.Context, o *model.Order) error {
+	// provider_intent is bound explicitly (not via the schema default) so
+	// callers can write the wechat_pay pre-auth payload in the same INSERT.
+	// A nil ProviderIntent must round-trip as SQL NULL — required after
+	// migration 010_provider_intent_nullable so the JSON response's
+	// omitempty fires for orders without a pre-auth payload. We use the
+	// nullableJSONB driver.Valuer wrapper so empty intent binds NULL on
+	// the wire; passing a raw []byte would have Postgres reject '' with
+	// SQLSTATE 22P02.
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
-		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at)
-	`, o)
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent)
+	`, flattenOrderForInsert(o))
 	return err
+}
+
+// orderInsertRow flattens an Order into the shape sqlx's NamedExecContext
+// can bind. The provider_intent field is a *nullableJSONB (pointer to a
+// driver.Valuer) so a nil pointer + nil/empty message becomes SQL NULL —
+// required by migration 010_provider_intent_nullable so the JSON
+// response's omitempty fires for orders without a pre-auth payload.
+// Without this wrapper, sqlx would bind []byte as bytea, and Postgres
+// JSONB rejects '' with SQLSTATE 22P02.
+type orderInsertRow struct {
+	ID             string         `db:"id"`
+	UserID         string         `db:"user_id"`
+	PlanID         string         `db:"plan_id"`
+	Amount         float64        `db:"amount"`
+	Currency       string         `db:"currency"`
+	Status         string         `db:"status"`
+	ExpiresAt      time.Time      `db:"expires_at"`
+	ProviderIntent *nullableJSONB `db:"provider_intent"`
+}
+
+func flattenOrderForInsert(o *model.Order) *orderInsertRow {
+	return &orderInsertRow{
+		ID:             o.ID,
+		UserID:         o.UserID,
+		PlanID:         o.PlanID,
+		Amount:         o.Amount,
+		Currency:       o.Currency,
+		Status:         o.Status,
+		ExpiresAt:      o.ExpiresAt,
+		ProviderIntent: wrapNullableJSONB(o.ProviderIntent),
+	}
+}
+
+// wrapNullableJSONB returns nil when the message is nil or empty (so
+// sqlx binds SQL NULL via the nullableJSONB.Value receiver). Returns a
+// pointer to a populated nullableJSONB otherwise so the JSON bytes
+// round-trip verbatim.
+func wrapNullableJSONB(p *json.RawMessage) *nullableJSONB {
+	if p == nil || len(*p) == 0 {
+		return nil
+	}
+	return &nullableJSONB{msg: *p}
+}
+
+// nullableJSONB adapts a json.RawMessage for binding to a JSONB column.
+// Empty input (nil pointer or zero-length message) round-trips as SQL
+// NULL; non-empty input is passed through as raw bytes (pq driver
+// accepts []byte for JSONB columns via implicit bytea→jsonb cast).
+type nullableJSONB struct {
+	msg json.RawMessage
+}
+
+// Value implements driver.Valuer. Returns nil for empty input so the
+// Postgres driver binds SQL NULL; otherwise returns the raw bytes.
+func (n *nullableJSONB) Value() (driver.Value, error) {
+	if n == nil || len(n.msg) == 0 {
+		return nil, nil
+	}
+	return []byte(n.msg), nil
 }
 
 func (r *orderRepo) FindByID(ctx context.Context, id string) (*model.Order, error) {

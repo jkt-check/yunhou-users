@@ -31,6 +31,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
@@ -230,13 +231,18 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
 	// Payment service with stub refund API — e2e tests for /refunds land in M5.
+	// wechat_pay mock client lets e2e tests create wechat_pay orders without
+	// hitting api.mch.weixin.qq.com — the mock client mints a deterministic
+	// code_url from out_trade_no. Without this, PaymentService.CreateOrder
+	// returns ErrWechatPayNotConfigured (because no real cert + key are
+	// wired) and WeChat order tests fail at the order-creation step.
 	paymentSvc := service.NewPaymentService(
 		db,
 		orderRepo, paymentRepo, refundRepo,
 		subRepo, planRepo, userRepo,
 		webhookEventRepo, auditLogRepo,
 		&stubRefundAPI{},
-		nil,
+		&wechat.Client{MockMode: true},
 		cfg.OrderExpiryDuration,
 	)
 
@@ -456,7 +462,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		subRepo, planRepo, userRepo,
 		webhookEventRepo, auditLogRepo,
 		&stubRefundAPI{},
-		nil,
+		&wechat.Client{MockMode: true},
 		cfg.OrderExpiryDuration,
 	)
 

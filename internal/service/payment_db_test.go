@@ -106,8 +106,8 @@ func seedPaidOrder(t *testing.T, db *sqlx.DB, userID, planID string, amount floa
 	t.Helper()
 	id := mustNewUUID()
 	if _, err := db.ExecContext(context.Background(), `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, $3, $4, 'CNY', 'pending', now() + INTERVAL '30 minutes')
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES ($1, $2, $3, $4, 'CNY', 'pending', now() + INTERVAL '30 minutes', NULL)
 	`, id, userID, planID, amount); err != nil {
 		t.Fatalf("seed order: %v", err)
 	}
@@ -870,8 +870,8 @@ func TestPaymentService_OnWebhook_PaymentFailed(t *testing.T) {
 	txnID := "pi-fail-" + mustNewUUID()[:8]
 	eventID := "evt-fail-" + mustNewUUID()[:8]
 	_, err := db.ExecContext(context.Background(), `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes')
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes', NULL)
 	`, orderID, uid)
 	if err != nil {
 		t.Fatalf("seed order: %v", err)
@@ -1034,8 +1034,8 @@ func TestPaymentService_OnWebhook_PaymentFailed_InsertPending(t *testing.T) {
 	eventID := "evt-insert-pending-" + mustNewUUID()[:8]
 	// Seed an order with NO payment row.
 	if _, err := db.ExecContext(context.Background(), `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes')
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes', NULL)
 	`, orderID, uid); err != nil {
 		t.Fatalf("seed order: %v", err)
 	}
@@ -1383,8 +1383,8 @@ func TestPaymentService_OnWebhook_PaymentFailed_TerminalState(t *testing.T) {
 	txnID := "pi-failed-term-" + mustNewUUID()[:8]
 	eventID := "evt-failed-term-" + mustNewUUID()[:8]
 	if _, err := db.ExecContext(context.Background(), `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'failed', now() + INTERVAL '30 minutes')
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'failed', now() + INTERVAL '30 minutes', NULL)
 	`, orderID, uid); err != nil {
 		t.Fatalf("seed order: %v", err)
 	}
@@ -1638,8 +1638,8 @@ func TestPaymentService_OnPaymentFailed_BeginTxError(t *testing.T) {
 	txnID := "pi-begin-tx-fail-" + mustNewUUID()[:8]
 	eventID := "evt-begin-tx-fail-" + mustNewUUID()[:8]
 	if _, err := db.ExecContext(context.Background(), `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes')
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES ($1, $2, 'monthly', 29.9, 'CNY', 'pending', now() + INTERVAL '30 minutes', NULL)
 	`, orderID, uid); err != nil {
 		t.Fatalf("seed order: %v", err)
 	}

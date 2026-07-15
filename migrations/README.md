@@ -59,3 +59,5 @@ syntax, **not** transaction control — those are fine.
 | `006_paypal_sub_mapping.sql` | subscriptions.external_subscription_id for PayPal renewals |
 | `007_app_secret.sql` | apps.secret_hash column (backfilled by server startup) |
 | `008_drop_lemonsqueezy.sql` | removes lemonsqueezy from channel CHECK (LS code was removed in d8f333d) |
+| `009_wechat_pay_intent.sql` | adds orders.provider_intent JSONB for wechat_pay pre-auth metadata |
+| `010_provider_intent_nullable.sql` | change provider_intent default from `'{}'` to NULL so omitempty works |

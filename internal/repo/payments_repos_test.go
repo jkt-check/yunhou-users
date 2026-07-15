@@ -150,8 +150,8 @@ func TestOrderRepo_UpdateProviderIntent_RoundTrip(t *testing.T) {
 
 	orderID := newUUID()
 	if _, err := db.ExecContext(context.Background(), `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, 'monthly', 1.00, 'CNY', 'pending', now() + interval '30 minutes')
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES ($1, $2, 'monthly', 1.00, 'CNY', 'pending', now() + interval '30 minutes', NULL)
 	`, orderID, alice.ID); err != nil {
 		t.Fatalf("seed order: %v", err)
 	}

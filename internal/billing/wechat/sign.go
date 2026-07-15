@@ -17,7 +17,7 @@ import (
 // are read-only.
 type Signer struct {
 	MchID      string // 商户号
-	SerialNo   string // decimal string from cert
+	SerialNo   string // uppercase hex from cert (WeChat's `serial_no` field format)
 	PrivateKey *rsa.PrivateKey
 }
 

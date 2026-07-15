@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
@@ -186,6 +187,50 @@ func TestPaymentHandler_CreateOrder(t *testing.T) {
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("status: got %d, want 400 (binding error)", rec.Code)
+		}
+	})
+
+	t.Run("wechat_pay not configured → 400", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: service.ErrWechatPayNotConfigured}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly", "channel": "wechat_pay"})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("wechat 4xx upstream → 400", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: wechat.ErrWeChatUnifiedOrderRejected}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly", "channel": "wechat_pay"})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("wechat 5xx upstream → 502", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: wechat.ErrWeChatUpstream}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly", "channel": "wechat_pay"})
+
+		if rec.Code != http.StatusBadGateway {
+			t.Errorf("status: got %d, want 502 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("wechat network error → 502", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: wechat.ErrWeChatNetwork}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly", "channel": "wechat_pay"})
+
+		if rec.Code != http.StatusBadGateway {
+			t.Errorf("status: got %d, want 502 (body: %s)", rec.Code, rec.Body.String())
 		}
 	})
 }

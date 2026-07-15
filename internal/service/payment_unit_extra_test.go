@@ -305,8 +305,8 @@ func TestCreateOrder_WeChat_Real_PersistsIntent(t *testing.T) {
 	if !strings.Contains(string(orderRepo.updateIntentPayload), `"appid":"wx1900000109"`) {
 		t.Fatalf("UpdateProviderIntent payload missing appid: %s", orderRepo.updateIntentPayload)
 	}
-	if string(order.ProviderIntent) != string(orderRepo.updateIntentPayload) {
-		t.Errorf("order.ProviderIntent = %s, persisted payload = %s", order.ProviderIntent, orderRepo.updateIntentPayload)
+	if order.ProviderIntent == nil || string(*order.ProviderIntent) != string(orderRepo.updateIntentPayload) {
+		t.Errorf("order.ProviderIntent = %v, persisted payload = %s", order.ProviderIntent, orderRepo.updateIntentPayload)
 	}
 }
 

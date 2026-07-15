@@ -253,20 +253,21 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		// v3 NATIVE body fields are `appid` + `mchid` (no underscores) —
 		// the BFF uses mchid to audit-log which merchant handled each
 		// payment, and appid to cross-reference WeChat Open Platform info.
-		intent, _ := json.Marshal(map[string]string{
+		intentBytes, _ := json.Marshal(map[string]string{
 			"appid":        s.wechat.AppID(),
 			"mchid":        s.wechat.MchID(),
 			"code_url":     resp.CodeURL,
 			"out_trade_no": outTradeNo,
 		})
-		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intent); err != nil {
+		intent := json.RawMessage(intentBytes)
+		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intentBytes); err != nil {
 			return order, fmt.Errorf("persist provider intent: %w", err)
 		}
-		// ProviderIntent is json.RawMessage (a []byte under the hood) — the
-		// marshalled intent flows in directly so the handler response can
-		// echo the code_url back to the BFF in the same response as the
-		// order row.
-		order.ProviderIntent = intent
+		// ProviderIntent is *json.RawMessage so a SQL NULL column scans
+		// into a nil pointer, which then trips omitempty on the JSON
+		// response. The marshalled intent is addressable here (we just
+		// allocated it), so the pointer is safe to share with the row.
+		order.ProviderIntent = &intent
 	}
 
 	return order, nil
@@ -1279,8 +1280,8 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		orderExpiresAt = *e.SubExpiresAt
 	}
 	err = tx.QueryRowxContext(ctx, `
-		INSERT INTO orders (user_id, plan_id, amount, currency, status, expires_at)
-		VALUES ($1, $2, $3, $4, 'paid', $5)
+		INSERT INTO orders (user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES ($1, $2, $3, $4, 'paid', $5, NULL)
 		RETURNING id
 	`, sub.UserID, sub.PlanID, e.Amount, e.Currency, orderExpiresAt).Scan(&orderID)
 	if err != nil {

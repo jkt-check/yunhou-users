@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/service"
 )
@@ -303,6 +304,20 @@ func writePaymentError(c *gin.Context, err error) {
 		// channel on this deployment just isn't enabled) and not a 503
 		// (we're not temporarily down — we never wire this channel).
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "wechat pay not configured on this deployment"})
+	case errors.Is(err, wechat.ErrWeChatUnifiedOrderRejected):
+		// 400 — WeChat returned 4xx (or empty code_url). Terminal: retrying
+		// the same payload will fail again. Surface a 4xx so the caller
+		// knows to fix the request, not retry.
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "wechat pay rejected the order (4xx); check request and try a new order"})
+	case errors.Is(err, wechat.ErrWeChatUpstream):
+		// 502 — WeChat returned 5xx. Transient: caller may retry with the
+		// same OutTradeNo after a backoff. This package does not retry
+		// itself.
+		c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "wechat pay upstream 5xx; retry after backoff"})
+	case errors.Is(err, wechat.ErrWeChatNetwork):
+		// 502 — outbound HTTP failure (timeout, DNS, ctx cancellation).
+		// Transient: caller may retry.
+		c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "wechat pay network error; retry after backoff"})
 	default:
 		log.Printf("payment handler error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})

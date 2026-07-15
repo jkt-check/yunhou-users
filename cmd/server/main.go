@@ -39,7 +39,14 @@ func main() {
 	// deployments must have all 5 WECHAT_PAY_* envs set (gated by
 	// config.Validate); dev/mock environments with WECHAT_PAY_MOCK=1 get
 	// a non-functional mock client.
-	var wechatClient *wechat.Client
+	//
+	// Declared as the wechat.ClientIface interface type (not *wechat.Client)
+	// so an untyped `= nil` assignment produces a true zero-value interface.
+	// A *wechat.Client(nil) wrapped in an interface field is a typed-nil
+	// (interface holds type=*Client, value=nil), which fails the
+	// `s.wechat != nil` guard in PaymentService.CreateOrder and panics
+	// when the pre-auth path calls IsMockMode() on a nil receiver.
+	var wechatClient wechat.ClientIface
 	if cfg.WeChatPayMock {
 		wechatClient = &wechat.Client{MockMode: true}
 	} else if cfg.WeChatPayMchPrivateKeyPath != "" {
@@ -61,7 +68,8 @@ func main() {
 		}
 	} else {
 		// Real mode + no private key path = the deployment chose not to
-		// enable WeChat Pay at all (wechat endpoints return 404).
+		// enable WeChat Pay at all (wechat endpoints return 404). Untyped
+		// nil keeps the interface == nil so the service guard sees it.
 		wechatClient = nil
 	}
 

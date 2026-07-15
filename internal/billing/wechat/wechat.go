@@ -18,6 +18,21 @@ type HTTPDoer interface {
 	Do(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error)
 }
 
+// ClientIface is the public interface satisfied by *Client. Exposed so
+// callers (notably cmd/server/main.go) can hold a nil interface value
+// when WeChat Pay is not configured, avoiding the typed-nil pitfall
+// where a *Client assigned to an interface field with `= nil` is not
+// == nil at the language level — `s.wechat.IsMockMode()` on a nil
+// receiver would panic. By declaring the local variable as ClientIface,
+// an untyped nil stays == nil and `s.wechat != nil` guards behave
+// correctly.
+type ClientIface interface {
+	IsMockMode() bool
+	MchID() string
+	AppID() string
+	UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*UnifiedOrderResponse, error)
+}
+
 // HTTPRequest / HTTPResponse are the minimal shapes the real-mode
 // UnifiedOrder path needs. Kept here as opaque structs to avoid pulling
 // net/http into the package's public surface.

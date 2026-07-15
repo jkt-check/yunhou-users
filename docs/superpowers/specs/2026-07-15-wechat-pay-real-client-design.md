@@ -23,7 +23,7 @@ The webhook-side plumbing (signature verification, AES-GCM resource decryption, 
 | 4 | **5-tuple env validation in real mode** | `WECHAT_PAY_MCH_ID` + `WECHAT_PAY_API_V3_KEY` + `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` + `WECHAT_PAY_MCH_CERT_PATH` + `WECHAT_PAY_NOTIFY_URL` must all be present (non-empty) when `WECHAT_PAY_MOCK=false`. Mock mode unchanged (any subset). Prevents silent partial-wire boot |
 | 5 | **HTTPDoer interface retained** | Already exists in `internal/billing/wechat/wechat.go:35-54`. Lets unit tests stub the WeChat HTTP endpoint without `httptest`. Existing mock branch uses no HTTPDoer and keeps working |
 | 6 | **5xx / network errors → immediate return, no retry** | Local state (`orders` row + `provider_intent`) and remote state (`code_url`) can diverge under retry; v1 lets the BFF cancel-and-retry. Marked `TODO` for v2 |
-| 7 | **No response-signature verification** | WeChat signs some success responses with their platform cert (different from APIv3Key). v1 relies on TLS only. Noted in `sign.go` comment |
+| 7 | **No platform-cert response verification** | WeChat does not sign `UnifiedOrder` success responses (the body is trusted over TLS only). The HMAC verification on inbound webhooks stays as-is. Platform-cert response signatures — a v3 feature for refund / close-order flows — are deferred to a follow-up |
 | 8 | **No refund API** | `RefundAPI.Refund(channel="wechat_pay", ...)` stays at the existing v1 stub (`ErrRefundChannelFailed`). Deferred to a follow-up PR (matches LS / Stripe / Alipay v1 posture) |
 | 9 | **Out of scope:** JSAPI / H5 TradeType, plan_mapping routing, per-app cred overrides, WeChat platform-cert response verification | Reserved for follow-up |
 
@@ -71,6 +71,7 @@ POST /payments/orders  (channel=wechat_pay)
 | 11 | `internal/service/payment_test.go` | **extend** | Stub `wechat.Client` via the existing interface seam (or wrap into a small `wechatClient` interface so tests can stub). Cover: real-mode CreateOrder persists `code_url`; mock-mode CreateOrder doesn't touch client; non-wechat channels don't touch client |
 | 12 | `cmd/server/main.go` | **extend** | After `cfg, err := config.Load()`, call `wechat.LoadPrivateKey(...)` and `wechat.LoadCertSerial(...)`. Fail-fast if real mode + any load error. Build `wechat.Client`. Pass into `PaymentService` constructor. Adapt `*http.Client` → `wechat.HTTPDoer` (one-line adapter) |
 | 13 | `PROGRESS.md` | **update** | Mark A2.c follow-up as ✅ shipped. Reference new commit hash. Note deferred items remain: refund API, plan_mapping, per-app overrides |
+| 14 | `Makefile` | **extend** | Add `regen-test-keys` target — regenerates `internal/billing/wechat/testdata/sign_test_key.pem` + the fixedvector JSON fixture. Used only when the test vector in `sign_test.go` needs to be re-derived (e.g. after intentional sign-string format change) |
 
 ## 5. Data model
 
@@ -325,15 +326,13 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string)
     // in their own follow-up PRs.
     if s.wechat != nil && !s.wechat.IsMockMode() {
         // Convert order.Amount (CNY, decimal) → fen (int64) WITHOUT
-        // float multiplication. `order.Amount` is scanned from
-        // DECIMAL(10,2) into Go via sqlx; if it lands in float64,
-        // `x * 100` can introduce drift on non-.50 amounts (e.g.
-        // 0.29 → 28.999... → 28). Use a string-roundtrip path so the
-        // value WeChat sees is the exact CNY amount the user
-        // authorized. Implementation: parse the decimal as a string,
-        // shift the dot two places, parse back to int64. For example,
-        // "0.07" → "007" → 7; "12.34" → "1234" → 1234.
-        amountStr := order.Amount.StringFixed(2) // or fmt.Sprintf("%.2f", order.Amount)
+        // float multiplication. `order.Amount` is `float64` (scanned
+        // from DECIMAL(10,2) by sqlx). `x * 100` introduces drift on
+        // non-.50 amounts (e.g. 0.29 → 28.999... → 28, which would
+        // mismatch WeChat's record). Use a string-roundtrip: format
+        // to 2-decimal string, strip the dot, parse back to int64.
+        // "0.07" → "0.07" → "007" → 7; "12.34" → "12.34" → "1234" → 1234.
+        amountStr := fmt.Sprintf("%.2f", order.Amount)
         normalized := strings.ReplaceAll(amountStr, ".", "")
         amountFen, err := strconv.ParseInt(normalized, 10, 64)
         if err != nil {
@@ -411,6 +410,7 @@ Plus a smoke build check: `make build` succeeds, `make lint` passes (go vet clea
 | Real-mode call to WeChat fails → order row orphaned in `pending` | Documented in §9: caller decides cancel/retry; sweeper flips to `expired` after `ORDER_EXPIRY_DURATION`. No silent rollback |
 | Cert rotation requires server restart | OK for v1; merchant cert change is rare and operational, not a runtime path |
 | `provider_intent` JSON shape evolves | JSONB; no migration needed for new keys |
+| Merchant cert expires (~5y) | Cert loaded once at startup; expiry check is the operator's responsibility (deploy-runbook tracks renewal). A mis-rotated cert fails `LoadCertSerial` fast, so the server won't boot with a stale one |
 | Migration 009 fails on a DB that already has `provider_intent` (rare) | `IF NOT EXISTS` makes it replay-safe |
 | Wrong sign-string format (off-by-one `\n`, missing trailing `\n`) | Fixed test vector in `sign_test.go` captures the canonical example from WeChat docs; any drift fails the test |
 

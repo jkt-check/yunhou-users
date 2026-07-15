@@ -13,7 +13,9 @@ import (
 
 // doPayRequest is like payment_test.go's doRequest but accepts a string body
 // verbatim (no JSON re-encoding). Returns the response recorder.
-func doPayRequest(engine interface{ ServeHTTP(http.ResponseWriter, *http.Request) }, method, path, body string) *httptest.ResponseRecorder {
+func doPayRequest(engine interface {
+	ServeHTTP(http.ResponseWriter, *http.Request)
+}, method, path, body string) *httptest.ResponseRecorder {
 	var rdr *bytes.Reader
 	if body != "" {
 		rdr = bytes.NewReader([]byte(body))
@@ -31,7 +33,9 @@ func doPayRequest(engine interface{ ServeHTTP(http.ResponseWriter, *http.Request
 }
 
 // doPayRequestWithHeaders adds custom headers to the request.
-func doPayRequestWithHeaders(engine interface{ ServeHTTP(http.ResponseWriter, *http.Request) }, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+func doPayRequestWithHeaders(engine interface {
+	ServeHTTP(http.ResponseWriter, *http.Request)
+}, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	var rdr *bytes.Reader
 	if body != "" {
 		rdr = bytes.NewReader([]byte(body))
@@ -126,7 +130,7 @@ func TestPaymentHandler_GetRefund_InternalError(t *testing.T) {
 func TestPaymentHandler_CreateOrder_PlanNotFound(t *testing.T) {
 	svc := &mockPaymentSvc{createOrderErr: service.ErrPlanNotFound}
 	g := paymentTestEngine(svc, "u-1")
-	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"missing"}`)
+	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"missing","channel":"stripe"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status=%d, want 400", w.Code)
 	}
@@ -135,7 +139,7 @@ func TestPaymentHandler_CreateOrder_PlanNotFound(t *testing.T) {
 func TestPaymentHandler_CreateOrder_PlanInactive(t *testing.T) {
 	svc := &mockPaymentSvc{createOrderErr: service.ErrPlanInactive}
 	g := paymentTestEngine(svc, "u-1")
-	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"inactive"}`)
+	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"inactive","channel":"stripe"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status=%d, want 400", w.Code)
 	}
@@ -144,7 +148,7 @@ func TestPaymentHandler_CreateOrder_PlanInactive(t *testing.T) {
 func TestPaymentHandler_CreateOrder_HasActiveSub(t *testing.T) {
 	svc := &mockPaymentSvc{createOrderErr: service.ErrUserHasActiveSub}
 	g := paymentTestEngine(svc, "u-1")
-	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"monthly"}`)
+	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"monthly","channel":"stripe"}`)
 	if w.Code != http.StatusConflict {
 		t.Errorf("status=%d, want 409", w.Code)
 	}
@@ -153,7 +157,7 @@ func TestPaymentHandler_CreateOrder_HasActiveSub(t *testing.T) {
 func TestPaymentHandler_CreateOrder_InternalError(t *testing.T) {
 	svc := &mockPaymentSvc{createOrderErr: errors.New("db boom")}
 	g := paymentTestEngine(svc, "u-1")
-	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"monthly"}`)
+	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"monthly","channel":"stripe"}`)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status=%d, want 500", w.Code)
 	}

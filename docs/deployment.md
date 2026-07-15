@@ -57,23 +57,12 @@ on the host terminate TLS.
 6. **Apply migrations**
 
    ```bash
-   # Apply migrations in order. 002 alters tables created by 001 and will
-   # fail if 001 hasn't been applied yet. 003 adds payment/webhook tables.
-   # 004 historically extended CHECK constraints to allow channel='lemonsqueezy';
-   # 008 drops that value (the LS code path was removed in d8f333d).
-   # 005 adds the PayPal channel CHECK constraint. 006 adds
-   # subscriptions.external_subscription_id for PayPal renewal webhooks.
-   # 007 adds apps.secret_hash; after applying, start the server once so
-   # BackfillAppSecrets populates secret_hash for pre-existing rows
-   # (capture plaintexts from the deploy log and rotate).
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/001_init.sql
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/002_simplify_plans.sql
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/003_payments.sql
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/004_ls_channel.sql
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/005_paypal_channel.sql
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/006_paypal_sub_mapping.sql
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/007_app_secret.sql
-   sudo -u postgres psql "$(grep ^DATABASE_URL .env | cut -d= -f2-)" -f migrations/008_drop_lemonsqueezy.sql
+   # The standalone cmd/migrate binary owns the _migrations ledger.
+   # It applies pending files in lexicographic order and skips anything
+   # already recorded, so re-running is always a no-op. See
+   # migrations/README.md for the DDL rules each migration must follow.
+   docker compose run --rm migrate         # apply pending
+   docker compose run --rm migrate -status # inspect ledger
    ```
 
 7. **Install Nginx config**

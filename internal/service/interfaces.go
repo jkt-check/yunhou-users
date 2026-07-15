@@ -49,7 +49,7 @@ type PlanServiceInterface interface {
 // returns the (idempotent) refund row and whether it was newly inserted or
 // resolved from a previous Idempotency-Key match.
 type PaymentServiceInterface interface {
-	CreateOrder(ctx context.Context, userID, planID string) (*model.Order, error)
+	CreateOrder(ctx context.Context, userID, planID, channel string) (*model.Order, error)
 	CancelOrder(ctx context.Context, orderID, userID string) error
 	Confirm(ctx context.Context, in ConfirmInput) (*ConfirmResult, error)
 	Refund(ctx context.Context, in RefundInput) (*RefundResult, error)

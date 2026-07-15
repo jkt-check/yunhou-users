@@ -15,8 +15,4 @@
 --
 -- 顺序: 必须先 001 → 002 → 003 → 004 → 本 migration；backfill 由启动脚本触发。
 
-BEGIN;
-
 ALTER TABLE apps ADD COLUMN secret_hash TEXT;
-
-COMMIT;

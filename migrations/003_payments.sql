@@ -14,9 +14,6 @@
 --   - 部分唯一索引用 WHERE 子句
 --   - cross-table 引用不加 FK（service 层保证 referential integrity，
 --     避免 cascade 链路上 refund 测试被锁死）
-
-BEGIN;
-
 -- ============================================================================
 -- 1. orders — 支付前的意图（user 选了 plan，server mint 一行）
 -- ============================================================================
@@ -178,5 +175,3 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
 CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor);
 -- GIN 支持 tags 包含查询（如 action IN (...,...) OR tags && ARRAY[...]）
 CREATE INDEX IF NOT EXISTS idx_audit_log_tags ON audit_log USING GIN (tags);
-
-COMMIT;

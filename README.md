@@ -11,39 +11,41 @@ A shared user management API for multi-app ecosystems. One user identity across 
 - **Refresh token rotation** — one-time-use refresh tokens
 - **Rate limiting** — per-IP token bucket (10/s burst 20 on public, 30/s burst 60 on app management)
 
+## Dev mock mode
+
+Set `WECHAT_OAUTH_MOCK=1` to short-circuit the WeChat OAuth redirect and callback without contacting `open.weixin.qq.com`. Useful for local dev and CI e2e suites that don't have a registered WeChat 网站应用.
+
+- `GET /auth/wechat/redirect` returns a 302 to `redirect_uri#code=mock-code&state=<real-HMAC-state>` (no upstream call).
+- `GET /auth/wechat/callback?code=mock-code&state=<...>` constructs a fixed `ProviderUserInfo` (unionid `wechat_mock-unionid-001`) and runs the normal login pipeline.
+- Mock mode does **not** bypass the HMAC state defence — only the upstream WeChat HTTP round-trip is skipped.
+
+**Never enable in production**; the constant unionid means anyone with knowledge of the mock sentinel can impersonate a fixed account.
+
+Set `WECHAT_PAY_MOCK=1` to drive the WeChat Pay v3 webhook flow without a registered merchant. The `WeChatPayV3Verifier` short-circuits the HMAC check (still requires all three headers + a fresh timestamp), and the webhook handler accepts plaintext JSON (no AES-GCM resource decryption). The downstream `PaymentService.OnWebhook` path is identical to prod, so the order-paid → subscription-activated flow can be exercised end-to-end.
+
+**Never enable in production** — anyone could POST a fake paid event for any order.
+
 ## Quick Start
 
 ```bash
 # 1. Set up PostgreSQL
 createdb yunhou_users
-# Run ALL migrations in order — 002 alters tables created by 001, 003
-# adds payment/webhook tables, 004 adds the lemonsqueezy channel CHECK
-# constraint (historical — superseded by 008), 005 adds the paypal
-# channel CHECK constraint, 006 adds
-# subscriptions.external_subscription_id for PayPal renewal webhooks,
-# 007 adds apps.secret_hash, 008 drops lemonsqueezy from the
-# payments / refunds / webhook_events channel CHECK constraints (the
-# LemonSqueezy code path was removed in commit d8f333d; the migration
-# keeps the schema in sync with the handler, which 404s unknown
-# channels). Each depends on the prior; running out of order will fail.
-psql -d yunhou_users -f migrations/001_init.sql
-psql -d yunhou_users -f migrations/002_simplify_plans.sql
-psql -d yunhou_users -f migrations/003_payments.sql
-psql -d yunhou_users -f migrations/004_ls_channel.sql
-psql -d yunhou_users -f migrations/005_paypal_channel.sql
-psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
-psql -d yunhou_users -f migrations/007_app_secret.sql
-psql -d yunhou_users -f migrations/008_drop_lemonsqueezy.sql
 
-# 2. Generate RSA keys
+# 2. Apply migrations. The cmd/migrate binary owns the _migrations
+#    ledger so re-running is a no-op. See migrations/README.md for the
+#    naming + DDL rules each migration must follow.
+make migrate           # apply pending
+make migrate-status    # inspect ledger (✅ applied / ⏳ pending)
+
+# 3. Generate RSA keys
 make generate-keys
 
-# 3. Run — startup backfills apps.secret_hash for any pre-existing rows
+# 4. Run — startup backfills apps.secret_hash for any pre-existing rows
 #    and prints the plaintexts to stdout (capture them, then rotate each
 #    app's secret via POST /admin/apps/:id/rotate-secret).
 make run
 
-# 4. Login uses the redirect flow. Open in a browser:
+# 5. Login uses the redirect flow. Open in a browser:
 #   GitHub: GET /auth/github/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/callback
 #     After consent GitHub redirects to /auth/github/callback which 302s back
 #     to https://yundian.com/auth/callback#token=...&refresh_token=...&user_id=...
@@ -72,6 +74,9 @@ All configuration is via environment variables (or `.env` file):
 | `SWEEPER_INTERVAL` | No | `1m` | Must be strictly < `ORDER_EXPIRY_DURATION` |
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
+| `WECHAT_PAY_MOCK` | No | (empty) | `1` enables WeChat Pay v3 webhook plaintext mode (skips HMAC match + AES decrypt); empty / `0` = production. Pairs with `WECHAT_PAY_MCH_ID` (required when not in mock mode). |
+| `WECHAT_PAY_MCH_ID` | No (mock) / **Yes (prod)** | (empty) | 微信支付商户号. Required when `WECHAT_PAY_MOCK` is not `1`. |
+| `WECHAT_OAUTH_MOCK` | No | (empty) | `1` short-circuits `/auth/wechat/*` (no upstream `open.weixin.qq.com` call); empty / `0` = production. Never enable in prod. |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM file path; empty = Alipay webhooks return 404 |
 | `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which PayPal webhook_id/base URL is active |
 | `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | Empty = PayPal sandbox webhooks return 404 |

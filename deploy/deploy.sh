@@ -15,33 +15,43 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-echo "[1/5] git pull"
+echo "[1/6] git pull"
 git pull --ff-only
 
-echo "[2/5] pre-deploy backup"
+echo "[2/6] pre-deploy backup"
 if [[ -n "${DATABASE_URL:-}" && -x ./ops/backup.sh ]]; then
   ./ops/backup.sh || echo "!! backup failed (continuing; DB unchanged)"
 else
   echo "(skipping backup — DATABASE_URL or ops/backup.sh unavailable)"
 fi
 
-echo "[3/5] run migrations"
+echo "[3/6] build image"
+# Build only. We do NOT `docker compose up -d` here — that would start the
+# new container against the OLD schema (migrations haven't run yet). See
+# the step ordering note below.
+docker compose build
+
+echo "[4/6] run migrations"
 if [[ -n "${DATABASE_URL:-}" ]]; then
-  # Apply only the latest migration if it hasn't been recorded yet. For a
-  # brand-new deploy this runs both 001 and 002; for a re-deploy it no-ops.
-  for m in migrations/*.sql; do
-    echo "  - applying $m"
-    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$m" || {
-      echo "!! migration $m failed — aborting deploy"
-      exit 1
-    }
-  done
+  # Run the standalone migrate binary; it owns the _migrations ledger
+  # and re-applies nothing that's already recorded. See
+  # internal/migrate/migrate.go for the contract and migrations/README.md
+  # for the file naming + DDL rules.
+  #
+  # Ordering: build → migrate → up. If migrate fails, we abort BEFORE
+  # starting the new container, so the previous binary keeps serving
+  # against the unchanged schema. (Doing `up` first then `migrate`
+  # would risk the new binary crashing against the new column it added
+  # but couldn't yet write to — the order here is the safe one.)
+  docker compose run --rm migrate || {
+    echo "!! migrate failed — aborting deploy"
+    exit 1
+  }
 else
   echo "(skipping migrations — DATABASE_URL not set)"
 fi
 
-echo "[4/5] build + restart image"
-docker compose build
+echo "[5/6] restart + healthcheck"
 docker compose up -d
 # Poll for the container to reach 'running' state with a 60s ceiling.
 running=false
@@ -58,7 +68,7 @@ if [[ "$running" != "true" ]]; then
   exit 1
 fi
 
-echo "[5/5] healthcheck"
+echo "[6/6] healthcheck"
 if ! curl -fsS --max-time 5 http://127.0.0.1:8080/healthz; then
   echo "!! healthcheck failed, recent logs:"
   docker compose logs --tail=200 app

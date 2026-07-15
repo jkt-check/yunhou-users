@@ -23,7 +23,7 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 
 	// 1. Create order
 	t.Run("create_order", func(t *testing.T) {
-		body := `{"plan_id":"monthly"}`
+		body := `{"plan_id":"monthly","channel":"stripe"}`
 		resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("expected 201, got %d — body: %s", resp.StatusCode, string(resp.Body))
@@ -48,7 +48,7 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 	//    guard. Wait — that only fires when the user actually HAS an active sub.
 	//    The first order is still `pending`, not `active`. So this should succeed.
 	t.Run("second_pending_order_allowed", func(t *testing.T) {
-		body := `{"plan_id":"monthly"}`
+		body := `{"plan_id":"monthly","channel":"stripe"}`
 		resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("expected 201 (no active sub yet), got %d — body: %s", resp.StatusCode, string(resp.Body))
@@ -59,7 +59,7 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 	t.Run("confirm_order", func(t *testing.T) {
 		// Create a fresh user for clean state.
 		token2, userID := loginAndGetToken(t, srv.Engine, "payments-confirm", "yundian")
-		body := `{"plan_id":"monthly"}`
+		body := `{"plan_id":"monthly","channel":"stripe"}`
 		resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token2))
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("create order: %d %s", resp.StatusCode, string(resp.Body))
@@ -122,7 +122,7 @@ func TestPayments_ConfirmChannelMismatch(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "channel-mismatch", "yundian")
 
 	// First, create + confirm with Stripe.
-	body := `{"plan_id":"monthly"}`
+	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d", resp.StatusCode)
@@ -158,7 +158,7 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "refund-idem", "yundian")
 
 	// Create + confirm to get a paid payment.
-	body := `{"plan_id":"monthly"}`
+	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d", resp.StatusCode)
@@ -241,7 +241,7 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "refund-sum", "yundian")
 
 	// Setup: paid payment of 29.90
-	body := `{"plan_id":"monthly"}`
+	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
 		Data struct{ ID string `json:"id"` } `json:"data"`
@@ -285,7 +285,7 @@ func TestPayments_OwnershipIsolation(t *testing.T) {
 
 	// A creates + confirms an order.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(tokenA))
+		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(tokenA))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d", resp.StatusCode)
 	}
@@ -340,7 +340,7 @@ func TestPayments_CancelOrder(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "cancel-pending", "yundian")
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
 	var r struct {
 		Data struct{ ID string `json:"id"` } `json:"data"`
 	}
@@ -375,7 +375,7 @@ func TestPayments_LatePaymentHonored(t *testing.T) {
 
 	// Create + manually expire (simulating sweeper).
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
 	var r struct {
 		Data struct{ ID string `json:"id"` } `json:"data"`
 	}
@@ -455,7 +455,7 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "concurrent-refund", "yundian")
 
 	// Setup: paid payment of 29.90
-	body := `{"plan_id":"monthly"}`
+	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
 		Data struct{ ID string `json:"id"` } `json:"data"`
@@ -534,7 +534,7 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "concurrent-webhook", "yundian")
 
 	// Setup: paid order
-	body := `{"plan_id":"monthly"}`
+	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
 		Data struct{ ID string `json:"id"` } `json:"data"`

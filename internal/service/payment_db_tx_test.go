@@ -53,11 +53,11 @@ func (f *fakeTx) Rollback() error { return nil }
 // to the INSERT / activate-sub / update-order path).
 type countingFakeTx struct {
 	*fakeTx
-	t             *testing.T
+	t              *testing.T
 	execCallCount  int
 	execErrsAtCall map[int]error
-	getCallCount  int
-	getErrsAtCall map[int]error
+	getCallCount   int
+	getErrsAtCall  map[int]error
 }
 
 func (c *countingFakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql.Result, error) {
@@ -135,7 +135,7 @@ func TestOnDisputeCreated_SetDisputedError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
 	txnID := "pi-sde-" + mustNewUUID()[:8]
 	svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
@@ -190,7 +190,7 @@ func TestOnPaymentSucceeded_ActivateSubError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
 	txnID := "pi-ase-" + mustNewUUID()[:8]
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &countingFakeTx{
@@ -225,7 +225,7 @@ func TestOnPaymentSucceeded_UpdateOrderError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
 	txnID := "pi-uoe-" + mustNewUUID()[:8]
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &countingFakeTx{
@@ -278,7 +278,7 @@ func TestOnPaymentFailed_MarkFailedError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
 	txnID := "pi-mfe-" + mustNewUUID()[:8]
 	svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
@@ -310,7 +310,7 @@ func TestOnPaymentFailed_FlipOrderError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
 	txnID := "pi-floe-" + mustNewUUID()[:8]
 	svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
@@ -368,9 +368,9 @@ func TestOnPaypalRenewalSucceeded_BeginTxError(t *testing.T) {
 	}
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: "evt-prb-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
-		TransactionID: "pi-prb-" + mustNewUUID()[:8],
+		TransactionID:          "pi-prb-" + mustNewUUID()[:8],
 		ExternalSubscriptionID: "I-prb",
-		Amount: 29.9, Currency: "USD", RawPayload: []byte(`{}`),
+		Amount:                 29.9, Currency: "USD", RawPayload: []byte(`{}`),
 	})
 	if err == nil {
 		t.Fatal("expected error from begin tx failure, got nil")

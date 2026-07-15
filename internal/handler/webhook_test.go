@@ -28,7 +28,7 @@ type mockWebhookSvc struct {
 	err      error
 }
 
-func (m *mockWebhookSvc) CreateOrder(_ context.Context, _, _ string) (*model.Order, error) {
+func (m *mockWebhookSvc) CreateOrder(_ context.Context, _, _, _ string) (*model.Order, error) {
 	return nil, nil
 }
 func (m *mockWebhookSvc) CancelOrder(_ context.Context, _, _ string) error { return nil }
@@ -65,7 +65,7 @@ func webhookTestEngine(svc service.PaymentServiceInterface) *gin.Engine {
 		APIv3Key:     []byte("01234567890123456789012345678901"), // 32-byte test key
 		ReplayWindow: 5 * time.Minute,
 	}
-	h := NewWebhookHandler(svc, []byte("01234567890123456789012345678901"), verifier)
+	h := NewWebhookHandler(svc, []byte("01234567890123456789012345678901"), verifier, false)
 	engine.POST("/webhooks/payment/:channel", h.Handle)
 	return engine
 }
@@ -314,7 +314,6 @@ func TestWebhookHandler_Alipay_RefundEvent_DerivesExternalRefundID(t *testing.T)
 	}
 }
 
-
 // ============================================================================
 // WeChat — would need real AES-GCM encryption; we only test the parse error
 // path here. Full roundtrip is covered by middleware tests + e2e.
@@ -453,7 +452,7 @@ func TestWebhookHandler_WeChat_LocalDecryptPath(t *testing.T) {
 	// is NOT *middleware.WeChatPayV3Verifier (use a Stripe verifier to force
 	// the localWeChatDecrypt fallback).
 	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
-	h := NewWebhookHandler(svc, key, &middleware.StripeVerifier{Secret: []byte("x")})
+	h := NewWebhookHandler(svc, key, &middleware.StripeVerifier{Secret: []byte("x")}, false)
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	engine.POST("/webhooks/payment/:channel", h.Handle)

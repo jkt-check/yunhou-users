@@ -226,6 +226,13 @@ func parseStripeSignatureHeader(h string) (int64, [][]byte, error) {
 type WeChatPayV3Verifier struct {
 	APIv3Key     []byte // 32 bytes
 	ReplayWindow time.Duration
+
+	// MockMode (driven by WECHAT_PAY_MOCK=1) bypasses the HMAC match
+	// while still enforcing that all three headers are present and the
+	// timestamp is inside the replay window. Production MUST leave
+	// this false; the constant absence of a signature match would let
+	// any caller drive the order-paid → subscription flow.
+	MockMode bool
 }
 
 // DecryptResource decrypts a WeChat Pay v3 resource block. Called by the
@@ -272,6 +279,13 @@ func (v *WeChatPayV3Verifier) VerifySignature(channel string, body []byte, heade
 	}
 	if delta := time.Since(time.Unix(ts, 0)); delta > window || delta < -window {
 		return ErrTimestampOutOfRange
+	}
+	if v.MockMode {
+		// Mock mode: header presence + timestamp window are enough.
+		// Production rejects on this path because callers can't have
+		// the v3 HMAC key without registered merchant credentials —
+		// any inbound mock payload in prod is a misconfigured env.
+		return nil
 	}
 	toSign := tsStr + "\n" + nonce + "\n" + string(body) + "\n"
 	mac := hmac.New(sha256.New, v.APIv3Key)

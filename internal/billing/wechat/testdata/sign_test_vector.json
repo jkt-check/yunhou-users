@@ -1,0 +1,8 @@
+{
+  "body": "{\"appid\":\"wx1900000109\",\"mchid\":\"1900000109\",\"description\":\"plan-monthly\",\"out_trade_no\":\"order-1\",\"notify_url\":\"https://example.com/cb\",\"amount\":{\"total\":1234,\"currency\":\"CNY\"},\"trade_type\":\"NATIVE\"}",
+  "expected_authorization": "WECHATPAY2-SHA256-RSA2048 mchid=\"1900000109\",nonce_str=\"2f6c9f413c9590b18d3f7a26a7edf64e\",timestamp=\"1784098292\",serial_no=\"782516A3AE1CD4D331CE4B78DF100DBFCCFF3A03\",signature=\"iHyYzZsfSJp6rW271tSZ0ExsBF3c/lym8rlllOkPRLW8/UbF/xGe28HWeZdUDjgexi66E/ZazZFy/51PyNAINIDwNbHwqgE8q5xUQRWjIA5+7KXBr6pOzvyu5WuZkpyqIJid8FA7Q/Zp2KC0VdxRchfJd1Nk9WFu2v3yiEKozsRkUOb+q7yElNoCPLZIoWufQUPkKu5mK8pbCsAJM6PwNfx6Gus9XYVyIgOAj45+f/PPpjhKXgySqitARyVWZFUOb0o7tEp61dI+NaDGL7rtIyB3HaBjpHTxVPaicO5YwV5y6I2sx+ZjnkcZF0ln605/LatRP+cmodiUA/Uvg7zE0w==\"",
+  "mch_id": "1900000109",
+  "method": "POST",
+  "path": "/v3/pay/transactions/native",
+  "serial_no": "782516A3AE1CD4D331CE4B78DF100DBFCCFF3A03"
+}

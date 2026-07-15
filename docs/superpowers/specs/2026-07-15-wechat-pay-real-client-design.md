@@ -34,9 +34,9 @@ POST /payments/orders  (body: {plan_id, channel})
   └─ service.PaymentService.CreateOrder(ctx, userID, planID, channel)
        ├─ orderRepo.Create(order)                         ← existing
        ├─ [channel == "wechat_pay" + real mode] wechat.Client.UnifiedOrder(ctx, req)
-       │     ├─ JSON body: { mch_id, description, out_trade_no,
+       │     ├─ JSON body: { appid, mchid, description, out_trade_no,
        │     │              notify_url, amount:{total,currency}, trade_type }
-       │     │   (`appid` omitted — NATIVE does not need it)
+       │     │   (BOTH `appid` and `mchid` are required by v3 NATIVE)
        │     ├─ sign.BuildAuthHeader(method, path, body)
        │     │     └─ sign string = METHOD\nPATH\nTS\nNONCE\nBODY\n
        │     │     └─ SHA256withRSA(privateKey) → base64
@@ -44,13 +44,13 @@ POST /payments/orders  (body: {plan_id, channel})
        │     │                 timestamp=...,serial_no=...,signature=..."
        │     ├─ HTTPDoer.Do(POST api.mch.weixin.qq.com/v3/pay/transactions/native)
        │     └─ parse 200 → {code_url}; map 4xx/5xx → typed errors
-       └─ orderRepo.UpdateProviderIntent(orderID, {code_url, out_trade_no, mch_id})
+       └─ orderRepo.UpdateProviderIntent(orderID, {code_url, out_trade_no, mchid, appid})
 ```
 
 **Channel awareness at CreateOrder:** the existing `CreateOrder` signature is `(ctx, userID, planID)` and only `plan_id` is in the request body. This PR adds `channel` to both (handler request body + service signature) so the wechat pre-auth branch fires only for `channel == "wechat_pay"`. Without this, a Stripe order would mint a WeChat `code_url` and write it into `provider_intent` for the wrong channel — silent bug. The `channel` field is part of the request DTO and is validated via `validateChannel()` (the same allowlist `ConfirmOrder` already uses).
 
 **Dependencies on entry path:**
-- `cmd/server/main.go` at startup reads `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` → parses RSA private key (PKCS#1 or PKCS#8); reads `WECHAT_PAY_MCH_CERT_PATH` → parses X.509 cert, extracts `SerialNumber.String()` for `serial_no`. Builds `Signer{MchID, SerialNo, PrivateKey}`. Builds `Client{MockMode: cfg.WeChatPayMock, MchID, Signer, NotifyURL, BaseURL, HTTPDoer}`. **APIv3Key is only used for inbound webhook HMAC + AES-GCM** — it is read directly from cfg by `cmd/server/main.go` and is NOT stored on `Signer` or `Client`. Outbound signing uses the merchant RSA private key, never APIv3Key. Passes the client into `PaymentService` via the constructor — **new constructor parameter** added in this PR.
+- `cmd/server/main.go` at startup reads `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` → parses RSA private key (PKCS#1 or PKCS#8); reads `WECHAT_PAY_MCH_CERT_PATH` → parses X.509 cert, extracts `SerialNumber.Bytes()` formatted as **uppercase hex** for `serial_no` (WeChat's required format). Reads `WECHAT_PAY_APP_ID` for the outbound `appid` field. Builds `Signer{MchID, AppID, SerialNo, PrivateKey}`. Builds `Client{MockMode: cfg.WeChatPayMock, MchID, AppID, Signer, NotifyURL, BaseURL, HTTPDoer}`. **APIv3Key is only used for inbound webhook HMAC + AES-GCM** — it is read directly from cfg by `cmd/server/main.go` and is NOT stored on `Signer` or `Client`. Outbound signing uses the merchant RSA private key, never APIv3Key. Passes the client into `PaymentService` via the constructor — **new constructor parameter** added in this PR.
 - HTTPDoer in production: thin adapter over `*http.Client` (with timeout). In tests: stub returns canned body or error.
 - `PaymentService.CreateOrder` is channel-aware: when `Channel="wechat_pay"` AND the client is in real mode, it calls `UnifiedOrder` and persists `provider_intent`. Otherwise it returns the order unchanged (existing behavior for all other channels and for wechat_pay mock mode).
 
@@ -63,12 +63,12 @@ POST /payments/orders  (body: {plan_id, channel})
 | 3 | `internal/billing/wechat/sign_test.go` | **new** | Fixed test vector: known RSA key + body → known Authorization string. Catches drift in sign-string format |
 | 4 | `internal/billing/wechat/wechat.go` | **extend** | (a) Replace `ErrUnimplemented` stub with real `UnifiedOrder` branch: build request JSON, call Signer, HTTPDoer, parse response. Mock branch stays byte-for-byte identical. New typed errors: `ErrWeChatUnifiedOrderRejected`, `ErrWeChatNetwork`. (b) Replace `CertPath`/`KeyPath` string fields on `Client` with a single `Signer *Signer` field. (c) Add `MchID() string` getter on `*Client` to satisfy the service-layer interface |
 | 5 | `internal/billing/wechat/wechat_test.go` | **extend** | HTTPDoer stub tests: 200 happy / 4xx envelope / 5xx / network error / bad base64 cert / bad key / mock-mode still works. Existing mock-mode tests untouched |
-| 6 | `internal/billing/wechat/cert.go` | **new** | `LoadPrivateKey(path string) (*rsa.PrivateKey, error)` and `LoadCertSerial(path string) (string, error)`. PEM parse + serial decimal-string extraction. Pure helpers; no I/O outside file read. The test helper `GenerateTestKeyPair(t *testing.T) (*rsa.PrivateKey, []byte /*cert PEM*/)` is exported only via `_test.go` files (`export_test.go` pattern) so `sign_test.go` can build a deterministic fixture |
+| 6 | `internal/billing/wechat/cert.go` | **new** | `LoadPrivateKey(path string) (*rsa.PrivateKey, error)` and `LoadCertSerial(path string) (string, error)`. PEM parse + serial **uppercase HEX** extraction (WeChat's `serial_no` field format). Pure helpers; no I/O outside file read. The test helper `GenerateTestKeyPair(t *testing.T) (*rsa.PrivateKey, []byte /*cert PEM*/)` is exported only via `_test.go` files (`export_test.go` pattern) so `sign_test.go` can build a deterministic fixture |
 | 7 | `internal/billing/wechat/cert_test.go` | **new** | Test vectors: generated 2048-bit RSA key + self-signed cert, assert key parses, serial extracted matches expected format |
 | 8 | `internal/config/config.go` | **extend** | +3 fields: `WeChatPayMchPrivateKeyPath`, `WeChatPayMchCertPath`, `WeChatPayNotifyURL`. `Load()` parses them. `Validate()` extends the asymmetric WECHAT_PAY_MCH_ID ↔ APIv3_KEY rule (existing) to require the 5-tuple when real mode |
 | 9 | `internal/config/config_test.go` | **extend** | `TestValidate_WeChatReal_AllFiveRequired` (5 missing permutations fail), `TestValidate_WeChatMock_AllowsEmptyPartial` (mock + any subset of new envs still passes) |
 | 10 | `internal/service/payment.go` | **extend** | (a) `PaymentService` gets a new constructor field `wechat wechatClient` (interface, see §9). (b) `CreateOrder` adds a `wechat_pay`-and-real-mode branch: after `orderRepo.Create`, call `wechat.UnifiedOrder`, then `orderRepo.UpdateProviderIntent(orderID, providerIntentJSON)`. Other channels unchanged |
-| 10a | `internal/model/payment.go` | **extend** | Add `ProviderIntent []byte \`json:"-" db:"provider_intent"\`` to the `Order` struct so the column round-trips (json tag "-" keeps it out of HTTP responses; db tag wires the sqlx scan). |
+| 10a | `internal/model/payment.go` | **extend** | Add `ProviderIntent json.RawMessage \`json:"provider_intent,omitempty" db:"provider_intent"\`` to the `Order` struct so the column round-trips AND the BFF can read `code_url` from the JSON returned by `GetOrder` / `CreateOrder` HTTP responses. The `omitempty` keeps the field absent from responses for orders without a channel-specific pre-auth payload. |
 | 10b | `internal/repo/orders.go` (or wherever orders repo lives) | **extend** | Add `UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error` — UPDATE orders SET provider_intent = $payload::jsonb WHERE id = $1. Standard sqlx pattern matching existing repo methods. |
 | 11 | `internal/service/payment_test.go` | **extend** | Stub `wechatClient` interface (defined in service/payment.go per §9). Cover: real-mode + `channel=wechat_pay` persists `code_url`; mock-mode + `channel=wechat_pay` doesn't touch client; `channel=stripe` doesn't touch wechat client even when wired |
 | 12 | `cmd/server/main.go` | **extend** | After `cfg, err := config.Load()`, call `wechat.LoadPrivateKey(...)` and `wechat.LoadCertSerial(...)`. Fail-fast if real mode + any load error. Build `wechat.Client`. Pass into `PaymentService` constructor. Adapt `*http.Client` → `wechat.HTTPDoer` (one-line adapter) |
@@ -88,7 +88,7 @@ ALTER TABLE orders
 
 COMMENT ON COLUMN orders.provider_intent IS
     'Per-channel provider metadata written after channel-specific pre-auth: '
-    'wechat_pay → {code_url, out_trade_no, mch_id}; paypal → ...';
+    'wechat_pay → {appid, mchid, code_url, out_trade_no}; paypal → ...';
 ```
 
 Replaysafe on re-run.
@@ -98,10 +98,13 @@ Replaysafe on re-run.
 ```json
 {
   "code_url": "weixin://wxpay/bizpayurl?pr=AB12CD...",
-  "out_trade_no": "550e8400-e29b-41d4-a716-446655440000",
-  "mch_id": "1234567890"
+  "out_trade_no": "ord-20260715-0001",
+  "mchid": "1234567890",
+  "appid": "wx1234567890abcdef"
 }
 ```
+
+`out_trade_no` is at most **32 chars** (WeChat v3 limit). Order IDs from `GenerateUUID()` are 36 chars, so the service layer derives a shorter out_trade_no from the order ID (e.g. `ord-<first 24 chars of uuid>`).
 
 The repo layer exposes `UpdateProviderIntent(ctx, orderID, payload []byte) error` — service layer marshals the struct, repo writes `provider_intent = $payload::jsonb`. No ORM-mapped column.
 
@@ -110,9 +113,10 @@ The repo layer exposes `UpdateProviderIntent(ctx, orderID, payload []byte) error
 | Var | Required | Default | Notes |
 |---|---|---|---|
 | `WECHAT_PAY_MCH_ID` | Conditionally | (empty) | **Existing** — 商户号. Real mode requires + symmetric with APIv3_KEY (unchanged from A2.c review fix) |
-| `WECHAT_PAY_API_V3_KEY` | Conditionally | (empty) | **Existing** — 32 bytes. Used for inbound webhook HMAC + AES-GCM. Real mode requires (unchanged) |
+| `WECHAT_PAY_API_V3_KEY` | Conditionally | (empty) | **Existing** — **must be 32 bytes** in real mode. Used for inbound webhook HMAC + AES-GCM |
+| `WECHAT_PAY_APP_ID` | Real mode | (empty) | **New** — WeChat Open Platform 网站应用 appid. Required in NATIVE v3 request body |
 | `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` | Real mode | (empty) | **New** — Path to merchant RSA private key PEM (PKCS#1 or PKCS#8). Used to sign outbound requests |
-| `WECHAT_PAY_MCH_CERT_PATH` | Real mode | (empty) | **New** — Path to merchant X.509 cert PEM. `serial_no` extracted at startup, used in `Authorization` header |
+| `WECHAT_PAY_MCH_CERT_PATH` | Real mode | (empty) | **New** — Path to merchant X.509 cert PEM. `serial_no` extracted as **uppercase hex** at startup, used in `Authorization` header |
 | `WECHAT_PAY_NOTIFY_URL` | Real mode | (empty) | **New** — Full URL WeChat calls back to (typically `https://<host>/webhooks/payment/wechat_pay`). Sent in the unified-order body |
 
 **Validation rule** (additions to the existing asymmetric MCH_ID ↔ APIv3_KEY rule — the two existing case branches below stay; we add one more case after them):
@@ -124,13 +128,18 @@ case c.WeChatPayMchID == "" && c.WeChatAPIv3Key != "" && !c.WeChatPayMock:
 case c.WeChatPayMchID != "" && c.WeChatAPIv3Key == "" && !c.WeChatPayMock:
     return errors.New("WECHAT_PAY_API_V3_KEY is required when WECHAT_PAY_MCH_ID is set and WECHAT_PAY_MOCK is not enabled")
 
-// NEW rule — real mode also requires the 3 new envs to be present
+// NEW rule — real mode also requires the 4 new envs to be present
 case !c.WeChatPayMock && (
+    c.WeChatPayAppID == "" ||
     c.WeChatPayMchPrivateKeyPath == "" ||
     c.WeChatPayMchCertPath == "" ||
     c.WeChatPayNotifyURL == ""):
-    return errors.New("real WeChat Pay mode requires WECHAT_PAY_MCH_PRIVATE_KEY_PATH, "
-        "WECHAT_PAY_MCH_CERT_PATH, and WECHAT_PAY_NOTIFY_URL")
+    return errors.New("real WeChat Pay mode requires WECHAT_PAY_APP_ID, " +
+        "WECHAT_PAY_MCH_PRIVATE_KEY_PATH, WECHAT_PAY_MCH_CERT_PATH, and WECHAT_PAY_NOTIFY_URL")
+
+// APIv3Key length must be 32 bytes for inbound AES-GCM
+case !c.WeChatPayMock && c.WeChatAPIv3Key != "" && len(c.WeChatAPIv3Key) != 32:
+    return errors.New("WECHAT_PAY_API_V3_KEY must be exactly 32 bytes")
 ```
 
 The two existing cases still gate the symmetric 2-tuple. The new case covers the 3 new envs independently so a deployment with MCH_ID + APIv3_KEY but missing private key path fails fast with a clear message instead of crashing at HTTP-call time.
@@ -157,7 +166,7 @@ import (
 // are read-only.
 type Signer struct {
     MchID      string         // 商户号
-    SerialNo   string         // decimal string from cert
+    SerialNo   string         // uppercase hex from cert (WeChat's `serial_no` field format)
     PrivateKey *rsa.PrivateKey
 }
 
@@ -223,8 +232,10 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 
     // Real mode. NATIVE only needs mch_id — the `appid` field is
     // reserved for in-app / JSAPI flows and is intentionally omitted.
+    // Real mode. NATIVE requires BOTH appid and mchid (v3 protocol).
     type unifiedOrderBody struct {
-        MchID       string `json:"mch_id"`
+        AppID       string `json:"appid"`
+        MchID       string `json:"mchid"`
         Description string `json:"description"`
         OutTradeNo  string `json:"out_trade_no"`
         NotifyURL   string `json:"notify_url"`
@@ -235,6 +246,7 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
         TradeType string `json:"trade_type"`
     }
     var bodyBytes unifiedOrderBody
+    bodyBytes.AppID = c.AppID
     bodyBytes.MchID = c.MchID
     bodyBytes.Description = req.Description
     bodyBytes.OutTradeNo = req.OutTradeNo
@@ -350,8 +362,13 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
         if err != nil {
             return order, fmt.Errorf("amount to fen: %w", err)
         }
+        // WeChat's out_trade_no max length is 32 chars; our UUIDs are
+        // 36 chars. Derive a shorter out_trade_no from the order ID by
+        // stripping hyphens + truncating to 32 chars (still globally
+        // unique since UUIDs use hex digits).
+        outTradeNo := strings.ReplaceAll(order.ID, "-", "")[:32]
         resp, err := s.wechat.UnifiedOrder(ctx, wechat.UnifiedOrderRequest{
-            OutTradeNo:  order.ID,
+            OutTradeNo:  outTradeNo,
             Description: fmt.Sprintf("plan-%s", planID),
             Amount:      wechat.Amount{Total: amountFen, Currency: "CNY"},
             TradeType:   wechat.TradeTypeNative,
@@ -363,9 +380,10 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
             return order, fmt.Errorf("wechat unified order: %w", err)
         }
         intent, _ := json.Marshal(map[string]string{
+            "appid":        s.wechat.AppID(),
+            "mchid":        s.wechat.MchID(),
             "code_url":     resp.CodeURL,
-            "out_trade_no": order.ID,
-            "mch_id":       s.wechat.MchID,
+            "out_trade_no": outTradeNo,
         })
         if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intent); err != nil {
             return order, fmt.Errorf("persist provider intent: %w", err)
@@ -381,7 +399,8 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 ```go
 type wechatClient interface {
     IsMockMode() bool
-    MchID() string                       // service layer echoes this into provider_intent.mch_id
+    MchID() string                       // service layer echoes this into provider_intent.mchid
+    AppID() string                       // service layer echoes this into provider_intent.appid
     UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
 }
 ```

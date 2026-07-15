@@ -126,7 +126,7 @@ func TestWebhook_Stripe_PaymentSucceeded(t *testing.T) {
 
 	// Create the order first so the webhook can find it.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d %s", resp.StatusCode, string(resp.Body))
 	}
@@ -229,7 +229,7 @@ func TestWebhook_Stripe_DuplicateEvent(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "stripe-dup", "yundian")
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
 	var r struct {
 		Data struct {
 			ID string `json:"id"`
@@ -302,7 +302,7 @@ func TestWebhook_Alipay_PaymentSucceeded(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "alipay-paid", "yundian")
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"alipay"}`, authHeader(token))
 	var r struct {
 		Data struct {
 			ID string `json:"id"`
@@ -349,7 +349,7 @@ func TestWebhook_Alipay_FullRefund(t *testing.T) {
 
 	// Setup: paid order.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"alipay"}`, authHeader(token))
 	var r struct {
 		Data struct {
 			ID string `json:"id"`
@@ -408,7 +408,7 @@ func TestWebhook_WeChat_PaymentSucceeded(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "wechat-paid", "yundian")
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"wechat_pay"}`, authHeader(token))
 	var r struct {
 		Data struct {
 			ID string `json:"id"`
@@ -475,7 +475,7 @@ func TestWebhook_Stripe_DisputeCreated(t *testing.T) {
 
 	// Create the order + confirm so a paid payment row exists.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d %s", resp.StatusCode, string(resp.Body))
 	}
@@ -533,14 +533,14 @@ func TestWebhook_WeChat_PaymentFailed(t *testing.T) {
 	token, _ := loginAndGetToken(t, srv.Engine, "wechat-failed", "yundian")
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"wechat_pay"}`, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create order: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var r struct {
 		Data struct {
-			ID string `json":"id"`
-		} `json":"data"`
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -594,7 +594,7 @@ func TestWebhook_WeChat_MockMode_OrderPaid_SubscriptionActivated(t *testing.T) {
 
 	// Create an order.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly"}`, authHeader(token))
+		`{"plan_id":"monthly","channel":"wechat_pay"}`, authHeader(token))
 	var r struct {
 		Data struct {
 			ID string `json:"id"`

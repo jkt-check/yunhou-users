@@ -28,7 +28,7 @@ type mockWebhookSvc struct {
 	err      error
 }
 
-func (m *mockWebhookSvc) CreateOrder(_ context.Context, _, _ string) (*model.Order, error) {
+func (m *mockWebhookSvc) CreateOrder(_ context.Context, _, _, _ string) (*model.Order, error) {
 	return nil, nil
 }
 func (m *mockWebhookSvc) CancelOrder(_ context.Context, _, _ string) error { return nil }
@@ -313,7 +313,6 @@ func TestWebhookHandler_Alipay_RefundEvent_DerivesExternalRefundID(t *testing.T)
 		t.Errorf("refund_amount: got %v, want 29.90", svc.gotEvent.RefundAmount)
 	}
 }
-
 
 // ============================================================================
 // WeChat — would need real AES-GCM encryption; we only test the parse error

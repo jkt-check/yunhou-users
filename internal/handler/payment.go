@@ -54,14 +54,15 @@ func (h *PaymentHandler) CreateOrder(c *gin.Context) {
 		return
 	}
 	var req struct {
-		PlanID string `json:"plan_id" binding:"required"`
+		PlanID  string `json:"plan_id" binding:"required"`
+		Channel string `json:"channel" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
 	}
 
-	order, err := h.svc.CreateOrder(c.Request.Context(), userID, req.PlanID)
+	order, err := h.svc.CreateOrder(c.Request.Context(), userID, req.PlanID, req.Channel)
 	if err != nil {
 		writePaymentError(c, err)
 		return
@@ -107,8 +108,8 @@ func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
 	}
 
 	var req struct {
-		Channel       string     `json:"channel" binding:"required"`
-		ExternalTxnID string     `json:"external_txn_id" binding:"required"`
+		Channel       string `json:"channel" binding:"required"`
+		ExternalTxnID string `json:"external_txn_id" binding:"required"`
 		// ExpiresAt is the subscription expiry the frontend computed from
 		// plan.interval_days + business rules (rollover, grace, trial).
 		// yunhou-users MUST NOT compute this server-side — see the

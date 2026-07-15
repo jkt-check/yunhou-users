@@ -236,6 +236,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		subRepo, planRepo, userRepo,
 		webhookEventRepo, auditLogRepo,
 		&stubRefundAPI{},
+		nil,
 		cfg.OrderExpiryDuration,
 	)
 
@@ -455,6 +456,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		subRepo, planRepo, userRepo,
 		webhookEventRepo, auditLogRepo,
 		&stubRefundAPI{},
+		nil,
 		cfg.OrderExpiryDuration,
 	)
 
@@ -466,8 +468,8 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	cfg.PaypalWebhookIDLive = ""
 	cfg.PaypalAPIBaseLive = ""
 	mv := &middleware.MultiChannelVerifier{
-		Stripe:       &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
-		WeChat:       &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey), MockMode: wechatPayMock},
+		Stripe: &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
+		WeChat: &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey), MockMode: wechatPayMock},
 		Alipay: &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
 		Paypal: &middleware.PaypalVerifier{
 			HTTPClient:       &http.Client{Timeout: 2 * time.Second},

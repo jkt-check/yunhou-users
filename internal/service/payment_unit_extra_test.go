@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
@@ -26,18 +27,21 @@ import (
 // the lookup-heavy service functions. Unused methods panic — those code
 // paths have separate coverage elsewhere.
 type stubOrderRepoLookup struct {
-	byID              map[string]*model.Order
-	findErr           error
-	cancelOK          bool
-	cancelErr         error
-	cancelSeen        string
-	updateIntentCalled bool   // set when UpdateProviderIntent is invoked
+	byID                map[string]*model.Order
+	findErr             error
+	cancelOK            bool
+	cancelErr           error
+	cancelSeen          string
+	created             *model.Order
+	createErr           error
+	updateIntentCalled  bool   // set when UpdateProviderIntent is invoked
 	updateIntentPayload []byte // last payload passed to UpdateProviderIntent
-	updateIntentErr    error  // optional error to return from UpdateProviderIntent
+	updateIntentErr     error  // optional error to return from UpdateProviderIntent
 }
 
-func (s *stubOrderRepoLookup) Create(_ context.Context, _ *model.Order) error {
-	panic("Create not used by lookup tests")
+func (s *stubOrderRepoLookup) Create(_ context.Context, order *model.Order) error {
+	s.created = order
+	return s.createErr
 }
 func (s *stubOrderRepoLookup) FindByID(_ context.Context, id string) (*model.Order, error) {
 	if s.findErr != nil {
@@ -153,9 +157,10 @@ func newPaymentServiceForLookup(orderRepo repo.OrderRepo, paymentRepo repo.Payme
 		(*sqlx.DB)(nil),
 		orderRepo, paymentRepo, refundRepo,
 		nil, nil, nil, nil, nil,
-		&stubRefundAPI{},
-		0,
-	)
+		&stubRefundAPI{}, nil,
+
+		0)
+
 }
 
 // stubPlanRepo satisfies repo.PlanRepo with a single active plan for CreateOrder.
@@ -175,10 +180,10 @@ func (s *stubPlanRepo) FindByID(_ context.Context, id string) (*model.Plan, erro
 	return s.plan, nil
 }
 func (s *stubPlanRepo) FindByApp(_ context.Context, _ string) ([]model.Plan, error) { return nil, nil }
-func (s *stubPlanRepo) FindDefault(_ context.Context) (*model.Plan, error) { return nil, nil }
-func (s *stubPlanRepo) Create(_ context.Context, _ *model.Plan) error { return nil }
-func (s *stubPlanRepo) Update(_ context.Context, _ *model.Plan) error { return nil }
-func (s *stubPlanRepo) Delete(_ context.Context, _ string) error { return nil }
+func (s *stubPlanRepo) FindDefault(_ context.Context) (*model.Plan, error)          { return nil, nil }
+func (s *stubPlanRepo) Create(_ context.Context, _ *model.Plan) error               { return nil }
+func (s *stubPlanRepo) Update(_ context.Context, _ *model.Plan) error               { return nil }
+func (s *stubPlanRepo) Delete(_ context.Context, _ string) error                    { return nil }
 
 // stubSubRepo satisfies repo.SubscriptionRepo with configurable FindActiveByUserID error.
 type stubSubRepo struct {
@@ -196,10 +201,144 @@ func (s *stubSubRepo) FindActiveByUserID(_ context.Context, _ string) (*model.Su
 	}
 	return s.activeSub, nil
 }
-func (s *stubSubRepo) FindByID(_ context.Context, _ string) (*model.Subscription, error) { return nil, nil }
-func (s *stubSubRepo) ListByUserID(_ context.Context, _ string) ([]model.Subscription, error) { return nil, nil }
+func (s *stubSubRepo) FindByID(_ context.Context, _ string) (*model.Subscription, error) {
+	return nil, nil
+}
+func (s *stubSubRepo) ListByUserID(_ context.Context, _ string) ([]model.Subscription, error) {
+	return nil, nil
+}
 func (s *stubSubRepo) UpdateStatus(_ context.Context, _ string, _ string) error { return nil }
-func (s *stubSubRepo) Renew(_ context.Context, _ string, _ *time.Time) error { return nil }
+func (s *stubSubRepo) Renew(_ context.Context, _ string, _ *time.Time) error    { return nil }
+
+// stubWechat satisfies service.wechatClient for CreateOrder channel tests.
+type stubWechat struct {
+	mockMode  bool
+	mchID     string
+	unifiedFn func(context.Context, wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
+	called    int
+	gotReq    wechat.UnifiedOrderRequest
+}
+
+func (s *stubWechat) IsMockMode() bool { return s.mockMode }
+func (s *stubWechat) MchID() string    { return s.mchID }
+func (s *stubWechat) UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+	s.called++
+	s.gotReq = req
+	return s.unifiedFn(ctx, req)
+}
+
+func newPaymentServiceForCreateOrder(client *stubWechat) (*PaymentService, *stubOrderRepoLookup) {
+	orderRepo := &stubOrderRepoLookup{}
+	return NewPaymentService(
+		(*sqlx.DB)(nil),
+		orderRepo,
+		nil,
+		nil,
+		&stubSubRepo{},
+		&stubPlanRepo{plan: &model.Plan{ID: "plan-1", Price: 0.29, IsActive: true}},
+		nil,
+		nil,
+		nil,
+		&stubRefundAPI{},
+		client,
+		0,
+	), orderRepo
+}
+
+// ============================================================================
+// CreateOrder — channel-aware WeChat Pay pre-auth
+// ============================================================================
+
+func TestCreateOrder_WeChat_Real_PersistsIntent(t *testing.T) {
+	stub := &stubWechat{
+		mchID: "1900000109",
+		unifiedFn: func(_ context.Context, _ wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return &wechat.UnifiedOrderResponse{OutTradeNo: "order-1", CodeURL: "weixin://abc"}, nil
+		},
+	}
+	svc, orderRepo := newPaymentServiceForCreateOrder(stub)
+
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if stub.called != 1 {
+		t.Fatalf("UnifiedOrder called %d times, want 1", stub.called)
+	}
+	if stub.gotReq.OutTradeNo != order.ID {
+		t.Errorf("UnifiedOrder OutTradeNo = %q, want %q", stub.gotReq.OutTradeNo, order.ID)
+	}
+	if stub.gotReq.Amount.Total != 29 {
+		t.Errorf("UnifiedOrder amount = %d fen, want 29", stub.gotReq.Amount.Total)
+	}
+	if stub.gotReq.Amount.Currency != "CNY" || stub.gotReq.TradeType != wechat.TradeTypeNative {
+		t.Errorf("UnifiedOrder request = %+v", stub.gotReq)
+	}
+	if !orderRepo.updateIntentCalled {
+		t.Fatal("UpdateProviderIntent was not called")
+	}
+	if !strings.Contains(string(orderRepo.updateIntentPayload), `"code_url":"weixin://abc"`) {
+		t.Fatalf("UpdateProviderIntent payload = %s", orderRepo.updateIntentPayload)
+	}
+	if !strings.Contains(string(orderRepo.updateIntentPayload), `"mch_id":"1900000109"`) {
+		t.Fatalf("UpdateProviderIntent payload missing mch_id: %s", orderRepo.updateIntentPayload)
+	}
+	if string(order.ProviderIntent) != string(orderRepo.updateIntentPayload) {
+		t.Errorf("order.ProviderIntent = %s, persisted payload = %s", order.ProviderIntent, orderRepo.updateIntentPayload)
+	}
+}
+
+func TestCreateOrder_WeChat_Real_UnifiedOrderErr(t *testing.T) {
+	stub := &stubWechat{
+		unifiedFn: func(_ context.Context, _ wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return nil, errors.New("wechat down")
+		},
+	}
+	svc, orderRepo := newPaymentServiceForCreateOrder(stub)
+
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if order == nil || orderRepo.created == nil {
+		t.Fatal("pending order should remain after UnifiedOrder failure")
+	}
+	if orderRepo.updateIntentCalled {
+		t.Fatal("UpdateProviderIntent should not be called when UnifiedOrder fails")
+	}
+}
+
+func TestCreateOrder_WeChat_Mock_NoClientCall(t *testing.T) {
+	stub := &stubWechat{mockMode: true}
+	svc, orderRepo := newPaymentServiceForCreateOrder(stub)
+
+	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay"); err != nil {
+		t.Fatalf("CreateOrder mock: %v", err)
+	}
+	if stub.called != 0 {
+		t.Fatalf("UnifiedOrder called %d times in mock mode", stub.called)
+	}
+	if orderRepo.updateIntentCalled {
+		t.Fatal("UpdateProviderIntent called in mock mode")
+	}
+}
+
+func TestCreateOrder_Stripe_NilWeChat_OK(t *testing.T) {
+	svc, _ := newPaymentServiceForCreateOrder(nil)
+	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe"); err != nil {
+		t.Fatalf("CreateOrder stripe: %v", err)
+	}
+}
+
+func TestCreateOrder_InvalidChannel(t *testing.T) {
+	svc, orderRepo := newPaymentServiceForCreateOrder(nil)
+	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "fakechan"); err == nil {
+		t.Fatal("expected error for invalid channel")
+	}
+	if orderRepo.created != nil {
+		t.Fatal("invalid channel should be rejected before creating an order")
+	}
+}
 
 // ============================================================================
 // CreateOrder — subRepo error branch
@@ -214,10 +353,11 @@ func TestPaymentService_Unit_CreateOrder_SubRepoError(t *testing.T) {
 		&stubSubRepo{findErr: errors.New("db connection lost")},
 		&stubPlanRepo{plan: &model.Plan{ID: "monthly", IsActive: true}},
 		nil, nil, nil,
-		&stubRefundAPI{},
-		0,
-	)
-	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly")
+		&stubRefundAPI{}, nil,
+
+		0)
+
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe")
 	if err == nil {
 		t.Fatal("expected error from subRepo.FindActiveByUserID")
 	}
@@ -235,10 +375,11 @@ func TestPaymentService_Unit_CreateOrder_PlanNotFound(t *testing.T) {
 		&stubSubRepo{},
 		&stubPlanRepo{err: sql.ErrNoRows},
 		nil, nil, nil,
-		&stubRefundAPI{},
-		0,
-	)
-	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly")
+		&stubRefundAPI{}, nil,
+
+		0)
+
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe")
 	if !errors.Is(err, ErrPlanNotFound) {
 		t.Errorf("expected ErrPlanNotFound, got %v", err)
 	}
@@ -253,10 +394,11 @@ func TestPaymentService_Unit_CreateOrder_PlanInactive(t *testing.T) {
 		&stubSubRepo{},
 		&stubPlanRepo{plan: &model.Plan{ID: "monthly", IsActive: false}},
 		nil, nil, nil,
-		&stubRefundAPI{},
-		0,
-	)
-	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly")
+		&stubRefundAPI{}, nil,
+
+		0)
+
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe")
 	if !errors.Is(err, ErrPlanInactive) {
 		t.Errorf("expected ErrPlanInactive, got %v", err)
 	}
@@ -269,8 +411,8 @@ func TestPaymentService_Unit_CreateOrder_PlanInactive(t *testing.T) {
 func TestPaymentService_Unit_CancelOrder_ReReadError(t *testing.T) {
 	t.Parallel()
 	orderRepo := &stubOrderRepoLookup{
-		cancelOK:  false,        // triggers re-read path
-		findErr:   errors.New("db connection lost"), // non-ErrNoRows error on re-read
+		cancelOK: false,                            // triggers re-read path
+		findErr:  errors.New("db connection lost"), // non-ErrNoRows error on re-read
 	}
 	svc := newPaymentServiceForLookup(orderRepo, nil, nil)
 	err := svc.CancelOrder(context.Background(), "ord_1", "u_1")
@@ -541,8 +683,10 @@ func TestPaymentService_Unit_ListUserPayments_PassesThrough(t *testing.T) {
 		prepo,
 		&stubRefundRepoLookup{},
 		nil, nil, nil, nil, nil,
-		&stubRefundAPI{}, 0,
-	)
+		&stubRefundAPI{}, nil,
+
+		0)
+
 	got, err := svc.ListUserPayments(context.Background(), "u_1")
 	if err != nil {
 		t.Fatalf("list payments: %v", err)
@@ -569,7 +713,9 @@ func (s *stubPaymentRepoList) FindByChannelTxnID(_ context.Context, _, _ string)
 func (s *stubPaymentRepoList) FindPaidByOrderID(_ context.Context, _ string) (*model.Payment, error) {
 	return nil, sql.ErrNoRows
 }
-func (s *stubPaymentRepoList) ListByOrderID(_ context.Context, _ string) ([]model.Payment, error) { return nil, nil }
+func (s *stubPaymentRepoList) ListByOrderID(_ context.Context, _ string) ([]model.Payment, error) {
+	return nil, nil
+}
 func (s *stubPaymentRepoList) ListByUserID(_ context.Context, _ string) ([]model.Payment, error) {
 	if s.out == nil {
 		return nil, nil
@@ -580,7 +726,7 @@ func (s *stubPaymentRepoList) MarkPaid(_ context.Context, _ string, _ time.Time)
 	return nil
 }
 func (s *stubPaymentRepoList) MarkFailed(_ context.Context, _, _ string) error { return nil }
-func (s *stubPaymentRepoList) MarkRefunded(_ context.Context, _ string) error { return nil }
+func (s *stubPaymentRepoList) MarkRefunded(_ context.Context, _ string) error  { return nil }
 func (s *stubPaymentRepoList) SetDisputed(_ context.Context, _ string, _ time.Time) error {
 	return nil
 }

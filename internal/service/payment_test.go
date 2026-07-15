@@ -40,18 +40,19 @@ func (s *stubRefundAPI) Refund(_ context.Context, ch, txn string, amt float64, k
 // never called from the pure functions we test here.
 func nopRepos() *PaymentService {
 	return NewPaymentService(
-		(*sqlx.DB)(nil),  // db — never used in pure-function tests
-		nil,              // orderRepo
-		nil,              // paymentRepo
-		nil,              // refundRepo
-		nil,              // subRepo
-		nil,              // planRepo
-		nil,              // userRepo
-		nil,              // webhookRepo
-		nil,              // auditRepo
-		&stubRefundAPI{}, // refundAPI
-		0,                // orderExpiry — 0 means default 30min
-	)
+		(*sqlx.DB)(nil),
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		&stubRefundAPI{}, nil,
+
+		0)
+
 }
 
 // ============================================================================
@@ -70,9 +71,9 @@ func TestValidateChannel(t *testing.T) {
 		{"alipay", false},
 		{"paypal", false},
 		{"", true},
-		{"STRIPE", true},    // case-sensitive
-		{" stripe ", true},  // whitespace
-		{"\nstripe", true},  // leading newline
+		{"STRIPE", true},   // case-sensitive
+		{" stripe ", true}, // whitespace
+		{"\nstripe", true}, // leading newline
 	}
 	for _, c := range cases {
 		name := c.in
@@ -280,7 +281,8 @@ func TestOnWebhook_DisputeCreated_AcksPayloadBeforeTx(t *testing.T) {
 	t.Parallel()
 	webhookRepo := &stubWebhookEventRepo{insertID: "we-d", insertOK: true}
 	svc := NewPaymentService(nil, nil, nil, nil, nil, nil, nil,
-		webhookRepo, stubAuditRepo{}, nil, 30*time.Minute)
+		webhookRepo, stubAuditRepo{}, nil, nil,
+		30*time.Minute)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -317,7 +319,8 @@ func TestOnWebhook_DedupHit_ReturnsDuplicateEvent(t *testing.T) {
 	// We pass nil *sqlx.DB — OnWebhook's dedup-hit branch returns BEFORE
 	// calling BeginTxx, so the DB pointer never gets dereferenced.
 	svc := NewPaymentService(nil, nil, nil, nil, nil, nil, nil,
-		webhookRepo, stubAuditRepo{}, nil, 30*time.Minute)
+		webhookRepo, stubAuditRepo{}, nil, nil,
+		30*time.Minute)
 
 	result, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel:   "paypal",
@@ -342,7 +345,8 @@ func TestOnWebhook_UnknownEventType_Acks200(t *testing.T) {
 		insertOK: true,
 	}
 	svc := NewPaymentService(nil, nil, nil, nil, nil, nil, nil,
-		webhookRepo, stubAuditRepo{}, nil, 30*time.Minute)
+		webhookRepo, stubAuditRepo{}, nil, nil,
+		30*time.Minute)
 
 	result, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel:   "paypal",
@@ -453,7 +457,7 @@ func TestMustJSON(t *testing.T) {
 
 func TestNewPaymentService_DefaultsOrderExpiry(t *testing.T) {
 	t.Parallel()
-	svc := NewPaymentService(nil, nil, nil, nil, nil, nil, nil, nil, nil, &stubRefundAPI{}, 0)
+	svc := NewPaymentService(nil, nil, nil, nil, nil, nil, nil, nil, nil, &stubRefundAPI{}, nil, 0)
 	if svc.orderExpiry != 30*time.Minute {
 		t.Errorf("default orderExpiry = %v, want 30m", svc.orderExpiry)
 	}
@@ -461,7 +465,7 @@ func TestNewPaymentService_DefaultsOrderExpiry(t *testing.T) {
 
 func TestNewPaymentService_CustomOrderExpiry(t *testing.T) {
 	t.Parallel()
-	svc := NewPaymentService(nil, nil, nil, nil, nil, nil, nil, nil, nil, &stubRefundAPI{}, 5*time.Minute)
+	svc := NewPaymentService(nil, nil, nil, nil, nil, nil, nil, nil, nil, &stubRefundAPI{}, nil, 5*time.Minute)
 	if svc.orderExpiry != 5*time.Minute {
 		t.Errorf("custom orderExpiry = %v, want 5m", svc.orderExpiry)
 	}

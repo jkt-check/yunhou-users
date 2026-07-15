@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
-	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/middleware"
@@ -82,6 +82,7 @@ func main() {
 		subRepo, planRepo, userRepo,
 		webhookEventRepo, auditLogRepo,
 		&noChannelRefundAPI{},
+		nil,
 		cfg.OrderExpiryDuration,
 	)
 

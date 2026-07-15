@@ -6,12 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
+
+// wechatClient is the surface PaymentService needs from the wechat.Client.
+// Defined here so tests can replace the concrete billing client with a
+// hand-rolled stub.
+type wechatClient interface {
+	IsMockMode() bool
+	MchID() string
+	UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
+}
 
 // PaymentService implements the v1 payment data flow primitives:
 // order creation, frontend confirm, refund creation, channel webhook reception.
@@ -44,6 +56,10 @@ type PaymentService struct {
 	// real Stripe/WeChat/Alipay HTTP clients here; tests inject stubs.
 	refundAPI RefundAPI
 
+	// wechat is optional; nil deployments can still create orders for
+	// non-WeChat channels.
+	wechat wechatClient
+
 	// orderExpiry drives the order's default expires_at. Service layer
 	// sets this on INSERT (SQL DEFAULT is also 30 min; setting explicitly
 	// makes it configurable without re-migrating).
@@ -72,6 +88,7 @@ func NewPaymentService(
 	webhookRepo repo.WebhookEventRepo,
 	auditRepo repo.AuditLogRepo,
 	refundAPI RefundAPI,
+	wechat wechatClient,
 	orderExpiry time.Duration,
 ) *PaymentService {
 	if orderExpiry == 0 {
@@ -88,6 +105,7 @@ func NewPaymentService(
 		webhookRepo: webhookRepo,
 		auditRepo:   auditRepo,
 		refundAPI:   refundAPI,
+		wechat:      wechat,
 		orderExpiry: orderExpiry,
 		dbBeginTx: func(ctx context.Context) (dbTx, error) {
 			tx, err := db.BeginTxx(ctx, nil)
@@ -142,7 +160,11 @@ func (s *sqlxTx) QueryRowID(ctx context.Context, query string, args ...interface
 // CreateOrder mints an order row for a paid plan. The amount is a snapshot
 // of plan.price at creation time — plan price changes don't retroactively
 // affect in-flight orders.
-func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string) (*model.Order, error) {
+func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channel string) (*model.Order, error) {
+	if err := validateChannel(channel); err != nil {
+		return nil, err
+	}
+
 	plan, err := s.planRepo.FindByID(ctx, planID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -155,13 +177,13 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string)
 	}
 
 	// Enforce the partial unique index `UNIQUE(user_id) WHERE status='active'`
-// at the order layer. Without this pre-check, a concurrent order + activate
-// would hit the constraint at INSERT time and surface as a 500; the user
-// gets a clean 409 instead. The DB invariant IS the primitive — this is
-// just a friendly surface for it. If the product later allows multiple
-// active rows, both this check and the partial unique index need to change
-// together (yunhou-users stays primitive — upgrade flow / re-buy semantics
-// belong to the frontend).
+	// at the order layer. Without this pre-check, a concurrent order + activate
+	// would hit the constraint at INSERT time and surface as a 500; the user
+	// gets a clean 409 instead. The DB invariant IS the primitive — this is
+	// just a friendly surface for it. If the product later allows multiple
+	// active rows, both this check and the partial unique index need to change
+	// together (yunhou-users stays primitive — upgrade flow / re-buy semantics
+	// belong to the frontend).
 	if _, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
 		return nil, ErrUserHasActiveSub
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -180,6 +202,42 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID string)
 	if err := s.orderRepo.Create(ctx, order); err != nil {
 		return nil, fmt.Errorf("create order: %w", err)
 	}
+
+	// WeChat Pay NATIVE: mint code_url so the BFF can render a QR. Mock
+	// mode and non-WeChat channels do not need an upstream pre-auth call.
+	if channel == "wechat_pay" && s.wechat != nil && !s.wechat.IsMockMode() {
+		// Convert CNY decimal to fen without float multiplication: format to
+		// two decimal places, strip the decimal point, then parse the integer.
+		amountStr := fmt.Sprintf("%.2f", order.Amount)
+		normalized := strings.ReplaceAll(amountStr, ".", "")
+		amountFen, err := strconv.ParseInt(normalized, 10, 64)
+		if err != nil {
+			return order, fmt.Errorf("amount to fen: %w", err)
+		}
+
+		resp, err := s.wechat.UnifiedOrder(ctx, wechat.UnifiedOrderRequest{
+			OutTradeNo:  order.ID,
+			Description: fmt.Sprintf("plan-%s", planID),
+			Amount:      wechat.Amount{Total: amountFen, Currency: "CNY"},
+			TradeType:   wechat.TradeTypeNative,
+		})
+		if err != nil {
+			// The pending order already exists. The caller may cancel and retry,
+			// or the sweeper will eventually expire it.
+			return order, fmt.Errorf("wechat unified order: %w", err)
+		}
+
+		intent, _ := json.Marshal(map[string]string{
+			"code_url":     resp.CodeURL,
+			"out_trade_no": order.ID,
+			"mch_id":       s.wechat.MchID(),
+		})
+		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intent); err != nil {
+			return order, fmt.Errorf("persist provider intent: %w", err)
+		}
+		order.ProviderIntent = intent
+	}
+
 	return order, nil
 }
 
@@ -371,7 +429,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 
 	now := time.Now()
 	rawPayload, _ := json.Marshal(map[string]any{
-		"source": "frontend_confirm",
+		"source":   "frontend_confirm",
 		"order_id": order.ID,
 	})
 	p := &model.Payment{
@@ -480,8 +538,8 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 	}
 
 	// Caller-retry gate: same (user, key) → same row, no channel call.
-// Scoped to in.UserID — a global key lookup would let user B see user
-// A's refund response by reusing the same key (IDOR).
+	// Scoped to in.UserID — a global key lookup would let user B see user
+	// A's refund response by reusing the same key (IDOR).
 	if existing, err := s.refundRepo.FindByIdempotencyKey(ctx, in.UserID, in.IdempotencyKey); err == nil && existing != nil {
 		return &RefundResult{Refund: existing, Existing: true}, nil
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -597,34 +655,34 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 // service. Each channel's handler populates the fields it can extract;
 // fields not relevant to the event type are left zero.
 type WebhookEvent struct {
-	Channel        string
-	EventID        string // channel's event ID — Stripe `evt.id`, WeChat `notify_id`, Alipay `notify_id`
-	EventType      string // channel's event type string
-	RawPayload     json.RawMessage
-	TransactionID  string     // channel's transaction ID — maps to payments.external_txn_id
-	OrderID        string     // order UUID from channel metadata (Stripe) or out_trade_no (WeChat/Alipay)
-	Amount         float64    // settled amount (major currency units, normalized by handler)
-	Currency       string     // ISO 4217
-	RefundAmount   float64    // for refund events
-	ExternalRefundID string   // channel's refund ID
-	ExternalSubscriptionID string // PayPal: subscription ID (`I-...`) — used by renewal branch to find the active sub
-	SubExpiresAt *time.Time // subscription expiry at activation. MUST be supplied by the
-		// caller (e.g. an explicit channel metadata field) — yunhou-users
-		// MUST NOT compute it from plan.interval_days; that calculation is
-		// a frontend product decision (rollover rules, grace periods, trials).
-		// nil = never expires.
+	Channel                string
+	EventID                string // channel's event ID — Stripe `evt.id`, WeChat `notify_id`, Alipay `notify_id`
+	EventType              string // channel's event type string
+	RawPayload             json.RawMessage
+	TransactionID          string     // channel's transaction ID — maps to payments.external_txn_id
+	OrderID                string     // order UUID from channel metadata (Stripe) or out_trade_no (WeChat/Alipay)
+	Amount                 float64    // settled amount (major currency units, normalized by handler)
+	Currency               string     // ISO 4217
+	RefundAmount           float64    // for refund events
+	ExternalRefundID       string     // channel's refund ID
+	ExternalSubscriptionID string     // PayPal: subscription ID (`I-...`) — used by renewal branch to find the active sub
+	SubExpiresAt           *time.Time // subscription expiry at activation. MUST be supplied by the
+	// caller (e.g. an explicit channel metadata field) — yunhou-users
+	// MUST NOT compute it from plan.interval_days; that calculation is
+	// a frontend product decision (rollover rules, grace periods, trials).
+	// nil = never expires.
 }
 
 // OnWebhookResult reports what the handler did.
 type OnWebhookResult struct {
-	DuplicateEvent bool // true if event_id was already seen (handler should ack 200)
-	DomainAction string // set only when an action ran. Values:
-		//   "payment_paid" / "payment_failed" / "refund_paid"
-		//   / "payment_disputed" / "payment_dispute_closed" / "none"
-		// Empty string ("") means no action ran — either a dedupe hit
-		// (DuplicateEvent=true) or an uninteresting event type. Consumers
-		// should branch on `duplicate` for the dedupe case, not on
-		// `domain_action == "none"`.
+	DuplicateEvent bool   // true if event_id was already seen (handler should ack 200)
+	DomainAction   string // set only when an action ran. Values:
+	//   "payment_paid" / "payment_failed" / "refund_paid"
+	//   / "payment_disputed" / "payment_dispute_closed" / "none"
+	// Empty string ("") means no action ran — either a dedupe hit
+	// (DuplicateEvent=true) or an uninteresting event type. Consumers
+	// should branch on `duplicate` for the dedupe case, not on
+	// `domain_action == "none"`.
 }
 
 // OnWebhook dispatches the (already signature-verified) event to the right
@@ -1007,9 +1065,9 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	}
 
 	// Full vs partial refund — only the channel's amount tells us. We
-// compare in integer cents (DECIMAL(10,2) → int64) to avoid float
-// round-trip drift; the +0.0001 epsilon was masking this and mis-
-// classifying fee-inclusive refunds as full refunds.
+	// compare in integer cents (DECIMAL(10,2) → int64) to avoid float
+	// round-trip drift; the +0.0001 epsilon was masking this and mis-
+	// classifying fee-inclusive refunds as full refunds.
 	if toCents(e.RefundAmount) >= toCents(payment.Amount) {
 		// Full refund: payment → refunded, sub → cancelled.
 		if _, err := tx.ExecContext(ctx, `
@@ -1139,7 +1197,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "paypal", "renewal", "unknown_sub"},
 				map[string]any{
-					"event_id":                e.EventID,
+					"event_id":                 e.EventID,
 					"external_subscription_id": e.ExternalSubscriptionID,
 				})
 		}
@@ -1166,7 +1224,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 			[]string{"webhook", "paypal", "renewal", "duplicate"},
 			map[string]any{
 				"event_id":                 e.EventID,
-				"existing_payment_id":     existingPaymentID,
+				"existing_payment_id":      existingPaymentID,
 				"external_subscription_id": e.ExternalSubscriptionID,
 			})
 	case errors.Is(err, sql.ErrNoRows):
@@ -1263,11 +1321,11 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		fmt.Sprintf("subscription:%s", sub.ID),
 		[]string{"payment", "paypal", "renewal"},
 		map[string]any{
-			"payment_id":              paymentID,
-			"order_id":                orderID,
+			"payment_id":               paymentID,
+			"order_id":                 orderID,
 			"external_subscription_id": e.ExternalSubscriptionID,
-			"amount":                  e.Amount,
-			"currency":                e.Currency,
+			"amount":                   e.Amount,
+			"currency":                 e.Currency,
 		}); err != nil {
 		return fmt.Errorf("audit renewal: %w", err)
 	}

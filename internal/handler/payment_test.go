@@ -21,29 +21,31 @@ import (
 // Each method has a configurable error + return value, which is the pattern
 // used elsewhere in this package (auth_test.go, app handler tests).
 type mockPaymentSvc struct {
-	createOrderResp *model.Order
-	createOrderErr  error
-	cancelOrderErr  error
-	confirmResult   *service.ConfirmResult
-	confirmErr      error
-	gotConfirmInput *service.ConfirmInput // captures the input Confirm was called with
-	refundResult    *service.RefundResult
-	refundErr       error
-	getOrderResp    *model.Order
-	getOrderErr     error
-	listPayments    []model.Payment
-	listPaymentsErr error
-	getPaymentResp  *model.Payment
-	getPaymentErr   error
-	listRefunds     []model.Refund
-	listRefundsErr  error
-	getRefundResp   *model.Refund
-	getRefundErr    error
-	onWebhookResult *service.OnWebhookResult
-	onWebhookErr    error
+	createOrderResp  *model.Order
+	createOrderErr   error
+	gotCreateChannel string
+	cancelOrderErr   error
+	confirmResult    *service.ConfirmResult
+	confirmErr       error
+	gotConfirmInput  *service.ConfirmInput // captures the input Confirm was called with
+	refundResult     *service.RefundResult
+	refundErr        error
+	getOrderResp     *model.Order
+	getOrderErr      error
+	listPayments     []model.Payment
+	listPaymentsErr  error
+	getPaymentResp   *model.Payment
+	getPaymentErr    error
+	listRefunds      []model.Refund
+	listRefundsErr   error
+	getRefundResp    *model.Refund
+	getRefundErr     error
+	onWebhookResult  *service.OnWebhookResult
+	onWebhookErr     error
 }
 
-func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _ string) (*model.Order, error) {
+func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _, channel string) (*model.Order, error) {
+	m.gotCreateChannel = channel
 	return m.createOrderResp, m.createOrderErr
 }
 func (m *mockPaymentSvc) CancelOrder(_ context.Context, _, _ string) error {
@@ -135,10 +137,13 @@ func TestPaymentHandler_CreateOrder(t *testing.T) {
 			},
 		}
 		engine := paymentTestEngine(svc, "user-1")
-		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly"})
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly", "channel": "wechat_pay"})
 
 		if rec.Code != http.StatusCreated {
 			t.Errorf("status: got %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if svc.gotCreateChannel != "wechat_pay" {
+			t.Errorf("CreateOrder channel: got %q, want wechat_pay", svc.gotCreateChannel)
 		}
 	})
 
@@ -146,7 +151,7 @@ func TestPaymentHandler_CreateOrder(t *testing.T) {
 		t.Parallel()
 		svc := &mockPaymentSvc{createOrderErr: service.ErrPlanNotFound}
 		engine := paymentTestEngine(svc, "user-1")
-		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "ghost"})
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "ghost", "channel": "stripe"})
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("status: got %d, want 400", rec.Code)
@@ -157,7 +162,7 @@ func TestPaymentHandler_CreateOrder(t *testing.T) {
 		t.Parallel()
 		svc := &mockPaymentSvc{createOrderErr: service.ErrUserHasActiveSub}
 		engine := paymentTestEngine(svc, "user-1")
-		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly"})
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly", "channel": "wechat_pay"})
 
 		if rec.Code != http.StatusConflict {
 			t.Errorf("status: got %d, want 409", rec.Code)
@@ -167,7 +172,17 @@ func TestPaymentHandler_CreateOrder(t *testing.T) {
 	t.Run("missing plan_id → 400 (binding)", func(t *testing.T) {
 		t.Parallel()
 		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
-		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{})
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"channel": "stripe"})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 (binding error)", rec.Code)
+		}
+	})
+
+	t.Run("missing channel → 400 (binding)", func(t *testing.T) {
+		t.Parallel()
+		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly"})
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("status: got %d, want 400 (binding error)", rec.Code)

@@ -1,0 +1,8 @@
+{
+  "method": "POST",
+  "path": "/v3/pay/transactions/native",
+  "body": "{\"mch_id\":\"1900000109\"}",
+  "mch_id": "1900000109",
+  "serial_no": "685905992238958054984616619497717501610824776195",
+  "expected_authorization": "WECHATPAY2-SHA256-RSA2048 mchid=\"1900000109\",nonce_str=\"2f6c9f413c9590b18d3f7a26a7edf64e\",timestamp=\"1784098292\",serial_no=\"685905992238958054984616619497717501610824776195\",signature=\"BDFXzRm5w6kihXIaphjaB5V2ORbZPM0qFTQ/bjXhxAwT7G0mHQDQfJnM2cyn+VTm8xWdBuoNd0NKHRgBAr05BhBAV/RGxydO9dUiAR6hKPCg+hfFQuwGKly49vCzEZ7hze+Jea0h5yIH+Mz5u3LdVuIFAhp1A6sMtlr+A6OElwpv+kcdChGAdQf5Af3XDirtzv8H8mTbWiraYM1ZnPSJVL5r++iHr2YNwC99jdQeEX3uLouCfrBJR1air/GHJHm/6kJHtwrigvJ2BrZJl8I4OzvLwnMdcNKVkQKkssD3hR/7o+T+rUWli0IYgjQ1pefUHFxdAwPAItPkmycba09SRQ==\""
+}

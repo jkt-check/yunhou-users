@@ -2307,6 +2307,8 @@ func TestAuthErrReason(t *testing.T) {
 		{service.ErrUserSuspended, "user_suspended"},
 		{service.ErrSubscriptionExpired, "subscription_expired"},
 		{service.ErrSubscriptionNotActive, "subscription_expired"},
+		{service.ErrWeChatUpstream, "wechat_upstream"},
+		{service.ErrWeChatNoUnionID, "wechat_no_unionid"},
 		{errors.New("some other error"), "auth_failed"},
 		{nil, "auth_failed"},
 	}

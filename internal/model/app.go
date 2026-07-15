@@ -33,7 +33,8 @@ type BrandConfig struct {
 }
 
 type PaymentProvidersConfig struct {
-	Paypal *PaypalConfig `json:"paypal,omitempty"`
+	Paypal    *PaypalConfig    `json:"paypal,omitempty"`
+	WeChatPay *WeChatPayConfig `json:"wechat_pay,omitempty"`
 }
 
 type PaypalConfig struct {
@@ -63,10 +64,11 @@ type ProviderToken struct {
 }
 
 // OAuthProvidersConfig groups all OAuth providers configured for an app.
-// Today only GitHub is supported; the block is structured so future
+// Today GitHub and WeChat are supported; the block is structured so future
 // providers slot in alongside.
 type OAuthProvidersConfig struct {
 	GitHub *GitHubOAuthConfig `json:"github,omitempty"`
+	WeChat *WeChatOAuthConfig `json:"wechat,omitempty"`
 }
 
 // GitHubOAuthConfig stores the GitHub OAuth App credentials Yunhou uses to
@@ -91,4 +93,50 @@ type GitHubOAuthConfig struct {
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret"`
 	CallbackURLs []string `json:"callback_urls"`
+}
+
+// WeChatOAuthConfig stores the WeChat Open Platform 网站应用 credentials
+// Yunhou uses to run the /auth/wechat/redirect + /auth/wechat/callback
+// flow on behalf of a consumer app. Same boundary contract as the GitHub
+// block:
+//
+//   - AppID is the 微信开放平台 网站应用 AppID (public — appears in the
+//     authorize URL anyway).
+//   - AppSecret is server-side only. Never returned in any response body;
+//     the handler maps ErrWeChatNotConfigured without surfacing the secret.
+//   - CallbackURLs is the whitelist the callback handler matches the
+//     incoming redirect_uri against. Multiple entries allowed (web / iOS /
+//     Android sharing one WeChat 网站应用 registration).
+//
+// All Yunhou consumer apps that want cross-app unionid unification MUST
+// register their 网站应用 under the SAME 微信开放平台 account — this is a
+// Tencent-side requirement, not enforced in code.
+type WeChatOAuthConfig struct {
+	AppID        string   `json:"app_id"`
+	AppSecret    string   `json:"app_secret"`
+	CallbackURLs []string `json:"callback_urls"`
+}
+
+// WeChatPayConfig stores the WeChat Pay v3 merchant configuration Yunhou
+// uses to drive /webhooks/payment/wechat_pay verification + NATIVE/H5/JSAPI
+// order creation. Same boundary as the WeChat OAuth block: never return
+// any field below in a response body to the BFF.
+//
+// The cert / key paths point at merchant-supplied PEM files mounted into
+// the runtime container. Mock-mode deployments (WECHAT_PAY_MOCK=1) skip
+// the signature verifier entirely and accept plaintext JSON webhooks,
+// so neither file needs to exist in dev/staging that haven't been issued
+// a real merchant id yet.
+//
+// PlanMapping lets operators map a yunhou plan id (e.g. "monthly") to a
+// per-plan WeChat Pay product code; v1 ships with the unified-order
+// plan_code field always set to "" so the mapping is informational until
+// A2.c's real client lands.
+type WeChatPayConfig struct {
+	MchID         string            `json:"mch_id"`          // 微信支付商户号
+	APIv3Key      string            `json:"api_v3_key"`      // 32 bytes; used for HMAC + AES-GCM resource decrypt
+	CertPath      string            `json:"cert_path"`       // /keys/wechatpay/apiclient_cert.pem
+	KeyPath       string            `json:"key_path"`        // /keys/wechatpay/apiclient_key.pem
+	NotifyURL     string            `json:"notify_url"`      // https://api.yunhouai.com/webhooks/payment/wechat_pay
+	PlanMapping   map[string]string `json:"plan_mapping,omitempty"` // {"monthly": "MONTHLY_PLAN_CODE", ...}
 }

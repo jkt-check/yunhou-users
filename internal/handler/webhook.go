@@ -28,17 +28,21 @@ import (
 //   - Stripe  : application/json, `data.object.{id, metadata.order_id, amount, currency}`
 //     amount is in cents → divide by 100 to major units (design doc §"Amount unit convention")
 //   - WeChat  : application/json, AES-256-GCM-decrypt resource.ciphertext;
-//     metadata.order_id = out_trade_no (set at order creation)
+//     metadata.order_id = out_trade_no (set at order creation). When
+//     mockWechatPay is true the body is plaintext JSON (no resource
+//     block, no AES) so dev / e2e suites can drive the flow without a
+//     registered merchant.
 //   - Alipay  : application/x-www-form-urlencoded, out_trade_no IS the order_id,
 //     total_amount is in major units (no conversion)
 type WebhookHandler struct {
-	svc       service.PaymentServiceInterface
-	wechatKey []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
-	verifier  middleware.ChannelSignatureVerifier
+	svc            service.PaymentServiceInterface
+	wechatKey      []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
+	verifier       middleware.ChannelSignatureVerifier
+	mockWechatPay  bool
 }
 
-func NewWebhookHandler(svc service.PaymentServiceInterface, wechatAPIv3Key []byte, verifier middleware.ChannelSignatureVerifier) *WebhookHandler {
-	return &WebhookHandler{svc: svc, wechatKey: wechatAPIv3Key, verifier: verifier}
+func NewWebhookHandler(svc service.PaymentServiceInterface, wechatAPIv3Key []byte, verifier middleware.ChannelSignatureVerifier, mockWechatPay bool) *WebhookHandler {
+	return &WebhookHandler{svc: svc, wechatKey: wechatAPIv3Key, verifier: verifier, mockWechatPay: mockWechatPay}
 }
 
 // Handle is the single entrypoint for /webhooks/payment/:channel. The
@@ -168,7 +172,16 @@ func (h *WebhookHandler) parseStripe(raw []byte) (*service.WebhookEvent, error) 
 // from the decrypted payload. WeChat v3 encloses business data inside `resource`
 // with AES-256-GCM ciphertext; without decrypting, the business fields are
 // unreadable.
+//
+// In mock mode (mockWechatPay=true) the body is plaintext JSON with the
+// same field shape as the decrypted resource — no `resource` wrapper, no
+// ciphertext. e2e suites drive the order-paid → subscription flow
+// without registering a merchant.
 func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) {
+	if h.mockWechatPay {
+		return h.parseWeChatMock(raw)
+	}
+
 	var evt struct {
 		ID         string `json:"id"`
 		CreateTime string `json:"create_time"`
@@ -220,6 +233,54 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 	}
 	if resource.Amount.Refund > 0 {
 		we.RefundAmount = float64(resource.Amount.Refund) / 100
+	}
+	return we, nil
+}
+
+// parseWeChatMock accepts a plaintext JSON body that mirrors the
+// decrypted-resource shape directly (no resource wrapper, no AES). The
+// signature middleware's MockMode short-circuit has already accepted
+// the headers, so we just decode and pass through to the same
+// downstream WebhookEvent construction.
+func (h *WebhookHandler) parseWeChatMock(raw []byte) (*service.WebhookEvent, error) {
+	var evt struct {
+		ID         string `json:"id"`
+		EventType  string `json:"event_type"`
+		Resource   struct {
+			TransactionID string `json:"transaction_id"`
+			OutTradeNo    string `json:"out_trade_no"`
+			SubExpires    string `json:"sub_expires_at"`
+			Amount        struct {
+				Total  int64 `json:"total"`
+				Refund int64 `json:"refund"`
+			} `json:"amount"`
+		} `json:"resource"`
+	}
+	if err := json.Unmarshal(raw, &evt); err != nil {
+		return nil, fmt.Errorf("wechat mock body: %w", err)
+	}
+	if evt.EventType == "" {
+		return nil, fmt.Errorf("wechat mock missing event_type")
+	}
+	if evt.Resource.OutTradeNo == "" {
+		return nil, fmt.Errorf("wechat mock missing resource.out_trade_no")
+	}
+	we := &service.WebhookEvent{
+		Channel:       "wechat_pay",
+		EventID:       evt.ID,
+		EventType:     evt.EventType,
+		TransactionID: evt.Resource.TransactionID,
+		OrderID:       evt.Resource.OutTradeNo,
+		Amount:        float64(evt.Resource.Amount.Total) / 100,
+		Currency:      "CNY",
+	}
+	if evt.Resource.SubExpires != "" {
+		if t, err := time.Parse(time.RFC3339, evt.Resource.SubExpires); err == nil {
+			we.SubExpiresAt = &t
+		}
+	}
+	if evt.Resource.Amount.Refund > 0 {
+		we.RefundAmount = float64(evt.Resource.Amount.Refund) / 100
 	}
 	return we, nil
 }

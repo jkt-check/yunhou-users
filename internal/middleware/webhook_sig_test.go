@@ -1439,3 +1439,51 @@ func TestStripeVerifier_EmptySigHeader(t *testing.T) {
 		t.Errorf("expected ErrInvalidSignature on empty sig header, got %v", err)
 	}
 }
+
+// TestWeChatPayV3Verifier_MockMode covers WECHAT_PAY_MOCK=1: the
+// verifier still requires all three headers + a fresh timestamp but
+// skips the HMAC match. Without this guard the verifier would either
+// (a) reject every dev / e2e payload as ErrInvalidSignature, or
+// (b) accept any garbage if we just disabled the check entirely.
+func TestWeChatPayV3Verifier_MockMode(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{MockMode: true, APIv3Key: []byte("ignored-in-mock-mode-32-bytes-x")}
+	hdr := map[string]string{
+		"Wechatpay-Signature": "totally-wrong-signature",
+		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
+		"Wechatpay-Nonce":     "nonce-x",
+	}
+	if err := v.VerifySignature("wechat_pay", []byte("{}"), hdr); err != nil {
+		t.Errorf("mock mode with all headers + fresh ts: err = %v, want nil", err)
+	}
+
+	// Missing signature → still rejected.
+	hdr["Wechatpay-Signature"] = ""
+	if !errors.Is(v.VerifySignature("wechat_pay", []byte("{}"), hdr), ErrInvalidSignature) {
+		t.Errorf("mock mode still requires all three headers")
+	}
+
+	// Stale timestamp → still rejected (replay defence).
+	hdr["Wechatpay-Signature"] = "x"
+	hdr["Wechatpay-Timestamp"] = strconv.FormatInt(time.Now().Add(-1*time.Hour).Unix(), 10)
+	if !errors.Is(v.VerifySignature("wechat_pay", []byte("{}"), hdr), ErrTimestampOutOfRange) {
+		t.Errorf("mock mode still enforces replay window")
+	}
+}
+
+// TestWeChatPayV3Verifier_RealMode_RequiresValidHMAC confirms the mock
+// short-circuit does NOT weaken the real path: an inbound header set
+// with a wrong signature must still return ErrInvalidSignature when
+// MockMode is false.
+func TestWeChatPayV3Verifier_RealMode_RequiresValidHMAC(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{MockMode: false, APIv3Key: []byte("real-key-32-bytes-of-padding-x")}
+	hdr := map[string]string{
+		"Wechatpay-Signature": "not-the-right-sig",
+		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
+		"Wechatpay-Nonce":     "nonce-y",
+	}
+	if !errors.Is(v.VerifySignature("wechat_pay", []byte("{}"), hdr), ErrInvalidSignature) {
+		t.Errorf("real mode: wrong sig must still be rejected")
+	}
+}

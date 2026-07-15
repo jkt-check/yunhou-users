@@ -81,7 +81,7 @@ func TestGitHubOAuth_Redirect_HappyPath(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://yundian.com/auth/callback")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fyundian.com%2Fauth%2Fcallback", nil)
@@ -105,7 +105,7 @@ func TestGitHubOAuth_Redirect_MissingAppID(t *testing.T) {
 	appRepo := &stubAppLoader{}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/redirect?redirect_uri=https%3A%2F%2Fx", nil)
 	w := httptest.NewRecorder()
@@ -121,7 +121,7 @@ func TestGitHubOAuth_Redirect_MissingRedirectURI(t *testing.T) {
 	appRepo := &stubAppLoader{}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/redirect?app_id=yundian", nil)
 	w := httptest.NewRecorder()
@@ -137,7 +137,7 @@ func TestGitHubOAuth_Redirect_AppNotFound(t *testing.T) {
 	appRepo := &stubAppLoader{err: errors.New("db down")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=missing&redirect_uri=https%3A%2F%2Fx", nil)
@@ -154,7 +154,7 @@ func TestGitHubOAuth_Redirect_GitHubNotConfigured(t *testing.T) {
 	appRepo := &stubAppLoader{app: &model.App{AppID: "yundian", Name: "Yundian", IsActive: true}}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fx", nil)
@@ -171,7 +171,7 @@ func TestGitHubOAuth_Redirect_CallbackURLMismatch(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://yundian.com/auth/callback")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fevil.com%2Fcb", nil)
@@ -192,7 +192,7 @@ func TestGitHubOAuth_Redirect_MalformedConfig(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fx", nil)
@@ -211,7 +211,7 @@ func TestGitHubOAuth_Redirect_InactiveApp(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	// Inactive apps must not get a real GitHub authorize URL — the user
 	// would complete OAuth consent only to be rejected at /callback.
@@ -310,7 +310,7 @@ func TestGitHubOAuth_Callback_HappyPath(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	url := "/auth/github/callback?app_id=yundian&code=auth-code&state=" + state
@@ -353,7 +353,7 @@ func TestGitHubOAuth_Callback_ExchangeCodeFailure(t *testing.T) {
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	svc.SetAccessTokenURL(upstream.URL + "/login/oauth/access_token")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -395,7 +395,7 @@ func TestGitHubOAuth_Callback_ProfileFetchError(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -439,7 +439,7 @@ func TestGitHubOAuth_Callback_AuthServiceError(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -482,7 +482,7 @@ func TestGitHubOAuth_Callback_AuthServiceUnknownError(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -501,7 +501,7 @@ func TestGitHubOAuth_Callback_GitHubErrorParam(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth(cbURL)}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	// Sign a valid state so the handler can identify which callback
 	// URL the user started from. Mirrors the production flow.
@@ -536,7 +536,7 @@ func TestGitHubOAuth_Callback_GitHubErrorParamNoAppID(t *testing.T) {
 	appRepo := &stubAppLoader{}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/callback?error=access_denied&state=x", nil)
@@ -577,7 +577,7 @@ func TestGitHubOAuth_Callback_AppInactiveRedirects(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -625,7 +625,7 @@ func TestGitHubOAuth_Callback_UserSuspendedRedirects(t *testing.T) {
 	svc.SetUserURL(upstream.URL + "/user")
 	svc.SetEmailsURL(upstream.URL + "/user/emails")
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, authSvc, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, authSvc, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, cbURL)
 	req := httptest.NewRequest(http.MethodGet,
@@ -647,7 +647,7 @@ func TestGitHubOAuth_Callback_MissingCodeOrState(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://x")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/callback?app_id=yundian", nil)
 	w := httptest.NewRecorder()
@@ -663,7 +663,7 @@ func TestGitHubOAuth_Callback_MissingAppID(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://x")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=c&state=s", nil)
 	w := httptest.NewRecorder()
@@ -679,7 +679,7 @@ func TestGitHubOAuth_Callback_InvalidState(t *testing.T) {
 	appRepo := &stubAppLoader{app: ghAppWithOAuth("https://x")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/callback?app_id=yundian&code=c&state=not-a-valid-state", nil)
@@ -696,7 +696,7 @@ func TestGitHubOAuth_Callback_AppNotFound(t *testing.T) {
 	appRepo := &stubAppLoader{err: errors.New("not found")}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, "https://yundian.com/auth/callback")
 	req := httptest.NewRequest(http.MethodGet,
@@ -715,7 +715,7 @@ func TestGitHubOAuth_Callback_GitHubNotConfigured(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	// Need a valid state for "yundian" so state-verify passes and we
 	// exercise the GitHubNotConfigured branch that follows.
@@ -740,7 +740,7 @@ func TestGitHubOAuth_Callback_MalformedAppConfig(t *testing.T) {
 	appRepo := &stubAppLoader{app: app}
 	svc := service.NewGitHubOAuthService(ghTestSecret)
 	engine := gin.New()
-	RegisterGitHubOAuthRoutes(engine, svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
+	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	state := callbackURIFor(t, svc, "yundian", 0, "https://x")
 	req := httptest.NewRequest(http.MethodGet,
@@ -750,60 +750,6 @@ func TestGitHubOAuth_Callback_MalformedAppConfig(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
-	}
-}
-
-// =========================================================================
-// attachYunhouJWTToURL tests
-// =========================================================================
-
-func TestAttachYunhouJWTToURL_EmptyResponse(t *testing.T) {
-	got := attachYunhouJWTToURL("https://yundian.com/cb", nil)
-	if !strings.HasPrefix(got, "https://yundian.com/cb#") {
-		t.Errorf("got = %q", got)
-	}
-}
-
-func TestAttachYunhouJWTToURL_FullResponse(t *testing.T) {
-	resp := &service.LoginResponse{
-		AccessToken:  "a",
-		RefreshToken: "r",
-		User:         service.UserInfo{ID: "u-1"},
-		Subscription: &service.SubscriptionInfo{HasAccess: true},
-	}
-	got := attachYunhouJWTToURL("https://yundian.com/cb", resp)
-	if !strings.Contains(got, "token=a") || !strings.Contains(got, "refresh_token=r") ||
-		!strings.Contains(got, "user_id=u-1") || !strings.Contains(got, "has_access=true") {
-		t.Errorf("got = %q", got)
-	}
-}
-
-func TestAttachYunhouJWTToURL_NoAccess(t *testing.T) {
-	resp := &service.LoginResponse{
-		Subscription: &service.SubscriptionInfo{HasAccess: false},
-	}
-	got := attachYunhouJWTToURL("https://yundian.com/cb", resp)
-	if !strings.Contains(got, "has_access=false") {
-		t.Errorf("got = %q", got)
-	}
-}
-
-func TestAttachYunhouJWTToURL_PartialResponse(t *testing.T) {
-	resp := &service.LoginResponse{AccessToken: "only-access"}
-	got := attachYunhouJWTToURL("https://yundian.com/cb", resp)
-	if !strings.Contains(got, "token=only-access") {
-		t.Errorf("got = %q", got)
-	}
-	if strings.Contains(got, "refresh_token") {
-		t.Errorf("got = %q, should not contain refresh_token", got)
-	}
-}
-
-func TestAttachYunhouJWTToURL_BadURL(t *testing.T) {
-	resp := &service.LoginResponse{AccessToken: "x"}
-	got := attachYunhouJWTToURL("://bad-url", resp)
-	if got != "://bad-url" {
-		t.Errorf("bad URL should be returned as-is, got %q", got)
 	}
 }
 
@@ -994,6 +940,140 @@ func TestValidateGitHubOAuthConfig_DuplicateURL(t *testing.T) {
 	}
 	if err := validateGitHubOAuthConfig(g); err == nil {
 		t.Error("expected error for duplicate URLs")
+	}
+}
+
+// =========================================================================
+// validateWeChatOAuthConfig tests — mirror the GitHub set
+// =========================================================================
+
+func TestValidateWeChatOAuthConfig_HappyPath(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://bff.example.com/auth/wechat-callback"},
+	}
+	if err := validateWeChatOAuthConfig(w); err != nil {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestValidateWeChatOAuthConfig_MissingAppID(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for missing app_id")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_InvalidAppIDFormat(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "not-a-wechat-appid",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for invalid app_id format")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_AppIDUppercase(t *testing.T) {
+	// Tencent website-app AppIDs can be issued with uppercase A-F in
+	// the hex tail; the validator must accept either case so operators
+	// aren't locked out by a case mismatch on a real assignment. The
+	// "wx" prefix is anchored lowercase per Tencent's convention.
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789ABCDEF",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err != nil {
+		t.Errorf("expected uppercase hex AppID to be accepted, got %v", err)
+	}
+}
+
+func TestValidateWeChatOAuthConfig_AppIDUppercasePrefix(t *testing.T) {
+	// The "wx" prefix is anchored lowercase — operators who typo it as
+	// uppercase get rejected at admin time rather than discovering the
+	// mismatch via a confusing errcode=40013 in production.
+	w := &model.WeChatOAuthConfig{
+		AppID:        "WX0123456789ABCDEF",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for uppercase 'WX' prefix")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_AppIDMixedCase(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789AbCdEf",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err != nil {
+		t.Errorf("expected mixed-case hex AppID to be accepted, got %v", err)
+	}
+}
+
+func TestValidateWeChatOAuthConfig_InvalidAppSecretLength(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "tooshort",
+		CallbackURLs: []string{"https://b"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for invalid app_secret length")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_NoCallbackURLs(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:     "wx0123456789abcdef",
+		AppSecret: "0123456789abcdef0123456789abcdef",
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for empty callback_urls")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_InsecureURL(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"http://attacker.example.com/cb"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for non-https callback URL")
+	}
+}
+
+func TestValidateWeChatOAuthConfig_DuplicateURL(t *testing.T) {
+	w := &model.WeChatOAuthConfig{
+		AppID:        "wx0123456789abcdef",
+		AppSecret:    "0123456789abcdef0123456789abcdef",
+		CallbackURLs: []string{"https://x/cb", "https://x/cb"},
+	}
+	if err := validateWeChatOAuthConfig(w); err == nil {
+		t.Error("expected error for duplicate URLs")
+	}
+}
+
+func TestValidateAppConfig_WeChatBranch(t *testing.T) {
+	cfg := &model.AppConfig{
+		OAuthProviders: &model.OAuthProvidersConfig{
+			WeChat: &model.WeChatOAuthConfig{
+				AppID:        "wx0123456789abcdef",
+				AppSecret:    "0123456789abcdef0123456789abcdef",
+				CallbackURLs: []string{"https://b"},
+			},
+		},
+	}
+	if err := validateAppConfig(cfg); err != nil {
+		t.Errorf("err: %v", err)
 	}
 }
 

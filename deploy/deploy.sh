@@ -27,15 +27,14 @@ fi
 
 echo "[3/5] run migrations"
 if [[ -n "${DATABASE_URL:-}" ]]; then
-  # Apply only the latest migration if it hasn't been recorded yet. For a
-  # brand-new deploy this runs both 001 and 002; for a re-deploy it no-ops.
-  for m in migrations/*.sql; do
-    echo "  - applying $m"
-    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$m" || {
-      echo "!! migration $m failed — aborting deploy"
-      exit 1
-    }
-  done
+  # Run the standalone migrate binary; it owns the _migrations ledger
+  # and re-applies nothing that's already recorded. See
+  # internal/migrate/migrate.go for the contract and migrations/README.md
+  # for the file naming + DDL rules.
+  docker compose run --rm migrate || {
+    echo "!! migrate failed — aborting deploy"
+    exit 1
+  }
 else
   echo "(skipping migrations — DATABASE_URL not set)"
 fi

@@ -45,10 +45,10 @@ func isExpectedAuthErr(err error) bool {
 }
 
 // authErrReason maps the service-layer auth sentinels to a short token
-// safe to put in a URL fragment. Used by the GitHub OAuth callback to
-// tell the BFF which class of failure occurred without stranding the
-// browser on a JSON error page. Returns "auth_failed" for anything we
-// don't recognise.
+// safe to put in a URL fragment. Used by the GitHub and WeChat OAuth
+// callbacks to tell the BFF which class of failure occurred without
+// stranding the browser on a JSON error page. Returns "auth_failed"
+// for anything we don't recognise.
 func authErrReason(err error) string {
 	switch {
 	case errors.Is(err, service.ErrAppNotFound):
@@ -61,6 +61,10 @@ func authErrReason(err error) string {
 		return "user_suspended"
 	case errors.Is(err, service.ErrSubscriptionExpired), errors.Is(err, service.ErrSubscriptionNotActive):
 		return "subscription_expired"
+	case errors.Is(err, service.ErrWeChatUpstream):
+		return "wechat_upstream"
+	case errors.Is(err, service.ErrWeChatNoUnionID):
+		return "wechat_no_unionid"
 	default:
 		return "auth_failed"
 	}

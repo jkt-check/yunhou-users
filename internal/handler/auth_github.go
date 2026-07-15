@@ -35,15 +35,16 @@ type githubOAuthDeps struct {
 	tokenSvc service.TokenServiceInterface
 }
 
-// RegisterGitHubOAuthRoutes attaches /auth/github/redirect and
-// /auth/github/callback to the engine. Called from router.Setup().
+// RegisterGitHubOAuthRoutes attaches /redirect and /callback to the
+// given router. Called from router.Setup() with an `engine.Group("/auth/github", ...)`
+// so the routes resolve at /auth/github/redirect + /auth/github/callback.
 //
 // Both endpoints are public (no JWT) — same posture as the existing
 // /auth/refresh and /auth/logout. Rate-limited via the public limiter.
 func RegisterGitHubOAuthRoutes(engine gin.IRouter, svc *service.GitHubOAuthService, appRepo appLoader, authSvc service.AuthServiceInterface, tokenSvc service.TokenServiceInterface) {
 	d := &githubOAuthDeps{svc: svc, appRepo: appRepo, authSvc: authSvc, tokenSvc: tokenSvc}
-	engine.GET("/auth/github/redirect", d.Redirect)
-	engine.GET("/auth/github/callback", d.Callback)
+	engine.GET("/redirect", d.Redirect)
+	engine.GET("/callback", d.Callback)
 }
 
 // Redirect handles GET /auth/github/redirect?app_id=...&redirect_uri=...
@@ -251,7 +252,7 @@ func (d *githubOAuthDeps) Callback(c *gin.Context) {
 		return
 	}
 
-	c.Redirect(http.StatusFound, attachYunhouJWTToURL(redirectURI, resp))
+	c.Redirect(http.StatusFound, buildCallbackRedirectURL(redirectURI, resp))
 }
 
 // lookupGitHubConfig extracts the GitHub OAuth config from app.Config.
@@ -306,41 +307,4 @@ func normalizeCallbackURLForCompare(s string) string {
 		return decoded
 	}
 	return s
-}
-
-// attachYunhouJWTToURL adds the standard post-login params to the BFF's
-// callback URL via URL fragment (so the access_token doesn't end up in
-// browser history, server logs, or referer headers).
-//
-//	https://yundian.com/auth/callback#token=<access>&refresh_token=<refresh>&user_id=<uuid>&has_access=<bool>
-func attachYunhouJWTToURL(base string, resp *service.LoginResponse) string {
-	u, err := url.Parse(base)
-	if err != nil {
-		return base
-	}
-	fragment := url.Values{}
-	if resp == nil {
-		// Empty response — still emit the # marker so the BFF's
-		// client-side handler can route on "is there a token".
-		s := u.String()
-		return s + "#"
-	}
-	if resp.AccessToken != "" {
-		fragment.Set("token", resp.AccessToken)
-	}
-	if resp.RefreshToken != "" {
-		fragment.Set("refresh_token", resp.RefreshToken)
-	}
-	if resp.User.ID != "" {
-		fragment.Set("user_id", resp.User.ID)
-	}
-	if resp.Subscription != nil {
-		if resp.Subscription.HasAccess {
-			fragment.Set("has_access", "true")
-		} else {
-			fragment.Set("has_access", "false")
-		}
-	}
-	u.Fragment = fragment.Encode()
-	return u.String()
 }

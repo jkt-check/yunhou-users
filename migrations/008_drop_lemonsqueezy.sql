@@ -15,8 +15,6 @@
 --
 -- Apply AFTER 007_app_secret.
 
-BEGIN;
-
 -- payments.channel
 ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_channel_check;
 ALTER TABLE payments ADD CONSTRAINT payments_channel_check
@@ -31,5 +29,3 @@ ALTER TABLE refunds ADD CONSTRAINT refunds_channel_check
 ALTER TABLE webhook_events DROP CONSTRAINT IF EXISTS webhook_events_channel_check;
 ALTER TABLE webhook_events ADD CONSTRAINT webhook_events_channel_check
     CHECK (channel IN ('stripe', 'wechat_pay', 'alipay', 'paypal'));
-
-COMMIT;

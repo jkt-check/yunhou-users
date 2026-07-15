@@ -1,8 +1,5 @@
 -- Migration: 002_simplify_plans
 -- Description: 简化订阅系统，Plan 包含可访问的 App 列表，统一账号订阅
-
-BEGIN;
-
 -- 1. 创建 plans 表
 CREATE TABLE IF NOT EXISTS plans (
     id            TEXT PRIMARY KEY,
@@ -105,5 +102,3 @@ ALTER TABLE sessions DROP COLUMN app_id_old;
 -- 重建索引
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_app_id ON sessions(app_id);
-
-COMMIT;

@@ -17,7 +17,7 @@
 | Phase 0.1 | A1 — migrations ledger | ⏳ 待启动 | — |
 | Phase 0.2.a | A2.a — 微信 OAuth mock | ⏳ 待启动（依赖 A1） | — |
 | Phase 0.2.b | A2.b — 微信支付 mock | ⏳ 待启动（依赖 A1） | — |
-| Phase 0.2.c | A2.c — 生产凭据骨架 | ⏳ 待启动（依赖 A2.a） | — |
+| Phase 0.2.c | A2.c — 生产凭据 + 真客户端 | ✅ 完成（`feat/wechat-pay-real-client`） | 5-tuple Validate + 真 UnifiedOrder 落地；退款 / JSAPI / per-app 仍未做 |
 | Phase 0.3 | A3 — PR CI 工作流 | ⏳ 待启动（依赖 yunhou-deploy reusable workflow；过渡期用 inline） | — |
 | Phase 0.4 | A4 — paypal-l3.yml 修复 | ⏸ 显式延后到 Phase 4（intl） | — |
 
@@ -441,3 +441,7 @@ PR CI 工作流：每次 push / PR → 跑 `go vet` + `go test -race -cover` + �
 ## G. 已完成任务（追加历史）
 
 > 每完成一项追加一行。建议格式：`✅ <PhaseID 任务ID>—<一句话>—<commit hash>`
+
+| 日期 | 事项 | 备注 |
+|---|---|---|
+| 2026-07-15 | A2.c 真客户端落地（feat/wechat-pay-real-client）— Signer + cert helpers + real UnifiedOrder + provider_intent + cmd/server wiring + 5-tuple Validate | 8 PR commits; deferred: refund / JSAPI / per-app / plan_mapping |

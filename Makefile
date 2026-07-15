@@ -1,4 +1,4 @@
-.PHONY: build run test e2e migrate migrate-status lint deps generate-keys
+.PHONY: build run test e2e migrate migrate-status lint deps generate-keys regen-test-keys
 
 build:
 	go build -o bin/server ./cmd/server
@@ -40,3 +40,17 @@ generate-keys:
 	@mkdir -p keys
 	openssl genpkey -algorithm RSA -out keys/private.pem -pkeyopt rsa_keygen_bits:2048
 	openssl rsa -pubout -in keys/private.pem -out keys/public.pem
+
+# Regenerate the WeChat sign-test fixtures (testdata/sign_test_key.pem +
+# sign_test_cert.pem + sign_test_vector.json). Use only when the
+# sign-string format changes (e.g. WeChat docs revision) — never run
+# this in CI. After regenerating, manually update the embedded
+# Authorization header in sign_test_vector.json to match.
+regen-test-keys:
+	@mkdir -p internal/billing/wechat/testdata
+	@openssl genrsa -out internal/billing/wechat/testdata/sign_test_key.pem 2048
+	@openssl req -new -x509 -key internal/billing/wechat/testdata/sign_test_key.pem \
+	    -out internal/billing/wechat/testdata/sign_test_cert.pem -days 36500 \
+	    -subj "/CN=yunhou-users-test"
+	@echo "Generated new test keys. Re-capture sign_test_vector.json via the"
+	@echo "capture script in the plan, then run: go test ./internal/billing/wechat/..."

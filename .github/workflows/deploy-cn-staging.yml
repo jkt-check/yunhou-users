@@ -23,10 +23,11 @@ concurrency:
 
 jobs:
   build:
-    # SHA-pinned to the same commit yunhou-website uses (cross-checked
-    # 2026-07-16). `main` in yunhou-deploy is still live (the default
-    # branch migrated to `feat/cn-staging-pipeline`), but pinning locks
-    # the contract for review and prevents silent drift when main advances.
+    # SHA-pinned to a known-good commit of yunhou-deploy main. Pinning
+    # locks the contract for review and prevents silent drift when main
+    # advances. The SHA is the same one yunhou-website uses today
+    # (cross-checked 2026-07-16) so both call sites resolve against the
+    # same yunhou-deploy revision.
     uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@f38308f8f21d0a9dd13636c5332821b8f1d8d32b
     with:
       image-name: yunhou-users

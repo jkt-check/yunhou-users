@@ -25,16 +25,18 @@ jobs:
   build:
     # SHA-pinned to a known-good commit of yunhou-deploy main. Pinning
     # locks the contract for review and prevents silent drift when main
-    # advances. The SHA is the same one yunhou-website uses today
-    # (cross-checked 2026-07-16) so both call sites resolve against the
-    # same yunhou-deploy revision.
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@f38308f8f21d0a9dd13636c5332821b8f1d8d32b
+    # advances. yunhou-website pins to f38308f8 (an older revision that
+    # predates the test-paths input); we use 2c67013a which is main HEAD
+    # as of 2026-07-16 and includes the test-paths input needed by
+    # pr-ci.yml to scope `go vet/build/test` to packages that don't
+    # need a live Postgres. The SHA is shared with pr-ci.yml.
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
     with:
       image-name: yunhou-users
 
   bump:
     needs: build
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@f38308f8f21d0a9dd13636c5332821b8f1d8d32b
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
     with:
       service: users
       digest: ${{ needs.build.outputs.digest }}

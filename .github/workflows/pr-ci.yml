@@ -16,3 +16,20 @@ jobs:
     uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@f38308f8f21d0a9dd13636c5332821b8f1d8d32b
     with:
       go-version: "1.25"
+      # yunhou-users intrinsically needs Postgres for its service/repo/
+      # integration/e2e tests. The reusable workflow doesn't run migrations,
+      # so we narrow test-paths to packages that don't touch the DB — the
+      # DB-dependent tests are exercised locally + against staging where
+      # migrations are applied as part of the deploy step. To re-enable
+      # the full suite here, add a services.postgres + migrate job before
+      # this call (out of scope for PR #1).
+      # Folded scalar (`>`) so YAML collapses the newlines into spaces —
+      # `|` would pass literal newlines to the shell and break the
+      # `go vet/build/test` invocation into multiple commands.
+      test-paths: >-
+        ./internal/billing/...
+        ./internal/handler/...
+        ./internal/middleware/...
+        ./internal/model/...
+        ./internal/router/...
+        ./internal/util/...

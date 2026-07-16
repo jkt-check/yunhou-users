@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   go-ci:
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@main
+    # SHA-pinned to match deploy-cn-staging.yml — see that file's comment
+    # for why we pin instead of tracking `main`.
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@f38308f8f21d0a9dd13636c5332821b8f1d8d32b
     with:
       go-version: "1.25"

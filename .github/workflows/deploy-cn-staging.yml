@@ -1,0 +1,52 @@
+name: deploy-cn-staging
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+# The reusable-build-go.yml needs `packages: write` to push images to
+# GHCR, but caller workflows must also declare the permissions they grant
+# to the reusable — GitHub's permission model is the union, with the
+# most-restrictive default (no declaration → read-only). Declaring
+# `packages: write` here gives the reusable the access it asks for;
+# the `contents: read` is the default for code checkout.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-cn-staging
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # SHA-pinned to a known-good commit of yunhou-deploy main. Pinning
+    # locks the contract for review and prevents silent drift when main
+    # advances. yunhou-website pins to f38308f8 (an older revision that
+    # predates the test-paths input); we use 2c67013a which is main HEAD
+    # as of 2026-07-16 and includes the test-paths input needed by
+    # pr-ci.yml to scope `go vet/build/test` to packages that don't
+    # need a live Postgres. The SHA is shared with pr-ci.yml.
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
+    with:
+      image-name: yunhou-users
+
+  bump:
+    needs: build
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
+    with:
+      service: users
+      digest: ${{ needs.build.outputs.digest }}
+    secrets:
+      # app-id defaults to '' so HAS_APP in the reusable flips to false
+      # and the App-token step (`actions/create-github-app-token@v1` which
+      # fails to parse PKCS#8 PEMs on Node 24) is skipped entirely, leaving
+      # the PAT as the credential for the reusable's actions/checkout@v4
+      # token. When BUMP_APP_ID *is* set, the workflow runs the App-token
+      # path normally.
+      app-id:   ${{ secrets.BUMP_APP_ID || '' }}
+      app-key:  ${{ secrets.BUMP_APP_PRIVATE_KEY }}
+      bump-pat: ${{ secrets.DEPLOY_BOT_PAT }}

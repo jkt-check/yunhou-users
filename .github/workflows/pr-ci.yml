@@ -1,0 +1,37 @@
+name: pr-ci
+on:
+  pull_request:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'docs/**'
+
+permissions:
+  contents: read
+
+jobs:
+  go-ci:
+    # SHA-pinned to yunhou-deploy main HEAD (2c67013a, 2026-07-16) so
+    # the test-paths input below is accepted by the reusable. Earlier
+    # SHAs (e.g. f38308f8 that yunhou-website pins) predate this input
+    # and reject any unknown input key with startup_failure.
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
+    with:
+      go-version: "1.25"
+      # yunhou-users intrinsically needs Postgres for its service/repo/
+      # integration/e2e tests. The reusable workflow doesn't run migrations,
+      # so we narrow test-paths to packages that don't touch the DB — the
+      # DB-dependent tests are exercised locally + against staging where
+      # migrations are applied as part of the deploy step. To re-enable
+      # the full suite here, add a services.postgres + migrate job before
+      # this call (out of scope for PR #1).
+      # Folded scalar (`>`) so YAML collapses the newlines into spaces —
+      # `|` would pass literal newlines to the shell and break the
+      # `go vet/build/test` invocation into multiple commands.
+      test-paths: >-
+        ./internal/billing/...
+        ./internal/handler/...
+        ./internal/middleware/...
+        ./internal/model/...
+        ./internal/router/...
+        ./internal/util/...

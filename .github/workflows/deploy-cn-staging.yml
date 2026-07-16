@@ -23,20 +23,26 @@ concurrency:
 
 jobs:
   build:
-    # SHA-pinned to a known-good commit of yunhou-deploy main. Pinning
-    # locks the contract for review and prevents silent drift when main
-    # advances. yunhou-website pins to f38308f8 (an older revision that
-    # predates the test-paths input); we use 2c67013a which is main HEAD
-    # as of 2026-07-16 and includes the test-paths input needed by
-    # pr-ci.yml to scope `go vet/build/test` to packages that don't
-    # need a live Postgres. The SHA is shared with pr-ci.yml.
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
+    # SHA-pinned to yunhou-deploy main HEAD (fc2927d, 2026-07-16) so
+    # the build-paths + test-paths inputs below are accepted by the
+    # reusable. Earlier SHAs (2c67013a in PR #1) predate these inputs.
+    # The SHA is shared with the bump job below; pr-ci.yml pins
+    # separately to 2c67013a because reusable-pr-ci-go.yml has been
+    # stable since PR #7 and a bump is unnecessary.
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@fc2927d273bce87e45b458c855a43d7d62b20faa
     with:
       image-name: yunhou-users
+      # build 全 internal/cmd — image 实际包含的代码必须保证编译过。
+      build-paths: './cmd/... ./internal/...'
+      # test 收窄到不需要 PG/Redis 的子集 — service / repo / config / migrate
+      # 直接或间接连 PG（service → repo），CI runner 无 PG 时会 panic。
+      # tests/e2e + tests/integration 同理。PG-needing 测试留给本地
+      # (make test) + staging post-deploy smoke（v3 任务，未做）。
+      test-paths:  './cmd/... ./internal/util/... ./internal/billing/... ./internal/middleware/... ./internal/handler/... ./internal/model/... ./internal/router/...'
 
   bump:
     needs: build
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@fc2927d273bce87e45b458c855a43d7d62b20faa
     with:
       service: users
       digest: ${{ needs.build.outputs.digest }}

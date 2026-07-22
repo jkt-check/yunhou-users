@@ -44,6 +44,9 @@ func (m *mockOrderRepo) SweepExpired(_ context.Context, now time.Time) (int64, e
 func (m *mockOrderRepo) UpdateProviderIntent(_ context.Context, _ string, _ []byte) error {
 	return nil
 }
+func (m *mockOrderRepo) FindByProviderOutTradeNo(_ context.Context, _ string) (*model.Order, error) {
+	return nil, errors.New("not used")
+}
 
 func TestOrderSweeper_SweepOnce(t *testing.T) {
 	t.Parallel()

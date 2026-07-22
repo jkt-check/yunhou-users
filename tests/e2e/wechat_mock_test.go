@@ -310,18 +310,26 @@ func TestWeChat_Pay_MockMode_FullFlow_LoginBuySubscribe(t *testing.T) {
 	}
 	create.JSON(t, &created)
 	orderID := created.Data.ID
+	outTradeNo := created.Data.ProviderIntent.OutTradeNo
 	if !strings.HasPrefix(created.Data.ProviderIntent.CodeURL, "weixin://wxpay/bizpayurl?pr=mock_") {
 		t.Errorf("provider_intent.code_url=%q, want wechat-mock prefix", created.Data.ProviderIntent.CodeURL)
 	}
+	if len(outTradeNo) != 32 {
+		t.Fatalf("expected 32-char out_trade_no, got %q (len=%d)", outTradeNo, len(outTradeNo))
+	}
 
 	// Fire the mock webhook (plaintext body, no signature — MockMode on the
-	// verifier is the production fix that ships in this commit).
+	// verifier is the production fix that ships in this commit). out_trade_no
+	// echoes the 32-char hex from provider_intent — same shape as a real
+	// WeChat callback. A real WeChat echo would land on the JSONB fallback
+	// in onPaymentSucceeded; an in-test UUID echo would also pass (id lookup
+	// hits first), but using the 32-char form exercises the real code path.
 	webhookBody := []byte(`{
-		"id":"evt_fullflow_` + orderID + `",
+		"id":"evt_fullflow_` + outTradeNo + `",
 		"event_type":"TRANSACTION.SUCCESS",
 		"resource":{
-			"transaction_id":"wx_fullflow_` + orderID + `",
-			"out_trade_no":"` + orderID + `",
+			"transaction_id":"wx_fullflow_` + outTradeNo + `",
+			"out_trade_no":"` + outTradeNo + `",
 			"amount":{"total":2990},
 			"sub_expires_at":"2030-01-01T00:00:00Z"
 		}

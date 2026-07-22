@@ -597,16 +597,31 @@ func TestWebhook_WeChat_MockMode_OrderPaid_SubscriptionActivated(t *testing.T) {
 		`{"plan_id":"monthly","channel":"wechat_pay"}`, authHeader(token))
 	var r struct {
 		Data struct {
-			ID string `json:"id"`
+			ID             string `json:"id"`
+			ProviderIntent struct {
+				OutTradeNo string `json:"out_trade_no"`
+			} `json:"provider_intent"`
 		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
+	// The WeChat out_trade_no that real callbacks echo is a 32-char
+	// hex (UUID with hyphens stripped + truncated — see payment.go:246
+	// in yunhou-users). Reading it from the create-order response
+	// matches the real-world contract: a real WeChat callback would
+	// echo this same 32-char value, NOT the order's UUID.
+	outTradeNo := r.Data.ProviderIntent.OutTradeNo
+	if len(outTradeNo) != 32 {
+		t.Fatalf("expected 32-char out_trade_no, got %q (len=%d)", outTradeNo, len(outTradeNo))
+	}
 
 	// Mock-mode webhook body — plaintext, no resource wrapper.
+	// The transaction_id echoes outTradeNo (real WeChat does this for
+	// idempotency); sub_expires_at uses a fixed far-future date so the
+	// subscription lands as 'active'.
 	body := []byte(fmt.Sprintf(
 		`{"id":"evt_mock_%s","event_type":"TRANSACTION.SUCCESS","resource":{"transaction_id":"wx_mock_%s","out_trade_no":"%s","amount":{"total":2990},"sub_expires_at":"2030-01-01T00:00:00Z"}}`,
-		orderID, orderID, orderID,
+		orderID, outTradeNo, outTradeNo,
 	))
 	ts := time.Now().Unix()
 	resp = doRequest(t, srv.Engine, http.MethodPost,

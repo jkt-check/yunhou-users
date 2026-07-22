@@ -72,6 +72,15 @@ func (s *stubOrderRepoLookup) UpdateProviderIntent(_ context.Context, _ string, 
 	s.updateIntentPayload = payload
 	return s.updateIntentErr
 }
+func (s *stubOrderRepoLookup) FindByProviderOutTradeNo(_ context.Context, _ string) (*model.Order, error) {
+	// Default: no match (sql.ErrNoRows). The onPaymentSucceeded
+	// fallback path (review MAJOR 2 fix) only fires when the by-id
+	// lookup returns ErrNoRows, so leaving the stub at the default
+	// makes the test suite exercise the by-id path. Tests that
+	// specifically want to exercise the JSONB fallback can swap
+	// s.findByOutTradeNoErr / s.findByOutTradeNoResult.
+	return nil, sql.ErrNoRows
+}
 
 // stubPaymentRepoLookup — minimal PaymentRepo for GetPayment / GetRefund.
 type stubPaymentRepoLookup struct {

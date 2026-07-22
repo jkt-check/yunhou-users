@@ -32,6 +32,20 @@ type OrderRepo interface {
 	// channel-specific pre-auth flows (wechat_pay writes appid / mchid /
 	// code_url / out_trade_no; paypal reserves the slot for future use).
 	UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error
+	// FindByProviderOutTradeNo resolves a channel-side out_trade_no (e.g. the
+	// 32-char hex WeChat sends in webhook bodies) to the canonical Yunhou
+	// order. The lookup walks orders.provider_intent->>'out_trade_no' because
+	// Yunhou's orders.id is a UUID and WeChat's protocol constrains
+	// out_trade_no to 32 chars. The JSONB text-extraction operator returns
+	// NULL for rows without a wechat_pay provider_intent, so the query
+	// safely returns sql.ErrNoRows for non-wechat channels.
+	//
+	// No dedicated column is added: the value is already persisted inside
+	// provider_intent by CreateOrder's wechat_pay pre-auth branch, and
+	// adding a column would duplicate state. Webhook volume is low enough
+	// that a seq scan is fine; if hot path, add a GIN index on
+	// (provider_intent->>'out_trade_no') later.
+	FindByProviderOutTradeNo(ctx context.Context, outTradeNo string) (*model.Order, error)
 }
 
 type orderRepo struct{ db *sqlx.DB }
@@ -176,6 +190,26 @@ func (r *orderRepo) UpdateProviderIntent(ctx context.Context, orderID string, pa
 		return fmt.Errorf("update provider_intent: %w", err)
 	}
 	return nil
+}
+
+// FindByProviderOutTradeNo resolves a channel-side out_trade_no to the
+// canonical Yunhou order. WeChat sends 32-char hex out_trade_no; Alipay
+// sends its own shape (the handler would do similar JSONB extraction
+// when Alipay mock ships). Non-wechat orders naturally don't match
+// because provider_intent->>'out_trade_no' returns NULL without that key.
+// See OrderRepo interface doc for the rationale on JSONB vs a column.
+func (r *orderRepo) FindByProviderOutTradeNo(ctx context.Context, outTradeNo string) (*model.Order, error) {
+	var o model.Order
+	err := r.db.GetContext(ctx, &o, `
+		SELECT * FROM orders
+		WHERE provider_intent IS NOT NULL
+		  AND provider_intent->>'out_trade_no' = $1
+		LIMIT 1
+	`, outTradeNo)
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
 }
 
 // ============================================================================

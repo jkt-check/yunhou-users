@@ -829,9 +829,35 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// Find the order (handler already extracted orderID from channel metadata).
+	// Find the order. WeChat and Alipay send a channel-side identifier
+	// (out_trade_no, 32-char hex) rather than our UUID, and the
+	// WebhookEvent.OrderID contract documents this for the handler. The
+	// PRIMARY lookup is by id (covers Stripe + e2e tests that pass the
+	// UUID); the FALLBACK is a JSONB walk for wechat_pay/alipay's
+	// out_trade_no (covers real-world webhooks that send the 32-char
+	// form). Both queries run inside the same tx so MaxOpenConns
+	// constraints don't deadlock (the same constraint the comment below
+	// the SELECT-by-id block already documents).
+	//
+	// MAJOR fix (review 2): without the fallback, real WeChat webhooks
+	// 404'd because no order has the 32-char hex as its primary id; the
+	// order would stay "pending" forever and the user never got the
+	// subscription.
 	var order model.Order
-	if err := tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, e.OrderID); err != nil {
+	err = tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, e.OrderID)
+	if errors.Is(err, sql.ErrNoRows) && (e.Channel == "wechat_pay" || e.Channel == "alipay") {
+		// JSONB text-extraction ->> returns NULL for rows without the
+		// key; equality with the channel's out_trade_no resolves it to
+		// the canonical order. LIMIT 1 in case the JSONB value collides
+		// (operator error — duplicate out_trade_no is a YDN alert).
+		err = tx.GetContext(ctx, &order, `
+			SELECT * FROM orders
+			WHERE provider_intent IS NOT NULL
+			  AND provider_intent->>'out_trade_no' = $1
+			LIMIT 1
+		`, e.OrderID)
+	}
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Webhook arrived for an order that doesn't exist in our DB.
 			// Write audit log + 404 (channel retries per schedule).

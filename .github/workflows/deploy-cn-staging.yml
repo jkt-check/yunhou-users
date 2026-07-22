@@ -23,13 +23,13 @@ concurrency:
 
 jobs:
   build:
-    # SHA-pinned to yunhou-deploy main HEAD (fc2927d, 2026-07-16) so
-    # the build-paths + test-paths inputs below are accepted by the
-    # reusable. Earlier SHAs (2c67013a in PR #1) predate these inputs.
-    # The SHA is shared with the bump job below; pr-ci.yml pins
-    # separately to 2c67013a because reusable-pr-ci-go.yml has been
-    # stable since PR #7 and a bump is unnecessary.
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@fc2927d273bce87e45b458c855a43d7d62b20faa
+    # SHA-pinned to yunhou-deploy main HEAD (20893fc, 2026-07-22) so the
+    # build-paths + test-paths inputs below are accepted by the reusable.
+    # Bumped from fc2927d (2026-07-16) — the prior pin produced
+    # "workflow was not found" on the dispatch path in run 29895867556,
+    # so any later pin in the same repo is fine as long as the call site
+    # ships the matching `with:` contract.
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@20893fca4e57a5de3c78b77deb9fc51fd6c2cf26
     with:
       image-name: yunhou-users
       # build 全 internal/cmd — image 实际包含的代码必须保证编译过。
@@ -42,7 +42,7 @@ jobs:
 
   bump:
     needs: build
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@fc2927d273bce87e45b458c855a43d7d62b20faa
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@20893fca4e57a5de3c78b77deb9fc51fd6c2cf26
     with:
       service: users
       digest: ${{ needs.build.outputs.digest }}

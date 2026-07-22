@@ -11,11 +11,13 @@ permissions:
 
 jobs:
   go-ci:
-    # SHA-pinned to yunhou-deploy main HEAD (2c67013a, 2026-07-16) so
-    # the test-paths input below is accepted by the reusable. Earlier
-    # SHAs (e.g. f38308f8 that yunhou-website pins) predate this input
-    # and reject any unknown input key with startup_failure.
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@2c67013aa27804f1c2412fd2d259cdd7cc605199
+    # SHA-pinned to yunhou-deploy main HEAD (20893fc, 2026-07-22) so
+    # the test-paths input below is accepted by the reusable. Bumped
+    # from 2c67013a (2026-07-16) — the prior pin produced "workflow was
+    # not found" on the dispatch path in run 29895864198; bumping to
+    # the same SHA we now use in deploy-cn-staging keeps both calls
+    # in lockstep.
+    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@20893fca4e57a5de3c78b77deb9fc51fd6c2cf26
     with:
       go-version: "1.25"
       # yunhou-users intrinsically needs Postgres for its service/repo/

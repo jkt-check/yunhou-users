@@ -149,25 +149,45 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 	// Seed super app (idempotent on app_id PK). Apps carry a bcrypt-hashed
 	// secret_hash so InternalAppAuth can verify X-App-Secret. The plaintext
 	// (e2eAppSecret) lives at the top of this file; tests authenticate via
-	// appAuthHeaders(appID).
+	// appAuthHeaders(appID). The config JSONB carries per-app OAuth
+	// provider settings — we populate the WeChat OAuth block here so the
+	// /auth/wechat/* e2e tests (wechat_mock_test.go) can run without
+	// first having to mutate the DB. Real-mode flow uses AppID/AppSecret
+	// from this config; mock mode just needs callback_urls whitelisted.
 	secretHash, err := util.HashSecret(e2eAppSecret)
 	if err != nil {
 		t.Fatalf("hash e2e app secret: %v", err)
 	}
+	wechatOAuthConfig := `{
+		"oauth_providers": {
+			"wechat": {
+				"app_id": "wxe2e0000000000",
+				"app_secret": "e2e-test-app-secret-padded-to-32",
+				"callback_urls": [
+					"https://staging.yunhouai.com/auth/callback",
+					"https://bff.example.com/auth/wechat-callback"
+				]
+			}
+		}
+	}`
 	_, err = db.ExecContext(context.Background(), `
-		INSERT INTO apps (app_id, name, is_active, secret_hash)
-		VALUES ($1, 'E2E Test App', true, $2)
-		ON CONFLICT (app_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash
-	`, superAppID, secretHash)
+		INSERT INTO apps (app_id, name, is_active, secret_hash, config)
+		VALUES ($1, 'E2E Test App', true, $2, $3::jsonb)
+		ON CONFLICT (app_id) DO UPDATE SET
+			secret_hash = EXCLUDED.secret_hash,
+			config = EXCLUDED.config
+	`, superAppID, secretHash, wechatOAuthConfig)
 	if err != nil {
 		t.Fatalf("seed super app: %v", err)
 	}
 
 	_, err = db.ExecContext(context.Background(), `
-		INSERT INTO apps (app_id, name, is_active, secret_hash)
-		VALUES ('yundash', 'E2E Paid App', true, $1)
-		ON CONFLICT (app_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash
-	`, secretHash)
+		INSERT INTO apps (app_id, name, is_active, secret_hash, config)
+		VALUES ('yundash', 'E2E Paid App', true, $1, $2::jsonb)
+		ON CONFLICT (app_id) DO UPDATE SET
+			secret_hash = EXCLUDED.secret_hash,
+			config = EXCLUDED.config
+	`, secretHash, wechatOAuthConfig)
 	if err != nil {
 		t.Fatalf("seed paid app: %v", err)
 	}

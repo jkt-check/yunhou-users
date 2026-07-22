@@ -36,7 +36,7 @@ func main() {
 	// WeChat Pay client: real mode loads cert + key from disk and builds a
 	// Signer + Client. Mock mode skips both file loads and returns a
 	// stub Client that mints deterministic code_urls. Real-mode production
-	// deployments must have all 5 WECHAT_PAY_* envs set (gated by
+	// deployments must have all 6 WECHAT_PAY_* envs set (gated by
 	// config.Validate); dev/mock environments with WECHAT_PAY_MOCK=1 get
 	// a non-functional mock client.
 	//

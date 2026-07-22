@@ -257,16 +257,16 @@ func TestWeChat_OAuth_MockMode_FullRoundTrip(t *testing.T) {
 // WeChat mock story end-to-end:
 //
 //	OAuth round-trip  →  POST /payments/orders  →  POST webhook mock body
-//	→  GET /auth/me shows the active subscription.
+//	→  GET /user/subscriptions shows the active subscription.
 //
 // The existing TestWebhook_WeChat_MockMode_OrderPaid_SubscriptionActivated
 // in webhooks_test.go covers the order + webhook + subscription but
 // bypasses OAuth via /test/login. This test exercises the complete flow
 // including OAuth, which is the path cn-staging will actually take in
-// production (just with WECHAT_*_MOCK=1). It also pins that /auth/me
-// surfaces the subscription after the webhook fires — the FE polls
-// /auth/me on /console mount, so this is the user-visible signal that
-// "payment activated".
+// production (just with WECHAT_*_MOCK=1). It also pins that
+// /user/subscriptions surfaces the subscription after the webhook fires —
+// the FE polls /user/subscriptions on /console mount, so this is the
+// user-visible signal that "payment activated".
 func TestWeChat_Pay_MockMode_FullFlow_LoginBuySubscribe(t *testing.T) {
 	srv := setupE2EServerWithMockWeChat(t)
 

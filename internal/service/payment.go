@@ -225,7 +225,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 
 	if channel == "wechat_pay" && s.wechat != nil {
 		// Mock-mode UnifiedOrder returns a deterministic code_url
-		// synchronously (wexin://wxpay/bizpayurl?pr=mock_<OutTradeNo>);
+		// synchronously (weixin://wxpay/bizpayurl?pr=mock_<OutTradeNo>);
 		// no HTTP. The previous `&& !s.wechat.IsMockMode()` guard
 		// short-circuited the mock path, leaving mock-mode orders with
 		// provider_intent unset — BFF WeChatPayModal then 500s on

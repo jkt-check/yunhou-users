@@ -64,6 +64,30 @@ func redirectWithFragment(base string, fragment url.Values) string {
 	return u.String()
 }
 
+// redirectWithQuery appends a url.Values-encoded query string to base,
+// merging with any existing query. Used by mock-mode OAuth flows where
+// the redirect must round-trip a `code` / `state` pair through the
+// browser the same way a real WeChat authorization-endpoint 302 does
+// (real WeChat 302s to redirect_uri with `?code&state` in the QUERY
+// string, not the fragment — the Yunhou-orchestrated SPA
+// AuthCallbackPage reads those exact two params from window.location
+// before forwarding to /auth/wechat/callback, and a fragment-based
+// mock would fall straight through to the un-auth branch).
+func redirectWithQuery(base string, params url.Values) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	q := u.Query()
+	for k, vs := range params {
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // redirectWithErrorFragment is the convenience form used by the
 // post-login error paths (exchange upstream failure, profile fetch
 // failure, AuthService rejection): builds a fragment with

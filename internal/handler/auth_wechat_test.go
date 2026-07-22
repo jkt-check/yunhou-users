@@ -578,8 +578,15 @@ func TestWeChatOAuth_Callback_ErrorParamNoDescription_NoTrailingColon(t *testing
 
 // TestWeChatOAuth_Redirect_MockMode_SkipsWeixin asserts that when the
 // router is wired with mock=true, /auth/wechat/redirect returns a 302 to
-// the BFF with code=mock-code in the fragment and a real HMAC-signed
-// state, WITHOUT calling the upstream WeChat authorize URL.
+// the BFF with code=mock-code in the QUERY string (not the fragment)
+// and a real HMAC-signed state, WITHOUT calling the upstream WeChat
+// authorize URL.
+//
+// Query (not fragment) is required because the Yunhou-orchestrated SPA
+// AuthCallbackPage reads `?code=&state=` from window.location.search on
+// first hit and forwards those to /auth/wechat/callback — emitting the
+// pair as fragment makes the SPA fall through to the un-auth branch
+// and bounce the user back to /auth/login.
 func TestWeChatOAuth_Redirect_MockMode_SkipsWeixin(t *testing.T) {
 	installWeChatFixedClock(t)
 	cbURL := "https://bff.example.com/auth/wechat-callback"
@@ -599,18 +606,20 @@ func TestWeChatOAuth_Redirect_MockMode_SkipsWeixin(t *testing.T) {
 		t.Fatalf("status = %d, want 302; body=%s", w.Code, w.Body.String())
 	}
 	loc := w.Header().Get("Location")
-	if !strings.HasPrefix(loc, cbURL+"#") {
-		t.Fatalf("location = %q, want prefix %s#", loc, cbURL)
+	if !strings.HasPrefix(loc, cbURL+"?") {
+		t.Fatalf("location = %q, want query prefix %s?", loc, cbURL)
 	}
-	if !strings.Contains(loc, "code=mock-code") {
-		t.Errorf("mock mode must emit code=mock-code in fragment; got %q", loc)
+	// Mock must emit code+state in the QUERY string, not the fragment —
+	// see the AuthCallbackPage WeChat-first-hit branch.
+	if idx := strings.Index(loc, "#"); idx >= 0 {
+		t.Fatalf("location = %q still carries a fragment marker; mock must round-trip code+state via query", loc)
 	}
-	// Fragment must contain a non-empty state (real HMAC-signed) so the
-	// callback's VerifyCallbackState still runs unmodified.
-	frag := loc[strings.Index(loc, "#")+1:]
-	q, err := url.ParseQuery(frag)
+	q, err := url.ParseQuery(loc[strings.Index(loc, "?")+1:])
 	if err != nil {
-		t.Fatalf("parse fragment: %v", err)
+		t.Fatalf("parse query: %v", err)
+	}
+	if q.Get("code") != "mock-code" {
+		t.Errorf("mock mode must emit code=mock-code in query; got %q", loc)
 	}
 	if q.Get("state") == "" {
 		t.Errorf("mock mode must emit a real signed state; got empty in %q", loc)

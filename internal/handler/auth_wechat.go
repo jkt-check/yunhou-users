@@ -96,14 +96,18 @@ func (d *wechatOAuthDeps) Redirect(c *gin.Context) {
 	if d.mock {
 		// Mock-mode redirect: issue a real HMAC-signed state (so the
 		// callback's VerifyCallbackState still runs unmodified) and
-		// redirect straight back to the BFF with the mock code. No
-		// upstream WeChat HTTP call.
+		// redirect back to the BFF with the mock code. The code+state
+		// pair must travel as QUERY params (not fragment) so the SPA
+		// AuthCallbackPage's WeChat-first-hit branch — which reads
+		// window.location.search for `code` / `state` and forwards to
+		// /auth/wechat/callback — actually fires. A fragmented mock
+		// would land the user on /auth/login with no session.
 		state, err := d.svc.IssueState(appID, callbackIdx, wechatOAuthClock())
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "issue mock state"})
 			return
 		}
-		c.Redirect(http.StatusFound, redirectWithFragment(redirectURI, url.Values{
+		c.Redirect(http.StatusFound, redirectWithQuery(redirectURI, url.Values{
 			"code":  {wechatOAuthMockCode},
 			"state": {state},
 		}))

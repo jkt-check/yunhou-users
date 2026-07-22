@@ -759,6 +759,19 @@ func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 				out.ProviderIDs["paypal"] = pc.PlanID
 			}
 		}
+		// WeChat Pay: surface the plan→product mapping under
+		// provider_ids["wechat_pay"] so the BFF's wechatProvider.isConfigured()
+		// can flip to true and PricingSection renders the 微信支付 option.
+		// The actual UnifiedOrder routing against PlanMapping is still
+		// deferred (M8 / design doc 2026-07-15 line 28), but the BFF only
+		// reads provider_ids for *display* — mock-mode mock.UnifiedOrder
+		// ignores the product code entirely, so a non-empty entry here is
+		// sufficient to unlock the cn-staging demo path.
+		if wp := cfg.PaymentProviders.WeChatPay; wp != nil {
+			if pc, ok := wp.PlanMapping[p.ID]; ok && pc != "" {
+				out.ProviderIDs["wechat_pay"] = pc
+			}
+		}
 	}
 	// Authoritative cycle = PayPal's per-plan entry when present; nil when
 	// PayPal is unconfigured for this plan (the marketing page renders

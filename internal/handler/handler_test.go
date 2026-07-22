@@ -2492,6 +2492,53 @@ func TestPlanHandler_GetAppPlans_FullCoverage(t *testing.T) {
 		}
 	})
 
+	t.Run("app with wechat_pay plan_mapping returns provider_id[wechat_pay]", func(t *testing.T) {
+		// cn-staging demo path: BFF's wechatProvider.isConfigured() checks
+		// plans.some(p => !!p.provider_ids.wechat_pay). If buildPublicPlan
+		// never wires the WeChat block, /billing/providers omits wechat
+		// even when the app config has a plan_mapping. The actual
+		// UnifiedOrder routing against the mapping is still deferred (M8);
+		// this test pins the *display* contract the BFF depends on.
+		plans := []model.Plan{
+			{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}, IsDefault: true},
+			{ID: "monthly", Name: "Monthly", IsActive: true, Apps: pq.StringArray{"yundian"}, IntervalDays: 30, Price: 29.9},
+		}
+		app := model.App{
+			AppID: "yundian", IsActive: true,
+			Config: json.RawMessage(`{"payment_providers":{"wechat_pay":{"plan_mapping":{"monthly":"WX-MONTHLY-MOCK"}}}}`),
+		}
+		appRepo := &mockAppRepo{apps: []model.App{app}}
+		planSvc := &mockPlanSvc{plans: plans}
+		handler := NewPlanHandler(planSvc, appRepo, nil)
+		router := gin.New()
+		router.GET("/apps/:id/plans", handler.GetAppPlans)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code int                `json:"code"`
+			Data []model.PublicPlan `json:"data"`
+		}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		var monthly *model.PublicPlan
+		for i := range resp.Data {
+			if resp.Data[i].ID == "monthly" {
+				monthly = &resp.Data[i]
+				break
+			}
+		}
+		if monthly == nil {
+			t.Fatal("monthly plan not in response")
+		}
+		if monthly.ProviderIDs["wechat_pay"] != "WX-MONTHLY-MOCK" {
+			t.Errorf("ProviderIDs[wechat_pay] = %q, want WX-MONTHLY-MOCK", monthly.ProviderIDs["wechat_pay"])
+		}
+	})
+
 	t.Run("planSvc error returns 500", func(t *testing.T) {
 		appRepo := &mockAppRepo{apps: []model.App{{AppID: "yundian", IsActive: true}}}
 		// planSvc errors on FindByApp — handler must surface 500.

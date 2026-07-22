@@ -247,15 +247,17 @@ func buildWebhookVerifier(cfg *config.Config) middleware.ChannelSignatureVerifie
 	if cfg.StripeWebhookSecret != "" {
 		mv.Stripe = &middleware.StripeVerifier{Secret: []byte(cfg.StripeWebhookSecret)}
 	}
-	if cfg.WeChatAPIv3Key != "" {
-		// MockMode: when WECHAT_PAY_MOCK=1, the verifier skips the
-		// Wechatpay-Signature header check so plaintext mock bodies
-		// (used by parseWeChatMock) reach the handler. The production
-		// wiring previously left MockMode=false unconditionally, which
-		// meant any mock-mode POST to /webhooks/payment/wechat_pay 400'd
-		// before the handler's mock envelope parser could see it.
-		// The e2e test wiring has always set MockMode manually; this
-		// line brings the production wiring in line.
+	// WeChat verifier wires whenever EITHER a real API v3 key is present
+	// OR mock mode is enabled. The previous `cfg.WeChatAPIv3Key != ""`
+	// guard was the BLOCKER 1 from the independent review: cn-staging
+	// runs with WECHAT_PAY_MOCK=1 and an empty WECHAT_PAY_API_V3_KEY
+	// (mock doesn't need a real key), so the guard left mv.WeChat nil
+	// and the middleware returned ErrUnsupportedChannel (404) on
+	// every inbound POST. The mock verifier doesn't use the key for
+	// HMAC (it short-circuits on the Wechatpay-Signature header), so
+	// building it with an empty key in mock mode is safe. Real mode
+	// still has the real key set; the mock flag is just false.
+	if cfg.WeChatAPIv3Key != "" || cfg.WeChatPayMock {
 		mv.WeChat = &middleware.WeChatPayV3Verifier{
 			APIv3Key: []byte(cfg.WeChatAPIv3Key),
 			MockMode: cfg.WeChatPayMock,

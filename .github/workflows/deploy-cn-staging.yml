@@ -7,12 +7,18 @@ on:
       - '*.md'
   workflow_dispatch:
 
-# The reusable-build-go.yml needs `packages: write` to push images to
-# GHCR, but caller workflows must also declare the permissions they grant
-# to the reusable — GitHub's permission model is the union, with the
-# most-restrictive default (no declaration → read-only). Declaring
-# `packages: write` here gives the reusable the access it asks for;
-# the `contents: read` is the default for code checkout.
+# Inlined the build + bump jobs that used to be reusable calls into
+# jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml and
+# reusable-bump-manifest.yml. The two reusable runs (29895867556, 29895864198,
+# 29903280258, 29903275238) all failed with 0 jobs / 0 seconds and a
+# 'workflow was not found' error from the dispatch path — the yunhou-deploy
+# reusable workflows live in a private repo (access_level: user), and the
+# yunhou-users repo's selected-action whitelist (docker/*, jkt-check/*)
+# resolves the call at parse time but the cross-repo resolution fails at
+# dispatch. Inlining keeps the same call contract; the bump job still
+# pushes the digest into jkt-check/yunhou-deploy/deploy/cn-staging.digests
+# via ${{ secrets.DEPLOY_BOT_PAT }} / BUMP_APP_ID.
+
 permissions:
   contents: read
   packages: write
@@ -23,36 +29,79 @@ concurrency:
 
 jobs:
   build:
-    # SHA-pinned to yunhou-deploy main HEAD (20893fc, 2026-07-22) so the
-    # build-paths + test-paths inputs below are accepted by the reusable.
-    # Bumped from fc2927d (2026-07-16) — the prior pin produced
-    # "workflow was not found" on the dispatch path in run 29895867556,
-    # so any later pin in the same repo is fine as long as the call site
-    # ships the matching `with:` contract.
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml@20893fca4e57a5de3c78b77deb9fc51fd6c2cf26
-    with:
-      image-name: yunhou-users
-      # build 全 internal/cmd — image 实际包含的代码必须保证编译过。
-      build-paths: './cmd/... ./internal/...'
-      # test 收窄到不需要 PG/Redis 的子集 — service / repo / config / migrate
-      # 直接或间接连 PG（service → repo），CI runner 无 PG 时会 panic。
-      # tests/e2e + tests/integration 同理。PG-needing 测试留给本地
-      # (make test) + staging post-deploy smoke（v3 任务，未做）。
-      test-paths:  './cmd/... ./internal/util/... ./internal/billing/... ./internal/middleware/... ./internal/handler/... ./internal/model/... ./internal/router/...'
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./cmd/... ./internal/...
+      - name: unit test
+        run: go test -race ./cmd/... ./internal/util/... ./internal/billing/... ./internal/middleware/... ./internal/handler/... ./internal/model/... ./internal/router/...
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/yunhou-users:${{ github.sha }}
 
   bump:
     needs: build
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-bump-manifest.yml@20893fca4e57a5de3c78b77deb9fc51fd6c2cf26
-    with:
-      service: users
-      digest: ${{ needs.build.outputs.digest }}
-    secrets:
-      # app-id defaults to '' so HAS_APP in the reusable flips to false
-      # and the App-token step (`actions/create-github-app-token@v1` which
-      # fails to parse PKCS#8 PEMs on Node 24) is skipped entirely, leaving
-      # the PAT as the credential for the reusable's actions/checkout@v4
-      # token. When BUMP_APP_ID *is* set, the workflow runs the App-token
-      # path normally.
-      app-id:   ${{ secrets.BUMP_APP_ID || '' }}
-      app-key:  ${{ secrets.BUMP_APP_PRIVATE_KEY }}
-      bump-pat: ${{ secrets.DEPLOY_BOT_PAT }}
+    runs-on: ubuntu-latest
+    env:
+      HAS_APP: ${{ secrets.BUMP_APP_ID != '' }}
+    steps:
+      - id: app-token
+        if: ${{ env.HAS_APP == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BUMP_APP_ID }}
+          private-key: ${{ secrets.BUMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: yunhou-deploy
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/yunhou-deploy
+          token: ${{ steps.app-token.outputs.token || secrets.DEPLOY_BOT_PAT }}
+          ref: main
+      - name: validate caller and write digest
+        env:
+          CALLER: ${{ github.repository }}
+          SERVICE: users
+          DIGEST: ${{ needs.build.outputs.digest }}
+          STAGE: cn-staging
+        run: |
+          set -euo pipefail
+          bin/manifest.sh assert-repo-service "$CALLER" "$SERVICE"
+          KEY="$(bin/manifest.sh key-for-service "$SERVICE")"
+          bin/manifest.sh set "deploy/${STAGE}.digests" "$KEY" "$DIGEST"
+      - name: commit with fetch+rebase+retry
+        env:
+          STAGE: cn-staging
+          SERVICE: users
+        run: |
+          set -euo pipefail
+          git config user.name "yunhou-deploy-bot"
+          git config user.email "deploy-bot@users.noreply.github.com"
+          git add "deploy/${STAGE}.digests"
+          if git diff --cached --quiet; then echo "no change (idempotent digest)"; exit 0; fi
+          git commit -m "chore(${STAGE}): bump ${SERVICE} digest"
+          for i in 1 2 3 4 5; do
+            if git push origin main; then echo "pushed"; exit 0; fi
+            echo "push rejected, rebase retry $i"
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+            sleep $((i))
+          done
+          echo "push failed after retries" >&2
+          exit 1

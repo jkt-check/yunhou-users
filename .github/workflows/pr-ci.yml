@@ -6,34 +6,29 @@ on:
     paths-ignore:
       - 'docs/**'
 
+# Inlined the call to jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml
+# for the same reason as deploy-cn-staging.yml: the cross-repo dispatch
+# failed with 0 jobs / 0 seconds ("workflow was not found") because
+# yunhou-deploy is private and its access_level is "user", which the
+# yunhou-users selected-action whitelist cannot resolve. Inlining keeps
+# the same call contract.
+
 permissions:
   contents: read
 
 jobs:
   go-ci:
-    # SHA-pinned to yunhou-deploy main HEAD (20893fc, 2026-07-22) so
-    # the test-paths input below is accepted by the reusable. Bumped
-    # from 2c67013a (2026-07-16) — the prior pin produced "workflow was
-    # not found" on the dispatch path in run 29895864198; bumping to
-    # the same SHA we now use in deploy-cn-staging keeps both calls
-    # in lockstep.
-    uses: jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml@20893fca4e57a5de3c78b77deb9fc51fd6c2cf26
-    with:
-      go-version: "1.25"
-      # yunhou-users intrinsically needs Postgres for its service/repo/
-      # integration/e2e tests. The reusable workflow doesn't run migrations,
-      # so we narrow test-paths to packages that don't touch the DB — the
-      # DB-dependent tests are exercised locally + against staging where
-      # migrations are applied as part of the deploy step. To re-enable
-      # the full suite here, add a services.postgres + migrate job before
-      # this call (out of scope for PR #1).
-      # Folded scalar (`>`) so YAML collapses the newlines into spaces —
-      # `|` would pass literal newlines to the shell and break the
-      # `go vet/build/test` invocation into multiple commands.
-      test-paths: >-
-        ./internal/billing/...
-        ./internal/handler/...
-        ./internal/middleware/...
-        ./internal/model/...
-        ./internal/router/...
-        ./internal/util/...
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: lint (vet)
+        # Folded scalar (`>`) so YAML collapses the newlines into spaces —
+        # `|` would pass literal newlines to the shell and break the
+        # `go vet/build/test` invocation into multiple commands.
+        run: go vet ./internal/billing/... ./internal/handler/... ./internal/middleware/... ./internal/model/... ./internal/router/... ./internal/util/...
+      - name: build
+        run: go build ./internal/billing/... ./internal/handler/... ./internal/middleware/... ./internal/model/... ./internal/router/... ./internal/util/...
+      - name: unit test
+        run: go test -race ./internal/billing/... ./internal/handler/... ./internal/middleware/... ./internal/model/... ./internal/router/... ./internal/util/...

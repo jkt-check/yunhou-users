@@ -223,7 +223,17 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		}
 	}
 
-	if channel == "wechat_pay" && s.wechat != nil && !s.wechat.IsMockMode() {
+	if channel == "wechat_pay" && s.wechat != nil {
+		// Mock-mode UnifiedOrder returns a deterministic code_url
+		// synchronously (wexin://wxpay/bizpayurl?pr=mock_<OutTradeNo>);
+		// no HTTP. The previous `&& !s.wechat.IsMockMode()` guard
+		// short-circuited the mock path, leaving mock-mode orders with
+		// provider_intent unset — BFF WeChatPayModal then 500s on
+		// "WeChat order missing provider_intent.code_url" (see
+		// yunhou-website server/src/providers/wechat.ts:40-42).
+		// The CN-staging demo path needs the mock to mint a code_url
+		// end-to-end; real mode is unaffected because the real client
+		// hits api.mch.weixin.qq.com exactly as before.
 		// Convert CNY decimal to fen without float multiplication: format to
 		// two decimal places, strip the decimal point, then parse the integer.
 		amountStr := fmt.Sprintf("%.2f", order.Amount)

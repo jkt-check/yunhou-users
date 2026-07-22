@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"math"
 	"strings"
@@ -385,18 +386,48 @@ func TestCreateOrder_WeChat_Real_UnifiedOrderErr(t *testing.T) {
 	}
 }
 
-func TestCreateOrder_WeChat_Mock_NoClientCall(t *testing.T) {
-	stub := &stubWechat{mockMode: true}
+// TestCreateOrder_WeChat_Mock_CallsClientAndSetsIntent pins the fix for
+// the cn-staging demo path: in mock mode, CreateOrder MUST call
+// UnifiedOrder (synchronously, no HTTP) and persist the resulting
+// code_url in provider_intent. The previous "Mock_NoClientCall" test
+// locked in the bug where mock orders were left with no code_url —
+// BFF WeChatPayModal then 500s on "missing provider_intent.code_url".
+// The test name is "Mock_CallsClientAndSetsIntent" so future readers
+// understand the contract without having to read git blame.
+func TestCreateOrder_WeChat_Mock_CallsClientAndSetsIntent(t *testing.T) {
+	stub := &stubWechat{
+		mockMode: true,
+		unifiedFn: func(_ context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return &wechat.UnifiedOrderResponse{
+				OutTradeNo: req.OutTradeNo,
+				CodeURL:    "weixin://wxpay/bizpayurl?pr=mock_" + req.OutTradeNo,
+			}, nil
+		},
+	}
 	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 
-	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay"); err != nil {
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	if err != nil {
 		t.Fatalf("CreateOrder mock: %v", err)
 	}
-	if stub.called != 0 {
-		t.Fatalf("UnifiedOrder called %d times in mock mode", stub.called)
+	if stub.called != 1 {
+		t.Fatalf("UnifiedOrder called %d times in mock mode, want 1 (synchronous, no HTTP)", stub.called)
 	}
-	if orderRepo.updateIntentCalled {
-		t.Fatal("UpdateProviderIntent called in mock mode")
+	if !orderRepo.updateIntentCalled {
+		t.Fatal("UpdateProviderIntent should be called in mock mode so BFF can render the QR")
+	}
+	if order.ProviderIntent == nil {
+		t.Fatal("order.ProviderIntent should be set after mock UnifiedOrder")
+	}
+	var intent struct {
+		CodeURL    string `json:"code_url"`
+		OutTradeNo string `json:"out_trade_no"`
+	}
+	if err := json.Unmarshal(*order.ProviderIntent, &intent); err != nil {
+		t.Fatalf("decode provider_intent: %v", err)
+	}
+	if !strings.HasPrefix(intent.CodeURL, "weixin://wxpay/bizpayurl?pr=mock_") {
+		t.Errorf("provider_intent.code_url=%q, want wechat-mock prefix", intent.CodeURL)
 	}
 }
 

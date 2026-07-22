@@ -248,7 +248,18 @@ func buildWebhookVerifier(cfg *config.Config) middleware.ChannelSignatureVerifie
 		mv.Stripe = &middleware.StripeVerifier{Secret: []byte(cfg.StripeWebhookSecret)}
 	}
 	if cfg.WeChatAPIv3Key != "" {
-		mv.WeChat = &middleware.WeChatPayV3Verifier{APIv3Key: []byte(cfg.WeChatAPIv3Key)}
+		// MockMode: when WECHAT_PAY_MOCK=1, the verifier skips the
+		// Wechatpay-Signature header check so plaintext mock bodies
+		// (used by parseWeChatMock) reach the handler. The production
+		// wiring previously left MockMode=false unconditionally, which
+		// meant any mock-mode POST to /webhooks/payment/wechat_pay 400'd
+		// before the handler's mock envelope parser could see it.
+		// The e2e test wiring has always set MockMode manually; this
+		// line brings the production wiring in line.
+		mv.WeChat = &middleware.WeChatPayV3Verifier{
+			APIv3Key: []byte(cfg.WeChatAPIv3Key),
+			MockMode: cfg.WeChatPayMock,
+		}
 	}
 	if cfg.AlipayPublicKeyPath != "" {
 		if pemBytes, err := os.ReadFile(cfg.AlipayPublicKeyPath); err == nil {

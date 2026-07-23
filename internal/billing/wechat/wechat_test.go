@@ -120,8 +120,18 @@ func TestUnifiedOrder_Real_200(t *testing.T) {
 	if !strings.Contains(string(stub.got.Body), `"appid":"wx1900000109"`) {
 		t.Fatalf("body missing appid: %s", stub.got.Body)
 	}
-	if !strings.Contains(string(stub.got.Body), `"out_trade_no":"order-1"`) {
-		t.Fatalf("body missing out_trade_no: %s", stub.got.Body)
+	// 2026-07-23 regression net: WeChat Pay v3 NATIVE explicitly rejects
+	// `trade_type` in the body with HTTP 400 + code=PARAM_ERROR
+	// ("请求中含有未在API文档中定义的参数"). The product is implied by the
+	// URL path /v3/pay/transactions/native. Sending the field caused
+	// the user-facing "wechat pay rejected the order (4xx)" error on
+	// cn-staging — pin the body so a refactor cannot put it back.
+	bodyStr := string(stub.got.Body)
+	if strings.Contains(bodyStr, `"trade_type"`) || strings.Contains(bodyStr, `"tradeType"`) {
+		t.Fatalf("body must not contain trade_type/tradeType — v3 NATIVE rejects unknown fields: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"out_trade_no":"order-1"`) {
+		t.Fatalf("body missing out_trade_no: %s", bodyStr)
 	}
 }
 

@@ -54,6 +54,18 @@ type HTTPResponse struct {
 const userAgent = "yunhou-users/0.1"
 
 // unifiedOrderBody is the v3 /pay/transactions/native request body.
+//
+// WeChat Pay v3 NATIVE rejects unknown fields with HTTP 400 +
+// code=PARAM_ERROR ("请求中含有未在API文档中定义的参数") — verified live on
+// 2026-07-23 against mch=1115525931 with `trade_type` in the body. v3
+// infers trade_type from the URL path `/v3/pay/transactions/native`
+// (and the analogous H5/JSAPI/APP paths), so the field does NOT belong
+// in this body — including it is what triggered the
+// "wechat pay rejected the order (4xx)" user-facing error. The
+// UnifiedOrderRequest keeps a TradeType field for callers and future
+// product endpoints (H5, JSAPI) that DO need it, but only this struct
+// goes on the wire for /transactions/native — and it has no trade_type.
+//
 // NATIVE requires BOTH `appid` and `mchid` in v3 (the field name is
 // `mchid`, NOT `mch_id` — JSON-tag drift here caused the prior
 // mch_id = "" mismatch wechat reject). Amount reuses types.Amount
@@ -65,7 +77,6 @@ type unifiedOrderBody struct {
 	OutTradeNo  string `json:"out_trade_no"`
 	NotifyURL   string `json:"notify_url"`
 	Amount      Amount `json:"amount"`
-	TradeType   string `json:"trade_type"`
 }
 
 // Client is the WeChat Pay v3 entry point. Two modes:
@@ -148,7 +159,10 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 	bodyBytes.NotifyURL = c.NotifyURL
 	bodyBytes.Amount.Total = req.Amount.Total
 	bodyBytes.Amount.Currency = req.Amount.Currency
-	bodyBytes.TradeType = string(req.TradeType)
+	// trade_type intentionally NOT marshalled — see unifiedOrderBody's
+	// doc comment. TradeType on UnifiedOrderRequest is preserved for
+	// future H5/JSAPI products where the URL differs; for the v3 NATIVE
+	// path the URL alone selects the product.
 	body, err := json.Marshal(bodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)

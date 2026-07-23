@@ -11,3 +11,4 @@ tests/e2e-ui/playwright-report/
 tests/e2e-ui/blob-report/
 tests/e2e-ui/playwright/.cache/
 .claude/
+cmd/probe-wechat/

@@ -152,9 +152,16 @@ func (m *mockSocialIdentityRepo) DeleteIfNotLast(_ context.Context, id, userID s
 // --- PlanRepo mock ---
 
 type mockPlanRepo struct {
-	plans       map[string]*model.Plan
-	defaultPlan *model.Plan
-	err         error
+	plans            map[string]*model.Plan
+	defaultPlan      *model.Plan
+	err              error
+	// lookupErrForIDs forces FindByID to return the named error for the
+	// listed IDs even if a row was previously seeded into plans. Used by
+	// tests that model "plan row exists in DB but the lookup observed a
+	// transient failure" — currently the
+	// TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing
+	// degraded-mode case.
+	lookupErrForIDs map[string]error
 }
 
 func newMockPlanRepo() *mockPlanRepo {
@@ -175,6 +182,11 @@ func (m *mockPlanRepo) FindAll(_ context.Context) ([]model.Plan, error) {
 func (m *mockPlanRepo) FindByID(_ context.Context, id string) (*model.Plan, error) {
 	if m.err != nil {
 		return nil, m.err
+	}
+	if m.lookupErrForIDs != nil {
+		if e, ok := m.lookupErrForIDs[id]; ok {
+			return nil, e
+		}
 	}
 	p, ok := m.plans[id]
 	if !ok {

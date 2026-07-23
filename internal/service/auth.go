@@ -457,14 +457,26 @@ func (s *AuthService) issueTokensForUser(ctx context.Context, user *model.User, 
 
 // resolvePlanForTokenIssuance collapses the plan-selection logic shared
 // by issueTokensForUser (login) and RefreshToken (refresh). It returns:
-//   - chosenPlan:   plan whose .Apps determine the access-token scope +
-//                   has_access (the "real" entitlement right now).
-//   - surfacePlanID, surfacePlanName: what the login response's
-//                   Subscription.PlanID/PlanName should report. For
-//                   expired subs this is the original plan so the FE
-//                   shows "renew your X plan" instead of misreading as
-//                   "you got downgraded to free".
-//   - hasAccess:    chosenPlan.Apps contains appID.
+//   - chosenPlan:   plan whose .Apps determine the access-token scope.
+//                   For expired subs this is the default plan (the only
+//                   entitlement that holds right now).
+//   - surfacePlanID: what the login response's Subscription.PlanID
+//                   reports. For expired subs this is the user's paid
+//                   plan_id so the FE renders "renew your X plan" and
+//                   the checkout target (useBilling.planID != "free"
+//                   bypass) routes correctly.
+//   - surfacePlanName: human-readable plan name. For expired subs the
+//                   original plan's Name is looked up; if the lookup
+//                   fails (plan deleted), the field is set to ""
+//                   rather than silently substituting the default plan's
+//                   identity — silence here hid a separate defect
+//                   during the cn-staging 2026-07-23 incident.
+//   - hasAccess:    whether the user is currently entitled to use appID.
+//                   FALSE for expired subs (regardless of whether the
+//                   default plan happens to include the app). Code
+//                   & FE rely on this to gate paywall rendering and
+//                   to allow a fresh checkout via useBilling's
+//                   "already paid" check.
 //   - expiresAt:    sub.ExpiresAt (may be in the past — frontend uses
 //                   this for "your plan expired N days ago" copy).
 func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, appID string) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
@@ -483,28 +495,38 @@ func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, a
 	if err != nil {
 		return nil, "", "", false, nil, fmt.Errorf("get default plan: %w", err)
 	}
-	surfaceID, surfaceName := defaultPlan.ID, defaultPlan.Name
 	if sub != nil && expired {
-		// Active-but-past subscription. The user's *intended* plan is
-		// the paid sub's plan; surface that so console FE renderers
-		// show "your X plan expired" + "renew" CTA pointing back at
-		// /billing/checkout?plan=X. If we can't resolve the original
-		// plan row (very unlikely but defensively), keep the default
-		// plan's identity in the response — better than dropping the
-		// field entirely.
+		// Active-but-past subscription.
+		//
+		// chosenPlan stays as the default plan — the access-token
+		// scope and HasAccess are derived from the default plan's apps
+		// EXCEPT that HasAccess is forced to false for expired subs.
+		// The default plan on yunhou-users today includes "yundian"
+		// (the only Yunhou consumer app), so without the explicit
+		// override we'd report HasAccess=true for an expired monthly
+		// user. The FE's useBilling hook treats `plan_id != "free"
+		// && has_access=true` as "already subscribed", which would
+		// refuse the new checkout and leave the user in the loop.
+		// (cn-staging 2026-07-23 follow-up fix.)
+		surfaceID := sub.PlanID
+		surfaceName := ""
 		if orig, oerr := s.planRepo.FindByID(ctx, sub.PlanID); oerr == nil {
-			surfaceID, surfaceName = orig.ID, orig.Name
+			surfaceName = orig.Name
 		}
+		// sub.ExpiresAt is non-nil when status='active' (subscriptions
+		// table constraint checked by FindActiveByUserID); still guard.
+		var subExpiry *time.Time
+		if sub != nil {
+			subExpiry = sub.ExpiresAt
+		}
+		return defaultPlan, surfaceID, surfaceName, false, subExpiry, nil
 	}
-	// sub is nil here when the user has no active subscription; do
-	// NOT access sub.ExpiresAt unconditionally (nil-deref panics, was
-	// the bug that broke TestAuthService_RefreshToken_RarePaths after
-	// the resolvePlanForTokenIssuance extraction). Named-return
-	// `expiresAt` already exists at this scope; just assign.
-	if sub != nil {
-		expiresAt = sub.ExpiresAt
-	}
-	return defaultPlan, surfaceID, surfaceName, slices.Contains(defaultPlan.Apps, appID), expiresAt, nil
+	// sub == nil && !expired: no active subscription at all. Use the
+	// default plan's identity for both surface and chosen, and treat
+	// the user as a fresh "free" signup with HasAccess derived from
+	// the default plan's apps (which today includes "yundian").
+	// sub is nil here; named return `expiresAt` is already nil.
+	return defaultPlan, defaultPlan.ID, defaultPlan.Name, slices.Contains(defaultPlan.Apps, appID), expiresAt, nil
 }
 
 // Logout revokes the refresh token. Idempotent: a missing/expired session

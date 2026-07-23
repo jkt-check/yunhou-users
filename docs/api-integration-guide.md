@@ -1226,7 +1226,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | `wechat_no_unionid` | `/sns/userinfo` 响应中 `unionid` 字段为空（用户拒绝授权 snsapi_userinfo 或 app 未申请该权限） |
 | `user_not_found` | 防御性：JWT 主题无法解析到用户行（理论上不应发生）；`ErrUserDeleted` 也归并到此 reason |
 | `user_suspended` | 用户账号被停用 |
-| `subscription_expired` | 订阅过期；`ErrSubscriptionNotActive`（被 sweeper 翻成非 active）也归并到此 reason |
+| ~~`subscription_expired`~~ | **已弃用（2026-07-23）**：身份层与能力层解耦后，`findUsableSubscription`/`ErrSubscriptionExpired` 不再在 OAuth callback 触发登录失败；过期订阅表现为 `/auth/me` 中 `Subscription.HasAccess=false`，浏览器落在 `/console` + 续费 banner。该 reason 保留在 BFF 上但不再由 Yunhou 发出 — 若再次出现，说明别处出现了回归。 |
 | `app_not_found` / `app_disabled` | `app_id` 不存在或已停用 |
 
 #### 边界总结

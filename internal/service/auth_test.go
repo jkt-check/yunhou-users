@@ -1602,19 +1602,76 @@ func TestResolvePlanForTokenIssuance_ExpiredSub(t *testing.T) {
 	if surfaceName != "月付" {
 		t.Errorf("surfacePlanName: got %q, want %q", surfaceName, "月付")
 	}
-	// has_access MUST be false — chosenPlan (default) has apps=[yundian],
-	// so today this happens to be true. The spec's invariant is "for
-	// expired users HasAccess=false in the response so the console
-	// renders the paywall". issueTokensForUser encodes this by passing
-	// hasAccess unchanged to the SubscriptionInfo, then the response
-	// shape is what governs paywall rendering. The full response-shape
-	// assertion is in TestIssueTokensForUser_ExpiredSub below.
-	_ = hasAccess // covered by the response-shape test below
+	// hasAccess MUST be false — the default plan on yunhou-users today
+	// includes "yundian", so without the explicit override we'd return
+	// true for an expired monthly user. The FE's useBilling hook treats
+	// (plan_id != "free" && has_access=true) as "already subscribed"
+	// and refuses the new checkout, leaving the user looped.
+	if hasAccess {
+		t.Errorf("hasAccess: got true, want false (expired sub must NOT be granted has_access even when default plan includes appID; this was the cn-staging 2026-07-23 follow-up bug)")
+	}
+	// surfacePlanID is the user's *intended* plan, not the default —
+	// console renders "your X plan expired" + "renew" CTA.
+	if surfaceID != "monthly" {
+		t.Errorf("surfacePlanID: got %q, want %q", surfaceID, "monthly")
+	}
+	if surfaceName != "月付" {
+		t.Errorf("surfacePlanName: got %q, want %q", surfaceName, "月付")
+	}
+	// chosenPlan is the default (it's what scopes the access token),
+	// not the expired paid plan.
+	if chosenPlan.ID != "free" {
+		t.Errorf("chosenPlan.ID: got %q, want %q (token scope must reflect actual entitlement, not paid plan)", chosenPlan.ID, "free")
+	}
 	// ExpiresAt returns the original past timestamp so the FE knows the
 	// sub is "expired since …" and can render "your X plan expired N
 	// days ago".
 	if expiresAt == nil || !expiresAt.Equal(past) {
 		t.Errorf("expiresAt: got %v, want %v", expiresAt, past)
+	}
+}
+
+// TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing asserts
+// the degraded-mode contract: when the original plan row referenced by
+// sub.PlanID has been deleted (FK errors aren't normally possible but
+// transient DB failures are), surfacePlanID still reflects the user's
+// intent (sub.PlanID) rather than silently substituting the default
+// plan's ID — silence here hid a separate defect during the cn-staging
+// 2026-07-23 incident investigation.
+func TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ur, sir, pr, sr, ssr, ar := newAuthMocks()
+	ar.seedActive("yundian", "云店")
+
+	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	pr.defaultPlan = pr.plans["free"]
+	// Note: "monthly" intentionally NOT seeded. Lookup will fail.
+	pr.lookupErrForIDs = map[string]error{"monthly": errors.New("plan not found")}
+
+	past := time.Now().Add(-1 * time.Hour)
+	sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &past}
+	sr.byUserID["u-1"] = sr.subs["s-1"]
+	ur.users["u-1"] = &model.User{ID: "u-1", Status: "active"}
+	_ = sir; _ = ssr
+	tokenSvc := newTokenServiceWithMocks(ssr, sr)
+	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+	chosenPlan, surfaceID, surfaceName, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian")
+	if err != nil {
+		t.Fatalf("resolvePlanForTokenIssuance must not error on missing original plan; got %v", err)
+	}
+	if chosenPlan.ID != "free" {
+		t.Errorf("chosenPlan.ID: got %q, want free", chosenPlan.ID)
+	}
+	if surfaceID != "monthly" {
+		t.Errorf("surfacePlanID: got %q, want monthly (must reflect sub.PlanID, never silently fall back to default)", surfaceID)
+	}
+	if surfaceName != "" {
+		t.Errorf("surfacePlanName: got %q, want empty (lookup failed — empty is the documented degraded contract)", surfaceName)
+	}
+	if hasAccess {
+		t.Error("hasAccess: must be false even when the original plan cannot be resolved")
 	}
 }
 
@@ -1664,6 +1721,14 @@ func TestIssueTokensForUser_ExpiredSub(t *testing.T) {
 	}
 	if resp.Subscription.ExpiresAt == nil || !resp.Subscription.ExpiresAt.Equal(past) {
 		t.Errorf("Subscription.ExpiresAt: got %v, want %v", resp.Subscription.ExpiresAt, past)
+	}
+	// HasAccess MUST be false. The default plan includes "yundian", so
+	// without the explicit override the response would return true
+	// here — and useBilling's paywall check (`plan_id != free &&
+	// has_access`) would refuse the new checkout, leaving the user
+	// looped. This is the cn-staging 2026-07-23 follow-up fix.
+	if resp.Subscription.HasAccess {
+		t.Error("Subscription.HasAccess: got true, want false (expired sub must NOT receive has_access even when default plan includes appID)")
 	}
 	if resp.AccessToken == "" || resp.RefreshToken == "" {
 		t.Error("AccessToken/RefreshToken must be issued even for expired-sub users (they're coming in, not being kicked out)")

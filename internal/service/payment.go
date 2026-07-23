@@ -195,8 +195,21 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// active rows, both this check and the partial unique index need to change
 	// together (yunhou-users stays primitive — upgrade flow / re-buy semantics
 	// belong to the frontend).
-	if _, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
-		return nil, ErrUserHasActiveSub
+	//
+	// "active" here means status='active' AND the sub has not lapsed
+	// (expires_at NULL or future). A stale row (status='active' with
+	// expires_at < now()) is treated as expired and permitted through;
+	// the upcoming activateSubscriptionOnTx will UPDATE that row in
+	// place rather than create a new one, preserving the partial
+	// unique index. Without this carve-out, users whose subscription
+	// quietly went past could not renew even after the cn-staging
+	// 2026-07-23 login-decouple fix let them log in.
+	if existing, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
+		if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
+			return nil, ErrUserHasActiveSub
+		}
+		// stale: status='active' but expires_at < now(). Allow order
+		// creation — activateSubscriptionOnTx will update this row.
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("check active sub: %w", err)
 	}

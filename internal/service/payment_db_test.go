@@ -182,6 +182,40 @@ func TestPaymentService_CreateOrder_UserHasActiveSub(t *testing.T) {
 	}
 }
 
+// TestPaymentService_CreateOrder_StaleActiveSubAllowsRenewal exercises
+// the cn-staging 2026-07-23 follow-up fix: a row with status='active'
+// but expires_at in the past (e.g. from the pre-fix reconcile bug that
+// aliased SuccessTime into SubExpiresAt) is NOT a "currently active"
+// subscription for the purposes of the partial unique index guard.
+// CreateOrder proceeds; the new checkout's ActivateOnTx UPDATEs the
+// existing row in place, leaving exactly one status='active' row per
+// user. Without this carve-out, users whose subscription quietly went
+// past couldn't renew even after the login-decouple fix let them in.
+func TestPaymentService_CreateOrder_StaleActiveSubAllowsRenewal(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	// Pre-seed a stale active sub: status='active' but expires_at past.
+	past := time.Now().Add(-1 * time.Hour)
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (gen_random_uuid(), $1, 'monthly', 'active', now(), $2)
+	`, uid, past)
+	if err != nil {
+		t.Fatalf("seed stale sub: %v", err)
+	}
+	// CreateOrder must NOT return ErrUserHasActiveSub; the user is
+	// permitted to renew. After payment, activateSubscriptionOnTx
+	// transitions this same row to expires_at = NOW() + interval.
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("CreateOrder must NOT reject a stale-active sub (cn-staging 2026-07-23 fix); got %v", err)
+	}
+	if order == nil || order.Status != "pending" {
+		t.Errorf("order = %+v, want a fresh pending order", order)
+	}
+}
+
 // ============================================================================
 // CancelOrder
 // ============================================================================

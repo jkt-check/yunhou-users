@@ -2,6 +2,9 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -617,5 +620,104 @@ func TestBuildReconcileWebhookEvent_NilInput(t *testing.T) {
 	t.Parallel()
 	if _, err := buildReconcileWebhookEvent(nil); err == nil {
 		t.Error("nil OrderQueryResult must error — the production helper early-outs on nil upstream; keep the test honest")
+	}
+}
+
+// ============================================================================
+// reconcilePreCheck
+// ============================================================================
+//
+// Locks down the dedupe invariant introduced after round-1 review: a real
+// WeChat webhook can arrive AFTER the FE poll drives reconcile, and the two
+// events use different EventID shapes so the webhook_events unique constraint
+// doesn't catch the second one. The payment-row layer is the actual
+// idempotency boundary, and reconcile must short-circuit when the payment
+// is already paid to avoid an unnecessary (but no-op) UPSERT and a wasted
+// row in webhook_events.
+
+func TestReconcilePreCheck(t *testing.T) {
+	t.Parallel()
+
+	paidTxn := "txn-paid-1"
+	paidRow := &model.Payment{
+		ID:            "pay-1",
+		Channel:       "wechat_pay",
+		ExternalTxnID: paidTxn,
+		Status:        "paid",
+		Amount:        29.90,
+		Currency:      "CNY",
+	}
+	pendingRow := &model.Payment{
+		ID:            "pay-2",
+		Channel:       "wechat_pay",
+		ExternalTxnID: "txn-pending-1",
+		Status:        "pending",
+		Amount:        29.90,
+		Currency:      "CNY",
+	}
+
+	type tc struct {
+		name       string
+		existing   *model.Payment
+		findErr    error
+		wantSkip   bool
+		wantErr    bool
+	}
+	cases := []tc{
+		{
+			name:     "no payment row → fall through to OnWebhook",
+			existing: nil,
+			findErr:  sql.ErrNoRows,
+			wantSkip: false,
+			wantErr:  false,
+		},
+		{
+			name:     "paid payment row → skip OnWebhook",
+			existing: paidRow,
+			findErr:  nil,
+			wantSkip: true,
+			wantErr:  false,
+		},
+		{
+			name:     "pending payment row → fall through (OnWebhook will drive the transition)",
+			existing: pendingRow,
+			findErr:  nil,
+			wantSkip: false,
+			wantErr:  false,
+		},
+		{
+			name:     "DB error other than NoRows → bubble up (FE poll retries)",
+			existing: nil,
+			findErr:  errors.New("db down"),
+			wantSkip: false,
+			wantErr:  true,
+		},
+		{
+			name:     "NoRows wrapped → still treated as 'no row', continue",
+			existing: nil,
+			findErr:  fmt.Errorf("not found: %w", sql.ErrNoRows),
+			wantSkip: false,
+			wantErr:  false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			gotSkip, gotErr := reconcilePreCheck(c.existing, c.findErr)
+			if gotSkip != c.wantSkip {
+				t.Errorf("skip: got %v, want %v", gotSkip, c.wantSkip)
+			}
+			if (gotErr != nil) != c.wantErr {
+				t.Errorf("err: got %v, wantErr %v", gotErr, c.wantErr)
+			}
+		})
+	}
+
+	// Sanity: paid payment row for the txn we care about → skip, no err,
+	// happy-path snapshot.
+	gotSkip, gotErr := reconcilePreCheck(paidRow, nil)
+	if !gotSkip || gotErr != nil {
+		t.Errorf("paid-row pre-check returned skip=%v err=%v; want skip=true, err=nil", gotSkip, gotErr)
 	}
 }

@@ -445,9 +445,41 @@ func (s *PaymentService) reconcileFromChannel(ctx context.Context, o *model.Orde
 		}
 		return nil
 	}
-	// Treat as a TRANSACTION.SUCCESS webhook: same handler, same
-	// dedupe (eventID is derived from WeChat's transaction_id so a
-	// genuine webhook that arrives later will dedupe naturally).
+	// Treat as a TRANSACTION.SUCCESS webhook. The real WeChat webhook
+	// and the reconcile-synthesized event use DIFFERENT EventID shapes
+	// (real: WeChat's `evt.ID` UUID; reconcile: "reconcile:" + out_trade_no
+	// + ":" + transaction_id) so they CAN both land in webhook_events.
+	// Dedupe therefore happens at the payment-row layer, not the
+	// event-row layer: onPaymentSucceeded's INSERT-payment-on-conflict-
+	// do-nothing path re-reads the existing payment, and if it's already
+	// paid the subscription activation runs again with the same plan +
+	// same nil expiry — a no-op UPSERT. To skip the second activation
+	// altogether (and avoid touching webhook_events for the synthetic
+	// event when a real one already paid), pre-check the payment row
+	// here and short-circuit before OnWebhook. Race-safe: if a real
+	// webhook lands between this read and the OnWebhook transaction,
+	// onPaymentSucceeded's existing dedupe catches it.
+	existing, err := s.paymentRepo.FindByChannelTxnID(ctx, "wechat_pay", res.TransactionID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reconcile pre-check: %w", err)
+	}
+	if skip, skipErr := reconcilePreCheck(existing, err); skip || skipErr != nil {
+		if skip {
+			// Real webhook (or earlier reconcile) already paid this
+			// transaction. OnWebhook would just upsert with the same
+			// values and waste a row in webhook_events.
+			log.Printf("reconcile: transaction %s already paid (payment=%s); skipping OnWebhook",
+				res.TransactionID, existing.ID)
+			if _, err := s.db.ExecContext(ctx, `UPDATE orders SET last_reconciled_at = now() WHERE id = $1`, o.ID); err != nil {
+				return fmt.Errorf("stamp last_reconciled_at: %w", err)
+			}
+		}
+		if skipErr != nil {
+			return fmt.Errorf("reconcile pre-check: %w", skipErr)
+		}
+		return nil
+	}
+
 	event, err := buildReconcileWebhookEvent(res)
 	if err != nil {
 		return fmt.Errorf("build reconcile event: %w", err)
@@ -1791,6 +1823,56 @@ func buildReconcileWebhookEvent(res *wechat.OrderQueryResult) (WebhookEvent, err
 		// SubExpiresAt is nil on purpose — see the comment above. Do not
 		// populate from res.SuccessTime (it's a past timestamp).
 	}, nil
+}
+
+// reconcilePreCheck decides whether reconcileFromChannel should
+// short-circuit before calling OnWebhook. The real WeChat webhook and
+// the reconcile-synthesized event use different EventID shapes (real:
+// WeChat's evt.ID UUID; reconcile: "reconcile:" + out_trade_no + ":" +
+// transaction_id), so the (channel, event_id) unique constraint in
+// webhook_events does NOT catch a real webhook that arrives later. The
+// (channel, external_txn_id) unique constraint in payments catches the
+// payment-row side, but the subscribe path in onPaymentSucceeded
+// falls through on duplicate-payment to a re-activation UPSERT —
+// functionally a no-op today, but architecturally wrong. This helper
+// lets the reconcile path exit early when a paid payment row for the
+// same WeChat transaction already exists, so OnWebhook never even
+// fires for a transaction that a real webhook has already settled.
+//
+// Inputs:
+//   - existing: the row returned by paymentRepo.FindByChannelTxnID
+//     (nil on sql.ErrNoRows)
+//   - findErr: the error from FindByChannelTxnID
+//
+// Outputs:
+//   - skip=true: caller stamps last_reconciled_at and returns.
+//   - skipErr != nil: caller returns wrapped as the function's error
+//     so the FE poll retries.
+//   - both zero: continue to OnWebhook.
+//
+// A query error OTHER than sql.ErrNoRows (e.g. DB unreachable) is
+// treated as an error and bubbles up — the FE poll will retry. We
+// deliberately don't translate every error into "skip" because doing
+// so would mask real outages behind a silent success.
+func reconcilePreCheck(existing *model.Payment, findErr error) (skip bool, skipErr error) {
+	if findErr != nil {
+		// sql.ErrNoRows is the only "no row" signal; everything else
+		// is a DB error worth surfacing.
+		if errors.Is(findErr, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, findErr
+	}
+	if existing == nil {
+		return false, nil
+	}
+	if existing.Status == "paid" {
+		return true, nil
+	}
+	// Payment row exists but isn't 'paid' (e.g. 'failed' / 'pending').
+	// Fall through to OnWebhook so the reconcile can drive the state
+	// transition.
+	return false, nil
 }
 
 func mustJSON(v map[string]any) json.RawMessage {

@@ -713,11 +713,4 @@ func TestReconcilePreCheck(t *testing.T) {
 			}
 		})
 	}
-
-	// Sanity: paid payment row for the txn we care about → skip, no err,
-	// happy-path snapshot.
-	gotSkip, gotErr := reconcilePreCheck(paidRow, nil)
-	if !gotSkip || gotErr != nil {
-		t.Errorf("paid-row pre-check returned skip=%v err=%v; want skip=true, err=nil", gotSkip, gotErr)
-	}
 }

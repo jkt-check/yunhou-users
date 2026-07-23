@@ -467,9 +467,12 @@ func (s *PaymentService) reconcileFromChannel(ctx context.Context, o *model.Orde
 		if skip {
 			// Real webhook (or earlier reconcile) already paid this
 			// transaction. OnWebhook would just upsert with the same
-			// values and waste a row in webhook_events.
-			log.Printf("reconcile: transaction %s already paid (payment=%s); skipping OnWebhook",
-				res.TransactionID, existing.ID)
+			// values and waste a row in webhook_events. Tag with all
+			// three correlation keys (order / payment / txn) so on-call
+			// can grep by any of them when investigating a stuck
+			// reconciliation.
+			log.Printf("payment reconcile: order=%s txn=%s already paid (payment=%s); skipping OnWebhook",
+				o.ID, res.TransactionID, existing.ID)
 			if _, err := s.db.ExecContext(ctx, `UPDATE orders SET last_reconciled_at = now() WHERE id = $1`, o.ID); err != nil {
 				return fmt.Errorf("stamp last_reconciled_at: %w", err)
 			}

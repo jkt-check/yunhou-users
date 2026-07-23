@@ -28,8 +28,6 @@ var (
 	ErrUserSuspended       = errors.New("user is suspended")
 	ErrUserDeleted         = errors.New("user is deleted")
 
-	ErrSubscriptionNotActive = errors.New("subscription not active")
-	ErrSubscriptionExpired   = errors.New("subscription expired")
 	ErrSubscriptionNotFound  = errors.New("subscription not found")
 	ErrAlreadyCancelled      = errors.New("already cancelled")
 	ErrCannotRenewCancelled  = errors.New("cannot renew a cancelled subscription")

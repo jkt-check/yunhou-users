@@ -22,6 +22,18 @@ func NewAuthHandler(authSvc service.AuthServiceInterface, tokenSvc service.Token
 // expectedAuthErrors lists the service-level sentinel errors that map to a
 // user-facing 401. Anything else is treated as internal and surfaced only as
 // a generic 500 (the underlying detail goes to the log, not the client).
+//
+// Subscription-state sentinels used to live here — historically
+// ErrSubscriptionExpired and ErrSubscriptionNotActive came back from
+// findUsableSubscription inside LoginWithProfile and were translated into
+// a URL `reason=subscription_expired` that the BFF rendered as a banner.
+// That coupling was identified as the cn-staging 2026-07-23 incident's
+// root cause: a user with an expired-but-past `expires_at` row was
+// bounced off the login page and could not renew. Login is now an
+// identity-layer concern; subscription state is reported in the
+// /auth/me response as Subscription.HasAccess=false and surfaced via
+// console banners instead. See service.AuthService.peekSubscription
+// and docs/superpowers/specs/2026-07-23-login-subscription-decouple-design.md.
 var expectedAuthErrors = []error{
 	service.ErrInvalidProviderToken,
 	service.ErrUnsupportedProvider,
@@ -29,8 +41,6 @@ var expectedAuthErrors = []error{
 	service.ErrUserNotFound,
 	service.ErrUserSuspended,
 	service.ErrUserDeleted,
-	service.ErrSubscriptionNotActive,
-	service.ErrSubscriptionExpired,
 	service.ErrAppNotFound,
 	service.ErrAppInactive,
 }
@@ -59,8 +69,6 @@ func authErrReason(err error) string {
 		return "user_not_found"
 	case errors.Is(err, service.ErrUserSuspended):
 		return "user_suspended"
-	case errors.Is(err, service.ErrSubscriptionExpired), errors.Is(err, service.ErrSubscriptionNotActive):
-		return "subscription_expired"
 	case errors.Is(err, service.ErrWeChatUpstream):
 		return "wechat_upstream"
 	case errors.Is(err, service.ErrWeChatNoUnionID):

@@ -283,10 +283,10 @@ func (m *mockSubscriptionRepo) FindActiveByUserID(_ context.Context, userID stri
 	if s == nil {
 		return nil, nil
 	}
-	// Check if expired
-	if s.ExpiresAt != nil && s.ExpiresAt.Before(time.Now()) {
-		return nil, fmt.Errorf("subscription expired")
-	}
+	// Expiry is decided by AuthService.peekSubscription in production.
+	// The mock returns the row verbatim so callers can drive both the
+	// "active, not expired" and "active, past expires_at" branches
+	// deterministically without the mock time-gating the result.
 	return s, nil
 }
 

@@ -71,25 +71,27 @@ func NewAuthService(
 	}
 }
 
-// findUsableSubscription returns the user's currently-active, non-expired
-// subscription. Expiry is determined by the `expires_at` timestamp; the
-// repo's `FindActiveByUserID` already filters `status = 'active'`, and a
-// periodic sweeper is responsible for marking expired rows as such.
-// We deliberately do NOT write here: writing in a read path holds row locks
-// and serializes concurrent logins for the same user. The status update is
-// the sweeper's job.
-func (s *AuthService) findUsableSubscription(ctx context.Context, userID string) (*model.Subscription, error) {
+// peekSubscription returns the user's status='active' subscription plus a
+// boolean flag indicating whether its `expires_at` (if set) is in the past.
+// It does NOT raise an error for an expired row — the decision of whether
+// an expired subscription blocks login or merely downgrades the response
+// is the caller's. The historical `findUsableSubscription` returned
+// ErrSubscriptionExpired and propagated it all the way to the OAuth
+// callback's redirect, which kicked the user back to /auth/login with a
+// banner — a coupling between identity and ability that the user
+// rejected on 2026-07-23. The split between authentication (who you are)
+// and subscription enforcement (what you can do) lives here: peek is
+// pure-read; the policy is up to the caller.
+func (s *AuthService) peekSubscription(ctx context.Context, userID string) (*model.Subscription, bool, error) {
 	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, fmt.Errorf("get subscription: %w", err)
+		return nil, false, fmt.Errorf("get subscription: %w", err)
 	}
-	if sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now()) {
-		return nil, ErrSubscriptionExpired
-	}
-	return sub, nil
+	expired := sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now())
+	return sub, expired, nil
 }
 
 type ProviderUserInfo struct {
@@ -198,16 +200,15 @@ func (s *AuthService) LoginWithProfile(ctx context.Context, req LoginWithProfile
 		}
 	}
 
-	// 5. Get user's active subscription (no row → no subscription, use default plan)
-	sub, err := s.findUsableSubscription(ctx, user.ID)
-	if err != nil {
-		return nil, err
-	}
-	_ = sub // sub's ExpiresAt is fetched inside issueTokensForUser
-
-	// 6+7. Plan + access + token issuance via the shared tail so the
+	// 5. Plan + access + token issuance via the shared tail so the
 	// GitHub flow and /test/login are byte-for-byte identical at the
-	// bottom.
+	// bottom. The historical call to findUsableSubscription here was
+	// deliberately thrown away (_ = sub); its only purpose was to
+	// translate expired subscriptions into a login error and bounce
+	// the user to /auth/login. The cn-staging 2026-07-23 incident
+	// proved that conflation wrong — login and subscription are
+	// independent concerns, so peekSubscription is invoked inside
+	// issueTokensForUser only.
 	return s.issueTokensForUser(ctx, user, appID, nil)
 }
 
@@ -382,25 +383,29 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 // Callers are responsible for app existence/active check + user account
 // status guard + email binding (the response UserInfo.Email). This tail
 // starts at "we have a verified user, give them tokens for this app".
+//
+// Plan selection for the response (and access token scope):
+//   - Active, unexpired subscription → that sub's plan.
+//   - No subscription → default plan.
+//   - Active but `expires_at < now()` (expired) → default plan for the
+//     access-token scope + has_access, but the response surfaces the
+//     original PlanID/PlanName so the FE renders a "renew your X plan"
+//     banner instead of misreading the state as "you got downgraded".
+//     See service/auth.go peekSubscription and docs/superpowers/specs/
+//     2026-07-23-login-subscription-decouple-design.md.
 func (s *AuthService) issueTokensForUser(ctx context.Context, user *model.User, appID string, overrideEmail *string) (*LoginResponse, error) {
-	// Resolve the user's plan for the response. Falls back to the
-	// default plan if the user has no active sub.
-	var plan *model.Plan
-	active, err := s.subRepo.FindActiveByUserID(ctx, user.ID)
-	if err == nil && active != nil {
-		plan, err = s.planRepo.FindByID(ctx, active.PlanID)
-		if err != nil {
-			return nil, fmt.Errorf("get plan: %w", err)
-		}
-	} else {
-		plan, err = s.planRepo.FindDefault(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("get default plan: %w", err)
-		}
+	// Pick the access-token plan (scope + has_access) using the same
+	// rule that the response's `plan` field will be derived from —
+	// except for the expired branch, where scope/has_access come from
+	// the default plan (the only entitlement right now) while the
+	// surfaced PlanID/PlanName come from the original (so renew CTAs
+	// target the right SKU).
+	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuance(ctx, user.ID, appID)
+	if err != nil {
+		return nil, err
 	}
-	hasAccess := slices.Contains(plan.Apps, appID)
 
-	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, plan.Apps)
+	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, chosenPlan.Apps)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -414,17 +419,12 @@ func (s *AuthService) issueTokensForUser(ctx context.Context, user *model.User, 
 		AppID:        appID,
 		SessionType:  "refresh",
 		RefreshToken: hashToken(refreshTokenRaw),
-		Scope:        plan.Apps,
+		Scope:        chosenPlan.Apps,
 		Revoked:      false,
 		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
 	}
 	if err := s.sessionRepo.Create(ctx, session); err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
-	}
-
-	var expiresAt *time.Time
-	if active != nil {
-		expiresAt = active.ExpiresAt
 	}
 
 	// Pick the email for the response. LoginWithProfile leaves it as
@@ -447,12 +447,64 @@ func (s *AuthService) issueTokensForUser(ctx context.Context, user *model.User, 
 			AvatarURL: user.AvatarURL,
 		},
 		Subscription: &SubscriptionInfo{
-			PlanID:    plan.ID,
-			PlanName:  plan.Name,
+			PlanID:    surfacePlanID,
+			PlanName:  surfacePlanName,
 			HasAccess: hasAccess,
 			ExpiresAt: expiresAt,
 		},
 	}, nil
+}
+
+// resolvePlanForTokenIssuance collapses the plan-selection logic shared
+// by issueTokensForUser (login) and RefreshToken (refresh). It returns:
+//   - chosenPlan:   plan whose .Apps determine the access-token scope +
+//                   has_access (the "real" entitlement right now).
+//   - surfacePlanID, surfacePlanName: what the login response's
+//                   Subscription.PlanID/PlanName should report. For
+//                   expired subs this is the original plan so the FE
+//                   shows "renew your X plan" instead of misreading as
+//                   "you got downgraded to free".
+//   - hasAccess:    chosenPlan.Apps contains appID.
+//   - expiresAt:    sub.ExpiresAt (may be in the past — frontend uses
+//                   this for "your plan expired N days ago" copy).
+func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, appID string) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
+	sub, expired, err := s.peekSubscription(ctx, userID)
+	if err != nil {
+		return nil, "", "", false, nil, err
+	}
+	if sub != nil && !expired {
+		plan, err := s.planRepo.FindByID(ctx, sub.PlanID)
+		if err != nil {
+			return nil, "", "", false, nil, fmt.Errorf("get plan: %w", err)
+		}
+		return plan, plan.ID, plan.Name, slices.Contains(plan.Apps, appID), sub.ExpiresAt, nil
+	}
+	defaultPlan, err := s.planRepo.FindDefault(ctx)
+	if err != nil {
+		return nil, "", "", false, nil, fmt.Errorf("get default plan: %w", err)
+	}
+	surfaceID, surfaceName := defaultPlan.ID, defaultPlan.Name
+	if sub != nil && expired {
+		// Active-but-past subscription. The user's *intended* plan is
+		// the paid sub's plan; surface that so console FE renderers
+		// show "your X plan expired" + "renew" CTA pointing back at
+		// /billing/checkout?plan=X. If we can't resolve the original
+		// plan row (very unlikely but defensively), keep the default
+		// plan's identity in the response — better than dropping the
+		// field entirely.
+		if orig, oerr := s.planRepo.FindByID(ctx, sub.PlanID); oerr == nil {
+			surfaceID, surfaceName = orig.ID, orig.Name
+		}
+	}
+	// sub is nil here when the user has no active subscription; do
+	// NOT access sub.ExpiresAt unconditionally (nil-deref panics, was
+	// the bug that broke TestAuthService_RefreshToken_RarePaths after
+	// the resolvePlanForTokenIssuance extraction). Named-return
+	// `expiresAt` already exists at this scope; just assign.
+	if sub != nil {
+		expiresAt = sub.ExpiresAt
+	}
+	return defaultPlan, surfaceID, surfaceName, slices.Contains(defaultPlan.Apps, appID), expiresAt, nil
 }
 
 // Logout revokes the refresh token. Idempotent: a missing/expired session
@@ -514,27 +566,12 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		return nil, ErrAppInactive
 	}
 
-	sub, err := s.findUsableSubscription(ctx, user.ID)
+	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuance(ctx, user.ID, appID)
 	if err != nil {
 		return nil, err
 	}
 
-	var plan *model.Plan
-	if sub == nil {
-		plan, err = s.planRepo.FindDefault(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("get default plan: %w", err)
-		}
-	} else {
-		plan, err = s.planRepo.FindByID(ctx, sub.PlanID)
-		if err != nil {
-			return nil, fmt.Errorf("get plan: %w", err)
-		}
-	}
-
-	hasAccess := slices.Contains(plan.Apps, appID)
-
-	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, plan.Apps)
+	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, chosenPlan.Apps)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -550,7 +587,7 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		AppID:        appID,
 		SessionType:  "refresh",
 		RefreshToken: hashToken(newRefreshTokenRaw),
-		Scope:        plan.Apps,
+		Scope:        chosenPlan.Apps,
 		Revoked:      false,
 		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
 	}
@@ -569,11 +606,6 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		return nil, fmt.Errorf("rotate refresh token: %w", err)
 	}
 
-	var expiresAt *time.Time
-	if sub != nil {
-		expiresAt = sub.ExpiresAt
-	}
-
 	return &LoginResponse{
 		AccessToken:  accessToken,
 		RefreshToken: newRefreshTokenRaw,
@@ -584,8 +616,8 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 			AvatarURL: user.AvatarURL,
 		},
 		Subscription: &SubscriptionInfo{
-			PlanID:    plan.ID,
-			PlanName:  plan.Name,
+			PlanID:    surfacePlanID,
+			PlanName:  surfacePlanName,
 			HasAccess: hasAccess,
 			ExpiresAt: expiresAt,
 		},

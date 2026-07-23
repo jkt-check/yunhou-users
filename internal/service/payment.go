@@ -434,12 +434,15 @@ func (s *PaymentService) reconcileFromChannel(ctx context.Context, o *model.Orde
 	if err != nil {
 		return err
 	}
-	// Stamp LastReconciledAt regardless of outcome so a persistent
-	// NOTPAY does not turn every poll into an outbound call.
-	if _, err := s.db.ExecContext(ctx, `UPDATE orders SET last_reconciled_at = now() WHERE id = $1`, o.ID); err != nil {
-		return fmt.Errorf("stamp last_reconciled_at: %w", err)
-	}
 	if res == nil || res.TradeState != "SUCCESS" {
+		// Persistent NOTPAY (or upstream returned a body we can't decode
+		// past). Stamp last_reconciled_at so the next FE poll within
+		// reconcileMinInterval doesn't trigger another outbound call.
+		// Successful reconcile stamps AFTER OnWebhook commits (see below)
+		// — see the matching comment there.
+		if _, err := s.db.ExecContext(ctx, `UPDATE orders SET last_reconciled_at = now() WHERE id = $1`, o.ID); err != nil {
+			return fmt.Errorf("stamp last_reconciled_at: %w", err)
+		}
 		return nil
 	}
 	// Treat as a TRANSACTION.SUCCESS webhook: same handler, same
@@ -459,8 +462,20 @@ func (s *PaymentService) reconcileFromChannel(ctx context.Context, o *model.Orde
 	if !successAt.IsZero() {
 		event.SubExpiresAt = &successAt
 	}
-	_, err = s.OnWebhook(ctx, event)
-	return err
+	if _, err := s.OnWebhook(ctx, event); err != nil {
+		// Don't stamp last_reconciled_at on failure — we want the next
+		// FE poll within reconcileMinInterval to retry the reconcile
+		// instead of silently leaving a paid order as 'pending' until
+		// the throttle expires. OnWebhook is idempotent (eventID dedupe),
+		// so retrying is safe.
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE orders SET last_reconciled_at = now() WHERE id = $1`, o.ID); err != nil {
+		// Non-fatal: the order is already paid; the throttle will
+		// re-engage on the first OnWebhook-side retry of a later poll.
+		log.Printf("payment reconcile: stamp last_reconciled_at after success failed for order=%s: %v", o.ID, err)
+	}
+	return nil
 }
 
 // ListUserPayments returns payments for orders owned by userID.

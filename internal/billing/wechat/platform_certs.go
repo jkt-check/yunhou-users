@@ -127,14 +127,11 @@ func (m *PlatformCertManager) PublicKeyFor(ctx context.Context, serial string) (
 			}
 			return nil, err
 		}
-		// Refresh succeeded but the serial is still missing — update
-		// fetchedAt so the next miss within the rate-limit window is a
-		// fast no-upstream lookup, not another /v3/certificates call.
-		if _, ok := m.certs[serial]; !ok {
-			m.mu.Lock()
-			m.fetchedAt = time.Now()
-			m.mu.Unlock()
-		}
+		// refresh() already stamps m.fetchedAt = time.Now() on success.
+		// If the requested serial is still missing (e.g. WeChat just
+		// rotated to a cert we can't fetch yet), the next miss within
+		// the rate-limit window short-circuits below without another
+		// upstream call.
 	}
 
 	m.mu.Lock()

@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -682,16 +683,24 @@ var wechatPlatformPub atomic.Value        // *rsa.PublicKey
 
 func newE2EPlatformKeySource(t *testing.T) *e2ePlatformKeySource {
 	t.Helper()
-	privAny := wechatPlatformPrivHolder.Load()
-	if privAny == nil {
-		priv, err := rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			t.Fatalf("gen wechat platform key: %v", err)
-		}
-		wechatPlatformPrivHolder.Store(priv)
-		wechatPlatformPub.Store(&priv.PublicKey)
-	}
+	// sync.Once ensures the first concurrent setupE2EServerWithVerifier
+	// call generates one keypair; without it two goroutines could each
+	// see Load()==nil, generate their own keypair, and last-write-wins
+	// on Store — leaving the verifier using pubB while later signWeChat
+	// calls still hold privA from the earlier Store.
+	newWechatPlatformKeypairOnce.Do(initWechatPlatformKeypair)
 	return &e2ePlatformKeySource{}
+}
+
+var newWechatPlatformKeypairOnce sync.Once
+
+func initWechatPlatformKeypair() {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic("e2e: rsa.GenerateKey for wechat platform: " + err.Error())
+	}
+	wechatPlatformPrivHolder.Store(priv)
+	wechatPlatformPub.Store(&priv.PublicKey)
 }
 
 type e2ePlatformKeySource struct{}

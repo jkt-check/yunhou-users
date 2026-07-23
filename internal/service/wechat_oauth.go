@@ -89,9 +89,11 @@ var ErrWeChatCallbackURLMismatch = errors.New("redirect_uri not in wechat callba
 var ErrWeChatUpstream = errors.New("wechat oauth upstream error")
 
 // ErrWeChatNoUnionID signals that the /sns/userinfo response did not
-// include unionid. This happens when the website app did not request
-// snsapi_userinfo scope or the user did not grant it. We require
-// unionid for cross-app identity unification, so we reject the login.
+// include unionid. This happens when the website app is not bound to a
+// WeChat Open Platform account (unionid only exists per Open Platform
+// account) — NOT because of scope: snsapi_login is sufficient for
+// /sns/userinfo on a 网站应用. We require unionid for cross-app identity
+// unification, so we reject the login.
 var ErrWeChatNoUnionID = errors.New("wechat userinfo missing unionid")
 
 // BuildAuthorizeURL assembles the upstream WeChat authorize URL. The
@@ -121,7 +123,15 @@ func (s *WeChatOAuthService) BuildAuthorizeURL(appID string, cfg *model.WeChatOA
 	q.Set("appid", cfg.AppID)
 	q.Set("redirect_uri", cfg.CallbackURLs[callbackIndex])
 	q.Set("response_type", "code")
-	q.Set("scope", "snsapi_login,snsapi_userinfo")
+	// 2026-07-23: scope MUST be snsapi_login alone for a 网站应用
+	// (qrconnect). snsapi_userinfo belongs to the 公众号 (mp) platform's
+	// oauth2/authorize flow — appending it here makes WeChat render a
+	// second, mobile-style "申请使用你的昵称、头像" consent dialog with
+	// 拒绝/允许 buttons after the QR scan; clicking 拒绝 fails the login
+	// (verified live on cn-staging). With snsapi_login alone,
+	// /sns/userinfo still returns nickname/headimgurl/unionid for a
+	// website app bound to an Open Platform account.
+	q.Set("scope", "snsapi_login")
 	q.Set("state", state)
 	return s.authorizeURL + "?" + q.Encode() + "#wechat_redirect", nil
 }
@@ -283,10 +293,10 @@ func (s *WeChatOAuthService) FetchWeChatProfile(ctx context.Context, accessToken
 
 	if parsed.UnionID == "" {
 		// Design decision: we REQUIRE unionid. A userinfo response
-		// without it means snsapi_userinfo was not granted (e.g. the
-		// operator forgot to register the scope, or the user denied
-		// it). Reject the login rather than silently creating a
-		// per-app identity.
+		// without it means the website app is not bound to a WeChat
+		// Open Platform account (unionid is per-Open-Platform-account).
+		// Reject the login rather than silently creating a per-app
+		// identity.
 		return nil, ErrWeChatNoUnionID
 	}
 

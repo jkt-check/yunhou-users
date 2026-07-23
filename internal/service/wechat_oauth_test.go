@@ -56,8 +56,12 @@ func TestWeChatOAuthService_BuildAuthorizeURL_HappyPath(t *testing.T) {
 	if q.Get("response_type") != "code" {
 		t.Errorf("response_type = %q, want code", q.Get("response_type"))
 	}
-	if q.Get("scope") != "snsapi_login,snsapi_userinfo" {
-		t.Errorf("scope = %q, want snsapi_login,snsapi_userinfo", q.Get("scope"))
+	// 2026-07-23: 网站应用 qrconnect must request snsapi_login ALONE.
+	// Adding snsapi_userinfo (a 公众号-platform scope) makes WeChat show
+	// an extra 昵称/头像 consent dialog; users clicking 拒绝 broke login
+	// on cn-staging. /sns/userinfo still returns unionid without it.
+	if q.Get("scope") != "snsapi_login" {
+		t.Errorf("scope = %q, want snsapi_login", q.Get("scope"))
 	}
 	if q.Get("state") == "" {
 		t.Errorf("state is empty")

@@ -146,13 +146,16 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 // /auth/wechat/* path under WECHAT_OAUTH_MOCK=1. The browser-style
 // round-trip is:
 //
-//   1. GET /auth/wechat/redirect?app_id=...&redirect_uri=...
-//      → 302 to redirect_uri with #code=mock-code&state=<hmac>
-//   2. Extract state from the fragment, then
-//      GET /auth/wechat/callback?app_id=...&code=mock-code&state=<hmac>
-//      → 302 to redirect_uri with #token=...&refresh_token=...
-//   3. With the access token, GET /user/profile
-//      → 200 with {user: {provider:"wechat", provider_uid:"wechat_mock-unionid-001"}, subscription:...}
+//  1. GET /auth/wechat/redirect?app_id=...&redirect_uri=...
+//     → 302 to redirect_uri with ?code=mock-code&state=<hmac> in the
+//     QUERY (mirrors real WeChat, which always sends code+state in the
+//     query; changed from fragment on 2026-07-22 so the SPA's
+//     AuthCallbackPage handles mock and real identically)
+//  2. Extract state from the query, then
+//     GET /auth/wechat/callback?app_id=...&code=mock-code&state=<hmac>
+//     → 302 to redirect_uri with #token=...&refresh_token=...
+//  3. With the access token, GET /user/profile
+//     → 200 with {user: {provider:"wechat", provider_uid:"wechat_mock-unionid-001"}, subscription:...}
 //
 // This is the only test in the repo that exercises /auth/wechat/redirect
 // and /auth/wechat/callback together. The handler-level unit tests cover
@@ -166,8 +169,8 @@ func TestWeChat_OAuth_MockMode_FullRoundTrip(t *testing.T) {
 	redirectURI := "https://staging.yunhouai.com/auth/callback"
 
 	// 1. /auth/wechat/redirect — expect 302 to redirect_uri with
-	//    #code=mock-code&state=<hmac> in the FRAGMENT (not query — see
-	//    auth_wechat.go redirectWithFragment).
+	//    ?code=mock-code&state=<hmac> in the QUERY (same contract as real
+	//    WeChat's 302 to redirect_uri).
 	step1 := doRequest(t, srv.Engine, http.MethodGet,
 		"/auth/wechat/redirect?app_id=yundian&redirect_uri="+url.QueryEscape(redirectURI),
 		"", nil)
@@ -175,13 +178,17 @@ func TestWeChat_OAuth_MockMode_FullRoundTrip(t *testing.T) {
 		t.Fatalf("step1 redirect: status=%d body=%s", step1.StatusCode, string(step1.Body))
 	}
 	loc := step1.Headers.Get("Location")
-	if !strings.HasPrefix(loc, redirectURI+"#") {
-		t.Fatalf("step1 Location %q does not start with redirect_uri# (fragment expected)", loc)
+	if !strings.HasPrefix(loc, redirectURI+"?") {
+		t.Fatalf("step1 Location %q does not start with redirect_uri? (query expected)", loc)
 	}
 	if !strings.Contains(loc, "code=mock-code") {
 		t.Fatalf("step1 Location %q missing code=mock-code", loc)
 	}
-	state := extractFragmentValue(t, loc, "state")
+	locParsed, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("step1 Location %q unparseable: %v", loc, err)
+	}
+	state := locParsed.Query().Get("state")
 	if state == "" {
 		t.Fatalf("step1 Location %q missing state", loc)
 	}
@@ -279,7 +286,13 @@ func TestWeChat_Pay_MockMode_FullFlow_LoginBuySubscribe(t *testing.T) {
 	if step1.StatusCode != http.StatusFound {
 		t.Fatalf("oauth redirect: status=%d", step1.StatusCode)
 	}
-	state := extractFragmentValue(t, step1.Headers.Get("Location"), "state")
+	// Mock redirect now carries code+state in the QUERY (mirrors real
+	// WeChat), not the fragment — see TestWeChat_OAuth_MockMode_FullRoundTrip.
+	step1URL, err := url.Parse(step1.Headers.Get("Location"))
+	if err != nil {
+		t.Fatalf("oauth redirect Location unparseable: %v", err)
+	}
+	state := step1URL.Query().Get("state")
 	step2 := doRequest(t, srv.Engine, http.MethodGet,
 		"/auth/wechat/callback?app_id=yundian&code=mock-code&state="+url.QueryEscape(state),
 		"", nil)

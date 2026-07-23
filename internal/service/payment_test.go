@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
@@ -531,3 +532,90 @@ var (
 	_ repo.WebhookEventRepo = repo.WebhookEventRepo(nil)
 	_ repo.AuditLogRepo     = repo.AuditLogRepo(nil)
 )
+
+// ============================================================================
+// buildReconcileWebhookEvent
+// ============================================================================
+//
+// Regression for the cn-staging "login → subscription expired → resubscribe
+// → login" loop observed 2026-07-23. Root cause: this helper previously
+// did `event.SubExpiresAt = &successAt` where successAt was parsed from
+// `res.SuccessTime` (a past timestamp). The OnWebhook downstream then
+// wrote subscriptions.expires_at = <past>, and findUsableSubscription's
+// `expires_at < now()` check refused the next login with
+// ErrSubscriptionExpired. See the doc comment on buildReconcileWebhookEvent
+// for the full story.
+//
+// These tests pin SubExpiresAt == nil for every input shape so the bug
+// cannot silently come back.
+
+func TestBuildReconcileWebhookEvent_DoesNotSetSubExpiresAt(t *testing.T) {
+	t.Parallel()
+
+	// successTime set to "now" — the exact value that triggered the
+	// production incident: a freshly-paid order has a SuccessTime ≈ now,
+	// which would have become subscriptions.expires_at = now.
+	justNow := time.Now().UTC().Format(time.RFC3339)
+	res := &wechat.OrderQueryResult{
+		OutTradeNo:    "otn-abc-123",
+		TransactionID: "txn-xyz-789",
+		TradeState:    "SUCCESS",
+		SuccessTime:   justNow,
+		Amount: struct {
+			Total    int64  `json:"total"`
+			Currency string `json:"currency"`
+		}{Total: 2990, Currency: "CNY"},
+	}
+
+	got, err := buildReconcileWebhookEvent(res)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.SubExpiresAt != nil {
+		t.Fatalf("SubExpiresAt must stay nil on reconcile; got %v (would write subscriptions.expires_at into the past and break login)",
+			*got.SubExpiresAt)
+	}
+	if got.Amount != 29.90 {
+		t.Errorf("Amount major units: got %v, want 29.90", got.Amount)
+	}
+	if got.Currency != "CNY" {
+		t.Errorf("Currency: got %q, want CNY", got.Currency)
+	}
+	if got.Channel != "wechat_pay" {
+		t.Errorf("Channel: got %q, want wechat_pay", got.Channel)
+	}
+	if got.EventType != "TRANSACTION.SUCCESS" {
+		t.Errorf("EventType: got %q, want TRANSACTION.SUCCESS", got.EventType)
+	}
+	if got.EventID != "reconcile:otn-abc-123:txn-xyz-789" {
+		t.Errorf("EventID: got %q, want reconcile:otn-abc-123:txn-xyz-789", got.EventID)
+	}
+	if got.OrderID != "otn-abc-123" {
+		t.Errorf("OrderID: got %q, want otn-abc-123", got.OrderID)
+	}
+	if got.TransactionID != "txn-xyz-789" {
+		t.Errorf("TransactionID: got %q, want txn-xyz-789", got.TransactionID)
+	}
+}
+
+func TestBuildReconcileWebhookEvent_RejectsNonSuccess(t *testing.T) {
+	t.Parallel()
+	for _, state := range []string{"NOTPAY", "CLOSED", "REFUND"} {
+		res := &wechat.OrderQueryResult{
+			OutTradeNo:    "otn-1",
+			TransactionID: "txn-1",
+			TradeState:    state,
+			SuccessTime:   time.Now().Format(time.RFC3339),
+		}
+		if _, err := buildReconcileWebhookEvent(res); err == nil {
+			t.Errorf("trade_state=%s should be rejected (reconcile must only promote SUCCESS)", state)
+		}
+	}
+}
+
+func TestBuildReconcileWebhookEvent_NilInput(t *testing.T) {
+	t.Parallel()
+	if _, err := buildReconcileWebhookEvent(nil); err == nil {
+		t.Error("nil OrderQueryResult must error — the production helper early-outs on nil upstream; keep the test honest")
+	}
+}

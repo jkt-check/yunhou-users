@@ -448,19 +448,9 @@ func (s *PaymentService) reconcileFromChannel(ctx context.Context, o *model.Orde
 	// Treat as a TRANSACTION.SUCCESS webhook: same handler, same
 	// dedupe (eventID is derived from WeChat's transaction_id so a
 	// genuine webhook that arrives later will dedupe naturally).
-	successAt, _ := time.Parse(time.RFC3339, res.SuccessTime)
-	event := WebhookEvent{
-		Channel:       "wechat_pay",
-		EventID:       "reconcile:" + res.OutTradeNo + ":" + res.TransactionID,
-		EventType:     "TRANSACTION.SUCCESS",
-		TransactionID: res.TransactionID,
-		OrderID:       res.OutTradeNo,
-		Amount:        float64(res.Amount.Total) / 100,
-		Currency:      res.Amount.Currency,
-		SubExpiresAt:  nil,
-	}
-	if !successAt.IsZero() {
-		event.SubExpiresAt = &successAt
+	event, err := buildReconcileWebhookEvent(res)
+	if err != nil {
+		return fmt.Errorf("build reconcile event: %w", err)
 	}
 	if _, err := s.OnWebhook(ctx, event); err != nil {
 		// Don't stamp last_reconciled_at on failure — we want the next
@@ -1755,6 +1745,52 @@ func isPaypalRenewal(eventType string) bool {
 // subscription activation. nil = never expires (free plan / explicit no-end).
 func subExpiresAtFromWebhook(e WebhookEvent) *time.Time {
 	return e.SubExpiresAt
+}
+
+// buildReconcileWebhookEvent builds the WebhookEvent that the active
+// reconciliation path (`reconcileFromChannel` in GetOrder) feeds into
+// OnWebhook when WeChat's QueryOrder reports the order as SUCCESS.
+//
+// SubExpiresAt is intentionally LEFT NIL. WeChat's QueryOrder response
+// carries `success_time` (when the payment settled — a moment in the
+// past), not a subscription expiry. Reusing it as SubExpiresAt would
+// write subscriptions.expires_at = <past>, and the auth path's
+// `findUsableSubscription` would refuse the next login with
+// ErrSubscriptionExpired even though the user just paid (real-world
+// observed in cn-staging 2026-07-23).
+//
+// This matches parseWeChat's behaviour: WeChat's TRANSACTION.SUCCESS
+// resource block also has no sub_expires_at field today, so the real
+// webhook leaves SubExpiresAt nil already. End-to-end threading of a
+// BFF-computed sub_expires_at through the order row is tracked
+// separately — for now, both paths produce the same subscription
+// shape (never-expires).
+//
+// `res` is checked for nil to keep the helper safe to call from tests
+// that exercise the failure-shape (QueryOrder returning nil) without
+// going through reconcileFromChannel's earlier `res == nil` early-out.
+func buildReconcileWebhookEvent(res *wechat.OrderQueryResult) (WebhookEvent, error) {
+	if res == nil {
+		return WebhookEvent{}, errors.New("nil query result")
+	}
+	if res.TradeState != "SUCCESS" {
+		// Reconcile only invokes the webhook path on SUCCESS; for other
+		// states callers should use the throttle + last_reconciled_at
+		// update and return early. Guard the helper too so a future
+		// caller can't accidentally promote a NOTPAY into a paid event.
+		return WebhookEvent{}, fmt.Errorf("build reconcile: trade_state=%q, want SUCCESS", res.TradeState)
+	}
+	return WebhookEvent{
+		Channel:       "wechat_pay",
+		EventID:       "reconcile:" + res.OutTradeNo + ":" + res.TransactionID,
+		EventType:     "TRANSACTION.SUCCESS",
+		TransactionID: res.TransactionID,
+		OrderID:       res.OutTradeNo,
+		Amount:        float64(res.Amount.Total) / 100,
+		Currency:      res.Amount.Currency,
+		// SubExpiresAt is nil on purpose — see the comment above. Do not
+		// populate from res.SuccessTime (it's a past timestamp).
+	}, nil
 }
 
 func mustJSON(v map[string]any) json.RawMessage {

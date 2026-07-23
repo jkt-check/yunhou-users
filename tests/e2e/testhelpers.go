@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -495,7 +496,18 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	cfg.PaypalAPIBaseLive = ""
 	mv := &middleware.MultiChannelVerifier{
 		Stripe: &middleware.StripeVerifier{Secret: []byte(e2eStripeSecret)},
-		WeChat: &middleware.WeChatPayV3Verifier{APIv3Key: []byte(e2eWeChatKey), MockMode: wechatPayMock},
+		WeChat: &middleware.WeChatPayV3Verifier{
+			APIv3Key: []byte(e2eWeChatKey),
+			MockMode: wechatPayMock,
+			// 2026-07-23: e2e previously relied on the APIv3-key HMAC
+			// scheme that real WeChat has never used. The new
+			// platform-cert RSA verify needs a matching pubkey; signWeChat
+			// uses the e2eWeChatPlatformKey below to produce valid
+			// signatures. Only wired when wechatPayMock is off — mock
+			// mode short-circuits on header presence and never reaches
+			// the key lookup.
+			PlatformKeys: newE2EPlatformKeySource(t),
+		},
 		Alipay: &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
 		Paypal: &middleware.PaypalVerifier{
 			HTTPClient:       &http.Client{Timeout: 2 * time.Second},
@@ -638,11 +650,58 @@ func signStripe(secret string, ts int64, body []byte) string {
 // below remain active.)
 
 // signWeChat produces the four headers WeChat sends, given the body.
-func signWeChat(key []byte, ts int64, nonce, body string) (timestamp, nonceStr, signature string) {
+// 2026-07-23: real WeChat v3 webhooks are RSA-signed with the platform
+// private key (signed-string "<ts>\n<nonce>\n<body>\n"); the APIv3 key
+// is for AES-GCM resource decryption only. Tests now sign with the
+// key wired into wechatPlatformPrivHolder (set by the e2e setup).
+// The `key` arg is kept for back-compat with existing callers but
+// ignored — pass any non-empty byte slice to satisfy the signature.
+func signWeChat(_ []byte, ts int64, nonce, body string) (timestamp, nonceStr, signature string) {
 	tsStr := fmt.Sprintf("%d", ts)
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(tsStr + "\n" + nonce + "\n" + body + "\n"))
-	return tsStr, nonce, base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	privAny := wechatPlatformPrivHolder.Load()
+	if privAny == nil {
+		// Test forgot to set up the verifier — fall back to legacy HMAC
+		// so the failure surfaces as a verifier-side mismatch, not a
+		// nil deref panic.
+		return tsStr, nonce, ""
+	}
+	priv := privAny.(*rsa.PrivateKey)
+	hashed := sha256.Sum256([]byte(tsStr + "\n" + nonce + "\n" + body + "\n"))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hashed[:])
+	if err != nil {
+		return tsStr, nonce, ""
+	}
+	return tsStr, nonce, base64.StdEncoding.EncodeToString(sig)
+}
+
+// newE2EPlatformKeySource returns a PlatformKeySource that resolves any
+// serial to the test WeChat platform public key. Generated once per
+// setup; concurrent-safe.
+var wechatPlatformPrivHolder atomic.Value // *rsa.PrivateKey
+var wechatPlatformPub atomic.Value        // *rsa.PublicKey
+
+func newE2EPlatformKeySource(t *testing.T) *e2ePlatformKeySource {
+	t.Helper()
+	privAny := wechatPlatformPrivHolder.Load()
+	if privAny == nil {
+		priv, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("gen wechat platform key: %v", err)
+		}
+		wechatPlatformPrivHolder.Store(priv)
+		wechatPlatformPub.Store(&priv.PublicKey)
+	}
+	return &e2ePlatformKeySource{}
+}
+
+type e2ePlatformKeySource struct{}
+
+func (e2ePlatformKeySource) PublicKeyFor(_ context.Context, _ string) (*rsa.PublicKey, error) {
+	v := wechatPlatformPub.Load()
+	if v == nil {
+		return nil, errors.New("e2e platform key not initialised")
+	}
+	return v.(*rsa.PublicKey), nil
 }
 
 // signAlipay produces a complete signed form-encoded body ready to POST

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/billing/wechat"
 )
 
 // ChannelSignatureVerifier is the per-channel abstraction. Production wires
@@ -215,23 +217,41 @@ func parseStripeSignatureHeader(h string) (int64, [][]byte, error) {
 }
 
 // ============================================================================
-// WeChat Pay v3 — HMAC + AES-256-GCM resource decryption
+// WeChat Pay v3 — platform-certificate RSA verify + AES-256-GCM decrypt
 // ============================================================================
 
-// WeChatPayV3Verifier verifies WeChat Pay v3 webhooks. HMAC over
-// `<ts>\n<nonce>\n<body>\n`, then handlers decrypt resource.ciphertext
-// with AES-256-GCM (key = APIv3Key).
+// PlatformKeySource resolves a WeChat platform certificate serial
+// (Wechatpay-Serial header) to its RSA public key. Production wires
+// *wechat.PlatformCertManager (fetches /v3/certificates, caches);
+// tests inject a stub.
+type PlatformKeySource interface {
+	PublicKeyFor(ctx context.Context, serial string) (*rsa.PublicKey, error)
+}
+
+// WeChatPayV3Verifier verifies WeChat Pay v3 webhooks. Real WeChat signs
+// callbacks with its platform RSA private key (SHA256-RSA over
+// "<ts>\n<nonce>\n<body>\n"); we verify with the platform certificate's
+// public key resolved via PlatformKeys. Handlers then decrypt
+// resource.ciphertext with AES-256-GCM (key = APIv3Key).
 //
-// Headers: Wechatpay-Signature, Wechatpay-Timestamp, Wechatpay-Nonce.
+// 2026-07-23: this verifier used to HMAC-SHA256 the payload with the
+// APIv3 key — a scheme WeChat has never used — so every real
+// TRANSACTION.SUCCESS failed verification (400), WeChat's retries
+// exhausted, and paid orders never reconciled on cn-staging. The APIv3
+// key is for AES-GCM decryption ONLY.
+//
+// Headers: Wechatpay-Signature, Wechatpay-Timestamp, Wechatpay-Nonce,
+// Wechatpay-Serial.
 type WeChatPayV3Verifier struct {
-	APIv3Key     []byte // 32 bytes
+	APIv3Key     []byte // 32 bytes; AES-GCM only (DecryptResource)
+	PlatformKeys PlatformKeySource
 	ReplayWindow time.Duration
 
-	// MockMode (driven by WECHAT_PAY_MOCK=1) bypasses the HMAC match
-	// while still enforcing that all three headers are present and the
-	// timestamp is inside the replay window. Production MUST leave
-	// this false; the constant absence of a signature match would let
-	// any caller drive the order-paid → subscription flow.
+	// MockMode (driven by WECHAT_PAY_MOCK=1) bypasses the signature match
+	// while still enforcing that all three signature headers are present
+	// and the timestamp is inside the replay window. Production MUST
+	// leave this false; otherwise any caller could drive the order-paid →
+	// subscription flow with header presence alone.
 	MockMode bool
 }
 
@@ -283,18 +303,43 @@ func (v *WeChatPayV3Verifier) VerifySignature(channel string, body []byte, heade
 	if v.MockMode {
 		// Mock mode: header presence + timestamp window are enough.
 		// Production rejects on this path because callers can't have
-		// the v3 HMAC key without registered merchant credentials —
-		// any inbound mock payload in prod is a misconfigured env.
+		// the platform private key — any inbound mock payload in prod
+		// is a misconfigured env.
 		return nil
 	}
+	if v.PlatformKeys == nil {
+		// Real mode without a platform-key source is a wiring bug;
+		// treat as transient so WeChat retries after the deploy is
+		// fixed rather than permanently dropping the notification.
+		return errors.New("wechat verifier: PlatformKeys not wired")
+	}
+	serial := headers["Wechatpay-Serial"]
+	if serial == "" {
+		return ErrInvalidSignature
+	}
+	// 10s cap: PublicKeyFor may fetch /v3/certificates upstream on a
+	// cache miss; the middleware has no request ctx, so bound it here.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pub, err := v.PlatformKeys.PublicKeyFor(ctx, serial)
+	if err != nil {
+		if errors.Is(err, wechat.ErrUnknownPlatformSerial) {
+			// Unknown serial even after a refresh: could be a forged
+			// delivery, or WeChat rotating to a cert we can't fetch
+			// yet. Return transient (500) so legitimate deliveries
+			// retry after rotation settles; forged ones just retry
+			// harmlessly against the rate-limited cert fetch.
+			return fmt.Errorf("wechat platform serial unknown: %w", err)
+		}
+		return fmt.Errorf("wechat platform key lookup: %w", err)
+	}
 	toSign := tsStr + "\n" + nonce + "\n" + string(body) + "\n"
-	mac := hmac.New(sha256.New, v.APIv3Key)
-	mac.Write([]byte(toSign))
-	got, err := base64.StdEncoding.DecodeString(sigB64)
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
 	if err != nil {
 		return fmt.Errorf("%w: bad base64 sig", ErrInvalidSignature)
 	}
-	if !hmac.Equal(mac.Sum(nil), got) {
+	hashed := sha256.Sum256([]byte(toSign))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hashed[:], sig); err != nil {
 		return ErrInvalidSignature
 	}
 	return nil

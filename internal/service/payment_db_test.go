@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/repo"
 )
 
@@ -74,6 +75,11 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 
 func newTestPaymentService(t *testing.T, db *sqlx.DB) *PaymentService {
 	t.Helper()
+	return newTestPaymentServiceWith(t, db, nil)
+}
+
+func newTestPaymentServiceWith(t *testing.T, db *sqlx.DB, client wechatClient) *PaymentService {
+	t.Helper()
 	return NewPaymentService(
 		db,
 		repo.NewOrderRepo(db),
@@ -84,10 +90,8 @@ func newTestPaymentService(t *testing.T, db *sqlx.DB) *PaymentService {
 		repo.NewUserRepo(db),
 		repo.NewWebhookEventRepo(db),
 		repo.NewAuditLogRepo(db),
-		&stubRefundAPI{}, nil,
-
+		&stubRefundAPI{}, client,
 		30*time.Minute)
-
 }
 
 func mustNewUUID() string { return uuid.New().String() }
@@ -265,6 +269,106 @@ func TestPaymentService_GetOrder_NotFound(t *testing.T) {
 	_, err := svc.GetOrder(context.Background(), mustNewUUID(), "any")
 	if !errors.Is(err, ErrOrderNotFound) {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// TestPaymentService_GetOrder_ReconcilesPaidWeChatOrder pins the active
+// reconcile path: a pending wechat_pay order whose underlying WeChat
+// state has flipped to SUCCESS is paid + subscription-activated just
+// because the FE polled GetOrder (the webhook was lost / never arrived
+// / failed verify before the platform-cert fix). Without reconcile,
+// the user would see "still pending" forever.
+func TestPaymentService_GetOrder_ReconcilesPaidWeChatOrder(t *testing.T) {
+	db := setupPaymentDB(t)
+
+	queryCalled := false
+	stub := &stubWechat{
+		mockMode: false, // non-mock so shouldReconcile engages
+		mchID:    "1900000109",
+		appID:    "wx_test_app",
+		unifiedFn: func(_ context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return &wechat.UnifiedOrderResponse{
+				OutTradeNo: req.OutTradeNo,
+				CodeURL:    "weixin://wxpay/bizpayurl?pr=" + req.OutTradeNo,
+			}, nil
+		},
+		queryFn: func(_ context.Context, outTradeNo string) (*wechat.OrderQueryResult, error) {
+			queryCalled = true
+			return &wechat.OrderQueryResult{
+				OutTradeNo:    outTradeNo,
+				TransactionID: "wx_txn_001",
+				TradeState:    "SUCCESS",
+				SuccessTime:   time.Now().UTC().Format(time.RFC3339),
+				Amount: struct {
+					Total    int64  `json:"total"`
+					Currency string `json:"currency"`
+				}{Total: 2900, Currency: "CNY"},
+			}, nil
+		},
+	}
+	svc := newTestPaymentServiceWith(t, db, stub)
+
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+
+	// Force last_reconciled_at into the past so shouldReconcile engages
+	// on the very next GetOrder (CreateOrder stamps it to now() so the
+	// first poll after CreateOrder doesn't hit WeChat).
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET last_reconciled_at = now() - interval '1 minute' WHERE id = $1`, order.ID); err != nil {
+		t.Fatalf("age last_reconciled_at: %v", err)
+	}
+
+	got, err := svc.GetOrder(context.Background(), order.ID, uid)
+	if err != nil {
+		t.Fatalf("GetOrder: %v", err)
+	}
+	if !queryCalled {
+		t.Fatalf("expected wechat.QueryOrder to be called during GetOrder")
+	}
+	if got.Status != "paid" {
+		t.Errorf("after reconcile, order.Status = %q, want paid", got.Status)
+	}
+}
+
+// TestPaymentService_GetOrder_ReconcileThrottled pins the rate-limit:
+// a second GetOrder within reconcileMinInterval must NOT trigger a
+// second upstream QueryOrder. The first one stamps last_reconciled_at
+// = now; the second one sees < reconcileMinInterval since then and
+// short-circuits.
+func TestPaymentService_GetOrder_ReconcileThrottled(t *testing.T) {
+	db := setupPaymentDB(t)
+	var queryCalls int
+	stub := &stubWechat{
+		mockMode: false,
+		appID:    "wx_test_app",
+		unifiedFn: func(_ context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return &wechat.UnifiedOrderResponse{OutTradeNo: req.OutTradeNo, CodeURL: "weixin://x"}, nil
+		},
+		queryFn: func(_ context.Context, outTradeNo string) (*wechat.OrderQueryResult, error) {
+			queryCalls++
+			return &wechat.OrderQueryResult{OutTradeNo: outTradeNo, TradeState: "NOTPAY"}, nil
+		},
+	}
+	svc := newTestPaymentServiceWith(t, db, stub)
+
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET last_reconciled_at = now() - interval '1 minute' WHERE id = $1`, order.ID); err != nil {
+		t.Fatalf("age last_reconciled_at: %v", err)
+	}
+	if _, err := svc.GetOrder(context.Background(), order.ID, uid); err != nil {
+		t.Fatalf("first GetOrder: %v", err)
+	}
+	if _, err := svc.GetOrder(context.Background(), order.ID, uid); err != nil {
+		t.Fatalf("second GetOrder: %v", err)
+	}
+	if queryCalls != 1 {
+		t.Errorf("expected 1 QueryOrder (second poll throttled), got %d", queryCalls)
 	}
 }
 

@@ -31,6 +31,7 @@ type ClientIface interface {
 	MchID() string
 	AppID() string
 	UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*UnifiedOrderResponse, error)
+	QueryOrder(ctx context.Context, outTradeNo string) (*OrderQueryResult, error)
 }
 
 // HTTPRequest / HTTPResponse are the minimal shapes the real-mode
@@ -218,6 +219,75 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 		return nil, fmt.Errorf("%w: empty code_url", ErrWeChatUnifiedOrderRejected)
 	}
 	return &UnifiedOrderResponse{OutTradeNo: req.OutTradeNo, CodeURL: out.CodeURL}, nil
+}
+
+// OrderQueryResult is the parsed shape of
+// GET /v3/pay/transactions/out-trade-no/{out_trade_no}. Only the fields
+// yunhou-users needs for reconciliation are decoded; WeChat returns
+// more (payer, promotion_detail, ...).
+type OrderQueryResult struct {
+	OutTradeNo    string `json:"out_trade_no"`
+	TransactionID string `json:"transaction_id"`
+	TradeState    string `json:"trade_state"` // SUCCESS / NOTPAY / CLOSED / REFUND / ...
+	SuccessTime   string `json:"success_time"`
+	Amount        struct {
+		Total    int64  `json:"total"` // fen
+		Currency string `json:"currency"`
+	} `json:"amount"`
+}
+
+// QueryOrder fetches the current state of an order from WeChat. This is
+// the ACTIVE reconciliation path: the webhook is the primary signal,
+// but if a webhook is lost (or was rejected before the platform-cert
+// verifier fix of 2026-07-23), the FE's order-status poll drives this
+// query and the service layer flips the order paid from the answer.
+//
+// Mock mode returns a deterministic NOTPAY so mock-mode behaviour is
+// unchanged (mock payments reconcile via the mock webhook).
+func (c *Client) QueryOrder(ctx context.Context, outTradeNo string) (*OrderQueryResult, error) {
+	if outTradeNo == "" {
+		return nil, errors.New("outTradeNo is required")
+	}
+	if c.MockMode {
+		return &OrderQueryResult{OutTradeNo: outTradeNo, TradeState: "NOTPAY"}, nil
+	}
+
+	reqPath := "/v3/pay/transactions/out-trade-no/" + outTradeNo + "?mchid=" + c.Signer.MchID
+	auth, err := c.Signer.BuildAuthHeader("GET", reqPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build auth: %w", err)
+	}
+
+	resp, err := c.HTTPDoer.Do(ctx, &HTTPRequest{
+		Method: "GET",
+		URL:    c.BaseURL + reqPath,
+		Headers: map[string]string{
+			"Authorization": auth,
+			"Accept":        "application/json",
+			"User-Agent":    userAgent,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrWeChatNetwork, err)
+	}
+	if resp.StatusCode >= 500 {
+		return nil, fmt.Errorf("%w: %d", ErrWeChatUpstream, resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		var errEnv struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(resp.Body, &errEnv)
+		return nil, fmt.Errorf("%w: %d %s: %s", ErrWeChatUnifiedOrderRejected,
+			resp.StatusCode, errEnv.Code, errEnv.Message)
+	}
+
+	var out OrderQueryResult
+	if err := json.Unmarshal(resp.Body, &out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &out, nil
 }
 
 // ErrWeChatUnifiedOrderRejected — WeChat returned a 4xx response (or a

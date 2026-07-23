@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
@@ -25,6 +26,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yunhou/users/internal/billing/wechat"
 
 	"github.com/gin-gonic/gin"
 )
@@ -221,25 +224,57 @@ func TestStripeVerifier_DirectCallAnyChannel(t *testing.T) {
 func TestWeChatPayV3Verifier_Accept(t *testing.T) {
 	t.Parallel()
 
-	key := bytes.Repeat([]byte("k"), 32) // 32-byte test key
-	v := &WeChatPayV3Verifier{APIv3Key: key}
+	// 2026-07-23: verifier switched from APIv3-key HMAC to WeChat
+	// platform-cert RSA. Sign with a fresh key, expose via stub
+	// PlatformKeySource.
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &WeChatPayV3Verifier{
+		APIv3Key:     bytes.Repeat([]byte("k"), 32),
+		PlatformKeys: &stubKeySource{pub: &priv.PublicKey},
+	}
 	body := []byte(`{"id":"evt_1"}`)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	nonce := "abc123"
 
 	toSign := ts + "\n" + nonce + "\n" + string(body) + "\n"
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(toSign))
-	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	hashed := sha256.Sum256([]byte(toSign))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hashed[:])
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	headers := map[string]string{
-		"Wechatpay-Signature": sig,
+		"Wechatpay-Signature": base64.StdEncoding.EncodeToString(sig),
 		"Wechatpay-Timestamp": ts,
 		"Wechatpay-Nonce":     nonce,
+		"Wechatpay-Serial":    "TEST_SERIAL",
 	}
 	if err := v.VerifySignature("wechat_pay", body, headers); err != nil {
 		t.Errorf("valid wechat sig rejected: %v", err)
 	}
+}
+
+// stubKeySource is a tiny test-only PlatformKeySource. Production wires
+// *wechat.PlatformCertManager; tests use this to pin RSA keys and force
+// transient/unknown-serial paths without spinning up a /v3/certificates
+// server.
+type stubKeySource struct {
+	pub     *rsa.PublicKey
+	serial  string // non-empty → return UnknownPlatformSerial
+	lookupErr error
+}
+
+func (s *stubKeySource) PublicKeyFor(_ context.Context, serial string) (*rsa.PublicKey, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
+	if s.serial != "" && serial == s.serial {
+		return nil, wechat.ErrUnknownPlatformSerial
+	}
+	return s.pub, nil
 }
 
 func TestWeChatPayV3Verifier_DecryptResource(t *testing.T) {
@@ -1145,31 +1180,47 @@ func TestWeChatPayV3_VerifySignature_ReplayWindowOut(t *testing.T) {
 // failure on the signature header.
 func TestWeChatPayV3_VerifySignature_BadBase64Sig(t *testing.T) {
 	t.Parallel()
-	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &WeChatPayV3Verifier{
+		APIv3Key:     bytes.Repeat([]byte("k"), 32),
+		PlatformKeys: &stubKeySource{pub: &priv.PublicKey},
+	}
 	headers := map[string]string{
 		"Wechatpay-Signature": "!!!not-base64!!!",
 		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
 		"Wechatpay-Nonce":     "n",
+		"Wechatpay-Serial":    "S",
 	}
-	err := v.VerifySignature("wechat_pay", []byte("{}"), headers)
+	err = v.VerifySignature("wechat_pay", []byte("{}"), headers)
 	if !errors.Is(err, ErrInvalidSignature) || !strings.Contains(err.Error(), "bad base64") {
 		t.Errorf("expected ErrInvalidSignature/bad-base64, got %v", err)
 	}
 }
 
-// TestWeChatPayV3_VerifySignature_HMACMismatch covers the final equality-fail
-// path when the signature decoded successfully but didn't match the recomputed
-// HMAC.
+// TestWeChatPayV3_VerifySignature_HMACMismatch covers the signature-mismatch
+// path when the signature decoded successfully but didn't match the
+// recomputed hash.
 func TestWeChatPayV3_VerifySignature_HMACMismatch(t *testing.T) {
 	t.Parallel()
-	v := &WeChatPayV3Verifier{APIv3Key: bytes.Repeat([]byte("k"), 32)}
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &WeChatPayV3Verifier{
+		APIv3Key:     bytes.Repeat([]byte("k"), 32),
+		PlatformKeys: &stubKeySource{pub: &priv.PublicKey},
+	}
 	headers := map[string]string{
-		"Wechatpay-Signature": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAA}, 32)),
+		"Wechatpay-Signature": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAA}, 256)),
 		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
 		"Wechatpay-Nonce":     "n",
+		"Wechatpay-Serial":    "S",
 	}
 	if err := v.VerifySignature("wechat_pay", []byte("{}"), headers); !errors.Is(err, ErrInvalidSignature) {
-		t.Errorf("expected ErrInvalidSignature on HMAC mismatch, got %v", err)
+		t.Errorf("expected ErrInvalidSignature on signature mismatch, got %v", err)
 	}
 }
 
@@ -1475,15 +1526,49 @@ func TestWeChatPayV3Verifier_MockMode(t *testing.T) {
 // short-circuit does NOT weaken the real path: an inbound header set
 // with a wrong signature must still return ErrInvalidSignature when
 // MockMode is false.
-func TestWeChatPayV3Verifier_RealMode_RequiresValidHMAC(t *testing.T) {
+func TestWeChatPayV3Verifier_RealMode_RequiresValidSignature(t *testing.T) {
 	t.Parallel()
-	v := &WeChatPayV3Verifier{MockMode: false, APIv3Key: []byte("real-key-32-bytes-of-padding-x")}
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &WeChatPayV3Verifier{
+		MockMode:     false,
+		APIv3Key:     []byte("real-key-32-bytes-of-padding-x"),
+		PlatformKeys: &stubKeySource{pub: &priv.PublicKey},
+	}
 	hdr := map[string]string{
 		"Wechatpay-Signature": "not-the-right-sig",
 		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
 		"Wechatpay-Nonce":     "nonce-y",
+		"Wechatpay-Serial":    "S",
 	}
 	if !errors.Is(v.VerifySignature("wechat_pay", []byte("{}"), hdr), ErrInvalidSignature) {
 		t.Errorf("real mode: wrong sig must still be rejected")
+	}
+}
+
+// TestWeChatPayV3_UnknownPlatformSerial_Transient verifies the unknown-serial
+// path returns a NON-sentinel error (500 retry) rather than
+// ErrInvalidSignature (400 stop). A forged delivery with a random serial
+// must not stop WeChat's retries during a legitimate cert rotation.
+func TestWeChatPayV3_UnknownPlatformSerial_Transient(t *testing.T) {
+	t.Parallel()
+	v := &WeChatPayV3Verifier{
+		APIv3Key:     bytes.Repeat([]byte("k"), 32),
+		PlatformKeys: &stubKeySource{serial: "ROTATING_SERIAL"},
+	}
+	hdr := map[string]string{
+		"Wechatpay-Signature": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAA}, 256)),
+		"Wechatpay-Timestamp": strconv.FormatInt(time.Now().Unix(), 10),
+		"Wechatpay-Nonce":     "n",
+		"Wechatpay-Serial":    "ROTATING_SERIAL",
+	}
+	err := v.VerifySignature("wechat_pay", []byte("{}"), hdr)
+	if errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("unknown serial must be transient, not ErrInvalidSignature (400), got %v", err)
+	}
+	if err == nil {
+		t.Errorf("expected non-nil error")
 	}
 }

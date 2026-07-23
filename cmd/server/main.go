@@ -47,6 +47,8 @@ func main() {
 	// `s.wechat != nil` guard in PaymentService.CreateOrder and panics
 	// when the pre-auth path calls IsMockMode() on a nil receiver.
 	var wechatClient wechat.ClientIface
+	var wechatHTTPDoer wechat.HTTPDoer
+	var wechatSigner *wechat.Signer
 	if cfg.WeChatPayMock {
 		wechatClient = &wechat.Client{MockMode: true}
 	} else if cfg.WeChatPayMchPrivateKeyPath != "" {
@@ -58,13 +60,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("wechat: load cert %q: %v", cfg.WeChatPayMchCertPath, err)
 		}
+		wechatHTTPDoer = newWechatHTTPAdapter(10 * time.Second)
+		wechatSigner = &wechat.Signer{MchID: cfg.WeChatPayMchID, SerialNo: serial, PrivateKey: pk}
 		wechatClient = &wechat.Client{
 			MockMode:   false,
-			Signer:     &wechat.Signer{MchID: cfg.WeChatPayMchID, SerialNo: serial, PrivateKey: pk},
+			Signer:     wechatSigner,
 			AppIDValue: cfg.WeChatPayAppID,
 			NotifyURL:  cfg.WeChatPayNotifyURL,
 			BaseURL:    "https://api.mch.weixin.qq.com",
-			HTTPDoer:   newWechatHTTPAdapter(10 * time.Second),
+			HTTPDoer:   wechatHTTPDoer,
 		}
 	} else {
 		// Real mode + no private key path = the deployment chose not to
@@ -142,7 +146,7 @@ func main() {
 
 	// Webhook signature verifier. Each channel is optional — empty secret
 	// means that channel returns 404 (not configured).
-	webhookVerifier := buildWebhookVerifier(cfg)
+	webhookVerifier := buildWebhookVerifier(cfg, wechatSigner, wechatHTTPDoer)
 
 	// Provider-token plumbing. PayPal's base URL tracks PAYPAL_ENV so the
 	// /apps/:id/provider-token/paypal endpoint hits the same environment as
@@ -241,7 +245,7 @@ func main() {
 //
 // Alipay's public key is loaded from ALIPAY_PUBLIC_KEY_PATH. A missing file
 // is treated as "Alipay not configured" — same effect as empty secret.
-func buildWebhookVerifier(cfg *config.Config) middleware.ChannelSignatureVerifier {
+func buildWebhookVerifier(cfg *config.Config, wechatSigner *wechat.Signer, wechatDoer wechat.HTTPDoer) middleware.ChannelSignatureVerifier {
 	mv := &middleware.MultiChannelVerifier{}
 
 	if cfg.StripeWebhookSecret != "" {
@@ -253,15 +257,25 @@ func buildWebhookVerifier(cfg *config.Config) middleware.ChannelSignatureVerifie
 	// runs with WECHAT_PAY_MOCK=1 and an empty WECHAT_PAY_API_V3_KEY
 	// (mock doesn't need a real key), so the guard left mv.WeChat nil
 	// and the middleware returned ErrUnsupportedChannel (404) on
-	// every inbound POST. The mock verifier doesn't use the key for
-	// HMAC (it short-circuits on the Wechatpay-Signature header), so
-	// building it with an empty key in mock mode is safe. Real mode
-	// still has the real key set; the mock flag is just false.
+	// every inbound POST. The mock verifier doesn't need the key
+	// (it short-circuits on header presence), so building it with
+	// an empty key in mock mode is safe. Real mode also requires a
+	// platform-key source (signer+doer) for the new RSA verify path;
+	// without it the verifier returns transient 500 on every call.
 	if cfg.WeChatAPIv3Key != "" || cfg.WeChatPayMock {
-		mv.WeChat = &middleware.WeChatPayV3Verifier{
+		verifier := &middleware.WeChatPayV3Verifier{
 			APIv3Key: []byte(cfg.WeChatAPIv3Key),
 			MockMode: cfg.WeChatPayMock,
 		}
+		if wechatSigner != nil && wechatDoer != nil && cfg.WeChatAPIv3Key != "" {
+			verifier.PlatformKeys = &wechat.PlatformCertManager{
+				Signer:   wechatSigner,
+				APIv3Key: []byte(cfg.WeChatAPIv3Key),
+				BaseURL:  "https://api.mch.weixin.qq.com",
+				HTTPDoer: wechatDoer,
+			}
+		}
+		mv.WeChat = verifier
 	}
 	if cfg.AlipayPublicKeyPath != "" {
 		if pemBytes, err := os.ReadFile(cfg.AlipayPublicKeyPath); err == nil {

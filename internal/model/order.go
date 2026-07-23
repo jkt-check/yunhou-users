@@ -20,6 +20,12 @@ type Order struct {
 	ExpiresAt time.Time `db:"expires_at" json:"expires_at"` // 30 min default; sweeper flips pending→expired after this
 	CreatedAt time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
+	// LastReconciledAt is stamped whenever GetOrder drives the active
+	// channel-query reconcile path (wechat_pay, non-mock). Used as a
+	// rate-limit guard so 500ms FE polls collapse to ~1 outbound call
+	// per reconcileMinInterval per order. Not surfaced in JSON — it's
+	// an internal reconcile timestamp, not a user-visible field.
+	LastReconciledAt time.Time `db:"last_reconciled_at" json:"-"`
 	// ProviderIntent holds per-channel metadata written after a
 	// channel-specific pre-auth (wechat_pay → {appid, mchid, code_url,
 	// out_trade_no}; paypal/alipay populate their own keys). Exposed via

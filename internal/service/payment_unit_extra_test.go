@@ -226,6 +226,7 @@ type stubWechat struct {
 	mchID     string
 	appID     string
 	unifiedFn func(context.Context, wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
+	queryFn   func(context.Context, string) (*wechat.OrderQueryResult, error)
 	called    int
 	gotReq    wechat.UnifiedOrderRequest
 }
@@ -237,6 +238,12 @@ func (s *stubWechat) UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRe
 	s.called++
 	s.gotReq = req
 	return s.unifiedFn(ctx, req)
+}
+func (s *stubWechat) QueryOrder(ctx context.Context, outTradeNo string) (*wechat.OrderQueryResult, error) {
+	if s.queryFn == nil {
+		return &wechat.OrderQueryResult{OutTradeNo: outTradeNo, TradeState: "NOTPAY"}, nil
+	}
+	return s.queryFn(ctx, outTradeNo)
 }
 
 func newPaymentServiceForCreateOrder(client wechatClient) (*PaymentService, *stubOrderRepoLookup) {

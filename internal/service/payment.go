@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ type wechatClient interface {
 	MchID() string
 	AppID() string
 	UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
+	QueryOrder(ctx context.Context, outTradeNo string) (*wechat.OrderQueryResult, error)
 }
 
 // ErrWechatPayNotConfigured is returned by CreateOrder when channel="wechat_pay"
@@ -273,6 +275,14 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intentBytes); err != nil {
 			return order, fmt.Errorf("persist provider intent: %w", err)
 		}
+		// Stamp LastReconciledAt = now so the first FE poll after
+		// CreateOrder doesn't immediately hit WeChat (orders typically
+		// sit pending for minutes while the user scans the QR; we don't
+		// need an outbound call in that window). Set on the in-memory
+		// order so tests that don't persist (or that use a nil
+		// sqlx.DB) still see the new gate; the default NOT NULL now() on
+		// the column covers orders that go through the normal DB path.
+		order.LastReconciledAt = time.Now()
 		// ProviderIntent is *json.RawMessage so a SQL NULL column scans
 		// into a nil pointer, which then trips omitempty on the JSON
 		// response. The marshalled intent is addressable here (we just
@@ -313,9 +323,29 @@ func (s *PaymentService) CancelOrder(ctx context.Context, orderID, userID string
 // Reads (with ownership check)
 // ============================================================================
 
+// reconcileMinInterval bounds the active-query rate when a pending order
+// has no payments yet: each caller (FE polling at 500ms) would otherwise
+// hit WeChat on every poll, which WeChat rate-limits aggressively.
+// Real production deployments should also throttle by user; we keep
+// the per-order throttle simple and rely on the FE poll cadence for
+// user-side throttle.
+const reconcileMinInterval = 10 * time.Second
+
 // GetOrder returns an order by ID, or ErrOrderNotFound if missing or
 // not owned by the caller. Internal-app callers (via SetOrderInternal)
 // bypass the ownership check.
+//
+// Active reconciliation (2026-07-23): for a still-pending wechat_pay
+// order with no payments yet, GetOrder also calls
+// wechat.QueryOrder(out_trade_no) at most once per reconcileMinInterval
+// and, on TradeState=SUCCESS, drives the order through the same
+// payment-paid → subscription-activated pipeline that the webhook
+// uses. The reconcile is the safety net for the 2026-07-22 bug
+// where every webhook failed signature verification (HMAC with the
+// wrong key) and paid orders never reconciled; with the new
+// platform-cert RSA verifier webhooks usually land, but a transient
+// WeChat outage or a WeChat cert rotation can still drop a delivery,
+// and the FE will keep polling until it sees paid.
 func (s *PaymentService) GetOrder(ctx context.Context, orderID, userID string) (*model.Order, error) {
 	o, err := s.orderRepo.FindByID(ctx, orderID)
 	if err != nil {
@@ -327,7 +357,110 @@ func (s *PaymentService) GetOrder(ctx context.Context, orderID, userID string) (
 	if o.UserID != userID {
 		return nil, ErrOrderNotFound // hide existence from non-owner
 	}
+
+	if s.shouldReconcile(ctx, o) {
+		if rerr := s.reconcileFromChannel(ctx, o); rerr != nil {
+			// Reconcile failure must not block the read; the FE poll
+			// retries. Log so an operator can spot a sustained upstream
+			// outage.
+			log.Printf("payment reconcile failed for order=%s: %v", o.ID, rerr)
+		} else {
+			// Re-read so the response reflects the post-reconcile state.
+			if refreshed, ferr := s.orderRepo.FindByID(ctx, orderID); ferr == nil {
+				o = refreshed
+			}
+		}
+	}
 	return o, nil
+}
+
+// shouldReconcile gates the active QueryOrder path. Conditions:
+//   - status still pending/expired (terminal states have nothing to gain)
+//   - the order carries a wechat provider_intent block (every wechat_pay
+//     order does; PayPal/Alipay orders have their own reconciliation)
+//   - last_reconciled_at > reconcileMinInterval ago, so 500ms FE polls
+//     collapse to ~1 outbound call per 10s per order
+//   - wechat client is wired (non-nil) AND not in mock mode (mock mode
+//     already short-circuits via the mock webhook)
+func (s *PaymentService) shouldReconcile(ctx context.Context, o *model.Order) bool {
+	if o.Status != "pending" && o.Status != "expired" {
+		return false
+	}
+	if s.wechat == nil || s.wechat.IsMockMode() {
+		return false
+	}
+	if time.Since(o.LastReconciledAt) < reconcileMinInterval {
+		return false
+	}
+	// WeChat orders always write provider_intent.appid; PayPal/Alipay
+	// orders carry different keys. A nil provider_intent is rare (would
+	// mean a wechat_pay order that failed pre-auth, which the handler
+	// already 4xx'd) — skip silently.
+	if o.ProviderIntent == nil {
+		return false
+	}
+	var intent struct {
+		AppID string `json:"appid"`
+	}
+	if err := json.Unmarshal(*o.ProviderIntent, &intent); err != nil || intent.AppID == "" {
+		return false
+	}
+	return true
+}
+
+// reconcileFromChannel queries WeChat for the order's current state and,
+// if SUCCESS, dispatches the same payment-paid handler that the webhook
+// would. Errors are returned to the caller (GetOrder logs them); the
+// reconcile is idempotent — re-running it on an already-paid order is a
+// no-op (no payments row, then payments-insert dedupe, then
+// activateSubscriptionOnTx UPSERT, all safe).
+func (s *PaymentService) reconcileFromChannel(ctx context.Context, o *model.Order) error {
+	if o.ProviderIntent == nil {
+		// No pre-auth payload: nothing to query WeChat with. Skip
+		// silently (this can happen for non-wechat channels, but the
+		// caller already gates on channel == wechat_pay).
+		return nil
+	}
+	var intent struct {
+		OutTradeNo string `json:"out_trade_no"`
+	}
+	if err := json.Unmarshal(*o.ProviderIntent, &intent); err != nil || intent.OutTradeNo == "" {
+		// Malformed provider_intent (or no out_trade_no). Skip rather
+		// than 500; the order would have failed earlier if out_trade_no
+		// was genuinely missing.
+		return nil
+	}
+	res, err := s.wechat.QueryOrder(ctx, intent.OutTradeNo)
+	if err != nil {
+		return err
+	}
+	// Stamp LastReconciledAt regardless of outcome so a persistent
+	// NOTPAY does not turn every poll into an outbound call.
+	if _, err := s.db.ExecContext(ctx, `UPDATE orders SET last_reconciled_at = now() WHERE id = $1`, o.ID); err != nil {
+		return fmt.Errorf("stamp last_reconciled_at: %w", err)
+	}
+	if res == nil || res.TradeState != "SUCCESS" {
+		return nil
+	}
+	// Treat as a TRANSACTION.SUCCESS webhook: same handler, same
+	// dedupe (eventID is derived from WeChat's transaction_id so a
+	// genuine webhook that arrives later will dedupe naturally).
+	successAt, _ := time.Parse(time.RFC3339, res.SuccessTime)
+	event := WebhookEvent{
+		Channel:       "wechat_pay",
+		EventID:       "reconcile:" + res.OutTradeNo + ":" + res.TransactionID,
+		EventType:     "TRANSACTION.SUCCESS",
+		TransactionID: res.TransactionID,
+		OrderID:       res.OutTradeNo,
+		Amount:        float64(res.Amount.Total) / 100,
+		Currency:      res.Amount.Currency,
+		SubExpiresAt:  nil,
+	}
+	if !successAt.IsZero() {
+		event.SubExpiresAt = &successAt
+	}
+	_, err = s.OnWebhook(ctx, event)
+	return err
 }
 
 // ListUserPayments returns payments for orders owned by userID.

@@ -426,6 +426,7 @@ func TestWebhook_WeChat_PaymentSucceeded(t *testing.T) {
 		"/webhooks/payment/wechat_pay", string(body),
 		map[string]string{
 			"Wechatpay-Signature": sig,
+			"Wechatpay-Serial":    "E2E_PLATFORM",
 			"Wechatpay-Timestamp": strconv.FormatInt(ts, 10),
 			"Wechatpay-Nonce":     nonce,
 			"Content-Type":        "application/json",
@@ -553,6 +554,7 @@ func TestWebhook_WeChat_PaymentFailed(t *testing.T) {
 		"/webhooks/payment/wechat_pay", string(body),
 		map[string]string{
 			"Wechatpay-Signature": sig,
+			"Wechatpay-Serial":    "E2E_PLATFORM",
 			"Wechatpay-Timestamp": strconv.FormatInt(ts, 10),
 			"Wechatpay-Nonce":     nonce,
 			"Content-Type":        "application/json",

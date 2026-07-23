@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -75,6 +76,14 @@ type PlatformCertManager struct {
 	mu        sync.Mutex
 	certs     map[string]*rsa.PublicKey // serial_no → public key
 	fetchedAt time.Time
+
+	// refreshing is a CAS gate that ensures at most ONE goroutine runs
+	// refresh() at a time across the whole process. Without it, a burst
+	// of webhook deliveries with random serials would each pass the
+	// minFetchInterval check (gate becomes true for all of them when
+	// fetchedAt is old) and each issue their own /v3/certificates call —
+	// converting a single WeChat-side incident into N upstream requests.
+	refreshing atomic.Bool
 }
 
 // platformCertMaxAge caps how long a cached cert set is trusted without
@@ -103,13 +112,21 @@ func (m *PlatformCertManager) PublicKeyFor(ctx context.Context, serial string) (
 		m.mu.Unlock()
 		return key, nil
 	}
-	// Miss (or stale cache). Refresh, but not more often than
-	// platformCertMinFetchInterval to avoid amplifying forged serials.
-	refresh := time.Since(m.fetchedAt) >= platformCertMinFetchInterval
+	// Miss (or stale cache). Try to win the single-flight gate so only
+	// one goroutine issues /v3/certificates at a time. Other concurrent
+	// callers either (a) lose the CAS and spin-wait for the in-flight
+	// refresh to finish, then re-read the cache, or (b) lose the rate-
+	// limit gate (already refreshed within platformCertMinFetchInterval)
+	// and skip the refresh entirely. Either way, the upstream is hit
+	// at most once per cache-miss event regardless of goroutine count.
+	canRefresh := time.Since(m.fetchedAt) >= platformCertMinFetchInterval
 	m.mu.Unlock()
 
-	if refresh {
-		if err := m.refresh(ctx); err != nil {
+	if canRefresh && m.refreshing.CompareAndSwap(false, true) {
+		// We're the designated refresher.
+		err := m.refresh(ctx)
+		m.refreshing.Store(false)
+		if err != nil {
 			// Refresh failed. A cached-but-stale key is still
 			// cryptographically valid (platform certs live ~5 years;
 			// maxAge is a freshness policy, not certificate expiry), so
@@ -127,11 +144,15 @@ func (m *PlatformCertManager) PublicKeyFor(ctx context.Context, serial string) (
 			}
 			return nil, err
 		}
-		// refresh() already stamps m.fetchedAt = time.Now() on success.
-		// If the requested serial is still missing (e.g. WeChat just
-		// rotated to a cert we can't fetch yet), the next miss within
-		// the rate-limit window short-circuits below without another
-		// upstream call.
+	} else if canRefresh {
+		// Another goroutine is already refreshing. Spin-wait for it to
+		// finish so we read its cache (which may contain the serial we
+		// just missed). Cap the wait at the fetch timeout so a stuck
+		// upstream doesn't wedge the verifier.
+		deadline := time.Now().Add(10 * time.Second)
+		for m.refreshing.Load() && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 
 	m.mu.Lock()

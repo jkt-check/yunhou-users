@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -91,6 +92,51 @@ func TestPlatformCertManager_RefreshFailure_UsesStaleCache(t *testing.T) {
 	}
 	if stub.calls.Load() == 0 {
 		t.Errorf("expected an upstream refresh attempt")
+	}
+}
+
+// TestPlatformCertManager_ConcurrentMisses_OneRefresh pins that a burst
+// of concurrent goroutines hitting an empty cache triggers exactly ONE
+// upstream /v3/certificates call, not N. Without the single-flight
+// gate (review N1 from the 2026-07-23 independent review), the
+// non-atomic time.Since + refresh pair would let every goroutine pass
+// the rate-limit check and issue its own refresh — turning a single
+// cert-rotation event into an outbound amplifier.
+func TestPlatformCertManager_ConcurrentMisses_OneRefresh(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey := strings.Repeat("k", 32)
+	ciphertext := encryptCertForTest(t, certPEM(t, priv), "nonce1234567", "transaction_event")
+	stub := &stubHTTPDoer{resp: &HTTPResponse{
+		StatusCode: 200,
+		Body: []byte(`{"data":[{"serial_no":"S1","encrypt_certificate":{` +
+			`"algorithm":"AEAD_AES_256_GCM","nonce":"nonce1234567",` +
+			`"associated_data":"transaction_event","ciphertext":"` + ciphertext + `"}}]}`),
+	}}
+	mgr := &PlatformCertManager{
+		Signer:   &Signer{MchID: "1900000109", PrivateKey: priv},
+		APIv3Key: []byte(apiKey),
+		BaseURL:  "https://api.mch.weixin.qq.com",
+		HTTPDoer: stub,
+	}
+
+	const N = 50
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := mgr.PublicKeyFor(t.Context(), "S1"); err != nil {
+				t.Errorf("PublicKeyFor: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := stub.calls.Load(); got != 1 {
+		t.Errorf("expected exactly 1 refresh across %d concurrent goroutines, got %d", N, got)
 	}
 }
 

@@ -413,6 +413,12 @@ func TestPlanRepo_FindByApp_SortsByDisplayOrder(t *testing.T) {
 	r := NewPlanRepo(db)
 
 	const testApp = "sort-test-app"
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(),
+			`DELETE FROM plans WHERE id IN ('sort-a', 'sort-b', 'sort-c')`)
+		_, _ = db.ExecContext(context.Background(),
+			`DELETE FROM apps WHERE app_id = $1`, testApp)
+	})
 	if _, err := db.ExecContext(context.Background(),
 		`INSERT INTO apps (app_id, name, is_active) VALUES ($1, $2, true)
 		 ON CONFLICT (app_id) DO NOTHING`, testApp, "Sort Test App"); err != nil {

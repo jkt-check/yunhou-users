@@ -33,6 +33,12 @@ func (s *PlanService) FindByApp(ctx context.Context, appID string) ([]model.Plan
 }
 
 func (s *PlanService) CreatePlan(ctx context.Context, p *model.Plan) error {
+	if p.Currency == "" {
+		p.Currency = "CNY"
+	}
+	// Phase 1 keeps the legacy column, but newly created plans must never be
+	// designated as the default plan.
+	p.IsDefault = false
 	return s.planRepo.Create(ctx, p)
 }
 

@@ -90,7 +90,7 @@ func TestPlanService_CreatePlan(t *testing.T) {
 			Price:        9.99,
 			IntervalDays: 30,
 			IsActive:     true,
-			IsDefault:    false,
+			IsDefault:    true,
 		}
 
 		err := svc.CreatePlan(ctx, plan)
@@ -98,8 +98,15 @@ func TestPlanService_CreatePlan(t *testing.T) {
 			t.Fatalf("create plan: %v", err)
 		}
 
-		if planRepo.plans["test-plan"] == nil {
-			t.Error("plan was not stored")
+		created := planRepo.plans["test-plan"]
+		if created == nil {
+			t.Fatal("plan was not stored")
+		}
+		if created.Currency != "CNY" {
+			t.Errorf("Currency = %q, want CNY", created.Currency)
+		}
+		if created.IsDefault {
+			t.Error("IsDefault = true, want false")
 		}
 	})
 

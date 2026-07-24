@@ -574,12 +574,19 @@ func (h *PlanHandler) GetPlan(c *gin.Context) {
 
 func (h *PlanHandler) CreatePlan(c *gin.Context) {
 	var req struct {
-		ID           string   `json:"id" binding:"required"`
-		Name         string   `json:"name" binding:"required"`
-		Price        float64  `json:"price"`
-		IntervalDays int      `json:"interval_days"`
-		Apps         []string `json:"apps"`
-		IsDefault    bool     `json:"is_default"`
+		ID                        string   `json:"id" binding:"required"`
+		Name                      string   `json:"name" binding:"required"`
+		Price                     float64  `json:"price"`
+		IntervalDays              int      `json:"interval_days"`
+		Apps                      []string `json:"apps"`
+		Currency                  *string  `json:"currency"`
+		IsListed                  *bool    `json:"is_listed"`
+		AcceptingNewSubscriptions *bool    `json:"accepting_new_subscriptions"`
+		TrialDays                 int      `json:"trial_days"`
+		Description               *string  `json:"description"`
+		DisplayOrder              int      `json:"display_order"`
+		IsActive                  *bool    `json:"is_active"`
+		IsDefault                 bool     `json:"is_default"` // ignored; Phase 1 forces false
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
@@ -594,14 +601,42 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 		return
 	}
 
+	if req.TrialDays < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must be >= 0"})
+		return
+	}
+
+	currency := "CNY"
+	if req.Currency != nil && *req.Currency != "" {
+		currency = *req.Currency
+	}
+	isListed := true
+	if req.IsListed != nil {
+		isListed = *req.IsListed
+	}
+	acceptingNewSubscriptions := true
+	if req.AcceptingNewSubscriptions != nil {
+		acceptingNewSubscriptions = *req.AcceptingNewSubscriptions
+	}
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
+	}
+
 	plan := &model.Plan{
-		ID:           req.ID,
-		Name:         req.Name,
-		Price:        req.Price,
-		IntervalDays: req.IntervalDays,
-		Apps:         pq.StringArray(req.Apps),
-		IsActive:     true,
-		IsDefault:    req.IsDefault,
+		ID:                        req.ID,
+		Name:                      req.Name,
+		Price:                     req.Price,
+		IntervalDays:              req.IntervalDays,
+		Apps:                      pq.StringArray(req.Apps),
+		IsActive:                  isActive,
+		IsDefault:                 false,
+		IsListed:                  isListed,
+		AcceptingNewSubscriptions: acceptingNewSubscriptions,
+		Currency:                  currency,
+		TrialDays:                 req.TrialDays,
+		Description:               req.Description,
+		DisplayOrder:              req.DisplayOrder,
 	}
 	if err := h.planSvc.CreatePlan(c.Request.Context(), plan); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create plan"})

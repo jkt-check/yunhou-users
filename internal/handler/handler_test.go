@@ -352,6 +352,64 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 		if w.Code != http.StatusCreated {
 			t.Errorf("expected 201, got %d", w.Code)
 		}
+
+		var response struct {
+			Data model.Plan `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if response.Data.Currency != "CNY" {
+			t.Errorf("Currency = %q, want CNY", response.Data.Currency)
+		}
+		if !response.Data.IsListed {
+			t.Error("IsListed = false, want true")
+		}
+		if !response.Data.AcceptingNewSubscriptions {
+			t.Error("AcceptingNewSubscriptions = false, want true")
+		}
+		if !response.Data.IsActive {
+			t.Error("IsActive = false, want true")
+		}
+		if response.Data.IsDefault {
+			t.Error("IsDefault = true, want false")
+		}
+	})
+
+	t.Run("create plan passes commercial fields", func(t *testing.T) {
+		planSvc := &mockPlanSvc{}
+		handler := NewPlanHandler(planSvc, nil, nil)
+
+		router := gin.New()
+		router.POST("/admin/plans", handler.CreatePlan)
+
+		body := `{"id":"test","name":"Test Plan","price":9.99,"interval_days":30,"apps":["yundian"],"currency":"USD","is_listed":false,"accepting_new_subscriptions":false,"is_active":false,"trial_days":7,"description":"Trial plan","display_order":4,"is_default":true}`
+		req := httptest.NewRequest(http.MethodPost, "/admin/plans", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d", w.Code)
+		}
+		var response struct {
+			Data model.Plan `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if response.Data.Currency != "USD" || response.Data.TrialDays != 7 || response.Data.DisplayOrder != 4 {
+			t.Errorf("commercial fields not passed through: %+v", response.Data)
+		}
+		if response.Data.Description == nil || *response.Data.Description != "Trial plan" {
+			t.Errorf("Description = %v, want Trial plan", response.Data.Description)
+		}
+		if response.Data.IsListed || response.Data.AcceptingNewSubscriptions || response.Data.IsActive {
+			t.Errorf("explicit false flags not preserved: %+v", response.Data)
+		}
+		if response.Data.IsDefault {
+			t.Error("IsDefault = true, want forced false")
+		}
 	})
 
 	t.Run("create plan invalid body", func(t *testing.T) {

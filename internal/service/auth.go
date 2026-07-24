@@ -392,37 +392,35 @@ func (s *AuthService) TestLogin(ctx context.Context, req TestLoginRequest) (*Log
 }
 
 // issueTokensForUser is the shared token-issuance tail used by every
-// login path (LoginWithProfile for the GitHub OAuth callback, TestLogin
-// for the dev-only /test/login endpoint). Keeping a single implementation
-// guarantees refresh-token rotation, JWT claims, session schema, and the
-// (plan, has_access) view all stay byte-for-byte identical across paths —
-// a /test/login user holds a JWT indistinguishable from one minted by the
-// real GitHub flow.
+// login path (LoginWithProfile for OAuth callbacks and TestLogin for the
+// dev-only /test/login endpoint). Keeping a single implementation guarantees
+// refresh-token rotation, JWT claims, session schema, and the (plan,
+// has_access) view stay identical across paths.
 //
-// Callers are responsible for app existence/active check + user account
-// status guard + email binding (the response UserInfo.Email). This tail
-// starts at "we have a verified user, give them tokens for this app".
+// Callers are responsible for the app existence/active check, user account
+// status guard, and email binding. This tail starts at "we have a verified
+// user; issue tokens for this app".
 //
-// Plan selection for the response (and access token scope):
-//   - Active, unexpired subscription → that sub's plan.
-//   - No subscription → default plan.
-//   - Active but `expires_at < now()` (expired) → default plan for the
-//     access-token scope + has_access, but the response surfaces the
-//     original PlanID/PlanName so the FE renders a "renew your X plan"
-//     banner instead of misreading the state as "you got downgraded".
-//     See service/auth.go peekSubscription and docs/superpowers/specs/
-//     2026-07-23-login-subscription-decouple-design.md.
+// Plan selection for the response and access-token scope:
+//   - Active, unexpired subscription: surface that plan; its apps become scope
+//     only while the plan remains active.
+//   - No subscription: no chosen plan and an empty scope.
+//   - Expired subscription: preserve the historical plan in the response for
+//     renewal UI, but force the token scope and has_access to empty/false.
+//   - TestLogin may supply an explicit requested plan for a user with no
+//     subscription; this is not a default-plan fallback.
 func (s *AuthService) issueTokensForUser(ctx context.Context, user *model.User, appID string, overrideEmail *string) (*LoginResponse, error) {
 	return s.issueTokensForUserWithPlan(ctx, user, appID, overrideEmail, nil)
 }
 
 func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *model.User, appID string, overrideEmail *string, requestedPlan *model.Plan) (*LoginResponse, error) {
-	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuanceWithFallback(ctx, user.ID, appID, requestedPlan)
+	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuanceWithPlan(ctx, user.ID, appID, requestedPlan)
 	if err != nil {
 		return nil, err
 	}
 
-	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, chosenPlan.Apps)
+	scope := scopeForTokenIssuance(chosenPlan, expiresAt)
+	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, scope)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -436,7 +434,7 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 		AppID:        appID,
 		SessionType:  "refresh",
 		RefreshToken: hashToken(refreshTokenRaw),
-		Scope:        chosenPlan.Apps,
+		Scope:        scope,
 		Revoked:      false,
 		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
 	}
@@ -473,83 +471,58 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 	}, nil
 }
 
-// resolvePlanForTokenIssuance collapses the plan-selection logic shared
-// by issueTokensForUser (login) and RefreshToken (refresh). It returns:
-//   - chosenPlan:   plan whose .Apps determine the access-token scope.
-//     For expired subs this is the default plan (the only
-//     entitlement that holds right now).
-//   - surfacePlanID: what the login response's Subscription.PlanID
-//     reports. For expired subs this is the user's paid
-//     plan_id so the FE renders "renew your X plan" and
-//     the checkout target (useBilling.planID != "free"
-//     bypass) routes correctly.
-//   - surfacePlanName: human-readable plan name. For expired subs the
-//     original plan's Name is looked up; if the lookup
-//     fails (plan deleted), the field is set to ""
-//     rather than silently substituting the default plan's
-//     identity — silence here hid a separate defect
-//     during the cn-staging 2026-07-23 incident.
-//   - hasAccess:    whether the user is currently entitled to use appID.
-//     FALSE for expired subs (regardless of whether the
-//     default plan happens to include the app). Code
-//     & FE rely on this to gate paywall rendering and
-//     to allow a fresh checkout via useBilling's
-//     "already paid" check.
-//   - expiresAt:    sub.ExpiresAt (may be in the past — frontend uses
-//     this for "your plan expired N days ago" copy).
+// resolvePlanForTokenIssuance collapses the three-state plan decision shared
+// by login and refresh. chosenPlan is nil when no active subscription exists;
+// an expired subscription preserves its historical plan for the renewal CTA,
+// while scopeForTokenIssuance prevents that plan from granting token scope.
 func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, appID string) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
-	return s.resolvePlanForTokenIssuanceWithFallback(ctx, userID, appID, nil)
+	return s.resolvePlanForTokenIssuanceWithPlan(ctx, userID, appID, nil)
 }
 
-func (s *AuthService) resolvePlanForTokenIssuanceWithFallback(ctx context.Context, userID, appID string, fallbackPlan *model.Plan) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
+// resolvePlanForTokenIssuanceWithPlan additionally accepts the explicit plan
+// selected by the dev-only TestLogin path. It is used only when the user has no
+// subscription and is not a replacement for the retired default-plan lookup.
+func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, userID, appID string, requestedPlan *model.Plan) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
 	sub, expired, err := s.peekSubscription(ctx, userID)
 	if err != nil {
 		return nil, "", "", false, nil, err
 	}
-	if sub != nil && !expired {
-		plan, err := s.planRepo.FindByID(ctx, sub.PlanID)
-		if err != nil {
-			return nil, "", "", false, nil, fmt.Errorf("get plan: %w", err)
+
+	if sub == nil {
+		if requestedPlan == nil {
+			return nil, "", "", false, nil, nil
 		}
-		return plan, plan.ID, plan.Name, slices.Contains(plan.Apps, appID), sub.ExpiresAt, nil
+		hasAccess = requestedPlan.IsActive && slices.Contains(requestedPlan.Apps, appID)
+		return requestedPlan, requestedPlan.ID, requestedPlan.Name, hasAccess, nil, nil
 	}
-	if fallbackPlan == nil {
-		fallbackPlan, err = s.planRepo.FindDefault(ctx)
-		if err != nil {
-			return nil, "", "", false, nil, fmt.Errorf("get default plan: %w", err)
+
+	plan, err := s.planRepo.FindByID(ctx, sub.PlanID)
+	if err != nil {
+		if expired {
+			// Keep login/refresh available if a historical plan lookup is
+			// temporarily unavailable. The placeholder carries only the
+			// subscription id; scopeForTokenIssuance fails closed because
+			// the placeholder is not active.
+			return &model.Plan{ID: sub.PlanID}, sub.PlanID, "", false, sub.ExpiresAt, nil
 		}
+		return nil, "", "", false, nil, fmt.Errorf("get plan: %w", err)
 	}
-	if sub != nil && expired {
-		// Active-but-past subscription.
-		//
-		// chosenPlan stays as the default plan — the access-token
-		// scope and HasAccess are derived from the default plan's apps
-		// EXCEPT that HasAccess is forced to false for expired subs.
-		// The default plan on yunhou-users today includes "yundian"
-		// (the only Yunhou consumer app), so without the explicit
-		// override we'd report HasAccess=true for an expired monthly
-		// user. The FE's useBilling hook treats `plan_id != "free"
-		// && has_access=true` as "already subscribed", which would
-		// refuse the new checkout and leave the user in the loop.
-		// (cn-staging 2026-07-23 follow-up fix.)
-		surfaceID := sub.PlanID
-		surfaceName := ""
-		if orig, oerr := s.planRepo.FindByID(ctx, sub.PlanID); oerr == nil {
-			surfaceName = orig.Name
-		}
-		// sub is non-nil in this branch (the `sub != nil && expired` guard
-		// above); the `subscriptions` table constraint enforced by
-		// FindActiveByUserID guarantees ExpiresAt is set for status='active'
-		// rows. sub.ExpiresAt is allowed to be in the past — that's the
-		// "active but expired" state we're in here.
-		return fallbackPlan, surfaceID, surfaceName, false, sub.ExpiresAt, nil
+	if expired {
+		return plan, plan.ID, plan.Name, false, sub.ExpiresAt, nil
 	}
-	// sub == nil && !expired: no active subscription at all. Use the
-	// default plan's identity for both surface and chosen, and treat
-	// the user as a fresh "free" signup with HasAccess derived from
-	// the default plan's apps (which today includes "yundian").
-	// sub is nil here; named return `expiresAt` is already nil.
-	return fallbackPlan, fallbackPlan.ID, fallbackPlan.Name, slices.Contains(fallbackPlan.Apps, appID), expiresAt, nil
+
+	hasAccess = plan.IsActive && slices.Contains(plan.Apps, appID)
+	return plan, plan.ID, plan.Name, hasAccess, sub.ExpiresAt, nil
+}
+
+// scopeForTokenIssuance returns the currently authorized plan apps. Expired
+// subscriptions retain a chosen plan only for response rendering, and inactive
+// plans are historical records rather than active authorization grants.
+func scopeForTokenIssuance(chosenPlan *model.Plan, expiresAt *time.Time) []string {
+	if chosenPlan == nil || !chosenPlan.IsActive || (expiresAt != nil && expiresAt.Before(time.Now())) {
+		return []string{}
+	}
+	return chosenPlan.Apps
 }
 
 // Logout revokes the refresh token. Idempotent: a missing/expired session
@@ -616,7 +589,8 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		return nil, err
 	}
 
-	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, chosenPlan.Apps)
+	scope := scopeForTokenIssuance(chosenPlan, expiresAt)
+	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, scope)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -632,7 +606,7 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		AppID:        appID,
 		SessionType:  "refresh",
 		RefreshToken: hashToken(newRefreshTokenRaw),
-		Scope:        chosenPlan.Apps,
+		Scope:        scope,
 		Revoked:      false,
 		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
 	}

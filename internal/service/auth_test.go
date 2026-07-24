@@ -115,8 +115,12 @@ func TestAuthService_RefreshToken(t *testing.T) {
 	ctx := context.Background()
 
 	plans := map[string]*model.Plan{
-		"free":    {ID: "free", Name: "免费", Apps: []string{"yundian"}},
-		"monthly": {ID: "monthly", Name: "按月订阅", Apps: []string{"yundian", "yundash"}},
+		"free": {
+			ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
+		},
+		"monthly": {
+			ID: "monthly", Name: "按月订阅", Apps: []string{"yundian", "yundash"}, IsActive: true,
+		},
 	}
 
 	tests := []struct {
@@ -161,8 +165,11 @@ func TestAuthService_RefreshToken(t *testing.T) {
 				if resp.RefreshToken == "" {
 					t.Error("expected refresh token")
 				}
-				if resp.Subscription.PlanID != "free" {
-					t.Errorf("expected plan free, got %s", resp.Subscription.PlanID)
+				if resp.Subscription.PlanID != "" {
+					t.Errorf("expected no plan for user without subscription, got %s", resp.Subscription.PlanID)
+				}
+				if resp.Subscription.HasAccess {
+					t.Error("expected has_access=false for user without subscription")
 				}
 			},
 		},
@@ -1191,22 +1198,28 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("find default plan error", func(t *testing.T) {
+	t.Run("no subscription ignores retired default-plan lookup", func(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		// No sub, so FindActiveByUserID returns ErrNoRows, and FindDefault
-		// is called. We need FindDefault to return an error other than
-		// ErrNoRows so the service bubbles it.
+		// A plan-repository error must not matter when there is no
+		// subscription: the retired FindDefault path must not be called.
 		pr.err = errTest
 		ur.users["u-2"] = &model.User{ID: "u-2", Status: "active"}
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
-		_, err := svc.issueTokensForUser(ctx, ur.users["u-2"], "yundian", nil)
-		if err == nil {
-			t.Fatal("expected error, got nil")
+		resp, err := svc.issueTokensForUser(ctx, ur.users["u-2"], "yundian", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-		if !strings.Contains(err.Error(), "get default plan") {
-			t.Errorf("expected 'get default plan' in error, got %q", err.Error())
+		if resp.Subscription == nil || resp.Subscription.PlanID != "" || resp.Subscription.HasAccess {
+			t.Errorf("subscription = %+v, want no plan and has_access=false", resp.Subscription)
+		}
+		claims, err := tokenSvc.VerifyAccessToken(resp.AccessToken)
+		if err != nil {
+			t.Fatalf("VerifyAccessToken: %v", err)
+		}
+		if len(claims.Scope) != 0 {
+			t.Errorf("JWT scope = %v, want empty", claims.Scope)
 		}
 	})
 
@@ -1850,25 +1863,163 @@ func TestPeekSubscription(t *testing.T) {
 	})
 }
 
-// TestResolvePlanForTokenIssuance_ExpiredSub locks down spec §4.4 + §4.5:
-// an active-but-past subscription chooses the default plan for the
-// access-token scope / has_access computation, but the response surfaces
-// the original PlanID + PlanName so the FE shows "renew your X plan"
-// instead of misreading the state as "you got downgraded to free".
+// Task 19: the default-plan fallback is gone. Token issuance now has three
+// subscription states: no subscription, expired subscription, and active
+// subscription. These tests lock down the plan-selection and JWT-scope
+// consequences of each state.
+func TestResolvePlanForTokenIssuance_NoSub_ReturnsNilChosenPlan(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ur, sir, pr, sr, ssr, ar := newAuthMocks()
+
+	// Seed the former default so this test proves the resolver ignores it.
+	pr.defaultPlan = &model.Plan{
+		ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
+	}
+	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+
+	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-no-sub", "yundian")
+	if err != nil {
+		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
+	}
+	if chosenPlan != nil {
+		t.Errorf("chosenPlan = %+v, want nil", chosenPlan)
+	}
+	if surfaceID != "" || surfaceName != "" {
+		t.Errorf("surface plan = (%q, %q), want empty", surfaceID, surfaceName)
+	}
+	if hasAccess {
+		t.Error("hasAccess = true, want false")
+	}
+	if expiresAt != nil {
+		t.Errorf("expiresAt = %v, want nil", expiresAt)
+	}
+}
+
+func TestResolvePlanForTokenIssuance_ExpiredSub_ScopeEmpty(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ur, sir, pr, sr, ssr, ar := newAuthMocks()
+
+	pr.defaultPlan = &model.Plan{
+		ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
+	}
+	paidPlan := &model.Plan{
+		ID: "monthly", Name: "月付", Apps: []string{"yundian"}, IsActive: true,
+	}
+	pr.plans[paidPlan.ID] = paidPlan
+	past := time.Now().Add(-time.Hour)
+	sr.byUserID["u-expired"] = &model.Subscription{
+		ID: "sub-expired", UserID: "u-expired", PlanID: paidPlan.ID,
+		Status: "active", ExpiresAt: &past,
+	}
+	user := &model.User{ID: "u-expired", Status: "active"}
+	ur.users[user.ID] = user
+	tokenSvc := newTokenServiceWithMocks(ssr, sr)
+	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+	chosenPlan, surfaceID, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, user.ID, "yundian")
+	if err != nil {
+		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
+	}
+	if chosenPlan != paidPlan {
+		t.Errorf("chosenPlan = %+v, want expired subscription plan %+v", chosenPlan, paidPlan)
+	}
+	if surfaceID != paidPlan.ID {
+		t.Errorf("surfacePlanID = %q, want %q", surfaceID, paidPlan.ID)
+	}
+	if hasAccess {
+		t.Error("hasAccess = true, want false")
+	}
+
+	resp, err := svc.issueTokensForUser(ctx, user, "yundian", nil)
+	if err != nil {
+		t.Fatalf("issueTokensForUser: %v", err)
+	}
+	claims, err := tokenSvc.VerifyAccessToken(resp.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
+	}
+	if len(claims.Scope) != 0 {
+		t.Errorf("JWT scope = %v, want empty", claims.Scope)
+	}
+}
+
+func TestResolvePlanForTokenIssuance_ActiveSub_PlanDeactivated(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ur, sir, pr, sr, ssr, ar := newAuthMocks()
+
+	deactivatedPlan := &model.Plan{
+		ID: "legacy", Name: "已停用", Apps: []string{"yundian"}, IsActive: false,
+	}
+	pr.plans[deactivatedPlan.ID] = deactivatedPlan
+	future := time.Now().Add(time.Hour)
+	sr.byUserID["u-deactivated"] = &model.Subscription{
+		ID: "sub-deactivated", UserID: "u-deactivated", PlanID: deactivatedPlan.ID,
+		Status: "active", ExpiresAt: &future,
+	}
+	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+
+	chosenPlan, _, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-deactivated", "yundian")
+	if err != nil {
+		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
+	}
+	if chosenPlan != deactivatedPlan {
+		t.Errorf("chosenPlan = %+v, want %+v", chosenPlan, deactivatedPlan)
+	}
+	if hasAccess {
+		t.Error("hasAccess = true, want false for deactivated plan")
+	}
+}
+
+func TestIssueTokensForUser_NoSub_SignWithEmptyScope(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ur, sir, pr, sr, ssr, ar := newAuthMocks()
+
+	// The old implementation used this plan's apps as scope. It must now be
+	// ignored when the user has no subscription.
+	pr.defaultPlan = &model.Plan{
+		ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
+	}
+	user := &model.User{ID: "u-no-sub", Status: "active"}
+	tokenSvc := newTokenServiceWithMocks(ssr, sr)
+	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+	resp, err := svc.issueTokensForUser(ctx, user, "yundian", nil)
+	if err != nil {
+		t.Fatalf("issueTokensForUser: %v", err)
+	}
+	claims, err := tokenSvc.VerifyAccessToken(resp.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
+	}
+	if len(claims.Scope) != 0 {
+		t.Errorf("JWT scope = %v, want empty", claims.Scope)
+	}
+	if resp.Subscription == nil || resp.Subscription.HasAccess {
+		t.Errorf("subscription = %+v, want has_access=false", resp.Subscription)
+	}
+}
+
+// TestResolvePlanForTokenIssuance_ExpiredSub locks down the expired branch:
+// the historical plan remains available for the renewal CTA, but it does not
+// grant access. The access-token scope is asserted separately by
+// TestResolvePlanForTokenIssuance_ExpiredSub_ScopeEmpty above.
 func TestResolvePlanForTokenIssuance_ExpiredSub(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
 
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
-	pr.plans["free"] = defaultPlan
-	pr.defaultPlan = defaultPlan
-	paidPlan := &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
-	pr.plans["monthly"] = paidPlan
+	paidPlan := &model.Plan{
+		ID: "monthly", Name: "月付", Apps: []string{"yundian"}, IsActive: true,
+	}
+	pr.plans[paidPlan.ID] = paidPlan
 
 	past := time.Now().Add(-1 * time.Hour)
-	sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &past}
+	sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: paidPlan.ID, Status: "active", ExpiresAt: &past}
 	sr.byUserID["u-1"] = sr.subs["s-1"]
 
 	ur.users["u-1"] = &model.User{ID: "u-1", Status: "active"}
@@ -1879,89 +2030,59 @@ func TestResolvePlanForTokenIssuance_ExpiredSub(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
-	// chosenPlan must be the default (entitlement right now)
-	if chosenPlan.ID != "free" {
-		t.Errorf("chosenPlan.ID: got %q, want %q (expired sub must not grant the paid plan's entitlements)", chosenPlan.ID, "free")
+	if chosenPlan != paidPlan {
+		t.Errorf("chosenPlan = %+v, want historical plan %+v", chosenPlan, paidPlan)
 	}
-	// surface ID/Name come from the original (paid) plan so the FE can
-	// render the renew CTA targeting "monthly"
-	if surfaceID != "monthly" {
-		t.Errorf("surfacePlanID: got %q, want %q (FE needs to render renew CTA against the user's original plan)", surfaceID, "monthly")
+	if surfaceID != paidPlan.ID {
+		t.Errorf("surfacePlanID = %q, want %q", surfaceID, paidPlan.ID)
 	}
-	if surfaceName != "月付" {
-		t.Errorf("surfacePlanName: got %q, want %q", surfaceName, "月付")
+	if surfaceName != paidPlan.Name {
+		t.Errorf("surfacePlanName = %q, want %q", surfaceName, paidPlan.Name)
 	}
-	// hasAccess MUST be false — the default plan on yunhou-users today
-	// includes "yundian", so without the explicit override we'd return
-	// true for an expired monthly user. The FE's useBilling hook treats
-	// (plan_id != "free" && has_access=true) as "already subscribed"
-	// and refuses the new checkout, leaving the user looped.
 	if hasAccess {
-		t.Errorf("hasAccess: got true, want false (expired sub must NOT be granted has_access even when default plan includes appID; this was the cn-staging 2026-07-23 follow-up bug)")
+		t.Error("hasAccess = true, want false for expired subscription")
 	}
-	// surfacePlanID is the user's *intended* plan, not the default —
-	// console renders "your X plan expired" + "renew" CTA.
-	if surfaceID != "monthly" {
-		t.Errorf("surfacePlanID: got %q, want %q", surfaceID, "monthly")
-	}
-	if surfaceName != "月付" {
-		t.Errorf("surfacePlanName: got %q, want %q", surfaceName, "月付")
-	}
-	// chosenPlan is the default (it's what scopes the access token),
-	// not the expired paid plan.
-	if chosenPlan.ID != "free" {
-		t.Errorf("chosenPlan.ID: got %q, want %q (token scope must reflect actual entitlement, not paid plan)", chosenPlan.ID, "free")
-	}
-	// ExpiresAt returns the original past timestamp so the FE knows the
-	// sub is "expired since …" and can render "your X plan expired N
-	// days ago".
 	if expiresAt == nil || !expiresAt.Equal(past) {
-		t.Errorf("expiresAt: got %v, want %v", expiresAt, past)
+		t.Errorf("expiresAt = %v, want %v", expiresAt, past)
 	}
 }
 
-// TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing asserts
-// the degraded-mode contract: when the original plan row referenced by
-// sub.PlanID has been deleted (FK errors aren't normally possible but
-// transient DB failures are), surfacePlanID still reflects the user's
-// intent (sub.PlanID) rather than silently substituting the default
-// plan's ID — silence here hid a separate defect during the cn-staging
-// 2026-07-23 incident investigation.
+// TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing keeps the
+// degraded-mode contract for a historical-plan lookup failure. The resolver
+// preserves the subscription id for the renewal CTA, but returns a non-active
+// placeholder so token scope remains empty and no default plan is introduced.
 func TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
-
-	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
-	pr.defaultPlan = pr.plans["free"]
-	// Note: "monthly" intentionally NOT seeded. Lookup will fail.
 	pr.lookupErrForIDs = map[string]error{"monthly": errors.New("plan not found")}
 
 	past := time.Now().Add(-1 * time.Hour)
-	sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &past}
-	sr.byUserID["u-1"] = sr.subs["s-1"]
-	ur.users["u-1"] = &model.User{ID: "u-1", Status: "active"}
-	_ = sir
-	_ = ssr
+	sr.byUserID["u-1"] = &model.Subscription{
+		ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &past,
+	}
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
 	chosenPlan, surfaceID, surfaceName, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian")
 	if err != nil {
-		t.Fatalf("resolvePlanForTokenIssuance must not error on missing original plan; got %v", err)
+		t.Fatalf("resolvePlanForTokenIssuance must preserve degraded mode; got %v", err)
 	}
-	if chosenPlan.ID != "free" {
-		t.Errorf("chosenPlan.ID: got %q, want free", chosenPlan.ID)
+	if chosenPlan == nil || chosenPlan.ID != "monthly" {
+		t.Errorf("chosenPlan = %+v, want non-active placeholder for monthly", chosenPlan)
+	}
+	if chosenPlan != nil && chosenPlan.IsActive {
+		t.Error("placeholder plan must not be active")
 	}
 	if surfaceID != "monthly" {
-		t.Errorf("surfacePlanID: got %q, want monthly (must reflect sub.PlanID, never silently fall back to default)", surfaceID)
+		t.Errorf("surfacePlanID = %q, want monthly", surfaceID)
 	}
 	if surfaceName != "" {
-		t.Errorf("surfacePlanName: got %q, want empty (lookup failed — empty is the documented degraded contract)", surfaceName)
+		t.Errorf("surfacePlanName = %q, want empty", surfaceName)
 	}
 	if hasAccess {
-		t.Error("hasAccess: must be false even when the original plan cannot be resolved")
+		t.Error("hasAccess = true, want false")
 	}
 }
 
@@ -1976,18 +2097,9 @@ func TestIssueTokensForUser_ExpiredSub(t *testing.T) {
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
 
-	// Paid "monthly" plan includes ONLY "yundian" — same set as the
-	// default, so we can't distinguish entitlement via chosenPlan.Apps
-	// membership. To force the difference, use apps=["other-app"] for
-	// "monthly" (which doesn't include "yundian"), and apps=["yundian"]
-	// for the default. That way has_access computed against the chosen
-	// (default) plan IS true, matching today's behaviour; the spec's
-	// "HasAccess=false during expired" promise is delivered at the
-	// response-shape layer in production where the FE additionally
-	// checks Subscription.ExpiresAt < now to gate the paywall.
-	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
-	pr.defaultPlan = pr.plans["free"]
-	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
+	// The historical plan is preserved for the renewal CTA, while its
+	// expiration—not a default plan—forces has_access and token scope off.
+	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}, IsActive: true}
 
 	past := time.Now().Add(-1 * time.Hour)
 	sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &past}
@@ -2013,13 +2125,10 @@ func TestIssueTokensForUser_ExpiredSub(t *testing.T) {
 	if resp.Subscription.ExpiresAt == nil || !resp.Subscription.ExpiresAt.Equal(past) {
 		t.Errorf("Subscription.ExpiresAt: got %v, want %v", resp.Subscription.ExpiresAt, past)
 	}
-	// HasAccess MUST be false. The default plan includes "yundian", so
-	// without the explicit override the response would return true
-	// here — and useBilling's paywall check (`plan_id != free &&
-	// has_access`) would refuse the new checkout, leaving the user
-	// looped. This is the cn-staging 2026-07-23 follow-up fix.
+	// Expired subscriptions never grant access, regardless of the
+	// historical plan's app list.
 	if resp.Subscription.HasAccess {
-		t.Error("Subscription.HasAccess: got true, want false (expired sub must NOT receive has_access even when default plan includes appID)")
+		t.Error("Subscription.HasAccess: got true, want false for expired subscription")
 	}
 	if resp.AccessToken == "" || resp.RefreshToken == "" {
 		t.Error("AccessToken/RefreshToken must be issued even for expired-sub users (they're coming in, not being kicked out)")
@@ -2038,9 +2147,7 @@ func TestLoginWithProfile_ExpiredSub_LogsInSuccessfully(t *testing.T) {
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
 
-	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
-	pr.defaultPlan = pr.plans["free"]
-	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
+	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}, IsActive: true}
 
 	past := time.Now().Add(-1 * time.Hour)
 	sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &past}
@@ -2082,8 +2189,7 @@ func TestRefreshToken_ExpiredSub_DoesNotError(t *testing.T) {
 	ctx := context.Background()
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
-	pr.defaultPlan = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
-	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
+	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}, IsActive: true}
 
 	// The session has already been issued under the paid plan; now the
 	// sub has lapsed. The user tries to refresh before the access

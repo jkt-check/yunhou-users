@@ -130,7 +130,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	if err != nil {
 		panic(fmt.Sprintf("failed to init token service: %v", err))
 	}
-	planSvc := service.NewPlanService(planRepo)
+	planSvc := service.NewPlanService(planRepo, appRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 

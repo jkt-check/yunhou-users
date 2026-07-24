@@ -2,6 +2,9 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/yunhou/users/internal/model"
@@ -10,10 +13,11 @@ import (
 
 type PlanService struct {
 	planRepo repo.PlanRepo
+	appRepo  AppLookup
 }
 
-func NewPlanService(planRepo repo.PlanRepo) *PlanService {
-	return &PlanService{planRepo: planRepo}
+func NewPlanService(planRepo repo.PlanRepo, appRepo AppLookup) *PlanService {
+	return &PlanService{planRepo: planRepo, appRepo: appRepo}
 }
 
 func (s *PlanService) ListPlans(ctx context.Context) ([]model.Plan, error) {
@@ -48,6 +52,27 @@ func (s *PlanService) UpdatePlan(ctx context.Context, p *model.Plan) error {
 
 func (s *PlanService) DeletePlan(ctx context.Context, id string) error {
 	return s.planRepo.Delete(ctx, id)
+}
+
+// ValidateApps checks that every app_id in the provided list exists in the
+// apps table AND is currently active. Used by CreatePlan / UpdatePlan to
+// reject unknown or deactivated apps before they hit plans.apps (spec §4.12).
+// Returns an error wrapping ErrInvalidAppID on the first failure; the loop
+// short-circuits so callers don't get a flood of partial diagnostics.
+func (s *PlanService) ValidateApps(ctx context.Context, apps []string) error {
+	for _, id := range apps {
+		app, err := s.appRepo.FindByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: %s", ErrInvalidAppID, id)
+			}
+			return err
+		}
+		if !app.IsActive {
+			return fmt.Errorf("%w: %s is inactive", ErrInvalidAppID, id)
+		}
+	}
+	return nil
 }
 
 // CheckAppAccess checks if a user with given subscription can access the specified app.

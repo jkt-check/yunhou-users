@@ -137,10 +137,11 @@ type UserInfo struct {
 }
 
 type SubscriptionInfo struct {
-	PlanID    string     `json:"plan_id"`
-	PlanName  string     `json:"plan_name"`
-	HasAccess bool       `json:"has_access"`
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	PlanID         string     `json:"plan_id"`
+	PlanName       string     `json:"plan_name"`
+	HasAccess      bool       `json:"has_access"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	IsAcceptingNew bool       `json:"is_accepting_new"`
 }
 
 // LoginWithProfile is the Login flow that accepts a pre-fetched

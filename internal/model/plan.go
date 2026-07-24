@@ -32,10 +32,8 @@ const CycleBaseFormula = "now + trial + cycle"
 // ResolveCycle returns the cycle configured for this plan under PayPal, or
 // the plan.IntervalDays fallback when no PayPal per-plan entry exists.
 //
-// Single source of truth — both the marketing-page PublicPlan builder and
-// the BFF quote endpoint must show identical cycle values, so the resolution
-// logic lives here in model (not in handler or service). Adding a new
-// payment channel means extending AppConfig and this function together.
+// This is used by the PublicPlan builder. QuoteService does not call it; the
+// quote endpoint inlines the equivalent plan-based cycle configuration.
 func ResolveCycle(cfg AppConfig, planID string, planInterval int) CycleConfig {
 	providers := cfg.PaymentProviders
 	if providers == nil || providers.Paypal == nil {

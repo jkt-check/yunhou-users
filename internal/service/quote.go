@@ -14,8 +14,9 @@ import (
 )
 
 // QuoteService assembles the BFF-facing quote for a (app, plan) pair. It
-// reads the plan row, the app's config (provider IDs + cycle), and computes
-// sub_expires_at from the configured cycle. It does NOT make any HTTP calls —
+// reads the plan row as the source of truth for trial, currency, and billing
+// cycle, while reading the app's config for provider IDs. It computes
+// sub_expires_at from the plan cycle. It does NOT make any HTTP calls —
 // PayPal/LS API calls happen in the BFF using the returned provider_data.
 type QuoteService struct {
 	plans repo.PlanRepo
@@ -31,8 +32,9 @@ func NewQuoteService(plans repo.PlanRepo, apps AppLookup) *QuoteService {
 // access to that app.
 var ErrPlanAppMismatch = errors.New("plan does not include this app")
 
-// Get returns the quote for (appID, planID). userID is currently unused but
-// kept in the signature for future audit logging — quote calls are user-scoped
+// Get returns the quote for (appID, planID). Plan.TrialDays, Plan.IntervalDays,
+// and Plan.Currency are authoritative for the quote. userID is currently unused
+// but kept in the signature for future audit logging — quote calls are user-scoped
 // (the route requires JWT) and operators may want to know who requested what.
 func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*model.Quote, error) {
 	plan, err := s.plans.FindByID(ctx, planID)

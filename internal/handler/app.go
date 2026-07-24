@@ -536,8 +536,8 @@ func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 }
 
 type PlanHandler struct {
-	planSvc service.PlanServiceInterface
-	appRepo AppRepoInterface
+	planSvc  service.PlanServiceInterface
+	appRepo  AppRepoInterface
 	quoteSvc QuoteLookup
 }
 
@@ -780,8 +780,8 @@ func (h *PlanHandler) GetAppPlans(c *gin.Context) {
 
 // buildPublicPlan assembles a PublicPlan DTO from the canonical Plan row and
 // the app's typed config. Resolves provider_ids for every configured channel
-// and delegates cycle resolution to model.ResolveCycle (single source of
-// truth shared with QuoteService — keeps marketing page and /quote in sync).
+// and delegates cycle resolution to model.ResolveCycle for PublicPlan only.
+// QuoteService inlines its own plan-based cycle configuration.
 func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 	out := model.PublicPlan{
 		ID:           p.ID,

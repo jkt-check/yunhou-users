@@ -404,9 +404,6 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 		if !response.Data.IsActive {
 			t.Error("IsActive = false, want true")
 		}
-		if response.Data.IsDefault {
-			t.Error("IsDefault = true, want false")
-		}
 	})
 
 	t.Run("create plan passes commercial fields", func(t *testing.T) {
@@ -439,9 +436,6 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 		}
 		if response.Data.IsListed || response.Data.AcceptingNewSubscriptions || response.Data.IsActive {
 			t.Errorf("explicit false flags not preserved: %+v", response.Data)
-		}
-		if response.Data.IsDefault {
-			t.Error("IsDefault = true, want forced false")
 		}
 	})
 
@@ -2847,7 +2841,7 @@ func TestPlanHandler_GetAppPlans_FullCoverage(t *testing.T) {
 
 	t.Run("app with paypal config returns cycle + provider_id", func(t *testing.T) {
 		plans := []model.Plan{
-			{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}, IsDefault: true},
+			{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}},
 			{ID: "monthly", Name: "Monthly", IsActive: true, Apps: pq.StringArray{"yundian"}, IntervalDays: 30, Price: 29.9},
 		}
 		app := model.App{
@@ -2904,7 +2898,7 @@ func TestPlanHandler_GetAppPlans_FullCoverage(t *testing.T) {
 		// UnifiedOrder routing against the mapping is still deferred (M8);
 		// this test pins the *display* contract the BFF depends on.
 		plans := []model.Plan{
-			{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}, IsDefault: true},
+			{ID: "free", Name: "Free", IsActive: true, Apps: pq.StringArray{"yundian"}},
 			{ID: "monthly", Name: "Monthly", IsActive: true, Apps: pq.StringArray{"yundian"}, IntervalDays: 30, Price: 29.9},
 		}
 		app := model.App{

@@ -114,9 +114,8 @@ func TestPlanJSON(t *testing.T) {
 			Name:         "Monthly Plan",
 			Price:        29.90,
 			IntervalDays: 30,
-			Apps:        []string{"yundian", "yundash"},
-			IsActive:    true,
-			IsDefault:   false,
+			Apps:         []string{"yundian", "yundash"},
+			IsActive:     true,
 		}
 
 		data, err := json.Marshal(plan)
@@ -136,11 +135,10 @@ func TestPlanJSON(t *testing.T) {
 
 	t.Run("plan with empty apps", func(t *testing.T) {
 		plan := &Plan{
-			ID:    "free",
-			Name:  "Free Plan",
-			Apps:  []string{},
-			IsActive:  true,
-			IsDefault: true,
+			ID:       "free",
+			Name:     "Free Plan",
+			Apps:     []string{},
+			IsActive: true,
 		}
 
 		data, err := json.Marshal(plan)
@@ -174,7 +172,6 @@ func TestPlanCommercialModelShape(t *testing.T) {
 		{"IntervalDays", "interval_days", "interval_days"},
 		{"Apps", "apps", "apps"},
 		{"IsActive", "is_active", "is_active"},
-		{"IsDefault", "is_default", "is_default"},
 		{"IsListed", "is_listed", "is_listed"},
 		{"AcceptingNewSubscriptions", "accepting_new_subscriptions", "accepting_new_subscriptions"},
 		{"Currency", "currency", "currency"},
@@ -316,13 +313,13 @@ func TestSessionJSON(t *testing.T) {
 
 	t.Run("marshal session", func(t *testing.T) {
 		session := &Session{
-			ID:           "sess-123",
-			UserID:       "user-456",
-			AppID:        "yundian",
-			SessionType:  "refresh", // not exported (json:"-")
-			Scope:        []string{"yundian", "yundash"},
-			Revoked:      false,
-			ExpiresAt:    time.Now().Add(7 * 24 * time.Hour),
+			ID:          "sess-123",
+			UserID:      "user-456",
+			AppID:       "yundian",
+			SessionType: "refresh", // not exported (json:"-")
+			Scope:       []string{"yundian", "yundash"},
+			Revoked:     false,
+			ExpiresAt:   time.Now().Add(7 * 24 * time.Hour),
 		}
 
 		data, err := json.Marshal(session)

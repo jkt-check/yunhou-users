@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"time"
 
 	"github.com/lib/pq"
@@ -13,7 +14,6 @@ type Plan struct {
 	IntervalDays              int            `db:"interval_days" json:"interval_days"`
 	Apps                      pq.StringArray `db:"apps" json:"apps"`
 	IsActive                  bool           `db:"is_active" json:"is_active"`
-	IsDefault                 bool           `db:"is_default" json:"is_default"`
 	IsListed                  bool           `db:"is_listed" json:"is_listed"`
 	AcceptingNewSubscriptions bool           `db:"accepting_new_subscriptions" json:"accepting_new_subscriptions"`
 	Currency                  string         `db:"currency" json:"currency"`
@@ -23,6 +23,8 @@ type Plan struct {
 	UpdatedAt                 time.Time      `db:"updated_at" json:"updated_at"`
 	CreatedAt                 time.Time      `db:"created_at" json:"created_at"`
 }
+
+var ErrDeprecatedDefaultPlan = errors.New("default plan concept is deprecated; supply plan_id explicitly")
 
 // CycleBaseFormula is the human-readable description of how SubExpiresAt is
 // computed. Surfaced in Quote / PublicPlan responses so callers can audit the

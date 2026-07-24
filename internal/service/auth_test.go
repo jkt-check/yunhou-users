@@ -616,7 +616,7 @@ func TestAuthService_LoginWithProfile(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 
 	t.Run("nil profile rejected", func(t *testing.T) {
 		t.Parallel()
@@ -753,7 +753,7 @@ func TestAuthService_TestLogin(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 
 	t.Run("requested plan controls token scope", func(t *testing.T) {
 		t.Parallel()
@@ -1164,7 +1164,7 @@ func TestAuthService_LoginWithProfile_RarePaths(t *testing.T) {
 func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 
 	t.Run("plan not found error", func(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
@@ -1372,7 +1372,7 @@ func TestAuthService_IssueTokensForUser_IsAcceptingNew(t *testing.T) {
 		// chosenPlan=nil when there's no sub — same outcome.
 		pr.defaultPlan = &model.Plan{
 			ID: "free", Name: "免费", Apps: []string{"yundian"},
-			IsDefault: true, IsActive: false, AcceptingNewSubscriptions: false,
+			IsActive: false, AcceptingNewSubscriptions: false,
 		}
 		ur.users["u-nosub"] = &model.User{ID: "u-nosub", Status: "active"}
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
@@ -1861,8 +1861,9 @@ func TestResolvePlanForTokenIssuance_ExpiredSub(t *testing.T) {
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
 
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 	pr.plans["free"] = defaultPlan
+	pr.defaultPlan = defaultPlan
 	paidPlan := &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
 	pr.plans["monthly"] = paidPlan
 
@@ -1932,7 +1933,7 @@ func TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing(t *testing.T
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
 
-	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 	pr.defaultPlan = pr.plans["free"]
 	// Note: "monthly" intentionally NOT seeded. Lookup will fail.
 	pr.lookupErrForIDs = map[string]error{"monthly": errors.New("plan not found")}
@@ -1984,7 +1985,8 @@ func TestIssueTokensForUser_ExpiredSub(t *testing.T) {
 	// "HasAccess=false during expired" promise is delivered at the
 	// response-shape layer in production where the FE additionally
 	// checks Subscription.ExpiresAt < now to gate the paywall.
-	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
+	pr.defaultPlan = pr.plans["free"]
 	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
 
 	past := time.Now().Add(-1 * time.Hour)
@@ -2036,7 +2038,8 @@ func TestLoginWithProfile_ExpiredSub_LogsInSuccessfully(t *testing.T) {
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
 
-	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
+	pr.defaultPlan = pr.plans["free"]
 	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
 
 	past := time.Now().Add(-1 * time.Hour)
@@ -2079,7 +2082,7 @@ func TestRefreshToken_ExpiredSub_DoesNotError(t *testing.T) {
 	ctx := context.Background()
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 	ar.seedActive("yundian", "云店")
-	pr.defaultPlan = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+	pr.defaultPlan = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 	pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Apps: []string{"yundian"}}
 
 	// The session has already been issued under the paid plan; now the

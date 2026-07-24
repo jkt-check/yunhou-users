@@ -221,11 +221,6 @@ func (m *mockPlanRepo) FindDefault(_ context.Context) (*model.Plan, error) {
 	if m.defaultPlan != nil {
 		return m.defaultPlan, nil
 	}
-	for _, p := range m.plans {
-		if p.IsDefault {
-			return p, nil
-		}
-	}
 	return nil, sql.ErrNoRows
 }
 

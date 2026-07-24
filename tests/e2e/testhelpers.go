@@ -119,41 +119,37 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 		price              float64
 		days               int
 		apps               string
-		// isDef retained during Phase 1 because PlanService.FindDefault is still in use.
-		// Will be removed when migration 014 (T17) drops the is_default column.
-		isDef        bool
-		trialDays    int
-		description  string
-		isListed     bool
-		acceptingNew bool
-		displayOrder int
+		trialDays          int
+		description        string
+		isListed           bool
+		acceptingNew       bool
+		displayOrder       int
 	}{
-		{"free", "免费", "CNY", 0, 0, "{yundian}", true, 0, "免费版（已下线）", true, false, 0},
-		{"monthly", "按月订阅", "CNY", 29.9, 30, "{yundian,yundash}", false, 0, "按月订阅 ¥29.9，自动续费，可随时取消", true, true, 10},
-		{"monthly_usd", "Monthly PayPal Test", "USD", 29.9, 30, "{}", false, 0, "PayPal USD test fixture", false, true, 0},
+		{"free", "免费", "CNY", 0, 0, "{yundian}", 0, "免费版（已下线）", true, false, 0},
+		{"monthly", "按月订阅", "CNY", 29.9, 30, "{yundian,yundash}", 0, "按月订阅 ¥29.9，自动续费，可随时取消", true, true, 10},
+		{"monthly_usd", "Monthly PayPal Test", "USD", 29.9, 30, "{}", 0, "PayPal USD test fixture", false, true, 0},
 	}
 	for _, p := range plans {
 		_, err := db.ExecContext(context.Background(), `
 			INSERT INTO plans (
-				id, name, price, interval_days, apps, is_default, is_listed,
+				id, name, price, interval_days, apps, is_listed,
 				accepting_new_subscriptions, currency, trial_days,
 				description, display_order
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				price = EXCLUDED.price,
 				interval_days = EXCLUDED.interval_days,
 				apps = EXCLUDED.apps,
-				is_default = EXCLUDED.is_default,
 				is_listed = EXCLUDED.is_listed,
 				accepting_new_subscriptions = EXCLUDED.accepting_new_subscriptions,
 				currency = EXCLUDED.currency,
 				trial_days = EXCLUDED.trial_days,
 				description = EXCLUDED.description,
 				display_order = EXCLUDED.display_order
-		`, p.id, p.name, p.price, p.days, p.apps, p.isDef, p.isListed,
-			p.acceptingNew, p.currency, p.trialDays, p.description, p.displayOrder)
+		`, p.id, p.name, p.price, p.days, p.apps, p.isListed, p.acceptingNew, p.currency, p.trialDays,
+			p.description, p.displayOrder)
 		if err != nil {
 			t.Fatalf("seed plan %s: %v", p.id, err)
 		}

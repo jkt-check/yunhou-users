@@ -223,13 +223,8 @@ func (r *planRepo) FindByID(ctx context.Context, id string) (*model.Plan, error)
 	return &p, nil
 }
 
-func (r *planRepo) FindDefault(ctx context.Context) (*model.Plan, error) {
-	var p model.Plan
-	err := r.db.GetContext(ctx, &p, `SELECT * FROM plans WHERE is_default = true LIMIT 1`)
-	if err != nil {
-		return nil, err
-	}
-	return &p, nil
+func (r *planRepo) FindDefault(context.Context) (*model.Plan, error) {
+	return nil, model.ErrDeprecatedDefaultPlan
 }
 
 // FindByApp returns active plans whose `apps` array contains appID, ordered
@@ -253,11 +248,11 @@ func (r *planRepo) FindByApp(ctx context.Context, appID string) ([]model.Plan, e
 func (r *planRepo) Create(ctx context.Context, p *model.Plan) error {
 	_, err := r.db.NamedExecContext(ctx, `
 		INSERT INTO plans (
-		    id, name, price, interval_days, apps, is_active, is_default,
+		    id, name, price, interval_days, apps, is_active,
 		    is_listed, accepting_new_subscriptions, currency, trial_days,
 		    description, display_order
 		) VALUES (
-		    :id, :name, :price, :interval_days, :apps, :is_active, :is_default,
+		    :id, :name, :price, :interval_days, :apps, :is_active,
 		    :is_listed, :accepting_new_subscriptions, :currency, :trial_days,
 		    :description, :display_order
 		)
@@ -269,7 +264,7 @@ func (r *planRepo) Update(ctx context.Context, p *model.Plan) error {
 	_, err := r.db.NamedExecContext(ctx, `
 		UPDATE plans SET
 		    name = :name, price = :price, interval_days = :interval_days,
-		    apps = :apps, is_active = :is_active, is_default = :is_default,
+		    apps = :apps, is_active = :is_active,
 		    is_listed = :is_listed,
 		    accepting_new_subscriptions = :accepting_new_subscriptions,
 		    currency = :currency, trial_days = :trial_days,

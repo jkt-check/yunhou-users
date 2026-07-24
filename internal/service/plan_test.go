@@ -92,7 +92,6 @@ func TestPlanService_CreatePlan(t *testing.T) {
 			Price:        9.99,
 			IntervalDays: 30,
 			IsActive:     true,
-			IsDefault:    true,
 		}
 
 		err := svc.CreatePlan(ctx, plan)
@@ -106,9 +105,6 @@ func TestPlanService_CreatePlan(t *testing.T) {
 		}
 		if created.Currency != "CNY" {
 			t.Errorf("Currency = %q, want CNY", created.Currency)
-		}
-		if created.IsDefault {
-			t.Error("IsDefault = true, want false")
 		}
 	})
 

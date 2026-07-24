@@ -58,9 +58,9 @@ func TestE2E_GetAppPlans_WithProviderConfig(t *testing.T) {
 	if _, err := db.ExecContext(context.Background(),
 		`INSERT INTO plans (id, name, price, interval_days, apps, is_active,
 			is_listed, accepting_new_subscriptions, currency, trial_days,
-			description, display_order, is_default)
+			description, display_order)
 		 VALUES ('mp', 'Monthly Pro', 49.9, 30, ARRAY[$1], true,
-			true, true, 'USD', 7, 'Monthly Pro test fixture', 10, false)`, appID); err != nil {
+			true, true, 'USD', 7, 'Monthly Pro test fixture', 10)`, appID); err != nil {
 		t.Fatalf("seed mp: %v", err)
 	}
 

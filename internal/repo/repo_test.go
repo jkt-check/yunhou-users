@@ -39,32 +39,28 @@ func setupDB(t *testing.T) *sqlx.DB {
 		"sessions", "subscriptions", "social_identities",
 		"plans", "apps", "users", "audit_log",
 	}
-	// Clear is_default before wiping plans so the partial unique index
-	// doesn't fire if a prior run left free with is_default=true.
-	_, _ = db.ExecContext(context.Background(), `UPDATE plans SET is_default = false`)
 	for _, tbl := range tables {
 		if _, err := db.ExecContext(context.Background(), "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("wipe %s: %v", tbl, err)
 		}
 	}
 
-	// Seed default plans. ON CONFLICT DO NOTHING so a parallel test
+	// Seed plans. ON CONFLICT DO NOTHING so a parallel test
 	// can re-seed safely if it already wiped the table.
 	for _, p := range []struct {
 		id, name string
 		price    float64
 		days     int
 		apps     []string
-		isDef    bool
 	}{
-		{"free", "Free", 0, 0, []string{"yundian"}, true},
-		{"monthly", "Monthly", 29.9, 30, []string{"yundian", "yundash"}, false},
+		{"free", "Free", 0, 0, []string{"yundian"}},
+		{"monthly", "Monthly", 29.9, 30, []string{"yundian", "yundash"}},
 	} {
 		_, err := db.ExecContext(context.Background(), `
-			INSERT INTO plans (id, name, price, interval_days, apps, is_default)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO plans (id, name, price, interval_days, apps)
+			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (id) DO NOTHING
-		`, p.id, p.name, p.price, p.days, pq.Array(p.apps), p.isDef)
+		`, p.id, p.name, p.price, p.days, pq.Array(p.apps))
 		if err != nil {
 			t.Fatalf("seed plan %s: %v", p.id, err)
 		}
@@ -338,11 +334,11 @@ func TestPlanRepo_FindDefault(t *testing.T) {
 	db := setupDB(t)
 	r := NewPlanRepo(db)
 	got, err := r.FindDefault(context.Background())
-	if err != nil {
-		t.Fatalf("FindDefault: %v", err)
+	if got != nil {
+		t.Errorf("FindDefault returned plan: %+v, want nil", got)
 	}
-	if !got.IsDefault {
-		t.Errorf("returned plan not default: %+v", got)
+	if !errors.Is(err, model.ErrDeprecatedDefaultPlan) {
+		t.Errorf("err = %v, want ErrDeprecatedDefaultPlan", err)
 	}
 }
 
@@ -471,7 +467,7 @@ func TestPlanRepo_CreateUpdateDelete(t *testing.T) {
 	desc := "Annual subscription"
 	p := &model.Plan{
 		ID: "yearly", Name: "Yearly", Price: 299, IntervalDays: 365,
-		Apps: pq.StringArray{"yundian"}, IsActive: true, IsDefault: false,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
 		IsListed: true, AcceptingNewSubscriptions: true,
 		Currency: "CNY", TrialDays: 0, Description: &desc, DisplayOrder: 50,
 	}
@@ -618,7 +614,7 @@ func TestAppRepo_ListUnhashedFiltersAtSQLLayer(t *testing.T) {
 // TestAppRepo_BackfillSecretHashRespectsConcurrentRotate guards the TOCTOU
 // between BackfillAppSecrets' ListUnhashed-then-UPDATE and an admin's
 // POST /admin/apps/:id/rotate-secret. The guard is "secret_hash IS NULL OR
-// = ''" on the UPDATE; without it a concurrent rotate would be silently
+// = ”" on the UPDATE; without it a concurrent rotate would be silently
 // overwritten by the backfill and the operator's captured plaintext
 // would no longer authenticate.
 func TestAppRepo_BackfillSecretHashRespectsConcurrentRotate(t *testing.T) {

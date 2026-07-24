@@ -271,22 +271,22 @@ func TestE2E_RefreshReuseFamilyRevoke(t *testing.T) {
 // TestE2E_ExpiredSub_LoginAndRefresh is the cn-staging 2026-07-23
 // incident's end-to-end regression. A user with status='active' but
 // expires_at in the past must:
-//   1. Still log in successfully (the historical bug: the OAuth
-//      callback returned `reason=subscription_expired` and bounced
-//      the user to /auth/login with no escape).
-//   2. Receive has_access=false in the login response (the original
-//      plan's apps[] is honoured by the access-token scope, but the
-//      response flag is forced false so the FE renders the paywall
-//      and `useBilling.planID != "free"` bypass routes correctly to
-//      the renewal CTA).
-//   3. Surface the original PlanID/PlanName (NOT the default plan's
-//      identity) so the FE renders "renew your X plan" rather than
-//      misreading as "downgraded to free".
-//   4. Refresh the access token without error (the historical bug
-//      path returned ErrSubscriptionExpired here too).
-//   5. Be permitted to create an order for an accepting plan (the
-//      second-stage follow-up fix widened CreateOrder's precondition
-//      to allow past-but-active rows through).
+//  1. Still log in successfully (the historical bug: the OAuth
+//     callback returned `reason=subscription_expired` and bounced
+//     the user to /auth/login with no escape).
+//  2. Receive has_access=false in the login response (the original
+//     plan's apps[] is honoured by the access-token scope, but the
+//     response flag is forced false so the FE renders the paywall
+//     and `useBilling.planID != "free"` bypass routes correctly to
+//     the renewal CTA).
+//  3. Surface the original PlanID/PlanName (NOT the default plan's
+//     identity) so the FE renders "renew your X plan" rather than
+//     misreading as "downgraded to free".
+//  4. Refresh the access token without error (the historical bug
+//     path returned ErrSubscriptionExpired here too).
+//  5. Be permitted to create an order for an accepting plan (the
+//     second-stage follow-up fix widened CreateOrder's precondition
+//     to allow past-but-active rows through).
 //
 // Setup seeds an active-but-past subscription directly in the DB
 // before the /test/login call (the only login endpoint available in
@@ -394,11 +394,11 @@ func e2eMustSeedExpiredSubUser(t *testing.T, db *sqlx.DB) string {
 	// the app" case that motivated the HasAccess=false override.
 	if _, err := db.ExecContext(context.Background(),
 		`INSERT INTO plans (
-			id, name, price, interval_days, apps, is_active, is_default,
+			id, name, price, interval_days, apps, is_active,
 			is_listed, accepting_new_subscriptions, currency, trial_days,
 			description, display_order
 		) VALUES (
-			'quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true, false,
+			'quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true,
 			true, false, 'CNY', 0, '按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留', 20
 		) ON CONFLICT (id) DO NOTHING`); err != nil {
 		t.Fatalf("seed plan: %v", err)
@@ -425,14 +425,14 @@ var _ = strings.TrimSpace
 // TestE2E_GitHubOAuth_RedirectToCallback drives the full GitHub OAuth
 // redirect→callback flow against an httptest mock of api.github.com.
 // The test pins every observable surface of the production code path:
-//   1. /auth/github/redirect → 302 to a GitHub URL whose state binds
-//      (app_id, callback_index) and validates against the HMAC secret.
-//   2. /auth/github/callback with a valid code+state → 302 to the BFF
-//      callback URL with a fresh access/refresh token pair in the
-//      fragment.
-//   3. The minted JWT is delivered to the BFF; the user + identity
-//      rows are persisted (the email-merge identity-binding path
-//      hit /user/emails, found the verified primary, and bound).
+//  1. /auth/github/redirect → 302 to a GitHub URL whose state binds
+//     (app_id, callback_index) and validates against the HMAC secret.
+//  2. /auth/github/callback with a valid code+state → 302 to the BFF
+//     callback URL with a fresh access/refresh token pair in the
+//     fragment.
+//  3. The minted JWT is delivered to the BFF; the user + identity
+//     rows are persisted (the email-merge identity-binding path
+//     hit /user/emails, found the verified primary, and bound).
 //
 // Without this test, the OAuth state HMAC binding, the code-exchange
 // upstream call, the profile fetch, and the BFF redirect contract are
@@ -441,7 +441,7 @@ var _ = strings.TrimSpace
 func TestE2E_GitHubOAuth_RedirectToCallback(t *testing.T) {
 	// Start a mock GitHub server and rewire the GitHubOAuthService
 	// to point at it. The mock serves the same /login/oauth/access_token,
-//	/user, /user/emails paths production GitHub uses, returning a
+	//	/user, /user/emails paths production GitHub uses, returning a
 	// deterministic access token + verified primary email.
 	github := newMockGitHubServer(t)
 	srv, db := setupE2EServerWithGH(t)

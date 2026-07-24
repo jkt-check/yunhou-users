@@ -209,11 +209,11 @@ func TestE2E_PlanCommercial_QuarterlyNotAcceptingNew(t *testing.T) {
 	// active-sub check.
 	if _, err := db.ExecContext(context.Background(),
 		`INSERT INTO plans (
-			id, name, price, interval_days, apps, is_active, is_default,
+			id, name, price, interval_days, apps, is_active,
 			is_listed, accepting_new_subscriptions, currency, trial_days,
 			description, display_order
 		) VALUES (
-			'quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true, false,
+			'quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true,
 			true, false, 'CNY', 0, 'Quarterly test fixture (not accepting new)', 20
 		) ON CONFLICT (id) DO UPDATE SET
 			accepting_new_subscriptions = EXCLUDED.accepting_new_subscriptions,

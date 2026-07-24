@@ -710,7 +710,6 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 		IntervalDays:              req.IntervalDays,
 		Apps:                      pq.StringArray(req.Apps),
 		IsActive:                  isActive,
-		IsDefault:                 false,
 		IsListed:                  isListed,
 		AcceptingNewSubscriptions: acceptingNewSubscriptions,
 		Currency:                  currency,

@@ -38,30 +38,26 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 		"sessions", "subscriptions", "social_identities",
 		"plans", "apps", "users", "audit_log",
 	}
-	// Clear is_default before wiping plans so the partial unique index
-	// doesn't fire if a prior run left free with is_default=true.
-	_, _ = db.ExecContext(context.Background(), `UPDATE plans SET is_default = false`)
 	for _, tbl := range tables {
 		if _, err := db.ExecContext(context.Background(), "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("wipe %s: %v", tbl, err)
 		}
 	}
-	// Plans: free is default, monthly is paid.
+	// Plans: free and monthly.
 	for _, p := range []struct {
 		id, name string
 		price    float64
 		days     int
 		apps     []string
-		isDef    bool
 	}{
-		{"free", "Free", 0, 0, []string{"yundian"}, true},
-		{"monthly", "Monthly", 29.9, 30, []string{"yundian", "yundash"}, false},
+		{"free", "Free", 0, 0, []string{"yundian"}},
+		{"monthly", "Monthly", 29.9, 30, []string{"yundian", "yundash"}},
 	} {
 		_, err := db.ExecContext(context.Background(), `
-			INSERT INTO plans (id, name, price, interval_days, apps, is_default)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO plans (id, name, price, interval_days, apps)
+			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (id) DO NOTHING
-		`, p.id, p.name, p.price, p.days, p.apps, p.isDef)
+		`, p.id, p.name, p.price, p.days, p.apps)
 		if err != nil {
 			t.Fatalf("seed plan %s: %v", p.id, err)
 		}

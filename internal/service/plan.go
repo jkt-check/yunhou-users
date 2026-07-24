@@ -29,6 +29,12 @@ func (s *PlanService) GetPlan(ctx context.Context, id string) (*model.Plan, erro
 	return s.planRepo.FindByID(ctx, id)
 }
 
+// FindDefault is deprecated: the default plan concept was removed by migration 014.
+// Callers must supply an explicit plan_id.
+func (s *PlanService) FindDefault(context.Context) (*model.Plan, error) {
+	return nil, ErrDeprecatedDefaultPlan
+}
+
 // FindByApp returns active plans whose `apps` array contains appID. Used by
 // the public GET /apps/:id/plans endpoint (M2) to enumerate plans available
 // for a given app — including their provider_ids sourced from
@@ -41,9 +47,6 @@ func (s *PlanService) CreatePlan(ctx context.Context, p *model.Plan) error {
 	if p.Currency == "" {
 		p.Currency = "CNY"
 	}
-	// Phase 1 keeps the legacy column, but newly created plans must never be
-	// designated as the default plan.
-	p.IsDefault = false
 	if err := s.planRepo.Create(ctx, p); err != nil {
 		return err
 	}

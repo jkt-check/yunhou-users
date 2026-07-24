@@ -9,11 +9,17 @@ Yunhou Users is a **shared user management API** serving multiple consumer appli
 ## Architecture
 
 - **Shared identity**: One user account across all consumer apps
-- **Plan-based access**: Apps are accessible based on the user's subscribed plan (free/monthly/quarterly/yearly)
+- **Plan-based access**: Apps are accessible only through an active subscription whose active Plan includes the requested app
 - **API-first**: Consumer apps integrate via REST; no server-rendered UI
 - **OAuth redirect flow**: Login is via `/auth/{github,wechat}/redirect` → `/auth/{github,wechat}/callback`. Yunhou holds each app's GitHub OAuth App `client_secret` / WeChat Open Platform 网站应用 AppSecret and runs the code exchange server-side. There is no `POST /auth/login` endpoint. The two providers share `util.IssueOAuthState` for the HMAC state token — the state binding is `(appID, callbackIndex)`, provider-agnostic.
-- **Subscription gate**: Login and token refresh check active subscription and plan app list before issuing tokens
+- **Subscription-derived authorization**: Login remains available without a usable subscription, but JWT `scope` and `subscription.has_access` are narrowed according to the subscription decision matrix below
 - **Refresh token rotation**: Every refresh invalidates the old refresh token and issues a new one
+
+### Commercial plans
+
+Plans are the commercial source of truth. In addition to identity, price, interval, app scope, and active state, each Plan carries `is_listed`, `accepting_new_subscriptions`, `currency`, `trial_days`, nullable `description`, `display_order`, and DB-managed `updated_at`. `currency` is restricted to `CNY` / `USD` / `EUR`, `trial_days` must be non-negative, and quote/order currency plus quote trial duration are derived from the Plan.
+
+`is_listed` controls catalog presentation independently from `accepting_new_subscriptions`, which controls whether new subscriptions/orders may be created. The seeded `quarterly` Plan is a legacy offer (`accepting_new_subscriptions=false`) but existing subscriptions may still renew. The `free` Plan is being retired (`is_active=false`, `accepting_new_subscriptions=false` in Phase 2). Admin create/patch already reject any `is_default` input with 400; Phase 2 removes the column and the default-plan fallback entirely.
 
 ### Layering
 
@@ -28,7 +34,16 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 3. `POST /auth/logout` — revokes refresh token
 4. Consumer apps verify access tokens locally via `GET /.well-known/jwks.json` (RSA256 JWK, kid=`yunhou-users-rsa`)
 
-**Plan-based access**: Each plan contains a list of accessible apps. When a user logs in, the response includes `has_access: true/false` for the requested app based on their subscribed plan.
+**Plan-based access decision matrix**:
+
+| Subscription state | JWT `scope` | `subscription.plan_id` | `subscription.has_access` |
+|---|---|---|---|
+| No subscription | `[]` | Empty / null-equivalent | `false` |
+| Expired subscription | `[]` | Historical Plan ID preserved | `false` |
+| Active subscription, active Plan | `plan.apps` | Current Plan ID | `true` only when `plan.apps` contains the requested `app_id`; otherwise `false` |
+| Active subscription, inactive Plan | `[]` | Current Plan ID preserved | `false` |
+
+`subscription.is_accepting_new` is always present. It is `true` only when the selected/historical Plan is active and has `accepting_new_subscriptions=true`; it does not itself grant access.
 
 ### JWT Claims
 
@@ -38,7 +53,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `iss` | string | Issuer; server-validated as `"yunhou-users"` |
 | `aud` | string array | App IDs the token is valid for; server-validated to include the requested `app_id` |
 | `app_id` | string | App ID the token was issued for (matches `aud[0]`) |
-| `scope` | string array | Apps from the user's current Plan (`plans.apps`) |
+| `scope` | string array | Apps from the user's active Plan; empty for no subscription, expired subscriptions, or inactive Plans |
 | `exp` | int (Unix s) | Expiry — set to `iat + JWT_ACCESS_TTL` |
 | `iat` | int (Unix s) | Issued-at |
 
@@ -52,7 +67,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 - `make deps` — tidy go.mod
 - `make generate-keys` — generate RSA key pair in `keys/`
 - `go test -race -run TestFoo ./internal/service/` — run a single test
-- Database migration: apply `001_init.sql`, then `002_simplify_plans.sql`, then `003_payments.sql`, then `004_ls_channel.sql`, then `005_paypal_channel.sql`, then `006_paypal_sub_mapping.sql`, then `007_app_secret.sql`, then `008_drop_lemonsqueezy.sql` (each depends on the prior; running out of order fails). After applying 007, run the server once so `BackfillAppSecrets` populates `secret_hash` for pre-existing app rows; capture the plaintexts from the deploy log and rotate them via `POST /admin/apps/:id/rotate-secret`. Migration 008 removes `lemonsqueezy` from the channel CHECK constraint after LemonSqueezy was removed from the codebase.
+- Database migration: apply `001_init.sql` through `013_plan_change_log_fk_set_null.sql` in numeric order (each depends on the prior; running out of order fails). Migration 012 adds the commercial Plan fields; migration 013 adjusts the Plan audit-log FK. Phase 2 will add `014_remove_default_plan.sql` to retire `free` and remove `is_default`, coordinated with the auth-service default-fallback removal. After applying 007, run the server once so `BackfillAppSecrets` populates `secret_hash` for pre-existing app rows; capture the plaintexts from the deploy log and rotate them via `POST /admin/apps/:id/rotate-secret`. Migration 008 removes `lemonsqueezy` from the channel CHECK constraint after LemonSqueezy was removed from the codebase.
 
 ## Required Environment Variables
 
@@ -76,7 +91,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Not consumed by the running redirect flow — `/auth/github/*` reads each app's GitHub OAuth App credentials from `apps.config.oauth_providers.github` in the DB. Safe to leave blank. |
 | `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the OAuth `state` parameter (`/auth/{github,wechat}/redirect` + `/auth/{github,wechat}/callback`). The state binding is provider-agnostic — both flows share `util.IssueOAuthState` and bind `(app_id, callback_index)`. Server-side only — multi-instance deployments must share the same value. **Minimum 32 characters** — `Validate()` (`internal/config/config.go:127`) rejects shorter values. Generate with `openssl rand -hex 32`. |
-| `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login`. `1` enables the endpoint; any other value (or unset) makes the handler return 404. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
+| `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login?plan_id=<plan-id>`. `1` enables the endpoint; any other value (or unset) makes the handler return 404. Every enabled request must supply an explicit Plan ID. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 
 ## API Response Format
 
@@ -92,27 +107,28 @@ All endpoints return:
 ## Endpoints
 
 **Public** (rate-limited 10/s burst 20 per IP):
-- `GET /.well-known/jwks.json`, `POST /auth/refresh`, `POST /auth/logout`, `GET /apps/:id/plans`
+- `GET /.well-known/jwks.json`, `POST /auth/refresh`, `POST /auth/logout`
+- `GET /apps/:id/plans` — returns active Plans as `PublicPlan` DTOs, including `currency`, `trial_days`, nullable `description`, and `display_order` alongside price/app/provider/cycle data.
 - `GET /auth/github/redirect` and `GET /auth/github/callback` — the GitHub OAuth Authorization Code flow. Yunhou holds the OAuth App's `client_secret` and runs the code exchange server-side; the BFF supplies only `client_id` (via redirect URL) and a `redirect_uri` matching an entry in `apps.config.oauth_providers.github.callback_urls`. See "Boundary" below.
 - `GET /auth/wechat/redirect` and `GET /auth/wechat/callback` — the WeChat Open Platform 网站应用 (QR-code) OAuth2.0 flow. Same posture as GitHub: Yunhou holds each app's `app_secret` and runs the code exchange server-side. The authorize URL is `open.weixin.qq.com/connect/qrconnect` (with mandatory `#wechat_redirect` fragment), and `redirect_uri` must match an entry in `apps.config.oauth_providers.wechat.callback_urls`. Yunhou REJECTS logins where `/sns/userinfo` lacks `unionid` (returned as `#error=auth_failed&reason=wechat_no_unionid`).
-- `POST /test/login` — **dev-only** (gated by `PAYPAL_L3_E2E_MODE=1`, otherwise returns 404). Used by `tests/e2e-ui/` and `tests/integration/` to mint JWTs without going through OAuth. Never exposed in production.
+- `POST /test/login?plan_id=<plan-id>` — **dev-only** (gated by `PAYPAL_L3_E2E_MODE=1`, otherwise returns 404). `plan_id` is required; missing returns 400, unknown returns 404, and inactive/not-accepting Plans return 400. Used by `tests/e2e-ui/` and `tests/integration/` to mint JWTs without going through OAuth. Never exposed in production.
 
 **Health probe** (NOT rate-limited — registered before the public limiter in `internal/router/router.go:35`):
 - `GET /healthz` — DB-backed liveness/readiness. Returns 200 `{"code":0,"data":{"status":"ok"}}` or 503 `{"code":503,"message":"db unavailable"}` if the DB ping fails.
 
 **User** (JWT Bearer auth, no explicit rate limit on `/user/*`):
 - `GET /user/profile`, `PATCH /user/profile`, `GET /user/identities`, `DELETE /user/identities/:id`, `GET /user/subscriptions`, `POST /user/subscriptions`, `DELETE /user/subscriptions/:id`
-- `POST /apps/:id/quote` — JWT-authed quote endpoint mounted at the engine level (NOT under `/user`) so the URL stays `/apps/:id/quote`; the handler reads `user_id` from JWT context but does NOT gate on subscription status — any authenticated user may quote any plan. `currency` is hardcoded `"USD"` in v1.
+- `POST /apps/:id/quote` — JWT-authed quote endpoint mounted at the engine level (NOT under `/user`) so the URL stays `/apps/:id/quote`; the handler reads `user_id` from JWT context but does NOT gate on subscription status — any authenticated user may quote any plan. `currency` and `cycle_config.trial_days` are derived from the Plan.
 
 **Payments & Refunds** (JWT Bearer auth, rate-limited 30/s burst 60 per IP):
 - `POST /payments/orders`, `GET /payments/orders/:id`, `DELETE /payments/orders/:id`, `POST /payments/orders/:order_id/confirm`
 - `GET /payments`, `GET /payments/:id`, `GET /payments/:id/refunds`
 - `POST /refunds`, `GET /refunds/:id`
-- New orders write `currency = "CNY"` hardcoded in `internal/service/payment.go:125`. Channel webhooks carry `sub_expires_at` through `payment.metadata`/`resource.sub_expires_at`/`meta.custom_data.sub_expires_at` — yunhou-users does not derive it server-side.
+- New orders snapshot `plan.price` and `plan.currency`; PayPal requires a USD Plan and WeChat Pay requires a CNY Plan (`ErrPlanCurrencyMismatch` otherwise). Channel webhooks carry `sub_expires_at` through `payment.metadata`/`resource.sub_expires_at`/`meta.custom_data.sub_expires_at` — yunhou-users does not derive it server-side.
 
 **App management** (internal service auth via `X-App-ID` + `X-App-Secret` headers, rate-limited 30/s burst 60 per IP):
 - `GET /apps`, `GET /apps/:id`, `GET /apps/:id/provider-token/:channel` (PayPal OAuth token cached in-process for `expires_in − 60s` — typically ~9h, never shorter than the safety margin; singleflight dedupe avoids N concurrent fetches per `client_id`)
-- `GET /admin/plans`, `GET /admin/plans/:id`, `POST /admin/plans`, `PATCH /admin/plans/:id`, `DELETE /admin/plans/:id`
+- `GET /admin/plans`, `GET /admin/plans/:id`, `POST /admin/plans`, `PATCH /admin/plans/:id`, `DELETE /admin/plans/:id`; create/patch accept the commercial fields but reject any `is_default` input with 400
 - `POST /admin/apps` (returns plaintext `secret` once — only bcrypt hash is persisted), `PATCH /admin/apps/:id`, `POST /admin/apps/:id/rotate-secret` (returns new plaintext, invalidates the old one immediately)
 
 **Channel webhooks** (signature verification, NOT JWT; rate-limited 200/s burst 400 per IP — looser bucket because traffic is upstream-driven):

@@ -7,7 +7,7 @@
 Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一套用户身份——每个用户只需一个账号即可使用所有接入应用。系统支持两种 OAuth 重定向登录：GitHub OAuth 和 WeChat Open Platform 网站应用（扫码登录）。`POST /auth/login` 已下线，所有登录必须走下方对应的重定向流程。
 
 核心概念：
-- **Plan（订阅计划）**：定义可访问的 App 列表。Plan ID 由运营侧自由定义（例：`free` / `monthly` / `quarterly`）
+- **Plan（订阅计划）**：定义商业属性与可访问的 App 列表。Plan ID 由运营侧自由定义（例：`monthly` / `quarterly` / `yearly`）
 - **App（应用）**：接入的系统，如 yundian、yundash
 - **Subscription（订阅）**：用户订阅某个 Plan
 
@@ -46,15 +46,24 @@ Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一
       "plan_id": "monthly",
       "plan_name": "按月订阅",
       "has_access": true,
-      "expires_at": "2026-12-19T00:00:00Z"
+      "expires_at": "2026-12-19T00:00:00Z",
+      "is_accepting_new": true
     }
   }
 }
 ```
 
-**关键字段**：`has_access` 表示用户是否可以访问当前 App。如果为 `false`，用户可能需要升级订阅。
+**关键字段**：`data.subscription.has_access` 表示用户是否可以访问当前 App；它只在订阅有效、Plan 启用且 `plan.apps` 包含当前 `app_id` 时为 `true`。`data.subscription.is_accepting_new` 表示该 Plan 当前是否仍接受新订阅，不等价于访问权限。无订阅或订阅已过期时 `has_access=false` 且 JWT `scope=[]`；过期订阅仍保留历史 `plan_id` 供续费页面使用。
 
-**字段约束（重要）**：`data.user.nickname` / `data.user.email` / `data.user.avatar_url` 都是 optional（GitHub 没返回 email、用户没设头像时整个字段**缺失**而不是 `null`）；`data.subscription.expires_at` 同理（订阅永不过期时缺失）。集成方用 TypeScript / Go struct 等静态类型时需把这些字段标为 `?:` / `*string` / `*time.Time`，否则会编译失败或 runtime 报错。
+**商业 Plan 新增错误**：
+
+| Service sentinel | HTTP | 触发条件 |
+|---|---|---|
+| `ErrPlanNotAcceptingNew` | 409 | 创建订阅或订单时，Plan 不接受新订阅 |
+| `ErrPlanCurrencyMismatch` | 400 | 下单渠道要求的币种与 `plan.currency` 不一致 |
+| `ErrInvalidAppID` | 400 | 管理端创建/更新 Plan 时，`apps` 含未知或已停用的 App ID |
+
+**字段约束（重要）**：`data.user.nickname` / `data.user.email` / `data.user.avatar_url` 都是 optional（GitHub 没返回 email、用户没设头像时整个字段**缺失**而不是 `null`）；`data.subscription.expires_at` 同理（订阅永不过期时缺失）。`data.subscription.is_accepting_new` 是始终返回的 boolean（无可用 Plan 时为 `false`）。集成方用 TypeScript / Go struct 等静态类型时需把 optional 字段标为 `?:` / `*string` / `*time.Time`，否则会编译失败或 runtime 报错。
 
 `POST /auth/refresh` 与 `POST /auth/logout` 返回相同 envelope，所以同样的 optional 字段约定适用。
 
@@ -202,7 +211,7 @@ curl https://your-yunhou-domain/user/profile \
 
 #### GET /apps/:id/plans
 
-公共的 Plan 目录接口，**无需鉴权**（无需 `X-App-ID`、无需 JWT）。返回指定 App 当前启用的 Plans，每个 Plan 附带上游渠道的 plan_id / variant_id 与解析后的 trial / billing cycle，方便营销页直接渲染价格 + "前 X 天免费，之后每 Y 天 $Z"。
+公共的 Plan 目录接口，**无需鉴权**（无需 `X-App-ID`、无需 JWT）。返回指定 App 当前启用的 Plans，按 `display_order ASC, created_at ASC, id ASC` 排序。响应使用精简的 `PublicPlan` DTO，包含商业展示字段及上游渠道的 plan ID / variant ID。
 
 **响应（200）**：
 ```json
@@ -210,21 +219,30 @@ curl https://your-yunhou-domain/user/profile \
   "code": 0,
   "data": [
     {
-      "id": "free",
-      "name": "免费",
-      "price": 0,
-      "interval_days": 0,
-      "is_default": true,
-      "provider_ids": {}
-    },
-    {
       "id": "monthly",
       "name": "按月订阅",
       "price": 29.9,
       "interval_days": 30,
-      "is_default": false,
-      "provider_ids": {"paypal": "P-MONTHLY-7D"},
-      "cycle": {"trial_days": 7, "billing_cycle_days": 30}
+      "currency": "CNY",
+      "trial_days": 0,
+      "description": "按月订阅 ¥29.9，自动续费，可随时取消",
+      "apps": ["yundian", "yundash"],
+      "display_order": 10,
+      "provider_ids": {"paypal": "P-MONTHLY"},
+      "cycle": {"trial_days": 0, "billing_cycle_days": 30}
+    },
+    {
+      "id": "quarterly",
+      "name": "按季订阅",
+      "price": 79.9,
+      "interval_days": 90,
+      "currency": "CNY",
+      "trial_days": 0,
+      "description": "按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留",
+      "apps": ["yundian", "yundash"],
+      "display_order": 20,
+      "provider_ids": {},
+      "cycle": null
     }
   ]
 }
@@ -234,10 +252,15 @@ curl https://your-yunhou-domain/user/profile \
 
 | 字段 | 说明 |
 |------|------|
-| `provider_ids` | 该 Plan 在 PayPal 上对应的 subscription plan ID。未配置 PayPal 时为 `{}`（BFF 即可判定"当前 App 该 Plan 暂无可下单渠道"）。 |
-| `cycle` | 解析后的试用 + 计费周期；用于营销页文案。PayPal 未配置此 plan 时**字段被省略**（不是 `null`，BFF 集成时应用 `cycle === undefined` 判空而非 `=== null`）；缺失时回退到 `interval_days`。 |
+| `currency` | Plan 的结算币种；取值为 `CNY` / `USD` / `EUR`。 |
+| `trial_days` | Plan 定义的商业试用天数。 |
+| `description` | 可空的营销文案。 |
+| `apps` | 该 Plan 授权的 App ID 列表。 |
+| `display_order` | 运营配置的展示顺序；数值较小的 Plan 先返回。 |
+| `provider_ids` | 该 Plan 在 PayPal 等渠道对应的上游 plan ID。未配置时为 `{}`（BFF 即可判定“当前 App 该 Plan 暂无可下单渠道”）。 |
+| `cycle` | Provider 侧解析后的试用 + 计费周期；用于营销页核对上游配置。对应 Plan 未配置 PayPal 时为 `null`；业务试用天数仍以顶层 `trial_days`（即 `plan.trial_days`）为准。 |
 
-**cycle 解析规则**：使用 PayPal 的 `trial_days` + `billing_cycle_days`。运营侧需保证 PayPal 控制台上的账单周期与这里写下的值一致，否则营销页展示的 "X 天免费 / Y 天周期" 跟实际结算会不一致。
+`PublicPlan` 不返回管理字段 `is_active`、`is_listed`、`accepting_new_subscriptions`、`updated_at` 或已废弃的 `is_default`。`quarterly` 当前是 legacy Plan（`accepting_new_subscriptions=false`）；目录出现不代表可以创建新订阅或订单，BFF 下单前必须处理 409。`free` 正在退役，Phase 2 会设置 `is_active=false`、`accepting_new_subscriptions=false`。
 
 **错误响应**：
 
@@ -383,19 +406,19 @@ Authorization: Bearer <access_token>
 
 #### POST /user/subscriptions
 
-创建订阅。仅免费 Plan（`price == 0`）允许用户自助创建；付费 Plan 必须通过支付流程创建（参见 §支付接口）。`expires_at` 字段被服务层忽略，过期时间由 `plan.interval_days` 推导（`interval_days == 0` 表示永不过期）。
+创建订阅。仅同时满足 `price == 0`、`is_active=true`、`accepting_new_subscriptions=true` 的 Plan 允许用户自助创建；付费 Plan 必须通过支付流程创建（参见 §支付接口）。`expires_at` 字段被服务层忽略，过期时间由 `plan.interval_days` 推导（`interval_days == 0` 表示永不过期）。种子 Plan `free` 正在退役且不接受新订阅，因此不能再用作自助订阅目标。
 
 **请求体**：
 ```json
 {
-  "plan_id": "free",
+  "plan_id": "promo",
   "expires_at": "2026-07-19T00:00:00Z"
 }
 ```
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `plan_id` | 是 | 订阅的 Plan ID；只接受 `price == 0` 的 Plan |
+| `plan_id` | 是 | 订阅的 Plan ID；只接受可用、接受新订阅且 `price == 0` 的 Plan |
 | `expires_at` | 否 | **忽略字段**（保留仅为向后兼容）。过期时间由 `plan.interval_days` 决定 |
 
 **响应（201）**：
@@ -405,7 +428,7 @@ Authorization: Bearer <access_token>
   "data": {
     "id": "550e8400-e29b-41d4-a716-446655440010",
     "user_id": "550e8400-e29b-41d4-a716-446655440002",
-    "plan_id": "free",
+    "plan_id": "promo",
     "status": "active",
     "started_at": "2026-06-23T08:30:00Z",
     "expires_at": null,
@@ -424,6 +447,7 @@ Authorization: Bearer <access_token>
 | 400 | `plan not found` | `plan_id` 不存在 |
 | 400 | `plan is inactive` | Plan 已停用 |
 | 403 | `paid plans require payment, cannot self-subscribe` | 试图自助订阅付费 Plan |
+| 409 | `plan is not accepting new subscriptions` (`ErrPlanNotAcceptingNew`) | Plan 是 legacy/停售状态，不接受新订阅 |
 | 409 | `user already has an active subscription` | 用户已有活跃订阅 |
 
 #### DELETE /user/subscriptions/:id
@@ -470,8 +494,8 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
       "webhook_id": "W-...",
       "mode": "live",
       "plans": {
-        "monthly": {
-          "plan_id": "P-MONTHLY-7D",
+        "monthly-usd": {
+          "plan_id": "P-MONTHLY-USD-7D",
           "trial_days": 7,
           "billing_cycle_days": 30
         }
@@ -484,9 +508,9 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 要点：
 
 - `paypal.plans` 是 `plan_id -> 配置对象` 的 map；`plan_id` 与业务 `plans.id` 同名（运营侧负责对齐）。
-- `trial_days` / `billing_cycle_days` 决定 `sub_expires_at = now + trial + cycle` 的计算结果；务必与 PayPal 控制台账单周期同步。`billing_cycle_days` 缺省时回退到 `plans.interval_days`。
+- `trial_days` 仍会被解析，供 provider 配置兼容与 `PublicPlan.cycle` 核对使用，但已废弃为业务试用期来源；`POST /apps/:id/quote` 只读取 `plan.trial_days`。`billing_cycle_days` 仅描述 PayPal 上游周期，缺省时回退到 `plans.interval_days`。
 - `brand.name` 缺省回退到 `apps.name`，对应 PayPal `application_context.brand_name`。
-- `apps.config` 中 PayPal 段当前 schema 是嵌套对象形：`{ plan_id, trial_days, billing_cycle_days }`。配置行若缺少 `payment_providers.paypal.plans` 或对应 plan_id 的条目，quote / catalog 接口会视该 plan 为未配置。
+- `apps.config` 中 PayPal 段当前 schema 是嵌套对象形：`{ plan_id, trial_days, billing_cycle_days }`。配置行若缺少 `payment_providers.paypal.plans` 或对应 plan_id 的条目，catalog 的 `provider_ids` 为空且 `cycle` 为 `null`；quote 的币种、试用期和账单周期仍分别来自 `plan.currency`、`plan.trial_days`、`plan.interval_days`。
 
 **字段校验**（`POST /admin/apps` 与 `PATCH /admin/apps/:id` 时执行；违反会得到 400 + 具体字段 message）：
 
@@ -582,13 +606,13 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### POST /apps/:id/quote
 
-下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**（终端用户身份触发；调用方必须先完成 GitHub OAuth 登录并拿到 JWT），handler 读 JWT 上下文中的 `user_id`。**注意**：当前**不强制 `has_access` gating**——任何已登录用户都可以对任意 app/plan 发起 quote，前端必须自己根据 `has_access` 决定是否展示下单按钮。
+下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**（终端用户身份触发；调用方必须先完成 GitHub OAuth 登录并拿到 JWT），handler 读 JWT 上下文中的 `user_id`。**注意**：当前**不强制 `subscription.has_access` gating**——任何已登录用户都可以对包含目标 app 的 Plan 发起 quote，前端必须自己根据 `subscription.has_access` 决定是否展示下单按钮。
 
 **路径参数**：`id` 是 App ID。
 
 **请求体**：
 ```json
-{ "plan_id": "monthly" }
+{ "plan_id": "monthly-usd" }
 ```
 
 | 字段 | 必填 | 说明 |
@@ -600,8 +624,8 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 {
   "code": 0,
   "data": {
-    "plan_id": "monthly",
-    "amount": 29.9,
+    "plan_id": "monthly-usd",
+    "amount": 4.99,
     "currency": "USD",
     "sub_expires_at": "2026-08-04T00:00:00Z",
     "cycle_config": {
@@ -611,7 +635,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
     },
     "provider_data": {
       "paypal": {
-        "plan_id": "P-MONTHLY-7D",
+        "plan_id": "P-MONTHLY-USD-7D",
         "application_context": {
           "brand_name": "云店",
           "shipping_preference": "NO_SHIPPING",
@@ -628,12 +652,12 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 | 字段 | 说明 |
 |------|------|
 | `amount` | 透传 `plans.price` |
-| `currency` | **v1 硬编码 `"USD"`**，与 `/payments/orders` 的 `currency` 字段无关。多币种尚不支持 |
-| `sub_expires_at` | `now + trial_days + billing_cycle_days`（服务器时间）。BFF 在创建 PayPal checkout 时将其写入 `metadata.sub_expires_at`；PayPal 自己的 renewal webhook 会通过 `resource.billing_info.next_billing_time` 回传，yunhou 不参与续费的周期计算 |
+| `currency` | 来自 `plan.currency`（`CNY` / `USD` / `EUR`），不再硬编码，也不接受 caller 覆盖 |
+| `sub_expires_at` | `now + plan.trial_days + plan.interval_days`（服务器时间）。BFF 在创建 PayPal checkout 时将其写入 `metadata.sub_expires_at`；PayPal 自己的 renewal webhook 会通过 `resource.billing_info.next_billing_time` 回传，yunhou 不参与续费的周期计算 |
 | `cycle_config.base` | 恒为 `"now + trial + cycle"`，给审计/排查时一眼看出计算方式 |
 | `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK |
 
-**Cycle 解析规则**：PayPal 是当前唯一受支持的支付渠道；`sub_expires_at` 完全由 `app.config.payment_providers.paypal.plans[plan_id].trial_days + billing_cycle_days` 决定。运营侧必须保证 PayPal 控制台的账单周期跟 `provider_data.paypal.plan_id` 对应的 product 一致，否则报价跟实际结算对不上。
+**Cycle 解析规则**：`cycle_config.trial_days` 来自 `plan.trial_days`，`cycle_config.billing_cycle_days` 来自 `plan.interval_days`；不再读取 `apps.config.payment_providers.paypal.plans[plan_id].trial_days`，且 `plan.trial_days == 0` 时不做 fallback。`sub_expires_at` 按这两个 Plan 字段计算。PayPal 的 provider 配置仍负责提供上游 `plan_id`，运营侧必须确保该 product 的实际周期与 Plan 一致，否则报价跟实际结算对不上。
 
 **错误响应**：
 
@@ -663,16 +687,6 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
   "code": 0,
   "data": [
     {
-      "id": "free",
-      "name": "免费",
-      "price": 0,
-      "interval_days": 0,
-      "apps": ["yundian"],
-      "is_active": true,
-      "is_default": true,
-      "created_at": "2026-01-01T00:00:00Z"
-    },
-    {
       "id": "monthly",
       "name": "按月订阅",
       "price": 29.9,
@@ -680,11 +694,37 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
       "apps": ["yundian", "yundash"],
       "is_active": true,
       "is_default": false,
+      "is_listed": true,
+      "accepting_new_subscriptions": true,
+      "currency": "CNY",
+      "trial_days": 0,
+      "description": "按月订阅 ¥29.9，自动续费，可随时取消",
+      "display_order": 10,
+      "updated_at": "2026-07-24T08:30:00Z",
+      "created_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "id": "quarterly",
+      "name": "按季订阅",
+      "price": 79.9,
+      "interval_days": 90,
+      "apps": ["yundian", "yundash"],
+      "is_active": true,
+      "is_default": false,
+      "is_listed": true,
+      "accepting_new_subscriptions": false,
+      "currency": "CNY",
+      "trial_days": 0,
+      "description": "按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留",
+      "display_order": 20,
+      "updated_at": "2026-07-24T08:30:00Z",
       "created_at": "2026-01-01T00:00:00Z"
     }
   ]
 }
 ```
+
+Phase 1 的管理端读取响应暂时仍包含 legacy `is_default=false`；该字段不能写入，并将在 Phase 2 连同默认 Plan 机制一起移除。`updated_at` 为只读字段，由数据库 trigger 在每次 UPDATE 时维护。
 
 #### POST /admin/plans
 
@@ -693,12 +733,18 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 **请求体**：
 ```json
 {
-  "id": "quarterly",
-  "name": "按季订阅",
-  "price": 79.9,
+  "id": "quarterly-usd",
+  "name": "按季订阅（USD）",
+  "price": 11.99,
   "interval_days": 90,
   "apps": ["yundian", "yundash"],
-  "is_default": false
+  "is_active": true,
+  "is_listed": true,
+  "accepting_new_subscriptions": true,
+  "currency": "USD",
+  "trial_days": 7,
+  "description": "按季订阅，含 7 天试用",
+  "display_order": 25
 }
 ```
 
@@ -708,32 +754,50 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 | `name` | 是 | Plan 显示名称 |
 | `price` | 否 | 价格，默认 0；必须 `>= 0` |
 | `interval_days` | 否 | 订阅周期（天），默认 0（永久）；必须 `>= 0` |
-| `apps` | 否 | 可访问的 App 列表，默认空 |
-| `is_default` | 否 | 是否为默认 Plan，默认 false |
+| `apps` | 否 | 可访问的 App 列表，默认空；每项必须是存在且启用的 App，否则返回 400 `ErrInvalidAppID` |
+| `is_active` | 否 | 是否启用，默认 `true` |
+| `is_listed` | 否 | 是否出现在商业目录，默认 `true` |
+| `accepting_new_subscriptions` | 否 | 是否允许创建新订阅/订单，默认 `true` |
+| `currency` | 否 | 默认 `CNY`；只能是 `CNY` / `USD` / `EUR` |
+| `trial_days` | 否 | 试用天数，默认 0；必须 `>= 0` |
+| `description` | 否 | 可空的营销文案 |
+| `display_order` | 否 | 目录排序值，默认 0；数值越小越靠前 |
+| `is_default` | 禁止 | 已废弃；只要请求体包含该字段就返回 400 |
 
-> `is_active` 在创建时默认设为 `true`。
+`updated_at` 不接受 caller 输入；它由数据库默认值和 UPDATE trigger 管理。
 
 **响应（201）**：
 ```json
 {
   "code": 0,
   "data": {
-    "id": "quarterly",
-    "name": "按季订阅",
-    "price": 79.9,
+    "id": "quarterly-usd",
+    "name": "按季订阅（USD）",
+    "price": 11.99,
     "interval_days": 90,
     "apps": ["yundian", "yundash"],
     "is_active": true,
     "is_default": false,
-    "created_at": "2026-06-23T08:30:00Z"
+    "is_listed": true,
+    "accepting_new_subscriptions": true,
+    "currency": "USD",
+    "trial_days": 7,
+    "description": "按季订阅，含 7 天试用",
+    "display_order": 25,
+    "updated_at": "2026-07-24T08:30:00Z",
+    "created_at": "2026-07-24T08:30:00Z"
   }
 }
 ```
 
 **响应（400）**—— 字段不合法：
 ```json
-{"code": 400, "message": "price must be >= 0"}
-{"code": 400, "message": "interval_days must be >= 0"}
+{"code": 400, "message": "price must be non-negative"}
+{"code": 400, "message": "interval_days must be non-negative"}
+{"code": 400, "message": "trial_days must be non-negative"}
+{"code": 400, "message": "currency must be one of CNY/USD/EUR"}
+{"code": 400, "message": "is_default is no longer supported; use plan selection logic in BFF"}
+{"code": 400, "message": "plan apps contains unknown or inactive app_id: missing-app"}
 ```
 
 #### PATCH /admin/plans/:id
@@ -748,7 +812,12 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
   "interval_days": 30,
   "apps": ["yundian", "yundash", "yundown"],
   "is_active": true,
-  "is_default": false
+  "is_listed": true,
+  "accepting_new_subscriptions": false,
+  "currency": "CNY",
+  "trial_days": 0,
+  "description": "仅保留已有订阅续费",
+  "display_order": 20
 }
 ```
 
@@ -757,9 +826,17 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 | `name` | 否 | 显示名称 |
 | `price` | 否 | 必须 `>= 0` |
 | `interval_days` | 否 | 必须 `>= 0` |
-| `apps` | 否 | 可访问的 App 列表（数组；传 `[]` 清空） |
+| `apps` | 否 | 可访问的 App 列表（数组；传 `[]` 清空）；每项必须存在且启用 |
 | `is_active` | 否 | 启用状态 |
-| `is_default` | 否 | 是否为默认 Plan |
+| `is_listed` | 否 | 目录可见性 |
+| `accepting_new_subscriptions` | 否 | 是否接受新订阅/订单；设为 `false` 不影响既有订阅续费 |
+| `currency` | 否 | 只能是 `CNY` / `USD` / `EUR` |
+| `trial_days` | 否 | 必须 `>= 0` |
+| `description` | 否 | 营销文案 |
+| `display_order` | 否 | 目录排序值 |
+| `is_default` | 禁止 | 已废弃；只要请求体包含该字段就返回 400 |
+
+`updated_at` 为只读、DB 管理字段，PATCH 成功后由 trigger 自动刷新。
 
 **响应（200）**：
 ```json
@@ -773,16 +850,19 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
     "apps": ["yundian", "yundash", "yundown"],
     "is_active": true,
     "is_default": false,
+    "is_listed": true,
+    "accepting_new_subscriptions": false,
+    "currency": "CNY",
+    "trial_days": 0,
+    "description": "仅保留已有订阅续费",
+    "display_order": 20,
+    "updated_at": "2026-07-24T09:00:00Z",
     "created_at": "2026-06-23T08:30:00Z"
   }
 }
 ```
 
-**响应（400）**—— 字段不合法：
-```json
-{"code": 400, "message": "price must be >= 0"}
-{"code": 400, "message": "interval_days must be >= 0"}
-```
+**响应（400）**—— 与创建接口执行相同的非负数、币种、App ID 和 `is_default` 校验。
 
 #### DELETE /admin/plans/:id
 
@@ -1255,8 +1335,13 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 **请求体**：
 ```json
-{"plan_id": "monthly"}
+{"plan_id": "monthly", "channel": "wechat_pay"}
 ```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `plan_id` | 是 | 要购买的 Plan ID；Plan 必须启用且接受新订阅 |
+| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `paypal`；PayPal 要求 `plan.currency=USD`，WeChat Pay 要求 `plan.currency=CNY` |
 
 **响应（201）**：
 ```json
@@ -1276,6 +1361,8 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 }
 ```
 
+订单金额和币种分别快照自 `plan.price` 与 `plan.currency`，caller 不能覆盖。PayPal 订单仅接受 USD Plan，WeChat Pay 订单仅接受 CNY Plan；不匹配返回 400 `ErrPlanCurrencyMismatch`。Stripe / Alipay 没有额外的单币种限制，沿用 Plan 币种。
+
 订单默认 30 分钟后过期，过期后由 sweeper 翻转为 `expired`。如果此后 webhook 到达，仍会"honor the payment"激活订阅（参见 webhook 文档 §8）。
 
 **错误响应**：
@@ -1285,6 +1372,8 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | 400 | `invalid request body` | 请求体缺失或字段类型错误 |
 | 400 | `plan not found` | `plan_id` 不存在 |
 | 400 | `plan is inactive` | Plan 已停用 |
+| 400 | `plan currency does not match order currency` (`ErrPlanCurrencyMismatch`) | Plan 币种不满足渠道要求（PayPal→USD，WeChat Pay→CNY） |
+| 409 | `plan is not accepting new subscriptions` (`ErrPlanNotAcceptingNew`) | Plan 已停售新订阅（例如 legacy `quarterly`） |
 | 409 | `user already has an active subscription` | 用户已有活跃订阅 |
 
 #### GET /payments/orders/:id
@@ -1678,7 +1767,7 @@ GET /.well-known/jwks.json
 | `iss` | 固定值 `"yunhou-users"`（服务端会校验） |
 | `aud` | 登录时请求的 App ID（数组；服务端会校验是否包含 `app_id`） |
 | `app_id` | 登录时请求的 App ID（与 `aud[0]` 一致） |
-| `scope` | Plan 中定义的 Apps 列表（`[]string`） |
+| `scope` | 有效订阅 Plan 的 Apps 列表（`[]string`）；无订阅、订阅过期或 Plan 停用时为 `[]` |
 | `exp` | 过期时间（Unix 秒） |
 | `iat` | 签发时间（Unix 秒） |
 
@@ -1699,13 +1788,20 @@ GET /.well-known/jwks.json
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `id` | string | Plan ID（如 `free`, `monthly`） |
+| `id` | string | Plan ID（如 `monthly`, `quarterly`） |
 | `name` | string | 显示名称 |
-| `price` | decimal | 价格 |
-| `interval_days` | int | 订阅周期（天），0 表示永久 |
-| `apps` | string[] | 该 Plan 可访问的 App 列表 |
-| `is_active` | bool | 是否启用 |
-| `is_default` | bool | 是否为默认 Plan |
+| `price` | decimal | 价格；必须 `>= 0` |
+| `interval_days` | int | 订阅周期（天），0 表示永久；必须 `>= 0` |
+| `apps` | string[] | 该 Plan 可访问的 App 列表；管理端写入时每个 App 必须存在且启用 |
+| `is_active` | bool | 是否启用；停用后不授予访问 scope |
+| `is_default` | bool | Phase 1 只读 legacy 字段；管理端输入会返回 400，Phase 2 将删除 |
+| `is_listed` | bool | 是否在商业目录中展示；与是否接受新订阅相互独立 |
+| `accepting_new_subscriptions` | bool | 是否允许创建新订阅/订单；不影响既有订阅续费 |
+| `currency` | string | 结算币种；只能是 `CNY` / `USD` / `EUR` |
+| `trial_days` | int | 试用天数；必须 `>= 0`，quote 的权威来源 |
+| `description` | string? | 可空的营销文案 |
+| `display_order` | int | 目录排序值；数值越小越靠前 |
+| `updated_at` | datetime | 更新时间；只读，由数据库 trigger 管理 |
 | `created_at` | datetime | 创建时间 |
 
 ### App
@@ -1810,8 +1906,8 @@ GET /.well-known/jwks.json
 - [ ] BFF 调 `/apps/:id/plans`、`/apps/:id/provider-token/:channel`、所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`
 - [ ] 实现 GitHub OAuth 重定向登录：BFF 302 到 `/auth/github/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，让浏览器走完 GitHub 授权；回调页从 URL fragment 解析 `token` / `refresh_token` / `user_id` / `has_access`（注意 fragment 不会上行到服务器，BFF 必须前端 JS 解析）
 - [ ] （可选）实现 WeChat OAuth 扫码登录：BFF 302 到 `/auth/wechat/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，PC 浏览器展示二维码；用户手机微信扫码后在回调页同样从 URL fragment 解析 token；需要识别 fragment 里的 `error=auth_failed&reason=wechat_no_unionid` 并展示对应文案；所有 Yunhou 消费 app 的「网站应用」必须注册在**同一个微信开放平台账号**下才能跨 app unionid 统一
-- [ ] 解析响应中的 `has_access` 字段，判断用户是否有权限访问
-- [ ] 如果 `has_access` 为 `false`，提示用户订阅/升级
+- [ ] 解析响应中的 `subscription.has_access` 字段，判断用户是否有权限访问
+- [ ] 如果 `subscription.has_access` 为 `false`，提示用户订阅/升级；过期订阅用保留的 `subscription.plan_id` 渲染续费 CTA
 - [ ] 使用 `access_token` 调用用户接口
 - [ ] 实现 Token 刷新逻辑，处理 Refresh Token 轮转（每次 refresh 必须使用返回的新 refresh_token，旧 token 立即失效）
 - [ ] 获取 JWKS 配置本地 JWT 验证（**必须**，不要每次请求都把 token 回传给 yunhou-users 校验）

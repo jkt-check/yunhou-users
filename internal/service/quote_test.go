@@ -40,6 +40,7 @@ func mustJSONRawQuote(t *testing.T, s string) json.RawMessage {
 func TestQuote_Get_HappyPath_PayPalConfigured(t *testing.T) {
 	plan := &model.Plan{
 		ID: "monthly", Name: "Monthly", Price: 29.9, IntervalDays: 30,
+		Currency: "USD", TrialDays: 7,
 		Apps: pq.StringArray{"yundian"}, IsActive: true,
 	}
 	app := &model.App{
@@ -47,7 +48,7 @@ func TestQuote_Get_HappyPath_PayPalConfigured(t *testing.T) {
 		Config: mustJSONRawQuote(t, `{
 			"brand": {"name": "Yundian Brand"},
 			"payment_providers": {
-				"paypal": {"plans": {"monthly": {"plan_id": "P-1", "trial_days": 7, "billing_cycle_days": 30}}}
+				"paypal": {"plans": {"monthly": {"plan_id": "P-1"}}}
 			}
 		}`),
 	}
@@ -77,6 +78,68 @@ func TestQuote_Get_HappyPath_PayPalConfigured(t *testing.T) {
 	}
 	if pd["plan_id"] != "P-1" {
 		t.Errorf("paypal.plan_id = %v", pd["plan_id"])
+	}
+}
+
+// TestQuoteService_Get_PlanTrialDaysOverride verifies that plan.TrialDays
+// drives Quote.CycleConfig.TrialDays — not the AppConfig PayPal per-plan
+// trial_days override. After migration 012, plan.trial_days is the single
+// source of truth; AppConfig.Paypal.Plans[id].trial_days is still parsed
+// for external consumers but is no longer consulted by quote.
+func TestQuoteService_Get_PlanTrialDaysOverride(t *testing.T) {
+	plan := &model.Plan{
+		ID: "monthly", Price: 29.9, IntervalDays: 30, TrialDays: 14,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+	}
+	// AppConfig.Paypal.Plans[id].trial_days = 7 (DIFFERENT from plan.TrialDays=14).
+	// Quote must read plan.TrialDays=14, ignoring the AppConfig override.
+	app := &model.App{
+		AppID: "yundian", Name: "Yundian", IsActive: true,
+		Config: mustJSONRawQuote(t, `{
+			"payment_providers": {
+				"paypal": {"plans": {"monthly": {"plan_id": "P-1", "trial_days": 7, "billing_cycle_days": 30}}}
+			}
+		}`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "user-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.CycleConfig.TrialDays != 14 {
+		t.Errorf("quote.CycleConfig.TrialDays = %d, want 14 (from plan.TrialDays, not AppConfig)", quote.CycleConfig.TrialDays)
+	}
+	if quote.CycleConfig.BillingCycleDays != 30 {
+		t.Errorf("quote.CycleConfig.BillingCycleDays = %d, want 30", quote.CycleConfig.BillingCycleDays)
+	}
+}
+
+// TestQuoteService_Get_CurrencyFromPlan verifies that Quote.Currency comes
+// from plan.Currency rather than a hardcoded "USD". CNY is used (not USD) so
+// the assertion actually proves the source moved — with the old hardcoded
+// "USD" constant this test would fail with "expected CNY, got USD".
+func TestQuoteService_Get_CurrencyFromPlan(t *testing.T) {
+	plan := &model.Plan{
+		ID: "monthly", Price: 29.9, IntervalDays: 30, Currency: "CNY",
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+	}
+	app := &model.App{
+		AppID: "yundian", Name: "Yundian", IsActive: true,
+		Config: mustJSONRawQuote(t, `{
+			"payment_providers": {
+				"paypal": {"plans": {"monthly": {"plan_id": "P-1", "billing_cycle_days": 30}}}
+			}
+		}`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "user-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.Currency != "CNY" {
+		t.Errorf("quote.Currency = %q, want %q (from plan.Currency, not hardcoded USD)", quote.Currency, "CNY")
 	}
 }
 

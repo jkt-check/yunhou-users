@@ -73,13 +73,17 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 		}
 	}
 
-	cycle := model.ResolveCycle(cfg, planID, plan.IntervalDays)
+	cycle := model.CycleConfig{
+		TrialDays:        plan.TrialDays,
+		BillingCycleDays: plan.IntervalDays,
+		Base:             model.CycleBaseFormula,
+	}
 	subExpires := time.Now().Add(time.Duration(cycle.TrialDays+cycle.BillingCycleDays) * 24 * time.Hour)
 
 	return &model.Quote{
 		PlanID:       plan.ID,
 		Amount:       plan.Price,
-		Currency:     "USD",
+		Currency:     plan.Currency,
 		SubExpiresAt: subExpires,
 		CycleConfig:  cycle,
 		ProviderData: buildProviderData(cfg, planID),

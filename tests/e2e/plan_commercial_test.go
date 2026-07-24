@@ -11,8 +11,9 @@ import (
 // "all seven new fields round-trip through POST/GET/PATCH" guard. The seven
 // new fields (added in migration 012) are: is_listed,
 // accepting_new_subscriptions, currency, trial_days, description,
-// display_order, updated_at. We exercise POST + GET in one test; PATCH
-// round-trip lives in the same shape so a single E2E is enough.
+// display_order, updated_at. We exercise POST + GET to confirm the initial
+// round-trip, then PATCH a couple of the new commercial fields and verify
+// via a follow-up GET that the update took effect.
 func TestE2E_PlanCommercial_CreateWithNewFields(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 	hdrs := appAuthHeaders(superAppID)
@@ -119,6 +120,50 @@ func TestE2E_PlanCommercial_CreateWithNewFields(t *testing.T) {
 	}
 	if len(fetched.Data.Apps) != 1 || fetched.Data.Apps[0] != "yundian" {
 		t.Errorf("get apps = %v, want [yundian]", fetched.Data.Apps)
+	}
+
+	// PATCH /admin/plans/:id — flip a few of the new commercial fields and
+	// verify via a follow-up GET. Spec §10.2 requires PATCH coverage for the
+	// round-trip; mirror the body shape used in
+	// TestPlanHandler_Patch_AcceptsNewFields (internal/handler/handler_test.go).
+	const patchedDescription = "PATCHED — E2E plan with all 7 new fields"
+	patchBody := `{
+		"trial_days": 14,
+		"description": "` + patchedDescription + `",
+		"display_order": 99
+	}`
+	patchResp := doRequest(t, engine, http.MethodPatch, "/admin/plans/"+planID, patchBody, hdrs)
+	if patchResp.StatusCode != http.StatusOK {
+		t.Fatalf("patch plan: status = %d, body = %s", patchResp.StatusCode, string(patchResp.Body))
+	}
+
+	// Follow-up GET asserts the PATCH took effect for the new commercial
+	// fields. Other fields (currency, is_listed, accepting_new_subscriptions)
+	// already had full coverage on the initial GET above.
+	getResp2 := doRequest(t, engine, http.MethodGet, "/admin/plans/"+planID, "", hdrs)
+	if getResp2.StatusCode != http.StatusOK {
+		t.Fatalf("get plan after patch: status = %d, body = %s", getResp2.StatusCode, string(getResp2.Body))
+	}
+	var fetched2 struct {
+		Data struct {
+			TrialDays    int     `json:"trial_days"`
+			Description  *string `json:"description"`
+			DisplayOrder int     `json:"display_order"`
+			UpdatedAt    string  `json:"updated_at"`
+		} `json:"data"`
+	}
+	getResp2.JSON(t, &fetched2)
+	if fetched2.Data.TrialDays != 14 {
+		t.Errorf("get-after-patch trial_days = %d, want 14", fetched2.Data.TrialDays)
+	}
+	if fetched2.Data.Description == nil || *fetched2.Data.Description != patchedDescription {
+		t.Errorf("get-after-patch description = %v, want %q", fetched2.Data.Description, patchedDescription)
+	}
+	if fetched2.Data.DisplayOrder != 99 {
+		t.Errorf("get-after-patch display_order = %d, want 99", fetched2.Data.DisplayOrder)
+	}
+	if fetched2.Data.UpdatedAt == "" || fetched2.Data.UpdatedAt == fetched.Data.UpdatedAt {
+		t.Errorf("get-after-patch updated_at = %q, want new non-empty value (was %q)", fetched2.Data.UpdatedAt, fetched.Data.UpdatedAt)
 	}
 }
 

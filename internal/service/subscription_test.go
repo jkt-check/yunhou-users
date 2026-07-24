@@ -343,13 +343,12 @@ func TestSubscriptionService_GetUserSubscription(t *testing.T) {
 			wantErr:    false,
 		},
 		{
-			name:   "user without subscription gets default plan",
+			name:   "user without subscription has no plan",
 			userID: "user-2",
 			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
 				// No subscription in byUserID
-				pr.defaultPlan = &model.Plan{ID: "free", Name: "免费"}
 			},
-			wantPlanID: "free",
+			wantPlanID: "",
 			wantSubNil: true,
 			wantErr:    false,
 		},
@@ -357,7 +356,7 @@ func TestSubscriptionService_GetUserSubscription(t *testing.T) {
 			name:   "subscription not found error",
 			userID: "user-3",
 			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
-				pr.err = fmt.Errorf("db error")
+				sr.findErr = fmt.Errorf("db error")
 			},
 			wantErr: true,
 		},
@@ -394,8 +393,16 @@ func TestSubscriptionService_GetUserSubscription(t *testing.T) {
 			if !tc.wantSubNil && sub == nil {
 				t.Errorf("expected non-nil subscription")
 			}
-			if plan.ID != tc.wantPlanID {
-				t.Errorf("expected planID %s, got %s", tc.wantPlanID, plan.ID)
+			if tc.wantPlanID == "" {
+				if plan != nil {
+					t.Errorf("expected nil plan, got %v", plan)
+				}
+			} else if plan == nil || plan.ID != tc.wantPlanID {
+				got := "<nil>"
+				if plan != nil {
+					got = plan.ID
+				}
+				t.Errorf("expected planID %s, got %s", tc.wantPlanID, got)
 			}
 		})
 	}
@@ -459,7 +466,6 @@ func TestSubscriptionService_GetUserSubscription_NilSub(t *testing.T) {
 	ctx := context.Background()
 	sr := newMockSubscriptionRepo()
 	pr := newMockPlanRepo()
-	pr.defaultPlan = &model.Plan{ID: "free", Name: "免费"}
 	// Pre-seed byUserID with a nil entry — simulates "DB returned
 	// nil without an error" (defensive branch).
 	var nilSub *model.Subscription
@@ -473,8 +479,8 @@ func TestSubscriptionService_GetUserSubscription_NilSub(t *testing.T) {
 	if sub != nil {
 		t.Errorf("expected nil subscription, got %v", sub)
 	}
-	if plan == nil || plan.ID != "free" {
-		t.Errorf("expected default plan 'free', got %v", plan)
+	if plan != nil {
+		t.Errorf("expected nil plan without subscription, got %v", plan)
 	}
 }
 
@@ -647,5 +653,5 @@ func TestIsDuplicateKey(t *testing.T) {
 
 type fakeDupKeyErr struct{}
 
-func (fakeDupKeyErr) Error() string           { return "fake dup" }
-func (fakeDupKeyErr) DuplicateKey() bool       { return true }
+func (fakeDupKeyErr) Error() string      { return "fake dup" }
+func (fakeDupKeyErr) DuplicateKey() bool { return true }

@@ -13,8 +13,8 @@ import (
 )
 
 type SubscriptionService struct {
-	subRepo  repo.SubscriptionRepo
-	planSvc  *PlanService
+	subRepo repo.SubscriptionRepo
+	planSvc *PlanService
 }
 
 func NewSubscriptionService(subRepo repo.SubscriptionRepo, planSvc *PlanService) *SubscriptionService {
@@ -153,31 +153,17 @@ func (s *SubscriptionService) Cancel(ctx context.Context, id, userID string) err
 }
 
 // GetUserSubscription returns the user's active subscription with plan info.
-// If no active subscription exists, returns (nil, defaultPlan, nil).
+// If no active subscription exists, returns (nil, nil, nil).
 func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID string) (*model.Subscription, *model.Plan, error) {
 	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
 	if err != nil {
-		// FindActiveByUserID returns sql.ErrNoRows for no row — treat
-		// that as "no subscription, use default plan". Any other DB
-		// error bubbles up.
 		if errors.Is(err, sql.ErrNoRows) {
-			plan, planErr := s.planSvc.planRepo.FindDefault(ctx)
-			if planErr != nil {
-				return nil, nil, fmt.Errorf("get default plan: %w", planErr)
-			}
-			return nil, plan, nil
+			return nil, nil, nil
 		}
 		return nil, nil, fmt.Errorf("get subscription: %w", err)
 	}
-	// Defensive: a nil subscription with no error means the repo
-	// returned a nil row (rare; mock implementations do this for the
-	// "explicit nil entry" case). Treat the same as sql.ErrNoRows.
 	if sub == nil {
-		plan, planErr := s.planSvc.planRepo.FindDefault(ctx)
-		if planErr != nil {
-			return nil, nil, fmt.Errorf("get default plan: %w", planErr)
-		}
-		return nil, plan, nil
+		return nil, nil, nil
 	}
 	plan, err := s.planSvc.planRepo.FindByID(ctx, sub.PlanID)
 	if err != nil {

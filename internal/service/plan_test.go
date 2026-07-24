@@ -297,21 +297,18 @@ func TestPlanService_CheckAppAccess(t *testing.T) {
 		}
 	})
 
-	t.Run("user without subscription uses default plan", func(t *testing.T) {
+	t.Run("user without subscription has no access", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true, Apps: []string{"yundian"}}
-		planRepo.defaultPlan = planRepo.plans["free"]
 		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		canAccess := svc.CheckAppAccess(ctx, nil, "yundian")
-		if !canAccess {
-			t.Error("expected true for yundian on default free plan")
+		if canAccess {
+			t.Error("expected false without subscription")
 		}
 
 		canAccess = svc.CheckAppAccess(ctx, nil, "yundash")
-		if canAccess {
-			t.Error("expected false for yundash on default free plan")
-		}
+
 	})
 }
 
@@ -322,12 +319,12 @@ func TestPlanService_CheckAppAccess_RarePaths(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	t.Run("FindDefault error when no subscription", func(t *testing.T) {
+	t.Run("no subscription has no access", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.err = errors.New("db down")
 		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		if svc.CheckAppAccess(ctx, nil, "yundian") {
-			t.Error("expected false when FindDefault errors")
+			t.Error("expected false without subscription")
 		}
 	})
 

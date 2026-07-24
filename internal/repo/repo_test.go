@@ -329,19 +329,6 @@ func TestPlanRepo_FindByID_NotFound(t *testing.T) {
 		t.Errorf("err = %v, want sql.ErrNoRows", err)
 	}
 }
-
-func TestPlanRepo_FindDefault(t *testing.T) {
-	db := setupDB(t)
-	r := NewPlanRepo(db)
-	got, err := r.FindDefault(context.Background())
-	if got != nil {
-		t.Errorf("FindDefault returned plan: %+v, want nil", got)
-	}
-	if !errors.Is(err, model.ErrDeprecatedDefaultPlan) {
-		t.Errorf("err = %v, want ErrDeprecatedDefaultPlan", err)
-	}
-}
-
 func TestPlanRepo_FindByApp(t *testing.T) {
 	db := setupDB(t)
 	r := NewPlanRepo(db)

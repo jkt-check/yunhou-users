@@ -190,7 +190,6 @@ func (s *stubPlanRepo) FindByID(_ context.Context, id string) (*model.Plan, erro
 	return s.plan, nil
 }
 func (s *stubPlanRepo) FindByApp(_ context.Context, _ string) ([]model.Plan, error) { return nil, nil }
-func (s *stubPlanRepo) FindDefault(_ context.Context) (*model.Plan, error)          { return nil, nil }
 func (s *stubPlanRepo) Create(_ context.Context, _ *model.Plan) error               { return nil }
 func (s *stubPlanRepo) Update(_ context.Context, _ *model.Plan) error               { return nil }
 func (s *stubPlanRepo) Delete(_ context.Context, _ string) error                    { return nil }

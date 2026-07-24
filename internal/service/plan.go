@@ -29,12 +29,6 @@ func (s *PlanService) GetPlan(ctx context.Context, id string) (*model.Plan, erro
 	return s.planRepo.FindByID(ctx, id)
 }
 
-// FindDefault is deprecated: the default plan concept was removed by migration 014.
-// Callers must supply an explicit plan_id.
-func (s *PlanService) FindDefault(context.Context) (*model.Plan, error) {
-	return nil, ErrDeprecatedDefaultPlan
-}
-
 // FindByApp returns active plans whose `apps` array contains appID. Used by
 // the public GET /apps/:id/plans endpoint (M2) to enumerate plans available
 // for a given app — including their provider_ids sourced from
@@ -116,23 +110,14 @@ func (s *PlanService) ValidateApps(ctx context.Context, apps []string) error {
 }
 
 // CheckAppAccess checks if a user with given subscription can access the specified app.
-// A deactivated plan (or default plan) yields no access — even if its apps[]
-// array still lists appID. This matters when an operator retires a SKU
-// mid-cycle: existing subscribers should not keep access via the stale
-// plan row. The DB doesn't filter deactivated plans here because the
-// repo contract is "give me the row"; the service layer applies the
-// is_active policy.
+// A deactivated plan yields no access — even if its apps[] array still lists appID.
+// This matters when an operator retires a SKU mid-cycle: existing subscribers
+// should not keep access via the stale plan row. The DB doesn't filter deactivated
+// plans here because the repo contract is "give me the row"; the service layer
+// applies the is_active policy.
 func (s *PlanService) CheckAppAccess(ctx context.Context, sub *model.Subscription, appID string) bool {
 	if sub == nil {
-		// No subscription, use default (free) plan
-		defaultPlan, err := s.planRepo.FindDefault(ctx)
-		if err != nil {
-			return false
-		}
-		if !defaultPlan.IsActive {
-			return false
-		}
-		return slices.Contains(defaultPlan.Apps, appID)
+		return false
 	}
 
 	plan, err := s.planRepo.FindByID(ctx, sub.PlanID)

@@ -152,9 +152,8 @@ func (m *mockSocialIdentityRepo) DeleteIfNotLast(_ context.Context, id, userID s
 // --- PlanRepo mock ---
 
 type mockPlanRepo struct {
-	plans       map[string]*model.Plan
-	defaultPlan *model.Plan
-	err         error
+	plans map[string]*model.Plan
+	err   error
 	// lookupErrForIDs forces FindByID to return the named error for the
 	// listed IDs even if a row was previously seeded into plans. Used by
 	// tests that model "plan row exists in DB but the lookup observed a
@@ -212,16 +211,6 @@ func (m *mockPlanRepo) FindByApp(_ context.Context, appID string) ([]model.Plan,
 		}
 	}
 	return out, nil
-}
-
-func (m *mockPlanRepo) FindDefault(_ context.Context) (*model.Plan, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	if m.defaultPlan != nil {
-		return m.defaultPlan, nil
-	}
-	return nil, sql.ErrNoRows
 }
 
 func (m *mockPlanRepo) Create(_ context.Context, p *model.Plan) error {

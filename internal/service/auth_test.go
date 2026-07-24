@@ -115,9 +115,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 	ctx := context.Background()
 
 	plans := map[string]*model.Plan{
-		"free": {
-			ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
-		},
+		"free": {ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true},
 		"monthly": {
 			ID: "monthly", Name: "按月订阅", Apps: []string{"yundian", "yundash"}, IsActive: true,
 		},
@@ -138,7 +136,6 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
-				pr.defaultPlan = plans["free"]
 
 				user := &model.User{ID: "user-1", Status: "active"}
 				ur.users["user-1"] = user
@@ -278,7 +275,6 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
-				pr.defaultPlan = plans["free"]
 				ur.users["user-susp"] = &model.User{ID: "user-susp", Status: "suspended"}
 				session := &model.Session{
 					ID:           "sess-susp",
@@ -311,7 +307,6 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
-				pr.defaultPlan = plans["free"]
 				ur.users["user-x"] = &model.User{ID: "user-x", Status: "active"}
 				pastExpiry := time.Now().Add(-time.Hour)
 				sr.subs["sub-x"] = &model.Subscription{
@@ -348,7 +343,6 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
-				pr.defaultPlan = plans["free"]
 				ur.users["user-reuse"] = &model.User{ID: "user-reuse", Status: "active"}
 				// Two siblings in the (user, app) family so we can verify
 				// both are revoked when reuse is detected.
@@ -488,7 +482,6 @@ func TestAuthService_RefreshToken_RarePaths(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		seed(t, ur, ssr, "u-deleted", "deleted", "t-deleted")
 		pr.plans["free"] = plans["free"]
-		pr.defaultPlan = plans["free"]
 		ar.seedActive("yundian", "云店")
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -512,7 +505,6 @@ func TestAuthService_RefreshToken_RarePaths(t *testing.T) {
 		}
 		ssr.byToken[hashToken("t-orphan")] = ssr.sessions["sess-orphan"]
 		pr.plans["free"] = plans["free"]
-		pr.defaultPlan = plans["free"]
 		ar.seedActive("yundian", "云店")
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -532,7 +524,6 @@ func TestAuthService_RefreshToken_RarePaths(t *testing.T) {
 		// Session is for yundian; the call passes appID="" so it must
 		// fall back to yundian.
 		pr.plans["free"] = plans["free"]
-		pr.defaultPlan = plans["free"]
 		ar.seedActive("yundian", "云店")
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -550,7 +541,6 @@ func TestAuthService_RefreshToken_RarePaths(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		seed(t, ur, ssr, "u-anf", "active", "t-anf")
 		pr.plans["free"] = plans["free"]
-		pr.defaultPlan = plans["free"]
 		// No app seeded for "nonexistent" — FindByID returns sql.ErrNoRows.
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -565,7 +555,6 @@ func TestAuthService_RefreshToken_RarePaths(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		seed(t, ur, ssr, "u-ai", "active", "t-ai")
 		pr.plans["free"] = plans["free"]
-		pr.defaultPlan = plans["free"]
 		ar.seedInactive("yundian", "云店")
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -623,7 +612,6 @@ func TestAuthService_LoginWithProfile(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 
 	t.Run("nil profile rejected", func(t *testing.T) {
 		t.Parallel()
@@ -678,7 +666,6 @@ func TestAuthService_LoginWithProfile(t *testing.T) {
 			ID: "ident-susp", UserID: "user-susp",
 			Provider: "github", ProviderUID: "gh-susp",
 		}
-		pr.defaultPlan = defaultPlan
 
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -696,7 +683,6 @@ func TestAuthService_LoginWithProfile(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		pr.defaultPlan = defaultPlan
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
@@ -722,7 +708,6 @@ func TestAuthService_LoginWithProfile(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		pr.defaultPlan = defaultPlan
 		// Pre-seed user + identity
 		ur.users["user-1"] = &model.User{ID: "user-1", Status: "active"}
 		email := "ex@x.com"
@@ -760,13 +745,11 @@ func TestAuthService_TestLogin(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 
 	t.Run("requested plan controls token scope", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		pr.defaultPlan = defaultPlan
 		pr.plans["monthly"] = &model.Plan{
 			ID: "monthly", Name: "月付", Apps: []string{"yundian", "yunbao"},
 			IsActive: true, AcceptingNewSubscriptions: true,
@@ -894,7 +877,6 @@ func TestAuthService_TestLogin(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		pr.defaultPlan = defaultPlan
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
@@ -929,7 +911,6 @@ func TestAuthService_TestLogin(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		pr.defaultPlan = defaultPlan
 		// Pre-seed user + identity with same email
 		ur.users["user-existing"] = &model.User{ID: "user-existing", Status: "active"}
 		email := "ex@x.com"
@@ -957,7 +938,6 @@ func TestAuthService_TestLogin(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		pr.defaultPlan = defaultPlan
 		ur.users["user-susp"] = &model.User{ID: "user-susp", Status: "suspended"}
 		email := "susp@x.com"
 		sir.identities["github:gh-susp"] = &model.SocialIdentity{
@@ -1171,14 +1151,13 @@ func TestAuthService_LoginWithProfile_RarePaths(t *testing.T) {
 func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
 
 	t.Run("plan not found error", func(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		// User has no subscription → falls into FindDefault. Make that fail.
+		// User has no subscription → falls into default-plan lookup. Make that fail.
 		// Actually no: with no subscription, FindActiveByUserID returns
-		// ErrNoRows, so the else branch runs FindDefault. We force the
+		// ErrNoRows, so the else branch runs default-plan lookup. We force the
 		// first branch (active sub present) by seeding one, then have
 		// FindByID fail.
 		exp := time.Now().Add(time.Hour)
@@ -1202,7 +1181,7 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
 		// A plan-repository error must not matter when there is no
-		// subscription: the retired FindDefault path must not be called.
+		// subscription: the retired default-plan lookup path must not be called.
 		pr.err = errTest
 		ur.users["u-2"] = &model.User{ID: "u-2", Status: "active"}
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
@@ -1226,7 +1205,6 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 	t.Run("overrideEmail applied to response", func(t *testing.T) {
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		ar.seedActive("yundian", "云店")
-		pr.defaultPlan = defaultPlan
 		ur.users["u-3"] = &model.User{ID: "u-3", Status: "active", Email: nil}
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -1246,7 +1224,7 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 		expAt := time.Now().Add(7 * 24 * time.Hour)
 		sr.subs["sub-4"] = &model.Subscription{ID: "sub-4", UserID: "u-4", PlanID: "free", Status: "active", ExpiresAt: &expAt}
 		sr.byUserID["u-4"] = sr.subs["sub-4"]
-		pr.plans["free"] = defaultPlan
+		pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true}
 		ur.users["u-4"] = &model.User{ID: "u-4", Status: "active"}
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -1383,10 +1361,6 @@ func TestAuthService_IssueTokensForUser_IsAcceptingNew(t *testing.T) {
 		// (chosenPlan != nil && chosenPlan.IsActive && ...) returns
 		// false when the default plan is deactivated. Phase 2 will switch
 		// chosenPlan=nil when there's no sub — same outcome.
-		pr.defaultPlan = &model.Plan{
-			ID: "free", Name: "免费", Apps: []string{"yundian"},
-			IsActive: false, AcceptingNewSubscriptions: false,
-		}
 		ur.users["u-nosub"] = &model.User{ID: "u-nosub", Status: "active"}
 		tokenSvc := newTokenServiceWithMocks(ssr, sr)
 		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
@@ -1873,9 +1847,6 @@ func TestResolvePlanForTokenIssuance_NoSub_ReturnsNilChosenPlan(t *testing.T) {
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
 
 	// Seed the former default so this test proves the resolver ignores it.
-	pr.defaultPlan = &model.Plan{
-		ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
-	}
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
 
 	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-no-sub", "yundian")
@@ -1900,10 +1871,6 @@ func TestResolvePlanForTokenIssuance_ExpiredSub_ScopeEmpty(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	ur, sir, pr, sr, ssr, ar := newAuthMocks()
-
-	pr.defaultPlan = &model.Plan{
-		ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
-	}
 	paidPlan := &model.Plan{
 		ID: "monthly", Name: "月付", Apps: []string{"yundian"}, IsActive: true,
 	}
@@ -1980,9 +1947,6 @@ func TestIssueTokensForUser_NoSub_SignWithEmptyScope(t *testing.T) {
 
 	// The old implementation used this plan's apps as scope. It must now be
 	// ignored when the user has no subscription.
-	pr.defaultPlan = &model.Plan{
-		ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true,
-	}
 	user := &model.User{ID: "u-no-sub", Status: "active"}
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)

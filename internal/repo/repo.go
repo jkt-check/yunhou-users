@@ -31,7 +31,6 @@ type PlanRepo interface {
 	FindAll(ctx context.Context) ([]model.Plan, error)
 	FindByID(ctx context.Context, id string) (*model.Plan, error)
 	FindByApp(ctx context.Context, appID string) ([]model.Plan, error)
-	FindDefault(ctx context.Context) (*model.Plan, error)
 	Create(ctx context.Context, p *model.Plan) error
 	Update(ctx context.Context, p *model.Plan) error
 	Delete(ctx context.Context, id string) error
@@ -221,10 +220,6 @@ func (r *planRepo) FindByID(ctx context.Context, id string) (*model.Plan, error)
 		return nil, err
 	}
 	return &p, nil
-}
-
-func (r *planRepo) FindDefault(context.Context) (*model.Plan, error) {
-	return nil, model.ErrDeprecatedDefaultPlan
 }
 
 // FindByApp returns active plans whose `apps` array contains appID, ordered

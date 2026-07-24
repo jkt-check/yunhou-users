@@ -14,6 +14,13 @@ type Plan struct {
 	Apps         pq.StringArray `db:"apps" json:"apps"`
 	IsActive     bool           `db:"is_active" json:"is_active"`
 	IsDefault    bool           `db:"is_default" json:"is_default"`
+	IsListed     bool           `db:"is_listed" json:"is_listed"`
+	AcceptingNewSubscriptions bool      `db:"accepting_new_subscriptions" json:"accepting_new_subscriptions"`
+	Currency     string         `db:"currency" json:"currency"`
+	TrialDays    int            `db:"trial_days" json:"trial_days"`
+	Description  *string        `db:"description" json:"description"`
+	DisplayOrder int            `db:"display_order" json:"display_order"`
+	UpdatedAt    time.Time      `db:"updated_at" json:"updated_at"`
 	CreatedAt    time.Time      `db:"created_at" json:"created_at"`
 }
 
@@ -57,16 +64,13 @@ type PublicPlan struct {
 	Name         string            `json:"name"`
 	Price        float64           `json:"price"`
 	IntervalDays int               `json:"interval_days"`
-	IsDefault    bool              `json:"is_default"`
-	// ProviderIDs maps channel → provider plan/variant ID. Empty when the
-	// app has no payment provider configured.
+	Currency     string            `json:"currency"`
+	TrialDays    int               `json:"trial_days"`
+	Description  *string           `json:"description"`
+	Apps         []string          `json:"apps"`
+	DisplayOrder int               `json:"display_order"`
 	ProviderIDs  map[string]string `json:"provider_ids"`
-	// Cycle is the resolved cycle for this plan when PayPal is configured
-	// for it; nil when no per-plan cycle is available. The marketing page
-	// uses this to display "first X days free, then $Y" — for the quote
-	// endpoint, the same logic is recomputed server-side from the
-	// authoritative config.
-	Cycle        *CycleSummary     `json:"cycle,omitempty"`
+	Cycle        *CycleSummary     `json:"cycle"`
 }
 
 // CycleSummary is the public view of trial + billing cycle. Used by the

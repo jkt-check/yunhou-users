@@ -750,7 +750,11 @@ func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 		Name:         p.Name,
 		Price:        p.Price,
 		IntervalDays: p.IntervalDays,
-		IsDefault:    p.IsDefault,
+		Currency:     p.Currency,
+		TrialDays:    p.TrialDays,
+		Description:  p.Description,
+		Apps:         []string(p.Apps),
+		DisplayOrder: p.DisplayOrder,
 		ProviderIDs:  map[string]string{},
 	}
 	if cfg.PaymentProviders != nil {

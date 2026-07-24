@@ -744,16 +744,32 @@ func TestBuildPublicPlan(t *testing.T) {
 	t.Parallel()
 	t.Run("plan with no providers", func(t *testing.T) {
 		t.Parallel()
-		p := model.Plan{ID: "free", Name: "Free", IsDefault: true, IntervalDays: 0}
+		description := "Free plan"
+		p := model.Plan{
+			ID:           "free",
+			Name:         "Free",
+			IntervalDays: 0,
+			Currency:     "CNY",
+			TrialDays:    3,
+			Description:  &description,
+			Apps:         []string{"yundian"},
+			DisplayOrder: 5,
+		}
 		out := buildPublicPlan(p, model.AppConfig{})
 		if out.ID != "free" {
 			t.Errorf("ID: got %q, want free", out.ID)
 		}
-		if out.Cycle != nil {
-			t.Errorf("Cycle: got %+v, want nil", out.Cycle)
+		if out.Currency != "CNY" || out.TrialDays != 3 {
+			t.Errorf("commercial fields: got currency=%q trial_days=%d", out.Currency, out.TrialDays)
 		}
-		if len(out.ProviderIDs) != 0 {
-			t.Errorf("ProviderIDs: got %v, want empty", out.ProviderIDs)
+		if out.Description == nil || *out.Description != description {
+			t.Errorf("Description: got %v, want %q", out.Description, description)
+		}
+		if len(out.Apps) != 1 || out.Apps[0] != "yundian" {
+			t.Errorf("Apps: got %v, want [yundian]", out.Apps)
+		}
+		if out.DisplayOrder != 5 {
+			t.Errorf("DisplayOrder: got %d, want 5", out.DisplayOrder)
 		}
 	})
 	t.Run("plan with paypal configured", func(t *testing.T) {

@@ -37,9 +37,13 @@ var (
 	ErrAppNotFound           = errors.New("app not found")
 	ErrAppInactive           = errors.New("app is inactive")
 
-	ErrPlanNotFound    = errors.New("plan not found")
-	ErrPlanInactive    = errors.New("plan is inactive")
-	ErrPaidPlanForbidden = errors.New("paid plan: payment required, cannot self-subscribe")
+	ErrPlanNotFound              = errors.New("plan not found")
+	ErrPlanInactive              = errors.New("plan is inactive")
+	ErrPaidPlanForbidden         = errors.New("paid plan: payment required, cannot self-subscribe")
+	ErrPlanNotAcceptingNew       = errors.New("plan is not accepting new subscriptions")
+	ErrPlanCurrencyMismatch      = errors.New("plan currency does not match order currency")
+	ErrInvalidAppID              = errors.New("plan apps contains unknown or inactive app_id")
+	ErrDeprecatedDefaultPlan     = errors.New("default plan concept is deprecated; supply plan_id explicitly")
 
 	// Payment flow (design doc + webhook doc).
 	ErrOrderNotFound          = errors.New("order not found")

@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -156,6 +157,71 @@ func TestPlanJSON(t *testing.T) {
 			t.Errorf("expected 0 apps, got %d", len(unmarshaled.Apps))
 		}
 	})
+}
+
+func TestPlanCommercialModelShape(t *testing.T) {
+	t.Parallel()
+
+	planType := reflect.TypeOf(Plan{})
+	wantPlanFields := []struct {
+		name string
+		db   string
+		json string
+	}{
+		{"ID", "id", "id"},
+		{"Name", "name", "name"},
+		{"Price", "price", "price"},
+		{"IntervalDays", "interval_days", "interval_days"},
+		{"Apps", "apps", "apps"},
+		{"IsActive", "is_active", "is_active"},
+		{"IsDefault", "is_default", "is_default"},
+		{"IsListed", "is_listed", "is_listed"},
+		{"AcceptingNewSubscriptions", "accepting_new_subscriptions", "accepting_new_subscriptions"},
+		{"Currency", "currency", "currency"},
+		{"TrialDays", "trial_days", "trial_days"},
+		{"Description", "description", "description"},
+		{"DisplayOrder", "display_order", "display_order"},
+		{"UpdatedAt", "updated_at", "updated_at"},
+		{"CreatedAt", "created_at", "created_at"},
+	}
+	if planType.NumField() != len(wantPlanFields) {
+		t.Fatalf("Plan field count = %d, want %d", planType.NumField(), len(wantPlanFields))
+	}
+	for i, want := range wantPlanFields {
+		got := planType.Field(i)
+		if got.Name != want.name || got.Tag.Get("db") != want.db || got.Tag.Get("json") != want.json {
+			t.Errorf("Plan field %d = %s db:%q json:%q, want %s db:%q json:%q",
+				i, got.Name, got.Tag.Get("db"), got.Tag.Get("json"), want.name, want.db, want.json)
+		}
+	}
+
+	publicType := reflect.TypeOf(PublicPlan{})
+	wantPublicFields := []struct {
+		name string
+		json string
+	}{
+		{"ID", "id"},
+		{"Name", "name"},
+		{"Price", "price"},
+		{"IntervalDays", "interval_days"},
+		{"Currency", "currency"},
+		{"TrialDays", "trial_days"},
+		{"Description", "description"},
+		{"Apps", "apps"},
+		{"DisplayOrder", "display_order"},
+		{"ProviderIDs", "provider_ids"},
+		{"Cycle", "cycle"},
+	}
+	if publicType.NumField() != len(wantPublicFields) {
+		t.Fatalf("PublicPlan field count = %d, want %d", publicType.NumField(), len(wantPublicFields))
+	}
+	for i, want := range wantPublicFields {
+		got := publicType.Field(i)
+		if got.Name != want.name || got.Tag.Get("json") != want.json {
+			t.Errorf("PublicPlan field %d = %s json:%q, want %s json:%q",
+				i, got.Name, got.Tag.Get("json"), want.name, want.json)
+		}
+	}
 }
 
 func TestSubscriptionJSON(t *testing.T) {

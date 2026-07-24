@@ -222,12 +222,16 @@ func (r *planRepo) FindDefault(ctx context.Context) (*model.Plan, error) {
 }
 
 // FindByApp returns active plans whose `apps` array contains appID, ordered
-// by created_at so listing is stable across calls. Used by the public
-// GET /apps/:id/plans endpoint (M2) to surface plans available for an app.
+// by display_order ASC, created_at ASC, id ASC. display_order is the ops-
+// controlled knob from migration 012; created_at and id break ties so the
+// order is stable when ops hasn't set display_order (still 0 by default).
+// Used by the public GET /apps/:id/plans endpoint to surface plans available
+// for an app.
 func (r *planRepo) FindByApp(ctx context.Context, appID string) ([]model.Plan, error) {
 	var list []model.Plan
 	err := r.db.SelectContext(ctx, &list,
-		`SELECT * FROM plans WHERE $1 = ANY(apps) AND is_active = true ORDER BY created_at, id`,
+		`SELECT * FROM plans WHERE $1 = ANY(apps) AND is_active = true
+		 ORDER BY display_order ASC, created_at ASC, id ASC`,
 		appID)
 	if err != nil {
 		return nil, err
@@ -237,16 +241,28 @@ func (r *planRepo) FindByApp(ctx context.Context, appID string) ([]model.Plan, e
 
 func (r *planRepo) Create(ctx context.Context, p *model.Plan) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO plans (id, name, price, interval_days, apps, is_active, is_default)
-		VALUES (:id, :name, :price, :interval_days, :apps, :is_active, :is_default)
+		INSERT INTO plans (
+		    id, name, price, interval_days, apps, is_active, is_default,
+		    is_listed, accepting_new_subscriptions, currency, trial_days,
+		    description, display_order
+		) VALUES (
+		    :id, :name, :price, :interval_days, :apps, :is_active, :is_default,
+		    :is_listed, :accepting_new_subscriptions, :currency, :trial_days,
+		    :description, :display_order
+		)
 	`, p)
 	return err
 }
 
 func (r *planRepo) Update(ctx context.Context, p *model.Plan) error {
 	_, err := r.db.NamedExecContext(ctx, `
-		UPDATE plans SET name = :name, price = :price, interval_days = :interval_days,
-		apps = :apps, is_active = :is_active, is_default = :is_default
+		UPDATE plans SET
+		    name = :name, price = :price, interval_days = :interval_days,
+		    apps = :apps, is_active = :is_active, is_default = :is_default,
+		    is_listed = :is_listed,
+		    accepting_new_subscriptions = :accepting_new_subscriptions,
+		    currency = :currency, trial_days = :trial_days,
+		    description = :description, display_order = :display_order
 		WHERE id = :id
 	`, p)
 	return err

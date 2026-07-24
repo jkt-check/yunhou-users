@@ -402,13 +402,72 @@ func TestPlanRepo_FindByApp_ExcludesInactive(t *testing.T) {
 	}
 }
 
+// TestPlanRepo_FindByApp_SortsByDisplayOrder guards the spec §7.3 ORDER BY
+// change. Three plans are inserted in non-sorted display_order (30, 10, 20)
+// and FindByApp must return them as 10, 20, 30 — NOT by created_at/id, which
+// would return the insertion order (30, 10, 20). The test uses a dedicated
+// app so the seeded 'free'/'monthly' rows (covering 'yundian') don't
+// contaminate the result set.
+func TestPlanRepo_FindByApp_SortsByDisplayOrder(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	const testApp = "sort-test-app"
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO apps (app_id, name, is_active) VALUES ($1, $2, true)
+		 ON CONFLICT (app_id) DO NOTHING`, testApp, "Sort Test App"); err != nil {
+		t.Fatalf("seed %s: %v", testApp, err)
+	}
+
+	// Insert in display_order 30, 10, 20 — so created_at order is 30, 10, 20.
+	// If ORDER BY ignores display_order and falls back to created_at, the
+	// test fails because we'd see 30, 10, 20.
+	type seed struct {
+		id    string
+		order int
+	}
+	for _, p := range []seed{
+		{"sort-a", 30},
+		{"sort-b", 10},
+		{"sort-c", 20},
+	} {
+		if _, err := db.ExecContext(context.Background(), `
+			INSERT INTO plans (id, name, price, interval_days, apps, is_active,
+			                   is_listed, accepting_new_subscriptions, currency,
+			                   trial_days, display_order)
+			VALUES ($1, $2, 0, 0, $3, true, true, true, 'CNY', 0, $4)
+			ON CONFLICT (id) DO NOTHING
+		`, p.id, p.id, pq.Array([]string{testApp}), p.order); err != nil {
+			t.Fatalf("seed plan %s: %v", p.id, err)
+		}
+	}
+
+	got, err := r.FindByApp(context.Background(), testApp)
+	if err != nil {
+		t.Fatalf("FindByApp(%s): %v", testApp, err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d plans, want 3 (IDs: %+v)", len(got), got)
+	}
+	wantOrder := []string{"sort-b", "sort-c", "sort-a"} // display_order 10, 20, 30
+	for i, want := range wantOrder {
+		if got[i].ID != want {
+			t.Errorf("at index %d: got ID=%q display_order=%d, want ID=%q",
+				i, got[i].ID, got[i].DisplayOrder, want)
+		}
+	}
+}
+
 func TestPlanRepo_CreateUpdateDelete(t *testing.T) {
 	db := setupDB(t)
 	r := NewPlanRepo(db)
 
+	desc := "Annual subscription"
 	p := &model.Plan{
 		ID: "yearly", Name: "Yearly", Price: 299, IntervalDays: 365,
 		Apps: pq.StringArray{"yundian"}, IsActive: true, IsDefault: false,
+		IsListed: true, AcceptingNewSubscriptions: true,
+		Currency: "CNY", TrialDays: 0, Description: &desc, DisplayOrder: 50,
 	}
 	if err := r.Create(context.Background(), p); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -426,6 +485,12 @@ func TestPlanRepo_CreateUpdateDelete(t *testing.T) {
 	}
 	if got.Name != "Annual" || got.Price != 199 {
 		t.Errorf("after update: %+v", got)
+	}
+	if got.Currency != "CNY" || got.DisplayOrder != 50 {
+		t.Errorf("commercial fields lost in round-trip: %+v", got)
+	}
+	if got.Description == nil || *got.Description != desc {
+		t.Errorf("Description round-trip: got %v, want %q", got.Description, desc)
 	}
 
 	if err := r.Delete(context.Background(), "yearly"); err != nil {

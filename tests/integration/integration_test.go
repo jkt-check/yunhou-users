@@ -68,12 +68,14 @@ func setupDB(t *testing.T) *sqlx.DB {
 		price              float64
 		days               int
 		apps               string
-		isDef              bool
-		trialDays          int
-		description        string
-		isListed           bool
-		acceptingNew       bool
-		displayOrder       int
+		// isDef retained during Phase 1 because PlanService.FindDefault is still in use.
+		// Will be removed when migration 014 (T17) drops the is_default column.
+		isDef        bool
+		trialDays    int
+		description  string
+		isListed     bool
+		acceptingNew bool
+		displayOrder int
 	}{
 		{"free", "免费", "CNY", 0, 0, "{yundian}", true, 0, "免费版（已下线）", true, false, 0},
 		{"monthly", "按月订阅", "CNY", 29.9, 30, "{yundian,yundash}", false, 0, "按月订阅 ¥29.9，自动续费，可随时取消", true, true, 10},
@@ -568,7 +570,7 @@ func TestLoginHasAccessField(t *testing.T) {
 	}
 
 	// Seed a restricted plan (yundian NOT in its apps list) and switch the user to it.
-	_, _ = db.ExecContext(context.Background(),
+	if _, err := db.ExecContext(context.Background(),
 		`INSERT INTO plans (
 			id, name, price, interval_days, apps, is_active, is_default,
 			is_listed, accepting_new_subscriptions, currency, trial_days,
@@ -577,7 +579,9 @@ func TestLoginHasAccessField(t *testing.T) {
 			'restricted', 'Restricted', 0, 0, ARRAY[]::TEXT[], true, false,
 			true, true, 'CNY', 0, 'Restricted integration fixture', 0
 		)
-		ON CONFLICT (id) DO NOTHING`)
+		ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed restricted: %v", err)
+	}
 	tok, _ := testLogin(t, srv, email, "yundian")
 	resp := doJSONWithAuth(t, http.MethodPost, srv.URL+"/user/subscriptions",
 		"Bearer "+tok, map[string]interface{}{"plan_id": "restricted"})

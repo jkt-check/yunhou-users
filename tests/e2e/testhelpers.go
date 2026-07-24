@@ -119,12 +119,14 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 		price              float64
 		days               int
 		apps               string
-		isDef              bool
-		trialDays          int
-		description        string
-		isListed           bool
-		acceptingNew       bool
-		displayOrder       int
+		// isDef retained during Phase 1 because PlanService.FindDefault is still in use.
+		// Will be removed when migration 014 (T17) drops the is_default column.
+		isDef        bool
+		trialDays    int
+		description  string
+		isListed     bool
+		acceptingNew bool
+		displayOrder int
 	}{
 		{"free", "免费", "CNY", 0, 0, "{yundian}", true, 0, "免费版（已下线）", true, false, 0},
 		{"monthly", "按月订阅", "CNY", 29.9, 30, "{yundian,yundash}", false, 0, "按月订阅 ¥29.9，自动续费，可随时取消", true, true, 10},

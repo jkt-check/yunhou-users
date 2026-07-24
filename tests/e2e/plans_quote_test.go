@@ -16,7 +16,9 @@ func TestE2E_GetAppPlans_PublicCatalog(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
 	// /apps/:id/plans is public — no X-App-ID, no JWT. seedTestData already
-	// created the "yundian" super app and two plans (free, monthly).
+	// created the "yundian" super app and three plans (free, monthly,
+	// monthly_usd); the listing filters by apps array, so only free +
+	// monthly surface for yundian (monthly_usd's apps array is empty).
 	resp := doRequest(t, engine, http.MethodGet, "/apps/yundian/plans", "", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, string(resp.Body))
@@ -53,9 +55,14 @@ func TestE2E_GetAppPlans_WithProviderConfig(t *testing.T) {
 		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
 	}
 	// Add a plan that maps to this app so the listing has something to return.
-	_, _ = db.ExecContext(context.Background(),
-		`INSERT INTO plans (id, name, price, interval_days, apps, is_active)
-		 VALUES ('mp', 'Monthly Pro', 49.9, 30, ARRAY[$1], true)`, appID)
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO plans (id, name, price, interval_days, apps, is_active,
+			is_listed, accepting_new_subscriptions, currency, trial_days,
+			description, display_order, is_default)
+		 VALUES ('mp', 'Monthly Pro', 49.9, 30, ARRAY[$1], true,
+			true, true, 'USD', 7, 'Monthly Pro test fixture', 10, false)`, appID); err != nil {
+		t.Fatalf("seed mp: %v", err)
+	}
 
 	resp := doRequest(t, engine, http.MethodGet, "/apps/"+appID+"/plans", "", nil)
 	if resp.StatusCode != http.StatusOK {

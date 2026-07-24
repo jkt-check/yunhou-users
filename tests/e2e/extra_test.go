@@ -357,16 +357,15 @@ func TestE2E_ExpiredSub_LoginAndRefresh(t *testing.T) {
 		t.Errorf("refresh Subscription.PlanID = %q, want quarterly", refreshed.Data.Subscription.PlanID)
 	}
 
-	// 5. CreateOrder for an accepting plan must NOT return ErrUserHasActiveSub for
-	// the past-but-active row. The quarterly fixture intentionally rejects new
-	// orders, so use monthly here to isolate the stale-subscription precondition.
+	// 5. CreateOrder for an accepting plan must succeed for the past-but-active
+	// row. The quarterly fixture intentionally rejects new orders, so use
+	// monthly here to isolate the stale-subscription precondition; monthly is
+	// valid and accepting-new, so the order must be created (201).
 	orderResp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(refreshed.Data.AccessToken))
-	if orderResp.StatusCode == http.StatusConflict {
-		t.Fatalf("CreateOrder must permit purchase when status=active but expires_at is past; got 409. Body: %s", string(orderResp.Body))
-	}
-	if orderResp.StatusCode >= 500 {
-		t.Fatalf("CreateOrder must not 5xx for an expired-but-active user: %d %s", orderResp.StatusCode, string(orderResp.Body))
+	if orderResp.StatusCode != http.StatusCreated {
+		t.Fatalf("CreateOrder must permit purchase when status=active but expires_at is past; got %d, want %d. Body: %s",
+			orderResp.StatusCode, http.StatusCreated, string(orderResp.Body))
 	}
 }
 

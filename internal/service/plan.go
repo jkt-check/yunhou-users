@@ -79,13 +79,16 @@ func (s *PlanService) DeletePlan(ctx context.Context, id string) error {
 	}
 	snapshot := *current
 
-	if err := s.planRepo.Delete(ctx, id); err != nil {
-		return err
-	}
-	// The plan mutation has committed; audit logging is best-effort so an audit
-	// outage does not turn a successful operation into a user-visible failure.
+	// Audit insert MUST happen before the hard delete. The
+	// plan_change_log.plan_id FK was relaxed to ON DELETE SET NULL in
+	// migration 013 (so an existing audit row survives a plan delete
+	// with plan_id=NULL), but at the moment of the INSERT the row must
+	// still exist for the FK to be satisfied. Audit logging is
+	// best-effort so an audit outage does not turn a successful delete
+	// into a user-visible failure.
 	_ = s.changeLogRepo.Insert(ctx, id, "admin", "plan_archive", &snapshot, nil)
-	return nil
+
+	return s.planRepo.Delete(ctx, id)
 }
 
 // ValidateApps checks that every app_id in the provided list exists in the

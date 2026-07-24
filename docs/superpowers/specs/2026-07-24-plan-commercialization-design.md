@@ -390,17 +390,19 @@ WHERE $1 = ANY(apps) AND is_active = true
 ORDER BY display_order ASC, created_at ASC, id ASC
 ```
 
-### 7.4 `internal/model/auth.go` — `LoginResponse.Subscription` (additive)
+### 7.4 `internal/service/auth.go` — `LoginResponse.Subscription` (additive)
 
 ```go
-type LoginSubscriptionInfo struct {
-    PlanID          *string    `json:"plan_id"`           // pointer for nullable
-    PlanName        *string    `json:"plan_name"`         // pointer for nullable
-    HasAccess       bool       `json:"has_access"`
-    ExpiresAt       *time.Time `json:"expires_at"`        // pointer for nullable
-    IsAcceptingNew  bool       `json:"is_accepting_new"`  // ← new
+type SubscriptionInfo struct {
+    PlanID         string     `json:"plan_id"`
+    PlanName       string     `json:"plan_name"`
+    HasAccess      bool       `json:"has_access"`
+    ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+    IsAcceptingNew bool       `json:"is_accepting_new"`  // ← new
 }
 ```
+
+> **Implementation note:** the struct lives in `internal/service/auth.go` (not `internal/model/`); `PlanID` / `PlanName` are value types (not `*string`); `ExpiresAt` keeps `omitempty`. The new field is additive and does not change existing wire behaviour for callers that omit it from their decoders.
 
 - `IsAcceptingNew = plan != nil && plan.IsActive && plan.AcceptingNewSubscriptions`
 - For un-subscribed users: all pointer fields nil, `HasAccess=false`, `IsAcceptingNew=false`.
@@ -542,7 +544,7 @@ The seeded prices make `quarterly` (¥79.9 / 90 days = ¥0.89/day) more expensiv
 | 2 | `migrations/013_remove_default_plan.sql` | NEW. Pre-check + retire `free` + drop `plans_one_default` + drop `is_default` |
 | 3 | `internal/model/plan.go` | Add 7 fields; remove `IsDefault`; expand `PublicPlan` |
 | 4 | `internal/model/app_test.go`, `internal/model/app.go` | (If `app_test.go` references removed fields; TBD during implementation) |
-| 5 | `internal/model/auth.go` | Add `IsAcceptingNew` to `LoginSubscriptionInfo`; pointer types for nullable fields |
+| 5 | `internal/service/auth.go` | Add `IsAcceptingNew` to `SubscriptionInfo` (struct already lives in this file with value-type `PlanID`/`PlanName` and `ExpiresAt *time.Time` with `omitempty`) |
 | 6 | `internal/model/quote.go` | (No schema change; `Currency` already a string) |
 | 7 | `internal/repo/repo.go` | `PlanRepo.Create/Update` columns updated; `FindByApp` ORDER BY changed; `FindDefault` body returns `ErrDeprecatedDefaultPlan` |
 | 8 | `internal/service/plan.go` | `ValidateApps` helper; `CreatePlan`/`UpdatePlan`/`DeletePlan` audit writes; remove `IsDefault` references |

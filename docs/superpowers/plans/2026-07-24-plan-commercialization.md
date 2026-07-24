@@ -28,7 +28,7 @@
 | Path | Phase | Change |
 |---|---|---|
 | `internal/model/plan.go` | 1 | Add 7 fields; remove `IsDefault` in Phase 2; expand `PublicPlan` |
-| `internal/model/auth.go` | 1 | Add `IsAcceptingNew` to `LoginSubscriptionInfo` |
+| `internal/service/auth.go` (SubscriptionInfo struct) | 1 | Add `IsAcceptingNew` field |
 | `internal/repo/repo.go` | 1 | PlanRepo Create/Update new columns; FindByApp ORDER BY |
 | `internal/service/plan.go` | 1+2 | ValidateApps; audit log; Create/Update/Delete with new fields; FindDefault deprecated |
 | `internal/service/subscription.go` | 1 | Create — accepting_new_subscriptions guard |
@@ -170,37 +170,46 @@ git commit -m "feat(model): add 7 plan fields + new commercial DTO"
 
 ---
 
-### Task 3: Model — add `IsAcceptingNew` to `LoginSubscriptionInfo`
+### Task 3: Model — add `IsAcceptingNew` to `SubscriptionInfo`
 
 **Files:**
-- Modify: `internal/model/auth.go`
+- Modify: `internal/service/auth.go`
 
-- [ ] **Step 1: Locate `LoginSubscriptionInfo` struct**
+- [ ] **Step 1: Locate `SubscriptionInfo` struct**
 
-In `internal/model/auth.go`, find the `LoginSubscriptionInfo` struct. It currently has fields like `PlanID *string`, `PlanName *string`, `HasAccess bool`, `ExpiresAt *time.Time`.
+In `internal/service/auth.go` (lines ~139-144), find the `SubscriptionInfo` struct. It currently has `PlanID string`, `PlanName string`, `HasAccess bool`, `ExpiresAt *time.Time` (with `json:",omitempty"`).
 
 - [ ] **Step 2: Add the new field**
 
+Append `IsAcceptingNew` after `ExpiresAt`:
+
 ```go
-type LoginSubscriptionInfo struct {
-    PlanID         *string    `json:"plan_id"`
-    PlanName       *string    `json:"plan_name"`
+type SubscriptionInfo struct {
+    PlanID         string     `json:"plan_id"`
+    PlanName       string     `json:"plan_name"`
     HasAccess      bool       `json:"has_access"`
-    ExpiresAt      *time.Time `json:"expires_at"`
+    ExpiresAt      *time.Time `json:"expires_at,omitempty"`
     IsAcceptingNew bool       `json:"is_accepting_new"`
 }
 ```
 
+The `bool` type (not `*bool`) — `false` is the correct zero value when there is no subscription. Do not add `omitempty`; the field must always appear.
+
 - [ ] **Step 3: Verify build**
 
-Run: `make build`
-Expected: succeeds. The new field is just added — no code sets it yet.
+Run: `make build` (fall back to `go build ./...` if unavailable).
+Expected: succeeds.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Run model + auth tests**
+
+Run: `go test -race ./internal/model/ ./internal/service/`
+Expected: green. If any existing test asserts on `SubscriptionInfo` JSON shape and breaks, update the test (do not skip).
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add internal/model/auth.go
-git commit -m "feat(model): add is_accepting_new to LoginSubscriptionInfo"
+git add internal/service/auth.go
+git commit -m "feat(auth): add is_accepting_new to SubscriptionInfo"
 ```
 
 ---
@@ -793,7 +802,7 @@ git commit -m "test: update fixtures for plan commercial fields"
 
 ---
 
-### Task 13: AuthService — `is_accepting_new` on LoginSubscriptionInfo
+### Task 13: AuthService — `is_accepting_new` on SubscriptionInfo
 
 **Files:**
 - Modify: `internal/service/auth.go`
@@ -814,17 +823,19 @@ Expected: FAIL — field not set.
 
 - [ ] **Step 2: Set the field in `issueTokensForUser`**
 
-In `internal/service/auth.go`, find the place where `LoginSubscriptionInfo` is populated. After setting `HasAccess`, add:
+In `internal/service/auth.go`, find the place where `SubscriptionInfo` is populated (around lines 449 and 639 — both `issueTokensForUser` and `RefreshToken` build a `SubscriptionInfo` literal). After setting `HasAccess`, add:
 
 ```go
 isAcceptingNew := chosenPlan != nil && chosenPlan.IsActive && chosenPlan.AcceptingNewSubscriptions
-subInfo := model.LoginSubscriptionInfo{
+subInfo := SubscriptionInfo{
     // ... existing fields ...
     IsAcceptingNew: isAcceptingNew,
 }
 ```
 
-(Don't rewrite `resolvePlanForTokenIssuance` yet — that's Task 17 in Phase 2. Phase 1 only sets the new field; behavior for the default-plan fallback stays as-is.)
+Note: `SubscriptionInfo` lives in package `service`, not `model`. Construct it directly (no `model.` prefix).
+
+(Don't rewrite `resolvePlanForTokenIssuance` yet — that's Task 19 in Phase 2. Phase 1 only sets the new field; behavior for the default-plan fallback stays as-is.)
 
 - [ ] **Step 3: Verify**
 
@@ -834,8 +845,8 @@ Expected: PASS.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add internal/service/auth.go internal/service/auth.go
-git commit -m "feat(auth): LoginResponse includes is_accepting_new"
+git add internal/service/auth.go internal/service/auth_test.go
+git commit -m "feat(auth): SubscriptionInfo includes is_accepting_new"
 ```
 
 ---
@@ -1250,7 +1261,7 @@ git tag v0.X.Y-phase2
 | §7.1 admin plan CRUD | T10 |
 | §7.2 PublicPlan DTO | T2 |
 | §7.3 /apps/:id/plans ordering | T4 |
-| §7.4 LoginSubscriptionInfo | T3, T13 |
+| §7.4 SubscriptionInfo (LoginResponse block) | T3, T13 |
 | §7.5 /apps/:id/quote | T9 |
 | §7.6 /payments/orders | T8 |
 | §8 decision matrix | T19 |

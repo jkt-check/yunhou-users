@@ -1249,6 +1249,188 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 	})
 }
 
+// TestAuthService_IssueTokensForUser_IsAcceptingNew locks down spec §6.4:
+// the LoginResponse.Subscription.IsAcceptingNew field mirrors the chosen
+// plan's (IsActive && AcceptingNewSubscriptions) status, so the BFF can
+// render "your sub is fine, but this plan isn't sold anymore" UX.
+//
+// Three branches covered:
+//   1. sub with plan.IsActive=true, AcceptingNewSubscriptions=true → true
+//   2. sub with plan.IsActive=false → false (deactivated plan)
+//   3. no sub → false (Phase 1: chosenPlan is the default plan; with
+//      IsActive=false / AcceptingNewSubscriptions=false on the default
+//      the field is false. Phase 2 will switch chosenPlan=nil when
+//      no sub, so the same assertion continues to hold.)
+func TestAuthService_IssueTokensForUser_IsAcceptingNew(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("active plan accepting new → true", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		// Plan that's both active and accepting new subscriptions.
+		pr.plans["monthly"] = &model.Plan{
+			ID: "monthly", Name: "月付", Apps: []string{"yundian"},
+			IsActive: true, AcceptingNewSubscriptions: true,
+		}
+		expAt := time.Now().Add(30 * 24 * time.Hour)
+		sr.subs["sub-monthly"] = &model.Subscription{
+			ID: "sub-monthly", UserID: "u-monthly", PlanID: "monthly",
+			Status: "active", ExpiresAt: &expAt,
+		}
+		sr.byUserID["u-monthly"] = sr.subs["sub-monthly"]
+		ur.users["u-monthly"] = &model.User{ID: "u-monthly", Status: "active"}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := svc.issueTokensForUser(ctx, ur.users["u-monthly"], "yundian", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Subscription == nil {
+			t.Fatal("Subscription is nil")
+		}
+		if !resp.Subscription.IsAcceptingNew {
+			t.Errorf("IsAcceptingNew: got false, want true (active plan + accepting new subs)")
+		}
+	})
+
+	t.Run("plan IsActive=false → false", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		// Deactivated plan. Even though AcceptingNewSubscriptions=true,
+		// IsActive=false flips the formula to false.
+		pr.plans["deactivated"] = &model.Plan{
+			ID: "deactivated", Name: "已停用", Apps: []string{"yundian"},
+			IsActive: false, AcceptingNewSubscriptions: true,
+		}
+		expAt := time.Now().Add(30 * 24 * time.Hour)
+		sr.subs["sub-deact"] = &model.Subscription{
+			ID: "sub-deact", UserID: "u-deact", PlanID: "deactivated",
+			Status: "active", ExpiresAt: &expAt,
+		}
+		sr.byUserID["u-deact"] = sr.subs["sub-deact"]
+		ur.users["u-deact"] = &model.User{ID: "u-deact", Status: "active"}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := svc.issueTokensForUser(ctx, ur.users["u-deact"], "yundian", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Subscription == nil {
+			t.Fatal("Subscription is nil")
+		}
+		if resp.Subscription.IsAcceptingNew {
+			t.Errorf("IsAcceptingNew: got true, want false (plan.IsActive=false)")
+		}
+	})
+
+	t.Run("plan AcceptingNewSubscriptions=false → false", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		// Plan that's active but has accepting_new_subscriptions=false
+		// (the quarterly case from spec §5.1: visible to existing
+		// subscribers, not sold to new ones).
+		pr.plans["legacy"] = &model.Plan{
+			ID: "legacy", Name: "遗留计划", Apps: []string{"yundian"},
+			IsActive: true, AcceptingNewSubscriptions: false,
+		}
+		expAt := time.Now().Add(30 * 24 * time.Hour)
+		sr.subs["sub-legacy"] = &model.Subscription{
+			ID: "sub-legacy", UserID: "u-legacy", PlanID: "legacy",
+			Status: "active", ExpiresAt: &expAt,
+		}
+		sr.byUserID["u-legacy"] = sr.subs["sub-legacy"]
+		ur.users["u-legacy"] = &model.User{ID: "u-legacy", Status: "active"}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := svc.issueTokensForUser(ctx, ur.users["u-legacy"], "yundian", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Subscription == nil {
+			t.Fatal("Subscription is nil")
+		}
+		if resp.Subscription.IsAcceptingNew {
+			t.Errorf("IsAcceptingNew: got true, want false (AcceptingNewSubscriptions=false)")
+		}
+	})
+
+	t.Run("no sub → false (default plan not accepting new)", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		// Default plan with IsActive=false. Phase 1's resolvePlan picks
+		// the default plan as chosenPlan when there's no sub; the formula
+		// (chosenPlan != nil && chosenPlan.IsActive && ...) returns
+		// false when the default plan is deactivated. Phase 2 will switch
+		// chosenPlan=nil when there's no sub — same outcome.
+		pr.defaultPlan = &model.Plan{
+			ID: "free", Name: "免费", Apps: []string{"yundian"},
+			IsDefault: true, IsActive: false, AcceptingNewSubscriptions: false,
+		}
+		ur.users["u-nosub"] = &model.User{ID: "u-nosub", Status: "active"}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := svc.issueTokensForUser(ctx, ur.users["u-nosub"], "yundian", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Subscription == nil {
+			t.Fatal("Subscription is nil")
+		}
+		if resp.Subscription.IsAcceptingNew {
+			t.Errorf("IsAcceptingNew: got true, want false (no sub + default plan not accepting)")
+		}
+	})
+
+	t.Run("RefreshToken also surfaces IsAcceptingNew", func(t *testing.T) {
+		t.Parallel()
+		// RefreshToken has its own SubscriptionInfo literal — covers the
+		// second call site end-to-end.
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		pr.plans["monthly"] = &model.Plan{
+			ID: "monthly", Name: "月付", Apps: []string{"yundian"},
+			IsActive: true, AcceptingNewSubscriptions: true,
+		}
+		expAt := time.Now().Add(30 * 24 * time.Hour)
+		sr.subs["sub-rt"] = &model.Subscription{
+			ID: "sub-rt", UserID: "u-rt", PlanID: "monthly",
+			Status: "active", ExpiresAt: &expAt,
+		}
+		sr.byUserID["u-rt"] = sr.subs["sub-rt"]
+		ur.users["u-rt"] = &model.User{ID: "u-rt", Status: "active"}
+		plaintext := "rt-accepting-new"
+		hashed := hashToken(plaintext)
+		ssr.sessions["sess-rt"] = &model.Session{
+			ID: "sess-rt", UserID: "u-rt", AppID: "yundian",
+			SessionType: "refresh", RefreshToken: hashed,
+			Revoked: false, ExpiresAt: time.Now().Add(time.Hour),
+		}
+		ssr.byToken[hashed] = ssr.sessions["sess-rt"]
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := svc.RefreshToken(ctx, plaintext, "yundian")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Subscription == nil {
+			t.Fatal("Subscription is nil")
+		}
+		if !resp.Subscription.IsAcceptingNew {
+			t.Errorf("IsAcceptingNew: got false, want true (refresh path must mirror login path)")
+		}
+	})
+}
+
 // TestAuthService_getOrCreateUser covers the internal helper that
 // LoginWithProfile / TestLogin share for the "find existing identity or
 // create new user + bind new identity" dance. The function has three

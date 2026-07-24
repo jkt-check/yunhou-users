@@ -464,10 +464,11 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 			AvatarURL: user.AvatarURL,
 		},
 		Subscription: &SubscriptionInfo{
-			PlanID:    surfacePlanID,
-			PlanName:  surfacePlanName,
-			HasAccess: hasAccess,
-			ExpiresAt: expiresAt,
+			PlanID:         surfacePlanID,
+			PlanName:       surfacePlanName,
+			HasAccess:      hasAccess,
+			ExpiresAt:      expiresAt,
+			IsAcceptingNew: chosenPlan != nil && chosenPlan.IsActive && chosenPlan.AcceptingNewSubscriptions,
 		},
 	}, nil
 }
@@ -660,10 +661,11 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 			AvatarURL: user.AvatarURL,
 		},
 		Subscription: &SubscriptionInfo{
-			PlanID:    surfacePlanID,
-			PlanName:  surfacePlanName,
-			HasAccess: hasAccess,
-			ExpiresAt: expiresAt,
+			PlanID:         surfacePlanID,
+			PlanName:       surfacePlanName,
+			HasAccess:      hasAccess,
+			ExpiresAt:      expiresAt,
+			IsAcceptingNew: chosenPlan != nil && chosenPlan.IsActive && chosenPlan.AcceptingNewSubscriptions,
 		},
 	}, nil
 }

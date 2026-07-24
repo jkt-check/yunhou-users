@@ -36,6 +36,9 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, planID string,
 	if !plan.IsActive {
 		return nil, ErrPlanInactive
 	}
+	if !plan.AcceptingNewSubscriptions {
+		return nil, ErrPlanNotAcceptingNew
+	}
 	if plan.Price > 0 {
 		return nil, ErrPaidPlanForbidden
 	}

@@ -30,7 +30,7 @@ func TestSubscriptionService_Create(t *testing.T) {
 			userID: "user-1",
 			planID: "free",
 			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
-				pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true}
+				pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true, AcceptingNewSubscriptions: true}
 			},
 			expiresAt: timePtr(time.Now().Add(30 * 24 * time.Hour)),
 			wantErr:   false,
@@ -40,7 +40,7 @@ func TestSubscriptionService_Create(t *testing.T) {
 			userID: "user-2",
 			planID: "free",
 			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
-				pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true}
+				pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true, AcceptingNewSubscriptions: true}
 				expiresAt := time.Now().Add(30 * 24 * time.Hour)
 				sr.subs["existing-sub"] = &model.Subscription{
 					ID:        "existing-sub",
@@ -59,7 +59,7 @@ func TestSubscriptionService_Create(t *testing.T) {
 			userID: "user-3",
 			planID: "monthly",
 			setup: func(sr *mockSubscriptionRepo, pr *mockPlanRepo) {
-				pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Price: 9.99, IsActive: true}
+				pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "月付", Price: 9.99, IsActive: true, AcceptingNewSubscriptions: true}
 			},
 			wantErr:     true,
 			errContains: "paid plan",
@@ -525,6 +525,35 @@ func TestSubscriptionService_GetUserSubscription_RarePaths(t *testing.T) {
 	})
 }
 
+// TestSubscriptionService_Create_RejectsNotAcceptingNew covers the new
+// `AcceptingNewSubscriptions` guard (spec §6.2 / Task 7). Quarterly is
+// `accepting_new_subscriptions=false` in production — existing subscribers
+// can renew, but a fresh self-subscribe via `POST /user/subscriptions`
+// must be rejected with `ErrPlanNotAcceptingNew`.
+func TestSubscriptionService_Create_RejectsNotAcceptingNew(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	sr := newMockSubscriptionRepo()
+	pr := newMockPlanRepo()
+	pr.plans["quarterly"] = &model.Plan{
+		ID:                        "quarterly",
+		Name:                      "季付",
+		IsActive:                  true,
+		AcceptingNewSubscriptions: false,
+		Price:                     0,
+	}
+	planSvc := &PlanService{planRepo: pr}
+	subSvc := NewSubscriptionService(sr, planSvc)
+
+	_, err := subSvc.Create(ctx, "user-1", "quarterly", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrPlanNotAcceptingNew) {
+		t.Errorf("expected error wrapping ErrPlanNotAcceptingNew, got %v", err)
+	}
+}
+
 // TestSubscriptionService_Create_RarePaths covers error paths the
 // table-driven Create test doesn't reach: generic planRepo / subRepo
 // errors, and subRepo.Create's generic (non-duplicate) error path.
@@ -553,7 +582,7 @@ func TestSubscriptionService_Create_RarePaths(t *testing.T) {
 		sr := newMockSubscriptionRepo()
 		sr.findErr = errors.New("db down on active sub lookup")
 		pr := newMockPlanRepo()
-		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true}
+		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true, AcceptingNewSubscriptions: true}
 		planSvc := &PlanService{planRepo: pr}
 		subSvc := NewSubscriptionService(sr, planSvc)
 		_, err := subSvc.Create(ctx, "user-x", "free", nil)
@@ -570,7 +599,7 @@ func TestSubscriptionService_Create_RarePaths(t *testing.T) {
 		sr := newMockSubscriptionRepo()
 		sr.createErr = errors.New("db down on create")
 		pr := newMockPlanRepo()
-		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true}
+		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true, AcceptingNewSubscriptions: true}
 		planSvc := &PlanService{planRepo: pr}
 		subSvc := NewSubscriptionService(sr, planSvc)
 		_, err := subSvc.Create(ctx, "user-x", "free", nil)
@@ -587,7 +616,7 @@ func TestSubscriptionService_Create_RarePaths(t *testing.T) {
 		sr := newMockSubscriptionRepo()
 		sr.createErr = &duplicateKeyError{}
 		pr := newMockPlanRepo()
-		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true}
+		pr.plans["free"] = &model.Plan{ID: "free", IsActive: true, AcceptingNewSubscriptions: true}
 		planSvc := &PlanService{planRepo: pr}
 		subSvc := NewSubscriptionService(sr, planSvc)
 		_, err := subSvc.Create(ctx, "user-x", "free", nil)

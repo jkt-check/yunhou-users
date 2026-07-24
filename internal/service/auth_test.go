@@ -1255,12 +1255,12 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 // render "your sub is fine, but this plan isn't sold anymore" UX.
 //
 // Three branches covered:
-//   1. sub with plan.IsActive=true, AcceptingNewSubscriptions=true → true
-//   2. sub with plan.IsActive=false → false (deactivated plan)
-//   3. no sub → false (Phase 1: chosenPlan is the default plan; with
-//      IsActive=false / AcceptingNewSubscriptions=false on the default
-//      the field is false. Phase 2 will switch chosenPlan=nil when
-//      no sub, so the same assertion continues to hold.)
+//  1. sub with plan.IsActive=true, AcceptingNewSubscriptions=true → true
+//  2. sub with plan.IsActive=false → false (deactivated plan)
+//  3. no sub → false (Phase 1: chosenPlan is the default plan; with
+//     IsActive=false / AcceptingNewSubscriptions=false on the default
+//     the field is false. Phase 2 will switch chosenPlan=nil when
+//     no sub, so the same assertion continues to hold.)
 func TestAuthService_IssueTokensForUser_IsAcceptingNew(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

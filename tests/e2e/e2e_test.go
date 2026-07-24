@@ -22,20 +22,20 @@ func TestLoginFlow(t *testing.T) {
 		if refresh == "" {
 			t.Fatal("refresh token is empty")
 		}
-		if sub.PlanID != "free" {
-			t.Fatalf("expected free plan, got %s", sub.PlanID)
+		if sub.PlanID != "monthly" {
+			t.Fatalf("expected monthly plan, got %s", sub.PlanID)
 		}
 		if !sub.HasAccess {
-			t.Error("expected has_access=true for yundian on free plan")
+			t.Error("expected has_access=true for yundian on monthly plan")
 		}
 	})
 
-	// Login to app not in free plan
-	t.Run("login_paid_app_no_subscription", func(t *testing.T) {
-	r := loginAndGetTokens(t, engine, "another-user-token", "yundash")
+	// Login to another app included in the requested monthly plan.
+	t.Run("login_paid_app_with_requested_plan", func(t *testing.T) {
+		r := loginAndGetTokens(t, engine, "another-user-token", "yundash")
 		sub := r.Subscription
-		if sub.HasAccess {
-			t.Error("expected has_access=false for yundash on free plan")
+		if !sub.HasAccess {
+			t.Error("expected has_access=true for yundash on monthly plan")
 		}
 	})
 }
@@ -278,7 +278,7 @@ func TestPlanManagement(t *testing.T) {
 func TestTestLoginMalformed(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
-	resp := doRequest(t, engine, http.MethodPost, "/test/login",
+	resp := doRequest(t, engine, http.MethodPost, "/test/login?plan_id=monthly",
 		`{"app_id":"yundian"}`, nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for missing email, got %d", resp.StatusCode)

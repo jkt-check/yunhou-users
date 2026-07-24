@@ -711,7 +711,7 @@ type loginResult struct {
 func loginAndGetTokens(t *testing.T, engine *gin.Engine, token, appID string) loginResult {
 	t.Helper()
 	body := fmt.Sprintf(`{"email":%q,"app_id":%q}`, token+"@e2e.test", appID)
-	resp := doRequest(t, engine, http.MethodPost, "/test/login", body, nil)
+	resp := doRequest(t, engine, http.MethodPost, "/test/login?plan_id=monthly", body, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("test login failed: %d %s", resp.StatusCode, string(resp.Body))
 	}

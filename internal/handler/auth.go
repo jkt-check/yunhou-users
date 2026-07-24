@@ -81,7 +81,7 @@ func authErrReason(err error) string {
 func (h *AuthHandler) RefreshToken(c *gin.Context) {
 	var req struct {
 		RefreshToken string `json:"refresh_token" binding:"required"`
-		AppID       string `json:"app_id"`
+		AppID        string `json:"app_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
@@ -145,16 +145,21 @@ func (h *AuthHandler) JWKS(c *gin.Context) {
 // This keeps the endpoint off in production. The route is also
 // never registered in router.Setup when the env is missing.
 //
-// POST /test/login  body: {"email":"...","app_id":"yundian"}
+// POST /test/login?plan_id=monthly  body: {"email":"...","app_id":"yundian"}
 // 200:        {access_token, refresh_token, user: {id, ...}}
 //
-// Side-effects: if the email has no matching user, creates one with
-// the default 'free' plan (so the L3 tests have a user + sub to
-// operate on). Refresh token row inserted via the same path the
-// production GitHub OAuth callback uses (`AuthService.LoginWithProfile`).
+// The requested plan must be active and accepting new subscriptions. It is
+// used for the minted token's scope; user creation and refresh-session storage
+// continue through AuthService.TestLogin.
 func (h *AuthHandler) TestLogin(c *gin.Context) {
 	if os.Getenv("PAYPAL_L3_E2E_MODE") != "1" {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "not found"})
+		return
+	}
+
+	planID := c.Query("plan_id")
+	if planID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan_id is required"})
 		return
 	}
 
@@ -168,12 +173,20 @@ func (h *AuthHandler) TestLogin(c *gin.Context) {
 	}
 
 	resp, err := h.authSvc.TestLogin(c.Request.Context(), service.TestLoginRequest{
-		Email: req.Email,
-		AppID: req.AppID,
+		Email:  req.Email,
+		AppID:  req.AppID,
+		PlanID: planID,
 	})
 	if err != nil {
-		log.Printf("test login internal error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "test login failed"})
+		switch {
+		case errors.Is(err, service.ErrPlanNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
+		case errors.Is(err, service.ErrPlanInactive), errors.Is(err, service.ErrPlanNotAcceptingNew):
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is not available for test login"})
+		default:
+			log.Printf("test login internal error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "test login failed"})
+		}
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": resp})

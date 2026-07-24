@@ -30,7 +30,7 @@ export async function initBackend(opts: {
     // L3 e2e uses the dev-only /test/login endpoint. The backend bakes
     // a real JWT (no GitHub OAuth round-trip), creating the user on
     // first call. Requires PAYPAL_L3_E2E_MODE=1 on the backend.
-    const res = await fetch(`${opts.baseUrl}/test/login`, {
+    const res = await fetch(`${opts.baseUrl}/test/login?plan_id=monthly`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, app_id: appId }),

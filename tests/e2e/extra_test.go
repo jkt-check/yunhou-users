@@ -86,7 +86,7 @@ func TestE2E_JWKS_ContentType(t *testing.T) {
 // drove /auth/login (removed by commit 5ef27ce).
 func TestE2E_TestLoginInvalidJSON(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	resp := doRequest(t, srv.Engine, http.MethodPost, "/test/login",
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/test/login?plan_id=monthly",
 		"not-json", nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("invalid json test-login: %d, want 400", resp.StatusCode)

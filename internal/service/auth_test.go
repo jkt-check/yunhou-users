@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -119,18 +120,18 @@ func TestAuthService_RefreshToken(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
+		name         string
 		refreshToken string
-		appID       string
-		setup       func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo, *mockAppRepo)
-		wantErr     bool
-		errContains string
-		validate    func(t *testing.T, resp *LoginResponse)
+		appID        string
+		setup        func(*mockUserRepo, *mockSocialIdentityRepo, *mockPlanRepo, *mockSubscriptionRepo, *mockSessionRepo, *mockAppRepo)
+		wantErr      bool
+		errContains  string
+		validate     func(t *testing.T, resp *LoginResponse)
 	}{
 		{
-			name: "refresh with valid token",
+			name:         "refresh with valid token",
 			refreshToken: "valid-refresh-token",
-			appID:       "yundian",
+			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.defaultPlan = plans["free"]
@@ -166,9 +167,9 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			},
 		},
 		{
-			name: "refresh with expired session token",
+			name:         "refresh with expired session token",
 			refreshToken: "expired-token",
-			appID:       "yundian",
+			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 
@@ -193,9 +194,9 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			errContains: "invalid refresh token",
 		},
 		{
-			name: "refresh with revoked token",
+			name:         "refresh with revoked token",
 			refreshToken: "revoked-token",
-			appID:       "yundian",
+			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 
@@ -220,9 +221,9 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			errContains: "invalid refresh token",
 		},
 		{
-			name: "refresh for paid app with subscription",
+			name:         "refresh for paid app with subscription",
 			refreshToken: "paid-user-token",
-			appID:       "yundash",
+			appID:        "yundash",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.plans["monthly"] = plans["monthly"]
@@ -265,9 +266,9 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			},
 		},
 		{
-			name: "refresh rejects suspended user",
+			name:         "refresh rejects suspended user",
 			refreshToken: "suspended-user-token",
-			appID:       "yundian",
+			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.defaultPlan = plans["free"]
@@ -335,9 +336,9 @@ func TestAuthService_RefreshToken(t *testing.T) {
 			// This is the security-critical test that would have caught
 			// the earlier bug where RotateRefresh returned a plain error
 			// that errors.Is could not match.
-			name:        "refresh reuse revokes the family",
+			name:         "refresh reuse revokes the family",
 			refreshToken: "reuse-token",
-			appID:       "yundian",
+			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				pr.defaultPlan = plans["free"]
@@ -601,7 +602,7 @@ func TestIsTestIdentityProviderUID(t *testing.T) {
 		{"github_12345", false},
 		{"wechat_openid_abc", false},
 		{"", false},
-		{"l3-e2e", false}, // prefix must include the trailing dash
+		{"l3-e2e", false},   // prefix must include the trailing dash
 		{"L3-E2E-X", false}, // case-sensitive: GitHub IDs are case-different
 	}
 	for _, c := range cases {
@@ -753,6 +754,111 @@ func TestAuthService_TestLogin(t *testing.T) {
 
 	ctx := context.Background()
 	defaultPlan := &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsDefault: true}
+
+	t.Run("requested plan controls token scope", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		pr.defaultPlan = defaultPlan
+		pr.plans["monthly"] = &model.Plan{
+			ID: "monthly", Name: "月付", Apps: []string{"yundian", "yunbao"},
+			IsActive: true, AcceptingNewSubscriptions: true,
+		}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := svc.TestLogin(ctx, TestLoginRequest{
+			Email: "plan-scope@x.com", AppID: "yundian", PlanID: "monthly",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		claims, err := tokenSvc.VerifyAccessToken(resp.AccessToken)
+		if err != nil {
+			t.Fatalf("verify access token: %v", err)
+		}
+		if !slices.Equal(claims.Scope, []string{"yundian", "yunbao"}) {
+			t.Errorf("token scope = %v, want requested plan apps", claims.Scope)
+		}
+		if resp.Subscription == nil || resp.Subscription.PlanID != "monthly" {
+			t.Errorf("subscription = %+v, want requested monthly plan", resp.Subscription)
+		}
+	})
+
+	t.Run("existing active subscription takes precedence over requested plan", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		pr.plans["monthly"] = &model.Plan{
+			ID: "monthly", Name: "月付", Apps: []string{"yundian"},
+			IsActive: true, AcceptingNewSubscriptions: true,
+		}
+		pr.plans["restricted"] = &model.Plan{
+			ID: "restricted", Name: "受限", Apps: []string{},
+			IsActive: true, AcceptingNewSubscriptions: true,
+		}
+		email := "subscribed@x.com"
+		ur.users["subscribed-user"] = &model.User{ID: "subscribed-user", Status: "active"}
+		sir.byEmail[email] = []model.SocialIdentity{{
+			ID: "subscribed-identity", UserID: "subscribed-user", Provider: "github", ProviderUID: "gh-subscribed", Email: &email,
+		}}
+		sr.byUserID["subscribed-user"] = &model.Subscription{
+			ID: "subscribed-sub", UserID: "subscribed-user", PlanID: "restricted", Status: "active",
+		}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := svc.TestLogin(ctx, TestLoginRequest{
+			Email: email, AppID: "yundian", PlanID: "monthly",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Subscription == nil || resp.Subscription.PlanID != "restricted" || resp.Subscription.HasAccess {
+			t.Errorf("subscription = %+v, want active restricted subscription", resp.Subscription)
+		}
+	})
+
+	t.Run("requested plan must exist", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+
+		_, err := svc.TestLogin(ctx, TestLoginRequest{
+			Email: "missing-plan@x.com", AppID: "yundian", PlanID: "missing",
+		})
+		if !errors.Is(err, ErrPlanNotFound) {
+			t.Errorf("error = %v, want ErrPlanNotFound", err)
+		}
+	})
+
+	t.Run("requested plan must be active and accepting new subscriptions", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name string
+			plan *model.Plan
+			want error
+		}{
+			{name: "inactive", plan: &model.Plan{ID: "monthly", AcceptingNewSubscriptions: true}, want: ErrPlanInactive},
+			{name: "not accepting", plan: &model.Plan{ID: "monthly", IsActive: true}, want: ErrPlanNotAcceptingNew},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				ur, sir, pr, sr, ssr, ar := newAuthMocks()
+				ar.seedActive("yundian", "云店")
+				pr.plans[tc.plan.ID] = tc.plan
+				svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+
+				_, err := svc.TestLogin(ctx, TestLoginRequest{
+					Email: "unavailable-plan@x.com", AppID: "yundian", PlanID: tc.plan.ID,
+				})
+				if !errors.Is(err, tc.want) {
+					t.Errorf("error = %v, want %v", err, tc.want)
+				}
+			})
+		}
+	})
 
 	t.Run("app not found", func(t *testing.T) {
 		t.Parallel()
@@ -1147,11 +1253,11 @@ func TestAuthService_issueTokensForUser_ErrorPaths(t *testing.T) {
 // LoginWithProfile / TestLogin share for the "find existing identity or
 // create new user + bind new identity" dance. The function has three
 // exit paths:
-//   1. existing identity → return that user
-//   2. brand-new user + identity
-//   3. race: a concurrent caller bound the same (provider, uid) first
-//      (mock this by seeding the identity BEFORE the call, but in the
-//      wrong order to force the duplicate-key path on Create)
+//  1. existing identity → return that user
+//  2. brand-new user + identity
+//  3. race: a concurrent caller bound the same (provider, uid) first
+//     (mock this by seeding the identity BEFORE the call, but in the
+//     wrong order to force the duplicate-key path on Create)
 func TestAuthService_getOrCreateUser(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1231,8 +1337,8 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 		// Custom mock: first FindByProviderUID returns "not found",
 		// second returns an error (the race-winner lookup itself fails).
 		identityRepo := &storeFirstIdentityRepo{
-			inner:         sir,
-			createErr:     &duplicateKeyError{},
+			inner:           sir,
+			createErr:       &duplicateKeyError{},
 			winnerLookupErr: errors.New("db down on winner lookup"),
 		}
 		svc := &AuthService{userRepo: ur, identityRepo: identityRepo}
@@ -1653,7 +1759,8 @@ func TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing(t *testing.T
 	sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &past}
 	sr.byUserID["u-1"] = sr.subs["s-1"]
 	ur.users["u-1"] = &model.User{ID: "u-1", Status: "active"}
-	_ = sir; _ = ssr
+	_ = sir
+	_ = ssr
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 

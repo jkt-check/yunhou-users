@@ -32,6 +32,7 @@ type mockAuthSvc struct {
 	refreshErr    error
 	testLoginResp *service.LoginResponse
 	testLoginErr  error
+	testLoginReq  service.TestLoginRequest
 }
 
 func (m *mockAuthSvc) LoginWithProfile(ctx context.Context, req service.LoginWithProfileRequest) (*service.LoginResponse, error) {
@@ -53,6 +54,7 @@ func (m *mockAuthSvc) RefreshToken(ctx context.Context, refreshToken, appID stri
 }
 
 func (m *mockAuthSvc) TestLogin(ctx context.Context, req service.TestLoginRequest) (*service.LoginResponse, error) {
+	m.testLoginReq = req
 	if m.testLoginErr != nil {
 		return nil, m.testLoginErr
 	}
@@ -2667,7 +2669,7 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 		router := gin.New()
 		router.POST("/test/login", handler.TestLogin)
 
-		req := httptest.NewRequest(http.MethodPost, "/test/login",
+		req := httptest.NewRequest(http.MethodPost, "/test/login?plan_id=monthly",
 			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2675,6 +2677,35 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 
 		if w.Code != http.StatusNotFound {
 			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("mode enabled + missing plan_id → 400", func(t *testing.T) {
+		prev := os.Getenv("PAYPAL_L3_E2E_MODE")
+		os.Setenv("PAYPAL_L3_E2E_MODE", "1")
+		t.Cleanup(func() { os.Setenv("PAYPAL_L3_E2E_MODE", prev) })
+
+		authSvc := &mockAuthSvc{
+			testLoginResp: &service.LoginResponse{
+				AccessToken:  "at",
+				RefreshToken: "rt",
+			},
+		}
+		handler := NewAuthHandler(authSvc, &mockTokenSvc{})
+		router := gin.New()
+		router.POST("/test/login", handler.TestLogin)
+
+		req := httptest.NewRequest(http.MethodPost, "/test/login",
+			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d body=%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"message":"plan_id is required"`) {
+			t.Errorf("expected plan_id required message, got %s", w.Body.String())
 		}
 	})
 
@@ -2694,7 +2725,7 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 		router := gin.New()
 		router.POST("/test/login", handler.TestLogin)
 
-		req := httptest.NewRequest(http.MethodPost, "/test/login",
+		req := httptest.NewRequest(http.MethodPost, "/test/login?plan_id=monthly",
 			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2702,6 +2733,9 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d body=%s", w.Code, w.Body.String())
+		}
+		if authSvc.testLoginReq.PlanID != "monthly" {
+			t.Errorf("expected plan_id monthly forwarded to service, got %q", authSvc.testLoginReq.PlanID)
 		}
 	})
 
@@ -2716,7 +2750,7 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 		router := gin.New()
 		router.POST("/test/login", handler.TestLogin)
 
-		req := httptest.NewRequest(http.MethodPost, "/test/login",
+		req := httptest.NewRequest(http.MethodPost, "/test/login?plan_id=monthly",
 			bytes.NewBufferString(`not-json`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2724,6 +2758,42 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("expected 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("plan validation errors", func(t *testing.T) {
+		prev := os.Getenv("PAYPAL_L3_E2E_MODE")
+		os.Setenv("PAYPAL_L3_E2E_MODE", "1")
+		t.Cleanup(func() { os.Setenv("PAYPAL_L3_E2E_MODE", prev) })
+
+		for _, tc := range []struct {
+			name    string
+			err     error
+			status  int
+			message string
+		}{
+			{name: "not found", err: service.ErrPlanNotFound, status: http.StatusNotFound, message: "plan not found"},
+			{name: "inactive", err: service.ErrPlanInactive, status: http.StatusBadRequest, message: "plan is not available for test login"},
+			{name: "not accepting", err: service.ErrPlanNotAcceptingNew, status: http.StatusBadRequest, message: "plan is not available for test login"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				handler := NewAuthHandler(&mockAuthSvc{testLoginErr: tc.err}, &mockTokenSvc{})
+				router := gin.New()
+				router.POST("/test/login", handler.TestLogin)
+
+				req := httptest.NewRequest(http.MethodPost, "/test/login?plan_id=monthly",
+					bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+
+				if w.Code != tc.status {
+					t.Fatalf("expected %d, got %d body=%s", tc.status, w.Code, w.Body.String())
+				}
+				if !strings.Contains(w.Body.String(), `"message":"`+tc.message+`"`) {
+					t.Errorf("expected message %q, got %s", tc.message, w.Body.String())
+				}
+			})
 		}
 	})
 
@@ -2738,7 +2808,7 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 		router := gin.New()
 		router.POST("/test/login", handler.TestLogin)
 
-		req := httptest.NewRequest(http.MethodPost, "/test/login",
+		req := httptest.NewRequest(http.MethodPost, "/test/login?plan_id=monthly",
 			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -2760,7 +2830,7 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 		router := gin.New()
 		router.POST("/test/login", handler.TestLogin)
 
-		req := httptest.NewRequest(http.MethodPost, "/test/login",
+		req := httptest.NewRequest(http.MethodPost, "/test/login?plan_id=monthly",
 			bytes.NewBufferString(`{"email":"x@y.com","app_id":"yundian"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()

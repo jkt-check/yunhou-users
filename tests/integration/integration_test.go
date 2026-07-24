@@ -163,7 +163,7 @@ func testLogin(t *testing.T, srv *httptest.Server, email, appID string) (access,
 		"email":  email,
 		"app_id": appID,
 	}
-	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login", body)
+	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login?plan_id=monthly", body)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -532,7 +532,7 @@ func TestTestLoginMalformedBody(t *testing.T) {
 	srv := setupServer(db)
 	defer srv.Close()
 
-	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login", map[string]interface{}{
+	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login?plan_id=monthly", map[string]interface{}{
 		// missing required "email" field
 		"app_id": "yundian",
 	})
@@ -548,13 +548,13 @@ func TestLoginHasAccessField(t *testing.T) {
 
 	const email = "user-with-free-plan@yundian.test"
 
-	// First login: yundian on the default 'free' plan → has_access=true.
+	// First login: yundian on the explicitly requested monthly plan → has_access=true.
 	subView := testLoginSub(t, srv, email, "yundian")
 	if subView["has_access"] != true {
-		t.Errorf("expected has_access=true for yundian on free plan, got %v", subView["has_access"])
+		t.Errorf("expected has_access=true for yundian on monthly plan, got %v", subView["has_access"])
 	}
-	if subView["plan_id"] != "free" {
-		t.Errorf("expected plan_id=free, got %v", subView["plan_id"])
+	if subView["plan_id"] != "monthly" {
+		t.Errorf("expected plan_id=monthly, got %v", subView["plan_id"])
 	}
 
 	// Seed a restricted plan (yundian NOT in its apps list) and switch the user to it.
@@ -581,7 +581,7 @@ func TestLoginHasAccessField(t *testing.T) {
 func testLoginSub(t *testing.T, srv *httptest.Server, email, appID string) map[string]interface{} {
 	t.Helper()
 	body := map[string]interface{}{"email": email, "app_id": appID}
-	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login", body)
+	resp := doJSON(t, http.MethodPost, srv.URL+"/test/login?plan_id=monthly", body)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()

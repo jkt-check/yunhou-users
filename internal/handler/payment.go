@@ -275,6 +275,10 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan not found"})
 	case errors.Is(err, service.ErrPlanInactive):
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is inactive"})
+	case errors.Is(err, service.ErrPlanNotAcceptingNew):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is not accepting new subscriptions"})
+	case errors.Is(err, service.ErrPlanCurrencyMismatch):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan currency does not match order currency"})
 	case errors.Is(err, service.ErrUserHasActiveSub):
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
 	case errors.Is(err, service.ErrOrderNotFound), errors.Is(err, service.ErrPaymentNotFound), errors.Is(err, service.ErrRefundNotFound):

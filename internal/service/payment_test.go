@@ -60,6 +60,97 @@ func nopRepos() *PaymentService {
 }
 
 // ============================================================================
+// CreateOrder — plan acceptance and currency source/guard
+// ============================================================================
+
+// newPaymentServiceForCreateOrderPlanTest wires the minimal repository stubs
+// needed by the CreateOrder tests below. The payment service's channel-specific
+// WeChat pre-auth path is not exercised here, so a nil WeChat client is safe.
+func newPaymentServiceForCreateOrderPlanTest(plan *model.Plan) (*PaymentService, *stubOrderRepoLookup) {
+	orderRepo := &stubOrderRepoLookup{}
+	svc := NewPaymentService(
+		nil,
+		orderRepo,
+		nil,
+		nil,
+		&stubSubRepo{},
+		&stubPlanRepo{plan: plan},
+		nil,
+		nil,
+		nil,
+		&stubRefundAPI{},
+		nil,
+		0,
+	)
+	return svc, orderRepo
+}
+
+func TestPaymentService_CreateOrder_RejectsNotAcceptingNew(t *testing.T) {
+	t.Parallel()
+
+	svc, orderRepo := newPaymentServiceForCreateOrderPlanTest(&model.Plan{
+		ID:                        "quarterly",
+		IsActive:                  true,
+		AcceptingNewSubscriptions: false,
+		Currency:                  "USD",
+	})
+	_, err := svc.CreateOrder(context.Background(), "user-1", "quarterly", "paypal")
+	if !errors.Is(err, ErrPlanNotAcceptingNew) {
+		t.Fatalf("CreateOrder error = %v, want ErrPlanNotAcceptingNew", err)
+	}
+	if orderRepo.created != nil {
+		t.Fatal("a rejected plan must not create an order")
+	}
+}
+
+func TestPaymentService_CreateOrder_RejectsCurrencyMismatch(t *testing.T) {
+	t.Parallel()
+
+	// PayPal orders are denominated in USD. A CNY plan must be rejected rather
+	// than creating an order whose channel currency cannot settle it.
+	svc, orderRepo := newPaymentServiceForCreateOrderPlanTest(&model.Plan{
+		ID:                        "monthly",
+		IsActive:                  true,
+		AcceptingNewSubscriptions: true,
+		Currency:                  "CNY",
+	})
+	_, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal")
+	if !errors.Is(err, ErrPlanCurrencyMismatch) {
+		t.Fatalf("CreateOrder error = %v, want ErrPlanCurrencyMismatch", err)
+	}
+	if orderRepo.created != nil {
+		t.Fatal("a currency-mismatched plan must not create an order")
+	}
+}
+
+func TestPaymentService_CreateOrder_ReadsCurrencyFromPlan(t *testing.T) {
+	t.Parallel()
+
+	svc, orderRepo := newPaymentServiceForCreateOrderPlanTest(&model.Plan{
+		ID:                        "monthly",
+		IsActive:                  true,
+		AcceptingNewSubscriptions: true,
+		Currency:                  "USD",
+	})
+	order, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if order == nil {
+		t.Fatal("CreateOrder returned nil order")
+	}
+	if order.Currency != "USD" {
+		t.Fatalf("order.Currency = %q, want USD (plan currency); order=%+v", order.Currency, order)
+	}
+	if orderRepo.created == nil {
+		t.Fatal("order repository did not receive an order")
+	}
+	if orderRepo.created.Currency != "USD" {
+		t.Fatalf("persisted order.Currency = %q, want USD", orderRepo.created.Currency)
+	}
+}
+
+// ============================================================================
 // validateChannel
 // ============================================================================
 
@@ -657,11 +748,11 @@ func TestReconcilePreCheck(t *testing.T) {
 	}
 
 	type tc struct {
-		name       string
-		existing   *model.Payment
-		findErr    error
-		wantSkip   bool
-		wantErr    bool
+		name     string
+		existing *model.Payment
+		findErr  error
+		wantSkip bool
+		wantErr  bool
 	}
 	cases := []tc{
 		{

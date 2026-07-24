@@ -254,7 +254,13 @@ func newPaymentServiceForCreateOrder(client wechatClient) (*PaymentService, *stu
 		nil,
 		nil,
 		&stubSubRepo{},
-		&stubPlanRepo{plan: &model.Plan{ID: "plan-1", Price: 0.29, IsActive: true}},
+		&stubPlanRepo{plan: &model.Plan{
+			ID:                        "plan-1",
+			Price:                     0.29,
+			IsActive:                  true,
+			AcceptingNewSubscriptions: true,
+			Currency:                  "CNY",
+		}},
 		nil,
 		nil,
 		nil,
@@ -475,7 +481,12 @@ func TestPaymentService_Unit_CreateOrder_SubRepoError(t *testing.T) {
 		&stubOrderRepoLookup{},
 		nil, nil,
 		&stubSubRepo{findErr: errors.New("db connection lost")},
-		&stubPlanRepo{plan: &model.Plan{ID: "monthly", IsActive: true}},
+		&stubPlanRepo{plan: &model.Plan{
+			ID:                        "monthly",
+			IsActive:                  true,
+			AcceptingNewSubscriptions: true,
+			Currency:                  "CNY",
+		}},
 		nil, nil, nil,
 		&stubRefundAPI{}, nil,
 

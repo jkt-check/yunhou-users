@@ -36,6 +36,16 @@ type wechatClient interface {
 // no way to pay — we surface a 4xx instead (mapped in handler/payment.go).
 var ErrWechatPayNotConfigured = errors.New("wechat pay not configured on this deployment")
 
+// channelRequiredCurrency describes the settlement currency required by the
+// channels that only support one currency in this service. Plans remain the
+// source of truth for the order's persisted currency. Stripe and Alipay are
+// intentionally omitted because they can settle the plan's configured
+// currency.
+var channelRequiredCurrency = map[string]string{
+	"wechat_pay": "CNY",
+	"paypal":     "USD",
+}
+
 // PaymentService implements the v1 payment data flow primitives:
 // order creation, frontend confirm, refund creation, channel webhook reception.
 // See docs/plans/2026-06-16-user-system-design.md and
@@ -186,6 +196,12 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	if !plan.IsActive {
 		return nil, ErrPlanInactive
 	}
+	if !plan.AcceptingNewSubscriptions {
+		return nil, ErrPlanNotAcceptingNew
+	}
+	if required, ok := channelRequiredCurrency[channel]; ok && plan.Currency != required {
+		return nil, ErrPlanCurrencyMismatch
+	}
 
 	// Enforce the partial unique index `UNIQUE(user_id) WHERE status='active'`
 	// at the order layer. Without this pre-check, a concurrent order + activate
@@ -219,7 +235,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		UserID:    userID,
 		PlanID:    planID,
 		Amount:    plan.Price,
-		Currency:  "CNY",
+		Currency:  plan.Currency,
 		Status:    "pending",
 		ExpiresAt: time.Now().Add(s.orderExpiry),
 	}
@@ -266,7 +282,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		resp, err := s.wechat.UnifiedOrder(ctx, wechat.UnifiedOrderRequest{
 			OutTradeNo:  outTradeNo,
 			Description: fmt.Sprintf("plan-%s", planID),
-			Amount:      wechat.Amount{Total: amountFen, Currency: "CNY"},
+			Amount:      wechat.Amount{Total: amountFen, Currency: order.Currency},
 			TradeType:   wechat.TradeTypeNative,
 		})
 		if err != nil {

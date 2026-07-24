@@ -154,6 +154,23 @@ func TestPaymentHandler_CreateOrder_HasActiveSub(t *testing.T) {
 	}
 }
 
+func TestPaymentHandler_CreateOrder_PlanNotAcceptingNew(t *testing.T) {
+	svc := &mockPaymentSvc{createOrderErr: service.ErrPlanNotAcceptingNew}
+	g := paymentTestEngine(svc, "u-1")
+	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"quarterly","channel":"paypal"}`)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status=%d, want 409", w.Code)
+	}
+}
+
+func TestPaymentHandler_CreateOrder_PlanCurrencyMismatch(t *testing.T) {
+	svc := &mockPaymentSvc{createOrderErr: service.ErrPlanCurrencyMismatch}
+	g := paymentTestEngine(svc, "u-1")
+	w := doPayRequest(g, http.MethodPost, "/payments/orders", `{"plan_id":"monthly","channel":"paypal"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", w.Code)
+	}
+}
 func TestPaymentHandler_CreateOrder_InternalError(t *testing.T) {
 	svc := &mockPaymentSvc{createOrderErr: errors.New("db boom")}
 	g := paymentTestEngine(svc, "u-1")

@@ -4,7 +4,7 @@
 
 **Goal:** Convert the `plans` table from an internal catalog into a commercial product surface — retire `free`, remove the default-plan concept, add 7 plan fields (is_listed / accepting_new_subscriptions / currency / trial_days / description / display_order / updated_at), and switch `quote`/`order`/`subscription` to read currency + trial_days from `plan` rather than from `orders` or `AppConfig`.
 
-**Architecture:** Two-phase deploy. Phase 1 applies `migrations/012_plan_commercial_fields.sql` (purely additive: new columns + new audit table + data backfill) and deploys service code that writes/reads those new fields without changing any default-plan behavior. Phase 2 applies `migrations/013_remove_default_plan.sql` (drop `is_default`, retire `free`, drop partial unique index) and deploys the auth-service rewrite that removes the default-plan fallback. Phase 1 is independently deployable and rollback-friendly; Phase 2 must deploy together with the auth-service change because the code can no longer reference `model.Plan.IsDefault` after 013.
+**Architecture:** Two-phase deploy. Phase 1 applies `migrations/012_plan_commercial_fields.sql` (purely additive: new columns + new audit table + data backfill) and deploys service code that writes/reads those new fields without changing any default-plan behavior. Phase 2 applies `migrations/014_remove_default_plan.sql` (drop `is_default`, retire `free`, drop partial unique index) and deploys the auth-service rewrite that removes the default-plan fallback. Phase 1 is independently deployable and rollback-friendly; Phase 2 must deploy together with the auth-service change because the code can no longer reference `model.Plan.IsDefault` after 013.
 
 **Tech Stack:** Go 1.22, PostgreSQL, sqlx, Echo, JWT (RS256), testify (mock in service tests). Tests are unit (`internal/service`, `internal/handler`) + E2E (`tests/e2e/`) + integration (`tests/integration/`).
 
@@ -19,7 +19,7 @@
 | Path | Purpose |
 |---|---|
 | `migrations/012_plan_commercial_fields.sql` | Add 7 columns + CHECKs + trigger + plan_change_log + backfill |
-| `migrations/013_remove_default_plan.sql` | Pre-check + retire free + drop plans_one_default + drop is_default |
+| `migrations/014_remove_default_plan.sql` | Pre-check + retire free + drop plans_one_default + drop is_default |
 | `tests/e2e/plan_commercial_test.go` | E2E tests per spec §10.2 (Phase 1 subset) |
 | `tests/e2e/plan_commercial_phase2_test.go` | E2E tests for retired-free + no-default (Phase 2 subset) |
 
@@ -951,7 +951,7 @@ Same steps on production. The default-plan fallback is still in effect; Phase 1 
 ### Task 17: Migration 013 — drop `is_default` + retire `free`
 
 **Files:**
-- Create: `migrations/013_remove_default_plan.sql`
+- Create: `migrations/014_remove_default_plan.sql`
 
 - [ ] **Step 1: Write the migration file**
 
@@ -985,7 +985,7 @@ If non-zero: cancel those subscriptions first (`UPDATE subscriptions SET status=
 
 - [ ] **Step 3: Apply locally**
 
-Run: `psql $DATABASE_URL -f migrations/013_remove_default_plan.sql`
+Run: `psql $DATABASE_URL -f migrations/014_remove_default_plan.sql`
 Expected: applies without error.
 
 Verify:
@@ -997,7 +997,7 @@ SELECT id, is_active FROM plans WHERE id = 'free'; -- is_active=false
 - [ ] **Step 4: Commit**
 
 ```bash
-git add migrations/013_remove_default_plan.sql
+git add migrations/014_remove_default_plan.sql
 git commit -m "feat(migration): drop is_default + retire free"
 ```
 
@@ -1213,7 +1213,7 @@ Apply migration 013 and deploy the new service **in the same maintenance window*
 
 Run:
 ```bash
-psql $PROD_DATABASE_URL -f migrations/013_remove_default_plan.sql
+psql $PROD_DATABASE_URL -f migrations/014_remove_default_plan.sql
 # then trigger service deploy
 ```
 

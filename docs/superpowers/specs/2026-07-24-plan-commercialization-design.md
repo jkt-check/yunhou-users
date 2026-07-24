@@ -150,7 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_plan_change_log_plan_changed_at
 - Touch `free` semantics beyond writing the new fields
 - Touch token issuance or subscription code paths
 
-### 5.2 `migrations/013_remove_default_plan.sql` — behavioral switch, requires coordinated deploy
+### 5.2 `migrations/014_remove_default_plan.sql` — behavioral switch, requires coordinated deploy
 
 ```sql
 -- Pre-check: abort if any active subscription still references plan_id='free'.
@@ -541,7 +541,7 @@ The seeded prices make `quarterly` (¥79.9 / 90 days = ¥0.89/day) more expensiv
 | # | File | Change |
 |---|---|---|
 | 1 | `migrations/012_plan_commercial_fields.sql` | NEW. Adds 7 columns + 2 CHECKs + trigger + plan_change_log + data backfill |
-| 2 | `migrations/013_remove_default_plan.sql` | NEW. Pre-check + retire `free` + drop `plans_one_default` + drop `is_default` |
+| 2 | `migrations/014_remove_default_plan.sql` | NEW. Pre-check + retire `free` + drop `plans_one_default` + drop `is_default` |
 | 3 | `internal/model/plan.go` | Add 7 fields; remove `IsDefault`; expand `PublicPlan` |
 | 4 | `internal/model/app_test.go`, `internal/model/app.go` | (If `app_test.go` references removed fields; TBD during implementation) |
 | 5 | `internal/service/auth.go` | Add `IsAcceptingNew` to `SubscriptionInfo` (struct already lives in this file with value-type `PlanID`/`PlanName` and `ExpiresAt *time.Time` with `omitempty`) |

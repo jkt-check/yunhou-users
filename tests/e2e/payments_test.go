@@ -19,7 +19,7 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 	// those DELETEs. Run these tests serially.
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "payments-lifecycle", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "payments-lifecycle", "yundian").AccessToken
 
 	// 1. Create order
 	t.Run("create_order", func(t *testing.T) {
@@ -58,7 +58,8 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 	// 3. Confirm the first order
 	t.Run("confirm_order", func(t *testing.T) {
 		// Create a fresh user for clean state.
-		token2, userID := loginAndGetToken(t, srv.Engine, "payments-confirm", "yundian")
+		login := loginAndGetTokens(t, srv.Engine, "payments-confirm", "yundian")
+		token2, userID := login.AccessToken, login.User.ID
 		body := `{"plan_id":"monthly","channel":"stripe"}`
 		resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token2))
 		if resp.StatusCode != http.StatusCreated {
@@ -119,7 +120,7 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 // than the existing paid payment → 409.
 func TestPayments_ConfirmChannelMismatch(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "channel-mismatch", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "channel-mismatch", "yundian").AccessToken
 
 	// First, create + confirm with Stripe.
 	body := `{"plan_id":"monthly","channel":"stripe"}`
@@ -155,7 +156,7 @@ func TestPayments_ConfirmChannelMismatch(t *testing.T) {
 func TestPayments_RefundIdempotency(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "refund-idem", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "refund-idem", "yundian").AccessToken
 
 	// Create + confirm to get a paid payment.
 	body := `{"plan_id":"monthly","channel":"stripe"}`
@@ -223,7 +224,7 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 func TestPayments_RefundMissingIdempotencyKey(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "refund-noidem", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "refund-noidem", "yundian").AccessToken
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/refunds",
 		`{"payment_id":"00000000-0000-0000-0000-000000000000","amount":5.0}`,
@@ -238,7 +239,7 @@ func TestPayments_RefundMissingIdempotencyKey(t *testing.T) {
 func TestPayments_RefundSumInvariant(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "refund-sum", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "refund-sum", "yundian").AccessToken
 
 	// Setup: paid payment of 29.90
 	body := `{"plan_id":"monthly","channel":"stripe"}`
@@ -280,8 +281,8 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 func TestPayments_OwnershipIsolation(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	tokenA, _ := loginAndGetToken(t, srv.Engine, "owner-a", "yundian")
-	tokenB, _ := loginAndGetToken(t, srv.Engine, "owner-b", "yundian")
+	tokenA := loginAndGetTokens(t, srv.Engine, "owner-a", "yundian").AccessToken
+	tokenB := loginAndGetTokens(t, srv.Engine, "owner-b", "yundian").AccessToken
 
 	// A creates + confirms an order.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
@@ -337,7 +338,7 @@ func TestPayments_UnauthenticatedRejected(t *testing.T) {
 func TestPayments_CancelOrder(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "cancel-pending", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "cancel-pending", "yundian").AccessToken
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
@@ -371,7 +372,7 @@ func TestPayments_CancelOrder(t *testing.T) {
 func TestPayments_LatePaymentHonored(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "late-pay", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "late-pay", "yundian").AccessToken
 
 	// Create + manually expire (simulating sweeper).
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
@@ -424,7 +425,7 @@ func TestPayments_LatePaymentHonored(t *testing.T) {
 func TestPayments_ListPayments(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "list-payments", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "list-payments", "yundian").AccessToken
 
 	resp := doRequest(t, srv.Engine, http.MethodGet, "/payments", "", authHeader(token))
 	if resp.StatusCode != http.StatusOK {
@@ -452,7 +453,7 @@ func TestPayments_ListPayments(t *testing.T) {
 func TestPayments_ConcurrentRefundRace(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "concurrent-refund", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "concurrent-refund", "yundian").AccessToken
 
 	// Setup: paid payment of 29.90
 	body := `{"plan_id":"monthly","channel":"stripe"}`
@@ -531,7 +532,7 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "concurrent-webhook", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "concurrent-webhook", "yundian").AccessToken
 
 	// Setup: paid order
 	body := `{"plan_id":"monthly","channel":"stripe"}`
@@ -607,5 +608,122 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 	}
 	if successes != N {
 		t.Errorf("expected %d successes, got %d", N, successes)
+	}
+}
+
+// TestPayments_ConcurrentWebhookSameEventID is the canonical "Stripe
+// retry burst for the same event_id" race — every concurrent webhook
+// carries the SAME (channel, event_id) and the SAME payment_intent.id.
+// The webhook_events UNIQUE(channel, event_id) constraint must absorb
+// the duplicates: only ONE business action should run; the others
+// must be 200 dedupe-hits with no duplicate payment row + no
+// duplicate subscription activation. Without this guard, two concurrent
+// deliveries of the same Stripe event would race the dedupe SELECT and
+// each mint a fresh payment_intent handler call — a real Stripe-side
+// incident observed in 2025-Q3.
+//
+// The companion test (TestPayments_ConcurrentWebhookSameOrder) covers
+// the orthogonal case: same payment_intent.id, DIFFERENT event_ids.
+// Together they pin the two distinct dedup layers — event-level
+// (webhook_events UNIQUE) and payment-level (payments UNIQUE(channel,
+// external_txn_id)).
+func TestPayments_ConcurrentWebhookSameEventID(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token := loginAndGetTokens(t, srv.Engine, "concurrent-event-id", "yundian").AccessToken
+
+	// Setup: a pending order. We deliberately do NOT pre-confirm —
+	// the test's purpose is to prove the webhook_events UNIQUE
+	// constraint + handler dedup path works without the (channel,
+	// external_txn_id) UNIQUE constraint as a backstop. If we
+	// pre-confirmed, the first webhook in the burst would still need
+	// to satisfy the partial UNIQUE(order_id) WHERE status='paid'
+	// guard — a separate invariant covered by the same-eventID
+	// companion test.
+	body := `{"plan_id":"monthly","channel":"stripe"}`
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
+	var r struct {
+		Data struct{ ID string `json:"id"` } `json:"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+
+	// Fire N concurrent webhooks with the SAME event_id and the SAME
+	// payment_intent.id. The webhook_events UNIQUE(channel, event_id)
+	// constraint must dedupe them: first wins, others are 200 acks
+	// with no further side-effects.
+	const N = 5
+	const sharedEventID = "evt_race_same_event_id"
+	const sharedTxnID = "pi_e2e_evtid_race_shared"
+	type whResult struct {
+		status int
+		body   string
+	}
+	results := make(chan whResult, N)
+	for i := 0; i < N; i++ {
+		go func() {
+			raw := []byte(fmt.Sprintf(`{
+				"id": "%s",
+				"type": "payment_intent.succeeded",
+				"data": {"object": {"id": "%s", "metadata": {"order_id": "%s"}, "amount": 2990, "currency": "usd"}}
+			}`, sharedEventID, sharedTxnID, orderID))
+			ts := time.Now().Unix()
+			sig := signStripe(e2eStripeSecret, ts, raw)
+			req := httptest.NewRequest(http.MethodPost, "/webhooks/payment/stripe", bytes.NewReader(raw))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Stripe-Signature", sig)
+			w := httptest.NewRecorder()
+			srv.Engine.ServeHTTP(w, req)
+			results <- whResult{status: w.Code, body: w.Body.String()}
+		}()
+	}
+	successes := 0
+	for i := 0; i < N; i++ {
+		r := <-results
+		switch r.status {
+		case http.StatusOK:
+			successes++
+		default:
+			t.Errorf("webhook %d: unexpected status %d body=%s", i, r.status, r.body)
+		}
+	}
+	if successes != N {
+		t.Errorf("expected %d successes (all webhook_events dedupe), got %d", N, successes)
+	}
+
+	// Critical invariant: exactly ONE webhook_events row was created
+	// for this event_id. If more than one exists, the dedup is broken.
+	var eventCount int
+	if err := srv.DB.GetContext(context.Background(), &eventCount,
+		`SELECT COUNT(*) FROM webhook_events WHERE channel = 'stripe' AND event_id = $1`,
+		sharedEventID); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 1 {
+		t.Errorf("expected exactly 1 webhook_events row for event_id %s, got %d (event-level dedup is broken)", sharedEventID, eventCount)
+	}
+
+	// Side-effect invariant: only ONE payment row was created for the
+	// shared external_txn_id — proves the first webhook won the race
+	// and the rest fell through the (channel, external_txn_id) UNIQUE
+	// check.
+	var paymentCount int
+	if err := srv.DB.GetContext(context.Background(), &paymentCount,
+		`SELECT COUNT(*) FROM payments WHERE channel = 'stripe' AND external_txn_id = $1`,
+		sharedTxnID); err != nil {
+		t.Fatal(err)
+	}
+	if paymentCount != 1 {
+		t.Errorf("expected exactly 1 payments row for txn_id %s, got %d (payment-row dedup is broken)", sharedTxnID, paymentCount)
+	}
+
+	// And only ONE active subscription exists for the order's user.
+	var subCount int
+	if err := srv.DB.GetContext(context.Background(), &subCount,
+		`SELECT COUNT(*) FROM subscriptions WHERE user_id = (SELECT user_id FROM orders WHERE id = $1) AND plan_id = 'monthly' AND status = 'active'`,
+		orderID); err != nil {
+		t.Fatal(err)
+	}
+	if subCount != 1 {
+		t.Errorf("expected exactly 1 active subscription, got %d (subscription UPSERT should be idempotent under burst)", subCount)
 	}
 }

@@ -304,6 +304,12 @@ func writePaymentError(c *gin.Context, err error) {
 		// channel on this deployment just isn't enabled) and not a 503
 		// (we're not temporarily down — we never wire this channel).
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "wechat pay not configured on this deployment"})
+	case errors.Is(err, wechat.ErrWechatMisconfigured):
+		// 500 — the deployment is in real-mode (MockMode=false) but the
+		// AppID/Signer/MchID is unset. Operator-fixable: re-set the env
+		// vars and redeploy. Not 4xx (the request is well-formed) and not
+		// 502 (this isn't an upstream failure).
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "wechat pay client misconfigured (check WECHAT_PAY_APP_ID / WECHAT_PAY_MCH_ID / signing key path)"})
 	case errors.Is(err, wechat.ErrWeChatUnifiedOrderRejected):
 		// 400 — WeChat returned 4xx (or empty code_url). Terminal: retrying
 		// the same payload will fail again. Surface a 4xx so the caller

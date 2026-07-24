@@ -104,7 +104,7 @@ func TestE2E_PostQuote_HappyPath(t *testing.T) {
 		t.Fatalf("seed plan: %v", err)
 	}
 
-	token, _ := loginAndGetToken(t, engine, "e2e-quote-user-"+randomSuffix(), appID)
+	token := loginAndGetTokens(t, engine, "e2e-quote-user-"+randomSuffix(), appID).AccessToken
 
 	body := `{"plan_id":"qp"}`
 	req, _ := http.NewRequest(http.MethodPost, "/apps/"+appID+"/quote", strings.NewReader(body))
@@ -161,7 +161,7 @@ func TestE2E_PostQuote_NoAuthReturns401(t *testing.T) {
 
 func TestE2E_PostQuote_PlanNotFound(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
-	token, _ := loginAndGetToken(t, engine, "e2e-quote-user-"+randomSuffix(), "yundian")
+	token := loginAndGetTokens(t, engine, "e2e-quote-user-"+randomSuffix(), "yundian").AccessToken
 	req, _ := http.NewRequest(http.MethodPost, "/apps/yundian/quote", strings.NewReader(`{"plan_id":"no-such-plan"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -176,7 +176,7 @@ func TestE2E_PostQuote_PlanAppMismatch(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 	// monthly plan apps={yundian, yundash}; free plan apps={yundian}.
 	// Requesting "free" plan for app yundash — free doesn't include yundash.
-	token, _ := loginAndGetToken(t, engine, "e2e-mismatch-"+randomSuffix(), "yundash")
+	token := loginAndGetTokens(t, engine, "e2e-mismatch-"+randomSuffix(), "yundash").AccessToken
 	req, _ := http.NewRequest(http.MethodPost, "/apps/yundash/quote", strings.NewReader(`{"plan_id":"free"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)

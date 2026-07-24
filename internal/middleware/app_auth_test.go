@@ -136,8 +136,12 @@ func TestInternalAppAuth(t *testing.T) {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
-		if w.Code != http.StatusForbidden {
-			t.Errorf("expected 403, got %d", w.Code)
+		// Info-leak prevention: a disabled app and an invalid secret
+		// both surface as 401 "invalid app_secret" so an attacker can't
+		// enumerate which X-App-ID values exist or are active. The
+		// operator-visible reason goes to the log.
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d (info-leak prevention: disabled app surfaces same code as invalid secret)", w.Code)
 		}
 	})
 

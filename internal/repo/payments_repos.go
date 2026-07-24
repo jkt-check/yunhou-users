@@ -181,9 +181,17 @@ func (r *orderRepo) SweepExpired(ctx context.Context, now time.Time) (int64, err
 // The `$1::jsonb` cast lets sqlx bind []byte (Postgres `bytea`) and converts
 // to JSONB server-side; if payload is not valid JSON, Postgres rejects with
 // SQLSTATE 22P02 and we surface the wrap below.
+//
+// Gated to status='pending': a slow pre-auth write landing after the
+// payment has already settled would otherwise overwrite the code_url
+// of a paid order, and the BFF would re-render a stale QR for a
+// payment that already succeeded. Once the order is paid/failed/etc.
+// the provider_intent is a forensic record; mutations belong to the
+// status-transition path, not this one.
 func (r *orderRepo) UpdateProviderIntent(ctx context.Context, orderID string, payload []byte) error {
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE orders SET provider_intent = $1::jsonb, updated_at = now() WHERE id = $2`,
+		`UPDATE orders SET provider_intent = $1::jsonb, updated_at = now()
+		 WHERE id = $2 AND status = 'pending'`,
 		payload, orderID,
 	)
 	if err != nil {

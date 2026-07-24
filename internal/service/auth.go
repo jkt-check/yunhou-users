@@ -513,13 +513,12 @@ func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, a
 		if orig, oerr := s.planRepo.FindByID(ctx, sub.PlanID); oerr == nil {
 			surfaceName = orig.Name
 		}
-		// sub.ExpiresAt is non-nil when status='active' (subscriptions
-		// table constraint checked by FindActiveByUserID); still guard.
-		var subExpiry *time.Time
-		if sub != nil {
-			subExpiry = sub.ExpiresAt
-		}
-		return defaultPlan, surfaceID, surfaceName, false, subExpiry, nil
+		// sub is non-nil in this branch (the `sub != nil && expired` guard
+		// above); the `subscriptions` table constraint enforced by
+		// FindActiveByUserID guarantees ExpiresAt is set for status='active'
+		// rows. sub.ExpiresAt is allowed to be in the past — that's the
+		// "active but expired" state we're in here.
+		return defaultPlan, surfaceID, surfaceName, false, sub.ExpiresAt, nil
 	}
 	// sub == nil && !expired: no active subscription at all. Use the
 	// default plan's identity for both surface and chosen, and treat

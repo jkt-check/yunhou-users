@@ -97,7 +97,33 @@ func Apply(ctx context.Context, db *sqlx.DB, migrations []Migration) (applied, s
 		return 0, 0, fmt.Errorf("create ledger: %w", err)
 	}
 
-	rows, err := db.QueryContext(ctx, `SELECT id FROM _migrations`)
+	// pg_advisory_lock so two concurrent `cmd/migrate` invocations
+	// (e.g. a rolling deploy where two replicas race to apply the same
+	// pending migration) serialise on the lock instead of both reading
+	// the empty ledger, both attempting the same INSERT INTO _migrations,
+	// and one tripping the unique-key constraint aborting the entire
+	// batch. The lock auto-releases on COMMIT/ROLLBACK of the wrapping
+	// tx — no manual unlock needed.
+	lockTx, err := db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin lock tx: %w", err)
+	}
+	if _, err := lockTx.ExecContext(ctx, `SELECT pg_advisory_lock(7243817)`); err != nil {
+		_ = lockTx.Rollback()
+		return 0, 0, fmt.Errorf("acquire migrate advisory lock: %w", err)
+	}
+	// We can't COMMIT the lock-tx because that releases the lock. Hold
+	// it open for the duration of Apply; release on every return path
+	// below via the defer-on-lockTx wrapper. Errors abort with ROLLBACK,
+	// success path commits AFTER the last applyOne.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = lockTx.Rollback()
+		}
+	}()
+
+	rows, err := lockTx.QueryContext(ctx, `SELECT id FROM _migrations`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("select applied: %w", err)
 	}
@@ -109,6 +135,10 @@ func Apply(ctx context.Context, db *sqlx.DB, migrations []Migration) (applied, s
 			return 0, 0, fmt.Errorf("scan applied id: %w", err)
 		}
 		appliedSet[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, fmt.Errorf("iterate applied ids: %w", err)
 	}
 	rows.Close()
 
@@ -124,6 +154,10 @@ func Apply(ctx context.Context, db *sqlx.DB, migrations []Migration) (applied, s
 		applied++
 		log.Printf("[migrate] applied %s", m.ID)
 	}
+	if err := lockTx.Commit(); err != nil {
+		return applied, skipped, fmt.Errorf("release migrate advisory lock: %w", err)
+	}
+	committed = true
 	return applied, skipped, nil
 }
 

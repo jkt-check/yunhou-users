@@ -122,7 +122,7 @@ func goldenWeChatFailed(t *testing.T, orderID, txnID string, amountFen int64) []
 
 func TestWebhook_Stripe_PaymentSucceeded(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "stripe-paid", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "stripe-paid", "yundian").AccessToken
 
 	// Create the order first so the webhook can find it.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
@@ -226,7 +226,7 @@ func TestWebhook_Stripe_UnknownOrder_Audited(t *testing.T) {
 
 func TestWebhook_Stripe_DuplicateEvent(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "stripe-dup", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "stripe-dup", "yundian").AccessToken
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
@@ -299,7 +299,7 @@ func TestWebhook_Stripe_BadSignature(t *testing.T) {
 
 func TestWebhook_Alipay_PaymentSucceeded(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "alipay-paid", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "alipay-paid", "yundian").AccessToken
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"alipay"}`, authHeader(token))
@@ -345,7 +345,7 @@ func TestWebhook_Alipay_PaymentSucceeded(t *testing.T) {
 
 func TestWebhook_Alipay_FullRefund(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "alipay-refund", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "alipay-refund", "yundian").AccessToken
 
 	// Setup: paid order.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
@@ -405,7 +405,7 @@ func TestWebhook_Alipay_FullRefund(t *testing.T) {
 
 func TestWebhook_WeChat_PaymentSucceeded(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "wechat-paid", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "wechat-paid", "yundian").AccessToken
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"wechat_pay"}`, authHeader(token))
@@ -472,7 +472,7 @@ func TestWebhook_UnsupportedChannel_404(t *testing.T) {
 // subscription state.
 func TestWebhook_Stripe_DisputeCreated(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "dispute", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "dispute", "yundian").AccessToken
 
 	// Create the order + confirm so a paid payment row exists.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
@@ -531,7 +531,7 @@ func TestWebhook_Stripe_DisputeCreated(t *testing.T) {
 // first.
 func TestWebhook_WeChat_PaymentFailed(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "wechat-failed", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "wechat-failed", "yundian").AccessToken
 
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"wechat_pay"}`, authHeader(token))
@@ -592,7 +592,7 @@ func TestWebhook_WeChat_PaymentFailed(t *testing.T) {
 // the signature wouldn't match — confirmed by TestWebhook_WeChat_MockMode_RealVerifierRejects.
 func TestWebhook_WeChat_MockMode_OrderPaid_SubscriptionActivated(t *testing.T) {
 	srv := setupE2EServerWithMockWeChatPay(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "wechat-mock-paid", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "wechat-mock-paid", "yundian").AccessToken
 
 	// Create an order.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",

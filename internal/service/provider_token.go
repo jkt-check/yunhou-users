@@ -39,8 +39,12 @@ var (
 )
 
 // Get returns the token/credential for (appID, channel). Channel must be
-// "paypal"; other values return ErrUnsupportedChannel.
+// "paypal"; other values return ErrUnsupportedChannel before any DB work
+// runs (saves a wasted app/config round-trip on attacker-supplied paths).
 func (s *ProviderTokenService) Get(ctx context.Context, appID, channel string) (*model.ProviderToken, error) {
+	if channel != "paypal" {
+		return nil, ErrUnsupportedChannel
+	}
 	app, err := s.apps.FindByID(ctx, appID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrAppNotFound
@@ -56,9 +60,6 @@ func (s *ProviderTokenService) Get(ctx context.Context, appID, channel string) (
 		if err := json.Unmarshal(app.Config, &cfg); err != nil {
 			return nil, fmt.Errorf("decode app config: %w", err)
 		}
-	}
-	if channel != "paypal" {
-		return nil, ErrUnsupportedChannel
 	}
 	if cfg.PaymentProviders == nil || cfg.PaymentProviders.Paypal == nil {
 		return nil, ErrProviderNotConfigured

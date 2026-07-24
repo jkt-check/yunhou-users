@@ -1,17 +1,23 @@
 package e2e
 
 import (
-	"bytes"
+	"context"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 )
 
 // TestE2E_AuthLogout_Roundtrip covers the full logout → re-login cycle.
 func TestE2E_AuthLogout_Roundtrip(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	tok, refresh := loginAndGetRefresh(t, srv.Engine, "logout-rt", "yundian")
+	r := loginAndGetTokens(t, srv.Engine, "logout-rt", "yundian")
+	tok := r.AccessToken
+	refresh := r.RefreshToken
 	if tok == "" || refresh == "" {
 		t.Fatal("missing tokens from login")
 	}
@@ -105,7 +111,7 @@ func TestE2E_AppAndPlanCRUD(t *testing.T) {
 		`{"app_id":"e2e-extra","name":"E2E Extra"}`,
 		hdrs)
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := readBody(resp)
+		body := string(resp.Body)
 		t.Fatalf("create app: %d %s", resp.StatusCode, body)
 	}
 
@@ -138,7 +144,7 @@ func TestE2E_AppAndPlanCRUD(t *testing.T) {
 		`{"id":"e2e-extra","name":"E2E Extra","price":1.0,"interval_days":30,"apps":["yundian"]}`,
 		hdrs)
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := readBody(resp)
+		body := string(resp.Body)
 		t.Fatalf("create plan: %d %s", resp.StatusCode, body)
 	}
 
@@ -178,7 +184,8 @@ func TestE2E_PlanCreateBadJSON(t *testing.T) {
 // TestE2E_RefreshRotatesToken verifies token rotation.
 func TestE2E_RefreshRotatesToken(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	_, refresh := loginAndGetRefresh(t, srv.Engine, "rotate", "yundian")
+	login := loginAndGetTokens(t, srv.Engine, "rotate", "yundian")
+	refresh := login.RefreshToken
 
 	// First refresh.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/auth/refresh",
@@ -186,7 +193,7 @@ func TestE2E_RefreshRotatesToken(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first refresh: %d", resp.StatusCode)
 	}
-	var r struct {
+	var refreshResp struct {
 		Data struct {
 			AccessToken  string `json:"access_token"`
 			RefreshToken string `json:"refresh_token"`
@@ -195,8 +202,8 @@ func TestE2E_RefreshRotatesToken(t *testing.T) {
 			} `json:"user"`
 		} `json:"data"`
 	}
-	resp.JSON(t, &r)
-	if r.Data.RefreshToken == refresh {
+	resp.JSON(t, &refreshResp)
+	if refreshResp.Data.RefreshToken == refresh {
 		t.Errorf("refresh token did not rotate")
 	}
 
@@ -211,7 +218,7 @@ func TestE2E_RefreshRotatesToken(t *testing.T) {
 // TestE2E_ProfilePatch covers nickname + avatar validation.
 func TestE2E_ProfilePatch(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	tok, _ := loginAndGetToken(t, srv.Engine, "profile", "yundian")
+	tok := loginAndGetTokens(t, srv.Engine, "profile", "yundian").AccessToken
 	_ = tok
 
 	t.Run("valid patch", func(t *testing.T) {
@@ -243,7 +250,8 @@ func TestE2E_ProfilePatch(t *testing.T) {
 // TestE2E_RefreshReuseFamilyRevoke tests the security response.
 func TestE2E_RefreshReuseFamilyRevoke(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	_, refresh := loginAndGetRefresh(t, srv.Engine, "reuse-test", "yundian")
+	r := loginAndGetTokens(t, srv.Engine, "reuse-test", "yundian")
+	refresh := r.RefreshToken
 
 	// First refresh.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/auth/refresh",
@@ -260,11 +268,264 @@ func TestE2E_RefreshReuseFamilyRevoke(t *testing.T) {
 	}
 }
 
-// readBody is a small helper that returns the response body as a string.
-func readBody(resp *httpResponse) (string, error) {
-	return string(resp.Body), nil
+// TestE2E_ExpiredSub_LoginAndRefresh is the cn-staging 2026-07-23
+// incident's end-to-end regression. A user with status='active' but
+// expires_at in the past must:
+//   1. Still log in successfully (the historical bug: the OAuth
+//      callback returned `reason=subscription_expired` and bounced
+//      the user to /auth/login with no escape).
+//   2. Receive has_access=false in the login response (the original
+//      plan's apps[] is honoured by the access-token scope, but the
+//      response flag is forced false so the FE renders the paywall
+//      and `useBilling.planID != "free"` bypass routes correctly to
+//      the renewal CTA).
+//   3. Surface the original PlanID/PlanName (NOT the default plan's
+//      identity) so the FE renders "renew your X plan" rather than
+//      misreading as "downgraded to free".
+//   4. Refresh the access token without error (the historical bug
+//      path returned ErrSubscriptionExpired here too).
+//   5. Be permitted to create a renewal order (the second-stage
+//      follow-up fix widened CreateOrder's precondition to allow
+//      past-but-active rows through; without it the user was blocked
+//      from renewing even after login worked).
+//
+// Setup seeds an active-but-past subscription directly in the DB
+// before the /test/login call (the only login endpoint available in
+// e2e), then drives the same code paths the OAuth callbacks do via
+// AuthService.LoginWithProfile. The test pins every observable
+// surface of the response shape so any future regression of the
+// decouple trips one of these assertions.
+func TestE2E_ExpiredSub_LoginAndRefresh(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	db := srv.DB
+	_ = e2eMustSeedExpiredSubUser(t, db) // seeds user+identity+plan+past sub; the /test/login below binds to it
+
+	// 1. Login (via /test/login which routes through AuthService.LoginWithProfile).
+	login := loginAndGetTokens(t, srv.Engine, "expired-sub-user", "yundian")
+	if login.AccessToken == "" {
+		t.Fatal("login must succeed even when subscription is past (cn-staging 2026-07-23 invariant)")
+	}
+	if login.Subscription == nil {
+		t.Fatal("login response must include subscription view")
+	}
+	// 2. has_access MUST be false — even though 'quarterly' includes 'yundian' and the
+	// default plan also includes 'yundian', the expired-sub branch forces the flag
+	// false so the FE's useBilling hook routes the user to renewal rather than
+	// treating them as "already subscribed".
+	if login.Subscription.HasAccess {
+		t.Error("Subscription.HasAccess must be false for an expired sub (cn-staging 2026-07-23 follow-up fix; default plan includes the app but the override is unconditional)")
+	}
+	// 3. PlanID is the user's *intended* paid plan, not the default plan — so the FE
+	// renders "renew your quarterly plan" rather than misreading as "downgraded to free".
+	if login.Subscription.PlanID != "quarterly" {
+		t.Errorf("Subscription.PlanID = %q, want quarterly (must reflect original paid plan, not default)", login.Subscription.PlanID)
+	}
+	if login.Subscription.PlanName != "按季订阅" {
+		t.Errorf("Subscription.PlanName = %q, want 按季订阅", login.Subscription.PlanName)
+	}
+	if login.Subscription.ExpiresAt == nil {
+		t.Errorf("Subscription.ExpiresAt must surface the past timestamp (FE reads this for 'your plan expired N days ago')")
+	}
+
+	// 4. Refresh must succeed with the same has_access=false shape (the historical
+	// bug returned ErrSubscriptionExpired here; refresh should issue a fresh token).
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/auth/refresh",
+		`{"refresh_token":"`+login.RefreshToken+`","app_id":"yundian"}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("refresh with expired sub must succeed (cn-staging 2026-07-23 invariant); got %d %s", resp.StatusCode, string(resp.Body))
+	}
+	var refreshed struct {
+		Data struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			Subscription *struct {
+				PlanID    string `json:"plan_id"`
+				HasAccess bool   `json:"has_access"`
+			} `json:"subscription"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &refreshed)
+	if refreshed.Data.AccessToken == "" {
+		t.Error("refresh must mint a new access token")
+	}
+	if refreshed.Data.Subscription == nil {
+		t.Fatal("refresh response must include subscription view")
+	}
+	if refreshed.Data.Subscription.HasAccess {
+		t.Error("refresh Subscription.HasAccess must be false for expired sub (same invariant as login)")
+	}
+	if refreshed.Data.Subscription.PlanID != "quarterly" {
+		t.Errorf("refresh Subscription.PlanID = %q, want quarterly", refreshed.Data.Subscription.PlanID)
+	}
+
+	// 5. CreateOrder must NOT return ErrUserHasActiveSub for the past-but-active row —
+	// the cn-staging follow-up fix widened the precondition to require either
+	// expires_at IS NULL OR expires_at > NOW(). Without it, the user is blocked from
+	// renewing even after the decouple fix let them log in.
+	orderResp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"quarterly","channel":"stripe"}`, authHeader(refreshed.Data.AccessToken))
+	if orderResp.StatusCode == http.StatusConflict {
+		t.Fatalf("CreateOrder must permit renewal when status=active but expires_at is past; got 409. Body: %s", string(orderResp.Body))
+	}
+	if orderResp.StatusCode >= 500 {
+		t.Fatalf("CreateOrder must not 5xx for an expired-but-active user: %d %s", orderResp.StatusCode, string(orderResp.Body))
+	}
 }
 
-// Compile-time guard.
-var _ = bytes.NewReader
-var _ = time.Now
+// e2eMustSeedExpiredSubUser creates a user + a 'quarterly' plan + an active-but-
+// past subscription in one shot. Returns the new user UUID. Used by
+// TestE2E_ExpiredSub_LoginAndRefresh to set up the cn-staging incident
+// reproduction in deterministic state.
+func e2eMustSeedExpiredSubUser(t *testing.T, db *sqlx.DB) string {
+	t.Helper()
+	uid := uuidNew()
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO users (id, nickname, avatar_url, status) VALUES ($1, $2, '', 'active')`,
+		uid, "expired-sub-user"); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	// Pre-seed a github social identity so the email-merge in LoginWithProfile
+	// finds a matching identity and binds to this user row (rather than racing
+	// a concurrent auto-create that would orphan our subscription).
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO social_identities (id, user_id, provider, provider_uid, email) VALUES (gen_random_uuid(), $1, 'github', $2, $3)`,
+		uid, "l3-e2e-"+uid, "expired-sub-user@e2e.test"); err != nil {
+		t.Fatalf("seed identity: %v", err)
+	}
+	// 'quarterly' includes 'yundian' (which is also on the free plan) — this
+	// drives the "default plan includes the app + paid plan also includes
+	// the app" case that motivated the HasAccess=false override.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO plans (id, name, price, interval_days, apps, is_active, is_default) VALUES ('quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true, false) ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed plan: %v", err)
+	}
+	past := time.Now().Add(-1 * time.Hour)
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at) VALUES (gen_random_uuid(), $1, 'quarterly', 'active', now() - INTERVAL '90 days', $2)`,
+		uid, past); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+	return uid
+}
+
+// uuidNew generates a UUID string. Standalone helper (rather than reusing
+// the unexported one in internal/repo/repo_test.go) keeps the test file's
+// import surface minimal — the only e2e test that needs UUIDs is this one.
+func uuidNew() string {
+	return uuid.NewString()
+}
+
+// keep strings import alive for future sub-test names without lint complaint.
+var _ = strings.TrimSpace
+
+// TestE2E_GitHubOAuth_RedirectToCallback drives the full GitHub OAuth
+// redirect→callback flow against an httptest mock of api.github.com.
+// The test pins every observable surface of the production code path:
+//   1. /auth/github/redirect → 302 to a GitHub URL whose state binds
+//      (app_id, callback_index) and validates against the HMAC secret.
+//   2. /auth/github/callback with a valid code+state → 302 to the BFF
+//      callback URL with a fresh access/refresh token pair in the
+//      fragment.
+//   3. The minted JWT is delivered to the BFF; the user + identity
+//      rows are persisted (the email-merge identity-binding path
+//      hit /user/emails, found the verified primary, and bound).
+//
+// Without this test, the OAuth state HMAC binding, the code-exchange
+// upstream call, the profile fetch, and the BFF redirect contract are
+// all exercised only at the unit-test layer — leaving an integration
+// regression (e.g. a route mount order change) undetected.
+func TestE2E_GitHubOAuth_RedirectToCallback(t *testing.T) {
+	// Start a mock GitHub server and rewire the GitHubOAuthService
+	// to point at it. The mock serves the same /login/oauth/access_token,
+//	/user, /user/emails paths production GitHub uses, returning a
+	// deterministic access token + verified primary email.
+	github := newMockGitHubServer(t)
+	srv, db := setupE2EServerWithGH(t)
+	srv.GitHubOAuthService.SetAccessTokenURL(github.URL + "/login/oauth/access_token")
+	srv.GitHubOAuthService.SetAuthorizeURL(github.URL + "/login/oauth/authorize")
+	srv.GitHubOAuthService.SetUserURL(github.URL + "/user")
+	srv.GitHubOAuthService.SetEmailsURL(github.URL + "/user/emails")
+	engine := srv.Engine
+
+	// 1. /auth/github/redirect → 302 to a GitHub URL with a valid state.
+	redirectResp := doRequest(t, engine, http.MethodGet,
+		"/auth/github/redirect?app_id=yundian&redirect_uri=https://staging.yunhouai.com/auth/callback",
+		"", nil)
+	if redirectResp.StatusCode != http.StatusFound {
+		t.Fatalf("/auth/github/redirect: expected 302, got %d %s", redirectResp.StatusCode, string(redirectResp.Body))
+	}
+	loc := redirectResp.Headers.Get("Location")
+	if loc == "" {
+		t.Fatal("redirect missing Location header")
+	}
+	// After URL override the redirect points at the mock, not real GitHub.
+	if !strings.HasPrefix(loc, github.URL+"/login/oauth/authorize") {
+		t.Errorf("redirect Location = %q, want mock GitHub URL prefix %q", loc, github.URL)
+	}
+	if !strings.Contains(loc, "state=") {
+		t.Error("redirect Location missing state parameter (HMAC state binding required)")
+	}
+
+	// 2. /auth/github/callback with a valid code + the captured state →
+	//    302 to the BFF callback URL with token + refresh in the
+	//    fragment. The callback path needs the SAME state we just
+	//    issued, so we parse it back out of the redirect Location.
+	parsedLoc, perr := url.Parse(loc)
+	if perr != nil {
+		t.Fatalf("parse redirect location: %v", perr)
+	}
+	state := parsedLoc.Query().Get("state")
+	if state == "" {
+		t.Fatal("could not extract state from redirect Location")
+	}
+
+	cbResp := doRequest(t, engine, http.MethodGet,
+		"/auth/github/callback?code="+mockGitHubCode+"&state="+state+"&app_id=yundian",
+		"", nil)
+	if cbResp.StatusCode != http.StatusFound {
+		t.Fatalf("/auth/github/callback: expected 302, got %d %s", cbResp.StatusCode, string(cbResp.Body))
+	}
+	cbLoc := cbResp.Headers.Get("Location")
+	if cbLoc == "" {
+		t.Fatal("callback missing Location header")
+	}
+	if !strings.Contains(cbLoc, "https://staging.yunhouai.com/auth/callback#") {
+		t.Errorf("callback Location = %q, want BFF callback URL with fragment", cbLoc)
+	}
+	// Fragment should carry the JWT pair the SPA reads.
+	cbParsed, perr := url.Parse(cbLoc)
+	if perr != nil {
+		t.Fatalf("parse callback location: %v", perr)
+	}
+	fragValues, perr := url.ParseQuery(cbParsed.Fragment)
+	if perr != nil {
+		t.Fatalf("parse callback fragment: %v", perr)
+	}
+	if fragValues.Get("token") == "" {
+		t.Error("callback fragment missing token parameter (access_token not delivered to BFF)")
+	}
+	if fragValues.Get("refresh_token") == "" {
+		t.Error("callback fragment missing refresh_token parameter")
+	}
+
+	// 3. The minted token must produce a user + identity row in the
+	//    DB (identity-binding path: /user + /user/emails → email-merge
+	//    → identity INSERT). If any step in the chain breaks, the
+	//    row count is 0.
+	var userCount int
+	if err := db.GetContext(context.Background(), &userCount,
+		`SELECT COUNT(*) FROM users`); err != nil {
+		t.Fatal(err)
+	}
+	if userCount < 1 {
+		t.Error("expected at least one user row created by GitHub callback")
+	}
+	var idCount int
+	if err := db.GetContext(context.Background(), &idCount,
+		`SELECT COUNT(*) FROM social_identities WHERE provider = 'github'`); err != nil {
+		t.Fatal(err)
+	}
+	if idCount < 1 {
+		t.Error("expected at least one github social_identity row bound by callback")
+	}
+}

@@ -82,7 +82,7 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 		Currency:     "USD",
 		SubExpiresAt: subExpires,
 		CycleConfig:  cycle,
-		ProviderData: buildProviderData(cfg, planID, subExpires),
+		ProviderData: buildProviderData(cfg, planID),
 	}, nil
 }
 
@@ -91,7 +91,7 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 // (fallback to apps.name). PayPal computes its own billing cycle from
 // plan_id; subExpires is not surfaced here (it lives at the top-level
 // Quote.sub_expires_at instead).
-func buildProviderData(cfg model.AppConfig, planID string, _ time.Time) map[string]any {
+func buildProviderData(cfg model.AppConfig, planID string) map[string]any {
 	out := map[string]any{}
 	brandName := ""
 	if cfg.Brand != nil {

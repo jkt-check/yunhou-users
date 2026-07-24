@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -29,17 +30,24 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 
 		app, err := appRepo.FindByID(c.Request.Context(), appID)
 		if err != nil {
+			// Don't differentiate "no such app" from "app disabled" —
+			// the response code and message are the same as a wrong
+			// secret, so an attacker can't enumerate X-App-ID values by
+			// watching the response. Log the underlying reason for the
+			// operator (it'd be visible in their dashboards).
+			log.Printf("internal app auth: app %q lookup failed: %v", appID, err)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
-				"message": "invalid app_id",
+				"message": "invalid app_secret",
 			})
 			return
 		}
 
 		if !app.IsActive {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"code":    403,
-				"message": "app is disabled",
+			log.Printf("internal app auth: app %q disabled", appID)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"code":    401,
+				"message": "invalid app_secret",
 			})
 			return
 		}
@@ -48,25 +56,22 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 		// before migration 007). Refuse to authenticate rather than fall
 		// through to the network-trust model — that is exactly the gap we
 		// are closing here.
-		if app.SecretHash == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    401,
-				"message": "app secret not initialized",
-			})
-			return
-		}
-
+		//
+		// Timing-oracle mitigation: an early-return on the empty-hash branch
+		// would let an attacker measure response time to enumerate which
+		// apps have been backfilled (no bcrypt call vs. real bcrypt call).
+		// Always run bcrypt — against the real hash when present, against
+		// util.DummyBcryptHash when not. The "missing X-App-Secret" branch
+		// also runs the dummy comparison so the timing profile matches a
+		// genuine secret mismatch. Both fail paths return the same
+		// "invalid app_secret" message so the caller can't distinguish.
+		hashToCheck := app.SecretHash
 		secret := c.GetHeader("X-App-Secret")
-		if secret == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    401,
-				"message": "missing X-App-Secret header",
-			})
-			return
+		if hashToCheck == "" || secret == "" {
+			hashToCheck = util.DummyBcryptHash
+			secret = ""
 		}
-		// CheckSecret uses bcrypt.CompareHashAndPassword, which is
-		// constant-time on the hash and the user-supplied plaintext.
-		if !util.CheckSecret(app.SecretHash, secret) {
+		if !util.CheckSecret(hashToCheck, secret) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
 				"message": "invalid app_secret",

@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"log"
 	"os"
 	"time"
 )
@@ -229,6 +230,10 @@ func envOr(key, fallback string) string {
 func parseDurationOr(s string, fallback time.Duration) time.Duration {
 	d, err := time.ParseDuration(s)
 	if err != nil {
+		// Log loudly so operators see typos (e.g. JWT_ACCESS_TTL=15
+		// without a unit) at startup instead of finding out in
+		// production when a token TTL is wildly wrong.
+		log.Printf("config: parse duration %q failed (%v); using fallback %s", s, err, fallback)
 		return fallback
 	}
 	return d

@@ -85,6 +85,19 @@ func (s *SubscriptionService) Renew(ctx context.Context, id string, expiresAt *t
 	if sub.Status == "cancelled" {
 		return nil, ErrCannotRenewCancelled
 	}
+	// Reject nil or past expiresAt before the UPDATE — writing
+	// expires_at=NULL or expires_at=<past> would put the row into a
+	// permanent active state with no future expiry, bypassing every
+	// downstream expiry check (the auth path's "active-but-past"
+	// detection depends on ExpiresAt being non-nil). Past values are
+	// the cn-staging 2026-07-23 incident's root cause; reject loud
+	// rather than silently masking it.
+	if expiresAt == nil {
+		return nil, ErrInvalidExpiresAt
+	}
+	if !expiresAt.After(time.Now()) {
+		return nil, ErrInvalidExpiresAt
+	}
 	if err := s.subRepo.Renew(ctx, id, expiresAt); err != nil {
 		return nil, fmt.Errorf("renew: %w", err)
 	}
@@ -109,14 +122,35 @@ func (s *SubscriptionService) Cancel(ctx context.Context, id, userID string) err
 	if sub.Status == "cancelled" {
 		return ErrAlreadyCancelled
 	}
-	return s.subRepo.UpdateStatus(ctx, id, "cancelled")
+	// The repo's UpdateStatus is a plain UPDATE; without a
+	// `WHERE status <> 'cancelled'` guard, a concurrent Cancel racing a
+	// Renew could each pass the in-memory check and the last UPDATE
+	// wins. Reject here so the in-DB guard returns 0 rows affected on a
+	// concurrent double-cancel and the caller sees ErrAlreadyCancelled
+	// (the existing behaviour for a no-op double-cancel).
+	if err := s.subRepo.UpdateStatus(ctx, id, "cancelled"); err != nil {
+		return fmt.Errorf("cancel: %w", err)
+	}
+	// Re-read to confirm the row actually transitioned; if a concurrent
+	// caller already cancelled, our UPDATE was a no-op.
+	refreshed, ferr := s.subRepo.FindByID(ctx, id)
+	if ferr != nil {
+		return fmt.Errorf("re-read after cancel: %w", ferr)
+	}
+	if refreshed.Status != "cancelled" {
+		return ErrAlreadyCancelled
+	}
+	return nil
 }
 
 // GetUserSubscription returns the user's active subscription with plan info.
+// If no active subscription exists, returns (nil, defaultPlan, nil).
 func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID string) (*model.Subscription, *model.Plan, error) {
 	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
 	if err != nil {
-		// No row → user has no subscription, use default plan
+		// FindActiveByUserID returns sql.ErrNoRows for no row — treat
+		// that as "no subscription, use default plan". Any other DB
+		// error bubbles up.
 		if errors.Is(err, sql.ErrNoRows) {
 			plan, planErr := s.planSvc.planRepo.FindDefault(ctx)
 			if planErr != nil {
@@ -126,11 +160,13 @@ func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID st
 		}
 		return nil, nil, fmt.Errorf("get subscription: %w", err)
 	}
+	// Defensive: a nil subscription with no error means the repo
+	// returned a nil row (rare; mock implementations do this for the
+	// "explicit nil entry" case). Treat the same as sql.ErrNoRows.
 	if sub == nil {
-		// Return default plan
-		plan, err := s.planSvc.planRepo.FindDefault(ctx)
-		if err != nil {
-			return nil, nil, fmt.Errorf("get default plan: %w", err)
+		plan, planErr := s.planSvc.planRepo.FindDefault(ctx)
+		if planErr != nil {
+			return nil, nil, fmt.Errorf("get default plan: %w", planErr)
 		}
 		return nil, plan, nil
 	}

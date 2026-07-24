@@ -248,11 +248,12 @@ func TestTokenBucket(t *testing.T) {
 		tb.allow("stale-ip")
 
 		// Mark as old
-		tb.visitors["stale-ip"].lastSeen = time.Now().Add(-3 * time.Minute)
+		v, _ := tb.visitors.Load("stale-ip")
+		v.(*visitor).lastSeenUnixNano.Store(time.Now().Add(-3 * time.Minute).UnixNano())
 
 		tb.cleanup()
 
-		if _, ok := tb.visitors["stale-ip"]; ok {
+		if _, ok := tb.visitors.Load("stale-ip"); ok {
 			t.Error("stale visitor should be removed")
 		}
 	})

@@ -31,6 +31,7 @@ var (
 	ErrSubscriptionNotFound  = errors.New("subscription not found")
 	ErrAlreadyCancelled      = errors.New("already cancelled")
 	ErrCannotRenewCancelled  = errors.New("cannot renew a cancelled subscription")
+	ErrInvalidExpiresAt      = errors.New("expires_at must be non-nil and in the future")
 	ErrUserHasActiveSub      = errors.New("user already has an active subscription")
 	ErrSubscriptionExists    = errors.New("subscription already exists for this user")
 	ErrAppNotFound           = errors.New("app not found")

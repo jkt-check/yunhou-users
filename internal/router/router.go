@@ -65,7 +65,10 @@ func Setup(
 	handler.RegisterWeChatOAuthRoutes(wechatOAuthGroup, wechatOAuthSvc, appRepo, authSvc, wechatOAuthMock)
 	// Dev-only login endpoint for the L3 e2e-ui suite. Returns 404 unless
 	// PAYPAL_L3_E2E_MODE=1 is set; the env check is inside the handler.
-	engine.POST("/test/login", authHandler.TestLogin)
+	// Mounted behind the public limiter so an accidental misconfig
+	// (PAYPAL_L3_E2E_MODE=1 left set in production) cannot be used to
+	// mint arbitrary JWTs without rate-limit friction.
+	engine.POST("/test/login", publicLimiter, authHandler.TestLogin)
 
 	// Public plan listing — unauthenticated so marketing pages and the BFF
 	// can fetch the catalog without holding admin credentials. Plan IDs and

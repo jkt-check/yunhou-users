@@ -678,11 +678,15 @@ func TestSubscriptionRepo_UpdateStatus_Renew(t *testing.T) {
 	}
 	_ = r.Create(context.Background(), sub)
 
-	if err := r.UpdateStatus(context.Background(), sub.ID, "cancelled"); err != nil {
+	// Renew guards on status='expired' (the only state that should be
+	// revivable — 'cancelled' is user-initiated terminal and must NOT
+	// be silently resurrected by an automatic-renewal webhook). Walk
+	// the row through active → expired → renewed → active.
+	if err := r.UpdateStatus(context.Background(), sub.ID, "expired"); err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
 	}
 	got, _ := r.FindByID(context.Background(), sub.ID)
-	if got.Status != "cancelled" {
+	if got.Status != "expired" {
 		t.Errorf("Status = %q", got.Status)
 	}
 
@@ -695,9 +699,16 @@ func TestSubscriptionRepo_UpdateStatus_Renew(t *testing.T) {
 		t.Errorf("after Renew: %+v", got)
 	}
 
-	// Renew with nil expires_at → should also be allowed.
-	if err := r.Renew(context.Background(), sub.ID, nil); err != nil {
-		t.Fatalf("Renew nil: %v", err)
+	// After re-activation, Renew is a no-op (rows already 'active' are
+	// outside the WHERE clause) — the call must succeed but not change
+	// the row.
+	prior := *got.ExpiresAt
+	if err := r.Renew(context.Background(), sub.ID, &newExp); err != nil {
+		t.Fatalf("Renew re-active: %v", err)
+	}
+	got, _ = r.FindByID(context.Background(), sub.ID)
+	if got.Status != "active" || !got.ExpiresAt.Equal(prior) {
+		t.Errorf("Renew on active row should no-op; got %+v", got)
 	}
 }
 

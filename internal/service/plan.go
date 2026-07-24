@@ -45,6 +45,12 @@ func (s *PlanService) DeletePlan(ctx context.Context, id string) error {
 }
 
 // CheckAppAccess checks if a user with given subscription can access the specified app.
+// A deactivated plan (or default plan) yields no access — even if its apps[]
+// array still lists appID. This matters when an operator retires a SKU
+// mid-cycle: existing subscribers should not keep access via the stale
+// plan row. The DB doesn't filter deactivated plans here because the
+// repo contract is "give me the row"; the service layer applies the
+// is_active policy.
 func (s *PlanService) CheckAppAccess(ctx context.Context, sub *model.Subscription, appID string) bool {
 	if sub == nil {
 		// No subscription, use default (free) plan
@@ -52,11 +58,17 @@ func (s *PlanService) CheckAppAccess(ctx context.Context, sub *model.Subscriptio
 		if err != nil {
 			return false
 		}
+		if !defaultPlan.IsActive {
+			return false
+		}
 		return slices.Contains(defaultPlan.Apps, appID)
 	}
 
 	plan, err := s.planRepo.FindByID(ctx, sub.PlanID)
 	if err != nil {
+		return false
+	}
+	if !plan.IsActive {
 		return false
 	}
 	return slices.Contains(plan.Apps, appID)

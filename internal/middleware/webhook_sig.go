@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -411,19 +412,30 @@ func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers ma
 	if replayWindow == 0 {
 		replayWindow = 5 * time.Minute
 	}
-	if notifyTime := values.Get("notify_time"); notifyTime != "" {
-		// Alipay sends notify_time in Beijing time (UTC+8) without a timezone
-		// suffix. Without an explicit location, time.Parse returns UTC, so a
-		// 20:00:00 Beijing notify would be compared against a 12:00:00 UTC
-		// "now" — an 8h negative delta that always trips the replay window.
-		beijing, err := time.LoadLocation("Asia/Shanghai")
-		if err != nil {
-			beijing = time.FixedZone("CST", 8*3600)
-		}
-		if t, err := time.ParseInLocation("2006-01-02 15:04:05", notifyTime, beijing); err == nil {
-			if delta := time.Since(t); delta > replayWindow || delta < -replayWindow {
-				return ErrTimestampOutOfRange
-			}
+	notifyTime := values.Get("notify_time")
+	if notifyTime == "" {
+		// Alipay's notify_time is not always present (some notify_type
+		// variants omit it). Without it we forfeit local replay
+		// protection — surface to operators via log so a sustained
+		// missing-notify_time pattern is visible — but accept the
+		// request because rejecting here would break legitimate
+		// notifications whose shape we don't control. The signature
+		// check (Verify above) is the real security gate; this window
+		// is belt-and-braces.
+		log.Printf("alipay verifier: notify_time missing — local replay protection disabled for this request")
+		return nil
+	}
+	// Alipay sends notify_time in Beijing time (UTC+8) without a timezone
+	// suffix. Without an explicit location, time.Parse returns UTC, so a
+	// 20:00:00 Beijing notify would be compared against a 12:00:00 UTC
+	// "now" — an 8h negative delta that always trips the replay window.
+	beijing, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		beijing = time.FixedZone("CST", 8*3600)
+	}
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", notifyTime, beijing); err == nil {
+		if delta := time.Since(t); delta > replayWindow || delta < -replayWindow {
+			return ErrTimestampOutOfRange
 		}
 	}
 	return nil
@@ -572,13 +584,20 @@ func ClearPaypalVerifyCache() {
 }
 
 type PaypalVerifier struct {
-	HTTPClient       *http.Client // nil → http.DefaultClient; production should set Timeout.
+	HTTPClient       *http.Client // nil → 5s-timeout client. Production should pass one with a Timeout set.
 	SandboxWebhookID string
 	LiveWebhookID    string
 	SandboxAPIBase   string // default https://api-m.sandbox.paypal.com
 	LiveAPIBase      string // default https://api-m.paypal.com
 	Env              string // "sandbox" | "live"
 }
+
+// paypalVerifyTimeout caps the verify-webhook-signature upstream call.
+// Without a timeout a misbehaving (or compromised) PayPal endpoint could
+// hold a webhook goroutine indefinitely; combined with the rate-limit
+// bucket that means a flood of slow PayPal-style POSTs consumes the
+// bucket even though no actual signature work happens.
+const paypalVerifyTimeout = 5 * time.Second
 
 // activeConfig resolves which (webhookID, apiBase) pair the verifier should
 // use for the current Env. Unknown Env or empty base returns defaults /
@@ -652,7 +671,10 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 
 	httpClient := v.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		// http.DefaultClient has zero timeout; the production cmd/server
+		// wires a 5s-timeout client at startup, but defensive-code here
+		// for the test-only path that constructs a bare verifier.
+		httpClient = &http.Client{Timeout: paypalVerifyTimeout}
 	}
 	req, err := http.NewRequest(http.MethodPost,
 		apiBase+"/v1/notifications/verify-webhook-signature",

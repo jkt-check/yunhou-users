@@ -123,9 +123,15 @@ func (m *PlatformCertManager) PublicKeyFor(ctx context.Context, serial string) (
 	m.mu.Unlock()
 
 	if canRefresh && m.refreshing.CompareAndSwap(false, true) {
-		// We're the designated refresher.
-		err := m.refresh(ctx)
-		m.refreshing.Store(false)
+		// We're the designated refresher. Defer the gate-clear so a panic
+		// inside refresh() (e.g. a malformed PEM block, a future code
+		// path) cannot leave refreshing=true permanently — that would
+		// freeze every subsequent cert refresh until the process restarts.
+		var err error
+		func() {
+			defer m.refreshing.Store(false)
+			err = m.refresh(ctx)
+		}()
 		if err != nil {
 			// Refresh failed. A cached-but-stale key is still
 			// cryptographically valid (platform certs live ~5 years;
@@ -148,8 +154,15 @@ func (m *PlatformCertManager) PublicKeyFor(ctx context.Context, serial string) (
 		// Another goroutine is already refreshing. Spin-wait for it to
 		// finish so we read its cache (which may contain the serial we
 		// just missed). Cap the wait at the fetch timeout so a stuck
-		// upstream doesn't wedge the verifier.
-		deadline := time.Now().Add(10 * time.Second)
+		// upstream doesn't wedge the verifier — and use the same
+		// timeout the leader is working against so a slow upstream
+		// (FetchTimeout > 10s) doesn't bail while the leader is still
+		// legitimately in flight.
+		waitTimeout := m.FetchTimeout
+		if waitTimeout == 0 {
+			waitTimeout = 10 * time.Second
+		}
+		deadline := time.Now().Add(waitTimeout)
 		for m.refreshing.Load() && time.Now().Before(deadline) {
 			time.Sleep(20 * time.Millisecond)
 		}

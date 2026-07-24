@@ -4,7 +4,9 @@
 //   - CSRF (attacker swaps their own code into our flow): the state is HMAC-signed
 //     so a third party cannot forge one without the server-side secret.
 //   - replay (attacker re-uses a previously observed state): the token embeds an
-//     expiry; VerifyState rejects tokens whose expiry has passed.
+//     expiry AND a per-token nonce that VerifyState records in a process-local
+//     dedupe set; a second use of the same nonce within the expiry window is
+//     rejected even if the signature still validates.
 //   - open redirect (attacker submits redirect_uri=evil.com): the token binds
 //     callback_index — the index of the chosen callback URL inside the app's
 //     configured callback_urls array — so the callback handler can verify the
@@ -19,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +29,36 @@ import (
 // for a human to complete GitHub's consent screen but short enough that a
 // leaked state token expires before an attacker can plausibly replay it.
 const StateExpiry = 5 * time.Minute
+
+// seenNonces is a process-local set of (nonce, expiry) pairs observed by
+// VerifyOAuthState. Entries expire after StateExpiry so the set stays bounded
+// by the legitimate issuance rate × expiry window. We use the nonce's
+// hex-encoded form as the map key for readable log output.
+//
+// The set is per-process, which means a Yunhou cluster with N replicas
+// permits up to N replays of the same captured state (one per replica).
+// That bounds the threat to "attacker can complete the OAuth flow once
+// per replica within the 5-min window" rather than "once per server
+// lifetime", which is acceptable: the captured state still has to be
+// paired with a fresh OAuth `code` from the provider, and the resulting
+// session is bound to the legitimate user's identity (the code only
+// resolves to the legitimate user, not the attacker's).
+var seenNonces sync.Map // map[string]time.Time (nonceHex → expiresAt)
+
+// rememberNonce records that nonce was just observed; returns true if the
+// nonce was new, false if it had been seen before (i.e. a replay). Expired
+// entries are evicted lazily on the next read.
+func rememberNonce(nonce []byte, expiresAt time.Time) (fresh bool) {
+	key := string(nonce)
+	now := time.Now()
+	if prev, ok := seenNonces.Load(key); ok {
+		if exp, ok := prev.(time.Time); ok && now.Before(exp) {
+			return false
+		}
+	}
+	seenNonces.Store(key, expiresAt)
+	return true
+}
 
 // State payload. The wire format is:
 //
@@ -90,7 +123,7 @@ func IssueOAuthState(secret []byte, appID string, callbackIndex int, now time.Ti
 // VerifyOAuthState parses a state token previously produced by
 // IssueOAuthState. On success it returns the bound appID and callbackIndex.
 // On any failure (bad base64, wrong length, signature mismatch, expiry
-// passed) it returns ErrInvalidState.
+// passed, nonce replayed) it returns ErrInvalidState.
 func VerifyOAuthState(secret []byte, token, expectedAppID string, now time.Time) (callbackIndex int, err error) {
 	if len(secret) == 0 {
 		return 0, ErrInvalidState
@@ -118,8 +151,28 @@ func VerifyOAuthState(secret []byte, token, expectedAppID string, now time.Time)
 		return 0, ErrInvalidState
 	}
 
+	nonce := payload[12 : 12+16]
+	// Replay guard: a captured state used twice within its expiry window
+	// must be rejected, even though the signature still validates. The
+	// process-local seenNonces set records first-use; rememberNonce
+	// returns false on a second hit (and lazily evicts entries that
+	// have passed their expiry).
+	if fresh := rememberNonce(nonce, time.Unix(expiry, 0)); !fresh {
+		return 0, ErrInvalidState
+	}
+
 	idx := binary.BigEndian.Uint32(payload[8:12])
 	return int(idx), nil
+}
+
+// ClearSeenNonces empties the per-process nonce replay set. Exported for
+// test setup so unit tests that intentionally exercise a nonce twice
+// don't leak across cases.
+func ClearSeenNonces() {
+	seenNonces.Range(func(k, _ any) bool {
+		seenNonces.Delete(k)
+		return true
+	})
 }
 
 // encodeState packs the (expiry, callback_index, nonce) triple into the

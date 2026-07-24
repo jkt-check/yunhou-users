@@ -121,9 +121,3 @@ func TestE2E_CreateApp_ReturnsSecret(t *testing.T) {
 		t.Errorf("stored secret_hash verifies against an unrelated plaintext — bcrypt mismatch suggests a bug")
 	}
 }
-
-// TestE2E_Quote_PayPalPlanId was removed with the LemonSqueezy removal
-// (commit d8f333d). The PayPal provider_data shape does not carry
-// sub_expires_at — PayPal computes its own billing cycle from plan_id, and
-// subExpires lives at the top-level Quote.sub_expires_at instead. See
-// internal/service/quote.go:buildProviderData for the current shape.

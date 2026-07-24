@@ -3,8 +3,6 @@ package e2e
 import (
 	"net/http"
 	"testing"
-
-	"github.com/gin-gonic/gin"
 )
 
 // TestLoginFlow exercises the complete login flow:
@@ -14,7 +12,10 @@ func TestLoginFlow(t *testing.T) {
 
 	// Login with test endpoint (PAYPAL_L3_E2E_MODE=1, see setupE2EServer).
 	t.Run("login", func(t *testing.T) {
-		access, refresh, sub := testLoginFull(t, engine, "test-user-token", "yundian")
+		r := loginAndGetTokens(t, engine, "test-user-token", "yundian")
+		access := r.AccessToken
+		refresh := r.RefreshToken
+		sub := r.Subscription
 		if access == "" {
 			t.Fatal("access token is empty")
 		}
@@ -31,7 +32,8 @@ func TestLoginFlow(t *testing.T) {
 
 	// Login to app not in free plan
 	t.Run("login_paid_app_no_subscription", func(t *testing.T) {
-		_, _, sub := testLoginFull(t, engine, "another-user-token", "yundash")
+	r := loginAndGetTokens(t, engine, "another-user-token", "yundash")
+		sub := r.Subscription
 		if sub.HasAccess {
 			t.Error("expected has_access=false for yundash on free plan")
 		}
@@ -43,7 +45,8 @@ func TestAuthRefresh(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
 	// Login first
-	_, refresh := loginAndGetRefresh(t, engine, "refresh-test-user", "yundian")
+	r := loginAndGetTokens(t, engine, "refresh-test-user", "yundian")
+	refresh := r.RefreshToken
 
 	// Refresh tokens
 	refreshBody := `{"refresh_token":"` + refresh + `"}`
@@ -82,7 +85,8 @@ func TestAuthLogout(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
 	// Login first
-	_, refresh := loginAndGetRefresh(t, engine, "logout-test-user", "yundian")
+	r := loginAndGetTokens(t, engine, "logout-test-user", "yundian")
+	refresh := r.RefreshToken
 
 	// Logout
 	logoutBody := `{"refresh_token":"` + refresh + `"}`
@@ -104,7 +108,7 @@ func TestUserProfileWithJWT(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 
 	// Login to get token
-	access, _ := loginAndGetToken(t, engine, "profile-test-user", "yundian")
+	access := loginAndGetTokens(t, engine, "profile-test-user", "yundian").AccessToken
 	authHeaders := map[string]string{"Authorization": "Bearer " + access}
 
 	// Get profile
@@ -279,38 +283,4 @@ func TestTestLoginMalformed(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for missing email, got %d", resp.StatusCode)
 	}
-}
-
-// loginResp mirrors service.LoginResponse for test-side unmarshalling.
-type loginResp struct {
-	Data struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		User         struct {
-			ID string `json:"id"`
-		} `json:"user"`
-		Subscription struct {
-			PlanID    string `json:"plan_id"`
-			HasAccess bool   `json:"has_access"`
-		} `json:"subscription"`
-	} `json:"data"`
-}
-
-// testLoginFull mints a JWT pair via /test/login and returns access token,
-// refresh token, and the embedded subscription view. The first `token`
-// argument is reused as the email prefix (with "@e2e.test" appended) so
-// call sites read like the legacy provider_token API.
-func testLoginFull(t *testing.T, engine *gin.Engine, token, appID string) (string, string, struct {
-	PlanID    string `json:"plan_id"`
-	HasAccess bool   `json:"has_access"`
-}) {
-	t.Helper()
-	body := `{"email":"` + token + `@e2e.test","app_id":"` + appID + `"}`
-	resp := doRequest(t, engine, http.MethodPost, "/test/login", body, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("test login failed: %d %s", resp.StatusCode, string(resp.Body))
-	}
-	var lr loginResp
-	resp.JSON(t, &lr)
-	return lr.Data.AccessToken, lr.Data.RefreshToken, lr.Data.Subscription
 }

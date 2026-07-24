@@ -169,6 +169,14 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 					"https://staging.yunhouai.com/auth/callback",
 					"https://bff.example.com/auth/wechat-callback"
 				]
+			},
+			"github": {
+				"client_id": "Iv1.e2e_test_client_id",
+				"client_secret": "e2e_test_client_secret_padded",
+				"callback_urls": [
+					"https://staging.yunhouai.com/auth/callback",
+					"https://bff.example.com/auth/github-callback"
+				]
 			}
 		}
 	}`
@@ -292,6 +300,96 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	return engine, nil, db
 }
 
+// setupE2EServerWithGH is the GitHub-OAuth-aware sibling of
+// setupE2EServer. It returns an *E2EServer whose GitHubOAuthService
+// field holds the live service so tests can call SetAccessTokenURL /
+// SetAuthorizeURL / SetUserURL / SetEmailsURL to point at an
+// httptest mock. The rest of the wiring is identical to setupE2EServer.
+func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
+	t.Helper()
+
+	if err := os.Setenv("PAYPAL_L3_E2E_MODE", "1"); err != nil {
+		t.Fatalf("set PAYPAL_L3_E2E_MODE: %v", err)
+	}
+
+	db := connectDB(t)
+	t.Cleanup(func() { db.Close() })
+	cleanupDB(t, db)
+	seedTestData(t, db)
+
+	keyDir := t.TempDir()
+	privPath := keyDir + "/private.pem"
+	pubPath := keyDir + "/public.pem"
+	genRSAKeys(t, privPath, pubPath)
+
+	cfg := &config.Config{
+		Port:                "0",
+		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:          privPath,
+		RSAPublic:           pubPath,
+		GitHubClientID:      "Iv1.e2e_test_client_id",
+		GitHubClientSecret:  "e2e_test_client_secret_padded",
+		JWTAccessTTL:        15 * time.Minute,
+		JWTRefreshTTL:       168 * time.Hour,
+		OrderExpiryDuration: 30 * time.Minute,
+		SweeperInterval:     1 * time.Minute,
+		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config validate: %v", err)
+	}
+
+	userRepo := repo.NewUserRepo(db)
+	identityRepo := repo.NewSocialIdentityRepo(db)
+	planRepo := repo.NewPlanRepo(db)
+	appRepo := repo.NewAppRepo(db)
+	subRepo := repo.NewSubscriptionRepo(db)
+	sessionRepo := repo.NewSessionRepo(db)
+	orderRepo := repo.NewOrderRepo(db)
+	paymentRepo := repo.NewPaymentRepo(db)
+	refundRepo := repo.NewRefundRepo(db)
+	webhookEventRepo := repo.NewWebhookEventRepo(db)
+	auditLogRepo := repo.NewAuditLogRepo(db)
+
+	tokenSvc, err := service.NewTokenService(cfg, sessionRepo, subRepo)
+	if err != nil {
+		t.Fatalf("token svc: %v", err)
+	}
+	planSvc := service.NewPlanService(planRepo)
+	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
+	subSvc := service.NewSubscriptionService(subRepo, planSvc)
+	paymentSvc := service.NewPaymentService(
+		db, orderRepo, paymentRepo, refundRepo,
+		subRepo, planRepo, userRepo,
+		webhookEventRepo, auditLogRepo,
+		&stubRefundAPI{},
+		&wechat.Client{MockMode: true},
+		cfg.OrderExpiryDuration,
+	)
+
+	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
+	quoteSvc := service.NewQuoteService(planRepo, appRepo)
+	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
+	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
+
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+	setupCtx, cancelSetup := context.WithCancel(context.Background())
+	t.Cleanup(cancelSetup)
+	router.Setup(setupCtx, engine, db,
+		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		tokenSvc, authSvc, subSvc, planSvc,
+		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
+		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, false, false)
+
+	return &E2EServer{
+		Engine:             engine,
+		DB:                 db,
+		GitHubOAuthService: githubOAuthSvc,
+	}, db
+}
+
 func newMockGitHubServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -393,6 +491,10 @@ type E2EServer struct {
 	// AlipayPublicKey is exposed so tests can verify they emit only
 	// payloads whose signature the verifier would accept.
 	AlipayPublicPEM []byte
+	// GitHubOAuthService is exposed so the GitHub OAuth e2e test can
+	// override the upstream URLs to point at the mock httptest server
+	// rather than api.github.com. Production wiring leaves this nil.
+	GitHubOAuthService *service.GitHubOAuthService
 }
 
 // setupE2EServerWithVerifier returns a server wired with real signature
@@ -574,52 +676,47 @@ func mustParseAlipayPubKey(t *testing.T, pemBytes []byte) *rsa.PublicKey {
 	return pub
 }
 
-// loginAndGetToken mints a JWT pair via the dev-only /test/login endpoint
-// (gated by PAYPAL_L3_E2E_MODE=1, set by TestMain) and returns the access
-// token + user id. The legacy /auth/login direct-token path was removed
-// by commit 5ef27ce; tests that need a JWT should call this helper.
-//
-// `token` is reused as the user email (with "@e2e.test" appended) so tests
-// can mint distinct users per call while keeping the call-site signature
-// close to the legacy helper.
-func loginAndGetToken(t *testing.T, engine *gin.Engine, token, appID string) (string, string) {
-	t.Helper()
-	email := token + "@e2e.test"
-	body := fmt.Sprintf(`{"email":%q,"app_id":%q}`, email, appID)
-	resp := doRequest(t, engine, http.MethodPost, "/test/login", body, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("test login failed: %d %s", resp.StatusCode, string(resp.Body))
-	}
-	var lr struct {
-		Data struct {
-			AccessToken string `json:"access_token"`
-			User        struct {
-				ID string `json:"id"`
-			} `json:"user"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &lr)
-	return lr.Data.AccessToken, lr.Data.User.ID
+// loginResult is the parsed shape of POST /test/login's data envelope.
+// Callers that only want a subset of fields (e.g. access token only)
+// destructure or ignore the others — Go's zero-value semantics for
+// missing JSON keys make this safe.
+type loginResult struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	User         struct {
+		ID string `json:"id"`
+	} `json:"user"`
+	Subscription *struct {
+		PlanID    string     `json:"plan_id"`
+		PlanName  string     `json:"plan_name"`
+		HasAccess bool       `json:"has_access"`
+		ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	} `json:"subscription"`
 }
 
-// loginAndGetRefresh mints a JWT pair via /test/login and returns both
-// access and refresh tokens. Used by tests that exercise the refresh-rotation
-// contract.
-func loginAndGetRefresh(t *testing.T, engine *gin.Engine, token, appID string) (access, refresh string) {
+// loginAndGetTokens mints a JWT pair via the dev-only /test/login
+// endpoint (gated by PAYPAL_L3_E2E_MODE=1, set by TestMain) and returns
+// the parsed envelope. The legacy /auth/login direct-token path was
+// removed by commit 5ef27ce; tests that need a JWT call this helper.
+//
+// `token` is reused as the email prefix (with "@e2e.test" appended) so
+// tests can mint distinct users per call while keeping the call-site
+// signature close to the legacy helper. Returning a single struct
+// (vs separate access/refresh/full variants) collapses three
+// previously-duplicated helpers (loginAndGetToken, loginAndGetRefresh,
+// testLoginFull) into one — callers ignore the fields they don't need.
+func loginAndGetTokens(t *testing.T, engine *gin.Engine, token, appID string) loginResult {
 	t.Helper()
 	body := fmt.Sprintf(`{"email":%q,"app_id":%q}`, token+"@e2e.test", appID)
 	resp := doRequest(t, engine, http.MethodPost, "/test/login", body, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("test login failed: %d %s", resp.StatusCode, string(resp.Body))
 	}
-	var lr struct {
-		Data struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-		} `json:"data"`
+	var env struct {
+		Data loginResult `json:"data"`
 	}
-	resp.JSON(t, &lr)
-	return lr.Data.AccessToken, lr.Data.RefreshToken
+	resp.JSON(t, &env)
+	return env.Data
 }
 
 func authHeader(token string) map[string]string {

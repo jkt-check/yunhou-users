@@ -152,6 +152,19 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 	// Body is built field-by-field from a fresh struct (rather than
 	// reusing a single object literal) so future field additions stay
 	// reviewable.
+	//
+	// Pre-flight validation: refuse to send a request whose appid or
+	// mchid is empty. Without this guard a misconfigured deployment
+	// (MockMode=false but AppIDValue/Signer.MchID not set) sends
+	// `"appid":"" / "mchid":""` to WeChat and only surfaces the
+	// misconfig at first checkout with a confusing `400 PARAM_ERROR`.
+	// Failing here is a clearer operator signal.
+	if c.AppIDValue == "" {
+		return nil, fmt.Errorf("%w: AppID not configured", ErrWechatMisconfigured)
+	}
+	if c.Signer == nil || c.Signer.MchID == "" {
+		return nil, fmt.Errorf("%w: Signer/MchID not configured", ErrWechatMisconfigured)
+	}
 	var bodyBytes unifiedOrderBody
 	bodyBytes.AppID = c.AppIDValue
 	bodyBytes.MchID = c.Signer.MchID
@@ -252,6 +265,16 @@ func (c *Client) QueryOrder(ctx context.Context, outTradeNo string) (*OrderQuery
 		return &OrderQueryResult{OutTradeNo: outTradeNo, TradeState: "NOTPAY"}, nil
 	}
 
+	// Same pre-flight as UnifiedOrder: refuse to send a request
+	// without a configured Signer/MchID rather than panic on
+	// `c.Signer.MchID` below. ErrWechatMisconfigured is a typed sentinel
+	// the handler maps to a 4xx (misconfig is operator-fixable, not
+	// transient) rather than the 502 the panic-during-NOTPAY would
+	// otherwise produce.
+	if c.Signer == nil || c.Signer.MchID == "" {
+		return nil, fmt.Errorf("%w: Signer/MchID not configured", ErrWechatMisconfigured)
+	}
+
 	reqPath := "/v3/pay/transactions/out-trade-no/" + outTradeNo + "?mchid=" + c.Signer.MchID
 	auth, err := c.Signer.BuildAuthHeader("GET", reqPath, nil)
 	if err != nil {
@@ -307,3 +330,12 @@ var ErrWeChatUpstream = errors.New("wechat upstream 5xx")
 // and ErrWeChatUpstream so callers can classify transient vs terminal
 // failures.
 var ErrWeChatNetwork = errors.New("wechat network error")
+
+// ErrWechatMisconfigured — a real-mode Client was used without AppID,
+// Signer/MchID, or both. Surfaced from the pre-flight guards in
+// UnifiedOrder / QueryOrder so a misconfigured deployment (e.g.
+// MockMode flipped to false in production but the upstream creds
+// weren't wired) fails at request time with a clear operator-visible
+// error rather than sending `appid=""` upstream and only failing
+// later at the upstream's 400 PARAM_ERROR.
+var ErrWechatMisconfigured = errors.New("wechat client misconfigured")

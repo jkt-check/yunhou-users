@@ -306,7 +306,7 @@ func (r *appRepo) Update(ctx context.Context, a *model.App) error {
 	// general "patch any field" handler.
 	_, err := r.db.NamedExecContext(ctx, `
 		UPDATE apps SET name = :name, description = :description, config = :config,
-		is_active = :is_active WHERE app_id = :app_id
+		is_active = :is_active, updated_at = now() WHERE app_id = :app_id
 	`, a)
 	return err
 }
@@ -424,8 +424,18 @@ func (r *subscriptionRepo) UpdateStatus(ctx context.Context, id, status string) 
 }
 
 func (r *subscriptionRepo) Renew(ctx context.Context, id string, expiresAt *time.Time) error {
+	// Refuse to resurrect a subscription the user explicitly cancelled —
+	// a Renew call here typically comes from the payment-success path,
+	// and the only state that should be revivable from 'expired' is
+	// 'expired'. Without the WHERE-status guard a `cancelled` row could
+	// be silently re-activated by an automatic-renewal webhook, granting
+	// access the user revoked. `active` rows are also excluded — they
+	// should reach Renew via a CreateOrder → activateSubscriptionOnTx
+	// UPSERT path that already covers re-activation; Renew on an
+	// already-active row is a caller-side bug.
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE subscriptions SET status = 'active', expires_at = $1, updated_at = now() WHERE id = $2
+		UPDATE subscriptions SET status = 'active', expires_at = $1, updated_at = now()
+		WHERE id = $2 AND status = 'expired'
 	`, expiresAt, id)
 	return err
 }

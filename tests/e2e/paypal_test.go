@@ -15,7 +15,7 @@ import (
 
 func TestE2E_Paypal_CaptureCompleted_HappyPath(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "paypal-cap", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "paypal-cap", "yundian").AccessToken
 
 	// Create the order first so the webhook can find it.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
@@ -113,7 +113,7 @@ func TestE2E_Paypal_MissingHeaders_400(t *testing.T) {
 
 	// Need an order so verify doesn't side-effect; the missing-header path
 	// rejects the request before any DB write.
-	token, _ := loginAndGetToken(t, srv.Engine, "paypal-bad", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "paypal-bad", "yundian").AccessToken
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"paypal"}`, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
@@ -144,7 +144,7 @@ func TestE2E_Paypal_MissingHeaders_400(t *testing.T) {
 
 func TestE2E_Paypal_SaleCompleted_ExtendsExpiresAt(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	token, _ := loginAndGetToken(t, srv.Engine, "paypal-renew", "yundian")
+	token := loginAndGetTokens(t, srv.Engine, "paypal-renew", "yundian").AccessToken
 
 	// Initial capture creates the order + payment + activates the subscription.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",

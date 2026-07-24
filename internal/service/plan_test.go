@@ -192,7 +192,7 @@ func TestPlanService_CheckAppAccess(t *testing.T) {
 
 	t.Run("user with subscription can access included app", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
-		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", Apps: []string{"yundian", "yundash"}}
+		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", IsActive: true, Apps: []string{"yundian", "yundash"}}
 		svc := NewPlanService(planRepo)
 
 		sub := &model.Subscription{ID: "sub-1", UserID: "user-1", PlanID: "monthly"}
@@ -216,7 +216,7 @@ func TestPlanService_CheckAppAccess(t *testing.T) {
 
 	t.Run("user without subscription uses default plan", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
-		planRepo.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
+		planRepo.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true, Apps: []string{"yundian"}}
 		planRepo.defaultPlan = planRepo.plans["free"]
 		svc := NewPlanService(planRepo)
 

@@ -74,8 +74,8 @@ func (m *mockTokenSvc) SignAccessToken(userID, appID string, scope []string) (st
 func (m *mockTokenSvc) VerifyAccessToken(token string) (*service.TokenClaims, error) {
 	return &service.TokenClaims{
 		RegisteredClaims: jwt.RegisteredClaims{Subject: "user-123"},
-		AppID: "yundian",
-		Scope: []string{"yundian"},
+		AppID:            "yundian",
+		Scope:            []string{"yundian"},
 	}, nil
 }
 
@@ -84,9 +84,9 @@ func (m *mockTokenSvc) Refresh(ctx context.Context, refreshToken, appID string) 
 }
 
 type mockSubSvc struct {
-	subs       []model.Subscription
-	createErr  error
-	cancelErr  error
+	subs      []model.Subscription
+	createErr error
+	cancelErr error
 }
 
 func (m *mockSubSvc) Create(ctx context.Context, userID, planID string, expiresAt *time.Time) (*model.Subscription, error) {
@@ -113,13 +113,14 @@ func (m *mockSubSvc) ListUserSubscriptions(ctx context.Context, userID string) (
 }
 
 type mockPlanSvc struct {
-	plans        []model.Plan
-	plan         *model.Plan
-	getErr       error
-	findByAppErr error
-	createErr    error
-	updateErr    error
-	deleteErr    error
+	plans           []model.Plan
+	plan            *model.Plan
+	getErr          error
+	findByAppErr    error
+	validateAppsErr error
+	createErr       error
+	updateErr       error
+	deleteErr       error
 }
 
 func (m *mockPlanSvc) ListPlans(ctx context.Context) ([]model.Plan, error) {
@@ -158,12 +159,24 @@ func (m *mockPlanSvc) GetPlan(ctx context.Context, id string) (*model.Plan, erro
 	return &cp, nil
 }
 
+func (m *mockPlanSvc) ValidateApps(ctx context.Context, apps []string) error {
+	return m.validateAppsErr
+}
+
 func (m *mockPlanSvc) CreatePlan(ctx context.Context, p *model.Plan) error {
-	return m.createErr
+	if m.createErr != nil {
+		return m.createErr
+	}
+	m.plan = p
+	return nil
 }
 
 func (m *mockPlanSvc) UpdatePlan(ctx context.Context, p *model.Plan) error {
-	return m.updateErr
+	if m.updateErr != nil {
+		return m.updateErr
+	}
+	m.plan = p
+	return nil
 }
 
 func (m *mockPlanSvc) DeletePlan(ctx context.Context, id string) error {
@@ -296,6 +309,24 @@ func TestAuthHandler_JWKS(t *testing.T) {
 
 // --- PlanHandler Tests ---
 
+func performPlanHandlerRequest(t *testing.T, svc *mockPlanSvc, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	handler := NewPlanHandler(svc, nil, nil)
+	router := gin.New()
+	router.POST("/admin/plans", handler.CreatePlan)
+	router.GET("/admin/plans/:id", handler.GetPlan)
+	router.PATCH("/admin/plans/:id", handler.UpdatePlan)
+
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
 func TestPlanHandler_ListPlans(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -383,7 +414,7 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 		router := gin.New()
 		router.POST("/admin/plans", handler.CreatePlan)
 
-		body := `{"id":"test","name":"Test Plan","price":9.99,"interval_days":30,"apps":["yundian"],"currency":"USD","is_listed":false,"accepting_new_subscriptions":false,"is_active":false,"trial_days":7,"description":"Trial plan","display_order":4,"is_default":true}`
+		body := `{"id":"test","name":"Test Plan","price":9.99,"interval_days":30,"apps":["yundian"],"currency":"USD","is_listed":false,"accepting_new_subscriptions":false,"is_active":false,"trial_days":7,"description":"Trial plan","display_order":4}`
 		req := httptest.NewRequest(http.MethodPost, "/admin/plans", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -429,6 +460,254 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 			t.Errorf("expected 400, got %d", w.Code)
 		}
 	})
+}
+
+func TestPlanHandler_Create_RejectsIsDefault(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"x","is_default":true}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "is_default is no longer supported") {
+		t.Errorf("body missing is_default rejection: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Create_RejectsNegativePrice(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"x","price":-1}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "price must be non-negative") {
+		t.Errorf("body missing price validation message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Create_RejectsBadCurrency(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"x","currency":"JPY"}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "currency must be one of CNY/USD/EUR") {
+		t.Errorf("body missing currency validation message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Create_RejectsNegativeTrialDays(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"x","trial_days":-1}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "trial_days must be non-negative") {
+		t.Errorf("body missing trial_days validation message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Create_AcceptsNewFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{}
+	body := `{"id":"q1","name":"Q1","price":99,"interval_days":30,"apps":["yundian"],"is_listed":false,"accepting_new_subscriptions":false,"currency":"EUR","trial_days":7,"description":"Quarterly Pro","display_order":15}`
+	created := performPlanHandlerRequest(t, svc, http.MethodPost, "/admin/plans", body)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want 201 (body: %s)", created.Code, created.Body.String())
+	}
+
+	got := performPlanHandlerRequest(t, svc, http.MethodGet, "/admin/plans/q1", "")
+	if got.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200 (body: %s)", got.Code, got.Body.String())
+	}
+	var response struct {
+		Data model.Plan `json:"data"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	plan := response.Data
+	if plan.ID != "q1" || plan.Name != "Q1" || plan.Price != 99 || plan.IntervalDays != 30 {
+		t.Errorf("base fields not preserved: %+v", plan)
+	}
+	if len(plan.Apps) != 1 || plan.Apps[0] != "yundian" {
+		t.Errorf("Apps = %v, want [yundian]", plan.Apps)
+	}
+	if plan.IsListed || plan.AcceptingNewSubscriptions {
+		t.Errorf("commercial flags = listed:%v accepting:%v, want both false", plan.IsListed, plan.AcceptingNewSubscriptions)
+	}
+	if plan.Currency != "EUR" || plan.TrialDays != 7 || plan.DisplayOrder != 15 {
+		t.Errorf("commercial fields not preserved: %+v", plan)
+	}
+	if plan.Description == nil || *plan.Description != "Quarterly Pro" {
+		t.Errorf("Description = %v, want Quarterly Pro", plan.Description)
+	}
+}
+
+func TestPlanHandler_Create_RejectsUnknownAppID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{validateAppsErr: service.ErrInvalidAppID}
+	w := performPlanHandlerRequest(t, svc, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"x","apps":["nope"]}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), service.ErrInvalidAppID.Error()) {
+		t.Errorf("body missing ErrInvalidAppID: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Create_ValidateApps_500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{validateAppsErr: errors.New("db exploded")}
+	w := performPlanHandlerRequest(t, svc, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"x","apps":["yundian"]}`)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "failed to validate plan apps") {
+		t.Errorf("body missing 500 message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_RejectsIsDefault(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly"}}
+	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"is_default":true}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("is_default:true status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "is_default is no longer supported") {
+		t.Errorf("is_default:true body missing rejection: %s", w.Body.String())
+	}
+
+	// PATCH must also reject is_default:false so the BFF cannot silently
+	// flip the legacy column.
+	w = performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"is_default":false,"name":"Updated"}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("is_default:false status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "is_default is no longer supported") {
+		t.Errorf("is_default:false body missing rejection: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_RejectsBadCurrency(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly"}}
+	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"currency":"JPY"}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "currency must be one of CNY/USD/EUR") {
+		t.Errorf("body missing currency validation message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_RejectsNegativeTrialDays(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly"}}
+	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"trial_days":-1}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "trial_days must be non-negative") {
+		t.Errorf("body missing trial_days validation message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_AcceptsNewFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	description := "Old"
+	svc := &mockPlanSvc{plan: &model.Plan{
+		ID:                        "monthly",
+		Name:                      "Monthly",
+		Apps:                      []string{"old-app"},
+		IsListed:                  true,
+		AcceptingNewSubscriptions: true,
+		Currency:                  "CNY",
+		Description:               &description,
+	}}
+	body := `{"apps":["yundian"],"is_listed":false,"accepting_new_subscriptions":false,"currency":"USD","trial_days":14,"description":"Updated","display_order":9}`
+	updated := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly", body)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200 (body: %s)", updated.Code, updated.Body.String())
+	}
+
+	got := performPlanHandlerRequest(t, svc, http.MethodGet, "/admin/plans/monthly", "")
+	if got.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200 (body: %s)", got.Code, got.Body.String())
+	}
+	var response struct {
+		Data model.Plan `json:"data"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	plan := response.Data
+	if len(plan.Apps) != 1 || plan.Apps[0] != "yundian" {
+		t.Errorf("Apps = %v, want [yundian]", plan.Apps)
+	}
+	if plan.IsListed || plan.AcceptingNewSubscriptions {
+		t.Errorf("commercial flags = listed:%v accepting:%v, want both false", plan.IsListed, plan.AcceptingNewSubscriptions)
+	}
+	if plan.Currency != "USD" || plan.TrialDays != 14 || plan.DisplayOrder != 9 {
+		t.Errorf("commercial fields not preserved: %+v", plan)
+	}
+	if plan.Description == nil || *plan.Description != "Updated" {
+		t.Errorf("Description = %v, want Updated", plan.Description)
+	}
+}
+
+func TestPlanHandler_Patch_RejectsUnknownAppID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{
+		plan:            &model.Plan{ID: "monthly", Name: "Monthly"},
+		validateAppsErr: service.ErrInvalidAppID,
+	}
+	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"apps":["nope"]}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), service.ErrInvalidAppID.Error()) {
+		t.Errorf("body missing ErrInvalidAppID: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_ValidateApps_500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{
+		plan:            &model.Plan{ID: "monthly", Name: "Monthly"},
+		validateAppsErr: errors.New("db exploded"),
+	}
+	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"apps":["yundian"]}`)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "failed to validate plan apps") {
+		t.Errorf("body missing 500 message: %s", w.Body.String())
+	}
 }
 
 func TestPlanHandler_DeletePlan(t *testing.T) {
@@ -1640,9 +1919,9 @@ func TestSubscriptionHandler_CancelSubscription_NoAuth_401(t *testing.T) {
 func TestPlanHandler_DeletePlan_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name       string
-		svc        *mockPlanSvc
-		wantStatus int
+		name        string
+		svc         *mockPlanSvc
+		wantStatus  int
 		wantMessage string
 	}{
 		{"PlanNotFound → 500",
@@ -1974,8 +2253,8 @@ func ptr(s string) *string { return &s }
 // --- Mock implementations for UserHandler tests ---
 
 type mockUserRepo struct {
-	user     *model.User
-	findErr  error
+	user      *model.User
+	findErr   error
 	updateErr error
 }
 
@@ -1995,10 +2274,10 @@ func (m *mockUserRepo) Update(ctx context.Context, u *model.User) error {
 }
 
 type mockIdentityRepo struct {
-	identities  []model.SocialIdentity
-	listErr     error
+	identities   []model.SocialIdentity
+	listErr      error
 	deleteResult bool
-	deleteErr   error
+	deleteErr    error
 }
 
 func (m *mockIdentityRepo) ListByUserID(ctx context.Context, userID string) ([]model.SocialIdentity, error) {
@@ -2140,7 +2419,6 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 
 func TestPlanHandler_GetAppPlans(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-
 
 	t.Run("app not found returns 404", func(t *testing.T) {
 		appRepo := &mockAppRepo{findErr: sql.ErrNoRows}

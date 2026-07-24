@@ -535,8 +535,13 @@ func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "cancelled"})
 }
 
+type adminPlanService interface {
+	service.PlanServiceInterface
+	ValidateApps(ctx context.Context, apps []string) error
+}
+
 type PlanHandler struct {
-	planSvc  service.PlanServiceInterface
+	planSvc  adminPlanService
 	appRepo  AppRepoInterface
 	quoteSvc QuoteLookup
 }
@@ -547,7 +552,84 @@ type QuoteLookup interface {
 	Get(ctx context.Context, appID, planID, userID string) (*model.Quote, error)
 }
 
-func NewPlanHandler(planSvc service.PlanServiceInterface, appRepo AppRepoInterface, quoteSvc QuoteLookup) *PlanHandler {
+type createPlanRequest struct {
+	ID                        string   `json:"id"`
+	Name                      string   `json:"name"`
+	Price                     float64  `json:"price"`
+	IntervalDays              int      `json:"interval_days"`
+	Apps                      []string `json:"apps"`
+	Currency                  *string  `json:"currency"`
+	IsListed                  *bool    `json:"is_listed"`
+	AcceptingNewSubscriptions *bool    `json:"accepting_new_subscriptions"`
+	TrialDays                 int      `json:"trial_days"`
+	Description               *string  `json:"description"`
+	DisplayOrder              int      `json:"display_order"`
+	IsActive                  *bool    `json:"is_active"`
+}
+
+type updatePlanRequest struct {
+	Name                      *string   `json:"name"`
+	Price                     *float64  `json:"price"`
+	IntervalDays              *int      `json:"interval_days"`
+	Apps                      *[]string `json:"apps"`
+	Currency                  *string   `json:"currency"`
+	IsListed                  *bool     `json:"is_listed"`
+	AcceptingNewSubscriptions *bool     `json:"accepting_new_subscriptions"`
+	TrialDays                 *int      `json:"trial_days"`
+	Description               *string   `json:"description"`
+	DisplayOrder              *int      `json:"display_order"`
+	IsActive                  *bool     `json:"is_active"`
+}
+
+func decodeAdminPlanRequest(c *gin.Context, dst any) bool {
+	body, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return false
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return false
+	}
+	if _, present := raw["is_default"]; present {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "is_default is no longer supported; use plan selection logic in BFF",
+		})
+		return false
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return false
+	}
+	return true
+}
+
+func isSupportedPlanCurrency(currency string) bool {
+	switch currency {
+	case "", "CNY", "USD", "EUR":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *PlanHandler) validatePlanApps(c *gin.Context, apps []string) bool {
+	if err := h.planSvc.ValidateApps(c.Request.Context(), apps); err != nil {
+		if errors.Is(err, service.ErrInvalidAppID) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return false
+		}
+		log.Printf("validate plan apps error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to validate plan apps"})
+		return false
+	}
+	return true
+}
+
+func NewPlanHandler(planSvc adminPlanService, appRepo AppRepoInterface, quoteSvc QuoteLookup) *PlanHandler {
 	return &PlanHandler{planSvc: planSvc, appRepo: appRepo, quoteSvc: quoteSvc}
 }
 
@@ -576,36 +658,31 @@ func (h *PlanHandler) GetPlan(c *gin.Context) {
 }
 
 func (h *PlanHandler) CreatePlan(c *gin.Context) {
-	var req struct {
-		ID                        string   `json:"id" binding:"required"`
-		Name                      string   `json:"name" binding:"required"`
-		Price                     float64  `json:"price"`
-		IntervalDays              int      `json:"interval_days"`
-		Apps                      []string `json:"apps"`
-		Currency                  *string  `json:"currency"`
-		IsListed                  *bool    `json:"is_listed"`
-		AcceptingNewSubscriptions *bool    `json:"accepting_new_subscriptions"`
-		TrialDays                 int      `json:"trial_days"`
-		Description               *string  `json:"description"`
-		DisplayOrder              int      `json:"display_order"`
-		IsActive                  *bool    `json:"is_active"`
-		IsDefault                 bool     `json:"is_default"` // ignored; Phase 1 forces false
+	var req createPlanRequest
+	if !decodeAdminPlanRequest(c, &req) {
+		return
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if req.ID == "" || req.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
 	}
 	if req.Price < 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "price must be >= 0"})
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "price must be non-negative"})
 		return
 	}
 	if req.IntervalDays < 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be >= 0"})
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be non-negative"})
 		return
 	}
-
 	if req.TrialDays < 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must be >= 0"})
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must be non-negative"})
+		return
+	}
+	if req.Currency != nil && !isSupportedPlanCurrency(*req.Currency) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "currency must be one of CNY/USD/EUR"})
+		return
+	}
+	if !h.validatePlanApps(c, req.Apps) {
 		return
 	}
 
@@ -650,6 +727,30 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 }
 
 func (h *PlanHandler) UpdatePlan(c *gin.Context) {
+	var req updatePlanRequest
+	if !decodeAdminPlanRequest(c, &req) {
+		return
+	}
+	if req.Price != nil && *req.Price < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "price must be non-negative"})
+		return
+	}
+	if req.IntervalDays != nil && *req.IntervalDays < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be non-negative"})
+		return
+	}
+	if req.TrialDays != nil && *req.TrialDays < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must be non-negative"})
+		return
+	}
+	if req.Currency != nil && !isSupportedPlanCurrency(*req.Currency) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "currency must be one of CNY/USD/EUR"})
+		return
+	}
+	if req.Apps != nil && !h.validatePlanApps(c, *req.Apps) {
+		return
+	}
+
 	id := c.Param("id")
 	plan, err := h.planSvc.GetPlan(c.Request.Context(), id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -662,44 +763,38 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		Name         *string  `json:"name"`
-		Price        *float64 `json:"price"`
-		IntervalDays *int     `json:"interval_days"`
-		Apps         []string `json:"apps"`
-		IsActive     *bool    `json:"is_active"`
-		IsDefault    *bool    `json:"is_default"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
-		return
-	}
-
 	if req.Name != nil {
 		plan.Name = *req.Name
 	}
 	if req.Price != nil {
-		if *req.Price < 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "price must be >= 0"})
-			return
-		}
 		plan.Price = *req.Price
 	}
 	if req.IntervalDays != nil {
-		if *req.IntervalDays < 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be >= 0"})
-			return
-		}
 		plan.IntervalDays = *req.IntervalDays
 	}
 	if req.Apps != nil {
-		plan.Apps = pq.StringArray(req.Apps)
+		plan.Apps = pq.StringArray(*req.Apps)
+	}
+	if req.Currency != nil && *req.Currency != "" {
+		plan.Currency = *req.Currency
+	}
+	if req.IsListed != nil {
+		plan.IsListed = *req.IsListed
+	}
+	if req.AcceptingNewSubscriptions != nil {
+		plan.AcceptingNewSubscriptions = *req.AcceptingNewSubscriptions
+	}
+	if req.TrialDays != nil {
+		plan.TrialDays = *req.TrialDays
+	}
+	if req.Description != nil {
+		plan.Description = req.Description
+	}
+	if req.DisplayOrder != nil {
+		plan.DisplayOrder = *req.DisplayOrder
 	}
 	if req.IsActive != nil {
 		plan.IsActive = *req.IsActive
-	}
-	if req.IsDefault != nil {
-		plan.IsDefault = *req.IsDefault
 	}
 
 	if err := h.planSvc.UpdatePlan(c.Request.Context(), plan); err != nil {

@@ -26,6 +26,9 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, planID string,
 	// creation is only allowed for free plans (Price == 0); paid plans must
 	// be created by admin endpoints (or a future payment-webhook flow) so
 	// users can't grant themselves paid access for free.
+	// AcceptingNewSubscriptions: plans marked as not accepting new
+	// subscriptions (e.g. legacy 'quarterly') reject self-subscribe. Renew is
+	// unaffected.
 	plan, err := s.planSvc.planRepo.FindByID(ctx, planID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrPlanNotFound
@@ -33,6 +36,9 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, planID string,
 	if err != nil {
 		return nil, fmt.Errorf("find plan: %w", err)
 	}
+	// Order: IsActive (cheapest / most obvious) → AcceptingNewSubscriptions
+	// (orthogonal to active; quarterly is active-but-not-accepting) → Price > 0
+	// (defensive — admin could zero a paid plan) → active-sub check (depends on user context).
 	if !plan.IsActive {
 		return nil, ErrPlanInactive
 	}

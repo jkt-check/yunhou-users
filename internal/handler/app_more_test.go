@@ -152,6 +152,28 @@ func TestSubscriptionHandler_CreateSubscription_PaidPlanForbidden(t *testing.T) 
 	}
 }
 
+func TestSubscriptionHandler_CreateSubscription_PlanNotAcceptingNew(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockSubSvc{createErr: service.ErrPlanNotAcceptingNew}
+	h := NewSubscriptionHandler(svc)
+	r := gin.New()
+	r.POST("/user/subscriptions", func(c *gin.Context) {
+		c.Set("user_id", "u1")
+		h.CreateSubscription(c)
+	})
+	body := `{"plan_id":"quarterly"}`
+	req := httptest.NewRequest(http.MethodPost, "/user/subscriptions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status=%d, want 409", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "plan is not accepting new subscriptions") {
+		t.Errorf("body=%s, want it to contain 'plan is not accepting new subscriptions'", w.Body.String())
+	}
+}
+
 func TestSubscriptionHandler_CreateSubscription_Conflict(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockSubSvc{createErr: service.ErrUserHasActiveSub}

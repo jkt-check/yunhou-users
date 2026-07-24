@@ -491,6 +491,9 @@ func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 		case errors.Is(err, service.ErrPaidPlanForbidden):
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "paid plans require payment, cannot self-subscribe"})
 			return
+		case errors.Is(err, service.ErrPlanNotAcceptingNew):
+			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is not accepting new subscriptions"})
+			return
 		case errors.Is(err, service.ErrUserHasActiveSub), errors.Is(err, service.ErrSubscriptionExists):
 			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
 			return

@@ -7,21 +7,21 @@ import (
 )
 
 type Plan struct {
-	ID           string         `db:"id" json:"id"` // free/monthly/quarterly/yearly
-	Name         string         `db:"name" json:"name"`
-	Price        float64        `db:"price" json:"price"`
-	IntervalDays int            `db:"interval_days" json:"interval_days"`
-	Apps         pq.StringArray `db:"apps" json:"apps"`
-	IsActive     bool           `db:"is_active" json:"is_active"`
-	IsDefault    bool           `db:"is_default" json:"is_default"`
-	IsListed     bool           `db:"is_listed" json:"is_listed"`
-	AcceptingNewSubscriptions bool      `db:"accepting_new_subscriptions" json:"accepting_new_subscriptions"`
-	Currency     string         `db:"currency" json:"currency"`
-	TrialDays    int            `db:"trial_days" json:"trial_days"`
-	Description  *string        `db:"description" json:"description"`
-	DisplayOrder int            `db:"display_order" json:"display_order"`
-	UpdatedAt    time.Time      `db:"updated_at" json:"updated_at"`
-	CreatedAt    time.Time      `db:"created_at" json:"created_at"`
+	ID                        string         `db:"id" json:"id"` // free/monthly/quarterly/yearly
+	Name                      string         `db:"name" json:"name"`
+	Price                     float64        `db:"price" json:"price"`
+	IntervalDays              int            `db:"interval_days" json:"interval_days"`
+	Apps                      pq.StringArray `db:"apps" json:"apps"`
+	IsActive                  bool           `db:"is_active" json:"is_active"`
+	IsDefault                 bool           `db:"is_default" json:"is_default"`
+	IsListed                  bool           `db:"is_listed" json:"is_listed"`
+	AcceptingNewSubscriptions bool           `db:"accepting_new_subscriptions" json:"accepting_new_subscriptions"`
+	Currency                  string         `db:"currency" json:"currency"`
+	TrialDays                 int            `db:"trial_days" json:"trial_days"`
+	Description               *string        `db:"description" json:"description"`
+	DisplayOrder              int            `db:"display_order" json:"display_order"`
+	UpdatedAt                 time.Time      `db:"updated_at" json:"updated_at"`
+	CreatedAt                 time.Time      `db:"created_at" json:"created_at"`
 }
 
 // CycleBaseFormula is the human-readable description of how SubExpiresAt is

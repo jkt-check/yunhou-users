@@ -284,10 +284,9 @@ func TestE2E_RefreshReuseFamilyRevoke(t *testing.T) {
 //      misreading as "downgraded to free".
 //   4. Refresh the access token without error (the historical bug
 //      path returned ErrSubscriptionExpired here too).
-//   5. Be permitted to create a renewal order (the second-stage
-//      follow-up fix widened CreateOrder's precondition to allow
-//      past-but-active rows through; without it the user was blocked
-//      from renewing even after login worked).
+//   5. Be permitted to create an order for an accepting plan (the
+//      second-stage follow-up fix widened CreateOrder's precondition
+//      to allow past-but-active rows through).
 //
 // Setup seeds an active-but-past subscription directly in the DB
 // before the /test/login call (the only login endpoint available in
@@ -358,14 +357,13 @@ func TestE2E_ExpiredSub_LoginAndRefresh(t *testing.T) {
 		t.Errorf("refresh Subscription.PlanID = %q, want quarterly", refreshed.Data.Subscription.PlanID)
 	}
 
-	// 5. CreateOrder must NOT return ErrUserHasActiveSub for the past-but-active row —
-	// the cn-staging follow-up fix widened the precondition to require either
-	// expires_at IS NULL OR expires_at > NOW(). Without it, the user is blocked from
-	// renewing even after the decouple fix let them log in.
+	// 5. CreateOrder for an accepting plan must NOT return ErrUserHasActiveSub for
+	// the past-but-active row. The quarterly fixture intentionally rejects new
+	// orders, so use monthly here to isolate the stale-subscription precondition.
 	orderResp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"quarterly","channel":"stripe"}`, authHeader(refreshed.Data.AccessToken))
+		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(refreshed.Data.AccessToken))
 	if orderResp.StatusCode == http.StatusConflict {
-		t.Fatalf("CreateOrder must permit renewal when status=active but expires_at is past; got 409. Body: %s", string(orderResp.Body))
+		t.Fatalf("CreateOrder must permit purchase when status=active but expires_at is past; got 409. Body: %s", string(orderResp.Body))
 	}
 	if orderResp.StatusCode >= 500 {
 		t.Fatalf("CreateOrder must not 5xx for an expired-but-active user: %d %s", orderResp.StatusCode, string(orderResp.Body))
@@ -396,7 +394,14 @@ func e2eMustSeedExpiredSubUser(t *testing.T, db *sqlx.DB) string {
 	// drives the "default plan includes the app + paid plan also includes
 	// the app" case that motivated the HasAccess=false override.
 	if _, err := db.ExecContext(context.Background(),
-		`INSERT INTO plans (id, name, price, interval_days, apps, is_active, is_default) VALUES ('quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true, false) ON CONFLICT (id) DO NOTHING`); err != nil {
+		`INSERT INTO plans (
+			id, name, price, interval_days, apps, is_active, is_default,
+			is_listed, accepting_new_subscriptions, currency, trial_days,
+			description, display_order
+		) VALUES (
+			'quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true, false,
+			true, false, 'CNY', 0, '按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留', 20
+		) ON CONFLICT (id) DO NOTHING`); err != nil {
 		t.Fatalf("seed plan: %v", err)
 	}
 	past := time.Now().Add(-1 * time.Hour)

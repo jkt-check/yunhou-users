@@ -113,36 +113,45 @@ func cleanupDB(t *testing.T, db *sqlx.DB) {
 
 func seedTestData(t *testing.T, db *sqlx.DB) {
 	t.Helper()
-	// Plans use a partial unique index `plans_one_default` (one is_default=true
-	// per table). With multiple tests running in parallel, ON CONFLICT(id) DO NOTHING
-	// doesn't help — that handles the PK conflict, not the partial unique. So
-	// we first clear is_default on every row, then upsert the seed plans.
-	if _, err := db.ExecContext(context.Background(),
-		`UPDATE plans SET is_default = false`); err != nil {
-		t.Fatalf("clear is_default: %v", err)
-	}
 
 	plans := []struct {
-		id, name string
-		price    float64
-		days     int
-		apps     string
-		isDef    bool
+		id, name, currency string
+		price              float64
+		days               int
+		apps               string
+		isDef              bool
+		trialDays          int
+		description        string
+		isListed           bool
+		acceptingNew       bool
+		displayOrder       int
 	}{
-		{"free", "免费", 0, 0, "{yundian}", true},
-		{"monthly", "按月订阅", 29.9, 30, "{yundian,yundash}", false},
+		{"free", "免费", "CNY", 0, 0, "{yundian}", true, 0, "免费版（已下线）", true, false, 0},
+		{"monthly", "按月订阅", "CNY", 29.9, 30, "{yundian,yundash}", false, 0, "按月订阅 ¥29.9，自动续费，可随时取消", true, true, 10},
+		{"monthly_usd", "Monthly PayPal Test", "USD", 29.9, 30, "{}", false, 0, "PayPal USD test fixture", false, true, 0},
 	}
 	for _, p := range plans {
 		_, err := db.ExecContext(context.Background(), `
-			INSERT INTO plans (id, name, price, interval_days, apps, is_default)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO plans (
+				id, name, price, interval_days, apps, is_default, is_listed,
+				accepting_new_subscriptions, currency, trial_days,
+				description, display_order
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				price = EXCLUDED.price,
 				interval_days = EXCLUDED.interval_days,
 				apps = EXCLUDED.apps,
-				is_default = EXCLUDED.is_default
-		`, p.id, p.name, p.price, p.days, p.apps, p.isDef)
+				is_default = EXCLUDED.is_default,
+				is_listed = EXCLUDED.is_listed,
+				accepting_new_subscriptions = EXCLUDED.accepting_new_subscriptions,
+				currency = EXCLUDED.currency,
+				trial_days = EXCLUDED.trial_days,
+				description = EXCLUDED.description,
+				display_order = EXCLUDED.display_order
+		`, p.id, p.name, p.price, p.days, p.apps, p.isDef, p.isListed,
+			p.acceptingNew, p.currency, p.trialDays, p.description, p.displayOrder)
 		if err != nil {
 			t.Fatalf("seed plan %s: %v", p.id, err)
 		}

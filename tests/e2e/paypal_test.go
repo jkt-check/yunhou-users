@@ -19,7 +19,7 @@ func TestE2E_Paypal_CaptureCompleted_HappyPath(t *testing.T) {
 
 	// Create the order first so the webhook can find it.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly","channel":"paypal"}`, authHeader(token))
+		`{"plan_id":"monthly_usd","channel":"paypal"}`, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create order: %d %s", resp.StatusCode, string(resp.Body))
 	}
@@ -99,8 +99,8 @@ func TestE2E_Paypal_CaptureCompleted_HappyPath(t *testing.T) {
 	if subStatus != "active" {
 		t.Errorf("expected subscription.status=active, got %s", subStatus)
 	}
-	if subPlanID != "monthly" {
-		t.Errorf("expected subscription.plan_id=monthly, got %s", subPlanID)
+	if subPlanID != "monthly_usd" {
+		t.Errorf("expected subscription.plan_id=monthly_usd, got %s", subPlanID)
 	}
 }
 
@@ -115,7 +115,7 @@ func TestE2E_Paypal_MissingHeaders_400(t *testing.T) {
 	// rejects the request before any DB write.
 	token := loginAndGetTokens(t, srv.Engine, "paypal-bad", "yundian").AccessToken
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly","channel":"paypal"}`, authHeader(token))
+		`{"plan_id":"monthly_usd","channel":"paypal"}`, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create order: %d %s", resp.StatusCode, string(resp.Body))
 	}
@@ -148,7 +148,7 @@ func TestE2E_Paypal_SaleCompleted_ExtendsExpiresAt(t *testing.T) {
 
 	// Initial capture creates the order + payment + activates the subscription.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
-		`{"plan_id":"monthly","channel":"paypal"}`, authHeader(token))
+		`{"plan_id":"monthly_usd","channel":"paypal"}`, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create order: %d %s", resp.StatusCode, string(resp.Body))
 	}

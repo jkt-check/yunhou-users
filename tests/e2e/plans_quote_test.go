@@ -99,8 +99,14 @@ func TestE2E_PostQuote_HappyPath(t *testing.T) {
 	// Seed a plan whose apps include our new app_id. setupE2EServer would
 	// wipe the app we just created if called again, so we reuse the db handle.
 	if _, err := db.ExecContext(context.Background(),
-		`INSERT INTO plans (id, name, price, interval_days, apps, is_active)
-		 VALUES ('qp', 'Quote Plan', 29.9, 30, ARRAY[$1], true)`, appID); err != nil {
+		`INSERT INTO plans (
+			id, name, price, interval_days, apps, is_active, is_listed,
+			accepting_new_subscriptions, currency, trial_days, description,
+			display_order
+		) VALUES (
+			'qp', 'Quote Plan', 29.9, 30, ARRAY[$1], true, true,
+			true, 'USD', 7, 'Quote test fixture', 0
+		)`, appID); err != nil {
 		t.Fatalf("seed plan: %v", err)
 	}
 

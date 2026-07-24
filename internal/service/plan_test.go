@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -20,7 +21,7 @@ func TestPlanService_ListPlans(t *testing.T) {
 		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", IsActive: true}
 		planRepo.plans["inactive"] = &model.Plan{ID: "inactive", Name: "Inactive", IsActive: false}
 
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		plans, err := svc.ListPlans(ctx)
 		if err != nil {
 			t.Fatalf("list plans: %v", err)
@@ -35,7 +36,7 @@ func TestPlanService_ListPlans(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.err = errTest
 
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		_, err := svc.ListPlans(ctx)
 		if err == nil {
 			t.Error("expected error")
@@ -52,7 +53,7 @@ func TestPlanService_GetPlan(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", Price: 29.9}
 
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		plan, err := svc.GetPlan(ctx, "monthly")
 		if err != nil {
 			t.Fatalf("get plan: %v", err)
@@ -67,7 +68,7 @@ func TestPlanService_GetPlan(t *testing.T) {
 
 	t.Run("get nonexistent plan", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		_, err := svc.GetPlan(ctx, "nonexistent")
 		if err == nil {
@@ -83,7 +84,7 @@ func TestPlanService_CreatePlan(t *testing.T) {
 
 	t.Run("create plan successfully", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		plan := &model.Plan{
 			ID:           "test-plan",
@@ -114,7 +115,7 @@ func TestPlanService_CreatePlan(t *testing.T) {
 	t.Run("create plan with error", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.err = errTest
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		plan := &model.Plan{ID: "test", Name: "Test"}
 		err := svc.CreatePlan(ctx, plan)
@@ -132,7 +133,7 @@ func TestPlanService_UpdatePlan(t *testing.T) {
 	t.Run("update existing plan", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "Old Name", Price: 19.9}
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		plan := &model.Plan{ID: "monthly", Name: "New Name", Price: 29.9}
 		err := svc.UpdatePlan(ctx, plan)
@@ -151,7 +152,7 @@ func TestPlanService_UpdatePlan(t *testing.T) {
 	t.Run("update plan with error", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.err = errTest
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		plan := &model.Plan{ID: "test", Name: "Test"}
 		err := svc.UpdatePlan(ctx, plan)
@@ -169,7 +170,7 @@ func TestPlanService_DeletePlan(t *testing.T) {
 	t.Run("delete existing plan", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["to-delete"] = &model.Plan{ID: "to-delete", Name: "To Delete"}
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		err := svc.DeletePlan(ctx, "to-delete")
 		if err != nil {
@@ -184,13 +185,91 @@ func TestPlanService_DeletePlan(t *testing.T) {
 	t.Run("delete plan with error", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.err = errTest
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		err := svc.DeletePlan(ctx, "test")
 		if err == nil {
 			t.Error("expected error")
 		}
 	})
+}
+
+func TestPlanService_CreatePlan_WritesAuditLog(t *testing.T) {
+	ctx := context.Background()
+	planRepo := newMockPlanRepo()
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+	plan := &model.Plan{ID: "pro", Name: "Pro", Price: 99, Apps: []string{"yundian"}}
+
+	if err := svc.CreatePlan(ctx, plan); err != nil {
+		t.Fatalf("CreatePlan: %v", err)
+	}
+	if len(changeLogRepo.calls) != 1 {
+		t.Fatalf("audit calls = %d, want 1", len(changeLogRepo.calls))
+	}
+	call := changeLogRepo.calls[0]
+	if call.planID != plan.ID || call.actorID != "admin" || call.changeType != "plan_create" {
+		t.Errorf("audit identity = (%q, %q, %q), want (%q, admin, plan_create)", call.planID, call.actorID, call.changeType, plan.ID)
+	}
+	if call.before != nil {
+		t.Errorf("before = %#v, want nil", call.before)
+	}
+	if call.after == nil || !reflect.DeepEqual(*call.after, *plan) {
+		t.Errorf("after = %#v, want %#v", call.after, plan)
+	}
+}
+
+func TestPlanService_UpdatePlan_WritesAuditLog(t *testing.T) {
+	ctx := context.Background()
+	planRepo := newMockPlanRepo()
+	before := &model.Plan{ID: "pro", Name: "Old", Price: 99, Apps: []string{"yundian"}}
+	planRepo.plans[before.ID] = before
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+	after := &model.Plan{ID: "pro", Name: "New", Price: 129, Apps: []string{"yundian", "yundash"}}
+
+	if err := svc.UpdatePlan(ctx, after); err != nil {
+		t.Fatalf("UpdatePlan: %v", err)
+	}
+	if len(changeLogRepo.calls) != 1 {
+		t.Fatalf("audit calls = %d, want 1", len(changeLogRepo.calls))
+	}
+	call := changeLogRepo.calls[0]
+	if call.planID != after.ID || call.actorID != "admin" || call.changeType != "plan_update" {
+		t.Errorf("audit identity = (%q, %q, %q), want (%q, admin, plan_update)", call.planID, call.actorID, call.changeType, after.ID)
+	}
+	if call.before == nil || !reflect.DeepEqual(*call.before, *before) {
+		t.Errorf("before = %#v, want %#v", call.before, before)
+	}
+	if call.after == nil || !reflect.DeepEqual(*call.after, *after) {
+		t.Errorf("after = %#v, want %#v", call.after, after)
+	}
+}
+
+func TestPlanService_DeletePlan_WritesArchiveLog(t *testing.T) {
+	ctx := context.Background()
+	planRepo := newMockPlanRepo()
+	snapshot := &model.Plan{ID: "legacy", Name: "Legacy", Price: 49, Apps: []string{"yundian"}}
+	planRepo.plans[snapshot.ID] = snapshot
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+
+	if err := svc.DeletePlan(ctx, snapshot.ID); err != nil {
+		t.Fatalf("DeletePlan: %v", err)
+	}
+	if len(changeLogRepo.calls) != 1 {
+		t.Fatalf("audit calls = %d, want 1", len(changeLogRepo.calls))
+	}
+	call := changeLogRepo.calls[0]
+	if call.planID != snapshot.ID || call.actorID != "admin" || call.changeType != "plan_archive" {
+		t.Errorf("audit identity = (%q, %q, %q), want (%q, admin, plan_archive)", call.planID, call.actorID, call.changeType, snapshot.ID)
+	}
+	if call.before == nil || !reflect.DeepEqual(*call.before, *snapshot) {
+		t.Errorf("before = %#v, want %#v", call.before, snapshot)
+	}
+	if call.after != nil {
+		t.Errorf("after = %#v, want nil", call.after)
+	}
 }
 
 func TestPlanService_CheckAppAccess(t *testing.T) {
@@ -201,7 +280,7 @@ func TestPlanService_CheckAppAccess(t *testing.T) {
 	t.Run("user with subscription can access included app", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", IsActive: true, Apps: []string{"yundian", "yundash"}}
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		sub := &model.Subscription{ID: "sub-1", UserID: "user-1", PlanID: "monthly"}
 		canAccess := svc.CheckAppAccess(ctx, sub, "yundian")
@@ -213,7 +292,7 @@ func TestPlanService_CheckAppAccess(t *testing.T) {
 	t.Run("user with subscription cannot access excluded app", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}}
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		sub := &model.Subscription{ID: "sub-1", UserID: "user-1", PlanID: "free"}
 		canAccess := svc.CheckAppAccess(ctx, sub, "yundash")
@@ -226,7 +305,7 @@ func TestPlanService_CheckAppAccess(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true, Apps: []string{"yundian"}}
 		planRepo.defaultPlan = planRepo.plans["free"]
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		canAccess := svc.CheckAppAccess(ctx, nil, "yundian")
 		if !canAccess {
@@ -250,7 +329,7 @@ func TestPlanService_CheckAppAccess_RarePaths(t *testing.T) {
 	t.Run("FindDefault error when no subscription", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.err = errors.New("db down")
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		if svc.CheckAppAccess(ctx, nil, "yundian") {
 			t.Error("expected false when FindDefault errors")
 		}
@@ -259,7 +338,7 @@ func TestPlanService_CheckAppAccess_RarePaths(t *testing.T) {
 	t.Run("FindByID error when subscription exists", func(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.err = errors.New("db down")
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		sub := &model.Subscription{ID: "sub-1", UserID: "user-1", PlanID: "missing"}
 		if svc.CheckAppAccess(ctx, sub, "yundian") {
 			t.Error("expected false when FindByID errors")
@@ -284,7 +363,7 @@ func TestPlanService_FindByApp(t *testing.T) {
 		planRepo := newMockPlanRepo()
 		planRepo.plans["free"] = &model.Plan{ID: "free", Name: "免费", IsActive: true, Apps: []string{"yundian"}}
 		planRepo.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", IsActive: true, Apps: []string{"yundian", "yundash"}}
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		plans, err := svc.FindByApp(ctx, "yundian")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -298,7 +377,7 @@ func TestPlanService_FindByApp(t *testing.T) {
 		t.Parallel()
 		planRepo := newMockPlanRepo()
 		planRepo.err = errTest
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		_, err := svc.FindByApp(ctx, "yundian")
 		if err == nil {
 			t.Error("expected error, got nil")
@@ -308,7 +387,7 @@ func TestPlanService_FindByApp(t *testing.T) {
 	t.Run("empty result for unknown app", func(t *testing.T) {
 		t.Parallel()
 		planRepo := newMockPlanRepo()
-		svc := NewPlanService(planRepo, newMockAppRepo())
+		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 		plans, err := svc.FindByApp(ctx, "nonexistent")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -327,7 +406,7 @@ func TestPlanService_ValidateApps_UnknownApp(t *testing.T) {
 	appRepo := newMockAppRepo()
 	appRepo.seedActive("yundian", "云店")
 
-	svc := NewPlanService(planRepo, appRepo)
+	svc := NewPlanService(planRepo, appRepo, newMockPlanChangeLogRepo())
 
 	err := svc.ValidateApps(ctx, []string{"yundian", "missing"})
 	if err == nil {
@@ -352,7 +431,7 @@ func TestPlanService_ValidateApps_InactiveApp(t *testing.T) {
 	appRepo.seedActive("yundian", "云店")
 	appRepo.seedInactive("yundash", "云盘")
 
-	svc := NewPlanService(planRepo, appRepo)
+	svc := NewPlanService(planRepo, appRepo, newMockPlanChangeLogRepo())
 
 	err := svc.ValidateApps(ctx, []string{"yundian", "yundash"})
 	if err == nil {
@@ -375,7 +454,7 @@ func TestPlanService_ValidateApps_AllValid(t *testing.T) {
 	appRepo.seedActive("yundian", "云店")
 	appRepo.seedActive("yundash", "云盘")
 
-	svc := NewPlanService(planRepo, appRepo)
+	svc := NewPlanService(planRepo, appRepo, newMockPlanChangeLogRepo())
 
 	if err := svc.ValidateApps(ctx, []string{"yundian", "yundash"}); err != nil {
 		t.Fatalf("expected nil error, got %v", err)
@@ -390,7 +469,7 @@ func TestPlanService_ValidateApps_RepoError(t *testing.T) {
 	appRepo := newMockAppRepo()
 	appRepo.findErr = errors.New("db down")
 
-	svc := NewPlanService(planRepo, appRepo)
+	svc := NewPlanService(planRepo, appRepo, newMockPlanChangeLogRepo())
 
 	// A non-ErrNoRows error from the repo must surface as-is (not be
 	// remapped to ErrInvalidAppID) so callers can distinguish a DB

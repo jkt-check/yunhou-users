@@ -12,12 +12,13 @@ import (
 )
 
 type PlanService struct {
-	planRepo repo.PlanRepo
-	appRepo  AppLookup
+	planRepo      repo.PlanRepo
+	appRepo       AppLookup
+	changeLogRepo repo.PlanChangeLogRepo
 }
 
-func NewPlanService(planRepo repo.PlanRepo, appRepo AppLookup) *PlanService {
-	return &PlanService{planRepo: planRepo, appRepo: appRepo}
+func NewPlanService(planRepo repo.PlanRepo, appRepo AppLookup, changeLogRepo repo.PlanChangeLogRepo) *PlanService {
+	return &PlanService{planRepo: planRepo, appRepo: appRepo, changeLogRepo: changeLogRepo}
 }
 
 func (s *PlanService) ListPlans(ctx context.Context) ([]model.Plan, error) {
@@ -43,15 +44,48 @@ func (s *PlanService) CreatePlan(ctx context.Context, p *model.Plan) error {
 	// Phase 1 keeps the legacy column, but newly created plans must never be
 	// designated as the default plan.
 	p.IsDefault = false
-	return s.planRepo.Create(ctx, p)
+	if err := s.planRepo.Create(ctx, p); err != nil {
+		return err
+	}
+
+	after := *p
+	// The plan mutation has committed; audit logging is best-effort so an audit
+	// outage does not turn a successful operation into a user-visible failure.
+	_ = s.changeLogRepo.Insert(ctx, p.ID, "admin", "plan_create", nil, &after)
+	return nil
 }
 
 func (s *PlanService) UpdatePlan(ctx context.Context, p *model.Plan) error {
-	return s.planRepo.Update(ctx, p)
+	current, err := s.planRepo.FindByID(ctx, p.ID)
+	if err != nil {
+		return err
+	}
+	before := *current
+
+	if err := s.planRepo.Update(ctx, p); err != nil {
+		return err
+	}
+	after := *p
+	// The plan mutation has committed; audit logging is best-effort so an audit
+	// outage does not turn a successful operation into a user-visible failure.
+	_ = s.changeLogRepo.Insert(ctx, p.ID, "admin", "plan_update", &before, &after)
+	return nil
 }
 
 func (s *PlanService) DeletePlan(ctx context.Context, id string) error {
-	return s.planRepo.Delete(ctx, id)
+	current, err := s.planRepo.FindByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	snapshot := *current
+
+	if err := s.planRepo.Delete(ctx, id); err != nil {
+		return err
+	}
+	// The plan mutation has committed; audit logging is best-effort so an audit
+	// outage does not turn a successful operation into a user-visible failure.
+	_ = s.changeLogRepo.Insert(ctx, id, "admin", "plan_archive", &snapshot, nil)
+	return nil
 }
 
 // ValidateApps checks that every app_id in the provided list exists in the

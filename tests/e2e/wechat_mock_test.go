@@ -66,6 +66,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
 	planRepo := repo.NewPlanRepo(db)
+	planChangeLogRepo := repo.NewPlanChangeLogRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
@@ -79,7 +80,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	if err != nil {
 		t.Fatalf("new token service: %v", err)
 	}
-	planSvc := service.NewPlanService(planRepo, appRepo)
+	planSvc := service.NewPlanService(planRepo, appRepo, planChangeLogRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 

@@ -152,9 +152,9 @@ func (m *mockSocialIdentityRepo) DeleteIfNotLast(_ context.Context, id, userID s
 // --- PlanRepo mock ---
 
 type mockPlanRepo struct {
-	plans            map[string]*model.Plan
-	defaultPlan      *model.Plan
-	err              error
+	plans       map[string]*model.Plan
+	defaultPlan *model.Plan
+	err         error
 	// lookupErrForIDs forces FindByID to return the named error for the
 	// listed IDs even if a row was previously seeded into plans. Used by
 	// tests that model "plan row exists in DB but the lookup observed a
@@ -250,6 +250,39 @@ func (m *mockPlanRepo) Delete(_ context.Context, id string) error {
 		return m.err
 	}
 	delete(m.plans, id)
+	return nil
+}
+
+// --- PlanChangeLogRepo mock ---
+
+type planChangeLogCall struct {
+	planID     string
+	actorID    string
+	changeType string
+	before     *model.Plan
+	after      *model.Plan
+}
+
+type mockPlanChangeLogRepo struct {
+	insertFunc func(context.Context, string, string, string, *model.Plan, *model.Plan) error
+	calls      []planChangeLogCall
+}
+
+func newMockPlanChangeLogRepo() *mockPlanChangeLogRepo {
+	return &mockPlanChangeLogRepo{}
+}
+
+func (m *mockPlanChangeLogRepo) Insert(ctx context.Context, planID, actorID, changeType string, before, after *model.Plan) error {
+	m.calls = append(m.calls, planChangeLogCall{
+		planID:     planID,
+		actorID:    actorID,
+		changeType: changeType,
+		before:     before,
+		after:      after,
+	})
+	if m.insertFunc != nil {
+		return m.insertFunc(ctx, planID, actorID, changeType, before, after)
+	}
 	return nil
 }
 
@@ -583,7 +616,7 @@ func newTokenServiceWithKeys(sessionRepo *mockSessionRepo, subRepo *mockSubscrip
 		PrivateKey:  priv,
 		PublicKey:   pub,
 		AccessTTL:   15 * time.Minute,
-		RefreshTTL: 168 * time.Hour,
+		RefreshTTL:  168 * time.Hour,
 		SessionRepo: sessionRepo,
 		SubRepo:     subRepo,
 	}
@@ -595,7 +628,7 @@ func newTokenServiceWithMocks(sessionRepo *mockSessionRepo, subRepo *mockSubscri
 		PrivateKey:  priv,
 		PublicKey:   pub,
 		AccessTTL:   15 * time.Minute,
-		RefreshTTL: 168 * time.Hour,
+		RefreshTTL:  168 * time.Hour,
 		SessionRepo: sessionRepo,
 		SubRepo:     subRepo,
 	}
@@ -610,5 +643,5 @@ var _ = util.HashSecret
 // duplicateKeyError is a test double that satisfies isDuplicateKey.
 type duplicateKeyError struct{}
 
-func (d *duplicateKeyError) Error() string   { return "duplicate key" }
+func (d *duplicateKeyError) Error() string      { return "duplicate key" }
 func (d *duplicateKeyError) DuplicateKey() bool { return true }

@@ -101,6 +101,7 @@ func main() {
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
 	planRepo := repo.NewPlanRepo(db)
+	planChangeLogRepo := repo.NewPlanChangeLogRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
@@ -116,7 +117,7 @@ func main() {
 		log.Fatalf("failed to initialize token service: %v", err)
 	}
 
-	planSvc := service.NewPlanService(planRepo, appRepo)
+	planSvc := service.NewPlanService(planRepo, appRepo, planChangeLogRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 

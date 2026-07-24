@@ -241,6 +241,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
 	planRepo := repo.NewPlanRepo(db)
+	planChangeLogRepo := repo.NewPlanChangeLogRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
@@ -256,7 +257,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		t.Fatalf("new token service: %v", err)
 	}
 
-	planSvc := service.NewPlanService(planRepo, appRepo)
+	planSvc := service.NewPlanService(planRepo, appRepo, planChangeLogRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
@@ -342,6 +343,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
 	planRepo := repo.NewPlanRepo(db)
+	planChangeLogRepo := repo.NewPlanChangeLogRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
@@ -355,7 +357,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 	if err != nil {
 		t.Fatalf("token svc: %v", err)
 	}
-	planSvc := service.NewPlanService(planRepo, appRepo)
+	planSvc := service.NewPlanService(planRepo, appRepo, planChangeLogRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 	paymentSvc := service.NewPaymentService(
@@ -563,6 +565,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
 	planRepo := repo.NewPlanRepo(db)
+	planChangeLogRepo := repo.NewPlanChangeLogRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
@@ -576,7 +579,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	if err != nil {
 		t.Fatalf("new token service: %v", err)
 	}
-	planSvc := service.NewPlanService(planRepo, appRepo)
+	planSvc := service.NewPlanService(planRepo, appRepo, planChangeLogRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 

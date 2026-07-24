@@ -111,17 +111,18 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 		panic(fmt.Sprintf("set PAYPAL_L3_E2E_MODE: %v", err))
 	}
 	cfg := &config.Config{
-		Port:          "8080",
-		JWTAccessTTL:   15 * time.Minute,
-		JWTRefreshTTL: 168 * time.Hour,
-		RSAPrivate:     "../../keys/private.pem",
-		RSAPublic:      "../../keys/public.pem",
+		Port:             "8080",
+		JWTAccessTTL:     15 * time.Minute,
+		JWTRefreshTTL:    168 * time.Hour,
+		RSAPrivate:       "../../keys/private.pem",
+		RSAPublic:        "../../keys/public.pem",
 		OAuthStateSecret: "e2e-test-oauth-state-secret-padded-to-32-bytes",
 	}
 
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
 	planRepo := repo.NewPlanRepo(db)
+	planChangeLogRepo := repo.NewPlanChangeLogRepo(db)
 	appRepo := repo.NewAppRepo(db)
 	subRepo := repo.NewSubscriptionRepo(db)
 	sessionRepo := repo.NewSessionRepo(db)
@@ -130,7 +131,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	if err != nil {
 		panic(fmt.Sprintf("failed to init token service: %v", err))
 	}
-	planSvc := service.NewPlanService(planRepo, appRepo)
+	planSvc := service.NewPlanService(planRepo, appRepo, planChangeLogRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 

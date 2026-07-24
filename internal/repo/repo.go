@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -34,6 +35,11 @@ type PlanRepo interface {
 	Create(ctx context.Context, p *model.Plan) error
 	Update(ctx context.Context, p *model.Plan) error
 	Delete(ctx context.Context, id string) error
+}
+
+// PlanChangeLogRepo records mutations to the plans table.
+type PlanChangeLogRepo interface {
+	Insert(ctx context.Context, planID, actorID, changeType string, before, after *model.Plan) error
 }
 
 type AppRepo interface {
@@ -83,6 +89,7 @@ type SessionRepo interface {
 type userRepo struct{ db *sqlx.DB }
 type socialIdentityRepo struct{ db *sqlx.DB }
 type planRepo struct{ db *sqlx.DB }
+type planChangeLogRepo struct{ db *sqlx.DB }
 type appRepo struct{ db *sqlx.DB }
 type subscriptionRepo struct{ db *sqlx.DB }
 type sessionRepo struct{ db *sqlx.DB }
@@ -91,15 +98,19 @@ var (
 	_ UserRepo           = (*userRepo)(nil)
 	_ SocialIdentityRepo = (*socialIdentityRepo)(nil)
 	_ PlanRepo           = (*planRepo)(nil)
+	_ PlanChangeLogRepo  = (*planChangeLogRepo)(nil)
 	_ AppRepo            = (*appRepo)(nil)
 	_ SubscriptionRepo   = (*subscriptionRepo)(nil)
 	_ SessionRepo        = (*sessionRepo)(nil)
 )
 
-func NewUserRepo(db *sqlx.DB) *userRepo                { return &userRepo{db: db} }
+func NewUserRepo(db *sqlx.DB) *userRepo                     { return &userRepo{db: db} }
 func NewSocialIdentityRepo(db *sqlx.DB) *socialIdentityRepo { return &socialIdentityRepo{db: db} }
-func NewPlanRepo(db *sqlx.DB) *planRepo                { return &planRepo{db: db} }
-func NewAppRepo(db *sqlx.DB) *appRepo                  { return &appRepo{db: db} }
+func NewPlanRepo(db *sqlx.DB) *planRepo                     { return &planRepo{db: db} }
+func NewPlanChangeLogRepo(db *sqlx.DB) PlanChangeLogRepo {
+	return &planChangeLogRepo{db: db}
+}
+func NewAppRepo(db *sqlx.DB) *appRepo                   { return &appRepo{db: db} }
 func NewSubscriptionRepo(db *sqlx.DB) *subscriptionRepo { return &subscriptionRepo{db: db} }
 func NewSessionRepo(db *sqlx.DB) *sessionRepo           { return &sessionRepo{db: db} }
 
@@ -273,6 +284,23 @@ func (r *planRepo) Delete(ctx context.Context, id string) error {
 	return err
 }
 
+func (r *planChangeLogRepo) Insert(ctx context.Context, planID, actorID, changeType string, before, after *model.Plan) error {
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		return err
+	}
+	afterJSON, err := json.Marshal(after)
+	if err != nil {
+		return err
+	}
+
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO plan_change_log (plan_id, actor_id, change_type, before, after)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+	`, planID, actorID, changeType, beforeJSON, afterJSON)
+	return err
+}
+
 // AppRepo implementation
 
 func (r *appRepo) Create(ctx context.Context, a *model.App) error {
@@ -292,7 +320,7 @@ func (r *appRepo) Create(ctx context.Context, a *model.App) error {
 // Two COALESCEs are needed because sqlx cannot scan a NULL column into the
 // corresponding Go type:
 //   - config → json.RawMessage (NULL would error). Coerce to '{}'.
-//   - secret_hash → string (NULL would error). Coerce to ''.
+//   - secret_hash → string (NULL would error). Coerce to ”.
 //
 // Pre-007 rows have secret_hash=NULL; without the COALESCE those rows would
 // fail to load. Keep both alias names (config, secret_hash) so the `db:"..."`

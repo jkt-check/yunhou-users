@@ -181,26 +181,38 @@ func (s *sqlxTx) QueryRowID(ctx context.Context, query string, args ...interface
 // CreateOrder mints an order row for a paid plan. The amount is a snapshot
 // of plan.price at creation time — plan price changes don't retroactively
 // affect in-flight orders.
+//
+// TOCTOU safety (D8): the plan eligibility check (active, accepting-new,
+// currency match) and the order INSERT must commit atomically with
+// respect to concurrent plan mutations. Without a lock, an operator
+// deactivating the plan between FindByID and the order INSERT could
+// leave an order pointing at a now-inactive plan. We wrap the check
+// + INSERT in a single transaction and lock the plan row with
+// FOR SHARE — concurrent FOR UPDATE / UPDATE / DELETE on the plan is
+// blocked until commit, but other FOR SHARE reads coexist (no deadlock
+// from concurrent payment attempts on the same plan).
+//
+// Order: subRepo active-sub check → eligibility tx. We check for an
+// already-active sub BEFORE acquiring any tx-scoped lock or persisting
+// an order row; otherwise a user with an active sub would receive an
+// orphan pending order that the sweeper eventually expires. The plan
+// eligibility lookup (FOR SHARE) only happens once we know the user is
+// allowed to create an order.
 func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channel string) (*model.Order, error) {
 	if err := validateChannel(channel); err != nil {
 		return nil, err
 	}
 
-	plan, err := s.planRepo.FindByID(ctx, planID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrPlanNotFound
-		}
-		return nil, fmt.Errorf("find plan: %w", err)
-	}
-	if !plan.IsActive {
-		return nil, ErrPlanInactive
-	}
-	if !plan.AcceptingNewSubscriptions {
-		return nil, ErrPlanNotAcceptingNew
-	}
-	if required, ok := channelRequiredCurrency[channel]; ok && plan.Currency != required {
-		return nil, ErrPlanCurrencyMismatch
+	// Channel-specific pre-auth gate (D1): some channels refuse to mint
+	// the pre-auth artifact (e.g. WeChat `code_url`) without a configured
+	// client. The check MUST run BEFORE orderRepo.Create — otherwise the
+	// order row is persisted as `pending`, then CreateOrder returns an
+	// error, and the caller is left staring at an orphan pending order
+	// until the sweeper expires it (ORDER_EXPIRY_DURATION, default 30m).
+	// Retries multiply the rows. New channels should extend
+	// providerPreAuth rather than inserting ad-hoc guards here.
+	if err := s.providerPreAuth(channel); err != nil {
+		return nil, err
 	}
 
 	// Enforce the partial unique index `UNIQUE(user_id) WHERE status='active'`
@@ -230,31 +242,18 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		return nil, fmt.Errorf("check active sub: %w", err)
 	}
 
-	order := &model.Order{
-		ID:        GenerateUUID(),
-		UserID:    userID,
-		PlanID:    planID,
-		Amount:    plan.Price,
-		Currency:  plan.Currency,
-		Status:    "pending",
-		ExpiresAt: time.Now().Add(s.orderExpiry),
-	}
-	if err := s.orderRepo.Create(ctx, order); err != nil {
-		return nil, fmt.Errorf("create order: %w", err)
+	var order *model.Order
+	err := s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, &order)
+	if err != nil {
+		return nil, err
 	}
 
-	// WeChat Pay NATIVE: mint code_url so the BFF can render a QR. Mock
-	// mode and non-WeChat channels do not need an upstream pre-auth call.
+	// WeChat Pay NATIVE: mint code_url so the BFF can render a QR. The
+	// providerPreAuth above already ensured s.wechat != nil when channel
+	// is wechat_pay, so this block is reached only on a WeChat-enabled
+	// deployment. Mock mode and non-WeChat channels do not need an
+	// upstream pre-auth call.
 	if channel == "wechat_pay" {
-		// nil wechat client + wechat_pay = deployment doesn't accept WeChat
-		// Pay. Surface a typed error so the handler returns 4xx instead of
-		// silently creating a pending order with no code_url.
-		if s.wechat == nil {
-			return nil, ErrWechatPayNotConfigured
-		}
-	}
-
-	if channel == "wechat_pay" && s.wechat != nil {
 		// Mock-mode UnifiedOrder returns a deterministic code_url
 		// synchronously (weixin://wxpay/bizpayurl?pr=mock_<OutTradeNo>);
 		// no HTTP. The previous `&& !s.wechat.IsMockMode()` guard
@@ -1753,6 +1752,139 @@ func validateChannel(channel string) error {
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidChannel, channel)
 	}
+}
+
+// providerPreAuth is the channel-specific configuration gate. A return
+// value other than nil means the deployment refuses to mint the pre-auth
+// artifact for the requested channel; CreateOrder must reject the
+// request BEFORE persisting the order row. Today the only check is the
+// WeChat Pay NATIVE pre-auth (wechat == nil ⇒ deployment has no client
+// to mint a code_url against). Adding a new channel means adding a new
+// branch here so the same "no orphan pending order" invariant holds.
+//
+// The function deliberately does not touch the database — the gate is
+// pure deployment configuration, so it can run before any plan/sub
+// lookups. Order matters only relative to validateChannel: an unknown
+// channel is already rejected there.
+func (s *PaymentService) providerPreAuth(channel string) error {
+	if channel == "wechat_pay" {
+		if s.wechat == nil {
+			return ErrWechatPayNotConfigured
+		}
+	}
+	// Other channels either don't need an upstream pre-auth (stripe uses
+	// Elements + intent, alipay uses the page-redirect pattern) or wire
+	// their client unconditionally. Add a new branch here when that
+	// changes.
+	return nil
+}
+
+// eligibilityAndInsertOrderTx runs the plan eligibility check
+// (existence, is_active, accepting_new_subscriptions, currency match)
+// AND the order INSERT inside a single transaction. The plan row is
+// locked with FOR SHARE for the duration of the tx so a concurrent
+// plan deactivation can't race past the check and leave an order
+// pointing at an inactive plan. Order is left at "pending" and the
+// caller (CreateOrder) drives the post-commit pre-auth (WeChat
+// UnifiedOrder) outside the tx; pre-auth is an external HTTP call and
+// must NOT run inside an open tx.
+//
+// On any returned error no order row exists (the tx rolled back).
+//
+// When s.db is nil — unit tests pass nil since they exercise the
+// eligibility branches without a real DB — this falls back to the
+// pre-D8 path: FindByID + INSERT outside any tx. The TOCTOU race
+// this leaves open only matters in production where a real DB is
+// threaded; the D8 race tests run against a real test DB.
+func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel string, out **model.Order) error {
+	if s.db == nil {
+		return s.eligibilityAndInsertNoTx(ctx, userID, planID, channel, out)
+	}
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // safe after Commit
+
+	plan, err := s.planRepo.FindByIDForShareTx(ctx, tx, planID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrPlanNotFound
+		}
+		return fmt.Errorf("lock plan: %w", err)
+	}
+	if !plan.IsActive {
+		return ErrPlanInactive
+	}
+	if !plan.AcceptingNewSubscriptions {
+		return ErrPlanNotAcceptingNew
+	}
+	if required, ok := channelRequiredCurrency[channel]; ok && plan.Currency != required {
+		return ErrPlanCurrencyMismatch
+	}
+
+	order := &model.Order{
+		ID:        GenerateUUID(),
+		UserID:    userID,
+		PlanID:    planID,
+		Amount:    plan.Price,
+		Currency:  plan.Currency,
+		Status:    "pending",
+		ExpiresAt: time.Now().Add(s.orderExpiry),
+	}
+	if err := s.orderRepo.CreateInTx(ctx, tx, order); err != nil {
+		return fmt.Errorf("create order: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit eligibility tx: %w", err)
+	}
+	*out = order
+	return nil
+}
+
+// eligibilityAndInsertNoTx is the unit-test fallback for
+// eligibilityAndInsertOrderTx. It still calls FindByIDForShareTx (the
+// lock-step lookup) — even though the FOR SHARE doesn't take effect
+// without a real tx — so unit tests that overwrite the lock-step plan
+// via stubPlanRepo.findByIDForShareTxFn drive the same code path
+// production would. The fallback only exists because unit tests pass
+// s.db == nil; production always threads a real DB.
+func (s *PaymentService) eligibilityAndInsertNoTx(ctx context.Context, userID, planID, channel string, out **model.Order) error {
+	// Use the lock-step lookup (passes nil tx; the production path
+	// would pass a real tx so FOR SHARE takes effect). Tests that want
+	// to model "plan-state changed between FindByID and the lock"
+	// override findByIDForShareTxFn on the stub plan repo to fire the
+	// post-lock truth.
+	plan, err := s.planRepo.FindByIDForShareTx(ctx, nil, planID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrPlanNotFound
+		}
+		return fmt.Errorf("find plan: %w", err)
+	}
+	if !plan.IsActive {
+		return ErrPlanInactive
+	}
+	if !plan.AcceptingNewSubscriptions {
+		return ErrPlanNotAcceptingNew
+	}
+	if required, ok := channelRequiredCurrency[channel]; ok && plan.Currency != required {
+		return ErrPlanCurrencyMismatch
+	}
+	order := &model.Order{
+		ID:        GenerateUUID(),
+		UserID:    userID,
+		PlanID:    planID,
+		Amount:    plan.Price,
+		Currency:  plan.Currency,
+		Status:    "pending",
+		ExpiresAt: time.Now().Add(s.orderExpiry),
+	}
+	if err := s.orderRepo.Create(ctx, order); err != nil {
+		return fmt.Errorf("create order: %w", err)
+	}
+	*out = order
+	return nil
 }
 
 // TODO: refactor to per-channel predicate maps at 5+ channels — the flat

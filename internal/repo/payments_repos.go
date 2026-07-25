@@ -46,6 +46,13 @@ type OrderRepo interface {
 	// that a seq scan is fine; if hot path, add a GIN index on
 	// (provider_intent->>'out_trade_no') later.
 	FindByProviderOutTradeNo(ctx context.Context, outTradeNo string) (*model.Order, error)
+
+	// CreateInTx performs the same INSERT as Create, but inside the
+	// caller-managed *sqlx.Tx. Used by PaymentService.CreateOrder to make
+	// the order INSERT part of the same transaction that locks the plan
+	// row with FOR SHARE — preventing the TOCTOU where a plan is
+	// deactivated between the eligibility check and the INSERT.
+	CreateInTx(ctx context.Context, tx *sqlx.Tx, o *model.Order) error
 }
 
 type orderRepo struct{ db *sqlx.DB }
@@ -62,6 +69,19 @@ func (r *orderRepo) Create(ctx context.Context, o *model.Order) error {
 	// the wire; passing a raw []byte would have Postgres reject '' with
 	// SQLSTATE 22P02.
 	_, err := r.db.NamedExecContext(ctx, `
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
+		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent)
+	`, flattenOrderForInsert(o))
+	return err
+}
+
+// CreateInTx mirrors Create but executes against the caller-managed
+// *sqlx.Tx. Used by PaymentService.CreateOrder to keep the order INSERT
+// and the plan-row FOR SHARE lock in a single transaction; otherwise a
+// concurrent plan deactivation could race past the eligibility check and
+// leave an order pointing at a now-inactive plan.
+func (r *orderRepo) CreateInTx(ctx context.Context, tx *sqlx.Tx, o *model.Order) error {
+	_, err := tx.NamedExecContext(ctx, `
 		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
 		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent)
 	`, flattenOrderForInsert(o))

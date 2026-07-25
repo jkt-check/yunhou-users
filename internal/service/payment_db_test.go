@@ -1733,9 +1733,11 @@ func TestPaymentService_OnWebhook_BadCurrency(t *testing.T) {
 
 // TestPaymentService_CreateOrder_GenericError covers the wrap paths
 // in CreateOrder that aren't covered by the "plan not found" / "plan
-// inactive" / "user has active sub" tests. A generic planRepo error
-// should be wrapped with "find plan:", and a generic subRepo error
-// should be wrapped with "check active sub:".
+// inactive" / "user has active sub" tests. After D8 the subRepo
+// active-sub check runs before the eligibility tx, so a closed DB now
+// surfaces as "check active sub" (subRepo is the first DB-backed
+// call). The planRepo wrap path is exercised in payment_db_test.go's
+// real-DB CreateOrder tests where the plan lookup runs inside a tx.
 func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 	t.Run("planRepo generic error", func(t *testing.T) {
 		db := setupPaymentDB(t)
@@ -1753,8 +1755,12 @@ func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error from closed db, got nil")
 		}
-		if !strings.Contains(err.Error(), "find plan") {
-			t.Errorf("expected wrap 'find plan', got %q", err.Error())
+		// SubRepo active-sub check runs first now (see CreateOrder doc),
+		// so a closed DB surfaces as "check active sub". Plan eligibility
+		// (FOR SHARE on plans) is exercised separately in the real-DB
+		// TestPaymentService_CreateOrder_PlanDeactivatedDuringTx.
+		if !strings.Contains(err.Error(), "check active sub") {
+			t.Errorf("expected wrap 'check active sub', got %q", err.Error())
 		}
 	})
 }

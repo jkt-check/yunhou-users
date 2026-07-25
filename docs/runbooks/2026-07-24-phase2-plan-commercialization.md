@@ -433,27 +433,43 @@ docker compose ps
 docker compose logs --since=30m app \
   | grep -Ei 'panic|fatal|error|status=(400|409|500|503)' || true
 
-# Confirm new plan_archive audit rows for free landed
+# Confirm new plan_archive audit rows for free landed and the
+# plan_change_log distribution is healthy. plan_change_log records
+# Plan mutations only - it does NOT record token issuance. For
+# "no free tokens issued" verification, see the JWT-decode / token-
+# issuance metrics query below.
 psql "$STAGING_DATABASE_URL" -v ON_ERROR_STOP=1 -P pager=off <<'SQL'
+-- Confirm new plan_archive audit rows for free landed (expect >= 1
+-- from the migration's UPDATE on free).
 SELECT plan_id, actor_id, change_type, changed_at
   FROM plan_change_log
  WHERE plan_id = 'free' AND change_type = 'plan_archive'
  ORDER BY changed_at DESC
  LIMIT 10;
-SQL
 
-# Confirm plan_change_log distribution is healthy
+-- Confirm plan_change_log distribution is healthy.
 SELECT change_type, COUNT(*)
   FROM plan_change_log
  WHERE changed_at >= now() - interval '24 hours'
  GROUP BY change_type
  ORDER BY change_type;
+SQL
 
-# Confirm no 'free' tokens are being issued (decoded JWT audit)
-SELECT count(*)
-  FROM plan_change_log
- WHERE plan_id = 'free' AND changed_at >= now() - interval '24 hours';
--- expected: at least 1 plan_archive row (the migration's UPDATE)
+# Confirm no 'free' tokens are being issued. plan_change_log does not
+# track token issuance - use the auth service's token-issuance metrics
+# or decode the most recent access tokens issued on /auth/{github,
+# wechat}/callback and /auth/refresh and confirm the JWT 'scope'
+# claim is [] for users whose most recent audit row references
+# plan_id='free' (or who have no subscription at all). The query
+# below returns the candidate user_id set to scan; the actual JWT
+# inspection is done via the public key + a one-off decoder.
+psql "$STAGING_DATABASE_URL" -v ON_ERROR_STOP=1 -P pager=off <<'SQL'
+SELECT s.user_id, s.plan_id, s.expires_at
+  FROM subscriptions s
+ WHERE s.plan_id = 'free'
+ ORDER BY s.expires_at DESC NULLS LAST
+ LIMIT 25;
+SQL
 ```
 
 Record smoke-test outputs, monitoring links, operator, release SHA, and the go/no-go decision in the deployment ticket.

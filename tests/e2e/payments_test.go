@@ -241,7 +241,8 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 	token := loginAndGetTokens(t, srv.Engine, "refund-sum", "yundian").AccessToken
 
-	// Setup: paid payment of 29.90
+	// Setup: paid payment of 19.90 (migration 016 sets monthly.price=19.9;
+	// was 29.9 before).
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
@@ -259,16 +260,16 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
 
-	// First refund of 25 — OK.
-	refund1 := fmt.Sprintf(`{"payment_id":%q,"amount":25.0}`, paymentID)
+	// First refund of 10 — OK (< payment 19.90).
+	refund1 := fmt.Sprintf(`{"payment_id":%q,"amount":10.0}`, paymentID)
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1,
 		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-1-key-1"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first refund: %d %s", resp.StatusCode, string(resp.Body))
 	}
 
-	// Second refund of 10 — would push total to 35, exceeding 29.90. Must fail.
-	refund2 := fmt.Sprintf(`{"payment_id":%q,"amount":10.0}`, paymentID)
+	// Second refund of 12 — would push total to 22, exceeding 19.90. Must fail.
+	refund2 := fmt.Sprintf(`{"payment_id":%q,"amount":12.0}`, paymentID)
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund2,
 		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-2-key-2"})
 	if resp.StatusCode != http.StatusBadRequest {

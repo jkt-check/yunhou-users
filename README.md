@@ -139,7 +139,7 @@ All configuration is via environment variables (or `.env` file):
 
 - `GET /apps/:id/plans` — **public**, no header, no JWT.
 - `POST /apps/:id/quote` — **JWT Bearer**. The quote is computed per-user (JWT identifies `user_id`); mounted at the engine level so it does not collide with the `X-App-ID` wrapper around the other `/apps/:id/*` routes.
-- `GET /apps/:id/provider-token/:channel` and every `/admin/*` route — **internal service auth** (`X-App-ID` + `X-App-Secret` headers). BFF calls these with its own service credentials; never expose to end users. `X-App-Secret` is the bcrypt-hashed value returned once by `POST /admin/apps` or `POST /admin/apps/:id/rotate-secret` — losing it requires a rotation.
+- `GET /apps/:id/provider-token/:channel` and every `/admin/*` route — **internal service auth** (`X-App-ID` + `X-App-Secret` headers). BFF calls these with its own service credentials; never expose to end users. `X-App-Secret` is the shared secret — returned in plaintext once at creation/rotation time; the database stores only its bcrypt hash. Losing it requires a rotation.
 
 User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 

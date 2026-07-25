@@ -32,7 +32,7 @@
 | `internal/model/plan.go` | 1 | Add 7 fields; remove `IsDefault` in Phase 2; expand `PublicPlan` |
 | `internal/service/auth.go` (SubscriptionInfo struct) | 1 | Add `IsAcceptingNew` field |
 | `internal/repo/repo.go` | 1 | PlanRepo Create/Update new columns; FindByApp ORDER BY |
-| `internal/service/plan.go` | 1+2 | ValidateApps; audit log; Create/Update/Delete with new fields; FindDefault deprecated |
+| `internal/service/plan.go` | 1+2 | ValidateApps; audit log; Create/Update/Delete with new fields; FindDefault removed entirely (T20) |
 | `internal/service/subscription.go` | 1 | Create — accepting_new_subscriptions guard |
 | `internal/service/payment.go` | 1 | CreateOrder — accepting_new_subscriptions + currency mismatch guard; plan.Currency source |
 | `internal/service/auth.go` | 2 | resolvePlanForTokenIssuance rewrite (no default fallback) |

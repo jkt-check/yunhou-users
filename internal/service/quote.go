@@ -83,8 +83,14 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 	subExpires := time.Now().Add(time.Duration(cycle.TrialDays+cycle.BillingCycleDays) * 24 * time.Hour)
 
 	return &model.Quote{
-		PlanID:       plan.ID,
-		Amount:       plan.Price,
+		PlanID: plan.ID,
+		// ApplyPlanAmountOverride lets dev/staging drive payment flows
+		// at "fake" amounts (e.g. ¥0.01 / ¥0.10) without a per-stage
+		// migration. Defaults to plan.Price verbatim when
+		// PLAN_AMOUNT_OVERRIDE_JSON is unset. See
+		// internal/service/price_override.go for the override contract
+		// (parse-at-boot, malformed-env = log-and-noop).
+		Amount:       ApplyPlanAmountOverride(plan.ID, plan.Price),
 		Currency:     plan.Currency,
 		SubExpiresAt: subExpires,
 		CycleConfig:  cycle,

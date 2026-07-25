@@ -256,3 +256,67 @@ func TestQuote_Get_GenericPlanFindError(t *testing.T) {
 		t.Errorf("expected wrap 'find plan', got %q", err.Error())
 	}
 }
+
+// TestQuote_Get_AmountOverride — when PLAN_AMOUNT_OVERRIDE_JSON lists
+// the requested plan_id, Quote.Amount reflects the override and
+// Quote.Currency / PlanID / Cycle stay untouched. After the test
+// ReloadOverrideFromEnv() restores the empty default so other tests in
+// the same package process don't see a stale override.
+//
+// This is the integration seam used by cn-staging to drive ¥0.01/¥0.10
+// payments without a per-stage migration — see
+// internal/service/price_override.go for the env contract.
+func TestQuote_Get_AmountOverride(t *testing.T) {
+	withOverrideEnv(t, `{"monthly":0.01,"yearly":0.1}`)
+
+	plan := &model.Plan{
+		ID: "monthly", Name: "Monthly", Price: 19.9, IntervalDays: 30,
+		Currency: "CNY", TrialDays: 0,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+	}
+	app := &model.App{
+		AppID: "yundian", Name: "Yundian", IsActive: true,
+		Config: json.RawMessage(`{}`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "user-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.Amount != 0.01 {
+		t.Errorf("quote.Amount = %v; want 0.01 (override)", quote.Amount)
+	}
+	if quote.Currency != "CNY" {
+		t.Errorf("quote.Currency = %v; want CNY (override must not change currency)", quote.Currency)
+	}
+	if quote.PlanID != "monthly" {
+		t.Errorf("quote.PlanID = %v; want monthly", quote.PlanID)
+	}
+	if quote.CycleConfig.BillingCycleDays != 30 {
+		t.Errorf("quote.CycleConfig.BillingCycleDays = %v; want 30 (override only touches amount)", quote.CycleConfig.BillingCycleDays)
+	}
+}
+
+// TestQuote_Get_AmountOverride_NoFallback — plans that aren't in the
+// override map (e.g. free, quarterly, or any future plan we forgot to
+// add) keep their canonical plans.price. See the matching guard in
+// ApplyPlanAmountOverride — this locks in the fall-through contract.
+func TestQuote_Get_AmountOverride_NoFallback(t *testing.T) {
+	withOverrideEnv(t, `{"monthly":0.01}`)
+
+	plan := &model.Plan{
+		ID: "yearly", Name: "Yearly", Price: 199.9, IntervalDays: 365,
+		Currency: "CNY", Apps: pq.StringArray{"yundian"}, IsActive: true,
+	}
+	app := &model.App{AppID: "yundian", IsActive: true, Config: json.RawMessage(`{}`)}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"yearly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "yearly", "user-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.Amount != 199.9 {
+		t.Errorf("quote.Amount = %v; want 199.9 (yearly not in override map)", quote.Amount)
+	}
+}

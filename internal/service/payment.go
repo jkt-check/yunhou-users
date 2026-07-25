@@ -1821,10 +1821,17 @@ func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID
 		}
 
 		order = &model.Order{
-			ID:        GenerateUUID(),
-			UserID:    userID,
-			PlanID:    planID,
-			Amount:    plan.Price,
+			ID:     GenerateUUID(),
+			UserID: userID,
+			PlanID: planID,
+			// ApplyPlanAmountOverride mirrors the QuoteService.Get
+			// override (price_override.go). The order row is the
+			// authoritative source for the WeChat UnifiedOrder amount
+			// fan-out — overriding only in QuoteService would leave
+			// the actual charge still at the DB price, defeating the
+			// test-mode intent. The override is per-plan-id, currency
+			// preserved from plans.currency.
+			Amount:    ApplyPlanAmountOverride(planID, plan.Price),
 			Currency:  plan.Currency,
 			Status:    "pending",
 			ExpiresAt: time.Now().Add(s.orderExpiry),

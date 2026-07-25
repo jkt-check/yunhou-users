@@ -103,6 +103,17 @@ type Config struct {
 	OrderExpiryDuration time.Duration
 	// Sweeper interval: how often the in-process goroutine runs. Default 1 min.
 	SweeperInterval time.Duration
+
+	// PlanAmountOverrideJSON is the (plan_id → amount-yuan) override map
+	// parsed once at boot by internal/service/price_override.go. When
+	// non-empty, QuoteService.Get() and PaymentService.CreateOrder()
+	// replace plans.price with the override value at runtime — letting
+	// dev/staging environments drive payment flows at "fake" amounts
+	// without dirtying the canonical plans row or writing a per-stage
+	// migration. Empty by default; format `{"monthly":0.01,"yearly":0.1}`.
+	// Surface here only so operators see it in the loaded-config log;
+	// the value itself is read by service.ReloadOverrideFromEnv().
+	PlanAmountOverrideJSON string
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -140,6 +151,8 @@ func Load() *Config {
 
 		OrderExpiryDuration: parseDurationOr(envOr("ORDER_EXPIRY_DURATION", "30m"), 30*time.Minute),
 		SweeperInterval:     parseDurationOr(envOr("SWEEPER_INTERVAL", "1m"), 1*time.Minute),
+
+		PlanAmountOverrideJSON: os.Getenv("PLAN_AMOUNT_OVERRIDE_JSON"),
 	}
 }
 

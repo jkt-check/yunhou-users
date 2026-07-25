@@ -150,6 +150,75 @@ func TestPaymentService_CreateOrder_ReadsCurrencyFromPlan(t *testing.T) {
 	}
 }
 
+// TestPaymentService_CreateOrder_AmountOverride — verifies that the
+// runtime override is applied at the order row (the canonical amount
+// the WeChat UnifiedOrder fan-out reads). Without this hook, a
+// server-side override that only updated QuoteService.Get() would
+// leave the actual WeChat charge at the DB price — which is the bug
+// the cn-staging ¥0.01 / ¥0.10 test scenario exists to surface. The
+// test sets + clears the env so it doesn't bleed into other suite cases.
+//
+// Channel note: we use paypal+USD here because the cn-staging target
+// (wechat_pay+CNY) requires a wired WeChat client that CreateOrder's
+// test helper deliberately doesn't construct (see the comment on
+// newPaymentServiceForCreateOrderPlanTest). The override hook itself
+// is channel-agnostic — it's applied at the eligibility-tx order
+// insertion, before channel-specific pre-auth fans out.
+func TestPaymentService_CreateOrder_AmountOverride(t *testing.T) {
+	withOverrideEnv(t, `{"monthly":0.01,"yearly":0.1}`)
+
+	svc, orderRepo := newPaymentServiceForCreateOrderPlanTest(&model.Plan{
+		ID:                        "monthly",
+		Price:                     19.9, // canonical DB price — override wins
+		IsActive:                  true,
+		AcceptingNewSubscriptions: true,
+		Currency:                  "USD",
+	})
+	order, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if order.Amount != 0.01 {
+		t.Fatalf("order.Amount = %v, want 0.01 (override applied to order snapshot)", order.Amount)
+	}
+	if order.Currency != "USD" {
+		t.Fatalf("order.Currency = %q, want USD (override must not change currency)", order.Currency)
+	}
+	if orderRepo.created == nil {
+		t.Fatal("order repository did not receive an order")
+	}
+	if orderRepo.created.Amount != 0.01 {
+		t.Fatalf("persisted order.Amount = %v, want 0.01", orderRepo.created.Amount)
+	}
+}
+
+// TestPaymentService_CreateOrder_AmountOverride_NoFallback — plans not
+// in the override map (e.g. quarterly) keep the canonical DB price.
+// Adding a new plan in the future must NOT silently inherit a 0.01
+// charge just because cn-staging has the override set — that's a billing
+// correctness regression, so we lock the fall-through contract here.
+func TestPaymentService_CreateOrder_AmountOverride_NoFallback(t *testing.T) {
+	withOverrideEnv(t, `{"monthly":0.01}`)
+
+	svc, orderRepo := newPaymentServiceForCreateOrderPlanTest(&model.Plan{
+		ID:                        "yearly",
+		Price:                     199.9,
+		IsActive:                  true,
+		AcceptingNewSubscriptions: true,
+		Currency:                  "USD",
+	})
+	order, err := svc.CreateOrder(context.Background(), "user-1", "yearly", "paypal")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if order.Amount != 199.9 {
+		t.Fatalf("order.Amount = %v, want 199.9 (yearly not in override map)", order.Amount)
+	}
+	if orderRepo.created == nil || orderRepo.created.Amount != 199.9 {
+		t.Fatalf("persisted order.Amount = %v, want 199.9", orderRepo.created.Amount)
+	}
+}
+
 // ============================================================================
 // validateChannel
 // ============================================================================

@@ -190,8 +190,8 @@ curl https://your-yunhou-domain/user/profile \
 | 401 | `user is suspended` / `user is deleted` | 用户账号被停用或已删除 |
 | 401 | `user not found` | refresh token 对应的 user 行已被删除（理论不应发生；防御性兜底） |
 | 401 | `app not found` / `app is inactive` | 解析得到的 `app_id` 不存在或已停用 |
-| 401 | `subscription expired` | 用户有订阅但 `expires_at` 已过 |
-| 401 | `subscription not active` | 用户订阅已被 sweeper 翻成非 active（如 cancelled/expired 状态，但 `expires_at` 字段还没推进） |
+
+> **Expired / non-active subscriptions are NOT an error.** `POST /auth/refresh` is decoupled from subscription state (login/subscription decouple, Phase 1+). A user with an expired subscription, no subscription, or a subscription that has been swept to `cancelled`/`expired` still receives a fresh token pair. The new JWT carries `scope=[]` and the response's `subscription.has_access=false`; `subscription.plan_id` is preserved as the historical plan id (null only when there has never been a subscription) so the BFF can render the renewal CTA. Operators must read `subscription.has_access` (not the HTTP status) to decide whether to show protected UI.
 
 #### POST /auth/logout
 

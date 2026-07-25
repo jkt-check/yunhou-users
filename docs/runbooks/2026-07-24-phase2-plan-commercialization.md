@@ -367,6 +367,11 @@ HTTP_STATUS="$(curl -sS -o "$TMP_DIR/active.json" -w '%{http_code}' \
   --data-binary @"$TMP_DIR/active-login-request.json")"
 test "$HTTP_STATUS" = "200"
 
+# Capture the active smoke user id so cleanup can delete it (Finding 10 fix).
+ACTIVE_USER_ID="$(jq -er '.data.user.id' "$TMP_DIR/active.json")"
+ACTIVE_REFRESH_TOKEN="$(jq -er '.data.refresh_token' "$TMP_DIR/active.json")"
+export ACTIVE_USER_ID ACTIVE_REFRESH_TOKEN
+
 jq -e '
   .code == 0
   and .data.subscription.plan_id == "monthly"
@@ -377,18 +382,21 @@ jq -e '
 
 ### Smoke-test cleanup
 
-The `/test/login` fixture users and their seeded subscriptions are removed with the same pattern as Phase 1. Remove the dedicated smoke rows before tearing down.
+The `/test/login` fixture users and their seeded subscriptions are removed with the same pattern as Phase 1. Remove the dedicated smoke rows before tearing down. The active user from step 6 must be deleted alongside the no-sub and expired-sub users; without this the active smoke user + its session row leak across deploys.
 
 ```bash
 psql "$STAGING_DATABASE_URL" -v ON_ERROR_STOP=1 \
   -v smoke_user_id="$SMOKE_USER_ID" \
-  -v expired_user_id="$EXPIRED_USER_ID" <<'SQL'
-DELETE FROM subscriptions WHERE user_id IN (:'smoke_user_id', :'expired_user_id');
-DELETE FROM users        WHERE id     IN (:'smoke_user_id', :'expired_user_id');
+  -v expired_user_id="$EXPIRED_USER_ID" \
+  -v active_user_id="$ACTIVE_USER_ID" <<'SQL'
+DELETE FROM refresh_sessions WHERE user_id IN (:'smoke_user_id', :'expired_user_id', :'active_user_id');
+DELETE FROM subscriptions    WHERE user_id IN (:'smoke_user_id', :'expired_user_id', :'active_user_id');
+DELETE FROM users            WHERE id     IN (:'smoke_user_id', :'expired_user_id', :'active_user_id');
 SQL
 
 rm -rf "$TMP_DIR"
-unset APP_SECRET REFRESH_TOKEN SMOKE_USER_ID EXPIRED_REFRESH_TOKEN EXPIRED_USER_ID
+unset APP_SECRET REFRESH_TOKEN SMOKE_USER_ID EXPIRED_REFRESH_TOKEN EXPIRED_USER_ID \
+      ACTIVE_USER_ID ACTIVE_REFRESH_TOKEN
 ```
 
 ## Rollback

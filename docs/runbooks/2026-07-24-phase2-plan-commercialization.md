@@ -9,7 +9,7 @@ Phase 2 retires the default-plan concept and the legacy `free` plan. It is a **b
 
 The migration drops the `is_default` column. The Phase 2 service code no longer references `model.Plan.IsDefault`. Deploying either piece without the other is a build failure (column-drop side) or a deprecated-call leftover (code-only side) — both block promotion. **Coordinated deploy required.**
 
-Phase 2 is fully backwards-compatible at the **wire shape** level (existing JWT consumers keep working), but **changes the semantics of unauthenticated-equivalent login**: a brand-new OAuth login no longer receives a default-plan fallback. BFF consumers must already understand `subscription.has_access=false` (it is the Phase 1 steady state for unauthenticated-equivalent users).
+Phase 2 is fully backwards-compatible at the **wire shape** level (existing JWT consumers keep working), but **changes the semantics of unauthenticated-equivalent login**: a brand-new OAuth login no longer receives a default-plan fallback. BFF consumers must already understand `subscription.has_access=false` — this is the new Phase 2 steady state for unauthenticated-equivalent users, and is **different** from Phase 1 (where the default-plan fallback still issued `plan_id="free"` and `has_access=true`). Operators must coordinate any BFF promotion that depends on `has_access=false` with this Phase 2 deploy; do not assume Phase 1 has already flipped the field.
 
 Run staging first. Do not promote to production until every required release gate passes or the release owner explicitly resolves the failures in [Known issues](#known-issues).
 
@@ -464,7 +464,7 @@ Record smoke-test outputs, monitoring links, operator, release SHA, and the go/n
 
 2. **Quarterly existing subscribers hit `accepting_new=false` on new self-subscribe.** This is by design — `SubscriptionService.Create` rejects non-accepting-new plans, but `SubscriptionService.Renew` does **not** check `accepting_new_subscriptions` (only `plan.IsActive`). Quarterly renews keep working.
 
-3. **BFF must already understand `subscription.has_access=false` for unauthenticated-equivalent users.** This is a Phase 1 steady state; if a BFF deployment is in flight that still assumes a default plan, that BFF promotion should land before Phase 2.
+3. **BFF must already understand `subscription.has_access=false` for unauthenticated-equivalent users.** This is a **new** Phase 2 steady state, not a Phase 1 one — under Phase 1 the default-plan fallback still issued `plan_id="free"` and `has_access=true`. If a BFF deployment is in flight that still assumes a default plan, that BFF promotion should land alongside (not before) Phase 2.
 
 4. **`free` historical subscriptions with `status IN ('cancelled','expired')` are not blocked by the pre-check.** The migration only blocks `status='active'`. Cancelled and expired rows still reference `plan_id='free'` and the row is kept in place so the FK resolves. A future `migrations/016_hard_delete_free.sql` is needed to clean those up; tracked in the design spec §12 follow-ups. (013 and 015 were added during code review between 012 and the switch, so the originally-planned 014_hard_delete_free slot is now occupied by the `is_default` removal.)
 

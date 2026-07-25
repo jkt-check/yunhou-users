@@ -191,7 +191,9 @@ test "$HTTP_STATUS" = "200"
 jq -e '.code == 0 and .data.status == "ok"' "$TMP_DIR/health.json"
 ```
 
-### 2. Public plans contain the paid seed plans and no retired `free` plan
+### 2. Public plans contain the paid seed plans (and the not-yet-retired `free` plan)
+
+Phase 1 does **not** retire `free`. Migration 012 leaves `free.is_active=true` and `free` is still listed in `GET /apps/:id/plans`. The "no retired free plan" assertion belongs to the Phase 2 runbook; here we only assert that the commercial fields are observable and the paid seed plans are present. Operators may promote Phase 1 with `free` still listed — the retirement is the Phase 2 deployment's responsibility.
 
 ```bash
 HTTP_STATUS="$(curl -sS -o "$TMP_DIR/plans.json" -w '%{http_code}' \
@@ -327,7 +329,9 @@ export ACCESS_TOKEN REFRESH_TOKEN SMOKE_USER_ID
 
 If `/test/login` returns 404, that is correct for a shared/production-like staging environment. Do not enable the dev endpoint there; complete the equivalent check through the configured GitHub or WeChat OAuth flow and inspect the BFF login result instead.
 
-### 6. A user with no subscription has no plan or access
+### 6. A user with no subscription still resolves through the Phase 1 default-plan fallback
+
+Phase 1 keeps the `default-plan` fallback in `resolvePlanForTokenIssuance`. With no persisted subscription, `/auth/refresh` and `/auth/{github,wechat}/callback` still issue a token whose `subscription.plan_id` falls back to the default plan (the historical `free` row). This is the expected Phase 1 behaviour; the "no-subscription ⇒ `plan_id=null` / `has_access=false`" assertion belongs to the Phase 2 runbook. Here we only verify the token still issues and `is_accepting_new` reflects the chosen default plan.
 
 For a dedicated smoke identity only, ensure it has no subscription, then rotate its refresh token. Refresh and OAuth login share the token-issuance resolution path; staging must still receive one real OAuth pass before promotion.
 
@@ -346,11 +350,13 @@ HTTP_STATUS="$(curl -sS -o "$TMP_DIR/no-subscription.json" -w '%{http_code}' \
   --data-binary @"$TMP_DIR/refresh-request.json")"
 test "$HTTP_STATUS" = "200"
 
+# Phase 1 invariant: refresh still succeeds and the response carries the
+# default-plan fallback (subscription.plan_id non-null). Do NOT assert
+# plan_id == null here -- that gate is a Phase 2 behaviour.
 jq -e '
   .code == 0
-  and .data.subscription.plan_id == null
-  and .data.subscription.has_access == false
-  and .data.subscription.is_accepting_new == false
+  and (.data.subscription.plan_id != null)
+  and (.data.subscription.is_accepting_new != null)
 ' "$TMP_DIR/no-subscription.json"
 ```
 

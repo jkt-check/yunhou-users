@@ -61,3 +61,4 @@ syntax, **not** transaction control — those are fine.
 | `008_drop_lemonsqueezy.sql` | removes lemonsqueezy from channel CHECK (LS code was removed in d8f333d) |
 | `009_wechat_pay_intent.sql` | adds orders.provider_intent JSONB for wechat_pay pre-auth metadata |
 | `010_provider_intent_nullable.sql` | change provider_intent default from `'{}'` to NULL so omitempty works |
+| `015_plan_change_log_nullable_snapshots.sql` | plan_change_log.before / .after become nullable so CreatePlan (`before=NULL`) and DeletePlan (`after=NULL`) can write audit rows (spec §6.1) |

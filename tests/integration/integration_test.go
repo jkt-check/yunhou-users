@@ -74,8 +74,8 @@ func setupDB(t *testing.T) *sqlx.DB {
 		acceptingNew       bool
 		displayOrder       int
 	}{
-		{"free", "免费", "CNY", 0, 0, "{yundian}", 0, "免费版（已下线）", true, false, 0},
-		{"monthly", "按月订阅", "CNY", 29.9, 30, "{yundian,yundash}", 0, "按月订阅 ¥29.9，自动续费，可随时取消", true, true, 10},
+		{"free", "免费", "CNY", 0, 0, "{yundian}", 0, "免费版（已下线）", false, false, 0},
+		{"monthly", "按月订阅", "CNY", 19.9, 30, "{yundian,yundash}", 0, "按月订阅 ¥19.9，自动续费，可随时取消", true, true, 10},
 		{"test_free", "Integration Free", "CNY", 0, 0, "{yundian}", 0, "Free integration fixture", false, true, 0},
 	}
 	for _, p := range plans {

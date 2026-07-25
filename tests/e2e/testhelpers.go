@@ -90,8 +90,12 @@ func connectDB(t *testing.T) *sqlx.DB {
 
 func cleanupDB(t *testing.T, db *sqlx.DB) {
 	t.Helper()
-	// Order matters: child tables first.
+	// Order matters: child tables first. plan_change_log is listed
+	// explicitly (spec §10.3); the plan_id FK is ON DELETE SET NULL
+	// in migration 013, so plan_change_log is independent of the
+	// plans delete and its order relative to "plans" does not matter.
 	tables := []string{
+		"plan_change_log",
 		"refunds",
 		"payments",
 		"webhook_events",

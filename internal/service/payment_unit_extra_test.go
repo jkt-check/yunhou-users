@@ -44,6 +44,14 @@ func (s *stubOrderRepoLookup) Create(_ context.Context, order *model.Order) erro
 	s.created = order
 	return s.createErr
 }
+
+// CreateInTx mirrors Create but accepts a *sqlx.Tx (ignored by the mock
+// — the mock doesn't model transaction rollback semantics, but the call
+// site treats it like Create to keep the D8 happy-path observable).
+func (s *stubOrderRepoLookup) CreateInTx(_ context.Context, _ *sqlx.Tx, order *model.Order) error {
+	s.created = order
+	return s.createErr
+}
 func (s *stubOrderRepoLookup) FindByID(_ context.Context, id string) (*model.Order, error) {
 	if s.findErr != nil {
 		return nil, s.findErr
@@ -177,6 +185,16 @@ func newPaymentServiceForLookup(orderRepo repo.OrderRepo, paymentRepo repo.Payme
 type stubPlanRepo struct {
 	plan *model.Plan
 	err  error
+	// findByIDForShareTxFn / findByIDForShareTxErr parallel FindByID but
+	// are scoped to the D8 eligibility-tx lock step, letting tests force
+	// a different return (e.g. plan-active-at-FindByID but inactive-at-
+	// lock) without depending on call ordering.
+	findByIDForShareTxFn   func(ctx context.Context, tx *sqlx.Tx, id string) (*model.Plan, error)
+	findByIDForShareTxErr  error
+	findByIDForShareTxPlan *model.Plan
+	// withTxFn lets the PlanService.CreatePlan/UpdatePlan tests inject
+	// custom tx-scoped error sequences (D8 part 2).
+	withTxFn func(ctx context.Context, fn func(*sqlx.Tx) error) error
 }
 
 func (s *stubPlanRepo) FindAll(_ context.Context) ([]model.Plan, error) { return nil, nil }
@@ -193,6 +211,38 @@ func (s *stubPlanRepo) FindByApp(_ context.Context, _ string) ([]model.Plan, err
 func (s *stubPlanRepo) Create(_ context.Context, _ *model.Plan) error               { return nil }
 func (s *stubPlanRepo) Update(_ context.Context, _ *model.Plan) error               { return nil }
 func (s *stubPlanRepo) Delete(_ context.Context, _ string) error                    { return nil }
+func (s *stubPlanRepo) CreateTx(_ context.Context, _ *sqlx.Tx, _ *model.Plan) error { return nil }
+func (s *stubPlanRepo) UpdateTx(_ context.Context, _ *sqlx.Tx, _ *model.Plan) error { return nil }
+func (s *stubPlanRepo) DeleteTx(_ context.Context, _ *sqlx.Tx, _ string) error      { return nil }
+
+// FindByIDForShareTx returns the configured lock-step plan (or the
+// configured lock-step error). The default is to defer to FindByID; an
+// explicit findByIDForShareTxFn / findByIDForShareTxErr overrides that
+// to drive the D8 race scenarios where the plan's truth changes
+// between FindByID and the lock.
+func (s *stubPlanRepo) FindByIDForShareTx(ctx context.Context, tx *sqlx.Tx, id string) (*model.Plan, error) {
+	if s.findByIDForShareTxFn != nil {
+		return s.findByIDForShareTxFn(ctx, tx, id)
+	}
+	if s.findByIDForShareTxErr != nil {
+		return nil, s.findByIDForShareTxErr
+	}
+	if s.findByIDForShareTxPlan != nil {
+		return s.findByIDForShareTxPlan, nil
+	}
+	return s.FindByID(ctx, id)
+}
+
+// WithTx is the D8 transactional wrapper for PlanService.CreatePlan /
+// UpdatePlan / DeletePlan. Default behaviour: invoke fn verbatim with a
+// nil tx (sufficient for service-level tests). Tests that need tx-aware
+// error injection supply withTxFn.
+func (s *stubPlanRepo) WithTx(ctx context.Context, fn func(*sqlx.Tx) error) error {
+	if s.withTxFn != nil {
+		return s.withTxFn(ctx, fn)
+	}
+	return fn(nil)
+}
 
 // stubSubRepo satisfies repo.SubscriptionRepo with configurable FindActiveByUserID error.
 type stubSubRepo struct {
@@ -345,6 +395,64 @@ func TestCreateOrder_WeChat_NilClient_Fourxx(t *testing.T) {
 	}
 	if orderRepo.updateIntentCalled {
 		t.Fatal("UpdateProviderIntent must not be called when wechat is nil")
+	}
+}
+
+// TestPaymentService_CreateOrder_WeChatNotConfigured_NoOrphanOrder pins
+// the D1 invariant: when channel=wechat_pay but s.wechat is nil, the
+// deployment-config gate must fire BEFORE orderRepo.Create. Otherwise
+// the order row is persisted as `pending` and CreateOrder then returns
+// an error, leaving an orphan that the sweeper can only expire after
+// ORDER_EXPIRY_DURATION (default 30m) — and retries multiply the rows.
+func TestPaymentService_CreateOrder_WeChatNotConfigured_NoOrphanOrder(t *testing.T) {
+	svc, orderRepo := newPaymentServiceForCreateOrder(nil)
+
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	if !errors.Is(err, ErrWechatPayNotConfigured) {
+		t.Fatalf("expected ErrWechatPayNotConfigured, got %v (order=%+v)", err, order)
+	}
+	if orderRepo.created != nil {
+		t.Fatalf("orderRepo.Create must NOT be called when wechat is nil; "+
+			"otherwise we leak an orphan pending row. created=%+v", orderRepo.created)
+	}
+}
+
+// TestPaymentService_CreateOrder_PlanDeactivatedDuringTx pins the D8
+// TOCTOU guarantee for CreateOrder: the eligibility-tx lookup with
+// FOR SHARE on the plan row MUST see the post-deactivation truth, so
+// a concurrent plan UPDATE that flips IsActive=true → false between
+// the prior FindByID and the lock surfaces as ErrPlanInactive. The
+// fixture simulates that by returning an active plan from FindByID
+// but an inactive one from FindByIDForShareTx.
+//
+// The unit-test fallback (s.db == nil → no real tx) won't exercise the
+// lock step; we install a FindByIDForShareTxFn that returns the
+// deactivated plan unconditionally. Production runs against a real DB
+// where FOR SHARE blocks concurrent UPDATEs until commit.
+func TestPaymentService_CreateOrder_PlanDeactivatedDuringTx(t *testing.T) {
+	orderRepo := &stubOrderRepoLookup{}
+	planRepo := &stubPlanRepo{
+		plan: &model.Plan{ID: "plan-1", IsActive: true, AcceptingNewSubscriptions: true, Currency: "CNY"},
+		// Lock-step returns the SAME plan as FindByID for the happy
+		// sub-test path; the deactivation suite below overrides this fn.
+		findByIDForShareTxFn: func(_ context.Context, _ *sqlx.Tx, _ string) (*model.Plan, error) {
+			return &model.Plan{ID: "plan-1", IsActive: false, AcceptingNewSubscriptions: true, Currency: "CNY"}, nil
+		},
+	}
+	svc := NewPaymentService(
+		nil, orderRepo, nil, nil,
+		&stubSubRepo{}, planRepo,
+		nil, nil, nil,
+		&stubRefundAPI{}, nil,
+		0,
+	)
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe")
+	if !errors.Is(err, ErrPlanInactive) {
+		t.Fatalf("CreateOrder error = %v, want ErrPlanInactive", err)
+	}
+	if orderRepo.created != nil {
+		t.Fatalf("orderRepo.CreateInTx must NOT be called when the eligibility tx fails; "+
+			"otherwise we leak an orphan pending row. created=%+v", orderRepo.created)
 	}
 }
 

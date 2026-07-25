@@ -830,6 +830,89 @@ func TestPlanHandler_DeletePlan(t *testing.T) {
 	})
 }
 
+// performPlanHandlerRequestAsApp is the InternalAppAuth-aware counterpart
+// to performPlanHandlerRequest. It injects a *model.App into the Gin
+// context at middleware.ContextApp, mirroring what the production
+// InternalAppAuth middleware does after verifying X-App-ID + X-App-Secret.
+// Tests that need to assert the audit-log actor_id (format "admin:<appID>")
+// MUST use this helper — the plain performPlanHandlerRequest sees the
+// defensive "admin:unknown" fallback because no middleware sets the key.
+func performPlanHandlerRequestAsApp(t *testing.T, svc *mockPlanSvc, appID, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	handler := NewPlanHandler(svc, nil, nil)
+	router := gin.New()
+	if appID != "" {
+		router.Use(func(c *gin.Context) {
+			c.Set(middleware.ContextApp, &model.App{AppID: appID})
+			c.Next()
+		})
+	}
+	router.POST("/admin/plans", handler.CreatePlan)
+	router.GET("/admin/plans/:id", handler.GetPlan)
+	router.PATCH("/admin/plans/:id", handler.UpdatePlan)
+	router.DELETE("/admin/plans/:id", handler.DeletePlan)
+
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+// TestPlanHandler_CreatePlan_ForwardsAppIDToAuditLog guards the D4
+// audit-log attribution: CreatePlan must thread adminActorID(c) — which
+// reads the *model.App set by InternalAppAuth at middleware.ContextApp —
+// into planSvc.CreatePlan as the actorID, formatted as "admin:<appID>".
+// Without InternalAppAuth context the handler would fall back to
+// "admin:unknown" and pin every audit row to the wrong attribution.
+func TestPlanHandler_CreatePlan_ForwardsAppIDToAuditLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{}
+
+	w := performPlanHandlerRequestAsApp(t, svc, "yundian", http.MethodPost, "/admin/plans",
+		`{"id":"audit-create","name":"Audit Create","price":9.99,"interval_days":30,"apps":["yundian"]}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+	if svc.lastActorID != "admin:yundian" {
+		t.Errorf("lastActorID = %q, want admin:yundian", svc.lastActorID)
+	}
+}
+
+// TestPlanHandler_UpdatePlan_ForwardsAppIDToAuditLog — see D4.
+func TestPlanHandler_UpdatePlan_ForwardsAppIDToAuditLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly"}}
+
+	w := performPlanHandlerRequestAsApp(t, svc, "yundian", http.MethodPatch, "/admin/plans/monthly",
+		`{"name":"Monthly Updated"}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if svc.lastActorID != "admin:yundian" {
+		t.Errorf("lastActorID = %q, want admin:yundian", svc.lastActorID)
+	}
+}
+
+// TestPlanHandler_DeletePlan_ForwardsAppIDToAuditLog — see D4.
+func TestPlanHandler_DeletePlan_ForwardsAppIDToAuditLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{}
+
+	w := performPlanHandlerRequestAsApp(t, svc, "yundian", http.MethodDelete, "/admin/plans/monthly", "")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if svc.lastActorID != "admin:yundian" {
+		t.Errorf("lastActorID = %q, want admin:yundian", svc.lastActorID)
+	}
+}
+
 func TestPlanHandler_GetPlan(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

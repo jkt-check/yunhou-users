@@ -665,7 +665,7 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		RefreshToken: hashToken(newRefreshTokenRaw),
 		Scope:        scope,
 		Revoked:      false,
-		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
+		ExpiresAt:    now.Add(s.tokenSvc.RefreshTTL),
 	}
 	if err := s.sessionRepo.RotateRefresh(ctx, session.ID, newSession); err != nil {
 		// Refresh-token reuse detection: if RotateRefresh reports the old

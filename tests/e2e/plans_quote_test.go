@@ -17,8 +17,13 @@ func TestE2E_GetAppPlans_PublicCatalog(t *testing.T) {
 
 	// /apps/:id/plans is public — no X-App-ID, no JWT. seedTestData already
 	// created the "yundian" super app and three plans (free, monthly,
-	// monthly_usd); the listing filters by apps array, so only free +
-	// monthly surface for yundian (monthly_usd's apps array is empty).
+	// monthly_usd); the listing filters by is_active AND is_listed AND
+	// apps-array-contains-appid. As of migration 016 free and quarterly are
+	// both is_listed=false (and quarterly is also is_active=false), so they
+	// are filtered out here; monthly is the only seed plan that surfaces
+	// for yundian (monthly_usd's apps array is empty). The "two-plan
+	// catalog" invariant is covered by
+	// TestE2E_PlanPricing_OnlyTwoPlansReturned in plans_pricing_test.go.
 	resp := doRequest(t, engine, http.MethodGet, "/apps/yundian/plans", "", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, string(resp.Body))
@@ -30,16 +35,17 @@ func TestE2E_GetAppPlans_PublicCatalog(t *testing.T) {
 	if err := json.Unmarshal(resp.Body, &body); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(body.Data) != 2 {
-		t.Fatalf("got %d plans, want 2 (free+monthly); data = %+v", len(body.Data), body.Data)
+	if len(body.Data) != 1 {
+		t.Fatalf("got %d plans, want 1 (monthly); data = %+v", len(body.Data), body.Data)
 	}
-	// free plan: defaults (no provider config in seed data).
-	if body.Data[0].ID != "free" || len(body.Data[0].ProviderIDs) != 0 {
-		t.Errorf("free plan = %+v", body.Data[0])
+	if body.Data[0].ID != "monthly" {
+		t.Errorf("expected only monthly, got %+v", body.Data[0])
 	}
-	// monthly: no provider config in seed data either, so provider_ids empty.
-	if body.Data[1].ID != "monthly" || len(body.Data[1].ProviderIDs) != 0 {
-		t.Errorf("monthly plan = %+v", body.Data[1])
+	if body.Data[0].Price != 19.9 {
+		t.Errorf("monthly.price: got %v, want 19.9 (migration 016)", body.Data[0].Price)
+	}
+	if len(body.Data[0].ProviderIDs) != 0 {
+		t.Errorf("monthly plan: %+v", body.Data[0])
 	}
 }
 

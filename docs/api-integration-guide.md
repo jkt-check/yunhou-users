@@ -1703,14 +1703,11 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 
 错误响应：
 
+为防止枚举攻击（attacker 通过差异化响应探测合法 `X-App-ID` / 哪个 app 启用了 secret），中间件对**所有**鉴权失败路径（缺失 `X-App-ID`、`X-App-ID` 不存在、缺失 `X-App-Secret`、`secret` 不匹配、`secret_hash` 未初始化、`app` 停用）一律返回 `401 "invalid app_secret"`。调用方无法仅凭响应区分"app 不存在"与"secret 错"；底层原因仅记入 server 日志供运维排查。
+
 | HTTP | message | 触发条件 |
 |------|---------|----------|
-| 401 | `missing X-App-ID header` | 调用方没带 `X-App-ID` |
-| 401 | `invalid app_id` | `X-App-ID` 不存在 |
-| 401 | `missing X-App-Secret header` | 调用方没带 `X-App-Secret` |
-| 401 | `invalid app_secret` | `X-App-Secret` 不匹配（**不会**区分"app 不存在" vs "secret 错"——避免枚举攻击） |
-| 401 | `app secret not initialized` | 该 app 行 `secret_hash` 为空（migration 007 之后未跑 `BackfillAppSecrets` 的过渡态）。建议：跑一次 server 启动 backfill，或者直接调 `POST /admin/apps/:id/rotate-secret` 重新生成 |
-| 403 | `app is disabled` | app 已停用 |
+| 401 | `invalid app_secret` | **所有**鉴权失败（缺失头、app 不存在、app 停用、`secret` 不匹配、`secret_hash` 未初始化）——统一消息，用于防枚举 |
 
 **Rotation 流程**：怀疑 `X-App-Secret` 泄漏（例如 BFF 容器镜像被 pull 过、CI 缓存里出现过）时，立即调：
 

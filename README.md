@@ -117,7 +117,27 @@ All configuration is via environment variables (or `.env` file):
 | GET | `/user/subscriptions` | List user's subscriptions |
 | POST | `/user/subscriptions` | Create subscription |
 | DELETE | `/user/subscriptions/:id` | Cancel subscription |
-| POST | `/apps/:id/quote` | Quote a plan for an app (amount, sub_expires_at, per-channel provider_data) |
+| POST | `/apps/:id/quote` | Quote a plan for an app (amount, sub_expires_at, per-channel provider_data). JWT-authed; mounted at the engine level so the URL stays `/apps/:id/quote`. |
+
+### Payments & Refunds (JWT Bearer)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/payments/orders` | Create a pending order (snapshots `plan.price` + `plan.currency`; PayPal requires USD Plan, WeChat Pay requires CNY Plan, else `ErrPlanCurrencyMismatch`) |
+| GET | `/payments/orders/:id` | Fetch an order (pending / paid / failed / expired / refunded) |
+| DELETE | `/payments/orders/:id` | Cancel a pending order |
+| POST | `/payments/orders/:order_id/confirm` | BFF-confirmed payment completion; activates the subscription on success |
+| GET | `/payments` | List payments |
+| GET | `/payments/:id` | Fetch a payment |
+| GET | `/payments/:id/refunds` | List refunds for a payment |
+| POST | `/refunds` | Create a refund |
+| GET | `/refunds/:id` | Fetch a refund |
+
+### Channel Webhooks (signature verification, NOT JWT)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/webhooks/payment/:channel` | `:channel` is `stripe` / `wechat_pay` / `alipay` / `paypal`. Returns 404 when the corresponding webhook secret env var is empty; unknown channels also return 404 (defence-in-depth). Webhook payload carries `sub_expires_at` (via `payment.metadata` / `resource.sub_expires_at` / `meta.custom_data.sub_expires_at`) which yunhou-users trusts verbatim. |
 
 ### App/Plan Management Endpoints (Internal Auth)
 

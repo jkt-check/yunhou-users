@@ -181,8 +181,10 @@ func (h *AuthHandler) TestLogin(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrPlanNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
-		case errors.Is(err, service.ErrPlanInactive), errors.Is(err, service.ErrPlanNotAcceptingNew):
+		case errors.Is(err, service.ErrPlanInactive):
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is not available for test login"})
+		case errors.Is(err, service.ErrPlanNotAcceptingNew):
+			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is not accepting new subscriptions"})
 		default:
 			log.Printf("test login internal error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "test login failed"})

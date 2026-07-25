@@ -7,6 +7,16 @@
 -- backfills the existing seed rows; and a new plan_change_log audit
 -- table. Purely additive and idempotent — does NOT drop is_default or
 -- touch 'free' semantics; that lives in 013.
+--
+-- Idempotency:
+--   * Schema steps — `ADD COLUMN IF NOT EXISTS`, `pg_constraint`-gated
+--     `ADD CONSTRAINT`, `CREATE OR REPLACE FUNCTION` + `DROP TRIGGER IF
+--     EXISTS` + `CREATE TRIGGER`, `CREATE TABLE IF NOT EXISTS`,
+--     `CREATE INDEX IF NOT EXISTS` — are all deterministic.
+--   * Data step — the seed-row UPDATE is gated on the sentinel
+--     "no plans row has a non-NULL description" so it runs only on the
+--     first apply. On re-run it emits a NOTICE and skips, preserving
+--     any operator edits.
 
 -- (a) Add new columns
 ALTER TABLE plans
@@ -52,24 +62,44 @@ CREATE TRIGGER plans_touch_updated_at
     FOR EACH ROW EXECUTE FUNCTION plans_touch_updated_at();
 
 -- (d) Backfill the existing 4 rows
-UPDATE plans SET
-    currency = 'CNY',
-    trial_days = 0,
-    description = CASE id
-        WHEN 'monthly'   THEN '按月订阅 ¥29.9，自动续费，可随时取消'
-        WHEN 'quarterly' THEN '按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留'
-        WHEN 'yearly'    THEN '按年订阅 ¥299（约 83 折，比月付年省 ¥59.8）'
-        WHEN 'free'      THEN '免费版（已下线）'
-    END,
-    is_listed = true,
-    accepting_new_subscriptions = CASE id WHEN 'free' THEN false WHEN 'quarterly' THEN false ELSE true END,
-    display_order = CASE id
-        WHEN 'monthly' THEN 10
-        WHEN 'quarterly' THEN 20
-        WHEN 'yearly' THEN 30
-        ELSE 0
-    END
-WHERE id IN ('monthly','quarterly','yearly','free');
+--
+-- Idempotency note: the schema steps above (a)-(c) and the audit-table
+-- step (e) are fully idempotent — re-runs are no-ops. This data step
+-- is NOT idempotent by construction (an unconditional UPDATE would
+-- overwrite any operator-edited values back to seed defaults and bump
+-- updated_at). It is gated on the `description IS NULL` sentinel:
+-- before 012 first applies, every plans row has description=NULL;
+-- after the backfill, the 4 seeded rows have a non-NULL description.
+-- We use the absence of any non-NULL description as a "has the
+-- backfill run yet?" marker. Operator edits that set description=NULL
+-- after the backfill would re-arm the sentinel, but that is an
+-- explicit destructive act and the operator can simply skip the
+-- re-run if they have made such edits.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM plans WHERE description IS NOT NULL LIMIT 1) THEN
+        UPDATE plans SET
+            currency = 'CNY',
+            trial_days = 0,
+            description = CASE id
+                WHEN 'monthly'   THEN '按月订阅 ¥29.9，自动续费，可随时取消'
+                WHEN 'quarterly' THEN '按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留'
+                WHEN 'yearly'    THEN '按年订阅 ¥299（约 83 折，比月付年省 ¥59.8）'
+                WHEN 'free'      THEN '免费版（已下线）'
+            END,
+            is_listed = true,
+            accepting_new_subscriptions = CASE id WHEN 'free' THEN false WHEN 'quarterly' THEN false ELSE true END,
+            display_order = CASE id
+                WHEN 'monthly' THEN 10
+                WHEN 'quarterly' THEN 20
+                WHEN 'yearly' THEN 30
+                ELSE 0
+            END
+        WHERE id IN ('monthly','quarterly','yearly','free');
+    ELSE
+        RAISE NOTICE 'migration 012 data backfill: skipping (already applied — sentinel: any plans.description IS NOT NULL)';
+    END IF;
+END $$;
 
 -- (e) plan_change_log (new audit table)
 CREATE TABLE IF NOT EXISTS plan_change_log (

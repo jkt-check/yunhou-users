@@ -142,7 +142,9 @@ User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 ### v2 known limitations
 
 - `POST /apps/:id/quote` response hardcodes `currency = "USD"` (`internal/service/quote.go`); `POST /payments/orders` hardcodes `currency = "CNY"` (`internal/service/payment.go:125`); WeChat/Alipay webhooks default `CNY`. Multi-currency is not supported in v1; the `plans` table has no currency column today.
-- Channel webhooks carry `sub_expires_at` via `payment.metadata.sub_expires_at` / `resource.sub_expires_at`. yunhou-users does not derive it server-side — the BFF computes it from `plan.interval_days` + business rules and embeds it into checkout creation.
+- `sub_expires_at` has two sources:
+  - **Quote endpoint** (`POST /apps/:id/quote`): the server derives `sub_expires_at = now + plan.trial_days + plan.interval_days` from the Plan row (`internal/service/quote.go`).
+  - **Channel webhook path**: the BFF embeds the value when creating the checkout; the channel echoes it back in the webhook payload (`payment.metadata.sub_expires_at` / `resource.sub_expires_at` / `meta.custom_data.sub_expires_at`); yunhou-users trusts the embedded value and writes it directly to `subscriptions.expires_at`.
 - `POST /apps/:id/quote` requires JWT but does **not** enforce `has_access` against the user's subscription. Any authenticated user can quote any plan any app exposes.
 
 ### Cycle precedence

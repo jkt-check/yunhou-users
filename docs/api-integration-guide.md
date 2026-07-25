@@ -656,7 +656,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 |------|------|
 | `amount` | 透传 `plans.price` |
 | `currency` | 来自 `plan.currency`（`CNY` / `USD` / `EUR`），不再硬编码，也不接受 caller 覆盖 |
-| `sub_expires_at` | `now + plan.trial_days + plan.interval_days`（服务器时间）。BFF 在创建 PayPal checkout 时将其写入 `metadata.sub_expires_at`；PayPal 自己的 renewal webhook 会通过 `resource.billing_info.next_billing_time` 回传，yunhou 不参与续费的周期计算 |
+| `sub_expires_at` | **服务端计算**：`now + plan.trial_days + plan.interval_days`（服务器时间，见 `internal/service/quote.go`）。BFF 在创建 PayPal checkout 时将其写入 `metadata.sub_expires_at`；PayPal 自己的 renewal webhook 会通过 `resource.billing_info.next_billing_time` 回传，yunhou 不参与续费的周期计算。注意：`sub_expires_at` 在 channel webhook 路径上由 **BFF 嵌入 → channel 回传 → yunhou 信任并写入**，yunhou-users 不二次推导 webhook payload 里的值 |
 | `cycle_config.base` | 恒为 `"now + trial + cycle"`，给审计/排查时一眼看出计算方式 |
 | `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK |
 

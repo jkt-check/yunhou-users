@@ -34,15 +34,19 @@ func setupDB(t *testing.T) *sqlx.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	tables := []string{
-		"refunds", "payments", "webhook_events", "orders",
-		"sessions", "subscriptions", "social_identities",
-		"plans", "apps", "users", "audit_log",
-	}
-	for _, tbl := range tables {
-		if _, err := db.ExecContext(context.Background(), "DELETE FROM "+tbl); err != nil {
-			t.Fatalf("wipe %s: %v", tbl, err)
-		}
+	// Single TRUNCATE ... CASCADE handles the FK dependency graph in
+	// one statement — Postgres' TRUNCATE inspects foreign keys and
+	// child rows, so we don't have to maintain a manual
+	// parent-before-child ordering. RESTART IDENTITY resets BIGSERIAL
+	// counters so tests start from a deterministic state. plan_change_log
+	// is included explicitly (added in migration 012) so its rows
+	// don't bleed across tests; the cascade handles plans →
+	// plan_change_log. subscriptions_plan_id_fkey /
+	// orders_plan_id_fkey (both ON DELETE RESTRICT) are also truncated
+	// via the CASCADE keyword.
+	if _, err := db.ExecContext(context.Background(),
+		`TRUNCATE plan_change_log, refunds, payments, webhook_events, audit_log, orders, sessions, subscriptions, social_identities, plans, apps, users RESTART IDENTITY CASCADE;`); err != nil {
+		t.Fatalf("wipe tables: %v", err)
 	}
 
 	// Seed plans. ON CONFLICT DO NOTHING so a parallel test

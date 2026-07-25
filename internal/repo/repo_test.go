@@ -1122,3 +1122,299 @@ func TestAppRepo_RotateSecretHash(t *testing.T) {
 		t.Error("expected ErrNoRows for unknown app, got nil")
 	}
 }
+
+// ============================================================================
+// PlanRepo tx methods — CreateTx / UpdateTx / DeleteTx /
+// FindByIDForShareTx / WithTx, plus PlanChangeLogRepo.InsertTx and
+// OrderRepo.CreateInTx. Each test exercises the SQL layer in isolation;
+// the e2e suite already drives these through the service layer.
+// ============================================================================
+
+// TestPlanRepo_WithTx_Commit verifies that a nil error from fn causes the
+// transaction to commit so the plan mutation is visible after WithTx
+// returns. This is the happy-path contract; a regression that swallowed
+// the implicit Commit (or always rolled back) would silently drop plan
+// mutations even though fn never errored.
+func TestPlanRepo_WithTx_Commit(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	desc := "Committed plan"
+	err := r.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		return r.CreateTx(context.Background(), tx, &model.Plan{
+			ID: "tx-commit", Name: "TxCommit", Price: 9.99, IntervalDays: 30,
+			Apps: pq.StringArray{"yundian"}, IsActive: true,
+			IsListed: true, AcceptingNewSubscriptions: true,
+			Currency: "CNY", TrialDays: 0, Description: &desc, DisplayOrder: 10,
+		})
+	})
+	if err != nil {
+		t.Fatalf("WithTx(commit): %v", err)
+	}
+
+	got, err := r.FindByID(context.Background(), "tx-commit")
+	if err != nil {
+		t.Fatalf("FindByID after commit: %v", err)
+	}
+	if got.Name != "TxCommit" {
+		t.Errorf("Name = %q, want TxCommit", got.Name)
+	}
+	if got.Description == nil || *got.Description != desc {
+		t.Errorf("Description = %v, want %q", got.Description, desc)
+	}
+}
+
+// TestPlanRepo_WithTx_Rollback verifies that a non-nil error from fn
+// triggers the deferred Rollback so the plan mutation is NOT visible
+// after WithTx returns, and WithTx propagates fn's error to the caller.
+// A regression that swallowed the deferred Rollback or always committed
+// would leave audit/plan pairs out of sync.
+func TestPlanRepo_WithTx_Rollback(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	sentinel := errors.New("intentional rollback")
+	err := r.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		if err := r.CreateTx(context.Background(), tx, &model.Plan{
+			ID: "tx-rollback", Name: "TxRollback", Price: 5,
+			Apps: pq.StringArray{"yundian"}, IsActive: true, Currency: "CNY",
+		}); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("WithTx returned err = %v, want sentinel %v", err, sentinel)
+	}
+
+	// After rollback, the row must NOT be visible — the deferred tx.Rollback
+	// in WithTx is the line under test.
+	_, err = r.FindByID(context.Background(), "tx-rollback")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("after rollback: err = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestPlanRepo_CreateTx_Insert drives CreateTx inside WithTx and asserts
+// the new row is visible after commit. Guards against a bind-name typo
+// in the INSERT that would silently no-op rather than fail the call.
+func TestPlanRepo_CreateTx_Insert(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	err := r.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		return r.CreateTx(context.Background(), tx, &model.Plan{
+			ID: "ctx-insert", Name: "CtxInsert", Price: 1.0, IntervalDays: 7,
+			Apps: pq.StringArray{"yundian"}, IsActive: true,
+			IsListed: true, AcceptingNewSubscriptions: true,
+			Currency: "USD", TrialDays: 3, DisplayOrder: 17,
+		})
+	})
+	if err != nil {
+		t.Fatalf("WithTx: %v", err)
+	}
+	got, err := r.FindByID(context.Background(), "ctx-insert")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if got.Currency != "USD" || got.TrialDays != 3 || got.DisplayOrder != 17 {
+		t.Errorf("commercial fields lost in CreateTx: %+v", got)
+	}
+}
+
+// TestPlanRepo_UpdateTx_Updates drives UpdateTx inside WithTx (after a
+// FindByIDForShareTx eligibility read) and asserts the mutation is
+// visible after commit. Mirrors the production PlanService.UpdatePlan
+// shape so a Future-me refactor of the SQL keeps the binding in sync.
+func TestPlanRepo_UpdateTx_Updates(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	if err := r.Create(context.Background(), &model.Plan{
+		ID: "ctx-update", Name: "PreUpdate", Price: 10, IntervalDays: 30,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+		IsListed: true, AcceptingNewSubscriptions: true, Currency: "CNY",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	err := r.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		p, err := r.FindByIDForShareTx(context.Background(), tx, "ctx-update")
+		if err != nil {
+			return err
+		}
+		p.Name = "PostUpdate"
+		p.Price = 20
+		p.DisplayOrder = 77
+		return r.UpdateTx(context.Background(), tx, p)
+	})
+	if err != nil {
+		t.Fatalf("WithTx(update): %v", err)
+	}
+
+	got, err := r.FindByID(context.Background(), "ctx-update")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "PostUpdate" || got.Price != 20 || got.DisplayOrder != 77 {
+		t.Errorf("after UpdateTx: got %+v", got)
+	}
+}
+
+// TestPlanRepo_DeleteTx_Deletes drives DeleteTx inside WithTx and asserts
+// the row is gone after commit. The FK from plan_change_log.plan_id is
+// ON DELETE SET NULL (migration 013), so this transaction is the same
+// shape production uses to hard-delete a plan and preserves the audit
+// row with plan_id=NULL.
+func TestPlanRepo_DeleteTx_Deletes(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	if err := r.Create(context.Background(), &model.Plan{
+		ID: "ctx-delete", Name: "WillDelete", IntervalDays: 30,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+		IsListed: true, AcceptingNewSubscriptions: true, Currency: "CNY",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	err := r.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		return r.DeleteTx(context.Background(), tx, "ctx-delete")
+	})
+	if err != nil {
+		t.Fatalf("WithTx(delete): %v", err)
+	}
+
+	_, err = r.FindByID(context.Background(), "ctx-delete")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("after DeleteTx: err = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestPlanRepo_FindByIDForShareTx_ReleasesOnCommit guards the auto-release
+// semantics of FOR SHARE locks: after the holding transaction commits, a
+// subsequent outside-tx UPDATE on the row must not block. We cap the
+// UPDATE with a 5s context — if a regression leaked the lock, the test
+// would fail with context.DeadlineExceeded instead of hanging.
+func TestPlanRepo_FindByIDForShareTx_ReleasesOnCommit(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	// 1. Inside WithTx, take FOR SHARE on the seeded 'monthly' row, then
+	//    commit. The returned plan must match the seeded row.
+	err := r.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		p, err := r.FindByIDForShareTx(context.Background(), tx, "monthly")
+		if err != nil {
+			return err
+		}
+		if p.ID != "monthly" || p.Price != 29.9 {
+			return fmt.Errorf("got plan %+v, want monthly@29.9", p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithTx(commit): %v", err)
+	}
+
+	// 2. After commit, the FOR SHARE lock MUST be released. The bounded
+	//    context catches a stuck-blocking regression without hanging the
+	//    test runner.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx,
+		`UPDATE plans SET display_order = 99 WHERE id = $1`, "monthly"); err != nil {
+		t.Fatalf("post-commit UPDATE blocked or failed: %v", err)
+	}
+	got, err := r.FindByID(context.Background(), "monthly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DisplayOrder != 99 {
+		t.Errorf("post-commit UPDATE lost: display_order = %d, want 99", got.DisplayOrder)
+	}
+}
+
+// TestPlanChangeLogRepo_InsertTx_Writes verifies the audit row is
+// committed when InsertTx runs inside WithTx. PlansChangeLog is the
+// audit table D8 relies on — if InsertTx silently no-ops, every plan
+// mutation would lose its trail.
+func TestPlanChangeLogRepo_InsertTx_Writes(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+	cl := NewPlanChangeLogRepo(db)
+
+	if err := r.Create(context.Background(), &model.Plan{
+		ID: "audit-plan", Name: "AuditPlan", IntervalDays: 30,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+		IsListed: true, AcceptingNewSubscriptions: true, Currency: "CNY",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	before := &model.Plan{ID: "audit-plan", Name: "AuditPlan", Currency: "CNY"}
+	after := &model.Plan{ID: "audit-plan", Name: "AuditPlan", Currency: "USD"}
+	err := r.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		return cl.InsertTx(context.Background(), tx, "audit-plan",
+			"admin:test", "plan_update", before, after)
+	})
+	if err != nil {
+		t.Fatalf("WithTx(InsertTx): %v", err)
+	}
+
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT COUNT(*) FROM plan_change_log
+		   WHERE plan_id = $1 AND actor_id = $2 AND change_type = $3`,
+		"audit-plan", "admin:test", "plan_update"); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("plan_change_log row count = %d, want 1", n)
+	}
+}
+
+// TestOrderRepo_CreateInTx_Inserts drives the order INSERT inside a
+// PlanRepo.WithTx so the per-app FOR SHARE eligibility read and the
+// order row commit together. Mirrors PaymentService.CreateOrder's
+// transaction shape; without this guard, a Future-me refactor that
+// accidentally dropped CreateInTx in favour of plain Create would
+// re-open the plan-deactivation TOCTOU.
+func TestOrderRepo_CreateInTx_Inserts(t *testing.T) {
+	db := setupDB(t)
+	planRepo := NewPlanRepo(db)
+	orderRepo := NewOrderRepo(db)
+	userRepo := NewUserRepo(db)
+
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	if err := userRepo.Create(context.Background(), alice); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	orderID := newUUID()
+	expiresAt := time.Now().Add(30 * time.Minute)
+	err := planRepo.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+		// Eligibility read: lock the plan row with FOR SHARE.
+		if _, err := planRepo.FindByIDForShareTx(context.Background(), tx, "monthly"); err != nil {
+			return err
+		}
+		return orderRepo.CreateInTx(context.Background(), tx, &model.Order{
+			ID: orderID, UserID: alice.ID, PlanID: "monthly",
+			Amount: 29.9, Currency: "CNY", Status: "pending",
+			ExpiresAt: expiresAt,
+		})
+	})
+	if err != nil {
+		t.Fatalf("WithTx(CreateInTx): %v", err)
+	}
+
+	got, err := orderRepo.FindByID(context.Background(), orderID)
+	if err != nil {
+		t.Fatalf("FindByID order: %v", err)
+	}
+	if got.Status != "pending" || got.Currency != "CNY" || got.Amount != 29.9 {
+		t.Errorf("after CreateInTx: got %+v", got)
+	}
+	if got.UserID != alice.ID || got.PlanID != "monthly" {
+		t.Errorf("FK fields wrong: user=%s plan=%s", got.UserID, got.PlanID)
+	}
+}

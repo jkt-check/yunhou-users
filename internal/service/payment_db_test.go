@@ -51,7 +51,7 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 		apps     []string
 	}{
 		{"free", "Free", 0, 0, []string{"yundian"}},
-		{"monthly", "Monthly", 29.9, 30, []string{"yundian", "yundash"}},
+		{"monthly", "Monthly", 19.9, 30, []string{"yundian", "yundash"}},
 	} {
 		_, err := db.ExecContext(context.Background(), `
 			INSERT INTO plans (id, name, price, interval_days, apps)
@@ -127,7 +127,7 @@ func TestPaymentService_CreateOrder_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
-	if order.PlanID != "monthly" || order.Amount != 29.9 || order.Currency != "CNY" {
+	if order.PlanID != "monthly" || order.Amount != 19.9 || order.Currency != "CNY" {
 		t.Errorf("order = %+v", order)
 	}
 	if order.Status != "pending" {

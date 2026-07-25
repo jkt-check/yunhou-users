@@ -462,6 +462,30 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 	})
 }
 
+func TestPlanHandler_Create_RejectsWhitespaceName(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"   "}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestPlanHandler_Create_TrimsName(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{}
+	w := performPlanHandlerRequest(t, svc, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"  Hello  "}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+	if svc.plan == nil || svc.plan.Name != "Hello" {
+		t.Fatalf("stored plan name = %q, want Hello", svc.plan.Name)
+	}
+}
+
 func TestPlanHandler_Create_RejectsIsDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans",
@@ -576,6 +600,28 @@ func TestPlanHandler_Create_ValidateApps_500(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "failed to validate plan apps") {
 		t.Errorf("body missing 500 message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_RejectsEmptyName(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly"}}
+	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"name":""}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_RejectsWhitespaceName(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly"}}
+	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+		`{"name":"   "}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
 	}
 }
 

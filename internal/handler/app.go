@@ -629,6 +629,14 @@ func decodeAdminPlanRequest(c *gin.Context, dst any) bool {
 	return true
 }
 
+func validatePlanName(name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", errors.New("name must not be empty")
+	}
+	return trimmed, nil
+}
+
 func isSupportedPlanCurrency(currency string) bool {
 	switch currency {
 	case "", "CNY", "USD", "EUR":
@@ -684,8 +692,13 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 	if !decodeAdminPlanRequest(c, &req) {
 		return
 	}
-	if req.ID == "" || req.Name == "" {
+	if req.ID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+	var err error
+	if req.Name, err = validatePlanName(req.Name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
 	if req.Price < 0 {
@@ -752,6 +765,15 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 	if !decodeAdminPlanRequest(c, &req) {
 		return
 	}
+	var normalizedName string
+	if req.Name != nil {
+		var err error
+		normalizedName, err = validatePlanName(*req.Name)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
+	}
 	if req.Price != nil && *req.Price < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "price must be non-negative"})
 		return
@@ -785,7 +807,7 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 	}
 
 	if req.Name != nil {
-		plan.Name = *req.Name
+		plan.Name = normalizedName
 	}
 	if req.Price != nil {
 		plan.Price = *req.Price

@@ -205,7 +205,7 @@ jq -e '
     and ($ids | index("quarterly") != null)
     and ($ids | index("yearly") != null)
     and ($ids | index("free") == null)
-    and (.data[] | .is_listed == true)
+    and all(.data[]; .is_listed == true)
 ' "$TMP_DIR/plans.json"
 ```
 

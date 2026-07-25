@@ -1112,7 +1112,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | 400 | `missing app_id` / `missing code or state` | `code` / `state` / `app_id` 缺失 |
 | 400 | `invalid state` | state 无效或过期（5 分钟） |
 | 400 | `invalid callback index` | callback 索引越界 |
-| 400 | `github login not configured` | app 未配置 GitHub OAuth（少数 fallback 路径） |
+| 400 | `github login not configured` | 罕有：config JSON 解析失败的 fallback（message 与下方 404 相同，但触发条件不同——通常是 `apps.config.oauth_providers.github` 结构异常，需要运营侧修复） |
 | 404 | `app not found` | `app_id` 不存在 |
 | 404 | `github login not configured` | app 未配置 GitHub OAuth |
 | 500 | `login failed` | 内部错误（auth service 未预期异常） |

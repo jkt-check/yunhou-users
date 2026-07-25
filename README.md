@@ -93,6 +93,7 @@ All configuration is via environment variables (or `.env` file):
 | `PAYPAL_WEBHOOK_ID_LIVE` | No | (empty) | Empty = PayPal live webhooks return 404 |
 | `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Not consumed by the running redirect flow — `/auth/github/*` reads each app's GitHub OAuth App credentials from `apps.config.oauth_providers.github` in the DB. Safe to leave blank. |
 
 ## API Overview
 

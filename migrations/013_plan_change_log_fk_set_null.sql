@@ -24,40 +24,36 @@
 -- FK is satisfied at INSERT time; the new FK only matters on the
 -- subsequent DELETE.
 --
--- Idempotency: uses the pg_constraint lookup pattern from
--- 012_plan_commercial_fields.sql:27-43 — safe to re-run.
+-- Constraint name: hardcoded to `plan_change_log_plan_id_fkey` because
+-- migration 012 declares the FK inline (`plan_id TEXT NOT NULL
+-- REFERENCES plans(id) ON DELETE CASCADE`) without an explicit name,
+-- so PostgreSQL falls back to its default `<table>_<column>_fkey`
+-- convention. If 012 is ever edited to name the FK explicitly, this
+-- name must be updated to match.
+--
+-- Idempotency: uses deterministic PG primitives (`DROP CONSTRAINT IF
+-- EXISTS`, `ALTER COLUMN ... DROP NOT NULL` which is itself idempotent,
+-- and a `pg_constraint` lookup guard for the re-add) instead of
+-- `EXCEPTION WHEN OTHERS` error swallowing. Safe to re-run.
 
+-- Drop the existing FK if it is present (default name from 012).
+ALTER TABLE plan_change_log DROP CONSTRAINT IF EXISTS plan_change_log_plan_id_fkey;
+
+-- plan_id becomes nullable. `ALTER COLUMN ... DROP NOT NULL` is itself
+-- idempotent in PG, so no guard is needed.
+ALTER TABLE plan_change_log ALTER COLUMN plan_id DROP NOT NULL;
+
+-- Re-add the FK with ON DELETE SET NULL. PG has no `ADD CONSTRAINT IF
+-- NOT EXISTS`, so we use the same `pg_constraint` lookup idiom as
+-- 012_plan_commercial_fields.sql:37-53 to gate the ADD on absence.
 DO $$
 BEGIN
-    IF EXISTS (
+    IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'plan_change_log_plan_id_fkey' AND conrelid = 'plan_change_log'::regclass
     ) THEN
-        ALTER TABLE plan_change_log DROP CONSTRAINT plan_change_log_plan_id_fkey;
+        ALTER TABLE plan_change_log
+            ADD CONSTRAINT plan_change_log_plan_id_fkey
+            FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE SET NULL;
     END IF;
-END $$;
-
--- Drop NOT NULL only if it's currently enforced (idempotent against a
--- partial-apply order). ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL
--- is itself idempotent in PG, but wrapping it keeps the file symmetric
--- with the constraint add below.
-DO $$
-BEGIN
-    ALTER TABLE plan_change_log ALTER COLUMN plan_id DROP NOT NULL;
-EXCEPTION
-    WHEN OTHERS THEN NULL;
-END $$;
-
--- Re-add the FK with ON DELETE SET NULL. Same EXCEPTION WHEN
--- duplicate_object pattern as 005_paypal_channel.sql so re-runs are
--- safe: if the constraint already exists with the new shape (e.g. a
--- hand-fix landed first), the DO block swallows the duplicate_object
--- error.
-DO $$
-BEGIN
-    ALTER TABLE plan_change_log
-        ADD CONSTRAINT plan_change_log_plan_id_fkey
-        FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE SET NULL;
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
 END $$;

@@ -1,5 +1,13 @@
 # Payment Webhook Mechanism
 
+> **Superseded for endpoint and webhook-channel details.** This doc captures the v1 webhook design (June 2026). The endpoint surface and channel roster changed materially after this was written:
+>
+> - The confirm path is now `POST /payments/orders/:order_id/confirm` (was `POST /payments/:id/confirm` — the order id is now namespaced under `/payments/orders`).
+> - `lemonsqueezy` was removed from the channel roster (`migrations/008_drop_lemonsqueezy.sql`); the channel CHECK constraint and the `meta.custom_data.sub_expires_at` row in §6.4 no longer apply.
+> - Login is no longer coupled to subscription state — see the supersession banner in [`2026-06-16-user-system-design.md`](./2026-06-16-user-system-design.md). The webhooks themselves are unchanged, but the consumer (token issuance) no longer 401s on expired / non-active subscriptions.
+>
+> Treat sections below as design history unless explicitly re-validated against the current source.
+
 Companion to [`2026-06-16-user-system-design.md`](./2026-06-16-user-system-design.md). Explains how yunhou-users receives, verifies, and reconciles state from payment-channel webhooks.
 
 ## 1. Why a webhook is the trust anchor

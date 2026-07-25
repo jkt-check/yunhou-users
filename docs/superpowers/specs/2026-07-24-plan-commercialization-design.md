@@ -1,7 +1,7 @@
 # Plan Commercialization — Design Spec
 
 **Date:** 2026-07-24
-**Status:** Draft
+**Status:** Implemented / Current (Phase 1 + Phase 2 shipped; see `2026-07-24-plan-commercialization-COMPLETION.md`)
 **Author:** Claude (Yunhou Users)
 **Related specs:**
 - `2026-07-23-login-subscription-decouple-design.md` (login/subscription already decoupled — this spec layers the commercial surface on top)

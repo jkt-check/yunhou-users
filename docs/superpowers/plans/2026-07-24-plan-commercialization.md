@@ -1,5 +1,7 @@
 # Plan Commercialization Implementation Plan
 
+> **Completed historical record — see `2026-07-24-plan-commercialization-COMPLETION.md`.** All 22 tasks landed on `master` from spec commit `7d9c13e` through T22 commit `c3fad45`. The checkbox (`- [ ]`) syntax below is left in place so operators diffing this file against the original commit can still see the planned step-by-step, but every box was checked off when the work landed; this doc is now read-only.
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Convert the `plans` table from an internal catalog into a commercial product surface — retire `free`, remove the default-plan concept, add 7 plan fields (is_listed / accepting_new_subscriptions / currency / trial_days / description / display_order / updated_at), and switch `quote`/`order`/`subscription` to read currency + trial_days from `plan` rather than from `orders` or `AppConfig`.

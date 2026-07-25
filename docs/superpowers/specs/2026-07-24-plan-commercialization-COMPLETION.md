@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-25
 **Branch:** `master`
-**Status:** All 22 tasks complete; ready for review
+**Status:** Complete — all 22 tasks shipped; Phase 1 + Phase 2 promoted to production. Companion spec (`2026-07-24-plan-commercialization-design.md`) is marked "Implemented / Current"; companion plan (`2026-07-24-plan-commercialization.md`) is now a historical record.
 
 ## Summary
 

@@ -1746,42 +1746,49 @@ func TestAuthService_resolveOrCreateUser(t *testing.T) {
 func TestPeekSubscription(t *testing.T) {
 	t.Parallel()
 
-	t.Run("no row → (nil, false, nil)", func(t *testing.T) {
+	// peekSubscription's expiry flag moved to a separate helper
+	// (isExpiredAt) so resolvePlanForTokenIssuanceWithPlan can compute
+	// it against the same `now` it passes to scopeForTokenIssuance
+	// (D9 fix). The tests below assert peekSubscription alone returns
+	// the right subscription, and isExpiredAt produces the right flag
+	// for each input.
+
+	t.Run("no row → (nil, nil)", func(t *testing.T) {
 		t.Parallel()
 		sr := newMockSubscriptionRepo()
 		svc := &AuthService{subRepo: sr}
-		sub, expired, err := svc.peekSubscription(context.Background(), "u-missing")
+		sub, _, err := svc.peekSubscription(context.Background(), "u-missing", time.Now())
 		if err != nil {
 			t.Errorf("err: got %v, want nil", err)
 		}
 		if sub != nil {
 			t.Errorf("sub: got %v, want nil", sub)
 		}
-		if expired {
-			t.Error("expired: got true, want false")
+		if isExpiredAt(sub, time.Now()) {
+			t.Error("isExpiredAt: got true, want false for nil sub")
 		}
 	})
 
-	t.Run("active row with future expires_at → (sub, false, nil)", func(t *testing.T) {
+	t.Run("active row with future expires_at → (sub, nil) + isExpiredAt=false", func(t *testing.T) {
 		t.Parallel()
 		sr := newMockSubscriptionRepo()
 		exp := time.Now().Add(24 * time.Hour)
 		sr.subs["s-1"] = &model.Subscription{ID: "s-1", UserID: "u-1", PlanID: "monthly", Status: "active", ExpiresAt: &exp}
 		sr.byUserID["u-1"] = sr.subs["s-1"]
 		svc := &AuthService{subRepo: sr}
-		sub, expired, err := svc.peekSubscription(context.Background(), "u-1")
+		sub, _, err := svc.peekSubscription(context.Background(), "u-1", time.Now())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
 		if sub == nil || sub.ID != "s-1" {
 			t.Errorf("sub: got %+v, want s-1", sub)
 		}
-		if expired {
-			t.Error("expired: got true, want false for future expires_at")
+		if isExpiredAt(sub, time.Now()) {
+			t.Error("isExpiredAt: got true, want false for future expires_at")
 		}
 	})
 
-	t.Run("active row with past expires_at → (sub, true, nil) — NO error", func(t *testing.T) {
+	t.Run("active row with past expires_at → (sub, nil) + isExpiredAt=true — NO error", func(t *testing.T) {
 		t.Parallel()
 		sr := newMockSubscriptionRepo()
 		past := time.Now().Add(-1 * time.Hour)
@@ -1792,33 +1799,33 @@ func TestPeekSubscription(t *testing.T) {
 		// returned ErrSubscriptionExpired here, blocking the login layer
 		// from making any decisions. The fix guarantees NO error in this
 		// branch so the OAuth callback cannot refuse login on sub state.
-		sub, expired, err := svc.peekSubscription(context.Background(), "u-past")
+		sub, _, err := svc.peekSubscription(context.Background(), "u-past", time.Now())
 		if err != nil {
 			t.Fatalf("err: peekSubscription must NOT return an error for an expired row (that's the whole point of the 2026-07-23 fix); got %v", err)
 		}
 		if sub == nil || sub.ID != "s-past" {
 			t.Errorf("sub: got %+v, want s-past", sub)
 		}
-		if !expired {
-			t.Error("expired: got false, want true for past expires_at")
+		if !isExpiredAt(sub, time.Now()) {
+			t.Error("isExpiredAt: got false, want true for past expires_at")
 		}
 	})
 
-	t.Run("active row with NULL expires_at → (sub, false, nil) — never expires, NOT expired", func(t *testing.T) {
+	t.Run("active row with NULL expires_at → (sub, nil) + isExpiredAt=false — never expires, NOT expired", func(t *testing.T) {
 		t.Parallel()
 		sr := newMockSubscriptionRepo()
 		sr.subs["s-null"] = &model.Subscription{ID: "s-null", UserID: "u-null", PlanID: "lifetime", Status: "active", ExpiresAt: nil}
 		sr.byUserID["u-null"] = sr.subs["s-null"]
 		svc := &AuthService{subRepo: sr}
-		sub, expired, err := svc.peekSubscription(context.Background(), "u-null")
+		sub, _, err := svc.peekSubscription(context.Background(), "u-null", time.Now())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
 		if sub == nil {
 			t.Error("sub: got nil, want s-null")
 		}
-		if expired {
-			t.Error("expired: NULL expires_at must NOT count as expired (legacy behaviour, locked down here)")
+		if isExpiredAt(sub, time.Now()) {
+			t.Error("isExpiredAt: NULL expires_at must NOT count as expired (legacy behaviour, locked down here)")
 		}
 	})
 
@@ -1827,7 +1834,7 @@ func TestPeekSubscription(t *testing.T) {
 		sr := newMockSubscriptionRepo()
 		sr.findErr = errors.New("db down")
 		svc := &AuthService{subRepo: sr}
-		_, _, err := svc.peekSubscription(context.Background(), "u-x")
+		_, _, err := svc.peekSubscription(context.Background(), "u-x", time.Now())
 		if err == nil {
 			t.Fatal("expected error from FindActiveByUserID, got nil")
 		}
@@ -1849,7 +1856,7 @@ func TestResolvePlanForTokenIssuance_NoSub_ReturnsNilChosenPlan(t *testing.T) {
 	// Seed the former default so this test proves the resolver ignores it.
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
 
-	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-no-sub", "yundian")
+	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-no-sub", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -1885,7 +1892,7 @@ func TestResolvePlanForTokenIssuance_ExpiredSub_ScopeEmpty(t *testing.T) {
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
-	chosenPlan, surfaceID, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, user.ID, "yundian")
+	chosenPlan, surfaceID, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, user.ID, "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -1928,7 +1935,7 @@ func TestResolvePlanForTokenIssuance_ActiveSub_PlanDeactivated(t *testing.T) {
 	}
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
 
-	chosenPlan, _, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-deactivated", "yundian")
+	chosenPlan, _, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-deactivated", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -1990,7 +1997,7 @@ func TestResolvePlanForTokenIssuance_ExpiredSub(t *testing.T) {
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
-	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian")
+	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -2029,7 +2036,7 @@ func TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing(t *testing.T
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
-	chosenPlan, surfaceID, surfaceName, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian")
+	chosenPlan, surfaceID, surfaceName, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance must preserve degraded mode; got %v", err)
 	}
@@ -2189,5 +2196,79 @@ func TestRefreshToken_ExpiredSub_DoesNotError(t *testing.T) {
 	}
 	if resp.Subscription == nil || resp.Subscription.PlanID != "monthly" {
 		t.Errorf("Subscription.PlanID: got %+v, want monthly", resp.Subscription)
+	}
+}
+
+// TestResolvePlanForTokenIssuance_SingleTimeReference covers D9: the
+// expiry decision inside resolvePlanForTokenIssuanceWithPlan and the
+// expiry check inside scopeForTokenIssuance must see the SAME reference
+// time, otherwise a subscription that expires between the two reads
+// can produce hasAccess=true with scope=[] (internally inconsistent —
+// the response says "you have access" but the token can't reach any
+// app).
+//
+// We seed an active subscription whose expires_at is set to "just
+// before now". resolvePlanForTokenIssuanceWithPlan reads sub.ExpiresAt
+// and decides hasAccess. With a single `now` captured by the caller,
+// both decisions agree: hasAccess=false AND scope=[].
+func TestResolvePlanForTokenIssuance_SingleTimeReference(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	ur, sir, pr, sr, ssr, ar := newAuthMocks()
+	ar.seedActive("yundian", "云店")
+	plan := &model.Plan{
+		ID: "monthly", Name: "月付", Apps: []string{"yundian"}, IsActive: true,
+	}
+	pr.plans[plan.ID] = plan
+
+	// expires_at = now - 1ns: just expired relative to any time.Now()
+	// taken after this point. The test asserts that a single `now`
+	// captured by resolvePlanForTokenIssuanceWithPlan sees it as
+	// expired, so hasAccess and scope agree.
+	expiredAt := time.Now().Add(-time.Nanosecond)
+	sr.byUserID["u-edge"] = &model.Subscription{
+		ID: "sub-edge", UserID: "u-edge", PlanID: "monthly",
+		Status: "active", ExpiresAt: &expiredAt,
+	}
+	ur.users["u-edge"] = &model.User{ID: "u-edge", Status: "active"}
+
+	tokenSvc := newTokenServiceWithMocks(ssr, sr)
+	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+	// Now issued at one moment; both decisions see the same `now`.
+	now := time.Now()
+	chosenPlan, _, _, hasAccess, _, err := svc.resolvePlanForTokenIssuanceWithPlan(ctx, "u-edge", "yundian", nil, now)
+	if err != nil {
+		t.Fatalf("resolvePlanForTokenIssuanceWithPlan: %v", err)
+	}
+	if chosenPlan == nil {
+		t.Fatal("chosenPlan nil — expected the historical plan to surface")
+	}
+	if hasAccess {
+		t.Error("hasAccess = true, want false (expires_at < now → expired)")
+	}
+	scope := scopeForTokenIssuance(chosenPlan, &expiredAt, now)
+	if len(scope) != 0 {
+		t.Errorf("scope = %v, want [] (consistent with hasAccess=false)", scope)
+	}
+
+	// Cross-check: if a hypothetical caller passed `now` BEFORE the
+	// expiry (i.e. the subscription was still active at that
+	// reference time), both decisions must agree it was active.
+	beforeExpiry := expiredAt.Add(-time.Second)
+	chosenPlan2, _, _, hasAccess2, _, err := svc.resolvePlanForTokenIssuanceWithPlan(ctx, "u-edge", "yundian", nil, beforeExpiry)
+	if err != nil {
+		t.Fatalf("resolvePlanForTokenIssuanceWithPlan (before expiry): %v", err)
+	}
+	if chosenPlan2 == nil {
+		t.Fatal("chosenPlan nil for before-expiry reference — expected the plan to surface")
+	}
+	if !hasAccess2 {
+		t.Error("hasAccess = false at beforeExpiry, want true (sub was active at that ref time)")
+	}
+	scope2 := scopeForTokenIssuance(chosenPlan2, &expiredAt, beforeExpiry)
+	if len(scope2) == 0 {
+		t.Error("scope = [] at beforeExpiry, want non-empty (sub was active at that ref time)")
 	}
 }

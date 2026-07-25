@@ -71,18 +71,23 @@ func NewAuthService(
 	}
 }
 
-// peekSubscription returns the user's status='active' subscription plus a
-// boolean flag indicating whether its `expires_at` (if set) is in the past.
-// It does NOT raise an error for an expired row — the decision of whether
-// an expired subscription blocks login or merely downgrades the response
-// is the caller's. The historical `findUsableSubscription` returned
-// ErrSubscriptionExpired and propagated it all the way to the OAuth
-// callback's redirect, which kicked the user back to /auth/login with a
-// banner — a coupling between identity and ability that the user
-// rejected on 2026-07-23. The split between authentication (who you are)
-// and subscription enforcement (what you can do) lives here: peek is
-// pure-read; the policy is up to the caller.
-func (s *AuthService) peekSubscription(ctx context.Context, userID string) (*model.Subscription, bool, error) {
+// peekSubscription returns the user's status='active' subscription
+// along with a now-relative boolean indicating whether the row has
+// already passed its expires_at. The expiry flag uses the same
+// reference time as the caller (typically resolvePlanForTokenIssuance-
+// WithPlan) so the decision agrees with the rest of the auth response.
+//
+// peekSubscription does NOT raise an error for an expired row — the
+// decision of whether an expired subscription blocks login or merely
+// downgrades the response is the caller's. The historical
+// `findUsableSubscription` returned ErrSubscriptionExpired and
+// propagated it all the way to the OAuth callback's redirect, which
+// kicked the user back to /auth/login with a banner — a coupling
+// between identity and ability that the user rejected on 2026-07-23.
+// The split between authentication (who you are) and subscription
+// enforcement (what you can do) lives here: peek is pure-read; the
+// policy is up to the caller.
+func (s *AuthService) peekSubscription(ctx context.Context, userID string, now time.Time) (*model.Subscription, bool, error) {
 	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -90,8 +95,14 @@ func (s *AuthService) peekSubscription(ctx context.Context, userID string) (*mod
 		}
 		return nil, false, fmt.Errorf("get subscription: %w", err)
 	}
-	expired := sub.ExpiresAt != nil && sub.ExpiresAt.Before(time.Now())
-	return sub, expired, nil
+	return sub, isExpiredAt(sub, now), nil
+}
+
+// isExpiredAt reports whether the subscription's expires_at is in the
+// past relative to now. NULL expires_at means "never expires" — see
+// TestPeekSubscription's NULL branch for the lock-down.
+func isExpiredAt(sub *model.Subscription, now time.Time) bool {
+	return sub != nil && sub.ExpiresAt != nil && sub.ExpiresAt.Before(now)
 }
 
 type ProviderUserInfo struct {
@@ -414,12 +425,18 @@ func (s *AuthService) issueTokensForUser(ctx context.Context, user *model.User, 
 }
 
 func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *model.User, appID string, overrideEmail *string, requestedPlan *model.Plan) (*LoginResponse, error) {
-	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuanceWithPlan(ctx, user.ID, appID, requestedPlan)
+	// Capture a single `now` so the expiry check inside
+	// resolvePlanForTokenIssuanceWithPlan and the one inside
+	// scopeForTokenIssuance see the same reference time. Without this,
+	// a subscription that expires between the two reads would yield
+	// hasAccess=true with scope=[] — a quietly broken token.
+	now := time.Now()
+	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuanceWithPlan(ctx, user.ID, appID, requestedPlan, now)
 	if err != nil {
 		return nil, err
 	}
 
-	scope := scopeForTokenIssuance(chosenPlan, expiresAt)
+	scope := scopeForTokenIssuance(chosenPlan, expiresAt, now)
 	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, scope)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
@@ -436,7 +453,7 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 		RefreshToken: hashToken(refreshTokenRaw),
 		Scope:        scope,
 		Revoked:      false,
-		ExpiresAt:    time.Now().Add(s.tokenSvc.RefreshTTL),
+		ExpiresAt:    now.Add(s.tokenSvc.RefreshTTL),
 	}
 	if err := s.sessionRepo.Create(ctx, session); err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
@@ -475,18 +492,37 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 // by login and refresh. chosenPlan is nil when no active subscription exists;
 // an expired subscription preserves its historical plan for the renewal CTA,
 // while scopeForTokenIssuance prevents that plan from granting token scope.
-func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, appID string) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
-	return s.resolvePlanForTokenIssuanceWithPlan(ctx, userID, appID, nil)
+//
+// now is the reference time for the expiry check; see
+// resolvePlanForTokenIssuanceWithPlan for the rationale on why this is
+// threaded explicitly (a subscription expiring between hasAccess
+// evaluation and scope computation would otherwise produce a quietly
+// inconsistent response).
+func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, appID string, now time.Time) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
+	return s.resolvePlanForTokenIssuanceWithPlan(ctx, userID, appID, nil, now)
 }
 
 // resolvePlanForTokenIssuanceWithPlan additionally accepts the explicit plan
 // selected by the dev-only TestLogin path. It is used only when the user has no
 // subscription and is not a replacement for the retired default-plan lookup.
-func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, userID, appID string, requestedPlan *model.Plan) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
-	sub, expired, err := s.peekSubscription(ctx, userID)
+//
+// now is captured once at the start of the function so that hasAccess and
+// the scope computed downstream (via scopeForTokenIssuance) both see the
+// same reference time. Without this, a subscription that expires between
+// the two time.Now() reads (one inside peekSubscription via
+// sub.ExpiresAt.Before(time.Now()), one inside scopeForTokenIssuance)
+// could yield hasAccess=true with scope=[] — internally inconsistent
+// (and a security smell: the response says "you have access" but the
+// token can't reach any app). Callers should always pass the time they
+// want the policy evaluated against.
+func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, userID, appID string, requestedPlan *model.Plan, now time.Time) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
+	sub, expired, err := s.peekSubscription(ctx, userID, now)
 	if err != nil {
 		return nil, "", "", false, nil, err
 	}
+	// Compute expired against the SAME `now` we pass to
+	// scopeForTokenIssuance so the two decisions can't disagree.
+	// (expired is captured above by peekSubscription.)
 
 	if sub == nil {
 		if requestedPlan == nil {
@@ -507,6 +543,12 @@ func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, u
 		}
 		return nil, "", "", false, nil, fmt.Errorf("get plan: %w", err)
 	}
+	// expired is already computed against `now` (see peekSubscription
+	// call site above), so the two branches agree on whether the
+	// subscription has expired. A subscription that expires between
+	// this call and scopeForTokenIssuance cannot produce the
+	// inconsistent hasAccess=true / scope=[] result the D9 fix guards
+	// against.
 	if expired {
 		return plan, plan.ID, plan.Name, false, sub.ExpiresAt, nil
 	}
@@ -518,8 +560,14 @@ func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, u
 // scopeForTokenIssuance returns the currently authorized plan apps. Expired
 // subscriptions retain a chosen plan only for response rendering, and inactive
 // plans are historical records rather than active authorization grants.
-func scopeForTokenIssuance(chosenPlan *model.Plan, expiresAt *time.Time) []string {
-	if chosenPlan == nil || !chosenPlan.IsActive || (expiresAt != nil && expiresAt.Before(time.Now())) {
+//
+// now is the reference time for the expiry check; pass the same value
+// resolvePlanForTokenIssuanceWithPlan captured so a subscription that
+// expires between hasAccess evaluation and this call cannot produce
+// hasAccess=true / scope=[] (see the resolvePlanForTokenIssuanceWithPlan
+// comment for the full rationale).
+func scopeForTokenIssuance(chosenPlan *model.Plan, expiresAt *time.Time, now time.Time) []string {
+	if chosenPlan == nil || !chosenPlan.IsActive || (expiresAt != nil && expiresAt.Before(now)) {
 		return []string{}
 	}
 	return chosenPlan.Apps
@@ -584,12 +632,21 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		return nil, ErrAppInactive
 	}
 
-	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuance(ctx, user.ID, appID)
+	// Capture a single `now` so hasAccess (via the expiry check inside
+	// resolvePlanForTokenIssuance) and the scope computed by
+	// scopeForTokenIssuance both see the same reference time. Without
+	// this, a subscription that expires between the two reads would
+	// yield hasAccess=true with scope=[] — a quietly broken token
+	// (response says "you have access" but the token can't reach any
+	// app). See resolvePlanForTokenIssuanceWithPlan for the full
+	// rationale.
+	now := time.Now()
+	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuance(ctx, user.ID, appID, now)
 	if err != nil {
 		return nil, err
 	}
 
-	scope := scopeForTokenIssuance(chosenPlan, expiresAt)
+	scope := scopeForTokenIssuance(chosenPlan, expiresAt, now)
 	accessToken, err := s.tokenSvc.SignAccessToken(user.ID, appID, scope)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)

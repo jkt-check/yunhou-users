@@ -83,6 +83,10 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `SWEEPER_INTERVAL` | No | `1m` | Must be strictly < `ORDER_EXPIRY_DURATION` |
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
+| `WECHAT_PAY_APP_ID` | No (mock) / **Yes (prod)** | (empty) | WeChat Open Platform 网站应用 appid, written into the v3 NATIVE `UnifiedOrder` request body as `appid`. Part of the six-field production tuple (`internal/config/config.go` Validate). |
+| `WECHAT_PAY_NOTIFY_URL` | No (mock) / **Yes (prod)** | (empty) | Public callback URL passed to `UnifiedOrder` so WeChat knows where to POST async notifications. Part of the six-field production tuple. |
+| `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM path for the merchant's RSA private key (PKCS#1 or PKCS#8); signs every outbound `UnifiedOrder`. Part of the six-field production tuple. |
+| `WECHAT_PAY_MCH_CERT_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM path for the merchant's X.509 certificate; serial (UPPERCASE HEX) goes into the outbound `Authorization` `serial_no`. Part of the six-field production tuple. |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM path; empty = Alipay webhooks return 404 |
 | `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which webhook_id/API base is active |
 | `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | PayPal sandbox webhook ID; empty = sandbox disabled |

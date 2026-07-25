@@ -75,7 +75,12 @@ All configuration is via environment variables (or `.env` file):
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
 | `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
 | `WECHAT_PAY_MOCK` | No | (empty) | `1` enables WeChat Pay v3 webhook plaintext mode (skips HMAC match + AES decrypt); empty / `0` = production. Pairs with `WECHAT_PAY_MCH_ID` (required when not in mock mode). |
-| `WECHAT_PAY_MCH_ID` | No (mock) / **Yes (prod)** | (empty) | 微信支付商户号. Required when `WECHAT_PAY_MOCK` is not `1`. |
+| `WECHAT_PAY_MCH_ID` | No (mock) / **Yes (prod)** | (empty) | 微信支付商户号. **Part of the six-field production tuple** — when `WECHAT_PAY_MOCK` is not `1`, all of `WECHAT_PAY_MCH_ID`, `WECHAT_PAY_API_V3_KEY`, `WECHAT_PAY_APP_ID`, `WECHAT_PAY_MCH_PRIVATE_KEY_PATH`, `WECHAT_PAY_MCH_CERT_PATH`, `WECHAT_PAY_NOTIFY_URL` must be set together (or none for mock). |
+| `WECHAT_PAY_APP_ID` | No (mock) / **Yes (prod)** | (empty) | WeChat Open Platform 网站应用 appid, written into the v3 NATIVE `UnifiedOrder` request body as `appid`. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `WECHAT_PAY_NOTIFY_URL` | No (mock) / **Yes (prod)** | (empty) | Public callback URL (e.g. `https://host/webhooks/payment/wechat_pay`) passed to `UnifiedOrder` so WeChat knows where to POST async notifications. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM file path for the merchant's RSA private key (PKCS#1 or PKCS#8). Signs every outbound `UnifiedOrder` request. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `WECHAT_PAY_MCH_CERT_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM file path for the merchant's X.509 certificate. Its serial number (UPPERCASE HEX) goes into the outbound `Authorization` header `serial_no`. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login?plan_id=<plan-id>`. Set to `1` to enable; any other value (or unset) makes the handler return 404. Every enabled request must supply an explicit Plan ID. Used by `tests/e2e-ui/` and `tests/integration/` to mint JWTs without OAuth. |
 | `WECHAT_OAUTH_MOCK` | No | (empty) | `1` short-circuits `/auth/wechat/*` (no upstream `open.weixin.qq.com` call); empty / `0` = production. Never enable in prod. |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM file path; empty = Alipay webhooks return 404 |
 | `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which PayPal webhook_id/base URL is active |
@@ -83,7 +88,6 @@ All configuration is via environment variables (or `.env` file):
 | `PAYPAL_WEBHOOK_ID_LIVE` | No | (empty) | Empty = PayPal live webhooks return 404 |
 | `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
-| `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login`. Set to `1` to enable; any other value (or unset) makes the handler return 404. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 
 ## API Overview
 

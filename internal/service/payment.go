@@ -1791,97 +1791,51 @@ func (s *PaymentService) providerPreAuth(channel string) error {
 //
 // On any returned error no order row exists (the tx rolled back).
 //
-// When s.db is nil — unit tests pass nil since they exercise the
-// eligibility branches without a real DB — this falls back to the
-// pre-D8 path: FindByID + INSERT outside any tx. The TOCTOU race
-// this leaves open only matters in production where a real DB is
-// threaded; the D8 race tests run against a real test DB.
+// The transactional boundary is owned by PlanRepo.WithTx — the same
+// helper PlanService.CreatePlan/UpdatePlan/DeletePlan use for their
+// D8 mutations. Driving the tx through PlanRepo.WithTx makes the
+// "eligibility reads + order INSERT commit together" guarantee part
+// of the repo contract: callers can't opt out by skipping the wrapper
+// (the previous s.db.BeginTxx path was easy to bypass and the
+// pre-D8 no-tx fallback made it easy to ship a regression). The
+// repo implementation owns begin/commit/rollback; the closure here
+// only threads the tx through FindByIDForShareTx and CreateInTx.
 func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel string, out **model.Order) error {
-	if s.db == nil {
-		return s.eligibilityAndInsertNoTx(ctx, userID, planID, channel, out)
-	}
-	tx, err := s.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // safe after Commit
-
-	plan, err := s.planRepo.FindByIDForShareTx(ctx, tx, planID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrPlanNotFound
+	var order *model.Order
+	err := s.planRepo.WithTx(ctx, func(tx *sqlx.Tx) error {
+		plan, err := s.planRepo.FindByIDForShareTx(ctx, tx, planID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrPlanNotFound
+			}
+			return fmt.Errorf("lock plan: %w", err)
 		}
-		return fmt.Errorf("lock plan: %w", err)
-	}
-	if !plan.IsActive {
-		return ErrPlanInactive
-	}
-	if !plan.AcceptingNewSubscriptions {
-		return ErrPlanNotAcceptingNew
-	}
-	if required, ok := channelRequiredCurrency[channel]; ok && plan.Currency != required {
-		return ErrPlanCurrencyMismatch
-	}
-
-	order := &model.Order{
-		ID:        GenerateUUID(),
-		UserID:    userID,
-		PlanID:    planID,
-		Amount:    plan.Price,
-		Currency:  plan.Currency,
-		Status:    "pending",
-		ExpiresAt: time.Now().Add(s.orderExpiry),
-	}
-	if err := s.orderRepo.CreateInTx(ctx, tx, order); err != nil {
-		return fmt.Errorf("create order: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit eligibility tx: %w", err)
-	}
-	*out = order
-	return nil
-}
-
-// eligibilityAndInsertNoTx is the unit-test fallback for
-// eligibilityAndInsertOrderTx. It still calls FindByIDForShareTx (the
-// lock-step lookup) — even though the FOR SHARE doesn't take effect
-// without a real tx — so unit tests that overwrite the lock-step plan
-// via stubPlanRepo.findByIDForShareTxFn drive the same code path
-// production would. The fallback only exists because unit tests pass
-// s.db == nil; production always threads a real DB.
-func (s *PaymentService) eligibilityAndInsertNoTx(ctx context.Context, userID, planID, channel string, out **model.Order) error {
-	// Use the lock-step lookup (passes nil tx; the production path
-	// would pass a real tx so FOR SHARE takes effect). Tests that want
-	// to model "plan-state changed between FindByID and the lock"
-	// override findByIDForShareTxFn on the stub plan repo to fire the
-	// post-lock truth.
-	plan, err := s.planRepo.FindByIDForShareTx(ctx, nil, planID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrPlanNotFound
+		if !plan.IsActive {
+			return ErrPlanInactive
 		}
-		return fmt.Errorf("find plan: %w", err)
-	}
-	if !plan.IsActive {
-		return ErrPlanInactive
-	}
-	if !plan.AcceptingNewSubscriptions {
-		return ErrPlanNotAcceptingNew
-	}
-	if required, ok := channelRequiredCurrency[channel]; ok && plan.Currency != required {
-		return ErrPlanCurrencyMismatch
-	}
-	order := &model.Order{
-		ID:        GenerateUUID(),
-		UserID:    userID,
-		PlanID:    planID,
-		Amount:    plan.Price,
-		Currency:  plan.Currency,
-		Status:    "pending",
-		ExpiresAt: time.Now().Add(s.orderExpiry),
-	}
-	if err := s.orderRepo.Create(ctx, order); err != nil {
-		return fmt.Errorf("create order: %w", err)
+		if !plan.AcceptingNewSubscriptions {
+			return ErrPlanNotAcceptingNew
+		}
+		if required, ok := channelRequiredCurrency[channel]; ok && plan.Currency != required {
+			return ErrPlanCurrencyMismatch
+		}
+
+		order = &model.Order{
+			ID:        GenerateUUID(),
+			UserID:    userID,
+			PlanID:    planID,
+			Amount:    plan.Price,
+			Currency:  plan.Currency,
+			Status:    "pending",
+			ExpiresAt: time.Now().Add(s.orderExpiry),
+		}
+		if err := s.orderRepo.CreateInTx(ctx, tx, order); err != nil {
+			return fmt.Errorf("create order: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	*out = order
 	return nil

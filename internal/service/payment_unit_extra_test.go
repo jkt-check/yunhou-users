@@ -425,10 +425,12 @@ func TestPaymentService_CreateOrder_WeChatNotConfigured_NoOrphanOrder(t *testing
 // fixture simulates that by returning an active plan from FindByID
 // but an inactive one from FindByIDForShareTx.
 //
-// The unit-test fallback (s.db == nil → no real tx) won't exercise the
-// lock step; we install a FindByIDForShareTxFn that returns the
-// deactivated plan unconditionally. Production runs against a real DB
-// where FOR SHARE blocks concurrent UPDATEs until commit.
+// The unit test runs through stubPlanRepo.WithTx (which delegates to
+// fn(nil) by default) — the FOR SHARE doesn't actually take effect
+// without a real tx, so we install a FindByIDForShareTxFn that
+// returns the deactivated plan unconditionally. Production runs
+// against a real DB where FOR SHARE blocks concurrent UPDATEs until
+// commit.
 func TestPaymentService_CreateOrder_PlanDeactivatedDuringTx(t *testing.T) {
 	orderRepo := &stubOrderRepoLookup{}
 	planRepo := &stubPlanRepo{

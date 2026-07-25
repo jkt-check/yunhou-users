@@ -208,6 +208,10 @@ go test -race -run TestAuthService_Login ./internal/service/
 Database migration:
 ```bash
 # Run in order. Each migration depends on the prior.
+# Recommended: use `make migrate` (cmd/migrate binary) instead of running psql
+# manually — it owns the _migrations ledger so re-running is a no-op.
+# See migrations/README.md for the current file table (001 through 015 as of
+# this writing) and the DDL rules each migration must follow.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
 psql -d yunhou_users -f migrations/003_payments.sql
@@ -216,6 +220,13 @@ psql -d yunhou_users -f migrations/005_paypal_channel.sql
 psql -d yunhou_users -f migrations/006_paypal_sub_mapping.sql
 psql -d yunhou_users -f migrations/007_app_secret.sql
 psql -d yunhou_users -f migrations/008_drop_lemonsqueezy.sql
+psql -d yunhou_users -f migrations/009_wechat_pay_intent.sql
+psql -d yunhou_users -f migrations/010_provider_intent_nullable.sql
+psql -d yunhou_users -f migrations/011_order_reconcile.sql
+psql -d yunhou_users -f migrations/012_plan_commercial_fields.sql
+psql -d yunhou_users -f migrations/013_plan_change_log_fk_set_null.sql
+psql -d yunhou_users -f migrations/014_remove_default_plan.sql
+psql -d yunhou_users -f migrations/015_plan_change_log_nullable_snapshots.sql
 ```
 
 ## Tech Stack

@@ -19,7 +19,7 @@ Yunhou Users is a **shared user management API** serving multiple consumer appli
 
 Plans are the commercial source of truth. In addition to identity, price, interval, app scope, and active state, each Plan carries `is_listed`, `accepting_new_subscriptions`, `currency`, `trial_days`, nullable `description`, `display_order`, and DB-managed `updated_at`. `currency` is restricted to `CNY` / `USD` / `EUR`, `trial_days` must be non-negative, and quote/order currency plus quote trial duration are derived from the Plan.
 
-`is_listed` controls catalog presentation independently from `accepting_new_subscriptions`, which controls whether new subscriptions/orders may be created. The seeded `quarterly` Plan is a legacy offer (`accepting_new_subscriptions=false`) but existing subscriptions may still renew. The `free` Plan is being retired (`is_active=false`, `accepting_new_subscriptions=false` in Phase 2). Admin create/patch already reject any `is_default` input with 400; Phase 2 removes the column and the default-plan fallback entirely.
+`is_listed` controls catalog presentation independently from `accepting_new_subscriptions`, which controls whether new subscriptions/orders may be created. The seeded `quarterly` Plan is a legacy offer (`accepting_new_subscriptions=false`) but existing subscriptions may still renew. Migration 014 retired the `free` Plan (`is_active=false`, `accepting_new_subscriptions=false`), dropped the `is_default` column, and removed the default-plan fallback. Admin create/patch reject any legacy `is_default` input with 400.
 
 ### Layering
 
@@ -82,11 +82,14 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `ORDER_EXPIRY_DURATION` | No | `30m` | Pending order TTL; sweeper flips to `expired` after this |
 | `SWEEPER_INTERVAL` | No | `1m` | Must be strictly < `ORDER_EXPIRY_DURATION` |
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
-| `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
-| `WECHAT_PAY_APP_ID` | No (mock) / **Yes (prod)** | (empty) | WeChat Open Platform 网站应用 appid, written into the v3 NATIVE `UnifiedOrder` request body as `appid`. Part of the six-field production tuple (`internal/config/config.go` Validate). |
-| `WECHAT_PAY_NOTIFY_URL` | No (mock) / **Yes (prod)** | (empty) | Public callback URL passed to `UnifiedOrder` so WeChat knows where to POST async notifications. Part of the six-field production tuple. |
-| `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM path for the merchant's RSA private key (PKCS#1 or PKCS#8); signs every outbound `UnifiedOrder`. Part of the six-field production tuple. |
-| `WECHAT_PAY_MCH_CERT_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM path for the merchant's X.509 certificate; serial (UPPERCASE HEX) goes into the outbound `Authorization` `serial_no`. Part of the six-field production tuple. |
+| `WECHAT_PAY_API_V3_KEY` | Required when enabling real-mode WeChat Pay | (empty) | Exactly 32 bytes in real mode; part of the six-field all-or-none tuple below. All six may be empty when real WeChat Pay is disabled. |
+| `WECHAT_PAY_MCH_ID` | Required when enabling real-mode WeChat Pay | (empty) | 微信支付商户号; part of the six-field all-or-none tuple enforced by `Config.Validate`. |
+| `WECHAT_PAY_APP_ID` | Required when enabling real-mode WeChat Pay | (empty) | WeChat Open Platform 网站应用 appid, written into the v3 NATIVE `UnifiedOrder` request body as `appid`. Part of the six-field tuple. |
+| `WECHAT_PAY_NOTIFY_URL` | Required when enabling real-mode WeChat Pay | (empty) | Public callback URL passed to `UnifiedOrder` so WeChat knows where to POST async notifications. Part of the six-field tuple. |
+| `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` | Required when enabling real-mode WeChat Pay | (empty) | PEM path for the merchant's RSA private key (PKCS#1 or PKCS#8); signs every outbound `UnifiedOrder`. Part of the six-field tuple. |
+| `WECHAT_PAY_MCH_CERT_PATH` | Required when enabling real-mode WeChat Pay | (empty) | PEM path for the merchant's X.509 certificate; serial (UPPERCASE HEX) goes into the outbound `Authorization` `serial_no`. Part of the six-field tuple. |
+| `WECHAT_PAY_MOCK` | No | (empty) | `1` enables mock WeChat Pay; mock mode may leave the six real-mode fields empty or partially populated. Never enable in production. |
+| `WECHAT_OAUTH_MOCK` | No | (empty) | `1` short-circuits WeChat OAuth upstream calls for development/testing. Never enable in production. |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM path; empty = Alipay webhooks return 404 |
 | `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which webhook_id/API base is active |
 | `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | PayPal sandbox webhook ID; empty = sandbox disabled |
@@ -94,12 +97,12 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Not consumed by the running redirect flow — `/auth/github/*` reads each app's GitHub OAuth App credentials from `apps.config.oauth_providers.github` in the DB. Safe to leave blank. |
-| `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the OAuth `state` parameter (`/auth/{github,wechat}/redirect` + `/auth/{github,wechat}/callback`). The state binding is provider-agnostic — both flows share `util.IssueOAuthState` and bind `(app_id, callback_index)`. Server-side only — multi-instance deployments must share the same value. **Minimum 32 characters** — `Validate()` (`internal/config/config.go:127`) rejects shorter values. Generate with `openssl rand -hex 32`. |
+| `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the OAuth `state` parameter (`/auth/{github,wechat}/redirect` + `/auth/{github,wechat}/callback`). The state binding is provider-agnostic — both flows share `util.IssueOAuthState` and bind `(app_id, callback_index)`. Server-side only — multi-instance deployments must share the same value. **Minimum 32 characters** — `Config.Validate` rejects shorter values. Generate with `openssl rand -hex 32`. |
 | `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login?plan_id=<plan-id>`. `1` enables the endpoint; any other value (or unset) makes the handler return 404. Every enabled request must supply an explicit Plan ID. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
 
 ## API Response Format
 
-All endpoints return:
+JSON business endpoints generally return:
 ```json
 {"code": <int>, "data": <object|null>, "message": <string|null>}
 ```
@@ -108,16 +111,18 @@ All endpoints return:
 - `data`: response payload on success, null on error
 - `message`: null on success, error description on error
 
+Exceptions: `GET /.well-known/jwks.json` returns a raw JWKS object, while successful OAuth redirect/callback endpoints return HTTP 302 redirects rather than JSON.
+
 ## Endpoints
 
 **Public** (rate-limited 10/s burst 20 per IP):
 - `GET /.well-known/jwks.json`, `POST /auth/refresh`, `POST /auth/logout`
-- `GET /apps/:id/plans` — returns active Plans as `PublicPlan` DTOs, including `currency`, `trial_days`, nullable `description`, and `display_order` alongside price/app/provider/cycle data.
-- `GET /auth/github/redirect` and `GET /auth/github/callback` — the GitHub OAuth Authorization Code flow. Yunhou holds the OAuth App's `client_secret` and runs the code exchange server-side; the BFF supplies only `client_id` (via redirect URL) and a `redirect_uri` matching an entry in `apps.config.oauth_providers.github.callback_urls`. See "Boundary" below.
+- `GET /apps/:id/plans` — returns active and listed Plans (`is_active=true AND is_listed=true`) as `PublicPlan` DTOs, including `currency`, `trial_days`, nullable `description`, and `display_order` alongside price/app/provider/cycle data.
+- `GET /auth/github/redirect` and `GET /auth/github/callback` — the GitHub OAuth Authorization Code flow. Yunhou holds the OAuth App's `client_secret` and runs the code exchange server-side; the BFF supplies Yunhou `app_id` and a whitelisted `redirect_uri`; Yunhou loads the OAuth credentials from the app configuration. See "Boundary" below.
 - `GET /auth/wechat/redirect` and `GET /auth/wechat/callback` — the WeChat Open Platform 网站应用 (QR-code) OAuth2.0 flow. Same posture as GitHub: Yunhou holds each app's `app_secret` and runs the code exchange server-side. The authorize URL is `open.weixin.qq.com/connect/qrconnect` (with mandatory `#wechat_redirect` fragment), and `redirect_uri` must match an entry in `apps.config.oauth_providers.wechat.callback_urls`. Yunhou REJECTS logins where `/sns/userinfo` lacks `unionid` (returned as `#error=auth_failed&reason=wechat_no_unionid`).
-- `POST /test/login?plan_id=<plan-id>` — **dev-only** (gated by `PAYPAL_L3_E2E_MODE=1`, otherwise returns 404). `plan_id` is required; missing returns 400, unknown returns 404, and inactive/not-accepting Plans return 400. Used by `tests/e2e-ui/` and `tests/integration/` to mint JWTs without going through OAuth. Never exposed in production.
+- `POST /test/login?plan_id=<plan-id>` — **dev-only** (gated by `PAYPAL_L3_E2E_MODE=1`, otherwise returns 404). `plan_id` is required; missing returns 400, unknown returns 404, inactive Plans return 400, while non-accepting Plans return 409 with `plan is not accepting new subscriptions`. Used by `tests/e2e-ui/` and `tests/integration/` to mint JWTs without going through OAuth. Never exposed in production.
 
-**Health probe** (NOT rate-limited — registered before the public limiter in `internal/router/router.go:35`):
+**Health probe** (NOT rate-limited — registered before the public limiter in `router.Setup`):
 - `GET /healthz` — DB-backed liveness/readiness. Returns 200 `{"code":0,"data":{"status":"ok"}}` or 503 `{"code":503,"message":"db unavailable"}` if the DB ping fails.
 
 **User** (JWT Bearer auth, no explicit rate limit on `/user/*`):
@@ -174,6 +179,6 @@ The same boundary applies to WeChat Open Platform 网站应用 (website app) log
 | WeChat `access_token` (after code exchange) | yunhou-users (transient) | Used exactly once — `/sns/userinfo` — then dropped. Never written to DB. Never returned to the BFF. |
 | WeChat `refresh_token` (after code exchange) | yunhou-users (transient) | Discarded. Yunhou has its own refresh-token model; the WeChat refresh_token has no use beyond refreshing the WeChat access_token, which Yunhou does not need post-login. |
 
-**Identity key:** `social_identities.provider_uid = "wechat_" + unionid`. Yunhou REJECTS logins where `/sns/userinfo` does not return `unionid` (i.e. the user did not grant `snsapi_userinfo` scope). This rejects per-app identity fragmentation — without unionid, the same WeChat user across two Yunhou consumer apps would get two Yunhou accounts.
+**Identity key:** `social_identities.provider_uid = "wechat_" + unionid`. Yunhou REJECTS logins where `/sns/userinfo` does not return `unionid`. The 网站应用 flow requests only `scope=snsapi_login`; a missing `unionid` generally indicates that the website app is not bound under the same WeChat Open Platform account required for cross-app identity unification. This rejects per-app identity fragmentation — without unionid, the same WeChat user across two Yunhou consumer apps would get two Yunhou accounts.
 
 **Cross-app unionid unification** requires all Yunhou consumer apps to register their WeChat 网站应用 under the SAME 微信开放平台 account. This is a Tencent-side requirement, not enforced in code; operators document it in the consumer-app onboarding runbook.

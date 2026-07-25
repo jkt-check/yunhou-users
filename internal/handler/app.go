@@ -546,6 +546,28 @@ type PlanHandler struct {
 	quoteSvc QuoteLookup
 }
 
+// adminActorID returns the audit-log attribution string for the
+// authenticated internal-app caller: "admin:<appID>". The
+// InternalAppAuth middleware has already verified the X-App-ID +
+// X-App-Secret pair and stored the *model.App at middleware.ContextApp,
+// so reading it here is safe (panic if absent is the same blast radius
+// as the rest of the admin group — the middleware guarantees the value).
+//
+// We deliberately thread the appID (not the user) into the audit log:
+// the /admin/* endpoints are internal-service-to-service calls, not
+// user-initiated, so the relevant attribution is "which admin app did
+// this" rather than "which user clicked the button". Returns
+// "admin:unknown" if the context key is somehow missing (defensive —
+// the middleware would have aborted the request before reaching here).
+func adminActorID(c *gin.Context) string {
+	if v, ok := c.Get(middleware.ContextApp); ok {
+		if app, ok := v.(*model.App); ok && app != nil && app.AppID != "" {
+			return "admin:" + app.AppID
+		}
+	}
+	return "admin:unknown"
+}
+
 // QuoteLookup is the subset of QuoteService the handler uses. Defined here so
 // handler tests can plug in a fake without standing up the full service stack.
 type QuoteLookup interface {
@@ -717,7 +739,7 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 		Description:               req.Description,
 		DisplayOrder:              req.DisplayOrder,
 	}
-	if err := h.planSvc.CreatePlan(c.Request.Context(), plan); err != nil {
+	if err := h.planSvc.CreatePlan(c.Request.Context(), plan, adminActorID(c)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create plan"})
 		return
 	}
@@ -796,7 +818,7 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 		plan.IsActive = *req.IsActive
 	}
 
-	if err := h.planSvc.UpdatePlan(c.Request.Context(), plan); err != nil {
+	if err := h.planSvc.UpdatePlan(c.Request.Context(), plan, adminActorID(c)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update plan"})
 		return
 	}
@@ -806,7 +828,7 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 
 func (h *PlanHandler) DeletePlan(c *gin.Context) {
 	id := c.Param("id")
-	if err := h.planSvc.DeletePlan(c.Request.Context(), id); err != nil {
+	if err := h.planSvc.DeletePlan(c.Request.Context(), id, adminActorID(c)); err != nil {
 		// Postgres returns SQLSTATE 23503 when a FK reference prevents the
 		// delete; surface that as a 409 Conflict with a clear message.
 		if isFKViolation(err) {

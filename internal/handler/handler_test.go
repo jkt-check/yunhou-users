@@ -123,6 +123,7 @@ type mockPlanSvc struct {
 	createErr       error
 	updateErr       error
 	deleteErr       error
+	lastActorID     string
 }
 
 func (m *mockPlanSvc) ListPlans(ctx context.Context) ([]model.Plan, error) {
@@ -165,23 +166,26 @@ func (m *mockPlanSvc) ValidateApps(ctx context.Context, apps []string) error {
 	return m.validateAppsErr
 }
 
-func (m *mockPlanSvc) CreatePlan(ctx context.Context, p *model.Plan) error {
+func (m *mockPlanSvc) CreatePlan(ctx context.Context, p *model.Plan, actorID string) error {
 	if m.createErr != nil {
 		return m.createErr
 	}
 	m.plan = p
+	m.lastActorID = actorID
 	return nil
 }
 
-func (m *mockPlanSvc) UpdatePlan(ctx context.Context, p *model.Plan) error {
+func (m *mockPlanSvc) UpdatePlan(ctx context.Context, p *model.Plan, actorID string) error {
 	if m.updateErr != nil {
 		return m.updateErr
 	}
 	m.plan = p
+	m.lastActorID = actorID
 	return nil
 }
 
-func (m *mockPlanSvc) DeletePlan(ctx context.Context, id string) error {
+func (m *mockPlanSvc) DeletePlan(ctx context.Context, id string, actorID string) error {
+	m.lastActorID = actorID
 	return m.deleteErr
 }
 

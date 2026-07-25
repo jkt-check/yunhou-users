@@ -36,9 +36,9 @@ type PlanServiceInterface interface {
 	ListPlans(ctx context.Context) ([]model.Plan, error)
 	GetPlan(ctx context.Context, id string) (*model.Plan, error)
 	FindByApp(ctx context.Context, appID string) ([]model.Plan, error)
-	CreatePlan(ctx context.Context, p *model.Plan) error
-	UpdatePlan(ctx context.Context, p *model.Plan) error
-	DeletePlan(ctx context.Context, id string) error
+	CreatePlan(ctx context.Context, p *model.Plan, actorID string) error
+	UpdatePlan(ctx context.Context, p *model.Plan, actorID string) error
+	DeletePlan(ctx context.Context, id string, actorID string) error
 }
 
 // PaymentServiceInterface is the v1 payment data flow surface that handlers

@@ -25,35 +25,18 @@ Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一
 
 用户在你的应用中点击登录后：
 
-1. 你的前端引导用户进入 §"GitHub OAuth 授权码流程" 完成登录
-2. GitHub 回调成功后 Yunhou 把 JWT 通过 URL 片段返回给 BFF（见 §"GitHub OAuth 授权码流程"）
-3. BFF 用 JWT 调后续接口，refresh token 用于延长会话
+1. 前端引导用户完成 GitHub 或 WeChat OAuth 重定向流程。
+2. 成功时 Yunhou 返回 HTTP 302，跳转到白名单中的 BFF `redirect_uri`，凭据位于 URL fragment：
 
-响应：
-```json
-{
-  "code": 0,
-  "data": {
-    "access_token": "eyJhbGciOiJSUzI1NiIs...",
-    "refresh_token": "a1b2c3d4e5f6...",
-    "user": {
-      "id": "550e8400-e29b-41d4-a716-446655440002",
-      "nickname": "张三",
-      "email": "user@example.com",
-      "avatar_url": "https://avatars.githubusercontent.com/u/12345"
-    },
-    "subscription": {
-      "plan_id": "monthly",
-      "plan_name": "按月订阅",
-      "has_access": true,
-      "expires_at": "2026-12-19T00:00:00Z",
-      "is_accepting_new": true
-    }
-  }
-}
+```text
+https://app.example.com/auth/callback#token=<access_token>&refresh_token=<refresh_token>&user_id=<uuid>&has_access=<bool>
 ```
 
-**关键字段**：`data.subscription.has_access` 表示用户是否可以访问当前 App；它只在订阅有效、Plan 启用且 `plan.apps` 包含当前 `app_id` 时为 `true`。`data.subscription.is_accepting_new` 表示该 Plan 当前是否仍接受新订阅，不等价于访问权限。无订阅或订阅已过期时 `has_access=false` 且 JWT `scope=[]`；过期订阅仍保留历史 `plan_id` 供续费页面使用。
+3. 回调页用客户端 JavaScript 解析 fragment；fragment 不会发送到服务器。BFF 后续使用 JWT 调 API，并安全保存 refresh token 用于延长会话。
+
+`has_access` 只在订阅有效、Plan 启用且 `plan.apps` 包含当前 `app_id` 时为 `true`。无订阅或订阅已过期时 `has_access=false` 且 JWT `scope=[]`。
+
+完整 JSON token 响应由 `POST /auth/refresh` 返回，示例见该接口章节。`POST /auth/logout` 仅撤销 refresh token，单独见登出章节。
 
 **商业 Plan 新增错误**：
 
@@ -62,10 +45,6 @@ Yunhou Users 是一个共享用户管理 API，所有接入的应用共享同一
 | `ErrPlanNotAcceptingNew` | 409 | 创建订阅或订单时，Plan 不接受新订阅 |
 | `ErrPlanCurrencyMismatch` | 400 | 下单渠道要求的币种与 `plan.currency` 不一致 |
 | `ErrInvalidAppID` | 400 | 管理端创建/更新 Plan 时，`apps` 含未知或已停用的 App ID |
-
-**字段约束（重要）**：`data.user.nickname` / `data.user.email` / `data.user.avatar_url` 都是 optional（GitHub 没返回 email、用户没设头像时整个字段**缺失**而不是 `null`）；`data.subscription.expires_at` 同理（订阅永不过期时缺失）。`data.subscription.is_accepting_new` 是始终返回的 boolean（无可用 Plan 时为 `false`）。集成方用 TypeScript / Go struct 等静态类型时需把 optional 字段标为 `?:` / `*string` / `*time.Time`，否则会编译失败或 runtime 报错。
-
-`POST /auth/refresh` 与 `POST /auth/logout` 返回相同 envelope，所以同样的 optional 字段约定适用。
 
 ### 3. 调用用户信息接口
 
@@ -209,9 +188,21 @@ curl https://your-yunhou-domain/user/profile \
 {"code": 0, "message": "logged out"}
 ```
 
+#### POST /test/login
+
+仅用于开发和测试环境。端点由 `PAYPAL_L3_E2E_MODE=1` 开启；未开启时始终返回 404，生产环境不得启用。
+
+```bash
+curl -X POST "https://your-yunhou-domain/test/login?plan_id=monthly" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"dev@example.com","app_id":"yundian"}'
+```
+
+`plan_id` 查询参数、请求体中的 `email` 和 `app_id` 均必填。成功时返回 200 和标准登录 JSON（access token、一次性 refresh token、user、subscription）。状态码：缺少/非法输入或 Plan inactive 为 400；功能未开启或 Plan 不存在为 404；Plan 不接受新订阅为 409 `plan is not accepting new subscriptions`；成功为 200。
+
 #### GET /apps/:id/plans
 
-公共的 Plan 目录接口，**无需鉴权**（无需 `X-App-ID`、无需 JWT）。返回指定 App 当前启用的 Plans，按 `display_order ASC, created_at ASC, id ASC` 排序。响应使用精简的 `PublicPlan` DTO，包含商业展示字段及上游渠道的 plan ID / variant ID。
+公共的 Plan 目录接口，**无需鉴权**（无需 `X-App-ID`、无需 JWT）。返回指定 App 当前启用且公开展示的 Plans（`is_active=true AND is_listed=true`），按 `display_order ASC, created_at ASC, id ASC` 排序。响应使用精简的 `PublicPlan` DTO，包含商业展示字段及上游渠道的 plan ID / variant ID。
 
 **响应（200）**：
 ```json
@@ -609,7 +600,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### POST /apps/:id/quote
 
-下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**（终端用户身份触发；调用方必须先完成 GitHub OAuth 登录并拿到 JWT），handler 读 JWT 上下文中的 `user_id`。**注意**：当前**不强制 `subscription.has_access` gating**——任何已登录用户都可以对包含目标 app 的 Plan 发起 quote，前端必须自己根据 `subscription.has_access` 决定是否展示下单按钮。
+下单前的"取报价"接口。BFF 拿到 `data` 后直接把 `provider_data` 透传给 PayPal 创建 checkout session；`sub_expires_at` 是 yunhou-users 在 webhook 确认订阅时填进 `subscriptions.expires_at` 的值。**鉴权为 JWT Bearer**（终端用户身份触发；调用方必须先完成 GitHub 或 WeChat OAuth 登录并拿到 Yunhou JWT），handler 读 JWT 上下文中的 `user_id`。**注意**：当前**不强制 `subscription.has_access` gating**——任何已登录用户都可以对包含目标 app 的 Plan 发起 quote，前端必须自己根据 `subscription.has_access` 决定是否展示下单按钮。
 
 **路径参数**：`id` 是 App ID。
 
@@ -1233,7 +1224,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 > **WeChat `?error=access_denied` 等授权失败参数走另一条路径**：state + app 校验通过后会**直接 302 跳回 BFF**，在 URL fragment 里塞 `error=...&error_description=...`（不返回 JSON）。BFF 端需在 `redirect_uri` 落地的回调页同时处理 fragment 里的 `token` 和 `error`。
 >
-> **缺失 unionid 的拒绝路径**：`/sns/userinfo` 未返回 `unionid`（典型原因：网站应用未申请 `snsapi_userinfo` 权限，或用户在手机上拒绝了授权）→ yunhou 不会签发 yunhou JWT，而是直接 302 跳回 BFF，`#error=auth_failed&reason=wechat_no_unionid`。BFF 必须在回调页识别这个 reason 并展示对应文案。
+> **缺失 unionid 的拒绝路径**：`/sns/userinfo` 未返回 `unionid`（通常说明该网站应用没有绑定到用于跨 App 身份统一的同一微信开放平台账号；网站应用流程只请求 `snsapi_login`）→ yunhou 不会签发 yunhou JWT，而是直接 302 跳回 BFF，`#error=auth_failed&reason=wechat_no_unionid`。BFF 必须在回调页识别这个 reason 并展示对应文案。
 
 #### GET /auth/wechat/redirect
 
@@ -1246,7 +1237,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | `app_id` | 是 | Yunhou app 标识 |
 | `redirect_uri` | 是 | 微信回调完成后跳转的 BFF URL，必须命中 `apps.config.oauth_providers.wechat.callback_urls` 中的某一项 |
 
-**响应（302）**：跳转 `https://open.weixin.qq.com/connect/qrconnect?appid=...&redirect_uri=...&response_type=code&scope=snsapi_login,snsapi_userinfo&state=<HMAC>#wechat_redirect`。`#wechat_redirect` 片段是腾讯侧要求的，缺失会导致「该链接无法访问」。
+**响应（302）**：跳转 `https://open.weixin.qq.com/connect/qrconnect?appid=...&redirect_uri=...&response_type=code&scope=snsapi_login&state=<HMAC>#wechat_redirect`。`#wechat_redirect` 片段是腾讯侧要求的，缺失会导致「该链接无法访问」。
 
 **错误响应**：
 
@@ -1302,10 +1293,10 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | reason | 触发条件 |
 |---|---|
 | `wechat_upstream` | 微信上游调用失败（`/sns/oauth2/access_token` 或 `/sns/userinfo` 返回非 2xx / errcode ≠ 0 / 网络错误 / 解码失败 / 空 openid 等） |
-| `wechat_no_unionid` | `/sns/userinfo` 响应中 `unionid` 字段为空（用户拒绝授权 snsapi_userinfo 或 app 未申请该权限） |
+| `wechat_no_unionid` | `/sns/userinfo` 响应中 `unionid` 字段为空；通常说明网站应用未绑定在要求的同一微信开放平台账号下 |
 | `user_not_found` | 防御性：JWT 主题无法解析到用户行（理论上不应发生）；`ErrUserDeleted` 也归并到此 reason |
 | `user_suspended` | 用户账号被停用 |
-| ~~`subscription_expired`~~ | **已弃用（2026-07-23）**：身份层与能力层解耦后，`findUsableSubscription`/`ErrSubscriptionExpired` 不再在 OAuth callback 触发登录失败；过期订阅表现为 `/auth/me` 中 `Subscription.HasAccess=false`，浏览器落在 `/console` + 续费 banner。该 reason 保留在 BFF 上但不再由 Yunhou 发出 — 若再次出现，说明别处出现了回归。 |
+| ~~`subscription_expired`~~ | **已弃用（2026-07-23）**：身份层与能力层解耦后，`findUsableSubscription`/`ErrSubscriptionExpired` 不再在 OAuth callback 触发登录失败；过期订阅表现为登录/refresh 输出或 OAuth callback fragment 中 `has_access=false`，浏览器可落在 `/console` + 续费 banner。该 reason 保留在 BFF 上但不再由 Yunhou 发出 — 若再次出现，说明别处出现了回归。 |
 | `app_not_found` / `app_disabled` | `app_id` 不存在或已停用 |
 
 #### 边界总结
@@ -1671,7 +1662,7 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 - **判别 dedupe 请用 `duplicate: true`**，不要用 `domain_action == "none"`——后者只是"事件被记录但未触发业务动作"，不代表已处理。
 - **dedupe 命中时 `domain_action` 字段为空字符串**（**不是** `none` 也不是某个已知值）——handler 在 dedupe 命中路径上不会经过 switch 分支直接返回。所以重复事件的真实 payload 是 `{"received": true, "domain_action": "", "duplicate": true}`。做 retry 决策时只信 `duplicate` 字段。
 
-订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、PayPal `resource.billing_info.next_billing_time`（renewal `PAYMENT.SALE.COMPLETED` 事件携带；其他事件若无则忽略）。**前端必须从 `plan.interval_days` + 业务规则计算后写入**；yunhou-users 不做服务端推导。
+订阅过期时间通过 channel metadata 传入（RFC3339）：Stripe `data.object.metadata.sub_expires_at`、WeChat 解密后的 `resource.sub_expires_at`、Alipay form 字段 `sub_expires_at`、PayPal `resource.billing_info.next_billing_time`（renewal `PAYMENT.SALE.COMPLETED` 事件携带；其他事件若无则忽略）。**BFF 应把服务端 `/apps/:id/quote` 返回的 `sub_expires_at` 写入 checkout metadata**；webhook handler 不会重新计算收到的 metadata，而是按渠道回传值处理。
 
 ### Quote 路径 vs Confirm 路径：sub_expires_at 来源冲突
 
@@ -1703,11 +1694,12 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 
 错误响应：
 
-为防止枚举攻击（attacker 通过差异化响应探测合法 `X-App-ID` / 哪个 app 启用了 secret），中间件对**所有**鉴权失败路径（缺失 `X-App-ID`、`X-App-ID` 不存在、缺失 `X-App-Secret`、`secret` 不匹配、`secret_hash` 未初始化、`app` 停用）一律返回 `401 "invalid app_secret"`。调用方无法仅凭响应区分"app 不存在"与"secret 错"；底层原因仅记入 server 日志供运维排查。
+缺失 `X-App-ID` 会返回独立错误，便于调用方修正请求。提供 `X-App-ID` 后，其余失败路径使用统一的 `invalid app_secret`，避免通过差异化响应枚举 app 状态或 secret 配置。
 
 | HTTP | message | 触发条件 |
 |------|---------|----------|
-| 401 | `invalid app_secret` | **所有**鉴权失败（缺失头、app 不存在、app 停用、`secret` 不匹配、`secret_hash` 未初始化）——统一消息，用于防枚举 |
+| 401 | `missing X-App-ID header` | 缺少 `X-App-ID` |
+| 401 | `invalid app_secret` | 其余鉴权失败：app 不存在/停用、缺少或不匹配 `X-App-Secret`、`secret_hash` 未初始化 |
 
 **Rotation 流程**：怀疑 `X-App-Secret` 泄漏（例如 BFF 容器镜像被 pull 过、CI 缓存里出现过）时，立即调：
 
@@ -1887,7 +1879,7 @@ GET /.well-known/jwks.json
 
 | 接口类别 | 限制 | 说明 |
 |---------|------|------|
-| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/refresh`, `/auth/logout`, `/auth/github/*`, `/auth/wechat/*`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内（最早期注册，绕过 limiter）；`/apps/:id/plans` 公共可访问（无需鉴权）；`/auth/wechat/redirect` 与 `/auth/wechat/callback` 与 `/auth/github/*` 共用同一 limiter |
+| 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/refresh`, `/auth/logout`, `/auth/github/*`, `/auth/wechat/*`, `/test/login`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内（最早期注册，绕过 limiter）；`/apps/:id/plans` 公共可访问（无需鉴权）；`/auth/wechat/redirect` 与 `/auth/wechat/callback` 与 `/auth/github/*` 共用同一 limiter |
 | 内部服务接口（`/apps`, `/apps/:id`, `/apps/:id/provider-token/:channel`, `/admin/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 `X-App-ID` 头 + `X-App-Secret` 头 |
 | 用户态接口（`POST /apps/:id/quote`, `/payments/*`, `/refunds/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 JWT（终端用户身份） |
 | 用户接口（`/user/*`） | 无显式限制 | 仅要求 JWT |
@@ -1898,7 +1890,7 @@ GET /.well-known/jwks.json
 ## 快速接入清单
 
 - [ ] 获取应用的 `app_id` + `app_secret`（`POST /admin/apps` 响应里 `data.secret`，仅一次性返回，需立即落地）
-- [ ] BFF 调 `/apps/:id/plans`、`/apps/:id/provider-token/:channel`、所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`
+- [ ] BFF 仅在调用 `/apps/:id/provider-token/:channel` 和所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`；`/apps/:id/plans` 是公共目录，无需鉴权
 - [ ] 实现 GitHub OAuth 重定向登录：BFF 302 到 `/auth/github/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，让浏览器走完 GitHub 授权；回调页从 URL fragment 解析 `token` / `refresh_token` / `user_id` / `has_access`（注意 fragment 不会上行到服务器，BFF 必须前端 JS 解析）
 - [ ] （可选）实现 WeChat OAuth 扫码登录：BFF 302 到 `/auth/wechat/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，PC 浏览器展示二维码；用户手机微信扫码后在回调页同样从 URL fragment 解析 token；需要识别 fragment 里的 `error=auth_failed&reason=wechat_no_unionid` 并展示对应文案；所有 Yunhou 消费 app 的「网站应用」必须注册在**同一个微信开放平台账号**下才能跨 app unionid 统一
 - [ ] 解析响应中的 `subscription.has_access` 字段，判断用户是否有权限访问

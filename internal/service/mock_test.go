@@ -152,9 +152,21 @@ func (m *mockSocialIdentityRepo) DeleteIfNotLast(_ context.Context, id, userID s
 
 // --- PlanRepo mock ---
 
+// planRepoTxCall records a tx-scoped write to mockPlanRepo. Used by
+// tests that assert on call ordering (e.g. InsertTx must precede
+// DeleteTx in DeletePlan so the plan_change_log.plan_id FK is still
+// satisfied at INSERT time).
+type planRepoTxCall struct {
+	op     string // "CreateTx" | "UpdateTx" | "DeleteTx"
+	planID string
+	at     time.Time
+}
+
 type mockPlanRepo struct {
-	plans map[string]*model.Plan
-	err   error
+	plans     map[string]*model.Plan
+	err       error
+	deleteErr error // forces Delete/DeleteTx to fail (e.g. FK violation 23503)
+	txCalls   []planRepoTxCall
 	// lookupErrForIDs forces FindByID to return the named error for the
 	// listed IDs even if a row was previously seeded into plans. Used by
 	// tests that model "plan row exists in DB but the lookup observed a
@@ -250,6 +262,9 @@ func (m *mockPlanRepo) Delete(_ context.Context, id string) error {
 	if m.err != nil {
 		return m.err
 	}
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
 	delete(m.plans, id)
 	return nil
 }
@@ -258,14 +273,19 @@ func (m *mockPlanRepo) Delete(_ context.Context, id string) error {
 // Create / Update / Delete. The mock treats them the same as the
 // non-tx variants — there is no separate tx state to model. Service
 // tests verify call sequences via the captured state in m.plans +
-// changeLogRepo.calls.
+// changeLogRepo.calls + m.txCalls (the latter is appended in
+// timestamp order so tests that need to assert InsertTx happens
+// before DeleteTx can sort both mock slices by `at`).
 func (m *mockPlanRepo) CreateTx(_ context.Context, _ *sqlx.Tx, p *model.Plan) error {
+	m.txCalls = append(m.txCalls, planRepoTxCall{op: "CreateTx", planID: p.ID, at: time.Now()})
 	return m.Create(context.Background(), p)
 }
 func (m *mockPlanRepo) UpdateTx(_ context.Context, _ *sqlx.Tx, p *model.Plan) error {
+	m.txCalls = append(m.txCalls, planRepoTxCall{op: "UpdateTx", planID: p.ID, at: time.Now()})
 	return m.Update(context.Background(), p)
 }
 func (m *mockPlanRepo) DeleteTx(_ context.Context, _ *sqlx.Tx, id string) error {
+	m.txCalls = append(m.txCalls, planRepoTxCall{op: "DeleteTx", planID: id, at: time.Now()})
 	return m.Delete(context.Background(), id)
 }
 
@@ -302,12 +322,17 @@ func (m *mockPlanRepo) WithTx(ctx context.Context, fn func(*sqlx.Tx) error) erro
 
 // --- PlanChangeLogRepo mock ---
 
+// planChangeLogCall records one Insert / InsertTx invocation. The `at`
+// timestamp lets tests that span multiple mocks (e.g. asserting
+// InsertTx happens before DeleteTx in DeletePlan) correlate across
+// mockPlanChangeLogRepo.calls and mockPlanRepo.txCalls.
 type planChangeLogCall struct {
 	planID     string
 	actorID    string
 	changeType string
 	before     *model.Plan
 	after      *model.Plan
+	at         time.Time
 }
 
 type mockPlanChangeLogRepo struct {
@@ -326,6 +351,7 @@ func (m *mockPlanChangeLogRepo) Insert(ctx context.Context, planID, actorID, cha
 		changeType: changeType,
 		before:     before,
 		after:      after,
+		at:         time.Now(),
 	})
 	if m.insertFunc != nil {
 		return m.insertFunc(ctx, planID, actorID, changeType, before, after)
@@ -344,6 +370,7 @@ func (m *mockPlanChangeLogRepo) InsertTx(ctx context.Context, _ *sqlx.Tx, planID
 		changeType: changeType,
 		before:     before,
 		after:      after,
+		at:         time.Now(),
 	})
 	if m.insertFunc != nil {
 		return m.insertFunc(ctx, planID, actorID, changeType, before, after)

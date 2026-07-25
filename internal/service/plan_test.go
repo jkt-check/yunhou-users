@@ -268,6 +268,13 @@ func TestPlanService_UpdatePlan_WritesAuditLog(t *testing.T) {
 	}
 }
 
+// TestPlanService_DeletePlan_WritesArchiveLog covers the happy-path
+// audit identity (plan_id / actor_id / change_type) and the
+// before-snapshot capture. It does NOT verify call ordering
+// (InsertTx must precede DeleteTx) — see
+// TestPlanService_DeletePlan_AuditBeforeDelete — nor the
+// no-leak-on-FK-failure contract — see
+// TestPlanService_DeletePlan_NoAuditLeakOnDeleteFailure.
 func TestPlanService_DeletePlan_WritesArchiveLog(t *testing.T) {
 	ctx := context.Background()
 	planRepo := newMockPlanRepo()
@@ -291,6 +298,158 @@ func TestPlanService_DeletePlan_WritesArchiveLog(t *testing.T) {
 	}
 	if call.after != nil {
 		t.Errorf("after = %#v, want nil", call.after)
+	}
+}
+
+// TestPlanService_DeletePlan_AuditBeforeDelete pins the A2 contract
+// that the plan_change_log audit row is written BEFORE the hard DELETE
+// on plans. The plan_change_log.plan_id FK was relaxed to ON DELETE
+// SET NULL in migration 013 (so a post-delete audit row with
+// plan_id=NULL survives), but at the moment of the INSERT the plan
+// row must still exist — otherwise the INSERT itself fails with a FK
+// violation and the operator loses the audit trail. The test asserts
+// the call order by reading the per-mock `at` timestamps on
+// changeLogRepo.calls[0] (the audit InsertTx) and planRepo.txCalls[0]
+// (the plan DeleteTx). time.Now() is monotonic, so consecutive calls
+// produce strictly increasing timestamps.
+func TestPlanService_DeletePlan_AuditBeforeDelete(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	planRepo := newMockPlanRepo()
+	planRepo.plans["legacy"] = &model.Plan{ID: "legacy", Name: "Legacy", Apps: []string{"yundian"}}
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+
+	if err := svc.DeletePlan(ctx, "legacy", "admin"); err != nil {
+		t.Fatalf("DeletePlan: %v", err)
+	}
+
+	if len(changeLogRepo.calls) != 1 {
+		t.Fatalf("audit calls = %d, want 1", len(changeLogRepo.calls))
+	}
+	if len(planRepo.txCalls) != 1 {
+		t.Fatalf("planRepo txCalls = %d, want 1", len(planRepo.txCalls))
+	}
+
+	auditCall := changeLogRepo.calls[0]
+	planCall := planRepo.txCalls[0]
+	if planCall.op != "DeleteTx" {
+		t.Errorf("planRepo txCall op = %q, want DeleteTx", planCall.op)
+	}
+	if planCall.planID != "legacy" {
+		t.Errorf("planRepo txCall planID = %q, want legacy", planCall.planID)
+	}
+	if auditCall.changeType != "plan_archive" {
+		t.Errorf("audit changeType = %q, want plan_archive", auditCall.changeType)
+	}
+
+	if !auditCall.at.Before(planCall.at) {
+		t.Errorf("audit (%v) must be strictly before DeleteTx (%v) — otherwise the plan_change_log.plan_id FK fails at INSERT time",
+			auditCall.at, planCall.at)
+	}
+}
+
+// fkViolationErr is a stand-in for *pq.Error{Code: "23503"} (foreign
+// key violation). Used by TestPlanService_DeletePlan_NoAuditLeakOnDeleteFailure
+// to drive the FK-rollback path without standing up a real Postgres.
+// errors.Is(err, fkViolationErr{}) returns true so the test can
+// pin the error type the operator would see in production.
+type fkViolationErr struct{}
+
+func (fkViolationErr) Error() string { return "mock FK violation (SQLSTATE 23503)" }
+
+// TestPlanService_DeletePlan_NoAuditLeakOnDeleteFailure pins the A2
+// contract that when the hard DELETE fails with SQLSTATE 23503
+// (subscriptions / orders still reference the plan), the just-inserted
+// audit row is rolled back together with the failed DELETE — the
+// operator never sees a ghost "plan archived" row for a plan that
+// still exists.
+//
+// The mock can't model real tx semantics (it has no rollback state),
+// so the test verifies the *proxy* conditions:
+//   - DeleteTx returns the FK error (set via planRepo.deleteErr)
+//   - The mock's InsertTx was called (the service *attempted* the
+//     audit insert — production would commit it inside the same tx)
+//   - A custom withTxFn observes the tx body returning an error and
+//     "rolls back" (captures rolledBack=true), proving WithTx would
+//     abort the transaction instead of committing
+//   - The plan row still exists in the mock state (Delete returned
+//     the error before mutating m.plans)
+//   - The service surfaces the FK error to the caller
+//
+// A real-DB verification (plan_change_log row count == 0 after
+// rollback) lives in internal/repo/repo_test.go's TestPlanRepo_* suite
+// if/when it covers that path.
+func TestPlanService_DeletePlan_NoAuditLeakOnDeleteFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	planRepo := newMockPlanRepo()
+	planRepo.plans["in-use"] = &model.Plan{ID: "in-use", Name: "In Use", Apps: []string{"yundian"}}
+	// Force DeleteTx → Delete to surface an FK violation. m.err is left
+	// nil so FindByID at the top of DeletePlan still succeeds (it
+	// reads m.plans["in-use"] and returns the seeded plan).
+	planRepo.deleteErr = fkViolationErr{}
+
+	// Track whether the tx body returned an error — if it did, the
+	// production WithTx would call tx.Rollback() instead of
+	// tx.Commit(). The mock's default WithTx just returns fn's error,
+	// so we wrap it to observe the rollback decision.
+	rolledBack := false
+	committed := false
+	planRepo.withTxFn = func(_ context.Context, fn func(*sqlx.Tx) error) error {
+		err := fn(nil)
+		if err != nil {
+			rolledBack = true
+			return err
+		}
+		committed = true
+		return nil
+	}
+
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+
+	err := svc.DeletePlan(ctx, "in-use", "admin")
+	if err == nil {
+		t.Fatal("DeletePlan: expected FK error, got nil")
+	}
+	if !errors.Is(err, fkViolationErr{}) {
+		t.Errorf("DeletePlan err = %v, want errors.Is fkViolationErr", err)
+	}
+
+	// 1. The service attempted the audit insert (the mock's InsertTx
+	//    captured the call). In production the audit row lives inside
+	//    the same tx as the failed DELETE — the rollback below takes
+	//    it out.
+	if len(changeLogRepo.calls) != 1 {
+		t.Errorf("changeLogRepo.calls = %d, want 1 — service must attempt audit insert before DELETE", len(changeLogRepo.calls))
+	}
+	if changeLogRepo.calls[0].changeType != "plan_archive" {
+		t.Errorf("audit changeType = %q, want plan_archive", changeLogRepo.calls[0].changeType)
+	}
+
+	// 2. WithTx simulated a rollback (not a commit). This is the proxy
+	//    for the production tx.Rollback() that would discard the
+	//    audit row.
+	if !rolledBack {
+		t.Error("tx was committed despite FK error — production would leave a ghost plan_archive audit row")
+	}
+	if committed {
+		t.Error("tx body returned an error but WithTx reported a commit — race between rollback signal and commit")
+	}
+
+	// 3. The plan row is still present in mock state — Delete
+	//    returned the FK error before mutating m.plans.
+	if _, ok := planRepo.plans["in-use"]; !ok {
+		t.Error("plan was removed from mock state — Delete must not mutate state when it returns an error")
+	}
+
+	// 4. The mock recorded exactly one DeleteTx call (proves the
+	//    service reached the DELETE step inside the tx body).
+	if len(planRepo.txCalls) != 1 || planRepo.txCalls[0].op != "DeleteTx" {
+		t.Errorf("planRepo.txCalls = %+v, want one DeleteTx entry", planRepo.txCalls)
 	}
 }
 

@@ -6,6 +6,16 @@
 **Related incidents:** cn-staging 2026-07-23 WeChat-login → "订阅已过期" banner → resubscribe blocked → permanent loop
 **Companion spec:** `2026-07-23-sub-expires-at-end-to-end-design.md` (separately tracks the sub_expires_at data-channel fix; this spec is orthogonal — identity layer vs. data layer)
 
+> **Superseded by 2026-07-24 commercialization design (Phase 2).** The default-plan
+> fallback described in this spec was retired by `migrations/014_remove_default_plan.sql`
+> and the `resolvePlanForTokenIssuance` rewrite (Tasks T17–T21). In the current contract:
+> - `sub=nil` → `JWT.scope=[]`, `HasAccess=false` (no default plan)
+> - `expired=true, sub!=nil` → preserves `sub.PlanID`, `scope=[]`, `HasAccess=false`
+>
+> The login/subscription decoupling itself (deleting `ErrSubscriptionExpired`,
+> `findUsableSubscription → peekSubscription`) remains the standing contract; only
+> the plan-selection branch is obsolete.
+
 ## 1. Problem statement
 
 `yunhou-users` today fuses **authentication** (who you are) with **subscription enforcement** (whether you can use the app) inside OAuth callbacks and the access-token-issuance tail:

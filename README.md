@@ -7,7 +7,7 @@ A shared user management API for multi-app ecosystems. One user identity across 
 - **Social OAuth** — GitHub uses the OAuth Authorization Code flow (`/auth/github/redirect` → `/auth/github/callback`). WeChat Open Platform 网站应用 uses QR-code login (`/auth/wechat/redirect` → `/auth/wechat/callback`, via `open.weixin.qq.com/connect/qrconnect`). Yunhou holds each app's GitHub `client_secret` / WeChat `app_secret` and runs the code exchange server-side. State tokens are shared between providers — `(app_id, callback_index)` HMAC binding.
 - **Plan-based access** — Plans define which apps a user can access
 - **RSA256 JWT** access tokens with JWKS public key endpoint
-- **Subscription gating** — tokens are always issued but carry `scope=[]` and `has_access=false` when the user has no active subscription
+- **Subscription gating** — subscription state does not block token issuance: the JWT gets `scope=[]`, while the login/refresh response and OAuth callback fragment report `has_access=false` when the user has no active subscription
 - **Refresh token rotation** — one-time-use refresh tokens
 - **Rate limiting** — per-IP token bucket (10/s burst 20 on public, 30/s burst 60 on app management)
 
@@ -15,8 +15,8 @@ A shared user management API for multi-app ecosystems. One user identity across 
 
 Set `WECHAT_OAUTH_MOCK=1` to short-circuit the WeChat OAuth redirect and callback without contacting `open.weixin.qq.com`. Useful for local dev and CI e2e suites that don't have a registered WeChat 网站应用.
 
-- `GET /auth/wechat/redirect` returns a 302 to `redirect_uri#code=mock-code&state=<real-HMAC-state>` (no upstream call).
-- `GET /auth/wechat/callback?code=mock-code&state=<...>` constructs a fixed `ProviderUserInfo` (unionid `wechat_mock-unionid-001`) and runs the normal login pipeline.
+- `GET /auth/wechat/redirect` returns a 302 to `redirect_uri?code=mock-code&state=<real-HMAC-state>` (query parameters, no upstream call).
+- The BFF forwards `app_id`, `code`, and `state` to `GET /auth/wechat/callback?app_id=<app-id>&code=mock-code&state=<...>`, which constructs a fixed `ProviderUserInfo` (unionid `wechat_mock-unionid-001`) and runs the normal login pipeline.
 - Mock mode does **not** bypass the HMAC state defence — only the upstream WeChat HTTP round-trip is skipped.
 
 **Never enable in production**; the constant unionid means anyone with knowledge of the mock sentinel can impersonate a fixed account.
@@ -40,12 +40,17 @@ make migrate-status    # inspect ledger (✅ applied / ⏳ pending)
 # 3. Generate RSA keys
 make generate-keys
 
-# 4. Run — startup backfills apps.secret_hash for any pre-existing rows
+# 4. Configure required OAuth state signing secret
+cp .env.example .env
+# Set OAUTH_STATE_SECRET in .env to the output of:
+openssl rand -hex 32
+
+# 5. Run — startup backfills apps.secret_hash for any pre-existing rows
 #    and prints the plaintexts to stdout (capture them, then rotate each
 #    app's secret via POST /admin/apps/:id/rotate-secret).
 make run
 
-# 5. Login uses the redirect flow. Open in a browser:
+# 6. Login uses the redirect flow. Open in a browser:
 #   GitHub: GET /auth/github/redirect?app_id=yundian&redirect_uri=https://yundian.com/auth/callback
 #     After consent GitHub redirects to /auth/github/callback which 302s back
 #     to https://yundian.com/auth/callback#token=...&refresh_token=...&user_id=...
@@ -73,13 +78,13 @@ All configuration is via environment variables (or `.env` file):
 | `ORDER_EXPIRY_DURATION` | No | `30m` | Pending order expiry; sweeper flips to `expired` after this |
 | `SWEEPER_INTERVAL` | No | `1m` | Must be strictly < `ORDER_EXPIRY_DURATION` |
 | `STRIPE_WEBHOOK_SECRET` | No | (empty) | Empty = Stripe webhooks return 404 |
-| `WECHAT_PAY_API_V3_KEY` | No | (empty) | 32 bytes; empty = WeChat webhooks return 404 |
+| `WECHAT_PAY_API_V3_KEY` | Required when enabling real-mode WeChat Pay | (empty) | Exactly 32 bytes in real mode; part of the six-field all-or-none tuple. All six may be empty when real WeChat Pay is disabled. |
 | `WECHAT_PAY_MOCK` | No | (empty) | `1` enables WeChat Pay v3 webhook plaintext mode (skips HMAC match + AES decrypt); empty / `0` = production. Pairs with `WECHAT_PAY_MCH_ID` (required when not in mock mode). |
-| `WECHAT_PAY_MCH_ID` | No (mock) / **Yes (prod)** | (empty) | 微信支付商户号. **Part of the six-field production tuple** — when `WECHAT_PAY_MOCK` is not `1`, all of `WECHAT_PAY_MCH_ID`, `WECHAT_PAY_API_V3_KEY`, `WECHAT_PAY_APP_ID`, `WECHAT_PAY_MCH_PRIVATE_KEY_PATH`, `WECHAT_PAY_MCH_CERT_PATH`, `WECHAT_PAY_NOTIFY_URL` must be set together (or none for mock). |
-| `WECHAT_PAY_APP_ID` | No (mock) / **Yes (prod)** | (empty) | WeChat Open Platform 网站应用 appid, written into the v3 NATIVE `UnifiedOrder` request body as `appid`. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
-| `WECHAT_PAY_NOTIFY_URL` | No (mock) / **Yes (prod)** | (empty) | Public callback URL (e.g. `https://host/webhooks/payment/wechat_pay`) passed to `UnifiedOrder` so WeChat knows where to POST async notifications. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
-| `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM file path for the merchant's RSA private key (PKCS#1 or PKCS#8). Signs every outbound `UnifiedOrder` request. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
-| `WECHAT_PAY_MCH_CERT_PATH` | No (mock) / **Yes (prod)** | (empty) | PEM file path for the merchant's X.509 certificate. Its serial number (UPPERCASE HEX) goes into the outbound `Authorization` header `serial_no`. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `WECHAT_PAY_MCH_ID` | Required when enabling real-mode WeChat Pay | (empty) | 微信支付商户号. When `WECHAT_PAY_MOCK` is not `1`, the six real-mode fields must be all set or all empty; all empty disables real WeChat Pay. Mock mode may leave them empty or partially populated. |
+| `WECHAT_PAY_APP_ID` | Required when enabling real-mode WeChat Pay | (empty) | WeChat Open Platform 网站应用 appid, written into the v3 NATIVE `UnifiedOrder` request body as `appid`. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `WECHAT_PAY_NOTIFY_URL` | Required when enabling real-mode WeChat Pay | (empty) | Public callback URL (e.g. `https://host/webhooks/payment/wechat_pay`) passed to `UnifiedOrder` so WeChat knows where to POST async notifications. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `WECHAT_PAY_MCH_PRIVATE_KEY_PATH` | Required when enabling real-mode WeChat Pay | (empty) | PEM file path for the merchant's RSA private key (PKCS#1 or PKCS#8). Signs every outbound `UnifiedOrder` request. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
+| `WECHAT_PAY_MCH_CERT_PATH` | Required when enabling real-mode WeChat Pay | (empty) | PEM file path for the merchant's X.509 certificate. Its serial number (UPPERCASE HEX) goes into the outbound `Authorization` header `serial_no`. Part of the six-field production tuple (see `WECHAT_PAY_MCH_ID`). |
 | `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login?plan_id=<plan-id>`. Set to `1` to enable; any other value (or unset) makes the handler return 404. Every enabled request must supply an explicit Plan ID. Used by `tests/e2e-ui/` and `tests/integration/` to mint JWTs without OAuth. |
 | `WECHAT_OAUTH_MOCK` | No | (empty) | `1` short-circuits `/auth/wechat/*` (no upstream `open.weixin.qq.com` call); empty / `0` = production. Never enable in prod. |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM file path; empty = Alipay webhooks return 404 |
@@ -124,7 +129,7 @@ All configuration is via environment variables (or `.env` file):
 | Method | Path | Description |
 |---|---|---|
 | POST | `/payments/orders` | Create a pending order (snapshots `plan.price` + `plan.currency`; PayPal requires USD Plan, WeChat Pay requires CNY Plan, else `ErrPlanCurrencyMismatch`) |
-| GET | `/payments/orders/:id` | Fetch an order (pending / paid / failed / expired / refunded) |
+| GET | `/payments/orders/:id` | Fetch an order (pending / paid / failed / expired / refunded / cancelled) |
 | DELETE | `/payments/orders/:id` | Cancel a pending order |
 | POST | `/payments/orders/:order_id/confirm` | BFF-confirmed payment completion; activates the subscription on success |
 | GET | `/payments` | List payments |
@@ -163,17 +168,12 @@ All configuration is via environment variables (or `.env` file):
 
 User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 
-### v2 known limitations
+### Commercial currency and cycle behavior
 
-- `POST /apps/:id/quote` response hardcodes `currency = "USD"` (`internal/service/quote.go`); `POST /payments/orders` hardcodes `currency = "CNY"` (`internal/service/payment.go:125`); WeChat/Alipay webhooks default `CNY`. Multi-currency is not supported in v1; the `plans` table has no currency column today.
-- `sub_expires_at` has two sources:
-  - **Quote endpoint** (`POST /apps/:id/quote`): the server derives `sub_expires_at = now + plan.trial_days + plan.interval_days` from the Plan row (`internal/service/quote.go`).
-  - **Channel webhook path**: the BFF embeds the value when creating the checkout; the channel echoes it back in the webhook payload (`payment.metadata.sub_expires_at` / `resource.sub_expires_at` / `meta.custom_data.sub_expires_at`); yunhou-users trusts the embedded value and writes it directly to `subscriptions.expires_at`.
+- Quote and order currency come from `plan.currency`; orders snapshot `plan.price` and `plan.currency`. PayPal requires USD and WeChat Pay requires CNY.
+- The quote endpoint derives `sub_expires_at = now + plan.trial_days + plan.interval_days` from the Plan. The BFF should embed that server-produced value in checkout metadata; channel webhooks echo it back and yunhou-users stores it without recomputing the received metadata.
+- `PublicPlan.cycle` is only a summary of configured provider-side trial and billing-cycle values for catalog display and reconciliation. It does not control quote calculation; quote behavior uses the top-level Plan fields. Operators should keep provider billing definitions aligned with the Plan.
 - `POST /apps/:id/quote` requires JWT but does **not** enforce `has_access` against the user's subscription. Any authenticated user can quote any plan any app exposes.
-
-### Cycle precedence
-
-When both providers are configured for the same `plan_id`, the resolved cycle (and therefore `sub_expires_at`) uses **PayPal's `trial_days + billing_cycle_days`**. Keep PayPal's billing-cycle definition in sync with operator config or `sub_expires_at` will diverge from what PayPal actually bills.
 
 ## Authentication Flow
 

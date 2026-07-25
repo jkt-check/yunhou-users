@@ -236,6 +236,155 @@ func TestE2E_PlanCommercial_QuarterlyNotAcceptingNew(t *testing.T) {
 	}
 }
 
+// TestE2E_PlanCommercial_UnlistedPlanNotInPublicCatalog covers the spec
+// §5.2 public-catalog contract: a plan with is_listed=false must NOT be
+// returned by the public GET /apps/:id/plans endpoint, even though it
+// remains visible to admins (the admin PATCH + GET below confirm the row
+// still exists). Without the AND is_listed = true SQL filter the unlisted
+// row would leak into the marketing-page response.
+func TestE2E_PlanCommercial_UnlistedPlanNotInPublicCatalog(t *testing.T) {
+	engine, _, db := setupE2EServer(t)
+	hdrs := appAuthHeaders(superAppID)
+
+	suffix := randomSuffix()
+	planID := "e2e-unlisted-" + suffix
+	listedPlanID := "e2e-listed-" + suffix
+
+	// Create an unlisted plan: apps must include yundian so the public
+	// endpoint would otherwise return it; the unlisted flag must keep it
+	// out of the marketing response.
+	unlistedBody := `{
+		"id": "` + planID + `",
+		"name": "Hidden Catalog Plan",
+		"price": 9.9,
+		"interval_days": 30,
+		"apps": ["yundian"],
+		"is_listed": false,
+		"accepting_new_subscriptions": true,
+		"display_order": 5
+	}`
+	resp := doRequest(t, engine, http.MethodPost, "/admin/plans", unlistedBody, hdrs)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create unlisted plan: status = %d, body = %s", resp.StatusCode, string(resp.Body))
+	}
+
+	// Create a sibling listed plan on the same app so the response is
+	// non-empty if the filter accidentally drops everything. Provides a
+	// positive control: this plan MUST appear in the public catalog.
+	listedBody := `{
+		"id": "` + listedPlanID + `",
+		"name": "Visible Catalog Plan",
+		"price": 19.9,
+		"interval_days": 30,
+		"apps": ["yundian"],
+		"is_listed": true,
+		"accepting_new_subscriptions": true,
+		"display_order": 10
+	}`
+	resp2 := doRequest(t, engine, http.MethodPost, "/admin/plans", listedBody, hdrs)
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("create listed plan: status = %d, body = %s", resp2.StatusCode, string(resp2.Body))
+	}
+
+	// Public catalog: GET /apps/yundian/plans must contain the listed
+	// plan and must NOT contain the unlisted plan. The endpoint is
+	// unauthenticated (no X-App-ID / X-App-Secret) — plan IDs and prices
+	// are public by design.
+	pubResp := doRequest(t, engine, http.MethodGet, "/apps/yundian/plans", "", nil)
+	if pubResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /apps/yundian/plans: status = %d, body = %s", pubResp.StatusCode, string(pubResp.Body))
+	}
+	var pub struct {
+		Data []struct {
+			ID       string `json:"id"`
+			IsListed bool   `json:"is_listed"`
+		} `json:"data"`
+	}
+	pubResp.JSON(t, &pub)
+	seenUnlisted, seenListed := false, false
+	for _, p := range pub.Data {
+		if p.ID == planID {
+			seenUnlisted = true
+		}
+		if p.ID == listedPlanID {
+			seenListed = true
+			if !p.IsListed {
+				t.Errorf("public response: listed plan %q has is_listed=false in response", p.ID)
+			}
+		}
+	}
+	if seenUnlisted {
+		t.Errorf("unlisted plan %q leaked into GET /apps/yundian/plans response", planID)
+	}
+	if !seenListed {
+		t.Errorf("listed plan %q missing from GET /apps/yundian/plans response (regression — filter would have dropped both)", listedPlanID)
+	}
+
+	// Admin-side control: GET /admin/plans/:id still returns the row,
+	// so an operator can edit / re-list it later. This guards against
+	// an over-broad fix that hides the row from every read path.
+	adminResp := doRequest(t, engine, http.MethodGet, "/admin/plans/"+planID, "", hdrs)
+	if adminResp.StatusCode != http.StatusOK {
+		t.Fatalf("admin GET /admin/plans/%s: status = %d, body = %s",
+			planID, adminResp.StatusCode, string(adminResp.Body))
+	}
+	var admin struct {
+		Data struct {
+			ID       string `json:"id"`
+			IsListed bool   `json:"is_listed"`
+		} `json:"data"`
+	}
+	adminResp.JSON(t, &admin)
+	if admin.Data.ID != planID || admin.Data.IsListed {
+		t.Errorf("admin GET: got %+v, want id=%q is_listed=false", admin.Data, planID)
+	}
+
+	// PATCH is_listed to true and re-fetch the public catalog — proves
+	// the filter reacts to the flag (re-enabling a plan immediately
+	// surfaces it, no cache to invalidate). Also confirms the row exists
+	// in the DB after the previous assertions, ruling out accidental
+	// deletion along the way.
+	patchBody := `{"is_listed": true}`
+	patchResp := doRequest(t, engine, http.MethodPatch, "/admin/plans/"+planID, patchBody, hdrs)
+	if patchResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH /admin/plans/%s is_listed=true: status = %d, body = %s",
+			planID, patchResp.StatusCode, string(patchResp.Body))
+	}
+	pubResp2 := doRequest(t, engine, http.MethodGet, "/apps/yundian/plans", "", nil)
+	if pubResp2.StatusCode != http.StatusOK {
+		t.Fatalf("GET /apps/yundian/plans after patch: status = %d", pubResp2.StatusCode)
+	}
+	var pub2 struct {
+		Data []struct {
+			ID       string `json:"id"`
+			IsListed bool   `json:"is_listed"`
+		} `json:"data"`
+	}
+	pubResp2.JSON(t, &pub2)
+	nowListed := false
+	for _, p := range pub2.Data {
+		if p.ID == planID {
+			nowListed = true
+			if !p.IsListed {
+				t.Errorf("after patch, public response shows is_listed=false for %s", planID)
+			}
+		}
+	}
+	if !nowListed {
+		t.Errorf("after PATCH is_listed=true, %s still missing from public catalog", planID)
+	}
+
+	// Cleanup so re-runs of this test don't accumulate fixture rows in
+	// shared dev DBs. The TRUNCATE in seedTestData covers the table on
+	// the next test's setupE2EServer call, but leaving rows in place
+	// across runs (when `-count=1` is omitted) makes failure messages
+	// noisier.
+	t.Cleanup(func() {
+		_, _ = db.Exec(`DELETE FROM plan_change_log WHERE plan_id IN ($1, $2)`, planID, listedPlanID)
+		_, _ = db.Exec(`DELETE FROM plans WHERE id IN ($1, $2)`, planID, listedPlanID)
+	})
+}
+
 // TestE2E_PlanCommercial_OrderCurrencyMismatch covers spec §10.2
 // "Plan CNY + channel USD → 400". The paypal channel requires USD
 // (channelRequiredCurrency[paypal] = "USD" in internal/service/payment.go);

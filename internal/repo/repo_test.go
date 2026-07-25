@@ -389,6 +389,93 @@ func TestPlanRepo_FindByApp_ExcludesInactive(t *testing.T) {
 	}
 }
 
+// TestPlanRepo_FindByApp_ExcludesUnlistedPlan guards the spec §5.2 public-
+// catalog contract: is_listed=false must NOT appear in FindByApp results
+// (spec calls this out as a separate filter from is_active). The seeded
+// 'monthly' plan covers both yundian and yundash; we set its is_listed to
+// false and assert FindByApp returns zero plans for the test app (yundash).
+// Without the AND is_listed = true clause, the monthly plan would slip
+// through and this assertion would fail.
+func TestPlanRepo_FindByApp_ExcludesUnlistedPlan(t *testing.T) {
+	db := setupDB(t)
+	r := NewPlanRepo(db)
+
+	// Use a dedicated app so the seeded `free` row (which covers yundian
+	// only) does not contaminate the result set — the goal is to verify
+	// that an active-but-unlisted plan is hidden.
+	const testApp = "unlisted-filter-app"
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(),
+			`DELETE FROM plans WHERE id = 'unlisted-probe'`)
+		_, _ = db.ExecContext(context.Background(),
+			`DELETE FROM apps WHERE app_id = $1`, testApp)
+	})
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO apps (app_id, name, is_active) VALUES ($1, $2, true)
+		 ON CONFLICT (app_id) DO NOTHING`, testApp, "Unlisted Filter App"); err != nil {
+		t.Fatalf("seed %s: %v", testApp, err)
+	}
+	// Seed two plans scoped to the same test app — one listed, one
+	// unlisted. Both are is_active=true so the only differentiator must
+	// be is_listed (the column under test).
+	for _, p := range []struct {
+		id       string
+		isListed bool
+	}{
+		{"unlisted-probe", false}, // active=true, listed=false → must be hidden
+	} {
+		if _, err := db.ExecContext(context.Background(), `
+			INSERT INTO plans (id, name, price, interval_days, apps, is_active,
+			                   is_listed, accepting_new_subscriptions, currency,
+			                   trial_days, display_order)
+			VALUES ($1, $2, 0, 0, $3, true, $4, true, 'CNY', 0, 0)
+			ON CONFLICT (id) DO UPDATE SET
+				is_active = EXCLUDED.is_active,
+				is_listed = EXCLUDED.is_listed,
+				apps = EXCLUDED.apps
+		`, p.id, p.id, pq.Array([]string{testApp}), p.isListed); err != nil {
+			t.Fatalf("seed plan %s: %v", p.id, err)
+		}
+	}
+
+	// Baseline: FindByApp must exclude the unlisted row even though it
+	// matches the app, is_active, and apps criteria.
+	got, err := r.FindByApp(context.Background(), testApp)
+	if err != nil {
+		t.Fatalf("FindByApp(%s): %v", testApp, err)
+	}
+	if len(got) != 0 {
+		t.Errorf("FindByApp(%s) returned %d plans, want 0 (unlisted plan must be excluded); got IDs: %+v",
+			testApp, len(got), planIDs(got))
+	}
+
+	// Flip the plan to listed=true and confirm it now surfaces — proves
+	// the filter is driven by is_listed (not a stray app_id mismatch).
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE plans SET is_listed = true WHERE id = 'unlisted-probe'`); err != nil {
+		t.Fatalf("flip is_listed: %v", err)
+	}
+	got, err = r.FindByApp(context.Background(), testApp)
+	if err != nil {
+		t.Fatalf("FindByApp(%s) after flip: %v", testApp, err)
+	}
+	if len(got) != 1 || got[0].ID != "unlisted-probe" {
+		t.Errorf("after is_listed=true flip: got %+v, want [unlisted-probe]", planIDs(got))
+	}
+	if !got[0].IsListed {
+		t.Errorf("after flip, IsListed = false on returned row, want true")
+	}
+}
+
+// planIDs is a small helper for readable test failure messages.
+func planIDs(plans []model.Plan) []string {
+	ids := make([]string, len(plans))
+	for i, p := range plans {
+		ids[i] = p.ID
+	}
+	return ids
+}
+
 // TestPlanRepo_FindByApp_SortsByDisplayOrder guards the spec §7.3 ORDER BY
 // change. Three plans are inserted in non-sorted display_order (30, 10, 20)
 // and FindByApp must return them as 10, 20, 30 — NOT by created_at/id, which

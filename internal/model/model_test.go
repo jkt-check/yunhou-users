@@ -206,6 +206,7 @@ func TestPlanCommercialModelShape(t *testing.T) {
 		{"Description", "description"},
 		{"Apps", "apps"},
 		{"DisplayOrder", "display_order"},
+		{"IsListed", "is_listed"},
 		{"ProviderIDs", "provider_ids"},
 		{"Cycle", "cycle"},
 	}

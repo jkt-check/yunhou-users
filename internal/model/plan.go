@@ -59,6 +59,12 @@ func ResolveCycle(cfg AppConfig, planID string, planInterval int) CycleConfig {
 // PublicPlan is the DTO for GET /apps/:id/plans. It extends Plan with the
 // per-channel provider IDs and resolved cycle config so the marketing page
 // can render checkout buttons that point at the right provider subscription.
+//
+// IsListed mirrors the plans.is_listed column. Even though FindByApp only
+// returns rows with is_listed=true, exposing the flag on the DTO lets the
+// marketing page distinguish operator-hidden plans from operator-listed
+// plans if a future caller reads from a wider table (e.g. an admin preview
+// endpoint), and matches the spec §5.2 "expose is_listed to consumers" rule.
 type PublicPlan struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
@@ -69,6 +75,7 @@ type PublicPlan struct {
 	Description  *string           `json:"description"`
 	Apps         []string          `json:"apps"`
 	DisplayOrder int               `json:"display_order"`
+	IsListed     bool              `json:"is_listed"`
 	ProviderIDs  map[string]string `json:"provider_ids"`
 	Cycle        *CycleSummary     `json:"cycle"`
 }

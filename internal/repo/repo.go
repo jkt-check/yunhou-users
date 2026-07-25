@@ -253,16 +253,19 @@ func (r *planRepo) FindByID(ctx context.Context, id string) (*model.Plan, error)
 	return &p, nil
 }
 
-// FindByApp returns active plans whose `apps` array contains appID, ordered
-// by display_order ASC, created_at ASC, id ASC. display_order is the ops-
-// controlled knob from migration 012; created_at and id break ties so the
-// order is stable when ops hasn't set display_order (still 0 by default).
-// Used by the public GET /apps/:id/plans endpoint to surface plans available
-// for an app.
+// FindByApp returns active AND listed plans whose `apps` array contains
+// appID, ordered by display_order ASC, created_at ASC, id ASC. display_order
+// is the ops-controlled knob from migration 012; created_at and id break
+// ties so the order is stable when ops hasn't set display_order (still 0 by
+// default). The `is_listed = true` filter matches spec §5.2's public-catalog
+// contract — operators flip is_listed=false to hide a plan from
+// GET /apps/:id/plans without deactivating it (existing subscribers keep
+// their subscriptions; admin GETs still see the row). Used by the public
+// GET /apps/:id/plans endpoint to surface plans available for an app.
 func (r *planRepo) FindByApp(ctx context.Context, appID string) ([]model.Plan, error) {
 	var list []model.Plan
 	err := r.db.SelectContext(ctx, &list,
-		`SELECT * FROM plans WHERE $1 = ANY(apps) AND is_active = true
+		`SELECT * FROM plans WHERE $1 = ANY(apps) AND is_active = true AND is_listed = true
 		 ORDER BY display_order ASC, created_at ASC, id ASC`,
 		appID)
 	if err != nil {

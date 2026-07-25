@@ -931,6 +931,7 @@ func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 		Description:  p.Description,
 		Apps:         []string(p.Apps),
 		DisplayOrder: p.DisplayOrder,
+		IsListed:     p.IsListed,
 		ProviderIDs:  map[string]string{},
 	}
 	if cfg.PaymentProviders != nil {

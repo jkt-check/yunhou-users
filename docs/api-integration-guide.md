@@ -409,7 +409,7 @@ Authorization: Bearer <access_token>
 
 #### POST /user/subscriptions
 
-创建订阅。仅同时满足 `price == 0`、`is_active=true`、`accepting_new_subscriptions=true` 的 Plan 允许用户自助创建；付费 Plan 必须通过支付流程创建（参见 §支付接口）。`expires_at` 字段被服务层忽略，过期时间由 `plan.interval_days` 推导（`interval_days == 0` 表示永不过期）。种子 Plan `free` 正在退役且不接受新订阅，因此不能再用作自助订阅目标。
+创建订阅。仅同时满足 `price == 0`、`is_active=true`、`accepting_new_subscriptions=true` 的 Plan 允许用户自助创建；付费 Plan 必须通过支付流程创建（参见 §支付接口）。`expires_at` 字段被服务层忽略，过期时间由 `plan.interval_days` 推导（`interval_days == 0` 表示永不过期）。种子 Plan `free` 已退役且不接受新订阅，因此不能再用作自助订阅目标。
 
 **请求体**：
 ```json

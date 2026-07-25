@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"database/sql"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -239,6 +240,20 @@ func (m *mockPlanRepo) FindByApp(_ context.Context, appID string) ([]model.Plan,
 			}
 		}
 	}
+	// Mirror the production SQL ORDER BY (display_order ASC, created_at
+	// ASC, id ASC) so service-level tests that depend on display_order
+	// ordering see deterministic results without a real DB. The mock
+	// does NOT enforce is_listed (the production SQL does); callers
+	// that need is_listed filtering must model it explicitly.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DisplayOrder != out[j].DisplayOrder {
+			return out[i].DisplayOrder < out[j].DisplayOrder
+		}
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }
 

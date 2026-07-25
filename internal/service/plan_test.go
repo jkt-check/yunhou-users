@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/model"
@@ -574,6 +575,85 @@ func TestPlanService_FindByApp(t *testing.T) {
 			t.Errorf("expected 0 plans, got %d", len(plans))
 		}
 	})
+}
+
+// TestPlanService_FindByApp_SortsByDisplayOrder pins the service-level
+// sort contract for FindByApp. The production SQL orders by
+// display_order ASC, created_at ASC, id ASC (see repo.PlanRepo.FindByApp
+// in internal/repo/repo.go); service-level tests that depend on the
+// order would otherwise rely on Go map iteration which is randomized.
+// The mock's FindByApp mirrors the SQL ORDER BY (added alongside A2),
+// so this test exercises the mock's sort, not the real SQL.
+//
+// Seed order is intentionally non-monotonic to catch a sort that
+// merely preserves insertion order. All three plans are active and
+// include the requested app; the mock's FindByApp filter (is_active +
+// apps contains) accepts them. Per the user's note, the mock does NOT
+// enforce is_listed — so we set IsListed: true to mirror what the
+// production SQL would surface, but the field is not asserted on.
+func TestPlanService_FindByApp_SortsByDisplayOrder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	planRepo := newMockPlanRepo()
+	// Seed in display_order-descending order so a no-op sort would
+	// return them in reverse, which the test would catch.
+	mid := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	earliest := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	latest := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+	planRepo.plans["premium"] = &model.Plan{
+		ID:           "premium",
+		Name:         "Premium",
+		Price:        99,
+		IntervalDays: 365,
+		Apps:         []string{"yundian"},
+		IsActive:     true,
+		IsListed:     true,
+		DisplayOrder: 30,
+		CreatedAt:    latest,
+	}
+	planRepo.plans["monthly"] = &model.Plan{
+		ID:           "monthly",
+		Name:         "Monthly",
+		Price:        29,
+		IntervalDays: 30,
+		Apps:         []string{"yundian"},
+		IsActive:     true,
+		IsListed:     true,
+		DisplayOrder: 10,
+		CreatedAt:    mid,
+	}
+	planRepo.plans["quarterly"] = &model.Plan{
+		ID:           "quarterly",
+		Name:         "Quarterly",
+		Price:        79,
+		IntervalDays: 90,
+		Apps:         []string{"yundian"},
+		IsActive:     true,
+		IsListed:     true,
+		DisplayOrder: 20,
+		CreatedAt:    earliest,
+	}
+
+	svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
+	plans, err := svc.FindByApp(ctx, "yundian")
+	if err != nil {
+		t.Fatalf("FindByApp: %v", err)
+	}
+
+	if len(plans) != 3 {
+		t.Fatalf("len(plans) = %d, want 3", len(plans))
+	}
+
+	// Expected order: display_order ASC => monthly (10), quarterly (20),
+	// premium (30). The created_at / id tie-breakers are not exercised
+	// here because all three DisplayOrder values are distinct.
+	wantOrder := []string{"monthly", "quarterly", "premium"}
+	for i, want := range wantOrder {
+		if plans[i].ID != want {
+			t.Errorf("plans[%d].ID = %q, want %q — FindByApp must order by display_order ASC", i, plans[i].ID, want)
+		}
+	}
 }
 
 func TestPlanService_ValidateApps_UnknownApp(t *testing.T) {

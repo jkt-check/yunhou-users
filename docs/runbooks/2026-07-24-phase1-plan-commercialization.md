@@ -510,7 +510,7 @@ Record smoke-test outputs, monitoring links, operator, release SHA, and the go/n
 
 ## Known issues
 
-The Task 16 local smoke test found two release-gate mismatches in the current Phase 1 implementation:
+The Task 16 local smoke test found three release-gate mismatches in the current Phase 1 implementation:
 
 1. **`free` is not retired by migrations 012/013.** Migration 012 leaves `free.is_active=true` and backfills `free.is_listed=true`; migration 013 only changes the audit foreign key. The local `GET /apps/yundian/plans` call returned `free`, so the “no retired free plan” smoke assertion fails. If retiring `free` is a Phase 1 release requirement, do not promote until the migration/service scope is corrected; otherwise move that assertion to the coordinated default-plan-removal phase. (Historical note: `is_listed` was already an observable filter on the public catalog by the time of the Phase 1 code review — the post-D2 `is_listed` repo filter and `PublicPlan.IsListed` exposure fixed this; the original Task 16 observation is recorded here for traceability only.)
 2. **No-subscription token issuance still falls back to `free`.** After a dev login for a user with no persisted subscription, local `POST /auth/refresh` returned `subscription.plan_id="free"` and `has_access=true`, rather than `plan_id=null` and `has_access=false`. This is consistent with the default-plan fallback remaining in the current Phase 1 auth service. If the no-subscription behavior is a Phase 1 release gate, it must be fixed before promotion; otherwise the smoke gate belongs to the later auth/default-plan-removal deploy.

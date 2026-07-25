@@ -34,7 +34,7 @@ This spec turns the plan table from a development convenience into a commercial 
 
 Make `plans` a commercial product surface and remove the `default plan` mechanism:
 
-1. Add six columns to `plans`: `is_listed`, `accepting_new_subscriptions`, `currency`, `trial_days`, `description`, `display_order`, `updated_at`.
+1. Add seven columns to `plans`: `is_listed`, `accepting_new_subscriptions`, `currency`, `trial_days`, `description`, `display_order`, `updated_at`.
 2. Delete `is_default` and the `plans_one_default` partial unique index; retire `free` (soft-delete, hard-delete deferred to a later migration).
 3. Change `resolvePlanForTokenIssuance` so that users with **no subscription** get `JWT.scope=[]` and `HasAccess=false` (no default-plan fallback).
 4. Change the expired-subscription branch so `JWT.scope=[]` (security) while `LoginResponse.subscription.plan_id` preserves the user's historical plan (so the BFF can render the renewal CTA).

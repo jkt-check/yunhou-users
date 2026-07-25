@@ -1,5 +1,13 @@
 # Yunhou Users — System Design
 
+> **Superseded by 2026-07-24 commercialization design.** This doc captures the original v1 architecture (June 2026). The subscription/access model changed materially after Phase 2 shipping:
+>
+> - The `default_plan` / `plans.is_default` fallback was retired by `migrations/014_remove_default_plan.sql` (drops the column + the `plans_one_default` partial unique index). The `free` plan is `is_active=false` and no longer appears in `GET /apps/:id/plans`.
+> - Login is no longer coupled to subscription state. A user with no usable subscription can still log in; their JWT `scope` is `[]` and `subscription.has_access=false` on every token issuance / refresh (no fallback to a default plan).
+> - OAuth flow: `POST /auth/login` was removed. GitHub and WeChat Open Platform 网站应用 login run through `/auth/{github,wechat}/redirect` + `/auth/{github,wechat}/callback`. See `docs/api-integration-guide.md` and CLAUDE.md for the current contract.
+>
+> Treat sections below as design history unless explicitly re-validated against the current source.
+
 ## Overview
 
 A shared user management system API for multiple applications (apps, websites). One user account across all consumer apps, with social-only auth and an app marketplace subscription model.

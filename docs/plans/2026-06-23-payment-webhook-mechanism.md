@@ -531,7 +531,7 @@ Implications for us:
 | `payment_intent.succeeded`     | payment → `paid`, order → `paid`, activate sub        |
 | `payment_intent.payment_failed`| payment → `failed`, order → `failed`. **If the order was previously `paid` (rare race: confirm fired before this webhook), also flip `orders.status → 'failed'` and deactivate subscription** — see §9 state machine `paid → failed`. |
 | `payment_intent.canceled`      | payment → `failed`, order → `failed` (user/system canceled the PaymentIntent before completion). Same cascade rule as `payment_failed` if the order was previously `paid`. |
-| `charge.refunded` (full)       | payment → `refunded`, **subscription → `cancelled`**, user reverts to default plan. If a `paid` order exists, also flip `orders.status → 'refunded'`. |
+| `charge.refunded` (full)       | payment → `refunded`, **subscription → `cancelled`**; the user no longer has a usable subscription — on the next token issuance / refresh, their JWT `scope` is `[]` and `subscription.has_access=false`. There is no default-plan fallback (Phase 2 retired `plans.is_default`). If a `paid` order exists, also flip `orders.status → 'refunded'`. |
 | `charge.refunded` (partial)    | payment stays `paid`, **no subscription change** (we don't prorate in v1). New `refunds` row at status `paid`. |
 | `charge.dispute.created`       | payment → `disputed=true`, `disputed_at=now()`; subscription stays active until dispute resolves (chargeback rates climb if we proactively cancel). |
 | `charge.dispute.closed` (won)  | payment → `disputed=false`; subscription unchanged. Audit log records the resolution. |
@@ -601,7 +601,7 @@ PayPal sends JSON payloads with a top-level `id` (event id, `WH-...`), `event_ty
 
 These rules describe the **data side effects** only. **Who triggers a refund, when it's allowed, how much can be refunded, and whether approval is needed** are all decided by the caller (frontend / admin tooling / payment-service) — not by us. We just provide the primitive operation; the caller composes business policy on top.
 
-- **Full refund** → cancel the subscription immediately. User reverts to the default plan; their JWT scope shrinks on next refresh. The threshold for "full" is `refund.amount == payment.amount`; we don't enforce any other definition. The comparison is done in **integer cents** (DECIMAL(10,2) → int64 × 100) to avoid float64 round-trip drift — an epsilon-based comparison silently mis-classified fee-inclusive refunds.
+- **Full refund** → cancel the subscription immediately. The user has no usable subscription after this — on the next token issuance / refresh, their JWT `scope` is `[]` and `subscription.has_access=false`. There is no default-plan fallback (Phase 2 retired `plans.is_default`). The threshold for "full" is `refund.amount == payment.amount`; we don't enforce any other definition. The comparison is done in **integer cents** (DECIMAL(10,2) → int64 × 100) to avoid float64 round-trip drift — an epsilon-based comparison silently mis-classified fee-inclusive refunds.
 - **Partial refund** → no subscription change. We do NOT prorate (subtract N days from `expires_at`). Out of scope for v1; explicitly a known limitation.
 - **Refund after subscription already expired/cancelled** → still record the refund on the payment row; do NOT touch the (already terminal) subscription.
 - **Multiple partial refunds on the same payment** are allowed as separate rows; the sum-≤-original invariant is enforced in the service layer before insert (see design doc Refund table note).

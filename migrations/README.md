@@ -61,7 +61,7 @@ syntax, **not** transaction control — those are fine.
 | `008_drop_lemonsqueezy.sql` | removes lemonsqueezy from channel CHECK (LS code was removed in d8f333d) |
 | `009_wechat_pay_intent.sql` | adds orders.provider_intent JSONB for wechat_pay pre-auth metadata |
 | `010_provider_intent_nullable.sql` | change provider_intent default from `'{}'` to NULL so omitempty works |
-| `011_order_reconcile.sql` | adds orders.last_reconciled_at (defaulted to `now()`, indexed) so GetOrder's wechat_pay QueryOrAR reconcile path can throttle re-polls |
+| `011_order_reconcile.sql` | adds orders.last_reconciled_at (defaulted to `now()`, indexed) so GetOrder's wechat_pay QueryOrder reconcile path can throttle re-polls |
 | `012_plan_commercial_fields.sql` | commercializes the plans surface: `is_listed`, `accepting_new_subscriptions`, `currency`, `trial_days`, `description`, `display_order`, `updated_at` (trigger-maintained) + new `plan_change_log` audit table |
 | `013_plan_change_log_fk_set_null.sql` | relaxes `plan_change_log.plan_id` FK to `ON DELETE SET NULL` so hard-deleted plans keep their audit history; pairs with `PlanService.DeletePlan` reorder to INSERT-then-DELETE |
 | `014_remove_default_plan.sql` | retires the default-plan concept: marks `free` inactive, drops `plans_one_default` partial unique index, drops `plans.is_default` column (gated on no active `free` subscriptions) |

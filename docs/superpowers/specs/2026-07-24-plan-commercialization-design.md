@@ -60,7 +60,7 @@ Make `plans` a commercial product surface and remove the `default plan` mechanis
 | # | Decision | Rationale |
 |---|---|---|
 | 1 | Add `is_listed` and `accepting_new_subscriptions` as two separate booleans | Lets ops express both "visible in BFF list, accepting new subs" and "hidden but subscribable from admin" and "legacy (visible, not accepting new subs)" without an enum. The latter is what `quarterly` becomes. |
-| 2 | Retire `free` by setting `is_active=false, accepting_new_subscriptions=false`, keep the row | Hard-delete is deferred to a follow-up migration so historical `subscriptions.plan_id='free'` rows can still resolve their FK. The pre-check in migration 013 aborts if any active free subscription exists. |
+| 2 | Retire `free` by setting `is_active=false, accepting_new_subscriptions=false`, keep the row | Hard-delete is deferred to a follow-up migration so historical `subscriptions.plan_id='free'` rows can still resolve their FK. The pre-check in migration 014 aborts if any active free subscription exists. |
 | 3 | Delete `is_default` column + `plans_one_default` partial unique index | The default-plan concept is the user-facing "what does an anonymous user get?" question. The answer becomes "nothing — they need to subscribe." Column removal forces every caller to make an explicit choice. |
 | 4 | `resolvePlanForTokenIssuance` becomes a three-state decision without a default-plan fallback | The three observable states are still `sub=nil`, `sub≠nil && expired=true`, and `sub≠nil && expired=false`. What disappears is the `defaultPlan` variable and the branches that re-pointed `chosenPlan` at it. `chosenPlan` may now be `nil` when `sub=nil`. |
 | 5 | Expired-subscription users get `JWT.scope=[]` (not the plan's apps) | Security: a 15-minute access token with the previous scope lets a lapsed user keep calling APIs until expiry. The renewal CTA comes from `LoginResponse.subscription.plan_id`, not from the token. |
@@ -75,7 +75,7 @@ Make `plans` a commercial product surface and remove the `default plan` mechanis
 | 14 | `SubscriptionService.Create` keeps the `plan.Price > 0 → ErrPaidPlanForbidden` guard | Defense against an ops mistake that flips a paid plan to `price=0` to enable a self-subscribe bypass. Removed only when payment-driven self-subscribe lands (out of scope). |
 | 15 | Admin `POST /admin/plans` and `PATCH /admin/plans/:id` reject `is_default` input | Once the column is gone, accepting the field silently would mask migration ordering bugs. Reject with `400` so any stale client surfaces the issue immediately. |
 | 16 | `POST /test/login` (dev-only) requires `?plan_id=xxx` | Without a default plan, the dev/test login needs an explicit target. Reject 400 if missing, 404 if plan doesn't exist, 400 if plan is not active. |
-| 17 | Two-phase migration (012 then 013) | 012 is purely additive and backwards compatible — service can be deployed before, after, or simultaneously. 013 is the behavioral switch (drop default-plan fallback, retire free) and must deploy together with the code that no longer references `is_default`. |
+| 17 | Two-phase migration (012 then 014) | 012 is purely additive and backwards compatible — service can be deployed before, after, or simultaneously. 014 is the behavioral switch (drop default-plan fallback, retire free) and must deploy together with the code that no longer references `is_default`. |
 | 18 | `display_order` defaults to 0; seed assigns 10/20/30 to monthly/quarterly/yearly | BFF sorts `ORDER BY display_order ASC, created_at ASC, id ASC`. Ties break deterministically. |
 | 19 | `currency` CHECK constraint allows `('CNY','USD','EUR')` | We're not adding more, but the constraint keeps the column tight; adding a new currency is a one-line `ALTER TABLE` later. |
 | 20 | `PlanService.FindDefault` and `PlanRepo.FindDefault` are removed entirely | The T20 cleanup deleted the method bodies, the interface declarations, and the mock plumbing. `ErrDeprecatedDefaultPlan` is now unused dead code kept only because removing it would touch call sites that are already being deleted as part of T17/T18/T19; it is a follow-up to drop the sentinel once the interface signatures are verified cold. |
@@ -173,25 +173,27 @@ DROP INDEX IF EXISTS plans_one_default;
 ALTER TABLE plans DROP COLUMN IF EXISTS is_default;
 ```
 
-**013 must deploy together with the code changes** in §6/§7/§8 because:
+**014 must deploy together with the code changes** in §6/§7/§8 because:
 - `model.Plan.IsDefault` is being removed (compilation breaks if column removed first)
-- `PlanService` stops calling `FindDefault` (still safe even before 013, but the cleanup is a single logical step)
+- `PlanService` stops calling `FindDefault` (still safe even before 014, but the cleanup is a single logical step)
 
 ### 5.3 Migration ordering
 
 ```
 ... 011 (existing order_reconcile)
-012 plan_commercial_fields      ← additive
-013 remove_default_plan          ← switch
-014 (future, out of scope) hard_delete_free
+012 plan_commercial_fields           ← additive
+013 plan_change_log_fk_set_null       ← audit FK relax (added in code review; ships with Phase 1)
+014 remove_default_plan               ← switch
+015 plan_change_log_nullable_snapshots ← audit snapshot nullability (added in code review; ships with Phase 1)
+016 (future, out of scope) hard_delete_free
 ```
 
 ### 5.4 Pre-deploy checklist for ops
 
 1. Run on staging first; `SELECT COUNT(*) FROM subscriptions WHERE plan_id='free' AND status='active'` returns 0.
 2. If non-zero, manually cancel those subscriptions (or migrate them to `monthly` first).
-3. Apply 012, redeploy service (no behavior change yet).
-4. Apply 013 and deploy the new service in the same maintenance window.
+3. Apply 012 + 013 + 015, redeploy service (no behavior change yet).
+4. Apply 014 and deploy the new service in the same maintenance window.
 
 ## 6. Service-layer changes
 
@@ -513,8 +515,8 @@ The seeded prices make `quarterly` (¥79.9 / 90 days = ¥0.89/day) more expensiv
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| 013 deploys without the code change (or vice versa) | Build failure or runtime `Plan.IsDefault` zero-value mishaps | Document single deploy window; CI lint to flag `model.Plan.IsDefault` / `FindDefault` references |
-| Pre-check fails: active `plan_id='free'` subscription exists | Migration 013 aborts | Documented operator runbook: cancel those rows, or migrate them to `monthly` first |
+| 014 deploys without the code change (or vice versa) | Build failure or runtime `Plan.IsDefault` zero-value mishaps | Document single deploy window; CI lint to flag `model.Plan.IsDefault` / `FindDefault` references |
+| Pre-check fails: active `plan_id='free'` subscription exists | Migration 014 aborts | Documented operator runbook: cancel those rows, or migrate them to `monthly` first |
 | BFF sees new `subscription.is_accepting_new=false` and silently breaks | Renewal CTA fails open | New field is **additive**; old BFF clients ignore it. The renewal CTA still works because `plan_id` and `has_access` are unchanged |
 | Quarterly existing subscribers hit `accepting_new=false` on renewal | They can't renew | `SubscriptionService.Renew` does **not** check `accepting_new_subscriptions` (only `plan.IsActive`). Quarterly renews are still allowed |
 | `POST /test/login` breaks in e2e | Local CI red | E2E fixtures updated in §10.3 |
@@ -525,12 +527,12 @@ The seeded prices make `quarterly` (¥79.9 / 90 days = ¥0.89/day) more expensiv
 | Phase | Rollback |
 |---|---|
 | After 012 only | `ALTER TABLE plans DROP COLUMN ...` (lose data, no behavior impact since defaults are conservative). Trigger can stay or drop. |
-| After 013 | Re-add `is_default BOOLEAN DEFAULT false`, recreate `plans_one_default` partial unique index, set `free` to `is_default=true` again, restore the `defaultPlan` branch in `resolvePlanForTokenIssuance`. Service reverts cleanly because `model.Plan.IsDefault` is reintroduced and `FindDefault` body is intact. |
+| After 014 | Re-add `is_default BOOLEAN DEFAULT false`, recreate `plans_one_default` partial unique index, set `free` to `is_default=true` again, restore the `defaultPlan` branch in `resolvePlanForTokenIssuance`. Service reverts cleanly because `model.Plan.IsDefault` is reintroduced and `FindDefault` body is intact. |
 | Operational emergency | PATCH `is_listed=false` on any plan to hide from BFF without code change. PATCH `accepting_new_subscriptions=false` to stop new signups. |
 
 ## 12. Open follow-ups (out of scope)
 
-- `014_hard_delete_free.sql` — actually `DELETE FROM plans WHERE id='free'` once we are confident no historical cancelled/expired FKs rely on it.
+- `016_hard_delete_free.sql` — actually `DELETE FROM plans WHERE id='free'` once we are confident no historical cancelled/expired FKs rely on it. (The 014 / 015 follow-ups raised this number from the originally-planned 014.)
 - `2026-07-23-sub-expires-at-end-to-end-design.md` — `sub_expires_at` end-to-end plumbing (separate spec, separate PR).
 - Pricing re-evaluation per §11.1.
 - `apps` join table — revisited only if `TEXT[]` validation proves insufficient at scale.

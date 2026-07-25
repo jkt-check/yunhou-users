@@ -113,7 +113,7 @@ Executed against PostgreSQL `yunhou_users` on `127.0.0.1`:
 
 | Item | Source |
 |---|---|
-| `migrations/015_hard_delete_free.sql` — actually `DELETE FROM plans WHERE id='free'` once we are confident no historical cancelled/expired FKs rely on it | spec §12 |
+| `migrations/016_hard_delete_free.sql` — actually `DELETE FROM plans WHERE id='free'` once we are confident no historical cancelled/expired FKs rely on it (renumbered from 015 in this doc; the original plan reserved `015_hard_delete_free`, but the code review added 013 + 015 as data-path fixes) | spec §12 |
 | `2026-07-23-sub-expires-at-end-to-end-design.md` — `sub_expires_at` end-to-end plumbing (separate spec, separate PR) | spec §3 |
 | Pricing re-evaluation: quarterly ¥79.9/90d is more expensive per-day than yearly ¥299/365d — product decides | spec §11.1 |
 | `apps` join table — revisited only if `TEXT[]` validation proves insufficient at scale | spec §12 |

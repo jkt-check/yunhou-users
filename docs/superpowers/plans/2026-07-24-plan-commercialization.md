@@ -4,7 +4,7 @@
 
 **Goal:** Convert the `plans` table from an internal catalog into a commercial product surface — retire `free`, remove the default-plan concept, add 7 plan fields (is_listed / accepting_new_subscriptions / currency / trial_days / description / display_order / updated_at), and switch `quote`/`order`/`subscription` to read currency + trial_days from `plan` rather than from `orders` or `AppConfig`.
 
-**Architecture:** Two-phase deploy. Phase 1 applies `migrations/012_plan_commercial_fields.sql` (purely additive: new columns + new audit table + data backfill) and deploys service code that writes/reads those new fields without changing any default-plan behavior. Phase 2 applies `migrations/014_remove_default_plan.sql` (drop `is_default`, retire `free`, drop partial unique index) and deploys the auth-service rewrite that removes the default-plan fallback. Phase 1 is independently deployable and rollback-friendly; Phase 2 must deploy together with the auth-service change because the code can no longer reference `model.Plan.IsDefault` after 013.
+**Architecture:** Two-phase deploy. Phase 1 applies `migrations/012_plan_commercial_fields.sql` (purely additive: new columns + new audit table + data backfill) and deploys service code that writes/reads those new fields without changing any default-plan behavior. Phase 2 applies `migrations/014_remove_default_plan.sql` (drop `is_default`, retire `free`, drop partial unique index) and deploys the auth-service rewrite that removes the default-plan fallback. Phase 1 is independently deployable and rollback-friendly; Phase 2 must deploy together with the auth-service change because the code can no longer reference `model.Plan.IsDefault` after 014.
 
 **Tech Stack:** Go 1.22, PostgreSQL, sqlx, Echo, JWT (RS256), testify (mock in service tests). Tests are unit (`internal/service`, `internal/handler`) + E2E (`tests/e2e/`) + integration (`tests/integration/`).
 
@@ -951,9 +951,9 @@ Same steps on production. The default-plan fallback is still in effect; Phase 1 
 
 ---
 
-## Phase 2 — Behavioral switch (migration 013 + default-plan removal)
+## Phase 2 — Behavioral switch (migration 014 + default-plan removal)
 
-### Task 17: Migration 013 — drop `is_default` + retire `free`
+### Task 17: Migration 014 — drop `is_default` + retire `free`
 
 **Files:**
 - Create: `migrations/014_remove_default_plan.sql`
@@ -1215,7 +1215,7 @@ Expected: 0. If non-zero, cancel those rows first.
 
 - [ ] **Step 2: Coordinate deploy**
 
-Apply migration 013 and deploy the new service **in the same maintenance window**. Migration 013 drops `is_default`; if the service is still on the old code referencing `model.Plan.IsDefault`, the build was already broken — so this is a coordinated atomic step.
+Apply migration 014 and deploy the new service **in the same maintenance window**. Migration 014 drops `is_default`; if the service is still on the old code referencing `model.Plan.IsDefault`, the build was already broken — so this is a coordinated atomic step.
 
 Run:
 ```bash
@@ -1256,7 +1256,7 @@ git tag v0.X.Y-phase2
 | §2.8 apps validation | T5 |
 | §2.9 admin CRUD validation | T10 |
 | §5.1 migration 012 | T1 |
-| §5.2 migration 013 | T17 |
+| §5.2 migration 014 | T17 |
 | §6.1 PlanService | T5, T6, T20 |
 | §6.2 SubscriptionService | T7 |
 | §6.3 PaymentService | T8 |

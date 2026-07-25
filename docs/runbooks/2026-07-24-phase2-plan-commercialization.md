@@ -466,7 +466,7 @@ Record smoke-test outputs, monitoring links, operator, release SHA, and the go/n
 
 3. **BFF must already understand `subscription.has_access=false` for unauthenticated-equivalent users.** This is a Phase 1 steady state; if a BFF deployment is in flight that still assumes a default plan, that BFF promotion should land before Phase 2.
 
-4. **`free` historical subscriptions with `status IN ('cancelled','expired')` are not blocked by the pre-check.** The migration only blocks `status='active'`. Cancelled and expired rows still reference `plan_id='free'` and the row is kept in place so the FK resolves. A future `migrations/014_hard_delete_free.sql` is needed to clean those up; tracked in the design spec §12 follow-ups.
+4. **`free` historical subscriptions with `status IN ('cancelled','expired')` are not blocked by the pre-check.** The migration only blocks `status='active'`. Cancelled and expired rows still reference `plan_id='free'` and the row is kept in place so the FK resolves. A future `migrations/016_hard_delete_free.sql` is needed to clean those up; tracked in the design spec §12 follow-ups. (013 and 015 were added during code review between 012 and the switch, so the originally-planned 014_hard_delete_free slot is now occupied by the `is_default` removal.)
 
 ## Task 22 local verification record
 

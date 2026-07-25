@@ -78,7 +78,7 @@ Make `plans` a commercial product surface and remove the `default plan` mechanis
 | 17 | Two-phase migration (012 then 013) | 012 is purely additive and backwards compatible — service can be deployed before, after, or simultaneously. 013 is the behavioral switch (drop default-plan fallback, retire free) and must deploy together with the code that no longer references `is_default`. |
 | 18 | `display_order` defaults to 0; seed assigns 10/20/30 to monthly/quarterly/yearly | BFF sorts `ORDER BY display_order ASC, created_at ASC, id ASC`. Ties break deterministically. |
 | 19 | `currency` CHECK constraint allows `('CNY','USD','EUR')` | We're not adding more, but the constraint keeps the column tight; adding a new currency is a one-line `ALTER TABLE` later. |
-| 20 | Existing `PlanService.FindDefault` method is retained (deprecated) | Removing the interface method would force a sweeping refactor of the repo mock for marginal benefit. The method body returns `ErrDeprecatedDefaultPlan` after migration 013. |
+| 20 | `PlanService.FindDefault` and `PlanRepo.FindDefault` are removed entirely | The T20 cleanup deleted the method bodies, the interface declarations, and the mock plumbing. `ErrDeprecatedDefaultPlan` is now unused dead code kept only because removing it would touch call sites that are already being deleted as part of T17/T18/T19; it is a follow-up to drop the sentinel once the interface signatures are verified cold. |
 
 ## 5. Schema changes
 
@@ -216,7 +216,7 @@ func (s *PlanService) ValidateApps(ctx context.Context, apps []string) error
 - FK 23503 is still surfaced by the handler as `409 Conflict`.
 
 **FindDefault**
-- Method body kept for one release with a `// Deprecated: ...` doc comment; returns `ErrDeprecatedDefaultPlan` after the 013 deploy. The interface signature is unchanged.
+- Removed entirely by T20. The interface declaration, the `PlanService` method, and the `PlanRepo.FindDefault` SQL are all gone; `grep` for `FindDefault` in `internal/` returns zero matches. `ErrDeprecatedDefaultPlan` is now an unused sentinel — see follow-up note in decision row 20.
 
 ### 6.2 `internal/service/subscription.go`
 
@@ -316,7 +316,7 @@ quote.Currency = plan.Currency  // ← was literal "USD"
 | `service.ErrPlanNotAcceptingNew` | 409 | `SubscriptionService.Create`, `PaymentService.CreateOrder`, `POST /test/login` |
 | `service.ErrPlanCurrencyMismatch` | 400 | `PaymentService.CreateOrder` |
 | `service.ErrInvalidAppID` | 400 | `PlanService.ValidateApps` |
-| `service.ErrDeprecatedDefaultPlan` | 410 | `PlanService.FindDefault` (post-013 only) |
+| `service.ErrDeprecatedDefaultPlan` | 410 | (unused — `PlanService.FindDefault` removed entirely; sentinel kept as dead code) |
 
 ## 7. Handler / API changes
 
@@ -547,7 +547,7 @@ The seeded prices make `quarterly` (¥79.9 / 90 days = ¥0.89/day) more expensiv
 | 4 | `internal/model/app_test.go`, `internal/model/app.go` | (If `app_test.go` references removed fields; TBD during implementation) |
 | 5 | `internal/service/auth.go` | Add `IsAcceptingNew` to `SubscriptionInfo` (struct already lives in this file with value-type `PlanID`/`PlanName` and `ExpiresAt *time.Time` with `omitempty`) |
 | 6 | `internal/model/quote.go` | (No schema change; `Currency` already a string) |
-| 7 | `internal/repo/repo.go` | `PlanRepo.Create/Update` columns updated; `FindByApp` ORDER BY changed; `FindDefault` body returns `ErrDeprecatedDefaultPlan` |
+| 7 | `internal/repo/repo.go` | `PlanRepo.Create/Update` columns updated; `FindByApp` ORDER BY changed; `FindDefault` removed entirely |
 | 8 | `internal/service/plan.go` | `ValidateApps` helper; `CreatePlan`/`UpdatePlan`/`DeletePlan` audit writes; remove `IsDefault` references |
 | 9 | `internal/service/subscription.go` | New validation order in `Create` |
 | 10 | `internal/service/payment.go` | `CreateOrder` reads `plan.Currency`; new validation order |

@@ -1135,24 +1135,21 @@ git commit -m "feat(auth): resolvePlanForTokenIssuance three-state without defau
 
 ---
 
-### Task 20: PlanService — `FindDefault` deprecated
+### Task 20: PlanService / PlanRepo — `FindDefault` removed entirely
 
 **Files:**
-- Modify: `internal/service/plan.go`
+- Modify: `internal/service/plan.go` (drop `PlanService.FindDefault`)
+- Modify: `internal/repo/repo.go` (drop `PlanRepo.FindDefault` interface + SQL)
+- Modify: `cmd/server/main.go` (drop the interface-method constructor wiring)
+- Modify: `internal/service/plan_test.go` (drop mock `findDefault` field)
 
 - [ ] **Step 1: Locate `FindDefault`**
 
-In `internal/service/plan.go`, find `FindDefault` (or whatever the default-plan-lookup method is named).
+In `internal/service/plan.go`, find `FindDefault`. In `internal/repo/repo.go`, find the `PlanRepo.FindDefault(ctx)` interface declaration and the SQL implementation. In the test mock, find the `findDefault` function field.
 
-- [ ] **Step 2: Update method body**
+- [ ] **Step 2: Remove the method**
 
-```go
-// FindDefault is deprecated: the default plan concept is removed (migration 013).
-// It now returns ErrDeprecatedDefaultPlan. Callers must supply an explicit plan_id.
-func (s *PlanService) FindDefault(ctx context.Context) (*model.Plan, error) {
-    return nil, ErrDeprecatedDefaultPlan
-}
-```
+Delete the `PlanService.FindDefault` body, the `PlanRepo.FindDefault` interface declaration, the SQL implementation, and the mock field. `grep -rn "FindDefault" internal/ cmd/` must return zero matches.
 
 - [ ] **Step 3: Search for call sites**
 
@@ -1161,16 +1158,20 @@ Expected: zero remaining call sites (Phase 1's `resolvePlanForTokenIssuance` no 
 
 If any remain, replace them with explicit `FindByID(planID)`.
 
-- [ ] **Step 4: Verify build + tests**
+- [ ] **Step 4: Note on `ErrDeprecatedDefaultPlan`**
+
+The sentinel is now unused dead code (T2 added it; T20 removed the only caller). Removing the sentinel touches `internal/service/errors.go` plus every test that imports it; defer the dead-code deletion to a small follow-up so this task stays scoped to the interface change.
+
+- [ ] **Step 5: Verify build + tests**
 
 Run: `make build && make test`
 Expected: green.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add internal/service/plan.go internal/...
-git commit -m "refactor(plan): FindDefault returns ErrDeprecatedDefaultPlan"
+git add internal/service/plan.go internal/repo/repo.go cmd/server/main.go internal/service/plan_test.go
+git commit -m "refactor: remove PlanRepo.FindDefault + PlanService.FindDefault"
 ```
 
 ---

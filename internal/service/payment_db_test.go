@@ -733,9 +733,9 @@ func TestPaymentService_Refund_SumExceedsPayment(t *testing.T) {
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-sum",
 	})
 
-	// First refund 20.
+	// First refund 10 (payment is 19.9 post-migration-016; was 29.9 before).
 	if _, err := svc.Refund(context.Background(), RefundInput{
-		PaymentID: res.PaymentID, UserID: uid, IdempotencyKey: "k-1", Amount: 20,
+		PaymentID: res.PaymentID, UserID: uid, IdempotencyKey: "k-1", Amount: 10,
 	}); err != nil {
 		t.Fatalf("first refund: %v", err)
 	}
@@ -744,9 +744,9 @@ func TestPaymentService_Refund_SumExceedsPayment(t *testing.T) {
 	_, _ = db.ExecContext(context.Background(),
 		`UPDATE refunds SET status = 'paid' WHERE payment_id = $1`, res.PaymentID)
 
-	// Second refund 15 — would push sum to 35 > payment 29.9.
+	// Second refund 12 — would push sum to 22 > payment 19.9.
 	_, err := svc.Refund(context.Background(), RefundInput{
-		PaymentID: res.PaymentID, UserID: uid, IdempotencyKey: "k-2", Amount: 15,
+		PaymentID: res.PaymentID, UserID: uid, IdempotencyKey: "k-2", Amount: 12,
 	})
 	if !errors.Is(err, ErrRefundSumExceedsPayment) {
 		t.Errorf("err = %v, want ErrRefundSumExceedsPayment", err)

@@ -2768,7 +2768,7 @@ func TestAuthHandler_TestLogin(t *testing.T) {
 		}{
 			{name: "not found", err: service.ErrPlanNotFound, status: http.StatusNotFound, message: "plan not found"},
 			{name: "inactive", err: service.ErrPlanInactive, status: http.StatusBadRequest, message: "plan is not available for test login"},
-			{name: "not accepting", err: service.ErrPlanNotAcceptingNew, status: http.StatusBadRequest, message: "plan is not available for test login"},
+			{name: "not accepting", err: service.ErrPlanNotAcceptingNew, status: http.StatusConflict, message: "plan is not accepting new subscriptions"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				handler := NewAuthHandler(&mockAuthSvc{testLoginErr: tc.err}, &mockTokenSvc{})

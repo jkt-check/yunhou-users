@@ -195,8 +195,13 @@ func TestPlanService_DeletePlan(t *testing.T) {
 func TestPlanService_CreatePlan_WritesAuditLog(t *testing.T) {
 	ctx := context.Background()
 	planRepo := newMockPlanRepo()
+	appRepo := newMockAppRepo()
+	// B1: defense-in-depth ValidateApps runs at the top of CreatePlan
+	// (before the tx). Seed the apps the plan references so the
+	// pre-tx check passes and we exercise the in-tx audit-write path.
+	appRepo.seedActive("yundian", "云店")
 	changeLogRepo := newMockPlanChangeLogRepo()
-	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+	svc := NewPlanService(planRepo, appRepo, changeLogRepo)
 	// Stub the tx-scoped validation so the test exercises the
 	// audit-write path without standing up a tx-aware app repo.
 	svc.validateAppsForShareFn = func(_ context.Context, _ *sqlx.Tx, _ []string) error {
@@ -230,8 +235,14 @@ func TestPlanService_UpdatePlan_WritesAuditLog(t *testing.T) {
 	planRepo := newMockPlanRepo()
 	before := &model.Plan{ID: "pro", Name: "Old", Price: 99, Apps: []string{"yundian"}}
 	planRepo.plans[before.ID] = before
+	appRepo := newMockAppRepo()
+	// B1: defense-in-depth ValidateApps runs at the top of UpdatePlan
+	// (after FindByID, before the tx). Seed both apps the update
+	// references so the pre-tx check passes.
+	appRepo.seedActive("yundian", "云店")
+	appRepo.seedActive("yundash", "云盘")
 	changeLogRepo := newMockPlanChangeLogRepo()
-	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+	svc := NewPlanService(planRepo, appRepo, changeLogRepo)
 	// See TestPlanService_CreatePlan_WritesAuditLog — the tx-scoped app
 	// validation must be stubbed for mock-based tests.
 	svc.validateAppsForShareFn = func(_ context.Context, _ *sqlx.Tx, _ []string) error {
@@ -543,5 +554,141 @@ func TestPlanService_CreatePlan_AppDeactivatedDuringTx(t *testing.T) {
 	if len(changeLogRepo.calls) != 0 {
 		t.Errorf("changeLogRepo.calls = %d, want 0 — audit insert must roll back when lock fails",
 			len(changeLogRepo.calls))
+	}
+}
+
+// TestPlanService_CreatePlan_RejectsUnknownApp covers B1 (defense-in-depth):
+// the pre-tx ValidateApps call at the top of CreatePlan must reject an
+// unknown app_id BEFORE the transaction starts, so planRepo.CreateTx and
+// changeLogRepo.InsertTx are never called. This guards against a future
+// internal caller (batch job, second handler) inserting a plan that
+// points at a non-existent app and silently bypassing the FK-less
+// TEXT[] apps column.
+func TestPlanService_CreatePlan_RejectsUnknownApp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	planRepo := newMockPlanRepo()
+	appRepo := newMockAppRepo()
+	// No apps seeded — every app lookup should fail and
+	// ValidateApps remaps sql.ErrNoRows to ErrInvalidAppID.
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, appRepo, changeLogRepo)
+
+	plan := &model.Plan{
+		ID:   "new-plan",
+		Name: "New Plan",
+		Apps: []string{"yundian"}, // unknown — appRepo lookup fails
+	}
+
+	err := svc.CreatePlan(ctx, plan, "admin")
+	if err == nil {
+		t.Fatal("CreatePlan: expected ErrInvalidAppID-wrap for unknown app, got nil")
+	}
+	if !errors.Is(err, ErrInvalidAppID) {
+		t.Errorf("CreatePlan err = %v, want wraps ErrInvalidAppID", err)
+	}
+	if !strings.Contains(err.Error(), "yundian") {
+		t.Errorf("CreatePlan err = %v, want message to mention 'yundian'", err)
+	}
+	// planRepo.CreateTx must NOT have run — the pre-tx check failed,
+	// so the tx wrapper never executes the function body.
+	if _, ok := planRepo.plans["new-plan"]; ok {
+		t.Errorf("planRepo.plans[new-plan] = %+v, want nil — INSERT must not run when pre-tx ValidateApps fails", planRepo.plans["new-plan"])
+	}
+	// changeLogRepo.InsertTx must NOT have run either.
+	if len(changeLogRepo.calls) != 0 {
+		t.Errorf("changeLogRepo.calls = %d, want 0 — audit insert must not run when pre-tx ValidateApps fails", len(changeLogRepo.calls))
+	}
+}
+
+// TestPlanService_UpdatePlan_RejectsUnknownApp covers B1 (defense-in-depth):
+// the pre-tx ValidateApps call at the top of UpdatePlan must reject an
+// unknown app_id BEFORE the transaction starts, so planRepo.UpdateTx and
+// changeLogRepo.InsertTx are never called. The rejected apps list is the
+// `p.Apps` (the new list) — UpdatePlan already loaded `before` to
+// compute the fallback when `p.Apps` is empty, but the rejection here
+// is on the post-update apps to match the in-tx FOR SHARE check.
+func TestPlanService_UpdatePlan_RejectsUnknownApp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	planRepo := newMockPlanRepo()
+	existing := &model.Plan{ID: "monthly", Name: "Old Name", Price: 19.9, Apps: []string{"yundian"}}
+	planRepo.plans[existing.ID] = existing
+	appRepo := newMockAppRepo()
+	appRepo.seedActive("yundian", "云店")
+	// "yundash" is NOT seeded — the update's new apps list contains
+	// an unknown id, so pre-tx ValidateApps must fail.
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, appRepo, changeLogRepo)
+
+	plan := &model.Plan{ID: "monthly", Name: "New Name", Price: 29.9, Apps: []string{"yundash"}}
+
+	err := svc.UpdatePlan(ctx, plan, "admin")
+	if err == nil {
+		t.Fatal("UpdatePlan: expected ErrInvalidAppID-wrap for unknown app, got nil")
+	}
+	if !errors.Is(err, ErrInvalidAppID) {
+		t.Errorf("UpdatePlan err = %v, want wraps ErrInvalidAppID", err)
+	}
+	if !strings.Contains(err.Error(), "yundash") {
+		t.Errorf("UpdatePlan err = %v, want message to mention 'yundash'", err)
+	}
+	// planRepo.UpdateTx must NOT have run — the pre-tx check failed,
+	// so the row's existing values must be untouched.
+	got := planRepo.plans["monthly"]
+	if got.Name != "Old Name" {
+		t.Errorf("plan.Name = %q, want %q — UPDATE must not run when pre-tx ValidateApps fails", got.Name, "Old Name")
+	}
+	if got.Price != 19.9 {
+		t.Errorf("plan.Price = %v, want 19.9 — UPDATE must not run when pre-tx ValidateApps fails", got.Price)
+	}
+	// changeLogRepo.InsertTx must NOT have run either.
+	if len(changeLogRepo.calls) != 0 {
+		t.Errorf("changeLogRepo.calls = %d, want 0 — audit insert must not run when pre-tx ValidateApps fails", len(changeLogRepo.calls))
+	}
+}
+
+// TestPlanService_UpdatePlan_RejectsUnknownAppInFallback covers B1
+// (defense-in-depth) for the partial-update case: when the request
+// omits `apps` (p.Apps is empty), UpdatePlan validates the inherited
+// `before.Apps` list. If that pre-existing list points at an app that
+// has since been deleted, validation must fail and the UPDATE must NOT
+// run — without this, an admin who deletes an app row but leaves
+// behind plans.apps references would still see the UPDATE succeed.
+func TestPlanService_UpdatePlan_RejectsUnknownAppInFallback(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	planRepo := newMockPlanRepo()
+	existing := &model.Plan{ID: "monthly", Name: "Old Name", Price: 19.9, Apps: []string{"yundian"}}
+	planRepo.plans[existing.ID] = existing
+	appRepo := newMockAppRepo()
+	// "yundian" is NOT seeded — the partial update will inherit
+	// before.Apps=["yundian"] and validate it; the lookup fails.
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, appRepo, changeLogRepo)
+
+	// Partial update: only price changes, no apps in the request.
+	plan := &model.Plan{ID: "monthly", Name: "Old Name", Price: 29.9}
+
+	err := svc.UpdatePlan(ctx, plan, "admin")
+	if err == nil {
+		t.Fatal("UpdatePlan: expected ErrInvalidAppID-wrap for inherited unknown app, got nil")
+	}
+	if !errors.Is(err, ErrInvalidAppID) {
+		t.Errorf("UpdatePlan err = %v, want wraps ErrInvalidAppID", err)
+	}
+	if !strings.Contains(err.Error(), "yundian") {
+		t.Errorf("UpdatePlan err = %v, want message to mention 'yundian'", err)
+	}
+	// UPDATE must NOT have run.
+	got := planRepo.plans["monthly"]
+	if got.Price != 19.9 {
+		t.Errorf("plan.Price = %v, want 19.9 — UPDATE must not run when pre-tx ValidateApps fails on inherited apps", got.Price)
+	}
+	if len(changeLogRepo.calls) != 0 {
+		t.Errorf("changeLogRepo.calls = %d, want 0 — audit insert must not run when pre-tx ValidateApps fails", len(changeLogRepo.calls))
 	}
 }

@@ -60,6 +60,15 @@ func normalizeActorID(actorID string) string {
 }
 
 func (s *PlanService) CreatePlan(ctx context.Context, p *model.Plan, actorID string) error {
+	// Defense-in-depth (B1): reject unknown / inactive apps BEFORE the
+	// transaction / repo write. The handler already calls ValidateApps,
+	// but a future internal caller (batch job, second handler) could
+	// otherwise slip past the FK-less TEXT[] apps column and insert a
+	// row pointing at a non-existent app. The in-tx FOR SHARE check
+	// below still runs for TOCTOU safety (D8).
+	if err := s.ValidateApps(ctx, p.Apps); err != nil {
+		return err
+	}
 	if p.Currency == "" {
 		p.Currency = "CNY"
 	}
@@ -93,13 +102,23 @@ func (s *PlanService) UpdatePlan(ctx context.Context, p *model.Plan, actorID str
 	after := *p
 	actor := normalizeActorID(actorID)
 
+	// Defense-in-depth (B1): see CreatePlan. Use the same apps list the
+	// in-tx FOR SHARE check will lock — if the update doesn't touch
+	// apps, fall back to the existing apps so we validate whatever will
+	// end up in the row. An internal caller that bypasses the handler
+	// (which already validates `*req.Apps`) would otherwise slip past
+	// the FK-less TEXT[] apps column.
+	apps := p.Apps
+	if len(apps) == 0 {
+		apps = before.Apps
+	}
+	if err := s.ValidateApps(ctx, apps); err != nil {
+		return err
+	}
+
 	// TOCTOU safety (D8 part 2): see CreatePlan — wraps the
 	// ValidateApps FOR SHARE loop + UPDATE + audit insert in one tx.
 	return s.planRepo.WithTx(ctx, func(tx *sqlx.Tx) error {
-		apps := p.Apps
-		if len(apps) == 0 {
-			apps = before.Apps
-		}
 		if err := s.validateAppsForShareTx(ctx, tx, apps); err != nil {
 			return err
 		}

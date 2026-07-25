@@ -212,11 +212,11 @@ curl -X POST "https://your-yunhou-domain/test/login?plan_id=monthly" \
     {
       "id": "monthly",
       "name": "按月订阅",
-      "price": 29.9,
+      "price": 19.9,
       "interval_days": 30,
       "currency": "CNY",
       "trial_days": 0,
-      "description": "按月订阅 ¥29.9，自动续费，可随时取消",
+      "description": "按月订阅 ¥19.9，自动续费，可随时取消",
       "apps": ["yundian", "yundash"],
       "display_order": 10,
       "is_listed": true,
@@ -224,18 +224,18 @@ curl -X POST "https://your-yunhou-domain/test/login?plan_id=monthly" \
       "cycle": {"trial_days": 0, "billing_cycle_days": 30}
     },
     {
-      "id": "quarterly",
-      "name": "按季订阅",
-      "price": 79.9,
-      "interval_days": 90,
+      "id": "yearly",
+      "name": "按年订阅",
+      "price": 199.9,
+      "interval_days": 365,
       "currency": "CNY",
       "trial_days": 0,
-      "description": "按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留",
+      "description": "按年订阅 ¥199.9，自动续费，可随时取消",
       "apps": ["yundian", "yundash"],
-      "display_order": 20,
+      "display_order": 30,
       "is_listed": true,
-      "provider_ids": {},
-      "cycle": null
+      "provider_ids": {"paypal": "P-YEARLY"},
+      "cycle": {"trial_days": 0, "billing_cycle_days": 365}
     }
   ]
 }
@@ -683,7 +683,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
     {
       "id": "monthly",
       "name": "按月订阅",
-      "price": 29.9,
+      "price": 19.9,
       "interval_days": 30,
       "apps": ["yundian", "yundash"],
       "is_active": true,
@@ -691,7 +691,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
       "accepting_new_subscriptions": true,
       "currency": "CNY",
       "trial_days": 0,
-      "description": "按月订阅 ¥29.9，自动续费，可随时取消",
+      "description": "按月订阅 ¥19.9，自动续费，可随时取消",
       "display_order": 10,
       "updated_at": "2026-07-24T08:30:00Z",
       "created_at": "2026-01-01T00:00:00Z"
@@ -702,12 +702,12 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
       "price": 79.9,
       "interval_days": 90,
       "apps": ["yundian", "yundash"],
-      "is_active": true,
-      "is_listed": true,
+      "is_active": false,
+      "is_listed": false,
       "accepting_new_subscriptions": false,
       "currency": "CNY",
       "trial_days": 0,
-      "description": "按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留",
+      "description": "按季订阅 ¥79.9（已下线）",
       "display_order": 20,
       "updated_at": "2026-07-24T08:30:00Z",
       "created_at": "2026-01-01T00:00:00Z"

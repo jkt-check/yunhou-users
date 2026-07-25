@@ -34,11 +34,42 @@ type PlanRepo interface {
 	Create(ctx context.Context, p *model.Plan) error
 	Update(ctx context.Context, p *model.Plan) error
 	Delete(ctx context.Context, id string) error
+
+	// CreateTx / UpdateTx / DeleteTx mirror the non-tx variants above
+	// but execute inside a caller-managed transaction. Used by
+	// PlanService.CreatePlan / UpdatePlan / DeletePlan so the plan
+	// mutation + plan_change_log audit insert + per-app FOR SHARE
+	// lookups all commit (or roll back) together (D8).
+	CreateTx(ctx context.Context, tx *sqlx.Tx, p *model.Plan) error
+	UpdateTx(ctx context.Context, tx *sqlx.Tx, p *model.Plan) error
+	DeleteTx(ctx context.Context, tx *sqlx.Tx, id string) error
+
+	// FindByIDForShareTx acquires a row-level FOR SHARE lock on the plan
+	// row inside the caller-managed transaction. Used by payment + admin
+	// flows that need the eligibility decision (plan active? accepting
+	// new? currency match?) and the subsequent write to be atomic with
+	// respect to concurrent plan mutations — without the lock, an
+	// operator deactivating the plan between FindByID and Create would
+	// let an order through for a now-inactive plan. Lock auto-releases
+	// when the surrounding tx commits or rolls back.
+	FindByIDForShareTx(ctx context.Context, tx *sqlx.Tx, id string) (*model.Plan, error)
+
+	// WithTx runs fn inside a single transaction so the eligibility
+	// reads (FindByIDForShareTx + app-row FOR SHARE), the plan mutation,
+	// and the audit insert commit (or roll back) together. Implementations
+	// should BeginTx, call fn, commit on nil or rollback on error.
+	WithTx(ctx context.Context, fn func(tx *sqlx.Tx) error) error
 }
 
 // PlanChangeLogRepo records mutations to the plans table.
 type PlanChangeLogRepo interface {
 	Insert(ctx context.Context, planID, actorID, changeType string, before, after *model.Plan) error
+	// InsertTx writes the audit row inside a caller-managed transaction
+	// (typically PlanRepo.WithTx). Used so the audit insert and the plan
+	// mutation commit (or roll back) together — without it, a successful
+	// plan delete could leave a ghost plan_archive audit row when the FK
+	// from subscriptions still references the plan (SQLSTATE 23503).
+	InsertTx(ctx context.Context, tx *sqlx.Tx, planID, actorID, changeType string, before, after *model.Plan) error
 }
 
 type AppRepo interface {
@@ -274,6 +305,79 @@ func (r *planRepo) Delete(ctx context.Context, id string) error {
 	return err
 }
 
+// CreateTx / UpdateTx / DeleteTx mirror the non-tx variants and run
+// inside a caller-managed *sqlx.Tx. PlanService.CreatePlan /
+// UpdatePlan / DeletePlan thread these through their WithTx wrappers
+// so the plan mutation, the audit insert, and the per-app FOR SHARE
+// lookups commit (or roll back) together (D8).
+func (r *planRepo) CreateTx(ctx context.Context, tx *sqlx.Tx, p *model.Plan) error {
+	_, err := tx.NamedExecContext(ctx, `
+		INSERT INTO plans (
+		    id, name, price, interval_days, apps, is_active,
+		    is_listed, accepting_new_subscriptions, currency, trial_days,
+		    description, display_order
+		) VALUES (
+		    :id, :name, :price, :interval_days, :apps, :is_active,
+		    :is_listed, :accepting_new_subscriptions, :currency, :trial_days,
+		    :description, :display_order
+		)
+	`, p)
+	return err
+}
+
+func (r *planRepo) UpdateTx(ctx context.Context, tx *sqlx.Tx, p *model.Plan) error {
+	_, err := tx.NamedExecContext(ctx, `
+		UPDATE plans SET
+		    name = :name, price = :price, interval_days = :interval_days,
+		    apps = :apps, is_active = :is_active,
+		    is_listed = :is_listed,
+		    accepting_new_subscriptions = :accepting_new_subscriptions,
+		    currency = :currency, trial_days = :trial_days,
+		    description = :description, display_order = :display_order
+		WHERE id = :id
+	`, p)
+	return err
+}
+
+func (r *planRepo) DeleteTx(ctx context.Context, tx *sqlx.Tx, id string) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM plans WHERE id = $1`, id)
+	return err
+}
+
+// FindByIDForShareTx acquires a FOR SHARE row lock on the plan row
+// inside the caller-managed transaction. FOR SHARE blocks concurrent
+// FOR UPDATE / UPDATE / DELETE on the row (so a concurrent plan
+// deactivation can't slip in between this lookup and a subsequent
+// write), but lets other FOR SHARE locks coexist (so concurrent read-
+// only reads of the same plan don't deadlock). Lock auto-releases on
+// commit or rollback.
+func (r *planRepo) FindByIDForShareTx(ctx context.Context, tx *sqlx.Tx, id string) (*model.Plan, error) {
+	var p model.Plan
+	err := tx.GetContext(ctx, &p, `SELECT * FROM plans WHERE id = $1 FOR SHARE`, id)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// WithTx runs fn inside a single transaction so the eligibility reads
+// (FindByIDForShareTx + app-row FOR SHARE), the plan mutation, and the
+// audit insert commit (or roll back) together. fn receives the *sqlx.Tx
+// and must thread it through every write it wants to take part in the
+// transaction; BeginTxx is the only acquisition, and the standard
+// commit/rollback dance is taken care of here.
+func (r *planRepo) WithTx(ctx context.Context, fn func(tx *sqlx.Tx) error) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // safe to call after Commit
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (r *planChangeLogRepo) Insert(ctx context.Context, planID, actorID, changeType string, before, after *model.Plan) error {
 	beforeJSON, err := json.Marshal(before)
 	if err != nil {
@@ -285,6 +389,32 @@ func (r *planChangeLogRepo) Insert(ctx context.Context, planID, actorID, changeT
 	}
 
 	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO plan_change_log (plan_id, actor_id, change_type, before, after)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+	`, planID, actorID, changeType, beforeJSON, afterJSON)
+	return err
+}
+
+// InsertTx writes the audit row inside a caller-managed transaction
+// (typically PlanRepo.WithTx). Used so the audit insert and the plan
+// mutation commit (or roll back) together — without it, a successful
+// plan delete could leave a ghost plan_archive audit row when the FK
+// from subscriptions still references the plan (SQLSTATE 23503).
+//
+// Mirrors Insert but executes against the supplied *sqlx.Tx instead of
+// the connection pool. The plan_id FK must still be satisfied at INSERT
+// time — the audit insert must run BEFORE any DELETE on the plan row.
+func (r *planChangeLogRepo) InsertTx(ctx context.Context, tx *sqlx.Tx, planID, actorID, changeType string, before, after *model.Plan) error {
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		return err
+	}
+	afterJSON, err := json.Marshal(after)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO plan_change_log (plan_id, actor_id, change_type, before, after)
 		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
 	`, planID, actorID, changeType, beforeJSON, afterJSON)

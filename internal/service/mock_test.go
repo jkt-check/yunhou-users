@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/util"
 )
@@ -161,6 +162,22 @@ type mockPlanRepo struct {
 	// TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing
 	// degraded-mode case.
 	lookupErrForIDs map[string]error
+	// findByIDForShareTxFn, if non-nil, replaces the default
+	// FindByIDForShareTx implementation. Lets tests that exercise the
+	// TOCTOU path return a plan-state mismatch between the lock step
+	// and the eligibility decision (e.g. plan became inactive between
+	// the prior FindByID and the lock) without forcing the mock to model
+	// ordered call sequences.
+	findByIDForShareTxFn func(ctx context.Context, tx *sqlx.Tx, id string) (*model.Plan, error)
+	// findByIDForShareTxErr, if non-nil, makes FindByIDForShareTx return
+	// this error verbatim (when findByIDForShareTxFn is nil). Lets tests
+	// drive the eligibility-tx error paths (e.g. lock acquire fails).
+	findByIDForShareTxErr error
+	// withTxFn, if non-nil, replaces the default WithTx implementation.
+	// Lets tests inject custom tx-scoped error sequences (e.g. the
+	// plan-deactivated-during-tx test fires ErrPlanInactive from the
+	// FindByIDForShareTx callback).
+	withTxFn func(ctx context.Context, fn func(*sqlx.Tx) error) error
 }
 
 func newMockPlanRepo() *mockPlanRepo {
@@ -237,6 +254,52 @@ func (m *mockPlanRepo) Delete(_ context.Context, id string) error {
 	return nil
 }
 
+// CreateTx / UpdateTx / DeleteTx are the tx-scoped counterparts of
+// Create / Update / Delete. The mock treats them the same as the
+// non-tx variants — there is no separate tx state to model. Service
+// tests verify call sequences via the captured state in m.plans +
+// changeLogRepo.calls.
+func (m *mockPlanRepo) CreateTx(_ context.Context, _ *sqlx.Tx, p *model.Plan) error {
+	return m.Create(context.Background(), p)
+}
+func (m *mockPlanRepo) UpdateTx(_ context.Context, _ *sqlx.Tx, p *model.Plan) error {
+	return m.Update(context.Background(), p)
+}
+func (m *mockPlanRepo) DeleteTx(_ context.Context, _ *sqlx.Tx, id string) error {
+	return m.Delete(context.Background(), id)
+}
+
+// FindByIDForShareTx is the D8 mock for the eligibility-tx plan lookup.
+// Default behaviour: returns the same plan as FindByID but lets tests
+// drive an "activated → deactivated between FindByID and lock" race via
+// findByIDForShareTxFn / findByIDForShareTxErr. The mock treats the tx
+// as a black box — it does not model rollback semantics.
+func (m *mockPlanRepo) FindByIDForShareTx(ctx context.Context, tx *sqlx.Tx, id string) (*model.Plan, error) {
+	if m.findByIDForShareTxFn != nil {
+		return m.findByIDForShareTxFn(ctx, tx, id)
+	}
+	if m.findByIDForShareTxErr != nil {
+		return nil, m.findByIDForShareTxErr
+	}
+	return m.FindByID(ctx, id)
+}
+
+// WithTx is the D8 mock for the planner mutation transaction. The
+// real implementation BeginTx'es, runs fn against the tx, then commits.
+// The mock passes nil to fn — PlanService's tx-bound writes go through
+// interface methods (CreateTx / UpdateTx / DeleteTx / InsertTx) that
+// ignore the tx, so fn runs end-to-end against the mock's
+// capture-only state.
+//
+// Tests that need a fully-controlled fn body (e.g. to drive a
+// FOR SHARE step error) supply withTxFn to bypass this dispatch.
+func (m *mockPlanRepo) WithTx(ctx context.Context, fn func(*sqlx.Tx) error) error {
+	if m.withTxFn != nil {
+		return m.withTxFn(ctx, fn)
+	}
+	return fn(nil)
+}
+
 // --- PlanChangeLogRepo mock ---
 
 type planChangeLogCall struct {
@@ -257,6 +320,24 @@ func newMockPlanChangeLogRepo() *mockPlanChangeLogRepo {
 }
 
 func (m *mockPlanChangeLogRepo) Insert(ctx context.Context, planID, actorID, changeType string, before, after *model.Plan) error {
+	m.calls = append(m.calls, planChangeLogCall{
+		planID:     planID,
+		actorID:    actorID,
+		changeType: changeType,
+		before:     before,
+		after:      after,
+	})
+	if m.insertFunc != nil {
+		return m.insertFunc(ctx, planID, actorID, changeType, before, after)
+	}
+	return nil
+}
+
+// InsertTx mirrors Insert but accepts a *sqlx.Tx (ignored by the mock).
+// Used by CreatePlan/UpdatePlan/DeletePlan to participate in the
+// PlanRepo.WithTx wrapper. Service-level tests only need to verify the
+// call sequence; rollback semantics require a real test DB.
+func (m *mockPlanChangeLogRepo) InsertTx(ctx context.Context, _ *sqlx.Tx, planID, actorID, changeType string, before, after *model.Plan) error {
 	m.calls = append(m.calls, planChangeLogCall{
 		planID:     planID,
 		actorID:    actorID,

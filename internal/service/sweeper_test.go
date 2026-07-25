@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
@@ -46,6 +47,9 @@ func (m *mockOrderRepo) UpdateProviderIntent(_ context.Context, _ string, _ []by
 }
 func (m *mockOrderRepo) FindByProviderOutTradeNo(_ context.Context, _ string) (*model.Order, error) {
 	return nil, errors.New("not used")
+}
+func (m *mockOrderRepo) CreateInTx(_ context.Context, _ *sqlx.Tx, _ *model.Order) error {
+	return nil
 }
 
 func TestOrderSweeper_SweepOnce(t *testing.T) {

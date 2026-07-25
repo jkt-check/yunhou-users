@@ -3,10 +3,12 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/model"
 )
 
@@ -94,7 +96,7 @@ func TestPlanService_CreatePlan(t *testing.T) {
 			IsActive:     true,
 		}
 
-		err := svc.CreatePlan(ctx, plan)
+		err := svc.CreatePlan(ctx, plan, "admin")
 		if err != nil {
 			t.Fatalf("create plan: %v", err)
 		}
@@ -114,7 +116,7 @@ func TestPlanService_CreatePlan(t *testing.T) {
 		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		plan := &model.Plan{ID: "test", Name: "Test"}
-		err := svc.CreatePlan(ctx, plan)
+		err := svc.CreatePlan(ctx, plan, "admin")
 		if err == nil {
 			t.Error("expected error")
 		}
@@ -132,7 +134,7 @@ func TestPlanService_UpdatePlan(t *testing.T) {
 		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		plan := &model.Plan{ID: "monthly", Name: "New Name", Price: 29.9}
-		err := svc.UpdatePlan(ctx, plan)
+		err := svc.UpdatePlan(ctx, plan, "admin")
 		if err != nil {
 			t.Fatalf("update plan: %v", err)
 		}
@@ -151,7 +153,7 @@ func TestPlanService_UpdatePlan(t *testing.T) {
 		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
 		plan := &model.Plan{ID: "test", Name: "Test"}
-		err := svc.UpdatePlan(ctx, plan)
+		err := svc.UpdatePlan(ctx, plan, "admin")
 		if err == nil {
 			t.Error("expected error")
 		}
@@ -168,7 +170,7 @@ func TestPlanService_DeletePlan(t *testing.T) {
 		planRepo.plans["to-delete"] = &model.Plan{ID: "to-delete", Name: "To Delete"}
 		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
-		err := svc.DeletePlan(ctx, "to-delete")
+		err := svc.DeletePlan(ctx, "to-delete", "admin")
 		if err != nil {
 			t.Fatalf("delete plan: %v", err)
 		}
@@ -183,7 +185,7 @@ func TestPlanService_DeletePlan(t *testing.T) {
 		planRepo.err = errTest
 		svc := NewPlanService(planRepo, newMockAppRepo(), newMockPlanChangeLogRepo())
 
-		err := svc.DeletePlan(ctx, "test")
+		err := svc.DeletePlan(ctx, "test", "admin")
 		if err == nil {
 			t.Error("expected error")
 		}
@@ -195,9 +197,17 @@ func TestPlanService_CreatePlan_WritesAuditLog(t *testing.T) {
 	planRepo := newMockPlanRepo()
 	changeLogRepo := newMockPlanChangeLogRepo()
 	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+	// Stub the tx-scoped validation so the test exercises the
+	// audit-write path without standing up a tx-aware app repo.
+	svc.validateAppsForShareFn = func(_ context.Context, _ *sqlx.Tx, _ []string) error {
+		return nil
+	}
+	// The mock's WithTx (default) calls fn(nil); the service body
+	// uses interface methods (CreateTx / InsertTx) that ignore the tx,
+	// so fn runs end-to-end and InsertTx captures the audit row.
 	plan := &model.Plan{ID: "pro", Name: "Pro", Price: 99, Apps: []string{"yundian"}}
 
-	if err := svc.CreatePlan(ctx, plan); err != nil {
+	if err := svc.CreatePlan(ctx, plan, "admin"); err != nil {
 		t.Fatalf("CreatePlan: %v", err)
 	}
 	if len(changeLogRepo.calls) != 1 {
@@ -222,9 +232,14 @@ func TestPlanService_UpdatePlan_WritesAuditLog(t *testing.T) {
 	planRepo.plans[before.ID] = before
 	changeLogRepo := newMockPlanChangeLogRepo()
 	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
+	// See TestPlanService_CreatePlan_WritesAuditLog — the tx-scoped app
+	// validation must be stubbed for mock-based tests.
+	svc.validateAppsForShareFn = func(_ context.Context, _ *sqlx.Tx, _ []string) error {
+		return nil
+	}
 	after := &model.Plan{ID: "pro", Name: "New", Price: 129, Apps: []string{"yundian", "yundash"}}
 
-	if err := svc.UpdatePlan(ctx, after); err != nil {
+	if err := svc.UpdatePlan(ctx, after, "admin"); err != nil {
 		t.Fatalf("UpdatePlan: %v", err)
 	}
 	if len(changeLogRepo.calls) != 1 {
@@ -250,7 +265,7 @@ func TestPlanService_DeletePlan_WritesArchiveLog(t *testing.T) {
 	changeLogRepo := newMockPlanChangeLogRepo()
 	svc := NewPlanService(planRepo, newMockAppRepo(), changeLogRepo)
 
-	if err := svc.DeletePlan(ctx, snapshot.ID); err != nil {
+	if err := svc.DeletePlan(ctx, snapshot.ID, "admin"); err != nil {
 		t.Fatalf("DeletePlan: %v", err)
 	}
 	if len(changeLogRepo.calls) != 1 {
@@ -476,5 +491,57 @@ func TestPlanService_ValidateApps_RepoError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "db down") {
 		t.Errorf("err = %v, want underlying 'db down' to surface", err)
+	}
+}
+
+// TestPlanService_CreatePlan_AppDeactivatedDuringTx pins the D8
+// TOCTOU guarantee for CreatePlan: the FOR SHARE app lookup inside
+// validateAppsForShareTx MUST see the post-deactivation truth, so a
+// concurrent app deactivation (admin PATCH /apps/:id with
+// is_active=false) between the prior ValidateApps call and the lock
+// inside the eligibility tx surfaces as ErrInvalidAppID ("... is
+// inactive"). The plan INSERT must NOT run.
+//
+// The fixture installs validateAppsForShareFn on the plan service to
+// force the lock-step error (mimicking what a real DB would return
+// when the app row's is_active flipped between calls).
+func TestPlanService_CreatePlan_AppDeactivatedDuringTx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	planRepo := newMockPlanRepo()
+	appRepo := newMockAppRepo()
+	appRepo.seedActive("yundian", "云店")
+
+	changeLogRepo := newMockPlanChangeLogRepo()
+	svc := NewPlanService(planRepo, appRepo, changeLogRepo)
+	// Simulate the "app-active at the initial ValidateApps call but
+	// deactivated by the time the FOR SHARE lock fires" race.
+	svc.validateAppsForShareFn = func(_ context.Context, _ *sqlx.Tx, apps []string) error {
+		return fmt.Errorf("%w: %s is inactive", ErrInvalidAppID, apps[0])
+	}
+
+	plan := &model.Plan{
+		ID:   "monthly",
+		Name: "Monthly",
+		Apps: []string{"yundian"},
+	}
+	err := svc.CreatePlan(ctx, plan, "admin")
+	if err == nil {
+		t.Fatal("CreatePlan: expected ErrInvalidAppID-wrap from deactivation race, got nil")
+	}
+	if !errors.Is(err, ErrInvalidAppID) {
+		t.Errorf("CreatePlan err = %v, want wraps ErrInvalidAppID", err)
+	}
+	// The plan mutation must NOT have run (otherwise the row points
+	// at a now-inactive app).
+	if _, ok := planRepo.plans["monthly"]; ok {
+		t.Errorf("plans[monthly] = %+v, want nil — INSERT must roll back when lock fails", planRepo.plans["monthly"])
+	}
+	// The audit insert (which lives inside the same tx) must NOT have
+	// run either.
+	if len(changeLogRepo.calls) != 0 {
+		t.Errorf("changeLogRepo.calls = %d, want 0 — audit insert must roll back when lock fails",
+			len(changeLogRepo.calls))
 	}
 }

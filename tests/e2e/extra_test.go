@@ -398,8 +398,8 @@ func e2eMustSeedExpiredSubUser(t *testing.T, db *sqlx.DB) string {
 			is_listed, accepting_new_subscriptions, currency, trial_days,
 			description, display_order
 		) VALUES (
-			'quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], true,
-			true, false, 'CNY', 0, '按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留', 20
+			'quarterly', '按季订阅', 79.9, 90, ARRAY['yundian','yundash'], false,
+			false, false, 'CNY', 0, '按季订阅 ¥79.9（已下线）', 20
 		) ON CONFLICT (id) DO NOTHING`); err != nil {
 		t.Fatalf("seed plan: %v", err)
 	}

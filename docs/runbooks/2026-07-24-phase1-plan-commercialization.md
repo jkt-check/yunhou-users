@@ -205,10 +205,11 @@ jq -e '
     and ($ids | index("quarterly") != null)
     and ($ids | index("yearly") != null)
     and ($ids | index("free") == null)
+    and (.data[] | .is_listed == true)
 ' "$TMP_DIR/plans.json"
 ```
 
-The public DTO does not expose `is_listed`; absence from this response is the observable visibility check.
+The `PublicPlan` DTO exposes `is_listed` as a top-level JSON field. The repo filters by `is_listed=true`, so a plan with `is_listed=false` will be absent from this response — verify by absence. To verify a returned plan carries the flag, assert `.data[].is_listed == true`.
 
 ### 3. Admin plan creation accepts all commercial fields
 

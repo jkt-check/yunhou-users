@@ -89,7 +89,10 @@ func (s *PlanService) CreatePlan(ctx context.Context, p *model.Plan, actorID str
 		if err := s.planRepo.CreateTx(ctx, tx, p); err != nil {
 			return err
 		}
-		return s.changeLogRepo.InsertTx(ctx, tx, p.ID, actor, "plan_create", nil, &after)
+		if err := s.changeLogRepo.InsertTx(ctx, tx, p.ID, actor, "plan_create", nil, &after); err != nil {
+			return fmt.Errorf("insert plan_create audit: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -125,7 +128,10 @@ func (s *PlanService) UpdatePlan(ctx context.Context, p *model.Plan, actorID str
 		if err := s.planRepo.UpdateTx(ctx, tx, p); err != nil {
 			return err
 		}
-		return s.changeLogRepo.InsertTx(ctx, tx, p.ID, actor, "plan_update", &before, &after)
+		if err := s.changeLogRepo.InsertTx(ctx, tx, p.ID, actor, "plan_update", &before, &after); err != nil {
+			return fmt.Errorf("insert plan_update audit: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -149,7 +155,7 @@ func (s *PlanService) DeletePlan(ctx context.Context, id string, actorID string)
 	// a plan that still exists.
 	return s.planRepo.WithTx(ctx, func(tx *sqlx.Tx) error {
 		if err := s.changeLogRepo.InsertTx(ctx, tx, id, actor, "plan_archive", &snapshot, nil); err != nil {
-			return err
+			return fmt.Errorf("insert plan_archive audit: %w", err)
 		}
 		return s.planRepo.DeleteTx(ctx, tx, id)
 	})

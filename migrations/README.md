@@ -52,7 +52,7 @@ syntax, **not** transaction control — those are fine.
 | File | Purpose |
 |---|---|
 | `001_init.sql` | Core users / identities / apps / plans / subscriptions tables |
-| `002_simplify_plans.sql` | Plan has apps[]; default plans seeded |
+| `002_simplify_plans.sql` | Plan has apps[]; seeded free/monthly/quarterly/yearly rows (default-plan concept later dropped by 014) |
 | `003_payments.sql` | orders / payments / refunds / webhook_events / audit_log |
 | `004_ls_channel.sql` | (historical) added lemonsqueezy to channel CHECK — kept for installs that ran it before 008 |
 | `005_paypal_channel.sql` | extends channel CHECK to include 'paypal' |

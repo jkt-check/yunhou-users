@@ -598,7 +598,7 @@ type updatePlanRequest struct {
 	IsListed                  *bool     `json:"is_listed"`
 	AcceptingNewSubscriptions *bool     `json:"accepting_new_subscriptions"`
 	TrialDays                 *int      `json:"trial_days"`
-	Description               *string   `json:"description"`
+	Description               **string  `json:"description"`
 	DisplayOrder              *int      `json:"display_order"`
 	IsActive                  *bool     `json:"is_active"`
 }
@@ -625,6 +625,14 @@ func decodeAdminPlanRequest(c *gin.Context, dst any) bool {
 	if err := json.Unmarshal(body, dst); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return false
+	}
+	// encoding/json decodes both an absent **string field and an explicit null
+	// to a nil outer pointer. Preserve explicit null for PATCH so UpdatePlan can
+	// distinguish it from an omitted description.
+	if req, ok := dst.(*updatePlanRequest); ok {
+		if _, present := raw["description"]; present && req.Description == nil {
+			req.Description = new(*string)
+		}
 	}
 	return true
 }
@@ -831,7 +839,11 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 		plan.TrialDays = *req.TrialDays
 	}
 	if req.Description != nil {
-		plan.Description = req.Description
+		if *req.Description == nil {
+			plan.Description = nil
+		} else {
+			plan.Description = *req.Description
+		}
 	}
 	if req.DisplayOrder != nil {
 		plan.DisplayOrder = *req.DisplayOrder

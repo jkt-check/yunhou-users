@@ -679,6 +679,60 @@ func TestPlanHandler_Patch_RejectsNegativeTrialDays(t *testing.T) {
 	}
 }
 
+func TestPlanHandler_Patch_ClearsDescription(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	description := "Old description"
+	svc := &mockPlanSvc{plan: &model.Plan{
+		ID:          "monthly",
+		Name:        "Monthly",
+		Description: &description,
+	}}
+
+	updated := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly", `{"description":null}`)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200 (body: %s)", updated.Code, updated.Body.String())
+	}
+	if svc.plan.Description != nil {
+		t.Errorf("Description = %q, want nil", *svc.plan.Description)
+	}
+}
+
+func TestPlanHandler_Patch_AbsentDescriptionUnchanged(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	description := "Existing description"
+	svc := &mockPlanSvc{plan: &model.Plan{
+		ID:          "monthly",
+		Name:        "Monthly",
+		Description: &description,
+	}}
+
+	updated := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly", `{}`)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200 (body: %s)", updated.Code, updated.Body.String())
+	}
+	if svc.plan.Description == nil || *svc.plan.Description != description {
+		t.Errorf("Description = %v, want %q", svc.plan.Description, description)
+	}
+}
+
+func TestPlanHandler_Patch_SetsDescription(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	description := "Old description"
+	svc := &mockPlanSvc{plan: &model.Plan{
+		ID:          "monthly",
+		Name:        "Monthly",
+		Description: &description,
+	}}
+
+	updated := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly", `{"description":"New description"}`)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200 (body: %s)", updated.Code, updated.Body.String())
+	}
+	if svc.plan.Description == nil || *svc.plan.Description != "New description" {
+		t.Errorf("Description = %v, want New description", svc.plan.Description)
+	}
+}
+
 func TestPlanHandler_Patch_AcceptsNewFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	description := "Old"

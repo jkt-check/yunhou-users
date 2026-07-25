@@ -228,6 +228,7 @@ curl https://your-yunhou-domain/user/profile \
       "description": "按月订阅 ¥29.9，自动续费，可随时取消",
       "apps": ["yundian", "yundash"],
       "display_order": 10,
+      "is_listed": true,
       "provider_ids": {"paypal": "P-MONTHLY"},
       "cycle": {"trial_days": 0, "billing_cycle_days": 30}
     },
@@ -241,6 +242,7 @@ curl https://your-yunhou-domain/user/profile \
       "description": "按季订阅 ¥79.9，暂不开放新订阅，已有订阅保留",
       "apps": ["yundian", "yundash"],
       "display_order": 20,
+      "is_listed": true,
       "provider_ids": {},
       "cycle": null
     }
@@ -257,10 +259,11 @@ curl https://your-yunhou-domain/user/profile \
 | `description` | 可空的营销文案。 |
 | `apps` | 该 Plan 授权的 App ID 列表。 |
 | `display_order` | 运营配置的展示顺序；数值较小的 Plan 先返回。 |
+| `is_listed` | 是否出现在商业目录；当前接口只返回 `is_listed=true` 的行，但字段仍随 DTO 暴露以匹配 `model.PublicPlan` 结构。 |
 | `provider_ids` | 该 Plan 在 PayPal 等渠道对应的上游 plan ID。未配置时为 `{}`（BFF 即可判定“当前 App 该 Plan 暂无可下单渠道”）。 |
 | `cycle` | Provider 侧解析后的试用 + 计费周期；用于营销页核对上游配置。对应 Plan 未配置 PayPal 时为 `null`；业务试用天数仍以顶层 `trial_days`（即 `plan.trial_days`）为准。 |
 
-`PublicPlan` 不返回管理字段 `is_active`、`is_listed`、`accepting_new_subscriptions`、`updated_at`。`quarterly` 当前是 legacy Plan（`accepting_new_subscriptions=false`）；目录出现不代表可以创建新订阅或订单，BFF 下单前必须处理 409。`free` 正在退役，Phase 2 会设置 `is_active=false`、`accepting_new_subscriptions=false`。
+`PublicPlan` 不返回管理字段 `is_active`、`accepting_new_subscriptions`、`updated_at`（`is_listed` 已作为目录字段随 DTO 暴露）。`quarterly` 当前是 legacy Plan（`accepting_new_subscriptions=false`）；目录出现不代表可以创建新订阅或订单，BFF 下单前必须处理 409。`free` 已由 Phase 2 退役并设置为 `is_active=false`、`accepting_new_subscriptions=false`，不再出现在公开 Plan 目录中。
 
 **错误响应**：
 

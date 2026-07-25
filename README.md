@@ -7,7 +7,7 @@ A shared user management API for multi-app ecosystems. One user identity across 
 - **Social OAuth** — GitHub uses the OAuth Authorization Code flow (`/auth/github/redirect` → `/auth/github/callback`). WeChat Open Platform 网站应用 uses QR-code login (`/auth/wechat/redirect` → `/auth/wechat/callback`, via `open.weixin.qq.com/connect/qrconnect`). Yunhou holds each app's GitHub `client_secret` / WeChat `app_secret` and runs the code exchange server-side. State tokens are shared between providers — `(app_id, callback_index)` HMAC binding.
 - **Plan-based access** — Plans define which apps a user can access
 - **RSA256 JWT** access tokens with JWKS public key endpoint
-- **Subscription gating** — tokens only issued for active subscriptions based on plan
+- **Subscription gating** — tokens are always issued but carry `scope=[]` and `has_access=false` when the user has no active subscription
 - **Refresh token rotation** — one-time-use refresh tokens
 - **Rate limiting** — per-IP token bucket (10/s burst 20 on public, 30/s burst 60 on app management)
 

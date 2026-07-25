@@ -39,8 +39,8 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 		if r.Data.Status != "pending" {
 			t.Errorf("expected status=pending, got %s", r.Data.Status)
 		}
-		if r.Data.Amount != 29.9 {
-			t.Errorf("expected amount=29.9 (plan snapshot), got %v", r.Data.Amount)
+		if r.Data.Amount != 19.9 {
+			t.Errorf("expected amount=19.9 (plan snapshot, post-migration 016), got %v", r.Data.Amount)
 		}
 	})
 
@@ -73,7 +73,7 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 		resp.JSON(t, &r)
 		orderID := r.Data.ID
 
-		confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_%s","amount":29.90,"currency":"CNY"}`, orderID)
+		confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_%s","amount":19.90,"currency":"CNY"}`, orderID)
 		resp = doRequest(t, srv.Engine, http.MethodPost,
 			"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token2))
 		if resp.StatusCode != http.StatusOK {
@@ -456,7 +456,8 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 	token := loginAndGetTokens(t, srv.Engine, "concurrent-refund", "yundian").AccessToken
 
-	// Setup: paid payment of 29.90
+	// Setup: paid payment of 19.90 (migration 016 sets monthly.price=19.9;
+	// was 29.9 before).
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
@@ -474,13 +475,11 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
 
-	// Fire 4 concurrent refunds of 10.00 each. Sum would be 40.00 > 29.90.
-	// Expect: at most 2 succeed (10+10+10 = 30, but we cap at 29.90 so 2
-	// fits at 10+10=20, the 3rd of 10 would push to 30 which exceeds 29.90).
-	// Be conservative: at least ONE must fail (the 4th is certain, the
-	// 3rd is certain), and the success count must be < 4.
+	// Fire 4 concurrent refunds of 5.00 each. Sum would be 20.00 > 19.90.
+	// Expect: at most 3 succeed (5+5+5 = 15 ≤ 19.90, but 5+5+5+5 = 20 > 19.90,
+	// so the 4th must fail). The invariant is "sum ≤ payment amount".
 	const N = 4
-	const refundAmt = 10.0
+	const refundAmt = 5.0
 	results := make(chan int, N)
 	for i := 0; i < N; i++ {
 		go func(idx int) {
@@ -502,16 +501,16 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 			t.Errorf("refund %d: unexpected status %d", i, code)
 		}
 	}
-	// The sum invariant must block at least one. We expect at most 2
-	// successes (10+10=20 ≤ 29.90, but 10+10+10=30 > 29.90).
+	// The sum invariant must block at least one. We expect at most 3
+	// successes (5+5+5=15 ≤ 19.90, but 5+5+5+5=20 > 19.90).
 	if successes >= N {
-		t.Errorf("sum invariant broken: all %d refunds succeeded (max allowed: 2)", N)
+		t.Errorf("sum invariant broken: all %d refunds succeeded (max allowed: 3)", N)
 	}
-	if successes > 2 {
-		t.Errorf("sum invariant too loose: %d refunds succeeded but only 2 fit (3*10=30 > 29.90)", successes)
+	if successes > 3 {
+		t.Errorf("sum invariant too loose: %d refunds succeeded but only 3 fit (4*5=20 > 19.90)", successes)
 	}
 
-	// Verify the DB: the sum of paid refunds must not exceed 29.90.
+	// Verify the DB: the sum of paid refunds must not exceed 19.90.
 	var total float64
 	if err := srv.DB.GetContext(context.Background(), &total,
 		`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status = 'paid'`, paymentID,
@@ -520,8 +519,8 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 		t.Logf("sum check skipped: %v", err)
 		return
 	}
-	if total > 29.90+0.01 {
-		t.Errorf("DB refund sum = %v, exceeds 29.90", total)
+	if total > 19.90+0.01 {
+		t.Errorf("DB refund sum = %v, exceeds 19.90", total)
 	}
 	_ = sql.ErrNoRows // keep import used if env lacks DB
 }

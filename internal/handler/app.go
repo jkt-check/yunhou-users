@@ -934,9 +934,17 @@ func (h *PlanHandler) GetAppPlans(c *gin.Context) {
 // QuoteService inlines its own plan-based cycle configuration.
 func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 	out := model.PublicPlan{
-		ID:           p.ID,
-		Name:         p.Name,
-		Price:        p.Price,
+		ID:   p.ID,
+		Name: p.Name,
+		// ApplyPlanAmountOverride mirrors the override hook in
+		// QuoteService.Get() and PaymentService.eligibilityAndInsertOrderTx:
+		// the marketing catalog response reflects the same override so the
+		// FE pricing cards display test amounts in dev/staging without
+		// requiring a separate FE-side env switch. See
+		// internal/service/price_override.go for the env contract.
+		// Currency is preserved from plans.currency; only the numeric
+		// amount changes.
+		Price:        service.ApplyPlanAmountOverride(p.ID, p.Price),
 		IntervalDays: p.IntervalDays,
 		Currency:     p.Currency,
 		TrialDays:    p.TrialDays,

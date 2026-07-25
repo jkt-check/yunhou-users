@@ -855,3 +855,61 @@ func TestBuildPublicPlan(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildPublicPlan_PriceOverride is split out from TestBuildPublicPlan
+// because t.Setenv (and the withOverrideEnvLocal helper) cannot run
+// inside a t.Parallel subtree. TestBuildPublicPlan uses t.Parallel at the
+// root, so any setenv-using subtests must live in a separate top-level
+// test. See service.price_override_test.go's withOverrideEnv for the
+// full rationale on the env-restoration-LIFO dance.
+//
+// Mirror of the same override hook in QuoteService.Get and
+// PaymentService.eligibilityAndInsertOrderTx; see
+// internal/service/price_override.go for the env contract.
+func TestBuildPublicPlan_PriceOverride(t *testing.T) {
+	t.Run("empty override env preserves plan price", func(t *testing.T) {
+		withOverrideEnvLocal(t, "")
+		p := model.Plan{ID: "monthly", Price: 19.9, Currency: "CNY"}
+		out := buildPublicPlan(p, model.AppConfig{})
+		if out.Price != 19.9 {
+			t.Errorf("Price: got %v, want 19.9 (override disabled)", out.Price)
+		}
+		if out.Currency != "CNY" {
+			t.Errorf("Currency: got %q, want CNY (override must not change currency)", out.Currency)
+		}
+	})
+	t.Run("override applied to matching plan", func(t *testing.T) {
+		withOverrideEnvLocal(t, `{"monthly":0.01,"yearly":0.1}`)
+		p := model.Plan{ID: "monthly", Price: 19.9, Currency: "CNY"}
+		out := buildPublicPlan(p, model.AppConfig{})
+		if out.Price != 0.01 {
+			t.Errorf("Price: got %v, want 0.01 (override applied to PublicPlan)", out.Price)
+		}
+		if out.Currency != "CNY" {
+			t.Errorf("Currency: got %q, want CNY (override must not change currency)", out.Currency)
+		}
+	})
+	t.Run("override not applied to plans not in the map", func(t *testing.T) {
+		withOverrideEnvLocal(t, `{"monthly":0.01}`)
+		p := model.Plan{ID: "yearly", Price: 199.9, Currency: "CNY"}
+		out := buildPublicPlan(p, model.AppConfig{})
+		if out.Price != 199.9 {
+			t.Errorf("Price: got %v, want 199.9 (yearly not in override map)", out.Price)
+		}
+	})
+}
+
+// withOverrideEnvLocal mirrors service.withOverrideEnv but for the
+// handler test package — setenv PLAN_AMOUNT_OVERRIDE_JSON before the
+// test runs, reload the in-memory overrideMap, and reload again on
+// cleanup so the in-memory state tracks the env-restored state. See
+// the long doc comment on the matching service.withOverrideEnv for the
+// t.Setenv / t.Cleanup LIFO ordering rationale.
+func withOverrideEnvLocal(t *testing.T, value string) {
+	t.Helper()
+	t.Cleanup(func() {
+		service.ReloadOverrideFromEnv()
+	})
+	t.Setenv("PLAN_AMOUNT_OVERRIDE_JSON", value)
+	service.ReloadOverrideFromEnv()
+}

@@ -132,6 +132,7 @@ type PublicPlan struct {
     Currency     string             `json:"currency"`
     TrialDays    int                `json:"trial_days"`
     Description  *string            `json:"description"`
+    IsListed     bool               `json:"is_listed"`
     Apps         []string           `json:"apps"`
     DisplayOrder int                `json:"display_order"`
     ProviderIDs  map[string]string  `json:"provider_ids"`
@@ -243,7 +244,7 @@ Expected: FAIL — current ORDER BY is `created_at, id`.
 In `internal/repo/repo.go`, change the `FindByApp` SQL to:
 
 ```go
-SELECT * FROM plans WHERE $1 = ANY(apps) AND is_active = true ORDER BY display_order ASC, created_at ASC, id ASC
+SELECT * FROM plans WHERE $1 = ANY(apps) AND is_active = true AND is_listed = true ORDER BY display_order ASC, created_at ASC, id ASC
 ```
 
 - [ ] **Step 3: Update `Create` SQL columns**
@@ -872,12 +873,16 @@ POST `/user/subscriptions` with `quarterly` (after fixture sets `accepting_new_s
 
 Set plan currency to CNY but attempt to create an order with channel that forces USD — assert 400.
 
-- [ ] **Step 5: Run E2E**
+- [ ] **Step 5: Write `TestE2E_PlanCommercial_UnlistedHidden`**
+
+Create a plan with `is_listed=false` and assert it does NOT appear in `GET /apps/:id/plans` (absent from the public catalog). Also assert the round-tripped admin `GET /admin/plans/:id` keeps `is_listed=false`.
+
+- [ ] **Step 6: Run E2E**
 
 Run: `make e2e`
 Expected: all green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add tests/e2e/plan_commercial_test.go

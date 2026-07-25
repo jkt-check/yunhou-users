@@ -372,6 +372,7 @@ type PublicPlan struct {
     Currency                 string             `json:"currency"`
     TrialDays                int                `json:"trial_days"`
     Description              *string            `json:"description"`     // pointer for nullable
+    IsListed                 bool               `json:"is_listed"`
     Apps                     []string           `json:"apps"`
     DisplayOrder             int                `json:"display_order"`
     ProviderIDs              map[string]string  `json:"provider_ids"`
@@ -386,7 +387,7 @@ type PublicPlan struct {
 `PlanRepo.FindByApp` SQL change:
 ```sql
 SELECT * FROM plans
-WHERE $1 = ANY(apps) AND is_active = true
+WHERE $1 = ANY(apps) AND is_active = true AND is_listed = true
 ORDER BY display_order ASC, created_at ASC, id ASC
 ```
 

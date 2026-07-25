@@ -260,7 +260,7 @@ curl https://your-yunhou-domain/user/profile \
 | `provider_ids` | 该 Plan 在 PayPal 等渠道对应的上游 plan ID。未配置时为 `{}`（BFF 即可判定“当前 App 该 Plan 暂无可下单渠道”）。 |
 | `cycle` | Provider 侧解析后的试用 + 计费周期；用于营销页核对上游配置。对应 Plan 未配置 PayPal 时为 `null`；业务试用天数仍以顶层 `trial_days`（即 `plan.trial_days`）为准。 |
 
-`PublicPlan` 不返回管理字段 `is_active`、`is_listed`、`accepting_new_subscriptions`、`updated_at` 或已废弃的 `is_default`。`quarterly` 当前是 legacy Plan（`accepting_new_subscriptions=false`）；目录出现不代表可以创建新订阅或订单，BFF 下单前必须处理 409。`free` 正在退役，Phase 2 会设置 `is_active=false`、`accepting_new_subscriptions=false`。
+`PublicPlan` 不返回管理字段 `is_active`、`is_listed`、`accepting_new_subscriptions`、`updated_at`。`quarterly` 当前是 legacy Plan（`accepting_new_subscriptions=false`）；目录出现不代表可以创建新订阅或订单，BFF 下单前必须处理 409。`free` 正在退役，Phase 2 会设置 `is_active=false`、`accepting_new_subscriptions=false`。
 
 **错误响应**：
 
@@ -693,7 +693,6 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
       "interval_days": 30,
       "apps": ["yundian", "yundash"],
       "is_active": true,
-      "is_default": false,
       "is_listed": true,
       "accepting_new_subscriptions": true,
       "currency": "CNY",
@@ -710,7 +709,6 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
       "interval_days": 90,
       "apps": ["yundian", "yundash"],
       "is_active": true,
-      "is_default": false,
       "is_listed": true,
       "accepting_new_subscriptions": false,
       "currency": "CNY",
@@ -724,7 +722,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 }
 ```
 
-Phase 1 的管理端读取响应暂时仍包含 legacy `is_default=false`；该字段不能写入，并将在 Phase 2 连同默认 Plan 机制一起移除。`updated_at` 为只读字段，由数据库 trigger 在每次 UPDATE 时维护。
+`is_default` 字段已随 Phase 2（迁移 014）从 `plans` 表中移除，管理端读写响应都不再返回；如 BFF 因历史数据继续携带该字段，POST/PATCH 仍会以 400 显式拒绝，便于故障排查。`updated_at` 为只读字段，由数据库 trigger 在每次 UPDATE 时维护。
 
 #### POST /admin/plans
 
@@ -777,7 +775,6 @@ Phase 1 的管理端读取响应暂时仍包含 legacy `is_default=false`；该�
     "interval_days": 90,
     "apps": ["yundian", "yundash"],
     "is_active": true,
-    "is_default": false,
     "is_listed": true,
     "accepting_new_subscriptions": true,
     "currency": "USD",
@@ -849,7 +846,6 @@ Phase 1 的管理端读取响应暂时仍包含 legacy `is_default=false`；该�
     "interval_days": 30,
     "apps": ["yundian", "yundash", "yundown"],
     "is_active": true,
-    "is_default": false,
     "is_listed": true,
     "accepting_new_subscriptions": false,
     "currency": "CNY",
@@ -1794,7 +1790,6 @@ GET /.well-known/jwks.json
 | `interval_days` | int | 订阅周期（天），0 表示永久；必须 `>= 0` |
 | `apps` | string[] | 该 Plan 可访问的 App 列表；管理端写入时每个 App 必须存在且启用 |
 | `is_active` | bool | 是否启用；停用后不授予访问 scope |
-| `is_default` | bool | Phase 1 只读 legacy 字段；管理端输入会返回 400，Phase 2 将删除 |
 | `is_listed` | bool | 是否在商业目录中展示；与是否接受新订阅相互独立 |
 | `accepting_new_subscriptions` | bool | 是否允许创建新订阅/订单；不影响既有订阅续费 |
 | `currency` | string | 结算币种；只能是 `CNY` / `USD` / `EUR` |

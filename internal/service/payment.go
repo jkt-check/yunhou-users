@@ -1138,6 +1138,9 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	subExpiry, err := s.resolveSubExpiry(ctx, order.PlanID, e.SubExpiresAt)
 	if err != nil {
 		if errors.Is(err, ErrPlanMissingForExpiry) {
+			// Intentional: plan_missing is informational — the payment already
+			// succeeded, so we silently audit and let NULL fall through instead
+			// of failing the activation.
 			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
 				fmt.Sprintf("plan:%s", order.PlanID),
 				[]string{"webhook", "expiry_fallback", "plan_missing"},
@@ -1934,8 +1937,13 @@ var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 //     here — IsActive is intentionally NOT checked because the activation
 //     itself is the transition that decides whether the plan still applies.
 //
-//  3. nil (plan missing OR interval_days == 0). Caller decides: webhook
-//     paths audit-log + write NULL; Confirm path mirrors the same shape.
+//  3. branch on the remaining conditions:
+//     3a. plan missing — returns (nil, ErrPlanMissingForExpiry). The
+//         webhook caller audit-logs and writes NULL; plan missing is
+//         informational and never blocks a successful payment.
+//     3b. plan.interval_days == 0 — returns (nil, nil) silently. No audit
+//         log: the fallback is a no-op by spec ("never expires" plans), not
+//         an anomaly worth recording.
 //
 // Removed in Task 2; this helper is the sole entry point for sub-expiry
 // resolution on subscription activation.

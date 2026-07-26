@@ -2035,3 +2035,24 @@ func TestPaymentService_OnWebhook_PaypalRenewal_SubNotActive(t *testing.T) {
 		t.Error("expected audit_log row for paypal_renewal_sub_not_active")
 	}
 }
+
+// TestResolveSubExpiry_HintForwarded covers branch 1 of resolveSubExpiry:
+// when the caller supplies a hint (BFF on Confirm; webhook payload on
+// channels that ship sub_expires_at, e.g. Stripe metadata / PayPal
+// renewal), the helper must forward it verbatim and never touch the plan
+// row. This is the only branch Task 1 needs to lock down — branches 2/3
+// (plan.interval_days fallback, plan-missing) are exercised end-to-end by
+// the OnWebhook tests added in Task 2.
+func TestResolveSubExpiry_HintForwarded(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	hint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	got, err := s.resolveSubExpiry(context.Background(), "monthly", &hint)
+	if err != nil {
+		t.Fatalf("resolveSubExpiry: %v", err)
+	}
+	if got == nil || !got.Equal(hint) {
+		t.Errorf("hint not forwarded: got %v, want %v", got, hint)
+	}
+}

@@ -1904,6 +1904,50 @@ func subExpiresAtFromWebhook(e WebhookEvent) *time.Time {
 	return e.SubExpiresAt
 }
 
+// ErrPlanMissingForExpiry is returned by resolveSubExpiry when the plan row
+// was deleted between order creation and webhook arrival. Callers audit-log
+// this and fall back to the existing "NULL = never expires" branch.
+var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
+
+// resolveSubExpiry returns the expires_at to write on a subscription
+// activation. Priority:
+//
+//  1. caller-supplied hint (BFF on Confirm; webhook payload on channels
+//     that ship sub_expires_at, e.g. Stripe metadata / PayPal renewal).
+//     nil = no hint, fall through.
+//
+//  2. plan.interval_days fallback. Real WeChat NATIVE v3 doesn't ship
+//     sub_expires_at (verified 2026-07-27), so this fires for every fresh
+//     WeChat charge unless the BFF forwards one via
+//     /payments/orders/:order_id/confirm. Base = now() inside the calling
+//     transaction so started_at and expires_at agree on the same reference
+//     time. active dormant plans with interval_days > 0 also fall through
+//     here — IsActive is intentionally NOT checked because the activation
+//     itself is the transition that decides whether the plan still applies.
+//
+//  3. nil (plan missing OR interval_days == 0). Caller decides: webhook
+//     paths audit-log + write NULL; Confirm path mirrors the same shape.
+//
+// Coexists with the existing subExpiresAtFromWebhook passthrough — the
+// hint is just the first arg, no separate method needed.
+func (s *PaymentService) resolveSubExpiry(ctx context.Context, planID string, hint *time.Time) (*time.Time, error) {
+	if hint != nil {
+		return hint, nil
+	}
+	plan, err := s.planRepo.FindByID(ctx, planID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrPlanMissingForExpiry
+		}
+		return nil, fmt.Errorf("find plan for expiry fallback: %w", err)
+	}
+	if plan.IntervalDays <= 0 {
+		return nil, nil
+	}
+	t := time.Now().Add(time.Duration(plan.IntervalDays) * 24 * time.Hour)
+	return &t, nil
+}
+
 // buildReconcileWebhookEvent builds the WebhookEvent that the active
 // reconciliation path (`reconcileFromChannel` in GetOrder) feeds into
 // OnWebhook when WeChat's QueryOrder reports the order as SUCCESS.

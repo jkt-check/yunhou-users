@@ -2103,3 +2103,50 @@ func TestOnPaymentSucceeded_WeChatNoHint_UsesPlanInterval(t *testing.T) {
 		t.Errorf("expires_at too far in the future: %v", exp.Time)
 	}
 }
+
+// TestConfirm_NoHint_UsesPlanInterval exercises the BFF-confirmed path's
+// fallback to plan.interval_days when the caller (typically the frontend
+// after a WeChat v3 NATIVE charge) does NOT forward an ExpiresAt. This
+// mirrors the webhook fallback (TestOnPaymentSucceeded_WeChatNoHint_UsesPlanInterval)
+// but goes through Confirm rather than onPaymentSucceeded. Pre-fix, the
+// subscription row's expires_at stayed NULL because Confirm forwarded
+// in.ExpiresAt verbatim — which for WeChat v3 is always nil. After the
+// fix, Confirm calls resolveSubExpiry(planID, in.ExpiresAt), and the
+// helper falls through to plan.interval_days (monthly = 30 days).
+func TestConfirm_NoHint_UsesPlanInterval(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	userID := seedUser(t, db)
+	planID := "monthly"
+	orderID := seedPaidOrder(t, db, userID, planID, 19.9)
+
+	res, err := s.Confirm(context.Background(), ConfirmInput{
+		OrderID:       orderID,
+		UserID:        userID,
+		Channel:       "wechat_pay",
+		ExternalTxnID: "txn-confirm-1",
+		ExpiresAt:     nil, // BFF didn't pass one
+	})
+	if err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if !res.ActivatedSubscription {
+		t.Error("subscription not activated")
+	}
+
+	var exp sql.NullTime
+	if err := db.Get(&exp,
+		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if !exp.Valid {
+		t.Fatal("expires_at is NULL — Confirm fallback did not fire")
+	}
+	if exp.Time.Before(time.Now()) {
+		t.Error("expires_at is in the past")
+	}
+	if exp.Time.After(time.Now().Add(31 * 24 * time.Hour)) {
+		t.Errorf("expires_at too far in the future: %v", exp.Time)
+	}
+}

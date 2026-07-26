@@ -709,7 +709,25 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	}
 
 	// Activate subscription (UPSERT single-row, webhook doc §5.3).
-	activated, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, in.ExpiresAt)
+	// expires_at resolution mirrors the webhook path: a BFF-supplied
+	// ExpiresAt wins; otherwise fall back to plan.interval_days so that
+	// channels whose upstream payload doesn't ship sub_expires_at (real
+	// WeChat v3 NATIVE today) still produce a finite subscription.
+	subExpiry, err := s.resolveSubExpiry(ctx, order.PlanID, in.ExpiresAt)
+	if err != nil {
+		if errors.Is(err, ErrPlanMissingForExpiry) {
+			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
+				fmt.Sprintf("plan:%s", order.PlanID),
+				[]string{"confirm", "expiry_fallback", "plan_missing"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  in.Channel,
+				})
+		} else {
+			return nil, fmt.Errorf("resolve sub expiry: %w", err)
+		}
+	}
+	activated, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry)
 	if err != nil {
 		return nil, fmt.Errorf("activate sub: %w", err)
 	}
@@ -1917,12 +1935,14 @@ func isPaypalRenewal(eventType string) bool {
 }
 
 // ErrPlanMissingForExpiry is returned by resolveSubExpiry when the plan row
-// was deleted between order creation and webhook arrival. Callers audit-log
-// this and fall back to the existing "NULL = never expires" branch.
+// was deleted between order creation and webhook/confirm arrival. Callers
+// audit-log this and fall back to the existing "NULL = never expires" branch.
 var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 
 // resolveSubExpiry returns the expires_at to write on a subscription
-// activation. Priority:
+// activation. Used by both subscription activation paths — Confirm
+// (BFF-confirmed charge) and onPaymentSucceeded (channel webhook) — so
+// the two paths produce the same subscription shape. Priority:
 //
 //  1. caller-supplied hint (BFF on Confirm; webhook payload on channels
 //     that ship sub_expires_at, e.g. Stripe metadata / PayPal renewal).
@@ -1930,23 +1950,25 @@ var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 //
 //  2. plan.interval_days fallback. Real WeChat NATIVE v3 doesn't ship
 //     sub_expires_at (verified 2026-07-27), so this fires for every fresh
-//     WeChat charge unless the BFF forwards one via
-//     /payments/orders/:order_id/confirm. Base = now() inside the calling
-//     transaction so started_at and expires_at agree on the same reference
-//     time. active dormant plans with interval_days > 0 also fall through
-//     here — IsActive is intentionally NOT checked because the activation
-//     itself is the transition that decides whether the plan still applies.
+//     WeChat charge — whether the BFF calls /payments/orders/:id/confirm
+//     without an expires_at, or the channel webhook arrives with no
+//     SubExpiresAt. Base = now() inside the calling transaction so
+//     started_at and expires_at agree on the same reference time. Dormant
+//     plans with interval_days > 0 also fall through here — IsActive is
+//     intentionally NOT checked because the activation itself is the
+//     transition that decides whether the plan still applies.
 //
 //  3. branch on the remaining conditions:
-//     3a. plan missing — returns (nil, ErrPlanMissingForExpiry). The
-//         webhook caller audit-logs and writes NULL; plan missing is
-//         informational and never blocks a successful payment.
+//     3a. plan missing — returns (nil, ErrPlanMissingForExpiry). Both
+//         callers (Confirm and onPaymentSucceeded) audit-log and write
+//         NULL; plan missing is informational and never blocks a
+//         successful payment.
 //     3b. plan.interval_days == 0 — returns (nil, nil) silently. No audit
 //         log: the fallback is a no-op by spec ("never expires" plans), not
 //         an anomaly worth recording.
 //
-// Removed in Task 2; this helper is the sole entry point for sub-expiry
-// resolution on subscription activation.
+// This helper is the sole entry point for sub-expiry resolution on
+// subscription activation (Tasks 2 and 3 wired both paths through it).
 func (s *PaymentService) resolveSubExpiry(ctx context.Context, planID string, hint *time.Time) (*time.Time, error) {
 	if hint != nil {
 		return hint, nil

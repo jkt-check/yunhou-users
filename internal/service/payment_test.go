@@ -568,28 +568,6 @@ func TestToCents(t *testing.T) {
 }
 
 // ============================================================================
-// subExpiresAtFromWebhook
-// ============================================================================
-
-func TestSubExpiresAtFromWebhook(t *testing.T) {
-	t.Parallel()
-	t.Run("nil webhook returns nil", func(t *testing.T) {
-		e := WebhookEvent{}
-		if got := subExpiresAtFromWebhook(e); got != nil {
-			t.Errorf("got %v, want nil", got)
-		}
-	})
-	t.Run("populated webhook returns the pointer", func(t *testing.T) {
-		want := time.Now()
-		e := WebhookEvent{SubExpiresAt: &want}
-		got := subExpiresAtFromWebhook(e)
-		if got == nil || *got != want {
-			t.Errorf("got %v, want %v", got, want)
-		}
-	})
-}
-
-// ============================================================================
 // mustJSON
 // ============================================================================
 

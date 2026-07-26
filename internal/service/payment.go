@@ -1135,7 +1135,22 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// succeed). Re-running the activation UPSERT on a retried event is
 	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
 	// row.
-	if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiresAtFromWebhook(e)); err != nil {
+	subExpiry, err := s.resolveSubExpiry(ctx, order.PlanID, e.SubExpiresAt)
+	if err != nil {
+		if errors.Is(err, ErrPlanMissingForExpiry) {
+			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
+				fmt.Sprintf("plan:%s", order.PlanID),
+				[]string{"webhook", "expiry_fallback", "plan_missing"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  e.Channel,
+					"event_id": e.EventID,
+				})
+		} else {
+			return fmt.Errorf("resolve sub expiry: %w", err)
+		}
+	}
+	if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry); err != nil {
 		return fmt.Errorf("activate sub: %w", err)
 	}
 
@@ -1898,12 +1913,6 @@ func isPaypalRenewal(eventType string) bool {
 	return eventType == "PAYMENT.SALE.COMPLETED"
 }
 
-// subExpiresAtFromWebhook forwards the webhook payload's expires_at to the
-// subscription activation. nil = never expires (free plan / explicit no-end).
-func subExpiresAtFromWebhook(e WebhookEvent) *time.Time {
-	return e.SubExpiresAt
-}
-
 // ErrPlanMissingForExpiry is returned by resolveSubExpiry when the plan row
 // was deleted between order creation and webhook arrival. Callers audit-log
 // this and fall back to the existing "NULL = never expires" branch.
@@ -1928,8 +1937,8 @@ var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 //  3. nil (plan missing OR interval_days == 0). Caller decides: webhook
 //     paths audit-log + write NULL; Confirm path mirrors the same shape.
 //
-// Coexists with the existing subExpiresAtFromWebhook passthrough — the
-// hint is just the first arg, no separate method needed.
+// Removed in Task 2; this helper is the sole entry point for sub-expiry
+// resolution on subscription activation.
 func (s *PaymentService) resolveSubExpiry(ctx context.Context, planID string, hint *time.Time) (*time.Time, error) {
 	if hint != nil {
 		return hint, nil

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -2054,5 +2055,51 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 	}
 	if got == nil || !got.Equal(hint) {
 		t.Errorf("hint not forwarded: got %v, want %v", got, hint)
+	}
+}
+
+// TestOnPaymentSucceeded_WeChatNoHint_UsesPlanInterval exercises the
+// WeChat v3 NATIVE fallback path inside onPaymentSucceeded: the webhook
+// payload carries no SubExpiresAt, so resolveSubExpiry must compute
+// expires_at = NOW() + plan.interval_days (monthly → 30 days) and the
+// activated subscription row must have a non-NULL expires_at. Pre-fix
+// the row stayed NULL because subExpiresAtFromWebhook returned e.SubExpiresAt
+// verbatim — which for real WeChat webhooks is always nil.
+func TestOnPaymentSucceeded_WeChatNoHint_UsesPlanInterval(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	userID := seedUser(t, db)
+	planID := "monthly"
+	orderID := seedPaidOrder(t, db, userID, planID, 19.9)
+
+	// WebhookEvent with no SubExpiresAt — simulates real WeChat v3.
+	e := WebhookEvent{
+		Channel:       "wechat_pay",
+		EventID:       "evt-wc-1",
+		EventType:     "TRANSACTION.SUCCESS",
+		TransactionID: "txn-wc-1",
+		OrderID:       orderID,
+		Amount:        19.9,
+		Currency:      "CNY",
+	}
+
+	if err := s.onPaymentSucceeded(context.Background(), e); err != nil {
+		t.Fatalf("onPaymentSucceeded: %v", err)
+	}
+
+	var exp sql.NullTime
+	if err := db.Get(&exp,
+		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if !exp.Valid {
+		t.Fatal("expires_at is NULL — fallback did not fire")
+	}
+	if exp.Time.Before(time.Now()) {
+		t.Error("expires_at is in the past")
+	}
+	if exp.Time.After(time.Now().Add(31 * 24 * time.Hour)) {
+		t.Errorf("expires_at too far in the future: %v", exp.Time)
 	}
 }

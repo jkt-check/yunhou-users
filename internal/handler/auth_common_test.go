@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yunhou/users/internal/service"
 )
@@ -128,5 +129,17 @@ func TestLoginResponse_SubscriptionExpiresAt_AlwaysPresent(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"expires_at":null`) {
 		t.Errorf(`expected "expires_at":null in JSON, got: %s`, raw)
+	}
+}
+
+func TestLoginResponse_SubscriptionExpiresAt_RFC3339Serialization(t *testing.T) {
+	when := time.Date(2027, 1, 15, 12, 30, 45, 0, time.UTC)
+	resp := &service.LoginResponse{
+		User:         service.UserInfo{ID: "u-1"},
+		Subscription: &service.SubscriptionInfo{PlanID: "monthly", HasAccess: true, ExpiresAt: &when},
+	}
+	raw, _ := json.Marshal(resp)
+	if !strings.Contains(string(raw), `"expires_at":"2027-01-15T12:30:45Z"`) {
+		t.Errorf("expected RFC3339 expires_at, got: %s", raw)
 	}
 }

@@ -143,7 +143,7 @@ All configuration is via environment variables (or `.env` file):
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/webhooks/payment/:channel` | `:channel` is `stripe` / `wechat_pay` / `alipay` / `paypal`. Returns 404 when the corresponding webhook secret env var is empty; unknown channels also return 404 (defence-in-depth). Webhook payload carries `sub_expires_at` (via `payment.metadata` / `resource.sub_expires_at` / `meta.custom_data.sub_expires_at`) which yunhou-users trusts verbatim. |
+| POST | `/webhooks/payment/:channel` | `:channel` is `stripe` / `wechat_pay` / `alipay` / `paypal`. Returns 404 when the corresponding webhook secret env var is empty; unknown channels also return 404 (defence-in-depth). Most channels ship `sub_expires_at` in the payload (Stripe `metadata`, PayPal `resource.billing_info.next_billing_time` or `custom_data`, Alipay `passback_params`); yunhou-users trusts them verbatim. WeChat v3 NATIVE does NOT carry `sub_expires_at` — when missing, the webhook (and `POST /payments/orders/:id/confirm`) falls back to `plan.interval_days` (`time.Now() + interval_days*24h`) and audit-logs `subscription_expiry_plan_missing` if the plan row is gone. PayPal renewal is a deliberate exception: missing `next_billing_time` is treated as a contract drift, audit-logged, and the sub is NOT extended. |
 
 ### App/Plan Management Endpoints (Internal Auth)
 
@@ -172,7 +172,7 @@ User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 ### Commercial currency and cycle behavior
 
 - Quote and order currency come from `plan.currency`; orders snapshot `plan.price` and `plan.currency`. PayPal requires USD and WeChat Pay requires CNY.
-- The quote endpoint derives `sub_expires_at = now + plan.trial_days + plan.interval_days` from the Plan. The BFF should embed that server-produced value in checkout metadata; channel webhooks echo it back and yunhou-users stores it without recomputing the received metadata.
+- The quote endpoint derives `sub_expires_at = now + plan.trial_days + plan.interval_days` from the Plan. The BFF should embed that server-produced value in checkout metadata. Channels that carry `sub_expires_at` (Stripe metadata, PayPal custom_data, Alipay passback) echo it back and yunhou-users stores it verbatim. **WeChat v3 NATIVE does not carry `sub_expires_at`** — when the BFF omits it from `/payments/orders/:id/confirm` and the channel webhook lacks it, yunhou-users falls back to `time.Now() + plan.interval_days*24h` (or `NULL` if the plan row was deleted — see `migrations/017_sub_expiry_does_not_backfill.sql`).
 - `PublicPlan.cycle` is only a summary of configured provider-side trial and billing-cycle values for catalog display and reconciliation. It does not control quote calculation; quote behavior uses the top-level Plan fields. Operators should keep provider billing definitions aligned with the Plan.
 - `POST /apps/:id/quote` requires JWT but does **not** enforce `has_access` against the user's subscription. Any authenticated user can quote any plan any app exposes.
 
@@ -231,7 +231,7 @@ Database migration:
 # Run in order. Each migration depends on the prior.
 # Recommended: use `make migrate` (cmd/migrate binary) instead of running psql
 # manually — it owns the _migrations ledger so re-running is a no-op.
-# See migrations/README.md for the current file table (001 through 015 as of
+# See migrations/README.md for the current file table (001 through 017 as of
 # this writing) and the DDL rules each migration must follow.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
@@ -248,6 +248,8 @@ psql -d yunhou_users -f migrations/012_plan_commercial_fields.sql
 psql -d yunhou_users -f migrations/013_plan_change_log_fk_set_null.sql
 psql -d yunhou_users -f migrations/014_remove_default_plan.sql
 psql -d yunhou_users -f migrations/015_plan_change_log_nullable_snapshots.sql
+psql -d yunhou_users -f migrations/016_plan_pricing_and_hide.sql
+psql -d yunhou_users -f migrations/017_sub_expiry_does_not_backfill.sql
 ```
 
 ## Tech Stack

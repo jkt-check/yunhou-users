@@ -713,7 +713,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	// ExpiresAt wins; otherwise fall back to plan.interval_days so that
 	// channels whose upstream payload doesn't ship sub_expires_at (real
 	// WeChat v3 NATIVE today) still produce a finite subscription.
-	subExpiry, err := s.resolveSubExpiry(ctx, order.PlanID, in.ExpiresAt)
+	subExpiry, err := s.resolveSubExpiry(ctx, order.UserID, order.PlanID, in.ExpiresAt)
 	if err != nil {
 		if errors.Is(err, ErrPlanMissingForExpiry) {
 			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
@@ -1153,7 +1153,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// succeed). Re-running the activation UPSERT on a retried event is
 	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
 	// row.
-	subExpiry, err := s.resolveSubExpiry(ctx, order.PlanID, e.SubExpiresAt)
+	subExpiry, err := s.resolveSubExpiry(ctx, order.UserID, order.PlanID, e.SubExpiresAt)
 	if err != nil {
 		if errors.Is(err, ErrPlanMissingForExpiry) {
 			// Intentional: plan_missing is informational — the payment already
@@ -1948,7 +1948,19 @@ var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 //     that ship sub_expires_at, e.g. Stripe metadata / PayPal renewal).
 //     nil = no hint, fall through.
 //
-//  2. plan.interval_days fallback. Real WeChat NATIVE v3 doesn't ship
+//  2. preserve-on-retry: if the hint is nil but the user already has an
+//     active subscription row whose expires_at is in the future, return
+//     that existing value verbatim. Without this, a duplicate Confirm or
+//     webhook (channel retry, FE poll side-channel) would shift
+//     expires_at forward by the retry gap, granting extra time and
+//     violating the idempotency contract (webhook doc §5.3/§5.4). For
+//     renewals where the previous sub is expired or status != 'active',
+//     FindActiveByUserID returns ErrNoRows and this branch is skipped.
+//     We rely on the partial unique index subs_one_active_per_user
+//     preventing multiple active rows, so FindActiveByUserID returns at
+//     most one row.
+//
+//  3. plan.interval_days fallback. Real WeChat NATIVE v3 doesn't ship
 //     sub_expires_at (verified 2026-07-27), so this fires for every fresh
 //     WeChat charge — whether the BFF calls /payments/orders/:id/confirm
 //     without an expires_at, or the channel webhook arrives with no
@@ -1958,20 +1970,44 @@ var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 //     intentionally NOT checked because the activation itself is the
 //     transition that decides whether the plan still applies.
 //
-//  3. branch on the remaining conditions:
-//     3a. plan missing — returns (nil, ErrPlanMissingForExpiry). Both
-//         callers (Confirm and onPaymentSucceeded) audit-log and write
-//         NULL; plan missing is informational and never blocks a
-//         successful payment.
-//     3b. plan.interval_days == 0 — returns (nil, nil) silently. No audit
-//         log: the fallback is a no-op by spec ("never expires" plans), not
-//         an anomaly worth recording.
+//  4. branch on the remaining conditions:
+//     4a. plan missing — returns (nil, ErrPlanMissingForExpiry). Both
+//     callers (Confirm and onPaymentSucceeded) audit-log and write
+//     NULL; plan missing is informational and never blocks a
+//     successful payment.
+//     4b. plan.interval_days == 0 — returns (nil, nil) silently. No audit
+//     log: the fallback is a no-op by spec ("never expires" plans), not
+//     an anomaly worth recording.
 //
 // This helper is the sole entry point for sub-expiry resolution on
 // subscription activation (Tasks 2 and 3 wired both paths through it).
-func (s *PaymentService) resolveSubExpiry(ctx context.Context, planID string, hint *time.Time) (*time.Time, error) {
+func (s *PaymentService) resolveSubExpiry(ctx context.Context, userID, planID string, hint *time.Time) (*time.Time, error) {
 	if hint != nil {
 		return hint, nil
+	}
+	// Retry on same payment: preserve existing future expiry for idempotency.
+	// Without this, a webhook/Confirm retry would shift expires_at forward
+	// by the gap between calls, granting extra time. For renewals (sub
+	// expired or status != 'active'), FindActiveByUserID returns ErrNoRows
+	// and the fallback path fires. We rely on the partial unique index
+	// (Postgres subs_one_active_per_user) preventing multiple active rows,
+	// so FindActiveByUserID returns at most one row.
+	//
+	// userID == "" is treated as "skip" — the only realistic cause is a
+	// test exercising a fake-tx branch without populating the order
+	// (e.g. payment_db_tx_test.go's countingFakeTx returns nil from
+	// GetContext without writing into the destination). In production
+	// this helper is always called with a real userID loaded from a real
+	// order row; an empty userID means we have no order to inspect, so
+	// fall through to the planRepo lookup rather than 500 the request.
+	if userID != "" {
+		existing, err := s.subRepo.FindActiveByUserID(ctx, userID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("find existing active sub for expiry idempotency: %w", err)
+		}
+		if existing != nil && existing.ExpiresAt != nil && existing.ExpiresAt.After(time.Now()) {
+			return existing.ExpiresAt, nil
+		}
 	}
 	plan, err := s.planRepo.FindByID(ctx, planID)
 	if err != nil {

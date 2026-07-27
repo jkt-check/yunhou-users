@@ -2049,7 +2049,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 	s := newTestPaymentService(t, db)
 
 	hint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	got, err := s.resolveSubExpiry(context.Background(), "monthly", &hint)
+	got, err := s.resolveSubExpiry(context.Background(), "user-id", "monthly", &hint)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
@@ -2099,7 +2099,11 @@ func TestOnPaymentSucceeded_WeChatNoHint_UsesPlanInterval(t *testing.T) {
 	if exp.Time.Before(time.Now()) {
 		t.Error("expires_at is in the past")
 	}
-	if exp.Time.After(time.Now().Add(31 * 24 * time.Hour)) {
+	// Upper bound tied to plans.monthly.interval_days = 30. A 5-minute
+	// buffer absorbs clock skew / CI latency between the activation and
+	// the SELECT. Anything wider than that signals a regression to a
+	// 1d or 29d fallback (or a duplicate-confirm time-shift).
+	if exp.Time.After(time.Now().Add(30*24*time.Hour + 5*time.Minute)) {
 		t.Errorf("expires_at too far in the future: %v", exp.Time)
 	}
 }
@@ -2146,7 +2150,82 @@ func TestConfirm_NoHint_UsesPlanInterval(t *testing.T) {
 	if exp.Time.Before(time.Now()) {
 		t.Error("expires_at is in the past")
 	}
-	if exp.Time.After(time.Now().Add(31 * 24 * time.Hour)) {
+	// Upper bound tied to plans.monthly.interval_days = 30. A 5-minute
+	// buffer absorbs clock skew / CI latency between the activation and
+	// the SELECT. Anything wider than that signals a regression to a
+	// 1d or 29d fallback (or a duplicate-confirm time-shift).
+	if exp.Time.After(time.Now().Add(30*24*time.Hour + 5*time.Minute)) {
 		t.Errorf("expires_at too far in the future: %v", exp.Time)
+	}
+}
+
+// TestConfirm_RetryDoesNotExtend is the regression test for the
+// idempotency bug introduced by Task 3: resolveSubExpiry was called
+// on every Confirm/webhook event, including dedupe retries on the
+// same (channel, external_txn_id). Each retry re-computed
+// time.Now()+interval_days*24h, and activateSubscriptionOnTx then
+// unconditionally overwrote expires_at. So a t0+1h retry shifted
+// expires_at from t0+30d to t0+1h+30d — every retry granted extra time.
+//
+// This test pins the fix: the first Confirm establishes expires_at at
+// t0+30d, then we sleep long enough for a buggy implementation to
+// compute a noticeably different "now()+30d". The second Confirm with
+// the same ExternalTxnID is a dedupe hit on the payments row, but
+// resolveSubExpiry must return the existing expires_at verbatim
+// rather than recomputing. Without the fix, the second expires_at
+// would be strictly later than the first.
+func TestConfirm_RetryDoesNotExtend(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	userID := seedUser(t, db)
+	planID := "monthly"
+	orderID := seedPaidOrder(t, db, userID, planID, 19.9)
+
+	// First confirm — establishes the expiry.
+	if _, err := s.Confirm(context.Background(), ConfirmInput{
+		OrderID:       orderID,
+		UserID:        userID,
+		Channel:       "wechat_pay",
+		ExternalTxnID: "txn-retry-1",
+		ExpiresAt:     nil,
+	}); err != nil {
+		t.Fatalf("first confirm: %v", err)
+	}
+	var firstExp sql.NullTime
+	if err := db.Get(&firstExp,
+		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("read sub after first: %v", err)
+	}
+	if !firstExp.Valid {
+		t.Fatal("first expires_at is NULL")
+	}
+
+	// Sleep a small amount so a buggy implementation that re-runs the
+	// fallback would compute a noticeably different `now()` + 30d.
+	time.Sleep(50 * time.Millisecond)
+
+	// Second confirm — same ExternalTxnID, dedupe hit. The activation
+	// SQL still runs; resolveSubExpiry must preserve the existing expiry
+	// rather than recompute.
+	if _, err := s.Confirm(context.Background(), ConfirmInput{
+		OrderID:       orderID,
+		UserID:        userID,
+		Channel:       "wechat_pay",
+		ExternalTxnID: "txn-retry-1",
+		ExpiresAt:     nil,
+	}); err != nil {
+		t.Fatalf("second confirm: %v", err)
+	}
+	var secondExp sql.NullTime
+	if err := db.Get(&secondExp,
+		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("read sub after second: %v", err)
+	}
+	if !secondExp.Valid {
+		t.Fatal("second expires_at is NULL")
+	}
+	if !secondExp.Time.Equal(firstExp.Time) {
+		t.Errorf("retry extended expires_at: first=%v second=%v", firstExp.Time, secondExp.Time)
 	}
 }

@@ -158,6 +158,8 @@ curl https://your-yunhou-domain/user/profile \
 }
 ```
 
+**`subscription.expires_at` 契约**: 自 2026-07-27 起，`expires_at` 字段在 JSON 响应中**始终存在**（不再 `omitempty`）。新激活的订阅固定为 RFC3339 时间戳（优先 `plan.interval_days` 推算，对 WeChat v3 而言是 webhook 路径上唯一可得的产物，因为 v3 NATIVE 不携带 `sub_expires_at`）。历史 NULL 行（修复前由 WeChat 激活）保持 `null`——它们在 `subscriptions.expires_at` 列上就是 NULL，isExpiredAt 仍按 "never expires" 处理。如果 BFF 想要 UI 上的"永不过期"分支，应仅在 `expires_at: null` 时显示，不再用「字段缺席」做存在性判断。
+
 > **注意**：刷新时旧的 refresh token 会失效，必须使用返回的新 token。
 
 **错误响应**：
@@ -647,7 +649,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 |------|------|
 | `amount` | 透传 `plans.price` |
 | `currency` | 来自 `plan.currency`（`CNY` / `USD` / `EUR`），不再硬编码，也不接受 caller 覆盖 |
-| `sub_expires_at` | **服务端计算**：`now + plan.trial_days + plan.interval_days`（服务器时间，见 `internal/service/quote.go`）。BFF 在创建 PayPal checkout 时将其写入 `metadata.sub_expires_at`；PayPal 自己的 renewal webhook 会通过 `resource.billing_info.next_billing_time` 回传，yunhou 不参与续费的周期计算。注意：`sub_expires_at` 在 channel webhook 路径上由 **BFF 嵌入 → channel 回传 → yunhou 信任并写入**，yunhou-users 不二次推导 webhook payload 里的值 |
+| `sub_expires_at` | **服务端计算**：`now + plan.trial_days + plan.interval_days`（服务器时间，见 `internal/service/quote.go`）。BFF 在创建 PayPal checkout 时将其写入 `metadata.sub_expires_at`；PayPal 自己的 renewal webhook 会通过 `resource.billing_info.next_billing_time` 回传，yunhou 不参与续费的周期计算。注意：`sub_expires_at` 在 channel webhook 路径上由 **BFF 嵌入 → channel 回传 → yunhou 信任并写入**，yunhou-users 不二次推导 webhook payload 里的值。注：yunhou-users webhook / Confirm 路径在 webhook payload / BFF 入参均不含 `sub_expires_at` 时，会回退到 `plan.interval_days`（`time.Now() + interval_days*24h`）作为 contract 兜底。PayPal 续费路径是例外——`next_billing_time` 缺失会被审计并拒绝延期，`sub_expires_at` 不参与。 |
 | `cycle_config.base` | 恒为 `"now + trial + cycle"`，给审计/排查时一眼看出计算方式 |
 | `provider_data` | 每个已配置的渠道一段 payload；BFF 创建 checkout 时按需透传给对应渠道 SDK |
 

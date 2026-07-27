@@ -951,6 +951,32 @@ func TestPaymentService_Unit_ListUserPayments_PassesThrough(t *testing.T) {
 	}
 }
 
+func TestPaymentService_Unit_ListUserPayments_NilBecomesEmpty(t *testing.T) {
+	t.Parallel()
+	// Same contract as ListUserOrders: no rows must surface as a non-nil
+	// empty slice so the JSON response is "data": [], not null.
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		&stubOrderRepoLookup{},
+		&stubPaymentRepoList{},
+		&stubRefundRepoLookup{},
+		nil, nil, nil, nil, nil,
+		&stubRefundAPI{}, nil,
+
+		0)
+
+	got, err := svc.ListUserPayments(context.Background(), "u_1")
+	if err != nil {
+		t.Fatalf("list payments: %v", err)
+	}
+	if got == nil {
+		t.Error("expected non-nil empty slice, got nil")
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 payments, got %d", len(got))
+	}
+}
+
 func TestPaymentService_Unit_ListUserOrders_PassesThrough(t *testing.T) {
 	t.Parallel()
 	orepo := &stubOrderRepoLookup{

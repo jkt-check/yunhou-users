@@ -576,9 +576,19 @@ func (s *PaymentService) reconcileFromChannel(ctx context.Context, o *model.Orde
 	return nil
 }
 
-// ListUserPayments returns payments for orders owned by userID.
+// ListUserPayments returns payments for orders owned by userID. Like
+// ListUserOrders, a nil repo result is normalised to an empty slice so
+// the JSON response is `"data": []`, not `"data": null` — the two list
+// endpoints keep the same contract for FE consumers.
 func (s *PaymentService) ListUserPayments(ctx context.Context, userID string) ([]model.Payment, error) {
-	return s.paymentRepo.ListByUserID(ctx, userID)
+	list, err := s.paymentRepo.ListByUserID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list payments: %w", err)
+	}
+	if list == nil {
+		list = []model.Payment{}
+	}
+	return list, nil
 }
 
 // ListUserOrders returns the caller's orders newest-first for the console

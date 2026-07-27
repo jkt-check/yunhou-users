@@ -2340,8 +2340,9 @@ func TestConfirm_PlanMissing_AuditLogAndNullExpiry(t *testing.T) {
 	// (SET replica, DELETE, SET origin) must therefore run on the SAME
 	// pinned connection — otherwise the SET may land on a connection that
 	// never sees the DELETE, leaving the FK enforcement enabled and
-	// making this test flaky. Use db.Conn to pin the connection; close
-	// the pin before the Confirm call so it goes through the normal pool.
+	// making this test flaky. Use db.Conn to pin the connection; the
+	// Confirm call below goes through the normal pool (the pin is
+	// released by the deferred Close when the test returns).
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {

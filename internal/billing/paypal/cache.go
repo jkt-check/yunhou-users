@@ -25,13 +25,13 @@ import (
 // dep). The inlined version preserves the two contract guarantees the
 // upstream singleflight.Group provides that matter here:
 //
-//   1. Leader-error propagation: a single fetch failure surfaces to every
-//      follower as ErrUpstreamFailed. Followers do NOT each retry —
-//      retrying would re-create the thundering-herd the dedup prevents
-//      (see TestTokenCache_GetOrFetch_ConcurrentMissesDeduped).
-//   2. No-leader-window: the inflight entry is deleted AND the done
-//      channel is closed while holding c.mu, so a caller that missed the
-//      inflight slot never becomes a duplicate leader mid-flight.
+//  1. Leader-error propagation: a single fetch failure surfaces to every
+//     follower as ErrUpstreamFailed. Followers do NOT each retry —
+//     retrying would re-create the thundering-herd the dedup prevents
+//     (see TestTokenCache_GetOrFetch_ConcurrentMissesDeduped).
+//  2. No-leader-window: the inflight entry is deleted AND the done
+//     channel is closed while holding c.mu, so a caller that missed the
+//     inflight slot never becomes a duplicate leader mid-flight.
 //
 // Neither guarantee relies on x/sync internals; both are enforced in the
 // loop below. Switching to singleflight.Group would not change behaviour.

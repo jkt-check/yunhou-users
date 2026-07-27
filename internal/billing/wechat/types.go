@@ -5,7 +5,7 @@
 // The v1 surface used by the rest of the codebase is just two things:
 //   - Client.UnifiedOrder  → mints a code_url (NATIVE) the BFF QR-codes
 //   - Resource             → the AES-GCM-decrypted plaintext the
-//                            webhook handler turns into a Payment row
+//     webhook handler turns into a Payment row
 //
 // The HTTP / signing / certificate plumbing for the real production
 // call is intentionally left as a small surface (Client.UnifiedOrder's

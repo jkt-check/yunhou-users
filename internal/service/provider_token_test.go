@@ -26,12 +26,13 @@ func (s *stubAppRepo) FindByID(ctx context.Context, id string) (*model.App, erro
 	}
 	return nil, sql.ErrNoRows
 }
+
 // Create/Update/List unused by ProviderTokenService; if the test file's
 // package-level interface requires them, add stubs that panic.
 
 type stubPaypal struct {
-	called   bool
-	cid, cs  string
+	called    bool
+	cid, cs   string
 	returnTok *model.ProviderToken
 	returnErr error
 }

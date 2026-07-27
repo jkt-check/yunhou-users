@@ -29,9 +29,9 @@ type appLoader interface {
 // githubOAuthDeps bundles the service-layer dependencies for the GitHub
 // redirect flow. Wiring stays in router.go; tests construct this directly.
 type githubOAuthDeps struct {
-	svc     *service.GitHubOAuthService
-	appRepo appLoader
-	authSvc service.AuthServiceInterface
+	svc      *service.GitHubOAuthService
+	appRepo  appLoader
+	authSvc  service.AuthServiceInterface
 	tokenSvc service.TokenServiceInterface
 }
 

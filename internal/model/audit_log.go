@@ -17,7 +17,7 @@ import (
 // Convention for free-text fields:
 //   - actor  = "sweeper" / "service" / "user:<user_id>" / "admin:<app_id>"
 //   - action = short verb-noun, e.g. "late_payment_post_expiry", "cancel_order",
-//              "unexpected_state_transition"
+//     "unexpected_state_transition"
 //   - target = resource reference, e.g. "order:<order_id>"
 type AuditLog struct {
 	ID         string          `db:"id" json:"id"`

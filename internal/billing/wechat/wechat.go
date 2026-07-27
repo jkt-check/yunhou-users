@@ -99,11 +99,11 @@ type Client struct {
 	// the Authorization header and the JSON body cannot drift apart.
 	// APIv3Key is NOT stored on Client — it lives on cfg and is used
 	// by the inbound webhook verifier only.
-	Signer      *Signer
-	AppIDValue  string // WeChat Open Platform 网站应用 appid; required in v3 NATIVE body. Stored as AppIDValue so the AppID() getter (used by the service layer to echo into provider_intent.appid) doesn't collide with the field name.
-	NotifyURL   string
-	BaseURL     string // https://api.mch.weixin.qq.com
-	HTTPDoer    HTTPDoer
+	Signer     *Signer
+	AppIDValue string // WeChat Open Platform 网站应用 appid; required in v3 NATIVE body. Stored as AppIDValue so the AppID() getter (used by the service layer to echo into provider_intent.appid) doesn't collide with the field name.
+	NotifyURL  string
+	BaseURL    string // https://api.mch.weixin.qq.com
+	HTTPDoer   HTTPDoer
 }
 
 // MchID exposes the merchant ID to callers (e.g. PaymentService writes
@@ -189,8 +189,8 @@ func (c *Client) UnifiedOrder(ctx context.Context, req UnifiedOrderRequest) (*Un
 	}
 
 	resp, err := c.HTTPDoer.Do(ctx, &HTTPRequest{
-		Method:  "POST",
-		URL:     c.BaseURL + reqPath,
+		Method: "POST",
+		URL:    c.BaseURL + reqPath,
 		Headers: map[string]string{
 			"Authorization": auth,
 			"Content-Type":  "application/json",

@@ -89,7 +89,7 @@ func captureLog(t *testing.T) *bytes.Buffer {
 func TestApply_EmptyDB_AppliesAll(t *testing.T) {
 	db := freshTestDB(t)
 	dir := migrateDir(t, map[string]string{
-		"001_init":   `CREATE TABLE users (id INT PRIMARY KEY);`,
+		"001_init":    `CREATE TABLE users (id INT PRIMARY KEY);`,
 		"002_add_col": `ALTER TABLE users ADD COLUMN name TEXT;`,
 	})
 	migs, err := LoadFiles(dir)
@@ -161,9 +161,9 @@ func TestApply_RerunIsIdempotent(t *testing.T) {
 func TestApply_MidFileFailure_StopsAndDoesNotWriteLedger(t *testing.T) {
 	db := freshTestDB(t)
 	dir := migrateDir(t, map[string]string{
-		"001_init":   `CREATE TABLE users (id INT PRIMARY KEY);`,
-		"002_bad":    `THIS IS NOT VALID SQL;`,
-		"003_late":   `ALTER TABLE users ADD COLUMN name TEXT;`,
+		"001_init": `CREATE TABLE users (id INT PRIMARY KEY);`,
+		"002_bad":  `THIS IS NOT VALID SQL;`,
+		"003_late": `ALTER TABLE users ADD COLUMN name TEXT;`,
 	})
 	migs, err := LoadFiles(dir)
 	if err != nil {
@@ -209,9 +209,9 @@ func TestApply_PartialDelete_ReappliesOne(t *testing.T) {
 	// migration itself is safe to re-run. Real migrations follow the
 	// IF NOT EXISTS / DROP IF EXISTS rule documented in migrations/README.md.
 	dir := migrateDir(t, map[string]string{
-		"001_init":   `CREATE TABLE users (id INT PRIMARY KEY);`,
-		"002_add":    `ALTER TABLE users ADD COLUMN IF NOT EXISTS a TEXT;`,
-		"003_add_b":  `ALTER TABLE users ADD COLUMN IF NOT EXISTS b TEXT;`,
+		"001_init":  `CREATE TABLE users (id INT PRIMARY KEY);`,
+		"002_add":   `ALTER TABLE users ADD COLUMN IF NOT EXISTS a TEXT;`,
+		"003_add_b": `ALTER TABLE users ADD COLUMN IF NOT EXISTS b TEXT;`,
 	})
 	migs, err := LoadFiles(dir)
 	if err != nil {

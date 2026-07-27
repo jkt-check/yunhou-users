@@ -35,10 +35,10 @@ import (
 //   - Alipay  : application/x-www-form-urlencoded, out_trade_no IS the order_id,
 //     total_amount is in major units (no conversion)
 type WebhookHandler struct {
-	svc            service.PaymentServiceInterface
-	wechatKey      []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
-	verifier       middleware.ChannelSignatureVerifier
-	mockWechatPay  bool
+	svc           service.PaymentServiceInterface
+	wechatKey     []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
+	verifier      middleware.ChannelSignatureVerifier
+	mockWechatPay bool
 }
 
 func NewWebhookHandler(svc service.PaymentServiceInterface, wechatAPIv3Key []byte, verifier middleware.ChannelSignatureVerifier, mockWechatPay bool) *WebhookHandler {
@@ -244,9 +244,9 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 // downstream WebhookEvent construction.
 func (h *WebhookHandler) parseWeChatMock(raw []byte) (*service.WebhookEvent, error) {
 	var evt struct {
-		ID         string `json:"id"`
-		EventType  string `json:"event_type"`
-		Resource   struct {
+		ID        string `json:"id"`
+		EventType string `json:"event_type"`
+		Resource  struct {
 			TransactionID string `json:"transaction_id"`
 			OutTradeNo    string `json:"out_trade_no"`
 			SubExpires    string `json:"sub_expires_at"`

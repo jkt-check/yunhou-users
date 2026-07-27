@@ -217,13 +217,13 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 	engine := gin.New()
 
 	Setup(t.Context(), engine,
-		nil, // healthPinger
+		nil,                          // healthPinger
 		nil, nil, nil, nil, nil, nil, // repos
-		nil, // tokenSvc
-		nil, // authSvc
+		nil,           // tokenSvc
+		nil,           // authSvc
 		nil, nil, nil, // subSvc, planSvc, paymentSvc
-		nil, // webhookVerifier
-		nil, // wechatAPIv3Key
+		nil,      // webhookVerifier
+		nil,      // wechatAPIv3Key
 		nil, nil, // providerTokenSvc, quoteSvc
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
 		false, // wechatOAuthMock

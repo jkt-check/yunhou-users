@@ -262,8 +262,8 @@ func TestWeChatPayV3Verifier_Accept(t *testing.T) {
 // transient/unknown-serial paths without spinning up a /v3/certificates
 // server.
 type stubKeySource struct {
-	pub     *rsa.PublicKey
-	serial  string // non-empty → return UnknownPlatformSerial
+	pub       *rsa.PublicKey
+	serial    string // non-empty → return UnknownPlatformSerial
 	lookupErr error
 }
 
@@ -476,8 +476,8 @@ func TestMultiChannelVerifier_PaypalFanOut(t *testing.T) {
 // verify-webhook-signature endpoint. Tests configure the server's response
 // (record what arrived, return what the test wants PayPal to say).
 type paypalHarness struct {
-	server    *httptest.Server
-	seenBody  []byte
+	server     *httptest.Server
+	seenBody   []byte
 	seenHeader http.Header
 }
 
@@ -956,7 +956,7 @@ func TestCollectHeaders(t *testing.T) {
 func TestAlipayURLEncode(t *testing.T) {
 	t.Parallel()
 	cases := map[string]string{
-		"hello":      "hello",
+		"hello":       "hello",
 		"hello world": "hello%20world", // space → %20 (NOT +)
 		"a+b":         "a%2Bb",         // + → %2B (NOT space-encoded)
 		"x=y":         "x%3Dy",         // = → %3D

@@ -31,13 +31,13 @@ func jwtTestSign(t *testing.T, priv *rsa.PrivateKey, userID, appID string, scope
 	t.Helper()
 	now := time.Now()
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"sub": userID,
-		"iss": "yunhou-users",
-		"aud": appID,
+		"sub":    userID,
+		"iss":    "yunhou-users",
+		"aud":    appID,
 		"app_id": appID,
-		"scope": scope,
-		"iat": now.Unix(),
-		"exp": now.Add(15 * time.Minute).Unix(),
+		"scope":  scope,
+		"iat":    now.Unix(),
+		"exp":    now.Add(15 * time.Minute).Unix(),
 	})
 	signed, err := tok.SignedString(priv)
 	if err != nil {

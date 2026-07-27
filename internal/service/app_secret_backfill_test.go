@@ -97,7 +97,7 @@ func TestBackfillAppSecrets_ListUnhashedError(t *testing.T) {
 // specific methods (the mock itself only exposes createErr / findErr
 // etc., not listUnhashedErr).
 type errAppRepo struct {
-	inner          *mockAppRepo
+	inner           *mockAppRepo
 	listUnhashedErr error
 }
 

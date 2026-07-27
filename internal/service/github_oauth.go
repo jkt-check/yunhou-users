@@ -51,9 +51,9 @@ var (
 var githubOAuthHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 // GitHubOAuthService is the entry point Yunhou's redirect handler uses to:
-//   1. Build the upstream authorize URL the BFF redirects the user to.
-//   2. Exchange the auth code GitHub returns at the callback endpoint.
-//   3. Fetch the user's GitHub profile + verified primary email.
+//  1. Build the upstream authorize URL the BFF redirects the user to.
+//  2. Exchange the auth code GitHub returns at the callback endpoint.
+//  3. Fetch the user's GitHub profile + verified primary email.
 //
 // It depends on the OAuth config + state secret — both are injected at
 // construction (not globals) so the service is testable.

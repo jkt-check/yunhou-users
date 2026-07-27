@@ -249,8 +249,8 @@ func TestTokenService_Refresh(t *testing.T) {
 		tokenSvc := &TokenService{
 			PrivateKey:  priv,
 			PublicKey:   pub,
-			AccessTTL:  15 * time.Minute,
-			RefreshTTL: 168 * time.Hour,
+			AccessTTL:   15 * time.Minute,
+			RefreshTTL:  168 * time.Hour,
 			SessionRepo: sessionRepo,
 			SubRepo:     subRepo,
 		}
@@ -269,8 +269,8 @@ func TestTokenService_Refresh(t *testing.T) {
 		tokenSvc := &TokenService{
 			PrivateKey:  priv,
 			PublicKey:   pub,
-			AccessTTL:  15 * time.Minute,
-			RefreshTTL: 168 * time.Hour,
+			AccessTTL:   15 * time.Minute,
+			RefreshTTL:  168 * time.Hour,
 			SessionRepo: sessionRepo,
 			SubRepo:     subRepo,
 		}

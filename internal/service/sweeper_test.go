@@ -18,10 +18,10 @@ import (
 // tests care about "was SweepExpired called?", while SweepOnce tests care
 // about "what value did it return?".
 type mockOrderRepo struct {
-	callCount    atomic.Int64
-	returnCount  int64
-	err          error
-	lastSweepAt  atomic.Pointer[time.Time]
+	callCount   atomic.Int64
+	returnCount int64
+	err         error
+	lastSweepAt atomic.Pointer[time.Time]
 }
 
 func (m *mockOrderRepo) Create(_ context.Context, _ *model.Order) error { return nil }
@@ -160,6 +160,7 @@ func TestOrderSweeper_DefaultInterval(t *testing.T) {
 
 // Compile-time check that mockOrderRepo satisfies repo.OrderRepo.
 var _ repo.OrderRepo = (*mockOrderRepo)(nil)
+
 // TestOrderSweeper_tick covers the inner tick() method (not exposed directly).
 // Indirectly exercised via Start+Stop, but tick has a distinct error path
 // (the orderRepo.SweepExpired returns err) which produces a log + early

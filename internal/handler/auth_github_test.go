@@ -67,10 +67,12 @@ func ghAppWithOAuth(callbackURLs ...string) *model.App {
 
 type tokenSvcStub struct{}
 
-func (tokenSvcStub) JWKS() map[string]interface{}                                     { return nil }
-func (tokenSvcStub) SignAccessToken(string, string, []string) (string, error)        { return "", nil }
-func (tokenSvcStub) VerifyAccessToken(string) (*service.TokenClaims, error)          { return nil, nil }
-func (tokenSvcStub) Refresh(context.Context, string, string) (string, string, error) { return "", "", nil }
+func (tokenSvcStub) JWKS() map[string]interface{}                             { return nil }
+func (tokenSvcStub) SignAccessToken(string, string, []string) (string, error) { return "", nil }
+func (tokenSvcStub) VerifyAccessToken(string) (*service.TokenClaims, error)   { return nil, nil }
+func (tokenSvcStub) Refresh(context.Context, string, string) (string, string, error) {
+	return "", "", nil
+}
 
 // =========================================================================
 // /auth/github/redirect tests
@@ -448,7 +450,7 @@ func TestGitHubOAuth_Callback_AuthServiceError(t *testing.T) {
 	engine.ServeHTTP(w, req)
 
 	// New behavior: auth errors redirect back to BFF with the error in the
-// fragment instead of stranding the browser on a JSON error page.
+	// fragment instead of stranding the browser on a JSON error page.
 	if w.Code != http.StatusFound {
 		t.Errorf("status = %d, want 302", w.Code)
 	}

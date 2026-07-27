@@ -737,8 +737,8 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 // MultiChannelVerifier dispatches to per-channel verifiers. Pass nil for any
 // channel not configured yet — the middleware returns 404 for it.
 type MultiChannelVerifier struct {
-	Stripe       ChannelSignatureVerifier
-	WeChat       ChannelSignatureVerifier
+	Stripe ChannelSignatureVerifier
+	WeChat ChannelSignatureVerifier
 	Alipay ChannelSignatureVerifier
 	Paypal ChannelSignatureVerifier
 }

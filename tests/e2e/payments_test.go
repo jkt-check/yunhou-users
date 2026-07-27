@@ -129,7 +129,9 @@ func TestPayments_ConfirmChannelMismatch(t *testing.T) {
 		t.Fatalf("create: %d", resp.StatusCode)
 	}
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -165,7 +167,9 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 		t.Fatalf("create: %d", resp.StatusCode)
 	}
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -177,7 +181,9 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var cr struct {
-		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
+		Data struct {
+			PaymentID string `json:"payment_id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
@@ -190,7 +196,9 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 		t.Fatalf("first refund: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var rr1 struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &rr1)
 
@@ -201,7 +209,9 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 		t.Fatalf("second refund: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var rr2 struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &rr2)
 
@@ -246,7 +256,9 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -255,7 +267,9 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	resp = doRequest(t, srv.Engine, http.MethodPost,
 		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
 	var cr struct {
-		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
+		Data struct {
+			PaymentID string `json:"payment_id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
@@ -292,7 +306,9 @@ func TestPayments_OwnershipIsolation(t *testing.T) {
 		t.Fatalf("create: %d", resp.StatusCode)
 	}
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -305,7 +321,9 @@ func TestPayments_OwnershipIsolation(t *testing.T) {
 		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
 	}
 	var cr struct {
-		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
+		Data struct {
+			PaymentID string `json:"payment_id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
@@ -344,7 +362,9 @@ func TestPayments_CancelOrder(t *testing.T) {
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -379,7 +399,9 @@ func TestPayments_LatePaymentHonored(t *testing.T) {
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -445,6 +467,7 @@ func TestPayments_ListPayments(t *testing.T) {
 		t.Errorf("expected 0 payments, got %d", len(r.Data))
 	}
 }
+
 // TestPayments_ConcurrentRefundRace: fire 4 concurrent refund POSTs against
 // the same paid payment, with amounts summing to > payment.amount. The
 // SELECT FOR UPDATE in service.Refund must serialize the requests and
@@ -461,7 +484,9 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -470,7 +495,9 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	resp = doRequest(t, srv.Engine, http.MethodPost,
 		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
 	var cr struct {
-		Data struct{ PaymentID string `json:"payment_id"` } `json:"data"`
+		Data struct {
+			PaymentID string `json:"payment_id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &cr)
 	paymentID := cr.Data.PaymentID
@@ -538,7 +565,9 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
@@ -642,7 +671,9 @@ func TestPayments_ConcurrentWebhookSameEventID(t *testing.T) {
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
-		Data struct{ ID string `json:"id"` } `json:"data"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	resp.JSON(t, &r)
 	orderID := r.Data.ID

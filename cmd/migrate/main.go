@@ -4,13 +4,15 @@
 // replicas both try to migrate at startup).
 //
 // Usage:
-//   migrate            # apply pending migrations (default)
-//   migrate -status    # print ledger status
+//
+//	migrate            # apply pending migrations (default)
+//	migrate -status    # print ledger status
 //
 // Env:
-//   DATABASE_URL     (required) Postgres connection URL
-//   MIGRATIONS_DIR   (optional) directory of *.sql files
-//                    default /migrations (production), ./migrations (dev)
+//
+//	DATABASE_URL     (required) Postgres connection URL
+//	MIGRATIONS_DIR   (optional) directory of *.sql files
+//	                 default /migrations (production), ./migrations (dev)
 //
 // Exit code 0 on success, 1 on any migration failure or misconfiguration.
 package main

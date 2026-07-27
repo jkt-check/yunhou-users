@@ -666,8 +666,8 @@ func TestUserHandler_UpdateProfile_BadAvatar(t *testing.T) {
 	})
 	cases := []string{
 		`{"avatar_url":"http://example.com/x.png"}`,   // not https
-		`{"avatar_url":"https://x:y@example.com"}`,     // userinfo
-		`{"avatar_url":"https://example.com/x#frag"}`,  // fragment
+		`{"avatar_url":"https://x:y@example.com"}`,    // userinfo
+		`{"avatar_url":"https://example.com/x#frag"}`, // fragment
 		`{"avatar_url":"not a url at all"}`,
 	}
 	for _, body := range cases {

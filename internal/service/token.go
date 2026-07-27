@@ -54,9 +54,9 @@ type TokenClaims struct {
 func (s *TokenService) SignAccessToken(userID, appID string, scope []string) (string, error) {
 	claims := TokenClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   userID,
-			Issuer:    "yunhou-users",
-			Audience:  jwt.ClaimStrings{appID},
+			Subject:  userID,
+			Issuer:   "yunhou-users",
+			Audience: jwt.ClaimStrings{appID},
 		},
 		AppID: appID,
 		Scope: scope,

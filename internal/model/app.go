@@ -133,10 +133,10 @@ type WeChatOAuthConfig struct {
 // plan_code field always set to "" so the mapping is informational until
 // A2.c's real client lands.
 type WeChatPayConfig struct {
-	MchID         string            `json:"mch_id"`          // 微信支付商户号
-	APIv3Key      string            `json:"api_v3_key"`      // 32 bytes; used for HMAC + AES-GCM resource decrypt
-	CertPath      string            `json:"cert_path"`       // /keys/wechatpay/apiclient_cert.pem
-	KeyPath       string            `json:"key_path"`        // /keys/wechatpay/apiclient_key.pem
-	NotifyURL     string            `json:"notify_url"`      // https://api.yunhouai.com/webhooks/payment/wechat_pay
-	PlanMapping   map[string]string `json:"plan_mapping,omitempty"` // {"monthly": "MONTHLY_PLAN_CODE", ...}
+	MchID       string            `json:"mch_id"`                 // 微信支付商户号
+	APIv3Key    string            `json:"api_v3_key"`             // 32 bytes; used for HMAC + AES-GCM resource decrypt
+	CertPath    string            `json:"cert_path"`              // /keys/wechatpay/apiclient_cert.pem
+	KeyPath     string            `json:"key_path"`               // /keys/wechatpay/apiclient_key.pem
+	NotifyURL   string            `json:"notify_url"`             // https://api.yunhouai.com/webhooks/payment/wechat_pay
+	PlanMapping map[string]string `json:"plan_mapping,omitempty"` // {"monthly": "MONTHLY_PLAN_CODE", ...}
 }

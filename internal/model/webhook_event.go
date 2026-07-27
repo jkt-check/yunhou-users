@@ -12,8 +12,8 @@ import (
 // processed_at semantics:
 //   - NULL      = queued, handler hasn't finished (or crashed mid-process)
 //   - NOT NULL  = handler finished. This DOES NOT mean a domain action was
-//                 taken — many event types are intentionally no-op
-//                 (Stripe `payment_method.attached` etc.).
+//     taken — many event types are intentionally no-op
+//     (Stripe `payment_method.attached` etc.).
 type WebhookEvent struct {
 	ID          string          `db:"id" json:"id"`
 	Channel     string          `db:"channel" json:"channel"`

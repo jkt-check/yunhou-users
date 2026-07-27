@@ -24,7 +24,7 @@ type Refund struct {
 	Reason           *string   `db:"reason" json:"reason,omitempty"`
 	IdempotencyKey   string    `db:"idempotency_key" json:"idempotency_key"`
 	ExternalRefundID *string   `db:"external_refund_id" json:"external_refund_id,omitempty"` // NULL until channel returns
-	Status           string    `db:"status" json:"status"` // pending / paid / failed (reserved)
+	Status           string    `db:"status" json:"status"`                                   // pending / paid / failed (reserved)
 	CreatedAt        time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt        time.Time `db:"updated_at" json:"updated_at"`
 }

@@ -49,9 +49,9 @@ var ErrUnknownPlatformSerial = errors.New("unknown wechat platform certificate s
 // platformCertsResponse mirrors GET /v3/certificates' body.
 type platformCertsResponse struct {
 	Data []struct {
-		SerialNo          string    `json:"serial_no"`
-		EffectiveTime     time.Time `json:"effective_time"`
-		ExpireTime        time.Time `json:"expire_time"`
+		SerialNo           string    `json:"serial_no"`
+		EffectiveTime      time.Time `json:"effective_time"`
+		ExpireTime         time.Time `json:"expire_time"`
 		EncryptCertificate struct {
 			Algorithm      string `json:"algorithm"`
 			Nonce          string `json:"nonce"`

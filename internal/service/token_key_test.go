@@ -57,9 +57,9 @@ func TestNewTokenService_LoadsPKCS1Keys(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		RSAPrivate:  privPath,
-		RSAPublic:   pubPath,
-		JWTAccessTTL: 15 * 60 * 1e9, // 15m in ns (config package parses duration)
+		RSAPrivate:    privPath,
+		RSAPublic:     pubPath,
+		JWTAccessTTL:  15 * 60 * 1e9, // 15m in ns (config package parses duration)
 		JWTRefreshTTL: 168 * 3600 * 1e9,
 	}
 	svc, err := NewTokenService(cfg, &mockSessionRepo{}, &mockSubscriptionRepo{})
@@ -103,9 +103,9 @@ func TestNewTokenService_LoadsPKCS8Keys(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		RSAPrivate:  privPath,
-		RSAPublic:   pubPath,
-		JWTAccessTTL: 15 * 60 * 1e9,
+		RSAPrivate:    privPath,
+		RSAPublic:     pubPath,
+		JWTAccessTTL:  15 * 60 * 1e9,
 		JWTRefreshTTL: 168 * 3600 * 1e9,
 	}
 	svc, err := NewTokenService(cfg, &mockSessionRepo{}, &mockSubscriptionRepo{})
@@ -123,9 +123,9 @@ func TestNewTokenService_MissingPrivateKey(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	cfg := &config.Config{
-		RSAPrivate:  filepath.Join(dir, "nope.pem"),
-		RSAPublic:   filepath.Join(dir, "nope-pub.pem"),
-		JWTAccessTTL: 15 * 60 * 1e9,
+		RSAPrivate:    filepath.Join(dir, "nope.pem"),
+		RSAPublic:     filepath.Join(dir, "nope-pub.pem"),
+		JWTAccessTTL:  15 * 60 * 1e9,
 		JWTRefreshTTL: 168 * 3600 * 1e9,
 	}
 	_, err := NewTokenService(cfg, &mockSessionRepo{}, &mockSubscriptionRepo{})
@@ -150,9 +150,9 @@ func TestNewTokenService_InvalidPEMPrivateKey(t *testing.T) {
 	_ = os.WriteFile(pubPath, pubPEM, 0600)
 
 	cfg := &config.Config{
-		RSAPrivate:  privPath,
-		RSAPublic:   pubPath,
-		JWTAccessTTL: 15 * 60 * 1e9,
+		RSAPrivate:    privPath,
+		RSAPublic:     pubPath,
+		JWTAccessTTL:  15 * 60 * 1e9,
 		JWTRefreshTTL: 168 * 3600 * 1e9,
 	}
 	_, err := NewTokenService(cfg, &mockSessionRepo{}, &mockSubscriptionRepo{})
@@ -177,9 +177,9 @@ func TestNewTokenService_InvalidPublicKey(t *testing.T) {
 	_ = os.WriteFile(pubPath, []byte("not-pem"), 0600)
 
 	cfg := &config.Config{
-		RSAPrivate:  privPath,
-		RSAPublic:   pubPath,
-		JWTAccessTTL: 15 * 60 * 1e9,
+		RSAPrivate:    privPath,
+		RSAPublic:     pubPath,
+		JWTAccessTTL:  15 * 60 * 1e9,
 		JWTRefreshTTL: 168 * 3600 * 1e9,
 	}
 	_, err := NewTokenService(cfg, &mockSessionRepo{}, &mockSubscriptionRepo{})
@@ -214,9 +214,9 @@ func TestNewTokenService_PublicKeyNotRSA(t *testing.T) {
 	_ = os.WriteFile(pubPath, pubPEM, 0600)
 
 	cfg := &config.Config{
-		RSAPrivate:  privPath,
-		RSAPublic:   pubPath,
-		JWTAccessTTL: 15 * 60 * 1e9,
+		RSAPrivate:    privPath,
+		RSAPublic:     pubPath,
+		JWTAccessTTL:  15 * 60 * 1e9,
 		JWTRefreshTTL: 168 * 3600 * 1e9,
 	}
 	_, err = NewTokenService(cfg, &mockSessionRepo{}, &mockSubscriptionRepo{})

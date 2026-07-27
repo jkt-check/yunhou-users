@@ -580,13 +580,13 @@ func TestWebhook_WeChat_PaymentFailed(t *testing.T) {
 
 // TestWebhook_WeChat_MockMode_OrderPaid_SubscriptionActivated walks the
 // full mock-mode flow:
-//   1. login → mint a JWT
-//   2. POST /payments/orders → create pending order
-//   3. POST /webhooks/payment/wechat_pay with a PLAINTEXT JSON body
-//      (no resource block, no AES, no real signature) → the mock
-//      verifier short-circuits, the mock-aware handler decodes the
-//      body, the order is flipped to paid, and the user's subscription
-//      is activated.
+//  1. login → mint a JWT
+//  2. POST /payments/orders → create pending order
+//  3. POST /webhooks/payment/wechat_pay with a PLAINTEXT JSON body
+//     (no resource block, no AES, no real signature) → the mock
+//     verifier short-circuits, the mock-aware handler decodes the
+//     body, the order is flipped to paid, and the user's subscription
+//     is activated.
 //
 // In real prod (WECHAT_PAY_MOCK=0) the same webhook would 400 because
 // the signature wouldn't match — confirmed by TestWebhook_WeChat_MockMode_RealVerifierRejects.

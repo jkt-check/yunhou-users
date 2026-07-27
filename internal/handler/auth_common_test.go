@@ -138,7 +138,10 @@ func TestLoginResponse_SubscriptionExpiresAt_RFC3339Serialization(t *testing.T) 
 		User:         service.UserInfo{ID: "u-1"},
 		Subscription: &service.SubscriptionInfo{PlanID: "monthly", HasAccess: true, ExpiresAt: &when},
 	}
-	raw, _ := json.Marshal(resp)
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
 	if !strings.Contains(string(raw), `"expires_at":"2027-01-15T12:30:45Z"`) {
 		t.Errorf("expected RFC3339 expires_at, got: %s", raw)
 	}

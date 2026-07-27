@@ -36,6 +36,11 @@ type wechatClient interface {
 // no way to pay — we surface a 4xx instead (mapped in handler/payment.go).
 var ErrWechatPayNotConfigured = errors.New("wechat pay not configured on this deployment")
 
+// ErrPlanMissingForExpiry is returned by resolveSubExpiry when the plan row
+// was deleted between order creation and webhook/confirm arrival. Callers
+// audit-log this and fall back to the existing "NULL = never expires" branch.
+var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
+
 // channelRequiredCurrency describes the settlement currency required by the
 // channels that only support one currency in this service. Plans remain the
 // source of truth for the order's persisted currency. Stripe and Alipay are
@@ -182,6 +187,36 @@ func rawSQLXTx(tx dbTx) *sqlx.Tx {
 		return wrapped.Tx
 	}
 	return nil
+}
+
+// txLookupPlan reads a plan by id, sharing the surrounding tx's connection
+// when one is in flight. The nil-tx branch is exercised only by unit tests
+// that stub dbTx; production always carries a real *sqlx.Tx.
+func (s *PaymentService) txLookupPlan(ctx context.Context, tx *sqlx.Tx, planID string) (*model.Plan, error) {
+	if tx != nil {
+		return s.planRepo.FindByIDForShareTx(ctx, tx, planID)
+	}
+	return s.planRepo.FindByID(ctx, planID)
+}
+
+// txLookupActiveSubscription reads the user's current active sub, sharing
+// the surrounding tx's connection when one is in flight. Returns nil/nil
+// when no active sub exists (sql.ErrNoRows is swallowed at the call site
+// for retry-preservation lookups).
+func (s *PaymentService) txLookupActiveSubscription(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error) {
+	if tx != nil {
+		return s.subRepo.FindActiveByUserIDTx(ctx, tx, userID)
+	}
+	return s.subRepo.FindActiveByUserID(ctx, userID)
+}
+
+// txLookupPaymentByChannelTxnID reads a payment by (channel, externalTxnID),
+// sharing the surrounding tx's connection when one is in flight.
+func (s *PaymentService) txLookupPaymentByChannelTxnID(ctx context.Context, tx *sqlx.Tx, channel, externalTxnID string) (*model.Payment, error) {
+	if tx != nil {
+		return s.paymentRepo.FindByChannelTxnIDTx(ctx, tx, channel, externalTxnID)
+	}
+	return s.paymentRepo.FindByChannelTxnID(ctx, channel, externalTxnID)
 }
 
 // ============================================================================
@@ -720,14 +755,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// MaxOpenConns=25, 25 concurrent dedupe Confirms would each hold
 		// a tx connection and then fight for a second one here — same
 		// deadlock class as resolveSubExpiry's planRepo lookup.
-		var existing *model.Payment
-		var ferr error
-		if txSQLX != nil {
-			existing, ferr = s.paymentRepo.FindByChannelTxnIDTx(ctx, txSQLX, in.Channel, in.ExternalTxnID)
-		} else {
-			// Fake dbTx used by unit tests has no underlying *sqlx.Tx.
-			existing, ferr = s.paymentRepo.FindByChannelTxnID(ctx, in.Channel, in.ExternalTxnID)
-		}
+		existing, ferr := s.txLookupPaymentByChannelTxnID(ctx, txSQLX, in.Channel, in.ExternalTxnID)
 		if ferr != nil {
 			return nil, fmt.Errorf("re-read existing payment: %w", ferr)
 		}
@@ -738,14 +766,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// to ensure sub activation + order update are idempotent.
 		paymentID = existing.ID
 
-		var activeSub *model.Subscription
-		var sErr error
-		if txSQLX != nil {
-			activeSub, sErr = s.subRepo.FindActiveByUserIDTx(ctx, txSQLX, order.UserID)
-		} else {
-			// Fake transactions used by unit tests have no underlying SQL tx.
-			activeSub, sErr = s.subRepo.FindActiveByUserID(ctx, order.UserID)
-		}
+		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID)
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return nil, fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -1194,14 +1215,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		// (channel, external_txn_id) would each hold a tx connection and
 		// then fight for a second one here — same deadlock class as
 		// resolveSubExpiry's planRepo lookup.
-		var existing *model.Payment
-		var ferr error
-		if txSQLX != nil {
-			existing, ferr = s.paymentRepo.FindByChannelTxnIDTx(ctx, txSQLX, e.Channel, e.TransactionID)
-		} else {
-			// Fake dbTx used by unit tests has no underlying *sqlx.Tx.
-			existing, ferr = s.paymentRepo.FindByChannelTxnID(ctx, e.Channel, e.TransactionID)
-		}
+		existing, ferr := s.txLookupPaymentByChannelTxnID(ctx, txSQLX, e.Channel, e.TransactionID)
 		if ferr != nil {
 			return fmt.Errorf("re-read existing: %w", ferr)
 		}
@@ -1216,14 +1230,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		}
 		paymentID = existing.ID
 
-		var activeSub *model.Subscription
-		var sErr error
-		if txSQLX != nil {
-			activeSub, sErr = s.subRepo.FindActiveByUserIDTx(ctx, txSQLX, order.UserID)
-		} else {
-			// Fake transactions used by unit tests have no underlying SQL tx.
-			activeSub, sErr = s.subRepo.FindActiveByUserID(ctx, order.UserID)
-		}
+		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID)
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -2034,11 +2041,6 @@ func isPaypalRenewal(eventType string) bool {
 	return eventType == "PAYMENT.SALE.COMPLETED"
 }
 
-// ErrPlanMissingForExpiry is returned by resolveSubExpiry when the plan row
-// was deleted between order creation and webhook/confirm arrival. Callers
-// audit-log this and fall back to the existing "NULL = never expires" branch.
-var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
-
 // resolveSubExpiry returns the expires_at to write on a subscription
 // activation. Priority:
 //
@@ -2078,13 +2080,7 @@ func (s *PaymentService) resolveSubExpiry(
 	}
 	var plan *model.Plan
 	var err error
-	if tx != nil {
-		plan, err = s.planRepo.FindByIDForShareTx(ctx, tx, planID)
-	} else {
-		// Fake dbTx implementations used by unit tests do not expose a real
-		// *sqlx.Tx; production always takes the tx-bound branch above.
-		plan, err = s.planRepo.FindByID(ctx, planID)
-	}
+	plan, err = s.txLookupPlan(ctx, tx, planID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPlanMissingForExpiry

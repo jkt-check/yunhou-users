@@ -94,7 +94,7 @@ func (r *orderRepo) CreateInTx(ctx context.Context, tx *sqlx.Tx, o *model.Order)
 // required by migration 010_provider_intent_nullable so the JSON
 // response's omitempty fires for orders without a pre-auth payload.
 // Without this wrapper, sqlx would bind []byte as bytea, and Postgres
-// JSONB rejects ” with SQLSTATE 22P02.
+// JSONB rejects `''` with SQLSTATE 22P02.
 type orderInsertRow struct {
 	ID             string         `db:"id"`
 	UserID         string         `db:"user_id"`
@@ -405,7 +405,7 @@ func (r *paymentRepo) ClearDisputed(ctx context.Context, id string) error {
 // NonNilRawPayload returns p unchanged when it holds valid JSON, otherwise
 // an empty JSON object. Two cases are coerced to `'{}'`:
 //   - nil — sqlx's positional binding cannot represent a nil json.RawMessage.
-//   - empty (len==0, non-nil) — a zero-length json.RawMessage binds to ” which
+//   - empty (len==0, non-nil) — a zero-length json.RawMessage binds to `''` which
 //     Postgres rejects as invalid JSON (SQLSTATE 22023/22P02).
 //
 // All Postgres JSONB raw_payload columns in this package have a DEFAULT '{}'

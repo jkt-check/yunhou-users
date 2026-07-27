@@ -2106,12 +2106,14 @@ func TestOnPaymentSucceeded_WeChatNoHint_UsesPlanInterval(t *testing.T) {
 	if exp.Time.Before(time.Now()) {
 		t.Error("expires_at is in the past")
 	}
-	// Upper bound tied to plans.monthly.interval_days = 30. A 5-minute
-	// buffer absorbs clock skew / CI latency between the activation and
-	// the SELECT. Anything wider than that signals a regression to a
-	// 1d or 29d fallback (or a duplicate-confirm time-shift).
-	if exp.Time.After(time.Now().Add(30*24*time.Hour + 5*time.Minute)) {
-		t.Errorf("expires_at too far in the future: %v", exp.Time)
+	// Tight range around monthly.interval_days = 30. The 23h lower-bound
+	// slack absorbs up to one day of test-fixture build / CI scheduling
+	// latency; the +1min upper-bound slack absorbs the clock drift between
+	// resolveSubExpiry's time.Now() and this SELECT. A regression to a
+	// 29d / 31d / 1d fallback would land outside this window.
+	delta := time.Until(exp.Time)
+	if delta < 29*24*time.Hour || delta > 30*24*time.Hour+time.Minute {
+		t.Errorf("expires_at outside monthly window: delta=%v, want ≈30d", delta)
 	}
 }
 
@@ -2157,12 +2159,14 @@ func TestConfirm_NoHint_UsesPlanInterval(t *testing.T) {
 	if exp.Time.Before(time.Now()) {
 		t.Error("expires_at is in the past")
 	}
-	// Upper bound tied to plans.monthly.interval_days = 30. A 5-minute
-	// buffer absorbs clock skew / CI latency between the activation and
-	// the SELECT. Anything wider than that signals a regression to a
-	// 1d or 29d fallback (or a duplicate-confirm time-shift).
-	if exp.Time.After(time.Now().Add(30*24*time.Hour + 5*time.Minute)) {
-		t.Errorf("expires_at too far in the future: %v", exp.Time)
+	// Tight range around monthly.interval_days = 30. The 23h lower-bound
+	// slack absorbs up to one day of test-fixture build / CI scheduling
+	// latency; the +1min upper-bound slack absorbs the clock drift between
+	// resolveSubExpiry's time.Now() and this SELECT. A regression to a
+	// 29d / 31d / 1d fallback would land outside this window.
+	delta := time.Until(exp.Time)
+	if delta < 29*24*time.Hour || delta > 30*24*time.Hour+time.Minute {
+		t.Errorf("expires_at outside monthly window: delta=%v, want ≈30d", delta)
 	}
 }
 
@@ -2330,20 +2334,31 @@ func TestConfirm_PlanMissing_AuditLogAndNullExpiry(t *testing.T) {
 		t.Fatalf("seed doomed plan: %v", err)
 	}
 	orderID := seedPaidOrder(t, db, userID, planID, 0.0)
-	if _, err := db.ExecContext(context.Background(),
-		`SET session_replication_role = 'replica'`); err != nil {
+
+	// PostgreSQL SET is per-session, and database/sql returns connections
+	// to the pool after each ExecContext call. The three statements below
+	// (SET replica, DELETE, SET origin) must therefore run on the SAME
+	// pinned connection — otherwise the SET may land on a connection that
+	// never sees the DELETE, leaving the FK enforcement enabled and
+	// making this test flaky. Use db.Conn to pin the connection; close
+	// the pin before the Confirm call so it goes through the normal pool.
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin conn: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SET session_replication_role = 'replica'`); err != nil {
 		t.Fatalf("disable triggers: %v", err)
 	}
-	if _, err := db.ExecContext(context.Background(),
-		`DELETE FROM plans WHERE id = $1`, planID); err != nil {
+	if _, err := conn.ExecContext(ctx, `DELETE FROM plans WHERE id = $1`, planID); err != nil {
 		t.Fatalf("delete doomed plan: %v", err)
 	}
-	if _, err := db.ExecContext(context.Background(),
-		`SET session_replication_role = 'origin'`); err != nil {
+	if _, err := conn.ExecContext(ctx, `SET session_replication_role = 'origin'`); err != nil {
 		t.Fatalf("re-enable triggers: %v", err)
 	}
 
-	_, err := s.Confirm(context.Background(), ConfirmInput{
+	_, err = s.Confirm(context.Background(), ConfirmInput{
 		OrderID:       orderID,
 		UserID:        userID,
 		Channel:       "wechat_pay",

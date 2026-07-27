@@ -45,6 +45,9 @@ func (m *mockWebhookSvc) OnWebhook(_ context.Context, e service.WebhookEvent) (*
 func (m *mockWebhookSvc) GetOrder(_ context.Context, _, _ string) (*model.Order, error) {
 	return nil, nil
 }
+func (m *mockWebhookSvc) ListUserOrders(_ context.Context, _ string) ([]model.Order, error) {
+	return nil, nil
+}
 func (m *mockWebhookSvc) ListUserPayments(_ context.Context, _ string) ([]model.Payment, error) {
 	return nil, nil
 }

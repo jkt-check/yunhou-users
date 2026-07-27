@@ -86,6 +86,21 @@ func (h *PaymentHandler) GetOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": order})
 }
 
+// ListOrders — GET /payments/orders
+func (h *PaymentHandler) ListOrders(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+	list, err := h.svc.ListUserOrders(c.Request.Context(), userID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list})
+}
+
 // CancelOrder — DELETE /payments/orders/:id
 func (h *PaymentHandler) CancelOrder(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)

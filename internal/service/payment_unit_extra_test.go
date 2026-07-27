@@ -30,6 +30,8 @@ import (
 type stubOrderRepoLookup struct {
 	byID                map[string]*model.Order
 	findErr             error
+	listOut             []model.Order // returned by ListByUserID; nil default keeps pre-existing tests unchanged
+	listErr             error
 	cancelOK            bool
 	cancelErr           error
 	cancelSeen          string
@@ -63,7 +65,7 @@ func (s *stubOrderRepoLookup) FindByID(_ context.Context, id string) (*model.Ord
 	return o, nil
 }
 func (s *stubOrderRepoLookup) ListByUserID(_ context.Context, _ string) ([]model.Order, error) {
-	return nil, nil
+	return s.listOut, s.listErr
 }
 func (s *stubOrderRepoLookup) CancelPending(_ context.Context, id, _ string) (bool, error) {
 	s.cancelSeen = id
@@ -946,6 +948,77 @@ func TestPaymentService_Unit_ListUserPayments_PassesThrough(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Errorf("expected 2 payments, got %d", len(got))
+	}
+}
+
+func TestPaymentService_Unit_ListUserOrders_PassesThrough(t *testing.T) {
+	t.Parallel()
+	orepo := &stubOrderRepoLookup{
+		listOut: []model.Order{
+			{ID: "ord_1", PlanID: "monthly", Status: "paid"},
+			{ID: "ord_2", PlanID: "yearly", Status: "expired"},
+		},
+	}
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		orepo,
+		&stubPaymentRepoList{},
+		&stubRefundRepoLookup{},
+		nil, nil, nil, nil, nil,
+		&stubRefundAPI{}, nil,
+
+		0)
+
+	got, err := svc.ListUserOrders(context.Background(), "u_1")
+	if err != nil {
+		t.Fatalf("list orders: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "ord_1" {
+		t.Errorf("expected 2 orders headed by ord_1, got %+v", got)
+	}
+}
+
+func TestPaymentService_Unit_ListUserOrders_NilBecomesEmpty(t *testing.T) {
+	t.Parallel()
+	// Repo returns (nil, nil) when the user has no orders; the service
+	// must normalise to a non-nil empty slice so the JSON response is
+	// "data": [] and the FE can skip a null branch.
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		&stubOrderRepoLookup{},
+		&stubPaymentRepoList{},
+		&stubRefundRepoLookup{},
+		nil, nil, nil, nil, nil,
+		&stubRefundAPI{}, nil,
+
+		0)
+
+	got, err := svc.ListUserOrders(context.Background(), "u_1")
+	if err != nil {
+		t.Fatalf("list orders: %v", err)
+	}
+	if got == nil {
+		t.Error("expected non-nil empty slice, got nil")
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 orders, got %d", len(got))
+	}
+}
+
+func TestPaymentService_Unit_ListUserOrders_RepoErrorPropagates(t *testing.T) {
+	t.Parallel()
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		&stubOrderRepoLookup{listErr: errors.New("db exploded")},
+		&stubPaymentRepoList{},
+		&stubRefundRepoLookup{},
+		nil, nil, nil, nil, nil,
+		&stubRefundAPI{}, nil,
+
+		0)
+
+	if _, err := svc.ListUserOrders(context.Background(), "u_1"); err == nil {
+		t.Error("expected repo error to propagate, got nil")
 	}
 }
 

@@ -33,6 +33,8 @@ type mockPaymentSvc struct {
 	refundErr        error
 	getOrderResp     *model.Order
 	getOrderErr      error
+	listOrders       []model.Order
+	listOrdersErr    error
 	listPayments     []model.Payment
 	listPaymentsErr  error
 	getPaymentResp   *model.Payment
@@ -65,6 +67,9 @@ func (m *mockPaymentSvc) OnWebhook(_ context.Context, _ service.WebhookEvent) (*
 func (m *mockPaymentSvc) GetOrder(_ context.Context, _, _ string) (*model.Order, error) {
 	return m.getOrderResp, m.getOrderErr
 }
+func (m *mockPaymentSvc) ListUserOrders(_ context.Context, _ string) ([]model.Order, error) {
+	return m.listOrders, m.listOrdersErr
+}
 func (m *mockPaymentSvc) ListUserPayments(_ context.Context, _ string) ([]model.Payment, error) {
 	return m.listPayments, m.listPaymentsErr
 }
@@ -96,6 +101,7 @@ func paymentTestEngine(svc service.PaymentServiceInterface, userID string) *gin.
 	})
 
 	engine.POST("/payments/orders", h.CreateOrder)
+	engine.GET("/payments/orders", h.ListOrders)
 	engine.GET("/payments/orders/:id", h.GetOrder)
 	engine.DELETE("/payments/orders/:id", h.CancelOrder)
 	engine.POST("/payments/orders/:order_id/confirm", h.ConfirmOrder)
@@ -669,6 +675,59 @@ func TestPaymentHandler_ListPaymentRefunds_PropagatesOwnershipErr(t *testing.T) 
 	rec := doRequest(engine, http.MethodGet, "/payments/p-1/refunds", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status: got %d, want 404", rec.Code)
+	}
+}
+
+func TestPaymentHandler_ListOrders(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success returns the orders array", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			listOrders: []model.Order{
+				{ID: "o-1", PlanID: "monthly", Status: "paid"},
+				{ID: "o-2", PlanID: "yearly", Status: "expired"},
+			},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodGet, "/payments/orders", nil)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status: got %d, want 200", rec.Code)
+		}
+		var body struct {
+			Code int           `json:"code"`
+			Data []model.Order `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(body.Data) != 2 || body.Data[0].ID != "o-1" {
+			t.Errorf("data: got %+v, want 2 orders headed by o-1", body.Data)
+		}
+	})
+}
+
+func TestPaymentHandler_ListOrders_NoAuth_401(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	svc := &mockPaymentSvc{}
+	h := NewPaymentHandler(svc)
+	engine := gin.New()
+	engine.GET("/payments/orders", h.ListOrders)
+	rec := doRequest(engine, http.MethodGet, "/payments/orders", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing auth: got %d, want 401", rec.Code)
+	}
+}
+
+func TestPaymentHandler_ListOrders_Error_500(t *testing.T) {
+	t.Parallel()
+	svc := &mockPaymentSvc{listOrdersErr: errors.New("db exploded")}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, http.MethodGet, "/payments/orders", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("DB error: got %d, want 500", rec.Code)
 	}
 }
 

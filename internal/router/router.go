@@ -132,6 +132,7 @@ func Setup(
 	{
 		// Order lifecycle
 		paymentGroup.POST("/orders", paymentHandler.CreateOrder)
+		paymentGroup.GET("/orders", paymentHandler.ListOrders)
 		paymentGroup.GET("/orders/:id", paymentHandler.GetOrder)
 		paymentGroup.DELETE("/orders/:id", paymentHandler.CancelOrder)
 		paymentGroup.POST("/orders/:order_id/confirm", paymentHandler.ConfirmOrder)

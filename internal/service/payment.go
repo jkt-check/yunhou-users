@@ -581,6 +581,26 @@ func (s *PaymentService) ListUserPayments(ctx context.Context, userID string) ([
 	return s.paymentRepo.ListByUserID(ctx, userID)
 }
 
+// ListUserOrders returns the caller's orders newest-first for the console
+// order-history view. Read-only: unlike GetOrder it does NOT drive the
+// channel reconcile path — a history listing must not fan out one upstream
+// QueryOrder per pending row. Stale pending rows still converge via the
+// sweeper and the single-order poll the FE runs while a QR is open.
+//
+// A nil repo result (no rows) is normalised to an empty slice so the JSON
+// response is `"data": []`, not `"data": null` — the FE renders the empty
+// state straight from the array without a null branch.
+func (s *PaymentService) ListUserOrders(ctx context.Context, userID string) ([]model.Order, error) {
+	list, err := s.orderRepo.ListByUserID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list orders: %w", err)
+	}
+	if list == nil {
+		list = []model.Order{}
+	}
+	return list, nil
+}
+
 // GetPayment returns a payment by ID, or ErrPaymentNotFound if missing or
 // not owned by the caller.
 func (s *PaymentService) GetPayment(ctx context.Context, paymentID, userID string) (*model.Payment, error) {

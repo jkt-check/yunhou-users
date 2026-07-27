@@ -55,6 +55,7 @@ type PaymentServiceInterface interface {
 	Refund(ctx context.Context, in RefundInput) (*RefundResult, error)
 	OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebhookResult, error)
 	GetOrder(ctx context.Context, orderID, userID string) (*model.Order, error)
+	ListUserOrders(ctx context.Context, userID string) ([]model.Order, error)
 	ListUserPayments(ctx context.Context, userID string) ([]model.Payment, error)
 	GetPayment(ctx context.Context, paymentID, userID string) (*model.Payment, error)
 	ListPaymentRefunds(ctx context.Context, paymentID, userID string) ([]model.Refund, error)

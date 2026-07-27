@@ -257,6 +257,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"POST:/admin/apps",
 		"PATCH:/admin/apps/:id",
 		"POST:/payments/orders",
+		"GET:/payments/orders",
 		"GET:/payments/orders/:id",
 		"DELETE:/payments/orders/:id",
 		"POST:/payments/orders/:order_id/confirm",

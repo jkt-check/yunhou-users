@@ -445,3 +445,15 @@ PR CI 工作流：每次 push / PR → 跑 `go vet` + `go test -race -cover` + �
 | 日期 | 事项 | 备注 |
 |---|---|---|
 | 2026-07-15 | A2.c 真客户端落地（feat/wechat-pay-real-client）— Signer + cert helpers + real UnifiedOrder + provider_intent + cmd/server wiring + 5-tuple Validate | 8 PR commits; deferred: refund / JSAPI / per-app / plan_mapping |
+
+---
+
+## 2026-07-27: subscription.expires_at 现在始终是 RFC3339
+
+**Breaking-ish contract change** (consumer behavior, not protocol):
+
+- `LoginResponse.subscription.expires_at` 和 `GET /user/subscriptions[]` 中该字段从可选（`omitempty`）变为必存在。WeChat 通道因 v3 NATIVE 不携带 `sub_expires_at`,以前会写 NULL → 现在写 `now() + plan.interval_days*24h`。
+- BFF 接入侧需要：删除「`expires_at` 字段缺席 → 永不过期」的 UI 分支；现在 `expires_at: null` 才表示真正的"永不过期"（仅出现在修复前激活的行上）。
+- PayPal 续费路径策略不变：`next_billing_time` 缺失仍 fail-loud（audit-log `paypal_renewal_no_expiry_hint`），不参与 fallback。
+- 历史 NULL 行不补：见 `migrations/017_sub_expiry_does_not_backfill.sql`。
+- 修复点：`internal/service/payment.go` 新增 `resolveSubExpiry` 助手；`webhook` / `Confirm` / `reconcile` 三个入口均接入；`internal/service/auth.go` 上 `SubscriptionInfo.ExpiresAt` 去掉 `omitempty`。

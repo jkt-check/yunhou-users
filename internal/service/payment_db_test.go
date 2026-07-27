@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -2049,7 +2050,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 	s := newTestPaymentService(t, db)
 
 	hint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	got, err := s.resolveSubExpiry(context.Background(), "user-id", "monthly", &hint)
+	got, err := s.resolveSubExpiry(context.Background(), "monthly", &hint, nil)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
@@ -2227,5 +2228,143 @@ func TestConfirm_RetryDoesNotExtend(t *testing.T) {
 	}
 	if !secondExp.Time.Equal(firstExp.Time) {
 		t.Errorf("retry extended expires_at: first=%v second=%v", firstExp.Time, secondExp.Time)
+	}
+}
+
+// TestConfirm_DifferentOrder_SameUser_FallbackApplies covers the
+// critical case where a user has an active sub from a previous order
+// and a NEW order for a different plan arrives. The helper must
+// apply the new plan's interval_days, NOT preserve the previous sub's
+// expiry. Pre-fix the helper checked "any active sub for user" and
+// would return the previous sub's expiry — paying for a 365-day
+// yearly would only get 30 days because the existing monthly's
+// expires_at was preserved.
+func TestConfirm_DifferentOrder_SameUser_FallbackApplies(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	// Seed the yearly plan alongside the seeded monthly/free. The test
+	// setup only seeds monthly + free; this test needs a different
+	// plan with a different interval_days to detect the cross-order
+	// preservation bug.
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps)
+		VALUES ('yearly', 'Yearly', 199.9, 365, ARRAY['yundian', 'yundash'])
+		ON CONFLICT (id) DO NOTHING
+	`); err != nil {
+		t.Fatalf("seed yearly: %v", err)
+	}
+
+	userID := seedUser(t, db)
+	monthlyPlanID := "monthly"
+	yearlyPlanID := "yearly"
+
+	// First order: monthly. Confirm.
+	monthlyOrderID := seedPaidOrder(t, db, userID, monthlyPlanID, 19.9)
+	if _, err := s.Confirm(context.Background(), ConfirmInput{
+		OrderID:       monthlyOrderID,
+		UserID:        userID,
+		Channel:       "wechat_pay",
+		ExternalTxnID: "txn-monthly-1",
+		ExpiresAt:     nil,
+	}); err != nil {
+		t.Fatalf("first confirm (monthly): %v", err)
+	}
+
+	// Second order: yearly. Different order, different ExternalTxnID,
+	// no dedupe hit. The helper must compute a fresh expiry.
+	yearlyOrderID := seedPaidOrder(t, db, userID, yearlyPlanID, 199.9)
+	if _, err := s.Confirm(context.Background(), ConfirmInput{
+		OrderID:       yearlyOrderID,
+		UserID:        userID,
+		Channel:       "wechat_pay",
+		ExternalTxnID: "txn-yearly-1",
+		ExpiresAt:     nil,
+	}); err != nil {
+		t.Fatalf("second confirm (yearly): %v", err)
+	}
+
+	// The active sub now reflects yearly, with a fresh expiry ~365 days out.
+	var exp sql.NullTime
+	if err := db.Get(&exp,
+		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if !exp.Valid {
+		t.Fatal("expires_at is NULL")
+	}
+	expectedMin := time.Now().Add(364 * 24 * time.Hour)
+	expectedMax := time.Now().Add(366 * 24 * time.Hour)
+	if exp.Time.Before(expectedMin) || exp.Time.After(expectedMax) {
+		t.Errorf("expires_at should be ~now+365d for yearly; got %v", exp.Time)
+	}
+}
+
+// TestConfirm_PlanMissing_AuditLogAndNullExpiry covers the audit-log
+// branch in resolveSubExpiry when the plan row was deleted between
+// order creation and Confirm arrival. Expected behavior: audit-log
+// is written; subscription is activated with expires_at=NULL
+// (existing "NULL = never expires" semantics, auth path picks it up).
+func TestConfirm_PlanMissing_AuditLogAndNullExpiry(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	userID := seedUser(t, db)
+	planID := "doomed"
+	// Insert a plan, seed the order, then delete the plan. The
+	// orders.plan_id FK is ON DELETE RESTRICT, so we have to bypass
+	// the FK enforcement via session_replication_role='replica' to
+	// simulate the rare "plan row missing" state (the helper still
+	// covers it; production rarely hits it because the FK would
+	// block plan deletion in the first place, but the audit-log
+	// path must still behave correctly when reached).
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO plans (id, name, price, interval_days, apps, is_active) VALUES ($1, 'Doomed', 0, 30, '{yundian}', true)`,
+		planID); err != nil {
+		t.Fatalf("seed doomed plan: %v", err)
+	}
+	orderID := seedPaidOrder(t, db, userID, planID, 0.0)
+	if _, err := db.ExecContext(context.Background(),
+		`SET session_replication_role = 'replica'`); err != nil {
+		t.Fatalf("disable triggers: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(),
+		`DELETE FROM plans WHERE id = $1`, planID); err != nil {
+		t.Fatalf("delete doomed plan: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(),
+		`SET session_replication_role = 'origin'`); err != nil {
+		t.Fatalf("re-enable triggers: %v", err)
+	}
+
+	_, err := s.Confirm(context.Background(), ConfirmInput{
+		OrderID:       orderID,
+		UserID:        userID,
+		Channel:       "wechat_pay",
+		ExternalTxnID: "txn-plan-missing-1",
+		ExpiresAt:     nil,
+	})
+	if err != nil {
+		t.Fatalf("Confirm should not fail on plan missing (audit + nil): %v", err)
+	}
+
+	var exp sql.NullTime
+	if err := db.Get(&exp,
+		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if exp.Valid {
+		t.Errorf("expires_at should be NULL when plan missing, got %v", exp.Time)
+	}
+
+	// Audit log entry was written.
+	var auditCount int
+	if err := db.Get(&auditCount,
+		`SELECT COUNT(*) FROM audit_log WHERE action = 'subscription_expiry_plan_missing' AND target = $1`,
+		fmt.Sprintf("plan:%s", planID)); err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if auditCount == 0 {
+		t.Error("expected subscription_expiry_plan_missing audit log, got none")
 	}
 }

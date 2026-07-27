@@ -714,7 +714,20 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// Re-read it; if it's paid we're done (idempotent). If it's
 		// failed, refuse (the channel says this attempt failed even
 		// though the frontend thinks it succeeded).
-		existing, ferr := s.paymentRepo.FindByChannelTxnID(ctx, in.Channel, in.ExternalTxnID)
+		//
+		// Use the tx-bound variant when tx is a real *sqlx.Tx so the read
+		// shares the surrounding tx's connection. Without this, with
+		// MaxOpenConns=25, 25 concurrent dedupe Confirms would each hold
+		// a tx connection and then fight for a second one here — same
+		// deadlock class as resolveSubExpiry's planRepo lookup.
+		var existing *model.Payment
+		var ferr error
+		if txSQLX != nil {
+			existing, ferr = s.paymentRepo.FindByChannelTxnIDTx(ctx, txSQLX, in.Channel, in.ExternalTxnID)
+		} else {
+			// Fake dbTx used by unit tests has no underlying *sqlx.Tx.
+			existing, ferr = s.paymentRepo.FindByChannelTxnID(ctx, in.Channel, in.ExternalTxnID)
+		}
 		if ferr != nil {
 			return nil, fmt.Errorf("re-read existing payment: %w", ferr)
 		}
@@ -1174,7 +1187,21 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	if !inserted {
 		// Dedupe hit — payment row already exists. Re-read to know whether
 		// it's paid (no-op) or in a state we need to escalate.
-		existing, ferr := s.paymentRepo.FindByChannelTxnID(ctx, e.Channel, e.TransactionID)
+		//
+		// Use the tx-bound variant when tx is a real *sqlx.Tx so the read
+		// shares the surrounding tx's connection. Without this, with
+		// MaxOpenConns=25, 25 concurrent webhook retries for the same
+		// (channel, external_txn_id) would each hold a tx connection and
+		// then fight for a second one here — same deadlock class as
+		// resolveSubExpiry's planRepo lookup.
+		var existing *model.Payment
+		var ferr error
+		if txSQLX != nil {
+			existing, ferr = s.paymentRepo.FindByChannelTxnIDTx(ctx, txSQLX, e.Channel, e.TransactionID)
+		} else {
+			// Fake dbTx used by unit tests has no underlying *sqlx.Tx.
+			existing, ferr = s.paymentRepo.FindByChannelTxnID(ctx, e.Channel, e.TransactionID)
+		}
 		if ferr != nil {
 			return fmt.Errorf("re-read existing: %w", ferr)
 		}

@@ -252,6 +252,15 @@ type PaymentRepo interface {
 	InsertPaidOnConflictDoNothing(ctx context.Context, p *model.Payment) (string, bool, error)
 	FindByID(ctx context.Context, id string) (*model.Payment, error)
 	FindByChannelTxnID(ctx context.Context, channel, externalTxnID string) (*model.Payment, error)
+	// FindByChannelTxnIDTx is the tx-bound counterpart to FindByChannelTxnID.
+	// Use this from inside a transaction so the read shares the tx's
+	// connection (avoiding a second-connection pool grab that can
+	// deadlock under load with MaxOpenConns=25). The onPaymentSucceeded
+	// webhook path and the Confirm retry path both hold a tx connection
+	// when they re-read the existing payment row on a (channel,
+	// external_txn_id) dedupe hit — calling FindByChannelTxnID there would
+	// grab a second connection and deadlock with enough concurrent retries.
+	FindByChannelTxnIDTx(ctx context.Context, tx *sqlx.Tx, channel, externalTxnID string) (*model.Payment, error)
 	FindPaidByOrderID(ctx context.Context, orderID string) (*model.Payment, error) // channel mismatch pre-check (design doc confirm endpoint)
 	ListByOrderID(ctx context.Context, orderID string) ([]model.Payment, error)
 	ListByUserID(ctx context.Context, userID string) ([]model.Payment, error) // GET /payments — joins via orders
@@ -297,6 +306,21 @@ func (r *paymentRepo) FindByID(ctx context.Context, id string) (*model.Payment, 
 func (r *paymentRepo) FindByChannelTxnID(ctx context.Context, channel, externalTxnID string) (*model.Payment, error) {
 	var p model.Payment
 	err := r.db.GetContext(ctx, &p, `
+		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2
+	`, channel, externalTxnID)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// FindByChannelTxnIDTx mirrors FindByChannelTxnID but uses the supplied
+// transaction's connection. Same SQL, same return shape. Use from inside
+// Confirm's `!inserted` dedupe branch and from onPaymentSucceeded's
+// equivalent branch so the read shares the surrounding tx's connection.
+func (r *paymentRepo) FindByChannelTxnIDTx(ctx context.Context, tx *sqlx.Tx, channel, externalTxnID string) (*model.Payment, error) {
+	var p model.Payment
+	err := tx.GetContext(ctx, &p, `
 		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2
 	`, channel, externalTxnID)
 	if err != nil {

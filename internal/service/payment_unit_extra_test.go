@@ -112,6 +112,12 @@ func (s *stubPaymentRepoLookup) FindByID(_ context.Context, id string) (*model.P
 func (s *stubPaymentRepoLookup) FindByChannelTxnID(_ context.Context, _, _ string) (*model.Payment, error) {
 	return nil, sql.ErrNoRows
 }
+func (s *stubPaymentRepoLookup) FindByChannelTxnIDTx(_ context.Context, _ *sqlx.Tx, _, _ string) (*model.Payment, error) {
+	// Lookup tests don't drive the dedupe branch; mirror the non-tx
+	// stub with sql.ErrNoRows so any accidental exercise of the
+	// Confirm `!inserted` fallback exits the same way as FindByChannelTxnID.
+	return nil, sql.ErrNoRows
+}
 func (s *stubPaymentRepoLookup) FindPaidByOrderID(_ context.Context, _ string) (*model.Payment, error) {
 	return nil, sql.ErrNoRows
 }
@@ -955,6 +961,11 @@ func (s *stubPaymentRepoList) FindByID(_ context.Context, _ string) (*model.Paym
 	return nil, sql.ErrNoRows
 }
 func (s *stubPaymentRepoList) FindByChannelTxnID(_ context.Context, _, _ string) (*model.Payment, error) {
+	return nil, sql.ErrNoRows
+}
+func (s *stubPaymentRepoList) FindByChannelTxnIDTx(_ context.Context, _ *sqlx.Tx, _, _ string) (*model.Payment, error) {
+	// List-shape tests don't drive the dedupe branch; mirror the
+	// non-tx stub with sql.ErrNoRows.
 	return nil, sql.ErrNoRows
 }
 func (s *stubPaymentRepoList) FindPaidByOrderID(_ context.Context, _ string) (*model.Payment, error) {

@@ -2423,3 +2423,76 @@ func TestConfirm_ConcurrentFallback_NoDeadlock(t *testing.T) {
 		}
 	}
 }
+
+// TestConfirm_ConcurrentPaymentDedupe_NoDeadlock exercises the connection
+// pool fix on the payment dedupe path: pre-fix s.paymentRepo.FindByChannelTxnID
+// would grab a second connection while inside the tx. With 25 concurrent
+// retry Confirms (each hitting dedupe on its own (channel, txn_id)), 25
+// tx connections + 25 second-connection grabs could deadlock. With the
+// fix, dedupe reuses the tx connection via FindByChannelTxnIDTx.
+//
+// Each goroutine runs two Confirms back-to-back against the same
+// (channel, external_txn_id): the first inserts the payment row, the
+// second hits the !inserted dedupe branch — which is the read we care
+// about. Without the tx-bound variant this would deadlock under
+// MaxOpenConns=25 just like the resolveSubExpiry fallback path.
+func TestConfirm_ConcurrentPaymentDedupe_NoDeadlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in -short mode")
+	}
+	db := setupPaymentDB(t)
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	s := newTestPaymentService(t, db)
+
+	const n = 25
+	userIDs := make([]string, n)
+	orderIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		userIDs[i] = seedUser(t, db)
+		orderIDs[i] = seedPaidOrder(t, db, userIDs[i], "monthly", 19.9)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, n*2)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			// First Confirm (fresh insert, exercises the !inserted=false path).
+			if _, err := s.Confirm(ctx, ConfirmInput{
+				OrderID:       orderIDs[i],
+				UserID:        userIDs[i],
+				Channel:       "wechat_pay",
+				ExternalTxnID: fmt.Sprintf("txn-dedupe-%d", i),
+				ExpiresAt:     nil,
+			}); err != nil {
+				errs <- fmt.Errorf("first: %w", err)
+				return
+			}
+			// Second Confirm (dedupe hit — re-read inside the tx).
+			// This is the call site where FindByChannelTxnIDTx replaces
+			// FindByChannelTxnID. Under MaxOpenConns=25, the pre-fix
+			// version would deadlock here; the post-fix version
+			// completes deterministically.
+			if _, err := s.Confirm(ctx, ConfirmInput{
+				OrderID:       orderIDs[i],
+				UserID:        userIDs[i],
+				Channel:       "wechat_pay",
+				ExternalTxnID: fmt.Sprintf("txn-dedupe-%d", i),
+				ExpiresAt:     nil,
+			}); err != nil {
+				errs <- fmt.Errorf("second: %w", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent dedupe Confirm failed: %v", err)
+		}
+	}
+}

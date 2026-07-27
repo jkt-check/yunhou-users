@@ -1454,6 +1454,21 @@ func (s *PaymentService) onDisputeClosed(ctx context.Context, e WebhookEvent) er
 	return nil
 }
 
+// Note: onPaypalRenewalSucceeded does NOT use resolveSubExpiry. The
+// webhook path (onPaymentSucceeded → resolveSubExpiry) and the Confirm
+// path (Confirm → resolveSubExpiry) both fall back to plan.interval_days
+// when no sub_expires_at hint is supplied. PayPal renewal is intentionally
+// different:
+//
+// - WeChat onboarding: sub_expires_at is structurally absent (v3 NATIVE
+//   protocol doesn't carry it); the fallback is the only way to write a
+//   non-NULL expires_at.
+// - PayPal renewal: sub_expires_at is structurally PRESENT (resource.
+//   billing_info.next_billing_time); falling back to plan.interval_days
+//   when it's missing would silently mask a contract drift between
+//   PayPal's product definition and our Plan. The
+//   paypal_renewal_no_expiry_hint audit log lets ops reconcile manually.
+
 // onPaypalRenewalSucceeded handles PAYMENT.SALE.COMPLETED — the renewal
 // charge that PayPal fires automatically when a PayPal subscription
 // auto-renews. We don't have an `orders` row for renewals (the original

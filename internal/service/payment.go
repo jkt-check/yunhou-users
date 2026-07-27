@@ -2035,12 +2035,11 @@ func (s *PaymentService) resolveSubExpiry(ctx context.Context, userID, planID st
 // ErrSubscriptionExpired even though the user just paid (real-world
 // observed in cn-staging 2026-07-23).
 //
-// This matches parseWeChat's behaviour: WeChat's TRANSACTION.SUCCESS
-// resource block also has no sub_expires_at field today, so the real
-// webhook leaves SubExpiresAt nil already. End-to-end threading of a
-// BFF-computed sub_expires_at through the order row is tracked
-// separately — for now, both paths produce the same subscription
-// shape (never-expires).
+// Sub-expiry is computed downstream by onPaymentSucceeded's
+// resolveSubExpiry helper, which falls back to plan.interval_days when
+// no hint is provided. Pre-fix behavior was "never expires"; post-fix
+// behavior is "now() + plan.interval_days*24h" — same shape as the
+// BFF-confirmed Confirm path.
 //
 // `res` is checked for nil to keep the helper safe to call from tests
 // that exercise the failure-shape (QueryOrder returning nil) without

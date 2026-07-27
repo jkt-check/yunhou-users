@@ -456,4 +456,4 @@ PR CI 工作流：每次 push / PR → 跑 `go vet` + `go test -race -cover` + �
 - BFF 接入侧需要：删除「`expires_at` 字段缺席 → 永不过期」的 UI 分支；现在 `expires_at: null` 才表示真正的"永不过期"（仅出现在修复前激活的行上）。
 - PayPal 续费路径策略不变：`next_billing_time` 缺失仍 fail-loud（audit-log `paypal_renewal_no_expiry_hint`），不参与 fallback。
 - 历史 NULL 行不补：见 `migrations/017_sub_expiry_does_not_backfill.sql`。
-- 修复点：`internal/service/payment.go` 新增 `resolveSubExpiry` 助手；`webhook` / `Confirm` / `reconcile` 三个入口均接入；`internal/service/auth.go` 上 `SubscriptionInfo.ExpiresAt` 去掉 `omitempty`。
+- 修复点：`internal/service/payment.go` 新增 `resolveSubExpiry` 助手；`OnWebhook`（覆盖 webhook + reconcile 两条路）与 `Confirm` 两个直路调用点都接入；`internal/service/auth.go` 上 `SubscriptionInfo.ExpiresAt` 去掉 `omitempty`。

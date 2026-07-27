@@ -174,6 +174,16 @@ func (s *sqlxTx) QueryRowID(ctx context.Context, query string, args ...interface
 	return id, nil
 }
 
+// rawSQLXTx returns the underlying transaction for production dbTx values.
+// Test-only fake transactions intentionally return nil; those tests exercise
+// error paths before a tx-bound fallback lookup is needed.
+func rawSQLXTx(tx dbTx) *sqlx.Tx {
+	if wrapped, ok := tx.(*sqlxTx); ok {
+		return wrapped.Tx
+	}
+	return nil
+}
+
 // ============================================================================
 // Order lifecycle
 // ============================================================================
@@ -649,6 +659,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+	txSQLX := rawSQLXTx(tx)
 
 	// Channel mismatch check happens INSIDE the tx with FOR UPDATE on the
 	// existing paid payment row, so a concurrent webhook can't slip a
@@ -714,7 +725,14 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// to ensure sub activation + order update are idempotent.
 		paymentID = existing.ID
 
-		activeSub, sErr := s.subRepo.FindActiveByUserID(ctx, order.UserID)
+		var activeSub *model.Subscription
+		var sErr error
+		if txSQLX != nil {
+			activeSub, sErr = s.subRepo.FindActiveByUserIDTx(ctx, txSQLX, order.UserID)
+		} else {
+			// Fake transactions used by unit tests have no underlying SQL tx.
+			activeSub, sErr = s.subRepo.FindActiveByUserID(ctx, order.UserID)
+		}
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return nil, fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -728,7 +746,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	// ExpiresAt wins; otherwise fall back to plan.interval_days so that
 	// channels whose upstream payload doesn't ship sub_expires_at (real
 	// WeChat v3 NATIVE today) still produce a finite subscription.
-	subExpiry, err := s.resolveSubExpiry(ctx, order.PlanID, in.ExpiresAt, preservedExpiry)
+	subExpiry, err := s.resolveSubExpiry(ctx, txSQLX, order.PlanID, in.ExpiresAt, preservedExpiry)
 	if err != nil {
 		if errors.Is(err, ErrPlanMissingForExpiry) {
 			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
@@ -1062,6 +1080,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+	txSQLX := rawSQLXTx(tx)
 
 	// Find the order. WeChat and Alipay send a channel-side identifier
 	// (out_trade_no, 32-char hex) rather than our UUID, and the
@@ -1170,7 +1189,14 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		}
 		paymentID = existing.ID
 
-		activeSub, sErr := s.subRepo.FindActiveByUserID(ctx, order.UserID)
+		var activeSub *model.Subscription
+		var sErr error
+		if txSQLX != nil {
+			activeSub, sErr = s.subRepo.FindActiveByUserIDTx(ctx, txSQLX, order.UserID)
+		} else {
+			// Fake transactions used by unit tests have no underlying SQL tx.
+			activeSub, sErr = s.subRepo.FindActiveByUserID(ctx, order.UserID)
+		}
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -1185,7 +1211,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// succeed). Re-running the activation UPSERT on a retried event is
 	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
 	// row.
-	subExpiry, err := s.resolveSubExpiry(ctx, order.PlanID, e.SubExpiresAt, preservedExpiry)
+	subExpiry, err := s.resolveSubExpiry(ctx, txSQLX, order.PlanID, e.SubExpiresAt, preservedExpiry)
 	if err != nil {
 		if errors.Is(err, ErrPlanMissingForExpiry) {
 			// Intentional: plan_missing is informational — the payment already
@@ -1987,9 +2013,7 @@ func isPaypalRenewal(eventType string) bool {
 var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 
 // resolveSubExpiry returns the expires_at to write on a subscription
-// activation. Used by both subscription activation paths — Confirm
-// (BFF-confirmed charge) and onPaymentSucceeded (channel webhook) — so
-// the two paths produce the same subscription shape. Priority:
+// activation. Priority:
 //
 //  1. caller-supplied hint (BFF on Confirm; webhook payload on channels
 //     that ship sub_expires_at, e.g. Stripe metadata / PayPal renewal).
@@ -1998,41 +2022,42 @@ var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 //  2. preserved expiry (retry path). When the caller detects that the
 //     current call is a retry of an already-paid payment
 //     (paymentRepo.FindByChannelTxnID returned a row with status='paid'),
-//     the caller pre-fetches the active sub's expires_at and passes it
-//     here. This keeps activation idempotent: a webhook or Confirm
-//     retry doesn't shift the expiry forward. Critical: only the retry
-//     path passes a non-nil preservedExpiry. A fresh order, even for the
-//     same user with an unrelated active sub, must NOT trigger this
-//     branch — that's the cross-order scenario the original user-id
-//     check broke.
+//     the caller pre-fetches the active sub's expires_at (via
+//     subRepo.FindActiveByUserIDTx, sharing this tx's connection) and
+//     passes it here. This keeps activation idempotent: a webhook or
+//     Confirm retry doesn't shift the expiry forward.
 //
 //  3. plan.interval_days fallback. Real WeChat NATIVE v3 doesn't ship
 //     sub_expires_at (verified 2026-07-27), so this fires for every
 //     fresh WeChat charge unless the BFF forwards one via
-//     /payments/orders/:order_id/confirm. Base = time.Now() inside the
-//     calling goroutine so that successive fallback invocations on the
-//     same transaction agree on the reference time (started_at is
-//     Postgres now() and may differ by <1s; not a correctness issue).
-//     plan.interval_days > 0 means fallback applies; the
-//     partial unique index prevents multiple active subs per user, so
-//     we never worry about overwriting an unrelated active row.
+//     /payments/orders/:order_id/confirm. Looked up via
+//     planRepo.FindByIDForShareTx so the read shares the calling tx's
+//     connection (otherwise with MaxOpenConns=25, 25 concurrent
+//     fallback requests can deadlock waiting for a second connection).
 //
 //  4. nil (plan missing OR interval_days == 0). Caller decides: webhook
 //     paths audit-log + write NULL; Confirm path mirrors the same shape.
-//
-// Note: the helper no longer queries subRepo or planRepo when hint or
-// preservedExpiry is set, eliminating the second-connection pool grab
-// in the retry and BFF-hint paths. The fallback path still uses
-// planRepo.FindByID which grabs a second connection; this is a
-// pre-existing issue tracked separately.
-func (s *PaymentService) resolveSubExpiry(ctx context.Context, planID string, hint, preservedExpiry *time.Time) (*time.Time, error) {
+func (s *PaymentService) resolveSubExpiry(
+	ctx context.Context,
+	tx *sqlx.Tx,
+	planID string,
+	hint, preservedExpiry *time.Time,
+) (*time.Time, error) {
 	if hint != nil {
 		return hint, nil
 	}
 	if preservedExpiry != nil {
 		return preservedExpiry, nil
 	}
-	plan, err := s.planRepo.FindByID(ctx, planID)
+	var plan *model.Plan
+	var err error
+	if tx != nil {
+		plan, err = s.planRepo.FindByIDForShareTx(ctx, tx, planID)
+	} else {
+		// Fake dbTx implementations used by unit tests do not expose a real
+		// *sqlx.Tx; production always takes the tx-bound branch above.
+		plan, err = s.planRepo.FindByID(ctx, planID)
+	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPlanMissingForExpiry

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2050,7 +2051,12 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 	s := newTestPaymentService(t, db)
 
 	hint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	got, err := s.resolveSubExpiry(context.Background(), "monthly", &hint, nil)
+	tx, err := db.Beginx()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	got, err := s.resolveSubExpiry(context.Background(), tx, "monthly", &hint, nil)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
@@ -2366,5 +2372,54 @@ func TestConfirm_PlanMissing_AuditLogAndNullExpiry(t *testing.T) {
 	}
 	if auditCount == 0 {
 		t.Error("expected subscription_expiry_plan_missing audit log, got none")
+	}
+}
+
+// TestConfirm_ConcurrentFallback_NoDeadlock exercises the connection-pool fix:
+// with MaxOpenConns=25, before the fix 25 concurrent fallback Confirm calls
+// would deadlock (each holding a tx connection while trying to grab a second
+// for planRepo.FindByID). With the fix, all 25 share the tx connection for
+// the plan lookup, so they complete.
+func TestConfirm_ConcurrentFallback_NoDeadlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in -short mode")
+	}
+	db := setupPaymentDB(t)
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	s := newTestPaymentService(t, db)
+
+	const n = 25
+	userIDs := make([]string, n)
+	orderIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		userIDs[i] = seedUser(t, db)
+		orderIDs[i] = seedPaidOrder(t, db, userIDs[i], "monthly", 19.9)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err := s.Confirm(ctx, ConfirmInput{
+				OrderID:       orderIDs[i],
+				UserID:        userIDs[i],
+				Channel:       "wechat_pay",
+				ExternalTxnID: fmt.Sprintf("txn-conc-%d", i),
+				ExpiresAt:     nil,
+			})
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Confirm failed: %v", err)
+		}
 	}
 }

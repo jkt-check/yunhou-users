@@ -442,6 +442,10 @@ func (m *mockSubscriptionRepo) FindActiveByUserID(_ context.Context, userID stri
 	return s, nil
 }
 
+func (m *mockSubscriptionRepo) FindActiveByUserIDTx(_ context.Context, _ *sqlx.Tx, userID string) (*model.Subscription, error) {
+	return m.FindActiveByUserID(context.Background(), userID)
+}
+
 func (m *mockSubscriptionRepo) FindByID(_ context.Context, id string) (*model.Subscription, error) {
 	if m.findErr != nil {
 		return nil, m.findErr

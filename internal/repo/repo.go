@@ -98,6 +98,12 @@ type AppRepo interface {
 type SubscriptionRepo interface {
 	Create(ctx context.Context, s *model.Subscription) error
 	FindActiveByUserID(ctx context.Context, userID string) (*model.Subscription, error)
+	// FindActiveByUserIDTx is the tx-bound counterpart to FindActiveByUserID.
+	// Use this from inside a transaction so the read shares the tx's
+	// connection (avoiding a second-connection pool grab that can
+	// deadlock under load with MaxOpenConns=25). Mirrors FindActiveByUserID's
+	// "active" filter.
+	FindActiveByUserIDTx(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error)
 	FindByID(ctx context.Context, id string) (*model.Subscription, error)
 	ListByUserID(ctx context.Context, userID string) ([]model.Subscription, error)
 	UpdateStatus(ctx context.Context, id, status string) error
@@ -558,6 +564,19 @@ func (r *subscriptionRepo) Create(ctx context.Context, s *model.Subscription) er
 func (r *subscriptionRepo) FindActiveByUserID(ctx context.Context, userID string) (*model.Subscription, error) {
 	var s model.Subscription
 	err := r.db.GetContext(ctx, &s, `
+		SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// FindActiveByUserIDTx mirrors FindActiveByUserID but uses the supplied
+// transaction's connection. Same SQL, same return shape.
+func (r *subscriptionRepo) FindActiveByUserIDTx(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error) {
+	var s model.Subscription
+	err := tx.GetContext(ctx, &s, `
 		SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'
 	`, userID)
 	if err != nil {

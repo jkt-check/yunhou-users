@@ -260,6 +260,9 @@ func (s *stubSubRepo) FindActiveByUserID(_ context.Context, _ string) (*model.Su
 	}
 	return s.activeSub, nil
 }
+func (s *stubSubRepo) FindActiveByUserIDTx(_ context.Context, _ *sqlx.Tx, userID string) (*model.Subscription, error) {
+	return s.FindActiveByUserID(context.Background(), userID)
+}
 func (s *stubSubRepo) FindByID(_ context.Context, _ string) (*model.Subscription, error) {
 	return nil, nil
 }

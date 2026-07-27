@@ -152,7 +152,7 @@ type SubscriptionInfo struct {
 	PlanID         string     `json:"plan_id"`
 	PlanName       string     `json:"plan_name"`
 	HasAccess      bool       `json:"has_access"`
-	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at"`
 	IsAcceptingNew bool       `json:"is_accepting_new"`
 }
 

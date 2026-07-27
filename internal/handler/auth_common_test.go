@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/url"
 	"strings"
 	"testing"
@@ -102,5 +103,30 @@ func TestRedirectWithErrorFragment_BuildsAuthFailedShape(t *testing.T) {
 	want := "https://bff.example.com/cb#error=auth_failed&reason=user_suspended"
 	if got != want {
 		t.Errorf("got = %q, want %q", got, want)
+	}
+}
+
+// TestLoginResponse_SubscriptionExpiresAt_AlwaysPresent pins the contract
+// that subscription.expires_at serializes as `null` (not absent) when the
+// subscription has no expiry — the BFF relies on the field always being
+// present so it can render the "no expiry" state in the UI.
+func TestLoginResponse_SubscriptionExpiresAt_AlwaysPresent(t *testing.T) {
+	resp := &service.LoginResponse{
+		AccessToken:  "tok",
+		RefreshToken: "rt",
+		User:         service.UserInfo{ID: "u-1"},
+		Subscription: &service.SubscriptionInfo{
+			PlanID:         "monthly",
+			HasAccess:      true,
+			IsAcceptingNew: true,
+			ExpiresAt:      nil,
+		},
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"expires_at":null`) {
+		t.Errorf(`expected "expires_at":null in JSON, got: %s`, raw)
 	}
 }

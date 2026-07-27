@@ -1779,7 +1779,7 @@ func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID strin
 	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET
 			plan_id = $1,
-			started_at = now(),
+			started_at = COALESCE(started_at, now()),
 			expires_at = $2,
 			status = 'active'
 		WHERE id = (
@@ -2089,6 +2089,14 @@ func (s *PaymentService) resolveSubExpiry(
 	}
 	if plan.IntervalDays <= 0 {
 		return nil, nil
+	}
+	// Cap at ~290 years to keep the time.Duration multiply well below
+	// int64 nanosecond overflow. Plan.IntervalDays is operator-controlled;
+	// a defensive check prevents a typo from turning into a wildly past
+	// or future expires_at.
+	const maxIntervalDays = 365 * 290
+	if plan.IntervalDays > maxIntervalDays {
+		return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, plan.IntervalDays, maxIntervalDays)
 	}
 	t := time.Now().Add(time.Duration(plan.IntervalDays) * 24 * time.Hour)
 	return &t, nil

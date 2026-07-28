@@ -580,6 +580,39 @@ func TestConfirm_LifetimeOrderBlockedAfterUpgrade(t *testing.T) {
 	}
 }
 
+// TestConfirm_HintSurvivesPlanDeletedMidPayment (review N1): the plan
+// row is deleted between order creation and payment, AND the caller
+// supplies a hint. The downgrade guard can't compare intervals without
+// the plan row — the hint must be forwarded (pre-rollover behavior for
+// this edge) instead of being discarded into the plan-missing branch.
+func TestConfirm_HintSurvivesPlanDeletedMidPayment(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	seedActiveSub(t, db, uid, "monthly", time.Now().Add(10*24*time.Hour))
+
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	// Plan deleted mid-payment (operator mistake / extreme race).
+	if _, err := db.ExecContext(context.Background(),
+		`DELETE FROM plans WHERE id = 'yearly'`); err != nil {
+		t.Fatalf("delete plan: %v", err)
+	}
+
+	hint := time.Now().Add(400 * 24 * time.Hour).UTC().Truncate(time.Second)
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-hint-survives",
+		ExpiresAt: &hint,
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	_, expiresAt := readSub(t, db, uid)
+	withinSeconds(t, expiresAt, hint, time.Second)
+}
+
 // TestPaymentService_CreateOrder_StaleActiveSubAllowsRenewal exercises
 // the cn-staging 2026-07-23 follow-up fix: a row with status='active'
 // but expires_at in the past (e.g. from the pre-fix reconcile bug that

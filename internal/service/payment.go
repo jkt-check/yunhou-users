@@ -2318,6 +2318,15 @@ func (s *PaymentService) resolveSubExpiry(
 	if existing != nil && (existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now())) {
 		p, err := loadPlan()
 		if err != nil {
+			// The plan row was deleted mid-payment AND the caller
+			// supplied a hint: the guard can't compare intervals without
+			// the plan row, so fall back to the hint rather than
+			// discarding it (pre-rollover behavior for this edge). The
+			// no-hint shape still returns ErrPlanMissingForExpiry and
+			// the call sites audit + write NULL, as before.
+			if errors.Is(err, ErrPlanMissingForExpiry) && candidate != nil {
+				return candidate, nil
+			}
 			return nil, err
 		}
 		oldPlan, oErr := s.txLookupPlan(ctx, tx, existing.PlanID)

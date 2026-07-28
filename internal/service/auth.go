@@ -281,11 +281,11 @@ func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInf
 	return s.userRepo.FindByID(ctx, userID)
 }
 
-// TrialPlanID is the catalog id of the free-trial plan row seeded by
+// trialPlanID is the catalog id of the free-trial plan row seeded by
 // migration 018_trial_plan.sql. The row is is_active (so has_access
 // computes true) but accepting_new_subscriptions=false — the trial can
 // only be granted here, never bought.
-const TrialPlanID = "trial"
+const trialPlanID = "trial"
 
 // grantTrialSubscription inserts the active trial subscription row for a
 // brand-new user. Best-effort by design: every failure is logged and
@@ -294,13 +294,17 @@ const TrialPlanID = "trial"
 // duplicate grant into a DB-level no-op (unique violation, logged here).
 // There is deliberately no backfill for pre-existing users (spec: 只发新用户).
 func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string) {
-	plan, err := s.planRepo.FindByID(ctx, TrialPlanID)
+	plan, err := s.planRepo.FindByID(ctx, trialPlanID)
 	if err != nil {
-		log.Printf("trial grant: find plan %q: %v (user %s)", TrialPlanID, err, userID)
+		log.Printf("trial grant: find plan %q: %v (user %s)", trialPlanID, err, userID)
+		return
+	}
+	if !plan.IsActive {
+		log.Printf("trial grant: plan %q is inactive, skipping (user %s)", trialPlanID, userID)
 		return
 	}
 	if plan.TrialDays <= 0 {
-		log.Printf("trial grant: plan %q has trial_days=%d, skipping (user %s)", TrialPlanID, plan.TrialDays, userID)
+		log.Printf("trial grant: plan %q has trial_days=%d, skipping (user %s)", trialPlanID, plan.TrialDays, userID)
 		return
 	}
 	now := time.Now()

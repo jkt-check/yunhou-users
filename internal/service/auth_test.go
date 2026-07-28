@@ -2435,6 +2435,25 @@ func TestAuthService_LoginWithProfile_TrialGrant(t *testing.T) {
 		}
 	})
 
+	t.Run("inactive trial plan skips the grant but login succeeds", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		pr.plans["trial"] = &model.Plan{
+			ID: "trial", Name: "Free Trial", Apps: []string{"yundian"},
+			IsActive: false, AcceptingNewSubscriptions: false, TrialDays: 7,
+		}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		if _, err := login(svc, "gh-inactive"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(sr.subs) != 0 {
+			t.Errorf("inactive trial plan must not grant, got %d rows", len(sr.subs))
+		}
+	})
+
 	t.Run("subscription insert failure does not block login", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()

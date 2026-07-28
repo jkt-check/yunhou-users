@@ -294,6 +294,14 @@ const trialPlanID = "trial"
 // duplicate grant into a DB-level no-op (unique violation, logged here).
 // There is deliberately no backfill for pre-existing users (spec: 只发新用户).
 func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string) {
+	// The grant must outlive the request: a client disconnect mid-login
+	// (mobile norm) cancels the request ctx and would silently cost the
+	// user their only trial — grants are never retried (spec: 只发新用户).
+	// Detach from cancellation, keep a short timeout so a hung DB can't
+	// leak a goroutine.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
 	plan, err := s.planRepo.FindByID(ctx, trialPlanID)
 	if err != nil {
 		log.Printf("trial grant: find plan %q: %v (user %s)", trialPlanID, err, userID)

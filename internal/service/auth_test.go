@@ -2454,6 +2454,33 @@ func TestAuthService_LoginWithProfile_TrialGrant(t *testing.T) {
 		}
 	})
 
+	t.Run("cancelled request ctx does not cancel the grant", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		seedTrialPlan(pr)
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		// The plain mocks ignore ctx, so wrap plan/sub repos with
+		// ctx-checking decorators — without them this test would pass
+		// even if grantTrialSubscription used the request ctx directly.
+		svc := NewAuthService(ur, sir, &ctxCheckingPlanRepo{pr}, &ctxCheckingSubscriptionRepo{sr}, ssr, ar, tokenSvc)
+
+		// A client disconnect mid-first-login cancels the request ctx.
+		// The grant detaches from that cancellation (grants are never
+		// retried), so the row must still be inserted.
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		svc.grantTrialSubscription(cancelled, "user-disconnect")
+
+		sub := sr.byUserID["user-disconnect"]
+		if sub == nil {
+			t.Fatal("grant must survive request cancellation — the user has no other chance to receive a trial")
+		}
+		if sub.PlanID != "trial" || sub.Status != "active" {
+			t.Errorf("sub = %+v, want active trial", sub)
+		}
+	})
+
 	t.Run("subscription insert failure does not block login", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
@@ -2471,4 +2498,28 @@ func TestAuthService_LoginWithProfile_TrialGrant(t *testing.T) {
 			t.Error("expected tokens even when the trial grant fails")
 		}
 	})
+}
+
+// ctxCheckingPlanRepo / ctxCheckingSubscriptionRepo decorate the default
+// mocks so FindByID/Create honour context cancellation. The plain mocks
+// ignore ctx, which would let "cancelled request ctx does not cancel the
+// grant" pass even without the detach in grantTrialSubscription — these
+// wrappers make that test actually pin the behaviour (same pattern as
+// storeFirstIdentityRepo above).
+type ctxCheckingPlanRepo struct{ *mockPlanRepo }
+
+func (r *ctxCheckingPlanRepo) FindByID(ctx context.Context, id string) (*model.Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return r.mockPlanRepo.FindByID(ctx, id)
+}
+
+type ctxCheckingSubscriptionRepo struct{ *mockSubscriptionRepo }
+
+func (r *ctxCheckingSubscriptionRepo) Create(ctx context.Context, s *model.Subscription) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.mockSubscriptionRepo.Create(ctx, s)
 }

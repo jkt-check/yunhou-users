@@ -22,7 +22,7 @@
 
 ## 设计
 
-### 1. 数据层（yunhou-users，新 migration 017）
+### 1. 数据层（yunhou-users，新 migration 018 —— 017 已被 017_sub_expiry_does_not_backfill 占用）
 
 ```sql
 -- 预检查：已存在 id='trial' 行则 abort（风格对齐 014）
@@ -41,7 +41,7 @@ VALUES ('trial', 'Free Trial', 0, 0, '{yundian,yundash}',
 
 ### 2. 发放点（yunhou-users `internal/service/auth.go`）
 
-`LoginWithProfile` 中 `getOrCreateUser` 返回"新建"时（仅新建分支，不发存量用户）：
+`LoginWithProfile` 中 `getOrCreateUser` 返回"新建"时（仅新建分支，不发存量用户；底层 `resolveOrCreateUser` 已返回 `(userID, created bool, err)`，created 标志直接可用，email-merge 的老用户 created=false 不会误发）：
 
 1. 用户行创建成功后，作为**独立步骤**（不与用户创建同事务）发放：
    `INSERT INTO subscriptions (user_id, plan_id, status, started_at, expires_at)
@@ -101,3 +101,5 @@ VALUES ('trial', 'Free Trial', 0, 0, '{yundian,yundash}',
 
 - 发放失败无自动重试（无补发分支的代价，用户已接受）；靠 error 日志发现。
 - 用户删号重注册无防护（当前无删号功能；若未来加删号，需考虑 trial 防滥用——同一微信 unionid 重建会再得试用）。
+- **PayPal 渠道**：试用中购买 PayPal 订阅走独立激活路径（onPaypalRenewalSucceeded / BILLING.SUBSCRIPTION.ACTIVATED，不经 resolveSubExpiry），试用剩余天数**不结转**到 PayPal 订阅——无资损（试用免费），仅少送几天，cn 微信主渠道有结转，intl 此差异可接受。
+- **并发首次登录**：同一新用户两个并发 OAuth callback，只有一个走到 created=true 分支发放，另一个走已有用户分支不会重复发（`idx_subscriptions_user_active` 唯一索引兜底）；若恰好获胜方发放步骤失败，退化为通用"发放失败"边界。

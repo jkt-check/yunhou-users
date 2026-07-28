@@ -296,6 +296,8 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan currency does not match order currency"})
 	case errors.Is(err, service.ErrUserHasActiveSub):
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
+	case errors.Is(err, service.ErrPlanDowngrade):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "downgrade to a shorter billing cycle is not allowed with an active subscription"})
 	case errors.Is(err, service.ErrOrderNotFound), errors.Is(err, service.ErrPaymentNotFound), errors.Is(err, service.ErrRefundNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "not found"})
 	case errors.Is(err, service.ErrOrderNotPending):

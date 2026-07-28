@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/yunhou/users/internal/model"
 )
 
 // mockResult satisfies sql.Result for the fake txs.
@@ -27,9 +28,21 @@ type fakeTx struct {
 	execErr error
 	rowID   string
 	rowErr  error
+	// order, when set, is copied into *model.Order destinations in
+	// GetContext. Tests that drive onPaymentSucceeded far enough for the
+	// service to use order fields (e.g. resolveSubExpiry's rollover
+	// lookup by order.UserID) need a real user id on the fetched order;
+	// the zero-value struct the no-op GetContext used to leave behind
+	// makes those lookups fail on the real DB.
+	order *model.Order
 }
 
-func (f *fakeTx) GetContext(_ context.Context, _ interface{}, _ string, _ ...interface{}) error {
+func (f *fakeTx) GetContext(_ context.Context, dest interface{}, _ string, _ ...interface{}) error {
+	if f.order != nil {
+		if o, ok := dest.(*model.Order); ok {
+			*o = *f.order
+		}
+	}
 	return f.getErr
 }
 func (f *fakeTx) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql.Result, error) {
@@ -76,12 +89,15 @@ func (c *countingFakeTx) NamedExecContext(_ context.Context, _ string, _ interfa
 	return mockResult{}, nil
 }
 
-func (c *countingFakeTx) GetContext(_ context.Context, _ interface{}, _ string, _ ...interface{}) error {
+func (c *countingFakeTx) GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
 	c.getCallCount++
 	if err, ok := c.getErrsAtCall[c.getCallCount]; ok {
 		return err
 	}
-	return nil
+	// Delegate so the embedded fakeTx's order-fill (and getErr) still
+	// run — the counting wrapper used to shadow it entirely, leaving
+	// fetched orders zero-valued.
+	return c.fakeTx.GetContext(ctx, dest, query, args...)
 }
 
 // ptrTime returns a *time.Time for use in test fixtures.
@@ -194,7 +210,7 @@ func TestOnPaymentSucceeded_ActivateSubError(t *testing.T) {
 	txnID := "pi-ase-" + mustNewUUID()[:8]
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &countingFakeTx{
-			fakeTx: &fakeTx{rowID: txnID},
+			fakeTx: &fakeTx{rowID: txnID, order: order},
 			execErrsAtCall: map[int]error{
 				2: errors.New("synthetic activate sub failure"),
 			},
@@ -229,7 +245,7 @@ func TestOnPaymentSucceeded_UpdateOrderError(t *testing.T) {
 	txnID := "pi-uoe-" + mustNewUUID()[:8]
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &countingFakeTx{
-			fakeTx: &fakeTx{rowID: txnID},
+			fakeTx: &fakeTx{rowID: txnID, order: order},
 			execErrsAtCall: map[int]error{
 				2: errors.New("synthetic update order failure"),
 			},

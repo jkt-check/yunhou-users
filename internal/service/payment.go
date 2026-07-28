@@ -41,6 +41,14 @@ var ErrWechatPayNotConfigured = errors.New("wechat pay not configured on this de
 // audit-log this and fall back to the existing "NULL = never expires" branch.
 var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 
+// ErrDowngradeActivationBlocked is returned by resolveSubExpiry when a
+// paid order would REPLACE an unexpired active subscription with a
+// shorter-interval plan (e.g. a stale monthly QR paid after the user
+// upgraded to yearly). The payment is still honored — the order goes
+// paid and ops refunds manually — but the subscription is left
+// untouched and the call sites audit-log "downgrade_activation_blocked".
+var ErrDowngradeActivationBlocked = errors.New("activation blocked: would downgrade an active longer-cycle subscription")
+
 // channelRequiredCurrency describes the settlement currency required by the
 // channels that only support one currency in this service. Plans remain the
 // source of truth for the order's persisted currency. Stripe and Alipay are
@@ -266,8 +274,17 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// gets a clean 409 instead. The DB invariant IS the primitive — this is
 	// just a friendly surface for it. If the product later allows multiple
 	// active rows, both this check and the partial unique index need to change
-	// together (yunhou-users stays primitive — upgrade flow / re-buy semantics
-	// belong to the frontend).
+	// together.
+	//
+	// Repurchase rule (2026-07-28): an active, unexpired subscription no
+	// longer blanket-rejects new orders. With rollover at activation
+	// (resolveSubExpiry), a same-plan renewal extends from the current
+	// expiry and an upgrade to a longer-interval plan carries the
+	// remaining days over — both are fair to the user, so both are
+	// allowed. Only a DOWNGRADE to a shorter-interval plan is rejected
+	// (ErrPlanDowngrade → 409). resolveSubExpiry blocks the mirror-image
+	// race at activation time (a stale shorter-cycle order paid after an
+	// upgrade) with ErrDowngradeActivationBlocked.
 	//
 	// "active" here means status='active' AND the sub has not lapsed
 	// (expires_at NULL or future). A stale row (status='active' with
@@ -279,7 +296,13 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// 2026-07-23 login-decouple fix let them log in.
 	if existing, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
 		if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
-			return nil, ErrUserHasActiveSub
+			allowed, aerr := s.repurchaseAllowed(ctx, existing.PlanID, planID)
+			if aerr != nil {
+				return nil, aerr
+			}
+			if !allowed {
+				return nil, ErrPlanDowngrade
+			}
 		}
 		// stale: status='active' but expires_at < now(). Allow order
 		// creation — activateSubscriptionOnTx will update this row.
@@ -364,6 +387,35 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	}
 
 	return order, nil
+}
+
+// repurchaseAllowed reports whether a user whose active, unexpired
+// subscription is on currentPlanID may create an order for
+// requestedPlanID. Same-or-longer billing cycle → allowed: a same-plan
+// renewal rolls over at activation, and a longer-cycle upgrade carries
+// the remaining days over (both in resolveSubExpiry). Shorter cycle →
+// downgrade, rejected with ErrPlanDowngrade by the caller.
+//
+// Two non-comparable cases defer rather than block: an unknown
+// requested plan is left to the eligibility tx's own validation (so the
+// caller gets the proper plan error, not a misleading downgrade one),
+// and a retired/legacy current plan (no plans row) allows the purchase.
+func (s *PaymentService) repurchaseAllowed(ctx context.Context, currentPlanID, requestedPlanID string) (bool, error) {
+	requested, err := s.planRepo.FindByID(ctx, requestedPlanID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("find requested plan: %w", err)
+	}
+	current, err := s.planRepo.FindByID(ctx, currentPlanID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("find current plan: %w", err)
+	}
+	return requested.IntervalDays >= current.IntervalDays, nil
 }
 
 // CancelOrder transitions a pending order to cancelled. Returns ErrOrderNotPending
@@ -774,6 +826,14 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	// fresh order does not enter this branch — the cross-order scenario
 	// the original user-id check broke.
 	var preservedExpiry *time.Time
+	// downgradeRetry mirrors the first-delivery downgrade guard onto
+	// dedupe retries: preservedExpiry short-circuits resolveSubExpiry
+	// BEFORE the downgrade comparison, so without this check a retry of
+	// a downgrade-blocked payment (Confirm + webhook double delivery is
+	// the norm) would sail straight into activateSubscriptionOnTx and
+	// overwrite the longer-cycle sub's plan_id — silently undoing the
+	// block the first delivery applied.
+	downgradeRetry := false
 	if !inserted {
 		// (channel, external_txn_id) dedupe hit — the row already exists.
 		// Re-read it; if it's paid we're done (idempotent). If it's
@@ -802,6 +862,13 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		}
 		if activeSub != nil && activeSub.ExpiresAt != nil && activeSub.ExpiresAt.After(time.Now()) {
 			preservedExpiry = activeSub.ExpiresAt
+			// Plan mismatch on a retry means the first delivery did NOT
+			// activate this order's plan (a successful activation would
+			// have stamped order.PlanID onto the sub) — i.e. it was
+			// downgrade-blocked. Block the retry too.
+			if activeSub.PlanID != order.PlanID {
+				downgradeRetry = true
+			}
 		}
 	}
 
@@ -809,24 +876,56 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	// expires_at resolution mirrors the webhook path: a BFF-supplied
 	// ExpiresAt wins; otherwise fall back to plan.interval_days so that
 	// channels whose upstream payload doesn't ship sub_expires_at (real
-	// WeChat v3 NATIVE today) still produce a finite subscription.
-	subExpiry, err := s.resolveSubExpiry(ctx, txSQLX, order.PlanID, in.ExpiresAt, preservedExpiry)
-	if err != nil {
-		if errors.Is(err, ErrPlanMissingForExpiry) {
-			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
-				fmt.Sprintf("plan:%s", order.PlanID),
-				[]string{"confirm", "expiry_fallback", "plan_missing"},
-				map[string]any{
-					"order_id": order.ID,
-					"channel":  in.Channel,
-				})
-		} else {
-			return nil, fmt.Errorf("resolve sub expiry: %w", err)
-		}
+	// WeChat v3 NATIVE today) still produce a finite subscription. A
+	// first activation replacing an unexpired sub rolls the remaining
+	// days over (resolveSubExpiry branch 3).
+	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, in.ExpiresAt, preservedExpiry)
+	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
+	if downgradeRetry {
+		// The first delivery wrote its own audit row when it blocked;
+		// log the retry too so the repeat delivery is visible rather
+		// than silently no-op'd.
+		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+			fmt.Sprintf("order:%s", order.ID),
+			[]string{"confirm", "downgrade", "activation_blocked", "retry"},
+			map[string]any{
+				"order_id": order.ID,
+				"channel":  in.Channel,
+				"plan_id":  order.PlanID,
+			})
 	}
-	activated, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry)
-	if err != nil {
-		return nil, fmt.Errorf("activate sub: %w", err)
+	switch {
+	case rerr == nil:
+	case errors.Is(rerr, ErrPlanMissingForExpiry):
+		_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
+			fmt.Sprintf("plan:%s", order.PlanID),
+			[]string{"confirm", "expiry_fallback", "plan_missing"},
+			map[string]any{
+				"order_id": order.ID,
+				"channel":  in.Channel,
+			})
+	case downgradeBlocked:
+		// A stale shorter-cycle order (e.g. an old monthly QR) was paid
+		// after the user upgraded. Honor the payment — the order goes
+		// paid below and ops refunds manually — but leave the
+		// longer-cycle subscription untouched.
+		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+			fmt.Sprintf("order:%s", order.ID),
+			[]string{"confirm", "downgrade", "activation_blocked"},
+			map[string]any{
+				"order_id": order.ID,
+				"channel":  in.Channel,
+				"plan_id":  order.PlanID,
+			})
+	default:
+		return nil, fmt.Errorf("resolve sub expiry: %w", rerr)
+	}
+	activated := false
+	if !downgradeBlocked {
+		activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry)
+		if err != nil {
+			return nil, fmt.Errorf("activate sub: %w", err)
+		}
 	}
 
 	// Update order to paid (covers pending/expired/cancelled per §5.3).
@@ -1235,6 +1334,14 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// even for the same user, must NOT trigger this branch — that's
 	// the cross-order scenario the original user-id check broke.
 	var preservedExpiry *time.Time
+	// downgradeRetry mirrors the first-delivery downgrade guard onto
+	// dedupe retries: preservedExpiry short-circuits resolveSubExpiry
+	// BEFORE the downgrade comparison, so without this check a retry of
+	// a downgrade-blocked payment (Confirm + webhook double delivery is
+	// the norm) would sail straight into activateSubscriptionOnTx and
+	// overwrite the longer-cycle sub's plan_id — silently undoing the
+	// block the first delivery applied.
+	downgradeRetry := false
 	if !inserted {
 		// Dedupe hit — payment row already exists. Re-read to know whether
 		// it's paid (no-op) or in a state we need to escalate.
@@ -1266,6 +1373,13 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		}
 		if activeSub != nil && activeSub.ExpiresAt != nil && activeSub.ExpiresAt.After(time.Now()) {
 			preservedExpiry = activeSub.ExpiresAt
+			// Plan mismatch on a retry means the first delivery did NOT
+			// activate this order's plan (a successful activation would
+			// have stamped order.PlanID onto the sub) — i.e. it was
+			// downgrade-blocked. Block the retry too.
+			if activeSub.PlanID != order.PlanID {
+				downgradeRetry = true
+			}
 		}
 	}
 
@@ -1275,26 +1389,57 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// succeed). Re-running the activation UPSERT on a retried event is
 	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
 	// row.
-	subExpiry, err := s.resolveSubExpiry(ctx, txSQLX, order.PlanID, e.SubExpiresAt, preservedExpiry)
-	if err != nil {
-		if errors.Is(err, ErrPlanMissingForExpiry) {
-			// Intentional: plan_missing is informational — the payment already
-			// succeeded, so we silently audit and let NULL fall through instead
-			// of failing the activation.
-			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
-				fmt.Sprintf("plan:%s", order.PlanID),
-				[]string{"webhook", "expiry_fallback", "plan_missing"},
-				map[string]any{
-					"order_id": order.ID,
-					"channel":  e.Channel,
-					"event_id": e.EventID,
-				})
-		} else {
-			return fmt.Errorf("resolve sub expiry: %w", err)
-		}
+	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, e.SubExpiresAt, preservedExpiry)
+	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
+	if downgradeRetry {
+		// The first delivery wrote its own audit row when it blocked;
+		// log the retry too so the repeat delivery is visible rather
+		// than silently no-op'd.
+		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+			fmt.Sprintf("order:%s", order.ID),
+			[]string{"webhook", "downgrade", "activation_blocked", "retry"},
+			map[string]any{
+				"order_id": order.ID,
+				"channel":  e.Channel,
+				"event_id": e.EventID,
+				"plan_id":  order.PlanID,
+			})
 	}
-	if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry); err != nil {
-		return fmt.Errorf("activate sub: %w", err)
+	switch {
+	case rerr == nil:
+	case errors.Is(rerr, ErrPlanMissingForExpiry):
+		// Intentional: plan_missing is informational — the payment already
+		// succeeded, so we silently audit and let NULL fall through instead
+		// of failing the activation.
+		_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
+			fmt.Sprintf("plan:%s", order.PlanID),
+			[]string{"webhook", "expiry_fallback", "plan_missing"},
+			map[string]any{
+				"order_id": order.ID,
+				"channel":  e.Channel,
+				"event_id": e.EventID,
+			})
+	case downgradeBlocked:
+		// A stale shorter-cycle order (e.g. an old monthly QR) was paid
+		// after the user upgraded. Honor the payment — the order goes
+		// paid below and ops refunds manually — but leave the
+		// longer-cycle subscription untouched.
+		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+			fmt.Sprintf("order:%s", order.ID),
+			[]string{"webhook", "downgrade", "activation_blocked"},
+			map[string]any{
+				"order_id": order.ID,
+				"channel":  e.Channel,
+				"event_id": e.EventID,
+				"plan_id":  order.PlanID,
+			})
+	default:
+		return fmt.Errorf("resolve sub expiry: %w", rerr)
+	}
+	if !downgradeBlocked {
+		if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry); err != nil {
+			return fmt.Errorf("activate sub: %w", err)
+		}
 	}
 
 	// PayPal: stamp the PayPal subscription ID on the active row so renewal
@@ -2074,19 +2219,34 @@ func isPaypalRenewal(eventType string) bool {
 // resolveSubExpiry returns the expires_at to write on a subscription
 // activation. Priority:
 //
-//  1. caller-supplied hint (BFF on Confirm; webhook payload on channels
-//     that ship sub_expires_at, e.g. Stripe metadata / PayPal renewal).
-//     nil = no hint, fall through.
-//
-//  2. preserved expiry (retry path). When the caller detects that the
+//  1. preserved expiry (retry path). When the caller detects that the
 //     current call is a retry of an already-paid payment
 //     (paymentRepo.FindByChannelTxnID returned a row with status='paid'),
 //     the caller pre-fetches the active sub's expires_at (via
 //     subRepo.FindActiveByUserIDTx, sharing this tx's connection) and
 //     passes it here. This keeps activation idempotent: a webhook or
-//     Confirm retry doesn't shift the expiry forward.
+//     Confirm retry doesn't shift the expiry forward — and doesn't
+//     double-apply the rollover below. Preserved wins over the hint:
+//     the first activation already folded the hint (and any rollover)
+//     into the stored value, so re-forwarding a fresh hint would
+//     shorten or shift an already-extended sub.
 //
-//  3. plan.interval_days fallback. Real WeChat NATIVE v3 doesn't ship
+//  2. caller-supplied hint (BFF on Confirm; webhook payload on channels
+//     that ship sub_expires_at, e.g. Stripe metadata / PayPal renewal).
+//     nil = no hint, fall through.
+//
+//  3. rollover (2026-07-28 upgrade/renewal rule). When this activation
+//     REPLACES an unexpired active subscription, the remaining days
+//     carry over: the new expiry extends from the OLD expires_at, not
+//     from now(). Applies to same-plan renewal and longer-cycle
+//     upgrades — CreateOrder's repurchase rule already limits order
+//     creation to those two. A shorter-cycle replacement is a
+//     downgrade and fails with ErrDowngradeActivationBlocked: the
+//     payment is still honored (order goes paid, ops refunds), but the
+//     subscription is left untouched. A missing current-plan row
+//     (retired plan) can't be compared and is treated as non-downgrade.
+//
+//  4. plan.interval_days fallback. Real WeChat NATIVE v3 doesn't ship
 //     sub_expires_at (verified 2026-07-27), so this fires for every
 //     fresh WeChat charge unless the BFF forwards one via
 //     /payments/orders/:order_id/confirm. Looked up via
@@ -2094,41 +2254,112 @@ func isPaypalRenewal(eventType string) bool {
 //     connection (otherwise with MaxOpenConns=25, 25 concurrent
 //     fallback requests can deadlock waiting for a second connection).
 //
-//  4. nil (plan missing OR interval_days == 0). Caller decides: webhook
+//  5. nil (plan missing OR interval_days == 0). Caller decides: webhook
 //     paths audit-log + write NULL; Confirm path mirrors the same shape.
 func (s *PaymentService) resolveSubExpiry(
 	ctx context.Context,
 	tx *sqlx.Tx,
-	planID string,
+	userID, planID string,
 	hint, preservedExpiry *time.Time,
 ) (*time.Time, error) {
-	if hint != nil {
-		return hint, nil
-	}
 	if preservedExpiry != nil {
 		return preservedExpiry, nil
 	}
-	var plan *model.Plan
-	var err error
-	plan, err = s.txLookupPlan(ctx, tx, planID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrPlanMissingForExpiry
-		}
-		return nil, fmt.Errorf("find plan for expiry fallback: %w", err)
-	}
-	if plan.IntervalDays <= 0 {
-		return nil, nil
-	}
+
 	// Cap at ~290 years to keep the time.Duration multiply well below
 	// int64 nanosecond overflow. Plan.IntervalDays is operator-controlled;
 	// a defensive check prevents a typo from turning into a wildly past
 	// or future expires_at.
 	const maxIntervalDays = 365 * 290
-	if plan.IntervalDays > maxIntervalDays {
-		return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, plan.IntervalDays, maxIntervalDays)
+
+	// The new plan row is loaded lazily and at most once: the fallback
+	// branch needs its interval, and the rollover branch needs it for
+	// the downgrade comparison. The hint-only path with no active sub
+	// keeps its historical plan-free semantics (TestResolveSubExpiry_
+	// HintForwarded).
+	var plan *model.Plan
+	var planErr error
+	planLoaded := false
+	loadPlan := func() (*model.Plan, error) {
+		if planLoaded {
+			return plan, planErr
+		}
+		planLoaded = true
+		p, err := s.txLookupPlan(ctx, tx, planID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				planErr = ErrPlanMissingForExpiry
+			} else {
+				planErr = fmt.Errorf("find plan for expiry fallback: %w", err)
+			}
+			return nil, planErr
+		}
+		plan = p
+		return plan, nil
 	}
-	t := time.Now().Add(time.Duration(plan.IntervalDays) * 24 * time.Hour)
+
+	var candidate *time.Time
+	if hint != nil {
+		c := *hint
+		candidate = &c
+	}
+
+	existing, sErr := s.txLookupActiveSubscription(ctx, tx, userID)
+	if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
+		return nil, fmt.Errorf("find active sub for rollover: %w", sErr)
+	}
+	// The downgrade guard covers every replacement of an UNEXPIRED sub —
+	// including the two edge shapes that carry no rollable date:
+	// interval_days=0 plans (lifetime/free; 0 is the SMALLEST interval
+	// here, so a stale lifetime order paid after an upgrade is blocked
+	// by the same comparison) and expires_at=NULL rows (never-expire).
+	// Rollover itself needs a concrete old expires_at AND a positive
+	// new interval; anything else just skips the extension.
+	if existing != nil && (existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now())) {
+		p, err := loadPlan()
+		if err != nil {
+			return nil, err
+		}
+		oldPlan, oErr := s.txLookupPlan(ctx, tx, existing.PlanID)
+		if oErr != nil && !errors.Is(oErr, sql.ErrNoRows) {
+			return nil, fmt.Errorf("find current plan for rollover: %w", oErr)
+		}
+		if oldPlan != nil && oldPlan.IntervalDays > p.IntervalDays {
+			return nil, ErrDowngradeActivationBlocked
+		}
+		if existing.ExpiresAt != nil && p.IntervalDays > 0 {
+			if p.IntervalDays > maxIntervalDays {
+				return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, p.IntervalDays, maxIntervalDays)
+			}
+			// max(): a hint that already sits beyond the rolled value
+			// still wins. Note this intentionally prefers the rolled
+			// value over a same-plan renewal hint (e.g. a BFF quote for
+			// a renewal Confirm) — "extend the current expiry" is the
+			// product rule; the channel-side billing anchor (PayPal
+			// renewals run their own onPaypalRenewalSucceeded path and
+			// never reach here) is unaffected.
+			rolled := existing.ExpiresAt.Add(time.Duration(p.IntervalDays) * 24 * time.Hour)
+			if candidate == nil || rolled.After(*candidate) {
+				candidate = &rolled
+			}
+		}
+	}
+
+	if candidate != nil {
+		return candidate, nil
+	}
+
+	p, err := loadPlan()
+	if err != nil {
+		return nil, err
+	}
+	if p.IntervalDays <= 0 {
+		return nil, nil
+	}
+	if p.IntervalDays > maxIntervalDays {
+		return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, p.IntervalDays, maxIntervalDays)
+	}
+	t := time.Now().Add(time.Duration(p.IntervalDays) * 24 * time.Hour)
 	return &t, nil
 }
 

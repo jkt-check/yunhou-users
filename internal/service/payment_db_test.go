@@ -46,7 +46,8 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 			t.Fatalf("wipe %s: %v", tbl, err)
 		}
 	}
-	// Plans: free and monthly.
+	// Plans: free, monthly and yearly (yearly backs the repurchase-rule
+	// tests — upgrade allowed, downgrade rejected).
 	for _, p := range []struct {
 		id, name string
 		price    float64
@@ -55,6 +56,7 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 	}{
 		{"free", "Free", 0, 0, []string{"yundian"}},
 		{"monthly", "Monthly", 19.9, 30, []string{"yundian", "yundash"}},
+		{"yearly", "Yearly", 199.9, 365, []string{"yundian", "yundash"}},
 	} {
 		_, err := db.ExecContext(context.Background(), `
 			INSERT INTO plans (id, name, price, interval_days, apps)
@@ -160,7 +162,12 @@ func TestPaymentService_CreateOrder_PlanInactive(t *testing.T) {
 	}
 }
 
-func TestPaymentService_CreateOrder_UserHasActiveSub(t *testing.T) {
+// TestPaymentService_CreateOrder_SamePlanRenewalAllowed covers the
+// 2026-07-28 repurchase rule: an active, unexpired subscription no
+// longer blanket-rejects new orders. A same-plan order is a renewal —
+// activation rolls the remaining days over (covered by the
+// Confirm_Rollover tests) — so it is allowed through.
+func TestPaymentService_CreateOrder_SamePlanRenewalAllowed(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
@@ -174,10 +181,402 @@ func TestPaymentService_CreateOrder_UserHasActiveSub(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
-	// Second CreateOrder — user already has an active sub.
+	// Second CreateOrder for the SAME plan — renewal, allowed.
+	if _, err = svc.CreateOrder(context.Background(), uid, "monthly", "stripe"); err != nil {
+		t.Errorf("same-plan renewal must be allowed (2026-07-28 repurchase rule); got %v", err)
+	}
+}
+
+// TestPaymentService_CreateOrder_UpgradeAllowed: monthly active →
+// yearly order is the supported upgrade path.
+func TestPaymentService_CreateOrder_UpgradeAllowed(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("first order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-sub",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	up, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("monthly→yearly upgrade must be allowed; got %v", err)
+	}
+	if up.PlanID != "yearly" || up.Status != "pending" {
+		t.Errorf("order = %+v, want pending yearly", up)
+	}
+}
+
+// TestPaymentService_CreateOrder_DowngradeRejected: yearly active →
+// monthly order is a downgrade and stays rejected (409 mapping in the
+// handler).
+func TestPaymentService_CreateOrder_DowngradeRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("first order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-sub",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
 	_, err = svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
-	if !errors.Is(err, ErrUserHasActiveSub) {
-		t.Errorf("err = %v, want ErrUserHasActiveSub", err)
+	if !errors.Is(err, ErrPlanDowngrade) {
+		t.Errorf("err = %v, want ErrPlanDowngrade", err)
+	}
+}
+
+// ============================================================================
+// Rollover + downgrade guard at activation (2026-07-28 repurchase rule)
+// ============================================================================
+
+// seedActiveSub inserts an active subscription expiring at `expiry` and
+// returns nothing — the row is the fixture, read back via SQL in the
+// assertions.
+func seedActiveSub(t *testing.T, db *sqlx.DB, uid, planID string, expiry time.Time) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (gen_random_uuid(), $1, $2, 'active', now(), $3)
+	`, uid, planID, expiry); err != nil {
+		t.Fatalf("seed active sub: %v", err)
+	}
+}
+
+func readSub(t *testing.T, db *sqlx.DB, uid string) (planID string, expiresAt time.Time) {
+	t.Helper()
+	err := db.QueryRowContext(context.Background(), `
+		SELECT plan_id, expires_at FROM subscriptions WHERE user_id = $1 AND status = 'active'
+	`, uid).Scan(&planID, &expiresAt)
+	if err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	return planID, expiresAt
+}
+
+// withinSeconds fails unless got is within ±tol of want. Activation
+// timestamps are computed from time.Now() deep in the service, so exact
+// equality is impossible; a few seconds of execution slack is fine.
+func withinSeconds(t *testing.T, got, want time.Time, tol time.Duration) {
+	t.Helper()
+	diff := got.Sub(want)
+	if diff < -tol || diff > tol {
+		t.Errorf("expires_at = %v, want %v ±%v (off by %v)", got, want, tol, diff)
+	}
+}
+
+// TestConfirm_RolloverSamePlanRenewal: renewing monthly while monthly is
+// still active extends from the OLD expiry (+30d from old), not from
+// now() — the user never loses paid days by renewing early.
+func TestConfirm_RolloverSamePlanRenewal(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
+	seedActiveSub(t, db, uid, "monthly", oldExpiry)
+
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("renewal order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-renew-1",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	planID, expiresAt := readSub(t, db, uid)
+	if planID != "monthly" {
+		t.Errorf("plan = %q, want monthly", planID)
+	}
+	withinSeconds(t, expiresAt, oldExpiry.Add(30*24*time.Hour), 30*time.Second)
+}
+
+// TestConfirm_RolloverUpgrade: monthly with 10 days left upgrades to
+// yearly — the remaining days carry over: expiry ≈ old + 365d.
+func TestConfirm_RolloverUpgrade(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
+	seedActiveSub(t, db, uid, "monthly", oldExpiry)
+
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-up-1",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	planID, expiresAt := readSub(t, db, uid)
+	if planID != "yearly" {
+		t.Errorf("plan = %q, want yearly", planID)
+	}
+	withinSeconds(t, expiresAt, oldExpiry.Add(365*24*time.Hour), 30*time.Second)
+}
+
+// TestConfirm_RetryNoDoubleRollover: a Confirm retry of the SAME payment
+// must not extend the sub a second time — preservedExpiry wins and the
+// stored (already rolled-over) value is returned verbatim.
+func TestConfirm_RetryNoDoubleRollover(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
+	seedActiveSub(t, db, uid, "monthly", oldExpiry)
+
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	in := ConfirmInput{OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-up-retry"}
+	if _, err := svc.Confirm(context.Background(), in); err != nil {
+		t.Fatalf("first confirm: %v", err)
+	}
+	_, firstExpiry := readSub(t, db, uid)
+
+	if _, err := svc.Confirm(context.Background(), in); err != nil {
+		t.Fatalf("retry confirm: %v", err)
+	}
+	_, secondExpiry := readSub(t, db, uid)
+	withinSeconds(t, secondExpiry, firstExpiry, time.Second)
+}
+
+// TestConfirm_DowngradeActivationBlocked: a stale monthly order created
+// BEFORE the user upgraded is paid afterwards — the payment is honored
+// (order goes paid) but the yearly subscription is left untouched and
+// the block is audit-logged for a manual refund.
+func TestConfirm_DowngradeActivationBlocked(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+
+	// Stale monthly QR minted while the user had no subscription.
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("stale order: %v", err)
+	}
+	// User upgrades to yearly.
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: upOrder.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-up-first",
+	}); err != nil {
+		t.Fatalf("upgrade confirm: %v", err)
+	}
+	_, yearlyExpiry := readSub(t, db, uid)
+
+	// ...then the stale monthly QR gets paid. Must NOT clobber yearly.
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: staleOrder.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-stale-late",
+	}); err != nil {
+		t.Fatalf("stale confirm: %v", err)
+	}
+
+	planID, expiresAt := readSub(t, db, uid)
+	if planID != "yearly" {
+		t.Errorf("plan = %q, want yearly (downgrade must be blocked)", planID)
+	}
+	withinSeconds(t, expiresAt, yearlyExpiry, time.Second)
+
+	var orderStatus string
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT status FROM orders WHERE id = $1`, staleOrder.ID).Scan(&orderStatus); err != nil {
+		t.Fatalf("read stale order: %v", err)
+	}
+	if orderStatus != "paid" {
+		t.Errorf("stale order status = %q, want paid (payment honored, manual refund)", orderStatus)
+	}
+
+	var auditCount int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM audit_log WHERE action = 'downgrade_activation_blocked' AND target = $1`,
+		"order:"+staleOrder.ID).Scan(&auditCount); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if auditCount != 1 {
+		t.Errorf("downgrade_activation_blocked audit rows = %d, want 1", auditCount)
+	}
+}
+
+// TestConfirm_DowngradeActivationBlocked_RetryStaysBlocked is the B1
+// regression guard: a dedupe RETRY of a downgrade-blocked payment must
+// not activate either. preservedExpiry short-circuits resolveSubExpiry
+// before the downgrade comparison, so without the plan-mismatch check
+// in the dedupe branch this second Confirm would overwrite the yearly
+// sub's plan_id with monthly — silently undoing the first block.
+func TestConfirm_DowngradeActivationBlocked_RetryStaysBlocked(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("stale order: %v", err)
+	}
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: upOrder.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-up-first",
+	}); err != nil {
+		t.Fatalf("upgrade confirm: %v", err)
+	}
+
+	staleIn := ConfirmInput{OrderID: staleOrder.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-stale-late"}
+	if _, err := svc.Confirm(context.Background(), staleIn); err != nil {
+		t.Fatalf("first stale confirm: %v", err)
+	}
+	// The retry — same payment, dedupe hit. Must stay blocked.
+	if _, err := svc.Confirm(context.Background(), staleIn); err != nil {
+		t.Fatalf("retry stale confirm: %v", err)
+	}
+
+	planID, _ := readSub(t, db, uid)
+	if planID != "yearly" {
+		t.Errorf("plan = %q after blocked retry, want yearly (B1: retry undid the downgrade block)", planID)
+	}
+
+	var retryAudits int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM audit_log WHERE action = 'downgrade_activation_blocked' AND target = $1`,
+		"order:"+staleOrder.ID).Scan(&retryAudits); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if retryAudits < 2 {
+		t.Errorf("downgrade_activation_blocked audit rows = %d, want >= 2 (first delivery + retry)", retryAudits)
+	}
+}
+
+// TestOnWebhook_DowngradeActivationBlocked mirrors the Confirm-path
+// guard onto the webhook delivery channel: a stale monthly order paid
+// after the upgrade must not clobber the yearly sub.
+func TestOnWebhook_DowngradeActivationBlocked(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("stale order: %v", err)
+	}
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: upOrder.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-up-first",
+	}); err != nil {
+		t.Fatalf("upgrade confirm: %v", err)
+	}
+	_, yearlyExpiry := readSub(t, db, uid)
+
+	// The stale order's payment arrives via WEBHOOK (not Confirm).
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-stale-1", EventType: "payment_intent.succeeded",
+		TransactionID: "pi-stale-wh", OrderID: staleOrder.ID,
+		Amount: staleOrder.Amount, Currency: staleOrder.Currency,
+		RawPayload: []byte(`{}`),
+	}); err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+
+	planID, expiresAt := readSub(t, db, uid)
+	if planID != "yearly" {
+		t.Errorf("plan = %q, want yearly (webhook-path downgrade must be blocked)", planID)
+	}
+	withinSeconds(t, expiresAt, yearlyExpiry, time.Second)
+
+	var auditCount int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM audit_log WHERE action = 'downgrade_activation_blocked' AND target = $1`,
+		"order:"+staleOrder.ID).Scan(&auditCount); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if auditCount != 1 {
+		t.Errorf("downgrade_activation_blocked audit rows = %d, want 1", auditCount)
+	}
+}
+
+// TestConfirm_RolloverBeatsSmallerHint: when a hint is present but the
+// rolled value (old expiry + interval) is later, the rolled value
+// wins — the user never loses days to a stale quote.
+func TestConfirm_RolloverBeatsSmallerHint(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
+	seedActiveSub(t, db, uid, "monthly", oldExpiry)
+
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	// A hint SHORTER than old+365d (e.g. a quote computed before the
+	// user dawdled) must not shrink the rolled expiry.
+	hint := time.Now().Add(100 * 24 * time.Hour)
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-up-hint",
+		ExpiresAt: &hint,
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	_, expiresAt := readSub(t, db, uid)
+	withinSeconds(t, expiresAt, oldExpiry.Add(365*24*time.Hour), 30*time.Second)
+}
+
+// TestConfirm_LifetimeOrderBlockedAfterUpgrade (M1): an interval_days=0
+// ("lifetime") order minted before the user upgraded must not
+// overwrite the finite-cycle subscription when it's paid afterwards.
+func TestConfirm_LifetimeOrderBlockedAfterUpgrade(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps)
+		VALUES ('lifetime', 'Lifetime', 999, 0, ARRAY['yundian'])
+		ON CONFLICT (id) DO NOTHING
+	`); err != nil {
+		t.Fatalf("seed lifetime plan: %v", err)
+	}
+
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "lifetime", "stripe")
+	if err != nil {
+		t.Fatalf("stale lifetime order: %v", err)
+	}
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	if err != nil {
+		t.Fatalf("upgrade order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: upOrder.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-up-first",
+	}); err != nil {
+		t.Fatalf("upgrade confirm: %v", err)
+	}
+
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: staleOrder.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-lifetime-late",
+	}); err != nil {
+		t.Fatalf("stale confirm: %v", err)
+	}
+
+	planID, _ := readSub(t, db, uid)
+	if planID != "yearly" {
+		t.Errorf("plan = %q, want yearly (interval=0 stale order must be blocked)", planID)
 	}
 }
 
@@ -2039,16 +2438,17 @@ func TestPaymentService_OnWebhook_PaypalRenewal_SubNotActive(t *testing.T) {
 	}
 }
 
-// TestResolveSubExpiry_HintForwarded covers branch 1 of resolveSubExpiry:
-// when the caller supplies a hint (BFF on Confirm; webhook payload on
-// channels that ship sub_expires_at, e.g. Stripe metadata / PayPal
-// renewal), the helper must forward it verbatim and never touch the plan
-// row. This is the only branch Task 1 needs to lock down — branches 2/3
-// (plan.interval_days fallback, plan-missing) are exercised end-to-end by
-// the OnWebhook tests added in Task 2.
+// TestResolveSubExpiry_HintForwarded covers the hint branch of
+// resolveSubExpiry: when the caller supplies a hint (BFF on Confirm;
+// webhook payload on channels that ship sub_expires_at, e.g. Stripe
+// metadata / PayPal renewal) AND there is no active subscription to
+// roll over, the helper must forward the hint verbatim and never touch
+// the plan row. The retry/rollover/fallback branches are exercised
+// end-to-end by the OnWebhook + Confirm tests.
 func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 	db := setupPaymentDB(t)
 	s := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
 
 	hint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
 	tx, err := db.Beginx()
@@ -2056,7 +2456,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	got, err := s.resolveSubExpiry(context.Background(), tx, "monthly", &hint, nil)
+	got, err := s.resolveSubExpiry(context.Background(), tx, uid, "monthly", &hint, nil)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
@@ -2249,7 +2649,7 @@ func TestConfirm_RetryDoesNotExtend(t *testing.T) {
 // would return the previous sub's expiry — paying for a 365-day
 // yearly would only get 30 days because the existing monthly's
 // expires_at was preserved.
-func TestConfirm_DifferentOrder_SameUser_FallbackApplies(t *testing.T) {
+func TestConfirm_DifferentOrder_SameUser_UpgradeRollover(t *testing.T) {
 	db := setupPaymentDB(t)
 	s := newTestPaymentService(t, db)
 
@@ -2294,7 +2694,12 @@ func TestConfirm_DifferentOrder_SameUser_FallbackApplies(t *testing.T) {
 		t.Fatalf("second confirm (yearly): %v", err)
 	}
 
-	// The active sub now reflects yearly, with a fresh expiry ~365 days out.
+	// The active sub now reflects yearly. Under the 2026-07-28 rollover
+	// rule the remaining monthly days (~30d from the first confirm's
+	// interval fallback) carry over: expiry ≈ now + 30d + 365d, NOT a
+	// plain now+365d fallback. This still pins the original cross-order
+	// regression too — a wrongly-preserved monthly expiry would sit at
+	// ~now+30d, far outside the window.
 	var exp sql.NullTime
 	if err := db.Get(&exp,
 		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
@@ -2303,10 +2708,10 @@ func TestConfirm_DifferentOrder_SameUser_FallbackApplies(t *testing.T) {
 	if !exp.Valid {
 		t.Fatal("expires_at is NULL")
 	}
-	expectedMin := time.Now().Add(364 * 24 * time.Hour)
-	expectedMax := time.Now().Add(366 * 24 * time.Hour)
+	expectedMin := time.Now().Add(394 * 24 * time.Hour)
+	expectedMax := time.Now().Add(396 * 24 * time.Hour)
 	if exp.Time.Before(expectedMin) || exp.Time.After(expectedMax) {
-		t.Errorf("expires_at should be ~now+365d for yearly; got %v", exp.Time)
+		t.Errorf("expires_at should be ~now+395d (monthly remainder + 365d rollover); got %v", exp.Time)
 	}
 }
 

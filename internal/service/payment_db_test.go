@@ -57,6 +57,7 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 		{"free", "Free", 0, 0, []string{"yundian"}},
 		{"monthly", "Monthly", 19.9, 30, []string{"yundian", "yundash"}},
 		{"yearly", "Yearly", 199.9, 365, []string{"yundian", "yundash"}},
+		{"trial", "Free Trial", 0, 0, []string{"yundian", "yundash"}},
 	} {
 		_, err := db.ExecContext(context.Background(), `
 			INSERT INTO plans (id, name, price, interval_days, apps)
@@ -66,6 +67,15 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 		if err != nil {
 			t.Fatalf("seed plan %s: %v", p.id, err)
 		}
+	}
+	// trial mirrors migration 018: grantable by auth, never purchasable,
+	// never listed. The rollover tests only need the row to exist with
+	// interval_days=0; the 409 test needs accepting_new_subscriptions=false.
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE plans SET accepting_new_subscriptions = false, is_listed = false, trial_days = 7
+		WHERE id = 'trial'
+	`); err != nil {
+		t.Fatalf("seed trial plan flags: %v", err)
 	}
 	_, _ = db.ExecContext(context.Background(), `
 		INSERT INTO apps (app_id, name, is_active) VALUES ('yundian', 'Yundian', true)
@@ -233,6 +243,21 @@ func TestPaymentService_CreateOrder_DowngradeRejected(t *testing.T) {
 	}
 }
 
+// TestCreateOrder_TrialPlanNotPurchasable: the trial plan is granted by
+// auth on first login and must never be orderable — even for a user
+// with no subscription at all. eligibilityAndInsertOrderTx rejects it
+// with ErrPlanNotAcceptingNew (409 mapping in the handler). Pins the
+// accepting_new_subscriptions=false flag seeded above (migration 018).
+func TestCreateOrder_TrialPlanNotPurchasable(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	_, err := svc.CreateOrder(context.Background(), uid, "trial", "stripe")
+	if !errors.Is(err, ErrPlanNotAcceptingNew) {
+		t.Fatalf("expected ErrPlanNotAcceptingNew, got %v", err)
+	}
+}
+
 // ============================================================================
 // Rollover + downgrade guard at activation (2026-07-28 repurchase rule)
 // ============================================================================
@@ -323,6 +348,56 @@ func TestConfirm_RolloverUpgrade(t *testing.T) {
 		t.Errorf("plan = %q, want yearly", planID)
 	}
 	withinSeconds(t, expiresAt, oldExpiry.Add(365*24*time.Hour), 30*time.Second)
+}
+
+// TestConfirm_TrialRolloverOnFirstPurchase: a user on the granted 7-day
+// trial (interval_days=0) buys their first paid plan while the trial is
+// still active — the remaining trial days roll over: expiry ≈ trial
+// expiry + 30d, not now() + 30d. Characterization test for the existing
+// resolveSubExpiry rollover branch; the trial row behaves like any
+// other unexpired active subscription here.
+func TestConfirm_TrialRolloverOnFirstPurchase(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	trialExpiry := time.Now().Add(72 * time.Hour)
+	seedActiveSub(t, db, uid, "trial", trialExpiry)
+
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("first purchase order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-trial-first-1",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	planID, expiresAt := readSub(t, db, uid)
+	if planID != "monthly" {
+		t.Errorf("plan = %q, want monthly", planID)
+	}
+	withinSeconds(t, expiresAt, trialExpiry.Add(30*24*time.Hour), 2*time.Minute)
+}
+
+// The trial grant's concurrency safety net (auth.go grantTrialSubscription
+// doc): a duplicate grant hits idx_subscriptions_user_active and is
+// logged+swallowed. Pin the index itself at the DB layer.
+func TestSubscriptions_UniqueActivePerUser(t *testing.T) {
+	db := setupPaymentDB(t)
+	uid := seedUser(t, db)
+	seedActiveSub(t, db, uid, "trial", time.Now().Add(7*24*time.Hour))
+	// second active row for the same user must be rejected
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (gen_random_uuid(), $1, 'monthly', 'active', now(), now() + interval '30 days')
+	`, uid)
+	if err == nil {
+		t.Fatal("expected unique violation on second active subscription, got nil")
+	}
+	if !strings.Contains(err.Error(), "idx_subscriptions_user_active") {
+		t.Fatalf("expected idx_subscriptions_user_active violation, got %v", err)
+	}
 }
 
 // TestConfirm_RetryNoDoubleRollover: a Confirm retry of the SAME payment

@@ -1454,8 +1454,11 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 
 	t.Run("new user + new identity", func(t *testing.T) {
 		t.Parallel()
-		ur, sir, _, _, _, _ := newAuthMocks()
-		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		ur, sir, pr, sr, _, _ := newAuthMocks()
+		// planRepo/subRepo are wired because the created=true branch
+		// fires a best-effort trial grant (no trial plan seeded here,
+		// so the grant is a logged no-op).
+		svc := &AuthService{userRepo: ur, identityRepo: sir, planRepo: pr, subRepo: sr}
 		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-fresh", Email: "fresh@x.com",
 		})
@@ -2271,4 +2274,252 @@ func TestResolvePlanForTokenIssuance_SingleTimeReference(t *testing.T) {
 	if len(scope2) == 0 {
 		t.Error("scope = [] at beforeExpiry, want non-empty (sub was active at that ref time)")
 	}
+}
+
+// 2026-07-28 trial grant (spec: docs/superpowers/specs/2026-07-28-trial-grant-design.md):
+// a brand-new user's first login receives an active 'trial' subscription
+// row expiring in trial.trial_days. Grant is best-effort — failures must
+// never block login (subscription is a capability layer, not identity).
+func TestAuthService_LoginWithProfile_TrialGrant(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	seedTrialPlan := func(pr *mockPlanRepo) {
+		pr.plans["trial"] = &model.Plan{
+			ID: "trial", Name: "Free Trial", Apps: []string{"yundian", "yundash"},
+			IsActive: true, AcceptingNewSubscriptions: false, TrialDays: 7,
+		}
+	}
+	login := func(svc *AuthService, uid string) (*LoginResponse, error) {
+		return svc.LoginWithProfile(ctx, LoginWithProfileRequest{
+			Profile: &ProviderUserInfo{Provider: "github", ProviderUID: uid, Email: uid + "@x.com"},
+			AppID:   "yundian",
+		})
+	}
+
+	t.Run("new user gets active trial sub and trial-shaped response", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		seedTrialPlan(pr)
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		before := time.Now()
+		resp, err := login(svc, "gh-trial-new")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		sub := sr.byUserID[resp.User.ID]
+		if sub == nil {
+			t.Fatal("expected a trial subscription row for the new user")
+		}
+		if sub.PlanID != "trial" {
+			t.Errorf("plan_id = %q, want trial", sub.PlanID)
+		}
+		if sub.Status != "active" {
+			t.Errorf("status = %q, want active", sub.Status)
+		}
+		if sub.ExpiresAt == nil {
+			t.Fatal("expires_at must be set (nil = never expires)")
+		}
+		want := before.Add(7 * 24 * time.Hour)
+		if diff := sub.ExpiresAt.Sub(want); diff < -time.Minute || diff > time.Minute {
+			t.Errorf("expires_at = %v, want %v ±1m", *sub.ExpiresAt, want)
+		}
+
+		// The very first login response already surfaces the trial —
+		// first paint shows the trial countdown, no second fetch needed.
+		if resp.Subscription == nil {
+			t.Fatal("expected subscription in response")
+		}
+		if resp.Subscription.PlanID != "trial" {
+			t.Errorf("response plan_id = %q, want trial", resp.Subscription.PlanID)
+		}
+		if !resp.Subscription.HasAccess {
+			t.Error("response has_access = false, want true during trial")
+		}
+		if resp.Subscription.ExpiresAt == nil {
+			t.Error("response expires_at must carry the trial expiry")
+		}
+	})
+
+	t.Run("existing user (identity match) gets no grant", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		seedTrialPlan(pr)
+		ur.users["user-old"] = &model.User{ID: "user-old", Status: "active"}
+		sir.identities["github:gh-old"] = &model.SocialIdentity{
+			ID: "ident-old", UserID: "user-old", Provider: "github", ProviderUID: "gh-old",
+		}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := login(svc, "gh-old")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(sr.subs) != 0 {
+			t.Errorf("expected no subscription rows for an existing user, got %d", len(sr.subs))
+		}
+		if resp.Subscription != nil && resp.Subscription.PlanID == "trial" {
+			t.Error("existing user must not receive a trial")
+		}
+	})
+
+	t.Run("email-merge into an existing user gets no grant", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		seedTrialPlan(pr)
+		ur.users["user-merge"] = &model.User{ID: "user-merge", Status: "active"}
+		email := "merge@x.com"
+		sir.byEmail[email] = []model.SocialIdentity{
+			{ID: "ident-m", UserID: "user-merge", Provider: "google", ProviderUID: "g-1", Email: &email},
+		}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		// A brand-new GitHub identity whose email matches an existing
+		// google identity merges into that user — created=false, no trial.
+		_, err := svc.LoginWithProfile(ctx, LoginWithProfileRequest{
+			Profile: &ProviderUserInfo{Provider: "github", ProviderUID: "gh-merge", Email: email},
+			AppID:   "yundian",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(sr.subs) != 0 {
+			t.Errorf("email-merged user must not receive a trial, got %d rows", len(sr.subs))
+		}
+	})
+
+	t.Run("trial plan row missing: login succeeds without a grant", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		// deliberately no seedTrialPlan — migration not applied yet
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := login(svc, "gh-noplan")
+		if err != nil {
+			t.Fatalf("login must not fail when the trial plan is missing: %v", err)
+		}
+		if resp.AccessToken == "" {
+			t.Error("expected tokens even without the trial grant")
+		}
+		if len(sr.subs) != 0 {
+			t.Errorf("expected no subscription rows, got %d", len(sr.subs))
+		}
+	})
+
+	t.Run("trial_days=0 skips the grant but login succeeds", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		pr.plans["trial"] = &model.Plan{
+			ID: "trial", Name: "Free Trial", Apps: []string{"yundian"},
+			IsActive: true, AcceptingNewSubscriptions: false, TrialDays: 0,
+		}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		if _, err := login(svc, "gh-zero"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(sr.subs) != 0 {
+			t.Errorf("trial_days=0 must not grant (would be instantly expired), got %d rows", len(sr.subs))
+		}
+	})
+
+	t.Run("inactive trial plan skips the grant but login succeeds", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		pr.plans["trial"] = &model.Plan{
+			ID: "trial", Name: "Free Trial", Apps: []string{"yundian"},
+			IsActive: false, AcceptingNewSubscriptions: false, TrialDays: 7,
+		}
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		if _, err := login(svc, "gh-inactive"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(sr.subs) != 0 {
+			t.Errorf("inactive trial plan must not grant, got %d rows", len(sr.subs))
+		}
+	})
+
+	t.Run("cancelled request ctx does not cancel the grant", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		seedTrialPlan(pr)
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		// The plain mocks ignore ctx, so wrap plan/sub repos with
+		// ctx-checking decorators — without them this test would pass
+		// even if grantTrialSubscription used the request ctx directly.
+		svc := NewAuthService(ur, sir, &ctxCheckingPlanRepo{pr}, &ctxCheckingSubscriptionRepo{sr}, ssr, ar, tokenSvc)
+
+		// A client disconnect mid-first-login cancels the request ctx.
+		// The grant detaches from that cancellation (grants are never
+		// retried), so the row must still be inserted.
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		svc.grantTrialSubscription(cancelled, "user-disconnect")
+
+		sub := sr.byUserID["user-disconnect"]
+		if sub == nil {
+			t.Fatal("grant must survive request cancellation — the user has no other chance to receive a trial")
+		}
+		if sub.PlanID != "trial" || sub.Status != "active" {
+			t.Errorf("sub = %+v, want active trial", sub)
+		}
+	})
+
+	t.Run("subscription insert failure does not block login", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ar.seedActive("yundian", "云店")
+		seedTrialPlan(pr)
+		sr.createErr = errors.New("db down")
+		tokenSvc := newTokenServiceWithMocks(ssr, sr)
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+		resp, err := login(svc, "gh-grantfail")
+		if err != nil {
+			t.Fatalf("grant failure must not block login: %v", err)
+		}
+		if resp.AccessToken == "" || resp.RefreshToken == "" {
+			t.Error("expected tokens even when the trial grant fails")
+		}
+	})
+}
+
+// ctxCheckingPlanRepo / ctxCheckingSubscriptionRepo decorate the default
+// mocks so FindByID/Create honour context cancellation. The plain mocks
+// ignore ctx, which would let "cancelled request ctx does not cancel the
+// grant" pass even without the detach in grantTrialSubscription — these
+// wrappers make that test actually pin the behaviour (same pattern as
+// storeFirstIdentityRepo above).
+type ctxCheckingPlanRepo struct{ *mockPlanRepo }
+
+func (r *ctxCheckingPlanRepo) FindByID(ctx context.Context, id string) (*model.Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return r.mockPlanRepo.FindByID(ctx, id)
+}
+
+type ctxCheckingSubscriptionRepo struct{ *mockSubscriptionRepo }
+
+func (r *ctxCheckingSubscriptionRepo) Create(ctx context.Context, s *model.Subscription) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.mockSubscriptionRepo.Create(ctx, s)
 }

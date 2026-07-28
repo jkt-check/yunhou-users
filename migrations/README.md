@@ -68,3 +68,4 @@ syntax, **not** transaction control — those are fine.
 | `015_plan_change_log_nullable_snapshots.sql` | plan_change_log.before / .after become nullable so CreatePlan (`before=NULL`) and DeletePlan (`after=NULL`) can write audit rows (spec §6.1) |
 | `016_plan_pricing_and_hide.sql` | re-prices `monthly` (¥19.9/mo) and `yearly` (¥199.9/yr) to match the yunhou-website frontend promo; fully retires `quarterly` (`is_listed=false`, `is_active=false`) and hides `free` from the public catalog |
 | `017_sub_expiry_does_not_backfill.sql` | no-op marker documenting the decision NOT to backfill `subscriptions.expires_at = NULL` rows from the pre-2026-07-27 WeChat NATIVE v3 bug (see `docs/superpowers/plans/2026-07-27-subscription-expiry-fallback.md` for rationale) |
+| `018_trial_plan.sql` | adds the `trial` plan row (active, not purchasable, not listed, trial_days=7) backing `AuthService.grantTrialSubscription` — 7-day free trial granted at first login |

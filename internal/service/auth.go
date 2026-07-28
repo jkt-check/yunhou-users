@@ -264,12 +264,69 @@ func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInf
 			// If we created a brand-new user in step 2 and lost the
 			// race, the orphan row is harmless (no identities bound
 			// to it) but we still want to surface a usable user.
-			_ = isNew // orphan cleanup is a sweeper concern
+			// Orphan cleanup is a sweeper concern.
 		}
 		return nil, fmt.Errorf("create identity: %w", err)
 	}
 
+	// 4. First-ever login: best-effort grant of the free trial. Grant
+	//    failures never block login — subscription is a capability
+	//    layer, not an identity layer (cn-staging 2026-07-23 incident).
+	//    Only the created=true branch grants: email-merge and
+	//    existing-identity logins are not new users (spec: 只发新用户).
+	if isNew {
+		s.grantTrialSubscription(ctx, userID)
+	}
+
 	return s.userRepo.FindByID(ctx, userID)
+}
+
+// trialPlanID is the catalog id of the free-trial plan row seeded by
+// migration 018_trial_plan.sql. The row is is_active (so has_access
+// computes true) but accepting_new_subscriptions=false — the trial can
+// only be granted here, never bought.
+const trialPlanID = "trial"
+
+// grantTrialSubscription inserts the active trial subscription row for a
+// brand-new user. Best-effort by design: every failure is logged and
+// swallowed so a catalog hiccup can never bounce a first login. The
+// partial unique index idx_subscriptions_user_active turns a concurrent
+// duplicate grant into a DB-level no-op (unique violation, logged here).
+// There is deliberately no backfill for pre-existing users (spec: 只发新用户).
+func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string) {
+	// The grant must outlive the request: a client disconnect mid-login
+	// (mobile norm) cancels the request ctx and would silently cost the
+	// user their only trial — grants are never retried (spec: 只发新用户).
+	// Detach from cancellation, keep a short timeout so a hung DB can't
+	// leak a goroutine.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	plan, err := s.planRepo.FindByID(ctx, trialPlanID)
+	if err != nil {
+		log.Printf("trial grant: find plan %q: %v (user %s)", trialPlanID, err, userID)
+		return
+	}
+	if !plan.IsActive {
+		log.Printf("trial grant: plan %q is inactive, skipping (user %s)", trialPlanID, userID)
+		return
+	}
+	if plan.TrialDays <= 0 {
+		log.Printf("trial grant: plan %q has trial_days=%d, skipping (user %s)", trialPlanID, plan.TrialDays, userID)
+		return
+	}
+	now := time.Now()
+	expiresAt := now.Add(time.Duration(plan.TrialDays) * 24 * time.Hour)
+	if err := s.subRepo.Create(ctx, &model.Subscription{
+		ID:        GenerateUUID(),
+		UserID:    userID,
+		PlanID:    plan.ID,
+		Status:    "active",
+		StartedAt: now,
+		ExpiresAt: &expiresAt,
+	}); err != nil {
+		log.Printf("trial grant: create subscription: %v (user %s)", err, userID)
+	}
 }
 
 // resolveOrCreateUser returns the user_id to bind this login to, plus a

@@ -107,7 +107,9 @@ func TestMigration019_KayaBridge(t *testing.T) {
 		execMigration019(t, db)
 
 		// Plans: full-function set gains yunhou-website, free does not.
-		for _, id := range []string{"monthly", "yearly", "trial"} {
+		// quarterly 也在集合内(016 已 is_active=false,不实际授权;
+		// 有意包含,复活即为全功能 —— review minor #1 锁定)
+		for _, id := range []string{"monthly", "yearly", "trial", "quarterly"} {
 			if !planHasApp(t, db, id, "yunhou-website") {
 				t.Errorf("plan %q missing yunhou-website in apps", id)
 			}

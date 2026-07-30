@@ -56,10 +56,10 @@ SET config = jsonb_set(
     (config #> '{oauth_providers,wechat,callback_urls}')
         || COALESCE(
             (
-                SELECT jsonb_agg(u) FROM (
-                    SELECT 'https://staging.yunhouai.com/auth/kaya-bridge' AS u
+                SELECT jsonb_agg(u ORDER BY ord) FROM (
+                    SELECT 'https://staging.yunhouai.com/auth/kaya-bridge' AS u, 1 AS ord
                     UNION ALL
-                    SELECT 'https://yunhouai.com/auth/kaya-bridge'
+                    SELECT 'https://yunhouai.com/auth/kaya-bridge', 2
                 ) AS new_urls
                 WHERE NOT (config #> '{oauth_providers,wechat,callback_urls}') @> to_jsonb(u)
             ),
@@ -79,6 +79,6 @@ BEGIN
            WHERE app_id = 'yunhou-website'
              AND config #> '{oauth_providers,wechat,callback_urls}' IS NOT NULL
        ) THEN
-        RAISE WARNING '019_kaya_bridge: yunhou-website has no wechat callback_urls configured; bridge URL not added — configure wechat OAuth via admin API, then re-run this migration';
+        RAISE WARNING '019_kaya_bridge: yunhou-website has no wechat callback_urls configured; bridge URL not added — configure wechat OAuth via admin API, then re-apply THIS FILE manually (psql -f migrations/019_kaya_bridge.sql) or DELETE FROM _migrations WHERE id=''019_kaya_bridge'' and re-run cmd/migrate (the ledger skips already-applied files, so a plain re-run is a no-op)';
     END IF;
 END $$;

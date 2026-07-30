@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -26,7 +27,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 
 	"github.com/yunhou/users/internal/migrate"
 )
@@ -59,8 +60,19 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	db, err := sqlx.ConnectContext(ctx, "postgres", dsn)
+	// 注册 notice handler —— 迁移文件里的 RAISE WARNING(如 019 的
+	// "wechat 未配置"提示)在 lib/pq 默认行为下会被静默丢弃(只在
+	// Postgres server log 里,部署日志看不到)。接到 stdout 让部署
+	// 日志能捕获。
+	base, err := pq.NewConnector(dsn)
 	if err != nil {
+		log.Fatalf("connector: %v", err)
+	}
+	connector := pq.ConnectorWithNoticeHandler(base, func(e *pq.Error) {
+		log.Printf("[migrate] db %s: %s", e.Severity, e.Message)
+	})
+	db := sqlx.NewDb(sql.OpenDB(connector), "postgres")
+	if err := db.PingContext(ctx); err != nil {
 		log.Fatalf("connect: %v", err)
 	}
 	defer db.Close()

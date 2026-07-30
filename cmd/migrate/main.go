@@ -62,8 +62,8 @@ func main() {
 
 	// 注册 notice handler —— 迁移文件里的 RAISE WARNING(如 019 的
 	// "wechat 未配置"提示)在 lib/pq 默认行为下会被静默丢弃(只在
-	// Postgres server log 里,部署日志看不到)。接到 stdout 让部署
-	// 日志能捕获。
+	// Postgres server log 里,部署日志看不到)。接到 runner 日志(log.Printf,
+	// stderr;部署管道通常 stderr/stdout 都捕获)。
 	base, err := pq.NewConnector(dsn)
 	if err != nil {
 		log.Fatalf("connector: %v", err)

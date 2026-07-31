@@ -1,10 +1,7 @@
 name: pr-ci
 on:
   pull_request:
-  push:
     branches: [master]
-    paths-ignore:
-      - 'docs/**'
 
 # Inlined the call to jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml
 # for the same reason as deploy-cn-staging.yml: the cross-repo dispatch
@@ -16,9 +13,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pr-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   go-ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -27,8 +29,8 @@ jobs:
         # Folded scalar (`>`) so YAML collapses the newlines into spaces —
         # `|` would pass literal newlines to the shell and break the
         # `go vet/build/test` invocation into multiple commands.
-        run: go vet ./internal/billing/... ./internal/handler/... ./internal/middleware/... ./internal/model/... ./internal/router/... ./internal/util/...
+        run: go vet ./internal/... ./cmd/...
       - name: build
-        run: go build ./internal/billing/... ./internal/handler/... ./internal/middleware/... ./internal/model/... ./internal/router/... ./internal/util/...
+        run: go build ./...
       - name: unit test
-        run: go test -race ./internal/billing/... ./internal/handler/... ./internal/middleware/... ./internal/model/... ./internal/router/... ./internal/util/...
+        run: go test -race ./internal/... ./cmd/...

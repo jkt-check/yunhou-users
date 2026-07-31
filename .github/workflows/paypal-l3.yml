@@ -1,9 +1,9 @@
 # L3 PayPal sandbox UI integration suite.
 #
-# NOT a default PR gate — runs nightly + on demand. Trigger via the
-# Actions tab (workflow_dispatch) or as the nightlies schedule.
-#
-# Required secrets:
+# NOT a default PR gate — runs on demand only. Trigger via the Actions
+# tab (workflow_dispatch). The nightly schedule is disabled because the
+# 7 required PayPal secrets are NOT configured in this repo — all 17
+# historical runs failed on "Missing required env var":
 #   PAYPAL_SANDBOX_CLIENT_ID       - sandbox REST app client id
 #   PAYPAL_SANDBOX_SECRET          - sandbox REST app secret
 #   PAYPAL_SANDBOX_WEBHOOK_ID      - registered webhook id
@@ -11,13 +11,20 @@
 #   PAYPAL_BUYER_ACCOUNT_PASSWORD  - sandbox personal buyer
 #   PAYPAL_TEST_PLAN_ID            - pre-created Plan id (P-xxx)
 #   PAYPAL_NGROK_AUTHTOKEN         - ngrok authtoken
+# Restore the cron trigger ('0 7 * * *', nightly 07:00 UTC) once they
+# are set.
 
 name: paypal-l3-sandbox
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 7 * * *'   # nightly 07:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paypal-l3
+  cancel-in-progress: false
 
 jobs:
   paypal-l3:
@@ -41,16 +48,15 @@ jobs:
           node-version: '20'
 
       - name: Start Postgres
+        env:
+          DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
         run: |
           sudo service postgresql start
           sudo -u postgres createdb yunhou_users_e2e
-          sudo -u postgres psql -d yunhou_users_e2e -f migrations/001_init.sql
-          sudo -u postgres psql -d yunhou_users_e2e -f migrations/002_simplify_plans.sql
-          sudo -u postgres psql -d yunhou_users_e2e -f migrations/003_payments.sql
-          sudo -u postgres psql -d yunhou_users_e2e -f migrations/004_ls_channel.sql
-          sudo -u postgres psql -d yunhou_users_e2e -f migrations/005_paypal_channel.sql
-          sudo -u postgres psql -d yunhou_users_e2e -f migrations/006_paypal_sub_mapping.sql
-          sudo -u postgres psql -d yunhou_users_e2e -f migrations/007_app_secret.sql
+          # cmd/migrate reads DATABASE_URL and applies every pending
+          # migration in ./migrations (001-019) via its ledger; replaces
+          # the old psql list that stopped at 007.
+          go run ./cmd/migrate
 
       # All long-running daemons (ngrok, backend) live in a single step
       # that runs to completion before the test step. This avoids the
@@ -76,12 +82,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Pre-flight: fail fast with a clear message when required
+          # PayPal/ngrok secrets are not configured, instead of dying
+          # deep in the suite on the first missing var.
+          missing=""
+          for var in PAYPAL_SANDBOX_CLIENT_ID PAYPAL_SANDBOX_SECRET PAYPAL_SANDBOX_WEBHOOK_ID PAYPAL_BUYER_ACCOUNT_EMAIL PAYPAL_BUYER_ACCOUNT_PASSWORD PAYPAL_TEST_PLAN_ID NGROK_AUTHTOKEN; do
+            if [ -z "${!var:-}" ]; then
+              missing="$missing $var"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required secrets:$missing"
+            echo "Configure them under repo Settings > Secrets and variables > Actions, then re-run."
+            exit 1
+          fi
+
           # Persist transient artifacts to a durable location so the
           # same step's later commands can read them.
           mkdir -p "$ARTIFACTS_DIR"
 
           # 1) ngrok
-          curl -sSL https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.tgz | tar xz -C /tmp/
+          # Pinned 2026-07-31: ngrok v3 stable linux-amd64 tarball,
+          # verified against its sha256 before extracting.
+          curl -sSL -o /tmp/ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          echo "9dfbe1a914e69cc7e980d61e6bd5a642025918102c5bc69905d1c57703aca3e8  /tmp/ngrok.tgz" | sha256sum -c -
+          tar xzf /tmp/ngrok.tgz -C /tmp/
           "$NGROK_BIN" authtoken "$NGROK_AUTHTOKEN"
           "$NGROK_BIN" http 8080 --log "$ARTIFACTS_DIR/ngrok.log" > "$ARTIFACTS_DIR/ngrok.out" 2>&1 &
           NGROK_PID=$!
@@ -126,7 +151,7 @@ jobs:
 
           # 3) playwright (foreground, the point-of-failure step).
           cd tests/e2e-ui
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npx playwright install --with-deps chromium
           WEBHOOK_BASE_URL="$NGROK_URL" npm run all
           # DON'T set exit; the trap runs cleanup and exits with the test code.
@@ -137,17 +162,20 @@ jobs:
         with:
           name: playwright-report
           path: tests/e2e-ui/playwright-report/
+          retention-days: 7
 
       - name: Upload trace
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-trace
           path: tests/e2e-ui/test-results/
+          retention-days: 7
 
       - name: Upload backend + ngrok logs
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: paypal-l3-logs
           path: /tmp/paypal-l3-artifacts/
+          retention-days: 7

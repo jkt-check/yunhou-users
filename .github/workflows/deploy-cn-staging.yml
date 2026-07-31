@@ -9,7 +9,7 @@ on:
 
 # Inlined the build + bump jobs that used to be reusable calls into
 # jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml and
-# reusable-bump-manifest.yml. The two reusable runs (29895867556, 29895864198,
+# reusable-bump-manifest.yml. The four reusable runs (29895867556, 29895864198,
 # 29903280258, 29903275238) all failed with 0 jobs / 0 seconds and a
 # 'workflow was not found' error from the dispatch path — the yunhou-deploy
 # reusable workflows live in a private repo (access_level: user), and the
@@ -21,7 +21,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: deploy-cn-staging
@@ -29,7 +28,12 @@ concurrency:
 
 jobs:
   build:
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -41,7 +45,7 @@ jobs:
       - name: build
         run: go build ./cmd/... ./internal/...
       - name: unit test
-        run: go test -race ./cmd/... ./internal/util/... ./internal/billing/... ./internal/middleware/... ./internal/handler/... ./internal/model/... ./internal/router/...
+        run: go test -race ./internal/... ./cmd/...
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -54,13 +58,30 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/yunhou-users:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   bump:
+    if: github.ref == 'refs/heads/master'
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     env:
       HAS_APP: ${{ secrets.BUMP_APP_ID != '' }}
     steps:
+      - name: fail-fast on missing deploy credentials
+        env:
+          BUMP_APP_ID: ${{ secrets.BUMP_APP_ID }}
+          DEPLOY_BOT_PAT: ${{ secrets.DEPLOY_BOT_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUMP_APP_ID" ] && [ -z "$DEPLOY_BOT_PAT" ]; then
+            echo "::error::Neither a GitHub App (BUMP_APP_ID + BUMP_APP_PRIVATE_KEY) nor DEPLOY_BOT_PAT is configured."
+            echo "Configure BUMP_APP_ID/BUMP_APP_PRIVATE_KEY or DEPLOY_BOT_PAT in repo secrets so the bump job can push to yunhou-deploy."
+            exit 1
+          fi
       - id: app-token
         if: ${{ env.HAS_APP == 'true' }}
         uses: actions/create-github-app-token@v1

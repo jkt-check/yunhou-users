@@ -143,7 +143,7 @@ func Load() *Config {
 		WeChatAPIv3Key:      os.Getenv("WECHAT_PAY_API_V3_KEY"),
 		AlipayPublicKeyPath: os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
 
-		PaypalEnv:              envOr("PAYPAL_ENV", "live"),
+		PaypalEnv:              envOr("PAYPAL_ENV", ""),
 		PaypalWebhookIDSandbox: os.Getenv("PAYPAL_WEBHOOK_ID_SANDBOX"),
 		PaypalWebhookIDLive:    os.Getenv("PAYPAL_WEBHOOK_ID_LIVE"),
 		PaypalAPIBaseSandbox:   envOr("PAYPAL_API_BASE_SANDBOX", "https://api-m.sandbox.paypal.com"),

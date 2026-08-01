@@ -358,8 +358,8 @@ func TestLoad_PaypalDefaults(t *testing.T) {
 	}
 
 	cfg := Load()
-	if cfg.PaypalEnv != "live" {
-		t.Errorf("PaypalEnv default: got %q, want live", cfg.PaypalEnv)
+	if cfg.PaypalEnv != "" {
+		t.Errorf("PaypalEnv default: got %q, want empty (must be set explicitly; avoids accidental live)", cfg.PaypalEnv)
 	}
 	if cfg.PaypalAPIBaseSandbox != "https://api-m.sandbox.paypal.com" {
 		t.Errorf("PaypalAPIBaseSandbox default: got %q", cfg.PaypalAPIBaseSandbox)

@@ -135,14 +135,16 @@ func main() {
 	)
 
 	// Validate PayPal environment BEFORE building anything that depends on it.
-	// config.PaypalEnv defaults to "live" when unset, so cfg.PaypalEnv == ""
-	// is unreachable. Anything other than "sandbox" or "live" is a typo —
-	// we crash loud rather than silently misrouting OAuth tokens. Doing this
-	// before buildWebhookVerifier prevents the verifier from logging a stale
-	// "channel will return 404" right before the process exits on a typo.
-	paypalMode := paypal.Mode(cfg.PaypalEnv)
-	if paypalMode != paypal.ModeSandbox && paypalMode != paypal.ModeLive {
-		log.Fatalf("paypal: PAYPAL_ENV=%q is invalid; must be sandbox or live", cfg.PaypalEnv)
+	// config.PaypalEnv 默认 ""（cn 域不启用 PayPal）。空值 = 未启用：webhook
+	// verifier 会构建 nil verifier（渠道返回 404），这里给 provider-token
+	// client 一个 live 占位 BaseURL（不会真正发请求，因为渠道未配置）。
+	// 非空但既非 sandbox 又非 live = 拼写错误，响亮崩溃。
+	paypalMode := paypal.ModeLive
+	if cfg.PaypalEnv != "" {
+		paypalMode = paypal.Mode(cfg.PaypalEnv)
+		if paypalMode != paypal.ModeSandbox && paypalMode != paypal.ModeLive {
+			log.Fatalf("paypal: PAYPAL_ENV=%q is invalid; must be sandbox or live", cfg.PaypalEnv)
+		}
 	}
 
 	// Webhook signature verifier. Each channel is optional — empty secret

@@ -92,7 +92,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `WECHAT_PAY_MOCK` | No | (empty) | `1` enables mock WeChat Pay; mock mode may leave the six real-mode fields empty or partially populated. Never enable in production. |
 | `WECHAT_OAUTH_MOCK` | No | (empty) | `1` short-circuits WeChat OAuth upstream calls for development/testing. Never enable in production. |
 | `ALIPAY_PUBLIC_KEY_PATH` | No | (empty) | PEM path; empty = Alipay webhooks return 404 |
-| `PAYPAL_ENV` | No | `live` | `sandbox` \| `live`; selects which webhook_id/API base is active |
+| `PAYPAL_ENV` | No | (空=禁用) | `sandbox` \| `live`; selects which webhook_id/API base is active. 空值=未启用（渠道返回 404），仅在真正启用 PayPal 时设值 |
 | `PAYPAL_WEBHOOK_ID_SANDBOX` | No | (empty) | PayPal sandbox webhook ID; empty = sandbox disabled |
 | `PAYPAL_WEBHOOK_ID_LIVE` | No | (empty) | PayPal live webhook ID; empty = live disabled |
 | `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |

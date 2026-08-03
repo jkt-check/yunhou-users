@@ -59,4 +59,10 @@ var (
 	ErrRefundChannelFailed     = errors.New("channel refund API call failed")
 	ErrMissingIdempotencyKey   = errors.New("missing Idempotency-Key header")
 	ErrInvalidChannel          = errors.New("invalid channel")
+
+	// Chat proxy (POST /chat → DeepSeek chat.completions, SSE).
+	ErrChatNotEnabled    = errors.New("chat is not enabled")
+	ErrChatNoAccess      = errors.New("active subscription with access to this app is required")
+	ErrChatRateLimited   = errors.New("chat upstream rate limit exceeded")
+	ErrChatUpstreamError = errors.New("chat upstream error")
 )

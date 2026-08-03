@@ -94,8 +94,15 @@ All configuration is via environment variables (or `.env` file):
 | `PAYPAL_API_BASE_SANDBOX` | No | `https://api-m.sandbox.paypal.com` | |
 | `PAYPAL_API_BASE_LIVE` | No | `https://api-m.paypal.com` | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Not consumed by the running redirect flow — `/auth/github/*` reads each app's GitHub OAuth App credentials from `apps.config.oauth_providers.github` in the DB. Safe to leave blank. |
+| `PLAN_AMOUNT_OVERRIDE_JSON` | No | (empty) | Optional `{plan_id: amount-yuan}` map for dev/staging payment flows, e.g. `{"monthly":0.01,"yearly":0.1}` — overrides `plans.price` at runtime without a migration. See `internal/service/price_override.go`. |
+| `DEEPSEEK_API_KEY` | No (empty = chat disabled) | (empty) | Server-side DeepSeek API key backing `POST /chat`. Empty = the endpoint returns 404 (same convention as empty webhook secrets). Never shipped to consumer apps — they call `/chat` with a user JWT. |
+| `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com` | OpenAI-compatible API origin; the service appends `/chat/completions`. |
+| `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model name sent in the upstream `chat.completions` body. |
+| `CHAT_LOG_PATH` | No | (empty) | Chat access audit log file: one JSON line per request (`user_id`, `app_id`, `session_id`, input messages, parsed output text, status, duration). Empty = disabled (endpoint still works, no audit trail). File is opened 0o600 (conversation content is PII). Server fails to start if the path is set but unopenable. |
 
 ## API Overview
+
+> Full BFF/consumer-app integration contract (endpoint-by-endpoint request/response shapes, OAuth flows, error codes, rate limits, quick-start checklist): **[docs/api-integration-guide.md](docs/api-integration-guide.md)**. Deployment ops: [docs/deployment.md](docs/deployment.md).
 
 ### Public Endpoints
 
@@ -124,12 +131,14 @@ All configuration is via environment variables (or `.env` file):
 | POST | `/user/subscriptions` | Create subscription |
 | DELETE | `/user/subscriptions/:id` | Cancel subscription |
 | POST | `/apps/:id/quote` | Quote a plan for an app (amount, sub_expires_at, per-channel provider_data). JWT-authed; mounted at the engine level so the URL stays `/apps/:id/quote`. |
+| POST | `/chat` | Chat proxy for consumer apps (kaya): relays `{"messages":[{"role","content"}...]}` to DeepSeek (`deepseek-v4-flash`) and streams the SSE answer back verbatim. JWT-authed + subscription-gated (active subscription whose active plan's `apps[]` contains the JWT `app_id`); requires `DEEPSEEK_API_KEY` (404 otherwise). Exempt from the 20s request timeout; bounded by `chatUpstreamTimeout` (5m). Errors before the stream are JSON `{code,data,message}`; a `200` response is `text/event-stream`. |
 
 ### Payments & Refunds (JWT Bearer)
 
 | Method | Path | Description |
 |---|---|---|
 | POST | `/payments/orders` | Create a pending order (snapshots `plan.price` + `plan.currency`; PayPal requires USD Plan, WeChat Pay requires CNY Plan, else `ErrPlanCurrencyMismatch`) |
+| GET | `/payments/orders` | List the current user's orders (newest first) |
 | GET | `/payments/orders/:id` | Fetch an order (pending / paid / failed / expired / refunded / cancelled) |
 | DELETE | `/payments/orders/:id` | Cancel a pending order |
 | POST | `/payments/orders/:order_id/confirm` | BFF-confirmed payment completion; activates the subscription on success |
@@ -231,7 +240,7 @@ Database migration:
 # Run in order. Each migration depends on the prior.
 # Recommended: use `make migrate` (cmd/migrate binary) instead of running psql
 # manually — it owns the _migrations ledger so re-running is a no-op.
-# See migrations/README.md for the current file table (001 through 017 as of
+# See migrations/README.md for the current file table (001 through 019 as of
 # this writing) and the DDL rules each migration must follow.
 psql -d yunhou_users -f migrations/001_init.sql
 psql -d yunhou_users -f migrations/002_simplify_plans.sql
@@ -250,6 +259,8 @@ psql -d yunhou_users -f migrations/014_remove_default_plan.sql
 psql -d yunhou_users -f migrations/015_plan_change_log_nullable_snapshots.sql
 psql -d yunhou_users -f migrations/016_plan_pricing_and_hide.sql
 psql -d yunhou_users -f migrations/017_sub_expiry_does_not_backfill.sql
+psql -d yunhou_users -f migrations/018_trial_plan.sql
+psql -d yunhou_users -f migrations/019_kaya_bridge.sql
 ```
 
 ## Tech Stack

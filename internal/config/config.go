@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"log"
+	"net/url"
 	"os"
 	"time"
 )
@@ -114,6 +115,24 @@ type Config struct {
 	// Surface here only so operators see it in the loaded-config log;
 	// the value itself is read by service.ReloadOverrideFromEnv().
 	PlanAmountOverrideJSON string
+
+	// DeepSeekAPIKey enables the POST /chat endpoint (ChatService). Empty =
+	// chat not enabled (the route returns 404, mirroring how empty webhook
+	// secrets disable their channels). The key belongs to yunhou — consumer
+	// apps like kaya never see it; they call /chat with a user JWT and the
+	// server proxies to DeepSeek with this key.
+	DeepSeekAPIKey string
+	// DeepSeekBaseURL is the OpenAI-compatible API origin. The service
+	// appends /chat/completions. Default https://api.deepseek.com.
+	DeepSeekBaseURL string
+	// DeepSeekModel is the model name sent in the upstream chat.completions
+	// body (e.g. deepseek-v4-flash). Default "deepseek-v4-flash".
+	DeepSeekModel string
+	// ChatLogPath is the file for chat access logs (one JSON line per
+	// request: user_id, session_id, input messages, output text, status,
+	// duration). Empty = chat access logging disabled (the /chat endpoint
+	// still works, only the audit trail is skipped).
+	ChatLogPath string
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -153,6 +172,11 @@ func Load() *Config {
 		SweeperInterval:     parseDurationOr(envOr("SWEEPER_INTERVAL", "1m"), 1*time.Minute),
 
 		PlanAmountOverrideJSON: os.Getenv("PLAN_AMOUNT_OVERRIDE_JSON"),
+
+		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekBaseURL: envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+		DeepSeekModel:   envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+		ChatLogPath:     os.Getenv("CHAT_LOG_PATH"),
 	}
 }
 
@@ -229,6 +253,25 @@ func (c *Config) Validate() error {
 	// boundaries at request time; catch them at startup.
 	if !c.WeChatPayMock && c.WeChatAPIv3Key != "" && len(c.WeChatAPIv3Key) != 32 {
 		return errors.New("WECHAT_PAY_API_V3_KEY must be exactly 32 bytes")
+	}
+	// Chat (DeepSeek proxy) is optional: empty key = endpoint disabled.
+	// When the key is set, the base URL and model must be sane — an empty
+	// model would be rejected upstream with a confusing 400 instead of a
+	// clear startup error.
+	if c.DeepSeekAPIKey != "" && c.DeepSeekBaseURL == "" {
+		return errors.New("DEEPSEEK_BASE_URL is required when DEEPSEEK_API_KEY is set")
+	}
+	if c.DeepSeekAPIKey != "" && c.DeepSeekModel == "" {
+		return errors.New("DEEPSEEK_MODEL is required when DEEPSEEK_API_KEY is set")
+	}
+	// A malformed base URL (e.g. missing scheme, or a non-HTTP scheme like
+	// ftp://) only surfaces at request time as a permanent 502 — catch it
+	// at startup instead.
+	if c.DeepSeekAPIKey != "" {
+		u, err := url.Parse(c.DeepSeekBaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("DEEPSEEK_BASE_URL must be an absolute http(s) URL (e.g. https://api.deepseek.com)")
+		}
 	}
 	return nil
 }

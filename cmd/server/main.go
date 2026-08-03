@@ -167,6 +167,24 @@ func main() {
 	// Quote service — assembles price + cycle + provider_data for BFF checkout.
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 
+	// Chat proxy — server-side DeepSeek key; empty key = /chat returns 404.
+	chatSvc := service.NewChatService(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, subRepo, planRepo)
+
+	// Chat access audit log: one JSON line per request (user_id, session_id,
+	// input, output, status, duration). Optional — empty CHAT_LOG_PATH
+	// disables it. Fail-fast when configured but unopenable: silently
+	// dropping audit lines is worse than refusing to start.
+	// 0o600: the file holds full user conversation content (PII); same-OS
+	// users must not read it.
+	var chatAccessLog *log.Logger
+	if cfg.ChatLogPath != "" {
+		f, err := os.OpenFile(cfg.ChatLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			log.Fatalf("open chat log file %s: %v", cfg.ChatLogPath, err)
+		}
+		chatAccessLog = log.New(f, "", 0) // no prefix/ts — the JSON line carries its own ts
+	}
+
 	// Order expiry sweeper (in-process goroutine).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)
 
@@ -183,10 +201,25 @@ func main() {
 
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+	// Pin trusted proxies: gin's default trusts EVERY proxy, so ClientIP()
+	// (which keys all rate-limit buckets, including the paid-upstream /chat
+	// bucket) would take a client-supplied X-Forwarded-For — rotating XFF
+	// bypasses the limiter. Trust only loopback and private ranges: the app
+	// sits behind nginx on the same host (or the docker bridge gateway when
+	// containerized), so legitimate peers are always private, and an
+	// external client's injected XFF is ignored.
+	if err := engine.SetTrustedProxies([]string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}); err != nil {
+		log.Fatalf("set trusted proxies: %v", err)
+	}
 	// Bound how long any handler can run before the client disconnects, to
 	// limit the blast radius of a slow downstream call (e.g. the OAuth
 	// provider timeout is 10s; we leave a little headroom here).
-	engine.Use(timeoutMiddleware(20 * time.Second))
+	// /chat is exempt: it relays an upstream SSE stream whose legitimate
+	// lifetime exceeds 20s. Its own safety net is chatUpstreamTimeout
+	// (5m, inside ChatService) plus a per-response write deadline set by
+	// the chat handler (the server-wide WriteTimeout below is an absolute
+	// per-request deadline — it would hard-cut a longer stream).
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat"))
 
 	// A cancelable context so the rate-limiter cleanup goroutines and the
 	// sweeper exit on shutdown.
@@ -203,7 +236,7 @@ func main() {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
-		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc,
+		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
 		cfg.WeChatOAuthMock, cfg.WeChatPayMock)
 
 	srv := &http.Server{
@@ -318,8 +351,18 @@ func (noChannelRefundAPI) Refund(_ context.Context, _, _ string, _ float64, _ st
 // timeoutMiddleware caps each request's total wall-clock time. Without it
 // a slow upstream (e.g. provider userinfo) can hold a goroutine past
 // proxy_read_timeout and result in a partial response.
-func timeoutMiddleware(d time.Duration) gin.HandlerFunc {
+//
+// Routes listed in skipPaths are exempt — used for /chat, whose upstream SSE
+// relay legitimately outlives the generic cap (its own bounds live in
+// ChatService.chatUpstreamTimeout).
+func timeoutMiddleware(d time.Duration, skipPaths ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		for _, p := range skipPaths {
+			if c.FullPath() == p {
+				c.Next()
+				return
+			}
+		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), d)
 		defer cancel()
 		c.Request = c.Request.WithContext(ctx)

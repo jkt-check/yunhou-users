@@ -263,6 +263,75 @@ func TestValidate_ErrorPaths(t *testing.T) {
 	}
 }
 
+// TestValidate_DeepSeek walks the chat-proxy validation branches: config is
+// only checked when DEEPSEEK_API_KEY is set (empty key = endpoint disabled,
+// base URL/model are then irrelevant), and the base URL must be an absolute
+// http(s) URL so a typo can't turn every /chat call into a permanent 502.
+func TestValidate_DeepSeek(t *testing.T) {
+	t.Parallel()
+	base := func() *Config {
+		return &Config{
+			DatabaseURL:                "postgres://x",
+			RSAPrivate:                 "priv",
+			RSAPublic:                  "pub",
+			JWTAccessTTL:               15 * time.Minute,
+			JWTRefreshTTL:              168 * time.Hour,
+			OrderExpiryDuration:        30 * time.Minute,
+			SweeperInterval:            1 * time.Minute,
+			OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
+			WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef",
+			WeChatPayMchID:             "1900000001",
+			WeChatPayAppID:             "wx1900000109",
+			WeChatPayMchPrivateKeyPath: "/etc/wechat/apiclient_key.pem",
+			WeChatPayMchCertPath:       "/etc/wechat/apiclient_cert.pem",
+			WeChatPayNotifyURL:         "https://example.com/webhooks/payment/wechat_pay",
+			DeepSeekAPIKey:             "sk-test",
+			DeepSeekBaseURL:            "https://api.deepseek.com",
+			DeepSeekModel:              "deepseek-v4-flash",
+		}
+	}
+
+	// Happy path: key + sane URL + model validates.
+	if err := base().Validate(); err != nil {
+		t.Fatalf("happy path: want nil, got %v", err)
+	}
+	// Disabled chat: garbage base URL is irrelevant when the key is empty.
+	disabled := base()
+	disabled.DeepSeekAPIKey = ""
+	disabled.DeepSeekBaseURL = "not a url"
+	disabled.DeepSeekModel = ""
+	if err := disabled.Validate(); err != nil {
+		t.Fatalf("disabled chat: want nil, got %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		mutate    func(c *Config)
+		needleSub string
+	}{
+		{"empty base url", func(c *Config) { c.DeepSeekBaseURL = "" }, "DEEPSEEK_BASE_URL is required"},
+		{"empty model", func(c *Config) { c.DeepSeekModel = "" }, "DEEPSEEK_MODEL is required"},
+		{"missing scheme", func(c *Config) { c.DeepSeekBaseURL = "api.deepseek.com" }, "absolute http(s) URL"},
+		{"non-http scheme", func(c *Config) { c.DeepSeekBaseURL = "ftp://api.deepseek.com" }, "absolute http(s) URL"},
+		{"missing host", func(c *Config) { c.DeepSeekBaseURL = "https://" }, "absolute http(s) URL"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := base()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.needleSub) {
+				t.Errorf("error message missing %q: %v", tc.needleSub, err)
+			}
+		})
+	}
+}
+
 // TestLoad_PaymentChannelDefaults confirms that when the payment-channel
 // env vars are unset, the corresponding Config fields are empty (the docs
 // promise "Empty = <channel> webhooks return 404") and ORDER_EXPIRY_*

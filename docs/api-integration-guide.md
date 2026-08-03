@@ -36,6 +36,8 @@ https://app.example.com/auth/callback#token=<access_token>&refresh_token=<refres
 
 `has_access` 只在订阅有效、Plan 启用且 `plan.apps` 包含当前 `app_id` 时为 `true`。无订阅或订阅已过期时 `has_access=false` 且 JWT `scope=[]`。
 
+> **首次登录自动发放 7 天试用**：新用户首次登录时，服务端会 best-effort 自动授予一条 `trial` Plan 的 7 天订阅（`AuthService.grantTrialSubscription`，migration 018）。因此"无订阅"状态在真实用户中很少出现；trial 属于全功能集合（含 `yunhou-website`/`yundash` 等 app），到期后按普通过期处理。trial 不可购买、不出现在目录中。
+
 完整 JSON token 响应由 `POST /auth/refresh` 返回，示例见该接口章节。`POST /auth/logout` 仅撤销 refresh token，单独见登出章节。
 
 **商业 Plan 新增错误**：
@@ -172,7 +174,7 @@ curl https://your-yunhou-domain/user/profile \
 | 401 | `user not found` | refresh token 对应的 user 行已被删除（理论不应发生；防御性兜底） |
 | 401 | `app not found` / `app is inactive` | 解析得到的 `app_id` 不存在或已停用 |
 
-> **Expired / non-active subscriptions are NOT an error.** `POST /auth/refresh` is decoupled from subscription state (login/subscription decouple, Phase 1+). A user with an expired subscription, no subscription, or a subscription that has been swept to `cancelled`/`expired` still receives a fresh token pair. The new JWT carries `scope=[]` and the response's `subscription.has_access=false`; `subscription.plan_id` is preserved as the historical plan id (null only when there has never been a subscription) so the BFF can render the renewal CTA. Operators must read `subscription.has_access` (not the HTTP status) to decide whether to show protected UI.
+> **Expired / non-active subscriptions are NOT an error.** `POST /auth/refresh` is decoupled from subscription state (login/subscription decouple, Phase 1+). A user with an expired subscription, no subscription, or a subscription that has been swept to `cancelled`/`expired` still receives a fresh token pair. The new JWT carries `scope=[]` and the response's `subscription.has_access=false`; `subscription.plan_id` is preserved as the historical plan id (empty string `""` when there has never been a subscription) so the BFF can render the renewal CTA. Operators must read `subscription.has_access` (not the HTTP status) to decide whether to show protected UI.
 
 #### POST /auth/logout
 
@@ -253,10 +255,10 @@ curl -X POST "https://your-yunhou-domain/test/login?plan_id=monthly" \
 | `apps` | 该 Plan 授权的 App ID 列表。 |
 | `display_order` | 运营配置的展示顺序；数值较小的 Plan 先返回。 |
 | `is_listed` | 是否出现在商业目录；当前接口只返回 `is_listed=true` 的行，但字段仍随 DTO 暴露以匹配 `model.PublicPlan` 结构。 |
-| `provider_ids` | 该 Plan 在 PayPal 等渠道对应的上游 plan ID。未配置时为 `{}`（BFF 即可判定“当前 App 该 Plan 暂无可下单渠道”）。 |
+| `provider_ids` | 该 Plan 在渠道侧对应的上游 plan ID / variant ID 映射。已实现的渠道键：`paypal`（来自 `apps.config.payment_providers.paypal.plan_mapping`）与 `wechat_pay`（来自 `apps.config.payment_providers.wechat_pay.plan_mapping`）；未配置的渠道键不出现。未配置任何渠道时为 `{}`（BFF 即可判定"当前 App 该 Plan 暂无可下单渠道"）。 |
 | `cycle` | Provider 侧解析后的试用 + 计费周期；用于营销页核对上游配置。对应 Plan 未配置 PayPal 时为 `null`；业务试用天数仍以顶层 `trial_days`（即 `plan.trial_days`）为准。 |
 
-`PublicPlan` 不返回管理字段 `is_active`、`accepting_new_subscriptions`、`updated_at`（`is_listed` 已作为目录字段随 DTO 暴露）。`quarterly` 当前是 legacy Plan（`accepting_new_subscriptions=false`）；目录出现不代表可以创建新订阅或订单，BFF 下单前必须处理 409。`free` 已由 Phase 2 退役并设置为 `is_active=false`、`accepting_new_subscriptions=false`，不再出现在公开 Plan 目录中。
+`PublicPlan` 不返回管理字段 `is_active`、`accepting_new_subscriptions`、`updated_at`（`is_listed` 已作为目录字段随 DTO 暴露）。`quarterly` 当前是 legacy Plan（`accepting_new_subscriptions=false`）；目录出现不代表可以创建新订阅或订单，BFF 下单前必须处理 409。`free` 已由 Phase 2 退役并设置为 `is_active=false`、`accepting_new_subscriptions=false`，不再出现在公开 Plan 目录中。此外还存在 `trial` Plan（`is_active=true`、`is_listed=false`、`accepting_new_subscriptions=false`）——不出现在本目录，仅由服务端在首次登录时自动授予（见快速接入章节）。
 
 **错误响应**：
 
@@ -461,6 +463,65 @@ Authorization: Bearer <access_token>
 |------|---------|----------|
 | 400 | `already cancelled` | 订阅已经处于 `cancelled` 状态 |
 | 404 | `subscription not found` | ID 不存在或不属于当前用户 |
+
+---
+
+### Chat 接口
+
+Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的 DeepSeek API Key 代为调用模型，并把流式响应原样转发给客户端。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：
+
+- 要求 JWT 认证（与 `/user/*` 同级，引擎级挂载在 `POST /chat`）；
+- 要求有效订阅：订阅未过期、Plan 处于激活态且 `plan.apps` 包含 JWT 的 `app_id`（与登录时 `has_access` 同一判定矩阵），否则 403；
+- 独立限流桶 10 次/秒、突发 20（按 IP，与其他接口桶隔离）；
+- 服务端未配置 `DEEPSEEK_API_KEY` 时整体返回 404（未启用）。
+
+#### POST /chat
+
+**请求体**：
+
+```json
+{
+  "session_id": "sess-uuid-or-any-opaque-id",
+  "messages": [
+    {"role": "system", "content": "你是一个简洁的助手"},
+    {"role": "user", "content": "你好"}
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `messages` | 是 | 对话消息数组，OpenAI 兼容格式；`role` 取值 `system` / `user` / `assistant`。kaya 自行维护会话历史，每次请求携带完整上下文（服务端无状态代理） |
+| `session_id` | 否 | 会话标识（≤64 字符），仅用于服务端访问日志按会话分组，不参与任何业务逻辑 |
+
+**限制**（超出返回 400）：1–20 条消息；每条 `content` 非空且 ≤8000 字节（`len()` 字节数，CJK 每字约 3 字节）；全部消息总字节数 ≤32000。
+
+**响应（200）**：`Content-Type: text/event-stream`，逐块透传 DeepSeek 的 OpenAI 兼容 SSE 事件：
+
+```
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"content":"你"}}]}
+
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"content":"好"}}]}
+
+data: [DONE]
+```
+
+kaya 端按 `data: ` 前缀解析 JSON，拼接 `choices[0].delta.content` 即得完整回复；`data: [DONE]` 表示流结束。
+
+**错误响应**（流开始前返回标准 JSON；流开始后的错误取决于成因——DeepSeek 自身发出的错误事件会原样透传，而上游连接中断（含 5 分钟超时）时流直接结束：客户端收不到 `data: [DONE]`，应把"缺少 `[DONE]` 的结束"视为失败并重试）：
+
+| HTTP | message | 触发条件 |
+|---|---|---|
+| 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` | 请求体或消息不符合限制 |
+| 401 | `missing or invalid authorization header` / `invalid or expired token` | 未携带或无效 JWT（由 `JWTAuth` 中间件统一返回） |
+| 403 | `active subscription with access to this app is required` | 无有效订阅，或 Plan 未激活，或 `plan.apps` 不含 JWT `app_id` |
+| 404 | `chat is not enabled` | 服务端未配置 `DEEPSEEK_API_KEY` |
+| 429 | `chat upstream rate limit exceeded` | DeepSeek 上游限流 |
+| 502 | `chat upstream error` | 上游非 2xx 或网络错误 |
+
+**超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 5 分钟，订阅门禁的 DB 查询另有 10s 上限。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。错误行的输入按每条消息 1 KiB 截断（`input_truncated` 标记），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII），需部署侧配置轮转。
+
+**部署注意**：SSE 需要反代放行长连接且不缓冲——参考 `deploy/nginx.conf` 的 `location = /chat`（`proxy_buffering off`、`proxy_read_timeout 360s`）；服务端也会随响应下发 `X-Accel-Buffering: no`。
 
 ---
 
@@ -719,6 +780,39 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 ```
 
 `is_default` 字段已随 Phase 2（迁移 014）从 `plans` 表中移除，管理端读写响应都不再返回；如 BFF 因历史数据继续携带该字段，POST/PATCH 仍会以 400 显式拒绝，便于故障排查。`updated_at` 为只读字段，由数据库 trigger 在每次 UPDATE 时维护。
+
+#### GET /admin/plans/:id
+
+查询单个 Plan 详情。需要 `X-App-ID` + `X-App-Secret`。响应结构与 `GET /admin/plans` 数组元素一致（含全部管理字段）。
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": {
+    "id": "monthly",
+    "name": "按月订阅",
+    "price": 19.9,
+    "interval_days": 30,
+    "apps": ["yundian", "yundash"],
+    "is_active": true,
+    "is_listed": true,
+    "accepting_new_subscriptions": true,
+    "currency": "CNY",
+    "trial_days": 0,
+    "description": "按月订阅 ¥19.9，自动续费，可随时取消",
+    "display_order": 10,
+    "updated_at": "2026-07-24T08:30:00Z",
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+}
+```
+
+**错误响应**：
+
+| HTTP | message | 触发条件 |
+|------|---------|----------|
+| 404 | `plan not found` | Plan ID 不存在 |
 
 #### POST /admin/plans
 
@@ -1368,6 +1462,32 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | 409 | `plan is not accepting new subscriptions` (`ErrPlanNotAcceptingNew`) | Plan 已停售新订阅（例如 legacy `quarterly`） |
 | 409 | `user already has an active subscription` | 用户已有活跃订阅 |
 
+#### GET /payments/orders
+
+列出当前用户的订单（按 `created_at DESC`，最新在前）。只能看到自己的订单。
+
+**响应（200）**：
+```json
+{
+  "code": 0,
+  "data": [
+    {
+      "id": "order-uuid-2",
+      "user_id": "user-uuid",
+      "plan_id": "monthly",
+      "amount": 29.9,
+      "currency": "CNY",
+      "status": "paid",
+      "expires_at": "2026-07-23T08:30:00Z",
+      "created_at": "2026-06-23T08:00:00Z",
+      "updated_at": "2026-06-23T08:05:00Z"
+    }
+  ]
+}
+```
+
+`data` 为订单数组（可能为空 `[]`），元素结构与 `GET /payments/orders/:id` 一致。
+
 #### GET /payments/orders/:id
 
 查询订单详情。只能查自己的订单；不是本人或 ID 不存在都返回 404（避免枚举）。
@@ -1464,6 +1584,8 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 列出当前用户的所有支付记录（无分页，按 `created_at` **降序**）。
 
+> 注意：`paid_at`、`failed_reason`、`disputed_at`、`external_txn_id` 等字段带 `omitempty`——仅在适用状态出现，**缺席不等于 `null`**。例如 `paid` 状态没有 `failed_reason` 字段；BFF 解析时应做"字段是否存在"判断，不要假设值为 `null`。
+
 **响应（200）**：
 ```json
 {
@@ -1495,7 +1617,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 #### GET /payments/:id
 
-查询支付详情。只能查自己的支付（通过 order → user_id 关联校验）。
+查询支付详情。只能查自己的支付（通过 order → user_id 关联校验）。字段缺席语义与 `GET /payments` 相同（`omitempty`：`paid_at`/`failed_reason`/`disputed_at` 等仅在适用状态出现）。
 
 **响应（200）**：
 ```json
@@ -1510,9 +1632,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
     "currency": "CNY",
     "status": "paid",
     "paid_at": "2026-06-23T08:00:30Z",
-    "failed_reason": null,
     "disputed": false,
-    "disputed_at": null,
     "raw_payload": "{\"id\":\"evt_xxx\",...}",
     "created_at": "2026-06-23T08:00:30Z",
     "updated_at": "2026-06-23T08:00:30Z"
@@ -1716,7 +1836,7 @@ curl -X POST https://<YOUR_YUNHOU_HOST>/admin/apps/yundian/rotate-secret \
 **部署侧建议**：除了 `X-App-Secret` 服务端校验，部署侧也建议对所有走 `InternalAppAuth` 的端点做 nginx IP 白名单 / VPC 限制：
 - `GET /apps`、`GET /apps/:id`
 - `GET /apps/:id/provider-token/:channel`
-- `GET /admin/plans`、`GET /admin/plans/:id`、`POST/PATCH/DELETE /admin/plans/:id`
+- `GET /admin/plans`、`GET /admin/plans/:id`、`PATCH/DELETE /admin/plans/:id`、`POST /admin/plans`
 - `POST /admin/apps`、`PATCH /admin/apps/:id`、`POST /admin/apps/:id/rotate-secret`
 
 把 BFF 出口段固定下来。两层防御互不替代——服务端 secret 防的是凭据泄漏，IP 白名单防的是 endpoint 暴露面。
@@ -1815,7 +1935,7 @@ GET /.well-known/jwks.json
 | `status` | string | 状态：`active` / `expired` / `cancelled` |
 | `started_at` | datetime | 开始时间 |
 | `expires_at` | datetime? | 过期时间，null 表示永不过期 |
-| `external_subscription_id` | string? | 渠道侧订阅 ID（当前仅 PayPal 的 `I-...`）；非 PayPal 渠道为 `null`。用于 webhook 续费事件反查订阅 |
+| `external_subscription_id` | string? | 渠道侧订阅 ID（当前仅 PayPal 的 `I-...`）；非 PayPal 渠道该字段**缺席**（`omitempty`，不是 `null`）。用于 webhook 续费事件反查订阅 |
 | `created_at` | datetime | 创建时间 |
 | `updated_at` | datetime | 更新时间 |
 
@@ -1883,7 +2003,7 @@ GET /.well-known/jwks.json
 |---------|------|------|
 | 公共接口（`/healthz`, `/.well-known/jwks.json`, `/auth/refresh`, `/auth/logout`, `/auth/github/*`, `/auth/wechat/*`, `/test/login`, `/apps/:id/plans`） | 10 次/秒，突发 20 | 按客户端 IP 限制；`/healthz` 不在 limiter 路径内（最早期注册，绕过 limiter）；`/apps/:id/plans` 公共可访问（无需鉴权）；`/auth/wechat/redirect` 与 `/auth/wechat/callback` 与 `/auth/github/*` 共用同一 limiter |
 | 内部服务接口（`/apps`, `/apps/:id`, `/apps/:id/provider-token/:channel`, `/admin/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 `X-App-ID` 头 + `X-App-Secret` 头 |
-| 用户态接口（`POST /apps/:id/quote`, `/payments/*`, `/refunds/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 JWT（终端用户身份） |
+| 用户态接口（`POST /apps/:id/quote`, `POST /chat`, `/payments/*`, `/refunds/*`） | 30 次/秒，突发 60 | 按客户端 IP 限制；要求 JWT（终端用户身份）。`POST /chat` 为独立桶：10 次/秒，突发 20（每请求消耗模型额度，桶更紧且与其他接口隔离） |
 | 用户接口（`/user/*`） | 无显式限制 | 仅要求 JWT |
 | 渠道 Webhook（`/webhooks/payment/*`） | 200 次/秒，突发 400 | 走签名校验，不限 IP 业务速率 |
 
@@ -1892,7 +2012,7 @@ GET /.well-known/jwks.json
 ## 快速接入清单
 
 - [ ] 获取应用的 `app_id` + `app_secret`（`POST /admin/apps` 响应里 `data.secret`，仅一次性返回，需立即落地）
-- [ ] BFF 仅在调用 `/apps/:id/provider-token/:channel` 和所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`；`/apps/:id/plans` 是公共目录，无需鉴权
+- [ ] BFF 仅在调用 `GET /apps`、`GET /apps/:id`、`GET /apps/:id/provider-token/:channel` 和所有 `/admin/*` 时带 `X-App-ID` + `X-App-Secret`；`/apps/:id/plans` 与 `/apps/:id/quote` 是公共/用户态接口，无需内部服务鉴权
 - [ ] 实现 GitHub OAuth 重定向登录：BFF 302 到 `/auth/github/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，让浏览器走完 GitHub 授权；回调页从 URL fragment 解析 `token` / `refresh_token` / `user_id` / `has_access`（注意 fragment 不会上行到服务器，BFF 必须前端 JS 解析）
 - [ ] （可选）实现 WeChat OAuth 扫码登录：BFF 302 到 `/auth/wechat/redirect?app_id=<app_id>&redirect_uri=<回调 URL>`，PC 浏览器展示二维码；用户手机微信扫码后在回调页同样从 URL fragment 解析 token；需要识别 fragment 里的 `error=auth_failed&reason=wechat_no_unionid` 并展示对应文案；所有 Yunhou 消费 app 的「网站应用」必须注册在**同一个微信开放平台账号**下才能跨 app unionid 统一
 - [ ] 解析响应中的 `subscription.has_access` 字段，判断用户是否有权限访问
@@ -1900,4 +2020,5 @@ GET /.well-known/jwks.json
 - [ ] 使用 `access_token` 调用用户接口
 - [ ] 实现 Token 刷新逻辑，处理 Refresh Token 轮转（每次 refresh 必须使用返回的新 refresh_token，旧 token 立即失效）
 - [ ] 获取 JWKS 配置本地 JWT 验证（**必须**，不要每次请求都把 token 回传给 yunhou-users 校验）
+- [ ] （可选）接入 Chat：`POST /chat` 携带用户 JWT + `{"messages":[...]}`，按 SSE 解析回复；无订阅用户收到 403，未启用收到 404；需要按会话分组审计时传 `session_id`（详见「Chat 接口」章节）
 - [ ] 怀疑 `app_secret` 泄漏时调 `POST /admin/apps/:id/rotate-secret`，旧 secret 立即失效

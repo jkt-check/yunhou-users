@@ -225,6 +225,8 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		nil,      // webhookVerifier
 		nil,      // wechatAPIv3Key
 		nil, nil, // providerTokenSvc, quoteSvc
+		nil,      // chatSvc
+		nil,      // chatAccessLog
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
 		false, // wechatOAuthMock
 		false, // wechatPayMock
@@ -256,6 +258,8 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"DELETE:/admin/plans/:id",
 		"POST:/admin/apps",
 		"PATCH:/admin/apps/:id",
+		"POST:/apps/:id/quote",
+		"POST:/chat",
 		"POST:/payments/orders",
 		"GET:/payments/orders",
 		"GET:/payments/orders/:id",

@@ -121,6 +121,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	engine.Use(gin.Recovery())
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
+	chatSvc := service.NewChatService("", "", "", subRepo, planRepo) // chat disabled in this e2e helper
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
@@ -130,7 +131,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, githubOAuthSvc, wechatOAuthSvc, true, true)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true)
 
 	alipayPrivHolder.Store(alipayPriv)
 

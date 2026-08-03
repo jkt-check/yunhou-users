@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"log"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
@@ -29,6 +30,8 @@ func Setup(
 	wechatAPIv3Key []byte,
 	providerTokenSvc *service.ProviderTokenService,
 	quoteSvc *service.QuoteService,
+	chatSvc *service.ChatService,
+	chatAccessLog *log.Logger,
 	githubOAuthSvc *service.GitHubOAuthService,
 	wechatOAuthSvc *service.WeChatOAuthService,
 	wechatOAuthMock bool,
@@ -46,6 +49,7 @@ func Setup(
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
+	chatHandler := handler.NewChatHandler(chatSvc, chatAccessLog)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
@@ -103,6 +107,14 @@ func Setup(
 	// path stays /apps/:id/quote without colliding with InternalAppAuth that
 	// wraps the other /apps/:id routes.
 	engine.POST("/apps/:id/quote", appLimiter, middleware.JWTAuth(tokenSvc), planHandler.PostQuote)
+
+	// Chat proxy — JWT-authenticated, subscription-gated DeepSeek streaming
+	// endpoint for consumer apps (kaya). Sits outside the 20s request
+	// timeout (see cmd/server timeoutMiddleware skip list) because the SSE
+	// stream can legitimately run longer; its own limiter bucket is tighter
+	// than the generic app bucket because every call spends upstream tokens.
+	chatLimiter := middleware.RateLimit(ctx, 10, 20)
+	engine.POST("/chat", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.StreamChat)
 
 	// Admin routes for plan management (internal service auth)
 	adminLimiter := middleware.RateLimit(ctx, 30, 60)

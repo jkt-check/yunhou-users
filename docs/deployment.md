@@ -74,6 +74,14 @@ on the host terminate TLS.
    sudo nginx -t && sudo systemctl reload nginx
    ```
 
+   > **Client IPs & rate limiting:** the app pins gin's trusted proxies to
+   > loopback + RFC1918 (`cmd/server/main.go`) so per-IP rate-limit buckets
+   > key on the real client IP from `X-Forwarded-For`. This assumes nginx is
+   > on the same host (or reached via the docker bridge). If you later put a
+   > public-IP hop in front (off-host nginx, CDN, WAF), every user will share
+   > one bucket keyed on that hop's IP — extend the trusted-proxies list in
+   > `cmd/server/main.go` to include that hop.
+
 8. **Open firewall**
 
    ```bash

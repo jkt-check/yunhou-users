@@ -22,17 +22,21 @@ import (
 
 // mockChatSvc implements chatStreamer with injectable results.
 type mockChatSvc struct {
-	resp   *http.Response
-	err    error
-	gotUID string
-	gotApp string
-	gotMsg []model.ChatMessage
+	resp               *http.Response
+	err                error
+	gotUID             string
+	gotApp             string
+	gotMsg             []model.ChatMessage
+	gotTools           []json.RawMessage
+	gotThinkingEnabled *bool
 }
 
-func (m *mockChatSvc) StreamChat(_ context.Context, userID, appID string, messages []model.ChatMessage) (*http.Response, error) {
+func (m *mockChatSvc) StreamChat(_ context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
 	m.gotUID = userID
 	m.gotApp = appID
 	m.gotMsg = messages
+	m.gotTools = tools
+	m.gotThinkingEnabled = thinkingEnabled
 	return m.resp, m.err
 }
 
@@ -102,6 +106,65 @@ func TestChatHandler_Validation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestChatHandler_ToolsValidation(t *testing.T) {
+	tooMany := strings.Builder{}
+	tooMany.WriteString(`{"messages":[{"role":"user","content":"hi"}],"tools":[`)
+	for i := 0; i < model.ChatMaxTools+1; i++ {
+		if i > 0 {
+			tooMany.WriteString(",")
+		}
+		tooMany.WriteString(`{"type":"function"}`)
+	}
+	tooMany.WriteString(`]}`)
+
+	bigTool := strings.Builder{}
+	bigTool.WriteString(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","description":"`)
+	bigTool.WriteString(strings.Repeat("a", model.ChatMaxToolsBytes+1))
+	bigTool.WriteString(`"}]}`)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"too many tools", tooMany.String()},
+		{"tools too large", bigTool.String()},
+		{"invalid tool element (non-object)", `{"messages":[{"role":"user","content":"hi"}],"tools":[null]}`},
+		{"invalid tool element (empty)", `{"messages":[{"role":"user","content":"hi"}],"tools":[""]}`},
+		{"invalid tool element (array)", `{"messages":[{"role":"user","content":"hi"}],"tools":[[]]}`},
+		{"body too large", `{"messages":[{"role":"user","content":"hi"}],"padding":"` + strings.Repeat("a", 150<<10) + `"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := chatTestRouter(&mockChatSvc{})
+			w := performChatRequest(r, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", w.Code)
+			}
+		})
+	}
+
+	// 合法 tools + thinking 透传到 svc。
+	t.Run("valid tools and thinking relayed", func(t *testing.T) {
+		sse := "data: [DONE]\n\n"
+		svc := &mockChatSvc{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}}
+		r, _ := chatTestRouter(svc)
+		w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"ls"}],"thinking_enabled":true}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if len(svc.gotTools) != 1 {
+			t.Fatalf("tools = %d, want 1", len(svc.gotTools))
+		}
+		if svc.gotThinkingEnabled == nil || !*svc.gotThinkingEnabled {
+			t.Fatalf("thinking_enabled not relayed: %v", svc.gotThinkingEnabled)
+		}
+	})
 }
 
 func TestChatHandler_ServiceErrors(t *testing.T) {

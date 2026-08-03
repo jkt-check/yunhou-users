@@ -1,5 +1,7 @@
 package model
 
+import "encoding/json"
+
 // ChatMessage is one turn of a chat conversation, in the OpenAI-compatible
 // shape that the DeepSeek chat.completions API consumes. The server proxies
 // these verbatim upstream — kaya owns conversation history and sends the
@@ -17,9 +19,24 @@ type ChatMessage struct {
 // identifier so chat access logs can group requests per session. The server
 // only validates length and echoes it into the audit log — it never uses it
 // for state.
+// Tools / ThinkingEnabled are relayed verbatim upstream (see
+// ChatService.StreamChat). They are optional: a client that only wants plain
+// chat omits them and the upstream payload is byte-identical to the
+// pre-tool-proxy shape.
 type ChatRequest struct {
 	Messages  []ChatMessage `json:"messages"`
 	SessionID string        `json:"session_id"`
+	// Tools is the OpenAI-compatible function/tool schema list, relayed
+	// verbatim to the upstream DeepSeek chat.completions `tools` field.
+	// The server treats it as opaque JSON — it never parses tool contents,
+	// only bounds total size (ChatMaxToolsBytes) and count (ChatMaxTools)
+	// so a hostile client can't push a multi-MB schema through the proxy.
+	// Omitted when the client only wants plain chat.
+	Tools []json.RawMessage `json:"tools,omitempty"`
+	// ThinkingEnabled relays kaya's reasoning toggle to the upstream
+	// DeepSeek `thinking: {"type": "enabled"}` parameter. Omitted (nil)
+	// when the client didn't ask for thinking mode.
+	ThinkingEnabled *bool `json:"thinking_enabled,omitempty"`
 }
 
 // ChatMaxMessages bounds the number of turns per request (abuse surface:
@@ -39,3 +56,12 @@ const ChatMaxTotalBytes = 32000
 // ChatMaxSessionIDLen bounds the optional session_id field — it is only an
 // audit-log grouping key, so anything longer is rejected rather than stored.
 const ChatMaxSessionIDLen = 64
+
+// ChatMaxTools bounds the number of tool definitions per request (abuse
+// surface: each tool inflates the upstream prompt and costs tokens).
+const ChatMaxTools = 16
+
+// ChatMaxToolsBytes bounds the total serialized size of the tools array.
+// Tool schemas are typically a few hundred bytes each (kaya ships 4 tools);
+// 32 KiB covers pathological schemas while bounding memory per request.
+const ChatMaxToolsBytes = 32 << 10

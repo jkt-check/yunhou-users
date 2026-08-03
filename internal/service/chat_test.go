@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -48,7 +49,7 @@ func seedChatActiveSub(repo *mockSubscriptionRepo, userID, planID string) {
 func TestChatService_NotEnabled(t *testing.T) {
 	svc := NewChatService("", "https://upstream.invalid", "deepseek-v4-flash",
 		newMockSubscriptionRepo(), newMockPlanRepo())
-	_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}})
+	_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
 	if !errors.Is(err, ErrChatNotEnabled) {
 		t.Fatalf("err = %v, want ErrChatNotEnabled", err)
 	}
@@ -90,7 +91,7 @@ func TestChatService_AccessGating(t *testing.T) {
 			planRepo := newMockPlanRepo()
 			planRepo.plans[tc.plan.ID] = tc.plan
 			svc := NewChatService("test-key", "https://upstream.invalid", "deepseek-v4-flash", tc.subRepo, planRepo)
-			_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}})
+			_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}
@@ -104,7 +105,7 @@ func TestChatService_RepoError(t *testing.T) {
 	subRepo := newMockSubscriptionRepo()
 	subRepo.findErr = errors.New("db down")
 	svc := NewChatService("test-key", "https://upstream.invalid", "deepseek-v4-flash", subRepo, newMockPlanRepo())
-	_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}})
+	_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
 	if err == nil || errors.Is(err, ErrChatNoAccess) || errors.Is(err, ErrChatNotEnabled) {
 		t.Fatalf("err = %v, want a wrapped repo error", err)
 	}
@@ -129,7 +130,7 @@ func TestChatService_StreamSuccess(t *testing.T) {
 	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
 
 	resp, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website",
-		[]model.ChatMessage{{Role: "system", Content: "be brief"}, {Role: "user", Content: "hi"}})
+		[]model.ChatMessage{{Role: "system", Content: "be brief"}, {Role: "user", Content: "hi"}}, nil, nil)
 	if err != nil {
 		t.Fatalf("StreamChat: %v", err)
 	}
@@ -166,6 +167,75 @@ func TestChatService_StreamSuccess(t *testing.T) {
 	}
 }
 
+// TestChatService_ToolsAndThinkingRelay locks the tool-proxy extension:
+// the upstream payload must carry `tools` verbatim and translate
+// thinking_enabled=true into DeepSeek's `thinking: {"type":"enabled"}`.
+// Omitted flags must NOT appear in the payload (back-compat with the
+// pre-tool-proxy shape).
+func TestChatService_ToolsAndThinkingRelay(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	var gotBody []byte
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	})
+
+	svc, subRepo, planRepo := chatTestFixture(t, upstream)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	thinking := true
+	tools := []json.RawMessage{
+		json.RawMessage(`{"type":"function","name":"run_shell"}`),
+		json.RawMessage(`{"type":"function","name":"list_dir"}`),
+	}
+	resp, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website",
+		[]model.ChatMessage{{Role: "user", Content: "hi"}}, tools, &thinking)
+	if err != nil {
+		t.Fatalf("StreamChat: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body := string(gotBody)
+	for _, want := range []string{`"tools"`, `"run_shell"`, `"list_dir"`, `"thinking":{"type":"enabled"}`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("upstream body missing %s: %s", want, body)
+		}
+	}
+}
+
+// TestChatService_NoToolsNoThinkingKeepsLegacyPayload locks back-compat:
+// a client that sends neither tools nor thinking_enabled gets an upstream
+// payload without those keys.
+func TestChatService_NoToolsNoThinkingKeepsLegacyPayload(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	var gotBody []byte
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	})
+
+	svc, subRepo, planRepo := chatTestFixture(t, upstream)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	resp, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website",
+		[]model.ChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
+	if err != nil {
+		t.Fatalf("StreamChat: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body := string(gotBody)
+	if strings.Contains(body, `"tools"`) || strings.Contains(body, `"thinking"`) {
+		t.Errorf("legacy payload must not contain tools/thinking: %s", body)
+	}
+}
+
 // TestChatService_StreamChunkedDelayed guards the cancel-on-close binding:
 // the transport's readLoop tears down the upstream connection when reqCtx is
 // cancelled, so cancelling at StreamChat return (instead of at body Close)
@@ -187,7 +257,7 @@ func TestChatService_StreamChunkedDelayed(t *testing.T) {
 	seedChatActiveSub(subRepo, "u-1", "monthly")
 	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
 
-	resp, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}})
+	resp, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
 	if err != nil {
 		t.Fatalf("StreamChat: %v", err)
 	}
@@ -222,7 +292,7 @@ func TestChatService_UpstreamErrors(t *testing.T) {
 			seedChatActiveSub(subRepo, "u-1", "monthly")
 			planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
 
-			_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}})
+			_, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", []model.ChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}

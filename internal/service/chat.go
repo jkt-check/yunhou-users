@@ -84,7 +84,15 @@ func (s *ChatService) SetBaseURL(u string) {
 // subscription whose plan is active and whose apps include appID. Errors are
 // the ErrChat* sentinels (mapped by the handler) plus wrapped repo errors
 // (500 at the handler).
-func (s *ChatService) StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage) (*http.Response, error) {
+//
+// tools / thinkingEnabled are relayed verbatim into the upstream payload:
+//   - tools (OpenAI-compatible tool schema list) → `tools` field, so the
+//     upstream model can emit tool_calls the client executes locally
+//     (kaya's run_shell / list_dir etc.). Bounds are validated by the
+//     handler (model.ChatMaxTools / ChatMaxToolsBytes) before any spend.
+//   - thinkingEnabled=true → `thinking: {"type": "enabled"}` (DeepSeek
+//     reasoning mode). nil/false → omitted, upstream default behavior.
+func (s *ChatService) StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
 	if s.apiKey == "" {
 		return nil, ErrChatNotEnabled
 	}
@@ -112,6 +120,12 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID string, mess
 		"model":    s.model,
 		"messages": messages,
 		"stream":   true,
+	}
+	if len(tools) > 0 {
+		payload["tools"] = tools
+	}
+	if thinkingEnabled != nil && *thinkingEnabled {
+		payload["thinking"] = map[string]any{"type": "enabled"}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

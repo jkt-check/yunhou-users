@@ -23,7 +23,7 @@ import (
 // local interface so handler tests can inject a hand-rolled mock without a
 // real upstream.
 type chatStreamer interface {
-	StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage) (*http.Response, error)
+	StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
 }
 
 // ChatHandler serves POST /chat — the JWT-authenticated, subscription-gated
@@ -47,6 +47,11 @@ func NewChatHandler(svc chatStreamer, accessLog *log.Logger) *ChatHandler {
 // against syscall overhead for the SSE relay loop.
 const chatStreamBufSize = 32 << 10
 
+// chatMaxBodyBytes caps the total request body size. Legal payloads:
+// messages ≤32 KiB + tools ≤32 KiB + JSON overhead — 128 KiB leaves
+// headroom while bounding MaxBytesReader allocation for hostile bodies.
+const chatMaxBodyBytes = 128 << 10
+
 // chatWriteTimeout is the per-response write deadline for /chat streams,
 // set via http.ResponseController. Slightly above ChatService's 5m upstream
 // timeout so the stream ends by ctx cancellation, never by a write kill.
@@ -66,6 +71,8 @@ type chatAccessEntry struct {
 	Status          string              `json:"status"` // "ok" | "error" | "disconnected" | "upstream_error"
 	Error           string              `json:"error,omitempty"`
 	MessageCount    int                 `json:"message_count"`
+	ToolsCount      int                 `json:"tools_count,omitempty"`
+	ThinkingEnabled bool                `json:"thinking_enabled,omitempty"`
 	InputBytes      int                 `json:"input_bytes"`
 	OutputBytes     int                 `json:"output_bytes"`
 	DurationMS      int64               `json:"duration_ms"`
@@ -80,6 +87,10 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	started := time.Now()
 	userID := c.GetString(middleware.ContextUserID)
 	appID := c.GetString(middleware.ContextAppID)
+
+	// 请求体总大小上限(滥用面):tools 字段加入后 body 面略增,128 KiB
+	// 覆盖 messages(≤32 KiB)+ tools(≤32 KiB)的合法组合,超限拒绝。
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, chatMaxBodyBytes)
 
 	var req model.ChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -97,8 +108,13 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		writeChatError(c, http.StatusBadRequest, "session_id too long")
 		return
 	}
+	if msg := validateChatTools(req.Tools); msg != "" {
+		h.logAccess(started, userID, appID, req, "error", msg, "")
+		writeChatError(c, http.StatusBadRequest, msg)
+		return
+	}
 
-	resp, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Messages)
+	resp, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Messages, req.Tools, req.ThinkingEnabled)
 	if err != nil {
 		status, msg := chatErrorMapping(err)
 		h.logAccess(started, userID, appID, req, "error", msg, "")
@@ -195,6 +211,8 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req mod
 		Status:          status,
 		Error:           errMsg,
 		MessageCount:    len(req.Messages),
+		ToolsCount:      len(req.Tools),
+		ThinkingEnabled: req.ThinkingEnabled != nil && *req.ThinkingEnabled,
 		InputBytes:      chatTotalBytes(req.Messages),
 		OutputBytes:     realBytes,
 		DurationMS:      time.Since(started).Milliseconds(),
@@ -384,6 +402,38 @@ func validateChatMessages(messages []model.ChatMessage) string {
 		total += len(m.Content)
 		if total > model.ChatMaxTotalBytes {
 			return "total message content too long"
+		}
+	}
+	return ""
+}
+
+// validateChatTools enforces the abuse bounds on the optional tools array.
+// Returns an empty string when valid, otherwise a human-readable reason.
+// The tools themselves are opaque JSON — the server never parses them.
+func validateChatTools(tools []json.RawMessage) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	if len(tools) > model.ChatMaxTools {
+		return "too many tools"
+	}
+	total := 0
+	for _, t := range tools {
+		// 元素必须是 JSON 对象(工具 schema):`null`/`123`/`"str"`/`[]` 等
+		// 合法但非对象的值会透传上游 → 上游 400 → 客户端得到语义模糊的
+		// 502。json.Valid + 首字符检查:ShouldBindJSON 已保证 body 合法,
+		// json.Valid 对已解析元素恒 true,作为解析路径变化的深层防御;
+		// 首字符 `{` 是实际生效的对象性检查。
+		if !json.Valid(t) {
+			return "invalid tool definition"
+		}
+		trimmed := bytes.TrimSpace(t)
+		if len(trimmed) == 0 || trimmed[0] != '{' {
+			return "invalid tool definition"
+		}
+		total += len(trimmed)
+		if total > model.ChatMaxToolsBytes {
+			return "tools too large"
 		}
 	}
 	return ""

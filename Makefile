@@ -7,13 +7,19 @@ build:
 run:
 	go run ./cmd/server
 
+# -p 1: package test binaries run sequentially. internal/repo and
+# internal/service DB-backed tests share ONE Postgres (both default
+# dbURL() to postgres://postgres@localhost/yunhou_users) and each wipes
+# tables in setup — run in parallel they TRUNCATE each other's data
+# (deadlocks, FK violations, duplicate keys). Serializing packages is the
+# cheap fix; per-package test DBs would force every dev to migrate two.
 test:
-	go test -race -cover ./internal/...
+	go test -race -cover -p 1 ./internal/...
 
 # ci-test mirrors the GitHub Actions workflow so local runs catch the
 # same regressions CI would.
 ci-test:
-	go test -race -coverprofile=coverage.out ./internal/... ./cmd/...
+	go test -race -coverprofile=coverage.out -p 1 ./internal/... ./cmd/...
 
 e2e:
 	go test -race -count=1 -v ./tests/e2e/

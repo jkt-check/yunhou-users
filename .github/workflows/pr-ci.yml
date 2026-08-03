@@ -33,4 +33,8 @@ jobs:
       - name: build
         run: go build ./...
       - name: unit test
-        run: go test -race ./internal/... ./cmd/...
+        # -p 1: internal/repo + internal/service DB tests share one Postgres
+        # and wipe tables in setup — parallel packages corrupt each other
+        # (see Makefile "test" for details). Harmless when DB tests skip
+        # (no Postgres in CI today); protects the day CI adds one.
+        run: go test -race -p 1 ./internal/... ./cmd/...

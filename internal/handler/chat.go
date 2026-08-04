@@ -396,7 +396,13 @@ func validateChatMessages(messages []model.ChatMessage) string {
 		if m.Content == "" {
 			return "message content is required"
 		}
-		if len(m.Content) > model.ChatMaxMessageBytes {
+		// System messages get their own (larger) budget — kaya's rendered
+		// system prompt is ~21-23 KB and must not hit the per-message cap.
+		limit := model.ChatMaxMessageBytes
+		if m.Role == "system" {
+			limit = model.ChatMaxSystemBytes
+		}
+		if len(m.Content) > limit {
 			return "message content too long"
 		}
 		total += len(m.Content)

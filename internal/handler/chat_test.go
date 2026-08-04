@@ -88,6 +88,7 @@ func TestChatHandler_Validation(t *testing.T) {
 		{"invalid role", `{"messages":[{"role":"robot","content":"hi"}]}`},
 		{"empty content", `{"messages":[{"role":"user","content":""}]}`},
 		{"content too long", `{"messages":[{"role":"user","content":"` + longContent + `"}]}`},
+		{"system content too long", `{"messages":[{"role":"system","content":"` + strings.Repeat("a", model.ChatMaxSystemBytes+1) + `"}]}`},
 		{"malformed json", `{"messages":`},
 	}
 	for _, tc := range cases {
@@ -105,6 +106,30 @@ func TestChatHandler_Validation(t *testing.T) {
 				t.Errorf("code = %v, want 400", resp["code"])
 			}
 		})
+	}
+}
+
+// TestChatHandler_SystemMessageBudget verifies that a system message that
+// exceeds the per-message cap (ChatMaxMessageBytes) but fits within the
+// system budget (ChatMaxSystemBytes) is accepted — not rejected as too long.
+func TestChatHandler_SystemMessageBudget(t *testing.T) {
+	// kaya's rendered system prompt is ~21 KB; build one that is larger than
+	// the 8000-byte per-message cap but within the 24576-byte system budget.
+	bigSystem := strings.Repeat("a", model.ChatMaxMessageBytes+1)
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+	svc := &mockChatSvc{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}}
+	r, mock := chatTestRouter(svc)
+	body := `{"messages":[{"role":"system","content":"` + bigSystem + `"},{"role":"user","content":"hi"}]}`
+	w := performChatRequest(r, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (system budget should allow >8000 bytes)", w.Code)
+	}
+	if len(mock.gotMsg) != 2 || mock.gotMsg[0].Role != "system" {
+		t.Errorf("messages relayed = %+v, want [system ..., user hi]", mock.gotMsg)
 	}
 }
 

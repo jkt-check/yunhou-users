@@ -20,7 +20,26 @@ concurrency:
 jobs:
   go-ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yunhou_users
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # internal/repo、internal/service、internal/migrate、tests/integration
+      # 的 DB 测试都读 DATABASE_URL（未设时静默 skip）——设上它让合并门禁
+      # 真正覆盖 DB 层，而不是 PR 全绿但 DB 零覆盖。
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -32,9 +51,22 @@ jobs:
         run: go vet ./internal/... ./cmd/...
       - name: build
         run: go build ./...
-      - name: unit test
-        # -p 1: internal/repo + internal/service DB tests share one Postgres
-        # and wipe tables in setup — parallel packages corrupt each other
-        # (see Makefile "test" for details). Harmless when DB tests skip
-        # (no Postgres in CI today); protects the day CI adds one.
-        run: go test -race -p 1 ./internal/... ./cmd/...
+      - name: apply migrations
+        # MIGRATIONS_DIR 缺省先试 /migrations（runner 上不存在）再回退
+        # ./migrations（从仓库根 go run），无需显式传。
+        run: go run ./cmd/migrate
+      - name: migrate idempotency smoke
+        # 迁移账本幂等：二跑必须全部 skipped、退出码 0（A1 验收标准）。
+        run: go run ./cmd/migrate
+      - name: unit + integration tests (postgres-backed)
+        # -p 1: internal/repo + internal/service + tests/integration 的 DB
+        # 测试共享一个 Postgres 并 TRUNCATE——并行包会互相污染（见 Makefile
+        # "test" 注释）。-race 全开。coverage.out 上传供人工查看。
+        run: go test -race -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...
+      - name: upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage.out
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7

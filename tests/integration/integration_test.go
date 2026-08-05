@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -32,6 +34,27 @@ func TestMain(m *testing.M) {
 	// set in setupServer) to mint JWTs without going through OAuth. Don't
 	// reintroduce /auth/login calls — use the testLogin helper instead.
 	os.Exit(m.Run())
+}
+
+// testKeyPriv / testKeyPub are ephemeral RSA keys generated once per test
+// process. The repo's keys/ dir is gitignored (never present on CI), so
+// tests must not depend on it — same pattern as tests/e2e/genRSAKeys.
+var (
+	testKeyPriv, testKeyPub = generateTestKeys()
+)
+
+func generateTestKeys() (priv, pub string) {
+	dir, err := os.MkdirTemp("", "yh-integration-keys-")
+	if err != nil {
+		panic(fmt.Sprintf("mkdir temp keys: %v", err))
+	}
+	priv = filepath.Join(dir, "private.pem")
+	pub = filepath.Join(dir, "public.pem")
+	if err := exec.Command("sh", "-c",
+		fmt.Sprintf("openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out %s && openssl rsa -pubout -in %s -out %s", priv, priv, pub)).Run(); err != nil {
+		panic(fmt.Sprintf("generate RSA keys: %v", err))
+	}
+	return priv, pub
 }
 
 func dbURL() string {
@@ -126,8 +149,8 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 		Port:             "8080",
 		JWTAccessTTL:     15 * time.Minute,
 		JWTRefreshTTL:    168 * time.Hour,
-		RSAPrivate:       "../../keys/private.pem",
-		RSAPublic:        "../../keys/public.pem",
+		RSAPrivate:       testKeyPriv,
+		RSAPublic:        testKeyPub,
 		OAuthStateSecret: "e2e-test-oauth-state-secret-padded-to-32-bytes",
 	}
 
@@ -638,8 +661,8 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 	cfg := &config.Config{
 		Port:                "8080",
 		DatabaseURL:         dbURL(),
-		RSAPrivate:          "../../keys/private.pem",
-		RSAPublic:           "../../keys/public.pem",
+		RSAPrivate:          testKeyPriv,
+		RSAPublic:           testKeyPub,
 		JWTAccessTTL:        15 * time.Minute,
 		JWTRefreshTTL:       168 * time.Hour,
 		OrderExpiryDuration: 30 * time.Minute,

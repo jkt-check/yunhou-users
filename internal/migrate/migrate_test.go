@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,8 +32,9 @@ func adminDBURL() string {
 func freshTestDB(t *testing.T) *sqlx.DB {
 	t.Helper()
 	name := "yunhou_migrate_test_" + strings.ReplaceAll(uuid.New().String()[:8], "-", "")
+	adminURL := adminDBURL()
 
-	admin, err := sqlx.Connect("postgres", adminDBURL())
+	admin, err := sqlx.Connect("postgres", adminURL)
 	if err != nil {
 		t.Skipf("skip: no postgres available (%v)", err)
 	}
@@ -43,15 +45,29 @@ func freshTestDB(t *testing.T) *sqlx.DB {
 	t.Cleanup(func() {
 		// Reconnect to admin to drop — the test DB connection may already
 		// be closed by the time Cleanup runs in a t.Fatal path.
-		adm, err := sqlx.Connect("postgres", adminDBURL())
+		adm, err := sqlx.Connect("postgres", adminURL)
 		if err == nil {
 			_, _ = adm.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
 			adm.Close()
 		}
 	})
 
-	dbURL := strings.Replace(adminDBURL(), "/postgres?", "/"+name+"?", 1)
-	db, err := sqlx.Connect("postgres", dbURL)
+	// Derive the per-test DB URL by replacing the database name in the
+	// admin URL's path with the fresh DB name. The previous
+	// strings.Replace(..., "/postgres?", ...) only worked when the admin
+	// URL pointed at the `postgres` maintenance database — with
+	// DATABASE_URL set to any other database (e.g. CI's yunhou_users)
+	// the replacement silently no-op'd and every migrate test ran
+	// against the SHARED DATABASE_URL database: the fake migrations
+	// (which ALTER TABLE users ... ADD COLUMN name) polluted the shared
+	// schema and broke every later `SELECT * FROM users` scan.
+	u, err := url.Parse(adminURL)
+	if err != nil {
+		admin.Close()
+		t.Fatalf("parse admin url %q: %v", adminURL, err)
+	}
+	u.Path = "/" + name
+	db, err := sqlx.Connect("postgres", u.String())
 	if err != nil {
 		t.Fatalf("connect test db %q: %v", name, err)
 	}

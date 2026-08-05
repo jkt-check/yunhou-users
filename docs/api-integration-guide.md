@@ -491,10 +491,12 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `messages` | 是 | 对话消息数组，OpenAI 兼容格式；`role` 取值 `system` / `user` / `assistant`。kaya 自行维护会话历史，每次请求携带完整上下文（服务端无状态代理） |
+| `messages` | 是 | 对话消息数组，OpenAI 兼容格式；`role` 取值 `system` / `user` / `assistant` / `tool`。kaya 自行维护会话历史，每次请求携带完整上下文（服务端无状态代理） |
 | `session_id` | 否 | 会话标识（≤64 字符），仅用于服务端访问日志按会话分组，不参与任何业务逻辑 |
+| `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
+| `thinking_enabled` | 否 | 布尔值；为 `true` 时上游请求带 `thinking: {"type": "enabled"}`（DeepSeek 推理模式），省略/`false` 时不下发该字段 |
 
-**限制**（超出返回 400）：1–20 条消息；每条 `content` 非空且 ≤8000 字节（`len()` 字节数，CJK 每字约 3 字节）；全部消息总字节数 ≤32000。
+**限制**（超出返回 400）：1–20 条消息；每条 `content` ≤8000 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息单独放宽到 ≤24576 字节；全部消息总字节数 ≤65536。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
 
 **响应（200）**：`Content-Type: text/event-stream`，逐块透传 DeepSeek 的 OpenAI 兼容 SSE 事件：
 
@@ -508,16 +510,17 @@ data: [DONE]
 
 kaya 端按 `data: ` 前缀解析 JSON，拼接 `choices[0].delta.content` 即得完整回复；`data: [DONE]` 表示流结束。
 
-**错误响应**（流开始前返回标准 JSON；流开始后的错误取决于成因——DeepSeek 自身发出的错误事件会原样透传，而上游连接中断（含 5 分钟超时）时流直接结束：客户端收不到 `data: [DONE]`，应把"缺少 `[DONE]` 的结束"视为失败并重试）：
+**错误响应**（流开始前返回标准 JSON；流开始后的错误取决于成因——DeepSeek 自身发出的错误事件会原样透传，而上游连接中断（含 5 分钟超时）时服务端会先向流内注入一条 `data: {"error":{"message":"upstream stream interrupted"}}` 事件再结束响应，客户端应把流内 `error` 事件与"缺少 `[DONE]` 的结束"都视为失败并重试）：
 
 | HTTP | message | 触发条件 |
 |---|---|---|
-| 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` | 请求体或消息不符合限制 |
+| 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` / `too many tools` / `tools too large` / `invalid tool definition` | 请求体、消息或 tools 不符合限制 |
 | 401 | `missing or invalid authorization header` / `invalid or expired token` | 未携带或无效 JWT（由 `JWTAuth` 中间件统一返回） |
 | 403 | `active subscription with access to this app is required` | 无有效订阅，或 Plan 未激活，或 `plan.apps` 不含 JWT `app_id` |
 | 404 | `chat is not enabled` | 服务端未配置 `DEEPSEEK_API_KEY` |
 | 429 | `chat upstream rate limit exceeded` | DeepSeek 上游限流 |
-| 502 | `chat upstream error` | 上游非 2xx 或网络错误 |
+| 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——永久性错误，重试同样的请求必败 |
+| 502 | `chat upstream error` | 上游 5xx 或网络错误 |
 
 **超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 5 分钟，订阅门禁的 DB 查询另有 10s 上限。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。错误行的输入按每条消息 1 KiB 截断（`input_truncated` 标记），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII），需部署侧配置轮转。
 

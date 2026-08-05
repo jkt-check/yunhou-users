@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -55,12 +56,29 @@ type ChatService struct {
 // secret convention for disabled channels.
 func NewChatService(apiKey, baseURL, model string, subRepo repo.SubscriptionRepo, planRepo repo.PlanRepo) *ChatService {
 	return &ChatService{
-		apiKey:     apiKey,
-		baseURL:    baseURL,
-		model:      model,
-		subRepo:    subRepo,
-		planRepo:   planRepo,
-		httpClient: &http.Client{Timeout: 0}, // no client-level cap: SSE stream length is bounded by ctx
+		apiKey:   apiKey,
+		baseURL:  baseURL,
+		model:    model,
+		subRepo:  subRepo,
+		planRepo: planRepo,
+		// No client-level Timeout: the SSE stream length is bounded by ctx
+		// (chatUpstreamTimeout). But the transport gets explicit dial and
+		// response-header deadlines so a silently-hung upstream fails in
+		// seconds instead of pinning the connection until the 5m ctx fires.
+		// Fields otherwise mirror http.DefaultTransport.
+		httpClient: &http.Client{Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+		}},
 	}
 }
 
@@ -157,6 +175,12 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID string, mess
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, chatUpstreamErrorBodyCap))
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return nil, fmt.Errorf("%w (status %d): %s", ErrChatRateLimited, resp.StatusCode, errBody)
+		}
+		// Upstream 4xx (other than 429) rejects the request itself — a
+		// permanent error that retrying will never fix, so it gets its own
+		// sentinel and a client message that doesn't suggest retrying.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return nil, fmt.Errorf("%w (status %d): %s", ErrChatUpstreamRejected, resp.StatusCode, errBody)
 		}
 		return nil, fmt.Errorf("%w (status %d): %s", ErrChatUpstreamError, resp.StatusCode, errBody)
 	}

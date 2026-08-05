@@ -7,8 +7,30 @@ import "encoding/json"
 // these verbatim upstream — kaya owns conversation history and sends the
 // full context each request (stateless proxy, no server-side sessions).
 type ChatMessage struct {
-	Role    string `json:"role"` // "system" | "user" | "assistant"
-	Content string `json:"content"`
+	Role       string     `json:"role"` // "system" | "user" | "assistant" | "tool"
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 轮发起的工具调用(透传上游)
+	ToolCallID string     `json:"tool_call_id,omitempty"` // role=tool 时关联的 assistant tool_call id
+}
+
+// ToolCall is the OpenAI Chat Completions assistant tool_call shape. The
+// server proxies it verbatim upstream — it never parses the contents, only
+// bounds message body size (see validateChatMessages). Keeping it structured
+// (instead of flattening to text) is what lets the model emit native
+// tool_calls instead of mimicking a text "[tool call: ...]" annotation in
+// history (which broke tool calling on the built-in model).
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // always "function"
+	Function ToolCallFunction `json:"function"`
+}
+
+// ToolCallFunction is the function payload of a tool_call. Arguments is a
+// JSON-encoded string (the OpenAI streaming-protocol shape), not an object —
+// matching what kaya serializes on the client side.
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // ChatRequest is the POST /chat request body. `stream` is intentionally not

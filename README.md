@@ -131,7 +131,7 @@ All configuration is via environment variables (or `.env` file):
 | POST | `/user/subscriptions` | Create subscription |
 | DELETE | `/user/subscriptions/:id` | Cancel subscription |
 | POST | `/apps/:id/quote` | Quote a plan for an app (amount, sub_expires_at, per-channel provider_data). JWT-authed; mounted at the engine level so the URL stays `/apps/:id/quote`. |
-| POST | `/chat` | Chat proxy for consumer apps (kaya): relays `{"messages":[{"role","content"}...]}` to DeepSeek (`deepseek-v4-flash`) and streams the SSE answer back verbatim. JWT-authed + subscription-gated (active subscription whose active plan's `apps[]` contains the JWT `app_id`); requires `DEEPSEEK_API_KEY` (404 otherwise). Exempt from the 20s request timeout; bounded by `chatUpstreamTimeout` (5m). Errors before the stream are JSON `{code,data,message}`; a `200` response is `text/event-stream`. |
+| POST | `/chat` | Chat proxy for consumer apps (kaya): relays `{"messages":[{"role","content"}...]}` (roles `system` / `user` / `assistant` / `tool`; ≤8000 bytes per message, ≤24576 for `system`, ≤65536 total; optional `tools` / `thinking_enabled`) to DeepSeek (`deepseek-v4-flash`) and streams the SSE answer back verbatim. JWT-authed + subscription-gated (active subscription whose active plan's `apps[]` contains the JWT `app_id`); requires `DEEPSEEK_API_KEY` (404 otherwise). Exempt from the 20s request timeout; bounded by `chatUpstreamTimeout` (5m). Errors before the stream are JSON `{code,data,message}`; a `200` response is `text/event-stream`. |
 
 ### Payments & Refunds (JWT Bearer)
 

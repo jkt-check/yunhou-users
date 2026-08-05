@@ -61,8 +61,9 @@ var (
 	ErrInvalidChannel          = errors.New("invalid channel")
 
 	// Chat proxy (POST /chat → DeepSeek chat.completions, SSE).
-	ErrChatNotEnabled    = errors.New("chat is not enabled")
-	ErrChatNoAccess      = errors.New("active subscription with access to this app is required")
-	ErrChatRateLimited   = errors.New("chat upstream rate limit exceeded")
-	ErrChatUpstreamError = errors.New("chat upstream error")
+	ErrChatNotEnabled       = errors.New("chat is not enabled")
+	ErrChatNoAccess         = errors.New("active subscription with access to this app is required")
+	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
+	ErrChatUpstreamError    = errors.New("chat upstream error")
+	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")
 )

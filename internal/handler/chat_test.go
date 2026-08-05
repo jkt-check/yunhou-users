@@ -201,6 +201,7 @@ func TestChatHandler_ServiceErrors(t *testing.T) {
 		{"not enabled", service.ErrChatNotEnabled, http.StatusNotFound},
 		{"no access", service.ErrChatNoAccess, http.StatusForbidden},
 		{"upstream rate limited", service.ErrChatRateLimited, http.StatusTooManyRequests},
+		{"upstream rejected", service.ErrChatUpstreamRejected, http.StatusBadGateway},
 		{"upstream error", service.ErrChatUpstreamError, http.StatusBadGateway},
 		{"internal", errors.New("boom"), http.StatusInternalServerError},
 	}
@@ -452,6 +453,28 @@ func TestChatHandler_AccessLog_UpstreamBroke(t *testing.T) {
 	}
 }
 
+// TestChatHandler_UpstreamBrokeInjectsErrorEvent: when the upstream stream
+// breaks mid-answer, the client must receive an explicit in-stream error
+// event after the partial chunks — not a [DONE]-less clean EOF that kaya
+// would render as a completed answer.
+func TestChatHandler_UpstreamBrokeInjectsErrorEvent(t *testing.T) {
+	partial := "data: {\"choices\":[{\"delta\":{\"content\":\"半\"}}]}\n\n"
+	svc := &mockChatSvc{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(&errAfterReader{data: partial}),
+	}}
+	r, _ := chatTestRouter(svc)
+	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stream had already started)", w.Code)
+	}
+	want := partial + "data: {\"error\":{\"message\":\"upstream stream interrupted\"}}\n\n"
+	if body := w.Body.String(); body != want {
+		t.Errorf("body = %q, want partial chunk + error event %q", body, want)
+	}
+}
+
 func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 	// Validation-failed requests carry unvalidated content — the audit line
 	// must cap it (per message) instead of mirroring the full payload.
@@ -481,5 +504,70 @@ func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 	// input_bytes still reflects the REAL (rejected) payload size.
 	if entry.InputBytes != len(long) {
 		t.Errorf("input_bytes = %d, want real length %d", entry.InputBytes, len(long))
+	}
+}
+
+// TestChatHandler_ToolMessagesAcceptance locks the structured tool_call
+// relay: role=tool messages and assistant turns carrying tool_calls must
+// pass validation (including empty content, which the OpenAI convention
+// allows there) and reach the service verbatim with their tool_calls /
+// tool_call_id fields intact. This is the proxy half of eliminating the text
+// "[tool call: ...]" annotation that broke the built-in model's tool calling.
+func TestChatHandler_ToolMessagesAcceptance(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	svc := &mockChatSvc{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}}
+	r, mock := chatTestRouter(svc)
+	// A multi-turn tool loop: assistant (empty content + tool_calls) followed
+	// by a tool result (role=tool + tool_call_id).
+	body := `{"messages":[` +
+		`{"role":"user","content":"list files"},` +
+		`{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"run_shell","arguments":"{\"cmd\":\"ls\"}"}}]},` +
+		`{"role":"tool","content":"file_a\nfile_b","tool_call_id":"call_1"}` +
+		`]}`
+	w := performChatRequest(r, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (tool messages must be accepted)", w.Code)
+	}
+	if len(mock.gotMsg) != 3 {
+		t.Fatalf("relayed messages = %d, want 3", len(mock.gotMsg))
+	}
+	assistant := mock.gotMsg[1]
+	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
+		t.Fatalf("assistant tool_calls not relayed: %+v", assistant)
+	}
+	tc := assistant.ToolCalls[0]
+	if tc.ID != "call_1" || tc.Type != "function" || tc.Function.Name != "run_shell" {
+		t.Errorf("tool_call shape wrong: %+v", tc)
+	}
+	if tc.Function.Arguments != `{"cmd":"ls"}` {
+		t.Errorf("arguments = %q, want JSON string {\"cmd\":\"ls\"}", tc.Function.Arguments)
+	}
+	tool := mock.gotMsg[2]
+	if tool.Role != "tool" || tool.ToolCallID != "call_1" || tool.Content != "file_a\nfile_b" {
+		t.Errorf("tool result not relayed with tool_call_id: %+v", tool)
+	}
+}
+
+// TestChatHandler_ToolRoleEmptyContentAccepted: role=tool with empty content
+// is legitimate (a tool that ran but produced no stdout) and must not trip the
+// "message content is required" check.
+func TestChatHandler_ToolRoleEmptyContentAccepted(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	svc := &mockChatSvc{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}}
+	r, _ := chatTestRouter(svc)
+	body := `{"messages":[{"role":"user","content":"hi"},` +
+		`{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"noop","arguments":"{}"}}]},` +
+		`{"role":"tool","content":"","tool_call_id":"c1"}]}`
+	w := performChatRequest(r, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (empty tool content must be accepted)", w.Code)
 	}
 }

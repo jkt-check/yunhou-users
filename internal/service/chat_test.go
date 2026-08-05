@@ -280,7 +280,8 @@ func TestChatService_UpstreamErrors(t *testing.T) {
 	}{
 		{"rate limited", http.StatusTooManyRequests, ErrChatRateLimited},
 		{"upstream 500", http.StatusInternalServerError, ErrChatUpstreamError},
-		{"upstream 401", http.StatusUnauthorized, ErrChatUpstreamError},
+		{"upstream 400", http.StatusBadRequest, ErrChatUpstreamRejected},
+		{"upstream 401", http.StatusUnauthorized, ErrChatUpstreamRejected},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -297,5 +298,57 @@ func TestChatService_UpstreamErrors(t *testing.T) {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestChatService_ToolCallsRelay locks the structured tool_call pass-through:
+// an assistant turn with tool_calls and a role=tool result (with
+// tool_call_id) must reach the upstream payload verbatim — NOT flattened to
+// text. This is what lets DeepSeek keep a structured multi-turn tool loop
+// instead of seeing a "[tool call: ...]" text annotation it would mimic on
+// the next turn (the root cause of the built-in model's tool-calling failure).
+func TestChatService_ToolCallsRelay(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	var gotBody []byte
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	})
+
+	svc, subRepo, planRepo := chatTestFixture(t, upstream)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	messages := []model.ChatMessage{
+		{Role: "user", Content: "list files"},
+		{Role: "assistant", Content: "", ToolCalls: []model.ToolCall{
+			{ID: "call_1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: `{"cmd":"ls"}`}},
+		}},
+		{Role: "tool", Content: "file_a\nfile_b", ToolCallID: "call_1"},
+	}
+	resp, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", messages, nil, nil)
+	if err != nil {
+		t.Fatalf("StreamChat: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body := string(gotBody)
+	for _, want := range []string{
+		`"role":"tool"`,
+		`"tool_call_id":"call_1"`,
+		`"tool_calls"`,
+		`"name":"run_shell"`,
+		`"arguments"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("upstream body missing %s: %s", want, body)
+		}
+	}
+	// Legacy-shape guarantee: the text annotation that used to carry tool
+	// calls must NOT appear anywhere in the structured payload.
+	if strings.Contains(body, "[tool call:") {
+		t.Errorf("upstream body contains text tool-call annotation: %s", body)
 	}
 }

@@ -48,7 +48,7 @@ func NewChatHandler(svc chatStreamer, accessLog *log.Logger) *ChatHandler {
 const chatStreamBufSize = 32 << 10
 
 // chatMaxBodyBytes caps the total request body size. Legal payloads:
-// messages ≤32 KiB + tools ≤32 KiB + JSON overhead — 128 KiB leaves
+// messages ≤64 KiB + tools ≤32 KiB + JSON overhead — 128 KiB leaves
 // headroom while bounding MaxBytesReader allocation for hostile bodies.
 const chatMaxBodyBytes = 128 << 10
 
@@ -89,7 +89,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	appID := c.GetString(middleware.ContextAppID)
 
 	// 请求体总大小上限(滥用面):tools 字段加入后 body 面略增,128 KiB
-	// 覆盖 messages(≤32 KiB)+ tools(≤32 KiB)的合法组合,超限拒绝。
+	// 覆盖 messages(≤64 KiB)+ tools(≤32 KiB)的合法组合,超限拒绝。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, chatMaxBodyBytes)
 
 	var req model.ChatRequest
@@ -144,6 +144,15 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	}
 
 	raw, result := relayChatSSE(c.Writer, resp.Body)
+	if result == chatRelayUpstreamBroke {
+		// Upstream died mid-stream (no [DONE] relayed): a clean EOF here
+		// would make kaya render the partial answer as complete. Inject an
+		// in-stream error event (kaya parses the error key) before ending
+		// the response. Bytes already relayed are untouched; a write error
+		// means the client is also gone, which changes nothing.
+		_, _ = io.WriteString(c.Writer, chatUpstreamBrokeEvent)
+		c.Writer.Flush()
+	}
 	output := extractChatOutput(raw)
 	status := "ok"
 	errMsg := ""
@@ -176,6 +185,11 @@ func chatErrorMapping(err error) (int, string) {
 	case errors.Is(err, service.ErrChatRateLimited):
 		log.Printf("chat: upstream rate limited: %v", err)
 		return http.StatusTooManyRequests, service.ErrChatRateLimited.Error()
+	case errors.Is(err, service.ErrChatUpstreamRejected):
+		// Upstream 4xx (≠429) — permanent; retrying the same request will
+		// fail again, so the message must not invite a retry.
+		log.Printf("chat: upstream rejected: %v", err)
+		return http.StatusBadGateway, service.ErrChatUpstreamRejected.Error()
 	case errors.Is(err, service.ErrChatUpstreamError):
 		log.Printf("chat: upstream error: %v", err)
 		return http.StatusBadGateway, service.ErrChatUpstreamError.Error()
@@ -300,6 +314,11 @@ const (
 	chatRelayUpstreamBroke                        // upstream read failed mid-stream
 )
 
+// chatUpstreamBrokeEvent is the SSE event injected client-side when the
+// upstream stream breaks mid-answer, so kaya sees an explicit error instead
+// of a [DONE]-less clean EOF it would render as a completed answer.
+const chatUpstreamBrokeEvent = "data: {\"error\":{\"message\":\"upstream stream interrupted\"}}\n\n"
+
 // flushWriter is the slice of gin.ResponseWriter the relay needs, declared
 // so tests can drive the relay with hand-rolled fakes.
 type flushWriter interface {
@@ -389,11 +408,16 @@ func validateChatMessages(messages []model.ChatMessage) string {
 	total := 0
 	for _, m := range messages {
 		switch m.Role {
-		case "system", "user", "assistant":
+		case "system", "user", "assistant", "tool":
 		default:
 			return "invalid message role"
 		}
-		if m.Content == "" {
+		// content is required for text-bearing roles. Two cases are exempt
+		// (DeepSeek accepts empty content there): role=tool — a tool result
+		// that may legitimately be empty — and assistant turns that carry
+		// tool_calls (a pure tool-call turn, content empty by OpenAI
+		// convention). Everything else with empty content is rejected.
+		if m.Content == "" && m.Role != "tool" && len(m.ToolCalls) == 0 {
 			return "message content is required"
 		}
 		// System messages get their own (larger) budget — kaya's rendered

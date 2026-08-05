@@ -655,37 +655,67 @@ func TestConfirm_LifetimeOrderBlockedAfterUpgrade(t *testing.T) {
 	}
 }
 
-// TestConfirm_HintSurvivesPlanDeletedMidPayment (review N1): the plan
-// row is deleted between order creation and payment, AND the caller
-// supplies a hint. The downgrade guard can't compare intervals without
-// the plan row — the hint must be forwarded (pre-rollover behavior for
-// this edge) instead of being discarded into the plan-missing branch.
-func TestConfirm_HintSurvivesPlanDeletedMidPayment(t *testing.T) {
+// TestConfirm_PlanMissing_ExistingSubUntouched: with the RESTRICT FKs on
+// orders/subscriptions.plan_id, "plan deleted mid-payment" is only
+// reachable via manual DB surgery (simulated below by bypassing FK
+// enforcement). Confirm must not fail and must NOT touch the existing
+// active subscription — no activation can reference the missing plan —
+// and the audit trail must record the event.
+func TestConfirm_PlanMissing_ExistingSubUntouched(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	seedActiveSub(t, db, uid, "monthly", time.Now().Add(10*24*time.Hour))
+	seededExpiry := time.Now().Add(10 * 24 * time.Hour)
+	seedActiveSub(t, db, uid, "monthly", seededExpiry)
 
 	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
-	// Plan deleted mid-payment (operator mistake / extreme race).
-	if _, err := db.ExecContext(context.Background(),
-		`DELETE FROM plans WHERE id = 'yearly'`); err != nil {
+	// Delete the plan with FK enforcement bypassed — orders_plan_id_fkey
+	// is ON DELETE RESTRICT and would refuse this in a consistent DB.
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin conn: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SET session_replication_role = 'replica'`); err != nil {
+		t.Fatalf("disable triggers: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM plans WHERE id = 'yearly'`); err != nil {
 		t.Fatalf("delete plan: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SET session_replication_role = 'origin'`); err != nil {
+		t.Fatalf("re-enable triggers: %v", err)
 	}
 
 	hint := time.Now().Add(400 * 24 * time.Hour).UTC().Truncate(time.Second)
 	if _, err := svc.Confirm(context.Background(), ConfirmInput{
-		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-hint-survives",
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-plan-missing",
 		ExpiresAt: &hint,
 	}); err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
 
-	_, expiresAt := readSub(t, db, uid)
-	withinSeconds(t, expiresAt, hint, time.Second)
+	// The existing active subscription must be untouched: still monthly,
+	// still the seeded expiry — the missing-plan path skips activation.
+	planID, expiresAt := readSub(t, db, uid)
+	if planID != "monthly" {
+		t.Errorf("active sub plan = %q, want monthly (untouched)", planID)
+	}
+	withinSeconds(t, expiresAt, seededExpiry, time.Second)
+
+	// The audit trail records the plan-missing event.
+	var auditCount int
+	if err := db.Get(&auditCount,
+		`SELECT COUNT(*) FROM audit_log WHERE action = 'subscription_expiry_plan_missing' AND target = $1`,
+		"plan:yearly"); err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if auditCount == 0 {
+		t.Error("expected a subscription_expiry_plan_missing audit row")
+	}
 }
 
 // TestPaymentService_CreateOrder_StaleActiveSubAllowsRenewal exercises
@@ -2823,12 +2853,13 @@ func TestConfirm_DifferentOrder_SameUser_UpgradeRollover(t *testing.T) {
 	}
 }
 
-// TestConfirm_PlanMissing_AuditLogAndNullExpiry covers the audit-log
+// TestConfirm_PlanMissing_AuditLogNoActivation covers the audit-log
 // branch in resolveSubExpiry when the plan row was deleted between
-// order creation and Confirm arrival. Expected behavior: audit-log
-// is written; subscription is activated with expires_at=NULL
-// (existing "NULL = never expires" semantics, auth path picks it up).
-func TestConfirm_PlanMissing_AuditLogAndNullExpiry(t *testing.T) {
+// order creation and Confirm arrival. Expected behavior: audit-log is
+// written; subscription activation is skipped (a subscription cannot
+// reference the missing plan — the FK would reject the insert); the
+// order's payment still succeeds for manual ops follow-up.
+func TestConfirm_PlanMissing_AuditLogNoActivation(t *testing.T) {
 	db := setupPaymentDB(t)
 	s := newTestPaymentService(t, db)
 
@@ -2837,10 +2868,10 @@ func TestConfirm_PlanMissing_AuditLogAndNullExpiry(t *testing.T) {
 	// Insert a plan, seed the order, then delete the plan. The
 	// orders.plan_id FK is ON DELETE RESTRICT, so we have to bypass
 	// the FK enforcement via session_replication_role='replica' to
-	// simulate the rare "plan row missing" state (the helper still
-	// covers it; production rarely hits it because the FK would
-	// block plan deletion in the first place, but the audit-log
-	// path must still behave correctly when reached).
+	// simulate the rare "plan row missing" state (production rarely
+	// hits it because the FK would block plan deletion in the first
+	// place, but the audit-log path must still behave correctly when
+	// reached).
 	if _, err := db.ExecContext(context.Background(),
 		`INSERT INTO plans (id, name, price, interval_days, apps, is_active) VALUES ($1, 'Doomed', 0, 30, '{yundian}', true)`,
 		planID); err != nil {
@@ -2872,24 +2903,26 @@ func TestConfirm_PlanMissing_AuditLogAndNullExpiry(t *testing.T) {
 		t.Fatalf("re-enable triggers: %v", err)
 	}
 
-	_, err = s.Confirm(context.Background(), ConfirmInput{
+	if _, err := s.Confirm(context.Background(), ConfirmInput{
 		OrderID:       orderID,
 		UserID:        userID,
 		Channel:       "wechat_pay",
 		ExternalTxnID: "txn-plan-missing-1",
 		ExpiresAt:     nil,
-	})
-	if err != nil {
-		t.Fatalf("Confirm should not fail on plan missing (audit + nil): %v", err)
+	}); err != nil {
+		t.Fatalf("Confirm should not fail on plan missing (audit + no activation): %v", err)
 	}
 
-	var exp sql.NullTime
-	if err := db.Get(&exp,
-		`SELECT expires_at FROM subscriptions WHERE user_id = $1`, userID); err != nil {
-		t.Fatalf("read sub: %v", err)
+	// No subscription may be created: a row referencing the missing plan
+	// would violate subscriptions_plan_id_fkey. The payment still goes
+	// through for manual ops to follow up from the audit log.
+	var subCount int
+	if err := db.Get(&subCount,
+		`SELECT COUNT(*) FROM subscriptions WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("count subs: %v", err)
 	}
-	if exp.Valid {
-		t.Errorf("expires_at should be NULL when plan missing, got %v", exp.Time)
+	if subCount != 0 {
+		t.Errorf("expected no subscription row when plan is missing, got %d", subCount)
 	}
 
 	// Audit log entry was written.

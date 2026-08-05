@@ -38,7 +38,9 @@ var ErrWechatPayNotConfigured = errors.New("wechat pay not configured on this de
 
 // ErrPlanMissingForExpiry is returned by resolveSubExpiry when the plan row
 // was deleted between order creation and webhook/confirm arrival. Callers
-// audit-log this and fall back to the existing "NULL = never expires" branch.
+// audit-log this and skip subscription activation: with the RESTRICT FKs on
+// orders.plan_id / subscriptions.plan_id the state is only reachable via
+// manual DB surgery, and no INSERT/UPDATE can reference a missing plan.
 var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 
 // ErrDowngradeActivationBlocked is returned by resolveSubExpiry when a
@@ -880,6 +882,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	// first activation replacing an unexpired sub rolls the remaining
 	// days over (resolveSubExpiry branch 3).
 	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, in.ExpiresAt, preservedExpiry)
+	planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
 	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
 	if downgradeRetry {
 		// The first delivery wrote its own audit row when it blocked;
@@ -921,7 +924,10 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		return nil, fmt.Errorf("resolve sub expiry: %w", rerr)
 	}
 	activated := false
-	if !downgradeBlocked {
+	// planMissing: a subscription cannot reference the missing plan (the
+	// FK would reject the INSERT/UPDATE), so skip activation; the order
+	// still goes paid below and ops follows up from the audit log.
+	if !downgradeBlocked && !planMissing {
 		activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry)
 		if err != nil {
 			return nil, fmt.Errorf("activate sub: %w", err)
@@ -1390,6 +1396,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
 	// row.
 	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, e.SubExpiresAt, preservedExpiry)
+	planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
 	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
 	if downgradeRetry {
 		// The first delivery wrote its own audit row when it blocked;
@@ -1409,8 +1416,8 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	case rerr == nil:
 	case errors.Is(rerr, ErrPlanMissingForExpiry):
 		// Intentional: plan_missing is informational — the payment already
-		// succeeded, so we silently audit and let NULL fall through instead
-		// of failing the activation.
+		// succeeded, so we silently audit and skip activation (a
+		// subscription cannot reference the missing plan).
 		_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
 			fmt.Sprintf("plan:%s", order.PlanID),
 			[]string{"webhook", "expiry_fallback", "plan_missing"},
@@ -1436,7 +1443,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	default:
 		return fmt.Errorf("resolve sub expiry: %w", rerr)
 	}
-	if !downgradeBlocked {
+	if !downgradeBlocked && !planMissing {
 		if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry); err != nil {
 			return fmt.Errorf("activate sub: %w", err)
 		}
@@ -2318,15 +2325,13 @@ func (s *PaymentService) resolveSubExpiry(
 	if existing != nil && (existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now())) {
 		p, err := loadPlan()
 		if err != nil {
-			// The plan row was deleted mid-payment AND the caller
-			// supplied a hint: the guard can't compare intervals without
-			// the plan row, so fall back to the hint rather than
-			// discarding it (pre-rollover behavior for this edge). The
-			// no-hint shape still returns ErrPlanMissingForExpiry and
-			// the call sites audit + write NULL, as before.
-			if errors.Is(err, ErrPlanMissingForExpiry) && candidate != nil {
-				return candidate, nil
-			}
+			// Plan deleted mid-payment: with the RESTRICT FKs on
+			// orders/subscriptions.plan_id this state is only reachable
+			// via manual DB surgery, and no activation can reference the
+			// missing plan (any INSERT/UPDATE would violate the FK). The
+			// caller's hint has no destination to attach to — always
+			// surface ErrPlanMissingForExpiry so call sites audit and
+			// skip activation.
 			return nil, err
 		}
 		oldPlan, oErr := s.txLookupPlan(ctx, tx, existing.PlanID)

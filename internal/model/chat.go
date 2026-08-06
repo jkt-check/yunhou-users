@@ -68,18 +68,19 @@ const ChatMaxMessages = 20
 
 // ChatMaxMessageBytes bounds a single non-system message's content length in
 // BYTES (len(), not runes — CJK content counts ~3 bytes per character). Long
-// paste-in of documents should be chunked by the caller.
-const ChatMaxMessageBytes = 8000
+// paste-in of documents should be chunked by the caller. Matches the client's
+// MAX_MESSAGE_BYTES (v1.2.3: 8000 → 32768).
+const ChatMaxMessageBytes = 32768
 
 // ChatMaxSystemBytes bounds a single system message's content length. kaya's
-// rendered system prompt is ~21-23 KB, well above the per-message cap, so
-// system messages get their own budget that matches the client (see
-// MAX_SYSTEM_BYTES in yunhou_chat.rs). This must stay in sync with the client.
+// rendered system prompt is ~21-23 KB, so system messages get their own
+// budget that matches the client (see MAX_SYSTEM_BYTES in yunhou_chat.rs).
+// This must stay in sync with the client.
 const ChatMaxSystemBytes = 24576
 
 // ChatMaxTotalBytes bounds the total request size in bytes across all
-// messages. Matches the client's MAX_TOTAL_BYTES.
-const ChatMaxTotalBytes = 65536
+// messages. Matches the client's MAX_TOTAL_BYTES (v1.2.3: 65536 → 262144).
+const ChatMaxTotalBytes = 262144
 
 // ChatMaxSessionIDLen bounds the optional session_id field — it is only an
 // audit-log grouping key, so anything longer is rejected rather than stored.

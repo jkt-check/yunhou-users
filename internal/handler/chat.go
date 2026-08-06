@@ -48,9 +48,10 @@ func NewChatHandler(svc chatStreamer, accessLog *log.Logger) *ChatHandler {
 const chatStreamBufSize = 32 << 10
 
 // chatMaxBodyBytes caps the total request body size. Legal payloads:
-// messages ≤64 KiB + tools ≤32 KiB + JSON overhead — 128 KiB leaves
-// headroom while bounding MaxBytesReader allocation for hostile bodies.
-const chatMaxBodyBytes = 128 << 10
+// messages ≤256 KiB + tools ≤32 KiB + JSON overhead ≈ 290 KiB — 320 KiB
+// leaves ~30 KiB headroom while bounding MaxBytesReader allocation for
+// hostile bodies (spec §5.1: 128 KiB → 320 KiB).
+const chatMaxBodyBytes = 320 << 10
 
 // chatWriteTimeout is the per-response write deadline for /chat streams,
 // set via http.ResponseController. Slightly above ChatService's 5m upstream
@@ -88,8 +89,8 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	appID := c.GetString(middleware.ContextAppID)
 
-	// 请求体总大小上限(滥用面):tools 字段加入后 body 面略增,128 KiB
-	// 覆盖 messages(≤64 KiB)+ tools(≤32 KiB)的合法组合,超限拒绝。
+	// 请求体总大小上限(滥用面):tools 字段加入后 body 面略增,320 KiB
+	// 覆盖 messages(≤256 KiB)+ tools(≤32 KiB)的合法组合,超限拒绝。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, chatMaxBodyBytes)
 
 	var req model.ChatRequest
@@ -204,8 +205,8 @@ func chatErrorMapping(err error) (int, string) {
 // balloon the file. OutputBytes always reflects the REAL output length
 // (before truncation) so cost analysis isn't skewed by the log cap. On
 // error lines the input is truncated too: validation-failed requests carry
-// unvalidated (potentially near-64 KiB) content that would otherwise be
-// mirrored into the log in full.
+// unvalidated (potentially near-32 KiB per message) content that would
+// otherwise be mirrored into the log in full.
 func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req model.ChatRequest, status, errMsg, output string) {
 	if h.accessLog == nil {
 		return
@@ -420,8 +421,9 @@ func validateChatMessages(messages []model.ChatMessage) string {
 		if m.Content == "" && m.Role != "tool" && len(m.ToolCalls) == 0 {
 			return "message content is required"
 		}
-		// System messages get their own (larger) budget — kaya's rendered
-		// system prompt is ~21-23 KB and must not hit the per-message cap.
+		// System messages get their own budget (ChatMaxSystemBytes, synced
+		// with kaya's MAX_SYSTEM_BYTES). kaya's rendered system prompt is
+		// ~21-23 KB and is truncated client-side to that budget.
 		limit := model.ChatMaxMessageBytes
 		if m.Role == "system" {
 			limit = model.ChatMaxSystemBytes

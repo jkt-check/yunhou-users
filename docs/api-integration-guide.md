@@ -496,7 +496,7 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 | `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
 | `thinking_enabled` | 否 | 布尔值；为 `true` 时上游请求带 `thinking: {"type": "enabled"}`（DeepSeek 推理模式），省略/`false` 时不下发该字段 |
 
-**限制**（超出返回 400）：1–20 条消息；每条 `content` ≤8000 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息单独放宽到 ≤24576 字节；全部消息总字节数 ≤65536。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
+**限制**（超出返回 400）：1–20 条消息；每条 `content` ≤32768 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息走独立上限 ≤24576 字节；全部消息总字节数 ≤262144。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
 
 **响应（200）**：`Content-Type: text/event-stream`，逐块透传 DeepSeek 的 OpenAI 兼容 SSE 事件：
 

@@ -109,13 +109,15 @@ func TestChatHandler_Validation(t *testing.T) {
 	}
 }
 
-// TestChatHandler_SystemMessageBudget verifies that a system message that
-// exceeds the per-message cap (ChatMaxMessageBytes) but fits within the
-// system budget (ChatMaxSystemBytes) is accepted — not rejected as too long.
+// TestChatHandler_SystemMessageBudget verifies that a system message is
+// judged against the system budget (ChatMaxSystemBytes), not the general
+// per-message cap (ChatMaxMessageBytes). The per-message cap now exceeds
+// the system budget (32 KiB vs 24 KiB), so the system budget is the binding
+// constraint — a system message right at the budget must be accepted.
 func TestChatHandler_SystemMessageBudget(t *testing.T) {
-	// kaya's rendered system prompt is ~21 KB; build one that is larger than
-	// the 8000-byte per-message cap but within the 24576-byte system budget.
-	bigSystem := strings.Repeat("a", model.ChatMaxMessageBytes+1)
+	// kaya's rendered system prompt is ~21 KB; build one right at the
+	// 24576-byte system budget.
+	bigSystem := strings.Repeat("a", model.ChatMaxSystemBytes)
 	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
 	svc := &mockChatSvc{resp: &http.Response{
 		StatusCode: http.StatusOK,
@@ -126,7 +128,7 @@ func TestChatHandler_SystemMessageBudget(t *testing.T) {
 	body := `{"messages":[{"role":"system","content":"` + bigSystem + `"},{"role":"user","content":"hi"}]}`
 	w := performChatRequest(r, body)
 	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (system budget should allow >8000 bytes)", w.Code)
+		t.Fatalf("status = %d, want 200 (system budget allows content up to ChatMaxSystemBytes)", w.Code)
 	}
 	if len(mock.gotMsg) != 2 || mock.gotMsg[0].Role != "system" {
 		t.Errorf("messages relayed = %+v, want [system ..., user hi]", mock.gotMsg)
@@ -158,7 +160,7 @@ func TestChatHandler_ToolsValidation(t *testing.T) {
 		{"invalid tool element (non-object)", `{"messages":[{"role":"user","content":"hi"}],"tools":[null]}`},
 		{"invalid tool element (empty)", `{"messages":[{"role":"user","content":"hi"}],"tools":[""]}`},
 		{"invalid tool element (array)", `{"messages":[{"role":"user","content":"hi"}],"tools":[[]]}`},
-		{"body too large", `{"messages":[{"role":"user","content":"hi"}],"padding":"` + strings.Repeat("a", 150<<10) + `"}`},
+		{"body too large", `{"messages":[{"role":"user","content":"hi"}],"padding":"` + strings.Repeat("a", chatMaxBodyBytes+1) + `"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -478,7 +480,7 @@ func TestChatHandler_UpstreamBrokeInjectsErrorEvent(t *testing.T) {
 func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 	// Validation-failed requests carry unvalidated content — the audit line
 	// must cap it (per message) instead of mirroring the full payload.
-	long := strings.Repeat("滥", model.ChatMaxMessageBytes) // fails the 8000-byte validation
+	long := strings.Repeat("滥", model.ChatMaxMessageBytes) // fails the per-message validation
 	body := `{"messages":[{"role":"user","content":"` + long + `"}]}`
 	r, logBuf := chatTestRouterWithLog(&mockChatSvc{})
 	w := performChatRequest(r, body)

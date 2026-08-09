@@ -40,8 +40,16 @@ type Config struct {
 	// and dev environments can drive the order-paid → subscription
 	// activated flow without a registered merchant. Pair with the
 	// mock-mode NATIVE UnifiedOrder in internal/billing/wechat/.
-	// Production MUST leave this false.
+	// Production MUST leave this false — Validate() hard-fails when it
+	// combines with PAYPAL_ENV=live or a full set of real WeChat Pay
+	// credentials.
 	WeChatPayMock bool
+
+	// PaypalL3E2EMode gates the dev-only POST /test/login endpoint (route
+	// registration in router.Setup + check inside the handler). It mints
+	// real JWTs for arbitrary emails with no OAuth, so Validate()
+	// hard-fails when it combines with PAYPAL_ENV=live.
+	PaypalL3E2EMode bool
 
 	// WeChatPayMchID is the 微信支付商户号. Required when WeChatPayMock
 	// is false (production); ignored otherwise. Per-app overrides live
@@ -149,6 +157,7 @@ func Load() *Config {
 		GitHubClientSecret:         os.Getenv("GITHUB_CLIENT_SECRET"),
 		WeChatOAuthMock:            os.Getenv("WECHAT_OAUTH_MOCK") == "1",
 		WeChatPayMock:              os.Getenv("WECHAT_PAY_MOCK") == "1",
+		PaypalL3E2EMode:            os.Getenv("PAYPAL_L3_E2E_MODE") == "1",
 		WeChatPayMchID:             os.Getenv("WECHAT_PAY_MCH_ID"),
 		WeChatPayAppID:             os.Getenv("WECHAT_PAY_APP_ID"),
 		WeChatPayMchPrivateKeyPath: os.Getenv("WECHAT_PAY_MCH_PRIVATE_KEY_PATH"),
@@ -246,6 +255,32 @@ func (c *Config) Validate() error {
 				c.WeChatPayMchCertPath == "" || c.WeChatPayNotifyURL == "")):
 		return errors.New("real WeChat Pay mode requires ALL of: WECHAT_PAY_MCH_ID, WECHAT_PAY_API_V3_KEY, WECHAT_PAY_APP_ID, " +
 			"WECHAT_PAY_MCH_PRIVATE_KEY_PATH, WECHAT_PAY_MCH_CERT_PATH, WECHAT_PAY_NOTIFY_URL")
+	}
+	// Test/mock escape hatches each bypass a real security boundary
+	// (/test/login mints arbitrary JWTs, WECHAT_PAY_MOCK accepts unsigned
+	// payment webhooks, WECHAT_OAUTH_MOCK logs in a fixed identity). They
+	// exist for dev/e2e only — hard-fail at startup when one combines with
+	// a production signal so a stray env line in a production .env is
+	// caught at deploy time instead of silently opening the bypass.
+	if c.PaypalEnv == "live" {
+		if c.PaypalL3E2EMode {
+			return errors.New("PAYPAL_L3_E2E_MODE must not be enabled when PAYPAL_ENV=live")
+		}
+		if c.WeChatPayMock {
+			return errors.New("WECHAT_PAY_MOCK must not be enabled when PAYPAL_ENV=live")
+		}
+		if c.WeChatOAuthMock {
+			return errors.New("WECHAT_OAUTH_MOCK must not be enabled when PAYPAL_ENV=live")
+		}
+	}
+	// A fully-populated real WeChat Pay credential tuple alongside mock
+	// mode is the same class of misconfig: the deployment looks production
+	// but the webhook verifier is disarmed.
+	if c.WeChatPayMock &&
+		c.WeChatPayMchID != "" && c.WeChatAPIv3Key != "" &&
+		c.WeChatPayAppID != "" && c.WeChatPayMchPrivateKeyPath != "" &&
+		c.WeChatPayMchCertPath != "" && c.WeChatPayNotifyURL != "" {
+		return errors.New("WECHAT_PAY_MOCK must not be enabled when real WeChat Pay credentials are fully configured")
 	}
 	// APIv3Key is 32 bytes exactly — used both as the HMAC key for
 	// inbound signature verification and as the AES-GCM key for resource

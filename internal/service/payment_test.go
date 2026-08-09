@@ -271,8 +271,10 @@ func TestIsPaymentSuccess(t *testing.T) {
 		// Alipay
 		{"trade_status_sync", true},
 		{"TRADE_SUCCESS", true},
-		{"order_created", true},
-		{"subscription_created", true},
+		// LemonSqueezy-era names — dead since the channel was dropped
+		// (migration 008); must NOT dispatch.
+		{"order_created", false},
+		{"subscription_created", false},
 		{"subscription_payment_success", false}, // renewal — v1 ack-200 no-op
 		// unrelated
 		{"charge.refunded", false},
@@ -319,8 +321,10 @@ func TestIsRefundEvent(t *testing.T) {
 		{"TRANSACTION.REFUND", true},
 		{"trade_closed", true},
 		{"TRADE_CLOSED", true},
-		{"order_refunded", true},
-		{"subscription_payment_refunded", true},
+		// LemonSqueezy-era names — dead since the channel was dropped
+		// (migration 008); must NOT dispatch.
+		{"order_refunded", false},
+		{"subscription_payment_refunded", false},
 		{"subscription_updated", false},
 		{"payment_intent.succeeded", false},
 		{"payment_intent.payment_failed", false},

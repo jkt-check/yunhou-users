@@ -74,10 +74,12 @@ func (d *githubOAuthDeps) Redirect(c *gin.Context) {
 	}
 	// Don't issue a real GitHub authorize URL for a disabled app — the user
 	// would complete GitHub consent only to be rejected at /callback with
-	// ErrAppInactive, dropping a real OAuth grant on the floor.
+	// ErrAppInactive, dropping a real OAuth grant on the floor. Return the
+	// same 404 as the not-found branch so pre-login callers can't
+	// enumerate which app_ids exist by diffing status codes.
 	if !app.IsActive {
 		log.Printf("github oauth redirect: app %q inactive", appID)
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "app is disabled"})
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
 		return
 	}
 

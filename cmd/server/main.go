@@ -190,13 +190,13 @@ func main() {
 
 	// One-shot secret backfill for rows created before migration 007_app_secret
 	// added the secret_hash column. Idempotent — once every row has a hash,
-	// subsequent restarts are no-ops. Plaintext is logged exactly once per row
-	// to stdout; capture it from the deploy log and rotate via the dedicated
-	// endpoint so the backfill secret never lives past the next deploy.
+	// subsequent restarts are no-ops. The plaintext is NEVER logged (see
+	// service.BackfillAppSecrets); operators must rotate via the dedicated
+	// endpoint to obtain each app's new secret.
 	if n, err := service.BackfillAppSecrets(context.Background(), appRepo); err != nil {
 		log.Printf("app secret backfill error: %v (continuing startup)", err)
 	} else if n > 0 {
-		log.Printf("app secret backfill: %d row(s) initialised — capture plaintexts from the lines above and rotate via POST /admin/apps/:id/rotate-secret", n)
+		log.Printf("app secret backfill: %d row(s) initialised — rotate each via POST /admin/apps/:id/rotate-secret to obtain the new plaintext", n)
 	}
 
 	engine := gin.New()
@@ -220,6 +220,19 @@ func main() {
 	// the chat handler (the server-wide WriteTimeout below is an absolute
 	// per-request deadline — it would hard-cut a longer stream).
 	engine.Use(timeoutMiddleware(20*time.Second, "/chat"))
+
+	// Global request-body cap — defence in depth behind nginx's
+	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,
+	// misconfigured proxy) would otherwise let ShouldBindJSON handlers and
+	// decodeAdminPlanRequest read unbounded bodies into memory. /chat keeps
+	// its own tighter cap (320 KiB) inside the handler and webhooks cap at
+	// 1 MiB in the signature middleware; this outer 1 MiB matches both.
+	engine.Use(maxRequestBodyBytes(1 << 20))
+
+	// Security headers at the app layer. nginx sets the same trio, but any
+	// path that bypasses nginx (direct container port, health probes) must
+	// not lose them.
+	engine.Use(securityHeaders())
 
 	// A cancelable context so the rate-limiter cleanup goroutines and the
 	// sweeper exit on shutdown.
@@ -346,6 +359,25 @@ type noChannelRefundAPI struct{}
 
 func (noChannelRefundAPI) Refund(_ context.Context, _, _ string, _ float64, _ string) (string, error) {
 	return "", errors.New("channel refund API not wired in v1")
+}
+
+// maxRequestBodyBytes caps every request body at n bytes (see engine.Use
+// above for why this exists even though nginx has client_max_body_size).
+func maxRequestBodyBytes(n int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, n)
+		c.Next()
+	}
+}
+
+// securityHeaders mirrors deploy/nginx.conf's header trio at the app layer.
+func securityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Next()
+	}
 }
 
 // timeoutMiddleware caps each request's total wall-clock time. Without it

@@ -142,8 +142,10 @@ func TestWeChatOAuth_Redirect_InactiveApp(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/auth/wechat/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fbff.example.com%2Fauth%2Fwechat-callback", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", w.Code)
+	// Same 404 as the unknown-app branch — no app_id enumeration via
+	// status-code diffing.
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
 	}
 }
 
@@ -530,16 +532,12 @@ func TestWeChatOAuth_Callback_UpstreamErrcode_FragmentFormat(t *testing.T) {
 	}
 }
 
-// TestWeChatOAuth_Callback_ErrorParamNoDescription_NoTrailingColon
-// asserts that the JSON 400 fallback (state verify / app lookup failed,
-// so the BFF fragment path is unreachable) does NOT emit a trailing
-// ": " when error_description is empty. The previous code assembled
-//
-//	message: upstreamErr + ": " + upstreamErrDesc
-//
-// which produced "access_denied: " for access_denied-with-no-description
-// callbacks — a malformed message that breaks BFF-side parsing.
-func TestWeChatOAuth_Callback_ErrorParamNoDescription_NoTrailingColon(t *testing.T) {
+// TestWeChatOAuth_Callback_ErrorParamUnverifiableState_GenericMessage
+// asserts that the JSON 400 fallback (state verify / app lookup failed, so
+// the BFF fragment path is unreachable) returns a fixed generic message
+// rather than reflecting the attacker-controllable `error` /
+// `error_description` query params into the response body.
+func TestWeChatOAuth_Callback_ErrorParamUnverifiableState_GenericMessage(t *testing.T) {
 	r := gin.New()
 	RegisterWeChatOAuthRoutes(r.Group("/auth/wechat"),
 		&service.WeChatOAuthService{}, // state verify will fail (empty secret) → fallback JSON path
@@ -564,11 +562,11 @@ func TestWeChatOAuth_Callback_ErrorParamNoDescription_NoTrailingColon(t *testing
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode body: %v; body=%s", err, w.Body.String())
 	}
-	if strings.HasSuffix(resp.Message, ": ") || strings.HasSuffix(resp.Message, ":") {
-		t.Errorf("message = %q has trailing colon / colon-space", resp.Message)
+	if resp.Message != "authorization failed" {
+		t.Errorf("message = %q, want exactly %q", resp.Message, "authorization failed")
 	}
-	if resp.Message != "access_denied" {
-		t.Errorf("message = %q, want exactly %q", resp.Message, "access_denied")
+	if strings.Contains(resp.Message, "access_denied") {
+		t.Errorf("message reflects upstream param verbatim: %q", resp.Message)
 	}
 }
 

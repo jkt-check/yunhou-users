@@ -252,6 +252,15 @@ func parseJSON(t *testing.T, resp *http.Response) map[string]interface{} {
 
 func doWithAppAuth(t *testing.T, method, url, appID string, body interface{}) *http.Response {
 	t.Helper()
+	return doWithAppAuthSecret(t, method, url, appID, integrationAppSecret, body)
+}
+
+// doWithAppAuthSecret is doWithAppAuth with an explicit secret — needed for
+// apps created mid-test (their one-time plaintext secret comes from the
+// POST /admin/apps response), since /apps/:id and /admin/apps/:id are
+// scoped to the caller's own app.
+func doWithAppAuthSecret(t *testing.T, method, url, appID, secret string, body interface{}) *http.Response {
+	t.Helper()
 	var bodyReader io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -265,7 +274,7 @@ func doWithAppAuth(t *testing.T, method, url, appID string, body interface{}) *h
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("X-App-ID", appID)
-	req.Header.Set("X-App-Secret", integrationAppSecret)
+	req.Header.Set("X-App-Secret", secret)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -452,9 +461,15 @@ func TestAppCRUD(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create app: status %d", resp.StatusCode)
 	}
+	created := parseJSON(t, resp)
+	newSecret, _ := created["data"].(map[string]interface{})["secret"].(string)
+	if newSecret == "" {
+		t.Fatal("create app: response missing data.secret")
+	}
 
-	// Update app
-	resp = doWithAppAuth(t, http.MethodPatch, srv.URL+"/admin/apps/test-app", appID, map[string]interface{}{
+	// Update app — /admin/apps/:id is scoped to the caller's own app, so
+	// authenticate as test-app with its one-time create secret.
+	resp = doWithAppAuthSecret(t, http.MethodPatch, srv.URL+"/admin/apps/test-app", "test-app", newSecret, map[string]interface{}{
 		"name": "Updated Test App",
 	})
 	if resp.StatusCode != http.StatusOK {
@@ -735,6 +750,9 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 // order in mock mode: plaintext body shaped like the AES-decrypted
 // resource, with the three Wechatpay-* headers present (HMAC bypassed
 // when the mock branch is on, but absent headers still 400).
+// amount.total is 1990 fen = ¥19.90, the monthly plan's order snapshot —
+// the 2026-08 amount validation in onPaymentSucceeded rejects events
+// that settle less than the order.
 func mockWechatPayWebhook(t *testing.T, srv *httptest.Server, orderID string) *http.Response {
 	t.Helper()
 	subExpiresAt := time.Now().Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
@@ -744,7 +762,7 @@ func mockWechatPayWebhook(t *testing.T, srv *httptest.Server, orderID string) *h
 		"resource": map[string]interface{}{
 			"transaction_id": "tx-integration-" + orderID,
 			"out_trade_no":   orderID,
-			"amount":         map[string]interface{}{"total": 1, "refund": 0},
+			"amount":         map[string]interface{}{"total": 1990, "refund": 0},
 			"sub_expires_at": subExpiresAt,
 		},
 	}
@@ -872,12 +890,13 @@ func mustUserID(t *testing.T, db *sqlx.DB, email string) string {
 	return id
 }
 
-// TestConfirmOrderActivatesSubscription drives the BFF-confirm path:
-// create order → POST /payments/orders/:id/confirm → subscription
-// activates. This covers PaymentService.Confirm — the alternative
-// activation path to the webhook (covered by TestCreateOrderWebhook*).
-// A second confirm with the same external_txn_id must be idempotent.
-func TestConfirmOrderActivatesSubscription(t *testing.T) {
+// TestConfirmOrderRequiresUpstreamVerification pins the 2026-08 trust
+// model at the HTTP layer: POST /payments/orders/:id/confirm no longer
+// marks the order paid on the caller's word alone. Against a mock-mode
+// WeChat client the upstream query reports NOTPAY, so the confirm is
+// refused (400) and the order stays pending until the (mock) channel
+// webhook settles it — which then activates the subscription.
+func TestConfirmOrderRequiresUpstreamVerification(t *testing.T) {
 	db := setupDB(t)
 	srv := setupFullServer(t, db)
 	defer srv.Close()
@@ -891,18 +910,35 @@ func TestConfirmOrderActivatesSubscription(t *testing.T) {
 	}
 	orderID := parseJSON(t, resp)["data"].(map[string]interface{})["id"].(string)
 
-	for i := 0; i < 2; i++ {
-		resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders/"+orderID+"/confirm",
-			"Bearer "+tok, map[string]interface{}{
-				"channel": "wechat_pay", "external_txn_id": "txn-confirm-" + orderID,
-			})
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			t.Fatalf("confirm delivery %d: status %d, body %s", i+1, resp.StatusCode, string(body))
-		}
+	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders/"+orderID+"/confirm",
+		"Bearer "+tok, map[string]interface{}{
+			"channel": "wechat_pay", "external_txn_id": "txn-confirm-" + orderID,
+		})
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		t.Fatalf("confirm must be rejected without upstream verification: status %d, body %s", resp.StatusCode, string(body))
 	}
+	resp.Body.Close()
+
+	// Order is still pending after the rejected confirm.
+	var status string
+	if err := db.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatalf("read order status: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("order status after rejected confirm = %q, want pending", status)
+	}
+
+	// The channel webhook settles the order → subscription activates.
+	whResp := mockWechatPayWebhook(t, srv, orderID)
+	if whResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(whResp.Body)
+		whResp.Body.Close()
+		t.Fatalf("webhook: status %d, body %s", whResp.StatusCode, string(body))
+	}
+	whResp.Body.Close()
 
 	// Subscription activated on monthly.
 	resp = doJSONWithAuth(t, http.MethodGet, srv.URL+"/user/subscriptions", "Bearer "+tok, nil)
@@ -911,7 +947,7 @@ func TestConfirmOrderActivatesSubscription(t *testing.T) {
 	}
 	subs := parseJSON(t, resp)["data"].([]interface{})
 	if len(subs) == 0 || subs[0].(map[string]interface{})["plan_id"] != "monthly" {
-		t.Fatalf("subscription not activated via confirm: %v", subs)
+		t.Fatalf("subscription not activated via webhook: %v", subs)
 	}
 }
 
@@ -975,7 +1011,8 @@ func TestRefundFlow(t *testing.T) {
 
 	tok, _ := testLogin(t, srv, "refund-user@yundian.test", "yundian")
 
-	// Create + confirm → paid payment row.
+	// Create + settle via the mock channel webhook → paid payment row
+	// (confirm no longer marks orders paid without upstream verification).
 	resp := doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders",
 		"Bearer "+tok, map[string]interface{}{"plan_id": "monthly", "channel": "wechat_pay"})
 	if resp.StatusCode != http.StatusCreated {
@@ -983,13 +1020,16 @@ func TestRefundFlow(t *testing.T) {
 	}
 	orderID := parseJSON(t, resp)["data"].(map[string]interface{})["id"].(string)
 
-	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders/"+orderID+"/confirm",
-		"Bearer "+tok, map[string]interface{}{"channel": "wechat_pay", "external_txn_id": "txn-refund-" + orderID})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d", resp.StatusCode)
+	whResp := mockWechatPayWebhook(t, srv, orderID)
+	if whResp.StatusCode != http.StatusOK {
+		t.Fatalf("settle webhook: %d", whResp.StatusCode)
 	}
-	paymentID := parseJSON(t, resp)["data"].(map[string]interface{})["payment_id"].(string)
-	resp.Body.Close()
+	whResp.Body.Close()
+	var paymentID string
+	if err := db.GetContext(context.Background(), &paymentID,
+		`SELECT id FROM payments WHERE order_id = $1 AND status = 'paid'`, orderID); err != nil {
+		t.Fatalf("read paid payment: %v", err)
+	}
 
 	// Refund with an idempotency key.
 	body, _ := json.Marshal(map[string]interface{}{"payment_id": paymentID, "amount": 19.9})
@@ -1048,13 +1088,18 @@ func TestPaymentQueryEndpoints(t *testing.T) {
 	}
 	orderID := parseJSON(t, resp)["data"].(map[string]interface{})["id"].(string)
 
-	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders/"+orderID+"/confirm",
-		"Bearer "+tok, map[string]interface{}{"channel": "wechat_pay", "external_txn_id": "txn-payquery-" + orderID})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d", resp.StatusCode)
+	// Settle via the mock channel webhook (confirm requires upstream
+	// verification now) and read the paid payment back.
+	whResp := mockWechatPayWebhook(t, srv, orderID)
+	if whResp.StatusCode != http.StatusOK {
+		t.Fatalf("settle webhook: %d", whResp.StatusCode)
 	}
-	paymentID := parseJSON(t, resp)["data"].(map[string]interface{})["payment_id"].(string)
-	resp.Body.Close()
+	whResp.Body.Close()
+	var paymentID string
+	if err := db.GetContext(context.Background(), &paymentID,
+		`SELECT id FROM payments WHERE order_id = $1 AND status = 'paid'`, orderID); err != nil {
+		t.Fatalf("read paid payment: %v", err)
+	}
 
 	// GET /payments list.
 	resp = doJSONWithAuth(t, http.MethodGet, srv.URL+"/payments", "Bearer "+tok, nil)
@@ -1121,14 +1166,14 @@ func TestWebhookRefundEvent(t *testing.T) {
 		t.Fatalf("create order: %d", resp.StatusCode)
 	}
 	orderID := parseJSON(t, resp)["data"].(map[string]interface{})["id"].(string)
-	txnID := "txn-refundevt-" + orderID
-
-	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders/"+orderID+"/confirm",
-		"Bearer "+tok, map[string]interface{}{"channel": "wechat_pay", "external_txn_id": txnID})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d", resp.StatusCode)
+	// Settle via the mock channel webhook; the payment's external_txn_id
+	// is the helper's "tx-integration-<orderID>".
+	txnID := "tx-integration-" + orderID
+	settleResp := mockWechatPayWebhook(t, srv, orderID)
+	if settleResp.StatusCode != http.StatusOK {
+		t.Fatalf("settle webhook: %d", settleResp.StatusCode)
 	}
-	resp.Body.Close()
+	settleResp.Body.Close()
 
 	// Fire a refund event for the same transaction.
 	body := map[string]interface{}{
@@ -1241,14 +1286,14 @@ func TestWebhookDisputeEvent(t *testing.T) {
 		t.Fatalf("create order: %d", resp.StatusCode)
 	}
 	orderID := parseJSON(t, resp)["data"].(map[string]interface{})["id"].(string)
-	txnID := "txn-dispute-" + orderID
-
-	resp = doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders/"+orderID+"/confirm",
-		"Bearer "+tok, map[string]interface{}{"channel": "wechat_pay", "external_txn_id": txnID})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d", resp.StatusCode)
+	// Settle via the mock channel webhook; the payment's external_txn_id
+	// is the helper's "tx-integration-<orderID>".
+	txnID := "tx-integration-" + orderID
+	settleResp := mockWechatPayWebhook(t, srv, orderID)
+	if settleResp.StatusCode != http.StatusOK {
+		t.Fatalf("settle webhook: %d", settleResp.StatusCode)
 	}
-	resp.Body.Close()
+	settleResp.Body.Close()
 
 	body := map[string]interface{}{
 		"id":         "evt-dispute-" + orderID,

@@ -499,9 +499,10 @@ func LoadAlipayPublicKeyFromPEM(pemBytes []byte) (*rsa.PublicKey, error) {
 //
 // verifyCache is a tiny in-process cache that absorbs PayPal's retry bursts.
 // PayPal retries on transient errors within seconds; without the cache every
-// retry pays a full DNS+TCP+TLS+RTT to api-m.paypal.com. Key is the unique
-// (transmission_id, transmission_time) tuple so a genuine second delivery at
-// a different time isn't suppressed.
+// retry pays a full DNS+TCP+TLS+RTT to api-m.paypal.com. The key covers the
+// (transmission_id, transmission_time) tuple PLUS the transmission_sig header
+// and a SHA-256 of the raw body — a cached SUCCESS must never authorize a
+// delivery whose body or signature was modified between retries.
 const paypalVerifyCacheTTL = 60 * time.Second
 
 type paypalVerifyCacheEntry struct {
@@ -552,6 +553,8 @@ func init() { startPaypalVerifyCacheJanitor() }
 type paypalVerifyCacheKey struct {
 	transmissionID   string
 	transmissionTime string
+	transmissionSig  string
+	bodySHA256       [32]byte
 }
 
 func lookupVerifyCache(k paypalVerifyCacheKey) (paypalVerifyCacheEntry, bool) {
@@ -629,13 +632,18 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 	}
 
 	// Cache hit: short-circuit the upstream call. PayPal retries on
-	// transient errors within seconds; the (transmission_id, transmission_time)
-	// tuple uniquely identifies a delivery, so a cached SUCCESS applies to
-	// the genuine retry burst only.
-	if entry, ok := lookupVerifyCache(paypalVerifyCacheKey{
+	// transient errors within seconds; the key binds the
+	// (transmission_id, transmission_time) tuple to the sig header and
+	// the raw body, so a cached verdict applies only to byte-identical
+	// genuine retries — a modified body or sig misses the cache and pays
+	// a fresh upstream verification.
+	cacheKey := paypalVerifyCacheKey{
 		transmissionID:   transmissionID,
 		transmissionTime: transmissionTime,
-	}); ok {
+		transmissionSig:  transmissionSIG,
+		bodySHA256:       sha256.Sum256(body),
+	}
+	if entry, ok := lookupVerifyCache(cacheKey); ok {
 		return entry.err
 	}
 
@@ -717,16 +725,10 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 		return fmt.Errorf("paypal verify unexpected status %q", out.VerificationStatus)
 	}
 	if out.VerificationStatus == "FAILURE" {
-		storeVerifyCache(paypalVerifyCacheKey{
-			transmissionID:   transmissionID,
-			transmissionTime: transmissionTime,
-		}, out.VerificationStatus, ErrInvalidSignature)
+		storeVerifyCache(cacheKey, out.VerificationStatus, ErrInvalidSignature)
 		return ErrInvalidSignature
 	}
-	storeVerifyCache(paypalVerifyCacheKey{
-		transmissionID:   transmissionID,
-		transmissionTime: transmissionTime,
-	}, out.VerificationStatus, nil)
+	storeVerifyCache(cacheKey, out.VerificationStatus, nil)
 	return nil
 }
 

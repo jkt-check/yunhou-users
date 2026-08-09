@@ -114,27 +114,32 @@ func TestE2E_AppAndPlanCRUD(t *testing.T) {
 		body := string(resp.Body)
 		t.Fatalf("create app: %d %s", resp.StatusCode, body)
 	}
+	extraHdrs := appAuthHeadersWithSecret("e2e-extra", createdAppSecret(t, resp.Body))
 
-	// List apps — should include the new one.
+	// List apps — scoped to the caller's own app (per-app isolation): the
+	// listing must contain yundian and must NOT leak e2e-extra to it.
 	resp = doRequest(t, srv.Engine, http.MethodGet, "/apps",
 		``, hdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list apps: %d", resp.StatusCode)
 	}
-	if !strings.Contains(string(resp.Body), `"app_id":"e2e-extra"`) {
-		t.Errorf("new app not in list: %s", resp.Body)
+	if !strings.Contains(string(resp.Body), `"app_id":"yundian"`) {
+		t.Errorf("own app missing from list: %s", resp.Body)
+	}
+	if strings.Contains(string(resp.Body), `"app_id":"e2e-extra"`) {
+		t.Errorf("foreign app leaked into list: %s", resp.Body)
 	}
 
-	// Get specific app.
+	// Get specific app — as the app itself (cross-app reads are 403).
 	resp = doRequest(t, srv.Engine, http.MethodGet, "/apps/e2e-extra",
-		``, hdrs)
+		``, extraHdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("get app: %d", resp.StatusCode)
 	}
 
-	// Update app.
+	// Update app — as the app itself.
 	resp = doRequest(t, srv.Engine, http.MethodPatch, "/admin/apps/e2e-extra",
-		`{"description":"updated"}`, hdrs)
+		`{"description":"updated"}`, extraHdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("update app: %d", resp.StatusCode)
 	}

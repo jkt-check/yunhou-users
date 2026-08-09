@@ -539,6 +539,8 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 | `POST /apps/:id/quote` | **JWT Bearer**（终端用户） | 给定 (app, plan) 给出下单报价 |
 
 > 同样的 `X-App-ID` + `X-App-Secret` 头对适用于所有 `/admin/*` 路由（plan 管理 + app 管理 + rotate-secret）。详见下文 §"内部服务鉴权"。
+>
+> **按 App 隔离（安全边界）**：通过 `InternalAppAuth` 后，调用方只能操作**自己**的 app——`GET /apps` 只返回调用方自身这一条；`GET /apps/:id`、`PATCH /admin/apps/:id`、`POST /admin/apps/:id/rotate-secret`、`GET /apps/:id/provider-token/:channel` 的 `:id` 必须等于 `X-App-ID`，否则 403。plan 管理接口（`POST/PATCH/DELETE /admin/plans*`）只允许操作 `apps` 数组全部等于调用方 app_id 的 plan。任何响应里的 `config` 都会对 provider 密钥字段（`paypal.client_secret`、`oauth_providers.*` 的 secret、`wechat_pay.api_v3_key`）做脱敏（返回 `"***"`）。
 
 #### apps.config JSONB 结构
 
@@ -581,7 +583,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### GET /apps
 
-查看所有已注册的应用。
+查看**调用方自己**的应用（按 App 隔离：列表永远只含 `X-App-ID` 对应的那一条；config 中的 provider 密钥字段已脱敏为 `"***"`）。
 
 **响应（200）**：
 ```json
@@ -603,7 +605,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### GET /apps/:id
 
-查看指定应用详情。
+查看指定应用详情。`:id` 必须等于 `X-App-ID`（只能读自己），否则 403；config 中的 provider 密钥字段已脱敏为 `"***"`。
 
 **响应（200）**：
 ```json
@@ -1011,7 +1013,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### PATCH /admin/apps/:id
 
-更新 App。所有字段均为可选；`name` 不可为空。**不能通过此接口改 `secret`——secret 走专用 rotation endpoint。**
+更新 App。所有字段均为可选；`name` 不可为空。**不能通过此接口改 `secret`——secret 走专用 rotation endpoint。** `:id` 必须等于 `X-App-ID`（只能改自己），否则 403；响应中的 config 密钥字段脱敏为 `"***"`。
 
 **请求体**：
 ```json
@@ -1050,7 +1052,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### POST /admin/apps/:id/rotate-secret
 
-轮换 App 的内部服务密钥。**调用前必须先用现有 secret 通过 `InternalAppAuth` 才能进入此 endpoint**（admin group 上的 middleware 校验）。轮换后旧 secret 立即失效，下次 admin 调用必须改用新返回的 secret。
+轮换 App 的内部服务密钥。**调用前必须先用现有 secret 通过 `InternalAppAuth` 才能进入此 endpoint**（admin group 上的 middleware 校验），且 `:id` 必须等于 `X-App-ID`（只能轮换自己），否则 403。轮换后旧 secret 立即失效，下次 admin 调用必须改用新返回的 secret。
 
 **路径参数**：
 
@@ -1540,11 +1542,16 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 前端 SDK 在收到 channel 回调后调用此接口做"快通道确认"。后端会与随后到达的 webhook 互为幂等。
 
+**安全契约（2026-08 起）**：confirm 不再仅凭调用方声明就标记已支付——服务端必须先向渠道独立核实交易：
+
+- `wechat_pay`：服务端以订单的 `out_trade_no` 发起 `QueryOrder`，要求 `trade_state=SUCCESS` 且 `transaction_id`、金额（≥ 订单快照金额）、币种全部匹配，否则 400。
+- `stripe` / `paypal` / `alipay`：当前未接服务端查询客户端，confirm 一律返回 400 `payment confirmation is unavailable for this channel`——订单改由**签名验证过的渠道 webhook** 结算。
+
 **请求体**：
 ```json
 {
-  "channel": "stripe",
-  "external_txn_id": "pi_xxx",
+  "channel": "wechat_pay",
+  "external_txn_id": "420000xxxx",
   "expires_at": "2026-07-23T00:00:00Z"
 }
 ```
@@ -1552,8 +1559,8 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | 字段 | 必填 | 说明 |
 |------|------|------|
 | `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `paypal` |
-| `external_txn_id` | 是 | 渠道侧交易 ID |
-| `expires_at` | 否 | RFC3339 时间，订阅过期时刻。**前端必须从 `plan.interval_days` + 业务规则（rollover/grace/trial）计算**；yunhou-users 不做服务端推导。省略 = 永不过期。 |
+| `external_txn_id` | 是 | 渠道侧交易 ID（wechat_pay 会与上游查询结果比对） |
+| `expires_at` | 否 | **已废弃：服务端不信任并忽略该 hint**。订阅过期时间由服务端按 `plan.interval_days` 推导（webhook 携带的渠道权威值会被 clamp 到同一上界） |
 
 `amount` / `currency` **不接受 caller 输入**；订单行是权威来源。caller 输入金额会让用户把 $1 订单声称 $100。
 
@@ -1579,6 +1586,8 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 |------|---------|----------|
 | 400 | `invalid channel` | `channel` 取值不在 `stripe` / `wechat_pay` / `alipay` / `paypal` 之内 |
 | 400 | `invalid request body` | 请求体缺失或字段类型错误 |
+| 400 | `payment confirmation is unavailable for this channel; the order will be settled by the channel webhook` | 该渠道无服务端查询能力（stripe/paypal/alipay），由 webhook 结算 |
+| 400 | `payment not confirmed by the channel` | 上游查询未显示与订单匹配的已结算交易（未支付 / txn 不匹配 / 金额不足） |
 | 404 | `not found` | 订单不存在或不属于当前用户 |
 | 409 | `order is in a non-recoverable terminal state` | 订单已是 `failed` / `refunded` 终态 |
 | 409 | `order already has a paid payment on a different channel` | 该订单已有其他渠道的 paid 记录 |
@@ -1794,15 +1803,14 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 订单可能通过两条路径被标记为已支付——生产环境更常见的场景是 **race**（同一笔订单的 webhook 与前端 `/confirm` 几乎同时到达），而不是"业务上选哪条都行"：
 
 - **Quote 路径**：`/quote` 返回 `sub_expires_at`，BFF 把它嵌入 channel checkout metadata（PayPal `metadata.sub_expires_at`，Stripe/WeChat/Alipay 等价字段）；channel webhook 到达后 yunhou 直接写入 `subscriptions.expires_at`
-- **Confirm 路径**：`POST /payments/orders/:order_id/confirm` 由 BFF 在前端检测到 channel 支付成功时主动调用，`expires_at` 由 BFF 自己算后透传
+- **Confirm 路径**：`POST /payments/orders/:order_id/confirm` 由 BFF 在前端检测到 channel 支付成功时主动调用。**2026-08 起 confirm 的 `expires_at` hint 被服务端忽略**（防客户端自签发超长订阅）；且仅 `wechat_pay` 支持 confirm（服务端 `QueryOrder` 核实），其余渠道一律由 webhook 结算
 
-两条路径在 `subscriptions.expires_at` 这一列是**最后写入胜出**（`activateSubscriptionOnTx` 是一个盲 UPSERT，没有"哪个值更权威"的判断逻辑；见 `internal/service/payment.go`）。如果两条路径在同一订单上前后到达且 `expires_at` 计算口径不一致，**先到的被覆盖，结果不可预测**。
+服务端对过期时间的处理（`resolveSubExpiry`）：webhook 携带的渠道权威 hint 会被 clamp 到 `now + plan.interval_days` 上界——即使是真实渠道回传值也无法签发超出 plan 周期的订阅；无 hint 时由 plan 推导。
 
 **推荐契约**（避免 last-write-wins 模糊性）：
 
-1. **有 channel webhook 携带 `sub_expires_at` 的渠道**（Stripe / WeChat / Alipay / PayPal）：webhook 是权威源。`/confirm` 调用时**不要传 `expires_at`**——保持 `nil`，让 webhook 的值留下
-2. **没有 channel webhook 的渠道**（理论上不存在；当前四个渠道都支持）：BFF 必须在 `/confirm` 里提供 `expires_at`
-3. **`/quote` 的输出仅作为 webhook metadata 的来源**，不作为最终值——BFF 在 webhook 到达前可以展示它给用户，但订阅激活一律以 webhook payload 为准
+1. **有 channel webhook 携带 `sub_expires_at` 的渠道**（Stripe / WeChat / Alipay / PayPal）：webhook 是权威源。`/confirm` 调用时**不要传 `expires_at`**（传了也会被忽略）
+2. **`/quote` 的输出仅作为 webhook metadata 的来源**，不作为最终值——BFF 在 webhook 到达前可以展示它给用户，但订阅激活一律以 webhook payload 为准
 
 如果你们的 Stripe / WeChat / Alipay / PayPal 流程会**并发触发** webhook 与 `/confirm`（前端轮询订单状态 + channel 同时回调的常见 race），请务必遵守契约 (1)，否则会出现"前端显示 7 天试用，但实际订阅 30 天"之类的对账漂移。
 

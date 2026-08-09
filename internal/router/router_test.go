@@ -277,4 +277,43 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 			t.Errorf("Setup did not register route %s", w)
 		}
 	}
+	// /test/login must NOT be registered without PAYPAL_L3_E2E_MODE=1 —
+	// the route existing at all is the dev-only escape hatch.
+	if have["POST:/test/login"] {
+		t.Error("Setup registered /test/login without PAYPAL_L3_E2E_MODE=1")
+	}
+}
+
+// TestSetup_TestLoginGatedOnEnv verifies the /test/login route exists only
+// when PAYPAL_L3_E2E_MODE=1 — previously it was always registered and gated
+// only inside the handler, so one stray env line in production would have
+// exposed arbitrary JWT minting.
+func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
+	// Not parallel: t.Setenv mutates process env.
+	gin.SetMode(gin.TestMode)
+	t.Setenv("PAYPAL_L3_E2E_MODE", "1")
+	engine := gin.New()
+
+	Setup(t.Context(), engine,
+		nil,                          // healthPinger
+		nil, nil, nil, nil, nil, nil, // repos
+		nil,           // tokenSvc
+		nil,           // authSvc
+		nil, nil, nil, // subSvc, planSvc, paymentSvc
+		nil,      // webhookVerifier
+		nil,      // wechatAPIv3Key
+		nil, nil, // providerTokenSvc, quoteSvc
+		nil,      // chatSvc
+		nil,      // chatAccessLog
+		nil, nil, // githubOAuthSvc, wechatOAuthSvc
+		false, // wechatOAuthMock
+		false, // wechatPayMock
+	)
+
+	for _, r := range engine.Routes() {
+		if r.Method == "POST" && r.Path == "/test/login" {
+			return
+		}
+	}
+	t.Error("Setup did not register /test/login with PAYPAL_L3_E2E_MODE=1")
 }

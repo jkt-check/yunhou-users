@@ -36,6 +36,19 @@ type wechatClient interface {
 // no way to pay — we surface a 4xx instead (mapped in handler/payment.go).
 var ErrWechatPayNotConfigured = errors.New("wechat pay not configured on this deployment")
 
+// ErrConfirmVerificationUnavailable is returned by Confirm for channels
+// with no wired server-side order-query client (stripe / paypal / alipay
+// today — their channel clients are stubs). Confirm must not mark an
+// order paid on the caller's word alone; the channel webhook settles it.
+var ErrConfirmVerificationUnavailable = errors.New("payment confirmation is unavailable for this channel")
+
+// ErrConfirmNotVerified is returned by Confirm when the channel's
+// server-side query does not show a settled payment matching the order
+// (out_trade_no / transaction id / amount / currency). Terminal for the
+// caller — retrying the same claim will fail again until the channel
+// actually settles the order.
+var ErrConfirmNotVerified = errors.New("payment not confirmed by the channel")
+
 // ErrPlanMissingForExpiry is returned by resolveSubExpiry when the plan row
 // was deleted between order creation and webhook/confirm arrival. Callers
 // audit-log this and skip subscription activation: with the RESTRICT FKs on
@@ -95,6 +108,14 @@ type PaymentService struct {
 	// wechat is optional; nil deployments can still create orders for
 	// non-WeChat channels.
 	wechat wechatClient
+
+	// confirmVerifier, when non-nil, replaces the upstream verification
+	// Confirm runs before marking an order paid. Production leaves it nil
+	// (verifyConfirmPayment's built-in dispatch: WeChat QueryOrder, other
+	// channels rejected); tests install a double so the post-verification
+	// pipeline (rollover, dedupe, retry) can be exercised without an
+	// upstream.
+	confirmVerifier func(ctx context.Context, order *model.Order, channel, externalTxnID string) error
 
 	// orderExpiry drives the order's default expires_at. Service layer
 	// sets this on INSERT (SQL DEFAULT is also 30 min; setting explicitly
@@ -718,7 +739,7 @@ func (s *PaymentService) GetRefund(ctx context.Context, refundID, userID string)
 }
 
 // ============================================================================
-// Confirm (frontend SDK callback fast-track)
+// Confirm (caller-initiated payment confirmation, upstream-verified)
 // ============================================================================
 
 // ConfirmInput is the request body for POST /payments/orders/:order_id/confirm.
@@ -732,7 +753,13 @@ type ConfirmInput struct {
 	// paid a different amount than the order — the webhook reconciles
 	// against the channel's actual amount, but the subscription would
 	// already be activated for the wrong amount by then.
-	ExpiresAt *time.Time // optional; subscription expiry (nil = never expires per plan defaults)
+	//
+	// ExpiresAt is accepted for API compatibility but IGNORED: a
+	// caller-supplied subscription expiry is untrusted (a caller could
+	// grant themselves a longer subscription than the plan grants).
+	// Activation derives expires_at from the plan via resolveSubExpiry,
+	// the same trust model as SubscriptionService.Create.
+	ExpiresAt *time.Time
 }
 
 // ConfirmResult is the response from Confirm.
@@ -765,6 +792,17 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	switch order.Status {
 	case "failed", "refunded":
 		return nil, ErrOrderAlreadyTerminal
+	}
+
+	// Upstream verification (2026-08 trust-model fix): the caller's claim
+	// of payment is NOT trusted. The channel must independently confirm
+	// the transaction server-side (WeChat QueryOrder: SUCCESS + matching
+	// out_trade_no / transaction id / amount / currency) before anything
+	// is marked paid. Channels without a wired query client are rejected
+	// with ErrConfirmVerificationUnavailable — their orders settle via
+	// the signature-verified webhook instead.
+	if err := s.verifyConfirmPayment(ctx, order, in.Channel, in.ExternalTxnID); err != nil {
+		return nil, err
 	}
 
 	// Amount and currency come from the order — the order is the
@@ -875,13 +913,15 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	}
 
 	// Activate subscription (UPSERT single-row, webhook doc §5.3).
-	// expires_at resolution mirrors the webhook path: a BFF-supplied
-	// ExpiresAt wins; otherwise fall back to plan.interval_days so that
-	// channels whose upstream payload doesn't ship sub_expires_at (real
-	// WeChat v3 NATIVE today) still produce a finite subscription. A
-	// first activation replacing an unexpired sub rolls the remaining
-	// days over (resolveSubExpiry branch 3).
-	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, in.ExpiresAt, preservedExpiry)
+	// expires_at resolution mirrors the webhook path, but the hint is
+	// ALWAYS nil here: the caller-supplied ExpiresAt is untrusted and
+	// ignored (a caller could otherwise extend their own subscription
+	// past what the plan grants). resolveSubExpiry falls back to
+	// plan.interval_days so channels whose upstream payload doesn't
+	// ship sub_expires_at (real WeChat v3 NATIVE today) still produce
+	// a finite subscription. A first activation replacing an unexpired
+	// sub rolls the remaining days over (resolveSubExpiry branch 3).
+	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, nil, preservedExpiry)
 	planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
 	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
 	if downgradeRetry {
@@ -968,6 +1008,59 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		ActivatedSubscription: activated,
 		WasLatePayment:        wasLate && orderUpdated,
 	}, nil
+}
+
+// verifyConfirmPayment is Confirm's upstream gate: it returns nil only
+// when the channel has independently confirmed, server-side, that
+// externalTxnID is a settled payment for this order. WeChat is verified
+// via QueryOrder (the same client call the active-reconcile path in
+// GetOrder uses); stripe / paypal / alipay have no wired query client
+// today, so their confirms are refused with
+// ErrConfirmVerificationUnavailable and left to the channel webhook.
+func (s *PaymentService) verifyConfirmPayment(ctx context.Context, order *model.Order, channel, externalTxnID string) error {
+	if s.confirmVerifier != nil {
+		return s.confirmVerifier(ctx, order, channel, externalTxnID)
+	}
+	if channel != "wechat_pay" {
+		return ErrConfirmVerificationUnavailable
+	}
+	if s.wechat == nil {
+		return ErrWechatPayNotConfigured
+	}
+	// The order's provider_intent carries the out_trade_no minted at
+	// CreateOrder — the only handle WeChat accepts for an order query.
+	// Orders created for a different channel (or a wechat order that
+	// failed pre-auth) have none; either way the claim cannot be
+	// verified upstream, so it is refused as unverified (4xx), not a
+	// server error.
+	if order.ProviderIntent == nil {
+		return ErrConfirmNotVerified
+	}
+	var intent struct {
+		OutTradeNo string `json:"out_trade_no"`
+	}
+	if err := json.Unmarshal(*order.ProviderIntent, &intent); err != nil || intent.OutTradeNo == "" {
+		return ErrConfirmNotVerified
+	}
+	res, err := s.wechat.QueryOrder(ctx, intent.OutTradeNo)
+	if err != nil {
+		// Wrapped with the wechat sentinels (ErrWeChatUpstream /
+		// ErrWeChatNetwork / ...) the handler already maps — a transient
+		// upstream failure must surface as retryable, not as "not paid".
+		return err
+	}
+	// Every field the caller could lie about is checked against the
+	// upstream answer: trade state, the order handle, the transaction id
+	// they claimed, and the settled amount/currency against the order's
+	// snapshot (amount.total is fen, i.e. cents).
+	if res == nil || res.TradeState != "SUCCESS" ||
+		res.OutTradeNo != intent.OutTradeNo ||
+		res.TransactionID != externalTxnID ||
+		res.Amount.Total < toCents(order.Amount) ||
+		!strings.EqualFold(res.Amount.Currency, order.Currency) {
+		return ErrConfirmNotVerified
+	}
+	return nil
 }
 
 // ============================================================================
@@ -1062,7 +1155,9 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 		`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status IN ('paid', 'pending')`, payment.ID); err != nil {
 		return nil, fmt.Errorf("sum refunds: %w", err)
 	}
-	if currentSum+in.Amount > paymentAmount {
+	// Compare in integer cents (DECIMAL(10,2) → int64) — a float64 sum
+	// like 0.1+0.2 > 0.3 would wrongly reject an exact full refund.
+	if toCents(currentSum)+toCents(in.Amount) > toCents(paymentAmount) {
 		return nil, ErrRefundSumExceedsPayment
 	}
 
@@ -1312,6 +1407,43 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 				map[string]any{"order_id": order.ID, "webhook_channel": e.Channel, "existing_channel": existing.Channel},
 			)
 		}
+		if existing.ExternalTxnID != e.TransactionID {
+			// Same channel, already-paid order, but a DIFFERENT transaction:
+			// letting the INSERT below run would collide with the partial
+			// unique index (UNIQUE(order_id) WHERE status='paid') and
+			// surface as a 500 — the channel would retry forever. Treat as
+			// dedupe: ack 200 + audit. A matching txn id is a legitimate
+			// redelivery and falls through to the
+			// (channel, external_txn_id) dedupe below.
+			return s.writeAudit(ctx, "service", "webhook_duplicate_paid_order",
+				fmt.Sprintf("order:%s", order.ID),
+				[]string{"webhook", "duplicate_paid_order"},
+				map[string]any{
+					"order_id": order.ID, "channel": e.Channel,
+					"existing_txn_id": existing.ExternalTxnID, "event_txn_id": e.TransactionID,
+					"event_id": e.EventID,
+				},
+			)
+		}
+	}
+
+	// Amount/currency validation (2026-08 trust-model fix): the channel
+	// signature proves the event came from the channel, not that the
+	// settled amount matches the order. An under-paid or wrong-currency
+	// event must NOT activate the subscription. Compare in integer cents
+	// (DECIMAL(10,2) round-trip drifts in float64); currency match is
+	// case-insensitive. Ack 200 (non-retryable) + audit so channels
+	// don't retry forever and ops can reconcile manually.
+	if toCents(e.Amount) < toCents(order.Amount) || !strings.EqualFold(e.Currency, order.Currency) {
+		return s.writeAudit(ctx, "service", "webhook_amount_mismatch",
+			fmt.Sprintf("order:%s", order.ID),
+			[]string{"webhook", "amount_mismatch"},
+			map[string]any{
+				"order_id": order.ID, "channel": e.Channel, "event_id": e.EventID,
+				"event_amount": e.Amount, "event_currency": e.Currency,
+				"order_amount": order.Amount, "order_currency": order.Currency,
+			},
+		)
 	}
 
 	now := time.Now()
@@ -1361,6 +1493,20 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		existing, ferr := s.txLookupPaymentByChannelTxnID(ctx, txSQLX, e.Channel, e.TransactionID)
 		if ferr != nil {
 			return fmt.Errorf("re-read existing: %w", ferr)
+		}
+		if existing.OrderID != order.ID {
+			// The (channel, external_txn_id) row belongs to a DIFFERENT
+			// order than this event resolved. Activating here would grant
+			// this event's order a subscription another order paid for.
+			// Audit + skip activation; ack 200 (non-retryable).
+			return s.writeAudit(ctx, "service", "webhook_payment_order_mismatch",
+				fmt.Sprintf("payment:%s", existing.ID),
+				[]string{"webhook", "payment_order_mismatch"},
+				map[string]any{
+					"channel": e.Channel, "event_id": e.EventID,
+					"event_order_id": order.ID, "payment_order_id": existing.OrderID,
+				},
+			)
 		}
 		if existing.Status != "paid" {
 			// Defensive: SQL guard will make UPDATE a no-op + audit log
@@ -2179,7 +2325,6 @@ func isPaymentSuccess(eventType string) bool {
 	switch eventType {
 	case "payment_intent.succeeded", "TRANSACTION.SUCCESS",
 		"TRADE_SUCCESS", "trade_status_sync",
-		"order_created", "subscription_created",
 		"PAYMENT.CAPTURE.COMPLETED", "BILLING.SUBSCRIPTION.CREATED":
 		return true
 	}
@@ -2200,7 +2345,6 @@ func isRefundEvent(eventType string) bool {
 	switch eventType {
 	case "charge.refunded", "TRANSACTION.REFUND",
 		"TRADE_CLOSED", "trade_closed",
-		"order_refunded", "subscription_payment_refunded",
 		"PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED":
 		return true
 	}
@@ -2238,9 +2382,12 @@ func isPaypalRenewal(eventType string) bool {
 //     into the stored value, so re-forwarding a fresh hint would
 //     shorten or shift an already-extended sub.
 //
-//  2. caller-supplied hint (BFF on Confirm; webhook payload on channels
-//     that ship sub_expires_at, e.g. Stripe metadata / PayPal renewal).
-//     nil = no hint, fall through.
+//  2. channel-authoritative hint (webhook payload on channels that ship
+//     sub_expires_at, e.g. Stripe metadata / PayPal renewal), clamped
+//     to now() + plan.interval_days so even a verified hint cannot
+//     extend the subscription beyond what the plan grants. The Confirm
+//     path passes nil — caller-supplied expiry is untrusted and ignored
+//     there. nil = no hint, fall through.
 //
 //  3. rollover (2026-07-28 upgrade/renewal rule). When this activation
 //     REPLACES an unexpired active subscription, the remaining days
@@ -2280,10 +2427,8 @@ func (s *PaymentService) resolveSubExpiry(
 	const maxIntervalDays = 365 * 290
 
 	// The new plan row is loaded lazily and at most once: the fallback
-	// branch needs its interval, and the rollover branch needs it for
-	// the downgrade comparison. The hint-only path with no active sub
-	// keeps its historical plan-free semantics (TestResolveSubExpiry_
-	// HintForwarded).
+	// branch needs its interval, the rollover branch needs it for the
+	// downgrade comparison, and the hint branch needs it for the clamp.
 	var plan *model.Plan
 	var planErr error
 	planLoaded := false
@@ -2307,7 +2452,27 @@ func (s *PaymentService) resolveSubExpiry(
 
 	var candidate *time.Time
 	if hint != nil {
+		// Hints reach here only from signature-verified channel payloads
+		// (Stripe metadata / PayPal next_billing_time) — Confirm no longer
+		// forwards the caller-supplied ExpiresAt. Clamp anyway: even a
+		// channel-authoritative hint must not extend the subscription
+		// beyond what the plan grants from now (now + interval_days).
+		// Legitimate longer values derived from an existing unexpired
+		// sub are produced by the rollover branch below, which runs its
+		// own max() against this candidate.
+		p, err := loadPlan()
+		if err != nil {
+			return nil, err
+		}
 		c := *hint
+		if p.IntervalDays > 0 {
+			if p.IntervalDays > maxIntervalDays {
+				return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, p.IntervalDays, maxIntervalDays)
+			}
+			if maxHint := time.Now().Add(time.Duration(p.IntervalDays) * 24 * time.Hour); c.After(maxHint) {
+				c = maxHint
+			}
+		}
 		candidate = &c
 	}
 

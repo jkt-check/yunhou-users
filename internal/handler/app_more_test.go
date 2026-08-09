@@ -408,7 +408,7 @@ func TestPlanHandler_UpdatePlan_NegativePrice(t *testing.T) {
 
 func TestPlanHandler_DeletePlan_FKViolation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	svc := &mockPlanSvc{deleteErr: newFKViolation()}
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "in-use", Name: "In Use"}, deleteErr: newFKViolation()}
 	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.DELETE("/admin/plans/:id", h.DeletePlan)
@@ -422,7 +422,7 @@ func TestPlanHandler_DeletePlan_FKViolation(t *testing.T) {
 
 func TestPlanHandler_DeletePlan_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	svc := &mockPlanSvc{}
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "free", Name: "Free"}}
 	h := NewPlanHandler(svc, nil, nil)
 	r := gin.New()
 	r.DELETE("/admin/plans/:id", h.DeletePlan)
@@ -447,7 +447,7 @@ func TestAppHandler_UpdateApp_BadJSON(t *testing.T) {
 	r.apps["yundian"] = &model.App{AppID: "yundian", Name: "Yundian", IsActive: true}
 	h := NewAppHandler(r, nil)
 	g := gin.New()
-	g.PATCH("/admin/apps/:id", h.UpdateApp)
+	g.PATCH("/admin/apps/:id", withCallerApp("yundian"), h.UpdateApp)
 	req := httptest.NewRequest(http.MethodPatch, "/admin/apps/yundian", bytes.NewBufferString("not json"))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -463,7 +463,7 @@ func TestAppHandler_UpdateApp_EmptyName(t *testing.T) {
 	r.apps["yundian"] = &model.App{AppID: "yundian", Name: "Yundian", IsActive: true}
 	h := NewAppHandler(r, nil)
 	g := gin.New()
-	g.PATCH("/admin/apps/:id", h.UpdateApp)
+	g.PATCH("/admin/apps/:id", withCallerApp("yundian"), h.UpdateApp)
 	body := `{"name":"   "}`
 	req := httptest.NewRequest(http.MethodPatch, "/admin/apps/yundian", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")

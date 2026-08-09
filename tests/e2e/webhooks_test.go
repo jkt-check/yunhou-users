@@ -359,11 +359,19 @@ func TestWebhook_Alipay_FullRefund(t *testing.T) {
 	orderID := r.Data.ID
 
 	txnID := "alipay_e2e_" + orderID
-	confirm := fmt.Sprintf(`{"channel":"alipay","external_txn_id":%q}`, txnID)
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
+	// Settle the order via the signed Alipay TRADE_SUCCESS webhook —
+	// the confirm endpoint no longer marks orders paid without upstream
+	// verification (2026-08 trust-model fix).
+	payParams := map[string]string{
+		"out_trade_no": orderID,
+		"trade_no":     txnID,
+		"total_amount": "29.90",
+		"notify_id":    fmt.Sprintf("n_e2e_paid_%s", orderID),
+		"notify_type":  "trade_status_sync",
+	}
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", signAlipay(t, payParams), nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
+		t.Fatalf("paid webhook: %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
 
 	// Send full-refund webhook with the SAME txn_id the channel uses to

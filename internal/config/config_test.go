@@ -832,3 +832,95 @@ func TestParseDurationOr(t *testing.T) {
 		}
 	})
 }
+
+// TestValidate_MockModeProductionGuards covers the startup hard-fail rules
+// for the dev/e2e escape hatches (test login, WeChat OAuth mock, WeChat Pay
+// mock): each bypasses a real security boundary, so combining any of them
+// with a production signal (PAYPAL_ENV=live, or a fully-populated real
+// WeChat Pay credential tuple) must refuse to start.
+func TestValidate_MockModeProductionGuards(t *testing.T) {
+	t.Parallel()
+	base := func() *Config {
+		return &Config{
+			DatabaseURL:         "postgres://x",
+			RSAPrivate:          "priv",
+			RSAPublic:           "pub",
+			JWTAccessTTL:        15 * time.Minute,
+			JWTRefreshTTL:       168 * time.Hour,
+			OrderExpiryDuration: 30 * time.Minute,
+			SweeperInterval:     1 * time.Minute,
+			OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+			// WeChat Pay disabled (all six fields empty) — valid real mode.
+		}
+	}
+
+	t.Run("mock flags without production signals → ok", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.PaypalL3E2EMode = true
+		cfg.WeChatPayMock = true
+		cfg.WeChatOAuthMock = true
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("dev/e2e combination should validate, got: %v", err)
+		}
+	})
+
+	t.Run("test login + PAYPAL_ENV=live → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.PaypalEnv = "live"
+		cfg.PaypalL3E2EMode = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "PAYPAL_L3_E2E_MODE") {
+			t.Errorf("want PAYPAL_L3_E2E_MODE rejection, got: %v", err)
+		}
+	})
+
+	t.Run("wechat pay mock + PAYPAL_ENV=live → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.PaypalEnv = "live"
+		cfg.WeChatPayMock = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_PAY_MOCK") {
+			t.Errorf("want WECHAT_PAY_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("wechat oauth mock + PAYPAL_ENV=live → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.PaypalEnv = "live"
+		cfg.WeChatOAuthMock = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_OAUTH_MOCK") {
+			t.Errorf("want WECHAT_OAUTH_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("mock + full real wechat credentials → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatPayMock = true
+		cfg.WeChatPayMchID = "1900000001"
+		cfg.WeChatAPIv3Key = "0123456789abcdef0123456789abcdef"
+		cfg.WeChatPayAppID = "wx1900000109"
+		cfg.WeChatPayMchPrivateKeyPath = "/k"
+		cfg.WeChatPayMchCertPath = "/c"
+		cfg.WeChatPayNotifyURL = "https://x/cb"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_PAY_MOCK") {
+			t.Errorf("want WECHAT_PAY_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("mock + partial wechat credentials → ok (staging form)", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatPayMock = true
+		cfg.WeChatPayMchID = "1900000001"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("partial creds in mock mode should validate, got: %v", err)
+		}
+	})
+}

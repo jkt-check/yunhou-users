@@ -216,14 +216,16 @@ func TestGitHubOAuth_Redirect_InactiveApp(t *testing.T) {
 	RegisterGitHubOAuthRoutes(engine.Group("/auth/github"), svc, appRepo, &stubAuthSvc{}, tokenSvcStub{})
 
 	// Inactive apps must not get a real GitHub authorize URL — the user
-	// would complete OAuth consent only to be rejected at /callback.
+	// would complete OAuth consent only to be rejected at /callback. The
+	// response is the same 404 as the unknown-app branch so pre-login
+	// callers can't enumerate app_ids by diffing status codes.
 	req := httptest.NewRequest(http.MethodGet,
 		"/auth/github/redirect?app_id=yundian&redirect_uri=https%3A%2F%2Fyundian.com%2Fauth%2Fcallback", nil)
 	w := httptest.NewRecorder()
 	engine.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want 403", w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
 	}
 }
 

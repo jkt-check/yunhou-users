@@ -49,6 +49,87 @@ func NewAppHandler(appRepo AppRepoInterface, providerToken ProviderTokenLookup) 
 	return &AppHandler{appRepo: appRepo, providerToken: providerToken}
 }
 
+// redactedSecret masks server-side-only credential fields in API responses.
+const redactedSecret = "***"
+
+// callerApp returns the InternalAppAuth-authenticated app from the gin
+// context, or nil when the middleware didn't run (unit tests that register
+// handlers bare must set middleware.ContextApp themselves).
+func callerApp(c *gin.Context) *model.App {
+	if v, ok := c.Get(middleware.ContextApp); ok {
+		if app, ok := v.(*model.App); ok {
+			return app
+		}
+	}
+	return nil
+}
+
+// selfAppOnly enforces per-app isolation on /apps/:id and /admin/apps/:id
+// routes: the caller may only operate on its own app row. InternalAppAuth
+// proves possession of *a* valid app secret, but every app secret is equally
+// powerful — without this check one leaked secret could read, reconfigure,
+// rotate, or disable every other app (including exfiltrating the provider
+// credentials stored in apps.config). Returns nil (after writing the 403
+// response) when the caller targets a different app.
+func selfAppOnly(c *gin.Context) *model.App {
+	caller := callerApp(c)
+	if caller != nil && caller.AppID == c.Param("id") {
+		return caller
+	}
+	log.Printf("app authz: caller %q denied access to app %q", callerAppID(c), c.Param("id"))
+	c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "apps may only access their own app"})
+	return nil
+}
+
+func callerAppID(c *gin.Context) string {
+	if app := callerApp(c); app != nil {
+		return app.AppID
+	}
+	return ""
+}
+
+// redactAppConfigSecrets returns a copy of app whose Config has every
+// server-side-only credential field masked. apps.config stores provider
+// secrets the server must read (paypal client_secret, oauth app secrets,
+// wechat pay api_v3_key — see the boundary contracts in model/app.go);
+// none of them may cross the API boundary, or a response-body capture
+// (proxy log, client persistence) hands the reader live provider
+// credentials. Fails closed (config dropped) when it can't be parsed.
+func redactAppConfigSecrets(app *model.App) *model.App {
+	if app == nil || len(app.Config) == 0 {
+		return app
+	}
+	out := *app
+	var cfg model.AppConfig
+	if err := json.Unmarshal(app.Config, &cfg); err != nil {
+		out.Config = nil
+		return &out
+	}
+	if pp := cfg.PaymentProviders; pp != nil {
+		if pp.Paypal != nil && pp.Paypal.ClientSecret != "" {
+			pp.Paypal.ClientSecret = redactedSecret
+		}
+		if pp.WeChatPay != nil && pp.WeChatPay.APIv3Key != "" {
+			pp.WeChatPay.APIv3Key = redactedSecret
+		}
+	}
+	if op := cfg.OAuthProviders; op != nil {
+		if op.GitHub != nil && op.GitHub.ClientSecret != "" {
+			op.GitHub.ClientSecret = redactedSecret
+		}
+		if op.WeChat != nil && op.WeChat.AppSecret != "" {
+			op.WeChat.AppSecret = redactedSecret
+		}
+	}
+	masked, err := json.Marshal(cfg)
+	if err != nil {
+		out.Config = nil
+		return &out
+	}
+	out.Config = masked
+	return &out
+}
+
 func (h *AppHandler) ListApps(c *gin.Context) {
 	apps, err := h.appRepo.List(c.Request.Context())
 	if err != nil {
@@ -56,12 +137,24 @@ func (h *AppHandler) ListApps(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list apps"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": apps})
+	// Scope the listing to the caller's own app — same isolation rule as
+	// selfAppOnly. There is no legitimate "see every app's config" use case
+	// for an internal app, and the rows carry provider credentials.
+	caller := callerAppID(c)
+	out := make([]*model.App, 0, 1)
+	for i := range apps {
+		if apps[i].AppID == caller {
+			out = append(out, redactAppConfigSecrets(&apps[i]))
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": out})
 }
 
 func (h *AppHandler) GetApp(c *gin.Context) {
-	id := c.Param("id")
-	app, err := h.appRepo.FindByID(c.Request.Context(), id)
+	if selfAppOnly(c) == nil {
+		return
+	}
+	app, err := h.appRepo.FindByID(c.Request.Context(), c.Param("id"))
 	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
 		return
@@ -71,7 +164,7 @@ func (h *AppHandler) GetApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load app"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": redactAppConfigSecrets(app)})
 }
 
 func (h *AppHandler) CreateApp(c *gin.Context) {
@@ -139,17 +232,22 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 	// data.secret is the only place the plaintext ever appears — capture it
 	// client-side. After this response the server only has the bcrypt hash.
 	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": gin.H{
-		"app":    app,
+		"app":    redactAppConfigSecrets(app),
 		"secret": plaintext,
 	}})
 }
 
 // RotateSecret handles POST /admin/apps/:id/rotate-secret. The auth middleware
 // (X-App-ID + X-App-Secret) has already verified the caller's existing secret
-// before this handler runs — this endpoint is gated by the admin group. We
-// hand the caller a fresh plaintext, hash it, and persist. The old secret
-// stops working the moment the UPDATE commits.
+// before this handler runs — this endpoint is gated by the admin group, and
+// selfAppOnly restricts it to the caller's own app (rotating someone else's
+// secret would be a one-request takeover/lockout). We hand the caller a
+// fresh plaintext, hash it, and persist. The old secret stops working the
+// moment the UPDATE commits.
 func (h *AppHandler) RotateSecret(c *gin.Context) {
+	if selfAppOnly(c) == nil {
+		return
+	}
 	id := c.Param("id")
 
 	plaintext, hash, err := util.GenerateSecret()
@@ -172,6 +270,9 @@ func (h *AppHandler) RotateSecret(c *gin.Context) {
 }
 
 func (h *AppHandler) UpdateApp(c *gin.Context) {
+	if selfAppOnly(c) == nil {
+		return
+	}
 	id := c.Param("id")
 	app, err := h.appRepo.FindByID(c.Request.Context(), id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -240,7 +341,7 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app})
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": redactAppConfigSecrets(app)})
 }
 
 // GetProviderToken handles GET /apps/:id/provider-token/:channel.
@@ -248,10 +349,15 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 // Auth is via the InternalAppAuth middleware (X-App-ID + X-App-Secret
 // headers) — mounted in router.go on the same group as the other /apps
 // routes. The middleware verifies the caller's app_id matches an active app
-// AND the X-App-Secret bcrypt-verifies against apps.secret_hash; the service
+// AND the X-App-Secret bcrypt-verifies against apps.secret_hash; selfAppOnly
+// then pins the request to the caller's own app so one app can never pull a
+// live provider access token belonging to another app. The service
 // layer additionally loads apps.config.payment_providers.<channel> to read
 // the credentials before calling the provider.
 func (h *AppHandler) GetProviderToken(c *gin.Context) {
+	if selfAppOnly(c) == nil {
+		return
+	}
 	appID := c.Param("id")
 	channel := c.Param("channel")
 	// Defensive nil-check: production router always wires a real
@@ -568,6 +674,25 @@ func adminActorID(c *gin.Context) string {
 	return "admin:unknown"
 }
 
+// rejectForeignPlanApps enforces per-app isolation on plan management:
+// every entry in apps must be the caller's own app id. Plans are shared
+// global rows — any app listed in plan.apps surfaces that plan to its
+// users, and price / accepting_new_subscriptions changes take effect
+// platform-wide. Without this check any one app secret could reprice or
+// close another app's plans. Writes the 403 response and returns false on
+// violation.
+func rejectForeignPlanApps(c *gin.Context, apps []string) bool {
+	caller := callerAppID(c)
+	for _, a := range apps {
+		if a != caller {
+			log.Printf("plan authz: caller %q tried to manage plan referencing app %q", caller, a)
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "plans may only reference the caller's own app"})
+			return false
+		}
+	}
+	return true
+}
+
 // QuoteLookup is the subset of QuoteService the handler uses. Defined here so
 // handler tests can plug in a fake without standing up the full service stack.
 type QuoteLookup interface {
@@ -725,6 +850,9 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "currency must be one of CNY/USD/EUR"})
 		return
 	}
+	if !rejectForeignPlanApps(c, req.Apps) {
+		return
+	}
 	if !h.validatePlanApps(c, req.Apps) {
 		return
 	}
@@ -798,6 +926,9 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "currency must be one of CNY/USD/EUR"})
 		return
 	}
+	if req.Apps != nil && !rejectForeignPlanApps(c, *req.Apps) {
+		return
+	}
 	if req.Apps != nil && !h.validatePlanApps(c, *req.Apps) {
 		return
 	}
@@ -811,6 +942,11 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 	if err != nil {
 		log.Printf("update plan lookup error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load plan"})
+		return
+	}
+	// The existing plan must also belong to the caller — otherwise an app
+	// could hijack another app's plan by patching it in place.
+	if !rejectForeignPlanApps(c, []string(plan.Apps)) {
 		return
 	}
 
@@ -862,6 +998,26 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 
 func (h *PlanHandler) DeletePlan(c *gin.Context) {
 	id := c.Param("id")
+	// Ownership check before delete: plans are shared global rows, so an app
+	// may only delete plans that reference itself alone. The load doubles as
+	// the existence check (404 before any delete attempt).
+	plan, err := h.planSvc.GetPlan(c.Request.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("delete plan lookup error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load plan"})
+		return
+	}
+	if plan == nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "plan not found"})
+		return
+	}
+	if !rejectForeignPlanApps(c, []string(plan.Apps)) {
+		return
+	}
 	if err := h.planSvc.DeletePlan(c.Request.Context(), id, adminActorID(c)); err != nil {
 		// Postgres returns SQLSTATE 23503 when a FK reference prevents the
 		// delete; surface that as a 409 Conflict with a clear message.

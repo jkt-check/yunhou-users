@@ -754,6 +754,35 @@ func appAuthHeaders(appID string) map[string]string {
 	}
 }
 
+// appAuthHeadersWithSecret is appAuthHeaders for an app other than the
+// seeded superAppID — the secret comes from the POST /admin/apps response
+// (the only place a plaintext secret ever appears). Needed now that
+// /apps/:id, /admin/apps/:id and provider-token routes are scoped to the
+// caller's own app.
+func appAuthHeadersWithSecret(appID, secret string) map[string]string {
+	return map[string]string{
+		"X-App-ID":     appID,
+		"X-App-Secret": secret,
+	}
+}
+
+// createdAppSecret extracts data.secret from a POST /admin/apps response body.
+func createdAppSecret(t *testing.T, body []byte) string {
+	t.Helper()
+	var parsed struct {
+		Data struct {
+			Secret string `json:"secret"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("decode create-app response: %v (body: %s)", err, string(body))
+	}
+	if parsed.Data.Secret == "" {
+		t.Fatalf("create-app response missing data.secret (body: %s)", string(body))
+	}
+	return parsed.Data.Secret
+}
+
 // --- Webhook signing helpers (Stripe / WeChat / Alipay / LemonSqueezy) ---
 
 // signStripe produces a Stripe-Signature header for body at unix ts.

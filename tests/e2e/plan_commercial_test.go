@@ -167,9 +167,12 @@ func TestE2E_PlanCommercial_CreateWithNewFields(t *testing.T) {
 	}
 }
 
-// TestE2E_PlanCommercial_AppsValidation covers spec §10.2
-// "POST /admin/plans with apps=['nope'] → 400" — exercises the
-// PlanService.ValidateApps guard that wraps ErrInvalidAppID.
+// TestE2E_PlanCommercial_AppsValidation covers the per-app isolation rule
+// on plan management: an app may only reference itself in plan.apps, so
+// POST /admin/plans with apps=['nonexistent'] from caller yundian is
+// rejected with 403 before ValidateApps even runs. (ValidateApps's
+// ErrInvalidAppID → 400 mapping is covered by the handler unit tests,
+// which authenticate as the referenced app.)
 func TestE2E_PlanCommercial_AppsValidation(t *testing.T) {
 	engine, _, _ := setupE2EServer(t)
 	hdrs := appAuthHeaders(superAppID)
@@ -184,11 +187,8 @@ func TestE2E_PlanCommercial_AppsValidation(t *testing.T) {
 	}`
 
 	resp := doRequest(t, engine, http.MethodPost, "/admin/plans", body, hdrs)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unknown app_id, got %d; body = %s", resp.StatusCode, string(resp.Body))
-	}
-	if !strings.Contains(string(resp.Body), "unknown or inactive app_id") {
-		t.Errorf("expected message to mention ErrInvalidAppID, got body: %s", string(resp.Body))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for foreign app_id reference, got %d; body = %s", resp.StatusCode, string(resp.Body))
 	}
 }
 

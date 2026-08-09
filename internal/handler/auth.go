@@ -91,7 +91,12 @@ func (h *AuthHandler) RefreshToken(c *gin.Context) {
 	resp, err := h.authSvc.RefreshToken(c.Request.Context(), req.RefreshToken, req.AppID)
 	if err != nil {
 		if isExpectedAuthErr(err) {
-			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": err.Error()})
+			// Generic client message on purpose: the distinct sentinel
+			// texts ("invalid refresh token", "user is suspended",
+			// "user is deleted", ...) would disclose account state to
+			// anyone holding a token. Details go to the server log.
+			log.Printf("refresh rejected: %v", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "refresh failed"})
 			return
 		}
 		log.Printf("refresh internal error: %v", err)

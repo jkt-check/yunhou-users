@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"log"
+	"os"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
@@ -67,12 +68,15 @@ func Setup(
 	// behind the public limiter like the other /auth/* routes.
 	wechatOAuthGroup := engine.Group("/auth/wechat", publicLimiter)
 	handler.RegisterWeChatOAuthRoutes(wechatOAuthGroup, wechatOAuthSvc, appRepo, authSvc, wechatOAuthMock)
-	// Dev-only login endpoint for the L3 e2e-ui suite. Returns 404 unless
-	// PAYPAL_L3_E2E_MODE=1 is set; the env check is inside the handler.
-	// Mounted behind the public limiter so an accidental misconfig
-	// (PAYPAL_L3_E2E_MODE=1 left set in production) cannot be used to
-	// mint arbitrary JWTs without rate-limit friction.
-	engine.POST("/test/login", publicLimiter, authHandler.TestLogin)
+	// Dev-only login endpoint for the L3 e2e-ui suite. The route is only
+	// registered when PAYPAL_L3_E2E_MODE=1 — anywhere else the path does not
+	// exist at all, so a stray env line in a production .env is the ONLY way
+	// to expose it, and config.Validate hard-fails when that combines with
+	// PAYPAL_ENV=live. The handler keeps its own env check as defence in
+	// depth. Mounted behind the public limiter for rate-limit friction.
+	if os.Getenv("PAYPAL_L3_E2E_MODE") == "1" {
+		engine.POST("/test/login", publicLimiter, authHandler.TestLogin)
+	}
 
 	// Public plan listing — unauthenticated so marketing pages and the BFF
 	// can fetch the catalog without holding admin credentials. Plan IDs and

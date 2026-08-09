@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/billing/wechat"
+	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
 
@@ -91,7 +92,7 @@ func newTestPaymentService(t *testing.T, db *sqlx.DB) *PaymentService {
 
 func newTestPaymentServiceWith(t *testing.T, db *sqlx.DB, client wechatClient) *PaymentService {
 	t.Helper()
-	return NewPaymentService(
+	svc := NewPaymentService(
 		db,
 		repo.NewOrderRepo(db),
 		repo.NewPaymentRepo(db),
@@ -103,6 +104,15 @@ func newTestPaymentServiceWith(t *testing.T, db *sqlx.DB, client wechatClient) *
 		repo.NewAuditLogRepo(db),
 		&stubRefundAPI{}, client,
 		30*time.Minute)
+	// Most Confirm tests in this file predate the 2026-08 upstream-
+	// verification gate and use Confirm (channel=stripe/wechat_pay) as a
+	// SETUP step for the post-verification pipeline (rollover, dedupe,
+	// retry, refund). Install a pass-through double so those tests keep
+	// exercising the pipeline without an upstream. The verification gate
+	// itself is pinned by dedicated tests (TestConfirm_Verification*)
+	// that construct their service WITHOUT this double.
+	svc.confirmVerifier = func(_ context.Context, _ *model.Order, _, _ string) error { return nil }
+	return svc
 }
 
 func mustNewUUID() string { return uuid.New().String() }
@@ -1849,7 +1859,7 @@ func TestPaymentService_OnWebhook_PaypalStampsExternalSubID(t *testing.T) {
 
 	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: "evt-stamp-" + mustNewUUID()[:8], EventType: "PAYMENT.CAPTURE.COMPLETED",
-		TransactionID: "pi-pp-stamp", OrderID: order.ID, Amount: 29.9, Currency: "USD",
+		TransactionID: "pi-pp-stamp", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
 		ExternalSubscriptionID: "I-PAYPAL-SUB-STAMP",
 		RawPayload:             json.RawMessage(`{}`),
 	}); err != nil {
@@ -2247,10 +2257,13 @@ func TestPaymentService_OnWebhook_ReRunSameTxnID(t *testing.T) {
 	}
 }
 
-// TestPaymentService_OnWebhook_BadCurrency covers the "insert
-// payment" error path in onPaymentSucceeded. The payments table
-// has CHECK (length(currency) = 3); a currency of wrong length
-// violates the constraint and the INSERT fails with check_violation.
+// TestPaymentService_OnWebhook_BadCurrency pins the 2026-08 amount/currency
+// validation in onPaymentSucceeded: an event whose currency (or amount)
+// doesn't match the order's snapshot must NOT insert a payment, must NOT
+// activate a subscription, and must be acked (nil error, so the channel
+// doesn't retry forever) with a webhook_amount_mismatch audit row.
+// Pre-fix this event reached the payments INSERT and failed the
+// CHECK (length(currency) = 3) constraint as a 500 — infinite retries.
 func TestPaymentService_OnWebhook_BadCurrency(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
@@ -2260,14 +2273,26 @@ func TestPaymentService_OnWebhook_BadCurrency(t *testing.T) {
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "stripe", EventID: "evt-bad-cur-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
 		TransactionID: "pi-bad-cur-" + mustNewUUID()[:8], OrderID: order.ID,
-		Amount: 29.9, Currency: "DOLLAR", // 6 chars — violates CHECK (length=3)
+		Amount: 29.9, Currency: "DOLLAR", // does not match the order's CNY snapshot
 		RawPayload: json.RawMessage(`{}`),
 	})
-	if err == nil {
-		t.Fatal("expected error from bad-currency insert, got nil")
+	if err != nil {
+		t.Fatalf("mismatched event must be acked (non-retryable), got err: %v", err)
 	}
-	if !strings.Contains(err.Error(), "insert payment") {
-		t.Errorf("expected wrap 'insert payment', got %q", err.Error())
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_amount_mismatch'`)
+	if n == 0 {
+		t.Error("expected audit_log row for webhook_amount_mismatch")
+	}
+	// No payment row, order still pending — nothing was activated.
+	_ = db.GetContext(context.Background(), &n, `SELECT count(*) FROM payments`)
+	if n != 0 {
+		t.Errorf("expected 0 payments after mismatched event, got %d", n)
+	}
+	got, _ := svc.GetOrder(context.Background(), order.ID, uid)
+	if got.Status != "pending" {
+		t.Errorf("order.Status = %q, want pending (mismatch must not mark paid)", got.Status)
 	}
 }
 
@@ -2577,18 +2602,20 @@ func TestPaymentService_OnWebhook_PaypalRenewal_SubNotActive(t *testing.T) {
 }
 
 // TestResolveSubExpiry_HintForwarded covers the hint branch of
-// resolveSubExpiry: when the caller supplies a hint (BFF on Confirm;
-// webhook payload on channels that ship sub_expires_at, e.g. Stripe
-// metadata / PayPal renewal) AND there is no active subscription to
-// roll over, the helper must forward the hint verbatim and never touch
-// the plan row. The retry/rollover/fallback branches are exercised
+// resolveSubExpiry: when a channel-authoritative hint (webhook payload on
+// channels that ship sub_expires_at, e.g. Stripe metadata) is supplied AND
+// there is no active subscription to roll over, the helper returns the
+// hint — clamped to now() + plan.interval_days so even a verified hint
+// cannot extend the subscription beyond what the plan grants (2026-08
+// trust-model fix). The retry/rollover/fallback branches are exercised
 // end-to-end by the OnWebhook + Confirm tests.
 func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 	db := setupPaymentDB(t)
 	s := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
 
-	hint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	// Within the plan grant (monthly = 30d): forwarded verbatim.
+	hint := time.Now().Add(10 * 24 * time.Hour).UTC().Truncate(time.Second)
 	tx, err := db.Beginx()
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -2599,8 +2626,19 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
 	if got == nil || !got.Equal(hint) {
-		t.Errorf("hint not forwarded: got %v, want %v", got, hint)
+		t.Errorf("hint within plan grant not forwarded: got %v, want %v", got, hint)
 	}
+
+	// Beyond the plan grant: clamped to ~now + 30d.
+	farHint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	got, err = s.resolveSubExpiry(context.Background(), tx, uid, "monthly", &farHint, nil)
+	if err != nil {
+		t.Fatalf("resolveSubExpiry far hint: %v", err)
+	}
+	if got == nil {
+		t.Fatal("clamped hint returned nil")
+	}
+	withinSeconds(t, *got, time.Now().Add(30*24*time.Hour), time.Minute)
 }
 
 // TestOnPaymentSucceeded_WeChatNoHint_UsesPlanInterval exercises the
@@ -3056,5 +3094,374 @@ func TestConfirm_ConcurrentPaymentDedupe_NoDeadlock(t *testing.T) {
 		if err != nil {
 			t.Errorf("concurrent dedupe Confirm failed: %v", err)
 		}
+	}
+}
+
+// ============================================================================
+// Confirm upstream verification (2026-08 trust-model fix)
+// ============================================================================
+
+// newSecureTestPaymentService builds a PaymentService WITHOUT the
+// pass-through confirmVerifier double the shared helper installs — these
+// tests pin the verification gate itself.
+func newSecureTestPaymentService(t *testing.T, db *sqlx.DB, client wechatClient) *PaymentService {
+	t.Helper()
+	return NewPaymentService(
+		db,
+		repo.NewOrderRepo(db),
+		repo.NewPaymentRepo(db),
+		repo.NewRefundRepo(db),
+		repo.NewSubscriptionRepo(db),
+		repo.NewPlanRepo(db),
+		repo.NewUserRepo(db),
+		repo.NewWebhookEventRepo(db),
+		repo.NewAuditLogRepo(db),
+		&stubRefundAPI{}, client,
+		30*time.Minute)
+}
+
+// wechatQuerySUCCESS builds the QueryOrder result a real-mode WeChat
+// client returns for a settled order: SUCCESS with the matching
+// out_trade_no / transaction id and a fen-denominated amount.
+func wechatQuerySUCCESS(outTradeNo, txnID string, fen int64) *wechat.OrderQueryResult {
+	res := &wechat.OrderQueryResult{
+		OutTradeNo:    outTradeNo,
+		TransactionID: txnID,
+		TradeState:    "SUCCESS",
+	}
+	res.Amount.Total = fen
+	res.Amount.Currency = "CNY"
+	return res
+}
+
+// confirmableWechatStub returns a stubWechat whose UnifiedOrder mints a
+// code_url and whose QueryOrder reports SUCCESS for any out_trade_no
+// with the given transaction id and fen amount.
+func confirmableWechatStub(txnID string, fen int64) *stubWechat {
+	return &stubWechat{
+		mockMode: false,
+		mchID:    "1900000109",
+		appID:    "wx_test_app",
+		unifiedFn: func(_ context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return &wechat.UnifiedOrderResponse{OutTradeNo: req.OutTradeNo, CodeURL: "weixin://x"}, nil
+		},
+		queryFn: func(_ context.Context, outTradeNo string) (*wechat.OrderQueryResult, error) {
+			return wechatQuerySUCCESS(outTradeNo, txnID, fen), nil
+		},
+	}
+}
+
+// TestConfirm_UnverifiableChannelRejected pins the gate for channels with
+// no wired server-side query client: a stripe confirm must be refused
+// with ErrConfirmVerificationUnavailable and must NOT write a payment
+// row or mark the order paid — the channel webhook settles it instead.
+func TestConfirm_UnverifiableChannelRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newSecureTestPaymentService(t, db, nil)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+
+	_, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-unverified",
+	})
+	if !errors.Is(err, ErrConfirmVerificationUnavailable) {
+		t.Fatalf("err = %v, want ErrConfirmVerificationUnavailable", err)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n, `SELECT count(*) FROM payments`)
+	if n != 0 {
+		t.Errorf("expected 0 payments after rejected confirm, got %d", n)
+	}
+	got, _ := svc.GetOrder(context.Background(), order.ID, uid)
+	if got.Status != "pending" {
+		t.Errorf("order.Status = %q, want pending (rejected confirm must not mark paid)", got.Status)
+	}
+}
+
+// TestConfirm_WeChatUpstreamVerified drives the happy path: WeChat's
+// server-side QueryOrder shows SUCCESS with matching out_trade_no /
+// transaction id / amount / currency, so Confirm marks the order paid
+// and activates the subscription.
+func TestConfirm_WeChatUpstreamVerified(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newSecureTestPaymentService(t, db, confirmableWechatStub("wx-txn-ok", 1990))
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+
+	res, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "wechat_pay", ExternalTxnID: "wx-txn-ok",
+	})
+	if err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if res.Status != "paid" || !res.ActivatedSubscription {
+		t.Errorf("ConfirmResult = %+v, want paid + activated", res)
+	}
+}
+
+// TestConfirm_WeChatNotVerified pins the rejection shapes: anything the
+// caller could lie about (trade state, transaction id, amount, currency)
+// is checked against the upstream answer and refuses with
+// ErrConfirmNotVerified — no payment row, order stays pending.
+func TestConfirm_WeChatNotVerified(t *testing.T) {
+	cases := []struct {
+		name  string
+		stub  *stubWechat
+		txnID string
+	}{
+		{"not paid upstream", confirmableWechatStub("wx-txn-ok", 1990), "wx-txn-ok"},
+		{"transaction id mismatch", confirmableWechatStub("wx-txn-ok", 1990), "wx-txn-OTHER"},
+		{"amount short", confirmableWechatStub("wx-txn-ok", 1000), "wx-txn-ok"},
+	}
+	// The "not paid upstream" case needs a NOTPAY stub; override it.
+	cases[0].stub.queryFn = func(_ context.Context, outTradeNo string) (*wechat.OrderQueryResult, error) {
+		return &wechat.OrderQueryResult{OutTradeNo: outTradeNo, TradeState: "NOTPAY"}, nil
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupPaymentDB(t)
+			svc := newSecureTestPaymentService(t, db, tc.stub)
+			uid := seedUser(t, db)
+			order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+			if err != nil {
+				t.Fatalf("CreateOrder: %v", err)
+			}
+			_, err = svc.Confirm(context.Background(), ConfirmInput{
+				OrderID: order.ID, UserID: uid, Channel: "wechat_pay", ExternalTxnID: tc.txnID,
+			})
+			if !errors.Is(err, ErrConfirmNotVerified) {
+				t.Fatalf("err = %v, want ErrConfirmNotVerified", err)
+			}
+			var n int
+			_ = db.GetContext(context.Background(), &n, `SELECT count(*) FROM payments`)
+			if n != 0 {
+				t.Errorf("expected 0 payments after unverified confirm, got %d", n)
+			}
+			got, _ := svc.GetOrder(context.Background(), order.ID, uid)
+			if got.Status != "pending" {
+				t.Errorf("order.Status = %q, want pending", got.Status)
+			}
+		})
+	}
+}
+
+// TestConfirm_WeChatUpstreamError: a transient upstream failure must
+// surface as the wrapped wechat sentinel (retryable 502 in the handler),
+// NOT as ErrConfirmNotVerified (terminal).
+func TestConfirm_WeChatUpstreamError(t *testing.T) {
+	db := setupPaymentDB(t)
+	stub := confirmableWechatStub("wx-txn-ok", 1990)
+	stub.queryFn = func(_ context.Context, _ string) (*wechat.OrderQueryResult, error) {
+		return nil, wechat.ErrWeChatNetwork
+	}
+	svc := newSecureTestPaymentService(t, db, stub)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	_, err = svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "wechat_pay", ExternalTxnID: "wx-txn-ok",
+	})
+	if !errors.Is(err, wechat.ErrWeChatNetwork) {
+		t.Fatalf("err = %v, want ErrWeChatNetwork (retryable)", err)
+	}
+}
+
+// TestConfirm_ExpiresAtHintIgnored pins the 2026-08 trust model: a
+// caller-supplied expires_at far beyond the plan grant must be ignored —
+// activation derives expires_at from plan.interval_days (monthly = 30d).
+func TestConfirm_ExpiresAtHintIgnored(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newSecureTestPaymentService(t, db, confirmableWechatStub("wx-txn-hint", 1990))
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+
+	greedy := time.Now().Add(10 * 365 * 24 * time.Hour) // caller asks for 10 years
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "wechat_pay",
+		ExternalTxnID: "wx-txn-hint", ExpiresAt: &greedy,
+	}); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+
+	var exp sql.NullTime
+	if err := db.Get(&exp, `SELECT expires_at FROM subscriptions WHERE user_id = $1`, uid); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if !exp.Valid {
+		t.Fatal("expires_at is NULL — plan fallback did not fire")
+	}
+	withinSeconds(t, exp.Time, time.Now().Add(30*24*time.Hour), time.Minute)
+}
+
+// TestOnWebhook_UnderpaidEvent pins the amount half of the 2026-08
+// validation: a signed event settling LESS than the order's snapshot
+// must not activate — ack 200 + webhook_amount_mismatch audit.
+func TestOnWebhook_UnderpaidEvent(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe") // 19.9 CNY
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-underpaid-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-underpaid-" + mustNewUUID()[:8], OrderID: order.ID,
+		Amount: 9.9, Currency: "CNY", // less than the order's 19.9
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("underpaid event must be acked (non-retryable), got err: %v", err)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_amount_mismatch'`)
+	if n == 0 {
+		t.Error("expected audit_log row for webhook_amount_mismatch")
+	}
+	_ = db.GetContext(context.Background(), &n, `SELECT count(*) FROM payments`)
+	if n != 0 {
+		t.Errorf("expected 0 payments after underpaid event, got %d", n)
+	}
+}
+
+// TestOnWebhook_DuplicatePaidOrderSameChannel pins finding: a second,
+// different paid transaction on the same channel for an already-paid
+// order must be treated as dedupe-success (ack 200 + audit) instead of
+// colliding with the partial unique index and 500ing into infinite
+// channel retries.
+func TestOnWebhook_DuplicatePaidOrderSameChannel(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+
+	first := WebhookEvent{
+		Channel: "stripe", EventID: "evt-dpo-1-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-dpo-first", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}
+	if _, err := svc.OnWebhook(context.Background(), first); err != nil {
+		t.Fatalf("first webhook: %v", err)
+	}
+	second := first
+	second.EventID = "evt-dpo-2-" + mustNewUUID()[:8]
+	second.TransactionID = "pi-dpo-second" // different txn, same order+channel
+	if _, err := svc.OnWebhook(context.Background(), second); err != nil {
+		t.Fatalf("second paid event must be acked (dedupe-success), got err: %v", err)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_duplicate_paid_order'`)
+	if n == 0 {
+		t.Error("expected audit_log row for webhook_duplicate_paid_order")
+	}
+	_ = db.GetContext(context.Background(), &n, `SELECT count(*) FROM payments WHERE order_id = $1`, order.ID)
+	if n != 1 {
+		t.Errorf("expected exactly 1 payment for the order, got %d", n)
+	}
+}
+
+// TestOnWebhook_DedupeOrderMismatch pins the dedupe-hit guard: when the
+// existing (channel, external_txn_id) payment belongs to a DIFFERENT
+// order than this event resolved, activation must be skipped (audit +
+// ack) — otherwise the new event's order would get a subscription
+// another order paid for.
+func TestOnWebhook_DedupeOrderMismatch(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid1, uid2 := seedUser(t, db), seedUser(t, db)
+	order1, _ := svc.CreateOrder(context.Background(), uid1, "monthly", "stripe")
+	order2, _ := svc.CreateOrder(context.Background(), uid2, "monthly", "stripe")
+
+	// Pay order1 via webhook with txn T.
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-oom-1-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-oom-shared", OrderID: order1.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("order1 webhook: %v", err)
+	}
+	// A webhook for order2 arrives carrying the SAME (channel, txn) —
+	// dedupe hit, but the existing payment belongs to order1.
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-oom-2-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-oom-shared", OrderID: order2.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("order-mismatched event must be acked, got err: %v", err)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_payment_order_mismatch'`)
+	if n == 0 {
+		t.Error("expected audit_log row for webhook_payment_order_mismatch")
+	}
+	got, _ := svc.GetOrder(context.Background(), order2.ID, uid2)
+	if got.Status != "pending" {
+		t.Errorf("order2.Status = %q, want pending (activation must be skipped)", got.Status)
+	}
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM subscriptions WHERE user_id = $1 AND status = 'active'`, uid2)
+	if n != 0 {
+		t.Errorf("expected no active subscription for uid2, got %d", n)
+	}
+}
+
+// TestPaymentService_Refund_SumInvariantCents pins the integer-cents
+// comparison in Refund's sum invariant: 0.1 + 0.2 over a 0.30 payment
+// must be allowed (exactly the payment amount in cents) — the pre-fix
+// float64 comparison rejected it as 0.30000000000000004 > 0.3.
+func TestPaymentService_Refund_SumInvariantCents(t *testing.T) {
+	db := setupPaymentDB(t)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps)
+		VALUES ('micro', 'Micro', 0.3, 30, ARRAY['yundian'])
+		ON CONFLICT (id) DO NOTHING
+	`); err != nil {
+		t.Fatalf("seed micro plan: %v", err)
+	}
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "micro", "stripe")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	res, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-micro",
+	})
+	if err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+
+	stub := svc.refundAPI.(*stubRefundAPI)
+	for i, amt := range []float64{0.1, 0.2} {
+		stub.returnID = fmt.Sprintf("re_micro_%d", i)
+		_, err := svc.Refund(context.Background(), RefundInput{
+			PaymentID:      res.PaymentID,
+			UserID:         uid,
+			IdempotencyKey: fmt.Sprintf("k-micro-%d-%s", i, mustNewUUID()[:8]),
+			Amount:         amt,
+		})
+		if err != nil {
+			t.Fatalf("refund %d (%v): %v", i, amt, err)
+		}
+	}
+	// A further cent must still be rejected: 10 + 20 + 1 > 30 in cents.
+	stub.returnID = "re_micro_over"
+	_, err = svc.Refund(context.Background(), RefundInput{
+		PaymentID:      res.PaymentID,
+		UserID:         uid,
+		IdempotencyKey: "k-micro-over-" + mustNewUUID()[:8],
+		Amount:         0.01,
+	})
+	if !errors.Is(err, ErrRefundSumExceedsPayment) {
+		t.Errorf("err = %v, want ErrRefundSumExceedsPayment", err)
 	}
 }

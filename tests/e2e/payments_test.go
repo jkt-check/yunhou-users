@@ -55,8 +55,12 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 		}
 	})
 
-	// 3. Confirm the first order
-	t.Run("confirm_order", func(t *testing.T) {
+	// 3. Caller-initiated confirm is REJECTED without upstream
+	//    verification (2026-08 trust-model fix): stripe has no wired
+	//    server-side query client, so the confirm endpoint refuses to
+	//    mark the order paid on the caller's word alone. The
+	//    signature-verified channel webhook settles the order instead.
+	t.Run("confirm_rejected_webhook_settles", func(t *testing.T) {
 		// Create a fresh user for clean state.
 		login := loginAndGetTokens(t, srv.Engine, "payments-confirm", "yundian")
 		token2, userID := login.AccessToken, login.User.ID
@@ -76,23 +80,12 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 		confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_%s","amount":19.90,"currency":"CNY"}`, orderID)
 		resp = doRequest(t, srv.Engine, http.MethodPost,
 			"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token2))
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("confirm: expected 200, got %d — body: %s", resp.StatusCode, string(resp.Body))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("confirm: expected 400 (verification unavailable), got %d — body: %s", resp.StatusCode, string(resp.Body))
 		}
-		var cr struct {
-			Data struct {
-				PaymentID             string `json:"payment_id"`
-				Status                string `json:"status"`
-				ActivatedSubscription bool   `json:"activated_subscription"`
-			} `json:"data"`
-		}
-		resp.JSON(t, &cr)
-		if cr.Data.Status != "paid" {
-			t.Errorf("expected status=paid, got %s", cr.Data.Status)
-		}
-		if !cr.Data.ActivatedSubscription {
-			t.Error("expected activated_subscription=true")
-		}
+
+		// Settle via the signed Stripe webhook, then verify state.
+		payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_"+orderID)
 
 		// Verify order row in DB.
 		var status string
@@ -116,13 +109,41 @@ func TestPayments_OrderLifecycle(t *testing.T) {
 	})
 }
 
-// TestPayments_ConfirmChannelMismatch: confirm with a different channel
-// than the existing paid payment → 409.
+// payOrderViaStripeWebhook settles an order through the signature-verified
+// Stripe webhook and returns the paid payment's id. Tests that need a
+// paid payment drive the channel path — the confirm endpoint no longer
+// marks orders paid without upstream verification (2026-08 trust-model
+// fix). Amount 1990 cents = ¥19.90, the monthly plan snapshot.
+func payOrderViaStripeWebhook(t *testing.T, srv *E2EServer, orderID, txnID string) string {
+	t.Helper()
+	raw := goldenStripePaid(orderID, txnID, 1990)
+	ts := time.Now().Unix()
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/payment/stripe", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", signStripe(e2eStripeSecret, ts, raw))
+	w := httptest.NewRecorder()
+	srv.Engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("stripe webhook settle: %d %s", w.Code, w.Body.String())
+	}
+	var paymentID string
+	if err := srv.DB.GetContext(context.Background(), &paymentID,
+		`SELECT id FROM payments WHERE order_id = $1 AND status = 'paid'`, orderID); err != nil {
+		t.Fatalf("read paid payment: %v", err)
+	}
+	return paymentID
+}
+
+// TestPayments_ConfirmChannelMismatch: after the order is paid (via the
+// signed Stripe webhook), a confirm on a different channel must be
+// rejected — with the 2026-08 trust model the wechat_pay confirm fails
+// upstream verification (mock upstream reports NOTPAY) before it can
+// double-pay the order, surfacing a 400 instead of the old 409.
 func TestPayments_ConfirmChannelMismatch(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 	token := loginAndGetTokens(t, srv.Engine, "channel-mismatch", "yundian").AccessToken
 
-	// First, create + confirm with Stripe.
+	// First, create + settle with Stripe.
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
@@ -136,19 +157,24 @@ func TestPayments_ConfirmChannelMismatch(t *testing.T) {
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
 
-	confirm1 := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_first_%s"}`, orderID)
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm", confirm1, authHeader(token))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("first confirm: %d %s", resp.StatusCode, string(resp.Body))
-	}
+	payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_first_"+orderID)
 
 	// Now try to confirm with a different channel.
 	confirm2 := fmt.Sprintf(`{"channel":"wechat_pay","external_txn_id":"wx_e2e_second_%s"}`, orderID)
 	resp = doRequest(t, srv.Engine, http.MethodPost,
 		"/payments/orders/"+orderID+"/confirm", confirm2, authHeader(token))
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("expected 409 channel mismatch, got %d — body: %s", resp.StatusCode, string(resp.Body))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 (cross-channel confirm rejected), got %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+
+	// The order must still carry exactly one paid payment (stripe).
+	var n int
+	if err := srv.DB.GetContext(context.Background(), &n,
+		`SELECT COUNT(*) FROM payments WHERE order_id = $1`, orderID); err != nil {
+		t.Fatalf("count payments: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 payment after rejected cross-channel confirm, got %d", n)
 	}
 }
 
@@ -160,7 +186,7 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 	token := loginAndGetTokens(t, srv.Engine, "refund-idem", "yundian").AccessToken
 
-	// Create + confirm to get a paid payment.
+	// Create + settle to get a paid payment.
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	if resp.StatusCode != http.StatusCreated {
@@ -174,19 +200,7 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
 
-	confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_refund_%s"}`, orderID)
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
-	}
-	var cr struct {
-		Data struct {
-			PaymentID string `json:"payment_id"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &cr)
-	paymentID := cr.Data.PaymentID
+	paymentID := payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_refund_"+orderID)
 
 	// First refund.
 	refund1 := fmt.Sprintf(`{"payment_id":%q,"amount":5.0,"reason":"first call"}`, paymentID)
@@ -263,16 +277,7 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
 
-	confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_sum_%s"}`, orderID)
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
-	var cr struct {
-		Data struct {
-			PaymentID string `json:"payment_id"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &cr)
-	paymentID := cr.Data.PaymentID
+	paymentID := payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_sum_"+orderID)
 
 	// First refund of 10 — OK (< payment 19.90).
 	refund1 := fmt.Sprintf(`{"payment_id":%q,"amount":10.0}`, paymentID)
@@ -299,7 +304,7 @@ func TestPayments_OwnershipIsolation(t *testing.T) {
 	tokenA := loginAndGetTokens(t, srv.Engine, "owner-a", "yundian").AccessToken
 	tokenB := loginAndGetTokens(t, srv.Engine, "owner-b", "yundian").AccessToken
 
-	// A creates + confirms an order.
+	// A creates + settles an order.
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
 		`{"plan_id":"monthly","channel":"stripe"}`, authHeader(tokenA))
 	if resp.StatusCode != http.StatusCreated {
@@ -313,20 +318,7 @@ func TestPayments_OwnershipIsolation(t *testing.T) {
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
 
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm",
-		fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_owner_%s"}`, orderID),
-		authHeader(tokenA))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
-	}
-	var cr struct {
-		Data struct {
-			PaymentID string `json:"payment_id"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &cr)
-	paymentID := cr.Data.PaymentID
+	paymentID := payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_owner_"+orderID)
 
 	// B tries to GET A's payment → 404 (hide existence from non-owner).
 	resp = doRequest(t, srv.Engine, http.MethodGet, "/payments/"+paymentID, "", authHeader(tokenB))
@@ -387,9 +379,9 @@ func TestPayments_CancelOrder(t *testing.T) {
 }
 
 // TestPayments_LatePaymentHonored: an order that the sweeper marked
-// `expired` can still be confirmed — the channel webhook arrives late and
-// we honor the payment. We simulate the race by manually flipping the
-// order to expired and then calling confirm.
+// `expired` is still honored when the channel webhook arrives late.
+// We simulate the race by manually flipping the order to expired and
+// then delivering the signed Stripe webhook.
 func TestPayments_LatePaymentHonored(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
@@ -411,13 +403,8 @@ func TestPayments_LatePaymentHonored(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Confirm — should honor.
-	confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_late_%s"}`, orderID)
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 (honor), got %d — body: %s", resp.StatusCode, string(resp.Body))
-	}
+	// Late webhook — should honor.
+	payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_late_"+orderID)
 
 	// Verify order flipped back to paid.
 	var status string
@@ -491,16 +478,7 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
 
-	confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_race_%s"}`, orderID)
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
-	var cr struct {
-		Data struct {
-			PaymentID string `json:"payment_id"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &cr)
-	paymentID := cr.Data.PaymentID
+	paymentID := payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_race_"+orderID)
 
 	// Fire 4 concurrent refunds of 5.00 each. Sum would be 20.00 > 19.90.
 	// Expect: at most 3 succeed (5+5+5 = 15 ≤ 19.90, but 5+5+5+5 = 20 > 19.90,
@@ -561,7 +539,8 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 	token := loginAndGetTokens(t, srv.Engine, "concurrent-webhook", "yundian").AccessToken
 
-	// Setup: paid order
+	// Setup: paid order (settled via the signed Stripe webhook — confirm
+	// no longer marks orders paid without upstream verification).
 	body := `{"plan_id":"monthly","channel":"stripe"}`
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders", body, authHeader(token))
 	var r struct {
@@ -572,21 +551,17 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 	resp.JSON(t, &r)
 	orderID := r.Data.ID
 
-	confirm := fmt.Sprintf(`{"channel":"stripe","external_txn_id":"pi_e2e_w_race_%s"}`, orderID)
-	resp = doRequest(t, srv.Engine, http.MethodPost,
-		"/payments/orders/"+orderID+"/confirm", confirm, authHeader(token))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("confirm: %d %s", resp.StatusCode, string(resp.Body))
-	}
+	payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_w_race_"+orderID)
 
 	// Fire 5 concurrent webhooks with distinct event_ids but the same
 	// payment_intent.id. The webhook handler inserts into webhook_events
 	// keyed on (channel, event_id), so 5 distinct event_ids means 5
-	// distinct dedupe rows — all 5 reach the business action. The
-	// partial unique index on payments(order_id) WHERE status='paid'
-	// must allow only ONE to actually insert a paid payment; the other
-	// 4 hit the unique violation. The handler returns 200 on dedupe
-	// hit (same event_id) and 500 on the partial unique violation.
+	// distinct dedupe rows — all 5 reach the business action. All 5
+	// carry the same (channel, external_txn_id) as the pre-settled
+	// payment, so the payment-row dedupe absorbs every one and each
+	// returns 200; the amount/currency matches the order snapshot
+	// (1990 cents CNY = the monthly price) so the 2026-08 validation
+	// doesn't reject them.
 	const N = 5
 	type whResult struct {
 		status int
@@ -598,7 +573,7 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 			raw := []byte(fmt.Sprintf(`{
 				"id": "evt_race_%d_%s",
 				"type": "payment_intent.succeeded",
-				"data": {"object": {"id": "pi_e2e_w_race_%s", "metadata": {"order_id": "%s"}, "amount": 2990, "currency": "usd"}}
+				"data": {"object": {"id": "pi_e2e_w_race_%s", "metadata": {"order_id": "%s"}, "amount": 1990, "currency": "cny"}}
 			}`, idx, orderID, orderID, orderID))
 			ts := time.Now().Unix()
 			sig := signStripe(e2eStripeSecret, ts, raw)
@@ -611,7 +586,8 @@ func TestPayments_ConcurrentWebhookSameOrder(t *testing.T) {
 		}(i)
 	}
 	// All 5 webhooks have the same (channel, external_txn_id) as the
-	// pre-confirm, so the (channel, external_txn_id) UNIQUE index dedupes
+	// pre-settled payment, so the (channel, external_txn_id) UNIQUE index
+	// dedupes
 	// every one of them via `ON CONFLICT DO NOTHING` in
 	// insertPaymentOnTx — all 5 return 200 (dedup hit). The test still
 	// proves the system is safe under concurrent delivery: no double
@@ -695,7 +671,7 @@ func TestPayments_ConcurrentWebhookSameEventID(t *testing.T) {
 			raw := []byte(fmt.Sprintf(`{
 				"id": "%s",
 				"type": "payment_intent.succeeded",
-				"data": {"object": {"id": "%s", "metadata": {"order_id": "%s"}, "amount": 2990, "currency": "usd"}}
+				"data": {"object": {"id": "%s", "metadata": {"order_id": "%s"}, "amount": 1990, "currency": "cny"}}
 			}`, sharedEventID, sharedTxnID, orderID))
 			ts := time.Now().Unix()
 			sig := signStripe(e2eStripeSecret, ts, raw)

@@ -95,8 +95,10 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 
 	var req model.ChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		// Fixed client message: err.Error() would reflect binding/struct
+		// internals to the caller.
 		h.logAccess(started, userID, appID, req, "error", "invalid request body", "")
-		writeChatError(c, http.StatusBadRequest, err.Error())
+		writeChatError(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if msg := validateChatMessages(req.Messages); msg != "" {

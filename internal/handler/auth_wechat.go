@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -72,8 +73,11 @@ func (d *wechatOAuthDeps) Redirect(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
 		return
 	}
+	// Same 404 as the not-found branch — diffing status codes would let
+	// pre-login callers enumerate which app_ids exist.
 	if !app.IsActive {
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "app is inactive"})
+		log.Printf("wechat oauth redirect: app %q inactive", appID)
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "app not found"})
 		return
 	}
 
@@ -185,14 +189,12 @@ func (d *wechatOAuthDeps) Callback(c *gin.Context) {
 				}
 			}
 		}
-		// Fallback when state verify / app lookup fails — surface the
-		// upstream error verbatim. Drop the trailing ": " that would
-		// otherwise appear when error_description is empty.
-		msg := upstreamErr
-		if upstreamErrDesc != "" {
-			msg = upstreamErr + ": " + upstreamErrDesc
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": msg})
+		// Fallback when state verify / app lookup fails — don't echo the
+		// upstream error verbatim (attacker-controllable query params
+		// reflected into a JSON body); return a fixed message and keep
+		// the detail in the server log.
+		log.Printf("wechat oauth callback: upstream error %q (%q) with unverifiable state", upstreamErr, upstreamErrDesc)
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "authorization failed"})
 		return
 	}
 

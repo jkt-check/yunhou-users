@@ -16,10 +16,13 @@ func TestE2E_ProviderToken_UnsupportedChannel(t *testing.T) {
 	if createResp.StatusCode != http.StatusCreated {
 		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
 	}
+	// provider-token is scoped to the caller's own app — authenticate as the
+	// freshly created app with the one-time secret from the create response.
+	hdrs := appAuthHeadersWithSecret(appID, createdAppSecret(t, createResp.Body))
 
 	resp := doRequest(t, engine, http.MethodGet,
 		"/apps/"+appID+"/provider-token/stripe",
-		"", appAuthHeaders(superAppID))
+		"", hdrs)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400; body = %s", resp.StatusCode, string(resp.Body))
 	}
@@ -34,10 +37,11 @@ func TestE2E_ProviderToken_MissingConfig(t *testing.T) {
 	if createResp.StatusCode != http.StatusCreated {
 		t.Fatalf("create app: %d %s", createResp.StatusCode, string(createResp.Body))
 	}
+	hdrs := appAuthHeadersWithSecret(appID, createdAppSecret(t, createResp.Body))
 
 	resp := doRequest(t, engine, http.MethodGet,
 		"/apps/"+appID+"/provider-token/paypal",
-		"", appAuthHeaders(superAppID))
+		"", hdrs)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400; body = %s", resp.StatusCode, string(resp.Body))
 	}

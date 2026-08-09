@@ -320,6 +320,11 @@ func performPlanHandlerRequest(t *testing.T, svc *mockPlanSvc, method, path, bod
 
 	handler := NewPlanHandler(svc, nil, nil)
 	router := gin.New()
+	// Inject the InternalAppAuth context as app "yundian": plan mutations
+	// are scoped to the caller's own app (rejectForeignPlanApps), and most
+	// fixtures in this file reference "yundian". Tests that deliberately
+	// operate on another app's id must use performPlanHandlerRequestAsApp.
+	router.Use(withCallerApp("yundian"))
 	router.POST("/admin/plans", handler.CreatePlan)
 	router.GET("/admin/plans/:id", handler.GetPlan)
 	router.PATCH("/admin/plans/:id", handler.UpdatePlan)
@@ -378,7 +383,7 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
-		router.POST("/admin/plans", handler.CreatePlan)
+		router.POST("/admin/plans", withCallerApp("yundian"), handler.CreatePlan)
 
 		body := `{"id":"test","name":"Test Plan","price":9.99,"interval_days":30,"apps":["yundian"]}`
 		req := httptest.NewRequest(http.MethodPost, "/admin/plans", bytes.NewBufferString(body))
@@ -415,7 +420,7 @@ func TestPlanHandler_CreatePlan(t *testing.T) {
 		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
-		router.POST("/admin/plans", handler.CreatePlan)
+		router.POST("/admin/plans", withCallerApp("yundian"), handler.CreatePlan)
 
 		body := `{"id":"test","name":"Test Plan","price":9.99,"interval_days":30,"apps":["yundian"],"currency":"USD","is_listed":false,"accepting_new_subscriptions":false,"is_active":false,"trial_days":7,"description":"Trial plan","display_order":4}`
 		req := httptest.NewRequest(http.MethodPost, "/admin/plans", bytes.NewBufferString(body))
@@ -578,7 +583,9 @@ func TestPlanHandler_Create_AcceptsNewFields(t *testing.T) {
 func TestPlanHandler_Create_RejectsUnknownAppID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{validateAppsErr: service.ErrInvalidAppID}
-	w := performPlanHandlerRequest(t, svc, http.MethodPost, "/admin/plans",
+	// Caller "nope" so the per-app ownership check (rejectForeignPlanApps)
+	// passes and the request reaches ValidateApps — the wiring under test.
+	w := performPlanHandlerRequestAsApp(t, svc, "nope", http.MethodPost, "/admin/plans",
 		`{"id":"x","name":"x","apps":["nope"]}`)
 
 	if w.Code != http.StatusBadRequest {
@@ -739,7 +746,7 @@ func TestPlanHandler_Patch_AcceptsNewFields(t *testing.T) {
 	svc := &mockPlanSvc{plan: &model.Plan{
 		ID:                        "monthly",
 		Name:                      "Monthly",
-		Apps:                      []string{"old-app"},
+		Apps:                      []string{"yundian"},
 		IsListed:                  true,
 		AcceptingNewSubscriptions: true,
 		Currency:                  "CNY",
@@ -782,7 +789,7 @@ func TestPlanHandler_Patch_RejectsUnknownAppID(t *testing.T) {
 		plan:            &model.Plan{ID: "monthly", Name: "Monthly"},
 		validateAppsErr: service.ErrInvalidAppID,
 	}
-	w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly",
+	w := performPlanHandlerRequestAsApp(t, svc, "nope", http.MethodPatch, "/admin/plans/monthly",
 		`{"apps":["nope"]}`)
 
 	if w.Code != http.StatusBadRequest {
@@ -814,7 +821,7 @@ func TestPlanHandler_DeletePlan(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	t.Run("delete plan success", func(t *testing.T) {
-		planSvc := &mockPlanSvc{}
+		planSvc := &mockPlanSvc{plan: &model.Plan{ID: "test-plan", Name: "Test"}}
 		handler := NewPlanHandler(planSvc, nil, nil)
 
 		router := gin.New()
@@ -901,7 +908,10 @@ func TestPlanHandler_UpdatePlan_ForwardsAppIDToAuditLog(t *testing.T) {
 // TestPlanHandler_DeletePlan_ForwardsAppIDToAuditLog — see D4.
 func TestPlanHandler_DeletePlan_ForwardsAppIDToAuditLog(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	svc := &mockPlanSvc{}
+	// The plan must belong to the calling app or DeletePlan's ownership
+	// check (rejectForeignPlanApps) stops the request before the audit
+	// attribution under test.
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly", Apps: []string{"yundian"}}}
 
 	w := performPlanHandlerRequestAsApp(t, svc, "yundian", http.MethodDelete, "/admin/plans/monthly", "")
 
@@ -1153,6 +1163,16 @@ func (m *mockAppRepo) BackfillSecretHash(ctx context.Context, appID, newHash str
 	return false, sql.ErrNoRows
 }
 
+// withCallerApp mimics InternalAppAuth's context for handler tests that
+// exercise selfAppOnly-scoped routes (the real middleware bcrypt-verifies
+// the secret; the handler only reads the context value it sets).
+func withCallerApp(appID string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set(middleware.ContextApp, &model.App{AppID: appID, IsActive: true})
+		c.Next()
+	}
+}
+
 func TestAppHandler_ListApps(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1165,7 +1185,7 @@ func TestAppHandler_ListApps(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.GET("/apps", handler.ListApps)
+		router.GET("/apps", withCallerApp("yundian"), handler.ListApps)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps", nil)
 		w := httptest.NewRecorder()
@@ -1174,6 +1194,13 @@ func TestAppHandler_ListApps(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", w.Code)
 		}
+		// Per-app isolation: the listing is scoped to the caller's own app.
+		if !strings.Contains(w.Body.String(), "yundian") {
+			t.Errorf("own app missing from listing: %s", w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "yundash") {
+			t.Errorf("foreign app leaked into listing: %s", w.Body.String())
+		}
 	})
 
 	t.Run("list apps error", func(t *testing.T) {
@@ -1181,7 +1208,7 @@ func TestAppHandler_ListApps(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.GET("/apps", handler.ListApps)
+		router.GET("/apps", withCallerApp("yundian"), handler.ListApps)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps", nil)
 		w := httptest.NewRecorder()
@@ -1202,7 +1229,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.GET("/apps/:id", handler.GetApp)
+		router.GET("/apps/:id", withCallerApp("yundian"), handler.GetApp)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/yundian", nil)
 		w := httptest.NewRecorder()
@@ -1218,7 +1245,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.GET("/apps/:id", handler.GetApp)
+		router.GET("/apps/:id", withCallerApp("nonexistent"), handler.GetApp)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/nonexistent", nil)
 		w := httptest.NewRecorder()
@@ -1226,6 +1253,54 @@ func TestAppHandler_GetApp(t *testing.T) {
 
 		if w.Code != http.StatusNotFound {
 			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("get foreign app denied", func(t *testing.T) {
+		apps := []model.App{{AppID: "yundash", Name: "Yundash"}}
+		appRepo := &mockAppRepo{apps: apps}
+		handler := NewAppHandler(appRepo, nil)
+
+		router := gin.New()
+		router.GET("/apps/:id", withCallerApp("yundian"), handler.GetApp)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundash", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Errorf("expected 403, got %d", w.Code)
+		}
+	})
+
+	t.Run("response redacts provider secrets", func(t *testing.T) {
+		cfg := `{"payment_providers":{"paypal":{"client_id":"cid","client_secret":"RAW-PP-SECRET","webhook_id":"W","mode":"live"},"wechat_pay":{"mch_id":"m","api_v3_key":"RAW-APIV3-KEY","cert_path":"c","key_path":"k","notify_url":"n"}},"oauth_providers":{"github":{"client_id":"g","client_secret":"RAW-GH-SECRET","callback_urls":["https://x/cb"]},"wechat":{"app_id":"wx0123456789abcdef","app_secret":"RAW-WX-SECRET","callback_urls":["https://x/cb"]}}}`
+		apps := []model.App{{AppID: "yundian", Name: "Yundian", Config: json.RawMessage(cfg)}}
+		appRepo := &mockAppRepo{apps: apps}
+		handler := NewAppHandler(appRepo, nil)
+
+		router := gin.New()
+		router.GET("/apps/:id", withCallerApp("yundian"), handler.GetApp)
+
+		req := httptest.NewRequest(http.MethodGet, "/apps/yundian", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		for _, raw := range []string{"RAW-PP-SECRET", "RAW-APIV3-KEY", "RAW-GH-SECRET", "RAW-WX-SECRET"} {
+			if strings.Contains(body, raw) {
+				t.Errorf("response leaked provider secret %q: %s", raw, body)
+			}
+		}
+		if !strings.Contains(body, redactedSecret) {
+			t.Errorf("response missing redaction marker %q: %s", redactedSecret, body)
+		}
+		// Public, non-secret fields must survive redaction.
+		if !strings.Contains(body, "cid") {
+			t.Errorf("response lost non-secret config fields: %s", body)
 		}
 	})
 }
@@ -1350,7 +1425,7 @@ func TestAppHandler_RotateSecret(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.POST("/apps/:id/rotate-secret", handler.RotateSecret)
+		router.POST("/apps/:id/rotate-secret", withCallerApp("test"), handler.RotateSecret)
 
 		req := httptest.NewRequest(http.MethodPost, "/apps/test/rotate-secret", nil)
 		w := httptest.NewRecorder()
@@ -1388,7 +1463,7 @@ func TestAppHandler_RotateSecret(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.POST("/apps/:id/rotate-secret", handler.RotateSecret)
+		router.POST("/apps/:id/rotate-secret", withCallerApp("missing"), handler.RotateSecret)
 
 		req := httptest.NewRequest(http.MethodPost, "/apps/missing/rotate-secret", nil)
 		w := httptest.NewRecorder()
@@ -1409,7 +1484,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.PATCH("/apps/:id", handler.UpdateApp)
+		router.PATCH("/apps/:id", withCallerApp("test"), handler.UpdateApp)
 
 		body := `{"name":"New Name"}`
 		req := httptest.NewRequest(http.MethodPatch, "/apps/test", bytes.NewBufferString(body))
@@ -1427,7 +1502,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 		handler := NewAppHandler(appRepo, nil)
 
 		router := gin.New()
-		router.PATCH("/apps/:id", handler.UpdateApp)
+		router.PATCH("/apps/:id", withCallerApp("nonexistent"), handler.UpdateApp)
 
 		body := `{"name":"New Name"}`
 		req := httptest.NewRequest(http.MethodPatch, "/apps/nonexistent", bytes.NewBufferString(body))
@@ -1448,7 +1523,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 		appRepo := &mockAppRepo{apps: existing}
 		handler := NewAppHandler(appRepo, nil)
 		router := gin.New()
-		router.PATCH("/apps/:id", handler.UpdateApp)
+		router.PATCH("/apps/:id", withCallerApp("site"), handler.UpdateApp)
 
 		body := `{"config":{"payment_providers":{"paypal":{"client_id":"c","client_secret":"s","webhook_id":"w","mode":"live"}}}}`
 		req := httptest.NewRequest(http.MethodPatch, "/apps/site", bytes.NewBufferString(body))
@@ -1477,7 +1552,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 		appRepo := &mockAppRepo{apps: existing}
 		handler := NewAppHandler(appRepo, nil)
 		router := gin.New()
-		router.PATCH("/apps/:id", handler.UpdateApp)
+		router.PATCH("/apps/:id", withCallerApp("site"), handler.UpdateApp)
 
 		body := `{"config":{"payment_providers":{"paypal":{"client_id":"only"}}}}`
 		req := httptest.NewRequest(http.MethodPatch, "/apps/site", bytes.NewBufferString(body))
@@ -2101,20 +2176,26 @@ func TestSubscriptionHandler_CancelSubscription_NoAuth_401(t *testing.T) {
 
 func TestPlanHandler_DeletePlan_ErrorPaths(t *testing.T) {
 	t.Parallel()
+	// DeletePlan now loads the plan first (ownership scoping), so every case
+	// that should reach planSvc.DeletePlan needs a GetPlan fixture.
+	loadable := &model.Plan{ID: "x", Name: "X"}
 	cases := []struct {
 		name        string
 		svc         *mockPlanSvc
 		wantStatus  int
 		wantMessage string
 	}{
+		{"load: PlanNotFound → 404",
+			&mockPlanSvc{getErr: sql.ErrNoRows},
+			http.StatusNotFound, "plan not found"},
 		{"PlanNotFound → 500",
-			&mockPlanSvc{deleteErr: sql.ErrNoRows},
+			&mockPlanSvc{plan: loadable, deleteErr: sql.ErrNoRows},
 			http.StatusInternalServerError, "failed to delete plan"},
 		{"unknown error → 500",
-			&mockPlanSvc{deleteErr: errors.New("db exploded")},
+			&mockPlanSvc{plan: loadable, deleteErr: errors.New("db exploded")},
 			http.StatusInternalServerError, "failed to delete plan"},
 		{"success → 200",
-			&mockPlanSvc{},
+			&mockPlanSvc{plan: loadable},
 			http.StatusOK, "deleted"},
 	}
 	for _, tc := range cases {
@@ -2243,7 +2324,7 @@ func TestAuthHandler_RefreshToken_ErrorPaths(t *testing.T) {
 		{"ErrInvalidRefreshToken → 401",
 			&mockAuthSvc{refreshErr: service.ErrInvalidRefreshToken},
 			`{"refresh_token":"bad","app_id":"a"}`,
-			http.StatusUnauthorized, "invalid refresh token"},
+			http.StatusUnauthorized, "refresh failed"},
 		{"unknown error → 500",
 			&mockAuthSvc{refreshErr: errors.New("db exploded")},
 			`{"refresh_token":"x","app_id":"a"}`,
@@ -2322,9 +2403,11 @@ func newAppEngine(repo *mockAppRepo) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	h := NewAppHandler(repo, nil)
-	engine.GET("/apps/:id", h.GetApp)
+	// Tests in this file target the app "yundian"; the caller-app middleware
+	// mimics InternalAppAuth so selfAppOnly lets the request through.
+	engine.GET("/apps/:id", withCallerApp("yundian"), h.GetApp)
 	engine.POST("/admin/apps", h.CreateApp)
-	engine.PATCH("/admin/apps/:id", h.UpdateApp)
+	engine.PATCH("/admin/apps/:id", withCallerApp("yundian"), h.UpdateApp)
 	return engine
 }
 
@@ -2498,7 +2581,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 		pt := &fakeProviderToken{result: &model.ProviderToken{Channel: "paypal", AccessToken: "AT", ExpiresIn: 3600}}
 		handler := NewAppHandler(appRepo, pt)
 		router := gin.New()
-		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
 		w := httptest.NewRecorder()
@@ -2526,7 +2609,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrUnsupportedChannel}
 		handler := NewAppHandler(&mockAppRepo{}, pt)
 		router := gin.New()
-		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/stripe", nil)
 		w := httptest.NewRecorder()
@@ -2541,7 +2624,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrProviderNotConfigured}
 		handler := NewAppHandler(&mockAppRepo{}, pt)
 		router := gin.New()
-		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
 		w := httptest.NewRecorder()
@@ -2556,7 +2639,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrAppInactive}
 		handler := NewAppHandler(&mockAppRepo{}, pt)
 		router := gin.New()
-		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
 		w := httptest.NewRecorder()
@@ -2571,7 +2654,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrAppNotFound}
 		handler := NewAppHandler(&mockAppRepo{}, pt)
 		router := gin.New()
-		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+		router.GET("/apps/:id/provider-token/:channel", withCallerApp("missing"), handler.GetProviderToken)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/missing/provider-token/paypal", nil)
 		w := httptest.NewRecorder()
@@ -2586,7 +2669,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 		pt := &fakeProviderToken{err: errors.New("upstream failed")}
 		handler := NewAppHandler(&mockAppRepo{}, pt)
 		router := gin.New()
-		router.GET("/apps/:id/provider-token/:channel", handler.GetProviderToken)
+		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
 		req := httptest.NewRequest(http.MethodGet, "/apps/site/provider-token/paypal", nil)
 		w := httptest.NewRecorder()

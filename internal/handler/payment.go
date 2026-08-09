@@ -126,11 +126,10 @@ func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
 	var req struct {
 		Channel       string `json:"channel" binding:"required"`
 		ExternalTxnID string `json:"external_txn_id" binding:"required"`
-		// ExpiresAt is the subscription expiry the frontend computed from
-		// plan.interval_days + business rules (rollover, grace, trial).
-		// yunhou-users MUST NOT compute this server-side — see the
-		// WebhookEvent.SubExpiresAt doc comment in service/payment.go.
-		// nil = frontend declined to set one (free plan / explicit no-end).
+		// ExpiresAt is accepted for API compatibility but IGNORED — a
+		// caller-supplied subscription expiry is untrusted (a caller could
+		// extend their own subscription past what the plan grants). The
+		// service derives expires_at from the plan at activation.
 		ExpiresAt *time.Time `json:"expires_at,omitempty"`
 		// Amount and Currency are NOT accepted from the caller — the order
 		// row is the authoritative source. A caller-supplied amount lets a
@@ -319,6 +318,16 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "missing Idempotency-Key header"})
 	case errors.Is(err, service.ErrInvalidChannel):
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid channel"})
+	case errors.Is(err, service.ErrConfirmVerificationUnavailable):
+		// 400 — the channel has no wired server-side query client, so a
+		// caller-initiated confirm can never be trusted. Terminal: the
+		// signature-verified channel webhook settles the order instead.
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "payment confirmation is unavailable for this channel; the order will be settled by the channel webhook"})
+	case errors.Is(err, service.ErrConfirmNotVerified):
+		// 400 — the channel's server-side query does not show a settled
+		// payment matching this order. Terminal for this claim: retrying
+		// fails again until the channel actually settles the order.
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "payment not confirmed by the channel"})
 	case errors.Is(err, service.ErrWechatPayNotConfigured):
 		// 400 — the deployment chose not to wire a WeChat Pay client, so
 		// the channel can't be served. Not a 404 (the route exists; the
@@ -327,10 +336,12 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "wechat pay not configured on this deployment"})
 	case errors.Is(err, wechat.ErrWechatMisconfigured):
 		// 500 — the deployment is in real-mode (MockMode=false) but the
-		// AppID/Signer/MchID is unset. Operator-fixable: re-set the env
-		// vars and redeploy. Not 4xx (the request is well-formed) and not
-		// 502 (this isn't an upstream failure).
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "wechat pay client misconfigured (check WECHAT_PAY_APP_ID / WECHAT_PAY_MCH_ID / signing key path)"})
+		// AppID/Signer/MchID is unset. Operator-fixable and logged with
+		// the full detail server-side; the client only gets a generic
+		// message — env var names and key paths are config internals and
+		// must not leak to callers.
+		log.Printf("wechat pay client misconfigured: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "payment channel unavailable"})
 	case errors.Is(err, wechat.ErrWeChatUnifiedOrderRejected):
 		// 400 — WeChat returned 4xx (or empty code_url). Terminal: retrying
 		// the same payload will fail again. Surface a 4xx so the caller

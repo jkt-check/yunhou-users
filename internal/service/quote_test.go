@@ -79,6 +79,51 @@ func TestQuote_Get_HappyPath_PayPalConfigured(t *testing.T) {
 	if pd["plan_id"] != "P-1" {
 		t.Errorf("paypal.plan_id = %v", pd["plan_id"])
 	}
+	ac, ok := pd["application_context"].(map[string]any)
+	if !ok {
+		t.Fatalf("paypal application_context missing or wrong type: %+v", pd)
+	}
+	if ac["brand_name"] != "Yundian Brand" {
+		t.Errorf("brand_name = %v, want config brand.name", ac["brand_name"])
+	}
+}
+
+// TestQuote_Get_BrandFallbackToAppName verifies the PayPal
+// application_context.brand_name falls back to the app's name when no
+// brand block is configured. An empty brand_name is rejected by PayPal
+// (400 INVALID_PARAMETER_VALUE on /application_context/brand_name), so
+// the fallback is load-bearing — not cosmetic.
+func TestQuote_Get_BrandFallbackToAppName(t *testing.T) {
+	plan := &model.Plan{
+		ID: "monthly", Name: "Monthly", Price: 29.9, IntervalDays: 30,
+		Currency: "USD", TrialDays: 7,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+	}
+	app := &model.App{
+		AppID: "yundian", Name: "Yundian App Name", IsActive: true,
+		Config: mustJSONRawQuote(t, `{
+			"payment_providers": {
+				"paypal": {"plans": {"monthly": {"plan_id": "P-1"}}}
+			}
+		}`),
+	}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "user-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pd, ok := quote.ProviderData["paypal"].(map[string]any)
+	if !ok {
+		t.Fatalf("paypal provider_data missing or wrong type: %+v", quote.ProviderData)
+	}
+	ac, ok := pd["application_context"].(map[string]any)
+	if !ok {
+		t.Fatalf("paypal application_context missing or wrong type: %+v", pd)
+	}
+	if ac["brand_name"] != "Yundian App Name" {
+		t.Errorf("brand_name = %v, want app name fallback", ac["brand_name"])
+	}
 }
 
 // TestQuoteService_Get_PlanTrialDaysOverride verifies that plan.TrialDays

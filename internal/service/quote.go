@@ -94,19 +94,21 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 		Currency:     plan.Currency,
 		SubExpiresAt: subExpires,
 		CycleConfig:  cycle,
-		ProviderData: buildProviderData(cfg, planID),
+		ProviderData: buildProviderData(cfg, app.Name, planID),
 	}, nil
 }
 
 // buildProviderData assembles the per-channel payload BFF hands to PayPal
 // to create a checkout session. brand_name comes from apps.config.brand.name
-// (fallback to apps.name). PayPal computes its own billing cycle from
+// and falls back to apps.name — PayPal rejects an empty brand_name with
+// 400 INVALID_PARAMETER_VALUE, so an app without a brand block must still
+// get a non-empty value. PayPal computes its own billing cycle from
 // plan_id; subExpires is not surfaced here (it lives at the top-level
 // Quote.sub_expires_at instead).
-func buildProviderData(cfg model.AppConfig, planID string) map[string]any {
+func buildProviderData(cfg model.AppConfig, appName, planID string) map[string]any {
 	out := map[string]any{}
-	brandName := ""
-	if cfg.Brand != nil {
+	brandName := appName
+	if cfg.Brand != nil && cfg.Brand.Name != "" {
 		brandName = cfg.Brand.Name
 	}
 	if providers := cfg.PaymentProviders; providers != nil {

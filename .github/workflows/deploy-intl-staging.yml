@@ -1,0 +1,129 @@
+name: deploy-intl-staging
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+# 与 deploy-cn-staging.yml 同构（build + bump 内联，原因见 cn 版头注释：
+# yunhou-deploy 私有仓 reusable workflow 跨仓 dispatch 失败）。差异仅
+# STAGE=intl-staging：镜像 tag 不变（同仓同 SHA），bump 写
+# jkt-check/yunhou-deploy/deploy/intl-staging.digests。
+#
+# 部署耦合提醒：digest 回写会触发 yunhou-deploy 的 deploy-intl-staging.yml
+#（paths: deploy/intl-staging.digests）。intl-staging 的 VPS / environment
+# secrets 就绪前，该部署 job 会失败并开 incident issue —— build 与 bump 本身
+# 不受影响，USERS_DIGEST 会正常写入清单。
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-intl-staging
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: vet
+        run: go vet ./internal/... ./cmd/...
+      - name: build
+        run: go build ./cmd/... ./internal/...
+      - name: unit test
+        # -p 1: see pr-ci.yml — serializes package binaries so the shared-
+        # Postgres DB tests in internal/repo and internal/service can't
+        # wipe each other's tables mid-run.
+        run: go test -race -p 1 ./internal/... ./cmd/...
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/yunhou-users:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  bump:
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      HAS_APP: ${{ secrets.BUMP_APP_ID != '' }}
+    steps:
+      - name: fail-fast on missing deploy credentials
+        env:
+          BUMP_APP_ID: ${{ secrets.BUMP_APP_ID }}
+          DEPLOY_BOT_PAT: ${{ secrets.DEPLOY_BOT_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUMP_APP_ID" ] && [ -z "$DEPLOY_BOT_PAT" ]; then
+            echo "::error::Neither a GitHub App (BUMP_APP_ID + BUMP_APP_PRIVATE_KEY) nor DEPLOY_BOT_PAT is configured."
+            echo "Configure BUMP_APP_ID/BUMP_APP_PRIVATE_KEY or DEPLOY_BOT_PAT in repo secrets so the bump job can push to yunhou-deploy."
+            exit 1
+          fi
+      - id: app-token
+        if: ${{ env.HAS_APP == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BUMP_APP_ID }}
+          private-key: ${{ secrets.BUMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: yunhou-deploy
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/yunhou-deploy
+          token: ${{ steps.app-token.outputs.token || secrets.DEPLOY_BOT_PAT }}
+          ref: main
+      - name: validate caller and write digest
+        env:
+          CALLER: ${{ github.repository }}
+          SERVICE: users
+          DIGEST: ${{ needs.build.outputs.digest }}
+          STAGE: intl-staging
+        run: |
+          set -euo pipefail
+          bin/manifest.sh assert-repo-service "$CALLER" "$SERVICE"
+          KEY="$(bin/manifest.sh key-for-service "$SERVICE")"
+          bin/manifest.sh set "deploy/${STAGE}.digests" "$KEY" "$DIGEST"
+      - name: commit with fetch+rebase+retry
+        env:
+          STAGE: intl-staging
+          SERVICE: users
+        run: |
+          set -euo pipefail
+          git config user.name "yunhou-deploy-bot"
+          git config user.email "deploy-bot@users.noreply.github.com"
+          git add "deploy/${STAGE}.digests"
+          if git diff --cached --quiet; then echo "no change (idempotent digest)"; exit 0; fi
+          git commit -m "chore(${STAGE}): bump ${SERVICE} digest"
+          for i in 1 2 3 4 5; do
+            if git push origin main; then echo "pushed"; exit 0; fi
+            echo "push rejected, rebase retry $i"
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+            sleep $((i))
+          done
+          echo "push failed after retries" >&2
+          exit 1

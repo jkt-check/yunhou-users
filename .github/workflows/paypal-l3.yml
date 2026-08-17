@@ -29,6 +29,23 @@ jobs:
   paypal-l3:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    services:
+      # Same postgres:16-alpine service-container pattern as pr-ci.yml —
+      # the runner's system Postgres rejects TCP password-less auth on
+      # current ubuntu-latest images (28P01).
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yunhou_users_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       BACKEND_BIN: /tmp/yunhou-server
       NGROK_BIN: /tmp/ngrok
@@ -46,12 +63,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Start Postgres
+      - name: Migrate DB
         env:
-          DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
         run: |
-          sudo service postgresql start
-          sudo -u postgres createdb yunhou_users_e2e
           # cmd/migrate reads DATABASE_URL and applies every pending
           # migration in ./migrations (001-019) via its ledger; replaces
           # the old psql list that stopped at 007.
@@ -65,7 +80,7 @@ jobs:
       # pattern below keeps both alive for the whole workflow.
       - name: Run ngrok + backend + Playwright
         env:
-          DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
           PAYPAL_ENV: sandbox
           PAYPAL_WEBHOOK_ID_SANDBOX: ${{ secrets.PAYPAL_SANDBOX_WEBHOOK_ID }}
           PAYPAL_API_BASE_SANDBOX: https://api-m.sandbox.paypal.com
@@ -75,7 +90,7 @@ jobs:
           PAYPAL_BUYER_ACCOUNT_EMAIL: ${{ secrets.PAYPAL_BUYER_ACCOUNT_EMAIL }}
           PAYPAL_BUYER_ACCOUNT_PASSWORD: ${{ secrets.PAYPAL_BUYER_ACCOUNT_PASSWORD }}
           PAYPAL_TEST_PLAN_ID: ${{ secrets.PAYPAL_TEST_PLAN_ID }}
-          E2E_DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          E2E_DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
           BACKEND_URL: http://localhost:8080
           NGROK_AUTHTOKEN: ${{ secrets.PAYPAL_NGROK_AUTHTOKEN }}
         run: |

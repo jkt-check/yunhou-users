@@ -178,11 +178,13 @@ jobs:
           # Point the registered sandbox webhook at this run's tunnel so
           # PayPal delivers real events to the ephemeral backend. The
           # webhook_id stays stable (backend verification depends on it);
-          # only its /url is rewritten per run.
-          PP_TOKEN=$(curl -sf -u "$PAYPAL_CLIENT_ID:$PAYPAL_CLIENT_SECRET" \
+          # only its /url is rewritten per run. --fail-with-body keeps the
+          # PayPal error payload visible (sandbox flakes on oauth ~1 in 5).
+          PP_TOKEN=$(curl -sS --fail-with-body --retry 3 --retry-all-errors \
+            -u "$PAYPAL_CLIENT_ID:$PAYPAL_CLIENT_SECRET" \
             -d grant_type=client_credentials \
             https://api-m.sandbox.paypal.com/v1/oauth2/token | jq -r .access_token)
-          curl -sf -X PATCH \
+          curl -sS --fail-with-body --retry 3 --retry-all-errors -X PATCH \
             "https://api-m.sandbox.paypal.com/v1/notifications/webhooks/$PAYPAL_SANDBOX_WEBHOOK_ID" \
             -H "Authorization: Bearer $PP_TOKEN" \
             -H "Content-Type: application/json" \

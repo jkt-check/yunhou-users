@@ -67,6 +67,18 @@ jobs:
         # 测试共享一个 Postgres 并 TRUNCATE——并行包会互相污染（见 Makefile
         # "test" 注释）。-race 全开。coverage.out 上传供人工查看。
         run: go test -race -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...
+      - name: coverage floor (>= 80%)
+        # 覆盖率下限门禁（CI/CD-REVIEW P2-14）：此前 coverage.out 只上传人工
+        # 查看，无任何强制。当前基线 83.7%（2026-08-17 实测），floor 定 80
+        # 留波动余量；降过线即 FAIL，要降就先改这个数并说明理由。
+        run: |
+          set -euo pipefail
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { exit !(t+0 >= 80) }' || {
+            echo "::error::coverage ${total}% is below the 80% floor"
+            exit 1
+          }
       - name: upload coverage
         uses: actions/upload-artifact@v4
         with:

@@ -542,6 +542,50 @@ func TestPaypalVerifier_HappyPath(t *testing.T) {
 	}
 }
 
+func TestPaypalVerifier_TokenFuncSendsBearer(t *testing.T) {
+	// Production wiring (cmd/server) sets TokenFunc from the cached OAuth
+	// fetcher — verify-webhook-signature 401s without it (2026-08-17
+	// incident). The harness asserts the Authorization header arrives.
+	resetPaypalVerifyCache(t)
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer tok-123" {
+			t.Errorf("Authorization: got %q, want Bearer tok-123", got)
+		}
+		fmt.Fprintln(w, `{"verification_status":"SUCCESS"}`)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	calls := 0
+	v.TokenFunc = func() (string, error) { calls++; return "tok-123", nil }
+
+	body := []byte(`{"id":"WH-1","event_type":"BILLING.SUBSCRIPTION.CREATED"}`)
+	if err := v.VerifySignature("paypal", body, paypalHeaders("tid-tok", "sig-1")); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("TokenFunc called %d times, want 1", calls)
+	}
+}
+
+func TestPaypalVerifier_TokenFetchErrorIsTransient(t *testing.T) {
+	// OAuth endpoint down → generic error (500 at the middleware, PayPal
+	// retries) — NOT ErrInvalidSignature, which would 400 and stop retries.
+	resetPaypalVerifyCache(t)
+	h := newPaypalHarness(t, func(h *paypalHarness, w http.ResponseWriter, r *http.Request) {
+		t.Error("verify endpoint must not be called when token fetch fails")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	v := newHarnessVerifier(h, "sandbox")
+	v.TokenFunc = func() (string, error) { return "", errors.New("oauth down") }
+
+	err := v.VerifySignature("paypal", []byte(`{}`), paypalHeaders("tid-tokerr", "sig-1"))
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("token fetch failure must not map to ErrInvalidSignature, got %v", err)
+	}
+}
+
 func TestPaypalVerifier_FailureMapsToInvalidSignature(t *testing.T) {
 	// t.Parallel removed: package-level paypalVerifyCache is shared between tests
 	resetPaypalVerifyCache(t)

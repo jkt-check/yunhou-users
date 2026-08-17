@@ -116,10 +116,12 @@ jobs:
           mkdir -p "$ARTIFACTS_DIR"
 
           # 1) ngrok
-          # Pinned 2026-07-31: ngrok v3 stable linux-amd64 tarball,
-          # verified against its sha256 before extracting.
+          # Pinned 2026-08-17: ngrok v3 stable linux-amd64 tarball,
+          # verified against its sha256 before extracting. The "stable"
+          # URL floats — when ngrok ships a new build this check fails
+          # closed; re-pin by hashing the fresh tarball.
           curl -sSL -o /tmp/ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
-          echo "9dfbe1a914e69cc7e980d61e6bd5a642025918102c5bc69905d1c57703aca3e8  /tmp/ngrok.tgz" | sha256sum -c -
+          echo "cec0b4997fcc5f529dfc74bac89050354d11a915f968720600039738fdf330cf  /tmp/ngrok.tgz" | sha256sum -c -
           tar xzf /tmp/ngrok.tgz -C /tmp/
           "$NGROK_BIN" authtoken "$NGROK_AUTHTOKEN"
           "$NGROK_BIN" http 8080 --log "$ARTIFACTS_DIR/ngrok.log" > "$ARTIFACTS_DIR/ngrok.out" 2>&1 &

@@ -104,14 +104,16 @@ test.describe('@happy Sandbox subscription flow', () => {
       await backend.assertOrderPaid(orderId);
       await backend.assertSubActive(userId);
 
-      // 8) Webhook event log — filter by our own orderId channel so a
-      //    sibling test that ran a different PayPal event doesn't pollute us.
+      // 8) Webhook event log — match on resource.custom_id (our orderId),
+      //    NOT raw_payload.id: that's PayPal's own event id. BILLING.
+      //    SUBSCRIPTION.* events echo the custom_id the checkout page set
+      //    at subscription creation; PAYMENT.SALE.* renewals don't.
       const events = await backend.db.query<{ event_id: string }>(
         `SELECT event_id FROM webhook_events
           WHERE channel = 'paypal'
-            AND raw_payload->>'id' IN ($1, $2)
+            AND raw_payload->'resource'->>'custom_id' = $1
           ORDER BY received_at DESC LIMIT 1`,
-        ['WH-' + orderId, orderId],
+        [orderId],
       );
       expect(events.rows[0]?.event_id).toBeDefined();
 

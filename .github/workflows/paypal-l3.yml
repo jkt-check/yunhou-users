@@ -1,9 +1,8 @@
 # L3 PayPal sandbox UI integration suite.
 #
-# NOT a default PR gate — runs on demand only. Trigger via the Actions
-# tab (workflow_dispatch). The nightly schedule is disabled because the
-# 7 required PayPal secrets are NOT configured in this repo — all 17
-# historical runs failed on "Missing required env var":
+# NOT a default PR gate — runs nightly (07:00 UTC) and on demand via
+# the Actions tab (workflow_dispatch). Requires 7 repo-level secrets
+# (all configured as of 2026-08-17):
 #   PAYPAL_SANDBOX_CLIENT_ID       - sandbox REST app client id
 #   PAYPAL_SANDBOX_SECRET          - sandbox REST app secret
 #   PAYPAL_SANDBOX_WEBHOOK_ID      - registered webhook id
@@ -11,12 +10,12 @@
 #   PAYPAL_BUYER_ACCOUNT_PASSWORD  - sandbox personal buyer
 #   PAYPAL_TEST_PLAN_ID            - pre-created Plan id (P-xxx)
 #   PAYPAL_NGROK_AUTHTOKEN         - ngrok authtoken
-# Restore the cron trigger ('0 7 * * *', nightly 07:00 UTC) once they
-# are set.
 
 name: paypal-l3-sandbox
 
 on:
+  schedule:
+    - cron: '0 7 * * *'
   workflow_dispatch:
 
 permissions:

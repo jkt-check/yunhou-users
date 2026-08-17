@@ -319,6 +319,18 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// 2026-07-23 login-decouple fix let them log in.
 	if existing, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
 		if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
+			// PayPal 订阅制与 WeChat 的根本差异：渠道侧自动续费
+			// （PAYMENT.SALE.COMPLETED webhook 延期），用户无需也不应手动
+			// "续费"。这里每放行一单，BFF 就在 PayPal 创建一个全新的
+			// subscription 对象（重新吃 plan 内嵌的 trial），而旧订阅仍在
+			// 自动扣费 → 双重扣费（2026-08-17 intl-staging 验收实测同一
+			// 用户 3 个 ACTIVE PayPal 订阅并存、到期叠到两个月后）。
+			// 改签（月↔年）需要专门的"取消旧订阅+建新订阅"流程，落地前
+			// PayPal 渠道对任何未过期 active 订阅一律拒绝新单（409）。
+			// WeChat 无自动续费，手动续费 rollover 是正确行为，不受影响。
+			if channel == "paypal" {
+				return nil, ErrUserHasActiveSub
+			}
 			allowed, aerr := s.repurchaseAllowed(ctx, existing.PlanID, planID)
 			if aerr != nil {
 				return nil, aerr

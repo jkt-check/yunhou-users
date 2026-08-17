@@ -253,6 +253,40 @@ func TestPaymentService_CreateOrder_DowngradeRejected(t *testing.T) {
 	}
 }
 
+// TestPaymentService_CreateOrder_PaypalActiveSubRejected pins the
+// 2026-08-17 intl-staging finding: PayPal subscriptions auto-renew on the
+// channel side, so a manual "renewal" order only creates a SECOND PayPal
+// subscription object (fresh embedded trial included) while the old one
+// keeps auto-charging — double billing. Any unexpired active sub must
+// reject new PayPal orders (409 via ErrUserHasActiveSub) until the
+// dedicated cancel-and-recreate plan-change flow exists. Other channels
+// (WeChat/Stripe) keep the manual-renewal rollover behavior.
+func TestPaymentService_CreateOrder_PaypalActiveSubRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("first order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-sub",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// Same plan AND upgrade are both rejected on paypal — any new order
+	// would mint a parallel PayPal subscription.
+	for _, planID := range []string{"monthly", "yearly"} {
+		if _, err := svc.CreateOrder(context.Background(), uid, planID, "paypal"); !errors.Is(err, ErrUserHasActiveSub) {
+			t.Errorf("paypal %s: err = %v, want ErrUserHasActiveSub", planID, err)
+		}
+	}
+	// Same user on a manual-renewal channel stays allowed.
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe"); err != nil {
+		t.Errorf("stripe same-plan renewal must stay allowed; got %v", err)
+	}
+}
+
 // TestCreateOrder_TrialPlanNotPurchasable: the trial plan is granted by
 // auth on first login and must never be orderable — even for a user
 // with no subscription at all. eligibilityAndInsertOrderTx rejects it

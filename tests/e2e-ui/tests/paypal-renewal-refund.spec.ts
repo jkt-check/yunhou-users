@@ -39,14 +39,16 @@ test.describe('Renewal + Refund simulation paths', () => {
       // would never be touched by the renewal path. So this test
       // simulates a renewal against an existing active subscription
       // directly.
-
-      // Pre-stamp the active subscription with a fake PayPal subscription id.
+      //
+      // /test/login issues tokens only — it does NOT create a
+      // subscription row (the OAuth first-login trial grant lives in a
+      // different code path). Insert the active-subscription fixture
+      // the renewal handler will look up by external_subscription_id.
       const fakeSubId = `I-E2E-${Date.now()}`;
       await backend.db.query(
-        `UPDATE subscriptions
-           SET external_subscription_id = $1
-         WHERE user_id = $2 AND status = 'active'`,
-        [fakeSubId, userId],
+        `INSERT INTO subscriptions (user_id, plan_id, status, expires_at, external_subscription_id)
+         VALUES ($1, 'monthly', 'active', NOW() + INTERVAL '7 days', $2)`,
+        [userId, fakeSubId],
       );
 
       const expBefore = await backend.db.query<{ exp: Date | null }>(

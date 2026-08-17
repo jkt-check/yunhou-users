@@ -83,7 +83,15 @@ export class PayPalPopupPage {
     }
     await passwordInput.waitFor({ state: 'visible', timeout: 15_000 });
     await passwordInput.fill(env.buyerPassword);
-    await scope.locator('button[type="submit"], button#btnLogin').first().click();
+    // Click the LOGIN button specifically: PayPal's unified login keeps
+    // both #btnNext and #btnLogin in the DOM (toggling visibility), so a
+    // bare button[type="submit"] matches #btnNext first and submits the
+    // email screen again, wedging the flow. :visible keeps the fallback
+    // from matching the hidden one.
+    await scope
+      .locator('button#btnLogin:visible, button[type="submit"]:visible')
+      .first()
+      .click({ timeout: 30_000 });
     await this.page.waitForTimeout(2_000);
     return { loggedIn: true } as const;
   }
@@ -95,7 +103,7 @@ export class PayPalPopupPage {
     );
     const count = await approveBtn.count();
     if (count === 0) {
-      await scope.locator('button[type="submit"]').first().click();
+      await scope.locator('button[type="submit"]:visible').first().click();
     } else {
       await approveBtn.first().click();
     }

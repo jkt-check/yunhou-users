@@ -31,6 +31,8 @@ test.describe('Renewal + Refund simulation paths', () => {
       dbUrl: process.env.E2E_DATABASE_URL ?? 'postgres://postgres@localhost/yunhou_users?sslmode=disable',
     });
 
+    // Declared outside try so the finally cleanup can reference it.
+    const fakeSubId = `I-E2E-${Date.now()}`;
     try {
       const { userId } = await backend.login(env.buyerEmail);
       // NB: we don't call backend.createOrder() because the renewal
@@ -44,7 +46,6 @@ test.describe('Renewal + Refund simulation paths', () => {
       // subscription row (the OAuth first-login trial grant lives in a
       // different code path). Insert the active-subscription fixture
       // the renewal handler will look up by external_subscription_id.
-      const fakeSubId = `I-E2E-${Date.now()}`;
       await backend.db.query(
         `INSERT INTO subscriptions (user_id, plan_id, status, expires_at, external_subscription_id)
          VALUES ($1, 'monthly', 'active', NOW() + INTERVAL '7 days', $2)`,
@@ -98,6 +99,12 @@ test.describe('Renewal + Refund simulation paths', () => {
       );
       expect(pay.rows[0].count).toBe(1);
     } finally {
+      // Remove the fixture: tests share one DB (workers=1) and the
+      // PayPal channel rejects new orders while the user has ANY active
+      // subscription (repurchase block) — a leaked fixture would 409 the
+      // @happy subscribe test that runs after this file.
+      await backend.db.query(`DELETE FROM payments WHERE external_txn_id = 'SALE-E2E-1'`);
+      await backend.db.query(`DELETE FROM subscriptions WHERE external_subscription_id = $1`, [fakeSubId]);
       await backend.close();
     }
   });

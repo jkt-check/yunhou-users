@@ -89,14 +89,14 @@ test.describe('@happy Sandbox subscription flow', () => {
       await paypal.loginIfNeeded(env);
       await paypal.approve();
 
-      // 5) Wait for popup to close. Frontend should now hold orderId.
-      await popup.waitForEvent('close', { timeout: 60_000 });
-
-      // 6) We need the order id from frontend → backend. Since this is a
-      //    pure L3 (real popup), we extract from the page URL after
-      //    PayPal's `return_url` lands us back. For SUBSCRIBE_NOW PayPal
-      //    returns ?subscription_id=...; for one-time, ?token=... and PayerID.
-      await expect(page).toHaveURL(/\?/);
+      // 5) Approval signal: onApprove in the parent page stamps the URL
+      //    with ?subscription_id=...&order_id=... — that, not the popup
+      //    close, is the reliable signal (sandbox occasionally keeps the
+      //    popup open on a spinner or an interstitial after approval).
+      await expect(page).toHaveURL(/\?/, { timeout: 90_000 });
+      await popup.waitForEvent('close', { timeout: 15_000 }).catch(() => {
+        // Popup lingering after a successful approval is harmless.
+      });
 
       // 7) Read DB state directly. We deliberately do NOT trust SDK output.
       //    useOrderId is captured at top of test so we don't race another

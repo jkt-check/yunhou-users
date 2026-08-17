@@ -34,6 +34,25 @@ jobs:
       packages: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yunhou_users
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # 与 pr-ci.yml 同一模式：internal/repo、internal/service 的 DB 测试
+      # 读 DATABASE_URL（未设时静默 skip）——不设它 master 推送门禁对 DB
+      # 层零覆盖，测试全绿只是假象。
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -42,6 +61,9 @@ jobs:
         run: go vet ./internal/... ./cmd/...
       - name: build
         run: go build ./cmd/... ./internal/...
+      - name: apply migrations
+        # DB 测试不自建 schema，表结构必须先落好（同 pr-ci.yml）。
+        run: go run ./cmd/migrate
       - name: unit test
         # -p 1: see pr-ci.yml — serializes package binaries so the shared-
         # Postgres DB tests in internal/repo and internal/service can't

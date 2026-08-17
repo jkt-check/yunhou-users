@@ -108,10 +108,16 @@ test.describe('@happy Sandbox subscription flow', () => {
       //    NOT raw_payload.id: that's PayPal's own event id. BILLING.
       //    SUBSCRIPTION.* events echo the custom_id the checkout page set
       //    at subscription creation; PAYMENT.SALE.* renewals don't.
+      //    raw_payload is stored as a JSON *string* (wrapRawPayload), so
+      //    unwrap via #>> '{}' and re-parse before key lookup.
+      const dump = await backend.db.query<{ event_id: string; event_type: string }>(
+        `SELECT event_id, event_type FROM webhook_events WHERE channel = 'paypal'`,
+      );
+      console.log('paypal webhook_events received:', dump.rows);
       const events = await backend.db.query<{ event_id: string }>(
         `SELECT event_id FROM webhook_events
           WHERE channel = 'paypal'
-            AND raw_payload->'resource'->>'custom_id' = $1
+            AND ((raw_payload #>> '{}')::jsonb -> 'resource' ->> 'custom_id') = $1
           ORDER BY received_at DESC LIMIT 1`,
         [orderId],
       );

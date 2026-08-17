@@ -93,6 +93,10 @@ jobs:
           E2E_DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
           BACKEND_URL: http://localhost:8080
           NGROK_AUTHTOKEN: ${{ secrets.PAYPAL_NGROK_AUTHTOKEN }}
+          # Enables the /test/login helper route (404 without it). Only
+          # valid with PAYPAL_ENV=sandbox — config.Validate() rejects
+          # this combination when PAYPAL_ENV=live.
+          PAYPAL_L3_E2E_MODE: '1'
         run: |
           set -euo pipefail
 
@@ -141,8 +145,20 @@ jobs:
           NGROK_URL=$(jq -r '.tunnels[] | select(.public_url|startswith("https://")) | .public_url' "$ARTIFACTS_DIR/tunnels.json" | head -1)
           echo "ngrok url=$NGROK_URL"
           echo "$NGROK_URL" > "$ARTIFACTS_DIR/ngrok-url"
+          if [ -z "$NGROK_URL" ]; then
+            echo "::error::ngrok tunnel did not come up; ngrok.log follows"
+            cat "$ARTIFACTS_DIR/ngrok.log" || true
+            exit 1
+          fi
 
           # 2) backend
+          # Ephemeral per-run config: config.Validate() fails fast
+          # without RSA key paths and a >=32-char OAuth state secret.
+          openssl genrsa -out /tmp/l3_rsa.pem 2048
+          openssl rsa -in /tmp/l3_rsa.pem -pubout -out /tmp/l3_rsa_pub.pem
+          export RSA_PRIVATE_KEY_PATH=/tmp/l3_rsa.pem
+          export RSA_PUBLIC_KEY_PATH=/tmp/l3_rsa_pub.pem
+          export OAUTH_STATE_SECRET="$(openssl rand -hex 32)"
           go build -o "$BACKEND_BIN" ./cmd/server
           "$BACKEND_BIN" > "$ARTIFACTS_DIR/backend.log" 2>&1 &
           BACKEND_PID=$!
@@ -154,6 +170,11 @@ jobs:
             fi
             sleep 1
           done
+          if ! curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
+            echo "::error::backend did not become healthy; backend.log follows"
+            cat "$ARTIFACTS_DIR/backend.log" || true
+            exit 1
+          fi
 
           # Cleanup runs unconditionally (set +e), so processes die even
           # if the test exits non-zero. Without this `set -e` would skip

@@ -33,14 +33,38 @@ export class PayPalPopupPage {
     return popup;
   }
 
+  /** Selector for the approve/agree control on PayPal's review screen.
+   *  The control varies by page vintage AND locale: modern checkout uses
+   *  button#confirmButton, the hermes billing-agreement review renders
+   *  input[type="submit"], and the buyer account's locale switches the
+   *  text (observed: English login pages followed by a Chinese
+   *  "同意并订阅" review button). Keep text variants for en + zh and
+   *  structural fallbacks; always :visible so hidden twins don't match. */
+  private static readonly APPROVE_SEL = [
+    'button[data-testid="confirmButton"]:visible',
+    'button#confirmButton:visible',
+    'input#confirmButton:visible',
+    'button:has-text("Agree & Subscribe"):visible',
+    'button:has-text("同意并订阅"):visible',
+    'button:has-text("Complete Purchase"):visible',
+    'button:has-text("Subscribe"):visible',
+    'button:has-text("订阅"):visible',
+    'button:has-text("Agree"):visible',
+    'button:has-text("同意"):visible',
+    'button:has-text("Continue"):visible',
+    'button:has-text("继续"):visible',
+    'button:has-text("Pay Now"):visible',
+    'input[type="submit"]:visible',
+    'button[type="submit"]:visible',
+  ].join(', ');
+
   /** Resolve the scope the login/approve form lives in: the popup
    *  document itself (real popup-window flow) or the embedded PayPal
    *  iframe. Returns null when neither shows a form (returning-customer
    *  path skips login entirely). */
   private async formScope(): Promise<Pick<Page, 'locator'> | null> {
     const emailSel = 'input[name="email"], input#email';
-    const approveSel =
-      'button[data-testid="confirmButton"], button#confirmButton, button:has-text("Subscribe"), button:has-text("Continue"), button:has-text("Agree"), button[type="submit"]';
+    const approveSel = PayPalPopupPage.APPROVE_SEL;
     try {
       await this.page
         .locator(`${emailSel}, ${approveSel}`)
@@ -97,18 +121,38 @@ export class PayPalPopupPage {
   }
 
   async approve(): Promise<PayPalPopupResult> {
-    const scope = (await this.formScope()) ?? this.page;
-    const approveBtn = scope.locator(
-      'button[data-testid="confirmButton"], button#confirmButton, button:has-text("Subscribe"), button:has-text("Continue"), button:has-text("Agree & Subscribe"), button:has-text("Complete Purchase"), button:has-text("Pay")',
-    );
-    const count = await approveBtn.count();
-    if (count === 0) {
-      await scope.locator('button[type="submit"]:visible').first().click();
-    } else {
-      await approveBtn.first().click();
+    // The review screen can take a while to appear after login (secure-
+    // login spinner + several redirects in sandbox). Poll both the popup
+    // document and the iframe variant for up to 60s instead of a single
+    // snapshot check.
+    const sel = PayPalPopupPage.APPROVE_SEL;
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      const docBtn = this.page.locator(sel).first();
+      if ((await docBtn.count()) > 0) {
+        await docBtn.click({ timeout: 10_000 });
+        await this.page.waitForTimeout(2_000);
+        return { approved: true, flow: 'login-then-approve' as const };
+      }
+      try {
+        const frameBtn = this.root().locator(sel).first();
+        if ((await frameBtn.count()) > 0) {
+          await frameBtn.click({ timeout: 10_000 });
+          await this.page.waitForTimeout(2_000);
+          return { approved: true, flow: 'login-then-approve' as const };
+        }
+      } catch {
+        // iframe not mounted yet — keep polling.
+      }
+      if (Date.now() > deadline) {
+        // Leave evidence of what the popup actually showed.
+        await this.page
+          .screenshot({ path: `test-results/approve-not-found-${Date.now()}.png` })
+          .catch(() => {});
+        throw new Error('approve button never appeared in popup');
+      }
+      await this.page.waitForTimeout(1_000);
     }
-    await this.page.waitForTimeout(2_000);
-    return { approved: true, flow: 'login-then-approve' as const };
   }
 
   async decline(): Promise<PayPalPopupResult> {

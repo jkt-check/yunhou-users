@@ -2,6 +2,10 @@ name: pr-ci
 on:
   pull_request:
     branches: [master]
+  # 手动兜底：pull_request 事件偶发被 GitHub 丢弃时（2026-08-17 PR #8/#9
+  # 无 run 产生），可 gh workflow run pr-ci.yml --ref <branch> 让 go-ci
+  # 检查照常报到，不走 --admin 绕过、不手工伪造 check run。
+  workflow_dispatch:
 
 # Inlined the call to jkt-check/yunhou-deploy/.github/workflows/reusable-pr-ci-go.yml
 # for the same reason as deploy-cn-staging.yml: the cross-repo dispatch

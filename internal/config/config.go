@@ -106,6 +106,13 @@ type Config struct {
 	PaypalWebhookIDLive    string
 	PaypalAPIBaseSandbox   string // default https://api-m.sandbox.paypal.com
 	PaypalAPIBaseLive      string // default https://api-m.paypal.com
+	// Client credentials for the webhook-signature verifier's OAuth token
+	// fetch (verify-webhook-signature requires a Bearer token). Must match
+	// the active PaypalEnv: sandbox pair on staging, live pair on prod.
+	// Empty → verifier calls PayPal unauthenticated (legacy behavior) and
+	// every delivery 401s — main.go warns loudly at startup.
+	PaypalClientID     string
+	PaypalClientSecret string
 
 	// Order expiry: how long a pending order is valid before the sweeper
 	// flips it to 'expired'. Default 30 min per design doc §"v1 decisions".
@@ -176,6 +183,8 @@ func Load() *Config {
 		PaypalWebhookIDLive:    os.Getenv("PAYPAL_WEBHOOK_ID_LIVE"),
 		PaypalAPIBaseSandbox:   envOr("PAYPAL_API_BASE_SANDBOX", "https://api-m.sandbox.paypal.com"),
 		PaypalAPIBaseLive:      envOr("PAYPAL_API_BASE_LIVE", "https://api-m.paypal.com"),
+		PaypalClientID:         os.Getenv("PAYPAL_CLIENT_ID"),
+		PaypalClientSecret:     os.Getenv("PAYPAL_CLIENT_SECRET"),
 
 		OrderExpiryDuration: parseDurationOr(envOr("ORDER_EXPIRY_DURATION", "30m"), 30*time.Minute),
 		SweeperInterval:     parseDurationOr(envOr("SWEEPER_INTERVAL", "1m"), 1*time.Minute),

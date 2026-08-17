@@ -593,6 +593,14 @@ type PaypalVerifier struct {
 	SandboxAPIBase   string // default https://api-m.sandbox.paypal.com
 	LiveAPIBase      string // default https://api-m.paypal.com
 	Env              string // "sandbox" | "live"
+	// TokenFunc returns a PayPal OAuth access token for the
+	// verify-webhook-signature call — that endpoint 401s without
+	// `Authorization: Bearer` (2026-08-17 intl-staging incident: every
+	// genuine webhook delivery got a 401 upstream, surfaced as 500, and
+	// PayPal retried forever while orders stayed pending). nil keeps the
+	// legacy unauthenticated call (unit tests, misconfigured deploys —
+	// main.go warns loudly at startup in that case).
+	TokenFunc func() (string, error)
 }
 
 // paypalVerifyTimeout caps the verify-webhook-signature upstream call.
@@ -692,6 +700,14 @@ func (v *PaypalVerifier) VerifySignature(channel string, body []byte, headers ma
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if v.TokenFunc != nil {
+		token, terr := v.TokenFunc()
+		if terr != nil {
+			// OAuth fetch failed → transient (500), let PayPal retry.
+			return fmt.Errorf("paypal verify token: %w", terr)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

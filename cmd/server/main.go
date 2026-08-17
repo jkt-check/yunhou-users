@@ -147,10 +147,6 @@ func main() {
 		}
 	}
 
-	// Webhook signature verifier. Each channel is optional — empty secret
-	// means that channel returns 404 (not configured).
-	webhookVerifier := buildWebhookVerifier(cfg, wechatSigner, wechatHTTPDoer)
-
 	// Provider-token plumbing. PayPal's base URL tracks PAYPAL_ENV so the
 	// /apps/:id/provider-token/paypal endpoint hits the same environment as
 	// the webhook verifier (api-m.sandbox.paypal.com for sandbox,
@@ -158,11 +154,20 @@ func main() {
 	// the same client_id's TTL window. LS is webhook-only in Yunhou — no
 	// outbound HTTP, the service reads the api_key directly from
 	// apps.config.payment_providers.lemonsqueezy.
+	//
+	// Built BEFORE buildWebhookVerifier: the PayPal webhook verifier needs
+	// the same cached fetcher — verify-webhook-signature 401s without a
+	// Bearer token (2026-08-17 incident: all genuine deliveries 500'd,
+	// orders stuck pending until the sweeper expired them).
 	paypalHTTPClient := &http.Client{Timeout: 5 * time.Second}
 	paypalOAuth := paypal.NewOAuthClient(paypalHTTPClient, paypalMode.BaseURL())
 	paypalCache := paypal.NewTokenCache(60 * time.Second)
 	paypalFetcher := paypal.NewCachedClient(paypalOAuth, paypalCache)
 	providerTokenSvc := service.NewProviderTokenService(appRepo, paypalFetcher)
+
+	// Webhook signature verifier. Each channel is optional — empty secret
+	// means that channel returns 404 (not configured).
+	webhookVerifier := buildWebhookVerifier(cfg, wechatSigner, wechatHTTPDoer, paypalFetcher)
 
 	// Quote service — assembles price + cycle + provider_data for BFF checkout.
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
@@ -294,7 +299,7 @@ func main() {
 //
 // Alipay's public key is loaded from ALIPAY_PUBLIC_KEY_PATH. A missing file
 // is treated as "Alipay not configured" — same effect as empty secret.
-func buildWebhookVerifier(cfg *config.Config, wechatSigner *wechat.Signer, wechatDoer wechat.HTTPDoer) middleware.ChannelSignatureVerifier {
+func buildWebhookVerifier(cfg *config.Config, wechatSigner *wechat.Signer, wechatDoer wechat.HTTPDoer, paypalFetcher *paypal.CachedClient) middleware.ChannelSignatureVerifier {
 	mv := &middleware.MultiChannelVerifier{}
 
 	if cfg.StripeWebhookSecret != "" {
@@ -338,7 +343,7 @@ func buildWebhookVerifier(cfg *config.Config, wechatSigner *wechat.Signer, wecha
 		}
 	}
 	if cfg.PaypalEnv == "sandbox" || cfg.PaypalEnv == "live" {
-		mv.Paypal = &middleware.PaypalVerifier{
+		pv := &middleware.PaypalVerifier{
 			HTTPClient:       &http.Client{Timeout: 5 * time.Second},
 			SandboxWebhookID: cfg.PaypalWebhookIDSandbox,
 			LiveWebhookID:    cfg.PaypalWebhookIDLive,
@@ -346,6 +351,23 @@ func buildWebhookVerifier(cfg *config.Config, wechatSigner *wechat.Signer, wecha
 			LiveAPIBase:      cfg.PaypalAPIBaseLive,
 			Env:              cfg.PaypalEnv,
 		}
+		// verify-webhook-signature requires a Bearer token. Wire the shared
+		// cached fetcher with the deployment's client credentials; without
+		// them every genuine delivery fails upstream auth and surfaces as a
+		// 500 (PayPal retries forever, orders never activate). Warn loudly
+		// rather than silently running unauthenticated.
+		if cfg.PaypalClientID != "" && cfg.PaypalClientSecret != "" && paypalFetcher != nil {
+			pv.TokenFunc = func() (string, error) {
+				tok, err := paypalFetcher.FetchToken(context.Background(), cfg.PaypalClientID, cfg.PaypalClientSecret)
+				if err != nil {
+					return "", err
+				}
+				return tok.AccessToken, nil
+			}
+		} else {
+			log.Printf("paypal: PAYPAL_CLIENT_ID/SECRET unset — webhook signature verification will fail upstream auth (500); set them to match PAYPAL_ENV=%s", cfg.PaypalEnv)
+		}
+		mv.Paypal = pv
 	} else if cfg.PaypalEnv != "" {
 		log.Printf("paypal: PAYPAL_ENV=%q is not sandbox|live, channel will return 404", cfg.PaypalEnv)
 	}

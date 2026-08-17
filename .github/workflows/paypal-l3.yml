@@ -178,18 +178,26 @@ jobs:
           # Point the registered sandbox webhook at this run's tunnel so
           # PayPal delivers real events to the ephemeral backend. The
           # webhook_id stays stable (backend verification depends on it);
-          # only its /url is rewritten per run. --fail-with-body keeps the
-          # PayPal error payload visible (sandbox flakes on oauth ~1 in 5).
+          # only its /url is rewritten per run. With a reserved ngrok
+          # domain the URL is unchanged between runs and PayPal answers
+          # 400 WEBHOOK_PATCH_REQUEST_NO_CHANGE — that is success for us.
           PP_TOKEN=$(curl -sS --fail-with-body --retry 3 --retry-all-errors \
             -u "$PAYPAL_CLIENT_ID:$PAYPAL_CLIENT_SECRET" \
             -d grant_type=client_credentials \
             https://api-m.sandbox.paypal.com/v1/oauth2/token | jq -r .access_token)
-          curl -sS --fail-with-body --retry 3 --retry-all-errors -X PATCH \
+          PATCH_RESP=$(curl -sS --retry 3 --retry-all-errors -X PATCH \
             "https://api-m.sandbox.paypal.com/v1/notifications/webhooks/$PAYPAL_SANDBOX_WEBHOOK_ID" \
             -H "Authorization: Bearer $PP_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "[{\"op\":\"replace\",\"path\":\"/url\",\"value\":\"$NGROK_URL/webhooks/payment/paypal\"}]"
-          echo "webhook $PAYPAL_SANDBOX_WEBHOOK_ID now points at $NGROK_URL"
+            -d "[{\"op\":\"replace\",\"path\":\"/url\",\"value\":\"$NGROK_URL/webhooks/payment/paypal\"}]")
+          if echo "$PATCH_RESP" | grep -q '"url"'; then
+            echo "webhook $PAYPAL_SANDBOX_WEBHOOK_ID now points at $(echo "$PATCH_RESP" | jq -r .url)"
+          elif echo "$PATCH_RESP" | grep -q WEBHOOK_PATCH_REQUEST_NO_CHANGE; then
+            echo "webhook already points at $NGROK_URL (no change)"
+          else
+            echo "::error::webhook PATCH failed: $PATCH_RESP"
+            exit 1
+          fi
 
           # 2) backend
           # Ephemeral per-run config: config.Validate() fails fast

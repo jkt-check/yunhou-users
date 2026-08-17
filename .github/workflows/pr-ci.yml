@@ -74,3 +74,41 @@ jobs:
           path: coverage.out
           if-no-files-found: error
           retention-days: 7
+
+  go-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yunhou_users
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # cmd/migrate 读 DATABASE_URL；tests/e2e 读 E2E_DATABASE_URL
+      # （testhelpers.go connectDB，未设时回退 localhost 无密码 DSN）。
+      # PAYPAL_L3_E2E_MODE=1 由测试 setup 进程内自设，无需在此声明。
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users?sslmode=disable
+      E2E_DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: apply migrations
+        # e2e 不自建 schema——cleanupDB/seedTestData 直接 DELETE/INSERT，
+        # 表结构必须先由迁移落好。
+        run: go run ./cmd/migrate
+      - name: e2e tests (in-process server, postgres-backed)
+        # 对齐 make e2e（go test -race -count=1 ./tests/e2e/，去掉本地用的
+        # -v）。每个 setup 都清空并重灌整个库，所以 e2e 独占一个 job +
+        # Postgres service，绝不与 go-ci 的 DB 测试共享实例。genRSAKeys
+        # 通过 shell 调 openssl——runner 镜像自带，无需安装。
+        run: go test -race -count=1 ./tests/e2e/...

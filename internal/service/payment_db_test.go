@@ -2296,6 +2296,88 @@ func TestPaymentService_OnWebhook_BadCurrency(t *testing.T) {
 	}
 }
 
+// TestPaymentService_OnWebhook_PaypalActivated_NoAmount pins the
+// 2026-08-17 intl-staging fix: BILLING.SUBSCRIPTION.ACTIVATED is the
+// subscription activation trigger, and PayPal lifecycle payloads carry NO
+// resource.amount — Amount=0/Currency="" is by construction
+// (SkipAmountCheck=true), not underpayment. The event must activate the
+// order (payment_paid), insert the payment row, and stamp
+// external_subscription_id on the subscription for the renewal path.
+// Pre-fix the amount check rejected these events with
+// webhook_amount_mismatch and the order stayed pending until expiry.
+func TestPaymentService_OnWebhook_PaypalActivated_NoAmount(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+
+	hint := time.Now().Add(7 * 24 * time.Hour).UTC().Truncate(time.Second)
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "WH-ACT-" + mustNewUUID()[:8], EventType: "BILLING.SUBSCRIPTION.ACTIVATED",
+		TransactionID: "I-ACT" + mustNewUUID()[:8], OrderID: order.ID,
+		Amount: 0, Currency: "", SkipAmountCheck: true,
+		ExternalSubscriptionID: "I-ACT" + mustNewUUID()[:8],
+		SubExpiresAt:           &hint,
+		RawPayload:             json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("lifecycle event must be acked, got err: %v", err)
+	}
+	if res.DomainAction != "payment_paid" {
+		t.Errorf("DomainAction = %q, want payment_paid", res.DomainAction)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_amount_mismatch'`)
+	if n != 0 {
+		t.Error("SkipAmountCheck event must not write webhook_amount_mismatch")
+	}
+	_ = db.GetContext(context.Background(), &n, `SELECT count(*) FROM payments`)
+	if n != 1 {
+		t.Errorf("expected 1 payment row, got %d", n)
+	}
+	got, _ := svc.GetOrder(context.Background(), order.ID, uid)
+	if got.Status != "paid" {
+		t.Errorf("order.Status = %q, want paid", got.Status)
+	}
+	var extID string
+	_ = db.GetContext(context.Background(), &extID,
+		`SELECT coalesce(external_subscription_id,'') FROM subscriptions WHERE user_id = $1 AND status = 'active'`, uid)
+	if extID == "" {
+		t.Error("active subscription must carry external_subscription_id for the renewal path")
+	}
+}
+
+// TestPaymentService_OnWebhook_PaypalCaptureStillAmountChecked guards the
+// other side: payment events (no SkipAmountCheck) keep the strict
+// underpayment rejection.
+func TestPaymentService_OnWebhook_PaypalCaptureStillAmountChecked(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "WH-CAP-" + mustNewUUID()[:8], EventType: "PAYMENT.CAPTURE.COMPLETED",
+		TransactionID: "cap-" + mustNewUUID()[:8], OrderID: order.ID,
+		Amount: 0, Currency: "USD", // under-paid vs the CNY order snapshot
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("mismatch must be acked, got err: %v", err)
+	}
+	var n int
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_amount_mismatch'`)
+	if n == 0 {
+		t.Error("expected webhook_amount_mismatch audit for under-paid CAPTURE")
+	}
+	got, _ := svc.GetOrder(context.Background(), order.ID, uid)
+	if got.Status != "pending" {
+		t.Errorf("order.Status = %q, want pending", got.Status)
+	}
+}
+
 // TestPaymentService_CreateOrder_GenericError covers the wrap paths
 // in CreateOrder that aren't covered by the "plan not found" / "plan
 // inactive" / "user has active sub" tests. After D8 the subRepo

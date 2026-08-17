@@ -447,14 +447,16 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 		return nil, fmt.Errorf("paypal missing resource.id")
 	}
 	// resource.custom_id is required only for events that need to map back
-	// to a Yunhou order row. Subscription renewals (PAYMENT.SALE.*) and
-	// lifecycle events (BILLING.SUBSCRIPTION.*) don't carry custom_id —
-	// they identify the subscription via resource.billing_agreement_id
-	// (renewals) or resource.id (lifecycle). Requiring custom_id globally
-	// would silently drop every renewal webhook, leaving paid customers
-	// without an extended subscription. PAYMENT.CAPTURE.COMPLETED for
-	// one-time purchases still requires custom_id (it's the only link
-	// back to the order).
+	// to a Yunhou order row. Subscription renewals (PAYMENT.SALE.*) don't
+	// carry custom_id — they identify the subscription via
+	// resource.billing_agreement_id. Lifecycle events
+	// (BILLING.SUBSCRIPTION.*) DO echo the custom_id the BFF set at
+	// subscription creation (verified against live sandbox events
+	// 2026-08-17), which is how ACTIVATED finds the order row. Requiring
+	// custom_id globally would silently drop every renewal webhook,
+	// leaving paid customers without an extended subscription.
+	// PAYMENT.CAPTURE.COMPLETED for one-time purchases still requires
+	// custom_id (it's the only link back to the order).
 	needsCustomID := evt.EventType == "PAYMENT.CAPTURE.COMPLETED" ||
 		evt.EventType == "PAYMENT.CAPTURE.REFUNDED"
 	if needsCustomID && evt.Resource.CustomID == "" {
@@ -468,6 +470,9 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 		OrderID:       evt.Resource.CustomID,
 		TransactionID: evt.Resource.ID,
 		Currency:      strings.ToUpper(evt.Resource.Amount.CurrencyCode),
+		// Lifecycle payloads carry no resource.amount at all — exempt them
+		// from the underpayment check (see WebhookEvent.SkipAmountCheck).
+		SkipAmountCheck: isPaypalLifecycleEvent(evt.EventType),
 	}
 
 	// Refund events: resource.id is the refund ID, not the capture ID we

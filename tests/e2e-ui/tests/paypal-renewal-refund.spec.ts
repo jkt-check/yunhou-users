@@ -31,6 +31,8 @@ test.describe('Renewal + Refund simulation paths', () => {
       dbUrl: process.env.E2E_DATABASE_URL ?? 'postgres://postgres@localhost/yunhou_users?sslmode=disable',
     });
 
+    // Declared outside try so the finally cleanup can reference it.
+    const fakeSubId = `I-E2E-${Date.now()}`;
     try {
       const { userId } = await backend.login(env.buyerEmail);
       // NB: we don't call backend.createOrder() because the renewal
@@ -39,14 +41,15 @@ test.describe('Renewal + Refund simulation paths', () => {
       // would never be touched by the renewal path. So this test
       // simulates a renewal against an existing active subscription
       // directly.
-
-      // Pre-stamp the active subscription with a fake PayPal subscription id.
-      const fakeSubId = `I-E2E-${Date.now()}`;
+      //
+      // /test/login issues tokens only — it does NOT create a
+      // subscription row (the OAuth first-login trial grant lives in a
+      // different code path). Insert the active-subscription fixture
+      // the renewal handler will look up by external_subscription_id.
       await backend.db.query(
-        `UPDATE subscriptions
-           SET external_subscription_id = $1
-         WHERE user_id = $2 AND status = 'active'`,
-        [fakeSubId, userId],
+        `INSERT INTO subscriptions (user_id, plan_id, status, expires_at, external_subscription_id)
+         VALUES ($1, 'monthly', 'active', NOW() + INTERVAL '7 days', $2)`,
+        [userId, fakeSubId],
       );
 
       const expBefore = await backend.db.query<{ exp: Date | null }>(
@@ -65,7 +68,7 @@ test.describe('Renewal + Refund simulation paths', () => {
         {
           id: 'SALE-E2E-1',
           billing_agreement_id: fakeSubId,
-          amount: { total: '4.99', currency: 'USD' },
+          amount: { value: '4.99', currency_code: 'USD' },
           billing_info: {
             next_billing_time: new Date(Date.now() + 60 * 86_400_000).toISOString(),
           },
@@ -96,6 +99,12 @@ test.describe('Renewal + Refund simulation paths', () => {
       );
       expect(pay.rows[0].count).toBe(1);
     } finally {
+      // Remove the fixture: tests share one DB (workers=1) and the
+      // PayPal channel rejects new orders while the user has ANY active
+      // subscription (repurchase block) — a leaked fixture would 409 the
+      // @happy subscribe test that runs after this file.
+      await backend.db.query(`DELETE FROM payments WHERE external_txn_id = 'SALE-E2E-1'`);
+      await backend.db.query(`DELETE FROM subscriptions WHERE external_subscription_id = $1`, [fakeSubId]);
       await backend.close();
     }
   });

@@ -50,7 +50,7 @@ export async function initBackend(opts: {
     planId: string,
     opts2: { expiresAt?: string } = {},
   ): Promise<string> {
-    const body: Record<string, unknown> = { plan_id: planId };
+    const body: Record<string, unknown> = { plan_id: planId, channel: 'paypal' };
     if (opts2.expiresAt) {
       body.expires_at = opts2.expiresAt;
     }

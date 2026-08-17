@@ -1,9 +1,8 @@
 # L3 PayPal sandbox UI integration suite.
 #
-# NOT a default PR gate — runs on demand only. Trigger via the Actions
-# tab (workflow_dispatch). The nightly schedule is disabled because the
-# 7 required PayPal secrets are NOT configured in this repo — all 17
-# historical runs failed on "Missing required env var":
+# NOT a default PR gate — runs nightly (07:00 UTC) and on demand via
+# the Actions tab (workflow_dispatch). Requires 7 repo-level secrets
+# (all configured as of 2026-08-17):
 #   PAYPAL_SANDBOX_CLIENT_ID       - sandbox REST app client id
 #   PAYPAL_SANDBOX_SECRET          - sandbox REST app secret
 #   PAYPAL_SANDBOX_WEBHOOK_ID      - registered webhook id
@@ -11,12 +10,12 @@
 #   PAYPAL_BUYER_ACCOUNT_PASSWORD  - sandbox personal buyer
 #   PAYPAL_TEST_PLAN_ID            - pre-created Plan id (P-xxx)
 #   PAYPAL_NGROK_AUTHTOKEN         - ngrok authtoken
-# Restore the cron trigger ('0 7 * * *', nightly 07:00 UTC) once they
-# are set.
 
 name: paypal-l3-sandbox
 
 on:
+  schedule:
+    - cron: '0 7 * * *'
   workflow_dispatch:
 
 permissions:
@@ -30,6 +29,23 @@ jobs:
   paypal-l3:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    services:
+      # Same postgres:16-alpine service-container pattern as pr-ci.yml —
+      # the runner's system Postgres rejects TCP password-less auth on
+      # current ubuntu-latest images (28P01).
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yunhou_users_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       BACKEND_BIN: /tmp/yunhou-server
       NGROK_BIN: /tmp/ngrok
@@ -47,16 +63,34 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Start Postgres
+      - name: Migrate DB + seed L3 fixtures
         env:
-          DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
+          PGPASSWORD: postgres
         run: |
-          sudo service postgresql start
-          sudo -u postgres createdb yunhou_users_e2e
           # cmd/migrate reads DATABASE_URL and applies every pending
           # migration in ./migrations (001-019) via its ledger; replaces
           # the old psql list that stopped at 007.
           go run ./cmd/migrate
+          # L3 fixtures: migrations seed no apps/plans, but /test/login
+          # requires an active app row and /payments/orders requires an
+          # active, accepting-new plan whose currency matches the
+          # channel (paypal → USD, see channelRequiredCurrency).
+          psql -h localhost -U postgres -d yunhou_users_e2e -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO apps (app_id, name, description, config, is_active, secret_hash)
+          VALUES ('yundian', 'L3 Test App', 'PayPal L3 CI fixture', '{}', true, NULL)
+          ON CONFLICT (app_id) DO NOTHING;
+
+          INSERT INTO plans (id, name, price, interval_days, apps, is_listed,
+                             accepting_new_subscriptions, currency, trial_days,
+                             description, display_order)
+          VALUES ('monthly', 'Monthly (L3)', 9.99, 30, '{yundian}', true, true,
+                  'USD', 0, 'PayPal L3 CI fixture', 10)
+          ON CONFLICT (id) DO UPDATE SET
+            is_active = true,
+            accepting_new_subscriptions = true,
+            currency = 'USD';
+          SQL
 
       # All long-running daemons (ngrok, backend) live in a single step
       # that runs to completion before the test step. This avoids the
@@ -66,19 +100,27 @@ jobs:
       # pattern below keeps both alive for the whole workflow.
       - name: Run ngrok + backend + Playwright
         env:
-          DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
           PAYPAL_ENV: sandbox
           PAYPAL_WEBHOOK_ID_SANDBOX: ${{ secrets.PAYPAL_SANDBOX_WEBHOOK_ID }}
           PAYPAL_API_BASE_SANDBOX: https://api-m.sandbox.paypal.com
+          # Backend reads PAYPAL_CLIENT_ID/SECRET (webhook
+          # verify-webhook-signature upstream auth); map the sandbox app.
+          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_SANDBOX_CLIENT_ID }}
+          PAYPAL_CLIENT_SECRET: ${{ secrets.PAYPAL_SANDBOX_SECRET }}
           PAYPAL_SANDBOX_CLIENT_ID: ${{ secrets.PAYPAL_SANDBOX_CLIENT_ID }}
           PAYPAL_SANDBOX_SECRET: ${{ secrets.PAYPAL_SANDBOX_SECRET }}
           PAYPAL_SANDBOX_WEBHOOK_ID: ${{ secrets.PAYPAL_SANDBOX_WEBHOOK_ID }}
           PAYPAL_BUYER_ACCOUNT_EMAIL: ${{ secrets.PAYPAL_BUYER_ACCOUNT_EMAIL }}
           PAYPAL_BUYER_ACCOUNT_PASSWORD: ${{ secrets.PAYPAL_BUYER_ACCOUNT_PASSWORD }}
           PAYPAL_TEST_PLAN_ID: ${{ secrets.PAYPAL_TEST_PLAN_ID }}
-          E2E_DATABASE_URL: postgres://postgres@localhost/yunhou_users_e2e?sslmode=disable
+          E2E_DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
           BACKEND_URL: http://localhost:8080
           NGROK_AUTHTOKEN: ${{ secrets.PAYPAL_NGROK_AUTHTOKEN }}
+          # Enables the /test/login helper route (404 without it). Only
+          # valid with PAYPAL_ENV=sandbox — config.Validate() rejects
+          # this combination when PAYPAL_ENV=live.
+          PAYPAL_L3_E2E_MODE: '1'
         run: |
           set -euo pipefail
 
@@ -102,10 +144,12 @@ jobs:
           mkdir -p "$ARTIFACTS_DIR"
 
           # 1) ngrok
-          # Pinned 2026-07-31: ngrok v3 stable linux-amd64 tarball,
-          # verified against its sha256 before extracting.
+          # Pinned 2026-08-17: ngrok v3 stable linux-amd64 tarball,
+          # verified against its sha256 before extracting. The "stable"
+          # URL floats — when ngrok ships a new build this check fails
+          # closed; re-pin by hashing the fresh tarball.
           curl -sSL -o /tmp/ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
-          echo "9dfbe1a914e69cc7e980d61e6bd5a642025918102c5bc69905d1c57703aca3e8  /tmp/ngrok.tgz" | sha256sum -c -
+          echo "cec0b4997fcc5f529dfc74bac89050354d11a915f968720600039738fdf330cf  /tmp/ngrok.tgz" | sha256sum -c -
           tar xzf /tmp/ngrok.tgz -C /tmp/
           "$NGROK_BIN" authtoken "$NGROK_AUTHTOKEN"
           "$NGROK_BIN" http 8080 --log "$ARTIFACTS_DIR/ngrok.log" > "$ARTIFACTS_DIR/ngrok.out" 2>&1 &
@@ -125,8 +169,44 @@ jobs:
           NGROK_URL=$(jq -r '.tunnels[] | select(.public_url|startswith("https://")) | .public_url' "$ARTIFACTS_DIR/tunnels.json" | head -1)
           echo "ngrok url=$NGROK_URL"
           echo "$NGROK_URL" > "$ARTIFACTS_DIR/ngrok-url"
+          if [ -z "$NGROK_URL" ]; then
+            echo "::error::ngrok tunnel did not come up; ngrok.log follows"
+            cat "$ARTIFACTS_DIR/ngrok.log" || true
+            exit 1
+          fi
+
+          # Point the registered sandbox webhook at this run's tunnel so
+          # PayPal delivers real events to the ephemeral backend. The
+          # webhook_id stays stable (backend verification depends on it);
+          # only its /url is rewritten per run. With a reserved ngrok
+          # domain the URL is unchanged between runs and PayPal answers
+          # 400 WEBHOOK_PATCH_REQUEST_NO_CHANGE — that is success for us.
+          PP_TOKEN=$(curl -sS --fail-with-body --retry 3 --retry-all-errors \
+            -u "$PAYPAL_CLIENT_ID:$PAYPAL_CLIENT_SECRET" \
+            -d grant_type=client_credentials \
+            https://api-m.sandbox.paypal.com/v1/oauth2/token | jq -r .access_token)
+          PATCH_RESP=$(curl -sS --retry 3 --retry-all-errors -X PATCH \
+            "https://api-m.sandbox.paypal.com/v1/notifications/webhooks/$PAYPAL_SANDBOX_WEBHOOK_ID" \
+            -H "Authorization: Bearer $PP_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "[{\"op\":\"replace\",\"path\":\"/url\",\"value\":\"$NGROK_URL/webhooks/payment/paypal\"}]")
+          if echo "$PATCH_RESP" | grep -q '"url"'; then
+            echo "webhook $PAYPAL_SANDBOX_WEBHOOK_ID now points at $(echo "$PATCH_RESP" | jq -r .url)"
+          elif echo "$PATCH_RESP" | grep -q WEBHOOK_PATCH_REQUEST_NO_CHANGE; then
+            echo "webhook already points at $NGROK_URL (no change)"
+          else
+            echo "::error::webhook PATCH failed: $PATCH_RESP"
+            exit 1
+          fi
 
           # 2) backend
+          # Ephemeral per-run config: config.Validate() fails fast
+          # without RSA key paths and a >=32-char OAuth state secret.
+          openssl genrsa -out /tmp/l3_rsa.pem 2048
+          openssl rsa -in /tmp/l3_rsa.pem -pubout -out /tmp/l3_rsa_pub.pem
+          export RSA_PRIVATE_KEY_PATH=/tmp/l3_rsa.pem
+          export RSA_PUBLIC_KEY_PATH=/tmp/l3_rsa_pub.pem
+          export OAUTH_STATE_SECRET="$(openssl rand -hex 32)"
           go build -o "$BACKEND_BIN" ./cmd/server
           "$BACKEND_BIN" > "$ARTIFACTS_DIR/backend.log" 2>&1 &
           BACKEND_PID=$!
@@ -138,6 +218,11 @@ jobs:
             fi
             sleep 1
           done
+          if ! curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
+            echo "::error::backend did not become healthy; backend.log follows"
+            cat "$ARTIFACTS_DIR/backend.log" || true
+            exit 1
+          fi
 
           # Cleanup runs unconditionally (set +e), so processes die even
           # if the test exits non-zero. Without this `set -e` would skip

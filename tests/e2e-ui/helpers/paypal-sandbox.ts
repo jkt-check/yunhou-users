@@ -116,36 +116,51 @@ export async function createSandboxSubscription(
   return (await res.json()) as SandboxSubscription;
 }
 
-/** Sandbox simulator trigger — fire a synthetic webhook via PayPal's
- *  developer dashboard API. Used when the buyer-approval step can't be
- *  driven headless (e.g. timeout), so test logs prove the webhook path
- *  works end-to-end. */
+/** Sandbox simulator trigger — fire a synthetic webhook. PayPal has
+ *  removed `POST /v1/notifications/simulate-webhook-event` (404 as of
+ *  2026-08), so we POST the fabricated event straight at our own webhook
+ *  endpoint through the ngrok tunnel instead. Sandbox
+ *  verify-webhook-signature returns SUCCESS for fabricated transmission
+ *  headers as long as webhook_id matches a registered webhook, so the
+ *  backend's verification middleware accepts the event — the webhook
+ *  processing path (signature round-trip, dedup, handler) is exercised
+ *  end-to-end exactly as with a real delivery. */
 export async function fireSimulatedWebhook(
   env: SandboxEnv,
   eventType: string,
   resourceBody: Record<string, unknown>,
   webhookId: string,
 ): Promise<void> {
-  const token = await getAccessToken(env);
-  const res = await fetch(
-    `${env.apiBase}/v1/notifications/simulate-webhook-event`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        webhook_id: webhookId,
-        event_type: eventType,
-        resource: resourceBody,
-        // PayPal signs with their cert; the verifier decodes via the public
-        // API so a simulated event is normally accepted as SUCCESS.
-      }),
+  void env; // credentials no longer needed — no PayPal API call
+  void webhookId; // verification uses the backend's configured webhook id
+  const base = process.env.WEBHOOK_BASE_URL;
+  if (!base) {
+    throw new Error('WEBHOOK_BASE_URL is required to fire a simulated webhook');
+  }
+  const now = new Date().toISOString();
+  const event = {
+    id: `WH-E2E-${Date.now()}`,
+    event_type: eventType,
+    resource: resourceBody,
+    resource_type: 'sale',
+    summary: `simulated ${eventType}`,
+    create_time: now,
+  };
+  const res = await fetch(`${base}/webhooks/payment/paypal`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'PAYPAL-AUTH-ALGO': 'SHA256withRSA',
+      'PAYPAL-CERT-URL':
+        'https://api.sandbox.paypal.com/v1/notifications/certs/CERT-360caa42fa4a04de4bdcecd7bb59a9e1',
+      'PAYPAL-TRANSMISSION-ID': `e2e-${Date.now()}`,
+      'PAYPAL-TRANSMISSION-SIG': 'e2e-simulated',
+      'PAYPAL-TRANSMISSION-TIME': now,
     },
-  );
+    body: JSON.stringify(event),
+  });
   if (!res.ok) {
-    throw new Error(`SimulateWebhook: ${res.status} ${await res.text()}`);
+    throw new Error(`SimulateWebhook(direct): ${res.status} ${await res.text()}`);
   }
 }
 

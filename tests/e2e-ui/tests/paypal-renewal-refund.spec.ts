@@ -65,7 +65,7 @@ test.describe('Renewal + Refund simulation paths', () => {
         {
           id: 'SALE-E2E-1',
           billing_agreement_id: fakeSubId,
-          amount: { total: '4.99', currency: 'USD' },
+          amount: { value: '4.99', currency_code: 'USD' },
           billing_info: {
             next_billing_time: new Date(Date.now() + 60 * 86_400_000).toISOString(),
           },

@@ -33,29 +33,69 @@ export class PayPalPopupPage {
     return popup;
   }
 
+  /** Resolve the scope the login/approve form lives in: the popup
+   *  document itself (real popup-window flow) or the embedded PayPal
+   *  iframe. Returns null when neither shows a form (returning-customer
+   *  path skips login entirely). */
+  private async formScope(): Promise<Pick<Page, 'locator'> | null> {
+    const emailSel = 'input[name="email"], input#email';
+    const approveSel =
+      'button[data-testid="confirmButton"], button#confirmButton, button:has-text("Subscribe"), button:has-text("Continue"), button:has-text("Agree"), button[type="submit"]';
+    try {
+      await this.page
+        .locator(`${emailSel}, ${approveSel}`)
+        .first()
+        .waitFor({ state: 'visible', timeout: 10_000 });
+      return this.page;
+    } catch {
+      try {
+        await this.root()
+          .locator(`${emailSel}, ${approveSel}`)
+          .first()
+          .waitFor({ state: 'visible', timeout: 10_000 });
+        return this.root();
+      } catch {
+        return null;
+      }
+    }
+  }
+
   async loginIfNeeded(env: SandboxEnv) {
     // PayPal's "returning customer" path may skip the login form. Detect
     // and adapt: if email field is present, fill it; otherwise skip.
-    const emailInput = this.root().locator('input[name="email"], input#email');
-    const visible = await emailInput.count();
-    if (visible === 0) {
+    const scope = await this.formScope();
+    if (!scope) {
       return { loggedIn: true } as const;
     }
-    await emailInput.first().fill(env.buyerEmail);
-    const passwordInput = this.root().locator('input[name="password"], input#password');
-    await passwordInput.first().fill(env.buyerPassword);
-    await this.root().locator('button[type="submit"], button#btnLogin').first().click();
+    const emailInput = scope.locator('input[name="email"], input#email').first();
+    if ((await emailInput.count()) === 0 || !(await emailInput.isVisible().catch(() => false))) {
+      // Approve screen is already up — no login required.
+      return { loggedIn: true } as const;
+    }
+    await emailInput.fill(env.buyerEmail);
+    const passwordInput = scope.locator('input[name="password"], input#password').first();
+    if (!(await passwordInput.isVisible().catch(() => false))) {
+      // Split login: email → "Next" → password on a second screen.
+      const next = scope.locator('button#btnNext, button:has-text("Next"), button:has-text("下一步")').first();
+      if ((await next.count()) > 0) {
+        await next.click();
+      }
+    }
+    await passwordInput.waitFor({ state: 'visible', timeout: 15_000 });
+    await passwordInput.fill(env.buyerPassword);
+    await scope.locator('button[type="submit"], button#btnLogin').first().click();
     await this.page.waitForTimeout(2_000);
     return { loggedIn: true } as const;
   }
 
   async approve(): Promise<PayPalPopupResult> {
-    const approveBtn = this.root().locator(
-      'button[data-testid="confirmButton"], button#confirmButton, button:has-text("Pay"), button:has-text("Subscribe"), button:has-text("Continue"), button:has-text("Agree & Subscribe")',
+    const scope = (await this.formScope()) ?? this.page;
+    const approveBtn = scope.locator(
+      'button[data-testid="confirmButton"], button#confirmButton, button:has-text("Subscribe"), button:has-text("Continue"), button:has-text("Agree & Subscribe"), button:has-text("Complete Purchase"), button:has-text("Pay")',
     );
     const count = await approveBtn.count();
     if (count === 0) {
-      await this.root().locator('button[type="submit"]').first().click();
+      await scope.locator('button[type="submit"]').first().click();
     } else {
       await approveBtn.first().click();
     }

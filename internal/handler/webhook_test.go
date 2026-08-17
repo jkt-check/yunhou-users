@@ -650,6 +650,9 @@ func TestWebhookHandler_Paypal_SubscriptionCreated_HasExternalSubscriptionID(t *
 	if svc.gotEvent.EventType != "BILLING.SUBSCRIPTION.CREATED" {
 		t.Errorf("event_type: got %q", svc.gotEvent.EventType)
 	}
+	if !svc.gotEvent.SkipAmountCheck {
+		t.Error("lifecycle events must set SkipAmountCheck (PayPal omits resource.amount)")
+	}
 }
 
 func TestWebhookHandler_Paypal_MissingCustomID_400(t *testing.T) {

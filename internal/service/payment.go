@@ -1217,14 +1217,23 @@ type WebhookEvent struct {
 	EventID                string // channel's event ID — Stripe `evt.id`, WeChat `notify_id`, Alipay `notify_id`
 	EventType              string // channel's event type string
 	RawPayload             json.RawMessage
-	TransactionID          string     // channel's transaction ID — maps to payments.external_txn_id
-	OrderID                string     // order UUID from channel metadata (Stripe) or out_trade_no (WeChat/Alipay)
-	Amount                 float64    // settled amount (major currency units, normalized by handler)
-	Currency               string     // ISO 4217
-	RefundAmount           float64    // for refund events
-	ExternalRefundID       string     // channel's refund ID
-	ExternalSubscriptionID string     // PayPal: subscription ID (`I-...`) — used by renewal branch to find the active sub
-	SubExpiresAt           *time.Time // subscription expiry at activation. MUST be supplied by the
+	TransactionID          string  // channel's transaction ID — maps to payments.external_txn_id
+	OrderID                string  // order UUID from channel metadata (Stripe) or out_trade_no (WeChat/Alipay)
+	Amount                 float64 // settled amount (major currency units, normalized by handler)
+	Currency               string  // ISO 4217
+	RefundAmount           float64 // for refund events
+	ExternalRefundID       string  // channel's refund ID
+	ExternalSubscriptionID string  // PayPal: subscription ID (`I-...`) — used by renewal branch to find the active sub
+	// SkipAmountCheck exempts PayPal lifecycle events
+	// (BILLING.SUBSCRIPTION.ACTIVATED etc.) from the amount/currency
+	// validation in onPaymentSucceeded: PayPal omits resource.amount from
+	// lifecycle payloads entirely, so Amount=0/Currency="" there is by
+	// construction, not evidence of underpayment. The trust anchor for
+	// activation is the verified signature + custom_id order link +
+	// subscription status, not the (absent) amount. Payment events
+	// (CAPTURE/SALE) always carry amounts and keep the strict check.
+	SkipAmountCheck bool
+	SubExpiresAt    *time.Time // subscription expiry at activation. MUST be supplied by the
 	// caller (e.g. an explicit channel metadata field) — yunhou-users
 	// MUST NOT compute it from plan.interval_days; that calculation is
 	// a frontend product decision (rollover rules, grace periods, trials).
@@ -1434,7 +1443,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// (DECIMAL(10,2) round-trip drifts in float64); currency match is
 	// case-insensitive. Ack 200 (non-retryable) + audit so channels
 	// don't retry forever and ops can reconcile manually.
-	if toCents(e.Amount) < toCents(order.Amount) || !strings.EqualFold(e.Currency, order.Currency) {
+	if !e.SkipAmountCheck && (toCents(e.Amount) < toCents(order.Amount) || !strings.EqualFold(e.Currency, order.Currency)) {
 		return s.writeAudit(ctx, "service", "webhook_amount_mismatch",
 			fmt.Sprintf("order:%s", order.ID),
 			[]string{"webhook", "amount_mismatch"},
@@ -1447,13 +1456,23 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	}
 
 	now := time.Now()
+	// PayPal lifecycle events (ACTIVATED) carry no amount/currency — the
+	// payment row records a $0 first settlement in the ORDER's currency
+	// (payments_currency_check is length=3; "" would violate it). For a
+	// trialed subscription $0 is genuinely what was charged at approval;
+	// the first real charge arrives later as PAYMENT.SALE.COMPLETED on the
+	// renewal path with its own amount.
+	paymentAmount, paymentCurrency := e.Amount, e.Currency
+	if e.SkipAmountCheck && paymentCurrency == "" {
+		paymentCurrency = order.Currency
+	}
 	p := &model.Payment{
 		ID:            GenerateUUID(),
 		OrderID:       order.ID,
 		Channel:       e.Channel,
 		ExternalTxnID: e.TransactionID,
-		Amount:        e.Amount,
-		Currency:      e.Currency,
+		Amount:        paymentAmount,
+		Currency:      paymentCurrency,
 		Status:        "paid",
 		PaidAt:        &now,
 		RawPayload:    e.RawPayload,
@@ -2325,7 +2344,13 @@ func isPaymentSuccess(eventType string) bool {
 	switch eventType {
 	case "payment_intent.succeeded", "TRANSACTION.SUCCESS",
 		"TRADE_SUCCESS", "trade_status_sync",
-		"PAYMENT.CAPTURE.COMPLETED", "BILLING.SUBSCRIPTION.CREATED":
+		"PAYMENT.CAPTURE.COMPLETED", "BILLING.SUBSCRIPTION.ACTIVATED":
+		// ACTIVATED is the subscription activation trigger: its resource
+		// carries custom_id (the order UUID the BFF set at creation),
+		// status=ACTIVE (the buyer actually approved) and
+		// billing_info.next_billing_time (expiry hint — 7-day trial end).
+		// CREATED fires pre-approval with status=APPROVAL_PENDING and must
+		// NOT activate: the buyer may abandon at the PayPal login.
 		return true
 	}
 	return false

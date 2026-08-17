@@ -271,6 +271,11 @@ func TestIsPaymentSuccess(t *testing.T) {
 		// Alipay
 		{"trade_status_sync", true},
 		{"TRADE_SUCCESS", true},
+		// PayPal: ACTIVATED (post-approval, has custom_id + next_billing_time)
+		// activates the order; CREATED is pre-approval (APPROVAL_PENDING)
+		// and must not.
+		{"BILLING.SUBSCRIPTION.ACTIVATED", true},
+		{"BILLING.SUBSCRIPTION.CREATED", false},
 		// LemonSqueezy-era names — dead since the channel was dropped
 		// (migration 008); must NOT dispatch.
 		{"order_created", false},

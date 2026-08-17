@@ -63,14 +63,34 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Migrate DB
+      - name: Migrate DB + seed L3 fixtures
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/yunhou_users_e2e?sslmode=disable
+          PGPASSWORD: postgres
         run: |
           # cmd/migrate reads DATABASE_URL and applies every pending
           # migration in ./migrations (001-019) via its ledger; replaces
           # the old psql list that stopped at 007.
           go run ./cmd/migrate
+          # L3 fixtures: migrations seed no apps/plans, but /test/login
+          # requires an active app row and /payments/orders requires an
+          # active, accepting-new plan whose currency matches the
+          # channel (paypal → USD, see channelRequiredCurrency).
+          psql -h localhost -U postgres -d yunhou_users_e2e -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO apps (app_id, name, description, config, is_active, secret_hash)
+          VALUES ('yundian', 'L3 Test App', 'PayPal L3 CI fixture', '{}', true, NULL)
+          ON CONFLICT (app_id) DO NOTHING;
+
+          INSERT INTO plans (id, name, price, interval_days, apps, is_listed,
+                             accepting_new_subscriptions, currency, trial_days,
+                             description, display_order)
+          VALUES ('monthly', 'Monthly (L3)', 9.99, 30, '{yundian}', true, true,
+                  'USD', 0, 'PayPal L3 CI fixture', 10)
+          ON CONFLICT (id) DO UPDATE SET
+            is_active = true,
+            accepting_new_subscriptions = true,
+            currency = 'USD';
+          SQL
 
       # All long-running daemons (ngrok, backend) live in a single step
       # that runs to completion before the test step. This avoids the
@@ -84,6 +104,10 @@ jobs:
           PAYPAL_ENV: sandbox
           PAYPAL_WEBHOOK_ID_SANDBOX: ${{ secrets.PAYPAL_SANDBOX_WEBHOOK_ID }}
           PAYPAL_API_BASE_SANDBOX: https://api-m.sandbox.paypal.com
+          # Backend reads PAYPAL_CLIENT_ID/SECRET (webhook
+          # verify-webhook-signature upstream auth); map the sandbox app.
+          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_SANDBOX_CLIENT_ID }}
+          PAYPAL_CLIENT_SECRET: ${{ secrets.PAYPAL_SANDBOX_SECRET }}
           PAYPAL_SANDBOX_CLIENT_ID: ${{ secrets.PAYPAL_SANDBOX_CLIENT_ID }}
           PAYPAL_SANDBOX_SECRET: ${{ secrets.PAYPAL_SANDBOX_SECRET }}
           PAYPAL_SANDBOX_WEBHOOK_ID: ${{ secrets.PAYPAL_SANDBOX_WEBHOOK_ID }}

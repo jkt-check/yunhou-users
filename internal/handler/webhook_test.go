@@ -591,6 +591,80 @@ func TestWebhookHandler_Paypal_CaptureRefunded_DerivesExternalRefundID(t *testin
 	}
 }
 
+// TestWebhookHandler_Paypal_SaleRefunded_KeepsSaleID pins the
+// SALE.REFUNDED binding fix (review users-1, 2026-08-17): unlike
+// CAPTURE.REFUNDED (resource.id = refund id → must rewrite from the
+// links[rel=up] capture), SALE.REFUNDED's resource.id IS the sale id —
+// the exact external_txn_id stored when the renewal payment was minted.
+// Overwriting it with the up-link (billing agreement / subscription id)
+// would mis-bind onRefundSucceeded to the $0 ACTIVATED payment row.
+func TestWebhookHandler_Paypal_SaleRefunded_KeepsSaleID(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "refund_paid"}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-SALE-REFUND",
+		"event_type": "PAYMENT.SALE.REFUNDED",
+		"resource": {
+			"id": "SALE-RENEWAL-1",
+			"billing_agreement_id": "I-BWX42ABCD",
+			"amount": {"value": "9.99", "currency_code": "USD"},
+			"links": [
+				{"rel": "self", "href": "https://api-m.sandbox.paypal.com/v1/payments/sale/SALE-RENEWAL-1"},
+				{"rel": "up", "href": "https://api-m.sandbox.paypal.com/v1/billing-agreements/I-BWX42ABCD"}
+			]
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+	// TransactionID must stay the SALE id (the stored external_txn_id) —
+	// NOT be overwritten by the up-link's trailing subscription id.
+	if svc.gotEvent.TransactionID != "SALE-RENEWAL-1" {
+		t.Errorf("transaction_id: got %q, want SALE-RENEWAL-1 (must not take up-link suffix)", svc.gotEvent.TransactionID)
+	}
+	if svc.gotEvent.RefundAmount != 9.99 {
+		t.Errorf("refund_amount: got %v, want 9.99", svc.gotEvent.RefundAmount)
+	}
+	if svc.gotEvent.ExternalRefundID != "paypal-SALE-RENEWAL-1" {
+		t.Errorf("external_refund_id: got %q", svc.gotEvent.ExternalRefundID)
+	}
+	if svc.gotEvent.ExternalSubscriptionID != "I-BWX42ABCD" {
+		t.Errorf("external_subscription_id: got %q", svc.gotEvent.ExternalSubscriptionID)
+	}
+}
+
+// TestWebhookHandler_Paypal_MissingCurrency_Rejected pins the parse-time
+// currency requirement (review users-1, 2026-08-17): a PAYMENT.* event
+// without amount.currency_code previously passed parsePaypal and then
+// violated the payments.currency CHECK (length=3) at INSERT → 500 →
+// PayPal retried forever. It must be rejected at parse time instead.
+func TestWebhookHandler_Paypal_MissingCurrency_Rejected(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+
+	body := []byte(`{
+		"id": "WH-PP-NO-CUR",
+		"event_type": "PAYMENT.SALE.COMPLETED",
+		"resource": {
+			"id": "SALE-NO-CUR-1",
+			"billing_agreement_id": "I-BWX42ABCD",
+			"amount": {"value": "9.99"}
+		}
+	}`)
+	rec := postRaw(engine, "/webhooks/payment/paypal", body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want 400 (missing currency must be rejected at parse time)", rec.Code)
+	}
+}
+
 func TestWebhookHandler_Paypal_SaleCompleted_SetsSubscriptionAndExpiry(t *testing.T) {
 	t.Parallel()
 

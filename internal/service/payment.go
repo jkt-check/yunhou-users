@@ -328,7 +328,11 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 			// 改签（月↔年）需要专门的"取消旧订阅+建新订阅"流程，落地前
 			// PayPal 渠道对任何未过期 active 订阅一律拒绝新单（409）。
 			// WeChat 无自动续费，手动续费 rollover 是正确行为，不受影响。
-			if channel == "paypal" {
+			// trial 订阅是 OAuth 首登赠予的（migration 018），**不是**
+			// PayPal 订阅：渠道侧没有对应的自动扣费 subscription，豁免
+			// 它不会造成双重扣费，反而正是 trial→付费 的核心转化漏斗
+			// （review users-1, 2026-08-17）。
+			if channel == "paypal" && existing.PlanID != "trial" {
 				return nil, ErrUserHasActiveSub
 			}
 			allowed, aerr := s.repurchaseAllowed(ctx, existing.PlanID, planID)
@@ -2017,6 +2021,54 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	orderExpiresAt := time.Now().AddDate(100, 0, 0) // +100y sentinel
 	if e.SubExpiresAt != nil {
 		orderExpiresAt = *e.SubExpiresAt
+	}
+	// Amount/currency sanity check (review users-1, 2026-08-17): the
+	// signature proves the event came from PayPal, not that the settled
+	// amount matches the plan. A wrong-currency or below-plan renewal must
+	// NOT silently extend the subscription. Unlike the order-activation
+	// path (webhook_amount_mismatch → reject), the renewal path audit-logs
+	// mismatches but still processes: intl-staging runs plan-amount-override
+	// ($0.01/$0.10 sandbox charges) and the L3 suite fires $4.99 renewals,
+	// so hard-rejecting on amount would break legitimate test/staging flows.
+	// The audit row is the ops signal to investigate a genuine undercharge.
+	if plan, perr := s.txLookupPlan(ctx, rawSQLXTx(tx), sub.PlanID); perr != nil {
+		// Missing plan is not this event's fault — proceed with the renewal
+		// but flag it so ops can reconcile (mirrors onPaymentSucceeded's
+		// lenient plan lookup).
+		_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_plan_lookup_failed",
+			fmt.Sprintf("subscription:%s", sub.ID),
+			[]string{"webhook", "paypal", "renewal", "plan_lookup"},
+			map[string]any{
+				"plan_id":  sub.PlanID,
+				"event_id": e.EventID,
+			})
+	} else {
+		if !strings.EqualFold(e.Currency, plan.Currency) {
+			_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_currency_mismatch",
+				fmt.Sprintf("subscription:%s", sub.ID),
+				[]string{"webhook", "paypal", "renewal", "currency_mismatch"},
+				map[string]any{
+					"event_id":       e.EventID,
+					"event_currency": e.Currency,
+					"plan_currency":  plan.Currency,
+					"amount":         e.Amount,
+					"payment_id":     "",
+					"order_id":       "",
+				})
+		} else if toCents(e.Amount) < toCents(plan.Price) {
+			_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_amount_below_plan",
+				fmt.Sprintf("subscription:%s", sub.ID),
+				[]string{"webhook", "paypal", "renewal", "amount_mismatch"},
+				map[string]any{
+					"event_id":     e.EventID,
+					"event_amount": e.Amount,
+					"plan_amount":  plan.Price,
+					"currency":     e.Currency,
+					"payment_id":   "",
+					"order_id":     "",
+					"note":         "audit-only; renewal still processed (plan-amount-override / test flows)",
+				})
+		}
 	}
 	err = tx.QueryRowxContext(ctx, `
 		INSERT INTO orders (user_id, plan_id, amount, currency, status, expires_at, provider_intent)

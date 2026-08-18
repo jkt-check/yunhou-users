@@ -475,11 +475,16 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 		SkipAmountCheck: isPaypalLifecycleEvent(evt.EventType),
 	}
 
-	// Refund events: resource.id is the refund ID, not the capture ID we
-	// stored when the original CAPTURE.COMPLETED arrived. PayPal publishes
-	// the parent capture as links[rel="up"]; extract the trailing path
-	// segment so the refund handler can find the original payment row.
-	if isPaypalRefundEvent(evt.EventType) {
+	// Refund events: resource.id is the refund ID for CAPTURE.REFUNDED, not
+	// the capture ID we stored when the original CAPTURE.COMPLETED arrived.
+	// PayPal publishes the parent capture as links[rel="up"]; extract the
+	// trailing path segment so the refund handler can find the original
+	// payment row. SALE.REFUNDED is different: resource.id IS the sale id —
+	// the exact external_txn_id stored when the renewal payment was minted —
+	// so it must NOT be overwritten from the up-link (whose trailing segment
+	// is the billing agreement / subscription id, I-...). Only the capture
+	// variant needs the up-link rewrite (review users-1, 2026-08-17).
+	if evt.EventType == "PAYMENT.CAPTURE.REFUNDED" {
 		for _, l := range evt.Resource.Links {
 			if l.Rel == "up" {
 				if id := lastPathSegment(l.Href); id != "" {
@@ -521,6 +526,14 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 	} else {
 		we.Amount = v
 	}
+	// Currency is mandatory for PAYMENT.* events (review users-1,
+	// 2026-08-17): an empty currency_code previously slipped through here
+	// and the payments.currency CHECK (length=3) then rejected the INSERT
+	// with a 500 — PayPal retries the webhook forever. Lifecycle events are
+	// exempt (they carry no amount at all).
+	if !isPaypalLifecycleEvent(evt.EventType) && strings.ToUpper(evt.Resource.Amount.CurrencyCode) == "" {
+		return nil, fmt.Errorf("paypal missing amount.currency_code for %s", evt.EventType)
+	}
 
 	if evt.Resource.BillingInfo != nil && evt.Resource.BillingInfo.NextBillingTime != "" {
 		if t, err := time.Parse(time.RFC3339, evt.Resource.BillingInfo.NextBillingTime); err == nil {
@@ -542,7 +555,7 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 }
 
 func isPaypalRefundEvent(eventType string) bool {
-	return eventType == "PAYMENT.CAPTURE.REFUNDED"
+	return eventType == "PAYMENT.CAPTURE.REFUNDED" || eventType == "PAYMENT.SALE.REFUNDED"
 }
 
 // isPaypalSubscriptionEvent is local to the handler — it covers BILLING.SUBSCRIPTION.*

@@ -287,6 +287,40 @@ func TestPaymentService_CreateOrder_PaypalActiveSubRejected(t *testing.T) {
 	}
 }
 
+// TestPaymentService_CreateOrder_PaypalTrialSubExempt pins the trial
+// exemption (review users-1, 2026-08-17): a 'trial' subscription is an
+// OAuth first-login grant (migration 018), NOT a PayPal subscription —
+// there is no channel-side auto-charge to duplicate. Blocking it would
+// 409 the trial→paid conversion funnel, the single most important intl
+// path. A trial user must be able to create their first PayPal order.
+func TestPaymentService_CreateOrder_PaypalTrialSubExempt(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+
+	// Grant the trial like AuthService does on first login.
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (gen_random_uuid(), $1, 'trial', 'active', now(), now() + interval '7 days')
+	`, uid); err != nil {
+		t.Fatalf("seed trial sub: %v", err)
+	}
+	// monthly is seeded CNY by setupPaymentDB; the PayPal channel requires
+	// USD (channelRequiredCurrency). Real intl-staging seeds monthly as USD
+	// (seed-intl-plans.sh) — mirror that here so the trial→paid order passes
+	// the currency gate.
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE plans SET currency = 'USD' WHERE id = 'monthly'
+	`); err != nil {
+		t.Fatalf("set monthly currency: %v", err)
+	}
+
+	// Trial user must be able to start their first paid order on paypal.
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal"); err != nil {
+		t.Fatalf("trial user's first paypal order must be allowed; got %v", err)
+	}
+}
+
 // TestCreateOrder_TrialPlanNotPurchasable: the trial plan is granted by
 // auth on first login and must never be orderable — even for a user
 // with no subscription at all. eligibilityAndInsertOrderTx rejects it
@@ -2587,6 +2621,98 @@ func TestPaymentService_OnWebhook_PaypalRenewal_UnknownSubscription(t *testing.T
 		`SELECT COUNT(*) FROM orders WHERE user_id = $1`, uid)
 	if orderCount != 0 {
 		t.Errorf("expected 0 orders, got %d", orderCount)
+	}
+}
+
+// TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit pins the
+// renewal amount/currency sanity audit (review users-1, 2026-08-17): a
+// below-plan or wrong-currency PAYMENT.SALE.COMPLETED must still process
+// the renewal (order + payment + expiry extension — plan-amount-override
+// and the L3 $4.99 renewals legitimately deviate) BUT write an audit row
+// so ops can spot a genuine undercharge. Note: setupPaymentDB seeds
+// monthly with currency='CNY' (migration default), so a USD renewal is
+// exactly the currency_mismatch case.
+func TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+
+	subID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'active', now() + interval '15 days', 'I-PP-AUDIT')
+	`, subID, uid); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		amount   float64
+		currency string
+		wantAudit string // audit action, or "" if none expected
+	}{
+		// USD vs monthly-plan CNY → currency_mismatch; amount 29.9 >= 19.9 CNY
+		// is not below-plan, so only the currency row is written.
+		{"wrong currency", 29.9, "USD", "paypal_renewal_currency_mismatch"},
+		// USD + below-plan amount → amount_below_plan (currency mismatch
+		// also fires, but the if/else-if structure logs currency first).
+		{"below plan amount", 1.0, "USD", "paypal_renewal_currency_mismatch"},
+		// CNY + below-plan → amount_below_plan only.
+		{"below plan amount same currency", 1.0, "CNY", "paypal_renewal_amount_below_plan"},
+		// CNY + at-plan amount → no audit.
+		{"matches plan", 19.9, "CNY", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			txnID := "txn-audit-" + mustNewUUID()[:8]
+			eventID := "evt-audit-" + mustNewUUID()[:8]
+			newExpAt := time.Now().Add(45 * 24 * time.Hour)
+			_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+				Channel: "paypal", EventID: eventID, EventType: "PAYMENT.SALE.COMPLETED",
+				TransactionID: txnID, ExternalSubscriptionID: "I-PP-AUDIT",
+				Amount: tc.amount, Currency: tc.currency,
+				SubExpiresAt: &newExpAt,
+				RawPayload:   json.RawMessage(`{}`),
+			})
+			if err != nil {
+				t.Fatalf("OnWebhook renewal: %v", err)
+			}
+
+			// Renewal must still be processed regardless of audit outcome:
+			// the payment row exists and expires_at advanced.
+			var payCount int
+			_ = db.GetContext(context.Background(), &payCount,
+				`SELECT COUNT(*) FROM payments WHERE channel='paypal' AND external_txn_id=$1`, txnID)
+			if payCount != 1 {
+				t.Errorf("renewal payment not created (count=%d); audit must not block processing", payCount)
+			}
+			var newExp time.Time
+			if err := db.GetContext(context.Background(), &newExp,
+				`SELECT expires_at FROM subscriptions WHERE id=$1`, subID); err != nil {
+				t.Fatalf("read sub: %v", err)
+			}
+			if newExp.Unix() != newExpAt.Unix() {
+				t.Errorf("expires_at: got %v, want %v (renewal must still extend)", newExp, newExpAt)
+			}
+
+			var auditCount int
+			// context.event_id 唯一标识本次 webhook 的 audit 行，避免串到
+			// 前面子用例的 audit（共享同一 DB）。
+			_ = db.GetContext(context.Background(), &auditCount,
+				`SELECT COUNT(*) FROM audit_log WHERE action=$1 AND context->>'event_id'=$2`, tc.wantAudit, eventID)
+			if tc.wantAudit == "" {
+				// No audit expected — assert no paypal_renewal audit for THIS event.
+				var anyAudit int
+				_ = db.GetContext(context.Background(), &anyAudit,
+					`SELECT COUNT(*) FROM audit_log WHERE action LIKE 'paypal_renewal_%' AND context->>'event_id'=$1`, eventID)
+				if anyAudit != 0 {
+					t.Errorf("expected no audit rows for this event, got %d", anyAudit)
+				}
+			} else if auditCount == 0 {
+				t.Errorf("expected audit action %q, got none", tc.wantAudit)
+			}
+		})
 	}
 }
 

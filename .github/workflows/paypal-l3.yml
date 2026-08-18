@@ -156,6 +156,20 @@ jobs:
           NGROK_PID=$!
           echo "ngrok pid=$NGROK_PID"
 
+          # Cleanup registers as soon as the FIRST background process is up
+          # (review users-1, 2026-08-17): previously the trap was installed
+          # after backend health-check, so a failure in between (ngrok URL
+          # fetch, webhook PATCH, backend startup) leaked ngrok+backend and
+          # left the sandbox webhook bound to a dead tunnel. EXIT trap runs
+          # on any exit (success, error, set -e bail), not just failures.
+          cleanup() {
+            local exit_code=$?
+            # ${VAR:-} guards the pre-backend window where the PID is unset.
+            kill "${BACKEND_PID:-}" "${NGROK_PID:-}" 2>/dev/null || true
+            return "$exit_code"
+          }
+          trap cleanup EXIT
+
           # Wait for ngrok to assign a public URL; tunnel is ready when
           # the admin API responds with at least one tunnel entry.
           for _ in $(seq 1 30); do
@@ -223,16 +237,6 @@ jobs:
             cat "$ARTIFACTS_DIR/backend.log" || true
             exit 1
           fi
-
-          # Cleanup runs unconditionally (set +e), so processes die even
-          # if the test exits non-zero. Without this `set -e` would skip
-          # the kill on failure and leak ngrok + the backend.
-          cleanup() {
-            local exit_code=$?
-            kill "$BACKEND_PID" "$NGROK_PID" 2>/dev/null || true
-            return "$exit_code"
-          }
-          trap cleanup EXIT
 
           # 3) playwright (foreground, the point-of-failure step).
           cd tests/e2e-ui

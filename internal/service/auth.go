@@ -644,9 +644,70 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 	return s.sessionRepo.Revoke(ctx, session.ID)
 }
 
+// refreshRotationGraceWindow bounds how long after a refresh-token rotation a
+// retry presenting the OLD token is treated as a legitimate lost-response
+// retry (the client never received the rotation response) rather than a token
+// replay. Sized for mobile clients on flaky networks: long enough for the
+// client's own timeout + one retry, short enough that a stolen-token replay
+// is still caught quickly. Refresh tokens are only usable within this window
+// after being rotated out.
+//
+// revoked_at is stamped by the DB clock (now()) while the comparison uses the
+// app server's clock — keep hosts on NTP; a skewed app clock shrinks (ahead)
+// or stretches (behind) the effective window.
+const refreshRotationGraceWindow = 60 * time.Second
+
+// maxRotationChainHops bounds the rotated_to chain walk in RefreshToken so a
+// pathological chain (or a bug writing a cycle) cannot loop forever. Repeated
+// lost responses produce one hop per lost rotation; real chains are 1-2 hops.
+const maxRotationChainHops = 10
+
+// graceSuccessor follows one rotated_to hop from a revoked session. It
+// returns ErrInvalidRefreshToken when the hop is not a legitimate
+// lost-response retry: the session was revoked outside the grace window, or
+// revoked by something other than a rotation (RevokedAt/RotatedTo NULL), or
+// the chain dangles. A DB error other than ErrNoRows is wrapped and returned
+// for the caller to surface as a 500 (no family revoke on transient errors).
+func (s *AuthService) graceSuccessor(ctx context.Context, cur *model.Session, now time.Time) (*model.Session, error) {
+	withinGrace := cur.RotatedTo != nil && cur.RevokedAt != nil &&
+		now.Sub(*cur.RevokedAt) <= refreshRotationGraceWindow
+	if !withinGrace {
+		return nil, ErrInvalidRefreshToken
+	}
+	next, err := s.sessionRepo.FindByID(ctx, *cur.RotatedTo)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Dangling chain — cannot happen with the rotated_to FK in place;
+		// treat as reuse rather than issuing tokens.
+		return nil, ErrInvalidRefreshToken
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find rotation successor: %w", err)
+	}
+	// Defence in depth: rotated_to is only ever written by RotateRefresh
+	// (same-user, refresh-type successor), so a mismatch means direct DB
+	// manipulation — refuse to cross identity or session-type boundaries.
+	if next.UserID != cur.UserID || next.SessionType != "refresh" {
+		return nil, ErrInvalidRefreshToken
+	}
+	return next, nil
+}
+
+// revokeFamilyForReuse revokes every active session for (userID, appID) after
+// confirmed refresh-token reuse. Best-effort: a failure is logged, not
+// surfaced, so the caller's 401 response is unaffected.
+func (s *AuthService) revokeFamilyForReuse(ctx context.Context, userID, appID string) {
+	if err := s.sessionRepo.RevokeFamilyByUserApp(ctx, userID, appID); err != nil {
+		log.Printf("refresh: family revoke failed: %v", err)
+	}
+}
+
 // RefreshToken refreshes access token using refresh token.
 func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID string) (*LoginResponse, error) {
-	session, err := s.sessionRepo.FindByRefreshToken(ctx, hashToken(refreshToken), "refresh")
+	// IncludeRevoked variant: a revoked-but-recently-rotated session is NOT
+	// immediately "invalid" — it may be a legitimate lost-response retry
+	// (mobile client never saw the rotation response). The grace-window
+	// decision happens at the rotation site below.
+	session, err := s.sessionRepo.FindByRefreshTokenIncludeRevoked(ctx, hashToken(refreshToken), "refresh")
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrInvalidRefreshToken
 	}
@@ -724,19 +785,73 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		Revoked:      false,
 		ExpiresAt:    now.Add(s.tokenSvc.RefreshTTL),
 	}
-	if err := s.sessionRepo.RotateRefresh(ctx, session.ID, newSession); err != nil {
-		// Refresh-token reuse detection: if RotateRefresh reports the old
-		// session was already revoked, the token we're holding has either
-		// been replayed or stolen. Revoke the entire (user, app) family so
-		// any other outstanding refresh tokens for this user become useless,
-		// then surface a generic 401.
-		if errors.Is(err, ErrSessionAlreadyRevoked) {
-			if revErr := s.sessionRepo.RevokeFamilyByUserApp(ctx, user.ID, appID); revErr != nil {
-				log.Printf("refresh: family revoke failed: %v", revErr)
+	// Rotate, with grace-window disambiguation for the already-revoked case.
+	// A revoked presented session means either (a) a lost-response retry —
+	// the rotation committed but the client never saw the response, so it
+	// legitimately retries with the old token — or (b) a token replay. Since
+	// only token hashes are stored we cannot re-issue the lost token; instead
+	// we walk the rotated_to chain (within refreshRotationGraceWindow) to the
+	// live successor and rotate THAT, issuing the client a fresh pair. A
+	// replay outside the window, or on a session revoked by something other
+	// than a rotation (logout, family revoke — rotated_to is NULL), is still
+	// treated as theft: revoke the whole (user, app) family and 401.
+	target := session
+	rotated := false
+	var reuseErr error
+	for hops := 0; hops < maxRotationChainHops && !rotated; hops++ {
+		if target.Revoked {
+			next, gerr := s.graceSuccessor(ctx, target, now)
+			if gerr != nil {
+				reuseErr = gerr
+				break
 			}
+			target = next
+			continue
+		}
+		if target.ExpiresAt.Before(now) {
+			// An EXPIRED chain tail is not evidence of theft (pre-020 an
+			// expired token was a silent 401 at lookup) — plain 401, no
+			// family revoke. Practically near-unreachable: the lookup
+			// already filters expiry, and a chain tail is ≤ grace-window
+			// old with an hours-long TTL.
 			return nil, ErrInvalidRefreshToken
 		}
-		return nil, fmt.Errorf("rotate refresh token: %w", err)
+		rerr := s.sessionRepo.RotateRefresh(ctx, target.ID, newSession)
+		if rerr == nil {
+			rotated = true
+			break
+		}
+		if !errors.Is(rerr, ErrSessionAlreadyRevoked) {
+			return nil, fmt.Errorf("rotate refresh token: %w", rerr)
+		}
+		// A concurrent rotation won the race between our lookup and our
+		// RotateRefresh — re-read the row and let the grace walk decide
+		// whether this is a legitimate retry.
+		fresh, ferr := s.sessionRepo.FindByID(ctx, target.ID)
+		if ferr != nil {
+			return nil, fmt.Errorf("re-read session after rotation race: %w", ferr)
+		}
+		target = fresh
+	}
+	if !rotated {
+		if reuseErr != nil && !errors.Is(reuseErr, ErrInvalidRefreshToken) {
+			// reuseErr is a DB error from the chain walk. Only confirmed
+			// reuse earns the family revoke — a transient DB failure must
+			// not nuke the user's sessions.
+			return nil, reuseErr
+		}
+		if reuseErr == nil {
+			// Hop limit exhausted on pure rotation-race contention without
+			// a confirmed reuse verdict — surface a 500 rather than
+			// revoking an innocent family.
+			return nil, fmt.Errorf("refresh rotation did not converge within %d hops", maxRotationChainHops)
+		}
+		// Confirmed reuse: revoke the compromised session's family — note
+		// this is session.AppID, NOT the caller-supplied appID, which is
+		// attacker-controlled and could otherwise point the revoke at the
+		// wrong (user, app) family while the compromised one stays live.
+		s.revokeFamilyForReuse(ctx, user.ID, session.AppID)
+		return nil, ErrInvalidRefreshToken
 	}
 
 	return &LoginResponse{

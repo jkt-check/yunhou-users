@@ -362,12 +362,25 @@ func TestTokenRefresh(t *testing.T) {
 		t.Fatal("new tokens are empty")
 	}
 
-	// Old refresh token should be revoked
+	// Within the rotation grace window (migration 020), retrying the OLD
+	// token is a legitimate lost-response retry: the server walks the
+	// rotated_to chain and rotates the live successor — 200, not 401.
 	oldRefreshResp := doJSON(t, http.MethodPost, srv.URL+"/auth/refresh", map[string]interface{}{
 		"refresh_token": refreshToken,
 	})
+	if oldRefreshResp.StatusCode != http.StatusOK {
+		t.Fatalf("grace-window retry with old refresh token: expected 200, got %d", oldRefreshResp.StatusCode)
+	}
+
+	// The same replay OUTSIDE the grace window is token reuse → 401.
+	if _, err := db.Exec(`UPDATE sessions SET revoked_at = now() - interval '5 minutes' WHERE revoked_at IS NOT NULL`); err != nil {
+		t.Fatalf("backdate revoked_at: %v", err)
+	}
+	oldRefreshResp = doJSON(t, http.MethodPost, srv.URL+"/auth/refresh", map[string]interface{}{
+		"refresh_token": refreshToken,
+	})
 	if oldRefreshResp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("expected 401 for old refresh token, got %d", oldRefreshResp.StatusCode)
+		t.Errorf("expected 401 for old refresh token beyond grace window, got %d", oldRefreshResp.StatusCode)
 	}
 }
 

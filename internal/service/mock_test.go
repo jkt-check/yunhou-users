@@ -506,6 +506,15 @@ type mockSessionRepo struct {
 	revokeErr   error
 	createCount int
 	failAfter   int // if >0, fail the Nth Create call
+	// findByIDErr, if non-nil, makes FindByID return it verbatim. Lets tests
+	// drive the "DB error mid grace-walk" branch without breaking the
+	// initial token lookup (which findErr would also break).
+	findByIDErr error
+	// rotateHook, if non-nil, runs at the top of RotateRefresh; a non-nil
+	// return short-circuits the default logic. Tests use it to simulate a
+	// concurrent rotation winning the race (mutating the old session into
+	// revoked-with-successor state, then returning the sentinel).
+	rotateHook func(oldID string, newSession *model.Session) error
 }
 
 func newMockSessionRepo() *mockSessionRepo {
@@ -547,13 +556,51 @@ func (m *mockSessionRepo) FindByRefreshToken(_ context.Context, token string, se
 	return s, nil
 }
 
+// FindByRefreshTokenIncludeRevoked mirrors the production SQL of the same
+// name: same token/type/expiry filters as FindByRefreshToken but WITHOUT the
+// revoked filter, so the grace-window logic in RefreshToken can inspect
+// revoked-but-recently-rotated sessions.
+func (m *mockSessionRepo) FindByRefreshTokenIncludeRevoked(_ context.Context, token string, sessionType string) (*model.Session, error) {
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+	s, ok := m.byToken[token]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	if s.ExpiresAt.Before(time.Now()) {
+		return nil, sql.ErrNoRows
+	}
+	return s, nil
+}
+
+func (m *mockSessionRepo) FindByID(_ context.Context, id string) (*model.Session, error) {
+	if m.findByIDErr != nil {
+		return nil, m.findByIDErr
+	}
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+	s, ok := m.sessions[id]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	return s, nil
+}
+
 func (m *mockSessionRepo) Revoke(_ context.Context, id string) error {
 	if m.revokeErr != nil {
 		return m.revokeErr
 	}
-	s, ok := m.sessions[id]
-	if ok {
+	if s, ok := m.sessions[id]; ok {
 		s.Revoked = true
+		if s.RevokedAt == nil {
+			// Mirrors the production COALESCE: the first revocation
+			// timestamp wins, so re-revoking a rotated session can't
+			// re-open the grace window.
+			now := time.Now()
+			s.RevokedAt = &now
+		}
 	}
 	return nil
 }
@@ -566,11 +613,18 @@ func (m *mockSessionRepo) RevokeIfNotRevoked(_ context.Context, id string) (bool
 	if !ok || s.Revoked {
 		return false, nil
 	}
+	now := time.Now()
 	s.Revoked = true
+	s.RevokedAt = &now
 	return true, nil
 }
 
 func (m *mockSessionRepo) RotateRefresh(_ context.Context, oldID string, newSession *model.Session) error {
+	if m.rotateHook != nil {
+		if err := m.rotateHook(oldID, newSession); err != nil {
+			return err
+		}
+	}
 	if m.createErr != nil {
 		return m.createErr
 	}
@@ -580,9 +634,15 @@ func (m *mockSessionRepo) RotateRefresh(_ context.Context, oldID string, newSess
 	}
 	s, ok := m.sessions[oldID]
 	if !ok || s.Revoked {
-		return fmt.Errorf("session already revoked")
+		// Mirrors the production sentinel so service code can match with
+		// errors.Is — a plain error here would silently break reuse
+		// detection at the call site.
+		return model.ErrSessionAlreadyRevoked
 	}
+	now := time.Now()
 	s.Revoked = true
+	s.RevokedAt = &now
+	s.RotatedTo = &newSession.ID
 	m.sessions[newSession.ID] = newSession
 	m.byToken[newSession.RefreshToken] = newSession
 	return nil
@@ -600,16 +660,20 @@ func (m *mockSessionRepo) ExchangeAuthCode(_ context.Context, oldID string, newS
 	if !ok || s.Revoked {
 		return false, nil
 	}
+	now := time.Now()
 	s.Revoked = true
+	s.RevokedAt = &now
 	m.sessions[newSession.ID] = newSession
 	m.byToken[newSession.RefreshToken] = newSession
 	return true, nil
 }
 
 func (m *mockSessionRepo) RevokeFamilyByUserApp(_ context.Context, userID, appID string) error {
+	now := time.Now()
 	for _, s := range m.sessions {
 		if s.UserID == userID && s.AppID == appID && !s.Revoked {
 			s.Revoked = true
+			s.RevokedAt = &now
 		}
 	}
 	return nil

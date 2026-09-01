@@ -411,6 +411,282 @@ func TestAuthService_RefreshToken(t *testing.T) {
 	}
 }
 
+// TestAuthService_RefreshToken_RotationGrace covers the lost-response retry
+// window (kaya on a flaky network): when a rotation commits but the response
+// never reaches the client, the client's retry presents the OLD token, whose
+// session is already revoked. Within refreshRotationGraceWindow this is a
+// legitimate retry — the server walks the rotated_to chain to the live
+// successor and rotates THAT, issuing a fresh pair. Outside the window, or
+// when the chain is broken (no rotated_to link), the replay is treated as
+// token theft: family revoke + 401.
+func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	seedBase := func(ur *mockUserRepo, pr *mockPlanRepo, ar *mockAppRepo) {
+		ur.users["user-g"] = &model.User{ID: "user-g", Status: "active"}
+		pr.plans["free"] = &model.Plan{ID: "free", Name: "免费", Apps: []string{"yundian"}, IsActive: true}
+		ar.seedActive("yundian", "云店")
+	}
+	put := func(ssr *mockSessionRepo, s *model.Session) {
+		ssr.sessions[s.ID] = s
+		ssr.byToken[s.RefreshToken] = s
+	}
+	liveSess := func(id, token string) *model.Session {
+		return &model.Session{
+			ID: id, UserID: "user-g", AppID: "yundian", SessionType: "refresh",
+			RefreshToken: hashToken(token), Revoked: false, ExpiresAt: time.Now().Add(time.Hour),
+		}
+	}
+	revokedSess := func(id, token string, revokedAgo time.Duration, rotatedTo *string) *model.Session {
+		s := liveSess(id, token)
+		s.Revoked = true
+		at := time.Now().Add(-revokedAgo)
+		s.RevokedAt = &at
+		s.RotatedTo = rotatedTo
+		return s
+	}
+
+	t.Run("lost-response retry within grace rotates the successor", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		old := revokedSess("sess-old", "old-token", 5*time.Second, stringPtr("sess-successor"))
+		successor := liveSess("sess-successor", "successor-token")
+		sibling := liveSess("sess-sibling", "sibling-token") // same family, must survive
+		put(ssr, old)
+		put(ssr, successor)
+		put(ssr, sibling)
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		resp, err := svc.RefreshToken(ctx, "old-token", "yundian")
+		if err != nil {
+			t.Fatalf("in-grace retry must succeed, got %v", err)
+		}
+		if resp.AccessToken == "" || resp.RefreshToken == "" {
+			t.Error("expected a fresh token pair")
+		}
+		// The successor was consumed by a fresh rotation and now points at
+		// the newly minted session.
+		if !ssr.sessions["sess-successor"].Revoked {
+			t.Error("expected successor session to be rotated (revoked)")
+		}
+		next := ssr.sessions["sess-successor"].RotatedTo
+		if next == nil {
+			t.Fatal("expected successor.RotatedTo to link to the new session")
+		}
+		fresh, ok := ssr.sessions[*next]
+		if !ok || fresh.Revoked {
+			t.Errorf("expected live freshly-rotated session at %v, got %+v", next, fresh)
+		}
+		// Crucially: NO family revoke — the sibling stays usable.
+		if ssr.sessions["sess-sibling"].Revoked {
+			t.Error("in-grace retry must NOT revoke the family")
+		}
+	})
+
+	t.Run("replay outside grace revokes the family", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		old := revokedSess("sess-old", "old-token", 2*time.Hour, stringPtr("sess-successor"))
+		successor := liveSess("sess-successor", "successor-token")
+		sibling := liveSess("sess-sibling", "sibling-token")
+		put(ssr, old)
+		put(ssr, successor)
+		put(ssr, sibling)
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		_, err := svc.RefreshToken(ctx, "old-token", "yundian")
+		if !errors.Is(err, ErrInvalidRefreshToken) {
+			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
+		}
+		// Real replay → the whole (user, app) family is revoked.
+		if !ssr.sessions["sess-sibling"].Revoked {
+			t.Error("expected family revoke: sibling still live")
+		}
+		if !ssr.sessions["sess-successor"].Revoked {
+			t.Error("expected family revoke: successor still live")
+		}
+	})
+
+	t.Run("revoked without rotated_to link revokes the family", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		// Recently revoked but no successor link — e.g. an explicit logout.
+		// A replay here is NOT a lost-response retry; treat as reuse.
+		old := revokedSess("sess-old", "old-token", 5*time.Second, nil)
+		sibling := liveSess("sess-sibling", "sibling-token")
+		put(ssr, old)
+		put(ssr, sibling)
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		_, err := svc.RefreshToken(ctx, "old-token", "yundian")
+		if !errors.Is(err, ErrInvalidRefreshToken) {
+			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
+		}
+		if !ssr.sessions["sess-sibling"].Revoked {
+			t.Error("expected family revoke: sibling still live")
+		}
+	})
+
+	t.Run("double lost-response retry walks the rotated_to chain", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		// Two rotations committed but both responses were lost: old → mid → live.
+		old := revokedSess("sess-old", "old-token", 5*time.Second, stringPtr("sess-mid"))
+		mid := revokedSess("sess-mid", "mid-token", 3*time.Second, stringPtr("sess-successor"))
+		successor := liveSess("sess-successor", "successor-token")
+		sibling := liveSess("sess-sibling", "sibling-token")
+		put(ssr, old)
+		put(ssr, mid)
+		put(ssr, successor)
+		put(ssr, sibling)
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		resp, err := svc.RefreshToken(ctx, "old-token", "yundian")
+		if err != nil {
+			t.Fatalf("chain walk within grace must succeed, got %v", err)
+		}
+		if resp.RefreshToken == "" {
+			t.Error("expected a fresh refresh token")
+		}
+		if !ssr.sessions["sess-successor"].Revoked {
+			t.Error("expected chain end to be rotated")
+		}
+		if ssr.sessions["sess-sibling"].Revoked {
+			t.Error("in-grace chain walk must NOT revoke the family")
+		}
+	})
+
+	t.Run("concurrent rotation race recovers via grace path", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		// Session is live at lookup time, but a concurrent request rotates
+		// it before our RotateRefresh lands — RotateRefresh reports
+		// ErrSessionAlreadyRevoked. The grace path must re-read the session,
+		// follow rotated_to, and rotate the successor instead of 401ing.
+		sess := liveSess("sess-race", "race-token")
+		put(ssr, sess)
+		ssr.rotateHook = func(oldID string, _ *model.Session) error {
+			ssr.rotateHook = nil // one-shot
+			s := ssr.sessions[oldID]
+			now := time.Now()
+			s.Revoked = true
+			s.RevokedAt = &now
+			succ := liveSess("sess-race-successor", "race-successor-token")
+			s.RotatedTo = &succ.ID
+			put(ssr, succ)
+			return model.ErrSessionAlreadyRevoked
+		}
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		resp, err := svc.RefreshToken(ctx, "race-token", "yundian")
+		if err != nil {
+			t.Fatalf("race within grace must recover, got %v", err)
+		}
+		if resp.RefreshToken == "" {
+			t.Error("expected a fresh refresh token")
+		}
+		if !ssr.sessions["sess-race-successor"].Revoked {
+			t.Error("expected the concurrent successor to be rotated")
+		}
+	})
+
+	t.Run("DB error mid chain-walk surfaces 500 without family revoke", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		old := revokedSess("sess-old", "old-token", 5*time.Second, stringPtr("sess-successor"))
+		successor := liveSess("sess-successor", "successor-token")
+		sibling := liveSess("sess-sibling", "sibling-token")
+		put(ssr, old)
+		put(ssr, successor)
+		put(ssr, sibling)
+		// The token lookup succeeds (revoked session IS returned by the
+		// include-revoked lookup), but the chain walk's FindByID fails.
+		ssr.findByIDErr = errors.New("db blip")
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		_, err := svc.RefreshToken(ctx, "old-token", "yundian")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if errors.Is(err, ErrInvalidRefreshToken) {
+			t.Errorf("transient DB error must NOT surface as 401, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "find rotation successor") {
+			t.Errorf("expected wrap 'find rotation successor', got %q", err.Error())
+		}
+		// Crucially: no family revoke on a transient error — the user's
+		// other sessions survive a DB blip.
+		if ssr.sessions["sess-sibling"].Revoked || ssr.sessions["sess-successor"].Revoked {
+			t.Error("transient DB error must NOT revoke the family")
+		}
+	})
+
+	t.Run("family revoke targets the compromised session's app, not the request app", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		ar.seedActive("yundash", "云dash")
+		// The stolen token belongs to the yundian family; the replay passes
+		// a DIFFERENT active app in the request body.
+		old := revokedSess("sess-old", "old-token", 2*time.Hour, stringPtr("sess-successor"))
+		successor := liveSess("sess-successor", "successor-token")
+		sibling := liveSess("sess-sibling", "sibling-token") // same yundian family
+		put(ssr, old)
+		put(ssr, successor)
+		put(ssr, sibling)
+		otherApp := liveSess("sess-otherapp", "otherapp-token")
+		otherApp.AppID = "yundash"
+		put(ssr, otherApp)
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		_, err := svc.RefreshToken(ctx, "old-token", "yundash")
+		if !errors.Is(err, ErrInvalidRefreshToken) {
+			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
+		}
+		// The compromised yundian family is revoked…
+		if !ssr.sessions["sess-sibling"].Revoked || !ssr.sessions["sess-successor"].Revoked {
+			t.Error("expected the compromised yundian family to be revoked")
+		}
+		// …and the request-supplied yundash family is NOT the revoke target.
+		if ssr.sessions["sess-otherapp"].Revoked {
+			t.Error("family revoke must not follow the request-supplied app_id")
+		}
+	})
+
+	t.Run("successor owned by a different user is treated as reuse", func(t *testing.T) {
+		t.Parallel()
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		seedBase(ur, pr, ar)
+		old := revokedSess("sess-old", "old-token", 5*time.Second, stringPtr("sess-successor"))
+		successor := liveSess("sess-successor", "successor-token")
+		successor.UserID = "someone-else" // tampered chain (DB manipulation)
+		sibling := liveSess("sess-sibling", "sibling-token")
+		put(ssr, old)
+		put(ssr, successor)
+		put(ssr, sibling)
+
+		svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
+		_, err := svc.RefreshToken(ctx, "old-token", "yundian")
+		if !errors.Is(err, ErrInvalidRefreshToken) {
+			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
+		}
+		// The grace walk must NOT have rotated the foreign session.
+		if ssr.sessions["sess-successor"].Revoked {
+			t.Error("must not rotate a successor owned by another user")
+		}
+		if !ssr.sessions["sess-sibling"].Revoked {
+			t.Error("expected family revoke on tampered chain")
+		}
+	})
+}
+
 func TestGenerateRefreshToken_Unique(t *testing.T) {
 	t.Parallel()
 

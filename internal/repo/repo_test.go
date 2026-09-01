@@ -1005,6 +1005,94 @@ func TestSessionRepo_RotateRefresh(t *testing.T) {
 	if got.ID != newSess.ID {
 		t.Errorf("new session ID = %v, want %v", got.ID, newSess.ID)
 	}
+
+	// The old row carries the rotation metadata the grace-window logic in
+	// AuthService.RefreshToken depends on: revoked_at within the last few
+	// seconds and rotated_to pointing at the new session.
+	oldRow, err := r.FindByID(context.Background(), s.ID)
+	if err != nil {
+		t.Fatalf("FindByID(old): %v", err)
+	}
+	if oldRow.RevokedAt == nil {
+		t.Error("old session: revoked_at is NULL, want set by rotation")
+	} else if time.Since(*oldRow.RevokedAt) > time.Minute {
+		t.Errorf("old session: revoked_at = %v, want ~now", *oldRow.RevokedAt)
+	}
+	if oldRow.RotatedTo == nil || *oldRow.RotatedTo != newSess.ID {
+		t.Errorf("old session: rotated_to = %v, want %v", oldRow.RotatedTo, newSess.ID)
+	}
+}
+
+// TestSessionRepo_FindByRefreshTokenIncludeRevoked pins the lookup used by
+// the grace-window path: revoked (but unexpired) sessions ARE returned,
+// expired sessions are NOT.
+func TestSessionRepo_FindByRefreshTokenIncludeRevoked(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), alice)
+	r := NewSessionRepo(db)
+
+	tokHash := fmt.Sprintf("h-%s", newUUID())
+	s := &model.Session{
+		ID: newUUID(), UserID: alice.ID, AppID: "yundian",
+		SessionType: "refresh", RefreshToken: tokHash, Scope: pq.StringArray{"yundian"},
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	}
+	if err := r.Create(context.Background(), s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := r.Revoke(context.Background(), s.ID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	got, err := r.FindByRefreshTokenIncludeRevoked(context.Background(), tokHash, "refresh")
+	if err != nil {
+		t.Fatalf("revoked-but-unexpired session must be returned: %v", err)
+	}
+	if !got.Revoked || got.ID != s.ID {
+		t.Errorf("got %+v, want revoked session %v", got, s.ID)
+	}
+
+	// Expired rows stay invisible even to the include-revoked lookup.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE sessions SET expires_at = now() - interval '1 hour' WHERE id = $1`, s.ID); err != nil {
+		t.Fatalf("expire session: %v", err)
+	}
+	_, err = r.FindByRefreshTokenIncludeRevoked(context.Background(), tokHash, "refresh")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expired session: err = %v, want ErrNoRows", err)
+	}
+}
+
+func TestSessionRepo_FindByID(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), alice)
+	r := NewSessionRepo(db)
+
+	s := &model.Session{
+		ID: newUUID(), UserID: alice.ID, AppID: "yundian",
+		SessionType: "refresh", RefreshToken: fmt.Sprintf("h-%s", newUUID()), Scope: pq.StringArray{"yundian"},
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	}
+	if err := r.Create(context.Background(), s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := r.FindByID(context.Background(), s.ID)
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if got.ID != s.ID {
+		t.Errorf("got %v, want %v", got.ID, s.ID)
+	}
+
+	_, err = r.FindByID(context.Background(), newUUID())
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("missing id: err = %v, want ErrNoRows", err)
+	}
 }
 
 func TestSessionRepo_RotateRefresh_AlreadyRevoked(t *testing.T) {
@@ -1030,6 +1118,13 @@ func TestSessionRepo_RotateRefresh_AlreadyRevoked(t *testing.T) {
 	err := r.RotateRefresh(context.Background(), s.ID, newSess)
 	if !errors.Is(err, model.ErrSessionAlreadyRevoked) {
 		t.Errorf("err = %v, want ErrSessionAlreadyRevoked", err)
+	}
+	// The tx rolls back on the sentinel, so the INSERT-first successor row
+	// must NOT survive — otherwise a failed rotation would leak a live
+	// session whose token was never issued.
+	_, err = r.FindByRefreshToken(context.Background(), "new-hash", "refresh")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("rolled-back successor: err = %v, want ErrNoRows", err)
 	}
 }
 

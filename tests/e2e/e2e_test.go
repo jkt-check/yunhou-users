@@ -42,7 +42,7 @@ func TestLoginFlow(t *testing.T) {
 
 // TestAuthRefresh exercises token refresh with rotation.
 func TestAuthRefresh(t *testing.T) {
-	engine, _, _ := setupE2EServer(t)
+	engine, _, db := setupE2EServer(t)
 
 	// Login first
 	r := loginAndGetTokens(t, engine, "refresh-test-user", "yundian")
@@ -65,11 +65,13 @@ func TestAuthRefresh(t *testing.T) {
 		t.Fatal("refreshed tokens are empty")
 	}
 
-	// Old refresh token should be revoked
+	// Within the rotation grace window (migration 020), retrying the OLD
+	// token is a legitimate lost-response retry: the server walks the
+	// rotated_to chain and rotates the live successor — 200, not 401.
 	oldRefreshBody := `{"refresh_token":"` + refresh + `"}`
 	resp = doRequest(t, engine, http.MethodPost, "/auth/refresh", oldRefreshBody, nil)
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("reuse old refresh token: expected 401, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("grace-window retry with old refresh token: expected 200, got %d", resp.StatusCode)
 	}
 
 	// New refresh token works
@@ -77,6 +79,16 @@ func TestAuthRefresh(t *testing.T) {
 	resp = doRequest(t, engine, http.MethodPost, "/auth/refresh", newRefreshBody, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("new refresh token: expected 200, got %d", resp.StatusCode)
+	}
+
+	// The same replay OUTSIDE the grace window is token reuse → 401
+	// (and revokes the family — nothing is used afterwards).
+	if _, err := db.Exec(`UPDATE sessions SET revoked_at = now() - interval '5 minutes' WHERE revoked_at IS NOT NULL`); err != nil {
+		t.Fatalf("backdate revoked_at: %v", err)
+	}
+	resp = doRequest(t, engine, http.MethodPost, "/auth/refresh", oldRefreshBody, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("reuse old refresh token beyond grace window: expected 401, got %d", resp.StatusCode)
 	}
 }
 

@@ -212,11 +212,23 @@ func TestE2E_RefreshRotatesToken(t *testing.T) {
 		t.Errorf("refresh token did not rotate")
 	}
 
-	// Old refresh should be revoked.
+	// Within the grace window (migration 020), retrying the old token is a
+	// legitimate lost-response retry — the rotated_to chain walk rotates
+	// the successor and returns 200 with a fresh pair.
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/auth/refresh",
+		`{"refresh_token":"`+refresh+`","app_id":"yundian"}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("after rotate, old refresh within grace window: %d, want 200", resp.StatusCode)
+	}
+
+	// The same replay OUTSIDE the grace window is reuse → 401.
+	if _, err := srv.DB.Exec(`UPDATE sessions SET revoked_at = now() - interval '5 minutes' WHERE revoked_at IS NOT NULL`); err != nil {
+		t.Fatalf("backdate revoked_at: %v", err)
+	}
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/auth/refresh",
 		`{"refresh_token":"`+refresh+`","app_id":"yundian"}`, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("after rotate, old refresh: %d, want 401", resp.StatusCode)
+		t.Errorf("after grace window, old refresh: %d, want 401", resp.StatusCode)
 	}
 }
 
@@ -252,7 +264,9 @@ func TestE2E_ProfilePatch(t *testing.T) {
 	})
 }
 
-// TestE2E_RefreshReuseFamilyRevoke tests the security response.
+// TestE2E_RefreshReuseFamilyRevoke tests the security response: a refresh
+// replay OUTSIDE the rotation grace window is confirmed reuse → 401 and the
+// whole (user, app) session family is revoked.
 func TestE2E_RefreshReuseFamilyRevoke(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
 	r := loginAndGetTokens(t, srv.Engine, "reuse-test", "yundian")
@@ -264,12 +278,31 @@ func TestE2E_RefreshReuseFamilyRevoke(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first refresh: %d", resp.StatusCode)
 	}
+	var refreshResp struct {
+		Data struct {
+			RefreshToken string `json:"refresh_token"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &refreshResp)
 
-	// Now the old refresh is revoked; re-using it should 401.
+	// Push the rotation beyond the grace window; within the window a retry
+	// with the old token would be a legitimate lost-response retry.
+	if _, err := srv.DB.Exec(`UPDATE sessions SET revoked_at = now() - interval '5 minutes' WHERE revoked_at IS NOT NULL`); err != nil {
+		t.Fatalf("backdate revoked_at: %v", err)
+	}
+
+	// Re-using the old refresh beyond the grace window should 401.
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/auth/refresh",
 		`{"refresh_token":"`+refresh+`","app_id":"yundian"}`, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("after rotate, old refresh: %d, want 401", resp.StatusCode)
+		t.Errorf("after grace window, old refresh: %d, want 401", resp.StatusCode)
+	}
+
+	// Family revoke: the rotated successor is dead too.
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/auth/refresh",
+		`{"refresh_token":"`+refreshResp.Data.RefreshToken+`","app_id":"yundian"}`, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("after reuse, successor refresh: %d, want 401 (family revoked)", resp.StatusCode)
 	}
 }
 

@@ -112,7 +112,13 @@ type SubscriptionRepo interface {
 
 type SessionRepo interface {
 	Create(ctx context.Context, s *model.Session) error
+	FindByID(ctx context.Context, id string) (*model.Session, error)
 	FindByRefreshToken(ctx context.Context, token, sessionType string) (*model.Session, error)
+	// FindByRefreshTokenIncludeRevoked is FindByRefreshToken WITHOUT the
+	// revoked filter (the expiry filter stays). AuthService.RefreshToken uses
+	// it so the grace-window logic can distinguish a lost-response retry
+	// (recently rotated, rotated_to set) from a real replay.
+	FindByRefreshTokenIncludeRevoked(ctx context.Context, token, sessionType string) (*model.Session, error)
 	Revoke(ctx context.Context, id string) error
 	RevokeIfNotRevoked(ctx context.Context, id string) (bool, error)
 	RotateRefresh(ctx context.Context, oldID string, newSession *model.Session) error
@@ -641,7 +647,7 @@ func (r *sessionRepo) Create(ctx context.Context, s *model.Session) error {
 // revoking the whole family limits the blast radius of a stolen token.
 func (r *sessionRepo) RevokeFamilyByUserApp(ctx context.Context, userID, appID string) error {
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE sessions SET revoked = true
+		UPDATE sessions SET revoked = true, revoked_at = now()
 		WHERE user_id = $1 AND app_id = $2 AND revoked = false
 	`, userID, appID)
 	return err
@@ -658,16 +664,44 @@ func (r *sessionRepo) FindByRefreshToken(ctx context.Context, token, sessionType
 	return &s, nil
 }
 
+// FindByRefreshTokenIncludeRevoked mirrors FindByRefreshToken but drops the
+// `revoked = false` filter (the expiry filter stays — an expired token is
+// invalid regardless of rotation state). Used by RefreshToken so the
+// grace-window logic can inspect a revoked-but-recently-rotated session and
+// walk its rotated_to chain.
+func (r *sessionRepo) FindByRefreshTokenIncludeRevoked(ctx context.Context, token, sessionType string) (*model.Session, error) {
+	var s model.Session
+	err := r.db.GetContext(ctx, &s, `
+		SELECT * FROM sessions WHERE refresh_token = $1 AND session_type = $2 AND expires_at > $3
+	`, token, sessionType, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (r *sessionRepo) FindByID(ctx context.Context, id string) (*model.Session, error) {
+	var s model.Session
+	err := r.db.GetContext(ctx, &s, `SELECT * FROM sessions WHERE id = $1`, id)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 func (r *sessionRepo) Revoke(ctx context.Context, id string) error {
+	// COALESCE preserves the FIRST revocation timestamp: overwriting
+	// revoked_at on an already-revoked (e.g. rotated) session would silently
+	// re-open the refresh grace window the reuse-detection logic relies on.
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE sessions SET revoked = true WHERE id = $1
+		UPDATE sessions SET revoked = true, revoked_at = COALESCE(revoked_at, now()) WHERE id = $1
 	`, id)
 	return err
 }
 
 func (r *sessionRepo) RevokeIfNotRevoked(ctx context.Context, id string) (bool, error) {
 	result, err := r.db.ExecContext(ctx, `
-		UPDATE sessions SET revoked = true WHERE id = $1 AND revoked = false
+		UPDATE sessions SET revoked = true, revoked_at = now() WHERE id = $1 AND revoked = false
 	`, id)
 	if err != nil {
 		return false, err
@@ -686,9 +720,23 @@ func (r *sessionRepo) RotateRefresh(ctx context.Context, oldID string, newSessio
 	}
 	defer tx.Rollback()
 
+	// INSERT the successor first: the old row's rotated_to FK references it,
+	// so it must exist before the UPDATE below (the FK is not deferred).
+	_, err = tx.NamedExecContext(ctx, `
+		INSERT INTO sessions (id, user_id, app_id, session_type, refresh_token, scope, revoked, expires_at)
+		VALUES (:id, :user_id, :app_id, :session_type, :refresh_token, :scope, :revoked, :expires_at)
+	`, newSession)
+	if err != nil {
+		return err
+	}
+
+	// revoked_at + rotated_to feed the grace-window disambiguation in
+	// AuthService.RefreshToken: a retry within the window follows rotated_to
+	// instead of being treated as a replay.
 	res, err := tx.ExecContext(ctx, `
-		UPDATE sessions SET revoked = true WHERE id = $1 AND revoked = false
-	`, oldID)
+		UPDATE sessions SET revoked = true, revoked_at = now(), rotated_to = $2
+		WHERE id = $1 AND revoked = false
+	`, oldID, newSession.ID)
 	if err != nil {
 		return err
 	}
@@ -698,18 +746,10 @@ func (r *sessionRepo) RotateRefresh(ctx context.Context, oldID string, newSessio
 	}
 	if n == 0 {
 		// Return the sentinel directly so AuthService can match with
-		// errors.Is and trigger the family-revoke response. A plain
-		// fmt.Errorf here would silently break refresh-token reuse
+		// errors.Is and trigger the grace-window / family-revoke decision.
+		// A plain fmt.Errorf here would silently break refresh-token reuse
 		// detection (errors.Is only matches via %w).
 		return model.ErrSessionAlreadyRevoked
-	}
-
-	_, err = tx.NamedExecContext(ctx, `
-		INSERT INTO sessions (id, user_id, app_id, session_type, refresh_token, scope, revoked, expires_at)
-		VALUES (:id, :user_id, :app_id, :session_type, :refresh_token, :scope, :revoked, :expires_at)
-	`, newSession)
-	if err != nil {
-		return err
 	}
 
 	return tx.Commit()
@@ -723,7 +763,7 @@ func (r *sessionRepo) ExchangeAuthCode(ctx context.Context, oldID string, newSes
 	defer tx.Rollback()
 
 	res, err := tx.ExecContext(ctx, `
-		UPDATE sessions SET revoked = true WHERE id = $1 AND revoked = false
+		UPDATE sessions SET revoked = true, revoked_at = now() WHERE id = $1 AND revoked = false
 	`, oldID)
 	if err != nil {
 		return false, err

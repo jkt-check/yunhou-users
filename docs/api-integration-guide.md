@@ -464,6 +464,54 @@ Authorization: Bearer <access_token>
 | 400 | `already cancelled` | 订阅已经处于 `cancelled` 状态 |
 | 404 | `subscription not found` | ID 不存在或不属于当前用户 |
 
+#### POST /user/usage/heartbeat
+
+使用统计心跳（设计文档见 yunhou-terminal 仓库 `docs/superpowers/specs/2026-09-04-usage-analytics-design.md`）。登录客户端（kaya）每 5 分钟上报一拍应用存活心跳；断网时客户端缓冲，恢复后批量补发（≤100 条/请求）。**未登录用户不上报**；payload 刻意不含 nickname/email/会话内容等任何 PII，身份只从 JWT 取（`sub` → user_id、`app_id`），客户端自报身份无效。
+
+**限流**：独立桶 30 次/分钟（突发 10），**按用户**（JWT subject）而非按 IP——同一 NAT 后的用户互不挤占。
+
+**请求体**：
+
+```json
+{
+  "beats": [
+    {
+      "client_event_id": "3f6b0d4e-7c2a-4c1a-9a4b-2f2c0d5e8a11",
+      "occurred_at": "2026-09-04T10:00:00+08:00",
+      "local_date": "2026-09-04",
+      "active_seconds": 300,
+      "platform": "macos",
+      "app_version": "2.1.14"
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `client_event_id` | 每拍一个 UUIDv4，幂等键：`(user_id, client_event_id)` 唯一约束，重试/补发的重复拍会被吞掉（仍返回 200） |
+| `occurred_at` | 拍发生时刻（RFC3339） |
+| `local_date` | **客户端本地日期**（YYYY-MM-DD），该拍的 `active_seconds` 计入这一天；统计日界以此为准 |
+| `active_seconds` | 距上次成功心跳的存活秒数，客户端每拍封顶 300；服务端接受 0–3600 |
+| `platform` | `macos` / `windows` / `linux` |
+| `app_version` | 客户端版本号（≤64 字符） |
+
+**响应（200）**：
+
+```json
+{"code": 0, "data": {"accepted": 2, "inserted": 1}}
+```
+
+`accepted` 为本次通过校验的拍数，`inserted` 为实际落库数（二者之差即被幂等约束吞掉的重复拍）。
+
+**错误响应**：
+
+| HTTP | message | 触发条件 |
+|------|---------|----------|
+| 400 | `beats is required` / `too many beats` / `invalid client_event_id` / `invalid local_date` / `active_seconds out of range` / `invalid platform` / `invalid app_version` | 请求体或字段越界 |
+| 401 | （JWTAuth 统一返回） | 未携带或过期 JWT |
+| 429 | `too many requests` | 超过每用户 30 次/分钟 |
+
 ---
 
 ### Chat 接口
@@ -1085,6 +1133,58 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 3. 旧 secret 立即失效，中间没有 grace period
 
 如果怀疑旧 secret 泄漏（例如 BFF 容器镜像被 pull 过），立即 rotate 即可，无需改 `app_id`。
+
+#### GET /admin/stats/active
+
+活跃用户统计（DAU/WAU/MAU），基于 `usage_events` 心跳表。日界按**客户端本地日期**（`local_date`），与 `/admin/stats/new-users` 的服务器时区口径不同。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `date` | 否 | 基准日 YYYY-MM-DD，默认今天（服务器时区） |
+| `granularity` | 否 | `day`（默认，当天 DAU）/ `week`（`[date-6, date]` 共 7 天 WAU）/ `month`（`[date-29, date]` 共 30 天 MAU） |
+| `group_by` | 否 | `platform` / `app_version`，按维度拆分；`total` 为各组之和（同一用户跨平台会重复计入，与未分组口径不同） |
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "date": "2026-09-04", "from": "2026-08-30", "to": "2026-09-04",
+    "granularity": "week", "group_by": "platform", "total": 8,
+    "groups": [{"group": "macos", "users": 5}, {"group": "windows", "users": 3}]
+  }
+}
+```
+
+#### GET /admin/stats/usage-duration
+
+使用时长统计（应用存活时长口径，非交互活跃）。`from` / `to` 必填（闭区间，跨度 ≤366 天），`granularity` = `day`（默认）/ `month`，`group_by` 可选。
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": [
+    {"period": "2026-09-04", "total_seconds": 900, "active_users": 2, "per_user_seconds": 450}
+  ]
+}
+```
+
+`period` 在 `day` 粒度下为 YYYY-MM-DD，`month` 粒度下为 YYYY-MM；`per_user_seconds = total_seconds / active_users`。
+
+#### GET /admin/stats/new-users
+
+新增用户统计，直查 `users.created_at` 按天分组（**服务器时区**日界）。`from` / `to` 必填（闭区间）。
+
+**响应（200）**：
+
+```json
+{"code": 0, "data": [{"date": "2026-09-04", "users": 5}]}
+```
+
+三个统计接口的参数错误均返回 400（message 带具体原因），日期格式为 YYYY-MM-DD，`granularity` / `group_by` 为白名单枚举。
 
 ---
 

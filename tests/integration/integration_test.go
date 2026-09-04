@@ -82,7 +82,7 @@ func setupDB(t *testing.T) *sqlx.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	tables := []string{"sessions", "subscriptions", "social_identities", "plans", "apps", "users"}
+	tables := []string{"usage_events", "plan_change_log", "refunds", "payments", "webhook_events", "audit_log", "orders", "sessions", "subscriptions", "social_identities", "plans", "apps", "users"}
 	for _, tbl := range tables {
 		db.ExecContext(context.Background(), "DELETE FROM "+tbl)
 	}
@@ -179,7 +179,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
-		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false)
+		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)))
 
 	return httptest.NewServer(engine)
 }
@@ -754,7 +754,7 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, service.NewUsageService(repo.NewUsageRepo(db)))
 
 	return httptest.NewServer(engine)
 }

@@ -175,6 +175,11 @@ func main() {
 	// Chat proxy — server-side DeepSeek key; empty key = /chat returns 404.
 	chatSvc := service.NewChatService(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, subRepo, planRepo)
 
+	// Usage analytics: heartbeat intake + admin stats reads over
+	// usage_events (migration 021).
+	usageRepo := repo.NewUsageRepo(db)
+	usageSvc := service.NewUsageService(usageRepo)
+
 	// Chat access audit log: one JSON line per request (user_id, session_id,
 	// input, output, status, duration). Optional — empty CHAT_LOG_PATH
 	// disables it. Fail-fast when configured but unopenable: silently
@@ -255,7 +260,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock)
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

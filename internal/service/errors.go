@@ -66,4 +66,8 @@ var (
 	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
 	ErrChatUpstreamError    = errors.New("chat upstream error")
 	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")
+
+	// Usage analytics (/user/usage/heartbeat + /admin/stats/*). Wrapped
+	// with a detail message (fmt.Errorf %w); handlers map it to 400.
+	ErrUsageInvalidParam = errors.New("invalid usage stats parameter")
 )

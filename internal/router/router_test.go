@@ -230,6 +230,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
 		false, // wechatOAuthMock
 		false, // wechatPayMock
+		nil,   // usageSvc
 	)
 
 	routes := engine.Routes()
@@ -271,6 +272,10 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"POST:/refunds",
 		"GET:/refunds/:id",
 		"POST:/webhooks/payment/:channel",
+		"POST:/user/usage/heartbeat",
+		"GET:/admin/stats/active",
+		"GET:/admin/stats/usage-duration",
+		"GET:/admin/stats/new-users",
 	}
 	for _, w := range want {
 		if !have[w] {
@@ -308,6 +313,7 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
 		false, // wechatOAuthMock
 		false, // wechatPayMock
+		nil,   // usageSvc
 	)
 
 	for _, r := range engine.Routes() {

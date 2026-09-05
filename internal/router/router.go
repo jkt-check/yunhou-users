@@ -37,6 +37,7 @@ func Setup(
 	wechatOAuthSvc *service.WeChatOAuthService,
 	wechatOAuthMock bool,
 	wechatPayMock bool,
+	usageSvc *service.UsageService,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -51,6 +52,7 @@ func Setup(
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
 	chatHandler := handler.NewChatHandler(chatSvc, chatAccessLog)
+	usageHandler := handler.NewUsageHandler(usageSvc)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
@@ -94,6 +96,17 @@ func Setup(
 		userGroup.GET("/subscriptions", subHandler.ListUserSubscriptions)
 		userGroup.POST("/subscriptions", subHandler.CreateSubscription)
 		userGroup.DELETE("/subscriptions/:id", subHandler.CancelSubscription)
+
+		// Usage heartbeat (2026-09-04-usage-analytics-design.md §3.3):
+		// kaya sends one 5-min beat per login session, batched ≤100 when
+		// flushing the offline buffer. Per-USER bucket (30/min sustained,
+		// burst 10) — a per-IP bucket would collapse all users behind one
+		// NAT into a single shared allowance. The key func runs after
+		// JWTAuth, so ContextUserID is always set here.
+		usageLimiter := middleware.RateLimitWithKey(ctx, 0.5, 10, func(c *gin.Context) string {
+			return c.GetString(middleware.ContextUserID)
+		})
+		userGroup.POST("/usage/heartbeat", usageLimiter, usageHandler.PostHeartbeat)
 	}
 
 	// App routes (internal service auth)
@@ -138,6 +151,14 @@ func Setup(
 		// Secret rotation: dedicated endpoint so it has its own audit trail
 		// and a response shape that always returns the new plaintext once.
 		adminGroup.POST("/apps/:id/rotate-secret", appHandler.RotateSecret)
+
+		// Usage analytics stats (2026-09-04-usage-analytics-design.md §3.3):
+		// DAU/WAU/MAU, usage duration, and new-user counts over the
+		// usage_events heartbeat table. Consumed by manual API calls / SQL
+		// for now — no ops dashboard in v1.
+		adminGroup.GET("/stats/active", usageHandler.GetActiveStats)
+		adminGroup.GET("/stats/usage-duration", usageHandler.GetUsageDuration)
+		adminGroup.GET("/stats/new-users", usageHandler.GetNewUsers)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

@@ -38,7 +38,7 @@ type rateLimiter struct {
 	burst    int
 }
 
-func newRateLimiter(r int, burst int) *rateLimiter {
+func newRateLimiter(r float64, burst int) *rateLimiter {
 	return &rateLimiter{
 		rate:  rate.Limit(r),
 		burst: burst,
@@ -83,16 +83,32 @@ func (rl *rateLimiter) cleanup() {
 	}
 }
 
-// RateLimit returns a per-IP token-bucket limiter middleware. The
-// rate-limiter key is c.ClientIP(), which Gin resolves from the
-// X-Forwarded-For / X-Real-IP headers via its TrustedProxies setting.
+// RateLimit returns a per-IP token-bucket limiter middleware (r is the
+// sustained rate in requests per second — fractional values like 0.5 mean
+// "one request per 2s"). The rate-limiter key is c.ClientIP(), which Gin
+// resolves from the X-Forwarded-For / X-Real-IP headers via its
+// TrustedProxies setting.
 //
 // Deployment note: callers MUST pin TrustedProxies (gin.Engine.SetTrustedProxies)
 // to the upstream proxy's CIDR before the server starts. Without this
 // pin, a malicious client can spoof the header and rotate X-Forwarded-For
 // per request to bypass the per-IP bucket. The default of trusting
 // every proxy in Gin's engine is unsafe for a public deployment.
-func RateLimit(ctx context.Context, r, burst int) gin.HandlerFunc {
+func RateLimit(ctx context.Context, r float64, burst int) gin.HandlerFunc {
+	return RateLimitWithKey(ctx, r, burst, func(c *gin.Context) string {
+		return c.ClientIP()
+	})
+}
+
+// RateLimitWithKey is RateLimit with a caller-chosen bucket key instead of
+// the client IP. Used for per-USER buckets on JWT-authenticated routes
+// (e.g. the usage heartbeat's 30/min per user) where keying by IP would
+// collapse all users behind one NAT into a single shared bucket. The key
+// func runs after JWTAuth in the middleware chain, so it can read the
+// identity from the gin context; an empty key falls back to the client IP
+// (defence in depth — an unauthenticated request should never reach here,
+// but a shared fallback bucket is safer than a shared empty key).
+func RateLimitWithKey(ctx context.Context, r float64, burst int, key func(*gin.Context) string) gin.HandlerFunc {
 	limiter := newRateLimiter(r, burst)
 
 	go func() {
@@ -109,8 +125,11 @@ func RateLimit(ctx context.Context, r, burst int) gin.HandlerFunc {
 	}()
 
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
-		if !limiter.allow(ip) {
+		k := key(c)
+		if k == "" {
+			k = c.ClientIP()
+		}
+		if !limiter.allow(k) {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"code":    429,
 				"message": "too many requests",

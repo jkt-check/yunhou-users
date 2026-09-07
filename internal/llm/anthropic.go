@@ -101,6 +101,18 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens int, messages []model
 		}
 	}
 
+	// Two client-legal shapes (they pass handler validation and OpenAI accepts
+	// them) are hard 400s for stock Anthropic — fail deliberately here, before
+	// a paid upstream round-trip buys an opaque 502: a system-only request
+	// translates to no messages at all (Anthropic requires >= 1 non-system
+	// message), and a leading assistant turn violates user-first.
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("anthropic translation: no non-system messages")
+	}
+	if msgs[0]["role"] != "user" {
+		return nil, fmt.Errorf("anthropic translation: first non-system message must be a user turn")
+	}
+
 	payload := map[string]any{
 		"model":      upstreamModel,
 		"max_tokens": maxTokens,

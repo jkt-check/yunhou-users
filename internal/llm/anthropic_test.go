@@ -135,6 +135,51 @@ func TestBuildAnthropicPayload_ToolsTranslation(t *testing.T) {
 	}
 }
 
+// TestBuildAnthropicPayload_RejectsAnthropicIllegalShapes: two shapes pass
+// handler validation and are legal for OpenAI-protocol models, but stock
+// Anthropic 400s them — the translation must fail deliberately instead of
+// buying an opaque upstream 502 with a paid round-trip.
+func TestBuildAnthropicPayload_RejectsAnthropicIllegalShapes(t *testing.T) {
+	cases := []struct {
+		name     string
+		messages []model.ChatMessage
+	}{
+		{"system-only request (Anthropic requires >= 1 non-system message)", []model.ChatMessage{
+			{Role: "system", Content: "be brief"},
+		}},
+		{"leading assistant with no preceding user (Anthropic requires user-first)", []model.ChatMessage{
+			{Role: "assistant", Content: "hello"},
+			{Role: "user", Content: "hi"},
+		}},
+		{"system then leading assistant", []model.ChatMessage{
+			{Role: "system", Content: "be brief"},
+			{Role: "assistant", Content: "hello"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := BuildAnthropicPayload("m", 0, tc.messages, nil, nil)
+			if err == nil {
+				t.Errorf("BuildAnthropicPayload succeeded, want a deliberate error; payload: %s", body)
+			}
+		})
+	}
+}
+
+// TestBuildOpenAIPayload_AcceptsShapesAnthropicRejects: the guards are scoped
+// to the Anthropic translator — the OpenAI payload builder must keep
+// accepting system-only and leading-assistant histories unchanged.
+func TestBuildOpenAIPayload_AcceptsShapesAnthropicRejects(t *testing.T) {
+	for _, messages := range [][]model.ChatMessage{
+		{{Role: "system", Content: "be brief"}},
+		{{Role: "assistant", Content: "hello"}, {Role: "user", Content: "hi"}},
+	} {
+		if _, err := BuildOpenAIPayload("m", messages, nil, nil); err != nil {
+			t.Errorf("BuildOpenAIPayload(%v): %v, want success (OpenAI-protocol behavior unchanged)", messages, err)
+		}
+	}
+}
+
 // TestBuildAnthropicPayload_SkipsNamelessTools: a tool without a name would
 // translate to "name":null and 400 the whole request upstream — drop it
 // instead. When every tool is nameless the tools key is omitted entirely.
@@ -252,6 +297,7 @@ func TestBuildAnthropicPayload_ToolAfterPlainUserMerges(t *testing.T) {
 // first, then the text (the shape Anthropic accepts).
 func TestBuildAnthropicPayload_UserTextAfterToolResult(t *testing.T) {
 	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+		{Role: "user", Content: "list files"},
 		{Role: "assistant", ToolCalls: []model.ToolCall{
 			{ID: "c1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: `{"cmd":"ls"}`}},
 		}},
@@ -262,12 +308,12 @@ func TestBuildAnthropicPayload_UserTextAfterToolResult(t *testing.T) {
 		t.Fatalf("BuildAnthropicPayload: %v", err)
 	}
 	msgs := decode(t, body)["messages"].([]any)
-	if len(msgs) != 2 {
-		t.Fatalf("messages len = %d, want 2 (assistant + merged user)", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want 3 (user, assistant, merged user)", len(msgs))
 	}
-	user := msgs[1].(map[string]any)
+	user := msgs[2].(map[string]any)
 	if user["role"] != "user" {
-		t.Fatalf("msgs[1].role = %v", user["role"])
+		t.Fatalf("msgs[2].role = %v", user["role"])
 	}
 	blocks := user["content"].([]any)
 	if len(blocks) != 2 {

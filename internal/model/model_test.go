@@ -171,6 +171,7 @@ func TestPlanCommercialModelShape(t *testing.T) {
 		{"Price", "price", "price"},
 		{"IntervalDays", "interval_days", "interval_days"},
 		{"Apps", "apps", "apps"},
+		{"ChatModels", "chat_models", "chat_models,omitempty"},
 		{"IsActive", "is_active", "is_active"},
 		{"IsListed", "is_listed", "is_listed"},
 		{"AcceptingNewSubscriptions", "accepting_new_subscriptions", "accepting_new_subscriptions"},

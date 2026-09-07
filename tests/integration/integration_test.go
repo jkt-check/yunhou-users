@@ -20,6 +20,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -179,7 +180,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
-		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)))
+		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil)
 
 	return httptest.NewServer(engine)
 }
@@ -735,7 +736,7 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 	engine := gin.New()
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
-	chatSvc := service.NewChatService("", "", "", subRepo, planRepo)
+	chatSvc := service.NewChatService(llm.LegacyCatalog(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel), subRepo, planRepo, repo.NewLLMUsageRepo(db))
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	setupCtx, cancel := context.WithCancel(context.Background())
@@ -754,7 +755,7 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, service.NewUsageService(repo.NewUsageRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)))
 
 	return httptest.NewServer(engine)
 }

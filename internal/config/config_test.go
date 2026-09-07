@@ -924,3 +924,71 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 		}
 	})
 }
+
+// TestValidate_LLMCatalog walks the multi-model catalog branch: a malformed
+// LLM_PROVIDERS_JSON must kill the process at boot (fail-fast on operator
+// typos, DisallowUnknownFields + referential integrity live in
+// llm.ParseCatalog), an empty string stays valid (back-compat with the
+// legacy DEEPSEEK_* triple), and a well-formed catalog validates.
+func TestValidate_LLMCatalog(t *testing.T) {
+	t.Parallel()
+	base := func() *Config {
+		return &Config{
+			DatabaseURL:                "postgres://x",
+			RSAPrivate:                 "priv",
+			RSAPublic:                  "pub",
+			JWTAccessTTL:               15 * time.Minute,
+			JWTRefreshTTL:              168 * time.Hour,
+			OrderExpiryDuration:        30 * time.Minute,
+			SweeperInterval:            1 * time.Minute,
+			OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
+			WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef",
+			WeChatPayMchID:             "1900000001",
+			WeChatPayAppID:             "wx1900000109",
+			WeChatPayMchPrivateKeyPath: "/etc/wechat/apiclient_key.pem",
+			WeChatPayMchCertPath:       "/etc/wechat/apiclient_cert.pem",
+			WeChatPayNotifyURL:         "https://example.com/webhooks/payment/wechat_pay",
+		}
+	}
+
+	// Empty catalog = legacy DEEPSEEK_* back-compat path; always valid here.
+	if err := base().Validate(); err != nil {
+		t.Fatalf("empty catalog: want nil, got %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		json      string
+		needleSub string
+	}{
+		{"not json at all", `{`, "LLM_PROVIDERS_JSON"},
+		{"unknown field rejected", `{"bogus": true}`, "LLM_PROVIDERS_JSON"},
+		{"empty providers", `{"providers":{},"models":{"m":{"provider":"p","upstream_model":"u"}}}`, "providers must not be empty"},
+		{"model references unknown provider", `{"providers":{"p":{"protocol":"openai","base_url":"https://x.example","api_keys":["k"]}},"models":{"m":{"provider":"nope","upstream_model":"u"}}}`, "unknown provider"},
+		{"bad provider base_url", `{"providers":{"p":{"protocol":"openai","base_url":"not a url","api_keys":["k"]}},"models":{"m":{"provider":"p","upstream_model":"u"}}}`, "absolute http(s) URL"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := base()
+			cfg.LLMProvidersJSON = tc.json
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.needleSub) {
+				t.Errorf("error message missing %q: %v", tc.needleSub, err)
+			}
+		})
+	}
+
+	t.Run("valid catalog accepted", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.LLMProvidersJSON = `{"providers":{"p":{"protocol":"openai","base_url":"https://x.example","api_keys":["k"]}},"models":{"m":{"provider":"p","upstream_model":"u"}}}`
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("valid catalog rejected: %v", err)
+		}
+	})
+}

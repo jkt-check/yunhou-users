@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -121,7 +122,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	engine.Use(gin.Recovery())
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
-	chatSvc := service.NewChatService("", "", "", subRepo, planRepo) // chat disabled in this e2e helper
+	chatSvc := service.NewChatService(llm.LegacyCatalog(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel), subRepo, planRepo, repo.NewLLMUsageRepo(db)) // chat disabled in this e2e helper
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
@@ -131,7 +132,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, service.NewUsageService(repo.NewUsageRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)))
 
 	alipayPrivHolder.Store(alipayPriv)
 

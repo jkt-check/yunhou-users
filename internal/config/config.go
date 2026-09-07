@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"os"
 	"time"
+
+	"github.com/yunhou/users/internal/llm"
 )
 
 // Config holds all runtime configuration. Required fields are validated
@@ -143,6 +145,12 @@ type Config struct {
 	// DeepSeekModel is the model name sent in the upstream chat.completions
 	// body (e.g. deepseek-v4-flash). Default "deepseek-v4-flash".
 	DeepSeekModel string
+	// LLMProvidersJSON is the multi-model catalog (providers + logical
+	// models) as one JSON object; parsed and validated at boot by
+	// llm.ParseCatalog. When set it takes precedence over the legacy
+	// DEEPSEEK_* triple; when empty those envs synthesize a one-model
+	// catalog (back-compat). See docs/api-integration-guide.md.
+	LLMProvidersJSON string
 	// ChatLogPath is the file for chat access logs (one JSON line per
 	// request: user_id, session_id, input messages, output text, status,
 	// duration). Empty = chat access logging disabled (the /chat endpoint
@@ -191,10 +199,11 @@ func Load() *Config {
 
 		PlanAmountOverrideJSON: os.Getenv("PLAN_AMOUNT_OVERRIDE_JSON"),
 
-		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekBaseURL: envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-		DeepSeekModel:   envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-		ChatLogPath:     os.Getenv("CHAT_LOG_PATH"),
+		DeepSeekAPIKey:   os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekBaseURL:  envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+		DeepSeekModel:    envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+		LLMProvidersJSON: os.Getenv("LLM_PROVIDERS_JSON"),
+		ChatLogPath:      os.Getenv("CHAT_LOG_PATH"),
 	}
 }
 
@@ -315,6 +324,13 @@ func (c *Config) Validate() error {
 		u, err := url.Parse(c.DeepSeekBaseURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return errors.New("DEEPSEEK_BASE_URL must be an absolute http(s) URL (e.g. https://api.deepseek.com)")
+		}
+	}
+	// Multi-model catalog: malformed JSON or a broken reference must kill
+	// the process at boot, not surface as per-request 502s.
+	if c.LLMProvidersJSON != "" {
+		if _, err := llm.ParseCatalog(c.LLMProvidersJSON); err != nil {
+			return err
 		}
 	}
 	return nil

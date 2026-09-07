@@ -38,6 +38,7 @@ func Setup(
 	wechatOAuthMock bool,
 	wechatPayMock bool,
 	usageSvc *service.UsageService,
+	llmUsageSvc *service.LLMUsageService,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -53,6 +54,7 @@ func Setup(
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
 	chatHandler := handler.NewChatHandler(chatSvc, chatAccessLog)
 	usageHandler := handler.NewUsageHandler(usageSvc)
+	llmUsageHandler := handler.NewLLMUsageHandler(llmUsageSvc)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
@@ -132,6 +134,9 @@ func Setup(
 	// than the generic app bucket because every call spends upstream tokens.
 	chatLimiter := middleware.RateLimit(ctx, 10, 20)
 	engine.POST("/chat", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.StreamChat)
+	// Model picker for kaya: same bucket (cheap, but no reason to make it
+	// easier to hammer than chat itself).
+	engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.GetModels)
 
 	// Admin routes for plan management (internal service auth)
 	adminLimiter := middleware.RateLimit(ctx, 30, 60)
@@ -159,6 +164,9 @@ func Setup(
 		adminGroup.GET("/stats/active", usageHandler.GetActiveStats)
 		adminGroup.GET("/stats/usage-duration", usageHandler.GetUsageDuration)
 		adminGroup.GET("/stats/new-users", usageHandler.GetNewUsers)
+
+		// LLM token metering aggregates (migration 022).
+		adminGroup.GET("/stats/llm-usage", llmUsageHandler.GetByModel)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

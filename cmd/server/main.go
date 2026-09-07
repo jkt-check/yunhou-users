@@ -19,6 +19,7 @@ import (
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -172,8 +173,22 @@ func main() {
 	// Quote service — assembles price + cycle + provider_data for BFF checkout.
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 
-	// Chat proxy — server-side DeepSeek key; empty key = /chat returns 404.
-	chatSvc := service.NewChatService(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, subRepo, planRepo)
+	// Chat gateway: LLM_PROVIDERS_JSON wins; the legacy DEEPSEEK_* triple
+	// synthesizes a one-model catalog when the JSON is absent. Both empty →
+	// chat disabled (/chat returns 404).
+	llmCatalog, err := llm.ParseCatalog(cfg.LLMProvidersJSON)
+	if err != nil {
+		log.Fatalf("parse LLM_PROVIDERS_JSON: %v", err)
+	}
+	if llmCatalog == nil {
+		llmCatalog = llm.LegacyCatalog(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel)
+	}
+	if llmCatalog != nil {
+		log.Printf("chat: %d models across %d providers (default %s)",
+			len(llmCatalog.Models), len(llmCatalog.Providers), llmCatalog.DefaultModel)
+	}
+	llmUsageRepo := repo.NewLLMUsageRepo(db)
+	chatSvc := service.NewChatService(llmCatalog, subRepo, planRepo, llmUsageRepo)
 
 	// Usage analytics: heartbeat intake + admin stats reads over
 	// usage_events (migration 021).
@@ -260,7 +275,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc)
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, service.NewLLMUsageService(llmUsageRepo))
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

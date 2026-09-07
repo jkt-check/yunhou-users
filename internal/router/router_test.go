@@ -231,6 +231,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		false, // wechatOAuthMock
 		false, // wechatPayMock
 		nil,   // usageSvc
+		nil,   // llmUsageSvc
 	)
 
 	routes := engine.Routes()
@@ -276,6 +277,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"GET:/admin/stats/active",
 		"GET:/admin/stats/usage-duration",
 		"GET:/admin/stats/new-users",
+		"GET:/admin/stats/llm-usage",
 	}
 	for _, w := range want {
 		if !have[w] {
@@ -314,6 +316,7 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		false, // wechatOAuthMock
 		false, // wechatPayMock
 		nil,   // usageSvc
+		nil,   // llmUsageSvc
 	)
 
 	for _, r := range engine.Routes() {

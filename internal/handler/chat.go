@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
@@ -23,7 +24,12 @@ import (
 // local interface so handler tests can inject a hand-rolled mock without a
 // real upstream.
 type chatStreamer interface {
-	StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
+	StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error)
+	// RecordUsage meters one completed upstream call; it never fails the
+	// request (the service swallows and logs repo errors).
+	RecordUsage(ctx context.Context, userID, appID string, route *service.ChatRoute, status string, inputTokens, outputTokens int)
+	// AllowedModels backs GET /chat/models.
+	AllowedModels(ctx context.Context, userID, appID string) ([]service.ChatModelInfo, error)
 }
 
 // ChatHandler serves POST /chat — the JWT-authenticated, subscription-gated
@@ -69,6 +75,7 @@ type chatAccessEntry struct {
 	UserID          string              `json:"user_id"`
 	AppID           string              `json:"app_id"`
 	SessionID       string              `json:"session_id"`
+	Model           string              `json:"model,omitempty"`
 	Status          string              `json:"status"` // "ok" | "error" | "disconnected" | "upstream_error"
 	Error           string              `json:"error,omitempty"`
 	MessageCount    int                 `json:"message_count"`
@@ -97,30 +104,35 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		// Fixed client message: err.Error() would reflect binding/struct
 		// internals to the caller.
-		h.logAccess(started, userID, appID, req, "error", "invalid request body", "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "invalid request body", "")
 		writeChatError(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if msg := validateChatMessages(req.Messages); msg != "" {
-		h.logAccess(started, userID, appID, req, "error", msg, "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
 		writeChatError(c, http.StatusBadRequest, msg)
 		return
 	}
 	if len(req.SessionID) > model.ChatMaxSessionIDLen {
-		h.logAccess(started, userID, appID, req, "error", "session_id too long", "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "session_id too long", "")
 		writeChatError(c, http.StatusBadRequest, "session_id too long")
 		return
 	}
+	if len(req.Model) > model.ChatMaxModelLen {
+		h.logAccess(started, userID, appID, req.Model, req, "error", "model id too long", "")
+		writeChatError(c, http.StatusBadRequest, "model id too long")
+		return
+	}
 	if msg := validateChatTools(req.Tools); msg != "" {
-		h.logAccess(started, userID, appID, req, "error", msg, "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
 		writeChatError(c, http.StatusBadRequest, msg)
 		return
 	}
 
-	resp, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Messages, req.Tools, req.ThinkingEnabled)
+	resp, route, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Model, req.Messages, req.Tools, req.ThinkingEnabled)
 	if err != nil {
 		status, msg := chatErrorMapping(err)
-		h.logAccess(started, userID, appID, req, "error", msg, "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
 		writeChatError(c, status, msg)
 		return
 	}
@@ -146,7 +158,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		log.Printf("chat: set write deadline: %v", err)
 	}
 
-	raw, result := relayChatSSE(c.Writer, resp.Body)
+	raw, result, usage := relayChatSSE(c.Writer, resp.Body)
 	if result == chatRelayUpstreamBroke {
 		// Upstream died mid-stream (no [DONE] relayed): a clean EOF here
 		// would make kaya render the partial answer as complete. Inject an
@@ -173,7 +185,45 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		status = "upstream_error"
 		errMsg = "upstream stream interrupted"
 	}
-	h.logAccess(started, userID, appID, req, status, errMsg, output)
+	// Meter the upstream spend. Usage tokens come from the relay's
+	// incremental tracker (OpenAI usage chunks, requested via stream_options;
+	// synthesized by the Anthropic translator), so metering is independent of
+	// the capped audit capture and of how the relay ended: a client
+	// disconnect or an upstream break mid-stream still records every usage
+	// chunk read from upstream. context.WithoutCancel: the request ctx is
+	// already cancelled when the client disconnected mid-stream, but the
+	// consumed tokens are a real spend and must still be recorded.
+	if route != nil {
+		usageCtx, usageCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		h.svc.RecordUsage(usageCtx, userID, appID, route, status, usage.InputTokens, usage.OutputTokens)
+		usageCancel()
+	}
+	h.logAccess(started, userID, appID, routeModel(route, req.Model), req, status, errMsg, output)
+}
+
+// routeModel prefers the resolved (effective) model over the raw client
+// value so the audit log shows what actually served the request.
+func routeModel(route *service.ChatRoute, fallback string) string {
+	if route != nil {
+		return route.LogicalModel
+	}
+	return fallback
+}
+
+// GetModels handles GET /chat/models: the catalog models the caller's plan
+// may use, for kaya's model picker. Unlike StreamChat this is a plain JSON
+// endpoint under the global 20s timeout (AllowedModels bounds its DB reads
+// with chatAccessTimeout internally).
+func (h *ChatHandler) GetModels(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	appID := c.GetString(middleware.ContextAppID)
+	models, err := h.svc.AllowedModels(c.Request.Context(), userID, appID)
+	if err != nil {
+		status, msg := chatErrorMapping(err)
+		writeChatError(c, status, msg)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": models}})
 }
 
 // chatErrorMapping converts a StreamChat error into (HTTP status, safe
@@ -196,6 +246,12 @@ func chatErrorMapping(err error) (int, string) {
 	case errors.Is(err, service.ErrChatUpstreamError):
 		log.Printf("chat: upstream error: %v", err)
 		return http.StatusBadGateway, service.ErrChatUpstreamError.Error()
+	case errors.Is(err, service.ErrChatUnknownModel):
+		return http.StatusBadRequest, service.ErrChatUnknownModel.Error()
+	case errors.Is(err, service.ErrChatModelNotAllowed):
+		return http.StatusForbidden, service.ErrChatModelNotAllowed.Error()
+	case errors.Is(err, service.ErrChatRequestShape):
+		return http.StatusBadRequest, service.ErrChatRequestShape.Error()
 	default:
 		log.Printf("chat: internal error: %v", err)
 		return http.StatusInternalServerError, "internal error"
@@ -209,9 +265,16 @@ func chatErrorMapping(err error) (int, string) {
 // error lines the input is truncated too: validation-failed requests carry
 // unvalidated (potentially near-32 KiB per message) content that would
 // otherwise be mirrored into the log in full.
-func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req model.ChatRequest, status, errMsg, output string) {
+func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string, req model.ChatRequest, status, errMsg, output string) {
 	if h.accessLog == nil {
 		return
+	}
+	// modelID can be the RAW client value (validation-failure paths): the
+	// >64-char rejection still logs it, and the body cap would let one audit
+	// line carry ~300 KiB of junk. Cap it here so no call site can forget.
+	if len(modelID) > model.ChatMaxModelLen {
+		cut, _ := truncateUTF8(modelID, model.ChatMaxModelLen)
+		modelID = cut + "…"
 	}
 	realBytes := len(output)
 	output, truncated := truncateChatOutput(output)
@@ -225,6 +288,7 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req mod
 		UserID:          userID,
 		AppID:           appID,
 		SessionID:       req.SessionID,
+		Model:           modelID,
 		Status:          status,
 		Error:           errMsg,
 		MessageCount:    len(req.Messages),
@@ -330,16 +394,22 @@ type flushWriter interface {
 }
 
 // relayChatSSE streams the upstream body to the client, flushing after every
-// chunk, and captures up to chatRawLogCap bytes of the raw SSE stream for the
-// audit log. The result reports how the relay ended (see chatRelayResult).
-func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult) {
+// chunk, captures up to chatRawLogCap bytes of the raw SSE stream for the
+// audit log, and incrementally tracks the stream's usage object for metering.
+// The tracker is fed from the upstream read, BEFORE the client write: spent
+// tokens count even when the client has already disconnected, and even when
+// the usage chunk lands past the capture cap or the stream ends abnormally.
+// The result reports how the relay ended (see chatRelayResult).
+func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult, llm.StreamUsage) {
 	buf := make([]byte, chatStreamBufSize)
 	var captured bytes.Buffer
+	var tracker llm.UsageTracker
 	for {
 		n, readErr := body.Read(buf)
 		if n > 0 {
+			tracker.Feed(buf[:n])
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return captured.Bytes(), chatRelayClientGone // client gone — stop relaying
+				return captured.Bytes(), chatRelayClientGone, tracker.Usage() // client gone — stop relaying
 			}
 			w.Flush()
 			if captured.Len() < chatRawLogCap {
@@ -353,9 +423,9 @@ func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult) {
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				return captured.Bytes(), chatRelayOK // clean end of stream
+				return captured.Bytes(), chatRelayOK, tracker.Usage() // clean end of stream
 			}
-			return captured.Bytes(), chatRelayUpstreamBroke // upstream broke mid-stream
+			return captured.Bytes(), chatRelayUpstreamBroke, tracker.Usage() // upstream broke mid-stream
 		}
 	}
 }

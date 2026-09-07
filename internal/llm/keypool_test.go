@@ -57,3 +57,16 @@ func TestKeyPool_SingleKey(t *testing.T) {
 		t.Errorf("single key pool must always return its key, got %q", k)
 	}
 }
+
+func TestKeyPool_EmptyPool(t *testing.T) {
+	// Unreachable in production (catalog Validate requires >= 1 key), but the
+	// type must be safe standalone: Acquire on an empty pool must not panic.
+	p := NewKeyPool(nil)
+	if p.Len() != 0 {
+		t.Fatalf("Len = %d, want 0", p.Len())
+	}
+	idx, key := p.Acquire(time.Now())
+	if idx != -1 || key != "" {
+		t.Errorf("Acquire on empty pool = (%d, %q), want (-1, \"\")", idx, key)
+	}
+}

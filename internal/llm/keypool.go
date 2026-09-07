@@ -32,6 +32,9 @@ func (p *KeyPool) Len() int { return len(p.keys) }
 func (p *KeyPool) Acquire(now time.Time) (int, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(p.keys) == 0 {
+		return -1, "" // empty pool: no key to give (production catalogs validate >= 1 key)
+	}
 	best, bestUntil := -1, time.Time{}
 	for i := 0; i < len(p.keys); i++ {
 		idx := (p.next + i) % len(p.keys)

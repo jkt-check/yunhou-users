@@ -582,6 +582,31 @@ func TestPlanRepo_CreateUpdateDelete(t *testing.T) {
 	}
 }
 
+func TestPlanRepo_ChatModelsRoundTrip(t *testing.T) {
+	db := setupDB(t)
+	ctx := context.Background()
+	// plans SELECT * must map chat_models without error (column added by
+	// migration 023); NULL → nil slice.
+	plan, err := NewPlanRepo(db).FindByID(ctx, "free")
+	if err != nil {
+		t.Fatalf("FindByID(free): %v", err)
+	}
+	if len(plan.ChatModels) != 0 {
+		t.Errorf("free.ChatModels = %v, want empty (NULL)", plan.ChatModels)
+	}
+	// Direct UPDATE (no repo support by design) then re-read.
+	if _, err := db.ExecContext(ctx, `UPDATE plans SET chat_models = $1 WHERE id = 'free'`, pq.StringArray{"deepseek-flash"}); err != nil {
+		t.Fatalf("set chat_models: %v", err)
+	}
+	plan, err = NewPlanRepo(db).FindByID(ctx, "free")
+	if err != nil {
+		t.Fatalf("FindByID(free) again: %v", err)
+	}
+	if len(plan.ChatModels) != 1 || plan.ChatModels[0] != "deepseek-flash" {
+		t.Errorf("ChatModels = %v, want [deepseek-flash]", plan.ChatModels)
+	}
+}
+
 // ============================================================================
 // appRepo
 // ============================================================================

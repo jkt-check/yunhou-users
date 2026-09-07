@@ -159,11 +159,19 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 	switch provider.Protocol {
 	case llm.ProtocolAnthropic:
 		body, err = llm.BuildAnthropicPayload(m.UpstreamModel, m.MaxTokens, messages, tools, thinkingEnabled)
+		if err != nil {
+			// Anthropic translation only fails on un-encodable client input:
+			// the shape guards (history legal per chat validation, forbidden
+			// by Anthropic protocol), an unsupported role, or an undecodable
+			// tool — the final marshal cannot fail. All of it is a client
+			// shape problem, not a server fault: mark it for a 400 mapping.
+			return nil, nil, fmt.Errorf("encode chat request: %w: %v", ErrChatRequestShape, err)
+		}
 	default:
 		body, err = llm.BuildOpenAIPayload(m.UpstreamModel, messages, tools, thinkingEnabled)
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("encode chat request: %w", err)
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode chat request: %w", err)
+		}
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, chatUpstreamTimeout)

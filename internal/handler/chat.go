@@ -250,6 +250,8 @@ func chatErrorMapping(err error) (int, string) {
 		return http.StatusBadRequest, service.ErrChatUnknownModel.Error()
 	case errors.Is(err, service.ErrChatModelNotAllowed):
 		return http.StatusForbidden, service.ErrChatModelNotAllowed.Error()
+	case errors.Is(err, service.ErrChatRequestShape):
+		return http.StatusBadRequest, service.ErrChatRequestShape.Error()
 	default:
 		log.Printf("chat: internal error: %v", err)
 		return http.StatusInternalServerError, "internal error"

@@ -65,6 +65,7 @@ var (
 	ErrChatNoAccess         = errors.New("active subscription with access to this app is required")
 	ErrChatUnknownModel     = errors.New("unknown chat model")
 	ErrChatModelNotAllowed  = errors.New("chat model is not allowed for the current plan")
+	ErrChatRequestShape     = errors.New("chat request shape is not supported by the selected model")
 	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
 	ErrChatUpstreamError    = errors.New("chat upstream error")
 	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")

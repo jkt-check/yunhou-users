@@ -321,6 +321,7 @@ func TestChatHandler_UnknownModelMapped(t *testing.T) {
 	}{
 		{"unknown model", service.ErrChatUnknownModel, http.StatusBadRequest},
 		{"model not allowed", service.ErrChatModelNotAllowed, http.StatusForbidden},
+		{"request shape not supported by the model", service.ErrChatRequestShape, http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

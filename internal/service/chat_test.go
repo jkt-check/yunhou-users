@@ -411,8 +411,44 @@ func TestChatService_AnthropicRoute(t *testing.T) {
 	}
 }
 
-func TestChatService_RecordUsage(t *testing.T) {
-	usageRepo := &mockLLMUsageRepo{}
+// TestChatService_AnthropicShapeGuardMarkedClientError: a history shape that
+// Anthropic forbids (here: system-only, which would translate to zero
+// messages) passes chat validation but must fail BEFORE any upstream call,
+// wrapped so errors.Is finds ErrChatRequestShape — the handler maps that to
+// 400, not the generic 500 a plain encode error would get.
+func TestChatService_AnthropicShapeGuardMarkedClientError(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	catalog := &llm.Catalog{
+		DefaultModel: "kimi-k3",
+		Providers:    map[string]llm.Provider{"kimi": {Protocol: llm.ProtocolAnthropic, BaseURL: srv.URL, APIKeys: []string{"sk-kimi-1"}}},
+		Models:       map[string]llm.Model{"kimi-k3": {Provider: "kimi", UpstreamModel: "kimi-k3-latest"}},
+	}
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(catalog, subRepo, planRepo, &mockLLMUsageRepo{})
+
+	_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "",
+		[]model.ChatMessage{{Role: "system", Content: "be brief"}}, nil, nil)
+	if err == nil {
+		t.Fatal("StreamChat succeeded for a system-only history on an Anthropic model")
+	}
+	if !errors.Is(err, ErrChatRequestShape) {
+		t.Errorf("err = %v, want errors.Is(err, ErrChatRequestShape)", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("upstream called %d times, want 0 (shape guards fail before any spend)", n)
+	}
+}
+
+func TestChatService_RecordUsage(t *testing.T) {	usageRepo := &mockLLMUsageRepo{}
 	svc := NewChatService(testCatalog("https://upstream.invalid"), newMockSubscriptionRepo(), newMockPlanRepo(), usageRepo)
 	route := &ChatRoute{LogicalModel: "deepseek-flash", Provider: "deepseek", Protocol: llm.ProtocolOpenAI, UpstreamModel: "deepseek-v4-flash", InputPerMtok: 2, OutputPerMtok: 8}
 	// cost = 100*2 + 50*8 = 600 µ¥ (see llm.Model price identity)

@@ -21,6 +21,13 @@ func NewLLMUsageHandler(svc *service.LLMUsageService) *LLMUsageHandler {
 
 // GetByModel handles GET /admin/stats/llm-usage?from=YYYY-MM-DD&to=YYYY-MM-DD.
 func (h *LLMUsageHandler) GetByModel(c *gin.Context) {
+	// The route is registered unconditionally (router.Setup); a nil service
+	// means the feature isn't wired, so degrade to 503 instead of panicking —
+	// the same request-time-error convention as a disabled chat service.
+	if h.svc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"code": http.StatusServiceUnavailable, "data": nil, "message": "llm usage stats not enabled"})
+		return
+	}
 	rows, err := h.svc.StatsByModel(c.Request.Context(), c.Query("from"), c.Query("to"))
 	if err != nil {
 		if errors.Is(err, service.ErrUsageInvalidParam) {

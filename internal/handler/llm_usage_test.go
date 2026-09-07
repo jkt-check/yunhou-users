@@ -95,4 +95,20 @@ func TestLLMUsageGetByModel(t *testing.T) {
 			t.Error("internal error detail must not leak to the client")
 		}
 	})
+
+	t.Run("nil service maps to 503, not a panic", func(t *testing.T) {
+		// router.Setup registers the route unconditionally; a nil service
+		// (e.g. tests wiring the router without the repo) must degrade to a
+		// clean error, mirroring how a disabled chat returns an error rather
+		// than crashing the request.
+		gin.SetMode(gin.TestMode)
+		engine := gin.New()
+		engine.GET("/admin/stats/llm-usage", NewLLMUsageHandler(nil).GetByModel)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet,
+			"/admin/stats/llm-usage?from=2026-09-01&to=2026-09-07", nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected 503, got %d (%s)", w.Code, w.Body.String())
+		}
+	})
 }

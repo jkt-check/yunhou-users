@@ -48,6 +48,10 @@ type ToolCallFunction struct {
 type ChatRequest struct {
 	Messages  []ChatMessage `json:"messages"`
 	SessionID string        `json:"session_id"`
+	// Model is the logical built-in model id (see GET /chat/models). Empty
+	// selects the server-configured default — pre-multi-model clients never
+	// send it and keep working unchanged.
+	Model string `json:"model,omitempty"`
 	// Tools is the OpenAI-compatible function/tool schema list, relayed
 	// verbatim to the upstream DeepSeek chat.completions `tools` field.
 	// The server treats it as opaque JSON — it never parses tool contents,
@@ -85,6 +89,10 @@ const ChatMaxTotalBytes = 262144
 // ChatMaxSessionIDLen bounds the optional session_id field — it is only an
 // audit-log grouping key, so anything longer is rejected rather than stored.
 const ChatMaxSessionIDLen = 64
+
+// ChatMaxModelLen bounds the optional model id — it must match a catalog
+// entry, and catalog ids are themselves capped at 64 chars (llm.Validate).
+const ChatMaxModelLen = 64
 
 // ChatMaxTools bounds the number of tool definitions per request (abuse
 // surface: each tool inflates the upstream prompt and costs tokens).

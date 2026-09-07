@@ -132,6 +132,9 @@ func Setup(
 	// than the generic app bucket because every call spends upstream tokens.
 	chatLimiter := middleware.RateLimit(ctx, 10, 20)
 	engine.POST("/chat", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.StreamChat)
+	// Model picker for kaya: same bucket (cheap, but no reason to make it
+	// easier to hammer than chat itself).
+	engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.GetModels)
 
 	// Admin routes for plan management (internal service auth)
 	adminLimiter := middleware.RateLimit(ctx, 30, 60)

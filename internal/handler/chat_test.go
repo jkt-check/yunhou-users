@@ -20,29 +20,78 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
-// mockChatSvc implements chatStreamer with injectable results.
-type mockChatSvc struct {
-	resp               *http.Response
-	err                error
-	gotUID             string
-	gotApp             string
-	gotMsg             []model.ChatMessage
-	gotTools           []json.RawMessage
-	gotThinkingEnabled *bool
+// streamFunc is the mock StreamChat signature (kept named so mock field
+// declarations stay readable).
+type streamFunc func(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error)
+
+// usageCall records one RecordUsage invocation for assertions.
+type usageCall struct {
+	userID, appID, status string
+	route                 *service.ChatRoute
+	inputTokens           int
+	outputTokens          int
 }
 
-func (m *mockChatSvc) StreamChat(_ context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
-	m.gotUID = userID
-	m.gotApp = appID
-	m.gotMsg = messages
-	m.gotTools = tools
-	m.gotThinkingEnabled = thinkingEnabled
-	return m.resp, m.err
+// mockChatStreamer implements chatStreamer with injectable results.
+type mockChatStreamer struct {
+	streamFn      streamFunc
+	usageEvents   []usageCall
+	allowedModels []service.ChatModelInfo
+	allowedErr    error
+}
+
+func (m *mockChatStreamer) StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error) {
+	return m.streamFn(ctx, userID, appID, logicalModel, messages, tools, thinkingEnabled)
+}
+
+func (m *mockChatStreamer) RecordUsage(_ context.Context, userID, appID string, route *service.ChatRoute, status string, inputTokens, outputTokens int) {
+	m.usageEvents = append(m.usageEvents, usageCall{userID: userID, appID: appID, status: status, route: route, inputTokens: inputTokens, outputTokens: outputTokens})
+}
+
+func (m *mockChatStreamer) AllowedModels(_ context.Context, _, _ string) ([]service.ChatModelInfo, error) {
+	return m.allowedModels, m.allowedErr
+}
+
+// chatCall captures one StreamChat invocation for assertions.
+type chatCall struct {
+	userID, appID, logicalModel string
+	messages                    []model.ChatMessage
+	tools                       []json.RawMessage
+	thinkingEnabled             *bool
+}
+
+// sseResp builds a streaming upstream response carrying sse.
+func sseResp(sse string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}
+}
+
+// streamReply returns a streamFn that records the call into got (when
+// non-nil) and replies with a 200 SSE response carrying sse plus a resolved
+// route, mimicking a successful upstream call.
+func streamReply(sse string, got *chatCall) streamFunc {
+	return func(_ context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error) {
+		if got != nil {
+			*got = chatCall{userID: userID, appID: appID, logicalModel: logicalModel, messages: messages, tools: tools, thinkingEnabled: thinkingEnabled}
+		}
+		return sseResp(sse), &service.ChatRoute{LogicalModel: "deepseek-flash"}, nil
+	}
+}
+
+// streamFails returns a streamFn that fails with err before any upstream
+// response exists (no route either).
+func streamFails(err error) streamFunc {
+	return func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+		return nil, nil, err
+	}
 }
 
 // chatTestRouter wires a ChatHandler behind a fake JWT identity
 // (user_id/app_id set directly) and returns the router + mock.
-func chatTestRouter(svc *mockChatSvc) (*gin.Engine, *mockChatSvc) {
+func chatTestRouter(svc *mockChatStreamer) (*gin.Engine, *mockChatStreamer) {
 	gin.SetMode(gin.TestMode)
 	h := NewChatHandler(svc, nil)
 	r := gin.New()
@@ -56,7 +105,7 @@ func chatTestRouter(svc *mockChatSvc) (*gin.Engine, *mockChatSvc) {
 
 // chatTestRouterWithLog wires the same handler with an in-memory access log
 // and returns the router + log buffer.
-func chatTestRouterWithLog(svc *mockChatSvc) (*gin.Engine, *bytes.Buffer) {
+func chatTestRouterWithLog(svc *mockChatStreamer) (*gin.Engine, *bytes.Buffer) {
 	gin.SetMode(gin.TestMode)
 	var buf bytes.Buffer
 	h := NewChatHandler(svc, log.New(&buf, "", 0))
@@ -67,6 +116,20 @@ func chatTestRouterWithLog(svc *mockChatSvc) (*gin.Engine, *bytes.Buffer) {
 		h.StreamChat(c)
 	})
 	return r, &buf
+}
+
+// chatModelsTestRouter wires GetModels (GET /chat/models) behind the same
+// fake JWT identity.
+func chatModelsTestRouter(svc *mockChatStreamer) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	h := NewChatHandler(svc, nil)
+	r := gin.New()
+	r.GET("/chat/models", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "u-1")
+		c.Set(middleware.ContextAppID, "yunhou-website")
+		h.GetModels(c)
+	})
+	return r
 }
 
 func performChatRequest(r *gin.Engine, body string) *httptest.ResponseRecorder {
@@ -93,7 +156,7 @@ func TestChatHandler_Validation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, _ := chatTestRouter(&mockChatSvc{})
+			r, _ := chatTestRouter(&mockChatStreamer{})
 			w := performChatRequest(r, tc.body)
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", w.Code)
@@ -109,6 +172,32 @@ func TestChatHandler_Validation(t *testing.T) {
 	}
 }
 
+// TestChatHandler_ModelTooLong: a model id beyond ChatMaxModelLen is
+// rejected with 400 before any upstream spend (the service is never called).
+func TestChatHandler_ModelTooLong(t *testing.T) {
+	called := false
+	mock := &mockChatStreamer{streamFn: func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+		called = true
+		return nil, nil, errors.New("must not be called")
+	}}
+	r, _ := chatTestRouter(mock)
+	body := `{"model":"` + strings.Repeat("m", model.ChatMaxModelLen+1) + `","messages":[{"role":"user","content":"hi"}]}`
+	w := performChatRequest(r, body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if resp["message"] != "model id too long" {
+		t.Errorf("message = %v, want %q", resp["message"], "model id too long")
+	}
+	if called {
+		t.Error("streamFn was called for an over-long model id")
+	}
+}
+
 // TestChatHandler_SystemMessageBudget verifies that a system message is
 // judged against the system budget (ChatMaxSystemBytes), not the general
 // per-message cap (ChatMaxMessageBytes). The per-message cap now exceeds
@@ -119,19 +208,15 @@ func TestChatHandler_SystemMessageBudget(t *testing.T) {
 	// 24576-byte system budget.
 	bigSystem := strings.Repeat("a", model.ChatMaxSystemBytes)
 	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(sse)),
-	}}
-	r, mock := chatTestRouter(svc)
+	var got chatCall
+	r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamReply(sse, &got)})
 	body := `{"messages":[{"role":"system","content":"` + bigSystem + `"},{"role":"user","content":"hi"}]}`
 	w := performChatRequest(r, body)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (system budget allows content up to ChatMaxSystemBytes)", w.Code)
 	}
-	if len(mock.gotMsg) != 2 || mock.gotMsg[0].Role != "system" {
-		t.Errorf("messages relayed = %+v, want [system ..., user hi]", mock.gotMsg)
+	if len(got.messages) != 2 || got.messages[0].Role != "system" {
+		t.Errorf("messages relayed = %+v, want [system ..., user hi]", got.messages)
 	}
 }
 
@@ -164,7 +249,7 @@ func TestChatHandler_ToolsValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, _ := chatTestRouter(&mockChatSvc{})
+			r, _ := chatTestRouter(&mockChatStreamer{})
 			w := performChatRequest(r, tc.body)
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", w.Code)
@@ -175,21 +260,17 @@ func TestChatHandler_ToolsValidation(t *testing.T) {
 	// 合法 tools + thinking 透传到 svc。
 	t.Run("valid tools and thinking relayed", func(t *testing.T) {
 		sse := "data: [DONE]\n\n"
-		svc := &mockChatSvc{resp: &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body:       io.NopCloser(strings.NewReader(sse)),
-		}}
-		r, _ := chatTestRouter(svc)
+		var got chatCall
+		r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamReply(sse, &got)})
 		w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"ls"}],"thinking_enabled":true}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", w.Code)
 		}
-		if len(svc.gotTools) != 1 {
-			t.Fatalf("tools = %d, want 1", len(svc.gotTools))
+		if len(got.tools) != 1 {
+			t.Fatalf("tools = %d, want 1", len(got.tools))
 		}
-		if svc.gotThinkingEnabled == nil || !*svc.gotThinkingEnabled {
-			t.Fatalf("thinking_enabled not relayed: %v", svc.gotThinkingEnabled)
+		if got.thinkingEnabled == nil || !*got.thinkingEnabled {
+			t.Fatalf("thinking_enabled not relayed: %v", got.thinkingEnabled)
 		}
 	})
 }
@@ -209,7 +290,7 @@ func TestChatHandler_ServiceErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, _ := chatTestRouter(&mockChatSvc{err: tc.err})
+			r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamFails(tc.err)})
 			w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
 			if w.Code != tc.status {
 				t.Fatalf("status = %d, want %d", w.Code, tc.status)
@@ -228,15 +309,41 @@ func TestChatHandler_ServiceErrors(t *testing.T) {
 	}
 }
 
+// TestChatHandler_UnknownModelMapped locks the two model-selection error
+// mappings: an unknown catalog id is a client error (400), a known model the
+// plan excludes is forbidden (403).
+func TestChatHandler_UnknownModelMapped(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"unknown model", service.ErrChatUnknownModel, http.StatusBadRequest},
+		{"model not allowed", service.ErrChatModelNotAllowed, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamFails(tc.err)})
+			w := performChatRequest(r, `{"model":"some-model","messages":[{"role":"user","content":"hi"}]}`)
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d", w.Code, tc.status)
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("response not JSON: %v", err)
+			}
+			if resp["message"] != tc.err.Error() {
+				t.Errorf("message = %v, want %q", resp["message"], tc.err.Error())
+			}
+		})
+	}
+}
+
 func TestChatHandler_StreamSuccess(t *testing.T) {
 	// Upstream SSE with two chunks — the relay must emit both and flush.
 	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\ndata: [DONE]\n\n"
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(sse)),
-	}}
-	r, mock := chatTestRouter(svc)
+	var got chatCall
+	r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamReply(sse, &got)})
 	w := performChatRequest(r, `{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}`)
 
 	if w.Code != http.StatusOK {
@@ -248,25 +355,136 @@ func TestChatHandler_StreamSuccess(t *testing.T) {
 	if body := w.Body.String(); body != sse {
 		t.Errorf("relayed body = %q, want %q", body, sse)
 	}
-	if mock.gotUID != "u-1" {
-		t.Errorf("userID = %q, want u-1", mock.gotUID)
+	if got.userID != "u-1" {
+		t.Errorf("userID = %q, want u-1", got.userID)
 	}
-	if mock.gotApp != "yunhou-website" {
-		t.Errorf("appID = %q, want yunhou-website", mock.gotApp)
+	if got.appID != "yunhou-website" {
+		t.Errorf("appID = %q, want yunhou-website", got.appID)
 	}
-	if len(mock.gotMsg) != 2 || mock.gotMsg[1].Role != "user" || mock.gotMsg[1].Content != "hi" {
-		t.Errorf("messages relayed = %+v, want [system be brief, user hi]", mock.gotMsg)
+	if len(got.messages) != 2 || got.messages[1].Role != "user" || got.messages[1].Content != "hi" {
+		t.Errorf("messages relayed = %+v, want [system be brief, user hi]", got.messages)
+	}
+}
+
+// TestChatHandler_ModelFieldRelayed: the optional logical model id reaches
+// the service verbatim; omitted (pre-multi-model clients) it arrives as "".
+func TestChatHandler_ModelFieldRelayed(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	var got chatCall
+	r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamReply(sse, &got)})
+	w := performChatRequest(r, `{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got.logicalModel != "kimi-k3" {
+		t.Errorf("logicalModel = %q, want kimi-k3", got.logicalModel)
+	}
+
+	got = chatCall{}
+	w = performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no model field)", w.Code)
+	}
+	if got.logicalModel != "" {
+		t.Errorf("logicalModel = %q, want empty (server picks the default)", got.logicalModel)
+	}
+}
+
+// TestChatHandler_RecordsUsageAfterStream: a completed stream meters exactly
+// one usage event, with tokens parsed from the terminal usage chunk and the
+// resolved route from the service.
+func TestChatHandler_RecordsUsageAfterStream(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n" +
+		"data: [DONE]\n\n"
+	mock := &mockChatStreamer{
+		streamFn: func(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(sse)),
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			}, &service.ChatRoute{LogicalModel: "kimi-k3"}, nil
+		},
+	}
+	r, _ := chatTestRouter(mock)
+	w := performChatRequest(r, `{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if len(mock.usageEvents) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(mock.usageEvents))
+	}
+	ev := mock.usageEvents[0]
+	if ev.inputTokens != 7 || ev.outputTokens != 2 || ev.status != "ok" || ev.route.LogicalModel != "kimi-k3" {
+		t.Errorf("usage event = %+v", ev)
+	}
+	if ev.userID != "u-1" || ev.appID != "yunhou-website" {
+		t.Errorf("usage event identity = %s/%s, want u-1/yunhou-website", ev.userID, ev.appID)
+	}
+}
+
+// TestChatHandler_NoUsageRecordedWhenUpstreamCallFails: no upstream response
+// means no spend to meter.
+func TestChatHandler_NoUsageRecordedWhenUpstreamCallFails(t *testing.T) {
+	mock := &mockChatStreamer{
+		streamFn: func(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error) {
+			return nil, nil, service.ErrChatUpstreamError
+		},
+	}
+	r, _ := chatTestRouter(mock)
+	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	if len(mock.usageEvents) != 0 {
+		t.Errorf("usage events = %d, want 0 (no upstream spend happened)", len(mock.usageEvents))
+	}
+}
+
+func TestChatHandler_GetModels(t *testing.T) {
+	mock := &mockChatStreamer{allowedModels: []service.ChatModelInfo{
+		{ID: "deepseek-flash", DisplayName: "DeepSeek Flash", Provider: "deepseek", Default: true},
+	}}
+	r := chatModelsTestRouter(mock)
+	req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"code":0`) {
+		t.Errorf("body missing code 0: %s", body)
+	}
+	if !strings.Contains(body, "deepseek-flash") {
+		t.Errorf("body missing model id: %s", body)
+	}
+	if !strings.Contains(body, `"default":true`) {
+		t.Errorf("body missing default flag: %s", body)
+	}
+}
+
+func TestChatHandler_GetModelsNoAccess(t *testing.T) {
+	mock := &mockChatStreamer{allowedErr: service.ErrChatNoAccess}
+	r := chatModelsTestRouter(mock)
+	req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if resp["message"] != service.ErrChatNoAccess.Error() {
+		t.Errorf("message = %v, want %q", resp["message"], service.ErrChatNoAccess.Error())
 	}
 }
 
 func TestChatHandler_AccessLog_Success(t *testing.T) {
 	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"世界\"}}]}\n\ndata: [DONE]\n\n"
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(sse)),
-	}}
-	r, logBuf := chatTestRouterWithLog(svc)
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamReply(sse, nil)})
 	body := `{"session_id":"sess-abc-123","messages":[{"role":"user","content":"hi"}]}`
 	w := performChatRequest(r, body)
 	if w.Code != http.StatusOK {
@@ -310,8 +528,26 @@ func TestChatHandler_AccessLog_Success(t *testing.T) {
 	}
 }
 
+// TestChatHandler_AccessLog_Model: the audit line records the RESOLVED model
+// (what actually served the request), not the raw client value.
+func TestChatHandler_AccessLog_Model(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamReply(sse, nil)})
+	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var entry chatAccessEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(logBuf.String())), &entry); err != nil {
+		t.Fatalf("log line not JSON: %v", err)
+	}
+	if entry.Model != "deepseek-flash" {
+		t.Errorf("model = %q, want the resolved route model deepseek-flash", entry.Model)
+	}
+}
+
 func TestChatHandler_AccessLog_Error(t *testing.T) {
-	r, logBuf := chatTestRouterWithLog(&mockChatSvc{err: service.ErrChatNoAccess})
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamFails(service.ErrChatNoAccess)})
 	w := performChatRequest(r, `{"session_id":"sess-x","messages":[{"role":"user","content":"hi"}]}`)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", w.Code)
@@ -384,12 +620,7 @@ func TestChatHandler_AccessLog_TruncatedOutput(t *testing.T) {
 	// (rune-safe) output, the truncated flag, and the REAL output_bytes.
 	big := strings.Repeat("答", chatOutputLogCap/2+100) // > cap in bytes
 	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"" + big + "\"}}]}\n\ndata: [DONE]\n\n"
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(sse)),
-	}}
-	r, logBuf := chatTestRouterWithLog(svc)
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamReply(sse, nil)})
 	if w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`); w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
@@ -413,7 +644,7 @@ func TestChatHandler_AccessLog_TruncatedOutput(t *testing.T) {
 
 func TestChatHandler_AccessLog_InvalidBody(t *testing.T) {
 	// JSON binding failures must also leave an audit line (status=error).
-	r, logBuf := chatTestRouterWithLog(&mockChatSvc{})
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{})
 	w := performChatRequest(r, `{"messages":`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", w.Code)
@@ -430,12 +661,14 @@ func TestChatHandler_AccessLog_InvalidBody(t *testing.T) {
 func TestChatHandler_AccessLog_UpstreamBroke(t *testing.T) {
 	// An upstream that dies mid-stream must be audited as upstream_error
 	// (not "disconnected" — that means the CLIENT went away).
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(&errAfterReader{data: "data: {\"choices\":[{\"delta\":{\"content\":\"半\"}}]}\n\n"}),
+	mock := &mockChatStreamer{streamFn: func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&errAfterReader{data: "data: {\"choices\":[{\"delta\":{\"content\":\"半\"}}]}\n\n"}),
+		}, &service.ChatRoute{LogicalModel: "deepseek-flash"}, nil
 	}}
-	r, logBuf := chatTestRouterWithLog(svc)
+	r, logBuf := chatTestRouterWithLog(mock)
 	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (stream had already started)", w.Code)
@@ -461,12 +694,14 @@ func TestChatHandler_AccessLog_UpstreamBroke(t *testing.T) {
 // would render as a completed answer.
 func TestChatHandler_UpstreamBrokeInjectsErrorEvent(t *testing.T) {
 	partial := "data: {\"choices\":[{\"delta\":{\"content\":\"半\"}}]}\n\n"
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(&errAfterReader{data: partial}),
+	mock := &mockChatStreamer{streamFn: func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&errAfterReader{data: partial}),
+		}, &service.ChatRoute{LogicalModel: "deepseek-flash"}, nil
 	}}
-	r, _ := chatTestRouter(svc)
+	r, _ := chatTestRouter(mock)
 	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (stream had already started)", w.Code)
@@ -482,7 +717,7 @@ func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 	// must cap it (per message) instead of mirroring the full payload.
 	long := strings.Repeat("滥", model.ChatMaxMessageBytes) // fails the per-message validation
 	body := `{"messages":[{"role":"user","content":"` + long + `"}]}`
-	r, logBuf := chatTestRouterWithLog(&mockChatSvc{})
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{})
 	w := performChatRequest(r, body)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", w.Code)
@@ -517,12 +752,8 @@ func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 // "[tool call: ...]" annotation that broke the built-in model's tool calling.
 func TestChatHandler_ToolMessagesAcceptance(t *testing.T) {
 	sse := "data: [DONE]\n\n"
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(sse)),
-	}}
-	r, mock := chatTestRouter(svc)
+	var got chatCall
+	r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamReply(sse, &got)})
 	// A multi-turn tool loop: assistant (empty content + tool_calls) followed
 	// by a tool result (role=tool + tool_call_id).
 	body := `{"messages":[` +
@@ -534,10 +765,10 @@ func TestChatHandler_ToolMessagesAcceptance(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (tool messages must be accepted)", w.Code)
 	}
-	if len(mock.gotMsg) != 3 {
-		t.Fatalf("relayed messages = %d, want 3", len(mock.gotMsg))
+	if len(got.messages) != 3 {
+		t.Fatalf("relayed messages = %d, want 3", len(got.messages))
 	}
-	assistant := mock.gotMsg[1]
+	assistant := got.messages[1]
 	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
 		t.Fatalf("assistant tool_calls not relayed: %+v", assistant)
 	}
@@ -548,7 +779,7 @@ func TestChatHandler_ToolMessagesAcceptance(t *testing.T) {
 	if tc.Function.Arguments != `{"cmd":"ls"}` {
 		t.Errorf("arguments = %q, want JSON string {\"cmd\":\"ls\"}", tc.Function.Arguments)
 	}
-	tool := mock.gotMsg[2]
+	tool := got.messages[2]
 	if tool.Role != "tool" || tool.ToolCallID != "call_1" || tool.Content != "file_a\nfile_b" {
 		t.Errorf("tool result not relayed with tool_call_id: %+v", tool)
 	}
@@ -559,12 +790,7 @@ func TestChatHandler_ToolMessagesAcceptance(t *testing.T) {
 // "message content is required" check.
 func TestChatHandler_ToolRoleEmptyContentAccepted(t *testing.T) {
 	sse := "data: [DONE]\n\n"
-	svc := &mockChatSvc{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(sse)),
-	}}
-	r, _ := chatTestRouter(svc)
+	r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamReply(sse, nil)})
 	body := `{"messages":[{"role":"user","content":"hi"},` +
 		`{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"noop","arguments":"{}"}}]},` +
 		`{"role":"tool","content":"","tool_call_id":"c1"}]}`

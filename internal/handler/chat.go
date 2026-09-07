@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
@@ -23,7 +24,12 @@ import (
 // local interface so handler tests can inject a hand-rolled mock without a
 // real upstream.
 type chatStreamer interface {
-	StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
+	StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error)
+	// RecordUsage meters one completed upstream call; it never fails the
+	// request (the service swallows and logs repo errors).
+	RecordUsage(ctx context.Context, userID, appID string, route *service.ChatRoute, status string, inputTokens, outputTokens int)
+	// AllowedModels backs GET /chat/models.
+	AllowedModels(ctx context.Context, userID, appID string) ([]service.ChatModelInfo, error)
 }
 
 // ChatHandler serves POST /chat — the JWT-authenticated, subscription-gated
@@ -69,6 +75,7 @@ type chatAccessEntry struct {
 	UserID          string              `json:"user_id"`
 	AppID           string              `json:"app_id"`
 	SessionID       string              `json:"session_id"`
+	Model           string              `json:"model,omitempty"`
 	Status          string              `json:"status"` // "ok" | "error" | "disconnected" | "upstream_error"
 	Error           string              `json:"error,omitempty"`
 	MessageCount    int                 `json:"message_count"`
@@ -97,30 +104,35 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		// Fixed client message: err.Error() would reflect binding/struct
 		// internals to the caller.
-		h.logAccess(started, userID, appID, req, "error", "invalid request body", "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "invalid request body", "")
 		writeChatError(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if msg := validateChatMessages(req.Messages); msg != "" {
-		h.logAccess(started, userID, appID, req, "error", msg, "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
 		writeChatError(c, http.StatusBadRequest, msg)
 		return
 	}
 	if len(req.SessionID) > model.ChatMaxSessionIDLen {
-		h.logAccess(started, userID, appID, req, "error", "session_id too long", "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "session_id too long", "")
 		writeChatError(c, http.StatusBadRequest, "session_id too long")
 		return
 	}
+	if len(req.Model) > model.ChatMaxModelLen {
+		h.logAccess(started, userID, appID, req.Model, req, "error", "model id too long", "")
+		writeChatError(c, http.StatusBadRequest, "model id too long")
+		return
+	}
 	if msg := validateChatTools(req.Tools); msg != "" {
-		h.logAccess(started, userID, appID, req, "error", msg, "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
 		writeChatError(c, http.StatusBadRequest, msg)
 		return
 	}
 
-	resp, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Messages, req.Tools, req.ThinkingEnabled)
+	resp, route, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Model, req.Messages, req.Tools, req.ThinkingEnabled)
 	if err != nil {
 		status, msg := chatErrorMapping(err)
-		h.logAccess(started, userID, appID, req, "error", msg, "")
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
 		writeChatError(c, status, msg)
 		return
 	}
@@ -173,7 +185,43 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		status = "upstream_error"
 		errMsg = "upstream stream interrupted"
 	}
-	h.logAccess(started, userID, appID, req, status, errMsg, output)
+	// Meter the upstream spend. Usage tokens come from the terminal usage
+	// chunk (requested via stream_options for OpenAI providers; synthesized
+	// by the Anthropic translator). context.WithoutCancel: the request ctx
+	// is already cancelled when the client disconnected mid-stream, but the
+	// consumed tokens are a real spend and must still be recorded.
+	if route != nil {
+		inputTokens, outputTokens, _ := llm.ExtractStreamUsage(raw)
+		usageCtx, usageCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		h.svc.RecordUsage(usageCtx, userID, appID, route, status, inputTokens, outputTokens)
+		usageCancel()
+	}
+	h.logAccess(started, userID, appID, routeModel(route, req.Model), req, status, errMsg, output)
+}
+
+// routeModel prefers the resolved (effective) model over the raw client
+// value so the audit log shows what actually served the request.
+func routeModel(route *service.ChatRoute, fallback string) string {
+	if route != nil {
+		return route.LogicalModel
+	}
+	return fallback
+}
+
+// GetModels handles GET /chat/models: the catalog models the caller's plan
+// may use, for kaya's model picker. Unlike StreamChat this is a plain JSON
+// endpoint under the global 20s timeout (AllowedModels bounds its DB reads
+// with chatAccessTimeout internally).
+func (h *ChatHandler) GetModels(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	appID := c.GetString(middleware.ContextAppID)
+	models, err := h.svc.AllowedModels(c.Request.Context(), userID, appID)
+	if err != nil {
+		status, msg := chatErrorMapping(err)
+		writeChatError(c, status, msg)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": models}})
 }
 
 // chatErrorMapping converts a StreamChat error into (HTTP status, safe
@@ -196,6 +244,10 @@ func chatErrorMapping(err error) (int, string) {
 	case errors.Is(err, service.ErrChatUpstreamError):
 		log.Printf("chat: upstream error: %v", err)
 		return http.StatusBadGateway, service.ErrChatUpstreamError.Error()
+	case errors.Is(err, service.ErrChatUnknownModel):
+		return http.StatusBadRequest, service.ErrChatUnknownModel.Error()
+	case errors.Is(err, service.ErrChatModelNotAllowed):
+		return http.StatusForbidden, service.ErrChatModelNotAllowed.Error()
 	default:
 		log.Printf("chat: internal error: %v", err)
 		return http.StatusInternalServerError, "internal error"
@@ -209,7 +261,7 @@ func chatErrorMapping(err error) (int, string) {
 // error lines the input is truncated too: validation-failed requests carry
 // unvalidated (potentially near-32 KiB per message) content that would
 // otherwise be mirrored into the log in full.
-func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req model.ChatRequest, status, errMsg, output string) {
+func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string, req model.ChatRequest, status, errMsg, output string) {
 	if h.accessLog == nil {
 		return
 	}
@@ -225,6 +277,7 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req mod
 		UserID:          userID,
 		AppID:           appID,
 		SessionID:       req.SessionID,
+		Model:           modelID,
 		Status:          status,
 		Error:           errMsg,
 		MessageCount:    len(req.Messages),

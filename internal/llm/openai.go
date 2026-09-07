@@ -34,6 +34,10 @@ func BuildOpenAIPayload(upstreamModel string, messages []model.ChatMessage, tool
 // terminal usage chunk (choices: [], usage: {...}) and returns the token
 // counts. The LAST usage chunk wins so cumulative-reporting providers are
 // handled correctly. ok=false when no chunk carried usage.
+//
+// This is the batch-shaped twin of UsageTracker, kept for tests — production
+// metering does NOT use it (a bounded capture can miss the usage chunk);
+// the relay meters via UsageTracker as bytes flow through.
 func ExtractStreamUsage(raw []byte) (inputTokens, outputTokens int, ok bool) {
 	for _, block := range strings.Split(string(raw), "\n\n") {
 		line := strings.TrimSpace(block)

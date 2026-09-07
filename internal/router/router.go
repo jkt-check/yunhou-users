@@ -38,6 +38,7 @@ func Setup(
 	wechatOAuthMock bool,
 	wechatPayMock bool,
 	usageSvc *service.UsageService,
+	llmUsageSvc *service.LLMUsageService,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -53,6 +54,7 @@ func Setup(
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
 	chatHandler := handler.NewChatHandler(chatSvc, chatAccessLog)
 	usageHandler := handler.NewUsageHandler(usageSvc)
+	llmUsageHandler := handler.NewLLMUsageHandler(llmUsageSvc)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
@@ -162,6 +164,9 @@ func Setup(
 		adminGroup.GET("/stats/active", usageHandler.GetActiveStats)
 		adminGroup.GET("/stats/usage-duration", usageHandler.GetUsageDuration)
 		adminGroup.GET("/stats/new-users", usageHandler.GetNewUsers)
+
+		// LLM token metering aggregates (migration 022).
+		adminGroup.GET("/stats/llm-usage", llmUsageHandler.GetByModel)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

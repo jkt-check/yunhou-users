@@ -36,10 +36,17 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens int, messages []model
 				systemParts = append(systemParts, m.Content)
 			}
 		case "user":
-			msgs = append(msgs, map[string]any{
-				"role":    "user",
-				"content": []any{map[string]any{"type": "text", "text": m.Content}},
-			})
+			block := map[string]any{"type": "text", "text": m.Content}
+			// Anthropic requires strict user/assistant alternation (400
+			// otherwise) while handler validation deliberately allows
+			// consecutive same-role messages: merge into the previous user
+			// turn. Text goes after any tool_result blocks already there —
+			// tool_results must lead the turn.
+			if n := len(msgs); n > 0 && msgs[n-1]["role"] == "user" {
+				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), block)
+				continue
+			}
+			msgs = append(msgs, map[string]any{"role": "user", "content": []any{block}})
 		case "assistant":
 			var blocks []any
 			if m.Content != "" {
@@ -59,18 +66,34 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens int, messages []model
 			if len(blocks) == 0 {
 				continue
 			}
+			// Same alternation rule as the user case: append to a previous
+			// assistant turn instead of opening an adjacent one.
+			if n := len(msgs); n > 0 && msgs[n-1]["role"] == "assistant" {
+				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), blocks...)
+				continue
+			}
 			msgs = append(msgs, map[string]any{"role": "assistant", "content": blocks})
 		case "tool":
 			block := map[string]any{"type": "tool_result", "tool_use_id": m.ToolCallID, "content": m.Content}
 			// Anthropic requires tool_result blocks at the start of a user
-			// turn; consecutive OpenAI tool messages merge into one.
+			// turn; consecutive OpenAI tool messages merge into one user
+			// message, and a tool result following a plain user text merges
+			// ahead of that text rather than opening an adjacent user turn.
 			if n := len(msgs); n > 0 && msgs[n-1]["role"] == "user" {
-				if arr, ok := msgs[n-1]["content"].([]any); ok && len(arr) > 0 {
-					if first, ok := arr[0].(map[string]any); ok && first["type"] == "tool_result" {
-						msgs[n-1]["content"] = append(arr, block)
-						continue
+				arr := msgs[n-1]["content"].([]any)
+				insert := 0
+				for insert < len(arr) {
+					b, ok := arr[insert].(map[string]any)
+					if !ok || b["type"] != "tool_result" {
+						break
 					}
+					insert++
 				}
+				arr = append(arr, nil)
+				copy(arr[insert+1:], arr[insert:])
+				arr[insert] = block
+				msgs[n-1]["content"] = arr
+				continue
 			}
 			msgs = append(msgs, map[string]any{"role": "user", "content": []any{block}})
 		default:

@@ -150,3 +150,105 @@ func TestBuildAnthropicPayload_Thinking(t *testing.T) {
 		t.Errorf("max_tokens %v must exceed budget_tokens", p["max_tokens"])
 	}
 }
+
+// TestBuildAnthropicPayload_MergesConsecutiveSameRole: handler validation
+// deliberately allows consecutive same-role messages (OpenAI accepts them),
+// but Anthropic requires strict user/assistant alternation and 400s — the
+// translation must merge such turns into one.
+func TestBuildAnthropicPayload_MergesConsecutiveSameRole(t *testing.T) {
+	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+		{Role: "user", Content: "one"},
+		{Role: "user", Content: "two"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "user", Content: "three"},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	msgs := decode(t, body)["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want 3 (consecutive same-role turns merged)", len(msgs))
+	}
+	user := msgs[0].(map[string]any)
+	if user["role"] != "user" {
+		t.Fatalf("msgs[0].role = %v", user["role"])
+	}
+	ub := user["content"].([]any)
+	if len(ub) != 2 || ub[0].(map[string]any)["text"] != "one" || ub[1].(map[string]any)["text"] != "two" {
+		t.Errorf("merged user blocks = %v, want [one two]", ub)
+	}
+	asst := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Fatalf("msgs[1].role = %v", asst["role"])
+	}
+	ab := asst["content"].([]any)
+	if len(ab) != 2 || ab[0].(map[string]any)["text"] != "a1" || ab[1].(map[string]any)["text"] != "a2" {
+		t.Errorf("merged assistant blocks = %v, want [a1 a2]", ab)
+	}
+	last := msgs[2].(map[string]any)
+	if last["role"] != "user" || last["content"].([]any)[0].(map[string]any)["text"] != "three" {
+		t.Errorf("msgs[2] = %v", last)
+	}
+}
+
+// TestBuildAnthropicPayload_ToolAfterPlainUserMerges: a tool result following
+// a plain user message must not open a second adjacent user turn; the
+// tool_result block merges in ahead of the text (tool_results lead the turn).
+func TestBuildAnthropicPayload_ToolAfterPlainUserMerges(t *testing.T) {
+	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+		{Role: "user", Content: "hi"},
+		{Role: "tool", Content: "res", ToolCallID: "c1"},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	msgs := decode(t, body)["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("messages len = %d, want 1 (tool result merged into the user turn)", len(msgs))
+	}
+	blocks := msgs[0].(map[string]any)["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("merged blocks = %d, want 2", len(blocks))
+	}
+	if b := blocks[0].(map[string]any); b["type"] != "tool_result" || b["tool_use_id"] != "c1" {
+		t.Errorf("blocks[0] = %v, want the tool_result first", b)
+	}
+	if b := blocks[1].(map[string]any); b["type"] != "text" || b["text"] != "hi" {
+		t.Errorf("blocks[1] = %v, want the text after", b)
+	}
+}
+
+// TestBuildAnthropicPayload_UserTextAfterToolResult: a plain user text
+// following tool results merges into the same user turn, tool_result blocks
+// first, then the text (the shape Anthropic accepts).
+func TestBuildAnthropicPayload_UserTextAfterToolResult(t *testing.T) {
+	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+		{Role: "assistant", ToolCalls: []model.ToolCall{
+			{ID: "c1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: `{"cmd":"ls"}`}},
+		}},
+		{Role: "tool", Content: "file_a", ToolCallID: "c1"},
+		{Role: "user", Content: "thanks"},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	msgs := decode(t, body)["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want 2 (assistant + merged user)", len(msgs))
+	}
+	user := msgs[1].(map[string]any)
+	if user["role"] != "user" {
+		t.Fatalf("msgs[1].role = %v", user["role"])
+	}
+	blocks := user["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("merged blocks = %d, want 2", len(blocks))
+	}
+	if b := blocks[0].(map[string]any); b["type"] != "tool_result" || b["content"] != "file_a" {
+		t.Errorf("blocks[0] = %v, want tool_result first", b)
+	}
+	if b := blocks[1].(map[string]any); b["type"] != "text" || b["text"] != "thanks" {
+		t.Errorf("blocks[1] = %v, want the user text last", b)
+	}
+}

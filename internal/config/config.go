@@ -199,11 +199,11 @@ func Load() *Config {
 
 		PlanAmountOverrideJSON: os.Getenv("PLAN_AMOUNT_OVERRIDE_JSON"),
 
-		DeepSeekAPIKey:     os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekBaseURL:    envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-		DeepSeekModel:      envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-		LLMProvidersJSON:   os.Getenv("LLM_PROVIDERS_JSON"),
-		ChatLogPath:        os.Getenv("CHAT_LOG_PATH"),
+		DeepSeekAPIKey:   os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekBaseURL:  envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+		DeepSeekModel:    envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+		LLMProvidersJSON: os.Getenv("LLM_PROVIDERS_JSON"),
+		ChatLogPath:      os.Getenv("CHAT_LOG_PATH"),
 	}
 }
 

@@ -448,7 +448,8 @@ func TestChatService_AnthropicShapeGuardMarkedClientError(t *testing.T) {
 	}
 }
 
-func TestChatService_RecordUsage(t *testing.T) {	usageRepo := &mockLLMUsageRepo{}
+func TestChatService_RecordUsage(t *testing.T) {
+	usageRepo := &mockLLMUsageRepo{}
 	svc := NewChatService(testCatalog("https://upstream.invalid"), newMockSubscriptionRepo(), newMockPlanRepo(), usageRepo)
 	route := &ChatRoute{LogicalModel: "deepseek-flash", Provider: "deepseek", Protocol: llm.ProtocolOpenAI, UpstreamModel: "deepseek-v4-flash", InputPerMtok: 2, OutputPerMtok: 8}
 	// cost = 100*2 + 50*8 = 600 µ¥ (see llm.Model price identity)

@@ -516,12 +516,12 @@ Authorization: Bearer <access_token>
 
 ### Chat 接口
 
-Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的 DeepSeek API Key 代为调用模型，并把流式响应原样转发给客户端。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：
+Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的上游 API Key 代为调用模型，并把流式响应统一翻译成 OpenAI 兼容的 SSE 格式转发给客户端。服务端支持**多模型目录**：运营方通过 `LLM_PROVIDERS_JSON` 配置多个 provider（OpenAI 兼容协议或 Anthropic 协议）与多个逻辑模型；未配置 `LLM_PROVIDERS_JSON` 时回退到旧的 `DEEPSEEK_*` 三件套（合成单模型目录，行为与之前完全一致）。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：
 
 - 要求 JWT 认证（与 `/user/*` 同级，引擎级挂载在 `POST /chat`）；
 - 要求有效订阅：订阅未过期、Plan 处于激活态且 `plan.apps` 包含 JWT 的 `app_id`（与登录时 `has_access` 同一判定矩阵），否则 403；
 - 独立限流桶 10 次/秒、突发 20（按 IP，与其他接口桶隔离）；
-- 服务端未配置 `DEEPSEEK_API_KEY` 时整体返回 404（未启用）。
+- 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` 时整体返回 404（未启用）。
 
 #### POST /chat
 
@@ -540,13 +540,14 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `messages` | 是 | 对话消息数组，OpenAI 兼容格式；`role` 取值 `system` / `user` / `assistant` / `tool`。kaya 自行维护会话历史，每次请求携带完整上下文（服务端无状态代理） |
+| `model` | 否 | 逻辑模型 ID（≤64 字符），取值来自 `GET /chat/models` 返回的 `id`。省略时使用目录的默认模型（`default_model`）；旧客户端不传该字段行为不变 |
 | `session_id` | 否 | 会话标识（≤64 字符），仅用于服务端访问日志按会话分组，不参与任何业务逻辑 |
 | `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
 | `thinking_enabled` | 否 | 布尔值；为 `true` 时上游请求带 `thinking: {"type": "enabled"}`（DeepSeek 推理模式），省略/`false` 时不下发该字段 |
 
 **限制**（超出返回 400）：1–20 条消息；每条 `content` ≤32768 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息走独立上限 ≤24576 字节；全部消息总字节数 ≤262144。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
 
-**响应（200）**：`Content-Type: text/event-stream`，逐块透传 DeepSeek 的 OpenAI 兼容 SSE 事件：
+**响应（200）**：`Content-Type: text/event-stream`，无论上游是 OpenAI 兼容协议还是 Anthropic 协议，服务端统一翻译成 OpenAI 兼容的 `chat.completion.chunk` SSE 事件：
 
 ```
 data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"content":"你"}}]}
@@ -558,21 +559,82 @@ data: [DONE]
 
 kaya 端按 `data: ` 前缀解析 JSON，拼接 `choices[0].delta.content` 即得完整回复；`data: [DONE]` 表示流结束。
 
-**错误响应**（流开始前返回标准 JSON；流开始后的错误取决于成因——DeepSeek 自身发出的错误事件会原样透传，而上游连接中断（含 5 分钟超时）时服务端会先向流内注入一条 `data: {"error":{"message":"upstream stream interrupted"}}` 事件再结束响应，客户端应把流内 `error` 事件与"缺少 `[DONE]` 的结束"都视为失败并重试）：
+**错误响应**（流开始前返回标准 JSON；流开始后的错误取决于成因——上游自身发出的错误事件会原样透传（Anthropic 协议的错误也会翻译成 OpenAI 形态），而上游连接中断（含 5 分钟超时）时服务端会先向流内注入一条 `data: {"error":{"message":"upstream stream interrupted"}}` 事件再结束响应，客户端应把流内 `error` 事件与"缺少 `[DONE]` 的结束"都视为失败并重试）：
 
 | HTTP | message | 触发条件 |
 |---|---|---|
-| 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` / `too many tools` / `tools too large` / `invalid tool definition` | 请求体、消息或 tools 不符合限制 |
+| 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` / `model id too long` / `too many tools` / `tools too large` / `invalid tool definition` | 请求体、消息或 tools 不符合限制 |
+| 400 | `unknown chat model` | `model` 字段不在服务端目录中 |
 | 401 | `missing or invalid authorization header` / `invalid or expired token` | 未携带或无效 JWT（由 `JWTAuth` 中间件统一返回） |
 | 403 | `active subscription with access to this app is required` | 无有效订阅，或 Plan 未激活，或 `plan.apps` 不含 JWT `app_id` |
-| 404 | `chat is not enabled` | 服务端未配置 `DEEPSEEK_API_KEY` |
-| 429 | `chat upstream rate limit exceeded` | DeepSeek 上游限流 |
+| 403 | `chat model is not allowed for the current plan` | 订阅有效，但该 Plan 的 `chat_models` 白名单不含请求的模型 |
+| 404 | `chat is not enabled` | 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` |
+| 429 | `chat upstream rate limit exceeded` | 上游限流（该 provider 全部 API key 均在冷却期内） |
 | 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——永久性错误，重试同样的请求必败 |
-| 502 | `chat upstream error` | 上游 5xx 或网络错误 |
+| 502 | `chat upstream error` | 上游 5xx 或网络错误（该 provider 所有可用 key 均已尝试） |
 
 **超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 5 分钟，订阅门禁的 DB 查询另有 10s 上限。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。错误行的输入按每条消息 1 KiB 截断（`input_truncated` 标记），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII），需部署侧配置轮转。
 
 **部署注意**：SSE 需要反代放行长连接且不缓冲——参考 `deploy/nginx.conf` 的 `location = /chat`（`proxy_buffering off`、`proxy_read_timeout 360s`）；服务端也会随响应下发 `X-Accel-Buffering: no`。
+
+#### GET /chat/models
+
+模型选择器接口（kaya 用于渲染模型下拉框）。JWT 认证，限流与 `POST /chat` 同桶；同样要求有效订阅。返回**当前用户 Plan 允许**的模型列表（已按 `chat_models` 白名单过滤）：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "models": [
+      {"id": "deepseek-flash", "display_name": "DeepSeek Flash", "provider": "deepseek", "default": true},
+      {"id": "kimi-k3", "display_name": "Kimi K3", "provider": "kimi", "default": false}
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 逻辑模型 ID，传给 `POST /chat` 的 `model` 字段 |
+| `display_name` | 展示名（目录中为空时回退为 `id`） |
+| `provider` | 所属 provider 名（目录中的 key，仅供展示） |
+| `default` | 是否为目录默认模型（`POST /chat` 省略 `model` 时使用） |
+
+错误：401（未携带/无效 JWT）、403（无有效订阅）、404（chat 未启用，同 `POST /chat`）。
+
+#### 运营侧：多模型目录配置（LLM_PROVIDERS_JSON）
+
+`LLM_PROVIDERS_JSON` 是一个 JSON 对象（设置后**优先于** `DEEPSEEK_*`；未设置时用 `DEEPSEEK_*` 合成单模型目录，老部署零改动）。结构：
+
+```json
+{
+  "default_model": "deepseek-flash",
+  "providers": {
+    "<provider名>": {
+      "protocol": "openai | anthropic",
+      "base_url": "https://...",
+      "api_keys": ["sk-a", "sk-b"],
+      "headers": {"可选": "每个请求附加的静态头"}
+    }
+  },
+  "models": {
+    "<逻辑模型ID>": {
+      "provider": "<provider名>",
+      "upstream_model": "<上游真实模型名>",
+      "display_name": "展示名",
+      "input_price_per_mtok": 2,
+      "output_price_per_mtok": 8,
+      "max_tokens": 16384
+    }
+  }
+}
+```
+
+- 价格为**每百万 token 的人民币元数**（成本核算用，可为 0）；`max_tokens` 仅 Anthropic 协议需要（缺省 8192）。多模型目录必须显式指定 `default_model`；单模型目录可省略（自动取唯一模型）。
+- JSON 在启动时解析并强校验（未知字段、空 api_keys、模型引用不存在的 provider、非法 base_url 等均**启动即失败**），改配置需重启生效。
+- **Key 池**：每个 provider 的 `api_keys` 组成轮询池；某 key 收到 429/5xx 后冷却 60s；池内 ≥2 个可用 key 时，单个 key 的临时失败会**透明换 key 重试一次**。全部 key 冷却中对客户端返回 429 `chat upstream rate limit exceeded`。
+- **计量**：每次请求结束后写入 `llm_usage_events` 表（user/app/模型/token 数/成本，迁移 022）；聚合查询走内部接口 `GET /admin/stats/llm-usage?from=YYYY-MM-DD&to=YYYY-MM-DD`（InternalAppAuth 鉴权），按模型分组返回 token 与成本合计。上游不返回 usage 的 provider 记为 0 token（行仍会写入）。
+- **按 Plan 限制可用模型**：`plans.chat_models` 列为白名单（NULL/空 = 放开全部目录模型）。示例：`UPDATE plans SET chat_models = '{deepseek-flash,kimi-k3}' WHERE id = 'monthly';`
 
 ---
 

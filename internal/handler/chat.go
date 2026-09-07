@@ -267,6 +267,13 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string
 	if h.accessLog == nil {
 		return
 	}
+	// modelID can be the RAW client value (validation-failure paths): the
+	// >64-char rejection still logs it, and the body cap would let one audit
+	// line carry ~300 KiB of junk. Cap it here so no call site can forget.
+	if len(modelID) > model.ChatMaxModelLen {
+		cut, _ := truncateUTF8(modelID, model.ChatMaxModelLen)
+		modelID = cut + "…"
+	}
 	realBytes := len(output)
 	output, truncated := truncateChatOutput(output)
 	input := req.Messages

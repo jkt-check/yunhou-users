@@ -626,6 +626,32 @@ func TestChatHandler_AccessLog_Model(t *testing.T) {
 	}
 }
 
+// TestChatHandler_AccessLog_ModelTruncated: an over-long model id is rejected
+// with 400, but the raw value still reaches the audit line — it must be
+// truncated there, not mirrored in full (the body cap would otherwise let one
+// line carry ~300 KiB of junk).
+func TestChatHandler_AccessLog_ModelTruncated(t *testing.T) {
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{})
+	long := strings.Repeat("m", model.ChatMaxModelLen*4)
+	w := performChatRequest(r, `{"model":"`+long+`","messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	var entry chatAccessEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(logBuf.String())), &entry); err != nil {
+		t.Fatalf("log line not JSON: %v", err)
+	}
+	if want := model.ChatMaxModelLen + len("…"); len(entry.Model) != want {
+		t.Errorf("logged model len = %d, want %d (cap + ellipsis)", len(entry.Model), want)
+	}
+	if !strings.HasSuffix(entry.Model, "…") {
+		t.Errorf("logged model = %q, want an ellipsis marker", entry.Model)
+	}
+	if !utf8.ValidString(entry.Model) {
+		t.Error("logged model is not valid UTF-8")
+	}
+}
+
 func TestChatHandler_AccessLog_Error(t *testing.T) {
 	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamFails(service.ErrChatNoAccess)})
 	w := performChatRequest(r, `{"session_id":"sess-x","messages":[{"role":"user","content":"hi"}]}`)

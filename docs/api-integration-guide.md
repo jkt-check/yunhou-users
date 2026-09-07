@@ -516,7 +516,7 @@ Authorization: Bearer <access_token>
 
 ### Chat 接口
 
-Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的上游 API Key 代为调用模型，并把流式响应统一翻译成 OpenAI 兼容的 SSE 格式转发给客户端。服务端支持**多模型目录**：运营方通过 `LLM_PROVIDERS_JSON` 配置多个 provider（OpenAI 兼容协议或 Anthropic 协议）与多个逻辑模型；未配置 `LLM_PROVIDERS_JSON` 时回退到旧的 `DEEPSEEK_*` 三件套（合成单模型目录，行为与之前完全一致）。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：
+Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的上游 API Key 代为调用模型，并把流式响应统一翻译成 OpenAI 兼容的 SSE 格式转发给客户端。服务端支持**多模型目录**：运营方通过 `LLM_PROVIDERS_JSON` 配置多个 provider（OpenAI 兼容协议或 Anthropic 协议）与多个逻辑模型；未配置 `LLM_PROVIDERS_JSON` 时回退到旧的 `DEEPSEEK_*` 三件套（合成单模型目录：路由与鉴权行为与之前一致，但响应流末尾会**新增一个 usage chunk**——旧客户端必须能跳过 `choices` 为空数组的 chunk，见下文解析规则）。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：
 
 - 要求 JWT 认证（与 `/user/*` 同级，引擎级挂载在 `POST /chat`）；
 - 要求有效订阅：订阅未过期、Plan 处于激活态且 `plan.apps` 包含 JWT 的 `app_id`（与登录时 `has_access` 同一判定矩阵），否则 403；
@@ -540,38 +540,73 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `messages` | 是 | 对话消息数组，OpenAI 兼容格式；`role` 取值 `system` / `user` / `assistant` / `tool`。kaya 自行维护会话历史，每次请求携带完整上下文（服务端无状态代理） |
-| `model` | 否 | 逻辑模型 ID（≤64 字符），取值来自 `GET /chat/models` 返回的 `id`。省略时使用目录的默认模型（`default_model`）；旧客户端不传该字段行为不变 |
-| `session_id` | 否 | 会话标识（≤64 字符），仅用于服务端访问日志按会话分组，不参与任何业务逻辑 |
+| `model` | 否 | 逻辑模型 ID（≤64 **字节**），取值来自 `GET /chat/models` 返回的 `id`。省略时使用目录的默认模型（`default_model`）；旧客户端不传该字段行为不变 |
+| `session_id` | 否 | 会话标识（≤64 **字节**），仅用于服务端访问日志按会话分组，不参与任何业务逻辑 |
 | `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
-| `thinking_enabled` | 否 | 布尔值；为 `true` 时上游请求带 `thinking: {"type": "enabled"}`（DeepSeek 推理模式），省略/`false` 时不下发该字段 |
+| `thinking_enabled` | 否 | 布尔值；为 `true` 时请求启用上游推理模式，行为取决于所选模型的 provider 协议——OpenAI 协议原样下发 `thinking: {"type": "enabled"}`（不支持该字段的 provider 可能 400 → 客户端收到 502）；Anthropic 协议映射为扩展思考（`budget_tokens=4096`，`max_tokens` 下限相应抬高）。省略/`false` 时不下发。开启后响应 chunk 的 `delta` 中可能出现 `reasoning_content` 字段（两种协议都会产出），客户端不展示时可安全忽略 |
 
-**限制**（超出返回 400）：1–20 条消息；每条 `content` ≤32768 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息走独立上限 ≤24576 字节；全部消息总字节数 ≤262144。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
+**限制**（超出返回 400）：请求体整体 ≤320 KiB；1–20 条消息；每条 `content` ≤32768 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息走独立上限 ≤24576 字节；全部消息总字节数 ≤262144。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
+
+**Anthropic 协议模型的历史约束**（仅当所选 `model` 路由到 Anthropic 协议 provider 时适用；OpenAI 协议模型无此约束）：剔除 `system` 消息后历史不能为空（纯 system 请求会被拒），且首条非 system 消息必须是 `user` 轮。违反时返回 400 `chat request shape is not supported by the selected model`。
 
 **响应（200）**：`Content-Type: text/event-stream`，无论上游是 OpenAI 兼容协议还是 Anthropic 协议，服务端统一翻译成 OpenAI 兼容的 `chat.completion.chunk` SSE 事件：
 
 ```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"content":"你"}}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"content":"好"}}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"content":"你"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{"content":"好"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: {"object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14}}
 
 data: [DONE]
 ```
 
-kaya 端按 `data: ` 前缀解析 JSON，拼接 `choices[0].delta.content` 即得完整回复；`data: [DONE]` 表示流结束。
+解析规则（kaya 端务必遵守）：
+
+- 按 `data: ` 前缀解析 JSON；`data: [DONE]` 表示流正常结束。
+- **跳过 `choices` 为空数组的 chunk**——那是终结 usage chunk，只携带 token 统计（`usage.prompt_tokens` / `completion_tokens` / `total_tokens`，可用于展示本次消耗）；**严禁直接对 `choices` 取下标 0**。
+- 首个 chunk 可能只有 `delta.role`（无 content）；拼接正文取 `choices[0].delta.content`。
+- `finish_reason`：流中的内容 chunk 为 `null`；收尾内容 chunk 携带 `"stop"` / `"tool_calls"` / `"length"`（Anthropic 协议的 `end_turn` / `tool_use` / `max_tokens` 分别映射为这三个值）。
+- 跨 provider 仅保证 `object` / `choices` / `delta`（及终结 usage chunk 的 `usage`）字段存在；`id` / `created` 等字段**不保证**（Anthropic 协议翻译出的 chunk 没有 `id`）。
+
+**工具调用的流式响应契约**：模型发起工具调用时，调用信息以 `delta.tool_calls` 流式下发（请求侧 `tools` 字段见上文）。形状：
+
+```
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run_shell","arguments":""}}]},"finish_reason":null}]}
+
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":"}}]},"finish_reason":null}]}
+
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]},"finish_reason":null}]}
+
+data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+```
+
+首个 chunk 携带 `index` / `id` / `function.name`，后续 chunk 只携带 `index` + `function.arguments` 片段——`arguments` 是**分片的 JSON 字符串**，按 `index` 分组顺序拼接完整后再 `JSON.parse`。同一轮可能有多个工具调用（不同 `index`）。Anthropic 协议模型由服务端把 `tool_use` 块翻译成上述形状，客户端契约一致。
+
+历史侧契约（下一轮请求带着工具结果继续对话时）：`assistant` 轮携带 `tool_calls`（`content` 可为空），其后每个工具结果以一条 `role=tool` 消息携带对应的 `tool_call_id` 与 `content`；服务端对 Anthropic 协议模型会把它们翻译成 `tool_use` / `tool_result` 块，客户端无需感知。
 
 **错误响应**（流开始前返回标准 JSON；流开始后的错误取决于成因——上游自身发出的错误事件会原样透传（Anthropic 协议的错误也会翻译成 OpenAI 形态），而上游连接中断（含 5 分钟超时）时服务端会先向流内注入一条 `data: {"error":{"message":"upstream stream interrupted"}}` 事件再结束响应，客户端应把流内 `error` 事件与"缺少 `[DONE]` 的结束"都视为失败并重试）：
 
 | HTTP | message | 触发条件 |
 |---|---|---|
+| 400 | `invalid request body` | JSON 解析失败，或请求体超过 320 KiB 上限 |
 | 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` / `model id too long` / `too many tools` / `tools too large` / `invalid tool definition` | 请求体、消息或 tools 不符合限制 |
 | 400 | `unknown chat model` | `model` 字段不在服务端目录中 |
+| 400 | `chat request shape is not supported by the selected model` | 消息历史不满足所选模型的协议约束（仅 Anthropic 协议模型：剔除 system 后历史为空，或首条非 system 消息不是 user 轮） |
 | 401 | `missing or invalid authorization header` / `invalid or expired token` | 未携带或无效 JWT（由 `JWTAuth` 中间件统一返回） |
 | 403 | `active subscription with access to this app is required` | 无有效订阅，或 Plan 未激活，或 `plan.apps` 不含 JWT `app_id` |
 | 403 | `chat model is not allowed for the current plan` | 订阅有效，但该 Plan 的 `chat_models` 白名单不含请求的模型 |
 | 404 | `chat is not enabled` | 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` |
-| 429 | `chat upstream rate limit exceeded` | 上游限流（该 provider 全部 API key 均在冷却期内） |
+| 429 | `too many requests` | 触发每 IP 限流桶（10 次/秒，突发 20） |
+| 429 | `chat upstream rate limit exceeded` | 上游限流——该 provider 所有可用 key 均被上游限流（冷却中的 key 仍会被取出尝试，返回 429 即最后一次尝试仍被上游 429） |
 | 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——永久性错误，重试同样的请求必败 |
 | 502 | `chat upstream error` | 上游 5xx 或网络错误（该 provider 所有可用 key 均已尝试） |
+
+**客户端重试指引**：400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试；502 `chat request rejected by upstream` → 永久性错误（请求本身被上游拒绝），修正请求前不要重试；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
 
 **超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 5 分钟，订阅门禁的 DB 查询另有 10s 上限。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。错误行的输入按每条消息 1 KiB 截断（`input_truncated` 标记），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII），需部署侧配置轮转。
 
@@ -633,7 +668,7 @@ kaya 端按 `data: ` 前缀解析 JSON，拼接 `choices[0].delta.content` 即�
 - 价格为**每百万 token 的人民币元数**（成本核算用，可为 0）；`max_tokens` 仅 Anthropic 协议需要（缺省 8192）。多模型目录必须显式指定 `default_model`；单模型目录可省略（自动取唯一模型）。
 - JSON 在启动时解析并强校验（未知字段、空 api_keys、模型引用不存在的 provider、非法 base_url 等均**启动即失败**），改配置需重启生效。
 - **Key 池**：每个 provider 的 `api_keys` 组成轮询池；某 key 收到 429/5xx 后冷却 60s；池内 ≥2 个可用 key 时，单个 key 的临时失败会**透明换 key 重试一次**。全部 key 冷却中对客户端返回 429 `chat upstream rate limit exceeded`。
-- **计量**：每次请求结束后写入 `llm_usage_events` 表（user/app/模型/token 数/成本，迁移 022）；聚合查询走内部接口 `GET /admin/stats/llm-usage?from=YYYY-MM-DD&to=YYYY-MM-DD`（InternalAppAuth 鉴权），按模型分组返回 token 与成本合计。上游不返回 usage 的 provider 记为 0 token（行仍会写入）。
+- **计量**：每次请求结束后写入 `llm_usage_events` 表（user/app/模型/token 数/成本，迁移 022）；聚合查询走内部接口 `GET /admin/stats/llm-usage`（详见「管理接口」章节的正式文档），按模型分组返回 token 与成本合计。上游不返回 usage 的 provider 记为 0 token（行仍会写入）。
 - **按 Plan 限制可用模型**：`plans.chat_models` 列为白名单（NULL/空 = 放开全部目录模型）。示例：`UPDATE plans SET chat_models = '{deepseek-flash,kimi-k3}' WHERE id = 'monthly';`
 
 ---
@@ -1246,7 +1281,36 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 {"code": 0, "data": [{"date": "2026-09-04", "users": 5}]}
 ```
 
-三个统计接口的参数错误均返回 400（message 带具体原因），日期格式为 YYYY-MM-DD，`granularity` / `group_by` 为白名单枚举。
+#### GET /admin/stats/llm-usage
+
+LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游调用落一行，见「Chat 接口」章节的计量说明），按**逻辑模型**分组跨全部用户/全部 app 合计。InternalAppAuth 鉴权（同其他 `/admin/*`）。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `from` | 是 | 起始日期 YYYY-MM-DD（服务器时区，闭区间） |
+| `to` | 是 | 截止日期 YYYY-MM-DD，必须 ≥ `from` |
+
+参数缺失或非法返回 400，message 为 `invalid usage stats parameter: …`（带具体原因）。
+
+**响应（200）**：`data` 为裸数组（无聚合时返回 `[]`）：
+
+```json
+{
+  "code": 0,
+  "data": [
+    {"model": "deepseek-flash", "requests": 3, "input_tokens": 1000, "output_tokens": 200, "cost_micros": 3600}
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `model` | 逻辑模型 ID（客户端在 `POST /chat` 的 `model` 字段所选的目录 id） |
+| `requests` | 区间内的上游调用次数（含 `disconnected` / `upstream_error` 的异常终止行） |
+| `input_tokens` / `output_tokens` | 区间输入/输出 token 合计 |
+| `cost_micros` | 区间成本合计，**单位微元（1e-6 CNY）**——`cost_micros ÷ 1000000` 即为人民币元数 |
+
+以上统计接口的参数错误均返回 400（message 带具体原因），日期格式为 YYYY-MM-DD，`granularity` / `group_by` 为白名单枚举。
 
 ---
 

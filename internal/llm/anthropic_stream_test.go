@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -130,6 +131,88 @@ func TestTranslateAnthropicStream_CloseClosesSource(t *testing.T) {
 	if !closed {
 		t.Error("closing the translated stream must close the underlying body")
 	}
+}
+
+// TestTranslateAnthropicStream_PartialUsageWithoutMessageStop: a stream that
+// ends (clean EOF) after message_start/message_delta but WITHOUT message_stop
+// has still consumed tokens — the translator must surface the partial usage
+// as a terminal OpenAI usage chunk so metering doesn't record 0/0.
+func TestTranslateAnthropicStream_PartialUsageWithoutMessageStop(t *testing.T) {
+	src := "event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":42}}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n"
+	out, err := io.ReadAll(TranslateAnthropicStream(io.NopCloser(strings.NewReader(src))))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+	for _, want := range []string{
+		`"prompt_tokens":42`,
+		`"completion_tokens":7`,
+		`"total_tokens":49`,
+		"data: [DONE]",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("partial stream missing %s\n--- stream ---\n%s", want, s)
+		}
+	}
+}
+
+// TestTranslateAnthropicStream_NoUsageNoTerminalChunk: without any usage
+// signal (and without message_stop) the translator must NOT invent a 0/0
+// usage chunk — ok=false downstream is how "provider didn't report" is told
+// apart from "provider reported zero".
+func TestTranslateAnthropicStream_NoUsageNoTerminalChunk(t *testing.T) {
+	src := "event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+	out, err := io.ReadAll(TranslateAnthropicStream(io.NopCloser(strings.NewReader(src))))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if s := string(out); strings.Contains(s, `"usage"`) || strings.Contains(s, "[DONE]") {
+		t.Errorf("stream without usage/message_stop must not emit a terminal chunk: %s", s)
+	}
+}
+
+// TestTranslateAnthropicStream_PartialUsageOnUpstreamError: an upstream read
+// error mid-stream still flushes the usage seen so far (as a terminal chunk)
+// before the error propagates to the relay.
+func TestTranslateAnthropicStream_PartialUsageOnUpstreamError(t *testing.T) {
+	src := &errAfterStringReader{
+		data: "event: message_start\n" +
+			"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42}}}\n\n" +
+			"event: message_delta\n" +
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+	}
+	r := TranslateAnthropicStream(io.NopCloser(src))
+	out, err := io.ReadAll(r)
+	if err == nil {
+		t.Fatal("read: expected the upstream error to propagate")
+	}
+	s := string(out)
+	for _, want := range []string{`"prompt_tokens":42`, `"completion_tokens":7`, "data: [DONE]"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("broken stream missing partial usage %s\n--- stream ---\n%s", want, s)
+		}
+	}
+}
+
+// errAfterStringReader yields data once, then fails — an upstream that breaks
+// mid-stream.
+type errAfterStringReader struct {
+	data string
+	read bool
+}
+
+func (r *errAfterStringReader) Read(p []byte) (int, error) {
+	if !r.read {
+		r.read = true
+		return copy(p, r.data), nil
+	}
+	return 0, errors.New("upstream broke")
 }
 
 type trackCloser struct {

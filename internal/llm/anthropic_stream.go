@@ -78,6 +78,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer) error {
 	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
 
 	inputTokens, outputTokens := 0, 0
+	stopSeen := false
 	for scanner.Scan() {
 		data, ok := strings.CutPrefix(scanner.Text(), "data: ")
 		if !ok {
@@ -126,6 +127,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer) error {
 				err = writeOpenAIChunk(w, map[string]any{}, mapAnthropicStopReason(ev.Delta.StopReason))
 			}
 		case "message_stop":
+			stopSeen = true
 			err = writeOpenAIUsageAndDone(w, inputTokens, outputTokens)
 		case "error":
 			// kaya parses the {"error":...} chunk convention (same shape the
@@ -134,6 +136,16 @@ func translateAnthropicEvents(body io.Reader, w io.Writer) error {
 		}
 		if err != nil {
 			return err // client (pipe reader) is gone
+		}
+	}
+	// The stream ended without message_stop (clean EOF or an upstream read
+	// error). Non-zero counters mean tokens were already consumed — emit the
+	// terminal usage chunk anyway so downstream metering doesn't record 0/0.
+	// Zero counters mean the provider never reported usage; emitting a 0/0
+	// chunk would be indistinguishable from a real zero reading, so don't.
+	if !stopSeen && (inputTokens > 0 || outputTokens > 0) {
+		if err := writeOpenAIUsageAndDone(w, inputTokens, outputTokens); err != nil {
+			return err
 		}
 	}
 	return scanner.Err()

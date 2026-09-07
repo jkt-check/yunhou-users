@@ -441,6 +441,86 @@ func TestChatHandler_NoUsageRecordedWhenUpstreamCallFails(t *testing.T) {
 	}
 }
 
+// failAfterWriter is an http.ResponseWriter whose body writes start failing
+// once limit bytes have been written — a client that disconnected mid-stream.
+type failAfterWriter struct {
+	header  http.Header
+	limit   int
+	written int
+}
+
+func (w *failAfterWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = http.Header{}
+	}
+	return w.header
+}
+
+func (w *failAfterWriter) WriteHeader(int) {}
+func (w *failAfterWriter) Flush()          {}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	if w.written >= w.limit {
+		return 0, errors.New("client gone")
+	}
+	w.written += len(p)
+	return len(p), nil
+}
+
+// scriptReader yields one chunk per Read — an upstream whose SSE events
+// arrive in separate packets (so the relay writes them separately too).
+type scriptReader struct {
+	chunks []string
+	idx    int
+}
+
+func (r *scriptReader) Read(p []byte) (int, error) {
+	if r.idx >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.idx])
+	r.idx++
+	return n, nil
+}
+
+// TestChatHandler_RecordsUsageOnClientDisconnect: the client disconnects
+// mid-stream, right before the chunk carrying the terminal usage object —
+// so the usage never reaches the client, but the tokens were spent upstream
+// and must still be metered (status "disconnected").
+func TestChatHandler_RecordsUsageOnClientDisconnect(t *testing.T) {
+	chunk1 := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	usageChunk := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n"
+	mock := &mockChatStreamer{streamFn: func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&scriptReader{chunks: []string{chunk1, usageChunk, "data: [DONE]\n\n"}}),
+		}, &service.ChatRoute{LogicalModel: "deepseek-flash"}, nil
+	}}
+	h := NewChatHandler(mock, nil)
+	w := &failAfterWriter{limit: len(chunk1)} // first chunk relays, then the client is gone
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set(middleware.ContextUserID, "u-1")
+	c.Set(middleware.ContextAppID, "yunhou-website")
+	h.StreamChat(c)
+
+	if w.written != len(chunk1) {
+		t.Errorf("client received %d bytes, want exactly the first chunk (%d)", w.written, len(chunk1))
+	}
+	if len(mock.usageEvents) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(mock.usageEvents))
+	}
+	ev := mock.usageEvents[0]
+	if ev.status != "disconnected" {
+		t.Errorf("status = %q, want disconnected", ev.status)
+	}
+	if ev.inputTokens != 7 || ev.outputTokens != 2 {
+		t.Errorf("usage = %d/%d tokens, want 7/2 (spent tokens recorded despite disconnect)", ev.inputTokens, ev.outputTokens)
+	}
+}
+
 func TestChatHandler_GetModels(t *testing.T) {
 	mock := &mockChatStreamer{allowedModels: []service.ChatModelInfo{
 		{ID: "deepseek-flash", DisplayName: "DeepSeek Flash", Provider: "deepseek", Default: true},

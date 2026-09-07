@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -54,4 +55,82 @@ func ExtractStreamUsage(raw []byte) (inputTokens, outputTokens int, ok bool) {
 		}
 	}
 	return inputTokens, outputTokens, ok
+}
+
+// StreamUsage is the last usage object seen in an OpenAI-format SSE stream.
+type StreamUsage struct {
+	InputTokens  int
+	OutputTokens int
+	OK           bool // false when no chunk carried usage
+}
+
+// UsageTracker incrementally meters an OpenAI-format SSE stream as its bytes
+// flow through the relay: Feed every upstream read, then Usage returns the
+// last-seen usage object (LAST wins, matching ExtractStreamUsage). Unlike a
+// post-hoc scan of the captured copy, it is independent of the audit-log
+// capture cap and of how the relay ends — clean end, client disconnect or
+// upstream break all meter every usage chunk read from upstream.
+type UsageTracker struct {
+	pending []byte // current unterminated line
+	usage   StreamUsage
+}
+
+// usageTrackLineCap bounds the pending (unterminated) line. Usage chunks are
+// a few hundred bytes; a longer line is a big content delta that cannot be a
+// usage chunk worth buffering, so it is dropped and scanning resumes at the
+// next newline.
+const usageTrackLineCap = 64 << 10
+
+// Feed consumes one upstream read. Lines are reassembled across reads (the
+// relay buffer has no line alignment). Only complete `data:` lines containing
+// `"usage"` are JSON-parsed — everything else costs a substring scan.
+func (t *UsageTracker) Feed(p []byte) {
+	for len(p) > 0 {
+		nl := bytes.IndexByte(p, '\n')
+		end := len(p)
+		if nl >= 0 {
+			end = nl
+		}
+		if len(t.pending)+end > usageTrackLineCap {
+			t.pending = t.pending[:0] // overlong line: drop
+			if nl < 0 {
+				return
+			}
+			p = p[nl+1:]
+			continue
+		}
+		t.pending = append(t.pending, p[:end]...)
+		if nl < 0 {
+			return
+		}
+		t.scanLine(t.pending)
+		t.pending = t.pending[:0]
+		p = p[nl+1:]
+	}
+}
+
+// Usage returns the last usage object seen so far (zero value when none).
+func (t *UsageTracker) Usage() StreamUsage { return t.usage }
+
+func (t *UsageTracker) scanLine(line []byte) {
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return
+	}
+	if !bytes.Contains(line, []byte(`"usage"`)) {
+		return
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	var chunk struct {
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(payload, &chunk) == nil && chunk.Usage != nil {
+		t.usage = StreamUsage{
+			InputTokens:  chunk.Usage.PromptTokens,
+			OutputTokens: chunk.Usage.CompletionTokens,
+			OK:           true,
+		}
+	}
 }

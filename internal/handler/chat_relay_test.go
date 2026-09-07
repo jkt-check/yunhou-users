@@ -41,7 +41,7 @@ func (r *errAfterReader) Read(p []byte) (int, error) {
 func TestRelayChatSSE_CleanEnd(t *testing.T) {
 	sse := "data: {}\n\ndata: [DONE]\n\n"
 	w := &countingFlushWriter{}
-	captured, result := relayChatSSE(w, strings.NewReader(sse))
+	captured, result, usage := relayChatSSE(w, strings.NewReader(sse))
 	if result != chatRelayOK {
 		t.Fatalf("result = %v, want chatRelayOK", result)
 	}
@@ -54,10 +54,13 @@ func TestRelayChatSSE_CleanEnd(t *testing.T) {
 	if w.flushes == 0 {
 		t.Error("no flushes — SSE chunks must be flushed per chunk")
 	}
+	if usage.OK {
+		t.Errorf("usage = %+v, want OK=false (no usage chunk in stream)", usage)
+	}
 }
 
 func TestRelayChatSSE_ClientGone(t *testing.T) {
-	captured, result := relayChatSSE(failWriter{}, strings.NewReader("data: {}\n\n"))
+	captured, result, usage := relayChatSSE(failWriter{}, strings.NewReader("data: {}\n\n"))
 	if result != chatRelayClientGone {
 		t.Fatalf("result = %v, want chatRelayClientGone", result)
 	}
@@ -66,11 +69,14 @@ func TestRelayChatSSE_ClientGone(t *testing.T) {
 	if len(captured) != 0 {
 		t.Errorf("captured = %q, want empty (nothing reached the client)", captured)
 	}
+	if usage.OK {
+		t.Errorf("usage = %+v, want OK=false (no usage chunk in stream)", usage)
+	}
 }
 
 func TestRelayChatSSE_UpstreamBroke(t *testing.T) {
 	w := &countingFlushWriter{}
-	captured, result := relayChatSSE(w, &errAfterReader{data: "data: partial"})
+	captured, result, _ := relayChatSSE(w, &errAfterReader{data: "data: partial"})
 	if result != chatRelayUpstreamBroke {
 		t.Fatalf("result = %v, want chatRelayUpstreamBroke", result)
 	}
@@ -82,7 +88,7 @@ func TestRelayChatSSE_UpstreamBroke(t *testing.T) {
 func TestRelayChatSSE_CaptureCap(t *testing.T) {
 	body := strings.Repeat("x", chatRawLogCap+10000)
 	w := &countingFlushWriter{}
-	captured, result := relayChatSSE(w, strings.NewReader(body))
+	captured, result, _ := relayChatSSE(w, strings.NewReader(body))
 	if result != chatRelayOK {
 		t.Fatalf("result = %v, want chatRelayOK", result)
 	}
@@ -91,6 +97,57 @@ func TestRelayChatSSE_CaptureCap(t *testing.T) {
 	}
 	if w.Len() != len(body) {
 		t.Errorf("relayed len = %d, want full body %d (cap is for the log only)", w.Len(), len(body))
+	}
+}
+
+// TestRelayChatSSE_UsageTracked: the relay meters the terminal usage chunk.
+func TestRelayChatSSE_UsageTracked(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n" +
+		"data: [DONE]\n\n"
+	_, result, usage := relayChatSSE(&countingFlushWriter{}, strings.NewReader(sse))
+	if result != chatRelayOK {
+		t.Fatalf("result = %v, want chatRelayOK", result)
+	}
+	if !usage.OK || usage.InputTokens != 7 || usage.OutputTokens != 2 {
+		t.Errorf("usage = %+v, want {7 2 true}", usage)
+	}
+}
+
+// TestRelayChatSSE_UsageBeyondCaptureCap: on a stream longer than the capture
+// cap the terminal usage chunk falls outside the captured copy, so metering
+// from that copy would record 0/0. The incremental tracker must still see it.
+func TestRelayChatSSE_UsageBeyondCaptureCap(t *testing.T) {
+	big := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("a", chatRawLogCap) + "\"}}]}\n\n"
+	sse := big +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":300000,\"total_tokens\":300003}}\n\n" +
+		"data: [DONE]\n\n"
+	w := &countingFlushWriter{}
+	captured, result, usage := relayChatSSE(w, strings.NewReader(sse))
+	if result != chatRelayOK {
+		t.Fatalf("result = %v, want chatRelayOK", result)
+	}
+	if len(captured) != chatRawLogCap {
+		t.Errorf("captured len = %d, want exactly the %d cap", len(captured), chatRawLogCap)
+	}
+	if !usage.OK || usage.InputTokens != 3 || usage.OutputTokens != 300000 {
+		t.Errorf("usage = %+v, want {3 300000 true} (usage chunk past the capture cap)", usage)
+	}
+}
+
+// TestRelayChatSSE_UsageRecordedOnClientGone: the chunk carrying the terminal
+// usage fails to reach the client, but the tokens were spent upstream — the
+// tracker is fed from the upstream read, before the client write.
+func TestRelayChatSSE_UsageRecordedOnClientGone(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n" +
+		"data: [DONE]\n\n"
+	_, result, usage := relayChatSSE(failWriter{}, strings.NewReader(sse))
+	if result != chatRelayClientGone {
+		t.Fatalf("result = %v, want chatRelayClientGone", result)
+	}
+	if !usage.OK || usage.InputTokens != 7 || usage.OutputTokens != 2 {
+		t.Errorf("usage = %+v, want {7 2 true} (tokens spent even though the client is gone)", usage)
 	}
 }
 

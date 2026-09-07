@@ -158,7 +158,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		log.Printf("chat: set write deadline: %v", err)
 	}
 
-	raw, result := relayChatSSE(c.Writer, resp.Body)
+	raw, result, usage := relayChatSSE(c.Writer, resp.Body)
 	if result == chatRelayUpstreamBroke {
 		// Upstream died mid-stream (no [DONE] relayed): a clean EOF here
 		// would make kaya render the partial answer as complete. Inject an
@@ -185,15 +185,17 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		status = "upstream_error"
 		errMsg = "upstream stream interrupted"
 	}
-	// Meter the upstream spend. Usage tokens come from the terminal usage
-	// chunk (requested via stream_options for OpenAI providers; synthesized
-	// by the Anthropic translator). context.WithoutCancel: the request ctx
-	// is already cancelled when the client disconnected mid-stream, but the
+	// Meter the upstream spend. Usage tokens come from the relay's
+	// incremental tracker (OpenAI usage chunks, requested via stream_options;
+	// synthesized by the Anthropic translator), so metering is independent of
+	// the capped audit capture and of how the relay ended: a client
+	// disconnect or an upstream break mid-stream still records every usage
+	// chunk read from upstream. context.WithoutCancel: the request ctx is
+	// already cancelled when the client disconnected mid-stream, but the
 	// consumed tokens are a real spend and must still be recorded.
 	if route != nil {
-		inputTokens, outputTokens, _ := llm.ExtractStreamUsage(raw)
 		usageCtx, usageCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
-		h.svc.RecordUsage(usageCtx, userID, appID, route, status, inputTokens, outputTokens)
+		h.svc.RecordUsage(usageCtx, userID, appID, route, status, usage.InputTokens, usage.OutputTokens)
 		usageCancel()
 	}
 	h.logAccess(started, userID, appID, routeModel(route, req.Model), req, status, errMsg, output)
@@ -383,16 +385,22 @@ type flushWriter interface {
 }
 
 // relayChatSSE streams the upstream body to the client, flushing after every
-// chunk, and captures up to chatRawLogCap bytes of the raw SSE stream for the
-// audit log. The result reports how the relay ended (see chatRelayResult).
-func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult) {
+// chunk, captures up to chatRawLogCap bytes of the raw SSE stream for the
+// audit log, and incrementally tracks the stream's usage object for metering.
+// The tracker is fed from the upstream read, BEFORE the client write: spent
+// tokens count even when the client has already disconnected, and even when
+// the usage chunk lands past the capture cap or the stream ends abnormally.
+// The result reports how the relay ended (see chatRelayResult).
+func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult, llm.StreamUsage) {
 	buf := make([]byte, chatStreamBufSize)
 	var captured bytes.Buffer
+	var tracker llm.UsageTracker
 	for {
 		n, readErr := body.Read(buf)
 		if n > 0 {
+			tracker.Feed(buf[:n])
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return captured.Bytes(), chatRelayClientGone // client gone — stop relaying
+				return captured.Bytes(), chatRelayClientGone, tracker.Usage() // client gone — stop relaying
 			}
 			w.Flush()
 			if captured.Len() < chatRawLogCap {
@@ -406,9 +414,9 @@ func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult) {
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				return captured.Bytes(), chatRelayOK // clean end of stream
+				return captured.Bytes(), chatRelayOK, tracker.Usage() // clean end of stream
 			}
-			return captured.Bytes(), chatRelayUpstreamBroke // upstream broke mid-stream
+			return captured.Bytes(), chatRelayUpstreamBroke, tracker.Usage() // upstream broke mid-stream
 		}
 	}
 }

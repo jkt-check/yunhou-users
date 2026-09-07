@@ -3242,3 +3242,36 @@ git commit -m "feat(llm): wire multi-model catalog via LLM_PROVIDERS_JSON, docs,
 - Spec coverage: catalog+routing (T1,T7), key pool (T1,T7), dual protocol (T2-T4,T7), plan gating (T6,T7), metering (T2,T4,T5,T7,T8), model picker endpoint (T7,T8), admin stats (T9), config/wiring/docs (T10). Legacy back-compat: `LegacyCatalog` (T1) + wiring (T10). No-quota-yet: per-plan token QUOTA is deliberately out of scope (metering lands first; quota enforcement is a follow-up reading `llm_usage_events`).
 - Type consistency: `ChatRoute`, `ChatModelInfo`, `LLMUsageEvent`, `LLMUsageRow`, `LLMUsageRepo`, `ParseCatalog`, `LegacyCatalog`, `TranslateAnthropicStream`, `BuildOpenAIPayload`, `BuildAnthropicPayload`, `ExtractStreamUsage`, `NewKeyPool/Acquire/Cool/Len` are used with identical signatures across tasks.
 - Known acceptable gap: Anthropic `content_block_start` text blocks emit nothing (OpenAI needs no block-start); tool_calls index uses the Anthropic block index (gaps possible, harmless). Providers ignoring `stream_options.include_usage` meter as 0 tokens — the row is still written.
+
+---
+
+## Post-Review Fixes (2026-09-07, senior review of feat/multi-model-gateway)
+
+The plan body above describes the as-designed implementation; the following
+review-driven fixes supersede two of its details:
+
+- **Metering no longer reads the capped capture.** The relay feeds every
+  upstream read into an incremental `llm.UsageTracker` (line-reassembling,
+  `"usage"`-gated, last-wins) BEFORE the client write, and the handler meters
+  from the tracker regardless of how the relay ended. The 256 KiB
+  `chatRawLogCap` capture now bounds ONLY the audit-log output text;
+  `ExtractStreamUsage` remains as the batch-shaped twin used by tests. This
+  makes migration 022's header claim (disconnected/interrupted streams still
+  record consumed tokens) actually true. Additionally, the Anthropic
+  translator emits the terminal OpenAI usage chunk (+`[DONE]`) when the
+  stream ends WITHOUT `message_stop` (EOF or upstream error) and usage
+  counters are non-zero, so partial Anthropic consumption is metered too.
+- **Anthropic translation merges consecutive same-role turns.** Handler
+  validation deliberately allows them (legal for OpenAI-protocol models) but
+  Anthropic 400s without strict user/assistant alternation. Text blocks
+  append onto a previous same-role turn; tool_result blocks always lead a
+  merged user turn (a tool result following plain user text inserts ahead of
+  the text, plain user text following tool results appends after them).
+
+Smaller hardening: the audit log truncates the `model` field at
+`ChatMaxModelLen` (+ellipsis) inside `logAccess`; `LLMUsageHandler` answers
+503 when its service is nil (route is registered unconditionally);
+`KeyPool.Acquire` returns `(-1, "")` on an empty pool instead of panicking;
+nameless tool definitions are dropped during Anthropic translation (the
+`tools` key is omitted when nothing survives) instead of emitting
+`"name":null` and failing the whole request upstream.

@@ -136,7 +136,10 @@ func TestTranslateAnthropicStream_CloseClosesSource(t *testing.T) {
 // TestTranslateAnthropicStream_PartialUsageWithoutMessageStop: a stream that
 // ends (clean EOF) after message_start/message_delta but WITHOUT message_stop
 // has still consumed tokens — the translator must surface the partial usage
-// as a terminal OpenAI usage chunk so metering doesn't record 0/0.
+// as a terminal OpenAI usage chunk so metering doesn't record 0/0. But it
+// must NOT append [DONE]: clients stop parsing at [DONE] and would render
+// the partial answer as complete (per the client contract a missing [DONE]
+// means failure). Only a real message_stop earns [DONE].
 func TestTranslateAnthropicStream_PartialUsageWithoutMessageStop(t *testing.T) {
 	src := "event: message_start\n" +
 		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":42}}}\n\n" +
@@ -153,11 +156,13 @@ func TestTranslateAnthropicStream_PartialUsageWithoutMessageStop(t *testing.T) {
 		`"prompt_tokens":42`,
 		`"completion_tokens":7`,
 		`"total_tokens":49`,
-		"data: [DONE]",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("partial stream missing %s\n--- stream ---\n%s", want, s)
 		}
+	}
+	if strings.Contains(s, "data: [DONE]") {
+		t.Errorf("abnormal termination must NOT emit [DONE] (clients would render the partial answer as complete)\n--- stream ---\n%s", s)
 	}
 }
 
@@ -179,7 +184,9 @@ func TestTranslateAnthropicStream_NoUsageNoTerminalChunk(t *testing.T) {
 
 // TestTranslateAnthropicStream_PartialUsageOnUpstreamError: an upstream read
 // error mid-stream still flushes the usage seen so far (as a terminal chunk)
-// before the error propagates to the relay.
+// before the error propagates to the relay. Again without [DONE]: the relay
+// appends its own upstream-broke error event, which must be the last thing
+// the client sees — a [DONE] before it would mark the answer complete.
 func TestTranslateAnthropicStream_PartialUsageOnUpstreamError(t *testing.T) {
 	src := &errAfterStringReader{
 		data: "event: message_start\n" +
@@ -193,10 +200,13 @@ func TestTranslateAnthropicStream_PartialUsageOnUpstreamError(t *testing.T) {
 		t.Fatal("read: expected the upstream error to propagate")
 	}
 	s := string(out)
-	for _, want := range []string{`"prompt_tokens":42`, `"completion_tokens":7`, "data: [DONE]"} {
+	for _, want := range []string{`"prompt_tokens":42`, `"completion_tokens":7`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("broken stream missing partial usage %s\n--- stream ---\n%s", want, s)
 		}
+	}
+	if strings.Contains(s, "data: [DONE]") {
+		t.Errorf("upstream-error flush must NOT emit [DONE]\n--- stream ---\n%s", s)
 	}
 }
 

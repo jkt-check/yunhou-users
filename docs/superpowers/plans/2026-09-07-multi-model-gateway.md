@@ -3258,9 +3258,11 @@ review-driven fixes supersede two of its details:
   `ExtractStreamUsage` remains as the batch-shaped twin used by tests. This
   makes migration 022's header claim (disconnected/interrupted streams still
   record consumed tokens) actually true. Additionally, the Anthropic
-  translator emits the terminal OpenAI usage chunk (+`[DONE]`) when the
-  stream ends WITHOUT `message_stop` (EOF or upstream error) and usage
-  counters are non-zero, so partial Anthropic consumption is metered too.
+  translator emits the terminal OpenAI usage chunk (WITHOUT `[DONE]` — a
+  synthetic `[DONE]` would mark the partial answer complete; only a real
+  `message_stop` earns `[DONE]`) when the stream ends WITHOUT `message_stop`
+  (EOF or upstream error) and usage counters are non-zero, so partial
+  Anthropic consumption is metered too.
 - **Anthropic translation merges consecutive same-role turns.** Handler
   validation deliberately allows them (legal for OpenAI-protocol models) but
   Anthropic 400s without strict user/assistant alternation. Text blocks

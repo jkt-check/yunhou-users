@@ -143,8 +143,12 @@ func translateAnthropicEvents(body io.Reader, w io.Writer) error {
 	// terminal usage chunk anyway so downstream metering doesn't record 0/0.
 	// Zero counters mean the provider never reported usage; emitting a 0/0
 	// chunk would be indistinguishable from a real zero reading, so don't.
+	// NO [DONE] here: clients stop parsing at [DONE] and would render the
+	// partial answer as complete (per the client contract a missing [DONE]
+	// means failure) — and on the upstream-error path the handler's
+	// upstream-broke error event must be the last thing the client sees.
 	if !stopSeen && (inputTokens > 0 || outputTokens > 0) {
-		if err := writeOpenAIUsageAndDone(w, inputTokens, outputTokens); err != nil {
+		if err := writeOpenAIUsage(w, inputTokens, outputTokens); err != nil {
 			return err
 		}
 	}
@@ -164,10 +168,21 @@ func writeOpenAIChunk(w io.Writer, delta map[string]any, finish string) error {
 	})
 }
 
-// writeOpenAIUsageAndDone emits the terminal usage chunk (the shape
-// ExtractStreamUsage looks for) followed by [DONE].
+// writeOpenAIUsageAndDone emits the terminal usage chunk followed by [DONE] —
+// the clean message_stop ending. [DONE] marks the answer COMPLETE, so the
+// abnormal-termination flush (no message_stop) uses writeOpenAIUsage instead.
 func writeOpenAIUsageAndDone(w io.Writer, inputTokens, outputTokens int) error {
-	if err := writeRawSSE(w, map[string]any{
+	if err := writeOpenAIUsage(w, inputTokens, outputTokens); err != nil {
+		return err
+	}
+	_, err := io.WriteString(w, "data: [DONE]\n\n")
+	return err
+}
+
+// writeOpenAIUsage emits just the usage chunk (the shape the UsageTracker and
+// ExtractStreamUsage look for) — no [DONE].
+func writeOpenAIUsage(w io.Writer, inputTokens, outputTokens int) error {
+	return writeRawSSE(w, map[string]any{
 		"object":  "chat.completion.chunk",
 		"choices": []any{},
 		"usage": map[string]any{
@@ -175,11 +190,7 @@ func writeOpenAIUsageAndDone(w io.Writer, inputTokens, outputTokens int) error {
 			"completion_tokens": outputTokens,
 			"total_tokens":      inputTokens + outputTokens,
 		},
-	}); err != nil {
-		return err
-	}
-	_, err := io.WriteString(w, "data: [DONE]\n\n")
-	return err
+	})
 }
 
 func writeRawSSE(w io.Writer, v map[string]any) error {

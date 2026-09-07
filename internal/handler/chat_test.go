@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
@@ -481,6 +482,82 @@ func (r *scriptReader) Read(p []byte) (int, error) {
 	n := copy(p, r.chunks[r.idx])
 	r.idx++
 	return n, nil
+}
+
+// TestChatHandler_AnthropicAbnormalTerminationNoDone: an Anthropic-protocol
+// upstream that ends without message_stop must NOT produce a [DONE] chunk —
+// per the client contract a missing [DONE] means failure, and clients stop
+// parsing at [DONE], so a synthetic one would render the partial answer as
+// complete. Covers both endings: upstream read error (the handler's
+// upstream-broke error event must come LAST, after the flushed usage chunk)
+// and clean EOF. The reported tokens are metered in both cases.
+func TestChatHandler_AnthropicAbnormalTerminationNoDone(t *testing.T) {
+	anthropicEvents := "event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42}}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"半\"}}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n"
+
+	t.Run("upstream error", func(t *testing.T) {
+		mock := &mockChatStreamer{streamFn: func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       llm.TranslateAnthropicStream(io.NopCloser(&errAfterReader{data: anthropicEvents})),
+			}, &service.ChatRoute{LogicalModel: "kimi-k3", Protocol: llm.ProtocolAnthropic}, nil
+		}}
+		r, _ := chatTestRouter(mock)
+		w := performChatRequest(r, `{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (stream had already started)", w.Code)
+		}
+		body := w.Body.String()
+		if strings.Contains(body, "data: [DONE]") {
+			t.Errorf("client stream must NOT contain [DONE] on abnormal termination:\n%s", body)
+		}
+		if !strings.Contains(body, `"prompt_tokens":42`) || !strings.Contains(body, `"completion_tokens":7`) {
+			t.Errorf("flushed usage chunk missing from client stream:\n%s", body)
+		}
+		if !strings.HasSuffix(body, chatUpstreamBrokeEvent) {
+			t.Errorf("client stream must END with the upstream-broke error event, got:\n%s", body)
+		}
+		if len(mock.usageEvents) != 1 {
+			t.Fatalf("usage events = %d, want 1", len(mock.usageEvents))
+		}
+		ev := mock.usageEvents[0]
+		if ev.inputTokens != 42 || ev.outputTokens != 7 || ev.status != "upstream_error" {
+			t.Errorf("usage event = %+v, want 42/7 upstream_error", ev)
+		}
+	})
+
+	t.Run("clean EOF without message_stop", func(t *testing.T) {
+		mock := &mockChatStreamer{streamFn: func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       llm.TranslateAnthropicStream(io.NopCloser(strings.NewReader(anthropicEvents))),
+			}, &service.ChatRoute{LogicalModel: "kimi-k3", Protocol: llm.ProtocolAnthropic}, nil
+		}}
+		r, _ := chatTestRouter(mock)
+		w := performChatRequest(r, `{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		body := w.Body.String()
+		if strings.Contains(body, "data: [DONE]") {
+			t.Errorf("client stream must NOT contain [DONE] when message_stop never arrived:\n%s", body)
+		}
+		if !strings.Contains(body, `"prompt_tokens":42`) {
+			t.Errorf("flushed usage chunk missing from client stream:\n%s", body)
+		}
+		if len(mock.usageEvents) != 1 {
+			t.Fatalf("usage events = %d, want 1", len(mock.usageEvents))
+		}
+		if ev := mock.usageEvents[0]; ev.inputTokens != 42 || ev.outputTokens != 7 {
+			t.Errorf("usage event = %+v, want 42/7 (partial consumption metered)", ev)
+		}
+	})
 }
 
 // TestChatHandler_RecordsUsageOnClientDisconnect: the client disconnects

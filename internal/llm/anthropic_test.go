@@ -135,6 +135,34 @@ func TestBuildAnthropicPayload_ToolsTranslation(t *testing.T) {
 	}
 }
 
+// TestBuildAnthropicPayload_SkipsNamelessTools: a tool without a name would
+// translate to "name":null and 400 the whole request upstream — drop it
+// instead. When every tool is nameless the tools key is omitted entirely.
+func TestBuildAnthropicPayload_SkipsNamelessTools(t *testing.T) {
+	tools := []json.RawMessage{
+		json.RawMessage(`{"type":"function","function":{"description":"no name here","parameters":{"type":"object"}}}`),
+		json.RawMessage(`{"name":"list_dir","input_schema":{"type":"object"}}`),
+	}
+	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{{Role: "user", Content: "x"}}, tools, nil)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	p := decode(t, body)
+	ts := p["tools"].([]any)
+	if len(ts) != 1 || ts[0].(map[string]any)["name"] != "list_dir" {
+		t.Errorf("tools = %v, want only the named tool", ts)
+	}
+
+	allNameless := []json.RawMessage{json.RawMessage(`{"type":"function","function":{"description":"no name"}}`)}
+	body, err = BuildAnthropicPayload("m", 0, []model.ChatMessage{{Role: "user", Content: "x"}}, allNameless, nil)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	if _, ok := decode(t, body)["tools"]; ok {
+		t.Errorf("all-nameless tools must omit the tools key entirely: %s", body)
+	}
+}
+
 func TestBuildAnthropicPayload_Thinking(t *testing.T) {
 	thinking := true
 	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking)

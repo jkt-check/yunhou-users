@@ -123,8 +123,12 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens int, messages []model
 			if f, ok := tool["function"].(map[string]any); ok {
 				fn = f
 			}
+			name, _ := fn["name"].(string)
+			if name == "" {
+				continue // a nameless tool marshals as "name":null and 400s the whole request upstream
+			}
 			entry := map[string]any{
-				"name":         fn["name"],
+				"name":         name,
 				"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 			}
 			if d, ok := fn["description"]; ok {
@@ -138,7 +142,9 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens int, messages []model
 			}
 			out = append(out, entry)
 		}
-		payload["tools"] = out
+		if len(out) > 0 {
+			payload["tools"] = out
+		}
 	}
 	if thinkingEnabled != nil && *thinkingEnabled {
 		if maxTokens <= anthropicThinkingBudget {

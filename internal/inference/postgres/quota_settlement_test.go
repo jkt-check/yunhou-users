@@ -111,14 +111,19 @@ func TestReserveAndSettleShareOneTransaction(t *testing.T) {
 			t.Errorf("window %s: used=%d reserved=%d, want 60000/0", id, used, reserved)
 		}
 	}
-	// Key 预算保持已消耗（预占时已计入）。
-	if got := keyBudgetUsed(t, s, f.keyID); got != 100_000 {
-		t.Errorf("key budget used = %d, want 100000", got)
+	// Key 预算按实际消费校正：预占 100_000，结算 60_000，差额归还。
+	if got := keyBudgetUsed(t, s, f.keyID); got != 60_000 {
+		t.Errorf("key budget used = %d, want 60000 (charge, not hold)", got)
 	}
 	// 请求终态与账本。
 	req, err := s.GetRequest(ctx, adm.RequestID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// 请求级预占额 = 单次消费预占上界（镜像进 4 个目标，只记一次，
+	// 不得是 hold 之和 400_000）。
+	if req.ReservedMicros == nil || *req.ReservedMicros != 100_000 {
+		t.Errorf("reserved_micros = %v, want 100000 (single consumption, not 4× hold sum)", req.ReservedMicros)
 	}
 	if req.Status != domain.ReqSettled || req.SettledMicros == nil || *req.SettledMicros != 60_000 {
 		t.Errorf("request = status %q settled %v, want settled/60000", req.Status, req.SettledMicros)
@@ -299,6 +304,69 @@ func TestDuplicateSettleIsAConflict(t *testing.T) {
 	}
 	if charges != 1 {
 		t.Errorf("charges = %d, want 1 (重复结算不生效)", charges)
+	}
+}
+
+func TestSettleCorrectsKeyBudgetOverHold(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	// 预占 100_000，实际结算 25_000：budget_used 须校正为 25_000
+	// （差额归还，不永久多计）。
+	settleOnce := func(hold, charge domain.Microcredit) string {
+		t.Helper()
+		uow, err := s.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, hold))
+		if err != nil {
+			t.Fatalf("reserve: %v", err)
+		}
+		attID := uuid.NewString()
+		if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+			t.Fatal(err)
+		}
+		in, out := int64(10), int64(5)
+		err = s.Settle(ctx, uow, domain.SettleCommand{
+			RequestID: adm.RequestID,
+			Usage: domain.UsageRecord{
+				RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+				Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+			},
+			ChargeMicros: charge, SettledAt: time.Now().UTC(),
+		})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		if err := uow.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		return adm.RequestID
+	}
+
+	settleOnce(100_000, 25_000)
+	if got := keyBudgetUsed(t, s, f.keyID); got != 25_000 {
+		t.Errorf("after settle 25k of 100k hold: budget_used = %d, want 25000", got)
+	}
+	for _, id := range []string{w5, ww, wm} {
+		if used, reserved := windowState(t, s, id); used != 25_000 || reserved != 0 {
+			t.Errorf("window %s: used=%d reserved=%d, want 25000/0", id, used, reserved)
+		}
+	}
+
+	// 第二个请求累计实际消费：25_000 + 50_000 = 75_000。
+	settleOnce(80_000, 50_000)
+	if got := keyBudgetUsed(t, s, f.keyID); got != 75_000 {
+		t.Errorf("after second settle: budget_used = %d, want 75000 (累计实际消费)", got)
+	}
+
+	// 零消费结算（usage 未知但确认为零的场景）：预占全额归还。
+	settleOnce(10_000, 0)
+	if got := keyBudgetUsed(t, s, f.keyID); got != 75_000 {
+		t.Errorf("after zero-charge settle: budget_used = %d, want 75000 (hold 全额归还)", got)
 	}
 }
 

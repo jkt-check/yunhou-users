@@ -201,13 +201,15 @@ type Request struct {
 	WindowFiveHourID *string
 	WindowWeeklyID   *string
 	WindowMonthlyID  *string
-	ReservedMicros   *Microcredit
-	SettledMicros    *Microcredit
-	UsageStatus      UsageSource
-	LastError        string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	CompletedAt      *time.Time
+	// ReservedMicros 是这次请求的单次消费预占上界：同一次消费镜像进
+	// 全部目标（三窗口 + Key 预算），请求行只记一次，不等于各 hold 之和。
+	ReservedMicros *Microcredit
+	SettledMicros  *Microcredit
+	UsageStatus    UsageSource
+	LastError      string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	CompletedAt    *time.Time
 }
 
 // LedgerEntry is one append-only ledger fact (设计 §7.3: 追加 + 冲正，

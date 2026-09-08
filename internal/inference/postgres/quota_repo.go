@@ -145,7 +145,11 @@ func (s *Store) Reserve(ctx context.Context, w domain.UnitOfWork, cmd domain.Res
 
 	var blocked []domain.WindowBlock
 	keyBudgetBlocked := false
-	var total domain.Microcredit
+	// reserveAmount 是这次请求的单次消费预占上界：同一次消费镜像进
+	// 全部目标（三窗口 + Key 预算），请求行只记一次，不累加各 hold
+	// （否则 4 目标 = 4 倍膨胀）。holds 等额时即取其一；不等额取最大
+	// 作为安全上界。
+	var reserveAmount domain.Microcredit
 
 	// 2./3. Apply holds.
 	for _, h := range holds {
@@ -203,11 +207,9 @@ func (s *Store) Reserve(ctx context.Context, w domain.UnitOfWork, cmd domain.Res
 				return nil, mapError("reserve: window", err)
 			}
 		}
-		totalHold, terr := total.Add(h.Amount)
-		if terr != nil {
-			return nil, terr
+		if h.Amount > reserveAmount {
+			reserveAmount = h.Amount
 		}
-		total = totalHold
 	}
 
 	if len(blocked) > 0 || keyBudgetBlocked {
@@ -218,7 +220,7 @@ func (s *Store) Reserve(ctx context.Context, w domain.UnitOfWork, cmd domain.Res
 	req := cmd.Request
 	req.Status = domain.ReqReserved
 	req.AdmittedAt = &cmd.AdmittedAt
-	req.ReservedMicros = &total
+	req.ReservedMicros = &reserveAmount
 	for _, h := range holds {
 		switch h.TargetKind {
 		case domain.TargetWindowFiveHour:

@@ -21,7 +21,8 @@ import (
 //  1. persist the normalized usage fact,
 //  2. append the customer ledger charge (UNIQUE per request → idempotent),
 //  3. convert held reservations: windows reserved→used (actual charged
-//     amount), key budget stays consumed, reservations marked settled,
+//     amount), key budget corrected by (charge − hold) so an over-hold is
+//     returned, reservations marked settled,
 //  4. move the request to settled with its usage status.
 func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error {
 	tx, err := sqlTx(w)
@@ -60,10 +61,11 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		ID         string  `db:"id"`
 		TargetKind string  `db:"target_kind"`
 		WindowID   *string `db:"window_id"`
+		APIKeyID   *string `db:"api_key_id"`
 		Amount     int64   `db:"amount_micros"`
 	}
 	if err := tx.SelectContext(ctx, &rows,
-		`SELECT id, target_kind, window_id, amount_micros
+		`SELECT id, target_kind, window_id, api_key_id, amount_micros
 		 FROM inference_reservations
 		 WHERE request_id = $1 AND state = 'held'
 		 ORDER BY target_kind`, cmd.RequestID); err != nil {
@@ -72,7 +74,21 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	for _, r := range rows {
 		switch r.TargetKind {
 		case string(domain.TargetKeyBudget):
-			// Key budget was consumed at reserve time; nothing to convert.
+			// 与窗口的 reserved→used 转换对齐：预占时已 budget_used += hold，
+			// 结算校正 budget_used += (charge − hold)，实际 < 预占的差额在此
+			// 归还；守卫 budget_used 不得变负。
+			res, err := tx.ExecContext(ctx,
+				`UPDATE inference_api_keys
+				 SET budget_used_micros = budget_used_micros - $2 + $3, updated_at = now()
+				 WHERE id = $1 AND budget_used_micros - $2 + $3 >= 0`,
+				*r.APIKeyID, r.Amount, int64(cmd.ChargeMicros))
+			if err != nil {
+				return mapError("settle: key budget convert", err)
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return domain.WrapError(domain.CodeConflict,
+					"settle: key budget correction would go negative (concurrent settlement?)", nil)
+			}
 		default:
 			// The same consumption lands in every applicable window
 			// (设计 §6: 一次消费同时增加三个适用窗口的 used).

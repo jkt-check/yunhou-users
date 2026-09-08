@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/yunhou/users/internal/inference/domain"
 )
 
 // blockedReason describes why an address is not a permitted upstream target.
@@ -157,45 +159,12 @@ func (v *EgressValidator) ValidateRedirect(ctx context.Context, target string) e
 // reservedHeaderPrefixes blocks custom operator-configured request headers
 // that would collide with the gateway's own auth / tracing boundary (设计
 // §5：自定义请求头不得覆盖网关认证/追踪边界或泄漏秘密).
-var reservedHeaderPrefixes = []string{"Authorization", "Proxy-Authorization", "Host"}
-
-// reservedHeaderExact blocks exact header names the gateway sets itself.
-var reservedHeaderExact = map[string]bool{
-	"X-Api-Key":    true, // gateway injects the upstream credential
-	"X-Request-Id": true, // tracing boundary
-}
-
 // ValidateCustomHeaders rejects operator-supplied headers that would
-// override the gateway's authentication or tracing boundaries. Header names
-// are canonicalised before comparison so case tricks don't slip through.
+// override the gateway's authentication or tracing boundaries. The blacklist
+// lives in the domain package (single source of truth); deployment writes
+// enforce it via domain.ExtensionHeaders + this check on the write path.
 func ValidateCustomHeaders(headers map[string]string) error {
-	for name := range headers {
-		canonical := httpCanonicalHeaderKey(name)
-		if reservedHeaderExact[canonical] {
-			return fmt.Errorf("custom header %q is managed by the gateway and must not be overridden", name)
-		}
-		for _, prefix := range reservedHeaderPrefixes {
-			if canonical == prefix {
-				return fmt.Errorf("custom header %q is managed by the gateway and must not be overridden", name)
-			}
-		}
-	}
-	return nil
-}
-
-// httpCanonicalHeaderKey is textproto.CanonicalMIMEHeaderKey without importing
-// net/http into this file's API surface twice; kept local for clarity.
-func httpCanonicalHeaderKey(s string) string {
-	// net/http's canonical form: first letter and letters after '-' upper.
-	upper := true
-	b := []byte(s)
-	for i, c := range b {
-		if upper && 'a' <= c && c <= 'z' {
-			b[i] = c - ('a' - 'A')
-		}
-		upper = c == '-'
-	}
-	return string(b)
+	return domain.ValidateCustomHeaders(headers)
 }
 
 // ErrNoValidator is returned by lifecycle helpers when the deployment did

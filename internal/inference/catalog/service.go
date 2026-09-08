@@ -116,6 +116,18 @@ func ValidateDeployment(d *domain.Deployment) error {
 	if err := validateBaseURL(d.BaseURL); err != nil {
 		return err
 	}
+	// Extension config may carry operator-supplied request headers (Task 8
+	// introduces the protocol-header convention). Whatever shape they take,
+	// they must never override the gateway's authentication/tracing boundary
+	// — so the blacklist is enforced on EVERY deployment write (operator API
+	// and env import alike; both funnel through this validation).
+	headers, err := domain.ExtensionHeaders(d.Config)
+	if err != nil {
+		return err
+	}
+	if err := domain.ValidateCustomHeaders(headers); err != nil {
+		return domain.NewError(domain.CodeInvalidInput, err.Error())
+	}
 	if d.ConnectTimeout <= 0 || d.RequestTimeout <= 0 {
 		return domain.NewError(domain.CodeInvalidInput, "connect/request timeouts must be > 0")
 	}

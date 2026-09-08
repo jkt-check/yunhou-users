@@ -244,3 +244,52 @@ func mustField(raw json.RawMessage, key string) json.RawMessage {
 	}
 	return m[key]
 }
+
+// TestAdminDeploymentConfigHeadersRejected: the extension config may carry
+// operator-supplied request headers (Task 8 introduces the convention), but
+// they must never override the gateway's authentication/tracing boundary —
+// deployment writes (operator API path; env import funnels through the same
+// ValidateDeployment) reject blacklisted headers and malformed payloads.
+func TestAdminDeploymentConfigHeadersRejected(t *testing.T) {
+	engine := newTestServer(t)
+
+	env := do(t, engine, http.MethodPost, "/admin/providers", map[string]any{
+		"code": "hdr-check", "display_name": "HDR", "access_type": "official_api",
+	}, http.StatusOK)
+	var providerID string
+	if err := json.Unmarshal(dataField(t, env, "id"), &providerID); err != nil {
+		t.Fatal(err)
+	}
+
+	base := map[string]any{
+		"provider_id": providerID, "upstream_model": "m", "base_url": "https://api.example.com/v1",
+		"protocol": "openai_chat",
+	}
+
+	// Gateway-managed headers are refused however they are cased.
+	for _, h := range []string{"Authorization", "authorization", "X-Api-Key", "Host", "X-Request-Id"} {
+		body := map[string]any{}
+		for k, v := range base {
+			body[k] = v
+		}
+		body["config"] = map[string]any{"schema_version": 1, "headers": map[string]string{h: "evil"}}
+		do(t, engine, http.MethodPost, "/admin/deployments", body, http.StatusBadRequest)
+	}
+
+	// Malformed headers payload (not a string→string object) fails closed.
+	body := map[string]any{}
+	for k, v := range base {
+		body[k] = v
+	}
+	body["config"] = map[string]any{"schema_version": 1, "headers": []string{"Authorization"}}
+	do(t, engine, http.MethodPost, "/admin/deployments", body, http.StatusBadRequest)
+
+	// Benign custom headers are accepted — the forward-compatible path for
+	// Task 8 protocol headers (blacklist only, not absence).
+	body = map[string]any{}
+	for k, v := range base {
+		body[k] = v
+	}
+	body["config"] = map[string]any{"schema_version": 1, "headers": map[string]string{"X-Tenant": "acme"}}
+	do(t, engine, http.MethodPost, "/admin/deployments", body, http.StatusOK)
+}

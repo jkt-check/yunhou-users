@@ -147,3 +147,39 @@ func TestNewVaultRejectsBadInput(t *testing.T) {
 		t.Fatal("non-positive version must fail")
 	}
 }
+
+// TestParseKeysEnvErrorsRedactKeyMaterial: a malformed paste of REAL key
+// material must not echo the key bytes into the error string — the error
+// travels to the startup log via cmd/server log.Fatalf (Task 4 review
+// fix #2). Errors may name the entry index or the version segment (the part
+// before the colon, never key material) and nothing else.
+func TestParseKeysEnvErrorsRedactKeyMaterial(t *testing.T) {
+	material := strings.Repeat("ab1c", 16) // 64 hex chars standing in for a real key
+
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"no colon echoes nothing", material},
+		{"bad version echoes version segment only", "abc:" + material},
+		{"odd length hex echoes nothing", "1:" + material + "0"},
+		{"invalid hex byte echoes nothing", "1:zz" + material[:62]},
+		{"bad second entry echoes nothing", "1:" + material + ",2:" + material + "0"},
+	}
+	for _, tc := range cases {
+		_, _, err := ParseKeysEnv(tc.in)
+		if err == nil {
+			t.Fatalf("%s: expected error", tc.name)
+		}
+		if strings.Contains(err.Error(), material) {
+			t.Fatalf("%s: error leaks key material: %v", tc.name, err)
+		}
+	}
+
+	// The version segment (before the colon) is not key material and may be
+	// quoted to help the operator locate the typo.
+	_, _, err := ParseKeysEnv("abc:" + material)
+	if !strings.Contains(err.Error(), `"abc"`) {
+		t.Fatalf("invalid-version error should quote the version segment: %v", err)
+	}
+}

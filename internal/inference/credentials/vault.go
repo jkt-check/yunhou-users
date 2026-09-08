@@ -68,25 +68,30 @@ func (v *Vault) CurrentVersion() int { return v.current }
 // becomes the current encryption key. The plaintext key material comes from
 // the deployment secret store (env / injected file) only — never from code,
 // config files in the repo, or request input.
+//
+// SECURITY: every error names the entry index or the version segment only.
+// A malformed paste of REAL key material must not echo it into the startup
+// logs (cmd/server log.Fatalf), so hex-key bytes are never quoted back —
+// not even inside a wrapped hex decode error.
 func ParseKeysEnv(s string) (map[int][]byte, int, error) {
 	keys := map[int][]byte{}
 	highest := 0
-	for _, entry := range strings.Split(s, ",") {
+	for i, entry := range strings.Split(s, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
 		verStr, hexKey, ok := strings.Cut(entry, ":")
 		if !ok {
-			return nil, 0, fmt.Errorf("credentials vault: key entry %q must be version:hex", entry)
+			return nil, 0, fmt.Errorf("credentials vault: key entry #%d must be version:hex", i+1)
 		}
 		ver, err := strconv.Atoi(strings.TrimPrefix(verStr, "v"))
 		if err != nil || ver <= 0 {
-			return nil, 0, fmt.Errorf("credentials vault: key entry %q has invalid version", entry)
+			return nil, 0, fmt.Errorf("credentials vault: key entry #%d has invalid version %q", i+1, verStr)
 		}
 		key, err := hex.DecodeString(strings.TrimSpace(hexKey))
 		if err != nil {
-			return nil, 0, fmt.Errorf("credentials vault: key version %d is not hex: %v", ver, err)
+			return nil, 0, fmt.Errorf("credentials vault: key version %d is not valid hex", ver)
 		}
 		if len(key) != KeyLen {
 			return nil, 0, fmt.Errorf("credentials vault: key version %d must decode to %d bytes", ver, KeyLen)

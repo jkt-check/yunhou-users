@@ -18,6 +18,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 
+	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
@@ -33,6 +34,10 @@ var (
 	_ domain.QuotaStore      = (*Store)(nil)
 	_ domain.SettlementStore = (*Store)(nil)
 	_ domain.CatalogReader   = (*Store)(nil)
+	// Task 4: the credential service's transactional write path (mutation +
+	// propagation + audit in ONE UnitOfWork).
+	_ credentials.TxStore    = (*Store)(nil)
+	_ credentials.TxRecorder = (*Store)(nil)
 )
 
 // NewStore wraps an existing pool. The caller owns db's lifecycle.

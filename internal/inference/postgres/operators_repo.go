@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/management"
 )
 
@@ -80,6 +81,21 @@ func (s *Store) FindUserIDByEmail(ctx context.Context, email string) (string, er
 // The detail is stored sanitized by the caller; this method adds a final
 // belt-and-suspenders pass so no caller mistake can leak secrets.
 func (s *Store) Record(ctx context.Context, ev management.AuditEvent) error {
+	return recordAudit(ctx, s.db, ev)
+}
+
+// RecordTx is Record inside an open UnitOfWork — the caller
+// (credentials.Service) commits the audit row together with the mutation it
+// describes; an audit failure then rolls the whole change back.
+func (s *Store) RecordTx(ctx context.Context, w domain.UnitOfWork, ev management.AuditEvent) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	return recordAudit(ctx, tx, ev)
+}
+
+func recordAudit(ctx context.Context, ex sqlxExecutor, ev management.AuditEvent) error {
 	detail := management.SanitizeDetail(ev.Detail)
 	raw, err := json.Marshal(detail)
 	if err != nil {
@@ -89,7 +105,7 @@ func (s *Store) Record(ctx context.Context, ev management.AuditEvent) error {
 	if ev.ActorUser != "" {
 		actorUser = ev.ActorUser
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = ex.ExecContext(ctx,
 		`INSERT INTO inference_audit_log
 		 (actor_user_id, actor_app_id, action, object_type, object_id, reason, detail)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,

@@ -121,11 +121,25 @@ func (s *Store) GetAPIKeyByPrefix(ctx context.Context, prefix string) (*domain.A
 // must encrypt BEFORE insert; this method never sees a usable secret
 // contract beyond bytes it cannot interpret (Task 4 owns encryption).
 func (s *Store) InsertCredential(ctx context.Context, c *domain.Credential) error {
+	return insertCredential(ctx, s.db, c)
+}
+
+// InsertCredentialTx is InsertCredential inside an open UnitOfWork — the
+// caller (credentials.Service) commits it together with the audit row.
+func (s *Store) InsertCredentialTx(ctx context.Context, w domain.UnitOfWork, c *domain.Credential) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	return insertCredential(ctx, tx, c)
+}
+
+func insertCredential(ctx context.Context, ex sqlxExecutor, c *domain.Credential) error {
 	status := c.Status
 	if status == "" {
 		status = "active"
 	}
-	err := s.db.QueryRowxContext(ctx,
+	err := ex.QueryRowxContext(ctx,
 		`INSERT INTO inference_credentials
 		 (id, provider_id, label, auth_type, ciphertext, key_version, generation, expires_at, status)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -213,7 +227,21 @@ func (s *Store) ListCredentials(ctx context.Context, providerID string, limit in
 // bumps the generation CAS counter atomically. A zero RowsAffected means the
 // credential vanished between read and write.
 func (s *Store) RotateCredentialSecret(ctx context.Context, id string, ciphertext []byte, keyVersion int) error {
-	res, err := s.db.ExecContext(ctx,
+	return rotateCredentialSecret(ctx, s.db, id, ciphertext, keyVersion)
+}
+
+// RotateCredentialSecretTx is RotateCredentialSecret inside an open
+// UnitOfWork — committed together with the rotate audit row.
+func (s *Store) RotateCredentialSecretTx(ctx context.Context, w domain.UnitOfWork, id string, ciphertext []byte, keyVersion int) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	return rotateCredentialSecret(ctx, tx, id, ciphertext, keyVersion)
+}
+
+func rotateCredentialSecret(ctx context.Context, ex sqlxExecutor, id string, ciphertext []byte, keyVersion int) error {
+	res, err := ex.ExecContext(ctx,
 		`UPDATE inference_credentials
 		    SET ciphertext = $2, key_version = $3, generation = generation + 1,
 		        last_rotated_at = now(), updated_at = now()
@@ -230,7 +258,21 @@ func (s *Store) RotateCredentialSecret(ctx context.Context, id string, ciphertex
 
 // SetCredentialStatus flips a credential's status.
 func (s *Store) SetCredentialStatus(ctx context.Context, id, status string) error {
-	res, err := s.db.ExecContext(ctx,
+	return setCredentialStatus(ctx, s.db, id, status)
+}
+
+// SetCredentialStatusTx is SetCredentialStatus inside an open UnitOfWork —
+// committed together with the upstream-account propagation and audit row.
+func (s *Store) SetCredentialStatusTx(ctx context.Context, w domain.UnitOfWork, id, status string) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	return setCredentialStatus(ctx, tx, id, status)
+}
+
+func setCredentialStatus(ctx context.Context, ex sqlxExecutor, id, status string) error {
+	res, err := ex.ExecContext(ctx,
 		`UPDATE inference_credentials SET status = $2, updated_at = now() WHERE id = $1`,
 		id, status)
 	if err != nil {
@@ -243,12 +285,27 @@ func (s *Store) SetCredentialStatus(ctx context.Context, id, status string) erro
 }
 
 // DisableUpstreamAccountsByCredential is the emergency-disable propagation:
-// every account bound to the credential stops scheduling new attempts in the
-// same statement the credential flips. (设计 §5：禁用后账号池在配置刷新周期
-// 内的传播有界 — 账号状态随凭据同刻翻转；已发布的目录快照最多延迟一个
-// 快照刷新周期不再引用新调度。)
+// every account bound to the credential stops scheduling new attempts. The
+// caller (credentials.Service) runs this inside the same UnitOfWork as the
+// credential status flip and the audit row, so all three commit or roll back
+// together. (设计 §5：禁用后账号池在配置刷新周期内的传播有界 — 账号状态随凭据
+// 同刻翻转；已发布的目录快照最多延迟一个快照刷新周期不再引用新调度。)
 func (s *Store) DisableUpstreamAccountsByCredential(ctx context.Context, credentialID string) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
+	return disableUpstreamAccountsByCredential(ctx, s.db, credentialID)
+}
+
+// DisableUpstreamAccountsByCredentialTx is the propagation inside an open
+// UnitOfWork (see DisableUpstreamAccountsByCredential).
+func (s *Store) DisableUpstreamAccountsByCredentialTx(ctx context.Context, w domain.UnitOfWork, credentialID string) (int64, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return 0, err
+	}
+	return disableUpstreamAccountsByCredential(ctx, tx, credentialID)
+}
+
+func disableUpstreamAccountsByCredential(ctx context.Context, ex sqlxExecutor, credentialID string) (int64, error) {
+	res, err := ex.ExecContext(ctx,
 		`UPDATE inference_upstream_accounts
 		    SET status = 'disabled', updated_at = now()
 		  WHERE credential_id = $1 AND status <> 'disabled'`,

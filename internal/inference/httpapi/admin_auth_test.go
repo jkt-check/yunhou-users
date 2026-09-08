@@ -62,6 +62,7 @@ func newAuthzEngine(store httpapi.OperatorStore) *gin.Engine {
 		}
 		if a := c.GetHeader("X-Test-App"); a != "" {
 			c.Set(middleware.ContextApp, &model.App{AppID: a})
+			c.Set(middleware.ContextAppID, a) // JWTAuth leg, mirrored
 		}
 		c.Next()
 	})
@@ -169,6 +170,7 @@ func TestOperatorRequireRole(t *testing.T) {
 	engine.Use(func(c *gin.Context) {
 		c.Set(middleware.ContextUserID, c.GetHeader("X-Test-User"))
 		c.Set(middleware.ContextApp, &model.App{AppID: c.GetHeader("X-Test-App")})
+		c.Set(middleware.ContextAppID, c.GetHeader("X-Test-App")) // JWTAuth leg, mirrored
 		c.Next()
 	})
 	g := engine.Group("/admin")
@@ -191,6 +193,7 @@ func TestGrantRevokeHandlers(t *testing.T) {
 	engine.Use(func(c *gin.Context) {
 		c.Set(middleware.ContextUserID, c.GetHeader("X-Test-User"))
 		c.Set(middleware.ContextApp, &model.App{AppID: c.GetHeader("X-Test-App")})
+		c.Set(middleware.ContextAppID, c.GetHeader("X-Test-App")) // JWTAuth leg, mirrored
 		c.Next()
 	})
 	g := engine.Group("/admin")

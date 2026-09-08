@@ -26,10 +26,66 @@ type Store interface {
 	// generation CAS counter in one statement (设计 §8).
 	RotateCredentialSecret(ctx context.Context, id string, ciphertext []byte, keyVersion int) error
 	SetCredentialStatus(ctx context.Context, id, status string) error
-	// DisableUpstreamAccountsByCredential propagates an emergency credential
-	// disable to every account bound to it, in the same call (调用方同一事务
-	// 语义由 store 层单语句保证). Returns the number of accounts disabled.
+	// DisableUpstreamAccountsByCredential flips every account bound to the
+	// credential. Atomicity with the status flip and the audit row is the
+	// caller's job: production stores satisfy TxStore/TxRecorder and the
+	// service runs all three in ONE UnitOfWork (an audit failure rolls the
+	// whole change back); plain fakes run the sequential fallback below.
 	DisableUpstreamAccountsByCredential(ctx context.Context, credentialID string) (int64, error)
+}
+
+// TxStore is the optional transaction-aware upgrade of Store: when the
+// store implements it (postgres.Store does; in-memory test fakes usually
+// don't), credential mutations run change + propagation + audit inside one
+// domain.UnitOfWork opened by Begin.
+type TxStore interface {
+	Store
+	Begin(ctx context.Context) (domain.UnitOfWork, error)
+	InsertCredentialTx(ctx context.Context, w domain.UnitOfWork, c *domain.Credential) error
+	RotateCredentialSecretTx(ctx context.Context, w domain.UnitOfWork, id string, ciphertext []byte, keyVersion int) error
+	SetCredentialStatusTx(ctx context.Context, w domain.UnitOfWork, id, status string) error
+	DisableUpstreamAccountsByCredentialTx(ctx context.Context, w domain.UnitOfWork, credentialID string) (int64, error)
+}
+
+// TxRecorder is the optional transaction-aware upgrade of the audit
+// recorder. RecordTx MUST write through the given UnitOfWork so the audit
+// row commits (or rolls back) with the change it describes.
+type TxRecorder interface {
+	management.AuditRecorder
+	RecordTx(ctx context.Context, w domain.UnitOfWork, ev management.AuditEvent) error
+}
+
+// runAtomic executes fn inside one UnitOfWork when both the store and the
+// audit recorder are transaction-aware, committing only when fn succeeds —
+// so an audit failure (or any step) rolls the whole mutation back. The
+// boolean reports whether the transactional path ran; when it is false the
+// caller must use its sequential fallback (plain test fakes).
+func (s *Service) runAtomic(ctx context.Context, fn func(w domain.UnitOfWork) error) (bool, error) {
+	ts, ok := s.store.(TxStore)
+	if !ok {
+		return false, nil
+	}
+	if _, ok := s.audit.(TxRecorder); !ok {
+		return false, nil
+	}
+	w, err := ts.Begin(ctx)
+	if err != nil {
+		return true, domain.WrapError(domain.CodeInternal, "begin transaction", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = w.Rollback(ctx)
+		}
+	}()
+	if err := fn(w); err != nil {
+		return true, err
+	}
+	if err := w.Commit(ctx); err != nil {
+		return true, domain.WrapError(domain.CodeInternal, "commit transaction", err)
+	}
+	committed = true
+	return true, nil
 }
 
 // Operator is the verified operator attribution (设计 §9.2: 每次变更记录人员
@@ -80,8 +136,10 @@ func NewService(vault *Vault, store Store, audit management.AuditRecorder) *Serv
 	return &Service{vault: vault, store: store, audit: audit}
 }
 
-func (s *Service) record(ctx context.Context, op Operator, action, objectID, reason string, detail map[string]any) error {
-	ev := management.AuditEvent{
+// auditEvent builds the sanitized dual-attribution event shared by the
+// transactional and fallback write paths.
+func auditEvent(op Operator, action, objectID, reason string, detail map[string]any) management.AuditEvent {
+	return management.AuditEvent{
 		Action:     action,
 		ObjectType: "credential",
 		ObjectID:   objectID,
@@ -90,7 +148,10 @@ func (s *Service) record(ctx context.Context, op Operator, action, objectID, rea
 		ActorApp:   op.AppID,
 		Detail:     management.SanitizeDetail(detail),
 	}
-	if err := s.audit.Record(ctx, ev); err != nil {
+}
+
+func (s *Service) record(ctx context.Context, op Operator, action, objectID, reason string, detail map[string]any) error {
+	if err := s.audit.Record(ctx, auditEvent(op, action, objectID, reason, detail)); err != nil {
 		// Fail closed: an unaudited secret mutation must not report success.
 		return domain.WrapError(domain.CodeInternal, "audit write failed", err)
 	}
@@ -126,13 +187,26 @@ func (s *Service) Create(ctx context.Context, op Operator, providerID, label, au
 		Ciphertext: ct, KeyVersion: version, Generation: 1, ExpiresAt: expiresAt,
 		Status: "active",
 	}
+	createDetail := map[string]any{
+		"provider_id": providerID, "label": label, "auth_type": authType,
+		"key_version": version,
+	}
+	if ran, err := s.runAtomic(ctx, func(w domain.UnitOfWork) error {
+		if err := s.store.(TxStore).InsertCredentialTx(ctx, w, cred); err != nil {
+			return err
+		}
+		return s.audit.(TxRecorder).RecordTx(ctx, w, auditEvent(op, "credential.create", id, reason, createDetail))
+	}); ran {
+		if err != nil {
+			return nil, err
+		}
+		return toView(cred), nil
+	}
+	// Sequential fallback for plain (non-transactional) test stores.
 	if err := s.store.InsertCredential(ctx, cred); err != nil {
 		return nil, err
 	}
-	if err := s.record(ctx, op, "credential.create", id, reason, map[string]any{
-		"provider_id": providerID, "label": label, "auth_type": authType,
-		"key_version": version,
-	}); err != nil {
+	if err := s.record(ctx, op, "credential.create", id, reason, createDetail); err != nil {
 		return nil, err
 	}
 	return toView(cred), nil
@@ -157,15 +231,29 @@ func (s *Service) Rotate(ctx context.Context, op Operator, id, newPlaintext, rea
 	if err != nil {
 		return nil, domain.WrapError(domain.CodeInternal, "encrypt credential", err)
 	}
-	if err := s.store.RotateCredentialSecret(ctx, id, ct, version); err != nil {
-		return nil, err
-	}
+	// Optimistic in-memory view of the CAS bump the SQL performs; on commit
+	// this matches the stored row.
 	cred.KeyVersion = version
 	cred.Generation++
 	cred.Status = "active"
-	if err := s.record(ctx, op, "credential.rotate", id, reason, map[string]any{
+	rotateDetail := map[string]any{
 		"provider_id": cred.ProviderID, "key_version": version, "generation": cred.Generation,
-	}); err != nil {
+	}
+	if ran, err := s.runAtomic(ctx, func(w domain.UnitOfWork) error {
+		if err := s.store.(TxStore).RotateCredentialSecretTx(ctx, w, id, ct, version); err != nil {
+			return err
+		}
+		return s.audit.(TxRecorder).RecordTx(ctx, w, auditEvent(op, "credential.rotate", id, reason, rotateDetail))
+	}); ran {
+		if err != nil {
+			return nil, err
+		}
+		return toView(cred), nil
+	}
+	if err := s.store.RotateCredentialSecret(ctx, id, ct, version); err != nil {
+		return nil, err
+	}
+	if err := s.record(ctx, op, "credential.rotate", id, reason, rotateDetail); err != nil {
 		return nil, err
 	}
 	return toView(cred), nil
@@ -198,10 +286,11 @@ func (s *Service) Test(ctx context.Context, op Operator, id, reason string) (*Vi
 
 // SetStatus flips a credential's status. Disabling ("revoked") is the
 // emergency path: it propagates to every upstream account bound to the
-// credential in the same store call, so the account pool stops scheduling
-// new attempts immediately. The propagation bound for already-cached route
-// snapshots is one catalog snapshot refresh interval (see cmd/server); new
-// dispatches re-check account status against the DB per attempt.
+// credential in the SAME UnitOfWork as the status flip and the audit row —
+// either all three commit or none do. The propagation bound for already-
+// cached route snapshots is one catalog snapshot refresh interval (see
+// cmd/server); new dispatches re-check account status against the DB per
+// attempt.
 func (s *Service) SetStatus(ctx context.Context, op Operator, id, status, reason string) (*View, error) {
 	if status != "active" && status != "revoked" && status != "rotating" {
 		return nil, domain.NewError(domain.CodeInvalidInput, "status must be active, rotating or revoked")
@@ -210,10 +299,31 @@ func (s *Service) SetStatus(ctx context.Context, op Operator, id, status, reason
 	if err != nil {
 		return nil, err
 	}
+	detail := map[string]any{"provider_id": cred.ProviderID, "from": cred.Status, "to": status}
+	if ran, err := s.runAtomic(ctx, func(w domain.UnitOfWork) error {
+		ts := s.store.(TxStore)
+		if err := ts.SetCredentialStatusTx(ctx, w, id, status); err != nil {
+			return err
+		}
+		if status == "revoked" {
+			n, err := ts.DisableUpstreamAccountsByCredentialTx(ctx, w, id)
+			if err != nil {
+				return err
+			}
+			detail["upstream_accounts_disabled"] = n
+		}
+		return s.audit.(TxRecorder).RecordTx(ctx, w, auditEvent(op, "credential.disable", id, reason, detail))
+	}); ran {
+		if err != nil {
+			return nil, err
+		}
+		cred.Status = status
+		return toView(cred), nil
+	}
+	// Sequential fallback for plain (non-transactional) test stores.
 	if err := s.store.SetCredentialStatus(ctx, id, status); err != nil {
 		return nil, err
 	}
-	detail := map[string]any{"provider_id": cred.ProviderID, "from": cred.Status, "to": status}
 	if status == "revoked" {
 		n, err := s.store.DisableUpstreamAccountsByCredential(ctx, id)
 		if err != nil {

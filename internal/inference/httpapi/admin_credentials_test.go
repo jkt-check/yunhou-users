@@ -424,3 +424,37 @@ func task4ProviderID(t *testing.T, db *sqlx.DB) string {
 	return id
 }
 
+
+// TestOperatorJWTBoundToVerifiedApp: the two identity legs must BIND. A
+// stolen operator JWT issued for another app presented together with a valid
+// secret for the real app must not authorize (Task 4 review fix #1) — and
+// must not launder audit attribution through the wrong app.
+func TestOperatorJWTBoundToVerifiedApp(t *testing.T) {
+	env := setupTask4(t)
+
+	token, err := env.tok.SignAccessToken(task4Admin, "task4-other-app", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := map[string]string{
+		"Authorization": "Bearer " + token,
+		"X-App-ID":      task4AppID,
+		"X-App-Secret":  task4AppSecret,
+	}
+	body := fmt.Sprintf(`{"provider_id":%q,"label":"x","auth_type":"api_key","secret":"s","reason":"r"}`,
+		task4ProviderID(t, env.db))
+	if w := postJSON(t, env.engine, "/admin/credentials", h, body); w.Code != http.StatusForbidden {
+		t.Fatalf("cross-app JWT must be rejected: %d %s", w.Code, w.Body.String())
+	}
+
+	// The rejected attempt must not leave an audit row attributing to the
+	// real app either.
+	var n int
+	if err := env.db.Get(&n,
+		`SELECT count(*) FROM inference_audit_log WHERE actor_user_id = $1`, task4Admin); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("rejected cross-app attempt left audit rows: %d", n)
+	}
+}

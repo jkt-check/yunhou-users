@@ -1,9 +1,10 @@
 // admin_auth.go — 运营授权中间件与运营人员管理端点（设计 §9.2）。
 //
-// 运营身份 = 组合认定：用户 JWT（middleware.JWTAuth 服务端验证，ContextUserID）
-// + 受验证的服务身份（middleware.InternalAppAuth，ContextApp）。二者缺一即拒；
-// 角色只来自 operator_roles 表，请求体自报的 role/actor 一律无效（凭据端点用
-// 严格 JSON 解码显式拒绝携带未知字段的请求）。
+// 运营身份 = 组合认定：用户 JWT（middleware.JWTAuth 服务端验证，ContextUserID；
+// 其 app claim 落在 ContextAppID）+ 受验证的服务身份（middleware.InternalAppAuth，
+// ContextApp）。三者缺一即拒，且 JWT 的 app claim 必须与受验证服务身份一致
+// （跨 app 的 JWT+secret 组合 403）；角色只来自 operator_roles 表，请求体自报的
+// role/actor 一律无效（凭据端点用严格 JSON 解码显式拒绝携带未知字段的请求）。
 
 package httpapi
 
@@ -51,16 +52,19 @@ type OperatorAdminStore interface {
 
 // loadOperator resolves the verified dual identity from the gin context
 // (set by JWTAuth + InternalAppAuth before this middleware runs). Fail
-// closed on every missing leg: the user identity, the service identity,
-// and at least one operator role.
+// closed on every missing or mismatched leg: the user identity, the service
+// identity, the BINDING between them (a JWT issued for app A must not be
+// usable with app B's verified secret), and at least one operator role.
 var (
 	errNoUserIdentity    = errors.New("operator user identity missing")
 	errNoServiceIdentity = errors.New("verified service identity missing")
+	errAppMismatch       = errors.New("JWT audience app does not match the verified service identity")
 	errNotAnOperator     = errors.New("user is not an operator")
 )
 
 func loadOperator(c *gin.Context, store OperatorStore) (userID, appID string, roles []string, err error) {
 	userID = c.GetString(middleware.ContextUserID)
+	jwtAppID := c.GetString(middleware.ContextAppID)
 	if v, present := c.Get(middleware.ContextApp); present {
 		if app, ok := v.(*model.App); ok && app != nil {
 			appID = app.AppID
@@ -71,6 +75,14 @@ func loadOperator(c *gin.Context, store OperatorStore) (userID, appID string, ro
 	}
 	if appID == "" {
 		return "", "", nil, errNoServiceIdentity
+	}
+	// Bind the two legs: JWTAuth stores the token's app claim in
+	// ContextAppID; InternalAppAuth stores the secret-verified *model.App.
+	// A stolen operator JWT (issued for app A) combined with an attacker's
+	// own app B secret must not authorize — and must not launder audit
+	// attribution through the attacker's app.
+	if jwtAppID == "" || jwtAppID != appID {
+		return "", "", nil, errAppMismatch
 	}
 	roles, err = store.RolesForUser(c.Request.Context(), userID)
 	if err != nil {

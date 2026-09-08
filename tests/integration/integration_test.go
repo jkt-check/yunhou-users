@@ -82,7 +82,7 @@ func setupDB(t *testing.T) *sqlx.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	tables := []string{"usage_events", "plan_change_log", "refunds", "payments", "webhook_events", "audit_log", "orders", "sessions", "subscriptions", "social_identities", "plans", "apps", "users"}
+	tables := []string{"plan_upgrade_rules", "plan_benefit_configs", "usage_events", "plan_change_log", "refunds", "payments", "webhook_events", "audit_log", "orders", "sessions", "subscriptions", "social_identities", "plans", "apps", "users"}
 	for _, tbl := range tables {
 		db.ExecContext(context.Background(), "DELETE FROM "+tbl)
 	}

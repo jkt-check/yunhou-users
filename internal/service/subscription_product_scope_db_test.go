@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
@@ -14,15 +15,24 @@ import (
 // ============================================================================
 // Dual-product subscription isolation (migration 027 / design §4.1)
 //
-// Coding Plan is NOT on sale in this phase — no client-facing path may
-// create coding-plan subscriptions. These tests construct coding-plan rows
-// directly at the service/repo layer (as the task brief allows) to prove
-// the storage and activation machinery treats products independently.
+// Task 10 起 Coding Plan 开售需要支付配置（plan_benefit_configs，029）：这些
+// 用例的 coding 套餐夹具随之补齐配置行，产品隔离断言原样保留。
 // ============================================================================
 
-// seedCodingPlans inserts one paid and one free coding-plan fixture.
+// seedCodingPlans inserts one paid and one free coding-plan fixture, each
+// with its payment/benefit configuration (mandatory for purchasability
+// since migration 029).
 func seedCodingPlans(t *testing.T, db *sqlx.DB) {
 	t.Helper()
+	ctx := context.Background()
+	st := inferencepostgres.NewStore(db)
+	pol := &inferencepostgres.PolicyVersion{
+		Name: "dual-product-policy", Revision: 1, ModelIDs: []string{"glm-4.6"},
+		MonthlyLimit: microcredits(100_000_000), Status: "published",
+	}
+	if err := st.InsertPolicyVersion(ctx, pol); err != nil {
+		t.Fatalf("seed policy version: %v", err)
+	}
 	for _, p := range []struct {
 		id    string
 		price float64
@@ -31,12 +41,19 @@ func seedCodingPlans(t *testing.T, db *sqlx.DB) {
 		{"coding-monthly", 49.9, 30},
 		{"coding-free", 0, 30},
 	} {
-		if _, err := db.ExecContext(context.Background(), `
+		if _, err := db.ExecContext(ctx, `
 			INSERT INTO plans (id, name, price, interval_days, apps, currency, product_code)
 			VALUES ($1, $2, $3, $4, '{}', 'CNY', 'coding-plan')
 			ON CONFLICT (id) DO NOTHING
 		`, p.id, p.id, p.price, p.days); err != nil {
 			t.Fatalf("seed coding plan %s: %v", p.id, err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO plan_benefit_configs (plan_id, policy_version_id, model_ids, grant_mode)
+			VALUES ($1, $2, '{glm-4.6}', 'subscription')
+			ON CONFLICT (plan_id) DO NOTHING
+		`, p.id, pol.ID); err != nil {
+			t.Fatalf("seed coding benefit config %s: %v", p.id, err)
 		}
 	}
 }
@@ -71,7 +88,7 @@ func readSubForProduct(t *testing.T, db *sqlx.DB, uid, productCode string) (stat
 // permits exactly this coexistence).
 func TestDualProduct_PurchaseCodingPlanLeavesKayaUntouched(t *testing.T) {
 	db := setupPaymentDB(t)
-	s := newTestPaymentService(t, db)
+	s := newBenefitStack(t, db).svc
 	seedCodingPlans(t, db)
 	uid := seedUser(t, db)
 
@@ -149,9 +166,11 @@ func TestDualProduct_DuplicateActivationRejected(t *testing.T) {
 		t.Fatalf("construct coding sub: %v", err)
 	}
 
-	// Same product again → refused.
-	if _, err := subSvc.Create(context.Background(), uid, "coding-free", nil); !errors.Is(err, ErrUserHasActiveSub) {
-		t.Fatalf("second coding-plan Create err = %v, want ErrUserHasActiveSub", err)
+	// Self-serve creation of a coding-plan subscription is refused outright
+	// (Task 10 product guard — stronger than the previous per-product
+	// uniqueness refusal, which still holds one layer down at the DB index).
+	if _, err := subSvc.Create(context.Background(), uid, "coding-free", nil); !errors.Is(err, ErrSelfServiceProductForbidden) {
+		t.Fatalf("self-serve coding-plan Create err = %v, want ErrSelfServiceProductForbidden", err)
 	}
 
 	// Other product (kaya free plan) → allowed.
@@ -175,7 +194,7 @@ func TestDualProduct_DuplicateActivationRejected(t *testing.T) {
 // with its original expiry.
 func TestDualProduct_CancelAndRefundAreProductScoped(t *testing.T) {
 	db := setupPaymentDB(t)
-	s := newTestPaymentService(t, db)
+	s := newBenefitStack(t, db).svc
 	seedCodingPlans(t, db)
 	uid := seedUser(t, db)
 

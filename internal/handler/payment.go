@@ -297,6 +297,14 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
 	case errors.Is(err, service.ErrPlanDowngrade):
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "downgrade to a shorter billing cycle is not allowed with an active subscription"})
+	case errors.Is(err, service.ErrPlanNotPurchasable):
+		// 400 — the plan has no payment/benefit configuration (migration 029);
+		// it is a draft, not purchasable (设计 §4.3).
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is not purchasable: no payment configuration"})
+	case errors.Is(err, service.ErrPlanUpgradeNotConfigured):
+		// 409 — cross-tier change for a coding-plan subscription requires an
+		// explicitly configured upgrade rule (设计 §4.2).
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "cross-tier upgrade is not configured for this plan"})
 	case errors.Is(err, service.ErrOrderNotFound), errors.Is(err, service.ErrPaymentNotFound), errors.Is(err, service.ErrRefundNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "not found"})
 	case errors.Is(err, service.ErrOrderNotPending):

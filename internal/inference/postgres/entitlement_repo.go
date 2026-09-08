@@ -66,6 +66,155 @@ func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) er
 	return mapError("insert entitlement", err)
 }
 
+// InsertEntitlementTx is InsertEntitlement inside the caller's UnitOfWork —
+// the entitlement-sync worker commits the grant and the outbox delivery
+// mark in one transaction (Task 10).
+func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e *domain.Entitlement) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	status := string(e.Status)
+	if status == "" {
+		status = string(domain.EntitlementActive)
+	}
+	if e.Revision == 0 {
+		e.Revision = 1
+	}
+	err = tx.QueryRowxContext(ctx,
+		`INSERT INTO inference_entitlements
+		 (billing_account_id, source_type, source_id, model_ids, policy_version_id,
+		  anchor_at, effective_from, effective_to, revision, stackable, status)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		 RETURNING id, created_at, updated_at`,
+		e.BillingAccountID, string(e.SourceType), e.SourceID, strArr(e.ModelIDs),
+		e.PolicyVersionID, e.AnchorAt, e.EffectiveFrom, e.EffectiveTo,
+		e.Revision, e.Stackable, status).
+		Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
+	return mapError("insert entitlement", err)
+}
+
+// GetLatestEntitlementBySource returns the highest-revision entitlement row
+// for one source (any status). The sync path needs the retired rows too —
+// a re-purchase after refund revives the same source in place.
+// sql.ErrNoRows (→ CodeNotFound) when the source never granted.
+func (s *Store) GetLatestEntitlementBySource(ctx context.Context, sourceType domain.EntitlementSource, sourceID string) (*domain.Entitlement, error) {
+	var row entitlementRow
+	err := s.db.GetContext(ctx, &row,
+		`SELECT * FROM inference_entitlements
+		 WHERE source_type = $1 AND source_id = $2
+		 ORDER BY revision DESC, created_at DESC
+		 LIMIT 1`, string(sourceType), sourceID)
+	if err != nil {
+		return nil, mapError("get entitlement by source", err)
+	}
+	return row.toDomain(), nil
+}
+
+// ReviseEntitlementTx is ReviseEntitlement inside the caller's UnitOfWork.
+func (s *Store) ReviseEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	var row entitlementRow
+	err = tx.GetContext(ctx, &row,
+		`UPDATE inference_entitlements
+		 SET revision = revision + 1, updated_at = now(),
+		     policy_version_id = COALESCE($2, policy_version_id),
+		     model_ids = COALESCE($3::text[], model_ids),
+		     effective_to = COALESCE($4, effective_to)
+		 WHERE id = $1 AND revision = $5 AND status = 'active'
+		 RETURNING *`,
+		id, patch.PolicyVersionID, patchStrArr(patch.ModelIDs), patch.EffectiveTo,
+		patch.ExpectedRevision)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.NewError(domain.CodeConflict,
+				"revise entitlement: stale revision or entitlement not active")
+		}
+		return nil, mapError("revise entitlement", err)
+	}
+	return row.toDomain(), nil
+}
+
+// ReviveEntitlementTx returns a retired (revoked/expired) entitlement to
+// active while applying the patch — the re-purchase-after-refund path.
+// Same optimistic guard as ReviseEntitlement; the anchor and the
+// consumption subject (ID) never change, so quota history stays attached.
+func (s *Store) ReviveEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	var row entitlementRow
+	err = tx.GetContext(ctx, &row,
+		`UPDATE inference_entitlements
+		 SET revision = revision + 1, updated_at = now(), status = 'active',
+		     policy_version_id = COALESCE($2, policy_version_id),
+		     model_ids = COALESCE($3::text[], model_ids),
+		     effective_to = COALESCE($4, effective_to)
+		 WHERE id = $1 AND revision = $5 AND status IN ('revoked', 'expired')
+		 RETURNING *`,
+		id, patch.PolicyVersionID, patchStrArr(patch.ModelIDs), patch.EffectiveTo,
+		patch.ExpectedRevision)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.NewError(domain.CodeConflict,
+				"revive entitlement: stale revision or entitlement not retired")
+		}
+		return nil, mapError("revive entitlement", err)
+	}
+	return row.toDomain(), nil
+}
+
+// RetireEntitlementTx flips an active entitlement to a terminal status
+// (revoked on cancel/refund/lost payment evidence, expired on natural
+// lapse) with the optimistic revision guard. 已消费账本与窗口不动 —— 状态
+// 翻转只切断后续调用的授权来源（SelectEntitlement 只认 active）。
+func (s *Store) RetireEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, expectedRevision int, to domain.EntitlementStatus) error {
+	switch to {
+	case domain.EntitlementRevoked, domain.EntitlementExpired, domain.EntitlementSuperseded:
+	default:
+		return domain.NewError(domain.CodeInvalidInput, "retire entitlement: invalid target status "+string(to))
+	}
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE inference_entitlements
+		 SET status = $2, revision = revision + 1, updated_at = now()
+		 WHERE id = $1 AND revision = $3 AND status = 'active'`,
+		id, string(to), expectedRevision)
+	if err != nil {
+		return mapError("retire entitlement", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return domain.NewError(domain.CodeConflict,
+			"retire entitlement: stale revision or entitlement not active")
+	}
+	return nil
+}
+
+// MarkExpiredEntitlements flips active entitlements whose effective_to has
+// passed to status='expired' (natural lapse hygiene — authorization is
+// already cut off by the effective_to bound in ListActiveEntitlements /
+// SelectEntitlement; this makes the stored status honest). Idempotent.
+func (s *Store) MarkExpiredEntitlements(ctx context.Context, now time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inference_entitlements
+		 SET status = 'expired', revision = revision + 1, updated_at = now()
+		 WHERE status = 'active' AND effective_to IS NOT NULL AND effective_to <= $1`,
+		now.UTC())
+	if err != nil {
+		return 0, mapError("mark expired entitlements", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // ReviseEntitlement applies an in-place revision computed by the pure rules
 // (access.Upgrade / access.Renew). The entitlement ID — the consumption
 // subject the quota windows key on — and the original anchor NEVER change,

@@ -3,11 +3,14 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
+	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
@@ -15,10 +18,25 @@ import (
 type SubscriptionService struct {
 	subRepo repo.SubscriptionRepo
 	planSvc *PlanService
+
+	// Task 10: when wired, Cancel flips the subscription AND enqueues the
+	// entitlement-sync outbox message in ONE transaction (同事务 outbox),
+	// so a cancelled coding-plan subscription revokes its model entitlement
+	// with no crash window. Nil (unit tests with mock repos) keeps the
+	// legacy non-tx path.
+	db          *sqlx.DB
+	benefitSync BenefitSyncOutbox
 }
 
 func NewSubscriptionService(subRepo repo.SubscriptionRepo, planSvc *PlanService) *SubscriptionService {
 	return &SubscriptionService{subRepo: subRepo, planSvc: planSvc}
+}
+
+// SetBenefitSync wires the transactional entitlement-sync enqueue used by
+// Cancel. Production calls this unconditionally.
+func (s *SubscriptionService) SetBenefitSync(db *sqlx.DB, outbox BenefitSyncOutbox) {
+	s.db = db
+	s.benefitSync = outbox
 }
 
 func (s *SubscriptionService) Create(ctx context.Context, userID, planID string, expiresAt *time.Time) (*model.Subscription, error) {
@@ -35,6 +53,15 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, planID string,
 	}
 	if err != nil {
 		return nil, fmt.Errorf("find plan: %w", err)
+	}
+	// Product guard (Task 10, design §4.1/§4.3): self-serve Create is a
+	// kaya-membership-only surface. Coding-plan subscriptions — even a
+	// price-0 draft plan — must come through the paid order pipeline so the
+	// entitlement grant always has payment evidence. The DB column is
+	// NOT NULL (027), so "" only appears in in-memory fixtures (mock repos)
+	// and is treated as the legacy kaya shape.
+	if plan.ProductCode != "" && plan.ProductCode != model.ProductKayaMembership {
+		return nil, ErrSelfServiceProductForbidden
 	}
 	// Order: IsActive (cheapest / most obvious) → AcceptingNewSubscriptions
 	// (orthogonal to active; quarterly is active-but-not-accepting) → Price > 0
@@ -119,7 +146,74 @@ func (s *SubscriptionService) Renew(ctx context.Context, id string, expiresAt *t
 
 // Cancel marks a subscription as cancelled. Requires the caller's userID and
 // will refuse if the subscription belongs to someone else.
+//
+// Task 10: when the benefit-sync outbox is wired (production), the status
+// flip and the entitlement-sync message commit in ONE transaction — a
+// cancelled coding-plan subscription's model entitlement is revoked by the
+// sync worker with no crash window, and a cancel → re-purchase → cancel
+// sequence enqueues twice (no dedup key on purpose; convergence makes the
+// duplicate a no-op). When unwired (unit tests over mock repos) the legacy
+// non-transactional path runs unchanged.
 func (s *SubscriptionService) Cancel(ctx context.Context, id, userID string) error {
+	if s.db != nil && s.benefitSync != nil {
+		return s.cancelWithBenefitSync(ctx, id, userID)
+	}
+	return s.cancelLegacy(ctx, id, userID)
+}
+
+// cancelWithBenefitSync is the transactional Cancel: lock → guard → flip →
+// enqueue → commit.
+func (s *SubscriptionService) cancelWithBenefitSync(ctx context.Context, id, userID string) error {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin cancel tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var sub model.Subscription
+	if err := tx.GetContext(ctx, &sub, `SELECT * FROM subscriptions WHERE id = $1 FOR UPDATE`, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrSubscriptionNotFound
+		}
+		return fmt.Errorf("lock subscription: %w", err)
+	}
+	if sub.UserID != userID {
+		// Same response whether the subscription belongs to someone else or
+		// doesn't exist, so attackers can't enumerate subscription IDs.
+		return ErrSubscriptionNotFound
+	}
+	if sub.Status == "cancelled" {
+		return ErrAlreadyCancelled
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE subscriptions SET status = 'cancelled', updated_at = now()
+		WHERE id = $1 AND status <> 'cancelled'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("cancel: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Lost a concurrent cancel race after the FOR UPDATE read.
+		return ErrAlreadyCancelled
+	}
+
+	payload, err := json.Marshal(access.EntitlementSyncMessage{
+		UserID:         userID,
+		ProductCode:    sub.ProductCode,
+		Reason:         access.SyncReasonSubCancelled,
+		SubscriptionID: sub.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal benefit sync message: %w", err)
+	}
+	if _, err := s.benefitSync.EnqueueOutboxSQLTx(ctx, tx, access.TopicEntitlementSync, payload, nil); err != nil {
+		return fmt.Errorf("enqueue benefit sync: %w", err)
+	}
+	return tx.Commit()
+}
+
+// cancelLegacy is the pre-Task-10 Cancel: plain repo calls, no outbox.
+func (s *SubscriptionService) cancelLegacy(ctx context.Context, id, userID string) error {
 	sub, err := s.subRepo.FindByID(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrSubscriptionNotFound

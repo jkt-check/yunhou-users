@@ -205,6 +205,10 @@ type Config struct {
 	InferenceRecoveryBatch          int
 	InferenceRecoveryGrace          time.Duration
 	InferenceReconciliationDeadline time.Duration
+	// Task 10: entitlement-sync worker (outbox consumer for payment→
+	// entitlement grants). Defaults: 2s / 100 / 10min backoff cap.
+	InferenceEntitlementSyncInterval time.Duration
+	InferenceEntitlementSyncBatch    int
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -261,10 +265,12 @@ func Load() *Config {
 		InferenceKayaChatGateway:   os.Getenv("INFERENCE_KAYA_CHAT_GATEWAY") == "1",
 		KayaChatModel:              os.Getenv("KAYA_CHAT_MODEL"),
 
-		InferenceRecoveryInterval:       parseDurationOr(envOr("INFERENCE_RECOVERY_INTERVAL", "30s"), 30*time.Second),
-		InferenceRecoveryBatch:          parseIntOr(envOr("INFERENCE_RECOVERY_BATCH", "100"), 100),
-		InferenceRecoveryGrace:          parseDurationOr(envOr("INFERENCE_RECOVERY_GRACE", "15m"), 15*time.Minute),
-		InferenceReconciliationDeadline: parseDurationOr(envOr("INFERENCE_RECONCILIATION_DEADLINE", "24h"), 24*time.Hour),
+		InferenceRecoveryInterval:        parseDurationOr(envOr("INFERENCE_RECOVERY_INTERVAL", "30s"), 30*time.Second),
+		InferenceRecoveryBatch:           parseIntOr(envOr("INFERENCE_RECOVERY_BATCH", "100"), 100),
+		InferenceRecoveryGrace:           parseDurationOr(envOr("INFERENCE_RECOVERY_GRACE", "15m"), 15*time.Minute),
+		InferenceReconciliationDeadline:  parseDurationOr(envOr("INFERENCE_RECONCILIATION_DEADLINE", "24h"), 24*time.Hour),
+		InferenceEntitlementSyncInterval: parseDurationOr(envOr("INFERENCE_ENTITLEMENT_SYNC_INTERVAL", "2s"), 2*time.Second),
+		InferenceEntitlementSyncBatch:    parseIntOr(envOr("INFERENCE_ENTITLEMENT_SYNC_BATCH", "100"), 100),
 	}
 }
 

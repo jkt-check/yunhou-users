@@ -21,11 +21,21 @@ import (
 type QuoteService struct {
 	plans repo.PlanRepo
 	apps  AppLookup
+	// benefits, when wired, is the purchasability gate for coding-plan
+	// plans (migration 029, 设计 §4.3): quoting a coding-plan plan without
+	// a plan_benefit_configs row is refused, so the marketing page never
+	// sells a product whose payment could not grant anything. Nil (unit
+	// tests / partial deployments) skips the gate — CreateOrder's own
+	// fail-closed check remains the hard boundary.
+	benefits repo.PlanBenefitRepo
 }
 
 func NewQuoteService(plans repo.PlanRepo, apps AppLookup) *QuoteService {
 	return &QuoteService{plans: plans, apps: apps}
 }
+
+// SetBenefitRepo wires the plan-benefit read surface (Task 10).
+func (s *QuoteService) SetBenefitRepo(r repo.PlanBenefitRepo) { s.benefits = r }
 
 // ErrPlanAppMismatch is returned when the requested plan does not include
 // the requested app in its `apps` array — i.e. this plan does not grant
@@ -49,6 +59,16 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 	}
 	if !slices.Contains(plan.Apps, appID) {
 		return nil, ErrPlanAppMismatch
+	}
+	// 设计 §4.3 / Task 10：没有支付配置（plan_benefit_configs 行）的
+	// coding-plan 商品不可购买——报价阶段就拒绝，而不是等下单失败。
+	if plan.ProductCode == model.ProductCodingPlan && s.benefits != nil {
+		if _, err := s.benefits.FindByPlanID(ctx, planID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrPlanNotPurchasable
+			}
+			return nil, fmt.Errorf("check benefit config: %w", err)
+		}
 	}
 
 	app, err := s.apps.FindByID(ctx, appID)

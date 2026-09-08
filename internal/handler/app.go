@@ -610,6 +610,11 @@ func (h *SubscriptionHandler) CreateSubscription(c *gin.Context) {
 		case errors.Is(err, service.ErrPaidPlanForbidden):
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "paid plans require payment, cannot self-subscribe"})
 			return
+		case errors.Is(err, service.ErrSelfServiceProductForbidden):
+			// Task 10: self-serve subscribe is kaya-membership-only;
+			// coding-plan subscriptions come through the paid order pipeline.
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "this product must be purchased through the order pipeline"})
+			return
 		case errors.Is(err, service.ErrPlanNotAcceptingNew):
 			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is not accepting new subscriptions"})
 			return
@@ -1198,6 +1203,10 @@ func (h *PlanHandler) PostQuote(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is inactive"})
 		case errors.Is(err, service.ErrPlanAppMismatch):
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan does not include this app"})
+		case errors.Is(err, service.ErrPlanNotPurchasable):
+			// Task 10: coding-plan plan without payment/benefit configuration
+			// is a draft — not quotable (设计 §4.3).
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is not purchasable: no payment configuration"})
 		case errors.Is(err, service.ErrAppInactive):
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "app is disabled"})
 		case errors.Is(err, service.ErrAppNotFound):

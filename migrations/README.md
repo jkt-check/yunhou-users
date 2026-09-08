@@ -76,3 +76,6 @@ syntax, **not** transaction control — those are fine.
 | `025_inference_accounts.sql` | inference 账号表组：credentials（AEAD 密文 + key_version + generation）/upstream_accounts（含上游额度缓存）/billing_accounts（每用户一个，不级联删除）/api_keys（前缀+摘要，预算） |
 | `026_inference_accounting.sql` | inference 计量/账本表组：price_versions/policy_versions/entitlements/requests/attempts/usage_records/quota_windows（区间不重叠 EXCLUDE）/reservations/concurrency_leases/ledger_entries（每请求一条 charge 的部分唯一索引）/adjustments/outbox/reconciliation_jobs；全部整数微额度/微金额，账本不对用户级联删除 |
 | `027_subscription_product_scope.sql` | 套餐/订阅增加 `product_code`（默认回填 `kaya-membership`）；002 的每用户全局活跃唯一索引替换为 `(user_id, product_code)` 部分唯一索引；迁移前 DO 块对同 (user,product) 多活跃订阅输出可读诊断并中止；触发器保证订阅 product_code 与套餐一致 |
+| `028_operator_permissions.sql` | inference 运营授权表组：operator_roles（角色→权限映射）+ inference_audit_log（递归脱敏审计）（Task 4） |
+| `029_order_benefit_snapshot.sql` | 下单权益快照：orders 增加 product_code/plan_interval_days/benefit_policy_version_id/benefit_model_ids/benefit_grant_mode/order_kind/upgrade_from_plan_id（支付回调只按快照兑现；存量订单按 plan 当前值回填）；新增 plan_benefit_configs（套餐→权益版本发布配置，无配置的商品不可购买）与 plan_upgrade_rules（跨档升级显式规则）（Task 10） |
+| `031_inference_settlement_recovery.sql` | 幂等结算与崩溃恢复：charge 允许零额（零消费恒落行）、reconciliation reason 增 settlement_overage、窗口级任务部分唯一索引、请求行持久化准入上界（Task 9；030 起空号经控制者裁决） |

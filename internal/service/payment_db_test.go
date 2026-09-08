@@ -37,6 +37,26 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 
+	// Task 10: the payment-benefit tests seed inference rows. Wipe the whole
+	// inference group with one TRUNCATE ... CASCADE (the requests/windows/
+	// attempts FK ring makes manual DELETE ordering brittle — same idiom as
+	// internal/repo tests), then the legacy tables in FK-safe order.
+	if _, err := db.ExecContext(context.Background(), `TRUNCATE
+		inference_reconciliation_jobs, inference_outbox,
+		inference_ledger_entries, inference_adjustments,
+		inference_concurrency_leases, inference_reservations,
+		inference_quota_windows, inference_usage_records,
+		inference_attempts, inference_requests,
+		inference_entitlements, inference_price_versions,
+		inference_policy_versions, inference_api_keys,
+		inference_billing_accounts, inference_upstream_accounts,
+		inference_model_routes, inference_deployments,
+		inference_credentials, inference_config_revisions,
+		inference_providers, inference_models,
+		plan_upgrade_rules, plan_benefit_configs
+		RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatalf("wipe inference tables: %v", err)
+	}
 	tables := []string{
 		"refunds", "payments", "webhook_events", "orders",
 		"sessions", "subscriptions", "social_identities",
@@ -2663,9 +2683,9 @@ func TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit(t *testing.T
 	}
 
 	cases := []struct {
-		name     string
-		amount   float64
-		currency string
+		name      string
+		amount    float64
+		currency  string
 		wantAudit string // audit action, or "" if none expected
 	}{
 		// USD vs monthly-plan CNY → currency_mismatch; amount 29.9 >= 19.9 CNY
@@ -2880,7 +2900,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	got, err := s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &hint, nil)
+	got, err := s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &hint, nil, 0)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
@@ -2890,7 +2910,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 
 	// Beyond the plan grant: clamped to ~now + 30d.
 	farHint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	got, err = s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &farHint, nil)
+	got, err = s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &farHint, nil, 0)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry far hint: %v", err)
 	}

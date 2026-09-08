@@ -200,6 +200,17 @@ func main() {
 	// DB-operational config on restart (基线报告差距 1).
 	infStore := inferencepostgres.NewStore(db)
 	catalogSvc := inferencecatalog.NewService(infStore)
+
+	// Task 10: payment → entitlement closed loop. The benefit repo gates
+	// coding-plan purchasability (no plan_benefit_configs row = not
+	// purchasable, 设计 §4.3) and the outbox enqueue rides the payment
+	// transaction so a state flip and its entitlement-sync message commit
+	// or roll back together.
+	benefitRepo := repo.NewPlanBenefitRepo(db)
+	paymentSvc.SetBenefitRepo(benefitRepo)
+	paymentSvc.SetBenefitSync(infStore)
+	subSvc.SetBenefitSync(db, infStore)
+	quoteSvc.SetBenefitRepo(benefitRepo)
 	catalogCache := inferencecatalog.NewSnapshotCache(infStore, func(err error) {
 		log.Printf("WARN inference catalog snapshot refresh failed; continuing on last verified snapshot: %v", err)
 	})
@@ -316,8 +327,10 @@ func main() {
 		chatAccessLog = log.New(f, "", 0) // no prefix/ts — the JSON line carries its own ts
 	}
 
-	// Order expiry sweeper (in-process goroutine).
+	// Order expiry sweeper (in-process goroutine). Also marks naturally
+	// lapsed entitlements 'expired' on the same cadence (Task 10).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)
+	sweeper.SetEntitlementExpirer(infStore)
 
 	// One-shot secret backfill for rows created before migration 007_app_secret
 	// added the secret_hash column. Idempotent — once every row has a hash,
@@ -388,6 +401,17 @@ func main() {
 		ReconciliationDeadline: cfg.InferenceReconciliationDeadline,
 	}, nil)
 	go recoveryWorker.Start(rootCtx)
+
+	// Task 10: entitlement sync worker — consumes the inference_outbox
+	// messages the payment pipeline enqueues in the SAME transaction as the
+	// payment state flip, and converges entitlements to the state demanded
+	// by (subscription, paying order snapshot). Idempotent and order-safe
+	// by construction (access.DecideSync/Converge).
+	entitlementSyncWorker := inferenceworkers.NewEntitlementSync(infStore, nil, inferenceworkers.EntitlementSyncConfig{
+		Interval:   cfg.InferenceEntitlementSyncInterval,
+		BatchLimit: cfg.InferenceEntitlementSyncBatch,
+	})
+	go entitlementSyncWorker.Start(rootCtx)
 
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)

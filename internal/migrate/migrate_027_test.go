@@ -8,8 +8,10 @@ import (
 )
 
 // loadRealMigrations loads the repo's migrations/ directory, splitting the
-// result into "everything before 027" and the 027 file itself so the test
-// can stage pre-027 anomalous data before applying it.
+// result into "everything that orders BEFORE 027" and the 027 file itself so
+// the test can stage pre-027 anomalous data before applying it. Later
+// migrations (028/029/031…) depend on 027's columns and must NOT leak into
+// the pre set.
 func loadRealMigrations(t *testing.T) (pre []Migration, mig027 Migration) {
 	t.Helper()
 	migs, err := LoadFiles(filepath.Join("..", "..", "migrations"))
@@ -23,7 +25,9 @@ func loadRealMigrations(t *testing.T) (pre []Migration, mig027 Migration) {
 			found = true
 			continue
 		}
-		pre = append(pre, m)
+		if m.ID < "027_subscription_product_scope" {
+			pre = append(pre, m)
+		}
 	}
 	if !found {
 		t.Skip("027_subscription_product_scope.sql not present")

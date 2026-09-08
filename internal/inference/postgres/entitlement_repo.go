@@ -123,11 +123,11 @@ func (s *Store) ReviseEntitlementTx(ctx context.Context, w domain.UnitOfWork, id
 		 SET revision = revision + 1, updated_at = now(),
 		     policy_version_id = COALESCE($2, policy_version_id),
 		     model_ids = COALESCE($3::text[], model_ids),
-		     effective_to = COALESCE($4, effective_to)
+		     effective_to = CASE WHEN $6 THEN NULL ELSE COALESCE($4, effective_to) END
 		 WHERE id = $1 AND revision = $5 AND status = 'active'
 		 RETURNING *`,
 		id, patch.PolicyVersionID, patchStrArr(patch.ModelIDs), patch.EffectiveTo,
-		patch.ExpectedRevision)
+		patch.ExpectedRevision, patch.ClearEffectiveTo)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.NewError(domain.CodeConflict,
@@ -153,11 +153,11 @@ func (s *Store) ReviveEntitlementTx(ctx context.Context, w domain.UnitOfWork, id
 		 SET revision = revision + 1, updated_at = now(), status = 'active',
 		     policy_version_id = COALESCE($2, policy_version_id),
 		     model_ids = COALESCE($3::text[], model_ids),
-		     effective_to = COALESCE($4, effective_to)
+		     effective_to = CASE WHEN $6 THEN NULL ELSE COALESCE($4, effective_to) END
 		 WHERE id = $1 AND revision = $5 AND status IN ('revoked', 'expired')
 		 RETURNING *`,
 		id, patch.PolicyVersionID, patchStrArr(patch.ModelIDs), patch.EffectiveTo,
-		patch.ExpectedRevision)
+		patch.ExpectedRevision, patch.ClearEffectiveTo)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.NewError(domain.CodeConflict,
@@ -228,11 +228,11 @@ func (s *Store) ReviseEntitlement(ctx context.Context, id string, patch domain.E
 		 SET revision = revision + 1, updated_at = now(),
 		     policy_version_id = COALESCE($2, policy_version_id),
 		     model_ids = COALESCE($3::text[], model_ids),
-		     effective_to = COALESCE($4, effective_to)
+		     effective_to = CASE WHEN $6 THEN NULL ELSE COALESCE($4, effective_to) END
 		 WHERE id = $1 AND revision = $5 AND status = 'active'
 		 RETURNING *`,
 		id, patch.PolicyVersionID, patchStrArr(patch.ModelIDs), patch.EffectiveTo,
-		patch.ExpectedRevision)
+		patch.ExpectedRevision, patch.ClearEffectiveTo)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			var exists bool

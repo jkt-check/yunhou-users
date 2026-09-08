@@ -145,7 +145,19 @@ func (w *EntitlementSync) RunPass(ctx context.Context) (EntitlementSyncStats, er
 // processMessage applies one message: plan (pure reads + converge) → apply
 // (one tx with the delivery mark). Failures reschedule with bounded
 // exponential backoff; the message is never dropped.
+//
+// The recover is the crash-loop guard (审查修复): a panicking message must
+// never take the server process down — with it, the message goes back into
+// bounded backoff (observable via the pending index + ALARM log); without
+// it a single poisoned message would crash every worker restart forever.
 func (w *EntitlementSync) processMessage(ctx context.Context, msg postgres.OutboxMessage, stats *EntitlementSyncStats) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ALARM inference entitlement sync: outbox %d panicked: %v — rescheduled into backoff", msg.ID, r)
+			w.reschedule(ctx, msg)
+			stats.Failed++
+		}
+	}()
 	var syncMsg access.EntitlementSyncMessage
 	if err := json.Unmarshal(msg.Payload, &syncMsg); err != nil {
 		log.Printf("ERROR inference entitlement sync: outbox %d undecodable payload: %v", msg.ID, err)

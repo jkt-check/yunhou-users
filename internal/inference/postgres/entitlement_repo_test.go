@@ -189,3 +189,87 @@ func TestReviseEntitlement_ConflictAndNotFound(t *testing.T) {
 		t.Errorf("revoked revise: %v, want conflict", err)
 	}
 }
+
+// TestReviseEntitlement_ClearEffectiveTo pins the Task-10 review fix: the
+// finite → open-ended transition (effective_to → NULL) is expressible via
+// EntitlementPatch.ClearEffectiveTo on all three write variants, and a
+// patch that does not mention effective_to still keeps the current value
+// (COALESCE semantics preserved).
+func TestReviseEntitlement_ClearEffectiveTo(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	fin := time.Now().UTC().Add(30 * 24 * time.Hour).Truncate(time.Second)
+
+	// 1. 有限 → 开放：ClearEffectiveTo 写 NULL。
+	ent := seedEntitlement(t, s, f, domain.SourceSubscription, "sub-clear-"+uuid.NewString(), []string{f.modelID}, base, &fin)
+	got, err := s.ReviseEntitlement(ctx, ent.ID, domain.EntitlementPatch{
+		ExpectedRevision: ent.Revision, ClearEffectiveTo: true,
+	})
+	if err != nil {
+		t.Fatalf("revise clear: %v", err)
+	}
+	if got.EffectiveTo != nil {
+		t.Fatalf("effective_to = %v, want NULL after ClearEffectiveTo", *got.EffectiveTo)
+	}
+	if got.Revision != ent.Revision+1 {
+		t.Fatalf("revision = %d", got.Revision)
+	}
+
+	// 2. 未提有效的修订保持原值（COALESCE 语义不变）。
+	ent2 := seedEntitlement(t, s, f, domain.SourceSubscription, "sub-keep-"+uuid.NewString(), []string{f.modelID}, base, &fin)
+	newPol := f.policyID
+	got2, err := s.ReviseEntitlement(ctx, ent2.ID, domain.EntitlementPatch{
+		ExpectedRevision: ent2.Revision, PolicyVersionID: &newPol, // 同 policy 不同 patch 面
+	})
+	if err != nil {
+		t.Fatalf("revise keep: %v", err)
+	}
+	if got2.EffectiveTo == nil || !got2.EffectiveTo.Equal(fin) {
+		t.Fatalf("effective_to = %v, want unchanged %v", got2.EffectiveTo, fin)
+	}
+
+	// 3. tx 变体同样可表达置 NULL；复活路径同样支持。
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uow.Rollback(ctx) //nolint:errcheck
+	got3, err := s.ReviseEntitlementTx(ctx, uow, got2.ID, domain.EntitlementPatch{
+		ExpectedRevision: got2.Revision, ClearEffectiveTo: true,
+	})
+	if err != nil {
+		t.Fatalf("revise tx clear: %v", err)
+	}
+	if got3.EffectiveTo != nil {
+		t.Fatalf("tx: effective_to = %v, want NULL", *got3.EffectiveTo)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. revive（retired → active）+ ClearEffectiveTo 一步到位。
+	ent4 := seedEntitlement(t, s, f, domain.SourceSubscription, "sub-revive-"+uuid.NewString(), []string{f.modelID}, base, &fin)
+	uow2, _ := s.Begin(ctx)
+	if err := s.RetireEntitlementTx(ctx, uow2, ent4.ID, ent4.Revision, domain.EntitlementRevoked); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	uow3, _ := s.Begin(ctx)
+	got4, err := s.ReviveEntitlementTx(ctx, uow3, ent4.ID, domain.EntitlementPatch{
+		ExpectedRevision: ent4.Revision + 1, ClearEffectiveTo: true,
+	})
+	if err != nil {
+		t.Fatalf("revive clear: %v", err)
+	}
+	if err := uow3.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got4.Status != domain.EntitlementActive || got4.EffectiveTo != nil {
+		t.Fatalf("revived = status %s effective_to %v", got4.Status, got4.EffectiveTo)
+	}
+}

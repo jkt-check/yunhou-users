@@ -148,9 +148,16 @@ type EntitlementPatch struct {
 	// ModelIDs, when non-nil, replaces the explicit model set (an empty
 	// non-nil slice grants NO models — never NULL-means-all).
 	ModelIDs []string
-	// EffectiveTo, when non-nil, extends the effective range (续费延长
-	// 有效期，不提前重置窗口).
+	// EffectiveTo, when non-nil, extends/repoints the effective range
+	// (续费延长有效期，不提前重置窗口).
 	EffectiveTo *time.Time
+	// ClearEffectiveTo, when true, writes effective_to = NULL — the
+	// finite → open-ended transition (e.g. upgrade to a lifetime plan,
+	// 开放型订阅). COALESCE alone cannot express that write (审查修复:
+	// nil EffectiveTo previously meant only "keep the current value", so
+	// 有限→开放 在持久层不可表达). ClearEffectiveTo wins over
+	// EffectiveTo when both are set (caller error, fail deterministically).
+	ClearEffectiveTo bool
 }
 
 // UpstreamAccountStatus is the account state machine of 设计 §8.

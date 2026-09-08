@@ -254,24 +254,32 @@ func Converge(current *domain.Entitlement, decision *SyncDecision, now time.Time
 		patch.ModelIDs = dedupeModels(want.ModelIDs)
 	}
 	if !sameEffectiveTo(want.EffectiveTo, current.EffectiveTo) {
-		if want.EffectiveTo != nil && !want.EffectiveTo.After(current.EffectiveFrom) {
-			return ConvergeAction{}, domain.NewError(domain.CodeInvalidInput,
-				"benefit converge: effective_to must stay after effective_from")
+		if want.EffectiveTo == nil {
+			// 目标为开放型（订阅 expires_at 为 NULL）：显式置 NULL。
+			// 绝不对 nil *time.Time 调 .UTC()——那是空指针 panic
+			// （审查修复 Important：worker 无 recover 时单条消息即可
+			// 形成崩溃循环）。
+			patch.ClearEffectiveTo = true
+		} else {
+			if !want.EffectiveTo.After(current.EffectiveFrom) {
+				return ConvergeAction{}, domain.NewError(domain.CodeInvalidInput,
+					"benefit converge: effective_to must stay after effective_from")
+			}
+			to := want.EffectiveTo.UTC()
+			patch.EffectiveTo = &to
 		}
-		to := want.EffectiveTo.UTC()
-		patch.EffectiveTo = &to
 	}
 
 	if current.Status != domain.EntitlementActive {
 		// 退款/取消后重新购买（订阅行原地复活）：同一权益行复活并带上
 		// 新快照规格；锚点与消费主体保持不变（既有窗口不跨期重叠，
 		// EXCLUDE 约束保证，新周期自然开新窗口）。
-		if patch.PolicyVersionID == nil && patch.ModelIDs == nil && patch.EffectiveTo == nil {
+		if patch.PolicyVersionID == nil && patch.ModelIDs == nil && patch.EffectiveTo == nil && !patch.ClearEffectiveTo {
 			// 规格与有效期未变也仍须复活（状态翻转本身是一次修订）。
 		}
 		return ConvergeAction{Op: ConvergeRevive, Patch: patch}, nil
 	}
-	if patch.PolicyVersionID == nil && patch.ModelIDs == nil && patch.EffectiveTo == nil {
+	if patch.PolicyVersionID == nil && patch.ModelIDs == nil && patch.EffectiveTo == nil && !patch.ClearEffectiveTo {
 		return ConvergeAction{Op: ConvergeNoop}, nil
 	}
 	return ConvergeAction{Op: ConvergeRevise, Patch: patch}, nil

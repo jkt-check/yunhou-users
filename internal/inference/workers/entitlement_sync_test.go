@@ -744,3 +744,124 @@ func TestMarkExpiredEntitlements(t *testing.T) {
 		t.Fatalf("rerun marked = %d, err = %v", n, err)
 	}
 }
+
+// --- 审查修复：开放型订阅（expires_at NULL）的有限→开放转型 + panic 兜底 ---
+
+// TestEntitlementSync_OpenEndedTransition: 订阅从有限期改为开放型
+// （expires_at = NULL，如升级终身档）后，同步必须把现存有限权益的
+// effective_to 显式置 NULL —— 不 panic、不空转。
+func TestEntitlementSync_OpenEndedTransition(t *testing.T) {
+	f := newSyncFixture(t)
+	f.seedPlan(t, "cp_basic", model.ProductCodingPlan, 30, 29.9)
+	f.seedBenefitConfig(t, "cp_basic", f.policyID, []string{"glm-4.6"}, model.BenefitGrantModeSubscription)
+	f.seedPaidOrderFull(t, "cp_basic", &f.policyID, []string{"glm-4.6"}, model.BenefitGrantModeSubscription, model.OrderKindNew)
+	exp := futureExpiry(30)
+	subID := f.seedSubscription(t, "cp_basic", model.ProductCodingPlan, "active", exp)
+
+	if _, err := f.worker.SyncUserProduct(context.Background(), f.userID, model.ProductCodingPlan, ""); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	before := f.onlyEntitlement(t, domain.SourceSubscription, subID)
+	if before.EffectiveTo == nil {
+		t.Fatal("precondition: finite effective_to")
+	}
+
+	// 订阅转为开放型（expires_at := NULL）。
+	if _, err := f.db.ExecContext(context.Background(),
+		`UPDATE subscriptions SET expires_at = NULL WHERE id = $1`, subID); err != nil {
+		t.Fatal(err)
+	}
+	n, err := f.worker.SyncUserProduct(context.Background(), f.userID, model.ProductCodingPlan, "")
+	if err != nil {
+		t.Fatalf("open-ended sync must not fail/panic: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sync changed %d rows, want 1", n)
+	}
+	after := f.onlyEntitlement(t, domain.SourceSubscription, subID)
+	if after.EffectiveTo != nil {
+		t.Fatalf("effective_to = %v, want NULL (有限→开放)", *after.EffectiveTo)
+	}
+	if after.Status != domain.EntitlementActive || after.Revision != before.Revision+1 {
+		t.Fatalf("after = status %s revision %d", after.Status, after.Revision)
+	}
+	// 重复同步 → noop（置 NULL 后收敛稳定）。
+	n, err = f.worker.SyncUserProduct(context.Background(), f.userID, model.ProductCodingPlan, "")
+	if err != nil || n != 0 {
+		t.Fatalf("re-sync = %d, err %v, want noop", n, err)
+	}
+}
+
+// panicOnSubStore is a fake EntitlementSyncStore whose subscription read
+// panics — the poisoned-message fixture for the recover test. All other
+// methods are inert stubs.
+type panicOnSubStore struct {
+	msg        postgres.OutboxMessage
+	failMarks  int
+	failLastID int64
+}
+
+func (p *panicOnSubStore) Begin(context.Context) (domain.UnitOfWork, error) {
+	return nil, domain.NewError(domain.CodeInternal, "panic store: begin not used")
+}
+func (p *panicOnSubStore) EnsureBillingAccount(context.Context, string) (*domain.BillingAccount, error) {
+	return nil, domain.NewError(domain.CodeInternal, "panic store: not used")
+}
+func (p *panicOnSubStore) FetchPendingOutboxByTopic(context.Context, string, int) ([]postgres.OutboxMessage, error) {
+	return []postgres.OutboxMessage{p.msg}, nil
+}
+func (p *panicOnSubStore) MarkOutboxFailed(_ context.Context, id int64, _ time.Time) error {
+	p.failMarks++
+	p.failLastID = id
+	return nil
+}
+func (p *panicOnSubStore) MarkOutboxDeliveredTx(context.Context, domain.UnitOfWork, int64) error {
+	return nil
+}
+func (p *panicOnSubStore) GetSyncSubscription(context.Context, string, string) (*access.SubscriptionState, error) {
+	panic("poisoned store: subscription read panics")
+}
+func (p *panicOnSubStore) GetLatestPaidBenefitOrder(context.Context, string, string) (*access.OrderBenefitSnapshot, error) {
+	return nil, domain.NewError(domain.CodeNotFound, "panic store: not used")
+}
+func (p *panicOnSubStore) GetLatestEntitlementBySource(context.Context, domain.EntitlementSource, string) (*domain.Entitlement, error) {
+	return nil, domain.NewError(domain.CodeNotFound, "panic store: not used")
+}
+func (p *panicOnSubStore) InsertEntitlementTx(context.Context, domain.UnitOfWork, *domain.Entitlement) error {
+	return nil
+}
+func (p *panicOnSubStore) ReviseEntitlementTx(context.Context, domain.UnitOfWork, string, domain.EntitlementPatch) (*domain.Entitlement, error) {
+	return nil, nil
+}
+func (p *panicOnSubStore) ReviveEntitlementTx(context.Context, domain.UnitOfWork, string, domain.EntitlementPatch) (*domain.Entitlement, error) {
+	return nil, nil
+}
+func (p *panicOnSubStore) RetireEntitlementTx(context.Context, domain.UnitOfWork, string, int, domain.EntitlementStatus) error {
+	return nil
+}
+
+// TestEntitlementSync_PanicInMessageNeverCrashes pins the worker recover
+// 兜底: a message whose processing panics is rescheduled into bounded
+// backoff (MarkOutboxFailed), counted Failed, and the worker loop keeps
+// running — no process crash, no crash loop across passes.
+func TestEntitlementSync_PanicInMessageNeverCrashes(t *testing.T) {
+	payload, _ := json.Marshal(access.EntitlementSyncMessage{
+		UserID: "u-1", ProductCode: "coding-plan", Reason: access.SyncReasonPaymentPaid,
+	})
+	store := &panicOnSubStore{msg: postgres.OutboxMessage{ID: 42, Topic: access.TopicEntitlementSync, Payload: payload}}
+	w := NewEntitlementSync(store, nil, EntitlementSyncConfig{})
+
+	// 两个 pass 都不崩溃；消息每轮被标记重试（attempts 前进、进入退避）。
+	for pass := 0; pass < 2; pass++ {
+		stats, err := w.RunPass(context.Background())
+		if err != nil {
+			t.Fatalf("pass %d returned error: %v", pass, err)
+		}
+		if stats.Failed != 1 || stats.Delivered != 0 {
+			t.Fatalf("pass %d stats = %+v, want exactly 1 failed", pass, stats)
+		}
+	}
+	if store.failMarks != 2 || store.failLastID != 42 {
+		t.Fatalf("fail marks = %d (last id %d), want 2 reschedules of message 42", store.failMarks, store.failLastID)
+	}
+}

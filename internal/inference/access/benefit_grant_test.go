@@ -390,3 +390,67 @@ func TestMigrationGift(t *testing.T) {
 		t.Fatal("want error for empty policy")
 	}
 }
+
+// TestConverge_NilTargetEffectiveTo pins the审查修复: a nil target
+// EffectiveTo (open-ended subscription, expires_at NULL) against an
+// existing FINITE entitlement must not panic — it converges via an explicit
+// set-NULL patch (ClearEffectiveTo), on both the revise and revive paths.
+func TestConverge_NilTargetEffectiveTo(t *testing.T) {
+	fin := benefitNow.Add(30 * 24 * time.Hour)
+	mkCurrent := func(status domain.EntitlementStatus) *domain.Entitlement {
+		return &domain.Entitlement{
+			ID: "ent-1", BillingAccountID: "acct-1",
+			SourceType: domain.SourceSubscription, SourceID: "sub-1",
+			ModelIDs: []string{"glm-4.6"}, PolicyVersionID: "pol-1",
+			AnchorAt: benefitNow.Add(-24 * time.Hour), EffectiveFrom: benefitNow.Add(-24 * time.Hour),
+			EffectiveTo: &fin, Revision: 3, Status: status,
+		}
+	}
+	openTarget := &SyncDecision{Target: &BenefitTarget{
+		SourceType: domain.SourceSubscription, SourceID: "sub-1",
+		PolicyVersionID: "pol-1", ModelIDs: []string{"glm-4.6"},
+		EffectiveTo: nil, // 开放型目标
+	}}
+
+	t.Run("revise path: finite current + open target → ClearEffectiveTo, no panic", func(t *testing.T) {
+		var a ConvergeAction
+		var err error
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Converge panicked on nil target EffectiveTo: %v", r)
+			}
+		}()
+		a, err = Converge(mkCurrent(domain.EntitlementActive), openTarget, benefitNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.Op != ConvergeRevise {
+			t.Fatalf("op = %s, want revise", a.Op)
+		}
+		if !a.Patch.ClearEffectiveTo || a.Patch.EffectiveTo != nil {
+			t.Fatalf("patch = %+v, want ClearEffectiveTo=true and EffectiveTo=nil", a.Patch)
+		}
+	})
+
+	t.Run("revive path: retired current + open target → ClearEffectiveTo, no panic", func(t *testing.T) {
+		a, err := Converge(mkCurrent(domain.EntitlementRevoked), openTarget, benefitNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.Op != ConvergeRevive || !a.Patch.ClearEffectiveTo {
+			t.Fatalf("action = %+v, want revive with ClearEffectiveTo", a)
+		}
+	})
+
+	t.Run("both nil → noop", func(t *testing.T) {
+		cur := mkCurrent(domain.EntitlementActive)
+		cur.EffectiveTo = nil
+		a, err := Converge(cur, openTarget, benefitNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.Op != ConvergeNoop {
+			t.Fatalf("op = %s, want noop", a.Op)
+		}
+	})
+}

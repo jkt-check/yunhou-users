@@ -122,6 +122,21 @@ func windowOrderKey(k domain.ReservationTargetKind) int {
 	return 9
 }
 
+// windowKindOfTarget maps a window reservation target to its window kind,
+// so a hold failure can record a detail-less block even when the window row
+// is already gone (审查修复：fail-closed 不得静默丢弃).
+func windowKindOfTarget(t domain.ReservationTargetKind) domain.WindowKind {
+	switch t {
+	case domain.TargetWindowFiveHour:
+		return domain.WindowFiveHour
+	case domain.TargetWindowWeekly:
+		return domain.WindowWeekly
+	case domain.TargetWindowMonthly:
+		return domain.WindowMonthly
+	}
+	return ""
+}
+
 // lockAccountTx takes the billing-account anchor lock (fixed lock order
 // step 1) and verifies the account is active. Same-account admissions and
 // releases serialize on this row, which is what makes concurrent
@@ -314,25 +329,34 @@ func (s *Store) Reserve(ctx context.Context, w domain.UnitOfWork, cmd domain.Res
 				 RETURNING *`, *h.WindowID, int64(h.Amount)).StructScan(&wr)
 			if err != nil {
 				if domain.CodeOf(mapError("reserve: window", err)) == domain.CodeNotFound {
-					// Limit exceeded (or window gone): read the window for
-					// the block detail + deficit, then fail the whole reserve.
+					// Fail-closed（审查修复）：条件 UPDATE 未命中活跃行 =
+					// 超限或窗口已消失，无论哪种都必须阻断。先无条件记录
+					// blocked（与 Key 预算路径先置 keyBudgetBlocked 对称），
+					// 明细重读仅作补充：行已消失时 block 只带 kind、ResetsAt
+					// 为 nil（恢复时刻未知，API 层不得编造倒计时，设计 §9.1）；
+					// 重读出真实错误则整个 Reserve 中止。
+					block := domain.WindowBlock{Kind: windowKindOfTarget(h.TargetKind)}
 					var full windowRow
-					if qerr := tx.QueryRowxContext(ctx,
-						`SELECT * FROM inference_quota_windows WHERE id = $1`, *h.WindowID).StructScan(&full); qerr == nil {
+					qerr := tx.QueryRowxContext(ctx,
+						`SELECT * FROM inference_quota_windows WHERE id = $1`, *h.WindowID).StructScan(&full)
+					switch {
+					case qerr == nil:
 						end := full.End
-						blocked = append(blocked, domain.WindowBlock{
-							Kind:           domain.WindowKind(full.Kind),
-							LimitMicros:    domain.Microcredit(full.Limit),
-							UsedMicros:     domain.Microcredit(full.Used),
-							ReservedMicros: domain.Microcredit(full.Reserved),
-							ResetsAt:       &end,
-						})
+						block.LimitMicros = domain.Microcredit(full.Limit)
+						block.UsedMicros = domain.Microcredit(full.Used)
+						block.ReservedMicros = domain.Microcredit(full.Reserved)
+						block.ResetsAt = &end
 						if avail := domain.Microcredit(full.Limit - full.Used - full.Reserved); avail < h.Amount {
 							if d := h.Amount - avail; d > deficit {
 								deficit = d
 							}
 						}
+					case domain.CodeOf(mapError("reserve: window detail", qerr)) == domain.CodeNotFound:
+						// 窗口行在重读前消失：detail-less block 依然阻断。
+					default:
+						return nil, mapError("reserve: window detail", qerr)
 					}
+					blocked = append(blocked, block)
 					continue
 				}
 				return nil, mapError("reserve: window", err)

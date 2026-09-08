@@ -540,6 +540,56 @@ func TestReleaseRefusesFinalizedOrReconciled(t *testing.T) {
 	}
 }
 
+// TestReserveWindowHoldFailClosedOnVanishedRow: 窗口行在条件 UPDATE 未命
+// 中且明细重读前已消失（同事务内删除）时，Reserve 必须阻断（quota_exceeded
+// 带 detail-less block），绝不放行、不产生任何预占/请求行（审查修复：
+// 修复前此路径静默 continue，其他 hold 成功时请求会在缺少该窗口预占的情
+// 况下被放行 —— fail-open）。
+func TestReserveWindowHoldFailClosedOnVanishedRow(t *testing.T) {
+	db, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同事务内删除五小时窗口行：条件 UPDATE 与明细重读都查不到它。
+	if _, err := mustTx(t, uow).ExecContext(ctx,
+		`DELETE FROM inference_quota_windows WHERE id = $1`, w5); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	var qe *domain.QuotaExceededError
+	if !errors.As(err, &qe) {
+		t.Fatalf("err = %v, want QuotaExceededError (fail-closed)", err)
+	}
+	if len(qe.BlockedBy) != 1 || qe.BlockedBy[0].Kind != domain.WindowFiveHour {
+		t.Errorf("blocked by %+v, want one five_hour block", qe.BlockedBy)
+	}
+	if qe.BlockedBy[0].ResetsAt != nil {
+		t.Errorf("ResetsAt = %v, want nil（恢复时刻未知不得编造）", qe.BlockedBy[0].ResetsAt)
+	}
+	if err := uow.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 零预占、零请求行、Key 预算未动。
+	if n := countRequests(t, db, f.entID, ""); n != 0 {
+		t.Errorf("requests = %d, want 0", n)
+	}
+	var reservations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inference_reservations`).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if reservations != 0 {
+		t.Errorf("reservations = %d, want 0", reservations)
+	}
+	if got := keyBudgetUsed(t, s, f.keyID); got != 0 {
+		t.Errorf("key budget = %d, want 0", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 数据库租约：账户及上游并发协调（续租、所有权、fencing、超时回收）
 // ---------------------------------------------------------------------------

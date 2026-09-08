@@ -2,10 +2,14 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/url"
 	"os"
+	"strings"
 	"time"
+
+	"github.com/yunhou/users/internal/inference/credentials"
 )
 
 // Config holds all runtime configuration. Required fields are validated
@@ -158,6 +162,20 @@ type Config struct {
 	// startup loudly. The runtime catalog truth is the published DB
 	// revision, never this env.
 	LLMProvidersJSON string
+
+	// InferenceCredentialKeys is the deployment-secret key material for
+	// the upstream-credential vault (AEAD). Format:
+	//   1:64hexchars,2:64hexchars
+	// Highest version = current encryption key; earlier versions stay for
+	// decrypting old ciphertext. Injected from the deployment secret store
+	// only — never committed, never logged. Empty = credential management
+	// endpoints fail closed until key material is configured.
+	InferenceCredentialKeys string
+	// InferenceUpstreamAllowlist lists CIDRs (10.0.0.0/8, fd00::/8) and/or
+	// exact hostnames that may be used as upstream deployment targets even
+	// though they are not globally routable (self-hosted intranet
+	// deployments, 设计 §5). Empty = only globally routable targets.
+	InferenceUpstreamAllowlist []string
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -207,6 +225,9 @@ func Load() *Config {
 		ChatLogPath:     os.Getenv("CHAT_LOG_PATH"),
 
 		LLMProvidersJSON: os.Getenv("LLM_PROVIDERS_JSON"),
+
+		InferenceCredentialKeys:    os.Getenv("INFERENCE_CREDENTIAL_KEYS"),
+		InferenceUpstreamAllowlist: splitComma(os.Getenv("INFERENCE_UPSTREAM_ALLOWLIST")),
 	}
 }
 
@@ -329,6 +350,15 @@ func (c *Config) Validate() error {
 			return errors.New("DEEPSEEK_BASE_URL must be an absolute http(s) URL (e.g. https://api.deepseek.com)")
 		}
 	}
+	// Inference credential vault keys: when present they must parse (the
+	// vault itself fails closed at request time when unset). Rejecting bad
+	// material at startup beats discovering a hex typo the first time an
+	// operator tries to store a credential.
+	if c.InferenceCredentialKeys != "" {
+		if _, _, err := credentials.ParseKeysEnv(c.InferenceCredentialKeys); err != nil {
+			return fmt.Errorf("INFERENCE_CREDENTIAL_KEYS: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -337,6 +367,20 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func splitComma(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func parseDurationOr(s string, fallback time.Duration) time.Duration {

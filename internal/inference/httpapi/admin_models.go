@@ -279,16 +279,18 @@ func fail(c *gin.Context, err error) {
 	c.JSON(status, gin.H{"code": status, "data": nil, "message": err.Error()})
 }
 
-// actorOf extracts the operator attribution. Task 4 replaces this with the
-// verified operator subject from the authorization middleware; until then
-// it returns a placeholder that never grants anything by itself.
+// actorOf extracts the operator attribution set by the Task 4 authorization
+// middleware ("user:<uid>@app:<appid>"). A request can only reach a write
+// handler after the middleware verified the dual identity, so a missing
+// value means the route was mounted without authorization — fail loudly in
+// the audit trail rather than silently attributing to a placeholder.
 func actorOf(c *gin.Context) string {
-	if v, ok := c.Get("operator_subject"); ok {
-		if s, ok2 := v.(string); ok2 {
+	if v, ok := c.Get(OperatorSubjectKey); ok {
+		if s, ok2 := v.(string); ok2 && s != "" {
 			return s
 		}
 	}
-	return "task4-authz-pending"
+	return "user:unauthenticated@app:unknown"
 }
 
 func parseLimit(c *gin.Context, def int) int {

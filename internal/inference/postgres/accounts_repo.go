@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"time"
 
 	"github.com/lib/pq"
@@ -126,11 +127,11 @@ func (s *Store) InsertCredential(ctx context.Context, c *domain.Credential) erro
 	}
 	err := s.db.QueryRowxContext(ctx,
 		`INSERT INTO inference_credentials
-		 (provider_id, label, auth_type, ciphertext, key_version, generation, expires_at, status)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		 RETURNING id, created_at, updated_at`,
-		c.ProviderID, c.Label, c.AuthType, c.Ciphertext, c.KeyVersion, c.Generation, c.ExpiresAt, status).
-		Scan(&c.ID, &c.CreatedAt, &c.UpdatedAt)
+		 (id, provider_id, label, auth_type, ciphertext, key_version, generation, expires_at, status)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 RETURNING created_at, updated_at`,
+		c.ID, c.ProviderID, c.Label, c.AuthType, c.Ciphertext, c.KeyVersion, c.Generation, c.ExpiresAt, status).
+		Scan(&c.CreatedAt, &c.UpdatedAt)
 	return mapError("insert credential", err)
 }
 
@@ -138,17 +139,18 @@ func (s *Store) InsertCredential(ctx context.Context, c *domain.Credential) erro
 // credentials package's decrypt path; HTTP layers must never serialize it).
 func (s *Store) GetCredential(ctx context.Context, id string) (*domain.Credential, error) {
 	var row struct {
-		ID         string     `db:"id"`
-		ProviderID string     `db:"provider_id"`
-		Label      string     `db:"label"`
-		AuthType   string     `db:"auth_type"`
-		Ciphertext []byte     `db:"ciphertext"`
-		KeyVersion int        `db:"key_version"`
-		Generation int64      `db:"generation"`
-		ExpiresAt  *time.Time `db:"expires_at"`
-		Status     string     `db:"status"`
-		CreatedAt  time.Time  `db:"created_at"`
-		UpdatedAt  time.Time  `db:"updated_at"`
+		ID            string     `db:"id"`
+		ProviderID    string     `db:"provider_id"`
+		Label         string     `db:"label"`
+		AuthType      string     `db:"auth_type"`
+		Ciphertext    []byte     `db:"ciphertext"`
+		KeyVersion    int        `db:"key_version"`
+		Generation    int64      `db:"generation"`
+		ExpiresAt     *time.Time `db:"expires_at"`
+		LastRotatedAt *time.Time `db:"last_rotated_at"`
+		Status        string     `db:"status"`
+		CreatedAt     time.Time  `db:"created_at"`
+		UpdatedAt     time.Time  `db:"updated_at"`
 	}
 	err := s.db.GetContext(ctx, &row,
 		`SELECT * FROM inference_credentials WHERE id = $1`, id)
@@ -158,9 +160,103 @@ func (s *Store) GetCredential(ctx context.Context, id string) (*domain.Credentia
 	return &domain.Credential{
 		ID: row.ID, ProviderID: row.ProviderID, Label: row.Label, AuthType: row.AuthType,
 		Ciphertext: row.Ciphertext, KeyVersion: row.KeyVersion, Generation: row.Generation,
-		ExpiresAt: row.ExpiresAt, Status: row.Status,
+		ExpiresAt: row.ExpiresAt, LastRotatedAt: row.LastRotatedAt, Status: row.Status,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}, nil
+}
+
+// ListCredentials returns masked-eligible rows (ciphertext included — the
+// credentials package is the only consumer and treats it as opaque).
+func (s *Store) ListCredentials(ctx context.Context, providerID string, limit int) ([]domain.Credential, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := `SELECT id, provider_id, label, auth_type, ciphertext, key_version, generation,
+		expires_at, last_rotated_at, status, created_at, updated_at
+	  FROM inference_credentials`
+	var args []interface{}
+	if providerID != "" {
+		query += ` WHERE provider_id = $1`
+		args = append(args, providerID)
+	}
+	query += ` ORDER BY created_at, id LIMIT ` + strconv.Itoa(limit)
+	var rows []struct {
+		ID            string     `db:"id"`
+		ProviderID    string     `db:"provider_id"`
+		Label         string     `db:"label"`
+		AuthType      string     `db:"auth_type"`
+		Ciphertext    []byte     `db:"ciphertext"`
+		KeyVersion    int        `db:"key_version"`
+		Generation    int64      `db:"generation"`
+		ExpiresAt     *time.Time `db:"expires_at"`
+		LastRotatedAt *time.Time `db:"last_rotated_at"`
+		Status        string     `db:"status"`
+		CreatedAt     time.Time  `db:"created_at"`
+		UpdatedAt     time.Time  `db:"updated_at"`
+	}
+	if err := s.db.SelectContext(ctx, &rows, query, args...); err != nil {
+		return nil, mapError("list credentials", err)
+	}
+	out := make([]domain.Credential, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, domain.Credential{
+			ID: r.ID, ProviderID: r.ProviderID, Label: r.Label, AuthType: r.AuthType,
+			Ciphertext: r.Ciphertext, KeyVersion: r.KeyVersion, Generation: r.Generation,
+			ExpiresAt: r.ExpiresAt, LastRotatedAt: r.LastRotatedAt, Status: r.Status,
+			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		})
+	}
+	return out, nil
+}
+
+// RotateCredentialSecret stores the new ciphertext under keyVersion and
+// bumps the generation CAS counter atomically. A zero RowsAffected means the
+// credential vanished between read and write.
+func (s *Store) RotateCredentialSecret(ctx context.Context, id string, ciphertext []byte, keyVersion int) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inference_credentials
+		    SET ciphertext = $2, key_version = $3, generation = generation + 1,
+		        last_rotated_at = now(), updated_at = now()
+		  WHERE id = $1`,
+		id, ciphertext, keyVersion)
+	if err != nil {
+		return mapError("rotate credential", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return mapError("rotate credential", sql.ErrNoRows)
+	}
+	return nil
+}
+
+// SetCredentialStatus flips a credential's status.
+func (s *Store) SetCredentialStatus(ctx context.Context, id, status string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inference_credentials SET status = $2, updated_at = now() WHERE id = $1`,
+		id, status)
+	if err != nil {
+		return mapError("set credential status", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return mapError("set credential status", sql.ErrNoRows)
+	}
+	return nil
+}
+
+// DisableUpstreamAccountsByCredential is the emergency-disable propagation:
+// every account bound to the credential stops scheduling new attempts in the
+// same statement the credential flips. (设计 §5：禁用后账号池在配置刷新周期
+// 内的传播有界 — 账号状态随凭据同刻翻转；已发布的目录快照最多延迟一个
+// 快照刷新周期不再引用新调度。)
+func (s *Store) DisableUpstreamAccountsByCredential(ctx context.Context, credentialID string) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inference_upstream_accounts
+		    SET status = 'disabled', updated_at = now()
+		  WHERE credential_id = $1 AND status <> 'disabled'`,
+		credentialID)
+	if err != nil {
+		return 0, mapError("disable upstream accounts", err)
+	}
+	return res.RowsAffected()
 }
 
 // InsertUpstreamAccount registers one schedulable upstream account.

@@ -185,9 +185,11 @@ type Credential struct {
 	KeyVersion int
 	Generation int64
 	ExpiresAt  *time.Time
-	Status     string // "active" | "rotating" | "revoked"
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// LastRotatedAt is set by the rotate path (migration 025).
+	LastRotatedAt *time.Time
+	Status        string // "active" | "rotating" | "revoked"
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // CredentialResolver resolves caller/upstream credentials into principals

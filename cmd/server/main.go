@@ -20,6 +20,7 @@ import (
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	inferencecatalog "github.com/yunhou/users/internal/inference/catalog"
+	inferencecredentials "github.com/yunhou/users/internal/inference/credentials"
 	inferencehttpapi "github.com/yunhou/users/internal/inference/httpapi"
 	inferencemanagement "github.com/yunhou/users/internal/inference/management"
 	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
@@ -194,8 +195,42 @@ func main() {
 	catalogCache := inferencecatalog.NewSnapshotCache(infStore, func(err error) {
 		log.Printf("WARN inference catalog snapshot refresh failed; continuing on last verified snapshot: %v", err)
 	})
-	catalogMgr := inferencemanagement.NewCatalogManager(catalogSvc)
+
+	// Task 4: upstream credential vault + egress guard + operator authz.
+	// Key material comes from the deployment secret (INFERENCE_CREDENTIAL_KEYS);
+	// an empty value leaves the vault nil and every credential operation
+	// fails closed. The egress validator enforces the SSRF policy on
+	// deployment base URLs at write time.
+	var credVault *inferencecredentials.Vault
+	if cfg.InferenceCredentialKeys != "" {
+		keys, current, err := inferencecredentials.ParseKeysEnv(cfg.InferenceCredentialKeys)
+		if err != nil {
+			log.Fatalf("INFERENCE_CREDENTIAL_KEYS: %v", err)
+		}
+		credVault, err = inferencecredentials.NewVault(keys, current)
+		if err != nil {
+			log.Fatalf("credential vault: %v", err)
+		}
+		log.Printf("credential vault: %d key version(s) loaded, current=v%d", len(keys), current)
+	}
+	egressValidator, err := inferencecredentials.NewEgressValidator(cfg.InferenceUpstreamAllowlist)
+	if err != nil {
+		log.Fatalf("INFERENCE_UPSTREAM_ALLOWLIST: %v", err)
+	}
+	if len(cfg.InferenceUpstreamAllowlist) > 0 {
+		log.Printf("egress policy: %d internal target(s) allowlisted", len(cfg.InferenceUpstreamAllowlist))
+	}
+	credSvc := inferencecredentials.NewService(credVault, infStore, infStore)
+	catalogMgr := inferencemanagement.NewCatalogManager(catalogSvc, infStore, egressValidator.ValidateURL)
 	adminModelsHandler := inferencehttpapi.NewAdminModelsHandler(catalogMgr)
+	adminOps := &inferencehttpapi.AdminOps{
+		RequireModels:      inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermModelsManage),
+		RequireCredentials: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermCredentialsManage),
+		RequireAdmin:       inferencehttpapi.OperatorRequireRole(infStore, inferencemanagement.RoleAdmin),
+		Models:             adminModelsHandler,
+		Credentials:        inferencehttpapi.NewAdminCredentialsHandler(credSvc),
+		Auth:               inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
+	}
 	if cfg.LLMProvidersJSON != "" {
 		res, err := catalogSvc.ImportEnvCatalog(context.Background(), cfg.LLMProvidersJSON)
 		if err != nil {
@@ -288,7 +323,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler)
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

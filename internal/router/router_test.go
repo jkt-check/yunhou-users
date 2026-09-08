@@ -232,6 +232,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		false, // wechatPayMock
 		nil,   // usageSvc
 		nil,   // adminModelsHandler
+		nil,   // adminOps
 	)
 
 	routes := engine.Routes()
@@ -289,9 +290,10 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 			t.Errorf("Setup did not register route %s", w)
 		}
 	}
-	// Task 3 mounts only the read-only catalog queries. Write endpoints are
-	// implemented but MUST NOT be reachable until Task 4 wires operator
-	// authorization — their absence is the security property under test.
+	// The Task 4 operator write surface is mounted only when adminOps is
+	// provided; this Setup call passed nil, so catalog writes, credentials
+	// and operator administration must all stay unmounted (fail closed for
+	// tests/misconfigured builds).
 	for _, w := range []string{
 		"POST:/admin/models",
 		"PATCH:/admin/models/:id",
@@ -301,9 +303,12 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"DELETE:/admin/deployments/:id",
 		"POST:/admin/catalog/publish",
 		"POST:/admin/catalog/rollback",
+		"POST:/admin/credentials",
+		"POST:/admin/credentials/:id/rotate",
+		"POST:/admin/operators",
 	} {
 		if have[w] {
-			t.Errorf("Setup registered catalog write route %s before Task 4 authorization", w)
+			t.Errorf("Setup registered operator write route %s with nil adminOps", w)
 		}
 	}
 	// /test/login must NOT be registered without PAYPAL_L3_E2E_MODE=1 —
@@ -339,6 +344,7 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		false, // wechatPayMock
 		nil,   // usageSvc
 		nil,   // adminModelsHandler
+		nil,   // adminOps
 	)
 
 	for _, r := range engine.Routes() {

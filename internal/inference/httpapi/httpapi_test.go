@@ -61,6 +61,8 @@ func newTestServer(t *testing.T) *gin.Engine {
 	}
 	t.Cleanup(func() { db.Close() })
 	_, err = db.Exec(`TRUNCATE
+		inference_audit_log,
+		operator_roles,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,
@@ -79,7 +81,8 @@ func newTestServer(t *testing.T) *gin.Engine {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	h := httpapi.NewAdminModelsHandler(management.NewCatalogManager(catalog.NewService(postgres.NewStore(db))))
+	h := httpapi.NewAdminModelsHandler(management.NewCatalogManager(catalog.NewService(postgres.NewStore(db)), nil,
+		func(context.Context, string) error { return nil })) // permissive egress stub
 	group := engine.Group("/admin")
 	h.RegisterReadOnly(group)
 	h.RegisterWrite(group)

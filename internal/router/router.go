@@ -40,6 +40,7 @@ func Setup(
 	wechatPayMock bool,
 	usageSvc *service.UsageService,
 	adminModelsHandler *httpapi.AdminModelsHandler,
+	adminOps *httpapi.AdminOps,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -164,17 +165,23 @@ func Setup(
 
 		// Inference model catalog (Kaya Coding Plan Task 3): read-only
 		// model/deployment/revision queries. Write endpoints (create/edit/
-		// publish/rollback) are implemented and tested in
-		// internal/inference/httpapi but intentionally NOT mounted here —
-		// Task 4 lands operator authorization first, then mounts them via
-		// adminModelsHandler.RegisterWrite(catalogGroup):
-		//
-		//   // Task 4 (after operator authz middleware):
-		//   // catalogGroup := adminGroup.Group("/catalog-ops") 或复用本组
-		//   // adminModelsHandler.RegisterWrite(adminGroup)
-		//
-		// Until then POST/PATCH/DELETE on these paths return 404.
+		// publish/rollback) are mounted below under the Task 4 operator
+		// authorization chain — the read-only surface stays available to
+		// verified internal apps, writes require the verified user JWT +
+		// service identity combo AND the models:manage permission.
 		adminModelsHandler.RegisterReadOnly(adminGroup)
+
+		// Task 4: operator write surface — catalog writes (models:manage),
+		// credential lifecycle (credentials:manage), operator administration
+		// (admin role). The chain is InternalAppAuth (ancestor group) +
+		// JWTAuth + per-permission authorization middleware; a nil adminOps
+		// leaves the entire write surface unmounted (defence in depth for
+		// tests and misconfigured builds).
+		if adminOps != nil {
+			opsGroup := adminGroup.Group("")
+			opsGroup.Use(middleware.JWTAuth(tokenSvc))
+			adminOps.Mount(opsGroup)
+		}
 	}
 
 	// Payment routes (JWT auth, user-scoped).

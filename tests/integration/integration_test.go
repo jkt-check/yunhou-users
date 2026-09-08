@@ -179,7 +179,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
-		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil)
+		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil)
 
 	return httptest.NewServer(engine)
 }
@@ -754,7 +754,7 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, service.NewUsageService(repo.NewUsageRepo(db)), nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil)
 
 	return httptest.NewServer(engine)
 }

@@ -93,14 +93,16 @@ func (s *Store) EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfW
 	}
 	// Window-level: the partial unique index dedups open jobs; a resolved/
 	// escalated predecessor must NOT block a fresh finding, so update first.
+	// Refresh merges detail ONLY and keeps the ORIGINAL deadline (审查修复
+	// Important 2): pushing the deadline forward on every pass would make a
+	// persistent drift unescalatable — 期限告警语义必须在漂移持续期间成立.
 	windowed := mergeWindowDetail(detail, cmd.WindowID)
 	res, err := tx.ExecContext(ctx,
 		`UPDATE inference_reconciliation_jobs
-		 SET detail = inference_reconciliation_jobs.detail || $1,
-		     deadline_at = GREATEST(deadline_at, $2), updated_at = now()
-		 WHERE request_id IS NULL AND reason = $3
-		   AND detail->>'window_id' = $4 AND status IN ('pending','running')`,
-		windowed, cmd.Deadline, cmd.Reason, cmd.WindowID)
+		 SET detail = inference_reconciliation_jobs.detail || $1, updated_at = now()
+		 WHERE request_id IS NULL AND reason = $2
+		   AND detail->>'window_id' = $3 AND status IN ('pending','running')`,
+		windowed, cmd.Reason, cmd.WindowID)
 	if err != nil {
 		return mapError("reconciliation: refresh window job", err)
 	}
@@ -146,18 +148,34 @@ var openRequestStatuses = []string{
 }
 
 // ListStaleOpenRequests returns in-flight requests whose last state change
-// is older than the cutoff — crash candidates. The grace cutoff keeps the
-// sweep off live requests (a live settlement holds the request row lock for
-// milliseconds; grace >> settleTimeout).
+// is older than the cutoff — crash candidates. Two guards keep the sweep off
+// LIVE requests (审查修复 Critical 1):
+//
+//  1. updated_at < cutoff — state-transition recency. NOT sufficient alone:
+//     a live request can sit in ONE state far longer than any naive grace
+//     (attempt dispatch runs up to the deployment RequestTimeout, default
+//     10min; nginx lets /v1/chat/completions SSE run 700s), so
+//  2. NOT EXISTS an attempt started within the grace window — attempt intent
+//     persists BEFORE dispatch, so a recent started_at means the request may
+//     legitimately still be mid-flight. Grace (> worst live phase) then
+//     guarantees any attempt older than grace has exceeded its timeout.
+//
+// Sweeping a live request would settle it at the FULL hold while its stream
+// is still producing — the real usage arriving later would hit the settled
+// guard and be swallowed as a "duplicate" (多扣). These guards make that
+// structurally impossible; the grace floor is enforced in config.Validate.
 func (s *Store) ListStaleOpenRequests(ctx context.Context, cutoff time.Time, limit int) ([]domain.Request, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	var ids []string
 	if err := s.db.SelectContext(ctx, &ids,
-		`SELECT id FROM inference_requests
-		 WHERE status = ANY($1) AND updated_at < $2
-		 ORDER BY updated_at LIMIT $3`,
+		`SELECT id FROM inference_requests r
+		 WHERE r.status = ANY($1) AND r.updated_at < $2
+		   AND NOT EXISTS (
+		       SELECT 1 FROM inference_attempts a
+		       WHERE a.request_id = r.id AND a.started_at IS NOT NULL AND a.started_at >= $2)
+		 ORDER BY r.updated_at LIMIT $3`,
 		openRequestStatuses, cutoff.UTC(), limit); err != nil {
 		return nil, mapError("recovery: scan stale open", err)
 	}
@@ -462,19 +480,27 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return mapError("correction: request", err)
 	}
 
-	// 8. Evidence landed: the request's open verification job resolves.
+	// 8. Evidence landed: the request's open EVIDENCE jobs resolve — only
+	// crash_recovery/unknown_usage (审查修复 Important 1): an open
+	// settlement_overage anomaly is NOT evidence-resolved; blindly resolving
+	// it here and re-enqueueing it in step 9 would leave a same-reason job
+	// resolved and invisible while the request is still over its hold.
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE inference_reconciliation_jobs
 		 SET status = 'resolved', resolved_at = now(), updated_at = now(),
 		     detail = detail || $2
-		 WHERE request_id = $1 AND status IN ('pending','running')`,
+		 WHERE request_id = $1 AND status IN ('pending','running')
+		   AND reason IN ('crash_recovery','unknown_usage')`,
 		cmd.RequestID, mustJSON(map[string]string{
 			"resolution": "corrected by real evidence: " + cmd.Reason,
 		})); err != nil {
 		return mapError("correction: resolve job", err)
 	}
 
-	// 9. Overage re-check against the hold (不隐藏负差额).
+	// 9. Overage re-check against the hold (不隐藏负差额). Still over →
+	// enqueue/refresh the anomaly (the open job merges detail and STAYS
+	// pending); back within the hold → the anomaly is addressed by this
+	// correction, so an open overage job resolves with the note.
 	if reserved.Valid && cmd.CorrectedMicros > domain.Microcredit(reserved.Int64) {
 		detail := mustJSON(map[string]interface{}{
 			"schema_version":  1,
@@ -492,6 +518,18 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 			Detail: detail, Deadline: deadline,
 		}); err != nil {
 			return err
+		}
+	} else if reserved.Valid {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE inference_reconciliation_jobs
+			 SET status = 'resolved', resolved_at = now(), updated_at = now(),
+			     detail = detail || $2
+			 WHERE request_id = $1 AND status IN ('pending','running')
+			   AND reason = 'settlement_overage'`,
+			cmd.RequestID, mustJSON(map[string]string{
+				"resolution": "correction brought the charge within the hold: " + cmd.Reason,
+			})); err != nil {
+			return mapError("correction: resolve overage job", err)
 		}
 	}
 	return nil

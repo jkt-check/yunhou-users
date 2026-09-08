@@ -167,6 +167,7 @@ func TestValidate_HappyPath(t *testing.T) {
 		WeChatPayMchPrivateKeyPath: "/etc/wechat/apiclient_key.pem",
 		WeChatPayMchCertPath:       "/etc/wechat/apiclient_cert.pem",
 		WeChatPayNotifyURL:         "https://example.com/webhooks/payment/wechat_pay",
+		InferenceRecoveryGrace:     15 * time.Minute,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("want nil, got %v", err)
@@ -240,16 +241,17 @@ func TestValidate_ErrorPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			cfg := &Config{
-				DatabaseURL:         "postgres://x",
-				RSAPrivate:          "priv",
-				RSAPublic:           "pub",
-				JWTAccessTTL:        15 * time.Minute,
-				JWTRefreshTTL:       168 * time.Hour,
-				OrderExpiryDuration: 30 * time.Minute,
-				SweeperInterval:     1 * time.Minute,
-				OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
-				WeChatAPIv3Key:      "0123456789abcdef0123456789abcdef",
-				WeChatPayMchID:      "1900000001",
+				DatabaseURL:            "postgres://x",
+				RSAPrivate:             "priv",
+				RSAPublic:              "pub",
+				JWTAccessTTL:           15 * time.Minute,
+				JWTRefreshTTL:          168 * time.Hour,
+				OrderExpiryDuration:    30 * time.Minute,
+				SweeperInterval:        1 * time.Minute,
+				OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
+				InferenceRecoveryGrace: 15 * time.Minute,
+				WeChatAPIv3Key:         "0123456789abcdef0123456789abcdef",
+				WeChatPayMchID:         "1900000001",
 			}
 			tc.mutate(cfg)
 			err := cfg.Validate()
@@ -260,6 +262,36 @@ func TestValidate_ErrorPaths(t *testing.T) {
 				t.Errorf("error message missing %q: %v", tc.needleSub, err)
 			}
 		})
+	}
+}
+
+// TestValidate_RecoveryGraceFloor pins the Task 9 grace floor: the recovery
+// sweep grace must exceed the worst live request phase (deployment
+// RequestTimeout default 10m, nginx SSE relay 700s, settlement 15s) — a
+// shorter grace settles LIVE long requests at their full hold.
+func TestValidate_RecoveryGraceFloor(t *testing.T) {
+	t.Parallel()
+	base := func() *Config {
+		return &Config{
+			DatabaseURL:         "postgres://x",
+			RSAPrivate:          "priv",
+			RSAPublic:           "pub",
+			JWTAccessTTL:        15 * time.Minute,
+			JWTRefreshTTL:       168 * time.Hour,
+			OrderExpiryDuration: 30 * time.Minute,
+			SweeperInterval:     1 * time.Minute,
+			OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+		}
+	}
+	cfg := base()
+	cfg.InferenceRecoveryGrace = 5 * time.Minute
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "INFERENCE_RECOVERY_GRACE") {
+		t.Errorf("grace below floor must fail, got %v", err)
+	}
+	cfg = base()
+	cfg.InferenceRecoveryGrace = 15 * time.Minute
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("grace at default must pass, got %v", err)
 	}
 }
 
@@ -288,6 +320,7 @@ func TestValidate_DeepSeek(t *testing.T) {
 			DeepSeekAPIKey:             "sk-test",
 			DeepSeekBaseURL:            "https://api.deepseek.com",
 			DeepSeekModel:              "deepseek-v4-flash",
+			InferenceRecoveryGrace:     15 * time.Minute,
 		}
 	}
 
@@ -726,6 +759,7 @@ func validRealWeChatConfig() *Config {
 		WeChatPayMchPrivateKeyPath: "/k",
 		WeChatPayMchCertPath:       "/c",
 		WeChatPayNotifyURL:         "https://x/cb",
+		InferenceRecoveryGrace:     15 * time.Minute,
 	}
 }
 
@@ -736,14 +770,15 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
 		return &Config{
-			DatabaseURL:         "postgres://x",
-			RSAPrivate:          "priv",
-			RSAPublic:           "pub",
-			JWTAccessTTL:        15 * time.Minute,
-			JWTRefreshTTL:       168 * time.Hour,
-			OrderExpiryDuration: 30 * time.Minute,
-			SweeperInterval:     1 * time.Minute,
-			OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+			DatabaseURL:            "postgres://x",
+			RSAPrivate:             "priv",
+			RSAPublic:              "pub",
+			JWTAccessTTL:           15 * time.Minute,
+			JWTRefreshTTL:          168 * time.Hour,
+			OrderExpiryDuration:    30 * time.Minute,
+			SweeperInterval:        1 * time.Minute,
+			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace: 15 * time.Minute,
 		}
 	}
 
@@ -842,14 +877,15 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
 		return &Config{
-			DatabaseURL:         "postgres://x",
-			RSAPrivate:          "priv",
-			RSAPublic:           "pub",
-			JWTAccessTTL:        15 * time.Minute,
-			JWTRefreshTTL:       168 * time.Hour,
-			OrderExpiryDuration: 30 * time.Minute,
-			SweeperInterval:     1 * time.Minute,
-			OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+			DatabaseURL:            "postgres://x",
+			RSAPrivate:             "priv",
+			RSAPublic:              "pub",
+			JWTAccessTTL:           15 * time.Minute,
+			JWTRefreshTTL:          168 * time.Hour,
+			OrderExpiryDuration:    30 * time.Minute,
+			SweeperInterval:        1 * time.Minute,
+			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace: 15 * time.Minute,
 			// WeChat Pay disabled (all six fields empty) — valid real mode.
 		}
 	}

@@ -197,7 +197,10 @@ type Config struct {
 	// Settlement recovery worker (Task 9): pass interval, per-pass batch
 	// cap, staleness grace (must exceed the 15s settlement deadline so live
 	// requests are never swept), and the reconciliation evidence window.
-	// Defaults: 30s / 100 / 60s / 24h.
+	// Defaults: 30s / 100 / 15m / 24h. Grace floor (12m) enforced by
+	// Validate: it must exceed the worst LIVE request phase (deployment
+	// RequestTimeout default 10min; nginx SSE relay 700s; settlement 15s),
+	// otherwise the sweep settles live long requests at their full hold.
 	InferenceRecoveryInterval       time.Duration
 	InferenceRecoveryBatch          int
 	InferenceRecoveryGrace          time.Duration
@@ -260,7 +263,7 @@ func Load() *Config {
 
 		InferenceRecoveryInterval:       parseDurationOr(envOr("INFERENCE_RECOVERY_INTERVAL", "30s"), 30*time.Second),
 		InferenceRecoveryBatch:          parseIntOr(envOr("INFERENCE_RECOVERY_BATCH", "100"), 100),
-		InferenceRecoveryGrace:          parseDurationOr(envOr("INFERENCE_RECOVERY_GRACE", "60s"), 60*time.Second),
+		InferenceRecoveryGrace:          parseDurationOr(envOr("INFERENCE_RECOVERY_GRACE", "15m"), 15*time.Minute),
 		InferenceReconciliationDeadline: parseDurationOr(envOr("INFERENCE_RECONCILIATION_DEADLINE", "24h"), 24*time.Hour),
 	}
 }
@@ -397,6 +400,16 @@ func (c *Config) Validate() error {
 	// 者），否则 facade 无模型可路由。
 	if c.InferenceKayaChatGateway && c.KayaChatModel == "" {
 		return errors.New("KAYA_CHAT_MODEL is required when INFERENCE_KAYA_CHAT_GATEWAY=1")
+	}
+	// Recovery grace floor (Task 9 审查修复): the sweep grace must exceed
+	// the worst LIVE phase of one request — deployment RequestTimeout
+	// (default 10min) covers dispatch, nginx lets /v1/chat/completions SSE
+	// run 700s, settlement adds 15s. A shorter grace sweeps live long
+	// requests and settles them at the full hold while still streaming.
+	// 联动校验：raising a deployment's RequestTimeout above this floor
+	// requires raising INFERENCE_RECOVERY_GRACE accordingly.
+	if c.InferenceRecoveryGrace < 12*time.Minute {
+		return fmt.Errorf("INFERENCE_RECOVERY_GRACE=%s is below the 12m floor (must exceed worst live request phase: 700s SSE relay + 15s settlement)", c.InferenceRecoveryGrace)
 	}
 	return nil
 }

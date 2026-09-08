@@ -73,8 +73,14 @@ type RecoveryConfig struct {
 	// BatchLimit caps each scan per pass (default 100).
 	BatchLimit int
 	// Grace is how long a request must be untouched before the sweep treats
-	// it as a crash candidate (default 60s — comfortably above the 15s
-	// settlement deadline so live requests are never swept).
+	// it as a crash candidate (default 15min). It MUST exceed the worst live
+	// phase of one request — attempt dispatch can run up to the deployment
+	// RequestTimeout (default 10min), nginx lets the SSE relay run 700s, and
+	// settlement adds up to 15s — otherwise the sweep would settle a LIVE
+	// long request at its full hold and swallow the real usage arriving
+	// later (审查修复 Critical 1). The floor is enforced by config.Validate;
+	// the scan additionally skips any request with an attempt started inside
+	// the grace window.
 	Grace time.Duration
 	// ReconciliationDeadline is the evidence window for jobs the worker
 	// itself creates (default 24h, 设计 §7.2 恢复时限).
@@ -90,7 +96,7 @@ func (c *RecoveryConfig) withDefaults() RecoveryConfig {
 		out.BatchLimit = 100
 	}
 	if out.Grace <= 0 {
-		out.Grace = 60 * time.Second
+		out.Grace = 15 * time.Minute
 	}
 	if out.ReconciliationDeadline <= 0 {
 		out.ReconciliationDeadline = 24 * time.Hour

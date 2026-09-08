@@ -919,3 +919,159 @@ func TestWindowMismatchEnqueuesJob(t *testing.T) {
 		t.Errorf("second pass mismatches = %d, want still detected (1)", stats.WindowMismatches)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 审查修复 Critical 1：活的长请求绝不被扫描误结算
+// ---------------------------------------------------------------------------
+
+// 一次活请求可在单一状态停留远超朴素 grace（部署 RequestTimeout 默认 10 分
+// 钟、nginx SSE 700s）：status=streaming + updated_at 新鲜 + 在途 attempt。
+// 多个 pass 后：不结算、不入账、预占原样 —— 流尾活路径的真实用量结算不会
+// 被"撞 CodeConflict 吞掉"（多扣）。
+func TestRecovery_LiveStreamingRequestNeverSwept(t *testing.T) {
+	f := newWorkerFixture(t)
+	ctx := context.Background()
+	reqID := f.fabricateReserved(t)
+	f.fabricateAttempt(t, reqID, "dispatching", "", false) // started_at = 近期
+	if err := f.store.UpdateRequestStatus(ctx, reqID, domain.ReqStreaming, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// 真实时钟 + 默认级 grace（15min 地板语义；测试用 15min 表达生产口径）。
+	live := NewSettlementRecovery(f.store, nil, RecoveryConfig{
+		BatchLimit: 50, Grace: 15 * time.Minute, ReconciliationDeadline: 24 * time.Hour,
+	}, nil)
+	for pass := 0; pass < 3; pass++ {
+		stats, err := live.RunPass(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.SettledConservative != 0 || stats.ReleasedNotSent != 0 || stats.Scanned != 0 {
+			t.Fatalf("pass %d swept a live request: %+v", pass, stats)
+		}
+	}
+	status, usage, reserved, settled := f.requestState(t, reqID)
+	if status != "streaming" || usage != "pending" || settled != 0 {
+		t.Errorf("live request = %s/%s/%d, want streaming/pending/unsettled", status, usage, settled)
+	}
+	if reserved != 50_000 {
+		t.Errorf("reserved = %d, want 50000 (预占原样保留)", reserved)
+	}
+	charges, _ := f.ledgerEntries(t, reqID)
+	if charges != 0 {
+		t.Errorf("charges = %d, want 0 (活请求绝不被保守结算)", charges)
+	}
+
+	// 即使 updated_at 被人为老化（例如某路径少了一次状态跃迁），只要存在
+	// grace 窗口内启动的在途 attempt，扫描守卫依然跳过它。
+	if _, err := f.db.Exec(
+		`UPDATE inference_requests SET updated_at = now() - interval '30 minutes' WHERE id = $1`, reqID); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := live.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Scanned != 0 || stats.SettledConservative != 0 {
+		t.Errorf("aged-updated_at live request swept: %+v (attempt 存活守卫失效)", stats)
+	}
+	// 全部 attempt 也超过 grace（真正卡死）后才允许恢复介入。
+	if _, err := f.db.Exec(
+		`UPDATE inference_attempts SET started_at = now() - interval '30 minutes' WHERE request_id = $1`, reqID); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = live.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SettledConservative != 1 {
+		t.Errorf("stats = %+v, want recovery once the request is provably stuck", stats)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 审查修复 Important 2：窗口漂移持续期间，任务按原 deadline 升级
+// ---------------------------------------------------------------------------
+
+func TestWindowMismatchEscalatesAtOriginalDeadline(t *testing.T) {
+	f := newWorkerFixture(t)
+	ctx := context.Background()
+	reqID := f.fabricateReserved(t)
+	attID := f.fabricateAttempt(t, reqID, "completed", "", true)
+	uow, err := f.store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, out := int64(800), int64(200)
+	if err := f.store.Settle(ctx, uow, domain.SettleCommand{
+		RequestID: reqID,
+		Usage: domain.UsageRecord{
+			RequestID: reqID, AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: 30_000, SettledAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`UPDATE inference_quota_windows SET used_micros = used_micros + 7 WHERE id = $1`, f.w5); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass 1 @ T：入队，deadline = T+24h。
+	t0 := time.Now().UTC()
+	w1 := NewSettlementRecovery(f.store, domain.FixedClock{T: t0}, RecoveryConfig{
+		BatchLimit: 50, Grace: 15 * time.Minute, ReconciliationDeadline: 24 * time.Hour,
+	}, nil)
+	stats, err := w1.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.WindowMismatches != 1 || stats.Escalated != 0 {
+		t.Fatalf("pass1 = %+v, want 1 mismatch, 0 escalations", stats)
+	}
+	var deadline time.Time
+	if err := f.db.Get(&deadline,
+		`SELECT deadline_at FROM inference_reconciliation_jobs WHERE request_id IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if deadline.Before(t0.Add(23*time.Hour)) || deadline.After(t0.Add(25*time.Hour)) {
+		t.Fatalf("deadline = %s, want ≈ T+24h", deadline)
+	}
+
+	// Pass 2..4 @ T+1h…T+23h：漂移持续存在，每轮 refresh —— 期限不得被推后。
+	for _, offset := range []time.Duration{time.Hour, 12 * time.Hour, 23 * time.Hour} {
+		w := NewSettlementRecovery(f.store, domain.FixedClock{T: t0.Add(offset)}, RecoveryConfig{
+			BatchLimit: 50, Grace: 15 * time.Minute, ReconciliationDeadline: 24 * time.Hour,
+		}, nil)
+		stats, err := w.RunPass(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Escalated != 0 {
+			t.Fatalf("pass @+%v escalated early: %+v", offset, stats)
+		}
+		var d2 time.Time
+		if err := f.db.Get(&d2,
+			`SELECT deadline_at FROM inference_reconciliation_jobs WHERE request_id IS NULL`); err != nil {
+			t.Fatal(err)
+		}
+		if !d2.Equal(deadline) {
+			t.Fatalf("pass @+%v moved deadline %s → %s (期限告警失效)", offset, deadline, d2)
+		}
+	}
+
+	// Pass @ T+25h（超过原 deadline）：升级命中。
+	wLate := NewSettlementRecovery(f.store, domain.FixedClock{T: t0.Add(25 * time.Hour)}, RecoveryConfig{
+		BatchLimit: 50, Grace: 15 * time.Minute, ReconciliationDeadline: 24 * time.Hour,
+	}, nil)
+	stats, err = wLate.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Escalated != 1 {
+		t.Errorf("pass @+25h escalated = %d, want 1 (漂移持续 24h 后必须升级告警)", stats.Escalated)
+	}
+}

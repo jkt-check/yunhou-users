@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -176,6 +177,11 @@ type Config struct {
 	// though they are not globally routable (self-hosted intranet
 	// deployments, 设计 §5). Empty = only globally routable targets.
 	InferenceUpstreamAllowlist []string
+	// InferenceAccountRPM is the default per-billing-account requests-per-
+	// minute bucket on /v1/* (Task 5; per-Key rpm_limit applies on top when
+	// set). Process-local sliding window; cross-instance coordination is
+	// Task 7's database leases. 0 disables the account-level bucket.
+	InferenceAccountRPM int
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -228,6 +234,7 @@ func Load() *Config {
 
 		InferenceCredentialKeys:    os.Getenv("INFERENCE_CREDENTIAL_KEYS"),
 		InferenceUpstreamAllowlist: splitComma(os.Getenv("INFERENCE_UPSTREAM_ALLOWLIST")),
+		InferenceAccountRPM:        parseIntOr(envOr("INFERENCE_ACCOUNT_RPM", "120"), 120),
 	}
 }
 
@@ -393,4 +400,13 @@ func parseDurationOr(s string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func parseIntOr(s string, fallback int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		log.Printf("config: parse int %q failed; using fallback %d", s, fallback)
+		return fallback
+	}
+	return n
 }

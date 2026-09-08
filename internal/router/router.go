@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
@@ -41,6 +42,7 @@ func Setup(
 	usageSvc *service.UsageService,
 	adminModelsHandler *httpapi.AdminModelsHandler,
 	adminOps *httpapi.AdminOps,
+	accessOps *httpapi.AccessOps,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -110,6 +112,30 @@ func Setup(
 			return c.GetString(middleware.ContextUserID)
 		})
 		userGroup.POST("/usage/heartbeat", usageLimiter, usageHandler.PostHeartbeat)
+
+		// Kaya Coding Plan Task 5: customer API-key self-management
+		// (/user/api-keys). Ownership derives from ContextUserID set by
+		// JWTAuth above — never from request-body fields. A nil
+		// accessOps.UserAPIKeys leaves the surface unmounted (fail closed,
+		// mirroring the Task 4 operator write surface).
+		if accessOps != nil && accessOps.UserAPIKeys != nil {
+			accessOps.UserAPIKeys.Register(userGroup)
+		}
+	}
+
+	// Kaya Coding Plan Task 5: the standard-protocol /v1 surface. The
+	// group fixes the auth chain — per-IP limiter as the outer perimeter
+	// guard, then customer API-key authentication with per-Key/account RPM
+	// buckets — so no /v1 route can ever be registered unauthenticated.
+	// Task 8 mounts the protocol routes (/v1/models, /v1/chat/completions)
+	// into this group; until then every /v1 path is 404 by gin's NoRoute.
+	// This chain is independent of the operator surface: X-App-Secret is
+	// not a customer credential (设计 §9.2).
+	if accessOps != nil && accessOps.V1Auth != nil {
+		if accessOps.RPMCounter != nil {
+			go accessOps.RPMCounter.RunJanitor(ctx, time.Minute, 2*time.Minute)
+		}
+		engine.Group("/v1", middleware.RateLimit(ctx, 60, 120), accessOps.V1Auth)
 	}
 
 	// App routes (internal service auth)

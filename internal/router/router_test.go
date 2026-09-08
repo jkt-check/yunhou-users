@@ -233,6 +233,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		nil,   // usageSvc
 		nil,   // adminModelsHandler
 		nil,   // adminOps
+		nil,   // accessOps
 	)
 
 	routes := engine.Routes()
@@ -311,6 +312,19 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 			t.Errorf("Setup registered operator write route %s with nil adminOps", w)
 		}
 	}
+	// The Task 5 customer key-management surface is mounted only when
+	// accessOps carries a UserAPIKeys handler; nil must leave it unmounted.
+	for _, w := range []string{
+		"POST:/user/api-keys",
+		"GET:/user/api-keys",
+		"GET:/user/api-keys/:id",
+		"PATCH:/user/api-keys/:id",
+		"DELETE:/user/api-keys/:id",
+	} {
+		if have[w] {
+			t.Errorf("Setup registered customer key route %s with nil accessOps", w)
+		}
+	}
 	// /test/login must NOT be registered without PAYPAL_L3_E2E_MODE=1 —
 	// the route existing at all is the dev-only escape hatch.
 	if have["POST:/test/login"] {
@@ -345,6 +359,7 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		nil,   // usageSvc
 		nil,   // adminModelsHandler
 		nil,   // adminOps
+		nil,   // accessOps
 	)
 
 	for _, r := range engine.Routes() {

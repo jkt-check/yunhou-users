@@ -271,10 +271,16 @@ func fail(c *gin.Context, err error) {
 	switch domain.CodeOf(err) {
 	case domain.CodeInvalidInput:
 		status = http.StatusBadRequest
+	case domain.CodeInvalidKey:
+		status = http.StatusUnauthorized
+	case domain.CodeModelNotAllowed:
+		status = http.StatusForbidden
 	case domain.CodeNotFound:
 		status = http.StatusNotFound
 	case domain.CodeConflict:
 		status = http.StatusConflict
+	case domain.CodeRateLimited:
+		status = http.StatusTooManyRequests
 	}
 	c.JSON(status, gin.H{"code": status, "data": nil, "message": err.Error()})
 }

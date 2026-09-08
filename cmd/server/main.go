@@ -19,6 +19,7 @@ import (
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	inferenceaccess "github.com/yunhou/users/internal/inference/access"
 	inferencecatalog "github.com/yunhou/users/internal/inference/catalog"
 	inferencecredentials "github.com/yunhou/users/internal/inference/credentials"
 	inferencehttpapi "github.com/yunhou/users/internal/inference/httpapi"
@@ -231,6 +232,19 @@ func main() {
 		Credentials:        inferencehttpapi.NewAdminCredentialsHandler(credSvc),
 		Auth:               inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
 	}
+
+	// Task 5: customer API keys + caller principal resolution. The
+	// resolver authenticates /v1/* keys straight from the store on every
+	// call (revocation/expiry take effect immediately); the key service
+	// backs /user/api-keys with ownership bound to the JWT identity.
+	accessResolver := inferenceaccess.NewResolver(infStore, nil)
+	keySvc := inferenceaccess.NewKeyService(infStore, nil)
+	rpmCounter := inferenceaccess.NewRPMCounter(nil)
+	accessOps := &inferencehttpapi.AccessOps{
+		UserAPIKeys: inferencehttpapi.NewUserAPIKeysHandler(keySvc),
+		V1Auth:      inferencehttpapi.APIKeyAuth(accessResolver, rpmCounter, cfg.InferenceAccountRPM),
+		RPMCounter:  rpmCounter,
+	}
 	if cfg.LLMProvidersJSON != "" {
 		res, err := catalogSvc.ImportEnvCatalog(context.Background(), cfg.LLMProvidersJSON)
 		if err != nil {
@@ -323,7 +337,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps)
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps, accessOps)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

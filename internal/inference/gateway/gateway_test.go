@@ -1120,6 +1120,126 @@ func TestStreamWithoutUsageChunk_EstimatedNotZero(t *testing.T) {
 	}
 }
 
+// 非流式响应省略 usage:估算必须按实际送达的可见内容计费,输出 token
+// 不得按字面 0 入账(审查修复:estimateUsage 用 payload 内容字节)。
+func TestNonStreamNoUsage_EstimatesFromContent(t *testing.T) {
+	const answer = "Hello, estimated world!" // 23 bytes → 输出估算 23/2=11
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-no-usage","object":"chat.completion","created":1,
+			"choices":[{"index":0,"message":{"role":"assistant","content":"`+answer+`"},"finish_reason":"stop"}]}`)
+	})
+	f := newFixture(t, up)
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	status, usageStatus, _, settled := f.requestRow(t, out.RequestID)
+	if status != "settled" || usageStatus != "estimated" {
+		t.Errorf("request = %s/%s, want settled/estimated", status, usageStatus)
+	}
+	var src string
+	var inTok, outTok *int64
+	if err := f.db.QueryRow(`SELECT source, input_tokens, output_tokens FROM inference_usage_records
+		WHERE request_id = $1`, out.RequestID).Scan(&src, &inTok, &outTok); err != nil {
+		t.Fatal(err)
+	}
+	if src != "estimated" {
+		t.Errorf("usage source = %s, want estimated", src)
+	}
+	wantOut := int64(len(answer) / 2)
+	if outTok == nil || *outTok != wantOut {
+		t.Errorf("output_tokens = %v, want %d (可见内容估算,不是 0)", outTok, wantOut)
+	}
+	if inTok == nil || *inTok <= 0 {
+		t.Errorf("input_tokens = %v, want the admission estimate", inTok)
+	}
+	// charge = 输入估算×1 + 输出估算×2;关键是输出项非零。
+	wantCharge := *inTok*1 + wantOut*2
+	if settled != wantCharge || settled <= *inTok {
+		t.Errorf("settled = %d, want %d (输出费用按可见内容计入)", settled, wantCharge)
+	}
+}
+
+// 流式途中租约被超时回收(fencing):续租冲突必须中止流,请求不得在无授
+// 权状态下继续跑(审查修复:guard 盯 streamKeeper,finalize 归类中断)。
+func TestStreamFencedMidStream_AbortsAndSettlesInterrupted(t *testing.T) {
+	// 上游:先发 usage chunk,然后慢慢滴 content([DONE] 永远到不了)。
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		for i := 0; i < 50; i++ {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(30 * time.Millisecond):
+			}
+			_, _ = io.WriteString(w, chunkB)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	})
+	f := newFixture(t, up)
+	// 缩短租约 TTL:续租间隔 = TTL/3 = 20ms,回收后下一次续租即冲突。
+	f.routing.LeaseTTL = 60 * time.Millisecond
+
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(true, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	buf := make([]byte, 4096)
+	if _, err := out.Stream.Read(buf); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	// 强制回收该请求的上游租约(模拟 Task 7 超时回收)。
+	res, err := f.db.Exec(`UPDATE inference_concurrency_leases SET state = 'expired'
+		WHERE request_id = $1 AND scope = 'upstream_account' AND state = 'held'`, out.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("expired %d leases, want 1", n)
+	}
+	// 继续读:续租冲突后 guard 必须中止流(fencing),不得继续转发。
+	var readErr error
+	for i := 0; i < 100; i++ {
+		if _, readErr = out.Stream.Read(buf); readErr != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if readErr == nil {
+		t.Fatal("stream must abort after the lease was reclaimed (fencing)")
+	}
+	if !strings.Contains(readErr.Error(), "lease") {
+		t.Errorf("read error = %v, want the fencing cause", readErr)
+	}
+	// 即使调用方误报 EndCompleted,finalize 也必须按中断归类(keeper 有冲突)。
+	if err := out.Stream.Finish(EndCompleted); err != nil {
+		t.Fatal(err)
+	}
+	out.Stream.Close()
+	status, usageStatus, _, settled := f.requestRow(t, out.RequestID)
+	if status != "settled" || usageStatus != "estimated" {
+		t.Errorf("request = %s/%s, want settled/estimated (中断语义:已读用量保留)", status, usageStatus)
+	}
+	if settled != 9 { // 已读 usage 5×1 + 2×2
+		t.Errorf("settled = %d, want 9", settled)
+	}
+	attempts := f.attemptRows(t, out.RequestID)
+	if len(attempts) != 1 || attempts[0].Status != "failed" || attempts[0].Kind != "stream_interrupted" {
+		t.Errorf("attempts = %+v, want failed/stream_interrupted (fenced, not completed)", attempts)
+	}
+}
+
 // errorsAsQuota 提取 QuotaExceededError(避免在测试里引入 errors 的噪音)。
 func errorsAsQuota(err error, target **domain.QuotaExceededError) bool {
 	for err != nil {

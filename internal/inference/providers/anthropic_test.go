@@ -292,6 +292,10 @@ func TestAnthropicDecodeNonStream_TextAndTools(t *testing.T) {
 	if usage["prompt_tokens"] != float64(25) || usage["completion_tokens"] != float64(17) {
 		t.Errorf("client usage = %v", usage)
 	}
+	// "answer"(6) + "hmm"(3) — 非流式估算的输出侧依据。
+	if res.ContentBytes != 9 {
+		t.Errorf("ContentBytes = %d, want 9", res.ContentBytes)
+	}
 }
 
 func TestAnthropicDecodeNonStream_NoUsageIsNotZero(t *testing.T) {

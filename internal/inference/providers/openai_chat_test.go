@@ -117,6 +117,9 @@ func TestOpenAIDecodeNonStream_FullUsage(t *testing.T) {
 	if u.InputTokens == nil || *u.InputTokens != 12 || u.OutputTokens == nil || *u.OutputTokens != 34 {
 		t.Errorf("usage = %+v, want 12/34", u)
 	}
+	if res.ContentBytes != 2 { // "ok"
+		t.Errorf("ContentBytes = %d, want 2 (visible content feeds the estimate path)", res.ContentBytes)
+	}
 	if u.CacheReadTokens == nil || *u.CacheReadTokens != 4 {
 		t.Errorf("cache read = %v, want 4", u.CacheReadTokens)
 	}
@@ -133,7 +136,8 @@ func TestOpenAIDecodeNonStream_FullUsage(t *testing.T) {
 }
 
 func TestOpenAIDecodeNonStream_NoUsageIsNotZero(t *testing.T) {
-	res, err := NewOpenAIChat().DecodeNonStream([]byte(`{"id":"x","choices":[]}`))
+	res, err := NewOpenAIChat().DecodeNonStream([]byte(
+		`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"visible answer"},"finish_reason":"stop"}]}`))
 	if err != nil {
 		t.Fatalf("DecodeNonStream: %v", err)
 	}
@@ -142,5 +146,9 @@ func TestOpenAIDecodeNonStream_NoUsageIsNotZero(t *testing.T) {
 	}
 	if res.Usage.InputTokens != nil || res.Usage.OutputTokens != nil {
 		t.Errorf("usage = %+v, want all-nil buckets", res.Usage)
+	}
+	// 可见内容字节必须在场:非流式估算的输出侧依据(不为 0)。
+	if res.ContentBytes != int64(len("visible answer")) {
+		t.Errorf("ContentBytes = %d, want %d", res.ContentBytes, len("visible answer"))
 	}
 }

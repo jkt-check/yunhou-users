@@ -98,10 +98,17 @@ func (a *OpenAIChat) WrapStream(body io.ReadCloser) *Stream {
 
 // openAINonStream is the non-streaming chat.completion shape we read usage
 // from. The payload is relayed to the client untouched — this struct is a
-// metering view only.
+// metering view only. Choices carry the visible content so a missing usage
+// object can still be ESTIMATED from what was actually served (never 0).
 type openAINonStream struct {
-	ID    string       `json:"id"`
-	Usage *openAIUsage `json:"usage"`
+	ID      string       `json:"id"`
+	Usage   *openAIUsage `json:"usage"`
+	Choices []struct {
+		Message struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"message"`
+	} `json:"choices"`
 }
 
 // DecodeNonStream implements Adapter.
@@ -111,6 +118,9 @@ func (a *OpenAIChat) DecodeNonStream(body []byte) (*NonStreamResult, error) {
 		return nil, fmt.Errorf("providers: decode openai chat.completion: %w", err)
 	}
 	out := &NonStreamResult{Payload: body, UpstreamRequestID: resp.ID}
+	for _, ch := range resp.Choices {
+		out.ContentBytes += int64(len(ch.Message.Content) + len(ch.Message.ReasoningContent))
+	}
 	if resp.Usage == nil {
 		// The upstream genuinely did not report usage on a non-streaming
 		// call — the estimated path handles it (设计 §7.1).

@@ -361,6 +361,9 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 		}},
 	}
 	result := &NonStreamResult{UpstreamRequestID: resp.ID}
+	// Visible answer size feeds the estimate path when usage is absent —
+	// same 口径 as the streaming tap (content + reasoning bytes).
+	result.ContentBytes = int64(text.Len() + reasoning.Len())
 	if resp.Usage != nil {
 		u := resp.Usage
 		out["usage"] = map[string]any{

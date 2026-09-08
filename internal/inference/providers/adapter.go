@@ -286,6 +286,7 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	d.Usage = ns.Usage
 	d.UsageRaw = ns.UsageRaw
 	d.UsageReported = ns.UsageReported
+	d.ContentBytes = ns.ContentBytes
 	if d.UpstreamRequestID == "" {
 		d.UpstreamRequestID = ns.UpstreamRequestID
 	}
@@ -302,6 +303,8 @@ type DispatchResult struct {
 	Usage         domain.UsageBuckets
 	UsageRaw      json.RawMessage
 	UsageReported bool
+	// ContentBytes is the visible answer size for the estimate path.
+	ContentBytes int64
 }
 
 // NonStreamResult is the adapter's decode of a non-streaming response.
@@ -311,6 +314,10 @@ type NonStreamResult struct {
 	UsageRaw          json.RawMessage
 	UsageReported     bool
 	UpstreamRequestID string
+	// ContentBytes is the visible answer size (content + reasoning across
+	// choices) — the output side of the estimate when the upstream omits
+	// usage (与流式 tap 的 ContentBytes 同口径).
+	ContentBytes int64
 }
 
 // upstreamRequestID prefers the conventional response headers; adapters

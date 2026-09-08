@@ -569,13 +569,15 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 
 	// Usage: reported when the upstream provided it; when the upstream
 	// genuinely has no usage on this path, the estimated path applies
-	// (设计 §7.1 — never zero).
+	// (设计 §7.1 — never zero). The estimate uses the VISIBLE content of
+	// the payload we hold (same 口径 as the streaming tap), so an upstream
+	// that omits usage on a 200 cannot deterministically under-charge output.
 	usage := disp.Usage
 	source := domain.UsageReported
 	raw := disp.UsageRaw
 	if !disp.UsageReported || emptyBuckets(usage) {
 		source = domain.UsageEstimated
-		usage = s.estimateUsage(adm, 0)
+		usage = s.estimateUsage(adm, disp.ContentBytes)
 		raw = nil
 	}
 	sctx, scancel := detached(settleTimeout)
@@ -611,11 +613,21 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 		cancel: cancel,
 		keeper: streamKeeper,
 	}
+	// The fencing guard watches the STREAM keeper — the one actually
+	// renewing for the stream's whole lifetime and therefore the only one
+	// that can observe a renewal conflict (a reclaimed slot aborts the
+	// stream instead of running ungated, Task 7).
 	body.reader = &guardedTeeReader{
 		body:   disp.Stream.TeeBody(),
-		keeper: keeper,
+		keeper: streamKeeper,
 	}
 	body.finalize = func(end StreamEnd) error {
+		// A keeper conflict mid-stream means the lease was reclaimed and the
+		// guard cut the stream: classify as upstream-broken, never completed
+		// (无论 tap 是否恰好看到终止标记 — 授权已失,按中断语义结算).
+		if streamKeeper.Err() != nil && end == EndCompleted {
+			end = EndUpstreamBroke
+		}
 		attemptStatus, kind := "completed", ""
 		switch end {
 		case EndUpstreamBroke:

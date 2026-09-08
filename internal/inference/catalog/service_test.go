@@ -492,3 +492,69 @@ func TestLifecycleStateMachine(t *testing.T) {
 		t.Error("retired→active must be refused (retired is terminal)")
 	}
 }
+
+// 审查修复 Important #1: publish must drain the whole catalog with keyset
+// pagination — the old hardcoded Limit: 500 silently dropped entities 501+
+// from the published snapshot.
+func TestPublishDrainsMoreThanOnePage(t *testing.T) {
+	_, store, svc := testDB(t)
+	ctx := context.Background()
+
+	const totalModels = 600 // > publishPageSize (500) forces at least two pages
+	store.InsertProvider(ctx, &domain.Provider{Code: "bulk", DisplayName: "Bulk", AccessType: domain.AccessOfficialAPI})
+	for i := 0; i < totalModels; i++ {
+		m := sampleModel(fmt.Sprintf("bulk-%04d", i))
+		if err := store.InsertModel(ctx, &m); err != nil {
+			t.Fatalf("seed model %d: %v", i, err)
+		}
+	}
+
+	rev, err := svc.Publish(ctx, "op-bulk")
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if rev != 1 {
+		t.Errorf("revision = %d, want 1", rev)
+	}
+	snap, err := svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Models) != totalModels {
+		t.Errorf("snapshot has %d models, want %d (entities beyond page 1 must not be silently dropped)",
+			len(snap.Models), totalModels)
+	}
+	for _, id := range []string{"bulk-0000", "bulk-0499", "bulk-0500", "bulk-0599"} {
+		if _, ok := snap.Models[id]; !ok {
+			t.Errorf("model %s missing from published snapshot", id)
+		}
+	}
+}
+
+// 审查修复 Important #2: a nil AccessCheck must fail closed with an
+// explicit error — never a panic, never an implicit allow.
+func TestListPublishedModelsNilAccessCheckFailsClosed(t *testing.T) {
+	_, _, svc := testDB(t)
+	ctx := context.Background()
+	seedProviderModelDeployment(t, svc, "glm-4.6")
+	if _, err := svc.Publish(ctx, "op"); err != nil {
+		t.Fatal(err)
+	}
+	svc.SetPriceCheck(func(context.Context, string) (bool, error) { return true, nil })
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("nil AccessCheck panicked: %v", r)
+		}
+	}()
+	models, err := svc.ListPublishedModels(ctx, nil)
+	if err == nil {
+		t.Error("nil AccessCheck: want explicit error, got nil")
+	}
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("nil AccessCheck: code = %s, want invalid_input", domain.CodeOf(err))
+	}
+	if len(models) != 0 {
+		t.Errorf("nil AccessCheck returned %d models, want none (fail-closed)", len(models))
+	}
+}

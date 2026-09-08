@@ -444,22 +444,82 @@ func (s *Service) DeleteRoute(ctx context.Context, id string) error {
 
 // --- publish / rollback (设计 §5: 草稿 → 校验 → 原子发布; 回滚不改历史) ---
 
+// publishPageSize is the keyset page size used when draining the catalog
+// for a publish. The old hardcoded single-page Limit: 500 silently
+// truncated catalogs with more than 500 entities (审查修复 Important #1:
+// 发布出不完整快照且不报错，违反"不得加载半个版本") — Publish now pages
+// through the ENTIRE catalog.
+const publishPageSize = 500
+
+// publishMaxEntities is the defensive upper bound of the paged drain: past
+// this many entities of one kind the publish fails loudly with a clear
+// error instead of publishing a snapshot nobody can reason about.
+const publishMaxEntities = 20000
+
+// drainPages walks a keyset-paginated listing until the store returns a
+// short page, collecting every entity. page must return the next page for
+// the given cursor and report each entity's cursor key.
+func drainPages[T any](ctx context.Context, page func(after string, limit int) ([]T, error), key func(T) string) ([]T, error) {
+	out := make([]T, 0, publishPageSize)
+	after := ""
+	for {
+		items, err := page(after, publishPageSize)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
+		if len(items) < publishPageSize {
+			return out, nil
+		}
+		if len(out) >= publishMaxEntities {
+			return nil, domain.NewError(domain.CodeInvalidInput,
+				fmt.Sprintf("catalog too large to publish: more than %d entities", publishMaxEntities))
+		}
+		after = key(items[len(items)-1])
+	}
+}
+
+func (s *Service) allModels(ctx context.Context) ([]domain.Model, error) {
+	return drainPages(ctx,
+		func(after string, limit int) ([]domain.Model, error) {
+			return s.store.ListModels(ctx, domain.ModelFilter{AfterID: after, Limit: limit})
+		},
+		func(m domain.Model) string { return m.ID })
+}
+
+func (s *Service) allProviders(ctx context.Context) ([]domain.Provider, error) {
+	return drainPages(ctx,
+		func(after string, limit int) ([]domain.Provider, error) {
+			return s.store.ListProviders(ctx, after, limit)
+		},
+		func(p domain.Provider) string { return p.ID })
+}
+
+func (s *Service) allDeployments(ctx context.Context) ([]domain.Deployment, error) {
+	return drainPages(ctx,
+		func(after string, limit int) ([]domain.Deployment, error) {
+			return s.store.ListDeployments(ctx, domain.DeploymentFilter{AfterID: after, Limit: limit})
+		},
+		func(d domain.Deployment) string { return d.ID })
+}
+
 // Publish validates the current draft catalog, appends an immutable
 // revision and atomically switches the active pointer to it. The returned
 // number is the new revision. Validation happens BEFORE anything is
 // written; the revision insert + activation is the atomic switch
 // (ActivateRevision runs in a single DB transaction with the partial
-// unique index as the safety net).
+// unique index as the safety net). The catalog is drained with keyset
+// pagination so no entity is ever silently dropped from the snapshot.
 func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
-	models, err := s.store.ListModels(ctx, domain.ModelFilter{Limit: 500})
+	models, err := s.allModels(ctx)
 	if err != nil {
 		return 0, err
 	}
-	providers, err := s.store.ListProviders(ctx, "", 500)
+	providers, err := s.allProviders(ctx)
 	if err != nil {
 		return 0, err
 	}
-	deployments, err := s.store.ListDeployments(ctx, domain.DeploymentFilter{Limit: 500})
+	deployments, err := s.allDeployments(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -585,7 +645,13 @@ func (s *Service) LoadSnapshot(ctx context.Context) (*Snapshot, error) {
 // least one enabled route to an active deployment, a bound sellable price,
 // and the caller's access check. Price and access are fail-closed hooks —
 // until Task 5/6 wire the real resolvers, the defaults deny everything.
+// A nil access check is an explicit error, never a panic and never an
+// implicit allow (审查修复 Important #2).
 func (s *Service) ListPublishedModels(ctx context.Context, access AccessCheck) ([]domain.Model, error) {
+	if access == nil {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"access check is required to list published models (refusing to answer without an authorization hook)")
+	}
 	snap, err := s.LoadSnapshot(ctx)
 	if err != nil {
 		return nil, err

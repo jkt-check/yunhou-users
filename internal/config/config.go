@@ -182,6 +182,17 @@ type Config struct {
 	// set). Process-local sliding window; cross-instance coordination is
 	// Task 7's database leases. 0 disables the account-level bucket.
 	InferenceAccountRPM int
+
+	// InferenceKayaChatGateway is the /chat 迁移开关 (Task 8): when true,
+	// POST /chat and GET /chat/models are served by the inference gateway
+	// facade (JWT → principal → entitlement → quota → routing) instead of
+	// the legacy DeepSeek passthrough. Default false = 旧行为直通 (legacy
+	// passthrough, no entitlement gate).
+	InferenceKayaChatGateway bool
+	// KayaChatModel is the public inference model id the /chat facade
+	// applies when the client sends no model (旧无 model 默认). Required
+	// when InferenceKayaChatGateway is on.
+	KayaChatModel string
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -235,6 +246,8 @@ func Load() *Config {
 		InferenceCredentialKeys:    os.Getenv("INFERENCE_CREDENTIAL_KEYS"),
 		InferenceUpstreamAllowlist: splitComma(os.Getenv("INFERENCE_UPSTREAM_ALLOWLIST")),
 		InferenceAccountRPM:        parseIntOr(envOr("INFERENCE_ACCOUNT_RPM", "120"), 120),
+		InferenceKayaChatGateway:   os.Getenv("INFERENCE_KAYA_CHAT_GATEWAY") == "1",
+		KayaChatModel:              os.Getenv("KAYA_CHAT_MODEL"),
 	}
 }
 
@@ -365,6 +378,11 @@ func (c *Config) Validate() error {
 		if _, _, err := credentials.ParseKeysEnv(c.InferenceCredentialKeys); err != nil {
 			return fmt.Errorf("INFERENCE_CREDENTIAL_KEYS: %v", err)
 		}
+	}
+	// /chat 网关迁移开关：开启时必须配置默认模型（旧无 model 默认的承接
+	// 者），否则 facade 无模型可路由。
+	if c.InferenceKayaChatGateway && c.KayaChatModel == "" {
+		return errors.New("KAYA_CHAT_MODEL is required when INFERENCE_KAYA_CHAT_GATEWAY=1")
 	}
 	return nil
 }

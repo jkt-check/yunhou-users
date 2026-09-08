@@ -48,6 +48,12 @@ type ToolCallFunction struct {
 type ChatRequest struct {
 	Messages  []ChatMessage `json:"messages"`
 	SessionID string        `json:"session_id"`
+	// Model is optional. The LEGACY DeepSeek proxy ignores it entirely (the
+	// upstream model is server-configured, 旧无 model 默认). When the
+	// inference-gateway migration switch is on (INFERENCE_KAYA_CHAT_GATEWAY),
+	// the facade honors it as the public model id; empty means the server's
+	// configured default model (KAYA_CHAT_MODEL).
+	Model string `json:"model,omitempty"`
 	// Tools is the OpenAI-compatible function/tool schema list, relayed
 	// verbatim to the upstream DeepSeek chat.completions `tools` field.
 	// The server treats it as opaque JSON — it never parses tool contents,
@@ -94,3 +100,9 @@ const ChatMaxTools = 16
 // Tool schemas are typically a few hundred bytes each (kaya ships 4 tools);
 // 32 KiB covers pathological schemas while bounding memory per request.
 const ChatMaxToolsBytes = 32 << 10
+
+// ChatMaxModelLen bounds the optional model override (a public inference
+// model id). Only meaningful when the gateway facade is enabled; the legacy
+// proxy ignores the field, but the length bound applies either way so a
+// junk value never reaches either path.
+const ChatMaxModelLen = 64

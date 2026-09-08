@@ -19,6 +19,7 @@ import (
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/service"
 )
 
 // AccessOps bundles the Task 5 customer-access surface for router.Setup:
@@ -35,6 +36,19 @@ type AccessOps struct {
 	// RPMCounter backs V1Auth's per-key/account buckets; the router
 	// starts its janitor goroutine when set.
 	RPMCounter *access.RPMCounter
+
+	// V1Models / V1ChatCompletions are the Task 8 standard-protocol
+	// endpoints; both require V1Auth (mounted into the authenticated /v1
+	// group). Nil leaves the route unmounted (404) even when V1Auth exists.
+	V1Models          *ModelsHandler
+	V1ChatCompletions *ChatCompletionsHandler
+
+	// KayaChat, when non-nil, replaces the legacy chat service for
+	// POST /chat (迁移开关 INFERENCE_KAYA_CHAT_GATEWAY 的接线点).
+	KayaChat service.ChatStreamer
+	// KayaChatModels serves GET /chat/models (Kaya 模型选择契约); mounted
+	// only together with the facade.
+	KayaChatModels *KayaModelsHandler
 }
 
 // UserAPIKeysHandler serves the customer key-management endpoints.

@@ -377,6 +377,50 @@ func (s *Store) GetUpstreamAccount(ctx context.Context, id string) (*domain.Upst
 	}, nil
 }
 
+// ListActiveUpstreamAccounts returns the schedulable (status='active')
+// accounts of one provider, in deterministic id order — the routing layer's
+// account pool (设计 §8: 账号状态机；只有 active 账号可被调度).
+func (s *Store) ListActiveUpstreamAccounts(ctx context.Context, providerID string) ([]domain.UpstreamAccount, error) {
+	var rows []struct {
+		ID            string         `db:"id"`
+		ProviderID    string         `db:"provider_id"`
+		CredentialID  string         `db:"credential_id"`
+		ExternalID    string         `db:"external_account_id"`
+		DisplayName   string         `db:"display_name"`
+		Status        string         `db:"status"`
+		ConcLimit     int            `db:"concurrency_limit"`
+		QuotaLimit    sql.NullInt64  `db:"quota_limit_micros"`
+		QuotaRemain   sql.NullInt64  `db:"quota_remaining_micros"`
+		QuotaObserved *time.Time     `db:"quota_observed_at"`
+		QuotaSource   sql.NullString `db:"quota_source"`
+		QuotaReset    *time.Time     `db:"quota_reset_at"`
+		CreatedAt     time.Time      `db:"created_at"`
+		UpdatedAt     time.Time      `db:"updated_at"`
+	}
+	if err := s.db.SelectContext(ctx, &rows,
+		`SELECT * FROM inference_upstream_accounts
+		 WHERE provider_id = $1 AND status = 'active' ORDER BY id`, providerID); err != nil {
+		return nil, mapError("list upstream accounts", err)
+	}
+	out := make([]domain.UpstreamAccount, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, domain.UpstreamAccount{
+			ID: r.ID, ProviderID: r.ProviderID, CredentialID: r.CredentialID,
+			ExternalAccountID: r.ExternalID, DisplayName: r.DisplayName,
+			Status: domain.UpstreamAccountStatus(r.Status), ConcurrencyLimit: r.ConcLimit,
+			Quota: domain.UpstreamQuota{
+				LimitMicros:     microFromNull(r.QuotaLimit),
+				RemainingMicros: microFromNull(r.QuotaRemain),
+				ObservedAt:      r.QuotaObserved,
+				Source:          strFromNull(r.QuotaSource),
+				ResetAt:         r.QuotaReset,
+			},
+			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		})
+	}
+	return out, nil
+}
+
 // --- nullable helpers -------------------------------------------------------
 
 func microPtr(m *domain.Microcredit) interface{} {

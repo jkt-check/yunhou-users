@@ -42,6 +42,13 @@ const chatUpstreamErrorBodyCap = 8 << 10
 // endpoint (DeepSeek) with the server's own API key. Consumer apps (kaya
 // etc.) never see the key — they authenticate with a user JWT and the
 // server checks subscription-based access before spending upstream tokens.
+//
+// ChatStreamer is the /chat service surface; the legacy proxy and the
+// inference-gateway facade (ChatGatewayFacade, Task 8) both satisfy it.
+type ChatStreamer interface {
+	StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
+}
+
 type ChatService struct {
 	apiKey     string // server-side DeepSeek API key; empty = chat disabled
 	baseURL    string // OpenAI-compatible origin, e.g. https://api.deepseek.com

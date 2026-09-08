@@ -1,0 +1,902 @@
+// Package gateway orchestrates ONE logical model call end to end
+// (设计 §3 gateway: 一次逻辑调用的编排；§7.2 请求生命周期):
+//
+//	鉴权 principal → 权益解析(SelectEntitlement) → 目录快照 pin(一次调用
+//	固定一个快照版本) → 配额预占(Admit, 同事务) → 路由(能力兼容部署 +
+//	账号池/租约) → attempt 持久化(发送前落库) → 上游调用(流式/非流式) →
+//	结算(Settle; 崩溃恢复归 Task 9).
+//
+// Transaction boundaries (设计 §7.2: 原子检查并锁定适用窗口，短事务提交后
+// 才请求上游；不持有 DB 事务等待网络):
+//
+//  1. admission tx (quota.Service.Admit): account lock → window activation
+//     → holds → request row (+ account concurrency lease) — committed BEFORE
+//     any network I/O;
+//  2. attempt tx: upstream-account lease + attempt row — committed before
+//     the dispatch;
+//  3. settlement tx: usage fact + ledger charge + reservation conversion +
+//     request terminal state — runs on a detached, deadline-bounded context
+//     so client cancellation never loses already-read usage (设计 §7.2:
+//     结算使用独立且有截止时间的 context).
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/yunhou/users/internal/inference/access"
+	"github.com/yunhou/users/internal/inference/accounting"
+	"github.com/yunhou/users/internal/inference/catalog"
+	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/postgres"
+	"github.com/yunhou/users/internal/inference/providers"
+	"github.com/yunhou/users/internal/inference/quota"
+	"github.com/yunhou/users/internal/inference/routing"
+)
+
+// SnapshotSource pins one catalog snapshot per call (设计 §5: 一次调用固定
+// 使用一个快照，不混用新旧路由/价格). Satisfied by catalog.SnapshotCache.
+type SnapshotSource interface {
+	Current(ctx context.Context) (*catalog.Snapshot, error)
+}
+
+// SecretResolver decrypts the credential bound to an upstream account
+// (Task 4 credentials.Service).
+type SecretResolver interface {
+	ResolveSecret(ctx context.Context, id string, pinGeneration *int64) ([]byte, *domain.Credential, error)
+}
+
+// Store is the persistence surface the gateway orchestration needs;
+// satisfied by inference/postgres.Store. Methods taking a UnitOfWork
+// participate in that transaction — no hidden second connection.
+type Store interface {
+	Begin(ctx context.Context) (domain.UnitOfWork, error)
+	// Policy/price resolution (immutable versions, pinned at admission).
+	GetPolicyVersion(ctx context.Context, id string) (*postgres.PolicyVersion, error)
+	LatestPriceVersion(ctx context.Context, modelID, kind string, at time.Time) (*postgres.PriceVersion, error)
+	// Attempt lifecycle.
+	AcquireLeaseTx(ctx context.Context, w domain.UnitOfWork, cmd domain.AcquireLeaseCommand) (*domain.ConcurrencyLease, error)
+	InsertAttemptTx(ctx context.Context, w domain.UnitOfWork, a *domain.Attempt) error
+	UpdateRequestStatus(ctx context.Context, id string, status domain.RequestStatus, lastErr string) error
+	FinishAttempt(ctx context.Context, id, status, errorKind, upstreamRequestID string, finishedAt time.Time) error
+	// Settlement (domain.SettlementStore / QuotaStore release).
+	Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error
+	MarkReconciliationRequired(ctx context.Context, w domain.UnitOfWork, requestID, reason string, deadline time.Time) error
+	Release(ctx context.Context, w domain.UnitOfWork, requestID string) error
+}
+
+// settleTimeout bounds the detached settlement context (设计 §7.2: 结算使
+// 用独立且有截止时间的 context).
+const settleTimeout = 15 * time.Second
+
+// reconciliationDeadline is the recovery window for requests parked with
+// unknown usage (设计 §7.2: 设定恢复时限、告警和人工调整入口，避免额度永
+// 久悬挂). The recovery worker itself is Task 9.
+const reconciliationDeadline = 24 * time.Hour
+
+// maxAttemptsDefault caps the bounded failover (任务书: 有界重试限于可重试
+// 错误且未开始客户端输出；重试不用于绕过账号容量/不重复扣费).
+const maxAttemptsDefault = 3
+
+// Service is the gateway orchestrator.
+type Service struct {
+	snapshots    SnapshotSource
+	store        Store
+	entitlements *access.EntitlementResolver
+	quotaSvc     *quota.Service
+	routingSvc   *routing.Service
+	secrets      SecretResolver
+	client       *http.Client
+	egress       providers.EgressChecker
+	clock        domain.Clock
+
+	// MaxAttempts bounds the failover loop (default 3, never above the
+	// candidate count). Every attempt persists its own row; the customer
+	// settles once per request.
+	MaxAttempts int
+
+	// OnSettleError receives settlement failures that park the request in
+	// reconciliation (计费不可静默丢失 — this hook is the alarm; cmd/server
+	// wires loud logging).
+	OnSettleError func(requestID string, err error)
+}
+
+// NewService builds the gateway. A nil clock uses the system clock (UTC).
+func NewService(snapshots SnapshotSource, store Store, entitlements *access.EntitlementResolver,
+	quotaSvc *quota.Service, routingSvc *routing.Service, secrets SecretResolver,
+	client *http.Client, egress providers.EgressChecker, clock domain.Clock) *Service {
+	if clock == nil {
+		clock = domain.SystemClock{}
+	}
+	return &Service{
+		snapshots: snapshots, store: store, entitlements: entitlements,
+		quotaSvc: quotaSvc, routingSvc: routingSvc, secrets: secrets,
+		client: client, egress: egress, clock: clock,
+		MaxAttempts: maxAttemptsDefault,
+		OnSettleError: func(requestID string, err error) {
+			log.Printf("ERROR gateway: settlement failed for request %s: %v (parked for reconciliation)", requestID, err)
+		},
+	}
+}
+
+// detached is the settlement context factory: decoupled from the (possibly
+// canceled) request context, with its own deadline (设计 §7.2).
+func detached(d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), d)
+}
+
+// Outcome is one admitted call's result. Exactly one of Payload / Stream is
+// set. The caller (httpapi handler / Kaya facade) serves Payload or relays
+// Stream, then finalizes the stream with Stream.Finish.
+type Outcome struct {
+	RequestID string
+	ModelID   string
+	// Payload is the OpenAI-shaped chat.completion body (non-streaming).
+	Payload []byte
+	// Stream is the streaming result (OpenAI-shaped SSE + usage tap).
+	Stream *StreamBody
+}
+
+// StreamEnd classifies how the client-facing relay finished.
+type StreamEnd int
+
+const (
+	// EndCompleted: protocol end marker observed ([DONE]/message_stop).
+	EndCompleted StreamEnd = iota
+	// EndUpstreamBroke: the upstream stream ended WITHOUT the end marker
+	// (mid-stream EOF / read error / fencing stop).
+	EndUpstreamBroke
+	// EndClientGone: the client disconnected mid-stream (已读用量保留,
+	// 结算继续 — 设计 §7.2).
+	EndClientGone
+)
+
+// StreamBody is the streaming half of an Outcome: a tee reader feeding the
+// usage tap, the terminal-state probe, and the exactly-once settlement.
+type StreamBody struct {
+	reader   io.ReadCloser // tee into tap + fencing guard
+	tap      providers.UsageTap
+	cancel   context.CancelFunc
+	keeper   *routing.LeaseKeeper
+	finalize func(end StreamEnd) error
+	once     sync.Once
+	finErr   error
+}
+
+// Read implements io.Reader. Every read feeds the usage tap before the
+// caller sees the bytes; a fencing conflict (lease reclaimed) aborts the
+// stream instead of running ungated.
+func (s *StreamBody) Read(p []byte) (int, error) {
+	return s.reader.Read(p)
+}
+
+// Close stops the upstream connection. If the caller never finished the
+// stream (facade relay teardown), Close finalizes as client-gone — usage
+// already read is preserved and settled (设计 §7.2).
+func (s *StreamBody) Close() error {
+	err := s.reader.Close()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_ = s.Finish(EndClientGone)
+	return err
+}
+
+// Terminal reports whether the protocol end marker was observed.
+func (s *StreamBody) Terminal() bool { return s.tap.Result().Terminal }
+
+// Tap exposes the metering state (the estimate path and tests).
+func (s *StreamBody) Tap() providers.TapResult { return s.tap.Result() }
+
+// Finish settles the request exactly once with the relay's end state.
+func (s *StreamBody) Finish(end StreamEnd) error {
+	s.once.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.keeper != nil {
+			ctx, cancel := detached(settleTimeout)
+			defer cancel()
+			s.keeper.Stop(ctx)
+		}
+		s.finErr = s.finalize(end)
+	})
+	return s.finErr
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+// ChatCompletions runs the full §7.2 lifecycle for one logical call.
+// clientProto is the protocol the CALLER speaks (openai_chat for /v1,
+// kaya_chat for the facade); req.Model is the public model id.
+//
+// Every post-admission exit finalizes the reservation exactly once:
+// released (confirmed zero consumption), settled (reported/estimated), or
+// reconciliation_required (unknown) — never a dangling hold.
+func (s *Service) ChatCompletions(ctx context.Context, p *domain.Principal, key *domain.APIKey,
+	clientProto domain.Protocol, req *providers.ChatRequest) (*Outcome, error) {
+	if p == nil || p.BillingAccountID == "" {
+		return nil, domain.NewError(domain.CodeInvalidKey, "gateway: unauthenticated caller (fail closed)")
+	}
+
+	// 1. Pin ONE catalog snapshot for the whole call (设计 §5).
+	snap, err := s.snapshots.Current(ctx)
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeInternal, "gateway: catalog snapshot unavailable", err)
+	}
+	m, ok := snap.Model(req.Model)
+	if !ok {
+		return nil, domain.NewError(domain.CodeNotFound, "model "+req.Model+" not found")
+	}
+	if !modelSpeaks(m, clientProto) {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"model "+m.ID+" is not served on protocol "+string(clientProto))
+	}
+	// 2. Capability validation BEFORE any spend (设计: 不支持的工具/模态明
+	// 确报错). Modality/field-shape validation happened at the API edge.
+	thinking := req.ThinkingEnabled != nil && *req.ThinkingEnabled
+	if len(req.Tools) > 0 && !m.SupportsTools {
+		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support tools")
+	}
+	if thinking && !m.SupportsReasoning {
+		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support reasoning")
+	}
+	// Key narrowing can never widen beyond the entitlement set (设计 §4.2).
+	if key != nil && len(key.ModelAllow) > 0 && !contains(key.ModelAllow, m.ID) {
+		return nil, domain.NewError(domain.CodeModelNotAllowed, "model "+m.ID+" is not allowed for this API key")
+	}
+
+	// 3. Entitlement resolution (显式套餐优先，赠送不叠加/不兜底 — Task 6).
+	now := s.clock.Now()
+	ent, err := s.entitlements.Resolve(ctx, p.BillingAccountID, m.ID, now)
+	if err != nil {
+		return nil, err // CodeModelNotAllowed when nothing grants the model
+	}
+	// 4. Pin the immutable policy and sale-credit price revisions.
+	polRow, err := s.store.GetPolicyVersion(ctx, ent.PolicyVersionID)
+	if err != nil {
+		return nil, err
+	}
+	policy := polRow.Pure()
+	priceRow, err := s.store.LatestPriceVersion(ctx, m.ID, string(accounting.PriceSaleCredit), now)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return nil, accounting.ErrUnpriced
+		}
+		return nil, err
+	}
+	creditPrice, err := priceRow.Pure()
+	if err != nil {
+		return nil, err
+	}
+
+	// 5. Quota admission — the reservation commits BEFORE any upstream
+	// network call (设计 §7.2).
+	var keyID *string
+	if key != nil {
+		keyID = &key.ID
+	} else if p.APIKeyID != "" {
+		keyID = &p.APIKeyID
+	}
+	adm, err := s.quotaSvc.Admit(ctx, quota.AdmitCommand{
+		Request: domain.Request{
+			BillingAccountID: p.BillingAccountID, APIKeyID: keyID,
+			EntitlementID: ent.ID, ModelID: m.ID,
+			Protocol: clientProto, Stream: req.Stream,
+		},
+		Entitlement:          *ent,
+		Policy:               policy,
+		CreditPrice:          creditPrice,
+		Model:                *m,
+		EstimatedInputTokens: EstimateInputTokens(req),
+		ClientMaxTokens:      req.MaxTokens,
+	})
+	if err != nil {
+		return nil, err
+	}
+	requestID := adm.RequestID
+	// From here on, every exit path finalizes the reservation.
+
+	// 6. Route: capability-compatible candidates only (设计 §5).
+	needs := routing.Needs{Tools: len(req.Tools) > 0, Reasoning: thinking}
+	cands, err := s.routingSvc.Candidates(ctx, snap, m.ID, needs)
+	if err != nil {
+		s.releaseAdmission(requestID, adm.AccountLease)
+		return nil, domain.WrapError(domain.CodeInternal, "gateway: route candidates", err)
+	}
+	if len(cands) == 0 {
+		s.releaseAdmission(requestID, adm.AccountLease)
+		return nil, domain.NewError(domain.CodeUpstreamUnavailable,
+			"no compatible deployment with capacity for model "+m.ID)
+	}
+
+	return s.dispatchLoop(ctx, requestID, adm, req, creditPrice, cands)
+}
+
+// dispatchLoop walks the candidates with the bounded-retry policy. Every
+// attempt persists its intent + lease BEFORE dispatch; retries never bill
+// the customer twice (settlement happens once, on the winning attempt).
+func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota.AdmissionResult,
+	req *providers.ChatRequest, price accounting.PriceVersion, cands []routing.Candidate) (*Outcome, error) {
+
+	maxAttempts := s.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = maxAttemptsDefault
+	}
+	if maxAttempts > len(cands) {
+		maxAttempts = len(cands)
+	}
+
+	var lastErr error
+	executedUnknown := false
+	for i := 0; i < maxAttempts; i++ {
+		cand := cands[i]
+		adapter, ok := s.routingSvc.AdapterFor(cand.Deployment.Protocol)
+		if !ok {
+			continue
+		}
+		outcome, err := s.attempt(ctx, requestID, i+1, adm, req, price, cand, adapter)
+		if err == nil {
+			return outcome, nil
+		}
+		// Client/shape errors (*domain.Error, e.g. an Anthropic-illegal
+		// history) are NOT upstream failures: nothing was sent, the
+		// reservation releases, and the caller sees the real 400.
+		var de *providers.DispatchError
+		if !errorsAsDispatch(err, &de) {
+			s.releaseAdmission(requestID, adm.AccountLease)
+			return nil, err
+		}
+		lastErr = de
+		if de.ExecutedUnknown {
+			executedUnknown = true
+		}
+		switch {
+		case providers.IsCanceled(de.Err):
+			// The caller is gone: stop spending upstream (设计 §7.2 客户端
+			// 取消后停止上游连接). No consumption is confirmed, so the
+			// reservation releases — unless execution was already unknown.
+			if executedUnknown {
+				return nil, s.holdForReconciliation(requestID, de)
+			}
+			s.releaseAdmission(requestID, adm.AccountLease)
+			return nil, domain.WrapError(domain.CodeUpstreamUnavailable, "caller canceled mid-dispatch", de)
+		case !de.Retryable():
+			// Non-retryable upstream rejection (e.g. 400/401/403): the
+			// upstream answered without serving — zero consumption.
+			s.releaseAdmission(requestID, adm.AccountLease)
+			return nil, domain.WrapError(domain.CodeUpstreamUnavailable,
+				"upstream rejected the request", de)
+		case domain.CodeOf(de.Err) == domain.CodeInsufficientCapacity:
+			// Account at its concurrency ceiling: try the next candidate,
+			// never cool it (fullness is transient, not a failure) and never
+			// retry INSIDE the account to dodge its capacity (设计 §8).
+			continue
+		default:
+			// Retryable (429/5xx/transport): cool the account and fail over.
+			s.routingSvc.CooldownAfterFailure(cand.Account.ID)
+			continue
+		}
+	}
+
+	// All attempts failed before any client output. Unknown execution holds
+	// the reservation for reconciliation (禁止静默释放可能已发生的消费);
+	// confirmed zero consumption releases (设计 §7.2 reserved → released).
+	if executedUnknown {
+		return nil, s.holdForReconciliation(requestID, lastErr)
+	}
+	s.releaseAdmission(requestID, adm.AccountLease)
+	return nil, domain.WrapError(domain.CodeUpstreamUnavailable,
+		"all compatible upstreams failed", lastErr)
+}
+
+// holdForReconciliation parks the request with its reservation intact and
+// reports the dispatch failure.
+func (s *Service) holdForReconciliation(requestID string, cause error) error {
+	s.markReconciliation(requestID, "unknown_usage",
+		fmt.Sprintf("dispatch failed with unknown execution state: %v", cause))
+	return domain.WrapError(domain.CodeUpstreamUnavailable,
+		"upstream execution state unknown; reservation held for reconciliation", cause)
+}
+
+// attempt runs ONE upstream try: persist intent + lease (one tx) → fencing
+// check → egress re-validation → secret resolution → dispatch. A nil error
+// returns the live outcome whose finalization belongs to the caller. A
+// *domain.Error result is a client/shape failure (release + 400); a
+// *providers.DispatchError feeds the retry policy.
+func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, adm *quota.AdmissionResult,
+	req *providers.ChatRequest, price accounting.PriceVersion, cand routing.Candidate,
+	adapter providers.Adapter) (*Outcome, error) {
+
+	// Attempt intent + upstream concurrency lease commit in ONE tx —
+	// before any byte is sent upstream (设计 §7.2).
+	now := s.clock.Now()
+	attempt := &domain.Attempt{
+		ID: uuid.NewString(), RequestID: requestID, AttemptNo: attemptNo,
+		DeploymentID:      &cand.Deployment.ID,
+		UpstreamAccountID: &cand.Account.ID,
+		Status:            "dispatching",
+		StartedAt:         &now,
+	}
+	lease, err := s.persistAttempt(ctx, attempt, cand, now)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeInsufficientCapacity {
+			return nil, &providers.DispatchError{Err: err}
+		}
+		return nil, domain.WrapError(domain.CodeInternal, "gateway: persist attempt", err)
+	}
+	releaseLease := func() {
+		rctx, rcancel := detached(settleTimeout)
+		defer rcancel()
+		if err := s.routingSvc.ReleaseLease(rctx, lease); err != nil {
+			log.Printf("gateway: release upstream lease %s: %v", lease.ID, err)
+		}
+	}
+	failAttempt := func(status, kind string) {
+		s.finishAttempt(attempt.ID, status, kind, "")
+		releaseLease()
+	}
+
+	// Fencing: the lease must still be a live authorization right before
+	// the resource is used (Task 7: 超时回收不得与仍活跃请求重叠授权).
+	if err := s.routingSvc.CheckLease(ctx, lease); err != nil {
+		failAttempt("failed", "lease_lost")
+		return nil, &providers.DispatchError{Err: err}
+	}
+
+	// Dispatch-time egress re-validation (Task 4: DNS-rebinding defense).
+	if s.egress != nil {
+		if err := s.egress.ValidateURL(ctx, cand.Deployment.BaseURL); err != nil {
+			failAttempt("failed", "egress_rejected")
+			return nil, &providers.DispatchError{Err: err}
+		}
+	}
+
+	// Secret resolution (Task 4). A rotated/disabled credential rejects
+	// this candidate, not the whole request.
+	secret, _, err := s.secrets.ResolveSecret(ctx, cand.Account.CredentialID, nil)
+	if err != nil {
+		failAttempt("failed", "credential")
+		return nil, &providers.DispatchError{Err: err}
+	}
+
+	extraHeaders, err := domain.ExtensionHeaders(cand.Deployment.Config)
+	if err != nil {
+		failAttempt("failed", "config")
+		return nil, domain.WrapError(domain.CodeInternal, "gateway: deployment config", err)
+	}
+
+	if err := s.store.UpdateRequestStatus(ctx, requestID, domain.ReqDispatching, ""); err != nil {
+		failAttempt("failed", "storage")
+		return nil, domain.WrapError(domain.CodeInternal, "gateway: mark dispatching", err)
+	}
+
+	timeout := cand.Deployment.RequestTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	// The keeper renews the UPSTREAM lease while the dispatch is in flight
+	// (a renewal conflict fences the attempt — the stream guard then stops
+	// the upstream call). The billing-account lease lives for the WHOLE
+	// request: it joins the keeper only on the streaming success path and
+	// is released by the finalizer (settle/release), never per attempt.
+	keeper := s.routingSvc.NewLeaseKeeper(lease)
+
+	disp, err := providers.Dispatch(attemptCtx, s.client, adapter, &providers.Call{
+		Deployment:   &cand.Deployment,
+		Secret:       secret,
+		RequestID:    requestID,
+		Request:      req,
+		OutputCap:    adm.OutputCap,
+		ExtraHeaders: extraHeaders,
+	})
+	if err != nil {
+		cancel()
+		kstop, kcancel := detached(settleTimeout)
+		keeper.Stop(kstop)
+		kcancel()
+		var de *providers.DispatchError
+		if !errorsAsDispatch(err, &de) {
+			// Build-time shape error (invalid_input): nothing was sent.
+			failAttempt("failed", "payload")
+			return nil, err
+		}
+		kind := "transport"
+		if de.StatusCode != 0 {
+			kind = fmt.Sprintf("http_%d", de.StatusCode)
+		}
+		status := "failed"
+		if de.ExecutedUnknown {
+			status = "unknown" // 上游是否执行未知 — 尝试状态如实记录
+		}
+		s.finishAttempt(attempt.ID, status, kind, "")
+		releaseLease()
+		return nil, de
+	}
+
+	if req.Stream {
+		return s.onStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
+	}
+	return s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
+}
+
+// persistAttempt commits the attempt row and the upstream-account lease in
+// one transaction.
+func (s *Service) persistAttempt(ctx context.Context, a *domain.Attempt, cand routing.Candidate, now time.Time) (*domain.ConcurrencyLease, error) {
+	uow, err := s.store.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := s.routingSvc.AcquireUpstreamLease(ctx, uow, cand.Account, a.RequestID, now)
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		return nil, err
+	}
+	if err := s.store.InsertAttemptTx(ctx, uow, a); err != nil {
+		_ = uow.Rollback(ctx)
+		return nil, err
+	}
+	if err := uow.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return lease, nil
+}
+
+// onNonStreamDispatch settles immediately and returns the payload. Both
+// leases end with the request: upstream via the keeper, account explicitly.
+func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
+	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
+	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
+	cancel()
+	kctx, kcancel := detached(settleTimeout)
+	keeper.Stop(kctx)
+	kcancel()
+	s.finishAttempt(attempt.ID, "completed", "", disp.UpstreamRequestID)
+	if err := s.store.UpdateRequestStatus(context.Background(), requestID, domain.ReqNonStreaming, ""); err != nil {
+		log.Printf("gateway: mark non_streaming %s: %v", requestID, err)
+	}
+
+	// Usage: reported when the upstream provided it; when the upstream
+	// genuinely has no usage on this path, the estimated path applies
+	// (设计 §7.1 — never zero).
+	usage := disp.Usage
+	source := domain.UsageReported
+	raw := disp.UsageRaw
+	if !disp.UsageReported || emptyBuckets(usage) {
+		source = domain.UsageEstimated
+		usage = s.estimateUsage(adm, 0)
+		raw = nil
+	}
+	sctx, scancel := detached(settleTimeout)
+	defer scancel()
+	s.settle(sctx, requestID, attempt.ID, usage, source, raw, price, adapter, adm)
+	if adm.AccountLease != nil {
+		if err := s.routingSvc.ReleaseLease(sctx, adm.AccountLease); err != nil {
+			log.Printf("gateway: release account lease %s: %v", adm.AccountLease.ID, err)
+		}
+	}
+	return &Outcome{RequestID: requestID, ModelID: price.ModelID, Payload: disp.Payload}, nil
+}
+
+// onStreamDispatch hands the live stream to the caller; settlement runs in
+// StreamBody.Finish.
+func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
+	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
+	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
+	if err := s.store.UpdateRequestStatus(context.Background(), requestID, domain.ReqStreaming, ""); err != nil {
+		log.Printf("gateway: mark streaming %s: %v", requestID, err)
+	}
+	// The dispatch keeper pauses WITHOUT releasing; the stream keeper takes
+	// over both leases for the whole stream lifetime (account lease is
+	// request-scoped, not attempt-scoped).
+	keeper.Pause()
+	streamLeases := keeper.Leases()
+	if adm.AccountLease != nil {
+		streamLeases = append(streamLeases, adm.AccountLease)
+	}
+	streamKeeper := s.routingSvc.NewLeaseKeeper(streamLeases...)
+	body := &StreamBody{
+		tap:    disp.Stream.Tap,
+		cancel: cancel,
+		keeper: streamKeeper,
+	}
+	body.reader = &guardedTeeReader{
+		body:   disp.Stream.TeeBody(),
+		keeper: keeper,
+	}
+	body.finalize = func(end StreamEnd) error {
+		attemptStatus, kind := "completed", ""
+		switch end {
+		case EndUpstreamBroke:
+			attemptStatus, kind = "failed", "stream_interrupted"
+		case EndClientGone:
+			attemptStatus, kind = "cancelled", "client_gone"
+		}
+		s.finishAttempt(attempt.ID, attemptStatus, kind, disp.UpstreamRequestID)
+
+		tap := body.tap.Result()
+		sctx, scancel := detached(settleTimeout)
+		defer scancel()
+		switch {
+		case !tap.SawUsage && !tap.Terminal:
+			// Interrupted with NO usage read: hold the reservation, park for
+			// reconciliation — 不记零、不静默释放 (设计 §7.2).
+			s.markReconciliation(requestID, "unknown_usage",
+				"stream interrupted before any usage was reported")
+			return nil
+		case tap.SawUsage && tap.Terminal && !emptyBuckets(tap.Buckets):
+			// Clean end with usage: reported.
+			s.settle(sctx, requestID, attempt.ID,
+				tap.Buckets, domain.UsageReported, tap.Raw, price, adapter, adm)
+			return nil
+		default:
+			// 中断但已读用量 (estimated = 已知实际量), 或完整结束但上游确实
+			// 不提供 usage → estimated 估算路径 (设计 §7.1/§7.2).
+			usage := tap.Buckets
+			raw := tap.Raw
+			if !tap.SawUsage || emptyBuckets(usage) {
+				usage = s.estimateUsage(adm, tap.ContentBytes)
+				raw = nil
+			}
+			s.settle(sctx, requestID, attempt.ID,
+				usage, domain.UsageEstimated, raw, price, adapter, adm)
+			return nil
+		}
+	}
+	return &Outcome{RequestID: requestID, ModelID: price.ModelID, Stream: body}, nil
+}
+
+// guardedTeeReader aborts the stream when the lease keeper reports a
+// fencing conflict (a reclaimed slot must stop the upstream call instead of
+// running ungated, Task 7).
+type guardedTeeReader struct {
+	body   io.ReadCloser
+	keeper *routing.LeaseKeeper
+}
+
+func (r *guardedTeeReader) Read(p []byte) (int, error) {
+	if err := r.keeper.Err(); err != nil {
+		_ = r.body.Close()
+		return 0, fmt.Errorf("gateway: concurrency lease lost (fenced): %w", err)
+	}
+	return r.body.Read(p)
+}
+
+func (r *guardedTeeReader) Close() error { return r.body.Close() }
+
+// ---------------------------------------------------------------------------
+// Settlement
+// ---------------------------------------------------------------------------
+
+// settle runs the idempotent settlement in one transaction. A failure never
+// silently drops the charge: the request is parked in reconciliation and
+// the OnSettleError alarm fires (设计 §7.2: 计费不可静默丢失). A duplicate
+// settlement is idempotent by design (唯一键防重复结算) and not an alarm.
+func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage domain.UsageBuckets,
+	source domain.UsageSource, raw json.RawMessage, price accounting.PriceVersion,
+	adapter providers.Adapter, adm *quota.AdmissionResult) {
+
+	record := domain.UsageRecord{
+		RequestID: requestID, AttemptID: attemptID, Source: source,
+		RawUsage: domain.ExtensionConfig{SchemaVersion: 1, Raw: raw},
+	}
+	// Normalize overlapping semantics exactly once (设计 §7.1): reasoning
+	// already inside output is not re-added; cache buckets inside input are
+	// priced at their own rate.
+	billable, err := accounting.BillableBuckets(usage, adapter.Inclusion())
+	if err != nil {
+		s.parkSettleFailure(requestID, fmt.Errorf("normalize usage: %w", err))
+		return
+	}
+	record.Buckets = billable
+
+	charge, err := price.Quote(record, nil)
+	if err != nil {
+		s.parkSettleFailure(requestID, fmt.Errorf("price quote: %w", err))
+		return
+	}
+
+	cmd := domain.SettleCommand{
+		RequestID:    requestID,
+		Usage:        record,
+		ChargeMicros: charge.Credit,
+		SettledAt:    s.clock.Now(),
+	}
+	// Per-attempt upstream cost with its basis (任务书: 为每次尝试保存成本
+	// 来源). Only when an upstream_cost price version exists — no cost list,
+	// no fabricated cost.
+	cost, basis, cerr := s.attemptCost(price.ModelID, record)
+	if cerr != nil {
+		log.Printf("gateway: attempt cost for %s: %v (cost left unset, charge unaffected)", attemptID, cerr)
+	} else if cost != nil {
+		cmd.AttemptID = &attemptID
+		cmd.AttemptCost = cost
+		cmd.CostBasis = basis
+	}
+
+	uow, err := s.store.Begin(ctx)
+	if err != nil {
+		s.parkSettleFailure(requestID, fmt.Errorf("settle begin: %w", err))
+		return
+	}
+	if err := s.store.Settle(ctx, uow, cmd); err != nil {
+		_ = uow.Rollback(ctx)
+		if domain.CodeOf(err) == domain.CodeConflict {
+			return // already settled — idempotent delivery, not an error
+		}
+		s.parkSettleFailure(requestID, fmt.Errorf("settle: %w", err))
+		return
+	}
+	if err := uow.Commit(ctx); err != nil {
+		s.parkSettleFailure(requestID, fmt.Errorf("settle commit: %w", err))
+		return
+	}
+}
+
+// attemptCost prices the attempt's upstream cost under the effective
+// upstream_cost list. The basis mirrors the usage source: reported usage →
+// reported cost, estimated usage → estimated cost (设计 §7.1 cost_basis).
+func (s *Service) attemptCost(modelID string, record domain.UsageRecord) (*domain.Money, *domain.CostBasis, error) {
+	row, err := s.store.LatestPriceVersion(context.Background(), modelID, string(accounting.PriceUpstreamCost), s.clock.Now())
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return nil, nil, nil // no procurement list — cost stays unset
+		}
+		return nil, nil, err
+	}
+	pv, err := row.Pure()
+	if err != nil {
+		return nil, nil, err
+	}
+	charge, err := pv.Quote(record, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	basis := domain.CostReported
+	if record.Source == domain.UsageEstimated {
+		basis = domain.CostEstimated
+	}
+	return charge.Money, &basis, nil
+}
+
+// parkSettleFailure holds the reservation and enqueues reconciliation —
+// the anti-silent-loss path (设计 §7.2).
+func (s *Service) parkSettleFailure(requestID string, cause error) {
+	log.Printf("gateway: settlement failed for %s: %v — parking in reconciliation", requestID, cause)
+	s.markReconciliation(requestID, "unknown_usage", cause.Error())
+	if s.OnSettleError != nil {
+		s.OnSettleError(requestID, cause)
+	}
+}
+
+// markReconciliation parks a request whose consumption is unknown, keeping
+// the reservation (禁止仅凭 TTL 释放全部预占).
+func (s *Service) markReconciliation(requestID, reason, detail string) {
+	ctx, cancel := detached(settleTimeout)
+	defer cancel()
+	uow, err := s.store.Begin(ctx)
+	if err != nil {
+		log.Printf("ERROR gateway: reconciliation begin %s: %v", requestID, err)
+		return
+	}
+	if err := s.store.MarkReconciliationRequired(ctx, uow, requestID, reason,
+		s.clock.Now().Add(reconciliationDeadline)); err != nil {
+		_ = uow.Rollback(ctx)
+		log.Printf("ERROR gateway: reconciliation mark %s: %v", requestID, err)
+		return
+	}
+	if err := uow.Commit(ctx); err != nil {
+		log.Printf("ERROR gateway: reconciliation commit %s: %v", requestID, err)
+	}
+}
+
+// releaseAdmission confirms zero upstream consumption: every hold drops in
+// one transaction (reserved → released) and an unused five-hour window is
+// voided in-transaction (设计 §6/§7.2). A failure leaves the hold for
+// Task 9 recovery — loud, never silent.
+func (s *Service) releaseAdmission(requestID string, accountLease *domain.ConcurrencyLease) {
+	ctx, cancel := detached(settleTimeout)
+	defer cancel()
+	if err := s.quotaSvc.ReleaseAdmission(ctx, requestID); err != nil {
+		log.Printf("ERROR gateway: release admission %s: %v (reservation held; recovery reconciles)", requestID, err)
+	}
+	if accountLease != nil {
+		if err := s.routingSvc.ReleaseLease(ctx, accountLease); err != nil {
+			log.Printf("gateway: release account lease %s: %v", accountLease.ID, err)
+		}
+	}
+}
+
+// finishAttempt marks the attempt's terminal state (best-effort; the row
+// was committed before dispatch, so the audit trail exists either way).
+func (s *Service) finishAttempt(id, status, errorKind, upstreamRequestID string) {
+	ctx, cancel := detached(settleTimeout)
+	defer cancel()
+	if err := s.store.FinishAttempt(ctx, id, status, errorKind, upstreamRequestID, s.clock.Now()); err != nil {
+		log.Printf("gateway: finish attempt %s: %v", id, err)
+	}
+}
+
+// estimateUsage is the §7.1 estimated path: used ONLY when the upstream
+// genuinely provided no usage (the adapters always request it explicitly).
+// Input follows the admission estimator; output derives from the relayed
+// content bytes. The estimate is auditable (source=estimated on the usage
+// record) and correctable by later real evidence.
+func (s *Service) estimateUsage(adm *quota.AdmissionResult, contentBytes int64) domain.UsageBuckets {
+	in := adm.InputBound
+	out := contentBytes / 2
+	if contentBytes > 0 && out == 0 {
+		out = 1
+	}
+	return domain.UsageBuckets{InputTokens: &in, OutputTokens: &out}
+}
+
+// EstimateInputTokens is the admission input estimate: a conservative
+// bytes-based upper bound (CJK ~3 bytes/token, English ~4 bytes/token; /2
+// over-estimates both — a reservation is a SAFE UPPER BOUND, 设计 §7.2),
+// narrowed to the model context limit by quota.InputBound.
+func EstimateInputTokens(req *providers.ChatRequest) int64 {
+	var b int64
+	for _, m := range req.Messages {
+		b += int64(len(m.Content)) + 8
+		for _, tc := range m.ToolCalls {
+			b += int64(len(tc.Function.Name)+len(tc.Function.Arguments)) + 16
+		}
+	}
+	for _, t := range req.Tools {
+		b += int64(len(t))
+	}
+	if len(req.ToolChoice) > 0 {
+		b += int64(len(req.ToolChoice))
+	}
+	return b/2 + 16
+}
+
+func modelSpeaks(m *domain.Model, p domain.Protocol) bool {
+	for _, mp := range m.Protocols {
+		if mp == p {
+			return true
+		}
+	}
+	return false
+}
+
+func contains(list []string, id string) bool {
+	for _, x := range list {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+func emptyBuckets(b domain.UsageBuckets) bool {
+	return b.InputTokens == nil && b.OutputTokens == nil && b.CacheReadTokens == nil &&
+		b.CacheWriteTokens == nil && b.ReasoningTokens == nil
+}
+
+func errorsAsDispatch(err error, target **providers.DispatchError) bool {
+	for err != nil {
+		if de, ok := err.(*providers.DispatchError); ok {
+			*target = de
+			return true
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}

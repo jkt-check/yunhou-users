@@ -56,7 +56,6 @@ func Setup(
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
-	chatHandler := handler.NewChatHandler(chatSvc, chatAccessLog)
 	usageHandler := handler.NewUsageHandler(usageSvc)
 
 	// Public routes (rate limited)
@@ -123,19 +122,25 @@ func Setup(
 		}
 	}
 
-	// Kaya Coding Plan Task 5: the standard-protocol /v1 surface. The
+	// Kaya Coding Plan Task 5/8: the standard-protocol /v1 surface. The
 	// group fixes the auth chain — per-IP limiter as the outer perimeter
 	// guard, then customer API-key authentication with per-Key/account RPM
 	// buckets — so no /v1 route can ever be registered unauthenticated.
-	// Task 8 mounts the protocol routes (/v1/models, /v1/chat/completions)
-	// into this group; until then every /v1 path is 404 by gin's NoRoute.
 	// This chain is independent of the operator surface: X-App-Secret is
 	// not a customer credential (设计 §9.2).
 	if accessOps != nil && accessOps.V1Auth != nil {
 		if accessOps.RPMCounter != nil {
 			go accessOps.RPMCounter.RunJanitor(ctx, time.Minute, 2*time.Minute)
 		}
-		engine.Group("/v1", middleware.RateLimit(ctx, 60, 120), accessOps.V1Auth)
+		v1 := engine.Group("/v1", middleware.RateLimit(ctx, 60, 120), accessOps.V1Auth)
+		// Task 8 protocol routes: the native OpenAI shapes, never the
+		// management envelope (设计 §9.1). Nil handlers stay unmounted.
+		if accessOps.V1Models != nil {
+			v1.GET("/models", accessOps.V1Models.List)
+		}
+		if accessOps.V1ChatCompletions != nil {
+			v1.POST("/chat/completions", accessOps.V1ChatCompletions.Create)
+		}
 	}
 
 	// App routes (internal service auth)
@@ -159,8 +164,22 @@ func Setup(
 	// timeout (see cmd/server timeoutMiddleware skip list) because the SSE
 	// stream can legitimately run longer; its own limiter bucket is tighter
 	// than the generic app bucket because every call spends upstream tokens.
+	//
+	// Task 8 迁移开关：accessOps.KayaChat 非空时 /chat 由 inference 网关
+	// facade 服务（INFERENCE_KAYA_CHAT_GATEWAY=1），否则保持旧 DeepSeek
+	// 直通。两条路径共用同一 handler（鉴权、限流、审计日志、SSE relay、
+	// 错误 shape 不变）。
 	chatLimiter := middleware.RateLimit(ctx, 10, 20)
+	var chatStreamSvc handler.ChatStreamer = chatSvc
+	if accessOps != nil && accessOps.KayaChat != nil {
+		chatStreamSvc = accessOps.KayaChat
+	}
+	chatHandler := handler.NewChatHandler(chatStreamSvc, chatAccessLog)
 	engine.POST("/chat", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.StreamChat)
+	// GET /chat/models (Kaya 模型选择契约) 仅随 facade 挂载。
+	if accessOps != nil && accessOps.KayaChatModels != nil {
+		engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), accessOps.KayaChatModels.List)
+	}
 
 	// Admin routes for plan management (internal service auth)
 	adminLimiter := middleware.RateLimit(ctx, 30, 60)

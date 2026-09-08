@@ -19,11 +19,20 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
-// chatStreamer is the ChatService surface the handler needs. Defined as a
-// local interface so handler tests can inject a hand-rolled mock without a
-// real upstream.
-type chatStreamer interface {
+// ChatStreamer is the ChatService surface the handler needs. Defined as an
+// interface so handler tests can inject a hand-rolled mock without a real
+// upstream, and so the inference-gateway facade (service.ChatGatewayFacade)
+// can replace the legacy proxy when the migration switch is on (Task 8).
+type ChatStreamer interface {
 	StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
+}
+
+// chatModelStreamer is the optional model-aware extension of chatStreamer:
+// services that implement it receive the client's optional model override
+// (ChatRequest.Model). The legacy proxy deliberately does NOT implement it
+// (its model is server-configured), so old behavior is untouched.
+type chatModelStreamer interface {
+	StreamChatWithModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
 }
 
 // ChatHandler serves POST /chat — the JWT-authenticated, subscription-gated
@@ -35,11 +44,11 @@ type chatStreamer interface {
 // failure) with user_id, session_id, input messages, output text, status and
 // duration — the chat audit trail. Nil disables access logging.
 type ChatHandler struct {
-	svc       chatStreamer
+	svc       ChatStreamer
 	accessLog *log.Logger
 }
 
-func NewChatHandler(svc chatStreamer, accessLog *log.Logger) *ChatHandler {
+func NewChatHandler(svc ChatStreamer, accessLog *log.Logger) *ChatHandler {
 	return &ChatHandler{svc: svc, accessLog: accessLog}
 }
 
@@ -111,13 +120,27 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		writeChatError(c, http.StatusBadRequest, "session_id too long")
 		return
 	}
+	if len(req.Model) > model.ChatMaxModelLen {
+		h.logAccess(started, userID, appID, req, "error", "model id too long", "")
+		writeChatError(c, http.StatusBadRequest, "model id too long")
+		return
+	}
 	if msg := validateChatTools(req.Tools); msg != "" {
 		h.logAccess(started, userID, appID, req, "error", msg, "")
 		writeChatError(c, http.StatusBadRequest, msg)
 		return
 	}
 
-	resp, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Messages, req.Tools, req.ThinkingEnabled)
+	var resp *http.Response
+	var err error
+	if ms, ok := h.svc.(chatModelStreamer); ok {
+		// Gateway facade path: the optional model override is honored (旧
+		// 客户端不带 model → 服务端默认). Validation above already bounded
+		// the legacy fields.
+		resp, err = ms.StreamChatWithModel(c.Request.Context(), userID, req.Model, req.Messages, req.Tools, req.ThinkingEnabled)
+	} else {
+		resp, err = h.svc.StreamChat(c.Request.Context(), userID, appID, req.Messages, req.Tools, req.ThinkingEnabled)
+	}
 	if err != nil {
 		status, msg := chatErrorMapping(err)
 		h.logAccess(started, userID, appID, req, "error", msg, "")

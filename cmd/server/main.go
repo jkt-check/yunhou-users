@@ -20,11 +20,17 @@ import (
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	inferenceaccess "github.com/yunhou/users/internal/inference/access"
+	inferenceaccounting "github.com/yunhou/users/internal/inference/accounting"
 	inferencecatalog "github.com/yunhou/users/internal/inference/catalog"
 	inferencecredentials "github.com/yunhou/users/internal/inference/credentials"
+	inferencedomain "github.com/yunhou/users/internal/inference/domain"
+	inferencegateway "github.com/yunhou/users/internal/inference/gateway"
 	inferencehttpapi "github.com/yunhou/users/internal/inference/httpapi"
 	inferencemanagement "github.com/yunhou/users/internal/inference/management"
 	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
+	inferenceproviders "github.com/yunhou/users/internal/inference/providers"
+	inferencequota "github.com/yunhou/users/internal/inference/quota"
+	inferencerouting "github.com/yunhou/users/internal/inference/routing"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -240,10 +246,50 @@ func main() {
 	accessResolver := inferenceaccess.NewResolver(infStore, nil)
 	keySvc := inferenceaccess.NewKeyService(infStore, nil)
 	rpmCounter := inferenceaccess.NewRPMCounter(nil)
+
+	// Task 8: the inference gateway — adapters, routing (account pool +
+	// concurrency leases), quota admission, and the orchestration service
+	// that pins ONE catalog snapshot per call (设计 §5: catalogCache 按请求
+	// pin；发布原子切换在各进程有界延迟内生效).
+	adapters := map[inferencedomain.Protocol]inferenceproviders.Adapter{
+		inferencedomain.ProtocolOpenAIChat:       inferenceproviders.NewOpenAIChat(),
+		inferencedomain.ProtocolAnthropicMessage: inferenceproviders.NewAnthropicMessages(),
+	}
+	routingSvc := inferencerouting.NewService(infStore, adapters, nil)
+	quotaSvc := inferencequota.NewService(infStore, nil)
+	entitlementResolver := inferenceaccess.NewEntitlementResolver(infStore, nil)
+	gatewayHTTPClient := inferenceproviders.NewHTTPClient(egressValidator)
+	gatewaySvc := inferencegateway.NewService(
+		catalogCache, infStore, entitlementResolver, quotaSvc, routingSvc,
+		credSvc, gatewayHTTPClient, egressValidator, nil)
+
+	// Sellable gate for the published-model listings (/v1/models and
+	// /chat/models): a model without an effective sale-credit price version
+	// is NOT sellable (新模型默认不可售; deny by default).
+	catalogSvc.SetPriceCheck(func(ctx context.Context, modelID string) (bool, error) {
+		_, err := infStore.LatestPriceVersion(ctx, modelID, string(inferenceaccounting.PriceSaleCredit), time.Now())
+		if err != nil {
+			if inferencedomain.CodeOf(err) == inferencedomain.CodeNotFound {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+
 	accessOps := &inferencehttpapi.AccessOps{
-		UserAPIKeys: inferencehttpapi.NewUserAPIKeysHandler(keySvc),
-		V1Auth:      inferencehttpapi.APIKeyAuth(accessResolver, rpmCounter, cfg.InferenceAccountRPM),
-		RPMCounter:  rpmCounter,
+		UserAPIKeys:       inferencehttpapi.NewUserAPIKeysHandler(keySvc),
+		V1Auth:            inferencehttpapi.APIKeyAuth(accessResolver, rpmCounter, cfg.InferenceAccountRPM),
+		RPMCounter:        rpmCounter,
+		V1Models:          inferencehttpapi.NewModelsHandler(catalogSvc, accessResolver),
+		V1ChatCompletions: inferencehttpapi.NewChatCompletionsHandler(gatewaySvc),
+	}
+	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
+	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
+	if cfg.InferenceKayaChatGateway {
+		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, cfg.KayaChatModel)
+		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, cfg.KayaChatModel)
+		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}
 	if cfg.LLMProvidersJSON != "" {
 		res, err := catalogSvc.ImportEnvCatalog(context.Background(), cfg.LLMProvidersJSON)
@@ -253,9 +299,6 @@ func main() {
 		log.Printf("LLM_PROVIDERS_JSON import: +%d providers, +%d models, +%d deployments, +%d routes, %d already present (skipped)",
 			res.ProvidersInserted, res.ModelsInserted, res.DeploymentsInserted, res.RoutesInserted, res.Skipped)
 	}
-	// catalogCache is pinned per request once the gateway lands (Task 8);
-	// ops reads go through the service/manager today.
-	_ = catalogCache
 
 	// Chat access audit log: one JSON line per request (user_id, session_id,
 	// input, output, status, duration). Optional — empty CHAT_LOG_PATH
@@ -301,12 +344,13 @@ func main() {
 	// Bound how long any handler can run before the client disconnects, to
 	// limit the blast radius of a slow downstream call (e.g. the OAuth
 	// provider timeout is 10s; we leave a little headroom here).
-	// /chat is exempt: it relays an upstream SSE stream whose legitimate
-	// lifetime exceeds 20s. Its own safety net is chatUpstreamTimeout
-	// (5m, inside ChatService) plus a per-response write deadline set by
-	// the chat handler (the server-wide WriteTimeout below is an absolute
+	// /chat and /v1/chat/completions are exempt: both relay upstream SSE
+	// streams whose legitimate lifetime exceeds 20s. Their own safety nets
+	// are per-attempt deployment request timeouts (gateway, Task 8) /
+	// chatUpstreamTimeout (legacy /chat) plus per-response write deadlines
+	// set by the handlers (the server-wide WriteTimeout below is an absolute
 	// per-request deadline — it would hard-cut a longer stream).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat"))
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,

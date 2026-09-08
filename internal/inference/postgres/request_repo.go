@@ -133,6 +133,44 @@ func (s *Store) InsertAttempt(ctx context.Context, a *domain.Attempt) error {
 	return insertAttempt(ctx, s.db, a)
 }
 
+// InsertAttemptTx is InsertAttempt inside an open UnitOfWork — the gateway
+// persists the attempt intent in the SAME transaction as the upstream
+// concurrency lease (设计 §7.2: 上游发送前持久化尝试意图与并发租约).
+func (s *Store) InsertAttemptTx(ctx context.Context, w domain.UnitOfWork, a *domain.Attempt) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	return insertAttempt(ctx, tx, a)
+}
+
+// UpdateRequestStatus moves a request through the §7.2 lifecycle outside an
+// open UnitOfWork (single-statement). Terminal transitions that must commit
+// with their effects (settled/released/reconciliation_required) have their
+// own transactional paths — this is for the dispatch markers.
+func (s *Store) UpdateRequestStatus(ctx context.Context, id string, status domain.RequestStatus, lastErr string) error {
+	return s.updateRequestStatus(ctx, s.db, id, status, lastErr)
+}
+
+// FinishAttempt marks an attempt's terminal state (completed | failed |
+// cancelled | unknown) with its error kind and the upstream request id when
+// known. errorKind is a short classifier (e.g. "http_429", "transport",
+// "payload") — never a raw upstream body.
+func (s *Store) FinishAttempt(ctx context.Context, id, status, errorKind, upstreamRequestID string, finishedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inference_attempts
+		 SET status = $2, error_kind = $3, upstream_request_id = $4, finished_at = $5
+		 WHERE id = $1`,
+		id, status, errorKind, upstreamRequestID, finishedAt.UTC())
+	if err != nil {
+		return mapError("finish attempt", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return mapError("finish attempt", sql.ErrNoRows)
+	}
+	return nil
+}
+
 // InsertUsageRecord persists one normalized metering fact.
 // UNIQUE(attempt_id, revision) is the usage-revision idempotency key.
 // Unknown usage stores NULL buckets — never zero (设计 §7.1).

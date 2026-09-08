@@ -46,6 +46,18 @@
 
 实施 Task 0 必须检查该分支的最新状态并登记复用方案。不得覆盖其他 worktree；不得重用已存在的 022/023 编号来表达不同 DDL。此次仅阅读，没有合并或挑选提交。
 
+### 2.1 Task 0 复用决定（2026-09-08 登记）
+
+详见 [基线报告](../../runbooks/kaya-coding-plan-baseline.md)。基线测试（`kaya-coding-plan` @ `299feeb`，一次性 PostgreSQL 实例）全部通过：vet/build、迁移幂等（applied=21 → skipped=21）、`-race -p 1` 套件总覆盖 83.2%、e2e 106.5s。
+
+`feat/multi-model-gateway`（HEAD `1d0281d`，未合入主线，24 个提交）：**定向复用，整分支不合入**。上表八条差距的逐条决定——改造后复用：第 1 条（`ParseCatalog`/`Validate` 改为环境变量兼容导入器的输入校验）、第 2 条（逻辑 ID 解析思路保留，单 Provider 引用改 ModelRoute 多部署）；拒绝继承：第 3–8 条（NULL 白名单全放行、写账失败只记日志、缺失 usage 记零、单笔用量事件当账本、float64 计价、随用户级联删除）。定向复用文件：`internal/llm/openai.go`（`BuildOpenAIPayload` 含 `stream_options.include_usage`、`UsageTracker` 增量 SSE 计量）、`anthropic.go`/`anthropic_stream.go`（请求/流式翻译与异常终止语义）、`keypool.go`（单实例冷却池起点）、`catalog.go`（校验逻辑），连同各自 `_test.go`；`handler/chat.go` 的 relay/deadline/审计截断机制与 `GET /chat/models` 返回形状作为 Kaya facade 契约基准。022 流水与 `/admin/stats/llm-usage` 不进入 inference 账本与正式统计。
+
+`feat/usage-analytics`（HEAD `3fdab4c`）：其树与 master `ec25565` 完全一致（已随 PR #17 squash 合入），属基线而非候选。Task 15 复用其 admin stats 参数校验与半开区间聚合查询模式；模型用量/成本统计数据源必须是 inference 账本，不得使用 `usage_events` 心跳表。
+
+**最终迁移序列**：master 已应用至 021；022/023 保留给 `feat/multi-model-gateway` 将来合入；inference 新迁移从 024 起追加——`024_inference_catalog` / `025_inference_accounts` / `026_inference_accounting`（Task 1）、`027_subscription_product_scope`（Task 2）、`028_operator_permissions`（Task 4）、`029_order_benefit_snapshot`（Task 10）、`030_inference_wallet`（Task 14）。编码前若候选分支先合入或有热修插入，按最新序号 +1 重新分配。
+
+**待业务方确认**：“OOS / SUM TO API” 暂按 OAuth/Sub2API 连接器假设推进（若实为 OSS 自托管，按 §1 声明不影响目录与账本）；Task 12 启动前必须取得结论。
+
 ## 3. 业务与模块边界
 
 先做模块化单体：同 Go 工程、同进程、同 PostgreSQL，新增 `internal/inference/`。现有 `internal/model/` 继续表示通用数据结构，不承担新业务模块的命名。

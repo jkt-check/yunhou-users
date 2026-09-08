@@ -48,16 +48,18 @@
 - Create: `docs/runbooks/kaya-coding-plan-baseline.md`。
 - Update: 本计划与设计中的复用结果、最终迁移序列。
 
-- [ ] 检查当前分支、工作区与目标分支最新提交，不触碰其他 worktree 的未完成工作。
-- [ ] 在隔离测试环境运行基线 build/vet/串行测试，记录实际结果；对失败在未修改基线上复现，不凭旧计划认定是预置失败。
-- [ ] Review 候选协议转换、增量 SSE usage、Key 池、旧 `/chat` 契约和覆盖范围。
-- [ ] 选择兼容适配器与测试的定向复用；避免直接引入“写账失败忽略、缺失用量记零、NULL 白名单全放行”的计费语义。
-- [ ] 如候选分支已经合入主线，则基于合入结果做增量改造；如未合入，记录选取的提交/文件及归属，避免后续双份实现。
-- [ ] 登记本地 `feat/usage-analytics`（检查时 HEAD `3fdab4c`，位于 `.worktrees/usage-analytics`）的统计/管理接口能力，评估与 Task 15 的重叠，决定复用或拒绝继承，避免第三份用量统计实现。
+- [x] 检查当前分支、工作区与目标分支最新提交，不触碰其他 worktree 的未完成工作。
+- [x] 在隔离测试环境运行基线 build/vet/串行测试，记录实际结果；对失败在未修改基线上复现，不凭旧计划认定是预置失败。
+- [x] Review 候选协议转换、增量 SSE usage、Key 池、旧 `/chat` 契约和覆盖范围。
+- [x] 选择兼容适配器与测试的定向复用；避免直接引入“写账失败忽略、缺失用量记零、NULL 白名单全放行”的计费语义。
+- [x] 如候选分支已经合入主线，则基于合入结果做增量改造；如未合入，记录选取的提交/文件及归属，避免后续双份实现。
+- [x] 登记本地 `feat/usage-analytics`（检查时 HEAD `3fdab4c`，位于 `.worktrees/usage-analytics`）的统计/管理接口能力，评估与 Task 15 的重叠，决定复用或拒绝继承，避免第三份用量统计实现。
 - [ ] 向业务方确认“OOS / SUM TO API”实际含义（OAuth/Sub2API 连接器或 OSS 自托管），结论写入基线报告；Task 12 启动前必须已有结论。
-- [ ] 检查迁移账本与分支编号。022/023 已在候选分支使用，新迁移按最新序号追加，不能修改曾应用的 SQL。计划中的 `NNN_*` 是占位名，编码前替换为唯一序号。
+- [x] 检查迁移账本与分支编号。022/023 已在候选分支使用，新迁移按最新序号追加，不能修改曾应用的 SQL。计划中的 `NNN_*` 是占位名，编码前替换为唯一序号。
 
 **验收**：基线报告列明具体 commit、可复用能力、拒绝继承的旧语义、测试结果和迁移顺序；没有未经核验的“已有实现足够计费”结论。
+
+**Task 0 结果（2026-09-08）**：基线报告见 [kaya-coding-plan-baseline.md](../../runbooks/kaya-coding-plan-baseline.md)。基线全绿（vet/build/迁移幂等/-race 套件 83.2% 覆盖/e2e 106.5s 均通过）。`feat/multi-model-gateway` 定向复用协议适配、增量 SSE usage、relay 机制；八条语义差距逐条决定，计费旧语义全部拒绝继承。`feat/usage-analytics` 内容与 master `ec25565` 树一致（已随 PR #17 合入），Task 15 复用其统计查询模式、不继承心跳数据源。迁移 022/023 保留给候选分支，inference 从 024 起。未完成项：仅“OOS / SUM TO API 向业务方确认”——本环境无法求证，当前按 OAuth/Sub2API 假设推进，Task 12 启动前必须闭环。
 
 ## Task 1：模块契约、类型与持久化骨架
 
@@ -410,3 +412,4 @@ go tool cover -func=coverage.out
 
 - 2026-09-08：创建并切换 `kaya-coding-plan`；完成设计及本计划，记录未合入网关分支的复用候选。未开始 Task 0–16 实施，未运行功能测试，未修改生产代码。
 - 2026-09-08：评审后补充——登记 `feat/usage-analytics` 复用候选；“OOS / SUM TO API” 术语澄清前置到 Task 0；未知用量恢复改为估算为主、核对例外；剩余额度不足预占上界时默认拒绝、不静默钳制；流式 usage 显式请求；修正 Task 14/15 的 `admin_adjustments.go` 归属重叠；Task 7 明确双进程并发测试编排要求。
+- 2026-09-08：完成 Task 0。实际修改：新增 `docs/runbooks/kaya-coding-plan-baseline.md`；勾选本计划 Task 0 已完成项（“OOS 术语向业务方确认”保持未勾选）；更新设计 §2 复用决定与迁移序列。验证：一次性 PostgreSQL 16.14 实例上 `go vet`/`go build` 通过、`cmd/migrate` 连跑两次幂等（applied=21 → applied=0 skipped=21）、`go test -race -p 1` 全套通过（总覆盖 83.2%）、`go test -race ./tests/e2e/...` 通过（106.5s）；候选分支 `internal/llm` 与 `ChatService` 测试在其 worktree 只读运行通过。遗留问题：OOS / SUM TO API 术语待业务方确认（Task 12 前置）；`feat/multi-model-gateway` 的 022/023 尚未合入主线，inference 迁移固定从 024 起。

@@ -264,6 +264,7 @@ func TestUserAPIKeys_LifecycleAndCrossCustomerMatrix(t *testing.T) {
 
 	// Cross-customer matrix: B cannot read, update or revoke A's key —
 	// every attempt is 404, indistinguishable from a missing key.
+	nonexistentID := uuid.NewString()
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/user/api-keys/" + keyID},
 		{http.MethodPatch, "/user/api-keys/" + keyID},
@@ -272,6 +273,24 @@ func TestUserAPIKeys_LifecycleAndCrossCustomerMatrix(t *testing.T) {
 		w := f.do(t, tc.method, tc.path, tokB, map[string]any{"name": "pwned"})
 		if w.Code != http.StatusNotFound {
 			t.Errorf("B %s %s: got %d, want 404 (%s)", tc.method, tc.path, w.Code, w.Body.String())
+		}
+		// Existence oracle guard: someone else's key ID and a never-created
+		// ID must produce byte-identical responses for the same caller —
+		// same status, same body (no "get api key by id: not found" vs
+		// "api key not found" split, no internal operation names).
+		wMissing := f.do(t, tc.method, "/user/api-keys/"+nonexistentID, tokB, map[string]any{"name": "pwned"})
+		if wMissing.Code != w.Code || wMissing.Body.String() != w.Body.String() {
+			t.Errorf("B %s: foreign-id and missing-id responses differ:\nforeign: %d %s\nmissing: %d %s",
+				tc.method, w.Code, w.Body.String(), wMissing.Code, wMissing.Body.String())
+		}
+		// The same indistinguishability holds for the owner querying a
+		// missing ID (owner has an account, exercising the third branch).
+		if tc.method == http.MethodGet {
+			wOwner := f.do(t, tc.method, "/user/api-keys/"+nonexistentID, tokA, nil)
+			if wOwner.Code != w.Code || wOwner.Body.String() != w.Body.String() {
+				t.Errorf("owner missing-id response differs from cross-customer:\nowner: %d %s\nforeign: %d %s",
+					wOwner.Code, wOwner.Body.String(), w.Code, w.Body.String())
+			}
 		}
 	}
 	// B's list does not contain A's key.

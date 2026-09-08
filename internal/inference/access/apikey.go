@@ -317,25 +317,35 @@ func (s *KeyService) RevokeKey(ctx context.Context, userID, keyID string) (chang
 }
 
 // ownedKey loads keyID and proves it belongs to the caller's account.
-// Cross-customer access is indistinguishable from a missing key (404).
+// Cross-customer access is indistinguishable from a missing key (404):
+// every NotFound path — unknown id, no account, foreign owner — returns
+// the SAME error value, so response bodies are byte-identical and leak
+// neither existence nor internal operation names.
 func (s *KeyService) ownedKey(ctx context.Context, userID, keyID string) (*domain.APIKey, error) {
 	key, err := s.store.GetAPIKeyByID(ctx, keyID)
 	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return nil, errAPIKeyNotFound
+		}
 		return nil, err
 	}
 	account, err := s.store.GetBillingAccountByUser(ctx, userID)
 	if err != nil {
 		// No account → cannot own any key.
 		if domain.CodeOf(err) == domain.CodeNotFound {
-			return nil, domain.NewError(domain.CodeNotFound, "api key not found")
+			return nil, errAPIKeyNotFound
 		}
 		return nil, err
 	}
 	if key.BillingAccountID != account.ID {
-		return nil, domain.NewError(domain.CodeNotFound, "api key not found")
+		return nil, errAPIKeyNotFound
 	}
 	return key, nil
 }
+
+// errAPIKeyNotFound is the single not-found value for every ownedKey
+// miss (shared instance: identical Code AND message by construction).
+var errAPIKeyNotFound = domain.NewError(domain.CodeNotFound, "api key not found")
 
 // checkModelScope verifies allow ⊆ union of the account's active
 // entitlement model sets at the current time.

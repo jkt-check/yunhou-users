@@ -341,9 +341,20 @@ func TestGetKey_CrossCustomerIs404(t *testing.T) {
 		t.Fatalf("CreateKey: %v", err)
 	}
 	// Customer B cannot read A's key; the error is indistinguishable from
-	// a missing key.
-	if _, err := svc.GetKey(ctx, "user-b", created.Key.ID); err == nil || domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("cross-customer read: want not_found, got %v", err)
+	// a missing key — identical Code AND identical message (existence
+	// oracle guard; the HTTP layer serializes err.Error() verbatim).
+	_, errForeign := svc.GetKey(ctx, "user-b", created.Key.ID)
+	if errForeign == nil || domain.CodeOf(errForeign) != domain.CodeNotFound {
+		t.Fatalf("cross-customer read: want not_found, got %v", errForeign)
+	}
+	_, errMissing := svc.GetKey(ctx, "user-b", uuid.NewString())
+	if errMissing == nil || errMissing.Error() != errForeign.Error() {
+		t.Fatalf("missing-id and foreign-id errors differ:\nmissing: %v\nforeign: %v", errMissing, errForeign)
+	}
+	// The owner querying a missing ID gets the same error value too.
+	_, errOwnerMissing := svc.GetKey(ctx, "user-a", uuid.NewString())
+	if errOwnerMissing == nil || errOwnerMissing.Error() != errForeign.Error() {
+		t.Fatalf("owner missing-id error differs:\nowner: %v\nforeign: %v", errOwnerMissing, errForeign)
 	}
 	if _, err := svc.GetKey(ctx, "user-a", created.Key.ID); err != nil {
 		t.Fatalf("owner read: %v", err)

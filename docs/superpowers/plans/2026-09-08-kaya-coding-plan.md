@@ -71,13 +71,13 @@
 - Modify: `migrations/README.md`、`internal/migrate/*_test.go`。
 - Test: `internal/inference/domain/*_test.go`、`internal/inference/postgres/*_test.go`。
 
-- [ ] 定义稳定公开模型 ID、部署/账号 ID、调用主体、价格版本、规范化用量与来源状态。
-- [ ] 定义 `CatalogReader`、`CredentialResolver`、`EntitlementResolver`、`ProviderAdapter`、`QuotaStore`、`SettlementStore` 和可注入时钟接口。
-- [ ] 定义事务边界：预占与结算 repo 必须共享同一 tx；不得隐藏调用另一个数据库连接。
-- [ ] 实现整数微额度、Decimal/有理数价格转换、溢出检查、取整与币种校验。
-- [ ] 按设计表组创建 schema、外键、请求/尝试/结算唯一键；数据字段及分页索引服务实际查询。
-- [ ] 核心字段用类型列和 CHECK；仅协议扩展配置使用带 schema 版本的 JSONB。
-- [ ] 迁移遵循仓库幂等约定，不自行写顶层 BEGIN/COMMIT；账本删除不使用用户级联删除。
+- [x] 定义稳定公开模型 ID、部署/账号 ID、调用主体、价格版本、规范化用量与来源状态。
+- [x] 定义 `CatalogReader`、`CredentialResolver`、`EntitlementResolver`、`ProviderAdapter`、`QuotaStore`、`SettlementStore` 和可注入时钟接口。
+- [x] 定义事务边界：预占与结算 repo 必须共享同一 tx；不得隐藏调用另一个数据库连接。
+- [x] 实现整数微额度、Decimal/有理数价格转换、溢出检查、取整与币种校验。
+- [x] 按设计表组创建 schema、外键、请求/尝试/结算唯一键；数据字段及分页索引服务实际查询。
+- [x] 核心字段用类型列和 CHECK；仅协议扩展配置使用带 schema 版本的 JSONB。
+- [x] 迁移遵循仓库幂等约定，不自行写顶层 BEGIN/COMMIT；账本删除不使用用户级联删除。
 
 **测试与验收**：全新数据库完整迁移与二次运行通过；金额舍入、极值、币种不符、重复唯一键和负数约束可验证；domain 不依赖 Gin 或跨域 service。
 
@@ -413,3 +413,4 @@ go tool cover -func=coverage.out
 - 2026-09-08：创建并切换 `kaya-coding-plan`；完成设计及本计划，记录未合入网关分支的复用候选。未开始 Task 0–16 实施，未运行功能测试，未修改生产代码。
 - 2026-09-08：评审后补充——登记 `feat/usage-analytics` 复用候选；“OOS / SUM TO API” 术语澄清前置到 Task 0；未知用量恢复改为估算为主、核对例外；剩余额度不足预占上界时默认拒绝、不静默钳制；流式 usage 显式请求；修正 Task 14/15 的 `admin_adjustments.go` 归属重叠；Task 7 明确双进程并发测试编排要求。
 - 2026-09-08：完成 Task 0。实际修改：新增 `docs/runbooks/kaya-coding-plan-baseline.md`；勾选本计划 Task 0 已完成项（“OOS 术语向业务方确认”保持未勾选）；更新设计 §2 复用决定与迁移序列。验证：一次性 PostgreSQL 16.14 实例上 `go vet`/`go build` 通过、`cmd/migrate` 连跑两次幂等（applied=21 → applied=0 skipped=21）、`go test -race -p 1` 全套通过（总覆盖 83.2%）、`go test -race ./tests/e2e/...` 通过（106.5s）；候选分支 `internal/llm` 与 `ChatService` 测试在其 worktree 只读运行通过。遗留问题：OOS / SUM TO API 术语待业务方确认（Task 12 前置）；`feat/multi-model-gateway` 的 022/023 尚未合入主线，inference 迁移固定从 024 起。
+- 2026-09-08：完成 Task 1。实际修改：新增 `internal/inference/domain/`（model/principal/usage/money/errors + 测试）与 `internal/inference/postgres/`（按表组 repo + 共享 UnitOfWork 事务 + 测试）、`migrations/024_inference_catalog.sql`/`025_inference_accounts.sql`/`026_inference_accounting.sql`、`internal/migrate/migrate_inference_test.go`；修改 `migrations/README.md` 与本计划 Task 1 复选框。验证（一次性 PostgreSQL 16.14，端口 55434 可丢弃库，报告见 `.superpowers/sdd/2026-09-08-kaya-coding-plan/task-1-report.md`）：`go vet`/`go build` 通过；`cmd/migrate` 全新库连跑两次幂等（applied=24 → applied=0 skipped=24）；`go test -race -p 1 ./internal/inference/... ./internal/migrate/...` 全 ok；全量 `./internal/... ./cmd/...` 全 ok；domain 包零跨域依赖（`go list -deps` 无 gin/service/model 等）。遗留问题：`migrate.Apply` 的 `pg_advisory_lock` 实为会话级锁（注释语义有误，现有测试模型不暴露；是否改 `pg_advisory_xact_lock` 待后续任务决定）；Key 预算周期重置语义留给 Task 7；OOS/SUM TO API 术语待业务方确认（Task 12 前置）。

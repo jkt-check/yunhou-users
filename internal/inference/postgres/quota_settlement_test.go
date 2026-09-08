@@ -1,0 +1,398 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+
+	"github.com/yunhou/users/internal/inference/domain"
+)
+
+// quota_settlement_test.go — 预占/释放/结算共享事务的行为验证（真实库）。
+
+// reserveCmd builds a full four-target hold (three windows + key budget).
+func reserveCmd(f fixture, w5, ww, wm string, amount domain.Microcredit) domain.ReserveCommand {
+	admitted := time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC)
+	return domain.ReserveCommand{
+		Request: domain.Request{
+			ID: uuid.NewString(), BillingAccountID: f.accountID, APIKeyID: &f.keyID,
+			EntitlementID: f.entID, ModelID: f.modelID,
+			Protocol: domain.ProtocolOpenAIChat, Stream: true,
+			PolicyVersionID: f.policyID,
+		},
+		AdmittedAt: admitted,
+		Holds: []domain.HoldSpec{
+			{TargetKind: domain.TargetWindowFiveHour, WindowID: &w5, Amount: amount},
+			{TargetKind: domain.TargetWindowWeekly, WindowID: &ww, Amount: amount},
+			{TargetKind: domain.TargetWindowMonthly, WindowID: &wm, Amount: amount},
+			{TargetKind: domain.TargetKeyBudget, APIKeyID: &f.keyID, Amount: amount},
+		},
+	}
+}
+
+func windowState(t *testing.T, s *Store, id string) (used, reserved domain.Microcredit) {
+	t.Helper()
+	var u, r int64
+	if err := s.db.QueryRow(
+		`SELECT used_micros, reserved_micros FROM inference_quota_windows WHERE id = $1`, id).
+		Scan(&u, &r); err != nil {
+		t.Fatalf("window state: %v", err)
+	}
+	return domain.Microcredit(u), domain.Microcredit(r)
+}
+
+func keyBudgetUsed(t *testing.T, s *Store, id string) domain.Microcredit {
+	t.Helper()
+	var v int64
+	if err := s.db.QueryRow(
+		`SELECT budget_used_micros FROM inference_api_keys WHERE id = $1`, id).Scan(&v); err != nil {
+		t.Fatalf("key budget: %v", err)
+	}
+	return domain.Microcredit(v)
+}
+
+func TestReserveAndSettleShareOneTransaction(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	// 预占与结算在同一个 UnitOfWork（同一个 *sqlx.Tx）。
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := reserveCmd(f, w5, ww, wm, 100_000)
+	adm, err := s.Reserve(ctx, uow, cmd)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if adm.RequestID != cmd.Request.ID || len(adm.Holds) != 4 {
+		t.Fatalf("admission = %+v, want 4 holds", adm)
+	}
+
+	attemptID := uuid.NewString()
+	att := &domain.Attempt{ID: attemptID, RequestID: adm.RequestID, AttemptNo: 1}
+	if err := insertAttempt(ctx, mustTx(t, uow), att); err != nil {
+		t.Fatalf("attempt: %v", err)
+	}
+
+	in, out := int64(800), int64(200)
+	cost, _ := domain.NewMoney(1234, "USD")
+	basis := domain.CostReported
+	err = s.Settle(ctx, uow, domain.SettleCommand{
+		RequestID: adm.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: adm.RequestID, AttemptID: attemptID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: 60_000,
+		AttemptID:    &attemptID,
+		AttemptCost:  &cost,
+		CostBasis:    &basis,
+		SettledAt:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// 三窗口 used 同额增加、reserved 归零（设计 §6: 一次消费同时增加三个
+	// 适用窗口的 used，客户只结算一次）。
+	for _, id := range []string{w5, ww, wm} {
+		used, reserved := windowState(t, s, id)
+		if used != 60_000 || reserved != 0 {
+			t.Errorf("window %s: used=%d reserved=%d, want 60000/0", id, used, reserved)
+		}
+	}
+	// Key 预算保持已消耗（预占时已计入）。
+	if got := keyBudgetUsed(t, s, f.keyID); got != 100_000 {
+		t.Errorf("key budget used = %d, want 100000", got)
+	}
+	// 请求终态与账本。
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqSettled || req.SettledMicros == nil || *req.SettledMicros != 60_000 {
+		t.Errorf("request = status %q settled %v, want settled/60000", req.Status, req.SettledMicros)
+	}
+	if req.UsageStatus != domain.UsageReported {
+		t.Errorf("usage_status = %q, want reported", req.UsageStatus)
+	}
+	if req.WindowFiveHourID == nil || *req.WindowFiveHourID != w5 {
+		t.Errorf("window binding lost: %+v", req.WindowFiveHourID)
+	}
+	var charges int
+	if err := s.db.Get(&charges,
+		`SELECT COUNT(*) FROM inference_ledger_entries
+		 WHERE request_id = $1 AND entry_type = 'charge'`, adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if charges != 1 {
+		t.Errorf("ledger charges = %d, want 1", charges)
+	}
+	var costBasis string
+	if err := s.db.Get(&costBasis,
+		`SELECT cost_basis FROM inference_attempts WHERE id = $1`, attemptID); err != nil {
+		t.Fatal(err)
+	}
+	if costBasis != string(domain.CostReported) {
+		t.Errorf("cost_basis = %q, want reported", costBasis)
+	}
+}
+
+func TestReserveRollbackLeavesNoPartialHolds(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000)); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// 预占后回滚：不得遗留任何部分占用（设计 §7.2）。
+	if err := uow.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	for _, id := range []string{w5, ww, wm} {
+		if used, reserved := windowState(t, s, id); used != 0 || reserved != 0 {
+			t.Errorf("window %s after rollback: used=%d reserved=%d, want 0/0", id, used, reserved)
+		}
+	}
+	if got := keyBudgetUsed(t, s, f.keyID); got != 0 {
+		t.Errorf("key budget after rollback = %d, want 0", got)
+	}
+	var reqCount int
+	if err := s.db.Get(&reqCount, `SELECT COUNT(*) FROM inference_requests`); err != nil {
+		t.Fatal(err)
+	}
+	if reqCount != 0 {
+		t.Errorf("requests after rollback = %d, want 0", reqCount)
+	}
+}
+
+func TestReserveFailsWhenAnyWindowLacksQuota(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+
+	// 五小时/周窗口充足；月窗口只剩 50k，预占 100k → 全部拒绝
+	// （不能只占五小时/周/Key）。
+	start := time.Date(2026, 9, 8, 3, 0, 0, 0, time.UTC)
+	mkWindow := func(kind domain.WindowKind, end time.Time, limit domain.Microcredit) string {
+		w := &domain.QuotaWindow{EntitlementID: f.entID, Kind: kind, Start: start, End: end, Limit: limit}
+		if err := s.InsertQuotaWindow(ctx, w); err != nil {
+			t.Fatalf("insert %s window: %v", kind, err)
+		}
+		return w.ID
+	}
+	w5 := mkWindow(domain.WindowFiveHour, start.Add(5*time.Hour), 1_000_000)
+	ww := mkWindow(domain.WindowWeekly, start.Add(7*24*time.Hour), 10_000_000)
+	tinyID := mkWindow(domain.WindowMonthly, start.AddDate(0, 1, 0), 50_000)
+
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Reserve(ctx, uow, reserveCmd(f, w5, ww, tinyID, 100_000))
+	var qe *domain.QuotaExceededError
+	if !errors.As(err, &qe) {
+		t.Fatalf("err = %v, want QuotaExceededError", err)
+	}
+	if len(qe.BlockedBy) != 1 || qe.BlockedBy[0].Kind != domain.WindowMonthly {
+		t.Errorf("blocked by %+v, want monthly window", qe.BlockedBy)
+	}
+	if err := uow.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 失败不遗留部分占用。
+	for _, id := range []string{w5, ww, tinyID} {
+		if used, reserved := windowState(t, s, id); used != 0 || reserved != 0 {
+			t.Errorf("window %s: used=%d reserved=%d, want 0/0", id, used, reserved)
+		}
+	}
+	if got := keyBudgetUsed(t, s, f.keyID); got != 0 {
+		t.Errorf("key budget = %d, want 0", got)
+	}
+}
+
+func TestReserveFailsOnKeyBudget(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	// Key 预算 5_000_000，预占 6_000_000 → KeyBudgetExhausted。
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 6_000_000))
+	var qe *domain.QuotaExceededError
+	if !errors.As(err, &qe) {
+		t.Fatalf("err = %v, want QuotaExceededError", err)
+	}
+	if !qe.KeyBudgetExhausted {
+		t.Errorf("KeyBudgetExhausted = false, want true")
+	}
+	_ = uow.Rollback(ctx)
+}
+
+func TestDuplicateSettleIsAConflict(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	in, out := int64(10), int64(5)
+	settle := func(uow domain.UnitOfWork) error {
+		return s.Settle(ctx, uow, domain.SettleCommand{
+			RequestID: adm.RequestID,
+			Usage: domain.UsageRecord{
+				RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+				Buckets:  domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+				RawUsage: domain.ExtensionConfig{SchemaVersion: 1},
+			},
+			ChargeMicros: 60_000, SettledAt: time.Now().UTC(),
+		})
+	}
+	if err := settle(uow); err != nil {
+		t.Fatalf("first settle: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// 结算唯一键：重复结算撞 UNIQUE(request_id) WHERE entry_type='charge'。
+	uow2, _ := s.Begin(ctx)
+	err = settle(uow2)
+	_ = uow2.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("second settle: err = %v, want CodeConflict", err)
+	}
+	// 账本仍只有一条 charge。
+	var charges int
+	if err := s.db.Get(&charges,
+		`SELECT COUNT(*) FROM inference_ledger_entries WHERE request_id = $1 AND entry_type='charge'`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if charges != 1 {
+		t.Errorf("charges = %d, want 1 (重复结算不生效)", charges)
+	}
+}
+
+func TestReleaseReturnsAllHolds(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 确认无上游消费 → 同事务释放全部预占。
+	uow2, _ := s.Begin(ctx)
+	if err := s.Release(ctx, uow2, adm.RequestID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{w5, ww, wm} {
+		if used, reserved := windowState(t, s, id); used != 0 || reserved != 0 {
+			t.Errorf("window %s after release: used=%d reserved=%d, want 0/0", id, used, reserved)
+		}
+	}
+	if got := keyBudgetUsed(t, s, f.keyID); got != 0 {
+		t.Errorf("key budget after release = %d, want 0", got)
+	}
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqReleased {
+		t.Errorf("status = %q, want released", req.Status)
+	}
+}
+
+func TestMarkReconciliationRequired(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().UTC().Add(24 * time.Hour)
+	uow2, _ := s.Begin(ctx)
+	if err := s.MarkReconciliationRequired(ctx, uow2, adm.RequestID, "unknown_usage", deadline); err != nil {
+		t.Fatalf("mark reconciliation: %v", err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqReconciliationRequired {
+		t.Errorf("status = %q, want reconciliation_required", req.Status)
+	}
+	var jobs int
+	if err := s.db.Get(&jobs,
+		`SELECT COUNT(*) FROM inference_reconciliation_jobs WHERE request_id = $1 AND status = 'pending'`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Errorf("reconciliation jobs = %d, want 1", jobs)
+	}
+	// 预占保留（禁止仅凭未知状态释放）。
+	if _, reserved := windowState(t, s, w5); reserved != 100_000 {
+		t.Errorf("five-hour reserved = %d, want 100000 (保留合理预占进入核对)", reserved)
+	}
+}
+
+// mustTx unwraps the shared tx for test-only direct writes.
+func mustTx(t *testing.T, w domain.UnitOfWork) *sqlx.Tx {
+	t.Helper()
+	tx, err := sqlTx(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tx
+}

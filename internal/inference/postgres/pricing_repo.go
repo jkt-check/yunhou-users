@@ -8,7 +8,9 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/quota"
 )
 
 // pricing_repo.go — 表组 inference_price_versions/policy_versions
@@ -69,24 +71,39 @@ func (s *Store) InsertPriceVersion(ctx context.Context, p *PriceVersion) error {
 	return mapError("insert price version", err)
 }
 
+// priceVersionRow is the storage row of inference_price_versions.
+type priceVersionRow struct {
+	ID         string          `db:"id"`
+	ModelID    string          `db:"model_id"`
+	Kind       string          `db:"kind"`
+	Unit       string          `db:"unit"`
+	Currency   sql.NullString  `db:"currency"`
+	Input      int64           `db:"input_micros_per_mtok"`
+	CacheRead  int64           `db:"cache_read_micros_per_mtok"`
+	CacheWrite int64           `db:"cache_write_micros_per_mtok"`
+	Output     int64           `db:"output_micros_per_mtok"`
+	Extra      json.RawMessage `db:"extra_rates"`
+	Revision   int             `db:"revision"`
+	From       time.Time       `db:"effective_from"`
+	To         *time.Time      `db:"effective_to"`
+	CreatedAt  time.Time       `db:"created_at"`
+}
+
+func (r priceVersionRow) toPriceVersion() *PriceVersion {
+	return &PriceVersion{
+		ID: r.ID, ModelID: r.ModelID, Kind: r.Kind, Unit: r.Unit,
+		Currency:     stringFromNull(r.Currency),
+		InputPerMtok: r.Input, CacheReadPerMtok: r.CacheRead,
+		CacheWritePerMtok: r.CacheWrite, OutputPerMtok: r.Output,
+		ExtraRates: domain.ExtensionConfig{SchemaVersion: 1, Raw: r.Extra},
+		Revision:   r.Revision, EffectiveFrom: r.From, EffectiveTo: r.To,
+		CreatedAt: r.CreatedAt,
+	}
+}
+
 // LatestPriceVersion returns the revision effective at `at`.
 func (s *Store) LatestPriceVersion(ctx context.Context, modelID, kind string, at time.Time) (*PriceVersion, error) {
-	var row struct {
-		ID         string          `db:"id"`
-		ModelID    string          `db:"model_id"`
-		Kind       string          `db:"kind"`
-		Unit       string          `db:"unit"`
-		Currency   sql.NullString  `db:"currency"`
-		Input      int64           `db:"input_micros_per_mtok"`
-		CacheRead  int64           `db:"cache_read_micros_per_mtok"`
-		CacheWrite int64           `db:"cache_write_micros_per_mtok"`
-		Output     int64           `db:"output_micros_per_mtok"`
-		Extra      json.RawMessage `db:"extra_rates"`
-		Revision   int             `db:"revision"`
-		From       time.Time       `db:"effective_from"`
-		To         *time.Time      `db:"effective_to"`
-		CreatedAt  time.Time       `db:"created_at"`
-	}
+	var row priceVersionRow
 	err := s.db.GetContext(ctx, &row,
 		`SELECT * FROM inference_price_versions
 		 WHERE model_id = $1 AND kind = $2
@@ -95,14 +112,56 @@ func (s *Store) LatestPriceVersion(ctx context.Context, modelID, kind string, at
 	if err != nil {
 		return nil, mapError("latest price version", err)
 	}
-	return &PriceVersion{
-		ID: row.ID, ModelID: row.ModelID, Kind: row.Kind, Unit: row.Unit,
-		Currency:     stringFromNull(row.Currency),
-		InputPerMtok: row.Input, CacheReadPerMtok: row.CacheRead,
-		CacheWritePerMtok: row.CacheWrite, OutputPerMtok: row.Output,
-		ExtraRates: domain.ExtensionConfig{SchemaVersion: 1, Raw: row.Extra},
-		Revision:   row.Revision, EffectiveFrom: row.From, EffectiveTo: row.To,
-		CreatedAt: row.CreatedAt,
+	return row.toPriceVersion(), nil
+}
+
+// GetPriceVersion loads one immutable revision by id. A settled request's
+// PINNED version never changes when new prices publish — old requests still
+// settle by the old version (设计 §7.1: 运营修改价格只影响生效后的请求).
+func (s *Store) GetPriceVersion(ctx context.Context, id string) (*PriceVersion, error) {
+	var row priceVersionRow
+	err := s.db.GetContext(ctx, &row,
+		`SELECT * FROM inference_price_versions WHERE id = $1`, id)
+	if err != nil {
+		return nil, mapError("get price version", err)
+	}
+	return row.toPriceVersion(), nil
+}
+
+// Pure converts the stored row into the accounting rule shape: per-million
+// storage rates become exact rationals, extra_rates decode through the
+// schema-versioned contract. Rounding direction and token normalization
+// stay owned by the accounting package.
+func (p *PriceVersion) Pure() (accounting.PriceVersion, error) {
+	rate := func(microsPerMtok int64) (domain.Rate, error) {
+		return domain.RatePerMillion(microsPerMtok)
+	}
+	input, err := rate(p.InputPerMtok)
+	if err != nil {
+		return accounting.PriceVersion{}, err
+	}
+	cacheRead, err := rate(p.CacheReadPerMtok)
+	if err != nil {
+		return accounting.PriceVersion{}, err
+	}
+	cacheWrite, err := rate(p.CacheWritePerMtok)
+	if err != nil {
+		return accounting.PriceVersion{}, err
+	}
+	output, err := rate(p.OutputPerMtok)
+	if err != nil {
+		return accounting.PriceVersion{}, err
+	}
+	extras, err := accounting.DecodeExtraRates(p.ExtraRates.Raw)
+	if err != nil {
+		return accounting.PriceVersion{}, err
+	}
+	return accounting.PriceVersion{
+		ID: p.ID, ModelID: p.ModelID, Kind: accounting.PriceKind(p.Kind),
+		Currency: p.Currency,
+		Input:    input, CacheRead: cacheRead, CacheWrite: cacheWrite, Output: output,
+		ExtraRates: extras,
+		Revision:   p.Revision, EffectiveFrom: p.EffectiveFrom, EffectiveTo: p.EffectiveTo,
 	}, nil
 }
 
@@ -185,6 +244,19 @@ func (s *Store) GetPolicyVersion(ctx context.Context, id string) (*PolicyVersion
 		OveragePolicy:    row.Overage, Status: row.Status,
 		CreatedAt: row.CreatedAt, PublishedAt: row.Published,
 	}, nil
+}
+
+// Pure converts the stored policy revision into the quota rule shape
+// (disabled windows stay nil — never unlimited).
+func (p *PolicyVersion) Pure() quota.Policy {
+	return quota.Policy{
+		Name: p.Name, Revision: p.Revision, ModelIDs: p.ModelIDs,
+		FiveHourLimit: p.FiveHourLimit, WeeklyLimit: p.WeeklyLimit,
+		MonthlyLimit: p.MonthlyLimit,
+		RPMLimit:     p.RPMLimit, TPMLimit: p.TPMLimit,
+		ConcurrencyLimit: p.ConcurrencyLimit,
+		Overage:          quota.OveragePolicy(p.OveragePolicy),
+	}
 }
 
 func stringFromNull(s sql.NullString) string {

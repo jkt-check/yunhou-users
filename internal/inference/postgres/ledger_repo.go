@@ -39,19 +39,23 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	}
 
 	// 2. Ledger charge. The partial unique index on (request_id) WHERE
-	// entry_type='charge' makes a duplicate settlement a conflict.
+	// entry_type='charge' makes a duplicate settlement a conflict. The
+	// charge carries the request's PINNED price version (locked FOR UPDATE
+	// from the request row, never caller-supplied) so a later price change
+	// can never rewrite which version settled this request (设计 §7.1).
 	if cmd.ChargeMicros > 0 {
 		var accountID string
+		var priceVersionID *string
 		if err := tx.QueryRowxContext(ctx,
-			`SELECT billing_account_id FROM inference_requests WHERE id = $1 FOR UPDATE`,
-			cmd.RequestID).Scan(&accountID); err != nil {
+			`SELECT billing_account_id, price_version_id FROM inference_requests WHERE id = $1 FOR UPDATE`,
+			cmd.RequestID).Scan(&accountID, &priceVersionID); err != nil {
 			return mapError("settle: lock request", err)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO inference_ledger_entries
-			 (billing_account_id, request_id, entry_type, amount_micros, unit)
-			 VALUES ($1,$2,'charge',$3,'microcredit')`,
-			accountID, cmd.RequestID, int64(cmd.ChargeMicros)); err != nil {
+			 (billing_account_id, request_id, entry_type, amount_micros, unit, price_version_id)
+			 VALUES ($1,$2,'charge',$3,'microcredit',$4)`,
+			accountID, cmd.RequestID, int64(cmd.ChargeMicros), priceVersionID); err != nil {
 			return mapError("settle: ledger charge", err)
 		}
 	}

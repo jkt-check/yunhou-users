@@ -134,6 +134,25 @@ func (e *Entitlement) AllowsModel(modelID string) bool {
 	return false
 }
 
+// EntitlementPatch is the in-place revision payload for upgrade/renewal
+// (设计 §4.2/§6). Revision bumps by exactly one; ID, anchor and account
+// NEVER change — the entitlement stays the same consumption subject, and
+// because quota windows key on entitlement ID, their used/reserved carry
+// over (更新限额不清空 used/reserved；不能通过新 policy ID 获得全新空窗口).
+type EntitlementPatch struct {
+	// ExpectedRevision is the optimistic-lock guard: the writer must have
+	// read this revision; a stale writer conflicts.
+	ExpectedRevision int
+	// PolicyVersionID, when non-nil, replaces the quota policy version.
+	PolicyVersionID *string
+	// ModelIDs, when non-nil, replaces the explicit model set (an empty
+	// non-nil slice grants NO models — never NULL-means-all).
+	ModelIDs []string
+	// EffectiveTo, when non-nil, extends the effective range (续费延长
+	// 有效期，不提前重置窗口).
+	EffectiveTo *time.Time
+}
+
 // UpstreamAccountStatus is the account state machine of 设计 §8.
 type UpstreamAccountStatus string
 

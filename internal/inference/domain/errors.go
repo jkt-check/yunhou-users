@@ -22,7 +22,10 @@ const (
 	CodeNotFound             Code = "not_found"
 	CodeConflict             Code = "conflict"
 	CodeInsufficientCapacity Code = "insufficient_capacity"
-	CodeInternal             Code = "internal"
+	// CodeUnpricedCapability rejects a chargeable capability that has no
+	// effective price version (设计 §7.1/Task 6: 拒绝未定价且需扣费的能力).
+	CodeUnpricedCapability Code = "unpriced_capability"
+	CodeInternal           Code = "internal"
 )
 
 // Error is the domain error: a stable Code plus a human-readable message.

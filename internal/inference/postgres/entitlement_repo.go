@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/lib/pq"
@@ -62,6 +64,48 @@ func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) er
 		e.Revision, e.Stackable, status).
 		Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
 	return mapError("insert entitlement", err)
+}
+
+// ReviseEntitlement applies an in-place revision computed by the pure rules
+// (access.Upgrade / access.Renew). The entitlement ID — the consumption
+// subject the quota windows key on — and the original anchor NEVER change,
+// so accumulated used/reserved carry over (设计 §4.2/§6: 更新限额不清空
+// used/reserved；续费不提前重置窗口). Optimistic on ExpectedRevision: a
+// stale writer (or a non-active entitlement) conflicts.
+func (s *Store) ReviseEntitlement(ctx context.Context, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error) {
+	var row entitlementRow
+	err := s.db.GetContext(ctx, &row,
+		`UPDATE inference_entitlements
+		 SET revision = revision + 1, updated_at = now(),
+		     policy_version_id = COALESCE($2, policy_version_id),
+		     model_ids = COALESCE($3::text[], model_ids),
+		     effective_to = COALESCE($4, effective_to)
+		 WHERE id = $1 AND revision = $5 AND status = 'active'
+		 RETURNING *`,
+		id, patch.PolicyVersionID, patchStrArr(patch.ModelIDs), patch.EffectiveTo,
+		patch.ExpectedRevision)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			var exists bool
+			if qerr := s.db.GetContext(ctx, &exists,
+				`SELECT EXISTS(SELECT 1 FROM inference_entitlements WHERE id = $1)`, id); qerr == nil && exists {
+				return nil, domain.NewError(domain.CodeConflict,
+					"revise entitlement: stale revision or entitlement not active")
+			}
+		}
+		return nil, mapError("revise entitlement", err)
+	}
+	return row.toDomain(), nil
+}
+
+// patchStrArr encodes a patch model set: nil means "keep the current set"
+// (SQL NULL → COALESCE keeps), a non-nil slice replaces it — including the
+// empty slice, which grants NO models (never NULL-means-all).
+func patchStrArr(s []string) interface{} {
+	if s == nil {
+		return nil
+	}
+	return pq.Array(s)
 }
 
 // GetEntitlement loads one entitlement by id.

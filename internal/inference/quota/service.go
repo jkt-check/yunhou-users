@@ -243,6 +243,13 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	if pv := cmd.CreditPrice.ID; pv != "" {
 		req.PriceVersionID = &pv
 	}
+	// Persist the admission bounds with the request (Task 9, migration 031):
+	// crash recovery settles the conservative estimate (= the safe upper
+	// bound these bounds price to) from the ROW, auditable and correctable —
+	// never zero-by-TTL.
+	req.InputBoundTokens = &inputBound
+	req.OutputCapTokens = &outputCap
+	req.ExtraBounds = cmd.ExtraBounds
 	holds := make([]domain.HoldSpec, 0, len(windows)+1)
 	windowIDs := make(map[domain.WindowKind]string, len(windows))
 	for _, w := range windows {

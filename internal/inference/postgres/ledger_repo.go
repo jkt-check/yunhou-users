@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,10 +11,12 @@ import (
 )
 
 // ledger_repo.go — 表组 inference_ledger_entries/adjustments
-// (migration 026) + domain.SettlementStore 实现。
+// (migration 026 + 031) + domain.SettlementStore 实现。
 //
 // 账本规则（设计 §7.3）：追加 + 冲正，不 UPDATE 已结算分录；同一请求
-// 至多一条 charge（部分唯一索引），重复结算 → CodeConflict。
+// 至多一条 charge（部分唯一索引），重复结算 → CodeConflict。Task 9 起零
+// 消费结算也落 charge 行（amount=0，migration 031 放宽 CHECK）：唯一键
+// 统一保护全部结算投递，"已结算(0)"与"未结算"在账本层可区分。
 
 // Settle implements domain.SettlementStore. One transaction does all of
 // (设计 §7.2):
@@ -59,16 +62,17 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		return err
 	}
 
-	// 3. Ledger charge. The partial unique index on (request_id) WHERE
-	// entry_type='charge' makes a duplicate settlement a conflict.
-	if cmd.ChargeMicros > 0 {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO inference_ledger_entries
-			 (billing_account_id, request_id, entry_type, amount_micros, unit, price_version_id)
-			 VALUES ($1,$2,'charge',$3,'microcredit',$4)`,
-			accountID, cmd.RequestID, int64(cmd.ChargeMicros), priceVersionID); err != nil {
-			return mapError("settle: ledger charge", err)
-		}
+	// 3. Ledger charge — ALWAYS appended, including a zero charge (Task 9 /
+	// migration 031): the partial unique index on (request_id) WHERE
+	// entry_type='charge' then guards EVERY settlement delivery uniformly
+	// (duplicate → conflict), and "已结算(0)" is distinguishable from
+	// "未结算" at the ledger level — a zero row never affects window sums.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO inference_ledger_entries
+		 (billing_account_id, request_id, entry_type, amount_micros, unit, price_version_id)
+		 VALUES ($1,$2,'charge',$3,'microcredit',$4)`,
+		accountID, cmd.RequestID, int64(cmd.ChargeMicros), priceVersionID); err != nil {
+		return mapError("settle: ledger charge", err)
 	}
 
 	// 4. Convert held reservations → used/settled, fixed lock order.
@@ -156,14 +160,25 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 
 // MarkReconciliationRequired implements domain.SettlementStore: parks the
 // request in the reconciliation queue with a recovery deadline (设计 §7.2:
-// 恢复时限、告警；禁止仅凭 TTL 释放全部预占).
+// 恢复时限、告警；禁止仅凭 TTL 释放全部预占). Task 9: parking also marks
+// usage_status='unknown' — a parked request has NO persisted metering fact
+// (usage records only ever commit inside Settle), so unknown is the honest
+// ledger-level state until recovery settles or corrects it.
 func (s *Store) MarkReconciliationRequired(ctx context.Context, w domain.UnitOfWork, requestID string, reason string, deadline time.Time) error {
 	tx, err := sqlTx(w)
 	if err != nil {
 		return err
 	}
-	if err := s.updateRequestStatus(ctx, tx, requestID, domain.ReqReconciliationRequired, reason); err != nil {
-		return err
+	res, err := tx.ExecContext(ctx,
+		`UPDATE inference_requests
+		 SET status = $2, usage_status = 'unknown', last_error = $3, updated_at = now()
+		 WHERE id = $1`,
+		requestID, string(domain.ReqReconciliationRequired), reason)
+	if err != nil {
+		return mapError("mark reconciliation", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return mapError("mark reconciliation", sql.ErrNoRows)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO inference_reconciliation_jobs (id, request_id, reason, deadline_at)

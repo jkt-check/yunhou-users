@@ -67,7 +67,28 @@ func (s *Store) Release(ctx context.Context, w domain.UnitOfWork, requestID stri
 	if err != nil {
 		return err
 	}
+	return s.releaseLocked(ctx, tx, w, requestID, false)
+}
 
+// ReleaseFromReconciliation releases a PARKED (reconciliation_required)
+// request — only the recovery worker calls it, and only with PROOF of zero
+// upstream consumption (every attempt failed pre-execution; Task 9 分类
+// "未发送/全尝试确认零消费"). This is evidence-driven, never TTL-driven:
+// the guard that keeps Release away from unknown-state requests stays
+// intact. The request's open reconciliation job resolves in the same
+// transaction (无"已释放但任务悬挂"窗口).
+func (s *Store) ReleaseFromReconciliation(ctx context.Context, w domain.UnitOfWork, requestID string) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	return s.releaseLocked(ctx, tx, w, requestID, true)
+}
+
+// releaseLocked is the shared release core. fromReconciliation admits the
+// reconciliation_required state (evidence-driven recovery release) and
+// resolves the open job in the same tx.
+func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfWork, requestID string, fromReconciliation bool) error {
 	// Locate the owner account, then lock in the fixed order.
 	var accountID, status string
 	if err := tx.QueryRowxContext(ctx,
@@ -79,16 +100,22 @@ func (s *Store) Release(ctx context.Context, w domain.UnitOfWork, requestID stri
 		return err
 	}
 	// Re-read the request under the account lock and take the request row
-	// lock; a terminal or reconciling request must not be released.
+	// lock; a terminal or reconciling request must not be released — unless
+	// the caller is the evidence-driven recovery path.
 	if err := tx.QueryRowxContext(ctx,
 		`SELECT status FROM inference_requests WHERE id = $1 FOR UPDATE`,
 		requestID).Scan(&status); err != nil {
 		return mapError("release: lock request", err)
 	}
 	switch domain.RequestStatus(status) {
-	case domain.ReqSettled, domain.ReqReleased, domain.ReqReconciliationRequired:
+	case domain.ReqSettled, domain.ReqReleased:
 		return domain.NewError(domain.CodeConflict,
-			"release: request already finalized or in reconciliation ("+status+")")
+			"release: request already finalized ("+status+")")
+	case domain.ReqReconciliationRequired:
+		if !fromReconciliation {
+			return domain.NewError(domain.CodeConflict,
+				"release: request in reconciliation (禁止仅凭 TTL/未知状态释放)")
+		}
 	}
 
 	rows, err := loadHeldReservations(ctx, tx, requestID)
@@ -145,6 +172,16 @@ func (s *Store) Release(ctx context.Context, w domain.UnitOfWork, requestID stri
 	if fiveHourWindow != nil {
 		if err := voidUnusedFiveHourWindow(ctx, tx, *fiveHourWindow); err != nil {
 			return err
+		}
+	}
+	if fromReconciliation {
+		// Evidence-driven release resolves the open job atomically.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE inference_reconciliation_jobs
+			 SET status = 'resolved', resolved_at = now(), updated_at = now(),
+			     detail = detail || '{"schema_version":1,"resolution":"zero consumption proven by attempt evidence"}'::jsonb
+			 WHERE request_id = $1 AND status IN ('pending','running')`, requestID); err != nil {
+			return mapError("release: resolve reconciliation job", err)
 		}
 	}
 	if err := s.updateRequestStatus(ctx, tx, requestID, domain.ReqReleased, ""); err != nil {

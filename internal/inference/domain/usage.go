@@ -206,10 +206,15 @@ type Request struct {
 	ReservedMicros *Microcredit
 	SettledMicros  *Microcredit
 	UsageStatus    UsageSource
-	LastError      string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	CompletedAt    *time.Time
+	// InputBoundTokens/OutputCapTokens/ExtraBounds 是准入时的安全上界
+	// （Task 9, migration 031）：崩溃恢复的保守估算以此入账，可审计、可冲正。
+	InputBoundTokens *int64
+	OutputCapTokens  *int64
+	ExtraBounds      map[string]int64
+	LastError        string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	CompletedAt      *time.Time
 }
 
 // LedgerEntry is one append-only ledger fact (设计 §7.3: 追加 + 冲正，

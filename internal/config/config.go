@@ -193,6 +193,15 @@ type Config struct {
 	// applies when the client sends no model (旧无 model 默认). Required
 	// when InferenceKayaChatGateway is on.
 	KayaChatModel string
+
+	// Settlement recovery worker (Task 9): pass interval, per-pass batch
+	// cap, staleness grace (must exceed the 15s settlement deadline so live
+	// requests are never swept), and the reconciliation evidence window.
+	// Defaults: 30s / 100 / 60s / 24h.
+	InferenceRecoveryInterval       time.Duration
+	InferenceRecoveryBatch          int
+	InferenceRecoveryGrace          time.Duration
+	InferenceReconciliationDeadline time.Duration
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -248,6 +257,11 @@ func Load() *Config {
 		InferenceAccountRPM:        parseIntOr(envOr("INFERENCE_ACCOUNT_RPM", "120"), 120),
 		InferenceKayaChatGateway:   os.Getenv("INFERENCE_KAYA_CHAT_GATEWAY") == "1",
 		KayaChatModel:              os.Getenv("KAYA_CHAT_MODEL"),
+
+		InferenceRecoveryInterval:       parseDurationOr(envOr("INFERENCE_RECOVERY_INTERVAL", "30s"), 30*time.Second),
+		InferenceRecoveryBatch:          parseIntOr(envOr("INFERENCE_RECOVERY_BATCH", "100"), 100),
+		InferenceRecoveryGrace:          parseDurationOr(envOr("INFERENCE_RECOVERY_GRACE", "60s"), 60*time.Second),
+		InferenceReconciliationDeadline: parseDurationOr(envOr("INFERENCE_RECONCILIATION_DEADLINE", "24h"), 24*time.Hour),
 	}
 }
 

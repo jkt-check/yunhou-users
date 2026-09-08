@@ -15,7 +15,10 @@ import (
 
 // InsertRequest persists a logical request. The ID is caller-generated
 // (the gateway mints it after auth); a duplicate ID is a conflict — this
-// is the request-level idempotency key (设计 §7.2).
+// is the request-level idempotency key (设计 §7.2). The admission bounds
+// (input/output caps and extra billable-item bounds, migration 031) persist
+// with the row: they are the audit basis of the crash-recovery conservative
+// estimate (Task 9).
 func insertRequest(ctx context.Context, ex sqlxExecutor, r *domain.Request) error {
 	status := string(r.Status)
 	if status == "" {
@@ -25,18 +28,63 @@ func insertRequest(ctx context.Context, ex sqlxExecutor, r *domain.Request) erro
 	if usageStatus == "" {
 		usageStatus = string(domain.UsagePending)
 	}
-	_, err := ex.ExecContext(ctx,
+	extraBounds, err := encodeExtraBounds(r.ExtraBounds)
+	if err != nil {
+		return err
+	}
+	_, err = ex.ExecContext(ctx,
 		`INSERT INTO inference_requests
 		 (id, billing_account_id, api_key_id, entitlement_id, model_id,
 		  protocol, stream, status, admitted_at, price_version_id, policy_version_id,
 		  window_five_hour_id, window_weekly_id, window_monthly_id,
-		  reserved_micros, usage_status)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+		  reserved_micros, usage_status,
+		  input_bound_tokens, output_cap_tokens, extra_bounds)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		r.ID, r.BillingAccountID, strPtr(r.APIKeyID), r.EntitlementID, r.ModelID,
 		string(r.Protocol), r.Stream, status, r.AdmittedAt, strPtr(r.PriceVersionID), r.PolicyVersionID,
 		strPtr(r.WindowFiveHourID), strPtr(r.WindowWeeklyID), strPtr(r.WindowMonthlyID),
-		microPtr(r.ReservedMicros), usageStatus)
+		microPtr(r.ReservedMicros), usageStatus,
+		r.InputBoundTokens, r.OutputCapTokens, extraBounds)
 	return mapError("insert request", err)
+}
+
+// extraBoundsDoc is the schema-versioned storage shape of
+// inference_requests.extra_bounds: upper bounds of other billable items.
+type extraBoundsDoc struct {
+	SchemaVersion int              `json:"schema_version"`
+	Bounds        map[string]int64 `json:"bounds"`
+}
+
+func encodeExtraBounds(bounds map[string]int64) (json.RawMessage, error) {
+	doc := extraBoundsDoc{SchemaVersion: 1, Bounds: bounds}
+	if doc.Bounds == nil {
+		doc.Bounds = map[string]int64{}
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeInvalidInput, "insert request: encode extra bounds", err)
+	}
+	return raw, nil
+}
+
+// decodeExtraBounds parses the schema-versioned bounds document; only
+// schema_version 1 is understood.
+func decodeExtraBounds(raw json.RawMessage) (map[string]int64, error) {
+	out := make(map[string]int64)
+	if len(raw) == 0 {
+		return out, nil
+	}
+	var doc extraBoundsDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, domain.WrapError(domain.CodeInvalidInput, "request: decode extra_bounds", err)
+	}
+	if doc.SchemaVersion != 1 {
+		return nil, domain.NewError(domain.CodeInvalidInput, "request: unsupported extra_bounds schema_version")
+	}
+	for k, v := range doc.Bounds {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // InsertRequest inserts outside an open UnitOfWork (single-statement).
@@ -62,31 +110,38 @@ func (s *Store) updateRequestStatus(ctx context.Context, ex sqlxExecutor, id str
 // GetRequest loads one logical request.
 func (s *Store) GetRequest(ctx context.Context, id string) (*domain.Request, error) {
 	var row struct {
-		ID            string         `db:"id"`
-		AccountID     string         `db:"billing_account_id"`
-		APIKeyID      sql.NullString `db:"api_key_id"`
-		EntitlementID string         `db:"entitlement_id"`
-		ModelID       string         `db:"model_id"`
-		Protocol      string         `db:"protocol"`
-		Stream        bool           `db:"stream"`
-		Status        string         `db:"status"`
-		AdmittedAt    *time.Time     `db:"admitted_at"`
-		PriceID       sql.NullString `db:"price_version_id"`
-		PolicyID      string         `db:"policy_version_id"`
-		Win5h         sql.NullString `db:"window_five_hour_id"`
-		WinW          sql.NullString `db:"window_weekly_id"`
-		WinM          sql.NullString `db:"window_monthly_id"`
-		Reserved      sql.NullInt64  `db:"reserved_micros"`
-		Settled       sql.NullInt64  `db:"settled_micros"`
-		UsageStatus   string         `db:"usage_status"`
-		LastError     string         `db:"last_error"`
-		CreatedAt     time.Time      `db:"created_at"`
-		UpdatedAt     time.Time      `db:"updated_at"`
-		CompletedAt   *time.Time     `db:"completed_at"`
+		ID            string          `db:"id"`
+		AccountID     string          `db:"billing_account_id"`
+		APIKeyID      sql.NullString  `db:"api_key_id"`
+		EntitlementID string          `db:"entitlement_id"`
+		ModelID       string          `db:"model_id"`
+		Protocol      string          `db:"protocol"`
+		Stream        bool            `db:"stream"`
+		Status        string          `db:"status"`
+		AdmittedAt    *time.Time      `db:"admitted_at"`
+		PriceID       sql.NullString  `db:"price_version_id"`
+		PolicyID      string          `db:"policy_version_id"`
+		Win5h         sql.NullString  `db:"window_five_hour_id"`
+		WinW          sql.NullString  `db:"window_weekly_id"`
+		WinM          sql.NullString  `db:"window_monthly_id"`
+		Reserved      sql.NullInt64   `db:"reserved_micros"`
+		Settled       sql.NullInt64   `db:"settled_micros"`
+		UsageStatus   string          `db:"usage_status"`
+		InputBound    *int64          `db:"input_bound_tokens"`
+		OutputCap     *int64          `db:"output_cap_tokens"`
+		ExtraBounds   json.RawMessage `db:"extra_bounds"`
+		LastError     string          `db:"last_error"`
+		CreatedAt     time.Time       `db:"created_at"`
+		UpdatedAt     time.Time       `db:"updated_at"`
+		CompletedAt   *time.Time      `db:"completed_at"`
 	}
 	err := s.db.GetContext(ctx, &row, `SELECT * FROM inference_requests WHERE id = $1`, id)
 	if err != nil {
 		return nil, mapError("get request", err)
+	}
+	bounds, err := decodeExtraBounds(row.ExtraBounds)
+	if err != nil {
+		return nil, err
 	}
 	return &domain.Request{
 		ID: row.ID, BillingAccountID: row.AccountID,
@@ -97,7 +152,9 @@ func (s *Store) GetRequest(ctx context.Context, id string) (*domain.Request, err
 		WindowFiveHourID: strFromNull(row.Win5h), WindowWeeklyID: strFromNull(row.WinW),
 		WindowMonthlyID: strFromNull(row.WinM),
 		ReservedMicros:  microFromNull(row.Reserved), SettledMicros: microFromNull(row.Settled),
-		UsageStatus: domain.UsageSource(row.UsageStatus), LastError: row.LastError,
+		UsageStatus:      domain.UsageSource(row.UsageStatus),
+		InputBoundTokens: row.InputBound, OutputCapTokens: row.OutputCap, ExtraBounds: bounds,
+		LastError: row.LastError,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, CompletedAt: row.CompletedAt,
 	}, nil
 }

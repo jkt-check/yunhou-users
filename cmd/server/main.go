@@ -31,6 +31,7 @@ import (
 	inferenceproviders "github.com/yunhou/users/internal/inference/providers"
 	inferencequota "github.com/yunhou/users/internal/inference/quota"
 	inferencerouting "github.com/yunhou/users/internal/inference/routing"
+	inferenceworkers "github.com/yunhou/users/internal/inference/workers"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -372,6 +373,21 @@ func main() {
 	defer cancel()
 
 	sweeper.Start(rootCtx)
+
+	// Task 9: settlement recovery worker — crash recovery for stranded
+	// in-flight requests (conservative-estimate settlement = reserved hold,
+	// reconciliation queue, deadline escalation, ledger/window rebuild
+	// check). Never zeroes unknown usage, never releases by TTL alone, never
+	// double-charges (guarded transitions + unique keys). The verifier is
+	// nil: mainstream Chat/Messages upstreams have no per-request execution
+	// query API (设计 §7.2 补充段), so recovery always estimates.
+	recoveryWorker := inferenceworkers.NewSettlementRecovery(infStore, nil, inferenceworkers.RecoveryConfig{
+		Interval:               cfg.InferenceRecoveryInterval,
+		BatchLimit:             cfg.InferenceRecoveryBatch,
+		Grace:                  cfg.InferenceRecoveryGrace,
+		ReconciliationDeadline: cfg.InferenceReconciliationDeadline,
+	}, nil)
+	go recoveryWorker.Start(rootCtx)
 
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)

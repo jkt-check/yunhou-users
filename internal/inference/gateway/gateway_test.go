@@ -820,8 +820,10 @@ func TestMidStreamEOFNoUsage_ReconciliationHoldsReservation(t *testing.T) {
 	if status != "reconciliation_required" {
 		t.Errorf("status = %s, want reconciliation_required", status)
 	}
-	if usageStatus != "pending" {
-		t.Errorf("usage_status = %s, want pending (never zeroed)", usageStatus)
+	if usageStatus != "unknown" {
+		// Task 9: 停放 = 无已持久化计量事实，usage_status 如实标记 unknown
+		// （不是 pending，更绝不是 0）——恢复 worker 将按保守估算结算。
+		t.Errorf("usage_status = %s, want unknown (parked, never zeroed)", usageStatus)
 	}
 	if reserved <= 0 {
 		t.Errorf("reserved = %d, want the hold retained", reserved)
@@ -1237,6 +1239,90 @@ func TestStreamFencedMidStream_AbortsAndSettlesInterrupted(t *testing.T) {
 	attempts := f.attemptRows(t, out.RequestID)
 	if len(attempts) != 1 || attempts[0].Status != "failed" || attempts[0].Kind != "stream_interrupted" {
 		t.Errorf("attempts = %+v, want failed/stream_interrupted (fenced, not completed)", attempts)
+	}
+}
+
+// errorsAsQuota 提取 QuotaExceededError(避免在测试里引入 errors 的噪音)。
+// Task 9 — 超出预占的实际费用：上游报告用量远超预占上界（不守
+// max_tokens 的异常上游）。结算必须按真实费用入账（不钳制、不隐藏负差
+// 额），同一事务落 settlement_overage 异常任务并告警；继续透支由窗口
+// used 超限 → 后续准入拒绝 来结构性阻止。
+func TestSettleOverHold_OverageJobAndRealCharge(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-over","object":"chat.completion","created":1,
+			"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":100000,"completion_tokens":50000,"total_tokens":150000}}`)
+	})
+	f := newFixture(t, up)
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	status, usageStatus, reserved, settled := f.requestRow(t, out.RequestID)
+	if status != "settled" || usageStatus != "reported" {
+		t.Fatalf("request = %s/%s, want settled/reported", status, usageStatus)
+	}
+	// 真实费用 100000×1 + 50000×2 = 200_000 micros ≫ 预占（输入估算 ~25 +
+	// 输出上限 8192×2 ≈ 16_4xx micros）。
+	if settled != 200_000 {
+		t.Errorf("settled = %d, want 200000 (真实费用入账，绝不钳制到预占)", settled)
+	}
+	if reserved <= 0 || settled <= reserved {
+		t.Errorf("settled %d must exceed reserved %d (超占场景)", settled, reserved)
+	}
+	if charge := f.ledgerCharge(t, out.RequestID); charge != 200_000 {
+		t.Errorf("charge = %d, want 200000", charge)
+	}
+	// 异常任务与结算同事务落库。
+	var reason, status2, detail string
+	if err := f.db.QueryRow(
+		`SELECT reason, status, detail::text FROM inference_reconciliation_jobs WHERE request_id = $1`,
+		out.RequestID).Scan(&reason, &status2, &detail); err != nil {
+		t.Fatalf("overage job missing: %v", err)
+	}
+	if reason != "settlement_overage" || status2 != "pending" {
+		t.Errorf("job = %s/%s, want settlement_overage/pending", reason, status2)
+	}
+	if !strings.Contains(detail, "over_micros") || !strings.Contains(detail, "200000") {
+		t.Errorf("detail = %s, want reserved/charge/over 明细", detail)
+	}
+	// 窗口 used 按真实费用增加（可超过预占，不隐藏）。
+	f.windowUsedEach(t, 200_000)
+}
+
+// Task 9 — 零消费结算：上游如实报告 0 用量。落一条 amount=0 的 charge 行
+// （Task 1 遗留决策点裁定）："已结算(0)"与"未结算"在账本层可区分，结算
+// 唯一键统一保护全部投递。
+func TestZeroUsageSettle_ChargeRowDistinguishable(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-zero","object":"chat.completion","created":1,
+			"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	})
+	f := newFixture(t, up)
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	status, usageStatus, _, settled := f.requestRow(t, out.RequestID)
+	if status != "settled" || usageStatus != "reported" {
+		t.Errorf("request = %s/%s, want settled/reported", status, usageStatus)
+	}
+	if settled != 0 {
+		t.Errorf("settled = %d, want 0", settled)
+	}
+	if charge := f.ledgerCharge(t, out.RequestID); charge != 0 {
+		t.Errorf("charge row = %d, want 0 (零消费也落 charge 行)", charge)
+	}
+	// 预占转换照常：hold 全额归还（used=0, reserved=0）。
+	f.windowUsedEach(t, 0)
+	_, res := f.windowTotals(t)
+	if res != 0 {
+		t.Errorf("reserved total = %d, want 0", res)
 	}
 }
 

@@ -70,6 +70,9 @@ type Store interface {
 	// Settlement (domain.SettlementStore / QuotaStore release).
 	Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error
 	MarkReconciliationRequired(ctx context.Context, w domain.UnitOfWork, requestID, reason string, deadline time.Time) error
+	// EnqueueReconciliationJobTx upserts a reconciliation job in the
+	// settlement transaction (Task 9: overage anomaly tracked atomically).
+	EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfWork, cmd postgres.EnqueueReconciliationCommand) error
 	Release(ctx context.Context, w domain.UnitOfWork, requestID string) error
 }
 
@@ -691,44 +694,53 @@ func (r *guardedTeeReader) Close() error { return r.body.Close() }
 // Settlement
 // ---------------------------------------------------------------------------
 
+// settleMaxAttempts bounds the in-process settlement retry (transient
+// storage errors, e.g. a dropped connection). The usage fact lives in
+// process memory until it commits — retrying within the detached context
+// budget keeps a transient failure from falling into the reconciliation
+// queue (where recovery would have to ESTIMATE what we actually know).
+const settleMaxAttempts = 3
+
+// settleBackoff is the pause between in-process settlement retries.
+const settleBackoff = 200 * time.Millisecond
+
 // settle runs the idempotent settlement in one transaction. A failure never
-// silently drops the charge: the request is parked in reconciliation and
-// the OnSettleError alarm fires (设计 §7.2: 计费不可静默丢失). A duplicate
-// settlement is idempotent by design (唯一键防重复结算) and not an alarm.
+// silently drops the charge: after the bounded in-process retry the request
+// is parked in reconciliation and the OnSettleError alarm fires
+// (设计 §7.2: 计费不可静默丢失). A duplicate settlement is idempotent by
+// design (唯一键防重复结算) and not an alarm.
+//
+// Overage (charge > hold): the REAL charge settles — clamping would
+// silently free the excess (不隐藏负差额). The excess enqueues a
+// settlement_overage reconciliation job in the SAME transaction and alarms;
+// 继续透支 is blocked structurally: window used exceeding the limit drives
+// remaining ≤ 0, so subsequent admissions reject (max(0, …) 口径 §6).
 func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage domain.UsageBuckets,
 	source domain.UsageSource, raw json.RawMessage, price accounting.PriceVersion,
 	adapter providers.Adapter, adm *quota.AdmissionResult) {
 
-	record := domain.UsageRecord{
-		RequestID: requestID, AttemptID: attemptID, Source: source,
+	// Normalize overlapping semantics exactly once (设计 §7.1) and price
+	// under the pinned revision — the shared pure rule, never a second
+	// implementation (Task 9: accounting.Decide).
+	decision, err := accounting.Decide(domain.UsageRecord{
+		RequestID: requestID, AttemptID: attemptID, Source: source, Buckets: usage,
 		RawUsage: domain.ExtensionConfig{SchemaVersion: 1, Raw: raw},
-	}
-	// Normalize overlapping semantics exactly once (设计 §7.1): reasoning
-	// already inside output is not re-added; cache buckets inside input are
-	// priced at their own rate.
-	billable, err := accounting.BillableBuckets(usage, adapter.Inclusion())
+	}, price, adapter.Inclusion(), adm.HoldMicros)
 	if err != nil {
-		s.parkSettleFailure(requestID, fmt.Errorf("normalize usage: %w", err))
-		return
-	}
-	record.Buckets = billable
-
-	charge, err := price.Quote(record, nil)
-	if err != nil {
-		s.parkSettleFailure(requestID, fmt.Errorf("price quote: %w", err))
+		s.parkSettleFailure(requestID, fmt.Errorf("settle decision: %w", err))
 		return
 	}
 
-	cmd := domain.SettleCommand{
-		RequestID:    requestID,
-		Usage:        record,
-		ChargeMicros: charge.Credit,
-		SettledAt:    s.clock.Now(),
-	}
 	// Per-attempt upstream cost with its basis (任务书: 为每次尝试保存成本
 	// 来源). Only when an upstream_cost price version exists — no cost list,
 	// no fabricated cost.
-	cost, basis, cerr := s.attemptCost(price.ModelID, record)
+	cmd := domain.SettleCommand{
+		RequestID:    requestID,
+		Usage:        decision.Record,
+		ChargeMicros: decision.Charge.Credit,
+		SettledAt:    s.clock.Now(),
+	}
+	cost, basis, cerr := s.attemptCost(price.ModelID, decision.Record)
 	if cerr != nil {
 		log.Printf("gateway: attempt cost for %s: %v (cost left unset, charge unaffected)", attemptID, cerr)
 	} else if cost != nil {
@@ -737,23 +749,69 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		cmd.CostBasis = basis
 	}
 
+	// Overage detail is appended to the SAME settlement transaction, so a
+	// settled-but-over-hold request never exists without its anomaly job.
+	var overDetail json.RawMessage
+	if over := decision.OverageMicros(); over > 0 {
+		overDetail, _ = json.Marshal(map[string]interface{}{
+			"schema_version":  1,
+			"reserved_micros": int64(adm.HoldMicros),
+			"charge_micros":   int64(decision.Charge.Credit),
+			"over_micros":     int64(over),
+			"origin":          "settlement",
+		})
+	}
+
+	var lastErr error
+	for try := 0; try < settleMaxAttempts; try++ {
+		if try > 0 {
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err()
+				goto parked
+			case <-time.After(settleBackoff):
+			}
+		}
+		if lastErr = s.settleOnce(ctx, cmd, overDetail); lastErr == nil {
+			if overDetail != nil {
+				log.Printf("ALARM gateway: request %s charge %d exceeds hold %d by %d microcredits (settled real amount; overage tracked, further overdraft blocked by quota)",
+					requestID, int64(decision.Charge.Credit), int64(adm.HoldMicros), int64(decision.OverageMicros()))
+			}
+			return
+		}
+		if domain.CodeOf(lastErr) == domain.CodeConflict {
+			return // already settled — idempotent delivery, not an error
+		}
+	}
+parked:
+	s.parkSettleFailure(requestID, fmt.Errorf("settle: %w", lastErr))
+}
+
+// settleOnce is one settlement transaction: usage fact + ledger charge +
+// reserved→used conversion + request terminal state (+ overage job).
+func (s *Service) settleOnce(ctx context.Context, cmd domain.SettleCommand, overDetail json.RawMessage) error {
 	uow, err := s.store.Begin(ctx)
 	if err != nil {
-		s.parkSettleFailure(requestID, fmt.Errorf("settle begin: %w", err))
-		return
+		return fmt.Errorf("settle begin: %w", err)
 	}
 	if err := s.store.Settle(ctx, uow, cmd); err != nil {
 		_ = uow.Rollback(ctx)
-		if domain.CodeOf(err) == domain.CodeConflict {
-			return // already settled — idempotent delivery, not an error
+		return fmt.Errorf("settle: %w", err)
+	}
+	if overDetail != nil {
+		if err := s.store.EnqueueReconciliationJobTx(ctx, uow, postgres.EnqueueReconciliationCommand{
+			RequestID: &cmd.RequestID, Reason: "settlement_overage",
+			Detail:   overDetail,
+			Deadline: s.clock.Now().Add(reconciliationDeadline),
+		}); err != nil {
+			_ = uow.Rollback(ctx)
+			return fmt.Errorf("settle overage job: %w", err)
 		}
-		s.parkSettleFailure(requestID, fmt.Errorf("settle: %w", err))
-		return
 	}
 	if err := uow.Commit(ctx); err != nil {
-		s.parkSettleFailure(requestID, fmt.Errorf("settle commit: %w", err))
-		return
+		return fmt.Errorf("settle commit: %w", err)
 	}
+	return nil
 }
 
 // attemptCost prices the attempt's upstream cost under the effective

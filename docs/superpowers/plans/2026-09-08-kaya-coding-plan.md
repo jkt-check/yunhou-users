@@ -187,14 +187,14 @@
 - Create: `internal/inference/postgres/{quota_repo,reservation_repo,lease_repo}.go`。
 - Test: `internal/inference/quota/*_test.go`、`internal/inference/postgres/quota_concurrency_test.go`。
 
-- [ ] 一个事务内按固定顺序锁定账户、窗口和 Key 预算，检查并创建请求/预占；在网络调用前提交。
-- [ ] 三窗口同时检查并更新 reserved；唯一键防止同一内部请求重复预占。
-- [ ] 实现首次五小时窗口并发初始化及“全部请求确认无消费”时的安全撤销。
-- [ ] 绑定 admitted_at、窗口 ID、价格与策略版本，结算不会改绑新周期。
-- [ ] 用数据库租约协调账户及上游并发，定义续租、所有权和 fencing token；超时回收须避免与仍活跃请求重叠授权。
-- [ ] 实现安全的预占金额计算；强制输出上限，校验高成本工具等额外计费项目上界。
-- [ ] 存储不可用时新售卖调用拒绝放行；在途请求进入 Task 9 的持久恢复路径。
-- [ ] 跨实例并发测试用两个真实服务进程共享同一可丢弃测试库编排；CI 单 job 暂不支撑时，在验收记录中写明本地编排方式、命令与实测结果，不得以单进程加锁模拟代替。
+- [x] 一个事务内按固定顺序锁定账户、窗口和 Key 预算，检查并创建请求/预占；在网络调用前提交。
+- [x] 三窗口同时检查并更新 reserved；唯一键防止同一内部请求重复预占。
+- [x] 实现首次五小时窗口并发初始化及“全部请求确认无消费”时的安全撤销。
+- [x] 绑定 admitted_at、窗口 ID、价格与策略版本，结算不会改绑新周期。
+- [x] 用数据库租约协调账户及上游并发，定义续租、所有权和 fencing token；超时回收须避免与仍活跃请求重叠授权。
+- [x] 实现安全的预占金额计算；强制输出上限，校验高成本工具等额外计费项目上界。
+- [x] 存储不可用时新售卖调用拒绝放行；在途请求进入 Task 9 的持久恢复路径。
+- [x] 跨实例并发测试用两个真实服务进程共享同一可丢弃测试库编排；CI 单 job 暂不支撑时，在验收记录中写明本地编排方式、命令与实测结果，不得以单进程加锁模拟代替。
 
 **测试与验收**：真实 PostgreSQL 上多 goroutine、两个服务实例竞争最后额度，放行量不超过安全预占界限；部分窗口失败全部回滚；重复预占、跨窗口完成、Key 子预算及并发释放均一致。不能只用串行 mock 验证。
 
@@ -422,3 +422,4 @@ go tool cover -func=coverage.out
 - 2026-09-08：完成 Task 5。实际修改：新增 `internal/inference/access/`（apikey=`yk-`+base64url(32B) 高熵生成 + SHA-256 摘要常数时间比对 + KeyService 管理用例；principal=Resolver.Authenticate/facade ResolveUserSession/AuthorizedModelIDs；ratelimit=可注入时钟滑动窗口 RPM）、`internal/inference/postgres/{billing_account_repo,apikey_repo}.go`（ON CONFLICT 幂等建户、管理面不读 key_hash、幂等撤销/惰性过期）、`internal/inference/httpapi/{apikey_auth,user_api_keys}.go`（/v1 原生错误形状 + Key/账户 RPM + Retry-After；/user/api-keys 五端点 envelope + 字段存在性 PATCH + 明文仅创建一次）、`internal/inference/access/*_test.go`、`postgres/billing_account_repo_test.go`、`httpapi/user_api_keys_test.go`（越权矩阵/限速/撤销过期生效，真实库+真实 JWT）；修改 `internal/router/router.go`（accessOps 参数，/user/api-keys 挂 JWT 后、/v1 组固定鉴权链）、`cmd/server/main.go` 装配、`internal/config/config.go`（INFERENCE_ACCOUNT_RPM 默认 120）、`.env.example`、httpapi `fail()` 增加 401/403/429 映射、router_test fail-closed 断言、integration/e2e 六处 Setup 调用点补 nil。无新迁移（025 已含表组）。验证（一次性 PostgreSQL 16.14，端口 55438 可丢弃库 yunhou_task5，测毕清理；报告见 `.superpowers/sdd/2026-09-08-kaya-coding-plan/task-5-report.md`）：`go vet`/`go build` 通过；`go test -race -count=1 -p 1 ./internal/... ./cmd/... ./tests/integration/...` 全 ok 无 FAIL。遗留问题：/v1 组暂无业务路由（Task 8 挂载；httpapi 探针测试已钉牢鉴权/撤销/过期/限速语义）；facade 中间件生产接线归 Task 8；RPM 为进程内原语（多实例≈配置×实例数，Task 7 租约接管）；last_used_at 写放大与 Key 预算扣减归 Task 7/8。
 - 2026-09-09：Task 5 审查修复（1 Important，commit a39a76d）：`ownedKey` 三条 NotFound 路径（未知 ID / 无账户 / 他人所有）统一返回共享 `errAPIKeyNotFound`，不再透传内部操作名；httpapi 越权矩阵断言"不存在 ID 与他人 ID"响应体逐字节相同。
 - 2026-09-09：完成 Task 6。实际修改：新增 `internal/inference/quota/{window,policy}.go`（三窗口纯规则：AddMonthsClamped 原始锚点日裁剪闰年感知、weekly 7×24h 锚定、five_hour 消费激活/读取不激活、[start,end) 边界；策略 EvaluateAdmission 全窗口 fail-closed、SettlementPlan 镜像不翻倍）、`internal/inference/accounting/pricing.go`（三套价目独立版本化 ResolvePrice [from,to)、BillableBuckets 缓存/推理规范化、Quote 逐行取整——客户 RoundUp/成本 RoundDown、estimated/unknown 与 reported 分离、CodeUnpricedCapability 拒绝未定价扣费项）、`internal/inference/access/entitlement.go`（PlanRevision→GrantFromPlan 映射、SelectEntitlement 显式优先/赠送抑制/不叠加/无 grant 不自动获模型、Upgrade/Renew/DowngradeEffectiveAt 修订规则）、纯逻辑测试四件（quota/window_test.go+policy_test.go、accounting/pricing_test.go、access/entitlement_test.go，注入时钟/内存 fake 不依赖 DB）、`internal/inference/postgres/{entitlement_repo_test,pricing_repo_test}.go`（真实库）；修改 `internal/inference/domain/{errors,principal}.go`（CodeUnpricedCapability、EntitlementPatch）、`internal/inference/postgres/{entitlement_repo,pricing_repo,ledger_repo}.go`（ReviseEntitlement 乐观锁 in-place 修订、GetPriceVersion/Pure 转换器、Settle 账本 charge 携带请求钉住的 price_version_id）。无新迁移（表组已在 026）。验证（一次性 PostgreSQL 16.14，端口 55439 可丢弃库 yunhou_task6，测毕清理；报告见 `.superpowers/sdd/2026-09-08-kaya-coding-plan/task-6-report.md`）：`go vet`/`go build` 通过；`go test -race -count=1 -p 1 ./internal/... ./cmd/... ./tests/integration/...` 23 包全 ok 无 FAIL。验收硬项全部有测试钉牢：1/31 锚点→2 月末→3/31 恢复（含闰年与年付 12 期逐月）、同一消费三窗口 used 同增且账本恰一条 charge、钉住版本不受新价影响且账本归因不可改写。遗留问题：窗口并发建行/原子预占编排归 Task 7；Stackable 合并规则待后续明确发布；CodeUnpricedCapability 的 httpapi 映射随 Task 8/9 接线；OOS 术语待业务方确认（Task 12 前置）。
+- 2026-09-09：完成 Task 7。实际修改：新增 `internal/inference/quota/{service,reservation}.go`（准入编排：事务内窗口激活+预占+账户并发租约一次提交、admitted_at 按预占成功时绑定且每次重试取新鲜服务端时钟、fail-closed；预占上界纯规则：输入/强制输出/额外计费项目逐行 RoundUp 上界价）、`internal/inference/postgres/{reservation_repo,lease_repo}.go`（释放+五小时窗口事务内安全撤销；租约获取/续租/所有权/fencing/超时回收/CheckLease）、`internal/inference/quota/{reservation_test,service_test}.go`、`internal/inference/postgres/quota_concurrency_test.go`（多 goroutine + re-exec 双真实进程竞争最后额度）；修改 `internal/inference/postgres/quota_repo.go`（锁序改为 账户→窗口→Key 预算、`lockAccountTx`、`ActivateWindowsTx`、配额拒绝带 DeficitMicros 缺口、移除已迁移骨架）、`internal/inference/postgres/ledger_repo.go`（Settle 无条件锁请求行/终态拒绝/空预占拒绝/固定锁序/held 守卫）、`internal/inference/domain/usage.go`（租约类型）、勾选本计划 Task 7 复选框。无新迁移（表组与约束已在 026）。验证（一次性 PostgreSQL，端口 55440 可丢弃库 yunhou_task7，测毕清理；报告见 `.superpowers/sdd/2026-09-08-kaya-coding-plan/task-7-report.md`）：`go vet`/`go build` 通过；`go test -race -count=1 -p 1 ./internal/... ./cmd/... ./tests/integration/...` 全 ok；双进程实测 proc A 放行 2 + proc B 放行 1 = 容量 3，其余 13 次 quota_exceeded，并发套件 -race 连跑 5 轮全绿。修复的自测发现：admitted_at 跨重试沿用排队前时间戳会与等待期间提交的窗口永久 EXCLUDE 冲突（改为按预占成功时绑定）；CheckLease 误用"token 须为 scope 最大值"会 fence 合法并发持有者（改为状态+所有权+未过期）。遗留问题：上游 scope 租约消费点归 Task 8；崩溃恢复 worker 归 Task 9；clamp_if_declared 待协议字段；advisory 锁哈希碰撞仅性能影响。

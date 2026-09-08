@@ -241,6 +241,68 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Concurrency leases (Task 7: 数据库租约协调账户及上游并发)
+// ---------------------------------------------------------------------------
+
+// LeaseScope mirrors the inference_concurrency_leases.scope CHECK: what a
+// lease coordinates — customer billing account, upstream account,
+// deployment, or customer Key.
+type LeaseScope string
+
+const (
+	LeaseScopeBillingAccount  LeaseScope = "billing_account"
+	LeaseScopeUpstreamAccount LeaseScope = "upstream_account"
+	LeaseScopeDeployment      LeaseScope = "deployment"
+	LeaseScopeAPIKey          LeaseScope = "api_key"
+)
+
+// LeaseState mirrors the DB CHECK.
+type LeaseState string
+
+const (
+	LeaseHeld     LeaseState = "held"
+	LeaseReleased LeaseState = "released"
+	LeaseExpired  LeaseState = "expired"
+)
+
+// ConcurrencyLease is one database-coordinated concurrency slot. Ownership
+// is the (OwnerToken, FencingToken) pair: OwnerToken identifies the holder
+// instance, FencingToken is a per-scope monotonically increasing token
+// issued at acquisition — never reused, even across reclamations. A
+// reclaimed (timed-out) lease can never reassert authorization: renewal/
+// release/check all require the exact pair AND the held state, so timeout
+// reclamation never overlaps authorization with a still-active earlier
+// request (设计 §7.2/Task 7). Concurrent live leases of a multi-slot scope
+// do not fence each other — the token orders acquisition history, it is
+// not a mutual-exclusion gate.
+type ConcurrencyLease struct {
+	ID           string
+	Scope        LeaseScope
+	ScopeID      string
+	RequestID    string
+	OwnerToken   string
+	FencingToken int64
+	State        LeaseState
+	AcquiredAt   time.Time
+	ExpiresAt    time.Time
+	ReleasedAt   *time.Time
+}
+
+// AcquireLeaseCommand is the input of one lease acquisition. Limit is the
+// maximum number of simultaneously held (unexpired) leases of the scope;
+// Now is the server time the expiry is computed from (injected clock —
+// all metering time comes from the server, 设计 §6).
+type AcquireLeaseCommand struct {
+	Scope      LeaseScope
+	ScopeID    string
+	RequestID  string
+	OwnerToken string
+	Limit      int
+	TTL        time.Duration
+	Now        time.Time
+}
+
+// ---------------------------------------------------------------------------
 // Transactional contracts (Task 1 core: 预占与结算共享同一事务)
 // ---------------------------------------------------------------------------
 

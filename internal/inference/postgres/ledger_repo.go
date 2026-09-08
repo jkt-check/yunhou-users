@@ -18,12 +18,16 @@ import (
 // Settle implements domain.SettlementStore. One transaction does all of
 // (设计 §7.2):
 //
-//  1. persist the normalized usage fact,
-//  2. append the customer ledger charge (UNIQUE per request → idempotent),
-//  3. convert held reservations: windows reserved→used (actual charged
-//     amount), key budget corrected by (charge − hold) so an over-hold is
-//     returned, reservations marked settled,
-//  4. move the request to settled with its usage status.
+//  1. lock the request row FOR UPDATE (serializes against a concurrent
+//     release/settlement of the same request — 并发释放均一致),
+//  2. persist the normalized usage fact,
+//  3. append the customer ledger charge (UNIQUE per request → idempotent),
+//  4. convert held reservations — in the fixed lock order (windows
+//     five_hour→weekly→monthly, then Key budget): windows reserved→used
+//     (actual charged amount), key budget corrected by (charge − hold) so
+//     an over-hold is returned, reservations marked settled with a
+//     state='held' guard,
+//  5. move the request to settled with its usage status.
 func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -33,24 +37,31 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		return domain.WrapError(domain.CodeInvalidInput, "settle: negative charge", domain.ErrNegativeValue)
 	}
 
-	// 1. Usage fact (UNIQUE(attempt_id, revision)).
+	// 1. Lock the request (fixed order: account is never needed here; the
+	// request row is what release also locks). The charge carries the
+	// request's PINNED price version (read from the locked row, never
+	// caller-supplied) so a later price change can never rewrite which
+	// version settled this request (设计 §7.1).
+	var accountID, status string
+	var priceVersionID *string
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT billing_account_id, price_version_id, status FROM inference_requests WHERE id = $1 FOR UPDATE`,
+		cmd.RequestID).Scan(&accountID, &priceVersionID, &status); err != nil {
+		return mapError("settle: lock request", err)
+	}
+	if domain.RequestStatus(status) == domain.ReqSettled || domain.RequestStatus(status) == domain.ReqReleased {
+		return domain.NewError(domain.CodeConflict,
+			"settle: request already finalized ("+status+")")
+	}
+
+	// 2. Usage fact (UNIQUE(attempt_id, revision)).
 	if err := insertUsageRecord(ctx, tx, &cmd.Usage); err != nil {
 		return err
 	}
 
-	// 2. Ledger charge. The partial unique index on (request_id) WHERE
-	// entry_type='charge' makes a duplicate settlement a conflict. The
-	// charge carries the request's PINNED price version (locked FOR UPDATE
-	// from the request row, never caller-supplied) so a later price change
-	// can never rewrite which version settled this request (设计 §7.1).
+	// 3. Ledger charge. The partial unique index on (request_id) WHERE
+	// entry_type='charge' makes a duplicate settlement a conflict.
 	if cmd.ChargeMicros > 0 {
-		var accountID string
-		var priceVersionID *string
-		if err := tx.QueryRowxContext(ctx,
-			`SELECT billing_account_id, price_version_id FROM inference_requests WHERE id = $1 FOR UPDATE`,
-			cmd.RequestID).Scan(&accountID, &priceVersionID); err != nil {
-			return mapError("settle: lock request", err)
-		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO inference_ledger_entries
 			 (billing_account_id, request_id, entry_type, amount_micros, unit, price_version_id)
@@ -60,20 +71,14 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		}
 	}
 
-	// 3. Convert held reservations → used/settled.
-	var rows []struct {
-		ID         string  `db:"id"`
-		TargetKind string  `db:"target_kind"`
-		WindowID   *string `db:"window_id"`
-		APIKeyID   *string `db:"api_key_id"`
-		Amount     int64   `db:"amount_micros"`
+	// 4. Convert held reservations → used/settled, fixed lock order.
+	rows, err := loadHeldReservations(ctx, tx, cmd.RequestID)
+	if err != nil {
+		return err
 	}
-	if err := tx.SelectContext(ctx, &rows,
-		`SELECT id, target_kind, window_id, api_key_id, amount_micros
-		 FROM inference_reservations
-		 WHERE request_id = $1 AND state = 'held'
-		 ORDER BY target_kind`, cmd.RequestID); err != nil {
-		return mapError("settle: load reservations", err)
+	if len(rows) == 0 {
+		return domain.NewError(domain.CodeConflict,
+			"settle: no held reservations (already released or settled?)")
 	}
 	for _, r := range rows {
 		switch r.TargetKind {
@@ -95,7 +100,9 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 			}
 		default:
 			// The same consumption lands in every applicable window
-			// (设计 §6: 一次消费同时增加三个适用窗口的 used).
+			// (设计 §6: 一次消费同时增加三个适用窗口的 used). The request
+			// stays bound to the windows pinned at admission — settlement
+			// never rebinds to a newer period (设计 §6/Task 7).
 			res, err := tx.ExecContext(ctx,
 				`UPDATE inference_quota_windows
 				 SET reserved_micros = reserved_micros - $2,
@@ -110,14 +117,20 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 					"settle: window reservation no longer held (concurrent settlement?)", nil)
 			}
 		}
-		if _, err := tx.ExecContext(ctx,
+		res, err := tx.ExecContext(ctx,
 			`UPDATE inference_reservations
-			 SET state = 'settled', settled_at = now() WHERE id = $1`, r.ID); err != nil {
+			 SET state = 'settled', settled_at = now()
+			 WHERE id = $1 AND state = 'held'`, r.ID)
+		if err != nil {
 			return mapError("settle: reservation", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return domain.NewError(domain.CodeConflict,
+				"settle: reservation already transitioned (concurrent release?)")
 		}
 	}
 
-	// 4. Optional attempt cost (reported/estimated/allocated).
+	// 5. Attempt cost (reported/estimated/allocated), optional.
 	if cmd.AttemptID != nil && cmd.AttemptCost != nil && cmd.CostBasis != nil {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE inference_attempts

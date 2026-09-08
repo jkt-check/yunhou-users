@@ -19,6 +19,10 @@ import (
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	inferencecatalog "github.com/yunhou/users/internal/inference/catalog"
+	inferencehttpapi "github.com/yunhou/users/internal/inference/httpapi"
+	inferencemanagement "github.com/yunhou/users/internal/inference/management"
+	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -180,6 +184,30 @@ func main() {
 	usageRepo := repo.NewUsageRepo(db)
 	usageSvc := service.NewUsageService(usageRepo)
 
+	// Inference model catalog (Kaya Coding Plan Task 3): draft CRUD with
+	// optimistic locking, atomic publish/rollback and immutable snapshots
+	// over migration 024. The LLM_PROVIDERS_JSON import is explicit and
+	// idempotent: it inserts only what is missing and never overwrites
+	// DB-operational config on restart (基线报告差距 1).
+	infStore := inferencepostgres.NewStore(db)
+	catalogSvc := inferencecatalog.NewService(infStore)
+	catalogCache := inferencecatalog.NewSnapshotCache(infStore, func(err error) {
+		log.Printf("WARN inference catalog snapshot refresh failed; continuing on last verified snapshot: %v", err)
+	})
+	catalogMgr := inferencemanagement.NewCatalogManager(catalogSvc)
+	adminModelsHandler := inferencehttpapi.NewAdminModelsHandler(catalogMgr)
+	if cfg.LLMProvidersJSON != "" {
+		res, err := catalogSvc.ImportEnvCatalog(context.Background(), cfg.LLMProvidersJSON)
+		if err != nil {
+			log.Fatalf("LLM_PROVIDERS_JSON import failed: %v", err)
+		}
+		log.Printf("LLM_PROVIDERS_JSON import: +%d providers, +%d models, +%d deployments, +%d routes, %d already present (skipped)",
+			res.ProvidersInserted, res.ModelsInserted, res.DeploymentsInserted, res.RoutesInserted, res.Skipped)
+	}
+	// catalogCache is pinned per request once the gateway lands (Task 8);
+	// ops reads go through the service/manager today.
+	_ = catalogCache
+
 	// Chat access audit log: one JSON line per request (user_id, session_id,
 	// input, output, status, duration). Optional — empty CHAT_LOG_PATH
 	// disables it. Fail-fast when configured but unopenable: silently
@@ -260,7 +288,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc)
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

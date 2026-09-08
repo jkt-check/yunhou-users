@@ -148,6 +148,16 @@ type Config struct {
 	// duration). Empty = chat access logging disabled (the /chat endpoint
 	// still works, only the audit trail is skipped).
 	ChatLogPath string
+
+	// LLMProvidersJSON is the OPTIONAL compatibility import of the model
+	// catalog (基线报告差距 1: LLM_PROVIDERS_JSON 环境变量目录 → 数据库配置).
+	// When non-empty, cmd/server runs ONE explicit idempotent import at
+	// startup: entities missing from the database are inserted as DRAFT,
+	// everything already present is left untouched — the env never
+	// overwrites operational DB config on restart. Invalid JSON fails
+	// startup loudly. The runtime catalog truth is the published DB
+	// revision, never this env.
+	LLMProvidersJSON string
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -195,6 +205,8 @@ func Load() *Config {
 		DeepSeekBaseURL: envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 		DeepSeekModel:   envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
 		ChatLogPath:     os.Getenv("CHAT_LOG_PATH"),
+
+		LLMProvidersJSON: os.Getenv("LLM_PROVIDERS_JSON"),
 	}
 }
 

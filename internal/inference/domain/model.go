@@ -171,6 +171,16 @@ type ModelFilter struct {
 	Limit     int
 }
 
+// DeploymentFilter filters deployment listings. Empty ProviderID / Status
+// match all; AfterID is the keyset cursor on id; Limit <= 0 uses the
+// implementation's default page size.
+type DeploymentFilter struct {
+	ProviderID string
+	Status     DeploymentStatus
+	AfterID    string
+	Limit      int
+}
+
 // CatalogReader is the read side of the publishable catalog. A gateway
 // request pins ONE active revision snapshot for its whole lifetime
 // (设计 §5: 一次调用固定使用一个快照).

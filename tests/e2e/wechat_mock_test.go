@@ -131,7 +131,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, service.NewUsageService(repo.NewUsageRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, service.NewUsageService(repo.NewUsageRepo(db)), nil)
 
 	alipayPrivHolder.Store(alipayPriv)
 

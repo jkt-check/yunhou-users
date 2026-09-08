@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
+	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/service"
@@ -38,6 +39,7 @@ func Setup(
 	wechatOAuthMock bool,
 	wechatPayMock bool,
 	usageSvc *service.UsageService,
+	adminModelsHandler *httpapi.AdminModelsHandler,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -159,6 +161,20 @@ func Setup(
 		adminGroup.GET("/stats/active", usageHandler.GetActiveStats)
 		adminGroup.GET("/stats/usage-duration", usageHandler.GetUsageDuration)
 		adminGroup.GET("/stats/new-users", usageHandler.GetNewUsers)
+
+		// Inference model catalog (Kaya Coding Plan Task 3): read-only
+		// model/deployment/revision queries. Write endpoints (create/edit/
+		// publish/rollback) are implemented and tested in
+		// internal/inference/httpapi but intentionally NOT mounted here —
+		// Task 4 lands operator authorization first, then mounts them via
+		// adminModelsHandler.RegisterWrite(catalogGroup):
+		//
+		//   // Task 4 (after operator authz middleware):
+		//   // catalogGroup := adminGroup.Group("/catalog-ops") 或复用本组
+		//   // adminModelsHandler.RegisterWrite(adminGroup)
+		//
+		// Until then POST/PATCH/DELETE on these paths return 404.
+		adminModelsHandler.RegisterReadOnly(adminGroup)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

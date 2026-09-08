@@ -114,6 +114,10 @@ func (m *mockSubSvc) ListUserSubscriptions(ctx context.Context, userID string) (
 	return m.subs, nil
 }
 
+func (m *mockSubSvc) ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error) {
+	return m.subs, nil
+}
+
 type mockPlanSvc struct {
 	plans           []model.Plan
 	plan            *model.Plan

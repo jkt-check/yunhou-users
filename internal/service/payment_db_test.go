@@ -459,13 +459,14 @@ func TestConfirm_TrialRolloverOnFirstPurchase(t *testing.T) {
 }
 
 // The trial grant's concurrency safety net (auth.go grantTrialSubscription
-// doc): a duplicate grant hits idx_subscriptions_user_active and is
-// logged+swallowed. Pin the index itself at the DB layer.
+// doc): a duplicate grant hits idx_subscriptions_user_product_active
+// (migration 027, per user+product) and is logged+swallowed. Pin the index
+// itself at the DB layer — and its per-product scope.
 func TestSubscriptions_UniqueActivePerUser(t *testing.T) {
 	db := setupPaymentDB(t)
 	uid := seedUser(t, db)
 	seedActiveSub(t, db, uid, "trial", time.Now().Add(7*24*time.Hour))
-	// second active row for the same user must be rejected
+	// second active row for the same user IN THE SAME PRODUCT must be rejected
 	_, err := db.ExecContext(context.Background(), `
 		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
 		VALUES (gen_random_uuid(), $1, 'monthly', 'active', now(), now() + interval '30 days')
@@ -473,8 +474,24 @@ func TestSubscriptions_UniqueActivePerUser(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected unique violation on second active subscription, got nil")
 	}
-	if !strings.Contains(err.Error(), "idx_subscriptions_user_active") {
-		t.Fatalf("expected idx_subscriptions_user_active violation, got %v", err)
+	if !strings.Contains(err.Error(), "idx_subscriptions_user_product_active") {
+		t.Fatalf("expected idx_subscriptions_user_product_active violation, got %v", err)
+	}
+
+	// A second active row in a DIFFERENT product is exactly what migration
+	// 027 exists to permit (dual-product coexistence).
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, product_code)
+		VALUES ('coding-monthly', 'Coding Plan Monthly', 49.9, 30, '{}', 'coding-plan')
+		ON CONFLICT (id) DO NOTHING
+	`); err != nil {
+		t.Fatalf("seed coding plan: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (gen_random_uuid(), $1, 'coding-monthly', 'active', now(), now() + interval '30 days')
+	`, uid); err != nil {
+		t.Fatalf("second active row in coding-plan product must coexist: %v", err)
 	}
 }
 
@@ -2448,11 +2465,13 @@ func TestPaymentService_OnWebhook_PaypalCaptureStillAmountChecked(t *testing.T) 
 
 // TestPaymentService_CreateOrder_GenericError covers the wrap paths
 // in CreateOrder that aren't covered by the "plan not found" / "plan
-// inactive" / "user has active sub" tests. After D8 the subRepo
-// active-sub check runs before the eligibility tx, so a closed DB now
-// surfaces as "check active sub" (subRepo is the first DB-backed
-// call). The planRepo wrap path is exercised in payment_db_test.go's
-// real-DB CreateOrder tests where the plan lookup runs inside a tx.
+// inactive" / "user has active sub" tests. Since migration 027 the
+// requested plan is looked up FIRST (its product_code scopes the
+// active-sub pre-check), so a closed DB now surfaces as
+// "find requested plan". The subRepo wrap path ("check active sub") is
+// reachable when the plan read succeeds but the sub read fails; plan
+// eligibility (FOR SHARE on plans) is exercised separately in the
+// real-DB TestPaymentService_CreateOrder_PlanDeactivatedDuringTx.
 func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 	t.Run("planRepo generic error", func(t *testing.T) {
 		db := setupPaymentDB(t)
@@ -2470,12 +2489,10 @@ func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error from closed db, got nil")
 		}
-		// SubRepo active-sub check runs first now (see CreateOrder doc),
-		// so a closed DB surfaces as "check active sub". Plan eligibility
-		// (FOR SHARE on plans) is exercised separately in the real-DB
-		// TestPaymentService_CreateOrder_PlanDeactivatedDuringTx.
-		if !strings.Contains(err.Error(), "check active sub") {
-			t.Errorf("expected wrap 'check active sub', got %q", err.Error())
+		// The product resolution plan read runs first (see CreateOrder),
+		// so a closed DB surfaces as "find requested plan".
+		if !strings.Contains(err.Error(), "find requested plan") {
+			t.Errorf("expected wrap 'find requested plan', got %q", err.Error())
 		}
 	})
 }
@@ -2863,7 +2880,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	got, err := s.resolveSubExpiry(context.Background(), tx, uid, "monthly", &hint, nil)
+	got, err := s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &hint, nil)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
@@ -2873,7 +2890,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 
 	// Beyond the plan grant: clamped to ~now + 30d.
 	farHint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	got, err = s.resolveSubExpiry(context.Background(), tx, uid, "monthly", &farHint, nil)
+	got, err = s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &farHint, nil)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry far hint: %v", err)
 	}

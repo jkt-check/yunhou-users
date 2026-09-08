@@ -97,15 +97,30 @@ type AppRepo interface {
 
 type SubscriptionRepo interface {
 	Create(ctx context.Context, s *model.Subscription) error
+	// FindActiveByUserID is the legacy compatibility entry point: it is
+	// explicitly scoped to the kaya-membership product (design §4.1 — the
+	// pre-027 "one active sub per user" contract). Callers that need a
+	// different product must use FindActiveByUserAndProduct.
 	FindActiveByUserID(ctx context.Context, userID string) (*model.Subscription, error)
 	// FindActiveByUserIDTx is the tx-bound counterpart to FindActiveByUserID.
 	// Use this from inside a transaction so the read shares the tx's
 	// connection (avoiding a second-connection pool grab that can
 	// deadlock under load with MaxOpenConns=25). Mirrors FindActiveByUserID's
-	// "active" filter.
+	// "active" filter and kaya-membership scope.
 	FindActiveByUserIDTx(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error)
+	// FindActiveByUserAndProduct returns the user's active subscription for
+	// one specific product. The (user_id, product_code) partial unique index
+	// (idx_subscriptions_user_product_active, migration 027) guarantees at
+	// most one row, so no LIMIT 1 / ORDER BY pick is involved or allowed.
+	FindActiveByUserAndProduct(ctx context.Context, userID, productCode string) (*model.Subscription, error)
+	// FindActiveByUserAndProductTx is the tx-bound counterpart; see
+	// FindActiveByUserIDTx for why the tx variant exists.
+	FindActiveByUserAndProductTx(ctx context.Context, tx *sqlx.Tx, userID, productCode string) (*model.Subscription, error)
 	FindByID(ctx context.Context, id string) (*model.Subscription, error)
 	ListByUserID(ctx context.Context, userID string) ([]model.Subscription, error)
+	// ListByUserAndProduct lists a user's subscriptions for one product
+	// only (all statuses), newest last. Used by product-scoped listing.
+	ListByUserAndProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error)
 	UpdateStatus(ctx context.Context, id, status string) error
 	Renew(ctx context.Context, id string, expiresAt *time.Time) error
 }
@@ -287,21 +302,30 @@ func (r *planRepo) FindByApp(ctx context.Context, appID string) ([]model.Plan, e
 }
 
 func (r *planRepo) Create(ctx context.Context, p *model.Plan) error {
+	// COALESCE(NULLIF(...)) maps an empty ProductCode to the compat product
+	// 'kaya-membership' (an explicit NULL bind would bypass the column
+	// DEFAULT and violate NOT NULL); coding-plan rows pass it explicitly.
 	_, err := r.db.NamedExecContext(ctx, `
 		INSERT INTO plans (
 		    id, name, price, interval_days, apps, is_active,
 		    is_listed, accepting_new_subscriptions, currency, trial_days,
-		    description, display_order
+		    description, display_order, product_code
 		) VALUES (
 		    :id, :name, :price, :interval_days, :apps, :is_active,
 		    :is_listed, :accepting_new_subscriptions, :currency, :trial_days,
-		    :description, :display_order
+		    :description, :display_order, COALESCE(NULLIF(:product_code, ''), 'kaya-membership')
 		)
 	`, p)
 	return err
 }
 
 func (r *planRepo) Update(ctx context.Context, p *model.Plan) error {
+	// product_code is sticky on update: an empty incoming value keeps the
+	// existing one (admin PATCH payloads that predate the column must not
+	// null it out; the column is NOT NULL). Renaming a plan's product is
+	// possible but deliberately requires an explicit non-empty value —
+	// existing subscriptions' product_code follows the plan row via the
+	// 027 trigger on their next plan_id/product_code write.
 	_, err := r.db.NamedExecContext(ctx, `
 		UPDATE plans SET
 		    name = :name, price = :price, interval_days = :interval_days,
@@ -309,7 +333,8 @@ func (r *planRepo) Update(ctx context.Context, p *model.Plan) error {
 		    is_listed = :is_listed,
 		    accepting_new_subscriptions = :accepting_new_subscriptions,
 		    currency = :currency, trial_days = :trial_days,
-		    description = :description, display_order = :display_order
+		    description = :description, display_order = :display_order,
+		    product_code = COALESCE(NULLIF(:product_code, ''), product_code)
 		WHERE id = :id
 	`, p)
 	return err
@@ -330,11 +355,11 @@ func (r *planRepo) CreateTx(ctx context.Context, tx *sqlx.Tx, p *model.Plan) err
 		INSERT INTO plans (
 		    id, name, price, interval_days, apps, is_active,
 		    is_listed, accepting_new_subscriptions, currency, trial_days,
-		    description, display_order
+		    description, display_order, product_code
 		) VALUES (
 		    :id, :name, :price, :interval_days, :apps, :is_active,
 		    :is_listed, :accepting_new_subscriptions, :currency, :trial_days,
-		    :description, :display_order
+		    :description, :display_order, COALESCE(NULLIF(:product_code, ''), 'kaya-membership')
 		)
 	`, p)
 	return err
@@ -348,7 +373,8 @@ func (r *planRepo) UpdateTx(ctx context.Context, tx *sqlx.Tx, p *model.Plan) err
 		    is_listed = :is_listed,
 		    accepting_new_subscriptions = :accepting_new_subscriptions,
 		    currency = :currency, trial_days = :trial_days,
-		    description = :description, display_order = :display_order
+		    description = :description, display_order = :display_order,
+		    product_code = COALESCE(NULLIF(:product_code, ''), product_code)
 		WHERE id = :id
 	`, p)
 	return err
@@ -560,31 +586,45 @@ func (r *appRepo) BackfillSecretHash(ctx context.Context, appID, newHash string)
 // SubscriptionRepo implementation
 
 func (r *subscriptionRepo) Create(ctx context.Context, s *model.Subscription) error {
+	// NULLIF lets an empty ProductCode bind as SQL NULL so the
+	// trg_subscriptions_plan_product trigger fills it from the plan row;
+	// an explicit non-empty value is validated against the plan's product
+	// by the same trigger. Callers creating rows for a specific product
+	// (e.g. coding-plan) should set ProductCode explicitly.
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
-		VALUES (:id, :user_id, :plan_id, :status, :started_at, :expires_at)
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at, product_code)
+		VALUES (:id, :user_id, :plan_id, :status, :started_at, :expires_at, NULLIF(:product_code, ''))
 	`, s)
 	return err
 }
 
 func (r *subscriptionRepo) FindActiveByUserID(ctx context.Context, userID string) (*model.Subscription, error) {
+	// Legacy compat entry: kaya-membership only (see interface doc).
+	return r.FindActiveByUserAndProduct(ctx, userID, model.ProductKayaMembership)
+}
+
+// FindActiveByUserIDTx mirrors FindActiveByUserID but uses the supplied
+// transaction's connection. Same SQL, same return shape.
+func (r *subscriptionRepo) FindActiveByUserIDTx(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error) {
+	return r.FindActiveByUserAndProductTx(ctx, tx, userID, model.ProductKayaMembership)
+}
+
+func (r *subscriptionRepo) FindActiveByUserAndProduct(ctx context.Context, userID, productCode string) (*model.Subscription, error) {
 	var s model.Subscription
 	err := r.db.GetContext(ctx, &s, `
-		SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'
-	`, userID)
+		SELECT * FROM subscriptions WHERE user_id = $1 AND product_code = $2 AND status = 'active'
+	`, userID, productCode)
 	if err != nil {
 		return nil, err
 	}
 	return &s, nil
 }
 
-// FindActiveByUserIDTx mirrors FindActiveByUserID but uses the supplied
-// transaction's connection. Same SQL, same return shape.
-func (r *subscriptionRepo) FindActiveByUserIDTx(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error) {
+func (r *subscriptionRepo) FindActiveByUserAndProductTx(ctx context.Context, tx *sqlx.Tx, userID, productCode string) (*model.Subscription, error) {
 	var s model.Subscription
 	err := tx.GetContext(ctx, &s, `
-		SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'
-	`, userID)
+		SELECT * FROM subscriptions WHERE user_id = $1 AND product_code = $2 AND status = 'active'
+	`, userID, productCode)
 	if err != nil {
 		return nil, err
 	}
@@ -605,6 +645,14 @@ func (r *subscriptionRepo) ListByUserID(ctx context.Context, userID string) ([]m
 	err := r.db.SelectContext(ctx, &list, `
 		SELECT * FROM subscriptions WHERE user_id = $1 ORDER BY created_at
 	`, userID)
+	return list, err
+}
+
+func (r *subscriptionRepo) ListByUserAndProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error) {
+	var list []model.Subscription
+	err := r.db.SelectContext(ctx, &list, `
+		SELECT * FROM subscriptions WHERE user_id = $1 AND product_code = $2 ORDER BY created_at
+	`, userID, productCode)
 	return list, err
 }
 

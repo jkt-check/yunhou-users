@@ -91,13 +91,13 @@
 - Modify: `internal/handler/{app,user,payment}.go`、相关 mocks、`tests/e2e/testhelpers.go`。
 - Test: `internal/service/{auth,subscription,quote,payment}_test.go` 及 DB 测试。
 
-- [ ] 给既有套餐、订阅回填 `kaya-membership`；确保 plan 与 subscription 产品归属一致，有数据库约束或等效事务保证。
-- [ ] 新查询显式带 `product_code`；旧方法封装固定原会员产品，不随机返回 Coding Plan。
-- [ ] 用按 `(user_id, product_code)` 的 active 唯一约束替换全局约束；迁移前检查异常数据并给出可读诊断。
-- [ ] 逐项改造：首次登录试用、JWT/refresh、订阅列表/取消、报价、购买资格、支付确认、续订 webhook、退款、到期与重查。
-- [ ] 检查 `external_subscription_id` 的定位是否足以识别商品，不通过“用户当前订阅”推断支付对象。
-- [ ] 旧 API 省略 product 时只使用原会员产品；Coding Plan 新入口显式传产品，不允许客户端把付款兑换成其他商品。
-- [ ] 阶段内暂不开放 Coding Plan 在售；先部署支持双产品的代码，再允许第二产品订阅落库。
+- [x] 给既有套餐、订阅回填 `kaya-membership`；确保 plan 与 subscription 产品归属一致，有数据库约束或等效事务保证。
+- [x] 新查询显式带 `product_code`；旧方法封装固定原会员产品，不随机返回 Coding Plan。
+- [x] 用按 `(user_id, product_code)` 的 active 唯一约束替换全局约束；迁移前检查异常数据并给出可读诊断。
+- [x] 逐项改造：首次登录试用、JWT/refresh、订阅列表/取消、报价、购买资格、支付确认、续订 webhook、退款、到期与重查。
+- [x] 检查 `external_subscription_id` 的定位是否足以识别商品，不通过“用户当前订阅”推断支付对象。
+- [x] 旧 API 省略 product 时只使用原会员产品；Coding Plan 新入口显式传产品，不允许客户端把付款兑换成其他商品。
+- [x] 阶段内暂不开放 Coding Plan 在售；先部署支持双产品的代码，再允许第二产品订阅落库。
 
 **测试与验收**：同一用户双产品共存；同产品重复激活仍被拒绝；购买/取消/退款 API 套餐不改变 Kaya 有效期；旧 JWT、试用和支付 e2e 保持契约。迁移报告列明所有旧查询调用点已经处理。
 
@@ -414,3 +414,4 @@ go tool cover -func=coverage.out
 - 2026-09-08：评审后补充——登记 `feat/usage-analytics` 复用候选；“OOS / SUM TO API” 术语澄清前置到 Task 0；未知用量恢复改为估算为主、核对例外；剩余额度不足预占上界时默认拒绝、不静默钳制；流式 usage 显式请求；修正 Task 14/15 的 `admin_adjustments.go` 归属重叠；Task 7 明确双进程并发测试编排要求。
 - 2026-09-08：完成 Task 0。实际修改：新增 `docs/runbooks/kaya-coding-plan-baseline.md`；勾选本计划 Task 0 已完成项（“OOS 术语向业务方确认”保持未勾选）；更新设计 §2 复用决定与迁移序列。验证：一次性 PostgreSQL 16.14 实例上 `go vet`/`go build` 通过、`cmd/migrate` 连跑两次幂等（applied=21 → applied=0 skipped=21）、`go test -race -p 1` 全套通过（总覆盖 83.2%）、`go test -race ./tests/e2e/...` 通过（106.5s）；候选分支 `internal/llm` 与 `ChatService` 测试在其 worktree 只读运行通过。遗留问题：OOS / SUM TO API 术语待业务方确认（Task 12 前置）；`feat/multi-model-gateway` 的 022/023 尚未合入主线，inference 迁移固定从 024 起。
 - 2026-09-08：完成 Task 1。实际修改：新增 `internal/inference/domain/`（model/principal/usage/money/errors + 测试）与 `internal/inference/postgres/`（按表组 repo + 共享 UnitOfWork 事务 + 测试）、`migrations/024_inference_catalog.sql`/`025_inference_accounts.sql`/`026_inference_accounting.sql`、`internal/migrate/migrate_inference_test.go`；修改 `migrations/README.md` 与本计划 Task 1 复选框。验证（一次性 PostgreSQL 16.14，端口 55434 可丢弃库，报告见 `.superpowers/sdd/2026-09-08-kaya-coding-plan/task-1-report.md`）：`go vet`/`go build` 通过；`cmd/migrate` 全新库连跑两次幂等（applied=24 → applied=0 skipped=24）；`go test -race -p 1 ./internal/inference/... ./internal/migrate/...` 全 ok；全量 `./internal/... ./cmd/...` 全 ok；domain 包零跨域依赖（`go list -deps` 无 gin/service/model 等）。遗留问题：`migrate.Apply` 的 `pg_advisory_lock` 实为会话级锁（注释语义有误，现有测试模型不暴露；是否改 `pg_advisory_xact_lock` 待后续任务决定）；Key 预算周期重置语义留给 Task 7；OOS/SUM TO API 术语待业务方确认（Task 12 前置）。
+- 2026-09-08：完成 Task 2。实际修改：新增 `migrations/027_subscription_product_scope.sql`（plans/subscriptions 增加 product_code 并回填 kaya-membership、异常数据可读诊断 DO 块、(user_id, product_code) 部分唯一索引替换 002 全局索引、套餐↔订阅产品一致性触发器）、`internal/migrate/migrate_027_test.go`、`internal/service/subscription_product_scope_db_test.go`、`tests/e2e/subscription_product_test.go`；修改 model/repo/service/handler 订阅链路（详见 `.superpowers/sdd/2026-09-08-kaya-coding-plan/task-2-report.md` 逐项调用点对照表）、`migrations/README.md` 与本计划 Task 2 复选框。验证（一次性 PostgreSQL 16.14，端口 55435 可丢弃库 yunhou_task2，测毕已清理）：`go vet`/`go build` 通过；`cmd/migrate` 全新库连跑两次幂等（applied=25 → applied=0 skipped=25）；`go test -race -p 1 ./internal/... ./cmd/... ./tests/integration/...` 全 ok；`go test -race -count=1 ./tests/e2e/...` 通过（104.6s）。双产品共存/同产品重复激活拒绝/购买取消退款不影响 Kaya 有效期/迁移异常诊断均有真实库测试钉牢；Coding Plan 本阶段不在售，无客户端路径可落库。遗留问题：plan 改写 product_code 不联动既有订阅（本阶段无此管理入口）；退款/失败级联取消仍按 (user_id, plan_id) 定位（plan_id 经触发器唯一绑定产品）。

@@ -13,6 +13,11 @@ type Plan struct {
 	Price                     float64        `db:"price" json:"price"`
 	IntervalDays              int            `db:"interval_days" json:"interval_days"`
 	Apps                      pq.StringArray `db:"apps" json:"apps"`
+	// ProductCode is the commercial product this plan sells (design §4.1).
+	// Subscriptions inherit it via the trg_subscriptions_plan_product
+	// trigger; pre-027 rows carry ProductKayaMembership via the column
+	// default.
+	ProductCode               string         `db:"product_code" json:"product_code"`
 	IsActive                  bool           `db:"is_active" json:"is_active"`
 	IsListed                  bool           `db:"is_listed" json:"is_listed"`
 	AcceptingNewSubscriptions bool           `db:"accepting_new_subscriptions" json:"accepting_new_subscriptions"`
@@ -70,6 +75,7 @@ type PublicPlan struct {
 	Name         string            `json:"name"`
 	Price        float64           `json:"price"`
 	IntervalDays int               `json:"interval_days"`
+	ProductCode  string            `json:"product_code"`
 	Currency     string            `json:"currency"`
 	TrialDays    int               `json:"trial_days"`
 	Description  *string           `json:"description"`

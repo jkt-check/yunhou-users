@@ -57,8 +57,11 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, planID string,
 		derivedExpiry = &t
 	}
 
-	// Check if user already has an active subscription
-	existing, err := s.subRepo.FindActiveByUserID(ctx, userID)
+	// Check if user already has an active subscription IN THIS PLAN'S
+	// PRODUCT (migration 027): a kaya-membership sub must not block a
+	// coding-plan subscription and vice versa. plan.ProductCode comes from
+	// the plan row, not from the user's existing rows.
+	existing, err := s.subRepo.FindActiveByUserAndProduct(ctx, userID, plan.ProductCode)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("check existing: %w", err)
 	}
@@ -67,12 +70,13 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, planID string,
 	}
 
 	sub := &model.Subscription{
-		ID:        GenerateUUID(),
-		UserID:    userID,
-		PlanID:    planID,
-		Status:    "active",
-		StartedAt: time.Now(),
-		ExpiresAt: derivedExpiry,
+		ID:          GenerateUUID(),
+		UserID:      userID,
+		PlanID:      planID,
+		ProductCode: plan.ProductCode,
+		Status:      "active",
+		StartedAt:   time.Now(),
+		ExpiresAt:   derivedExpiry,
 	}
 	if err := s.subRepo.Create(ctx, sub); err != nil {
 		if isDuplicateKey(err) {
@@ -152,8 +156,11 @@ func (s *SubscriptionService) Cancel(ctx context.Context, id, userID string) err
 	return nil
 }
 
-// GetUserSubscription returns the user's active subscription with plan info.
-// If no active subscription exists, returns (nil, nil, nil).
+// GetUserSubscription returns the user's active KAYA-MEMBERSHIP
+// subscription with plan info — the legacy view (design §4.1: old API
+// paths that don't name a product operate on kaya-membership only; a
+// coding-plan subscription is never surfaced here). If no active
+// kaya-membership subscription exists, returns (nil, nil, nil).
 func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID string) (*model.Subscription, *model.Plan, error) {
 	sub, err := s.subRepo.FindActiveByUserID(ctx, userID)
 	if err != nil {
@@ -172,9 +179,25 @@ func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID st
 	return sub, plan, nil
 }
 
-// ListUserSubscriptions returns all subscriptions for a user.
+// ListUserSubscriptions returns the user's KAYA-MEMBERSHIP subscriptions —
+// the legacy contract of GET /user/subscriptions when no product is named.
+// Use ListUserSubscriptionsByProduct for an explicit product scope.
 func (s *SubscriptionService) ListUserSubscriptions(ctx context.Context, userID string) ([]model.Subscription, error) {
-	return s.subRepo.ListByUserID(ctx, userID)
+	return s.ListUserSubscriptionsByProduct(ctx, userID, model.ProductKayaMembership)
+}
+
+// ListUserSubscriptionsByProduct lists a user's subscriptions (all
+// statuses) for one product. The sentinel productCode "all" returns every
+// product's rows — reserved for future multi-product consoles; the legacy
+// list endpoint never passes it by default.
+func (s *SubscriptionService) ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error) {
+	if productCode == "all" {
+		return s.subRepo.ListByUserID(ctx, userID)
+	}
+	if productCode == "" {
+		productCode = model.ProductKayaMembership
+	}
+	return s.subRepo.ListByUserAndProduct(ctx, userID, productCode)
 }
 
 // isDuplicateKey reports whether err is a Postgres unique-constraint violation

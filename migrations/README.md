@@ -75,3 +75,4 @@ syntax, **not** transaction control — those are fine.
 | `024_inference_catalog.sql` | inference 模型目录表组：models/providers/deployments/model_routes/config_revisions（每 scope 一个 active 发布的部分唯一索引）。022/023 保留给未合入的 feat/multi-model-gateway 分支，不得占用 |
 | `025_inference_accounts.sql` | inference 账号表组：credentials（AEAD 密文 + key_version + generation）/upstream_accounts（含上游额度缓存）/billing_accounts（每用户一个，不级联删除）/api_keys（前缀+摘要，预算） |
 | `026_inference_accounting.sql` | inference 计量/账本表组：price_versions/policy_versions/entitlements/requests/attempts/usage_records/quota_windows（区间不重叠 EXCLUDE）/reservations/concurrency_leases/ledger_entries（每请求一条 charge 的部分唯一索引）/adjustments/outbox/reconciliation_jobs；全部整数微额度/微金额，账本不对用户级联删除 |
+| `027_subscription_product_scope.sql` | 套餐/订阅增加 `product_code`（默认回填 `kaya-membership`）；002 的每用户全局活跃唯一索引替换为 `(user_id, product_code)` 部分唯一索引；迁移前 DO 块对同 (user,product) 多活跃订阅输出可读诊断并中止；触发器保证订阅 product_code 与套餐一致 |

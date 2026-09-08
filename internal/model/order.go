@@ -9,6 +9,13 @@ import (
 // Created when a user picks a paid plan, BEFORE the frontend opens
 // the channel SDK to actually collect money.
 //
+// Product ownership is NOT a column here: plan_id (FK RESTRICT to plans)
+// determines the commercial product unambiguously (plans.product_code,
+// migration 027), and the 027 trigger keeps subscriptions.product_code
+// consistent with it. Downstream activation/renewal paths must resolve
+// the product from the order's plan row — never from "the user's current
+// subscription".
+//
 // See design doc §"Order" + webhook doc §3 for lifecycle.
 type Order struct {
 	ID        string    `db:"id" json:"id"`

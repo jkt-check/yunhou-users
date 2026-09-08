@@ -230,15 +230,34 @@ func (s *PaymentService) txLookupPlan(ctx context.Context, tx *sqlx.Tx, planID s
 	return s.planRepo.FindByID(ctx, planID)
 }
 
-// txLookupActiveSubscription reads the user's current active sub, sharing
-// the surrounding tx's connection when one is in flight. Returns nil/nil
-// when no active sub exists (sql.ErrNoRows is swallowed at the call site
-// for retry-preservation lookups).
-func (s *PaymentService) txLookupActiveSubscription(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error) {
+// txLookupActiveSubscription reads the user's current active sub for one
+// product, sharing the surrounding tx's connection when one is in flight.
+// Returns nil/nil when no active sub exists (sql.ErrNoRows is swallowed at
+// the call site for retry-preservation lookups). productCode comes from the
+// order's plan row (never from the user's other subscriptions); an empty
+// productCode (plan row missing — activation will be skipped via
+// ErrPlanMissingForExpiry) matches no rows, which is the safe outcome.
+func (s *PaymentService) txLookupActiveSubscription(ctx context.Context, tx *sqlx.Tx, userID, productCode string) (*model.Subscription, error) {
 	if tx != nil {
-		return s.subRepo.FindActiveByUserIDTx(ctx, tx, userID)
+		return s.subRepo.FindActiveByUserAndProductTx(ctx, tx, userID, productCode)
 	}
-	return s.subRepo.FindActiveByUserID(ctx, userID)
+	return s.subRepo.FindActiveByUserAndProduct(ctx, userID, productCode)
+}
+
+// productCodeForPlan resolves the commercial product a plan belongs to.
+// A missing plan row returns ("", nil): the plan-missing case is reported
+// downstream by resolveSubExpiry (ErrPlanMissingForExpiry), and an empty
+// product code makes the product-scoped subscription lookups return no
+// rows — the same shape as "user has no active sub in this product".
+func (s *PaymentService) productCodeForPlan(ctx context.Context, tx *sqlx.Tx, planID string) (string, error) {
+	plan, err := s.txLookupPlan(ctx, tx, planID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return plan.ProductCode, nil
 }
 
 // txLookupPaymentByChannelTxnID reads a payment by (channel, externalTxnID),
@@ -291,13 +310,12 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		return nil, err
 	}
 
-	// Enforce the partial unique index `UNIQUE(user_id) WHERE status='active'`
+	// Enforce the partial unique index `UNIQUE(user_id, product_code) WHERE
+	// status='active'` (idx_subscriptions_user_product_active, migration 027)
 	// at the order layer. Without this pre-check, a concurrent order + activate
 	// would hit the constraint at INSERT time and surface as a 500; the user
 	// gets a clean 409 instead. The DB invariant IS the primitive — this is
-	// just a friendly surface for it. If the product later allows multiple
-	// active rows, both this check and the partial unique index need to change
-	// together.
+	// just a friendly surface for it.
 	//
 	// Repurchase rule (2026-07-28): an active, unexpired subscription no
 	// longer blanket-rejects new orders. With rollover at activation
@@ -309,6 +327,16 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// race at activation time (a stale shorter-cycle order paid after an
 	// upgrade) with ErrDowngradeActivationBlocked.
 	//
+	// Product scope (migration 027): the pre-check only considers an active
+	// subscription in the REQUESTED PLAN's product — an active
+	// kaya-membership sub must not block a coding-plan order and vice
+	// versa. The product is resolved from the plan row, never inferred
+	// from the user's existing subscriptions. A missing requested plan
+	// skips the pre-check entirely; eligibilityAndInsertOrderTx then
+	// returns ErrPlanNotFound, matching the pre-027 outcome for unknown
+	// plans (repurchaseAllowed treated them as allowed and let the tx
+	// produce the real error).
+	//
 	// "active" here means status='active' AND the sub has not lapsed
 	// (expires_at NULL or future). A stale row (status='active' with
 	// expires_at < now()) is treated as expired and permitted through;
@@ -317,36 +345,42 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// unique index. Without this carve-out, users whose subscription
 	// quietly went past could not renew even after the cn-staging
 	// 2026-07-23 login-decouple fix let them log in.
-	if existing, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
-		if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
-			// PayPal 订阅制与 WeChat 的根本差异：渠道侧自动续费
-			// （PAYMENT.SALE.COMPLETED webhook 延期），用户无需也不应手动
-			// "续费"。这里每放行一单，BFF 就在 PayPal 创建一个全新的
-			// subscription 对象（重新吃 plan 内嵌的 trial），而旧订阅仍在
-			// 自动扣费 → 双重扣费（2026-08-17 intl-staging 验收实测同一
-			// 用户 3 个 ACTIVE PayPal 订阅并存、到期叠到两个月后）。
-			// 改签（月↔年）需要专门的"取消旧订阅+建新订阅"流程，落地前
-			// PayPal 渠道对任何未过期 active 订阅一律拒绝新单（409）。
-			// WeChat 无自动续费，手动续费 rollover 是正确行为，不受影响。
-			// trial 订阅是 OAuth 首登赠予的（migration 018），**不是**
-			// PayPal 订阅：渠道侧没有对应的自动扣费 subscription，豁免
-			// 它不会造成双重扣费，反而正是 trial→付费 的核心转化漏斗
-			// （review users-1, 2026-08-17）。
-			if channel == "paypal" && existing.PlanID != "trial" {
-				return nil, ErrUserHasActiveSub
+	requestedPlan, perr := s.planRepo.FindByID(ctx, planID)
+	if perr != nil && !errors.Is(perr, sql.ErrNoRows) {
+		return nil, fmt.Errorf("find requested plan: %w", perr)
+	}
+	if requestedPlan != nil {
+		if existing, err := s.subRepo.FindActiveByUserAndProduct(ctx, userID, requestedPlan.ProductCode); err == nil {
+			if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
+				// PayPal 订阅制与 WeChat 的根本差异：渠道侧自动续费
+				// （PAYMENT.SALE.COMPLETED webhook 延期），用户无需也不应手动
+				// "续费"。这里每放行一单，BFF 就在 PayPal 创建一个全新的
+				// subscription 对象（重新吃 plan 内嵌的 trial），而旧订阅仍在
+				// 自动扣费 → 双重扣费（2026-08-17 intl-staging 验收实测同一
+				// 用户 3 个 ACTIVE PayPal 订阅并存、到期叠到两个月后）。
+				// 改签（月↔年）需要专门的"取消旧订阅+建新订阅"流程，落地前
+				// PayPal 渠道对任何未过期 active 订阅一律拒绝新单（409）。
+				// WeChat 无自动续费，手动续费 rollover 是正确行为，不受影响。
+				// trial 订阅是 OAuth 首登赠予的（migration 018），**不是**
+				// PayPal 订阅：渠道侧没有对应的自动扣费 subscription，豁免
+				// 它不会造成双重扣费，反而正是 trial→付费 的核心转化漏斗
+				// （review users-1, 2026-08-17）。
+				if channel == "paypal" && existing.PlanID != "trial" {
+					return nil, ErrUserHasActiveSub
+				}
+				allowed, aerr := s.repurchaseAllowed(ctx, existing.PlanID, planID)
+				if aerr != nil {
+					return nil, aerr
+				}
+				if !allowed {
+					return nil, ErrPlanDowngrade
+				}
 			}
-			allowed, aerr := s.repurchaseAllowed(ctx, existing.PlanID, planID)
-			if aerr != nil {
-				return nil, aerr
-			}
-			if !allowed {
-				return nil, ErrPlanDowngrade
-			}
+			// stale: status='active' but expires_at < now(). Allow order
+			// creation — activateSubscriptionOnTx will update this row.
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("check active sub: %w", err)
 		}
-		// stale: status='active' but expires_at < now(). Allow order
-		// creation — activateSubscriptionOnTx will update this row.
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("check active sub: %w", err)
 	}
 
 	var order *model.Order
@@ -876,6 +910,17 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		return nil, fmt.Errorf("insert payment: %w", err)
 	}
 
+	// Product scope (migration 027): every subscription read/write below is
+	// scoped to the product of the ORDER'S plan, resolved from the plan row
+	// — never inferred from "the user's current subscription". An empty
+	// product (plan row missing) is safe: product-scoped lookups return no
+	// rows and resolveSubExpiry surfaces ErrPlanMissingForExpiry, which the
+	// existing audit-and-skip branch handles.
+	orderProduct, pcErr := s.productCodeForPlan(ctx, txSQLX, order.PlanID)
+	if pcErr != nil {
+		return nil, fmt.Errorf("resolve order product: %w", pcErr)
+	}
+
 	// Retry path: pre-fetch the existing active sub's expiry so
 	// resolveSubExpiry can preserve it. Only triggered when the payment
 	// row already exists (dedupe hit on channel+external_txn_id); a
@@ -912,7 +957,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// to ensure sub activation + order update are idempotent.
 		paymentID = existing.ID
 
-		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID)
+		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID, orderProduct)
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return nil, fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -937,7 +982,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	// ship sub_expires_at (real WeChat v3 NATIVE today) still produce
 	// a finite subscription. A first activation replacing an unexpired
 	// sub rolls the remaining days over (resolveSubExpiry branch 3).
-	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, nil, preservedExpiry)
+	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, orderProduct, nil, preservedExpiry)
 	planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
 	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
 	if downgradeRetry {
@@ -984,7 +1029,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 	// FK would reject the INSERT/UPDATE), so skip activation; the order
 	// still goes paid below and ops follows up from the audit log.
 	if !downgradeBlocked && !planMissing {
-		activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry)
+		activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry)
 		if err != nil {
 			return nil, fmt.Errorf("activate sub: %w", err)
 		}
@@ -1499,6 +1544,16 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		return fmt.Errorf("insert payment: %w", err)
 	}
 
+	// Product scope (migration 027): every subscription read/write below is
+	// scoped to the product of the ORDER'S plan, resolved from the plan row
+	// — never inferred from "the user's current subscription". An empty
+	// product (plan row missing) matches no subscription rows and lets
+	// resolveSubExpiry surface ErrPlanMissingForExpiry instead.
+	orderProduct, pcErr := s.productCodeForPlan(ctx, txSQLX, order.PlanID)
+	if pcErr != nil {
+		return fmt.Errorf("resolve order product: %w", pcErr)
+	}
+
 	// Retry path: pre-fetch the existing active sub's expiry so
 	// resolveSubExpiry can preserve it instead of computing a new
 	// `now() + interval_days` and shifting the subscription forward.
@@ -1554,7 +1609,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		}
 		paymentID = existing.ID
 
-		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID)
+		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID, orderProduct)
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -1576,7 +1631,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// succeed). Re-running the activation UPSERT on a retried event is
 	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
 	// row.
-	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, e.SubExpiresAt, preservedExpiry)
+	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, orderProduct, e.SubExpiresAt, preservedExpiry)
 	planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
 	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
 	if downgradeRetry {
@@ -1625,7 +1680,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		return fmt.Errorf("resolve sub expiry: %w", rerr)
 	}
 	if !downgradeBlocked && !planMissing {
-		if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry); err != nil {
+		if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry); err != nil {
 			return fmt.Errorf("activate sub: %w", err)
 		}
 	}
@@ -1642,6 +1697,11 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// "I-OLD" ID on the row — subsequent renewals for the NEW subscription
 	// would fail to find the row, hitting paypal_renewal_unknown_subscription
 	// and silently dropping paid charges.
+	//
+	// The subquery is scoped by (user_id, plan_id, product_code): plan_id
+	// already pins the product via the 027 trigger, but carrying
+	// product_code explicitly keeps the row selection unambiguous if a
+	// plan ever changes product between order and webhook.
 	if e.ExternalSubscriptionID != "" {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
@@ -1650,11 +1710,12 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 				SELECT id FROM subscriptions
 				WHERE user_id = $2
 				  AND plan_id = $3
+				  AND product_code = $4
 				  AND status = 'active'
 				ORDER BY created_at DESC
 				LIMIT 1
 			)
-		`, e.ExternalSubscriptionID, order.UserID, order.PlanID); err != nil {
+		`, e.ExternalSubscriptionID, order.UserID, order.PlanID, orderProduct); err != nil {
 			return fmt.Errorf("set external_subscription_id: %w", err)
 		}
 	}
@@ -2181,12 +2242,16 @@ func insertPaymentOnTx(ctx context.Context, tx dbTx, p *model.Payment) (string, 
 	return id, true, nil
 }
 
-// activateSubscriptionOnTx: the single-row UPSERT from webhook doc §5.3.
-// Returns whether activation actually happened (true if the user just got
-// a new active sub this call; false if they already had one or we reactivated
-// an existing row).
-func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID string, expiresAt *time.Time) (bool, error) {
-	// Step 1: UPDATE the target row (active first, else most recent).
+// activateSubscriptionOnTx: the single-row UPSERT from webhook doc §5.3,
+// scoped to one (user, product) pair since migration 027. Returns whether
+// activation actually happened (true if the user just got a new active sub
+// this call; false if they already had one or we reactivated an existing
+// row). The product scope means a payment for product A never mutates the
+// user's product-B subscription row.
+func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID, productCode string, expiresAt *time.Time) (bool, error) {
+	// Step 1: UPDATE the target row within this product (active first, else
+	// most recent). The 027 trigger validates plan↔product consistency on
+	// the plan_id write; a mismatch aborts the whole activation tx.
 	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET
 			plan_id = $1,
@@ -2195,11 +2260,11 @@ func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID strin
 			status = 'active'
 		WHERE id = (
 			SELECT id FROM subscriptions
-			WHERE user_id = $3
+			WHERE user_id = $3 AND product_code = $4
 			ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, created_at DESC
 			LIMIT 1
 		)
-	`, planID, expiresAt, userID)
+	`, planID, expiresAt, userID, productCode)
 	if err != nil {
 		return false, fmt.Errorf("update subscription: %w", err)
 	}
@@ -2209,11 +2274,13 @@ func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID strin
 	n, _ := res.RowsAffected()
 
 	if n == 0 {
-		// Step 2: INSERT a new active row.
+		// Step 2: INSERT a new active row for this product. The partial
+		// unique index idx_subscriptions_user_product_active rejects a
+		// concurrent duplicate activation for the same (user, product).
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
-			VALUES ($1, $2, $3, 'active', now(), $4)
-		`, GenerateUUID(), userID, planID, expiresAt)
+			INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at, product_code)
+			VALUES ($1, $2, $3, 'active', now(), $4, $5)
+		`, GenerateUUID(), userID, planID, expiresAt, productCode)
 		if err != nil {
 			return false, fmt.Errorf("insert subscription: %w", err)
 		}
@@ -2479,7 +2546,10 @@ func isPaypalRenewal(eventType string) bool {
 //     there. nil = no hint, fall through.
 //
 //  3. rollover (2026-07-28 upgrade/renewal rule). When this activation
-//     REPLACES an unexpired active subscription, the remaining days
+//     REPLACES an unexpired active subscription IN THE SAME PRODUCT
+//     (productCode scope, migration 027 — an active sub in another
+//     product is invisible here and must not trigger rollover or the
+//     downgrade block), the remaining days
 //     carry over: the new expiry extends from the OLD expires_at, not
 //     from now(). Applies to same-plan renewal and longer-cycle
 //     upgrades — CreateOrder's repurchase rule already limits order
@@ -2502,7 +2572,7 @@ func isPaypalRenewal(eventType string) bool {
 func (s *PaymentService) resolveSubExpiry(
 	ctx context.Context,
 	tx *sqlx.Tx,
-	userID, planID string,
+	userID, planID, productCode string,
 	hint, preservedExpiry *time.Time,
 ) (*time.Time, error) {
 	if preservedExpiry != nil {
@@ -2565,7 +2635,7 @@ func (s *PaymentService) resolveSubExpiry(
 		candidate = &c
 	}
 
-	existing, sErr := s.txLookupActiveSubscription(ctx, tx, userID)
+	existing, sErr := s.txLookupActiveSubscription(ctx, tx, userID, productCode)
 	if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 		return nil, fmt.Errorf("find active sub for rollover: %w", sErr)
 	}

@@ -548,7 +548,20 @@ func (h *SubscriptionHandler) ListUserSubscriptions(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
 		return
 	}
-	subs, err := h.subSvc.ListUserSubscriptions(c.Request.Context(), userID)
+	// Legacy contract (design §4.1): when the caller omits `product`, only
+	// kaya-membership subscriptions are returned — a coding-plan row must
+	// never leak into the old member-facing list. `product=all` is the
+	// explicit multi-product view reserved for future consoles.
+	product := c.Query("product")
+	var (
+		subs []model.Subscription
+		err  error
+	)
+	if product == "" {
+		subs, err = h.subSvc.ListUserSubscriptions(c.Request.Context(), userID)
+	} else {
+		subs, err = h.subSvc.ListUserSubscriptionsByProduct(c.Request.Context(), userID, product)
+	}
 	if err != nil {
 		log.Printf("list subscriptions error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list subscriptions"})
@@ -1102,6 +1115,7 @@ func buildPublicPlan(p model.Plan, cfg model.AppConfig) model.PublicPlan {
 		// amount changes.
 		Price:        service.ApplyPlanAmountOverride(p.ID, p.Price),
 		IntervalDays: p.IntervalDays,
+		ProductCode:  p.ProductCode,
 		Currency:     p.Currency,
 		TrialDays:    p.TrialDays,
 		Description:  p.Description,

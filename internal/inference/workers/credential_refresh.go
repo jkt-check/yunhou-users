@@ -72,6 +72,9 @@ type CredentialRefreshMetrics struct {
 	Converged      int `json:"converged"`
 	ReauthRequired int `json:"reauth_required"`
 	Retryable      int `json:"retryable_failures"`
+	// Misconfigured: 厂商配置类错误（invalid_client 等），需要运营修注册表，
+	// 不按可重试计（审查修复 M-3）。
+	Misconfigured int `json:"misconfigured_failures"`
 }
 
 // RunPass executes one refresh round. Idempotent and multi-instance safe
@@ -87,8 +90,13 @@ func (w *CredentialRefresh) RunPass(ctx context.Context) (CredentialRefreshMetri
 	for i := range creds {
 		outcome, err := w.refresher.RefreshCredential(ctx, creds[i].ID, "scheduled refresh")
 		if err != nil {
-			m.Retryable++
-			log.Printf("WARN credential refresh failed id=%s: %v", creds[i].ID, err)
+			if domain.CodeOf(err) == domain.CodeInvalidInput {
+				m.Misconfigured++
+				log.Printf("ERROR credential refresh misconfigured id=%s (operator must fix the connector registry): %v", creds[i].ID, err)
+			} else {
+				m.Retryable++
+				log.Printf("WARN credential refresh failed id=%s: %v", creds[i].ID, err)
+			}
 			continue
 		}
 		switch {
@@ -125,7 +133,7 @@ func (w *CredentialRefresh) Start(ctx context.Context) {
 				log.Printf("WARN credential refresh pass failed: %v", err)
 				continue
 			}
-			if m.Scanned > 0 || m.Retryable > 0 || m.ReauthRequired > 0 {
+			if m.Scanned > 0 || m.Retryable > 0 || m.ReauthRequired > 0 || m.Misconfigured > 0 {
 				log.Printf("credential refresh pass: %+v", m)
 			}
 		}

@@ -9,8 +9,11 @@
 //
 // The client is vendor-neutral: each vendor is described by a Spec from the
 // deployment registry (INFERENCE_OAUTH_CONNECTORS_JSON) so onboarding a new
-// OAuth vendor is configuration, not code. All endpoints are validated by
-// the egress (SSRF) policy at config load and per call.
+// OAuth vendor is configuration, not code. 安全边界如实口径（审查修复
+// M-2）：注册表加载时只校验"绝对 http(s) URL 形状 + 必填字段"；出站
+// SSRF/egress 校验由调用方注入的 HTTP 客户端承担（cmd/server 用
+// providers.NewHTTPClient(egressValidator)，且仅覆盖重定向目标——厂商
+// 端点本身是运营显式配置的受信地址，不在 egress 拦截范围）。
 package connector
 
 import (
@@ -76,6 +79,9 @@ func (s Spec) Validate() error {
 		if !strings.HasPrefix(u.v, "https://") && !strings.HasPrefix(u.v, "http://") {
 			return fmt.Errorf("connector %q: %s must be an absolute http(s) URL", s.Key, u.name)
 		}
+		// http:// 被允许的理由：本地/测试厂商（httptest、开发环境沙箱）没有
+		// TLS。生产部署应以 https 配置厂商端点——URL 形状校验不做环境区分，
+		// 该约束由部署评审承担（审查修复 M-2）。
 	}
 	if s.ClientID == "" {
 		return fmt.Errorf("connector %q: client_id is required", s.Key)
@@ -136,6 +142,14 @@ const (
 	// KindRetryable: 429/5xx/transport — retry with backoff, account state
 	// unchanged by the refresh path.
 	KindRetryable ErrorKind = "retryable"
+	// KindMisconfigured: the vendor answered with a client-class error that
+	// retrying the SAME request can never fix (RFC 6749 §5.2 400 中除
+	// invalid_grant 以外的错误，如 invalid_client/unsupported_grant_type —
+	// 审查修复 M-3：不再归入 retryable 无限重试). The operator must fix the
+	// connector registry (client_id/secret/endpoints); the refresh worker
+	// counts and logs it loudly without touching account state, and the next
+	// scheduled pass is the only retry cadence.
+	KindMisconfigured ErrorKind = "misconfigured"
 	// KindInvalid: the vendor answered but the payload is unusable.
 	KindInvalid ErrorKind = "invalid_response"
 )
@@ -262,8 +276,14 @@ func (c *Client) tokenCall(ctx context.Context, spec Spec, form url.Values) (*To
 			var oe struct {
 				Error string `json:"error"`
 			}
-			if json.Unmarshal(body, &oe) == nil && oe.Error == "invalid_grant" {
-				kind = KindReauthRequired
+			if json.Unmarshal(body, &oe) == nil {
+				switch oe.Error {
+				case "invalid_grant":
+					kind = KindReauthRequired
+				case "invalid_client", "unsupported_grant_type", "invalid_request", "unauthorized_client", "invalid_scope":
+					// 配置类错误：同一请求重试永远不会成功（审查修复 M-3）。
+					kind = KindMisconfigured
+				}
 			}
 		}
 		return nil, &Error{Kind: kind, StatusCode: resp.StatusCode, Msg: truncate(string(body), 256)}

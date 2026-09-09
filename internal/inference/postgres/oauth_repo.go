@@ -254,7 +254,9 @@ func (s *Store) SetUpstreamAccountsStatusByCredentialTx(ctx context.Context, w d
 // UpdateUpstreamAccountQuota stores one observed quota snapshot. The write
 // carries a monotonic observed_at guard: an older observation never
 // overwrites a newer one (健康任务乱序/重试不得回拨额度视图). Passing nil
-// fields keeps "unknown" unknown (设计 §8).
+// fields keeps "unknown" unknown (设计 §8). 审查修复 M-3：ObservedAt=nil
+// 的写入只允许在"尚无已知观测"时落库——已有观测的行拒绝被无时间戳的写
+// 入覆盖（无观测时刻的快照不是有效观测）。
 func (s *Store) UpdateUpstreamAccountQuota(ctx context.Context, id string, q domain.UpstreamQuota) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE inference_upstream_accounts
@@ -262,7 +264,9 @@ func (s *Store) UpdateUpstreamAccountQuota(ctx context.Context, id string, q dom
 		        quota_observed_at = $4::timestamptz, quota_source = $5::text, quota_reset_at = $6::timestamptz,
 		        updated_at = now()
 		  WHERE id = $1
-		    AND (quota_observed_at IS NULL OR $4::timestamptz IS NULL OR quota_observed_at <= $4::timestamptz)`,
+		    AND (($4::timestamptz IS NOT NULL
+		          AND (quota_observed_at IS NULL OR quota_observed_at <= $4::timestamptz))
+		         OR ($4::timestamptz IS NULL AND quota_observed_at IS NULL))`,
 		id, microPtr(q.LimitMicros), microPtr(q.RemainingMicros),
 		q.ObservedAt, strPtr(q.Source), q.ResetAt)
 	if err != nil {
@@ -513,6 +517,43 @@ func (s *Store) EndSessionBindingsForAccountTx(ctx context.Context, w domain.Uni
 		return nil, mapError("end session bindings for account", err)
 	}
 	return ids, nil
+}
+
+// EndSessionBindingsForCredentialTx terminates every live binding pointing
+// at ANY account bound to one credential — the revoke/invalidation
+// propagation (审查修复 I-2：吊销与 invalid_grant 走同一绑定终止语义，不
+// 留悬垂 active 绑定阻塞同 (session_key, model_id) 的重新绑定). Runs
+// inside the caller's UnitOfWork. Returns the number ended.
+func (s *Store) EndSessionBindingsForCredentialTx(ctx context.Context, w domain.UnitOfWork, credentialID, reason string) (int64, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE inference_session_bindings
+		    SET status = 'ended', ended_reason = $2, updated_at = now()
+		  WHERE status = 'active' AND account_id IN (
+		    SELECT id FROM inference_upstream_accounts WHERE credential_id = $1)`,
+		credentialID, reason)
+	if err != nil {
+		return 0, mapError("end session bindings for credential", err)
+	}
+	return res.RowsAffected()
+}
+
+// EndSessionBindingsForCredential is the non-transactional variant used by
+// the sequential fallback path in credentials.Service (plain test fakes).
+func (s *Store) EndSessionBindingsForCredential(ctx context.Context, credentialID, reason string) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inference_session_bindings
+		    SET status = 'ended', ended_reason = $2, updated_at = now()
+		  WHERE status = 'active' AND account_id IN (
+		    SELECT id FROM inference_upstream_accounts WHERE credential_id = $1)`,
+		credentialID, reason)
+	if err != nil {
+		return 0, mapError("end session bindings for credential", err)
+	}
+	return res.RowsAffected()
 }
 
 // EndExpiredSessionBindings sweeps live bindings whose expires_at passed.

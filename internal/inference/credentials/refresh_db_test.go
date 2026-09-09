@@ -406,3 +406,147 @@ func TestRefreshAccessTokenOnlyGrant(t *testing.T) {
 		t.Fatalf("access-token-only grant must no-op: %+v", outcome)
 	}
 }
+
+// TestRefreshStaleInvalidGrantMustNotFlip — 审查修复 C-1：RT 轮换型厂商
+// （一次成功即作废旧 RT）。实例 A、B 同以 g0=1/rt-old 调厂商；A 先成功
+// （g 1→2，rt-old 作废），B 后收到针对旧 RT 的 invalid_grant——锁内重读
+// 代次必须识别"失败信号针对的是已被替换的凭据"，按 Converged 返回，
+// 绝不翻转账号/终止绑定。
+func TestRefreshStaleInvalidGrantMustNotFlip(t *testing.T) {
+	db, store, _, _, vault, vendor, providerID := oauthSetup(t)
+	ctx := context.Background()
+
+	expiry := time.Now().Add(2 * time.Minute)
+	credID, accountID := seedOAuthCredential(t, db, vault, providerID, "rt-old", expiry)
+
+	// RT 轮换语义厂商：rt-old 只有一次成功机会，成功即作废。编排上 B 的
+	// 请求先到（第 1 个 rt-old 调用）并挂起；A 的请求（第 2 个）立即成功
+	// 并作废 rt-old；B 放行时读到的是 invalid_grant。
+	var vendorMu sync.Mutex
+	rtOldCalls := 0
+	bRelease := make(chan struct{})
+	bArrived := make(chan struct{}, 1)
+	vendor.mu.Lock()
+	vendor.tokenHandler = func(form url.Values) (int, string) {
+		rt := form.Get("refresh_token")
+		if rt != "rt-old" {
+			return 200, `{"access_token":"at-later","refresh_token":"rt-newer","token_type":"bearer","expires_in":3600}`
+		}
+		vendorMu.Lock()
+		rtOldCalls++
+		n := rtOldCalls
+		vendorMu.Unlock()
+		if n == 1 {
+			// B：挂起直到 A 提交；放行时 rt-old 已被 A 作废。
+			bArrived <- struct{}{}
+			<-bRelease
+			return 400, `{"error":"invalid_grant","error_description":"refresh token already rotated"}`
+		}
+		// A：成功轮换并作废 rt-old。
+		return 200, `{"access_token":"at-A","refresh_token":"rt-new","token_type":"bearer","expires_in":3600}`
+	}
+	vendor.mu.Unlock()
+
+	// 编排：B 先到厂商（挂起），A 后跑完整流程。
+	db2, err := sqlx.Connect("postgres", atomicDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	refresherA := credentials.NewRefresher(vault, postgres.NewStore(db), postgres.NewStore(db),
+		&connector.Client{HTTP: vendor.srv.Client()}, vendor.registry(), nil)
+	refresherB := credentials.NewRefresher(vault, postgres.NewStore(db2), postgres.NewStore(db2),
+		&connector.Client{HTTP: vendor.srv.Client()}, vendor.registry(), nil)
+
+	type result struct {
+		outcome *credentials.RefreshOutcome
+		err     error
+	}
+	bDone := make(chan result, 1)
+	go func() {
+		o, err := refresherB.RefreshCredential(ctx, credID, "B refresh")
+		bDone <- result{o, err}
+	}()
+	select {
+	case <-bArrived: // B 的 rt-old 请求已在厂商在途
+	case <-time.After(5 * time.Second):
+		t.Fatal("B never reached the vendor")
+	}
+
+	// A：rt-old 仍有效 → 成功轮换 g 1→2，rt-old 作废。
+	outA, err := refresherA.RefreshCredential(ctx, credID, "A refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outA.Rotated || outA.Generation != 2 {
+		t.Fatalf("A must rotate to generation 2: %+v", outA)
+	}
+
+	// 放行 B：rt-old 已作废 → invalid_grant。修复前 B 会把账号翻
+	// reauth_required；修复后必须 Converged。
+	close(bRelease)
+	resB := <-bDone
+	if resB.err != nil {
+		t.Fatalf("B must converge, not error: %v", resB.err)
+	}
+	if resB.outcome.ReauthRequired {
+		t.Fatal("C-1 regression: stale invalid_grant flipped accounts to reauth_required")
+	}
+	if !resB.outcome.Converged {
+		t.Fatalf("B must converge on the moved generation: %+v", resB.outcome)
+	}
+
+	// 终态：账号 active、generation=2、无 B 产生的 reauth 审计。
+	var acctStatus string
+	var gen int64
+	db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, accountID).Scan(&acctStatus)
+	db.QueryRow(`SELECT generation FROM inference_credentials WHERE id = $1`, credID).Scan(&gen)
+	if acctStatus != "active" || gen != 2 {
+		t.Fatalf("stale invalid_grant must not touch state: acct=%s gen=%d", acctStatus, gen)
+	}
+	var n int
+	db.Get(&n, `SELECT count(*) FROM inference_audit_log WHERE action = 'oauth.refresh.reauth_required' AND object_id = $1`, credID)
+	if n != 0 {
+		t.Fatalf("stale rejection must not audit reauth: %d", n)
+	}
+	// 账号仍在可调度池。
+	acts, err := store.ListActiveUpstreamAccounts(ctx, providerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acts) != 1 {
+		t.Fatalf("account must stay schedulable: %d", len(acts))
+	}
+}
+
+// TestRefreshAccessTokenOnlyExpiredGoesReauth — 审查修复 I-1：无 RT 且
+// access token 已过期 = 授权失效，走 reauth 传播（停止分配 + 终止绑定）。
+func TestRefreshAccessTokenOnlyExpiredGoesReauth(t *testing.T) {
+	db, store, _, _, vault, vendor, providerID := oauthSetup(t)
+	ctx := context.Background()
+
+	expired := time.Now().Add(-time.Minute)
+	credID, accountID := seedOAuthCredential(t, db, vault, providerID, "", expired)
+
+	r := credentials.NewRefresher(vault, store, store,
+		&connector.Client{HTTP: vendor.srv.Client()}, vendor.registry(), nil)
+	outcome, err := r.RefreshCredential(ctx, credID, "expired access-token-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.ReauthRequired {
+		t.Fatalf("expired access-token-only grant must reauth: %+v", outcome)
+	}
+	var acctStatus string
+	db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, accountID).Scan(&acctStatus)
+	if acctStatus != "reauth_required" {
+		t.Fatalf("account must leave the pool: %s", acctStatus)
+	}
+	acts, err := store.ListActiveUpstreamAccounts(ctx, providerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acts) != 0 {
+		t.Fatalf("dead-token account must not be schedulable: %d", len(acts))
+	}
+}

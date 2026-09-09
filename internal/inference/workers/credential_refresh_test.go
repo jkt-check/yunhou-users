@@ -191,10 +191,16 @@ func newRefreshEnv(t *testing.T) refreshEnv {
 // active account.
 func (e refreshEnv) seedExpiringCredential(t *testing.T) (credID, accountID string) {
 	t.Helper()
+	return e.seedCredentialWith(t, "rt-old", time.Now().Add(2*time.Minute))
+}
+
+// seedCredentialWith stores one oauth credential with the given refresh
+// token ("" = access-token-only grant) and expiry.
+func (e refreshEnv) seedCredentialWith(t *testing.T, refreshToken string, expiry time.Time) (credID, accountID string) {
+	t.Helper()
 	ctx := context.Background()
-	expiry := time.Now().Add(2 * time.Minute)
 	bundle, err := credentials.MarshalBundle(&credentials.OAuthBundle{
-		AccessToken: "at-old", RefreshToken: "rt-old", TokenType: "bearer", ObtainedAt: time.Now().UTC(),
+		AccessToken: "at-old", RefreshToken: refreshToken, TokenType: "bearer", ObtainedAt: time.Now().UTC(),
 	})
 	if err != nil {
 		t.Fatal(err)

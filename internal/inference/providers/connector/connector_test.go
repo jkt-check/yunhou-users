@@ -144,3 +144,23 @@ func TestServiceAuthClassification(t *testing.T) {
 		t.Fatalf("unreachable service must classify retryable: %v", err)
 	}
 }
+
+// 审查修复 M-3：400 非 invalid_grant（配置类错误）显式归 KindMisconfigured，
+// 不归 retryable 无限重试。
+func TestTokenMisconfiguredClassification(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		fmt.Fprint(w, `{"error":"invalid_client"}`)
+	}))
+	defer srv.Close()
+	spec := Spec{Key: "k", AuthorizeURL: srv.URL + "/a", TokenURL: srv.URL + "/token",
+		ClientID: "cid", RedirectURL: "https://ops.example/cb"}
+	c := &Client{HTTP: srv.Client()}
+	if _, err := c.RefreshToken(context.Background(), spec, "rt"); KindOf(err) != KindMisconfigured {
+		t.Fatalf("invalid_client must classify misconfigured: %v", err)
+	}
+	if _, err := c.ExchangeCode(context.Background(), spec, "code", "v"); KindOf(err) != KindMisconfigured {
+		t.Fatalf("invalid_client on exchange must classify misconfigured: %v", err)
+	}
+}

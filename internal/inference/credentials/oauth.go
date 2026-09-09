@@ -340,7 +340,12 @@ func (s *OAuthService) Revoke(ctx context.Context, op Operator, credentialID, re
 					if token == "" {
 						token = bundle.AccessToken
 					}
-					if rerr := s.client.Revoke(ctx, spec, token); rerr != nil {
+					// 厂商吊销是尽力而为的附属动作：独立 10s 超时，慢/挂的
+					// 厂商端点不得拖住本地吊销（审查修复 M-3）。
+					vendorCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					rerr := s.client.Revoke(vendorCtx, spec, token)
+					cancel()
+					if rerr != nil {
 						vendorRevoke = "failed"
 					} else if spec.RevokeURL != "" {
 						vendorRevoke = "ok"

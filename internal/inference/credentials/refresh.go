@@ -132,8 +132,18 @@ func (r *Refresher) RefreshCredential(ctx context.Context, credentialID, reason 
 		return nil, err
 	}
 	if bundle.RefreshToken == "" {
-		// Access-token-only grant: nothing to rotate. Operator re-runs the
-		// authorization flow instead.
+		// Access-token-only grant: nothing to rotate — 但 access token 已过期
+		// 的授权等同失效：走与 invalid_grant 相同的 reauth 传播（审查修复
+		// I-1：无 RT 凭据失效后不得保持 active 持死 token 派发）。
+		if cred.ExpiresAt != nil && !cred.ExpiresAt.After(r.clock.Now()) {
+			outcome, rerr := r.markReauthRequired(ctx, cred, reason,
+				domain.NewError(domain.CodeConflict, "access-token-only grant expired"))
+			if rerr != nil {
+				return nil, rerr
+			}
+			return outcome, nil
+		}
+		// 未过期：不动。Operator re-runs the authorization flow to renew.
 		return &RefreshOutcome{CredentialID: credentialID, Generation: cred.Generation}, nil
 	}
 	spec, ok := r.registry[cred.Connector]
@@ -146,14 +156,20 @@ func (r *Refresher) RefreshCredential(ctx context.Context, credentialID, reason 
 	// concurrently; the write phase below serializes and discards the loser.
 	ts, err := r.client.RefreshToken(ctx, spec, bundle.RefreshToken)
 	if err != nil {
-		if connector.KindOf(err) == connector.KindReauthRequired {
+		switch connector.KindOf(err) {
+		case connector.KindReauthRequired:
 			outcome, rerr := r.markReauthRequired(ctx, cred, reason, err)
 			if rerr != nil {
 				return nil, rerr
 			}
 			return outcome, nil
+		case connector.KindMisconfigured:
+			// 配置类错误（invalid_client 等）：重试同一请求永不成功，
+			// 显式归为 operator-action 类错误而非可重试上游故障（M-3）。
+			return nil, domain.WrapError(domain.CodeInvalidInput, "oauth refresh rejected by vendor (connector misconfigured)", err)
+		default:
+			return nil, domain.WrapError(domain.CodeUpstreamUnavailable, "oauth refresh request failed", err)
 		}
-		return nil, domain.WrapError(domain.CodeUpstreamUnavailable, "oauth refresh request failed", err)
 	}
 
 	newBundle, err := MarshalBundle(&OAuthBundle{
@@ -249,6 +265,13 @@ func (r *Refresher) RefreshCredential(ctx context.Context, credentialID, reason 
 // (停止分配新请求: ListActiveUpstreamAccounts 只认 active), terminates
 // their live session bindings (设计 §8: 撤销或失效后按照协议要求终止/重建
 // 会话，不能无条件切账号续接), and writes the audit row — all-or-nothing.
+//
+// 审查修复 C-1：失败路径与成功路径一样在 advisory 锁内重读代次。
+// cred.Generation 是本次厂商调用之前读到的代次 g0；RT 轮换型厂商下另一
+// 实例可能已刷新成功（g0→g0+1，旧 RT 同时作废）——本次收到的
+// invalid_grant 针对的是已被替换的旧 RT，不是库中当前凭据。代次已移动
+// （或凭据已被运营 revoked）→ 按 Converged 返回，绝不翻转账号；仅当
+// 锁内代次仍等于 g0（库中仍是那个被拒的 RT）才执行传播。
 func (r *Refresher) markReauthRequired(ctx context.Context, cred *domain.Credential, reason string, cause error) (*RefreshOutcome, error) {
 	w, err := r.store.Begin(ctx)
 	if err != nil {
@@ -262,6 +285,18 @@ func (r *Refresher) markReauthRequired(ctx context.Context, cred *domain.Credent
 	}()
 	if err := r.store.AcquireCredentialRefreshLockTx(ctx, w, cred.ID); err != nil {
 		return nil, err
+	}
+	current, err := r.store.GetCredentialTx(ctx, w, cred.ID)
+	if err != nil {
+		return nil, err
+	}
+	if current.Generation != cred.Generation || current.Status == "revoked" {
+		// 陈旧失败信号：凭据已换代/已吊销，本次 invalid_grant 针对旧值。
+		_ = w.Rollback(ctx)
+		committed = true
+		return &RefreshOutcome{
+			CredentialID: cred.ID, Converged: true, Generation: current.Generation,
+		}, nil
 	}
 	accountIDs, err := r.store.SetUpstreamAccountsStatusByCredentialTx(ctx, w, cred.ID,
 		[]domain.UpstreamAccountStatus{
@@ -300,6 +335,24 @@ func (r *Refresher) markReauthRequired(ctx context.Context, cred *domain.Credent
 	return &RefreshOutcome{
 		CredentialID: cred.ID, ReauthRequired: true, Generation: cred.Generation,
 	}, nil
+}
+
+// MarkReauthRequired runs the same guarded propagation from outside the
+// refresh call (审查修复 I-1：健康探测 401 且凭据无 refresh token 可轮换
+// 时，授权按失效处理——与 invalid_grant 同一路径、同一代次守卫）。
+func (r *Refresher) MarkReauthRequired(ctx context.Context, credentialID, reason string, cause error) (*RefreshOutcome, error) {
+	cred, err := r.store.GetCredential(ctx, credentialID)
+	if err != nil {
+		return nil, err
+	}
+	if cred.AuthType != "oauth" {
+		return nil, domain.NewError(domain.CodeInvalidInput, "only oauth credentials reauth through a connector")
+	}
+	if cred.Status != "active" && cred.Status != "rotating" {
+		// 已被吊销/处理：无需再翻。
+		return &RefreshOutcome{CredentialID: credentialID, Converged: true, Generation: cred.Generation}, nil
+	}
+	return r.markReauthRequired(ctx, cred, reason, cause)
 }
 
 func orElse(v, fallback string) string {

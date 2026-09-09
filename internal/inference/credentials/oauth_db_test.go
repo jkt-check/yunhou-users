@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 
@@ -457,3 +458,51 @@ func TestOAuthRegistryParse(t *testing.T) {
 }
 
 var _ = json.Marshal // keep encoding/json imported for fixture shaping
+
+// TestOAuthRevokeEndsSessionBindings — 审查修复 I-2：撤销与 invalid_grant
+// 路径一致地终止活跃会话绑定（同一事务），不留悬垂绑定阻塞重新 Bind。
+func TestOAuthRevokeEndsSessionBindings(t *testing.T) {
+	db, store, _, oauthSvc, _, _, providerID := oauthSetup(t)
+	ctx := context.Background()
+	op := task12Op()
+
+	start, err := oauthSvc.BeginAuthorization(ctx, op, providerID, "testvendor", "acct", "onboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := oauthSvc.HandleCallback(ctx, op, start.State, "good-code", "complete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO inference_models
+		(id, display_name, context_tokens, max_output_tokens)
+		VALUES ('task12-revoke-model','M',128000,8192) ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec(`DELETE FROM inference_models WHERE id = 'task12-revoke-model'`)
+	binding := &domain.SessionBinding{
+		SessionKey: "sess-revoke", ModelID: "task12-revoke-model", AccountID: res.AccountID,
+		Status: domain.BindingActive, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := store.InsertSessionBinding(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := oauthSvc.Revoke(ctx, op, res.Credential.ID, "offboard"); err != nil {
+		t.Fatal(err)
+	}
+	var bindStatus, bindReason string
+	db.QueryRow(`SELECT status, ended_reason FROM inference_session_bindings WHERE id = $1`, binding.ID).
+		Scan(&bindStatus, &bindReason)
+	if bindStatus != "ended" || bindReason != domain.BindingEndedAccountInvalid {
+		t.Fatalf("revoke must end live bindings: %s %s", bindStatus, bindReason)
+	}
+	// 审计可见绑定终止计数。
+	var n int
+	db.Get(&n, `SELECT count(*) FROM inference_audit_log
+		WHERE action = 'credential.disable' AND object_id = $1
+		  AND detail::text LIKE '%session_bindings_ended%'`, res.Credential.ID)
+	if n != 1 {
+		t.Fatalf("revoke audit must record bindings ended: %d", n)
+	}
+}

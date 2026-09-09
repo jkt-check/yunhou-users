@@ -45,6 +45,11 @@ type TxStore interface {
 	RotateCredentialSecretTx(ctx context.Context, w domain.UnitOfWork, id string, ciphertext []byte, keyVersion int) error
 	SetCredentialStatusTx(ctx context.Context, w domain.UnitOfWork, id, status string) error
 	DisableUpstreamAccountsByCredentialTx(ctx context.Context, w domain.UnitOfWork, credentialID string) (int64, error)
+	// EndSessionBindingsForCredentialTx terminates live sticky session
+	// bindings of every account bound to the credential (审查修复 I-2：吊销
+	// 传播必须与 invalid_grant 路径一致地终止绑定——悬垂 active 绑定会被
+	// 部分唯一索引挡住同 (session_key, model_id) 的重新绑定).
+	EndSessionBindingsForCredentialTx(ctx context.Context, w domain.UnitOfWork, credentialID, reason string) (int64, error)
 }
 
 // TxRecorder is the optional transaction-aware upgrade of the audit
@@ -311,6 +316,12 @@ func (s *Service) SetStatus(ctx context.Context, op Operator, id, status, reason
 				return err
 			}
 			detail["upstream_accounts_disabled"] = n
+			// 审查修复 I-2：吊销同事务终止这些账号的活跃会话绑定。
+			nb, err := ts.EndSessionBindingsForCredentialTx(ctx, w, id, domain.BindingEndedAccountInvalid)
+			if err != nil {
+				return err
+			}
+			detail["session_bindings_ended"] = nb
 		}
 		return s.audit.(TxRecorder).RecordTx(ctx, w, auditEvent(op, "credential.disable", id, reason, detail))
 	}); ran {
@@ -330,6 +341,16 @@ func (s *Service) SetStatus(ctx context.Context, op Operator, id, status, reason
 			return nil, err
 		}
 		detail["upstream_accounts_disabled"] = n
+		// 绑定终止在非事务 fake 下走可选接口（生产库必走上面的同事务路径）。
+		if eb, ok := s.store.(interface {
+			EndSessionBindingsForCredential(ctx context.Context, credentialID, reason string) (int64, error)
+		}); ok {
+			nb, err := eb.EndSessionBindingsForCredential(ctx, id, domain.BindingEndedAccountInvalid)
+			if err != nil {
+				return nil, err
+			}
+			detail["session_bindings_ended"] = nb
+		}
 	}
 	cred.Status = status
 	if err := s.record(ctx, op, "credential.disable", id, reason, detail); err != nil {

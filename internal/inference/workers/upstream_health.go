@@ -41,6 +41,9 @@ type UpstreamHealthStore interface {
 	Begin(ctx context.Context) (domain.UnitOfWork, error)
 	EndSessionBindingsForAccountTx(ctx context.Context, w domain.UnitOfWork, accountID, reason string) ([]string, error)
 	SetUpstreamAccountStatusConditionalTx(ctx context.Context, w domain.UnitOfWork, id string, from []domain.UpstreamAccountStatus, to domain.UpstreamAccountStatus) (bool, error)
+	// EndExpiredSessionBindings sweeps TTL-expired live bindings (审查修复
+	// M-1：此前无生产调用方，本 worker 每轮清扫).
+	EndExpiredSessionBindings(ctx context.Context, now time.Time, limit int) (int64, error)
 }
 
 // UpstreamHealthConfig tunes the worker; zero values take the defaults.
@@ -105,11 +108,19 @@ type UpstreamHealthMetrics struct {
 	ReauthRequired int `json:"reauth_required"`
 	QuotaObserved  int `json:"quota_observed"`
 	Errors         int `json:"errors"`
+	// BindingsExpired: TTL 到期清扫的活跃绑定数（审查修复 M-1）。
+	BindingsExpired int64 `json:"bindings_expired"`
 }
 
-// RunPass executes one health round.
+// RunPass executes one health round: first sweep TTL-expired session
+// bindings, then probe accounts.
 func (w *UpstreamHealth) RunPass(ctx context.Context) (UpstreamHealthMetrics, error) {
 	var m UpstreamHealthMetrics
+	expired, err := w.store.EndExpiredSessionBindings(ctx, w.clock.Now(), w.cfg.BatchLimit)
+	if err != nil {
+		return m, err
+	}
+	m.BindingsExpired = expired
 	dueBefore := w.clock.Now().Add(-w.cfg.Cooldown)
 	accounts, err := w.store.ListUpstreamAccountsForHealth(ctx, dueBefore, w.cfg.BatchLimit)
 	if err != nil {
@@ -183,8 +194,23 @@ func (w *UpstreamHealth) probeOAuth(ctx context.Context, a *domain.UpstreamAccou
 			w.onRetryableFailure(ctx, a, m)
 		case outcome.ReauthRequired:
 			m.ReauthRequired++
-		default: // rotated/converged/no-op → 凭据已更新，保持 active
+		case outcome.Rotated || outcome.Converged:
+			// 凭据已更新（或他实例已处理）→ 保持 active。
 			w.onHealthy(ctx, a, m)
+		default:
+			// 审查修复 I-1：no-op = 无 refresh token 可轮换——401 是确定性
+			// 失效信号，不能让账号持死 token 保持 active 可调度。走与
+			// invalid_grant 同一守卫传播路径。
+			outcome, merr := w.refresher.MarkReauthRequired(ctx, cred.ID, "health probe 401 (no refresh token)", err)
+			switch {
+			case merr != nil:
+				m.Errors++
+				log.Printf("WARN upstream health: reauth propagation failed account=%s: %v", a.ID, merr)
+			case outcome.ReauthRequired:
+				m.ReauthRequired++
+			default: // converged：他实例已换代/处理
+				w.onHealthy(ctx, a, m)
+			}
 		}
 		return
 	}
@@ -377,7 +403,7 @@ func (w *UpstreamHealth) Start(ctx context.Context) {
 				log.Printf("WARN upstream health pass failed: %v", err)
 				continue
 			}
-			if m.CooledDown > 0 || m.Recovered > 0 || m.ReauthRequired > 0 || m.Errors > 0 {
+			if m.CooledDown > 0 || m.Recovered > 0 || m.ReauthRequired > 0 || m.Errors > 0 || m.BindingsExpired > 0 {
 				log.Printf("upstream health pass: %+v", m)
 			}
 		}

@@ -271,8 +271,9 @@ func TestUpstreamHealthSelfHostedServiceAuth(t *testing.T) {
 	if err := env.store.InsertUpstreamAccount(ctx, acct); err != nil {
 		t.Fatal(err)
 	}
-	defer env.db.Exec(`DELETE FROM inference_upstream_accounts WHERE id = $1`, acct.ID)
+	// 清理顺序敏感（defer LIFO）：先注册凭据/账号删除，保证账号先于凭据删。
 	defer env.db.Exec(`DELETE FROM inference_credentials WHERE id = $1`, credID)
+	defer env.db.Exec(`DELETE FROM inference_upstream_accounts WHERE id = $1`, acct.ID)
 
 	// 200 → healthy（且没有 OAuth 语义介入：connector 列保持空）。
 	env.vendor.mu.Lock()
@@ -309,5 +310,118 @@ func TestUpstreamHealthSelfHostedServiceAuth(t *testing.T) {
 	env.db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, acct.ID).Scan(&acctStatus)
 	if acctStatus != "reauth_required" {
 		t.Fatalf("rejected static credential must stop scheduling: %s", acctStatus)
+	}
+}
+
+// 审查修复 I-1（健康路径）：无 refresh token 的凭据健康探测 401 → 走
+// MarkReauthRequired 传播，账号离开调度池。
+func TestUpstreamHealth401NoRefreshTokenGoesReauth(t *testing.T) {
+	env := newRefreshEnv(t)
+	// 无 RT、未过期（过期场景由 refresh 包测试覆盖；这里钉 401 健康路径）。
+	_, accountID := env.seedCredentialWith(t, "", time.Now().Add(time.Hour))
+	ctx := context.Background()
+
+	env.vendor.mu.Lock()
+	env.vendor.health = 401
+	env.vendor.mu.Unlock()
+
+	m, err := env.healthWorker().RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ReauthRequired != 1 {
+		t.Fatalf("401 without refresh token must reauth: %+v", m)
+	}
+	var status string
+	env.db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, accountID).Scan(&status)
+	if status != "reauth_required" {
+		t.Fatalf("account must leave the pool: %s", status)
+	}
+	acts, err := env.store.ListActiveUpstreamAccounts(ctx, env.provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acts) != 0 {
+		t.Fatalf("dead-token account must not be schedulable: %d", len(acts))
+	}
+}
+
+// 审查修复 M-1：健康 worker 每轮清扫 TTL 到期的活跃绑定。
+func TestUpstreamHealthSweepsExpiredBindings(t *testing.T) {
+	env := newRefreshEnv(t)
+	_, accountID := env.seedExpiringCredential(t)
+	ctx := context.Background()
+
+	binding := &domain.SessionBinding{
+		SessionKey: "sess-expire", ModelID: env.modelID, AccountID: accountID,
+		Status: domain.BindingActive, ExpiresAt: time.Now().Add(-time.Minute), // 已到期
+	}
+	if err := env.store.InsertSessionBinding(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	m, err := env.healthWorker().RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.BindingsExpired < 1 {
+		t.Fatalf("health pass must sweep expired bindings: %+v", m)
+	}
+	var status string
+	env.db.QueryRow(`SELECT status FROM inference_session_bindings WHERE id = $1`, binding.ID).Scan(&status)
+	if status != "ended" {
+		t.Fatalf("expired binding must be ended by the worker: %s", status)
+	}
+}
+
+// 审查修复 M-3：nil ObservedAt 不得覆盖已知观测；token 端点 400
+// invalid_client 归 misconfigured（不计 retryable，不动账号）。
+func TestUpstreamHealthNilObservedAtGuard(t *testing.T) {
+	env := newRefreshEnv(t)
+	_, accountID := env.seedExpiringCredential(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	limit := domain.Microcredit(1000)
+	src := "reported"
+	ok, err := env.store.UpdateUpstreamAccountQuota(ctx, accountID, domain.UpstreamQuota{
+		LimitMicros: &limit, ObservedAt: &now, Source: &src,
+	})
+	if err != nil || !ok {
+		t.Fatalf("first observation must land: %v %v", ok, err)
+	}
+	// nil ObservedAt 覆盖已知观测：拒绝。
+	ok, err = env.store.UpdateUpstreamAccountQuota(ctx, accountID, domain.UpstreamQuota{
+		LimitMicros: &limit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("nil observed_at must not overwrite a known observation")
+	}
+	acct, _ := env.store.GetUpstreamAccount(ctx, accountID)
+	if acct.Quota.ObservedAt == nil || !acct.Quota.ObservedAt.Equal(now) {
+		t.Fatalf("known observation must survive: %+v", acct.Quota)
+	}
+}
+
+func TestCredentialRefreshWorkerMisconfigured(t *testing.T) {
+	env := newRefreshEnv(t)
+	_, accountID := env.seedExpiringCredential(t)
+	ctx := context.Background()
+
+	env.vendor.push(stubResponse{status: 400, body: `{"error":"invalid_client"}`})
+	w := NewCredentialRefresh(env.store, env.refresher(), CredentialRefreshConfig{}, nil)
+	m, err := w.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Misconfigured != 1 || m.Retryable != 0 || m.Rotated != 0 || m.ReauthRequired != 0 {
+		t.Fatalf("invalid_client must count as misconfigured only: %+v", m)
+	}
+	var acctStatus string
+	env.db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, accountID).Scan(&acctStatus)
+	if acctStatus != "active" {
+		t.Fatalf("misconfigured must not touch account state: %s", acctStatus)
 	}
 }

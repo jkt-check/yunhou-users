@@ -29,6 +29,7 @@ import (
 	inferencemanagement "github.com/yunhou/users/internal/inference/management"
 	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
 	inferenceproviders "github.com/yunhou/users/internal/inference/providers"
+	inferenceconnector "github.com/yunhou/users/internal/inference/providers/connector"
 	inferencequota "github.com/yunhou/users/internal/inference/quota"
 	inferencerouting "github.com/yunhou/users/internal/inference/routing"
 	inferenceworkers "github.com/yunhou/users/internal/inference/workers"
@@ -242,6 +243,22 @@ func main() {
 	credSvc := inferencecredentials.NewService(credVault, infStore, infStore)
 	catalogMgr := inferencemanagement.NewCatalogManager(catalogSvc, infStore, egressValidator.ValidateURL)
 	adminModelsHandler := inferencehttpapi.NewAdminModelsHandler(catalogMgr)
+
+	// Task 12: upstream OAuth connector registry + authorization/refresh
+	// services. The registry comes from the deployment secret env
+	// (INFERENCE_OAUTH_CONNECTORS_JSON); empty registry = authorization
+	// endpoints reject every connector key as unknown (fail closed). The
+	// connector HTTP client reuses the egress (SSRF) policy — vendor
+	// endpoints are outbound targets like any other upstream. This OAuth
+	// flow is fully separate from social login (GitHub/WeChat), by design.
+	oauthRegistry, err := inferenceconnector.ParseRegistry(cfg.InferenceOAuthConnectorsJSON)
+	if err != nil {
+		log.Fatalf("INFERENCE_OAUTH_CONNECTORS_JSON: %v", err)
+	}
+	connectorClient := &inferenceconnector.Client{HTTP: inferenceproviders.NewHTTPClient(egressValidator)}
+	oauthSvc := inferencecredentials.NewOAuthService(credVault, infStore, infStore, connectorClient, oauthRegistry, credSvc, nil)
+	credRefresher := inferencecredentials.NewRefresher(credVault, infStore, infStore, connectorClient, oauthRegistry, nil)
+
 	adminOps := &inferencehttpapi.AdminOps{
 		RequireModels:      inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermModelsManage),
 		RequireCredentials: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermCredentialsManage),
@@ -249,6 +266,7 @@ func main() {
 		Models:             adminModelsHandler,
 		Credentials:        inferencehttpapi.NewAdminCredentialsHandler(credSvc),
 		Auth:               inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
+		OAuth:              inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
 	}
 
 	// Task 5: customer API keys + caller principal resolution. The
@@ -418,6 +436,27 @@ func main() {
 		BatchLimit: cfg.InferenceEntitlementSyncBatch,
 	})
 	go entitlementSyncWorker.Start(rootCtx)
+
+	// Task 12: OAuth credential refresh + upstream health workers. The
+	// refresh worker rotates expiring oauth credentials under a cross-
+	// instance advisory lock + generation CAS (双实例同时刷新安全：输家收敛
+	// 不覆盖); vendor-side invalid_grant flips bound accounts to
+	// reauth_required and ends their session bindings in one transaction.
+	// The health worker probes accounts, observes upstream quota snapshots
+	// (unknown stays unknown — never derived from customer balances), and
+	// cools down / recovers accounts on retryable failures.
+	credentialRefreshWorker := inferenceworkers.NewCredentialRefresh(infStore, credRefresher, inferenceworkers.CredentialRefreshConfig{
+		Interval:    cfg.InferenceCredentialRefreshInterval,
+		BatchLimit:  cfg.InferenceCredentialRefreshBatch,
+		RefreshSkew: cfg.InferenceCredentialRefreshSkew,
+	}, nil)
+	go credentialRefreshWorker.Start(rootCtx)
+	upstreamHealthWorker := inferenceworkers.NewUpstreamHealth(infStore, credVault, connectorClient, credRefresher, oauthRegistry, infStore, inferenceworkers.UpstreamHealthConfig{
+		Interval:   cfg.InferenceUpstreamHealthInterval,
+		BatchLimit: cfg.InferenceUpstreamHealthBatch,
+		Cooldown:   cfg.InferenceUpstreamHealthCooldown,
+	}, nil)
+	go upstreamHealthWorker.Start(rootCtx)
 
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)

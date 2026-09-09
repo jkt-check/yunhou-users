@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yunhou/users/internal/inference/credentials"
+	"github.com/yunhou/users/internal/inference/providers/connector"
 )
 
 // Config holds all runtime configuration. Required fields are validated
@@ -209,6 +210,25 @@ type Config struct {
 	// entitlement grants). Defaults: 2s / 100 / 10min backoff cap.
 	InferenceEntitlementSyncInterval time.Duration
 	InferenceEntitlementSyncBatch    int
+
+	// InferenceOAuthConnectorsJSON is the upstream OAuth connector registry
+	// (Task 12): a JSON array of vendor specs (key, authorize/token/revoke/
+	// models/quota endpoints, client_id/secret, scopes, redirect_url, pkce).
+	// Deployment secret material (client_secret) lives here only — never in
+	// the DB, never logged. Empty = OAuth authorization endpoints reject
+	// every connector key as unknown.
+	// 注意：与社交登录（GitHub/WeChat OAuth）完全无关，互不复用配置。
+	InferenceOAuthConnectorsJSON string
+	// Credential-refresh worker (Task 12): proactive OAuth token rotation.
+	// Defaults: 60s / 50 per pass / refresh 5min before expiry.
+	InferenceCredentialRefreshInterval time.Duration
+	InferenceCredentialRefreshBatch    int
+	InferenceCredentialRefreshSkew     time.Duration
+	// Upstream-health worker (Task 12): account probes + quota observation.
+	// Defaults: 60s / 100 per pass / 5min cooldown before re-probe.
+	InferenceUpstreamHealthInterval time.Duration
+	InferenceUpstreamHealthBatch    int
+	InferenceUpstreamHealthCooldown time.Duration
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -271,6 +291,14 @@ func Load() *Config {
 		InferenceReconciliationDeadline:  parseDurationOr(envOr("INFERENCE_RECONCILIATION_DEADLINE", "24h"), 24*time.Hour),
 		InferenceEntitlementSyncInterval: parseDurationOr(envOr("INFERENCE_ENTITLEMENT_SYNC_INTERVAL", "2s"), 2*time.Second),
 		InferenceEntitlementSyncBatch:    parseIntOr(envOr("INFERENCE_ENTITLEMENT_SYNC_BATCH", "100"), 100),
+
+		InferenceOAuthConnectorsJSON:       os.Getenv("INFERENCE_OAUTH_CONNECTORS_JSON"),
+		InferenceCredentialRefreshInterval: parseDurationOr(envOr("INFERENCE_CREDENTIAL_REFRESH_INTERVAL", "60s"), 60*time.Second),
+		InferenceCredentialRefreshBatch:    parseIntOr(envOr("INFERENCE_CREDENTIAL_REFRESH_BATCH", "50"), 50),
+		InferenceCredentialRefreshSkew:     parseDurationOr(envOr("INFERENCE_CREDENTIAL_REFRESH_SKEW", "5m"), 5*time.Minute),
+		InferenceUpstreamHealthInterval:    parseDurationOr(envOr("INFERENCE_UPSTREAM_HEALTH_INTERVAL", "60s"), 60*time.Second),
+		InferenceUpstreamHealthBatch:       parseIntOr(envOr("INFERENCE_UPSTREAM_HEALTH_BATCH", "100"), 100),
+		InferenceUpstreamHealthCooldown:    parseDurationOr(envOr("INFERENCE_UPSTREAM_HEALTH_COOLDOWN", "5m"), 5*time.Minute),
 	}
 }
 
@@ -416,6 +444,15 @@ func (c *Config) Validate() error {
 	// requires raising INFERENCE_RECOVERY_GRACE accordingly.
 	if c.InferenceRecoveryGrace < 12*time.Minute {
 		return fmt.Errorf("INFERENCE_RECOVERY_GRACE=%s is below the 12m floor (must exceed worst live request phase: 700s SSE relay + 15s settlement)", c.InferenceRecoveryGrace)
+	}
+	// Task 12: OAuth connector registry must parse when present (each spec
+	// validated: endpoints absolute URLs, client_id/redirect_url required,
+	// keys unique). A typo discovered at startup beats a 500 at the first
+	// authorization attempt.
+	if c.InferenceOAuthConnectorsJSON != "" {
+		if _, err := connector.ParseRegistry(c.InferenceOAuthConnectorsJSON); err != nil {
+			return fmt.Errorf("INFERENCE_OAUTH_CONNECTORS_JSON: %v", err)
+		}
 	}
 	return nil
 }

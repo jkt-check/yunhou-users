@@ -20,6 +20,9 @@ type AdminOps struct {
 	Models      *AdminModelsHandler
 	Credentials *AdminCredentialsHandler
 	Auth        *AdminAuthHandler
+	// OAuth guards the upstream OAuth authorization lifecycle (Task 12);
+	// mounted under the same credentials:manage permission.
+	OAuth *AdminOAuthHandler
 }
 
 // Mount wires the write surface onto g. The caller must already have
@@ -31,6 +34,9 @@ func (o *AdminOps) Mount(g *gin.RouterGroup) {
 	}
 	if o.Credentials != nil && o.RequireCredentials != nil {
 		o.Credentials.Register(g.Group("", o.RequireCredentials))
+	}
+	if o.OAuth != nil && o.RequireCredentials != nil {
+		o.OAuth.Register(g.Group("", o.RequireCredentials))
 	}
 	if o.Auth != nil && o.RequireAdmin != nil {
 		o.Auth.RegisterOperators(g.Group("", o.RequireAdmin))

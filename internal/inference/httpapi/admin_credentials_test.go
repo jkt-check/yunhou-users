@@ -66,6 +66,7 @@ func setupTask4(t *testing.T) *task4Env {
 	// repo tests, Task 3 catalog tests) leave models/providers behind, and
 	// publish validates the whole draft — leftovers would fail this suite.
 	if _, err := db.Exec(`TRUNCATE
+		inference_session_bindings, inference_oauth_grants,
 		inference_audit_log, operator_roles,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,

@@ -139,7 +139,7 @@ func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 		if err != nil {
 			return nil, err
 		}
-		for _, a := range s.orderAccounts(d.ProviderID, accounts, now) {
+		for _, a := range s.orderAccountsWithQuota(d.ProviderID, accounts, now) {
 			out = append(out, Candidate{Route: route, Deployment: d, Account: a})
 		}
 	}

@@ -224,8 +224,11 @@ type Credential struct {
 	// LastRotatedAt is set by the rotate path (migration 025).
 	LastRotatedAt *time.Time
 	Status        string // "active" | "rotating" | "revoked"
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// Connector is the OAuth connector registry key this credential was
+	// authorized through (migration 032); empty for api_key/service rows.
+	Connector string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // CredentialResolver resolves caller/upstream credentials into principals
@@ -246,4 +249,60 @@ type CredentialResolver interface {
 // only when no explicit plan exists and never stack or auto-fallback.
 type EntitlementResolver interface {
 	Resolve(ctx context.Context, billingAccountID, modelID string, at time.Time) (*Entitlement, error)
+}
+
+// ---------------------------------------------------------------------------
+// Task 12: OAuth authorization grants & sticky session bindings (设计 §8)
+// ---------------------------------------------------------------------------
+
+// OAuthGrant is one pending authorization flow: a one-time state bound to
+// the initiating operator (user + app), the target provider, and an expiry
+// (设计 §8: state 绑定发起运营人员、目标账号/供应商及有效期). The PKCE
+// verifier is a short-lived server-side secret and never leaves the
+// credentials boundary. Consumed rows are kept for audit.
+type OAuthGrant struct {
+	ID             string
+	State          string
+	Connector      string
+	ProviderID     string
+	AccountLabel   string
+	CodeVerifier   string
+	OperatorUserID string
+	OperatorAppID  string
+	ExpiresAt      time.Time
+	ConsumedAt     *time.Time
+	CreatedAt      time.Time
+}
+
+// SessionBindingStatus is the sticky-session binding lifecycle.
+type SessionBindingStatus string
+
+const (
+	BindingActive SessionBindingStatus = "active"
+	BindingEnded  SessionBindingStatus = "ended"
+)
+
+// Well-known ended reasons (审计可读口径).
+const (
+	BindingEndedAccountInvalid = "account_invalid" // 账号失效：reauth/disabled/revoked
+	BindingEndedMigrated       = "migrated"        // 显式迁移（新会话语义重建）
+	BindingEndedExpired        = "expired"         // 到期清扫
+	BindingEndedOperator       = "operator_end"    // 运营显式终止
+)
+
+// SessionBinding pins one (session_key, model_id) conversation to one
+// upstream account (设计 §8: 需要会话黏性时绑定具体账号，撤销或失效后按照
+// 协议要求终止/重建会话，不能无条件切账号续接).
+type SessionBinding struct {
+	ID          string
+	SessionKey  string
+	ModelID     string
+	AccountID   string
+	Status      SessionBindingStatus
+	EndedReason *string
+	BoundAt     time.Time
+	LastUsedAt  time.Time
+	ExpiresAt   time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }

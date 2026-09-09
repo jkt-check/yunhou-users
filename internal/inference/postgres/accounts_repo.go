@@ -141,10 +141,10 @@ func insertCredential(ctx context.Context, ex sqlxExecutor, c *domain.Credential
 	}
 	err := ex.QueryRowxContext(ctx,
 		`INSERT INTO inference_credentials
-		 (id, provider_id, label, auth_type, ciphertext, key_version, generation, expires_at, status)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 (id, provider_id, label, auth_type, ciphertext, key_version, generation, expires_at, status, connector)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		 RETURNING created_at, updated_at`,
-		c.ID, c.ProviderID, c.Label, c.AuthType, c.Ciphertext, c.KeyVersion, c.Generation, c.ExpiresAt, status).
+		c.ID, c.ProviderID, c.Label, c.AuthType, c.Ciphertext, c.KeyVersion, c.Generation, c.ExpiresAt, status, c.Connector).
 		Scan(&c.CreatedAt, &c.UpdatedAt)
 	return mapError("insert credential", err)
 }
@@ -163,6 +163,7 @@ func (s *Store) GetCredential(ctx context.Context, id string) (*domain.Credentia
 		ExpiresAt     *time.Time `db:"expires_at"`
 		LastRotatedAt *time.Time `db:"last_rotated_at"`
 		Status        string     `db:"status"`
+		Connector     string     `db:"connector"`
 		CreatedAt     time.Time  `db:"created_at"`
 		UpdatedAt     time.Time  `db:"updated_at"`
 	}
@@ -175,7 +176,7 @@ func (s *Store) GetCredential(ctx context.Context, id string) (*domain.Credentia
 		ID: row.ID, ProviderID: row.ProviderID, Label: row.Label, AuthType: row.AuthType,
 		Ciphertext: row.Ciphertext, KeyVersion: row.KeyVersion, Generation: row.Generation,
 		ExpiresAt: row.ExpiresAt, LastRotatedAt: row.LastRotatedAt, Status: row.Status,
-		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+		Connector: row.Connector, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}, nil
 }
 
@@ -186,7 +187,7 @@ func (s *Store) ListCredentials(ctx context.Context, providerID string, limit in
 		limit = 100
 	}
 	query := `SELECT id, provider_id, label, auth_type, ciphertext, key_version, generation,
-		expires_at, last_rotated_at, status, created_at, updated_at
+		expires_at, last_rotated_at, status, connector, created_at, updated_at
 	  FROM inference_credentials`
 	var args []interface{}
 	if providerID != "" {
@@ -205,6 +206,7 @@ func (s *Store) ListCredentials(ctx context.Context, providerID string, limit in
 		ExpiresAt     *time.Time `db:"expires_at"`
 		LastRotatedAt *time.Time `db:"last_rotated_at"`
 		Status        string     `db:"status"`
+		Connector     string     `db:"connector"`
 		CreatedAt     time.Time  `db:"created_at"`
 		UpdatedAt     time.Time  `db:"updated_at"`
 	}
@@ -217,7 +219,7 @@ func (s *Store) ListCredentials(ctx context.Context, providerID string, limit in
 			ID: r.ID, ProviderID: r.ProviderID, Label: r.Label, AuthType: r.AuthType,
 			Ciphertext: r.Ciphertext, KeyVersion: r.KeyVersion, Generation: r.Generation,
 			ExpiresAt: r.ExpiresAt, LastRotatedAt: r.LastRotatedAt, Status: r.Status,
-			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+			Connector: r.Connector, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}
 	return out, nil

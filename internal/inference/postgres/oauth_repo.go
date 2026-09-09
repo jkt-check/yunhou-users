@@ -157,6 +157,14 @@ func (s *Store) GetCredentialTx(ctx context.Context, w domain.UnitOfWork, id str
 // ListOAuthCredentialsExpiring returns active oauth credentials whose
 // expires_at falls before `before` (the refresh worker's scan). Credentials
 // without an expiry are not proactively refreshed.
+//
+// Scan-set membership additionally requires at least one SCHEDULABLE bound
+// account (active/refreshing/cooldown): after a definitive vendor rejection
+// the reauth propagation flips every bound account to reauth_required while
+// the credential row itself stays active+expired — without this filter the
+// credential would be re-scanned every pass, re-calling the vendor for a
+// grant already known dead and re-writing the same audit row (Task 13 M-4).
+// The EXISTS form keeps this fix DDL-free (no new credential status value).
 func (s *Store) ListOAuthCredentialsExpiring(ctx context.Context, before time.Time, limit int) ([]domain.Credential, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -180,6 +188,9 @@ func (s *Store) ListOAuthCredentialsExpiring(ctx context.Context, before time.Ti
 		`SELECT * FROM inference_credentials
 		  WHERE auth_type = 'oauth' AND status = 'active'
 		    AND expires_at IS NOT NULL AND expires_at < $1
+		    AND EXISTS (SELECT 1 FROM inference_upstream_accounts a
+		                 WHERE a.credential_id = inference_credentials.id
+		                   AND a.status IN ('active', 'refreshing', 'cooldown'))
 		  ORDER BY expires_at LIMIT $2`, before, limit); err != nil {
 		return nil, mapError("list expiring oauth credentials", err)
 	}

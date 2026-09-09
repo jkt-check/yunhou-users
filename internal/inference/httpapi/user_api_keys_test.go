@@ -62,6 +62,7 @@ func newAccessFixture(t *testing.T, accountRPM int) *accessFixture {
 	_, err = db.Exec(`TRUNCATE
 		inference_audit_log,
 		operator_roles,
+		inference_response_chains,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,

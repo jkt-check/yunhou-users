@@ -42,6 +42,7 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 	// attempts FK ring makes manual DELETE ordering brittle — same idiom as
 	// internal/repo tests), then the legacy tables in FK-safe order.
 	if _, err := db.ExecContext(context.Background(), `TRUNCATE
+		inference_response_chains,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,

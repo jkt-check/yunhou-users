@@ -65,6 +65,7 @@ func testDB(t *testing.T) (*sqlx.DB, *postgres.Store, *catalog.Service) {
 func wipe(t *testing.T, db *sqlx.DB) {
 	t.Helper()
 	_, err := db.Exec(`TRUNCATE
+		inference_response_chains,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,

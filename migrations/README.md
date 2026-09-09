@@ -80,3 +80,4 @@ syntax, **not** transaction control — those are fine.
 | `029_order_benefit_snapshot.sql` | 下单权益快照：orders 增加 product_code/plan_interval_days/benefit_policy_version_id/benefit_model_ids/benefit_grant_mode/order_kind/upgrade_from_plan_id（支付回调只按快照兑现；存量订单按 plan 当前值回填）；新增 plan_benefit_configs（套餐→权益版本发布配置，无配置的商品不可购买）与 plan_upgrade_rules（跨档升级显式规则）（Task 10） |
 | `031_inference_settlement_recovery.sql` | 幂等结算与崩溃恢复：charge 允许零额（零消费恒落行）、reconciliation reason 增 settlement_overage、窗口级任务部分唯一索引、请求行持久化准入上界（Task 9；030 起空号经控制者裁决） |
 | `032_inference_oauth_sessions.sql` | inference OAuth 授权状态（一次性 state + PKCE，独立于社交登录）与粘性会话绑定表组（Task 12；控制者裁决确需 DDL 从 032 起） |
+| `033_inference_response_chains.sql` | OpenAI Responses 会话链持久化：previous_response_id 接续的 transcript 回放 + 账户/上游账号归属（Task 13） |

@@ -60,6 +60,7 @@ func wipeViews(t *testing.T, db *sqlx.DB) {
 	t.Helper()
 	_, err := db.Exec(`TRUNCATE
 		inference_audit_log, operator_roles,
+		inference_response_chains,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,
@@ -123,10 +124,10 @@ func mustMicro(v int64) *domain.Microcredit { m := domain.Microcredit(v); return
 // seedViewGraph seeds a full customer graph: policy + entitlement + three
 // window rows + one settled request with usage + one parked request.
 type viewGraph struct {
-	accountID string
-	entID     string
-	policyID  string
-	windows   map[domain.WindowKind]string
+	accountID  string
+	entID      string
+	policyID   string
+	windows    map[domain.WindowKind]string
 	reqSettled string
 	reqParked  string
 }

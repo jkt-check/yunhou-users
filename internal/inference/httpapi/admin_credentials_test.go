@@ -2,8 +2,8 @@ package httpapi_test
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"crypto/rsa"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -66,6 +66,7 @@ func setupTask4(t *testing.T) *task4Env {
 	// repo tests, Task 3 catalog tests) leave models/providers behind, and
 	// publish validates the whole draft — leftovers would fail this suite.
 	if _, err := db.Exec(`TRUNCATE
+		inference_response_chains,
 		inference_session_bindings, inference_oauth_grants,
 		inference_audit_log, operator_roles,
 		inference_reconciliation_jobs, inference_outbox,
@@ -424,7 +425,6 @@ func task4ProviderID(t *testing.T, db *sqlx.DB) string {
 	}
 	return id
 }
-
 
 // TestOperatorJWTBoundToVerifiedApp: the two identity legs must BIND. A
 // stolen operator JWT issued for another app presented together with a valid

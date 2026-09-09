@@ -553,6 +553,48 @@ Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-
 
 ---
 
+### 标准协议接口 `/v1/*` — 编程工具接入（Claude Code / Codex 等）
+
+编程工具用客户 API Key 直连标准协议面。鉴权：`Authorization: Bearer <key>`（OpenAI 风格）或 `X-Api-Key: <key>`（Anthropic 风格，两者同值域）。同一 principal/预占/结算链贯穿所有协议面 —— 额度口径、429 语义、账本分类与协议无关。
+
+| 端点 | 协议 | 目标客户端 |
+|---|---|---|
+| `GET /v1/models` | OpenAI 模型列表形状 | 通用（Anthropic 形状的模型列表端点不实现） |
+| `POST /v1/chat/completions` | OpenAI Chat Completions（流式/非流式） | 通用 OpenAI SDK 客户端 |
+| `POST /v1/messages` | Anthropic Messages（API 版本 `2023-06-01` 子集） | Claude Code 及 Anthropic SDK |
+| `POST /v1/responses` | OpenAI Responses（流式/非流式） | Codex 及 Responses SDK |
+
+**协议版本记录**：Anthropic Messages 按 `2023-06-01` 请求/响应/事件形状验证；OpenAI Responses 按 2025 年公开形状（`response.created`/`output_item`/`response.completed` 事件族）验证。契约级验证基于官方 SDK 请求样例与官方文档 fixture（请求/响应形状、流式事件序列、错误映射）；**真实客户端联调在 Task 16 演练环境进行**。
+
+**能力矩阵（不支持 = 明确 400，绝不静默丢弃）**
+
+| 能力 | /v1/chat/completions | /v1/messages | /v1/responses |
+|---|---|---|---|
+| 文本对话（多轮） | ✅ | ✅ | ✅ |
+| 工具调用（自定义 function/custom 工具，ID 逐字保留） | ✅ | ✅ | ✅（`function_call`/`function_call_output`） |
+| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled` | ✅ `thinking.type=enabled`（`budget_tokens` 校验 < `max_tokens` 且 ≥1024） | ✅ `reasoning.effort`（low/medium/high → 开；none/minimal → 关） |
+| 流式 SSE | ✅（`[DONE]` 终止） | ✅（`message_stop` 终止） | ✅（`response.completed`/`response.incomplete` 终止） |
+| 采样参数 | `temperature`/`top_p`/`stop`/`presence_penalty`/`frequency_penalty`/`seed` | `temperature`/`top_p`/`top_k`/`stop_sequences` | `temperature`/`top_p`/`parallel_tool_calls` |
+| `tool_choice` | ✅ OpenAI 全形状 | ✅ `auto`/`any`/`none`/`tool`（`disable_parallel_tool_use` 映射 `parallel_tool_calls=false`） | ✅ `auto`/`none`/`required`/指定 function |
+| 多模态（图片/文件/音频输入或输出） | ❌ 400 | ❌ 400（`image`/`document` 块） | ❌ 400（`input_image`/`input_file` part） |
+| 服务端工具（web_search/computer/bash/code_execution/mcp 等） | ❌ 400（无执行面） | ❌ 400 | ❌ 400（含 `web_search_call` 等结果项与 `item_reference`） |
+| `n>1` / logprobs / prediction / 结构化输出（`response_format`、`text.format=json_*`） | ❌ 400 | n/a | ❌ 400 |
+| `background:true` / 非空 `include` / `max_tool_calls` / `truncation:auto` | n/a | n/a | ❌ 400（无异步面/附加数据面；服务端静默裁剪上下文违反不静默原则） |
+
+**接受但不保证生效的字段（已在文档明示，非静默丢弃）**：`metadata`（客户端标记，不消费）、`cache_control`（成本提示，上游不保证生效）、Messages 历史中的 `thinking`/`redacted_thinking` 块（chat 形状上游无回放语义，接受并丢弃；文本与工具调用连续性不受影响）、`tool_result.is_error` 标志（无对应上游字段，错误文本照常传递）、Responses 输入中的 `reasoning` 项（同上，不回放）。模型未声明支持工具/推理时携带对应字段 → 400（先于任何计费）。
+
+**用法/用量映射**：Messages 面 `usage.input_tokens` 不含 cache_read（Anthropic 口径），`cache_read_input_tokens`/`cache_creation_input_tokens` 单列；Responses 面 `input_tokens` 含 cached（OpenAI 口径）+ `input_tokens_details.cached_tokens`。流式 `message_start.usage` 是协议占位（0/0），真实值在终止 `message_delta.usage`（含 `input_tokens`，当前 Anthropic SDK 的 `MessageDeltaUsage` 支持该字段）。非流式响应在上游确实未报 usage 时不伪造 usage 字段。
+
+**流式中断语义（三协议一致）**：协议终止标记（`[DONE]`/`message_stop`/`response.completed`）是唯一干净结束；上游中断时向流内注入该协议的原生错误事件（chat：内联 `{"error":...}` 块；messages：`event: error`；responses：`event: error`）后结束，**绝不伪造终止标记**。已读用量照常结算（estimated）；未读用量挂起核对（不记零）。
+
+**Responses 会话链（`previous_response_id`）**：成功响应（`store` 缺省 true）持久化截至本轮的完整规范 items transcript + 账户归属 + 实际服务账号（24h TTL，超 512 KiB 的 transcript 不落链）。引用链的请求 = transcript 回放（既有上下文 + 新输入），并经粘性会话绑定钉住同一上游账号；账号失效时显式迁移（旧绑定终止 reason=migrated + 新绑定同事务建立），**绝不静默换号续接**。`store:false` 的响应不落链；引用不存在/过期/他人/`store:false` 的响应一律 404（`previous_response_not_found`，不泄漏存在性）。`GET /v1/responses/{id}`（OpenAI stored-response 读取面）不实现。
+
+**限制**：请求体 ≤1 MiB；消息/输入项 ≤512；工具 ≤128（总 ≤256 KiB）；模型 id ≤128 字符。Messages 面 `max_tokens` 必填（Anthropic 语义）。
+
+**WebSocket**：不实现 —— 目标接入（Claude Code / Codex）均走 HTTP SSE，无 WebSocket 需求。
+
+---
+
 ### Chat 接口
 
 Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的 DeepSeek API Key 代为调用模型，并把流式响应原样转发给客户端。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：

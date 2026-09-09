@@ -101,6 +101,10 @@ type Service struct {
 	egress       providers.EgressChecker
 	clock        domain.Clock
 
+	// sessions is the sticky-session binder (Task 12/13); nil = session
+	// pinning not configured (session-keyed entry points fail closed).
+	sessions *routing.SessionBinder
+
 	// MaxAttempts bounds the failover loop (default 3, never above the
 	// candidate count). Every attempt persists its own row; the customer
 	// settles once per request.
@@ -130,6 +134,23 @@ func NewService(snapshots SnapshotSource, store Store, entitlements *access.Enti
 	}
 }
 
+// SetSessionBinder wires the sticky-session binder (Task 13: Responses
+// 会话链经 SessionBinding 钉住上游账号). Called once at assembly.
+func (s *Service) SetSessionBinder(b *routing.SessionBinder) { s.sessions = b }
+
+// BindSession pins (sessionKey, modelID) to the account that served the
+// chain's first turn (called by the protocol surface AFTER a successful
+// unbound response). A CodeConflict means a parallel first-turn already
+// bound it — the caller logs and moves on (binding is affinity, not
+// correctness).
+func (s *Service) BindSession(ctx context.Context, sessionKey, modelID, accountID string) error {
+	if s.sessions == nil {
+		return domain.NewError(domain.CodeInternal, "gateway: sticky sessions not configured")
+	}
+	_, err := s.sessions.Bind(ctx, sessionKey, modelID, accountID)
+	return err
+}
+
 // detached is the settlement context factory: decoupled from the (possibly
 // canceled) request context, with its own deadline (设计 §7.2).
 func detached(d time.Duration) (context.Context, context.CancelFunc) {
@@ -142,6 +163,13 @@ func detached(d time.Duration) (context.Context, context.CancelFunc) {
 type Outcome struct {
 	RequestID string
 	ModelID   string
+	// AccountID is the upstream account that served the call (the winning
+	// attempt) — the sticky-session binder pins on it (Task 13).
+	AccountID string
+	// Inclusion is the winning adapter's usage overlap declaration (cache
+	// read inside input or not); client-surface translators normalize their
+	// native usage shapes from it (Task 13).
+	Inclusion accounting.Inclusion
 	// Payload is the OpenAI-shaped chat.completion body (non-streaming).
 	Payload []byte
 	// Stream is the streaming result (OpenAI-shaped SSE + usage tap).
@@ -228,6 +256,23 @@ func (s *StreamBody) Finish(end StreamEnd) error {
 // reconciliation_required (unknown) — never a dangling hold.
 func (s *Service) ChatCompletions(ctx context.Context, p *domain.Principal, key *domain.APIKey,
 	clientProto domain.Protocol, req *providers.ChatRequest) (*Outcome, error) {
+	return s.run(ctx, p, key, clientProto, req, "")
+}
+
+// ChatCompletionsSticky is ChatCompletions with a sticky-session key (Task
+// 13: Responses 会话链): the call dispatches ONLY to the account bound to
+// (sessionKey, model). Binding semantics follow Task 12 — a dead binding is
+// never silently continued on another account: a temporarily unschedulable
+// bound account fails the call retryable; an invalidated account migrates
+// EXPLICITLY (SessionBinder.Migrate, 新会话语义重建——协议层携带完整
+// transcript 回放).
+func (s *Service) ChatCompletionsSticky(ctx context.Context, p *domain.Principal, key *domain.APIKey,
+	clientProto domain.Protocol, req *providers.ChatRequest, sessionKey string) (*Outcome, error) {
+	return s.run(ctx, p, key, clientProto, req, sessionKey)
+}
+
+func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIKey,
+	clientProto domain.Protocol, req *providers.ChatRequest, sessionKey string) (*Outcome, error) {
 	if p == nil || p.BillingAccountID == "" {
 		return nil, domain.NewError(domain.CodeInvalidKey, "gateway: unauthenticated caller (fail closed)")
 	}
@@ -322,8 +367,76 @@ func (s *Service) ChatCompletions(ctx context.Context, p *domain.Principal, key 
 		return nil, domain.NewError(domain.CodeUpstreamUnavailable,
 			"no compatible deployment with capacity for model "+m.ID)
 	}
+	// Sticky session: narrow the candidate set to the bound account (Task
+	// 13). Failures here release the reservation — no upstream spend.
+	if sessionKey != "" {
+		cands, err = s.pinSessionCandidates(ctx, sessionKey, m.ID, cands)
+		if err != nil {
+			s.releaseAdmission(requestID, adm.AccountLease)
+			return nil, err
+		}
+	}
 
 	return s.dispatchLoop(ctx, requestID, adm, req, creditPrice, cands)
+}
+
+// pinSessionCandidates narrows the failover set to the session's bound
+// account following the Task 12 binder semantics:
+//   - Resolve OK: dispatch only to the bound account. When routing's live
+//     view excludes it (in-process cooldown / quota race) the call fails
+//     RETRYABLE — transient fullness never rebinds.
+//   - CodeNotFound: bind to the first candidate's account (first turn of a
+//     chain) and dispatch there.
+//   - CodeConflict (account invalidated — reauth/disabled/quota-exhausted):
+//     explicit Migrate to the first candidate (同事务终止旧绑定+建新), never
+//     a silent account switch. The protocol layer carries the full
+//     transcript, so the migration IS the protocol-level session rebuild.
+func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID string, cands []routing.Candidate) ([]routing.Candidate, error) {
+	if s.sessions == nil {
+		return nil, domain.NewError(domain.CodeInternal, "gateway: sticky sessions not configured")
+	}
+	for tries := 0; tries < 2; tries++ {
+		binding, _, err := s.sessions.Resolve(ctx, sessionKey, modelID)
+		switch {
+		case err == nil:
+			pinned := filterCandidatesByAccount(cands, binding.AccountID)
+			if len(pinned) == 0 {
+				return nil, domain.NewError(domain.CodeUpstreamUnavailable,
+					"session-bound account is temporarily unavailable; retry shortly")
+			}
+			return pinned, nil
+		case domain.CodeOf(err) == domain.CodeNotFound:
+			if _, berr := s.sessions.Bind(ctx, sessionKey, modelID, cands[0].Account.ID); berr != nil {
+				if domain.CodeOf(berr) == domain.CodeConflict {
+					continue // parallel first-turn binding — re-resolve
+				}
+				return nil, domain.WrapError(domain.CodeInternal, "gateway: bind session", berr)
+			}
+			return filterCandidatesByAccount(cands, cands[0].Account.ID), nil
+		case domain.CodeOf(err) == domain.CodeConflict:
+			if _, merr := s.sessions.Migrate(ctx, sessionKey, modelID, cands[0].Account.ID); merr != nil {
+				if domain.CodeOf(merr) == domain.CodeConflict {
+					continue // concurrent migration — re-resolve
+				}
+				return nil, domain.WrapError(domain.CodeInternal, "gateway: migrate session", merr)
+			}
+			return filterCandidatesByAccount(cands, cands[0].Account.ID), nil
+		default:
+			return nil, domain.WrapError(domain.CodeInternal, "gateway: resolve session", err)
+		}
+	}
+	return nil, domain.NewError(domain.CodeUpstreamUnavailable, "session binding raced; retry")
+}
+
+// filterCandidatesByAccount keeps only the triples served by accountID.
+func filterCandidatesByAccount(cands []routing.Candidate, accountID string) []routing.Candidate {
+	out := make([]routing.Candidate, 0, len(cands))
+	for _, c := range cands {
+		if c.Account.ID == accountID {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // dispatchLoop walks the candidates with the bounded-retry policy. Every
@@ -528,10 +641,17 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 		return nil, de
 	}
 
+	var outcome *Outcome
 	if req.Stream {
-		return s.onStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
+		outcome, err = s.onStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
+	} else {
+		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
 	}
-	return s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
+	if err == nil && outcome != nil {
+		outcome.AccountID = cand.Account.ID
+		outcome.Inclusion = adapter.Inclusion()
+	}
+	return outcome, err
 }
 
 // persistAttempt commits the attempt row and the upstream-account lease in

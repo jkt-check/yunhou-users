@@ -154,6 +154,14 @@ func Setup(
 		if accessOps.V1ChatCompletions != nil {
 			v1.POST("/chat/completions", accessOps.V1ChatCompletions.Create)
 		}
+		// Task 13 protocol routes: Anthropic Messages / OpenAI Responses
+		// native surfaces (same auth chain, same gateway闸门).
+		if accessOps.V1Messages != nil {
+			v1.POST("/messages", accessOps.V1Messages.Create)
+		}
+		if accessOps.V1Responses != nil {
+			v1.POST("/responses", accessOps.V1Responses.Create)
+		}
 	}
 
 	// App routes (internal service auth)

@@ -374,34 +374,9 @@ func (h *ChatCompletionsHandler) relayStream(c *gin.Context, outcome *gateway.Ou
 func writeV1DomainError(c *gin.Context, err error) {
 	var qe *domain.QuotaExceededError
 	if errors.As(err, &qe) {
-		message := "quota exceeded"
-		kinds := ""
-		allKnown := len(qe.BlockedBy) > 0
-		var reset time.Time
-		for i, b := range qe.BlockedBy {
-			if i > 0 {
-				kinds += ","
-			}
-			kinds += string(b.Kind)
-			if b.ResetsAt == nil {
-				allKnown = false
-			} else if reset.IsZero() || b.ResetsAt.After(reset) {
-				reset = *b.ResetsAt
-			}
-		}
-		if kinds != "" {
-			message = "quota exceeded: blocked by " + kinds
-		}
-		if qe.KeyBudgetExhausted {
-			message += "; key budget exhausted"
-		}
-		if qe.DeficitMicros != nil {
-			message += "; deficit_micros=" + strconv.FormatInt(int64(*qe.DeficitMicros), 10)
-		}
-		if allKnown && !reset.IsZero() {
-			if secs := int(time.Until(reset).Seconds()) + 1; secs > 0 {
-				c.Header("Retry-After", strconv.Itoa(secs))
-			}
+		message, retryAfter := quotaExceededDetails(qe)
+		if retryAfter > 0 {
+			c.Header("Retry-After", strconv.Itoa(retryAfter))
 		}
 		v1Error(c, http.StatusTooManyRequests, "rate_limit_error", "quota_exceeded", message)
 		return
@@ -428,6 +403,42 @@ func writeV1DomainError(c *gin.Context, err error) {
 		log.Printf("v1 internal error: %v", err)
 		v1Error(c, http.StatusInternalServerError, "server_error", "internal_error", "internal error")
 	}
+}
+
+// quotaExceededDetails renders the shared quota message and the Retry-After
+// seconds (0 = unknown recovery — 不能编造倒计时). All three protocol
+// surfaces (chat/messages/responses) render the same 429 detail.
+func quotaExceededDetails(qe *domain.QuotaExceededError) (message string, retryAfterSecs int) {
+	message = "quota exceeded"
+	kinds := ""
+	allKnown := len(qe.BlockedBy) > 0
+	var reset time.Time
+	for i, b := range qe.BlockedBy {
+		if i > 0 {
+			kinds += ","
+		}
+		kinds += string(b.Kind)
+		if b.ResetsAt == nil {
+			allKnown = false
+		} else if reset.IsZero() || b.ResetsAt.After(reset) {
+			reset = *b.ResetsAt
+		}
+	}
+	if kinds != "" {
+		message = "quota exceeded: blocked by " + kinds
+	}
+	if qe.KeyBudgetExhausted {
+		message += "; key budget exhausted"
+	}
+	if qe.DeficitMicros != nil {
+		message += "; deficit_micros=" + strconv.FormatInt(int64(*qe.DeficitMicros), 10)
+	}
+	if allKnown && !reset.IsZero() {
+		if secs := int(time.Until(reset).Seconds()) + 1; secs > 0 {
+			retryAfterSecs = secs
+		}
+	}
+	return message, retryAfterSecs
 }
 
 // safeMsg exposes the domain error's Message (never the cause chain, which

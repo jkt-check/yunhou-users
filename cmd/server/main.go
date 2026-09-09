@@ -292,6 +292,9 @@ func main() {
 	gatewaySvc := inferencegateway.NewService(
 		catalogCache, infStore, entitlementResolver, quotaSvc, routingSvc,
 		credSvc, gatewayHTTPClient, egressValidator, nil)
+	// Task 13: sticky-session binder wiring (Responses 会话链钉住上游账号;
+	// 失效显式迁移,绝不静默换号 — Task 12 binder 语义).
+	gatewaySvc.SetSessionBinder(inferencerouting.NewSessionBinder(infStore, nil))
 
 	// Sellable gate for the published-model listings (/v1/models and
 	// /chat/models): a model without an effective sale-credit price version
@@ -313,6 +316,11 @@ func main() {
 		RPMCounter:        rpmCounter,
 		V1Models:          inferencehttpapi.NewModelsHandler(catalogSvc, accessResolver),
 		V1ChatCompletions: inferencehttpapi.NewChatCompletionsHandler(gatewaySvc),
+		// Task 13: Anthropic Messages / OpenAI Responses 编程工具面（与 chat
+		// 面共用同一 principal/预占/结算链；Responses 会话链落库 + 粘性会话
+		// 绑定经 routing.SessionBinding）。
+		V1Messages:  inferencehttpapi.NewMessagesHandler(gatewaySvc),
+		V1Responses: inferencehttpapi.NewResponsesHandler(gatewaySvc, infStore, nil),
 		// Task 11: customer quota/usage/subscription read views over the
 		// inference store (quota reads are the authoritative current state;
 		// usage reads carry as_of/complete_through).
@@ -388,7 +396,9 @@ func main() {
 	// chatUpstreamTimeout (legacy /chat) plus per-response write deadlines
 	// set by the handlers (the server-wide WriteTimeout below is an absolute
 	// per-request deadline — it would hard-cut a longer stream).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions"))
+	// Task 13: /v1/messages and /v1/responses get the same exemption (same
+	// SSE relay pattern, same per-response write deadline in the handlers).
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,

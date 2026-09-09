@@ -46,11 +46,13 @@ func (a *OpenAIChat) Inclusion() accounting.Inclusion {
 }
 
 // passthroughKeys are the sampling parameters this adapter relays verbatim.
-var passthroughKeys = []string{"temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "seed"}
+var passthroughKeys = []string{"temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "seed", "parallel_tool_calls"}
 
 // BuildPayload implements Adapter. Adapted from the candidate's
 // BuildOpenAIPayload: same payload keys, plus the forced max_tokens cap,
-// tool_choice and the passthrough allowlist.
+// tool_choice and the passthrough allowlist. Passthrough keys OUTSIDE the
+// allowlist are rejected explicitly — never silently dropped (设计: 不能静默
+// 丢字段; e.g. Anthropic's top_k has no chat-completions equivalent).
 func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
 	payload := map[string]any{
@@ -77,6 +79,19 @@ func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 	for _, k := range passthroughKeys {
 		if v, ok := r.Passthrough[k]; ok {
 			payload[k] = v
+		}
+	}
+	for k := range r.Passthrough {
+		known := false
+		for _, allowed := range passthroughKeys {
+			if k == allowed {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return nil, domain.NewError(domain.CodeInvalidInput,
+				"providers: parameter "+k+" is not supported by the openai_chat protocol")
 		}
 	}
 	return json.Marshal(payload)

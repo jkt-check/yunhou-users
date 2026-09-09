@@ -96,7 +96,10 @@ func (t *teeReader) Close() error { return t.body.Close() }
 const trackLineCap = 64 << 10
 
 // openAIUsage is the OpenAI usage object shape, including the detail
-// sub-objects that carry cache/reasoning breakdowns.
+// sub-objects that carry cache/reasoning breakdowns. The
+// cache_creation_input_tokens extension key is Anthropic-origin wire data
+// (OpenAI servers never send it; OpenAI clients ignore unknown keys) so the
+// client-surface translators can render the Messages cache-creation bucket.
 type openAIUsage struct {
 	PromptTokens     *int64 `json:"prompt_tokens"`
 	CompletionTokens *int64 `json:"completion_tokens"`
@@ -107,6 +110,7 @@ type openAIUsage struct {
 	CompletionDetails *struct {
 		ReasoningTokens *int64 `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
+	CacheCreationTokens *int64 `json:"cache_creation_input_tokens"`
 }
 
 // OpenAIUsageTracker incrementally meters an OpenAI-format SSE stream as

@@ -42,6 +42,11 @@ type AccessOps struct {
 	// group). Nil leaves the route unmounted (404) even when V1Auth exists.
 	V1Models          *ModelsHandler
 	V1ChatCompletions *ChatCompletionsHandler
+	// V1Messages / V1Responses are the Task 13 programming-tool surfaces
+	// (Anthropic Messages / OpenAI Responses native shapes); same mount
+	// rule — nil = unmounted.
+	V1Messages  *MessagesHandler
+	V1Responses *ResponsesHandler
 
 	// Task 11 customer read views (设计 §9.2): /user/model-quotas,
 	// /user/model-usage/{summary,requests}, /user/model-subscriptions.

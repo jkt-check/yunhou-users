@@ -51,6 +51,11 @@ type ChatRequest struct {
 	// ThinkingEnabled toggles reasoning mode (OpenAI thinking / Anthropic
 	// extended thinking) on models that declare SupportsReasoning.
 	ThinkingEnabled *bool
+	// ThinkingBudget is the client-declared Anthropic thinking budget
+	// (budget_tokens). Nil means the adapter's default. Only the anthropic
+	// adapter consumes it; other adapters ignore it (their protocols have
+	// no budget concept — documented in the capability matrix).
+	ThinkingBudget *int64
 	// Passthrough carries the allowlisted sampling parameters
 	// (temperature, top_p, stop, presence_penalty, frequency_penalty,
 	// seed). Each adapter maps what its protocol supports and rejects the

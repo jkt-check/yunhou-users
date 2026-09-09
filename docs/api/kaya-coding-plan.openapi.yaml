@@ -9,9 +9,12 @@ info:
 
     ## 全局约定
 
-    - **Envelope**：本文件所有端点使用管理 envelope `{code, data, message}`。
+    - **Envelope**：本文件 `/user/*` 端点使用管理 envelope `{code, data, message}`。
       成功 `code=0` + `data`；失败 `code=<HTTP 状态码>` + `data=null` + `message`。
-      （`/v1/*` 标准协议端点使用 OpenAI 原生错误形状，不在本文件范围。）
+      `/v1/*` 标准协议端点（Task 8/13）使用**各自协议的原生形状**（不含 envelope）：
+      `/v1/messages` 用 Anthropic 形状、`/v1/responses` 与 `/v1/chat/completions`
+      用 OpenAI 形状；两端点的协议子集/能力矩阵见对应 path 描述与
+      `docs/api-integration-guide.md`「标准协议接口」一节。
     - **整数精度**：64 位额度/金额一律为**十进制整数字符串**（`DecimalInt64`），
       避免 JS `Number` 精度丢失（>2^53）。单位 `microcredit`（微额度）。
       token 计数与请求计数为 JSON 整数（`int64` 范围内，JS 安全）。
@@ -62,6 +65,8 @@ tags:
     description: 客户 API Key 自管（Task 5）
   - name: model-console
     description: Coding Plan 配额/用量/套餐读视图（Task 11）
+  - name: v1-protocols
+    description: 编程工具标准协议面 /v1/*（原生形状,Task 8/13）
 
 paths:
   /user/model-quotas:
@@ -377,13 +382,198 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  # -------------------------------------------------------------------------
+  # Task 13: 编程工具协议面（原生形状,无管理 envelope）。
+  # 能力矩阵详表见 docs/api-integration-guide.md「标准协议接口」一节;
+  # 两端的共同点:同一 principal/预占/结算链,不支持的字段一律 400
+  # (不静默丢弃),流式以协议终止标记为唯一干净结束。
+  # -------------------------------------------------------------------------
+  /v1/messages:
+    post:
+      tags: [v1-protocols]
+      summary: Anthropic Messages（2023-06-01 子集,Claude Code 目标面）
+      description: |
+        原生 Anthropic Messages 请求/响应/SSE 事件形状。鉴权接受
+        `Authorization: Bearer <key>` 或 `X-Api-Key: <key>`（同值域）。
+
+        **支持的请求子集**：`model`（必填）、`messages`（user/assistant，
+        文本与 `tool_use`/`tool_result` 块，ID 逐字保留）、`system`
+        （字符串或 text 块数组）、`max_tokens`（必填，Anthropic 语义）、
+        `stream`、`tools`（仅 custom 工具）、`tool_choice`
+        （auto/any/none/tool + disable_parallel_tool_use）、`thinking`
+        （enabled/disabled，budget_tokens ≥1024 且 < max_tokens）、
+        `temperature`/`top_p`/`top_k`/`stop_sequences`、`metadata`
+        （接受但不消费）。
+        **明确 400**：`image`/`document` 块、服务端工具类型
+        （web_search/computer/bash/code_execution/mcp 等）、其余未知内容块。
+        **接受不回放**：历史 `thinking`/`redacted_thinking` 块、
+        `tool_result.is_error` 标志、`cache_control` 提示。
+
+        响应：`type=message` 原生形状（`usage.input_tokens` 不含
+        cache_read，cache 桶单列）。流式事件序列 `message_start →
+        content_block_start/delta/stop → message_delta → message_stop`；
+        `message_start.usage` 为协议占位（0/0），真实值在终止
+        `message_delta.usage`（含 input_tokens）。上游中断注入
+        `event: error` 后结束，绝不伪造 `message_stop`。
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessagesRequest"
+      responses:
+        "200":
+          description: Anthropic message JSON（非流式）或 Messages SSE 流（stream=true）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessagesResponse"
+            text/event-stream:
+              schema: { type: string, description: "Messages SSE 事件序列" }
+        "400":
+          description: invalid_request_error（能力不兼容/字段非法,原生形状）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "401":
+          description: authentication_error（原生形状）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "403":
+          description: permission_error（模型未授权/未定价）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "404":
+          description: not_found_error（模型不存在）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "429":
+          description: rate_limit_error（额度耗尽;可计算恢复时刻时带 Retry-After）
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "529":
+          description: overloaded_error（上游暂不可用）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+
+  /v1/responses:
+    post:
+      tags: [v1-protocols]
+      summary: OpenAI Responses（Codex 目标面,含 previous_response_id 会话链）
+      description: |
+        原生 OpenAI Responses 请求/响应/SSE 事件形状。鉴权
+        `Authorization: Bearer <key>`。
+
+        **支持的请求子集**：`model`（必填）、`input`（字符串或 items：
+        message（input_text/output_text）、function_call、
+        function_call_output；reasoning 项接受但不回放）、`instructions`、
+        `max_output_tokens`、`stream`、`store`（缺省 true）、
+        `previous_response_id`、`tools`（仅 function 类型）、
+        `tool_choice`（auto/none/required/指定 function）、
+        `parallel_tool_calls`、`temperature`/`top_p`、`reasoning.effort`、
+        `metadata`（接受但不消费）。
+        **明确 400**：`input_image`/`input_file` part、服务端工具类型与
+        其结果项（web_search_call 等）、`item_reference`、`background:true`、
+        非空 `include`、`max_tool_calls`、`truncation:auto`（服务端静默
+        裁剪上下文违反不静默原则）、`text.format` ≠ text。
+
+        **会话链**：成功响应（store≠false）持久化完整 transcript（24h
+        TTL,≤512 KiB）;引用 `previous_response_id` = 上下文回放 + 粘性
+        绑定同一上游账号,账号失效显式迁移(不静默换号)。引用不存在/过期/
+        他人/store:false 的响应一律 404 `previous_response_not_found`。
+
+        流式事件序列 `response.created → response.in_progress →
+        response.output_item.added → (output_text.delta |
+        function_call_arguments.delta | reasoning_summary_text.delta)… →
+        response.completed|response.incomplete`；上游中断注入
+        `event: error` 后结束,绝不伪造 `response.completed`。
+        `GET /v1/responses/{id}`（stored-response 读取面）不实现。
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResponsesRequest"
+      responses:
+        "200":
+          description: Responses 对象 JSON（非流式）或 Responses SSE 流（stream=true）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResponsesResponse"
+            text/event-stream:
+              schema: { type: string, description: "Responses SSE 事件序列" }
+        "400":
+          description: invalid_input（能力不兼容/字段非法）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "401":
+          description: invalid_api_key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "403":
+          description: model_not_allowed / unpriced_capability
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "404":
+          description: model_not_found / previous_response_not_found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "429":
+          description: quota_exceeded（可计算恢复时刻时带 Retry-After）
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "503":
+          description: upstream_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+
 components:
   securitySchemes:
     BearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: 用户 JWT（Website BFF 保持 Cookie→用户身份的转发）。
+      description: 用户 JWT（Website BFF 保持 Cookie→用户身份的转发）;/v1 协议面同时接受客户 API Key。
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Anthropic 风格凭据头（/v1 协议面,与 Bearer 同值域）。
 
   parameters:
     RangeFrom:
@@ -969,3 +1159,166 @@ components:
                 total: { type: integer, format: int64 }
                 limit: { type: integer }
                 offset: { type: integer }
+    # -----------------------------------------------------------------------
+    # Task 13: /v1 协议面 schema(原生形状,非管理 envelope)。
+    # -----------------------------------------------------------------------
+    V1Error:
+      type: object
+      description: OpenAI 原生错误形状（chat/responses 面）。
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            type:
+              type: string
+              enum: [authentication_error, invalid_request_error, permission_error, rate_limit_error, server_error]
+            code:
+              type: string
+              description: 统一内部错误码映射(invalid_input/quota_exceeded/model_not_found/model_not_allowed/previous_response_not_found/upstream_unavailable 等)
+      required: [error]
+    AnthropicError:
+      type: object
+      description: Anthropic 原生错误形状（messages 面）。
+      properties:
+        type: { type: string, enum: [error] }
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, permission_error, not_found_error, rate_limit_error, api_error, overloaded_error]
+            message: { type: string }
+      required: [type, error]
+    MessagesRequest:
+      type: object
+      description: |
+        Anthropic Messages 请求子集(2023-06-01)。不支持的字段一律 400:
+        image/document 块、服务端工具类型。历史 thinking 块接受但不回放。
+      properties:
+        model: { type: string, maxLength: 128 }
+        max_tokens: { type: integer, format: int64, minimum: 1 }
+        messages:
+          type: array
+          maxItems: 512
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [user, assistant] }
+              content:
+                description: 字符串或内容块数组(text/tool_use/tool_result;thinking 接受不回放;image/document 拒绝)
+        system:
+          description: 字符串或 text 块数组(cache_control 提示接受但不保证生效)
+        stream: { type: boolean, default: false }
+        tools:
+          type: array
+          maxItems: 128
+          items:
+            type: object
+            description: 仅 custom 工具({name, description?, input_schema?})
+        tool_choice:
+          description: "{type:auto|any|none|tool, name?, disable_parallel_tool_use?}"
+        thinking:
+          type: object
+          properties:
+            type: { type: string, enum: [enabled, disabled] }
+            budget_tokens: { type: integer, format: int64, minimum: 1024, description: "必须 < max_tokens" }
+        temperature: { type: number }
+        top_p: { type: number }
+        top_k: { type: integer, format: int64, minimum: 1 }
+        stop_sequences: { type: array, items: { type: string } }
+        metadata: { type: object, description: "客户端标记,不消费" }
+      required: [model, max_tokens, messages]
+    MessagesResponse:
+      type: object
+      description: Anthropic message 原生响应。usage.input_tokens 不含 cache_read(Anthropic 口径)。
+      properties:
+        id: { type: string, example: "msg_01Xy…" }
+        type: { type: string, enum: [message] }
+        role: { type: string, enum: [assistant] }
+        model: { type: string, description: 公开模型 id(非上游名) }
+        content:
+          type: array
+          items:
+            type: object
+            description: text / thinking(无签名) / tool_use 块
+        stop_reason: { type: string, nullable: true, enum: [end_turn, tool_use, max_tokens, null] }
+        stop_sequence: { type: string, nullable: true }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer, format: int64 }
+            output_tokens: { type: integer, format: int64 }
+            cache_read_input_tokens: { type: integer, format: int64 }
+            cache_creation_input_tokens: { type: integer, format: int64 }
+      required: [id, type, role, model, content]
+    ResponsesRequest:
+      type: object
+      description: |
+        OpenAI Responses 请求子集。明确 400:多模态 part、服务端工具
+        (含 web_search_call 等结果项与 item_reference)、background:true、
+        非空 include、max_tool_calls、truncation:auto、text.format≠text。
+      properties:
+        model: { type: string, maxLength: 128 }
+        input:
+          description: 字符串或 items 数组(message/function_call/function_call_output;reasoning 接受不回放)
+        instructions: { type: string, description: "系统提示(→ system 消息)" }
+        max_output_tokens: { type: integer, format: int64, minimum: 1 }
+        stream: { type: boolean, default: false }
+        store:
+          type: boolean
+          default: true
+          description: "false = 不落会话链,后续 previous_response_id 引用得 404"
+        previous_response_id:
+          type: string
+          description: "会话链引用:transcript 回放 + 粘性绑定同一上游账号;跨客户/过期/store:false 一律 404"
+        tools:
+          type: array
+          maxItems: 128
+          items:
+            type: object
+            description: 仅 {type:function, name, description?, parameters?, strict?}
+        tool_choice: { description: "auto|none|required|{type:function,name}" }
+        parallel_tool_calls: { type: boolean }
+        temperature: { type: number }
+        top_p: { type: number }
+        reasoning:
+          type: object
+          properties:
+            effort: { type: string, enum: [low, medium, high, xhigh, none, minimal] }
+        metadata: { type: object, description: "客户端标记,不消费" }
+      required: [model, input]
+    ResponsesResponse:
+      type: object
+      description: OpenAI Responses 原生响应对象。
+      properties:
+        id: { type: string, example: "resp_0f3c…" }
+        object: { type: string, enum: [response] }
+        created_at: { type: integer, format: int64 }
+        status: { type: string, enum: [completed, incomplete] }
+        incomplete_details:
+          type: object
+          nullable: true
+          properties:
+            reason: { type: string, enum: [max_output_tokens] }
+        model: { type: string, description: 公开模型 id(非上游名) }
+        output:
+          type: array
+          items:
+            type: object
+            description: reasoning(摘要文本) / message(output_text) / function_call(call_id 逐字保留)
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer, format: int64, description: "含 cached(OpenAI 口径)" }
+            input_tokens_details:
+              type: object
+              properties:
+                cached_tokens: { type: integer, format: int64 }
+            output_tokens: { type: integer, format: int64 }
+            output_tokens_details:
+              type: object
+              properties:
+                reasoning_tokens: { type: integer, format: int64 }
+            total_tokens: { type: integer, format: int64 }
+      required: [id, object, created_at, status, model, output]

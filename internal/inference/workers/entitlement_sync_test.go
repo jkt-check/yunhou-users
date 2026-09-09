@@ -26,6 +26,7 @@ import (
 func wipeSyncTables(t *testing.T, db *sqlx.DB) {
 	t.Helper()
 	if _, err := db.Exec(`TRUNCATE
+		inference_response_chains,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,

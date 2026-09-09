@@ -176,21 +176,39 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 		}
 	}
 	if r.ThinkingEnabled != nil && *r.ThinkingEnabled {
-		if maxTokens <= anthropicThinkingBudget {
-			maxTokens = anthropicThinkingBudget * 2
+		budget := anthropicThinkingBudget
+		if r.ThinkingBudget != nil && *r.ThinkingBudget > 0 {
+			budget = *r.ThinkingBudget
+		}
+		if maxTokens <= budget {
+			maxTokens = budget * 2
 			payload["max_tokens"] = maxTokens
 		}
-		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": anthropicThinkingBudget}
+		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
 	}
 	// Passthrough mapping: temperature/top_p/stop map onto Anthropic's
-	// names; the remaining OpenAI-only knobs are rejected explicitly instead
-	// of silently dropped (设计: 不能静默丢字段).
+	// names; parallel_tool_calls=false folds into tool_choice as
+	// disable_parallel_tool_use; the remaining OpenAI-only knobs are
+	// rejected explicitly instead of silently dropped (设计: 不能静默丢字段).
 	for k, v := range r.Passthrough {
 		switch k {
 		case "temperature", "top_p":
 			payload[k] = v
+		case "top_k":
+			payload["top_k"] = v
 		case "stop":
 			payload["stop_sequences"] = v
+		case "parallel_tool_calls":
+			enabled, _ := v.(bool)
+			if enabled {
+				continue
+			}
+			tc, _ := payload["tool_choice"].(map[string]any)
+			if tc == nil {
+				tc = map[string]any{"type": "auto"}
+				payload["tool_choice"] = tc
+			}
+			tc["disable_parallel_tool_use"] = true
 		default:
 			return nil, domain.NewError(domain.CodeInvalidInput,
 				"providers: parameter "+k+" is not supported by the anthropic protocol")
@@ -366,11 +384,22 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	result.ContentBytes = int64(text.Len() + reasoning.Len())
 	if resp.Usage != nil {
 		u := resp.Usage
-		out["usage"] = map[string]any{
+		usage := map[string]any{
 			"prompt_tokens":     derefInt64(u.InputTokens),
 			"completion_tokens": derefInt64(u.OutputTokens),
 			"total_tokens":      derefInt64(u.InputTokens) + derefInt64(u.OutputTokens),
 		}
+		// Cache buckets ride the wire so the client surfaces (Task 13) can
+		// render them natively: cached_tokens in prompt_tokens_details
+		// (OpenAI-conventional), cache creation via the extension key
+		// (OpenAI consumers ignore unknown keys).
+		if u.CacheReadInputTokens != nil {
+			usage["prompt_tokens_details"] = map[string]any{"cached_tokens": *u.CacheReadInputTokens}
+		}
+		if u.CacheCreationTokens != nil {
+			usage["cache_creation_input_tokens"] = *u.CacheCreationTokens
+		}
+		out["usage"] = usage
 		result.UsageReported = true
 		result.Usage = domain.UsageBuckets{
 			InputTokens:      u.InputTokens,

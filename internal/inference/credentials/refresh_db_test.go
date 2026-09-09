@@ -359,6 +359,78 @@ func TestRefreshInvalidGrantMovesAccountsToReauth(t *testing.T) {
 	}
 }
 
+// M-4（Task 13 清理）：reauth 传播后凭据保持 active+过期，但绝不能再
+// 留在刷新扫描集里——否则每轮扫描都重复命中（重复调厂商 + 审计刷屏）。
+// 无迁移解法：扫描集要求至少一个可调度账号（active/refreshing/cooldown）。
+func TestReauthPropagatedCredentialLeavesRefreshScanSet(t *testing.T) {
+	db, store, _, _, vault, vendor, providerID := oauthSetup(t)
+	ctx := context.Background()
+
+	expiry := time.Now().Add(2 * time.Minute)
+	credID, accountID := seedOAuthCredential(t, db, vault, providerID, "rt-revoked-2", expiry)
+
+	// 传播前：到期窗口内的凭据在扫描集中。
+	before := time.Now().Add(5 * time.Minute)
+	hits, err := store.ListOAuthCredentialsExpiring(ctx, before, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range hits {
+		if c.ID == credID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("precondition: expiring credential must be in the scan set before propagation")
+	}
+
+	vendor.mu.Lock()
+	vendor.tokenHandler = func(form url.Values) (int, string) {
+		return 400, `{"error":"invalid_grant"}`
+	}
+	vendor.mu.Unlock()
+	r := credentials.NewRefresher(vault, store, store,
+		&connector.Client{HTTP: vendor.srv.Client()}, vendor.registry(), nil)
+	outcome, err := r.RefreshCredential(ctx, credID, "scheduled refresh")
+	if err != nil || !outcome.ReauthRequired {
+		t.Fatalf("outcome=%+v err=%v", outcome, err)
+	}
+	var acctStatus string
+	db.Get(&acctStatus, `SELECT status FROM inference_upstream_accounts WHERE id = $1`, accountID)
+	if acctStatus != "reauth_required" {
+		t.Fatalf("account status = %s", acctStatus)
+	}
+
+	// 传播后：凭据仍是 active+过期（M-4 的状态事实），但扫描集不再命中。
+	hits, err = store.ListOAuthCredentialsExpiring(ctx, before, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range hits {
+		if c.ID == credID {
+			t.Fatalf("M-4 regression: reauth-propagated credential still in refresh scan set")
+		}
+	}
+	// 可调度账号回归（运营重新授权/启用）→ 凭据回到扫描集。
+	if _, err := db.Exec(`UPDATE inference_upstream_accounts SET status='active' WHERE id = $1`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	hits, err = store.ListOAuthCredentialsExpiring(ctx, before, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, c := range hits {
+		if c.ID == credID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("credential with a schedulable account must re-enter the scan set")
+	}
+}
+
 // TestRefreshConnectorUnavailableIsRetryable — 验收场景"连接器不可用"：
 // 传输错误/5xx 只重试，不动账号状态（连接器暂时不可用 ≠ 授权失效）。
 func TestRefreshConnectorUnavailableIsRetryable(t *testing.T) {

@@ -44,6 +44,9 @@ type UpstreamHealthStore interface {
 	// EndExpiredSessionBindings sweeps TTL-expired live bindings (审查修复
 	// M-1：此前无生产调用方，本 worker 每轮清扫).
 	EndExpiredSessionBindings(ctx context.Context, now time.Time, limit int) (int64, error)
+	// DeleteExpiredResponseChains sweeps TTL-expired Responses 会话链行
+	// (Task 13; 与绑定清扫同轮次).
+	DeleteExpiredResponseChains(ctx context.Context, now time.Time, limit int) (int64, error)
 }
 
 // UpstreamHealthConfig tunes the worker; zero values take the defaults.
@@ -110,10 +113,12 @@ type UpstreamHealthMetrics struct {
 	Errors         int `json:"errors"`
 	// BindingsExpired: TTL 到期清扫的活跃绑定数（审查修复 M-1）。
 	BindingsExpired int64 `json:"bindings_expired"`
+	// ChainsExpired: TTL 到期清扫的 Responses 会话链行数（Task 13）。
+	ChainsExpired int64 `json:"chains_expired"`
 }
 
 // RunPass executes one health round: first sweep TTL-expired session
-// bindings, then probe accounts.
+// bindings and response chains, then probe accounts.
 func (w *UpstreamHealth) RunPass(ctx context.Context) (UpstreamHealthMetrics, error) {
 	var m UpstreamHealthMetrics
 	expired, err := w.store.EndExpiredSessionBindings(ctx, w.clock.Now(), w.cfg.BatchLimit)
@@ -121,6 +126,11 @@ func (w *UpstreamHealth) RunPass(ctx context.Context) (UpstreamHealthMetrics, er
 		return m, err
 	}
 	m.BindingsExpired = expired
+	chains, err := w.store.DeleteExpiredResponseChains(ctx, w.clock.Now(), w.cfg.BatchLimit)
+	if err != nil {
+		return m, err
+	}
+	m.ChainsExpired = chains
 	dueBefore := w.clock.Now().Add(-w.cfg.Cooldown)
 	accounts, err := w.store.ListUpstreamAccountsForHealth(ctx, dueBefore, w.cfg.BatchLimit)
 	if err != nil {

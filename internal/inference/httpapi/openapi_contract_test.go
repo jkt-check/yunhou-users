@@ -30,6 +30,9 @@ func TestOpenAPI_CoversMountedEndpoints(t *testing.T) {
 		"/user/model-subscriptions:",
 		"/user/api-keys:",
 		"/user/api-keys/{id}:",
+		// Task 13: 编程工具协议面(原生形状)必须留档。
+		"/v1/messages:",
+		"/v1/responses:",
 	} {
 		if !strings.Contains(doc, path) {
 			t.Errorf("openapi missing path %s", path)
@@ -47,6 +50,18 @@ func TestOpenAPI_CoversMountedEndpoints(t *testing.T) {
 	} {
 		if !strings.Contains(doc, "fixtures/"+fx) {
 			t.Errorf("openapi missing fixture reference %s", fx)
+		}
+	}
+	// 协议面能力矩阵关键词(Task 13):不得夸大兼容。
+	for _, kw := range []string{
+		"2023-06-01", "previous_response_id", "previous_response_not_found",
+		"message_start", "message_stop", "response.completed", "response.incomplete",
+		"invalid_request_error", "overloaded_error", "ApiKeyAuth",
+		"tool_use", "tool_result", "function_call_output", "item_reference",
+		"cache_read_input_tokens", "budget_tokens", "reasoning",
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing protocol keyword %q", kw)
 		}
 	}
 }

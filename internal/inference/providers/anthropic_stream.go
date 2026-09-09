@@ -243,6 +243,12 @@ func writeOpenAIUsage(w io.Writer, b domain.UsageBuckets) error {
 		}
 		usage["prompt_tokens_details"] = details
 	}
+	if b.CacheWriteTokens != nil {
+		// Anthropic-origin cache creation has no chat-completions home; the
+		// extension key keeps it on the wire for the Messages surface (Task
+		// 13) and is ignored by OpenAI-shape consumers.
+		usage["cache_creation_input_tokens"] = *b.CacheWriteTokens
+	}
 	usage["total_tokens"] = total
 	return writeRawSSE(w, map[string]any{
 		"object":  "chat.completion.chunk",

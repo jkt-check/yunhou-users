@@ -63,25 +63,46 @@ func v1Error(c *gin.Context, status int, typ, code, message string) {
 	})
 }
 
+// v1AuthError writes the auth-chain error in the shape of the protocol the
+// route speaks: Anthropic-native for /v1/messages (设计 §9.1: 各自协议的
+// 原生错误), the OpenAI /v1 shape elsewhere.
+func v1AuthError(c *gin.Context, status int, typ, code, message string) {
+	if strings.HasSuffix(c.Request.URL.Path, "/v1/messages") {
+		anthropicError(c, status, typ, message)
+		return
+	}
+	v1Error(c, status, typ, code, message)
+}
+
 // APIKeyAuth authenticates /v1/* requests by customer API key and applies
 // per-Key (when the key carries rpm_limit) and per-account (accountRPM,
 // when > 0) sliding-window rate limits. Rate limiting runs AFTER
 // authentication so buckets key on verified identities, not client input.
+//
+// Credentials are accepted as `Authorization: Bearer <key>` (OpenAI style)
+// or `X-Api-Key: <key>` (Anthropic style — Task 13: Claude Code 等
+// Anthropic SDK 客户端以 x-api-key 为默认凭据头). Both headers present:
+// Bearer wins. The key VALUE space is identical.
 func APIKeyAuth(resolver *access.Resolver, counter *access.RPMCounter, accountRPM int) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		auth := c.GetHeader("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			v1Error(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key",
+		var rawKey string
+		if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			rawKey = strings.TrimPrefix(auth, "Bearer ")
+		} else if xkey := c.GetHeader("X-Api-Key"); xkey != "" {
+			rawKey = xkey
+		}
+		if rawKey == "" {
+			v1AuthError(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key",
 				"missing bearer API key")
 			return
 		}
-		res, err := resolver.Authenticate(c.Request.Context(), strings.TrimPrefix(auth, "Bearer "))
+		res, err := resolver.Authenticate(c.Request.Context(), rawKey)
 		if err != nil {
 			if domain.CodeOf(err) == domain.CodeInternal {
-				v1Error(c, http.StatusInternalServerError, "server_error", "internal_error", "internal error")
+				v1AuthError(c, http.StatusInternalServerError, "server_error", "internal_error", "internal error")
 				return
 			}
-			v1Error(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key",
+			v1AuthError(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key",
 				"invalid, revoked or expired API key")
 			return
 		}
@@ -100,7 +121,7 @@ func APIKeyAuth(resolver *access.Resolver, counter *access.RPMCounter, accountRP
 				if ra := counter.RetryAfter(scope); ra > 0 {
 					c.Header("Retry-After", strconv.Itoa(int(ra.Seconds())+1))
 				}
-				v1Error(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited",
+				v1AuthError(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited",
 					"rate limit exceeded")
 				return
 			}

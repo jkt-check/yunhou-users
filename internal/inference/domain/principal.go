@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -305,4 +306,23 @@ type SessionBinding struct {
 	ExpiresAt   time.Time
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+// ResponseChain is the persisted chain record of one OpenAI Responses call
+// (Task 13, migration 033): the canonical transcript up to and including
+// this turn, so a later previous_response_id reference replays real context
+// instead of silently guessing. BillingAccountID scopes reads to the owning
+// customer (cross-customer references are indistinguishable from a missing
+// id); UpstreamAccountID records which account actually served the turn
+// (audit attribution — the LIVE pin authority is SessionBinding).
+type ResponseChain struct {
+	ID                string
+	ChainID           string
+	BillingAccountID  string
+	RequestID         string
+	ModelID           string
+	UpstreamAccountID string
+	Transcript        json.RawMessage
+	CreatedAt         time.Time
+	ExpiresAt         time.Time
 }

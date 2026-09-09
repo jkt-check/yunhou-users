@@ -11,6 +11,13 @@ type ChatMessage struct {
 	Content    string     `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 轮发起的工具调用(透传上游)
 	ToolCallID string     `json:"tool_call_id,omitempty"` // role=tool 时关联的 assistant tool_call id
+	// ReasoningContent 是 thinking 模式下 assistant 轮的推理内容(透传上游)。
+	// DeepSeek 要求:带 tool_calls 的 assistant 轮在后续请求中必须原样回传
+	// reasoning_content,否则上游 400 拒绝。omitempty 保证非 thinking 会话
+	// 的上行 payload 与之前逐字节一致(向后兼容)。其大小有意不计入消息条
+	// 数预算(长推理链是合法输入,按内容预算拒绝会误伤),由请求体总上限
+	// chatMaxBodyBytes 兜底——与 tool_calls 的处理方式一致。
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ToolCall is the OpenAI Chat Completions assistant tool_call shape. The

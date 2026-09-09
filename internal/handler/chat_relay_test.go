@@ -191,3 +191,30 @@ func TestTruncateChatInput(t *testing.T) {
 		t.Error("caller's request slice was mutated")
 	}
 }
+
+// TestTruncateChatInput_PreservesRelayFields: cutting an over-long Content
+// for the audit log must not silently strip the turn's other relay fields
+// (reasoning_content / tool_calls / tool_call_id) — an error line that lost
+// them would make the audit trail unreliable for debugging exactly the
+// thinking-mode/tool-calling relay issues it exists for.
+func TestTruncateChatInput_PreservesRelayFields(t *testing.T) {
+	long := strings.Repeat("长", chatErrInputLogCap)
+	big := []model.ChatMessage{
+		{Role: "assistant", Content: long, ReasoningContent: "trace",
+			ToolCalls: []model.ToolCall{{ID: "call_1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: "{}"}}}},
+		{Role: "tool", Content: "ok", ToolCallID: "call_1"},
+	}
+	out, truncated := truncateChatInput(big)
+	if !truncated {
+		t.Fatal("truncated = false, want true")
+	}
+	if out[0].ReasoningContent != "trace" {
+		t.Error("reasoning_content dropped by content truncation")
+	}
+	if len(out[0].ToolCalls) != 1 || out[0].ToolCalls[0].ID != "call_1" {
+		t.Error("tool_calls dropped by content truncation")
+	}
+	if out[1].ToolCallID != "call_1" {
+		t.Error("tool_call_id dropped by content truncation")
+	}
+}

@@ -261,10 +261,13 @@ func chatErrorMapping(err error) (int, string) {
 // logAccess appends one chatAccessEntry line to the audit log, if enabled.
 // Output text is truncated for the log so a single pathological reply can't
 // balloon the file. OutputBytes always reflects the REAL output length
-// (before truncation) so cost analysis isn't skewed by the log cap. On
-// error lines the input is truncated too: validation-failed requests carry
-// unvalidated (potentially near-32 KiB per message) content that would
-// otherwise be mirrored into the log in full.
+// (before truncation) so cost analysis isn't skewed by the log cap; the
+// same real-bytes rule holds for InputBytes, which counts content AND
+// reasoning even though the logged input is cut. Two input truncations
+// apply: on error lines the (unvalidated, potentially near-32 KiB) content
+// is capped per message, and on every line reasoning_content is capped at
+// chatReasoningLogCap — thinking traces are bounded only by the body cap
+// and would otherwise dominate the log.
 func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string, req model.ChatRequest, status, errMsg, output string) {
 	if h.accessLog == nil {
 		return
@@ -282,6 +285,10 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string
 	inputTruncated := false
 	if status == "error" {
 		input, inputTruncated = truncateChatInput(req.Messages)
+	}
+	if capped, reasoningCut := capChatReasoning(input); reasoningCut {
+		input = capped
+		inputTruncated = true
 	}
 	entry := chatAccessEntry{
 		TS:              started.Format(time.RFC3339),
@@ -309,12 +316,15 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string
 	h.accessLog.Println(string(b))
 }
 
-// chatTotalBytes sums message content lengths in bytes (len() — CJK content
-// counts ~3 bytes per rune; the field names say bytes, not chars).
+// chatTotalBytes sums message content + reasoning lengths in bytes (len() —
+// CJK content counts ~3 bytes per rune; the field names say bytes, not
+// chars). reasoning_content counts because it is billed upstream input on
+// thinking-mode continuations; this metric feeds cost analysis, so it must
+// reflect the REAL request size even when the logged input is truncated.
 func chatTotalBytes(messages []model.ChatMessage) int {
 	total := 0
 	for _, m := range messages {
-		total += len(m.Content)
+		total += len(m.Content) + len(m.ReasoningContent)
 	}
 	return total
 }
@@ -327,6 +337,13 @@ const chatOutputLogCap = 64 << 10
 // precisely what validation rejected — so it needs its own, smaller cap.
 const chatErrInputLogCap = 1 << 10
 
+// chatReasoningLogCap bounds each message's reasoning_content in EVERY audit
+// line. Thinking traces are model-internal text bounded only by the request
+// body cap (they bypass the per-message content budgets), so mirroring them
+// in full would balloon the log; a 1 KiB sample is enough to debug relay
+// issues. The real byte count still lands in input_bytes via chatTotalBytes.
+const chatReasoningLogCap = 1 << 10
+
 // truncateChatOutput cuts s at chatOutputLogCap on a UTF-8 rune boundary.
 func truncateChatOutput(s string) (string, bool) {
 	return truncateUTF8(s, chatOutputLogCap)
@@ -334,7 +351,9 @@ func truncateChatOutput(s string) (string, bool) {
 
 // truncateChatInput caps every message's content at chatErrInputLogCap for
 // error-path audit lines. Returns the (possibly copied) slice and whether
-// any content was cut.
+// any content was cut. Cutting only replaces Content — the turn's other
+// relay fields (reasoning_content, tool_calls, tool_call_id) are preserved
+// so the audit line still shows the real message shape.
 func truncateChatInput(messages []model.ChatMessage) ([]model.ChatMessage, bool) {
 	truncated := false
 	out := messages
@@ -346,13 +365,41 @@ func truncateChatInput(messages []model.ChatMessage) ([]model.ChatMessage, bool)
 				copy(out, messages[:i])
 			}
 			cut, _ := truncateUTF8(m.Content, chatErrInputLogCap)
-			out[i] = model.ChatMessage{Role: m.Role, Content: cut}
+			cutMsg := m
+			cutMsg.Content = cut
+			out[i] = cutMsg
 			truncated = true
 		} else if truncated {
 			out[i] = m
 		}
 	}
 	return out, truncated
+}
+
+// capChatReasoning caps every message's reasoning_content at
+// chatReasoningLogCap for audit lines (all paths — reasoning bypasses the
+// content size budgets, so it needs its own log cap). Returns the (possibly
+// copied) slice and whether any reasoning was cut.
+func capChatReasoning(messages []model.ChatMessage) ([]model.ChatMessage, bool) {
+	capped := false
+	out := messages
+	for i, m := range messages {
+		if len(m.ReasoningContent) > chatReasoningLogCap {
+			if !capped {
+				// First cut: copy the slice so the caller's request is untouched.
+				out = make([]model.ChatMessage, len(messages))
+				copy(out, messages[:i])
+			}
+			cut, _ := truncateUTF8(m.ReasoningContent, chatReasoningLogCap)
+			cutMsg := m
+			cutMsg.ReasoningContent = cut
+			out[i] = cutMsg
+			capped = true
+		} else if capped {
+			out[i] = m
+		}
+	}
+	return out, capped
 }
 
 // truncateUTF8 cuts s at cap bytes on a UTF-8 rune boundary — a byte-slice

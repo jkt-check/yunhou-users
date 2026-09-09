@@ -297,6 +297,37 @@ func TestChatService_KeyPoolFailover(t *testing.T) {
 	}
 }
 
+// TestChatService_NoToolsNoThinkingKeepsLegacyPayload locks back-compat:
+// a client that sends neither tools nor thinking_enabled gets an upstream
+// payload without those keys — and without reasoning_content, which
+// omitempty must drop when absent so non-thinking payloads stay
+// byte-identical to the pre-thinking-proxy shape.
+func TestChatService_NoToolsNoThinkingKeepsLegacyPayload(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	var gotBody []byte
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	})
+
+	svc, subRepo, planRepo, _ := chatTestFixture(t, upstream)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	resp, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("StreamChat: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body := string(gotBody)
+	if strings.Contains(body, `"tools"`) || strings.Contains(body, `"thinking"`) || strings.Contains(body, `"reasoning_content"`) {
+		t.Errorf("legacy payload must not contain tools/thinking/reasoning_content: %s", body)
+	}
+}
+
 // TestChatService_SingleKey429NoRetry: with one key, a 429 maps to
 // ErrChatRateLimited without a retry.
 func TestChatService_SingleKey429NoRetry(t *testing.T) {
@@ -525,5 +556,49 @@ func TestChatService_AllowedModels(t *testing.T) {
 	_, err = svc.AllowedModels(context.Background(), "u-nope", "yunhou-website")
 	if !errors.Is(err, ErrChatNoAccess) {
 		t.Errorf("err = %v, want ErrChatNoAccess", err)
+	}
+}
+
+// TestChatService_ReasoningContentRelay locks the thinking-mode pass-through:
+// DeepSeek's thinking mode rejects a continuation whose assistant tool_calls
+// turn doesn't carry back the reasoning_content it was generated with ("The
+// `reasoning_content` in the thinking mode must be passed back to the API").
+// kaya owns conversation history and sends reasoning_content on assistant
+// turns; the proxy must relay it verbatim. Messages are bound from JSON
+// exactly as the handler's ShouldBindJSON does, so the test locks the wire
+// tag itself — a struct literal would pass even with a mistyped tag.
+func TestChatService_ReasoningContentRelay(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	var gotBody []byte
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	})
+
+	svc, subRepo, planRepo, _ := chatTestFixture(t, upstream)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	var messages []model.ChatMessage
+	inbound := `[
+		{"role":"user","content":"list files"},
+		{"role":"assistant","content":"","reasoning_content":"thinking about ls","tool_calls":[{"id":"call_1","type":"function","function":{"name":"run_shell","arguments":"{\"cmd\":\"ls\"}"}}]},
+		{"role":"tool","content":"file_a","tool_call_id":"call_1"}
+	]`
+	if err := json.Unmarshal([]byte(inbound), &messages); err != nil {
+		t.Fatalf("unmarshal inbound messages: %v", err)
+	}
+
+	resp, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", messages, nil, nil)
+	if err != nil {
+		t.Fatalf("StreamChat: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body := string(gotBody)
+	if !strings.Contains(body, `"reasoning_content":"thinking about ls"`) {
+		t.Errorf("upstream body missing reasoning_content: %s", body)
 	}
 }

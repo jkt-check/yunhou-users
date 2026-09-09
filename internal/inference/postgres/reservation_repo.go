@@ -137,6 +137,12 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 				 WHERE id = $1 AND budget_used_micros >= $2`, *r.APIKeyID, r.Amount); err != nil {
 				return mapError("release: key budget", err)
 			}
+		case string(domain.TargetWallet):
+			// 钱包冻结释放（Task 14）：hold 行状态迁移，不是账本重写；
+			// 与并发结算竞态 → CodeConflict（state='held' 守卫）。
+			if err := s.releaseWalletLocked(ctx, tx, requestID); err != nil {
+				return err
+			}
 		default:
 			res, err := tx.ExecContext(ctx,
 				`UPDATE inference_quota_windows

@@ -279,7 +279,7 @@ func fail(c *gin.Context, err error) {
 		status = http.StatusNotFound
 	case domain.CodeConflict:
 		status = http.StatusConflict
-	case domain.CodeRateLimited:
+	case domain.CodeRateLimited, domain.CodeQuotaExceeded, domain.CodeInsufficientBalance:
 		status = http.StatusTooManyRequests
 	}
 	c.JSON(status, gin.H{"code": status, "data": nil, "message": err.Error()})

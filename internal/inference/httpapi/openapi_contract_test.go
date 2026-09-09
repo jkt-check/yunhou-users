@@ -33,6 +33,15 @@ func TestOpenAPI_CoversMountedEndpoints(t *testing.T) {
 		// Task 13: 编程工具协议面(原生形状)必须留档。
 		"/v1/messages:",
 		"/v1/responses:",
+		// Task 14: 钱包/套餐外/PAYG 面。
+		"/user/wallet:",
+		"/user/wallet/entries:",
+		"/user/wallet/overage:",
+		"/user/wallet/payg:",
+		"/admin/wallet/adjustments:",
+		"/admin/wallet/reversals:",
+		"/admin/wallet:",
+		"/admin/payg-config:",
 	} {
 		if !strings.Contains(doc, path) {
 			t.Errorf("openapi missing path %s", path)
@@ -77,6 +86,9 @@ func TestOpenAPI_ConventionsAndDTOFields(t *testing.T) {
 		"quota_exhausted", "entitlement_expired", "no_active_entitlement",
 		"bundle_gift", "migration_gift", "kaya_membership",
 		"usage_events", // 心跳表不作为用量来源的明确口径
+		// Task 14 钱包口径：账本派生、现金/赠送来源隔离、套餐外默认关、PAYG 显式权益。
+		"micromoney", "cash", "bonus", "overage_enabled", "monthly_spend_limit_micros",
+		"topup", "consume", "refund", "reversal", "payg",
 	} {
 		if !strings.Contains(doc, kw) {
 			t.Errorf("openapi missing convention keyword %q", kw)

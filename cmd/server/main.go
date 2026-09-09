@@ -263,10 +263,13 @@ func main() {
 		RequireModels:      inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermModelsManage),
 		RequireCredentials: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermCredentialsManage),
 		RequireAdmin:       inferencehttpapi.OperatorRequireRole(infStore, inferencemanagement.RoleAdmin),
-		Models:             adminModelsHandler,
-		Credentials:        inferencehttpapi.NewAdminCredentialsHandler(credSvc),
-		Auth:               inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
-		OAuth:              inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
+		// Task 14: 钱包运营面（调整/冲正/PAYG 发布配置）走 billing:adjust。
+		RequireBilling: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermBillingAdjust),
+		Models:         adminModelsHandler,
+		Credentials:    inferencehttpapi.NewAdminCredentialsHandler(credSvc),
+		Auth:           inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
+		OAuth:          inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
+		Adjustments:    inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil),
 	}
 
 	// Task 5: customer API keys + caller principal resolution. The
@@ -327,6 +330,8 @@ func main() {
 		UserQuotas:        inferencehttpapi.NewUserQuotasHandler(inferencemanagement.NewQuotaViewService(infStore, nil)),
 		UserUsage:         inferencehttpapi.NewUserUsageHandler(inferencemanagement.NewUsageViewService(infStore, nil)),
 		UserSubscriptions: inferencehttpapi.NewUserSubscriptionsHandler(inferencemanagement.NewSubscriptionViewService(infStore, nil)),
+		// Task 14: 客户钱包面（派生余额/流水/套餐外开关/PAYG 开启）。
+		UserWallet: inferencehttpapi.NewUserWalletHandler(infStore, nil),
 	}
 	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
@@ -446,6 +451,15 @@ func main() {
 		BatchLimit: cfg.InferenceEntitlementSyncBatch,
 	})
 	go entitlementSyncWorker.Start(rootCtx)
+
+	// Task 14: wallet sync worker — consumes wallet.sync outbox messages
+	// (余额充值入账/现金退款), idempotent by business key (重复回调只生效
+	// 一次); reuses the entitlement-sync tuning knobs.
+	walletSyncWorker := inferenceworkers.NewWalletSync(infStore, nil, inferenceworkers.EntitlementSyncConfig{
+		Interval:   cfg.InferenceEntitlementSyncInterval,
+		BatchLimit: cfg.InferenceEntitlementSyncBatch,
+	})
+	go walletSyncWorker.Start(rootCtx)
 
 	// Task 12: OAuth credential refresh + upstream health workers. The
 	// refresh worker rotates expiring oauth credentials under a cross-

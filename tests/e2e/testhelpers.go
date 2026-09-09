@@ -97,6 +97,8 @@ func cleanupDB(t *testing.T, db *sqlx.DB) {
 	// TRUNCATE ... CASCADE sidesteps the requests/windows FK ring.
 	if _, err := db.Exec(`TRUNCATE
 		inference_audit_log, operator_roles,
+		inference_wallet_entries, inference_wallet_audits,
+		inference_wallet_holds, inference_wallets, inference_payg_config,
 		inference_response_chains,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,

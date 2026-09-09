@@ -15,6 +15,11 @@ const (
 	// this phase: code supports dual-product rows, but no client-facing
 	// sale path may create coding-plan subscriptions yet.
 	ProductCodingPlan = "coding-plan"
+	// ProductWalletTopup is the prepaid pay-as-you-go balance top-up
+	// product (Task 14): paying a wallet-topup order credits the
+	// customer's inference wallet (cash source) instead of activating any
+	// subscription — 充值金额不作为订阅有效期（设计 §4.3, 裁决 1).
+	ProductWalletTopup = "wallet-topup"
 )
 
 type Subscription struct {

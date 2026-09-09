@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Kaya Coding Plan — 客户控制台 API（yunhou-users）
-  version: 0.11.0
+  version: 0.12.0
   description: |
     Kaya Coding Plan（独立模型 API 套餐）客户侧契约，供 Website 客户控制台对接。
     本文件与 `internal/inference/httpapi/{user_api_keys,user_quotas,user_usage,
@@ -257,6 +257,184 @@ paths:
                 $ref: "#/components/schemas/ModelSubscriptionsEnvelope"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+
+  /user/wallet:
+    get:
+      tags: [model-console]
+      summary: 钱包余额总览（预付按量，Task 14）
+      description: |
+        返回账户每个币种钱包的**账本派生**余额：cash/bonus 分来源，
+        available = Σcredit − Σdebit − Σheld（冻结中金额单列）；没有独立
+        缓存余额，展示永远等于账本（设计 §7.3）。现金退款落在已消费资金
+        上时现金余额如实为负（不隐藏负差额）。另含套餐外消费开关
+        （overage_enabled，默认关）、UTC 自然月支出上限
+        （monthly_spend_limit_micros）与当月已支出（month_spent_micros，
+        区间 [month_start, month_end)），以及 PAYG（无套餐按量）开启状态。
+        所有金额字段为 DecimalInt64（十进制整数字符串）+ unit=micromoney。
+      operationId: getWallet
+      responses:
+        "200":
+          description: 钱包总览（无计费账户时为零状态：空 wallets + payg.enabled=false）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/wallet/entries:
+    get:
+      tags: [model-console]
+      summary: 钱包分录流水（追加+冲正，keyset 分页）
+      description: |
+        钱包账本逐条呈现：topup/bonus/consume/refund/adjustment/reversal，
+        direction（debit/credit）与 source（cash/bonus）分列；退款只允许
+        cash 来源原路退，赠送（bonus）余额不得伪装现金退款。按 id 倒序，
+        cursor 为上一页末条 id；next_cursor 为空表示到底。
+      operationId: listWalletEntries
+      parameters:
+        - name: currency
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[A-Z]{3}$" }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 100 }
+      responses:
+        "200":
+          description: 分录页
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletEntriesEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/wallet/overage:
+    put:
+      tags: [model-console]
+      summary: 显式开启/关闭套餐外消费 + 设置支出上限
+      description: |
+        套餐外消费**默认关**：套餐额度耗尽即停（quota_exceeded），不动余额。
+        开启必须同时设置 UTC 自然月支出上限（enabled=true 且缺
+        monthly_spend_limit_micros → 400）；开启/关闭/改上限全部写入
+        审计（inference_wallet_audits）。请求入场时固定扣费来源（套餐或
+        钱包），首版不在请求中途隐式切换；钱包路径同样走完整有界预占
+        （冻结→结算/释放），预占金额按入场价格版本固定，调价不影响在途
+        冻结。
+      operationId: setWalletOverage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WalletOverageRequest"
+      responses:
+        "200":
+          description: 更新后的该币种钱包视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletView"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/wallet/payg:
+    post:
+      tags: [model-console]
+      summary: 开启无套餐按量（PAYG）——显式权益记录
+      description: |
+        账户没有套餐时，允许在**显式 PAYG 权益记录**下用余额调用
+        （source_type=payg）；模型授权/速率/并发限制照常执行。开启动作按
+        运营发布的 PAYG 配置（PUT /admin/payg-config）创建权益；未发布配
+        置 → 404（没有配置的商品不可购买）。幂等：重复开启返回同一记录。
+        钱包扣费仍需先开启套餐外消费并设支出上限。
+      operationId: enablePayg
+      responses:
+        "200":
+          description: PAYG 权益视图（幂等）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaygEnvelope"
+        "404":
+          description: 运营未发布 PAYG 配置
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /admin/wallet/adjustments:
+    post:
+      tags: [model-admin]
+      summary: 运营钱包调整（billing:adjust）
+      description: |
+        赠送发放（source=bonus, direction=credit）、现金补偿与扣回；写入
+        inference_adjustments + 钱包分录（同一事务），operator/service
+        双重归因，idempotency_key 幂等（重复投递只生效一次，重放响应
+        applied=false）。金额 DecimalInt64；bonus 永不走现金退款路径。
+      operationId: createWalletAdjustment
+      responses:
+        "201": { description: 已应用 }
+        "200": { description: 幂等重放（applied=false） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/wallet/reversals:
+    post:
+      tags: [model-admin]
+      summary: 冲正一条钱包分录（billing:adjust）
+      description: 追加反向分录（不重写已入账事实）；一条分录至多一条冲正，重复冲正 reversed=false。
+      operationId: reverseWalletEntry
+      responses:
+        "200": { description: reversed=true/false }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/wallet:
+    get:
+      tags: [model-admin]
+      summary: 运营只读：派生余额 + 近期分录（billing:adjust）
+      operationId: getWalletAdmin
+      parameters:
+        - name: billing_account_id
+          in: query
+          schema: { type: string }
+        - name: user_id
+          in: query
+          schema: { type: string }
+        - name: currency
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[A-Z]{3}$" }
+      responses:
+        "200": { description: 钱包视图 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/payg-config:
+    get:
+      tags: [model-admin]
+      summary: 读取 PAYG 发布配置（billing:adjust）
+      operationId: getPaygConfig
+      responses:
+        "200": { description: 当前配置 }
+        "404": { description: 未配置 }
+    put:
+      tags: [model-admin]
+      summary: 发布 PAYG 默认策略版本 + 显式模型集合（billing:adjust）
+      description: 策略版本必须已 published；空 model_ids = 不授权任何模型（无 NULL 全放行语义）。
+      operationId: putPaygConfig
+      responses:
+        "200": { description: 已发布 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /user/api-keys:
     post:
@@ -606,6 +784,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
+    Forbidden:
+      description: 已认证但无权限（运营权限不足 / 模型未授权）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
     NotFound:
       description: 不存在或不属于本人（404 不区分，不泄漏存在性）
       content:
@@ -620,6 +804,79 @@ components:
       pattern: "^[0-9]+$"
       example: "1000000"
       description: 64 位整数的十进制字符串（JS 大整数精度安全）；额度单位 microcredit
+    MicroMoney:
+      type: string
+      pattern: "^-?[0-9]+$"
+      example: "29990000"
+      description: 带币种定点微金额的十进制整数字符串（1 单位币种 = 1,000,000 微）；钱包口径可负（现金退款落在已消费资金上时如实为负）
+    WalletView:
+      type: object
+      properties:
+        currency: { type: string, example: "CNY" }
+        unit: { type: string, enum: [micromoney] }
+        cash_available_micros: { $ref: "#/components/schemas/MicroMoney" }
+        bonus_available_micros: { $ref: "#/components/schemas/MicroMoney" }
+        cash_held_micros: { $ref: "#/components/schemas/MicroMoney" }
+        bonus_held_micros: { $ref: "#/components/schemas/MicroMoney" }
+        total_available_micros: { $ref: "#/components/schemas/MicroMoney" }
+        overage_enabled: { type: boolean, description: 套餐外消费开关，默认关 }
+        monthly_spend_limit_micros: { $ref: "#/components/schemas/MicroMoney" }
+        month_spent_micros: { $ref: "#/components/schemas/MicroMoney" }
+        month_start: { $ref: "#/components/schemas/RFC3339UTC" }
+        month_end: { $ref: "#/components/schemas/RFC3339UTC" }
+      description: 单币种钱包视图——账本派生（无缓存余额），held 为在途冻结
+    WalletEnvelope:
+      type: object
+      properties:
+        server_time: { $ref: "#/components/schemas/RFC3339UTC" }
+        wallets:
+          type: array
+          items: { $ref: "#/components/schemas/WalletView" }
+        payg:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            entitlement_id: { type: string }
+            model_ids: { type: array, items: { type: string } }
+            policy_version_id: { type: string }
+    WalletEntriesEnvelope:
+      type: object
+      properties:
+        entries:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { $ref: "#/components/schemas/DecimalInt64" }
+              entry_type: { type: string, enum: [topup, bonus, consume, refund, adjustment, reversal] }
+              direction: { type: string, enum: [debit, credit] }
+              source: { type: string, enum: [cash, bonus], description: cash 可原路退；bonus（赠送）不得伪装现金退款 }
+              amount_micros: { $ref: "#/components/schemas/MicroMoney" }
+              currency: { type: string }
+              request_id: { type: string, nullable: true }
+              payment_id: { type: string, nullable: true }
+              refund_id: { type: string, nullable: true }
+              reverses_entry_id: { $ref: "#/components/schemas/DecimalInt64" }
+              created_by: { type: string }
+              created_at: { $ref: "#/components/schemas/RFC3339UTC" }
+        next_cursor: { type: string, nullable: true }
+    WalletOverageRequest:
+      type: object
+      required: [currency, enabled]
+      properties:
+        currency: { type: string, pattern: "^[A-Z]{3}$" }
+        enabled: { type: boolean }
+        monthly_spend_limit_micros:
+          description: UTC 自然月支出上限；enabled=true 时必填
+          allOf:
+            - $ref: "#/components/schemas/MicroMoney"
+    PaygEnvelope:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        entitlement_id: { type: string }
+        model_ids: { type: array, items: { type: string } }
+        policy_version_id: { type: string }
     RFC3339UTC:
       type: string
       format: date-time

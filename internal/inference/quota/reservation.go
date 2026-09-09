@@ -151,3 +151,27 @@ func ReserveAmount(price accounting.PriceVersion, b ReserveBounds) (domain.Micro
 	}
 	return total, nil
 }
+
+// ReserveAmountMoney is the wallet-path counterpart of ReserveAmount
+// (Task 14): the SAME safe upper bound priced under the pinned sale_money
+// price version, in micromoney of its currency. The wallet freeze never
+// under-covers the exact rational bound; 预占金额按价格版本固定，调价不影
+// 响在途冻结.
+func ReserveAmountMoney(price accounting.PriceVersion, b ReserveBounds) (domain.Money, error) {
+	if price.Kind != accounting.PriceSaleMoney {
+		return domain.Money{}, domain.NewError(domain.CodeInvalidInput,
+			"quota: wallet reservation must be priced from the sale_money list, got "+string(price.Kind))
+	}
+	// Reuse the credit-path math against the money price's rates: the rate
+	// lines are unit-agnostic micros; the wrapper pins the currency.
+	mirror := accounting.PriceVersion{
+		Kind:  accounting.PriceSaleCredit,
+		Input: price.Input, CacheRead: price.CacheRead, CacheWrite: price.CacheWrite,
+		Output: price.Output, ExtraRates: price.ExtraRates,
+	}
+	total, err := ReserveAmount(mirror, b)
+	if err != nil {
+		return domain.Money{}, err
+	}
+	return domain.NewMoney(int64(total), price.Currency)
+}

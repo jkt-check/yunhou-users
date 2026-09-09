@@ -133,6 +133,11 @@ func Setup(
 		if accessOps != nil && accessOps.UserSubscriptions != nil {
 			accessOps.UserSubscriptions.Register(userGroup)
 		}
+		// Kaya Coding Plan Task 14: customer wallet (/user/wallet*) — 余额
+		// 总览/流水/套餐外开关/PAYG 开启；归属仅来自 JWT 身份。
+		if accessOps != nil && accessOps.UserWallet != nil {
+			accessOps.UserWallet.Register(userGroup)
+		}
 	}
 
 	// Kaya Coding Plan Task 5/8: the standard-protocol /v1 surface. The

@@ -35,10 +35,20 @@ type Decision struct {
 // 藏负差额). Zero when the charge fits the hold. The charge itself is NEVER
 // clamped to the hold — clamping would silently free real consumption.
 func (d *Decision) OverageMicros() domain.Microcredit {
-	if d.Charge == nil || d.Charge.Credit <= d.ReservedMicros {
+	if d.Charge == nil {
 		return 0
 	}
-	return d.Charge.Credit - d.ReservedMicros
+	// Unit-agnostic: credit path carries Credit, wallet path carries Money
+	// (Task 14); ReservedMicros is denominated in the same unit as the
+	// charge by construction (admission fixed the source).
+	charged := d.Charge.Credit
+	if d.Charge.Money != nil {
+		charged = domain.Microcredit(d.Charge.Money.Micros)
+	}
+	if charged <= d.ReservedMicros {
+		return 0
+	}
+	return charged - d.ReservedMicros
 }
 
 // Decide prices one settlement: normalize overlapping semantics exactly

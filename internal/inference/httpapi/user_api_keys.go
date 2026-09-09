@@ -56,6 +56,10 @@ type AccessOps struct {
 	UserQuotas        *UserQuotasHandler
 	UserUsage         *UserUsageHandler
 	UserSubscriptions *UserSubscriptionsHandler
+	// UserWallet serves the Task 14 customer wallet surface (/user/wallet*):
+	// derived balances, statement, explicit overage opt-in, PAYG enablement.
+	// Nil leaves the surface unmounted (fail closed).
+	UserWallet *UserWalletHandler
 
 	// KayaChat, when non-nil, replaces the legacy chat service for
 	// POST /chat (迁移开关 INFERENCE_KAYA_CHAT_GATEWAY 的接线点).

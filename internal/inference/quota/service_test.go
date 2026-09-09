@@ -37,6 +37,9 @@ type fakeStore struct {
 	reserveErr  error
 	reserveCmds []domain.ReserveCommand
 
+	walletErr  error
+	walletCmds []domain.ReserveWalletCommand
+
 	releaseErr error
 	released   []string
 
@@ -70,8 +73,15 @@ func (s *fakeStore) Reserve(ctx context.Context, uow domain.UnitOfWork, cmd doma
 	return &domain.Admission{RequestID: cmd.Request.ID}, nil
 }
 
-func (s *fakeStore) Release(ctx context.Context, uow domain.UnitOfWork, requestID string) error {
-	if s.releaseErr != nil {
+func (s *fakeStore) ReserveWallet(ctx context.Context, uow domain.UnitOfWork, cmd domain.ReserveWalletCommand) (*domain.Admission, error) {
+	if s.walletErr != nil {
+		return nil, s.walletErr
+	}
+	s.walletCmds = append(s.walletCmds, cmd)
+	return &domain.Admission{RequestID: cmd.Request.ID}, nil
+}
+
+func (s *fakeStore) Release(ctx context.Context, uow domain.UnitOfWork, requestID string) error {	if s.releaseErr != nil {
 		return s.releaseErr
 	}
 	s.released = append(s.released, requestID)

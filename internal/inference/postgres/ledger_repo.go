@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 
 	"github.com/yunhou/users/internal/inference/domain"
 )
@@ -47,14 +48,21 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	// version settled this request (设计 §7.1).
 	var accountID, status string
 	var priceVersionID *string
+	var chargeSource string
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT billing_account_id, price_version_id, status FROM inference_requests WHERE id = $1 FOR UPDATE`,
-		cmd.RequestID).Scan(&accountID, &priceVersionID, &status); err != nil {
+		`SELECT billing_account_id, price_version_id, status, charge_source
+		 FROM inference_requests WHERE id = $1 FOR UPDATE`,
+		cmd.RequestID).Scan(&accountID, &priceVersionID, &status, &chargeSource); err != nil {
 		return mapError("settle: lock request", err)
 	}
 	if domain.RequestStatus(status) == domain.ReqSettled || domain.RequestStatus(status) == domain.ReqReleased {
 		return domain.NewError(domain.CodeConflict,
 			"settle: request already finalized ("+status+")")
+	}
+
+	// 钱包路径（Task 14）：micromoney 结算 + 钱包冻结转消费，全程同一事务。
+	if domain.ChargeSource(chargeSource) == domain.ChargeSourceWallet {
+		return s.settleWallet(ctx, tx, cmd, accountID, priceVersionID)
 	}
 
 	// 2. Usage fact (UNIQUE(attempt_id, revision)).
@@ -154,6 +162,101 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		 WHERE id = $1`,
 		cmd.RequestID, settled, string(cmd.Usage.Source), cmd.SettledAt); err != nil {
 		return mapError("settle: request", err)
+	}
+	return nil
+}
+
+// settleWallet is the charge_source='wallet' settlement (Task 14): same
+// one-transaction shape as the plan path — usage fact + ledger charge
+// (micromoney + currency, pinned price version) + wallet hold → consume
+// entries + reservation conversion + request terminal state. The request
+// row lock is already held by the caller.
+//
+// Crash recovery calls this with cmd.WalletCharge == nil: the conservative
+// charge then equals the RESERVED hold (cmd.ChargeMicros) in the wallet's
+// own currency (Task 9 口径: 未知费用 → 按预占额保守入账，可冲正).
+func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.SettleCommand, accountID string, priceVersionID *string) error {
+	if cmd.ChargeMicros < 0 {
+		return domain.WrapError(domain.CodeInvalidInput, "settle wallet: negative charge", domain.ErrNegativeValue)
+	}
+
+	// 2. Usage fact (UNIQUE(attempt_id, revision)).
+	if err := insertUsageRecord(ctx, tx, &cmd.Usage); err != nil {
+		return err
+	}
+
+	// Resolve the charge money: priced by the gateway under the pinned
+	// sale_money revision; recovery re-supplies the reserved hold.
+	charge := cmd.WalletCharge
+	if charge == nil {
+		var currency string
+		if err := tx.QueryRowxContext(ctx,
+			`SELECT w.currency FROM inference_wallet_holds h
+			 JOIN inference_wallets w ON w.id = h.wallet_id
+			 WHERE h.request_id = $1`, cmd.RequestID).Scan(&currency); err != nil {
+			return mapError("settle wallet: currency", err)
+		}
+		m, err := domain.NewMoney(int64(cmd.ChargeMicros), currency)
+		if err != nil {
+			return err
+		}
+		charge = &m
+	}
+	if charge.Micros != int64(cmd.ChargeMicros) {
+		return domain.NewError(domain.CodeInvalidInput,
+			"settle wallet: wallet charge and charge_micros disagree (调用方必须同源)")
+	}
+
+	// 3. Ledger charge — micromoney, pinned price version, per-request
+	// unique key (恒落，含零额：与 plan 路径同一可区分口径).
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO inference_ledger_entries
+		 (billing_account_id, request_id, entry_type, amount_micros, unit, currency, price_version_id)
+		 VALUES ($1,$2,'charge',$3,'micromoney',$4,$5)`,
+		accountID, cmd.RequestID, charge.Micros, charge.Currency, priceVersionID); err != nil {
+		return mapError("settle wallet: ledger charge", err)
+	}
+
+	// 4. Wallet hold → consume entries (bonus-first; over-hold debits cash
+	// honestly).
+	if err := s.settleWalletLocked(ctx, tx, cmd.RequestID, *charge); err != nil {
+		return err
+	}
+
+	// 5. Flip the mirrored wallet reservation (guarded, fixed order is
+	// trivial here — the wallet hold is the only target).
+	res, err := tx.ExecContext(ctx,
+		`UPDATE inference_reservations
+		 SET state = 'settled', settled_at = now()
+		 WHERE request_id = $1 AND target_kind = 'wallet' AND state = 'held'`, cmd.RequestID)
+	if err != nil {
+		return mapError("settle wallet: reservation", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return domain.NewError(domain.CodeConflict,
+			"settle wallet: reservation already transitioned (concurrent release?)")
+	}
+
+	// 6. Attempt cost (same optional block as the plan path).
+	if cmd.AttemptID != nil && cmd.AttemptCost != nil && cmd.CostBasis != nil {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE inference_attempts
+			 SET cost_micros = $2, cost_currency = $3, cost_basis = $4
+			 WHERE id = $1`,
+			*cmd.AttemptID, cmd.AttemptCost.Micros, cmd.AttemptCost.Currency, string(*cmd.CostBasis)); err != nil {
+			return mapError("settle wallet: attempt cost", err)
+		}
+	}
+
+	// 7. Request terminal state; settled_micros carries money micros
+	// (charge_source='wallet' disambiguates the unit).
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE inference_requests
+		 SET status = 'settled', settled_micros = $2, usage_status = $3,
+		     completed_at = $4, updated_at = now()
+		 WHERE id = $1`,
+		cmd.RequestID, charge.Micros, string(cmd.Usage.Source), cmd.SettledAt); err != nil {
+		return mapError("settle wallet: request", err)
 	}
 	return nil
 }

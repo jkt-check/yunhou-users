@@ -61,6 +61,8 @@ func newTestServer(t *testing.T) *gin.Engine {
 	}
 	t.Cleanup(func() { db.Close() })
 	_, err = db.Exec(`TRUNCATE
+		inference_wallet_entries, inference_wallet_audits,
+		inference_wallet_holds, inference_wallets, inference_payg_config,
 		inference_response_chains,
 		inference_session_bindings, inference_oauth_grants,
 		inference_audit_log,

@@ -58,6 +58,11 @@ type Store interface {
 	// AcquireLeaseTx takes one concurrency lease inside the shared tx
 	// (ownership + fencing token + TTL, Task 7).
 	AcquireLeaseTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.AcquireLeaseCommand) (*domain.ConcurrencyLease, error)
+	// ReserveWallet atomically freezes one wallet-funded hold and persists
+	// the request (charge_source='wallet') inside the shared tx (Task 14;
+	// domain.ReserveWalletCommand contract: 账户→钱包固定锁序、派生余额
+	// 检查、赠送先扣拆分、支出上限门控).
+	ReserveWallet(ctx context.Context, uow domain.UnitOfWork, cmd domain.ReserveWalletCommand) (*domain.Admission, error)
 }
 
 // ActivateWindowsCommand is the input of in-transaction window resolution
@@ -106,7 +111,8 @@ type AdmitCommand struct {
 type AdmissionResult struct {
 	RequestID string
 	// HoldMicros is the single-consumption safe upper bound mirrored into
-	// every target (三窗口 + Key 预算各镜像一份，客户只结算一次).
+	// every target (三窗口 + Key 预算各镜像一份，客户只结算一次). For
+	// ChargeSource=wallet it is the money hold in WalletCurrency micros.
 	HoldMicros   domain.Microcredit
 	AdmittedAt   time.Time
 	WindowIDs    map[domain.WindowKind]string
@@ -115,6 +121,13 @@ type AdmissionResult struct {
 	PolicyID     string
 	PriceID      string
 	AccountLease *domain.ConcurrencyLease
+	// ChargeSource is the admission-fixed charge source (Task 14); the zero
+	// value means the plan/quota path.
+	ChargeSource domain.ChargeSource
+	// WalletID/WalletCurrency identify the frozen wallet (ChargeSource =
+	// wallet only).
+	WalletID       string
+	WalletCurrency string
 }
 
 // Service is the quota admission orchestrator.
@@ -308,10 +321,133 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	return result, nil
 }
 
+// ---------------------------------------------------------------------------
+// 钱包准入（Task 14）：套餐外 / PAYG 请求的有界预占
+// ---------------------------------------------------------------------------
+
+// AdmitWalletCommand is one logical call entering the WALLET gate. The
+// charge source is fixed to the wallet for the request's whole lifetime
+// (入场时选定，首版不中途切换). The entitlement still governs model
+// authorization and the policy's rate/concurrency limits (裁决 6:
+// 模型授权/速率/并发限制照常执行).
+type AdmitWalletCommand struct {
+	Request domain.Request
+	// Entitlement is the authorization source selected at entry: the PAYG
+	// record (no plan) or the exhausted plan's entitlement (overage).
+	Entitlement domain.Entitlement
+	// Policy is the pinned policy revision — its concurrency limit is
+	// enforced here; its RPM/TPM ride the auth middleware as usual.
+	Policy Policy
+	// MoneyPrice is the pinned sale_money price version; its currency
+	// selects the wallet.
+	MoneyPrice accounting.PriceVersion
+	// WalletID is the account's wallet in MoneyPrice.Currency.
+	WalletID string
+	Model    domain.Model
+	// Same bound semantics as AdmitCommand.
+	EstimatedInputTokens int64
+	ClientMaxTokens      *int64
+	ExtraBounds          map[string]int64
+	At                   time.Time
+}
+
+// AdmitWallet runs the wallet gate: full bounded reservation against the
+// prepaid balance (冻结→结算/释放), priced under the pinned sale_money
+// revision. No window holds, no key-budget hold (both are
+// microcredit-denominated); the account concurrency lease IS taken when the
+// policy sets a limit. Fail-closed like Admit: any failure leaves no
+// partial state and never admits.
+func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*AdmissionResult, error) {
+	if cmd.Request.ID == "" {
+		cmd.Request.ID = uuid.NewString()
+	}
+	inputBound, err := InputBound(cmd.EstimatedInputTokens, cmd.Model.ContextTokens)
+	if err != nil {
+		return nil, err
+	}
+	outputCap, err := EffectiveOutputCap(cmd.ClientMaxTokens, cmd.Model.MaxOutputTokens)
+	if err != nil {
+		return nil, err
+	}
+	hold, err := ReserveAmountMoney(cmd.MoneyPrice, ReserveBounds{
+		InputBoundTokens: inputBound,
+		OutputCapTokens:  outputCap,
+		ExtraBounds:      cmd.ExtraBounds,
+	})
+	if err != nil {
+		return nil, err
+	}
+	at := cmd.At.UTC()
+	if at.IsZero() {
+		at = s.clock.Now()
+	}
+	monthStart, monthEnd := accounting.MonthBoundsUTC(at)
+
+	uow, err := s.store.Begin(ctx)
+	if err != nil {
+		return nil, err // fail-closed
+	}
+	rollback := func(err error) (*AdmissionResult, error) {
+		_ = uow.Rollback(ctx)
+		return nil, err
+	}
+
+	req := cmd.Request
+	req.PolicyVersionID = firstNonEmpty(req.PolicyVersionID, cmd.Entitlement.PolicyVersionID)
+	if pv := cmd.MoneyPrice.ID; pv != "" {
+		req.PriceVersionID = &pv
+	}
+	// 准入上界随请求持久化（Task 9/031 同口径）：崩溃恢复的保守估算以此入账。
+	req.InputBoundTokens = &inputBound
+	req.OutputCapTokens = &outputCap
+	req.ExtraBounds = cmd.ExtraBounds
+
+	adm, err := s.store.ReserveWallet(ctx, uow, domain.ReserveWalletCommand{
+		Request: req, WalletID: cmd.WalletID,
+		HoldMicros: hold.Micros, PriceVersionID: cmd.MoneyPrice.ID,
+		AdmittedAt: at, MonthStart: monthStart, MonthEnd: monthEnd,
+	})
+	if err != nil {
+		return rollback(err)
+	}
+
+	result := &AdmissionResult{
+		RequestID: adm.RequestID, HoldMicros: domain.Microcredit(hold.Micros),
+		AdmittedAt: at, OutputCap: outputCap, InputBound: inputBound,
+		PolicyID: req.PolicyVersionID, PriceID: cmd.MoneyPrice.ID,
+		ChargeSource:   domain.ChargeSourceWallet,
+		WalletID:       cmd.WalletID,
+		WalletCurrency: hold.Currency,
+	}
+
+	// 并发限制照常（裁决 6）：与额度路径同一租约机制、同一事务。
+	if cmd.Policy.ConcurrencyLimit != nil {
+		lease, err := s.store.AcquireLeaseTx(ctx, uow, domain.AcquireLeaseCommand{
+			Scope:      domain.LeaseScopeBillingAccount,
+			ScopeID:    cmd.Request.BillingAccountID,
+			RequestID:  adm.RequestID,
+			OwnerToken: s.OwnerToken,
+			Limit:      *cmd.Policy.ConcurrencyLimit,
+			TTL:        s.AccountLeaseTTL,
+			Now:        at,
+		})
+		if err != nil {
+			return rollback(err)
+		}
+		result.AccountLease = lease
+	}
+
+	if err := uow.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // ReleaseAdmission confirms zero upstream consumption and drops every hold
 // of the request in one transaction; an unused five-hour window is voided
 // in-transaction when all its requests confirmed no consumption and no
-// other valid hold remains (设计 §6).
+// other valid hold remains (设计 §6). Wallet holds release through the same
+// path (hold-state transition, no ledger rewrite).
 func (s *Service) ReleaseAdmission(ctx context.Context, requestID string) error {
 	uow, err := s.store.Begin(ctx)
 	if err != nil {

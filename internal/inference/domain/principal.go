@@ -98,6 +98,11 @@ const (
 	SourceSubscription EntitlementSource = "subscription"
 	SourceOrder        EntitlementSource = "order"
 	SourceGrant        EntitlementSource = "grant"
+	// SourcePAYG is the explicit pay-as-you-go record (Task 14, migration
+	// 030): an account WITHOUT a plan may call under a wallet-funded
+	// pay-as-you-go entitlement only when this explicit row exists; model
+	// authorization / rate / concurrency limits apply unchanged.
+	SourcePAYG EntitlementSource = "payg"
 )
 
 // EntitlementStatus mirrors the DB CHECK.

@@ -16,6 +16,9 @@ type AdminOps struct {
 	RequireCredentials gin.HandlerFunc
 	// RequireAdmin guards operator administration (admin role).
 	RequireAdmin gin.HandlerFunc
+	// RequireBilling guards wallet adjustments / PAYG publishing
+	// (billing:adjust, Task 14).
+	RequireBilling gin.HandlerFunc
 
 	Models      *AdminModelsHandler
 	Credentials *AdminCredentialsHandler
@@ -23,6 +26,9 @@ type AdminOps struct {
 	// OAuth guards the upstream OAuth authorization lifecycle (Task 12);
 	// mounted under the same credentials:manage permission.
 	OAuth *AdminOAuthHandler
+	// Adjustments is the operator wallet surface (Task 14: 运营调整/冲正/
+	// PAYG 发布配置); mounted under billing:adjust.
+	Adjustments *AdminAdjustmentsHandler
 }
 
 // Mount wires the write surface onto g. The caller must already have
@@ -40,5 +46,8 @@ func (o *AdminOps) Mount(g *gin.RouterGroup) {
 	}
 	if o.Auth != nil && o.RequireAdmin != nil {
 		o.Auth.RegisterOperators(g.Group("", o.RequireAdmin))
+	}
+	if o.Adjustments != nil && o.RequireBilling != nil {
+		o.Adjustments.Register(g.Group("", o.RequireBilling))
 	}
 }

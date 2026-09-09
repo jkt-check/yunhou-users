@@ -118,6 +118,10 @@ func windowOrderKey(k domain.ReservationTargetKind) int {
 		return 2
 	case domain.TargetKeyBudget:
 		return 3
+	case domain.TargetWallet:
+		// 钱包预占排在 Key 预算之后（固定锁序尾部；钱包行锁在账户锚行
+		// 之后取得，与 wallet_repo 的全部变动同序）。
+		return 4
 	}
 	return 9
 }

@@ -277,3 +277,57 @@ func TestDowngradeEffectiveAt(t *testing.T) {
 		t.Errorf("boundary: effective at %v, want Apr 30 10:00", got)
 	}
 }
+
+// TestSelectEntitlement_PAYGFallback（Task 14 裁决 6）：显式 PAYG 权益只在
+// 显式套餐与赠送都不授权该模型时兜底；无记录不自动获得模型。
+func TestSelectEntitlement_PAYGFallback(t *testing.T) {
+	at := entUTC(2026, 9, 9, 12)
+	payg := mkEnt(domain.SourcePAYG, "payg:acct-1", []string{"glm-4.6"}, entUTC(2026, 9, 1, 0))
+
+	// 无任何记录 → model_not_allowed（无套餐不自动获得按量资格）。
+	if _, err := SelectEntitlement(nil, "glm-4.6", at); domain.CodeOf(err) != domain.CodeModelNotAllowed {
+		t.Fatalf("empty: %v", err)
+	}
+	// 只有 PAYG 记录 → 兜底选中。
+	got, err := SelectEntitlement([]domain.Entitlement{payg}, "glm-4.6", at)
+	if err != nil || got.SourceType != domain.SourcePAYG {
+		t.Fatalf("payg fallback: %v %v", got, err)
+	}
+	// PAYG 不授权该模型 → 拒绝。
+	if _, err := SelectEntitlement([]domain.Entitlement{payg}, "other-model", at); domain.CodeOf(err) != domain.CodeModelNotAllowed {
+		t.Fatalf("payg not covering: %v", err)
+	}
+	// 显式套餐优先于 PAYG。
+	sub := mkEnt(domain.SourceSubscription, "sub-1", []string{"glm-4.6"}, entUTC(2026, 9, 2, 0))
+	got, err = SelectEntitlement([]domain.Entitlement{payg, sub}, "glm-4.6", at)
+	if err != nil || got.SourceType != domain.SourceSubscription {
+		t.Fatalf("explicit must win over payg: %v %v", got, err)
+	}
+	// 赠送优先于 PAYG（无显式套餐时赠送先用）。
+	gift := mkEnt(domain.SourceGrant, "gift-1", []string{"glm-4.6"}, entUTC(2026, 9, 3, 0))
+	got, err = SelectEntitlement([]domain.Entitlement{payg, gift}, "glm-4.6", at)
+	if err != nil || got.SourceType != domain.SourceGrant {
+		t.Fatalf("gift must win over payg: %v %v", got, err)
+	}
+	// 套餐存在但不授权该模型 → PAYG 可兜底该模型（不扩大套餐语义）。
+	subOther := mkEnt(domain.SourceSubscription, "sub-2", []string{"other-model"}, entUTC(2026, 9, 2, 0))
+	got, err = SelectEntitlement([]domain.Entitlement{subOther, payg}, "glm-4.6", at)
+	if err != nil || got.SourceType != domain.SourcePAYG {
+		t.Fatalf("payg covers model the plan does not: %v %v", got, err)
+	}
+}
+
+// TestGrantFromPlan_PAYGSource：payg 来源走同一发放构造（Task 14）。
+func TestGrantFromPlan_PAYGSource(t *testing.T) {
+	from := entUTC(2026, 9, 9, 0)
+	ent, err := GrantFromPlan(PlanRevision{
+		SourceType: domain.SourcePAYG, SourceID: "payg:acct-1",
+		ModelIDs: []string{"glm-4.6"}, PolicyVersionID: "pol-payg",
+	}, time.Time{}, from, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ent.SourceType != domain.SourcePAYG || ent.Stackable {
+		t.Fatalf("payg grant = %+v", ent)
+	}
+}

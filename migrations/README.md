@@ -78,6 +78,7 @@ syntax, **not** transaction control — those are fine.
 | `027_subscription_product_scope.sql` | 套餐/订阅增加 `product_code`（默认回填 `kaya-membership`）；002 的每用户全局活跃唯一索引替换为 `(user_id, product_code)` 部分唯一索引；迁移前 DO 块对同 (user,product) 多活跃订阅输出可读诊断并中止；触发器保证订阅 product_code 与套餐一致 |
 | `028_operator_permissions.sql` | inference 运营授权表组：operator_roles（角色→权限映射）+ inference_audit_log（递归脱敏审计）（Task 4） |
 | `029_order_benefit_snapshot.sql` | 下单权益快照：orders 增加 product_code/plan_interval_days/benefit_policy_version_id/benefit_model_ids/benefit_grant_mode/order_kind/upgrade_from_plan_id（支付回调只按快照兑现；存量订单按 plan 当前值回填）；新增 plan_benefit_configs（套餐→权益版本发布配置，无配置的商品不可购买）与 plan_upgrade_rules（跨档升级显式规则）（Task 10） |
-| `031_inference_settlement_recovery.sql` | 幂等结算与崩溃恢复：charge 允许零额（零消费恒落行）、reconciliation reason 增 settlement_overage、窗口级任务部分唯一索引、请求行持久化准入上界（Task 9；030 起空号经控制者裁决） |
+| `030_inference_wallet.sql` | 预付按量钱包：wallets（每账户每币种一行、无缓存余额列、套餐外开关+UTC 自然月支出上限）/wallet_entries（借贷分录追加+冲正、cash/bonus 来源隔离、refund 仅 cash 的 CHECK、幂等 business_key、一条分录至多一条冲正）/wallet_holds（每请求一条冻结、赠送先扣拆分、价格版本钉住）/wallet_audits（开关与上限修改审计）/payg_config（单行发布配置）；权益来源扩 'payg'、请求行增 charge_source、预占目标扩 'wallet'（Task 14；030 为 Task 0 预留号） |
+| `031_inference_settlement_recovery.sql` | 幂等结算与崩溃恢复：charge 允许零额（零消费恒落行）、reconciliation reason 增 settlement_overage、窗口级任务部分唯一索引、请求行持久化准入上界（Task 9；030 起空号经控制者裁决，后由 Task 14 占用 030） |
 | `032_inference_oauth_sessions.sql` | inference OAuth 授权状态（一次性 state + PKCE，独立于社交登录）与粘性会话绑定表组（Task 12；控制者裁决确需 DDL 从 032 起） |
 | `033_inference_response_chains.sql` | OpenAI Responses 会话链持久化：previous_response_id 接续的 transcript 回放 + 账户/上游账号归属（Task 13） |

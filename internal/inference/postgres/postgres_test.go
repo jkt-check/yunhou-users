@@ -74,6 +74,8 @@ func testDB(t *testing.T) (*sqlx.DB, *Store) {
 func wipeInference(t *testing.T, db *sqlx.DB) {
 	t.Helper()
 	_, err := db.Exec(`TRUNCATE
+		inference_wallet_entries, inference_wallet_audits,
+		inference_wallet_holds, inference_wallets, inference_payg_config,
 		inference_response_chains,
 		inference_session_bindings, inference_oauth_grants,
 		inference_reconciliation_jobs, inference_outbox,

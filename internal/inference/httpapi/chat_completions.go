@@ -393,6 +393,10 @@ func writeV1DomainError(c *gin.Context, err error) {
 		v1Error(c, http.StatusForbidden, "permission_error", "model_not_allowed", safeMsg(err))
 	case domain.CodeRateLimited, domain.CodeInsufficientCapacity:
 		v1Error(c, http.StatusTooManyRequests, "rate_limit_error", string(domain.CodeOf(err)), safeMsg(err))
+	case domain.CodeQuotaExceeded, domain.CodeInsufficientBalance:
+		// 钱包门控（未开启套餐外/月支出上限/余额不足）按限流类 429 答复，
+		// 与套餐耗尽同一客户语义（Task 14）。
+		v1Error(c, http.StatusTooManyRequests, "rate_limit_error", string(domain.CodeOf(err)), safeMsg(err))
 	case domain.CodeUnpricedCapability:
 		v1Error(c, http.StatusForbidden, "permission_error", "unpriced_capability", safeMsg(err))
 	case domain.CodeUpstreamUnavailable:

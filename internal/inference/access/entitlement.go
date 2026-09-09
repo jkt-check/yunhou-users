@@ -40,7 +40,7 @@ type PlanRevision struct {
 //     需要叠加时再发布明确合并规则).
 func GrantFromPlan(plan PlanRevision, anchor, effectiveFrom time.Time, effectiveTo *time.Time) (*domain.Entitlement, error) {
 	switch plan.SourceType {
-	case domain.SourceSubscription, domain.SourceOrder, domain.SourceGrant:
+	case domain.SourceSubscription, domain.SourceOrder, domain.SourceGrant, domain.SourcePAYG:
 	default:
 		return nil, domain.NewError(domain.CodeInvalidInput, "entitlement: unknown source type "+string(plan.SourceType))
 	}
@@ -147,13 +147,16 @@ func (r *EntitlementResolver) Resolve(ctx context.Context, billingAccountID, mod
 //     participate ONLY when the account has no active explicit entitlement
 //     at all — gifts never stack with an explicit plan and never
 //     auto-fallback after the plan is exhausted (设计 §4.2);
-//  3. within the winning class the earliest-created row that grants the
+//  3. pay-as-you-go (payg, Task 14) rows participate ONLY when neither an
+//     explicit purchase nor a gift grants the model — the explicit PAYG
+//     record authorizes wallet-funded calls for plan-less accounts;
+//  4. within the winning class the earliest-created row that grants the
 //     model wins (deterministic; exactly one entitlement ever applies);
-//  4. nothing grants the model → CodeModelNotAllowed. A legacy Kaya member
+//  5. nothing grants the model → CodeModelNotAllowed. A legacy Kaya member
 //     without an explicit grant therefore gets NO models automatically.
 func SelectEntitlement(ents []domain.Entitlement, modelID string, at time.Time) (*domain.Entitlement, error) {
 	t := at.UTC()
-	var explicit, gifts []domain.Entitlement
+	var explicit, gifts, payg []domain.Entitlement
 	for _, e := range ents {
 		if e.Status != domain.EntitlementActive {
 			continue
@@ -164,9 +167,12 @@ func SelectEntitlement(ents []domain.Entitlement, modelID string, at time.Time) 
 		if e.EffectiveTo != nil && !t.Before(e.EffectiveTo.UTC()) {
 			continue
 		}
-		if e.SourceType == domain.SourceGrant {
+		switch e.SourceType {
+		case domain.SourceGrant:
 			gifts = append(gifts, e)
-		} else {
+		case domain.SourcePAYG:
+			payg = append(payg, e)
+		default:
 			explicit = append(explicit, e)
 		}
 	}
@@ -174,9 +180,28 @@ func SelectEntitlement(ents []domain.Entitlement, modelID string, at time.Time) 
 	if len(pool) == 0 {
 		pool = gifts
 	}
-	if len(pool) == 0 {
+	// 显式套餐/赠送都不授权该模型时，显式 PAYG 权益兜底（无套餐按量；
+	// 钱包扣费门控在准入处另行执行）。
+	winner := grantsModel(pool, modelID)
+	if winner == nil {
+		winner = grantsModel(payg, modelID)
+	}
+	if winner != nil {
+		return winner, nil
+	}
+	if len(pool) == 0 && len(payg) == 0 {
 		return nil, domain.NewError(domain.CodeModelNotAllowed,
-			"no active entitlement for this account (无显式权益/赠送，不自动获得模型)")
+			"no active entitlement for this account (无显式权益/赠送/PAYG，不自动获得模型)")
+	}
+	return nil, domain.NewError(domain.CodeModelNotAllowed,
+		"model "+modelID+" is not covered by the effective entitlement")
+}
+
+// grantsModel returns the deterministic winner of one class (earliest
+// created that grants the model), or nil when none does.
+func grantsModel(pool []domain.Entitlement, modelID string) *domain.Entitlement {
+	if len(pool) == 0 {
+		return nil
 	}
 	sort.SliceStable(pool, func(i, j int) bool {
 		if !pool[i].CreatedAt.Equal(pool[j].CreatedAt) {
@@ -186,11 +211,10 @@ func SelectEntitlement(ents []domain.Entitlement, modelID string, at time.Time) 
 	})
 	for i := range pool {
 		if pool[i].AllowsModel(modelID) {
-			return &pool[i], nil
+			return &pool[i]
 		}
 	}
-	return nil, domain.NewError(domain.CodeModelNotAllowed,
-		"model "+modelID+" is not covered by the effective entitlement")
+	return nil
 }
 
 // ---------------------------------------------------------------------------

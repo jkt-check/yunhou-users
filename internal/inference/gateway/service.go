@@ -62,6 +62,9 @@ type Store interface {
 	// Policy/price resolution (immutable versions, pinned at admission).
 	GetPolicyVersion(ctx context.Context, id string) (*postgres.PolicyVersion, error)
 	LatestPriceVersion(ctx context.Context, modelID, kind string, at time.Time) (*postgres.PriceVersion, error)
+	// GetWalletByAccount resolves the account's wallet in a currency
+	// (Task 14 wallet admission; CodeNotFound = no wallet → 余额不足).
+	GetWalletByAccount(ctx context.Context, accountID, currency string) (*postgres.Wallet, error)
 	// Attempt lifecycle.
 	AcquireLeaseTx(ctx context.Context, w domain.UnitOfWork, cmd domain.AcquireLeaseCommand) (*domain.ConcurrencyLease, error)
 	InsertAttemptTx(ctx context.Context, w domain.UnitOfWork, a *domain.Attempt) error
@@ -304,53 +307,73 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		return nil, domain.NewError(domain.CodeModelNotAllowed, "model "+m.ID+" is not allowed for this API key")
 	}
 
-	// 3. Entitlement resolution (显式套餐优先，赠送不叠加/不兜底 — Task 6).
+	// 3. Entitlement resolution (显式套餐优先，赠送不叠加/不兜底；无套餐时
+	// 显式 PAYG 权益兜底 — Task 6/14).
 	now := s.clock.Now()
 	ent, err := s.entitlements.Resolve(ctx, p.BillingAccountID, m.ID, now)
 	if err != nil {
 		return nil, err // CodeModelNotAllowed when nothing grants the model
 	}
-	// 4. Pin the immutable policy and sale-credit price revisions.
+	// 4. Pin the immutable policy revision; the charge source is selected
+	// AT ENTRY and never switched mid-request (控制者裁决 5: 首版不在请求
+	// 中途隐式切换套餐/余额).
 	polRow, err := s.store.GetPolicyVersion(ctx, ent.PolicyVersionID)
 	if err != nil {
 		return nil, err
 	}
 	policy := polRow.Pure()
-	priceRow, err := s.store.LatestPriceVersion(ctx, m.ID, string(accounting.PriceSaleCredit), now)
-	if err != nil {
-		if domain.CodeOf(err) == domain.CodeNotFound {
-			return nil, accounting.ErrUnpriced
-		}
-		return nil, err
-	}
-	creditPrice, err := priceRow.Pure()
-	if err != nil {
-		return nil, err
-	}
 
-	// 5. Quota admission — the reservation commits BEFORE any upstream
-	// network call (设计 §7.2).
 	var keyID *string
 	if key != nil {
 		keyID = &key.ID
 	} else if p.APIKeyID != "" {
 		keyID = &p.APIKeyID
 	}
-	adm, err := s.quotaSvc.Admit(ctx, quota.AdmitCommand{
-		Request: domain.Request{
+	newRequest := func() domain.Request {
+		return domain.Request{
 			BillingAccountID: p.BillingAccountID, APIKeyID: keyID,
 			EntitlementID: ent.ID, ModelID: m.ID,
 			Protocol: clientProto, Stream: req.Stream,
-		},
-		Entitlement:          *ent,
-		Policy:               policy,
-		CreditPrice:          creditPrice,
-		Model:                *m,
-		EstimatedInputTokens: EstimateInputTokens(req),
-		ClientMaxTokens:      req.MaxTokens,
-	})
-	if err != nil {
-		return nil, err
+		}
+	}
+
+	var adm *quota.AdmissionResult
+	var price accounting.PriceVersion // the pinned revision this call reserves & settles under
+	if ent.SourceType == domain.SourcePAYG {
+		// 无套餐按量（裁决 6）：钱包路径，权益/限流/并发照常。
+		adm, price, err = s.admitWallet(ctx, newRequest(), *ent, policy, m, req, now)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// 5. Plan path — quota admission commits BEFORE any upstream call.
+		creditPrice, err := s.pinCreditPrice(ctx, m.ID, now)
+		if err != nil {
+			return nil, err
+		}
+		price = creditPrice
+		adm, err = s.quotaSvc.Admit(ctx, quota.AdmitCommand{
+			Request:              newRequest(),
+			Entitlement:          *ent,
+			Policy:               policy,
+			CreditPrice:          creditPrice,
+			Model:                *m,
+			EstimatedInputTokens: EstimateInputTokens(req),
+			ClientMaxTokens:      req.MaxTokens,
+		})
+		if err != nil {
+			// 套餐耗尽且策略允许套餐外 + 客户已显式开启钱包消费 → 本次请求
+			// 固定走钱包（裁决 4/5）；钱包门控失败时按原 quota_exceeded 答复
+			// （未开启超额时不动余额，也不静默切换）。
+			if policy.Overage != quota.OverageAllowOverage || domain.CodeOf(err) != domain.CodeQuotaExceeded {
+				return nil, err
+			}
+			wadm, wprice, werr := s.admitWallet(ctx, newRequest(), *ent, policy, m, req, now)
+			if werr != nil {
+				return nil, err
+			}
+			adm, price = wadm, wprice
+		}
 	}
 	requestID := adm.RequestID
 	// From here on, every exit path finalizes the reservation.
@@ -377,7 +400,63 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		}
 	}
 
-	return s.dispatchLoop(ctx, requestID, adm, req, creditPrice, cands)
+	return s.dispatchLoop(ctx, requestID, adm, req, price, cands)
+}
+
+// pinCreditPrice resolves the effective sale_credit revision (plan path).
+func (s *Service) pinCreditPrice(ctx context.Context, modelID string, now time.Time) (accounting.PriceVersion, error) {
+	priceRow, err := s.store.LatestPriceVersion(ctx, modelID, string(accounting.PriceSaleCredit), now)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return accounting.PriceVersion{}, accounting.ErrUnpriced
+		}
+		return accounting.PriceVersion{}, err
+	}
+	return priceRow.Pure()
+}
+
+// admitWallet runs the wallet-funded admission (PAYG entry or explicit
+// overage fallback): pin the effective sale_money revision (其币种选定钱
+// 包), then freeze the safe upper bound against the derived balance. The
+// customer must have explicitly enabled wallet spend with a monthly limit
+// (裁决 4) — otherwise the wallet is never touched.
+func (s *Service) admitWallet(ctx context.Context, request domain.Request, ent domain.Entitlement,
+	policy quota.Policy, m *domain.Model, req *providers.ChatRequest, now time.Time) (*quota.AdmissionResult, accounting.PriceVersion, error) {
+
+	priceRow, err := s.store.LatestPriceVersion(ctx, m.ID, string(accounting.PriceSaleMoney), now)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return nil, accounting.PriceVersion{}, accounting.ErrUnpriced
+		}
+		return nil, accounting.PriceVersion{}, err
+	}
+	moneyPrice, err := priceRow.Pure()
+	if err != nil {
+		return nil, accounting.PriceVersion{}, err
+	}
+	wallet, err := s.store.GetWalletByAccount(ctx, request.BillingAccountID, moneyPrice.Currency)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			// 无钱包 = 从未充值/开启：按余额不足答复（429），不泄露内部结构。
+			return nil, accounting.PriceVersion{}, accounting.ErrInsufficientBalance
+		}
+		return nil, accounting.PriceVersion{}, err
+	}
+	adm, err := s.quotaSvc.AdmitWallet(ctx, quota.AdmitWalletCommand{
+		Request:              request,
+		Entitlement:          ent,
+		Policy:               policy,
+		MoneyPrice:           moneyPrice,
+		WalletID:             wallet.ID,
+		Model:                *m,
+		EstimatedInputTokens: EstimateInputTokens(req),
+		ClientMaxTokens:      req.MaxTokens,
+		At:                   now,
+	})
+	if err != nil {
+		return nil, accounting.PriceVersion{}, err
+	}
+	return adm, moneyPrice, nil
 }
 
 // pinSessionCandidates narrows the failover set to the session's bound
@@ -860,6 +939,16 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		ChargeMicros: decision.Charge.Credit,
 		SettledAt:    s.clock.Now(),
 	}
+	if adm.ChargeSource == domain.ChargeSourceWallet {
+		// 钱包路径（Task 14）：金额计费，货币随冻结钱包；charge 与
+		// ChargeMicros 同源（settle 事务内校验一致）。
+		if decision.Charge.Money == nil {
+			s.parkSettleFailure(requestID, fmt.Errorf("settle decision: wallet path produced no money charge"))
+			return
+		}
+		cmd.WalletCharge = decision.Charge.Money
+		cmd.ChargeMicros = domain.Microcredit(decision.Charge.Money.Micros)
+	}
 	cost, basis, cerr := s.attemptCost(price.ModelID, decision.Record)
 	if cerr != nil {
 		log.Printf("gateway: attempt cost for %s: %v (cost left unset, charge unaffected)", attemptID, cerr)
@@ -876,7 +965,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		overDetail, _ = json.Marshal(map[string]interface{}{
 			"schema_version":  1,
 			"reserved_micros": int64(adm.HoldMicros),
-			"charge_micros":   int64(decision.Charge.Credit),
+			"charge_micros":   int64(cmd.ChargeMicros),
 			"over_micros":     int64(over),
 			"origin":          "settlement",
 		})
@@ -894,8 +983,8 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		}
 		if lastErr = s.settleOnce(ctx, cmd, overDetail); lastErr == nil {
 			if overDetail != nil {
-				log.Printf("ALARM gateway: request %s charge %d exceeds hold %d by %d microcredits (settled real amount; overage tracked, further overdraft blocked by quota)",
-					requestID, int64(decision.Charge.Credit), int64(adm.HoldMicros), int64(decision.OverageMicros()))
+				log.Printf("ALARM gateway: request %s charge %d exceeds hold %d by %d micros (charge_source=%s; settled real amount; overage tracked, further overdraft blocked)",
+					requestID, int64(cmd.ChargeMicros), int64(adm.HoldMicros), int64(decision.OverageMicros()), adm.ChargeSource)
 			}
 			return
 		}

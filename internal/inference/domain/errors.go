@@ -25,7 +25,11 @@ const (
 	// CodeUnpricedCapability rejects a chargeable capability that has no
 	// effective price version (设计 §7.1/Task 6: 拒绝未定价且需扣费的能力).
 	CodeUnpricedCapability Code = "unpriced_capability"
-	CodeInternal           Code = "internal"
+	// CodeInsufficientBalance rejects a wallet-funded admission when the
+	// derived available balance (or the monthly spend limit) cannot cover
+	// the safe upper-bound hold (Task 14: 并发扣减在 DB 层原子，不超扣).
+	CodeInsufficientBalance Code = "insufficient_balance"
+	CodeInternal            Code = "internal"
 )
 
 // Error is the domain error: a stable Code plus a human-readable message.

@@ -137,6 +137,11 @@ const (
 	TargetWindowWeekly   ReservationTargetKind = "window_weekly"
 	TargetWindowMonthly  ReservationTargetKind = "window_monthly"
 	TargetKeyBudget      ReservationTargetKind = "key_budget"
+	// TargetWallet is the money hold of a wallet-funded request (Task 14):
+	// the reservation row mirrors the inference_wallet_holds freeze so the
+	// unified audit surface / unique key still guard it; Amount carries
+	// MICROMONEY of the wallet currency for this target (not microcredits).
+	TargetWallet ReservationTargetKind = "wallet"
 )
 
 // Reservation is one held amount against one target. A request holds at
@@ -183,6 +188,21 @@ const (
 	CostAllocated CostBasis = "allocated"
 )
 
+// ChargeSource pins WHERE a request is charged, fixed at admission
+// (Task 14, 控制者裁决: 入场时选定 plan entitlement 或 wallet，首版不在
+// 请求中途隐式切换).
+type ChargeSource string
+
+const (
+	// ChargeSourcePlan charges the plan entitlement's quota windows
+	// (microcredits, sale_credit price list).
+	ChargeSourcePlan ChargeSource = "plan"
+	// ChargeSourceWallet charges the prepaid wallet (micromoney of the
+	// wallet currency, sale_money price list): explicit overage fallback
+	// or pay-as-you-go.
+	ChargeSourceWallet ChargeSource = "wallet"
+)
+
 // Request is one logical model call. PriceVersionID/PolicyVersionID and
 // the window bindings are pinned at admission; a request finishing after
 // a reset still settles into its original windows (设计 §6).
@@ -203,9 +223,13 @@ type Request struct {
 	WindowMonthlyID  *string
 	// ReservedMicros 是这次请求的单次消费预占上界：同一次消费镜像进
 	// 全部目标（三窗口 + Key 预算），请求行只记一次，不等于各 hold 之和。
+	// ChargeSource='wallet' 时它是钱包币种微金额（money micros）。
 	ReservedMicros *Microcredit
 	SettledMicros  *Microcredit
-	UsageStatus    UsageSource
+	// ChargeSource 是入场固定的扣费来源（migration 030）；'plan' 行走额度
+	// 窗口，'wallet' 行走钱包冻结，二者绝不中途切换。
+	ChargeSource ChargeSource
+	UsageStatus  UsageSource
 	// InputBoundTokens/OutputCapTokens/ExtraBounds 是准入时的安全上界
 	// （Task 9, migration 031）：崩溃恢复的保守估算以此入账，可审计、可冲正。
 	InputBoundTokens *int64
@@ -321,14 +345,17 @@ type UnitOfWork interface {
 	Rollback(ctx context.Context) error
 }
 
-// HoldSpec is one atomic hold inside a reservation: a window hold or the
-// Key budget hold. Exactly one of WindowID / APIKeyID is set, matching
-// TargetKind.
+// HoldSpec is one atomic hold inside a reservation: a window hold, the Key
+// budget hold, or a wallet money hold. Exactly one of WindowID / APIKeyID /
+// WalletID is set, matching TargetKind. For TargetWallet, Amount carries
+// MICROMONEY of the wallet's currency.
 type HoldSpec struct {
 	TargetKind ReservationTargetKind
 	WindowID   *string
 	APIKeyID   *string
-	Amount     Microcredit
+	// WalletID is set for TargetWallet holds (Task 14).
+	WalletID *string
+	Amount   Microcredit
 }
 
 // ReserveCommand is the input of an atomic reservation. The caller (quota
@@ -339,6 +366,25 @@ type ReserveCommand struct {
 	Holds   []HoldSpec
 	// AdmittedAt binds windows and price (设计 §6/§7.2).
 	AdmittedAt time.Time
+}
+
+// ReserveWalletCommand is the input of an atomic wallet-funded admission
+// (Task 14): one money hold frozen against the account's wallet in the
+// pinned sale_money price's currency. The request's charge source is
+// pinned to wallet by the store implementation (入场固定扣费来源).
+type ReserveWalletCommand struct {
+	Request Request
+	// WalletID is the account's wallet in the pinned price's currency.
+	WalletID string
+	// HoldMicros is the safe upper bound in MICROMONEY of the wallet
+	// currency (priced under PriceVersionID at admission).
+	HoldMicros     int64
+	PriceVersionID string
+	AdmittedAt     time.Time
+	// MonthStart/MonthEnd bound the UTC calendar month the spend limit is
+	// evaluated over (derived from AdmittedAt by the caller).
+	MonthStart time.Time
+	MonthEnd   time.Time
 }
 
 // Admission is the result of a successful reservation.
@@ -353,8 +399,15 @@ type Admission struct {
 type SettleCommand struct {
 	RequestID string
 	Usage     UsageRecord
-	// ChargeMicros is the customer-consumption amount in microcredits.
+	// ChargeMicros is the customer-consumption amount in microcredits
+	// (plan path). For wallet requests it mirrors WalletCharge.Micros so
+	// crash recovery (which knows no currency) can re-supply the
+	// conservative charge (= the reserved hold) without re-pricing.
 	ChargeMicros Microcredit
+	// WalletCharge is the priced money charge for charge_source='wallet'
+	// requests (Task 14): micromoney + currency, quoted under the price
+	// version pinned at admission. Nil on the plan path.
+	WalletCharge *Money
 	// AttemptCost (optional) updates the attempt's cost with its basis.
 	AttemptID   *string
 	AttemptCost *Money

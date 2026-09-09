@@ -38,14 +38,25 @@ func insertRequest(ctx context.Context, ex sqlxExecutor, r *domain.Request) erro
 		  protocol, stream, status, admitted_at, price_version_id, policy_version_id,
 		  window_five_hour_id, window_weekly_id, window_monthly_id,
 		  reserved_micros, usage_status,
-		  input_bound_tokens, output_cap_tokens, extra_bounds)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+		  input_bound_tokens, output_cap_tokens, extra_bounds,
+		  charge_source)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		r.ID, r.BillingAccountID, strPtr(r.APIKeyID), r.EntitlementID, r.ModelID,
 		string(r.Protocol), r.Stream, status, r.AdmittedAt, strPtr(r.PriceVersionID), r.PolicyVersionID,
 		strPtr(r.WindowFiveHourID), strPtr(r.WindowWeeklyID), strPtr(r.WindowMonthlyID),
 		microPtr(r.ReservedMicros), usageStatus,
-		r.InputBoundTokens, r.OutputCapTokens, extraBounds)
+		r.InputBoundTokens, r.OutputCapTokens, extraBounds,
+		chargeSourceOf(r))
 	return mapError("insert request", err)
+}
+
+// chargeSourceOf normalizes the admission-fixed charge source (migration
+// 030; 'plan' is the DB default for pre-030 shapes).
+func chargeSourceOf(r *domain.Request) string {
+	if r.ChargeSource == domain.ChargeSourceWallet {
+		return string(domain.ChargeSourceWallet)
+	}
+	return string(domain.ChargeSourcePlan)
 }
 
 // extraBoundsDoc is the schema-versioned storage shape of
@@ -130,6 +141,7 @@ func (s *Store) GetRequest(ctx context.Context, id string) (*domain.Request, err
 		InputBound    *int64          `db:"input_bound_tokens"`
 		OutputCap     *int64          `db:"output_cap_tokens"`
 		ExtraBounds   json.RawMessage `db:"extra_bounds"`
+		ChargeSource  string          `db:"charge_source"`
 		LastError     string          `db:"last_error"`
 		CreatedAt     time.Time       `db:"created_at"`
 		UpdatedAt     time.Time       `db:"updated_at"`
@@ -153,6 +165,7 @@ func (s *Store) GetRequest(ctx context.Context, id string) (*domain.Request, err
 		WindowMonthlyID: strFromNull(row.WinM),
 		ReservedMicros:  microFromNull(row.Reserved), SettledMicros: microFromNull(row.Settled),
 		UsageStatus:      domain.UsageSource(row.UsageStatus),
+		ChargeSource:     domain.ChargeSource(row.ChargeSource),
 		InputBoundTokens: row.InputBound, OutputCapTokens: row.OutputCap, ExtraBounds: bounds,
 		LastError: row.LastError,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, CompletedAt: row.CompletedAt,

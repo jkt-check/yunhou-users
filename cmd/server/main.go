@@ -295,6 +295,12 @@ func main() {
 		RPMCounter:        rpmCounter,
 		V1Models:          inferencehttpapi.NewModelsHandler(catalogSvc, accessResolver),
 		V1ChatCompletions: inferencehttpapi.NewChatCompletionsHandler(gatewaySvc),
+		// Task 11: customer quota/usage/subscription read views over the
+		// inference store (quota reads are the authoritative current state;
+		// usage reads carry as_of/complete_through).
+		UserQuotas:        inferencehttpapi.NewUserQuotasHandler(inferencemanagement.NewQuotaViewService(infStore, nil)),
+		UserUsage:         inferencehttpapi.NewUserUsageHandler(inferencemanagement.NewUsageViewService(infStore, nil)),
+		UserSubscriptions: inferencehttpapi.NewUserSubscriptionsHandler(inferencemanagement.NewSubscriptionViewService(infStore, nil)),
 	}
 	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。

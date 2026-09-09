@@ -514,6 +514,43 @@ Authorization: Bearer <access_token>
 
 ---
 
+### Kaya Coding Plan 客户接口（模型 API 套餐）
+
+Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-plan`）。本节是 Website 客户控制台的对接契约；完整机器可读契约见
+[docs/api/kaya-coding-plan.openapi.yaml](api/kaya-coding-plan.openapi.yaml)，七个代表状态的响应 fixture 见 [docs/api/fixtures/](api/fixtures/)（零额度、未激活、耗尽、已过期、预占中、跨月、待核对）。
+
+**全局约定**
+
+- 全部端点需用户 JWT（`Authorization: Bearer`）；只有本人可查自身 Key/配额/用量/订阅 —— 端点不接收用户/账户 ID 参数，所有权永远来自 JWT 身份。
+- **64 位额度/金额一律十进制整数字符串**（如 `"used": "200000"`），避免 JS 大整数精度丢失；额度单位 `microcredit`。token/请求计数为 JSON 整数。
+- 时间一律 RFC3339 UTC；额度周期由服务端锚点推导，客户端切时区不改变额度。
+- **窗口展示语义**：三窗口 `[start, end)`；五小时窗口未激活时 `window_start`/`resets_at` 为 null 且 `activation=on_first_consumption`；禁用窗口 `disabled=true` + `limit=null`（缺失**不等于**无限额度）。
+- **读口径**：`/user/model-quotas` 是当前**权威**额度状态（`as_of` 即读取时刻，可直接用于展示剩余额度）。`/user/model-usage/*` 是历史统计，带 `as_of`/`complete_through` 截止时刻；统计不得用作实时放行依据。
+- **用量来源**：`inference_requests`/`inference_usage_records`/`inference_ledger_entries`；`usage_events` 心跳表（客户端活跃信号）**不是**模型用量来源。
+- **计量完整性**：每请求 `usage_status` ∈ `reported`/`estimated`/`unknown`/`pending`；token 桶 `null` = 未报告（未知 ≠ 0）；待核对请求 `status=reconciliation_required`，预占保留、未结算金额为 null。
+
+#### `GET /user/model-quotas` — 三窗口额度（权威）
+
+返回当前权益的三窗口 `used`/`reserved`/`remaining`、`window_start`/`resets_at`（前端无需计算窗口）、权益有效期（`entitlement.effective_from/effective_to`）与当前阻断 `blocked_by`。多个窗口同时阻断时全部返回（各带准确 `resets_at`）；恢复时刻未知时 `resets_at=null`（不编造倒计时）。`blocked_by` 的 `reason` ∈ `quota_exhausted`/`entitlement_expired`/`entitlement_revoked`/`entitlement_superseded`/`entitlement_not_yet_effective`/`no_active_entitlement`/`account_not_active`。
+
+#### `GET /user/model-usage/summary` — 用量分组聚合 + 日序列
+
+参数：`from`/`to`（RFC3339，缺省最近 30 天，跨度最大 92 天）、`group_by=model|key`（默认 model）、`model_id`/`api_key_id`（可选收窄）。返回分组聚合（请求计数、计量完整性计数、`charge_micros`/`reversed_micros`/`net_micros`、token 桶合计）+ UTC 自然日序列 `series`。`group_by=key` 时 `api_key_id=null` 的组是无 Key 的 JWT/facade 调用。
+
+#### `GET /user/model-usage/requests` — 请求明细分页
+
+参数：`from`/`to` 同上，`model_id`/`api_key_id` 过滤，`limit`（1–100，默认 50），`cursor`（上一页 `next_cursor`，不透明 keyset 游标，持续写入下不跳行；最后一页为 null）。每行：`request_id`、`model_id`、`api_key_id`/`key_name`/`key_prefix`、`status`、`usage_status`、`reserved_micros`/`charge_micros`/`reversed_micros`/`net_micros`、`tokens`、`created_at`/`admitted_at`/`completed_at`。
+
+#### `GET /user/model-subscriptions` — Coding Plan 套餐与权益
+
+返回 `subscriptions`（仅 coding-plan，全部状态，最新在前）、`entitlements`（当前与已停用权益，`source` 记录 grant 来源：`subscription`/`order`/`grant`；grant 细分 `bundle_gift`（kaya 会员捆绑）/`migration_gift`（迁移赠送）/`other`）、`kaya_membership`（旧会员活跃标记，命名空间隔离；无活跃会员为 null）。旧会员详情仍由 `GET /user/subscriptions` 提供；**上游供应商账号不出现在任何字段中**。
+
+#### `/user/api-keys` — 客户 Key 自管
+
+`POST /user/api-keys`（明文仅创建响应出现一次）、`GET`（分页，永不携带明文）、`GET/PATCH /user/api-keys/:id`（`PATCH` 显式 `null` 清除可选约束）、`DELETE`（幂等撤销，下一次 `/v1` 调用即生效）。字段与错误形状见 OpenAPI 文件。
+
+---
+
 ### Chat 接口
 
 Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的 DeepSeek API Key 代为调用模型，并把流式响应原样转发给客户端。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：

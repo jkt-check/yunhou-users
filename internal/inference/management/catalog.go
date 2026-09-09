@@ -1,5 +1,7 @@
 // Package management hosts the operator-facing use cases of the inference
-// module. Each write carries an actor (the authenticated operator subject
+// module and — since Task 11 — the customer self-service READ views
+// (quota_view / usage_view / subscription_view, backing /user/model-*).
+// Each write carries an actor (the authenticated operator subject
 // once Task 4 wires operator auth); today the actor is recorded as
 // revision attribution (created_by) and handed to the catalog service.
 // Task 4 adds the authorization gate and the audit trail without changing

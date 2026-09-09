@@ -1,0 +1,948 @@
+openapi: 3.0.3
+info:
+  title: Kaya Coding Plan — 客户控制台 API（yunhou-users）
+  version: 0.11.0
+  description: |
+    Kaya Coding Plan（独立模型 API 套餐）客户侧契约，供 Website 客户控制台对接。
+    本文件与 `internal/inference/httpapi/{user_api_keys,user_quotas,user_usage,
+    user_subscriptions}.go` 的实际响应逐字段对齐（Task 11；设计 §9.2）。
+
+    ## 全局约定
+
+    - **Envelope**：本文件所有端点使用管理 envelope `{code, data, message}`。
+      成功 `code=0` + `data`；失败 `code=<HTTP 状态码>` + `data=null` + `message`。
+      （`/v1/*` 标准协议端点使用 OpenAI 原生错误形状，不在本文件范围。）
+    - **整数精度**：64 位额度/金额一律为**十进制整数字符串**（`DecimalInt64`），
+      避免 JS `Number` 精度丢失（>2^53）。单位 `microcredit`（微额度）。
+      token 计数与请求计数为 JSON 整数（`int64` 范围内，JS 安全）。
+    - **时间格式**：全部 RFC3339 UTC（`2026-09-08T04:00:00Z`）。所有计量时间
+      来自服务端；客户端切时区不改变额度周期（设计 §6）。
+    - **窗口语义**：三窗口 `[start, end)`，到边界属新窗口。五小时窗口未激活时
+      `window_start`/`resets_at` 为 null 且 `activation=on_first_consumption`；
+      禁用窗口 `disabled=true` + `limit=null`（缺失**不等于**无限额度）。
+    - **读口径**：`/user/model-quotas` 是当前**权威**额度状态（as_of 即读取时刻）。
+      `/user/model-usage/*` 是历史统计，带 `as_of`/`complete_through` 截止时刻；
+      本实现直读权威表（complete_through = as_of），若未来引入延迟聚合，
+      complete_through 会如实给出截止时间。**延迟统计不得用作实时放行依据**。
+    - **用量来源**：`inference_requests` / `inference_usage_records` /
+      `inference_ledger_entries`。绝不使用 `usage_events` 心跳表（客户端活跃
+      信号，非计费事实）。
+    - **计量完整性**：每请求 `usage_status` ∈ `reported/estimated/unknown/pending`；
+      token 桶 `null` = 未报告（未知 ≠ 0）。
+    - **权限**：全部端点需用户 JWT（`Authorization: Bearer`）；只有本人可查自身
+      Key/账本/配额/订阅（端点不接收用户/账户 ID 参数，越权在结构上不可能）。
+
+    ## 错误码（envelope code = HTTP 状态码）
+
+    | HTTP | message 前缀/含义 | 触发 |
+    |---|---|---|
+    | 400 | invalid_input | 参数/时间格式/游标非法；未知 body 字段 |
+    | 401 | 未认证或 JWT 失效 | JWT 中间件 |
+    | 403 | model_not_allowed | Key 模型权限超出账户权益 |
+    | 404 | not_found | 资源不存在或不属于本人（不区分） |
+    | 409 | conflict | 幂等/乐观锁冲突 |
+    | 429 | rate_limited | 频率限制 |
+    | 500 | internal | 内部错误 |
+
+    响应 fixture（七态：零额度/未激活/耗尽/已过期/预占中/跨月/待核对）见
+    `docs/api/fixtures/`，并由 `internal/inference/httpapi` 的测试逐字段断言。
+  contact:
+    name: yunhou-users backend
+servers:
+  - url: /
+security:
+  - BearerAuth: []
+tags:
+  - name: api-keys
+    description: 客户 API Key 自管（Task 5）
+  - name: model-console
+    description: Coding Plan 配额/用量/套餐读视图（Task 11）
+
+paths:
+  /user/model-quotas:
+    get:
+      tags: [model-console]
+      summary: 三窗口额度视图（权威当前状态）
+      description: |
+        返回当前权益的三窗口 used/reserved/remaining（前端无需计算窗口：
+        window_start/resets_at/remaining 由服务端给出）、权益有效期与当前
+        阻断原因。quota 读是**当前权威状态**（直读配额闸门写入的窗口行）。
+        多个窗口同时阻断时 blocked_by 全部返回；恢复时刻未知（如未激活的
+        零限额五小时窗口）时 resets_at 为 null，绝不编造倒计时。
+      operationId: getModelQuotas
+      responses:
+        "200":
+          description: 额度视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelQuotasEnvelope"
+              examples:
+                active:
+                  summary: 正常（五小时窗口活跃）
+                  value:
+                    code: 0
+                    data:
+                      server_time: "2026-09-08T04:00:00Z"
+                      as_of: "2026-09-08T04:00:00Z"
+                      unit: microcredit
+                      entitlement_id: "5f0d2f2e-9a1f-4a1e-9a2b-0000000000aa"
+                      entitlement:
+                        id: "5f0d2f2e-9a1f-4a1e-9a2b-0000000000aa"
+                        status: active
+                        source_type: subscription
+                        model_ids: ["glm-4.6"]
+                        policy_version_id: "7c9e6679-7425-40de-944b-0000000000bb"
+                        anchor_at: "2026-09-01T10:00:00Z"
+                        effective_from: "2026-09-01T10:00:00Z"
+                        effective_to: "2026-10-01T10:00:00Z"
+                        revision: 1
+                      blocked_by: []
+                      windows:
+                        - kind: five_hour
+                          mode: anchored_duration
+                          disabled: false
+                          limit: "1000000"
+                          used: "200000"
+                          reserved: "100000"
+                          remaining: "700000"
+                          window_start: "2026-09-08T03:00:00Z"
+                          resets_at: "2026-09-08T08:00:00Z"
+                        - kind: weekly
+                          mode: anchored_period_7d
+                          disabled: false
+                          limit: "10000000"
+                          used: "200000"
+                          reserved: "100000"
+                          remaining: "9700000"
+                          window_start: "2026-09-08T10:00:00Z"
+                          resets_at: "2026-09-15T10:00:00Z"
+                        - kind: monthly
+                          mode: anchored_calendar_month
+                          disabled: false
+                          limit: "100000000"
+                          used: "200000"
+                          reserved: "100000"
+                          remaining: "99700000"
+                          window_start: "2026-09-01T10:00:00Z"
+                          resets_at: "2026-10-01T10:00:00Z"
+                zero-limit:
+                  summary: 零额度（限额为 0，三窗口全阻断）
+                  externalValue: fixtures/model-quotas-zero-limit.json
+                unactivated:
+                  summary: 未激活（五小时窗口等待首次消费）
+                  externalValue: fixtures/model-quotas-unactivated.json
+                exhausted:
+                  summary: 耗尽（五小时+周窗口同时阻断）
+                  externalValue: fixtures/model-quotas-exhausted.json
+                expired:
+                  summary: 已过期（权益过期，窗口状态如实保留）
+                  externalValue: fixtures/model-quotas-expired.json
+                reserved:
+                  summary: 预占中（在途预占计入 reserved）
+                  externalValue: fixtures/model-quotas-reserved.json
+                cross-month:
+                  summary: 跨月（1 月 31 日锚点的月窗裁剪，不漂移）
+                  externalValue: fixtures/model-quotas-cross-month.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/model-usage/summary:
+    get:
+      tags: [model-console]
+      summary: 用量分组聚合 + UTC 日序列
+      description: |
+        按模型（group_by=model，默认）或 Key（group_by=key）聚合
+        [from, to) 范围内的请求：请求计数、计量完整性计数
+        （reported/estimated/unknown/pending）、charge/reversed/net
+        （十进制字符串，microcredit）、token 桶合计（最新计量 revision；
+        未报告桶为 null）。series 为 UTC 自然日桶（与 DB 会话时区无关）。
+        时间范围受限：默认最近 30 天，最大跨度 92 天。
+      operationId: getModelUsageSummary
+      parameters:
+        - $ref: "#/components/parameters/RangeFrom"
+        - $ref: "#/components/parameters/RangeTo"
+        - name: group_by
+          in: query
+          schema: { type: string, enum: [model, key], default: model }
+        - name: model_id
+          in: query
+          schema: { type: string }
+          description: 收窄到单个模型（同时收窄 series）
+        - name: api_key_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: 收窄到单个 Key（同时收窄 series）
+      responses:
+        "200":
+          description: 用量汇总
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageSummaryEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/model-usage/requests:
+    get:
+      tags: [model-console]
+      summary: 请求明细分页（keyset 游标）
+      description: |
+        按 (created_at DESC, id DESC) 稳定排序的请求明细。`next_cursor` 为
+        不透明 keyset 游标（base64url），持续写入下不跳行/不重复；最后一页
+        为 null。未结算请求 charge_micros/net_micros 为 null（预占中），
+        reserved_micros 展示在途预占；reversed_micros 承载结算后的账本冲正。
+      operationId: listModelUsageRequests
+      parameters:
+        - $ref: "#/components/parameters/RangeFrom"
+        - $ref: "#/components/parameters/RangeTo"
+        - name: model_id
+          in: query
+          schema: { type: string }
+        - name: api_key_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: 上一页响应的 next_cursor（不透明，不要解析）
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        "200":
+          description: 请求明细页
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageRequestsEnvelope"
+              examples:
+                reconciliation:
+                  summary: 待核对（计量缺失，预占保留）
+                  externalValue: fixtures/model-usage-requests-reconciliation.json
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/model-subscriptions:
+    get:
+      tags: [model-console]
+      summary: Coding Plan 套餐与权益视图（与旧会员分离）
+      description: |
+        返回 coding-plan 产品的订阅列表（全部状态，最新在前）、计费账户的
+        权益（含 grant 来源：subscription / order / bundle_gift /
+        migration_gift）与命名空间化的 kaya_membership 活跃标记。
+        旧会员详情仍由 /user/subscriptions 提供，两边不混排。
+        赠送来源记录到订阅/规则级；**上游供应商账号不出现在任何字段中**。
+      operationId: getModelSubscriptions
+      responses:
+        "200":
+          description: 套餐与权益视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelSubscriptionsEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/api-keys:
+    post:
+      tags: [api-keys]
+      summary: 创建 API Key（明文仅此响应出现一次）
+      operationId: createApiKey
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiKeyCreateRequest"
+      responses:
+        "200":
+          description: 创建成功（data.key 为唯一一次明文）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreatedEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: 模型权限超出账户权益
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    get:
+      tags: [api-keys]
+      summary: 分页查询 Key（永不携带明文）
+      operationId: listApiKeys
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Key 列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyListEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/api-keys/{id}:
+    get:
+      tags: [api-keys]
+      summary: 单个 Key 详情
+      operationId: getApiKey
+      parameters:
+        - $ref: "#/components/parameters/ApiKeyId"
+      responses:
+        "200":
+          description: Key 详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [api-keys]
+      summary: 更新权限/预算/有效期（显式 null 清除可选约束）
+      operationId: updateApiKey
+      parameters:
+        - $ref: "#/components/parameters/ApiKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiKeyUpdateRequest"
+      responses:
+        "200":
+          description: 更新后的 Key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: 模型权限超出账户权益
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [api-keys]
+      summary: 撤销 Key（幂等；下一次 /v1 调用即生效）
+      operationId: revokeApiKey
+      parameters:
+        - $ref: "#/components/parameters/ApiKeyId"
+      responses:
+        "200":
+          description: 撤销结果（revoked=false 表示本就已撤销）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          id: { type: string, format: uuid }
+                          revoked: { type: boolean }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 用户 JWT（Website BFF 保持 Cookie→用户身份的转发）。
+
+  parameters:
+    RangeFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date-time }
+      description: 范围起点（含），RFC3339 UTC；缺省 = to - 30 天
+    RangeTo:
+      name: to
+      in: query
+      schema: { type: string, format: date-time }
+      description: 范围终点（不含），RFC3339 UTC；缺省 = 当前服务端时间；跨度最大 92 天
+    ApiKeyId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    InvalidInput:
+      description: 参数非法（invalid_input）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example: { code: 400, data: null, message: "inference/invalid_input: usage: from must be before to" }
+    Unauthorized:
+      description: 未认证（JWT 缺失/失效）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    NotFound:
+      description: 不存在或不属于本人（404 不区分，不泄漏存在性）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example: { code: 404, data: null, message: "inference/not_found: api key not found" }
+
+  schemas:
+    DecimalInt64:
+      type: string
+      pattern: "^[0-9]+$"
+      example: "1000000"
+      description: 64 位整数的十进制字符串（JS 大整数精度安全）；额度单位 microcredit
+    RFC3339UTC:
+      type: string
+      format: date-time
+      example: "2026-09-08T04:00:00Z"
+      description: RFC3339，一律 UTC（服务端计量时间）
+    Envelope:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: integer
+          description: 0 = 成功；失败时为 HTTP 状态码
+        data:
+          nullable: true
+        message:
+          type: string
+          description: 仅失败时携带
+    ErrorEnvelope:
+      type: object
+      required: [code, data, message]
+      properties:
+        code: { type: integer }
+        data: { type: object, nullable: true }
+        message: { type: string }
+
+    # --- /user/model-quotas ---
+
+    QuotaWindow:
+      type: object
+      required: [kind, mode, disabled, limit, used, reserved, remaining, window_start, resets_at]
+      properties:
+        kind:
+          type: string
+          enum: [five_hour, weekly, monthly]
+        mode:
+          type: string
+          enum: [anchored_duration, anchored_period_7d, anchored_calendar_month]
+          description: 窗口展示语义（§6）：五小时=首次消费锚定固定时长；周=锚点起 7×24h；月=锚点公历月（原始锚点日裁剪）
+        disabled:
+          type: boolean
+          description: 策略显式禁用该窗口（缺失≠无限额度）
+        limit:
+          allOf:
+            - $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: 禁用时为 null
+        used:
+          $ref: "#/components/schemas/DecimalInt64"
+        reserved:
+          $ref: "#/components/schemas/DecimalInt64"
+        remaining:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: max(0, limit-used-reserved)；禁用时为 null
+        window_start:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 五小时窗口未激活时为 null
+        resets_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 五小时窗口未激活时为 null
+        activation:
+          type: string
+          enum: [on_first_consumption]
+          description: 仅未激活五小时窗口携带
+    QuotaBlock:
+      type: object
+      required: [kind, reason, limit, used, reserved, remaining, resets_at, expired_at]
+      description: 当前阻断约束；窗口块带计数快照，权益/账户块带原因。所有键恒定存在，不适用为 null
+      properties:
+        kind:
+          type: string
+          enum: [five_hour, weekly, monthly, entitlement, account]
+        reason:
+          type: string
+          enum: [quota_exhausted, entitlement_expired, entitlement_revoked, entitlement_superseded, entitlement_not_yet_effective, no_active_entitlement, account_not_active]
+        limit:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        used:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        reserved:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        remaining:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        resets_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 恢复时刻未知时为 null（不编造倒计时）
+        expired_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 仅 entitlement_expired 携带（effective_to）
+    QuotaEntitlement:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [active, expired, revoked, superseded]
+        source_type:
+          type: string
+          enum: [subscription, order, grant]
+        model_ids:
+          type: array
+          items: { type: string }
+        policy_version_id: { type: string, format: uuid }
+        anchor_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_from:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_to:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        revision: { type: integer }
+    ModelQuotasEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, unit, entitlement_id, entitlement, blocked_by, windows]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                  description: 权威状态读取时刻（quota 读无延迟）
+                unit:
+                  type: string
+                  enum: [microcredit]
+                entitlement_id:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: null = 账户从未有任何权益（勿解释为无限额度）
+                entitlement:
+                  $ref: "#/components/schemas/QuotaEntitlement"
+                  nullable: true
+                blocked_by:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/QuotaBlock"
+                windows:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/QuotaWindow"
+                  description: 固定顺序 five_hour → weekly → monthly；无权益时为空数组
+
+    # --- /user/model-usage ---
+
+    UsageTokens:
+      type: object
+      description: 规范化 token 桶（最新计量 revision）；null = 未报告（未知 ≠ 0）
+      properties:
+        input_tokens: { type: integer, format: int64, nullable: true }
+        cache_read_tokens: { type: integer, format: int64, nullable: true }
+        cache_write_tokens: { type: integer, format: int64, nullable: true }
+        output_tokens: { type: integer, format: int64, nullable: true }
+        reasoning_tokens: { type: integer, format: int64, nullable: true }
+    UsageGroup:
+      type: object
+      properties:
+        model_id:
+          type: string
+          nullable: true
+          description: group_by=model 的分组键；group_by=key 时为 null
+        api_key_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: group_by=key 的分组键；null = 无 Key 的 JWT/facade 调用组
+        key_name: { type: string }
+        key_prefix: { type: string, description: 展示前缀（永不携带 Key 材料） }
+        requests: { type: integer, format: int64 }
+        settled: { type: integer, format: int64 }
+        released: { type: integer, format: int64 }
+        in_flight: { type: integer, format: int64, description: 预占/在途未终态 }
+        failed: { type: integer, format: int64 }
+        reconciliation_pending: { type: integer, format: int64, description: 待核对 }
+        reported: { type: integer, format: int64 }
+        estimated: { type: integer, format: int64 }
+        unknown: { type: integer, format: int64 }
+        pending: { type: integer, format: int64 }
+        charge_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        reversed_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        net_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: charge - reversed
+        tokens:
+          $ref: "#/components/schemas/UsageTokens"
+    UsageSeriesBucket:
+      type: object
+      description: UTC 自然日桶
+      properties:
+        bucket_start:
+          $ref: "#/components/schemas/RFC3339UTC"
+        requests: { type: integer, format: int64 }
+        charge_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        reported: { type: integer, format: int64 }
+        estimated: { type: integer, format: int64 }
+        unknown: { type: integer, format: int64 }
+    UsageSummaryEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, complete_through, unit, range, group_by, groups, series]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                complete_through:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                  description: 统计覆盖截止时刻；延迟聚合实现必须如实给出
+                unit: { type: string, enum: [microcredit] }
+                range:
+                  type: object
+                  properties:
+                    from:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                    to:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                group_by: { type: string, enum: [model, key] }
+                groups:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/UsageGroup"
+                series:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/UsageSeriesBucket"
+    UsageRequestRow:
+      type: object
+      properties:
+        request_id: { type: string, format: uuid }
+        model_id: { type: string }
+        api_key_id:
+          type: string
+          format: uuid
+          nullable: true
+        key_name: { type: string }
+        key_prefix: { type: string }
+        protocol:
+          type: string
+          enum: [openai_chat, openai_responses, anthropic_messages, kaya_chat]
+        stream: { type: boolean }
+        status:
+          type: string
+          enum: [authenticated, reserved, dispatching, streaming, non_streaming, settling, settled, released, reconciliation_required, failed]
+        usage_status:
+          type: string
+          enum: [pending, reported, estimated, unknown]
+          description: 计量完整性状态
+        reserved_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: 预占上界（在途请求可见）
+        charge_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: 结算扣费；未结算为 null
+        reversed_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        net_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        tokens:
+          $ref: "#/components/schemas/UsageTokens"
+          nullable: true
+          description: 无计量记录时整体为 null（配合 usage_status 解读）
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        admitted_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        completed_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+    UsageRequestsEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, unit, range, items, next_cursor, limit]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                unit: { type: string, enum: [microcredit] }
+                range:
+                  type: object
+                  properties:
+                    from:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                    to:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                items:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/UsageRequestRow"
+                next_cursor:
+                  type: string
+                  nullable: true
+                  description: 不透明 keyset 游标；null = 最后一页
+                limit: { type: integer }
+
+    # --- /user/model-subscriptions ---
+
+    ProductSubscription:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        plan_id: { type: string }
+        plan_name:
+          type: string
+          nullable: true
+        product_code:
+          type: string
+          enum: [coding-plan, kaya-membership]
+        status:
+          type: string
+          enum: [active, expired, cancelled]
+        started_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+    EntitlementSource:
+      type: object
+      required: [type, reference]
+      description: grant 来源记录（订阅/订单/赠送规则）；永不含上游账号
+      properties:
+        type:
+          type: string
+          enum: [subscription, order, grant]
+        kind:
+          type: string
+          enum: [bundle_gift, migration_gift, other]
+          description: 仅 type=grant 携带
+        reference:
+          type: string
+          description: 原始 source_id（客户自己的订阅/订单/规则标识）
+        subscription_id:
+          type: string
+          format: uuid
+          description: 可解析到本人订阅时携带（显式套餐或捆绑赠送的会员订阅）
+        plan_id: { type: string }
+        plan_name:
+          type: string
+          nullable: true
+    EntitlementItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [active, expired, revoked, superseded]
+        revision: { type: integer }
+        model_ids:
+          type: array
+          items: { type: string }
+        policy_version_id: { type: string, format: uuid }
+        anchor_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_from:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_to:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        stackable:
+          type: boolean
+          description: 赠送默认不叠加（§4.2）
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        source:
+          $ref: "#/components/schemas/EntitlementSource"
+    ModelSubscriptionsEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, subscriptions, entitlements, kaya_membership]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                subscriptions:
+                  type: array
+                  description: 仅 coding-plan 产品（全部状态，最新在前）
+                  items:
+                    $ref: "#/components/schemas/ProductSubscription"
+                entitlements:
+                  type: array
+                  description: 当前与已停用权益（active 在前，其余按创建时间倒序）
+                  items:
+                    $ref: "#/components/schemas/EntitlementItem"
+                kaya_membership:
+                  $ref: "#/components/schemas/ProductSubscription"
+                  nullable: true
+                  description: 旧会员活跃标记（命名空间隔离；无活跃会员时为 null）
+
+    # --- /user/api-keys ---
+
+    ApiKey:
+      type: object
+      description: 管理视图永不携带 Key 材料（prefix 仅展示/关联用）
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string, example: "yk-Ab3xY9kQ2" }
+        model_ids:
+          type: array
+          items: { type: string }
+          description: 空数组 = 不额外收窄（账户权益全集）
+        budget_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        budget_used_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        rpm_limit:
+          type: integer
+          nullable: true
+        status:
+          type: string
+          enum: [active, revoked, expired]
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        revoked_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        last_used_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+    ApiKeyCreateRequest:
+      type: object
+      properties:
+        name: { type: string, maxLength: 128 }
+        model_ids:
+          type: array
+          items: { type: string }
+        budget_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        rpm_limit: { type: integer, minimum: 1 }
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+    ApiKeyUpdateRequest:
+      type: object
+      description: 仅列出字段被修改；显式 null 清除可选约束（budget/rpm/expires）；未知字段一律 400
+      properties:
+        name: { type: string, maxLength: 128 }
+        model_ids:
+          type: array
+          nullable: true
+          items: { type: string }
+        budget_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        rpm_limit:
+          type: integer
+          nullable: true
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+    ApiKeyCreatedEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              allOf:
+                - $ref: "#/components/schemas/ApiKey"
+                - type: object
+                  properties:
+                    key:
+                      type: string
+                      description: 明文仅此一次；服务端不可恢复
+    ApiKeyEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/ApiKey"
+    ApiKeyListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              properties:
+                items:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/ApiKey"
+                total: { type: integer, format: int64 }
+                limit: { type: integer }
+                offset: { type: integer }

@@ -43,6 +43,15 @@ type AccessOps struct {
 	V1Models          *ModelsHandler
 	V1ChatCompletions *ChatCompletionsHandler
 
+	// Task 11 customer read views (设计 §9.2): /user/model-quotas,
+	// /user/model-usage/{summary,requests}, /user/model-subscriptions.
+	// Mounted under the JWT-authenticated /user group; ownership derives
+	// from the JWT identity only. Nil fields leave the surface unmounted
+	// (fail closed).
+	UserQuotas        *UserQuotasHandler
+	UserUsage         *UserUsageHandler
+	UserSubscriptions *UserSubscriptionsHandler
+
 	// KayaChat, when non-nil, replaces the legacy chat service for
 	// POST /chat (迁移开关 INFERENCE_KAYA_CHAT_GATEWAY 的接线点).
 	KayaChat service.ChatStreamer

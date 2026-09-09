@@ -1,0 +1,88 @@
+package httpapi_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// openapi_contract_test.go — docs/api/kaya-coding-plan.openapi.yaml 与
+// handler 实际响应的对齐断言（轻量文本级；fixture 级逐字段对齐由
+// user_views_fixture_test.go 承担）。钉住：每个已挂载端点都在文档中、
+// 七个 fixture 都被引用、关键 DTO 字段/枚举/约定不漂移。
+
+func readOpenAPI(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "api", "kaya-coding-plan.openapi.yaml"))
+	if err != nil {
+		t.Fatalf("openapi file missing: %v", err)
+	}
+	return string(raw)
+}
+
+func TestOpenAPI_CoversMountedEndpoints(t *testing.T) {
+	doc := readOpenAPI(t)
+	for _, path := range []string{
+		"/user/model-quotas:",
+		"/user/model-usage/summary:",
+		"/user/model-usage/requests:",
+		"/user/model-subscriptions:",
+		"/user/api-keys:",
+		"/user/api-keys/{id}:",
+	} {
+		if !strings.Contains(doc, path) {
+			t.Errorf("openapi missing path %s", path)
+		}
+	}
+	// 七个响应 fixture 全部被引用。
+	for _, fx := range []string{
+		"model-quotas-zero-limit.json",
+		"model-quotas-unactivated.json",
+		"model-quotas-exhausted.json",
+		"model-quotas-expired.json",
+		"model-quotas-reserved.json",
+		"model-quotas-cross-month.json",
+		"model-usage-requests-reconciliation.json",
+	} {
+		if !strings.Contains(doc, "fixtures/"+fx) {
+			t.Errorf("openapi missing fixture reference %s", fx)
+		}
+	}
+}
+
+func TestOpenAPI_ConventionsAndDTOFields(t *testing.T) {
+	doc := readOpenAPI(t)
+	// 约定：十进制整数字符串、UTC、计量完整性、未激活提示、keyset 游标。
+	for _, kw := range []string{
+		"microcredit", "DecimalInt64", "date-time",
+		"on_first_consumption", "anchored_duration", "anchored_period_7d", "anchored_calendar_month",
+		"reported", "estimated", "unknown", "pending",
+		"next_cursor", "complete_through", "as_of", "server_time",
+		"quota_exhausted", "entitlement_expired", "no_active_entitlement",
+		"bundle_gift", "migration_gift", "kaya_membership",
+		"usage_events", // 心跳表不作为用量来源的明确口径
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing convention keyword %q", kw)
+		}
+	}
+	// DTO 字段（与 handler 输出同源）：逐字段在文档中出现。
+	for _, field := range []string{
+		"window_start", "resets_at", "remaining", "blocked_by", "entitlement_id",
+		"charge_micros", "reversed_micros", "net_micros", "reserved_micros",
+		"usage_status", "reconciliation_pending", "in_flight",
+		"policy_version_id", "effective_from", "effective_to", "anchor_at",
+		"budget_used_micros", "key_prefix",
+	} {
+		if !strings.Contains(doc, field) {
+			t.Errorf("openapi missing DTO field %q", field)
+		}
+	}
+	// 整数精度约定：DecimalInt64 必须是 string 类型而非 integer。
+	i := strings.Index(doc, "DecimalInt64:")
+	j := strings.Index(doc[i:], "type: string")
+	if i < 0 || j < 0 || j > 120 {
+		t.Error("DecimalInt64 must be declared as type: string (十进制整数字符串)")
+	}
+}

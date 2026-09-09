@@ -120,6 +120,19 @@ func Setup(
 		if accessOps != nil && accessOps.UserAPIKeys != nil {
 			accessOps.UserAPIKeys.Register(userGroup)
 		}
+
+		// Kaya Coding Plan Task 11: customer quota/usage/subscription read
+		// views (/user/model-*). Same ownership rule (JWT identity only);
+		// nil handlers stay unmounted (fail closed).
+		if accessOps != nil && accessOps.UserQuotas != nil {
+			accessOps.UserQuotas.Register(userGroup)
+		}
+		if accessOps != nil && accessOps.UserUsage != nil {
+			accessOps.UserUsage.Register(userGroup)
+		}
+		if accessOps != nil && accessOps.UserSubscriptions != nil {
+			accessOps.UserSubscriptions.Register(userGroup)
+		}
 	}
 
 	// Kaya Coding Plan Task 5/8: the standard-protocol /v1 surface. The

@@ -928,6 +928,42 @@ func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 	}
 }
 
+// TestChatHandler_AccessLog_ReasoningContentCapped: thinking traces are
+// model-internal text bounded only by the request body cap, so mirroring
+// them in full would balloon the audit log. The logged input must carry a
+// capped (rune-safe) sample with input_truncated set, while input_bytes
+// still counts the REAL reasoning bytes — reasoning is billed upstream
+// input on continuations, so the cost metric must not ignore it.
+func TestChatHandler_AccessLog_ReasoningContentCapped(t *testing.T) {
+	const wantCap = 1 << 10
+	big := strings.Repeat("推", wantCap) // 3x the cap in bytes
+	sse := "data: [DONE]\n\n"
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamReply(sse, nil)})
+	body := `{"messages":[{"role":"assistant","content":"好的","reasoning_content":"` + big + `"}]}`
+	if w := performChatRequest(r, body); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var entry chatAccessEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(logBuf.String())), &entry); err != nil {
+		t.Fatalf("log line not JSON: %v", err)
+	}
+	if len(entry.Input) != 1 {
+		t.Fatalf("logged input len = %d, want 1", len(entry.Input))
+	}
+	if got := len(entry.Input[0].ReasoningContent); got > wantCap {
+		t.Errorf("logged reasoning len = %d, want <= %d", got, wantCap)
+	}
+	if !entry.InputTruncated {
+		t.Error("input_truncated = false, want true (reasoning was capped)")
+	}
+	if !utf8.ValidString(entry.Input[0].ReasoningContent) {
+		t.Error("logged reasoning is not valid UTF-8 (rune boundary broken)")
+	}
+	if want := len("好的") + len(big); entry.InputBytes != want {
+		t.Errorf("input_bytes = %d, want real content+reasoning length %d", entry.InputBytes, want)
+	}
+}
+
 // TestChatHandler_ToolMessagesAcceptance locks the structured tool_call
 // relay: role=tool messages and assistant turns carrying tool_calls must
 // pass validation (including empty content, which the OpenAI convention

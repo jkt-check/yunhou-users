@@ -30,6 +30,16 @@ type Principal struct {
 	OperatorSubject string
 }
 
+// BillingAccountStatus mirrors the DB CHECK on
+// inference_billing_accounts.status (migration 025).
+type BillingAccountStatus string
+
+const (
+	BillingAccountActive    BillingAccountStatus = "active"
+	BillingAccountSuspended BillingAccountStatus = "suspended"
+	BillingAccountClosed    BillingAccountStatus = "closed"
+)
+
 // BillingAccount is the billing owner of usage. Phase 1: exactly one per
 // user (UNIQUE(user_id)); SubjectType reserves organization seats (设计
 // §4.2). Deleting a user must NOT cascade here — the de-identification
@@ -38,7 +48,7 @@ type BillingAccount struct {
 	ID          string
 	UserID      string
 	SubjectType string // "user" | "organization"
-	Status      string // "active" | "suspended" | "closed"
+	Status      string // BillingAccountStatus（active/suspended/closed）
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }

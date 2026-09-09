@@ -81,6 +81,7 @@ type usageGroupJSON struct {
 
 	ChargeMicros   string `json:"charge_micros"`
 	ReversedMicros string `json:"reversed_micros"`
+	AdjustedMicros string `json:"adjusted_micros"`
 	NetMicros      string `json:"net_micros"`
 
 	Tokens usageTokensJSON `json:"tokens"`
@@ -96,6 +97,7 @@ func toUsageGroupJSON(g management.UsageGroup) usageGroupJSON {
 		Reported: g.Reported, Estimated: g.Estimated, Unknown: g.Unknown, Pending: g.Pending,
 		ChargeMicros:   strconv.FormatInt(g.ChargeMicros, 10),
 		ReversedMicros: strconv.FormatInt(g.ReversedMicros, 10),
+		AdjustedMicros: strconv.FormatInt(g.AdjustedMicros, 10),
 		NetMicros:      strconv.FormatInt(g.NetMicros(), 10),
 		Tokens:         toUsageTokensJSON(g.Tokens),
 	}
@@ -120,12 +122,15 @@ func (h *UserUsageHandler) Summary(c *gin.Context) {
 	series := make([]gin.H, 0, len(view.Series))
 	for _, b := range view.Series {
 		series = append(series, gin.H{
-			"bucket_start":  b.BucketStart.UTC().Format(time.RFC3339),
-			"requests":      b.RequestsTotal,
-			"charge_micros": strconv.FormatInt(b.ChargeMicros, 10),
-			"reported":      b.Reported,
-			"estimated":     b.Estimated,
-			"unknown":       b.Unknown,
+			"bucket_start":    b.BucketStart.UTC().Format(time.RFC3339),
+			"requests":        b.RequestsTotal,
+			"charge_micros":   strconv.FormatInt(b.ChargeMicros, 10),
+			"reversed_micros": strconv.FormatInt(b.ReversedMicros, 10),
+			"adjusted_micros": strconv.FormatInt(b.AdjustedMicros, 10),
+			"net_micros":      strconv.FormatInt(b.NetMicros(), 10),
+			"reported":        b.Reported,
+			"estimated":       b.Estimated,
+			"unknown":         b.Unknown,
 		})
 	}
 	ok(c, gin.H{
@@ -155,9 +160,10 @@ func parseSummaryParams(c *gin.Context) (management.UsageSummaryFilter, error) {
 	return f, nil
 }
 
-// usageRequestJSON is one logical request row. charge/net are null until
-// settlement （预占中： reserved 持有、charge 未知）；reversed carries
-// post-settlement corrections （账本冲正）.
+// usageRequestJSON is one logical request row. charge_micros 派生自不可变
+// 账本 charge 分录（未结算/已释放为 null —— 预占中： reserved 持有、
+// charge 未知）；reversed_micros 与 adjusted_micros（debit + / credit −
+// 签名合计）承载结算后修正；net = charge − reversed + adjusted。
 type usageRequestJSON struct {
 	RequestID  string  `json:"request_id"`
 	ModelID    string  `json:"model_id"`
@@ -172,6 +178,7 @@ type usageRequestJSON struct {
 	ReservedMicros *string `json:"reserved_micros"`
 	ChargeMicros   *string `json:"charge_micros"`
 	ReversedMicros string  `json:"reversed_micros"`
+	AdjustedMicros string  `json:"adjusted_micros"`
 	NetMicros      *string `json:"net_micros"`
 
 	Tokens *usageTokensJSON `json:"tokens"`
@@ -188,6 +195,7 @@ func toUsageRequestJSON(r management.RequestRow) usageRequestJSON {
 		Protocol: r.Protocol, Stream: r.Stream,
 		Status: string(r.Status), UsageStatus: string(r.UsageStatus),
 		ReversedMicros: strconv.FormatInt(r.ReversedMicros, 10),
+		AdjustedMicros: strconv.FormatInt(r.AdjustedMicros, 10),
 		CreatedAt:      r.CreatedAt.UTC().Format(time.RFC3339),
 		AdmittedAt:     rfc3339Ptr(r.AdmittedAt),
 		CompletedAt:    rfc3339Ptr(r.CompletedAt),
@@ -196,8 +204,8 @@ func toUsageRequestJSON(r management.RequestRow) usageRequestJSON {
 		s := strconv.FormatInt(int64(*r.ReservedMicros), 10)
 		out.ReservedMicros = &s
 	}
-	if r.SettledMicros != nil {
-		s := strconv.FormatInt(int64(*r.SettledMicros), 10)
+	if r.ChargeMicros != nil {
+		s := strconv.FormatInt(*r.ChargeMicros, 10)
 		out.ChargeMicros = &s
 	}
 	if n := r.NetMicrosPtr(); n != nil {

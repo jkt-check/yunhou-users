@@ -108,7 +108,9 @@ func toQuotaBlockJSON(b management.Block) quotaBlockJSON {
 		limit := strconv.FormatInt(int64(b.Window.Limit), 10)
 		used := strconv.FormatInt(int64(b.Window.Used), 10)
 		reserved := strconv.FormatInt(int64(b.Window.Reserved), 10)
-		remaining := "0"
+		// Remaining 由 management.Remaining 计算（与阻断谓词同一实现），
+		// 不在此处重复 max(0,...) 逻辑。
+		remaining := strconv.FormatInt(int64(b.Window.Remaining), 10)
 		out.Limit, out.Used, out.Reserved, out.Remaining = &limit, &used, &reserved, &remaining
 		out.ResetsAt = rfc3339Ptr(b.Window.ResetsAt)
 	}

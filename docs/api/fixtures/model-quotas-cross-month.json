@@ -1,23 +1,23 @@
 {
   "code": 0,
   "data": {
-    "as_of": "2026-09-09T01:21:42Z",
+    "as_of": "2026-09-09T02:18:18Z",
     "blocked_by": [],
     "entitlement": {
       "anchor_at": "2026-01-31T10:00:00Z",
       "effective_from": "2026-01-31T10:00:00Z",
       "effective_to": "2027-01-31T10:00:00Z",
-      "id": "5ddf8b9b-9f92-415e-9150-6e071a7aaa0c",
+      "id": "1b3e87ab-6e06-47b7-8198-7e1e1b5f01e9",
       "model_ids": [
         "glm-4.6"
       ],
-      "policy_version_id": "efeec1bd-04dd-4312-8b24-659a800292ae",
+      "policy_version_id": "875ed1d2-ff05-46f0-b9c7-d62459e90087",
       "revision": 1,
       "source_type": "subscription",
       "status": "active"
     },
-    "entitlement_id": "5ddf8b9b-9f92-415e-9150-6e071a7aaa0c",
-    "server_time": "2026-09-09T01:21:42Z",
+    "entitlement_id": "1b3e87ab-6e06-47b7-8198-7e1e1b5f01e9",
+    "server_time": "2026-09-09T02:18:18Z",
     "unit": "microcredit",
     "windows": [
       {

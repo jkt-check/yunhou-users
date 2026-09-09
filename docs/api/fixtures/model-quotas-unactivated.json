@@ -1,23 +1,23 @@
 {
   "code": 0,
   "data": {
-    "as_of": "2026-09-09T01:21:41Z",
+    "as_of": "2026-09-09T02:18:17Z",
     "blocked_by": [],
     "entitlement": {
-      "anchor_at": "2026-09-07T01:21:41Z",
-      "effective_from": "2026-09-07T01:21:41Z",
+      "anchor_at": "2026-09-07T02:18:17Z",
+      "effective_from": "2026-09-07T02:18:17Z",
       "effective_to": null,
-      "id": "53d24acf-aa30-44b4-bba8-5e62aebc1467",
+      "id": "10bc03b3-2c1a-4972-bd25-25db85590f80",
       "model_ids": [
         "glm-4.6"
       ],
-      "policy_version_id": "0d903d92-aafe-4b84-96ec-58b1ed456f72",
+      "policy_version_id": "459d61e5-2b8d-4d66-a116-38145c1c6295",
       "revision": 1,
       "source_type": "subscription",
       "status": "active"
     },
-    "entitlement_id": "53d24acf-aa30-44b4-bba8-5e62aebc1467",
-    "server_time": "2026-09-09T01:21:41Z",
+    "entitlement_id": "10bc03b3-2c1a-4972-bd25-25db85590f80",
+    "server_time": "2026-09-09T02:18:17Z",
     "unit": "microcredit",
     "windows": [
       {
@@ -39,9 +39,9 @@
         "mode": "anchored_period_7d",
         "remaining": "10000000",
         "reserved": "0",
-        "resets_at": "2026-09-14T01:21:41Z",
+        "resets_at": "2026-09-14T02:18:17Z",
         "used": "0",
-        "window_start": "2026-09-07T01:21:41Z"
+        "window_start": "2026-09-07T02:18:17Z"
       },
       {
         "disabled": false,
@@ -50,9 +50,9 @@
         "mode": "anchored_calendar_month",
         "remaining": "100000000",
         "reserved": "0",
-        "resets_at": "2026-10-07T01:21:41Z",
+        "resets_at": "2026-10-07T02:18:17Z",
         "used": "0",
-        "window_start": "2026-09-07T01:21:41Z"
+        "window_start": "2026-09-07T02:18:17Z"
       }
     ]
   }

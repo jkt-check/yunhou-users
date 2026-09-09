@@ -1,20 +1,21 @@
 {
   "code": 0,
   "data": {
-    "as_of": "2026-09-09T01:21:42Z",
+    "as_of": "2026-09-09T02:18:18Z",
     "items": [
       {
+        "adjusted_micros": "0",
         "admitted_at": null,
         "api_key_id": null,
         "charge_micros": null,
         "completed_at": null,
-        "created_at": "2026-09-09T01:21:42Z",
+        "created_at": "2026-09-09T02:18:18Z",
         "key_name": "",
         "key_prefix": "",
         "model_id": "glm-4.6",
         "net_micros": null,
         "protocol": "openai_chat",
-        "request_id": "bca6e2b4-73ec-4bca-8be3-019b002bca8e",
+        "request_id": "482fdf5b-39e2-4df8-ae69-5ac639f8e088",
         "reserved_micros": "9999",
         "reversed_micros": "0",
         "status": "reconciliation_required",
@@ -23,17 +24,18 @@
         "usage_status": "unknown"
       },
       {
-        "admitted_at": "2026-09-09T01:21:42Z",
+        "adjusted_micros": "0",
+        "admitted_at": "2026-09-09T02:18:18Z",
         "api_key_id": null,
         "charge_micros": "60000",
-        "completed_at": "2026-09-09T01:21:42Z",
-        "created_at": "2026-09-09T01:21:42Z",
+        "completed_at": "2026-09-09T02:18:18Z",
+        "created_at": "2026-09-09T02:18:18Z",
         "key_name": "",
         "key_prefix": "",
         "model_id": "glm-4.6",
         "net_micros": "60000",
         "protocol": "openai_chat",
-        "request_id": "afb92f97-8b2d-4fcd-9dde-ab8a17c2cef6",
+        "request_id": "daf1d842-2887-49e9-93e0-971378085654",
         "reserved_micros": "70000",
         "reversed_micros": "0",
         "status": "settled",
@@ -51,10 +53,10 @@
     "limit": 50,
     "next_cursor": null,
     "range": {
-      "from": "2026-08-10T01:21:42Z",
-      "to": "2026-09-09T01:21:42Z"
+      "from": "2026-08-10T02:18:18Z",
+      "to": "2026-09-09T02:18:18Z"
     },
-    "server_time": "2026-09-09T01:21:42Z",
+    "server_time": "2026-09-09T02:18:18Z",
     "unit": "microcredit"
   }
 }

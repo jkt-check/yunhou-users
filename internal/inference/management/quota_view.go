@@ -58,6 +58,9 @@ type WindowBlockView struct {
 	Limit     domain.Microcredit
 	Used      domain.Microcredit
 	Reserved  domain.Microcredit
+	// Remaining is Remaining(window) at block time (max(0, limit-used-
+	// reserved) — 与 ExhaustedWindowBlock 谓词同一计算，不重复实现).
+	Remaining domain.Microcredit
 	ResetsAt  *time.Time
 }
 
@@ -155,7 +158,7 @@ func (s *QuotaViewService) Get(ctx context.Context, userID string) (*QuotaView, 
 		}
 		return nil, err
 	}
-	if account.Status != "active" {
+	if account.Status != string(domain.BillingAccountActive) {
 		view.BlockedBy = append(view.BlockedBy, Block{Kind: BlockKindAccount, Reason: BlockAccountNotActive})
 	}
 	ents, err := s.store.ListEntitlements(ctx, account.ID)
@@ -234,7 +237,7 @@ func ExhaustedWindowBlock(w quota.WindowView) (Block, bool) {
 		Reason: BlockQuotaExhausted,
 		Window: &WindowBlockView{
 			Kind: w.Kind, Limit: *w.Limit, Used: w.Used, Reserved: w.Reserved,
-			ResetsAt: w.ResetsAt,
+			Remaining: *r, ResetsAt: w.ResetsAt,
 		},
 	}, true
 }

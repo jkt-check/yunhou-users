@@ -343,10 +343,18 @@ func TestUserViews_UsageValidation(t *testing.T) {
 		"/user/model-usage/summary?from=2026-06-01T00:00:00Z&to=2026-09-09T00:00:00Z", // > 92 天
 		"/user/model-usage/requests?from=not-a-time",
 	}
+	// I1：伪造游标（合法 base64+JSON、id 非 UUID）必须 400 invalid_input，
+	// 不得漏到 SQL 的 ::uuid 转换（500）。
+	forged := management.EncodeRequestCursor(management.RequestCursor{
+		CreatedAt: time.Now().UTC(), ID: "not-a-uuid"})
+	bad = append(bad, "/user/model-usage/requests?cursor="+forged)
 	for _, path := range bad {
 		w := f.get(t, path, tokA)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s: got %d, want 400 (%s)", path, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "invalid_input") {
+			t.Errorf("%s: body missing invalid_input (%s)", path, w.Body.String())
 		}
 	}
 	// 默认范围（30 天）生效。

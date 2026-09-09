@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func TestResolveUsageRange(t *testing.T) {
 }
 
 func TestRequestCursorCodec(t *testing.T) {
-	c := RequestCursor{CreatedAt: uvNow, ID: "req-123"}
+	c := RequestCursor{CreatedAt: uvNow, ID: "bca6e2b4-73ec-4bca-8be3-019b002bca8e"}
 	dec, err := DecodeRequestCursor(EncodeRequestCursor(c))
 	if err != nil {
 		t.Fatal(err)
@@ -85,6 +86,19 @@ func TestRequestCursorCodec(t *testing.T) {
 		if _, err := DecodeRequestCursor(bad); err == nil {
 			t.Errorf("malformed cursor %q must fail", bad)
 		}
+	}
+	// I1：合法 base64 + 合法 JSON 但 id 非 UUID —— 必须在边界 400，而不是
+	// 漏到 SQL 的 ::uuid 转换报 500。
+	forged := EncodeRequestCursor(RequestCursor{CreatedAt: uvNow, ID: "not-a-uuid"})
+	if _, err := DecodeRequestCursor(forged); err == nil {
+		t.Error("forged cursor (non-UUID id) must fail")
+	} else if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("forged cursor code = %s, want invalid_input", domain.CodeOf(err))
+	}
+	// id 为空/时间缺失同样拒绝（含伪造 JSON 直构）。
+	raw := base64.RawURLEncoding.EncodeToString([]byte(`{"t":"2026-09-09T04:00:00Z","id":""}`))
+	if _, err := DecodeRequestCursor(raw); err == nil {
+		t.Error("empty id must fail")
 	}
 }
 
@@ -130,11 +144,13 @@ func TestUsageView_ListRequests(t *testing.T) {
 		return RequestRow{ID: id, ModelID: "glm-4.6", Status: domain.ReqSettled,
 			UsageStatus: domain.UsageReported, CreatedAt: at}
 	}
+	// 游标 id 必须是 UUID（I1 边界校验）——测试夹具使用 UUID 形状。
+	uid := func(n string) string { return "00000000-0000-0000-0000-00000000000" + n }
 
 	t.Run("hasMore trimming and next_cursor", func(t *testing.T) {
 		// store 返回 limit+1 行；服务截断到 limit 并用最后一行生成游标。
 		rows := make([]RequestRow, 0, 4)
-		for i, id := range []string{"r1", "r2", "r3", "r4"} {
+		for i, id := range []string{uid("1"), uid("2"), uid("3"), uid("4")} {
 			rows = append(rows, mkRow(id, uvNow.Add(-time.Duration(i)*time.Minute)))
 		}
 		store := &fakeUsageStore{rows: rows}
@@ -150,8 +166,8 @@ func TestUsageView_ListRequests(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cur.ID != "r3" {
-			t.Errorf("cursor id = %q, want r3 (last row of the page)", cur.ID)
+		if cur.ID != uid("3") {
+			t.Errorf("cursor id = %q, want %s (last row of the page)", cur.ID, uid("3"))
 		}
 		// limit+1 传给存储层（hasMore 探测）。
 		if store.gotListF == nil || store.gotListF.Limit != 3 {
@@ -160,7 +176,7 @@ func TestUsageView_ListRequests(t *testing.T) {
 	})
 
 	t.Run("exact page → no next cursor", func(t *testing.T) {
-		store := &fakeUsageStore{rows: []RequestRow{mkRow("r1", uvNow)}}
+		store := &fakeUsageStore{rows: []RequestRow{mkRow(uid("1"), uvNow)}}
 		svc := NewUsageViewService(store, domain.FixedClock{T: uvNow})
 		page, err := svc.ListRequests(context.Background(), "u", RequestListFilter{Limit: 1})
 		if err != nil {
@@ -193,16 +209,23 @@ func TestUsageView_ListRequests(t *testing.T) {
 	})
 
 	t.Run("cursor is opaque base64url (no offset math leaks)", func(t *testing.T) {
-		tok := EncodeRequestCursor(RequestCursor{CreatedAt: uvNow, ID: "r9"})
-		if strings.Contains(tok, "r9") || strings.ContainsAny(tok, "+/=") {
+		id := uid("9")
+		tok := EncodeRequestCursor(RequestCursor{CreatedAt: uvNow, ID: id})
+		if strings.Contains(tok, id) || strings.ContainsAny(tok, "+/=") {
 			t.Errorf("cursor must be opaque base64url: %q", tok)
 		}
 	})
 }
 
 func TestUsageGroup_NetMicros(t *testing.T) {
-	g := UsageGroup{ChargeMicros: 1000, ReversedMicros: 250}
-	if g.NetMicros() != 750 {
+	// 账本派生：net = charge − reversed + adjusted（debit + / credit −）。
+	g := UsageGroup{ChargeMicros: 1000, ReversedMicros: 250, AdjustedMicros: -100}
+	if g.NetMicros() != 650 {
 		t.Errorf("net = %d", g.NetMicros())
+	}
+	// 作废（void）形态：全额 reversal 后 net=0，绝不为负。
+	v := UsageGroup{ChargeMicros: 60_000, ReversedMicros: 60_000}
+	if v.NetMicros() != 0 {
+		t.Errorf("void net = %d, want 0", v.NetMicros())
 	}
 }

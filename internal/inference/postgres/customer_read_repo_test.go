@@ -30,6 +30,19 @@ func settleOne(t *testing.T, s *Store, f fixture, wins [3]string, keyID *string,
 	cmd := reserveCmd(f, w5, ww, wm, charge+10_000) // hold > charge（预占上界）
 	cmd.Request.APIKeyID = keyID
 	cmd.Request.ModelID = modelID
+	// 请求行与 Key 预算 hold 必须指向同一把 Key（生产网关的一致不变量；
+	// 审查修复轮1 发现本 helper 曾让二者分叉，CorrectSettlement 按请求行
+	// 的 api_key_id 校正预算时触发负数守卫）。
+	for i := range cmd.Holds {
+		if cmd.Holds[i].TargetKind == domain.TargetKeyBudget {
+			if keyID == nil {
+				cmd.Holds = append(cmd.Holds[:i], cmd.Holds[i+1:]...) // facade 调用无预算 hold
+			} else {
+				cmd.Holds[i].APIKeyID = keyID
+			}
+			break
+		}
+	}
 	adm, err := s.Reserve(ctx, uow, cmd)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
@@ -143,11 +156,50 @@ func groupByKey(groups []management.UsageGroup, key string) *management.UsageGro
 
 // seedUsageGraph builds the shared request graph used by the summary/series
 // tests: 2 settled (reported + estimated) on glm-4.6, 1 released, 1
-// in-flight, 1 parked (unknown, no key), 1 settled on deepseek-v4, one
-// reversal against the first request, one out-of-range settled request.
+// in-flight, 1 parked (unknown, no key), 1 settled on deepseek-v4, one REAL
+// CorrectSettlement partial correction on the first request (credit
+// adjustment 10_000 via the write path — 审查修复轮1：手工插 reversal 是
+// 写模型不可能产生的种子，真实作废/补差只能由 CorrectSettlement 产生）,
+// one out-of-range settled request.
 type usageGraph struct {
 	req1, req2, req3, req4, req5, req6, reqOut string
 	key2ID                                     string
+}
+
+// correctSettlement drives the REAL Task 9 correction write path in one
+// UnitOfWork（作废 = CorrectedMicros 0 → 全额 reversal + settled 归零；
+// 部分修正 → debit/credit 补差分录）.
+func correctSettlement(t *testing.T, s *Store, requestID string, corrected domain.Microcredit, idemKey string) {
+	t.Helper()
+	ctx := context.Background()
+	var attemptID string
+	if err := s.db.GetContext(ctx, &attemptID,
+		`SELECT id FROM inference_attempts WHERE request_id = $1 ORDER BY attempt_no LIMIT 1`, requestID); err != nil {
+		t.Fatalf("attempt for %s: %v", requestID, err)
+	}
+	in, out := int64(800), int64(250)
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.CorrectSettlement(ctx, uow, CorrectionCommand{
+		RequestID: requestID,
+		Corrected: domain.UsageRecord{
+			AttemptID: attemptID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		CorrectedMicros: corrected,
+		Reason:          "real evidence arrived (test)",
+		OperatorSubject: "system:test",
+		IdempotencyKey:  idemKey,
+		At:              time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("correct settlement: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seedUsageGraph(t *testing.T, s *Store, f fixture) usageGraph {
@@ -173,19 +225,6 @@ func seedUsageGraph(t *testing.T, s *Store, f fixture) usageGraph {
 	in1, out1 := int64(800), int64(200)
 	g.req1 = settleOne(t, s, f, wins, &f.keyID, f.modelID, 60_000, domain.UsageReported,
 		domain.UsageBuckets{InputTokens: &in1, OutputTokens: &out1})
-	// 修正 revision 2：输出改为 250（历史保留，展示取最新）。
-	att1 := ""
-	if err := s.db.GetContext(ctx, &att1,
-		`SELECT id FROM inference_attempts WHERE request_id = $1`, g.req1); err != nil {
-		t.Fatal(err)
-	}
-	out1b := int64(250)
-	if err := s.InsertUsageRecord(ctx, &domain.UsageRecord{
-		RequestID: g.req1, AttemptID: att1, Source: domain.UsageReported, Revision: 2,
-		Buckets: domain.UsageBuckets{InputTokens: &in1, OutputTokens: &out1b},
-	}); err != nil {
-		t.Fatalf("usage correction: %v", err)
-	}
 
 	in2, out2 := int64(100), int64(50)
 	g.req2 = settleOne(t, s, f, wins, &g.key2ID, f.modelID, 20_000, domain.UsageEstimated,
@@ -195,19 +234,10 @@ func seedUsageGraph(t *testing.T, s *Store, f fixture) usageGraph {
 	g.req5 = reserveOnly(t, s, f, wins)
 	g.req6 = settleOne(t, s, f, wins, &f.keyID, "deepseek-v4", 5_000, domain.UsageReported, domain.UsageBuckets{})
 
-	// 账本冲正：req1 的 10_000 被退回（追加 reversal，不重写 charge）。
-	var chargeID int64
-	if err := s.db.GetContext(ctx, &chargeID,
-		`SELECT id FROM inference_ledger_entries WHERE request_id = $1 AND entry_type = 'charge'`, g.req1); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO inference_ledger_entries
-		 (billing_account_id, request_id, entry_type, amount_micros, unit, reverses_entry_id)
-		 VALUES ($1, $2, 'reversal', 10000, 'microcredit', $3)`,
-		f.accountID, g.req1, chargeID); err != nil {
-		t.Fatalf("reversal: %v", err)
-	}
+	// 真实修正路径（部分补差）：req1 60000 → 50000，账本追加 credit
+	// adjustment 10_000，settled_micros 同步为 50000；usage revision 2
+	// （输出 250）随修正落库，展示取最新。
+	correctSettlement(t, s, g.req1, 50_000, "correct-"+g.req1)
 
 	// 范围外请求（10 天前）——任何查询都不得计入。
 	g.reqOut = settleOne(t, s, f, wins, &f.keyID, f.modelID, 40_000, domain.UsageReported, domain.UsageBuckets{})
@@ -245,8 +275,13 @@ func TestCustomerRead_SummarizeByModel(t *testing.T) {
 		t.Errorf("integrity = reported %d estimated %d unknown %d pending %d, want 1/1/1/2",
 			g.Reported, g.Estimated, g.Unknown, g.Pending)
 	}
-	if g.ChargeMicros != 80_000 || g.ReversedMicros != 10_000 || g.NetMicros() != 70_000 {
-		t.Errorf("amounts = charge %d reversed %d", g.ChargeMicros, g.ReversedMicros)
+	// 账本派生：charge=80_000（req1 原始 charge 60_000 + req2 20_000，不可
+	// 变分录），真实修正产生 credit adjustment −10_000（非 reversal），
+	// net = 80_000 − 0 − 10_000 = 70_000。
+	if g.ChargeMicros != 80_000 || g.ReversedMicros != 0 || g.AdjustedMicros != -10_000 ||
+		g.NetMicros() != 70_000 {
+		t.Errorf("amounts = charge %d reversed %d adjusted %d",
+			g.ChargeMicros, g.ReversedMicros, g.AdjustedMicros)
 	}
 	// token：req1 最新 revision（output 250）+ req2（100/50）；未报告桶保持
 	// NULL（未知 ≠ 0）。
@@ -289,6 +324,9 @@ func TestCustomerRead_SummarizeByKey(t *testing.T) {
 	if k1 == nil || k1.RequestsTotal != 4 || k1.ChargeMicros != 65_000 {
 		t.Errorf("key1 group = %+v (req1+req4+req5+req6)", k1)
 	}
+	if k1 == nil || k1.AdjustedMicros != -10_000 || k1.NetMicros() != 55_000 {
+		t.Errorf("key1 amounts = %+v (charge 65k − credit adj 10k)", k1)
+	}
 	if k1 == nil || k1.KeyName != "cli" || k1.KeyPrefix == "" {
 		t.Errorf("key1 display = %+v", k1)
 	}
@@ -330,14 +368,18 @@ func TestCustomerRead_SummarizeSeriesUTCDays(t *testing.T) {
 	if !series[0].BucketStart.Before(series[1].BucketStart) {
 		t.Errorf("series order = %v then %v", series[0].BucketStart, series[1].BucketStart)
 	}
-	// 当日桶：req1..req5（req6 已拨走）。
+	// 当日桶：req1..req5（req6 已拨走）；金额列为账本派生口径
+	// （charge 毛额 80_000 + 修正 credit −10_000 → net 70_000）。
 	today := series[1]
 	if today.RequestsTotal != 5 || today.ChargeMicros != 80_000 ||
 		today.Reported != 1 || today.Estimated != 1 || today.Unknown != 1 {
 		t.Errorf("today bucket = %+v", today)
 	}
+	if today.ReversedMicros != 0 || today.AdjustedMicros != -10_000 || today.NetMicros() != 70_000 {
+		t.Errorf("today bucket amounts = %+v", today)
+	}
 	old := series[0]
-	if old.RequestsTotal != 1 || old.ChargeMicros != 5_000 {
+	if old.RequestsTotal != 1 || old.ChargeMicros != 5_000 || old.NetMicros() != 5_000 {
 		t.Errorf("old bucket = %+v", old)
 	}
 
@@ -435,11 +477,14 @@ func TestCustomerRead_ListRequestsKeyset(t *testing.T) {
 	if !r1.HasUsage || r1.Tokens.OutputTokens == nil || *r1.Tokens.OutputTokens != 250 {
 		t.Errorf("req1 tokens = %+v (latest revision wins)", r1.Tokens)
 	}
-	if r1.ReversedMicros != 10_000 || r1.NetMicrosPtr() == nil || *r1.NetMicrosPtr() != 50_000 {
-		t.Errorf("req1 net = %v reversed %d", r1.NetMicrosPtr(), r1.ReversedMicros)
+	// 账本派生：原始 charge 60_000（不可变），credit 补差 −10_000，net=
+	// 50_000；settled_micros 同步为 50_000 不影响读口径。
+	if r1.ReversedMicros != 0 || r1.AdjustedMicros != -10_000 ||
+		r1.NetMicrosPtr() == nil || *r1.NetMicrosPtr() != 50_000 {
+		t.Errorf("req1 net = %v reversed %d adjusted %d", r1.NetMicrosPtr(), r1.ReversedMicros, r1.AdjustedMicros)
 	}
-	if r1.SettledMicros == nil || *r1.SettledMicros != 60_000 {
-		t.Errorf("req1 charge = %v", r1.SettledMicros)
+	if r1.ChargeMicros == nil || *r1.ChargeMicros != 60_000 {
+		t.Errorf("req1 charge = %v (原始 charge 分录)", r1.ChargeMicros)
 	}
 	if r3.HasUsage {
 		t.Errorf("parked request must have no usage record: %+v", r3.Tokens)
@@ -463,6 +508,137 @@ func TestCustomerRead_ListRequestsKeyset(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != g.req2 {
 		t.Errorf("key filter rows = %+v", rows)
+	}
+}
+
+func TestCustomerRead_LedgerDerivedNetAfterVoid(t *testing.T) {
+	_, s := testDB(t)
+	f := seedFixture(t, s, true)
+	g := seedUsageGraph(t, s, f)
+	ctx := context.Background()
+	from, to := usageRange()
+
+	// C1 回归：走真实 CorrectSettlement 作废路径（CorrectedMicros=0 → 全额
+	// reversal 追加 + settled_micros 归零）。旧的 settled−reversal 口径会
+	// 报 net=−20_000（双重扣减）；账本派生口径必须报 net=0。作废 req2
+	// （charge 20_000，estimated）。
+	correctSettlement(t, s, g.req2, 0, "void-"+g.req2)
+
+	// 行级：charge 20_000（原始分录不可变）、reversed 20_000、net 0。
+	rows, err := s.ListRequestRows(ctx, f.accountID, management.RequestListFilter{
+		From: from, To: to, Limit: 10, APIKeyID: g.key2ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != g.req2 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	r := rows[0]
+	if r.ChargeMicros == nil || *r.ChargeMicros != 20_000 {
+		t.Errorf("voided charge = %v, want 20000（原始分录保留）", r.ChargeMicros)
+	}
+	if r.ReversedMicros != 20_000 {
+		t.Errorf("voided reversed = %d, want 20000", r.ReversedMicros)
+	}
+	if net := r.NetMicrosPtr(); net == nil || *net != 0 {
+		t.Errorf("voided net = %v, want 0（不得为负）", net)
+	}
+
+	// 组级：glm-4.6 组 charge 80_000（req1 60k + req2 原始 20k，分录不可
+	// 变），reversed 20_000（作废），adjusted −10_000（req1 补差），
+	// net = 80_000 − 20_000 − 10_000 = 50_000。
+	groups, err := s.SummarizeUsageGroups(ctx, f.accountID,
+		management.UsageSummaryFilter{From: from, To: to, GroupBy: management.GroupByModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grp := groupByKey(groups, f.modelID)
+	if grp == nil {
+		t.Fatalf("group missing: %+v", groups)
+	}
+	if grp.ChargeMicros != 80_000 || grp.ReversedMicros != 20_000 ||
+		grp.AdjustedMicros != -10_000 || grp.NetMicros() != 50_000 {
+		t.Errorf("group after void = charge %d reversed %d adjusted %d net %d, want 80000/20000/-10000/50000",
+			grp.ChargeMicros, grp.ReversedMicros, grp.AdjustedMicros, grp.NetMicros())
+	}
+	// 作废请求的计量修正也落了 usage revision（estimated → reported），
+	// usage_status 同步翻转。
+	if grp.Reported != 2 || grp.Estimated != 0 || grp.Unknown != 1 {
+		t.Errorf("integrity after void: reported=%d estimated=%d unknown=%d, want 2/0/1",
+			grp.Reported, grp.Estimated, grp.Unknown)
+	}
+}
+
+func TestCustomerRead_OperatorAdjustmentCountsIntoNet(t *testing.T) {
+	_, s := testDB(t)
+	f := seedFixture(t, s, true)
+	g := seedUsageGraph(t, s, f)
+	ctx := context.Background()
+	from, to := usageRange()
+
+	// I2：请求级运营补偿只写 adjustments+ledger（不动 settled_micros）——
+	// 账本派生口径下对客户视图自然可见。req6（deepseek-v4，charge 5_000）
+	// 获 credit 补偿 2_000（退还）。
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendAdjustment(ctx, uow, Adjustment{
+		BillingAccountID: f.accountID, RequestID: &g.req6,
+		Reason: "goodwill credit (test)", AmountMicros: 2_000, Direction: "credit",
+		OperatorSubject: "op:test", IdempotencyKey: "adj-" + g.req6,
+	}); err != nil {
+		t.Fatalf("append adjustment: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 重复投递同一幂等键只生效一次。
+	uow2, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendAdjustment(ctx, uow2, Adjustment{
+		BillingAccountID: f.accountID, RequestID: &g.req6,
+		Reason: "goodwill credit (test)", AmountMicros: 2_000, Direction: "credit",
+		OperatorSubject: "op:test", IdempotencyKey: "adj-" + g.req6,
+	}); err == nil {
+		_ = uow2.Commit(ctx)
+		t.Fatal("duplicate idempotency key must conflict")
+	}
+	_ = uow2.Rollback(ctx)
+
+	// 行级：adjusted −2_000，net 3_000；settled_micros 未被动过（5_000 不变）。
+	rows, err := s.ListRequestRows(ctx, f.accountID, management.RequestListFilter{
+		From: from, To: to, Limit: 10, ModelID: "deepseek-v4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].AdjustedMicros != -2_000 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if net := rows[0].NetMicrosPtr(); net == nil || *net != 3_000 {
+		t.Errorf("adjusted net = %v, want 3000", net)
+	}
+	if rows[0].ChargeMicros == nil || *rows[0].ChargeMicros != 5_000 {
+		t.Errorf("charge = %v, want 5000（补偿不改原始分录）", rows[0].ChargeMicros)
+	}
+
+	// 组级：deepseek-v4 组 net 3_000；glm-4.6 组不受邻组补偿影响。
+	groups, err := s.SummarizeUsageGroups(ctx, f.accountID,
+		management.UsageSummaryFilter{From: from, To: to, GroupBy: management.GroupByModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g6 := groupByKey(groups, "deepseek-v4")
+	if g6 == nil || g6.AdjustedMicros != -2_000 || g6.NetMicros() != 3_000 {
+		t.Errorf("deepseek group = %+v", g6)
+	}
+	g1 := groupByKey(groups, f.modelID)
+	if g1 == nil || g1.NetMicros() != 70_000 {
+		t.Errorf("glm group net = %v, want 70000（补偿不跨组）", g1)
 	}
 }
 

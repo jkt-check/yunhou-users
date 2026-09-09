@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
@@ -82,28 +84,45 @@ type UsageGroup struct {
 	Unknown   int64
 	Pending   int64
 
-	// ChargeMicros sums settled_micros of settled requests; ReversedMicros
-	// sums ledger reversal entries attributed to the in-range requests
-	// （账本追加+冲正，不重写已结算事实 —— 净额 = charge - reversed）。
+	// 金额口径派生自不可变账本（与 reconciliation 重建不变量逐字一致：
+	// 窗口 used ≡ Σ charge − Σ reversal ± Σ 请求级 adjustment（debit + /
+	// credit −），Task 9 accounting/reconciliation.go）：
+	//   - ChargeMicros  = Σ entry_type='charge'（原始 charge 分录，修正不
+	//     重写它 —— CorrectSettlement 作废时 settled_micros 归零但 charge
+	//     分录保留，因此 charge 绝不能读 settled_micros，否则 void 后
+	//     net = 0 − reversal 出现负净额）；
+	//   - ReversedMicros = Σ entry_type='reversal'；
+	//   - AdjustedMicros = 请求级 adjustment 签名合计（debit + / credit −，
+	//     含 CorrectSettlement 补差与运营补偿 —— 后者只写账本不动
+	//     settled_micros，账本派生口径下对客户自然可见）。
 	ChargeMicros   int64
 	ReversedMicros int64
+	AdjustedMicros int64
 
 	Tokens domain.UsageBuckets
 }
 
-// NetMicros is charge minus reversals.
-func (g UsageGroup) NetMicros() int64 { return g.ChargeMicros - g.ReversedMicros }
+// NetMicros is charge − reversed + adjusted (debit + / credit −).
+func (g UsageGroup) NetMicros() int64 { return g.ChargeMicros - g.ReversedMicros + g.AdjustedMicros }
 
 // UsageSeriesBucket is one UTC calendar day of the time series
 // (设计 §9.2: 时间序列). Bucket boundaries are UTC regardless of the DB
-// session timezone.
+// session timezone. Amount columns share the ledger-derived semantics of
+// UsageGroup (charge 毛额 + reversal + adjustment；净额 = NetMicros).
 type UsageSeriesBucket struct {
-	BucketStart   time.Time
-	RequestsTotal int64
-	ChargeMicros  int64
-	Reported      int64
-	Estimated     int64
-	Unknown       int64
+	BucketStart    time.Time
+	RequestsTotal  int64
+	ChargeMicros   int64
+	ReversedMicros int64
+	AdjustedMicros int64
+	Reported       int64
+	Estimated      int64
+	Unknown        int64
+}
+
+// NetMicros is charge − reversed + adjusted.
+func (b UsageSeriesBucket) NetMicros() int64 {
+	return b.ChargeMicros - b.ReversedMicros + b.AdjustedMicros
 }
 
 // UsageSummary is the assembled summary read model.
@@ -138,7 +157,9 @@ func EncodeRequestCursor(c RequestCursor) string {
 }
 
 // DecodeRequestCursor parses an opaque token; malformed input is a client
-// error (invalid_input), never silently ignored.
+// error (invalid_input), never silently ignored. The id must be a UUID —
+// a well-formed envelope carrying a non-UUID id would otherwise fail the
+// `$n::uuid` cast deep in SQL (500); reject it at the boundary (400).
 func DecodeRequestCursor(s string) (RequestCursor, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
@@ -147,6 +168,9 @@ func DecodeRequestCursor(s string) (RequestCursor, error) {
 	var c RequestCursor
 	if err := json.Unmarshal(raw, &c); err != nil || c.ID == "" || c.CreatedAt.IsZero() {
 		return RequestCursor{}, domain.NewError(domain.CodeInvalidInput, "usage: malformed cursor")
+	}
+	if _, err := uuid.Parse(c.ID); err != nil {
+		return RequestCursor{}, domain.NewError(domain.CodeInvalidInput, "usage: malformed cursor (id must be a UUID)")
 	}
 	return c, nil
 }
@@ -161,10 +185,11 @@ type RequestListFilter struct {
 }
 
 // RequestRow is one logical request in the customer detail list.
-// SettledMicros is nil until the request settles （预占中 = reserved held,
-// charge not yet known); ReversedMicros carries post-settlement
-// corrections. Tokens sums the latest usage revision per attempt; a nil
-// bucket means not reported.
+// ChargeMicros derives from the IMMUTABLE ledger charge entry (nil while
+// no charge exists — 预占中/已释放/待核对）; ReversedMicros and the signed
+// AdjustedMicros carry post-settlement corrections (void 冲正 /
+// CorrectSettlement 补差 / 运营补偿). Tokens sums the latest usage revision
+// per attempt; a nil bucket means not reported.
 type RequestRow struct {
 	ID         string
 	ModelID    string
@@ -176,8 +201,9 @@ type RequestRow struct {
 	Status     domain.RequestStatus
 	UsageStatus domain.UsageSource
 	ReservedMicros *domain.Microcredit
-	SettledMicros  *domain.Microcredit
+	ChargeMicros   *int64 // 账本 charge 分录；nil = 尚无 charge 行
 	ReversedMicros int64
+	AdjustedMicros int64 // 签名合计：debit + / credit −
 	// HasUsage distinguishes "no usage record yet" from "record exists but
 	// unknown" (both render null buckets; usage_status carries the state).
 	HasUsage bool
@@ -188,12 +214,13 @@ type RequestRow struct {
 	CompletedAt *time.Time
 }
 
-// NetMicrosPtr is settled minus reversals; nil while unsettled.
+// NetMicrosPtr is charge − reversed + adjusted; nil while the request has
+// no charge entry (未结算).
 func (r RequestRow) NetMicrosPtr() *int64 {
-	if r.SettledMicros == nil {
+	if r.ChargeMicros == nil {
 		return nil
 	}
-	n := int64(*r.SettledMicros) - r.ReversedMicros
+	n := *r.ChargeMicros - r.ReversedMicros + r.AdjustedMicros
 	return &n
 }
 

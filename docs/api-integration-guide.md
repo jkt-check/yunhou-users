@@ -535,11 +535,13 @@ Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-
 
 #### `GET /user/model-usage/summary` — 用量分组聚合 + 日序列
 
-参数：`from`/`to`（RFC3339，缺省最近 30 天，跨度最大 92 天）、`group_by=model|key`（默认 model）、`model_id`/`api_key_id`（可选收窄）。返回分组聚合（请求计数、计量完整性计数、`charge_micros`/`reversed_micros`/`net_micros`、token 桶合计）+ UTC 自然日序列 `series`。`group_by=key` 时 `api_key_id=null` 的组是无 Key 的 JWT/facade 调用。
+参数：`from`/`to`（RFC3339，缺省最近 30 天，跨度最大 92 天）、`group_by=model|key`（默认 model）、`model_id`/`api_key_id`（可选收窄）。返回分组聚合（请求计数、计量完整性计数、金额、token 桶合计）+ UTC 自然日序列 `series`。`group_by=key` 时 `api_key_id=null` 的组是无 Key 的 JWT/facade 调用。
+
+**金额口径（账本派生）**：`charge_micros` = Σ 原始 charge 分录（不可变；修正/作废不重写它）、`reversed_micros` = Σ 冲正（作废 = 全额冲正）、`adjusted_micros` = Σ 请求级调整签名合计（debit 正 / credit 负，修正补差与运营补偿均计入）、`net_micros` = charge − reversed + adjusted（作废后净额为 0，不为负）。`series` 桶与分组同一口径。
 
 #### `GET /user/model-usage/requests` — 请求明细分页
 
-参数：`from`/`to` 同上，`model_id`/`api_key_id` 过滤，`limit`（1–100，默认 50），`cursor`（上一页 `next_cursor`，不透明 keyset 游标，持续写入下不跳行；最后一页为 null）。每行：`request_id`、`model_id`、`api_key_id`/`key_name`/`key_prefix`、`status`、`usage_status`、`reserved_micros`/`charge_micros`/`reversed_micros`/`net_micros`、`tokens`、`created_at`/`admitted_at`/`completed_at`。
+参数：`from`/`to` 同上，`model_id`/`api_key_id` 过滤，`limit`（1–100，默认 50），`cursor`（上一页 `next_cursor`，不透明 keyset 游标，持续写入下不跳行；最后一页为 null）。每行：`request_id`、`model_id`、`api_key_id`/`key_name`/`key_prefix`、`status`、`usage_status`、`reserved_micros`/`charge_micros`/`reversed_micros`/`adjusted_micros`/`net_micros`（同一账本派生口径）、`tokens`、`created_at`/`admitted_at`/`completed_at`。
 
 #### `GET /user/model-subscriptions` — Coding Plan 套餐与权益
 

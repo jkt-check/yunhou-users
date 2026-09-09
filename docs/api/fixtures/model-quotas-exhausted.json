@@ -1,7 +1,7 @@
 {
   "code": 0,
   "data": {
-    "as_of": "2026-09-09T01:21:41Z",
+    "as_of": "2026-09-09T02:18:17Z",
     "blocked_by": [
       {
         "expired_at": null,
@@ -10,7 +10,7 @@
         "reason": "quota_exhausted",
         "remaining": "0",
         "reserved": "0",
-        "resets_at": "2026-09-09T05:21:41Z",
+        "resets_at": "2026-09-09T06:18:17Z",
         "used": "100"
       },
       {
@@ -20,25 +20,25 @@
         "reason": "quota_exhausted",
         "remaining": "0",
         "reserved": "0",
-        "resets_at": "2026-09-14T01:21:41Z",
+        "resets_at": "2026-09-14T02:18:17Z",
         "used": "500"
       }
     ],
     "entitlement": {
-      "anchor_at": "2026-09-07T01:21:41Z",
-      "effective_from": "2026-09-07T01:21:41Z",
+      "anchor_at": "2026-09-07T02:18:17Z",
+      "effective_from": "2026-09-07T02:18:17Z",
       "effective_to": null,
-      "id": "f8cc9e14-7843-44f4-9019-b36d2f357bd8",
+      "id": "02c5a830-079f-47e1-8a96-757637e326b6",
       "model_ids": [
         "glm-4.6"
       ],
-      "policy_version_id": "5bc077bc-c17d-42f7-bb44-c2c8b9d5d7f8",
+      "policy_version_id": "cd79507a-a1dd-4155-9237-af9b5f131402",
       "revision": 1,
       "source_type": "subscription",
       "status": "active"
     },
-    "entitlement_id": "f8cc9e14-7843-44f4-9019-b36d2f357bd8",
-    "server_time": "2026-09-09T01:21:41Z",
+    "entitlement_id": "02c5a830-079f-47e1-8a96-757637e326b6",
+    "server_time": "2026-09-09T02:18:17Z",
     "unit": "microcredit",
     "windows": [
       {
@@ -48,9 +48,9 @@
         "mode": "anchored_duration",
         "remaining": "0",
         "reserved": "0",
-        "resets_at": "2026-09-09T05:21:41Z",
+        "resets_at": "2026-09-09T06:18:17Z",
         "used": "100",
-        "window_start": "2026-09-09T00:21:41Z"
+        "window_start": "2026-09-09T01:18:17Z"
       },
       {
         "disabled": false,
@@ -59,9 +59,9 @@
         "mode": "anchored_period_7d",
         "remaining": "0",
         "reserved": "0",
-        "resets_at": "2026-09-14T01:21:41Z",
+        "resets_at": "2026-09-14T02:18:17Z",
         "used": "500",
-        "window_start": "2026-09-07T01:21:41Z"
+        "window_start": "2026-09-07T02:18:17Z"
       },
       {
         "disabled": false,
@@ -70,9 +70,9 @@
         "mode": "anchored_calendar_month",
         "remaining": "8990",
         "reserved": "0",
-        "resets_at": "2026-10-07T01:21:41Z",
+        "resets_at": "2026-10-07T02:18:17Z",
         "used": "10",
-        "window_start": "2026-09-07T01:21:41Z"
+        "window_start": "2026-09-07T02:18:17Z"
       }
     ]
   }

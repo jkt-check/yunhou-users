@@ -95,9 +95,12 @@ func usageScopeClause(f management.UsageSummaryFilter, args []interface{}) (stri
 }
 
 // SummarizeUsageGroups implements management.UsageViewStore: per-group
-// request counts, usage-integrity counts, charge sums (settled rows),
-// reversal sums (ledger 冲正) and token sums (latest usage revision per
-// attempt). NULL token sums stay NULL — unknown never collapses to zero.
+// request counts, usage-integrity counts, and ledger-derived amounts —
+// charge = Σ 原始 charge 分录（不可变；绝不读 settled_micros，否则
+// CorrectSettlement 作废后 net 双重扣减出现负净额）、reversed = Σ
+// reversal、adjusted = Σ 请求级 adjustment（debit + / credit −，运营补偿
+// 与修正补差都计入）。token 桶为最新 usage revision 求和；NULL 桶保持
+// NULL（未知 ≠ 0）。
 func (s *Store) SummarizeUsageGroups(ctx context.Context, accountID string, f management.UsageSummaryFilter) ([]management.UsageGroup, error) {
 	gcol, err := usageGroupColumn(f.GroupBy)
 	if err != nil {
@@ -105,7 +108,7 @@ func (s *Store) SummarizeUsageGroups(ctx context.Context, accountID string, f ma
 	}
 	scope, args := usageScopeClause(f, []interface{}{accountID, f.From, f.To})
 
-	// 1) 请求计数 + 计量完整性 + charge 合计。
+	// 1) 请求计数 + 计量完整性。
 	keyCols := ""
 	if f.GroupBy == management.GroupByKey {
 		keyCols = ", k.name, k.key_prefix"
@@ -121,13 +124,12 @@ func (s *Store) SummarizeUsageGroups(ctx context.Context, accountID string, f ma
 		        COUNT(*) FILTER (WHERE r.usage_status = 'reported') AS reported,
 		        COUNT(*) FILTER (WHERE r.usage_status = 'estimated') AS estimated,
 		        COUNT(*) FILTER (WHERE r.usage_status = 'unknown') AS unknown,
-		        COUNT(*) FILTER (WHERE r.usage_status = 'pending') AS pending,
-		        COALESCE(SUM(r.settled_micros) FILTER (WHERE r.status = 'settled'), 0) AS charge_micros
+		        COUNT(*) FILTER (WHERE r.usage_status = 'pending') AS pending
 		   FROM inference_requests r
 		   LEFT JOIN inference_api_keys k ON k.id = r.api_key_id
 		  WHERE r.billing_account_id = $1 AND r.created_at >= $2 AND r.created_at < $3%s
 		  GROUP BY r.%s%s
-		  ORDER BY charge_micros DESC, gkey`, gcol, keyCols, scope, gcol, keyCols)
+		  ORDER BY requests_total DESC, gkey`, gcol, keyCols, scope, gcol, keyCols)
 	type groupKey = string
 	groups := make(map[groupKey]*management.UsageGroup)
 	order := []groupKey{}
@@ -145,7 +147,6 @@ func (s *Store) SummarizeUsageGroups(ctx context.Context, accountID string, f ma
 		Estimated    int64          `db:"estimated"`
 		Unknown      int64          `db:"unknown"`
 		Pending      int64          `db:"pending"`
-		Charge       int64          `db:"charge_micros"`
 	}
 	if err := s.db.SelectContext(ctx, &countRows, countsSQL, args...); err != nil {
 		return nil, mapError("usage groups: counts", err)
@@ -155,7 +156,6 @@ func (s *Store) SummarizeUsageGroups(ctx context.Context, accountID string, f ma
 			RequestsTotal: r.Total, SettledRequests: r.Settled, ReleasedRequests: r.Released,
 			InFlightRequests: r.InFlight, FailedRequests: r.Failed, ReconciliationPending: r.ReconPending,
 			Reported: r.Reported, Estimated: r.Estimated, Unknown: r.Unknown, Pending: r.Pending,
-			ChargeMicros: r.Charge,
 			KeyName:    stringFromNull(r.KeyName), KeyPrefix: stringFromNull(r.KeyPrefix),
 		}
 		if f.GroupBy == management.GroupByModel {
@@ -169,24 +169,34 @@ func (s *Store) SummarizeUsageGroups(ctx context.Context, accountID string, f ma
 		order = append(order, r.Gkey.String)
 	}
 
-	// 2) 账本冲正合计（按请求归属分组；账户级调整无 request_id，不进分组）。
-	revSQL := fmt.Sprintf(
-		`SELECT r.%s AS gkey, COALESCE(SUM(l.amount_micros), 0) AS reversed_micros
+	// 2) 账本派生金额（按请求归属分组；账户级调整无 request_id，不进分组）。
+	//    与 reconciliation 重建不变量逐字一致：charge（不可变原始分录）−
+	//    reversal ± adjustment（debit + / credit −）；只计 microcredit。
+	ledSQL := fmt.Sprintf(
+		`SELECT r.%s AS gkey,
+		        COALESCE(SUM(l.amount_micros) FILTER (WHERE l.entry_type = 'charge'), 0) AS charge_micros,
+		        COALESCE(SUM(l.amount_micros) FILTER (WHERE l.entry_type = 'reversal'), 0) AS reversed_micros,
+		        COALESCE(SUM(CASE WHEN a.direction = 'debit' THEN l.amount_micros
+		                          WHEN a.direction = 'credit' THEN -l.amount_micros END)
+		                 FILTER (WHERE l.entry_type = 'adjustment'), 0) AS adjusted_micros
 		   FROM inference_ledger_entries l
 		   JOIN inference_requests r ON r.id = l.request_id
-		  WHERE l.billing_account_id = $1 AND l.entry_type = 'reversal'
+		   LEFT JOIN inference_adjustments a ON a.id = l.adjustment_id
+		  WHERE l.billing_account_id = $1 AND l.unit = 'microcredit'
 		    AND r.created_at >= $2 AND r.created_at < $3%s
 		  GROUP BY r.%s`, gcol, scope, gcol)
-	var revRows []struct {
+	var ledRows []struct {
 		Gkey     sql.NullString `db:"gkey"`
+		Charge   int64          `db:"charge_micros"`
 		Reversed int64          `db:"reversed_micros"`
+		Adjusted int64          `db:"adjusted_micros"`
 	}
-	if err := s.db.SelectContext(ctx, &revRows, revSQL, args...); err != nil {
-		return nil, mapError("usage groups: reversals", err)
+	if err := s.db.SelectContext(ctx, &ledRows, ledSQL, args...); err != nil {
+		return nil, mapError("usage groups: ledger", err)
 	}
-	for _, r := range revRows {
+	for _, r := range ledRows {
 		if g, ok := groups[r.Gkey.String]; ok {
-			g.ReversedMicros = r.Reversed
+			g.ChargeMicros, g.ReversedMicros, g.AdjustedMicros = r.Charge, r.Reversed, r.Adjusted
 		}
 	}
 
@@ -242,13 +252,13 @@ func (s *Store) SummarizeUsageGroups(ctx context.Context, accountID string, f ma
 
 // SummarizeUsageSeries implements management.UsageViewStore: UTC calendar-day
 // buckets over the in-range requests (date_trunc 在 UTC 壁钟上进行，与 DB
-// 会话时区无关 —— 设计 §6 全部计量时间为服务端 UTC).
+// 会话时区无关 —— 设计 §6 全部计量时间为服务端 UTC). 金额列与分组同一账
+// 本派生口径（charge 毛额 + reversal + adjustment，按请求归属日落桶）。
 func (s *Store) SummarizeUsageSeries(ctx context.Context, accountID string, f management.UsageSummaryFilter) ([]management.UsageSeriesBucket, error) {
 	scope, args := usageScopeClause(f, []interface{}{accountID, f.From, f.To})
 	var rows []struct {
 		BucketStart time.Time `db:"bucket_start"`
 		Total       int64     `db:"requests_total"`
-		Charge      int64     `db:"charge_micros"`
 		Reported    int64     `db:"reported"`
 		Estimated   int64     `db:"estimated"`
 		Unknown     int64     `db:"unknown"`
@@ -256,7 +266,6 @@ func (s *Store) SummarizeUsageSeries(ctx context.Context, accountID string, f ma
 	err := s.db.SelectContext(ctx, &rows,
 		`SELECT (date_trunc('day', r.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS bucket_start,
 		        COUNT(*) AS requests_total,
-		        COALESCE(SUM(r.settled_micros) FILTER (WHERE r.status = 'settled'), 0) AS charge_micros,
 		        COUNT(*) FILTER (WHERE r.usage_status = 'reported') AS reported,
 		        COUNT(*) FILTER (WHERE r.usage_status = 'estimated') AS estimated,
 		        COUNT(*) FILTER (WHERE r.usage_status = 'unknown') AS unknown
@@ -266,12 +275,43 @@ func (s *Store) SummarizeUsageSeries(ctx context.Context, accountID string, f ma
 	if err != nil {
 		return nil, mapError("usage series", err)
 	}
+	byBucket := make(map[time.Time]int, len(rows))
 	out := make([]management.UsageSeriesBucket, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, management.UsageSeriesBucket{
-			BucketStart: r.BucketStart.UTC(), RequestsTotal: r.Total, ChargeMicros: r.Charge,
+			BucketStart: r.BucketStart.UTC(), RequestsTotal: r.Total,
 			Reported: r.Reported, Estimated: r.Estimated, Unknown: r.Unknown,
 		})
+		byBucket[r.BucketStart.UTC()] = len(out) - 1
+	}
+
+	// 账本金额按请求归属日落桶（无请求的日子无分录，天然对齐）。
+	var ledRows []struct {
+		BucketStart time.Time `db:"bucket_start"`
+		Charge      int64     `db:"charge_micros"`
+		Reversed    int64     `db:"reversed_micros"`
+		Adjusted    int64     `db:"adjusted_micros"`
+	}
+	err = s.db.SelectContext(ctx, &ledRows,
+		`SELECT (date_trunc('day', r.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS bucket_start,
+		        COALESCE(SUM(l.amount_micros) FILTER (WHERE l.entry_type = 'charge'), 0) AS charge_micros,
+		        COALESCE(SUM(l.amount_micros) FILTER (WHERE l.entry_type = 'reversal'), 0) AS reversed_micros,
+		        COALESCE(SUM(CASE WHEN a.direction = 'debit' THEN l.amount_micros
+		                          WHEN a.direction = 'credit' THEN -l.amount_micros END)
+		                 FILTER (WHERE l.entry_type = 'adjustment'), 0) AS adjusted_micros
+		   FROM inference_ledger_entries l
+		   JOIN inference_requests r ON r.id = l.request_id
+		   LEFT JOIN inference_adjustments a ON a.id = l.adjustment_id
+		  WHERE l.billing_account_id = $1 AND l.unit = 'microcredit'
+		    AND r.created_at >= $2 AND r.created_at < $3`+scope+`
+		  GROUP BY 1 ORDER BY 1`, args...)
+	if err != nil {
+		return nil, mapError("usage series: ledger", err)
+	}
+	for _, r := range ledRows {
+		if idx, ok := byBucket[r.BucketStart.UTC()]; ok {
+			out[idx].ChargeMicros, out[idx].ReversedMicros, out[idx].AdjustedMicros = r.Charge, r.Reversed, r.Adjusted
+		}
 	}
 	return out, nil
 }
@@ -283,12 +323,13 @@ func (s *Store) SummarizeUsageSeries(ctx context.Context, accountID string, f ma
 // ListRequestRows implements management.UsageViewStore: at most f.Limit+1
 // rows after the keyset cursor in (created_at DESC, id DESC) order. Each
 // row is enriched with the latest usage revision per attempt (token sums)
-// and the reversal sum from the ledger.
+// and the ledger-derived amounts (charge 分录 / reversal / 请求级
+// adjustment —— 与分组/序列同一口径；不读 settled_micros).
 func (s *Store) ListRequestRows(ctx context.Context, accountID string, f management.RequestListFilter) ([]management.RequestRow, error) {
 	args := []interface{}{accountID, f.From, f.To}
 	query := `SELECT r.id, r.model_id, r.api_key_id, k.name AS key_name, k.key_prefix,
 		        r.protocol, r.stream, r.status, r.usage_status,
-		        r.reserved_micros, r.settled_micros,
+		        r.reserved_micros,
 		        r.created_at, r.admitted_at, r.completed_at
 		   FROM inference_requests r
 		   LEFT JOIN inference_api_keys k ON k.id = r.api_key_id
@@ -320,7 +361,6 @@ func (s *Store) ListRequestRows(ctx context.Context, accountID string, f managem
 		Status      string         `db:"status"`
 		UsageStatus string         `db:"usage_status"`
 		Reserved    sql.NullInt64  `db:"reserved_micros"`
-		Settled     sql.NullInt64  `db:"settled_micros"`
 		CreatedAt   time.Time      `db:"created_at"`
 		AdmittedAt  *time.Time     `db:"admitted_at"`
 		CompletedAt *time.Time     `db:"completed_at"`
@@ -336,7 +376,7 @@ func (s *Store) ListRequestRows(ctx context.Context, accountID string, f managem
 			KeyName: stringFromNull(r.KeyName), KeyPrefix: stringFromNull(r.KeyPrefix),
 			Protocol: r.Protocol, Stream: r.Stream,
 			Status: domain.RequestStatus(r.Status), UsageStatus: domain.UsageSource(r.UsageStatus),
-			ReservedMicros: microFromNull(r.Reserved), SettledMicros: microFromNull(r.Settled),
+			ReservedMicros: microFromNull(r.Reserved),
 			CreatedAt: r.CreatedAt, AdmittedAt: r.AdmittedAt, CompletedAt: r.CompletedAt,
 		})
 		ids = append(ids, r.ID)
@@ -383,21 +423,41 @@ func (s *Store) ListRequestRows(ctx context.Context, accountID string, f managem
 		}
 	}
 
-	// Reversal enrichment (账本冲正合计，按请求归属).
-	var revRows []struct {
-		RequestID string `db:"request_id"`
-		Reversed  int64  `db:"reversed_micros"`
+	// Ledger enrichment (账本派生金额：charge 分录存在性 + reversal + 请求级
+	// adjustment 签名合计). charge 无行时保持 NULL（未结算/已释放）；
+	// SUM 空集为 NULL 恰好表达这一点。
+	var ledRows []struct {
+		RequestID string         `db:"request_id"`
+		Charge    sql.NullInt64  `db:"charge_micros"`
+		Reversed  int64          `db:"reversed_micros"`
+		Adjusted  int64          `db:"adjusted_micros"`
 	}
-	if err := s.db.SelectContext(ctx, &revRows,
-		`SELECT request_id, COALESCE(SUM(amount_micros), 0) AS reversed_micros
-		   FROM inference_ledger_entries
-		  WHERE entry_type = 'reversal' AND request_id = ANY($1)
-		  GROUP BY request_id`, pq.Array(ids)); err != nil {
-		return nil, mapError("usage requests: reversals", err)
+	if err := s.db.SelectContext(ctx, &ledRows,
+		`SELECT l.request_id,
+		        SUM(l.amount_micros) FILTER (WHERE l.entry_type = 'charge') AS charge_micros,
+		        COALESCE(SUM(l.amount_micros) FILTER (WHERE l.entry_type = 'reversal'), 0) AS reversed_micros,
+		        COALESCE(SUM(CASE WHEN a.direction = 'debit' THEN l.amount_micros
+		                          WHEN a.direction = 'credit' THEN -l.amount_micros END)
+		                 FILTER (WHERE l.entry_type = 'adjustment'), 0) AS adjusted_micros
+		   FROM inference_ledger_entries l
+		   LEFT JOIN inference_adjustments a ON a.id = l.adjustment_id
+		  WHERE l.unit = 'microcredit' AND l.request_id = ANY($1)
+		  GROUP BY l.request_id`, pq.Array(ids)); err != nil {
+		return nil, mapError("usage requests: ledger", err)
 	}
-	revByReq := make(map[string]int64, len(revRows))
-	for _, r := range revRows {
-		revByReq[r.RequestID] = r.Reversed
+	type ledgerAmt struct {
+		charge   *int64
+		reversed int64
+		adjusted int64
+	}
+	ledByReq := make(map[string]ledgerAmt, len(ledRows))
+	for _, r := range ledRows {
+		a := ledgerAmt{reversed: r.Reversed, adjusted: r.Adjusted}
+		if r.Charge.Valid {
+			c := r.Charge.Int64
+			a.charge = &c
+		}
+		ledByReq[r.RequestID] = a
 	}
 
 	for i := range out {
@@ -405,7 +465,11 @@ func (s *Store) ListRequestRows(ctx context.Context, accountID string, f managem
 			out[i].HasUsage = true
 			out[i].Tokens = b
 		}
-		out[i].ReversedMicros = revByReq[out[i].ID]
+		if a, ok := ledByReq[out[i].ID]; ok {
+			out[i].ChargeMicros = a.charge
+			out[i].ReversedMicros = a.reversed
+			out[i].AdjustedMicros = a.adjusted
+		}
 	}
 	return out, nil
 }

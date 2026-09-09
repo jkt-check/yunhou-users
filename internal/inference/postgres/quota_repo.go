@@ -148,7 +148,7 @@ func lockAccountTx(ctx context.Context, tx *sqlx.Tx, accountID string) error {
 		accountID).Scan(&status); err != nil {
 		return mapError("lock account", err)
 	}
-	if status != "active" {
+	if status != string(domain.BillingAccountActive) {
 		return domain.NewError(domain.CodeInvalidKey, "billing account not active: "+status)
 	}
 	return nil

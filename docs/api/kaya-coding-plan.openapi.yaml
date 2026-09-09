@@ -29,6 +29,11 @@ info:
       信号，非计费事实）。
     - **计量完整性**：每请求 `usage_status` ∈ `reported/estimated/unknown/pending`；
       token 桶 `null` = 未报告（未知 ≠ 0）。
+    - **金额口径**：用量金额派生自不可变账本 —— `charge_micros`=Σ 原始
+      charge 分录（修正/作废不重写）、`reversed_micros`=Σ 冲正、
+      `adjusted_micros`=Σ 请求级调整（debit 正 / credit 负，修正补差与运营
+      补偿均计入）、`net_micros` = charge − reversed + adjusted。作废
+      （void）修正后净额为 0，不为负。
     - **权限**：全部端点需用户 JWT（`Authorization: Bearer`）；只有本人可查自身
       Key/账本/配额/订阅（端点不接收用户/账户 ID 参数，越权在结构上不可能）。
 
@@ -616,22 +621,35 @@ components:
         pending: { type: integer, format: int64 }
         charge_micros:
           $ref: "#/components/schemas/DecimalInt64"
+          description: Σ 原始 charge 分录（不可变账本派生；修正/作废不重写它）
         reversed_micros:
           $ref: "#/components/schemas/DecimalInt64"
+          description: Σ reversal 冲正分录
+        adjusted_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: Σ 请求级 adjustment 签名合计（debit 正 / credit 负；修正补差与运营补偿均计入）
         net_micros:
           $ref: "#/components/schemas/DecimalInt64"
-          description: charge - reversed
+          description: charge − reversed + adjusted（与 reconciliation 账本重建不变量一致）
         tokens:
           $ref: "#/components/schemas/UsageTokens"
     UsageSeriesBucket:
       type: object
-      description: UTC 自然日桶
+      description: UTC 自然日桶；金额列与分组同一账本派生口径（charge 毛额 + reversal + 签名 adjustment）
       properties:
         bucket_start:
           $ref: "#/components/schemas/RFC3339UTC"
         requests: { type: integer, format: int64 }
         charge_micros:
           $ref: "#/components/schemas/DecimalInt64"
+        reversed_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        adjusted_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: 请求级 adjustment 签名合计（debit 正 / credit 负）
+        net_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: charge − reversed + adjusted
         reported: { type: integer, format: int64 }
         estimated: { type: integer, format: int64 }
         unknown: { type: integer, format: int64 }
@@ -697,12 +715,17 @@ components:
         charge_micros:
           $ref: "#/components/schemas/DecimalInt64"
           nullable: true
-          description: 结算扣费；未结算为 null
+          description: 账本原始 charge 分录；尚无 charge 行（未结算/已释放）为 null；作废修正不归零它
         reversed_micros:
           $ref: "#/components/schemas/DecimalInt64"
+          description: Σ reversal 冲正（作废 = 全额冲正原始 charge）
+        adjusted_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: 请求级 adjustment 签名合计（debit 正 / credit 负）
         net_micros:
           $ref: "#/components/schemas/DecimalInt64"
           nullable: true
+          description: charge − reversed + adjusted；无 charge 行为 null；作废后 net=0（不为负）
         tokens:
           $ref: "#/components/schemas/UsageTokens"
           nullable: true

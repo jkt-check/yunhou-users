@@ -7,6 +7,8 @@ package management
 import (
 	"context"
 	"strings"
+
+	"github.com/yunhou/users/internal/inference/domain"
 )
 
 // AuditEvent is one management audit fact. ActorUser is the server-verified
@@ -27,6 +29,14 @@ type AuditEvent struct {
 // tests use in-memory recorders.
 type AuditRecorder interface {
 	Record(ctx context.Context, ev AuditEvent) error
+}
+
+// AuditTxRecorder records the audit event INSIDE the caller's transaction —
+// the audit row commits or rolls back together with the mutation it
+// describes (补偿/冲正的追加审计与效果同生共死，Task 15). Implemented by
+// the postgres store (RecordTx).
+type AuditTxRecorder interface {
+	RecordTx(ctx context.Context, w domain.UnitOfWork, ev AuditEvent) error
 }
 
 // sensitiveKeyPattern matches detail keys that must never reach the audit

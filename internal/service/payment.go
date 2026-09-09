@@ -2293,8 +2293,21 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	// 余额充值订单的退款（全额或部分，Task 14）：同事务入队钱包退款消息
 	// ——钱包现金原路退（dedup 钉 refund 行；消费侧 wallet:refund:{id} 业
 	// 务键幂等）。赠送余额不参与退款（钱包侧纯规则 + CHECK 双兜底）。
+	// 纵深防御（Task 14 deferred minor，Task 15 收尾）：只有支付行在本事务
+	// 入口仍处 paid 才允许入队。dedup 键钉的是同一笔 refund 的重投；对已
+	// refunded 的支付再到达的*另一笔*退款事件（不同 external_refund_id）
+	// 若不入守卫会再次扣减钱包现金。退款行本身照常记录（支付域事实），
+	// 但钱包侧不再跟随。
 	if refundProduct == model.ProductWalletTopup {
-		if err := s.enqueueWalletRefund(ctx, tx, &order, payment.ID, refundID, e.RefundAmount); err != nil {
+		if payment.Status != "paid" {
+			if err := writeAuditOnTx(ctx, tx, "service", "wallet_refund_skipped_payment_not_paid",
+				fmt.Sprintf("payment:%s", payment.ID),
+				[]string{"refund", "wallet_topup", "guard"},
+				map[string]any{"payment_id": payment.ID, "payment_status": payment.Status,
+					"refund_id": refundID, "channel": e.Channel}); err != nil {
+				return fmt.Errorf("write audit: %w", err)
+			}
+		} else if err := s.enqueueWalletRefund(ctx, tx, &order, payment.ID, refundID, e.RefundAmount); err != nil {
 			return err
 		}
 	}

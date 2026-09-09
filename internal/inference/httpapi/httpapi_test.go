@@ -65,6 +65,7 @@ func newTestServer(t *testing.T) *gin.Engine {
 		inference_wallet_holds, inference_wallets, inference_payg_config,
 		inference_response_chains,
 		inference_session_bindings, inference_oauth_grants,
+		inference_bulk_imports,
 		inference_audit_log,
 		operator_roles,
 		inference_reconciliation_jobs, inference_outbox,

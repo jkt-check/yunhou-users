@@ -57,7 +57,7 @@ func newWalletFixture(t *testing.T) *walletFixture {
 		}
 		c.Next()
 	}, httpapi.OperatorAuthz(store, management.PermBillingAdjust))
-	httpapi.NewAdminAdjustmentsHandler(store, nil).Register(admin)
+	httpapi.NewAdminAdjustmentsHandler(store, nil, store, management.NewOperationsService(store, nil)).Register(admin)
 	return &walletFixture{db: v.db, store: store, engine: v.engine, views: v}
 }
 

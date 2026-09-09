@@ -206,6 +206,72 @@ func TestWalletTopup_RefundCashBack(t *testing.T) {
 	_ = payID
 }
 
+// TestWalletTopup_RefundGuardPaidOnly: 钱包退款入队的 payment.status='paid'
+// 守卫（Task 14 deferred minor / Task 15 纵深防御）——支付已 refunded 后，
+// 另一笔不同 external_refund_id 的退款事件只落退款行，不再入队钱包退款
+// （否则钱包现金会被二次扣减；dedup 键挡不住不同 refund_id）。
+func TestWalletTopup_RefundGuardPaidOnly(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	svc.SetBenefitRepo(repo.NewPlanBenefitRepo(db))
+	svc.SetBenefitSync(inferencepostgres.NewStore(db))
+	ctx := context.Background()
+
+	seedTopupPlan(t, db, "topup-60", 60.00)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(ctx, uid, "topup-60", "stripe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OnWebhook(ctx, stripePaidEvent(order.ID, "evt-pay-g", "pi_g1", 60.00)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 全额退款（支付翻 refunded，入队 1 条钱包退款）。
+	fullRefund := WebhookEvent{
+		Channel: "stripe", EventID: "evt-g-ref1", EventType: "charge.refunded",
+		TransactionID: "pi_g1", OrderID: order.ID, Amount: 60.00, Currency: "CNY",
+		RefundAmount: 60.00, ExternalRefundID: "re_g_full",
+		RawPayload: json.RawMessage(`{"id":"evt-g-ref1"}`),
+	}
+	if _, err := svc.OnWebhook(ctx, fullRefund); err != nil {
+		t.Fatal(err)
+	}
+	if n := walletOutboxCount(t, db); n != 2 { // 1 topup + 1 refund
+		t.Fatalf("wallet.sync outbox = %d, want 2", n)
+	}
+
+	// 第二笔不同 refund_id 的退款事件（支付已 refunded）→ 守卫拦截：
+	// 退款行落库（支付域事实）但钱包退款不再入队。
+	stray := fullRefund
+	stray.EventID = "evt-g-ref2"
+	stray.ExternalRefundID = "re_g_stray"
+	stray.RawPayload = json.RawMessage(`{"id":"evt-g-ref2"}`)
+	if _, err := svc.OnWebhook(ctx, stray); err != nil {
+		t.Fatal(err)
+	}
+	if n := walletOutboxCount(t, db); n != 2 {
+		t.Fatalf("wallet.sync outbox = %d after stray refund, want 2 (guard held)", n)
+	}
+	var refundRows int
+	if err := db.GetContext(ctx, &refundRows,
+		`SELECT COUNT(*) FROM refunds WHERE payment_id = (SELECT id FROM payments WHERE order_id = $1)`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if refundRows != 2 {
+		t.Fatalf("refund rows = %d, want 2 (payment-domain fact recorded)", refundRows)
+	}
+	// 守卫动作留审计痕。
+	var audits int
+	if err := db.GetContext(ctx, &audits,
+		`SELECT COUNT(*) FROM audit_log WHERE action = 'wallet_refund_skipped_payment_not_paid'`); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 {
+		t.Fatalf("guard audit rows = %d, want 1", audits)
+	}
+}
+
 // activeSubForMaybe is the nil-tolerant variant of activeSubFor.
 func activeSubForMaybe(t *testing.T, db *sqlx.DB, userID, product string) *struct{} {
 	t.Helper()

@@ -42,6 +42,14 @@ func TestOpenAPI_CoversMountedEndpoints(t *testing.T) {
 		"/admin/wallet/reversals:",
 		"/admin/wallet:",
 		"/admin/payg-config:",
+		// Task 15: 运营面（批量导入/统计/异常/共享账号检测/补偿追踪/变更预览）。
+		"/admin/catalog/bulk-import:",
+		"/admin/model-usage/summary:",
+		"/admin/model-usage/exceptions:",
+		"/admin/upstream-accounts/shared:",
+		"/admin/model-adjustments:",
+		"/admin/model-prices/preview:",
+		"/admin/quota-policies/preview:",
 	} {
 		if !strings.Contains(doc, path) {
 			t.Errorf("openapi missing path %s", path)

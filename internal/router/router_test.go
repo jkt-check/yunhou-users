@@ -307,6 +307,14 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"POST:/admin/credentials",
 		"POST:/admin/credentials/:id/rotate",
 		"POST:/admin/operators",
+		// Task 15 运营面同样 fail-closed（nil adminOps = 不挂载）。
+		"POST:/admin/catalog/bulk-import",
+		"GET:/admin/model-usage/summary",
+		"GET:/admin/model-usage/exceptions",
+		"GET:/admin/upstream-accounts/shared",
+		"GET:/admin/model-adjustments",
+		"POST:/admin/model-prices/preview",
+		"POST:/admin/quota-policies/preview",
 	} {
 		if have[w] {
 			t.Errorf("Setup registered operator write route %s with nil adminOps", w)

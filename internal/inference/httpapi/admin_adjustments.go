@@ -25,6 +25,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/management"
 	"github.com/yunhou/users/internal/inference/postgres"
 )
 
@@ -46,18 +47,31 @@ type AdminWalletStore interface {
 	PutPAYGConfig(ctx context.Context, policyVersionID string, modelIDs []string, updatedBy string) (*postgres.PAYGConfig, error)
 }
 
+// adjustmentAuditor combines post-hoc and transactional audit recording
+// (the postgres store implements both; unit tests may pass nil).
+type adjustmentAuditor interface {
+	management.AuditRecorder
+	management.AuditTxRecorder
+}
+
 // AdminAdjustmentsHandler exposes the operator wallet surface.
 type AdminAdjustmentsHandler struct {
 	store AdminWalletStore
 	clock domain.Clock
+	// audit 是补偿/冲正/PAYG 发布的追加审计通道（调整与冲正同事务落库—
+	// 审计与效果同生共死）；nil 仅存在于不演练审计的单测。
+	audit adjustmentAuditor
+	// ops 提供补偿列表的只读视图（nil = 列表端点响亮报错而非静默空表）。
+	ops *management.OperationsService
 }
 
 // NewAdminAdjustmentsHandler builds the handler; a nil clock uses UTC.
-func NewAdminAdjustmentsHandler(store AdminWalletStore, clock domain.Clock) *AdminAdjustmentsHandler {
+// audit and ops may be nil (unit tests only); production wires the store.
+func NewAdminAdjustmentsHandler(store AdminWalletStore, clock domain.Clock, audit adjustmentAuditor, ops *management.OperationsService) *AdminAdjustmentsHandler {
 	if clock == nil {
 		clock = domain.SystemClock{}
 	}
-	return &AdminAdjustmentsHandler{store: store, clock: clock}
+	return &AdminAdjustmentsHandler{store: store, clock: clock, audit: audit, ops: ops}
 }
 
 // Register mounts the endpoints; the caller wraps the group with the
@@ -65,9 +79,35 @@ func NewAdminAdjustmentsHandler(store AdminWalletStore, clock domain.Clock) *Adm
 func (h *AdminAdjustmentsHandler) Register(g *gin.RouterGroup) {
 	g.POST("/wallet/adjustments", h.Adjust)
 	g.POST("/wallet/reversals", h.Reverse)
+	g.GET("/wallet/adjustments", h.ListAdjustments)
 	g.GET("/wallet", h.Get)
 	g.GET("/payg-config", h.GetPAYG)
 	g.PUT("/payg-config", h.PutPAYG)
+}
+
+// auditWalletTx appends one audit event inside the mutation's transaction —
+// 补偿/冲正的追加审计与效果同生共死（同事务提交或回滚）。nil 记录器仅存
+// 在于不演练审计的单测。
+func (h *AdminAdjustmentsHandler) auditWalletTx(ctx context.Context, uow domain.UnitOfWork, op credentialsOperator, action, objectID, reason string, detail map[string]any) error {
+	if h.audit == nil {
+		return nil
+	}
+	return h.audit.RecordTx(ctx, uow, management.AuditEvent{
+		Action: action, ObjectType: "wallet", ObjectID: objectID, Reason: reason,
+		ActorUser: op.UserID, ActorApp: op.AppID, Detail: management.SanitizeDetail(detail),
+	})
+}
+
+// credentialsOperator is the attribute subset of credentials.Operator this
+// handler needs (avoid re-deriving it from the gin context deep in helpers).
+type credentialsOperator struct{ UserID, AppID string }
+
+// adjIDOf renders the adjustment id for audit detail (nil-safe).
+func adjIDOf(adj *postgres.Adjustment) string {
+	if adj == nil {
+		return ""
+	}
+	return adj.ID
 }
 
 // resolveAccount pins the billing account: billing_account_id directly, or
@@ -151,6 +191,20 @@ func (h *AdminAdjustmentsHandler) Adjust(c *gin.Context) {
 		fail(c, err)
 		return
 	}
+	// 追加审计（同事务）：补偿可定位到人员（Task 15；设计 §9.2）。
+	if err := h.auditWalletTx(ctx, uow, credentialsOperator{op.UserID, op.AppID},
+		"wallet.adjust", acct.ID, req.Reason, map[string]any{
+			"adjustment_id":   adjIDOf(adj),
+			"direction":       req.Direction,
+			"source":          req.Source,
+			"amount_micros":   req.AmountMicros,
+			"currency":        req.Currency,
+			"idempotency_key": req.IdempotencyKey,
+		}); err != nil {
+		_ = uow.Rollback(ctx)
+		fail(c, domain.WrapError(domain.CodeInternal, "audit write failed", err))
+		return
+	}
 	if err := uow.Commit(ctx); err != nil {
 		fail(c, err)
 		return
@@ -173,6 +227,24 @@ func adjustmentJSON(adj *postgres.Adjustment) gin.H {
 		"reason":        adj.Reason,
 		"created_at":    adj.CreatedAt.UTC().Format(time.RFC3339),
 	}
+}
+
+// adjustmentViewsJSON renders the compensation listing (可定位到人员：
+// operator_subject / service_subject / idempotency_key 全量呈现).
+func adjustmentViewsJSON(views []management.AdjustmentView) []gin.H {
+	out := make([]gin.H, 0, len(views))
+	for _, v := range views {
+		out = append(out, gin.H{
+			"id": v.ID, "billing_account_id": v.BillingAccountID,
+			"request_id": v.RequestID, "reason": v.Reason,
+			"amount_micros": strconv.FormatInt(v.AmountMicros, 10),
+			"direction": v.Direction, "unit": v.Unit, "currency": v.Currency,
+			"operator_subject": v.OperatorSubject, "service_subject": v.ServiceSubject,
+			"idempotency_key": v.IdempotencyKey,
+			"created_at":      v.CreatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return out
 }
 
 type walletReversalRequest struct {
@@ -214,6 +286,15 @@ func (h *AdminAdjustmentsHandler) Reverse(c *gin.Context) {
 			return
 		}
 		fail(c, err)
+		return
+	}
+	// 追加审计（同事务）：冲正可定位到人员（Task 15）。
+	if err := h.auditWalletTx(ctx, uow, credentialsOperator{op.UserID, op.AppID},
+		"wallet.reverse", acct.ID, "operator reversal", map[string]any{
+			"entry_id": req.EntryID,
+		}); err != nil {
+		_ = uow.Rollback(ctx)
+		fail(c, domain.WrapError(domain.CodeInternal, "audit write failed", err))
 		return
 	}
 	if err := uow.Commit(ctx); err != nil {
@@ -289,10 +370,40 @@ func (h *AdminAdjustmentsHandler) PutPAYG(c *gin.Context) {
 		fail(c, err)
 		return
 	}
+	// 追加审计（发布配置变更；Task 15）。PutPAYGConfig 是单行 upsert，审计
+	// 紧随其后落库；审计失败对运营响亮报错（配置已生效，审计面可查
+	// wallet_audits 的开关留痕与此条互补）。
+	if h.audit != nil {
+		if err := h.audit.Record(c.Request.Context(), management.AuditEvent{
+			Action: "payg_config.publish", ObjectType: "payg_config", ObjectID: req.PolicyVersionID,
+			ActorUser: op.UserID, ActorApp: op.AppID,
+			Detail: management.SanitizeDetail(map[string]any{"model_ids": req.ModelIDs}),
+		}); err != nil {
+			fail(c, domain.WrapError(domain.CodeInternal, "audit write failed", err))
+			return
+		}
+	}
 	ok(c, gin.H{
 		"policy_version_id": cfg.PolicyVersionID,
 		"model_ids":         cfg.ModelIDs,
 		"updated_by":        cfg.UpdatedBy,
 		"updated_at":        cfg.UpdatedAt.UTC().Format(time.RFC3339),
 	})
+}
+
+// ListAdjustments handles GET /wallet/adjustments?billing_account_id=&limit=
+// — 补偿追踪（有原因、对象、金额、操作者与幂等键，设计 §9.2 /admin/
+// model-adjustments 族）。usage:read 的 /admin/model-adjustments 别名在
+// admin_usage.go 挂载（同一服务，同一口径）。
+func (h *AdminAdjustmentsHandler) ListAdjustments(c *gin.Context) {
+	if h.ops == nil {
+		fail(c, domain.NewError(domain.CodeInternal, "adjustments listing not wired"))
+		return
+	}
+	views, err := h.ops.Adjustments(c.Request.Context(), c.Query("billing_account_id"), parseLimit(c, 100))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, gin.H{"adjustments": adjustmentViewsJSON(views)})
 }

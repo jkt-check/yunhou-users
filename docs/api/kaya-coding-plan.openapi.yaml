@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Kaya Coding Plan — 客户控制台 API（yunhou-users）
-  version: 0.12.0
+  version: 0.13.0
   description: |
     Kaya Coding Plan（独立模型 API 套餐）客户侧契约，供 Website 客户控制台对接。
     本文件与 `internal/inference/httpapi/{user_api_keys,user_quotas,user_usage,
@@ -379,11 +379,23 @@ paths:
         inference_adjustments + 钱包分录（同一事务），operator/service
         双重归因，idempotency_key 幂等（重复投递只生效一次，重放响应
         applied=false）。金额 DecimalInt64；bonus 永不走现金退款路径。
+        Task 15 起调整/冲正带同事务追加审计（wallet.adjust / wallet.reverse，
+        可定位到人员）。
       operationId: createWalletAdjustment
       responses:
         "201": { description: 已应用 }
         "200": { description: 幂等重放（applied=false） }
         "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      tags: [model-admin]
+      summary: 补偿追踪列表（billing:adjust 读面；与 /admin/model-adjustments 同一口径）（Task 15）
+      operationId: listWalletAdjustments
+      parameters:
+        - { name: billing_account_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 补偿列表（原因/对象/金额/操作者/幂等键） }
         "403": { $ref: "#/components/responses/Forbidden" }
 
   /admin/wallet/reversals:
@@ -433,6 +445,160 @@ paths:
       operationId: putPaygConfig
       responses:
         "200": { description: 已发布 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ------------------------------------------------------------------
+  # Task 15：大量模型运营、价格预览与成本分析
+  # ------------------------------------------------------------------
+
+  /admin/catalog/bulk-import:
+    post:
+      tags: [model-admin]
+      summary: 批量导入目录（models:manage）
+      description: |
+        批量导入 providers/models/deployments（路由按部署派生）。语义：
+        - `dry_run=true`：逐项预演（`would_insert`/`would_skip`/`error`），
+          一行不写；部分错误的预览只存在于 dry-run 响应。
+        - `dry_run=false`（commit）：**全部有效才落库**——任一 item 出错则
+          整个任务 400（`data.items` 携带逐项错误），一行不写（绝不半发布；
+          要导入子集就删掉错误项换新 task_id 重提）。
+        - `task_id` 幂等：commit 与目录写入同一事务；重复提交（哪怕文档
+          不同）返回 200 + `replayed=true` 与首次已记录的结果，不重复创建。
+        - 大小上限：条目总数 ≤ 200（另有全局 1 MiB body 上限）。
+        - 落库即草稿（lifecycle/status=draft，默认不可售）；运营补齐授权/
+          价格后走 `POST /admin/catalog/publish` 发布。停用上游不删除历史
+          路由记录（删除接口不触碰既有请求/尝试行）。
+        - 每次 commit 追加审计（`catalog.bulk_import`，人员及服务双重归因）。
+      operationId: bulkImportCatalog
+      responses:
+        "200": { description: dry-run 预演 / 幂等重放（replayed=true） }
+        "201": { description: 已提交（committed=true，逐项 inserted/skipped） }
+        "400": { description: 逐项错误（data.items），一行未写 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-usage/summary:
+    get:
+      tags: [model-admin]
+      summary: 运营用量/成本聚合（usage:read）
+      description: |
+        每模型/供应商/客户（`group_by=model|provider|customer`，默认 model）
+        的请求量、成功率（settled+released 占终态比）、延迟（attempts 的
+        avg/p95 毫秒）、计量完整性（reported/estimated/unknown/pending）、
+        客户消费（账本派生 microcredit：charge/reversed/adjusted/net，
+        与客户面逐字同口径）与采购成本（attempts 落库事实，按 币种 ×
+        cost_basis[reported/estimated/allocated] 分片，绝不跨币种合并；
+        `cost_unknown_attempts` 单列成本未知的尝试）。
+        供应商分组：请求级计数按最终尝试（attempt_no 最大）的部署归属
+        （重试不双计）；尝试级指标按每次尝试自己的部署归属；供应商维度
+        不归属请求级账本金额（恒 0——一次请求跨供应商重试时拆账是编造，
+        金额权威维度是模型/客户）。
+        数据源只有 inference_requests/attempts/usage_records/ledger_entries；
+        `as_of`=`complete_through`=读取时刻（直读权威表）。时间范围默认
+        最近 30 天、最大 92 天（`from`/`to` RFC3339 半开区间）。
+      operationId: opsUsageSummary
+      parameters:
+        - { name: group_by, in: query, schema: { type: string, enum: [model, provider, customer], default: model } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: model_id, in: query, schema: { type: string } }
+        - { name: provider_id, in: query, schema: { type: string } }
+        - { name: billing_account_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: 聚合分组 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-usage/exceptions:
+    get:
+      tags: [model-admin]
+      summary: 异常筛选（usage:read）
+      description: |
+        `kind` 必选：
+        - `stuck_reservations`：held 超过 1 小时的异常预占（请求状态/账户/
+          模型/额度/滞留时长）；
+        - `reauth_required_accounts`：授权失效的上游账号（invalid_grant
+          传播后停止调度；Task 12 语义）；
+        - `settlement_backlog`：pending/running/escalated 的核对任务
+          （含 `overdue` 超期标记——期限告警语义，超期不等于自动释放）。
+      operationId: opsUsageExceptions
+      parameters:
+        - { name: kind, in: query, required: true, schema: { type: string, enum: [stuck_reservations, reauth_required_accounts, settlement_backlog] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 异常列表（kind 对应字段非空） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/upstream-accounts/shared:
+    get:
+      tags: [model-admin]
+      summary: '“一账号一部署”检测视图（usage:read）'
+      description: |
+        **运营约束**：一个上游账号只挂一个部署。两部署共享同一上游账号时，
+        故障切换会撞并发租约唯一键（500）——调度语义不在线变更，本视图是
+        显式检测面：观测窗口内（attempts 落库事实，默认最近 7 天）同一上游
+        账号服务过 >1 个部署的账号清单。命中即应把账号拆到各自部署。
+      operationId: opsSharedDeploymentAccounts
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 违规账号（deployment_ids/attempts/latest_attempt_at） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-adjustments:
+    get:
+      tags: [model-admin]
+      summary: 补偿追踪（usage:read；设计 §9.2 /admin/model-adjustments 族）
+      description: |
+        补偿记录列表（newest first）：原因、对象（billing_account_id /
+        request_id）、金额（DecimalInt64 + 币种/单位）、操作者
+        （operator_subject = user:<uid>@app:<appid> 人员及服务双重归因）、
+        service_subject、幂等键。与 billing:adjust 面的
+        `GET /admin/wallet/adjustments` 同一服务同一口径；本路径供
+        auditor 角色（仅 usage:read）只读追踪。
+      operationId: listModelAdjustments
+      parameters:
+        - { name: billing_account_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 补偿列表 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-prices/preview:
+    post:
+      tags: [model-admin]
+      summary: 价格变更影响预览（models:manage；只读不落库）
+      description: |
+        展示：生效时间（`effective_from`，缺省=当前；[from,to) 边界属新版
+        本）、生效时刻被替换的当前版本（`current_effective`，null=此前未
+        定价）、受影响账户数（覆盖该模型的活跃权益）与受影响套餐（订阅来
+        源权益关联）、在途钉住请求数（它们永远按入场钉住的版本计费）。
+        `existing_subscriptions_keep_version` 恒为 true——旧订阅/在途请求
+        保留版本是结构性事实（031 持久化准入绑定）。
+      operationId: previewModelPrice
+      responses:
+        "200": { description: 影响预览 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: 模型不存在 }
+
+  /admin/quota-policies/preview:
+    post:
+      tags: [model-admin]
+      summary: 额度策略变更影响预览（models:manage；只读不落库）
+      description: |
+        按策略 name 对比当前发布版：模型集合差分（added/removed）、窗口
+        限额变化（proposed vs current_published）、引用当前发布版的活跃
+        权益数（`affected_accounts_kept_on_old`——权益钉住
+        policy_version_id，新版本只影响新发权益；旧订阅保留版本恒 true）。
+        策略版本按权益发放钉住，不存在全局生效时刻。
+      operationId: previewQuotaPolicy
+      responses:
+        "200": { description: 影响预览 }
         "400": { $ref: "#/components/responses/InvalidInput" }
         "403": { $ref: "#/components/responses/Forbidden" }
 

@@ -167,7 +167,7 @@ func newProtoStack(t *testing.T) *protoStack {
 	db := setupDB(t)
 	ctx := context.Background()
 	_, err := db.Exec(`TRUNCATE
-		inference_response_chains,
+		inference_response_chains, inference_bulk_imports,
 		inference_session_bindings, inference_oauth_grants,
 		inference_audit_log, operator_roles,
 		inference_reconciliation_jobs, inference_outbox,

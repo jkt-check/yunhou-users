@@ -172,7 +172,7 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 		inference_audit_log, operator_roles,
 		inference_wallet_entries, inference_wallet_audits,
 		inference_wallet_holds, inference_wallets, inference_payg_config,
-		inference_response_chains,
+		inference_response_chains, inference_bulk_imports,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,

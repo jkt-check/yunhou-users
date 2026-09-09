@@ -82,3 +82,4 @@ syntax, **not** transaction control — those are fine.
 | `031_inference_settlement_recovery.sql` | 幂等结算与崩溃恢复：charge 允许零额（零消费恒落行）、reconciliation reason 增 settlement_overage、窗口级任务部分唯一索引、请求行持久化准入上界（Task 9；030 起空号经控制者裁决，后由 Task 14 占用 030） |
 | `032_inference_oauth_sessions.sql` | inference OAuth 授权状态（一次性 state + PKCE，独立于社交登录）与粘性会话绑定表组（Task 12；控制者裁决确需 DDL 从 032 起） |
 | `033_inference_response_chains.sql` | OpenAI Responses 会话链持久化：previous_response_id 接续的 transcript 回放 + 账户/上游账号归属（Task 13） |
+| `034_inference_operations.sql` | 运营面支撑：inference_bulk_imports 批量导入幂等任务表（commit 与目录写入同事务、重复提交重放已记录结果）+ requests/attempts 的 created_at 范围扫描索引（运营统计/异常筛选的真实查询计划；只读派生路径，不引入外部分析库）（Task 15） |

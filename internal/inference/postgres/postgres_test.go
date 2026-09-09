@@ -78,6 +78,7 @@ func wipeInference(t *testing.T, db *sqlx.DB) {
 		inference_wallet_holds, inference_wallets, inference_payg_config,
 		inference_response_chains,
 		inference_session_bindings, inference_oauth_grants,
+		inference_bulk_imports,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,
@@ -108,8 +109,16 @@ type fixture struct {
 
 func seedFixture(t *testing.T, s *Store, withKey bool) fixture {
 	t.Helper()
+	return seedFixtureModel(t, s, withKey, "glm-4.6")
+}
+
+// seedFixtureModel is seedFixture with an explicit model id — tests needing
+// TWO accounts call it twice with distinct models (the model insert is part
+// of the chain and would otherwise collide on the primary key).
+func seedFixtureModel(t *testing.T, s *Store, withKey bool, modelID string) fixture {
+	t.Helper()
 	ctx := context.Background()
-	f := fixture{modelID: "glm-4.6"}
+	f := fixture{modelID: modelID}
 
 	userID := uuid.NewString()
 	if _, err := s.db.ExecContext(ctx,
@@ -132,7 +141,7 @@ func seedFixture(t *testing.T, s *Store, withKey bool) fixture {
 	}
 
 	pol := &PolicyVersion{
-		Name: "coding-plan", Revision: 1, ModelIDs: []string{f.modelID},
+		Name: "coding-plan-" + modelID, Revision: 1, ModelIDs: []string{f.modelID},
 		FiveHourLimit: micro(1_000_000), WeeklyLimit: micro(10_000_000),
 		MonthlyLimit: micro(100_000_000),
 	}

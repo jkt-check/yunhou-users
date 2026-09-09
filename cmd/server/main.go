@@ -244,6 +244,11 @@ func main() {
 	catalogMgr := inferencemanagement.NewCatalogManager(catalogSvc, infStore, egressValidator.ValidateURL)
 	adminModelsHandler := inferencehttpapi.NewAdminModelsHandler(catalogMgr)
 
+	// Task 15: 运营读模型（统计/异常/补偿追踪/变更预览）——只读派生路径，
+	// 直读权威表（inference_requests/attempts/usage_records/ledger_entries），
+	// 绝不使用 usage_events 心跳表，不触碰额度闸门的权威事务状态。
+	opsViewSvc := inferencemanagement.NewOperationsService(infStore, nil)
+
 	// Task 12: upstream OAuth connector registry + authorization/refresh
 	// services. The registry comes from the deployment secret env
 	// (INFERENCE_OAUTH_CONNECTORS_JSON); empty registry = authorization
@@ -265,11 +270,18 @@ func main() {
 		RequireAdmin:       inferencehttpapi.OperatorRequireRole(infStore, inferencemanagement.RoleAdmin),
 		// Task 14: 钱包运营面（调整/冲正/PAYG 发布配置）走 billing:adjust。
 		RequireBilling: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermBillingAdjust),
-		Models:         adminModelsHandler,
-		Credentials:    inferencehttpapi.NewAdminCredentialsHandler(credSvc),
-		Auth:           inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
-		OAuth:          inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
-		Adjustments:    inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil),
+		// Task 15: 运营统计/异常筛选/补偿追踪走 usage:read（auditor 可达）。
+		RequireUsage: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermUsageRead),
+		Models:       adminModelsHandler,
+		Credentials:  inferencehttpapi.NewAdminCredentialsHandler(credSvc),
+		Auth:         inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
+		OAuth:        inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
+		// Task 15: 补偿/冲正带同事务追加审计；补偿列表经运营读模型。
+		Adjustments: inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil, infStore, opsViewSvc),
+		// Task 15: 批量导入（dry-run/逐项错误/幂等任务 ID/绝不半发布）。
+		Bulk: inferencehttpapi.NewAdminBulkHandler(inferencemanagement.NewBulkImportService(infStore, infStore, egressValidator.ValidateURL)),
+		// Task 15: 运营统计/成本分析/异常筛选/共享账号检测/变更预览。
+		Usage: inferencehttpapi.NewAdminUsageHandler(opsViewSvc, inferencemanagement.NewPricingPreviewService(infStore, nil)),
 	}
 
 	// Task 5: customer API keys + caller principal resolution. The

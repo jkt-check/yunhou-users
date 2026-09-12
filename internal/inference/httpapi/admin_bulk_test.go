@@ -127,10 +127,13 @@ func newOpsFixture(t *testing.T) *opsFixture {
 	modelsGroup := engine.Group("/adminm", stub, httpapi.OperatorAuthz(store, management.PermModelsManage))
 	bulkH.Register(modelsGroup)
 	usageH.RegisterPreview(modelsGroup)
-	// 既有目录发布面（导入→草稿→发布链路断言用）。
+	// 既有目录发布面（导入→草稿→发布链路断言用）。Task 16：读写两面都挂
+	// （RegisterReadOnly 提供 GET 列表/详情/revisions/active 覆盖路径）。
 	catalogSvc := catalog.NewService(store)
-	httpapi.NewAdminModelsHandler(management.NewCatalogManager(catalogSvc, store,
-		func(context.Context, string) error { return nil })).RegisterWrite(modelsGroup)
+	adminModelsH := httpapi.NewAdminModelsHandler(management.NewCatalogManager(catalogSvc, store,
+		func(context.Context, string) error { return nil }))
+	adminModelsH.RegisterReadOnly(modelsGroup)
+	adminModelsH.RegisterWrite(modelsGroup)
 	usageGroup := engine.Group("/adminu", stub, httpapi.OperatorAuthz(store, management.PermUsageRead))
 	usageH.RegisterRead(usageGroup)
 	billingGroup := engine.Group("/adminb", stub, httpapi.OperatorAuthz(store, management.PermBillingAdjust))

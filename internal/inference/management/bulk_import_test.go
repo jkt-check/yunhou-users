@@ -177,6 +177,134 @@ func (p *probeBulkStore) GetProviderByCode(ctx context.Context, code string) (*d
 	return p.fakeBulkStore.GetProviderByCode(ctx, code)
 }
 
+// --- Task 16 minor ①：批量导入审计与导入效果同事务（RecordTx），审计失败
+// 或记录器无事务能力即整体回滚，绝不落下无审计的目录变更。 ---
+
+type fakeUow struct{ committed, rolledBack bool }
+
+func (u *fakeUow) Commit(ctx context.Context) error   { u.committed = true; return nil }
+func (u *fakeUow) Rollback(ctx context.Context) error { u.rolledBack = true; return nil }
+
+// uowBulkStore is fakeBulkStore with a real (fake) UnitOfWork.
+type uowBulkStore struct {
+	*fakeBulkStore
+	uow *fakeUow
+}
+
+func (s *uowBulkStore) Begin(ctx context.Context) (domain.UnitOfWork, error) { return s.uow, nil }
+
+// txFailRecorder implements AuditTxRecorder and always fails RecordTx.
+type txFailRecorder struct{ err error }
+
+func (r txFailRecorder) Record(ctx context.Context, ev AuditEvent) error { return r.err }
+func (r txFailRecorder) RecordTx(ctx context.Context, w domain.UnitOfWork, ev AuditEvent) error {
+	return r.err
+}
+
+// posthocOnlyRecorder implements only Record (no transactional support).
+type posthocOnlyRecorder struct{}
+
+func (posthocOnlyRecorder) Record(ctx context.Context, ev AuditEvent) error { return nil }
+
+// txSpyRecorder records whether RecordTx ran before Commit.
+type txSpyRecorder struct {
+	uow          *fakeUow
+	txCalls      int
+	committedAtCall bool
+}
+
+func (r *txSpyRecorder) Record(ctx context.Context, ev AuditEvent) error { return nil }
+func (r *txSpyRecorder) RecordTx(ctx context.Context, w domain.UnitOfWork, ev AuditEvent) error {
+	r.txCalls++
+	r.committedAtCall = r.uow.committed
+	return nil
+}
+
+func newUowFixture(t *testing.T) (*uowBulkStore, *fakeUow) {
+	t.Helper()
+	uow := &fakeUow{}
+	return &uowBulkStore{fakeBulkStore: &fakeBulkStore{t: t, allowApply: true}, uow: uow}, uow
+}
+
+func TestBulkImport_AuditInsideTransaction(t *testing.T) {
+	fs, uow := newUowFixture(t)
+	rec := &txSpyRecorder{uow: uow}
+	svc := NewBulkImportService(fs, rec, func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-audit", validBulkDoc(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Committed || !uow.committed || uow.rolledBack {
+		t.Fatalf("commit state: committed=%v uow=%+v", res.Committed, uow)
+	}
+	if rec.txCalls != 1 || rec.committedAtCall {
+		t.Fatalf("audit must run inside the tx before commit: calls=%d committedAtCall=%v",
+			rec.txCalls, rec.committedAtCall)
+	}
+}
+
+func TestBulkImport_AuditTxFailureRollsBack(t *testing.T) {
+	fs, uow := newUowFixture(t)
+	svc := NewBulkImportService(fs, txFailRecorder{err: domain.NewError(domain.CodeInternal, "audit boom")},
+		func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-audit-fail", validBulkDoc(), false)
+	if err == nil || domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("err = %v, want internal", err)
+	}
+	if res != nil || !uow.rolledBack || uow.committed {
+		t.Fatalf("audit failure must roll the import back: res=%+v uow=%+v", res, uow)
+	}
+}
+
+func TestBulkImport_PosthocOnlyRecorderRejected(t *testing.T) {
+	fs, uow := newUowFixture(t)
+	svc := NewBulkImportService(fs, posthocOnlyRecorder{}, func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-audit-posthoc", validBulkDoc(), false)
+	if err == nil || domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("err = %v, want internal (fail-closed)", err)
+	}
+	if res != nil || !uow.rolledBack || uow.committed {
+		t.Fatalf("non-transactional recorder must roll the import back: res=%+v uow=%+v", res, uow)
+	}
+}
+
+// Task 16 minor ⑤：缺 provider 引用的错误文案如实——不再谎称"apply 时解析
+// 既有 provider"。
+func TestBulkImport_MissingProviderMessageTruthful(t *testing.T) {
+	doc := validBulkDoc()
+	doc.Providers = nil // 文档不列 provider，部署引用 glm → 逐项错误
+	svc := NewBulkImportService(&fakeBulkStore{t: t}, nil, func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-msg", doc, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg string
+	for _, it := range res.Items {
+		if it.Kind == BulkKindDeployment && it.Status == BulkItemError {
+			msg = it.Error
+		}
+	}
+	if msg == "" {
+		t.Fatalf("deployment error missing: %+v", res.Items)
+	}
+	if !strings.Contains(msg, "not auto-resolved") || strings.Contains(msg, "resolve at apply time") {
+		t.Fatalf("contradictory message still present: %q", msg)
+	}
+}
+
+// Task 16 minor ⑦：运营列表 limit 钳到 500（不静默回退默认 100）。
+func TestClampOpsLimit(t *testing.T) {
+	for in, want := range map[int]int{
+		0: 100, -7: 100, // 未给/非正 → 默认
+		1: 1, 200: 200, 500: 500, // 范围内原样
+		501: 500, 100000: 500, // 超上限钳到 500（OpenAPI maximum）
+	} {
+		if got := clampOpsLimit(in); got != want {
+			t.Errorf("clampOpsLimit(%d) = %d, want %d", in, got, want)
+		}
+	}
+}
+
 func TestPricingPreview_DiffSets(t *testing.T) {
 	added, removed := diffStringSets([]string{"a", "b", "c"}, []string{"b", "d"})
 	if len(added) != 2 || added[0] != "a" || added[1] != "c" {

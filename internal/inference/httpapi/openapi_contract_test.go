@@ -94,6 +94,7 @@ func TestOpenAPI_ConventionsAndDTOFields(t *testing.T) {
 		"quota_exhausted", "entitlement_expired", "no_active_entitlement",
 		"bundle_gift", "migration_gift", "kaya_membership",
 		"usage_events", // 心跳表不作为用量来源的明确口径
+		"不补零行",       // Task 16 minor ③：运营统计零活动分组缺席的明确声明
 		// Task 14 钱包口径：账本派生、现金/赠送来源隔离、套餐外默认关、PAYG 显式权益。
 		"micromoney", "cash", "bonus", "overage_enabled", "monthly_spend_limit_micros",
 		"topup", "consume", "refund", "reversal", "payg",

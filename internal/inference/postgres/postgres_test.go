@@ -79,6 +79,7 @@ func wipeInference(t *testing.T, db *sqlx.DB) {
 		inference_response_chains,
 		inference_session_bindings, inference_oauth_grants,
 		inference_bulk_imports,
+		inference_audit_log, operator_roles,
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,

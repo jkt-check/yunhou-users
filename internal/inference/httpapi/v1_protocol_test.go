@@ -43,6 +43,20 @@ type v1Fixture struct {
 	account  *domain.BillingAccount
 	keyPlain string
 	keyID    string
+	// bodies records upstream request bodies（Task 16: 转发断言;非阻塞写入）。
+	bodies chan []byte
+}
+
+// lastUpstreamBody returns the most recent upstream request body.
+func (f *v1Fixture) lastUpstreamBody(t *testing.T) string {
+	t.Helper()
+	select {
+	case b := <-f.bodies:
+		return string(b)
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream saw no request")
+		return ""
+	}
 }
 
 func newV1Fixture(t *testing.T) *v1Fixture {
@@ -52,7 +66,7 @@ func newV1Fixture(t *testing.T) *v1Fixture {
 	store := fx.store
 	ctx := context.Background()
 
-	f := &v1Fixture{db: db, store: store, modelID: "glm-4.6"}
+	f := &v1Fixture{db: db, store: store, modelID: "glm-4.6", bodies: make(chan []byte, 16)}
 
 	// --- catalog: published model with a public (never dialed) deployment ---
 	if err := store.InsertModel(ctx, &domain.Model{
@@ -161,6 +175,10 @@ func newV1Fixture(t *testing.T) *v1Fixture {
 	// loopback 是刻意的写路径行为,见 gateway 包测试说明) ---
 	f.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		select {
+		case f.bodies <- body:
+		default:
+		}
 		if strings.Contains(string(body), `"stream":true`) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)

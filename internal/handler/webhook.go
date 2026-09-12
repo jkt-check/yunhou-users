@@ -74,7 +74,11 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 		// Internal errors: 500 so the channel retries per its schedule.
 		// The service layer is responsible for already-known non-actionable
 		// cases (e.g. webhook_for_unknown_order) being written to audit_log
-		// without surfacing as an error.
+		// without surfacing as an error. Exception (评审轮1 C2): a refund for
+		// a payment row we don't have yet deliberately surfaces an error —
+		// the refund may precede the payment-success event, and only a
+		// non-2xx keeps the channel retrying until the out-of-order pair
+		// resolves (the audit row is written either way).
 		log.Printf("webhook: handler error (%s, %s): %v", channel, event.EventType, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "handler error"})
 		return

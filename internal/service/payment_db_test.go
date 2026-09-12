@@ -2116,8 +2116,12 @@ func TestPaymentService_OnWebhook_PaymentFailed_AfterPaid(t *testing.T) {
 }
 
 // TestPaymentService_OnWebhook_Refund_MissingPayment covers the
-// "no payment row" branch in onRefundSucceeded (the handler should
-// no-op rather than error).
+// "no payment row" branch in onRefundSucceeded (评审轮1 C2): the refund
+// event may arrive BEFORE the payment-success event (channel out-of-order
+// delivery). The handler must return an error — the webhook handler maps
+// it to 500 and the channel retries per its schedule — instead of acking
+// 200 (which would mark the event processed and permanently drop the
+// refund once the payment lands). The audit row is still written.
 func TestPaymentService_OnWebhook_Refund_MissingPayment(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
@@ -2127,8 +2131,30 @@ func TestPaymentService_OnWebhook_Refund_MissingPayment(t *testing.T) {
 		TransactionID: "pi-rf-nopay-" + mustNewUUID()[:8], RefundAmount: 1, ExternalRefundID: "re_nopay",
 		RawPayload: json.RawMessage(`{}`),
 	})
-	if err != nil {
-		t.Errorf("missing-payment refund should not error, got: %v", err)
+	if err == nil {
+		t.Fatal("missing-payment refund must return an error so the channel retries (C2)")
+	}
+	if !strings.Contains(err.Error(), "unknown payment") {
+		t.Errorf("err = %q, want the unknown-payment signal", err.Error())
+	}
+	// 审计痕照留（writeAudit 独立提交，不随业务事务回滚）。
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unknown_payment'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("audit rows = %d, want 1", n)
+	}
+	// 事件行保留 processed_at=NULL：渠道重投同一 event_id 时会重跑业务动作
+	// （OnWebhook dedup 分支 b），而不是被当作已处理直接 ack。
+	var processed *time.Time
+	if err := db.GetContext(context.Background(), &processed,
+		`SELECT processed_at FROM webhook_events WHERE channel = 'stripe' ORDER BY received_at DESC LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	if processed != nil {
+		t.Errorf("webhook event must stay unprocessed after the error, got %v", processed)
 	}
 }
 

@@ -272,6 +272,103 @@ func TestWalletTopup_RefundGuardPaidOnly(t *testing.T) {
 	}
 }
 
+// TestWalletTopup_RefundArrivesBeforePayment_OutOfOrder: 评审轮1 C2 端到端
+// 乱序——退款事件先于支付成功事件到达：第一次投递查无支付行 → 返回错误
+// （handler 映射 500 → 渠道重投）；支付成功随后入队钱包充值；渠道重投同一
+// 退款事件 → 命中支付行入队钱包退款。worker 消费后钱包先充后退、净额正确。
+func TestWalletTopup_RefundArrivesBeforePayment_OutOfOrder(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	store := inferencepostgres.NewStore(db)
+	svc.SetBenefitRepo(repo.NewPlanBenefitRepo(db))
+	svc.SetBenefitSync(store)
+	ctx := context.Background()
+
+	seedTopupPlan(t, db, "topup-ooo", 50.00)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(ctx, uid, "topup-ooo", "stripe")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 退款先到：查无支付行 → 错误（非 2xx 语义，渠道将重投）。
+	refund := WebhookEvent{
+		Channel: "stripe", EventID: "evt-ooo-ref", EventType: "charge.refunded",
+		TransactionID: "pi_ooo", OrderID: order.ID, Amount: 50.00, Currency: "CNY",
+		RefundAmount: 50.00, ExternalRefundID: "re_ooo",
+		RawPayload: json.RawMessage(`{"id":"evt-ooo-ref"}`),
+	}
+	if _, err := svc.OnWebhook(ctx, refund); err == nil {
+		t.Fatal("refund before payment must return an error so the channel retries")
+	}
+	if n := walletOutboxCount(t, db); n != 0 {
+		t.Fatalf("wallet.sync outbox = %d before payment, want 0", n)
+	}
+
+	// 2. 支付成功到达：照常入队钱包充值。
+	if _, err := svc.OnWebhook(ctx, stripePaidEvent(order.ID, "evt-ooo-pay", "pi_ooo", 50.00)); err != nil {
+		t.Fatalf("webhook paid: %v", err)
+	}
+
+	// 3. 渠道重投同一退款事件（同 event_id；processed_at=NULL → dedup 分支
+	//    重跑业务动作）→ 这次命中支付行，入队钱包退款。
+	if _, err := svc.OnWebhook(ctx, refund); err != nil {
+		t.Fatalf("redelivered refund must succeed once the payment row exists: %v", err)
+	}
+	if n := walletOutboxCount(t, db); n != 2 { // 1 topup + 1 refund
+		t.Fatalf("wallet.sync outbox = %d, want 2 (topup + refund)", n)
+	}
+
+	// 4. worker 消费：先充 50 后退 50，净额 0，且严格非负拆分/不双花。
+	w := workers.NewWalletSync(store, nil, workers.EntitlementSyncConfig{})
+	stats, err := w.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Credited != 1 || stats.Refunded != 1 {
+		t.Fatalf("worker stats = %+v, want 1 credited / 1 refunded", stats)
+	}
+	acct, err := store.GetBillingAccountByUser(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.WalletBalance(ctx, acct.ID, "CNY", order.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Balance.CashAvailable != 0 || view.Balance.BonusAvailable != 0 {
+		t.Fatalf("wallet = %+v, want net 0 (先充后退)", view.Balance)
+	}
+}
+
+// TestWalletTopup_RefundPaymentNeverArrives: 支付成功事件永不到达时，退款
+// 事件每次投递都持续返回错误（本测试只断言错误语义；最终一致性依赖渠道的
+// 重投窗口——窗口内支付到达则乱序自愈，窗口外审计行
+// webhook_refund_unknown_payment 给运营人工介入信号）。
+func TestWalletTopup_RefundPaymentNeverArrives(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	for i, eventID := range []string{"evt-never-1", "evt-never-2"} {
+		_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+			Channel: "stripe", EventID: eventID, EventType: "charge.refunded",
+			TransactionID: "pi_never_arrives", RefundAmount: 10.00, ExternalRefundID: "re_never",
+			RawPayload: json.RawMessage(`{}`),
+		})
+		if err == nil {
+			t.Fatalf("delivery %d: refund for a payment that never arrives must keep returning an error", i+1)
+		}
+	}
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unknown_payment'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("audit rows = %d, want 2 (每次投递都留审计痕)", n)
+	}
+}
+
 // activeSubForMaybe is the nil-tolerant variant of activeSubFor.
 func activeSubForMaybe(t *testing.T, db *sqlx.DB, userID, product string) *struct{} {
 	t.Helper()

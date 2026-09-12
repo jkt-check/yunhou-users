@@ -2170,11 +2170,19 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE
 	`, e.Channel, e.TransactionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return s.writeAudit(ctx, "service", "webhook_refund_unknown_payment",
+			// 评审轮1 C2：退款事件可能先于支付成功事件到达（渠道乱序投递）。
+			// 审计照留（writeAudit 独立连接提交，不随本事务回滚），但必须返回
+			// 错误让 handler 映射为非 2xx —— 渠道按其重投计划再次投递；ack
+			// 200 会让 OnWebhook 标记 processed、渠道不再重投，之后支付成功
+			// 照常给钱包充值而退款永久丢失（双花）。
+			if aerr := s.writeAudit(ctx, "service", "webhook_refund_unknown_payment",
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "unknown_payment"},
 				map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID, "event_id": e.EventID},
-			)
+			); aerr != nil {
+				return fmt.Errorf("write audit: %w", aerr)
+			}
+			return fmt.Errorf("refund for unknown payment (channel=%s txn=%s): payment success event not processed yet — returning an error so the channel retries", e.Channel, e.TransactionID)
 		}
 		return fmt.Errorf("find payment: %w", err)
 	}

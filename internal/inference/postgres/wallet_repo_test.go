@@ -888,6 +888,53 @@ func TestPAYGEntitlement_ExplicitRecord(t *testing.T) {
 	}
 }
 
+// 评审轮1 M3：EnsurePAYGEntitlementTx 持 tx 期间的配置/既有权益读取必须
+// 走同一连接——连接池只剩 1 个连接时（旧实现用 s.db 第二连接会等不到连
+// 接而死锁）全流程仍须完成。
+func TestPAYGEntitlement_SingleConnectionPool(t *testing.T) {
+	db, s := testDB(t)
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'published' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutPAYGConfig(ctx, f.policyID, []string{f.modelID}, "user:ops@app:test"); err != nil {
+		t.Fatal(err)
+	}
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent, err := s.EnsurePAYGEntitlementTx(ctx, uow, f.accountID, time.Now().UTC())
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatalf("single-connection ensure: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ent.Status != domain.EntitlementActive {
+		t.Fatalf("entitlement = %+v", ent)
+	}
+	// 已存在权益的读取路径（existing 分支）同样在单连接下完成。
+	uow2, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent2, err := s.EnsurePAYGEntitlementTx(ctx, uow2, f.accountID, time.Now().UTC())
+	if err != nil {
+		_ = uow2.Rollback(ctx)
+		t.Fatalf("single-connection re-ensure: %v", err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ent2.ID != ent.ID {
+		t.Fatalf("re-ensure = %s, want %s", ent2.ID, ent.ID)
+	}
+}
+
 // TestWalletAuditTrail: 开启/关闭/改上限全部写审计行（裁决 4）。
 func TestWalletAuditTrail(t *testing.T) {
 	_, s := testDB(t)

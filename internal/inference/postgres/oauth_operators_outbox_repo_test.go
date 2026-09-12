@@ -43,6 +43,71 @@ func seedOAuthChain(t *testing.T, s *Store, connector string, expiresAt *time.Ti
 	return prov.ID, cred.ID, acct.ID
 }
 
+// 评审轮1 M2：部分观测快照不得抹掉已知字段——只带 remaining 的探测落库
+// 后，已知的 limit/耗尽视图必须保留（COALESCE($n, 旧值) 口径）。
+func TestUpdateUpstreamAccountQuota_PartialSnapshotKeepsKnownFields(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	_, _, acctID := seedOAuthChain(t, s, "vendor-x", nil)
+
+	t1 := time.Now().UTC()
+	lim := domain.Microcredit(1000)
+	rem := domain.Microcredit(800)
+	src := "reported"
+	ok, err := s.UpdateUpstreamAccountQuota(ctx, acctID, domain.UpstreamQuota{
+		LimitMicros: &lim, RemainingMicros: &rem, ObservedAt: &t1, Source: &src,
+	})
+	if err != nil || !ok {
+		t.Fatalf("full snapshot = %v/%v", ok, err)
+	}
+
+	// 部分快照：只带 remaining=0（耗尽观测），不带 limit/source。
+	t2 := t1.Add(time.Minute)
+	zero := domain.Microcredit(0)
+	ok, err = s.UpdateUpstreamAccountQuota(ctx, acctID, domain.UpstreamQuota{
+		RemainingMicros: &zero, ObservedAt: &t2,
+	})
+	if err != nil || !ok {
+		t.Fatalf("partial snapshot = %v/%v", ok, err)
+	}
+	var gotLim, gotRem *int64
+	var gotSrc *string
+	if err := s.db.QueryRow(
+		`SELECT quota_limit_micros, quota_remaining_micros, quota_source
+		 FROM inference_upstream_accounts WHERE id = $1`, acctID).
+		Scan(&gotLim, &gotRem, &gotSrc); err != nil {
+		t.Fatal(err)
+	}
+	if gotLim == nil || *gotLim != 1000 {
+		t.Errorf("limit = %v, want 1000 preserved (部分快照不得清空已知字段)", gotLim)
+	}
+	if gotRem == nil || *gotRem != 0 {
+		t.Errorf("remaining = %v, want 0 (partial observation lands its own fields)", gotRem)
+	}
+	if gotSrc == nil || *gotSrc != "reported" {
+		t.Errorf("source = %v, want reported preserved", gotSrc)
+	}
+
+	// 对称：只带 limit 的快照不清空已知 remaining=0 的耗尽状态。
+	t3 := t2.Add(time.Minute)
+	lim2 := domain.Microcredit(2000)
+	ok, err = s.UpdateUpstreamAccountQuota(ctx, acctID, domain.UpstreamQuota{
+		LimitMicros: &lim2, ObservedAt: &t3,
+	})
+	if err != nil || !ok {
+		t.Fatalf("limit-only snapshot = %v/%v", ok, err)
+	}
+	if err := s.db.QueryRow(
+		`SELECT quota_limit_micros, quota_remaining_micros
+		 FROM inference_upstream_accounts WHERE id = $1`, acctID).
+		Scan(&gotLim, &gotRem); err != nil {
+		t.Fatal(err)
+	}
+	if gotLim == nil || *gotLim != 2000 || gotRem == nil || *gotRem != 0 {
+		t.Errorf("limit-only snapshot: limit=%v remaining=%v, want 2000/0 (耗尽状态不被抹掉)", gotLim, gotRem)
+	}
+}
+
 func TestOAuthGrant_ConsumeOnceAndExpiry(t *testing.T) {
 	_, s := testDB(t)
 	ctx := context.Background()

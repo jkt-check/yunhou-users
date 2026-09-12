@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -243,6 +244,26 @@ func mustField(raw json.RawMessage, key string) json.RawMessage {
 		panic(err)
 	}
 	return m[key]
+}
+
+// 评审轮1 M4：带外部 cause 的 domain 错误经 fail() 映射为 4xx 时，响应只
+// 含 Message 部分，不得拼出 cause 链（DB/厂商内部细节不进 4xx 响应）。
+func TestAdminFail_StripsCauseChainFrom4xx(t *testing.T) {
+	engine := newTestServer(t)
+
+	// 引用不存在模型的 route：CreateRoute 产 WrapError(invalid_input,
+	// "route references unknown model ...", <store not_found cause>)。
+	env := do(t, engine, http.MethodPost, "/admin/models/ghost-model/routes", map[string]any{
+		"deployment_id": "00000000-0000-0000-0000-000000000000", "weight": 1, "enabled": true,
+	}, http.StatusBadRequest)
+	if env.Message != "route references unknown model ghost-model" {
+		t.Errorf("message = %q, want only the domain Message (no cause chain)", env.Message)
+	}
+	for _, leak := range []string{"not_found", "sql", "inference/"} {
+		if strings.Contains(env.Message, leak) {
+			t.Errorf("message %q leaks cause-chain fragment %q", env.Message, leak)
+		}
+	}
 }
 
 // TestAdminDeploymentConfigHeadersRejected: the extension config may carry

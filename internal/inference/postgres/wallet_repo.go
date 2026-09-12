@@ -963,6 +963,27 @@ func (s *Store) GetPAYGConfig(ctx context.Context) (*PAYGConfig, error) {
 	}, nil
 }
 
+// getPAYGConfigTx is GetPAYGConfig on the caller's transaction — callers
+// already holding a tx must read through it (评审轮1 M3：持 tx 期间用 s.db
+// 第二连接读配置在池饱和时可死锁).
+func (s *Store) getPAYGConfigTx(ctx context.Context, tx *sqlx.Tx) (*PAYGConfig, error) {
+	var row struct {
+		ID              string         `db:"id"`
+		PolicyVersionID string         `db:"policy_version_id"`
+		ModelIDs        pq.StringArray `db:"model_ids"`
+		UpdatedBy       string         `db:"updated_by"`
+		UpdatedAt       time.Time      `db:"updated_at"`
+	}
+	if err := tx.GetContext(ctx, &row,
+		`SELECT * FROM inference_payg_config WHERE id = 'default'`); err != nil {
+		return nil, mapError("get payg config", err)
+	}
+	return &PAYGConfig{
+		PolicyVersionID: row.PolicyVersionID, ModelIDs: []string(row.ModelIDs),
+		UpdatedBy: row.UpdatedBy, UpdatedAt: row.UpdatedAt,
+	}, nil
+}
+
 // PutPAYGConfig publishes the PAYG default. The policy version must exist
 // and be published (没有配置的商品保持不可购买，设计 §4.3).
 func (s *Store) PutPAYGConfig(ctx context.Context, policyVersionID string, modelIDs []string, updatedBy string) (*PAYGConfig, error) {
@@ -1013,12 +1034,14 @@ func (s *Store) EnsurePAYGEntitlementTx(ctx context.Context, w domain.UnitOfWork
 	if err := lockAccountTx(ctx, tx, accountID); err != nil {
 		return nil, err
 	}
-	cfg, err := s.GetPAYGConfig(ctx)
+	// 评审轮1 M3：配置与既有权益都经同一 tx 读（不得用 s.db 第二连接——
+	// 池饱和时第二连接等待即死锁）。
+	cfg, err := s.getPAYGConfigTx(ctx, tx)
 	if err != nil {
 		return nil, err // CodeNotFound: 运营未发布 PAYG 配置 → 不可开启
 	}
 	srcID := accounting.PAYGEntitlementSourceID(accountID)
-	existing, err := s.GetLatestEntitlementBySource(ctx, domain.SourcePAYG, srcID)
+	existing, err := s.getLatestEntitlementBySourceTx(ctx, tx, domain.SourcePAYG, srcID)
 	if err == nil {
 		if existing.Status == domain.EntitlementActive {
 			return existing, nil
@@ -1042,8 +1065,8 @@ func (s *Store) EnsurePAYGEntitlementTx(ctx context.Context, w domain.UnitOfWork
 	ent.BillingAccountID = accountID
 	if err := s.InsertEntitlementTx(ctx, w, ent); err != nil {
 		if domain.CodeOf(err) == domain.CodeConflict {
-			// 并发开启撞唯一键：读回赢家。
-			return s.GetLatestEntitlementBySource(ctx, domain.SourcePAYG, srcID)
+			// 并发开启撞唯一键：读回赢家（同 tx，M3）。
+			return s.getLatestEntitlementBySourceTx(ctx, tx, domain.SourcePAYG, srcID)
 		}
 		return nil, err
 	}

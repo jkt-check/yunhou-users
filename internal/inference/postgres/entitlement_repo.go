@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 
 	"github.com/yunhou/users/internal/inference/domain"
@@ -101,6 +102,22 @@ func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e 
 func (s *Store) GetLatestEntitlementBySource(ctx context.Context, sourceType domain.EntitlementSource, sourceID string) (*domain.Entitlement, error) {
 	var row entitlementRow
 	err := s.db.GetContext(ctx, &row,
+		`SELECT * FROM inference_entitlements
+		 WHERE source_type = $1 AND source_id = $2
+		 ORDER BY revision DESC, created_at DESC
+		 LIMIT 1`, string(sourceType), sourceID)
+	if err != nil {
+		return nil, mapError("get entitlement by source", err)
+	}
+	return row.toDomain(), nil
+}
+
+// getLatestEntitlementBySourceTx is GetLatestEntitlementBySource on the
+// caller's transaction (评审轮1 M3：持 tx 期间不得用 s.db 第二连接读——池
+// 饱和时第二连接等不到可用连接即死锁).
+func (s *Store) getLatestEntitlementBySourceTx(ctx context.Context, tx *sqlx.Tx, sourceType domain.EntitlementSource, sourceID string) (*domain.Entitlement, error) {
+	var row entitlementRow
+	err := tx.GetContext(ctx, &row,
 		`SELECT * FROM inference_entitlements
 		 WHERE source_type = $1 AND source_id = $2
 		 ORDER BY revision DESC, created_at DESC

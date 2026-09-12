@@ -1013,6 +1013,47 @@ func TestConcurrencyLease_AcquiredAndReleased(t *testing.T) {
 	}
 }
 
+// 评审轮1 M1：非流式 dispatch 期间账户级租约也随 dispatch keeper 续租
+// （旧行为只有流式 streamKeeper 续租账户租约——非流式长 dispatch 里账户
+// 租约等 TTL 自然到期，与流式不对称）。策略并发上限触发账户租约；账户
+// 租约初始 expires_at = acquired + AccountLeaseTTL(10m)，dispatch keeper
+// 以 routing TTL 续租会重写 expires_at —— 以此作为续租发生的证据。
+func TestNonStreamDispatch_RenewsAccountLease(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		time.Sleep(150 * time.Millisecond) // dispatch 跨越多个续租周期
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-m1","object":"chat.completion","created":1,
+			"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`)
+	})
+	f := newFixture(t, up)
+	conc := 1
+	if _, err := f.db.Exec(`UPDATE inference_policy_versions SET concurrency_limit = $1 WHERE id = $2`, conc, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	f.routing.LeaseTTL = 50 * time.Millisecond // 续租间隔 TTL/3 ≈ 17ms
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi")); err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	var state string
+	var acquired, expires time.Time
+	if err := f.db.QueryRow(
+		`SELECT state, acquired_at, expires_at FROM inference_concurrency_leases WHERE scope = 'billing_account'`).
+		Scan(&state, &acquired, &expires); err != nil {
+		t.Fatal(err)
+	}
+	// 修复前非流式路径账户租约从不续租：expires_at 恒为 acquired+10m。续租
+	// 发生后被改写为 续租时刻+50ms ≪ acquired+9m。
+	if expires.After(acquired.Add(9 * time.Minute)) {
+		t.Errorf("account lease expires_at = %s (acquired %s): no renewal happened during non-stream dispatch (M1)", expires, acquired)
+	}
+	if state != "released" {
+		t.Errorf("account lease state = %s, want released after settle (request-scoped, never per attempt)", state)
+	}
+}
+
 // Anthropic 上游:流式翻译成 OpenAI 形状,usage 来自 message_delta,正常结算。
 func TestAnthropicUpstream_StreamTranslatedAndSettled(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {

@@ -6,6 +6,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -286,7 +287,22 @@ func fail(c *gin.Context, err error) {
 		c.JSON(status, gin.H{"code": status, "data": nil, "message": "internal error"})
 		return
 	}
-	c.JSON(status, gin.H{"code": status, "data": nil, "message": err.Error()})
+	// 评审轮1 M4：非 500 分支只输出 domain.Error 的 Message——err.Error()
+	// 会拼上完整 cause 链（厂商 256 字节响应体、DB 约束名等内部细节会进
+	// 4xx 响应）；与 /v1 safeMsg 同口径。QuotaExceededError 的 Error() 只含
+	// 窗口类别名（无 cause 链），原样输出保留排障信息。
+	var de *domain.Error
+	var qe *domain.QuotaExceededError
+	switch {
+	case errors.As(err, &de):
+		c.JSON(status, gin.H{"code": status, "data": nil, "message": de.Message})
+	case errors.As(err, &qe):
+		c.JSON(status, gin.H{"code": status, "data": nil, "message": qe.Error()})
+	default:
+		// 纯 errors.New 的非 domain 错误落在 4xx 是不可能的（CodeOf 兜底
+		// CodeInternal → 500 已脱敏）；防御性固定文案。
+		c.JSON(status, gin.H{"code": status, "data": nil, "message": "request failed"})
+	}
 }
 
 // actorOf extracts the operator attribution set by the Task 4 authorization

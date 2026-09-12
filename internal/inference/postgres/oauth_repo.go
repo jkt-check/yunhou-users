@@ -267,12 +267,18 @@ func (s *Store) SetUpstreamAccountsStatusByCredentialTx(ctx context.Context, w d
 // overwrites a newer one (健康任务乱序/重试不得回拨额度视图). Passing nil
 // fields keeps "unknown" unknown (设计 §8). 审查修复 M-3：ObservedAt=nil
 // 的写入只允许在"尚无已知观测"时落库——已有观测的行拒绝被无时间戳的写
-// 入覆盖（无观测时刻的快照不是有效观测）。
+// 入覆盖（无观测时刻的快照不是有效观测）。评审轮1 M2：每列
+// COALESCE($n, 旧值)——部分观测（只带了其中几项的快照）不得把已知字段
+// 抹回 NULL（例如只带 remaining 的探测不得清空已知的 limit/耗尽视图），
+// 与上面注释的"unknown 保持 unknown/已知不被无观测覆盖"口径一致。
 func (s *Store) UpdateUpstreamAccountQuota(ctx context.Context, id string, q domain.UpstreamQuota) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE inference_upstream_accounts
-		    SET quota_limit_micros = $2::bigint, quota_remaining_micros = $3::bigint,
-		        quota_observed_at = $4::timestamptz, quota_source = $5::text, quota_reset_at = $6::timestamptz,
+		    SET quota_limit_micros = COALESCE($2::bigint, quota_limit_micros),
+		        quota_remaining_micros = COALESCE($3::bigint, quota_remaining_micros),
+		        quota_observed_at = COALESCE($4::timestamptz, quota_observed_at),
+		        quota_source = COALESCE($5::text, quota_source),
+		        quota_reset_at = COALESCE($6::timestamptz, quota_reset_at),
 		        updated_at = now()
 		  WHERE id = $1
 		    AND (($4::timestamptz IS NOT NULL

@@ -681,12 +681,15 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 		timeout = 10 * time.Minute
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-	// The keeper renews the UPSTREAM lease while the dispatch is in flight
-	// (a renewal conflict fences the attempt — the stream guard then stops
-	// the upstream call). The billing-account lease lives for the WHOLE
-	// request: it joins the keeper only on the streaming success path and
-	// is released by the finalizer (settle/release), never per attempt.
-	keeper := s.routingSvc.NewLeaseKeeper(lease)
+	// The keeper renews BOTH leases while the dispatch is in flight (评审轮1
+	// M1: the billing-account lease is request-scoped and must be renewed on
+	// the non-streaming path too — previously only the streaming path renewed
+	// it via the stream keeper, an asymmetric lapse window). A renewal
+	// conflict fences the attempt — the stream guard then stops the upstream
+	// call. Neither lease is released by the keeper: the upstream lease ends
+	// per attempt (explicit release below), the account lease is released by
+	// the finalizer (settle/release), never per attempt.
+	keeper := s.routingSvc.NewLeaseKeeper(lease, adm.AccountLease)
 
 	disp, err := providers.Dispatch(attemptCtx, s.client, adapter, &providers.Call{
 		Deployment:   &cand.Deployment,
@@ -698,9 +701,10 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	})
 	if err != nil {
 		cancel()
-		kstop, kcancel := detached(settleTimeout)
-		keeper.Stop(kstop)
-		kcancel()
+		// Pause (no release): the account lease survives for the retry/
+		// finalizer; only the attempt-scoped upstream lease is released
+		// (releaseLease below / inside failAttempt).
+		keeper.Pause()
 		var de *providers.DispatchError
 		if !errorsAsDispatch(err, &de) {
 			// Build-time shape error (invalid_input): nothing was sent.
@@ -756,13 +760,24 @@ func (s *Service) persistAttempt(ctx context.Context, a *domain.Attempt, cand ro
 }
 
 // onNonStreamDispatch settles immediately and returns the payload. Both
-// leases end with the request: upstream via the keeper, account explicitly.
+// leases end with the request: upstream explicitly after the keeper pauses,
+// account by the finalizer below.
 func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
 	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
 	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
 	cancel()
 	kctx, kcancel := detached(settleTimeout)
-	keeper.Stop(kctx)
+	// Pause (no release), then release ONLY the attempt-scoped upstream
+	// lease; the account lease stays held until the finalizer below (M1).
+	keeper.Pause()
+	for _, l := range keeper.Leases() {
+		if adm.AccountLease != nil && l.ID == adm.AccountLease.ID {
+			continue
+		}
+		if err := s.routingSvc.ReleaseLease(kctx, l); err != nil {
+			log.Printf("gateway: release upstream lease %s: %v", l.ID, err)
+		}
+	}
 	kcancel()
 	s.finishAttempt(attempt.ID, "completed", "", disp.UpstreamRequestID)
 	if err := s.store.UpdateRequestStatus(context.Background(), requestID, domain.ReqNonStreaming, ""); err != nil {
@@ -802,14 +817,11 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 		log.Printf("gateway: mark streaming %s: %v", requestID, err)
 	}
 	// The dispatch keeper pauses WITHOUT releasing; the stream keeper takes
-	// over both leases for the whole stream lifetime (account lease is
-	// request-scoped, not attempt-scoped).
+	// over both leases for the whole stream lifetime (the dispatch keeper
+	// already carries the request-scoped account lease since M1 — do NOT
+	// append it twice).
 	keeper.Pause()
-	streamLeases := keeper.Leases()
-	if adm.AccountLease != nil {
-		streamLeases = append(streamLeases, adm.AccountLease)
-	}
-	streamKeeper := s.routingSvc.NewLeaseKeeper(streamLeases...)
+	streamKeeper := s.routingSvc.NewLeaseKeeper(keeper.Leases()...)
 	body := &StreamBody{
 		tap:    disp.Stream.Tap,
 		cancel: cancel,

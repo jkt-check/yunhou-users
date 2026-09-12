@@ -455,6 +455,141 @@ func TestMarkReconciliationRequired(t *testing.T) {
 	}
 }
 
+// 评审轮1 I2：mark 与并发成功 settle 交错——终态绝不被覆盖。settle 先提交
+// 后 MarkReconciliationRequired 必须静默收敛：status 保持 settled、
+// usage_status 不被改回 unknown、不入队核对任务。
+func TestMarkReconciliationRequired_TerminalGuard(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	reqID, _ := settledRequest(t, s, f, w5, ww, wm, 100_000, 42_000)
+
+	deadline := time.Now().UTC().Add(24 * time.Hour)
+	uow, _ := s.Begin(ctx)
+	if err := s.MarkReconciliationRequired(ctx, uow, reqID, "unknown_usage", deadline); err != nil {
+		t.Fatalf("mark over a settled request must converge silently: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	req, err := s.GetRequest(ctx, reqID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqSettled {
+		t.Errorf("status = %q, want settled (终态不被覆盖)", req.Status)
+	}
+	if req.UsageStatus != domain.UsageReported {
+		t.Errorf("usage_status = %q, want reported (不被改回 unknown)", req.UsageStatus)
+	}
+	var jobs int
+	if err := s.db.Get(&jobs,
+		`SELECT COUNT(*) FROM inference_reconciliation_jobs WHERE request_id = $1`, reqID); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 {
+		t.Errorf("jobs = %d, want 0 (终态请求不入队任务)", jobs)
+	}
+
+	// released 终态同样收敛。
+	uow2, _ := s.Begin(ctx)
+	adm2, err := s.Reserve(ctx, uow2, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Release(ctx, uow2, adm2.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkReconciliationRequired(ctx, uow2, adm2.RequestID, "unknown_usage", deadline); err != nil {
+		t.Fatalf("mark over a released request must converge silently: %v", err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	req2, err := s.GetRequest(ctx, adm2.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req2.Status != domain.ReqReleased {
+		t.Errorf("status = %q, want released (终态不被覆盖)", req2.Status)
+	}
+
+	// 请求不存在仍是调用方 bug → NotFound。
+	uow3, _ := s.Begin(ctx)
+	err = s.MarkReconciliationRequired(ctx, uow3, uuid.NewString(), "unknown_usage", deadline)
+	_ = uow3.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("missing request: err = %v, want not_found", err)
+	}
+}
+
+// 评审轮1 I2（任务 CASE 守卫）：已 resolved 的任务不被同理由投递无条件
+// 重开；新理由（新证据）才重开为 pending。
+func TestMarkReconciliationRequired_JobReopenGuard(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().UTC().Add(24 * time.Hour)
+	if err := s.MarkReconciliationRequired(ctx, uow, adm.RequestID, "unknown_usage", deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var jobID string
+	if err := s.db.Get(&jobID,
+		`SELECT id FROM inference_reconciliation_jobs WHERE request_id = $1`, adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResolveReconciliationJob(ctx, jobID, "manually verified"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 同理由重投：请求重新入核对状态，但任务保持 resolved（不无条件重开）。
+	uow2, _ := s.Begin(ctx)
+	if err := s.MarkReconciliationRequired(ctx, uow2, adm.RequestID, "unknown_usage", deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := s.db.Get(&status,
+		`SELECT status FROM inference_reconciliation_jobs WHERE id = $1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "resolved" {
+		t.Errorf("job status = %q after same-reason re-mark, want resolved (不无条件重开)", status)
+	}
+
+	// 新理由（新证据）→ 重开为 pending 并换理由。
+	uow3, _ := s.Begin(ctx)
+	if err := s.MarkReconciliationRequired(ctx, uow3, adm.RequestID, "crash_recovery", deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow3.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var reason string
+	if err := s.db.QueryRow(
+		`SELECT status, reason FROM inference_reconciliation_jobs WHERE id = $1`, jobID).
+		Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || reason != "crash_recovery" {
+		t.Errorf("job = %s/%s after new-reason mark, want pending/crash_recovery (新证据重开)", status, reason)
+	}
+}
+
 // mustTx unwraps the shared tx for test-only direct writes.
 func mustTx(t *testing.T, w domain.UnitOfWork) *sqlx.Tx {
 	t.Helper()

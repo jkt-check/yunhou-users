@@ -40,6 +40,36 @@ func TestSplitFreeze_InsufficientBalance(t *testing.T) {
 	}
 }
 
+// 评审轮1 I1：派生余额为负（冲正已消费的 bonus 充值等诚实账本形态）时，
+// 拆分两侧钳到零下界——不得产出负数拆分撞 hold CHECK 把现金充足的客户
+// 全部 400；负缺口继续压总额度（raw 合计口径，不超扣）。
+func TestSplitFreeze_NegativeDerivedBalancesClamp(t *testing.T) {
+	// bonus 为负、现金充足：冻结成功，拆分非负，现金足额扣。
+	cash, bonus, err := SplitFreeze(-300, 500, 200)
+	if err != nil {
+		t.Fatalf("negative bonus with ample cash must freeze: %v", err)
+	}
+	if bonus != 0 || cash != 200 {
+		t.Fatalf("want bonus=0 cash=200, got bonus=%d cash=%d", bonus, cash)
+	}
+	// 负缺口压总可用量：-300 + 500 = 200，冻 201 必须拒绝（不超扣）。
+	if _, _, err := SplitFreeze(-300, 500, 201); !errors.Is(err, ErrInsufficientBalance) {
+		t.Fatalf("negative deficit must still gate the total, got %v", err)
+	}
+	// cash 为负（退款后消费）、bonus 充足：对称钳零。
+	cash, bonus, err = SplitFreeze(500, -100, 400)
+	if err != nil {
+		t.Fatalf("negative cash with ample bonus must freeze: %v", err)
+	}
+	if bonus != 400 || cash != 0 {
+		t.Fatalf("want bonus=400 cash=0, got bonus=%d cash=%d", bonus, cash)
+	}
+	// 两侧皆负 → 永远不足。
+	if _, _, err := SplitFreeze(-1, -1, 1); !errors.Is(err, ErrInsufficientBalance) {
+		t.Fatalf("both negative must be insufficient, got %v", err)
+	}
+}
+
 func TestSplitConsume_WithinHold(t *testing.T) {
 	// hold: cash=100 bonus=300；charge=250 → bonus 250, cash 0
 	cash, bonus, extra, err := SplitConsume(100, 300, 250)

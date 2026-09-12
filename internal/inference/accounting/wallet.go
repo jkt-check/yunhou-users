@@ -154,12 +154,26 @@ func ReversalOf(orig WalletEntrySpec) (WalletEntrySpec, error) {
 // bonus first, then cash (赠送优先消耗，现金留作可退). The composition is
 // persisted on the hold row; settlement and release follow it exactly.
 // available figures are the DERIVED balances (ledger sums minus held).
+// A derived balance can legitimately be NEGATIVE (e.g. a reversal of an
+// already-consumed bonus credit, or a cash refund landing after the funds
+// were spent — 不隐藏负差额); the split must then clamp the negative side
+// to zero instead of producing a negative component that violates the hold
+// row CHECK and hard-blocks every admission with a 400 (评审轮1 I1). The
+// negative deficit stays visible in the derived balance and is filled by
+// later credits; the total-availability gate below already accounts it
+// (negative bonus reduces what can be frozen from cash).
 func SplitFreeze(bonusAvailable, cashAvailable, amount int64) (cash, bonus int64, err error) {
 	if amount <= 0 {
 		return 0, 0, domain.WrapError(domain.CodeInvalidInput, "accounting: freeze amount must be > 0", domain.ErrNegativeValue)
 	}
 	if bonusAvailable+cashAvailable < amount {
 		return 0, 0, ErrInsufficientBalance
+	}
+	if bonusAvailable < 0 {
+		bonusAvailable = 0
+	}
+	if cashAvailable < 0 {
+		cashAvailable = 0
 	}
 	bonus = min(amount, bonusAvailable)
 	cash = amount - bonus

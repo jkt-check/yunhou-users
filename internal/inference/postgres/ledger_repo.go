@@ -267,6 +267,13 @@ func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 // usage_status='unknown' — a parked request has NO persisted metering fact
 // (usage records only ever commit inside Settle), so unknown is the honest
 // ledger-level state until recovery settles or corrects it.
+//
+// 评审轮1 I2 终态守卫：mark 与并发成功 settle 交错时绝不覆盖终态——UPDATE
+// 带 status NOT IN ('settled','released') 谓词，0 行且请求存在 = 已被并发
+// 终态化，静默收敛（与 Release 的对称守卫同口径）：不覆盖 status、不把
+// usage_status 改回 unknown、也不入队任务。任务 upsert 复用
+// EnqueueReconciliationJobTx 的 CASE 语义：resolved/escalated 的任务不被
+// 同理由投递无条件重开，只有新理由（新证据）才重开为 pending。
 func (s *Store) MarkReconciliationRequired(ctx context.Context, w domain.UnitOfWork, requestID string, reason string, deadline time.Time) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -275,23 +282,28 @@ func (s *Store) MarkReconciliationRequired(ctx context.Context, w domain.UnitOfW
 	res, err := tx.ExecContext(ctx,
 		`UPDATE inference_requests
 		 SET status = $2, usage_status = 'unknown', last_error = $3, updated_at = now()
-		 WHERE id = $1`,
+		 WHERE id = $1 AND status NOT IN ('settled','released')`,
 		requestID, string(domain.ReqReconciliationRequired), reason)
 	if err != nil {
 		return mapError("mark reconciliation", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return mapError("mark reconciliation", sql.ErrNoRows)
+		// 已被并发终态化（settle/release 先提交）→ 静默收敛；请求不存在才
+		// 是调用方 bug，按 NotFound 报错。
+		var exists bool
+		if err := tx.QueryRowxContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM inference_requests WHERE id = $1)`, requestID).
+			Scan(&exists); err != nil {
+			return mapError("mark reconciliation", err)
+		}
+		if !exists {
+			return mapError("mark reconciliation", sql.ErrNoRows)
+		}
+		return nil
 	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO inference_reconciliation_jobs (id, request_id, reason, deadline_at)
-		 VALUES ($1,$2,$3,$4)
-		 ON CONFLICT (request_id) DO UPDATE
-		 SET status = 'pending', deadline_at = EXCLUDED.deadline_at, updated_at = now()`,
-		uuid.NewString(), requestID, reason, deadline); err != nil {
-		return mapError("reconciliation: enqueue", err)
-	}
-	return nil
+	return s.EnqueueReconciliationJobTx(ctx, w, EnqueueReconciliationCommand{
+		RequestID: &requestID, Reason: reason, Deadline: deadline,
+	})
 }
 
 // AppendAdjustment writes an operator compensation and its ledger entry in

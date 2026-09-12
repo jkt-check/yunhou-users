@@ -574,6 +574,120 @@ func TestWalletReversal_OncePerEntry(t *testing.T) {
 	}
 }
 
+// TestWalletFreeze_NegativeDerivedBonus_ClampedSplit: 评审轮1 I1 链路——
+// 冲正一笔已被部分消费的 bonus 赠送后派生 bonus 为负；后续冻结必须成功
+// （拆分钳零下界：bonus=0、现金足额扣），不得再因负数拆分撞 hold CHECK
+// 把现金充足的客户全部 400；负缺口留在派生余额如实展示。
+func TestWalletFreeze_NegativeDerivedBonus_ClampedSplit(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+	now := time.Now().UTC()
+	priceID := seedMoneyPrice(t, s, f.modelID, "CNY", 1, now.Add(-time.Hour)) // 1 micro/token
+
+	// 现金 5 CNY + 赠送 2 CNY（adjustment credit bonus，记录 entry id 供冲正）。
+	fundWallet(t, s, f.accountID, "CNY", 5_000_000, 0)
+	uowG, _ := s.Begin(ctx)
+	if _, err := s.ApplyWalletAdjustmentTx(ctx, uowG, WalletAdjustmentCommand{
+		AccountID: f.accountID, Currency: "CNY",
+		Source: accounting.WalletBonus, Direction: accounting.DirCredit,
+		AmountMicros: 2_000_000, Reason: "welcome gift",
+		OperatorSubject: "user:ops@app:test", IdempotencyKey: "gift-" + uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("bonus grant: %v", err)
+	}
+	if err := uowG.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var bonusEntryID int64
+	if err := s.db.QueryRow(
+		`SELECT id FROM inference_wallet_entries WHERE source = 'bonus' AND entry_type = 'adjustment'`).
+		Scan(&bonusEntryID); err != nil {
+		t.Fatal(err)
+	}
+	enableOverage(t, s, f.accountID, "CNY", 100_000_000)
+	w, err := s.GetWalletByAccount(ctx, f.accountID, "CNY")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 消费赠送：hold 1.5 CNY 全部从 bonus 冻结并结算消费掉 → bonus 剩 0.5。
+	uow, _ := s.Begin(ctx)
+	adm, err := s.ReserveWallet(ctx, uow, reserveWalletCmd(t, s, f, w.ID, priceID, 1_500_000))
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	in, out := int64(1_000_000), int64(500_000)
+	pv, err := s.GetPriceVersion(ctx, priceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pure, err := pv.Pure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	charge, err := pure.Quote(domain.UsageRecord{
+		RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+		Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Settle(ctx, uow, domain.SettleCommand{
+		RequestID: adm.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: domain.Microcredit(charge.Money.Micros),
+		WalletCharge: charge.Money, SettledAt: now,
+	}); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 冲正整笔 2 CNY 赠送（其中 1.5 已被消费）→ 派生 bonus = 0.5 − 2 = −1.5。
+	uowR, _ := s.Begin(ctx)
+	if err := s.ReverseWalletEntryTx(ctx, uowR, f.accountID, bonusEntryID, "user:ops@app:test"); err != nil {
+		t.Fatalf("reverse bonus: %v", err)
+	}
+	if err := uowR.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	view, err := s.WalletBalance(ctx, f.accountID, "CNY", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Balance.BonusAvailable != -1_500_000 {
+		t.Fatalf("derived bonus = %d, want -1_500_000 (负缺口如实展示)", view.Balance.BonusAvailable)
+	}
+
+	// 后续冻结：现金充足必须放行，拆分非负、现金足额扣。
+	uow2, _ := s.Begin(ctx)
+	adm2, err := s.ReserveWallet(ctx, uow2, reserveWalletCmd(t, s, f, w.ID, priceID, 1_000_000))
+	if err != nil {
+		t.Fatalf("freeze with negative derived bonus must succeed (I1): %v", err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var holdCash, holdBonus int64
+	if err := s.db.QueryRow(
+		`SELECT cash_micros, bonus_micros FROM inference_wallet_holds WHERE request_id = $1`, adm2.RequestID).
+		Scan(&holdCash, &holdBonus); err != nil {
+		t.Fatal(err)
+	}
+	if holdBonus != 0 || holdCash != 1_000_000 {
+		t.Fatalf("hold split = cash %d bonus %d, want 1_000_000/0 (钳零下界、现金足额扣)", holdCash, holdBonus)
+	}
+}
+
 // TestWalletSpendLimitGate: 月支出上限按 UTC 自然月账本派生；到达上限后
 // 冻结拒绝（ErrSpendLimitExceeded）。
 func TestWalletSpendLimitGate(t *testing.T) {

@@ -558,19 +558,36 @@ Implications for us:
 
 ### Alipay
 
+真实报文形态（评审轮4 对齐）：异步通知的 `notify_type` 恒为
+`trade_status_sync`（仅作通知分类参考）；事件判别由 `trade_status`
+驱动——`TRADE_SUCCESS`/`TRADE_FINISHED` 为成功类，`TRADE_CLOSED` 为
+关单（未支付超时关单 OR 已支付退款关单）；退款金额字段是
+**`refund_fee`（累计退款总额**，伴随 `gmt_refund`/`out_biz_no`），报文
+中**不存在** `refund_amount`。分发键同时看 `trade_status` 与
+`refund_fee`：`refund_fee > 0` 的通知一律进退款分支（部分退款为
+`trade_refund`）；`trade_status` 缺失时回退 `notify_type` 判别、`
+refund_fee` 缺失时回退 `refund_amount`（legacy mock 形态兼容）。
+
 | Notification type                  | Action                                              |
 |------------------------------------|-----------------------------------------------------|
-| `trade_status_sync` (or `TRADE_SUCCESS` legacy) | payment → `paid`, activate sub           |
-| `trade_closed` (full refund, or `TRADE_CLOSED` legacy) | payment → `refunded`, subscription → `cancelled` |
-| `trade_closed` (partial refund)    | payment stays `paid`, no subscription change         |
+| `TRADE_SUCCESS` (trade_status)     | payment → `paid`, activate sub           |
+| `trade_closed` (TRADE_CLOSED, refund_fee ≥ 全额) | payment → `refunded`, subscription → `cancelled` |
+| `trade_refund` / `trade_closed` (refund_fee 累计 < 全额) | payment stays `paid`, 退款行只记**增量**（refund_fee − 已记录退款总额） |
+| `trade_closed` (TRADE_CLOSED, 无 refund_fee) | 未支付关单：audit + 200，订单保持未支付 |
 
-**Note on event_type casing**: real Alipay production traffic uses lowercase
-`trade_status_sync` for paid notifications and `trade_closed` for refunds.
-The capitalized forms (`TRADE_SUCCESS`, `TRADE_CLOSED`) are accepted as
-legacy aliases — both are normalized to the same handler dispatch in
-`service.isPaymentSuccess` / `service.isRefundEvent`. When in doubt, match
-what the actual channel sends: lowercase for current Alipay, uppercase
-for older docs / sample payloads.
+**累计语义**：`refund_fee` 是累计值，同一累计值的重复通知增量为 0
+（幂等收敛不双退）；全额判定按累计值（`refund_fee` ≥ payment.amount）。
+
+**重放防护（评审轮4 A-2）**：Alipay 以同一份签名报文（`notify_time`
+不变）重投最长 ~24h，验签层不再按 `notify_time` 时间窗拒绝——重放去
+重由 `webhook_events (channel, event_id)` 幂等表承担（迟到重投被接
+受，重复投递 DuplicateEvent ack 200）。Stripe/PayPal/WeChat 的时间窗
+与各自重投计划兼容，保持不变。
+
+**Legacy casing note**: 老 mock 形态的 `notify_type=trade_closed` 直传与
+大写 `TRADE_SUCCESS`/`TRADE_CLOSED` 仍被接受（解析回退 +
+`service.isPaymentSuccess`/`service.isRefundEvent` 并容），真实渠道以
+`trade_status_sync` + `trade_status` 为准。
 
 ### LemonSqueezy
 

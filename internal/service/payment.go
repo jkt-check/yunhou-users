@@ -2186,7 +2186,7 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 			// 退款），也表已支付交易的关闭。仅当 (a) 事件不携退款额且
 			// (b) 订单从未支付 时才 audit+200：
 			//   (a) 依赖渠道语义——Alipay 未支付关单的 trade_closed 不携带
-			//       refund fee（webhook parser 的 refund_amount 字段，未支
+			//       refund fee（webhook parser 的 refund_fee 字段，未支
 			//       付关单解析为 0）。携带退款额（RefundAmount > 0）说明渠
 			//       道侧确已支付并退款（可能只是 TRADE_SUCCESS 仍在约 24h
 			//       的重投窗口内）：一律落到下面的返错重投分支，否则
@@ -2240,6 +2240,25 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		return fmt.Errorf("load order: %w", err)
 	}
 
+	// 评审轮4 B：Alipay 的 refund_fee 是**累计**退款总额——本次事件金额
+	// = 累计值 − 该支付已记录退款总额。重复投递同一累计值（或同一通知重
+	// 投）→ 增量为 0 → 幂等收敛不双退；部分退款序列（refund_fee 递增）
+	// 逐笔只认增量。全额判定仍按累计值（e.RefundAmount ≥ payment.Amount）。
+	// 其他渠道按单笔事件金额（既有语义）。增量 ≤ 0 时不落新行、不重复
+	// 钱包扣减（全额/权益状态在首次记录增量时已收敛）。
+	eventRefundAmount := e.RefundAmount
+	if e.Channel == "alipay" {
+		var prior float64
+		if err := tx.GetContext(ctx, &prior,
+			`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1`, payment.ID); err != nil {
+			return fmt.Errorf("sum prior refunds: %w", err)
+		}
+		eventRefundAmount = e.RefundAmount - prior
+		if eventRefundAmount <= 0 {
+			return tx.Commit()
+		}
+	}
+
 	// Find or insert the refund row keyed on (channel, external_refund_id).
 	// Insert as `pending` first so the sum-invariant (which counts pending
 	// rows in Refund) holds even when this path creates a refund row that
@@ -2255,7 +2274,7 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		VALUES ($1, $2, $3, $4, $5, $6, 'pending')
 		ON CONFLICT (channel, external_refund_id) DO NOTHING
 		RETURNING id
-	`, payment.ID, e.Channel, order.UserID, e.RefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
+	`, payment.ID, e.Channel, order.UserID, eventRefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
 	switch {
 	case err == nil:
 		// inserted (new pending row — will be flipped below)
@@ -2361,13 +2380,14 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 					"refund_id": refundID, "channel": e.Channel}); err != nil {
 				return fmt.Errorf("write audit: %w", err)
 			}
-		} else if err := s.enqueueWalletRefund(ctx, tx, &order, payment.ID, refundID, e.RefundAmount); err != nil {
+		} else if err := s.enqueueWalletRefund(ctx, tx, &order, payment.ID, refundID, eventRefundAmount); err != nil {
 			return err
 		}
 	}
 	// Partial refund: no domain action beyond marking the refund paid.
 	// 部分退款不动订阅与权益（既有规则保留）：订阅继续到原到期点；
-	// 金额侧由 refunds 行与渠道对账承载。
+	// 金额侧由 refunds 行与渠道对账承载。Alipay 累计语义下 eventRefundAmount
+	// 是本笔增量（评审轮4 B），全额判定用的累计值在 e.RefundAmount。
 
 	return tx.Commit()
 }
@@ -3054,6 +3074,10 @@ func isRefundEvent(eventType string) bool {
 	switch eventType {
 	case "charge.refunded", "TRANSACTION.REFUND",
 		"TRADE_CLOSED", "trade_closed",
+		// 评审轮4：trade_refund = Alipay TRADE_SUCCESS/TRADE_FINISHED 携带
+		// refund_fee 的部分退款通知；REFUND.SUCCESS = 真实 WeChat v3 退款
+		// 事件类型（TRANSACTION.REFUND 为既有 mock 契约，两者并容）。
+		"trade_refund", "REFUND.SUCCESS",
 		"PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED":
 		return true
 	}

@@ -416,6 +416,72 @@ func TestWalletTopup_TradeClosedWithRefundAmount_OutOfOrder(t *testing.T) {
 	}
 }
 
+// TestWalletTopup_AlipayRefund_CumulativeDelta: 评审轮4 B 钱包侧——Alipay
+// 累计 refund_fee 的部分退款序列只按增量扣钱包现金；同一累计值重复通知
+// 不双退。
+func TestWalletTopup_AlipayRefund_CumulativeDelta(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	store := inferencepostgres.NewStore(db)
+	svc.SetBenefitRepo(repo.NewPlanBenefitRepo(db))
+	svc.SetBenefitSync(store)
+	ctx := context.Background()
+
+	seedTopupPlan(t, db, "topup-cum", 50.00)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(ctx, uid, "topup-cum", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OnWebhook(ctx, WebhookEvent{
+		Channel: "alipay", EventID: "evt-wcum-pay", EventType: "TRADE_SUCCESS",
+		TransactionID: "txn_wcum", OrderID: order.ID, Amount: 50.00, Currency: "CNY",
+		RawPayload: json.RawMessage(`{"id":"evt-wcum-pay"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refund := func(eventID, extID string, cumulative float64) {
+		_, err := svc.OnWebhook(ctx, WebhookEvent{
+			Channel: "alipay", EventID: eventID, EventType: "trade_refund",
+			TransactionID: "txn_wcum", OrderID: order.ID, Amount: 50.00, Currency: "CNY",
+			RefundAmount: cumulative, ExternalRefundID: extID,
+			RawPayload: json.RawMessage(`{"id":"` + eventID + `"}`),
+		})
+		if err != nil {
+			t.Fatalf("refund %s: %v", eventID, err)
+		}
+	}
+	// refund_fee 20 → 钱包退 20；refund_fee 35（累计）→ 只退增量 15；
+	// 同累计 35 重复通知 → 不再入队。
+	refund("evt-wcum-r1", "alipay-wbiz-1", 20.00)
+	refund("evt-wcum-r2", "alipay-wbiz-2", 35.00)
+	refund("evt-wcum-r3", "alipay-wbiz-2b", 35.00)
+	if n := walletOutboxCount(t, db); n != 3 { // 1 topup + 2 refund（第三笔增量 0 不入队）
+		t.Fatalf("wallet.sync outbox = %d, want 3 (topup + 20 + 15)", n)
+	}
+
+	w := workers.NewWalletSync(store, nil, workers.EntitlementSyncConfig{})
+	stats, err := w.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Credited != 1 || stats.Refunded != 2 {
+		t.Fatalf("worker stats = %+v, want 1 credited / 2 refunded", stats)
+	}
+	acct, err := store.GetBillingAccountByUser(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.WalletBalance(ctx, acct.ID, "CNY", order.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 50 − 20 − 15 = 15（逐笔增量，累计 35）。
+	if view.Balance.CashAvailable != 15_000_000 {
+		t.Fatalf("cash = %d, want 15 CNY (50−20−15 增量语义)", view.Balance.CashAvailable)
+	}
+}
+
 // TestWalletTopup_RefundPaymentNeverArrives: 支付成功事件永不到达时，退款
 // 事件每次投递都持续返回错误（本测试只断言错误语义；最终一致性依赖渠道的
 // 重投窗口——窗口内支付到达则乱序自愈，窗口外审计行

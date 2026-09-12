@@ -2228,6 +2228,109 @@ func TestPaymentService_OnWebhook_Refund_PaidOrderMissingPaymentRow(t *testing.T
 	}
 }
 
+// 评审轮4 B：Alipay refund_fee 累计语义——部分退款序列（refund_fee 递
+// 增）逐笔只认增量；同一累计值的重复通知增量为 0 → 幂等收敛不双退；
+// 累计达到全额 → 全额翻转 + 订阅取消。
+func TestPaymentService_OnWebhook_AlipayRefund_CumulativeSemantics(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 支付成功（TRADE_SUCCESS）。
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: "evt-cum-pay-" + mustNewUUID()[:8], EventType: "TRADE_SUCCESS",
+		TransactionID: "txn-cum-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("paid webhook: %v", err)
+	}
+
+	refund := func(eventID, extID string, cumulative float64) error {
+		_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+			Channel: "alipay", EventID: eventID, EventType: "trade_refund",
+			TransactionID: "txn-cum-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+			RefundAmount: cumulative, ExternalRefundID: extID,
+			RawPayload: json.RawMessage(`{}`),
+		})
+		return err
+	}
+	// ① refund_fee=10（部分）→ 退款行 10。
+	if err := refund("evt-cum-r1-"+mustNewUUID()[:8], "alipay-biz-1", 10.00); err != nil {
+		t.Fatalf("partial 1: %v", err)
+	}
+	// ② refund_fee=25（累计）→ 只认增量 15。
+	if err := refund("evt-cum-r2-"+mustNewUUID()[:8], "alipay-biz-2", 25.00); err != nil {
+		t.Fatalf("partial 2: %v", err)
+	}
+	// ③ 同一累计值 25 的另一通知（重复投递语义）→ 增量 0，不落新行。
+	if err := refund("evt-cum-r3-"+mustNewUUID()[:8], "alipay-biz-2b", 25.00); err != nil {
+		t.Fatalf("same-cumulative redelivery: %v", err)
+	}
+	var rows []float64
+	if err := db.SelectContext(context.Background(), &rows,
+		`SELECT amount FROM refunds ORDER BY created_at`); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0] != 10.00 || rows[1] != 15.00 {
+		t.Fatalf("refund rows = %v, want [10 15]（逐笔增量）", rows)
+	}
+	// 部分退款：支付保持 paid，订阅不动。
+	var payStatus, subStatus string
+	if err := db.GetContext(context.Background(), &payStatus,
+		`SELECT status FROM payments WHERE order_id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if payStatus != "paid" {
+		t.Errorf("payment after partial = %s, want paid", payStatus)
+	}
+	if err := db.GetContext(context.Background(), &subStatus,
+		`SELECT status FROM subscriptions WHERE user_id = $1 AND plan_id = 'monthly'`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if subStatus != "active" {
+		t.Errorf("sub after partial = %s, want active (部分退款不动订阅)", subStatus)
+	}
+	// ④ 累计到全额 29.90 → 增量 4.90，全额翻转 + 订阅取消。
+	if err := refund("evt-cum-r4-"+mustNewUUID()[:8], "alipay-biz-3", 29.90); err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	if err := db.SelectContext(context.Background(), &rows,
+		`SELECT amount FROM refunds ORDER BY created_at`); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 || rows[2] != 4.90 {
+		t.Fatalf("refund rows = %v, want [10 15 4.9]", rows)
+	}
+	if err := db.GetContext(context.Background(), &payStatus,
+		`SELECT status FROM payments WHERE order_id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if payStatus != "refunded" {
+		t.Errorf("payment after full = %s, want refunded", payStatus)
+	}
+	if err := db.GetContext(context.Background(), &subStatus,
+		`SELECT status FROM subscriptions WHERE user_id = $1 AND plan_id = 'monthly'`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if subStatus != "cancelled" {
+		t.Errorf("sub after full = %s, want cancelled (全额退款级联)", subStatus)
+	}
+	// ⑤ 全额后的重复通知（同累计 29.90）→ 幂等收敛，无新行无错误。
+	if err := refund("evt-cum-r5-"+mustNewUUID()[:8], "alipay-biz-3b", 29.90); err != nil {
+		t.Fatalf("post-full redelivery: %v", err)
+	}
+	var n int
+	if err := db.GetContext(context.Background(), &n, `SELECT count(*) FROM refunds`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("refund rows after redelivery = %d, want 3 (幂等收敛)", n)
+	}
+}
+
 // TestPaymentService_OnWebhook_Refund_MissingPayment covers the
 // "no payment row" branch in onRefundSucceeded (评审轮1 C2): the refund
 // event may arrive BEFORE the payment-success event (channel out-of-order

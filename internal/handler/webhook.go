@@ -207,10 +207,11 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 
 	// decrypted resource shape:
 	//   TRANSACTION.SUCCESS: { "transaction_id": "...", "amount": { "total": 100, ... }, "out_trade_no": "...", "sub_expires_at": "..." }
-	//   TRANSACTION.REFUND:  { "transaction_id": "...", "amount": { "refund": 100, ... }, "out_trade_no": "..." }
+	//   TRANSACTION.REFUND / REFUND.SUCCESS: { "transaction_id": "...", "out_refund_no": "...", "amount": { "refund": 100, ... }, "out_trade_no": "..." }
 	var resource struct {
 		TransactionID string `json:"transaction_id"`
 		OutTradeNo    string `json:"out_trade_no"`
+		OutRefundNo   string `json:"out_refund_no"`
 		SubExpires    string `json:"sub_expires_at"`
 		Amount        struct {
 			Total  int64 `json:"total"`
@@ -238,6 +239,15 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 	if resource.Amount.Refund > 0 {
 		we.RefundAmount = float64(resource.Amount.Refund) / 100
 	}
+	// 退款业务键（评审轮4 顺手对齐）：out_refund_no 是商户退款单号，缺失
+	// 时回退事件 id——refunds.(channel,external_refund_id) 唯一键不得落空串。
+	if evt.EventType == "REFUND.SUCCESS" || evt.EventType == "TRANSACTION.REFUND" {
+		if resource.OutRefundNo != "" {
+			we.ExternalRefundID = resource.OutRefundNo
+		} else {
+			we.ExternalRefundID = "wechat-" + evt.ID
+		}
+	}
 	return we, nil
 }
 
@@ -253,6 +263,7 @@ func (h *WebhookHandler) parseWeChatMock(raw []byte) (*service.WebhookEvent, err
 		Resource  struct {
 			TransactionID string `json:"transaction_id"`
 			OutTradeNo    string `json:"out_trade_no"`
+			OutRefundNo   string `json:"out_refund_no"`
 			SubExpires    string `json:"sub_expires_at"`
 			Amount        struct {
 				Total  int64 `json:"total"`
@@ -285,6 +296,13 @@ func (h *WebhookHandler) parseWeChatMock(raw []byte) (*service.WebhookEvent, err
 	}
 	if evt.Resource.Amount.Refund > 0 {
 		we.RefundAmount = float64(evt.Resource.Amount.Refund) / 100
+	}
+	if evt.EventType == "REFUND.SUCCESS" || evt.EventType == "TRANSACTION.REFUND" {
+		if evt.Resource.OutRefundNo != "" {
+			we.ExternalRefundID = evt.Resource.OutRefundNo
+		} else {
+			we.ExternalRefundID = "wechat-" + evt.ID
+		}
 	}
 	return we, nil
 }
@@ -326,10 +344,24 @@ func localWeChatDecrypt(key, ciphertextB64, nonce, associatedData string) ([]byt
 	return gcm.Open(nil, []byte(nonce), ciphertext, []byte(associatedData))
 }
 
-// parseAlipay reads the form-encoded body. Alipay sends:
+// parseAlipay reads the form-encoded body. 两套报文形态（评审轮4）：
 //
-//	out_trade_no (order_id), trade_no (transaction_id), total_amount,
-//	refund_amount (if refund event), notify_id (event_id), notify_type (event_type).
+// 真实 Alipay 异步通知：notify_type 恒为 trade_status_sync（仅作通知分
+// 类参考）；事件判别由 trade_status 驱动——TRADE_SUCCESS/TRADE_FINISHED
+// 为成功类，TRADE_CLOSED 为关单（未支付超时关单 OR 已支付退款关单）；
+// 退款金额字段是 refund_fee（**累计**退款总额，伴随 gmt_refund /
+// out_biz_no）——报文中不存在 refund_amount。分发键同时看 trade_status
+// 与 refund_fee：TRADE_SUCCESS/TRADE_FINISHED 且 refund_fee>0 = 部分退
+// 款通知（trade_refund），TRADE_CLOSED = trade_closed（退款关单或未支
+// 付关单，由 service 层 D-1 闸按 refund_fee 有无区分）。
+//
+// 老 mock 形态（兼容，既有 e2e/mock 渠道不破）：trade_status 为空时回退
+// notify_type 判别（trade_status_sync 成功 / trade_closed 关单），
+// refund_fee 缺失时回退读 refund_amount（legacy alias）。
+//
+// 字段来源：out_trade_no（order_id / 渠道侧 out_trade_no）、trade_no
+// （transaction_id）、total_amount（订单全额，major units）、refund_fee、
+// out_biz_no（商户退款请求号）、notify_id（事件去重键）、notify_type。
 func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) {
 	values, err := url.ParseQuery(string(raw))
 	if err != nil {
@@ -339,14 +371,22 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 	outTradeNo := values.Get("out_trade_no")
 	tradeNo := values.Get("trade_no")
 	totalAmount := values.Get("total_amount")
-	refundAmount := values.Get("refund_amount")
+	refundFee := values.Get("refund_fee")
+	if refundFee == "" {
+		// legacy alias：真实报文没有 refund_amount；保留它以兼容既有 mock
+		// 形态（评审轮4 兼容策略）。
+		refundFee = values.Get("refund_amount")
+	}
+	outBizNo := values.Get("out_biz_no")
 	subExpires := values.Get("sub_expires_at")
 	notifyID := values.Get("notify_id")
 	notifyType := values.Get("notify_type")
+	tradeStatus := values.Get("trade_status")
 
 	// Reject malformed webhooks — notify_id and notify_type are the dedupe
-	// key + dispatch key. Empty values would collapse every malformed
-	// notification into the same row and silently no-op the dispatch.
+	// key + notification classification. Empty values would collapse every
+	// malformed notification into the same row and silently no-op the
+	// dispatch.
 	if notifyID == "" {
 		return nil, fmt.Errorf("alipay missing notify_id")
 	}
@@ -354,12 +394,38 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 		return nil, fmt.Errorf("alipay missing notify_type")
 	}
 
+	var refundAmount float64
+	if refundFee != "" {
+		v, err := strconv.ParseFloat(refundFee, 64)
+		if err != nil {
+			return nil, fmt.Errorf("alipay refund_fee: %w", err)
+		}
+		refundAmount = v
+	}
+
+	// 事件判别：trade_status 优先（真实形态）；为空回退 notify_type
+	// （老 mock 形态）。任何携带 refund_fee>0 的通知都进退款分支——包括
+	// TRADE_SUCCESS 的部分退款（分发键同时看 trade_status 与 refund_fee，
+	// 评审轮4 B）。
+	eventType := notifyType
+	switch tradeStatus {
+	case "TRADE_CLOSED":
+		eventType = "trade_closed"
+	case "TRADE_SUCCESS", "TRADE_FINISHED":
+		if refundAmount > 0 {
+			eventType = "trade_refund" // 部分退款（累计 refund_fee）
+		} else {
+			eventType = "TRADE_SUCCESS"
+		}
+	}
+
 	event := &service.WebhookEvent{
 		Channel:       "alipay",
 		EventID:       notifyID,
-		EventType:     notifyType,
+		EventType:     eventType,
 		TransactionID: tradeNo,
 		OrderID:       outTradeNo,
+		RefundAmount:  refundAmount,
 		Currency:      "CNY", // v1 assumption
 	}
 	if totalAmount != "" {
@@ -369,30 +435,31 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 		}
 		event.Amount = v
 	}
-	if refundAmount != "" {
-		v, err := strconv.ParseFloat(refundAmount, 64)
-		if err != nil {
-			return nil, fmt.Errorf("alipay refund_amount: %w", err)
-		}
-		event.RefundAmount = v
-	}
 	if subExpires != "" {
 		if t, err := time.Parse(time.RFC3339, subExpires); err == nil {
 			event.SubExpiresAt = &t
 		}
 	}
 
-	// Alipay doesn't echo its own refund ID; the service generates an
-	// internal external_refund_id derived from notify_id for refund events.
-	if isAlipayRefundEvent(notifyType) {
-		event.ExternalRefundID = "alipay-" + notifyID
+	// Refund business key: prefer the merchant-side refund request id
+	// (out_biz_no — a re-notified refund operation echoes the same one);
+	// fall back to notify_id (unique per notification). The cumulative
+	// refund_fee semantics in the service layer make either idempotent
+	// (评审轮4 B).
+	if isAlipayRefundEvent(eventType) {
+		if outBizNo != "" {
+			event.ExternalRefundID = "alipay-" + outBizNo
+		} else {
+			event.ExternalRefundID = "alipay-" + notifyID
+		}
 	}
 	return event, nil
 }
 
-func isAlipayRefundEvent(notifyType string) bool {
-	// Alipay event types: trade_status_sync (paid), trade_closed (closed/refunded).
-	return notifyType == "trade_closed"
+func isAlipayRefundEvent(eventType string) bool {
+	// trade_closed：退款关单或未支付关单（service 层按 refund_fee 区分）；
+	// trade_refund：TRADE_SUCCESS/TRADE_FINISHED 携带 refund_fee 的部分退款。
+	return eventType == "trade_closed" || eventType == "trade_refund"
 }
 
 // parsePaypal — kept below

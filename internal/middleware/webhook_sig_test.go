@@ -1349,13 +1349,15 @@ func TestAlipayVerifier_ReplayWindowFreshNotify(t *testing.T) {
 	}
 }
 
-// TestAlipayVerifier_ReplayWindowExpiredNotify covers the notify_time
-// out-of-window path. We send a notify_time well in the past so the delta
-// exceeds the 5-minute replay window.
-func TestAlipayVerifier_ReplayWindowExpiredNotify(t *testing.T) {
+// TestAlipayVerifier_LateRetryAccepted covers 评审轮4 A-2：Alipay 以同一
+// 份签名报文（notify_time 不变）重投最长 ~24h——C2/D-1 的"返错让渠道重
+// 投"机制依赖迟到重投被接受，5 分钟窗会在窗口后把每次重投拒成 400、事
+// 件永久丢失。验签通过后不再按 notify_time 拒绝；重放去重由
+// webhook_events (channel,event_id) 幂等表承担。
+func TestAlipayVerifier_LateRetryAccepted(t *testing.T) {
 	t.Parallel()
 	priv, pub := rsaTestKey(t)
-	past := time.Now().Add(-24 * time.Hour).In(time.FixedZone("CST", 8*3600))
+	past := time.Now().Add(-23 * time.Hour).In(time.FixedZone("CST", 8*3600))
 	notify := past.Format("2006-01-02 15:04:05")
 	body := "out_trade_no=order_1&notify_time=" + urlEncodeFormValue(notify)
 	canonical := alipayCanonicalForTest(t, body)
@@ -1365,8 +1367,8 @@ func TestAlipayVerifier_ReplayWindowExpiredNotify(t *testing.T) {
 	bodySigned := body + "&sign=" + urlEncodeFormValue(sigB64) + "&sign_type=RSA2"
 
 	v := &AlipayVerifier{PublicKey: pub}
-	if err := v.VerifySignature("alipay", []byte(bodySigned), nil); !errors.Is(err, ErrTimestampOutOfRange) {
-		t.Errorf("expected ErrTimestampOutOfRange for expired notify_time, got %v", err)
+	if err := v.VerifySignature("alipay", []byte(bodySigned), nil); err != nil {
+		t.Errorf("23h-old signed notify (Alipay retry schedule) must be accepted, got %v", err)
 	}
 }
 

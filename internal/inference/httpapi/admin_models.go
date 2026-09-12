@@ -282,6 +282,10 @@ func fail(c *gin.Context, err error) {
 	case domain.CodeRateLimited, domain.CodeQuotaExceeded, domain.CodeInsufficientBalance:
 		status = http.StatusTooManyRequests
 	}
+	if status == http.StatusInternalServerError {
+		c.JSON(status, gin.H{"code": status, "data": nil, "message": "internal error"})
+		return
+	}
 	c.JSON(status, gin.H{"code": status, "data": nil, "message": err.Error()})
 }
 

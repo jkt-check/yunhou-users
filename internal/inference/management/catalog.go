@@ -196,6 +196,13 @@ func (m *CatalogManager) ListRoutes(ctx context.Context, modelID string) ([]doma
 	return m.svc.ListRoutes(ctx, modelID)
 }
 
+// GetRoute reads one route (httpapi 更新路径先读后写：校验/乐观锁需要完整
+// 对象——Task 16 实测 PATCH /admin/routes/:id 因缺 model_id/deployment_id
+// 永远 400 的修复).
+func (m *CatalogManager) GetRoute(ctx context.Context, id string) (*domain.ModelRoute, error) {
+	return m.svc.GetRoute(ctx, id)
+}
+
 func (m *CatalogManager) UpdateRoute(ctx context.Context, actor string, r *domain.ModelRoute) error {
 	if err := m.svc.UpdateRoute(ctx, r); err != nil {
 		return err

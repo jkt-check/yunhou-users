@@ -53,11 +53,13 @@ func HasPermission(perms map[string]bool, permission string) bool {
 }
 
 // OperatorGrant is one operator_roles row — the shared DTO of the postgres
-// store and the httpapi handlers.
+// store and the httpapi handlers. db tags are required: sqlx cannot map
+// user_id onto UserID without them (Task 16 实测 GET /admin/operators 500
+// 修复——httpapi 测试此前用桩存储未触达真实扫描).
 type OperatorGrant struct {
-	UserID    string    `json:"user_id"`
-	Role      string    `json:"role"`
-	GrantedBy *string   `json:"granted_by,omitempty"`
-	Reason    string    `json:"reason"`
-	CreatedAt time.Time `json:"created_at"`
+	UserID    string    `json:"user_id" db:"user_id"`
+	Role      string    `json:"role" db:"role"`
+	GrantedBy *string   `json:"granted_by,omitempty" db:"granted_by"`
+	Reason    string    `json:"reason" db:"reason"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }

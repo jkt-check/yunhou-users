@@ -493,6 +493,8 @@ paths:
         （重试不双计）；尝试级指标按每次尝试自己的部署归属；供应商维度
         不归属请求级账本金额（恒 0——一次请求跨供应商重试时拆账是编造，
         金额权威维度是模型/客户）。
+        分组只含窗口内确有活动的键：模型/供应商/客户在该 [from, to) 内
+        零请求（供应商零尝试）时整组缺席于 `groups`，不补零行。
         数据源只有 inference_requests/attempts/usage_records/ledger_entries；
         `as_of`=`complete_through`=读取时刻（直读权威表）。时间范围默认
         最近 30 天、最大 92 天（`from`/`to` RFC3339 半开区间）。

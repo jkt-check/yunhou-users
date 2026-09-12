@@ -272,7 +272,7 @@ func (s *BulkImportService) validateDocument(ctx context.Context, doc *BulkCatal
 			case seen[key]:
 				item.Status, item.Error = BulkItemError, "duplicate deployment in document"
 			case !providerCodes[d.ProviderCode]:
-				item.Status, item.Error = BulkItemError, "references provider not present in document (existing providers resolve at apply time)"
+				item.Status, item.Error = BulkItemError, "references provider not listed in this document; existing catalog providers are not auto-resolved — list the provider in the document too (it will be reused as skipped, not duplicated)"
 			default:
 				if err := catalog.ValidateDeployment(dd); err != nil {
 					item.Status, item.Error = BulkItemError, err.Error()
@@ -359,13 +359,17 @@ func (s *BulkImportService) Import(ctx context.Context, actor, taskID string, do
 		}
 		return nil, err
 	}
-	if err := uow.Commit(ctx); err != nil {
-		return nil, err
-	}
-	committed.Committed = true
 	if s.recorder != nil {
+		// 同事务审计（与 wallet.adjust 齐平）：审计行与导入效果同生共死；
+		// 记录器不支持事务写入时整个导入失败（fail-closed，不落下无审计
+		// 的目录变更）。
+		txRec, ok := s.recorder.(AuditTxRecorder)
+		if !ok {
+			_ = uow.Rollback(ctx)
+			return nil, domain.NewError(domain.CodeInternal, "bulk import: audit recorder lacks transactional support")
+		}
 		userID, appID := ParseActor(actor)
-		if err := s.recorder.Record(ctx, AuditEvent{
+		if err := txRec.RecordTx(ctx, uow, AuditEvent{
 			Action: "catalog.bulk_import", ObjectType: "bulk_import", ObjectID: taskID,
 			ActorUser: userID, ActorApp: appID,
 			Detail: SanitizeDetail(map[string]any{
@@ -373,9 +377,14 @@ func (s *BulkImportService) Import(ctx context.Context, actor, taskID string, do
 				"item_count": len(committed.Items),
 			}),
 		}); err != nil {
+			_ = uow.Rollback(ctx)
 			return nil, domain.WrapError(domain.CodeInternal, "bulk import audit write failed", err)
 		}
 	}
+	if err := uow.Commit(ctx); err != nil {
+		return nil, err
+	}
+	committed.Committed = true
 	return committed, nil
 }
 

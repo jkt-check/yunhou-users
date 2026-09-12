@@ -587,17 +587,22 @@ func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 	ok(c, toRouteDTO(r))
 }
 
-// UpdateRoute PATCH /routes/:route_id
+// UpdateRoute PATCH /routes/:route_id — 先读后写：校验与乐观锁需要完整
+// 对象（model_id/deployment_id 不在请求体里，由既有路由行带出；Task 16
+// 实测此前直接以空 model/deployment 提交，任何 PATCH 都 400）。
 func (h *AdminModelsHandler) UpdateRoute(c *gin.Context) {
 	var req routeWriteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
 		return
 	}
-	r := &domain.ModelRoute{
-		ID: c.Param("route_id"), Priority: req.Priority, Weight: req.Weight,
-		Capabilities: req.Capabilities, Enabled: req.Enabled,
+	r, err := h.mgr.GetRoute(c.Request.Context(), c.Param("route_id"))
+	if err != nil {
+		fail(c, err)
+		return
 	}
+	r.Priority, r.Weight = req.Priority, req.Weight
+	r.Capabilities, r.Enabled = req.Capabilities, req.Enabled
 	if req.PoolStrategy != "" {
 		r.PoolStrategy = domain.PoolStrategy(req.PoolStrategy)
 	}

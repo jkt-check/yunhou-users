@@ -31,9 +31,9 @@ import (
 
 // Compile-time contract checks.
 var (
-	_ management.OperationsStore      = (*Store)(nil)
-	_ management.PricingPreviewStore  = (*Store)(nil)
-	_ management.BulkImportStore      = (*Store)(nil)
+	_ management.OperationsStore     = (*Store)(nil)
+	_ management.PricingPreviewStore = (*Store)(nil)
+	_ management.BulkImportStore     = (*Store)(nil)
 )
 
 // ---------------------------------------------------------------------------
@@ -219,12 +219,12 @@ func (s *Store) SummarizeOpsUsage(ctx context.Context, f management.OpsUsageFilt
 		        SUM(reasoning_tokens) AS reasoning_tokens`+tokFrom+`
 		  GROUP BY gkey`, tokKey, tokJoin, scope)
 	var tokRows []struct {
-		Gkey       string         `db:"gkey"`
-		Input      sql.NullInt64  `db:"input_tokens"`
-		CacheRead  sql.NullInt64  `db:"cache_read_tokens"`
-		CacheWrite sql.NullInt64  `db:"cache_write_tokens"`
-		Output     sql.NullInt64  `db:"output_tokens"`
-		Reasoning  sql.NullInt64  `db:"reasoning_tokens"`
+		Gkey       string        `db:"gkey"`
+		Input      sql.NullInt64 `db:"input_tokens"`
+		CacheRead  sql.NullInt64 `db:"cache_read_tokens"`
+		CacheWrite sql.NullInt64 `db:"cache_write_tokens"`
+		Output     sql.NullInt64 `db:"output_tokens"`
+		Reasoning  sql.NullInt64 `db:"reasoning_tokens"`
 	}
 	if err := s.db.SelectContext(ctx, &tokRows, tokSQL, args...); err != nil {
 		return nil, mapError("ops usage: tokens", err)
@@ -254,7 +254,6 @@ func (s *Store) SummarizeOpsUsage(ctx context.Context, f management.OpsUsageFilt
 	}
 	attSQL := fmt.Sprintf(
 		`SELECT %s AS gkey,
-		        COUNT(*) AS attempts_total,
 		        ROUND(AVG(EXTRACT(EPOCH FROM (a.finished_at - a.started_at)) * 1000)
 		              FILTER (WHERE a.finished_at IS NOT NULL AND a.started_at IS NOT NULL))::bigint AS avg_latency_ms,
 		        ROUND(percentile_cont(0.95) WITHIN GROUP (
@@ -267,11 +266,10 @@ func (s *Store) SummarizeOpsUsage(ctx context.Context, f management.OpsUsageFilt
 		  WHERE r.created_at >= $1 AND r.created_at < $2%s
 		  GROUP BY %s`, attKey, attJoin, attScope, attKey)
 	var attRows []struct {
-		Gkey     string        `db:"gkey"`
-		Attempts int64         `db:"attempts_total"`
-		AvgMs    sql.NullInt64 `db:"avg_latency_ms"`
-		P95Ms    sql.NullInt64 `db:"p95_latency_ms"`
-		Unknown  int64         `db:"cost_unknown"`
+		Gkey    string        `db:"gkey"`
+		AvgMs   sql.NullInt64 `db:"avg_latency_ms"`
+		P95Ms   sql.NullInt64 `db:"p95_latency_ms"`
+		Unknown int64         `db:"cost_unknown"`
 	}
 	if err := s.db.SelectContext(ctx, &attRows, attSQL, args...); err != nil {
 		return nil, mapError("ops usage: attempts", err)
@@ -592,7 +590,7 @@ func (s *Store) LatestPolicyVersionByName(ctx context.Context, name string) (*ma
 		ID: p.ID, Name: p.Name, Revision: p.Revision, ModelIDs: p.ModelIDs,
 		FiveHourLimit: microToInt64(p.FiveHourLimit), WeeklyLimit: microToInt64(p.WeeklyLimit),
 		MonthlyLimit: microToInt64(p.MonthlyLimit),
-		RPMLimit: p.RPMLimit, TPMLimit: p.TPMLimit, ConcurrencyLimit: p.ConcurrencyLimit,
+		RPMLimit:     p.RPMLimit, TPMLimit: p.TPMLimit, ConcurrencyLimit: p.ConcurrencyLimit,
 		OveragePolicy: p.OveragePolicy, Status: p.Status,
 	}, nil
 }

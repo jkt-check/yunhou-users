@@ -272,15 +272,25 @@ func (s *OperationsService) Summary(ctx context.Context, f OpsUsageFilter) (*Ops
 	}, nil
 }
 
+// clampOpsLimit bounds the operator list page size: 未给/非正取默认 100；
+// 超过上限钳到 500（与 OpenAPI maximum 一致，不静默回退默认值）。
+func clampOpsLimit(limit int) int {
+	if limit <= 0 {
+		return 100
+	}
+	if limit > 500 {
+		return 500
+	}
+	return limit
+}
+
 // Exceptions builds one exception view. kind 必选项；limit 上限 500。
 func (s *OperationsService) Exceptions(ctx context.Context, kind string, limit int) (*OpsExceptions, error) {
 	if !ValidExceptionKind(kind) {
 		return nil, domain.NewError(domain.CodeInvalidInput,
 			"ops exceptions: kind must be stuck_reservations|reauth_required_accounts|settlement_backlog")
 	}
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
+	limit = clampOpsLimit(limit)
 	now := s.clock.Now().UTC()
 	out := &OpsExceptions{
 		ServerTime: now, Kind: kind,
@@ -320,19 +330,13 @@ func (s *OperationsService) SharedDeploymentAccounts(ctx context.Context, from, 
 	if to.Sub(from) > MaxUsageRange {
 		return nil, domain.NewError(domain.CodeInvalidInput, "ops shared-accounts: time range exceeds 92 days")
 	}
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	return s.store.ListSharedDeploymentAccounts(ctx, from, to, limit)
+	return s.store.ListSharedDeploymentAccounts(ctx, from, to, clampOpsLimit(limit))
 }
 
 // Adjustments lists compensation records (newest first), optionally scoped
 // to one billing account.
 func (s *OperationsService) Adjustments(ctx context.Context, accountID string, limit int) ([]AdjustmentView, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	return s.store.ListAdjustments(ctx, accountID, limit)
+	return s.store.ListAdjustments(ctx, accountID, clampOpsLimit(limit))
 }
 
 // --- wire helpers (十进制整数字符串；JS 大整数精度) ---

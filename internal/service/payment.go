@@ -1686,6 +1686,36 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 	return &OnWebhookResult{DuplicateEvent: false, DomainAction: domainAction}, nil
 }
 
+// lookupOrderByWebhookID finds the order behind a webhook's order
+// reference. The PRIMARY lookup is by orders.id (Stripe + e2e tests that
+// pass the UUID); the FALLBACK is a JSONB walk for wechat_pay/alipay's
+// out_trade_no — the channel-side identifier those channels send (32-char
+// hyphenless form minted at CreateOrder as
+// strings.ReplaceAll(order.ID,"-","")[:32]). Shared by onPaymentSucceeded
+// and the refund path (评审轮3 D-2: N-2 的关单反查必须走同一段两段式查
+// 找——只用主键在真实渠道键形态下必然 miss，未支付关单 500 风暴原样保留).
+// Callers run it inside their own tx (same-connection constraint).
+func lookupOrderByWebhookID(ctx context.Context, tx dbTx, channel, orderRef string) (*model.Order, error) {
+	var order model.Order
+	err := tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, orderRef)
+	if errors.Is(err, sql.ErrNoRows) && (channel == "wechat_pay" || channel == "alipay") {
+		// JSONB text-extraction ->> returns NULL for rows without the
+		// key; equality with the channel's out_trade_no resolves it to
+		// the canonical order. LIMIT 1 in case the JSONB value collides
+		// (operator error — duplicate out_trade_no is a YDN alert).
+		err = tx.GetContext(ctx, &order, `
+			SELECT * FROM orders
+			WHERE provider_intent IS NOT NULL
+			  AND provider_intent->>'out_trade_no' = $1
+			LIMIT 1
+		`, orderRef)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &order, nil
+}
+
 // onPaymentSucceeded: payment_intent.succeeded (Stripe), TRANSACTION.SUCCESS (WeChat), TRADE_SUCCESS (Alipay).
 // Mirrors Confirm but driven by the channel — the cross-table transaction
 // must hold event-insert + payment-insert + sub-activate + order-update.
@@ -1697,34 +1727,15 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	defer tx.Rollback() //nolint:errcheck
 	txSQLX := rawSQLXTx(tx)
 
-	// Find the order. WeChat and Alipay send a channel-side identifier
-	// (out_trade_no, 32-char hex) rather than our UUID, and the
-	// WebhookEvent.OrderID contract documents this for the handler. The
-	// PRIMARY lookup is by id (covers Stripe + e2e tests that pass the
-	// UUID); the FALLBACK is a JSONB walk for wechat_pay/alipay's
-	// out_trade_no (covers real-world webhooks that send the 32-char
-	// form). Both queries run inside the same tx so MaxOpenConns
-	// constraints don't deadlock (the same constraint the comment below
-	// the SELECT-by-id block already documents).
+	// Find the order (两段式：主键 + provider_intent out_trade_no 回退 —
+	// 与退款路径共用 lookupOrderByWebhookID，评审轮3 D-2). WeChat and
+	// Alipay send the 32-char hyphenless out_trade_no rather than our UUID.
 	//
 	// MAJOR fix (review 2): without the fallback, real WeChat webhooks
 	// 404'd because no order has the 32-char hex as its primary id; the
 	// order would stay "pending" forever and the user never got the
 	// subscription.
-	var order model.Order
-	err = tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, e.OrderID)
-	if errors.Is(err, sql.ErrNoRows) && (e.Channel == "wechat_pay" || e.Channel == "alipay") {
-		// JSONB text-extraction ->> returns NULL for rows without the
-		// key; equality with the channel's out_trade_no resolves it to
-		// the canonical order. LIMIT 1 in case the JSONB value collides
-		// (operator error — duplicate out_trade_no is a YDN alert).
-		err = tx.GetContext(ctx, &order, `
-			SELECT * FROM orders
-			WHERE provider_intent IS NOT NULL
-			  AND provider_intent->>'out_trade_no' = $1
-			LIMIT 1
-		`, e.OrderID)
-	}
+	order, err := lookupOrderByWebhookID(ctx, tx, e.Channel, e.OrderID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Webhook arrived for an order that doesn't exist in our DB.
@@ -1830,7 +1841,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// order's frozen product snapshot; the live plan row is the pre-029
 	// fallback. An empty product (plan row missing) matches no subscription
 	// rows and lets the resolver surface ErrPlanMissingForExpiry instead.
-	orderProduct, pcErr := s.resolveOrderProduct(ctx, txSQLX, &order)
+	orderProduct, pcErr := s.resolveOrderProduct(ctx, txSQLX, order)
 	if pcErr != nil {
 		return fmt.Errorf("resolve order product: %w", pcErr)
 	}
@@ -1909,7 +1920,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// 余额充值商品（Task 14）：不激活订阅、不发模型权益——同事务入队钱包
 	// 充值消息（dedup 钉 payment_id；重复 webhook 投递不重复入账）。
 	if orderProduct == model.ProductWalletTopup {
-		if err := s.enqueueWalletTopup(ctx, tx, &order, paymentID); err != nil {
+		if err := s.enqueueWalletTopup(ctx, tx, order, paymentID); err != nil {
 			return err
 		}
 	} else {
@@ -1920,7 +1931,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		// succeed). Re-running the activation UPSERT on a retried event is
 		// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
 		// row.
-		subExpiry, rerr := s.resolveOrderActivation(ctx, txSQLX, &order, orderProduct, e.SubExpiresAt, preservedExpiry)
+		subExpiry, rerr := s.resolveOrderActivation(ctx, txSQLX, order, orderProduct, e.SubExpiresAt, preservedExpiry)
 		planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
 		activationConflict := errors.Is(rerr, ErrOrderActivationConflict)
 		downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
@@ -1991,7 +2002,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 			// 同事务 outbox（Task 10）：权益同步消息随支付状态翻转同一事务
 			// 提交；dedup 键钉在 payment 上，webhook/Confirm/主动补单三路
 			// 重复投递只入队一次。blocked/planMissing 时订阅未动，无需同步。
-			if orderTouchesBenefits(&order, orderProduct) {
+			if orderTouchesBenefits(order, orderProduct) {
 				dedup := access.PaidSyncDedupKey(paymentID)
 				if err := s.enqueueBenefitSync(ctx, tx, access.EntitlementSyncMessage{
 					UserID:      order.UserID,
@@ -2170,26 +2181,38 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE
 	`, e.Channel, e.TransactionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// 评审轮2 N-2：TRADE_CLOSED/trade_closed 是双义事件——既表"未
-			// 支付超时/取消关单"（高频正常事件，永远无支付行、不可能有退
-			// 款），也表已支付交易的关闭。仅对该双义类型用 e.OrderID
-			// （Alipay/WeChat 的 out_trade_no）反查订单：订单存在且从未支
-			// 付（pending/expired/cancelled/failed）→ audit+200 即止（返
-			// 错会让每个未支付关单重试一整天的 500 风暴+审计噪音）。
+			// 评审轮3 D-1+D-2：TRADE_CLOSED/trade_closed 是双义事件——既表
+			// "未支付超时/取消关单"（高频正常事件，永远无支付行、不可能有
+			// 退款），也表已支付交易的关闭。仅当 (a) 事件不携退款额且
+			// (b) 订单从未支付 时才 audit+200：
+			//   (a) 依赖渠道语义——Alipay 未支付关单的 trade_closed 不携带
+			//       refund fee（webhook parser 的 refund_amount 字段，未支
+			//       付关单解析为 0）。携带退款额（RefundAmount > 0）说明渠
+			//       道侧确已支付并退款（可能只是 TRADE_SUCCESS 仍在约 24h
+			//       的重投窗口内）：一律落到下面的返错重投分支，否则
+			//       audit+200 → MarkProcessed → 退款永久丢失、随后
+			//       TRADE_SUCCESS 重投照常充值 = 双花（轮 2 N-2 重开的乱
+			//       序窗口）。
+			//   (b) 订单反查走与 onPaymentSucceeded 相同的两段式查找
+			//       （主键 + provider_intent->>'out_trade_no'）——真实渠道
+			//       键是 32 位无横线 out_trade_no，只查主键必然 miss。
 			// charge.refunded/TRANSACTION.REFUND 等无歧义退款事件不走此分
 			// 支——查无支付行一律按乱序处理（保轮 1 C2 语义）。
-			if e.OrderID != "" && (e.EventType == "TRADE_CLOSED" || e.EventType == "trade_closed") {
-				var orderStatus string
-				if oerr := tx.GetContext(ctx, &orderStatus,
-					`SELECT status FROM orders WHERE id = $1`, e.OrderID); oerr == nil &&
-					(orderStatus == "pending" || orderStatus == "expired" ||
-						orderStatus == "cancelled" || orderStatus == "failed") {
-					return s.writeAudit(ctx, "service", "webhook_refund_unpaid_order",
-						fmt.Sprintf("event:%s", e.EventID),
-						[]string{"webhook", "unpaid_order"},
-						map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID,
-							"order_id": e.OrderID, "order_status": orderStatus, "event_id": e.EventID},
-					)
+			if e.OrderID != "" && (e.EventType == "TRADE_CLOSED" || e.EventType == "trade_closed") && e.RefundAmount <= 0 {
+				order, oerr := lookupOrderByWebhookID(ctx, tx, e.Channel, e.OrderID)
+				switch {
+				case oerr == nil:
+					if order.Status == "pending" || order.Status == "expired" ||
+						order.Status == "cancelled" || order.Status == "failed" {
+						return s.writeAudit(ctx, "service", "webhook_refund_unpaid_order",
+							fmt.Sprintf("event:%s", e.EventID),
+							[]string{"webhook", "unpaid_order"},
+							map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID,
+								"order_id": e.OrderID, "order_status": order.Status, "event_id": e.EventID},
+						)
+					}
+				case !errors.Is(oerr, sql.ErrNoRows):
+					return fmt.Errorf("lookup order for close event: %w", oerr)
 				}
 			}
 			// 评审轮1 C2：退款事件可能先于支付成功事件到达（渠道乱序投递）。

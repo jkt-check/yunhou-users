@@ -2115,8 +2115,11 @@ func TestPaymentService_OnWebhook_PaymentFailed_AfterPaid(t *testing.T) {
 	_ = res // silence unused
 }
 
-// 评审轮2 N-2：Alipay trade_closed 未支付关单（订单 pending，永远不会有
-// 支付行）→ audit+200 即止，不得返错制造一天 500 重试风暴。
+// 评审轮3 D-1：Alipay trade_closed 真未支付关单（订单 pending，永不
+// 会有支付行；渠道语义：未支付关单不携带 refund fee——parser 的
+// refund_amount 解析为 0）→ audit+200 即止，不得返错制造一天 500 重试
+// 风暴。注意：本用例不得携带 RefundAmount——带退款额的 trade_closed 表
+// 渠道侧已支付并退款，必须返错重投（见 D-1 乱序闭环测试）。
 func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
@@ -2128,8 +2131,8 @@ func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose(t *testing.T) {
 	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "alipay", EventID: "evt-close-" + mustNewUUID()[:8], EventType: "trade_closed",
 		TransactionID: "txn-never-paid-" + mustNewUUID()[:8], OrderID: order.ID,
-		RefundAmount: 29.9, ExternalRefundID: "rf_close",
-		RawPayload: json.RawMessage(`{}`),
+		ExternalRefundID: "rf_close",
+		RawPayload:       json.RawMessage(`{}`),
 	})
 	if err != nil {
 		t.Fatalf("unpaid close must ack 200 (audit only), got: %v", err)
@@ -2152,6 +2155,42 @@ func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose(t *testing.T) {
 	}
 	if refunds != 0 {
 		t.Errorf("refund rows = %d, want 0 (未支付订单无退款事实)", refunds)
+	}
+}
+
+// 评审轮3 D-2：真实渠道键形态——e.OrderID 是 32 位无横线 out_trade_no
+// （CreateOrder 以 strings.ReplaceAll(order.ID,"-","")[:32] 铸造并存入
+// provider_intent）。关单反查必须经两段式查找命中订单，未支付关单照样
+// audit+200（只查主键会 miss → 错误地全天 500）。
+func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose_OutTradeNo(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outTradeNo := strings.ReplaceAll(order.ID, "-", "")[:32]
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET provider_intent = $2 WHERE id = $1`,
+		order.ID, `{"out_trade_no":"`+outTradeNo+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: "evt-close-otn-" + mustNewUUID()[:8], EventType: "trade_closed",
+		TransactionID: "txn-otn-" + mustNewUUID()[:8], OrderID: outTradeNo, // 无横线 32 位渠道键
+		ExternalRefundID: "rf_close_otn",
+		RawPayload:       json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("unpaid close via out_trade_no must ack 200, got: %v", err)
+	}
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unpaid_order'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("unpaid-order audit rows = %d, want 1 (out_trade_no 回退命中)", n)
 	}
 }
 

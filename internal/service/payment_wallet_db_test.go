@@ -341,6 +341,81 @@ func TestWalletTopup_RefundArrivesBeforePayment_OutOfOrder(t *testing.T) {
 	}
 }
 
+// TestWalletTopup_TradeClosedWithRefundAmount_OutOfOrder: 评审轮3 D-1 乱
+// 序闭环——Alipay 交易已支付但 TRADE_SUCCESS 还在重投窗口，商户后台退款
+// 的 trade_closed（携带退款额）先到：携带退款额 → 不落入未支付关单
+// ack，返错让渠道重投；TRADE_SUCCESS 随后到达充值；退款重投成功；钱包
+// 先充后退净额 0（双花窗口闭合）。
+func TestWalletTopup_TradeClosedWithRefundAmount_OutOfOrder(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	store := inferencepostgres.NewStore(db)
+	svc.SetBenefitRepo(repo.NewPlanBenefitRepo(db))
+	svc.SetBenefitSync(store)
+	ctx := context.Background()
+
+	seedTopupPlan(t, db, "topup-tc", 50.00)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(ctx, uid, "topup-tc", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 带退款额的 trade_closed 先到（订单 pending、无支付行）→ 返错。
+	closeEvent := WebhookEvent{
+		Channel: "alipay", EventID: "evt-tc-ref", EventType: "trade_closed",
+		TransactionID: "txn_tc_1", OrderID: order.ID, Amount: 50.00, Currency: "CNY",
+		RefundAmount: 50.00, ExternalRefundID: "rf_tc_1",
+		RawPayload: json.RawMessage(`{"id":"evt-tc-ref"}`),
+	}
+	if _, err := svc.OnWebhook(ctx, closeEvent); err == nil {
+		t.Fatal("trade_closed carrying a refund amount must return an error so the channel retries (D-1)")
+	}
+	if n := walletOutboxCount(t, db); n != 0 {
+		t.Fatalf("wallet.sync outbox = %d before payment, want 0", n)
+	}
+
+	// 2. TRADE_SUCCESS 重投到达：照常入队钱包充值。
+	paid := WebhookEvent{
+		Channel: "alipay", EventID: "evt-tc-pay", EventType: "TRADE_SUCCESS",
+		TransactionID: "txn_tc_1", OrderID: order.ID, Amount: 50.00, Currency: "CNY",
+		RawPayload: json.RawMessage(`{"id":"evt-tc-pay"}`),
+	}
+	if _, err := svc.OnWebhook(ctx, paid); err != nil {
+		t.Fatalf("webhook paid: %v", err)
+	}
+
+	// 3. 渠道重投同一 trade_closed（processed_at=NULL → dedup 分支重跑）
+	//    → 命中支付行，入队钱包退款。
+	if _, err := svc.OnWebhook(ctx, closeEvent); err != nil {
+		t.Fatalf("redelivered trade_closed must succeed once the payment row exists: %v", err)
+	}
+	if n := walletOutboxCount(t, db); n != 2 { // 1 topup + 1 refund
+		t.Fatalf("wallet.sync outbox = %d, want 2 (topup + refund)", n)
+	}
+
+	// 4. worker 消费：先充 50 后退 50，净额 0。
+	w := workers.NewWalletSync(store, nil, workers.EntitlementSyncConfig{})
+	stats, err := w.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Credited != 1 || stats.Refunded != 1 {
+		t.Fatalf("worker stats = %+v, want 1 credited / 1 refunded", stats)
+	}
+	acct, err := store.GetBillingAccountByUser(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.WalletBalance(ctx, acct.ID, "CNY", order.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Balance.CashAvailable != 0 || view.Balance.BonusAvailable != 0 {
+		t.Fatalf("wallet = %+v, want net 0 (先充后退)", view.Balance)
+	}
+}
+
 // TestWalletTopup_RefundPaymentNeverArrives: 支付成功事件永不到达时，退款
 // 事件每次投递都持续返回错误（本测试只断言错误语义；最终一致性依赖渠道的
 // 重投窗口——窗口内支付到达则乱序自愈，窗口外审计行

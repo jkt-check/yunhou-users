@@ -237,17 +237,25 @@ func (s *StreamBody) Tap() providers.TapResult { return s.tap.Result() }
 // 期租约）不再保护该请求：存量超 grace 部署 + 超 grace 长流会被 sweep
 // 全额保守结算，真实用量随后被终态守卫吞掉。finalize 失败（停放语义）
 // 时租约仍照常释放——延迟释放但绝不提前。
+// 评审轮3 F-1：keeper.Stop 收进 defer——finalize 闭包内任何 panic
+// （OnSettleError 回调、nil tap、DB 层非常规 panic）都必须照样释放租
+// 约；否则 once 已消费而 Stop 被跳过：续租 goroutine 无限续租 → sweep
+// 活性 guard 永远视为存活 → 预占永久冻结、并发槽永久泄漏直到进程重
+// 启。panic 仍向上传播（调用方 gin recovery 兜底行为同既有），本修复只
+// 保证租约释放与 once 语义不被跳过。
 func (s *StreamBody) Finish(end StreamEnd) error {
 	s.once.Do(func() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		defer func() {
+			if s.keeper != nil {
+				ctx, cancel := detached(settleTimeout)
+				defer cancel()
+				s.keeper.Stop(ctx)
+			}
+		}()
 		s.finErr = s.finalize(end)
-		if s.keeper != nil {
-			ctx, cancel := detached(settleTimeout)
-			defer cancel()
-			s.keeper.Stop(ctx)
-		}
 	})
 	return s.finErr
 }

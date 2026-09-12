@@ -90,6 +90,32 @@ func TestValidateURLBlocksMetadataAndInternal(t *testing.T) {
 	}
 }
 
+// 评审轮3 S-4：NAT64 形式的目标与 v4 allowlist 对称——64:ff9b::/96 内地
+// 址取低 32 位成 v4 再比对 allowNets；NAT64-of-metadata 不被该机制误放
+// 行（映射后 169.254.169.254 不在 allowlist 内）。
+func TestValidateURLAllowlist_NAT64MappedToV4CIDR(t *testing.T) {
+	v, err := NewEgressValidator([]string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// [64:ff9b::a00:1] = 10.0.0.1：映射后命中 allowlist → 放行。
+	if err := v.ValidateURL(context.Background(), "http://[64:ff9b::a00:1]/v1"); err != nil {
+		t.Errorf("NAT64 of an allowlisted private address must be allowed: %v", err)
+	}
+	// [64:ff9b::a9fe:a9fe] = 169.254.169.254：映射后不在 allowlist → 必拒。
+	if err := v.ValidateURL(context.Background(), "http://[64:ff9b::a9fe:a9fe]/v1"); err == nil {
+		t.Error("NAT64 of the metadata address must NOT be allowed by a 10/8 allowlist")
+	}
+	// 未配 allowlist 时 NAT64-of-private 仍必拒（判定侧不变）。
+	v2, err := NewEgressValidator(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v2.ValidateURL(context.Background(), "http://[64:ff9b::a00:1]/v1"); err == nil {
+		t.Error("NAT64 of a private address without allowlist must be rejected")
+	}
+}
+
 // 评审轮1 I4：拨号期 DNS 重绑定——ValidateURL 解析返公网、DialContext 再
 // 解析返元数据地址时必须拒拨（策略绑定实际拨号 IP，不是陈旧的校验结果）。
 func TestDialContextRejectsDNSRebinding(t *testing.T) {

@@ -97,3 +97,44 @@ func TestStreamBodyFinish_FinalizeBeforeLeaseRelease(t *testing.T) {
 		t.Fatalf("second Finish released again: %v", got)
 	}
 }
+
+// 评审轮3 F-1：finalize 闭包 panic 时租约仍必须释放——否则 once 已消费
+// 而 Stop 被跳过，续租 goroutine 无限续租，预占/并发槽永久泄漏。panic
+// 向上传播（调用方 recovery 兜底），二次 Finish 不再重复副作用。
+func TestStreamBodyFinish_PanicStillReleasesLeases(t *testing.T) {
+	stub := &leaseOrderStub{}
+	routingSvc := routing.NewService(stub, nil, nil)
+	keeper := routingSvc.NewLeaseKeeper(&domain.ConcurrencyLease{
+		ID: "lease-a", Scope: domain.LeaseScopeUpstreamAccount, ScopeID: "acct-1",
+		RequestID: "req-p", OwnerToken: "owner", FencingToken: 1,
+		State: domain.LeaseHeld, ExpiresAt: time.Now().Add(time.Minute),
+	}, &domain.ConcurrencyLease{
+		ID: "lease-b", Scope: domain.LeaseScopeBillingAccount, ScopeID: "acct-1",
+		RequestID: "req-p", OwnerToken: "owner", FencingToken: 2,
+		State: domain.LeaseHeld, ExpiresAt: time.Now().Add(time.Minute),
+	})
+	body := &StreamBody{
+		keeper: keeper,
+		finalize: func(end StreamEnd) error {
+			panic("settle exploded (injected)")
+		},
+	}
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("Finish must propagate the finalize panic")
+			}
+		}()
+		_ = body.Finish(EndCompleted)
+	}()
+	if got := stub.releasedIDs(); len(got) != 2 {
+		t.Fatalf("released after panic = %v, want both leases released", got)
+	}
+	// once 已消费：二次 Finish 返回 nil 且不再触发 finalize/释放。
+	if err := body.Finish(EndCompleted); err != nil {
+		t.Fatalf("second Finish = %v, want nil (once semantics)", err)
+	}
+	if got := stub.releasedIDs(); len(got) != 2 {
+		t.Fatalf("second Finish released again: %v", got)
+	}
+}

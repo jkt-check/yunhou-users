@@ -135,6 +135,11 @@ func NewEgressValidator(allowlist []string) (*EgressValidator, error) {
 
 // AllowlistEntry reports whether host is explicitly allowlisted (exact
 // hostname match or CIDR containment of the resolved address).
+//
+// 评审轮3 S-4：NAT64 目标与 v4 allowlist 对称——64:ff9b::/96 内地址取低
+// 32 位成 v4 再比对 allowNets（与判定侧 blockedReason 的映射同口径）；
+// 否则运营配 10.0.0.0/8 无法放行自己内网的 [64:ff9b::a00:1] 形式，唯一
+// 变通是放行 64:ff9b::/96 整段（过宽）。
 func (v *EgressValidator) allowlistEntry(host string, ips []netip.Addr) bool {
 	if v.allowHosts[strings.ToLower(host)] {
 		return true
@@ -143,6 +148,12 @@ func (v *EgressValidator) allowlistEntry(host string, ips []netip.Addr) bool {
 		for _, p := range v.allowNets {
 			if p.Contains(ip) {
 				return true
+			}
+			if ip.Is6() && nat64WellKnown.Contains(ip) {
+				b := ip.As16()
+				if p.Contains(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]})) {
+					return true
+				}
 			}
 		}
 	}

@@ -302,6 +302,46 @@ func TestWebhookHandler_Alipay_RealForm_PartialRefund(t *testing.T) {
 	}
 }
 
+// 评审轮5 Critical：真实 trade_status 域不穷尽的穿透——WAIT_BUYER_PAY
+// （商户可在 Alipay 控制台开启的"交易创建"触发）、TRADE_INVALID 及任意
+// 未来新增状态必须映射为惰性 trade_pending（OnWebhook default 分支
+// ack 200 零域动作），绝不得穿透到支付成功分支。
+func TestWebhookHandler_Alipay_UnknownTradeStatus_Inert(t *testing.T) {
+	t.Parallel()
+	for _, ts := range []string{"WAIT_BUYER_PAY", "TRADE_INVALID", "SOME_FUTURE_STATUS"} {
+		svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "none"}}
+		engine := webhookTestEngine(svc)
+		body := []byte("out_trade_no=order-w&trade_no=2023115&total_amount=29.90&notify_id=n_" + ts + "&notify_type=trade_status_sync&trade_status=" + ts + "&sign=xx")
+		rec := postRaw(engine, "/webhooks/payment/alipay", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", ts, rec.Code)
+		}
+		if svc.gotEvent.EventType != "trade_pending" {
+			t.Errorf("%s: event_type = %q, want trade_pending (惰性，绝不当支付成功)", ts, svc.gotEvent.EventType)
+		}
+		// 评审轮5 Minor-1：alipay 成功应答体必须是纯文本 "success"。
+		if rec.Body.String() != "success" {
+			t.Errorf("%s: alipay ack body = %q, want \"success\"", ts, rec.Body.String())
+		}
+	}
+}
+
+// 评审轮5 Minor-1：alipay 渠道成功应答体为纯文本 "success"（渠道契约；
+// 其他渠道 JSON 应答形状不变——stripe 用例继续钉 JSON envelope）。
+func TestWebhookHandler_Alipay_AckBodyIsSuccess(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+	body := []byte("out_trade_no=order-uuid-1&trade_no=2023110&total_amount=29.90&notify_id=n_ack&notify_type=trade_status_sync&trade_status=TRADE_SUCCESS&sign=xx")
+	rec := postRaw(engine, "/webhooks/payment/alipay", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "success" {
+		t.Errorf("alipay ack body = %q, want \"success\"", rec.Body.String())
+	}
+}
+
 // TestWebhookHandler_Alipay_WithSubExpires covers the sub_expires_at
 // RFC3339 parse path in parseAlipay.
 func TestWebhookHandler_Alipay_WithSubExpires(t *testing.T) {

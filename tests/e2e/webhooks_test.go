@@ -526,20 +526,14 @@ func TestWebhook_Alipay_LateRetryAcceptedAndDeduped(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first delivery (3h-old notify_time) must be accepted: %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
-	// 同一报文原样重投 → 200 + duplicate（webhook_events 幂等去重承担重放
-	// 防护，而非时间窗）。
+// 同一报文原样重投 → 200 "success"（评审轮5 Minor-1 应答契约），
+	// webhook_events 幂等去重吸收（重放防护归位幂等表，而非时间窗）。
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", body, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("retry of the same signed payload must be accepted: %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
-	var dup struct {
-		Data struct {
-			Duplicate bool `json:"duplicate"`
-		} `json:"data"`
-	}
-	resp.JSON(t, &dup)
-	if !dup.Data.Duplicate {
-		t.Errorf("second delivery of the same payload must dedup (duplicate=true): %s", string(resp.Body))
+	if string(resp.Body) != "success" {
+		t.Errorf("alipay ack body = %q, want \"success\"", string(resp.Body))
 	}
 	var payments int
 	if err := srv.DB.GetContext(context.Background(), &payments,
@@ -548,6 +542,94 @@ func TestWebhook_Alipay_LateRetryAcceptedAndDeduped(t *testing.T) {
 	}
 	if payments != 1 {
 		t.Errorf("payments = %d, want 1 (重投幂等，不重复入账)", payments)
+	}
+	// 同一 event_id 只有一行且已处理（重投被去重吸收）。
+	var processed int
+	if err := srv.DB.GetContext(context.Background(), &processed,
+		`SELECT count(*) FROM webhook_events WHERE channel = 'alipay' AND event_id = $1 AND processed_at IS NOT NULL`,
+		fmt.Sprintf("n_e2e_retry_%s", orderID)); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 {
+		t.Errorf("processed webhook_events = %d, want 1 (同一通知重投被幂等去重)", processed)
+	}
+}
+
+// ============================================================================
+// 评审轮5 Critical：WAIT_BUYER_PAY（真实"交易创建"触发）穿透防护——
+// total_amount 齐全也绝不得被结算为已支付
+// ============================================================================
+
+func TestWebhook_Alipay_WaitBuyerPay_Inert(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token := loginAndGetTokens(t, srv.Engine, "alipay-wbp", "yundian").AccessToken
+
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"monthly","channel":"alipay"}`, authHeader(token))
+	var r struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+
+	// 真实形态：trade_status_sync + WAIT_BUYER_PAY + total_amount 齐全。
+	// 必须惰性（trade_pending → ack 200 零域动作）：订单保持 pending、零
+	// 支付行、零订阅、应答体纯文本 "success"。
+	params := map[string]string{
+		"out_trade_no": orderID,
+		"trade_no":     "2023116_e2e_wbp",
+		"total_amount": "29.90",
+		"notify_id":    fmt.Sprintf("n_e2e_wbp_%s", orderID),
+		"notify_type":  "trade_status_sync",
+		"trade_status": "WAIT_BUYER_PAY",
+		"gmt_create":   "2026-09-12 22:30:00",
+	}
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", signAlipay(t, params), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("WAIT_BUYER_PAY webhook: %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+	if string(resp.Body) != "success" {
+		t.Errorf("alipay ack body = %q, want \"success\"", string(resp.Body))
+	}
+	var status string
+	if err := srv.DB.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Errorf("WAIT_BUYER_PAY must NOT settle the order, got status=%s (评审轮5 Critical)", status)
+	}
+	var payments, subs int
+	if err := srv.DB.GetContext(context.Background(), &payments,
+		`SELECT count(*) FROM payments WHERE order_id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if payments != 0 {
+		t.Errorf("payments = %d, want 0", payments)
+	}
+	var orderUserID string
+	if err := srv.DB.GetContext(context.Background(), &orderUserID,
+		`SELECT user_id FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.DB.GetContext(context.Background(), &subs,
+		`SELECT count(*) FROM subscriptions WHERE user_id = $1`, orderUserID); err != nil {
+		t.Fatal(err)
+	}
+	if subs != 0 {
+		t.Errorf("subscriptions = %d, want 0 (钱未到账不得发权益)", subs)
+	}
+	// 审计留痕：事件行落库且已处理（后续 TRADE_SUCCESS 到达仍会被正常处理）。
+	var processed int
+	if err := srv.DB.GetContext(context.Background(), &processed,
+		`SELECT count(*) FROM webhook_events WHERE channel = 'alipay' AND event_id = $1 AND processed_at IS NOT NULL`,
+		fmt.Sprintf("n_e2e_wbp_%s", orderID)); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 {
+		t.Errorf("processed webhook_events = %d, want 1 (audit-only ack)", processed)
 	}
 }
 

@@ -2331,6 +2331,56 @@ func TestPaymentService_OnWebhook_AlipayRefund_CumulativeSemantics(t *testing.T)
 	}
 }
 
+// 评审轮5 Critical：trade_pending（WAIT_BUYER_PAY 等未识别/非终态
+// trade_status 的惰性映射）落 OnWebhook default 分支——ack 200 零域动
+// 作：订单保持未支付、零支付行；事件行落库并标记已处理（审计留痕）。
+func TestPaymentService_OnWebhook_AlipayTradePending_Inert(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID := "evt-pending-" + mustNewUUID()[:8]
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: eventID, EventType: "trade_pending",
+		TransactionID: "txn-wbp-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("trade_pending must ack without error: %v", err)
+	}
+	if res == nil || res.DomainAction != "none" {
+		t.Errorf("result = %+v, want domain_action none (零域动作)", res)
+	}
+	var status string
+	if err := db.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Errorf("order = %s, want pending (钱未到账不得结算)", status)
+	}
+	var payments int
+	if err := db.GetContext(context.Background(), &payments,
+		`SELECT count(*) FROM payments WHERE order_id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if payments != 0 {
+		t.Errorf("payments = %d, want 0", payments)
+	}
+	// 审计留痕：事件行落库且已处理（重投被幂等去重）。
+	var processed *time.Time
+	if err := db.GetContext(context.Background(), &processed,
+		`SELECT processed_at FROM webhook_events WHERE channel = 'alipay' AND event_id = $1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	if processed == nil {
+		t.Error("webhook_events row must be recorded and marked processed (audit trail)")
+	}
+}
+
 // TestPaymentService_OnWebhook_Refund_MissingPayment covers the
 // "no payment row" branch in onRefundSucceeded (评审轮1 C2): the refund
 // event may arrive BEFORE the payment-success event (channel out-of-order

@@ -87,10 +87,17 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 	// Always 200 on success — duplicates, uninteresting event types, and
 	// real domain actions all converge to the same shape. The channel stops
 	// retrying on 2xx (per its own contract).
-	// Per CLAUDE.md envelope, `domain_action` and `duplicate` live INSIDE
+	// 评审轮5 Minor-1：Alipay 官方契约要求应答体含纯文本 "success" 才认
+	// 定投递成功，否则按 ~24h/8 次重投（控制台持续报错 + 审计噪音）——
+	// alipay 渠道返回纯文本 "success"；其他渠道 JSON 应答不变（Per
+	// CLAUDE.md envelope, `domain_action` and `duplicate` live INSIDE
 	// `data` (not as top-level keys). Channels parse this body, not the
 	// envelope itself, so they don't notice either way; the in-shape keys
-	// keep consumer apps that parse `data.*` working uniformly.
+	// keep consumer apps that parse `data.*` working uniformly）.
+	if channel == "alipay" {
+		c.String(http.StatusOK, "success")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": gin.H{
@@ -406,9 +413,17 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 	// 事件判别：trade_status 优先（真实形态）；为空回退 notify_type
 	// （老 mock 形态）。任何携带 refund_fee>0 的通知都进退款分支——包括
 	// TRADE_SUCCESS 的部分退款（分发键同时看 trade_status 与 refund_fee，
-	// 评审轮4 B）。
+	// 评审轮4 B）。switch 对真实 trade_status 域必须穷尽（评审轮5
+	// Critical）：default 把 WAIT_BUYER_PAY（商户可在控制台开启的"交易
+	// 创建"触发）、TRADE_INVALID 及任何未来新增状态映射为惰性类型
+	// "trade_pending"——OnWebhook 落 default 分支（domain_action="none"
+	// 的 audit-only ack 200，零域动作）。缺 default 时未识别状态会穿透
+	// notify_type=trade_status_sync 被 isPaymentSuccess 当支付成功：金额
+	// 校验通过 → 钱未到账权益永久生效。
 	eventType := notifyType
 	switch tradeStatus {
+	case "":
+		// 老 mock 形态：notify_type 回退判别（eventType 已是 notifyType）。
 	case "TRADE_CLOSED":
 		eventType = "trade_closed"
 	case "TRADE_SUCCESS", "TRADE_FINISHED":
@@ -417,6 +432,8 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 		} else {
 			eventType = "TRADE_SUCCESS"
 		}
+	default:
+		eventType = "trade_pending"
 	}
 
 	event := &service.WebhookEvent{

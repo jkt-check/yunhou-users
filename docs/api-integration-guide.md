@@ -1967,7 +1967,7 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 | 404 | `unknown channel` | 该 channel 对应的 webhook secret/key 未配置（如 `STRIPE_WEBHOOK_SECRET` 空时 Stripe 收 404；`WECHAT_PAY_API_V3_KEY` 空时 WeChat 收 404；`ALIPAY_PUBLIC_KEY_PATH` 空时 Alipay 收 404；`PAYPAL_WEBHOOK_ID_SANDBOX` / `PAYPAL_WEBHOOK_ID_LIVE` 空时 PayPal 收 404）。这是"channel 没启用"语义，运营侧需检查对应 env 是否漏配 | 否（重试同样 404） |
 | 500 | `signature verification failed` / `handler error` | 临时错误（DB 抖动、PayPal 上游 verify 接口超时等） | 是（渠道按其重试策略） |
 
-成功响应统一格式（标准 envelope）：
+成功响应统一格式（标准 envelope，alipay 渠道例外——按渠道契约返回纯文本 `success`）：
 
 ```json
 {

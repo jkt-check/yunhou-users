@@ -18,11 +18,45 @@ import (
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
+// nonGlobalPrefixes are the IANA special-purpose ranges NOT covered by
+// netip's IsLoopback/IsPrivate/IsLinkLocal*/IsMulticast/IsUnspecified that
+// must still never be upstream targets (评审轮1 I3): 100.64.0.0/10 is the
+// CGNAT shared space that carries the Alibaba cloud metadata endpoint
+// 100.100.100.200; 240.0.0.0/4 subsumes the limited broadcast
+// 255.255.255.255/32. The operator allowlist can still override each of
+// these (same semantics as the other checks).
+var nonGlobalPrefixes = []struct {
+	prefix netip.Prefix
+	reason string
+}{
+	{netip.MustParsePrefix("100.64.0.0/10"), "shared address space (CGNAT; carries cloud metadata 100.100.100.200)"},
+	{netip.MustParsePrefix("192.0.0.0/24"), "IETF protocol assignments"},
+	{netip.MustParsePrefix("192.0.2.0/24"), "documentation range (TEST-NET-1)"},
+	{netip.MustParsePrefix("198.18.0.0/15"), "benchmarking range"},
+	{netip.MustParsePrefix("198.51.100.0/24"), "documentation range (TEST-NET-2)"},
+	{netip.MustParsePrefix("203.0.113.0/24"), "documentation range (TEST-NET-3)"},
+	{netip.MustParsePrefix("240.0.0.0/4"), "reserved range (includes limited broadcast 255.255.255.255)"},
+	{netip.MustParsePrefix("64:ff9b:1::/48"), "local-use NAT64 prefix"},
+	{netip.MustParsePrefix("100::/64"), "discard-only prefix"},
+	{netip.MustParsePrefix("2001:db8::/32"), "documentation prefix"},
+	{netip.MustParsePrefix("3fff::/20"), "documentation prefix"},
+}
+
+// nat64WellKnown is 64:ff9b::/96 (RFC 6052 well-known NAT64 prefix): the
+// low 32 bits are a translated IPv4 address, so the address is judged by
+// the mapped IPv4 (评审轮1 I3: 映射回 IPv4 的按映射后判定).
+var nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
+
 // blockedReason describes why an address is not a permitted upstream target.
 // Anything that is not a globally routable unicast address is denied by
 // default; the operator allowlist is the ONLY way to permit non-global
 // targets (self-hosted intranet deployments).
 func blockedReason(ip netip.Addr) string {
+	ip = ip.Unmap()
+	if ip.Is6() && nat64WellKnown.Contains(ip) {
+		b := ip.As16()
+		return blockedReason(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
+	}
 	switch {
 	case ip.IsUnspecified():
 		return "unspecified address"
@@ -36,9 +70,13 @@ func blockedReason(ip netip.Addr) string {
 	case ip.IsPrivate():
 		// RFC1918 + fc00::/7 (fd00::/8 ULA)
 		return "private address"
-	default:
-		return ""
 	}
+	for _, np := range nonGlobalPrefixes {
+		if np.prefix.Contains(ip) {
+			return np.reason
+		}
+	}
+	return ""
 }
 
 // EgressValidator validates upstream URLs against the SSRF policy.
@@ -154,6 +192,53 @@ func (v *EgressValidator) ValidateURL(ctx context.Context, rawURL string) error 
 // the initial check (e.g. DNS-rebinding between config time and dial time).
 func (v *EgressValidator) ValidateRedirect(ctx context.Context, target string) error {
 	return v.ValidateURL(ctx, target)
+}
+
+// DialContext resolves host AT DIAL TIME and dials only addresses that pass
+// the same blockedReason/allowlist policy as ValidateURL (评审轮1 I4): the
+// resolution ValidateURL performed moments earlier and the resolver answer
+// at connection time can differ (DNS rebinding TOCTOU), so the policy must
+// bind to the actual dialed IP, not to a stale validation. Blocked
+// candidates are skipped (only validated IPs are dialed); the last failure
+// surfaces when nothing is dialable. TLS ServerName and the Host header
+// come from the request URL inside http.Transport, not from the dialed
+// address, so dialing by validated IP preserves both.
+func (v *EgressValidator) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("egress dial: split host/port %q: %v", addr, err)
+	}
+	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	allowed := func(host string, ip netip.Addr) (string, bool) {
+		ip = ip.Unmap()
+		if reason := blockedReason(ip); reason != "" && !v.allowlistEntry(host, []netip.Addr{ip}) {
+			return reason, false
+		}
+		return "", true
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if reason, ok := allowed(host, ip); !ok {
+			return nil, fmt.Errorf("egress dial: %s is blocked (%s)", ip.Unmap(), reason)
+		}
+		return d.DialContext(ctx, network, addr)
+	}
+	ips, err := v.resolve(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("egress dial: host %q does not resolve: %v", host, err)
+	}
+	var lastErr error
+	for _, ip := range ips {
+		if reason, ok := allowed(host, ip); !ok {
+			lastErr = fmt.Errorf("egress dial: host %q resolves to %s (%s) — blocked", host, ip.Unmap(), reason)
+			continue
+		}
+		conn, derr := d.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+		if derr == nil {
+			return conn, nil
+		}
+		lastErr = derr
+	}
+	return nil, lastErr
 }
 
 // reservedHeaderPrefixes blocks custom operator-configured request headers

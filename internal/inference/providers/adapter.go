@@ -190,19 +190,37 @@ type EgressChecker interface {
 	ValidateRedirect(ctx context.Context, target string) error
 }
 
+// egressDialer is the dial-time half of the egress policy (评审轮1 I4): the
+// checker that also validates every candidate IP AT CONNECTION TIME and
+// dials only validated addresses. ValidateURL's resolution and the resolver
+// answer at dial time can differ (DNS rebinding TOCTOU), so the policy must
+// bind to the actual dialed IP. *credentials.EgressValidator implements it;
+// test doubles that only implement EgressChecker keep the plain dialer.
+type egressDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
 // NewHTTPClient builds the shared dispatch client. There is deliberately no
 // client-level Timeout: stream lifetimes are bounded by the per-request
 // context (deployment.RequestTimeout) and the transport keeps explicit
 // dial / TLS / response-header deadlines so a silently-hung upstream fails
 // in seconds instead of pinning a connection. Redirects re-validate against
-// the egress policy (Task 4).
+// the egress policy (Task 4); when the egress checker also provides a
+// policy-binding DialContext, every dialed IP is validated at connection
+// time (I4 — covers the first dial AND post-redirect dials alike).
 func NewHTTPClient(egress EgressChecker) *http.Client {
+	dial := (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	if egress != nil {
+		if ed, ok := egress.(egressDialer); ok {
+			dial = ed.DialContext
+		}
+	}
 	c := &http.Client{Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dial,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,

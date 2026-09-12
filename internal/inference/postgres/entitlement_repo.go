@@ -95,6 +95,46 @@ func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e 
 	return mapError("insert entitlement", err)
 }
 
+// insertEntitlementOrReadWinnerTx is the getOrCreateWalletLocked pattern for
+// entitlements: INSERT ... ON CONFLICT (source_type, source_id, revision)
+// DO NOTHING RETURNING *; a conflicted (concurrent) create reads the winner
+// back in the SAME transaction. Unlike InsertEntitlementTx + catch
+// CodeConflict, no statement ever FAILS here — a unique_violation would
+// abort the whole tx (25P02) and poison every subsequent statement,
+// including the read-back (评审轮2 N-1: 并发 PAYG 开启的输家确定性 500).
+func (s *Store) insertEntitlementOrReadWinnerTx(ctx context.Context, tx *sqlx.Tx, e *domain.Entitlement) (*domain.Entitlement, error) {
+	status := string(e.Status)
+	if status == "" {
+		status = string(domain.EntitlementActive)
+	}
+	if e.Revision == 0 {
+		e.Revision = 1
+	}
+	var row entitlementRow
+	err := tx.QueryRowxContext(ctx,
+		`INSERT INTO inference_entitlements
+		 (billing_account_id, source_type, source_id, model_ids, policy_version_id,
+		  anchor_at, effective_from, effective_to, revision, stackable, status)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		 ON CONFLICT (source_type, source_id, revision) DO NOTHING
+		 RETURNING *`,
+		e.BillingAccountID, string(e.SourceType), e.SourceID, strArr(e.ModelIDs),
+		e.PolicyVersionID, e.AnchorAt, e.EffectiveFrom, e.EffectiveTo,
+		e.Revision, e.Stackable, status).StructScan(&row)
+	switch {
+	case err == nil:
+		e.ID, e.CreatedAt, e.UpdatedAt = row.ID, row.CreatedAt, row.UpdatedAt
+		e.Status = domain.EntitlementStatus(status)
+		return e, nil
+	case errors.Is(err, sql.ErrNoRows):
+		// Lost the create race — read the winner (no failed statement, the
+		// tx is clean).
+		return s.getLatestEntitlementBySourceTx(ctx, tx, e.SourceType, e.SourceID)
+	default:
+		return nil, mapError("insert entitlement", err)
+	}
+}
+
 // GetLatestEntitlementBySource returns the highest-revision entitlement row
 // for one source (any status). The sync path needs the retired rows too —
 // a re-purchase after refund revives the same source in place.

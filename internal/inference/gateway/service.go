@@ -231,17 +231,23 @@ func (s *StreamBody) Terminal() bool { return s.tap.Result().Terminal }
 func (s *StreamBody) Tap() providers.TapResult { return s.tap.Result() }
 
 // Finish settles the request exactly once with the relay's end state.
+// 评审轮2 B1 顺序不变式：finalize（settle 落账、请求终态化）必须先于
+// keeper.Stop（释放双租约）——"持有租约"与"未终态"严格同区间。旧顺序
+// 先放租约后结算，settle 提交前的窗口里恢复扫描的活性 guard（held 未过
+// 期租约）不再保护该请求：存量超 grace 部署 + 超 grace 长流会被 sweep
+// 全额保守结算，真实用量随后被终态守卫吞掉。finalize 失败（停放语义）
+// 时租约仍照常释放——延迟释放但绝不提前。
 func (s *StreamBody) Finish(end StreamEnd) error {
 	s.once.Do(func() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		s.finErr = s.finalize(end)
 		if s.keeper != nil {
 			ctx, cancel := detached(settleTimeout)
 			defer cancel()
 			s.keeper.Stop(ctx)
 		}
-		s.finErr = s.finalize(end)
 	})
 	return s.finErr
 }

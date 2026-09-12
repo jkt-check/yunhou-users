@@ -2115,6 +2115,80 @@ func TestPaymentService_OnWebhook_PaymentFailed_AfterPaid(t *testing.T) {
 	_ = res // silence unused
 }
 
+// 评审轮2 N-2：Alipay trade_closed 未支付关单（订单 pending，永远不会有
+// 支付行）→ audit+200 即止，不得返错制造一天 500 重试风暴。
+func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: "evt-close-" + mustNewUUID()[:8], EventType: "trade_closed",
+		TransactionID: "txn-never-paid-" + mustNewUUID()[:8], OrderID: order.ID,
+		RefundAmount: 29.9, ExternalRefundID: "rf_close",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("unpaid close must ack 200 (audit only), got: %v", err)
+	}
+	if res == nil || res.DomainAction != "refund_paid" {
+		t.Errorf("result = %+v", res)
+	}
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unpaid_order'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("unpaid-order audit rows = %d, want 1", n)
+	}
+	// 未支付关单不得落任何退款行。
+	var refunds int
+	if err := db.GetContext(context.Background(), &refunds, `SELECT count(*) FROM refunds`); err != nil {
+		t.Fatal(err)
+	}
+	if refunds != 0 {
+		t.Errorf("refund rows = %d, want 0 (未支付订单无退款事实)", refunds)
+	}
+}
+
+// 评审轮2 N-2 边界：订单已支付但支付行缺失（退款先于支付事件，轮 1 C2
+// 语义保持）→ 返错重投；e.OrderID 指向不存在的订单 → 同样返错。
+func TestPaymentService_OnWebhook_Refund_PaidOrderMissingPaymentRow(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 订单已支付、支付行尚未落库（乱序窗口）。
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET status = 'paid' WHERE id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-rf-paid-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-missing-" + mustNewUUID()[:8], OrderID: order.ID,
+		RefundAmount: 29.9, ExternalRefundID: "re_missing",
+		RawPayload: json.RawMessage(`{}`),
+	}); err == nil {
+		t.Fatal("paid order with missing payment row must return an error so the channel retries (C2)")
+	}
+	// 订单不存在 → 返错。
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-rf-ghost-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-ghost-" + mustNewUUID()[:8], OrderID: mustNewUUID(),
+		RefundAmount: 29.9, ExternalRefundID: "re_ghost",
+		RawPayload: json.RawMessage(`{}`),
+	}); err == nil {
+		t.Fatal("refund for a nonexistent order must return an error")
+	}
+}
+
 // TestPaymentService_OnWebhook_Refund_MissingPayment covers the
 // "no payment row" branch in onRefundSucceeded (评审轮1 C2): the refund
 // event may arrive BEFORE the payment-success event (channel out-of-order

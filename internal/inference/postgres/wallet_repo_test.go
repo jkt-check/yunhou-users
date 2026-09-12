@@ -935,6 +935,59 @@ func TestPAYGEntitlement_SingleConnectionPool(t *testing.T) {
 	}
 }
 
+// 评审轮2 N-1：多个连接并发 EnablePAYG（双击/超时重试形态）——赢家创建、
+// 输家在同 tx 读回（INSERT ON CONFLICT DO NOTHING 不产生 25P02 毒化），
+// 双方都成功且权益恰一行（端点契约幂等）。
+func TestPAYGEntitlement_ConcurrentEnable_Idempotent(t *testing.T) {
+	db, s := testDB(t)
+	db.SetMaxOpenConns(8)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'published' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutPAYGConfig(ctx, f.policyID, []string{f.modelID}, "user:ops@app:test"); err != nil {
+		t.Fatal(err)
+	}
+
+	const racers = 6
+	errs := make(chan error, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			uow, err := s.Begin(ctx)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if _, err := s.EnsurePAYGEntitlementTx(ctx, uow, f.accountID, time.Now().UTC()); err != nil {
+				_ = uow.Rollback(ctx)
+				errs <- err
+				return
+			}
+			errs <- uow.Commit(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent enable must all succeed (N-1: no 25P02 poison): %v", err)
+		}
+	}
+	var n int
+	if err := s.db.Get(&n,
+		`SELECT COUNT(*) FROM inference_entitlements
+		 WHERE billing_account_id = $1 AND source_type = 'payg'`, f.accountID); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("entitlements = %d, want exactly 1 (并发开启幂等)", n)
+	}
+}
+
 // TestWalletAuditTrail: 开启/关闭/改上限全部写审计行（裁决 4）。
 func TestWalletAuditTrail(t *testing.T) {
 	_, s := testDB(t)

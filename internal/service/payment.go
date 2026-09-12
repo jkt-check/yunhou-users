@@ -2170,11 +2170,34 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE
 	`, e.Channel, e.TransactionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			// 评审轮2 N-2：TRADE_CLOSED/trade_closed 是双义事件——既表"未
+			// 支付超时/取消关单"（高频正常事件，永远无支付行、不可能有退
+			// 款），也表已支付交易的关闭。仅对该双义类型用 e.OrderID
+			// （Alipay/WeChat 的 out_trade_no）反查订单：订单存在且从未支
+			// 付（pending/expired/cancelled/failed）→ audit+200 即止（返
+			// 错会让每个未支付关单重试一整天的 500 风暴+审计噪音）。
+			// charge.refunded/TRANSACTION.REFUND 等无歧义退款事件不走此分
+			// 支——查无支付行一律按乱序处理（保轮 1 C2 语义）。
+			if e.OrderID != "" && (e.EventType == "TRADE_CLOSED" || e.EventType == "trade_closed") {
+				var orderStatus string
+				if oerr := tx.GetContext(ctx, &orderStatus,
+					`SELECT status FROM orders WHERE id = $1`, e.OrderID); oerr == nil &&
+					(orderStatus == "pending" || orderStatus == "expired" ||
+						orderStatus == "cancelled" || orderStatus == "failed") {
+					return s.writeAudit(ctx, "service", "webhook_refund_unpaid_order",
+						fmt.Sprintf("event:%s", e.EventID),
+						[]string{"webhook", "unpaid_order"},
+						map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID,
+							"order_id": e.OrderID, "order_status": orderStatus, "event_id": e.EventID},
+					)
+				}
+			}
 			// 评审轮1 C2：退款事件可能先于支付成功事件到达（渠道乱序投递）。
 			// 审计照留（writeAudit 独立连接提交，不随本事务回滚），但必须返回
 			// 错误让 handler 映射为非 2xx —— 渠道按其重投计划再次投递；ack
 			// 200 会让 OnWebhook 标记 processed、渠道不再重投，之后支付成功
-			// 照常给钱包充值而退款永久丢失（双花）。
+			// 照常给钱包充值而退款永久丢失（双花）。订单不存在或订单已支付
+			// 但支付行缺失都落此分支。
 			if aerr := s.writeAudit(ctx, "service", "webhook_refund_unknown_payment",
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "unknown_payment"},

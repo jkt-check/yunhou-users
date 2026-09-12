@@ -1063,12 +1063,8 @@ func (s *Store) EnsurePAYGEntitlementTx(ctx context.Context, w domain.UnitOfWork
 		return nil, err
 	}
 	ent.BillingAccountID = accountID
-	if err := s.InsertEntitlementTx(ctx, w, ent); err != nil {
-		if domain.CodeOf(err) == domain.CodeConflict {
-			// 并发开启撞唯一键：读回赢家（同 tx，M3）。
-			return s.getLatestEntitlementBySourceTx(ctx, tx, domain.SourcePAYG, srcID)
-		}
-		return nil, err
-	}
-	return ent, nil
+	// 评审轮2 N-1：INSERT ... ON CONFLICT DO NOTHING + 同 tx 读回赢家——
+	// 不让 unique_violation 发生（一旦发生事务即 25P02 中止，同事务读回
+	// 必败，并发开启的输家确定性 500）。
+	return s.insertEntitlementOrReadWinnerTx(ctx, tx, ent)
 }

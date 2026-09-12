@@ -29,15 +29,21 @@ var nonGlobalPrefixes = []struct {
 	prefix netip.Prefix
 	reason string
 }{
+	{netip.MustParsePrefix("0.0.0.0/8"), "this-host/source addresses (0.0.0.0/8)"},
 	{netip.MustParsePrefix("100.64.0.0/10"), "shared address space (CGNAT; carries cloud metadata 100.100.100.200)"},
 	{netip.MustParsePrefix("192.0.0.0/24"), "IETF protocol assignments"},
 	{netip.MustParsePrefix("192.0.2.0/24"), "documentation range (TEST-NET-1)"},
+	{netip.MustParsePrefix("192.88.99.0/24"), "6to4 relay anycast (deprecated)"},
 	{netip.MustParsePrefix("198.18.0.0/15"), "benchmarking range"},
 	{netip.MustParsePrefix("198.51.100.0/24"), "documentation range (TEST-NET-2)"},
 	{netip.MustParsePrefix("203.0.113.0/24"), "documentation range (TEST-NET-3)"},
 	{netip.MustParsePrefix("240.0.0.0/4"), "reserved range (includes limited broadcast 255.255.255.255)"},
 	{netip.MustParsePrefix("64:ff9b:1::/48"), "local-use NAT64 prefix"},
 	{netip.MustParsePrefix("100::/64"), "discard-only prefix"},
+	{netip.MustParsePrefix("2001:1::1/128"), "Port Control Protocol anycast"},
+	{netip.MustParsePrefix("2001:1::2/128"), "Traversal Using Relays around NAT anycast"},
+	{netip.MustParsePrefix("2001:2::/48"), "benchmarking prefix"},
+	{netip.MustParsePrefix("2001:10::/28"), "ORCHIDv1 (deprecated)"},
 	{netip.MustParsePrefix("2001:db8::/32"), "documentation prefix"},
 	{netip.MustParsePrefix("3fff::/20"), "documentation prefix"},
 }
@@ -51,8 +57,12 @@ var nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
 // Anything that is not a globally routable unicast address is denied by
 // default; the operator allowlist is the ONLY way to permit non-global
 // targets (self-hosted intranet deployments).
+//
+// 评审轮2 S-1：策略判定剥离 IPv6 zone——netip.Prefix.Contains 对带 zone
+// 地址一律 false，URL 字面 host 可携带 zone（%25 编码）绕过全部前缀与
+// NAT64 映射判定；拨号仍用原始带 zone 形式（DialContext 侧不剥）。
 func blockedReason(ip netip.Addr) string {
-	ip = ip.Unmap()
+	ip = ip.Unmap().WithZone("")
 	if ip.Is6() && nat64WellKnown.Contains(ip) {
 		b := ip.As16()
 		return blockedReason(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
@@ -176,7 +186,7 @@ func (v *EgressValidator) ValidateURL(ctx context.Context, rawURL string) error 
 	for _, ip := range ips {
 		ip = ip.Unmap()
 		if reason := blockedReason(ip); reason != "" {
-			if v.allowlistEntry(host, []netip.Addr{ip}) {
+			if v.allowlistEntry(host, []netip.Addr{ip.WithZone("")}) {
 				continue
 			}
 			return fmt.Errorf("upstream host %q resolves to %s (%s); add it to INFERENCE_UPSTREAM_ALLOWLIST to permit an internal target", host, ip, reason)
@@ -211,7 +221,7 @@ func (v *EgressValidator) DialContext(ctx context.Context, network, addr string)
 	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	allowed := func(host string, ip netip.Addr) (string, bool) {
 		ip = ip.Unmap()
-		if reason := blockedReason(ip); reason != "" && !v.allowlistEntry(host, []netip.Addr{ip}) {
+		if reason := blockedReason(ip); reason != "" && !v.allowlistEntry(host, []netip.Addr{ip.WithZone("")}) {
 			return reason, false
 		}
 		return "", true

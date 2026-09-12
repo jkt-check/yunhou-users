@@ -57,6 +57,19 @@ func TestValidateURLBlocksMetadataAndInternal(t *testing.T) {
 		"http://[100::1]/v1",             // discard-only
 		"http://[2001:db8::1]/v1",        // documentation v6
 		"http://[3fff::1]/v1",            // documentation v6
+		// 评审轮2 S-3：残余漏网段。
+		"http://0.0.0.1/v1",           // 0.0.0.0/8 整段（非只 0.0.0.0）
+		"http://0.255.255.255/v1",     // 0.0.0.0/8 整段
+		"http://192.88.99.1/v1",       // 6to4 relay anycast
+		"http://[2001:2::1]/v1",       // benchmarking v6
+		"http://[2001:10::1]/v1",      // ORCHIDv1
+		"http://[2001:1::1]/v1",       // PCP anycast
+		"http://[2001:1::2]/v1",       // TURN anycast
+		// 评审轮2 S-1：带 zone 的地址不得绕过前缀/NAT64 判定。
+		"http://[64:ff9b::a9fe:a9fe%25eth0]/v1", // NAT64→metadata，带 zone
+		"http://[2001:db8::1%25eth0]/v1",        // 文档段，带 zone
+		"http://[fe80::1%25eth0]/v1",            // link-local，带 zone
+		"http://[100::1%25eth0]/v1",             // discard-only，带 zone
 		"ftp://93.184.216.34/v1",    // scheme
 		"http://user:pass@93.184.216.34/v1", // userinfo
 		"/relative/path",            // not absolute
@@ -70,6 +83,10 @@ func TestValidateURLBlocksMetadataAndInternal(t *testing.T) {
 	// NAT64 映射到公网地址则按公网放行（映射后判定语义对称）。
 	if err := v.ValidateURL(context.Background(), "http://[64:ff9b::5db8:d822]/v1"); err != nil {
 		t.Errorf("NAT64 of a public address (93.184.216.34) must be allowed: %v", err)
+	}
+	// 带 zone 的公网地址同样放行（zone 只影响策略判定的剥离，不构成拒绝理由）。
+	if err := v.ValidateURL(context.Background(), "http://[2606:4700:4700::1111%25eth0]/v1"); err != nil {
+		t.Errorf("public address with a zone must be allowed: %v", err)
 	}
 }
 

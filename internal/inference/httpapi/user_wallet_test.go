@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -374,9 +375,57 @@ func TestUserWalletEntries_Pagination(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("missing currency: %d", w.Code)
 	}
-	// 非法游标 → 400。
+// 非法游标 → 400。
 	w = f.do(t, http.MethodGet, "/userw/wallet/entries?currency=CNY&cursor=abc", tok, nil, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("bad cursor: %d", w.Code)
+	}
+}
+
+// 评审轮2 S-2：客户流水的 created_by 只保留归因类别（operator/payment/
+// system），不回显运营身份（UUID@app）或支付 ID；运营面保持完整归因。
+func TestUserWalletEntries_CreatedByNormalized(t *testing.T) {
+	f := newWalletFixture(t)
+	userID, tok := f.views.addUser(t)
+	f.seedCustomerWallet(t, userID, 3_000_000, 2_000_000) // topup(payment:pay-…) + bonus(operator:user:ops@app:test)
+
+	w := f.do(t, http.MethodGet, "/userw/wallet/entries?currency=CNY&limit=50", tok, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("entries: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "user:ops") {
+		t.Fatalf("customer entries leak operator identity: %s", w.Body.String())
+	}
+	data := decodeData(t, w)
+	entries, _ := data["entries"].([]any)
+	if len(entries) != 2 {
+		t.Fatalf("entries = %v", data)
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		cb := e.(map[string]any)["created_by"].(string)
+		if strings.Contains(cb, ":") {
+			t.Errorf("created_by = %q, want category only (identity stripped)", cb)
+		}
+		seen[cb] = true
+	}
+	if !seen["payment"] || !seen["operator"] {
+		t.Errorf("created_by categories = %v, want payment+operator", seen)
+	}
+
+	// 运营面（/admin/wallet/adjustments）仍见完整归因。
+	acct, err := f.store.GetBillingAccountByUser(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminID := uuid.NewString()
+	f.grantBillingAdmin(t, adminID)
+	w = f.do(t, http.MethodGet, "/adminw/wallet/adjustments?billing_account_id="+acct.ID, "",
+		nil, map[string]string{"X-Test-User": adminID, "X-Test-App": "ops-console"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("admin adjustments: %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "user:ops@app:test") {
+		t.Errorf("admin surface must keep full attribution, got %s", w.Body.String())
 	}
 }

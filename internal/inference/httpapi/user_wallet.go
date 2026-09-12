@@ -15,6 +15,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -199,7 +200,7 @@ func (h *UserWalletHandler) Entries(c *gin.Context) {
 			EntryType: e.EntryType, Direction: e.Direction, Source: e.Source,
 			AmountMicros: strconv.FormatInt(e.AmountMicros, 10), Currency: e.Currency,
 			RequestID: e.RequestID, PaymentID: e.PaymentID, RefundID: e.RefundID,
-			CreatedBy: e.CreatedBy,
+			CreatedBy: walletCreatedByPublic(e.CreatedBy),
 			CreatedAt: e.CreatedAt.UTC().Format(time.RFC3339),
 		}
 		if e.ReversesEntryID != nil {
@@ -213,6 +214,17 @@ func (h *UserWalletHandler) Entries(c *gin.Context) {
 		next = &s
 	}
 	ok(c, gin.H{"entries": out, "next_cursor": next})
+}
+
+// walletCreatedByPublic normalizes created_by for the CUSTOMER statement
+// (评审轮2 S-2)：保留冒号前的归因类别（operator/payment/system），剥离
+// 身份部分（运营 subject 里的用户 UUID@app、payment id）——客户流水不得
+// 原样回显运营身份。运营面（/admin/wallet*）仍输出原值。
+func walletCreatedByPublic(createdBy string) string {
+	if i := strings.IndexByte(createdBy, ':'); i >= 0 {
+		return createdBy[:i]
+	}
+	return createdBy
 }
 
 type setOverageRequest struct {

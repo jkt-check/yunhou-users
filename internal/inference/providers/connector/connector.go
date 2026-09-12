@@ -10,10 +10,11 @@
 // The client is vendor-neutral: each vendor is described by a Spec from the
 // deployment registry (INFERENCE_OAUTH_CONNECTORS_JSON) so onboarding a new
 // OAuth vendor is configuration, not code. 安全边界如实口径（审查修复
-// M-2）：注册表加载时只校验"绝对 http(s) URL 形状 + 必填字段"；出站
-// SSRF/egress 校验由调用方注入的 HTTP 客户端承担（cmd/server 用
-// providers.NewHTTPClient(egressValidator)，且仅覆盖重定向目标——厂商
-// 端点本身是运营显式配置的受信地址，不在 egress 拦截范围）。
+// M-2，评审轮1 I4 起首拨同覆盖）：注册表加载时只校验"绝对 http(s) URL
+// 形状 + 必填字段"；出站 SSRF/egress 校验由调用方注入的 HTTP 客户端承担
+// （cmd/server 用 providers.NewHTTPClient(egressValidator)——DialContext
+// 对每次拨号的实际 IP 跑策略判定，首拨与重定向目标同覆盖；egress 拦截
+// 的非全局地址仍须运营显式 allowlist）。
 package connector
 
 import (

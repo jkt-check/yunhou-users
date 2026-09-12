@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -199,6 +200,46 @@ func TestDeploymentOptimisticLockAndRouteGuards(t *testing.T) {
 	bad.BaseURL = "https://169.254.169.254/latest"
 	if err := svc.UpdateDeployment(ctx, &bad); err == nil {
 		t.Error("metadata address must be rejected")
+	}
+}
+
+// 对抗评审 C1（管理面写闸）：request_timeout 达到/超过生效 recovery grace
+// 的 deployment 写入必须被拒绝——否则超 grace 的活请求会被恢复扫描全额误
+// 结算，真实用量随后被终态守卫吞掉。
+func TestDeploymentWriteRejectsTimeoutBeyondRecoveryGrace(t *testing.T) {
+	_, _, svc := testDB(t)
+	ctx := context.Background()
+	prov := &domain.Provider{Code: "grace-prov", DisplayName: "P", AccessType: domain.AccessOfficialAPI}
+	if err := svc.CreateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	over := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "m", BaseURL: "https://api.example.com/v1",
+		Protocol: domain.ProtocolOpenAIChat, RequestTimeout: 16 * time.Minute, // > 默认 grace 15m
+	}
+	if err := svc.CreateDeployment(ctx, over); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("create with timeout above grace: err = %v, want invalid_input", err)
+	}
+
+	// 合法超时照常写入；随后向超 grace 方向的 Update 同样被拒。
+	ok := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "m", BaseURL: "https://api.example.com/v1",
+		Protocol: domain.ProtocolOpenAIChat, RequestTimeout: 5 * time.Minute,
+	}
+	if err := svc.CreateDeployment(ctx, ok); err != nil {
+		t.Fatalf("create within grace: %v", err)
+	}
+	ok.RequestTimeout = 20 * time.Minute
+	if err := svc.UpdateDeployment(ctx, ok); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("update raising timeout above grace: err = %v, want invalid_input", err)
+	}
+	// 默认 request_timeout（600s）在 grace 地板（12m）之下：默认路径永不被误伤。
+	def := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "m2", BaseURL: "https://api2.example.com/v1",
+		Protocol: domain.ProtocolOpenAIChat,
+	}
+	if err := svc.CreateDeployment(ctx, def); err != nil {
+		t.Fatalf("default-timeout create rejected: %v", err)
 	}
 }
 

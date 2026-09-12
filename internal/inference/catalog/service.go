@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/domain"
@@ -100,6 +101,48 @@ func ValidateProvider(p *domain.Provider) error {
 // (DNS pinning, private-range policy for self-hosted allowlists) lands
 // with Task 4; this guards the catalog boundary already.
 var metadataIP = net.ParseIP("169.254.169.254")
+
+// recoveryGraceNs holds the EFFECTIVE recovery grace window
+// (INFERENCE_RECOVERY_GRACE; default 15m, floored at 12m by
+// config.Validate) in nanoseconds. Deployment write validation compares
+// RequestTimeout against this value, not against a hardcoded constant, so
+// an operator-lowered grace tightens the write gate immediately.
+var recoveryGraceNs atomic.Int64
+
+func init() { recoveryGraceNs.Store(int64(15 * time.Minute)) }
+
+// SetRecoveryGrace wires the effective recovery grace into deployment write
+// validation. It must be called once at startup with the VALIDATED config
+// value (before any catalog write or env import); non-positive values are
+// ignored so the safe default survives a miswire.
+func SetRecoveryGrace(d time.Duration) {
+	if d > 0 {
+		recoveryGraceNs.Store(int64(d))
+	}
+}
+
+// RecoveryGrace returns the effective recovery grace window used by
+// deployment write validation (config default 15m when never wired).
+func RecoveryGrace() time.Duration { return time.Duration(recoveryGraceNs.Load()) }
+
+// ValidateDeploymentRecoveryWindow enforces the RequestTimeout < recovery
+// grace coupling on the WRITE path (operator CRUD, bulk import and env
+// import all funnel here; published snapshots are exempt — ParseSnapshot
+// must stay able to LOAD older revisions). A request timeout at or above
+// the grace defeats both staleness guards of the recovery sweep: a live
+// dispatch/stream can sit in one state past the cutoff with every attempt
+// older than the grace, and the sweep would then settle it at the FULL
+// hold while the real usage arrives later and is swallowed by the settled
+// guard (对抗评审 C1). Raise INFERENCE_RECOVERY_GRACE first if a longer
+// timeout is genuinely needed.
+func ValidateDeploymentRecoveryWindow(d *domain.Deployment) error {
+	grace := RecoveryGrace()
+	if d.RequestTimeout >= grace {
+		return domain.NewError(domain.CodeInvalidInput,
+			fmt.Sprintf("request_timeout_ms (%s) must be below the recovery grace (%s); raise INFERENCE_RECOVERY_GRACE first — a timeout at/above the grace lets the recovery sweep settle a still-live request at its full hold", d.RequestTimeout, grace))
+	}
+	return nil
+}
 
 // ValidateDeployment checks the deployment invariants.
 func ValidateDeployment(d *domain.Deployment) error {
@@ -383,6 +426,9 @@ func (s *Service) CreateDeployment(ctx context.Context, d *domain.Deployment) er
 	if err := ValidateDeployment(d); err != nil {
 		return err
 	}
+	if err := ValidateDeploymentRecoveryWindow(d); err != nil {
+		return err
+	}
 	return s.store.InsertDeployment(ctx, d)
 }
 
@@ -402,6 +448,9 @@ func (s *Service) UpdateDeployment(ctx context.Context, d *domain.Deployment) er
 			"config_version version token is required (read the deployment first)")
 	}
 	if err := ValidateDeployment(d); err != nil {
+		return err
+	}
+	if err := ValidateDeploymentRecoveryWindow(d); err != nil {
 		return err
 	}
 	return s.store.UpdateDeployment(ctx, d)

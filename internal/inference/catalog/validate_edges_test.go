@@ -102,6 +102,41 @@ func TestValidateDeployment_Edges(t *testing.T) {
 	}
 }
 
+// 对抗评审 C1：RequestTimeout 不得超过生效 recovery grace——否则超 grace
+// 的活请求会被恢复扫描按全额预占误结算，真实用量到达时撞终态守卫被吞。
+func TestValidateDeploymentRecoveryWindow_Edges(t *testing.T) {
+	dep := &domain.Deployment{RequestTimeout: 10 * time.Minute}
+	if err := ValidateDeploymentRecoveryWindow(dep); err != nil {
+		t.Fatalf("10m timeout under the default 15m grace rejected: %v", err)
+	}
+	// 边界：等于 grace 即拒绝（活请求可在 cutoff 之前完成全阶段）。
+	dep.RequestTimeout = 15 * time.Minute
+	if err := ValidateDeploymentRecoveryWindow(dep); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("timeout == grace: err = %v, want invalid_input", err)
+	}
+	dep.RequestTimeout = 16 * time.Minute
+	if err := ValidateDeploymentRecoveryWindow(dep); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("timeout > grace: err = %v, want invalid_input", err)
+	}
+	// 调低 grace（config.Validate 地板 12m）后，原来能写的 13m 必须被拦。
+	old := RecoveryGrace()
+	t.Cleanup(func() { SetRecoveryGrace(old) })
+	SetRecoveryGrace(12 * time.Minute)
+	dep.RequestTimeout = 13 * time.Minute
+	if err := ValidateDeploymentRecoveryWindow(dep); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("timeout > lowered grace: err = %v, want invalid_input", err)
+	}
+	dep.RequestTimeout = 10 * time.Minute
+	if err := ValidateDeploymentRecoveryWindow(dep); err != nil {
+		t.Errorf("10m timeout under the lowered 12m grace rejected: %v", err)
+	}
+	// 非正数布线不得破坏安全默认。
+	SetRecoveryGrace(0)
+	if RecoveryGrace() != 12*time.Minute {
+		t.Errorf("SetRecoveryGrace(0) clobbered the effective grace: %s", RecoveryGrace())
+	}
+}
+
 func TestValidateRoute_Edges(t *testing.T) {
 	ok := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true}
 	if err := ValidateRoute(ok); err != nil {

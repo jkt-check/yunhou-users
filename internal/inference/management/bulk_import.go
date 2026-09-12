@@ -276,6 +276,8 @@ func (s *BulkImportService) validateDocument(ctx context.Context, doc *BulkCatal
 			default:
 				if err := catalog.ValidateDeployment(dd); err != nil {
 					item.Status, item.Error = BulkItemError, err.Error()
+				} else if err := catalog.ValidateDeploymentRecoveryWindow(dd); err != nil {
+					item.Status, item.Error = BulkItemError, err.Error()
 				} else if err := s.validateDeploymentURL(ctx, d.BaseURL); err != nil {
 					item.Status, item.Error = BulkItemError, err.Error()
 				}

@@ -86,6 +86,35 @@ func TestBulkImport_DryRunWritesNothing(t *testing.T) {
 	}
 }
 
+// 对抗评审 C1（批量导入写闸）：request_timeout_ms 达到/超过生效 grace 的
+// deployment 逐项报错且阻断提交——与管理面同一 catalog 收口规则。
+func TestBulkImport_DeploymentTimeoutBeyondGraceRejected(t *testing.T) {
+	doc := validBulkDoc()
+	doc.Models[0].Deployments[0].RequestTimeoutMs = 16 * 60 * 1000 // 16m > 默认 grace 15m
+	fs := &fakeBulkStore{t: t}
+	svc := NewBulkImportService(fs, nil, func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-grace", doc, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.HasErrors() || res.Committed {
+		t.Fatalf("result = %+v, want per-item error and no commit", res)
+	}
+	var depErr bool
+	for _, it := range res.Items {
+		if it.Kind == BulkKindDeployment && it.Status == BulkItemError &&
+			strings.Contains(it.Error, "recovery grace") {
+			depErr = true
+		}
+	}
+	if !depErr {
+		t.Fatalf("deployment item error missing recovery-grace rejection: %+v", res.Items)
+	}
+	if fs.applied != nil {
+		t.Fatal("timeout-beyond-grace document must not reach the write path")
+	}
+}
+
 func TestBulkImport_PerItemErrorsBlockCommit(t *testing.T) {
 	doc := validBulkDoc()
 	doc.Models = append(doc.Models, BulkModel{

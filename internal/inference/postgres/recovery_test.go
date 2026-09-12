@@ -229,6 +229,77 @@ func TestListStaleOpenRequests(t *testing.T) {
 	}
 }
 
+// 对抗评审 C1（活性 guard）：updated_at 老于 cutoff、attempt 也老化的请求，
+// 只要仍持未过期的 held 并发租约（keeper 每 TTL/3 续租，活着的 dispatch/
+// 流恒持租约）就绝不能被扫描为崩溃候选；租约过期后才允许扫描。
+func TestListStaleOpenRequests_LiveLeaseGuard(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 长活形状：状态跃迁与 attempt 全部老于 cutoff（两道旧 guard 均失效）。
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Hour)
+	uow2, _ := s.Begin(ctx)
+	if err := insertAttempt(ctx, mustTx(t, uow2), &domain.Attempt{
+		ID: uuid.NewString(), RequestID: adm.RequestID, AttemptNo: 1, StartedAt: &old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE inference_requests SET status='streaming', updated_at = $2 WHERE id = $1`,
+		adm.RequestID, old); err != nil {
+		t.Fatal(err)
+	}
+	// 活着的 keeper：持有未过期租约（续租节奏 TTL/3，expires_at 恒在未来）。
+	if _, err := s.AcquireLease(ctx, domain.AcquireLeaseCommand{
+		Scope: domain.LeaseScopeBillingAccount, ScopeID: f.accountID,
+		RequestID: adm.RequestID, Limit: 4, TTL: 5 * time.Minute, Now: now,
+	}); err != nil {
+		t.Fatalf("acquire lease: %v", err)
+	}
+	stale, err := s.ListStaleOpenRequests(ctx, now.Add(-time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range stale {
+		if r.ID == adm.RequestID {
+			t.Fatalf("live request %s (held unexpired lease) swept as crash candidate", adm.RequestID)
+		}
+	}
+	// 租约被超时回收（持有者真死 → state='expired'）→ 允许扫描。
+	if _, err := s.db.Exec(
+		`UPDATE inference_concurrency_leases SET state = 'expired' WHERE request_id = $1`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	stale, err = s.ListStaleOpenRequests(ctx, now.Add(-time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range stale {
+		if r.ID == adm.RequestID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("request whose lease lapsed must become a crash candidate")
+	}
+}
+
 func TestReconciliationJobUpsertAndEscalation(t *testing.T) {
 	_, s := testDB(t)
 	ctx := context.Background()

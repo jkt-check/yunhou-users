@@ -200,6 +200,10 @@ func main() {
 	// idempotent: it inserts only what is missing and never overwrites
 	// DB-operational config on restart (基线报告差距 1).
 	infStore := inferencepostgres.NewStore(db)
+	// 联动校验落地（对抗评审 C1）：deployment 写路径的 RequestTimeout 上限跟
+	// 随生效的 recovery grace——调低 INFERENCE_RECOVERY_GRACE 立即收紧写闸。
+	// 必须在任何目录写入/env 导入之前完成布线。
+	inferencecatalog.SetRecoveryGrace(cfg.InferenceRecoveryGrace)
 	catalogSvc := inferencecatalog.NewService(infStore)
 
 	// Task 10: payment → entitlement closed loop. The benefit repo gates

@@ -155,6 +155,9 @@ func ParseEnvCatalog(raw string) (*EnvCatalog, error) {
 			if err := ValidateDeployment(&dd); err != nil {
 				return nil, domain.WrapError(domain.CodeInvalidInput, "model "+m.ID, err)
 			}
+			if err := ValidateDeploymentRecoveryWindow(&dd); err != nil {
+				return nil, domain.WrapError(domain.CodeInvalidInput, "model "+m.ID, err)
+			}
 		}
 	}
 	return &ec, nil

@@ -148,8 +148,8 @@ var openRequestStatuses = []string{
 }
 
 // ListStaleOpenRequests returns in-flight requests whose last state change
-// is older than the cutoff — crash candidates. Two guards keep the sweep off
-// LIVE requests (审查修复 Critical 1):
+// is older than the cutoff — crash candidates. Three guards keep the sweep
+// off LIVE requests (审查修复 Critical 1 + 对抗评审 C1):
 //
 //  1. updated_at < cutoff — state-transition recency. NOT sufficient alone:
 //     a live request can sit in ONE state far longer than any naive grace
@@ -158,7 +158,15 @@ var openRequestStatuses = []string{
 //  2. NOT EXISTS an attempt started within the grace window — attempt intent
 //     persists BEFORE dispatch, so a recent started_at means the request may
 //     legitimately still be mid-flight. Grace (> worst live phase) then
-//     guarantees any attempt older than grace has exceeded its timeout.
+//     guarantees any attempt older than grace has exceeded its timeout,
+//     PROVIDED RequestTimeout < grace holds for every deployment — the
+//     write path enforces that coupling
+//     (catalog.ValidateDeploymentRecoveryWindow), and
+//  3. NOT EXISTS a held, unexpired concurrency lease for the request — the
+//     lease keeper renews every TTL/3 for the WHOLE dispatch/stream life
+//     (upstream lease + account lease, request-scoped), so any live request
+//     continuously holds an unexpired lease row; only a genuinely dead
+//     holder lets it lapse.
 //
 // Sweeping a live request would settle it at the FULL hold while its stream
 // is still producing — the real usage arriving later would hit the settled
@@ -175,6 +183,9 @@ func (s *Store) ListStaleOpenRequests(ctx context.Context, cutoff time.Time, lim
 		   AND NOT EXISTS (
 		       SELECT 1 FROM inference_attempts a
 		       WHERE a.request_id = r.id AND a.started_at IS NOT NULL AND a.started_at >= $2)
+		   AND NOT EXISTS (
+		       SELECT 1 FROM inference_concurrency_leases l
+		       WHERE l.request_id = r.id AND l.state = 'held' AND l.expires_at > now())
 		 ORDER BY r.updated_at LIMIT $3`,
 		openRequestStatuses, cutoff.UTC(), limit); err != nil {
 		return nil, mapError("recovery: scan stale open", err)

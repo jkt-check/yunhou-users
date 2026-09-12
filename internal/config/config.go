@@ -440,8 +440,10 @@ func (c *Config) Validate() error {
 	// (default 10min) covers dispatch, nginx lets /v1/chat/completions SSE
 	// run 700s, settlement adds 15s. A shorter grace sweeps live long
 	// requests and settles them at the full hold while still streaming.
-	// 联动校验：raising a deployment's RequestTimeout above this floor
-	// requires raising INFERENCE_RECOVERY_GRACE accordingly.
+	// 联动校验（对抗评审 C1 已落地）：deployment 写路径强制
+	// RequestTimeout < 生效 grace —— catalog.SetRecoveryGrace 在启动时以本
+	// 值布线，catalog.ValidateDeploymentRecoveryWindow 在 operator CRUD /
+	// 批量导入 / env 导入三处收口执行比较。
 	if c.InferenceRecoveryGrace < 12*time.Minute {
 		return fmt.Errorf("INFERENCE_RECOVERY_GRACE=%s is below the 12m floor (must exceed worst live request phase: 700s SSE relay + 15s settlement)", c.InferenceRecoveryGrace)
 	}

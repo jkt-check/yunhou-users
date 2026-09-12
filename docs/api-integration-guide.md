@@ -519,6 +519,15 @@ Authorization: Bearer <access_token>
 Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-plan`）。本节是 Website 客户控制台的对接契约；完整机器可读契约见
 [docs/api/kaya-coding-plan.openapi.yaml](api/kaya-coding-plan.openapi.yaml)，七个代表状态的响应 fixture 见 [docs/api/fixtures/](api/fixtures/)（零额度、未激活、耗尽、已过期、预占中、跨月、待核对）。
 
+**交付导航（2026-09 Task 16 起）**：Website 一站式交接文档见
+[docs/api/kaya-coding-plan-website-handoff.md](api/kaya-coding-plan-website-handoff.md)
+（客户/运营接口清单、Cookie/BFF 身份传递、权限矩阵、分页与错误码、三窗
+口卡片各态、BFF 不持上游明文凭据/不重新定价的硬约束）；官方 SDK 请求
+形状 fixture（Claude Code / Codex 契约核对用）见
+[docs/api/fixtures/client/](api/fixtures/client/)；灰度/回滚/升级与故障
+演练实测、压测结论、真实客户端联调前置待办见
+[docs/runbooks/kaya-coding-plan-rollout.md](runbooks/kaya-coding-plan-rollout.md)。
+
 **全局约定**
 
 - 全部端点需用户 JWT（`Authorization: Bearer`）；只有本人可查自身 Key/配额/用量/订阅 —— 端点不接收用户/账户 ID 参数，所有权永远来自 JWT 身份。

@@ -178,6 +178,36 @@ All configuration is via environment variables (or `.env` file):
 
 User endpoints (`/user/*`, `/payments/*`, `/refunds/*`) require JWT Bearer only.
 
+## Kaya Coding Plan (独立模型 API 套餐)
+
+A second product line (`product_code='coding-plan'`, isolated from the legacy
+`kaya-membership`): customer API keys (`yk-`), three-window quotas (5-hour /
+weekly / monthly, anchored UTC), prepaid wallet with explicit overage opt-in,
+and programming-tool protocol surfaces. Key facts:
+
+- **Standard protocol surfaces** (`/v1/*`, API-key auth, each protocol's NATIVE
+  shape): `POST /v1/chat/completions`, `POST /v1/messages` (Anthropic
+  2023-06-01 subset), `POST /v1/responses`, `GET /v1/models`. Capability
+  matrices and known differences (no multimodal blocks, no `truncation:"auto"`,
+  thinking history blocks accepted but not replayed) are documented in
+  `docs/api-integration-guide.md` and the OpenAPI file.
+- **Customer console** (`/user/*`, JWT): `/user/api-keys` (self-managed keys),
+  `/user/model-quotas` (three-window card, authoritative current state),
+  `/user/model-usage/{summary,requests}`, `/user/model-subscriptions`,
+  `/user/wallet*` (derived balances, statement, overage opt-in, PAYG).
+- **Operator console** (`/admin/*`, service identity + operator JWT +
+  role permissions): catalog CRUD/publish/rollback, bulk import, credentials
+  & OAuth connectors, wallet adjustments, usage/cost analytics, exception
+  filters, pricing previews.
+- **Contract & runbooks**: `docs/api/kaya-coding-plan.openapi.yaml` (+ response
+  fixtures under `docs/api/fixtures/`), Website handoff
+  `docs/api/kaya-coding-plan-website-handoff.md`, rollout/rehearsal records
+  `docs/runbooks/kaya-coding-plan-rollout.md`, operations runbook
+  `docs/runbooks/kaya-coding-plan-operations.md`.
+- Coding Plan stays **off sale** until an operator configures
+  `plan_benefit_configs` and opens the plan — see the rollout runbook's
+  gray-release plan (migrations must be fully applied first, 027 especially).
+
 ### Commercial currency and cycle behavior
 
 - Quote and order currency come from `plan.currency`; orders snapshot `plan.price` and `plan.currency`. PayPal requires USD and WeChat Pay requires CNY.

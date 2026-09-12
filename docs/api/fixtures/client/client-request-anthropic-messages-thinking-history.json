@@ -1,0 +1,29 @@
+{
+  "_comment": "已知差异 ③：Anthropic Messages 历史中的 thinking/redacted_thinking 块——接受（200）但不回放（chat 形状上游无对应语义；交错 thinking 连续性不在本期）。工具与文本块不受影响。期望响应：正常完成。",
+  "model": "claude-pro",
+  "max_tokens": 256,
+  "messages": [
+    {"role": "user", "content": "Think, then list files."},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "thinking", "thinking": "The user wants a directory listing; I should call run_shell.", "signature": "EqQBCgIYAhIM"},
+        {"type": "tool_use", "id": "toolu_hist_1", "name": "run_shell", "input": {"cmd": "ls"}}
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_hist_1", "content": "a.txt\nb.txt"}
+      ]
+    },
+    {"role": "user", "content": "Any more?"}
+  ],
+  "tools": [
+    {
+      "name": "run_shell",
+      "description": "Run a shell command and return its output.",
+      "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}
+    }
+  ]
+}

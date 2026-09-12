@@ -1,0 +1,14 @@
+{
+  "_comment": "已知差异 ①：Anthropic Messages 多模态块（image/document 等）——本网关仅文本，明确 400 invalid_request_error，不静默丢弃。期望响应：HTTP 400 + Anthropic 原生错误信封。",
+  "model": "claude-pro",
+  "max_tokens": 64,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+        {"type": "text", "text": "What is in this image?"}
+      ]
+    }
+  ]
+}

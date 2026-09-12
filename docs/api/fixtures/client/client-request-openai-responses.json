@@ -1,0 +1,26 @@
+{
+  "_comment": "OpenAI 官方 SDK（Codex）Responses API 请求形状。instructions 为系统指令，input 为 items 数组（type:message + content type:input_text），工具为扁平 type:function 形状，store:false 表示不落会话链。",
+  "model": "codex-pro",
+  "instructions": "You are Codex, a coding assistant running in a CLI.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "List the files in the current directory."}]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "run_shell",
+      "description": "Run a shell command and return its output.",
+      "parameters": {
+        "type": "object",
+        "properties": {"cmd": {"type": "string"}},
+        "required": ["cmd"]
+      }
+    }
+  ],
+  "store": false,
+  "stream": true
+}

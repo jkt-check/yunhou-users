@@ -153,6 +153,9 @@ func (a *OpenAIChat) DecodeNonStream(body []byte) (*NonStreamResult, error) {
 	if resp.Usage.CompletionDetails != nil {
 		out.Usage.ReasoningTokens = resp.Usage.CompletionDetails.ReasoningTokens
 	}
+	// 评审轮1 M5：cache_creation_input_tokens 计入 CacheWriteTokens（与流
+	// 式 tap 及 Raw 留存口径一致，不丢弃缓存创建量）。
+	out.Usage.CacheWriteTokens = resp.Usage.CacheCreationTokens
 	return out, nil
 }
 

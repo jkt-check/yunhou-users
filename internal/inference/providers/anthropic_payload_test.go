@@ -105,6 +105,7 @@ func TestAnthropicBuildPayload_HardRejections(t *testing.T) {
 func TestAnthropicBuildPayload_ThinkingAndExtras(t *testing.T) {
 	a := NewAnthropicMessages()
 	call := anthropicCall([]model.ChatMessage{{Role: "user", Content: "think"}})
+	call.OutputCap = 4096 // thinking 需要容得下预算的 cap（I5：绝不上调 max_tokens）
 	on := true
 	budget := int64(2048)
 	call.Request.ThinkingEnabled = &on

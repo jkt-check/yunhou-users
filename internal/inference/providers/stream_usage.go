@@ -119,7 +119,12 @@ type openAIUsage struct {
 // are handled correctly). Adapted from the candidate UsageTracker and
 // extended with: detail sub-objects (cached/reasoning), [DONE] terminal
 // tracking and visible-content byte counting for the estimate path.
+//
+// 评审轮1 I6：Feed（relay/翻译 goroutine）与 Result（handler goroutine 的
+// Finish 路径）可并发——客户端断流时 handler 结算的同时翻译 goroutine 仍
+// 在读上游，必须与 anthropicTap 一样持锁，否则 -race 下数据竞争。
 type OpenAIUsageTracker struct {
+	mu      sync.Mutex
 	pending []byte
 	res     TapResult
 }
@@ -128,6 +133,8 @@ type OpenAIUsageTracker struct {
 // relay buffer has no line alignment). Only complete `data:` lines
 // containing "usage", "content" or [DONE] cost more than a prefix scan.
 func (t *OpenAIUsageTracker) Feed(p []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for len(p) > 0 {
 		nl := bytes.IndexByte(p, '\n')
 		end := len(p)
@@ -152,8 +159,17 @@ func (t *OpenAIUsageTracker) Feed(p []byte) {
 	}
 }
 
-// Result returns the metering state so far.
-func (t *OpenAIUsageTracker) Result() TapResult { return t.res }
+// Result returns the metering state so far. Raw is copied out so the caller
+// never aliases the buffer a concurrent Feed may reuse.
+func (t *OpenAIUsageTracker) Result() TapResult {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	res := t.res
+	if t.res.Raw != nil {
+		res.Raw = append(json.RawMessage(nil), t.res.Raw...)
+	}
+	return res
+}
 
 func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	if !bytes.HasPrefix(line, []byte("data:")) {
@@ -206,6 +222,10 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 		if chunk.Usage.CompletionDetails != nil {
 			t.res.Buckets.ReasoningTokens = chunk.Usage.CompletionDetails.ReasoningTokens
 		}
+		// 评审轮1 M5：cache_creation_input_tokens（Anthropic-origin 扩展键，
+		// OpenAI 协议面透传）必须计入 CacheWriteTokens——与 Raw 留存口径一
+		// 致，丢弃会让缓存创建量从计量消失。
+		t.res.Buckets.CacheWriteTokens = chunk.Usage.CacheCreationTokens
 	}
 }
 

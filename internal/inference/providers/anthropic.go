@@ -49,7 +49,8 @@ func (a *AnthropicMessages) Inclusion() accounting.Inclusion {
 }
 
 // anthropicThinkingBudget must stay strictly below max_tokens (Anthropic
-// rejects max_tokens <= thinking.budget_tokens).
+// rejects max_tokens <= thinking.budget_tokens; the protocol floor is
+// anthropicMinThinkingBudget — messages_client.go).
 const anthropicThinkingBudget int64 = 4096
 
 // anthropicVersionHeader is the pinned Messages API version.
@@ -180,9 +181,17 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 		if r.ThinkingBudget != nil && *r.ThinkingBudget > 0 {
 			budget = *r.ThinkingBudget
 		}
-		if maxTokens <= budget {
-			maxTokens = budget * 2
-			payload["max_tokens"] = maxTokens
+		// 评审轮1 I5：绝不把 max_tokens 提到客户声明的 OutputCap 之上（旧行
+		// 为 maxTokens = budget*2 会让上游产出远超声明上限、按真实用量多
+		// 收）。预算下调到 cap 之内；Anthropic 要求 budget_tokens >= 1024 且
+		// 严格小于 max_tokens，cap 容不下合法预算时显式 400（能力错误，客
+		// 户提高 max_tokens 或关闭 thinking）。
+		if maxTokens <= anthropicMinThinkingBudget+1 {
+			return nil, domain.NewError(domain.CodeInvalidInput,
+				fmt.Sprintf("providers: anthropic thinking requires max_tokens > %d (budget floor %d); raise max_tokens or disable thinking", anthropicMinThinkingBudget+1, anthropicMinThinkingBudget))
+		}
+		if budget > maxTokens-1 {
+			budget = maxTokens - 1
 		}
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
 	}

@@ -135,6 +135,25 @@ func TestOpenAIDecodeNonStream_FullUsage(t *testing.T) {
 	}
 }
 
+// 评审轮1 M5：非流式 usage 块携带 cache_creation_input_tokens 时计入
+// CacheWriteTokens（与流式 tap 同口径）。
+func TestOpenAIDecodeNonStream_CacheCreationBucket(t *testing.T) {
+	body := []byte(`{"id":"chatcmpl-2","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46,
+			"cache_creation_input_tokens":7,
+			"prompt_tokens_details":{"cached_tokens":4}}}`)
+	res, err := NewOpenAIChat().DecodeNonStream(body)
+	if err != nil {
+		t.Fatalf("DecodeNonStream: %v", err)
+	}
+	if res.Usage.CacheWriteTokens == nil || *res.Usage.CacheWriteTokens != 7 {
+		t.Errorf("cache write = %v, want 7 (cache_creation_input_tokens 不得丢弃)", res.Usage.CacheWriteTokens)
+	}
+	if res.Usage.CacheReadTokens == nil || *res.Usage.CacheReadTokens != 4 {
+		t.Errorf("cache read = %v, want 4", res.Usage.CacheReadTokens)
+	}
+}
+
 func TestOpenAIDecodeNonStream_NoUsageIsNotZero(t *testing.T) {
 	res, err := NewOpenAIChat().DecodeNonStream([]byte(
 		`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"visible answer"},"finish_reason":"stop"}]}`))

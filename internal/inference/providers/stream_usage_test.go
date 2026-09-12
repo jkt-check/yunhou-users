@@ -2,6 +2,7 @@ package providers
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -137,5 +138,51 @@ func TestUsageTracker_DetailBuckets(t *testing.T) {
 	}
 	if u.Buckets.ReasoningTokens == nil || *u.Buckets.ReasoningTokens != 12 {
 		t.Errorf("reasoning = %v, want 12", u.Buckets.ReasoningTokens)
+	}
+}
+
+// 评审轮1 M5：OpenAI 协议面 usage 块携带 cache_creation_input_tokens 时必
+// 须计入 CacheWriteTokens（不丢弃缓存创建量；与 Raw 留存口径一致）。
+func TestUsageTracker_CacheCreationBucket(t *testing.T) {
+	stream := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50," +
+		"\"cache_creation_input_tokens\":40," +
+		"\"prompt_tokens_details\":{\"cached_tokens\":30}}}\n\n"
+	var tr OpenAIUsageTracker
+	tr.Feed([]byte(stream))
+	u := tr.Result()
+	if u.Buckets.CacheWriteTokens == nil || *u.Buckets.CacheWriteTokens != 40 {
+		t.Errorf("cache write = %v, want 40 (cache_creation_input_tokens 不得丢弃)", u.Buckets.CacheWriteTokens)
+	}
+	if u.Buckets.CacheReadTokens == nil || *u.Buckets.CacheReadTokens != 30 {
+		t.Errorf("cache read = %v, want 30", u.Buckets.CacheReadTokens)
+	}
+}
+
+// 评审轮1 I6：客户端断流时翻译 goroutine 持续 Feed、handler goroutine 并
+// 发 Finish→Result——-race 下必须无数据竞争（与 anthropicTap 同一锁口径）。
+func TestUsageTracker_ConcurrentFeedAndResult(t *testing.T) {
+	var tr OpenAIUsageTracker
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				tr.Feed([]byte(openAISSEFixture))
+			}
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		_ = tr.Result()
+	}
+	close(stop)
+	wg.Wait()
+	// 功能仍在：最后一次 Feed 的 usage 可读。
+	if u := tr.Result(); !u.SawUsage || u.Buckets.InputTokens == nil {
+		t.Errorf("Result after concurrent access = %+v, want saw usage", u)
 	}
 }

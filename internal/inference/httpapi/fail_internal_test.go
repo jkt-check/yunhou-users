@@ -13,7 +13,8 @@ import (
 
 // fail() 的 envelope 面不得向客户端泄漏内部错误细节：500 一律固定文案，
 // 与 /v1 原生面（apikey_auth.go）的 "internal error" 口径一致；非 500 的
-// domain 错误照常透传 message（客户端可操作的输入错误）。
+// domain 错误只透传 Message（评审轮1 M4：不拼 code 前缀与 cause 链——客
+// 户端可操作的部分才进 4xx）。
 func TestFail_RedactsInternalErrors(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -43,16 +44,30 @@ func TestFail_RedactsInternalErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("client-facing errors keep their message", func(t *testing.T) {
+	t.Run("client-facing errors keep only the domain message", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(rec)
 		fail(c, domain.NewError(domain.CodeInvalidInput, "limit must be positive"))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400", rec.Code)
 		}
-		want := `{"code":400,"data":null,"message":"inference/invalid_input: limit must be positive"}`
+		want := `{"code":400,"data":null,"message":"limit must be positive"}`
 		if got := rec.Body.String(); got != want {
 			t.Fatalf("body = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("4xx drops the cause chain", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		fail(c, domain.WrapError(domain.CodeInvalidInput, "route references unknown model ghost",
+			errors.New("pq: relation detail FKD2V88A7 vendor body {\"error\":\"upstream says no\"}")))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+		want := `{"code":400,"data":null,"message":"route references unknown model ghost"}`
+		if got := rec.Body.String(); got != want {
+			t.Fatalf("body = %s, want %s (cause chain must not leak into 4xx)", got, want)
 		}
 	})
 }

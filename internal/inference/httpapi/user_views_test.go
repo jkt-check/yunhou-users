@@ -337,27 +337,29 @@ func TestUserViews_OwnershipAndIsolation(t *testing.T) {
 func TestUserViews_UsageValidation(t *testing.T) {
 	f := newViewsFixture(t)
 	_, tokA := f.addUser(t)
-	bad := []string{
-		"/user/model-usage/summary?group_by=day",
-		"/user/model-usage/requests?limit=0",
-		"/user/model-usage/requests?limit=101",
-		"/user/model-usage/requests?cursor=abc",
-		"/user/model-usage/summary?from=2026-09-09T00:00:00Z&to=2026-09-08T00:00:00Z",
-		"/user/model-usage/summary?from=2026-06-01T00:00:00Z&to=2026-09-09T00:00:00Z", // > 92 天
-		"/user/model-usage/requests?from=not-a-time",
+	// 每个非法输入 → 400 + 对应的校验 Message（评审轮1 M4 起 4xx 只透传
+	// domain Message，不再带 code 前缀/cause 链）。
+	bad := map[string]string{
+		"/user/model-usage/summary?group_by=day":      "group_by must be model|key",
+		"/user/model-usage/requests?limit=0":          "limit must be 1..100",
+		"/user/model-usage/requests?limit=101":        "limit must be 1..100",
+		"/user/model-usage/requests?cursor=abc":       "malformed cursor",
+		"/user/model-usage/requests?from=not-a-time":  "RFC3339",
+		"/user/model-usage/summary?from=2026-09-09T00:00:00Z&to=2026-09-08T00:00:00Z": "from must be before to",
+		"/user/model-usage/summary?from=2026-06-01T00:00:00Z&to=2026-09-09T00:00:00Z": "exceeds 92 days", // > 92 天
 	}
-	// I1：伪造游标（合法 base64+JSON、id 非 UUID）必须 400 invalid_input，
+	// I1：伪造游标（合法 base64+JSON、id 非 UUID）必须 400，
 	// 不得漏到 SQL 的 ::uuid 转换（500）。
 	forged := management.EncodeRequestCursor(management.RequestCursor{
 		CreatedAt: time.Now().UTC(), ID: "not-a-uuid"})
-	bad = append(bad, "/user/model-usage/requests?cursor="+forged)
-	for _, path := range bad {
+	bad["/user/model-usage/requests?cursor="+forged] = "malformed cursor (id must be a UUID)"
+	for path, wantMsg := range bad {
 		w := f.get(t, path, tokA)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s: got %d, want 400 (%s)", path, w.Code, w.Body.String())
 		}
-		if !strings.Contains(w.Body.String(), "invalid_input") {
-			t.Errorf("%s: body missing invalid_input (%s)", path, w.Body.String())
+		if !strings.Contains(w.Body.String(), wantMsg) {
+			t.Errorf("%s: body missing %q (%s)", path, wantMsg, w.Body.String())
 		}
 	}
 	// 默认范围（30 天）生效。

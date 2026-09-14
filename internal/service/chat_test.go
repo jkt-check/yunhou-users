@@ -602,3 +602,100 @@ func TestChatService_ReasoningContentRelay(t *testing.T) {
 		t.Errorf("upstream body missing reasoning_content: %s", body)
 	}
 }
+
+// TestChatService_UpstreamRejectionDetail: an upstream 4xx surfaces as a
+// *ChatUpstreamRejection carrying the real status, a normalized code, and the
+// upstream message — errors.Is still matches ErrChatUpstreamRejected.
+func TestChatService_UpstreamRejectionDetail(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"This model's maximum context length is 65536.","type":"invalid_request_error","code":"context_length_exceeded"}}`))
+	})
+	svc, subRepo, planRepo, _ := chatTestFixture(t, upstream)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if !errors.Is(err, ErrChatUpstreamRejected) {
+		t.Fatalf("err = %v, want ErrChatUpstreamRejected", err)
+	}
+	var rej *ChatUpstreamRejection
+	if !errors.As(err, &rej) {
+		t.Fatalf("err = %v, want *ChatUpstreamRejection", err)
+	}
+	if rej.Status != http.StatusBadRequest {
+		t.Errorf("Status = %d, want 400", rej.Status)
+	}
+	if rej.Code != UpstreamCodeContextLengthExceeded {
+		t.Errorf("Code = %q, want %q", rej.Code, UpstreamCodeContextLengthExceeded)
+	}
+	if !strings.Contains(rej.Message, "maximum context length") {
+		t.Errorf("Message = %q, want upstream message", rej.Message)
+	}
+}
+
+// TestClassifyUpstreamRejection: the classifier maps upstream status + error
+// body to a normalized code and a sanitized message.
+func TestClassifyUpstreamRejection(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		code    string
+		msgWant string // substring; "" means message must be empty-safe
+	}{
+		{"402 is balance", http.StatusPaymentRequired, `{"error":{"message":"whatever"}}`, UpstreamCodeInsufficientBalance, "whatever"},
+		{"insufficient keyword", http.StatusBadRequest, `{"error":{"message":"Insufficient Balance"}}`, UpstreamCodeInsufficientBalance, "Insufficient Balance"},
+		{"context length code", http.StatusBadRequest, `{"error":{"message":"too long","code":"context_length_exceeded"}}`, UpstreamCodeContextLengthExceeded, "too long"},
+		{"openai context message", http.StatusBadRequest, `{"error":{"message":"This model's maximum context length is 65536 tokens."}}`, UpstreamCodeContextLengthExceeded, "maximum context length"},
+		{"anthropic prompt too long", http.StatusBadRequest, `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213000 tokens > 200000 maximum"}}`, UpstreamCodeContextLengthExceeded, "prompt is too long"},
+		{"content filter", http.StatusBadRequest, `{"error":{"message":"Content Exists Risk"}}`, UpstreamCodeContentFilter, "Content Exists Risk"},
+		{"invalid request fallback", http.StatusBadRequest, `{"error":{"message":"messages: role not supported"}}`, UpstreamCodeInvalidRequest, "role not supported"},
+		{"string error shape", http.StatusUnauthorized, `{"error":"bad key"}`, UpstreamCodeInvalidRequest, "bad key"},
+		{"non-JSON body", http.StatusBadRequest, `Bad Request`, UpstreamCodeInvalidRequest, "Bad Request"},
+		{"empty body", http.StatusBadRequest, ``, UpstreamCodeInvalidRequest, ""},
+		{"error object without message keeps raw body", http.StatusBadRequest, `{"error":{"type":"invalid_request_error"}}`, UpstreamCodeInvalidRequest, `"type":"invalid_request_error"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rej := classifyUpstreamRejection(tc.status, []byte(tc.body))
+			if rej.Status != tc.status {
+				t.Errorf("Status = %d, want %d", rej.Status, tc.status)
+			}
+			if rej.Code != tc.code {
+				t.Errorf("Code = %q, want %q", rej.Code, tc.code)
+			}
+			if tc.msgWant != "" && !strings.Contains(rej.Message, tc.msgWant) {
+				t.Errorf("Message = %q, want substring %q", rej.Message, tc.msgWant)
+			}
+		})
+	}
+}
+
+// TestClassifyUpstreamRejection_MessageCapped: a pathological upstream error
+// body cannot push an unbounded message into the client response / audit log.
+func TestClassifyUpstreamRejection_MessageCapped(t *testing.T) {
+	long := strings.Repeat("x", chatUpstreamErrorBodyCap)
+	rej := classifyUpstreamRejection(http.StatusBadRequest, []byte(`{"error":{"message":"`+long+`"}}`))
+	if len(rej.Message) > chatUpstreamMessageCap+len("…") {
+		t.Errorf("Message len = %d, want <= %d (+ellipsis)", len(rej.Message), chatUpstreamMessageCap)
+	}
+}
+
+// TestClassifyUpstreamRejection_InvalidUTF8: a stray non-UTF-8 byte (GBK
+// error pages, misbehaving gateways) must not discard the whole message —
+// the invalid byte is replaced, the rest survives. (The JSON-path is cleaned
+// by encoding/json itself; these cases exercise the raw-text fallback.)
+func TestClassifyUpstreamRejection_InvalidUTF8(t *testing.T) {
+	rej := classifyUpstreamRejection(http.StatusBadRequest, []byte("bad \xffrequest shape"))
+	if !strings.Contains(rej.Message, "bad ") || !strings.Contains(rej.Message, "request shape") {
+		t.Errorf("Message = %q, want surviving content around the invalid byte", rej.Message)
+	}
+
+	// Long message with an invalid byte before the cap: content up to the
+	// cap must survive (not collapse to a bare ellipsis).
+	rej = classifyUpstreamRejection(http.StatusBadRequest, []byte("\xff"+strings.Repeat("a", 400)))
+	if !strings.Contains(rej.Message, strings.Repeat("a", 100)) {
+		t.Errorf("Message = %.50q, want capped content preserved", rej.Message)
+	}
+}

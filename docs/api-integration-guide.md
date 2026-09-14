@@ -603,12 +603,12 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 | 404 | `chat is not enabled` | 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` |
 | 429 | `too many requests` | 触发每 IP 限流桶（10 次/秒，突发 20） |
 | 429 | `chat upstream rate limit exceeded` | 上游限流——该 provider 所有可用 key 均被上游限流（冷却中的 key 仍会被取出尝试，返回 429 即最后一次尝试仍被上游 429） |
-| 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——永久性错误，重试同样的请求必败 |
+| 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——重试同样的请求必败，但改写请求后可能成功。此时 `data` 不为 null，携带结构化上游信息：`upstream_status`（真实上游状态码）、`upstream_code`（归一化分类：`context_length_exceeded` 上下文超长 / `content_filter` 内容审核拦截 / `insufficient_balance` 上游余额不足 / `invalid_request` 其他请求问题）、`upstream_message`（脱敏截断后的上游错误消息，约 300 字节） |
 | 502 | `chat upstream error` | 上游 5xx 或网络错误（该 provider 所有可用 key 均已尝试） |
 
-**客户端重试指引**：400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试；502 `chat request rejected by upstream` → 永久性错误（请求本身被上游拒绝），修正请求前不要重试；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
+**客户端重试指引**：400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试；502 `chat request rejected by upstream` → 按 `data.upstream_code` 分类处理：`context_length_exceeded` → 裁剪会话历史后重试（改写后的请求可能成功）；`insufficient_balance` / `content_filter` / `invalid_request` → 原样重试必败，需引导用户调整；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
 
-**超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 5 分钟，订阅门禁的 DB 查询另有 10s 上限。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。错误行的输入按每条消息 1 KiB 截断（`input_truncated` 标记），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII），需部署侧配置轮转。
+**超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 5 分钟，订阅门禁的 DB 查询另有 10s 上限。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、上游 4xx 拒绝时的 `upstream_status` / `upstream_code`（与错误响应 `data` 中的分类一致，用于事后统计错误分布）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。错误行的输入按每条消息 1 KiB 截断（`input_truncated` 标记），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII），需部署侧配置轮转。
 
 **部署注意**：SSE 需要反代放行长连接且不缓冲——参考 `deploy/nginx.conf` 的 `location = /chat`（`proxy_buffering off`、`proxy_read_timeout 360s`）；服务端也会随响应下发 `X-Accel-Buffering: no`。
 

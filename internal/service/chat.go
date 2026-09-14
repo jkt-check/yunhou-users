@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/model"
@@ -38,6 +39,12 @@ const chatAccessTimeout = 10 * time.Second
 // read before discarding — error payloads can be huge and are only used for
 // logging.
 const chatUpstreamErrorBodyCap = 8 << 10
+
+// chatUpstreamMessageCap bounds the upstream error message surfaced to
+// clients (data.upstream_message) and the server-side log via Error(). The
+// audit log records only upstream_status/upstream_code — not the message
+// (upstream text can echo request content).
+const chatUpstreamMessageCap = 300
 
 // ChatRoute describes where one chat request was actually sent. The handler
 // uses it for usage metering and the audit log; it is nil on error.
@@ -221,9 +228,12 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 			return nil, nil, fmt.Errorf("%w (status %d): %s", ErrChatRateLimited, resp.StatusCode, errBody)
 		}
 		// Upstream 4xx (other than 429) rejects the request itself — a
-		// permanent error that retrying will never fix.
+		// permanent error that retrying the same bytes will never fix. The
+		// structured rejection lets the client distinguish a
+		// retryable-by-rewrite cause (context length) from billing and
+		// content-policy ones.
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return nil, nil, fmt.Errorf("%w (status %d): %s", ErrChatUpstreamRejected, resp.StatusCode, errBody)
+			return nil, nil, classifyUpstreamRejection(resp.StatusCode, errBody)
 		}
 		return nil, nil, fmt.Errorf("%w (status %d): %s", ErrChatUpstreamError, resp.StatusCode, errBody)
 	}
@@ -371,4 +381,90 @@ func (s *ChatService) checkAccess(ctx context.Context, userID, appID, logicalMod
 		return ErrChatModelNotAllowed
 	}
 	return nil
+}
+
+// classifyUpstreamRejection builds the structured detail for an upstream 4xx
+// (≠429): real status, a normalized code, and the sanitized upstream message.
+// Classification precedence: billing (402 or balance keywords) → context
+// length → content policy → generic invalid_request.
+func classifyUpstreamRejection(status int, body []byte) *ChatUpstreamRejection {
+	msg, code := extractUpstreamError(body)
+	rej := &ChatUpstreamRejection{
+		Status:  status,
+		Code:    UpstreamCodeInvalidRequest,
+		Message: capUpstreamMessage(msg),
+	}
+	hay := strings.ToLower(code + " " + msg)
+	switch {
+	case status == http.StatusPaymentRequired ||
+		strings.Contains(hay, "insufficient") ||
+		strings.Contains(hay, "balance") ||
+		strings.Contains(msg, "余额"):
+		rej.Code = UpstreamCodeInsufficientBalance
+	case strings.Contains(hay, "context_length_exceeded") ||
+		strings.Contains(hay, "context length") ||
+		strings.Contains(hay, "maximum context") ||
+		strings.Contains(hay, "context window") ||
+		strings.Contains(hay, "prompt is too long") ||
+		strings.Contains(hay, "too many tokens"):
+		rej.Code = UpstreamCodeContextLengthExceeded
+	case strings.Contains(hay, "content_filter") ||
+		strings.Contains(hay, "content filter") ||
+		strings.Contains(hay, "content exists risk") ||
+		strings.Contains(hay, "content management") ||
+		strings.Contains(hay, "moderation") ||
+		strings.Contains(hay, "sensitive"):
+		rej.Code = UpstreamCodeContentFilter
+	}
+	return rej
+}
+
+// extractUpstreamError pulls message + code out of the common upstream error
+// shapes: OpenAI/DeepSeek {"error":{"message","code"}} (also Anthropic's
+// {"type":"error","error":{...}}), a bare {"error":"string"}, or — for
+// non-JSON bodies and message-less error objects — the raw text.
+func extractUpstreamError(body []byte) (message, code string) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return "", ""
+	}
+	var env struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(trimmed, &env); err == nil && len(env.Error) > 0 {
+		var obj struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		}
+		if err := json.Unmarshal(env.Error, &obj); err == nil {
+			if obj.Message == "" {
+				// An error object without a message (e.g. only "type") —
+				// surface the raw body rather than nothing.
+				return string(trimmed), ""
+			}
+			return obj.Message, obj.Code
+		}
+		var s string
+		if err := json.Unmarshal(env.Error, &s); err == nil {
+			return s, ""
+		}
+	}
+	return string(trimmed), ""
+}
+
+// capUpstreamMessage bounds the message at chatUpstreamMessageCap bytes,
+// cutting on a UTF-8 boundary (the "…" marker may push the total a few bytes
+// past the cap). Invalid UTF-8 (GBK error pages, stray gateway bytes) is
+// replaced first — otherwise validation of the whole cut would discard the
+// entire message.
+func capUpstreamMessage(msg string) string {
+	msg = strings.TrimSpace(strings.ToValidUTF8(msg, ""))
+	if len(msg) <= chatUpstreamMessageCap {
+		return msg
+	}
+	cut := msg[:chatUpstreamMessageCap]
+	for !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "…"
 }

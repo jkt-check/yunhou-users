@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/yunhou/users/internal/model"
 )
@@ -74,3 +75,29 @@ var (
 	// with a detail message (fmt.Errorf %w); handlers map it to 400.
 	ErrUsageInvalidParam = errors.New("invalid usage stats parameter")
 )
+
+// Normalized codes classifying an upstream 4xx rejection. Surfaced to
+// clients (data.upstream_code) so they can tell a retryable-by-rewrite
+// failure (context length) apart from billing and content-policy ones.
+const (
+	UpstreamCodeContextLengthExceeded = "context_length_exceeded"
+	UpstreamCodeContentFilter         = "content_filter"
+	UpstreamCodeInsufficientBalance   = "insufficient_balance"
+	UpstreamCodeInvalidRequest        = "invalid_request"
+)
+
+// ChatUpstreamRejection carries the structured detail of an upstream 4xx
+// (≠429): the real status, a normalized code, and the sanitized upstream
+// message. It unwraps to ErrChatUpstreamRejected, so existing errors.Is
+// mappings keep working; the handler additionally surfaces the fields.
+type ChatUpstreamRejection struct {
+	Status  int    // real upstream HTTP status
+	Code    string // one of the UpstreamCode* constants
+	Message string // sanitized upstream error message (capped)
+}
+
+func (e *ChatUpstreamRejection) Error() string {
+	return fmt.Sprintf("%s (status %d, code %s): %s", ErrChatUpstreamRejected, e.Status, e.Code, e.Message)
+}
+
+func (e *ChatUpstreamRejection) Unwrap() error { return ErrChatUpstreamRejected }

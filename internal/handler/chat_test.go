@@ -1019,3 +1019,89 @@ func TestChatHandler_ToolRoleEmptyContentAccepted(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (empty tool content must be accepted)", w.Code)
 	}
 }
+
+// TestChatHandler_UpstreamRejectedDetail: a structured upstream rejection is
+// surfaced to the client as 502 with the fixed message (backwards compatible)
+// PLUS data.upstream_status/upstream_code/upstream_message, and the audit
+// line records upstream_status/upstream_code.
+func TestChatHandler_UpstreamRejectedDetail(t *testing.T) {
+	rej := &service.ChatUpstreamRejection{
+		Status:  http.StatusBadRequest,
+		Code:    service.UpstreamCodeContextLengthExceeded,
+		Message: "maximum context length is 65536",
+	}
+	r, buf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamFails(rej)})
+	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if resp["message"] != service.ErrChatUpstreamRejected.Error() {
+		t.Errorf("message = %v, want %q", resp["message"], service.ErrChatUpstreamRejected.Error())
+	}
+	data, ok := resp["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("data = %v, want object", resp["data"])
+	}
+	if data["upstream_status"] != float64(400) {
+		t.Errorf("upstream_status = %v, want 400", data["upstream_status"])
+	}
+	if data["upstream_code"] != service.UpstreamCodeContextLengthExceeded {
+		t.Errorf("upstream_code = %v, want %q", data["upstream_code"], service.UpstreamCodeContextLengthExceeded)
+	}
+	if data["upstream_message"] != rej.Message {
+		t.Errorf("upstream_message = %v, want %q", data["upstream_message"], rej.Message)
+	}
+
+	line := strings.TrimSpace(buf.String())
+	if line == "" {
+		t.Fatal("audit log empty")
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		t.Fatalf("audit line not JSON: %v", err)
+	}
+	if entry["upstream_status"] != float64(400) {
+		t.Errorf("audit upstream_status = %v, want 400", entry["upstream_status"])
+	}
+	if entry["upstream_code"] != service.UpstreamCodeContextLengthExceeded {
+		t.Errorf("audit upstream_code = %v, want %q", entry["upstream_code"], service.UpstreamCodeContextLengthExceeded)
+	}
+}
+
+// TestChatHandler_PlainErrorsKeepNullData: error mappings without structured
+// upstream detail (bare sentinel, other error classes) keep data == null, so
+// older clients see no shape change — and the audit line omits the upstream
+// fields entirely (omitempty protects log consumers).
+func TestChatHandler_PlainErrorsKeepNullData(t *testing.T) {
+	r, buf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamFails(service.ErrChatUpstreamRejected)})
+	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if resp["data"] != nil {
+		t.Errorf("data = %v, want null for bare sentinel", resp["data"])
+	}
+
+	line := strings.TrimSpace(buf.String())
+	if line == "" {
+		t.Fatal("audit log empty")
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		t.Fatalf("audit line not JSON: %v", err)
+	}
+	if _, ok := entry["upstream_status"]; ok {
+		t.Errorf("audit upstream_status present on plain error: %v", entry["upstream_status"])
+	}
+	if _, ok := entry["upstream_code"]; ok {
+		t.Errorf("audit upstream_code present on plain error: %v", entry["upstream_code"])
+	}
+}

@@ -78,6 +78,8 @@ type chatAccessEntry struct {
 	Model           string              `json:"model,omitempty"`
 	Status          string              `json:"status"` // "ok" | "error" | "disconnected" | "upstream_error"
 	Error           string              `json:"error,omitempty"`
+	UpstreamStatus  int                 `json:"upstream_status,omitempty"` // real upstream 4xx, when classified
+	UpstreamCode    string              `json:"upstream_code,omitempty"`   // service.UpstreamCode*
 	MessageCount    int                 `json:"message_count"`
 	ToolsCount      int                 `json:"tools_count,omitempty"`
 	ThinkingEnabled bool                `json:"thinking_enabled,omitempty"`
@@ -104,36 +106,38 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		// Fixed client message: err.Error() would reflect binding/struct
 		// internals to the caller.
-		h.logAccess(started, userID, appID, req.Model, req, "error", "invalid request body", "")
-		writeChatError(c, http.StatusBadRequest, "invalid request body")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "invalid request body", "", nil)
+		writeChatError(c, http.StatusBadRequest, "invalid request body", nil)
 		return
 	}
 	if msg := validateChatMessages(req.Messages); msg != "" {
-		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
-		writeChatError(c, http.StatusBadRequest, msg)
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", nil)
+		writeChatError(c, http.StatusBadRequest, msg, nil)
 		return
 	}
 	if len(req.SessionID) > model.ChatMaxSessionIDLen {
-		h.logAccess(started, userID, appID, req.Model, req, "error", "session_id too long", "")
-		writeChatError(c, http.StatusBadRequest, "session_id too long")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "session_id too long", "", nil)
+		writeChatError(c, http.StatusBadRequest, "session_id too long", nil)
 		return
 	}
 	if len(req.Model) > model.ChatMaxModelLen {
-		h.logAccess(started, userID, appID, req.Model, req, "error", "model id too long", "")
-		writeChatError(c, http.StatusBadRequest, "model id too long")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "model id too long", "", nil)
+		writeChatError(c, http.StatusBadRequest, "model id too long", nil)
 		return
 	}
 	if msg := validateChatTools(req.Tools); msg != "" {
-		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
-		writeChatError(c, http.StatusBadRequest, msg)
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", nil)
+		writeChatError(c, http.StatusBadRequest, msg, nil)
 		return
 	}
 
 	resp, route, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Model, req.Messages, req.Tools, req.ThinkingEnabled)
 	if err != nil {
 		status, msg := chatErrorMapping(err)
-		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "")
-		writeChatError(c, status, msg)
+		var rej *service.ChatUpstreamRejection
+		errors.As(err, &rej)
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", rej)
+		writeChatError(c, status, msg, rej)
 		return
 	}
 	defer resp.Body.Close()
@@ -198,7 +202,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		h.svc.RecordUsage(usageCtx, userID, appID, route, status, usage.InputTokens, usage.OutputTokens)
 		usageCancel()
 	}
-	h.logAccess(started, userID, appID, routeModel(route, req.Model), req, status, errMsg, output)
+	h.logAccess(started, userID, appID, routeModel(route, req.Model), req, status, errMsg, output, nil)
 }
 
 // routeModel prefers the resolved (effective) model over the raw client
@@ -220,15 +224,17 @@ func (h *ChatHandler) GetModels(c *gin.Context) {
 	models, err := h.svc.AllowedModels(c.Request.Context(), userID, appID)
 	if err != nil {
 		status, msg := chatErrorMapping(err)
-		writeChatError(c, status, msg)
+		writeChatError(c, status, msg, nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": models}})
 }
 
 // chatErrorMapping converts a StreamChat error into (HTTP status, safe
-// client message). Internal details (upstream URL, upstream body) are logged
-// server-side by the caller's error branches, never sent to the client.
+// client message). Internal details (upstream URL, raw upstream body) are
+// logged server-side by the caller's error branches; the only upstream
+// detail that reaches the client is the sanitized, classified
+// ChatUpstreamRejection surfaced via writeChatError's data field.
 func chatErrorMapping(err error) (int, string) {
 	switch {
 	case errors.Is(err, service.ErrChatNotEnabled):
@@ -268,7 +274,7 @@ func chatErrorMapping(err error) (int, string) {
 // is capped per message, and on every line reasoning_content is capped at
 // chatReasoningLogCap — thinking traces are bounded only by the body cap
 // and would otherwise dominate the log.
-func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string, req model.ChatRequest, status, errMsg, output string) {
+func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string, req model.ChatRequest, status, errMsg, output string, rej *service.ChatUpstreamRejection) {
 	if h.accessLog == nil {
 		return
 	}
@@ -308,6 +314,10 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string
 		InputTruncated:  inputTruncated,
 		Output:          output,
 		OutputTruncated: truncated,
+	}
+	if rej != nil {
+		entry.UpstreamStatus = rej.Status
+		entry.UpstreamCode = rej.Code
 	}
 	b, err := json.Marshal(entry)
 	if err != nil {
@@ -591,6 +601,18 @@ func validateChatTools(tools []json.RawMessage) string {
 }
 
 // writeChatError emits the standard {"code","data","message"} error shape.
-func writeChatError(c *gin.Context, status int, message string) {
-	c.JSON(status, gin.H{"code": status, "data": nil, "message": message})
+// A structured upstream rejection additionally fills data with
+// upstream_status/upstream_code/upstream_message so clients can distinguish
+// the failure class; message stays the fixed sentinel text for
+// backwards compatibility.
+func writeChatError(c *gin.Context, status int, message string, rej *service.ChatUpstreamRejection) {
+	var data any
+	if rej != nil {
+		data = gin.H{
+			"upstream_status":  rej.Status,
+			"upstream_code":    rej.Code,
+			"upstream_message": rej.Message,
+		}
+	}
+	c.JSON(status, gin.H{"code": status, "data": data, "message": message})
 }

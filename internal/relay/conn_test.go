@@ -559,19 +559,42 @@ func TestWSSlowConsumer(t *testing.T) {
 	defer fast.CloseNow()
 	helloClient(t, fast, ticket, "c-fast")
 
-	// 大 payload(64KB × 20 = 1.28MB,远超内核缓冲)保证慢连接的 writer 阻塞、
-	// 出站缓冲必然溢出;断言以"连接最终被关 + device 与正常 client 不受影响"为准。
-	big := map[string]any{"data": strings.Repeat("x", 64<<10)}
-	for i := 0; i < 20; i++ {
+	// slow_consumer 关闭由 TCP 反压触发:只有内核发送缓冲填满、writer
+	// 阻塞、出站 channel 溢出,Enqueue 才会走 slow_consumer 关闭路径。
+	// 内核缓冲因平台/调参差异巨大(macOS  loopback 数百 KB,Linux
+	// loopback 自调节默认上限 4MB,CI 可能更高),固定小体量帧在某些
+	// 环境根本填不满 —— 原 64KB×20=1.28MB 版本在 CI(Linux loopback)
+	// 被内核全部吃进,writer 从不阻塞,断言超时失败。改为 fast 后台
+	// 排空 + 设备端持续发送,总量 256KB×128=32MB 超过任何常见
+	// loopback 自调节上限;单帧 255KB+信封 < MaxFrameBytes(读循环按整
+	// 帧判定,1024 余量只兜底 WS 库硬掐),不触发帧上限关闭。
+	big := map[string]any{"data": strings.Repeat("x", 255<<10)}
+	fastErr := make(chan error, 1)
+	go func() {
+		// fast 后台排空:既防止 fast 自己的出站缓冲(同为 8)被灌满
+		// 而被误伤为 slow_consumer,也验证正常 client 不受影响。
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			_, _, err := fast.Read(ctx)
+			cancel()
+			if err != nil {
+				fastErr <- err
+				return
+			}
+		}
+	}()
+	for i := 0; i < 128; i++ {
 		writeFrame(t, dev, map[string]any{"v": 1, "type": "app", "payload": big})
 	}
-	for i := 0; i < 20; i++ {
-		m := readFrame(t, fast)
-		if m["type"] != "app" {
-			t.Fatalf("fast client frame %d: got %v", i, m)
-		}
-	}
 	expectConnClosed(t, slow, 10*time.Second)
+	// fast 的 drain goroutine 只能在测试收尾 CloseNow 后才报错退出;
+	// 提前退出 = fast 连接被慢消费者株连。
+	select {
+	case err := <-fastErr:
+		t.Fatalf("fast client conn broke while slow consumer was dropped: %v", err)
+	default:
+	}
 }
 
 func TestWSConnectionCaps(t *testing.T) {

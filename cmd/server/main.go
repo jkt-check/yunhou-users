@@ -196,12 +196,14 @@ func main() {
 	// Relay(kaya 远程控制):仅当 RELAY_TICKET_SECRET 配置时启用,否则
 	// /relay/ticket 与 /relay/ws 路由不注册(404)。
 	var relayHandler *handler.RelayHandler
+	var relayHub *relay.Hub
 	if cfg.RelayTicketSecret != "" {
 		ticketSvc := service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second)
 		relaySvc := service.NewRelayService(subRepo, planRepo, ticketSvc)
 		relayHandler = handler.NewRelayHandler(relaySvc)
 		relayMetrics := relay.NewMetrics(prometheus.DefaultRegisterer, cfg.AppEnv)
-		relayHandler.SetHub(relay.NewHub(relay.DefaultOptions(), relayMetrics), ticketSvc, cfg.RelayAllowedOrigins)
+		relayHub = relay.NewHub(relay.DefaultOptions(), relayMetrics)
+		relayHandler.SetHub(relayHub, ticketSvc, cfg.RelayAllowedOrigins)
 	} else {
 		log.Printf("relay: disabled (RELAY_TICKET_SECRET empty)")
 	}
@@ -324,6 +326,14 @@ func main() {
 	case <-rootCtx.Done():
 		log.Printf("shutdown signal received, draining...")
 		sweeper.Stop()
+		if relayHub != nil {
+			// 停机序列:停接新连(handler 层 503)→ 全部在线连接收
+			// closed shutdown(conn 层 initiateClose 负责 flush 后关闭)。
+			// http.Server.Shutdown 不追踪 hijack 的 WS 连接,进程退出会
+			// 截断异步 flush,这里留 500ms(≤5s 预算内)给 closed 帧写出。
+			relayHub.Shutdown(5 * time.Second)
+			time.Sleep(500 * time.Millisecond)
+		}
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {

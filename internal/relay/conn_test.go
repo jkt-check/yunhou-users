@@ -659,3 +659,34 @@ func TestWSFrameRateLimit(t *testing.T) {
 	}
 	expectClosedReason(t, dev, "protocol")
 }
+
+func TestWSGracefulShutdown(t *testing.T) {
+	env := newWSTestEnv(t, testOptions(), 5, nil)
+	ticket := env.tickets.issue("u1", 10*time.Second)
+
+	dev := env.dial(t, "")
+	defer dev.CloseNow()
+	helloDevice(t, dev, ticket, "d1")
+	cl := env.dial(t, "")
+	defer cl.CloseNow()
+	helloClient(t, cl, ticket, "c1")
+
+	if env.hub.ShutdownStarted() {
+		t.Fatal("ShutdownStarted before Shutdown")
+	}
+	env.hub.Shutdown(5 * time.Second)
+	if !env.hub.ShutdownStarted() {
+		t.Fatal("ShutdownStarted false after Shutdown")
+	}
+
+	// 两条连接都收到 closed shutdown(client 侧的 presence offline 因
+	// closing 标志被丢弃,不影响 closed 断言);flush 由 conn 层 finalize
+	// 等 closedWritten 保证,不依赖墙钟 sleep。
+	expectClosedReason(t, dev, "shutdown")
+	expectClosedReason(t, cl, "shutdown")
+	expectConnClosed(t, dev, 2*time.Second)
+	expectConnClosed(t, cl, 2*time.Second)
+
+	// 停机后新握手在 handler 层直接 503,不升级
+	env.dialExpectStatus(t, "", http.StatusServiceUnavailable)
+}

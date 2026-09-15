@@ -314,7 +314,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	return engine, nil, db
 }
@@ -402,7 +402,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	return &E2EServer{
 		Engine:             engine,
@@ -658,7 +658,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	alipayPrivHolder.Store(alipayPriv)
 

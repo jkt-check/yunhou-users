@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yunhou/users/internal/handler"
 )
 
 func TestSetupRoutes(t *testing.T) {
@@ -232,6 +233,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		false, // wechatPayMock
 		nil,   // usageSvc
 		nil,   // llmUsageSvc
+		nil,   // relayHandler
 	)
 
 	routes := engine.Routes()
@@ -317,6 +319,7 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		false, // wechatPayMock
 		nil,   // usageSvc
 		nil,   // llmUsageSvc
+		nil,   // relayHandler
 	)
 
 	for _, r := range engine.Routes() {
@@ -325,4 +328,69 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		}
 	}
 	t.Error("Setup did not register /test/login with PAYPAL_L3_E2E_MODE=1")
+}
+
+// TestSetup_RelayRoutesWired 验证 relay 启用(relayHandler 非 nil)时的
+// 路由装配:POST /relay/ticket 挂在 JWTAuth + 30/min 签发限流之后,
+// GET /relay/ws 不走 JWTAuth(ticket 在 hello 首帧内鉴权)。
+func TestSetup_RelayRoutesWired(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+
+	// NewRelayHandler(nil):svc 不会被触达(无 token 的请求在 JWTAuth
+	// 就被 401 拦截);未 SetHub 时 ServeWS 固定 503,足以区分路由存在性。
+	Setup(t.Context(), engine,
+		nil,                          // healthPinger
+		nil, nil, nil, nil, nil, nil, // repos
+		nil,           // tokenSvc
+		nil,           // authSvc
+		nil, nil, nil, // subSvc, planSvc, paymentSvc
+		nil,      // webhookVerifier
+		nil,      // wechatAPIv3Key
+		nil, nil, // providerTokenSvc, quoteSvc
+		nil,      // chatSvc
+		nil,      // chatAccessLog
+		nil, nil, // githubOAuthSvc, wechatOAuthSvc
+		false, // wechatOAuthMock
+		false, // wechatPayMock
+		nil,   // usageSvc
+		nil,   // llmUsageSvc
+		handler.NewRelayHandler(nil), // relayHandler 非 nil = relay 启用
+	)
+
+	have := make(map[string]bool)
+	for _, r := range engine.Routes() {
+		have[r.Method+":"+r.Path] = true
+	}
+	if !have["POST:/relay/ticket"] {
+		t.Error("relay 启用时未注册 POST /relay/ticket")
+	}
+	if !have["GET:/relay/ws"] {
+		t.Error("relay 启用时未注册 GET /relay/ws")
+	}
+
+	// /relay/ticket 无 token → 401(JWTAuth 拦截,handler 不触达)。
+	// 连发 35 次全部 401 而非 429,证明 JWTAuth 在签发限流器之前
+	// (若限流器在前,空 user_id 共享同一桶,burst 30 后应返回 429)。
+	for i := 0; i < 35; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/relay/ticket", nil)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("POST /relay/ticket 无 token 第 %d 次: got %d, want 401 (JWTAuth 应先于限流器)", i+1, w.Code)
+		}
+	}
+
+	// /relay/ws 不走 JWTAuth:无 token 也不应 401;handler 未 SetHub 时
+	// 返回 503,证明路由已装配到 relay handler。
+	req := httptest.NewRequest(http.MethodGet, "/relay/ws", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("GET /relay/ws 返回 401:WS 路由不应挂 JWTAuth(ticket 在 hello 内鉴权)")
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /relay/ws: got %d, want 503 (handler 未 SetHub 的停机响应,证明路由已接线)", w.Code)
+	}
 }

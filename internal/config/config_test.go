@@ -173,7 +173,41 @@ func TestValidate_HappyPath(t *testing.T) {
 	}
 }
 
-// TestValidate_ErrorPaths walks every Validate() rejection branch.
+// TestValidate_RelayTicketSecretStrength guards the HMAC ticket secret floor:
+// empty = relay disabled (valid); once set, <32 chars is rejected (forgeable
+// by brute force), ≥32 passes — the same floor as OAUTH_STATE_SECRET.
+func TestValidate_RelayTicketSecretStrength(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		secret  string
+		wantErr bool
+	}{
+		{"empty disables relay", "", false},
+		{"32 chars ok", strings.Repeat("a", 32), false},
+		{"64 chars ok", strings.Repeat("a", 64), false},
+		{"31 chars rejected", strings.Repeat("a", 31), true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validRealWeChatConfig()
+			cfg.RelayTicketSecret = tc.secret
+			err := cfg.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %d-char secret, got nil", len(tc.secret))
+				}
+				if !strings.Contains(err.Error(), "RELAY_TICKET_SECRET") {
+					t.Errorf("error message missing RELAY_TICKET_SECRET: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("want nil for %d-char secret, got %v", len(tc.secret), err)
+			}
+		})
+	}
+}
 func TestValidate_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

@@ -16,11 +16,14 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/relay"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
 	"github.com/yunhou/users/internal/service"
@@ -190,6 +193,21 @@ func main() {
 	llmUsageRepo := repo.NewLLMUsageRepo(db)
 	chatSvc := service.NewChatService(llmCatalog, subRepo, planRepo, llmUsageRepo)
 
+	// Relay(kaya 远程控制):仅当 RELAY_TICKET_SECRET 配置时启用,否则
+	// /relay/ticket 与 /relay/ws 路由不注册(404)。
+	var relayHandler *handler.RelayHandler
+	var relayHub *relay.Hub
+	if cfg.RelayTicketSecret != "" {
+		ticketSvc := service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second)
+		relaySvc := service.NewRelayService(subRepo, planRepo, ticketSvc)
+		relayHandler = handler.NewRelayHandler(relaySvc)
+		relayMetrics := relay.NewMetrics(prometheus.DefaultRegisterer, cfg.AppEnv)
+		relayHub = relay.NewHub(relay.DefaultOptions(), relayMetrics)
+		relayHandler.SetHub(relayHub, ticketSvc, cfg.RelayAllowedOrigins)
+	} else {
+		log.Printf("relay: disabled (RELAY_TICKET_SECRET empty)")
+	}
+
 	// Usage analytics: heartbeat intake + admin stats reads over
 	// usage_events (migration 021).
 	usageRepo := repo.NewUsageRepo(db)
@@ -244,7 +262,10 @@ func main() {
 	// (5m, inside ChatService) plus a per-response write deadline set by
 	// the chat handler (the server-wide WriteTimeout below is an absolute
 	// per-request deadline — it would hard-cut a longer stream).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat"))
+	// /relay/ws is exempt too: it is a WebSocket long connection that must
+	// never sit under the 20s cap (its liveness bounds are the relay
+	// ping/idle timers in internal/relay).
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/relay/ws"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,
@@ -275,7 +296,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, service.NewLLMUsageService(llmUsageRepo))
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, service.NewLLMUsageService(llmUsageRepo), relayHandler)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -305,6 +326,16 @@ func main() {
 	case <-rootCtx.Done():
 		log.Printf("shutdown signal received, draining...")
 		sweeper.Stop()
+		if relayHub != nil {
+			// 停机序列:停接新连(handler 层 503)→ 全部在线连接先收
+			// presence offline、再收 closed shutdown(conn 层 initiateClose
+			// 负责 flush 后关闭)。http.Server.Shutdown 不追踪 hijack 的
+			// WS 连接,进程退出会截断异步 flush;Hub.Shutdown 的 wait 会
+			// 等到房间清空(全部连接收尾完毕)或 3s 上限,取先到者
+			// (≤5s 预算内,conn 层 closed 帧 flush 上限为 2s)。
+			relayHub.Shutdown(3 * time.Second)
+			relayHandler.Shutdown() // 停 hello 失败限流器的清理 goroutine
+		}
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {

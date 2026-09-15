@@ -90,6 +90,12 @@ func (h *Hub) Register(c Conn) (Conn, error) {
 	}
 
 	h.mu.Lock()
+	// 持锁复查:Shutdown 在同一互斥锁下快照房间,此处复查可消除
+	// 标志检查与插入之间的 TOCTOU 窗口(停机后注册的连接必然被拒)。
+	if h.shutdown.Load() {
+		h.mu.Unlock()
+		return nil, &RejectError{Reason: ReasonShutdown}
+	}
 	r := h.rooms[c.UserID()]
 	if r == nil {
 		r = &room{devices: make(map[string]Conn), clients: make(map[string]Conn)}

@@ -3,6 +3,7 @@ package relay
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -356,5 +357,74 @@ func TestHubShutdown(t *testing.T) {
 	var rej *RejectError
 	if !errors.As(err, &rej) || rej.Reason != ReasonShutdown {
 		t.Fatalf("Register after shutdown err = %v, want *RejectError{shutdown}", err)
+	}
+}
+
+// TestHubRegisterShutdownRace 回归测试:Register 与 Shutdown 并发时,
+// 每个 Register 成功的连接都必须最终收到 closed shutdown(否则即
+// TOCTOU 漏连:停机后插入房间、永远收不到关闭帧且房间泄漏)。
+func TestHubRegisterShutdownRace(t *testing.T) {
+	h := NewHub(DefaultOptions())
+
+	const workers = 16
+	const perWorker = 25
+
+	var wg sync.WaitGroup
+	success := make(chan *fakeConn, workers*perWorker)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				id := fmt.Sprintf("w%02d-%02d", w, i)
+				var c *fakeConn
+				if i%2 == 0 {
+					c = newDeviceConn("u-race", "dev-"+id, id)
+				} else {
+					c = newClientConn("u-race", "cli-"+id)
+				}
+				if _, err := h.Register(c); err == nil {
+					success <- c
+				}
+			}
+		}(w)
+	}
+
+	// 让一部分 Register 先跑,然后在 hammer 进行中停机
+	time.Sleep(time.Millisecond)
+	h.Shutdown(0)
+
+	wg.Wait()
+	close(success)
+
+	n := 0
+	for c := range success {
+		n++
+		found := false
+		c.mu.Lock()
+		for _, raw := range c.frames {
+			var m map[string]any
+			if err := json.Unmarshal(raw, &m); err != nil {
+				c.mu.Unlock()
+				t.Fatalf("bad frame on registered conn: %v", err)
+			}
+			if m["type"] == "closed" && m["reason"] == string(ReasonShutdown) {
+				found = true
+				break
+			}
+		}
+		c.mu.Unlock()
+		if !found {
+			t.Fatalf("conn %s/%s registered successfully but never received closed shutdown", c.GetRole(), c.UserID())
+		}
+	}
+	if n == 0 {
+		t.Fatal("no conn registered before shutdown; test did not exercise the race window")
+	}
+	t.Logf("%d conns registered before shutdown, all received closed shutdown", n)
+
+	// 停机后注册一律被拒
+	if _, err := h.Register(newClientConn("u-race", "cli-late")); err == nil {
+		t.Fatal("Register after shutdown succeeded, want *RejectError{shutdown}")
 	}
 }

@@ -42,7 +42,9 @@ func (h *RelayHandler) ServeWS(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "origin not allowed"})
 		return
 	}
-	relay.HandleWS(c.Writer, c.Request, h.hub, h.tickets, h.fails)
+	// c.ClientIP() 按 TrustedProxies 可信链解析(忽略不可信代理带来的
+	// 伪造 XFF);hello 失败限流与告警节流键以此为准,防 XFF 轮换绕过。
+	relay.HandleWS(c.Writer, c.Request, h.hub, h.tickets, h.fails, c.ClientIP())
 }
 
 // IssueTicket 处理 POST /relay/ticket:access_token(经 JWTAuth 中间件)+

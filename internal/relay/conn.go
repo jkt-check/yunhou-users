@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,12 +91,15 @@ func (c *wsConn) DeviceMeta() DeviceInfo { return c.meta }
 
 // HandleWS 是 /relay/ws 的入口:hello 失败限流预检 → Upgrade → 等 hello →
 // 注册 → 服务循环。Origin 已在 handler 层手工校验(已决事项 4:device 不带
-// Origin 头,不能用 AcceptOptions.OriginPatterns)。全部路径保证:返回前
+// Origin 头,不能用 AcceptOptions.OriginPatterns)。clientIP 必须是调用方
+// 按可信代理链解析后的来源(gin c.ClientIP())——不能在本层读原始
+// X-Forwarded-For:nginx 的 $proxy_add_x_forwarded_for 保留客户端自带的
+// XFF,攻击者轮换首段即可绕过限流(spec §8)。全部路径保证:返回前
 // 连接一定被关闭或已随服务循环终结。
-func HandleWS(w http.ResponseWriter, r *http.Request, hub *Hub, tickets ticketVerifier, fails *HelloFailLimiter) {
+func HandleWS(w http.ResponseWriter, r *http.Request, hub *Hub, tickets ticketVerifier, fails *HelloFailLimiter, clientIP string) {
 	opts := hub.Options()
 	// hello 失败超限的 IP 在握手阶段直接 403,不升级(spec §8)。
-	if fails != nil && !fails.Allow(clientIP(r)) {
+	if fails != nil && !fails.Allow(clientIP) {
 		http.Error(w, "too many hello failures", http.StatusForbidden)
 		return
 	}
@@ -121,17 +122,17 @@ func HandleWS(w http.ResponseWriter, r *http.Request, hub *Hub, tickets ticketVe
 		// 走到这里 Origin 已被 handler 层放行(或不存在);只记是否通过。
 		originPass: r.Header.Get("Origin") != "",
 	}
-	c.run(r, tickets, fails)
+	c.run(clientIP, tickets, fails)
 }
 
-// run 的阶段划分对应 spec §7 状态机。
-func (c *wsConn) run(r *http.Request, tickets ticketVerifier, fails *HelloFailLimiter) {
+// run 的阶段划分对应 spec §7 状态机。ip 是可信链解析后的来源,用于
+// hello 失败限流与告警节流键(与 HandleWS 预检同一桶)。
+func (c *wsConn) run(ip string, tickets ticketVerifier, fails *HelloFailLimiter) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
 	defer cancel()
 	defer c.ws.Close(websocket.StatusNormalClosure, "bye")
 	opts := c.hub.Options()
-	ip := clientIP(r)
 
 	// 阶段 1:等 hello(HelloTimeout 超时 → 直接关,不发帧,WS close 1008)
 	hello, err := c.readHello(ctx, opts)
@@ -507,20 +508,4 @@ func (c *wsConn) sendDirect(b []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = c.ws.Write(ctx, websocket.MessageText, b)
-}
-
-// clientIP 优先 X-Forwarded-For 首段(gin 的 TrustedProxies 已在全局
-// 中间件保证可信;relay 包内直接读 header),RemoteAddr 兜底。
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

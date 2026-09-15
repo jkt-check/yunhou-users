@@ -66,6 +66,10 @@ func testOptions() Options {
 
 // wsTestEnv 起 httptest.Server,入口与 handler.ServeWS 同构:
 // 停机 503 → Origin 白名单(调用同一个 relay.OriginAllowed)→ 移交 HandleWS。
+// clientIP 固定为 testClientIP,等价于 gin 按可信链解析后的结果;原始
+// X-Forwarded-For 不再参与限流键,伪造 XFF 分摊限流桶的场景由
+// TestWSHelloFailSpoofedXFF 守护。
+const testClientIP = "203.0.113.1"
 type wsTestEnv struct {
 	server  *httptest.Server
 	hub     *Hub
@@ -89,7 +93,7 @@ func newWSTestEnv(t *testing.T, opts Options, failLimit int, allowedOrigins []st
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
 		}
-		HandleWS(w, r, e.hub, e.tickets, e.fails)
+		HandleWS(w, r, e.hub, e.tickets, e.fails, testClientIP)
 	}))
 	t.Cleanup(func() {
 		e.server.Close()
@@ -100,12 +104,18 @@ func newWSTestEnv(t *testing.T, opts Options, failLimit int, allowedOrigins []st
 
 func (e *wsTestEnv) dial(t *testing.T, origin string) *websocket.Conn {
 	t.Helper()
+	h := http.Header{}
+	if origin != "" {
+		h.Set("Origin", origin)
+	}
+	return e.dialWithHeaders(t, h)
+}
+
+func (e *wsTestEnv) dialWithHeaders(t *testing.T, h http.Header) *websocket.Conn {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	dialOpts := &websocket.DialOptions{}
-	if origin != "" {
-		dialOpts.HTTPHeader = http.Header{"Origin": []string{origin}}
-	}
+	dialOpts := &websocket.DialOptions{HTTPHeader: h}
 	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.server.URL, "http")+"/relay/ws", dialOpts)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -117,12 +127,18 @@ func (e *wsTestEnv) dial(t *testing.T, origin string) *websocket.Conn {
 
 func (e *wsTestEnv) dialExpectStatus(t *testing.T, origin string, wantStatus int) {
 	t.Helper()
+	h := http.Header{}
+	if origin != "" {
+		h.Set("Origin", origin)
+	}
+	e.dialExpectStatusWithHeaders(t, h, wantStatus)
+}
+
+func (e *wsTestEnv) dialExpectStatusWithHeaders(t *testing.T, h http.Header, wantStatus int) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	dialOpts := &websocket.DialOptions{}
-	if origin != "" {
-		dialOpts.HTTPHeader = http.Header{"Origin": []string{origin}}
-	}
+	dialOpts := &websocket.DialOptions{HTTPHeader: h}
 	c, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.server.URL, "http")+"/relay/ws", dialOpts)
 	if err == nil {
 		c.CloseNow()
@@ -595,6 +611,28 @@ func TestWSHelloFailIPLimit(t *testing.T) {
 	}
 	// 第 4 次握手直接 403,不升级
 	env.dialExpectStatus(t, "", http.StatusForbidden)
+}
+
+// TestWSHelloFailSpoofedXFF:nginx 的 $proxy_add_x_forwarded_for 保留客户端
+// 自带 XFF,若限流键取自原始 XFF 首段,攻击者轮换首段即可分摊限流桶。
+// 修复后限流键来自调用方按可信链解析的 clientIP(测试基建固定
+// testClientIP),伪造不同的 XFF 仍共享同一桶。
+func TestWSHelloFailSpoofedXFF(t *testing.T) {
+	env := newWSTestEnv(t, testOptions(), 3, nil)
+	// 3 次坏 ticket hello,每次带不同的伪造 X-Forwarded-For。
+	for i := 0; i < 3; i++ {
+		h := http.Header{"X-Forwarded-For": []string{fmt.Sprintf("198.51.100.%d", i+1)}}
+		c := env.dialWithHeaders(t, h)
+		writeFrame(t, c, map[string]any{
+			"v": 1, "type": "hello", "ticket": "forged", "role": "device",
+			"device_id": fmt.Sprintf("d%d", i), "device_name": "Mac", "app_version": "2.4.0",
+		})
+		expectClosedReason(t, c, "auth")
+		c.CloseNow()
+	}
+	// 第 4 次换一个全新的伪造 XFF,仍命中同一解析 IP 的桶 → 403。
+	h := http.Header{"X-Forwarded-For": []string{"198.51.100.99"}}
+	env.dialExpectStatusWithHeaders(t, h, http.StatusForbidden)
 }
 
 func TestWSOriginCheck(t *testing.T) {

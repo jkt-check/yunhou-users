@@ -214,7 +214,7 @@ func TestMetricsWSFailureCounters(t *testing.T) {
 		fails:   NewHelloFailLimiter(10),
 	}
 	env.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		HandleWS(w, r, env.hub, env.tickets, env.fails)
+		HandleWS(w, r, env.hub, env.tickets, env.fails, testClientIP)
 	}))
 	t.Cleanup(func() {
 		env.server.Close()

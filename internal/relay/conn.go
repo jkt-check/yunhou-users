@@ -61,8 +61,11 @@ type wsConn struct {
 	cancel        context.CancelFunc
 
 	mu      sync.Mutex
-	exp     time.Time   // 当前 ticket 过期时刻
+	exp     time.Time     // 当前 ticket 过期时刻
 	renewed chan struct{} // cap 1:renew 成功通知 runTimers 重置定时器
+
+	originPass  bool        // Origin 头存在且已通过 handler 层白名单(只记是否通过)
+	closeReason CloseReason // 仅 initiateClose 设置(mu 保护);空 = 非主动关闭
 
 	framesIn    atomic.Int64
 	framesOut   atomic.Int64
@@ -115,6 +118,8 @@ func HandleWS(w http.ResponseWriter, r *http.Request, hub *Hub, tickets ticketVe
 		closeDone:     make(chan struct{}),
 		renewed:       make(chan struct{}, 1),
 		connectedAt:   time.Now(),
+		// 走到这里 Origin 已被 handler 层放行(或不存在);只记是否通过。
+		originPass: r.Header.Get("Origin") != "",
 	}
 	c.run(r, tickets, fails)
 }
@@ -131,11 +136,15 @@ func (c *wsConn) run(r *http.Request, tickets ticketVerifier, fails *HelloFailLi
 	// 阶段 1:等 hello(HelloTimeout 超时 → 直接关,不发帧,WS close 1008)
 	hello, err := c.readHello(ctx, opts)
 	if err != nil {
-		// hello 失败指标(helloFailures)在 Task 6 挂接;此处只记 IP 限流。
+		// helloProtoError = 可回 closed 的形态错;其余视为超时/传输错。
+		reason := "timeout"
 		var pe *helloProtoError
 		if errors.As(err, &pe) {
+			reason = "protocol"
 			c.sendDirect(ClosedFrame(ReasonProtocol))
 		}
+		c.hub.metrics.helloFailed(reason)
+		c.hub.warn.Logf("hello_fail:"+shortHash(ip), "hello failed reason=%s ip_hash=%s", reason, shortHash(ip))
 		fails.RecordFailure(ip)
 		c.ws.Close(websocket.StatusPolicyViolation, "hello failed")
 		return
@@ -144,12 +153,16 @@ func (c *wsConn) run(r *http.Request, tickets ticketVerifier, fails *HelloFailLi
 	// 阶段 2:校验 ticket + hello 形态
 	userID, exp, verr := tickets.Verify(hello.Ticket)
 	if verr != nil {
+		c.hub.metrics.helloFailed("auth")
+		c.hub.warn.Logf("hello_fail:"+shortHash(ip), "hello failed reason=auth ip_hash=%s", shortHash(ip))
 		fails.RecordFailure(ip)
 		c.sendDirect(ClosedFrame(ReasonAuth))
 		c.ws.Close(websocket.StatusPolicyViolation, string(ReasonAuth))
 		return
 	}
 	if !validHelloShape(hello, opts.MaxIDLen) {
+		c.hub.metrics.helloFailed("protocol")
+		c.hub.warn.Logf("hello_fail:"+shortHash(ip), "hello failed reason=protocol ip_hash=%s", shortHash(ip))
 		c.sendDirect(ClosedFrame(ReasonProtocol))
 		c.ws.Close(websocket.StatusPolicyViolation, string(ReasonProtocol))
 		return
@@ -176,6 +189,7 @@ func (c *wsConn) run(r *http.Request, tickets ticketVerifier, fails *HelloFailLi
 
 	// 阶段 4:hello_ok(client 带全量在线 device;device 也发,表为空)
 	c.sendDirect(HelloOKFrame(c.hub.OnlineDevices(c.userID), time.Now().Unix()))
+	logConnect(c)
 
 	// 阶段 5:服务循环:writer goroutine + 续期定时器 goroutine + 读循环
 	go c.writer(ctx)
@@ -187,6 +201,13 @@ func (c *wsConn) run(r *http.Request, tickets ticketVerifier, fails *HelloFailLi
 	if c.closing.Load() {
 		<-c.closeDone
 	}
+	// 关闭日志:主动关闭记 CloseReason;对端断开/传输失败(未走
+	// initiateClose)记 "eof"(不编造 spec 之外的 reason 枚举)。
+	reason := c.finalReason()
+	if reason == "" {
+		reason = "eof"
+	}
+	logClose(c, reason)
 }
 
 // readHello 在 HelloTimeout 内等首帧并做信封级校验。
@@ -257,6 +278,8 @@ func (c *wsConn) readLoop(ctx context.Context, tickets ticketVerifier) {
 		}
 		c.framesIn.Add(1)
 		if !limiter.Allow() || len(frame) > opts.MaxFrameBytes {
+			c.hub.warn.Logf("rate_limit:"+UserHash(c.userID)+"/"+c.id,
+				"frame limit hit user_hash=%s role=%s id=%s", UserHash(c.userID), c.role, c.id)
 			c.initiateClose(ReasonProtocol)
 			return
 		}
@@ -289,6 +312,9 @@ func (c *wsConn) readLoop(ctx context.Context, tickets ticketVerifier) {
 			uid, exp, err := tickets.Verify(rf.Ticket)
 			// 安全不变式:续期 ticket 的 sub 必须等于连接 user_id。
 			if err != nil || uid != c.userID {
+				c.hub.metrics.renewFailed()
+				c.hub.warn.Logf("renew_fail:"+UserHash(c.userID)+"/"+c.id,
+					"renew failed user_hash=%s role=%s id=%s", UserHash(c.userID), c.role, c.id)
 				c.initiateClose(ReasonAuth)
 				return
 			}
@@ -407,6 +433,9 @@ func (c *wsConn) Enqueue(b []byte) {
 	select {
 	case c.send <- b:
 	default:
+		c.hub.metrics.slowConsumerInc()
+		c.hub.warn.Logf("slow_consumer:"+UserHash(c.userID)+"/"+c.id,
+			"slow consumer close user_hash=%s role=%s id=%s", UserHash(c.userID), c.role, c.id)
 		c.initiateClose(ReasonSlowConsumer)
 	}
 }
@@ -416,6 +445,9 @@ func (c *wsConn) Enqueue(b []byte) {
 // finalize 等 writer flush(或 2s 超时)后关闭底层连接并取消 ctx。
 func (c *wsConn) initiateClose(reason CloseReason) {
 	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closeReason = reason
+		c.mu.Unlock()
 		c.closing.Store(true)
 		frame := ClosedFrame(reason)
 		select {
@@ -433,6 +465,16 @@ func (c *wsConn) initiateClose(reason CloseReason) {
 		go c.finalize(true, reason)
 	})
 }
+
+// finalReason 返回 initiateClose 记录的关闭原因;空 = 未走主动关闭路径。
+func (c *wsConn) finalReason() CloseReason {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeReason
+}
+
+// ConnectedSince 供 Hub 在 Unregister/踢连时观测连接存活时长。
+func (c *wsConn) ConnectedSince() time.Time { return c.connectedAt }
 
 // abort 传输层失败的硬关闭(不再尝试发 closed 帧)。
 func (c *wsConn) abort() {

@@ -72,7 +72,7 @@ func mustRegister(t *testing.T, h *Hub, c Conn) Conn {
 }
 
 func TestHubRegisterKickSameDeviceID(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	d1 := newDeviceConn("u1", "dev-1", "old")
 	d2 := newDeviceConn("u1", "dev-1", "new")
 
@@ -98,7 +98,7 @@ func TestHubRegisterKickSameDeviceID(t *testing.T) {
 }
 
 func TestHubDevicePresenceBroadcast(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	c1 := newClientConn("u1", "cli-1")
 	c2 := newClientConn("u1", "cli-2")
 	mustRegister(t, h, c1)
@@ -146,7 +146,7 @@ func TestHubDevicePresenceBroadcast(t *testing.T) {
 }
 
 func TestHubHelloOKDeviceList(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	mustRegister(t, h, newDeviceConn("u1", "dev-b", "b"))
 	mustRegister(t, h, newDeviceConn("u1", "dev-a", "a"))
 
@@ -179,7 +179,7 @@ func TestHubHelloOKDeviceList(t *testing.T) {
 }
 
 func TestHubRouteDeviceBroadcast(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	d := newDeviceConn("u1", "dev-1", "phone")
 	mustRegister(t, h, d)
 	c1 := newClientConn("u1", "cli-1")
@@ -218,7 +218,7 @@ func TestHubRouteDeviceBroadcast(t *testing.T) {
 }
 
 func TestHubRouteClientToDevice(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	d1 := newDeviceConn("u1", "dev-1", "one")
 	d2 := newDeviceConn("u1", "dev-2", "two")
 	mustRegister(t, h, d1)
@@ -246,7 +246,7 @@ func TestHubRouteClientToDevice(t *testing.T) {
 }
 
 func TestHubRouteUndeliverable(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	c := newClientConn("u1", "cli-1")
 	mustRegister(t, h, c)
 
@@ -280,7 +280,7 @@ func TestHubConnectionCaps(t *testing.T) {
 	opts := DefaultOptions()
 	opts.MaxDevicesPerUser = 2
 	opts.MaxClientsPerUser = 2
-	h := NewHub(opts)
+	h := NewHub(opts, nil)
 
 	mustRegister(t, h, newDeviceConn("u1", "dev-1", "1"))
 	mustRegister(t, h, newDeviceConn("u1", "dev-2", "2"))
@@ -303,7 +303,7 @@ func TestHubConnectionCaps(t *testing.T) {
 }
 
 func TestHubUnregisterSameIDNewerConnSafe(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	d1 := newDeviceConn("u1", "dev-1", "old")
 	d2 := newDeviceConn("u1", "dev-1", "new")
 	mustRegister(t, h, d1)
@@ -318,7 +318,7 @@ func TestHubUnregisterSameIDNewerConnSafe(t *testing.T) {
 }
 
 func TestHubShutdown(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 	d := newDeviceConn("u1", "dev-1", "phone")
 	mustRegister(t, h, d)
 	c := newClientConn("u1", "cli-1")
@@ -364,7 +364,7 @@ func TestHubShutdown(t *testing.T) {
 // 每个 Register 成功的连接都必须最终收到 closed shutdown(否则即
 // TOCTOU 漏连:停机后插入房间、永远收不到关闭帧且房间泄漏)。
 func TestHubRegisterShutdownRace(t *testing.T) {
-	h := NewHub(DefaultOptions())
+	h := NewHub(DefaultOptions(), nil)
 
 	const workers = 16
 	const perWorker = 25

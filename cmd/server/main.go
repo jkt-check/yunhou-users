@@ -16,6 +16,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
@@ -199,7 +200,8 @@ func main() {
 		ticketSvc := service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second)
 		relaySvc := service.NewRelayService(subRepo, planRepo, ticketSvc)
 		relayHandler = handler.NewRelayHandler(relaySvc)
-		relayHandler.SetHub(relay.NewHub(relay.DefaultOptions()), ticketSvc, cfg.RelayAllowedOrigins)
+		relayMetrics := relay.NewMetrics(prometheus.DefaultRegisterer, cfg.AppEnv)
+		relayHandler.SetHub(relay.NewHub(relay.DefaultOptions(), relayMetrics), ticketSvc, cfg.RelayAllowedOrigins)
 	} else {
 		log.Printf("relay: disabled (RELAY_TICKET_SECRET empty)")
 	}

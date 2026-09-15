@@ -65,15 +65,18 @@ type room struct {
 }
 
 // Hub 是单实例内存房间路由中心(spec §5.1)。不解析业务载荷。
+// metrics 为 nil 时全部指标记录为 no-op;warn 恒存在,节流异常日志。
 type Hub struct {
 	opts     Options
 	mu       sync.RWMutex
 	rooms    map[string]*room
 	shutdown atomic.Bool
+	metrics  *Metrics
+	warn     *warnThrottled
 }
 
-func NewHub(opts Options) *Hub {
-	return &Hub{opts: opts, rooms: make(map[string]*room)}
+func NewHub(opts Options, m *Metrics) *Hub {
+	return &Hub{opts: opts, rooms: make(map[string]*room), metrics: m, warn: newWarnThrottled()}
 }
 
 func (h *Hub) Options() Options { return h.opts }
@@ -127,7 +130,16 @@ func (h *Hub) Register(c Conn) (Conn, error) {
 			clients = append(clients, cl)
 		}
 	}
+	roomCount := len(h.rooms)
 	h.mu.Unlock()
+
+	// 指标:被踢旧连的房间成员资格在替换时结束(其后的 Unregister 因
+	// removed=false 不再扣减,connections gauge 保持配平)。
+	if kicked != nil && kicked != c {
+		h.metrics.connUnregistered(kicked.GetRole(), connAge(kicked))
+	}
+	h.metrics.connRegistered(c.GetRole())
+	h.metrics.roomsActiveSet(roomCount)
 
 	if kicked != nil && kicked != c {
 		kicked.Enqueue(ClosedFrame(ReasonReplaced))
@@ -172,7 +184,13 @@ func (h *Hub) Unregister(c Conn) {
 	if len(r.devices) == 0 && len(r.clients) == 0 {
 		delete(h.rooms, c.UserID())
 	}
+	roomCount := len(h.rooms)
 	h.mu.Unlock()
+
+	if removed {
+		h.metrics.connUnregistered(c.GetRole(), connAge(c))
+	}
+	h.metrics.roomsActiveSet(roomCount)
 
 	if removed && c.GetRole() == RoleDevice {
 		frame := PresenceFrame(c.DeviceID(), false, nil)
@@ -204,6 +222,7 @@ func (h *Hub) OnlineDevices(userID string) []DeviceInfo {
 //   - client → 指定 device(附 from_client_id);不在线 → 仅回发送方
 //     undeliverable;跨 room 目标同样 undeliverable,不泄露存在性。
 func (h *Hub) RouteApp(from Conn, targetDeviceID string, payload json.RawMessage) {
+	h.metrics.frameIn(from.GetRole())
 	h.mu.RLock()
 	r := h.rooms[from.UserID()]
 	switch from.GetRole() {
@@ -220,6 +239,7 @@ func (h *Hub) RouteApp(from Conn, targetDeviceID string, payload json.RawMessage
 		frame := AppFromDeviceFrame(from.DeviceID(), payload)
 		for _, cl := range targets {
 			cl.Enqueue(frame)
+			h.metrics.frameOut(RoleClient)
 		}
 	case RoleClient:
 		var dev Conn
@@ -228,10 +248,12 @@ func (h *Hub) RouteApp(from Conn, targetDeviceID string, payload json.RawMessage
 		}
 		h.mu.RUnlock()
 		if dev == nil {
+			h.metrics.undeliverableInc()
 			from.Enqueue(UndeliverableFrame(targetDeviceID))
 			return
 		}
 		dev.Enqueue(AppFromClientFrame(from.ClientID(), payload))
+		h.metrics.frameOut(RoleDevice)
 	}
 }
 

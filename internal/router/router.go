@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
@@ -59,6 +60,9 @@ func Setup(
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
+	// Prometheus 抓取端点。无条件暴露:即使 relay 禁用,进程级
+	// Go/runtime collector 仍可工作;挂在 publicLimiter 后防抓取滥用。
+	engine.GET("/metrics", publicLimiter, gin.WrapH(promhttp.Handler()))
 	engine.GET("/.well-known/jwks.json", publicLimiter, authHandler.JWKS)
 	engine.POST("/auth/refresh", publicLimiter, authHandler.RefreshToken)
 	engine.POST("/auth/logout", publicLimiter, authHandler.Logout)

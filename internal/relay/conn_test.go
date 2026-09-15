@@ -76,7 +76,7 @@ type wsTestEnv struct {
 func newWSTestEnv(t *testing.T, opts Options, failLimit int, allowedOrigins []string) *wsTestEnv {
 	t.Helper()
 	e := &wsTestEnv{
-		hub:     NewHub(opts),
+		hub:     NewHub(opts, nil),
 		tickets: newStubTickets(),
 		fails:   NewHelloFailLimiter(failLimit),
 	}

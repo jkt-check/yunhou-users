@@ -39,6 +39,7 @@ func Setup(
 	wechatPayMock bool,
 	usageSvc *service.UsageService,
 	llmUsageSvc *service.LLMUsageService,
+	relayHandler *handler.RelayHandler,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -137,6 +138,17 @@ func Setup(
 	// Model picker for kaya: same bucket (cheap, but no reason to make it
 	// easier to hammer than chat itself).
 	engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.GetModels)
+
+	// Relay(kaya 远程控制)。relayHandler 为 nil = relay 禁用(RELAY_TICKET_SECRET 未配置)。
+	if relayHandler != nil {
+		// 签发限流 30/min/user(spec §3.1):r=0.5/s,burst=30。
+		// JWTAuth 在前,key func 才能读到 user_id。
+		ticketLimiter := middleware.RateLimitWithKey(ctx, 0.5, 30, func(c *gin.Context) string {
+			return c.GetString(middleware.ContextUserID)
+		})
+		engine.POST("/relay/ticket", middleware.JWTAuth(tokenSvc), ticketLimiter, relayHandler.IssueTicket)
+		// /relay/ws 在 Task 5 注册
+	}
 
 	// Admin routes for plan management (internal service auth)
 	adminLimiter := middleware.RateLimit(ctx, 30, 60)

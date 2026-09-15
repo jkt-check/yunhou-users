@@ -232,6 +232,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		false, // wechatPayMock
 		nil,   // usageSvc
 		nil,   // llmUsageSvc
+		nil,   // relayHandler
 	)
 
 	routes := engine.Routes()
@@ -317,6 +318,7 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		false, // wechatPayMock
 		nil,   // usageSvc
 		nil,   // llmUsageSvc
+		nil,   // relayHandler
 	)
 
 	for _, r := range engine.Routes() {

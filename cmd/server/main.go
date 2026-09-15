@@ -19,6 +19,7 @@ import (
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
@@ -190,6 +191,17 @@ func main() {
 	llmUsageRepo := repo.NewLLMUsageRepo(db)
 	chatSvc := service.NewChatService(llmCatalog, subRepo, planRepo, llmUsageRepo)
 
+	// Relay(kaya 远程控制):仅当 RELAY_TICKET_SECRET 配置时启用,否则
+	// /relay/ticket 路由不注册(404)。
+	var relayHandler *handler.RelayHandler
+	if cfg.RelayTicketSecret != "" {
+		relaySvc := service.NewRelayService(subRepo, planRepo,
+			service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second))
+		relayHandler = handler.NewRelayHandler(relaySvc)
+	} else {
+		log.Printf("relay: disabled (RELAY_TICKET_SECRET empty)")
+	}
+
 	// Usage analytics: heartbeat intake + admin stats reads over
 	// usage_events (migration 021).
 	usageRepo := repo.NewUsageRepo(db)
@@ -275,7 +287,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, service.NewLLMUsageService(llmUsageRepo))
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, service.NewLLMUsageService(llmUsageRepo), relayHandler)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

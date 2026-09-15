@@ -78,6 +78,9 @@ var (
 	// relay ticket 校验失败(伪造/篡改/过期/错误 aud/错误 secret 统一口径,
 	// 不向连接方泄露具体原因)。
 	ErrRelayTicketInvalid = errors.New("invalid relay ticket")
+
+	// relay entitlement 拒绝(spec §3.1 固定文案,handler 映射 403)。
+	ErrRelayNoAccess = errors.New("remote access requires paid plan")
 )
 
 // Normalized codes classifying an upstream 4xx rejection. Surfaced to

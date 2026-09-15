@@ -206,9 +206,12 @@ nginx 掐断)。启用 443 server 块时同样需要复制该 location(模板内
 部署。水平扩容需要外部协调(粘性会话 + 跨实例路由),当前版本不支持——
 不要对 `:8080` 起多副本。
 
-**`/metrics` 暴露面提醒**:Prometheus 指标与 `/metrics` 端点只应绑定内网
-/loopback,不要经 nginx 暴露到公网 —— `relay_*` 指标包含在线连接数等运营数据。
-nginx 默认配置(`location /` 只代理到应用)不单独放行 `/metrics`,保持现状即可。
+**`/metrics` 暴露面提醒**:应用在 `:8080/metrics` 无条件暴露 Prometheus
+指标(无鉴权,仅有全局限流),`relay_*` 指标包含在线连接数等运营数据。
+nginx 的 catch-all `location /` 默认会把 `/metrics` 也代理到公网,因此
+`deploy/nginx.conf` 附带独立 `location = /metrics` 块收敛到 loopback
+(`allow 127.0.0.1; allow ::1; deny all;`)。从其他主机抓取时,把监控网段
+加进该块的 allow 列表,不要直接删除 `deny all`。
 
 **优雅停机**:SIGTERM/SIGINT → handler 层对 `/relay/ws` 新握手返回 503 →
 全部在线连接收到 `closed shutdown` 帧 → 等待 flush(≤5s 预算)→ 强制关闭。

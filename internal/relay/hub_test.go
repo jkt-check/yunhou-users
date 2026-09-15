@@ -341,15 +341,17 @@ func TestHubShutdown(t *testing.T) {
 		t.Fatalf("device closed frame = %v", m)
 	}
 	if c.frameCount() != c1frames+2 {
-		t.Fatalf("client frames = %d, want %d (closed shutdown + presence offline)", c.frameCount(), c1frames+2)
+		t.Fatalf("client frames = %d, want %d (presence offline + closed shutdown)", c.frameCount(), c1frames+2)
 	}
+	// presence offline 必须先于 closed shutdown 入队:真实 wsConn 对
+	// closed 帧会同步置 closing,反序会让 presence 被静默丢弃(spec §5.3)。
 	m = c.decoded(t, c1frames)
-	if m["type"] != "closed" || m["reason"] != string(ReasonShutdown) {
-		t.Fatalf("client closed frame = %v", m)
-	}
-	m = c.decoded(t, c1frames+1)
 	if m["type"] != "presence" || m["device_id"] != "dev-1" || m["online"] != false {
 		t.Fatalf("client shutdown presence frame = %v", m)
+	}
+	m = c.decoded(t, c1frames+1)
+	if m["type"] != "closed" || m["reason"] != string(ReasonShutdown) {
+		t.Fatalf("client closed frame = %v", m)
 	}
 
 	// 停机后拒绝新连接
@@ -358,6 +360,64 @@ func TestHubShutdown(t *testing.T) {
 	if !errors.As(err, &rej) || rej.Reason != ReasonShutdown {
 		t.Fatalf("Register after shutdown err = %v, want *RejectError{shutdown}", err)
 	}
+}
+
+// TestHubShutdownHonorsWait:Shutdown(wait) 等待房间清空(全部连接
+// Unregister)即返回,不空转满 wait;连接迟迟不摘除时按 wait 上限返回。
+func TestHubShutdownHonorsWait(t *testing.T) {
+	t.Run("rooms drained returns early", func(t *testing.T) {
+		h := NewHub(DefaultOptions(), nil)
+		d := newDeviceConn("u1", "dev-1", "phone")
+		mustRegister(t, h, d)
+		cl := newClientConn("u1", "cli-1")
+		mustRegister(t, h, cl)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.Shutdown(5 * time.Second)
+		}()
+		// 模拟 conn 层 flush 完成后 Unregister(真实 wsConn 的收尾路径):
+		// 只摘 device 时房间仍在,Shutdown 不得提前返回
+		time.Sleep(50 * time.Millisecond)
+		h.Unregister(d)
+		select {
+		case <-done:
+			t.Fatal("Shutdown returned before all conns unregistered (client still in room)")
+		case <-time.After(100 * time.Millisecond):
+		}
+		// client 也摘除后房间清空,Shutdown 应立即返回
+		h.Unregister(cl)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Shutdown did not return after rooms drained")
+		}
+	})
+
+	t.Run("wait deadline caps the wait", func(t *testing.T) {
+		h := NewHub(DefaultOptions(), nil)
+		mustRegister(t, h, newDeviceConn("u1", "dev-1", "phone"))
+		start := time.Now()
+		h.Shutdown(100 * time.Millisecond) // fakeConn 永不 Unregister
+		elapsed := time.Since(start)
+		if elapsed < 100*time.Millisecond {
+			t.Fatalf("Shutdown returned after %v, before wait deadline", elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("Shutdown blocked %v, far past wait deadline", elapsed)
+		}
+	})
+
+	t.Run("wait<=0 returns immediately", func(t *testing.T) {
+		h := NewHub(DefaultOptions(), nil)
+		mustRegister(t, h, newDeviceConn("u1", "dev-1", "phone"))
+		start := time.Now()
+		h.Shutdown(0)
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			t.Fatalf("Shutdown(0) blocked %v, want immediate return", elapsed)
+		}
+	})
 }
 
 // TestHubRegisterShutdownRace 回归测试:Register 与 Shutdown 并发时,

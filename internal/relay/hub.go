@@ -257,10 +257,12 @@ func (h *Hub) RouteApp(from Conn, targetDeviceID string, payload json.RawMessage
 	}
 }
 
-// Shutdown 停止接受新连接,给全部连接发 closed shutdown,并对每个
-// device 向其 room 的 client 广播 presence offline(停机也触发
-// presence,spec §5.3)。连接的实际关闭与出站 flush 等待由各 conn 的
-// 实现完成(conn 层职责);wait 仅保留在签名中供 Task 7 兼容。
+// Shutdown 停止接受新连接,先对每个 device 向其 room 的 client 广播
+// presence offline(停机也触发 presence,spec §5.3),再给全部连接发
+// closed shutdown。顺序不能反过来:wsConn.Enqueue 对 closed 帧会同步
+// 置 closing 标志,之后入队的 presence 帧会被直接丢弃。
+// 随后等待连接收尾:wsConn 收到 closed 帧后 flush 并 Unregister,
+// 这里轮询房间清空即返回;wait 为等待上限(≤0 表示不等待,立即返回)。
 func (h *Hub) Shutdown(wait time.Duration) {
 	h.shutdown.Store(true)
 
@@ -286,14 +288,31 @@ func (h *Hub) Shutdown(wait time.Duration) {
 	}
 	h.mu.Unlock()
 
-	closedFrame := ClosedFrame(ReasonShutdown)
-	for _, c := range conns {
-		c.Enqueue(closedFrame)
-	}
+	// presence 先行:此时各连接尚未置 closing,帧能进入出站缓冲;
+	// 随后的 closed 帧触发统一关闭路径,writer 按序 flush(presence
+	// 先于 closed 到达对端)。
 	for _, b := range broadcasts {
 		frame := PresenceFrame(b.deviceID, false, nil)
 		for _, c := range b.clients {
 			c.Enqueue(frame)
 		}
+	}
+	closedFrame := ClosedFrame(ReasonShutdown)
+	for _, c := range conns {
+		c.Enqueue(closedFrame)
+	}
+
+	if wait <= 0 {
+		return
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		h.mu.RLock()
+		empty := len(h.rooms) == 0
+		h.mu.RUnlock()
+		if empty || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

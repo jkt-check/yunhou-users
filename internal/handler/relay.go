@@ -32,6 +32,14 @@ func (h *RelayHandler) SetHub(hub *relay.Hub, tickets *service.RelayTicketServic
 	h.allowedOrigins = allowedOrigins
 }
 
+// Shutdown 释放 handler 持有的后台资源(hello 失败限流器的清理
+// goroutine)。main.go 停机序列中随 relayHub.Shutdown 一并调用。
+func (h *RelayHandler) Shutdown() {
+	if h.fails != nil {
+		h.fails.Stop()
+	}
+}
+
 // ServeWS 处理 GET /relay/ws:停机 503 → Origin 校验(防 CSWSH)→ 移交 relay 包。
 func (h *RelayHandler) ServeWS(c *gin.Context) {
 	if h.hub == nil || h.hub.ShutdownStarted() {

@@ -717,8 +717,14 @@ func TestWSGracefulShutdown(t *testing.T) {
 		t.Fatal("ShutdownStarted false after Shutdown")
 	}
 
-	// 两条连接都收到 closed shutdown(client 侧的 presence offline 因
-	// closing 标志被丢弃,不影响 closed 断言);flush 由 conn 层 finalize
+	// 停机帧序(spec §5.3):client 必须先收到 device 的 presence offline,
+	// 然后才是自己的 closed shutdown。旧实现顺序相反,closed 帧同步置
+	// closing 后 presence 被静默丢弃——本断言守护修复后的行为。
+	m := readFrame(t, cl)
+	if m["type"] != "presence" || m["device_id"] != "d1" || m["online"] != false {
+		t.Fatalf("first shutdown frame on client = %v, want presence offline for d1", m)
+	}
+	// device 与 client 都收到 closed shutdown;flush 由 conn 层 finalize
 	// 等 closedWritten 保证,不依赖墙钟 sleep。
 	expectClosedReason(t, dev, "shutdown")
 	expectClosedReason(t, cl, "shutdown")
@@ -727,4 +733,30 @@ func TestWSGracefulShutdown(t *testing.T) {
 
 	// 停机后新握手在 handler 层直接 503,不升级
 	env.dialExpectStatus(t, "", http.StatusServiceUnavailable)
+}
+
+// TestWSHelloFailNilLimiter:fails 限流器为 nil(关闭失败限流)时,
+// hello 失败路径不得 panic(RecordFailure 全部判空),连接按常规
+// closed auth 关闭。
+func TestWSHelloFailNilLimiter(t *testing.T) {
+	hub := NewHub(testOptions(), nil)
+	tickets := newStubTickets()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		HandleWS(w, r, hub, tickets, nil, testClientIP)
+	}))
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/relay/ws", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+	writeFrame(t, c, map[string]any{
+		"v": 1, "type": "hello", "ticket": "forged", "role": "device",
+		"device_id": "d1", "device_name": "Mac", "app_version": "2.4.0",
+	})
+	expectClosedReason(t, c, "auth")
+	expectConnClosed(t, c, 2*time.Second)
 }

@@ -185,7 +185,7 @@ Relay 为 kaya 客户端与受控设备之间提供 WebSocket 房间路由。未
 
 | 端点 | 说明 |
 |---|---|
-| `POST /relay/ticket` | 已登录用户换取一次性 WS ticket(HMAC 签名,TTL 5 分钟;entitlement 校验 + 0.5/s、burst 30 限流) |
+| `POST /relay/ticket` | 已登录用户换取 WS ticket(HMAC 签名,TTL 5 分钟;TTL 内可复用——Verify 无状态、不记 jti,同一 ticket 可完成多路并发 hello;entitlement 校验 + 0.5/s、burst 30 限流) |
 | `GET /relay/ws` | WebSocket 长连接,凭 ticket 完成 hello 握手后进入房间路由 |
 
 **环境变量**
@@ -214,8 +214,15 @@ nginx 的 catch-all `location /` 默认会把 `/metrics` 也代理到公网,因�
 加进该块的 allow 列表,不要直接删除 `deny all`。
 
 **优雅停机**:SIGTERM/SIGINT → handler 层对 `/relay/ws` 新握手返回 503 →
-全部在线连接收到 `closed shutdown` 帧 → 等待 flush(≤5s 预算)→ 强制关闭。
+全部在线连接先收 device 的 `presence offline`、再收 `closed shutdown` 帧 →
+等待连接收尾(房间清空或 3s 上限,≤5s 预算内)→ 强制关闭。
 客户端应把 `closed shutdown` 视为可重连信号,走 ticket 换新后重连。
+
+**已知限制:超大帧的关闭形态**。服务端读上限为 `MaxFrameBytes + 1024`
+(256 KiB + 1 KiB 信封余量)。超过该上限的帧会被 WebSocket 库以
+WS close 1009 直接掐断,连接收不到 spec §8 约定的 `closed protocol`;
+只有 (256 KiB, 257 KiB] 区间内的超大帧才会先收到 `closed protocol`
+再关闭。客户端不应依赖超大帧场景下的 `closed` 帧。
 
 ## Troubleshooting
 

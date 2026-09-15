@@ -327,12 +327,14 @@ func main() {
 		log.Printf("shutdown signal received, draining...")
 		sweeper.Stop()
 		if relayHub != nil {
-			// 停机序列:停接新连(handler 层 503)→ 全部在线连接收
-			// closed shutdown(conn 层 initiateClose 负责 flush 后关闭)。
-			// http.Server.Shutdown 不追踪 hijack 的 WS 连接,进程退出会
-			// 截断异步 flush,这里留 500ms(≤5s 预算内)给 closed 帧写出。
-			relayHub.Shutdown(5 * time.Second)
-			time.Sleep(500 * time.Millisecond)
+			// 停机序列:停接新连(handler 层 503)→ 全部在线连接先收
+			// presence offline、再收 closed shutdown(conn 层 initiateClose
+			// 负责 flush 后关闭)。http.Server.Shutdown 不追踪 hijack 的
+			// WS 连接,进程退出会截断异步 flush;Hub.Shutdown 的 wait 会
+			// 等到房间清空(全部连接收尾完毕)或 3s 上限,取先到者
+			// (≤5s 预算内,conn 层 closed 帧 flush 上限为 2s)。
+			relayHub.Shutdown(3 * time.Second)
+			relayHandler.Shutdown() // 停 hello 失败限流器的清理 goroutine
 		}
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()

@@ -109,7 +109,12 @@ func HandleWS(w http.ResponseWriter, r *http.Request, hub *Hub, tickets ticketVe
 	if err != nil {
 		return // Upgrade 失败,连接未建立
 	}
-	ws.SetReadLimit(int64(opts.MaxFrameBytes) + 1024) // 余量给信封外层
+	// 余量给信封外层。已知限制:超过 MaxFrameBytes+1024 的帧会被
+	// coder/websocket 以 WS close 1009 直接掐断,走不到下方的
+	// len(frame) > MaxFrameBytes 判定,因此收不到 spec §8 约定的
+	// closed protocol——只有 (MaxFrameBytes, MaxFrameBytes+1024]
+	// 区间内的超大帧才会收到该帧(见 docs/deployment.md 已知限制)。
+	ws.SetReadLimit(int64(opts.MaxFrameBytes) + 1024)
 
 	c := &wsConn{
 		hub:           hub,
@@ -126,7 +131,8 @@ func HandleWS(w http.ResponseWriter, r *http.Request, hub *Hub, tickets ticketVe
 }
 
 // run 的阶段划分对应 spec §7 状态机。ip 是可信链解析后的来源,用于
-// hello 失败限流与告警节流键(与 HandleWS 预检同一桶)。
+// hello 失败限流与告警节流键(与 HandleWS 预检同一桶)。fails 可为 nil
+// (关闭失败限流),所有使用点均判空。
 func (c *wsConn) run(ip string, tickets ticketVerifier, fails *HelloFailLimiter) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
@@ -146,7 +152,9 @@ func (c *wsConn) run(ip string, tickets ticketVerifier, fails *HelloFailLimiter)
 		}
 		c.hub.metrics.helloFailed(reason)
 		c.hub.warn.Logf("hello_fail:"+shortHash(ip), "hello failed reason=%s ip_hash=%s", reason, shortHash(ip))
-		fails.RecordFailure(ip)
+		if fails != nil {
+			fails.RecordFailure(ip)
+		}
 		c.ws.Close(websocket.StatusPolicyViolation, "hello failed")
 		return
 	}
@@ -156,7 +164,9 @@ func (c *wsConn) run(ip string, tickets ticketVerifier, fails *HelloFailLimiter)
 	if verr != nil {
 		c.hub.metrics.helloFailed("auth")
 		c.hub.warn.Logf("hello_fail:"+shortHash(ip), "hello failed reason=auth ip_hash=%s", shortHash(ip))
-		fails.RecordFailure(ip)
+		if fails != nil {
+			fails.RecordFailure(ip)
+		}
 		c.sendDirect(ClosedFrame(ReasonAuth))
 		c.ws.Close(websocket.StatusPolicyViolation, string(ReasonAuth))
 		return

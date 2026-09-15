@@ -289,3 +289,25 @@ func TestTokenBucket(t *testing.T) {
 		// If we get here without deadlock, it's thread safe
 	})
 }
+
+func TestRateLimit429SetsRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	// burst=1:第一请求放行,第二请求必触发 429
+	r.GET("/x", RateLimit(context.Background(), 0.0001, 1), func(c *gin.Context) { c.Status(200) })
+
+	rec1 := httptest.NewRecorder()
+	r.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec1.Code != 200 {
+		t.Fatalf("first request: got %d want 200", rec1.Code)
+	}
+
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec2.Code != 429 {
+		t.Fatalf("second request: got %d want 429", rec2.Code)
+	}
+	if rec2.Header().Get("Retry-After") == "" {
+		t.Fatalf("429 response missing Retry-After header")
+	}
+}

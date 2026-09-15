@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/yunhou/users/internal/llm"
@@ -89,6 +90,12 @@ type Config struct {
 
 	JWTAccessTTL  time.Duration
 	JWTRefreshTTL time.Duration
+
+	// Relay(远程控制 WS 中继;RELAY_TICKET_SECRET 为空 = 整体禁用)
+	RelayTicketSecret     string
+	RelayTicketSecretPrev string   // 轮换期旧 secret,校验时一并接受
+	RelayAllowedOrigins   []string // 浏览器 Origin 白名单(host 或 origin 形式)
+	AppEnv                string   // metrics 的 env label,默认 prod
 
 	// Payment channel webhook secrets. Loaded but not strictly required
 	// at startup — if a channel's secret is empty, webhooks for that channel
@@ -181,6 +188,11 @@ func Load() *Config {
 
 		JWTAccessTTL:  parseDurationOr(envOr("JWT_ACCESS_TTL", "15m"), 15*time.Minute),
 		JWTRefreshTTL: parseDurationOr(envOr("JWT_REFRESH_TTL", "168h"), 168*time.Hour),
+
+		RelayTicketSecret:     os.Getenv("RELAY_TICKET_SECRET"),
+		RelayTicketSecretPrev: os.Getenv("RELAY_TICKET_SECRET_PREVIOUS"),
+		RelayAllowedOrigins:   splitCSV(os.Getenv("RELAY_ALLOWED_ORIGINS")),
+		AppEnv:                envOr("APP_ENV", "prod"),
 
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
 		WeChatAPIv3Key:      os.Getenv("WECHAT_PAY_API_V3_KEY"),
@@ -341,6 +353,20 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// splitCSV 解析逗号分隔 env;空串返回 nil;每项 TrimSpace 后丢弃空项。
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseDurationOr(s string, fallback time.Duration) time.Duration {

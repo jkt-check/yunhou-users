@@ -74,6 +74,10 @@ var (
 	// Usage analytics (/user/usage/heartbeat + /admin/stats/*). Wrapped
 	// with a detail message (fmt.Errorf %w); handlers map it to 400.
 	ErrUsageInvalidParam = errors.New("invalid usage stats parameter")
+
+	// relay ticket 校验失败(伪造/篡改/过期/错误 aud/错误 secret 统一口径,
+	// 不向连接方泄露具体原因)。
+	ErrRelayTicketInvalid = errors.New("invalid relay ticket")
 )
 
 // Normalized codes classifying an upstream 4xx rejection. Surfaced to

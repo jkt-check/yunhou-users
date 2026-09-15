@@ -256,6 +256,12 @@ func (c *Config) Validate() error {
 	if len(c.OAuthStateSecret) < 32 {
 		return errors.New("OAUTH_STATE_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
 	}
+	// RELAY_TICKET_SECRET 为空 = relay 整体禁用,合法;一旦设置即签发
+	// HMAC-SHA256 ticket,低于 32 字符的 secret 可被暴力伪造,强度下限
+	// 与 OAUTH_STATE_SECRET 一致,生成同样用 `openssl rand -hex 32`。
+	if c.RelayTicketSecret != "" && len(c.RelayTicketSecret) < 32 {
+		return errors.New("RELAY_TICKET_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
+	}
 	// Real-mode WeChat Pay credentials are a six-field all-or-none tuple:
 	//   WECHAT_PAY_API_V3_KEY + WECHAT_PAY_MCH_ID  (used for webhook
 	//     verification, AES-GCM resource decryption, and to form the

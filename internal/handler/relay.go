@@ -6,16 +6,43 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/relay"
 	"github.com/yunhou/users/internal/service"
 )
 
-// RelayHandler 承载 relay 模块的 HTTP 入口。WS 升级逻辑见 serveWS(Task 5)。
+// RelayHandler 承载 relay 模块的 HTTP 入口。WS 升级逻辑见 ServeWS。
 type RelayHandler struct {
-	svc *service.RelayService
+	svc            *service.RelayService
+	hub            *relay.Hub
+	tickets        *service.RelayTicketService
+	fails          *relay.HelloFailLimiter
+	allowedOrigins []string
 }
 
 func NewRelayHandler(svc *service.RelayService) *RelayHandler {
 	return &RelayHandler{svc: svc}
+}
+
+// SetHub 注入 WS 侧依赖(main.go 在 relay 启用时调用)。
+// hello 失败限流器(5 次/min/IP,spec §8)由 handler 持有并传入 relay 包。
+func (h *RelayHandler) SetHub(hub *relay.Hub, tickets *service.RelayTicketService, allowedOrigins []string) {
+	h.hub = hub
+	h.tickets = tickets
+	h.fails = relay.NewHelloFailLimiter(5)
+	h.allowedOrigins = allowedOrigins
+}
+
+// ServeWS 处理 GET /relay/ws:停机 503 → Origin 校验(防 CSWSH)→ 移交 relay 包。
+func (h *RelayHandler) ServeWS(c *gin.Context) {
+	if h.hub == nil || h.hub.ShutdownStarted() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"code": 503, "message": "relay shutting down"})
+		return
+	}
+	if origin := c.GetHeader("Origin"); origin != "" && !relay.OriginAllowed(origin, h.allowedOrigins) {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "origin not allowed"})
+		return
+	}
+	relay.HandleWS(c.Writer, c.Request, h.hub, h.tickets, h.fails)
 }
 
 // IssueTicket 处理 POST /relay/ticket:access_token(经 JWTAuth 中间件)+

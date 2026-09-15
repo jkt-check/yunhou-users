@@ -22,6 +22,7 @@ import (
 	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/relay"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
 	"github.com/yunhou/users/internal/service"
@@ -192,12 +193,13 @@ func main() {
 	chatSvc := service.NewChatService(llmCatalog, subRepo, planRepo, llmUsageRepo)
 
 	// Relay(kaya 远程控制):仅当 RELAY_TICKET_SECRET 配置时启用,否则
-	// /relay/ticket 路由不注册(404)。
+	// /relay/ticket 与 /relay/ws 路由不注册(404)。
 	var relayHandler *handler.RelayHandler
 	if cfg.RelayTicketSecret != "" {
-		relaySvc := service.NewRelayService(subRepo, planRepo,
-			service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second))
+		ticketSvc := service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second)
+		relaySvc := service.NewRelayService(subRepo, planRepo, ticketSvc)
 		relayHandler = handler.NewRelayHandler(relaySvc)
+		relayHandler.SetHub(relay.NewHub(relay.DefaultOptions()), ticketSvc, cfg.RelayAllowedOrigins)
 	} else {
 		log.Printf("relay: disabled (RELAY_TICKET_SECRET empty)")
 	}
@@ -256,7 +258,10 @@ func main() {
 	// (5m, inside ChatService) plus a per-response write deadline set by
 	// the chat handler (the server-wide WriteTimeout below is an absolute
 	// per-request deadline — it would hard-cut a longer stream).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat"))
+	// /relay/ws is exempt too: it is a WebSocket long connection that must
+	// never sit under the 20s cap (its liveness bounds are the relay
+	// ping/idle timers in internal/relay).
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/relay/ws"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,

@@ -147,7 +147,9 @@ func Setup(
 			return c.GetString(middleware.ContextUserID)
 		})
 		engine.POST("/relay/ticket", middleware.JWTAuth(tokenSvc), ticketLimiter, relayHandler.IssueTicket)
-		// /relay/ws 在 Task 5 注册
+		// WS 长连接:不走 JWTAuth(ticket 在 hello 首帧内鉴权,spec §7),
+		// 且在 timeoutMiddleware 的 skip 列表中(main.go)。
+		engine.GET("/relay/ws", relayHandler.ServeWS)
 	}
 
 	// Admin routes for plan management (internal service auth)

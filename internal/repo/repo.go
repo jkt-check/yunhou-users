@@ -122,7 +122,12 @@ type SessionRepo interface {
 	Revoke(ctx context.Context, id string) error
 	RevokeIfNotRevoked(ctx context.Context, id string) (bool, error)
 	RotateRefresh(ctx context.Context, oldID string, newSession *model.Session) error
-	RevokeFamilyByUserApp(ctx context.Context, userID, appID string) error
+	// RevokeChainFrom revokes every live session reachable from startID via
+	// rotated_to links — the theft response to refresh-token reuse. Only the
+	// compromised rotation chain is revoked; independent sessions of the same
+	// (user, app), e.g. a fresh OAuth login, are not descendants of the
+	// stolen token and stay live.
+	RevokeChainFrom(ctx context.Context, startID string) error
 	ExchangeAuthCode(ctx context.Context, oldID string, newSession *model.Session) (bool, error)
 }
 
@@ -642,14 +647,27 @@ func (r *sessionRepo) Create(ctx context.Context, s *model.Session) error {
 	return err
 }
 
-// RevokeFamilyByUserApp marks every active session for (user_id, app_id) as
-// revoked. Used as a security response when refresh-token reuse is detected:
-// revoking the whole family limits the blast radius of a stolen token.
-func (r *sessionRepo) RevokeFamilyByUserApp(ctx context.Context, userID, appID string) error {
+// RevokeChainFrom marks every live session reachable from startID by
+// following rotated_to links as revoked. Replaces the old family-wide
+// revoke as the reuse response (2026-09-16 prod incident: a stale browser
+// cookie racing the post-login /auth/session call family-revoked the
+// just-created login session, making re-login impossible until cookies
+// were cleared). The UPDATE's user filter mirrors graceSuccessor's
+// same-user defence so a tampered cross-user link can't drag another
+// user's row into the revocation. UNION (not ALL) keeps a cyclic link
+// from looping the CTE forever.
+func (r *sessionRepo) RevokeChainFrom(ctx context.Context, startID string) error {
 	_, err := r.db.ExecContext(ctx, `
+		WITH RECURSIVE chain AS (
+			SELECT id, rotated_to, user_id FROM sessions WHERE id = $1
+			UNION
+			SELECT s.id, s.rotated_to, s.user_id FROM sessions s JOIN chain c ON s.id = c.rotated_to
+		)
 		UPDATE sessions SET revoked = true, revoked_at = now()
-		WHERE user_id = $1 AND app_id = $2 AND revoked = false
-	`, userID, appID)
+		WHERE id IN (SELECT id FROM chain)
+		  AND user_id = (SELECT user_id FROM chain WHERE id = $1)
+		  AND revoked = false
+	`, startID)
 	return err
 }
 
@@ -746,7 +764,7 @@ func (r *sessionRepo) RotateRefresh(ctx context.Context, oldID string, newSessio
 	}
 	if n == 0 {
 		// Return the sentinel directly so AuthService can match with
-		// errors.Is and trigger the grace-window / family-revoke decision.
+		// errors.Is and trigger the grace-window / chain-revoke decision.
 		// A plain fmt.Errorf here would silently break refresh-token reuse
 		// detection (errors.Is only matches via %w).
 		return model.ErrSessionAlreadyRevoked

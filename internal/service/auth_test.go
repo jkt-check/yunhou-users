@@ -334,18 +334,20 @@ func TestAuthService_RefreshToken(t *testing.T) {
 		},
 		{
 			// Refresh-token reuse detection: rotating then replaying the
-			// same refresh token must trigger the family-revoke response.
-			// This is the security-critical test that would have caught
+			// same refresh token must be rejected. This is the
+			// security-critical test that would have caught
 			// the earlier bug where RotateRefresh returned a plain error
-			// that errors.Is could not match.
-			name:         "refresh reuse revokes the family",
+			// that errors.Is could not match. (The chain-scoped revocation
+			// side of the response is pinned by TestAuthService_RefreshToken_RotationGrace.)
+			name:         "refresh reuse rejected",
 			refreshToken: "reuse-token",
 			appID:        "yundian",
 			setup: func(ur *mockUserRepo, sir *mockSocialIdentityRepo, pr *mockPlanRepo, sr *mockSubscriptionRepo, ssr *mockSessionRepo, ar *mockAppRepo) {
 				pr.plans["free"] = plans["free"]
 				ur.users["user-reuse"] = &model.User{ID: "user-reuse", Status: "active"}
-				// Two siblings in the (user, app) family so we can verify
-				// both are revoked when reuse is detected.
+				// An off-chain sibling in the same (user, app) family:
+				// the 401 is asserted by the runner; revocation scope is
+				// pinned by TestAuthService_RefreshToken_RotationGrace.
 				sibling := &model.Session{
 					ID:           "sess-sibling",
 					UserID:       "user-reuse",
@@ -418,7 +420,7 @@ func TestAuthService_RefreshToken(t *testing.T) {
 // legitimate retry — the server walks the rotated_to chain to the live
 // successor and rotates THAT, issuing a fresh pair. Outside the window, or
 // when the chain is broken (no rotated_to link), the replay is treated as
-// token theft: family revoke + 401.
+// token theft: chain revoke + 401.
 func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -479,13 +481,13 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 		if !ok || fresh.Revoked {
 			t.Errorf("expected live freshly-rotated session at %v, got %+v", next, fresh)
 		}
-		// Crucially: NO family revoke — the sibling stays usable.
+		// Crucially: NO reuse response — the sibling stays usable.
 		if ssr.sessions["sess-sibling"].Revoked {
-			t.Error("in-grace retry must NOT revoke the family")
+			t.Error("in-grace retry must NOT trigger any revocation")
 		}
 	})
 
-	t.Run("replay outside grace revokes the family", func(t *testing.T) {
+	t.Run("replay outside grace revokes the rotation chain only", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		seedBase(ur, pr, ar)
@@ -501,21 +503,27 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 		if !errors.Is(err, ErrInvalidRefreshToken) {
 			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
 		}
-		// Real replay → the whole (user, app) family is revoked.
-		if !ssr.sessions["sess-sibling"].Revoked {
-			t.Error("expected family revoke: sibling still live")
-		}
+		// Real replay → the compromised rotation chain is revoked...
 		if !ssr.sessions["sess-successor"].Revoked {
-			t.Error("expected family revoke: successor still live")
+			t.Error("expected chain revoke: successor still live")
+		}
+		// ...but an independent session (fresh OAuth login, not on the
+		// compromised chain) must survive. 2026-09-16 prod incident: a stale
+		// browser cookie racing the post-login /auth/session family-revoked
+		// the just-created login session, making re-login impossible.
+		if ssr.sessions["sess-sibling"].Revoked {
+			t.Error("independent session must NOT be revoked by chain reuse response")
 		}
 	})
 
-	t.Run("revoked without rotated_to link revokes the family", func(t *testing.T) {
+	t.Run("revoked without rotated_to link does not touch independent sessions", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		seedBase(ur, pr, ar)
-		// Recently revoked but no successor link — e.g. an explicit logout.
-		// A replay here is NOT a lost-response retry; treat as reuse.
+		// Recently revoked but no successor link — e.g. an explicit logout or
+		// a prior reuse response. Its chain is already dead (rotated_to NULL
+		// means no live descendant can exist), so the 401 alone suffices; an
+		// independent fresh login for the same (user, app) must survive.
 		old := revokedSess("sess-old", "old-token", 5*time.Second, nil)
 		sibling := liveSess("sess-sibling", "sibling-token")
 		put(ssr, old)
@@ -526,8 +534,8 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 		if !errors.Is(err, ErrInvalidRefreshToken) {
 			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
 		}
-		if !ssr.sessions["sess-sibling"].Revoked {
-			t.Error("expected family revoke: sibling still live")
+		if ssr.sessions["sess-sibling"].Revoked {
+			t.Error("independent session must NOT be revoked when the replayed chain is already dead")
 		}
 	})
 
@@ -557,7 +565,7 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 			t.Error("expected chain end to be rotated")
 		}
 		if ssr.sessions["sess-sibling"].Revoked {
-			t.Error("in-grace chain walk must NOT revoke the family")
+			t.Error("in-grace chain walk must NOT trigger any revocation")
 		}
 	})
 
@@ -596,7 +604,7 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 		}
 	})
 
-	t.Run("DB error mid chain-walk surfaces 500 without family revoke", func(t *testing.T) {
+	t.Run("DB error mid chain-walk surfaces 500 without chain revoke", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		seedBase(ur, pr, ar)
@@ -621,23 +629,25 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 		if !strings.Contains(err.Error(), "find rotation successor") {
 			t.Errorf("expected wrap 'find rotation successor', got %q", err.Error())
 		}
-		// Crucially: no family revoke on a transient error — the user's
+		// Crucially: no chain revoke on a transient error — the user's
 		// other sessions survive a DB blip.
 		if ssr.sessions["sess-sibling"].Revoked || ssr.sessions["sess-successor"].Revoked {
-			t.Error("transient DB error must NOT revoke the family")
+			t.Error("transient DB error must NOT revoke any session")
 		}
 	})
 
-	t.Run("family revoke targets the compromised session's app, not the request app", func(t *testing.T) {
+	t.Run("chain revoke follows rotated_to links, not the request app", func(t *testing.T) {
 		t.Parallel()
 		ur, sir, pr, sr, ssr, ar := newAuthMocks()
 		seedBase(ur, pr, ar)
 		ar.seedActive("yundash", "云dash")
-		// The stolen token belongs to the yundian family; the replay passes
-		// a DIFFERENT active app in the request body.
+		// The stolen token's chain belongs to yundian; the replay passes a
+		// DIFFERENT active app in the request body. Chain revocation walks
+		// rotated_to links from the presented session — the request-supplied
+		// app_id plays no role.
 		old := revokedSess("sess-old", "old-token", 2*time.Hour, stringPtr("sess-successor"))
 		successor := liveSess("sess-successor", "successor-token")
-		sibling := liveSess("sess-sibling", "sibling-token") // same yundian family
+		sibling := liveSess("sess-sibling", "sibling-token") // same (user, app), but NOT on the compromised chain
 		put(ssr, old)
 		put(ssr, successor)
 		put(ssr, sibling)
@@ -650,13 +660,17 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 		if !errors.Is(err, ErrInvalidRefreshToken) {
 			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
 		}
-		// The compromised yundian family is revoked…
-		if !ssr.sessions["sess-sibling"].Revoked || !ssr.sessions["sess-successor"].Revoked {
-			t.Error("expected the compromised yundian family to be revoked")
+		// The compromised chain (old → successor) is revoked…
+		if !ssr.sessions["sess-successor"].Revoked {
+			t.Error("expected the compromised chain successor to be revoked")
 		}
-		// …and the request-supplied yundash family is NOT the revoke target.
+		// …while independent sessions survive: same-family sibling (fresh
+		// login, not a descendant of the stolen token) and the other app's.
+		if ssr.sessions["sess-sibling"].Revoked {
+			t.Error("independent same-family session must survive chain revoke")
+		}
 		if ssr.sessions["sess-otherapp"].Revoked {
-			t.Error("family revoke must not follow the request-supplied app_id")
+			t.Error("chain revoke must not follow the request-supplied app_id")
 		}
 	})
 
@@ -677,12 +691,14 @@ func TestAuthService_RefreshToken_RotationGrace(t *testing.T) {
 		if !errors.Is(err, ErrInvalidRefreshToken) {
 			t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
 		}
-		// The grace walk must NOT have rotated the foreign session.
+		// The grace walk must NOT have rotated the foreign session…
 		if ssr.sessions["sess-successor"].Revoked {
 			t.Error("must not rotate a successor owned by another user")
 		}
-		if !ssr.sessions["sess-sibling"].Revoked {
-			t.Error("expected family revoke on tampered chain")
+		// …and the chain revoke must not cross into another user's row either.
+		// (The independent same-user sibling is off-chain and survives too.)
+		if ssr.sessions["sess-sibling"].Revoked {
+			t.Error("independent session must survive chain revoke on tampered chain")
 		}
 	})
 }

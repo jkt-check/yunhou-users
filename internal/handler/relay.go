@@ -17,6 +17,7 @@ type RelayHandler struct {
 	tickets        *service.RelayTicketService
 	fails          *relay.HelloFailLimiter
 	allowedOrigins []string
+	wsURLOverride  string
 }
 
 func NewRelayHandler(svc *service.RelayService) *RelayHandler {
@@ -30,6 +31,14 @@ func (h *RelayHandler) SetHub(hub *relay.Hub, tickets *service.RelayTicketServic
 	h.tickets = tickets
 	h.fails = relay.NewHelloFailLimiter(5)
 	h.allowedOrigins = allowedOrigins
+}
+
+// SetWSURLOverride 注入 RELAY_WS_URL(main.go 在 relay 启用时调用)。
+// 非空时 /relay/ticket 返回的 ws_url 固定为它 —— 用于把 WS 长连接引向
+// 不过 CDN 的直连域名(2026-09-16:阿里云 CDN 剥 Upgrade 头,经
+// www.yunhouai.com 的 /relay/ws 全部 426)。
+func (h *RelayHandler) SetWSURLOverride(wsURL string) {
+	h.wsURLOverride = wsURL
 }
 
 // Shutdown 释放 handler 持有的后台资源(hello 失败限流器的清理
@@ -79,12 +88,16 @@ func (h *RelayHandler) IssueTicket(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
 		"ticket":     ticket,
 		"expires_in": expiresIn,
-		"ws_url":     relayWSURL(c),
+		"ws_url":     h.relayWSURL(c),
 	}, "message": "ok"})
 }
 
-// relayWSURL 由请求推导 WS 地址(已决事项 7)。
-func relayWSURL(c *gin.Context) string {
+// relayWSURL 决定 /relay/ticket 返回的 WS 地址:RELAY_WS_URL 配置优先,
+// 否则由请求推导(scheme + Host,已决事项 7)。
+func (h *RelayHandler) relayWSURL(c *gin.Context) string {
+	if h.wsURLOverride != "" {
+		return h.wsURLOverride
+	}
 	scheme := "ws"
 	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
 		scheme = "wss"

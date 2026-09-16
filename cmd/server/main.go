@@ -201,6 +201,10 @@ func main() {
 		ticketSvc := service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second)
 		relaySvc := service.NewRelayService(subRepo, planRepo, ticketSvc)
 		relayHandler = handler.NewRelayHandler(relaySvc)
+		relayHandler.SetWSURLOverride(cfg.RelayWSURL)
+		if cfg.RelayWSURL != "" {
+			log.Printf("relay: ws_url override = %s", cfg.RelayWSURL)
+		}
 		relayMetrics := relay.NewMetrics(prometheus.DefaultRegisterer, cfg.AppEnv)
 		relayHub = relay.NewHub(relay.DefaultOptions(), relayMetrics)
 		relayHandler.SetHub(relayHub, ticketSvc, cfg.RelayAllowedOrigins)

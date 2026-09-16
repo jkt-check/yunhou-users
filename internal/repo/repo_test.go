@@ -1153,37 +1153,71 @@ func TestSessionRepo_RotateRefresh_AlreadyRevoked(t *testing.T) {
 	}
 }
 
-func TestSessionRepo_RevokeFamilyByUserApp(t *testing.T) {
+func TestSessionRepo_RevokeChainFrom(t *testing.T) {
 	db := setupDB(t)
 	u := NewUserRepo(db)
 	alice := &model.User{ID: newUUID(), Status: "active"}
 	_ = u.Create(context.Background(), alice)
 	r := NewSessionRepo(db)
-	// 2 sessions for alice/yundian + 1 for alice/yundash.
-	for i, appID := range []string{"yundian", "yundian", "yundash"} {
-		s := &model.Session{
-			ID: newUUID(), UserID: alice.ID, AppID: appID,
-			SessionType: "refresh", RefreshToken: fmt.Sprintf("h-%d-%s", i, newUUID()), Scope: pq.StringArray{"yundian"},
+	mkSess := func() *model.Session {
+		return &model.Session{
+			ID: newUUID(), UserID: alice.ID, AppID: "yundian",
+			SessionType: "refresh", RefreshToken: fmt.Sprintf("h-%s", newUUID()), Scope: pq.StringArray{"yundian"},
 			ExpiresAt: time.Now().Add(1 * time.Hour),
 		}
-		_ = r.Create(context.Background(), s)
 	}
-	if err := r.RevokeFamilyByUserApp(context.Background(), alice.ID, "yundian"); err != nil {
-		t.Fatalf("RevokeFamilyByUserApp: %v", err)
+	// Chain old → mid → live (built through real rotations so rotated_to
+	// links are exactly what production writes), plus an off-chain session
+	// for the same (user, app) — the "fresh login" that must survive.
+	old := mkSess()
+	_ = r.Create(context.Background(), old)
+	mid := mkSess()
+	_ = r.RotateRefresh(context.Background(), old.ID, mid)
+	live := mkSess()
+	_ = r.RotateRefresh(context.Background(), mid.ID, live)
+	independent := mkSess()
+	_ = r.Create(context.Background(), independent)
+
+	if err := r.RevokeChainFrom(context.Background(), old.ID); err != nil {
+		t.Fatalf("RevokeChainFrom: %v", err)
 	}
-	// yundian sessions are gone; yundash one survives.
-	list := []struct{ app, hash string }{{"yundian", "h-0"}, {"yundian", "h-1"}, {"yundash", "h-2"}}
-	for _, l := range list {
-		_, err := r.FindByRefreshToken(context.Background(), l.hash, "refresh")
-		if l.app == "yundian" {
-			if !errors.Is(err, sql.ErrNoRows) {
-				t.Errorf("%s: err = %v, want ErrNoRows", l.app, err)
-			}
-		} else {
-			// The exact hash is per-test unique, so we only confirm the
-			// yundash session is still fetchable by going through the DB.
-			_ = err
+	if _, err := r.FindByRefreshToken(context.Background(), live.RefreshToken, "refresh"); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("chain tail: err = %v, want ErrNoRows", err)
+	}
+	if _, err := r.FindByRefreshToken(context.Background(), independent.RefreshToken, "refresh"); err != nil {
+		t.Errorf("independent session must survive: %v", err)
+	}
+}
+
+func TestSessionRepo_RevokeChainFrom_TamperedCrossUserLink(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	bob := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), alice)
+	_ = u.Create(context.Background(), bob)
+	r := NewSessionRepo(db)
+	mkSess := func(userID string) *model.Session {
+		return &model.Session{
+			ID: newUUID(), UserID: userID, AppID: "yundian",
+			SessionType: "refresh", RefreshToken: fmt.Sprintf("h-%s", newUUID()), Scope: pq.StringArray{"yundian"},
+			ExpiresAt: time.Now().Add(1 * time.Hour),
 		}
+	}
+	old := mkSess(alice.ID)
+	_ = r.Create(context.Background(), old)
+	bobSess := mkSess(bob.ID)
+	_ = r.Create(context.Background(), bobSess)
+	// DB tampering: alice's session points at bob's. The revoke must not
+	// cross into bob's row (mirrors graceSuccessor's same-user defence).
+	if _, err := db.Exec(`UPDATE sessions SET rotated_to = $1 WHERE id = $2`, bobSess.ID, old.ID); err != nil {
+		t.Fatalf("plant tampered link: %v", err)
+	}
+	if err := r.RevokeChainFrom(context.Background(), old.ID); err != nil {
+		t.Fatalf("RevokeChainFrom: %v", err)
+	}
+	if _, err := r.FindByRefreshToken(context.Background(), bobSess.RefreshToken, "refresh"); err != nil {
+		t.Errorf("cross-user link target must survive: %v", err)
 	}
 }
 

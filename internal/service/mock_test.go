@@ -668,13 +668,33 @@ func (m *mockSessionRepo) ExchangeAuthCode(_ context.Context, oldID string, newS
 	return true, nil
 }
 
-func (m *mockSessionRepo) RevokeFamilyByUserApp(_ context.Context, userID, appID string) error {
+func (m *mockSessionRepo) RevokeChainFrom(_ context.Context, startID string) error {
+	// Mirrors the production recursive CTE: the chain INCLUDES the anchor,
+	// follows rotated_to links (through cross-user hops), and revokes live
+	// rows owned by the same user as the start row. The seen set mirrors
+	// the SQL UNION's cycle termination.
+	start, ok := m.sessions[startID]
+	if !ok {
+		return nil
+	}
 	now := time.Now()
-	for _, s := range m.sessions {
-		if s.UserID == userID && s.AppID == appID && !s.Revoked {
-			s.Revoked = true
-			s.RevokedAt = &now
+	seen := map[string]bool{startID: true}
+	if start.Revoked == false {
+		start.Revoked = true
+		start.RevokedAt = &now
+	}
+	cur := start
+	for cur.RotatedTo != nil {
+		next := m.sessions[*cur.RotatedTo]
+		if next == nil || seen[next.ID] {
+			break
 		}
+		seen[next.ID] = true
+		if next.UserID == start.UserID && !next.Revoked {
+			next.Revoked = true
+			next.RevokedAt = &now
+		}
+		cur = next
 	}
 	return nil
 }

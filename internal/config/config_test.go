@@ -208,6 +208,48 @@ func TestValidate_RelayTicketSecretStrength(t *testing.T) {
 		})
 	}
 }
+
+// TestValidate_RelayWSURLScheme pins the optional ws_url override: empty =
+// derive from request Host (valid); ws:// and wss:// accepted; anything else
+// (https://, bare host, garbage) is rejected — a typo'd override would
+// silently hand clients an unconnectable URL.
+func TestValidate_RelayWSURLScheme(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		wsURL   string
+		wantErr bool
+	}{
+		{"empty derives from Host", "", false},
+		{"wss ok", "wss://api.example.com/relay/ws", false},
+		{"ws ok", "ws://localhost:8080/relay/ws", false},
+		{"https rejected", "https://api.example.com/relay/ws", true},
+		{"bare host rejected", "api.example.com/relay/ws", true},
+		{"garbage rejected", "not-a-url", true},
+		{"hostless rejected", "wss://", true},
+		{"path-only rejected", "wss:///relay/ws", true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validRealWeChatConfig()
+			cfg.RelayWSURL = tc.wsURL
+			err := cfg.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tc.wsURL)
+				}
+				if !strings.Contains(err.Error(), "RELAY_WS_URL") {
+					t.Errorf("error message missing RELAY_WS_URL: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("want nil for %q, got %v", tc.wsURL, err)
+			}
+		})
+	}
+}
+
 func TestValidate_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

@@ -107,6 +107,43 @@ func TestRelayTicketIssueOK(t *testing.T) {
 	}
 }
 
+func TestRelayTicketIssueWSURLOverride(t *testing.T) {
+	// RELAY_WS_URL 配置后,无论请求从哪个 Host 进来(www 经 CDN 的 vhost),
+	// ws_url 都必须指向覆盖值(不过 CDN 的直连域名)——2026-09-16 阿里云 CDN
+	// 剥 Upgrade 头致 /relay/ws 426 的修复。
+	svc := newRelayServiceForHandlerTest(t, nil)
+	gin.SetMode(gin.TestMode)
+	h := NewRelayHandler(svc)
+	h.SetWSURLOverride("wss://api.example.com/relay/ws")
+	r := gin.New()
+	r.POST("/relay/ticket", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "u-1")
+		c.Set(middleware.ContextAppID, "yunhou-website")
+		h.IssueTicket(c)
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/relay/ticket", nil)
+	req.Host = "www.example.com"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("got %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			WSURL string `json:"ws_url"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Data.WSURL != "wss://api.example.com/relay/ws" {
+		t.Fatalf("ws_url = %q, want override", resp.Data.WSURL)
+	}
+}
+
 func TestRelayTicketIssueForbidden(t *testing.T) {
 	svc := newRelayServiceForHandlerTest(t, service.ErrRelayNoAccess)
 	r := relayTicketTestRouter(svc)

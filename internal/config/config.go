@@ -95,6 +95,7 @@ type Config struct {
 	RelayTicketSecret     string
 	RelayTicketSecretPrev string   // 轮换期旧 secret,校验时一并接受
 	RelayAllowedOrigins   []string // 浏览器 Origin 白名单(host 或 origin 形式)
+	RelayWSURL            string   // 可选:覆盖 /relay/ticket 返回的 ws_url(空 = 按请求 Host 推导)
 	AppEnv                string   // metrics 的 env label,默认 prod
 
 	// Payment channel webhook secrets. Loaded but not strictly required
@@ -192,6 +193,7 @@ func Load() *Config {
 		RelayTicketSecret:     os.Getenv("RELAY_TICKET_SECRET"),
 		RelayTicketSecretPrev: os.Getenv("RELAY_TICKET_SECRET_PREVIOUS"),
 		RelayAllowedOrigins:   splitCSV(os.Getenv("RELAY_ALLOWED_ORIGINS")),
+		RelayWSURL:            os.Getenv("RELAY_WS_URL"),
 		AppEnv:                envOr("APP_ENV", "prod"),
 
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
@@ -261,6 +263,15 @@ func (c *Config) Validate() error {
 	// 与 OAUTH_STATE_SECRET 一致,生成同样用 `openssl rand -hex 32`。
 	if c.RelayTicketSecret != "" && len(c.RelayTicketSecret) < 32 {
 		return errors.New("RELAY_TICKET_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
+	}
+	// RELAY_WS_URL 为空 = 按请求 Host 推导 ws_url,合法;一旦设置必须是
+	// 带 host 的 ws:// 或 wss:// URL —— 填错 scheme(如 https://)或空
+	// host 会让客户端拿到永远连不上的地址且无任何报错,比不配置更难排查。
+	if c.RelayWSURL != "" {
+		u, err := url.Parse(c.RelayWSURL)
+		if err != nil || u.Host == "" || (u.Scheme != "ws" && u.Scheme != "wss") {
+			return errors.New("RELAY_WS_URL must be a ws:// or wss:// URL with a host")
+		}
 	}
 	// Real-mode WeChat Pay credentials are a six-field all-or-none tuple:
 	//   WECHAT_PAY_API_V3_KEY + WECHAT_PAY_MCH_ID  (used for webhook

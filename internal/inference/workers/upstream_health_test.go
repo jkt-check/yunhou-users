@@ -380,7 +380,9 @@ func TestUpstreamHealthNilObservedAtGuard(t *testing.T) {
 	_, accountID := env.seedExpiringCredential(t)
 	ctx := context.Background()
 
-	now := time.Now().UTC()
+	// PG timestamptz 只有微秒精度；Linux 上 time.Now() 带纳秒，须先对齐
+	// 微秒，否则读回值被截断后与 now 的 Equal 比较在 CI 必挂。
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	limit := domain.Microcredit(1000)
 	src := "reported"
 	ok, err := env.store.UpdateUpstreamAccountQuota(ctx, accountID, domain.UpstreamQuota{

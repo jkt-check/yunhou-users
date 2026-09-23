@@ -124,6 +124,8 @@ func cleanupDB(t *testing.T, db *sqlx.DB) {
 		"plan_benefit_configs",
 		"plan_change_log",
 		"refunds",
+		// llm_usage_events.app_id 引用 apps(app_id) 无级联,必须先于 apps 清
+		"llm_usage_events",
 		"usage_events",
 		"payments",
 		"webhook_events",

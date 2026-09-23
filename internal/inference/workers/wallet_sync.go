@@ -53,10 +53,15 @@ func NewWalletSync(store WalletSyncStore, clock domain.Clock, cfg EntitlementSyn
 }
 
 // Start runs the periodic loop until ctx is canceled. The first pass runs
-// immediately at startup (启动即跑一轮).
+// immediately at startup (启动即跑一轮). runGuarded 兜底每轮 pass 的 panic
+// （与 per-message recover 互补：Fetch 等 pass 级 panic 也不再终止进程）。
 func (w *WalletSync) Start(ctx context.Context) {
 	log.Printf("inference wallet sync worker started (interval=%s batch=%d)", w.cfg.Interval, w.cfg.BatchLimit)
-	if _, err := w.RunPass(ctx); err != nil {
+	pass := func() error {
+		_, err := w.RunPass(ctx)
+		return err
+	}
+	if err := runGuarded("inference wallet sync", pass); err != nil {
 		log.Printf("ERROR inference wallet sync: initial pass failed: %v", err)
 	}
 	ticker := time.NewTicker(w.cfg.Interval)
@@ -67,7 +72,7 @@ func (w *WalletSync) Start(ctx context.Context) {
 			log.Printf("inference wallet sync worker stopped")
 			return
 		case <-ticker.C:
-			if _, err := w.RunPass(ctx); err != nil {
+			if err := runGuarded("inference wallet sync", pass); err != nil {
 				log.Printf("ERROR inference wallet sync: pass failed: %v", err)
 			}
 		}

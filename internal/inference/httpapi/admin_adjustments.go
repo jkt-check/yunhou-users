@@ -183,6 +183,14 @@ func (h *AdminAdjustmentsHandler) Adjust(c *gin.Context) {
 				fail(c, rerr)
 				return
 			}
+			// 重放必须比对载荷（评审轮1 m9）：同键不同 adjustment 是调用
+			// 方键复用错误，按 409 拒绝而非当良性重放。
+			if stored.BillingAccountID != acct.ID || stored.AmountMicros != amount ||
+				stored.Direction != req.Direction || stored.Currency != req.Currency {
+				fail(c, domain.NewError(domain.CodeConflict,
+					"idempotency_key already used with a different adjustment payload"))
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
 				"applied": false, "adjustment": adjustmentJSON(stored),
 			}})

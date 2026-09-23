@@ -33,6 +33,8 @@ func TestOpenAPI_CoversMountedEndpoints(t *testing.T) {
 		// Task 13: 编程工具协议面(原生形状)必须留档。
 		"/v1/messages:",
 		"/v1/responses:",
+		"/v1/chat/completions:",
+		"/v1/models:",
 		// Task 14: 钱包/套餐外/PAYG 面。
 		"/user/wallet:",
 		"/user/wallet/entries:",
@@ -94,7 +96,7 @@ func TestOpenAPI_ConventionsAndDTOFields(t *testing.T) {
 		"quota_exhausted", "entitlement_expired", "no_active_entitlement",
 		"bundle_gift", "migration_gift", "kaya_membership",
 		"usage_events", // 心跳表不作为用量来源的明确口径
-		"不补零行",       // Task 16 minor ③：运营统计零活动分组缺席的明确声明
+		"不补零行",         // Task 16 minor ③：运营统计零活动分组缺席的明确声明
 		// Task 14 钱包口径：账本派生、现金/赠送来源隔离、套餐外默认关、PAYG 显式权益。
 		"micromoney", "cash", "bonus", "overage_enabled", "monthly_spend_limit_micros",
 		"topup", "consume", "refund", "reversal", "payg",
@@ -120,5 +122,44 @@ func TestOpenAPI_ConventionsAndDTOFields(t *testing.T) {
 	j := strings.Index(doc[i:], "type: string")
 	if i < 0 || j < 0 || j > 120 {
 		t.Error("DecimalInt64 must be declared as type: string (十进制整数字符串)")
+	}
+}
+
+// TestOpenAPI_WalletSchemasUseEnvelope pins the wallet responses inside the
+// management envelope {code, data, message}（全局约定：/user/* 端点一律
+// envelope；实现 user_wallet.go 的 ok(c, resp) 全部带 envelope）。四个钱包
+// schema 必须按 ModelQuotasEnvelope 同款 allOf:[Envelope, {data:...}] 建模，
+// 不得直接建模 payload（评审轮9 Important-1）。
+func TestOpenAPI_WalletSchemasUseEnvelope(t *testing.T) {
+	doc := readOpenAPI(t)
+	for _, name := range []string{
+		"WalletEnvelope", "WalletEntriesEnvelope", "PaygEnvelope", "WalletViewEnvelope",
+	} {
+		i := strings.Index(doc, "    "+name+":")
+		if i < 0 {
+			t.Errorf("openapi missing schema %s", name)
+			continue
+		}
+		// 约束在 schema 头部 200 字符内：allOf 组合 Envelope 与 data 属性。
+		head := doc[i:min(i+200, len(doc))]
+		if !strings.Contains(head, "allOf:") ||
+			!strings.Contains(head, `"#/components/schemas/Envelope"`) {
+			t.Errorf("schema %s must wrap payload via allOf:[Envelope, {data:...}]", name)
+		}
+	}
+	// PUT /user/wallet/overage 的 200 响应同样走 envelope（不得裸 WalletView）。
+	oi := strings.Index(doc, "operationId: setWalletOverage")
+	ri := strings.Index(doc[oi:], `"#/components/schemas/WalletViewEnvelope"`)
+	if oi < 0 || ri < 0 || ri > 1200 {
+		t.Error("PUT /user/wallet/overage 200 must use WalletViewEnvelope")
+	}
+	// PAYG 是真实来源枚举（domain.SourcePAYG，Task 14 起）：两处枚举都要含。
+	if n := strings.Count(doc, "enum: [subscription, order, grant, payg]"); n != 2 {
+		t.Errorf("source_type/type enum with payg count = %d, want 2 (QuotaEntitlement + EntitlementSource)", n)
+	}
+	// 签名合计（adjusted_micros debit 正 / credit 负）用有符号变体。
+	si := strings.Index(doc, "SignedDecimalInt64:")
+	if si < 0 || !strings.Contains(doc[si:si+160], `"^-?[0-9]+$"`) {
+		t.Error("SignedDecimalInt64 must be declared with signed pattern ^-?[0-9]+$")
 	}
 }

@@ -319,9 +319,17 @@ func actorOf(c *gin.Context) string {
 	return "user:unauthenticated@app:unknown"
 }
 
+// adminListMaxLimit 是所有管理列表端点 ?limit= 的硬上限（评审轮1 m3：
+// 无上限的 limit=999999999 一次调用即可触发无界扫描）。超限按上限处理
+// 而非报错，与既有「非法值回落默认」同族。
+const adminListMaxLimit = 500
+
 func parseLimit(c *gin.Context, def int) int {
 	if raw := c.Query("limit"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			if n > adminListMaxLimit {
+				return adminListMaxLimit
+			}
 			return n
 		}
 	}

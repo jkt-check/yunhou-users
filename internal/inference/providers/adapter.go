@@ -208,6 +208,11 @@ type egressDialer interface {
 // the egress policy (Task 4); when the egress checker also provides a
 // policy-binding DialContext, every dialed IP is validated at connection
 // time (I4 — covers the first dial AND post-redirect dials alike).
+//
+// 评审轮2 I1：跨 origin 重定向绝不跟随。Go 的 http.Client 跨主机跳转只剥
+// Authorization/Cookie，x-api-key 与 operator 扩展头会被逐字拷给新主机，
+// 307/308 还会重发完整请求体（客户 prompt）。返回 ErrUseLastResponse 让
+// 3xx 响应体作为上游错误 surfaced（Dispatch 按非 200 处理）。
 func NewHTTPClient(egress EgressChecker) *http.Client {
 	dial := (&net.Dialer{
 		Timeout:   10 * time.Second,
@@ -228,15 +233,27 @@ func NewHTTPClient(egress EgressChecker) *http.Client {
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	}}
-	if egress != nil {
-		c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("providers: too many redirects")
-			}
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return fmt.Errorf("providers: too many redirects")
+		}
+		// 评审轮2 I1：任一跳转离开初始 origin 即拒绝跟随 —— 上游密钥与
+		// operator 扩展头绝不能落进另一台主机（egress IP 策略对所有公网
+		// 主机都放行，挡不住凭证外泄）。
+		if len(via) > 0 && !sameOrigin(req.URL, via[0].URL) {
+			return http.ErrUseLastResponse
+		}
+		if egress != nil {
 			return egress.ValidateRedirect(req.Context(), req.URL.String())
 		}
+		return nil
 	}
 	return c
+}
+
+// sameOrigin reports whether two URLs share scheme and host (重定向凭证边界).
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
 }
 
 // Dispatch performs one upstream call. A nil *DispatchResult plus a

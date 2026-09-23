@@ -131,11 +131,19 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 	for _, r := range rows {
 		switch r.TargetKind {
 		case string(domain.TargetKeyBudget):
-			if _, err := tx.ExecContext(ctx,
+			res, err := tx.ExecContext(ctx,
 				`UPDATE inference_api_keys
 				 SET budget_used_micros = budget_used_micros - $2, updated_at = now()
-				 WHERE id = $1 AND budget_used_micros >= $2`, *r.APIKeyID, r.Amount); err != nil {
+				 WHERE id = $1 AND budget_used_micros >= $2`, *r.APIKeyID, r.Amount)
+			if err != nil {
 				return mapError("release: key budget", err)
+			}
+			// 与下方 window 分支同一守卫（评审轮1 Important-2）：预算已不
+			// 足以归还这笔预占 = 并发结算/账本漂移，必须响亮冲突，否则
+			// reservation 被标记 released 而 budget 保持膨胀（静默泄漏）。
+			if n, _ := res.RowsAffected(); n == 0 {
+				return domain.NewError(domain.CodeConflict,
+					"release: key budget no longer covers the hold (concurrent settlement?)")
 			}
 		case string(domain.TargetWallet):
 			// 钱包冻结释放（Task 14）：hold 行状态迁移，不是账本重写；

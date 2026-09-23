@@ -45,8 +45,15 @@ func (h *MessagesHandler) Create(c *gin.Context) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, v1ChatMaxBodyBytes))
 	if err != nil {
+		// 超限是明确的 413（评审轮1 m7），不是含糊的 400。
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			anthropicError(c, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				"request body exceeds the size limit")
+			return
+		}
 		anthropicError(c, http.StatusBadRequest, "invalid_request_error",
-			"request body too large or unreadable")
+			"request body unreadable")
 		return
 	}
 	req, err := providers.ParseAnthropicMessagesRequest(body)

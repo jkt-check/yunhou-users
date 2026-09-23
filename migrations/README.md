@@ -83,3 +83,4 @@ syntax, **not** transaction control — those are fine.
 | `032_inference_oauth_sessions.sql` | inference OAuth 授权状态（一次性 state + PKCE，独立于社交登录）与粘性会话绑定表组（Task 12；控制者裁决确需 DDL 从 032 起） |
 | `033_inference_response_chains.sql` | OpenAI Responses 会话链持久化：previous_response_id 接续的 transcript 回放 + 账户/上游账号归属（Task 13） |
 | `034_inference_operations.sql` | 运营面支撑：inference_bulk_imports 批量导入幂等任务表（commit 与目录写入同事务、重复提交重放已记录结果）+ requests/attempts 的 created_at 范围扫描索引（运营统计/异常筛选的真实查询计划；只读派生路径，不引入外部分析库）（Task 15） |
+| `035_lease_indexes_reaper.sql` | 租约热路径索引与收割支撑：concurrency_leases 增 (scope, scope_id, fencing_token DESC) 索引（MAX(fencing) 不再扫 scope 全历史）与终态行部分索引（DeleteTerminalLeases 收割 released/expired 且早于 7 天保留窗口的行，挂 upstream_health 轮次）；wallet_entries 增 (wallet_id, created_at) 索引（支撑月度支出派生）（评审修复批次8） |

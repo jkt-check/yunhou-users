@@ -238,6 +238,8 @@
 
 **测试与验收**：在“预占后、发送后、流尾后、写账前、提交后但响应前”分别注入故障；重启 worker 能恢复或明确进入待核对，没有静默免费、双扣或无审计释放。由账本重建聚合值可与窗口核对。
 
+**已知限制（评审轮1 de-scope 说明）**：估算结算的更正确认通道（`CorrectSettlement`）本期未接线——方法本体保留在 `internal/inference/postgres/reconciliation_repo.go`，但无生产调用方。crash_recovery 按预占额保守入账产生的高估额会保持保守多计，直到后续版本接入更正通道；wallet 计费请求已显式拒绝（CodeInvalidInput），wallet 更正分支待后续实现。
+
 ## Task 10：支付到权益的完整闭环
 
 **文件**

@@ -326,9 +326,14 @@ type CodingPlanActivation struct {
 //     anything else blocks.
 //
 // hint is the channel-authoritative expiry hint (rare for coding plan;
-// WeChat NATIVE ships none), clamped to now+intervalDays — even a verified
-// hint cannot extend past what the order's plan grants. intervalDays <= 0
-// means open-ended (lifetime), matching the legacy interval semantics.
+// WeChat NATIVE ships none), clamped to [now, now+intervalDays] — even a
+// verified hint cannot extend past what the order's plan grants, and a past
+// hint must never shorten an entitlement the customer just paid for. A nil
+// base (lifetime order / open-ended rollover) ignores the hint entirely: an
+// open-ended grant has no expiry to extend, and letting any hint replace it
+// would turn a past hint into a past ExpiresAt that the next DecideSync
+// lapse-check revokes. intervalDays <= 0 means open-ended (lifetime),
+// matching the legacy interval semantics.
 func ResolveCodingPlanActivation(
 	kind string,
 	intervalDays int,
@@ -394,14 +399,20 @@ func ResolveCodingPlanActivation(
 			"benefit activation: unknown order kind "+kind)
 	}
 
-	if hint != nil {
+	if hint != nil && base != nil {
+		// 只上钳不下钳会让过去的 hint 盖过开放期 base（base == nil 已在
+		// 上面排除）；这里再把 hint 下钳到 now，双重保证 hint 绝不缩短
+		// 既有授权（base 恒 > now，钳制是纯防御）。
 		c := hint.UTC()
+		if c.Before(now) {
+			c = now
+		}
 		if intervalDays > 0 {
 			if max := now.Add(time.Duration(intervalDays) * 24 * time.Hour); c.After(max) {
 				c = max
 			}
 		}
-		if base == nil || c.After(*base) {
+		if c.After(*base) {
 			base = &c
 		}
 	}

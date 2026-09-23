@@ -47,6 +47,9 @@ type UpstreamHealthStore interface {
 	// DeleteExpiredResponseChains sweeps TTL-expired Responses 会话链行
 	// (Task 13; 与绑定清扫同轮次).
 	DeleteExpiredResponseChains(ctx context.Context, now time.Time, limit int) (int64, error)
+	// DeleteTerminalLeases sweeps 终态租约行（released/expired 且终态时间
+	// 早于 cutoff；评审修复批次8：准入热路径不再背负 scope 全历史行）.
+	DeleteTerminalLeases(ctx context.Context, cutoff time.Time, limit int) (int64, error)
 }
 
 // UpstreamHealthConfig tunes the worker; zero values take the defaults.
@@ -60,6 +63,10 @@ type UpstreamHealthConfig struct {
 	// scheduled while cooling — ListActiveUpstreamAccounts only reads
 	// 'active').
 	Cooldown time.Duration
+	// LeaseRetention is how long terminal (released/expired) concurrency
+	// leases are kept before the reaper deletes them (default 7d; fencing
+	// 单调性只需对 held 行成立，终态行只服务短期排查).
+	LeaseRetention time.Duration
 }
 
 func (c *UpstreamHealthConfig) withDefaults() UpstreamHealthConfig {
@@ -72,6 +79,9 @@ func (c *UpstreamHealthConfig) withDefaults() UpstreamHealthConfig {
 	}
 	if out.Cooldown <= 0 {
 		out.Cooldown = 5 * time.Minute
+	}
+	if out.LeaseRetention <= 0 {
+		out.LeaseRetention = 7 * 24 * time.Hour
 	}
 	return out
 }
@@ -115,10 +125,12 @@ type UpstreamHealthMetrics struct {
 	BindingsExpired int64 `json:"bindings_expired"`
 	// ChainsExpired: TTL 到期清扫的 Responses 会话链行数（Task 13）。
 	ChainsExpired int64 `json:"chains_expired"`
+	// LeasesReaped: 本轮收割的终态租约行数（评审修复批次8）。
+	LeasesReaped int64 `json:"leases_reaped"`
 }
 
 // RunPass executes one health round: first sweep TTL-expired session
-// bindings and response chains, then probe accounts.
+// bindings, response chains and terminal leases, then probe accounts.
 func (w *UpstreamHealth) RunPass(ctx context.Context) (UpstreamHealthMetrics, error) {
 	var m UpstreamHealthMetrics
 	expired, err := w.store.EndExpiredSessionBindings(ctx, w.clock.Now(), w.cfg.BatchLimit)
@@ -131,6 +143,11 @@ func (w *UpstreamHealth) RunPass(ctx context.Context) (UpstreamHealthMetrics, er
 		return m, err
 	}
 	m.ChainsExpired = chains
+	leases, err := w.store.DeleteTerminalLeases(ctx, w.clock.Now().Add(-w.cfg.LeaseRetention), w.cfg.BatchLimit)
+	if err != nil {
+		return m, err
+	}
+	m.LeasesReaped = leases
 	dueBefore := w.clock.Now().Add(-w.cfg.Cooldown)
 	accounts, err := w.store.ListUpstreamAccountsForHealth(ctx, dueBefore, w.cfg.BatchLimit)
 	if err != nil {
@@ -269,6 +286,7 @@ func (w *UpstreamHealth) probeStatic(ctx context.Context, a *domain.UpstreamAcco
 		// 等运营手工轮换凭据（Task 4 Rotate 后需人工恢复账号状态）。
 		if rerr := w.markAccountReauth(ctx, a, "static service credential rejected"); rerr != nil {
 			m.Errors++
+			log.Printf("ERROR upstream health: reauth propagation failed account=%s: %v", a.ID, rerr)
 			return
 		}
 		m.ReauthRequired++
@@ -306,19 +324,23 @@ func (w *UpstreamHealth) markAccountReauth(ctx context.Context, a *domain.Upstre
 		return err
 	}
 	if w.audit != nil {
-		if rec, ok := w.audit.(interface {
-			RecordTx(context.Context, domain.UnitOfWork, management.AuditEvent) error
-		}); ok {
-			if err := rec.RecordTx(ctx, txw, management.AuditEvent{
-				Action: "upstream_account.reauth_required", ObjectType: "upstream_account", ObjectID: a.ID,
-				Reason: reason, ActorApp: credentials.WorkerActorApp,
-				Detail: management.SanitizeDetail(map[string]any{
-					"provider_id": a.ProviderID, "credential_id": a.CredentialID,
-					"session_bindings_ended": len(bindings),
-				}),
-			}); err != nil {
-				return domain.WrapError(domain.CodeInternal, "audit write failed", err)
-			}
+		// 同事务审计 fail-closed（对齐 bulk_import，审查修复 Important-2）：
+		// 记录器不支持事务写入时整个翻转失败回滚——账号翻转 + 绑定终止与
+		// 审计同生共死，绝不静默提交无审计的状态变更。
+		rec, ok := w.audit.(management.AuditTxRecorder)
+		if !ok {
+			log.Printf("ERROR upstream health: audit recorder lacks transactional support — reauth propagation aborted account=%s", a.ID)
+			return domain.NewError(domain.CodeInternal, "upstream health: audit recorder lacks transactional support")
+		}
+		if err := rec.RecordTx(ctx, txw, management.AuditEvent{
+			Action: "upstream_account.reauth_required", ObjectType: "upstream_account", ObjectID: a.ID,
+			Reason: reason, ActorApp: credentials.WorkerActorApp,
+			Detail: management.SanitizeDetail(map[string]any{
+				"provider_id": a.ProviderID, "credential_id": a.CredentialID,
+				"session_bindings_ended": len(bindings),
+			}),
+		}); err != nil {
+			return domain.WrapError(domain.CodeInternal, "audit write failed", err)
 		}
 	}
 	if err := txw.Commit(ctx); err != nil {
@@ -395,8 +417,17 @@ func (w *UpstreamHealth) observeQuota(ctx context.Context, a *domain.UpstreamAcc
 }
 
 // Start runs the worker loop until ctx is done (first pass immediate).
+// runGuarded 兜底每轮 pass 的 panic（审查修复 Important-1：裸 goroutine
+// worker 的 panic 不再终止 API 进程）。
 func (w *UpstreamHealth) Start(ctx context.Context) {
-	if m, err := w.RunPass(ctx); err != nil {
+	var m UpstreamHealthMetrics
+	pass := func() error {
+		m = UpstreamHealthMetrics{}
+		var err error
+		m, err = w.RunPass(ctx)
+		return err
+	}
+	if err := runGuarded("upstream health", pass); err != nil {
 		log.Printf("WARN upstream health pass failed: %v", err)
 	} else if m.Scanned > 0 {
 		log.Printf("upstream health pass: %+v", m)
@@ -408,12 +439,11 @@ func (w *UpstreamHealth) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			m, err := w.RunPass(ctx)
-			if err != nil {
+			if err := runGuarded("upstream health", pass); err != nil {
 				log.Printf("WARN upstream health pass failed: %v", err)
 				continue
 			}
-			if m.CooledDown > 0 || m.Recovered > 0 || m.ReauthRequired > 0 || m.Errors > 0 || m.BindingsExpired > 0 {
+			if m.CooledDown > 0 || m.Recovered > 0 || m.ReauthRequired > 0 || m.Errors > 0 || m.BindingsExpired > 0 || m.LeasesReaped > 0 {
 				log.Printf("upstream health pass: %+v", m)
 			}
 		}

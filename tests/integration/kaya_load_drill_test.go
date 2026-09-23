@@ -182,8 +182,8 @@ func TestLoadDrill_Throughput(t *testing.T) {
 		total, elapsed.Round(time.Millisecond), float64(total)/elapsed.Seconds(), failures)
 	t.Logf("LATENCY: p50=%s p95=%s max=%s", pct(lat, 0.50), pct(lat, 0.95), pct(lat, 1.0))
 	t.Logf("SETTLE-LAG: p50=%s p95=%s max=%s (n=%d)", pct(lags, 0.50), pct(lags, 0.95), pct(lags, 1.0), len(lags))
-	t.Logf("POOL: InUse(max)=%d WaitCount +%d WaitDuration +%s MaxOpen=%d",
-		after.MaxIdleClosed, after.WaitCount-before.WaitCount, (after.WaitDuration - before.WaitDuration).Round(time.Millisecond), 20)
+	t.Logf("POOL: InUse(after)=%d WaitCount +%d WaitDuration +%s MaxOpen=%d",
+		after.InUse, after.WaitCount-before.WaitCount, (after.WaitDuration - before.WaitDuration).Round(time.Millisecond), 20)
 	t.Logf("POOL-STATS-BEFORE: %+v", before)
 	t.Logf("POOL-STATS-AFTER:  %+v", after)
 	sampler.mu.Lock()

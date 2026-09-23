@@ -276,6 +276,32 @@ func TestTranslateAnthropicStream_CacheBuckets(t *testing.T) {
 	}
 }
 
+// 评审轮2 M5：message_stop 在上游从未报 usage 时只发 [DONE]——缺失 usage
+// 绝不渲染为 {"usage":{"total_tokens":0}}（与 message_stop 缺失时的
+// !stopSeen 分支同一纪律）。
+func TestTranslateAnthropicStream_MessageStopWithoutUsage(t *testing.T) {
+	src := "event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+		"event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	st := TranslateAnthropicStream(io.NopCloser(strings.NewReader(src)))
+	out, err := io.ReadAll(st.TeeBody())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "data: [DONE]") {
+		t.Errorf("clean message_stop must still emit [DONE]: %s", s)
+	}
+	if strings.Contains(s, `"usage"`) {
+		t.Errorf("no-usage stream must not render a zero usage chunk: %s", s)
+	}
+	tap := st.Tap.Result()
+	if !tap.Terminal || tap.SawUsage {
+		t.Errorf("tap = %+v, want terminal + SawUsage=false", tap)
+	}
+}
+
 // errAfterStringReader yields data once, then fails — an upstream that
 // breaks mid-stream.
 type errAfterStringReader struct {

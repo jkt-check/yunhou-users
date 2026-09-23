@@ -11,12 +11,14 @@ package httpapi
 
 import (
 	"context"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/catalog"
+	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/middleware"
 )
 
@@ -46,10 +48,17 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	p, err := h.Resolver.ResolveUserSession(c.Request.Context(), userID)
 	if err != nil {
-		// No model billing account → the picker legitimately shows an empty
-		// list (the user never purchased/received a model grant), not an
-		// error — same UX as "no models available".
-		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": []kayaModelEntry{}}})
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			// No model billing account → the picker legitimately shows an
+			// empty list (the user never purchased/received a model grant),
+			// not an error — same UX as "no models available".
+			c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": []kayaModelEntry{}}})
+			return
+		}
+		// 其余错误（DB 故障、账户停用等）必须响亮报错（评审轮1 m5）：
+		// 渲染成成功空列表会把故障伪装成「用户无模型」。
+		log.Printf("chat/models: resolve user session: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
 		return
 	}
 	allowed, err := h.Resolver.AuthorizedModelIDs(c.Request.Context(), p, nil)

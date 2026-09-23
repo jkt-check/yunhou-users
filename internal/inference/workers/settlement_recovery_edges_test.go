@@ -2,9 +2,13 @@ package workers
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/postgres"
 )
 
 // settlement_recovery_edges_test.go — Task 16 覆盖率补强：恢复 worker 的
@@ -109,5 +113,74 @@ func TestRecover_WindowMismatchEnqueuedNotAutoFixed(t *testing.T) {
 	}
 	if jobs != 1 {
 		t.Errorf("window jobs = %d, want 1 (去重)", jobs)
+	}
+}
+
+// --- 审查修复 Minor-6：恢复 pass 各阶段独立执行、错误聚合 -----------------
+//
+// stageFakeStore 按阶段注入失败并记录调用（嵌入 nil 接口，仅覆盖 RunPass
+// 触达的五个阶段入口）。无需 DB。
+
+type stageFakeStore struct {
+	RecoveryStore
+	fail   map[string]error
+	called map[string]bool
+}
+
+func (s *stageFakeStore) mark(stage string) error {
+	s.called[stage] = true
+	return s.fail[stage]
+}
+
+func (s *stageFakeStore) ListStaleOpenRequests(ctx context.Context, cutoff time.Time, limit int) ([]domain.Request, error) {
+	return nil, s.mark("scan")
+}
+
+func (s *stageFakeStore) ListPendingReconciliationJobs(ctx context.Context, limit int) ([]postgres.ReconciliationJob, error) {
+	return nil, s.mark("jobs")
+}
+
+func (s *stageFakeStore) EscalateOverdueReconciliationJobs(ctx context.Context, now time.Time, limit int) ([]string, error) {
+	return nil, s.mark("escalate")
+}
+
+func (s *stageFakeStore) ReconcileWindowAggregates(ctx context.Context) ([]accounting.WindowReconciliation, error) {
+	return nil, s.mark("reconcile")
+}
+
+func (s *stageFakeStore) RecoveryMetrics(ctx context.Context, staleCutoff time.Time) (postgres.RecoveryMetrics, error) {
+	return postgres.RecoveryMetrics{}, s.mark("metrics")
+}
+
+// 阶段 2 失败不得连带跳过阶段 3（到期升级——卡死资金的安全网）与阶段 4；
+// 失败聚合后统一返回。
+func TestRunPass_StagesIndependentOnFailure(t *testing.T) {
+	scanErr := errors.New("scan boom")
+	jobsErr := errors.New("jobs boom")
+	store := &stageFakeStore{
+		fail:   map[string]error{"scan": scanErr, "jobs": jobsErr},
+		called: map[string]bool{},
+	}
+	w := NewSettlementRecovery(store, nil, RecoveryConfig{}, nil)
+	stats, err := w.RunPass(context.Background())
+	if err == nil || !errors.Is(err, scanErr) || !errors.Is(err, jobsErr) {
+		t.Fatalf("err = %v, want aggregated scan+jobs errors", err)
+	}
+	for _, stage := range []string{"scan", "jobs", "escalate", "reconcile", "metrics"} {
+		if !store.called[stage] {
+			t.Errorf("stage %s skipped — 阶段失败不得连带跳过后续阶段", stage)
+		}
+	}
+	if stats.Errors != 2 {
+		t.Errorf("stats.Errors = %d, want 2 (每失败阶段计一次)", stats.Errors)
+	}
+}
+
+// 全部阶段健康时返回 nil 错误（errors.Join 空集语义）。
+func TestRunPass_NoStageFailureReturnsNil(t *testing.T) {
+	store := &stageFakeStore{fail: map[string]error{}, called: map[string]bool{}}
+	w := NewSettlementRecovery(store, nil, RecoveryConfig{}, nil)
+	if _, err := w.RunPass(context.Background()); err != nil {
+		t.Fatalf("err = %v, want nil", err)
 	}
 }

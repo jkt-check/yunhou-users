@@ -60,7 +60,9 @@ type SourceView struct {
 	// Kind classifies grants: bundle_gift | migration_gift | other;
 	// empty for subscription/order sources.
 	Kind string
-	// Reference is the raw source_id.
+	// Reference is the raw source_id. PAYG 例外：其 source_id 为
+	// "payg:<billing_account_id>"（内部行标识），ResolveSourceView 置空
+	// 不外泄 —— 客户视图中 reference 为空字符串。
 	Reference string
 	// SubscriptionID is set when the source resolves to one of the user's
 	// own subscriptions (explicit plan, or the kaya membership behind a
@@ -243,6 +245,11 @@ func ResolveSourceView(item EntitlementItem, subByID map[string]ProductSubscript
 				sv.PlanName = sub.PlanName
 			}
 		}
+	case domain.SourcePAYG:
+		// PAYG 的 source_id 是 "payg:<billing_account_id>"（内部行标识），
+		// 对客户无意义且泄漏内部 id —— reference 置空不输出（评审轮9
+		// Important-2；OpenAPI EntitlementSource.reference 同款说明）。
+		sv.Reference = ""
 	default:
 		// subscription / order 显式来源：subscription 源直接解析到套餐。
 		if item.Source.Type == domain.SourceSubscription {

@@ -158,10 +158,35 @@ func TestUsageTracker_CacheCreationBucket(t *testing.T) {
 	}
 }
 
+// 评审轮2 I2：reasoning-only 流 delta 只带 "reasoning_content"——"content"
+// 不是它的字节子串，预解析门必须含 reasoning 条件，否则 reasoning 字节不
+// 计入 ContentBytes，上游不报 usage 时估算路径少计费。
+func TestUsageTracker_ReasoningOnlyDeltasCounted(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking \"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hard\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	var tr OpenAIUsageTracker
+	tr.Feed([]byte(stream))
+	u := tr.Result()
+	want := int64(len("thinking hard"))
+	if u.ContentBytes != want {
+		t.Errorf("ContentBytes = %d, want %d (reasoning 字节必须计量)", u.ContentBytes, want)
+	}
+	if u.SawUsage {
+		t.Errorf("SawUsage = true on a reasoning-only stream, want false")
+	}
+	if !u.Terminal {
+		t.Error("[DONE] must still mark the stream terminal")
+	}
+}
+
 // 评审轮1 I6：客户端断流时翻译 goroutine 持续 Feed、handler goroutine 并
 // 发 Finish→Result——-race 下必须无数据竞争（与 anthropicTap 同一锁口径）。
 func TestUsageTracker_ConcurrentFeedAndResult(t *testing.T) {
 	var tr OpenAIUsageTracker
+	// 先同步 Feed 一次：并发 goroutine 存在始终未被调度的理论可能，
+	// 末尾断言依赖「至少 Feed 过一次」，不能让调度偶发决定成败。
+	tr.Feed([]byte(openAISSEFixture))
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)

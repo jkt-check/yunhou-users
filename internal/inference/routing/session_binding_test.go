@@ -5,6 +5,7 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -229,5 +230,86 @@ func TestSessionBinding_EndAndExpiry(t *testing.T) {
 	}
 	if _, _, err := env.binder.Resolve(ctx, "sess-4", env.modelID); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("expired binding must resolve not_found, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 评审修复(Important-3): Resolve 的 Touch 错误映射 —— 纯内存 fake,无需 DB。
+// ---------------------------------------------------------------------------
+
+// fakeBindingStore 是 BindingStore 的可编程内存实现,TouchSessionBinding 的
+// 错误由测试注入。
+type fakeBindingStore struct {
+	binding  *domain.SessionBinding
+	account  *domain.UpstreamAccount
+	touchErr error
+}
+
+func (s *fakeBindingStore) InsertSessionBinding(ctx context.Context, b *domain.SessionBinding) error {
+	s.binding = b
+	return nil
+}
+
+func (s *fakeBindingStore) GetActiveSessionBinding(ctx context.Context, sessionKey, modelID string, now time.Time) (*domain.SessionBinding, error) {
+	return s.binding, nil
+}
+
+func (s *fakeBindingStore) TouchSessionBinding(ctx context.Context, id string) error {
+	return s.touchErr
+}
+
+func (s *fakeBindingStore) EndSessionBinding(ctx context.Context, id, reason string) (bool, error) {
+	return true, nil
+}
+
+func (s *fakeBindingStore) GetUpstreamAccount(ctx context.Context, id string) (*domain.UpstreamAccount, error) {
+	return s.account, nil
+}
+
+func (s *fakeBindingStore) Begin(ctx context.Context) (domain.UnitOfWork, error) { return nil, nil }
+
+func (s *fakeBindingStore) InsertSessionBindingTx(ctx context.Context, w domain.UnitOfWork, b *domain.SessionBinding) error {
+	return nil
+}
+
+func (s *fakeBindingStore) EndSessionBindingTx(ctx context.Context, w domain.UnitOfWork, id, reason string) (bool, error) {
+	return true, nil
+}
+
+// Touch 的瞬时存储错误(连接重置/超时/池耗尽)不得映射成 CodeConflict ——
+// 只有 rows=0(并发结束绑定,CodeNotFound)才意味「绑定已失效」;其余错误原
+// 样透传,gateway 按 retryable 失败处理,绝不据此迁移健康会话。
+func TestSessionBinding_ResolveTouchErrorMapping(t *testing.T) {
+	active := &domain.UpstreamAccount{ID: "acct-1", Status: domain.AccountActive}
+	binding := &domain.SessionBinding{
+		ID: "b-1", SessionKey: "s", ModelID: "m", AccountID: "acct-1",
+		Status: domain.BindingActive, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	store := &fakeBindingStore{binding: binding, account: active}
+	binder := NewSessionBinder(store, nil)
+	ctx := context.Background()
+
+	// rows=0(并发终止)→ CodeNotFound → CodeConflict(绑定确已失效)。
+	store.touchErr = domain.NewError(domain.CodeNotFound, "binding ended concurrently")
+	if _, _, err := binder.Resolve(ctx, "s", "m"); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("touch not_found must map to conflict, got %v", err)
+	}
+
+	// 瞬时存储错误 → 原样透传,绝不包成 Conflict(否则 gateway 会 Migrate
+	// 换号,健康会话被错误迁移)。
+	transient := errors.New("connection reset by peer")
+	store.touchErr = transient
+	_, _, err := binder.Resolve(ctx, "s", "m")
+	if !errors.Is(err, transient) {
+		t.Fatalf("transient touch error must pass through verbatim, got %v", err)
+	}
+	if domain.CodeOf(err) == domain.CodeConflict {
+		t.Fatalf("transient touch error must NOT become conflict (健康会话不得被迁移), got %v", err)
+	}
+
+	// 健康路径不受影响。
+	store.touchErr = nil
+	if _, _, err := binder.Resolve(ctx, "s", "m"); err != nil {
+		t.Fatalf("healthy resolve: %v", err)
 	}
 }

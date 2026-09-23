@@ -547,7 +547,6 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 	}
 
 	var lastErr error
-	executedUnknown := false
 	for i := 0; i < maxAttempts; i++ {
 		cand := cands[i]
 		adapter, ok := s.routingSvc.AdapterFor(cand.Deployment.Protocol)
@@ -567,17 +566,18 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 			return nil, err
 		}
 		lastErr = de
+		// 设计 §7.2: 上游是否执行未知的请求绝不盲目重放 —— 直接停放对账。
+		// 重放到下一候选会让上游被双倍消耗;若重放恰好成功,本尝试的
+		// status=unknown 也永远不会进 reconciliation(silent loss)。只对
+		// 确定零执行的失败(HTTP 拒绝、DNS/连接拒绝、容量类)做 failover。
 		if de.ExecutedUnknown {
-			executedUnknown = true
+			return nil, s.holdForReconciliation(requestID, de)
 		}
 		switch {
 		case providers.IsCanceled(de.Err):
 			// The caller is gone: stop spending upstream (设计 §7.2 客户端
 			// 取消后停止上游连接). No consumption is confirmed, so the
-			// reservation releases — unless execution was already unknown.
-			if executedUnknown {
-				return nil, s.holdForReconciliation(requestID, de)
-			}
+			// reservation releases.
 			s.releaseAdmission(requestID, adm.AccountLease)
 			return nil, domain.WrapError(domain.CodeUpstreamUnavailable, "caller canceled mid-dispatch", de)
 		case !de.Retryable():
@@ -598,12 +598,9 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 		}
 	}
 
-	// All attempts failed before any client output. Unknown execution holds
-	// the reservation for reconciliation (禁止静默释放可能已发生的消费);
-	// confirmed zero consumption releases (设计 §7.2 reserved → released).
-	if executedUnknown {
-		return nil, s.holdForReconciliation(requestID, lastErr)
-	}
+	// All attempts failed before any client output with CONFIRMED zero
+	// consumption (unknown-execution failures returned above): release the
+	// reservation (设计 §7.2 reserved → released).
 	s.releaseAdmission(requestID, adm.AccountLease)
 	return nil, domain.WrapError(domain.CodeUpstreamUnavailable,
 		"all compatible upstreams failed", lastErr)
@@ -704,6 +701,23 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	// per attempt (explicit release below), the account lease is released by
 	// the finalizer (settle/release), never per attempt.
 	keeper := s.routingSvc.NewLeaseKeeper(lease, adm.AccountLease)
+	// 防泄漏守卫:keeper 创建到交接(Pause 换交流式 keeper / 非流式显式释
+	// 放)之间,若 Dispatch 或 onStream/onNonStream panic(如 disp.Stream
+	// 为 nil、TeeBody 组装失败),gin recover 后 keeper goroutine 会永久续
+	// 租双租约 —— 恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
+	// 对齐 F-1(StreamBody.Finish)的 defer 释放模式:未交接则停 keeper
+	// 并取消 dispatch ctx;正常路径 Pause 已消费 stopMu,Stop 为 no-op,
+	// 零影响。panic 仍向上传播(行为同既有)。
+	handedOff := false
+	defer func() {
+		if handedOff {
+			return
+		}
+		cancel()
+		kctx, kcancel := detached(settleTimeout)
+		defer kcancel()
+		keeper.Stop(kctx)
+	}()
 
 	disp, err := providers.Dispatch(attemptCtx, s.client, adapter, &providers.Call{
 		Deployment:   &cand.Deployment,
@@ -719,6 +733,7 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 		// finalizer; only the attempt-scoped upstream lease is released
 		// (releaseLease below / inside failAttempt).
 		keeper.Pause()
+		handedOff = true // 续租循环已停,租约由下方显式处理,守卫无需再停
 		var de *providers.DispatchError
 		if !errorsAsDispatch(err, &de) {
 			// Build-time shape error (invalid_input): nothing was sent.
@@ -744,6 +759,9 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	} else {
 		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
 	}
+	// keeper 已 Pause 并完成交接(流式: stream keeper 接管双租约;非流式:
+	// 上游租约已释放、账户租约归 finalizer)。
+	handedOff = true
 	if err == nil && outcome != nil {
 		outcome.AccountID = cand.Account.ID
 		outcome.Inclusion = adapter.Inclusion()
@@ -794,7 +812,12 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 	}
 	kcancel()
 	s.finishAttempt(attempt.ID, "completed", "", disp.UpstreamRequestID)
-	if err := s.store.UpdateRequestStatus(context.Background(), requestID, domain.ReqNonStreaming, ""); err != nil {
+	// 状态标记与结算共用同一个带 deadline 的 detached ctx(设计 §7.2: 结
+	// 算使用独立且有截止时间的 context —— context.Background() 无截止,
+	// 会绕过 settleTimeout 预算)。
+	sctx, scancel := detached(settleTimeout)
+	defer scancel()
+	if err := s.store.UpdateRequestStatus(sctx, requestID, domain.ReqNonStreaming, ""); err != nil {
 		log.Printf("gateway: mark non_streaming %s: %v", requestID, err)
 	}
 
@@ -811,8 +834,6 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 		usage = s.estimateUsage(adm, disp.ContentBytes)
 		raw = nil
 	}
-	sctx, scancel := detached(settleTimeout)
-	defer scancel()
 	s.settle(sctx, requestID, attempt.ID, usage, source, raw, price, adapter, adm)
 	if adm.AccountLease != nil {
 		if err := s.routingSvc.ReleaseLease(sctx, adm.AccountLease); err != nil {
@@ -827,15 +848,29 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
 	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
 	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
-	if err := s.store.UpdateRequestStatus(context.Background(), requestID, domain.ReqStreaming, ""); err != nil {
+	stCtx, stCancel := detached(settleTimeout)
+	if err := s.store.UpdateRequestStatus(stCtx, requestID, domain.ReqStreaming, ""); err != nil {
 		log.Printf("gateway: mark streaming %s: %v", requestID, err)
 	}
+	stCancel()
 	// The dispatch keeper pauses WITHOUT releasing; the stream keeper takes
 	// over both leases for the whole stream lifetime (the dispatch keeper
 	// already carries the request-scoped account lease since M1 — do NOT
 	// append it twice).
 	keeper.Pause()
 	streamKeeper := s.routingSvc.NewLeaseKeeper(keeper.Leases()...)
+	// 与 attempt 同款防泄漏守卫:StreamBody 组装期间(tap 为 nil、TeeBody
+	// 失败等)panic 必须停 stream keeper,否则续租 goroutine 永久续租双租
+	// 约,恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
+	assembled := false
+	defer func() {
+		if assembled {
+			return
+		}
+		kctx, kcancel := detached(settleTimeout)
+		defer kcancel()
+		streamKeeper.Stop(kctx)
+	}()
 	body := &StreamBody{
 		tap:    disp.Stream.Tap,
 		cancel: cancel,
@@ -894,6 +929,7 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 			return nil
 		}
 	}
+	assembled = true // StreamBody 组装完成,租约生命周期移交 Finish
 	return &Outcome{RequestID: requestID, ModelID: price.ModelID, Stream: body}, nil
 }
 
@@ -975,7 +1011,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		cmd.WalletCharge = decision.Charge.Money
 		cmd.ChargeMicros = domain.Microcredit(decision.Charge.Money.Micros)
 	}
-	cost, basis, cerr := s.attemptCost(price.ModelID, decision.Record)
+	cost, basis, cerr := s.attemptCost(ctx, price.ModelID, decision.Record)
 	if cerr != nil {
 		log.Printf("gateway: attempt cost for %s: %v (cost left unset, charge unaffected)", attemptID, cerr)
 	} else if cost != nil {
@@ -1052,8 +1088,10 @@ func (s *Service) settleOnce(ctx context.Context, cmd domain.SettleCommand, over
 // attemptCost prices the attempt's upstream cost under the effective
 // upstream_cost list. The basis mirrors the usage source: reported usage →
 // reported cost, estimated usage → estimated cost (设计 §7.1 cost_basis).
-func (s *Service) attemptCost(modelID string, record domain.UsageRecord) (*domain.Money, *domain.CostBasis, error) {
-	row, err := s.store.LatestPriceVersion(context.Background(), modelID, string(accounting.PriceUpstreamCost), s.clock.Now())
+// ctx 为 settle 的 detached ctx(带 settleTimeout 截止),不使用无 deadline
+// 的 context.Background()。
+func (s *Service) attemptCost(ctx context.Context, modelID string, record domain.UsageRecord) (*domain.Money, *domain.CostBasis, error) {
+	row, err := s.store.LatestPriceVersion(ctx, modelID, string(accounting.PriceUpstreamCost), s.clock.Now())
 	if err != nil {
 		if domain.CodeOf(err) == domain.CodeNotFound {
 			return nil, nil, nil // no procurement list — cost stays unset

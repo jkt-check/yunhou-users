@@ -2,12 +2,14 @@ package workers
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/management"
 	"github.com/yunhou/users/internal/inference/providers/connector"
 )
 
@@ -181,5 +183,104 @@ func TestUpstreamHealthSelfHosted401PropagatesReauth(t *testing.T) {
 	}
 	if audit == 0 {
 		t.Error("reauth propagation must be audited")
+	}
+}
+
+// --- 审查修复 Important-2：markAccountReauth 审计 fail-closed -------------
+//
+// 对齐 bulk_import：审计记录器不支持事务写入（或写入失败）时，账号翻转 +
+// 绑定终止一并回滚，绝不提交无审计的状态变更。纯 fake，无需 DB。
+
+type fakeUoW struct{ committed, rolledBack bool }
+
+func (u *fakeUoW) Commit(ctx context.Context) error   { u.committed = true; return nil }
+func (u *fakeUoW) Rollback(ctx context.Context) error { u.rolledBack = true; return nil }
+
+// reauthFakeStore 提供 markAccountReauth 触达的事务面（嵌入 nil 接口）。
+type reauthFakeStore struct {
+	UpstreamHealthStore
+	uow *fakeUoW
+}
+
+func (s *reauthFakeStore) Begin(ctx context.Context) (domain.UnitOfWork, error) { return s.uow, nil }
+func (s *reauthFakeStore) SetUpstreamAccountStatusConditionalTx(ctx context.Context, w domain.UnitOfWork, id string, from []domain.UpstreamAccountStatus, to domain.UpstreamAccountStatus) (bool, error) {
+	return true, nil
+}
+func (s *reauthFakeStore) EndSessionBindingsForAccountTx(ctx context.Context, w domain.UnitOfWork, accountID, reason string) ([]string, error) {
+	return []string{"binding-1"}, nil
+}
+
+// recordOnlyAudit 只实现 Record（非事务）——此前类型断言失败会静默跳过审计。
+type recordOnlyAudit struct{}
+
+func (recordOnlyAudit) Record(ctx context.Context, ev management.AuditEvent) error { return nil }
+
+// failingTxAudit 支持事务写入但写失败。
+type failingTxAudit struct{ err error }
+
+func (f failingTxAudit) Record(ctx context.Context, ev management.AuditEvent) error { return nil }
+func (f failingTxAudit) RecordTx(ctx context.Context, w domain.UnitOfWork, ev management.AuditEvent) error {
+	return f.err
+}
+
+// spyTxAudit 记录事务审计事件。
+type spyTxAudit struct{ events []management.AuditEvent }
+
+func (s *spyTxAudit) Record(ctx context.Context, ev management.AuditEvent) error { return nil }
+func (s *spyTxAudit) RecordTx(ctx context.Context, w domain.UnitOfWork, ev management.AuditEvent) error {
+	s.events = append(s.events, ev)
+	return nil
+}
+
+func reauthWorkerFor(store UpstreamHealthStore, audit management.AuditRecorder) *UpstreamHealth {
+	return NewUpstreamHealth(store, nil, nil, nil, nil, audit, UpstreamHealthConfig{}, nil)
+}
+
+// 记录器不支持 RecordTx → 整个翻转失败回滚（fail-closed），不提交无审计变更。
+func TestMarkAccountReauth_RecorderLackingTxFailsClosed(t *testing.T) {
+	uow := &fakeUoW{}
+	w := reauthWorkerFor(&reauthFakeStore{uow: uow}, recordOnlyAudit{})
+	err := w.markAccountReauth(context.Background(), &domain.UpstreamAccount{ID: "acct-1"}, "test")
+	if err == nil {
+		t.Fatal("audit recorder without RecordTx must fail the propagation (fail-closed)")
+	}
+	if uow.committed {
+		t.Error("transaction must not commit without the audit row")
+	}
+	if !uow.rolledBack {
+		t.Error("transaction must roll back")
+	}
+}
+
+// RecordTx 写失败 → 同样回滚，不提交。
+func TestMarkAccountReauth_AuditWriteFailureRollsBack(t *testing.T) {
+	uow := &fakeUoW{}
+	w := reauthWorkerFor(&reauthFakeStore{uow: uow}, failingTxAudit{err: errors.New("audit boom")})
+	err := w.markAccountReauth(context.Background(), &domain.UpstreamAccount{ID: "acct-1"}, "test")
+	if err == nil {
+		t.Fatal("audit write failure must fail the propagation")
+	}
+	if uow.committed || !uow.rolledBack {
+		t.Errorf("uow = committed:%v rolledBack:%v, want rollback only", uow.committed, uow.rolledBack)
+	}
+}
+
+// 正常路径：翻转 + 绑定终止 + 审计同一事务提交，审计事件带 Reason。
+func TestMarkAccountReauth_CommitsWithAudit(t *testing.T) {
+	uow := &fakeUoW{}
+	audit := &spyTxAudit{}
+	w := reauthWorkerFor(&reauthFakeStore{uow: uow}, audit)
+	if err := w.markAccountReauth(context.Background(), &domain.UpstreamAccount{ID: "acct-1"}, "static service credential rejected"); err != nil {
+		t.Fatalf("markAccountReauth: %v", err)
+	}
+	if !uow.committed || uow.rolledBack {
+		t.Errorf("uow = committed:%v rolledBack:%v, want commit only", uow.committed, uow.rolledBack)
+	}
+	if len(audit.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(audit.events))
+	}
+	ev := audit.events[0]
+	if ev.Action != "upstream_account.reauth_required" || ev.Reason != "static service credential rejected" {
+		t.Errorf("audit event = %+v", ev)
 	}
 }

@@ -361,6 +361,51 @@ func TestResolveCodingPlanActivation(t *testing.T) {
 		}
 	})
 
+	t.Run("lifetime order + past hint → stays open-ended", func(t *testing.T) {
+		past := benefitNow.Add(-24 * time.Hour)
+		act, err := ResolveCodingPlanActivation(model.OrderKindNew, 0, nil, planID, nil, &past, benefitNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if act.ExpiresAt != nil || act.Blocked != "" {
+			t.Fatalf("past hint must not expire a lifetime grant, act = %+v", act)
+		}
+	})
+
+	t.Run("lifetime order + future hint → stays open-ended", func(t *testing.T) {
+		far := benefitNow.Add(30 * 24 * time.Hour)
+		act, err := ResolveCodingPlanActivation(model.OrderKindNew, 0, nil, planID, nil, &far, benefitNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if act.ExpiresAt != nil {
+			t.Fatalf("hint must never bound an open-ended grant, expires = %v", act.ExpiresAt)
+		}
+	})
+
+	t.Run("open-ended renewal + past hint → stays open-ended", func(t *testing.T) {
+		past := benefitNow.Add(-24 * time.Hour)
+		cur := activeSubState(planID, nil) // 开放期订阅续期：rollFrom(nil) = nil
+		act, err := ResolveCodingPlanActivation(model.OrderKindRenewal, 30, nil, planID, cur, &past, benefitNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if act.ExpiresAt != nil || act.Blocked != "" {
+			t.Fatalf("past hint must not expire an open-ended rollover, act = %+v", act)
+		}
+	})
+
+	t.Run("past hint never shortens a paid interval", func(t *testing.T) {
+		past := benefitNow.Add(-24 * time.Hour)
+		act, err := ResolveCodingPlanActivation(model.OrderKindNew, 30, nil, planID, nil, &past, benefitNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if act.ExpiresAt == nil || !act.ExpiresAt.Equal(benefitNow.Add(30*24*time.Hour)) {
+			t.Fatalf("expires = %v", act.ExpiresAt)
+		}
+	})
+
 	t.Run("unknown kind → error", func(t *testing.T) {
 		if _, err := ResolveCodingPlanActivation("bogus", 30, nil, planID, nil, nil, benefitNow); err == nil {
 			t.Fatal("want error")

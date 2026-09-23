@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/yunhou/users/internal/inference/domain"
@@ -586,19 +587,29 @@ func chatFinishToAnthropicStop(finish string) string {
 // Block bookkeeping: text and thinking blocks each occupy one content-block
 // index; every tool call gets its own index keyed from the wire's
 // tool_calls[].index (工具调用 ID 与参数片段逐字转发，跨块不重排).
+// 评审轮2 I4：tool_use 块按 wire index 保持开启——OpenAI 允许 parallel tool
+// calls 交错，迟到的 delta 必须仍落在自己的 block 上（Anthropic SDK 按
+// index 归集 content_block_*；对已 stop 的块再发 delta 会被拒绝）。
 type anthropicStreamRenderer struct {
 	messageID        string
 	model            string
 	cacheReadInInput bool
 
 	started       bool
-	openBlock     int // currently open content-block index (-1 = none)
-	openKind      string
+	openTextBlock int // currently open text/thinking block index (-1 = none)
+	openTextKind  string
 	nextBlock     int
-	toolBlockByIx map[int]int
+	toolBlocks    map[int]*anthropicToolBlock // wire tool_calls[].index → block
 	finish        string
 	usageEmitted  bool
 	errorRelayed  bool
+}
+
+// anthropicToolBlock is one in-flight tool_use content block keyed by the
+// wire tool_calls[].index.
+type anthropicToolBlock struct {
+	index int
+	open  bool
 }
 
 // TranslateOpenAIToAnthropicStream converts the internal chunk SSE stream
@@ -607,7 +618,7 @@ type anthropicStreamRenderer struct {
 func TranslateOpenAIToAnthropicStream(body io.ReadCloser, messageID, model string, cacheReadInInput bool) io.ReadCloser {
 	return translateStream(body, &anthropicStreamRenderer{
 		messageID: messageID, model: model, cacheReadInInput: cacheReadInInput,
-		openBlock: -1, toolBlockByIx: map[int]int{},
+		openTextBlock: -1, toolBlocks: map[int]*anthropicToolBlock{},
 	})
 }
 
@@ -667,7 +678,7 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 				return err
 			}
 			if err := writeSSE(w, "content_block_delta", map[string]any{
-				"type": "content_block_delta", "index": r.openBlock,
+				"type": "content_block_delta", "index": r.openTextBlock,
 				"delta": map[string]any{"type": "thinking_delta", "thinking": d.ReasoningContent},
 			}); err != nil {
 				return err
@@ -678,7 +689,7 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 				return err
 			}
 			if err := writeSSE(w, "content_block_delta", map[string]any{
-				"type": "content_block_delta", "index": r.openBlock,
+				"type": "content_block_delta", "index": r.openTextBlock,
 				"delta": map[string]any{"type": "text_delta", "text": d.Content},
 			}); err != nil {
 				return err
@@ -721,7 +732,7 @@ func (r *anthropicStreamRenderer) BrokenEnd(w io.Writer) error {
 // Anthropic SDK's MessageDeltaUsage carries input_tokens as well).
 func (r *anthropicStreamRenderer) emitStart(w io.Writer) error {
 	r.started = true
-	r.openBlock = -1
+	r.openTextBlock = -1
 	return writeSSE(w, "message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -733,17 +744,19 @@ func (r *anthropicStreamRenderer) emitStart(w io.Writer) error {
 	})
 }
 
-// openTextualBlock opens a text/thinking block when not already open.
+// openTextualBlock opens a text/thinking block when not already open
+// (kind 切换关闭当前文本块；tool_use 块不受影响——它们按 wire index 独立
+// 保持开启).
 func (r *anthropicStreamRenderer) openTextualBlock(w io.Writer, kind string) error {
-	if r.openKind == kind && r.openBlock >= 0 {
+	if r.openTextKind == kind && r.openTextBlock >= 0 {
 		return nil
 	}
-	if err := r.closeOpenBlock(w); err != nil {
+	if err := r.closeTextBlock(w); err != nil {
 		return err
 	}
-	r.openBlock = r.nextBlock
+	r.openTextBlock = r.nextBlock
 	r.nextBlock++
-	r.openKind = kind
+	r.openTextKind = kind
 	block := map[string]any{"type": kind}
 	switch kind {
 	case "text":
@@ -753,52 +766,82 @@ func (r *anthropicStreamRenderer) openTextualBlock(w io.Writer, kind string) err
 		block["signature"] = ""
 	}
 	return writeSSE(w, "content_block_start", map[string]any{
-		"type": "content_block_start", "index": r.openBlock, "content_block": block,
+		"type": "content_block_start", "index": r.openTextBlock, "content_block": block,
 	})
 }
 
 // renderToolCallDelta maps one wire tool_calls[] delta onto tool_use block
-// events. The FIRST delta of a call (carrying id+name) opens a new block;
-// argument fragments become input_json_delta partial_json (逐字).
+// events. The FIRST delta of a call (carrying id+name) opens ITS OWN block
+// keyed by the wire index; argument fragments become input_json_delta
+// partial_json (逐字). 评审轮2 I4：交错 parallel tool calls 下，开 ix1 的
+// 块不得关闭 ix0 的块——只为新块收尾开启中的文本/思考块。
 func (r *anthropicStreamRenderer) renderToolCallDelta(w io.Writer, ix int, id, name, args string) error {
-	blockIx, open := r.toolBlockByIx[ix]
-	if !open {
-		if err := r.closeOpenBlock(w); err != nil {
+	tb, ok := r.toolBlocks[ix]
+	if !ok {
+		if err := r.closeTextBlock(w); err != nil {
 			return err
 		}
-		blockIx = r.nextBlock
+		tb = &anthropicToolBlock{index: r.nextBlock, open: true}
 		r.nextBlock++
-		r.toolBlockByIx[ix] = blockIx
-		r.openBlock = blockIx
-		r.openKind = "tool_use"
+		r.toolBlocks[ix] = tb
 		if err := writeSSE(w, "content_block_start", map[string]any{
-			"type": "content_block_start", "index": blockIx,
+			"type": "content_block_start", "index": tb.index,
 			"content_block": map[string]any{
 				"type": "tool_use", "id": id, "name": name, "input": map[string]any{},
 			},
 		}); err != nil {
 			return err
 		}
-		if args == "" {
-			return nil
-		}
 	}
 	if args == "" {
 		return nil
 	}
 	return writeSSE(w, "content_block_delta", map[string]any{
-		"type": "content_block_delta", "index": blockIx,
+		"type": "content_block_delta", "index": tb.index,
 		"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
 	})
 }
 
+// closeOpenBlock closes every open block — the text/thinking block plus
+// each in-flight tool_use block — in block-index order.
 func (r *anthropicStreamRenderer) closeOpenBlock(w io.Writer) error {
-	if r.openBlock < 0 {
+	var indexes []int
+	if r.openTextBlock >= 0 {
+		indexes = append(indexes, r.openTextBlock)
+	}
+	for _, tb := range r.toolBlocks {
+		if tb.open {
+			indexes = append(indexes, tb.index)
+		}
+	}
+	sort.Ints(indexes)
+	for _, ix := range indexes {
+		if err := r.closeBlock(w, ix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// closeTextBlock closes the open text/thinking block only.
+func (r *anthropicStreamRenderer) closeTextBlock(w io.Writer) error {
+	if r.openTextBlock < 0 {
 		return nil
 	}
-	ix := r.openBlock
-	r.openBlock = -1
-	r.openKind = ""
+	return r.closeBlock(w, r.openTextBlock)
+}
+
+// closeBlock emits content_block_stop for one block and marks it closed.
+func (r *anthropicStreamRenderer) closeBlock(w io.Writer, ix int) error {
+	if r.openTextBlock == ix {
+		r.openTextBlock = -1
+		r.openTextKind = ""
+	}
+	for _, tb := range r.toolBlocks {
+		if tb.index == ix {
+			tb.open = false
+		}
+	}
 	return writeSSE(w, "content_block_stop", map[string]any{
 		"type": "content_block_stop", "index": ix,
 	})

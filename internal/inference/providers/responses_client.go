@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/yunhou/users/internal/model"
@@ -636,20 +637,31 @@ type ResponsesStreamState struct {
 	usage        *openAIUsage
 	errorRelayed bool
 
-	// open item bookkeeping
-	openKind       string // "" | "message" | "reasoning" | "function_call"
-	openIndex      int
-	openItemID     string
-	nextIndex      int
-	toolItemByIx   map[int]string // wire tool_calls[].index → item id
-	textBuf        strings.Builder
-	reasonBuf      strings.Builder
-	argsBuf        strings.Builder
-	openToolName   string
-	openToolCallID string
+	// open textual-item bookkeeping（message/reasoning 互斥，kind 切换即换 item）
+	openKind   string // "" | "message" | "reasoning"
+	openIndex  int
+	openItemID string
+	nextIndex  int
+	textBuf    strings.Builder
+	reasonBuf  strings.Builder
+	// 评审轮2 I3：function_call item 按 wire tool_calls[].index 独立维护
+	// （各自 id/name/args 缓冲），OpenAI 允许 parallel tool calls 交错——
+	// 一个 call 的 open 绝不得关闭另一个 call 的 item。
+	toolItems map[int]*responsesToolItem
 
 	outputItems []json.RawMessage
 	completed   bool
+}
+
+// responsesToolItem is one in-flight function_call item keyed by the wire
+// tool_calls[].index.
+type responsesToolItem struct {
+	itemID      string
+	outputIndex int
+	callID      string
+	name        string
+	argsBuf     strings.Builder
+	open        bool
 }
 
 // TranslateOpenAIToResponsesStream converts the internal chunk SSE stream
@@ -659,7 +671,7 @@ func TranslateOpenAIToResponsesStream(body io.ReadCloser, responseID, model stri
 	st := &ResponsesStreamState{
 		responseID: responseID, model: model, createdAt: createdAt,
 		cacheReadInInput: cacheReadInInput,
-		openIndex:        -1, toolItemByIx: map[int]string{},
+		openIndex:        -1, toolItems: map[int]*responsesToolItem{},
 	}
 	return translateStream(body, st), st
 }
@@ -709,7 +721,7 @@ func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
 	for _, choice := range chunk.Choices {
 		d := choice.Delta
 		if d.ReasoningContent != "" {
-			if err := s.openItem(w, "reasoning", ""); err != nil {
+			if err := s.openTextualItem(w, "reasoning"); err != nil {
 				return err
 			}
 			s.reasonBuf.WriteString(d.ReasoningContent)
@@ -721,7 +733,7 @@ func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
 			}
 		}
 		if d.Content != "" {
-			if err := s.openItem(w, "message", ""); err != nil {
+			if err := s.openTextualItem(w, "message"); err != nil {
 				return err
 			}
 			s.textBuf.WriteString(d.Content)
@@ -807,13 +819,14 @@ func (s *ResponsesStreamState) emitCreated(w io.Writer) error {
 	return s.emit(w, "response.in_progress", map[string]any{"response": resp})
 }
 
-// openItem opens the next output item of the given kind when not already
-// open (interleaving opens a NEW item; kind continuation reuses the open one).
-func (s *ResponsesStreamState) openItem(w io.Writer, kind string, toolCallID string) error {
-	if s.openKind == kind && (kind != "function_call") {
+// openTextualItem opens the next message/reasoning output item when not
+// already open (kind 切换关闭当前文本/推理 item 并开新 item；function_call
+// item 不受影响——它们按 wire index 独立维护).
+func (s *ResponsesStreamState) openTextualItem(w io.Writer, kind string) error {
+	if s.openKind == kind {
 		return nil
 	}
-	if err := s.closeOpenItem(w); err != nil {
+	if err := s.closeTextualItem(w); err != nil {
 		return err
 	}
 	s.openKind = kind
@@ -821,7 +834,6 @@ func (s *ResponsesStreamState) openItem(w io.Writer, kind string, toolCallID str
 	s.nextIndex++
 	s.textBuf.Reset()
 	s.reasonBuf.Reset()
-	s.argsBuf.Reset()
 	switch kind {
 	case "message":
 		s.openItemID = newPublicID("msg_")
@@ -850,46 +862,115 @@ func (s *ResponsesStreamState) openItem(w io.Writer, kind string, toolCallID str
 			"item_id": s.openItemID, "output_index": s.openIndex, "summary_index": 0,
 			"part": map[string]any{"type": "summary_text", "text": ""},
 		})
-	case "function_call":
-		s.openItemID = newPublicID("fc_")
-		s.openToolCallID = toolCallID
-		return s.emit(w, "response.output_item.added", map[string]any{
-			"output_index": s.openIndex,
-			"item": map[string]any{
-				"type": "function_call", "id": s.openItemID, "call_id": toolCallID,
-				"name": s.openToolName, "arguments": "", "status": "in_progress",
-			},
-		})
 	}
 	return nil
 }
 
 // renderToolDelta maps one wire tool_calls[] delta: the first fragment of a
-// call (id present) opens a function_call item; argument fragments stream as
-// function_call_arguments.delta (call_id 逐字保留).
+// call opens ITS OWN function_call item keyed by the wire index; argument
+// fragments stream as function_call_arguments.delta (call_id 逐字保留).
+// 评审轮2 I3：交错 parallel tool calls 下，开 ix1 的 item 不得关闭 ix0 的
+// item，迟到的 ix0 delta 仍落在 ix0 自己的 item_id/output_index/argsBuf 上。
 func (s *ResponsesStreamState) renderToolDelta(w io.Writer, ix int, id, name, args string) error {
-	itemID, open := s.toolItemByIx[ix]
-	if !open {
-		s.openToolName = name
-		if err := s.openItem(w, "function_call", id); err != nil {
+	ti, ok := s.toolItems[ix]
+	if !ok {
+		// 新 wire index：只收尾开启中的文本/推理 item，绝不动其他
+		// function_call item。
+		if err := s.closeTextualItem(w); err != nil {
 			return err
 		}
-		itemID = s.openItemID
-		s.toolItemByIx[ix] = itemID
+		ti = &responsesToolItem{
+			itemID: newPublicID("fc_"), outputIndex: s.nextIndex,
+			callID: id, name: name, open: true,
+		}
+		s.nextIndex++
+		s.toolItems[ix] = ti
+		if err := s.emit(w, "response.output_item.added", map[string]any{
+			"output_index": ti.outputIndex,
+			"item": map[string]any{
+				"type": "function_call", "id": ti.itemID, "call_id": id,
+				"name": name, "arguments": "", "status": "in_progress",
+			},
+		}); err != nil {
+			return err
+		}
 	}
 	if args == "" {
 		return nil
 	}
-	s.argsBuf.WriteString(args)
+	ti.argsBuf.WriteString(args)
 	return s.emit(w, "response.function_call_arguments.delta", map[string]any{
-		"item_id": itemID, "output_index": s.openIndex, "delta": args,
+		"item_id": ti.itemID, "output_index": ti.outputIndex, "delta": args,
 	})
 }
 
-// closeOpenItem emits the *.done events of the open item and appends its
-// canonical form to the assembled output (reasoning items join the response
-// output but are excluded from chain transcripts at persistence time).
+// closeOpenItem closes every open item — the textual item plus each
+// in-flight function_call item — in output_index order (canonical output 数
+// 组位置序与事件序一致).
 func (s *ResponsesStreamState) closeOpenItem(w io.Writer) error {
+	type closable struct {
+		index int
+		tool  *responsesToolItem // nil = the textual item
+	}
+	var list []closable
+	if s.openKind != "" {
+		list = append(list, closable{index: s.openIndex})
+	}
+	for _, ti := range s.toolItems {
+		if ti.open {
+			list = append(list, closable{index: ti.outputIndex, tool: ti})
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].index < list[j].index })
+	for _, c := range list {
+		var err error
+		if c.tool != nil {
+			err = s.closeToolItem(w, c.tool)
+		} else {
+			err = s.closeTextualItem(w)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// closeToolItem emits the *.done events of one function_call item and
+// appends its canonical form to the assembled output.
+func (s *ResponsesStreamState) closeToolItem(w io.Writer, ti *responsesToolItem) error {
+	if !ti.open {
+		return nil
+	}
+	ti.open = false
+	args := ti.argsBuf.String()
+	if args == "" {
+		args = "{}"
+	}
+	if err := s.emit(w, "response.function_call_arguments.done", map[string]any{
+		"item_id": ti.itemID, "output_index": ti.outputIndex, "arguments": args,
+	}); err != nil {
+		return err
+	}
+	item := map[string]any{
+		"type": "function_call", "id": ti.itemID, "call_id": ti.callID,
+		"name": ti.name, "arguments": args, "status": "completed",
+	}
+	if err := s.emit(w, "response.output_item.done", map[string]any{
+		"output_index": ti.outputIndex, "item": item,
+	}); err != nil {
+		return err
+	}
+	b, _ := json.Marshal(item)
+	s.outputItems = append(s.outputItems, b)
+	return nil
+}
+
+// closeTextualItem emits the *.done events of the open message/reasoning
+// item and appends its canonical form to the assembled output (reasoning
+// items join the response output but are excluded from chain transcripts at
+// persistence time).
+func (s *ResponsesStreamState) closeTextualItem(w io.Writer) error {
 	if s.openKind == "" {
 		return nil
 	}
@@ -948,27 +1029,6 @@ func (s *ResponsesStreamState) closeOpenItem(w io.Writer) error {
 		}); err != nil {
 			return err
 		}
-	case "function_call":
-		args := s.argsBuf.String()
-		if args == "" {
-			args = "{}"
-		}
-		if err := s.emit(w, "response.function_call_arguments.done", map[string]any{
-			"item_id": itemID, "output_index": ix, "arguments": args,
-		}); err != nil {
-			return err
-		}
-		item := map[string]any{
-			"type": "function_call", "id": itemID, "call_id": s.openToolCallID,
-			"name": s.openToolName, "arguments": args, "status": "completed",
-		}
-		if err := s.emit(w, "response.output_item.done", map[string]any{
-			"output_index": ix, "item": item,
-		}); err != nil {
-			return err
-		}
-		b, _ := json.Marshal(item)
-		s.outputItems = append(s.outputItems, b)
 	}
 	return nil
 }

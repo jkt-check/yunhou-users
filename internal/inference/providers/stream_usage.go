@@ -131,7 +131,8 @@ type OpenAIUsageTracker struct {
 
 // Feed consumes one upstream read. Lines are reassembled across reads (the
 // relay buffer has no line alignment). Only complete `data:` lines
-// containing "usage", "content" or [DONE] cost more than a prefix scan.
+// containing "usage", "content", "reasoning" or [DONE] cost more than a
+// prefix scan.
 func (t *OpenAIUsageTracker) Feed(p []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -186,9 +187,13 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	// Cheap gates before a full JSON parse. A content decoy containing the
 	// quoted word "usage" still fails the shape check below (candidate test
 	// TestUsageTracker_ContentMentioningUsageIgnored pins this).
+	// 评审轮2 I2：reasoning-only delta 只带 "reasoning_content"——"content"
+	// 不是它的字节子串（前一字符是 _），缺第三个门会让 reasoning 字节全部
+	// 跳过 ContentBytes，估算路径少计费。
 	wantUsage := bytes.Contains(line, []byte(`"usage"`))
 	wantContent := bytes.Contains(line, []byte(`"content"`))
-	if !wantUsage && !wantContent {
+	wantReasoning := bytes.Contains(line, []byte("reasoning"))
+	if !wantUsage && !wantContent && !wantReasoning {
 		return
 	}
 	var chunk struct {

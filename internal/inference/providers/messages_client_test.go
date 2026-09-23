@@ -220,6 +220,63 @@ func TestTranslateOpenAIToAnthropicStream_BrokenEnd(t *testing.T) {
 	}
 }
 
+// 评审轮2 I4：交错 parallel tool calls —— ix0 的 delta 在 ix1 的块开启后
+// 才到时，必须仍落在 ix0 自己的 content-block index 上（旧实现会给 ix0
+// 先 content_block_stop，迟到的 delta 以已关闭的块 index 发出，Anthropic
+// SDK 拒绝）。
+func TestTranslateOpenAIToAnthropicStream_InterleavedToolCalls(t *testing.T) {
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"toolu_a","type":"function","function":{"name":"Bash","arguments":"{\"a\":"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"toolu_b","type":"function","function":{"name":"Read","arguments":"{\"b\":"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	}
+	var wire strings.Builder
+	for _, c := range chunks {
+		wire.WriteString("data: " + c + "\n\n")
+	}
+	wire.WriteString("data: [DONE]\n\n")
+
+	r := TranslateOpenAIToAnthropicStream(io.NopCloser(strings.NewReader(wire.String())), "msg_il", "m", true)
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+
+	// 事件序列：start(0)+delta(0) → start(1)+delta(1) → delta(0,"1}") →
+	// delta(1,"2}") → stop(0) → stop(1) → message_delta → message_stop。
+	// 迟到的 ix0 delta 必须在 ix1 的块开启之后、ix0 的 content_block_stop
+	// 之前（块保持开启）。帧内 JSON 键按字典序：partial_json 先于 index。
+	anchors := []string{
+		`"id":"toolu_a","input":{},"name":"Bash","type":"tool_use"`,
+		`"partial_json":"{\"a\":"`,
+		`"id":"toolu_b","input":{},"name":"Read","type":"tool_use"`,
+		`"partial_json":"{\"b\":"`,
+		`"partial_json":"1}"`,
+		`"index":0,"type":"content_block_delta"`,
+		`"partial_json":"2}"`,
+		`"index":0,"type":"content_block_stop"`,
+		`"index":1,"type":"content_block_stop"`,
+		"event: message_delta",
+		"event: message_stop",
+	}
+	cursor := 0
+	for _, a := range anchors {
+		i := strings.Index(s[cursor:], a)
+		if i < 0 {
+			t.Errorf("missing anchor %q after offset %d in:\n%s", a, cursor, s)
+			continue
+		}
+		cursor += i + len(a)
+	}
+	// 每个块恰好一次 start/stop（不得有截断重开）。
+	if strings.Count(s, "event: content_block_start") != 2 || strings.Count(s, "event: content_block_stop") != 2 {
+		t.Errorf("want exactly 2 starts + 2 stops (no truncate/reopen):\n%s", s)
+	}
+}
+
 // 网关注入的内联 error 块 → 原生 error 事件转发,且不重复发.
 func TestTranslateOpenAIToAnthropicStream_InbandErrorChunk(t *testing.T) {
 	wire := "data: {\"error\":{\"message\":\"upstream stream interrupted\",\"type\":\"server_error\"}}\n\n"

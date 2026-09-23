@@ -18,7 +18,11 @@ import (
 //   - 获取：同事务内先 pg_advisory_xact_lock(scope:scope_id) 序列化同 scope
 //     的获取/回收；回收已到期租约（held→expired）；活跃（held 且未到期）
 //     数量达到上限 → CodeInsufficientCapacity（附最早恢复时刻）。fencing
-//     token 取该 scope 历史最大值 + 1 —— 跨回收单调递增，永不复用。
+//     token 取该 scope 历史最大值 + 1 —— 跨回收单调递增。终态行由
+//     DeleteTerminalLeases 定期收割（保留窗口 7 天，挂 upstream_health
+//     轮次）；行被删后 fencing 号可重新开始，这不破坏安全性：续租/释放/
+//     使用点检查都按行级 (id, owner, fencing) 精确匹配，已删行的所有权
+//     断言永远失败。
 //   - 所有权：(owner_token, fencing_token) 二元组。续租/释放都要求精确匹配
 //     且 state='held'；不匹配或已迁移 → CodeConflict（失去所有权/被 fence）。
 //   - 超时回收本身不证明旧请求已死（设计 §7.2: 租约到期本身不能证明没有消
@@ -94,18 +98,28 @@ func (s *Store) AcquireLeaseTx(ctx context.Context, w domain.UnitOfWork, cmd dom
 		return nil, mapError("lease: reclaim expired", err)
 	}
 
+	// 聚合拆成两条查询（评审修复批次8）：held 计数/最早恢复时刻走 026 的
+	// 部分索引（WHERE state = 'held' 可直接命中，FILTER 写法不能）；fencing
+	// 最大值走 035 的 (scope, scope_id, fencing_token DESC) 索引首行。两条
+	// 都不必再扫描该 scope 的终态历史行。
 	var live int
-	var maxFencing int64
 	var earliestExpiry *time.Time
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT COUNT(*) FILTER (WHERE state = 'held'),
-		        COALESCE(MAX(fencing_token), 0),
-		        MIN(expires_at) FILTER (WHERE state = 'held')
+		`SELECT COUNT(*), MIN(expires_at)
+		 FROM inference_concurrency_leases
+		 WHERE scope = $1 AND scope_id = $2 AND state = 'held'`,
+		string(cmd.Scope), cmd.ScopeID).
+		Scan(&live, &earliestExpiry); err != nil {
+		return nil, mapError("lease: count held", err)
+	}
+	var maxFencing int64
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT COALESCE(MAX(fencing_token), 0)
 		 FROM inference_concurrency_leases
 		 WHERE scope = $1 AND scope_id = $2`,
 		string(cmd.Scope), cmd.ScopeID).
-		Scan(&live, &maxFencing, &earliestExpiry); err != nil {
-		return nil, mapError("lease: count", err)
+		Scan(&maxFencing); err != nil {
+		return nil, mapError("lease: max fencing", err)
 	}
 	if live >= cmd.Limit {
 		msg := fmt.Sprintf("lease: scope %s/%s at concurrency limit %d", cmd.Scope, cmd.ScopeID, cmd.Limit)
@@ -187,6 +201,37 @@ func (s *Store) ReleaseLease(ctx context.Context, leaseID, ownerToken string, fe
 			"lease: release failed — not held by this owner/fencing token")
 	}
 	return nil
+}
+
+// DeleteTerminalLeases reaps terminal lease rows (released/expired) whose
+// terminal timestamp is older than cutoff (bounded batch). 评审修复批次8：
+// 此前无任何 job 删除终态租约，繁忙账户 scope 每请求一行永久累积，准入
+// 热路径成本随账户生命周期线性增长。
+//
+// 安全性：fencing 单调性只需对当前 held 行成立。续租/释放/使用点检查都按
+// 行级 (id, owner_token, fencing_token) 精确匹配——终态行被删后旧持有者
+// 的所有权断言命中 0 行（CodeConflict）或 load not-found，不可能借复用
+// 的 fencing 号重新自认被授权；held 行永不在收割范围内。released 行以
+// released_at 为终态时刻；expired 行（超时回收，released_at 为 NULL）以
+// expires_at 为终态时刻。
+//
+// Wired into the upstream-health pass alongside the binding/chain sweeps.
+func (s *Store) DeleteTerminalLeases(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM inference_concurrency_leases
+		  WHERE id IN (SELECT id FROM inference_concurrency_leases
+		                WHERE state IN ('released', 'expired')
+		                  AND COALESCE(released_at, expires_at) < $1
+		                ORDER BY COALESCE(released_at, expires_at) LIMIT $2)`,
+		cutoff.UTC(), limit)
+	if err != nil {
+		return 0, mapError("reap terminal leases", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // CheckLease verifies the caller's lease is still a live authorization

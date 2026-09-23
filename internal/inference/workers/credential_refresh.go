@@ -114,9 +114,17 @@ func (w *CredentialRefresh) RunPass(ctx context.Context) (CredentialRefreshMetri
 
 // Start runs the worker loop until ctx is done. The first pass runs
 // immediately so a booting instance converges expiring credentials without
-// waiting a full interval.
+// waiting a full interval. runGuarded 兜底每轮 pass 的 panic（审查修复
+// Important-1：裸 goroutine worker 的 panic 不再终止 API 进程）。
 func (w *CredentialRefresh) Start(ctx context.Context) {
-	if m, err := w.RunPass(ctx); err != nil {
+	var m CredentialRefreshMetrics
+	pass := func() error {
+		m = CredentialRefreshMetrics{}
+		var err error
+		m, err = w.RunPass(ctx)
+		return err
+	}
+	if err := runGuarded("credential refresh", pass); err != nil {
 		log.Printf("WARN credential refresh pass failed: %v", err)
 	} else if m.Scanned > 0 {
 		log.Printf("credential refresh pass: %+v", m)
@@ -128,8 +136,7 @@ func (w *CredentialRefresh) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			m, err := w.RunPass(ctx)
-			if err != nil {
+			if err := runGuarded("credential refresh", pass); err != nil {
 				log.Printf("WARN credential refresh pass failed: %v", err)
 				continue
 			}

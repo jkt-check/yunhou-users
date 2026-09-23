@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -383,5 +384,59 @@ func TestCatalogManager_ParseActor(t *testing.T) {
 	u, a = ParseActor("bare")
 	if u != "" && u != "bare" {
 		t.Fatalf("ParseActor bare = %q/%q", u, a)
+	}
+}
+
+// --- 审查修复 Important-3/Important-4 ---------------------------------------
+
+// failingRecorder 的 Record 永远失败（审计后端故障）。
+type failingRecorder struct{ err error }
+
+func (f failingRecorder) Record(ctx context.Context, ev AuditEvent) error { return f.err }
+
+// operator Reason 被采集进审计事件；未传时为空串（参数位保留给 httpapi 接线）。
+func TestCatalogManager_ReasonRecorded(t *testing.T) {
+	mgr, rec, _ := newManagerFixture()
+	ctx := context.Background()
+	if err := mgr.CreateModel(ctx, managerActor(), &domain.Model{
+		ID: "m-reason", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols: []domain.Protocol{domain.ProtocolOpenAIChat},
+	}, "上架新模型"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.events) != 1 || rec.events[0].Reason != "上架新模型" {
+		t.Fatalf("reason not captured: %+v", rec.events)
+	}
+	if err := mgr.DeleteModel(ctx, managerActor(), "m-reason"); err != nil {
+		t.Fatal(err)
+	}
+	if rec.events[1].Reason != "" {
+		t.Fatalf("omitted reason = %q, want empty", rec.events[1].Reason)
+	}
+}
+
+// 审计写失败对已生效变更返回成功（变更确已提交是事实）——返回错误会诱导
+// 重试产生重复修订；审计缺失由 ERROR 日志告警。
+func TestCatalogManager_AuditFailureStillSucceeds(t *testing.T) {
+	fs := newFakeCatalogStore()
+	mgr := NewCatalogManager(catalog.NewService(fs), failingRecorder{err: errors.New("audit boom")}, nil)
+	ctx := context.Background()
+
+	rev, err := mgr.Publish(ctx, managerActor())
+	if err != nil || rev != 1 {
+		t.Fatalf("publish = %d, %v — 审计失败不得对已生效变更返回错误", rev, err)
+	}
+	rev, err = mgr.Rollback(ctx, managerActor(), 1)
+	if err != nil || rev != 2 {
+		t.Fatalf("rollback = %d, %v — 审计失败不得对已生效变更返回错误", rev, err)
+	}
+	if err := mgr.CreateModel(ctx, managerActor(), &domain.Model{
+		ID: "m-audit-fail", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols: []domain.Protocol{domain.ProtocolOpenAIChat},
+	}); err != nil {
+		t.Fatalf("create = %v — 审计失败不得对已生效变更返回错误", err)
+	}
+	if _, err := fs.GetModel(ctx, "m-audit-fail"); err != nil {
+		t.Fatal("mutation must be effective despite audit failure")
 	}
 }

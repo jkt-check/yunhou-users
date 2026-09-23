@@ -28,7 +28,22 @@ func (s *Store) RolesForUser(ctx context.Context, userID string) ([]string, erro
 // GrantRole idempotently grants a role to a user. grantedBy is the granting
 // operator's user ID (nil for the offline bootstrap command).
 func (s *Store) GrantRole(ctx context.Context, userID, role string, grantedBy *string, reason string) (bool, error) {
-	res, err := s.db.ExecContext(ctx,
+	return grantRole(ctx, s.db, userID, role, grantedBy, reason)
+}
+
+// GrantRoleTx is GrantRole inside the caller's UnitOfWork — 授权与审计行
+// 同事务提交或回滚（评审轮1 I-2：绝不落下无审计的权限变更，与 RecordTx
+// 同口径）。
+func (s *Store) GrantRoleTx(ctx context.Context, w domain.UnitOfWork, userID, role string, grantedBy *string, reason string) (bool, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return false, err
+	}
+	return grantRole(ctx, tx, userID, role, grantedBy, reason)
+}
+
+func grantRole(ctx context.Context, ex sqlxExecutor, userID, role string, grantedBy *string, reason string) (bool, error) {
+	res, err := ex.ExecContext(ctx,
 		`INSERT INTO operator_roles (user_id, role, granted_by, reason)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (user_id, role) DO NOTHING`,
@@ -43,7 +58,21 @@ func (s *Store) GrantRole(ctx context.Context, userID, role string, grantedBy *s
 // RevokeRole removes a role grant. Returns false when the grant did not
 // exist (idempotent revoke).
 func (s *Store) RevokeRole(ctx context.Context, userID, role string) (bool, error) {
-	res, err := s.db.ExecContext(ctx,
+	return revokeRole(ctx, s.db, userID, role)
+}
+
+// RevokeRoleTx is RevokeRole inside the caller's UnitOfWork — 撤销与审计行
+// 同事务提交或回滚（评审轮1 I-2）。
+func (s *Store) RevokeRoleTx(ctx context.Context, w domain.UnitOfWork, userID, role string) (bool, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return false, err
+	}
+	return revokeRole(ctx, tx, userID, role)
+}
+
+func revokeRole(ctx context.Context, ex sqlxExecutor, userID, role string) (bool, error) {
+	res, err := ex.ExecContext(ctx,
 		`DELETE FROM operator_roles WHERE user_id = $1 AND role = $2`, userID, role)
 	if err != nil {
 		return false, mapError("revoke operator role", err)

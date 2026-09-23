@@ -903,3 +903,127 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 		t.Errorf("overage job = %s detail=%s, want resolved with note", status, detail)
 	}
 }
+
+// 评审轮1 Important-1：CorrectSettlement 对 charge_source='wallet' 的请求
+// 显式拒绝（CodeInvalidInput）——wallet 的 settled_micros 是 micromoney、
+// 入场无 key-budget 预占、更正需要钱包补偿分录，在完整 wallet 分支落地前
+// 不得走通用更正通道腐蚀钱包状态。
+func TestCorrectSettlementRejectsWallet(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+	priceID := seedMoneyPrice(t, s, f.modelID, "CNY", 1, time.Now().Add(-time.Hour))
+	fundWallet(t, s, f.accountID, "CNY", 10_000_000, 0)
+	enableOverage(t, s, f.accountID, "CNY", 100_000_000)
+	w, err := s.GetWalletByAccount(ctx, f.accountID, "CNY")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 钱包入场 + 结算（保守估算口径），得到 charge_source='wallet' 的已结算请求。
+	uow, _ := s.Begin(ctx)
+	adm, err := s.ReserveWallet(ctx, uow, reserveWalletCmd(t, s, f, w.ID, priceID, 5_000_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	in := int64(2000)
+	if err := s.Settle(ctx, uow, domain.SettleCommand{
+		RequestID: adm.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageEstimated,
+			Buckets: domain.UsageBuckets{InputTokens: &in},
+		},
+		ChargeMicros: 5_000_000, SettledAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("wallet settle: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	uow2, _ := s.Begin(ctx)
+	err = s.CorrectSettlement(ctx, uow2, CorrectionCommand{
+		RequestID: adm.RequestID,
+		Corrected: domain.UsageRecord{
+			AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(1000))},
+		},
+		CorrectedMicros: 1_000_000, Reason: "provider invoice arrived",
+		OperatorSubject: "system:recovery", IdempotencyKey: "corr-wallet-" + uuid.NewString(),
+		At: time.Now().UTC(),
+	})
+	_ = uow2.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("wallet correction: err = %v, want invalid_input (wallet 更正通道未接线,必须显式拒绝)", err)
+	}
+
+	// 拒绝必须零副作用：请求结算额与钱包派生余额保持原样。
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.SettledMicros == nil || *req.SettledMicros != 5_000_000 {
+		t.Errorf("settled = %v, want 5000000 (拒绝不得改动结算额)", req.SettledMicros)
+	}
+	view, err := s.WalletBalance(ctx, f.accountID, "CNY", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Balance.CashAvailable != 5_000_000 {
+		t.Errorf("cash available = %d, want 5000000 (拒绝不得改动钱包)", view.Balance.CashAvailable)
+	}
+}
+
+// 评审轮1 Important-2：release 的 key-budget 归还带 budget_used >= hold
+// 谓词，谓词不满足时必须响亮冲突（与 window 分支同一 RowsAffected 守
+// 卫）——否则 reservation 被标记 released 而预算保持膨胀（静默泄漏）。
+func TestReleaseKeyBudgetGuardConflict(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 账本漂移：预算已不足覆盖这笔预占（如被并发结算改写）。
+	if _, err := s.db.Exec(
+		`UPDATE inference_api_keys SET budget_used_micros = 50_000 WHERE id = $1`, f.keyID); err != nil {
+		t.Fatal(err)
+	}
+
+	uow2, _ := s.Begin(ctx)
+	err = s.Release(ctx, uow2, adm.RequestID)
+	_ = uow2.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("release with drifted key budget: err = %v, want conflict (守卫失败必须响亮拒绝)", err)
+	}
+
+	// 冲突后零副作用：预占仍 held、请求未进入 released。
+	var held int
+	if err := s.db.Get(&held,
+		`SELECT COUNT(*) FROM inference_reservations WHERE request_id = $1 AND state = 'held'`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if held == 0 {
+		t.Error("reservations released despite key-budget guard failure (静默泄漏)")
+	}
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status == domain.ReqReleased {
+		t.Errorf("status = %q, want not released after guard conflict", req.Status)
+	}
+}

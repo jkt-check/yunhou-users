@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -230,5 +231,75 @@ func TestEndpointURL_AndUpstreamRequestID(t *testing.T) {
 	resp := &http.Response{Header: http.Header{"Request-Id": []string{"r-2"}}}
 	if got := upstreamRequestID(resp); got != "r-2" {
 		t.Errorf("request id fallback = %q", got)
+	}
+}
+
+// 评审轮2 I1：跨 origin 重定向绝不跟随 —— 重定向目标收不到任何请求（上游
+// x-api-key / operator 扩展头与客户请求体不外泄），3xx 响应体作为上游错
+// 误 surfaced。302 与 307（重发请求体的那类）都覆盖。
+func TestDispatch_CrossOriginRedirectRefused(t *testing.T) {
+	for _, code := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		t.Run(fmt.Sprintf("status %d", code), func(t *testing.T) {
+			targetHits := 0
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetHits++
+				if k := r.Header.Get("x-api-key"); k != "" {
+					t.Errorf("x-api-key leaked to redirect target: %q", k)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer target.Close()
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+r.URL.Path, code)
+			}))
+			defer origin.Close()
+
+			call := chatCall(testDeployment(domain.ProtocolAnthropicMessage, origin.URL), false)
+			call.ExtraHeaders = map[string]string{"X-Team": "ops"}
+			d, err := Dispatch(context.Background(), NewHTTPClient(nil), NewAnthropicMessages(), call)
+			if d != nil {
+				t.Fatal("cross-origin redirect must not produce a result")
+			}
+			de, ok := err.(*DispatchError)
+			if !ok || de.StatusCode != code {
+				t.Fatalf("err = %#v, want upstream %d surfaced", err, code)
+			}
+			if targetHits != 0 {
+				t.Fatalf("redirect target received %d requests, want 0 (凭证绝不跨主机)", targetHits)
+			}
+		})
+	}
+}
+
+// 评审轮2 I1 对照组：同 origin 重定向照常跟随，上游密钥与扩展头保留（凭证
+// 本来就该发给这台主机）。
+func TestDispatch_SameOriginRedirectFollowed(t *testing.T) {
+	var sawFinal bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			http.Redirect(w, r, "/v1/messages", http.StatusFound)
+			return
+		}
+		sawFinal = true
+		if r.Header.Get("x-api-key") != "sk-test" {
+			t.Errorf("x-api-key = %q on same-origin redirect", r.Header.Get("x-api-key"))
+		}
+		if r.Header.Get("X-Team") != "ops" {
+			t.Errorf("operator header = %q on same-origin redirect", r.Header.Get("X-Team"))
+		}
+		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"up",
+			"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",
+			"usage":{"input_tokens":3,"output_tokens":2}}`)
+	}))
+	defer srv.Close()
+
+	call := chatCall(testDeployment(domain.ProtocolAnthropicMessage, srv.URL), false)
+	call.ExtraHeaders = map[string]string{"X-Team": "ops"}
+	d, err := Dispatch(context.Background(), NewHTTPClient(nil), NewAnthropicMessages(), call)
+	if err != nil || d == nil {
+		t.Fatalf("same-origin redirect must be followed: %v", err)
+	}
+	if !sawFinal {
+		t.Error("final handler never reached")
 	}
 }

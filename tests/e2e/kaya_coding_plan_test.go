@@ -258,11 +258,11 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
 		service.NewProviderTokenService(appRepo, nil), quoteSvc,
-		service.NewChatService("", "", "", subRepo, planRepo), nil,
+		service.NewChatService(nil, subRepo, planRepo, repo.NewLLMUsageRepo(db)), nil,
 		service.NewGitHubOAuthService(cfg.OAuthStateSecret),
 		service.NewWeChatOAuthService(cfg.OAuthStateSecret),
 		false, true, /* wechatPayMock */
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps)
+		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil)
 
 	// 在售商品 + 支付/权益配置（029 快照源）。
 	if _, err := db.ExecContext(ctx, `

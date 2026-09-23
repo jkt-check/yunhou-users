@@ -11,6 +11,13 @@ type ChatMessage struct {
 	Content    string     `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 轮发起的工具调用(透传上游)
 	ToolCallID string     `json:"tool_call_id,omitempty"` // role=tool 时关联的 assistant tool_call id
+	// ReasoningContent 是 thinking 模式下 assistant 轮的推理内容(透传上游)。
+	// DeepSeek 要求:带 tool_calls 的 assistant 轮在后续请求中必须原样回传
+	// reasoning_content,否则上游 400 拒绝。omitempty 保证非 thinking 会话
+	// 的上行 payload 与之前逐字节一致(向后兼容)。其大小有意不计入消息条
+	// 数预算(长推理链是合法输入,按内容预算拒绝会误伤),由请求体总上限
+	// chatMaxBodyBytes 兜底——与 tool_calls 的处理方式一致。
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ToolCall is the OpenAI Chat Completions assistant tool_call shape. The
@@ -48,11 +55,11 @@ type ToolCallFunction struct {
 type ChatRequest struct {
 	Messages  []ChatMessage `json:"messages"`
 	SessionID string        `json:"session_id"`
-	// Model is optional. The LEGACY DeepSeek proxy ignores it entirely (the
-	// upstream model is server-configured, 旧无 model 默认). When the
-	// inference-gateway migration switch is on (INFERENCE_KAYA_CHAT_GATEWAY),
-	// the facade honors it as the public model id; empty means the server's
-	// configured default model (KAYA_CHAT_MODEL).
+	// Model is the logical built-in model id (see GET /chat/models). Empty
+	// selects the server-configured default — pre-multi-model clients never
+	// send it and keep working unchanged. When the inference-gateway
+	// migration switch is on (INFERENCE_KAYA_CHAT_GATEWAY), the facade
+	// honors it as the public model id (empty = KAYA_CHAT_MODEL).
 	Model string `json:"model,omitempty"`
 	// Tools is the OpenAI-compatible function/tool schema list, relayed
 	// verbatim to the upstream DeepSeek chat.completions `tools` field.
@@ -92,6 +99,10 @@ const ChatMaxTotalBytes = 262144
 // audit-log grouping key, so anything longer is rejected rather than stored.
 const ChatMaxSessionIDLen = 64
 
+// ChatMaxModelLen bounds the optional model id — it must match a catalog
+// entry, and catalog ids are themselves capped at 64 chars (llm.Validate).
+const ChatMaxModelLen = 64
+
 // ChatMaxTools bounds the number of tool definitions per request (abuse
 // surface: each tool inflates the upstream prompt and costs tokens).
 const ChatMaxTools = 16
@@ -100,9 +111,3 @@ const ChatMaxTools = 16
 // Tool schemas are typically a few hundred bytes each (kaya ships 4 tools);
 // 32 KiB covers pathological schemas while bounding memory per request.
 const ChatMaxToolsBytes = 32 << 10
-
-// ChatMaxModelLen bounds the optional model override (a public inference
-// model id). Only meaningful when the gateway facade is enabled; the legacy
-// proxy ignores the field, but the length bound applies either way so a
-// junk value never reaches either path.
-const ChatMaxModelLen = 64

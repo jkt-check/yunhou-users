@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -130,6 +131,7 @@ func RateLimitWithKey(ctx context.Context, r float64, burst int, key func(*gin.C
 			k = c.ClientIP()
 		}
 		if !limiter.allow(k) {
+			c.Header("Retry-After", retryAfterSeconds(limiter, k))
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"code":    429,
 				"message": "too many requests",
@@ -138,4 +140,25 @@ func RateLimitWithKey(ctx context.Context, r float64, burst int, key func(*gin.C
 		}
 		c.Next()
 	}
+}
+
+// retryAfterSeconds 估算 key 下次获得令牌的等待秒数(向上取整,最小 1)。
+// Reserve 成功后立即 Cancel,不实际占用令牌;若突发量永远不足以放行
+// (delay 超过 reservation 上限),兜底返回 60s。
+func retryAfterSeconds(rl *rateLimiter, key string) string {
+	v, ok := rl.visitors.Load(key)
+	if !ok {
+		return "1"
+	}
+	res := v.(*visitor).limiter.Reserve()
+	if !res.OK() {
+		return "60"
+	}
+	d := res.Delay()
+	res.Cancel()
+	secs := int(d.Seconds()) + 1
+	if secs < 1 {
+		secs = 1
+	}
+	return strconv.Itoa(secs)
 }

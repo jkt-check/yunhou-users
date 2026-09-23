@@ -21,6 +21,7 @@ import (
 	"net/http"
 
 	"github.com/yunhou/users/internal/inference/access"
+	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/gateway"
 	"github.com/yunhou/users/internal/inference/providers"
@@ -28,32 +29,82 @@ import (
 )
 
 // ChatGatewayFacade serves the legacy /chat shape from the inference
-// gateway. It satisfies the chat handler's streamer interface.
+// gateway. It satisfies the chat handler's ChatStreamer interface.
 type ChatGatewayFacade struct {
 	gw           *gateway.Service
 	resolver     *access.Resolver
+	catalog      *catalog.Service
 	defaultModel string
 }
 
 // NewChatGatewayFacade builds the facade. defaultModel is the public model
 // id applied when the client sends no model (旧无 model 默认); an empty
 // default makes every call fail as no-access (misconfiguration is loud, not
-// silently routed).
-func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, defaultModel string) *ChatGatewayFacade {
-	return &ChatGatewayFacade{gw: gw, resolver: resolver, defaultModel: defaultModel}
+// silently routed). cat backs AllowedModels (GET /chat/models contract).
+func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *catalog.Service, defaultModel string) *ChatGatewayFacade {
+	return &ChatGatewayFacade{gw: gw, resolver: resolver, catalog: cat, defaultModel: defaultModel}
 }
 
 // StreamChat implements the /chat service surface. The request always
-// streams (SSE), exactly like the legacy proxy.
-func (f *ChatGatewayFacade) StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
-	return f.streamChatModel(ctx, userID, "", messages, tools, thinkingEnabled)
+// streams (SSE), exactly like the multi-model ChatService path. logicalModel
+// is the optional ChatRequest.Model (旧客户端不带 → defaultModel).
+func (f *ChatGatewayFacade) StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *ChatRoute, error) {
+	resp, err := f.streamChatModel(ctx, userID, logicalModel, messages, tools, thinkingEnabled)
+	if err != nil {
+		return nil, nil, err
+	}
+	modelID := logicalModel
+	if modelID == "" {
+		modelID = f.defaultModel
+	}
+	return resp, &ChatRoute{LogicalModel: modelID, Provider: "inference", UpstreamModel: modelID}, nil
 }
 
-// StreamChatWithModel is the model-aware extension the chat handler prefers
-// when available: it honors the optional ChatRequest.Model field (旧客户端
-// 不带 model → 默认模型; the legacy proxy ignores the field entirely).
-func (f *ChatGatewayFacade) StreamChatWithModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
-	return f.streamChatModel(ctx, userID, modelOverride, messages, tools, thinkingEnabled)
+// RecordUsage is a no-op for the facade: the inference gateway settles
+// metered usage internally (Task 9 transactional settlement); writing
+// llm_usage_events here would double-meter.
+func (f *ChatGatewayFacade) RecordUsage(ctx context.Context, userID, appID string, route *ChatRoute, status string, inputTokens, outputTokens int) {
+}
+
+// AllowedModels backs GET /chat/models from the inference catalog — same
+// judgment as /v1/models (published ∩ entitled); a user without a model
+// billing account gets an empty list, not an error (picker UX).
+func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID string) ([]ChatModelInfo, error) {
+	p, err := f.resolver.ResolveUserSession(ctx, userID)
+	if err != nil {
+		return []ChatModelInfo{}, nil
+	}
+	allowed, err := f.resolver.AuthorizedModelIDs(ctx, p, nil)
+	if err != nil {
+		return nil, err
+	}
+	allowSet := make(map[string]bool, len(allowed))
+	for _, id := range allowed {
+		allowSet[id] = true
+	}
+	models, err := f.catalog.ListPublishedModels(ctx,
+		func(_ context.Context, modelID string) (bool, error) { return allowSet[modelID], nil })
+	if err != nil {
+		return nil, err
+	}
+	snap, err := f.catalog.LoadSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChatModelInfo, 0, len(models))
+	for _, m := range models {
+		provider := ""
+		if deps := snap.ActiveDeployments(m.ID); len(deps) > 0 {
+			if pv, ok := snap.Providers[deps[0].ProviderID]; ok {
+				provider = pv.Code
+			}
+		}
+		out = append(out, ChatModelInfo{
+			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
+			Default: m.ID == f.defaultModel,
+		})
+	}
+	return out, nil
 }
 
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {

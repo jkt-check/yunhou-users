@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/yunhou/users/internal/model"
 )
@@ -66,9 +67,12 @@ var (
 	ErrMissingIdempotencyKey   = errors.New("missing Idempotency-Key header")
 	ErrInvalidChannel          = errors.New("invalid channel")
 
-	// Chat proxy (POST /chat → DeepSeek chat.completions, SSE).
+	// Chat proxy (POST /chat → LLM upstream, SSE).
 	ErrChatNotEnabled       = errors.New("chat is not enabled")
 	ErrChatNoAccess         = errors.New("active subscription with access to this app is required")
+	ErrChatUnknownModel     = errors.New("unknown chat model")
+	ErrChatModelNotAllowed  = errors.New("chat model is not allowed for the current plan")
+	ErrChatRequestShape     = errors.New("chat request shape is not supported by the selected model")
 	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
 	ErrChatUpstreamError    = errors.New("chat upstream error")
 	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")
@@ -76,4 +80,37 @@ var (
 	// Usage analytics (/user/usage/heartbeat + /admin/stats/*). Wrapped
 	// with a detail message (fmt.Errorf %w); handlers map it to 400.
 	ErrUsageInvalidParam = errors.New("invalid usage stats parameter")
+
+	// relay ticket 校验失败(伪造/篡改/过期/错误 aud/错误 secret 统一口径,
+	// 不向连接方泄露具体原因)。
+	ErrRelayTicketInvalid = errors.New("invalid relay ticket")
+
+	// relay entitlement 拒绝(spec §3.1 固定文案,handler 映射 403)。
+	ErrRelayNoAccess = errors.New("remote access requires paid plan")
 )
+
+// Normalized codes classifying an upstream 4xx rejection. Surfaced to
+// clients (data.upstream_code) so they can tell a retryable-by-rewrite
+// failure (context length) apart from billing and content-policy ones.
+const (
+	UpstreamCodeContextLengthExceeded = "context_length_exceeded"
+	UpstreamCodeContentFilter         = "content_filter"
+	UpstreamCodeInsufficientBalance   = "insufficient_balance"
+	UpstreamCodeInvalidRequest        = "invalid_request"
+)
+
+// ChatUpstreamRejection carries the structured detail of an upstream 4xx
+// (≠429): the real status, a normalized code, and the sanitized upstream
+// message. It unwraps to ErrChatUpstreamRejected, so existing errors.Is
+// mappings keep working; the handler additionally surfaces the fields.
+type ChatUpstreamRejection struct {
+	Status  int    // real upstream HTTP status
+	Code    string // one of the UpstreamCode* constants
+	Message string // sanitized upstream error message (capped)
+}
+
+func (e *ChatUpstreamRejection) Error() string {
+	return fmt.Sprintf("%s (status %d, code %s): %s", ErrChatUpstreamRejected, e.Status, e.Code, e.Message)
+}
+
+func (e *ChatUpstreamRejection) Unwrap() error { return ErrChatUpstreamRejected }

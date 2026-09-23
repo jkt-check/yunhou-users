@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/middleware"
@@ -43,6 +44,8 @@ func Setup(
 	adminModelsHandler *httpapi.AdminModelsHandler,
 	adminOps *httpapi.AdminOps,
 	accessOps *httpapi.AccessOps,
+	llmUsageSvc *service.LLMUsageService,
+	relayHandler *handler.RelayHandler,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -57,9 +60,13 @@ func Setup(
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
 	usageHandler := handler.NewUsageHandler(usageSvc)
+	llmUsageHandler := handler.NewLLMUsageHandler(llmUsageSvc)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
+	// Prometheus 抓取端点。无条件暴露:即使 relay 禁用,进程级
+	// Go/runtime collector 仍可工作;挂在 publicLimiter 后防抓取滥用。
+	engine.GET("/metrics", publicLimiter, gin.WrapH(promhttp.Handler()))
 	engine.GET("/.well-known/jwks.json", publicLimiter, authHandler.JWKS)
 	engine.POST("/auth/refresh", publicLimiter, authHandler.RefreshToken)
 	engine.POST("/auth/logout", publicLimiter, authHandler.Logout)
@@ -196,15 +203,31 @@ func Setup(
 	// 直通。两条路径共用同一 handler（鉴权、限流、审计日志、SSE relay、
 	// 错误 shape 不变）。
 	chatLimiter := middleware.RateLimit(ctx, 10, 20)
-	var chatStreamSvc handler.ChatStreamer = chatSvc
+	var chatStreamSvc service.ChatStreamer = chatSvc
 	if accessOps != nil && accessOps.KayaChat != nil {
 		chatStreamSvc = accessOps.KayaChat
 	}
 	chatHandler := handler.NewChatHandler(chatStreamSvc, chatAccessLog)
 	engine.POST("/chat", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.StreamChat)
-	// GET /chat/models (Kaya 模型选择契约) 仅随 facade 挂载。
+	// GET /chat/models (Kaya 模型选择契约):facade 路径用 inference 目录
+	// (无计费账号时空列表而非报错);否则用多模型 ChatService 的权益视图。
 	if accessOps != nil && accessOps.KayaChatModels != nil {
 		engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), accessOps.KayaChatModels.List)
+	} else {
+		engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.GetModels)
+	}
+
+	// Relay(kaya 远程控制)。relayHandler 为 nil = relay 禁用(RELAY_TICKET_SECRET 未配置)。
+	if relayHandler != nil {
+		// 签发限流 30/min/user(spec §3.1):r=0.5/s,burst=30。
+		// JWTAuth 在前,key func 才能读到 user_id。
+		ticketLimiter := middleware.RateLimitWithKey(ctx, 0.5, 30, func(c *gin.Context) string {
+			return c.GetString(middleware.ContextUserID)
+		})
+		engine.POST("/relay/ticket", middleware.JWTAuth(tokenSvc), ticketLimiter, relayHandler.IssueTicket)
+		// WS 长连接:不走 JWTAuth(ticket 在 hello 首帧内鉴权,spec §7),
+		// 且在 timeoutMiddleware 的 skip 列表中(main.go)。
+		engine.GET("/relay/ws", relayHandler.ServeWS)
 	}
 
 	// Admin routes for plan management (internal service auth)
@@ -253,6 +276,9 @@ func Setup(
 			opsGroup.Use(middleware.JWTAuth(tokenSvc))
 			adminOps.Mount(opsGroup)
 		}
+
+		// LLM token metering aggregates (migration 022).
+		adminGroup.GET("/stats/llm-usage", llmUsageHandler.GetByModel)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

@@ -174,7 +174,83 @@ func TestValidate_HappyPath(t *testing.T) {
 	}
 }
 
-// TestValidate_ErrorPaths walks every Validate() rejection branch.
+// TestValidate_RelayTicketSecretStrength guards the HMAC ticket secret floor:
+// empty = relay disabled (valid); once set, <32 chars is rejected (forgeable
+// by brute force), ≥32 passes — the same floor as OAUTH_STATE_SECRET.
+func TestValidate_RelayTicketSecretStrength(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		secret  string
+		wantErr bool
+	}{
+		{"empty disables relay", "", false},
+		{"32 chars ok", strings.Repeat("a", 32), false},
+		{"64 chars ok", strings.Repeat("a", 64), false},
+		{"31 chars rejected", strings.Repeat("a", 31), true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validRealWeChatConfig()
+			cfg.RelayTicketSecret = tc.secret
+			err := cfg.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %d-char secret, got nil", len(tc.secret))
+				}
+				if !strings.Contains(err.Error(), "RELAY_TICKET_SECRET") {
+					t.Errorf("error message missing RELAY_TICKET_SECRET: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("want nil for %d-char secret, got %v", len(tc.secret), err)
+			}
+		})
+	}
+}
+
+// TestValidate_RelayWSURLScheme pins the optional ws_url override: empty =
+// derive from request Host (valid); ws:// and wss:// accepted; anything else
+// (https://, bare host, garbage) is rejected — a typo'd override would
+// silently hand clients an unconnectable URL.
+func TestValidate_RelayWSURLScheme(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		wsURL   string
+		wantErr bool
+	}{
+		{"empty derives from Host", "", false},
+		{"wss ok", "wss://api.example.com/relay/ws", false},
+		{"ws ok", "ws://localhost:8080/relay/ws", false},
+		{"https rejected", "https://api.example.com/relay/ws", true},
+		{"bare host rejected", "api.example.com/relay/ws", true},
+		{"garbage rejected", "not-a-url", true},
+		{"hostless rejected", "wss://", true},
+		{"path-only rejected", "wss:///relay/ws", true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validRealWeChatConfig()
+			cfg.RelayWSURL = tc.wsURL
+			err := cfg.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tc.wsURL)
+				}
+				if !strings.Contains(err.Error(), "RELAY_WS_URL") {
+					t.Errorf("error message missing RELAY_WS_URL: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("want nil for %q, got %v", tc.wsURL, err)
+			}
+		})
+	}
+}
+
 func TestValidate_ErrorPaths(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -957,6 +1033,75 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 		cfg.WeChatPayMchID = "1900000001"
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("partial creds in mock mode should validate, got: %v", err)
+		}
+	})
+}
+
+// TestValidate_LLMCatalog walks the multi-model catalog branch: a malformed
+// LLM_PROVIDERS_JSON must kill the process at boot (fail-fast on operator
+// typos, DisallowUnknownFields + referential integrity live in
+// llm.ParseCatalog), an empty string stays valid (back-compat with the
+// legacy DEEPSEEK_* triple), and a well-formed catalog validates.
+func TestValidate_LLMCatalog(t *testing.T) {
+	t.Parallel()
+	base := func() *Config {
+		return &Config{
+			DatabaseURL:                "postgres://x",
+			RSAPrivate:                 "priv",
+			RSAPublic:                  "pub",
+			JWTAccessTTL:               15 * time.Minute,
+			JWTRefreshTTL:              168 * time.Hour,
+			OrderExpiryDuration:        30 * time.Minute,
+			SweeperInterval:            1 * time.Minute,
+			OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
+			WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef",
+			WeChatPayMchID:             "1900000001",
+			WeChatPayAppID:             "wx1900000109",
+			WeChatPayMchPrivateKeyPath: "/etc/wechat/apiclient_key.pem",
+			WeChatPayMchCertPath:       "/etc/wechat/apiclient_cert.pem",
+			WeChatPayNotifyURL:         "https://example.com/webhooks/payment/wechat_pay",
+			InferenceRecoveryGrace:     15 * time.Minute,
+		}
+	}
+
+	// Empty catalog = legacy DEEPSEEK_* back-compat path; always valid here.
+	if err := base().Validate(); err != nil {
+		t.Fatalf("empty catalog: want nil, got %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		json      string
+		needleSub string
+	}{
+		{"not json at all", `{`, "LLM_PROVIDERS_JSON"},
+		{"unknown field rejected", `{"bogus": true}`, "LLM_PROVIDERS_JSON"},
+		{"empty providers", `{"providers":{},"models":{"m":{"provider":"p","upstream_model":"u"}}}`, "providers must not be empty"},
+		{"model references unknown provider", `{"providers":{"p":{"protocol":"openai","base_url":"https://x.example","api_keys":["k"]}},"models":{"m":{"provider":"nope","upstream_model":"u"}}}`, "unknown provider"},
+		{"bad provider base_url", `{"providers":{"p":{"protocol":"openai","base_url":"not a url","api_keys":["k"]}},"models":{"m":{"provider":"p","upstream_model":"u"}}}`, "absolute http(s) URL"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := base()
+			cfg.LLMProvidersJSON = tc.json
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.needleSub) {
+				t.Errorf("error message missing %q: %v", tc.needleSub, err)
+			}
+		})
+	}
+
+	t.Run("valid catalog accepted", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.LLMProvidersJSON = `{"providers":{"p":{"protocol":"openai","base_url":"https://x.example","api_keys":["k"]}},"models":{"m":{"provider":"p","upstream_model":"u"}}}`
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("valid catalog rejected: %v", err)
 		}
 	})
 }

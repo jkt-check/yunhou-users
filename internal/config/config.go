@@ -12,6 +12,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/providers/connector"
+	"github.com/yunhou/users/internal/llm"
 )
 
 // Config holds all runtime configuration. Required fields are validated
@@ -94,6 +95,13 @@ type Config struct {
 	JWTAccessTTL  time.Duration
 	JWTRefreshTTL time.Duration
 
+	// Relay(远程控制 WS 中继;RELAY_TICKET_SECRET 为空 = 整体禁用)
+	RelayTicketSecret     string
+	RelayTicketSecretPrev string   // 轮换期旧 secret,校验时一并接受
+	RelayAllowedOrigins   []string // 浏览器 Origin 白名单(host 或 origin 形式)
+	RelayWSURL            string   // 可选:覆盖 /relay/ticket 返回的 ws_url(空 = 按请求 Host 推导)
+	AppEnv                string   // metrics 的 env label,默认 prod
+
 	// Payment channel webhook secrets. Loaded but not strictly required
 	// at startup — if a channel's secret is empty, webhooks for that channel
 	// return 404 (signature verifier is nil for that channel). Operators
@@ -149,21 +157,22 @@ type Config struct {
 	// DeepSeekModel is the model name sent in the upstream chat.completions
 	// body (e.g. deepseek-v4-flash). Default "deepseek-v4-flash".
 	DeepSeekModel string
+	// LLMProvidersJSON is the multi-model catalog (providers + logical
+	// models) as one JSON object, consumed two ways at boot: (1) parsed and
+	// validated by llm.ParseCatalog as the /chat runtime catalog (takes
+	// precedence over the legacy DEEPSEEK_* triple; when empty those envs
+	// synthesize a one-model catalog, back-compat); (2) ONE explicit
+	// idempotent import into the inference catalog DB (基线报告差距 1) —
+	// entities missing from the database are inserted as DRAFT, anything
+	// already present is left untouched, and the inference runtime truth is
+	// the published DB revision, never this env. Invalid JSON fails startup
+	// loudly. See docs/api-integration-guide.md.
+	LLMProvidersJSON string
 	// ChatLogPath is the file for chat access logs (one JSON line per
 	// request: user_id, session_id, input messages, output text, status,
 	// duration). Empty = chat access logging disabled (the /chat endpoint
 	// still works, only the audit trail is skipped).
 	ChatLogPath string
-
-	// LLMProvidersJSON is the OPTIONAL compatibility import of the model
-	// catalog (基线报告差距 1: LLM_PROVIDERS_JSON 环境变量目录 → 数据库配置).
-	// When non-empty, cmd/server runs ONE explicit idempotent import at
-	// startup: entities missing from the database are inserted as DRAFT,
-	// everything already present is left untouched — the env never
-	// overwrites operational DB config on restart. Invalid JSON fails
-	// startup loudly. The runtime catalog truth is the published DB
-	// revision, never this env.
-	LLMProvidersJSON string
 
 	// InferenceCredentialKeys is the deployment-secret key material for
 	// the upstream-credential vault (AEAD). Format:
@@ -255,6 +264,12 @@ func Load() *Config {
 		JWTAccessTTL:  parseDurationOr(envOr("JWT_ACCESS_TTL", "15m"), 15*time.Minute),
 		JWTRefreshTTL: parseDurationOr(envOr("JWT_REFRESH_TTL", "168h"), 168*time.Hour),
 
+		RelayTicketSecret:     os.Getenv("RELAY_TICKET_SECRET"),
+		RelayTicketSecretPrev: os.Getenv("RELAY_TICKET_SECRET_PREVIOUS"),
+		RelayAllowedOrigins:   splitCSV(os.Getenv("RELAY_ALLOWED_ORIGINS")),
+		RelayWSURL:            os.Getenv("RELAY_WS_URL"),
+		AppEnv:                envOr("APP_ENV", "prod"),
+
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
 		WeChatAPIv3Key:      os.Getenv("WECHAT_PAY_API_V3_KEY"),
 		AlipayPublicKeyPath: os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
@@ -280,7 +295,7 @@ func Load() *Config {
 		LLMProvidersJSON: os.Getenv("LLM_PROVIDERS_JSON"),
 
 		InferenceCredentialKeys:    os.Getenv("INFERENCE_CREDENTIAL_KEYS"),
-		InferenceUpstreamAllowlist: splitComma(os.Getenv("INFERENCE_UPSTREAM_ALLOWLIST")),
+		InferenceUpstreamAllowlist: splitCSV(os.Getenv("INFERENCE_UPSTREAM_ALLOWLIST")),
 		InferenceAccountRPM:        parseIntOr(envOr("INFERENCE_ACCOUNT_RPM", "120"), 120),
 		InferenceKayaChatGateway:   os.Getenv("INFERENCE_KAYA_CHAT_GATEWAY") == "1",
 		KayaChatModel:              os.Getenv("KAYA_CHAT_MODEL"),
@@ -338,6 +353,21 @@ func (c *Config) Validate() error {
 	// generate via `openssl rand -hex 32`.
 	if len(c.OAuthStateSecret) < 32 {
 		return errors.New("OAUTH_STATE_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
+	}
+	// RELAY_TICKET_SECRET 为空 = relay 整体禁用,合法;一旦设置即签发
+	// HMAC-SHA256 ticket,低于 32 字符的 secret 可被暴力伪造,强度下限
+	// 与 OAUTH_STATE_SECRET 一致,生成同样用 `openssl rand -hex 32`。
+	if c.RelayTicketSecret != "" && len(c.RelayTicketSecret) < 32 {
+		return errors.New("RELAY_TICKET_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
+	}
+	// RELAY_WS_URL 为空 = 按请求 Host 推导 ws_url,合法;一旦设置必须是
+	// 带 host 的 ws:// 或 wss:// URL —— 填错 scheme(如 https://)或空
+	// host 会让客户端拿到永远连不上的地址且无任何报错,比不配置更难排查。
+	if c.RelayWSURL != "" {
+		u, err := url.Parse(c.RelayWSURL)
+		if err != nil || u.Host == "" || (u.Scheme != "ws" && u.Scheme != "wss") {
+			return errors.New("RELAY_WS_URL must be a ws:// or wss:// URL with a host")
+		}
 	}
 	// Real-mode WeChat Pay credentials are a six-field all-or-none tuple:
 	//   WECHAT_PAY_API_V3_KEY + WECHAT_PAY_MCH_ID  (used for webhook
@@ -456,6 +486,13 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("INFERENCE_OAUTH_CONNECTORS_JSON: %v", err)
 		}
 	}
+	// Multi-model catalog: malformed JSON or a broken reference must kill
+	// the process at boot, not surface as per-request 502s.
+	if c.LLMProvidersJSON != "" {
+		if _, err := llm.ParseCatalog(c.LLMProvidersJSON); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -466,15 +503,15 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func splitComma(s string) []string {
-	if strings.TrimSpace(s) == "" {
+// splitCSV 解析逗号分隔 env;空串返回 nil;每项 TrimSpace 后丢弃空项。
+func splitCSV(s string) []string {
+	if s == "" {
 		return nil
 	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
 		}
 	}
 	return out

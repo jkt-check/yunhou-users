@@ -29,7 +29,7 @@ type Session struct {
 	// minted by the same rotation (migration 020). The grace-window logic in
 	// AuthService.RefreshToken walks this chain to distinguish a legitimate
 	// lost-response retry from a token replay. NULL for sessions revoked by
-	// anything other than a rotation (logout, family revoke).
+	// anything other than a rotation (logout, chain revoke).
 	RotatedTo  *string   `db:"rotated_to" json:"-"`
 	ExpiresAt  time.Time `db:"expires_at" json:"expires_at"`
 	CreatedAt  time.Time `db:"created_at" json:"created_at"`

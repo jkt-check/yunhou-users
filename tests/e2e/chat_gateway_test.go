@@ -26,6 +26,7 @@ import (
 	"github.com/yunhou/users/internal/inference/providers"
 	"github.com/yunhou/users/internal/inference/quota"
 	"github.com/yunhou/users/internal/inference/routing"
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -161,7 +162,7 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 		tokenSvc, authSvc, nil, nil, nil,
 		&middleware.MultiChannelVerifier{}, nil,
 		nil, nil, chatSvc, nil, nil, nil, false, false,
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps)
+		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil)
 }
 
 // setupChatE2E builds the engine in LEGACY mode: a real ChatService pointed
@@ -172,8 +173,8 @@ func setupChatE2E(t *testing.T, up *chatStubUpstream) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
-	chatSvc := service.NewChatService("sk-legacy-test", up.URL, "deepseek-v4-flash",
-		repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db))
+	chatSvc := service.NewChatService(llm.LegacyCatalog("sk-legacy-test", up.URL, "deepseek-v4-flash"),
+		repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db), repo.NewLLMUsageRepo(db))
 	setupCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	chatRouterSetup(setupCtx, engine, db, tokenSvc, authSvc, chatSvc, nil)
@@ -313,7 +314,7 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream) (*gin.Engine, *sqlx.
 		quota.NewService(store, nil), routingSvc, credSvc, providers.NewHTTPClient(egress), egress, nil)
 
 	accessOps := &httpapi.AccessOps{
-		KayaChat:       service.NewChatGatewayFacade(gw, resolver, modelID),
+		KayaChat:       service.NewChatGatewayFacade(gw, resolver, catalogSvc, modelID),
 		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, modelID),
 	}
 
@@ -323,7 +324,7 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream) (*gin.Engine, *sqlx.
 	setupCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	chatRouterSetup(setupCtx, engine, db, tokenSvc, authSvc,
-		service.NewChatService("", "", "", repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db)), accessOps)
+		service.NewChatService(nil, repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db), repo.NewLLMUsageRepo(db)), accessOps)
 	return engine, db, store
 }
 

@@ -36,6 +36,7 @@ import (
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
@@ -329,7 +330,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	// upstream.
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
-	chatSvc := service.NewChatService("", "", "", subRepo, planRepo) // chat disabled in e2e helpers
+	chatSvc := service.NewChatService(llm.LegacyCatalog(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel), subRepo, planRepo, repo.NewLLMUsageRepo(db)) // chat disabled in e2e helpers
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	// Cancellable context so rate-limit cleanup goroutines die at test end
@@ -340,7 +341,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	return engine, nil, db
 }
@@ -416,7 +417,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
-	chatSvc := service.NewChatService("", "", "", subRepo, planRepo) // chat disabled in e2e helpers
+	chatSvc := service.NewChatService(llm.LegacyCatalog(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel), subRepo, planRepo, repo.NewLLMUsageRepo(db)) // chat disabled in e2e helpers
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 
@@ -429,7 +430,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	return &E2EServer{
 		Engine:             engine,
@@ -687,7 +688,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	engine.Use(gin.Recovery())
 	providerTokenSvc := service.NewProviderTokenService(appRepo, nil)
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
-	chatSvc := service.NewChatService("", "", "", subRepo, planRepo) // chat disabled in e2e helpers
+	chatSvc := service.NewChatService(llm.LegacyCatalog(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel), subRepo, planRepo, repo.NewLLMUsageRepo(db)) // chat disabled in e2e helpers
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
@@ -696,7 +697,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	alipayPrivHolder.Store(alipayPriv)
 

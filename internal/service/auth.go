@@ -671,7 +671,7 @@ const maxRotationChainHops = 10
 // lost-response retry: the session was revoked outside the grace window, or
 // revoked by something other than a rotation (RevokedAt/RotatedTo NULL), or
 // the chain dangles. A DB error other than ErrNoRows is wrapped and returned
-// for the caller to surface as a 500 (no family revoke on transient errors).
+// for the caller to surface as a 500 (no chain revoke on transient errors).
 func (s *AuthService) graceSuccessor(ctx context.Context, cur *model.Session, now time.Time) (*model.Session, error) {
 	withinGrace := cur.RotatedTo != nil && cur.RevokedAt != nil &&
 		now.Sub(*cur.RevokedAt) <= refreshRotationGraceWindow
@@ -696,12 +696,18 @@ func (s *AuthService) graceSuccessor(ctx context.Context, cur *model.Session, no
 	return next, nil
 }
 
-// revokeFamilyForReuse revokes every active session for (userID, appID) after
-// confirmed refresh-token reuse. Best-effort: a failure is logged, not
-// surfaced, so the caller's 401 response is unaffected.
-func (s *AuthService) revokeFamilyForReuse(ctx context.Context, userID, appID string) {
-	if err := s.sessionRepo.RevokeFamilyByUserApp(ctx, userID, appID); err != nil {
-		log.Printf("refresh: family revoke failed: %v", err)
+// revokeChainForReuse is the theft response to confirmed refresh-token
+// reuse: revoke the compromised session's rotation chain (its rotated_to
+// descendants). Independent sessions of the same (user, app) — e.g. a
+// fresh OAuth login — are NOT descendants of the stolen token and stay
+// live. (2026-09-16 prod incident: the previous family-wide revoke let a
+// stale browser cookie, racing the post-login /auth/session call, nuke the
+// just-created login session — re-login became impossible until the user
+// cleared cookies.) Best-effort: a failure is logged, not surfaced, so the
+// caller's 401 response is unaffected.
+func (s *AuthService) revokeChainForReuse(ctx context.Context, session *model.Session) {
+	if err := s.sessionRepo.RevokeChainFrom(ctx, session.ID); err != nil {
+		log.Printf("refresh: chain revoke failed: %v", err)
 	}
 }
 
@@ -797,8 +803,8 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 	// we walk the rotated_to chain (within refreshRotationGraceWindow) to the
 	// live successor and rotate THAT, issuing the client a fresh pair. A
 	// replay outside the window, or on a session revoked by something other
-	// than a rotation (logout, family revoke — rotated_to is NULL), is still
-	// treated as theft: revoke the whole (user, app) family and 401.
+	// than a rotation (logout, chain revoke — rotated_to is NULL), is still
+	// treated as theft: revoke the compromised chain and 401.
 	target := session
 	rotated := false
 	var reuseErr error
@@ -815,7 +821,7 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 		if target.ExpiresAt.Before(now) {
 			// An EXPIRED chain tail is not evidence of theft (pre-020 an
 			// expired token was a silent 401 at lookup) — plain 401, no
-			// family revoke. Practically near-unreachable: the lookup
+			// chain revoke. Practically near-unreachable: the lookup
 			// already filters expiry, and a chain tail is ≤ grace-window
 			// old with an hours-long TTL.
 			return nil, ErrInvalidRefreshToken
@@ -840,21 +846,21 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 	if !rotated {
 		if reuseErr != nil && !errors.Is(reuseErr, ErrInvalidRefreshToken) {
 			// reuseErr is a DB error from the chain walk. Only confirmed
-			// reuse earns the family revoke — a transient DB failure must
+			// reuse earns the chain revoke — a transient DB failure must
 			// not nuke the user's sessions.
 			return nil, reuseErr
 		}
 		if reuseErr == nil {
 			// Hop limit exhausted on pure rotation-race contention without
 			// a confirmed reuse verdict — surface a 500 rather than
-			// revoking an innocent family.
+			// revoking innocent sessions.
 			return nil, fmt.Errorf("refresh rotation did not converge within %d hops", maxRotationChainHops)
 		}
-		// Confirmed reuse: revoke the compromised session's family — note
-		// this is session.AppID, NOT the caller-supplied appID, which is
-		// attacker-controlled and could otherwise point the revoke at the
-		// wrong (user, app) family while the compromised one stays live.
-		s.revokeFamilyForReuse(ctx, user.ID, session.AppID)
+		// Confirmed reuse: revoke the compromised session's rotation chain
+		// (rotated_to descendants). Chain links are server-written by
+		// RotateRefresh, so the attacker-controlled request appID plays no
+		// role here; independent sessions (fresh logins) stay live.
+		s.revokeChainForReuse(ctx, session)
 		return nil, ErrInvalidRefreshToken
 	}
 

@@ -8,16 +8,20 @@ import (
 )
 
 type Plan struct {
-	ID                        string         `db:"id" json:"id"` // free/monthly/quarterly/yearly
-	Name                      string         `db:"name" json:"name"`
-	Price                     float64        `db:"price" json:"price"`
-	IntervalDays              int            `db:"interval_days" json:"interval_days"`
-	Apps                      pq.StringArray `db:"apps" json:"apps"`
+	ID           string         `db:"id" json:"id"` // free/monthly/quarterly/yearly
+	Name         string         `db:"name" json:"name"`
+	Price        float64        `db:"price" json:"price"`
+	IntervalDays int            `db:"interval_days" json:"interval_days"`
+	Apps         pq.StringArray `db:"apps" json:"apps"`
 	// ProductCode is the commercial product this plan sells (design §4.1).
 	// Subscriptions inherit it via the trg_subscriptions_plan_product
 	// trigger; pre-027 rows carry ProductKayaMembership via the column
 	// default.
-	ProductCode               string         `db:"product_code" json:"product_code"`
+	ProductCode string `db:"product_code" json:"product_code"`
+	// ChatModels gates which logical chat models (llm catalog ids) this
+	// plan may use. NULL/empty = unrestricted. Backfilled as NULL by
+	// migration 023; managed via SQL until an admin UI exists.
+	ChatModels                pq.StringArray `db:"chat_models" json:"chat_models,omitempty"`
 	IsActive                  bool           `db:"is_active" json:"is_active"`
 	IsListed                  bool           `db:"is_listed" json:"is_listed"`
 	AcceptingNewSubscriptions bool           `db:"accepting_new_subscriptions" json:"accepting_new_subscriptions"`

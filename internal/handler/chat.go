@@ -14,26 +14,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
 )
 
-// ChatStreamer is the ChatService surface the handler needs. Defined as an
-// interface so handler tests can inject a hand-rolled mock without a real
-// upstream, and so the inference-gateway facade (service.ChatGatewayFacade)
-// can replace the legacy proxy when the migration switch is on (Task 8).
-type ChatStreamer interface {
-	StreamChat(ctx context.Context, userID, appID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
-}
-
-// chatModelStreamer is the optional model-aware extension of chatStreamer:
-// services that implement it receive the client's optional model override
-// (ChatRequest.Model). The legacy proxy deliberately does NOT implement it
-// (its model is server-configured), so old behavior is untouched.
-type chatModelStreamer interface {
-	StreamChatWithModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error)
-}
+// The handler depends on service.ChatStreamer (the multi-model ChatService
+// and the inference-gateway facade both satisfy it); tests inject a
+// hand-rolled mock without a real upstream.
 
 // ChatHandler serves POST /chat — the JWT-authenticated, subscription-gated
 // DeepSeek proxy. The upstream SSE stream is relayed verbatim to kaya; every
@@ -44,11 +33,11 @@ type chatModelStreamer interface {
 // failure) with user_id, session_id, input messages, output text, status and
 // duration — the chat audit trail. Nil disables access logging.
 type ChatHandler struct {
-	svc       ChatStreamer
+	svc       service.ChatStreamer
 	accessLog *log.Logger
 }
 
-func NewChatHandler(svc ChatStreamer, accessLog *log.Logger) *ChatHandler {
+func NewChatHandler(svc service.ChatStreamer, accessLog *log.Logger) *ChatHandler {
 	return &ChatHandler{svc: svc, accessLog: accessLog}
 }
 
@@ -78,8 +67,11 @@ type chatAccessEntry struct {
 	UserID          string              `json:"user_id"`
 	AppID           string              `json:"app_id"`
 	SessionID       string              `json:"session_id"`
+	Model           string              `json:"model,omitempty"`
 	Status          string              `json:"status"` // "ok" | "error" | "disconnected" | "upstream_error"
 	Error           string              `json:"error,omitempty"`
+	UpstreamStatus  int                 `json:"upstream_status,omitempty"` // real upstream 4xx, when classified
+	UpstreamCode    string              `json:"upstream_code,omitempty"`   // service.UpstreamCode*
 	MessageCount    int                 `json:"message_count"`
 	ToolsCount      int                 `json:"tools_count,omitempty"`
 	ThinkingEnabled bool                `json:"thinking_enabled,omitempty"`
@@ -106,45 +98,38 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		// Fixed client message: err.Error() would reflect binding/struct
 		// internals to the caller.
-		h.logAccess(started, userID, appID, req, "error", "invalid request body", "")
-		writeChatError(c, http.StatusBadRequest, "invalid request body")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "invalid request body", "", nil)
+		writeChatError(c, http.StatusBadRequest, "invalid request body", nil)
 		return
 	}
 	if msg := validateChatMessages(req.Messages); msg != "" {
-		h.logAccess(started, userID, appID, req, "error", msg, "")
-		writeChatError(c, http.StatusBadRequest, msg)
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", nil)
+		writeChatError(c, http.StatusBadRequest, msg, nil)
 		return
 	}
 	if len(req.SessionID) > model.ChatMaxSessionIDLen {
-		h.logAccess(started, userID, appID, req, "error", "session_id too long", "")
-		writeChatError(c, http.StatusBadRequest, "session_id too long")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "session_id too long", "", nil)
+		writeChatError(c, http.StatusBadRequest, "session_id too long", nil)
 		return
 	}
 	if len(req.Model) > model.ChatMaxModelLen {
-		h.logAccess(started, userID, appID, req, "error", "model id too long", "")
-		writeChatError(c, http.StatusBadRequest, "model id too long")
+		h.logAccess(started, userID, appID, req.Model, req, "error", "model id too long", "", nil)
+		writeChatError(c, http.StatusBadRequest, "model id too long", nil)
 		return
 	}
 	if msg := validateChatTools(req.Tools); msg != "" {
-		h.logAccess(started, userID, appID, req, "error", msg, "")
-		writeChatError(c, http.StatusBadRequest, msg)
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", nil)
+		writeChatError(c, http.StatusBadRequest, msg, nil)
 		return
 	}
 
-	var resp *http.Response
-	var err error
-	if ms, ok := h.svc.(chatModelStreamer); ok {
-		// Gateway facade path: the optional model override is honored (旧
-		// 客户端不带 model → 服务端默认). Validation above already bounded
-		// the legacy fields.
-		resp, err = ms.StreamChatWithModel(c.Request.Context(), userID, req.Model, req.Messages, req.Tools, req.ThinkingEnabled)
-	} else {
-		resp, err = h.svc.StreamChat(c.Request.Context(), userID, appID, req.Messages, req.Tools, req.ThinkingEnabled)
-	}
+	resp, route, err := h.svc.StreamChat(c.Request.Context(), userID, appID, req.Model, req.Messages, req.Tools, req.ThinkingEnabled)
 	if err != nil {
 		status, msg := chatErrorMapping(err)
-		h.logAccess(started, userID, appID, req, "error", msg, "")
-		writeChatError(c, status, msg)
+		var rej *service.ChatUpstreamRejection
+		errors.As(err, &rej)
+		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", rej)
+		writeChatError(c, status, msg, rej)
 		return
 	}
 	defer resp.Body.Close()
@@ -169,7 +154,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		log.Printf("chat: set write deadline: %v", err)
 	}
 
-	raw, result := relayChatSSE(c.Writer, resp.Body)
+	raw, result, usage := relayChatSSE(c.Writer, resp.Body)
 	if result == chatRelayUpstreamBroke {
 		// Upstream died mid-stream (no [DONE] relayed): a clean EOF here
 		// would make kaya render the partial answer as complete. Inject an
@@ -196,12 +181,52 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		status = "upstream_error"
 		errMsg = "upstream stream interrupted"
 	}
-	h.logAccess(started, userID, appID, req, status, errMsg, output)
+	// Meter the upstream spend. Usage tokens come from the relay's
+	// incremental tracker (OpenAI usage chunks, requested via stream_options;
+	// synthesized by the Anthropic translator), so metering is independent of
+	// the capped audit capture and of how the relay ended: a client
+	// disconnect or an upstream break mid-stream still records every usage
+	// chunk read from upstream. context.WithoutCancel: the request ctx is
+	// already cancelled when the client disconnected mid-stream, but the
+	// consumed tokens are a real spend and must still be recorded.
+	if route != nil {
+		usageCtx, usageCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		h.svc.RecordUsage(usageCtx, userID, appID, route, status, usage.InputTokens, usage.OutputTokens)
+		usageCancel()
+	}
+	h.logAccess(started, userID, appID, routeModel(route, req.Model), req, status, errMsg, output, nil)
+}
+
+// routeModel prefers the resolved (effective) model over the raw client
+// value so the audit log shows what actually served the request.
+func routeModel(route *service.ChatRoute, fallback string) string {
+	if route != nil {
+		return route.LogicalModel
+	}
+	return fallback
+}
+
+// GetModels handles GET /chat/models: the catalog models the caller's plan
+// may use, for kaya's model picker. Unlike StreamChat this is a plain JSON
+// endpoint under the global 20s timeout (AllowedModels bounds its DB reads
+// with chatAccessTimeout internally).
+func (h *ChatHandler) GetModels(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	appID := c.GetString(middleware.ContextAppID)
+	models, err := h.svc.AllowedModels(c.Request.Context(), userID, appID)
+	if err != nil {
+		status, msg := chatErrorMapping(err)
+		writeChatError(c, status, msg, nil)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": models}})
 }
 
 // chatErrorMapping converts a StreamChat error into (HTTP status, safe
-// client message). Internal details (upstream URL, upstream body) are logged
-// server-side by the caller's error branches, never sent to the client.
+// client message). Internal details (upstream URL, raw upstream body) are
+// logged server-side by the caller's error branches; the only upstream
+// detail that reaches the client is the sanitized, classified
+// ChatUpstreamRejection surfaced via writeChatError's data field.
 func chatErrorMapping(err error) (int, string) {
 	switch {
 	case errors.Is(err, service.ErrChatNotEnabled):
@@ -219,6 +244,12 @@ func chatErrorMapping(err error) (int, string) {
 	case errors.Is(err, service.ErrChatUpstreamError):
 		log.Printf("chat: upstream error: %v", err)
 		return http.StatusBadGateway, service.ErrChatUpstreamError.Error()
+	case errors.Is(err, service.ErrChatUnknownModel):
+		return http.StatusBadRequest, service.ErrChatUnknownModel.Error()
+	case errors.Is(err, service.ErrChatModelNotAllowed):
+		return http.StatusForbidden, service.ErrChatModelNotAllowed.Error()
+	case errors.Is(err, service.ErrChatRequestShape):
+		return http.StatusBadRequest, service.ErrChatRequestShape.Error()
 	default:
 		log.Printf("chat: internal error: %v", err)
 		return http.StatusInternalServerError, "internal error"
@@ -228,13 +259,23 @@ func chatErrorMapping(err error) (int, string) {
 // logAccess appends one chatAccessEntry line to the audit log, if enabled.
 // Output text is truncated for the log so a single pathological reply can't
 // balloon the file. OutputBytes always reflects the REAL output length
-// (before truncation) so cost analysis isn't skewed by the log cap. On
-// error lines the input is truncated too: validation-failed requests carry
-// unvalidated (potentially near-32 KiB per message) content that would
-// otherwise be mirrored into the log in full.
-func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req model.ChatRequest, status, errMsg, output string) {
+// (before truncation) so cost analysis isn't skewed by the log cap; the
+// same real-bytes rule holds for InputBytes, which counts content AND
+// reasoning even though the logged input is cut. Two input truncations
+// apply: on error lines the (unvalidated, potentially near-32 KiB) content
+// is capped per message, and on every line reasoning_content is capped at
+// chatReasoningLogCap — thinking traces are bounded only by the body cap
+// and would otherwise dominate the log.
+func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string, req model.ChatRequest, status, errMsg, output string, rej *service.ChatUpstreamRejection) {
 	if h.accessLog == nil {
 		return
+	}
+	// modelID can be the RAW client value (validation-failure paths): the
+	// >64-char rejection still logs it, and the body cap would let one audit
+	// line carry ~300 KiB of junk. Cap it here so no call site can forget.
+	if len(modelID) > model.ChatMaxModelLen {
+		cut, _ := truncateUTF8(modelID, model.ChatMaxModelLen)
+		modelID = cut + "…"
 	}
 	realBytes := len(output)
 	output, truncated := truncateChatOutput(output)
@@ -243,11 +284,16 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req mod
 	if status == "error" {
 		input, inputTruncated = truncateChatInput(req.Messages)
 	}
+	if capped, reasoningCut := capChatReasoning(input); reasoningCut {
+		input = capped
+		inputTruncated = true
+	}
 	entry := chatAccessEntry{
 		TS:              started.Format(time.RFC3339),
 		UserID:          userID,
 		AppID:           appID,
 		SessionID:       req.SessionID,
+		Model:           modelID,
 		Status:          status,
 		Error:           errMsg,
 		MessageCount:    len(req.Messages),
@@ -261,6 +307,10 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req mod
 		Output:          output,
 		OutputTruncated: truncated,
 	}
+	if rej != nil {
+		entry.UpstreamStatus = rej.Status
+		entry.UpstreamCode = rej.Code
+	}
 	b, err := json.Marshal(entry)
 	if err != nil {
 		return // log.Logger swallows write errors; don't fail the request for auditing
@@ -268,12 +318,15 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID string, req mod
 	h.accessLog.Println(string(b))
 }
 
-// chatTotalBytes sums message content lengths in bytes (len() — CJK content
-// counts ~3 bytes per rune; the field names say bytes, not chars).
+// chatTotalBytes sums message content + reasoning lengths in bytes (len() —
+// CJK content counts ~3 bytes per rune; the field names say bytes, not
+// chars). reasoning_content counts because it is billed upstream input on
+// thinking-mode continuations; this metric feeds cost analysis, so it must
+// reflect the REAL request size even when the logged input is truncated.
 func chatTotalBytes(messages []model.ChatMessage) int {
 	total := 0
 	for _, m := range messages {
-		total += len(m.Content)
+		total += len(m.Content) + len(m.ReasoningContent)
 	}
 	return total
 }
@@ -286,6 +339,13 @@ const chatOutputLogCap = 64 << 10
 // precisely what validation rejected — so it needs its own, smaller cap.
 const chatErrInputLogCap = 1 << 10
 
+// chatReasoningLogCap bounds each message's reasoning_content in EVERY audit
+// line. Thinking traces are model-internal text bounded only by the request
+// body cap (they bypass the per-message content budgets), so mirroring them
+// in full would balloon the log; a 1 KiB sample is enough to debug relay
+// issues. The real byte count still lands in input_bytes via chatTotalBytes.
+const chatReasoningLogCap = 1 << 10
+
 // truncateChatOutput cuts s at chatOutputLogCap on a UTF-8 rune boundary.
 func truncateChatOutput(s string) (string, bool) {
 	return truncateUTF8(s, chatOutputLogCap)
@@ -293,7 +353,9 @@ func truncateChatOutput(s string) (string, bool) {
 
 // truncateChatInput caps every message's content at chatErrInputLogCap for
 // error-path audit lines. Returns the (possibly copied) slice and whether
-// any content was cut.
+// any content was cut. Cutting only replaces Content — the turn's other
+// relay fields (reasoning_content, tool_calls, tool_call_id) are preserved
+// so the audit line still shows the real message shape.
 func truncateChatInput(messages []model.ChatMessage) ([]model.ChatMessage, bool) {
 	truncated := false
 	out := messages
@@ -305,13 +367,41 @@ func truncateChatInput(messages []model.ChatMessage) ([]model.ChatMessage, bool)
 				copy(out, messages[:i])
 			}
 			cut, _ := truncateUTF8(m.Content, chatErrInputLogCap)
-			out[i] = model.ChatMessage{Role: m.Role, Content: cut}
+			cutMsg := m
+			cutMsg.Content = cut
+			out[i] = cutMsg
 			truncated = true
 		} else if truncated {
 			out[i] = m
 		}
 	}
 	return out, truncated
+}
+
+// capChatReasoning caps every message's reasoning_content at
+// chatReasoningLogCap for audit lines (all paths — reasoning bypasses the
+// content size budgets, so it needs its own log cap). Returns the (possibly
+// copied) slice and whether any reasoning was cut.
+func capChatReasoning(messages []model.ChatMessage) ([]model.ChatMessage, bool) {
+	capped := false
+	out := messages
+	for i, m := range messages {
+		if len(m.ReasoningContent) > chatReasoningLogCap {
+			if !capped {
+				// First cut: copy the slice so the caller's request is untouched.
+				out = make([]model.ChatMessage, len(messages))
+				copy(out, messages[:i])
+			}
+			cut, _ := truncateUTF8(m.ReasoningContent, chatReasoningLogCap)
+			cutMsg := m
+			cutMsg.ReasoningContent = cut
+			out[i] = cutMsg
+			capped = true
+		} else if capped {
+			out[i] = m
+		}
+	}
+	return out, capped
 }
 
 // truncateUTF8 cuts s at cap bytes on a UTF-8 rune boundary — a byte-slice
@@ -353,16 +443,22 @@ type flushWriter interface {
 }
 
 // relayChatSSE streams the upstream body to the client, flushing after every
-// chunk, and captures up to chatRawLogCap bytes of the raw SSE stream for the
-// audit log. The result reports how the relay ended (see chatRelayResult).
-func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult) {
+// chunk, captures up to chatRawLogCap bytes of the raw SSE stream for the
+// audit log, and incrementally tracks the stream's usage object for metering.
+// The tracker is fed from the upstream read, BEFORE the client write: spent
+// tokens count even when the client has already disconnected, and even when
+// the usage chunk lands past the capture cap or the stream ends abnormally.
+// The result reports how the relay ended (see chatRelayResult).
+func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult, llm.StreamUsage) {
 	buf := make([]byte, chatStreamBufSize)
 	var captured bytes.Buffer
+	var tracker llm.UsageTracker
 	for {
 		n, readErr := body.Read(buf)
 		if n > 0 {
+			tracker.Feed(buf[:n])
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return captured.Bytes(), chatRelayClientGone // client gone — stop relaying
+				return captured.Bytes(), chatRelayClientGone, tracker.Usage() // client gone — stop relaying
 			}
 			w.Flush()
 			if captured.Len() < chatRawLogCap {
@@ -376,9 +472,9 @@ func relayChatSSE(w flushWriter, body io.Reader) ([]byte, chatRelayResult) {
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				return captured.Bytes(), chatRelayOK // clean end of stream
+				return captured.Bytes(), chatRelayOK, tracker.Usage() // clean end of stream
 			}
-			return captured.Bytes(), chatRelayUpstreamBroke // upstream broke mid-stream
+			return captured.Bytes(), chatRelayUpstreamBroke, tracker.Usage() // upstream broke mid-stream
 		}
 	}
 }
@@ -497,6 +593,18 @@ func validateChatTools(tools []json.RawMessage) string {
 }
 
 // writeChatError emits the standard {"code","data","message"} error shape.
-func writeChatError(c *gin.Context, status int, message string) {
-	c.JSON(status, gin.H{"code": status, "data": nil, "message": message})
+// A structured upstream rejection additionally fills data with
+// upstream_status/upstream_code/upstream_message so clients can distinguish
+// the failure class; message stays the fixed sentinel text for
+// backwards compatibility.
+func writeChatError(c *gin.Context, status int, message string, rej *service.ChatUpstreamRejection) {
+	var data any
+	if rej != nil {
+		data = gin.H{
+			"upstream_status":  rej.Status,
+			"upstream_code":    rej.Code,
+			"upstream_message": rej.Message,
+		}
+	}
+	c.JSON(status, gin.H{"code": status, "data": data, "message": message})
 }

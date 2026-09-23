@@ -16,9 +16,11 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	"github.com/yunhou/users/internal/handler"
 	inferenceaccess "github.com/yunhou/users/internal/inference/access"
 	inferenceaccounting "github.com/yunhou/users/internal/inference/accounting"
 	inferencecatalog "github.com/yunhou/users/internal/inference/catalog"
@@ -33,7 +35,9 @@ import (
 	inferencequota "github.com/yunhou/users/internal/inference/quota"
 	inferencerouting "github.com/yunhou/users/internal/inference/routing"
 	inferenceworkers "github.com/yunhou/users/internal/inference/workers"
+	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/relay"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/router"
 	"github.com/yunhou/users/internal/service"
@@ -186,8 +190,41 @@ func main() {
 	// Quote service — assembles price + cycle + provider_data for BFF checkout.
 	quoteSvc := service.NewQuoteService(planRepo, appRepo)
 
-	// Chat proxy — server-side DeepSeek key; empty key = /chat returns 404.
-	chatSvc := service.NewChatService(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, subRepo, planRepo)
+	// Chat gateway: LLM_PROVIDERS_JSON wins; the legacy DEEPSEEK_* triple
+	// synthesizes a one-model catalog when the JSON is absent. Both empty →
+	// chat disabled (/chat returns 404).
+	llmCatalog, err := llm.ParseCatalog(cfg.LLMProvidersJSON)
+	if err != nil {
+		log.Fatalf("parse LLM_PROVIDERS_JSON: %v", err)
+	}
+	if llmCatalog == nil {
+		llmCatalog = llm.LegacyCatalog(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel)
+	}
+	if llmCatalog != nil {
+		log.Printf("chat: %d models across %d providers (default %s)",
+			len(llmCatalog.Models), len(llmCatalog.Providers), llmCatalog.DefaultModel)
+	}
+	llmUsageRepo := repo.NewLLMUsageRepo(db)
+	chatSvc := service.NewChatService(llmCatalog, subRepo, planRepo, llmUsageRepo)
+
+	// Relay(kaya 远程控制):仅当 RELAY_TICKET_SECRET 配置时启用,否则
+	// /relay/ticket 与 /relay/ws 路由不注册(404)。
+	var relayHandler *handler.RelayHandler
+	var relayHub *relay.Hub
+	if cfg.RelayTicketSecret != "" {
+		ticketSvc := service.NewRelayTicketService(cfg.RelayTicketSecret, cfg.RelayTicketSecretPrev, 300*time.Second)
+		relaySvc := service.NewRelayService(subRepo, planRepo, ticketSvc)
+		relayHandler = handler.NewRelayHandler(relaySvc)
+		relayHandler.SetWSURLOverride(cfg.RelayWSURL)
+		if cfg.RelayWSURL != "" {
+			log.Printf("relay: ws_url override = %s", cfg.RelayWSURL)
+		}
+		relayMetrics := relay.NewMetrics(prometheus.DefaultRegisterer, cfg.AppEnv)
+		relayHub = relay.NewHub(relay.DefaultOptions(), relayMetrics)
+		relayHandler.SetHub(relayHub, ticketSvc, cfg.RelayAllowedOrigins)
+	} else {
+		log.Printf("relay: disabled (RELAY_TICKET_SECRET empty)")
+	}
 
 	// Usage analytics: heartbeat intake + admin stats reads over
 	// usage_events (migration 021).
@@ -352,7 +389,7 @@ func main() {
 	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
 	if cfg.InferenceKayaChatGateway {
-		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, cfg.KayaChatModel)
+		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, cfg.KayaChatModel)
 		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, cfg.KayaChatModel)
 		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}
@@ -419,7 +456,10 @@ func main() {
 	// per-request deadline — it would hard-cut a longer stream).
 	// Task 13: /v1/messages and /v1/responses get the same exemption (same
 	// SSE relay pattern, same per-response write deadline in the handlers).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses"))
+	// /relay/ws is exempt too: it is a WebSocket long connection that must
+	// never sit under the 20s cap (its liveness bounds are the relay
+	// ping/idle timers in internal/relay).
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses", "/relay/ws"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,
@@ -506,7 +546,8 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps, accessOps)
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps, accessOps,
+		service.NewLLMUsageService(llmUsageRepo), relayHandler)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -536,6 +577,16 @@ func main() {
 	case <-rootCtx.Done():
 		log.Printf("shutdown signal received, draining...")
 		sweeper.Stop()
+		if relayHub != nil {
+			// 停机序列:停接新连(handler 层 503)→ 全部在线连接先收
+			// presence offline、再收 closed shutdown(conn 层 initiateClose
+			// 负责 flush 后关闭)。http.Server.Shutdown 不追踪 hijack 的
+			// WS 连接,进程退出会截断异步 flush;Hub.Shutdown 的 wait 会
+			// 等到房间清空(全部连接收尾完毕)或 3s 上限,取先到者
+			// (≤5s 预算内,conn 层 closed 帧 flush 上限为 2s)。
+			relayHub.Shutdown(3 * time.Second)
+			relayHandler.Shutdown() // 停 hello 失败限流器的清理 goroutine
+		}
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {

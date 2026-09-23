@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -263,9 +265,11 @@ func (s *PaymentService) enqueueWalletRefund(ctx context.Context, tx dbTx, order
 // 来 payment_failed，支付行翻 failed 但已入账现金仍可花）。与
 // enqueueWalletRefund 同一现金借记语义，但触发方没有退款行——dedup 键与
 // 消费侧业务键都钉在 payment id 上（与 benefit:failed:{payment_id} 同一锚
-// 点），渠道重投只入队/入账一次。
-func (s *PaymentService) enqueueWalletFailedDebit(ctx context.Context, tx dbTx, order *model.Order, paymentID string) error {
-	micros, err := walletTopupMicros(order.Amount, order.Currency)
+// 点），渠道重投只入队/入账一次。amount 为应冲正差额（评审轮2 N3：订单全
+// 额扣除该支付已 paid 退款后的余额，由调用方计算并保证 > 0）——部分退款
+// 后按全额冲正会把已退回的钱再追一遍。
+func (s *PaymentService) enqueueWalletFailedDebit(ctx context.Context, tx dbTx, order *model.Order, paymentID string, amount float64) error {
+	micros, err := walletTopupMicros(amount, order.Currency)
 	if err != nil {
 		return fmt.Errorf("wallet failed-payment debit amount: %w", err)
 	}
@@ -286,6 +290,15 @@ func orderTouchesBenefits(o *model.Order, productCode string) bool {
 	return o.BenefitPolicyVersionID != nil || productCode == model.ProductCodingPlan
 }
 
+// deriveMerchantRefundNo 从客户端幂等键确定性派生商户退款单号（评审轮2
+// N2）。微信/支付宝以商户退款单号为退款幂等键：同键重试必得同号，渠道侧
+// 幂等兜底崩溃重试窗口的双退款。"mrn_" + sha256 hex 前 40 位 = 44 字符，
+// 低于渠道 64 字符单号上限。
+func deriveMerchantRefundNo(idempotencyKey string) string {
+	sum := sha256.Sum256([]byte("yunhou-refund:" + idempotencyKey))
+	return "mrn_" + hex.EncodeToString(sum[:])[:40]
+}
+
 // RefundAPI is the channel-side refund call. The service is the caller;
 // the channel client is injected so production swaps in real HTTP and
 // tests swap in a stub.
@@ -295,9 +308,10 @@ type RefundAPI interface {
 	// 调用方生成并持久化为 refunds.external_refund_id —— 渠道退款
 	// webhook 以同一商户单号对账（评审批次7 Important-2：两侧键必须一
 	// 致，否则 webhook 的 ON CONFLICT 重读永远 miss，API 行卡 pending）。
-	// 返回渠道回显的商户退款单号；渠道不回显时返回空串，调用方回落到入
-	// 参。idempotencyKey is forwarded to the channel (Stripe supports this
-	// header; others ignore).
+	// 返回渠道回显的商户退款单号（仅供调用方日志核对；评审轮2 M1 起调用
+	// 方一律以已发送单号为对账键入库，回显不再覆盖）。渠道不回显时返回
+	// 空串。idempotencyKey is forwarded to the channel (Stripe supports
+	// this header; others ignore).
 	Refund(ctx context.Context, channel, externalTxnID, merchantRefundNo string, amount float64, idempotencyKey string) (echoedMerchantRefundNo string, err error)
 }
 
@@ -1531,14 +1545,21 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 	// 商户退款单号由我方生成并传给渠道（评审批次7 Important-2）：渠道退款
 	// webhook 以同一商户单号派生 external_refund_id（微信 out_refund_no /
 	// 支付宝 out_biz_no），两侧键一致，webhook 的 ON CONFLICT 重读才能命
-	// 中本行（翻 paid），而不是为同一笔钱插入第二条退款行。
-	merchantRefundNo := GenerateUUID()
+	// 中本行（翻 paid），而不是为同一笔钱插入第二条退款行。单号从
+	// Idempotency-Key 确定性派生（评审轮2 N2）：渠道退款成功但 refunds 行
+	// INSERT 前崩溃/回滚时，客户端持同一幂等键重试必得同一单号，渠道以商
+	// 户单号为幂等键拒绝第二笔退款（随机单号则会被渠道当成新退款执行）。
+	merchantRefundNo := deriveMerchantRefundNo(in.IdempotencyKey)
 	echoed, err := s.refundAPI.Refund(ctx, payment.Channel, payment.ExternalTxnID, merchantRefundNo, in.Amount, in.IdempotencyKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRefundChannelFailed, err)
 	}
-	if echoed != "" {
-		merchantRefundNo = echoed
+	// 评审轮2 M1：对账键一律用已发送的商户单号入库，不采纳渠道回显覆盖
+	// ——真实客户端返回非空不同值会让 refunds 行与渠道侧静默错键，webhook
+	// 的 ON CONFLICT 重读永远 miss。回显不一致仅记 WARN 供排查。
+	if echoed != "" && echoed != merchantRefundNo {
+		log.Printf("WARN refund: channel echoed merchant refund no %q differs from sent %q (payment=%s) — keeping the sent value as the reconciliation key",
+			echoed, merchantRefundNo, payment.ID)
 	}
 
 	// INSERT pending refund. If another concurrent transaction beat us to
@@ -2202,8 +2223,22 @@ func (s *PaymentService) onPaymentFailed(ctx context.Context, e WebhookEvent) er
 		// 队钱包冲正（现金借记原路收回，已消费则如实转负），与权益吊销同
 		// 一级联。
 		if failProduct == model.ProductWalletTopup {
-			if err := s.enqueueWalletFailedDebit(ctx, tx, &order, payment.ID); err != nil {
-				return err
+			// 评审轮2 N3：冲正额 = 订单全额 − 该支付已 paid 退款合计。充值
+			// 50 → 部分退款 20（钱包已借记 20）→ payment_failed 乱序到达，
+			// 再按 50 冲正等于向用户追 70。只计 paid 行：pending 退款尚未触
+			// 发钱包借记，其 webhook 到达时会被 payment_not_paid 守卫拦下。
+			// 已全额退款（差额 ≤ 0）则跳过冲正——全额退款的支付通常已是
+			// refunded 终态走不到这里，此分支作纵深防御；dedup 守卫仍钉
+			// payment id，语义不变。
+			var refundedSum float64
+			if err := tx.GetContext(ctx, &refundedSum,
+				`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status = 'paid'`, payment.ID); err != nil {
+				return fmt.Errorf("sum paid refunds for failed-payment debit: %w", err)
+			}
+			if debit := order.Amount - refundedSum; toCents(debit) > 0 {
+				if err := s.enqueueWalletFailedDebit(ctx, tx, &order, payment.ID, debit); err != nil {
+					return err
+				}
 			}
 		}
 	}

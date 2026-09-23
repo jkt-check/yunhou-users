@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -677,6 +678,33 @@ func TestRefundModel_DBFields(t *testing.T) {
 	v := reflect.ValueOf(r)
 	for i := 0; i < v.NumField(); i++ {
 		_ = v.Field(i).Interface()
+	}
+}
+
+// ============================================================================
+// deriveMerchantRefundNo — 评审轮2 N2 确定性派生
+// ============================================================================
+
+// 同一 Idempotency-Key 两次调用必得同一商户退款单号（渠道以商户单号为退
+// 款幂等键，崩溃重试窗口由渠道侧幂等兜底）；不同键派生不同单号；长度低
+// 于渠道 64 字符上限。
+func TestDeriveMerchantRefundNo_Deterministic(t *testing.T) {
+	t.Parallel()
+
+	const key = "user-req-deterministic-001"
+	first := deriveMerchantRefundNo(key)
+	second := deriveMerchantRefundNo(key)
+	if first != second {
+		t.Errorf("same key derived different numbers: %q vs %q", first, second)
+	}
+	if other := deriveMerchantRefundNo("user-req-deterministic-002"); other == first {
+		t.Errorf("different keys derived the same number: %q", first)
+	}
+	if len(first) > 64 {
+		t.Errorf("merchant refund no length = %d, want <= 64（渠道单号上限）", len(first))
+	}
+	if !strings.HasPrefix(first, "mrn_") {
+		t.Errorf("merchant refund no = %q, want mrn_ 前缀", first)
 	}
 }
 

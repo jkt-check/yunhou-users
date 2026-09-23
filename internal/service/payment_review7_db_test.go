@@ -8,6 +8,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
+	"github.com/yunhou/users/internal/inference/access"
 	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/inference/workers"
 	"github.com/yunhou/users/internal/repo"
@@ -413,5 +414,86 @@ func TestOnWebhook_RefundFailedEvent_UnknownPayment(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "unknown payment") {
 		t.Fatalf("err = %v, want unknown-payment error（返错让渠道重投）", err)
+	}
+}
+
+// TestPaymentFailed_AfterPaid_PartialRefund_DebitsOnlyDifference — 评审轮2
+// N3：充值 50 → 部分退款 20（钱包已借记 20）→ payment_failed 乱序到达，
+// 钱包只冲正差额 30；若仍按订单全额冲正，用户被追 70。
+func TestPaymentFailed_AfterPaid_PartialRefund_DebitsOnlyDifference(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	store := inferencepostgres.NewStore(db)
+	svc.SetBenefitRepo(repo.NewPlanBenefitRepo(db))
+	svc.SetBenefitSync(store)
+	ctx := context.Background()
+
+	seedTopupPlan(t, db, "topup-partial-fail", 50.00)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(ctx, uid, "topup-partial-fail", "stripe")
+	if err != nil {
+		t.Fatalf("create topup order: %v", err)
+	}
+	if _, err := svc.OnWebhook(ctx, stripePaidEvent(order.ID, "evt-n3-pay", "pi_n3_partial", 50.00)); err != nil {
+		t.Fatalf("paid webhook: %v", err)
+	}
+	paymentID := paymentIDOf(t, db, order.ID)
+
+	// 部分退款 20：支付保持 paid，钱包已借记 20。
+	if _, err := svc.OnWebhook(ctx, WebhookEvent{
+		Channel: "stripe", EventID: "evt-n3-refund", EventType: "charge.refunded",
+		TransactionID: "pi_n3_partial", OrderID: order.ID, Currency: "CNY",
+		RefundAmount: 20.00, ExternalRefundID: "re_n3_partial",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("partial refund webhook: %v", err)
+	}
+
+	// payment_failed 乱序到达：只冲正差额 30（50 − 已 paid 退款 20）。
+	if _, err := svc.OnWebhook(ctx, WebhookEvent{
+		Channel: "stripe", EventID: "evt-n3-fail", EventType: "payment_intent.payment_failed",
+		TransactionID: "pi_n3_partial", OrderID: order.ID, Amount: 50.00, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("payment_failed webhook: %v", err)
+	}
+
+	// outbox：topup + 部分退款 + 差额冲正 = 3 条。
+	if n := walletOutboxCount(t, db); n != 3 {
+		t.Fatalf("wallet.sync outbox = %d, want 3 (topup + 部分退款 + 差额冲正)", n)
+	}
+	// 冲正消息金额必须是差额 30（30_000_000 微），不是订单全额 50。
+	var payload []byte
+	if err := db.GetContext(ctx, &payload,
+		`SELECT payload FROM inference_outbox WHERE topic = 'wallet.sync' AND dedup_key = $1`, "wallet:failed:"+paymentID); err != nil {
+		t.Fatalf("failed-debit outbox row: %v", err)
+	}
+	var msg access.WalletSyncMessage
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		t.Fatalf("unmarshal failed-debit payload: %v", err)
+	}
+	if msg.AmountMicros != 30_000_000 {
+		t.Errorf("failed-debit amount = %d micros, want 30_000_000（差额 30，不得按全额 50 冲正）", msg.AmountMicros)
+	}
+
+	// worker 消费：50 入账 − 20 退款 − 30 差额冲正 = 0。
+	w := workers.NewWalletSync(store, nil, workers.EntitlementSyncConfig{})
+	stats, err := w.RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Credited != 1 || stats.Refunded != 2 {
+		t.Fatalf("worker stats = %+v, want 1 credited / 2 refunded", stats)
+	}
+	acct, err := store.GetBillingAccountByUser(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.WalletBalance(ctx, acct.ID, "CNY", order.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Balance.CashAvailable != 0 {
+		t.Fatalf("cash = %d, want 0（50 − 20 退款 − 30 差额冲正）", view.Balance.CashAvailable)
 	}
 }

@@ -99,7 +99,9 @@ func toModelDTO(m *domain.Model) modelDTO {
 }
 
 // modelWriteRequest is the create/update body. ID is only used on create;
-// UpdatedAt is the optimistic-lock token (required on update).
+// UpdatedAt is the optimistic-lock token (required on update). Reason 是
+// 可选的运营理由，透传到审计事件（评审轮2 finding6：此前 httpapi 层从未
+// 接线，CatalogManager 的 reason 参数位一直空转）。
 type modelWriteRequest struct {
 	ID                string     `json:"id"`
 	DisplayName       string     `json:"display_name"`
@@ -114,6 +116,7 @@ type modelWriteRequest struct {
 	SupportsTools     bool       `json:"supports_tools"`
 	SupportsReasoning bool       `json:"supports_reasoning"`
 	UpdatedAt         *time.Time `json:"updated_at"`
+	Reason            string     `json:"reason"`
 }
 
 func (r *modelWriteRequest) toDomain(id string) *domain.Model {
@@ -152,6 +155,7 @@ type providerWriteRequest struct {
 	AccessType  domain.AccessType `json:"access_type"`
 	Status      string            `json:"status"`
 	UpdatedAt   *time.Time        `json:"updated_at"`
+	Reason      string            `json:"reason"` // 可选运营理由 → 审计
 }
 
 type deploymentDTO struct {
@@ -194,6 +198,7 @@ type deploymentWriteRequest struct {
 	Config           json.RawMessage `json:"config"`
 	Status           string          `json:"status"`
 	ConfigVersion    int             `json:"config_version"`
+	Reason           string          `json:"reason"` // 可选运营理由 → 审计
 }
 
 func (r *deploymentWriteRequest) toDomain(id string) *domain.Deployment {
@@ -241,6 +246,7 @@ type routeWriteRequest struct {
 	PoolStrategy string     `json:"pool_strategy"`
 	Enabled      bool       `json:"enabled"`
 	UpdatedAt    *time.Time `json:"updated_at"`
+	Reason       string     `json:"reason"` // 可选运营理由 → 审计
 }
 
 type revisionDTO struct {
@@ -318,6 +324,11 @@ func actorOf(c *gin.Context) string {
 	}
 	return "user:unauthenticated@app:unknown"
 }
+
+// reasonOf 取无请求体写端点（DELETE 系、catalog/publish）的可选运营理由
+// （?reason=）。有请求体的端点从各自 DTO 的 reason 字段取。未传为空串——
+// CatalogManager.firstReason 对空串与未传等价（现状兼容，评审轮2 finding6）。
+func reasonOf(c *gin.Context) string { return c.Query("reason") }
 
 // adminListMaxLimit 是所有管理列表端点 ?limit= 的硬上限（评审轮1 m3：
 // 无上限的 limit=999999999 一次调用即可触发无界扫描）。超限按上限处理
@@ -446,7 +457,7 @@ func (h *AdminModelsHandler) CreateModel(c *gin.Context) {
 		return
 	}
 	m := req.toDomain(req.ID)
-	if err := h.mgr.CreateModel(c.Request.Context(), actorOf(c), m); err != nil {
+	if err := h.mgr.CreateModel(c.Request.Context(), actorOf(c), m, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -461,23 +472,24 @@ func (h *AdminModelsHandler) UpdateModel(c *gin.Context) {
 		return
 	}
 	m := req.toDomain(c.Param("id"))
-	if err := h.mgr.UpdateModel(c.Request.Context(), actorOf(c), m); err != nil {
+	if err := h.mgr.UpdateModel(c.Request.Context(), actorOf(c), m, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, toModelDTO(m))
 }
 
-// SetModelLifecycle POST /models/:id/lifecycle {"lifecycle":"active"}
+// SetModelLifecycle POST /models/:id/lifecycle {"lifecycle":"active","reason":"…"}
 func (h *AdminModelsHandler) SetModelLifecycle(c *gin.Context) {
 	var req struct {
 		Lifecycle domain.Lifecycle `json:"lifecycle" binding:"required"`
+		Reason    string           `json:"reason"` // 可选运营理由 → 审计
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
 		return
 	}
-	if err := h.mgr.SetModelLifecycle(c.Request.Context(), actorOf(c), c.Param("id"), req.Lifecycle); err != nil {
+	if err := h.mgr.SetModelLifecycle(c.Request.Context(), actorOf(c), c.Param("id"), req.Lifecycle, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -489,9 +501,9 @@ func (h *AdminModelsHandler) SetModelLifecycle(c *gin.Context) {
 	ok(c, toModelDTO(m))
 }
 
-// DeleteModel DELETE /models/:id
+// DeleteModel DELETE /models/:id（可选 ?reason= 运营理由 → 审计）
 func (h *AdminModelsHandler) DeleteModel(c *gin.Context) {
-	if err := h.mgr.DeleteModel(c.Request.Context(), actorOf(c), c.Param("id")); err != nil {
+	if err := h.mgr.DeleteModel(c.Request.Context(), actorOf(c), c.Param("id"), reasonOf(c)); err != nil {
 		fail(c, err)
 		return
 	}
@@ -509,7 +521,7 @@ func (h *AdminModelsHandler) CreateProvider(c *gin.Context) {
 		Code: req.Code, DisplayName: req.DisplayName,
 		AccessType: req.AccessType, Status: req.Status,
 	}
-	if err := h.mgr.CreateProvider(c.Request.Context(), actorOf(c), p); err != nil {
+	if err := h.mgr.CreateProvider(c.Request.Context(), actorOf(c), p, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -534,7 +546,7 @@ func (h *AdminModelsHandler) UpdateProvider(c *gin.Context) {
 	if req.UpdatedAt != nil {
 		p.UpdatedAt = *req.UpdatedAt
 	}
-	if err := h.mgr.UpdateProvider(c.Request.Context(), actorOf(c), p); err != nil {
+	if err := h.mgr.UpdateProvider(c.Request.Context(), actorOf(c), p, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -545,9 +557,9 @@ func (h *AdminModelsHandler) UpdateProvider(c *gin.Context) {
 	})
 }
 
-// DeleteProvider DELETE /providers/:id
+// DeleteProvider DELETE /providers/:id（可选 ?reason= 运营理由 → 审计）
 func (h *AdminModelsHandler) DeleteProvider(c *gin.Context) {
-	if err := h.mgr.DeleteProvider(c.Request.Context(), actorOf(c), c.Param("id")); err != nil {
+	if err := h.mgr.DeleteProvider(c.Request.Context(), actorOf(c), c.Param("id"), reasonOf(c)); err != nil {
 		fail(c, err)
 		return
 	}
@@ -562,7 +574,7 @@ func (h *AdminModelsHandler) CreateDeployment(c *gin.Context) {
 		return
 	}
 	d := req.toDomain("")
-	if err := h.mgr.CreateDeployment(c.Request.Context(), actorOf(c), d); err != nil {
+	if err := h.mgr.CreateDeployment(c.Request.Context(), actorOf(c), d, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -577,16 +589,16 @@ func (h *AdminModelsHandler) UpdateDeployment(c *gin.Context) {
 		return
 	}
 	d := req.toDomain(c.Param("id"))
-	if err := h.mgr.UpdateDeployment(c.Request.Context(), actorOf(c), d); err != nil {
+	if err := h.mgr.UpdateDeployment(c.Request.Context(), actorOf(c), d, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, toDeploymentDTO(d))
 }
 
-// DeleteDeployment DELETE /deployments/:id
+// DeleteDeployment DELETE /deployments/:id（可选 ?reason= 运营理由 → 审计）
 func (h *AdminModelsHandler) DeleteDeployment(c *gin.Context) {
-	if err := h.mgr.DeleteDeployment(c.Request.Context(), actorOf(c), c.Param("id")); err != nil {
+	if err := h.mgr.DeleteDeployment(c.Request.Context(), actorOf(c), c.Param("id"), reasonOf(c)); err != nil {
 		fail(c, err)
 		return
 	}
@@ -608,7 +620,7 @@ func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 	if req.PoolStrategy != "" {
 		r.PoolStrategy = domain.PoolStrategy(req.PoolStrategy)
 	}
-	if err := h.mgr.CreateRoute(c.Request.Context(), actorOf(c), r); err != nil {
+	if err := h.mgr.CreateRoute(c.Request.Context(), actorOf(c), r, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -637,25 +649,25 @@ func (h *AdminModelsHandler) UpdateRoute(c *gin.Context) {
 	if req.UpdatedAt != nil {
 		r.UpdatedAt = *req.UpdatedAt
 	}
-	if err := h.mgr.UpdateRoute(c.Request.Context(), actorOf(c), r); err != nil {
+	if err := h.mgr.UpdateRoute(c.Request.Context(), actorOf(c), r, req.Reason); err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, toRouteDTO(r))
 }
 
-// DeleteRoute DELETE /routes/:route_id
+// DeleteRoute DELETE /routes/:route_id（可选 ?reason= 运营理由 → 审计）
 func (h *AdminModelsHandler) DeleteRoute(c *gin.Context) {
-	if err := h.mgr.DeleteRoute(c.Request.Context(), actorOf(c), c.Param("route_id")); err != nil {
+	if err := h.mgr.DeleteRoute(c.Request.Context(), actorOf(c), c.Param("route_id"), reasonOf(c)); err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, gin.H{"deleted": c.Param("route_id")})
 }
 
-// Publish POST /catalog/publish
+// Publish POST /catalog/publish（可选 ?reason= 运营理由 → 审计）
 func (h *AdminModelsHandler) Publish(c *gin.Context) {
-	rev, err := h.mgr.Publish(c.Request.Context(), actorOf(c))
+	rev, err := h.mgr.Publish(c.Request.Context(), actorOf(c), reasonOf(c))
 	if err != nil {
 		fail(c, err)
 		return
@@ -663,16 +675,17 @@ func (h *AdminModelsHandler) Publish(c *gin.Context) {
 	ok(c, gin.H{"revision": rev})
 }
 
-// Rollback POST /catalog/rollback {"to_revision":N}
+// Rollback POST /catalog/rollback {"to_revision":N,"reason":"…"}
 func (h *AdminModelsHandler) Rollback(c *gin.Context) {
 	var req struct {
-		ToRevision int `json:"to_revision" binding:"required"`
+		ToRevision int    `json:"to_revision" binding:"required"`
+		Reason     string `json:"reason"` // 可选运营理由 → 审计
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
 		return
 	}
-	rev, err := h.mgr.Rollback(c.Request.Context(), actorOf(c), req.ToRevision)
+	rev, err := h.mgr.Rollback(c.Request.Context(), actorOf(c), req.ToRevision, req.Reason)
 	if err != nil {
 		fail(c, err)
 		return

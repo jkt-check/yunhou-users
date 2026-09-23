@@ -163,3 +163,67 @@ func TestOpenAPI_WalletSchemasUseEnvelope(t *testing.T) {
 		t.Error("SignedDecimalInt64 must be declared with signed pattern ^-?[0-9]+$")
 	}
 }
+
+// TestOpenAPI_V1PathsDocument413 pins 评审轮2 C-I2：三个 v1 协议面都必须
+// 声明 413 响应——实现 chat_completions.go / messages.go / responses.go 在
+// MaxBytesReader 超限时返回 413（评审轮1 m7），文档缺列会与实现矛盾。
+// chat/responses 用 V1Error（code=request_too_large），messages 用
+// AnthropicError 原生形状。
+func TestOpenAPI_V1PathsDocument413(t *testing.T) {
+	doc := readOpenAPI(t)
+	for _, tc := range []struct {
+		path, errSchema string
+	}{
+		{"/v1/chat/completions:", "V1Error"},
+		{"/v1/responses:", "V1Error"},
+		{"/v1/messages:", "AnthropicError"},
+	} {
+		i := strings.Index(doc, tc.path)
+		if i < 0 {
+			t.Errorf("openapi missing path %s", tc.path)
+			continue
+		}
+		// 截取该 path 段（到下一个 path 声明或 components 为止）。
+		seg := doc[i:]
+		for _, end := range []string{"\n  /", "\ncomponents:"} {
+			if j := strings.Index(seg[len(tc.path):], end); j >= 0 {
+				seg = seg[:len(tc.path)+j]
+			}
+		}
+		k := strings.Index(seg, `"413":`)
+		if k < 0 {
+			t.Errorf("%s missing 413 response (实现返回 413 request_too_large)", tc.path)
+			continue
+		}
+		block := seg[k:]
+		if !strings.Contains(block, "MaxBytesReader") {
+			t.Errorf("%s 413 description must mention MaxBytesReader 上限", tc.path)
+		}
+		if !strings.Contains(block, `"#/components/schemas/`+tc.errSchema+`"`) {
+			t.Errorf("%s 413 must use %s error shape", tc.path, tc.errSchema)
+		}
+	}
+	// request_too_large 错误码在 chat/responses 面的 413 描述中出现。
+	if n := strings.Count(doc, "request_too_large"); n < 2 {
+		t.Errorf("request_too_large mentions = %d, want ≥2 (chat + responses 413)", n)
+	}
+}
+
+// TestOpenAPI_ChatCompletionsDocumentsReasoningContent pins 评审轮2 C-M3：
+// 网关显式支持并透传 assistant 消息的 reasoning_content（DeepSeek
+// tool-call 回合必需，见 parseChatCompletions），messages item schema 必须
+// 列出该字段。
+func TestOpenAPI_ChatCompletionsDocumentsReasoningContent(t *testing.T) {
+	doc := readOpenAPI(t)
+	i := strings.Index(doc, "    ChatCompletionsRequest:")
+	if i < 0 {
+		t.Fatal("openapi missing ChatCompletionsRequest schema")
+	}
+	seg := doc[i:]
+	if j := strings.Index(seg, "\n    ChatCompletionsResponse:"); j >= 0 {
+		seg = seg[:j]
+	}
+	if !strings.Contains(seg, "reasoning_content") {
+		t.Error("ChatCompletionsRequest messages item must document reasoning_content")
+	}
+}

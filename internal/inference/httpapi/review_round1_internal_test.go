@@ -212,13 +212,17 @@ func TestKayaModels_InternalErrorIs500NotEmptyList(t *testing.T) {
 		return w
 	}
 
-	// DB 故障 → 500，不得渲染成「用户无模型」。
-	if w := call(errors.New("db connection reset")); w.Code != http.StatusInternalServerError {
-		t.Fatalf("db failure = %d, want 500: %s", w.Code, w.Body.String())
+	// DB 故障 → 500，不得渲染成「用户无模型」；走包内 fail() 口径，
+	// 响应带全局 envelope 的 "data":null 键（评审轮2 C-M2）。
+	if w := call(errors.New("db connection reset")); w.Code != http.StatusInternalServerError ||
+		!strings.Contains(w.Body.String(), `"data":null`) {
+		t.Fatalf("db failure = %d, want 500 + data:null envelope: %s", w.Code, w.Body.String())
 	}
-	// 账户停用（invalid_key）同样不得伪装成空列表。
-	if w := call(domain.NewError(domain.CodeInvalidKey, "billing account is not active")); w.Code != http.StatusInternalServerError {
-		t.Fatalf("suspended account = %d, want 500: %s", w.Code, w.Body.String())
+	// 账户停用（invalid_key）同样不得伪装成空列表；fail() 口径映射为 401
+	// （评审轮2 C-M2，此前手搓成 500）。
+	if w := call(domain.NewError(domain.CodeInvalidKey, "billing account is not active")); w.Code != http.StatusUnauthorized ||
+		!strings.Contains(w.Body.String(), `"code":401`) || !strings.Contains(w.Body.String(), `"data":null`) {
+		t.Fatalf("suspended account = %d, want 401 + data:null envelope: %s", w.Code, w.Body.String())
 	}
 	// 无计费账户（NotFound）→ 合法的 200 空列表。
 	w := call(domain.NewError(domain.CodeNotFound, "no billing account"))
@@ -350,7 +354,8 @@ func TestAdminAdjustments_ReplayValidatesPayload(t *testing.T) {
 		applyErr: domain.NewError(domain.CodeConflict, "duplicate idempotency key"),
 		stored: &postgres.Adjustment{
 			ID: "adj-1", BillingAccountID: "acct-1", AmountMicros: 100,
-			Direction: "credit", Currency: "CNY", CreatedAt: time.Now(),
+			Direction: "credit", Currency: "CNY", Source: "bonus",
+			CreatedAt: time.Now(),
 		},
 	}
 	engine := gin.New()
@@ -388,5 +393,48 @@ func TestAdminAdjustments_ReplayValidatesPayload(t *testing.T) {
 	w = call(base)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("account mismatch = %d, want 409: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- 轮2 C-I1：重放比对纳入 source（cash|bonus 决定资金路由） ----------------
+
+func TestAdminAdjustments_ReplayValidatesSource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	acct := &domain.BillingAccount{ID: "acct-1", UserID: "u1", Status: "active"}
+	store := &stubAdminWalletStore{
+		acct:     acct,
+		uow:      &stubAdjUow{},
+		applyErr: domain.NewError(domain.CodeConflict, "duplicate idempotency key"),
+		stored: &postgres.Adjustment{
+			ID: "adj-1", BillingAccountID: "acct-1", AmountMicros: 100,
+			Direction: "credit", Currency: "CNY", Source: "cash",
+			CreatedAt: time.Now(),
+		},
+	}
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		setOperatorContext(c, "op-1", "app-1", []string{"admin"})
+		c.Next()
+	})
+	NewAdminAdjustmentsHandler(store, nil, nil, nil).Register(engine.Group("/admin"))
+
+	call := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/admin/wallet/adjustments", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		return w
+	}
+	base := `{"billing_account_id":"acct-1","currency":"CNY","source":"cash","direction":"credit","amount_micros":"100","reason":"r","idempotency_key":"k1"}`
+
+	// 同键同 source（其余载荷一致）→ 200 applied=false（良性重放）。
+	w := call(base)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"applied":false`) {
+		t.Fatalf("same-source replay = %d, want 200 applied=false: %s", w.Code, w.Body.String())
+	}
+	// 同键异 source（cash 落库后以 bonus 重发）→ 409：bonus 不得伪装
+	// 已生效（资金路由不同，不是同一笔调整）。
+	w = call(strings.Replace(base, `"source":"cash"`, `"source":"bonus"`, 1))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("source mismatch = %d, want 409: %s", w.Code, w.Body.String())
 	}
 }

@@ -803,6 +803,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AnthropicError"
+        "413":
+          description: invalid_request_error（请求体超 MaxBytesReader 上限,原生形状）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
         "429":
           description: rate_limit_error（额度耗尽;可计算恢复时刻时带 Retry-After）
           headers:
@@ -892,6 +898,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/V1Error"
+        "413":
+          description: request_too_large（请求体超 MaxBytesReader 上限）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
         "429":
           description: quota_exceeded（可计算恢复时刻时带 Retry-After）
           headers:
@@ -920,7 +932,8 @@ paths:
 
         **支持的请求子集**：`model`（必填，≤128 字符）、`messages`
         （system/user/assistant/tool，纯字符串 content；assistant 可带
-        `tool_calls`、tool 消息必须带 `tool_call_id`，ID 逐字保留）、
+        `tool_calls` 与 `reasoning_content`（思考链逐字透传，DeepSeek
+        tool-call 回合必需）、tool 消息必须带 `tool_call_id`，ID 逐字保留）、
         `stream`、`max_tokens`/`max_completion_tokens`、`tools`（仅
         function 定义，≤128 个/合计 ≤256 KiB）、`tool_choice`、
         `stream_options`、`thinking_enabled`/`thinking`
@@ -970,6 +983,12 @@ paths:
                 $ref: "#/components/schemas/V1Error"
         "404":
           description: model_not_found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "413":
+          description: request_too_large（请求体超 MaxBytesReader 上限）
           content:
             application/json:
               schema:
@@ -1802,6 +1821,9 @@ components:
                 type: array
                 items: { type: object }
                 description: assistant 工具调用；call id 逐字保留
+              reasoning_content:
+                type: string
+                description: assistant 轮的思考链（DeepSeek tool-call 回合必需）；显式支持并逐字透传上游，不丢弃
               tool_call_id:
                 type: string
                 description: role=tool 时必填（对应 assistant 的 tool_call id）

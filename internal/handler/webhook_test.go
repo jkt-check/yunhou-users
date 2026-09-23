@@ -462,6 +462,98 @@ func TestWebhookHandler_WeChat_RefundSuccess(t *testing.T) {
 // path here. Full roundtrip is covered by middleware tests + e2e.
 // ============================================================================
 
+// 评审轮2 N1：REFUND.ABNORMAL / REFUND.CLOSED（渠道终态退款失败）与成功
+// 类退款事件一样从 resource.out_refund_no 解析退款业务键——此前解析层只
+// 覆盖成功类，失败事件到服务层 extID=="" 只能审计+ack，失败退款卡
+// pending。加密信封形态逐事件类型断言。
+func TestWebhookHandler_WeChat_RefundFailedEvent_DerivesExternalRefundID(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("01234567890123456789012345678901")
+	nonce := []byte("0123456789ab")
+	associatedData := "refund-id"
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	innerJSON := []byte(`{
+		"transaction_id":"4200001234567890",
+		"out_trade_no":"order-uuid-wx-3",
+		"out_refund_no":"wx-r-fail-7",
+		"amount":{"total":9990,"refund":9990}
+	}`)
+	ciphertextB64 := base64.StdEncoding.EncodeToString(gcm.Seal(nil, nonce, innerJSON, []byte(associatedData)))
+
+	for _, eventType := range []string{"REFUND.ABNORMAL", "REFUND.CLOSED"} {
+		t.Run(eventType, func(t *testing.T) {
+			outer := []byte(`{
+				"id":"WH-WX-REF-F1",
+				"event_type":"` + eventType + `",
+				"resource":{"ciphertext":"` + ciphertextB64 + `","nonce":"` + string(nonce) + `","associated_data":"` + associatedData + `"}
+			}`)
+			svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "refund_failed"}}
+			engine := webhookTestEngine(svc)
+			rec := postRaw(engine, "/webhooks/payment/wechat_pay", outer)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+			}
+			if svc.gotEvent.EventType != eventType {
+				t.Errorf("event_type: got %q, want %q", svc.gotEvent.EventType, eventType)
+			}
+			if svc.gotEvent.ExternalRefundID != "wx-r-fail-7" {
+				t.Errorf("external_refund_id: got %q, want wx-r-fail-7 (out_refund_no)", svc.gotEvent.ExternalRefundID)
+			}
+			if svc.gotEvent.RefundAmount != 99.90 {
+				t.Errorf("refund_amount: got %v, want 99.90", svc.gotEvent.RefundAmount)
+			}
+		})
+	}
+}
+
+// 评审轮2 N1（mock 形态）：mock 明文报文的失败退款事件同样解析退款业务
+// 键；out_refund_no 缺失时回退 "wechat-"+事件 id（唯一键不落空串）。
+func TestParseWeChatMock_RefundFailedEvent_DerivesExternalRefundID(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{}
+	h := NewWebhookHandler(svc, nil, nil, true)
+
+	for _, eventType := range []string{"REFUND.ABNORMAL", "REFUND.CLOSED"} {
+		t.Run(eventType, func(t *testing.T) {
+			body := []byte(`{
+				"id":"WH-WX-MOCK-F1",
+				"event_type":"` + eventType + `",
+				"resource":{"transaction_id":"wx-txn-1","out_trade_no":"order-1","out_refund_no":"wx-r-mock-9","amount":{"total":1990,"refund":1990}}
+			}`)
+			we, err := h.parseWeChat(body)
+			if err != nil {
+				t.Fatalf("parseWeChat: %v", err)
+			}
+			if we.ExternalRefundID != "wx-r-mock-9" {
+				t.Errorf("external_refund_id: got %q, want wx-r-mock-9 (out_refund_no)", we.ExternalRefundID)
+			}
+
+			// out_refund_no 缺失 → 回退事件 id。
+			bodyNoRefundNo := []byte(`{
+				"id":"WH-WX-MOCK-F2",
+				"event_type":"` + eventType + `",
+				"resource":{"transaction_id":"wx-txn-1","out_trade_no":"order-1","amount":{"total":1990,"refund":1990}}
+			}`)
+			we2, err := h.parseWeChat(bodyNoRefundNo)
+			if err != nil {
+				t.Fatalf("parseWeChat (no out_refund_no): %v", err)
+			}
+			if we2.ExternalRefundID != "wechat-WH-WX-MOCK-F2" {
+				t.Errorf("external_refund_id fallback: got %q, want wechat-WH-WX-MOCK-F2", we2.ExternalRefundID)
+			}
+		})
+	}
+}
+
 func TestWebhookHandler_WeChat_BadResourceJSON(t *testing.T) {
 	t.Parallel()
 

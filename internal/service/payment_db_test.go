@@ -1427,6 +1427,69 @@ func TestPaymentService_Refund_ChannelFailed(t *testing.T) {
 	}
 }
 
+// TestPaymentService_Refund_MerchantRefundNoDeterministic — 评审轮2 N2+M1：
+// 商户退款单号从 Idempotency-Key 确定性派生——同一键（换用户绕开 (user,
+// key) 幂等闸）两次退款必得同一商户单号，渠道以其为退款幂等键兜底崩溃重
+// 试窗口的双退款；渠道回显的非空不同值不再覆盖已发送单号（M1），
+// refunds.external_refund_id 永远以已发送单号为对账键入库。
+func TestPaymentService_Refund_MerchantRefundNoDeterministic(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	ctx := context.Background()
+	const idemKey = "shared-idem-key-n2"
+
+	// 两个用户各自下单支付，用同一幂等键退款（幂等闸按 (user,key) 作用
+	// 域，不同用户都会真正调用渠道）——同键必得同一商户单号。
+	merchantNos := make([]string, 0, 2)
+	for i, txn := range []string{"pi-n2-a", "pi-n2-b"} {
+		uid := seedUser(t, db)
+		order, _ := svc.CreateOrder(ctx, uid, "monthly", "stripe")
+		res, err := svc.Confirm(ctx, ConfirmInput{OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txn})
+		if err != nil {
+			t.Fatalf("confirm %d: %v", i, err)
+		}
+		r, err := svc.Refund(ctx, RefundInput{
+			PaymentID: res.PaymentID, UserID: uid, IdempotencyKey: idemKey, Amount: 1,
+		})
+		if err != nil {
+			t.Fatalf("refund %d: %v", i, err)
+		}
+		if r.Refund.ExternalRefundID == nil || *r.Refund.ExternalRefundID == "" {
+			t.Fatalf("refund %d: external_refund_id empty", i)
+		}
+		merchantNos = append(merchantNos, *r.Refund.ExternalRefundID)
+	}
+	want := deriveMerchantRefundNo(idemKey)
+	if merchantNos[0] != merchantNos[1] || merchantNos[0] != want {
+		t.Errorf("merchant refund nos = %q / %q, want both = deriveMerchantRefundNo(key) = %q",
+			merchantNos[0], merchantNos[1], want)
+	}
+
+	// M1：渠道回显非空不同值 → 仍按已发送单号入库，回显仅记日志。
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(ctx, uid, "monthly", "stripe")
+	res, err := svc.Confirm(ctx, ConfirmInput{OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-n2-echo"})
+	if err != nil {
+		t.Fatalf("confirm echo: %v", err)
+	}
+	stub := svc.refundAPI.(*stubRefundAPI)
+	stub.returnID = "re_echo_different"
+	defer func() { stub.returnID = "" }()
+	r, err := svc.Refund(ctx, RefundInput{
+		PaymentID: res.PaymentID, UserID: uid, IdempotencyKey: "echo-key-m1", Amount: 1,
+	})
+	if err != nil {
+		t.Fatalf("refund echo: %v", err)
+	}
+	wantSent := deriveMerchantRefundNo("echo-key-m1")
+	if stub.gotMerchantNo != wantSent {
+		t.Errorf("sent merchant no = %q, want %q", stub.gotMerchantNo, wantSent)
+	}
+	if r.Refund.ExternalRefundID == nil || *r.Refund.ExternalRefundID != wantSent {
+		t.Errorf("external_refund_id = %v, want sent no %q（回显不得覆盖对账键）", r.Refund.ExternalRefundID, wantSent)
+	}
+}
+
 // ============================================================================
 // Reads
 // ============================================================================

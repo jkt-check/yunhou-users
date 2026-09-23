@@ -108,9 +108,10 @@ func (b *SessionBinder) Resolve(ctx context.Context, sessionKey, modelID string)
 			// 并发终止竞争(rows=0):触碰时绑定已被结束,按不可调度处理。
 			return binding, account, domain.WrapError(domain.CodeConflict, "binding ended concurrently", err)
 		}
-		// 瞬时存储错误(连接重置/超时/池耗尽)原样透传 —— gateway 按非迁
-		// 移的 retryable 失败处理;包成 CodeConflict 会被当成「绑定失效」
-		// 触发 Migrate 换号,健康会话被错误迁移(绝不切号)。
+		// 瞬时存储错误(连接重置/超时/池耗尽)原样透传 —— 上层经
+		// domain.CodeOf 兜底映射为 CodeInternal(500) 普通失败,不触发迁
+		// 移;包成 CodeConflict 会被当成「绑定失效」触发 Migrate 换号,
+		// 健康会话被错误迁移(绝不切号)。
 		return nil, nil, err
 	}
 	return binding, account, nil

@@ -352,6 +352,9 @@ func (s *Store) AppendAdjustment(ctx context.Context, w domain.UnitOfWork, adj A
 }
 
 // Adjustment is the operator compensation shape (骨架; Task 15 扩展).
+// Source 是钱包调整（unit='micromoney'）的资金路由来源（cash|bonus，
+// migration 036 起持久化）；额度调整（unit='microcredit'）无现金/赠送
+// 概念，Source 为空。
 type Adjustment struct {
 	ID               string
 	BillingAccountID string
@@ -361,6 +364,7 @@ type Adjustment struct {
 	Direction        string // credit | debit
 	Unit             string // microcredit | micromoney
 	Currency         string
+	Source           string // cash | bonus（仅 micromoney 调整；036 回填自配对钱包分录）
 	OperatorSubject  string
 	ServiceSubject   string
 	IdempotencyKey   string

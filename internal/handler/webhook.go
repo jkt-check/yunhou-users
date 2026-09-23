@@ -246,9 +246,12 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 	if resource.Amount.Refund > 0 {
 		we.RefundAmount = float64(resource.Amount.Refund) / 100
 	}
-	// 退款业务键（评审轮4 顺手对齐）：out_refund_no 是商户退款单号，缺失
-	// 时回退事件 id——refunds.(channel,external_refund_id) 唯一键不得落空串。
-	if evt.EventType == "REFUND.SUCCESS" || evt.EventType == "TRANSACTION.REFUND" {
+	// 退款业务键（评审轮4 顺手对齐；评审轮2 N1 扩到终态失败事件）：微信 v3
+	// 四类退款通知的 resource 均携 out_refund_no 商户退款单号——此前只给成
+	// 功类事件填键，REFUND.ABNORMAL/CLOSED 到服务层 extID=="" 只能审计+ack
+	// （渠道不再重投），失败退款永远卡 pending。out_refund_no 缺失时回退事
+	// 件 id——refunds.(channel,external_refund_id) 唯一键不得落空串。
+	if isWeChatRefundEvent(evt.EventType) {
 		if resource.OutRefundNo != "" {
 			we.ExternalRefundID = resource.OutRefundNo
 		} else {
@@ -256,6 +259,18 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 		}
 	}
 	return we, nil
+}
+
+// isWeChatRefundEvent 覆盖微信 v3 全部退款事件类型（评审轮2 N1）：
+// REFUND.SUCCESS / TRANSACTION.REFUND（成功类，TRANSACTION.REFUND 为既有
+// mock 契约）与 REFUND.ABNORMAL / REFUND.CLOSED（渠道终态失败）。四者的
+// 退款通知 resource 都携带 out_refund_no。
+func isWeChatRefundEvent(eventType string) bool {
+	switch eventType {
+	case "REFUND.SUCCESS", "TRANSACTION.REFUND", "REFUND.ABNORMAL", "REFUND.CLOSED":
+		return true
+	}
+	return false
 }
 
 // parseWeChatMock accepts a plaintext JSON body that mirrors the
@@ -304,7 +319,7 @@ func (h *WebhookHandler) parseWeChatMock(raw []byte) (*service.WebhookEvent, err
 	if evt.Resource.Amount.Refund > 0 {
 		we.RefundAmount = float64(evt.Resource.Amount.Refund) / 100
 	}
-	if evt.EventType == "REFUND.SUCCESS" || evt.EventType == "TRANSACTION.REFUND" {
+	if isWeChatRefundEvent(evt.EventType) {
 		if evt.Resource.OutRefundNo != "" {
 			we.ExternalRefundID = evt.Resource.OutRefundNo
 		} else {

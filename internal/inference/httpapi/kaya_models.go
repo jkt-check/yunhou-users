@@ -56,14 +56,16 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 			return
 		}
 		// 其余错误（DB 故障、账户停用等）必须响亮报错（评审轮1 m5）：
-		// 渲染成成功空列表会把故障伪装成「用户无模型」。
+		// 渲染成成功空列表会把故障伪装成「用户无模型」。统一走包内 fail()
+		// 口径（评审轮2 C-M2）：CodeInvalidKey（账户停用）→ 401、其余→500，
+		// 响应带全局 envelope 的 "data":null 键，形状与 /admin、/user 面一致。
 		log.Printf("chat/models: resolve user session: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
+		fail(c, err)
 		return
 	}
 	allowed, err := h.Resolver.AuthorizedModelIDs(c.Request.Context(), p, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
+		fail(c, err)
 		return
 	}
 	allowSet := make(map[string]bool, len(allowed))
@@ -73,12 +75,12 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 	models, err := h.Catalog.ListPublishedModels(c.Request.Context(),
 		func(_ context.Context, modelID string) (bool, error) { return allowSet[modelID], nil })
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
+		fail(c, err)
 		return
 	}
 	snap, err := h.Catalog.LoadSnapshot(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
+		fail(c, err)
 		return
 	}
 	out := make([]kayaModelEntry, 0, len(models))

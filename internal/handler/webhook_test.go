@@ -238,11 +238,15 @@ func TestWebhookHandler_Alipay_Success(t *testing.T) {
 	}
 	engine := webhookTestEngine(svc)
 
-	body := []byte("out_trade_no=order-uuid-1&trade_no=2023110&total_amount=29.90&notify_id=n_1&notify_type=trade_status_sync&sign=xx")
+	// 真实形态（评审轮4）：notify_type=trade_status_sync + trade_status 驱动判别。
+	body := []byte("out_trade_no=order-uuid-1&trade_no=2023110&total_amount=29.90&notify_id=n_1&notify_type=trade_status_sync&trade_status=TRADE_SUCCESS&gmt_payment=2026-09-12+20:00:00&sign=xx")
 	rec := postRaw(engine, "/webhooks/payment/alipay", body)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotEvent.EventType != "TRADE_SUCCESS" {
+		t.Errorf("event_type: got %q, want TRADE_SUCCESS (trade_status 驱动)", svc.gotEvent.EventType)
 	}
 	if svc.gotEvent.OrderID != "order-uuid-1" {
 		t.Errorf("order_id: got %q", svc.gotEvent.OrderID)
@@ -252,6 +256,89 @@ func TestWebhookHandler_Alipay_Success(t *testing.T) {
 	}
 	if svc.gotEvent.Amount != 29.90 {
 		t.Errorf("amount: got %v", svc.gotEvent.Amount)
+	}
+}
+
+// 评审轮4 Critical-1 回归：真实未支付超时关单（trade_status_sync +
+// TRADE_CLOSED + total_amount=订单全额、无 refund_fee）必须判别为
+// trade_closed（关单/退款路径），绝不得当支付成功分发——否则未付订单
+// 被结算为已支付（权益/钱包白送）。
+func TestWebhookHandler_Alipay_RealForm_UnpaidCloseNotPaid(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{}}
+	engine := webhookTestEngine(svc)
+	body := []byte("out_trade_no=order-unpaid&trade_no=2023111&total_amount=29.90&notify_id=n_close&notify_type=trade_status_sync&trade_status=TRADE_CLOSED&gmt_close=2026-09-12+21:00:00&sign=xx")
+	rec := postRaw(engine, "/webhooks/payment/alipay", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if svc.gotEvent.EventType != "trade_closed" {
+		t.Errorf("event_type: got %q, want trade_closed (绝不得进支付成功分支)", svc.gotEvent.EventType)
+	}
+	if svc.gotEvent.RefundAmount != 0 {
+		t.Errorf("refund_amount: got %v, want 0 (未支付关单不携 refund_fee)", svc.gotEvent.RefundAmount)
+	}
+}
+
+// 评审轮4 真实形态部分退款：TRADE_SUCCESS + refund_fee（累计）→ 分发到
+// 退款分支（trade_refund），业务键取 out_biz_no。
+func TestWebhookHandler_Alipay_RealForm_PartialRefund(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "refund_paid"}}
+	engine := webhookTestEngine(svc)
+	body := []byte("out_trade_no=order-p&trade_no=2023112&total_amount=29.90&refund_fee=10.00&gmt_refund=2026-09-12+21:30:00&out_biz_no=biz-123&notify_id=n_part&notify_type=trade_status_sync&trade_status=TRADE_SUCCESS&sign=xx")
+	rec := postRaw(engine, "/webhooks/payment/alipay", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if svc.gotEvent.EventType != "trade_refund" {
+		t.Errorf("event_type: got %q, want trade_refund (TRADE_SUCCESS+refund_fee 进退款分支)", svc.gotEvent.EventType)
+	}
+	if svc.gotEvent.RefundAmount != 10.00 {
+		t.Errorf("refund_amount: got %v, want 10.00 (refund_fee 累计值)", svc.gotEvent.RefundAmount)
+	}
+	if svc.gotEvent.ExternalRefundID != "alipay-biz-123" {
+		t.Errorf("external_refund_id: got %q, want alipay-biz-123 (out_biz_no)", svc.gotEvent.ExternalRefundID)
+	}
+}
+
+// 评审轮5 Critical：真实 trade_status 域不穷尽的穿透——WAIT_BUYER_PAY
+// （商户可在 Alipay 控制台开启的"交易创建"触发）、TRADE_INVALID 及任意
+// 未来新增状态必须映射为惰性 trade_pending（OnWebhook default 分支
+// ack 200 零域动作），绝不得穿透到支付成功分支。
+func TestWebhookHandler_Alipay_UnknownTradeStatus_Inert(t *testing.T) {
+	t.Parallel()
+	for _, ts := range []string{"WAIT_BUYER_PAY", "TRADE_INVALID", "SOME_FUTURE_STATUS"} {
+		svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "none"}}
+		engine := webhookTestEngine(svc)
+		body := []byte("out_trade_no=order-w&trade_no=2023115&total_amount=29.90&notify_id=n_" + ts + "&notify_type=trade_status_sync&trade_status=" + ts + "&sign=xx")
+		rec := postRaw(engine, "/webhooks/payment/alipay", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", ts, rec.Code)
+		}
+		if svc.gotEvent.EventType != "trade_pending" {
+			t.Errorf("%s: event_type = %q, want trade_pending (惰性，绝不当支付成功)", ts, svc.gotEvent.EventType)
+		}
+		// 评审轮5 Minor-1：alipay 成功应答体必须是纯文本 "success"。
+		if rec.Body.String() != "success" {
+			t.Errorf("%s: alipay ack body = %q, want \"success\"", ts, rec.Body.String())
+		}
+	}
+}
+
+// 评审轮5 Minor-1：alipay 渠道成功应答体为纯文本 "success"（渠道契约；
+// 其他渠道 JSON 应答形状不变——stripe 用例继续钉 JSON envelope）。
+func TestWebhookHandler_Alipay_AckBodyIsSuccess(t *testing.T) {
+	t.Parallel()
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "payment_paid"}}
+	engine := webhookTestEngine(svc)
+	body := []byte("out_trade_no=order-uuid-1&trade_no=2023110&total_amount=29.90&notify_id=n_ack&notify_type=trade_status_sync&trade_status=TRADE_SUCCESS&sign=xx")
+	rec := postRaw(engine, "/webhooks/payment/alipay", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "success" {
+		t.Errorf("alipay ack body = %q, want \"success\"", rec.Body.String())
 	}
 }
 
@@ -295,6 +382,9 @@ func TestWebhookHandler_Alipay_BadTotalAmount(t *testing.T) {
 	}
 }
 
+// TestWebhookHandler_Alipay_RefundEvent_DerivesExternalRefundID 保留老
+// mock 形态（无 trade_status、refund_amount legacy alias、notify_type 直
+// 传）作兼容用例——评审轮4 兼容策略：老形态仍可解析并走同一判别。
 func TestWebhookHandler_Alipay_RefundEvent_DerivesExternalRefundID(t *testing.T) {
 	t.Parallel()
 
@@ -309,11 +399,61 @@ func TestWebhookHandler_Alipay_RefundEvent_DerivesExternalRefundID(t *testing.T)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want 200", rec.Code)
 	}
+	if svc.gotEvent.EventType != "trade_closed" {
+		t.Errorf("event_type: got %q, want trade_closed (legacy notify_type 回退判别)", svc.gotEvent.EventType)
+	}
 	if svc.gotEvent.ExternalRefundID != "alipay-n_2" {
 		t.Errorf("external_refund_id: got %q, want alipay-n_2", svc.gotEvent.ExternalRefundID)
 	}
 	if svc.gotEvent.RefundAmount != 29.90 {
+		t.Errorf("refund_amount: got %v, want 29.90 (legacy refund_amount alias)", svc.gotEvent.RefundAmount)
+	}
+}
+
+// 评审轮4 顺手对齐：真实 WeChat v3 退款事件类型 REFUND.SUCCESS 可解
+// 析（加密信封形态），退款业务键取 out_refund_no（缺失回退
+// wechat-<event id>，refunds 唯一键不落空串）。
+func TestWebhookHandler_WeChat_RefundSuccess(t *testing.T) {
+	t.Parallel()
+
+	innerJSON := []byte(`{
+		"transaction_id":"4200001234567890",
+		"out_trade_no":"order-uuid-wx-2",
+		"out_refund_no":"wx-r-42",
+		"amount":{"total":9990,"refund":2990}
+	}`)
+	key := []byte("01234567890123456789012345678901")
+	nonce := []byte("0123456789ab")
+	associatedData := "refund-id"
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	ciphertextB64 := base64.StdEncoding.EncodeToString(gcm.Seal(nil, nonce, innerJSON, []byte(associatedData)))
+	outer := []byte(`{
+		"id":"WH-WX-REF-1",
+		"event_type":"REFUND.SUCCESS",
+		"resource":{"ciphertext":"` + ciphertextB64 + `","nonce":"` + string(nonce) + `","associated_data":"` + associatedData + `"}
+	}`)
+
+	svc := &mockWebhookSvc{result: &service.OnWebhookResult{DomainAction: "refund_paid"}}
+	engine := webhookTestEngine(svc)
+	rec := postRaw(engine, "/webhooks/payment/wechat_pay", outer)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotEvent.EventType != "REFUND.SUCCESS" {
+		t.Errorf("event_type: got %q", svc.gotEvent.EventType)
+	}
+	if svc.gotEvent.RefundAmount != 29.90 {
 		t.Errorf("refund_amount: got %v, want 29.90", svc.gotEvent.RefundAmount)
+	}
+	if svc.gotEvent.ExternalRefundID != "wx-r-42" {
+		t.Errorf("external_refund_id: got %q, want wx-r-42 (out_refund_no)", svc.gotEvent.ExternalRefundID)
 	}
 }
 

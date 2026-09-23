@@ -232,6 +232,9 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		false, // wechatOAuthMock
 		false, // wechatPayMock
 		nil,   // usageSvc
+		nil,   // adminModelsHandler
+		nil,   // adminOps
+		nil,   // accessOps
 		nil,   // llmUsageSvc
 		nil,   // relayHandler
 	)
@@ -279,11 +282,59 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"GET:/admin/stats/active",
 		"GET:/admin/stats/usage-duration",
 		"GET:/admin/stats/new-users",
+		"GET:/admin/models",
+		"GET:/admin/models/:id",
+		"GET:/admin/models/:id/routes",
+		"GET:/admin/deployments",
+		"GET:/admin/catalog/revisions",
+		"GET:/admin/catalog/active",
 		"GET:/admin/stats/llm-usage",
 	}
 	for _, w := range want {
 		if !have[w] {
 			t.Errorf("Setup did not register route %s", w)
+		}
+	}
+	// The Task 4 operator write surface is mounted only when adminOps is
+	// provided; this Setup call passed nil, so catalog writes, credentials
+	// and operator administration must all stay unmounted (fail closed for
+	// tests/misconfigured builds).
+	for _, w := range []string{
+		"POST:/admin/models",
+		"PATCH:/admin/models/:id",
+		"DELETE:/admin/models/:id",
+		"POST:/admin/deployments",
+		"PATCH:/admin/deployments/:id",
+		"DELETE:/admin/deployments/:id",
+		"POST:/admin/catalog/publish",
+		"POST:/admin/catalog/rollback",
+		"POST:/admin/credentials",
+		"POST:/admin/credentials/:id/rotate",
+		"POST:/admin/operators",
+		// Task 15 运营面同样 fail-closed（nil adminOps = 不挂载）。
+		"POST:/admin/catalog/bulk-import",
+		"GET:/admin/model-usage/summary",
+		"GET:/admin/model-usage/exceptions",
+		"GET:/admin/upstream-accounts/shared",
+		"GET:/admin/model-adjustments",
+		"POST:/admin/model-prices/preview",
+		"POST:/admin/quota-policies/preview",
+	} {
+		if have[w] {
+			t.Errorf("Setup registered operator write route %s with nil adminOps", w)
+		}
+	}
+	// The Task 5 customer key-management surface is mounted only when
+	// accessOps carries a UserAPIKeys handler; nil must leave it unmounted.
+	for _, w := range []string{
+		"POST:/user/api-keys",
+		"GET:/user/api-keys",
+		"GET:/user/api-keys/:id",
+		"PATCH:/user/api-keys/:id",
+		"DELETE:/user/api-keys/:id",
+	} {
+		if have[w] {
+			t.Errorf("Setup registered customer key route %s with nil accessOps", w)
 		}
 	}
 	// /test/login must NOT be registered without PAYPAL_L3_E2E_MODE=1 —
@@ -318,6 +369,9 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		false, // wechatOAuthMock
 		false, // wechatPayMock
 		nil,   // usageSvc
+		nil,   // adminModelsHandler
+		nil,   // adminOps
+		nil,   // accessOps
 		nil,   // llmUsageSvc
 		nil,   // relayHandler
 	)
@@ -355,6 +409,7 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 		false, // wechatOAuthMock
 		false, // wechatPayMock
 		nil,   // usageSvc
+		nil, nil, nil, // adminModelsHandler, adminOps, accessOps
 		nil,   // llmUsageSvc
 		handler.NewRelayHandler(nil), // relayHandler 非 nil = relay 启用
 	)

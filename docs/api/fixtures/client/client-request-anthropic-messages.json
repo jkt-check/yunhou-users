@@ -1,0 +1,21 @@
+{
+  "_comment": "Anthropic 官方 SDK（Claude Code）Messages API 请求形状。协议版本 anthropic-version: 2023-06-01。凭据头 x-api-key（本网关同时接受 Authorization: Bearer）。系统提示为顶层 system 字符串，自定义工具为 tools[].input_schema。",
+  "model": "claude-pro",
+  "max_tokens": 1024,
+  "system": "You are Claude Code, Anthropic's official CLI. You help users with software engineering tasks.",
+  "messages": [
+    {"role": "user", "content": "List the files in the current directory."}
+  ],
+  "tools": [
+    {
+      "name": "run_shell",
+      "description": "Run a shell command and return its output.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"cmd": {"type": "string", "description": "The command to run"}},
+        "required": ["cmd"]
+      }
+    }
+  ],
+  "stream": true
+}

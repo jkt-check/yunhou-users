@@ -271,10 +271,25 @@ func (s *stubSubRepo) FindActiveByUserID(_ context.Context, _ string) (*model.Su
 func (s *stubSubRepo) FindActiveByUserIDTx(_ context.Context, _ *sqlx.Tx, userID string) (*model.Subscription, error) {
 	return s.FindActiveByUserID(context.Background(), userID)
 }
+func (s *stubSubRepo) FindActiveByUserAndProduct(_ context.Context, _, _ string) (*model.Subscription, error) {
+	if s.findErr != nil {
+		return nil, s.findErr
+	}
+	if s.activeSub == nil {
+		return nil, sql.ErrNoRows
+	}
+	return s.activeSub, nil
+}
+func (s *stubSubRepo) FindActiveByUserAndProductTx(_ context.Context, _ *sqlx.Tx, userID, productCode string) (*model.Subscription, error) {
+	return s.FindActiveByUserAndProduct(context.Background(), userID, productCode)
+}
 func (s *stubSubRepo) FindByID(_ context.Context, _ string) (*model.Subscription, error) {
 	return nil, nil
 }
 func (s *stubSubRepo) ListByUserID(_ context.Context, _ string) ([]model.Subscription, error) {
+	return nil, nil
+}
+func (s *stubSubRepo) ListByUserAndProduct(_ context.Context, _, _ string) ([]model.Subscription, error) {
 	return nil, nil
 }
 func (s *stubSubRepo) UpdateStatus(_ context.Context, _ string, _ string) error { return nil }

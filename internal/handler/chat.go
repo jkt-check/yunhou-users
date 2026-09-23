@@ -20,17 +20,9 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
-// chatStreamer is the ChatService surface the handler needs. Defined as a
-// local interface so handler tests can inject a hand-rolled mock without a
-// real upstream.
-type chatStreamer interface {
-	StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *service.ChatRoute, error)
-	// RecordUsage meters one completed upstream call; it never fails the
-	// request (the service swallows and logs repo errors).
-	RecordUsage(ctx context.Context, userID, appID string, route *service.ChatRoute, status string, inputTokens, outputTokens int)
-	// AllowedModels backs GET /chat/models.
-	AllowedModels(ctx context.Context, userID, appID string) ([]service.ChatModelInfo, error)
-}
+// The handler depends on service.ChatStreamer (the multi-model ChatService
+// and the inference-gateway facade both satisfy it); tests inject a
+// hand-rolled mock without a real upstream.
 
 // ChatHandler serves POST /chat — the JWT-authenticated, subscription-gated
 // DeepSeek proxy. The upstream SSE stream is relayed verbatim to kaya; every
@@ -41,11 +33,11 @@ type chatStreamer interface {
 // failure) with user_id, session_id, input messages, output text, status and
 // duration — the chat audit trail. Nil disables access logging.
 type ChatHandler struct {
-	svc       chatStreamer
+	svc       service.ChatStreamer
 	accessLog *log.Logger
 }
 
-func NewChatHandler(svc chatStreamer, accessLog *log.Logger) *ChatHandler {
+func NewChatHandler(svc service.ChatStreamer, accessLog *log.Logger) *ChatHandler {
 	return &ChatHandler{svc: svc, accessLog: accessLog}
 }
 

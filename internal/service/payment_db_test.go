@@ -37,6 +37,27 @@ func setupPaymentDB(t *testing.T) *sqlx.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 
+	// Task 10: the payment-benefit tests seed inference rows. Wipe the whole
+	// inference group with one TRUNCATE ... CASCADE (the requests/windows/
+	// attempts FK ring makes manual DELETE ordering brittle — same idiom as
+	// internal/repo tests), then the legacy tables in FK-safe order.
+	if _, err := db.ExecContext(context.Background(), `TRUNCATE
+		inference_response_chains, inference_bulk_imports,
+		inference_reconciliation_jobs, inference_outbox,
+		inference_ledger_entries, inference_adjustments,
+		inference_concurrency_leases, inference_reservations,
+		inference_quota_windows, inference_usage_records,
+		inference_attempts, inference_requests,
+		inference_entitlements, inference_price_versions,
+		inference_policy_versions, inference_api_keys,
+		inference_billing_accounts, inference_upstream_accounts,
+		inference_model_routes, inference_deployments,
+		inference_credentials, inference_config_revisions,
+		inference_providers, inference_models,
+		plan_upgrade_rules, plan_benefit_configs
+		RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatalf("wipe inference tables: %v", err)
+	}
 	tables := []string{
 		"refunds", "payments", "webhook_events", "orders",
 		"sessions", "subscriptions", "social_identities",
@@ -459,13 +480,14 @@ func TestConfirm_TrialRolloverOnFirstPurchase(t *testing.T) {
 }
 
 // The trial grant's concurrency safety net (auth.go grantTrialSubscription
-// doc): a duplicate grant hits idx_subscriptions_user_active and is
-// logged+swallowed. Pin the index itself at the DB layer.
+// doc): a duplicate grant hits idx_subscriptions_user_product_active
+// (migration 027, per user+product) and is logged+swallowed. Pin the index
+// itself at the DB layer — and its per-product scope.
 func TestSubscriptions_UniqueActivePerUser(t *testing.T) {
 	db := setupPaymentDB(t)
 	uid := seedUser(t, db)
 	seedActiveSub(t, db, uid, "trial", time.Now().Add(7*24*time.Hour))
-	// second active row for the same user must be rejected
+	// second active row for the same user IN THE SAME PRODUCT must be rejected
 	_, err := db.ExecContext(context.Background(), `
 		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
 		VALUES (gen_random_uuid(), $1, 'monthly', 'active', now(), now() + interval '30 days')
@@ -473,8 +495,24 @@ func TestSubscriptions_UniqueActivePerUser(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected unique violation on second active subscription, got nil")
 	}
-	if !strings.Contains(err.Error(), "idx_subscriptions_user_active") {
-		t.Fatalf("expected idx_subscriptions_user_active violation, got %v", err)
+	if !strings.Contains(err.Error(), "idx_subscriptions_user_product_active") {
+		t.Fatalf("expected idx_subscriptions_user_product_active violation, got %v", err)
+	}
+
+	// A second active row in a DIFFERENT product is exactly what migration
+	// 027 exists to permit (dual-product coexistence).
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, product_code)
+		VALUES ('coding-monthly', 'Coding Plan Monthly', 49.9, 30, '{}', 'coding-plan')
+		ON CONFLICT (id) DO NOTHING
+	`); err != nil {
+		t.Fatalf("seed coding plan: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (gen_random_uuid(), $1, 'coding-monthly', 'active', now(), now() + interval '30 days')
+	`, uid); err != nil {
+		t.Fatalf("second active row in coding-plan product must coexist: %v", err)
 	}
 }
 
@@ -2077,9 +2115,279 @@ func TestPaymentService_OnWebhook_PaymentFailed_AfterPaid(t *testing.T) {
 	_ = res // silence unused
 }
 
+// 评审轮3 D-1：Alipay trade_closed 真未支付关单（订单 pending，永不
+// 会有支付行；渠道语义：未支付关单不携带 refund fee——parser 的
+// refund_amount 解析为 0）→ audit+200 即止，不得返错制造一天 500 重试
+// 风暴。注意：本用例不得携带 RefundAmount——带退款额的 trade_closed 表
+// 渠道侧已支付并退款，必须返错重投（见 D-1 乱序闭环测试）。
+func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: "evt-close-" + mustNewUUID()[:8], EventType: "trade_closed",
+		TransactionID: "txn-never-paid-" + mustNewUUID()[:8], OrderID: order.ID,
+		ExternalRefundID: "rf_close",
+		RawPayload:       json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("unpaid close must ack 200 (audit only), got: %v", err)
+	}
+	if res == nil || res.DomainAction != "refund_paid" {
+		t.Errorf("result = %+v", res)
+	}
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unpaid_order'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("unpaid-order audit rows = %d, want 1", n)
+	}
+	// 未支付关单不得落任何退款行。
+	var refunds int
+	if err := db.GetContext(context.Background(), &refunds, `SELECT count(*) FROM refunds`); err != nil {
+		t.Fatal(err)
+	}
+	if refunds != 0 {
+		t.Errorf("refund rows = %d, want 0 (未支付订单无退款事实)", refunds)
+	}
+}
+
+// 评审轮3 D-2：真实渠道键形态——e.OrderID 是 32 位无横线 out_trade_no
+// （CreateOrder 以 strings.ReplaceAll(order.ID,"-","")[:32] 铸造并存入
+// provider_intent）。关单反查必须经两段式查找命中订单，未支付关单照样
+// audit+200（只查主键会 miss → 错误地全天 500）。
+func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose_OutTradeNo(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outTradeNo := strings.ReplaceAll(order.ID, "-", "")[:32]
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET provider_intent = $2 WHERE id = $1`,
+		order.ID, `{"out_trade_no":"`+outTradeNo+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: "evt-close-otn-" + mustNewUUID()[:8], EventType: "trade_closed",
+		TransactionID: "txn-otn-" + mustNewUUID()[:8], OrderID: outTradeNo, // 无横线 32 位渠道键
+		ExternalRefundID: "rf_close_otn",
+		RawPayload:       json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("unpaid close via out_trade_no must ack 200, got: %v", err)
+	}
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unpaid_order'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("unpaid-order audit rows = %d, want 1 (out_trade_no 回退命中)", n)
+	}
+}
+
+// 评审轮2 N-2 边界：订单已支付但支付行缺失（退款先于支付事件，轮 1 C2
+// 语义保持）→ 返错重投；e.OrderID 指向不存在的订单 → 同样返错。
+func TestPaymentService_OnWebhook_Refund_PaidOrderMissingPaymentRow(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 订单已支付、支付行尚未落库（乱序窗口）。
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET status = 'paid' WHERE id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-rf-paid-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-missing-" + mustNewUUID()[:8], OrderID: order.ID,
+		RefundAmount: 29.9, ExternalRefundID: "re_missing",
+		RawPayload: json.RawMessage(`{}`),
+	}); err == nil {
+		t.Fatal("paid order with missing payment row must return an error so the channel retries (C2)")
+	}
+	// 订单不存在 → 返错。
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-rf-ghost-" + mustNewUUID()[:8], EventType: "charge.refunded",
+		TransactionID: "pi-ghost-" + mustNewUUID()[:8], OrderID: mustNewUUID(),
+		RefundAmount: 29.9, ExternalRefundID: "re_ghost",
+		RawPayload: json.RawMessage(`{}`),
+	}); err == nil {
+		t.Fatal("refund for a nonexistent order must return an error")
+	}
+}
+
+// 评审轮4 B：Alipay refund_fee 累计语义——部分退款序列（refund_fee 递
+// 增）逐笔只认增量；同一累计值的重复通知增量为 0 → 幂等收敛不双退；
+// 累计达到全额 → 全额翻转 + 订阅取消。
+func TestPaymentService_OnWebhook_AlipayRefund_CumulativeSemantics(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 支付成功（TRADE_SUCCESS）。
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: "evt-cum-pay-" + mustNewUUID()[:8], EventType: "TRADE_SUCCESS",
+		TransactionID: "txn-cum-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("paid webhook: %v", err)
+	}
+
+	refund := func(eventID, extID string, cumulative float64) error {
+		_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+			Channel: "alipay", EventID: eventID, EventType: "trade_refund",
+			TransactionID: "txn-cum-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+			RefundAmount: cumulative, ExternalRefundID: extID,
+			RawPayload: json.RawMessage(`{}`),
+		})
+		return err
+	}
+	// ① refund_fee=10（部分）→ 退款行 10。
+	if err := refund("evt-cum-r1-"+mustNewUUID()[:8], "alipay-biz-1", 10.00); err != nil {
+		t.Fatalf("partial 1: %v", err)
+	}
+	// ② refund_fee=25（累计）→ 只认增量 15。
+	if err := refund("evt-cum-r2-"+mustNewUUID()[:8], "alipay-biz-2", 25.00); err != nil {
+		t.Fatalf("partial 2: %v", err)
+	}
+	// ③ 同一累计值 25 的另一通知（重复投递语义）→ 增量 0，不落新行。
+	if err := refund("evt-cum-r3-"+mustNewUUID()[:8], "alipay-biz-2b", 25.00); err != nil {
+		t.Fatalf("same-cumulative redelivery: %v", err)
+	}
+	var rows []float64
+	if err := db.SelectContext(context.Background(), &rows,
+		`SELECT amount FROM refunds ORDER BY created_at`); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0] != 10.00 || rows[1] != 15.00 {
+		t.Fatalf("refund rows = %v, want [10 15]（逐笔增量）", rows)
+	}
+	// 部分退款：支付保持 paid，订阅不动。
+	var payStatus, subStatus string
+	if err := db.GetContext(context.Background(), &payStatus,
+		`SELECT status FROM payments WHERE order_id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if payStatus != "paid" {
+		t.Errorf("payment after partial = %s, want paid", payStatus)
+	}
+	if err := db.GetContext(context.Background(), &subStatus,
+		`SELECT status FROM subscriptions WHERE user_id = $1 AND plan_id = 'monthly'`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if subStatus != "active" {
+		t.Errorf("sub after partial = %s, want active (部分退款不动订阅)", subStatus)
+	}
+	// ④ 累计到全额 29.90 → 增量 4.90，全额翻转 + 订阅取消。
+	if err := refund("evt-cum-r4-"+mustNewUUID()[:8], "alipay-biz-3", 29.90); err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	if err := db.SelectContext(context.Background(), &rows,
+		`SELECT amount FROM refunds ORDER BY created_at`); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 || rows[2] != 4.90 {
+		t.Fatalf("refund rows = %v, want [10 15 4.9]", rows)
+	}
+	if err := db.GetContext(context.Background(), &payStatus,
+		`SELECT status FROM payments WHERE order_id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if payStatus != "refunded" {
+		t.Errorf("payment after full = %s, want refunded", payStatus)
+	}
+	if err := db.GetContext(context.Background(), &subStatus,
+		`SELECT status FROM subscriptions WHERE user_id = $1 AND plan_id = 'monthly'`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if subStatus != "cancelled" {
+		t.Errorf("sub after full = %s, want cancelled (全额退款级联)", subStatus)
+	}
+	// ⑤ 全额后的重复通知（同累计 29.90）→ 幂等收敛，无新行无错误。
+	if err := refund("evt-cum-r5-"+mustNewUUID()[:8], "alipay-biz-3b", 29.90); err != nil {
+		t.Fatalf("post-full redelivery: %v", err)
+	}
+	var n int
+	if err := db.GetContext(context.Background(), &n, `SELECT count(*) FROM refunds`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("refund rows after redelivery = %d, want 3 (幂等收敛)", n)
+	}
+}
+
+// 评审轮5 Critical：trade_pending（WAIT_BUYER_PAY 等未识别/非终态
+// trade_status 的惰性映射）落 OnWebhook default 分支——ack 200 零域动
+// 作：订单保持未支付、零支付行；事件行落库并标记已处理（审计留痕）。
+func TestPaymentService_OnWebhook_AlipayTradePending_Inert(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID := "evt-pending-" + mustNewUUID()[:8]
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "alipay", EventID: eventID, EventType: "trade_pending",
+		TransactionID: "txn-wbp-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("trade_pending must ack without error: %v", err)
+	}
+	if res == nil || res.DomainAction != "none" {
+		t.Errorf("result = %+v, want domain_action none (零域动作)", res)
+	}
+	var status string
+	if err := db.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Errorf("order = %s, want pending (钱未到账不得结算)", status)
+	}
+	var payments int
+	if err := db.GetContext(context.Background(), &payments,
+		`SELECT count(*) FROM payments WHERE order_id = $1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if payments != 0 {
+		t.Errorf("payments = %d, want 0", payments)
+	}
+	// 审计留痕：事件行落库且已处理（重投被幂等去重）。
+	var processed *time.Time
+	if err := db.GetContext(context.Background(), &processed,
+		`SELECT processed_at FROM webhook_events WHERE channel = 'alipay' AND event_id = $1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	if processed == nil {
+		t.Error("webhook_events row must be recorded and marked processed (audit trail)")
+	}
+}
+
 // TestPaymentService_OnWebhook_Refund_MissingPayment covers the
-// "no payment row" branch in onRefundSucceeded (the handler should
-// no-op rather than error).
+// "no payment row" branch in onRefundSucceeded (评审轮1 C2): the refund
+// event may arrive BEFORE the payment-success event (channel out-of-order
+// delivery). The handler must return an error — the webhook handler maps
+// it to 500 and the channel retries per its schedule — instead of acking
+// 200 (which would mark the event processed and permanently drop the
+// refund once the payment lands). The audit row is still written.
 func TestPaymentService_OnWebhook_Refund_MissingPayment(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
@@ -2089,8 +2397,30 @@ func TestPaymentService_OnWebhook_Refund_MissingPayment(t *testing.T) {
 		TransactionID: "pi-rf-nopay-" + mustNewUUID()[:8], RefundAmount: 1, ExternalRefundID: "re_nopay",
 		RawPayload: json.RawMessage(`{}`),
 	})
-	if err != nil {
-		t.Errorf("missing-payment refund should not error, got: %v", err)
+	if err == nil {
+		t.Fatal("missing-payment refund must return an error so the channel retries (C2)")
+	}
+	if !strings.Contains(err.Error(), "unknown payment") {
+		t.Errorf("err = %q, want the unknown-payment signal", err.Error())
+	}
+	// 审计痕照留（writeAudit 独立提交，不随业务事务回滚）。
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unknown_payment'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("audit rows = %d, want 1", n)
+	}
+	// 事件行保留 processed_at=NULL：渠道重投同一 event_id 时会重跑业务动作
+	// （OnWebhook dedup 分支 b），而不是被当作已处理直接 ack。
+	var processed *time.Time
+	if err := db.GetContext(context.Background(), &processed,
+		`SELECT processed_at FROM webhook_events WHERE channel = 'stripe' ORDER BY received_at DESC LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	if processed != nil {
+		t.Errorf("webhook event must stay unprocessed after the error, got %v", processed)
 	}
 }
 
@@ -2448,11 +2778,13 @@ func TestPaymentService_OnWebhook_PaypalCaptureStillAmountChecked(t *testing.T) 
 
 // TestPaymentService_CreateOrder_GenericError covers the wrap paths
 // in CreateOrder that aren't covered by the "plan not found" / "plan
-// inactive" / "user has active sub" tests. After D8 the subRepo
-// active-sub check runs before the eligibility tx, so a closed DB now
-// surfaces as "check active sub" (subRepo is the first DB-backed
-// call). The planRepo wrap path is exercised in payment_db_test.go's
-// real-DB CreateOrder tests where the plan lookup runs inside a tx.
+// inactive" / "user has active sub" tests. Since migration 027 the
+// requested plan is looked up FIRST (its product_code scopes the
+// active-sub pre-check), so a closed DB now surfaces as
+// "find requested plan". The subRepo wrap path ("check active sub") is
+// reachable when the plan read succeeds but the sub read fails; plan
+// eligibility (FOR SHARE on plans) is exercised separately in the
+// real-DB TestPaymentService_CreateOrder_PlanDeactivatedDuringTx.
 func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 	t.Run("planRepo generic error", func(t *testing.T) {
 		db := setupPaymentDB(t)
@@ -2470,12 +2802,10 @@ func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error from closed db, got nil")
 		}
-		// SubRepo active-sub check runs first now (see CreateOrder doc),
-		// so a closed DB surfaces as "check active sub". Plan eligibility
-		// (FOR SHARE on plans) is exercised separately in the real-DB
-		// TestPaymentService_CreateOrder_PlanDeactivatedDuringTx.
-		if !strings.Contains(err.Error(), "check active sub") {
-			t.Errorf("expected wrap 'check active sub', got %q", err.Error())
+		// The product resolution plan read runs first (see CreateOrder),
+		// so a closed DB surfaces as "find requested plan".
+		if !strings.Contains(err.Error(), "find requested plan") {
+			t.Errorf("expected wrap 'find requested plan', got %q", err.Error())
 		}
 	})
 }
@@ -2646,9 +2976,9 @@ func TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit(t *testing.T
 	}
 
 	cases := []struct {
-		name     string
-		amount   float64
-		currency string
+		name      string
+		amount    float64
+		currency  string
 		wantAudit string // audit action, or "" if none expected
 	}{
 		// USD vs monthly-plan CNY → currency_mismatch; amount 29.9 >= 19.9 CNY
@@ -2863,7 +3193,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	got, err := s.resolveSubExpiry(context.Background(), tx, uid, "monthly", &hint, nil)
+	got, err := s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &hint, nil, 0)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry: %v", err)
 	}
@@ -2873,7 +3203,7 @@ func TestResolveSubExpiry_HintForwarded(t *testing.T) {
 
 	// Beyond the plan grant: clamped to ~now + 30d.
 	farHint := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	got, err = s.resolveSubExpiry(context.Background(), tx, uid, "monthly", &farHint, nil)
+	got, err = s.resolveSubExpiry(context.Background(), tx, uid, "monthly", model.ProductKayaMembership, &farHint, nil, 0)
 	if err != nil {
 		t.Fatalf("resolveSubExpiry far hint: %v", err)
 	}

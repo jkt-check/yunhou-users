@@ -39,13 +39,19 @@ var (
 	ErrAppNotFound          = errors.New("app not found")
 	ErrAppInactive          = errors.New("app is inactive")
 
-	ErrPlanNotFound          = errors.New("plan not found")
-	ErrPlanInactive          = errors.New("plan is inactive")
-	ErrPaidPlanForbidden     = errors.New("paid plan: payment required, cannot self-subscribe")
-	ErrPlanNotAcceptingNew   = errors.New("plan is not accepting new subscriptions")
-	ErrPlanCurrencyMismatch  = errors.New("plan currency does not match order currency")
-	ErrInvalidAppID          = errors.New("plan apps contains unknown or inactive app_id")
-	ErrDeprecatedDefaultPlan = model.ErrDeprecatedDefaultPlan
+	ErrPlanNotFound      = errors.New("plan not found")
+	ErrPlanInactive      = errors.New("plan is inactive")
+	ErrPaidPlanForbidden = errors.New("paid plan: payment required, cannot self-subscribe")
+	// ErrSelfServiceProductForbidden: the self-serve subscribe endpoint only
+	// ever creates kaya-membership free plans. Coding-plan subscriptions
+	// (even price-0 ones) are created exclusively by the payment pipeline,
+	// whose entitlement-grant backstop requires a paid order as evidence
+	// (Task 10, design §4.1/§4.3).
+	ErrSelfServiceProductForbidden = errors.New("self-service subscription is not available for this product")
+	ErrPlanNotAcceptingNew         = errors.New("plan is not accepting new subscriptions")
+	ErrPlanCurrencyMismatch        = errors.New("plan currency does not match order currency")
+	ErrInvalidAppID                = errors.New("plan apps contains unknown or inactive app_id")
+	ErrDeprecatedDefaultPlan       = model.ErrDeprecatedDefaultPlan
 
 	// Payment flow (design doc + webhook doc).
 	ErrOrderNotFound           = errors.New("order not found")

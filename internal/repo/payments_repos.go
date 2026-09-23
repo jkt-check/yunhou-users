@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/yunhou/users/internal/model"
 )
 
@@ -69,8 +70,12 @@ func (r *orderRepo) Create(ctx context.Context, o *model.Order) error {
 	// the wire; passing a raw []byte would have Postgres reject '' with
 	// SQLSTATE 22P02.
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
-		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent)
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent,
+			product_code, plan_interval_days, benefit_policy_version_id, benefit_model_ids,
+			benefit_grant_mode, order_kind, upgrade_from_plan_id)
+		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent,
+			:product_code, :plan_interval_days, :benefit_policy_version_id, :benefit_model_ids,
+			:benefit_grant_mode, :order_kind, :upgrade_from_plan_id)
 	`, flattenOrderForInsert(o))
 	return err
 }
@@ -82,8 +87,12 @@ func (r *orderRepo) Create(ctx context.Context, o *model.Order) error {
 // leave an order pointing at a now-inactive plan.
 func (r *orderRepo) CreateInTx(ctx context.Context, tx *sqlx.Tx, o *model.Order) error {
 	_, err := tx.NamedExecContext(ctx, `
-		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent)
-		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent)
+		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent,
+			product_code, plan_interval_days, benefit_policy_version_id, benefit_model_ids,
+			benefit_grant_mode, order_kind, upgrade_from_plan_id)
+		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent,
+			:product_code, :plan_interval_days, :benefit_policy_version_id, :benefit_model_ids,
+			:benefit_grant_mode, :order_kind, :upgrade_from_plan_id)
 	`, flattenOrderForInsert(o))
 	return err
 }
@@ -104,6 +113,18 @@ type orderInsertRow struct {
 	Status         string         `db:"status"`
 	ExpiresAt      time.Time      `db:"expires_at"`
 	ProviderIntent *nullableJSONB `db:"provider_intent"`
+	// Benefit snapshot columns (migration 029). The model fields are
+	// already NULL-friendly pointers / pq.StringArray, so they bind SQL
+	// NULL verbatim — the orders_order_kind_check /
+	// orders_benefit_grant_mode_check CHECKs only accept the enum
+	// literals or NULL.
+	ProductCode            *string        `db:"product_code"`
+	PlanIntervalDays       *int           `db:"plan_interval_days"`
+	BenefitPolicyVersionID *string        `db:"benefit_policy_version_id"`
+	BenefitModelIDs        pq.StringArray `db:"benefit_model_ids"`
+	BenefitGrantMode       *string        `db:"benefit_grant_mode"`
+	OrderKind              *string        `db:"order_kind"`
+	UpgradeFromPlanID      *string        `db:"upgrade_from_plan_id"`
 }
 
 func flattenOrderForInsert(o *model.Order) *orderInsertRow {
@@ -116,6 +137,14 @@ func flattenOrderForInsert(o *model.Order) *orderInsertRow {
 		Status:         o.Status,
 		ExpiresAt:      o.ExpiresAt,
 		ProviderIntent: wrapNullableJSONB(o.ProviderIntent),
+
+		ProductCode:            o.ProductCode,
+		PlanIntervalDays:       o.PlanIntervalDays,
+		BenefitPolicyVersionID: o.BenefitPolicyVersionID,
+		BenefitModelIDs:        o.BenefitModelIDs,
+		BenefitGrantMode:       o.BenefitGrantMode,
+		OrderKind:              o.OrderKind,
+		UpgradeFromPlanID:      o.UpgradeFromPlanID,
 	}
 }
 

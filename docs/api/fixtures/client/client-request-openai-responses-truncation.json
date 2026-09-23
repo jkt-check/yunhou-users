@@ -1,0 +1,13 @@
+{
+  "_comment": "已知差异 ②：OpenAI Responses truncation:\"auto\"（上下文自动裁剪）——本网关不做服务端上下文管理，明确 400。同族差异：background/include/service_tier 等同样 400。期望响应：HTTP 400 + OpenAI 原生错误形状。",
+  "model": "codex-pro",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "Summarize the conversation so far."}]
+    }
+  ],
+  "truncation": "auto",
+  "stream": true
+}

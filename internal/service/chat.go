@@ -66,6 +66,21 @@ type ChatModelInfo struct {
 	Default     bool   `json:"default"`
 }
 
+// ChatStreamer is the /chat service surface: the multi-model ChatService
+// and the inference-gateway facade (ChatGatewayFacade, Task 8) both
+// satisfy it. Exported so the inference httpapi can wire the facade
+// without importing the handler.
+type ChatStreamer interface {
+	StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *ChatRoute, error)
+	// RecordUsage meters one completed upstream call; it never fails the
+	// request. The facade's implementation is a no-op (the inference
+	// gateway settles metered usage internally — double-writing
+	// llm_usage_events would duplicate metering).
+	RecordUsage(ctx context.Context, userID, appID string, route *ChatRoute, status string, inputTokens, outputTokens int)
+	// AllowedModels backs GET /chat/models.
+	AllowedModels(ctx context.Context, userID, appID string) ([]ChatModelInfo, error)
+}
+
 // ChatService routes POST /chat to the upstream LLM provider selected by the
 // request's logical model id. All provider API keys live server-side (the
 // llm.Catalog); consumer apps (kaya etc.) never see them — they authenticate

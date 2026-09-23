@@ -290,8 +290,9 @@ const trialPlanID = "trial"
 // grantTrialSubscription inserts the active trial subscription row for a
 // brand-new user. Best-effort by design: every failure is logged and
 // swallowed so a catalog hiccup can never bounce a first login. The
-// partial unique index idx_subscriptions_user_active turns a concurrent
-// duplicate grant into a DB-level no-op (unique violation, logged here).
+// partial unique index idx_subscriptions_user_product_active (migration
+// 027, scoped per user+product) turns a concurrent duplicate grant into a
+// DB-level no-op (unique violation, logged here).
 // There is deliberately no backfill for pre-existing users (spec: 只发新用户).
 func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string) {
 	// The grant must outlive the request: a client disconnect mid-login
@@ -321,9 +322,12 @@ func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string)
 		ID:        GenerateUUID(),
 		UserID:    userID,
 		PlanID:    plan.ID,
-		Status:    "active",
-		StartedAt: now,
-		ExpiresAt: &expiresAt,
+		// Trial is a kaya-membership grant (migration 018); the 027
+		// trigger would also fill this from the plan row.
+		ProductCode: model.ProductKayaMembership,
+		Status:      "active",
+		StartedAt:   now,
+		ExpiresAt:   &expiresAt,
 	}); err != nil {
 		log.Printf("trial grant: create subscription: %v (user %s)", err, userID)
 	}

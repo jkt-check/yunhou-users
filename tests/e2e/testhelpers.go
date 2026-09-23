@@ -35,6 +35,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
+	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
@@ -91,13 +92,40 @@ func connectDB(t *testing.T) *sqlx.DB {
 
 func cleanupDB(t *testing.T, db *sqlx.DB) {
 	t.Helper()
+	// Inference tables first: inference_billing_accounts references users
+	// without cascade (去标识化账本边界), so the legacy wipe below would
+	// violate the FK if any test left inference rows behind.
+	// TRUNCATE ... CASCADE sidesteps the requests/windows FK ring.
+	if _, err := db.Exec(`TRUNCATE
+		inference_audit_log, operator_roles,
+		inference_wallet_entries, inference_wallet_audits,
+		inference_wallet_holds, inference_wallets, inference_payg_config,
+		inference_response_chains,
+		inference_reconciliation_jobs, inference_outbox,
+		inference_ledger_entries, inference_adjustments,
+		inference_concurrency_leases, inference_reservations,
+		inference_quota_windows, inference_usage_records,
+		inference_attempts, inference_requests,
+		inference_entitlements, inference_policy_versions,
+		inference_price_versions,
+		inference_api_keys, inference_billing_accounts,
+		inference_upstream_accounts, inference_credentials,
+		inference_config_revisions, inference_model_routes,
+		inference_deployments, inference_providers, inference_models
+		RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatalf("cleanup inference tables: %v", err)
+	}
 	// Order matters: child tables first. plan_change_log is listed
 	// explicitly (spec §10.3); the plan_id FK is ON DELETE SET NULL
 	// in migration 013, so plan_change_log is independent of the
 	// plans delete and its order relative to "plans" does not matter.
 	tables := []string{
+		"plan_upgrade_rules",
+		"plan_benefit_configs",
 		"plan_change_log",
 		"refunds",
+		// llm_usage_events.app_id 引用 apps(app_id) 无级联,必须先于 apps 清
+		"llm_usage_events",
 		"usage_events",
 		"payments",
 		"webhook_events",
@@ -241,17 +269,18 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                "0",
-		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:          privPath,
-		RSAPublic:           pubPath,
-		GitHubClientID:      "e2e-fake-client-id",
-		GitHubClientSecret:  "e2e-fake-client-secret",
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     1 * time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		Port:                   "0",
+		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:             privPath,
+		RSAPublic:              pubPath,
+		GitHubClientID:         "e2e-fake-client-id",
+		GitHubClientSecret:     "e2e-fake-client-secret",
+		JWTAccessTTL:           15 * time.Minute,
+		JWTRefreshTTL:          168 * time.Hour,
+		OrderExpiryDuration:    30 * time.Minute,
+		SweeperInterval:        1 * time.Minute,
+		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace: 15 * time.Minute,
 	}
 
 	// Repos
@@ -314,7 +343,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	return engine, nil, db
 }
@@ -342,17 +371,18 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                "0",
-		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:          privPath,
-		RSAPublic:           pubPath,
-		GitHubClientID:      "Iv1.e2e_test_client_id",
-		GitHubClientSecret:  "e2e_test_client_secret_padded",
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     1 * time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		Port:                   "0",
+		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:             privPath,
+		RSAPublic:              pubPath,
+		GitHubClientID:         "Iv1.e2e_test_client_id",
+		GitHubClientSecret:     "e2e_test_client_secret_padded",
+		JWTAccessTTL:           15 * time.Minute,
+		JWTRefreshTTL:          168 * time.Hour,
+		OrderExpiryDuration:    30 * time.Minute,
+		SweeperInterval:        1 * time.Minute,
+		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace: 15 * time.Minute,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("config validate: %v", err)
@@ -402,7 +432,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	return &E2EServer{
 		Engine:             engine,
@@ -568,17 +598,18 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                "0",
-		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:          privPath,
-		RSAPublic:           pubPath,
-		GitHubClientID:      "e2e-fake-client-id",
-		GitHubClientSecret:  "e2e-fake-fake-client-secret",
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     1 * time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		Port:                   "0",
+		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:             privPath,
+		RSAPublic:              pubPath,
+		GitHubClientID:         "e2e-fake-client-id",
+		GitHubClientSecret:     "e2e-fake-fake-client-secret",
+		JWTAccessTTL:           15 * time.Minute,
+		JWTRefreshTTL:          168 * time.Hour,
+		OrderExpiryDuration:    30 * time.Minute,
+		SweeperInterval:        1 * time.Minute,
+		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace: 15 * time.Minute,
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -611,6 +642,16 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		&wechat.Client{MockMode: true},
 		cfg.OrderExpiryDuration,
 	)
+	// Task 10: wire the payment → entitlement loop exactly like
+	// cmd/server does — coding-plan orders snapshot their benefit spec at
+	// creation and the webhook/confirm paths enqueue the sync message in
+	// the same transaction. Tests drive the worker pass synchronously on
+	// the same DB.
+	infStore := inferencepostgres.NewStore(db)
+	benefitRepo := repo.NewPlanBenefitRepo(db)
+	paymentSvc.SetBenefitRepo(benefitRepo)
+	paymentSvc.SetBenefitSync(infStore)
+	subSvc.SetBenefitSync(db, infStore)
 
 	alipayPriv, alipayPubPEM := genAlipayRSAKeyPair(t)
 	paypalVerifySrv := newMockPaypalVerifyServer(t)
@@ -658,7 +699,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil)
 
 	alipayPrivHolder.Store(alipayPriv)
 

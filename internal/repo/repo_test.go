@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -1570,5 +1571,135 @@ func TestOrderRepo_CreateInTx_Inserts(t *testing.T) {
 	}
 	if got.UserID != alice.ID || got.PlanID != "monthly" {
 		t.Errorf("FK fields wrong: user=%s plan=%s", got.UserID, got.PlanID)
+	}
+}
+
+// ============================================================================
+// Product scope (migration 027)
+// ============================================================================
+
+// seedCodingPlan inserts a coding-plan product plan row. The service layer
+// deliberately has no coding-plan sale path in this phase; tests construct
+// the row directly, exactly as the task brief allows.
+func seedCodingPlan(t *testing.T, db *sqlx.DB) {
+	t.Helper()
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, product_code)
+		VALUES ('coding-monthly', 'Coding Plan Monthly', 49.9, 30, '{}', 'coding-plan')
+		ON CONFLICT (id) DO NOTHING
+	`)
+	if err != nil {
+		t.Fatalf("seed coding plan: %v", err)
+	}
+}
+
+func TestSubscriptionRepo_ProductScope(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), alice)
+	r := NewSubscriptionRepo(db)
+	seedCodingPlan(t, db)
+
+	exp := time.Now().Add(30 * 24 * time.Hour)
+	kayaSub := &model.Subscription{
+		ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+		ProductCode: model.ProductKayaMembership,
+		Status:      "active", StartedAt: time.Now(), ExpiresAt: &exp,
+	}
+	if err := r.Create(context.Background(), kayaSub); err != nil {
+		t.Fatalf("Create kaya sub: %v", err)
+	}
+
+	// Same user, second product: must coexist (no global unique violation).
+	codingSub := &model.Subscription{
+		ID: newUUID(), UserID: alice.ID, PlanID: "coding-monthly",
+		ProductCode: model.ProductCodingPlan,
+		Status:      "active", StartedAt: time.Now(), ExpiresAt: &exp,
+	}
+	if err := r.Create(context.Background(), codingSub); err != nil {
+		t.Fatalf("Create coding-plan sub alongside kaya sub: %v", err)
+	}
+
+	// Legacy entry point is pinned to kaya-membership.
+	got, err := r.FindActiveByUserID(context.Background(), alice.ID)
+	if err != nil {
+		t.Fatalf("FindActiveByUserID: %v", err)
+	}
+	if got.ID != kayaSub.ID {
+		t.Errorf("FindActiveByUserID = %v, want kaya sub %v", got.ID, kayaSub.ID)
+	}
+	if got.ProductCode != model.ProductKayaMembership {
+		t.Errorf("ProductCode = %q, want kaya-membership", got.ProductCode)
+	}
+
+	// Product-explicit lookup finds the coding-plan row.
+	got, err = r.FindActiveByUserAndProduct(context.Background(), alice.ID, model.ProductCodingPlan)
+	if err != nil {
+		t.Fatalf("FindActiveByUserAndProduct: %v", err)
+	}
+	if got.ID != codingSub.ID {
+		t.Errorf("FindActiveByUserAndProduct = %v, want coding sub %v", got.ID, codingSub.ID)
+	}
+
+	// Same product, second active row: still rejected by the
+	// (user_id, product_code) partial unique index.
+	dup := &model.Subscription{
+		ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+		ProductCode: model.ProductKayaMembership,
+		Status:      "active", StartedAt: time.Now(), ExpiresAt: &exp,
+	}
+	if err := r.Create(context.Background(), dup); err == nil {
+		t.Fatal("duplicate same-product active sub unexpectedly accepted")
+	} else {
+		var pqErr *pq.Error
+		if !errors.As(err, &pqErr) || pqErr.Code != "23505" {
+			t.Fatalf("duplicate active sub error = %v, want 23505 unique violation", err)
+		}
+	}
+
+	// Trigger: an explicit product that contradicts the plan's product is
+	// rejected; an omitted product is filled from the plan row.
+	mismatch := &model.Subscription{
+		ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+		ProductCode: model.ProductCodingPlan,
+		Status:      "expired", StartedAt: time.Now(),
+	}
+	if err := r.Create(context.Background(), mismatch); err == nil {
+		t.Fatal("product/plan mismatch unexpectedly accepted")
+	} else if !strings.Contains(err.Error(), "does not match plan") {
+		t.Fatalf("mismatch error = %v, want trigger diagnostic", err)
+	}
+
+	filled := &model.Subscription{
+		ID: newUUID(), UserID: alice.ID, PlanID: "coding-monthly",
+		Status: "expired", StartedAt: time.Now(), // no ProductCode — trigger fills it
+	}
+	if err := r.Create(context.Background(), filled); err != nil {
+		t.Fatalf("Create with empty product: %v", err)
+	}
+	got, err = r.FindByID(context.Background(), filled.ID)
+	if err != nil {
+		t.Fatalf("FindByID filled: %v", err)
+	}
+	if got.ProductCode != model.ProductCodingPlan {
+		t.Errorf("trigger-filled ProductCode = %q, want coding-plan", got.ProductCode)
+	}
+
+	// Product-scoped listing.
+	kayaList, err := r.ListByUserAndProduct(context.Background(), alice.ID, model.ProductKayaMembership)
+	if err != nil {
+		t.Fatalf("ListByUserAndProduct kaya: %v", err)
+	}
+	if len(kayaList) != 1 || kayaList[0].ID != kayaSub.ID {
+		t.Errorf("kaya list = %+v, want only the kaya sub", kayaList)
+	}
+	all, err := r.ListByUserID(context.Background(), alice.ID)
+	if err != nil {
+		t.Fatalf("ListByUserID: %v", err)
+	}
+	// kaya active + coding active + coding expired (trigger-filled) = 3.
+	if len(all) != 3 {
+		t.Errorf("ListByUserID = %d rows, want 3", len(all))
 	}
 }

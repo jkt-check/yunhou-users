@@ -1,0 +1,59 @@
+{
+  "code": 0,
+  "data": {
+    "as_of": "2026-09-09T02:18:17Z",
+    "blocked_by": [],
+    "entitlement": {
+      "anchor_at": "2026-09-07T02:18:17Z",
+      "effective_from": "2026-09-07T02:18:17Z",
+      "effective_to": null,
+      "id": "10bc03b3-2c1a-4972-bd25-25db85590f80",
+      "model_ids": [
+        "glm-4.6"
+      ],
+      "policy_version_id": "459d61e5-2b8d-4d66-a116-38145c1c6295",
+      "revision": 1,
+      "source_type": "subscription",
+      "status": "active"
+    },
+    "entitlement_id": "10bc03b3-2c1a-4972-bd25-25db85590f80",
+    "server_time": "2026-09-09T02:18:17Z",
+    "unit": "microcredit",
+    "windows": [
+      {
+        "activation": "on_first_consumption",
+        "disabled": false,
+        "kind": "five_hour",
+        "limit": "1000000",
+        "mode": "anchored_duration",
+        "remaining": "1000000",
+        "reserved": "0",
+        "resets_at": null,
+        "used": "0",
+        "window_start": null
+      },
+      {
+        "disabled": false,
+        "kind": "weekly",
+        "limit": "10000000",
+        "mode": "anchored_period_7d",
+        "remaining": "10000000",
+        "reserved": "0",
+        "resets_at": "2026-09-14T02:18:17Z",
+        "used": "0",
+        "window_start": "2026-09-07T02:18:17Z"
+      },
+      {
+        "disabled": false,
+        "kind": "monthly",
+        "limit": "100000000",
+        "mode": "anchored_calendar_month",
+        "remaining": "100000000",
+        "reserved": "0",
+        "resets_at": "2026-10-07T02:18:17Z",
+        "used": "0",
+        "window_start": "2026-09-07T02:18:17Z"
+      }
+    ]
+  }
+}

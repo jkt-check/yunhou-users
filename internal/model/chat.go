@@ -57,7 +57,9 @@ type ChatRequest struct {
 	SessionID string        `json:"session_id"`
 	// Model is the logical built-in model id (see GET /chat/models). Empty
 	// selects the server-configured default — pre-multi-model clients never
-	// send it and keep working unchanged.
+	// send it and keep working unchanged. When the inference-gateway
+	// migration switch is on (INFERENCE_KAYA_CHAT_GATEWAY), the facade
+	// honors it as the public model id (empty = KAYA_CHAT_MODEL).
 	Model string `json:"model,omitempty"`
 	// Tools is the OpenAI-compatible function/tool schema list, relayed
 	// verbatim to the upstream DeepSeek chat.completions `tools` field.

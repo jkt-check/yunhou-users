@@ -1,0 +1,24 @@
+{
+  "_comment": "OpenAI 官方 SDK Chat Completions 请求形状。stream_options.include_usage 是官方推荐的流式用量显式请求（本网关向上游恒开，客户端声明与否不影响计量）。",
+  "model": "codex-pro",
+  "messages": [
+    {"role": "system", "content": "You are a coding assistant."},
+    {"role": "user", "content": "List the files in the current directory."}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "run_shell",
+        "description": "Run a shell command and return its output.",
+        "parameters": {
+          "type": "object",
+          "properties": {"cmd": {"type": "string"}},
+          "required": ["cmd"]
+        }
+      }
+    }
+  ],
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}

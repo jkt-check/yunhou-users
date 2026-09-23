@@ -4,10 +4,12 @@ import (
 	"context"
 	"log"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/yunhou/users/internal/handler"
+	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/service"
@@ -39,6 +41,9 @@ func Setup(
 	wechatOAuthMock bool,
 	wechatPayMock bool,
 	usageSvc *service.UsageService,
+	adminModelsHandler *httpapi.AdminModelsHandler,
+	adminOps *httpapi.AdminOps,
+	accessOps *httpapi.AccessOps,
 	llmUsageSvc *service.LLMUsageService,
 	relayHandler *handler.RelayHandler,
 ) {
@@ -54,7 +59,6 @@ func Setup(
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
 	paymentHandler := handler.NewPaymentHandler(paymentSvc)
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
-	chatHandler := handler.NewChatHandler(chatSvc, chatAccessLog)
 	usageHandler := handler.NewUsageHandler(usageSvc)
 	llmUsageHandler := handler.NewLLMUsageHandler(llmUsageSvc)
 
@@ -114,6 +118,62 @@ func Setup(
 			return c.GetString(middleware.ContextUserID)
 		})
 		userGroup.POST("/usage/heartbeat", usageLimiter, usageHandler.PostHeartbeat)
+
+		// Kaya Coding Plan Task 5: customer API-key self-management
+		// (/user/api-keys). Ownership derives from ContextUserID set by
+		// JWTAuth above — never from request-body fields. A nil
+		// accessOps.UserAPIKeys leaves the surface unmounted (fail closed,
+		// mirroring the Task 4 operator write surface).
+		if accessOps != nil && accessOps.UserAPIKeys != nil {
+			accessOps.UserAPIKeys.Register(userGroup)
+		}
+
+		// Kaya Coding Plan Task 11: customer quota/usage/subscription read
+		// views (/user/model-*). Same ownership rule (JWT identity only);
+		// nil handlers stay unmounted (fail closed).
+		if accessOps != nil && accessOps.UserQuotas != nil {
+			accessOps.UserQuotas.Register(userGroup)
+		}
+		if accessOps != nil && accessOps.UserUsage != nil {
+			accessOps.UserUsage.Register(userGroup)
+		}
+		if accessOps != nil && accessOps.UserSubscriptions != nil {
+			accessOps.UserSubscriptions.Register(userGroup)
+		}
+		// Kaya Coding Plan Task 14: customer wallet (/user/wallet*) — 余额
+		// 总览/流水/套餐外开关/PAYG 开启；归属仅来自 JWT 身份。
+		if accessOps != nil && accessOps.UserWallet != nil {
+			accessOps.UserWallet.Register(userGroup)
+		}
+	}
+
+	// Kaya Coding Plan Task 5/8: the standard-protocol /v1 surface. The
+	// group fixes the auth chain — per-IP limiter as the outer perimeter
+	// guard, then customer API-key authentication with per-Key/account RPM
+	// buckets — so no /v1 route can ever be registered unauthenticated.
+	// This chain is independent of the operator surface: X-App-Secret is
+	// not a customer credential (设计 §9.2).
+	if accessOps != nil && accessOps.V1Auth != nil {
+		if accessOps.RPMCounter != nil {
+			go accessOps.RPMCounter.RunJanitor(ctx, time.Minute, 2*time.Minute)
+		}
+		v1 := engine.Group("/v1", middleware.RateLimit(ctx, 60, 120), accessOps.V1Auth)
+		// Task 8 protocol routes: the native OpenAI shapes, never the
+		// management envelope (设计 §9.1). Nil handlers stay unmounted.
+		if accessOps.V1Models != nil {
+			v1.GET("/models", accessOps.V1Models.List)
+		}
+		if accessOps.V1ChatCompletions != nil {
+			v1.POST("/chat/completions", accessOps.V1ChatCompletions.Create)
+		}
+		// Task 13 protocol routes: Anthropic Messages / OpenAI Responses
+		// native surfaces (same auth chain, same gateway闸门).
+		if accessOps.V1Messages != nil {
+			v1.POST("/messages", accessOps.V1Messages.Create)
+		}
+		if accessOps.V1Responses != nil {
+			v1.POST("/responses", accessOps.V1Responses.Create)
+		}
 	}
 
 	// App routes (internal service auth)
@@ -137,11 +197,25 @@ func Setup(
 	// timeout (see cmd/server timeoutMiddleware skip list) because the SSE
 	// stream can legitimately run longer; its own limiter bucket is tighter
 	// than the generic app bucket because every call spends upstream tokens.
+	//
+	// Task 8 迁移开关：accessOps.KayaChat 非空时 /chat 由 inference 网关
+	// facade 服务（INFERENCE_KAYA_CHAT_GATEWAY=1），否则保持旧 DeepSeek
+	// 直通。两条路径共用同一 handler（鉴权、限流、审计日志、SSE relay、
+	// 错误 shape 不变）。
 	chatLimiter := middleware.RateLimit(ctx, 10, 20)
+	var chatStreamSvc service.ChatStreamer = chatSvc
+	if accessOps != nil && accessOps.KayaChat != nil {
+		chatStreamSvc = accessOps.KayaChat
+	}
+	chatHandler := handler.NewChatHandler(chatStreamSvc, chatAccessLog)
 	engine.POST("/chat", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.StreamChat)
-	// Model picker for kaya: same bucket (cheap, but no reason to make it
-	// easier to hammer than chat itself).
-	engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.GetModels)
+	// GET /chat/models (Kaya 模型选择契约):facade 路径用 inference 目录
+	// (无计费账号时空列表而非报错);否则用多模型 ChatService 的权益视图。
+	if accessOps != nil && accessOps.KayaChatModels != nil {
+		engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), accessOps.KayaChatModels.List)
+	} else {
+		engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.GetModels)
+	}
 
 	// Relay(kaya 远程控制)。relayHandler 为 nil = relay 禁用(RELAY_TICKET_SECRET 未配置)。
 	if relayHandler != nil {
@@ -182,6 +256,26 @@ func Setup(
 		adminGroup.GET("/stats/active", usageHandler.GetActiveStats)
 		adminGroup.GET("/stats/usage-duration", usageHandler.GetUsageDuration)
 		adminGroup.GET("/stats/new-users", usageHandler.GetNewUsers)
+
+		// Inference model catalog (Kaya Coding Plan Task 3): read-only
+		// model/deployment/revision queries. Write endpoints (create/edit/
+		// publish/rollback) are mounted below under the Task 4 operator
+		// authorization chain — the read-only surface stays available to
+		// verified internal apps, writes require the verified user JWT +
+		// service identity combo AND the models:manage permission.
+		adminModelsHandler.RegisterReadOnly(adminGroup)
+
+		// Task 4: operator write surface — catalog writes (models:manage),
+		// credential lifecycle (credentials:manage), operator administration
+		// (admin role). The chain is InternalAppAuth (ancestor group) +
+		// JWTAuth + per-permission authorization middleware; a nil adminOps
+		// leaves the entire write surface unmounted (defence in depth for
+		// tests and misconfigured builds).
+		if adminOps != nil {
+			opsGroup := adminGroup.Group("")
+			opsGroup.Use(middleware.JWTAuth(tokenSvc))
+			adminOps.Mount(opsGroup)
+		}
 
 		// LLM token metering aggregates (migration 022).
 		adminGroup.GET("/stats/llm-usage", llmUsageHandler.GetByModel)

@@ -21,6 +21,20 @@ import (
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/handler"
+	inferenceaccess "github.com/yunhou/users/internal/inference/access"
+	inferenceaccounting "github.com/yunhou/users/internal/inference/accounting"
+	inferencecatalog "github.com/yunhou/users/internal/inference/catalog"
+	inferencecredentials "github.com/yunhou/users/internal/inference/credentials"
+	inferencedomain "github.com/yunhou/users/internal/inference/domain"
+	inferencegateway "github.com/yunhou/users/internal/inference/gateway"
+	inferencehttpapi "github.com/yunhou/users/internal/inference/httpapi"
+	inferencemanagement "github.com/yunhou/users/internal/inference/management"
+	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
+	inferenceproviders "github.com/yunhou/users/internal/inference/providers"
+	inferenceconnector "github.com/yunhou/users/internal/inference/providers/connector"
+	inferencequota "github.com/yunhou/users/internal/inference/quota"
+	inferencerouting "github.com/yunhou/users/internal/inference/routing"
+	inferenceworkers "github.com/yunhou/users/internal/inference/workers"
 	"github.com/yunhou/users/internal/llm"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/relay"
@@ -217,6 +231,177 @@ func main() {
 	usageRepo := repo.NewUsageRepo(db)
 	usageSvc := service.NewUsageService(usageRepo)
 
+	// Inference model catalog (Kaya Coding Plan Task 3): draft CRUD with
+	// optimistic locking, atomic publish/rollback and immutable snapshots
+	// over migration 024. The LLM_PROVIDERS_JSON import is explicit and
+	// idempotent: it inserts only what is missing and never overwrites
+	// DB-operational config on restart (基线报告差距 1).
+	infStore := inferencepostgres.NewStore(db)
+	// 联动校验落地（对抗评审 C1）：deployment 写路径的 RequestTimeout 上限跟
+	// 随生效的 recovery grace——调低 INFERENCE_RECOVERY_GRACE 立即收紧写闸。
+	// 必须在任何目录写入/env 导入之前完成布线。
+	inferencecatalog.SetRecoveryGrace(cfg.InferenceRecoveryGrace)
+	catalogSvc := inferencecatalog.NewService(infStore)
+
+	// Task 10: payment → entitlement closed loop. The benefit repo gates
+	// coding-plan purchasability (no plan_benefit_configs row = not
+	// purchasable, 设计 §4.3) and the outbox enqueue rides the payment
+	// transaction so a state flip and its entitlement-sync message commit
+	// or roll back together.
+	benefitRepo := repo.NewPlanBenefitRepo(db)
+	paymentSvc.SetBenefitRepo(benefitRepo)
+	paymentSvc.SetBenefitSync(infStore)
+	subSvc.SetBenefitSync(db, infStore)
+	quoteSvc.SetBenefitRepo(benefitRepo)
+	catalogCache := inferencecatalog.NewSnapshotCache(infStore, func(err error) {
+		log.Printf("WARN inference catalog snapshot refresh failed; continuing on last verified snapshot: %v", err)
+	})
+
+	// Task 4: upstream credential vault + egress guard + operator authz.
+	// Key material comes from the deployment secret (INFERENCE_CREDENTIAL_KEYS);
+	// an empty value leaves the vault nil and every credential operation
+	// fails closed. The egress validator enforces the SSRF policy on
+	// deployment base URLs at write time.
+	var credVault *inferencecredentials.Vault
+	if cfg.InferenceCredentialKeys != "" {
+		keys, current, err := inferencecredentials.ParseKeysEnv(cfg.InferenceCredentialKeys)
+		if err != nil {
+			log.Fatalf("INFERENCE_CREDENTIAL_KEYS: %v", err)
+		}
+		credVault, err = inferencecredentials.NewVault(keys, current)
+		if err != nil {
+			log.Fatalf("credential vault: %v", err)
+		}
+		log.Printf("credential vault: %d key version(s) loaded, current=v%d", len(keys), current)
+	}
+	egressValidator, err := inferencecredentials.NewEgressValidator(cfg.InferenceUpstreamAllowlist)
+	if err != nil {
+		log.Fatalf("INFERENCE_UPSTREAM_ALLOWLIST: %v", err)
+	}
+	if len(cfg.InferenceUpstreamAllowlist) > 0 {
+		log.Printf("egress policy: %d internal target(s) allowlisted", len(cfg.InferenceUpstreamAllowlist))
+	}
+	credSvc := inferencecredentials.NewService(credVault, infStore, infStore)
+	catalogMgr := inferencemanagement.NewCatalogManager(catalogSvc, infStore, egressValidator.ValidateURL)
+	adminModelsHandler := inferencehttpapi.NewAdminModelsHandler(catalogMgr)
+
+	// Task 15: 运营读模型（统计/异常/补偿追踪/变更预览）——只读派生路径，
+	// 直读权威表（inference_requests/attempts/usage_records/ledger_entries），
+	// 绝不使用 usage_events 心跳表，不触碰额度闸门的权威事务状态。
+	opsViewSvc := inferencemanagement.NewOperationsService(infStore, nil)
+
+	// Task 12: upstream OAuth connector registry + authorization/refresh
+	// services. The registry comes from the deployment secret env
+	// (INFERENCE_OAUTH_CONNECTORS_JSON); empty registry = authorization
+	// endpoints reject every connector key as unknown (fail closed). The
+	// connector HTTP client reuses the egress (SSRF) policy — vendor
+	// endpoints are outbound targets like any other upstream. This OAuth
+	// flow is fully separate from social login (GitHub/WeChat), by design.
+	oauthRegistry, err := inferenceconnector.ParseRegistry(cfg.InferenceOAuthConnectorsJSON)
+	if err != nil {
+		log.Fatalf("INFERENCE_OAUTH_CONNECTORS_JSON: %v", err)
+	}
+	connectorClient := &inferenceconnector.Client{HTTP: inferenceproviders.NewHTTPClient(egressValidator)}
+	oauthSvc := inferencecredentials.NewOAuthService(credVault, infStore, infStore, connectorClient, oauthRegistry, credSvc, nil)
+	credRefresher := inferencecredentials.NewRefresher(credVault, infStore, infStore, connectorClient, oauthRegistry, nil)
+
+	adminOps := &inferencehttpapi.AdminOps{
+		RequireModels:      inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermModelsManage),
+		RequireCredentials: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermCredentialsManage),
+		RequireAdmin:       inferencehttpapi.OperatorRequireRole(infStore, inferencemanagement.RoleAdmin),
+		// Task 14: 钱包运营面（调整/冲正/PAYG 发布配置）走 billing:adjust。
+		RequireBilling: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermBillingAdjust),
+		// Task 15: 运营统计/异常筛选/补偿追踪走 usage:read（auditor 可达）。
+		RequireUsage: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermUsageRead),
+		Models:       adminModelsHandler,
+		Credentials:  inferencehttpapi.NewAdminCredentialsHandler(credSvc),
+		Auth:         inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
+		OAuth:        inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
+		// Task 15: 补偿/冲正带同事务追加审计；补偿列表经运营读模型。
+		Adjustments: inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil, infStore, opsViewSvc),
+		// Task 15: 批量导入（dry-run/逐项错误/幂等任务 ID/绝不半发布）。
+		Bulk: inferencehttpapi.NewAdminBulkHandler(inferencemanagement.NewBulkImportService(infStore, infStore, egressValidator.ValidateURL)),
+		// Task 15: 运营统计/成本分析/异常筛选/共享账号检测/变更预览。
+		Usage: inferencehttpapi.NewAdminUsageHandler(opsViewSvc, inferencemanagement.NewPricingPreviewService(infStore, nil)),
+	}
+
+	// Task 5: customer API keys + caller principal resolution. The
+	// resolver authenticates /v1/* keys straight from the store on every
+	// call (revocation/expiry take effect immediately); the key service
+	// backs /user/api-keys with ownership bound to the JWT identity.
+	accessResolver := inferenceaccess.NewResolver(infStore, nil)
+	keySvc := inferenceaccess.NewKeyService(infStore, nil)
+	rpmCounter := inferenceaccess.NewRPMCounter(nil)
+
+	// Task 8: the inference gateway — adapters, routing (account pool +
+	// concurrency leases), quota admission, and the orchestration service
+	// that pins ONE catalog snapshot per call (设计 §5: catalogCache 按请求
+	// pin；发布原子切换在各进程有界延迟内生效).
+	adapters := map[inferencedomain.Protocol]inferenceproviders.Adapter{
+		inferencedomain.ProtocolOpenAIChat:       inferenceproviders.NewOpenAIChat(),
+		inferencedomain.ProtocolAnthropicMessage: inferenceproviders.NewAnthropicMessages(),
+	}
+	routingSvc := inferencerouting.NewService(infStore, adapters, nil)
+	quotaSvc := inferencequota.NewService(infStore, nil)
+	entitlementResolver := inferenceaccess.NewEntitlementResolver(infStore, nil)
+	gatewayHTTPClient := inferenceproviders.NewHTTPClient(egressValidator)
+	gatewaySvc := inferencegateway.NewService(
+		catalogCache, infStore, entitlementResolver, quotaSvc, routingSvc,
+		credSvc, gatewayHTTPClient, egressValidator, nil)
+	// Task 13: sticky-session binder wiring (Responses 会话链钉住上游账号;
+	// 失效显式迁移,绝不静默换号 — Task 12 binder 语义).
+	gatewaySvc.SetSessionBinder(inferencerouting.NewSessionBinder(infStore, nil))
+
+	// Sellable gate for the published-model listings (/v1/models and
+	// /chat/models): a model without an effective sale-credit price version
+	// is NOT sellable (新模型默认不可售; deny by default).
+	catalogSvc.SetPriceCheck(func(ctx context.Context, modelID string) (bool, error) {
+		_, err := infStore.LatestPriceVersion(ctx, modelID, string(inferenceaccounting.PriceSaleCredit), time.Now())
+		if err != nil {
+			if inferencedomain.CodeOf(err) == inferencedomain.CodeNotFound {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+
+	accessOps := &inferencehttpapi.AccessOps{
+		UserAPIKeys:       inferencehttpapi.NewUserAPIKeysHandler(keySvc),
+		V1Auth:            inferencehttpapi.APIKeyAuth(accessResolver, rpmCounter, cfg.InferenceAccountRPM),
+		RPMCounter:        rpmCounter,
+		V1Models:          inferencehttpapi.NewModelsHandler(catalogSvc, accessResolver),
+		V1ChatCompletions: inferencehttpapi.NewChatCompletionsHandler(gatewaySvc),
+		// Task 13: Anthropic Messages / OpenAI Responses 编程工具面（与 chat
+		// 面共用同一 principal/预占/结算链；Responses 会话链落库 + 粘性会话
+		// 绑定经 routing.SessionBinding）。
+		V1Messages:  inferencehttpapi.NewMessagesHandler(gatewaySvc),
+		V1Responses: inferencehttpapi.NewResponsesHandler(gatewaySvc, infStore, nil),
+		// Task 11: customer quota/usage/subscription read views over the
+		// inference store (quota reads are the authoritative current state;
+		// usage reads carry as_of/complete_through).
+		UserQuotas:        inferencehttpapi.NewUserQuotasHandler(inferencemanagement.NewQuotaViewService(infStore, nil)),
+		UserUsage:         inferencehttpapi.NewUserUsageHandler(inferencemanagement.NewUsageViewService(infStore, nil)),
+		UserSubscriptions: inferencehttpapi.NewUserSubscriptionsHandler(inferencemanagement.NewSubscriptionViewService(infStore, nil)),
+		// Task 14: 客户钱包面（派生余额/流水/套餐外开关/PAYG 开启）。
+		UserWallet: inferencehttpapi.NewUserWalletHandler(infStore, nil),
+	}
+	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
+	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
+	if cfg.InferenceKayaChatGateway {
+		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, cfg.KayaChatModel)
+		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, cfg.KayaChatModel)
+		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
+	}
+	if cfg.LLMProvidersJSON != "" {
+		res, err := catalogSvc.ImportEnvCatalog(context.Background(), cfg.LLMProvidersJSON)
+		if err != nil {
+			log.Fatalf("LLM_PROVIDERS_JSON import failed: %v", err)
+		}
+		log.Printf("LLM_PROVIDERS_JSON import: +%d providers, +%d models, +%d deployments, +%d routes, %d already present (skipped)",
+			res.ProvidersInserted, res.ModelsInserted, res.DeploymentsInserted, res.RoutesInserted, res.Skipped)
+	}
+
 	// Chat access audit log: one JSON line per request (user_id, session_id,
 	// input, output, status, duration). Optional — empty CHAT_LOG_PATH
 	// disables it. Fail-fast when configured but unopenable: silently
@@ -232,8 +417,10 @@ func main() {
 		chatAccessLog = log.New(f, "", 0) // no prefix/ts — the JSON line carries its own ts
 	}
 
-	// Order expiry sweeper (in-process goroutine).
+	// Order expiry sweeper (in-process goroutine). Also marks naturally
+	// lapsed entitlements 'expired' on the same cadence (Task 10).
 	sweeper := service.NewOrderSweeper(orderRepo, cfg.SweeperInterval)
+	sweeper.SetEntitlementExpirer(infStore)
 
 	// One-shot secret backfill for rows created before migration 007_app_secret
 	// added the secret_hash column. Idempotent — once every row has a hash,
@@ -261,15 +448,18 @@ func main() {
 	// Bound how long any handler can run before the client disconnects, to
 	// limit the blast radius of a slow downstream call (e.g. the OAuth
 	// provider timeout is 10s; we leave a little headroom here).
-	// /chat is exempt: it relays an upstream SSE stream whose legitimate
-	// lifetime exceeds 20s. Its own safety net is chatUpstreamTimeout
-	// (5m, inside ChatService) plus a per-response write deadline set by
-	// the chat handler (the server-wide WriteTimeout below is an absolute
+	// /chat and /v1/chat/completions are exempt: both relay upstream SSE
+	// streams whose legitimate lifetime exceeds 20s. Their own safety nets
+	// are per-attempt deployment request timeouts (gateway, Task 8) /
+	// chatUpstreamTimeout (legacy /chat) plus per-response write deadlines
+	// set by the handlers (the server-wide WriteTimeout below is an absolute
 	// per-request deadline — it would hard-cut a longer stream).
+	// Task 13: /v1/messages and /v1/responses get the same exemption (same
+	// SSE relay pattern, same per-response write deadline in the handlers).
 	// /relay/ws is exempt too: it is a WebSocket long connection that must
 	// never sit under the 20s cap (its liveness bounds are the relay
 	// ping/idle timers in internal/relay).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/relay/ws"))
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses", "/relay/ws"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,
@@ -292,6 +482,62 @@ func main() {
 
 	sweeper.Start(rootCtx)
 
+	// Task 9: settlement recovery worker — crash recovery for stranded
+	// in-flight requests (conservative-estimate settlement = reserved hold,
+	// reconciliation queue, deadline escalation, ledger/window rebuild
+	// check). Never zeroes unknown usage, never releases by TTL alone, never
+	// double-charges (guarded transitions + unique keys). The verifier is
+	// nil: mainstream Chat/Messages upstreams have no per-request execution
+	// query API (设计 §7.2 补充段), so recovery always estimates.
+	recoveryWorker := inferenceworkers.NewSettlementRecovery(infStore, nil, inferenceworkers.RecoveryConfig{
+		Interval:               cfg.InferenceRecoveryInterval,
+		BatchLimit:             cfg.InferenceRecoveryBatch,
+		Grace:                  cfg.InferenceRecoveryGrace,
+		ReconciliationDeadline: cfg.InferenceReconciliationDeadline,
+	}, nil)
+	go recoveryWorker.Start(rootCtx)
+
+	// Task 10: entitlement sync worker — consumes the inference_outbox
+	// messages the payment pipeline enqueues in the SAME transaction as the
+	// payment state flip, and converges entitlements to the state demanded
+	// by (subscription, paying order snapshot). Idempotent and order-safe
+	// by construction (access.DecideSync/Converge).
+	entitlementSyncWorker := inferenceworkers.NewEntitlementSync(infStore, nil, inferenceworkers.EntitlementSyncConfig{
+		Interval:   cfg.InferenceEntitlementSyncInterval,
+		BatchLimit: cfg.InferenceEntitlementSyncBatch,
+	})
+	go entitlementSyncWorker.Start(rootCtx)
+
+	// Task 14: wallet sync worker — consumes wallet.sync outbox messages
+	// (余额充值入账/现金退款), idempotent by business key (重复回调只生效
+	// 一次); reuses the entitlement-sync tuning knobs.
+	walletSyncWorker := inferenceworkers.NewWalletSync(infStore, nil, inferenceworkers.EntitlementSyncConfig{
+		Interval:   cfg.InferenceEntitlementSyncInterval,
+		BatchLimit: cfg.InferenceEntitlementSyncBatch,
+	})
+	go walletSyncWorker.Start(rootCtx)
+
+	// Task 12: OAuth credential refresh + upstream health workers. The
+	// refresh worker rotates expiring oauth credentials under a cross-
+	// instance advisory lock + generation CAS (双实例同时刷新安全：输家收敛
+	// 不覆盖); vendor-side invalid_grant flips bound accounts to
+	// reauth_required and ends their session bindings in one transaction.
+	// The health worker probes accounts, observes upstream quota snapshots
+	// (unknown stays unknown — never derived from customer balances), and
+	// cools down / recovers accounts on retryable failures.
+	credentialRefreshWorker := inferenceworkers.NewCredentialRefresh(infStore, credRefresher, inferenceworkers.CredentialRefreshConfig{
+		Interval:    cfg.InferenceCredentialRefreshInterval,
+		BatchLimit:  cfg.InferenceCredentialRefreshBatch,
+		RefreshSkew: cfg.InferenceCredentialRefreshSkew,
+	}, nil)
+	go credentialRefreshWorker.Start(rootCtx)
+	upstreamHealthWorker := inferenceworkers.NewUpstreamHealth(infStore, credVault, connectorClient, credRefresher, oauthRegistry, infStore, inferenceworkers.UpstreamHealthConfig{
+		Interval:   cfg.InferenceUpstreamHealthInterval,
+		BatchLimit: cfg.InferenceUpstreamHealthBatch,
+		Cooldown:   cfg.InferenceUpstreamHealthCooldown,
+	}, nil)
+	go upstreamHealthWorker.Start(rootCtx)
+
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 
@@ -300,7 +546,8 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, service.NewLLMUsageService(llmUsageRepo), relayHandler)
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps, accessOps,
+		service.NewLLMUsageService(llmUsageRepo), relayHandler)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

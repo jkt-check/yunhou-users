@@ -40,8 +40,15 @@ services:
     build: .
     image: yunhou-users:latest
     profiles: ["migrate"]
-    command: ["/migrate"]
+    # The image ENTRYPOINT is /server; `command` alone would only append an
+    # argument to it. Override the entrypoint so this service runs the
+    # migrate binary (`docker compose run --rm migrate [-status]`).
+    entrypoint: ["/migrate"]
     env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # same as app: resolves to host's docker bridge gateway
+    volumes:
+      - ./keys:/keys:ro         # migrate also initializes the token service (RSA keys)
     # Read-only root + no cap_drop override — the runtime image is already
     # hardened for the long-running server, and a one-shot migrate run
     # benefits from the same posture (no DB writes beyond SQL).

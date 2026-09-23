@@ -39,17 +39,19 @@ func goldenStripePaid(orderID, txnID string, amount int64) []byte {
 }
 
 func goldenAlipayPaid(orderID, txnID string, amount string) string {
-	// Alipay sends form-encoded key=value&key=value.
+	// Alipay sends form-encoded key=value&key=value. 真实形态（评审轮4）：
+	// notify_type 恒为 trade_status_sync，判别由 trade_status 驱动。
 	return fmt.Sprintf(
-		"out_trade_no=%s&trade_no=%s&total_amount=%s&notify_id=n_e2e_%s&notify_type=trade_status_sync&gmt_payment=2024-01-01+12:00:00",
+		"out_trade_no=%s&trade_no=%s&total_amount=%s&notify_id=n_e2e_%s&notify_type=trade_status_sync&trade_status=TRADE_SUCCESS&gmt_payment=2024-01-01+12:00:00",
 		orderID, txnID, amount, orderID,
 	)
 }
 
 func goldenAlipayRefund(orderID, txnID, refundAmount string) string {
+	// 真实形态：全额退款关单 = TRADE_CLOSED + refund_fee（累计）+ out_biz_no。
 	return fmt.Sprintf(
-		"out_trade_no=%s&trade_no=%s&total_amount=29.90&refund_amount=%s&notify_id=n_e2e_refund_%s&notify_type=trade_closed",
-		orderID, txnID, refundAmount, orderID,
+		"out_trade_no=%s&trade_no=%s&total_amount=29.90&refund_fee=%s&out_biz_no=biz_e2e_%s&notify_id=n_e2e_refund_%s&notify_type=trade_status_sync&trade_status=TRADE_CLOSED",
+		orderID, txnID, refundAmount, orderID, orderID,
 	)
 }
 
@@ -312,15 +314,16 @@ func TestWebhook_Alipay_PaymentSucceeded(t *testing.T) {
 	orderID := r.Data.ID
 
 	// Build unsigned params, sign with the e2e Alipay private key.
-	// Drop gmt_payment to avoid timezone/whitespace edge cases in canonical
-	// encoding — the verifier doesn't enforce the replay window when the
-	// field is absent (ReplayWindow defaults to 0 = disabled).
+	// 真实形态（评审轮4）：notify_type=trade_status_sync + trade_status 驱动
+	// 判别；notify_time 在场（A-2 起不再按时间窗拒绝，验签即可）。
 	params := map[string]string{
 		"out_trade_no": orderID,
 		"trade_no":     "2023110_e2e",
 		"total_amount": "29.90",
 		"notify_id":    fmt.Sprintf("n_e2e_%s", orderID),
 		"notify_type":  "trade_status_sync",
+		"trade_status": "TRADE_SUCCESS",
+		"notify_time":  time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"),
 	}
 	body := signAlipay(t, params)
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", body, nil)
@@ -361,13 +364,14 @@ func TestWebhook_Alipay_FullRefund(t *testing.T) {
 	txnID := "alipay_e2e_" + orderID
 	// Settle the order via the signed Alipay TRADE_SUCCESS webhook —
 	// the confirm endpoint no longer marks orders paid without upstream
-	// verification (2026-08 trust-model fix).
+	// verification (2026-08 trust-model fix). 真实形态（评审轮4）。
 	payParams := map[string]string{
 		"out_trade_no": orderID,
 		"trade_no":     txnID,
 		"total_amount": "29.90",
 		"notify_id":    fmt.Sprintf("n_e2e_paid_%s", orderID),
 		"notify_type":  "trade_status_sync",
+		"trade_status": "TRADE_SUCCESS",
 	}
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", signAlipay(t, payParams), nil)
 	if resp.StatusCode != http.StatusOK {
@@ -375,14 +379,18 @@ func TestWebhook_Alipay_FullRefund(t *testing.T) {
 	}
 
 	// Send full-refund webhook with the SAME txn_id the channel uses to
-	// identify this payment.
+	// identify this payment. 真实形态：TRADE_CLOSED + refund_fee（累计全
+	// 额）+ gmt_refund + out_biz_no；refund_amount 字段不存在于真实报文。
 	params := map[string]string{
-		"out_trade_no":  orderID,
-		"trade_no":      txnID,
-		"total_amount":  "29.90",
-		"refund_amount": "29.90",
-		"notify_id":     fmt.Sprintf("n_e2e_refund_%s", orderID),
-		"notify_type":   "trade_closed",
+		"out_trade_no": orderID,
+		"trade_no":     txnID,
+		"total_amount": "29.90",
+		"refund_fee":   "29.90",
+		"gmt_refund":   "2026-09-12 21:30:00",
+		"out_biz_no":   "biz_e2e_" + orderID,
+		"notify_id":    fmt.Sprintf("n_e2e_refund_%s", orderID),
+		"notify_type":  "trade_status_sync",
+		"trade_status": "TRADE_CLOSED",
 	}
 	body := signAlipay(t, params)
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", body, nil)
@@ -408,6 +416,220 @@ func TestWebhook_Alipay_FullRefund(t *testing.T) {
 	}
 	if subStatus != "cancelled" {
 		t.Errorf("expected subscription.status=cancelled, got %s", subStatus)
+	}
+}
+
+// ============================================================================
+// 评审轮4 Critical-1 回归：真实未支付超时关单不得被结算为已支付
+// ============================================================================
+
+func TestWebhook_Alipay_UnpaidTimeoutClose(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token := loginAndGetTokens(t, srv.Engine, "alipay-close", "yundian").AccessToken
+
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"monthly","channel":"alipay"}`, authHeader(token))
+	var r struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+
+	// 真实形态：trade_status_sync + TRADE_CLOSED + total_amount=订单全额、
+	// 无 refund_fee（未支付关单不携退款额）。判别必须走关单/audit 路径 —
+	// 订单保持未支付、无支付行、无订阅、无钱包动作。
+	params := map[string]string{
+		"out_trade_no": orderID,
+		"trade_no":     "2023111_e2e_close",
+		"total_amount": "29.90",
+		"notify_id":    fmt.Sprintf("n_e2e_close_%s", orderID),
+		"notify_type":  "trade_status_sync",
+		"trade_status": "TRADE_CLOSED",
+		"gmt_close":    "2026-09-12 22:00:00",
+	}
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", signAlipay(t, params), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("close webhook: %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+	var status string
+	if err := srv.DB.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Errorf("unpaid close must NOT settle the order, got status=%s (Critical-1 回归)", status)
+	}
+	var payments, subs int
+	if err := srv.DB.GetContext(context.Background(), &payments,
+		`SELECT count(*) FROM payments WHERE order_id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if payments != 0 {
+		t.Errorf("payments = %d, want 0 (未支付关单不得落支付行)", payments)
+	}
+	var orderUserID string
+	if err := srv.DB.GetContext(context.Background(), &orderUserID,
+		`SELECT user_id FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.DB.GetContext(context.Background(), &subs,
+		`SELECT count(*) FROM subscriptions WHERE user_id = $1`, orderUserID); err != nil {
+		t.Fatal(err)
+	}
+	if subs != 0 {
+		t.Errorf("subscriptions = %d, want 0 (未支付关单不得发权益)", subs)
+	}
+	// audit 痕：未支付关单被识别（webhook_refund_unpaid_order）。
+	var audits int
+	if err := srv.DB.GetContext(context.Background(), &audits,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_unpaid_order'`); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 {
+		t.Errorf("unpaid-order audit rows = %d, want 1", audits)
+	}
+}
+
+// ============================================================================
+// 评审轮4 A-2：>5min 的同一签名报文重投仍可被接受并按幂等去重
+// ============================================================================
+
+func TestWebhook_Alipay_LateRetryAcceptedAndDeduped(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token := loginAndGetTokens(t, srv.Engine, "alipay-retry", "yundian").AccessToken
+
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"monthly","channel":"alipay"}`, authHeader(token))
+	var r struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+
+	// notify_time 三小时前（远超旧 5 分钟重放窗）——Alipay 重投计划内的同
+	// 一份签名报文。
+	params := map[string]string{
+		"out_trade_no": orderID,
+		"trade_no":     "2023113_e2e_retry",
+		"total_amount": "29.90",
+		"notify_id":    fmt.Sprintf("n_e2e_retry_%s", orderID),
+		"notify_type":  "trade_status_sync",
+		"trade_status": "TRADE_SUCCESS",
+		"notify_time":  time.Now().Add(-3 * time.Hour).In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"),
+	}
+	body := signAlipay(t, params)
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", body, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first delivery (3h-old notify_time) must be accepted: %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+// 同一报文原样重投 → 200 "success"（评审轮5 Minor-1 应答契约），
+	// webhook_events 幂等去重吸收（重放防护归位幂等表，而非时间窗）。
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", body, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("retry of the same signed payload must be accepted: %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+	if string(resp.Body) != "success" {
+		t.Errorf("alipay ack body = %q, want \"success\"", string(resp.Body))
+	}
+	var payments int
+	if err := srv.DB.GetContext(context.Background(), &payments,
+		`SELECT count(*) FROM payments WHERE order_id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if payments != 1 {
+		t.Errorf("payments = %d, want 1 (重投幂等，不重复入账)", payments)
+	}
+	// 同一 event_id 只有一行且已处理（重投被去重吸收）。
+	var processed int
+	if err := srv.DB.GetContext(context.Background(), &processed,
+		`SELECT count(*) FROM webhook_events WHERE channel = 'alipay' AND event_id = $1 AND processed_at IS NOT NULL`,
+		fmt.Sprintf("n_e2e_retry_%s", orderID)); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 {
+		t.Errorf("processed webhook_events = %d, want 1 (同一通知重投被幂等去重)", processed)
+	}
+}
+
+// ============================================================================
+// 评审轮5 Critical：WAIT_BUYER_PAY（真实"交易创建"触发）穿透防护——
+// total_amount 齐全也绝不得被结算为已支付
+// ============================================================================
+
+func TestWebhook_Alipay_WaitBuyerPay_Inert(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token := loginAndGetTokens(t, srv.Engine, "alipay-wbp", "yundian").AccessToken
+
+	resp := doRequest(t, srv.Engine, http.MethodPost, "/payments/orders",
+		`{"plan_id":"monthly","channel":"alipay"}`, authHeader(token))
+	var r struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	resp.JSON(t, &r)
+	orderID := r.Data.ID
+
+	// 真实形态：trade_status_sync + WAIT_BUYER_PAY + total_amount 齐全。
+	// 必须惰性（trade_pending → ack 200 零域动作）：订单保持 pending、零
+	// 支付行、零订阅、应答体纯文本 "success"。
+	params := map[string]string{
+		"out_trade_no": orderID,
+		"trade_no":     "2023116_e2e_wbp",
+		"total_amount": "29.90",
+		"notify_id":    fmt.Sprintf("n_e2e_wbp_%s", orderID),
+		"notify_type":  "trade_status_sync",
+		"trade_status": "WAIT_BUYER_PAY",
+		"gmt_create":   "2026-09-12 22:30:00",
+	}
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/webhooks/payment/alipay", signAlipay(t, params), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("WAIT_BUYER_PAY webhook: %d — body: %s", resp.StatusCode, string(resp.Body))
+	}
+	if string(resp.Body) != "success" {
+		t.Errorf("alipay ack body = %q, want \"success\"", string(resp.Body))
+	}
+	var status string
+	if err := srv.DB.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Errorf("WAIT_BUYER_PAY must NOT settle the order, got status=%s (评审轮5 Critical)", status)
+	}
+	var payments, subs int
+	if err := srv.DB.GetContext(context.Background(), &payments,
+		`SELECT count(*) FROM payments WHERE order_id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if payments != 0 {
+		t.Errorf("payments = %d, want 0", payments)
+	}
+	var orderUserID string
+	if err := srv.DB.GetContext(context.Background(), &orderUserID,
+		`SELECT user_id FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.DB.GetContext(context.Background(), &subs,
+		`SELECT count(*) FROM subscriptions WHERE user_id = $1`, orderUserID); err != nil {
+		t.Fatal(err)
+	}
+	if subs != 0 {
+		t.Errorf("subscriptions = %d, want 0 (钱未到账不得发权益)", subs)
+	}
+	// 审计留痕：事件行落库且已处理（后续 TRADE_SUCCESS 到达仍会被正常处理）。
+	var processed int
+	if err := srv.DB.GetContext(context.Background(), &processed,
+		`SELECT count(*) FROM webhook_events WHERE channel = 'alipay' AND event_id = $1 AND processed_at IS NOT NULL`,
+		fmt.Sprintf("n_e2e_wbp_%s", orderID)); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 {
+		t.Errorf("processed webhook_events = %d, want 1 (audit-only ack)", processed)
 	}
 }
 

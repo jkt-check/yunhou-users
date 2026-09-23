@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/yunhou/users/internal/billing/wechat"
+	"github.com/yunhou/users/internal/inference/access"
+	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
@@ -63,6 +66,28 @@ var ErrPlanMissingForExpiry = errors.New("plan missing for sub-expiry fallback")
 // paid and ops refunds manually — but the subscription is left
 // untouched and the call sites audit-log "downgrade_activation_blocked".
 var ErrDowngradeActivationBlocked = errors.New("activation blocked: would downgrade an active longer-cycle subscription")
+
+// ErrPlanNotPurchasable is returned by CreateOrder (and the quote gate)
+// when a coding-plan plan has no plan_benefit_configs row — the product's
+// "payment configuration" (设计 §4.3: 没有配置的商品保持草稿或不可购买).
+// Without the mapping the service could not grant anything on payment, so
+// the order is refused up front instead of minting an orphan.
+var ErrPlanNotPurchasable = errors.New("plan is not purchasable: no payment/benefit configuration")
+
+// ErrPlanUpgradeNotConfigured is returned by CreateOrder when a coding-plan
+// order would cross tiers without a plan_upgrade_rules row (设计 §4.2:
+// 商品未配置升级报价规则时不开放即时跨档升级). The legacy
+// "longer-interval is an upgrade" rule is NOT applied to coding-plan —
+// only an explicit configured rule allows a cross-plan order there.
+var ErrPlanUpgradeNotConfigured = errors.New("cross-tier upgrade is not configured for this plan pair")
+
+// ErrOrderActivationConflict is returned by the coding-plan activation
+// resolver when a PAID order conflicts with a different active plan at
+// activation time (e.g. a stale order paid after the user changed tiers).
+// Same handling shape as ErrDowngradeActivationBlocked: the payment is
+// honored, the subscription/entitlement stay untouched, and the call
+// sites audit-log "activation_conflict_blocked" for ops to refund.
+var ErrOrderActivationConflict = errors.New("activation blocked: order conflicts with the current active plan")
 
 // channelRequiredCurrency describes the settlement currency required by the
 // channels that only support one currency in this service. Plans remain the
@@ -121,6 +146,125 @@ type PaymentService struct {
 	// sets this on INSERT (SQL DEFAULT is also 30 min; setting explicitly
 	// makes it configurable without re-migrating).
 	orderExpiry time.Duration
+
+	// benefitRepo reads the plan→benefit mapping and configured upgrade
+	// rules (migration 029). Nil in deployments/tests without the
+	// inference module: coding-plan orders are then refused at the
+	// benefit-config gate (fail-closed), kaya orders are unaffected.
+	benefitRepo repo.PlanBenefitRepo
+
+	// benefitSync enqueues entitlement-sync messages into
+	// inference_outbox INSIDE the payment transaction (同事务 outbox,
+	// Task 10): the message commits iff the payment state transition
+	// commits, and the entitlement-sync worker converges idempotently.
+	// Nil = feature off (unit tests); production wires it always.
+	benefitSync BenefitSyncOutbox
+}
+
+// BenefitSyncOutbox is the narrow surface PaymentService needs from the
+// inference module: enqueue one outbox row into the caller's *sqlx.Tx.
+// Implemented by inference/postgres.Store.
+type BenefitSyncOutbox interface {
+	EnqueueOutboxSQLTx(ctx context.Context, tx *sqlx.Tx, topic string, payload json.RawMessage, dedupKey *string) (int64, error)
+}
+
+// SetBenefitRepo wires the plan benefit/upgrade-rule reads (migration 029).
+// Production calls this unconditionally; without it coding-plan orders are
+// refused (fail-closed) and kaya orders behave exactly as before.
+func (s *PaymentService) SetBenefitRepo(r repo.PlanBenefitRepo) { s.benefitRepo = r }
+
+// SetBenefitSync wires the transactional outbox enqueue used to drive
+// entitlement grants after payment state transitions.
+func (s *PaymentService) SetBenefitSync(o BenefitSyncOutbox) { s.benefitSync = o }
+
+// enqueueBenefitSync appends one entitlement-sync message inside the
+// caller's payment transaction. A nil benefitSync (unit tests) or a fake
+// tx skips silently; a real enqueue failure aborts the caller's
+// transaction so the payment transition and its outbox message commit or
+// roll back together.
+func (s *PaymentService) enqueueBenefitSync(ctx context.Context, tx dbTx, msg access.EntitlementSyncMessage, dedupKey *string) error {
+	if s.benefitSync == nil {
+		return nil
+	}
+	raw := rawSQLXTx(tx)
+	if raw == nil {
+		return nil
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal benefit sync message: %w", err)
+	}
+	if _, err := s.benefitSync.EnqueueOutboxSQLTx(ctx, raw, access.TopicEntitlementSync, payload, dedupKey); err != nil {
+		return fmt.Errorf("enqueue benefit sync: %w", err)
+	}
+	return nil
+}
+
+// enqueueWalletSync appends one wallet-sync message inside the caller's
+// payment transaction (Task 14; same 同事务 outbox contract as
+// enqueueBenefitSync, on the wallet.sync topic).
+func (s *PaymentService) enqueueWalletSync(ctx context.Context, tx dbTx, msg access.WalletSyncMessage, dedupKey *string) error {
+	if s.benefitSync == nil {
+		return nil
+	}
+	raw := rawSQLXTx(tx)
+	if raw == nil {
+		return nil
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal wallet sync message: %w", err)
+	}
+	if _, err := s.benefitSync.EnqueueOutboxSQLTx(ctx, raw, access.TopicWalletSync, payload, dedupKey); err != nil {
+		return fmt.Errorf("enqueue wallet sync: %w", err)
+	}
+	return nil
+}
+
+// walletTopupMicros converts the order's frozen amount (decimal major
+// units — the payment boundary contract stays as-is) into wallet micros,
+// strictly, without float accumulation (设计 §7.1: 进入模型账本时严格转换).
+func walletTopupMicros(amount float64, currency string) (int64, error) {
+	return accounting.MicrosFromDecimalMajor(strconv.FormatFloat(amount, 'f', 6, 64), currency)
+}
+
+// enqueueWalletTopup enqueues the cash top-up for one settled wallet-topup
+// order (dedup 钉 payment_id；消费侧按 wallet:topup:{payment_id} 业务键幂
+// 等入账，重复回调/Confirm/webhook/补单竞争只入账一次).
+func (s *PaymentService) enqueueWalletTopup(ctx context.Context, tx dbTx, order *model.Order, paymentID string) error {
+	micros, err := walletTopupMicros(order.Amount, order.Currency)
+	if err != nil {
+		return fmt.Errorf("wallet topup amount: %w", err)
+	}
+	dedup := access.WalletTopupDedupKey(paymentID)
+	return s.enqueueWalletSync(ctx, tx, access.WalletSyncMessage{
+		Kind: access.WalletSyncTopup, UserID: order.UserID, OrderID: order.ID,
+		PaymentID: paymentID, AmountMicros: micros, Currency: order.Currency,
+	}, &dedup)
+}
+
+// enqueueWalletRefund enqueues the cash refund of one wallet-topup payment
+// (dedup 钉 refund_id；消费侧 wallet:refund:{refund_id} 幂等). 退款只允许
+// 现金来源原路退——赠送余额由钱包侧 CHECK/纯规则双兜底排除。
+func (s *PaymentService) enqueueWalletRefund(ctx context.Context, tx dbTx, order *model.Order, paymentID, refundID string, amount float64) error {
+	micros, err := walletTopupMicros(amount, order.Currency)
+	if err != nil {
+		return fmt.Errorf("wallet refund amount: %w", err)
+	}
+	dedup := access.WalletRefundDedupKey(refundID)
+	return s.enqueueWalletSync(ctx, tx, access.WalletSyncMessage{
+		Kind: access.WalletSyncRefund, UserID: order.UserID, OrderID: order.ID,
+		PaymentID: paymentID, RefundID: refundID, AmountMicros: micros, Currency: order.Currency,
+	}, &dedup)
+}
+
+// orderTouchesBenefits reports whether paying/refunding/failing this order
+// can move an entitlement: either the order froze a benefit snapshot
+// (post-029 benefit-bearing products) or it belongs to the coding-plan
+// product (whose entitlement must be re-converged even when the individual
+// order — e.g. a synthetic renewal row — carries no snapshot).
+func orderTouchesBenefits(o *model.Order, productCode string) bool {
+	return o.BenefitPolicyVersionID != nil || productCode == model.ProductCodingPlan
 }
 
 // RefundAPI is the channel-side refund call. The service is the caller;
@@ -230,15 +374,90 @@ func (s *PaymentService) txLookupPlan(ctx context.Context, tx *sqlx.Tx, planID s
 	return s.planRepo.FindByID(ctx, planID)
 }
 
-// txLookupActiveSubscription reads the user's current active sub, sharing
-// the surrounding tx's connection when one is in flight. Returns nil/nil
-// when no active sub exists (sql.ErrNoRows is swallowed at the call site
-// for retry-preservation lookups).
-func (s *PaymentService) txLookupActiveSubscription(ctx context.Context, tx *sqlx.Tx, userID string) (*model.Subscription, error) {
+// txLookupActiveSubscription reads the user's current active sub for one
+// product, sharing the surrounding tx's connection when one is in flight.
+// Returns nil/nil when no active sub exists (sql.ErrNoRows is swallowed at
+// the call site for retry-preservation lookups). productCode comes from the
+// order's plan row (never from the user's other subscriptions); an empty
+// productCode (plan row missing — activation will be skipped via
+// ErrPlanMissingForExpiry) matches no rows, which is the safe outcome.
+func (s *PaymentService) txLookupActiveSubscription(ctx context.Context, tx *sqlx.Tx, userID, productCode string) (*model.Subscription, error) {
 	if tx != nil {
-		return s.subRepo.FindActiveByUserIDTx(ctx, tx, userID)
+		return s.subRepo.FindActiveByUserAndProductTx(ctx, tx, userID, productCode)
 	}
-	return s.subRepo.FindActiveByUserID(ctx, userID)
+	return s.subRepo.FindActiveByUserAndProduct(ctx, userID, productCode)
+}
+
+// resolveOrderProduct prefers the order's frozen product snapshot
+// (migration 029) and falls back to the live plan row for orders created
+// before 029 (their snapshot columns are NULL by definition).
+func (s *PaymentService) resolveOrderProduct(ctx context.Context, tx *sqlx.Tx, order *model.Order) (string, error) {
+	if pc := order.SnapshotProductCode(); pc != "" {
+		return pc, nil
+	}
+	return s.productCodeForPlan(ctx, tx, order.PlanID)
+}
+
+// resolveOrderActivation computes the expires_at a PAID order writes onto
+// the subscription, choosing the resolver by what the order froze at
+// creation time (migration 029):
+//
+//   - coding-plan orders (OrderKind set): access.ResolveCodingPlanActivation
+//     over the ORDER SNAPSHOT — the product's own tier/cycle rules, no live
+//     plan reads, conflicts return ErrOrderActivationConflict;
+//   - legacy orders (no kind): resolveSubExpiry unchanged, except the new
+//     plan's interval comes from the order snapshot when present (调价/
+//     周期调整不影响已下单订单).
+//
+// Returned errors the call sites treat as "audit + honor payment + skip
+// activation": ErrPlanMissingForExpiry, ErrDowngradeActivationBlocked,
+// ErrOrderActivationConflict.
+func (s *PaymentService) resolveOrderActivation(ctx context.Context, tx *sqlx.Tx, order *model.Order, orderProduct string, hint, preservedExpiry *time.Time) (*time.Time, error) {
+	if order.SnapshotOrderKind() != "" {
+		// Same retry short-circuit as the legacy path: a re-delivered
+		// already-paid payment preserves the active sub's expiry instead
+		// of rolling it forward a second time.
+		if preservedExpiry != nil {
+			return preservedExpiry, nil
+		}
+		existing, err := s.txLookupActiveSubscription(ctx, tx, order.UserID, orderProduct)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("find active sub for coding-plan activation: %w", err)
+		}
+		var current *access.SubscriptionState
+		if existing != nil {
+			current = &access.SubscriptionState{
+				ID: existing.ID, UserID: existing.UserID, PlanID: existing.PlanID,
+				ProductCode: existing.ProductCode, Status: existing.Status, ExpiresAt: existing.ExpiresAt,
+			}
+		}
+		act, err := access.ResolveCodingPlanActivation(order.SnapshotOrderKind(), order.SnapshotIntervalDays(),
+			order.UpgradeFromPlanID, order.PlanID, current, hint, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		if act.Blocked != "" {
+			return nil, fmt.Errorf("%w: %s", ErrOrderActivationConflict, act.Blocked)
+		}
+		return act.ExpiresAt, nil
+	}
+	return s.resolveSubExpiry(ctx, tx, order.UserID, order.PlanID, orderProduct, hint, preservedExpiry, order.SnapshotIntervalDays())
+}
+
+// productCodeForPlan resolves the commercial product a plan belongs to.
+// A missing plan row returns ("", nil): the plan-missing case is reported
+// downstream by resolveSubExpiry (ErrPlanMissingForExpiry), and an empty
+// product code makes the product-scoped subscription lookups return no
+// rows — the same shape as "user has no active sub in this product".
+func (s *PaymentService) productCodeForPlan(ctx context.Context, tx *sqlx.Tx, planID string) (string, error) {
+	plan, err := s.txLookupPlan(ctx, tx, planID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return plan.ProductCode, nil
 }
 
 // txLookupPaymentByChannelTxnID reads a payment by (channel, externalTxnID),
@@ -291,13 +510,12 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		return nil, err
 	}
 
-	// Enforce the partial unique index `UNIQUE(user_id) WHERE status='active'`
+	// Enforce the partial unique index `UNIQUE(user_id, product_code) WHERE
+	// status='active'` (idx_subscriptions_user_product_active, migration 027)
 	// at the order layer. Without this pre-check, a concurrent order + activate
 	// would hit the constraint at INSERT time and surface as a 500; the user
 	// gets a clean 409 instead. The DB invariant IS the primitive — this is
-	// just a friendly surface for it. If the product later allows multiple
-	// active rows, both this check and the partial unique index need to change
-	// together.
+	// just a friendly surface for it.
 	//
 	// Repurchase rule (2026-07-28): an active, unexpired subscription no
 	// longer blanket-rejects new orders. With rollover at activation
@@ -309,6 +527,24 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// race at activation time (a stale shorter-cycle order paid after an
 	// upgrade) with ErrDowngradeActivationBlocked.
 	//
+	// Product scope (migration 027): the pre-check only considers an active
+	// subscription in the REQUESTED PLAN's product — an active
+	// kaya-membership sub must not block a coding-plan order and vice
+	// versa. The product is resolved from the plan row, never inferred
+	// from the user's existing subscriptions. A missing requested plan
+	// skips the pre-check entirely; eligibilityAndInsertOrderTx then
+	// returns ErrPlanNotFound, matching the pre-027 outcome for unknown
+	// plans (repurchaseAllowed treated them as allowed and let the tx
+	// produce the real error).
+	//
+	// Coding Plan divergence (migration 029, design §4.2): coding-plan
+	// orders do NOT use the interval-comparison repurchase rule below.
+	// Their order kind is frozen here: same plan = renewal, different
+	// plan requires an explicit plan_upgrade_rules row (otherwise
+	// ErrPlanUpgradeNotConfigured), no active sub = new. The kind +
+	// upgrade-from plan ride the order row so activation revalidates
+	// against the live subscription at payment time.
+	//
 	// "active" here means status='active' AND the sub has not lapsed
 	// (expires_at NULL or future). A stale row (status='active' with
 	// expires_at < now()) is treated as expired and permitted through;
@@ -317,40 +553,79 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	// unique index. Without this carve-out, users whose subscription
 	// quietly went past could not renew even after the cn-staging
 	// 2026-07-23 login-decouple fix let them log in.
-	if existing, err := s.subRepo.FindActiveByUserID(ctx, userID); err == nil {
-		if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
-			// PayPal 订阅制与 WeChat 的根本差异：渠道侧自动续费
-			// （PAYMENT.SALE.COMPLETED webhook 延期），用户无需也不应手动
-			// "续费"。这里每放行一单，BFF 就在 PayPal 创建一个全新的
-			// subscription 对象（重新吃 plan 内嵌的 trial），而旧订阅仍在
-			// 自动扣费 → 双重扣费（2026-08-17 intl-staging 验收实测同一
-			// 用户 3 个 ACTIVE PayPal 订阅并存、到期叠到两个月后）。
-			// 改签（月↔年）需要专门的"取消旧订阅+建新订阅"流程，落地前
-			// PayPal 渠道对任何未过期 active 订阅一律拒绝新单（409）。
-			// WeChat 无自动续费，手动续费 rollover 是正确行为，不受影响。
-			// trial 订阅是 OAuth 首登赠予的（migration 018），**不是**
-			// PayPal 订阅：渠道侧没有对应的自动扣费 subscription，豁免
-			// 它不会造成双重扣费，反而正是 trial→付费 的核心转化漏斗
-			// （review users-1, 2026-08-17）。
-			if channel == "paypal" && existing.PlanID != "trial" {
-				return nil, ErrUserHasActiveSub
-			}
-			allowed, aerr := s.repurchaseAllowed(ctx, existing.PlanID, planID)
-			if aerr != nil {
-				return nil, aerr
-			}
-			if !allowed {
-				return nil, ErrPlanDowngrade
-			}
+	requestedPlan, perr := s.planRepo.FindByID(ctx, planID)
+	if perr != nil && !errors.Is(perr, sql.ErrNoRows) {
+		return nil, fmt.Errorf("find requested plan: %w", perr)
+	}
+	// orderKind/upgradeFromPlanID are the frozen upgrade-rule outcome for
+	// coding-plan orders (migration 029). Kaya-membership orders keep both
+	// empty — the legacy interval-comparison rules drive them verbatim.
+	var orderKind string
+	var upgradeFromPlanID *string
+	if requestedPlan != nil {
+		if requestedPlan.ProductCode == model.ProductCodingPlan && s.benefitRepo == nil {
+			// Fail-closed: without the benefit-config read surface the
+			// service cannot prove the plan is purchasable (设计 §4.3).
+			return nil, ErrPlanNotPurchasable
 		}
-		// stale: status='active' but expires_at < now(). Allow order
-		// creation — activateSubscriptionOnTx will update this row.
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("check active sub: %w", err)
+		if existing, err := s.subRepo.FindActiveByUserAndProduct(ctx, userID, requestedPlan.ProductCode); err == nil {
+			if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
+				// PayPal 订阅制与 WeChat 的根本差异：渠道侧自动续费
+				// （PAYMENT.SALE.COMPLETED webhook 延期），用户无需也不应手动
+				// "续费"。这里每放行一单，BFF 就在 PayPal 创建一个全新的
+				// subscription 对象（重新吃 plan 内嵌的 trial），而旧订阅仍在
+				// 自动扣费 → 双重扣费（2026-08-17 intl-staging 验收实测同一
+				// 用户 3 个 ACTIVE PayPal 订阅并存、到期叠到两个月后）。
+				// 改签（月↔年）需要专门的"取消旧订阅+建新订阅"流程，落地前
+				// PayPal 渠道对任何未过期 active 订阅一律拒绝新单（409）。
+				// WeChat 无自动续费，手动续费 rollover 是正确行为，不受影响。
+				// trial 订阅是 OAuth 首登赠予的（migration 018），**不是**
+				// PayPal 订阅：渠道侧没有对应的自动扣费 subscription，豁免
+				// 它不会造成双重扣费，反而正是 trial→付费 的核心转化漏斗
+				// （review users-1, 2026-08-17）。
+				if channel == "paypal" && existing.PlanID != "trial" {
+					return nil, ErrUserHasActiveSub
+				}
+				if requestedPlan.ProductCode == model.ProductCodingPlan {
+					// Coding Plan 自身档位规则（设计 §4.2）：同套餐 = 续费；
+					// 跨套餐必须有 plan_upgrade_rules 显式规则行，否则 409。
+					// 不用"周期更长即可升级"的会员旧逻辑推导新商品。
+					if existing.PlanID == planID {
+						orderKind = model.OrderKindRenewal
+					} else {
+						ok, rerr := s.benefitRepo.HasUpgradeRule(ctx, existing.PlanID, planID)
+						if rerr != nil {
+							return nil, fmt.Errorf("check upgrade rule: %w", rerr)
+						}
+						if !ok {
+							return nil, ErrPlanUpgradeNotConfigured
+						}
+						orderKind = model.OrderKindUpgrade
+						from := existing.PlanID
+						upgradeFromPlanID = &from
+					}
+				} else {
+					allowed, aerr := s.repurchaseAllowed(ctx, existing.PlanID, planID)
+					if aerr != nil {
+						return nil, aerr
+					}
+					if !allowed {
+						return nil, ErrPlanDowngrade
+					}
+				}
+			}
+			// stale: status='active' but expires_at < now(). Allow order
+			// creation — activateSubscriptionOnTx will update this row.
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("check active sub: %w", err)
+		}
+		if requestedPlan.ProductCode == model.ProductCodingPlan && orderKind == "" {
+			orderKind = model.OrderKindNew
+		}
 	}
 
 	var order *model.Order
-	err := s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, &order)
+	err := s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, orderKind, upgradeFromPlanID, &order)
 	if err != nil {
 		return nil, err
 	}
@@ -876,6 +1151,17 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		return nil, fmt.Errorf("insert payment: %w", err)
 	}
 
+	// Product scope (migration 027): every subscription read/write below is
+	// scoped to the product of the ORDER'S plan. Migration 029: prefer the
+	// order's frozen product snapshot; the live plan row is the pre-029
+	// fallback. An empty product (plan row missing) is safe: product-scoped
+	// lookups return no rows and the resolver surfaces
+	// ErrPlanMissingForExpiry, which the audit-and-skip branch handles.
+	orderProduct, pcErr := s.resolveOrderProduct(ctx, txSQLX, order)
+	if pcErr != nil {
+		return nil, fmt.Errorf("resolve order product: %w", pcErr)
+	}
+
 	// Retry path: pre-fetch the existing active sub's expiry so
 	// resolveSubExpiry can preserve it. Only triggered when the payment
 	// row already exists (dedupe hit on channel+external_txn_id); a
@@ -912,7 +1198,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// to ensure sub activation + order update are idempotent.
 		paymentID = existing.ID
 
-		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID)
+		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID, orderProduct)
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return nil, fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -928,67 +1214,107 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		}
 	}
 
-	// Activate subscription (UPSERT single-row, webhook doc §5.3).
-	// expires_at resolution mirrors the webhook path, but the hint is
-	// ALWAYS nil here: the caller-supplied ExpiresAt is untrusted and
-	// ignored (a caller could otherwise extend their own subscription
-	// past what the plan grants). resolveSubExpiry falls back to
-	// plan.interval_days so channels whose upstream payload doesn't
-	// ship sub_expires_at (real WeChat v3 NATIVE today) still produce
-	// a finite subscription. A first activation replacing an unexpired
-	// sub rolls the remaining days over (resolveSubExpiry branch 3).
-	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, nil, preservedExpiry)
-	planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
-	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
-	if downgradeRetry {
-		// The first delivery wrote its own audit row when it blocked;
-		// log the retry too so the repeat delivery is visible rather
-		// than silently no-op'd.
-		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
-			fmt.Sprintf("order:%s", order.ID),
-			[]string{"confirm", "downgrade", "activation_blocked", "retry"},
-			map[string]any{
-				"order_id": order.ID,
-				"channel":  in.Channel,
-				"plan_id":  order.PlanID,
-			})
-	}
-	switch {
-	case rerr == nil:
-	case errors.Is(rerr, ErrPlanMissingForExpiry):
-		_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
-			fmt.Sprintf("plan:%s", order.PlanID),
-			[]string{"confirm", "expiry_fallback", "plan_missing"},
-			map[string]any{
-				"order_id": order.ID,
-				"channel":  in.Channel,
-			})
-	case downgradeBlocked:
-		// A stale shorter-cycle order (e.g. an old monthly QR) was paid
-		// after the user upgraded. Honor the payment — the order goes
-		// paid below and ops refunds manually — but leave the
-		// longer-cycle subscription untouched.
-		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
-			fmt.Sprintf("order:%s", order.ID),
-			[]string{"confirm", "downgrade", "activation_blocked"},
-			map[string]any{
-				"order_id": order.ID,
-				"channel":  in.Channel,
-				"plan_id":  order.PlanID,
-			})
-	default:
-		return nil, fmt.Errorf("resolve sub expiry: %w", rerr)
-	}
+	// 余额充值商品（Task 14）：不激活订阅、不发模型权益——同事务入队钱包
+	// 充值消息（dedup 钉 payment_id；消费侧按 wallet:topup:{payment_id}
+	// 业务键幂等入账，重复回调不重复入账）。充值金额不作为订阅有效期。
 	activated := false
-	// planMissing: a subscription cannot reference the missing plan (the
-	// FK would reject the INSERT/UPDATE), so skip activation; the order
-	// still goes paid below and ops follows up from the audit log.
-	if !downgradeBlocked && !planMissing {
-		activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry)
-		if err != nil {
-			return nil, fmt.Errorf("activate sub: %w", err)
+	if orderProduct == model.ProductWalletTopup {
+		if err := s.enqueueWalletTopup(ctx, tx, order, paymentID); err != nil {
+			return nil, err
 		}
-	}
+	} else {
+
+		// Activate subscription (UPSERT single-row, webhook doc §5.3).
+		// expires_at resolution mirrors the webhook path, but the hint is
+		// ALWAYS nil here: the caller-supplied ExpiresAt is untrusted and
+		// ignored (a caller could otherwise extend their own subscription
+		// past what the plan grants). The resolver falls back to the order's
+		// snapshot interval so channels whose upstream payload doesn't ship
+		// sub_expires_at (real WeChat v3 NATIVE today) still produce a finite
+		// subscription. A first activation replacing an unexpired sub rolls
+		// the remaining days over (legacy rollover / coding-plan kind rules).
+		subExpiry, rerr := s.resolveOrderActivation(ctx, txSQLX, order, orderProduct, nil, preservedExpiry)
+		planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
+		// ErrOrderActivationConflict is the coding-plan counterpart of the
+		// legacy downgrade block: the paid order conflicts with a different
+		// active plan at activation time. Same handling — honor the payment,
+		// leave the subscription/entitlement untouched, audit for ops.
+		activationConflict := errors.Is(rerr, ErrOrderActivationConflict)
+		downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
+		if downgradeRetry {
+			// The first delivery wrote its own audit row when it blocked;
+			// log the retry too so the repeat delivery is visible rather
+			// than silently no-op'd.
+			_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+				fmt.Sprintf("order:%s", order.ID),
+				[]string{"confirm", "downgrade", "activation_blocked", "retry"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  in.Channel,
+					"plan_id":  order.PlanID,
+				})
+		}
+		switch {
+		case rerr == nil:
+		case errors.Is(rerr, ErrPlanMissingForExpiry):
+			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
+				fmt.Sprintf("plan:%s", order.PlanID),
+				[]string{"confirm", "expiry_fallback", "plan_missing"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  in.Channel,
+				})
+		case downgradeBlocked:
+			// A stale shorter-cycle order (e.g. an old monthly QR) was paid
+			// after the user upgraded. Honor the payment — the order goes
+			// paid below and ops refunds manually — but leave the
+			// longer-cycle subscription untouched.
+			_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+				fmt.Sprintf("order:%s", order.ID),
+				[]string{"confirm", "downgrade", "activation_blocked"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  in.Channel,
+					"plan_id":  order.PlanID,
+				})
+		case activationConflict:
+			_ = writeAuditOnTx(ctx, tx, "service", "activation_conflict_blocked",
+				fmt.Sprintf("order:%s", order.ID),
+				[]string{"confirm", "coding_plan", "activation_blocked"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  in.Channel,
+					"plan_id":  order.PlanID,
+					"kind":     order.SnapshotOrderKind(),
+				})
+		default:
+			return nil, fmt.Errorf("resolve sub expiry: %w", rerr)
+		}
+		// planMissing: a subscription cannot reference the missing plan (the
+		// FK would reject the INSERT/UPDATE), so skip activation; the order
+		// still goes paid below and ops follows up from the audit log.
+		if !downgradeBlocked && !activationConflict && !planMissing {
+			activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry)
+			if err != nil {
+				return nil, fmt.Errorf("activate sub: %w", err)
+			}
+			// 同事务 outbox（Task 10）：权益同步消息与支付状态翻转同一事务
+			// 提交；dedup 键钉在 payment 上，Confirm/webhook/补单三路重复
+			// 投递只会入队一次。blocked/planMissing 时订阅未动，无需同步。
+			if orderTouchesBenefits(order, orderProduct) {
+				dedup := access.PaidSyncDedupKey(paymentID)
+				if err := s.enqueueBenefitSync(ctx, tx, access.EntitlementSyncMessage{
+					UserID:      order.UserID,
+					ProductCode: orderProduct,
+					Reason:      access.SyncReasonPaymentPaid,
+					OrderID:     order.ID,
+					PaymentID:   paymentID,
+				}, &dedup); err != nil {
+					return nil, err
+				}
+			}
+		}
+	} // end non-topup activation branch
 
 	// Update order to paid (covers pending/expired/cancelled per §5.3).
 	wasLate := order.Status == "expired"
@@ -1360,6 +1686,36 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 	return &OnWebhookResult{DuplicateEvent: false, DomainAction: domainAction}, nil
 }
 
+// lookupOrderByWebhookID finds the order behind a webhook's order
+// reference. The PRIMARY lookup is by orders.id (Stripe + e2e tests that
+// pass the UUID); the FALLBACK is a JSONB walk for wechat_pay/alipay's
+// out_trade_no — the channel-side identifier those channels send (32-char
+// hyphenless form minted at CreateOrder as
+// strings.ReplaceAll(order.ID,"-","")[:32]). Shared by onPaymentSucceeded
+// and the refund path (评审轮3 D-2: N-2 的关单反查必须走同一段两段式查
+// 找——只用主键在真实渠道键形态下必然 miss，未支付关单 500 风暴原样保留).
+// Callers run it inside their own tx (same-connection constraint).
+func lookupOrderByWebhookID(ctx context.Context, tx dbTx, channel, orderRef string) (*model.Order, error) {
+	var order model.Order
+	err := tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, orderRef)
+	if errors.Is(err, sql.ErrNoRows) && (channel == "wechat_pay" || channel == "alipay") {
+		// JSONB text-extraction ->> returns NULL for rows without the
+		// key; equality with the channel's out_trade_no resolves it to
+		// the canonical order. LIMIT 1 in case the JSONB value collides
+		// (operator error — duplicate out_trade_no is a YDN alert).
+		err = tx.GetContext(ctx, &order, `
+			SELECT * FROM orders
+			WHERE provider_intent IS NOT NULL
+			  AND provider_intent->>'out_trade_no' = $1
+			LIMIT 1
+		`, orderRef)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &order, nil
+}
+
 // onPaymentSucceeded: payment_intent.succeeded (Stripe), TRANSACTION.SUCCESS (WeChat), TRADE_SUCCESS (Alipay).
 // Mirrors Confirm but driven by the channel — the cross-table transaction
 // must hold event-insert + payment-insert + sub-activate + order-update.
@@ -1371,34 +1727,15 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	defer tx.Rollback() //nolint:errcheck
 	txSQLX := rawSQLXTx(tx)
 
-	// Find the order. WeChat and Alipay send a channel-side identifier
-	// (out_trade_no, 32-char hex) rather than our UUID, and the
-	// WebhookEvent.OrderID contract documents this for the handler. The
-	// PRIMARY lookup is by id (covers Stripe + e2e tests that pass the
-	// UUID); the FALLBACK is a JSONB walk for wechat_pay/alipay's
-	// out_trade_no (covers real-world webhooks that send the 32-char
-	// form). Both queries run inside the same tx so MaxOpenConns
-	// constraints don't deadlock (the same constraint the comment below
-	// the SELECT-by-id block already documents).
+	// Find the order (两段式：主键 + provider_intent out_trade_no 回退 —
+	// 与退款路径共用 lookupOrderByWebhookID，评审轮3 D-2). WeChat and
+	// Alipay send the 32-char hyphenless out_trade_no rather than our UUID.
 	//
 	// MAJOR fix (review 2): without the fallback, real WeChat webhooks
 	// 404'd because no order has the 32-char hex as its primary id; the
 	// order would stay "pending" forever and the user never got the
 	// subscription.
-	var order model.Order
-	err = tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, e.OrderID)
-	if errors.Is(err, sql.ErrNoRows) && (e.Channel == "wechat_pay" || e.Channel == "alipay") {
-		// JSONB text-extraction ->> returns NULL for rows without the
-		// key; equality with the channel's out_trade_no resolves it to
-		// the canonical order. LIMIT 1 in case the JSONB value collides
-		// (operator error — duplicate out_trade_no is a YDN alert).
-		err = tx.GetContext(ctx, &order, `
-			SELECT * FROM orders
-			WHERE provider_intent IS NOT NULL
-			  AND provider_intent->>'out_trade_no' = $1
-			LIMIT 1
-		`, e.OrderID)
-	}
+	order, err := lookupOrderByWebhookID(ctx, tx, e.Channel, e.OrderID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Webhook arrived for an order that doesn't exist in our DB.
@@ -1499,6 +1836,16 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		return fmt.Errorf("insert payment: %w", err)
 	}
 
+	// Product scope (migration 027): every subscription read/write below is
+	// scoped to the product of the ORDER'S plan. Migration 029: prefer the
+	// order's frozen product snapshot; the live plan row is the pre-029
+	// fallback. An empty product (plan row missing) matches no subscription
+	// rows and lets the resolver surface ErrPlanMissingForExpiry instead.
+	orderProduct, pcErr := s.resolveOrderProduct(ctx, txSQLX, order)
+	if pcErr != nil {
+		return fmt.Errorf("resolve order product: %w", pcErr)
+	}
+
 	// Retry path: pre-fetch the existing active sub's expiry so
 	// resolveSubExpiry can preserve it instead of computing a new
 	// `now() + interval_days` and shifting the subscription forward.
@@ -1554,7 +1901,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		}
 		paymentID = existing.ID
 
-		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID)
+		activeSub, sErr := s.txLookupActiveSubscription(ctx, txSQLX, order.UserID, orderProduct)
 		if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 			return fmt.Errorf("find active sub for retry preservation: %w", sErr)
 		}
@@ -1570,65 +1917,105 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		}
 	}
 
-	// Subscription activation is gated by payment success, not by order
-	// status — see doc §"Subscription activation". The order UPDATE below
-	// is idempotent (already-paid / late-paid / cancelled-but-honored all
-	// succeed). Re-running the activation UPSERT on a retried event is
-	// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
-	// row.
-	subExpiry, rerr := s.resolveSubExpiry(ctx, txSQLX, order.UserID, order.PlanID, e.SubExpiresAt, preservedExpiry)
-	planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
-	downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
-	if downgradeRetry {
-		// The first delivery wrote its own audit row when it blocked;
-		// log the retry too so the repeat delivery is visible rather
-		// than silently no-op'd.
-		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
-			fmt.Sprintf("order:%s", order.ID),
-			[]string{"webhook", "downgrade", "activation_blocked", "retry"},
-			map[string]any{
-				"order_id": order.ID,
-				"channel":  e.Channel,
-				"event_id": e.EventID,
-				"plan_id":  order.PlanID,
-			})
-	}
-	switch {
-	case rerr == nil:
-	case errors.Is(rerr, ErrPlanMissingForExpiry):
-		// Intentional: plan_missing is informational — the payment already
-		// succeeded, so we silently audit and skip activation (a
-		// subscription cannot reference the missing plan).
-		_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
-			fmt.Sprintf("plan:%s", order.PlanID),
-			[]string{"webhook", "expiry_fallback", "plan_missing"},
-			map[string]any{
-				"order_id": order.ID,
-				"channel":  e.Channel,
-				"event_id": e.EventID,
-			})
-	case downgradeBlocked:
-		// A stale shorter-cycle order (e.g. an old monthly QR) was paid
-		// after the user upgraded. Honor the payment — the order goes
-		// paid below and ops refunds manually — but leave the
-		// longer-cycle subscription untouched.
-		_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
-			fmt.Sprintf("order:%s", order.ID),
-			[]string{"webhook", "downgrade", "activation_blocked"},
-			map[string]any{
-				"order_id": order.ID,
-				"channel":  e.Channel,
-				"event_id": e.EventID,
-				"plan_id":  order.PlanID,
-			})
-	default:
-		return fmt.Errorf("resolve sub expiry: %w", rerr)
-	}
-	if !downgradeBlocked && !planMissing {
-		if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, subExpiry); err != nil {
-			return fmt.Errorf("activate sub: %w", err)
+	// 余额充值商品（Task 14）：不激活订阅、不发模型权益——同事务入队钱包
+	// 充值消息（dedup 钉 payment_id；重复 webhook 投递不重复入账）。
+	if orderProduct == model.ProductWalletTopup {
+		if err := s.enqueueWalletTopup(ctx, tx, order, paymentID); err != nil {
+			return err
 		}
-	}
+	} else {
+
+		// Subscription activation is gated by payment success, not by order
+		// status — see doc §"Subscription activation". The order UPDATE below
+		// is idempotent (already-paid / late-paid / cancelled-but-honored all
+		// succeed). Re-running the activation UPSERT on a retried event is
+		// safe — the UPDATE branch of activateSubscriptionOnTx hits the same
+		// row.
+		subExpiry, rerr := s.resolveOrderActivation(ctx, txSQLX, order, orderProduct, e.SubExpiresAt, preservedExpiry)
+		planMissing := errors.Is(rerr, ErrPlanMissingForExpiry)
+		activationConflict := errors.Is(rerr, ErrOrderActivationConflict)
+		downgradeBlocked := errors.Is(rerr, ErrDowngradeActivationBlocked) || downgradeRetry
+		if downgradeRetry {
+			// The first delivery wrote its own audit row when it blocked;
+			// log the retry too so the repeat delivery is visible rather
+			// than silently no-op'd.
+			_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+				fmt.Sprintf("order:%s", order.ID),
+				[]string{"webhook", "downgrade", "activation_blocked", "retry"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  e.Channel,
+					"event_id": e.EventID,
+					"plan_id":  order.PlanID,
+				})
+		}
+		switch {
+		case rerr == nil:
+		case errors.Is(rerr, ErrPlanMissingForExpiry):
+			// Intentional: plan_missing is informational — the payment already
+			// succeeded, so we silently audit and skip activation (a
+			// subscription cannot reference the missing plan).
+			_ = writeAuditOnTx(ctx, tx, "service", "subscription_expiry_plan_missing",
+				fmt.Sprintf("plan:%s", order.PlanID),
+				[]string{"webhook", "expiry_fallback", "plan_missing"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  e.Channel,
+					"event_id": e.EventID,
+				})
+		case downgradeBlocked:
+			// A stale shorter-cycle order (e.g. an old monthly QR) was paid
+			// after the user upgraded. Honor the payment — the order goes
+			// paid below and ops refunds manually — but leave the
+			// longer-cycle subscription untouched.
+			_ = writeAuditOnTx(ctx, tx, "service", "downgrade_activation_blocked",
+				fmt.Sprintf("order:%s", order.ID),
+				[]string{"webhook", "downgrade", "activation_blocked"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  e.Channel,
+					"event_id": e.EventID,
+					"plan_id":  order.PlanID,
+				})
+		case activationConflict:
+			// coding-plan counterpart of the downgrade block (Task 10): the
+			// paid order conflicts with a DIFFERENT active plan at activation
+			// time (e.g. a stale QR paid after a tier change). Honor the
+			// payment, leave subscription + entitlement untouched, audit.
+			_ = writeAuditOnTx(ctx, tx, "service", "activation_conflict_blocked",
+				fmt.Sprintf("order:%s", order.ID),
+				[]string{"webhook", "coding_plan", "activation_blocked"},
+				map[string]any{
+					"order_id": order.ID,
+					"channel":  e.Channel,
+					"event_id": e.EventID,
+					"plan_id":  order.PlanID,
+					"kind":     order.SnapshotOrderKind(),
+				})
+		default:
+			return fmt.Errorf("resolve sub expiry: %w", rerr)
+		}
+		if !downgradeBlocked && !activationConflict && !planMissing {
+			if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry); err != nil {
+				return fmt.Errorf("activate sub: %w", err)
+			}
+			// 同事务 outbox（Task 10）：权益同步消息随支付状态翻转同一事务
+			// 提交；dedup 键钉在 payment 上，webhook/Confirm/主动补单三路
+			// 重复投递只入队一次。blocked/planMissing 时订阅未动，无需同步。
+			if orderTouchesBenefits(order, orderProduct) {
+				dedup := access.PaidSyncDedupKey(paymentID)
+				if err := s.enqueueBenefitSync(ctx, tx, access.EntitlementSyncMessage{
+					UserID:      order.UserID,
+					ProductCode: orderProduct,
+					Reason:      access.SyncReasonPaymentPaid,
+					OrderID:     order.ID,
+					PaymentID:   paymentID,
+				}, &dedup); err != nil {
+					return err
+				}
+			}
+		}
+	} // end non-topup activation branch
 
 	// PayPal: stamp the PayPal subscription ID on the active row so renewal
 	// webhooks (PAYMENT.SALE.COMPLETED) can find the user's subscription
@@ -1642,6 +2029,11 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// "I-OLD" ID on the row — subsequent renewals for the NEW subscription
 	// would fail to find the row, hitting paypal_renewal_unknown_subscription
 	// and silently dropping paid charges.
+	//
+	// The subquery is scoped by (user_id, plan_id, product_code): plan_id
+	// already pins the product via the 027 trigger, but carrying
+	// product_code explicitly keeps the row selection unambiguous if a
+	// plan ever changes product between order and webhook.
 	if e.ExternalSubscriptionID != "" {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
@@ -1650,11 +2042,12 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 				SELECT id FROM subscriptions
 				WHERE user_id = $2
 				  AND plan_id = $3
+				  AND product_code = $4
 				  AND status = 'active'
 				ORDER BY created_at DESC
 				LIMIT 1
 			)
-		`, e.ExternalSubscriptionID, order.UserID, order.PlanID); err != nil {
+		`, e.ExternalSubscriptionID, order.UserID, order.PlanID, orderProduct); err != nil {
 			return fmt.Errorf("set external_subscription_id: %w", err)
 		}
 	}
@@ -1749,6 +2142,24 @@ func (s *PaymentService) onPaymentFailed(ctx context.Context, e WebhookEvent) er
 		); err != nil {
 			return fmt.Errorf("write audit: %w", err)
 		}
+		// 同事务 outbox（Task 10）：支付失败级联取消订阅后，权益同步
+		// 翻转为 revoked。dedup 键钉在 payment 上。
+		failProduct, fpErr := s.resolveOrderProduct(ctx, rawSQLXTx(tx), &order)
+		if fpErr != nil {
+			return fmt.Errorf("resolve failed order product: %w", fpErr)
+		}
+		if orderTouchesBenefits(&order, failProduct) {
+			dedup := access.FailedSyncDedupKey(payment.ID)
+			if err := s.enqueueBenefitSync(ctx, tx, access.EntitlementSyncMessage{
+				UserID:      order.UserID,
+				ProductCode: failProduct,
+				Reason:      access.SyncReasonPaymentFailed,
+				OrderID:     order.ID,
+				PaymentID:   payment.ID,
+			}, &dedup); err != nil {
+				return err
+			}
+		}
 	}
 
 	return tx.Commit()
@@ -1770,11 +2181,54 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE
 	`, e.Channel, e.TransactionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return s.writeAudit(ctx, "service", "webhook_refund_unknown_payment",
+			// 评审轮3 D-1+D-2：TRADE_CLOSED/trade_closed 是双义事件——既表
+			// "未支付超时/取消关单"（高频正常事件，永远无支付行、不可能有
+			// 退款），也表已支付交易的关闭。仅当 (a) 事件不携退款额且
+			// (b) 订单从未支付 时才 audit+200：
+			//   (a) 依赖渠道语义——Alipay 未支付关单的 trade_closed 不携带
+			//       refund fee（webhook parser 的 refund_fee 字段，未支
+			//       付关单解析为 0）。携带退款额（RefundAmount > 0）说明渠
+			//       道侧确已支付并退款（可能只是 TRADE_SUCCESS 仍在约 24h
+			//       的重投窗口内）：一律落到下面的返错重投分支，否则
+			//       audit+200 → MarkProcessed → 退款永久丢失、随后
+			//       TRADE_SUCCESS 重投照常充值 = 双花（轮 2 N-2 重开的乱
+			//       序窗口）。
+			//   (b) 订单反查走与 onPaymentSucceeded 相同的两段式查找
+			//       （主键 + provider_intent->>'out_trade_no'）——真实渠道
+			//       键是 32 位无横线 out_trade_no，只查主键必然 miss。
+			// charge.refunded/TRANSACTION.REFUND 等无歧义退款事件不走此分
+			// 支——查无支付行一律按乱序处理（保轮 1 C2 语义）。
+			if e.OrderID != "" && (e.EventType == "TRADE_CLOSED" || e.EventType == "trade_closed") && e.RefundAmount <= 0 {
+				order, oerr := lookupOrderByWebhookID(ctx, tx, e.Channel, e.OrderID)
+				switch {
+				case oerr == nil:
+					if order.Status == "pending" || order.Status == "expired" ||
+						order.Status == "cancelled" || order.Status == "failed" {
+						return s.writeAudit(ctx, "service", "webhook_refund_unpaid_order",
+							fmt.Sprintf("event:%s", e.EventID),
+							[]string{"webhook", "unpaid_order"},
+							map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID,
+								"order_id": e.OrderID, "order_status": order.Status, "event_id": e.EventID},
+						)
+					}
+				case !errors.Is(oerr, sql.ErrNoRows):
+					return fmt.Errorf("lookup order for close event: %w", oerr)
+				}
+			}
+			// 评审轮1 C2：退款事件可能先于支付成功事件到达（渠道乱序投递）。
+			// 审计照留（writeAudit 独立连接提交，不随本事务回滚），但必须返回
+			// 错误让 handler 映射为非 2xx —— 渠道按其重投计划再次投递；ack
+			// 200 会让 OnWebhook 标记 processed、渠道不再重投，之后支付成功
+			// 照常给钱包充值而退款永久丢失（双花）。订单不存在或订单已支付
+			// 但支付行缺失都落此分支。
+			if aerr := s.writeAudit(ctx, "service", "webhook_refund_unknown_payment",
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "unknown_payment"},
 				map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID, "event_id": e.EventID},
-			)
+			); aerr != nil {
+				return fmt.Errorf("write audit: %w", aerr)
+			}
+			return fmt.Errorf("refund for unknown payment (channel=%s txn=%s): payment success event not processed yet — returning an error so the channel retries", e.Channel, e.TransactionID)
 		}
 		return fmt.Errorf("find payment: %w", err)
 	}
@@ -1784,6 +2238,25 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	var order model.Order
 	if err := tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, payment.OrderID); err != nil {
 		return fmt.Errorf("load order: %w", err)
+	}
+
+	// 评审轮4 B：Alipay 的 refund_fee 是**累计**退款总额——本次事件金额
+	// = 累计值 − 该支付已记录退款总额。重复投递同一累计值（或同一通知重
+	// 投）→ 增量为 0 → 幂等收敛不双退；部分退款序列（refund_fee 递增）
+	// 逐笔只认增量。全额判定仍按累计值（e.RefundAmount ≥ payment.Amount）。
+	// 其他渠道按单笔事件金额（既有语义）。增量 ≤ 0 时不落新行、不重复
+	// 钱包扣减（全额/权益状态在首次记录增量时已收敛）。
+	eventRefundAmount := e.RefundAmount
+	if e.Channel == "alipay" {
+		var prior float64
+		if err := tx.GetContext(ctx, &prior,
+			`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1`, payment.ID); err != nil {
+			return fmt.Errorf("sum prior refunds: %w", err)
+		}
+		eventRefundAmount = e.RefundAmount - prior
+		if eventRefundAmount <= 0 {
+			return tx.Commit()
+		}
 	}
 
 	// Find or insert the refund row keyed on (channel, external_refund_id).
@@ -1801,7 +2274,7 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		VALUES ($1, $2, $3, $4, $5, $6, 'pending')
 		ON CONFLICT (channel, external_refund_id) DO NOTHING
 		RETURNING id
-	`, payment.ID, e.Channel, order.UserID, e.RefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
+	`, payment.ID, e.Channel, order.UserID, eventRefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
 	switch {
 	case err == nil:
 		// inserted (new pending row — will be flipped below)
@@ -1822,6 +2295,13 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		WHERE id = $1 AND status = 'pending'
 	`, refundID); err != nil {
 		return fmt.Errorf("mark refund paid: %w", err)
+	}
+
+	// 订单产品归属（订单快照优先，029 口径）；钱包充值订单的退款走钱包
+	// 现金原路退，订阅/权益路径与充值订单无关（Task 14）。
+	refundProduct, rpErr := s.resolveOrderProduct(ctx, rawSQLXTx(tx), &order)
+	if rpErr != nil {
+		return fmt.Errorf("resolve refunded order product: %w", rpErr)
 	}
 
 	// Full vs partial refund — only the channel's amount tells us. We
@@ -1846,25 +2326,68 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 		`, order.ID); err != nil {
 			return fmt.Errorf("flip order refunded: %w", err)
 		}
-		// Deactivate subscription. Only cancel the sub matching this
-		// order's plan_id — an unrelated active subscription on a
-		// different plan must NOT be cancelled. Already
-		// expired/cancelled subs are terminal (don't reopen them).
-		if _, err := tx.ExecContext(ctx, `
+		if refundProduct != model.ProductWalletTopup {
+			// Deactivate subscription. Only cancel the sub matching this
+			// order's plan_id — an unrelated active subscription on a
+			// different plan must NOT be cancelled. Already
+			// expired/cancelled subs are terminal (don't reopen them).
+			if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions SET status = 'cancelled', updated_at = now()
 			WHERE user_id = $1 AND plan_id = $2 AND status = 'active'
 		`, order.UserID, order.PlanID); err != nil {
-			return fmt.Errorf("cancel sub on full refund: %w", err)
+				return fmt.Errorf("cancel sub on full refund: %w", err)
+			}
+			if err := writeAuditOnTx(ctx, tx, "service", "subscription_cancelled_full_refund",
+				fmt.Sprintf("payment:%s", payment.ID),
+				[]string{"refund", "full", "sub_cancelled"},
+				map[string]any{"payment_id": payment.ID, "refund_id": refundID, "channel": e.Channel},
+			); err != nil {
+				return fmt.Errorf("write audit: %w", err)
+			}
+			// 同事务 outbox（Task 10）：全额退款把权益翻转为 revoked —— 阻止
+			// 后续不再具备权益的调用；已消费账本与配额窗口一行不动（账本
+			// 追加+冲正，设计 §7.3）。dedup 键钉在 refund 行上：渠道重投与
+			// 重复退款事件只入队一次，worker 收敛本身也是幂等的。
+			if orderTouchesBenefits(&order, refundProduct) {
+				dedup := access.RefundSyncDedupKey(refundID)
+				if err := s.enqueueBenefitSync(ctx, tx, access.EntitlementSyncMessage{
+					UserID:      order.UserID,
+					ProductCode: refundProduct,
+					Reason:      access.SyncReasonRefundFull,
+					OrderID:     order.ID,
+					PaymentID:   payment.ID,
+					RefundID:    refundID,
+				}, &dedup); err != nil {
+					return err
+				}
+			}
 		}
-		if err := writeAuditOnTx(ctx, tx, "service", "subscription_cancelled_full_refund",
-			fmt.Sprintf("payment:%s", payment.ID),
-			[]string{"refund", "full", "sub_cancelled"},
-			map[string]any{"payment_id": payment.ID, "refund_id": refundID, "channel": e.Channel},
-		); err != nil {
-			return fmt.Errorf("write audit: %w", err)
+	}
+	// 余额充值订单的退款（全额或部分，Task 14）：同事务入队钱包退款消息
+	// ——钱包现金原路退（dedup 钉 refund 行；消费侧 wallet:refund:{id} 业
+	// 务键幂等）。赠送余额不参与退款（钱包侧纯规则 + CHECK 双兜底）。
+	// 纵深防御（Task 14 deferred minor，Task 15 收尾）：只有支付行在本事务
+	// 入口仍处 paid 才允许入队。dedup 键钉的是同一笔 refund 的重投；对已
+	// refunded 的支付再到达的*另一笔*退款事件（不同 external_refund_id）
+	// 若不入守卫会再次扣减钱包现金。退款行本身照常记录（支付域事实），
+	// 但钱包侧不再跟随。
+	if refundProduct == model.ProductWalletTopup {
+		if payment.Status != "paid" {
+			if err := writeAuditOnTx(ctx, tx, "service", "wallet_refund_skipped_payment_not_paid",
+				fmt.Sprintf("payment:%s", payment.ID),
+				[]string{"refund", "wallet_topup", "guard"},
+				map[string]any{"payment_id": payment.ID, "payment_status": payment.Status,
+					"refund_id": refundID, "channel": e.Channel}); err != nil {
+				return fmt.Errorf("write audit: %w", err)
+			}
+		} else if err := s.enqueueWalletRefund(ctx, tx, &order, payment.ID, refundID, eventRefundAmount); err != nil {
+			return err
 		}
 	}
 	// Partial refund: no domain action beyond marking the refund paid.
+	// 部分退款不动订阅与权益（既有规则保留）：订阅继续到原到期点；
+	// 金额侧由 refunds 行与渠道对账承载。Alipay 累计语义下 eventRefundAmount
+	// 是本笔增量（评审轮4 B），全额判定用的累计值在 e.RefundAmount。
 
 	return tx.Commit()
 }
@@ -2031,6 +2554,14 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	// ($0.01/$0.10 sandbox charges) and the L3 suite fires $4.99 renewals,
 	// so hard-rejecting on amount would break legitimate test/staging flows.
 	// The audit row is the ops signal to investigate a genuine undercharge.
+	//
+	// planRow is also the source of the synthetic order's snapshot
+	// descriptors (product_code / plan_interval_days, migration 029). The
+	// benefit_* columns stay NULL by design: a renewal is not a new
+	// purchase negotiation — the entitlement worker falls back to the
+	// ORIGINAL paid order's frozen snapshot, so a renewal never picks up
+	// a silently-rewritten benefit config.
+	var planRow *model.Plan
 	if plan, perr := s.txLookupPlan(ctx, rawSQLXTx(tx), sub.PlanID); perr != nil {
 		// Missing plan is not this event's fault — proceed with the renewal
 		// but flag it so ops can reconcile (mirrors onPaymentSucceeded's
@@ -2043,6 +2574,7 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 				"event_id": e.EventID,
 			})
 	} else {
+		planRow = plan
 		if !strings.EqualFold(e.Currency, plan.Currency) {
 			_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_currency_mismatch",
 				fmt.Sprintf("subscription:%s", sub.ID),
@@ -2070,11 +2602,19 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 				})
 		}
 	}
+	// Snapshot descriptors for the synthetic order: product comes from the
+	// subscription row (trigger-maintained, always right), interval from
+	// the plan when found. Both are descriptive only — the coding-plan
+	// activation path never runs for synthetic renewal orders.
+	var synInterval *int
+	if planRow != nil {
+		synInterval = &planRow.IntervalDays
+	}
 	err = tx.QueryRowxContext(ctx, `
-		INSERT INTO orders (user_id, plan_id, amount, currency, status, expires_at, provider_intent)
-		VALUES ($1, $2, $3, $4, 'paid', $5, NULL)
+		INSERT INTO orders (user_id, plan_id, amount, currency, status, expires_at, provider_intent, product_code, plan_interval_days)
+		VALUES ($1, $2, $3, $4, 'paid', $5, NULL, $6, $7)
 		RETURNING id
-	`, sub.UserID, sub.PlanID, e.Amount, e.Currency, orderExpiresAt).Scan(&orderID)
+	`, sub.UserID, sub.PlanID, e.Amount, e.Currency, orderExpiresAt, sub.ProductCode, synInterval).Scan(&orderID)
 	if err != nil {
 		return fmt.Errorf("insert synthetic renewal order: %w", err)
 	}
@@ -2153,7 +2693,48 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		return fmt.Errorf("audit renewal: %w", err)
 	}
 
+	// 同事务 outbox（Task 10）：渠道侧续费延期后同步权益（续费延长有效期，
+	// 不提前重置窗口）。dedup 键钉在续费 payment 上，重投只入队一次。
+	// 门控：coding-plan 订阅总是相关；kaya 订阅仅当其套餐挂了捆绑赠送
+	// 配置（plan_benefit_configs）时才可能带动权益。worker 消费时按
+	// "最近一次已支付订单快照"收敛，续费权益规格沿用原购买快照。
+	if s.benefitSync != nil &&
+		(sub.ProductCode == model.ProductCodingPlan || s.planHasBenefitConfig(ctx, rawSQLXTx(tx), sub.PlanID)) {
+		dedup := access.PaidSyncDedupKey(paymentID)
+		if err := s.enqueueBenefitSync(ctx, tx, access.EntitlementSyncMessage{
+			UserID:         sub.UserID,
+			ProductCode:    sub.ProductCode,
+			Reason:         access.SyncReasonRenewalPaid,
+			OrderID:        orderID,
+			PaymentID:      paymentID,
+			SubscriptionID: sub.ID,
+		}, &dedup); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit()
+}
+
+// planHasBenefitConfig is the renewal-path gate for kaya bundle plans:
+// true when the plan carries a gift mapping (plan_benefit_configs). A live
+// read is fine here — the message is only a trigger; the worker converges
+// from the frozen order snapshots. Errors fail open to "enqueue anyway":
+// a spurious message converges to a no-op, a missed one delays a grant.
+// The read shares the surrounding tx's connection when one is in flight —
+// a second pool grab while holding a tx conn is the MaxOpenConns deadlock
+// class documented on resolveSubExpiry.
+func (s *PaymentService) planHasBenefitConfig(ctx context.Context, tx *sqlx.Tx, planID string) bool {
+	if s.benefitRepo == nil {
+		return false
+	}
+	var err error
+	if tx != nil {
+		_, err = s.benefitRepo.FindByPlanIDTx(ctx, tx, planID)
+	} else {
+		_, err = s.benefitRepo.FindByPlanID(ctx, planID)
+	}
+	return err == nil
 }
 
 // ============================================================================
@@ -2181,12 +2762,16 @@ func insertPaymentOnTx(ctx context.Context, tx dbTx, p *model.Payment) (string, 
 	return id, true, nil
 }
 
-// activateSubscriptionOnTx: the single-row UPSERT from webhook doc §5.3.
-// Returns whether activation actually happened (true if the user just got
-// a new active sub this call; false if they already had one or we reactivated
-// an existing row).
-func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID string, expiresAt *time.Time) (bool, error) {
-	// Step 1: UPDATE the target row (active first, else most recent).
+// activateSubscriptionOnTx: the single-row UPSERT from webhook doc §5.3,
+// scoped to one (user, product) pair since migration 027. Returns whether
+// activation actually happened (true if the user just got a new active sub
+// this call; false if they already had one or we reactivated an existing
+// row). The product scope means a payment for product A never mutates the
+// user's product-B subscription row.
+func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID, productCode string, expiresAt *time.Time) (bool, error) {
+	// Step 1: UPDATE the target row within this product (active first, else
+	// most recent). The 027 trigger validates plan↔product consistency on
+	// the plan_id write; a mismatch aborts the whole activation tx.
 	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET
 			plan_id = $1,
@@ -2195,11 +2780,11 @@ func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID strin
 			status = 'active'
 		WHERE id = (
 			SELECT id FROM subscriptions
-			WHERE user_id = $3
+			WHERE user_id = $3 AND product_code = $4
 			ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, created_at DESC
 			LIMIT 1
 		)
-	`, planID, expiresAt, userID)
+	`, planID, expiresAt, userID, productCode)
 	if err != nil {
 		return false, fmt.Errorf("update subscription: %w", err)
 	}
@@ -2209,11 +2794,13 @@ func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID strin
 	n, _ := res.RowsAffected()
 
 	if n == 0 {
-		// Step 2: INSERT a new active row.
+		// Step 2: INSERT a new active row for this product. The partial
+		// unique index idx_subscriptions_user_product_active rejects a
+		// concurrent duplicate activation for the same (user, product).
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
-			VALUES ($1, $2, $3, 'active', now(), $4)
-		`, GenerateUUID(), userID, planID, expiresAt)
+			INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at, product_code)
+			VALUES ($1, $2, $3, 'active', now(), $4, $5)
+		`, GenerateUUID(), userID, planID, expiresAt, productCode)
 		if err != nil {
 			return false, fmt.Errorf("insert subscription: %w", err)
 		}
@@ -2354,7 +2941,7 @@ func (s *PaymentService) providerPreAuth(channel string) error {
 // pre-D8 no-tx fallback made it easy to ship a regression). The
 // repo implementation owns begin/commit/rollback; the closure here
 // only threads the tx through FindByIDForShareTx and CreateInTx.
-func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel string, out **model.Order) error {
+func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel, orderKind string, upgradeFromPlanID *string, out **model.Order) error {
 	var order *model.Order
 	err := s.planRepo.WithTx(ctx, func(tx *sqlx.Tx) error {
 		plan, err := s.planRepo.FindByIDForShareTx(ctx, tx, planID)
@@ -2374,6 +2961,51 @@ func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID
 			return ErrPlanCurrencyMismatch
 		}
 
+		// Benefit snapshot (migration 029): freeze the product, billing
+		// cycle, entitlement spec and upgrade-rule outcome ON the order.
+		// The payment callback honors only this snapshot — later operator
+		// edits (price change, deactivation, config rewrite) never change
+		// what an already-created order grants.
+		//
+		// coding-plan plans REQUIRE a plan_benefit_configs row in
+		// 'subscription' mode — it is the product's payment configuration
+		// (设计 §4.3: 没有配置的商品不可购买); without it paying would
+		// grant nothing, so the order is refused here. kaya-membership
+		// plans may OPTIONALLY carry a 'gift' config (bundle mapping,
+		// 设计 §4.1): paying then issues a non-stackable gift entitlement.
+		// A wrong-mode config row is an operator error and fails closed.
+		var benefitPolicyVersionID *string
+		var benefitModelIDs pq.StringArray
+		var benefitGrantMode string
+		// 余额充值商品（Task 14）无权益映射：支付成功后按订单快照金额
+		// 充值钱包，benefit 快照列保持 NULL（不把充值金额当订阅有效期）。
+		if s.benefitRepo != nil && plan.ProductCode != model.ProductWalletTopup {
+			cfg, cerr := s.benefitRepo.FindByPlanIDTx(ctx, tx, planID)
+			switch {
+			case errors.Is(cerr, sql.ErrNoRows):
+				if plan.ProductCode == model.ProductCodingPlan {
+					return ErrPlanNotPurchasable
+				}
+			case cerr != nil:
+				return fmt.Errorf("read benefit config: %w", cerr)
+			default:
+				wantMode := model.BenefitGrantModeGift
+				if plan.ProductCode == model.ProductCodingPlan {
+					wantMode = model.BenefitGrantModeSubscription
+				}
+				if cfg.GrantMode != wantMode {
+					return ErrPlanNotPurchasable
+				}
+				benefitPolicyVersionID = &cfg.PolicyVersionID
+				benefitModelIDs = cfg.ModelIDs
+				benefitGrantMode = cfg.GrantMode
+			}
+		} else if plan.ProductCode == model.ProductCodingPlan {
+			// No benefit-config read surface at all (unit tests / partial
+			// deployments): coding-plan orders fail closed.
+			return ErrPlanNotPurchasable
+		}
+
 		order = &model.Order{
 			ID:     GenerateUUID(),
 			UserID: userID,
@@ -2389,6 +3021,14 @@ func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID
 			Currency:  plan.Currency,
 			Status:    "pending",
 			ExpiresAt: time.Now().Add(s.orderExpiry),
+
+			ProductCode:            ptrIfNotEmpty(plan.ProductCode),
+			PlanIntervalDays:       ptrInt(plan.IntervalDays),
+			BenefitPolicyVersionID: benefitPolicyVersionID,
+			BenefitModelIDs:        benefitModelIDs,
+			BenefitGrantMode:       ptrIfNotEmpty(benefitGrantMode),
+			OrderKind:              ptrIfNotEmpty(orderKind),
+			UpgradeFromPlanID:      upgradeFromPlanID,
 		}
 		if err := s.orderRepo.CreateInTx(ctx, tx, order); err != nil {
 			return fmt.Errorf("create order: %w", err)
@@ -2434,6 +3074,10 @@ func isRefundEvent(eventType string) bool {
 	switch eventType {
 	case "charge.refunded", "TRANSACTION.REFUND",
 		"TRADE_CLOSED", "trade_closed",
+		// 评审轮4：trade_refund = Alipay TRADE_SUCCESS/TRADE_FINISHED 携带
+		// refund_fee 的部分退款通知；REFUND.SUCCESS = 真实 WeChat v3 退款
+		// 事件类型（TRANSACTION.REFUND 为既有 mock 契约，两者并容）。
+		"trade_refund", "REFUND.SUCCESS",
 		"PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED":
 		return true
 	}
@@ -2479,7 +3123,10 @@ func isPaypalRenewal(eventType string) bool {
 //     there. nil = no hint, fall through.
 //
 //  3. rollover (2026-07-28 upgrade/renewal rule). When this activation
-//     REPLACES an unexpired active subscription, the remaining days
+//     REPLACES an unexpired active subscription IN THE SAME PRODUCT
+//     (productCode scope, migration 027 — an active sub in another
+//     product is invisible here and must not trigger rollover or the
+//     downgrade block), the remaining days
 //     carry over: the new expiry extends from the OLD expires_at, not
 //     from now(). Applies to same-plan renewal and longer-cycle
 //     upgrades — CreateOrder's repurchase rule already limits order
@@ -2496,14 +3143,18 @@ func isPaypalRenewal(eventType string) bool {
 //     planRepo.FindByIDForShareTx so the read shares the calling tx's
 //     connection (otherwise with MaxOpenConns=25, 25 concurrent
 //     fallback requests can deadlock waiting for a second connection).
+//     Migration 029: when the order carries a snapshot interval
+//     (snapshotIntervalDays > 0), it REPLACES the live plan interval
+//     everywhere below — 已支付订单按下单快照兑现，运营改周期不影响它。
 //
 //  5. nil (plan missing OR interval_days == 0). Caller decides: webhook
 //     paths audit-log + write NULL; Confirm path mirrors the same shape.
 func (s *PaymentService) resolveSubExpiry(
 	ctx context.Context,
 	tx *sqlx.Tx,
-	userID, planID string,
+	userID, planID, productCode string,
 	hint, preservedExpiry *time.Time,
+	snapshotIntervalDays int,
 ) (*time.Time, error) {
 	if preservedExpiry != nil {
 		return preservedExpiry, nil
@@ -2518,6 +3169,9 @@ func (s *PaymentService) resolveSubExpiry(
 	// The new plan row is loaded lazily and at most once: the fallback
 	// branch needs its interval, the rollover branch needs it for the
 	// downgrade comparison, and the hint branch needs it for the clamp.
+	// The interval the order actually honors is the frozen snapshot when
+	// present; the live plan row still drives the downgrade comparison
+	// against the CURRENT sub's plan (legacy rule, unchanged).
 	var plan *model.Plan
 	var planErr error
 	planLoaded := false
@@ -2538,6 +3192,13 @@ func (s *PaymentService) resolveSubExpiry(
 		plan = p
 		return plan, nil
 	}
+	// intervalOf applies the snapshot substitution for THIS order's plan.
+	intervalOf := func(p *model.Plan) int {
+		if snapshotIntervalDays > 0 {
+			return snapshotIntervalDays
+		}
+		return p.IntervalDays
+	}
 
 	var candidate *time.Time
 	if hint != nil {
@@ -2554,18 +3215,18 @@ func (s *PaymentService) resolveSubExpiry(
 			return nil, err
 		}
 		c := *hint
-		if p.IntervalDays > 0 {
-			if p.IntervalDays > maxIntervalDays {
-				return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, p.IntervalDays, maxIntervalDays)
+		if iv := intervalOf(p); iv > 0 {
+			if iv > maxIntervalDays {
+				return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, iv, maxIntervalDays)
 			}
-			if maxHint := time.Now().Add(time.Duration(p.IntervalDays) * 24 * time.Hour); c.After(maxHint) {
+			if maxHint := time.Now().Add(time.Duration(iv) * 24 * time.Hour); c.After(maxHint) {
 				c = maxHint
 			}
 		}
 		candidate = &c
 	}
 
-	existing, sErr := s.txLookupActiveSubscription(ctx, tx, userID)
+	existing, sErr := s.txLookupActiveSubscription(ctx, tx, userID, productCode)
 	if sErr != nil && !errors.Is(sErr, sql.ErrNoRows) {
 		return nil, fmt.Errorf("find active sub for rollover: %w", sErr)
 	}
@@ -2592,12 +3253,12 @@ func (s *PaymentService) resolveSubExpiry(
 		if oErr != nil && !errors.Is(oErr, sql.ErrNoRows) {
 			return nil, fmt.Errorf("find current plan for rollover: %w", oErr)
 		}
-		if oldPlan != nil && oldPlan.IntervalDays > p.IntervalDays {
+		if oldPlan != nil && oldPlan.IntervalDays > intervalOf(p) {
 			return nil, ErrDowngradeActivationBlocked
 		}
-		if existing.ExpiresAt != nil && p.IntervalDays > 0 {
-			if p.IntervalDays > maxIntervalDays {
-				return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, p.IntervalDays, maxIntervalDays)
+		if existing.ExpiresAt != nil && intervalOf(p) > 0 {
+			if intervalOf(p) > maxIntervalDays {
+				return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, intervalOf(p), maxIntervalDays)
 			}
 			// max(): a hint that already sits beyond the rolled value
 			// still wins. Note this intentionally prefers the rolled
@@ -2606,7 +3267,7 @@ func (s *PaymentService) resolveSubExpiry(
 			// product rule; the channel-side billing anchor (PayPal
 			// renewals run their own onPaypalRenewalSucceeded path and
 			// never reach here) is unaffected.
-			rolled := existing.ExpiresAt.Add(time.Duration(p.IntervalDays) * 24 * time.Hour)
+			rolled := existing.ExpiresAt.Add(time.Duration(intervalOf(p)) * 24 * time.Hour)
 			if candidate == nil || rolled.After(*candidate) {
 				candidate = &rolled
 			}
@@ -2621,13 +3282,13 @@ func (s *PaymentService) resolveSubExpiry(
 	if err != nil {
 		return nil, err
 	}
-	if p.IntervalDays <= 0 {
+	if intervalOf(p) <= 0 {
 		return nil, nil
 	}
-	if p.IntervalDays > maxIntervalDays {
-		return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, p.IntervalDays, maxIntervalDays)
+	if intervalOf(p) > maxIntervalDays {
+		return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, intervalOf(p), maxIntervalDays)
 	}
-	t := time.Now().Add(time.Duration(p.IntervalDays) * 24 * time.Hour)
+	t := time.Now().Add(time.Duration(intervalOf(p)) * 24 * time.Hour)
 	return &t, nil
 }
 
@@ -2730,6 +3391,19 @@ func mustJSON(v map[string]any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
 }
+
+// ptrIfNotEmpty returns nil for an empty string so the 029 snapshot columns
+// bind SQL NULL (their CHECK constraints only accept enum literals or NULL).
+func ptrIfNotEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// ptrInt returns a pointer to n (snapshot interval; 0 is a meaningful
+// "lifetime plan" value and must round-trip as 0, not NULL).
+func ptrInt(n int) *int { return &n }
 
 // toCents converts a major-units float64 (DECIMAL(10,2) round-trip) to
 // integer cents. Used for exact monetary comparisons that must not

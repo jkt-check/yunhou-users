@@ -357,8 +357,13 @@ func (v *WeChatPayV3Verifier) VerifySignature(channel string, body []byte, heade
 // Note: Alipay sends the payload as application/x-www-form-urlencoded in the
 // request body, NOT in headers — the middleware hands us the body.
 type AlipayVerifier struct {
-	PublicKey    *rsa.PublicKey
-	ReplayWindow time.Duration // applied to notify_time field, 0 = disabled
+	PublicKey *rsa.PublicKey
+	// ReplayWindow is DEPRECATED and ignored (评审轮4 A-2): Alipay retries
+	// the same signed payload with an unchanged notify_time for ~24h, so a
+	// time window silently kills the very retries the C2/D-1 error-retry
+	// mechanism depends on. Replay defense is the webhook_events
+	// (channel,event_id) idempotency dedup. Kept for config compatibility.
+	ReplayWindow time.Duration
 }
 
 func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
@@ -405,38 +410,22 @@ func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers ma
 		return ErrInvalidSignature
 	}
 
-	// Replay window defaults to 5 min (matches Stripe/WeChat). Alipay retries
-	// notifications for ~24h, so without this guard a captured notification
-	// could be replayed well outside the legitimate retry schedule.
-	replayWindow := v.ReplayWindow
-	if replayWindow == 0 {
-		replayWindow = 5 * time.Minute
-	}
-	notifyTime := values.Get("notify_time")
-	if notifyTime == "" {
+	// 评审轮4 A-2：Alipay 不应用 notify_time 时间窗。Alipay 以同一份签名
+	// 报文（notify_time 不变）重投最长 ~24h——C2/D-1 的"返错让渠道重投"
+	// 机制依赖这些迟到重投被接受；5 分钟窗会在窗口后把每一次重投都拒成
+	// 400，事件永久丢失（未支付关单正常事件除外——但乱序退款事件正是靠
+	// 重投自愈的）。重放防护改由 webhook_events (channel, event_id) 幂等
+	// 去重承担：它是 at-least-once 投递下的权威去重（首次处理落行、重复
+	// 投递 DuplicateEvent ack 200、中断重跑幂等），配合 RSA 验签（重放者
+	// 无法伪造新内容，只能原样重放已被去重吸收的旧报文）。Stripe/PayPal/
+	// WeChat 的时间窗与各自重投计划兼容，保持不变。ReplayWindow 字段对
+	// Alipay 不再生效；notify_time 仍解析记录（审计可见性），不用于拒绝。
+	_ = v.ReplayWindow
+	if values.Get("notify_time") == "" {
 		// Alipay's notify_time is not always present (some notify_type
-		// variants omit it). Without it we forfeit local replay
-		// protection — surface to operators via log so a sustained
-		// missing-notify_time pattern is visible — but accept the
-		// request because rejecting here would break legitimate
-		// notifications whose shape we don't control. The signature
-		// check (Verify above) is the real security gate; this window
-		// is belt-and-braces.
-		log.Printf("alipay verifier: notify_time missing — local replay protection disabled for this request")
-		return nil
-	}
-	// Alipay sends notify_time in Beijing time (UTC+8) without a timezone
-	// suffix. Without an explicit location, time.Parse returns UTC, so a
-	// 20:00:00 Beijing notify would be compared against a 12:00:00 UTC
-	// "now" — an 8h negative delta that always trips the replay window.
-	beijing, err := time.LoadLocation("Asia/Shanghai")
-	if err != nil {
-		beijing = time.FixedZone("CST", 8*3600)
-	}
-	if t, err := time.ParseInLocation("2006-01-02 15:04:05", notifyTime, beijing); err == nil {
-		if delta := time.Since(t); delta > replayWindow || delta < -replayWindow {
-			return ErrTimestampOutOfRange
-		}
+		// variants omit it) — surface to operators via log so a sustained
+		// missing-notify_time pattern is visible.
+		log.Printf("alipay verifier: notify_time missing (informational; replay dedup is handled by webhook_events)")
 	}
 	return nil
 }

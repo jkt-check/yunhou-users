@@ -29,6 +29,10 @@ type SubscriptionServiceInterface interface {
 	Cancel(ctx context.Context, id, userID string) error
 	GetUserSubscription(ctx context.Context, userID string) (*model.Subscription, *model.Plan, error)
 	ListUserSubscriptions(ctx context.Context, userID string) ([]model.Subscription, error)
+	// ListUserSubscriptionsByProduct lists subscriptions for one product
+	// (productCode "all" returns every product). The legacy
+	// ListUserSubscriptions is fixed to kaya-membership.
+	ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error)
 }
 
 // PlanServiceInterface defines the interface for plan operations

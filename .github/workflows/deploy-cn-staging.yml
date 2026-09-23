@@ -6,6 +6,12 @@ on:
       - 'docs/**'
       - '*.md'
   workflow_dispatch:
+    inputs:
+      deploy_branch:
+        description: '把当前 ref（非 master 分支）构建并部署到 cn-staging（仅集成测试用；测完需从 master 重新部署恢复）'
+        required: false
+        type: boolean
+        default: false
 
 # Inlined the build + bump jobs that used to be reusable calls into
 # jkt-check/yunhou-deploy/.github/workflows/reusable-build-go.yml and
@@ -28,7 +34,9 @@ concurrency:
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/master'
+    # master 推送照常构建；workflow_dispatch 只有显式勾选 deploy_branch
+    # 才构建（把功能分支镜像送上 cn-staging 做集成测试）。
+    if: github.ref == 'refs/heads/master' || (github.event_name == 'workflow_dispatch' && inputs.deploy_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -87,7 +95,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   bump:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || (github.event_name == 'workflow_dispatch' && inputs.deploy_branch)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10

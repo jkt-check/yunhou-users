@@ -2,12 +2,16 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yunhou/users/internal/inference/credentials"
+	"github.com/yunhou/users/internal/inference/providers/connector"
 	"github.com/yunhou/users/internal/llm"
 )
 
@@ -154,16 +158,86 @@ type Config struct {
 	// body (e.g. deepseek-v4-flash). Default "deepseek-v4-flash".
 	DeepSeekModel string
 	// LLMProvidersJSON is the multi-model catalog (providers + logical
-	// models) as one JSON object; parsed and validated at boot by
-	// llm.ParseCatalog. When set it takes precedence over the legacy
-	// DEEPSEEK_* triple; when empty those envs synthesize a one-model
-	// catalog (back-compat). See docs/api-integration-guide.md.
+	// models) as one JSON object, consumed two ways at boot: (1) parsed and
+	// validated by llm.ParseCatalog as the /chat runtime catalog (takes
+	// precedence over the legacy DEEPSEEK_* triple; when empty those envs
+	// synthesize a one-model catalog, back-compat); (2) ONE explicit
+	// idempotent import into the inference catalog DB (基线报告差距 1) —
+	// entities missing from the database are inserted as DRAFT, anything
+	// already present is left untouched, and the inference runtime truth is
+	// the published DB revision, never this env. Invalid JSON fails startup
+	// loudly. See docs/api-integration-guide.md.
 	LLMProvidersJSON string
 	// ChatLogPath is the file for chat access logs (one JSON line per
 	// request: user_id, session_id, input messages, output text, status,
 	// duration). Empty = chat access logging disabled (the /chat endpoint
 	// still works, only the audit trail is skipped).
 	ChatLogPath string
+
+	// InferenceCredentialKeys is the deployment-secret key material for
+	// the upstream-credential vault (AEAD). Format:
+	//   1:64hexchars,2:64hexchars
+	// Highest version = current encryption key; earlier versions stay for
+	// decrypting old ciphertext. Injected from the deployment secret store
+	// only — never committed, never logged. Empty = credential management
+	// endpoints fail closed until key material is configured.
+	InferenceCredentialKeys string
+	// InferenceUpstreamAllowlist lists CIDRs (10.0.0.0/8, fd00::/8) and/or
+	// exact hostnames that may be used as upstream deployment targets even
+	// though they are not globally routable (self-hosted intranet
+	// deployments, 设计 §5). Empty = only globally routable targets.
+	InferenceUpstreamAllowlist []string
+	// InferenceAccountRPM is the default per-billing-account requests-per-
+	// minute bucket on /v1/* (Task 5; per-Key rpm_limit applies on top when
+	// set). Process-local sliding window; cross-instance coordination is
+	// Task 7's database leases. 0 disables the account-level bucket.
+	InferenceAccountRPM int
+
+	// InferenceKayaChatGateway is the /chat 迁移开关 (Task 8): when true,
+	// POST /chat and GET /chat/models are served by the inference gateway
+	// facade (JWT → principal → entitlement → quota → routing) instead of
+	// the legacy DeepSeek passthrough. Default false = 旧行为直通 (legacy
+	// passthrough, no entitlement gate).
+	InferenceKayaChatGateway bool
+	// KayaChatModel is the public inference model id the /chat facade
+	// applies when the client sends no model (旧无 model 默认). Required
+	// when InferenceKayaChatGateway is on.
+	KayaChatModel string
+
+	// Settlement recovery worker (Task 9): pass interval, per-pass batch
+	// cap, staleness grace (must exceed the 15s settlement deadline so live
+	// requests are never swept), and the reconciliation evidence window.
+	// Defaults: 30s / 100 / 15m / 24h. Grace floor (12m) enforced by
+	// Validate: it must exceed the worst LIVE request phase (deployment
+	// RequestTimeout default 10min; nginx SSE relay 700s; settlement 15s),
+	// otherwise the sweep settles live long requests at their full hold.
+	InferenceRecoveryInterval       time.Duration
+	InferenceRecoveryBatch          int
+	InferenceRecoveryGrace          time.Duration
+	InferenceReconciliationDeadline time.Duration
+	// Task 10: entitlement-sync worker (outbox consumer for payment→
+	// entitlement grants). Defaults: 2s / 100 / 10min backoff cap.
+	InferenceEntitlementSyncInterval time.Duration
+	InferenceEntitlementSyncBatch    int
+
+	// InferenceOAuthConnectorsJSON is the upstream OAuth connector registry
+	// (Task 12): a JSON array of vendor specs (key, authorize/token/revoke/
+	// models/quota endpoints, client_id/secret, scopes, redirect_url, pkce).
+	// Deployment secret material (client_secret) lives here only — never in
+	// the DB, never logged. Empty = OAuth authorization endpoints reject
+	// every connector key as unknown.
+	// 注意：与社交登录（GitHub/WeChat OAuth）完全无关，互不复用配置。
+	InferenceOAuthConnectorsJSON string
+	// Credential-refresh worker (Task 12): proactive OAuth token rotation.
+	// Defaults: 60s / 50 per pass / refresh 5min before expiry.
+	InferenceCredentialRefreshInterval time.Duration
+	InferenceCredentialRefreshBatch    int
+	InferenceCredentialRefreshSkew     time.Duration
+	// Upstream-health worker (Task 12): account probes + quota observation.
+	// Defaults: 60s / 100 per pass / 5min cooldown before re-probe.
+	InferenceUpstreamHealthInterval time.Duration
+	InferenceUpstreamHealthBatch    int
+	InferenceUpstreamHealthCooldown time.Duration
 }
 
 // Load reads configuration from process env vars. Defaults match the values
@@ -213,11 +287,33 @@ func Load() *Config {
 
 		PlanAmountOverrideJSON: os.Getenv("PLAN_AMOUNT_OVERRIDE_JSON"),
 
-		DeepSeekAPIKey:   os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekBaseURL:  envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-		DeepSeekModel:    envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekBaseURL: envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+		DeepSeekModel:   envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+		ChatLogPath:     os.Getenv("CHAT_LOG_PATH"),
+
 		LLMProvidersJSON: os.Getenv("LLM_PROVIDERS_JSON"),
-		ChatLogPath:      os.Getenv("CHAT_LOG_PATH"),
+
+		InferenceCredentialKeys:    os.Getenv("INFERENCE_CREDENTIAL_KEYS"),
+		InferenceUpstreamAllowlist: splitCSV(os.Getenv("INFERENCE_UPSTREAM_ALLOWLIST")),
+		InferenceAccountRPM:        parseIntOr(envOr("INFERENCE_ACCOUNT_RPM", "120"), 120),
+		InferenceKayaChatGateway:   os.Getenv("INFERENCE_KAYA_CHAT_GATEWAY") == "1",
+		KayaChatModel:              os.Getenv("KAYA_CHAT_MODEL"),
+
+		InferenceRecoveryInterval:        parseDurationOr(envOr("INFERENCE_RECOVERY_INTERVAL", "30s"), 30*time.Second),
+		InferenceRecoveryBatch:           parseIntOr(envOr("INFERENCE_RECOVERY_BATCH", "100"), 100),
+		InferenceRecoveryGrace:           parseDurationOr(envOr("INFERENCE_RECOVERY_GRACE", "15m"), 15*time.Minute),
+		InferenceReconciliationDeadline:  parseDurationOr(envOr("INFERENCE_RECONCILIATION_DEADLINE", "24h"), 24*time.Hour),
+		InferenceEntitlementSyncInterval: parseDurationOr(envOr("INFERENCE_ENTITLEMENT_SYNC_INTERVAL", "2s"), 2*time.Second),
+		InferenceEntitlementSyncBatch:    parseIntOr(envOr("INFERENCE_ENTITLEMENT_SYNC_BATCH", "100"), 100),
+
+		InferenceOAuthConnectorsJSON:       os.Getenv("INFERENCE_OAUTH_CONNECTORS_JSON"),
+		InferenceCredentialRefreshInterval: parseDurationOr(envOr("INFERENCE_CREDENTIAL_REFRESH_INTERVAL", "60s"), 60*time.Second),
+		InferenceCredentialRefreshBatch:    parseIntOr(envOr("INFERENCE_CREDENTIAL_REFRESH_BATCH", "50"), 50),
+		InferenceCredentialRefreshSkew:     parseDurationOr(envOr("INFERENCE_CREDENTIAL_REFRESH_SKEW", "5m"), 5*time.Minute),
+		InferenceUpstreamHealthInterval:    parseDurationOr(envOr("INFERENCE_UPSTREAM_HEALTH_INTERVAL", "60s"), 60*time.Second),
+		InferenceUpstreamHealthBatch:       parseIntOr(envOr("INFERENCE_UPSTREAM_HEALTH_BATCH", "100"), 100),
+		InferenceUpstreamHealthCooldown:    parseDurationOr(envOr("INFERENCE_UPSTREAM_HEALTH_COOLDOWN", "5m"), 5*time.Minute),
 	}
 }
 
@@ -355,6 +451,41 @@ func (c *Config) Validate() error {
 			return errors.New("DEEPSEEK_BASE_URL must be an absolute http(s) URL (e.g. https://api.deepseek.com)")
 		}
 	}
+	// Inference credential vault keys: when present they must parse (the
+	// vault itself fails closed at request time when unset). Rejecting bad
+	// material at startup beats discovering a hex typo the first time an
+	// operator tries to store a credential.
+	if c.InferenceCredentialKeys != "" {
+		if _, _, err := credentials.ParseKeysEnv(c.InferenceCredentialKeys); err != nil {
+			return fmt.Errorf("INFERENCE_CREDENTIAL_KEYS: %v", err)
+		}
+	}
+	// /chat 网关迁移开关：开启时必须配置默认模型（旧无 model 默认的承接
+	// 者），否则 facade 无模型可路由。
+	if c.InferenceKayaChatGateway && c.KayaChatModel == "" {
+		return errors.New("KAYA_CHAT_MODEL is required when INFERENCE_KAYA_CHAT_GATEWAY=1")
+	}
+	// Recovery grace floor (Task 9 审查修复): the sweep grace must exceed
+	// the worst LIVE phase of one request — deployment RequestTimeout
+	// (default 10min) covers dispatch, nginx lets /v1/chat/completions SSE
+	// run 700s, settlement adds 15s. A shorter grace sweeps live long
+	// requests and settles them at the full hold while still streaming.
+	// 联动校验（对抗评审 C1 已落地）：deployment 写路径强制
+	// RequestTimeout < 生效 grace —— catalog.SetRecoveryGrace 在启动时以本
+	// 值布线，catalog.ValidateDeploymentRecoveryWindow 在 operator CRUD /
+	// 批量导入 / env 导入三处收口执行比较。
+	if c.InferenceRecoveryGrace < 12*time.Minute {
+		return fmt.Errorf("INFERENCE_RECOVERY_GRACE=%s is below the 12m floor (must exceed worst live request phase: 700s SSE relay + 15s settlement)", c.InferenceRecoveryGrace)
+	}
+	// Task 12: OAuth connector registry must parse when present (each spec
+	// validated: endpoints absolute URLs, client_id/redirect_url required,
+	// keys unique). A typo discovered at startup beats a 500 at the first
+	// authorization attempt.
+	if c.InferenceOAuthConnectorsJSON != "" {
+		if _, err := connector.ParseRegistry(c.InferenceOAuthConnectorsJSON); err != nil {
+			return fmt.Errorf("INFERENCE_OAUTH_CONNECTORS_JSON: %v", err)
+		}
+	}
 	// Multi-model catalog: malformed JSON or a broken reference must kill
 	// the process at boot, not surface as per-request 502s.
 	if c.LLMProvidersJSON != "" {
@@ -396,4 +527,13 @@ func parseDurationOr(s string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func parseIntOr(s string, fallback int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		log.Printf("config: parse int %q failed; using fallback %d", s, fallback)
+		return fallback
+	}
+	return n
 }

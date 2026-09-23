@@ -1,0 +1,1749 @@
+openapi: 3.0.3
+info:
+  title: Kaya Coding Plan — 客户控制台 API（yunhou-users）
+  version: 0.13.0
+  description: |
+    Kaya Coding Plan（独立模型 API 套餐）客户侧契约，供 Website 客户控制台对接。
+    本文件与 `internal/inference/httpapi/{user_api_keys,user_quotas,user_usage,
+    user_subscriptions}.go` 的实际响应逐字段对齐（Task 11；设计 §9.2）。
+
+    ## 全局约定
+
+    - **Envelope**：本文件 `/user/*` 端点使用管理 envelope `{code, data, message}`。
+      成功 `code=0` + `data`；失败 `code=<HTTP 状态码>` + `data=null` + `message`。
+      `/v1/*` 标准协议端点（Task 8/13）使用**各自协议的原生形状**（不含 envelope）：
+      `/v1/messages` 用 Anthropic 形状、`/v1/responses` 与 `/v1/chat/completions`
+      用 OpenAI 形状；两端点的协议子集/能力矩阵见对应 path 描述与
+      `docs/api-integration-guide.md`「标准协议接口」一节。
+    - **整数精度**：64 位额度/金额一律为**十进制整数字符串**（`DecimalInt64`），
+      避免 JS `Number` 精度丢失（>2^53）。单位 `microcredit`（微额度）。
+      token 计数与请求计数为 JSON 整数（`int64` 范围内，JS 安全）。
+    - **时间格式**：全部 RFC3339 UTC（`2026-09-08T04:00:00Z`）。所有计量时间
+      来自服务端；客户端切时区不改变额度周期（设计 §6）。
+    - **窗口语义**：三窗口 `[start, end)`，到边界属新窗口。五小时窗口未激活时
+      `window_start`/`resets_at` 为 null 且 `activation=on_first_consumption`；
+      禁用窗口 `disabled=true` + `limit=null`（缺失**不等于**无限额度）。
+    - **读口径**：`/user/model-quotas` 是当前**权威**额度状态（as_of 即读取时刻）。
+      `/user/model-usage/*` 是历史统计，带 `as_of`/`complete_through` 截止时刻；
+      本实现直读权威表（complete_through = as_of），若未来引入延迟聚合，
+      complete_through 会如实给出截止时间。**延迟统计不得用作实时放行依据**。
+    - **用量来源**：`inference_requests` / `inference_usage_records` /
+      `inference_ledger_entries`。绝不使用 `usage_events` 心跳表（客户端活跃
+      信号，非计费事实）。
+    - **计量完整性**：每请求 `usage_status` ∈ `reported/estimated/unknown/pending`；
+      token 桶 `null` = 未报告（未知 ≠ 0）。
+    - **金额口径**：用量金额派生自不可变账本 —— `charge_micros`=Σ 原始
+      charge 分录（修正/作废不重写）、`reversed_micros`=Σ 冲正、
+      `adjusted_micros`=Σ 请求级调整（debit 正 / credit 负，修正补差与运营
+      补偿均计入）、`net_micros` = charge − reversed + adjusted。作废
+      （void）修正后净额为 0，不为负。
+    - **权限**：全部端点需用户 JWT（`Authorization: Bearer`）；只有本人可查自身
+      Key/账本/配额/订阅（端点不接收用户/账户 ID 参数，越权在结构上不可能）。
+
+    ## 错误码（envelope code = HTTP 状态码）
+
+    | HTTP | message 前缀/含义 | 触发 |
+    |---|---|---|
+    | 400 | invalid_input | 参数/时间格式/游标非法；未知 body 字段 |
+    | 401 | 未认证或 JWT 失效 | JWT 中间件 |
+    | 403 | model_not_allowed | Key 模型权限超出账户权益 |
+    | 404 | not_found | 资源不存在或不属于本人（不区分） |
+    | 409 | conflict | 幂等/乐观锁冲突 |
+    | 429 | rate_limited | 频率限制 |
+    | 500 | internal | 内部错误 |
+
+    响应 fixture（七态：零额度/未激活/耗尽/已过期/预占中/跨月/待核对）见
+    `docs/api/fixtures/`，并由 `internal/inference/httpapi` 的测试逐字段断言。
+  contact:
+    name: yunhou-users backend
+servers:
+  - url: /
+security:
+  - BearerAuth: []
+tags:
+  - name: api-keys
+    description: 客户 API Key 自管（Task 5）
+  - name: model-console
+    description: Coding Plan 配额/用量/套餐读视图（Task 11）
+  - name: v1-protocols
+    description: 编程工具标准协议面 /v1/*（原生形状,Task 8/13）
+
+paths:
+  /user/model-quotas:
+    get:
+      tags: [model-console]
+      summary: 三窗口额度视图（权威当前状态）
+      description: |
+        返回当前权益的三窗口 used/reserved/remaining（前端无需计算窗口：
+        window_start/resets_at/remaining 由服务端给出）、权益有效期与当前
+        阻断原因。quota 读是**当前权威状态**（直读配额闸门写入的窗口行）。
+        多个窗口同时阻断时 blocked_by 全部返回；恢复时刻未知（如未激活的
+        零限额五小时窗口）时 resets_at 为 null，绝不编造倒计时。
+      operationId: getModelQuotas
+      responses:
+        "200":
+          description: 额度视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelQuotasEnvelope"
+              examples:
+                active:
+                  summary: 正常（五小时窗口活跃）
+                  value:
+                    code: 0
+                    data:
+                      server_time: "2026-09-08T04:00:00Z"
+                      as_of: "2026-09-08T04:00:00Z"
+                      unit: microcredit
+                      entitlement_id: "5f0d2f2e-9a1f-4a1e-9a2b-0000000000aa"
+                      entitlement:
+                        id: "5f0d2f2e-9a1f-4a1e-9a2b-0000000000aa"
+                        status: active
+                        source_type: subscription
+                        model_ids: ["glm-4.6"]
+                        policy_version_id: "7c9e6679-7425-40de-944b-0000000000bb"
+                        anchor_at: "2026-09-01T10:00:00Z"
+                        effective_from: "2026-09-01T10:00:00Z"
+                        effective_to: "2026-10-01T10:00:00Z"
+                        revision: 1
+                      blocked_by: []
+                      windows:
+                        - kind: five_hour
+                          mode: anchored_duration
+                          disabled: false
+                          limit: "1000000"
+                          used: "200000"
+                          reserved: "100000"
+                          remaining: "700000"
+                          window_start: "2026-09-08T03:00:00Z"
+                          resets_at: "2026-09-08T08:00:00Z"
+                        - kind: weekly
+                          mode: anchored_period_7d
+                          disabled: false
+                          limit: "10000000"
+                          used: "200000"
+                          reserved: "100000"
+                          remaining: "9700000"
+                          window_start: "2026-09-08T10:00:00Z"
+                          resets_at: "2026-09-15T10:00:00Z"
+                        - kind: monthly
+                          mode: anchored_calendar_month
+                          disabled: false
+                          limit: "100000000"
+                          used: "200000"
+                          reserved: "100000"
+                          remaining: "99700000"
+                          window_start: "2026-09-01T10:00:00Z"
+                          resets_at: "2026-10-01T10:00:00Z"
+                zero-limit:
+                  summary: 零额度（限额为 0，三窗口全阻断）
+                  externalValue: fixtures/model-quotas-zero-limit.json
+                unactivated:
+                  summary: 未激活（五小时窗口等待首次消费）
+                  externalValue: fixtures/model-quotas-unactivated.json
+                exhausted:
+                  summary: 耗尽（五小时+周窗口同时阻断）
+                  externalValue: fixtures/model-quotas-exhausted.json
+                expired:
+                  summary: 已过期（权益过期，窗口状态如实保留）
+                  externalValue: fixtures/model-quotas-expired.json
+                reserved:
+                  summary: 预占中（在途预占计入 reserved）
+                  externalValue: fixtures/model-quotas-reserved.json
+                cross-month:
+                  summary: 跨月（1 月 31 日锚点的月窗裁剪，不漂移）
+                  externalValue: fixtures/model-quotas-cross-month.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/model-usage/summary:
+    get:
+      tags: [model-console]
+      summary: 用量分组聚合 + UTC 日序列
+      description: |
+        按模型（group_by=model，默认）或 Key（group_by=key）聚合
+        [from, to) 范围内的请求：请求计数、计量完整性计数
+        （reported/estimated/unknown/pending）、charge/reversed/net
+        （十进制字符串，microcredit）、token 桶合计（最新计量 revision；
+        未报告桶为 null）。series 为 UTC 自然日桶（与 DB 会话时区无关）。
+        时间范围受限：默认最近 30 天，最大跨度 92 天。
+      operationId: getModelUsageSummary
+      parameters:
+        - $ref: "#/components/parameters/RangeFrom"
+        - $ref: "#/components/parameters/RangeTo"
+        - name: group_by
+          in: query
+          schema: { type: string, enum: [model, key], default: model }
+        - name: model_id
+          in: query
+          schema: { type: string }
+          description: 收窄到单个模型（同时收窄 series）
+        - name: api_key_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: 收窄到单个 Key（同时收窄 series）
+      responses:
+        "200":
+          description: 用量汇总
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageSummaryEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/model-usage/requests:
+    get:
+      tags: [model-console]
+      summary: 请求明细分页（keyset 游标）
+      description: |
+        按 (created_at DESC, id DESC) 稳定排序的请求明细。`next_cursor` 为
+        不透明 keyset 游标（base64url），持续写入下不跳行/不重复；最后一页
+        为 null。未结算请求 charge_micros/net_micros 为 null（预占中），
+        reserved_micros 展示在途预占；reversed_micros 承载结算后的账本冲正。
+      operationId: listModelUsageRequests
+      parameters:
+        - $ref: "#/components/parameters/RangeFrom"
+        - $ref: "#/components/parameters/RangeTo"
+        - name: model_id
+          in: query
+          schema: { type: string }
+        - name: api_key_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: 上一页响应的 next_cursor（不透明，不要解析）
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        "200":
+          description: 请求明细页
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageRequestsEnvelope"
+              examples:
+                reconciliation:
+                  summary: 待核对（计量缺失，预占保留）
+                  externalValue: fixtures/model-usage-requests-reconciliation.json
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/model-subscriptions:
+    get:
+      tags: [model-console]
+      summary: Coding Plan 套餐与权益视图（与旧会员分离）
+      description: |
+        返回 coding-plan 产品的订阅列表（全部状态，最新在前）、计费账户的
+        权益（含 grant 来源：subscription / order / bundle_gift /
+        migration_gift）与命名空间化的 kaya_membership 活跃标记。
+        旧会员详情仍由 /user/subscriptions 提供，两边不混排。
+        赠送来源记录到订阅/规则级；**上游供应商账号不出现在任何字段中**。
+      operationId: getModelSubscriptions
+      responses:
+        "200":
+          description: 套餐与权益视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelSubscriptionsEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+
+  /user/wallet:
+    get:
+      tags: [model-console]
+      summary: 钱包余额总览（预付按量，Task 14）
+      description: |
+        返回账户每个币种钱包的**账本派生**余额：cash/bonus 分来源，
+        available = Σcredit − Σdebit − Σheld（冻结中金额单列）；没有独立
+        缓存余额，展示永远等于账本（设计 §7.3）。现金退款落在已消费资金
+        上时现金余额如实为负（不隐藏负差额）。另含套餐外消费开关
+        （overage_enabled，默认关）、UTC 自然月支出上限
+        （monthly_spend_limit_micros）与当月已支出（month_spent_micros，
+        区间 [month_start, month_end)），以及 PAYG（无套餐按量）开启状态。
+        所有金额字段为 DecimalInt64（十进制整数字符串）+ unit=micromoney。
+      operationId: getWallet
+      responses:
+        "200":
+          description: 钱包总览（无计费账户时为零状态：空 wallets + payg.enabled=false）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/wallet/entries:
+    get:
+      tags: [model-console]
+      summary: 钱包分录流水（追加+冲正，keyset 分页）
+      description: |
+        钱包账本逐条呈现：topup/bonus/consume/refund/adjustment/reversal，
+        direction（debit/credit）与 source（cash/bonus）分列；退款只允许
+        cash 来源原路退，赠送（bonus）余额不得伪装现金退款。按 id 倒序，
+        cursor 为上一页末条 id；next_cursor 为空表示到底。
+      operationId: listWalletEntries
+      parameters:
+        - name: currency
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[A-Z]{3}$" }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 100 }
+      responses:
+        "200":
+          description: 分录页
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletEntriesEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/wallet/overage:
+    put:
+      tags: [model-console]
+      summary: 显式开启/关闭套餐外消费 + 设置支出上限
+      description: |
+        套餐外消费**默认关**：套餐额度耗尽即停（quota_exceeded），不动余额。
+        开启必须同时设置 UTC 自然月支出上限（enabled=true 且缺
+        monthly_spend_limit_micros → 400）；开启/关闭/改上限全部写入
+        审计（inference_wallet_audits）。请求入场时固定扣费来源（套餐或
+        钱包），首版不在请求中途隐式切换；钱包路径同样走完整有界预占
+        （冻结→结算/释放），预占金额按入场价格版本固定，调价不影响在途
+        冻结。
+      operationId: setWalletOverage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WalletOverageRequest"
+      responses:
+        "200":
+          description: 更新后的该币种钱包视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletView"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/wallet/payg:
+    post:
+      tags: [model-console]
+      summary: 开启无套餐按量（PAYG）——显式权益记录
+      description: |
+        账户没有套餐时，允许在**显式 PAYG 权益记录**下用余额调用
+        （source_type=payg）；模型授权/速率/并发限制照常执行。开启动作按
+        运营发布的 PAYG 配置（PUT /admin/payg-config）创建权益；未发布配
+        置 → 404（没有配置的商品不可购买）。幂等：重复开启返回同一记录。
+        钱包扣费仍需先开启套餐外消费并设支出上限。
+      operationId: enablePayg
+      responses:
+        "200":
+          description: PAYG 权益视图（幂等）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaygEnvelope"
+        "404":
+          description: 运营未发布 PAYG 配置
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /admin/wallet/adjustments:
+    post:
+      tags: [model-admin]
+      summary: 运营钱包调整（billing:adjust）
+      description: |
+        赠送发放（source=bonus, direction=credit）、现金补偿与扣回；写入
+        inference_adjustments + 钱包分录（同一事务），operator/service
+        双重归因，idempotency_key 幂等（重复投递只生效一次，重放响应
+        applied=false）。金额 DecimalInt64；bonus 永不走现金退款路径。
+        Task 15 起调整/冲正带同事务追加审计（wallet.adjust / wallet.reverse，
+        可定位到人员）。
+      operationId: createWalletAdjustment
+      responses:
+        "201": { description: 已应用 }
+        "200": { description: 幂等重放（applied=false） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      tags: [model-admin]
+      summary: 补偿追踪列表（billing:adjust 读面；与 /admin/model-adjustments 同一口径）（Task 15）
+      operationId: listWalletAdjustments
+      parameters:
+        - { name: billing_account_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 补偿列表（原因/对象/金额/操作者/幂等键） }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/wallet/reversals:
+    post:
+      tags: [model-admin]
+      summary: 冲正一条钱包分录（billing:adjust）
+      description: 追加反向分录（不重写已入账事实）；一条分录至多一条冲正，重复冲正 reversed=false。
+      operationId: reverseWalletEntry
+      responses:
+        "200": { description: reversed=true/false }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/wallet:
+    get:
+      tags: [model-admin]
+      summary: 运营只读：派生余额 + 近期分录（billing:adjust）
+      operationId: getWalletAdmin
+      parameters:
+        - name: billing_account_id
+          in: query
+          schema: { type: string }
+        - name: user_id
+          in: query
+          schema: { type: string }
+        - name: currency
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[A-Z]{3}$" }
+      responses:
+        "200": { description: 钱包视图 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/payg-config:
+    get:
+      tags: [model-admin]
+      summary: 读取 PAYG 发布配置（billing:adjust）
+      operationId: getPaygConfig
+      responses:
+        "200": { description: 当前配置 }
+        "404": { description: 未配置 }
+    put:
+      tags: [model-admin]
+      summary: 发布 PAYG 默认策略版本 + 显式模型集合（billing:adjust）
+      description: 策略版本必须已 published；空 model_ids = 不授权任何模型（无 NULL 全放行语义）。
+      operationId: putPaygConfig
+      responses:
+        "200": { description: 已发布 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ------------------------------------------------------------------
+  # Task 15：大量模型运营、价格预览与成本分析
+  # ------------------------------------------------------------------
+
+  /admin/catalog/bulk-import:
+    post:
+      tags: [model-admin]
+      summary: 批量导入目录（models:manage）
+      description: |
+        批量导入 providers/models/deployments（路由按部署派生）。语义：
+        - `dry_run=true`：逐项预演（`would_insert`/`would_skip`/`error`），
+          一行不写；部分错误的预览只存在于 dry-run 响应。
+        - `dry_run=false`（commit）：**全部有效才落库**——任一 item 出错则
+          整个任务 400（`data.items` 携带逐项错误），一行不写（绝不半发布；
+          要导入子集就删掉错误项换新 task_id 重提）。
+        - `task_id` 幂等：commit 与目录写入同一事务；重复提交（哪怕文档
+          不同）返回 200 + `replayed=true` 与首次已记录的结果，不重复创建。
+        - 大小上限：条目总数 ≤ 200（另有全局 1 MiB body 上限）。
+        - 落库即草稿（lifecycle/status=draft，默认不可售）；运营补齐授权/
+          价格后走 `POST /admin/catalog/publish` 发布。停用上游不删除历史
+          路由记录（删除接口不触碰既有请求/尝试行）。
+        - 每次 commit 追加审计（`catalog.bulk_import`，人员及服务双重归因）。
+      operationId: bulkImportCatalog
+      responses:
+        "200": { description: dry-run 预演 / 幂等重放（replayed=true） }
+        "201": { description: 已提交（committed=true，逐项 inserted/skipped） }
+        "400": { description: 逐项错误（data.items），一行未写 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-usage/summary:
+    get:
+      tags: [model-admin]
+      summary: 运营用量/成本聚合（usage:read）
+      description: |
+        每模型/供应商/客户（`group_by=model|provider|customer`，默认 model）
+        的请求量、成功率（settled+released 占终态比）、延迟（attempts 的
+        avg/p95 毫秒）、计量完整性（reported/estimated/unknown/pending）、
+        客户消费（账本派生 microcredit：charge/reversed/adjusted/net，
+        与客户面逐字同口径）与采购成本（attempts 落库事实，按 币种 ×
+        cost_basis[reported/estimated/allocated] 分片，绝不跨币种合并；
+        `cost_unknown_attempts` 单列成本未知的尝试）。
+        供应商分组：请求级计数按最终尝试（attempt_no 最大）的部署归属
+        （重试不双计）；尝试级指标按每次尝试自己的部署归属；供应商维度
+        不归属请求级账本金额（恒 0——一次请求跨供应商重试时拆账是编造，
+        金额权威维度是模型/客户）。
+        分组只含窗口内确有活动的键：模型/供应商/客户在该 [from, to) 内
+        零请求（供应商零尝试）时整组缺席于 `groups`，不补零行。
+        数据源只有 inference_requests/attempts/usage_records/ledger_entries；
+        `as_of`=`complete_through`=读取时刻（直读权威表）。时间范围默认
+        最近 30 天、最大 92 天（`from`/`to` RFC3339 半开区间）。
+      operationId: opsUsageSummary
+      parameters:
+        - { name: group_by, in: query, schema: { type: string, enum: [model, provider, customer], default: model } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: model_id, in: query, schema: { type: string } }
+        - { name: provider_id, in: query, schema: { type: string } }
+        - { name: billing_account_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: 聚合分组 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-usage/exceptions:
+    get:
+      tags: [model-admin]
+      summary: 异常筛选（usage:read）
+      description: |
+        `kind` 必选：
+        - `stuck_reservations`：held 超过 1 小时的异常预占（请求状态/账户/
+          模型/额度/滞留时长）；
+        - `reauth_required_accounts`：授权失效的上游账号（invalid_grant
+          传播后停止调度；Task 12 语义）；
+        - `settlement_backlog`：pending/running/escalated 的核对任务
+          （含 `overdue` 超期标记——期限告警语义，超期不等于自动释放）。
+      operationId: opsUsageExceptions
+      parameters:
+        - { name: kind, in: query, required: true, schema: { type: string, enum: [stuck_reservations, reauth_required_accounts, settlement_backlog] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 异常列表（kind 对应字段非空） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/upstream-accounts/shared:
+    get:
+      tags: [model-admin]
+      summary: '“一账号一部署”检测视图（usage:read）'
+      description: |
+        **运营约束**：一个上游账号只挂一个部署。两部署共享同一上游账号时，
+        故障切换会撞并发租约唯一键（500）——调度语义不在线变更，本视图是
+        显式检测面：观测窗口内（attempts 落库事实，默认最近 7 天）同一上游
+        账号服务过 >1 个部署的账号清单。命中即应把账号拆到各自部署。
+      operationId: opsSharedDeploymentAccounts
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 违规账号（deployment_ids/attempts/latest_attempt_at） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-adjustments:
+    get:
+      tags: [model-admin]
+      summary: 补偿追踪（usage:read；设计 §9.2 /admin/model-adjustments 族）
+      description: |
+        补偿记录列表（newest first）：原因、对象（billing_account_id /
+        request_id）、金额（DecimalInt64 + 币种/单位）、操作者
+        （operator_subject = user:<uid>@app:<appid> 人员及服务双重归因）、
+        service_subject、幂等键。与 billing:adjust 面的
+        `GET /admin/wallet/adjustments` 同一服务同一口径；本路径供
+        auditor 角色（仅 usage:read）只读追踪。
+      operationId: listModelAdjustments
+      parameters:
+        - { name: billing_account_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: 补偿列表 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/model-prices/preview:
+    post:
+      tags: [model-admin]
+      summary: 价格变更影响预览（models:manage；只读不落库）
+      description: |
+        展示：生效时间（`effective_from`，缺省=当前；[from,to) 边界属新版
+        本）、生效时刻被替换的当前版本（`current_effective`，null=此前未
+        定价）、受影响账户数（覆盖该模型的活跃权益）与受影响套餐（订阅来
+        源权益关联）、在途钉住请求数（它们永远按入场钉住的版本计费）。
+        `existing_subscriptions_keep_version` 恒为 true——旧订阅/在途请求
+        保留版本是结构性事实（031 持久化准入绑定）。
+      operationId: previewModelPrice
+      responses:
+        "200": { description: 影响预览 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: 模型不存在 }
+
+  /admin/quota-policies/preview:
+    post:
+      tags: [model-admin]
+      summary: 额度策略变更影响预览（models:manage；只读不落库）
+      description: |
+        按策略 name 对比当前发布版：模型集合差分（added/removed）、窗口
+        限额变化（proposed vs current_published）、引用当前发布版的活跃
+        权益数（`affected_accounts_kept_on_old`——权益钉住
+        policy_version_id，新版本只影响新发权益；旧订阅保留版本恒 true）。
+        策略版本按权益发放钉住，不存在全局生效时刻。
+      operationId: previewQuotaPolicy
+      responses:
+        "200": { description: 影响预览 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /user/api-keys:
+    post:
+      tags: [api-keys]
+      summary: 创建 API Key（明文仅此响应出现一次）
+      operationId: createApiKey
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiKeyCreateRequest"
+      responses:
+        "200":
+          description: 创建成功（data.key 为唯一一次明文）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreatedEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: 模型权限超出账户权益
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    get:
+      tags: [api-keys]
+      summary: 分页查询 Key（永不携带明文）
+      operationId: listApiKeys
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Key 列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyListEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /user/api-keys/{id}:
+    get:
+      tags: [api-keys]
+      summary: 单个 Key 详情
+      operationId: getApiKey
+      parameters:
+        - $ref: "#/components/parameters/ApiKeyId"
+      responses:
+        "200":
+          description: Key 详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [api-keys]
+      summary: 更新权限/预算/有效期（显式 null 清除可选约束）
+      operationId: updateApiKey
+      parameters:
+        - $ref: "#/components/parameters/ApiKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiKeyUpdateRequest"
+      responses:
+        "200":
+          description: 更新后的 Key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyEnvelope"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: 模型权限超出账户权益
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [api-keys]
+      summary: 撤销 Key（幂等；下一次 /v1 调用即生效）
+      operationId: revokeApiKey
+      parameters:
+        - $ref: "#/components/parameters/ApiKeyId"
+      responses:
+        "200":
+          description: 撤销结果（revoked=false 表示本就已撤销）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          id: { type: string, format: uuid }
+                          revoked: { type: boolean }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # -------------------------------------------------------------------------
+  # Task 13: 编程工具协议面（原生形状,无管理 envelope）。
+  # 能力矩阵详表见 docs/api-integration-guide.md「标准协议接口」一节;
+  # 两端的共同点:同一 principal/预占/结算链,不支持的字段一律 400
+  # (不静默丢弃),流式以协议终止标记为唯一干净结束。
+  # -------------------------------------------------------------------------
+  /v1/messages:
+    post:
+      tags: [v1-protocols]
+      summary: Anthropic Messages（2023-06-01 子集,Claude Code 目标面）
+      description: |
+        原生 Anthropic Messages 请求/响应/SSE 事件形状。鉴权接受
+        `Authorization: Bearer <key>` 或 `X-Api-Key: <key>`（同值域）。
+
+        **支持的请求子集**：`model`（必填）、`messages`（user/assistant，
+        文本与 `tool_use`/`tool_result` 块，ID 逐字保留）、`system`
+        （字符串或 text 块数组）、`max_tokens`（必填，Anthropic 语义）、
+        `stream`、`tools`（仅 custom 工具）、`tool_choice`
+        （auto/any/none/tool + disable_parallel_tool_use）、`thinking`
+        （enabled/disabled，budget_tokens ≥1024 且 < max_tokens）、
+        `temperature`/`top_p`/`top_k`/`stop_sequences`、`metadata`
+        （接受但不消费）。
+        **明确 400**：`image`/`document` 块、服务端工具类型
+        （web_search/computer/bash/code_execution/mcp 等）、其余未知内容块。
+        **接受不回放**：历史 `thinking`/`redacted_thinking` 块、
+        `tool_result.is_error` 标志、`cache_control` 提示。
+
+        响应：`type=message` 原生形状（`usage.input_tokens` 不含
+        cache_read，cache 桶单列）。流式事件序列 `message_start →
+        content_block_start/delta/stop → message_delta → message_stop`；
+        `message_start.usage` 为协议占位（0/0），真实值在终止
+        `message_delta.usage`（含 input_tokens）。上游中断注入
+        `event: error` 后结束，绝不伪造 `message_stop`。
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessagesRequest"
+      responses:
+        "200":
+          description: Anthropic message JSON（非流式）或 Messages SSE 流（stream=true）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessagesResponse"
+            text/event-stream:
+              schema: { type: string, description: "Messages SSE 事件序列" }
+        "400":
+          description: invalid_request_error（能力不兼容/字段非法,原生形状）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "401":
+          description: authentication_error（原生形状）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "403":
+          description: permission_error（模型未授权/未定价）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "404":
+          description: not_found_error（模型不存在）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "429":
+          description: rate_limit_error（额度耗尽;可计算恢复时刻时带 Retry-After）
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "529":
+          description: overloaded_error（上游暂不可用）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+
+  /v1/responses:
+    post:
+      tags: [v1-protocols]
+      summary: OpenAI Responses（Codex 目标面,含 previous_response_id 会话链）
+      description: |
+        原生 OpenAI Responses 请求/响应/SSE 事件形状。鉴权
+        `Authorization: Bearer <key>`。
+
+        **支持的请求子集**：`model`（必填）、`input`（字符串或 items：
+        message（input_text/output_text）、function_call、
+        function_call_output；reasoning 项接受但不回放）、`instructions`、
+        `max_output_tokens`、`stream`、`store`（缺省 true）、
+        `previous_response_id`、`tools`（仅 function 类型）、
+        `tool_choice`（auto/none/required/指定 function）、
+        `parallel_tool_calls`、`temperature`/`top_p`、`reasoning.effort`、
+        `metadata`（接受但不消费）。
+        **明确 400**：`input_image`/`input_file` part、服务端工具类型与
+        其结果项（web_search_call 等）、`item_reference`、`background:true`、
+        非空 `include`、`max_tool_calls`、`truncation:auto`（服务端静默
+        裁剪上下文违反不静默原则）、`text.format` ≠ text。
+
+        **会话链**：成功响应（store≠false）持久化完整 transcript（24h
+        TTL,≤512 KiB）;引用 `previous_response_id` = 上下文回放 + 粘性
+        绑定同一上游账号,账号失效显式迁移(不静默换号)。引用不存在/过期/
+        他人/store:false 的响应一律 404 `previous_response_not_found`。
+
+        流式事件序列 `response.created → response.in_progress →
+        response.output_item.added → (output_text.delta |
+        function_call_arguments.delta | reasoning_summary_text.delta)… →
+        response.completed|response.incomplete`；上游中断注入
+        `event: error` 后结束,绝不伪造 `response.completed`。
+        `GET /v1/responses/{id}`（stored-response 读取面）不实现。
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResponsesRequest"
+      responses:
+        "200":
+          description: Responses 对象 JSON（非流式）或 Responses SSE 流（stream=true）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResponsesResponse"
+            text/event-stream:
+              schema: { type: string, description: "Responses SSE 事件序列" }
+        "400":
+          description: invalid_input（能力不兼容/字段非法）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "401":
+          description: invalid_api_key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "403":
+          description: model_not_allowed / unpriced_capability
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "404":
+          description: model_not_found / previous_response_not_found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "429":
+          description: quota_exceeded（可计算恢复时刻时带 Retry-After）
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "503":
+          description: upstream_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 用户 JWT（Website BFF 保持 Cookie→用户身份的转发）;/v1 协议面同时接受客户 API Key。
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Anthropic 风格凭据头（/v1 协议面,与 Bearer 同值域）。
+
+  parameters:
+    RangeFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date-time }
+      description: 范围起点（含），RFC3339 UTC；缺省 = to - 30 天
+    RangeTo:
+      name: to
+      in: query
+      schema: { type: string, format: date-time }
+      description: 范围终点（不含），RFC3339 UTC；缺省 = 当前服务端时间；跨度最大 92 天
+    ApiKeyId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    InvalidInput:
+      description: 参数非法（invalid_input）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example: { code: 400, data: null, message: "inference/invalid_input: usage: from must be before to" }
+    Unauthorized:
+      description: 未认证（JWT 缺失/失效）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Forbidden:
+      description: 已认证但无权限（运营权限不足 / 模型未授权）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    NotFound:
+      description: 不存在或不属于本人（404 不区分，不泄漏存在性）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example: { code: 404, data: null, message: "inference/not_found: api key not found" }
+
+  schemas:
+    DecimalInt64:
+      type: string
+      pattern: "^[0-9]+$"
+      example: "1000000"
+      description: 64 位整数的十进制字符串（JS 大整数精度安全）；额度单位 microcredit
+    MicroMoney:
+      type: string
+      pattern: "^-?[0-9]+$"
+      example: "29990000"
+      description: 带币种定点微金额的十进制整数字符串（1 单位币种 = 1,000,000 微）；钱包口径可负（现金退款落在已消费资金上时如实为负）
+    WalletView:
+      type: object
+      properties:
+        currency: { type: string, example: "CNY" }
+        unit: { type: string, enum: [micromoney] }
+        cash_available_micros: { $ref: "#/components/schemas/MicroMoney" }
+        bonus_available_micros: { $ref: "#/components/schemas/MicroMoney" }
+        cash_held_micros: { $ref: "#/components/schemas/MicroMoney" }
+        bonus_held_micros: { $ref: "#/components/schemas/MicroMoney" }
+        total_available_micros: { $ref: "#/components/schemas/MicroMoney" }
+        overage_enabled: { type: boolean, description: 套餐外消费开关，默认关 }
+        monthly_spend_limit_micros: { $ref: "#/components/schemas/MicroMoney" }
+        month_spent_micros: { $ref: "#/components/schemas/MicroMoney" }
+        month_start: { $ref: "#/components/schemas/RFC3339UTC" }
+        month_end: { $ref: "#/components/schemas/RFC3339UTC" }
+      description: 单币种钱包视图——账本派生（无缓存余额），held 为在途冻结
+    WalletEnvelope:
+      type: object
+      properties:
+        server_time: { $ref: "#/components/schemas/RFC3339UTC" }
+        wallets:
+          type: array
+          items: { $ref: "#/components/schemas/WalletView" }
+        payg:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            entitlement_id: { type: string }
+            model_ids: { type: array, items: { type: string } }
+            policy_version_id: { type: string }
+    WalletEntriesEnvelope:
+      type: object
+      properties:
+        entries:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { $ref: "#/components/schemas/DecimalInt64" }
+              entry_type: { type: string, enum: [topup, bonus, consume, refund, adjustment, reversal] }
+              direction: { type: string, enum: [debit, credit] }
+              source: { type: string, enum: [cash, bonus], description: cash 可原路退；bonus（赠送）不得伪装现金退款 }
+              amount_micros: { $ref: "#/components/schemas/MicroMoney" }
+              currency: { type: string }
+              request_id: { type: string, nullable: true }
+              payment_id: { type: string, nullable: true }
+              refund_id: { type: string, nullable: true }
+              reverses_entry_id: { $ref: "#/components/schemas/DecimalInt64" }
+              created_by: { type: string }
+              created_at: { $ref: "#/components/schemas/RFC3339UTC" }
+        next_cursor: { type: string, nullable: true }
+    WalletOverageRequest:
+      type: object
+      required: [currency, enabled]
+      properties:
+        currency: { type: string, pattern: "^[A-Z]{3}$" }
+        enabled: { type: boolean }
+        monthly_spend_limit_micros:
+          description: UTC 自然月支出上限；enabled=true 时必填
+          allOf:
+            - $ref: "#/components/schemas/MicroMoney"
+    PaygEnvelope:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        entitlement_id: { type: string }
+        model_ids: { type: array, items: { type: string } }
+        policy_version_id: { type: string }
+    RFC3339UTC:
+      type: string
+      format: date-time
+      example: "2026-09-08T04:00:00Z"
+      description: RFC3339，一律 UTC（服务端计量时间）
+    Envelope:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: integer
+          description: 0 = 成功；失败时为 HTTP 状态码
+        data:
+          nullable: true
+        message:
+          type: string
+          description: 仅失败时携带
+    ErrorEnvelope:
+      type: object
+      required: [code, data, message]
+      properties:
+        code: { type: integer }
+        data: { type: object, nullable: true }
+        message: { type: string }
+
+    # --- /user/model-quotas ---
+
+    QuotaWindow:
+      type: object
+      required: [kind, mode, disabled, limit, used, reserved, remaining, window_start, resets_at]
+      properties:
+        kind:
+          type: string
+          enum: [five_hour, weekly, monthly]
+        mode:
+          type: string
+          enum: [anchored_duration, anchored_period_7d, anchored_calendar_month]
+          description: 窗口展示语义（§6）：五小时=首次消费锚定固定时长；周=锚点起 7×24h；月=锚点公历月（原始锚点日裁剪）
+        disabled:
+          type: boolean
+          description: 策略显式禁用该窗口（缺失≠无限额度）
+        limit:
+          allOf:
+            - $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: 禁用时为 null
+        used:
+          $ref: "#/components/schemas/DecimalInt64"
+        reserved:
+          $ref: "#/components/schemas/DecimalInt64"
+        remaining:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: max(0, limit-used-reserved)；禁用时为 null
+        window_start:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 五小时窗口未激活时为 null
+        resets_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 五小时窗口未激活时为 null
+        activation:
+          type: string
+          enum: [on_first_consumption]
+          description: 仅未激活五小时窗口携带
+    QuotaBlock:
+      type: object
+      required: [kind, reason, limit, used, reserved, remaining, resets_at, expired_at]
+      description: 当前阻断约束；窗口块带计数快照，权益/账户块带原因。所有键恒定存在，不适用为 null
+      properties:
+        kind:
+          type: string
+          enum: [five_hour, weekly, monthly, entitlement, account]
+        reason:
+          type: string
+          enum: [quota_exhausted, entitlement_expired, entitlement_revoked, entitlement_superseded, entitlement_not_yet_effective, no_active_entitlement, account_not_active]
+        limit:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        used:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        reserved:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        remaining:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        resets_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 恢复时刻未知时为 null（不编造倒计时）
+        expired_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+          description: 仅 entitlement_expired 携带（effective_to）
+    QuotaEntitlement:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [active, expired, revoked, superseded]
+        source_type:
+          type: string
+          enum: [subscription, order, grant]
+        model_ids:
+          type: array
+          items: { type: string }
+        policy_version_id: { type: string, format: uuid }
+        anchor_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_from:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_to:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        revision: { type: integer }
+    ModelQuotasEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, unit, entitlement_id, entitlement, blocked_by, windows]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                  description: 权威状态读取时刻（quota 读无延迟）
+                unit:
+                  type: string
+                  enum: [microcredit]
+                entitlement_id:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: null = 账户从未有任何权益（勿解释为无限额度）
+                entitlement:
+                  $ref: "#/components/schemas/QuotaEntitlement"
+                  nullable: true
+                blocked_by:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/QuotaBlock"
+                windows:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/QuotaWindow"
+                  description: 固定顺序 five_hour → weekly → monthly；无权益时为空数组
+
+    # --- /user/model-usage ---
+
+    UsageTokens:
+      type: object
+      description: 规范化 token 桶（最新计量 revision）；null = 未报告（未知 ≠ 0）
+      properties:
+        input_tokens: { type: integer, format: int64, nullable: true }
+        cache_read_tokens: { type: integer, format: int64, nullable: true }
+        cache_write_tokens: { type: integer, format: int64, nullable: true }
+        output_tokens: { type: integer, format: int64, nullable: true }
+        reasoning_tokens: { type: integer, format: int64, nullable: true }
+    UsageGroup:
+      type: object
+      properties:
+        model_id:
+          type: string
+          nullable: true
+          description: group_by=model 的分组键；group_by=key 时为 null
+        api_key_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: group_by=key 的分组键；null = 无 Key 的 JWT/facade 调用组
+        key_name: { type: string }
+        key_prefix: { type: string, description: 展示前缀（永不携带 Key 材料） }
+        requests: { type: integer, format: int64 }
+        settled: { type: integer, format: int64 }
+        released: { type: integer, format: int64 }
+        in_flight: { type: integer, format: int64, description: 预占/在途未终态 }
+        failed: { type: integer, format: int64 }
+        reconciliation_pending: { type: integer, format: int64, description: 待核对 }
+        reported: { type: integer, format: int64 }
+        estimated: { type: integer, format: int64 }
+        unknown: { type: integer, format: int64 }
+        pending: { type: integer, format: int64 }
+        charge_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: Σ 原始 charge 分录（不可变账本派生；修正/作废不重写它）
+        reversed_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: Σ reversal 冲正分录
+        adjusted_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: Σ 请求级 adjustment 签名合计（debit 正 / credit 负；修正补差与运营补偿均计入）
+        net_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: charge − reversed + adjusted（与 reconciliation 账本重建不变量一致）
+        tokens:
+          $ref: "#/components/schemas/UsageTokens"
+    UsageSeriesBucket:
+      type: object
+      description: UTC 自然日桶；金额列与分组同一账本派生口径（charge 毛额 + reversal + 签名 adjustment）
+      properties:
+        bucket_start:
+          $ref: "#/components/schemas/RFC3339UTC"
+        requests: { type: integer, format: int64 }
+        charge_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        reversed_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        adjusted_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: 请求级 adjustment 签名合计（debit 正 / credit 负）
+        net_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: charge − reversed + adjusted
+        reported: { type: integer, format: int64 }
+        estimated: { type: integer, format: int64 }
+        unknown: { type: integer, format: int64 }
+    UsageSummaryEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, complete_through, unit, range, group_by, groups, series]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                complete_through:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                  description: 统计覆盖截止时刻；延迟聚合实现必须如实给出
+                unit: { type: string, enum: [microcredit] }
+                range:
+                  type: object
+                  properties:
+                    from:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                    to:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                group_by: { type: string, enum: [model, key] }
+                groups:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/UsageGroup"
+                series:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/UsageSeriesBucket"
+    UsageRequestRow:
+      type: object
+      properties:
+        request_id: { type: string, format: uuid }
+        model_id: { type: string }
+        api_key_id:
+          type: string
+          format: uuid
+          nullable: true
+        key_name: { type: string }
+        key_prefix: { type: string }
+        protocol:
+          type: string
+          enum: [openai_chat, openai_responses, anthropic_messages, kaya_chat]
+        stream: { type: boolean }
+        status:
+          type: string
+          enum: [authenticated, reserved, dispatching, streaming, non_streaming, settling, settled, released, reconciliation_required, failed]
+        usage_status:
+          type: string
+          enum: [pending, reported, estimated, unknown]
+          description: 计量完整性状态
+        reserved_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: 预占上界（在途请求可见）
+        charge_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: 账本原始 charge 分录；尚无 charge 行（未结算/已释放）为 null；作废修正不归零它
+        reversed_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: Σ reversal 冲正（作废 = 全额冲正原始 charge）
+        adjusted_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          description: 请求级 adjustment 签名合计（debit 正 / credit 负）
+        net_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+          description: charge − reversed + adjusted；无 charge 行为 null；作废后 net=0（不为负）
+        tokens:
+          $ref: "#/components/schemas/UsageTokens"
+          nullable: true
+          description: 无计量记录时整体为 null（配合 usage_status 解读）
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        admitted_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        completed_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+    UsageRequestsEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, unit, range, items, next_cursor, limit]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                unit: { type: string, enum: [microcredit] }
+                range:
+                  type: object
+                  properties:
+                    from:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                    to:
+                      $ref: "#/components/schemas/RFC3339UTC"
+                items:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/UsageRequestRow"
+                next_cursor:
+                  type: string
+                  nullable: true
+                  description: 不透明 keyset 游标；null = 最后一页
+                limit: { type: integer }
+
+    # --- /user/model-subscriptions ---
+
+    ProductSubscription:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        plan_id: { type: string }
+        plan_name:
+          type: string
+          nullable: true
+        product_code:
+          type: string
+          enum: [coding-plan, kaya-membership]
+        status:
+          type: string
+          enum: [active, expired, cancelled]
+        started_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+    EntitlementSource:
+      type: object
+      required: [type, reference]
+      description: grant 来源记录（订阅/订单/赠送规则）；永不含上游账号
+      properties:
+        type:
+          type: string
+          enum: [subscription, order, grant]
+        kind:
+          type: string
+          enum: [bundle_gift, migration_gift, other]
+          description: 仅 type=grant 携带
+        reference:
+          type: string
+          description: 原始 source_id（客户自己的订阅/订单/规则标识）
+        subscription_id:
+          type: string
+          format: uuid
+          description: 可解析到本人订阅时携带（显式套餐或捆绑赠送的会员订阅）
+        plan_id: { type: string }
+        plan_name:
+          type: string
+          nullable: true
+    EntitlementItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [active, expired, revoked, superseded]
+        revision: { type: integer }
+        model_ids:
+          type: array
+          items: { type: string }
+        policy_version_id: { type: string, format: uuid }
+        anchor_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_from:
+          $ref: "#/components/schemas/RFC3339UTC"
+        effective_to:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        stackable:
+          type: boolean
+          description: 赠送默认不叠加（§4.2）
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+        source:
+          $ref: "#/components/schemas/EntitlementSource"
+    ModelSubscriptionsEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, as_of, subscriptions, entitlements, kaya_membership]
+              properties:
+                server_time:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                as_of:
+                  $ref: "#/components/schemas/RFC3339UTC"
+                subscriptions:
+                  type: array
+                  description: 仅 coding-plan 产品（全部状态，最新在前）
+                  items:
+                    $ref: "#/components/schemas/ProductSubscription"
+                entitlements:
+                  type: array
+                  description: 当前与已停用权益（active 在前，其余按创建时间倒序）
+                  items:
+                    $ref: "#/components/schemas/EntitlementItem"
+                kaya_membership:
+                  $ref: "#/components/schemas/ProductSubscription"
+                  nullable: true
+                  description: 旧会员活跃标记（命名空间隔离；无活跃会员时为 null）
+
+    # --- /user/api-keys ---
+
+    ApiKey:
+      type: object
+      description: 管理视图永不携带 Key 材料（prefix 仅展示/关联用）
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string, example: "yk-Ab3xY9kQ2" }
+        model_ids:
+          type: array
+          items: { type: string }
+          description: 空数组 = 不额外收窄（账户权益全集）
+        budget_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        budget_used_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        rpm_limit:
+          type: integer
+          nullable: true
+        status:
+          type: string
+          enum: [active, revoked, expired]
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        revoked_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        last_used_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+        created_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+    ApiKeyCreateRequest:
+      type: object
+      properties:
+        name: { type: string, maxLength: 128 }
+        model_ids:
+          type: array
+          items: { type: string }
+        budget_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+        rpm_limit: { type: integer, minimum: 1 }
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+    ApiKeyUpdateRequest:
+      type: object
+      description: 仅列出字段被修改；显式 null 清除可选约束（budget/rpm/expires）；未知字段一律 400
+      properties:
+        name: { type: string, maxLength: 128 }
+        model_ids:
+          type: array
+          nullable: true
+          items: { type: string }
+        budget_micros:
+          $ref: "#/components/schemas/DecimalInt64"
+          nullable: true
+        rpm_limit:
+          type: integer
+          nullable: true
+        expires_at:
+          $ref: "#/components/schemas/RFC3339UTC"
+          nullable: true
+    ApiKeyCreatedEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              allOf:
+                - $ref: "#/components/schemas/ApiKey"
+                - type: object
+                  properties:
+                    key:
+                      type: string
+                      description: 明文仅此一次；服务端不可恢复
+    ApiKeyEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/ApiKey"
+    ApiKeyListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              properties:
+                items:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/ApiKey"
+                total: { type: integer, format: int64 }
+                limit: { type: integer }
+                offset: { type: integer }
+    # -----------------------------------------------------------------------
+    # Task 13: /v1 协议面 schema(原生形状,非管理 envelope)。
+    # -----------------------------------------------------------------------
+    V1Error:
+      type: object
+      description: OpenAI 原生错误形状（chat/responses 面）。
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            type:
+              type: string
+              enum: [authentication_error, invalid_request_error, permission_error, rate_limit_error, server_error]
+            code:
+              type: string
+              description: 统一内部错误码映射(invalid_input/quota_exceeded/model_not_found/model_not_allowed/previous_response_not_found/upstream_unavailable 等)
+      required: [error]
+    AnthropicError:
+      type: object
+      description: Anthropic 原生错误形状（messages 面）。
+      properties:
+        type: { type: string, enum: [error] }
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, permission_error, not_found_error, rate_limit_error, api_error, overloaded_error]
+            message: { type: string }
+      required: [type, error]
+    MessagesRequest:
+      type: object
+      description: |
+        Anthropic Messages 请求子集(2023-06-01)。不支持的字段一律 400:
+        image/document 块、服务端工具类型。历史 thinking 块接受但不回放。
+      properties:
+        model: { type: string, maxLength: 128 }
+        max_tokens: { type: integer, format: int64, minimum: 1 }
+        messages:
+          type: array
+          maxItems: 512
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [user, assistant] }
+              content:
+                description: 字符串或内容块数组(text/tool_use/tool_result;thinking 接受不回放;image/document 拒绝)
+        system:
+          description: 字符串或 text 块数组(cache_control 提示接受但不保证生效)
+        stream: { type: boolean, default: false }
+        tools:
+          type: array
+          maxItems: 128
+          items:
+            type: object
+            description: 仅 custom 工具({name, description?, input_schema?})
+        tool_choice:
+          description: "{type:auto|any|none|tool, name?, disable_parallel_tool_use?}"
+        thinking:
+          type: object
+          properties:
+            type: { type: string, enum: [enabled, disabled] }
+            budget_tokens: { type: integer, format: int64, minimum: 1024, description: "必须 < max_tokens" }
+        temperature: { type: number }
+        top_p: { type: number }
+        top_k: { type: integer, format: int64, minimum: 1 }
+        stop_sequences: { type: array, items: { type: string } }
+        metadata: { type: object, description: "客户端标记,不消费" }
+      required: [model, max_tokens, messages]
+    MessagesResponse:
+      type: object
+      description: Anthropic message 原生响应。usage.input_tokens 不含 cache_read(Anthropic 口径)。
+      properties:
+        id: { type: string, example: "msg_01Xy…" }
+        type: { type: string, enum: [message] }
+        role: { type: string, enum: [assistant] }
+        model: { type: string, description: 公开模型 id(非上游名) }
+        content:
+          type: array
+          items:
+            type: object
+            description: text / thinking(无签名) / tool_use 块
+        stop_reason: { type: string, nullable: true, enum: [end_turn, tool_use, max_tokens, null] }
+        stop_sequence: { type: string, nullable: true }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer, format: int64 }
+            output_tokens: { type: integer, format: int64 }
+            cache_read_input_tokens: { type: integer, format: int64 }
+            cache_creation_input_tokens: { type: integer, format: int64 }
+      required: [id, type, role, model, content]
+    ResponsesRequest:
+      type: object
+      description: |
+        OpenAI Responses 请求子集。明确 400:多模态 part、服务端工具
+        (含 web_search_call 等结果项与 item_reference)、background:true、
+        非空 include、max_tool_calls、truncation:auto、text.format≠text。
+      properties:
+        model: { type: string, maxLength: 128 }
+        input:
+          description: 字符串或 items 数组(message/function_call/function_call_output;reasoning 接受不回放)
+        instructions: { type: string, description: "系统提示(→ system 消息)" }
+        max_output_tokens: { type: integer, format: int64, minimum: 1 }
+        stream: { type: boolean, default: false }
+        store:
+          type: boolean
+          default: true
+          description: "false = 不落会话链,后续 previous_response_id 引用得 404"
+        previous_response_id:
+          type: string
+          description: "会话链引用:transcript 回放 + 粘性绑定同一上游账号;跨客户/过期/store:false 一律 404"
+        tools:
+          type: array
+          maxItems: 128
+          items:
+            type: object
+            description: 仅 {type:function, name, description?, parameters?, strict?}
+        tool_choice: { description: "auto|none|required|{type:function,name}" }
+        parallel_tool_calls: { type: boolean }
+        temperature: { type: number }
+        top_p: { type: number }
+        reasoning:
+          type: object
+          properties:
+            effort: { type: string, enum: [low, medium, high, xhigh, none, minimal] }
+        metadata: { type: object, description: "客户端标记,不消费" }
+      required: [model, input]
+    ResponsesResponse:
+      type: object
+      description: OpenAI Responses 原生响应对象。
+      properties:
+        id: { type: string, example: "resp_0f3c…" }
+        object: { type: string, enum: [response] }
+        created_at: { type: integer, format: int64 }
+        status: { type: string, enum: [completed, incomplete] }
+        incomplete_details:
+          type: object
+          nullable: true
+          properties:
+            reason: { type: string, enum: [max_output_tokens] }
+        model: { type: string, description: 公开模型 id(非上游名) }
+        output:
+          type: array
+          items:
+            type: object
+            description: reasoning(摘要文本) / message(output_text) / function_call(call_id 逐字保留)
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer, format: int64, description: "含 cached(OpenAI 口径)" }
+            input_tokens_details:
+              type: object
+              properties:
+                cached_tokens: { type: integer, format: int64 }
+            output_tokens: { type: integer, format: int64 }
+            output_tokens_details:
+              type: object
+              properties:
+                reasoning_tokens: { type: integer, format: int64 }
+            total_tokens: { type: integer, format: int64 }
+      required: [id, object, created_at, status, model, output]

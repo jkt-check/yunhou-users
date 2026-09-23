@@ -243,3 +243,53 @@ func TestOrderSweeper_TickLogsFlippedCount(t *testing.T) {
 	// The success path with n > 0 doesn't return an error, doesn't
 	// panic — the test passes if the goroutine exits cleanly via Stop.
 }
+
+// fakeEntitlementExpirer records MarkExpiredEntitlements calls (Task 10
+// sweeper hook).
+type fakeEntitlementExpirer struct {
+	calls atomic.Int64
+	err   error
+}
+
+func (f *fakeEntitlementExpirer) MarkExpiredEntitlements(_ context.Context, _ time.Time) (int64, error) {
+	f.calls.Add(1)
+	if f.err != nil {
+		return 0, f.err
+	}
+	return 0, nil
+}
+
+func TestOrderSweeper_TickRunsEntitlementExpiry(t *testing.T) {
+	t.Parallel()
+	repo := &mockOrderRepo{}
+	exp := &fakeEntitlementExpirer{}
+	s := NewOrderSweeper(repo, time.Hour)
+	s.SetEntitlementExpirer(exp)
+	s.tick(context.Background())
+	if exp.calls.Load() != 1 {
+		t.Fatalf("entitlement expiry calls = %d, want 1", exp.calls.Load())
+	}
+}
+
+func TestOrderSweeper_TickEntitlementErrorDoesNotStopOrders(t *testing.T) {
+	t.Parallel()
+	repo := &mockOrderRepo{}
+	exp := &fakeEntitlementExpirer{err: errors.New("boom")}
+	s := NewOrderSweeper(repo, time.Hour)
+	s.SetEntitlementExpirer(exp)
+	// 权益标记失败只记日志、下一轮重试 —— 订单扫描不受影响、不 panic。
+	s.tick(context.Background())
+	if repo.callCount.Load() != 1 || exp.calls.Load() != 1 {
+		t.Fatalf("orders=%d entitlements=%d", repo.callCount.Load(), exp.calls.Load())
+	}
+}
+
+func TestOrderSweeper_TickWithoutEntitlementExpirer(t *testing.T) {
+	t.Parallel()
+	repo := &mockOrderRepo{}
+	s := NewOrderSweeper(repo, time.Hour)
+	s.tick(context.Background()) // 未接线 → 不 panic
+	if repo.callCount.Load() != 1 {
+		t.Fatalf("orders=%d", repo.callCount.Load())
+	}
+}

@@ -397,17 +397,41 @@ func (m *mockPlanChangeLogRepo) InsertTx(ctx context.Context, _ *sqlx.Tx, planID
 
 type mockSubscriptionRepo struct {
 	subs      map[string]*model.Subscription // key: id
-	byUserID  map[string]*model.Subscription // key: userID (only active)
+	byUserID  map[string]*model.Subscription // legacy view: bare userID (kaya-compat); tests poke this directly
+	byProduct map[string]*model.Subscription // key: userID+"|"+productCode (only active)
 	createErr error
 	findErr   error
 	updateErr error
 	renewErr  error
 }
 
+// mockSubProduct normalizes a subscription's product for map keying:
+// fixtures written before migration 027 (or hand-built in tests) leave
+// ProductCode empty; production fills it from the plan row via the 027
+// trigger, so empty maps to the kaya-membership compat product.
+func mockSubProduct(s *model.Subscription) string {
+	return mockProductCode(s.ProductCode)
+}
+
+// mockProductCode normalizes an incoming product_code the same way, so a
+// lookup keyed on a plan fixture with an empty ProductCode still finds the
+// kaya-membership rows production would have stored.
+func mockProductCode(productCode string) string {
+	if productCode == "" {
+		return model.ProductKayaMembership
+	}
+	return productCode
+}
+
+func mockUserProductKey(userID, productCode string) string {
+	return userID + "|" + mockProductCode(productCode)
+}
+
 func newMockSubscriptionRepo() *mockSubscriptionRepo {
 	return &mockSubscriptionRepo{
-		subs:     make(map[string]*model.Subscription),
-		byUserID: make(map[string]*model.Subscription),
+		subs:      make(map[string]*model.Subscription),
+		byUserID:  make(map[string]*model.Subscription),
+		byProduct: make(map[string]*model.Subscription),
 	}
 }
 
@@ -417,21 +441,39 @@ func (m *mockSubscriptionRepo) Create(_ context.Context, s *model.Subscription) 
 	}
 	m.subs[s.ID] = s
 	if s.Status == "active" {
-		m.byUserID[s.UserID] = s
+		m.byProduct[mockUserProductKey(s.UserID, mockSubProduct(s))] = s
+		if mockSubProduct(s) == model.ProductKayaMembership {
+			m.byUserID[s.UserID] = s
+		}
 	}
 	return nil
 }
 
 func (m *mockSubscriptionRepo) FindActiveByUserID(_ context.Context, userID string) (*model.Subscription, error) {
+	// Legacy compat entry: kaya-membership only (mirrors the real repo).
+	return m.findActive(userID, model.ProductKayaMembership)
+}
+
+func (m *mockSubscriptionRepo) FindActiveByUserAndProduct(_ context.Context, userID, productCode string) (*model.Subscription, error) {
+	return m.findActive(userID, productCode)
+}
+
+// findActive resolves the product-scoped map first; for the kaya-compat
+// product it also honors the legacy byUserID map so fixtures written by
+// direct poke (`sr.byUserID[u] = …`, pre-027 test idiom) keep working.
+func (m *mockSubscriptionRepo) findActive(userID, productCode string) (*model.Subscription, error) {
 	if m.findErr != nil {
 		return nil, m.findErr
 	}
-	s, ok := m.byUserID[userID]
+	s, ok := m.byProduct[mockUserProductKey(userID, productCode)]
+	if !ok && mockProductCode(productCode) == model.ProductKayaMembership {
+		s, ok = m.byUserID[userID]
+	}
 	if !ok {
 		return nil, sql.ErrNoRows
 	}
-	// Defensive: a nil entry in byUserID returns (nil, nil) — drives
-	// the "sub == nil" defensive branch in callers.
+	// Defensive: a nil entry returns (nil, nil) — drives the "sub == nil"
+	// defensive branch in callers.
 	if s == nil {
 		return nil, nil
 	}
@@ -444,6 +486,10 @@ func (m *mockSubscriptionRepo) FindActiveByUserID(_ context.Context, userID stri
 
 func (m *mockSubscriptionRepo) FindActiveByUserIDTx(_ context.Context, _ *sqlx.Tx, userID string) (*model.Subscription, error) {
 	return m.FindActiveByUserID(context.Background(), userID)
+}
+
+func (m *mockSubscriptionRepo) FindActiveByUserAndProductTx(_ context.Context, _ *sqlx.Tx, userID, productCode string) (*model.Subscription, error) {
+	return m.FindActiveByUserAndProduct(context.Background(), userID, productCode)
 }
 
 func (m *mockSubscriptionRepo) FindByID(_ context.Context, id string) (*model.Subscription, error) {
@@ -467,6 +513,16 @@ func (m *mockSubscriptionRepo) ListByUserID(_ context.Context, userID string) ([
 	return result, nil
 }
 
+func (m *mockSubscriptionRepo) ListByUserAndProduct(_ context.Context, userID, productCode string) ([]model.Subscription, error) {
+	var result []model.Subscription
+	for _, s := range m.subs {
+		if s.UserID == userID && mockSubProduct(s) == mockProductCode(productCode) {
+			result = append(result, *s)
+		}
+	}
+	return result, nil
+}
+
 func (m *mockSubscriptionRepo) UpdateStatus(_ context.Context, id, status string) error {
 	if m.updateErr != nil {
 		return m.updateErr
@@ -477,6 +533,7 @@ func (m *mockSubscriptionRepo) UpdateStatus(_ context.Context, id, status string
 	}
 	s.Status = status
 	if status != "active" {
+		delete(m.byProduct, mockUserProductKey(s.UserID, mockSubProduct(s)))
 		delete(m.byUserID, s.UserID)
 	}
 	return nil
@@ -492,7 +549,10 @@ func (m *mockSubscriptionRepo) Renew(_ context.Context, id string, expiresAt *ti
 	}
 	s.Status = "active"
 	s.ExpiresAt = expiresAt
-	m.byUserID[s.UserID] = s
+	m.byProduct[mockUserProductKey(s.UserID, mockSubProduct(s))] = s
+	if mockSubProduct(s) == model.ProductKayaMembership {
+		m.byUserID[s.UserID] = s
+	}
 	return nil
 }
 

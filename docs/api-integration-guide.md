@@ -514,6 +514,96 @@ Authorization: Bearer <access_token>
 
 ---
 
+### Kaya Coding Plan 客户接口（模型 API 套餐）
+
+Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-plan`）。本节是 Website 客户控制台的对接契约；完整机器可读契约见
+[docs/api/kaya-coding-plan.openapi.yaml](api/kaya-coding-plan.openapi.yaml)，七个代表状态的响应 fixture 见 [docs/api/fixtures/](api/fixtures/)（零额度、未激活、耗尽、已过期、预占中、跨月、待核对）。
+
+**交付导航（2026-09 Task 16 起）**：Website 一站式交接文档见
+[docs/api/kaya-coding-plan-website-handoff.md](api/kaya-coding-plan-website-handoff.md)
+（客户/运营接口清单、Cookie/BFF 身份传递、权限矩阵、分页与错误码、三窗
+口卡片各态、BFF 不持上游明文凭据/不重新定价的硬约束）；官方 SDK 请求
+形状 fixture（Claude Code / Codex 契约核对用）见
+[docs/api/fixtures/client/](api/fixtures/client/)；灰度/回滚/升级与故障
+演练实测、压测结论、真实客户端联调前置待办见
+[docs/runbooks/kaya-coding-plan-rollout.md](runbooks/kaya-coding-plan-rollout.md)。
+
+**全局约定**
+
+- 全部端点需用户 JWT（`Authorization: Bearer`）；只有本人可查自身 Key/配额/用量/订阅 —— 端点不接收用户/账户 ID 参数，所有权永远来自 JWT 身份。
+- **64 位额度/金额一律十进制整数字符串**（如 `"used": "200000"`），避免 JS 大整数精度丢失；额度单位 `microcredit`。token/请求计数为 JSON 整数。
+- 时间一律 RFC3339 UTC；额度周期由服务端锚点推导，客户端切时区不改变额度。
+- **窗口展示语义**：三窗口 `[start, end)`；五小时窗口未激活时 `window_start`/`resets_at` 为 null 且 `activation=on_first_consumption`；禁用窗口 `disabled=true` + `limit=null`（缺失**不等于**无限额度）。
+- **读口径**：`/user/model-quotas` 是当前**权威**额度状态（`as_of` 即读取时刻，可直接用于展示剩余额度）。`/user/model-usage/*` 是历史统计，带 `as_of`/`complete_through` 截止时刻；统计不得用作实时放行依据。
+- **用量来源**：`inference_requests`/`inference_usage_records`/`inference_ledger_entries`；`usage_events` 心跳表（客户端活跃信号）**不是**模型用量来源。
+- **计量完整性**：每请求 `usage_status` ∈ `reported`/`estimated`/`unknown`/`pending`；token 桶 `null` = 未报告（未知 ≠ 0）；待核对请求 `status=reconciliation_required`，预占保留、未结算金额为 null。
+
+#### `GET /user/model-quotas` — 三窗口额度（权威）
+
+返回当前权益的三窗口 `used`/`reserved`/`remaining`、`window_start`/`resets_at`（前端无需计算窗口）、权益有效期（`entitlement.effective_from/effective_to`）与当前阻断 `blocked_by`。多个窗口同时阻断时全部返回（各带准确 `resets_at`）；恢复时刻未知时 `resets_at=null`（不编造倒计时）。`blocked_by` 的 `reason` ∈ `quota_exhausted`/`entitlement_expired`/`entitlement_revoked`/`entitlement_superseded`/`entitlement_not_yet_effective`/`no_active_entitlement`/`account_not_active`。
+
+#### `GET /user/model-usage/summary` — 用量分组聚合 + 日序列
+
+参数：`from`/`to`（RFC3339，缺省最近 30 天，跨度最大 92 天）、`group_by=model|key`（默认 model）、`model_id`/`api_key_id`（可选收窄）。返回分组聚合（请求计数、计量完整性计数、金额、token 桶合计）+ UTC 自然日序列 `series`。`group_by=key` 时 `api_key_id=null` 的组是无 Key 的 JWT/facade 调用。
+
+**金额口径（账本派生）**：`charge_micros` = Σ 原始 charge 分录（不可变；修正/作废不重写它）、`reversed_micros` = Σ 冲正（作废 = 全额冲正）、`adjusted_micros` = Σ 请求级调整签名合计（debit 正 / credit 负，修正补差与运营补偿均计入）、`net_micros` = charge − reversed + adjusted（作废后净额为 0，不为负）。`series` 桶与分组同一口径。
+
+#### `GET /user/model-usage/requests` — 请求明细分页
+
+参数：`from`/`to` 同上，`model_id`/`api_key_id` 过滤，`limit`（1–100，默认 50），`cursor`（上一页 `next_cursor`，不透明 keyset 游标，持续写入下不跳行；最后一页为 null）。每行：`request_id`、`model_id`、`api_key_id`/`key_name`/`key_prefix`、`status`、`usage_status`、`reserved_micros`/`charge_micros`/`reversed_micros`/`adjusted_micros`/`net_micros`（同一账本派生口径）、`tokens`、`created_at`/`admitted_at`/`completed_at`。
+
+#### `GET /user/model-subscriptions` — Coding Plan 套餐与权益
+
+返回 `subscriptions`（仅 coding-plan，全部状态，最新在前）、`entitlements`（当前与已停用权益，`source` 记录 grant 来源：`subscription`/`order`/`grant`；grant 细分 `bundle_gift`（kaya 会员捆绑）/`migration_gift`（迁移赠送）/`other`）、`kaya_membership`（旧会员活跃标记，命名空间隔离；无活跃会员为 null）。旧会员详情仍由 `GET /user/subscriptions` 提供；**上游供应商账号不出现在任何字段中**。
+
+#### `/user/api-keys` — 客户 Key 自管
+
+`POST /user/api-keys`（明文仅创建响应出现一次）、`GET`（分页，永不携带明文）、`GET/PATCH /user/api-keys/:id`（`PATCH` 显式 `null` 清除可选约束）、`DELETE`（幂等撤销，下一次 `/v1` 调用即生效）。字段与错误形状见 OpenAPI 文件。
+
+---
+
+### 标准协议接口 `/v1/*` — 编程工具接入（Claude Code / Codex 等）
+
+编程工具用客户 API Key 直连标准协议面。鉴权：`Authorization: Bearer <key>`（OpenAI 风格）或 `X-Api-Key: <key>`（Anthropic 风格，两者同值域）。同一 principal/预占/结算链贯穿所有协议面 —— 额度口径、429 语义、账本分类与协议无关。
+
+| 端点 | 协议 | 目标客户端 |
+|---|---|---|
+| `GET /v1/models` | OpenAI 模型列表形状 | 通用（Anthropic 形状的模型列表端点不实现） |
+| `POST /v1/chat/completions` | OpenAI Chat Completions（流式/非流式） | 通用 OpenAI SDK 客户端 |
+| `POST /v1/messages` | Anthropic Messages（API 版本 `2023-06-01` 子集） | Claude Code 及 Anthropic SDK |
+| `POST /v1/responses` | OpenAI Responses（流式/非流式） | Codex 及 Responses SDK |
+
+**协议版本记录**：Anthropic Messages 按 `2023-06-01` 请求/响应/事件形状验证；OpenAI Responses 按 2025 年公开形状（`response.created`/`output_item`/`response.completed` 事件族）验证。契约级验证基于官方 SDK 请求样例与官方文档 fixture（请求/响应形状、流式事件序列、错误映射）；**真实客户端联调在 Task 16 演练环境进行**。
+
+**能力矩阵（不支持 = 明确 400，绝不静默丢弃）**
+
+| 能力 | /v1/chat/completions | /v1/messages | /v1/responses |
+|---|---|---|---|
+| 文本对话（多轮） | ✅ | ✅ | ✅ |
+| 工具调用（自定义 function/custom 工具，ID 逐字保留） | ✅ | ✅ | ✅（`function_call`/`function_call_output`） |
+| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled` | ✅ `thinking.type=enabled`（`budget_tokens` 校验 < `max_tokens` 且 ≥1024） | ✅ `reasoning.effort`（low/medium/high → 开；none/minimal → 关） |
+| 流式 SSE | ✅（`[DONE]` 终止） | ✅（`message_stop` 终止） | ✅（`response.completed`/`response.incomplete` 终止） |
+| 采样参数 | `temperature`/`top_p`/`stop`/`presence_penalty`/`frequency_penalty`/`seed` | `temperature`/`top_p`/`top_k`/`stop_sequences` | `temperature`/`top_p`/`parallel_tool_calls` |
+| `tool_choice` | ✅ OpenAI 全形状 | ✅ `auto`/`any`/`none`/`tool`（`disable_parallel_tool_use` 映射 `parallel_tool_calls=false`） | ✅ `auto`/`none`/`required`/指定 function |
+| 多模态（图片/文件/音频输入或输出） | ❌ 400 | ❌ 400（`image`/`document` 块） | ❌ 400（`input_image`/`input_file` part） |
+| 服务端工具（web_search/computer/bash/code_execution/mcp 等） | ❌ 400（无执行面） | ❌ 400 | ❌ 400（含 `web_search_call` 等结果项与 `item_reference`） |
+| `n>1` / logprobs / prediction / 结构化输出（`response_format`、`text.format=json_*`） | ❌ 400 | n/a | ❌ 400 |
+| `background:true` / 非空 `include` / `max_tool_calls` / `truncation:auto` | n/a | n/a | ❌ 400（无异步面/附加数据面；服务端静默裁剪上下文违反不静默原则） |
+
+**接受但不保证生效的字段（已在文档明示，非静默丢弃）**：`metadata`（客户端标记，不消费）、`cache_control`（成本提示，上游不保证生效）、Messages 历史中的 `thinking`/`redacted_thinking` 块（chat 形状上游无回放语义，接受并丢弃；文本与工具调用连续性不受影响）、`tool_result.is_error` 标志（无对应上游字段，错误文本照常传递）、Responses 输入中的 `reasoning` 项（同上，不回放）。模型未声明支持工具/推理时携带对应字段 → 400（先于任何计费）。
+
+**用法/用量映射**：Messages 面 `usage.input_tokens` 不含 cache_read（Anthropic 口径），`cache_read_input_tokens`/`cache_creation_input_tokens` 单列；Responses 面 `input_tokens` 含 cached（OpenAI 口径）+ `input_tokens_details.cached_tokens`。流式 `message_start.usage` 是协议占位（0/0），真实值在终止 `message_delta.usage`（含 `input_tokens`，当前 Anthropic SDK 的 `MessageDeltaUsage` 支持该字段）。非流式响应在上游确实未报 usage 时不伪造 usage 字段。
+
+**流式中断语义（三协议一致）**：协议终止标记（`[DONE]`/`message_stop`/`response.completed`）是唯一干净结束；上游中断时向流内注入该协议的原生错误事件（chat：内联 `{"error":...}` 块；messages：`event: error`；responses：`event: error`）后结束，**绝不伪造终止标记**。已读用量照常结算（estimated）；未读用量挂起核对（不记零）。
+
+**Responses 会话链（`previous_response_id`）**：成功响应（`store` 缺省 true）持久化截至本轮的完整规范 items transcript + 账户归属 + 实际服务账号（24h TTL，超 512 KiB 的 transcript 不落链）。引用链的请求 = transcript 回放（既有上下文 + 新输入），并经粘性会话绑定钉住同一上游账号；账号失效时显式迁移（旧绑定终止 reason=migrated + 新绑定同事务建立），**绝不静默换号续接**。`store:false` 的响应不落链；引用不存在/过期/他人/`store:false` 的响应一律 404（`previous_response_not_found`，不泄漏存在性）。`GET /v1/responses/{id}`（OpenAI stored-response 读取面）不实现。
+
+**限制**：请求体 ≤1 MiB；消息/输入项 ≤512；工具 ≤128（总 ≤256 KiB）；模型 id ≤128 字符。Messages 面 `max_tokens` 必填（Anthropic 语义）。
+
+**WebSocket**：不实现 —— 目标接入（Claude Code / Codex）均走 HTTP SSE，无 WebSocket 需求。
+
+---
+
 ### Chat 接口
 
 Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可获得对话能力：客户端携带用户 JWT 调用，服务端用自己持有的上游 API Key 代为调用模型，并把流式响应统一翻译成 OpenAI 兼容的 SSE 格式转发给客户端。服务端支持**多模型目录**：运营方通过 `LLM_PROVIDERS_JSON` 配置多个 provider（OpenAI 兼容协议或 Anthropic 协议）与多个逻辑模型；未配置 `LLM_PROVIDERS_JSON` 时回退到旧的 `DEEPSEEK_*` 三件套（合成单模型目录：路由与鉴权行为与之前一致，但响应流末尾会**新增一个 usage chunk**——旧客户端必须能跳过 `choices` 为空数组的 chunk，见下文解析规则）。**每个请求都消耗 yunhou 侧的模型额度**，因此本接口：
@@ -2003,7 +2093,7 @@ POST `/webhooks/payment/:channel`，由渠道方调用，**不需要 JWT**，走
 | 404 | `unknown channel` | 该 channel 对应的 webhook secret/key 未配置（如 `STRIPE_WEBHOOK_SECRET` 空时 Stripe 收 404；`WECHAT_PAY_API_V3_KEY` 空时 WeChat 收 404；`ALIPAY_PUBLIC_KEY_PATH` 空时 Alipay 收 404；`PAYPAL_WEBHOOK_ID_SANDBOX` / `PAYPAL_WEBHOOK_ID_LIVE` 空时 PayPal 收 404）。这是"channel 没启用"语义，运营侧需检查对应 env 是否漏配 | 否（重试同样 404） |
 | 500 | `signature verification failed` / `handler error` | 临时错误（DB 抖动、PayPal 上游 verify 接口超时等） | 是（渠道按其重试策略） |
 
-成功响应统一格式（标准 envelope）：
+成功响应统一格式（标准 envelope，alipay 渠道例外——按渠道契约返回纯文本 `success`）：
 
 ```json
 {

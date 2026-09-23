@@ -49,8 +49,8 @@ func ParseActor(actor string) (userID, appID string) {
 	return userID, appID
 }
 
-// firstReason 取操作员理由。写方法的 reason 是可变参数位——httpapi 层尚未
-// 透传时为空串（参数位保留给 httpapi 接线），调用方传入时写入审计事件
+// firstReason 取操作员理由。写方法的 reason 是可变参数位——httpapi 层已
+// 透传（body reason 字段或 ?reason=），未传时为空串；传入时写入审计事件
 // （审查修复 Important-4：operator Reason 此前从未被采集）。
 func firstReason(reason []string) string {
 	if len(reason) > 0 {

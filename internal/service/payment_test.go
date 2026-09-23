@@ -685,20 +685,25 @@ func TestRefundModel_DBFields(t *testing.T) {
 // deriveMerchantRefundNo — 评审轮2 N2 确定性派生
 // ============================================================================
 
-// 同一 Idempotency-Key 两次调用必得同一商户退款单号（渠道以商户单号为退
-// 款幂等键，崩溃重试窗口由渠道侧幂等兜底）；不同键派生不同单号；长度低
-// 于渠道 64 字符上限。
+// 同一支付 + 同一 Idempotency-Key 两次调用必得同一商户退款单号（渠道以
+// 商户单号为退款幂等键，崩溃重试窗口由渠道侧幂等兜底）；不同键或不同支
+// 付派生不同单号（评审轮3 Critical-1：refunds 有全局 UNIQUE(channel,
+// external_refund_id)，跨支付共享单号必撞唯一键）；长度低于渠道 64 字
+// 符上限。
 func TestDeriveMerchantRefundNo_Deterministic(t *testing.T) {
 	t.Parallel()
 
 	const key = "user-req-deterministic-001"
-	first := deriveMerchantRefundNo(key)
-	second := deriveMerchantRefundNo(key)
+	first := deriveMerchantRefundNo("pay-1", key)
+	second := deriveMerchantRefundNo("pay-1", key)
 	if first != second {
-		t.Errorf("same key derived different numbers: %q vs %q", first, second)
+		t.Errorf("same payment+key derived different numbers: %q vs %q", first, second)
 	}
-	if other := deriveMerchantRefundNo("user-req-deterministic-002"); other == first {
+	if other := deriveMerchantRefundNo("pay-1", "user-req-deterministic-002"); other == first {
 		t.Errorf("different keys derived the same number: %q", first)
+	}
+	if other := deriveMerchantRefundNo("pay-2", key); other == first {
+		t.Errorf("different payments same key derived the same number（必撞 refunds 全局唯一键）: %q", first)
 	}
 	if len(first) > 64 {
 		t.Errorf("merchant refund no length = %d, want <= 64（渠道单号上限）", len(first))

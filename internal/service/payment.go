@@ -290,12 +290,16 @@ func orderTouchesBenefits(o *model.Order, productCode string) bool {
 	return o.BenefitPolicyVersionID != nil || productCode == model.ProductCodingPlan
 }
 
-// deriveMerchantRefundNo 从客户端幂等键确定性派生商户退款单号（评审轮2
-// N2）。微信/支付宝以商户退款单号为退款幂等键：同键重试必得同号，渠道侧
-// 幂等兜底崩溃重试窗口的双退款。"mrn_" + sha256 hex 前 40 位 = 44 字符，
-// 低于渠道 64 字符单号上限。
-func deriveMerchantRefundNo(idempotencyKey string) string {
-	sum := sha256.Sum256([]byte("yunhou-refund:" + idempotencyKey))
+// deriveMerchantRefundNo 从支付 ID + 客户端幂等键确定性派生商户退款单号
+//（评审轮2 N2）。微信/支付宝以商户退款单号为退款幂等键：同笔支付同键
+// 重试必得同号，渠道侧幂等兜底崩溃重试窗口的双退款。"mrn_" + sha256 hex
+// 前 40 位 = 44 字符，低于渠道 64 字符单号上限。
+// 评审轮3 Critical-1：派生输入必须含 paymentID——refunds 表有全局
+// UNIQUE(channel, external_refund_id)，而 (user,key) 幂等闸按用户隔离，
+// 只按 key 派生会让跨用户撞键的两笔退款共享商户单号：第二笔渠道已退款
+// 但 INSERT 撞唯一键丢账，webhook 还会错配到第一笔的行。
+func deriveMerchantRefundNo(paymentID, idempotencyKey string) string {
+	sum := sha256.Sum256([]byte("yunhou-refund:" + paymentID + ":" + idempotencyKey))
 	return "mrn_" + hex.EncodeToString(sum[:])[:40]
 }
 
@@ -1546,10 +1550,12 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 	// webhook 以同一商户单号派生 external_refund_id（微信 out_refund_no /
 	// 支付宝 out_biz_no），两侧键一致，webhook 的 ON CONFLICT 重读才能命
 	// 中本行（翻 paid），而不是为同一笔钱插入第二条退款行。单号从
-	// Idempotency-Key 确定性派生（评审轮2 N2）：渠道退款成功但 refunds 行
-	// INSERT 前崩溃/回滚时，客户端持同一幂等键重试必得同一单号，渠道以商
-	// 户单号为幂等键拒绝第二笔退款（随机单号则会被渠道当成新退款执行）。
-	merchantRefundNo := deriveMerchantRefundNo(in.IdempotencyKey)
+	// paymentID+Idempotency-Key 确定性派生（评审轮2 N2 / 轮3 C-1）：渠道
+	// 退款成功但 refunds 行 INSERT 前崩溃/回滚时，客户端持同一幂等键重试
+	// 必得同一单号，渠道以商户单号为幂等键拒绝第二笔退款（随机单号则会
+	// 被渠道当成新退款执行）；混入 paymentID 避免跨支付撞 refunds 全局唯
+	// 一键。
+	merchantRefundNo := deriveMerchantRefundNo(payment.ID, in.IdempotencyKey)
 	echoed, err := s.refundAPI.Refund(ctx, payment.Channel, payment.ExternalTxnID, merchantRefundNo, in.Amount, in.IdempotencyKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRefundChannelFailed, err)

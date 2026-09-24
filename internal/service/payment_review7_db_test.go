@@ -8,6 +8,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
+	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/inference/access"
 	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/inference/workers"
@@ -18,6 +19,25 @@ import (
 // Critical-1（Alipay 累计差额早退不得跳过全额退款级联）、Important-2
 // （webhook 退款对账以商户退款单号为键 + 退款失败事件翻 failed）、
 // Important-3（paid 后 payment_failed 回冲钱包充值）。
+
+// newReview7WechatService 构造带微信 stub 的支付服务——wechat_pay 下单要求
+// 渠道客户端已接线（否则 ErrWechatPayNotConfigured），退款路径本身不打微
+// 信 API，stub 只需承接下单的 unified order。
+func newReview7WechatService(t *testing.T, db *sqlx.DB) *PaymentService {
+	t.Helper()
+	stub := &stubWechat{
+		mockMode: false,
+		mchID:    "1900000109",
+		appID:    "wx_test_app",
+		unifiedFn: func(_ context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return &wechat.UnifiedOrderResponse{
+				OutTradeNo: req.OutTradeNo,
+				CodeURL:    "weixin://wxpay/bizpayurl?pr=" + req.OutTradeNo,
+			}, nil
+		},
+	}
+	return newTestPaymentServiceWith(t, db, stub)
+}
 
 // apiRefundRowThenWebhook 走通「POST /refunds 记录行 → 对应 webhook 投递」
 // 的公共 setup：下单元月订阅、渠道支付成功、API 全额退款记录 pending 行，
@@ -119,7 +139,7 @@ func TestAlipay_APIRefundRowThenWebhook_FullCascadeRuns(t *testing.T) {
 // API 行翻 paid，不为同一笔钱插入第二条退款行；全额级联照常。
 func TestWeChat_APIRefundRowThenWebhook_Reconciled(t *testing.T) {
 	db := setupPaymentDB(t)
-	svc := newTestPaymentService(t, db)
+	svc := newReview7WechatService(t, db)
 	uid := seedUser(t, db)
 	ctx := context.Background()
 
@@ -312,7 +332,7 @@ func TestPaymentFailed_AfterPaid_WalletTopupDebitsWallet(t *testing.T) {
 // audit-only 默认分支，失败退款永远卡 pending、堵住合计不变量）。
 func TestOnWebhook_RefundFailedEvent_FlipsPendingRow(t *testing.T) {
 	db := setupPaymentDB(t)
-	svc := newTestPaymentService(t, db)
+	svc := newReview7WechatService(t, db)
 	uid := seedUser(t, db)
 	ctx := context.Background()
 

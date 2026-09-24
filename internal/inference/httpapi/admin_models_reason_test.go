@@ -85,7 +85,7 @@ func TestAdminModels_ReasonFlowsToAudit(t *testing.T) {
 
 	// 带 reason 的创建：审计事件 model.create 携带该 reason。
 	w := call(http.MethodPost, "/admin/models",
-		`{"id":"m-reason","display_name":"M","context_tokens":1024,"max_output_tokens":128,"reason":"promo onboarding"}`)
+		`{"id":"m-reason","display_name":"M","context_tokens":1024,"max_output_tokens":128,"protocols":["openai_chat"],"reason":"promo onboarding"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("create = %d: %s", w.Code, w.Body.String())
 	}
@@ -114,7 +114,7 @@ func TestAdminModels_ReasonFlowsToAudit(t *testing.T) {
 
 	// 未传 reason：空串（现状兼容），不报错。
 	w = call(http.MethodPost, "/admin/models",
-		`{"id":"m-noreason","display_name":"M2","context_tokens":1024,"max_output_tokens":128}`)
+		`{"id":"m-noreason","display_name":"M2","context_tokens":1024,"max_output_tokens":128,"protocols":["openai_chat"]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("create without reason = %d: %s", w.Code, w.Body.String())
 	}

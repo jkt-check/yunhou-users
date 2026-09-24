@@ -96,7 +96,7 @@ func (p *PriceVersion) Validate() error {
 		return domain.NewError(domain.CodeInvalidInput, "accounting: revision must be > 0")
 	}
 	if p.EffectiveTo != nil && !p.EffectiveTo.After(p.EffectiveFrom) {
-		return domain.NewError(domain.CodeInvalidInput, "accounting: effective range must be (from, to] with to > from")
+		return domain.NewError(domain.CodeInvalidInput, "accounting: effective range must be [from, to) with to > from")
 	}
 	return nil
 }

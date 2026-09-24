@@ -381,7 +381,7 @@ func TestKayaCodingPlan_FullChain(t *testing.T) {
 	// ---------- 2. 发 Key（明文只返回一次；管理面不存明文） ----------
 	resp := doRequest(t, s.engine, http.MethodPost, "/user/api-keys",
 		`{"name":"chain-key","model_ids":["glm-4.6"]}`, authHeader(token))
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("create key: %d — %s", resp.StatusCode, string(resp.Body))
 	}
 	var keyEnv struct {

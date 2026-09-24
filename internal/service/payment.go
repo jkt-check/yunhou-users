@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -258,6 +260,27 @@ func (s *PaymentService) enqueueWalletRefund(ctx context.Context, tx dbTx, order
 	}, &dedup)
 }
 
+// enqueueWalletFailedDebit enqueues the cash reversal of one wallet-topup
+// payment that FAILED after reaching paid（评审批次7 Important-3：paid 之后
+// 来 payment_failed，支付行翻 failed 但已入账现金仍可花）。与
+// enqueueWalletRefund 同一现金借记语义，但触发方没有退款行——dedup 键与
+// 消费侧业务键都钉在 payment id 上（与 benefit:failed:{payment_id} 同一锚
+// 点），渠道重投只入队/入账一次。amount 为应冲正差额（评审轮2 N3：订单全
+// 额扣除该支付已 paid 退款后的余额，由调用方计算并保证 > 0）——部分退款
+// 后按全额冲正会把已退回的钱再追一遍。
+func (s *PaymentService) enqueueWalletFailedDebit(ctx context.Context, tx dbTx, order *model.Order, paymentID string, amount float64) error {
+	micros, err := walletTopupMicros(amount, order.Currency)
+	if err != nil {
+		return fmt.Errorf("wallet failed-payment debit amount: %w", err)
+	}
+	dedup := "wallet:failed:" + paymentID
+	return s.enqueueWalletSync(ctx, tx, access.WalletSyncMessage{
+		Kind: access.WalletSyncRefund, UserID: order.UserID, OrderID: order.ID,
+		PaymentID: paymentID, RefundID: "payment-failed:" + paymentID,
+		AmountMicros: micros, Currency: order.Currency,
+	}, &dedup)
+}
+
 // orderTouchesBenefits reports whether paying/refunding/failing this order
 // can move an entitlement: either the order froze a benefit snapshot
 // (post-029 benefit-bearing products) or it belongs to the coding-plan
@@ -267,15 +290,33 @@ func orderTouchesBenefits(o *model.Order, productCode string) bool {
 	return o.BenefitPolicyVersionID != nil || productCode == model.ProductCodingPlan
 }
 
+// deriveMerchantRefundNo 从支付 ID + 客户端幂等键确定性派生商户退款单号
+//（评审轮2 N2）。微信/支付宝以商户退款单号为退款幂等键：同笔支付同键
+// 重试必得同号，渠道侧幂等兜底崩溃重试窗口的双退款。"mrn_" + sha256 hex
+// 前 40 位 = 44 字符，低于渠道 64 字符单号上限。
+// 评审轮3 Critical-1：派生输入必须含 paymentID——refunds 表有全局
+// UNIQUE(channel, external_refund_id)，而 (user,key) 幂等闸按用户隔离，
+// 只按 key 派生会让跨用户撞键的两笔退款共享商户单号：第二笔渠道已退款
+// 但 INSERT 撞唯一键丢账，webhook 还会错配到第一笔的行。
+func deriveMerchantRefundNo(paymentID, idempotencyKey string) string {
+	sum := sha256.Sum256([]byte("yunhou-refund:" + paymentID + ":" + idempotencyKey))
+	return "mrn_" + hex.EncodeToString(sum[:])[:40]
+}
+
 // RefundAPI is the channel-side refund call. The service is the caller;
 // the channel client is injected so production swaps in real HTTP and
 // tests swap in a stub.
 type RefundAPI interface {
-	// Refund issues a refund on the channel and returns the channel's
-	// refund ID (Stripe `re.id`, WeChat refund_id, Alipay trade_no for
-	// the refund). idempotencyKey is forwarded to the channel (Stripe
-	// supports this header; others ignore).
-	Refund(ctx context.Context, channel, externalTxnID string, amount float64, idempotencyKey string) (externalRefundID string, err error)
+	// Refund issues a refund on the channel. merchantRefundNo 是商户退款
+	// 单号（微信 out_refund_no / 支付宝 out_biz_no / Stripe metadata），由
+	// 调用方生成并持久化为 refunds.external_refund_id —— 渠道退款
+	// webhook 以同一商户单号对账（评审批次7 Important-2：两侧键必须一
+	// 致，否则 webhook 的 ON CONFLICT 重读永远 miss，API 行卡 pending）。
+	// 返回渠道回显的商户退款单号（仅供调用方日志核对；评审轮2 M1 起调用
+	// 方一律以已发送单号为对账键入库，回显不再覆盖）。渠道不回显时返回
+	// 空串。idempotencyKey is forwarded to the channel (Stripe supports
+	// this header; others ignore).
+	Refund(ctx context.Context, channel, externalTxnID, merchantRefundNo string, amount float64, idempotencyKey string) (echoedMerchantRefundNo string, err error)
 }
 
 func NewPaymentService(
@@ -1505,16 +1546,34 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 
 	// Call the channel refund API. Failure aborts before INSERT — we did
 	// not create the refund row, so no orphan.
-	externalRefundID, err := s.refundAPI.Refund(ctx, payment.Channel, payment.ExternalTxnID, in.Amount, in.IdempotencyKey)
+	// 商户退款单号由我方生成并传给渠道（评审批次7 Important-2）：渠道退款
+	// webhook 以同一商户单号派生 external_refund_id（微信 out_refund_no /
+	// 支付宝 out_biz_no），两侧键一致，webhook 的 ON CONFLICT 重读才能命
+	// 中本行（翻 paid），而不是为同一笔钱插入第二条退款行。单号从
+	// paymentID+Idempotency-Key 确定性派生（评审轮2 N2 / 轮3 C-1）：渠道
+	// 退款成功但 refunds 行 INSERT 前崩溃/回滚时，客户端持同一幂等键重试
+	// 必得同一单号，渠道以商户单号为幂等键拒绝第二笔退款（随机单号则会
+	// 被渠道当成新退款执行）；混入 paymentID 避免跨支付撞 refunds 全局唯
+	// 一键。
+	merchantRefundNo := deriveMerchantRefundNo(payment.ID, in.IdempotencyKey)
+	echoed, err := s.refundAPI.Refund(ctx, payment.Channel, payment.ExternalTxnID, merchantRefundNo, in.Amount, in.IdempotencyKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRefundChannelFailed, err)
+	}
+	// 评审轮2 M1：对账键一律用已发送的商户单号入库，不采纳渠道回显覆盖
+	// ——真实客户端返回非空不同值会让 refunds 行与渠道侧静默错键，webhook
+	// 的 ON CONFLICT 重读永远 miss。回显不一致仅记 WARN 供排查。
+	if echoed != "" && echoed != merchantRefundNo {
+		log.Printf("WARN refund: channel echoed merchant refund no %q differs from sent %q (payment=%s) — keeping the sent value as the reconciliation key",
+			echoed, merchantRefundNo, payment.ID)
 	}
 
 	// INSERT pending refund. If another concurrent transaction beat us to
 	// the same (channel, external_refund_id), the unique constraint fires;
-	// since we just got externalRefundID from the channel API, that shouldn't
-	// happen in practice (the channel wouldn't return the same id twice).
-	extID := externalRefundID
+	// since we just got the merchant refund no from the channel API, that
+	// shouldn't happen in practice (the channel wouldn't accept the same
+	// merchant refund no twice).
+	extID := merchantRefundNo
 	refund := &model.Refund{
 		ID:               GenerateUUID(),
 		PaymentID:        payment.ID,
@@ -1586,7 +1645,7 @@ type WebhookEvent struct {
 type OnWebhookResult struct {
 	DuplicateEvent bool   // true if event_id was already seen (handler should ack 200)
 	DomainAction   string // set only when an action ran. Values:
-	//   "payment_paid" / "payment_failed" / "refund_paid"
+	//   "payment_paid" / "payment_failed" / "refund_paid" / "refund_failed"
 	//   / "payment_disputed" / "payment_dispute_closed" / "none"
 	// Empty string ("") means no action ran — either a dedupe hit
 	// (DuplicateEvent=true) or an uninteresting event type. Consumers
@@ -1655,6 +1714,11 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 	case isRefundEvent(e.EventType):
 		domainAction = "refund_paid"
 		if err := s.onRefundSucceeded(ctx, e); err != nil {
+			return nil, err
+		}
+	case isRefundFailedEvent(e.EventType):
+		domainAction = "refund_failed"
+		if err := s.onRefundFailed(ctx, e); err != nil {
 			return nil, err
 		}
 	case isDisputeCreated(e.EventType):
@@ -2160,6 +2224,29 @@ func (s *PaymentService) onPaymentFailed(ctx context.Context, e WebhookEvent) er
 				return err
 			}
 		}
+		// 评审批次7 Important-3：wallet-topup 支付在 paid 之后收到
+		// payment_failed —— 支付行翻 failed 但已入账现金仍可花。同事务入
+		// 队钱包冲正（现金借记原路收回，已消费则如实转负），与权益吊销同
+		// 一级联。
+		if failProduct == model.ProductWalletTopup {
+			// 评审轮2 N3：冲正额 = 订单全额 − 该支付已 paid 退款合计。充值
+			// 50 → 部分退款 20（钱包已借记 20）→ payment_failed 乱序到达，
+			// 再按 50 冲正等于向用户追 70。只计 paid 行：pending 退款尚未触
+			// 发钱包借记，其 webhook 到达时会被 payment_not_paid 守卫拦下。
+			// 已全额退款（差额 ≤ 0）则跳过冲正——全额退款的支付通常已是
+			// refunded 终态走不到这里，此分支作纵深防御；dedup 守卫仍钉
+			// payment id，语义不变。
+			var refundedSum float64
+			if err := tx.GetContext(ctx, &refundedSum,
+				`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status = 'paid'`, payment.ID); err != nil {
+				return fmt.Errorf("sum paid refunds for failed-payment debit: %w", err)
+			}
+			if debit := order.Amount - refundedSum; toCents(debit) > 0 {
+				if err := s.enqueueWalletFailedDebit(ctx, tx, &order, payment.ID, debit); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	return tx.Commit()
@@ -2244,19 +2331,24 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	// = 累计值 − 该支付已记录退款总额。重复投递同一累计值（或同一通知重
 	// 投）→ 增量为 0 → 幂等收敛不双退；部分退款序列（refund_fee 递增）
 	// 逐笔只认增量。全额判定仍按累计值（e.RefundAmount ≥ payment.Amount）。
-	// 其他渠道按单笔事件金额（既有语义）。增量 ≤ 0 时不落新行、不重复
-	// 钱包扣减（全额/权益状态在首次记录增量时已收敛）。
+	// 其他渠道按单笔事件金额（既有语义）。
+	// 评审批次7 Critical-1：增量 ≤ 0 只抑制「退款行 INSERT」这一项记账
+	// 效应——全额/部分级联（payment/order 翻转、订阅取消、权益吊销入
+	// 队，全部幂等）必须永远执行。此前增量 ≤ 0 直接 tx.Commit() 早退：
+	// POST /refunds 的 API 行已计入 prior（金额被它承载），webhook 算出
+	// delta=0 便跳过整个级联——用户拿了全额现金退款还保留订阅权益。
+	// failed 行不计入 prior：那是渠道的终态否认，钱没有动（与 Refund()
+	// 合计不变量同一口径）。
 	eventRefundAmount := e.RefundAmount
+	deltaSkip := false
 	if e.Channel == "alipay" {
 		var prior float64
 		if err := tx.GetContext(ctx, &prior,
-			`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1`, payment.ID); err != nil {
+			`SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status IN ('paid', 'pending')`, payment.ID); err != nil {
 			return fmt.Errorf("sum prior refunds: %w", err)
 		}
 		eventRefundAmount = e.RefundAmount - prior
-		if eventRefundAmount <= 0 {
-			return tx.Commit()
-		}
+		deltaSkip = eventRefundAmount <= 0
 	}
 
 	// Find or insert the refund row keyed on (channel, external_refund_id).
@@ -2265,36 +2357,63 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	// wasn't initiated via POST /refunds. The follow-up UPDATE flips
 	// pending → paid atomically; re-runs of the same webhook are no-ops
 	// because the second pass sees `paid` and skips.
-	// ON CONFLICT DO NOTHING absorbs webhook retries; re-read for the
-	// (channel, external_refund_id) → id mapping.
-	extID := e.ExternalRefundID
+	// ON CONFLICT DO NOTHING absorbs webhook retries and——键统一为商户退
+	// 款单号后（评审批次7 Important-2）——命中 POST /refunds 的 API 行；
+	// re-read for the (channel, external_refund_id) → id mapping.
+	extID := normalizeExternalRefundID(e.Channel, e.ExternalRefundID)
 	var refundID string
-	err = tx.QueryRowxContext(ctx, `
-		INSERT INTO refunds (payment_id, channel, user_id, amount, idempotency_key, external_refund_id, status)
-		VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-		ON CONFLICT (channel, external_refund_id) DO NOTHING
-		RETURNING id
-	`, payment.ID, e.Channel, order.UserID, eventRefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
-	switch {
-	case err == nil:
-		// inserted (new pending row — will be flipped below)
-	case errors.Is(err, sql.ErrNoRows):
-		// already inserted by a prior webhook delivery — look it up
-		if lerr := tx.GetContext(ctx, &refundID, `
-			SELECT id FROM refunds WHERE channel = $1 AND external_refund_id = $2
-		`, e.Channel, e.ExternalRefundID); lerr != nil {
-			return fmt.Errorf("re-read refund: %w", lerr)
+	rowAmount := eventRefundAmount
+	if deltaSkip {
+		// 增量 ≤ 0：不落新行，金额效应由既有退款行承载。找该事件对应的
+		// 既有行（POST /refunds 的 API 行，或本累计值首次投递时落的行）
+		// 作为级联/钱包退款的锚点；找不到（换 notify_id 的重投）则级联
+		// 仍以支付行幂等收敛，钱包退款不再重复入队。
+		var row struct {
+			ID     string  `db:"id"`
+			Amount float64 `db:"amount"`
 		}
-	default:
-		return fmt.Errorf("insert refund: %w", err)
+		if err := tx.GetContext(ctx, &row, `
+			SELECT id, amount FROM refunds WHERE channel = $1 AND external_refund_id = $2
+		`, e.Channel, extID); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("lookup recorded refund: %w", err)
+			}
+		} else {
+			refundID = row.ID
+			rowAmount = row.Amount
+		}
+	} else {
+		err = tx.QueryRowxContext(ctx, `
+			INSERT INTO refunds (payment_id, channel, user_id, amount, idempotency_key, external_refund_id, status)
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+			ON CONFLICT (channel, external_refund_id) DO NOTHING
+			RETURNING id
+		`, payment.ID, e.Channel, order.UserID, eventRefundAmount, "webhook:"+e.EventID, extID).Scan(&refundID)
+		switch {
+		case err == nil:
+			// inserted (new pending row — will be flipped below)
+		case errors.Is(err, sql.ErrNoRows):
+			// already inserted (POST /refunds 的 API 行或 webhook 重投) — look it up
+			if lerr := tx.GetContext(ctx, &refundID, `
+				SELECT id FROM refunds WHERE channel = $1 AND external_refund_id = $2
+			`, e.Channel, extID); lerr != nil {
+				return fmt.Errorf("re-read refund: %w", lerr)
+			}
+		default:
+			return fmt.Errorf("insert refund: %w", err)
+		}
 	}
 
-	// Mark the refund paid (idempotent — if already paid, no-op).
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE refunds SET status = 'paid', updated_at = now()
-		WHERE id = $1 AND status = 'pending'
-	`, refundID); err != nil {
-		return fmt.Errorf("mark refund paid: %w", err)
+	// Mark the refund paid (idempotent — if already paid, no-op). webhook
+	// 即渠道确认：POST /refunds 落的 pending API 行也在此翻 paid，不再
+	// 永远卡住合计不变量。空 refundID（无归属行的重投）没有行可翻，跳过。
+	if refundID != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE refunds SET status = 'paid', updated_at = now()
+			WHERE id = $1 AND status = 'pending'
+		`, refundID); err != nil {
+			return fmt.Errorf("mark refund paid: %w", err)
+		}
 	}
 
 	// 订单产品归属（订单快照优先，029 口径）；钱包充值订单的退款走钱包
@@ -2347,9 +2466,15 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 			// 同事务 outbox（Task 10）：全额退款把权益翻转为 revoked —— 阻止
 			// 后续不再具备权益的调用；已消费账本与配额窗口一行不动（账本
 			// 追加+冲正，设计 §7.3）。dedup 键钉在 refund 行上：渠道重投与
-			// 重复退款事件只入队一次，worker 收敛本身也是幂等的。
+			// 重复退款事件只入队一次，worker 收敛本身也是幂等的。无归属行
+			// 的重投（refundID 为空）用 nil dedup——多笔支付不得共享一个
+			// 空键互相吃掉吊销（同 CancelSync 裁决：收敛幂等兜底）。
 			if orderTouchesBenefits(&order, refundProduct) {
-				dedup := access.RefundSyncDedupKey(refundID)
+				var dedup *string
+				if refundID != "" {
+					d := access.RefundSyncDedupKey(refundID)
+					dedup = &d
+				}
 				if err := s.enqueueBenefitSync(ctx, tx, access.EntitlementSyncMessage{
 					UserID:      order.UserID,
 					ProductCode: refundProduct,
@@ -2357,7 +2482,7 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 					OrderID:     order.ID,
 					PaymentID:   payment.ID,
 					RefundID:    refundID,
-				}, &dedup); err != nil {
+				}, dedup); err != nil {
 					return err
 				}
 			}
@@ -2371,8 +2496,13 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	// refunded 的支付再到达的*另一笔*退款事件（不同 external_refund_id）
 	// 若不入守卫会再次扣减钱包现金。退款行本身照常记录（支付域事实），
 	// 但钱包侧不再跟随。
+	// 金额口径（评审批次7 Critical-1）：增量事件用增量；deltaSkip（金额
+	// 由 POST /refunds 的 API 行承载）用行金额——否则 API 发起的全额退
+	// 款算出 delta=0，钱包退款永远不入队。无归属行的重投跳过（首次投递
+	// 已按行入队）。
 	if refundProduct == model.ProductWalletTopup {
-		if payment.Status != "paid" {
+		switch {
+		case payment.Status != "paid":
 			if err := writeAuditOnTx(ctx, tx, "service", "wallet_refund_skipped_payment_not_paid",
 				fmt.Sprintf("payment:%s", payment.ID),
 				[]string{"refund", "wallet_topup", "guard"},
@@ -2380,8 +2510,12 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 					"refund_id": refundID, "channel": e.Channel}); err != nil {
 				return fmt.Errorf("write audit: %w", err)
 			}
-		} else if err := s.enqueueWalletRefund(ctx, tx, &order, payment.ID, refundID, eventRefundAmount); err != nil {
-			return err
+		case refundID == "":
+			// 无归属退款行的重投：金额效应已随首次投递入队，不重复扣减。
+		default:
+			if err := s.enqueueWalletRefund(ctx, tx, &order, payment.ID, refundID, rowAmount); err != nil {
+				return err
+			}
 		}
 	}
 	// Partial refund: no domain action beyond marking the refund paid.
@@ -2390,6 +2524,101 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	// 是本笔增量（评审轮4 B），全额判定用的累计值在 e.RefundAmount。
 
 	return tx.Commit()
+}
+
+// onRefundFailed: 微信 REFUND.ABNORMAL / REFUND.CLOSED（渠道终态退款失
+// 败，评审批次7 Important-2）。匹配的 pending 退款行翻 failed —— failed
+// 是终态否认：不计入 Refund() 合计不变量的预留，也不计入 Alipay 累计口
+// 径的 prior，用户可重试同一逻辑退款。支付/订单/订阅一行不动：钱没退出
+// 去，paid 状态与权益保持。
+func (s *PaymentService) onRefundFailed(ctx context.Context, e WebhookEvent) error {
+	tx, err := s.dbBeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var payment model.Payment
+	if err := tx.GetContext(ctx, &payment, `
+		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE
+	`, e.Channel, e.TransactionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// 乱序：支付成功事件尚未处理。与退款成功同一哲学（评审轮1
+			// C2）——审计照留但返错让渠道重投，ack 200 会把失败事实永久
+			// 丢掉（退款行卡 pending，堵住合计不变量）。
+			if aerr := s.writeAudit(ctx, "service", "webhook_refund_failed_unknown_payment",
+				fmt.Sprintf("event:%s", e.EventID),
+				[]string{"webhook", "unknown_payment", "refund_failed"},
+				map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID, "event_id": e.EventID},
+			); aerr != nil {
+				return fmt.Errorf("write audit: %w", aerr)
+			}
+			return fmt.Errorf("refund-failure for unknown payment (channel=%s txn=%s): payment success event not processed yet — returning an error so the channel retries", e.Channel, e.TransactionID)
+		}
+		return fmt.Errorf("find payment: %w", err)
+	}
+
+	extID := normalizeExternalRefundID(e.Channel, e.ExternalRefundID)
+	if extID == "" {
+		// 事件未携商户退款单号（解析层未覆盖该事件类型）：无法键控匹配，
+		// 审计后 ack —— 返错重投也永远匹配不上，只会空转重投窗口。
+		return s.writeAudit(ctx, "service", "webhook_refund_failed_missing_refund_no",
+			fmt.Sprintf("event:%s", e.EventID),
+			[]string{"webhook", "refund_failed", "missing_key"},
+			map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID, "event_id": e.EventID},
+		)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE refunds SET status = 'failed', updated_at = now()
+		WHERE channel = $1 AND external_refund_id = $2 AND payment_id = $3 AND status = 'pending'
+	`, e.Channel, extID, payment.ID)
+	if err != nil {
+		return fmt.Errorf("mark refund failed: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// 无匹配 pending 行。区分两种情形：行存在但已是终态（paid——成
+		// 功/失败事件乱序，以先到的终态为准）→ 幂等收敛；行不存在（事
+		// 件先于 API 行的 commit 到达）→ 返错让渠道重投。
+		var status string
+		lerr := tx.GetContext(ctx, &status, `
+			SELECT status FROM refunds WHERE channel = $1 AND external_refund_id = $2 AND payment_id = $3
+		`, e.Channel, extID, payment.ID)
+		switch {
+		case lerr == nil:
+			// 已是终态：幂等 no-op。
+		case errors.Is(lerr, sql.ErrNoRows):
+			return fmt.Errorf("refund-failure matched no refund row (channel=%s txn=%s refund=%s): API row not committed yet — returning an error so the channel retries", e.Channel, e.TransactionID, extID)
+		default:
+			return fmt.Errorf("lookup refund for failure: %w", lerr)
+		}
+	} else if err := writeAuditOnTx(ctx, tx, "service", "refund_marked_failed",
+		fmt.Sprintf("payment:%s", payment.ID),
+		[]string{"refund", "failed", "webhook"},
+		map[string]any{"payment_id": payment.ID, "external_refund_id": extID, "channel": e.Channel},
+	); err != nil {
+		return fmt.Errorf("write audit: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// normalizeExternalRefundID 把 webhook 解析层为兜底唯一性加的渠道前缀
+// （"wechat-"/"alipay-"/"paypal-"，见 handler/webhook.go）剥掉，统一以裸
+// 商户退款单号作为 refunds.(channel, external_refund_id) 的键（评审批次
+// 7 Important-2）：POST /refunds 的 API 行存的就是裸商户单号，两侧键一
+// 致，webhook 的 ON CONFLICT 重读才能命中 API 行，不为同一笔钱插入第二
+// 条退款行。解析层若已改为不加前缀，TrimPrefix 是 no-op。
+func normalizeExternalRefundID(channel, extID string) string {
+	prefix := map[string]string{
+		"wechat_pay": "wechat-",
+		"alipay":     "alipay-",
+		"paypal":     "paypal-",
+	}[channel]
+	if prefix != "" {
+		return strings.TrimPrefix(extID, prefix)
+	}
+	return extID
 }
 
 func (s *PaymentService) onDisputeCreated(ctx context.Context, e WebhookEvent) error {
@@ -3084,6 +3313,18 @@ func isRefundEvent(eventType string) bool {
 	return false
 }
 
+// isRefundFailedEvent — 退款终态失败事件（评审批次7 Important-2）。微信
+// v3 REFUND.ABNORMAL（退款异常）/ REFUND.CLOSED（退款关闭）：此前不在任
+// 何分发分支里，落进 audit-only 默认分支，失败退款永远卡 pending。路由
+// 到 onRefundFailed 翻 failed。
+func isRefundFailedEvent(eventType string) bool {
+	switch eventType {
+	case "REFUND.ABNORMAL", "REFUND.CLOSED":
+		return true
+	}
+	return false
+}
+
 func isDisputeCreated(eventType string) bool {
 	return eventType == "charge.dispute.created"
 }
@@ -3413,6 +3654,12 @@ func ptrInt(n int) *int { return &n }
 func toCents(v float64) int64 {
 	if v != v { // NaN
 		return 0
+	}
+	// 先比 float 界再做窄化转换：float64→int64 的溢出转换结果是实现定
+	// 义（amd64 得 MinInt64、arm64 得 MaxInt64），单靠转换后的 c<0 守
+	// 不住 arm64。阈值 = math.MaxInt64/100 的 float64 近似。
+	if v >= 9.223372036854776e16 {
+		return 1<<62 - 1 // overflow clamp
 	}
 	c := int64(v * 100)
 	if v > 0 && c < 0 {

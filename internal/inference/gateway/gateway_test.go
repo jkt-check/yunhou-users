@@ -1385,3 +1385,134 @@ func errorsAsQuota(err error, target **domain.QuotaExceededError) bool {
 	}
 	return false
 }
+
+// 评审修复(Critical-1): ExecutedUnknown(超时/连接重置/200-body 解析失败)
+// 绝不盲目重放 —— 候选 1 超时后不得向候选 2 发起第二次 dispatch(上游会被
+// 双倍消耗,且 attempt1 的 status=unknown 永远进不了 reconciliation,
+// silent loss),请求必须带预占停放核对。只对确定零执行的失败做 failover。
+func TestExecutedUnknown_NoBlindReplay(t *testing.T) {
+	// 候选 1:慢上游,超过部署超时 → transport timeout → ExecutedUnknown。
+	up1 := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		select {
+		case <-time.After(10 * time.Second):
+		case <-r.Context().Done():
+		}
+	})
+	// 候选 2:健康上游 —— 修复前会被重放,修复后必须零调用。
+	up2 := newUpstream(t, sseHandler(chunkA, chunkB, chunkUsage, chunkDone))
+	f := newFixture(t, up1)
+	// 收紧候选 1 的部署超时。
+	dep := f.snap.Deployments[f.deploymentID]
+	dep.RequestTimeout = 300 * time.Millisecond
+	f.snap.Deployments[f.deploymentID] = dep
+
+	// 第二个 provider/deployment/account/route(同模型,priority 更高 = 后试),
+	// 结构同 TestFailoverOn429。
+	ctx := context.Background()
+	prov2 := &domain.Provider{Code: "moonshot", DisplayName: "Moonshot", AccessType: domain.AccessOfficialAPI, Status: "active"}
+	if err := f.store.InsertProvider(ctx, prov2); err != nil {
+		t.Fatal(err)
+	}
+	vault, _ := credentials.NewVault(map[int][]byte{1: []byte("0123456789abcdef0123456789abcdef")}, 1)
+	credSvc := credentials.NewService(vault, f.store, f.store)
+	cv2, err := credSvc.Create(ctx, credentials.Operator{UserID: uuid.NewString(), AppID: "test"}, prov2.ID, "main", "api_key", "sk-2", "seed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct2 := &domain.UpstreamAccount{ProviderID: prov2.ID, CredentialID: cv2.ID, Status: domain.AccountActive, ConcurrencyLimit: 4}
+	if err := f.store.InsertUpstreamAccount(ctx, acct2); err != nil {
+		t.Fatal(err)
+	}
+	dep2 := &domain.Deployment{
+		ProviderID: prov2.ID, UpstreamModel: "kimi-k2", BaseURL: up2.URL,
+		Protocol:       domain.ProtocolOpenAIChat,
+		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second, Status: domain.DeploymentActive,
+	}
+	if err := f.store.InsertDeployment(ctx, dep2); err != nil {
+		t.Fatal(err)
+	}
+	route2 := &domain.ModelRoute{ModelID: f.modelID, DeploymentID: dep2.ID, Priority: 2, Weight: 1, Enabled: true}
+	if err := f.store.InsertRoute(ctx, route2); err != nil {
+		t.Fatal(err)
+	}
+	// 既有 route priority 默认 0 → 先打 up1(超时)。
+	f.snap.Providers[prov2.ID] = *prov2
+	f.snap.Deployments[dep2.ID] = *dep2
+	f.snap.RoutesByModel[f.modelID] = append(f.snap.RoutesByModel[f.modelID], *route2)
+
+	p, key := f.principal()
+	_, err = f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if domain.CodeOf(err) != domain.CodeUpstreamUnavailable {
+		t.Fatalf("err = %v, want upstream_unavailable (parked for reconciliation)", err)
+	}
+	if up1.calls.Load() != 1 {
+		t.Errorf("up1 calls = %d, want 1", up1.calls.Load())
+	}
+	if up2.calls.Load() != 0 {
+		t.Errorf("up2 calls = %d, want 0 — ExecutedUnknown 绝不盲目重放到下一候选(双倍消耗)", up2.calls.Load())
+	}
+	requestID := mustRequestID(t, f.db)
+	status, _, reserved, _ := f.requestRow(t, requestID)
+	if status != "reconciliation_required" || reserved <= 0 {
+		t.Errorf("status=%s reserved=%d, want reconciliation_required with the hold retained", status, reserved)
+	}
+	attempts := f.attemptRows(t, requestID)
+	if len(attempts) != 1 || attempts[0].Status != "unknown" || attempts[0].Kind != "transport" {
+		t.Errorf("attempts = %+v, want a single unknown/transport attempt (unknown 必须入核对而非被重放吞掉)", attempts)
+	}
+	var jobs int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM inference_reconciliation_jobs WHERE status = 'pending'`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs < 1 {
+		t.Errorf("reconciliation jobs = %d, want >= 1 (unknown_usage 停放)", jobs)
+	}
+}
+
+// nilStreamAdapter 模拟适配器缺陷:WrapStream 返回 nil —— Dispatch 成功但
+// onStreamDispatch 组装 StreamBody 时 disp.Stream.Tap 解引用 panic
+// (keeper 创建到交接之间的 panic 场景)。
+type nilStreamAdapter struct{ providers.Adapter }
+
+func (a nilStreamAdapter) WrapStream(body io.ReadCloser) *providers.Stream { return nil }
+
+// 评审修复(Important-2): keeper 创建到交接之间 panic 不得泄漏续租
+// goroutine 与并发槽 —— 未交接守卫必须停掉 keeper 并释放双租约(计费账户 +
+// 上游账号),否则恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
+func TestStreamAssemblyPanic_ReleasesLeases(t *testing.T) {
+	up := newUpstream(t, sseHandler(chunkA, chunkB, chunkUsage, chunkDone))
+	f := newFixture(t, up)
+	conc := 1
+	if _, err := f.db.Exec(`UPDATE inference_policy_versions SET concurrency_limit = $1 WHERE id = $2`, conc, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	adapters := map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat:       nilStreamAdapter{providers.NewOpenAIChat()},
+		domain.ProtocolAnthropicMessage: providers.NewAnthropicMessages(),
+	}
+	routingSvc := routing.NewService(f.store, adapters, nil)
+	gw := NewService(&staticSnapshot{f.snap}, f.store, f.gateway.entitlements, f.gateway.quotaSvc,
+		routingSvc, f.gateway.secrets, f.gateway.client, f.gateway.egress, nil)
+
+	p, key := f.principal()
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		_, _ = gw.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(true, "hi"))
+	}()
+	if !panicked {
+		t.Fatal("nil Stream must panic during StreamBody assembly (pre-handoff)")
+	}
+	// 守卫必须释放两个并发槽,不得有任何租约滞留 held。
+	var held int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state = 'held'`).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != 0 {
+		t.Errorf("held leases = %d, want 0 — 交接前 panic 必须停 keeper 释放租约(预占/并发槽不得冻结)", held)
+	}
+}

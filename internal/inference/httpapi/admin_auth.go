@@ -50,6 +50,16 @@ type OperatorAdminStore interface {
 	ListOperators(ctx context.Context) ([]management.OperatorGrant, error)
 }
 
+// OperatorAdminTxStore 是支持事务化授权变更的 operator store（评审轮1
+// I-2：权限变更与审计行同事务提交或回滚，绝不落下无审计的权限变更——与
+// 钱包面 RecordTx 先例同口径）。由 inference/postgres.Store 满足。
+type OperatorAdminTxStore interface {
+	OperatorAdminStore
+	Begin(ctx context.Context) (domain.UnitOfWork, error)
+	GrantRoleTx(ctx context.Context, w domain.UnitOfWork, userID, role string, grantedBy *string, reason string) (bool, error)
+	RevokeRoleTx(ctx context.Context, w domain.UnitOfWork, userID, role string) (bool, error)
+}
+
 // loadOperator resolves the verified dual identity from the gin context
 // (set by JWTAuth + InternalAppAuth before this middleware runs). Fail
 // closed on every missing or mismatched leg: the user identity, the service
@@ -167,7 +177,8 @@ func OperatorOf(c *gin.Context) credentials.Operator {
 
 // strictBindJSON decodes the body rejecting unknown fields, so a client
 // smuggling actor/role fields gets an explicit 400 instead of a silent
-// ignore (设计 §9.2: 不接受请求体伪造 actor/role).
+// ignore (设计 §9.2: 不接受请求体伪造 actor/role). 单值后必须是 EOF
+// （评审轮1 m4：{"user_id":"x"...} garbage 这类尾部脏数据同样拒绝）。
 func strictBindJSON(c *gin.Context, dst any) error {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -177,6 +188,10 @@ func strictBindJSON(c *gin.Context, dst any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("unexpected trailing data after the JSON value")
 	}
 	return nil
 }
@@ -208,7 +223,24 @@ type grantRoleRequest struct {
 	Reason string `json:"reason" binding:"required"`
 }
 
+// grantAuditSupport resolves the transactional store + audit recorder the
+// mutation handlers need. 缺任一时 fail-closed（评审轮1 I-2，对齐
+// bulk_import.go 先例：审计与权限变更不能同生共死就拒绝变更，绝不落下
+// 无审计的授权/撤销）。
+func (h *AdminAuthHandler) grantAuditSupport() (OperatorAdminTxStore, management.AuditTxRecorder, error) {
+	txStore, ok := h.store.(OperatorAdminTxStore)
+	if !ok {
+		return nil, nil, domain.NewError(domain.CodeInternal, "operator store lacks transactional support")
+	}
+	txAudit, ok := h.audit.(management.AuditTxRecorder)
+	if !ok {
+		return nil, nil, domain.NewError(domain.CodeInternal, "audit recorder lacks transactional support")
+	}
+	return txStore, txAudit, nil
+}
+
 // GrantRole POST /operators — idempotent (re-grant reports granted=false).
+// 授权与审计同事务提交（评审轮1 I-2）。
 func (h *AdminAuthHandler) GrantRole(c *gin.Context) {
 	var req grantRoleRequest
 	if err := strictBindJSON(c, &req); err != nil {
@@ -219,42 +251,77 @@ func (h *AdminAuthHandler) GrantRole(c *gin.Context) {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "role must be admin, operator or auditor"))
 		return
 	}
-	op := OperatorOf(c)
-	granted, err := h.store.GrantRole(c.Request.Context(), req.UserID, req.Role, strPtrOrNil(op.UserID), req.Reason)
+	txStore, txAudit, err := h.grantAuditSupport()
 	if err != nil {
 		fail(c, err)
 		return
 	}
-	if err := h.audit.Record(c.Request.Context(), management.AuditEvent{
+	op := OperatorOf(c)
+	ctx := c.Request.Context()
+	uow, err := txStore.Begin(ctx)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	granted, err := txStore.GrantRoleTx(ctx, uow, req.UserID, req.Role, strPtrOrNil(op.UserID), req.Reason)
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		fail(c, err)
+		return
+	}
+	if err := txAudit.RecordTx(ctx, uow, management.AuditEvent{
 		Action: "permission.grant", ObjectType: "permission", ObjectID: req.UserID + ":" + req.Role,
 		Reason: req.Reason, ActorUser: op.UserID, ActorApp: op.AppID,
 		Detail: management.SanitizeDetail(map[string]any{"role": req.Role, "granted": granted}),
 	}); err != nil {
+		_ = uow.Rollback(ctx)
 		fail(c, domain.WrapError(domain.CodeInternal, "audit write failed", err))
+		return
+	}
+	if err := uow.Commit(ctx); err != nil {
+		fail(c, err)
 		return
 	}
 	ok(c, gin.H{"granted": granted, "user_id": req.UserID, "role": req.Role})
 }
 
 // RevokeRole DELETE /operators/:user_id/roles/:role — idempotent.
+// 撤销与审计同事务提交（评审轮1 I-2）。
 func (h *AdminAuthHandler) RevokeRole(c *gin.Context) {
 	userID, role := c.Param("user_id"), c.Param("role")
 	if !management.ValidRole(role) {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "role must be admin, operator or auditor"))
 		return
 	}
-	op := OperatorOf(c)
-	revoked, err := h.store.RevokeRole(c.Request.Context(), userID, role)
+	txStore, txAudit, err := h.grantAuditSupport()
 	if err != nil {
 		fail(c, err)
 		return
 	}
-	if err := h.audit.Record(c.Request.Context(), management.AuditEvent{
+	op := OperatorOf(c)
+	ctx := c.Request.Context()
+	uow, err := txStore.Begin(ctx)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	revoked, err := txStore.RevokeRoleTx(ctx, uow, userID, role)
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		fail(c, err)
+		return
+	}
+	if err := txAudit.RecordTx(ctx, uow, management.AuditEvent{
 		Action: "permission.revoke", ObjectType: "permission", ObjectID: userID + ":" + role,
 		Reason: "admin revoke", ActorUser: op.UserID, ActorApp: op.AppID,
 		Detail: management.SanitizeDetail(map[string]any{"role": role, "revoked": revoked}),
 	}); err != nil {
+		_ = uow.Rollback(ctx)
 		fail(c, domain.WrapError(domain.CodeInternal, "audit write failed", err))
+		return
+	}
+	if err := uow.Commit(ctx); err != nil {
+		fail(c, err)
 		return
 	}
 	ok(c, gin.H{"revoked": revoked, "user_id": userID, "role": role})

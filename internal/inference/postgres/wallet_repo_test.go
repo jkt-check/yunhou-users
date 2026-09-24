@@ -1091,3 +1091,38 @@ func TestWalletSettle_RecoveryConservative(t *testing.T) {
 		t.Fatalf("ledger charge = %s/%d, want CNY/5000000", currency, amount)
 	}
 }
+
+// TestWalletAdjustment_SourcePersisted（评审轮2 C-I1）：source 落库到
+// inference_adjustments（migration 036），按幂等键重读原样返回——重放
+// 载荷比对的 source 来自存储行而非调用方口述。
+func TestWalletAdjustment_SourcePersisted(t *testing.T) {
+	_, s := testDB(t)
+	f := seedFixture(t, s, false)
+	ctx := context.Background()
+
+	for _, src := range []accounting.WalletSource{accounting.WalletCash, accounting.WalletBonus} {
+		key := "adj-src-" + string(src) + "-" + uuid.NewString()
+		uow, err := s.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ApplyWalletAdjustmentTx(ctx, uow, WalletAdjustmentCommand{
+			AccountID: f.accountID, Currency: "CNY",
+			Source: src, Direction: accounting.DirCredit,
+			AmountMicros: 1_000_000, Reason: "source round-trip",
+			OperatorSubject: "user:ops@app:test", IdempotencyKey: key,
+		}); err != nil {
+			t.Fatalf("adjustment(%s): %v", src, err)
+		}
+		if err := uow.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		stored, err := s.GetAdjustmentByIdempotencyKey(ctx, key)
+		if err != nil {
+			t.Fatalf("re-read(%s): %v", src, err)
+		}
+		if stored.Source != string(src) {
+			t.Fatalf("stored source = %q, want %q", stored.Source, src)
+		}
+	}
+}

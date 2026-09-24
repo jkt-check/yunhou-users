@@ -337,6 +337,13 @@ type CorrectionCommand struct {
 //
 // A replayed IdempotencyKey hits the UNIQUE key → CodeConflict: the caller
 // treats it as already-applied.
+//
+// 仅支持 charge_source='plan' 的请求。wallet 计费请求显式拒绝
+// （CodeInvalidInput，评审轮1 Important-1）：wallet 路径的 settled_micros
+// 是 micromoney 而非 microcredit，入场也未做 key-budget 预占，且更正需要
+// 钱包补偿分录——在完整实现 wallet 分支前统一拒绝，避免通用调用方静默
+// 腐蚀钱包状态（当前本方法无生产调用方，更正通道本期未接线，见计划
+// Task 9 已知限制）。
 func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd CorrectionCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -362,16 +369,21 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 
 	// 1. Lock + require settled. The delta base is the CURRENT settled
 	// amount, never the immutable original charge.
-	var status, accountID string
+	var status, accountID, chargeSource string
 	var reserved, settled sql.NullInt64
 	var apiKeyID sql.NullString
 	var win5h, winW, winM sql.NullString
 	if err := tx.QueryRowxContext(ctx,
 		`SELECT status, billing_account_id, reserved_micros, settled_micros, api_key_id,
-		        window_five_hour_id, window_weekly_id, window_monthly_id
+		        window_five_hour_id, window_weekly_id, window_monthly_id, charge_source
 		 FROM inference_requests WHERE id = $1 FOR UPDATE`, cmd.RequestID).
-		Scan(&status, &accountID, &reserved, &settled, &apiKeyID, &win5h, &winW, &winM); err != nil {
+		Scan(&status, &accountID, &reserved, &settled, &apiKeyID, &win5h, &winW, &winM, &chargeSource); err != nil {
 		return mapError("correction: lock request", err)
+	}
+	// wallet 计费请求显式拒绝（见方法 doc：单位/预算/补偿分录均未适配）。
+	if chargeSource == string(domain.ChargeSourceWallet) {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: wallet-charged requests are not supported (钱包更正通道本期未接线)")
 	}
 	if domain.RequestStatus(status) != domain.ReqSettled {
 		return domain.NewError(domain.CodeConflict,

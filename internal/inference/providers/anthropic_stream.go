@@ -170,7 +170,13 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 		case "message_stop":
 			stopSeen = true
 			tap.markTerminal()
-			err = writeOpenAIUsageAndDone(w, tap.Result().Buckets)
+			// 评审轮2 M5：上游从未报 usage 时只发 [DONE]——缺失 usage 绝不
+			// 渲染为 {"total_tokens":0}（与下方 !stopSeen 分支同一纪律）。
+			if res := tap.Result(); res.SawUsage {
+				err = writeOpenAIUsageAndDone(w, res.Buckets)
+			} else {
+				_, err = io.WriteString(w, "data: [DONE]\n\n")
+			}
 		case "error":
 			// kaya/OpenAI clients parse the {"error":...} chunk convention
 			// (the same shape the gateway injects on upstream breaks).

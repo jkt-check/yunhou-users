@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/yunhou/users/internal/inference/access"
@@ -72,7 +73,14 @@ func (f *ChatGatewayFacade) RecordUsage(ctx context.Context, userID, appID strin
 func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID string) ([]ChatModelInfo, error) {
 	p, err := f.resolver.ResolveUserSession(ctx, userID)
 	if err != nil {
-		return []ChatModelInfo{}, nil
+		// 评审批次7 Minor-5：仅「无计费账户」哨兵是正常态（picker 显示空
+		// 列表）；其余错误（瞬时 DB 故障等）记录日志并透传——吞掉会把
+		// 故障伪装成「该用户无可用模型」。
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return []ChatModelInfo{}, nil
+		}
+		log.Printf("chat facade: resolve user session for models (user=%s): %v", userID, err)
+		return nil, err
 	}
 	allowed, err := f.resolver.AuthorizedModelIDs(ctx, p, nil)
 	if err != nil {
@@ -110,10 +118,11 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
 	// Kaya JWT → unified principal (kind=kaya_jwt). A user without a model
 	// billing account maps onto the legacy "no access" outcome (403),
-	// never an implicit account creation on a read path.
+	// never an implicit account creation on a read path. 其余错误（瞬时
+	// DB 故障等）走 mapGatewayError 透传为 500 类，不得伪装成 403。
 	p, err := f.resolver.ResolveUserSession(ctx, userID)
 	if err != nil {
-		return nil, ErrChatNoAccess
+		return nil, mapGatewayError(err)
 	}
 	modelID := modelOverride
 	if modelID == "" {
@@ -148,7 +157,7 @@ func mapGatewayError(err error) error {
 		return ErrChatRateLimited // 额度不足 → 429 (设计 §9.1)
 	}
 	switch domain.CodeOf(err) {
-	case domain.CodeModelNotAllowed, domain.CodeInvalidKey, domain.CodeNotFound, domain.CodeUnpricedCapability:
+	case domain.CodeModelNotAllowed, domain.CodeInvalidKey, domain.CodeNotFound:
 		// 无权益/模型未授权/默认模型未上架 → 旧的"无访问权限"语义。
 		return ErrChatNoAccess
 	case domain.CodeQuotaExceeded, domain.CodeRateLimited, domain.CodeInsufficientCapacity:
@@ -156,6 +165,9 @@ func mapGatewayError(err error) error {
 	case domain.CodeInvalidInput:
 		return ErrChatUpstreamRejected
 	default:
+		// CodeUnpricedCapability（运营定价配置错误）等也落这里——那是
+		// 服务端配置缺陷，呈现为 500 类而不是 403「无权限」（评审批次
+		// 7 Minor-4：与真实权益拒绝区分开，运营才能定位）。
 		return ErrChatUpstreamError
 	}
 }

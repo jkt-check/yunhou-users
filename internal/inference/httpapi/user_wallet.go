@@ -138,12 +138,23 @@ func (h *UserWalletHandler) Get(c *gin.Context) {
 		wallets = append(wallets, toWalletJSON(v))
 	}
 	resp["wallets"] = wallets
-	if ent, err := h.store.GetLatestEntitlementBySource(ctx, domain.SourcePAYG,
-		accounting.PAYGEntitlementSourceID(acct.ID)); err == nil && ent.Status == domain.EntitlementActive {
-		resp["payg"] = paygJSON{
-			Enabled: true, EntitlementID: ent.ID,
-			ModelIDs: ent.ModelIDs, PolicyVersionID: ent.PolicyVersionID,
+	ent, err := h.store.GetLatestEntitlementBySource(ctx, domain.SourcePAYG,
+		accounting.PAYGEntitlementSourceID(acct.ID))
+	switch {
+	case err == nil:
+		if ent.Status == domain.EntitlementActive {
+			resp["payg"] = paygJSON{
+				Enabled: true, EntitlementID: ent.ID,
+				ModelIDs: ent.ModelIDs, PolicyVersionID: ent.PolicyVersionID,
+			}
 		}
+	case domain.CodeOf(err) == domain.CodeNotFound:
+		// 无 PAYG 权益 → 合法的 enabled=false 零态。
+	default:
+		// DB 故障不得被吞成 payg.enabled=false（评审轮1 m6）：那会把
+		// 已开通 PAYG 的用户渲染成未开通。
+		fail(c, err)
+		return
 	}
 	ok(c, resp)
 }

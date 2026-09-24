@@ -401,6 +401,14 @@ func main() {
 		log.Printf("LLM_PROVIDERS_JSON import: +%d providers, +%d models, +%d deployments, +%d routes, %d already present (skipped)",
 			res.ProvidersInserted, res.ModelsInserted, res.DeploymentsInserted, res.RoutesInserted, res.Skipped)
 	}
+	// 评审修复（批次8 Minor-3）：/chat 网关开启时 KAYA_CHAT_MODEL 必须在
+	// 目录中真实存在（env 导入之后校验，只读查询）——拼错的 model id 在
+	// 启动即失败，而不是每个 /chat 请求期才报错。
+	if cfg.InferenceKayaChatGateway {
+		if _, err := catalogSvc.GetModel(context.Background(), cfg.KayaChatModel); err != nil {
+			log.Fatalf("KAYA_CHAT_MODEL %q is not in the inference catalog: %v", cfg.KayaChatModel, err)
+		}
+	}
 
 	// Chat access audit log: one JSON line per request (user_id, session_id,
 	// input, output, status, duration). Optional — empty CHAT_LOG_PATH
@@ -681,7 +689,7 @@ func buildWebhookVerifier(cfg *config.Config, wechatSigner *wechat.Signer, wecha
 // 502 instead of silently no-op'ing.
 type noChannelRefundAPI struct{}
 
-func (noChannelRefundAPI) Refund(_ context.Context, _, _ string, _ float64, _ string) (string, error) {
+func (noChannelRefundAPI) Refund(_ context.Context, _, _, _ string, _ float64, _ string) (string, error) {
 	return "", errors.New("channel refund API not wired in v1")
 }
 

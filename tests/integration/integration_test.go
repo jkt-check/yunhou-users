@@ -672,7 +672,10 @@ func testLoginSub(t *testing.T, srv *httptest.Server, email, appID string) map[s
 // at the unit level).
 type stubRefundAPI struct{}
 
-func (stubRefundAPI) Refund(_ context.Context, _, _ string, _ float64, idempotencyKey string) (string, error) {
+func (stubRefundAPI) Refund(_ context.Context, _, _, merchantRefundNo string, _ float64, idempotencyKey string) (string, error) {
+	if merchantRefundNo != "" {
+		return merchantRefundNo, nil
+	}
 	return "re_integration_" + idempotencyKey, nil
 }
 

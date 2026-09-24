@@ -458,6 +458,64 @@ func TestV1ChatCompletions_StreamSSE(t *testing.T) {
 	}
 }
 
+// 评审轮1 I-1：入站 assistant 轮的 reasoning_content 必须透传到上游
+// （DeepSeek 对不回显 reasoning_content 的 tool-call 回合 400 拒绝）。
+func TestV1ChatCompletions_ReasoningContentForwarded(t *testing.T) {
+	f := newV1Fixture(t)
+	w := f.call(t, http.MethodPost, "/v1/chat/completions", f.keyPlain, map[string]any{
+		"model": "glm-4.6",
+		"messages": []map[string]any{
+			{"role": "user", "content": "hi"},
+			{
+				"role": "assistant", "content": "", "reasoning_content": "chain-of-thought…",
+				"tool_calls": []map[string]any{{
+					"id": "call_1", "type": "function",
+					"function": map[string]any{"name": "run", "arguments": "{}"},
+				}},
+			},
+			{"role": "tool", "tool_call_id": "call_1", "content": "tool out"},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", w.Code, w.Body.String())
+	}
+	up := f.lastUpstreamBody(t)
+	if !strings.Contains(up, `"reasoning_content":"chain-of-thought…"`) {
+		t.Errorf("upstream body dropped reasoning_content: %s", up)
+	}
+}
+
+// 评审轮1 m8：上游无 [DONE] 中断时注入的错误帧必须有前导 \n——残帧没有
+// 结束分隔时仍能独立成行被标准 SSE 客户端解析。
+func TestV1ChatCompletions_UpstreamBreakInjectsParseableFrame(t *testing.T) {
+	f := newV1Fixture(t)
+	// 上游写一段无结束分隔的残帧后裸断（无 [DONE]）。
+	f.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if fl, ok := w.(http.Flusher); ok {
+			_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-brk\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}")
+			fl.Flush()
+		}
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+f.keyPlain)
+	w := httptest.NewRecorder()
+	f.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", w.Code, w.Body.String())
+	}
+	// 错误帧独占一行（不以残帧尾巴开头），且不含 [DONE]。
+	body := w.Body.String()
+	if !strings.Contains(body, "\ndata: {\"error\":{\"message\":\"upstream stream interrupted\"") {
+		t.Fatalf("error frame must start on its own line: %q", body)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Fatalf("a broken stream must never render [DONE]: %q", body)
+	}
+}
+
 func TestV1ChatCompletions_ErrorMatrix(t *testing.T) {
 	f := newV1Fixture(t)
 

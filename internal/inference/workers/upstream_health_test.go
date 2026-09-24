@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/providers/connector"
 )
@@ -425,5 +427,81 @@ func TestCredentialRefreshWorkerMisconfigured(t *testing.T) {
 	env.db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, accountID).Scan(&acctStatus)
 	if acctStatus != "active" {
 		t.Fatalf("misconfigured must not touch account state: %s", acctStatus)
+	}
+}
+
+// 评审修复批次8：健康 worker 每轮收割终态租约行（released/expired 且终态
+// 时间早于保留窗口），held 行与窗口内终态行保留。
+func TestUpstreamHealthReapsTerminalLeases(t *testing.T) {
+	env := newRefreshEnv(t)
+	ctx := context.Background()
+
+	// 租约行挂真实请求（FK）：补齐 user → billing_account → policy_version
+	// → entitlement → request 链。
+	userID := uuid.NewString()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	var baID, pvID, entID string
+	if _, err := env.db.Exec(`INSERT INTO users (id, status) VALUES ($1, 'active')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.QueryRow(`INSERT INTO inference_billing_accounts (user_id) VALUES ($1) RETURNING id`, userID).Scan(&baID); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.QueryRow(`INSERT INTO inference_policy_versions (name, revision, model_ids)
+		VALUES ('lease-reaper', 1, ARRAY[$1]) RETURNING id`, env.modelID).Scan(&pvID); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.QueryRow(`INSERT INTO inference_entitlements
+		(billing_account_id, source_type, source_id, model_ids, policy_version_id, anchor_at, effective_from)
+		VALUES ($1, 'grant', 'lease-reaper-test', ARRAY[$2], $3, $4, $4) RETURNING id`,
+		baID, env.modelID, pvID, now).Scan(&entID); err != nil {
+		t.Fatal(err)
+	}
+	reqID := uuid.NewString()
+	if _, err := env.db.Exec(`INSERT INTO inference_requests
+		(id, billing_account_id, entitlement_id, model_id, protocol, policy_version_id)
+		VALUES ($1, $2, $3, $4, 'openai_chat', $5)`, reqID, baID, entID, env.modelID, pvID); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-8 * 24 * time.Hour) // 早于 7 天保留窗口
+	leases := []struct {
+		state      string
+		acquired   time.Time
+		expires    time.Time
+		releasedAt *time.Time
+	}{
+		{"released", old.Add(-time.Hour), old, &old},           // 老 released → 收割
+		{"expired", old.Add(-time.Hour), old, nil},             // 老 expired → 收割
+		{"released", now.Add(-time.Hour), now, &now},           // 窗口内 released → 保留
+		{"held", now.Add(-time.Hour), now.Add(time.Hour), nil}, // held → 保留
+	}
+	for i, l := range leases {
+		if _, err := env.db.Exec(`INSERT INTO inference_concurrency_leases
+			(scope, scope_id, request_id, owner_token, fencing_token, state, acquired_at, expires_at, released_at)
+			VALUES ('upstream_account', $1, $2, 'owner', $3, $4, $5, $6, $7)`,
+			uuid.NewString(), reqID, i+1, l.state, l.acquired, l.expires, l.releasedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		env.db.Exec(`DELETE FROM inference_concurrency_leases WHERE request_id = $1`, reqID)
+		env.db.Exec(`DELETE FROM inference_requests WHERE id = $1`, reqID)
+		env.db.Exec(`DELETE FROM inference_entitlements WHERE id = $1`, entID)
+		env.db.Exec(`DELETE FROM inference_policy_versions WHERE id = $1`, pvID)
+		env.db.Exec(`DELETE FROM inference_billing_accounts WHERE id = $1`, baID)
+		env.db.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	})
+
+	m, err := env.healthWorker().RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.LeasesReaped != 2 {
+		t.Fatalf("health pass must reap 2 old terminal leases: %+v", m)
+	}
+	var remaining int
+	env.db.QueryRow(`SELECT COUNT(*) FROM inference_concurrency_leases WHERE request_id = $1`, reqID).Scan(&remaining)
+	if remaining != 2 {
+		t.Fatalf("held and in-window terminal leases must survive: remaining = %d, want 2", remaining)
 	}
 }

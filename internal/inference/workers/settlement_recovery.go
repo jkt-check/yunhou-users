@@ -5,6 +5,8 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -13,6 +15,20 @@ import (
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/postgres"
 )
+
+// runGuarded 执行一轮 worker pass 并兜底 panic：workers 在 cmd/server/main.go
+// 以裸 goroutine 启动，未恢复的 panic 会终止整个 API 进程（连 HTTP 服务一起
+// 带走）。panic 记 ALARM 后按 nil 错误返回，让 tick 循环继续——与 outbox
+// worker 的 per-message recover 先例对齐（审查修复 Important-1）。
+func runGuarded(name string, pass func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ALARM %s: pass panicked: %v — worker loop continues (panic 不再终止进程)", name, r)
+			err = nil
+		}
+	}()
+	return pass()
+}
 
 // settlement_recovery.go — 结算恢复 worker（Task 9，设计 §7.2：进程可能在
 // "上游已执行、结果未落库"时崩溃；恢复以"保守估算 + 核对队列"为主，按供应
@@ -123,12 +139,17 @@ func NewSettlementRecovery(store RecoveryStore, clock domain.Clock, cfg Recovery
 }
 
 // Start runs one pass immediately (a restart is exactly when recovery is
-// needed) and then ticks until ctx is done. It never panics the process: a
-// failing pass is logged and retried next tick.
+// needed) and then ticks until ctx is done. It never panics the process:
+// runGuarded 兜底每轮 pass 的 panic（ALARM 后继续 tick），失败的 pass 记
+// ERROR 下一轮重试。
 func (w *SettlementRecovery) Start(ctx context.Context) {
 	log.Printf("inference settlement recovery worker started (interval=%s batch=%d grace=%s deadline=%s)",
 		w.cfg.Interval, w.cfg.BatchLimit, w.cfg.Grace, w.cfg.ReconciliationDeadline)
-	if _, err := w.RunPass(ctx); err != nil {
+	pass := func() error {
+		_, err := w.RunPass(ctx)
+		return err
+	}
+	if err := runGuarded("inference recovery", pass); err != nil {
 		log.Printf("ERROR inference recovery: initial pass failed: %v", err)
 	}
 	ticker := time.NewTicker(w.cfg.Interval)
@@ -139,7 +160,7 @@ func (w *SettlementRecovery) Start(ctx context.Context) {
 			log.Printf("inference settlement recovery worker stopped")
 			return
 		case <-ticker.C:
-			if _, err := w.RunPass(ctx); err != nil {
+			if err := runGuarded("inference recovery", pass); err != nil {
 				log.Printf("ERROR inference recovery: pass failed: %v", err)
 			}
 		}
@@ -165,50 +186,63 @@ type PassStats struct {
 
 // RunPass executes one recovery pass. Exported for tests and for the
 // startup pass.
+//
+// 各阶段独立执行：单阶段失败计入 PassStats.Errors 并聚合返回，不跳过后续
+// 阶段——阶段 3 的到期升级是卡死资金的安全网，不能被前序故障连带跳过
+// （审查修复 Minor-6）。
 func (w *SettlementRecovery) RunPass(ctx context.Context) (PassStats, error) {
 	stats := PassStats{}
 	now := w.clock.Now()
 	cutoff := now.Add(-w.cfg.Grace)
+	var errs []error
 
 	// 1. Stale in-flight requests (crash candidates).
 	stale, err := w.store.ListStaleOpenRequests(ctx, cutoff, w.cfg.BatchLimit)
 	if err != nil {
-		return stats, err
-	}
-	stats.Scanned = len(stale)
-	for i := range stale {
-		w.recoverRequest(ctx, &stale[i], &stats)
+		stats.Errors++
+		errs = append(errs, fmt.Errorf("scan stale requests: %w", err))
+	} else {
+		stats.Scanned = len(stale)
+		for i := range stale {
+			w.recoverRequest(ctx, &stale[i], &stats)
+		}
 	}
 
 	// 2. Pending reconciliation jobs.
 	jobs, err := w.store.ListPendingReconciliationJobs(ctx, w.cfg.BatchLimit)
 	if err != nil {
-		return stats, err
-	}
-	for _, job := range jobs {
-		w.processJob(ctx, job, &stats)
+		stats.Errors++
+		errs = append(errs, fmt.Errorf("list reconciliation jobs: %w", err))
+	} else {
+		for _, job := range jobs {
+			w.processJob(ctx, job, &stats)
+		}
 	}
 
 	// 3. Deadline escalation (告警 — never auto-zero, never release by TTL).
 	escalated, err := w.store.EscalateOverdueReconciliationJobs(ctx, now, w.cfg.BatchLimit)
 	if err != nil {
-		return stats, err
-	}
-	stats.Escalated = len(escalated)
-	for _, id := range escalated {
-		log.Printf("ALARM inference recovery: reconciliation job %s past deadline — escalated for manual handling (禁止 TTL 到期视为零消费)", id)
+		stats.Errors++
+		errs = append(errs, fmt.Errorf("escalate overdue jobs: %w", err))
+	} else {
+		stats.Escalated = len(escalated)
+		for _, id := range escalated {
+			log.Printf("ALARM inference recovery: reconciliation job %s past deadline — escalated for manual handling (禁止 TTL 到期视为零消费)", id)
+		}
 	}
 
 	// 4. Ledger rebuild vs window aggregates.
 	recon, err := w.store.ReconcileWindowAggregates(ctx)
 	if err != nil {
-		return stats, err
-	}
-	for _, m := range accounting.Mismatches(recon) {
-		stats.WindowMismatches++
-		log.Printf("ALARM inference recovery: ledger mismatch window %s (%s): stored=%d rebuilt=%d diff=%d — reconciliation job enqueued",
-			m.WindowID, m.Kind, m.StoredUsed, m.RebuiltUsed, m.Diff())
-		w.enqueueWindowMismatch(ctx, m, now)
+		stats.Errors++
+		errs = append(errs, fmt.Errorf("reconcile window aggregates: %w", err))
+	} else {
+		for _, m := range accounting.Mismatches(recon) {
+			stats.WindowMismatches++
+			log.Printf("ALARM inference recovery: ledger mismatch window %s (%s): stored=%d rebuilt=%d diff=%d — reconciliation job enqueued",
+				m.WindowID, m.Kind, m.StoredUsed, m.RebuiltUsed, m.Diff())
+			w.enqueueWindowMismatch(ctx, m, now)
+		}
 	}
 
 	// 5. Metrics snapshot (结构化日志计数).
@@ -224,7 +258,7 @@ func (w *SettlementRecovery) RunPass(ctx context.Context) (PassStats, error) {
 		stats.JobsProcessed, stats.JobsSettled, stats.JobsAwaitingEvidence, stats.JobsNoEvidence, stats.Escalated,
 		metrics.ReconciliationBacklog, metrics.UnknownUsageRequests, metrics.DanglingHolds,
 		metrics.OpenRequests, lag.Seconds(), stats.WindowMismatches, stats.Errors)
-	return stats, nil
+	return stats, errors.Join(errs...)
 }
 
 // ---------------------------------------------------------------------------

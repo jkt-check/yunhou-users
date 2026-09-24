@@ -814,17 +814,18 @@ func (s *Store) ApplyWalletAdjustmentTx(ctx context.Context, w domain.UnitOfWork
 		ID: uuid.NewString(), BillingAccountID: cmd.AccountID,
 		Reason: cmd.Reason, AmountMicros: m.Micros,
 		Direction: string(cmd.Direction), Unit: "micromoney", Currency: m.Currency,
+		Source:          string(cmd.Source),
 		OperatorSubject: cmd.OperatorSubject, ServiceSubject: cmd.ServiceSubject,
 		IdempotencyKey: cmd.IdempotencyKey,
 	}
 	err = tx.QueryRowxContext(ctx,
 		`INSERT INTO inference_adjustments
 		 (id, billing_account_id, reason, amount_micros, direction,
-		  unit, currency, operator_subject, service_subject, idempotency_key)
-		 VALUES ($1,$2,$3,$4,$5,'micromoney',$6,$7,$8,$9)
+		  unit, currency, source, operator_subject, service_subject, idempotency_key)
+		 VALUES ($1,$2,$3,$4,$5,'micromoney',$6,$7,$8,$9,$10)
 		 RETURNING created_at`,
 		adj.ID, adj.BillingAccountID, adj.Reason, adj.AmountMicros, adj.Direction,
-		adj.Currency, adj.OperatorSubject, adj.ServiceSubject, adj.IdempotencyKey).
+		adj.Currency, adj.Source, adj.OperatorSubject, adj.ServiceSubject, adj.IdempotencyKey).
 		Scan(&adj.CreatedAt)
 	if err != nil {
 		return nil, mapError("wallet adjustment: insert", err)
@@ -854,6 +855,7 @@ func (s *Store) GetAdjustmentByIdempotencyKey(ctx context.Context, key string) (
 		Direction string         `db:"direction"`
 		Unit      string         `db:"unit"`
 		Currency  sql.NullString `db:"currency"`
+		Source    sql.NullString `db:"source"`
 		Operator  string         `db:"operator_subject"`
 		Service   string         `db:"service_subject"`
 		Key       string         `db:"idempotency_key"`
@@ -866,7 +868,7 @@ func (s *Store) GetAdjustmentByIdempotencyKey(ctx context.Context, key string) (
 	return &Adjustment{
 		ID: row.ID, BillingAccountID: row.AccountID, Reason: row.Reason,
 		AmountMicros: row.Amount, Direction: row.Direction, Unit: row.Unit,
-		Currency: row.Currency.String, OperatorSubject: row.Operator,
+		Currency: row.Currency.String, Source: row.Source.String, OperatorSubject: row.Operator,
 		ServiceSubject: row.Service, IdempotencyKey: row.Key, CreatedAt: row.CreatedAt,
 	}, nil
 }

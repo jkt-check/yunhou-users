@@ -104,8 +104,15 @@ func (b *SessionBinder) Resolve(ctx context.Context, sessionKey, modelID string)
 			"bound account is no longer schedulable (status="+string(account.Status)+")")
 	}
 	if err := b.store.TouchSessionBinding(ctx, binding.ID); err != nil {
-		// 并发终止竞争：触碰失败视为绑定已失效，按不可调度处理。
-		return binding, account, domain.WrapError(domain.CodeConflict, "binding ended concurrently", err)
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			// 并发终止竞争(rows=0):触碰时绑定已被结束,按不可调度处理。
+			return binding, account, domain.WrapError(domain.CodeConflict, "binding ended concurrently", err)
+		}
+		// 瞬时存储错误(连接重置/超时/池耗尽)原样透传 —— 上层经
+		// domain.CodeOf 兜底映射为 CodeInternal(500) 普通失败,不触发迁
+		// 移;包成 CodeConflict 会被当成「绑定失效」触发 Migrate 换号,
+		// 健康会话被错误迁移(绝不切号)。
+		return nil, nil, err
 	}
 	return binding, account, nil
 }

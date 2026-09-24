@@ -341,7 +341,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/WalletView"
+                $ref: "#/components/schemas/WalletViewEnvelope"
         "400":
           $ref: "#/components/responses/InvalidInput"
         "401":
@@ -803,6 +803,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AnthropicError"
+        "413":
+          description: invalid_request_error（请求体超 MaxBytesReader 上限,原生形状）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
         "429":
           description: rate_limit_error（额度耗尽;可计算恢复时刻时带 Retry-After）
           headers:
@@ -892,6 +898,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/V1Error"
+        "413":
+          description: request_too_large（请求体超 MaxBytesReader 上限）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
         "429":
           description: quota_exceeded（可计算恢复时刻时带 Retry-After）
           headers:
@@ -903,6 +915,120 @@ paths:
                 $ref: "#/components/schemas/V1Error"
         "503":
           description: upstream_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+
+  /v1/chat/completions:
+    post:
+      tags: [v1-protocols]
+      summary: OpenAI Chat Completions（通用 OpenAI SDK 目标面）
+      description: |
+        原生 OpenAI Chat Completions 请求/响应/SSE 形状（Task 8）。鉴权
+        `Authorization: Bearer <key>`。未知字段容忍（标准 OpenAI 服务端
+        行为）；命名到本网关无法兑现的能力的字段**明确 400**，绝不静默
+        丢字段或拼成文本。
+
+        **支持的请求子集**：`model`（必填，≤128 字符）、`messages`
+        （system/user/assistant/tool，纯字符串 content；assistant 可带
+        `tool_calls` 与 `reasoning_content`（思考链逐字透传，DeepSeek
+        tool-call 回合必需）、tool 消息必须带 `tool_call_id`，ID 逐字保留）、
+        `stream`、`max_tokens`/`max_completion_tokens`、`tools`（仅
+        function 定义，≤128 个/合计 ≤256 KiB）、`tool_choice`、
+        `stream_options`、`thinking_enabled`/`thinking`
+        （{"type":"enabled"}）、`temperature`/`top_p`/
+        `presence_penalty`/`frequency_penalty`/`seed`/`stop`（采样透传）。
+        **明确 400**：多模态 content 数组、`modalities`、`audio`、
+        `prediction`、`n`≠1、`logprobs`/`top_logprobs`、
+        `response_format.type`≠text。
+
+        响应：`object=chat.completion` 原生形状（非流式）；流式为
+        `chat.completion.chunk` SSE 序列，以 `data: [DONE]` 终止；上游
+        中断注入 in-stream error 事件后结束，绝不伪造 `[DONE]`。
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionsRequest"
+      responses:
+        "200":
+          description: chat.completion JSON（非流式）或 chunk SSE 流（stream=true）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionsResponse"
+            text/event-stream:
+              schema: { type: string, description: "chat.completion.chunk SSE 序列，[DONE] 终止" }
+        "400":
+          description: invalid_input（能力不兼容/字段非法）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "401":
+          description: invalid_api_key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "403":
+          description: model_not_allowed / unpriced_capability
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "404":
+          description: model_not_found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "413":
+          description: request_too_large（请求体超 MaxBytesReader 上限）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "429":
+          description: quota_exceeded / insufficient_balance / rate_limited（可计算恢复时刻时带 Retry-After）
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "503":
+          description: upstream_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+
+  /v1/models:
+    get:
+      tags: [v1-protocols]
+      summary: OpenAI 模型列表（调用者可见的已发布模型）
+      description: |
+        OpenAI 模型列表形状（`object=list`）。可见性 = 生命周期 active
+        且有启用路由与可售价格，且属于调用者有效权益模型集合（Key 的
+        model_allow 只能收窄不能放宽）。Anthropic 形状的模型列表端点
+        不实现。
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: 模型列表（按 id 排序）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+        "401":
+          description: invalid_api_key
           content:
             application/json:
               schema:
@@ -972,6 +1098,11 @@ components:
       pattern: "^[0-9]+$"
       example: "1000000"
       description: 64 位整数的十进制字符串（JS 大整数精度安全）；额度单位 microcredit
+    SignedDecimalInt64:
+      type: string
+      pattern: "^-?[0-9]+$"
+      example: "-120000"
+      description: 带符号 64 位整数的十进制字符串；用于签名合计（debit 正 / credit 负，可为负）
     MicroMoney:
       type: string
       pattern: "^-?[0-9]+$"
@@ -988,46 +1119,82 @@ components:
         bonus_held_micros: { $ref: "#/components/schemas/MicroMoney" }
         total_available_micros: { $ref: "#/components/schemas/MicroMoney" }
         overage_enabled: { type: boolean, description: 套餐外消费开关，默认关 }
-        monthly_spend_limit_micros: { $ref: "#/components/schemas/MicroMoney" }
+        monthly_spend_limit_micros:
+          allOf:
+            - $ref: "#/components/schemas/MicroMoney"
+          nullable: true
+          description: UTC 自然月支出上限；未设置时为 null
         month_spent_micros: { $ref: "#/components/schemas/MicroMoney" }
         month_start: { $ref: "#/components/schemas/RFC3339UTC" }
         month_end: { $ref: "#/components/schemas/RFC3339UTC" }
       description: 单币种钱包视图——账本派生（无缓存余额），held 为在途冻结
-    WalletEnvelope:
-      type: object
-      properties:
-        server_time: { $ref: "#/components/schemas/RFC3339UTC" }
-        wallets:
-          type: array
-          items: { $ref: "#/components/schemas/WalletView" }
-        payg:
-          type: object
+    WalletViewEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
           properties:
-            enabled: { type: boolean }
-            entitlement_id: { type: string }
-            model_ids: { type: array, items: { type: string } }
-            policy_version_id: { type: string }
-    WalletEntriesEnvelope:
+            data:
+              $ref: "#/components/schemas/WalletView"
+    PaygView:
       type: object
+      required: [enabled]
+      description: 账户 PAYG 状态；enabled=false 时仅 enabled 一键（entitlement 字段缺席）
       properties:
-        entries:
+        enabled: { type: boolean }
+        entitlement_id:
+          type: string
+          format: uuid
+          description: 仅 enabled=true 携带
+        model_ids:
           type: array
-          items:
-            type: object
-            properties:
-              id: { $ref: "#/components/schemas/DecimalInt64" }
-              entry_type: { type: string, enum: [topup, bonus, consume, refund, adjustment, reversal] }
-              direction: { type: string, enum: [debit, credit] }
-              source: { type: string, enum: [cash, bonus], description: cash 可原路退；bonus（赠送）不得伪装现金退款 }
-              amount_micros: { $ref: "#/components/schemas/MicroMoney" }
-              currency: { type: string }
-              request_id: { type: string, nullable: true }
-              payment_id: { type: string, nullable: true }
-              refund_id: { type: string, nullable: true }
-              reverses_entry_id: { $ref: "#/components/schemas/DecimalInt64" }
-              created_by: { type: string }
-              created_at: { $ref: "#/components/schemas/RFC3339UTC" }
-        next_cursor: { type: string, nullable: true }
+          items: { type: string }
+          description: 仅 enabled=true 携带
+        policy_version_id:
+          type: string
+          format: uuid
+          description: 仅 enabled=true 携带
+    WalletEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [server_time, wallets, payg]
+              properties:
+                server_time: { $ref: "#/components/schemas/RFC3339UTC" }
+                wallets:
+                  type: array
+                  items: { $ref: "#/components/schemas/WalletView" }
+                payg:
+                  $ref: "#/components/schemas/PaygView"
+    WalletEntriesEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [entries, next_cursor]
+              properties:
+                entries:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id: { $ref: "#/components/schemas/DecimalInt64" }
+                      entry_type: { type: string, enum: [topup, bonus, consume, refund, adjustment, reversal] }
+                      direction: { type: string, enum: [debit, credit] }
+                      source: { type: string, enum: [cash, bonus], description: cash 可原路退；bonus（赠送）不得伪装现金退款 }
+                      amount_micros: { $ref: "#/components/schemas/MicroMoney" }
+                      currency: { type: string }
+                      request_id: { type: string, nullable: true }
+                      payment_id: { type: string, nullable: true }
+                      refund_id: { type: string, nullable: true }
+                      reverses_entry_id: { $ref: "#/components/schemas/DecimalInt64" }
+                      created_by: { type: string }
+                      created_at: { $ref: "#/components/schemas/RFC3339UTC" }
+                next_cursor: { type: string, nullable: true }
     WalletOverageRequest:
       type: object
       required: [currency, enabled]
@@ -1035,16 +1202,16 @@ components:
         currency: { type: string, pattern: "^[A-Z]{3}$" }
         enabled: { type: boolean }
         monthly_spend_limit_micros:
-          description: UTC 自然月支出上限；enabled=true 时必填
+          description: UTC 自然月支出上限；enabled=true 时必填；非负十进制整数字符串（负数 400）
           allOf:
-            - $ref: "#/components/schemas/MicroMoney"
+            - $ref: "#/components/schemas/DecimalInt64"
     PaygEnvelope:
-      type: object
-      properties:
-        enabled: { type: boolean }
-        entitlement_id: { type: string }
-        model_ids: { type: array, items: { type: string } }
-        policy_version_id: { type: string }
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/PaygView"
     RFC3339UTC:
       type: string
       format: date-time
@@ -1151,7 +1318,8 @@ components:
           enum: [active, expired, revoked, superseded]
         source_type:
           type: string
-          enum: [subscription, order, grant]
+          enum: [subscription, order, grant, payg]
+          description: subscription=套餐订阅；order=订单购买；grant=赠送；payg=无套餐按量（Task 14 显式 PAYG 权益，钱包扣费）
         model_ids:
           type: array
           items: { type: string }
@@ -1241,7 +1409,7 @@ components:
           $ref: "#/components/schemas/DecimalInt64"
           description: Σ reversal 冲正分录
         adjusted_micros:
-          $ref: "#/components/schemas/DecimalInt64"
+          $ref: "#/components/schemas/SignedDecimalInt64"
           description: Σ 请求级 adjustment 签名合计（debit 正 / credit 负；修正补差与运营补偿均计入）
         net_micros:
           $ref: "#/components/schemas/DecimalInt64"
@@ -1260,7 +1428,7 @@ components:
         reversed_micros:
           $ref: "#/components/schemas/DecimalInt64"
         adjusted_micros:
-          $ref: "#/components/schemas/DecimalInt64"
+          $ref: "#/components/schemas/SignedDecimalInt64"
           description: 请求级 adjustment 签名合计（debit 正 / credit 负）
         net_micros:
           $ref: "#/components/schemas/DecimalInt64"
@@ -1335,7 +1503,7 @@ components:
           $ref: "#/components/schemas/DecimalInt64"
           description: Σ reversal 冲正（作废 = 全额冲正原始 charge）
         adjusted_micros:
-          $ref: "#/components/schemas/DecimalInt64"
+          $ref: "#/components/schemas/SignedDecimalInt64"
           description: 请求级 adjustment 签名合计（debit 正 / credit 负）
         net_micros:
           $ref: "#/components/schemas/DecimalInt64"
@@ -1414,14 +1582,15 @@ components:
       properties:
         type:
           type: string
-          enum: [subscription, order, grant]
+          enum: [subscription, order, grant, payg]
+          description: payg = 无套餐按量显式权益（POST /user/wallet/payg 创建，钱包扣费）
         kind:
           type: string
           enum: [bundle_gift, migration_gift, other]
           description: 仅 type=grant 携带
         reference:
           type: string
-          description: 原始 source_id（客户自己的订阅/订单/规则标识）
+          description: 原始 source_id（客户自己的订阅/订单/规则标识）；type=payg 时为空——"payg:<billing_account_id>" 是内部标识，不输出
         subscription_id:
           type: string
           format: uuid
@@ -1615,6 +1784,96 @@ components:
               enum: [invalid_request_error, authentication_error, permission_error, not_found_error, rate_limit_error, api_error, overloaded_error]
             message: { type: string }
       required: [type, error]
+    ModelList:
+      type: object
+      description: OpenAI 模型列表形状（GET /v1/models）。
+      properties:
+        object: { type: string, enum: [list] }
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, description: 公开模型 id（非上游名） }
+              object: { type: string, enum: [model] }
+              created: { type: integer, format: int64 }
+              owned_by: { type: string, example: yunhou }
+      required: [object, data]
+    ChatCompletionsRequest:
+      type: object
+      description: |
+        OpenAI Chat Completions 请求子集。未知字段容忍；明确 400：多模态
+        content 数组、modalities/audio/prediction、n≠1、logprobs/
+        top_logprobs、response_format.type≠text。
+      properties:
+        model: { type: string, maxLength: 128 }
+        messages:
+          type: array
+          maxItems: 512
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [system, user, assistant, tool] }
+              content:
+                type: string
+                description: 纯字符串；content 数组（多模态 part）明确 400，不静默拼接
+              tool_calls:
+                type: array
+                items: { type: object }
+                description: assistant 工具调用；call id 逐字保留
+              reasoning_content:
+                type: string
+                description: assistant 轮的思考链（DeepSeek tool-call 回合必需）；显式支持并逐字透传上游，不丢弃
+              tool_call_id:
+                type: string
+                description: role=tool 时必填（对应 assistant 的 tool_call id）
+        stream: { type: boolean, default: false }
+        max_tokens: { type: integer, format: int64, minimum: 1 }
+        max_completion_tokens: { type: integer, format: int64, minimum: 1 }
+        tools:
+          type: array
+          maxItems: 128
+          items:
+            type: object
+            description: 仅 function 定义（{type:function, function:{name, description?, parameters?}}；合计 ≤256 KiB）
+        tool_choice: { description: "auto|none|required|{type:function,function:{name}}" }
+        stream_options: { type: object }
+        thinking_enabled: { type: boolean, description: kaya 思考开关 }
+        thinking:
+          type: object
+          description: "{type:enabled|disabled}（DeepSeek 风格，与 thinking_enabled 同义）"
+        temperature: { type: number }
+        top_p: { type: number }
+        presence_penalty: { type: number }
+        frequency_penalty: { type: number }
+        seed: { type: integer, format: int64 }
+        stop: { description: "字符串或字符串数组（采样透传）" }
+      required: [model, messages]
+    ChatCompletionsResponse:
+      type: object
+      description: OpenAI chat.completion 原生响应；流式为 chat.completion.chunk SSE（[DONE] 终止）。
+      properties:
+        id: { type: string, example: "chatcmpl-…" }
+        object: { type: string, enum: [chat.completion] }
+        created: { type: integer, format: int64 }
+        model: { type: string, description: 公开模型 id（非上游名） }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              message:
+                type: object
+                description: "{role:assistant, content, tool_calls?}"
+              finish_reason: { type: string, nullable: true }
+        usage:
+          type: object
+          properties:
+            prompt_tokens: { type: integer, format: int64 }
+            completion_tokens: { type: integer, format: int64 }
+            total_tokens: { type: integer, format: int64 }
+      required: [id, object, created, model, choices]
     MessagesRequest:
       type: object
       description: |

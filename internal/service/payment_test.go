@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,22 +21,28 @@ import (
 // ("Handler tests use hand-rolled mock structs with function fields —
 // no external mocking libraries").
 type stubRefundAPI struct {
-	called    bool
-	gotCh     string
-	gotTxn    string
-	gotAmt    float64
-	gotKey    string
-	returnID  string
-	returnErr error
+	called        bool
+	gotCh         string
+	gotTxn        string
+	gotMerchantNo string
+	gotAmt        float64
+	gotKey        string
+	returnID      string
+	returnErr     error
 }
 
-func (s *stubRefundAPI) Refund(_ context.Context, ch, txn string, amt float64, key string) (string, error) {
+func (s *stubRefundAPI) Refund(_ context.Context, ch, txn, merchantRefundNo string, amt float64, key string) (string, error) {
 	s.called = true
 	s.gotCh = ch
 	s.gotTxn = txn
+	s.gotMerchantNo = merchantRefundNo
 	s.gotAmt = amt
 	s.gotKey = key
-	return s.returnID, s.returnErr
+	if s.returnID != "" || s.returnErr != nil {
+		return s.returnID, s.returnErr
+	}
+	// 默认回显商户退款单号（真实渠道契约：webhook 以同一单号对账）。
+	return merchantRefundNo, nil
 }
 
 // nopRepos returns a PaymentService with all repos set to nil. Pure-function
@@ -326,6 +333,9 @@ func TestIsRefundEvent(t *testing.T) {
 		{"TRANSACTION.REFUND", true},
 		{"trade_closed", true},
 		{"TRADE_CLOSED", true},
+		// 退款终态失败事件走 isRefundFailedEvent，不是成功退款。
+		{"REFUND.ABNORMAL", false},
+		{"REFUND.CLOSED", false},
 		// LemonSqueezy-era names — dead since the channel was dropped
 		// (migration 008); must NOT dispatch.
 		{"order_refunded", false},
@@ -339,6 +349,28 @@ func TestIsRefundEvent(t *testing.T) {
 		t.Run(c.eventType, func(t *testing.T) {
 			if got := isRefundEvent(c.eventType); got != c.want {
 				t.Errorf("isRefundEvent(%q) = %v, want %v", c.eventType, got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsRefundFailedEvent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		eventType string
+		want      bool
+	}{
+		{"REFUND.ABNORMAL", true},
+		{"REFUND.CLOSED", true},
+		{"REFUND.SUCCESS", false},
+		{"TRANSACTION.REFUND", false},
+		{"charge.refunded", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		t.Run(c.eventType, func(t *testing.T) {
+			if got := isRefundFailedEvent(c.eventType); got != c.want {
+				t.Errorf("isRefundFailedEvent(%q) = %v, want %v", c.eventType, got, c.want)
 			}
 		})
 	}
@@ -650,21 +682,62 @@ func TestRefundModel_DBFields(t *testing.T) {
 }
 
 // ============================================================================
+// deriveMerchantRefundNo — 评审轮2 N2 确定性派生
+// ============================================================================
+
+// 同一支付 + 同一 Idempotency-Key 两次调用必得同一商户退款单号（渠道以
+// 商户单号为退款幂等键，崩溃重试窗口由渠道侧幂等兜底）；不同键或不同支
+// 付派生不同单号（评审轮3 Critical-1：refunds 有全局 UNIQUE(channel,
+// external_refund_id)，跨支付共享单号必撞唯一键）；长度低于渠道 64 字
+// 符上限。
+func TestDeriveMerchantRefundNo_Deterministic(t *testing.T) {
+	t.Parallel()
+
+	const key = "user-req-deterministic-001"
+	first := deriveMerchantRefundNo("pay-1", key)
+	second := deriveMerchantRefundNo("pay-1", key)
+	if first != second {
+		t.Errorf("same payment+key derived different numbers: %q vs %q", first, second)
+	}
+	if other := deriveMerchantRefundNo("pay-1", "user-req-deterministic-002"); other == first {
+		t.Errorf("different keys derived the same number: %q", first)
+	}
+	if other := deriveMerchantRefundNo("pay-2", key); other == first {
+		t.Errorf("different payments same key derived the same number（必撞 refunds 全局唯一键）: %q", first)
+	}
+	if len(first) > 64 {
+		t.Errorf("merchant refund no length = %d, want <= 64（渠道单号上限）", len(first))
+	}
+	if !strings.HasPrefix(first, "mrn_") {
+		t.Errorf("merchant refund no = %q, want mrn_ 前缀", first)
+	}
+}
+
+// ============================================================================
 // stubRefundAPI behavior — round-trip sanity
 // ============================================================================
 
 func TestStubRefundAPI_RoundTrip(t *testing.T) {
 	t.Parallel()
 	s := &stubRefundAPI{returnID: "re_test", returnErr: nil}
-	got, err := s.Refund(context.Background(), "stripe", "pi_x", 5.0, "idem-1")
+	got, err := s.Refund(context.Background(), "stripe", "pi_x", "mrn-1", 5.0, "idem-1")
 	if err != nil {
 		t.Fatalf("Refund: %v", err)
 	}
 	if got != "re_test" {
 		t.Errorf("got %q, want re_test", got)
 	}
-	if !s.called || s.gotCh != "stripe" || s.gotTxn != "pi_x" || s.gotAmt != 5.0 || s.gotKey != "idem-1" {
+	if !s.called || s.gotCh != "stripe" || s.gotTxn != "pi_x" || s.gotMerchantNo != "mrn-1" || s.gotAmt != 5.0 || s.gotKey != "idem-1" {
 		t.Errorf("stub args not captured: %+v", s)
+	}
+	// 默认（returnID 未设置）回显商户退款单号——webhook 对账键。
+	s2 := &stubRefundAPI{}
+	got2, err := s2.Refund(context.Background(), "wechat_pay", "wx_x", "mrn-2", 3.0, "idem-2")
+	if err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	if got2 != "mrn-2" {
+		t.Errorf("echo got %q, want mrn-2 (商户退款单号)", got2)
 	}
 }
 

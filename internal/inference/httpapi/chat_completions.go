@@ -70,10 +70,15 @@ type chatCompletionsRequest struct {
 	Messages []struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
-		// ContentParts detects the multimodal array shape (content:[{...}]).
+		// name 已解析但本期不映射（评审轮1 m10：model.ChatMessage 无对应
+		// 字段，上游工具调用不依赖它——显式声明的不映射，非无意丢弃）。
 		Name       string           `json:"name"`
 		ToolCalls  []model.ToolCall `json:"tool_calls"`
 		ToolCallID string           `json:"tool_call_id"`
+		// ReasoningContent 必须回显：DeepSeek 对不回显 reasoning_content
+		// 的 tool-call assistant 回合 400 拒绝（internal/model/chat.go
+		// 契约；本文件头承诺不静默丢字段）。
+		ReasoningContent string `json:"reasoning_content"`
 	} `json:"messages"`
 	Stream              bool              `json:"stream"`
 	MaxTokens           *int64            `json:"max_tokens"`
@@ -159,6 +164,7 @@ func parseChatCompletions(body []byte) (*providers.ChatRequest, error) {
 		cm.Role = m.Role
 		cm.ToolCalls = m.ToolCalls
 		cm.ToolCallID = m.ToolCallID
+		cm.ReasoningContent = m.ReasoningContent
 		if len(m.Content) > 0 && string(m.Content) != "null" {
 			if m.Content[0] == '[' {
 				// 模态数组形态明确报错 — 不静默丢字段、不拼成文本。
@@ -281,7 +287,14 @@ func (h *ChatCompletionsHandler) Create(c *gin.Context) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, v1ChatMaxBodyBytes))
 	if err != nil {
-		v1Error(c, http.StatusBadRequest, "invalid_request_error", "invalid_input", "request body too large or unreadable")
+		// 超限是明确的 413（评审轮1 m7），不是含糊的 400。
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			v1Error(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "request_too_large",
+				"request body exceeds the size limit")
+			return
+		}
+		v1Error(c, http.StatusBadRequest, "invalid_request_error", "invalid_input", "request body unreadable")
 		return
 	}
 	req, err := parseChatCompletions(body)
@@ -352,7 +365,9 @@ func (h *ChatCompletionsHandler) relayStream(c *gin.Context, outcome *gateway.Ou
 	if end == gateway.EndUpstreamBroke {
 		// A clean EOF without [DONE] would make the client render the
 		// partial answer as complete — inject an in-stream error instead.
-		_, _ = io.WriteString(c.Writer, "data: {\"error\":{\"message\":\"upstream stream interrupted\",\"type\":\"server_error\",\"code\":\"upstream_unavailable\"}}\n\n")
+		// 前导 \n（评审轮1 m8）：上游残帧可能没有结束分隔（\n\n），直接
+		// 拼接会粘在残帧尾部成为不可解析的行。
+		_, _ = io.WriteString(c.Writer, "\ndata: {\"error\":{\"message\":\"upstream stream interrupted\",\"type\":\"server_error\",\"code\":\"upstream_unavailable\"}}\n\n")
 		c.Writer.Flush()
 	}
 	// Settlement runs on a detached context inside Finish: a client

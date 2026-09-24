@@ -92,10 +92,15 @@ func NewEntitlementSync(store EntitlementSyncStore, clock domain.Clock, cfg Enti
 
 // Start runs one pass immediately (a restart is exactly when a backlog
 // drains) and then ticks until ctx is done. A failing pass is logged and
-// retried next tick — never panics the process.
+// retried next tick; runGuarded 兜底每轮 pass 的 panic（与 processMessage 的
+// per-message recover 互补：Fetch 等 pass 级 panic 也不再终止进程）。
 func (w *EntitlementSync) Start(ctx context.Context) {
 	log.Printf("inference entitlement sync worker started (interval=%s batch=%d)", w.cfg.Interval, w.cfg.BatchLimit)
-	if _, err := w.RunPass(ctx); err != nil {
+	pass := func() error {
+		_, err := w.RunPass(ctx)
+		return err
+	}
+	if err := runGuarded("inference entitlement sync", pass); err != nil {
 		log.Printf("ERROR inference entitlement sync: initial pass failed: %v", err)
 	}
 	ticker := time.NewTicker(w.cfg.Interval)
@@ -106,7 +111,7 @@ func (w *EntitlementSync) Start(ctx context.Context) {
 			log.Printf("inference entitlement sync worker stopped")
 			return
 		case <-ticker.C:
-			if _, err := w.RunPass(ctx); err != nil {
+			if err := runGuarded("inference entitlement sync", pass); err != nil {
 				log.Printf("ERROR inference entitlement sync: pass failed: %v", err)
 			}
 		}
@@ -182,8 +187,10 @@ func (w *EntitlementSync) processMessage(ctx context.Context, msg postgres.Outbo
 		stats.Failed++
 	case racing:
 		// A concurrent converger moved the state forward; the next pass
-		// re-reads the converged state and noops. Not an error.
-		w.reschedule(ctx, msg)
+		// re-reads the converged state and noops. Not an error — 良性竞争
+		// 立即重排，不吃失败指数退避（审查修复 Minor-5：backoff 会不必要
+		// 地延迟 delivered 标记）。
+		w.rescheduleSoon(ctx, msg)
 		stats.Racing++
 	default:
 		stats.Delivered++
@@ -215,6 +222,14 @@ func (w *EntitlementSync) reschedule(ctx context.Context, msg postgres.OutboxMes
 		backoff = w.cfg.MaxBackoff
 	}
 	if err := w.store.MarkOutboxFailed(ctx, msg.ID, w.clock.Now().Add(backoff)); err != nil {
+		log.Printf("ERROR inference entitlement sync: reschedule outbox %d: %v", msg.ID, err)
+	}
+}
+
+// rescheduleSoon 立即重排（零延迟）：仅用于良性乐观竞争——状态已被并发收敛
+// 者推前，下一轮重读即收敛 noop，无需失败退避。
+func (w *EntitlementSync) rescheduleSoon(ctx context.Context, msg postgres.OutboxMessage) {
+	if err := w.store.MarkOutboxFailed(ctx, msg.ID, w.clock.Now()); err != nil {
 		log.Printf("ERROR inference entitlement sync: reschedule outbox %d: %v", msg.ID, err)
 	}
 }

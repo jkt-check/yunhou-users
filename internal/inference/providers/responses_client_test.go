@@ -253,6 +253,137 @@ func TestTranslateOpenAIToResponsesStream_BrokenEnd(t *testing.T) {
 	}
 }
 
+// 评审轮2 I3：交错 parallel tool calls —— 同一 wire tool_calls[].index 的
+// delta 不连续到达时，每个 call 必须有自己的 item（id/output_index/args
+// 缓冲），一个 call 的 open 不得截断另一个 call。坏 item 会进
+// FinalOutputItems() 被持久化为 previous_response_id 链 transcript。
+func TestTranslateOpenAIToResponsesStream_InterleavedToolCalls(t *testing.T) {
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"shell","arguments":"{\"a\":"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"read","arguments":"{\"b\":"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	}
+	var wire strings.Builder
+	for _, c := range chunks {
+		wire.WriteString("data: " + c + "\n\n")
+	}
+	wire.WriteString("data: [DONE]\n\n")
+
+	r, state := TranslateOpenAIToResponsesStream(io.NopCloser(strings.NewReader(wire.String())),
+		"resp_il", "m", 1, true)
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+
+	// 解析 SSE 帧：item_id 随机，按事件类型归集断言。
+	type frame struct {
+		event string
+		data  map[string]any
+	}
+	var frames []frame
+	for _, block := range strings.Split(s, "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var f frame
+		for _, line := range strings.Split(block, "\n") {
+			if ev, ok := strings.CutPrefix(line, "event: "); ok {
+				f.event = ev
+			}
+			if d, ok := strings.CutPrefix(line, "data: "); ok {
+				if err := json.Unmarshal([]byte(d), &f.data); err != nil {
+					t.Fatalf("frame data not json: %q", line)
+				}
+			}
+		}
+		frames = append(frames, f)
+	}
+
+	// 两个 function_call item 的 added：call_id → (item_id, output_index)。
+	itemOf := map[string]string{}
+	indexOf := map[string]float64{}
+	for _, f := range frames {
+		if f.event != "response.output_item.added" {
+			continue
+		}
+		item, _ := f.data["item"].(map[string]any)
+		if item["type"] != "function_call" {
+			continue
+		}
+		callID, _ := item["call_id"].(string)
+		itemOf[callID], _ = item["id"].(string)
+		indexOf[callID] = f.data["output_index"].(float64)
+	}
+	if len(itemOf) != 2 || itemOf["call_a"] == "" || itemOf["call_b"] == "" {
+		t.Fatalf("function_call items = %v, want call_a+call_b\n%s", itemOf, s)
+	}
+	if indexOf["call_a"] != 0 || indexOf["call_b"] != 1 {
+		t.Fatalf("output indexes = %v, want 0/1 in wire order", indexOf)
+	}
+
+	// 迟到的 ix0 delta 必须以 ix0 的 item_id + output_index 发出（旧实现会
+	// 错挂 ix1 的 output_index 并把参数拼进 ix1 的缓冲）。
+	seenDelta := map[string]bool{}
+	for _, f := range frames {
+		if f.event != "response.function_call_arguments.delta" {
+			continue
+		}
+		delta, _ := f.data["delta"].(string)
+		switch delta {
+		case "1}":
+			seenDelta["a"] = true
+			if f.data["item_id"] != itemOf["call_a"] || f.data["output_index"] != float64(0) {
+				t.Errorf("late ix0 delta misrouted: %+v", f.data)
+			}
+		case "2}":
+			seenDelta["b"] = true
+			if f.data["item_id"] != itemOf["call_b"] || f.data["output_index"] != float64(1) {
+				t.Errorf("ix1 delta misrouted: %+v", f.data)
+			}
+		}
+	}
+	if !seenDelta["a"] || !seenDelta["b"] {
+		t.Fatalf("missing arg deltas: %v\n%s", seenDelta, s)
+	}
+
+	// done 事件：各 call 的参数必须完整独立（不得截断/串缓冲）。
+	doneArgs := map[string]string{}
+	for _, f := range frames {
+		if f.event != "response.function_call_arguments.done" {
+			continue
+		}
+		doneArgs[f.data["item_id"].(string)] = f.data["arguments"].(string)
+	}
+	if doneArgs[itemOf["call_a"]] != `{"a":1}` || doneArgs[itemOf["call_b"]] != `{"b":2}` {
+		t.Errorf("done arguments = %v, want complete per-call args", doneArgs)
+	}
+
+	// 持久化 transcript：两个 canonical item，call_id/name/arguments 正确。
+	items := state.FinalOutputItems()
+	if len(items) != 2 {
+		t.Fatalf("final output items = %d, want 2", len(items))
+	}
+	got := map[string]string{}
+	for _, raw := range items {
+		var it map[string]any
+		if err := json.Unmarshal(raw, &it); err != nil {
+			t.Fatal(err)
+		}
+		got[it["call_id"].(string)] = it["name"].(string) + "|" + it["arguments"].(string)
+	}
+	if got["call_a"] != `shell|{"a":1}` || got["call_b"] != `read|{"b":2}` {
+		t.Errorf("transcript items = %v", got)
+	}
+	if !state.Completed() {
+		t.Error("state.Completed must be true after [DONE]")
+	}
+}
+
 // 会话链回放:transcript items + 新输入 → 完整消息序列(ID 保留)。
 func TestResponsesReplayToChat_ChainReplay(t *testing.T) {
 	transcript := []json.RawMessage{

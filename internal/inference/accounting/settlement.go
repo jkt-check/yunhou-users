@@ -55,6 +55,13 @@ func (d *Decision) OverageMicros() domain.Microcredit {
 // once, then quote under the pinned sale_credit price version. Unknown
 // usage refuses to price (ErrUnknownUsage) — it is held for reconciliation,
 // never charged nor zeroed.
+//
+// 已知限制（本期口径，extras 计费属 Phase 2）：Decide 无 extras 参数，
+// Quote 恒以 nil extras 计价，即本期结算不含工具等 extras 的实际用量；
+// 而入场（quota/reservation.go）会把 ExtraBounds 计入预占并对无费率
+// extras 拒绝。两侧口径不对称：入场预留是保守上界，结算按实际 token
+// 桶计。因此接入 extras 计费通道之前不应为模型配置 ExtraRates——否则
+// 平台永远收不到工具实际使用费，且客户每单多预留。
 func Decide(usage domain.UsageRecord, price PriceVersion, inc Inclusion, reserved domain.Microcredit) (*Decision, error) {
 	billable, err := BillableBuckets(usage.Buckets, inc)
 	if err != nil {

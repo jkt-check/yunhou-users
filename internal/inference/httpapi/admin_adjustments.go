@@ -183,6 +183,17 @@ func (h *AdminAdjustmentsHandler) Adjust(c *gin.Context) {
 				fail(c, rerr)
 				return
 			}
+			// 重放必须比对载荷（评审轮1 m9 + 轮2 C-I1）：同键不同
+			// adjustment 是调用方键复用错误，按 409 拒绝而非当良性重放。
+			// source 决定资金路由（bonus 不得现金退款），漏比对会让
+			// 「cash 成功后同键改 bonus 重发」被误当已生效，必须纳入。
+			if stored.BillingAccountID != acct.ID || stored.AmountMicros != amount ||
+				stored.Direction != req.Direction || stored.Currency != req.Currency ||
+				stored.Source != req.Source {
+				fail(c, domain.NewError(domain.CodeConflict,
+					"idempotency_key already used with a different adjustment payload"))
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
 				"applied": false, "adjustment": adjustmentJSON(stored),
 			}})
@@ -216,7 +227,8 @@ func (h *AdminAdjustmentsHandler) Adjust(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": data})
 }
 
-// adjustmentJSON renders the stored adjustment row.
+// adjustmentJSON renders the stored adjustment row. source 呈现资金路由
+// 来源（micromoney 调整恒有值；额度调整为空），便于运营核对重放响应。
 func adjustmentJSON(adj *postgres.Adjustment) gin.H {
 	return gin.H{
 		"id":            adj.ID,
@@ -224,6 +236,7 @@ func adjustmentJSON(adj *postgres.Adjustment) gin.H {
 		"direction":     adj.Direction,
 		"unit":          adj.Unit,
 		"currency":      adj.Currency,
+		"source":        adj.Source,
 		"reason":        adj.Reason,
 		"created_at":    adj.CreatedAt.UTC().Format(time.RFC3339),
 	}

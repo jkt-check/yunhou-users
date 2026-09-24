@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/inference/management"
 	"github.com/yunhou/users/internal/middleware"
@@ -41,14 +43,46 @@ func (s *stubOperatorStore) ListOperators(_ context.Context) ([]management.Opera
 	return nil, nil
 }
 
-// stubRecorder captures audit events.
+// stubRecorder captures audit events; RecordTx 供同事务审计路径使用，
+// txErr 注入审计写失败（验证权限变更随审计一起回滚）。
 type stubRecorder struct {
 	events []management.AuditEvent
+	txErr  error
 }
 
 func (r *stubRecorder) Record(_ context.Context, ev management.AuditEvent) error {
 	r.events = append(r.events, ev)
 	return nil
+}
+
+func (r *stubRecorder) RecordTx(_ context.Context, _ domain.UnitOfWork, ev management.AuditEvent) error {
+	if r.txErr != nil {
+		return r.txErr
+	}
+	r.events = append(r.events, ev)
+	return nil
+}
+
+// stubUow is a fake UnitOfWork tracking commit/rollback（评审轮1 I-2 测试）。
+type stubUow struct{ committed, rolledBack bool }
+
+func (u *stubUow) Commit(context.Context) error   { u.committed = true; return nil }
+func (u *stubUow) Rollback(context.Context) error { u.rolledBack = true; return nil }
+
+// stubOperatorTxStore implements httpapi.OperatorAdminTxStore in memory.
+type stubOperatorTxStore struct {
+	stubOperatorStore
+	uow *stubUow
+}
+
+func (s *stubOperatorTxStore) Begin(context.Context) (domain.UnitOfWork, error) { return s.uow, nil }
+
+func (s *stubOperatorTxStore) GrantRoleTx(_ context.Context, _ domain.UnitOfWork, userID, role string, grantedBy *string, reason string) (bool, error) {
+	return s.GrantRole(context.Background(), userID, role, grantedBy, reason)
+}
+
+func (s *stubOperatorTxStore) RevokeRoleTx(_ context.Context, _ domain.UnitOfWork, userID, role string) (bool, error) {
+	return s.RevokeRole(context.Background(), userID, role)
 }
 
 func newAuthzEngine(store httpapi.OperatorStore) *gin.Engine {
@@ -185,9 +219,9 @@ func TestOperatorRequireRole(t *testing.T) {
 	}
 }
 
-func TestGrantRevokeHandlers(t *testing.T) {
-	store := &stubOperatorStore{roles: map[string][]string{"adm-1": {"admin"}}}
-	rec := &stubRecorder{}
+// newOperatorAdminEngine mounts the operator-admin endpoints with the two
+// identity legs stubbed by headers (same pattern as newAuthzEngine).
+func newOperatorAdminEngine(store httpapi.OperatorAdminStore, rec *stubRecorder) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	engine.Use(func(c *gin.Context) {
@@ -199,29 +233,47 @@ func TestGrantRevokeHandlers(t *testing.T) {
 	g := engine.Group("/admin")
 	g.Use(httpapi.OperatorRequireRole(store, management.RoleAdmin))
 	httpapi.NewAdminAuthHandler(store, rec).RegisterOperators(g)
+	return engine
+}
 
-	// Grant with a forged role field in the body → 400 (strict decoding).
-	body := `{"user_id":"u2","role":"operator","reason":"onboard","role_elevation":"superadmin"}`
+func grantRequest(engine *gin.Engine, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/admin/operators", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-User", "adm-1")
 	req.Header.Set("X-Test-App", "a")
 	w := httptest.NewRecorder()
 	engine.ServeHTTP(w, req)
+	return w
+}
+
+func TestGrantRevokeHandlers(t *testing.T) {
+	uow := &stubUow{}
+	store := &stubOperatorTxStore{
+		stubOperatorStore: stubOperatorStore{roles: map[string][]string{"adm-1": {"admin"}}},
+		uow:               uow,
+	}
+	rec := &stubRecorder{}
+	engine := newOperatorAdminEngine(store, rec)
+
+	// Grant with a forged role field in the body → 400 (strict decoding).
+	w := grantRequest(engine, `{"user_id":"u2","role":"operator","reason":"onboard","role_elevation":"superadmin"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("forged field must be rejected: %d %s", w.Code, w.Body.String())
 	}
 
-	// Valid grant → audited with dual attribution.
-	body = `{"user_id":"u2","role":"operator","reason":"onboard"}`
-	req = httptest.NewRequest(http.MethodPost, "/admin/operators", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Test-User", "adm-1")
-	req.Header.Set("X-Test-App", "a")
-	w = httptest.NewRecorder()
-	engine.ServeHTTP(w, req)
+	// 单值后的尾部脏数据 → 400（评审轮1 m4）。
+	w = grantRequest(engine, `{"user_id":"u2","role":"operator","reason":"onboard"} trailing-garbage`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("trailing data must be rejected: %d %s", w.Code, w.Body.String())
+	}
+
+	// Valid grant → audited with dual attribution, 同事务提交。
+	w = grantRequest(engine, `{"user_id":"u2","role":"operator","reason":"onboard"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("grant: %d %s", w.Code, w.Body.String())
+	}
+	if !uow.committed || uow.rolledBack {
+		t.Fatalf("grant must commit the shared tx: %+v", uow)
 	}
 	if len(rec.events) != 1 || rec.events[0].Action != "permission.grant" {
 		t.Fatalf("grant audit: %+v", rec.events)
@@ -231,19 +283,13 @@ func TestGrantRevokeHandlers(t *testing.T) {
 	}
 
 	// Unknown role → 400.
-	body = `{"user_id":"u2","role":"superuser","reason":"x"}`
-	req = httptest.NewRequest(http.MethodPost, "/admin/operators", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Test-User", "adm-1")
-	req.Header.Set("X-Test-App", "a")
-	w = httptest.NewRecorder()
-	engine.ServeHTTP(w, req)
+	w = grantRequest(engine, `{"user_id":"u2","role":"superuser","reason":"x"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("unknown role: %d", w.Code)
 	}
 
 	// Revoke → audit permission.revoke.
-	req = httptest.NewRequest(http.MethodDelete, "/admin/operators/u2/roles/operator", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/admin/operators/u2/roles/operator", nil)
 	req.Header.Set("X-Test-User", "adm-1")
 	req.Header.Set("X-Test-App", "a")
 	w = httptest.NewRecorder()
@@ -256,3 +302,33 @@ func TestGrantRevokeHandlers(t *testing.T) {
 	}
 }
 
+// 评审轮1 I-2：审计写失败 → 500 且权限变更随审计一起回滚（同生共死）；
+// store 不支持事务时 fail-closed（绝不落下无审计的授权）。
+func TestGrantRole_AuditAndEffectAtomic(t *testing.T) {
+	// 审计失败 → 回滚，不落提交。
+	uow := &stubUow{}
+	store := &stubOperatorTxStore{
+		stubOperatorStore: stubOperatorStore{roles: map[string][]string{"adm-1": {"admin"}}},
+		uow:               uow,
+	}
+	rec := &stubRecorder{txErr: errors.New("audit sink down")}
+	engine := newOperatorAdminEngine(store, rec)
+	w := grantRequest(engine, `{"user_id":"u2","role":"operator","reason":"onboard"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("audit failure = %d, want 500: %s", w.Code, w.Body.String())
+	}
+	if !uow.rolledBack || uow.committed {
+		t.Fatalf("audit failure must roll the grant back: %+v", uow)
+	}
+
+	// store 无事务能力 → fail-closed 500（不是降级为非原子提交）。
+	plain := &stubOperatorStore{roles: map[string][]string{"adm-1": {"admin"}}}
+	engine2 := newOperatorAdminEngine(plain, &stubRecorder{})
+	w = grantRequest(engine2, `{"user_id":"u2","role":"operator","reason":"onboard"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("non-transactional store = %d, want fail-closed 500: %s", w.Code, w.Body.String())
+	}
+	if len(plain.granted) != 0 {
+		t.Fatalf("fail-closed must not apply the grant: %v", plain.granted)
+	}
+}

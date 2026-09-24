@@ -1404,6 +1404,145 @@ LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游�
 
 ---
 
+### Dashboard 运营接口（/admin/ops/*、/admin/users/*）
+
+替代 dashboard 原有的 SSH+psql 直查/直写生产库路径。全部挂在 `adminGroup`（`RateLimit(30,60)` + `InternalAppAuth`），请求头 `X-App-ID` + `X-App-Secret`，鉴权失败一律 401。响应包络 `{code, data, message}`，`code` 等于 HTTP 状态码数字（成功为 0）；`message` 为面向运营的中文文案，调用方直接透传展示即可，不要解析 `code` 做分支。输出时间一律 ISO 8601 UTC 秒级（`2026-09-23T08:00:00Z`）。
+
+#### GET /admin/ops/metrics
+
+运营指标（用户数 / 付费用户 / 营收），替代 dashboard `ops.js` 的 4 条 SQL。
+
+| 参数 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `tz` | 否 | `Asia/Shanghai` | IANA 时区名，`time.LoadLocation` 可加载，否则 400 |
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "users":     { "total": 1000, "today": 3, "week": 20, "month": 80 },
+    "paidUsers": {
+      "cumulative": { "total": 120, "today": 1, "week": 5, "month": 15 },
+      "active":     { "total": 100, "today": 1, "week": 4, "month": 12 }
+    },
+    "revenue":   { "total": 12345.6, "today": 19.9, "week": 99.5, "month": 298.5 }
+  }
+}
+```
+
+口径（与 dashboard 既有 SQL 严格一致）：
+
+- 边界：`today/week/month` 起点 = `tz` 时区内当日 00:00 / 本周一 00:00 / 本月 1 日 00:00（周一起点与 PG `date_trunc('week')` 一致），新增按对应时间戳归属。
+- `users`：`status != 'deleted'` 的用户数；新增按 `users.created_at`。
+- `paidUsers.cumulative`：历史上有过支付成功的去重用户数。支付事实源统一为「每订单最近一次成功支付」（`SELECT order_id, max(paid_at) FROM payments WHERE status='paid' GROUP BY order_id`）再 JOIN orders——一单多次支付尝试不会重复计数；新增按 `paid_at`。
+- `paidUsers.active`：当前持有 `status='active'` 且未过期、套餐 `price > 0` 订阅的去重用户数（排除 free/trial）；新增按 `subscriptions.created_at`。
+- `revenue`：同一支付事实源 JOIN orders 的 `amount` 合计（元）。
+- 无 `downloads` 字段（下载量仍走 nginx 日志路径）。
+
+#### GET /admin/users/search
+
+用户搜索。匹配语义：`users.id` 精确匹配，或昵称 / identity 邮箱 / identity provider_uid 的 ILIKE 模糊匹配（`%`、`_`、`\` 已按字面转义）。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `q` | 是 | trim 后为空 → 400；服务端截断至 64 字符 |
+
+**响应（200）**：按注册时间倒序，最多 20 个用户；无 identity 的用户 `identities` 为空数组。
+
+```json
+{
+  "code": 0,
+  "data": {
+    "users": [
+      {
+        "id": "3f6b0d4e-7c2a-4c1a-9a4b-2f2c0d5e8a11",
+        "nickname": "爱丽丝",
+        "status": "active",
+        "createdAt": "2026-09-01T08:00:00Z",
+        "identities": [
+          { "provider": "wechat", "providerUid": "oXyz...", "email": "a@example.com" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### GET /admin/users/:id
+
+用户详情。`:id` 必须是 canonical UUID（大小写不敏感），否则 400；用户不存在 → 404。
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "user": { "id": "...", "nickname": "爱丽丝", "status": "active", "createdAt": "..." },
+    "identities": [ { "provider": "wechat", "providerUid": "...", "email": null } ],
+    "activeSubscription": {
+      "planId": "monthly",
+      "startedAt": "...",
+      "expiresAt": "2026-10-23T08:00:00Z",
+      "planIsActive": true,
+      "price": 19.9
+    },
+    "history": [
+      { "planId": "monthly", "status": "active", "startedAt": "...", "expiresAt": "...", "createdAt": "..." }
+    ]
+  }
+}
+```
+
+- `activeSubscription` 与 `history` **只覆盖 kaya-membership 会员订阅**（027 后同一用户可同时持有 coding-plan 订阅，不会串入）；无 active 会员订阅时 `activeSubscription` 为 `null`。
+- `expiresAt: null` 表示终身 VIP；`planIsActive: null` 表示套餐行已不存在。
+- `history` 为该用户会员订阅按创建时间倒序最近 5 条。
+
+#### POST /admin/users/:id/vip
+
+给用户的 kaya-membership 会员加时长（唯一写接口）。
+
+**请求**：
+
+- 路径 `:id`：UUID 校验同上。
+- Body（JSON，严格解码，拒绝未知字段）：`{ "days": 30 }`，`days` 为 1–3650 的整数，否则 400。
+- 请求头 `Idempotency-Key`（可选，≤128 字符）：提供时幂等——同一 `(app, key)` 重放返回首次成功的响应，不重复加时长、不写第二条审计。**dashboard 端必须总是携带**（例如每次表单提交生成一个 UUID）。
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "action": "extended",
+    "planId": "monthly",
+    "before": { "planId": "monthly", "expiresAt": "2026-10-01T12:00:00Z" },
+    "after":  { "planId": "monthly", "expiresAt": "2026-10-31T12:00:00Z" }
+  }
+}
+```
+
+- `granted`：用户无 active 会员订阅，新插入 `monthly` 订阅，`before` 为 `null`。
+- `extended`：已有 active 订阅，`expires_at = max(原到期时间, now) + days`（已过期未续期的 active 行从 now 起算）。`trial` 行允许延长（延长的是试用期），前端可按 `planId == "trial"` 提示。
+
+业务规则（服务端唯一事实源，dashboard 不做判断）：
+
+| HTTP | 场景 | message 示例 |
+|---|---|---|
+| 400 | UUID 非法 / days 越界或非整数 / body 含未知字段 / Idempotency-Key 超长 | `非法用户 ID: …`、`非法天数（应为 1-3650 的整数）` |
+| 401 | App 鉴权失败 | （中间件统一响应） |
+| 404 | 用户不存在 | `用户不存在` |
+| 409 | 终身 VIP（`expires_at` 为空） | `该用户是终身 VIP（expires_at 为空），不支持加时长` |
+| 409 | 订阅在已退役套餐上（`is_active` 非 true、套餐行缺失，或 `free`/`quarterly`） | `该订阅在已退役套餐（quarterly）上，需人工处理` |
+| 409 | 预读后订阅被并发取消 | `订阅状态已变化（可能刚被取消），请刷新后重试` |
+| 500 | 内部错误（如 `monthly` 套餐缺失） | `internal error` |
+
+只动 `status='active'` 且 `product_code='kaya-membership'` 的订阅行或插入新行，绝不触碰 `cancelled`/`expired` 行。成功与拒绝（409）都会写 `audit_log` 行（`actor = admin:<app_id>`，`action = vip.grant / vip.extend / vip.reject`，`target = user:<id>`，context 含 days / before_expires_at / after_expires_at / reject_reason / idempotency_key），与订阅变更同一事务提交。
+
+---
+
 ### GitHub OAuth 授权码流程
 
 > **设计原则**：所有 OAuth provider 凭据（client_secret、access_token）由 yunhou 持有并使用，BFF 不接触任何长期秘密。BFF 端只持有 `client_id`（明文）+ 一次性 redirect_uri 白名单条目。

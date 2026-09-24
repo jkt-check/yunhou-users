@@ -11,6 +11,10 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	// 嵌入 IANA 时区库:运行镜像 alpine:3.20 不带 tzdata,而
+	// /admin/ops/metrics 的 tz 参数处理依赖 time.LoadLocation(默认
+	// Asia/Shanghai);没有嵌入库时容器内每个 metrics 请求都会 400。
+	_ "time/tzdata"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
@@ -45,6 +49,12 @@ import (
 
 func main() {
 	_ = godotenv.Load()
+
+	// tzdata 冒烟检查:嵌入库缺失(被裁掉的构建)在启动期就暴露,而不是
+	// 等到第一个 /admin/ops/metrics 请求才 400。
+	if _, err := time.LoadLocation(service.AdminOpsDefaultTZ); err != nil {
+		log.Fatalf("tzdata unavailable: LoadLocation(%q): %v", service.AdminOpsDefaultTZ, err)
+	}
 
 	cfg := config.Load()
 	if err := cfg.Validate(); err != nil {
@@ -230,6 +240,12 @@ func main() {
 	// usage_events (migration 021).
 	usageRepo := repo.NewUsageRepo(db)
 	usageSvc := service.NewUsageService(usageRepo)
+
+	// Dashboard 运营 admin API(dashboard-admin-api spec):运营指标 +
+	// 用户搜索/详情 + VIP 加时长(幂等键表见 migration 037)。
+	adminUsersRepo := repo.NewAdminUsersRepo(db)
+	adminOpsSvc := service.NewAdminOpsService(adminUsersRepo)
+	adminUsersSvc := service.NewAdminUsersService(adminUsersRepo)
 
 	// Inference model catalog (Kaya Coding Plan Task 3): draft CRUD with
 	// optimistic locking, atomic publish/rollback and immutable snapshots
@@ -555,7 +571,7 @@ func main() {
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
 		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps, accessOps,
-		service.NewLLMUsageService(llmUsageRepo), relayHandler)
+		service.NewLLMUsageService(llmUsageRepo), relayHandler, adminOpsSvc, adminUsersSvc)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

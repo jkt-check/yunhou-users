@@ -87,6 +87,13 @@ var (
 
 	// relay entitlement 拒绝(spec §3.1 固定文案,handler 映射 403)。
 	ErrRelayNoAccess = errors.New("remote access requires paid plan")
+
+	// Dashboard 运营 admin API(/admin/ops/metrics、/admin/users/*)。
+	// ErrAdminInvalidParam → 400;ErrAdminVipRejected → 409。均通过
+	// AdminParamError / AdminVipRejection 包装,Error() 即面向运营的
+	// 文案(dashboard 透传 message,不解析 code)。
+	ErrAdminInvalidParam = errors.New("invalid admin parameter")
+	ErrAdminVipRejected  = errors.New("vip operation rejected")
 )
 
 // Normalized codes classifying an upstream 4xx rejection. Surfaced to
@@ -114,3 +121,25 @@ func (e *ChatUpstreamRejection) Error() string {
 }
 
 func (e *ChatUpstreamRejection) Unwrap() error { return ErrChatUpstreamRejected }
+
+// AdminParamError carries a client-safe validation message for the
+// dashboard admin API (invalid tz / empty search query / ...). It unwraps
+// to ErrAdminInvalidParam so handlers map it to 400 while Error() returns
+// exactly the operator-facing text (no sentinel prefix leak).
+type AdminParamError struct {
+	Reason string
+}
+
+func (e *AdminParamError) Error() string { return e.Reason }
+func (e *AdminParamError) Unwrap() error { return ErrAdminInvalidParam }
+
+// AdminVipRejection is a VIP write rejected by a business rule (lifetime
+// VIP, retired plan, concurrent status change). It unwraps to
+// ErrAdminVipRejected → 409; Error() is the operator-facing Chinese
+// message that dashboard renders verbatim.
+type AdminVipRejection struct {
+	Reason string
+}
+
+func (e *AdminVipRejection) Error() string { return e.Reason }
+func (e *AdminVipRejection) Unwrap() error { return ErrAdminVipRejected }

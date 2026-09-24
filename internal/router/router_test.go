@@ -237,6 +237,8 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		nil,   // accessOps
 		nil,   // llmUsageSvc
 		nil,   // relayHandler
+		nil,   // adminOpsSvc
+		nil,   // adminUsersSvc
 	)
 
 	routes := engine.Routes()
@@ -289,6 +291,12 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"GET:/admin/catalog/revisions",
 		"GET:/admin/catalog/active",
 		"GET:/admin/stats/llm-usage",
+		// Dashboard 运营 admin API(dashboard-admin-api spec):挂在
+		// adminGroup(InternalAppAuth 链),与 operator JWT 面无关。
+		"GET:/admin/ops/metrics",
+		"GET:/admin/users/search",
+		"GET:/admin/users/:id",
+		"POST:/admin/users/:id/vip",
 	}
 	for _, w := range want {
 		if !have[w] {
@@ -374,6 +382,8 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		nil,   // accessOps
 		nil,   // llmUsageSvc
 		nil,   // relayHandler
+		nil,   // adminOpsSvc
+		nil,   // adminUsersSvc
 	)
 
 	for _, r := range engine.Routes() {
@@ -406,12 +416,14 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 		nil,      // chatSvc
 		nil,      // chatAccessLog
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
-		false, // wechatOAuthMock
-		false, // wechatPayMock
-		nil,   // usageSvc
+		false,         // wechatOAuthMock
+		false,         // wechatPayMock
+		nil,           // usageSvc
 		nil, nil, nil, // adminModelsHandler, adminOps, accessOps
-		nil,   // llmUsageSvc
+		nil,                          // llmUsageSvc
 		handler.NewRelayHandler(nil), // relayHandler 非 nil = relay 启用
+		nil,                          // adminOpsSvc
+		nil,                          // adminUsersSvc
 	)
 
 	have := make(map[string]bool)

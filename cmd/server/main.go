@@ -231,6 +231,12 @@ func main() {
 	usageRepo := repo.NewUsageRepo(db)
 	usageSvc := service.NewUsageService(usageRepo)
 
+	// Dashboard 运营 admin API(dashboard-admin-api spec):运营指标 +
+	// 用户搜索/详情 + VIP 加时长(幂等键表见 migration 037)。
+	adminUsersRepo := repo.NewAdminUsersRepo(db)
+	adminOpsSvc := service.NewAdminOpsService(adminUsersRepo)
+	adminUsersSvc := service.NewAdminUsersService(adminUsersRepo)
+
 	// Inference model catalog (Kaya Coding Plan Task 3): draft CRUD with
 	// optimistic locking, atomic publish/rollback and immutable snapshots
 	// over migration 024. The LLM_PROVIDERS_JSON import is explicit and
@@ -555,7 +561,7 @@ func main() {
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
 		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps, accessOps,
-		service.NewLLMUsageService(llmUsageRepo), relayHandler)
+		service.NewLLMUsageService(llmUsageRepo), relayHandler, adminOpsSvc, adminUsersSvc)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

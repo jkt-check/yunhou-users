@@ -262,7 +262,7 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 		service.NewGitHubOAuthService(cfg.OAuthStateSecret),
 		service.NewWeChatOAuthService(cfg.OAuthStateSecret),
 		false, true, /* wechatPayMock */
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil)
+		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil)
 
 	// 在售商品 + 支付/权益配置（029 快照源）。
 	if _, err := db.ExecContext(ctx, `

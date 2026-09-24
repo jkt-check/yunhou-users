@@ -85,3 +85,4 @@ syntax, **not** transaction control — those are fine.
 | `034_inference_operations.sql` | 运营面支撑：inference_bulk_imports 批量导入幂等任务表（commit 与目录写入同事务、重复提交重放已记录结果）+ requests/attempts 的 created_at 范围扫描索引（运营统计/异常筛选的真实查询计划；只读派生路径，不引入外部分析库）（Task 15） |
 | `035_lease_indexes_reaper.sql` | 租约热路径索引与收割支撑：concurrency_leases 增 (scope, scope_id, fencing_token DESC) 索引（MAX(fencing) 不再扫 scope 全历史）与终态行部分索引（DeleteTerminalLeases 收割 released/expired 且早于 7 天保留窗口的行，挂 upstream_health 轮次）；wallet_entries 增 (wallet_id, created_at) 索引（支撑月度支出派生）（评审修复批次8） |
 | `036_adjustments_source.sql` | inference_adjustments 增 source 列（cash|bonus，CHECK 约束）：幂等重放载荷比对纳入资金路由来源，同键异 source → 409；micromoney 存量行经 adjustment_id 联 wallet_entries 的 adjustment 分录回填真实来源，microcredit 行无现金/赠送概念保持 NULL（评审轮2 C-I1） |
+| `037_admin_idempotency.sql` | dashboard 运营 admin API 幂等键表 admin_idempotency_keys（UNIQUE(app_id,key)，撞键重放首次 response；与 VIP 订阅变更 + audit_log 同事务提交，只记录成功） |

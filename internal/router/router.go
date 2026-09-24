@@ -46,6 +46,8 @@ func Setup(
 	accessOps *httpapi.AccessOps,
 	llmUsageSvc *service.LLMUsageService,
 	relayHandler *handler.RelayHandler,
+	adminOpsSvc *service.AdminOpsService,
+	adminUsersSvc *service.AdminUsersService,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -61,6 +63,8 @@ func Setup(
 	webhookHandler := handler.NewWebhookHandler(paymentSvc, wechatAPIv3Key, webhookVerifier, wechatPayMock)
 	usageHandler := handler.NewUsageHandler(usageSvc)
 	llmUsageHandler := handler.NewLLMUsageHandler(llmUsageSvc)
+	adminOpsHandler := handler.NewAdminOpsHandler(adminOpsSvc)
+	adminUsersHandler := handler.NewAdminUsersHandler(adminUsersSvc)
 
 	// Public routes (rate limited)
 	publicLimiter := middleware.RateLimit(ctx, 10, 20)
@@ -279,6 +283,15 @@ func Setup(
 
 		// LLM token metering aggregates (migration 022).
 		adminGroup.GET("/stats/llm-usage", llmUsageHandler.GetByModel)
+
+		// Dashboard 运营 API(dashboard-admin-api spec):运营指标、用户
+		// 搜索/详情、VIP 加时长。与 /admin/stats/* 同一条 InternalAppAuth
+		// 链(任何持有效 app secret 的内部服务可调);不挂 opsGroup——那是
+		// inference catalog 的 operator JWT 体系,与本组端点无关。
+		adminGroup.GET("/ops/metrics", adminOpsHandler.GetMetrics)
+		adminGroup.GET("/users/search", adminUsersHandler.SearchUsers)
+		adminGroup.GET("/users/:id", adminUsersHandler.GetUser)
+		adminGroup.POST("/users/:id/vip", adminUsersHandler.AddVip)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

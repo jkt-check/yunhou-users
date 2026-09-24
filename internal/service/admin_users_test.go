@@ -107,6 +107,7 @@ type fakeAdminUsersTx struct {
 
 	insertPlanID   string
 	insertExpiry   time.Time
+	insertErr      error
 	insertCalled   bool
 	extendUpdated  bool
 	extendPlanID   string
@@ -115,6 +116,7 @@ type fakeAdminUsersTx struct {
 	idemStored     json.RawMessage
 	idemInsertOK   bool
 	idemInsertCall bool
+	idemAction     string
 
 	audits []fakeAuditCall
 }
@@ -135,6 +137,9 @@ func (t *fakeAdminUsersTx) FindActiveMembershipForUpdate(_ context.Context, _ st
 
 func (t *fakeAdminUsersTx) InsertMembershipSub(_ context.Context, _ string, _ int) (string, time.Time, error) {
 	t.insertCalled = true
+	if t.insertErr != nil {
+		return "", time.Time{}, t.insertErr
+	}
 	return t.insertPlanID, t.insertExpiry, nil
 }
 
@@ -147,8 +152,9 @@ func (t *fakeAdminUsersTx) GetIdempotencyResponse(_ context.Context, _, _ string
 	return t.idemStored, nil
 }
 
-func (t *fakeAdminUsersTx) InsertIdempotencyKey(_ context.Context, _, _, _, _ string, _ json.RawMessage) (bool, error) {
+func (t *fakeAdminUsersTx) InsertIdempotencyKey(_ context.Context, _, _, action, _ string, _ json.RawMessage) (bool, error) {
 	t.idemInsertCall = true
+	t.idemAction = action
 	return t.idemInsertOK, nil
 }
 
@@ -206,6 +212,11 @@ func TestAddVipDaysGrant(t *testing.T) {
 	}
 	if !fake.tx.idemInsertCall {
 		t.Fatal("idempotency key not recorded")
+	}
+	// 幂等表 action 必须是 vip.grant(与 037 迁移注释/spec §5.3 一致),
+	// 而不是响应里的 "granted"。
+	if fake.tx.idemAction != "vip.grant" {
+		t.Fatalf("idempotency action = %q, want vip.grant", fake.tx.idemAction)
 	}
 }
 
@@ -401,6 +412,53 @@ func TestAddVipDaysIdempotencyRace(t *testing.T) {
 	// Rollback discarded our audit row.
 	if len(fake.tx.audits) != 0 {
 		t.Fatalf("loser audit must roll back: %+v", fake.tx.audits)
+	}
+}
+
+func TestAddVipDaysGrantConflictReplay(t *testing.T) {
+	// 并发同 (app_id, key) 的 grant 路径:双方预读都看到无 active 行
+	// (FOR UPDATE 锁不到不存在的行),败者的 INSERT 撞 027 的部分唯一
+	// 索引 → repo 返回 ErrAdminSubscriptionConflict → 回滚 + 重放赢家响应,
+	// 而不是 500。
+	winner := json.RawMessage(`{"action":"granted","planId":"monthly","before":null,"after":{"planId":"monthly","expiresAt":"2026-10-24T08:00:00Z"}}`)
+	fake := &fakeAdminUsersRepo{
+		tx: &fakeAdminUsersTx{
+			userExists: true,
+			activeRow:  nil,
+			insertErr:  repo.ErrAdminSubscriptionConflict,
+		},
+		replayResponse: winner,
+	}
+	svc := NewAdminUsersService(fake)
+
+	res, err := svc.AddVipDays(context.Background(), "yundash", "admin:yundash", adminTestUserID, 30, "k-grant-race")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if res.Action != "granted" || *res.After.ExpiresAt != "2026-10-24T08:00:00Z" {
+		t.Fatalf("should replay winner response, got %+v", res)
+	}
+	// 回滚:无审计、无幂等键写入残留。
+	if len(fake.tx.audits) != 0 || fake.tx.idemInsertCall {
+		t.Fatalf("loser state must roll back: audits=%+v idem=%v", fake.tx.audits, fake.tx.idemInsertCall)
+	}
+}
+
+func TestAddVipDaysGrantConflictWithoutKey(t *testing.T) {
+	// 同样的唯一索引冲突,但请求没带 Idempotency-Key:没有可重放的响应,
+	// 保持原样上抛(handler 落 500)。
+	fake := &fakeAdminUsersRepo{
+		tx: &fakeAdminUsersTx{
+			userExists: true,
+			activeRow:  nil,
+			insertErr:  repo.ErrAdminSubscriptionConflict,
+		},
+	}
+	svc := NewAdminUsersService(fake)
+
+	_, err := svc.AddVipDays(context.Background(), "yundash", "admin:yundash", adminTestUserID, 30, "")
+	if !errors.Is(err, repo.ErrAdminSubscriptionConflict) {
+		t.Fatalf("err: %v", err)
 	}
 }
 

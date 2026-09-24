@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
+	"github.com/yunhou/users/internal/repo"
 )
 
 // Dashboard 运营 admin API e2e(dashboard-admin-api spec §7 验收矩阵)。
@@ -468,8 +469,9 @@ func TestE2E_AdminVipGrant(t *testing.T) {
 	if exp.Before(want.Add(-time.Hour)) || exp.After(want.Add(time.Hour)) {
 		t.Fatalf("expiresAt %s, want ≈ %s", exp, want)
 	}
-	// DB 落行 + product_code 正确。
-	if got := adminSubExpiry(t, db, uid); !got.Equal(exp) {
+	// DB 落行 + product_code 正确。DB 读回带微秒,响应按 spec §1.3 是
+	// 秒级,按 Unix 秒比较。
+	if got := adminSubExpiry(t, db, uid); got.Unix() != exp.Unix() {
 		t.Fatalf("db expiry %s != response %s", got, exp)
 	}
 	if n := adminAuditCount(t, db, "vip.grant", uid); n != 1 {
@@ -660,7 +662,7 @@ func TestE2E_AdminVipIdempotentReplay(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	exp, _ := time.Parse(time.RFC3339, *first.After.ExpiresAt)
-	if got := adminSubExpiry(t, db, uid); !got.Equal(exp) {
+	if got := adminSubExpiry(t, db, uid); got.Unix() != exp.Unix() {
 		t.Fatalf("db expiry %s != first response %s(重放不得二次写入)", got, exp)
 	}
 	if n := adminAuditCount(t, db, "vip.extend", uid); n != 1 {
@@ -690,5 +692,96 @@ func TestE2E_AdminVipIdempotencyKeyScopedByApp(t *testing.T) {
 	want := time.Now().Add(60 * 24 * time.Hour)
 	if exp.Before(want.Add(-2*time.Hour)) || exp.After(want.Add(2*time.Hour)) {
 		t.Fatalf("expiry %s, want ≈ %s", exp, want)
+	}
+}
+
+func TestE2E_AdminVipCancelledRowUntouched(t *testing.T) {
+	// 规则 1:只动 active 行或 INSERT 新行,绝不触碰 cancelled/expired 行。
+	// 用户只有一条 cancelled 订阅 → 调 VIP 应 granted 插入新 monthly 行,
+	// 旧 cancelled 行的 expires_at 字节不变。
+	engine, _, db := setupE2EServer(t)
+	ctx := context.Background()
+	uid := adminVipUser(t, db)
+
+	cancelledExp := time.Now().Add(-10 * 24 * time.Hour)
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO subscriptions (user_id, plan_id, status, started_at, expires_at, product_code)
+		VALUES ($1, 'monthly', 'cancelled', now() - interval '20 days', $2, 'kaya-membership')
+	`, uid, cancelledExp); err != nil {
+		t.Fatalf("seed cancelled sub: %v", err)
+	}
+
+	code, env := adminPostVip(t, engine, uid, `{"days":30}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("grant over cancelled: code=%d msg=%s", code, env.Message)
+	}
+	var data adminVipData
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if data.Action != "granted" || data.PlanID != "monthly" {
+		t.Fatalf("data: %+v", data)
+	}
+
+	// 旧 cancelled 行的 expires_at 微秒级不变。
+	var gotCancelled time.Time
+	if err := db.QueryRowxContext(ctx, `
+		SELECT expires_at FROM subscriptions
+		 WHERE user_id = $1 AND status = 'cancelled' AND product_code = 'kaya-membership'
+	`, uid).Scan(&gotCancelled); err != nil {
+		t.Fatalf("read cancelled row: %v", err)
+	}
+	if !gotCancelled.Equal(cancelledExp) {
+		t.Fatalf("cancelled row touched: expires_at %s, want %s", gotCancelled, cancelledExp)
+	}
+	// 新 active 行存在且到期时间在未来。
+	if got := adminSubExpiry(t, db, uid); got.Before(time.Now()) {
+		t.Fatalf("new active row expiry in the past: %s", got)
+	}
+}
+
+func TestE2E_AdminExtendMembershipSubNoActiveRow(t *testing.T) {
+	// 矩阵第 10 条的 repo 真库分支:ExtendMembershipSub 的 UPDATE 匹配 0 行
+	// (预读的 active 行被并发取消)→ updated=false、无 error。HTTP 层无法
+	// 确定性复现并发取消,直接驱动 repo 层。
+	_, _, db := setupE2EServer(t)
+	ctx := context.Background()
+	r := repo.NewAdminUsersRepo(db)
+
+	// 用户只有 cancelled 行。
+	uid := adminVipUser(t, db)
+	cancelledExp := time.Now().Add(-10 * 24 * time.Hour)
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO subscriptions (user_id, plan_id, status, started_at, expires_at, product_code)
+		VALUES ($1, 'monthly', 'cancelled', now() - interval '20 days', $2, 'kaya-membership')
+	`, uid, cancelledExp); err != nil {
+		t.Fatalf("seed cancelled sub: %v", err)
+	}
+
+	var updated bool
+	err := r.WithTx(ctx, func(tx repo.AdminUsersTx) error {
+		var err error
+		updated, _, _, err = tx.ExtendMembershipSub(ctx, uid, 30)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("extend cancelled-only user: %v", err)
+	}
+	if updated {
+		t.Fatal("extend on cancelled-only user must report updated=false")
+	}
+
+	// 完全无订阅行的用户同样 updated=false。
+	uid2 := adminVipUser(t, db)
+	err = r.WithTx(ctx, func(tx repo.AdminUsersTx) error {
+		var err error
+		updated, _, _, err = tx.ExtendMembershipSub(ctx, uid2, 30)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("extend no-sub user: %v", err)
+	}
+	if updated {
+		t.Fatal("extend on no-sub user must report updated=false")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -101,7 +102,8 @@ func (h *AdminUsersHandler) AddVip(c *gin.Context) {
 	}
 
 	idemKey := c.GetHeader("Idempotency-Key")
-	if len(idemKey) > adminIdempotencyKeyMaxLen {
+	// 上限按字符(rune)而非字节计,与 spec §5「≤128 字符」一致。
+	if utf8.RuneCountInString(idemKey) > adminIdempotencyKeyMaxLen {
 		writeAdminUsersError(c, http.StatusBadRequest, "Idempotency-Key 过长（上限 128 字符）")
 		return
 	}

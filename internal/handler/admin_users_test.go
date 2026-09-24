@@ -221,6 +221,19 @@ func TestAdminUsersAddVip(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("got %d, want 400", w.Code)
 		}
+		// 上限按字符而非字节:128 个多字节字符(384 字节)合法,129 个非法。
+		svc := &mockAdminUsersSvc{vipRes: &service.AdminVipResult{Action: "granted", PlanID: "monthly"}}
+		engine = adminUsersTestEngine(svc)
+		w = adminRequest(t, engine, http.MethodPost, "/admin/users/"+adminTestUUID+"/vip", `{"days":30}`,
+			map[string]string{"Idempotency-Key": strings.Repeat("密", 128)})
+		if w.Code != http.StatusOK {
+			t.Fatalf("128 runes: got %d, want 200 (%s)", w.Code, w.Body.String())
+		}
+		w = adminRequest(t, engine, http.MethodPost, "/admin/users/"+adminTestUUID+"/vip", `{"days":30}`,
+			map[string]string{"Idempotency-Key": strings.Repeat("密", 129)})
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("129 runes: got %d, want 400", w.Code)
+		}
 	})
 
 	t.Run("args threading and success envelope", func(t *testing.T) {

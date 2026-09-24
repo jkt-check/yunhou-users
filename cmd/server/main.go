@@ -11,6 +11,10 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	// 嵌入 IANA 时区库:运行镜像 alpine:3.20 不带 tzdata,而
+	// /admin/ops/metrics 的 tz 参数处理依赖 time.LoadLocation(默认
+	// Asia/Shanghai);没有嵌入库时容器内每个 metrics 请求都会 400。
+	_ "time/tzdata"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
@@ -45,6 +49,12 @@ import (
 
 func main() {
 	_ = godotenv.Load()
+
+	// tzdata 冒烟检查:嵌入库缺失(被裁掉的构建)在启动期就暴露,而不是
+	// 等到第一个 /admin/ops/metrics 请求才 400。
+	if _, err := time.LoadLocation(service.AdminOpsDefaultTZ); err != nil {
+		log.Fatalf("tzdata unavailable: LoadLocation(%q): %v", service.AdminOpsDefaultTZ, err)
+	}
 
 	cfg := config.Load()
 	if err := cfg.Validate(); err != nil {

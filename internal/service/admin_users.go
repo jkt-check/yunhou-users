@@ -276,8 +276,9 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 	target := "user:" + userID
 
 	var (
-		result    *AdminVipResult
-		rejection *AdminVipRejection
+		result        *AdminVipResult
+		rejection     *AdminVipRejection
+		successAction string
 	)
 
 	err := s.repo.WithTx(ctx, func(tx repo.AdminUsersTx) error {
@@ -335,6 +336,14 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 			// trg_subscriptions_plan_product trigger → generic 500.
 			planID, expiresAt, err := tx.InsertMembershipSub(ctx, userID, days)
 			if err != nil {
+				if idemKey != "" && errors.Is(err, repo.ErrAdminSubscriptionConflict) {
+					// 并发同 (app_id, key) 的 grant:双方预读都看到无
+					// active 行(FOR UPDATE 锁不到不存在的行),败者的
+					// INSERT 撞 idx_subscriptions_user_product_active。
+					// 走与末尾撞键相同的回滚 + 重放赢家路径。
+					result = nil
+					return errAdminIdemRace
+				}
 				return fmt.Errorf("insert membership subscription: %w", err)
 			}
 			result = &AdminVipResult{
@@ -342,6 +351,7 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 				PlanID: planID,
 				After:  &AdminVipSub{PlanID: planID, ExpiresAt: adminTimePtr(&expiresAt)},
 			}
+			successAction = adminVipActionGrant
 			if err := s.writeVipAudit(ctx, tx, actor, adminVipActionGrant, target, days, nil, result.After.ExpiresAt, idemKey); err != nil {
 				return err
 			}
@@ -370,6 +380,7 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 				Before: &AdminVipSub{PlanID: cur.PlanID, ExpiresAt: adminTimePtr(cur.ExpiresAt)},
 				After:  &AdminVipSub{PlanID: planID, ExpiresAt: adminTimePtr(&expiresAt)},
 			}
+			successAction = adminVipActionExtend
 			if err := s.writeVipAudit(ctx, tx, actor, adminVipActionExtend, target, days, result.Before.ExpiresAt, result.After.ExpiresAt, idemKey); err != nil {
 				return err
 			}
@@ -382,7 +393,7 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 			if err != nil {
 				return fmt.Errorf("marshal idempotent response: %w", err)
 			}
-			inserted, err := tx.InsertIdempotencyKey(ctx, appID, idemKey, "vip."+result.Action, target, payload)
+			inserted, err := tx.InsertIdempotencyKey(ctx, appID, idemKey, successAction, target, payload)
 			if err != nil {
 				return fmt.Errorf("insert idempotency key: %w", err)
 			}

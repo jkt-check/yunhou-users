@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // This file backs the dashboard ops admin API (dashboard-admin-api spec):
@@ -155,6 +156,21 @@ var _ AdminUsersRepo = (*adminUsersRepo)(nil)
 // on the membership product only (spec §4 — 027 made subscriptions
 // multi-product; coding-plan rows must never leak in).
 const adminMembershipProduct = "kaya-membership"
+
+// ErrAdminSubscriptionConflict marks a unique-constraint violation
+// (SQLSTATE 23505) from InsertMembershipSub: a concurrent grant for the
+// same (user, kaya-membership) won the partial unique index
+// idx_subscriptions_user_product_active. The service layer turns it into
+// an idempotent replay when the request carries an Idempotency-Key.
+var ErrAdminSubscriptionConflict = errors.New("admin: subscription insert conflict")
+
+// isAdminUniqueViolation reports whether err is a Postgres
+// unique-constraint violation (SQLSTATE 23505), lib/pq flavour (same
+// detection as service.isDuplicateKey).
+func isAdminUniqueViolation(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505"
+}
 
 func (r *adminUsersRepo) SearchUsers(ctx context.Context, exact, likePattern string) ([]AdminUserSearchRow, error) {
 	rows := []AdminUserSearchRow{}
@@ -361,6 +377,11 @@ func (t *adminUsersTx) InsertMembershipSub(ctx context.Context, userID string, d
 		RETURNING plan_id, expires_at
 	`, userID, days, adminMembershipProduct).Scan(&planID, &expiresAt)
 	if err != nil {
+		if isAdminUniqueViolation(err) {
+			// 并发 grant(同 key 或无 key)赢了部分唯一索引 —— 由 service
+			// 层决定重放(带 Idempotency-Key)还是 500。
+			return "", time.Time{}, ErrAdminSubscriptionConflict
+		}
 		return "", time.Time{}, err
 	}
 	return planID, expiresAt, nil

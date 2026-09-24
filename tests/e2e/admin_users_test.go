@@ -703,7 +703,8 @@ func TestE2E_AdminVipCancelledRowUntouched(t *testing.T) {
 	ctx := context.Background()
 	uid := adminVipUser(t, db)
 
-	cancelledExp := time.Now().Add(-10 * 24 * time.Hour)
+	// PG timestamptz 为微秒精度,截断种子时间以便与 DB 读回值比较。
+	cancelledExp := time.Now().Add(-10 * 24 * time.Hour).Truncate(time.Microsecond)
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO subscriptions (user_id, plan_id, status, started_at, expires_at, product_code)
 		VALUES ($1, 'monthly', 'cancelled', now() - interval '20 days', $2, 'kaya-membership')
@@ -731,7 +732,7 @@ func TestE2E_AdminVipCancelledRowUntouched(t *testing.T) {
 	`, uid).Scan(&gotCancelled); err != nil {
 		t.Fatalf("read cancelled row: %v", err)
 	}
-	if !gotCancelled.Equal(cancelledExp) {
+	if gotCancelled.UnixMicro() != cancelledExp.UnixMicro() {
 		t.Fatalf("cancelled row touched: expires_at %s, want %s", gotCancelled, cancelledExp)
 	}
 	// 新 active 行存在且到期时间在未来。

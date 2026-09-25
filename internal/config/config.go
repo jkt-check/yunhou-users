@@ -219,6 +219,12 @@ type Config struct {
 	// when InferenceKayaChatGateway is on.
 	KayaChatModel string
 
+	// InferenceLifecycleEnforce switches the gateway's non-active-model
+	// lifecycle gate from observe (log + alert only, 默认) to enforce
+	// (retired/draft 直达 → 403 model_not_allowed). 观察期排查确认影响面
+	// 可控前不得开启 (安全审查 I-6, 见 gateway/lifecycle_gate.go)。
+	InferenceLifecycleEnforce bool
+
 	// Settlement recovery worker (Task 9): pass interval, per-pass batch
 	// cap, staleness grace (must exceed the 15s settlement deadline so live
 	// requests are never swept), and the reconciliation evidence window.
@@ -316,6 +322,7 @@ func Load() *Config {
 		InferenceAccountRPM:        parseIntOr(envOr("INFERENCE_ACCOUNT_RPM", "120"), 120),
 		InferenceKayaChatGateway:   os.Getenv("INFERENCE_KAYA_CHAT_GATEWAY") == "1",
 		KayaChatModel:              os.Getenv("KAYA_CHAT_MODEL"),
+		InferenceLifecycleEnforce:  os.Getenv("INFERENCE_LIFECYCLE_ENFORCE") == "1",
 
 		InferenceRecoveryInterval:        parseDurationOr(envOr("INFERENCE_RECOVERY_INTERVAL", "30s"), 30*time.Second),
 		InferenceRecoveryBatch:           parseIntOr(envOr("INFERENCE_RECOVERY_BATCH", "100"), 100),

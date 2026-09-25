@@ -122,6 +122,14 @@ type fixture struct {
 	accountUpID  string
 	policyID     string
 	priceID      string
+	// modelLifecycle overrides the snapshot model lifecycle (I-6 gate tests);
+	// zero value = active.
+	modelLifecycle domain.Lifecycle
+}
+
+// withModelLifecycle pins the snapshot model at a non-active lifecycle.
+func withModelLifecycle(lc domain.Lifecycle) fixtureOpt {
+	return func(f *fixture) { f.modelLifecycle = lc }
 }
 
 type fixtureOpt func(f *fixture)
@@ -317,10 +325,14 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 	}
 
 	// Static catalog snapshot pinned over the same rows.
+	modelLC := f.modelLifecycle
+	if modelLC == "" {
+		modelLC = domain.LifecycleActive
+	}
 	f.snap = &catalog.Snapshot{
 		Revision: 1,
 		Models: map[string]domain.Model{f.modelID: {
-			ID: f.modelID, DisplayName: "GLM 4.6", Lifecycle: domain.LifecycleActive,
+			ID: f.modelID, DisplayName: "GLM 4.6", Lifecycle: modelLC,
 			ContextTokens: 200000, MaxOutputTokens: 8192,
 			Protocols:         []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
 			InputModalities:   []string{"text"},

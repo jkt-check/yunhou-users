@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/jmoiron/sqlx"
 
 	"github.com/yunhou/users/internal/inference/catalog"
+	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/inference/management"
@@ -138,6 +140,22 @@ func newOpsFixture(t *testing.T) *opsFixture {
 	usageH.RegisterRead(usageGroup)
 	billingGroup := engine.Group("/adminb", stub, httpapi.OperatorAuthz(store, management.PermBillingAdjust))
 	adjH.Register(billingGroup)
+
+	// 凭据/可调度账号面（credentials:manage）：OAuth handler 提供既有的
+	// GET /upstream-accounts 读面（oauth/refresh 服务在本夹具中不调用）。
+	keyBytes := make([]byte, credentials.KeyLen)
+	if _, err := rand.Read(keyBytes); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := credentials.NewVault(map[int][]byte{1: keyBytes}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credSvc := credentials.NewService(vault, store, store)
+	credGroup := engine.Group("/adminc", stub, httpapi.OperatorAuthz(store, management.PermCredentialsManage))
+	httpapi.NewAdminCredentialsHandler(credSvc).Register(credGroup)
+	httpapi.NewAdminOAuthHandler(nil, nil, store).Register(credGroup)
+	httpapi.NewAdminAccountsHandler(credentials.NewAccountService(store, store)).Register(credGroup)
 
 	return &opsFixture{db: db, store: store, engine: engine}
 }

@@ -89,6 +89,28 @@ func TestAccountPool_ZeroNoResetExhausted(t *testing.T) {
 	}
 }
 
+func TestAccountPool_ZeroConcurrencySkipped(t *testing.T) {
+	// concurrency_limit 0 = 备而不用（落库合法、不入候选序）。
+	out := candidatesForAccounts(t, []domain.UpstreamAccount{
+		account("a-parked", "prov", 0),
+		account("a-live", "prov", 1),
+	})
+	if len(out) != 1 || out[0].Account.ID != "a-live" {
+		ids := []string{}
+		for _, c := range out {
+			ids = append(ids, c.Account.ID)
+		}
+		t.Fatalf("concurrency 0 account must be skipped, got %v", ids)
+	}
+	// 唯一账号是 0 并发时,候选为空(而不是以有效并发 1 放行)。
+	out = candidatesForAccounts(t, []domain.UpstreamAccount{
+		account("a-parked-only", "prov", 0),
+	})
+	if len(out) != 0 {
+		t.Fatalf("parked-only provider must yield no candidates, got %d", len(out))
+	}
+}
+
 func TestAccountHealth_SchedulableComposition(t *testing.T) {
 	fs := newFakeStore()
 	svc := NewService(fs, nil, nil)
@@ -112,5 +134,9 @@ func TestAccountHealth_SchedulableComposition(t *testing.T) {
 	h := svc.HealthOf(cooled)
 	if h.Schedulable || h.CoolingUntil == nil {
 		t.Fatalf("cooling account must report cooling window: %+v", h)
+	}
+	parked := account("a5", "prov", 0)
+	if svc.HealthOf(parked).Schedulable {
+		t.Fatal("concurrency 0 (parked) account must not be schedulable")
 	}
 }

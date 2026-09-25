@@ -333,6 +333,8 @@ func main() {
 		Credentials:  inferencehttpapi.NewAdminCredentialsHandler(credSvc),
 		Auth:         inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
 		OAuth:        inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
+		// 可调度账号管理面（凭据→账号绑定/启停/调并发），同 credentials:manage。
+		Accounts: inferencehttpapi.NewAdminAccountsHandler(inferencecredentials.NewAccountService(infStore, infStore)),
 		// Task 15: 补偿/冲正带同事务追加审计；补偿列表经运营读模型。
 		Adjustments: inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil, infStore, opsViewSvc),
 		// Task 15: 批量导入（dry-run/逐项错误/幂等任务 ID/绝不半发布）。

@@ -161,30 +161,8 @@ func (h *AdminOAuthHandler) ListAccounts(c *gin.Context) {
 		return
 	}
 	views := make([]accountView, 0, len(accounts))
-	for _, a := range accounts {
-		v := accountView{
-			ID: a.ID, ProviderID: a.ProviderID, CredentialID: a.CredentialID,
-			ExternalAccountID: a.ExternalAccountID, DisplayName: a.DisplayName,
-			Status: string(a.Status), ConcurrencyLimit: a.ConcurrencyLimit,
-			QuotaSource: a.Quota.Source,
-		}
-		if a.Quota.LimitMicros != nil {
-			n := int64(*a.Quota.LimitMicros)
-			v.QuotaLimitMicros = &n
-		}
-		if a.Quota.RemainingMicros != nil {
-			n := int64(*a.Quota.RemainingMicros)
-			v.QuotaRemainingMicros = &n
-		}
-		if a.Quota.ObservedAt != nil {
-			s := a.Quota.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z")
-			v.QuotaObservedAt = &s
-		}
-		if a.Quota.ResetAt != nil {
-			s := a.Quota.ResetAt.UTC().Format("2006-01-02T15:04:05.999999999Z")
-			v.QuotaResetAt = &s
-		}
-		views = append(views, v)
+	for i := range accounts {
+		views = append(views, toAccountView(&accounts[i]))
 	}
 	ok(c, gin.H{"accounts": views})
 }

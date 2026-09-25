@@ -65,6 +65,7 @@ func atomicSetup(t *testing.T) (*sqlx.DB, *postgres.Store, *credentials.Service,
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() {
+		db.Exec(`DELETE FROM inference_session_bindings WHERE account_id IN (SELECT id FROM inference_upstream_accounts WHERE provider_id IN (SELECT id FROM inference_providers WHERE code = 'task4atomic'))`)
 		db.Exec(`DELETE FROM inference_upstream_accounts WHERE provider_id IN (SELECT id FROM inference_providers WHERE code = 'task4atomic')`)
 		db.Exec(`DELETE FROM inference_credentials WHERE provider_id IN (SELECT id FROM inference_providers WHERE code = 'task4atomic')`)
 		db.Exec(`DELETE FROM inference_audit_log WHERE actor_app_id = 'task4-atomic-app'`)

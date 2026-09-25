@@ -267,6 +267,23 @@ func TestLeaseLifecycle_AcquireCheckRenewRelease(t *testing.T) {
 	}
 }
 
+func TestAcquireUpstreamLease_ZeroConcurrencyRejected(t *testing.T) {
+	// 0 = 备而不用：租约层是候选过滤之外的兜底,按容量耗尽拒绝,
+	// 绝不静默把 0 当 1 放行。
+	fs := newFakeStore()
+	svc := NewService(fs, nil, nil)
+	_, err := svc.AcquireUpstreamLease(context.Background(), nil,
+		account("acct-1", "prov-a", 0), "req-1", svc.clock.Now())
+	if domain.CodeOf(err) != domain.CodeInsufficientCapacity {
+		t.Fatalf("code = %s, want insufficient_capacity (err=%v)", domain.CodeOf(err), err)
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if len(fs.leases) != 0 {
+		t.Fatalf("parked account must not take a lease, got %d", len(fs.leases))
+	}
+}
+
 func TestLeaseKeeper_RenewsAndReleases(t *testing.T) {
 	fs := newFakeStore()
 	svc := NewService(fs, nil, nil)

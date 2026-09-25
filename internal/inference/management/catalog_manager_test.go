@@ -26,6 +26,12 @@ type fakeCatalogStore struct {
 	deployments map[string]*domain.Deployment
 	routes      map[string]*domain.ModelRoute
 	revisions   []*domain.ConfigRevision
+	// publishErr 注入发布事务失败（安全审查 M-2：激活失败模拟）。
+	publishErr error
+	// txReads 统计经发布事务快照完成的读次数；directListCalls 统计绕过
+	// 事务的直接列表调用（安全审查 M-3 测试断言发布全程只走事务）。
+	txReads         int
+	directListCalls int
 }
 
 func newFakeCatalogStore() *fakeCatalogStore {
@@ -47,12 +53,17 @@ func (f *fakeCatalogStore) GetModel(ctx context.Context, id string) (*domain.Mod
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "model")
 }
-func (f *fakeCatalogStore) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+func (f *fakeCatalogStore) listModels(filter domain.ModelFilter) ([]domain.Model, error) {
 	out := []domain.Model{}
 	for _, m := range f.models {
 		out = append(out, *m)
 	}
 	return out, nil
+}
+
+func (f *fakeCatalogStore) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+	f.directListCalls++
+	return f.listModels(filter)
 }
 func (f *fakeCatalogStore) UpdateModel(ctx context.Context, m *domain.Model) error {
 	return f.InsertModel(ctx, m)
@@ -82,12 +93,17 @@ func (f *fakeCatalogStore) GetProviderByCode(ctx context.Context, code string) (
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "provider")
 }
-func (f *fakeCatalogStore) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+func (f *fakeCatalogStore) listProviders() []domain.Provider {
 	out := []domain.Provider{}
 	for _, p := range f.providers {
 		out = append(out, *p)
 	}
-	return out, nil
+	return out
+}
+
+func (f *fakeCatalogStore) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+	f.directListCalls++
+	return f.listProviders(), nil
 }
 func (f *fakeCatalogStore) UpdateProvider(ctx context.Context, p *domain.Provider) error {
 	return f.InsertProvider(ctx, p)
@@ -117,12 +133,17 @@ func (f *fakeCatalogStore) FindDeployment(ctx context.Context, providerID, upstr
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "deployment")
 }
-func (f *fakeCatalogStore) ListDeployments(ctx context.Context, flt domain.DeploymentFilter) ([]domain.Deployment, error) {
+func (f *fakeCatalogStore) listDeployments() []domain.Deployment {
 	out := []domain.Deployment{}
 	for _, d := range f.deployments {
 		out = append(out, *d)
 	}
-	return out, nil
+	return out
+}
+
+func (f *fakeCatalogStore) ListDeployments(ctx context.Context, flt domain.DeploymentFilter) ([]domain.Deployment, error) {
+	f.directListCalls++
+	return f.listDeployments(), nil
 }
 func (f *fakeCatalogStore) UpdateDeployment(ctx context.Context, d *domain.Deployment) error {
 	return f.InsertDeployment(ctx, d)
@@ -146,14 +167,19 @@ func (f *fakeCatalogStore) GetRoute(ctx context.Context, id string) (*domain.Mod
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "route")
 }
-func (f *fakeCatalogStore) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+func (f *fakeCatalogStore) listRoutes(modelID string) []domain.ModelRoute {
 	out := []domain.ModelRoute{}
 	for _, r := range f.routes {
 		if r.ModelID == modelID {
 			out = append(out, *r)
 		}
 	}
-	return out, nil
+	return out
+}
+
+func (f *fakeCatalogStore) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+	f.directListCalls++
+	return f.listRoutes(modelID), nil
 }
 func (f *fakeCatalogStore) UpdateRoute(ctx context.Context, r *domain.ModelRoute) error {
 	cp := *r
@@ -172,8 +198,10 @@ func (f *fakeCatalogStore) ActivateRevision(ctx context.Context, scope domain.Co
 	for _, r := range f.revisions {
 		if r.Revision == revision {
 			r.Status = domain.RevisionPublished
-		} else if r.Status == domain.RevisionPublished {
+			r.IsActive = true
+		} else if r.IsActive {
 			r.Status = domain.RevisionSuperseded
+			r.IsActive = false
 		}
 	}
 	return nil
@@ -195,11 +223,94 @@ func (f *fakeCatalogStore) GetRevision(ctx context.Context, scope domain.ConfigS
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "revision")
 }
-func (f *fakeCatalogStore) ListRevisions(ctx context.Context, scope domain.ConfigScope) ([]domain.ConfigRevision, error) {
-	return nil, nil
+func (f *fakeCatalogStore) ListRevisionMetas(ctx context.Context, scope domain.ConfigScope, afterRevision, limit int) ([]domain.RevisionMeta, error) {
+	out := []domain.RevisionMeta{}
+	for _, r := range f.revisions {
+		if afterRevision > 0 && r.Revision >= afterRevision {
+			continue
+		}
+		out = append(out, domain.RevisionMeta{
+			ID: r.ID, Scope: r.Scope, Revision: r.Revision, Status: r.Status,
+			IsActive: r.IsActive, PublishedAt: r.PublishedAt,
+			CreatedBy: r.CreatedBy, CreatedAt: r.CreatedAt,
+		})
+	}
+	return out, nil
+}
+func (f *fakeCatalogStore) ActiveRevisionMeta(ctx context.Context, scope domain.ConfigScope) (*domain.RevisionMeta, error) {
+	if len(f.revisions) == 0 {
+		return nil, domain.NewError(domain.CodeNotFound, "revision")
+	}
+	r := f.revisions[len(f.revisions)-1]
+	return &domain.RevisionMeta{
+		ID: r.ID, Scope: r.Scope, Revision: r.Revision, Status: r.Status,
+		IsActive: r.IsActive, PublishedAt: r.PublishedAt,
+		CreatedBy: r.CreatedBy, CreatedAt: r.CreatedAt,
+	}, nil
 }
 func (f *fakeCatalogStore) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
 	return len(f.revisions), nil
+}
+
+// fakePublishTx models catalog.PublishTx：InsertAndActivateRevision 先失败后
+// 追加（模拟同一事务的提交/回滚原子性——失败路径不留任何修订行）。读方法
+// 全部委托给 store 并计入 txReads（安全审查 M-3：发布抽取必须走事务快照）。
+type fakePublishTx struct {
+	store      *fakeCatalogStore
+	committed  bool
+	rolledBack bool
+}
+
+func (f *fakeCatalogStore) BeginPublish(ctx context.Context) (catalog.PublishTx, error) {
+	return &fakePublishTx{store: f}, nil
+}
+
+func (t *fakePublishTx) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+	t.store.txReads++
+	return t.store.listModels(filter)
+}
+
+func (t *fakePublishTx) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+	t.store.txReads++
+	return t.store.listProviders(), nil
+}
+
+func (t *fakePublishTx) ListDeployments(ctx context.Context, flt domain.DeploymentFilter) ([]domain.Deployment, error) {
+	t.store.txReads++
+	return t.store.listDeployments(), nil
+}
+
+func (t *fakePublishTx) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+	t.store.txReads++
+	return t.store.listRoutes(modelID), nil
+}
+
+func (t *fakePublishTx) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
+	return len(t.store.revisions), nil
+}
+
+func (t *fakePublishTx) GetRevision(ctx context.Context, scope domain.ConfigScope, revision int) (*domain.ConfigRevision, error) {
+	return t.store.GetRevision(ctx, scope, revision)
+}
+
+func (t *fakePublishTx) InsertAndActivateRevision(ctx context.Context, rev *domain.ConfigRevision) error {
+	if t.store.publishErr != nil {
+		return t.store.publishErr // 模拟同事务回滚：一行不留
+	}
+	t.store.revisions = append(t.store.revisions, rev)
+	return t.store.ActivateRevision(ctx, rev.Scope, rev.Revision)
+}
+
+func (t *fakePublishTx) Commit(ctx context.Context) error {
+	t.committed = true
+	return nil
+}
+
+func (t *fakePublishTx) Rollback(ctx context.Context) error {
+	if !t.committed {
+		t.rolledBack = true
+	}
+	return nil
 }
 
 // spyRecorder captures audit events.
@@ -272,7 +383,7 @@ func TestCatalogManager_CRUDRecordsAudit(t *testing.T) {
 
 	// 部署写路径的 egress 校验：https 放行。
 	dep := &domain.Deployment{
-		ID: uuid.NewString(),
+		ID:         uuid.NewString(),
 		ProviderID: prov.ID, UpstreamModel: "up", BaseURL: "https://api.glm.example.com",
 		Protocol: domain.ProtocolOpenAIChat, ConnectTimeout: time.Second, RequestTimeout: time.Second,
 		Status: domain.DeploymentDraft, ConfigVersion: 1,
@@ -438,5 +549,148 @@ func TestCatalogManager_AuditFailureStillSucceeds(t *testing.T) {
 	}
 	if _, err := fs.GetModel(ctx, "m-audit-fail"); err != nil {
 		t.Fatal("mutation must be effective despite audit failure")
+	}
+}
+
+// 安全审查 M-2：发布事务内激活失败必须整体回滚——不得留下孤儿 draft 修订，
+// 错误本身要干净透出（调用方重试是安全的）。
+func TestCatalogManager_PublishActivationFailureLeavesNoOrphanDraft(t *testing.T) {
+	fs := newFakeCatalogStore()
+	fs.publishErr = errors.New("activation boom")
+	mgr := NewCatalogManager(catalog.NewService(fs), &spyRecorder{}, nil)
+	ctx := context.Background()
+
+	if _, err := mgr.Publish(ctx, managerActor()); err == nil {
+		t.Fatal("activation failure must surface as publish error")
+	}
+	if len(fs.revisions) != 0 {
+		t.Fatalf("orphan draft revision left after failed activation: %+v", fs.revisions)
+	}
+
+	// 失败后的重试是安全的：恢复存储后同一发布成功落到 revision 1。
+	fs.publishErr = nil
+	rev, err := mgr.Publish(ctx, managerActor())
+	if err != nil || rev != 1 {
+		t.Fatalf("retry after transient failure = %d, %v; want 1, nil", rev, err)
+	}
+	if len(fs.revisions) != 1 || fs.revisions[0].Status != domain.RevisionPublished || !fs.revisions[0].IsActive {
+		t.Fatalf("retried revision = %+v, want published+active", fs.revisions[0])
+	}
+}
+
+// 安全审查 M-3：发布的目录抽取必须全部经由发布事务（REPEATABLE READ 快照，
+// 见 postgres.BeginPublish），不得绕过事务直接读 store——否则并发编辑能在
+// 抽取中途造出自相矛盾的 payload。
+func TestCatalogManager_PublishDrainsThroughSingleTx(t *testing.T) {
+	fs := newFakeCatalogStore()
+	mgr := NewCatalogManager(catalog.NewService(fs), &spyRecorder{}, nil)
+	ctx := context.Background()
+
+	// 造一个最小可发布目录。
+	if err := mgr.CreateProvider(ctx, managerActor(), &domain.Provider{
+		ID: uuid.NewString(), Code: "snap", DisplayName: "S", AccessType: domain.AccessOfficialAPI,
+	}, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CreateModel(ctx, managerActor(), &domain.Model{
+		ID: "snap-m", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols: []domain.Protocol{domain.ProtocolOpenAIChat},
+	}, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	fs.directListCalls = 0
+
+	if _, err := mgr.Publish(ctx, managerActor()); err != nil {
+		t.Fatal(err)
+	}
+	if fs.directListCalls != 0 {
+		t.Errorf("publish drained %d reads outside the publish tx; all reads must share one snapshot", fs.directListCalls)
+	}
+	// models/providers/deployments/routes 四类抽取都走了事务（路由按模型逐个抽取）。
+	if fs.txReads < 4 {
+		t.Errorf("tx reads = %d, want ≥4 (models/providers/deployments/routes)", fs.txReads)
+	}
+}
+
+// 安全审查 M-2（跟进）：回滚与发布同构——插入+激活在同一事务，激活失败
+// 必须整体回滚，不得留下孤儿 draft 修订；错误干净透出，重试安全。
+func TestCatalogManager_RollbackActivationFailureLeavesNoOrphanDraft(t *testing.T) {
+	fs := newFakeCatalogStore()
+	mgr := NewCatalogManager(catalog.NewService(fs), &spyRecorder{}, nil)
+	ctx := context.Background()
+
+	if _, err := mgr.Publish(ctx, managerActor()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fs.revisions) != 1 {
+		t.Fatalf("revisions = %d, want 1 after publish", len(fs.revisions))
+	}
+
+	fs.publishErr = errors.New("activation boom")
+	if _, err := mgr.Rollback(ctx, managerActor(), 1); err == nil {
+		t.Fatal("activation failure must surface as rollback error")
+	}
+	if len(fs.revisions) != 1 {
+		t.Fatalf("orphan draft revision left after failed rollback: %+v", fs.revisions)
+	}
+
+	// 失败后的重试是安全的：恢复存储后同一回滚成功落到 revision 2。
+	fs.publishErr = nil
+	rev, err := mgr.Rollback(ctx, managerActor(), 1)
+	if err != nil || rev != 2 {
+		t.Fatalf("retry after transient failure = %d, %v; want 2, nil", rev, err)
+	}
+	if len(fs.revisions) != 2 || fs.revisions[1].Status != domain.RevisionPublished || !fs.revisions[1].IsActive {
+		t.Fatalf("retried revision = %+v, want published+active", fs.revisions[1])
+	}
+}
+
+// 安全审查 I-7：审计补写失败必须触发告警钩子（默认 AUDIT_WRITE_FAILED
+// 结构化 ERROR 日志，生产接 on-call 通道），携带正确的动作/对象/归因；操作
+// 结果本身不变——变更已提交是事实，审计缺失是告警而非可回滚状态。
+func TestCatalogManager_AuditFailureInvokesAlertHook(t *testing.T) {
+	fs := newFakeCatalogStore()
+	mgr := NewCatalogManager(catalog.NewService(fs), failingRecorder{err: errors.New("audit backend down")}, nil)
+	ctx := context.Background()
+
+	var alerts []AuditEvent
+	var causes []error
+	prev := AuditAlertHook
+	AuditAlertHook = func(ctx context.Context, ev AuditEvent, cause error) {
+		alerts = append(alerts, ev)
+		causes = append(causes, cause)
+	}
+	t.Cleanup(func() { AuditAlertHook = prev })
+
+	if err := mgr.CreateModel(ctx, managerActor(), &domain.Model{
+		ID: "m-alert", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols: []domain.Protocol{domain.ProtocolOpenAIChat},
+	}, "probe"); err != nil {
+		t.Fatalf("mutation must succeed despite audit failure: %v", err)
+	}
+	if _, err := fs.GetModel(ctx, "m-alert"); err != nil {
+		t.Fatal("mutation must be effective despite audit failure")
+	}
+
+	if len(alerts) != 1 {
+		t.Fatalf("alert hook invocations = %d, want 1", len(alerts))
+	}
+	ev := alerts[0]
+	if ev.Action != "model.create" || ev.ObjectType != "model" || ev.ObjectID != "m-alert" {
+		t.Errorf("alert event = %+v, want model.create/model/m-alert", ev)
+	}
+	if ev.ActorUser != "op-1" || ev.ActorApp != "ops" {
+		t.Errorf("alert attribution = %s/%s", ev.ActorUser, ev.ActorApp)
+	}
+	if len(causes) != 1 || causes[0] == nil {
+		t.Errorf("alert cause = %v, want the recorder error", causes)
+	}
+
+	// Publish 失败审计同样告警（catalog.publish 的 objectID 为空串是既定形状）。
+	if _, err := mgr.Publish(ctx, managerActor()); err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 2 || alerts[1].Action != "catalog.publish" {
+		t.Fatalf("publish audit failure must alert: %+v", alerts)
 	}
 }

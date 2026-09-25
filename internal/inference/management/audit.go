@@ -6,10 +6,22 @@ package management
 
 import (
 	"context"
+	"log"
 	"strings"
 
 	"github.com/yunhou/users/internal/inference/domain"
 )
+
+// AuditAlertHook 是审计补写失败时的告警通道（安全审查 I-7）。catalog 写面
+// 的审计在业务变更提交后补写，失败无法回滚已生效的变更——但失败绝不允许
+// 只剩一句 log.Printf：默认实现输出带 AUDIT_WRITE_FAILED 标记的结构化
+// ERROR 日志（含动作/对象/双腿归因，便于巡检规则命中）；生产应在启动时把
+// 它接到 on-call 通道（pager/webhook），与 SnapshotCache.OnRefreshError
+// 同级的「响亮失败」约定。不得静默丢弃。调用方保证 hook 非 nil 且不 panic。
+var AuditAlertHook = func(ctx context.Context, ev AuditEvent, cause error) {
+	log.Printf("AUDIT_WRITE_FAILED action=%s object=%s/%s actor=%s/%s reason=%q err=%v — 变更已生效但审计缺失，需人工补录",
+		ev.Action, ev.ObjectType, ev.ObjectID, ev.ActorUser, ev.ActorApp, ev.Reason, cause)
+}
 
 // AuditEvent is one management audit fact. ActorUser is the server-verified
 // user JWT subject; ActorApp is the verified X-App-ID service identity. Both

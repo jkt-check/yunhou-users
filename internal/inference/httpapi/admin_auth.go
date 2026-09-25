@@ -286,11 +286,17 @@ func (h *AdminAuthHandler) GrantRole(c *gin.Context) {
 }
 
 // RevokeRole DELETE /operators/:user_id/roles/:role — idempotent.
-// 撤销与审计同事务提交（评审轮1 I-2）。
+// 撤销与审计同事务提交（评审轮1 I-2）。reason 经 ?reason= 必填（安全审查
+// M-6）：撤销是最高危的权限变更，审计理由必须来自调用方，不得再硬编码
+// "admin revoke" 这类无归因文案。
 func (h *AdminAuthHandler) RevokeRole(c *gin.Context) {
 	userID, role := c.Param("user_id"), c.Param("role")
 	if !management.ValidRole(role) {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "role must be admin, operator or auditor"))
+		return
+	}
+	reason, okReason := requiredReason(c, c.Query("reason"))
+	if !okReason {
 		return
 	}
 	txStore, txAudit, err := h.grantAuditSupport()
@@ -313,7 +319,7 @@ func (h *AdminAuthHandler) RevokeRole(c *gin.Context) {
 	}
 	if err := txAudit.RecordTx(ctx, uow, management.AuditEvent{
 		Action: "permission.revoke", ObjectType: "permission", ObjectID: userID + ":" + role,
-		Reason: "admin revoke", ActorUser: op.UserID, ActorApp: op.AppID,
+		Reason: reason, ActorUser: op.UserID, ActorApp: op.AppID,
 		Detail: management.SanitizeDetail(map[string]any{"role": role, "revoked": revoked}),
 	}); err != nil {
 		_ = uow.Rollback(ctx)

@@ -351,7 +351,7 @@ func TestRollbackPublishesOldContentWithoutRewritingHistory(t *testing.T) {
 
 	// History intact: revision 2 still exists with its V2 payload, and is
 	// superseded (immutable), revision 3 published+active.
-	revs, err := svc.ListRevisions(ctx)
+	revs, err := svc.ListRevisionMetas(ctx, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}

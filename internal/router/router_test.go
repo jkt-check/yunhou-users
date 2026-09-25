@@ -218,8 +218,8 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 	engine := gin.New()
 
 	Setup(t.Context(), engine,
-		nil,                          // healthPinger
-		nil, nil, nil, nil, nil, nil, // repos
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
 		nil,           // tokenSvc
 		nil,           // authSvc
 		nil, nil, nil, // subSvc, planSvc, paymentSvc
@@ -229,16 +229,18 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		nil,      // chatSvc
 		nil,      // chatAccessLog
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
-		false, // wechatOAuthMock
-		false, // wechatPayMock
-		nil,   // usageSvc
-		nil,   // adminModelsHandler
-		nil,   // adminOps
-		nil,   // accessOps
-		nil,   // llmUsageSvc
-		nil,   // relayHandler
-		nil,   // adminOpsSvc
-		nil,   // adminUsersSvc
+		false,               // wechatOAuthMock
+		false,               // wechatPayMock
+		"dev",               // appEnv — non-production, so /test/login may mount
+		nil,                 // usageSvc
+		nil,                 // adminModelsHandler
+		nil,                 // adminOps
+		nil,                 // accessOps
+		nil,                 // llmUsageSvc
+		nil,                 // relayHandler
+		nil,                 // adminOpsSvc
+		nil,                 // adminUsersSvc
+		[]string{"yundash"}, // dashboardAppIDs — 白名单非空即可,Routes() 自省不触达中间件
 	)
 
 	routes := engine.Routes()
@@ -360,18 +362,20 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 }
 
 // TestSetup_TestLoginGatedOnEnv verifies the /test/login route exists only
-// when PAYPAL_L3_E2E_MODE=1 — previously it was always registered and gated
-// only inside the handler, so one stray env line in production would have
-// exposed arbitrary JWT minting.
+// when PAYPAL_L3_E2E_MODE=1 AND the appEnv argument is a non-production
+// APP_ENV value — previously it was always registered and gated only inside
+// the handler, so one stray env line in production would have exposed
+// arbitrary JWT minting.
 func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 	// Not parallel: t.Setenv mutates process env.
 	gin.SetMode(gin.TestMode)
 	t.Setenv("PAYPAL_L3_E2E_MODE", "1")
+	t.Setenv("APP_ENV", "dev")
 	engine := gin.New()
 
 	Setup(t.Context(), engine,
-		nil,                          // healthPinger
-		nil, nil, nil, nil, nil, nil, // repos
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
 		nil,           // tokenSvc
 		nil,           // authSvc
 		nil, nil, nil, // subSvc, planSvc, paymentSvc
@@ -381,16 +385,18 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		nil,      // chatSvc
 		nil,      // chatAccessLog
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
-		false, // wechatOAuthMock
-		false, // wechatPayMock
-		nil,   // usageSvc
-		nil,   // adminModelsHandler
-		nil,   // adminOps
-		nil,   // accessOps
-		nil,   // llmUsageSvc
-		nil,   // relayHandler
-		nil,   // adminOpsSvc
-		nil,   // adminUsersSvc
+		false,               // wechatOAuthMock
+		false,               // wechatPayMock
+		"dev",               // appEnv — non-production, so /test/login may mount
+		nil,                 // usageSvc
+		nil,                 // adminModelsHandler
+		nil,                 // adminOps
+		nil,                 // accessOps
+		nil,                 // llmUsageSvc
+		nil,                 // relayHandler
+		nil,                 // adminOpsSvc
+		nil,                 // adminUsersSvc
+		[]string{"yundash"}, // dashboardAppIDs — 白名单非空即可,Routes() 自省不触达中间件
 	)
 
 	for _, r := range engine.Routes() {
@@ -398,7 +404,53 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 			return
 		}
 	}
-	t.Error("Setup did not register /test/login with PAYPAL_L3_E2E_MODE=1")
+	t.Error("Setup did not register /test/login with PAYPAL_L3_E2E_MODE=1 + non-production APP_ENV")
+}
+
+// TestSetup_TestLoginRefusedUnderProductionEnv is the audit-C-1 router-side
+// check: even with PAYPAL_L3_E2E_MODE=1 in the environment, a production
+// APP_ENV ("prod" is also the Load() default for an unset variable) must
+// keep the JWT-minting route unmounted. This covers the cn-prod shape where
+// PAYPAL_ENV is never set and the old PAYPAL_ENV=live guard never fired.
+func TestSetup_TestLoginRefusedUnderProductionEnv(t *testing.T) {
+	// Not parallel: t.Setenv mutates process env.
+	for _, appEnv := range []string{"prod", "production", ""} {
+		gin.SetMode(gin.TestMode)
+		t.Setenv("PAYPAL_L3_E2E_MODE", "1")
+		engine := gin.New()
+
+		Setup(t.Context(), engine,
+			nil,                               // healthPinger
+			nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
+			nil,           // tokenSvc
+			nil,           // authSvc
+			nil, nil, nil, // subSvc, planSvc, paymentSvc
+			nil,      // webhookVerifier
+			nil,      // wechatAPIv3Key
+			nil, nil, // providerTokenSvc, quoteSvc
+			nil,      // chatSvc
+			nil,      // chatAccessLog
+			nil, nil, // githubOAuthSvc, wechatOAuthSvc
+			false,               // wechatOAuthMock
+			false,               // wechatPayMock
+			appEnv,              // production signal — /test/login must stay unmounted
+			nil,                 // usageSvc
+			nil,                 // adminModelsHandler
+			nil,                 // adminOps
+			nil,                 // accessOps
+			nil,                 // llmUsageSvc
+			nil,                 // relayHandler
+			nil,                 // adminOpsSvc
+			nil,                 // adminUsersSvc
+			[]string{"yundash"}, // dashboardAppIDs
+		)
+
+		for _, r := range engine.Routes() {
+			if r.Method == "POST" && r.Path == "/test/login" {
+				t.Errorf("appEnv=%q: Setup registered /test/login under a production APP_ENV", appEnv)
+			}
+		}
+	}
 }
 
 // TestSetup_RelayRoutesWired 验证 relay 启用(relayHandler 非 nil)时的
@@ -412,8 +464,8 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 	// NewRelayHandler(nil):svc 不会被触达(无 token 的请求在 JWTAuth
 	// 就被 401 拦截);未 SetHub 时 ServeWS 固定 503,足以区分路由存在性。
 	Setup(t.Context(), engine,
-		nil,                          // healthPinger
-		nil, nil, nil, nil, nil, nil, // repos
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
 		nil,           // tokenSvc
 		nil,           // authSvc
 		nil, nil, nil, // subSvc, planSvc, paymentSvc
@@ -425,12 +477,14 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
 		false,         // wechatOAuthMock
 		false,         // wechatPayMock
+		"dev",         // appEnv
 		nil,           // usageSvc
 		nil, nil, nil, // adminModelsHandler, adminOps, accessOps
 		nil,                          // llmUsageSvc
 		handler.NewRelayHandler(nil), // relayHandler 非 nil = relay 启用
 		nil,                          // adminOpsSvc
 		nil,                          // adminUsersSvc
+		[]string{"yundash"},          // dashboardAppIDs
 	)
 
 	have := make(map[string]bool)

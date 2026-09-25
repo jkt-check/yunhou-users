@@ -86,3 +86,5 @@ syntax, **not** transaction control — those are fine.
 | `035_lease_indexes_reaper.sql` | 租约热路径索引与收割支撑：concurrency_leases 增 (scope, scope_id, fencing_token DESC) 索引（MAX(fencing) 不再扫 scope 全历史）与终态行部分索引（DeleteTerminalLeases 收割 released/expired 且早于 7 天保留窗口的行，挂 upstream_health 轮次）；wallet_entries 增 (wallet_id, created_at) 索引（支撑月度支出派生）（评审修复批次8） |
 | `036_adjustments_source.sql` | inference_adjustments 增 source 列（cash|bonus，CHECK 约束）：幂等重放载荷比对纳入资金路由来源，同键异 source → 409；micromoney 存量行经 adjustment_id 联 wallet_entries 的 adjustment 分录回填真实来源，microcredit 行无现金/赠送概念保持 NULL（评审轮2 C-I1） |
 | `037_admin_idempotency.sql` | dashboard 运营 admin API 幂等键表 admin_idempotency_keys（UNIQUE(app_id,key)，撞键重放首次 response；与 VIP 订阅变更 + audit_log 同事务提交，只记录成功） |
+| `038_admin_idempotency_request_hash.sql` | admin_idempotency_keys 增可空 request_hash 列：VIP 幂等重放校验载荷一致性（sha256(user_id, days)），同键异载荷 → 409；037 存量行 NULL 跳过比对（评审 I-8，对齐 wallet adjustments 同键异载荷 409 语义） |
+| `039_bulk_import_document_hash.sql` | inference_bulk_imports 增可空 document_hash 列：批量导入 task_id 幂等重放校验文档一致性（sha256(canonical JSON)），同 task_id 异文档 → 409；034 存量行 NULL 跳过比对（安全评审 M-4，对齐 wallet adjustments / admin idempotency 同键异载荷 409 语义） |

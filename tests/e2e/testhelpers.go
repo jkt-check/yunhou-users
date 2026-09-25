@@ -285,6 +285,14 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		SweeperInterval:        1 * time.Minute,
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
+		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
+		// wechat mocks, which config.Validate refuses under a production
+		// APP_ENV (default "prod").
+		AppEnv: "e2e",
+		// Dashboard 运营面白名单(audit I-2):dashboard 端点以 superAppID
+		// (yundian)与 yundash 双 app 互证(admin_users_test.go 幂等键
+		// 按 app 隔离用例)。
+		DashboardAppIDs: []string{"yundian", "yundash"},
 	}
 
 	// Repos
@@ -344,10 +352,11 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		cfg.DashboardAppIDs)
 
 	return engine, nil, db
 }
@@ -387,6 +396,14 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		SweeperInterval:        1 * time.Minute,
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
+		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
+		// wechat mocks, which config.Validate refuses under a production
+		// APP_ENV (default "prod").
+		AppEnv: "e2e",
+		// Dashboard 运营面白名单(audit I-2):dashboard 端点以 superAppID
+		// (yundian)与 yundash 双 app 互证(admin_users_test.go 幂等键
+		// 按 app 隔离用例)。
+		DashboardAppIDs: []string{"yundian", "yundash"},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("config validate: %v", err)
@@ -433,10 +450,11 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		cfg.DashboardAppIDs)
 
 	return &E2EServer{
 		Engine:             engine,
@@ -614,6 +632,14 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		SweeperInterval:        1 * time.Minute,
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
+		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
+		// wechat mocks, which config.Validate refuses under a production
+		// APP_ENV (default "prod").
+		AppEnv: "e2e",
+		// Dashboard 运营面白名单(audit I-2):dashboard 端点以 superAppID
+		// (yundian)与 yundash 双 app 互证(admin_users_test.go 幂等键
+		// 按 app 隔离用例)。
+		DashboardAppIDs: []string{"yundian", "yundash"},
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -700,10 +726,11 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		cfg.DashboardAppIDs)
 
 	alipayPrivHolder.Store(alipayPriv)
 

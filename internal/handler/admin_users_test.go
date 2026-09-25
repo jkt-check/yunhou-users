@@ -270,6 +270,21 @@ func TestAdminUsersAddVip(t *testing.T) {
 		}
 	})
 
+	t.Run("idempotency payload mismatch is 409", func(t *testing.T) {
+		// I-8:同键不同载荷 = 键复用错误,按 409 拒绝(与 wallet
+		// adjustments 面语义一致),消息透传给运营。
+		svc := &mockAdminUsersSvc{vipErr: service.ErrAdminIdemPayloadMismatch}
+		engine := adminUsersTestEngine(svc)
+		w := adminRequest(t, engine, http.MethodPost, "/admin/users/"+adminTestUUID+"/vip", `{"days":30}`,
+			map[string]string{"Idempotency-Key": "dash-123"})
+		if w.Code != http.StatusConflict {
+			t.Fatalf("got %d, want 409", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "different vip payload") {
+			t.Fatalf("message not passed through: %s", w.Body.String())
+		}
+	})
+
 	t.Run("unknown user is 404", func(t *testing.T) {
 		svc := &mockAdminUsersSvc{vipErr: service.ErrUserNotFound}
 		engine := adminUsersTestEngine(svc)

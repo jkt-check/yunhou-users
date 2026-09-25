@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/middleware"
@@ -20,6 +21,7 @@ func Setup(
 	engine *gin.Engine,
 	healthPinger handler.Pinger,
 	appRepo repo.AppRepo,
+	auditLogRepo repo.AuditLogRepo,
 	userRepo repo.UserRepo,
 	identityRepo repo.SocialIdentityRepo,
 	planRepo repo.PlanRepo,
@@ -40,6 +42,10 @@ func Setup(
 	wechatOAuthSvc *service.WeChatOAuthService,
 	wechatOAuthMock bool,
 	wechatPayMock bool,
+	// appEnv is cfg.AppEnv: the production signal gating the dev-only
+	// /test/login route. Anything not in config's non-production allowlist
+	// (including the "prod" default) keeps the route unmounted.
+	appEnv string,
 	usageSvc *service.UsageService,
 	adminModelsHandler *httpapi.AdminModelsHandler,
 	adminOps *httpapi.AdminOps,
@@ -48,6 +54,12 @@ func Setup(
 	relayHandler *handler.RelayHandler,
 	adminOpsSvc *service.AdminOpsService,
 	adminUsersSvc *service.AdminUsersService,
+	// dashboardAppIDs is cfg.DashboardAppIDs: the allowlist of app IDs
+	// permitted to use the dashboard 运营 surface below (audit I-2). An
+	// empty list denies every app (fail closed) — cmd/server refuses to
+	// start without DASHBOARD_APP_IDS, and this middleware is the defence-
+	// in-depth gate for router mounts that bypass the startup check.
+	dashboardAppIDs []string,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -55,7 +67,7 @@ func Setup(
 
 	// Handlers
 	authHandler := handler.NewAuthHandler(authSvc, tokenSvc)
-	appHandler := handler.NewAppHandler(appRepo, providerTokenSvc)
+	appHandler := handler.NewAppHandler(appRepo, providerTokenSvc, auditLogRepo)
 	subHandler := handler.NewSubscriptionHandler(subSvc)
 	planHandler := handler.NewPlanHandler(planSvc, appRepo, quoteSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)
@@ -86,12 +98,14 @@ func Setup(
 	wechatOAuthGroup := engine.Group("/auth/wechat", publicLimiter)
 	handler.RegisterWeChatOAuthRoutes(wechatOAuthGroup, wechatOAuthSvc, appRepo, authSvc, wechatOAuthMock)
 	// Dev-only login endpoint for the L3 e2e-ui suite. The route is only
-	// registered when PAYPAL_L3_E2E_MODE=1 — anywhere else the path does not
-	// exist at all, so a stray env line in a production .env is the ONLY way
-	// to expose it, and config.Validate hard-fails when that combines with
-	// PAYPAL_ENV=live. The handler keeps its own env check as defence in
-	// depth. Mounted behind the public limiter for rate-limit friction.
-	if os.Getenv("PAYPAL_L3_E2E_MODE") == "1" {
+	// registered when PAYPAL_L3_E2E_MODE=1 AND APP_ENV is a non-production
+	// value — anywhere else the path does not exist at all, so a stray env
+	// line in a production .env is the ONLY way to expose it, and
+	// config.Validate hard-fails when that combines with a production
+	// APP_ENV (the primary signal, independent of PAYPAL_ENV — audit C-1)
+	// or PAYPAL_ENV=live. The handler keeps its own env check as defence
+	// in depth. Mounted behind the public limiter for rate-limit friction.
+	if os.Getenv("PAYPAL_L3_E2E_MODE") == "1" && !config.IsProductionEnv(appEnv) {
 		engine.POST("/test/login", publicLimiter, authHandler.TestLogin)
 	}
 
@@ -285,13 +299,18 @@ func Setup(
 		adminGroup.GET("/stats/llm-usage", llmUsageHandler.GetByModel)
 
 		// Dashboard 运营 API(dashboard-admin-api spec):运营指标、用户
-		// 搜索/详情、VIP 加时长。与 /admin/stats/* 同一条 InternalAppAuth
-		// 链(任何持有效 app secret 的内部服务可调);不挂 opsGroup——那是
-		// inference catalog 的 operator JWT 体系,与本组端点无关。
-		adminGroup.GET("/ops/metrics", adminOpsHandler.GetMetrics)
-		adminGroup.GET("/users/search", adminUsersHandler.SearchUsers)
-		adminGroup.GET("/users/:id", adminUsersHandler.GetUser)
-		adminGroup.POST("/users/:id/vip", adminUsersHandler.AddVip)
+		// 搜索/详情、VIP 加时长。挂在 InternalAppAuth 链内的一个子组,
+		// 外加 DashboardAllowlist(audit I-2):仅 DASHBOARD_APP_IDS 白名单
+		// 内的 app 可用 —— 否则任一持有效 app secret 的内部服务都能读
+		// 邮箱 PII / 写 VIP。白名单为空 = 全部 403(fail closed),cmd/server
+		// 在启动时即以空名单拒启。审计归因沿用 admin:<appID>(见
+		// adminActorID);按人归因需 dashboard 鉴权改造,不在本次范围。
+		dashboardGroup := adminGroup.Group("")
+		dashboardGroup.Use(middleware.DashboardAllowlist(dashboardAppIDs))
+		dashboardGroup.GET("/ops/metrics", adminOpsHandler.GetMetrics)
+		dashboardGroup.GET("/users/search", adminUsersHandler.SearchUsers)
+		dashboardGroup.GET("/users/:id", adminUsersHandler.GetUser)
+		dashboardGroup.POST("/users/:id/vip", adminUsersHandler.AddVip)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

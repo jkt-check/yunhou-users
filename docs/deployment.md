@@ -195,7 +195,7 @@ Relay 为 kaya 客户端与受控设备之间提供 WebSocket 房间路由。未
 | `RELAY_TICKET_SECRET` | 启用时必填 | ticket HMAC 密钥。生成:`openssl rand -hex 32` |
 | `RELAY_TICKET_SECRET_PREVIOUS` | 否 | 轮换期的旧密钥(只验证、不签发)。轮换流程:新密钥写入 `RELAY_TICKET_SECRET`,旧密钥挪到本变量,等旧 ticket 全部过期(TTL 5 分钟)后清空 |
 | `RELAY_ALLOWED_ORIGINS` | 否 | WS 握手 Origin 白名单(逗号分隔,如 `https://www.yunhouai.com`)。空 = fail-closed:拒绝一切带 Origin 的握手;不带 Origin 的 native device 不受影响 |
-| `APP_ENV` | 是 | 指标标签(`relay_*` Prometheus 指标带 `env` 标签区分环境) |
+| `APP_ENV` | 是 | 指标标签(`relay_*` Prometheus 指标带 `env` 标签区分环境)。同时是 mock/后门开关(`PAYPAL_L3_E2E_MODE`、`WECHAT_PAY_MOCK`、`WECHAT_OAUTH_MOCK`,含 /test/login 路由)的生产闸门:仅 `dev`/`development`/`staging`/`test`/`local`/`e2e` 视为非生产,其余取值(含未设置时的默认 `prod`)视为生产——生产信号下配置校验拒绝启动、/test/login 不挂载 |
 
 **nginx 依赖**:`/relay/ws` 必须走 `deploy/nginx.conf` 里的独立
 `location = /relay/ws` 块 —— `proxy_http_version 1.1` + `Upgrade`/`Connection`

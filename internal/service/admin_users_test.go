@@ -31,8 +31,9 @@ type fakeAdminUsersRepo struct {
 	revenue     repo.AdminOpsAmounts
 	opsErr      error
 
-	// replayResponse backs the non-tx GetIdempotencyResponse re-read.
-	replayResponse json.RawMessage
+	// replayRecord backs the non-tx GetIdempotencyRecord re-read after a
+	// same-key race rollback.
+	replayRecord *repo.AdminIdempotencyRecord
 
 	gotSearchExact string
 	gotSearchLike  string
@@ -75,8 +76,8 @@ func (f *fakeAdminUsersRepo) OpsRevenue(_ context.Context, _, _, _ time.Time) (r
 	return f.revenue, f.opsErr
 }
 
-func (f *fakeAdminUsersRepo) GetIdempotencyResponse(_ context.Context, _, _ string) (json.RawMessage, error) {
-	return f.replayResponse, nil
+func (f *fakeAdminUsersRepo) GetIdempotencyRecord(_ context.Context, _, _ string) (*repo.AdminIdempotencyRecord, error) {
+	return f.replayRecord, nil
 }
 
 func (f *fakeAdminUsersRepo) WithTx(_ context.Context, fn func(tx repo.AdminUsersTx) error) error {
@@ -114,9 +115,11 @@ type fakeAdminUsersTx struct {
 	extendExpiry   time.Time
 	extendCalled   bool
 	idemStored     json.RawMessage
+	idemHash       *string
 	idemInsertOK   bool
 	idemInsertCall bool
 	idemAction     string
+	idemHashOut    string
 
 	audits []fakeAuditCall
 }
@@ -148,13 +151,17 @@ func (t *fakeAdminUsersTx) ExtendMembershipSub(_ context.Context, _ string, _ in
 	return t.extendUpdated, t.extendPlanID, t.extendExpiry, nil
 }
 
-func (t *fakeAdminUsersTx) GetIdempotencyResponse(_ context.Context, _, _ string) (json.RawMessage, error) {
-	return t.idemStored, nil
+func (t *fakeAdminUsersTx) GetIdempotencyRecord(_ context.Context, _, _ string) (*repo.AdminIdempotencyRecord, error) {
+	if t.idemStored == nil {
+		return nil, nil
+	}
+	return &repo.AdminIdempotencyRecord{Response: t.idemStored, RequestHash: t.idemHash}, nil
 }
 
-func (t *fakeAdminUsersTx) InsertIdempotencyKey(_ context.Context, _, _, action, _ string, _ json.RawMessage) (bool, error) {
+func (t *fakeAdminUsersTx) InsertIdempotencyKey(_ context.Context, _, _, action, _, requestHash string, _ json.RawMessage) (bool, error) {
 	t.idemInsertCall = true
 	t.idemAction = action
+	t.idemHashOut = requestHash
 	return t.idemInsertOK, nil
 }
 
@@ -179,6 +186,8 @@ func activeMembershipRow(planID string, expiresAt *time.Time, planIsActive *bool
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+func strPtr(s string) *string { return &s }
 
 func TestAddVipDaysGrant(t *testing.T) {
 	expiry := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
@@ -217,6 +226,10 @@ func TestAddVipDaysGrant(t *testing.T) {
 	// 而不是响应里的 "granted"。
 	if fake.tx.idemAction != "vip.grant" {
 		t.Fatalf("idempotency action = %q, want vip.grant", fake.tx.idemAction)
+	}
+	// 载荷摘要随键落库(038),重放比对用。
+	if fake.tx.idemHashOut != adminVipRequestHash(adminTestUserID, 30) {
+		t.Fatalf("idempotency request hash = %q", fake.tx.idemHashOut)
 	}
 }
 
@@ -366,9 +379,11 @@ func TestAddVipDaysUserNotFound(t *testing.T) {
 
 func TestAddVipDaysIdempotentReplay(t *testing.T) {
 	stored := json.RawMessage(`{"action":"granted","planId":"monthly","before":null,"after":{"planId":"monthly","expiresAt":"2026-10-24T08:00:00Z"}}`)
+	matchingHash := adminVipRequestHash(adminTestUserID, 30)
 	fake := &fakeAdminUsersRepo{tx: &fakeAdminUsersTx{
 		userExists: true,
 		idemStored: stored,
+		idemHash:   &matchingHash,
 	}}
 	svc := NewAdminUsersService(fake)
 
@@ -381,6 +396,47 @@ func TestAddVipDaysIdempotentReplay(t *testing.T) {
 	}
 	if fake.tx.insertCalled || fake.tx.extendCalled || len(fake.tx.audits) != 0 {
 		t.Fatal("replay must not write subscription or audit")
+	}
+}
+
+func TestAddVipDaysIdempotentReplayLegacyRow(t *testing.T) {
+	// 037 时代写入的存量行没有 request_hash(NULL):跳过载荷比对,
+	// 保持既有重放语义(038 迁移口径)。
+	stored := json.RawMessage(`{"action":"granted","planId":"monthly","before":null,"after":{"planId":"monthly","expiresAt":"2026-10-24T08:00:00Z"}}`)
+	fake := &fakeAdminUsersRepo{tx: &fakeAdminUsersTx{
+		userExists: true,
+		idemStored: stored,
+	}}
+	svc := NewAdminUsersService(fake)
+
+	res, err := svc.AddVipDays(context.Background(), "yundash", "admin:yundash", adminTestUserID, 30, "k-legacy")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if res.Action != "granted" {
+		t.Fatalf("replay result: %+v", res)
+	}
+}
+
+func TestAddVipDaysIdempotentReplayPayloadMismatch(t *testing.T) {
+	// I-8:同键不同载荷(这里 days 30→60)是调用方键复用错误,按 409 拒绝
+	// (ErrAdminIdemPayloadMismatch),不当良性重放——对齐 wallet
+	// adjustments 面 admin_adjustments.go 的同键异载荷 409。
+	stored := json.RawMessage(`{"action":"granted","planId":"monthly","before":null,"after":{"planId":"monthly","expiresAt":"2026-10-24T08:00:00Z"}}`)
+	otherHash := adminVipRequestHash(adminTestUserID, 60)
+	fake := &fakeAdminUsersRepo{tx: &fakeAdminUsersTx{
+		userExists: true,
+		idemStored: stored,
+		idemHash:   &otherHash,
+	}}
+	svc := NewAdminUsersService(fake)
+
+	_, err := svc.AddVipDays(context.Background(), "yundash", "admin:yundash", adminTestUserID, 30, "k-1")
+	if !errors.Is(err, ErrAdminIdemPayloadMismatch) {
+		t.Fatalf("err: %v", err)
+	}
+	if fake.tx.insertCalled || fake.tx.extendCalled || len(fake.tx.audits) != 0 || fake.tx.idemInsertCall {
+		t.Fatal("mismatch replay must not write anything")
 	}
 }
 
@@ -398,7 +454,10 @@ func TestAddVipDaysIdempotencyRace(t *testing.T) {
 			extendExpiry:  adminTestExpiry.Add(30 * 24 * time.Hour),
 			idemInsertOK:  false,
 		},
-		replayResponse: winner,
+		replayRecord: &repo.AdminIdempotencyRecord{
+			Response:    winner,
+			RequestHash: strPtr(adminVipRequestHash(adminTestUserID, 30)),
+		},
 	}
 	svc := NewAdminUsersService(fake)
 
@@ -415,6 +474,33 @@ func TestAddVipDaysIdempotencyRace(t *testing.T) {
 	}
 }
 
+func TestAddVipDaysRaceReplayPayloadMismatch(t *testing.T) {
+	// I-8:两个不同载荷的请求撞同一幂等键——胜者已提交,败者回滚后重放
+	// 时也必须比对载荷,不一致按 409 拒绝而不是把胜者的结果错发给
+	// 另一个载荷的调用方。
+	winner := json.RawMessage(`{"action":"extended","planId":"monthly","before":{"planId":"monthly","expiresAt":"2026-10-01T12:00:00Z"},"after":{"planId":"monthly","expiresAt":"2026-10-31T12:00:00Z"}}`)
+	fake := &fakeAdminUsersRepo{
+		tx: &fakeAdminUsersTx{
+			userExists:    true,
+			activeRow:     activeMembershipRow("monthly", &adminTestExpiry, boolPtr(true)),
+			extendUpdated: true,
+			extendPlanID:  "monthly",
+			extendExpiry:  adminTestExpiry.Add(30 * 24 * time.Hour),
+			idemInsertOK:  false,
+		},
+		replayRecord: &repo.AdminIdempotencyRecord{
+			Response:    winner,
+			RequestHash: strPtr(adminVipRequestHash(adminTestUserID, 60)),
+		},
+	}
+	svc := NewAdminUsersService(fake)
+
+	_, err := svc.AddVipDays(context.Background(), "yundash", "admin:yundash", adminTestUserID, 30, "k-race")
+	if !errors.Is(err, ErrAdminIdemPayloadMismatch) {
+		t.Fatalf("err: %v", err)
+	}
+}
+
 func TestAddVipDaysGrantConflictReplay(t *testing.T) {
 	// 并发同 (app_id, key) 的 grant 路径:双方预读都看到无 active 行
 	// (FOR UPDATE 锁不到不存在的行),败者的 INSERT 撞 027 的部分唯一
@@ -427,7 +513,10 @@ func TestAddVipDaysGrantConflictReplay(t *testing.T) {
 			activeRow:  nil,
 			insertErr:  repo.ErrAdminSubscriptionConflict,
 		},
-		replayResponse: winner,
+		replayRecord: &repo.AdminIdempotencyRecord{
+			Response:    winner,
+			RequestHash: strPtr(adminVipRequestHash(adminTestUserID, 30)),
+		},
 	}
 	svc := NewAdminUsersService(fake)
 
@@ -445,8 +534,8 @@ func TestAddVipDaysGrantConflictReplay(t *testing.T) {
 }
 
 func TestAddVipDaysGrantConflictWithoutKey(t *testing.T) {
-	// 同样的唯一索引冲突,但请求没带 Idempotency-Key:没有可重放的响应,
-	// 保持原样上抛(handler 落 500)。
+	// 同样的唯一索引冲突,但请求没带 Idempotency-Key:没有可重放的响应。
+	// spec §1.2:映射为 vip.reject 审计(同事务提交)+ 409,而不是 500。
 	fake := &fakeAdminUsersRepo{
 		tx: &fakeAdminUsersTx{
 			userExists: true,
@@ -457,8 +546,22 @@ func TestAddVipDaysGrantConflictWithoutKey(t *testing.T) {
 	svc := NewAdminUsersService(fake)
 
 	_, err := svc.AddVipDays(context.Background(), "yundash", "admin:yundash", adminTestUserID, 30, "")
-	if !errors.Is(err, repo.ErrAdminSubscriptionConflict) {
+	if !errors.Is(err, ErrAdminVipRejected) {
 		t.Fatalf("err: %v", err)
+	}
+	if !strings.Contains(err.Error(), "并发开通冲突") {
+		t.Fatalf("message: %v", err)
+	}
+	// Rejection audit commits in the same tx (I-4); the subscription insert
+	// rolled back to its savepoint so the row never lands.
+	if len(fake.tx.audits) != 1 || fake.tx.audits[0].action != "vip.reject" {
+		t.Fatalf("audits: %+v", fake.tx.audits)
+	}
+	if fake.tx.audits[0].ctx["reject_reason"] == nil {
+		t.Fatalf("audit ctx missing reject_reason: %+v", fake.tx.audits[0].ctx)
+	}
+	if fake.tx.idemInsertCall {
+		t.Fatal("idempotency write on a rejection")
 	}
 }
 

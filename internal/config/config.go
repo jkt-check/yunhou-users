@@ -37,7 +37,9 @@ type Config struct {
 	// a fixed ProviderUserInfo (wechat_mock-unionid-001) instead of
 	// exchanging the code with WeChat. Used by dev/staging environments
 	// that don't have a registered 网站应用 yet, and by the e2e suite.
-	// Real WeChat apps MUST leave this false.
+	// Real WeChat apps MUST leave this false — Validate() hard-fails when
+	// it combines with a production APP_ENV or a fully-populated real
+	// WeChat Pay credential tuple.
 	WeChatOAuthMock bool
 
 	// WeChatPayMock short-circuits the WeChat Pay v3 webhook signature
@@ -48,14 +50,15 @@ type Config struct {
 	// activated flow without a registered merchant. Pair with the
 	// mock-mode NATIVE UnifiedOrder in internal/billing/wechat/.
 	// Production MUST leave this false — Validate() hard-fails when it
-	// combines with PAYPAL_ENV=live or a full set of real WeChat Pay
-	// credentials.
+	// combines with a production APP_ENV, PAYPAL_ENV=live, or a full set
+	// of real WeChat Pay credentials.
 	WeChatPayMock bool
 
 	// PaypalL3E2EMode gates the dev-only POST /test/login endpoint (route
 	// registration in router.Setup + check inside the handler). It mints
 	// real JWTs for arbitrary emails with no OAuth, so Validate()
-	// hard-fails when it combines with PAYPAL_ENV=live.
+	// hard-fails when it combines with a production APP_ENV, PAYPAL_ENV=live,
+	// or configured real PayPal client credentials.
 	PaypalL3E2EMode bool
 
 	// WeChatPayMchID is the 微信支付商户号. Required when WeChatPayMock
@@ -100,7 +103,19 @@ type Config struct {
 	RelayTicketSecretPrev string   // 轮换期旧 secret,校验时一并接受
 	RelayAllowedOrigins   []string // 浏览器 Origin 白名单(host 或 origin 形式)
 	RelayWSURL            string   // 可选:覆盖 /relay/ticket 返回的 ws_url(空 = 按请求 Host 推导)
-	AppEnv                string   // metrics 的 env label,默认 prod
+	AppEnv                string   // metrics env label + mock/backdoor production gate; default "prod" (see IsProductionEnv)
+
+	// DashboardAppIDs is the allowlist of app IDs permitted to use the
+	// dashboard 运营 surface (/admin/ops/metrics, /admin/users/* — user
+	// search returning email PII and VIP write endpoints). Sourced from
+	// DASHBOARD_APP_IDS (comma-separated). Fail closed: cmd/server refuses
+	// to start when the list is empty (a loud startup failure is easier to
+	// diagnose than a dashboard silently 403ing for deploy-history
+	// reasons), and middleware.DashboardAllowlist denies every app when
+	// the list is empty as defence in depth for callers that mount the
+	// router without main's startup gate (audit I-2). Enforcement lives on
+	// the router's dashboard group.
+	DashboardAppIDs []string
 
 	// Payment channel webhook secrets. Loaded but not strictly required
 	// at startup — if a channel's secret is empty, webhooks for that channel
@@ -270,6 +285,8 @@ func Load() *Config {
 		RelayWSURL:            os.Getenv("RELAY_WS_URL"),
 		AppEnv:                envOr("APP_ENV", "prod"),
 
+		DashboardAppIDs: splitCSV(os.Getenv("DASHBOARD_APP_IDS")),
+
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
 		WeChatAPIv3Key:      os.Getenv("WECHAT_PAY_API_V3_KEY"),
 		AlipayPublicKeyPath: os.Getenv("ALIPAY_PUBLIC_KEY_PATH"),
@@ -315,6 +332,35 @@ func Load() *Config {
 		InferenceUpstreamHealthBatch:       parseIntOr(envOr("INFERENCE_UPSTREAM_HEALTH_BATCH", "100"), 100),
 		InferenceUpstreamHealthCooldown:    parseDurationOr(envOr("INFERENCE_UPSTREAM_HEALTH_COOLDOWN", "5m"), 5*time.Minute),
 	}
+}
+
+// nonProductionEnvs lists the ONLY APP_ENV values under which the
+// mock/backdoor switches (PAYPAL_L3_E2E_MODE, WECHAT_PAY_MOCK,
+// WECHAT_OAUTH_MOCK) may run. Everything else — "prod", "production",
+// "", and any unrecognized string — is treated as production. Fail closed
+// on unknown values so a typo'd env can never silently arm a bypass.
+var nonProductionEnvs = map[string]bool{
+	"dev":         true,
+	"development": true,
+	"staging":     true,
+	"test":        true,
+	"local":       true,
+	"e2e":         true,
+}
+
+// IsProductionEnv reports whether an APP_ENV value denotes production for
+// the purpose of gating mock/backdoor switches. Load() defaults APP_ENV to
+// "prod", so an unset variable lands here as production (fail closed).
+func IsProductionEnv(appEnv string) bool {
+	return !nonProductionEnvs[strings.ToLower(strings.TrimSpace(appEnv))]
+}
+
+// hasFullRealWeChatPayCredentials mirrors the six-field all-or-none real
+// WeChat Pay credential tuple validated in Validate().
+func (c *Config) hasFullRealWeChatPayCredentials() bool {
+	return c.WeChatPayMchID != "" && c.WeChatAPIv3Key != "" &&
+		c.WeChatPayAppID != "" && c.WeChatPayMchPrivateKeyPath != "" &&
+		c.WeChatPayMchCertPath != "" && c.WeChatPayNotifyURL != ""
 }
 
 // Validate enforces required fields and reasonable bounds. Call once at
@@ -405,6 +451,25 @@ func (c *Config) Validate() error {
 	// exist for dev/e2e only — hard-fail at startup when one combines with
 	// a production signal so a stray env line in a production .env is
 	// caught at deploy time instead of silently opening the bypass.
+	//
+	// The primary production signal is APP_ENV, NOT PAYPAL_ENV: cn-prod is
+	// a WeChat-Pay deployment that never sets PAYPAL_ENV, so a PayPal-keyed
+	// guard never fires there (audit C-1). Load() defaults APP_ENV to
+	// "prod", so an unset variable is production — fail closed.
+	if IsProductionEnv(c.AppEnv) {
+		if c.PaypalL3E2EMode {
+			return errors.New("PAYPAL_L3_E2E_MODE must not be enabled when APP_ENV is production (set APP_ENV to a non-production value like dev/staging to use mock switches)")
+		}
+		if c.WeChatPayMock {
+			return errors.New("WECHAT_PAY_MOCK must not be enabled when APP_ENV is production (set APP_ENV to a non-production value like dev/staging to use mock switches)")
+		}
+		if c.WeChatOAuthMock {
+			return errors.New("WECHAT_OAUTH_MOCK must not be enabled when APP_ENV is production (set APP_ENV to a non-production value like dev/staging to use mock switches)")
+		}
+	}
+	// Keep the PayPal-specific semantics: the live PayPal channel is an
+	// independent production signal that must also refuse every mock
+	// switch, regardless of APP_ENV.
 	if c.PaypalEnv == "live" {
 		if c.PaypalL3E2EMode {
 			return errors.New("PAYPAL_L3_E2E_MODE must not be enabled when PAYPAL_ENV=live")
@@ -416,14 +481,24 @@ func (c *Config) Validate() error {
 			return errors.New("WECHAT_OAUTH_MOCK must not be enabled when PAYPAL_ENV=live")
 		}
 	}
-	// A fully-populated real WeChat Pay credential tuple alongside mock
-	// mode is the same class of misconfig: the deployment looks production
-	// but the webhook verifier is disarmed.
-	if c.WeChatPayMock &&
-		c.WeChatPayMchID != "" && c.WeChatAPIv3Key != "" &&
-		c.WeChatPayAppID != "" && c.WeChatPayMchPrivateKeyPath != "" &&
-		c.WeChatPayMchCertPath != "" && c.WeChatPayNotifyURL != "" {
-		return errors.New("WECHAT_PAY_MOCK must not be enabled when real WeChat Pay credentials are fully configured")
+	// A fully-populated real WeChat Pay credential tuple alongside a mock
+	// switch is the same class of misconfig: the deployment looks production
+	// but the bypass is armed. WECHAT_PAY_MOCK disarms the webhook verifier;
+	// WECHAT_OAUTH_MOCK logs in a fixed identity — neither is tolerable on
+	// a host wired to real WeChat merchant credentials.
+	if c.hasFullRealWeChatPayCredentials() {
+		if c.WeChatPayMock {
+			return errors.New("WECHAT_PAY_MOCK must not be enabled when real WeChat Pay credentials are fully configured")
+		}
+		if c.WeChatOAuthMock {
+			return errors.New("WECHAT_OAUTH_MOCK must not be enabled when real WeChat Pay credentials are fully configured")
+		}
+	}
+	// /test/login mints arbitrary JWTs; arming it on a host that holds real
+	// PayPal client credentials (matching whatever PAYPAL_ENV selects) is
+	// the PayPal-side analog of the WeChat guard above.
+	if c.PaypalL3E2EMode && c.PaypalClientID != "" && c.PaypalClientSecret != "" {
+		return errors.New("PAYPAL_L3_E2E_MODE must not be enabled when real PayPal client credentials (PAYPAL_CLIENT_ID/PAYPAL_CLIENT_SECRET) are configured")
 	}
 	// APIv3Key is 32 bytes exactly — used both as the HMAC key for
 	// inbound signature verification and as the AES-GCM key for resource

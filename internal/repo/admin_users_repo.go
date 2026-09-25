@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -96,13 +97,16 @@ type AdminUsersTx interface {
 	// (GREATEST(expires_at, now()) + days). updated=false means the UPDATE
 	// matched 0 rows — the pre-read active row was concurrently cancelled.
 	ExtendMembershipSub(ctx context.Context, userID string, days int) (updated bool, planID string, expiresAt time.Time, err error)
-	// GetIdempotencyResponse returns the stored first-success response for
+	// GetIdempotencyRecord returns the stored first-success record for
 	// (appID, key), or (nil, nil) when the key has never succeeded.
-	GetIdempotencyResponse(ctx context.Context, appID, key string) (json.RawMessage, error)
+	// RequestHash is nil for rows written before migration 038 — the
+	// service skips the payload check for those.
+	GetIdempotencyRecord(ctx context.Context, appID, key string) (*AdminIdempotencyRecord, error)
 	// InsertIdempotencyKey records a successful response under
-	// (appID, key). inserted=false means a concurrent same-key request
-	// committed first — the caller must roll back and replay that response.
-	InsertIdempotencyKey(ctx context.Context, appID, key, action, target string, response json.RawMessage) (inserted bool, err error)
+	// (appID, key) together with the request-payload digest. inserted=false
+	// means a concurrent same-key request committed first — the caller
+	// must roll back and replay that response.
+	InsertIdempotencyKey(ctx context.Context, appID, key, action, target, requestHash string, response json.RawMessage) (inserted bool, err error)
 	// InsertAudit appends an audit_log row (actor 'admin:<appID>').
 	InsertAudit(ctx context.Context, actor, action, target string, ctxData map[string]any) error
 }
@@ -134,10 +138,10 @@ type AdminUsersRepo interface {
 	OpsPaidUsersActive(ctx context.Context, dayStart, weekStart, monthStart time.Time) (AdminOpsCounts, error)
 	OpsRevenue(ctx context.Context, dayStart, weekStart, monthStart time.Time) (AdminOpsAmounts, error)
 
-	// GetIdempotencyResponse is the non-transactional re-read used after a
+	// GetIdempotencyRecord is the non-transactional re-read used after a
 	// same-key race forced a rollback: the winner's row is committed by
-	// then, so its response can be replayed.
-	GetIdempotencyResponse(ctx context.Context, appID, key string) (json.RawMessage, error)
+	// then, so its response (and payload digest) can be replayed.
+	GetIdempotencyRecord(ctx context.Context, appID, key string) (*AdminIdempotencyRecord, error)
 
 	// WithTx runs fn inside a single transaction (BeginTxx/commit/rollback
 	// dance identical to PlanRepo.WithTx).
@@ -161,7 +165,10 @@ const adminMembershipProduct = "kaya-membership"
 // (SQLSTATE 23505) from InsertMembershipSub: a concurrent grant for the
 // same (user, kaya-membership) won the partial unique index
 // idx_subscriptions_user_product_active. The service layer turns it into
-// an idempotent replay when the request carries an Idempotency-Key.
+// an idempotent replay when the request carries an Idempotency-Key, and
+// into a vip.reject 409 (with the audit row committed in the same tx)
+// when it does not. InsertMembershipSub rolls back to a savepoint before
+// returning this error so the tx stays usable for the audit write.
 var ErrAdminSubscriptionConflict = errors.New("admin: subscription insert conflict")
 
 // isAdminUniqueViolation reports whether err is a Postgres
@@ -303,8 +310,17 @@ func (r *adminUsersRepo) OpsRevenue(ctx context.Context, dayStart, weekStart, mo
 	return a, err
 }
 
-func (r *adminUsersRepo) GetIdempotencyResponse(ctx context.Context, appID, key string) (json.RawMessage, error) {
-	return getIdempotencyResponse(ctx, r.db, appID, key)
+func (r *adminUsersRepo) GetIdempotencyRecord(ctx context.Context, appID, key string) (*AdminIdempotencyRecord, error) {
+	return getIdempotencyRecord(ctx, r.db, appID, key)
+}
+
+// AdminIdempotencyRecord is the stored first-success idempotency row.
+// RequestHash is the service-computed payload digest (migration 038);
+// nil for rows written before that migration, which skip the replay
+// payload check.
+type AdminIdempotencyRecord struct {
+	Response    json.RawMessage
+	RequestHash *string
 }
 
 // idemQuerier abstracts *sqlx.DB and *sqlx.Tx for the shared idempotency
@@ -313,18 +329,18 @@ type idemQuerier interface {
 	QueryRowxContext(ctx context.Context, query string, args ...interface{}) *sqlx.Row
 }
 
-func getIdempotencyResponse(ctx context.Context, q idemQuerier, appID, key string) (json.RawMessage, error) {
-	var response json.RawMessage
+func getIdempotencyRecord(ctx context.Context, q idemQuerier, appID, key string) (*AdminIdempotencyRecord, error) {
+	var rec AdminIdempotencyRecord
 	err := q.QueryRowxContext(ctx, `
-		SELECT response FROM admin_idempotency_keys WHERE app_id = $1 AND key = $2
-	`, appID, key).Scan(&response)
+		SELECT response, request_hash FROM admin_idempotency_keys WHERE app_id = $1 AND key = $2
+	`, appID, key).Scan(&rec.Response, &rec.RequestHash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return response, nil
+	return &rec, nil
 }
 
 func (r *adminUsersRepo) WithTx(ctx context.Context, fn func(tx AdminUsersTx) error) error {
@@ -371,15 +387,27 @@ func (t *adminUsersTx) InsertMembershipSub(ctx context.Context, userID string, d
 	// Explicit product_code matches the 'monthly' plan row, so the
 	// trg_subscriptions_plan_product trigger (027) passes; a missing
 	// 'monthly' plan makes the trigger raise → 500 at the handler.
+	//
+	// The INSERT runs behind a savepoint: a 23505 (concurrent grant won
+	// the partial unique index) aborts the whole Postgres transaction
+	// otherwise, and the service could not write the vip.reject audit row
+	// in the same tx. ROLLBACK TO SAVEPOINT keeps the tx usable.
+	const sp = "admin_vip_insert"
+	if _, err := t.tx.ExecContext(ctx, "SAVEPOINT "+sp); err != nil {
+		return "", time.Time{}, fmt.Errorf("savepoint: %w", err)
+	}
 	err := t.tx.QueryRowxContext(ctx, `
 		INSERT INTO subscriptions (user_id, plan_id, status, started_at, expires_at, product_code)
 		VALUES ($1, 'monthly', 'active', now(), now() + make_interval(days => $2), $3)
 		RETURNING plan_id, expires_at
 	`, userID, days, adminMembershipProduct).Scan(&planID, &expiresAt)
 	if err != nil {
+		if _, rbErr := t.tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT "+sp); rbErr != nil {
+			return "", time.Time{}, fmt.Errorf("rollback to savepoint after insert failure: %v (insert err: %w)", rbErr, err)
+		}
 		if isAdminUniqueViolation(err) {
 			// 并发 grant(同 key 或无 key)赢了部分唯一索引 —— 由 service
-			// 层决定重放(带 Idempotency-Key)还是 500。
+			// 层决定重放(带 Idempotency-Key)还是 vip.reject 409。
 			return "", time.Time{}, ErrAdminSubscriptionConflict
 		}
 		return "", time.Time{}, err
@@ -407,16 +435,16 @@ func (t *adminUsersTx) ExtendMembershipSub(ctx context.Context, userID string, d
 	return true, planID, expiresAt, nil
 }
 
-func (t *adminUsersTx) GetIdempotencyResponse(ctx context.Context, appID, key string) (json.RawMessage, error) {
-	return getIdempotencyResponse(ctx, t.tx, appID, key)
+func (t *adminUsersTx) GetIdempotencyRecord(ctx context.Context, appID, key string) (*AdminIdempotencyRecord, error) {
+	return getIdempotencyRecord(ctx, t.tx, appID, key)
 }
 
-func (t *adminUsersTx) InsertIdempotencyKey(ctx context.Context, appID, key, action, target string, response json.RawMessage) (bool, error) {
+func (t *adminUsersTx) InsertIdempotencyKey(ctx context.Context, appID, key, action, target, requestHash string, response json.RawMessage) (bool, error) {
 	res, err := t.tx.ExecContext(ctx, `
-		INSERT INTO admin_idempotency_keys (app_id, key, action, target, response)
-		VALUES ($1, $2, $3, $4, $5::jsonb)
+		INSERT INTO admin_idempotency_keys (app_id, key, action, target, response, request_hash)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6)
 		ON CONFLICT (app_id, key) DO NOTHING
-	`, appID, key, action, target, response)
+	`, appID, key, action, target, response, requestHash)
 	if err != nil {
 		return false, err
 	}

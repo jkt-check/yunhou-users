@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -14,13 +15,17 @@ import (
 // 有错误时绝不触碰写路径（不半发布的服务层闸）。
 
 // fakeBulkStore answers "nothing exists" to every probe and fails the test
-// if the write path is reached when it must not be.
+// if the write path is reached when it must not be. Once ApplyBulkImportTx
+// runs it records the committed result (with the document digest) so a
+// second Import with the same task_id exercises the replay path.
 type fakeBulkStore struct {
 	t            *testing.T
 	allowApply   bool
 	applied      *BulkCatalog
 	appliedActor string
 	appliedTask  string
+	applyCalls   int
+	stored       *BulkImportResult
 }
 
 func (f *fakeBulkStore) Begin(ctx context.Context) (domain.UnitOfWork, error) { return nil, nil }
@@ -37,6 +42,9 @@ func (f *fakeBulkStore) ListRoutes(ctx context.Context, modelID string) ([]domai
 	return nil, nil
 }
 func (f *fakeBulkStore) GetBulkImportByTaskID(ctx context.Context, taskID string) (*BulkImportResult, error) {
+	if f.stored != nil && f.stored.TaskID == taskID {
+		return f.stored, nil
+	}
 	return nil, domain.NewError(domain.CodeNotFound, "nope")
 }
 func (f *fakeBulkStore) ApplyBulkImportTx(ctx context.Context, w domain.UnitOfWork, taskID, actor string, plan *BulkCatalog) (*BulkImportResult, error) {
@@ -44,7 +52,12 @@ func (f *fakeBulkStore) ApplyBulkImportTx(ctx context.Context, w domain.UnitOfWo
 		f.t.Fatalf("ApplyBulkImportTx reached while document has errors (半发布守卫失效)")
 	}
 	f.applied, f.appliedActor, f.appliedTask = plan, actor, taskID
-	return &BulkImportResult{TaskID: taskID, Items: []BulkItemResult{}}, nil
+	f.applyCalls++
+	f.stored = &BulkImportResult{
+		TaskID: taskID, Committed: true, Items: []BulkItemResult{},
+		DocumentHash: BulkDocumentHash(plan),
+	}
+	return f.stored, nil
 }
 
 func validBulkDoc() *BulkCatalog {
@@ -166,6 +179,90 @@ func TestBulkImport_SizeCap(t *testing.T) {
 	}
 	if !res.HasErrors() || len(res.Items) != 1 || !strings.Contains(res.Items[0].Error, "exceeds limit") {
 		t.Fatalf("size cap result = %+v", res)
+	}
+}
+
+// --- M-4：task_id 幂等重放校验文档哈希（migration 039）——同 task_id 同
+// 文档 → 重放已记录结果；同 task_id 异文档 → 409（键复用，对齐 wallet
+// adjustments / VIP 同键异载荷语义）；034 存量行无摘要 → 跳过比对。 ---
+
+func TestBulkImport_ReplaySameDocReturnsStoredResult(t *testing.T) {
+	fs, _ := newUowFixture(t)
+	svc := NewBulkImportService(fs, nil, func(context.Context, string) error { return nil })
+	doc := validBulkDoc()
+	if _, err := svc.Import(context.Background(), "user:op1@app:ops", "task-replay", doc, false); err != nil {
+		t.Fatal(err)
+	}
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-replay", doc, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Replayed {
+		t.Fatalf("replay result = %+v, want replayed stored result", res)
+	}
+	if fs.applyCalls != 1 {
+		t.Fatalf("applyCalls = %d, want 1 (replay must not re-apply)", fs.applyCalls)
+	}
+}
+
+func TestBulkImport_ReplayDifferentDocIsConflict(t *testing.T) {
+	fs, _ := newUowFixture(t)
+	svc := NewBulkImportService(fs, nil, func(context.Context, string) error { return nil })
+	if _, err := svc.Import(context.Background(), "user:op1@app:ops", "task-replay", validBulkDoc(), false); err != nil {
+		t.Fatal(err)
+	}
+	// 同 task_id，但文档不同（display_name 变了 → 哈希不同）。
+	doc2 := validBulkDoc()
+	doc2.Models[0].DisplayName = "GLM 4.7 Renamed"
+	_, err := svc.Import(context.Background(), "user:op1@app:ops", "task-replay", doc2, false)
+	if err == nil || domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("err = %v, want CodeConflict (409)", err)
+	}
+	if fs.applyCalls != 1 {
+		t.Fatalf("applyCalls = %d, want 1 (mismatch must not re-apply)", fs.applyCalls)
+	}
+}
+
+func TestBulkImport_ReplayLegacyRowWithoutHashSkipsCompare(t *testing.T) {
+	// 034 存量任务行无 document_hash（NULL）：重放按摘要缺失跳过比对，
+	// 保持既有重放语义（与 admin idempotency request_hash NULL 同口径）。
+	fs, _ := newUowFixture(t)
+	fs.stored = &BulkImportResult{TaskID: "task-legacy", Committed: true, Items: []BulkItemResult{}}
+	svc := NewBulkImportService(fs, nil, func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-legacy", validBulkDoc(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Replayed {
+		t.Fatalf("legacy-row replay = %+v, want replayed", res)
+	}
+}
+
+func TestBulkDocumentHash(t *testing.T) {
+	doc := validBulkDoc()
+	h1, h2 := BulkDocumentHash(doc), BulkDocumentHash(doc)
+	if h1 == "" || h1 != h2 {
+		t.Fatalf("hash not deterministic: %q vs %q", h1, h2)
+	}
+	// Wire round-trip（handler 先 decode 再构造 BulkCatalog）：重编码后
+	// 哈希必须一致 —— 写路径（ApplyBulkImportTx 收的是 decode 后的
+	// struct）与重放校验算的是同一摘要。
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTripped BulkCatalog
+	if err := json.Unmarshal(raw, &roundTripped); err != nil {
+		t.Fatal(err)
+	}
+	if h := BulkDocumentHash(&roundTripped); h != h1 {
+		t.Fatalf("round-trip hash = %s, want %s (写/读路径摘要必须同源)", h, h1)
+	}
+	// 任一字段变化 → 摘要必须变化。
+	changed := validBulkDoc()
+	changed.Providers[0].DisplayName = "GLM Renamed"
+	if BulkDocumentHash(changed) == h1 {
+		t.Fatal("different document hashed identical — replay guard toothless")
 	}
 }
 

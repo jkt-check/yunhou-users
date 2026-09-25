@@ -1186,7 +1186,7 @@ func TestAppHandler_ListApps(t *testing.T) {
 			{AppID: "yundash", Name: "Yundash"},
 		}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.GET("/apps", withCallerApp("yundian"), handler.ListApps)
@@ -1209,7 +1209,7 @@ func TestAppHandler_ListApps(t *testing.T) {
 
 	t.Run("list apps error", func(t *testing.T) {
 		appRepo := &mockAppRepo{findErr: errors.New("db error")}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.GET("/apps", withCallerApp("yundian"), handler.ListApps)
@@ -1230,7 +1230,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 	t.Run("get existing app", func(t *testing.T) {
 		apps := []model.App{{AppID: "yundian", Name: "Yundian"}}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.GET("/apps/:id", withCallerApp("yundian"), handler.GetApp)
@@ -1246,7 +1246,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 
 	t.Run("get nonexistent app", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.GET("/apps/:id", withCallerApp("nonexistent"), handler.GetApp)
@@ -1263,7 +1263,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 	t.Run("get foreign app denied", func(t *testing.T) {
 		apps := []model.App{{AppID: "yundash", Name: "Yundash"}}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.GET("/apps/:id", withCallerApp("yundian"), handler.GetApp)
@@ -1281,7 +1281,7 @@ func TestAppHandler_GetApp(t *testing.T) {
 		cfg := `{"payment_providers":{"paypal":{"client_id":"cid","client_secret":"RAW-PP-SECRET","webhook_id":"W","mode":"live"},"wechat_pay":{"mch_id":"m","api_v3_key":"RAW-APIV3-KEY","cert_path":"c","key_path":"k","notify_url":"n"}},"oauth_providers":{"github":{"client_id":"g","client_secret":"RAW-GH-SECRET","callback_urls":["https://x/cb"]},"wechat":{"app_id":"wx0123456789abcdef","app_secret":"RAW-WX-SECRET","callback_urls":["https://x/cb"]}}}`
 		apps := []model.App{{AppID: "yundian", Name: "Yundian", Config: json.RawMessage(cfg)}}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.GET("/apps/:id", withCallerApp("yundian"), handler.GetApp)
@@ -1314,7 +1314,7 @@ func TestAppHandler_CreateApp(t *testing.T) {
 
 	t.Run("create app success", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.POST("/apps", handler.CreateApp)
@@ -1354,7 +1354,7 @@ func TestAppHandler_CreateApp(t *testing.T) {
 
 	t.Run("create app invalid body", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.POST("/apps", handler.CreateApp)
@@ -1372,7 +1372,7 @@ func TestAppHandler_CreateApp(t *testing.T) {
 
 	t.Run("create app with payment_providers config", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.POST("/apps", handler.CreateApp)
@@ -1396,7 +1396,7 @@ func TestAppHandler_CreateApp(t *testing.T) {
 
 	t.Run("create app rejects invalid paypal config", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.POST("/apps", handler.CreateApp)
@@ -1426,7 +1426,7 @@ func TestAppHandler_RotateSecret(t *testing.T) {
 			t.Fatal(err)
 		}
 		appRepo := &mockAppRepo{apps: []model.App{{AppID: "test", Name: "Test", IsActive: true, SecretHash: oldHash}}}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.POST("/apps/:id/rotate-secret", withCallerApp("test"), handler.RotateSecret)
@@ -1464,7 +1464,7 @@ func TestAppHandler_RotateSecret(t *testing.T) {
 
 	t.Run("rotate secret for unknown app", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.POST("/apps/:id/rotate-secret", withCallerApp("missing"), handler.RotateSecret)
@@ -1485,7 +1485,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 	t.Run("update app success", func(t *testing.T) {
 		apps := []model.App{{AppID: "test", Name: "Old Name"}}
 		appRepo := &mockAppRepo{apps: apps}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.PATCH("/apps/:id", withCallerApp("test"), handler.UpdateApp)
@@ -1503,7 +1503,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 
 	t.Run("update nonexistent app", func(t *testing.T) {
 		appRepo := &mockAppRepo{}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 
 		router := gin.New()
 		router.PATCH("/apps/:id", withCallerApp("nonexistent"), handler.UpdateApp)
@@ -1525,7 +1525,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 			{AppID: "site", Name: "x", Config: json.RawMessage(`{"old":"value"}`)},
 		}
 		appRepo := &mockAppRepo{apps: existing}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 		router := gin.New()
 		router.PATCH("/apps/:id", withCallerApp("site"), handler.UpdateApp)
 
@@ -1554,7 +1554,7 @@ func TestAppHandler_UpdateApp(t *testing.T) {
 		gin.SetMode(gin.TestMode)
 		existing := []model.App{{AppID: "site", Name: "x"}}
 		appRepo := &mockAppRepo{apps: existing}
-		handler := NewAppHandler(appRepo, nil)
+		handler := NewAppHandler(appRepo, nil, nil)
 		router := gin.New()
 		router.PATCH("/apps/:id", withCallerApp("site"), handler.UpdateApp)
 
@@ -2406,7 +2406,7 @@ func TestAuthHandler_Logout_ErrorPaths(t *testing.T) {
 func newAppEngine(repo *mockAppRepo) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	h := NewAppHandler(repo, nil)
+	h := NewAppHandler(repo, nil, nil)
 	// Tests in this file target the app "yundian"; the caller-app middleware
 	// mimics InternalAppAuth so selfAppOnly lets the request through.
 	engine.GET("/apps/:id", withCallerApp("yundian"), h.GetApp)
@@ -2583,7 +2583,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 	t.Run("paypal success", func(t *testing.T) {
 		appRepo := &mockAppRepo{apps: []model.App{{AppID: "site", IsActive: true}}}
 		pt := &fakeProviderToken{result: &model.ProviderToken{Channel: "paypal", AccessToken: "AT", ExpiresIn: 3600}}
-		handler := NewAppHandler(appRepo, pt)
+		handler := NewAppHandler(appRepo, pt, nil)
 		router := gin.New()
 		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
@@ -2611,7 +2611,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 
 	t.Run("unsupported channel returns 400", func(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrUnsupportedChannel}
-		handler := NewAppHandler(&mockAppRepo{}, pt)
+		handler := NewAppHandler(&mockAppRepo{}, pt, nil)
 		router := gin.New()
 		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
@@ -2626,7 +2626,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 
 	t.Run("provider not configured returns 400", func(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrProviderNotConfigured}
-		handler := NewAppHandler(&mockAppRepo{}, pt)
+		handler := NewAppHandler(&mockAppRepo{}, pt, nil)
 		router := gin.New()
 		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
@@ -2641,7 +2641,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 
 	t.Run("app inactive returns 403", func(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrAppInactive}
-		handler := NewAppHandler(&mockAppRepo{}, pt)
+		handler := NewAppHandler(&mockAppRepo{}, pt, nil)
 		router := gin.New()
 		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 
@@ -2656,7 +2656,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 
 	t.Run("app not found returns 404", func(t *testing.T) {
 		pt := &fakeProviderToken{err: service.ErrAppNotFound}
-		handler := NewAppHandler(&mockAppRepo{}, pt)
+		handler := NewAppHandler(&mockAppRepo{}, pt, nil)
 		router := gin.New()
 		router.GET("/apps/:id/provider-token/:channel", withCallerApp("missing"), handler.GetProviderToken)
 
@@ -2671,7 +2671,7 @@ func TestAppHandler_GetProviderToken(t *testing.T) {
 
 	t.Run("upstream error returns 502", func(t *testing.T) {
 		pt := &fakeProviderToken{err: errors.New("upstream failed")}
-		handler := NewAppHandler(&mockAppRepo{}, pt)
+		handler := NewAppHandler(&mockAppRepo{}, pt, nil)
 		router := gin.New()
 		router.GET("/apps/:id/provider-token/:channel", withCallerApp("site"), handler.GetProviderToken)
 

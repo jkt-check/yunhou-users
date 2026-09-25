@@ -76,6 +76,32 @@ func TestAdminOpsMetricsService(t *testing.T) {
 		}
 	})
 
+	t.Run("tz=Local is rejected (M-7)", func(t *testing.T) {
+		// LoadLocation("Local") is accepted by the stdlib but resolves to
+		// the container clock (UTC in practice) — an operator who thinks
+		// they pinned a tz has silently got UTC. Must be a 400, not a
+		// silent UTC result.
+		fake := &fakeAdminUsersRepo{}
+		svc := NewAdminOpsService(fake)
+		_, err := svc.Metrics(context.Background(), "Local")
+		var pe *AdminParamError
+		if !errors.As(err, &pe) {
+			t.Fatalf("err = %v, want AdminParamError", err)
+		}
+		if !fake.gotOpsBounds[0].IsZero() {
+			t.Fatalf("rejected tz must not reach the repo: %+v", fake.gotOpsBounds)
+		}
+	})
+
+	t.Run("explicit IANA tz and UTC are accepted", func(t *testing.T) {
+		svc := NewAdminOpsService(&fakeAdminUsersRepo{})
+		for _, tz := range []string{"Asia/Shanghai", "UTC", "America/New_York"} {
+			if _, err := svc.Metrics(context.Background(), tz); err != nil {
+				t.Fatalf("tz %q rejected: %v", tz, err)
+			}
+		}
+	})
+
 	t.Run("empty tz defaults to Asia/Shanghai", func(t *testing.T) {
 		fake := &fakeAdminUsersRepo{}
 		svc := NewAdminOpsService(fake)

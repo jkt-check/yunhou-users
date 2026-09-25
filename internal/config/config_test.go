@@ -775,6 +775,7 @@ func TestValidate_WeChatReal_AllSixSet_OK(t *testing.T) {
 // outbound signing path, so there is no material to load.
 func TestValidate_WeChatMock_AllowsEmpty(t *testing.T) {
 	t.Setenv("OAUTH_STATE_SECRET", "test-state-secret-thirty-two-bytes-min-len")
+	t.Setenv("APP_ENV", "dev") // mock switches require a non-production APP_ENV
 	t.Setenv("WECHAT_PAY_MOCK", "1")
 	// No wechat pay envs at all — mock mode must not block boot.
 	c := Load()
@@ -911,6 +912,7 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 	t.Run("mock mode, empty MCH_ID → ok", func(t *testing.T) {
 		t.Parallel()
 		cfg := base()
+		cfg.AppEnv = "dev" // mock switches require a non-production APP_ENV
 		cfg.WeChatPayMock = true
 		cfg.WeChatPayMchID = ""
 		if err := cfg.Validate(); err != nil {
@@ -947,8 +949,9 @@ func TestParseDurationOr(t *testing.T) {
 // TestValidate_MockModeProductionGuards covers the startup hard-fail rules
 // for the dev/e2e escape hatches (test login, WeChat OAuth mock, WeChat Pay
 // mock): each bypasses a real security boundary, so combining any of them
-// with a production signal (PAYPAL_ENV=live, or a fully-populated real
-// WeChat Pay credential tuple) must refuse to start.
+// with a production signal (APP_ENV=prod — the primary signal, independent
+// of PayPal; PAYPAL_ENV=live; or fully-populated real credentials) must
+// refuse to start.
 func TestValidate_MockModeProductionGuards(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
@@ -962,6 +965,7 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 			SweeperInterval:        1 * time.Minute,
 			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
 			InferenceRecoveryGrace: 15 * time.Minute,
+			AppEnv:                 "dev",
 			// WeChat Pay disabled (all six fields empty) — valid real mode.
 		}
 	}
@@ -974,6 +978,50 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 		cfg.WeChatOAuthMock = true
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("dev/e2e combination should validate, got: %v", err)
+		}
+	})
+
+	t.Run("mock flags with APP_ENV unset (zero value) → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.AppEnv = "" // Load() defaults unset APP_ENV to "prod" — both are production
+		cfg.WeChatPayMock = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_PAY_MOCK") {
+			t.Errorf("want WECHAT_PAY_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("mock flags with APP_ENV=production → rejected", func(t *testing.T) {
+		t.Parallel()
+		for _, env := range []string{"prod", "production"} {
+			for switchName, enable := range map[string]func(*Config){
+				"PAYPAL_L3_E2E_MODE": func(c *Config) { c.PaypalL3E2EMode = true },
+				"WECHAT_PAY_MOCK":    func(c *Config) { c.WeChatPayMock = true },
+				"WECHAT_OAUTH_MOCK":  func(c *Config) { c.WeChatOAuthMock = true },
+			} {
+				cfg := base()
+				cfg.AppEnv = env
+				enable(cfg)
+				err := cfg.Validate()
+				if err == nil || !strings.Contains(err.Error(), switchName) {
+					t.Errorf("APP_ENV=%s: want %s rejection, got: %v", env, switchName, err)
+				}
+			}
+		}
+	})
+
+	t.Run("mock flags with APP_ENV=staging → ok", func(t *testing.T) {
+		t.Parallel()
+		for _, env := range []string{"staging", "dev", "test"} {
+			cfg := base()
+			cfg.AppEnv = env
+			cfg.PaypalL3E2EMode = true
+			cfg.WeChatPayMock = true
+			cfg.WeChatOAuthMock = true
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("APP_ENV=%s: dev/staging combination should validate, got: %v", env, err)
+			}
 		}
 	})
 
@@ -1010,7 +1058,7 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 		}
 	})
 
-	t.Run("mock + full real wechat credentials → rejected", func(t *testing.T) {
+	t.Run("wechat pay mock + full real wechat credentials → rejected", func(t *testing.T) {
 		t.Parallel()
 		cfg := base()
 		cfg.WeChatPayMock = true
@@ -1026,6 +1074,44 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 		}
 	})
 
+	t.Run("wechat oauth mock + full real wechat credentials → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.WeChatOAuthMock = true
+		cfg.WeChatPayMchID = "1900000001"
+		cfg.WeChatAPIv3Key = "0123456789abcdef0123456789abcdef"
+		cfg.WeChatPayAppID = "wx1900000109"
+		cfg.WeChatPayMchPrivateKeyPath = "/k"
+		cfg.WeChatPayMchCertPath = "/c"
+		cfg.WeChatPayNotifyURL = "https://x/cb"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_OAUTH_MOCK") {
+			t.Errorf("want WECHAT_OAUTH_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("test login + real paypal client credentials → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.PaypalL3E2EMode = true
+		cfg.PaypalClientID = "paypal-real-client-id"
+		cfg.PaypalClientSecret = "paypal-real-client-secret"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "PAYPAL_L3_E2E_MODE") {
+			t.Errorf("want PAYPAL_L3_E2E_MODE rejection, got: %v", err)
+		}
+	})
+
+	t.Run("test login + only paypal client id → ok", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.PaypalL3E2EMode = true
+		cfg.PaypalClientID = "paypal-real-client-id"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("partial PayPal creds with e2e mode should validate, got: %v", err)
+		}
+	})
+
 	t.Run("mock + partial wechat credentials → ok (staging form)", func(t *testing.T) {
 		t.Parallel()
 		cfg := base()
@@ -1035,6 +1121,94 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 			t.Errorf("partial creds in mock mode should validate, got: %v", err)
 		}
 	})
+}
+
+// TestConfig_CNProd_RefusesMockSwitches simulates the cn-prod deployment
+// exactly as audited (audit C-1): a WeChat-Pay production host with NO
+// PAYPAL_ENV configured, real WeChat Pay merchant credentials fully
+// populated, and APP_ENV=prod. Before the fix the production guard hung off
+// PAYPAL_ENV=live, which never fires here — every mock/backdoor switch ran
+// unguarded. Now startup must refuse for each switch.
+func TestConfig_CNProd_RefusesMockSwitches(t *testing.T) {
+	t.Parallel()
+	cnProd := func() *Config {
+		return &Config{
+			DatabaseURL:            "postgres://x",
+			RSAPrivate:             "priv",
+			RSAPublic:              "pub",
+			JWTAccessTTL:           15 * time.Minute,
+			JWTRefreshTTL:          168 * time.Hour,
+			OrderExpiryDuration:    30 * time.Minute,
+			SweeperInterval:        1 * time.Minute,
+			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace: 15 * time.Minute,
+			AppEnv:                 "prod",
+			// cn-prod: WeChat-Pay deployment, PayPal never configured.
+			PaypalEnv: "",
+			// Real WeChat Pay credentials fully configured.
+			WeChatPayMchID:             "1900000001",
+			WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef",
+			WeChatPayAppID:             "wx1900000109",
+			WeChatPayMchPrivateKeyPath: "/k",
+			WeChatPayMchCertPath:       "/c",
+			WeChatPayNotifyURL:         "https://x/cb",
+		}
+	}
+
+	t.Run("WECHAT_PAY_MOCK on → startup refuses", func(t *testing.T) {
+		t.Parallel()
+		cfg := cnProd()
+		cfg.WeChatPayMock = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_PAY_MOCK") {
+			t.Errorf("cn-prod: want WECHAT_PAY_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("WECHAT_OAUTH_MOCK on → startup refuses", func(t *testing.T) {
+		t.Parallel()
+		cfg := cnProd()
+		cfg.WeChatOAuthMock = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "WECHAT_OAUTH_MOCK") {
+			t.Errorf("cn-prod: want WECHAT_OAUTH_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("PAYPAL_L3_E2E_MODE on → startup refuses", func(t *testing.T) {
+		t.Parallel()
+		cfg := cnProd()
+		cfg.PaypalL3E2EMode = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "PAYPAL_L3_E2E_MODE") {
+			t.Errorf("cn-prod: want PAYPAL_L3_E2E_MODE rejection, got: %v", err)
+		}
+	})
+
+	t.Run("all switches off → startup passes", func(t *testing.T) {
+		t.Parallel()
+		if err := cnProd().Validate(); err != nil {
+			t.Errorf("cn-prod with all switches off should start, got: %v", err)
+		}
+	})
+}
+
+// TestIsProductionEnv pins the APP_ENV classification used to gate the
+// mock/backdoor switches: only the explicit non-production allowlist passes;
+// everything else (including unset/empty and unrecognized values) is
+// production — fail closed.
+func TestIsProductionEnv(t *testing.T) {
+	t.Parallel()
+	for _, env := range []string{"dev", "development", "staging", "test", "local", "e2e", " DEV ", "Staging"} {
+		if IsProductionEnv(env) {
+			t.Errorf("IsProductionEnv(%q) = true, want false", env)
+		}
+	}
+	for _, env := range []string{"prod", "production", "", "prd", "PROD", "unknown-env", "production-cn"} {
+		if !IsProductionEnv(env) {
+			t.Errorf("IsProductionEnv(%q) = false, want true", env)
+		}
+	}
 }
 
 // TestValidate_LLMCatalog walks the multi-model catalog branch: a malformed
@@ -1102,6 +1276,42 @@ func TestValidate_LLMCatalog(t *testing.T) {
 		cfg.LLMProvidersJSON = `{"providers":{"p":{"protocol":"openai","base_url":"https://x.example","api_keys":["k"]}},"models":{"m":{"provider":"p","upstream_model":"u"}}}`
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("valid catalog rejected: %v", err)
+		}
+	})
+}
+
+// TestLoad_DashboardAppIDs covers the audit-I-2 allowlist parsing:
+// comma-separated env, whitespace trimming, empty items dropped, and an
+// unset env yielding a nil (empty) list — the value the cmd/server
+// startup gate refuses to run with.
+func TestLoad_DashboardAppIDs(t *testing.T) {
+	orig, had := os.LookupEnv("DASHBOARD_APP_IDS")
+	os.Unsetenv("DASHBOARD_APP_IDS")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("DASHBOARD_APP_IDS", orig)
+		} else {
+			os.Unsetenv("DASHBOARD_APP_IDS")
+		}
+	})
+
+	t.Run("unset yields empty list", func(t *testing.T) {
+		if got := Load().DashboardAppIDs; len(got) != 0 {
+			t.Errorf("unset: got %v, want empty", got)
+		}
+	})
+
+	t.Run("csv parsed with trimming", func(t *testing.T) {
+		t.Setenv("DASHBOARD_APP_IDS", " yundash , yundian ,, ")
+		got := Load().DashboardAppIDs
+		want := []string{"yundash", "yundian"}
+		if len(got) != len(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("index %d: got %q, want %q", i, got[i], want[i])
+			}
 		}
 	})
 }

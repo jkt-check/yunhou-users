@@ -619,6 +619,95 @@ func TestAccountServiceUpdateValidation(t *testing.T) {
 	}
 }
 
+// 审查修复 M-9：concurrency_limit 必须有上限——它是单账号对单一上游凭据
+// 的在飞租约天花板，2^31 之类的值等于悄悄关掉每账号并发控制。上限之上
+// → 400；恰在上限 → 通过；显式 0（备而不用）→ 通过。
+func TestAccountServiceConcurrencyLimitCap(t *testing.T) {
+	t.Run("create above cap -> 400", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		huge := maxConcurrencyLimit + 1
+		in := validCreateInput(provID, credID)
+		in.ConcurrencyLimit = &huge
+		_, err := svc.Create(context.Background(), testOp(), in)
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Fatalf("code = %s, want invalid_input (err=%v)", domain.CodeOf(err), err)
+		}
+		if len(store.accounts) != 0 {
+			t.Fatalf("accounts = %d, want 0 (rejected write must not land)", len(store.accounts))
+		}
+	})
+
+	t.Run("create at cap -> ok", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		at := maxConcurrencyLimit
+		in := validCreateInput(provID, credID)
+		in.ConcurrencyLimit = &at
+		acct, err := svc.Create(context.Background(), testOp(), in)
+		if err != nil {
+			t.Fatalf("create at cap: %v", err)
+		}
+		if acct.ConcurrencyLimit != maxConcurrencyLimit {
+			t.Fatalf("concurrency = %d, want %d", acct.ConcurrencyLimit, maxConcurrencyLimit)
+		}
+	})
+
+	t.Run("create zero -> ok (备而不用)", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		zero := 0
+		in := validCreateInput(provID, credID)
+		in.ConcurrencyLimit = &zero
+		if _, err := svc.Create(context.Background(), testOp(), in); err != nil {
+			t.Fatalf("create zero: %v", err)
+		}
+	})
+
+	t.Run("update above cap -> 400 and value unchanged", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		huge := 1 << 31
+		_, err = svc.Update(context.Background(), testOp(), acct.ID, nil, &huge, "x")
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Fatalf("code = %s, want invalid_input (err=%v)", domain.CodeOf(err), err)
+		}
+		stored, err := store.GetUpstreamAccount(context.Background(), acct.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.ConcurrencyLimit != 1 {
+			t.Fatalf("stored concurrency = %d, want unchanged 1", stored.ConcurrencyLimit)
+		}
+	})
+
+	t.Run("update at cap -> ok", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		at := maxConcurrencyLimit
+		got, err := svc.Update(context.Background(), testOp(), acct.ID, nil, &at, "拉满单账号并发")
+		if err != nil {
+			t.Fatalf("update at cap: %v", err)
+		}
+		if got.ConcurrencyLimit != maxConcurrencyLimit {
+			t.Fatalf("concurrency = %d, want %d", got.ConcurrencyLimit, maxConcurrencyLimit)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // 事务路径 fake（驱动 runAtomicAccounts 的同事务分支 + 凭据行锁复查）
 // ---------------------------------------------------------------------------
@@ -640,6 +729,12 @@ type txAccountStore struct {
 	lastUoW    *fakeUoW
 	lockedCred *domain.Credential
 	inserted   bool
+	// 审查修复 I-5：记录行锁复查与状态写入各自见到的 UnitOfWork 及
+	// 调用次数，断言两者在同一事务内、且复查先于状态写入。
+	lockUoW     domain.UnitOfWork
+	lockCalls   int
+	statusUoW   domain.UnitOfWork
+	statusCalls int
 }
 
 func (s *txAccountStore) Begin(context.Context) (domain.UnitOfWork, error) {
@@ -647,7 +742,9 @@ func (s *txAccountStore) Begin(context.Context) (domain.UnitOfWork, error) {
 	return s.lastUoW, nil
 }
 
-func (s *txAccountStore) GetCredentialForUpdateTx(_ context.Context, _ domain.UnitOfWork, id string) (*domain.Credential, error) {
+func (s *txAccountStore) GetCredentialForUpdateTx(_ context.Context, w domain.UnitOfWork, id string) (*domain.Credential, error) {
+	s.lockUoW = w
+	s.lockCalls++
 	if s.lockedCred != nil {
 		cp := *s.lockedCred
 		return &cp, nil
@@ -660,7 +757,9 @@ func (s *txAccountStore) InsertUpstreamAccountTx(ctx context.Context, _ domain.U
 	return s.InsertUpstreamAccount(ctx, a)
 }
 
-func (s *txAccountStore) SetUpstreamAccountStatusConditionalTx(ctx context.Context, _ domain.UnitOfWork, id string, from []domain.UpstreamAccountStatus, to domain.UpstreamAccountStatus) (bool, error) {
+func (s *txAccountStore) SetUpstreamAccountStatusConditionalTx(ctx context.Context, w domain.UnitOfWork, id string, from []domain.UpstreamAccountStatus, to domain.UpstreamAccountStatus) (bool, error) {
+	s.statusUoW = w
+	s.statusCalls++
 	return s.SetUpstreamAccountStatusConditional(ctx, id, from, to)
 }
 
@@ -735,5 +834,151 @@ func TestAccountServiceCreateTxPathCommitsAtomically(t *testing.T) {
 	}
 	if acct.Status != domain.AccountActive {
 		t.Fatalf("status = %s, want active", acct.Status)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 审查修复 I-5：SetStatus 激活路径的凭据 revoked 检查必须在事务内
+// ---------------------------------------------------------------------------
+
+// 激活路径：凭据的 FOR UPDATE 复查与账号状态写入必须见到同一个
+// UnitOfWork，且复查先于状态写入。
+func TestAccountServiceSetStatusActivateCredentialCheckInSameTx(t *testing.T) {
+	mem := newMemAccountStore()
+	provID, credID := seedAccountFixtures(mem)
+	store := &txAccountStore{memAccountStore: mem}
+	rec := &txMemRecorder{}
+	svc := NewAccountService(store, rec)
+
+	acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SetStatus(context.Background(), testOp(), acct.ID, "disabled", "off"); err != nil {
+		t.Fatal(err)
+	}
+	store.lockCalls, store.statusCalls = 0, 0
+
+	if _, err := svc.SetStatus(context.Background(), testOp(), acct.ID, "active", "恢复调度"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	if store.lockCalls != 1 {
+		t.Fatalf("in-tx credential re-checks = %d, want 1", store.lockCalls)
+	}
+	if store.statusCalls != 1 {
+		t.Fatalf("status writes = %d, want 1", store.statusCalls)
+	}
+	if store.lockUoW == nil || store.lockUoW != store.statusUoW {
+		t.Fatalf("credential re-check uow = %p, status write uow = %p — must be the SAME UnitOfWork",
+			store.lockUoW, store.statusUoW)
+	}
+	if store.lastUoW == nil || !store.lastUoW.committed || store.lastUoW.rolledBack {
+		t.Fatalf("uow = %+v, want committed and not rolled back", store.lastUoW)
+	}
+	if store.accounts[acct.ID].Status != domain.AccountActive {
+		t.Fatalf("status = %s, want active", store.accounts[acct.ID].Status)
+	}
+	if rec.find("upstream_account.status") == nil {
+		t.Fatal("missing status audit on activate tx path")
+	}
+}
+
+// TOCTOU：预检通过但事务内复查（持行锁）看到凭据已被并发吊销 → 激活
+// 整体 409 回滚：状态保持 disabled、状态写入未执行、审计未提交。
+func TestAccountServiceSetStatusActivateRevokedMidTxRollsBack(t *testing.T) {
+	mem := newMemAccountStore()
+	provID, credID := seedAccountFixtures(mem)
+	store := &txAccountStore{memAccountStore: mem}
+	svc := NewAccountService(store, &txMemRecorder{})
+
+	acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SetStatus(context.Background(), testOp(), acct.ID, "disabled", "off"); err != nil {
+		t.Fatal(err)
+	}
+	store.lockCalls, store.statusCalls = 0, 0
+
+	// 预检可见的凭据仍是 active，但事务内复查看到 revoked（并发吊销在
+	// 预检与提交之间落地——正是事务外检查闭不掉的窗口）。
+	revoked := *mem.creds[credID]
+	revoked.Status = "revoked"
+	store.lockedCred = &revoked
+
+	_, err = svc.SetStatus(context.Background(), testOp(), acct.ID, "active", "restore")
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("code = %s, want conflict (err=%v)", domain.CodeOf(err), err)
+	}
+	if store.statusCalls != 0 {
+		t.Fatalf("status writes = %d, want 0 (re-check must run before the write)", store.statusCalls)
+	}
+	if store.accounts[acct.ID].Status != domain.AccountDisabled {
+		t.Fatalf("status = %s, want disabled (tx rolled back)", store.accounts[acct.ID].Status)
+	}
+	if store.lastUoW == nil || store.lastUoW.committed || !store.lastUoW.rolledBack {
+		t.Fatalf("uow = %+v, want rolled back and not committed", store.lastUoW)
+	}
+}
+
+// 幂等激活分支：同样的事务内复查——账号已 active、凭据复查见 revoked →
+// 409 回滚，不得 noop 成功，审计不得提交。
+func TestAccountServiceSetStatusNoopActivateRevokedInTx(t *testing.T) {
+	mem := newMemAccountStore()
+	provID, credID := seedAccountFixtures(mem)
+	store := &txAccountStore{memAccountStore: mem}
+	rec := &txMemRecorder{}
+	svc := NewAccountService(store, rec)
+
+	acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 预检可见的凭据是 active；事务内复查看到 revoked。
+	revoked := *mem.creds[credID]
+	revoked.Status = "revoked"
+	store.lockedCred = &revoked
+
+	_, err = svc.SetStatus(context.Background(), testOp(), acct.ID, "active", "repeat")
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("code = %s, want conflict (err=%v)", domain.CodeOf(err), err)
+	}
+	if store.lastUoW == nil || store.lastUoW.committed || !store.lastUoW.rolledBack {
+		t.Fatalf("uow = %+v, want rolled back and not committed", store.lastUoW)
+	}
+	if n := len(rec.events); n != 1 { // 只有 create 一条；noop 审计不得提交
+		t.Fatalf("audit events = %d, want 1 (create only; noop audit must not commit)", n)
+	}
+}
+
+// 幂等激活正常定序：事务内复查通过 → noop 审计同事务提交。
+func TestAccountServiceSetStatusNoopActivateInTxCommits(t *testing.T) {
+	mem := newMemAccountStore()
+	provID, credID := seedAccountFixtures(mem)
+	store := &txAccountStore{memAccountStore: mem}
+	rec := &txMemRecorder{}
+	svc := NewAccountService(store, rec)
+
+	acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.lockCalls = 0 // Create 自身也做一次行锁复查，复位后再数 SetStatus 的
+	got, err := svc.SetStatus(context.Background(), testOp(), acct.ID, "active", "repeat")
+	if err != nil {
+		t.Fatalf("noop activate must succeed: %v", err)
+	}
+	if got.Status != domain.AccountActive {
+		t.Fatalf("status = %s, want active", got.Status)
+	}
+	if store.lockCalls != 1 {
+		t.Fatalf("in-tx credential re-checks = %d, want 1", store.lockCalls)
+	}
+	if store.lastUoW == nil || !store.lastUoW.committed || store.lastUoW.rolledBack {
+		t.Fatalf("uow = %+v, want committed and not rolled back", store.lastUoW)
+	}
+	ev := rec.find("upstream_account.status")
+	if ev == nil || ev.Detail["noop"] != true {
+		t.Fatalf("noop audit = %+v, want noop:true", ev)
 	}
 }

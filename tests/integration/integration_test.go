@@ -153,6 +153,9 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 		RSAPrivate:       testKeyPriv,
 		RSAPublic:        testKeyPub,
 		OAuthStateSecret: "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		// Non-production signal: PAYPAL_L3_E2E_MODE is set below, and the
+		// mock/backdoor switches refuse to arm under a production APP_ENV.
+		AppEnv: "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -179,8 +182,9 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
-		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, nil, nil, nil, nil)
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, cfg.AppEnv, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, nil, nil, nil, nil,
+		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 
 	return httptest.NewServer(engine)
 }
@@ -699,6 +703,10 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 		JWTRefreshTTL:       168 * time.Hour,
 		OrderExpiryDuration: 30 * time.Minute,
 		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		// Non-production signal: wechatPayMock + PAYPAL_L3_E2E_MODE are
+		// armed below; the mock/backdoor switches refuse to arm under a
+		// production APP_ENV.
+		AppEnv: "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -755,10 +763,11 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 	// wechatPayMock=true flips the webhook verifier + handler mock branches
 	// in lockstep (plaintext body accepted, HMAC bypassed).
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, cfg.AppEnv, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil,
+		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 
 	return httptest.NewServer(engine)
 }

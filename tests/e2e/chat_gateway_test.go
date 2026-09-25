@@ -138,6 +138,7 @@ func chatE2EBase(t *testing.T) (*sqlx.DB, *service.TokenService, *service.AuthSe
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     time.Minute,
 		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		AppEnv:              "e2e",
 	}
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
@@ -157,12 +158,13 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 	tokenSvc *service.TokenService, authSvc *service.AuthService,
 	chatSvc *service.ChatService, accessOps *httpapi.AccessOps) {
 	router.Setup(ctx, engine, db,
-		repo.NewAppRepo(db), repo.NewUserRepo(db), repo.NewSocialIdentityRepo(db),
+		repo.NewAppRepo(db), repo.NewAuditLogRepo(db), repo.NewUserRepo(db), repo.NewSocialIdentityRepo(db),
 		repo.NewPlanRepo(db), repo.NewSubscriptionRepo(db), repo.NewSessionRepo(db),
 		tokenSvc, authSvc, nil, nil, nil,
 		&middleware.MultiChannelVerifier{}, nil,
-		nil, nil, chatSvc, nil, nil, nil, false, false,
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil)
+		nil, nil, chatSvc, nil, nil, nil, false, false, "e2e",
+		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil,
+		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 }
 
 // setupChatE2E builds the engine in LEGACY mode: a real ChatService pointed

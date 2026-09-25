@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/repo"
+	"github.com/yunhou/users/internal/util"
 )
 
 // Dashboard 运营 admin API e2e(dashboard-admin-api spec §7 验收矩阵)。
@@ -784,5 +785,51 @@ func TestE2E_AdminExtendMembershipSubNoActiveRow(t *testing.T) {
 	}
 	if updated {
 		t.Fatal("extend on no-sub user must report updated=false")
+	}
+}
+
+// TestE2E_AdminOpsDashboardAllowlist is the audit-I-2 e2e: the dashboard
+// 运营面 requires BOTH a valid app secret (InternalAppAuth) AND membership
+// in the DASHBOARD_APP_IDS allowlist. A fully authenticated app that is
+// not allowlisted gets 403, not 404 — the route exists, the app is simply
+// forbidden.
+func TestE2E_AdminOpsDashboardAllowlist(t *testing.T) {
+	engine, _, db := setupE2EServer(t)
+	ctx := context.Background()
+
+	// 第三个 app:凭据完全有效(与种子 app 同一 secret),但不在白名单。
+	hash, err := util.HashSecret(e2eAppSecret)
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO apps (app_id, name, is_active, secret_hash)
+		VALUES ('intruder-app', 'Not Allowlisted', true, $1)
+		ON CONFLICT (app_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash
+	`, hash); err != nil {
+		t.Fatalf("seed intruder app: %v", err)
+	}
+
+	uid := "3f6b0d4e-7c2a-4c1a-9a4b-2f2c0d5e8a11"
+	intruder := appAuthHeadersWithSecret("intruder-app", e2eAppSecret)
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/admin/ops/metrics"},
+		{http.MethodGet, "/admin/users/search?q=x"},
+		{http.MethodGet, "/admin/users/" + uid},
+		{http.MethodPost, "/admin/users/" + uid + "/vip"},
+	} {
+		resp := doRequest(t, engine, tc.method, tc.path, `{"days":30}`, intruder)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s %s: got %d, want 403 (valid secret but not allowlisted)", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+
+	// 对照:白名单内 app 凭同一组端点可达(200/400 均证明非 403 拦截)。
+	allowlisted := appAuthHeaders(superAppID)
+	code, _ := adminGet(t, engine, "/admin/ops/metrics", allowlisted)
+	if code == http.StatusForbidden {
+		t.Fatal("allowlisted app got 403 on /admin/ops/metrics")
 	}
 }

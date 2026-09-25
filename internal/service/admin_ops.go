@@ -52,15 +52,12 @@ type AdminOpsMetrics struct {
 	Revenue AdminOpsRevenueBucket `json:"revenue"`
 }
 
-// Metrics validates tz (time.LoadLocation) and assembles the metric
-// buckets. An unloadable tz is a 400 (AdminParamError), never a 500.
+// Metrics validates tz and assembles the metric buckets. An unloadable tz
+// is a 400 (AdminParamError), never a 500.
 func (s *AdminOpsService) Metrics(ctx context.Context, tz string) (*AdminOpsMetrics, error) {
-	if tz == "" {
-		tz = AdminOpsDefaultTZ
-	}
-	loc, err := time.LoadLocation(tz)
+	loc, err := loadOpsLocation(tz)
 	if err != nil {
-		return nil, &AdminParamError{Reason: fmt.Sprintf("invalid tz: %q", tz)}
+		return nil, err
 	}
 
 	dayStart, weekStart, monthStart := opsWindowBounds(time.Now(), loc)
@@ -89,6 +86,29 @@ func (s *AdminOpsService) Metrics(ctx context.Context, tz string) (*AdminOpsMetr
 	out.PaidUsers.Cumulative = AdminOpsCountBucket(paidCum)
 	out.PaidUsers.Active = AdminOpsCountBucket(paidAct)
 	return out, nil
+}
+
+// loadOpsLocation resolves the tz query param to a *time.Location.
+// Empty falls back to the spec default (AdminOpsDefaultTZ). "Local" is
+// REJECTED explicitly (M-7): time.LoadLocation("Local") is accepted by the
+// stdlib but in containers resolves to the image's /etc/localtime — which
+// is UTC in practice — so an operator who thinks they pinned a timezone has
+// silently got UTC. Same for "": LoadLocation("") returns UTC silently,
+// so it must never reach the stdlib (the default above is the only empty
+// fallback). Operators must name an explicit IANA zone (e.g.
+// Asia/Shanghai) or UTC.
+func loadOpsLocation(tz string) (*time.Location, error) {
+	if tz == "" {
+		tz = AdminOpsDefaultTZ
+	}
+	if tz == "Local" {
+		return nil, &AdminParamError{Reason: `invalid tz: "Local" is not accepted — it silently resolves to the container's clock (UTC in practice); use an explicit IANA name (e.g. Asia/Shanghai) or "UTC"`}
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, &AdminParamError{Reason: fmt.Sprintf("invalid tz: %q", tz)}
+	}
+	return loc, nil
 }
 
 // opsWindowBounds computes the today/this-week/this-month start instants

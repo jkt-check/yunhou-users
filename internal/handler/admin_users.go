@@ -126,6 +126,10 @@ func writeAdminUsersServiceError(c *gin.Context, err error) {
 		writeAdminUsersError(c, http.StatusNotFound, "用户不存在")
 	case errors.Is(err, service.ErrAdminVipRejected):
 		writeAdminUsersError(c, http.StatusConflict, err.Error())
+	case errors.Is(err, service.ErrAdminIdemPayloadMismatch):
+		// 同幂等键 + 不同载荷 = 调用方键复用错误，按 409 拒绝而非当
+		// 良性重放（与 wallet adjustments 面一致）。
+		writeAdminUsersError(c, http.StatusConflict, err.Error())
 	default:
 		log.Printf("admin users: %v", err)
 		writeAdminUsersError(c, http.StatusInternalServerError, "internal error")

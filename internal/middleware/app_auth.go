@@ -11,6 +11,12 @@ import (
 
 const ContextApp = "app"
 
+// checkSecret is the bcrypt comparison used by InternalAppAuth. It is a
+// package-level variable so tests can swap in a spy and assert WHICH hash
+// each early-return path compared (timing side-channel regression tests)
+// without measuring wall-clock time.
+var checkSecret = util.CheckSecret
+
 // InternalAppAuth validates X-App-ID + X-App-Secret headers for internal
 // service-to-service calls. v1 dropped the secret in favour of network-layer
 // isolation (apps.secret was removed in 002_simplify_plans), but v2's public
@@ -36,6 +42,12 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 			// watching the response. Log the underlying reason for the
 			// operator (it'd be visible in their dashboards).
 			log.Printf("internal app auth: app %q lookup failed: %v", appID, err)
+			// Timing-oracle mitigation (M-8): an early return here used to
+			// skip the bcrypt compare entirely, so response time revealed
+			// whether the appID exists (no bcrypt call vs a real one).
+			// Burn the same comparison a real mismatch would cost before
+			// the 401 — the caller can't distinguish the paths by timing.
+			burnSecretCompare(c.GetHeader("X-App-Secret"))
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
 				"message": "invalid app_secret",
@@ -45,6 +57,10 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 
 		if !app.IsActive {
 			log.Printf("internal app auth: app %q disabled", appID)
+			// Same timing-oracle class as the missing-app branch: a
+			// disabled app must cost the same as a real hash mismatch so
+			// "exists but disabled" can't be enumerated either.
+			burnSecretCompare(c.GetHeader("X-App-Secret"))
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
 				"message": "invalid app_secret",
@@ -71,7 +87,7 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 			hashToCheck = util.DummyBcryptHash
 			secret = ""
 		}
-		if !util.CheckSecret(hashToCheck, secret) {
+		if !checkSecret(hashToCheck, secret) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    401,
 				"message": "invalid app_secret",
@@ -82,4 +98,12 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 		c.Set(ContextApp, app)
 		c.Next()
 	}
+}
+
+// burnSecretCompare runs a bcrypt comparison against the fixed dummy hash so
+// early-return 401 paths (missing app, disabled app) cost the same as a
+// genuine secret mismatch. The dummy hash matches no caller-supplied value
+// (verified by util's tests), so the result is always false and discarded.
+func burnSecretCompare(secret string) {
+	_ = checkSecret(util.DummyBcryptHash, secret)
 }

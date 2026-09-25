@@ -91,6 +91,7 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
 		InferenceAccountRPM:    120,
+		AppEnv:                 "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -254,15 +255,16 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
 		service.NewProviderTokenService(appRepo, nil), quoteSvc,
 		service.NewChatService(nil, subRepo, planRepo, repo.NewLLMUsageRepo(db)), nil,
 		service.NewGitHubOAuthService(cfg.OAuthStateSecret),
 		service.NewWeChatOAuthService(cfg.OAuthStateSecret),
-		false, true, /* wechatPayMock */
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil)
+		false, true, "e2e", /* wechatPayMock, appEnv */
+		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil,
+		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 
 	// 在售商品 + 支付/权益配置（029 快照源）。
 	if _, err := db.ExecContext(ctx, `

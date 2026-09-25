@@ -259,10 +259,47 @@ type Store interface {
 	InsertConfigRevision(ctx context.Context, rev *domain.ConfigRevision) error
 	ActivateRevision(ctx context.Context, scope domain.ConfigScope, revision int) error
 	ActiveRevision(ctx context.Context, scope domain.ConfigScope) (*domain.ConfigRevision, error)
+	ActiveRevisionMeta(ctx context.Context, scope domain.ConfigScope) (*domain.RevisionMeta, error)
 	ActiveRevisionHead(ctx context.Context, scope domain.ConfigScope) (int64, int, error)
 	GetRevision(ctx context.Context, scope domain.ConfigScope, revision int) (*domain.ConfigRevision, error)
-	ListRevisions(ctx context.Context, scope domain.ConfigScope) ([]domain.ConfigRevision, error)
+	// ListRevisionMetas lists revision metadata (payload blob never loaded),
+	// newest first, keyset-paginated by revision number: only revisions with
+	// a number below afterRevision are returned.
+	ListRevisionMetas(ctx context.Context, scope domain.ConfigScope, afterRevision, limit int) ([]domain.RevisionMeta, error)
 	LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error)
+
+	// BeginPublish opens the transaction that carries one publish
+	// (安全审查 M-2/M-3): the revision insert and the active-pointer switch
+	// commit or roll back together — an activation failure can never leave an
+	// orphan draft revision behind.
+	BeginPublish(ctx context.Context) (PublishTx, error)
+}
+
+// PublishTx is the transactional surface of one publish: every catalog read
+// of the drain AND the revision insert + activation run inside ONE
+// transaction, so (a) the reads see a single REPEATABLE READ snapshot — a
+// concurrent edit mid-drain cannot produce a self-contradictory payload
+// (安全审查 M-3), and (b) insert + activation commit or roll back together
+// (安全审查 M-2). The caller drains and validates, then Commit; any error
+// path rolls the whole thing back. Rollback rides the same transaction.
+type PublishTx interface {
+	// ListModels/Providers/Deployments/Routes drain the catalog inside the
+	// snapshot (same filters/cursors as the Store listing methods).
+	ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error)
+	ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error)
+	ListDeployments(ctx context.Context, f domain.DeploymentFilter) ([]domain.Deployment, error)
+	ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error)
+	LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error)
+	// GetRevision loads one immutable revision (payload included) inside the
+	// transaction — Rollback re-reads its target here so the insert+activate
+	// and the target read share one snapshot.
+	GetRevision(ctx context.Context, scope domain.ConfigScope, revision int) (*domain.ConfigRevision, error)
+	// InsertAndActivateRevision appends the draft revision and switches the
+	// scope's active pointer in the SAME transaction — no orphan draft can
+	// survive an activation failure (安全审查 M-2).
+	InsertAndActivateRevision(ctx context.Context, rev *domain.ConfigRevision) error
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
 }
 
 // AccessCheck decides whether one caller may see/use one published model.
@@ -301,10 +338,17 @@ func (s *Service) Store() Store { return s.store }
 // --- model CRUD ---
 
 // CreateModel validates and inserts a draft model. Empty modality lists
-// default to text→text, mirroring the DB column default.
+// default to text→text, mirroring the DB column default. An explicit
+// non-draft lifecycle is rejected (安全审查 I-1): new models always start
+// at draft and only move via SetModelLifecycle, so a create can never
+// smuggle a model past the draft→publish state machine.
 func (s *Service) CreateModel(ctx context.Context, m *domain.Model) error {
 	if m.Lifecycle == "" {
 		m.Lifecycle = domain.LifecycleDraft
+	}
+	if m.Lifecycle != domain.LifecycleDraft {
+		return domain.NewError(domain.CodeInvalidInput,
+			"models must be created as draft; promote via SetModelLifecycle")
 	}
 	defaultModalities(m)
 	if err := ValidateModel(m); err != nil {
@@ -325,10 +369,14 @@ func (s *Service) ListModels(ctx context.Context, filter domain.ModelFilter) ([]
 
 // UpdateModel validates and applies an edit. The caller passes the model
 // as previously read (its UpdatedAt is the optimistic-lock token); a
-// concurrent edit surfaces as CodeConflict.
+// concurrent edit surfaces as CodeConflict. An empty lifecycle is rejected
+// rather than defaulted to draft (安全审查 I-1): the previous reset knocked
+// a live active model back to draft whenever a caller passed a partial
+// object, and lifecycle moves belong to SetModelLifecycle alone.
 func (s *Service) UpdateModel(ctx context.Context, m *domain.Model) error {
 	if m.Lifecycle == "" {
-		m.Lifecycle = domain.LifecycleDraft
+		return domain.NewError(domain.CodeInvalidInput,
+			"lifecycle missing: pass the model as previously read; lifecycle changes go through SetModelLifecycle")
 	}
 	if m.UpdatedAt.IsZero() {
 		return domain.NewError(domain.CodeInvalidInput,
@@ -540,47 +588,47 @@ func drainPages[T any](ctx context.Context, page func(after string, limit int) (
 	}
 }
 
-func (s *Service) allModels(ctx context.Context) ([]domain.Model, error) {
-	return drainPages(ctx,
-		func(after string, limit int) ([]domain.Model, error) {
-			return s.store.ListModels(ctx, domain.ModelFilter{AfterID: after, Limit: limit})
-		},
-		func(m domain.Model) string { return m.ID })
-}
-
-func (s *Service) allProviders(ctx context.Context) ([]domain.Provider, error) {
-	return drainPages(ctx,
-		func(after string, limit int) ([]domain.Provider, error) {
-			return s.store.ListProviders(ctx, after, limit)
-		},
-		func(p domain.Provider) string { return p.ID })
-}
-
-func (s *Service) allDeployments(ctx context.Context) ([]domain.Deployment, error) {
-	return drainPages(ctx,
-		func(after string, limit int) ([]domain.Deployment, error) {
-			return s.store.ListDeployments(ctx, domain.DeploymentFilter{AfterID: after, Limit: limit})
-		},
-		func(d domain.Deployment) string { return d.ID })
-}
-
 // Publish validates the current draft catalog, appends an immutable
 // revision and atomically switches the active pointer to it. The returned
-// number is the new revision. Validation happens BEFORE anything is
-// written; the revision insert + activation is the atomic switch
-// (ActivateRevision runs in a single DB transaction with the partial
-// unique index as the safety net). The catalog is drained with keyset
-// pagination so no entity is ever silently dropped from the snapshot.
+// number is the new revision.
+//
+// 安全审查 M-3：整个发布跑在一个 REPEATABLE READ 事务里——目录抽取的所有
+// 查询共享同一快照，并发编辑无法在抽取中途造出自相矛盾的 payload（那种
+// payload 会让全网关 ParseSnapshot 失败、快照缓存只能回退旧版本）。并发
+// 发布者之间的一致性由 UNIQUE(scope, revision) 保证（后到者撞唯一键拿
+// CodeConflict），因此不需要咨询锁；咨询锁只串行化发布者，并不能固定读
+// 快照，故不采用。
+//
+// 安全审查 M-2：修订插入与激活在同一事务提交或回滚——激活失败不会留下
+// 孤儿 draft。目录用 keyset 分页抽取，任何实体都不会被悄悄丢出快照。
 func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
-	models, err := s.allModels(ctx)
+	tx, err := s.store.BeginPublish(ctx)
 	if err != nil {
 		return 0, err
 	}
-	providers, err := s.allProviders(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	models, err := drainPages(ctx,
+		func(after string, limit int) ([]domain.Model, error) {
+			return tx.ListModels(ctx, domain.ModelFilter{AfterID: after, Limit: limit})
+		},
+		func(m domain.Model) string { return m.ID })
 	if err != nil {
 		return 0, err
 	}
-	deployments, err := s.allDeployments(ctx)
+	providers, err := drainPages(ctx,
+		func(after string, limit int) ([]domain.Provider, error) {
+			return tx.ListProviders(ctx, after, limit)
+		},
+		func(p domain.Provider) string { return p.ID })
+	if err != nil {
+		return 0, err
+	}
+	deployments, err := drainPages(ctx,
+		func(after string, limit int) ([]domain.Deployment, error) {
+			return tx.ListDeployments(ctx, domain.DeploymentFilter{AfterID: after, Limit: limit})
+		},
+		func(d domain.Deployment) string { return d.ID })
 	if err != nil {
 		return 0, err
 	}
@@ -589,14 +637,14 @@ func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 	}
 	var routes []domain.ModelRoute
 	for _, m := range models {
-		rs, err := s.store.ListRoutes(ctx, m.ID)
+		rs, err := tx.ListRoutes(ctx, m.ID)
 		if err != nil {
 			return 0, err
 		}
 		routes = append(routes, rs...)
 	}
 
-	latest, err := s.store.LatestRevision(ctx, domain.ScopeCatalog)
+	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
 	if err != nil {
 		return 0, err
 	}
@@ -607,10 +655,10 @@ func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 		Status:    domain.RevisionDraft,
 		CreatedBy: createdBy,
 	}
-	if err := s.store.InsertConfigRevision(ctx, rev); err != nil {
-		return 0, err // UNIQUE(scope, revision) → CodeConflict on racing publishers
+	if err := tx.InsertAndActivateRevision(ctx, rev); err != nil {
+		return 0, err // 同事务回滚：UNIQUE(scope, revision) → CodeConflict on racing publishers
 	}
-	if err := s.store.ActivateRevision(ctx, domain.ScopeCatalog, rev.Revision); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return rev.Revision, nil
@@ -650,8 +698,18 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 // target revision is only READ, and the new revision gets the next
 // revision number. Only revisions that were published at some point may be
 // rollback targets.
+//
+// 安全审查 M-2（跟进）: 修订插入与激活与目标读取跑在同一事务——激活失败
+// 不会留下孤儿 draft（旧实现先 InsertConfigRevision 再 ActivateRevision,
+// 两步之间崩溃/失败即产生无人引用的 draft 修订）。
 func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string) (int, error) {
-	target, err := s.store.GetRevision(ctx, domain.ScopeCatalog, toRevision)
+	tx, err := s.store.BeginPublish(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	target, err := tx.GetRevision(ctx, domain.ScopeCatalog, toRevision)
 	if err != nil {
 		return 0, err
 	}
@@ -664,7 +722,7 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 	if _, err := ParseSnapshot(target); err != nil {
 		return 0, domain.WrapError(domain.CodeInvalidInput, "rollback target is not a parseable snapshot", err)
 	}
-	latest, err := s.store.LatestRevision(ctx, domain.ScopeCatalog)
+	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
 	if err != nil {
 		return 0, err
 	}
@@ -675,18 +733,27 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 		Status:    domain.RevisionDraft,
 		CreatedBy: createdBy,
 	}
-	if err := s.store.InsertConfigRevision(ctx, rev); err != nil {
-		return 0, err
+	if err := tx.InsertAndActivateRevision(ctx, rev); err != nil {
+		return 0, err // 同事务回滚：激活失败不留孤儿 draft
 	}
-	if err := s.store.ActivateRevision(ctx, domain.ScopeCatalog, rev.Revision); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return rev.Revision, nil
 }
 
-// ListRevisions returns the catalog revision history, newest first.
-func (s *Service) ListRevisions(ctx context.Context) ([]domain.ConfigRevision, error) {
-	return s.store.ListRevisions(ctx, domain.ScopeCatalog)
+// ListRevisionMetas returns the catalog revision history (metadata only —
+// the payload blob is never loaded for listings, 安全审查 M-1), newest
+// first, keyset-paginated by revision number. afterRevision is the cursor:
+// pass the last seen revision number (0 for the first page).
+func (s *Service) ListRevisionMetas(ctx context.Context, afterRevision, limit int) ([]domain.RevisionMeta, error) {
+	return s.store.ListRevisionMetas(ctx, domain.ScopeCatalog, afterRevision, limit)
+}
+
+// ActiveRevisionMeta returns the active catalog revision's metadata without
+// loading its payload.
+func (s *Service) ActiveRevisionMeta(ctx context.Context) (*domain.RevisionMeta, error) {
+	return s.store.ActiveRevisionMeta(ctx, domain.ScopeCatalog)
 }
 
 // LoadSnapshot loads and parses the currently active catalog revision

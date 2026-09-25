@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -268,12 +270,45 @@ func TestRepoRevisionReads(t *testing.T) {
 		t.Errorf("active = %+v", active)
 	}
 
-	revs, err := s.ListRevisions(ctx, domain.ScopeCatalog)
+	revs, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(revs) != 2 || revs[0].Revision != 2 {
 		t.Errorf("list = %+v", revs)
+	}
+
+	// 安全审查 M-1：元数据投影绝不携带 payload；分页游标与 limit 钳制生效。
+	if revs[0].Status == "" || revs[0].CreatedBy == "" {
+		t.Errorf("meta missing fields: %+v", revs[0])
+	}
+	page, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].Revision != 2 {
+		t.Fatalf("first page = %+v, want [2]", page)
+	}
+	rest, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, page[0].Revision, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 1 || rest[0].Revision != 1 {
+		t.Fatalf("second page = %+v, want [1]", rest)
+	}
+	clamped, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, 0, 999999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clamped) != 2 {
+		t.Errorf("limit 999999 must clamp to the 500 cap, got %d rows", len(clamped))
+	}
+	meta, err := s.ActiveRevisionMeta(ctx, domain.ScopeCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Revision != 1 || !meta.IsActive {
+		t.Errorf("active meta = %+v", meta)
 	}
 
 	if _, err := s.GetRevision(ctx, domain.ScopeCatalog, 99); domain.CodeOf(err) != domain.CodeNotFound {
@@ -293,5 +328,39 @@ func TestRepoRevisionReads(t *testing.T) {
 	}
 	if err := s.ActivateRevision(ctx, domain.ScopeCatalog, 42); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Errorf("activate missing revision: got %v", err)
+	}
+}
+
+// 安全审查 M-10：被历史事实（价格）引用的模型删除时映射为 409 + retire
+// 引导，而不是误导性的 400；失败的删除不回滚掉模型行；不存在的供应商/
+// 部署删除仍 404（既有的引用中删除 409/成功删除用例继续由
+// TestRepoProviderGuards/TestRepoDeploymentUpdateAndGuards 覆盖）。
+func TestRepoDeleteGuardsFKConflictAndNotFound(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	modelID, _ := repoCatalogChain(t, s)
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO inference_price_versions (model_id, kind, unit, revision, effective_from)
+		 VALUES ($1, 'sale_credit', 'microcredit', 1, now())`, modelID); err != nil {
+		t.Fatal(err)
+	}
+	err := s.DeleteModel(ctx, modelID)
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("delete price-referenced model: got %v, want conflict", err)
+	}
+	var de *domain.Error
+	if !errors.As(err, &de) || !strings.Contains(de.Message, "retired") {
+		t.Errorf("conflict message must direct operator to retire first: %v", err)
+	}
+	if _, err := s.GetModel(ctx, modelID); err != nil {
+		t.Errorf("model must survive the failed delete: %v", err)
+	}
+
+	if err := s.DeleteProvider(ctx, uuid.NewString()); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("delete missing provider: got %v, want not_found", err)
+	}
+	if err := s.DeleteDeployment(ctx, uuid.NewString()); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("delete missing deployment: got %v, want not_found", err)
 	}
 }

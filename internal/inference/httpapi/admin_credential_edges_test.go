@@ -124,14 +124,19 @@ func TestAdminOperators_RoleAdminPaths(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("bad role = %d, want 400", w.Code)
 	}
-	// Revoke：存在 → 200；不存在 → 200 revoked=false（幂等）。
-	req := newRequest(http.MethodDelete, "/admin/operators/"+task4PlainUser+"/roles/auditor", adminH)
+	// Revoke：存在 → 200；不存在 → 200 revoked=false（幂等）。reason 必填（M-6）。
+	req := newRequest(http.MethodDelete, "/admin/operators/"+task4PlainUser+"/roles/auditor?reason=edge+test", adminH)
 	w = doRaw(env.engine, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("revoke = %d %s", w.Code, w.Body.String())
 	}
-	w = doRaw(env.engine, newRequest(http.MethodDelete, "/admin/operators/"+task4PlainUser+"/roles/auditor", adminH))
+	w = doRaw(env.engine, newRequest(http.MethodDelete, "/admin/operators/"+task4PlainUser+"/roles/auditor?reason=edge+test", adminH))
 	if w.Code != http.StatusOK {
 		t.Fatalf("re-revoke = %d %s", w.Code, w.Body.String())
+	}
+	// 缺 reason → 400（M-6）。
+	w = doRaw(env.engine, newRequest(http.MethodDelete, "/admin/operators/"+task4PlainUser+"/roles/auditor", adminH))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("revoke without reason = %d, want 400", w.Code)
 	}
 }

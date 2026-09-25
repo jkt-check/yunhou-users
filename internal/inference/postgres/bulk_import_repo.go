@@ -24,12 +24,15 @@ type bulkSummaryDoc struct {
 }
 
 // GetBulkImportByTaskID re-reads a committed import task (幂等重放源).
+// The stored document digest comes back on Result.DocumentHash so the
+// caller can gate replay on document identity (migration 039, M-4).
 func (s *Store) GetBulkImportByTaskID(ctx context.Context, taskID string) (*management.BulkImportResult, error) {
 	var row struct {
-		Summary json.RawMessage `db:"summary"`
+		Summary      json.RawMessage `db:"summary"`
+		DocumentHash sql.NullString  `db:"document_hash"`
 	}
 	if err := s.db.GetContext(ctx, &row,
-		`SELECT summary FROM inference_bulk_imports WHERE task_id = $1`, taskID); err != nil {
+		`SELECT summary, document_hash FROM inference_bulk_imports WHERE task_id = $1`, taskID); err != nil {
 		return nil, mapError("bulk import: get task", err)
 	}
 	var doc bulkSummaryDoc
@@ -39,6 +42,7 @@ func (s *Store) GetBulkImportByTaskID(ctx context.Context, taskID string) (*mana
 	return &management.BulkImportResult{
 		TaskID: taskID, Committed: true,
 		Items: doc.Items, Inserted: doc.Inserted, Skipped: doc.Skipped,
+		DocumentHash: row.DocumentHash.String,
 	}, nil
 }
 
@@ -47,7 +51,8 @@ func (s *Store) GetBulkImportByTaskID(ctx context.Context, taskID string) (*mana
 // CodeConflict: a prior/concurrent commit owns this task_id — the caller
 // replays its recorded result); catalog rows follow with natural-key
 // ON CONFLICT absorption (racing imports degrade to skipped, never error);
-// the summary is written back to the task row before commit.
+// the summary and the document digest (BulkDocumentHash — the same function
+// the replay check uses) are written back to the task row before commit.
 func (s *Store) ApplyBulkImportTx(ctx context.Context, w domain.UnitOfWork, taskID, actor string, doc *management.BulkCatalog) (*management.BulkImportResult, error) {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -205,8 +210,8 @@ func (s *Store) ApplyBulkImportTx(ctx context.Context, w domain.UnitOfWork, task
 		return nil, mapError("bulk import: marshal summary", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE inference_bulk_imports SET summary = $1, item_count = $2 WHERE task_id = $3`,
-		summary, len(out.Items), taskID); err != nil {
+		`UPDATE inference_bulk_imports SET summary = $1, item_count = $2, document_hash = $3 WHERE task_id = $4`,
+		summary, len(out.Items), management.BulkDocumentHash(doc), taskID); err != nil {
 		return nil, mapError("bulk import: record summary", err)
 	}
 	return out, nil

@@ -530,7 +530,8 @@ func TestListAdjustments_Attribution(t *testing.T) {
 }
 
 // TestBulkImport_CommitReplayNoDuplicates: 批量导入 commit 原子落库 +
-// task_id 幂等重放（重复提交不重复创建；不同文档同 task_id 也重放原结果）。
+// task_id 幂等重放（同文档重复提交不重复创建；M-4：不同文档同 task_id
+// → 409，不得静默返回旧任务的结果）。
 func TestBulkImport_CommitReplayNoDuplicates(t *testing.T) {
 	_, s := testDB(t)
 	ctx := context.Background()
@@ -572,16 +573,24 @@ func TestBulkImport_CommitReplayNoDuplicates(t *testing.T) {
 		t.Fatalf("imported model lifecycle = %s, want draft (默认不可售)", lifecycle)
 	}
 
-	// 重放：同 task_id 不同文档 → 返回已记录结果，一行不增。
-	doc2 := &management.BulkCatalog{
-		Providers: []management.BulkProvider{{Code: "another", DisplayName: "X", AccessType: "official_api"}},
-	}
-	replay, err := svc.Import(ctx, "user:op2@app:ops", "imp-1", doc2, false)
+	// 重放：同 task_id 同文档 → 返回已记录结果，一行不增。
+	replay, err := svc.Import(ctx, "user:op2@app:ops", "imp-1", doc, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !replay.Replayed || !replay.Committed || replay.Inserted != 4 {
 		t.Fatalf("replay = %+v", replay)
+	}
+	assertRowCounts(t, s, 1, 1, 1, 1)
+
+	// M-4：同 task_id 不同文档 → 409（task_id 复用，不是良性重试），
+	// 一行不增。
+	doc2 := &management.BulkCatalog{
+		Providers: []management.BulkProvider{{Code: "another", DisplayName: "X", AccessType: "official_api"}},
+	}
+	if _, err := svc.Import(ctx, "user:op2@app:ops", "imp-1", doc2, false); err == nil ||
+		domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("different-doc replay err = %v, want CodeConflict", err)
 	}
 	assertRowCounts(t, s, 1, 1, 1, 1)
 

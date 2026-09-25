@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -264,6 +266,24 @@ func (s *AdminUsersService) GetUserDetail(ctx context.Context, userID string) (*
 // AddVipDays then re-reads and replays the winner's response.
 var errAdminIdemRace = errors.New("admin idempotency key committed concurrently")
 
+// ErrAdminIdemPayloadMismatch rejects an idempotency-key replay whose
+// request payload differs from the one the key succeeded with (spec §5.3,
+// aligned with the wallet-adjustments surface: same key + different
+// payload is caller key reuse, not a benign retry → 409).
+var ErrAdminIdemPayloadMismatch = errors.New("idempotency_key already used with a different vip payload")
+
+// adminVipRequestHash is the payload digest recorded with the idempotency
+// row and re-checked on replay (migration 038): the grant target and the
+// requested days fully determine the write, so both go into the digest.
+func adminVipRequestHash(userID string, days int) string {
+	payload, _ := json.Marshal(struct {
+		UserID string `json:"user_id"`
+		Days   int    `json:"days"`
+	}{UserID: userID, Days: days})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
 // AddVipDays implements spec §5: the eight VIP rules, the audit rows
 // (success AND rejection, committed in the same tx) and idempotent replay
 // scoped to (appID, idempotencyKey). actor is adminActorID(c)
@@ -279,20 +299,27 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 		result        *AdminVipResult
 		rejection     *AdminVipRejection
 		successAction string
+		digest        string
 	)
 
 	err := s.repo.WithTx(ctx, func(tx repo.AdminUsersTx) error {
 		// Idempotent replay: a stored response means the first attempt
 		// committed; return it verbatim without touching subscriptions or
-		// writing a second audit row (spec §5.3).
+		// writing a second audit row (spec §5.3). The stored payload digest
+		// must match — same key with a different payload is key reuse, 409
+		// (aligned with the wallet-adjustments surface).
 		if idemKey != "" {
-			stored, err := tx.GetIdempotencyResponse(ctx, appID, idemKey)
+			digest = adminVipRequestHash(userID, days)
+			stored, err := tx.GetIdempotencyRecord(ctx, appID, idemKey)
 			if err != nil {
 				return fmt.Errorf("read idempotency key: %w", err)
 			}
 			if stored != nil {
+				if stored.RequestHash != nil && *stored.RequestHash != digest {
+					return ErrAdminIdemPayloadMismatch
+				}
 				var r AdminVipResult
-				if err := json.Unmarshal(stored, &r); err != nil {
+				if err := json.Unmarshal(stored.Response, &r); err != nil {
 					return fmt.Errorf("decode idempotent response: %w", err)
 				}
 				result = &r
@@ -336,13 +363,19 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 			// trg_subscriptions_plan_product trigger → generic 500.
 			planID, expiresAt, err := tx.InsertMembershipSub(ctx, userID, days)
 			if err != nil {
-				if idemKey != "" && errors.Is(err, repo.ErrAdminSubscriptionConflict) {
-					// 并发同 (app_id, key) 的 grant:双方预读都看到无
-					// active 行(FOR UPDATE 锁不到不存在的行),败者的
-					// INSERT 撞 idx_subscriptions_user_product_active。
-					// 走与末尾撞键相同的回滚 + 重放赢家路径。
-					result = nil
-					return errAdminIdemRace
+				if errors.Is(err, repo.ErrAdminSubscriptionConflict) {
+					if idemKey != "" {
+						// 并发同 (app_id, key) 的 grant:双方预读都看到无
+						// active 行(FOR UPDATE 锁不到不存在的行),败者的
+						// INSERT 撞 idx_subscriptions_user_product_active。
+						// 走与末尾撞键相同的回滚 + 重放赢家路径。
+						result = nil
+						return errAdminIdemRace
+					}
+					// 无幂等键的并发 grant:没有可重放的响应。按 spec
+					// §1.2 记 vip.reject(与「找不到可重放响应」区分开)
+					// 并返回 409,而不是让唯一冲突冒泡成 500。
+					return reject("并发开通冲突：该用户已存在生效中的会员订阅，请刷新后重试")
 				}
 				return fmt.Errorf("insert membership subscription: %w", err)
 			}
@@ -393,7 +426,7 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 			if err != nil {
 				return fmt.Errorf("marshal idempotent response: %w", err)
 			}
-			inserted, err := tx.InsertIdempotencyKey(ctx, appID, idemKey, successAction, target, payload)
+			inserted, err := tx.InsertIdempotencyKey(ctx, appID, idemKey, successAction, target, digest, payload)
 			if err != nil {
 				return fmt.Errorf("insert idempotency key: %w", err)
 			}
@@ -408,7 +441,7 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 	})
 
 	if errors.Is(err, errAdminIdemRace) {
-		return s.replayIdempotentResponse(ctx, appID, idemKey)
+		return s.replayIdempotentResponse(ctx, appID, idemKey, digest)
 	}
 	if err != nil {
 		return nil, err
@@ -436,17 +469,22 @@ func (s *AdminUsersService) writeVipAudit(ctx context.Context, tx repo.AdminUser
 }
 
 // replayIdempotentResponse re-reads the committed winner row after a
-// same-key race rollback.
-func (s *AdminUsersService) replayIdempotentResponse(ctx context.Context, appID, idemKey string) (*AdminVipResult, error) {
-	stored, err := s.repo.GetIdempotencyResponse(ctx, appID, idemKey)
+// same-key race rollback. Two different payloads racing on one key is
+// caller key reuse, not a benign retry: the winner's digest must match
+// ours, else 409 (same rule as the in-tx replay check).
+func (s *AdminUsersService) replayIdempotentResponse(ctx context.Context, appID, idemKey, digest string) (*AdminVipResult, error) {
+	stored, err := s.repo.GetIdempotencyRecord(ctx, appID, idemKey)
 	if err != nil {
 		return nil, fmt.Errorf("re-read idempotency key: %w", err)
 	}
 	if stored == nil {
 		return nil, fmt.Errorf("idempotency key %q raced but no committed response found", idemKey)
 	}
+	if stored.RequestHash != nil && *stored.RequestHash != digest {
+		return nil, ErrAdminIdemPayloadMismatch
+	}
 	var r AdminVipResult
-	if err := json.Unmarshal(stored, &r); err != nil {
+	if err := json.Unmarshal(stored.Response, &r); err != nil {
 		return nil, fmt.Errorf("decode idempotent response: %w", err)
 	}
 	return &r, nil

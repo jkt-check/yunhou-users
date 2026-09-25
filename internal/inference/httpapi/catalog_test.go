@@ -63,6 +63,7 @@ func TestAdminCatalogFlow(t *testing.T) {
 	// Provider.
 	env := do(t, engine, http.MethodPost, "/admin/providers", map[string]any{
 		"code": "openai", "display_name": "OpenAI", "access_type": "official_api",
+		"reason": "seed",
 	}, http.StatusOK)
 	var providerID string
 	if err := json.Unmarshal(dataField(t, env, "id"), &providerID); err != nil {
@@ -73,20 +74,21 @@ func TestAdminCatalogFlow(t *testing.T) {
 	do(t, engine, http.MethodPost, "/admin/models", map[string]any{
 		"id": "glm-4.6", "display_name": "GLM 4.6",
 		"context_tokens": 200000, "max_output_tokens": 8192,
-		"protocols": []string{"openai_chat"},
+		"protocols": []string{"openai_chat"}, "reason": "seed",
 	}, http.StatusOK)
 
 	// Second model, SAME protocol — the acceptance scenario.
 	do(t, engine, http.MethodPost, "/admin/models", map[string]any{
 		"id": "deepseek-v4", "display_name": "DeepSeek V4",
 		"context_tokens": 128000, "max_output_tokens": 4096,
-		"protocols": []string{"openai_chat"},
+		"protocols": []string{"openai_chat"}, "reason": "seed",
 	}, http.StatusOK)
 
 	// Invalid model id → 400 envelope.
 	do(t, engine, http.MethodPost, "/admin/models", map[string]any{
 		"id": "BAD ID", "display_name": "x",
 		"context_tokens": 1, "max_output_tokens": 1, "protocols": []string{"openai_chat"},
+		"reason": "seed",
 	}, http.StatusBadRequest)
 
 	// Two deployments for the second model (模型可有多个部署).
@@ -95,6 +97,7 @@ func TestAdminCatalogFlow(t *testing.T) {
 		env := do(t, engine, http.MethodPost, "/admin/deployments", map[string]any{
 			"provider_id": providerID, "upstream_model": "deepseek-chat",
 			"base_url": base, "protocol": "openai_chat", "status": "active",
+			"reason": "seed",
 		}, http.StatusOK)
 		var id string
 		if err := json.Unmarshal(dataField(t, env, "id"), &id); err != nil {
@@ -104,15 +107,15 @@ func TestAdminCatalogFlow(t *testing.T) {
 	}
 	for _, depID := range depIDs {
 		do(t, engine, http.MethodPost, "/admin/models/deepseek-v4/routes", map[string]any{
-			"deployment_id": depID, "weight": 1, "enabled": true,
+			"deployment_id": depID, "weight": 1, "enabled": true, "reason": "seed",
 		}, http.StatusOK)
 	}
 
 	// Activate the second model, publish, then query everything back.
 	do(t, engine, http.MethodPost, "/admin/models/deepseek-v4/lifecycle", map[string]any{
-		"lifecycle": "active",
+		"lifecycle": "active", "reason": "onboard",
 	}, http.StatusOK)
-	env = do(t, engine, http.MethodPost, "/admin/catalog/publish", nil, http.StatusOK)
+	env = do(t, engine, http.MethodPost, "/admin/catalog/publish?reason=ship", nil, http.StatusOK)
 	var rev int
 	if err := json.Unmarshal(dataField(t, env, "revision"), &rev); err != nil {
 		t.Fatal(err)
@@ -164,6 +167,7 @@ func TestAdminModelOptimisticConflictOverHTTP(t *testing.T) {
 	do(t, engine, http.MethodPost, "/admin/models", map[string]any{
 		"id": "m-1", "display_name": "M",
 		"context_tokens": 10, "max_output_tokens": 10, "protocols": []string{"openai_chat"},
+		"reason": "seed",
 	}, http.StatusOK)
 
 	env := do(t, engine, http.MethodGet, "/admin/models/m-1", nil, http.StatusOK)
@@ -179,12 +183,14 @@ func TestAdminModelOptimisticConflictOverHTTP(t *testing.T) {
 	do(t, engine, http.MethodPatch, "/admin/models/m-1", map[string]any{
 		"display_name": "A", "context_tokens": 10, "max_output_tokens": 10,
 		"protocols": []string{"openai_chat"}, "updated_at": fetched.UpdatedAt,
+		"reason": "edit A",
 	}, http.StatusOK)
 
 	// Edit B reuses the stale token → 409 conflict, not silent overwrite.
 	env = do(t, engine, http.MethodPatch, "/admin/models/m-1", map[string]any{
 		"display_name": "B", "context_tokens": 10, "max_output_tokens": 10,
 		"protocols": []string{"openai_chat"}, "updated_at": fetched.UpdatedAt,
+		"reason": "edit B",
 	}, http.StatusConflict)
 	if env.Message == "" {
 		t.Error("conflict response must carry a message")
@@ -192,7 +198,7 @@ func TestAdminModelOptimisticConflictOverHTTP(t *testing.T) {
 
 	// Missing version token → 400.
 	do(t, engine, http.MethodPatch, "/admin/models/m-1", map[string]any{
-		"display_name": "C",
+		"display_name": "C", "reason": "no token",
 	}, http.StatusBadRequest)
 }
 
@@ -200,7 +206,7 @@ func TestAdminPublishValidateAndRollbackOverHTTP(t *testing.T) {
 	engine := newTestServer(t)
 
 	// Publish on an empty catalog is fine (empty snapshot).
-	do(t, engine, http.MethodPost, "/admin/catalog/publish", nil, http.StatusOK)
+	do(t, engine, http.MethodPost, "/admin/catalog/publish?reason=baseline", nil, http.StatusOK)
 
 	// A structurally broken catalog is refused at publish time: route
 	// pointing at a deleted... simpler: unknown reference via route create
@@ -208,6 +214,7 @@ func TestAdminPublishValidateAndRollbackOverHTTP(t *testing.T) {
 	env := do(t, engine, http.MethodPost, "/admin/models", map[string]any{
 		"id": "r-1", "display_name": "R",
 		"context_tokens": 10, "max_output_tokens": 10, "protocols": []string{"openai_chat"},
+		"reason": "seed",
 	}, http.StatusOK)
 	var updatedAt string
 	if err := json.Unmarshal(mustField(env.Data, "updated_at"), &updatedAt); err != nil {
@@ -215,13 +222,13 @@ func TestAdminPublishValidateAndRollbackOverHTTP(t *testing.T) {
 	}
 	do(t, engine, http.MethodPatch, "/admin/models/r-1", map[string]any{
 		"display_name": "R2", "context_tokens": 10, "max_output_tokens": 10,
-		"protocols": []string{"openai_chat"}, "updated_at": updatedAt,
+		"protocols": []string{"openai_chat"}, "updated_at": updatedAt, "reason": "rename",
 	}, http.StatusOK)
-	do(t, engine, http.MethodPost, "/admin/catalog/publish", nil, http.StatusOK)
+	do(t, engine, http.MethodPost, "/admin/catalog/publish?reason=ship", nil, http.StatusOK)
 
 	// Roll back to revision 1 → new revision 3 with old content.
 	env = do(t, engine, http.MethodPost, "/admin/catalog/rollback", map[string]any{
-		"to_revision": 1,
+		"to_revision": 1, "reason": "drill",
 	}, http.StatusOK)
 	var rev int
 	if err := json.Unmarshal(dataField(t, env, "revision"), &rev); err != nil {
@@ -234,7 +241,7 @@ func TestAdminPublishValidateAndRollbackOverHTTP(t *testing.T) {
 	// Revision 2 was published, so rolling back to it is allowed (content
 	// equals revision 2 under a new revision number).
 	do(t, engine, http.MethodPost, "/admin/catalog/rollback", map[string]any{
-		"to_revision": 2,
+		"to_revision": 2, "reason": "drill",
 	}, http.StatusOK)
 }
 
@@ -255,6 +262,7 @@ func TestAdminFail_StripsCauseChainFrom4xx(t *testing.T) {
 	// "route references unknown model ...", <store not_found cause>)。
 	env := do(t, engine, http.MethodPost, "/admin/models/ghost-model/routes", map[string]any{
 		"deployment_id": "00000000-0000-0000-0000-000000000000", "weight": 1, "enabled": true,
+		"reason": "probe",
 	}, http.StatusBadRequest)
 	if env.Message != "route references unknown model ghost-model" {
 		t.Errorf("message = %q, want only the domain Message (no cause chain)", env.Message)
@@ -276,6 +284,7 @@ func TestAdminDeploymentConfigHeadersRejected(t *testing.T) {
 
 	env := do(t, engine, http.MethodPost, "/admin/providers", map[string]any{
 		"code": "hdr-check", "display_name": "HDR", "access_type": "official_api",
+		"reason": "seed",
 	}, http.StatusOK)
 	var providerID string
 	if err := json.Unmarshal(dataField(t, env, "id"), &providerID); err != nil {
@@ -284,7 +293,7 @@ func TestAdminDeploymentConfigHeadersRejected(t *testing.T) {
 
 	base := map[string]any{
 		"provider_id": providerID, "upstream_model": "m", "base_url": "https://api.example.com/v1",
-		"protocol": "openai_chat",
+		"protocol": "openai_chat", "reason": "seed",
 	}
 
 	// Gateway-managed headers are refused however they are cased.
@@ -313,4 +322,83 @@ func TestAdminDeploymentConfigHeadersRejected(t *testing.T) {
 	}
 	body["config"] = map[string]any{"schema_version": 1, "headers": map[string]string{"X-Tenant": "acme"}}
 	do(t, engine, http.MethodPost, "/admin/deployments", body, http.StatusOK)
+}
+
+// 安全审查 M-1：GET /admin/catalog/revisions 只返回修订元数据（响应不得
+// 出现 payload 键），并按模块惯例 keyset 分页（limit 默认/钳制 + after
+// 游标），响应带 limit/next_after 供客户端翻页。
+func TestAdminCatalogRevisionsMetadataAndPagination(t *testing.T) {
+	engine := newTestServer(t)
+
+	// 三次发布 → 三行修订历史。
+	for i := 0; i < 3; i++ {
+		do(t, engine, http.MethodPost, "/admin/catalog/publish?reason=p", nil, http.StatusOK)
+	}
+
+	type page struct {
+		Revisions []map[string]any `json:"revisions"`
+		Limit     int              `json:"limit"`
+		NextAfter int              `json:"next_after"`
+	}
+	var p1 page
+	env := do(t, engine, http.MethodGet, "/admin/catalog/revisions?limit=2", nil, http.StatusOK)
+	if err := json.Unmarshal(env.Data, &p1); err != nil {
+		t.Fatal(err)
+	}
+	if len(p1.Revisions) != 2 {
+		t.Fatalf("page1 revisions = %d, want 2", len(p1.Revisions))
+	}
+	if p1.Limit != 2 {
+		t.Errorf("limit = %d, want echoed 2", p1.Limit)
+	}
+	if p1.NextAfter != 2 { // 修订号从 3 倒序：本页最后一条是 revision 2
+		t.Errorf("next_after = %d, want 2", p1.NextAfter)
+	}
+	for _, rev := range p1.Revisions {
+		if _, ok := rev["payload"]; ok {
+			t.Errorf("metadata-only shape violated: payload key in %+v", rev)
+		}
+		if rev["revision"] == nil || rev["status"] == nil || rev["created_by"] == nil {
+			t.Errorf("meta fields missing in %+v", rev)
+		}
+	}
+
+	// 第二页：after=2 → 只剩 revision 1，next_after=0 表示没有更多。
+	var p2 page
+	env = do(t, engine, http.MethodGet, "/admin/catalog/revisions?after=2&limit=2", nil, http.StatusOK)
+	if err := json.Unmarshal(env.Data, &p2); err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.Revisions) != 1 {
+		t.Fatalf("page2 revisions = %d, want 1", len(p2.Revisions))
+	}
+	if p2.Revisions[0]["revision"] != float64(1) {
+		t.Errorf("page2 revision = %v, want 1", p2.Revisions[0]["revision"])
+	}
+	if p2.NextAfter != 0 {
+		t.Errorf("page2 next_after = %d, want 0 (no more pages)", p2.NextAfter)
+	}
+
+	// limit 超限按 500 上限处理而非报错或全表扫描。
+	var big page
+	env = do(t, engine, http.MethodGet, "/admin/catalog/revisions?limit=999999999", nil, http.StatusOK)
+	if err := json.Unmarshal(env.Data, &big); err != nil {
+		t.Fatal(err)
+	}
+	if big.Limit != 500 || len(big.Revisions) != 3 {
+		t.Errorf("clamped limit = %d rows = %d, want 500/3", big.Limit, len(big.Revisions))
+	}
+
+	// 活跃修订元数据：无 payload，revision 为最新。
+	env = do(t, engine, http.MethodGet, "/admin/catalog/active", nil, http.StatusOK)
+	var active map[string]any
+	if err := json.Unmarshal(env.Data, &active); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := active["payload"]; ok {
+		t.Errorf("active revision must be metadata-only, got %+v", active)
+	}
+	if active["revision"] != float64(3) || active["is_active"] != true {
+		t.Errorf("active = %+v, want revision 3 active", active)
+	}
 }

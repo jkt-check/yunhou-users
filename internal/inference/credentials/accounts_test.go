@@ -619,6 +619,95 @@ func TestAccountServiceUpdateValidation(t *testing.T) {
 	}
 }
 
+// 审查修复 M-9：concurrency_limit 必须有上限——它是单账号对单一上游凭据
+// 的在飞租约天花板，2^31 之类的值等于悄悄关掉每账号并发控制。上限之上
+// → 400；恰在上限 → 通过；显式 0（备而不用）→ 通过。
+func TestAccountServiceConcurrencyLimitCap(t *testing.T) {
+	t.Run("create above cap -> 400", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		huge := maxConcurrencyLimit + 1
+		in := validCreateInput(provID, credID)
+		in.ConcurrencyLimit = &huge
+		_, err := svc.Create(context.Background(), testOp(), in)
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Fatalf("code = %s, want invalid_input (err=%v)", domain.CodeOf(err), err)
+		}
+		if len(store.accounts) != 0 {
+			t.Fatalf("accounts = %d, want 0 (rejected write must not land)", len(store.accounts))
+		}
+	})
+
+	t.Run("create at cap -> ok", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		at := maxConcurrencyLimit
+		in := validCreateInput(provID, credID)
+		in.ConcurrencyLimit = &at
+		acct, err := svc.Create(context.Background(), testOp(), in)
+		if err != nil {
+			t.Fatalf("create at cap: %v", err)
+		}
+		if acct.ConcurrencyLimit != maxConcurrencyLimit {
+			t.Fatalf("concurrency = %d, want %d", acct.ConcurrencyLimit, maxConcurrencyLimit)
+		}
+	})
+
+	t.Run("create zero -> ok (备而不用)", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		zero := 0
+		in := validCreateInput(provID, credID)
+		in.ConcurrencyLimit = &zero
+		if _, err := svc.Create(context.Background(), testOp(), in); err != nil {
+			t.Fatalf("create zero: %v", err)
+		}
+	})
+
+	t.Run("update above cap -> 400 and value unchanged", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		huge := 1 << 31
+		_, err = svc.Update(context.Background(), testOp(), acct.ID, nil, &huge, "x")
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Fatalf("code = %s, want invalid_input (err=%v)", domain.CodeOf(err), err)
+		}
+		stored, err := store.GetUpstreamAccount(context.Background(), acct.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.ConcurrencyLimit != 1 {
+			t.Fatalf("stored concurrency = %d, want unchanged 1", stored.ConcurrencyLimit)
+		}
+	})
+
+	t.Run("update at cap -> ok", func(t *testing.T) {
+		store := newMemAccountStore()
+		provID, credID := seedAccountFixtures(store)
+		svc := NewAccountService(store, &memRecorder{})
+		acct, err := svc.Create(context.Background(), testOp(), validCreateInput(provID, credID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		at := maxConcurrencyLimit
+		got, err := svc.Update(context.Background(), testOp(), acct.ID, nil, &at, "拉满单账号并发")
+		if err != nil {
+			t.Fatalf("update at cap: %v", err)
+		}
+		if got.ConcurrencyLimit != maxConcurrencyLimit {
+			t.Fatalf("concurrency = %d, want %d", got.ConcurrencyLimit, maxConcurrencyLimit)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // 事务路径 fake（驱动 runAtomicAccounts 的同事务分支 + 凭据行锁复查）
 // ---------------------------------------------------------------------------

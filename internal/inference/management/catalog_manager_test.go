@@ -28,6 +28,10 @@ type fakeCatalogStore struct {
 	revisions   []*domain.ConfigRevision
 	// publishErr 注入发布事务失败（安全审查 M-2：激活失败模拟）。
 	publishErr error
+	// txReads 统计经发布事务快照完成的读次数；directListCalls 统计绕过
+	// 事务的直接列表调用（安全审查 M-3 测试断言发布全程只走事务）。
+	txReads         int
+	directListCalls int
 }
 
 func newFakeCatalogStore() *fakeCatalogStore {
@@ -49,12 +53,17 @@ func (f *fakeCatalogStore) GetModel(ctx context.Context, id string) (*domain.Mod
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "model")
 }
-func (f *fakeCatalogStore) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+func (f *fakeCatalogStore) listModels(filter domain.ModelFilter) ([]domain.Model, error) {
 	out := []domain.Model{}
 	for _, m := range f.models {
 		out = append(out, *m)
 	}
 	return out, nil
+}
+
+func (f *fakeCatalogStore) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+	f.directListCalls++
+	return f.listModels(filter)
 }
 func (f *fakeCatalogStore) UpdateModel(ctx context.Context, m *domain.Model) error {
 	return f.InsertModel(ctx, m)
@@ -84,12 +93,17 @@ func (f *fakeCatalogStore) GetProviderByCode(ctx context.Context, code string) (
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "provider")
 }
-func (f *fakeCatalogStore) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+func (f *fakeCatalogStore) listProviders() []domain.Provider {
 	out := []domain.Provider{}
 	for _, p := range f.providers {
 		out = append(out, *p)
 	}
-	return out, nil
+	return out
+}
+
+func (f *fakeCatalogStore) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+	f.directListCalls++
+	return f.listProviders(), nil
 }
 func (f *fakeCatalogStore) UpdateProvider(ctx context.Context, p *domain.Provider) error {
 	return f.InsertProvider(ctx, p)
@@ -119,12 +133,17 @@ func (f *fakeCatalogStore) FindDeployment(ctx context.Context, providerID, upstr
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "deployment")
 }
-func (f *fakeCatalogStore) ListDeployments(ctx context.Context, flt domain.DeploymentFilter) ([]domain.Deployment, error) {
+func (f *fakeCatalogStore) listDeployments() []domain.Deployment {
 	out := []domain.Deployment{}
 	for _, d := range f.deployments {
 		out = append(out, *d)
 	}
-	return out, nil
+	return out
+}
+
+func (f *fakeCatalogStore) ListDeployments(ctx context.Context, flt domain.DeploymentFilter) ([]domain.Deployment, error) {
+	f.directListCalls++
+	return f.listDeployments(), nil
 }
 func (f *fakeCatalogStore) UpdateDeployment(ctx context.Context, d *domain.Deployment) error {
 	return f.InsertDeployment(ctx, d)
@@ -148,14 +167,19 @@ func (f *fakeCatalogStore) GetRoute(ctx context.Context, id string) (*domain.Mod
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "route")
 }
-func (f *fakeCatalogStore) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+func (f *fakeCatalogStore) listRoutes(modelID string) []domain.ModelRoute {
 	out := []domain.ModelRoute{}
 	for _, r := range f.routes {
 		if r.ModelID == modelID {
 			out = append(out, *r)
 		}
 	}
-	return out, nil
+	return out
+}
+
+func (f *fakeCatalogStore) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+	f.directListCalls++
+	return f.listRoutes(modelID), nil
 }
 func (f *fakeCatalogStore) UpdateRoute(ctx context.Context, r *domain.ModelRoute) error {
 	cp := *r
@@ -229,7 +253,8 @@ func (f *fakeCatalogStore) LatestRevision(ctx context.Context, scope domain.Conf
 }
 
 // fakePublishTx models catalog.PublishTx：InsertAndActivateRevision 先失败后
-// 追加（模拟同一事务的提交/回滚原子性——失败路径不留任何修订行）。
+// 追加（模拟同一事务的提交/回滚原子性——失败路径不留任何修订行）。读方法
+// 全部委托给 store 并计入 txReads（安全审查 M-3：发布抽取必须走事务快照）。
 type fakePublishTx struct {
 	store      *fakeCatalogStore
 	committed  bool
@@ -238,6 +263,26 @@ type fakePublishTx struct {
 
 func (f *fakeCatalogStore) BeginPublish(ctx context.Context) (catalog.PublishTx, error) {
 	return &fakePublishTx{store: f}, nil
+}
+
+func (t *fakePublishTx) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+	t.store.txReads++
+	return t.store.listModels(filter)
+}
+
+func (t *fakePublishTx) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+	t.store.txReads++
+	return t.store.listProviders(), nil
+}
+
+func (t *fakePublishTx) ListDeployments(ctx context.Context, flt domain.DeploymentFilter) ([]domain.Deployment, error) {
+	t.store.txReads++
+	return t.store.listDeployments(), nil
+}
+
+func (t *fakePublishTx) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+	t.store.txReads++
+	return t.store.listRoutes(modelID), nil
 }
 
 func (t *fakePublishTx) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
@@ -526,5 +571,39 @@ func TestCatalogManager_PublishActivationFailureLeavesNoOrphanDraft(t *testing.T
 	}
 	if len(fs.revisions) != 1 || fs.revisions[0].Status != domain.RevisionPublished || !fs.revisions[0].IsActive {
 		t.Fatalf("retried revision = %+v, want published+active", fs.revisions[0])
+	}
+}
+
+// 安全审查 M-3：发布的目录抽取必须全部经由发布事务（REPEATABLE READ 快照，
+// 见 postgres.BeginPublish），不得绕过事务直接读 store——否则并发编辑能在
+// 抽取中途造出自相矛盾的 payload。
+func TestCatalogManager_PublishDrainsThroughSingleTx(t *testing.T) {
+	fs := newFakeCatalogStore()
+	mgr := NewCatalogManager(catalog.NewService(fs), &spyRecorder{}, nil)
+	ctx := context.Background()
+
+	// 造一个最小可发布目录。
+	if err := mgr.CreateProvider(ctx, managerActor(), &domain.Provider{
+		ID: uuid.NewString(), Code: "snap", DisplayName: "S", AccessType: domain.AccessOfficialAPI,
+	}, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CreateModel(ctx, managerActor(), &domain.Model{
+		ID: "snap-m", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols: []domain.Protocol{domain.ProtocolOpenAIChat},
+	}, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	fs.directListCalls = 0
+
+	if _, err := mgr.Publish(ctx, managerActor()); err != nil {
+		t.Fatal(err)
+	}
+	if fs.directListCalls != 0 {
+		t.Errorf("publish drained %d reads outside the publish tx; all reads must share one snapshot", fs.directListCalls)
+	}
+	// models/providers/deployments/routes 四类抽取都走了事务（路由按模型逐个抽取）。
+	if fs.txReads < 4 {
+		t.Errorf("tx reads = %d, want ≥4 (models/providers/deployments/routes)", fs.txReads)
 	}
 }

@@ -87,6 +87,21 @@ func (s *Store) GetModel(ctx context.Context, id string) (*domain.Model, error) 
 
 // ListModels implements domain.CatalogReader with keyset pagination on id.
 func (s *Store) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+	return listModelsQ(ctx, s.db, filter)
+}
+
+// querier is the shared query surface of *sqlx.DB and *sqlx.Tx (sqlx's own
+// ExtContext omits GetContext/SelectContext), so the standalone store and
+// the publish transaction share one set of query helpers.
+type querier interface {
+	sqlx.ExtContext
+	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+}
+
+// listModelsQ is the ListModels query shared by the standalone store and
+// the publish transaction (安全审查 M-3: publish drains inside its snapshot).
+func listModelsQ(ctx context.Context, q querier, filter domain.ModelFilter) ([]domain.Model, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -99,7 +114,7 @@ func (s *Store) ListModels(ctx context.Context, filter domain.ModelFilter) ([]do
 	}
 	query += ` ORDER BY id LIMIT ` + itoa(limit)
 	var rows []modelRow
-	if err := s.db.SelectContext(ctx, &rows, query, args...); err != nil {
+	if err := q.SelectContext(ctx, &rows, query, args...); err != nil {
 		return nil, mapError("list models", err)
 	}
 	out := make([]domain.Model, 0, len(rows))
@@ -307,7 +322,7 @@ func (s *Store) RoutesForModel(ctx context.Context, modelID string) ([]domain.Mo
 // insertConfigRevisionQ is the INSERT shared by the standalone path and the
 // publish transaction (安全审查 M-2): it appends an immutable draft revision
 // and fills rev.ID/rev.CreatedAt from the RETURNING clause.
-func insertConfigRevisionQ(ctx context.Context, q sqlx.ExtContext, rev *domain.ConfigRevision) error {
+func insertConfigRevisionQ(ctx context.Context, q querier, rev *domain.ConfigRevision) error {
 	payload := rev.Payload.Raw
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{"schema_version":1}`)
@@ -328,7 +343,7 @@ func (s *Store) InsertConfigRevision(ctx context.Context, rev *domain.ConfigRevi
 // revision is superseded and this one becomes published+active in one
 // statement pair guarded by the partial unique index. Shared by the
 // standalone ActivateRevision and the publish transaction.
-func activateRevisionQ(ctx context.Context, q sqlx.ExtContext, scope domain.ConfigScope, revision int) error {
+func activateRevisionQ(ctx context.Context, q querier, scope domain.ConfigScope, revision int) error {
 	if _, err := q.ExecContext(ctx,
 		`UPDATE inference_config_revisions
 		 SET is_active = false, status = 'superseded'
@@ -365,21 +380,45 @@ func (s *Store) ActivateRevision(ctx context.Context, scope domain.ConfigScope, 
 }
 
 // publishTx is the single implementation of catalog.PublishTx: one live
-// transaction carrying the revision insert + activation of a single
-// publish, so the two commit or roll back together (安全审查 M-2).
+// REPEATABLE READ transaction carrying the whole publish — every drain read
+// sees the same snapshot (安全审查 M-3) and the revision insert + activation
+// commit or roll back together (安全审查 M-2).
 type publishTx struct {
 	tx   *sqlx.Tx
 	done bool
 }
 
-// BeginPublish opens the transaction of one publish (insert + activate in
-// one atomic unit — no orphan draft revision on activation failure).
+// BeginPublish opens the transaction of one publish at REPEATABLE READ
+// (安全审查 M-3): the catalog drain (models/providers/deployments/routes +
+// latest revision) and the insert+activate all share one snapshot, so a
+// concurrent edit mid-drain cannot produce a self-contradictory payload.
+// Racing publishers are separated by UNIQUE(scope, revision) — a second
+// publisher's insert blocks until the first commits and then fails with
+// CodeConflict, which is why no advisory lock is needed.
 func (s *Store) BeginPublish(ctx context.Context) (catalog.PublishTx, error) {
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return nil, mapError("begin publish", err)
 	}
 	return &publishTx{tx: tx}, nil
+}
+
+// ListModels/ListProviders/ListDeployments/ListRoutes drain the catalog
+// inside the publish snapshot — same queries as the standalone store.
+func (t *publishTx) ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error) {
+	return listModelsQ(ctx, t.tx, filter)
+}
+
+func (t *publishTx) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+	return listProvidersQ(ctx, t.tx, afterID, limit)
+}
+
+func (t *publishTx) ListDeployments(ctx context.Context, f domain.DeploymentFilter) ([]domain.Deployment, error) {
+	return listDeploymentsQ(ctx, t.tx, f)
+}
+
+func (t *publishTx) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+	return listRoutesQ(ctx, t.tx, modelID)
 }
 
 func (t *publishTx) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
@@ -574,6 +613,12 @@ func (r providerRow) toDomain() domain.Provider {
 
 // ListProviders lists providers keyset-paginated by id.
 func (s *Store) ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error) {
+	return listProvidersQ(ctx, s.db, afterID, limit)
+}
+
+// listProvidersQ is the ListProviders query shared by the standalone store
+// and the publish transaction (安全审查 M-3).
+func listProvidersQ(ctx context.Context, q querier, afterID string, limit int) ([]domain.Provider, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
@@ -585,7 +630,7 @@ func (s *Store) ListProviders(ctx context.Context, afterID string, limit int) ([
 	}
 	query += ` ORDER BY id LIMIT ` + itoa(limit)
 	var rows []providerRow
-	err := s.db.SelectContext(ctx, &rows, query, args...)
+	err := q.SelectContext(ctx, &rows, query, args...)
 	if err != nil {
 		return nil, mapError("list providers", err)
 	}
@@ -668,6 +713,12 @@ type DeploymentFilter = domain.DeploymentFilter
 
 // ListDeployments lists deployments keyset-paginated by id.
 func (s *Store) ListDeployments(ctx context.Context, f domain.DeploymentFilter) ([]domain.Deployment, error) {
+	return listDeploymentsQ(ctx, s.db, f)
+}
+
+// listDeploymentsQ is the ListDeployments query shared by the standalone
+// store and the publish transaction (安全审查 M-3).
+func listDeploymentsQ(ctx context.Context, q querier, f domain.DeploymentFilter) ([]domain.Deployment, error) {
 	limit := f.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -691,7 +742,7 @@ func (s *Store) ListDeployments(ctx context.Context, f domain.DeploymentFilter) 
 	}
 	query += ` ORDER BY id LIMIT ` + itoa(limit)
 	var rows []deploymentRow
-	if err := s.db.SelectContext(ctx, &rows, query, args...); err != nil {
+	if err := q.SelectContext(ctx, &rows, query, args...); err != nil {
 		return nil, mapError("list deployments", err)
 	}
 	out := make([]domain.Deployment, 0, len(rows))
@@ -799,8 +850,14 @@ func (r routeRow) toDomain() domain.ModelRoute {
 // ListRoutes returns every route of a model, enabled or not (the operator
 // view; RoutesForModel is the runtime enabled-only view).
 func (s *Store) ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error) {
+	return listRoutesQ(ctx, s.db, modelID)
+}
+
+// listRoutesQ is the ListRoutes query shared by the standalone store and
+// the publish transaction (安全审查 M-3).
+func listRoutesQ(ctx context.Context, q querier, modelID string) ([]domain.ModelRoute, error) {
 	var rows []routeRow
-	err := s.db.SelectContext(ctx, &rows,
+	err := q.SelectContext(ctx, &rows,
 		`SELECT * FROM inference_model_routes WHERE model_id=$1
 		 ORDER BY priority ASC, weight DESC, id`, modelID)
 	if err != nil {

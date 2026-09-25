@@ -275,10 +275,20 @@ type Store interface {
 	BeginPublish(ctx context.Context) (PublishTx, error)
 }
 
-// PublishTx is the transactional surface of one publish. The caller drains
-// and validates the catalog, then InsertAndActivateRevision + Commit; any
-// error path rolls the whole thing back.
+// PublishTx is the transactional surface of one publish: every catalog read
+// of the drain AND the revision insert + activation run inside ONE
+// transaction, so (a) the reads see a single REPEATABLE READ snapshot — a
+// concurrent edit mid-drain cannot produce a self-contradictory payload
+// (安全审查 M-3), and (b) insert + activation commit or roll back together
+// (安全审查 M-2). The caller drains and validates, then Commit; any error
+// path rolls the whole thing back.
 type PublishTx interface {
+	// ListModels/Providers/Deployments/Routes drain the catalog inside the
+	// snapshot (same filters/cursors as the Store listing methods).
+	ListModels(ctx context.Context, filter domain.ModelFilter) ([]domain.Model, error)
+	ListProviders(ctx context.Context, afterID string, limit int) ([]domain.Provider, error)
+	ListDeployments(ctx context.Context, f domain.DeploymentFilter) ([]domain.Deployment, error)
+	ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error)
 	LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error)
 	// InsertAndActivateRevision appends the draft revision and switches the
 	// scope's active pointer in the SAME transaction — no orphan draft can
@@ -574,48 +584,47 @@ func drainPages[T any](ctx context.Context, page func(after string, limit int) (
 	}
 }
 
-func (s *Service) allModels(ctx context.Context) ([]domain.Model, error) {
-	return drainPages(ctx,
-		func(after string, limit int) ([]domain.Model, error) {
-			return s.store.ListModels(ctx, domain.ModelFilter{AfterID: after, Limit: limit})
-		},
-		func(m domain.Model) string { return m.ID })
-}
-
-func (s *Service) allProviders(ctx context.Context) ([]domain.Provider, error) {
-	return drainPages(ctx,
-		func(after string, limit int) ([]domain.Provider, error) {
-			return s.store.ListProviders(ctx, after, limit)
-		},
-		func(p domain.Provider) string { return p.ID })
-}
-
-func (s *Service) allDeployments(ctx context.Context) ([]domain.Deployment, error) {
-	return drainPages(ctx,
-		func(after string, limit int) ([]domain.Deployment, error) {
-			return s.store.ListDeployments(ctx, domain.DeploymentFilter{AfterID: after, Limit: limit})
-		},
-		func(d domain.Deployment) string { return d.ID })
-}
-
 // Publish validates the current draft catalog, appends an immutable
 // revision and atomically switches the active pointer to it. The returned
-// number is the new revision. Validation happens BEFORE anything is
-// written; the revision insert + activation run in ONE transaction
-// (BeginPublish), so an activation failure rolls the draft insert back
-// instead of leaving an orphan draft revision (安全审查 M-2). The catalog is
-// drained with keyset pagination so no entity is ever silently dropped from
-// the snapshot.
+// number is the new revision.
+//
+// 安全审查 M-3：整个发布跑在一个 REPEATABLE READ 事务里——目录抽取的所有
+// 查询共享同一快照，并发编辑无法在抽取中途造出自相矛盾的 payload（那种
+// payload 会让全网关 ParseSnapshot 失败、快照缓存只能回退旧版本）。并发
+// 发布者之间的一致性由 UNIQUE(scope, revision) 保证（后到者撞唯一键拿
+// CodeConflict），因此不需要咨询锁；咨询锁只串行化发布者，并不能固定读
+// 快照，故不采用。
+//
+// 安全审查 M-2：修订插入与激活在同一事务提交或回滚——激活失败不会留下
+// 孤儿 draft。目录用 keyset 分页抽取，任何实体都不会被悄悄丢出快照。
 func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
-	models, err := s.allModels(ctx)
+	tx, err := s.store.BeginPublish(ctx)
 	if err != nil {
 		return 0, err
 	}
-	providers, err := s.allProviders(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	models, err := drainPages(ctx,
+		func(after string, limit int) ([]domain.Model, error) {
+			return tx.ListModels(ctx, domain.ModelFilter{AfterID: after, Limit: limit})
+		},
+		func(m domain.Model) string { return m.ID })
 	if err != nil {
 		return 0, err
 	}
-	deployments, err := s.allDeployments(ctx)
+	providers, err := drainPages(ctx,
+		func(after string, limit int) ([]domain.Provider, error) {
+			return tx.ListProviders(ctx, after, limit)
+		},
+		func(p domain.Provider) string { return p.ID })
+	if err != nil {
+		return 0, err
+	}
+	deployments, err := drainPages(ctx,
+		func(after string, limit int) ([]domain.Deployment, error) {
+			return tx.ListDeployments(ctx, domain.DeploymentFilter{AfterID: after, Limit: limit})
+		},
+		func(d domain.Deployment) string { return d.ID })
 	if err != nil {
 		return 0, err
 	}
@@ -624,18 +633,13 @@ func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 	}
 	var routes []domain.ModelRoute
 	for _, m := range models {
-		rs, err := s.store.ListRoutes(ctx, m.ID)
+		rs, err := tx.ListRoutes(ctx, m.ID)
 		if err != nil {
 			return 0, err
 		}
 		routes = append(routes, rs...)
 	}
 
-	tx, err := s.store.BeginPublish(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
 	if err != nil {
 		return 0, err

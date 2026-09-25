@@ -607,3 +607,53 @@ func TestCatalogManager_PublishDrainsThroughSingleTx(t *testing.T) {
 		t.Errorf("tx reads = %d, want ≥4 (models/providers/deployments/routes)", fs.txReads)
 	}
 }
+
+// 安全审查 I-7：审计补写失败必须触发告警钩子（默认 AUDIT_WRITE_FAILED
+// 结构化 ERROR 日志，生产接 on-call 通道），携带正确的动作/对象/归因；操作
+// 结果本身不变——变更已提交是事实，审计缺失是告警而非可回滚状态。
+func TestCatalogManager_AuditFailureInvokesAlertHook(t *testing.T) {
+	fs := newFakeCatalogStore()
+	mgr := NewCatalogManager(catalog.NewService(fs), failingRecorder{err: errors.New("audit backend down")}, nil)
+	ctx := context.Background()
+
+	var alerts []AuditEvent
+	var causes []error
+	prev := AuditAlertHook
+	AuditAlertHook = func(ctx context.Context, ev AuditEvent, cause error) {
+		alerts = append(alerts, ev)
+		causes = append(causes, cause)
+	}
+	t.Cleanup(func() { AuditAlertHook = prev })
+
+	if err := mgr.CreateModel(ctx, managerActor(), &domain.Model{
+		ID: "m-alert", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols: []domain.Protocol{domain.ProtocolOpenAIChat},
+	}, "probe"); err != nil {
+		t.Fatalf("mutation must succeed despite audit failure: %v", err)
+	}
+	if _, err := fs.GetModel(ctx, "m-alert"); err != nil {
+		t.Fatal("mutation must be effective despite audit failure")
+	}
+
+	if len(alerts) != 1 {
+		t.Fatalf("alert hook invocations = %d, want 1", len(alerts))
+	}
+	ev := alerts[0]
+	if ev.Action != "model.create" || ev.ObjectType != "model" || ev.ObjectID != "m-alert" {
+		t.Errorf("alert event = %+v, want model.create/model/m-alert", ev)
+	}
+	if ev.ActorUser != "op-1" || ev.ActorApp != "ops" {
+		t.Errorf("alert attribution = %s/%s", ev.ActorUser, ev.ActorApp)
+	}
+	if len(causes) != 1 || causes[0] == nil {
+		t.Errorf("alert cause = %v, want the recorder error", causes)
+	}
+
+	// Publish 失败审计同样告警（catalog.publish 的 objectID 为空串是既定形状）。
+	if _, err := mgr.Publish(ctx, managerActor()); err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 2 || alerts[1].Action != "catalog.publish" {
+		t.Fatalf("publish audit failure must alert: %+v", alerts)
+	}
+}

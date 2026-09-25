@@ -10,7 +10,6 @@ package management
 
 import (
 	"context"
-	"log"
 	"strings"
 
 	"github.com/yunhou/users/internal/inference/catalog"
@@ -63,20 +62,22 @@ func firstReason(reason []string) string {
 // the operator user and the verifying service identity.
 //
 // 变更已先于审计提交（catalog.Service 无同事务审计面），因此审计写失败
-// 不对操作员谎报失败：记 ERROR 日志并照常返回——Publish/Rollback 返回错误
-// 会诱导重试产生重复修订（审查修复 Important-3）。审计缺失由 ERROR 日志
-// 告警，需人工补录。
+// 不对操作员谎报失败：审计缺失由 AuditAlertHook 响亮告警（默认
+// AUDIT_WRITE_FAILED 结构化 ERROR 日志，生产应接 on-call 通道——安全审查
+// I-7），操作本身照常返回——Publish/Rollback 返回错误会诱导重试产生重复
+// 修订（审查修复 Important-3）。这一契约是刻意的：变更已生效是事实，
+// 审计缺失是需要人工补录的告警，不是可回滚的状态。
 func (m *CatalogManager) record(ctx context.Context, actor, action, objectType, objectID, reason string, detail map[string]any) {
 	if m.recorder == nil {
 		return
 	}
 	userID, appID := ParseActor(actor)
-	if err := m.recorder.Record(ctx, AuditEvent{
+	ev := AuditEvent{
 		Action: action, ObjectType: objectType, ObjectID: objectID, Reason: reason,
 		ActorUser: userID, ActorApp: appID, Detail: SanitizeDetail(detail),
-	}); err != nil {
-		log.Printf("ERROR catalog audit write failed action=%s object=%s/%s actor=%s: %v (变更已生效，审计缺失需人工补录)",
-			action, objectType, objectID, actor, err)
+	}
+	if err := m.recorder.Record(ctx, ev); err != nil {
+		AuditAlertHook(ctx, ev, err)
 	}
 }
 

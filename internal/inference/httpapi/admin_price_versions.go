@@ -82,6 +82,11 @@ func toPriceVersionView(p *management.PriceVersionInfo) priceVersionView {
 	if len(extra) == 0 {
 		extra = json.RawMessage(`{"schema_version":1}`)
 	}
+	var to *time.Time
+	if p.EffectiveTo != nil {
+		t := p.EffectiveTo.UTC()
+		to = &t
+	}
 	return priceVersionView{
 		PriceVersionID: p.ID, ModelID: p.ModelID, Kind: p.Kind,
 		Unit: p.Unit, Currency: p.Currency,
@@ -90,7 +95,7 @@ func toPriceVersionView(p *management.PriceVersionInfo) priceVersionView {
 		CacheWritePerMtok: strconv.FormatInt(p.CacheWritePerMtok, 10),
 		OutputPerMtok:     strconv.FormatInt(p.OutputPerMtok, 10),
 		ExtraRates:        extra, Revision: p.Revision,
-		EffectiveFrom: p.EffectiveFrom.UTC(), EffectiveTo: p.EffectiveTo,
+		EffectiveFrom: p.EffectiveFrom.UTC(), EffectiveTo: to,
 		CreatedAt: p.CreatedAt.UTC(),
 	}
 }

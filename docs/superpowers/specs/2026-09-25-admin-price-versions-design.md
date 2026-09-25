@@ -157,7 +157,8 @@ domain.Error.Message（不泄露 cause 链）。
 
 | # | 场景 | HTTP | code | message 方向 |
 |---|---|---|---|---|
-| 1 | 缺必填字段 / JSON 未知字段 / 尾随垃圾 | 400 | 400 | invalid request body |
+| 1 | JSON 未知字段 / 尾随垃圾 / 语法错误 | 400 | 400 | invalid request body |
+| 1b | 缺必填字段（model_id/kind/reason/revision） | 400 | 400 | 字段级具体文案（如 `model_id is required`） |
 | 2 | `kind` 非法 | 400 | 400 | unknown kind |
 | 3 | `model_id` 不存在 | 404 | 404 | model not found |
 | 4 | sale_credit 带了 currency | 400 | 400 | currency must be empty for sale_credit |
@@ -173,6 +174,16 @@ domain.Error.Message（不泄露 cause 链）。
 | 14 | auditor 角色（无 models:manage） | 403 | 403 | forbidden |
 | 15 | GET `kind` 非法 / `offset` < 0 | 400 | 400 | invalid query |
 | 16 | 速率超限（/admin 组 30 req/min） | 429 | 429 | rate_limited |
+
+测试口径说明：第 12/13 行（服务身份 / JWT 腿）与第 16 行（组级限流）由共享
+中间件保证，在端点级测试中以「无身份 401 / auditor 403 / 无角色 403」覆盖
+鉴权链在本端点的生效，中间件自身矩阵由其专属测试覆盖（与 accounts/bulk
+面同口径）。
+
+幂等比较精度：重放判定时 `effective_from`/`effective_to` 与库存行按
+**微秒**（PG timestamptz 存储精度，四舍五入）比较——客户端带纳秒精度
+RFC3339 的重放仍判 duplicate；省略 `effective_from` 的请求每次重放取新的
+服务器时刻，会判 conflict（协议内禀），dashboard 重放应固定显式值。
 
 非目标（显式排除）：不提供 update/delete（不可变设计）；不在创建时自动
 闭合前一版本的 `effective_to`（区间重叠允许，`LatestPriceVersion` 按

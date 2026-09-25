@@ -447,3 +447,34 @@ func TestAdminPriceVersionsList(t *testing.T) {
 	doH(t, f.engine, http.MethodGet, "/adminm/price-versions?offset=-1", nil, http.StatusBadRequest, h)
 	doH(t, f.engine, http.MethodGet, "/adminm/price-versions?offset=abc", nil, http.StatusBadRequest, h)
 }
+
+// TestAdminPriceVersionsReplayNanosecondTimestamp: PG timestamptz 截断到
+// 微秒——带纳秒尾数的 effective_from/effective_to 同内容重放仍是 409
+// duplicate（评审轮1 finding：µs 截断不得误判 conflict）；视图里的
+// effective_to 与 effective_from 一样 UTC 归一。
+func TestAdminPriceVersionsReplayNanosecondTimestamp(t *testing.T) {
+	f := newOpsFixture(t)
+	op := uuid.NewString()
+	f.grantOp(t, op, management.RoleOperator)
+	h := f.headers(op)
+	seedPVModel(t, f, "deepseek-chat")
+
+	body := createPVBody("deepseek-chat")
+	body["effective_from"] = "2026-09-25T08:00:00.123456789Z"
+	body["effective_to"] = "2026-10-25T08:00:00.987654321Z"
+	env := doH(t, f.engine, http.MethodPost, "/adminm/price-versions", body, http.StatusCreated, h)
+	v := decodePVView(t, env)
+	to, _ := v["effective_to"].(string)
+	if !strings.HasSuffix(to, "Z") || !strings.HasPrefix(to, "2026-10-25T08:00:00") {
+		t.Fatalf("effective_to = %v, want UTC RFC3339", v["effective_to"])
+	}
+
+	// 同内容重放（同样的纳秒时间戳）→ duplicate 而非 conflict。
+	env = doH(t, f.engine, http.MethodPost, "/adminm/price-versions", body, http.StatusConflict, h)
+	if !strings.Contains(env.Message, "duplicate") {
+		t.Fatalf("replay message = %q, want duplicate (stored row is µs-truncated)", env.Message)
+	}
+	if n := tableCount(t, f, "inference_price_versions"); n != 1 {
+		t.Fatalf("price version rows = %d, want 1", n)
+	}
+}

@@ -213,6 +213,9 @@ func (s *PriceVersionService) Create(ctx context.Context, actor string, in Creat
 			if existing, rerr := s.store.GetPriceVersionByRevision(ctx, in.ModelID, string(kind), in.Revision); rerr == nil {
 				return nil, &PriceVersionExistsError{Existing: existing, Identical: samePriceVersionContent(existing, candidate)}
 			}
+			// 重读也失败时不得把含约束名的原始错误抛给调用方（评审轮1
+			// finding：泄露 PG 内部细节）——固定文案的 409。
+			return nil, domain.NewError(domain.CodeConflict, "price version conflict for (model_id, kind, revision)")
 		}
 		return nil, err
 	}
@@ -249,13 +252,20 @@ func (s *PriceVersionService) List(ctx context.Context, f PriceVersionFilter) ([
 // priceVersionAuditDetail is the full create payload (model/kind/currency/
 // 四档费率/revision/生效区间), sanitized before Record.
 func priceVersionAuditDetail(p *PriceVersionInfo) map[string]any {
+	// extra_rates 解码成 map 再入 detail：SanitizeDetail 只递归 map/slice，
+	// 不透明 json.RawMessage 会让敏感键绕过脱敏（评审轮1 finding）。
+	var extra any = json.RawMessage(p.ExtraRates)
+	var extraObj map[string]any
+	if err := json.Unmarshal(p.ExtraRates, &extraObj); err == nil && extraObj != nil {
+		extra = extraObj
+	}
 	d := map[string]any{
 		"model_id": p.ModelID, "kind": p.Kind, "unit": p.Unit,
 		"input_micros_per_mtok":       p.InputPerMtok,
 		"cache_read_micros_per_mtok":  p.CacheReadPerMtok,
 		"cache_write_micros_per_mtok": p.CacheWritePerMtok,
 		"output_micros_per_mtok":      p.OutputPerMtok,
-		"extra_rates":                 json.RawMessage(p.ExtraRates),
+		"extra_rates":                 extra,
 		"revision":                    p.Revision,
 		"effective_from":              p.EffectiveFrom,
 	}
@@ -280,16 +290,25 @@ func samePriceVersionContent(existing, candidate *PriceVersionInfo) bool {
 		existing.Revision != candidate.Revision {
 		return false
 	}
-	if !existing.EffectiveFrom.Equal(candidate.EffectiveFrom) {
+	if !pgTimeEqual(existing.EffectiveFrom, candidate.EffectiveFrom) {
 		return false
 	}
 	if (existing.EffectiveTo == nil) != (candidate.EffectiveTo == nil) {
 		return false
 	}
-	if existing.EffectiveTo != nil && !existing.EffectiveTo.Equal(*candidate.EffectiveTo) {
+	if existing.EffectiveTo != nil && !pgTimeEqual(*existing.EffectiveTo, *candidate.EffectiveTo) {
 		return false
 	}
 	return jsonDeepEqual(existing.ExtraRates, candidate.ExtraRates)
+}
+
+// pgTimeEqual compares instants at PG timestamptz precision: PostgreSQL
+// rounds (not truncates) fractional seconds to the nearest microsecond on
+// input, so a stored row holds round(candidate, 1µs) — normalizing both
+// sides with Round makes an identical replay compare equal even when the
+// candidate carries a sub-microsecond tail (评审轮1 finding：duplicate 误判).
+func pgTimeEqual(a, b time.Time) bool {
+	return a.UTC().Round(time.Microsecond).Equal(b.UTC().Round(time.Microsecond))
 }
 
 // jsonDeepEqual compares two JSON documents by value (key order insensitive).

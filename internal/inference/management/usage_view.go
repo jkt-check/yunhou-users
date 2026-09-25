@@ -191,15 +191,15 @@ type RequestListFilter struct {
 // CorrectSettlement 补差 / 运营补偿). Tokens sums the latest usage revision
 // per attempt; a nil bucket means not reported.
 type RequestRow struct {
-	ID         string
-	ModelID    string
-	APIKeyID   *string
-	KeyName    string
-	KeyPrefix  string
-	Protocol   string
-	Stream     bool
-	Status     domain.RequestStatus
-	UsageStatus domain.UsageSource
+	ID             string
+	ModelID        string
+	APIKeyID       *string
+	KeyName        string
+	KeyPrefix      string
+	Protocol       string
+	Stream         bool
+	Status         domain.RequestStatus
+	UsageStatus    domain.UsageSource
 	ReservedMicros *domain.Microcredit
 	ChargeMicros   *int64 // 账本 charge 分录；nil = 尚无 charge 行
 	ReversedMicros int64

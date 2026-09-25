@@ -11,6 +11,7 @@ package gateway
 import (
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"testing"
@@ -71,6 +72,10 @@ func TestLifecycleGateDecision(t *testing.T) {
 		{domain.LifecycleRetired, LifecycleGateEnforce, true, true},
 		{domain.LifecycleDraft, LifecycleGateObserve, true, false},
 		{domain.LifecycleDraft, LifecycleGateEnforce, true, true},
+		{"", LifecycleGateObserve, false, false}, // 空 lifecycle 按 active 对待(DB 有 CHECK+DEFAULT 兜底)
+		{"", LifecycleGateEnforce, false, false},
+		{"weird", LifecycleGateObserve, true, false}, // 未知 lifecycle:只观察不拦截
+		{"weird", LifecycleGateEnforce, true, false},
 	}
 	for _, c := range cases {
 		observe, blocked := lifecycleGateDecision(c.lc, c.mode)
@@ -152,8 +157,8 @@ func TestLifecycleGate_Enforce_RetiredBlocked(t *testing.T) {
 	if code := domain.CodeOf(err); code != domain.CodeModelNotAllowed {
 		t.Fatalf("code = %v, want model_not_allowed (403): %v", code, err)
 	}
-	if !strings.Contains(err.Error(), "model_not_allowed") {
-		t.Errorf("error message = %q, want model_not_allowed marker", err.Error())
+	if !strings.Contains(err.Error(), string(domain.LifecycleRetired)) {
+		t.Errorf("error message = %q, want lifecycle name", err.Error())
 	}
 	if up.calls.Load() != 0 {
 		t.Errorf("upstream calls = %d, want 0 (blocked before dispatch)", up.calls.Load())
@@ -206,5 +211,63 @@ func TestLifecycleGate_Enforce_DeprecatedAllowed(t *testing.T) {
 	}
 	if cap.cause == nil || cap.blocked {
 		t.Errorf("observation blocked = %v, want reported unblocked", cap.blocked)
+	}
+}
+
+// 零值安全:未覆写 OnLifecycleGateHit 时走默认 reporter——结构化日志 +
+// AuditAlertHook 告警,不 panic、不拦截。
+func TestLifecycleGate_DefaultReporterFallback(t *testing.T) {
+	up := newUpstream(t, completionHandler)
+	f := newFixture(t, up, withModelLifecycle(domain.LifecycleRetired))
+	f.gateway.OnLifecycleGateHit = nil // 显式回到默认路径
+
+	var logBuf strings.Builder
+	prevOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	var alert management.AuditEvent
+	var alertCause error
+	prevHook := management.AuditAlertHook
+	management.AuditAlertHook = func(ctx context.Context, ev management.AuditEvent, cause error) {
+		alert = ev
+		alertCause = cause
+	}
+	t.Cleanup(func() { management.AuditAlertHook = prevHook })
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi")); err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	if up.calls.Load() != 1 {
+		t.Errorf("upstream calls = %d, want 1 (default reporter must not block)", up.calls.Load())
+	}
+	if !strings.Contains(logBuf.String(), "LIFECYCLE_GATE_HIT") {
+		t.Errorf("structured log missing LIFECYCLE_GATE_HIT: %q", logBuf.String())
+	}
+	if alert.Action != "model.lifecycle.gate_hit" || alert.ObjectID != f.modelID {
+		t.Errorf("alert = %+v, want action=model.lifecycle.gate_hit object=%s", alert, f.modelID)
+	}
+	if alertCause == nil {
+		t.Error("alert cause must be non-nil")
+	}
+}
+
+// 强制模式的回归护栏:active 模型在强制模式下必须完全不受影响。
+func TestLifecycleGate_Enforce_ActiveUnaffected(t *testing.T) {
+	up := newUpstream(t, completionHandler)
+	f := newFixture(t, up) // active
+	f.gateway.LifecycleGate = LifecycleGateEnforce
+
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	if up.calls.Load() != 1 {
+		t.Errorf("upstream calls = %d, want 1", up.calls.Load())
+	}
+	if out.RequestID == "" {
+		t.Error("empty request id")
 	}
 }

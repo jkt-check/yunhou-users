@@ -54,10 +54,10 @@ const (
 // (e.g. an unactivated zero-limit five-hour window) — never invented
 // (设计 §9.1: 未知恢复不能编造倒计时).
 type WindowBlockView struct {
-	Kind      domain.WindowKind
-	Limit     domain.Microcredit
-	Used      domain.Microcredit
-	Reserved  domain.Microcredit
+	Kind     domain.WindowKind
+	Limit    domain.Microcredit
+	Used     domain.Microcredit
+	Reserved domain.Microcredit
 	// Remaining is Remaining(window) at block time (max(0, limit-used-
 	// reserved) — 与 ExhaustedWindowBlock 谓词同一计算，不重复实现).
 	Remaining domain.Microcredit

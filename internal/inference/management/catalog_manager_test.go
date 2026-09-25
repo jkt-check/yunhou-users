@@ -645,7 +645,7 @@ func TestCatalogManager_RollbackActivationFailureLeavesNoOrphanDraft(t *testing.
 	}
 }
 
-// 安全审查 I-7：审计补写失败必须触发告警钩子（默认 AUDIT_WRITE_FAILED
+// 安全审查 I-7：审计补写失败必须触发告警钩子（默认 AUDIT_ALERT
 // 结构化 ERROR 日志，生产接 on-call 通道），携带正确的动作/对象/归因；操作
 // 结果本身不变——变更已提交是事实，审计缺失是告警而非可回滚状态。
 func TestCatalogManager_AuditFailureInvokesAlertHook(t *testing.T) {

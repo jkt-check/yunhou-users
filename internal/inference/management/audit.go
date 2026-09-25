@@ -12,14 +12,17 @@ import (
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
-// AuditAlertHook 是审计补写失败时的告警通道（安全审查 I-7）。catalog 写面
-// 的审计在业务变更提交后补写，失败无法回滚已生效的变更——但失败绝不允许
-// 只剩一句 log.Printf：默认实现输出带 AUDIT_WRITE_FAILED 标记的结构化
-// ERROR 日志（含动作/对象/双腿归因，便于巡检规则命中）；生产应在启动时把
-// 它接到 on-call 通道（pager/webhook），与 SnapshotCache.OnRefreshError
-// 同级的「响亮失败」约定。不得静默丢弃。调用方保证 hook 非 nil 且不 panic。
+// AuditAlertHook 是审计域的告警通道（安全审查 I-7/I-6）。两类调用方共享:
+// catalog 写面的审计在业务变更提交后补写,失败无法回滚已生效的变更;
+// 网关生命周期门(I-6)命中非 active 模型时也经此上报(默认实现输出
+// LIFECYCLE_GATE_HIT 结构化日志之外的第二通道)。默认实现输出带
+// AUDIT_ALERT 标记的结构化 ERROR 日志(含动作/对象/双腿归因,便于巡检
+// 规则命中);「审计缺失需人工补录」这类具体语义由调用方封装进 cause,
+// 保证日志陈述始终属实。生产应在启动时把它接到 on-call 通道
+// (pager/webhook),与 SnapshotCache.OnRefreshError 同级的「响亮失败」
+// 约定。不得静默丢弃。调用方保证 hook 非 nil 且不 panic。
 var AuditAlertHook = func(ctx context.Context, ev AuditEvent, cause error) {
-	log.Printf("AUDIT_WRITE_FAILED action=%s object=%s/%s actor=%s/%s reason=%q err=%v — 变更已生效但审计缺失，需人工补录",
+	log.Printf("AUDIT_ALERT action=%s object=%s/%s actor=%s/%s reason=%q err=%v",
 		ev.Action, ev.ObjectType, ev.ObjectID, ev.ActorUser, ev.ActorApp, ev.Reason, cause)
 }
 

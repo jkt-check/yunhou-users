@@ -133,7 +133,7 @@ func TestBulkImport_PerItemErrorsBlockCommit(t *testing.T) {
 	doc.Models = append(doc.Models, BulkModel{
 		ID: "Bad Model!", // 非法 ID（catalog.ValidateModel 拒绝）
 		Deployments: []BulkDeployment{{
-			ProviderCode: "ghost", // 文档内不存在的 provider
+			ProviderCode:  "ghost", // 文档内不存在的 provider
 			UpstreamModel: "x", Protocol: "openai_chat",
 		}},
 	})
@@ -334,8 +334,8 @@ func (posthocOnlyRecorder) Record(ctx context.Context, ev AuditEvent) error { re
 
 // txSpyRecorder records whether RecordTx ran before Commit.
 type txSpyRecorder struct {
-	uow          *fakeUow
-	txCalls      int
+	uow             *fakeUow
+	txCalls         int
 	committedAtCall bool
 }
 

@@ -182,8 +182,8 @@ type BulkImportStore interface {
 
 // BulkImportService validates and applies catalog bulk imports.
 type BulkImportService struct {
-	store      BulkImportStore
-	recorder   AuditRecorder
+	store       BulkImportStore
+	recorder    AuditRecorder
 	validateURL func(ctx context.Context, rawURL string) error
 }
 

@@ -65,6 +65,9 @@ func lifecycleGateDecision(lc domain.Lifecycle, mode LifecycleGateMode) (observe
 // structured log line (巡检规则按 LIFECYCLE_GATE_HIT 命中) plus the I-7
 // audit-alert channel — a non-active model taking traffic is exactly the
 // class of anomaly AuditAlertHook exists for. cause 必非 nil。
+// 归因说明:Principal 只携带 user/operator 身份,没有 app 腿——API key 与
+// kaya JWT 调用方落在 user 腿(operator 调用方经 OperatorSubject 兜底),
+// ActorApp 恒为空;双腿归因待 principal 携带服务身份后再补。
 func defaultLifecycleGateReporter(ctx context.Context, p *domain.Principal, m *domain.Model, blocked bool, cause error) {
 	actor := p.UserID
 	if actor == "" {

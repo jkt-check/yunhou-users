@@ -124,6 +124,8 @@ type Service struct {
 	// OnLifecycleGateHit receives one observation per request that resolved
 	// to a non-active model. Default: structured LIFECYCLE_GATE_HIT log +
 	// management.AuditAlertHook (I-7 告警通道); 生产可覆写接 on-call。
+	// 与 AuditAlertHook 同契约:调用方保证非 nil、不 panic(panic 依
+	// OnSettleError 约定向上传播给 gin recovery)。
 	OnLifecycleGateHit func(ctx context.Context, p *domain.Principal, m *domain.Model, blocked bool, cause error)
 }
 
@@ -318,7 +320,7 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		if blocked {
 			s.reportLifecycleGate(ctx, p, m, true, cause)
 			return nil, domain.NewError(domain.CodeModelNotAllowed,
-				"model "+m.ID+" is "+string(m.Lifecycle)+" (model_not_allowed)")
+				"model "+m.ID+" is "+string(m.Lifecycle))
 		}
 		s.reportLifecycleGate(ctx, p, m, false, cause)
 	}

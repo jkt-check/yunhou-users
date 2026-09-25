@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -161,7 +162,10 @@ const adminMembershipProduct = "kaya-membership"
 // (SQLSTATE 23505) from InsertMembershipSub: a concurrent grant for the
 // same (user, kaya-membership) won the partial unique index
 // idx_subscriptions_user_product_active. The service layer turns it into
-// an idempotent replay when the request carries an Idempotency-Key.
+// an idempotent replay when the request carries an Idempotency-Key, and
+// into a vip.reject 409 (with the audit row committed in the same tx)
+// when it does not. InsertMembershipSub rolls back to a savepoint before
+// returning this error so the tx stays usable for the audit write.
 var ErrAdminSubscriptionConflict = errors.New("admin: subscription insert conflict")
 
 // isAdminUniqueViolation reports whether err is a Postgres
@@ -371,15 +375,27 @@ func (t *adminUsersTx) InsertMembershipSub(ctx context.Context, userID string, d
 	// Explicit product_code matches the 'monthly' plan row, so the
 	// trg_subscriptions_plan_product trigger (027) passes; a missing
 	// 'monthly' plan makes the trigger raise → 500 at the handler.
+	//
+	// The INSERT runs behind a savepoint: a 23505 (concurrent grant won
+	// the partial unique index) aborts the whole Postgres transaction
+	// otherwise, and the service could not write the vip.reject audit row
+	// in the same tx. ROLLBACK TO SAVEPOINT keeps the tx usable.
+	const sp = "admin_vip_insert"
+	if _, err := t.tx.ExecContext(ctx, "SAVEPOINT "+sp); err != nil {
+		return "", time.Time{}, fmt.Errorf("savepoint: %w", err)
+	}
 	err := t.tx.QueryRowxContext(ctx, `
 		INSERT INTO subscriptions (user_id, plan_id, status, started_at, expires_at, product_code)
 		VALUES ($1, 'monthly', 'active', now(), now() + make_interval(days => $2), $3)
 		RETURNING plan_id, expires_at
 	`, userID, days, adminMembershipProduct).Scan(&planID, &expiresAt)
 	if err != nil {
+		if _, rbErr := t.tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT "+sp); rbErr != nil {
+			return "", time.Time{}, fmt.Errorf("rollback to savepoint after insert failure: %v (insert err: %w)", rbErr, err)
+		}
 		if isAdminUniqueViolation(err) {
 			// 并发 grant(同 key 或无 key)赢了部分唯一索引 —— 由 service
-			// 层决定重放(带 Idempotency-Key)还是 500。
+			// 层决定重放(带 Idempotency-Key)还是 vip.reject 409。
 			return "", time.Time{}, ErrAdminSubscriptionConflict
 		}
 		return "", time.Time{}, err

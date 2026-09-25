@@ -445,8 +445,8 @@ func TestAddVipDaysGrantConflictReplay(t *testing.T) {
 }
 
 func TestAddVipDaysGrantConflictWithoutKey(t *testing.T) {
-	// 同样的唯一索引冲突,但请求没带 Idempotency-Key:没有可重放的响应,
-	// 保持原样上抛(handler 落 500)。
+	// 同样的唯一索引冲突,但请求没带 Idempotency-Key:没有可重放的响应。
+	// spec §1.2:映射为 vip.reject 审计(同事务提交)+ 409,而不是 500。
 	fake := &fakeAdminUsersRepo{
 		tx: &fakeAdminUsersTx{
 			userExists: true,
@@ -457,8 +457,22 @@ func TestAddVipDaysGrantConflictWithoutKey(t *testing.T) {
 	svc := NewAdminUsersService(fake)
 
 	_, err := svc.AddVipDays(context.Background(), "yundash", "admin:yundash", adminTestUserID, 30, "")
-	if !errors.Is(err, repo.ErrAdminSubscriptionConflict) {
+	if !errors.Is(err, ErrAdminVipRejected) {
 		t.Fatalf("err: %v", err)
+	}
+	if !strings.Contains(err.Error(), "并发开通冲突") {
+		t.Fatalf("message: %v", err)
+	}
+	// Rejection audit commits in the same tx (I-4); the subscription insert
+	// rolled back to its savepoint so the row never lands.
+	if len(fake.tx.audits) != 1 || fake.tx.audits[0].action != "vip.reject" {
+		t.Fatalf("audits: %+v", fake.tx.audits)
+	}
+	if fake.tx.audits[0].ctx["reject_reason"] == nil {
+		t.Fatalf("audit ctx missing reject_reason: %+v", fake.tx.audits[0].ctx)
+	}
+	if fake.tx.idemInsertCall {
+		t.Fatal("idempotency write on a rejection")
 	}
 }
 

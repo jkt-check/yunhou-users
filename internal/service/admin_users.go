@@ -336,13 +336,19 @@ func (s *AdminUsersService) AddVipDays(ctx context.Context, appID, actor, userID
 			// trg_subscriptions_plan_product trigger → generic 500.
 			planID, expiresAt, err := tx.InsertMembershipSub(ctx, userID, days)
 			if err != nil {
-				if idemKey != "" && errors.Is(err, repo.ErrAdminSubscriptionConflict) {
-					// 并发同 (app_id, key) 的 grant:双方预读都看到无
-					// active 行(FOR UPDATE 锁不到不存在的行),败者的
-					// INSERT 撞 idx_subscriptions_user_product_active。
-					// 走与末尾撞键相同的回滚 + 重放赢家路径。
-					result = nil
-					return errAdminIdemRace
+				if errors.Is(err, repo.ErrAdminSubscriptionConflict) {
+					if idemKey != "" {
+						// 并发同 (app_id, key) 的 grant:双方预读都看到无
+						// active 行(FOR UPDATE 锁不到不存在的行),败者的
+						// INSERT 撞 idx_subscriptions_user_product_active。
+						// 走与末尾撞键相同的回滚 + 重放赢家路径。
+						result = nil
+						return errAdminIdemRace
+					}
+					// 无幂等键的并发 grant:没有可重放的响应。按 spec
+					// §1.2 记 vip.reject(与「找不到可重放响应」区分开)
+					// 并返回 409,而不是让唯一冲突冒泡成 500。
+					return reject("并发开通冲突：该用户已存在生效中的会员订阅，请刷新后重试")
 				}
 				return fmt.Errorf("insert membership subscription: %w", err)
 			}

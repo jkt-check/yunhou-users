@@ -11,14 +11,19 @@
 //     比较内容——同内容重放与同 revision 不同内容都返回 409
 //     （PriceVersionExistsError.Identical 区分两者），插入撞唯一键的竞态
 //     兜底同样映射 409；
+//   - revision 单调追加是强制不变量（M-5）：创建事务内要求
+//     revision == 该 (model_id, kind) 当前最大 revision + 1，否则 400；
+//     幂等重放（命中既有 revision）先于该检查返回 409；
 //   - 创建 = 写 + 审计同事务（accounts 先例：store.Begin +
 //     AuditTxRecorder.RecordTx，审计失败即回滚）；列表只读，不落审计。
 
 package management
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"math"
 	"reflect"
 	"regexp"
 	"time"
@@ -44,6 +49,10 @@ type PriceVersionStore interface {
 	GetPriceVersionByRevision(ctx context.Context, modelID, kind string, revision int) (*PriceVersionInfo, error)
 	ListPriceVersions(ctx context.Context, f PriceVersionFilter) ([]PriceVersionInfo, error)
 	Begin(ctx context.Context) (domain.UnitOfWork, error)
+	// MaxPriceVersionRevisionTx reads MAX(revision) of one (model_id, kind)
+	// inside the caller's UnitOfWork (0 when none) — the max+1 monotonicity
+	// gate of Create.
+	MaxPriceVersionRevisionTx(ctx context.Context, w domain.UnitOfWork, modelID, kind string) (int, error)
 	// InsertPriceVersionTx appends the immutable revision inside the
 	// caller's UnitOfWork (写 + 审计同事务) and fills ID/CreatedAt.
 	InsertPriceVersionTx(ctx context.Context, w domain.UnitOfWork, p *PriceVersionInfo) error
@@ -109,7 +118,8 @@ var priceCurrencyPattern = regexp.MustCompile(`^[A-Z]{3}$`)
 
 // Create validates and appends one immutable price revision. unit 派生、
 // kind/currency/revision/生效区间过 accounting.PriceVersion.Validate（与落库
-// CHECK 同一规则）；模型必须存在；（model_id, kind, revision) 幂等。
+// CHECK 同一规则）；模型必须存在；（model_id, kind, revision) 幂等；
+// revision 强制 max+1（创建事务内检查，幂等重放先于该检查返回 409）。
 func (s *PriceVersionService) Create(ctx context.Context, actor string, in CreatePriceVersionInput) (*PriceVersionInfo, error) {
 	if in.ModelID == "" {
 		return nil, domain.NewError(domain.CodeInvalidInput, "model_id is required")
@@ -140,6 +150,10 @@ func (s *PriceVersionService) Create(ctx context.Context, actor string, in Creat
 	}
 	if in.Revision <= 0 {
 		return nil, domain.NewError(domain.CodeInvalidInput, "revision must be > 0")
+	}
+	// 列是 INT（int4）：超出范围会在落库时报 22003 → 500；提前 400。
+	if in.Revision > math.MaxInt32 {
+		return nil, domain.NewError(domain.CodeInvalidInput, "revision out of range")
 	}
 	if in.Reason == "" {
 		return nil, domain.NewError(domain.CodeInvalidInput, "reason is required")
@@ -206,6 +220,17 @@ func (s *PriceVersionService) Create(ctx context.Context, actor string, in Creat
 			_ = uow.Rollback(ctx)
 		}
 	}()
+	// revision 单调追加是强制不变量而非约定（M-5）：必须是该
+	// (model_id, kind) 当前最大 revision + 1。检查在创建事务内做；两个
+	// 并发 max+1 创建由 UNIQUE 定序，输家走上面的 409 竞态兜底。幂等重放
+	// 不受此限——它在 Begin 之前的预检就已按 409 返回。
+	maxRev, err := s.store.MaxPriceVersionRevisionTx(ctx, uow, in.ModelID, string(kind))
+	if err != nil {
+		return nil, err
+	}
+	if in.Revision != maxRev+1 {
+		return nil, domain.NewError(domain.CodeInvalidInput, "revision must be max+1 for (model_id, kind)")
+	}
 	if err := s.store.InsertPriceVersionTx(ctx, uow, candidate); err != nil {
 		if domain.CodeOf(err) == domain.CodeConflict {
 			// 与并发创建撞唯一键（预检竞态兜底）：回滚后重读赢家已提交的
@@ -303,18 +328,53 @@ func samePriceVersionContent(existing, candidate *PriceVersionInfo) bool {
 }
 
 // pgTimeEqual compares instants at PG timestamptz precision: PostgreSQL
-// rounds (not truncates) fractional seconds to the nearest microsecond on
-// input, so a stored row holds round(candidate, 1µs) — normalizing both
-// sides with Round makes an identical replay compare equal even when the
-// candidate carries a sub-microsecond tail (评审轮1 finding：duplicate 误判).
+// rounds fractional seconds to the nearest microsecond on input with rint
+// (round HALF TO EVEN), so a stored row holds rint(candidate, 1µs) —
+// mirroring that rounding on both sides makes an identical replay compare
+// equal even when the candidate carries a sub-microsecond tail
+// (评审轮1/轮2 finding：duplicate 误判；time.Round 是 half-away-from-zero,
+// 在半微秒边界与 rint 不一致).
 func pgTimeEqual(a, b time.Time) bool {
-	return a.UTC().Round(time.Microsecond).Equal(b.UTC().Round(time.Microsecond))
+	return pgRoundMicros(a) == pgRoundMicros(b)
+}
+
+// pgRoundMicros mirrors PG's rint() on the µs grid (round half to even).
+// 整数算术，不走 float64：纪元年份的 UnixNano ≈ 1.8e18 超出 float64 精确
+// 整数范围（间距 256ns），math.RoundToEven(float64(ns)/1000) 会把一部分
+// 亚微秒尾数舍错（实测 ~1.3% 偏差）。
+func pgRoundMicros(t time.Time) int64 {
+	ns := t.UnixNano()
+	us := ns / 1000
+	rem := ns % 1000
+	if rem < 0 { // 负值先归一到 floor 语义
+		us--
+		rem += 1000
+	}
+	switch {
+	case rem > 500:
+		us++
+	case rem == 500 && us%2 != 0: // 恰好半微秒：舍到偶数微秒（rint）
+		us++
+	}
+	return us * 1000
 }
 
 // jsonDeepEqual compares two JSON documents by value (key order insensitive).
+// UseNumber 保住大整数（micros 价目可能超 float64 精确范围），不经 float64
+// 坍缩（评审轮2 finding）。
 func jsonDeepEqual(a, b json.RawMessage) bool {
-	var va, vb any
-	if json.Unmarshal(a, &va) != nil || json.Unmarshal(b, &vb) != nil {
+	decode := func(raw json.RawMessage) (any, bool) {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return nil, false
+		}
+		return v, true
+	}
+	va, oka := decode(a)
+	vb, okb := decode(b)
+	if !oka || !okb {
 		return false
 	}
 	return reflect.DeepEqual(va, vb)

@@ -80,6 +80,27 @@ func (s *Store) InsertPriceVersionTx(ctx context.Context, w domain.UnitOfWork, p
 	return nil
 }
 
+// MaxPriceVersionRevisionTx reads MAX(revision) of one (model_id, kind)
+// inside the caller's UnitOfWork (0 when none) — the max+1 monotonicity gate
+// of the admin create path (M-5). 并发同 revision 创建最终由 UNIQUE 定序
+// （输家 409 竞态兜底），本读数只需防止跳号/回退。
+func (s *Store) MaxPriceVersionRevisionTx(ctx context.Context, w domain.UnitOfWork, modelID, kind string) (int, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return 0, err
+	}
+	var max sql.NullInt64
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT MAX(revision) FROM inference_price_versions WHERE model_id = $1 AND kind = $2`,
+		modelID, kind).Scan(&max); err != nil {
+		return 0, mapError("max price version revision", err)
+	}
+	if !max.Valid {
+		return 0, nil
+	}
+	return int(max.Int64), nil
+}
+
 func insertPriceVersion(ctx context.Context, ex sqlxExecutor, p *PriceVersion) error {
 	extra := p.ExtraRates.Raw
 	if len(extra) == 0 {

@@ -49,7 +49,7 @@ quota-policies 并列），且配套的只读影响预览 `POST /admin/model-pri
 | `cache_write_micros_per_mtok` | int64 | 否 | ≥0，缺省 0 |
 | `output_micros_per_mtok` | int64 | 否 | ≥0，缺省 0 |
 | `extra_rates` | object | 否 | JSON 对象；缺省落 `{"schema_version":1}` |
-| `revision` | int | 是 | >0；约定 = 该 (model_id, kind) 当前最大 revision + 1 |
+| `revision` | int | 是 | >0 且 ≤ int4 上限；**强制** = 该 (model_id, kind) 当前最大 revision + 1（创建事务内检查，跳号/回退且非重放 → 400 `revision must be max+1`），不再是纯约定 |
 | `effective_from` | RFC3339 | 否 | 缺省 = 服务器当前时刻（与 preview 同语义） |
 | `effective_to` | RFC3339 | 否 | 给了必须 > effective_from |
 | `reason` | string | 是 | 审计必填，非空 |
@@ -134,6 +134,11 @@ micros 字段渲染为 **string**（int64 JSON 精度安全，与 preview 的
   （revision 取错），不是重放；
 - 服务端创建前按 (model_id, kind, revision) 先查：命中即比较后按上两条
   返回，未命中才插入。插入与唯一约束竞态兜底：constraint 违例映射 409。
+- revision 单调追加是**强制不变量**（M-5，评审轮2 收口）：创建事务内
+  要求 revision == 该 (model_id, kind) 当前最大 revision + 1，否则
+  400（跳号/回退且非重放一律拒绝）。两个并发 max+1 创建由 UNIQUE
+  定序，输家按上面的竞态兜底 409；命中既有 revision 的幂等重放先于
+  该检查返回（仍 409 duplicate，不受 max+1 拦截）。
 
 ## 5. 审计
 
@@ -174,6 +179,8 @@ domain.Error.Message（不泄露 cause 链）。
 | 14 | auditor 角色（无 models:manage） | 403 | 403 | forbidden |
 | 15 | GET `kind` 非法 / `offset` < 0 | 400 | 400 | invalid query |
 | 16 | 速率超限（/admin 组 30 req/min） | 429 | 429 | rate_limited |
+| 17 | `revision` 非 max+1（跳号/回退且非重放） | 400 | 400 | revision must be max+1 |
+| 18 | `revision` 超 int4 上限 | 400 | 400 | revision out of range |
 
 测试口径说明：第 12/13 行（服务身份 / JWT 腿）与第 16 行（组级限流）由共享
 中间件保证，在端点级测试中以「无身份 401 / auditor 403 / 无角色 403」覆盖

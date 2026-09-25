@@ -448,10 +448,11 @@ func TestAdminPriceVersionsList(t *testing.T) {
 	doH(t, f.engine, http.MethodGet, "/adminm/price-versions?offset=abc", nil, http.StatusBadRequest, h)
 }
 
-// TestAdminPriceVersionsReplayNanosecondTimestamp: PG timestamptz 截断到
-// 微秒——带纳秒尾数的 effective_from/effective_to 同内容重放仍是 409
-// duplicate（评审轮1 finding：µs 截断不得误判 conflict）；视图里的
-// effective_to 与 effective_from 一样 UTC 归一。
+// TestAdminPriceVersionsReplayNanosecondTimestamp: PG timestamptz 把分数秒
+// 舍入（rint，四舍六入五成双/half-to-even）到微秒——带纳秒尾数的
+// effective_from/effective_to 同内容重放仍是 409 duplicate（评审轮1/轮2
+// finding：µs 舍入不得误判 conflict）；视图里的 effective_to 与
+// effective_from 一样 UTC 归一。
 func TestAdminPriceVersionsReplayNanosecondTimestamp(t *testing.T) {
 	f := newOpsFixture(t)
 	op := uuid.NewString()
@@ -476,5 +477,55 @@ func TestAdminPriceVersionsReplayNanosecondTimestamp(t *testing.T) {
 	}
 	if n := tableCount(t, f, "inference_price_versions"); n != 1 {
 		t.Fatalf("price version rows = %d, want 1", n)
+	}
+}
+
+// TestAdminPriceVersionsRevisionMonotonic: M-5 —— revision 单调追加强制
+// （max+1，否则 400）；幂等重放最新 revision 仍 409 duplicate（不被
+// max+1 闸门拦截）。
+func TestAdminPriceVersionsRevisionMonotonic(t *testing.T) {
+	f := newOpsFixture(t)
+	op := uuid.NewString()
+	f.grantOp(t, op, management.RoleOperator)
+	h := f.headers(op)
+	seedPVModel(t, f, "deepseek-chat")
+
+	// 跳号：首版即 revision 5 → 400。
+	body := createPVBody("deepseek-chat")
+	body["revision"] = 5
+	env := doH(t, f.engine, http.MethodPost, "/adminm/price-versions", body, http.StatusBadRequest, h)
+	if !strings.Contains(env.Message, "revision must be max+1") {
+		t.Fatalf("gap message = %q", env.Message)
+	}
+
+	// 顺序 1,2,3 → 201。
+	for rev := 1; rev <= 3; rev++ {
+		b := createPVBody("deepseek-chat")
+		b["revision"] = rev
+		doH(t, f.engine, http.MethodPost, "/adminm/price-versions", b, http.StatusCreated, h)
+	}
+
+	// 重放最新 revision 3（同内容）→ 409 duplicate + 已存在视图。
+	replay := createPVBody("deepseek-chat")
+	replay["revision"] = 3
+	env = doH(t, f.engine, http.MethodPost, "/adminm/price-versions", replay, http.StatusConflict, h)
+	if !strings.Contains(env.Message, "duplicate") {
+		t.Fatalf("replay latest = %q, want duplicate", env.Message)
+	}
+	dup := decodePVView(t, env)
+	if dup["revision"] != float64(3) {
+		t.Fatalf("409 view = %s, want existing revision 3", env.Data)
+	}
+
+	// max=3 之后跳过 4 直接要 5 → 400（跳号始终拒绝，无论首尾）。
+	gap := createPVBody("deepseek-chat")
+	gap["revision"] = 5
+	env = doH(t, f.engine, http.MethodPost, "/adminm/price-versions", gap, http.StatusBadRequest, h)
+	if !strings.Contains(env.Message, "revision must be max+1") {
+		t.Fatalf("post-sequence gap message = %q", env.Message)
+	}
+
+	if n := tableCount(t, f, "inference_price_versions"); n != 3 {
+		t.Fatalf("rows = %d, want 3", n)
 	}
 }

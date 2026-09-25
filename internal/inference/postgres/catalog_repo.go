@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -154,6 +155,20 @@ func (s *Store) UpdateModel(ctx context.Context, m *domain.Model) error {
 		`SELECT updated_at FROM inference_models WHERE id=$1`, m.ID)
 }
 
+// mapDeleteFK 把删除路径上的 23503 外键违反映射成 409 conflict 而不是
+// mapError 的 400（安全审查 M-10）：模型/供应商/部署被历史事实（价格、
+// 用量、路由……）引用时，正确处置是 retire/disable 而不是删除——400 会
+// 误导操作员反复修正请求而不是改走生命周期/停用路径。其余错误照常走
+// mapError。
+func mapDeleteFK(op, hint string, err error) error {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code == "23503" {
+		return domain.NewError(domain.CodeConflict,
+			op+": still referenced by "+pqErr.Table+" — "+hint)
+	}
+	return mapError(op, err)
+}
+
 // DeleteModel removes a model and its route rows in one transaction.
 func (s *Store) DeleteModel(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTxx(ctx, nil)
@@ -167,7 +182,9 @@ func (s *Store) DeleteModel(ctx context.Context, id string) error {
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM inference_models WHERE id=$1`, id)
 	if err != nil {
-		return mapError("delete model", err)
+		// 模型仍被价格/用量等历史事实引用：引导操作员走 retire 而非删除。
+		return mapDeleteFK("delete model",
+			"set its lifecycle to retired instead of deleting (dependent facts must stay navigable)", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return mapError("delete model", sql.ErrNoRows)
@@ -682,21 +699,15 @@ func (s *Store) UpdateProvider(ctx context.Context, p *domain.Provider) error {
 		`SELECT updated_at FROM inference_providers WHERE id=$1`, p.ID)
 }
 
-// DeleteProvider refuses while deployments still reference the provider —
-// catalog history must stay navigable.
+// DeleteProvider refuses while deployments (or any other dependent rows)
+// still reference the provider — catalog history must stay navigable. The
+// single-statement DELETE leans on the foreign keys as the source of truth:
+// it either succeeds or fails with 23503, so the old count-then-delete race
+// window is closed (安全审查 M-10). 0 rows → 404.
 func (s *Store) DeleteProvider(ctx context.Context, id string) error {
-	var n int
-	if err := s.db.GetContext(ctx, &n,
-		`SELECT COUNT(*) FROM inference_deployments WHERE provider_id=$1`, id); err != nil {
-		return mapError("delete provider: count", err)
-	}
-	if n > 0 {
-		return domain.NewError(domain.CodeConflict,
-			"provider still has deployments; disable it or remove them first")
-	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM inference_providers WHERE id=$1`, id)
 	if err != nil {
-		return mapError("delete provider", err)
+		return mapDeleteFK("delete provider", "disable it or remove the dependents first", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return mapError("delete provider", sql.ErrNoRows)
@@ -803,19 +814,12 @@ func (s *Store) UpdateDeployment(ctx context.Context, d *domain.Deployment) erro
 }
 
 // DeleteDeployment refuses while routes still reference the deployment.
+// Single-statement DELETE + FK violation → 409 (no count-then-delete race,
+// 安全审查 M-10); 0 rows → 404.
 func (s *Store) DeleteDeployment(ctx context.Context, id string) error {
-	var n int
-	if err := s.db.GetContext(ctx, &n,
-		`SELECT COUNT(*) FROM inference_model_routes WHERE deployment_id=$1`, id); err != nil {
-		return mapError("delete deployment: count", err)
-	}
-	if n > 0 {
-		return domain.NewError(domain.CodeConflict,
-			"deployment still has model routes; disable the routes first")
-	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM inference_deployments WHERE id=$1`, id)
 	if err != nil {
-		return mapError("delete deployment", err)
+		return mapDeleteFK("delete deployment", "disable the routes first", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return mapError("delete deployment", sql.ErrNoRows)

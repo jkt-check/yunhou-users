@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -326,5 +328,39 @@ func TestRepoRevisionReads(t *testing.T) {
 	}
 	if err := s.ActivateRevision(ctx, domain.ScopeCatalog, 42); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Errorf("activate missing revision: got %v", err)
+	}
+}
+
+// 安全审查 M-10：被历史事实（价格）引用的模型删除时映射为 409 + retire
+// 引导，而不是误导性的 400；失败的删除不回滚掉模型行；不存在的供应商/
+// 部署删除仍 404（既有的引用中删除 409/成功删除用例继续由
+// TestRepoProviderGuards/TestRepoDeploymentUpdateAndGuards 覆盖）。
+func TestRepoDeleteGuardsFKConflictAndNotFound(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	modelID, _ := repoCatalogChain(t, s)
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO inference_price_versions (model_id, kind, unit, revision, effective_from)
+		 VALUES ($1, 'sale_credit', 'microcredit', 1, now())`, modelID); err != nil {
+		t.Fatal(err)
+	}
+	err := s.DeleteModel(ctx, modelID)
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("delete price-referenced model: got %v, want conflict", err)
+	}
+	var de *domain.Error
+	if !errors.As(err, &de) || !strings.Contains(de.Message, "retired") {
+		t.Errorf("conflict message must direct operator to retire first: %v", err)
+	}
+	if _, err := s.GetModel(ctx, modelID); err != nil {
+		t.Errorf("model must survive the failed delete: %v", err)
+	}
+
+	if err := s.DeleteProvider(ctx, uuid.NewString()); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("delete missing provider: got %v, want not_found", err)
+	}
+	if err := s.DeleteDeployment(ctx, uuid.NewString()); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("delete missing deployment: got %v, want not_found", err)
 	}
 }

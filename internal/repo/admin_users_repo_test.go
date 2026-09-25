@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -55,5 +56,63 @@ func TestInsertMembershipSubConflictKeepsTxUsable(t *testing.T) {
 	if err := db.GetContext(ctx, &auditN,
 		`SELECT count(*) FROM audit_log WHERE action = 'vip.reject' AND target = $1`, target); err != nil || auditN != 1 {
 		t.Fatalf("reject audit count = %d (err %v), want 1", auditN, err)
+	}
+}
+
+// TestIdempotencyRecordRoundTrip: the payload digest written with the key
+// (migration 038) comes back on the replay read; rows predating 038 have
+// NULL request_hash and must read back as nil so the service skips the
+// payload check for them.
+func TestIdempotencyRecordRoundTrip(t *testing.T) {
+	db := setupDB(t)
+	ctx := context.Background()
+	r := NewAdminUsersRepo(db)
+	// Fixed keys below: clear prior runs (setupDB does not truncate this
+	// 037 table).
+	if _, err := db.ExecContext(ctx, `DELETE FROM admin_idempotency_keys WHERE app_id = 'yundash'`); err != nil {
+		t.Fatalf("clear idempotency keys: %v", err)
+	}
+
+	const hash = "deadbeef"
+	err := r.WithTx(ctx, func(tx AdminUsersTx) error {
+		inserted, err := tx.InsertIdempotencyKey(ctx, "yundash", "k-hash", "vip.grant", "user:"+uuid.NewString(), hash,
+			json.RawMessage(`{"action":"granted"}`))
+		if err != nil || !inserted {
+			t.Fatalf("insert: inserted=%v err=%v", inserted, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("tx: %v", err)
+	}
+
+	rec, err := r.GetIdempotencyRecord(ctx, "yundash", "k-hash")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// jsonb normalizes the payload (whitespace), so compare decoded.
+	var decoded struct {
+		Action string `json:"action"`
+	}
+	if rec == nil || json.Unmarshal(rec.Response, &decoded) != nil || decoded.Action != "granted" {
+		t.Fatalf("record: %+v", rec)
+	}
+	if rec.RequestHash == nil || *rec.RequestHash != hash {
+		t.Fatalf("request hash: %+v, want %q", rec.RequestHash, hash)
+	}
+
+	// Legacy 037 row (no digest): NULL comes back as nil.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO admin_idempotency_keys (app_id, key, action, target, response)
+		VALUES ('yundash', 'k-legacy', 'vip.grant', 'user:x', '{"action":"granted"}'::jsonb)
+	`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	legacy, err := r.GetIdempotencyRecord(ctx, "yundash", "k-legacy")
+	if err != nil {
+		t.Fatalf("read legacy: %v", err)
+	}
+	if legacy == nil || legacy.RequestHash != nil {
+		t.Fatalf("legacy record: %+v, want nil hash", legacy)
 	}
 }

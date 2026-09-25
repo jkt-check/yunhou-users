@@ -294,7 +294,7 @@ func TestAdminBulkImport_HTTPFlow(t *testing.T) {
 
 	// 导入→草稿→发布：catalog publish 成功且发布不翻生命周期（仍是草稿，
 	// 运营补齐授权/价格后再单独激活）。
-	env = doH(t, f.engine, http.MethodPost, "/adminm/catalog/publish", map[string]any{}, http.StatusOK, f.headers(op))
+	env = doH(t, f.engine, http.MethodPost, "/adminm/catalog/publish?reason=ship", map[string]any{}, http.StatusOK, f.headers(op))
 	var pub struct {
 		Revision int `json:"revision"`
 	}

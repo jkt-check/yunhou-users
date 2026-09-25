@@ -329,7 +329,7 @@ func TestCatalogWriteMountedWithAuthz(t *testing.T) {
 
 	// Operator with models:manage can write; actor lands in revision history.
 	hdrs := env.headers(t, task4User)
-	body := fmt.Sprintf(`{"id":%q,"display_name":"M","protocols":["openai_chat"],"lifecycle":"draft","context_tokens":8000,"max_output_tokens":1000}`, task4ModelID)
+	body := fmt.Sprintf(`{"id":%q,"display_name":"M","protocols":["openai_chat"],"lifecycle":"draft","context_tokens":8000,"max_output_tokens":1000,"reason":"seed"}`, task4ModelID)
 	w := postJSON(t, env.engine, "/admin/models", hdrs, body)
 	if w.Code != http.StatusOK && w.Code != http.StatusCreated {
 		t.Fatalf("operator model create: %d %s", w.Code, w.Body.String())
@@ -345,7 +345,7 @@ func TestCatalogWriteMountedWithAuthz(t *testing.T) {
 	}
 
 	// Publish works and attributes the combined subject.
-	w = postJSON(t, env.engine, "/admin/catalog/publish", hdrs, `{}`)
+	w = postJSON(t, env.engine, "/admin/catalog/publish?reason=ship", hdrs, `{}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("publish: %d %s", w.Code, w.Body.String())
 	}

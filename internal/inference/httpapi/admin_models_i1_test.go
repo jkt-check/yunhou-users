@@ -17,7 +17,7 @@ func TestAdminModelPatch_RejectsLifecycleField(t *testing.T) {
 	do(t, engine, http.MethodPost, "/admin/models", map[string]any{
 		"id": "i1-patch-lc", "display_name": "M",
 		"context_tokens": 1024, "max_output_tokens": 128,
-		"protocols": []string{"openai_chat"},
+		"protocols": []string{"openai_chat"}, "reason": "seed",
 	}, http.StatusOK)
 
 	// 无论值是否「合法」，PATCH 携带 lifecycle 字段一律 400——绕过状态机的
@@ -37,16 +37,16 @@ func TestAdminModelCreate_RejectsDirectActive(t *testing.T) {
 		do(t, engine, http.MethodPost, "/admin/models", map[string]any{
 			"id": "i1-create-" + lc, "display_name": "M", "lifecycle": lc,
 			"context_tokens": 1024, "max_output_tokens": 128,
-			"protocols": []string{"openai_chat"},
+			"protocols": []string{"openai_chat"}, "reason": "seed",
 		}, http.StatusBadRequest)
 	}
 
 	// 显式 draft 是合法的，且与缺省等价。
 	for _, body := range []map[string]any{
 		{"id": "i1-create-draft", "display_name": "M", "lifecycle": "draft",
-			"context_tokens": 1024, "max_output_tokens": 128, "protocols": []string{"openai_chat"}},
+			"context_tokens": 1024, "max_output_tokens": 128, "protocols": []string{"openai_chat"}, "reason": "seed"},
 		{"id": "i1-create-omit", "display_name": "M",
-			"context_tokens": 1024, "max_output_tokens": 128, "protocols": []string{"openai_chat"}},
+			"context_tokens": 1024, "max_output_tokens": 128, "protocols": []string{"openai_chat"}, "reason": "seed"},
 	} {
 		env := do(t, engine, http.MethodPost, "/admin/models", body, http.StatusOK)
 		var got struct {
@@ -68,7 +68,7 @@ func TestAdminModelPatch_PartialUpdatePreservesFields(t *testing.T) {
 		"id": "i1-patch-partial", "display_name": "Before",
 		"context_tokens": 4096, "max_output_tokens": 512,
 		"protocols": []string{"openai_chat"}, "aliases": []string{"alias-1"},
-		"supports_tools": true,
+		"supports_tools": true, "reason": "seed",
 	}, http.StatusOK)
 
 	// 激活后只改 display_name（I-1 场景：运营改名绝不允许把在售模型打回
@@ -86,7 +86,7 @@ func TestAdminModelPatch_PartialUpdatePreservesFields(t *testing.T) {
 	}
 
 	do(t, engine, http.MethodPatch, "/admin/models/i1-patch-partial", map[string]any{
-		"display_name": "After", "updated_at": before.UpdatedAt,
+		"display_name": "After", "updated_at": before.UpdatedAt, "reason": "rename",
 	}, http.StatusOK)
 
 	env = do(t, engine, http.MethodGet, "/admin/models/i1-patch-partial", nil, http.StatusOK)

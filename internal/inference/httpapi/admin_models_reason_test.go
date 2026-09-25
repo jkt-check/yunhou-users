@@ -112,13 +112,15 @@ func TestAdminModels_ReasonFlowsToAudit(t *testing.T) {
 		t.Fatalf("audit = %+v, want model.delete with reason", ev)
 	}
 
-	// 未传 reason：空串（现状兼容），不报错。
+	// 未传 reason：400（安全审查 M-6——catalog 写变更理由必填，空串理由不
+	// 再 unnamed 落审计），且不产生审计事件。
+	nBefore := len(rec.events)
 	w = call(http.MethodPost, "/admin/models",
 		`{"id":"m-noreason","display_name":"M2","context_tokens":1024,"max_output_tokens":128,"protocols":["openai_chat"]}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("create without reason = %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("create without reason = %d, want 400: %s", w.Code, w.Body.String())
 	}
-	if ev := rec.last(); ev.Reason != "" {
-		t.Fatalf("audit reason = %q, want empty for absent reason", ev.Reason)
+	if len(rec.events) != nBefore {
+		t.Fatalf("rejected write must not produce audit events: %+v", rec.events[nBefore:])
 	}
 }

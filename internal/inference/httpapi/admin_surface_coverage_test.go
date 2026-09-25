@@ -67,7 +67,7 @@ func TestAdminCatalogWriteSurface_FullLifecycle(t *testing.T) {
 	doH(t, f.engine, http.MethodGet, "/adminm/models", nil, http.StatusOK, h)
 	tok = versionToken(t, f, "/adminm/models/glm-x-1", h)
 	doH(t, f.engine, http.MethodPost, "/adminm/models/glm-x-1/lifecycle", map[string]any{
-		"lifecycle": "active", "updated_at": tok, "reason": "activate",
+		"lifecycle": "active", "reason": "activate",
 	}, http.StatusOK, h)
 
 	// Deployment CRUD。
@@ -127,7 +127,7 @@ func TestAdminCatalogWriteSurface_FullLifecycle(t *testing.T) {
 	doH(t, f.engine, http.MethodDelete, "/adminm/routes/"+route.ID+"?reason=cleanup", nil, http.StatusOK, h)
 
 	// Publish → revisions/active → rollback。
-	doH(t, f.engine, http.MethodPost, "/adminm/catalog/publish", map[string]any{}, http.StatusOK, h)
+	doH(t, f.engine, http.MethodPost, "/adminm/catalog/publish?reason=ship", map[string]any{}, http.StatusOK, h)
 	doH(t, f.engine, http.MethodGet, "/adminm/catalog/revisions", nil, http.StatusOK, h)
 	doH(t, f.engine, http.MethodGet, "/adminm/catalog/active", nil, http.StatusOK, h)
 	doH(t, f.engine, http.MethodPost, "/adminm/catalog/rollback", map[string]any{

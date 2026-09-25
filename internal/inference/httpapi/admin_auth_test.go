@@ -120,7 +120,7 @@ func doAuthed(engine *gin.Engine, method, path string, headers map[string]string
 
 func TestOperatorAuthzDualIdentity(t *testing.T) {
 	store := &stubOperatorStore{roles: map[string][]string{
-		"op-1": {"operator"},
+		"op-1":       {"operator"},
 		"plain-user": nil,
 	}}
 	engine := newAuthzEngine(store)
@@ -134,8 +134,8 @@ func TestOperatorAuthzDualIdentity(t *testing.T) {
 	}
 	var body struct {
 		Actor struct {
-			UserID string `json:"user_id"`
-			AppID  string `json:"app_id"`
+			UserID string   `json:"user_id"`
+			AppID  string   `json:"app_id"`
 			Roles  []string `json:"roles"`
 		} `json:"actor"`
 	}
@@ -196,8 +196,8 @@ func TestOperatorAuthzPermissionSeparation(t *testing.T) {
 
 func TestOperatorRequireRole(t *testing.T) {
 	store := &stubOperatorStore{roles: map[string][]string{
-		"adm-1":  {"admin"},
-		"op-1":   {"operator"},
+		"adm-1": {"admin"},
+		"op-1":  {"operator"},
 	}}
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
@@ -288,17 +288,31 @@ func TestGrantRevokeHandlers(t *testing.T) {
 		t.Fatalf("unknown role: %d", w.Code)
 	}
 
-	// Revoke → audit permission.revoke.
+	// Revoke without a reason → 400 (M-6); with ?reason= → audit
+	// permission.revoke carries the caller-supplied attribution.
 	req := httptest.NewRequest(http.MethodDelete, "/admin/operators/u2/roles/operator", nil)
 	req.Header.Set("X-Test-User", "adm-1")
 	req.Header.Set("X-Test-App", "a")
 	w = httptest.NewRecorder()
 	engine.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("revoke: %d", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("revoke without reason = %d, want 400", w.Code)
 	}
-	if rec.events[len(rec.events)-1].Action != "permission.revoke" {
-		t.Fatalf("revoke audit: %+v", rec.events[len(rec.events)-1])
+
+	req = httptest.NewRequest(http.MethodDelete, "/admin/operators/u2/roles/operator?reason=offboard", nil)
+	req.Header.Set("X-Test-User", "adm-1")
+	req.Header.Set("X-Test-App", "a")
+	w = httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("revoke: %d %s", w.Code, w.Body.String())
+	}
+	last := rec.events[len(rec.events)-1]
+	if last.Action != "permission.revoke" {
+		t.Fatalf("revoke audit: %+v", last)
+	}
+	if last.Reason != "offboard" || last.ActorUser != "adm-1" || last.ActorApp != "a" {
+		t.Fatalf("revoke attribution must carry the caller reason: %+v", last)
 	}
 }
 

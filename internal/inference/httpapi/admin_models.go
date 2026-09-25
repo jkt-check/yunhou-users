@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -101,8 +102,8 @@ func toModelDTO(m *domain.Model) modelDTO {
 // modelCreateRequest is the POST /models body. An explicit lifecycle is
 // rejected unless it is "draft" (安全审查 I-1): new models always start as
 // draft and promote only via POST /models/:id/lifecycle, so a create can
-// never skip the draft→publish state machine. Reason 是可选的运营理由，
-// 透传到审计事件（评审轮2 finding6）。
+// never skip the draft→publish state machine. Reason 是必填的运营理由
+// （M-6：空串/缺省 400），透传到审计事件（评审轮2 finding6）。
 type modelCreateRequest struct {
 	ID                string   `json:"id"`
 	DisplayName       string   `json:"display_name"`
@@ -213,7 +214,7 @@ type providerWriteRequest struct {
 	AccessType  domain.AccessType `json:"access_type"`
 	Status      string            `json:"status"`
 	UpdatedAt   *time.Time        `json:"updated_at"`
-	Reason      string            `json:"reason"` // 可选运营理由 → 审计
+	Reason      string            `json:"reason"` // 必填运营理由 → 审计（M-6，空串/缺省 400）
 }
 
 type deploymentDTO struct {
@@ -256,7 +257,7 @@ type deploymentWriteRequest struct {
 	Config           json.RawMessage `json:"config"`
 	Status           string          `json:"status"`
 	ConfigVersion    int             `json:"config_version"`
-	Reason           string          `json:"reason"` // 可选运营理由 → 审计
+	Reason           string          `json:"reason"` // 必填运营理由 → 审计（M-6，空串/缺省 400）
 }
 
 func (r *deploymentWriteRequest) toDomain(id string) *domain.Deployment {
@@ -304,7 +305,7 @@ type routeWriteRequest struct {
 	PoolStrategy string     `json:"pool_strategy"`
 	Enabled      bool       `json:"enabled"`
 	UpdatedAt    *time.Time `json:"updated_at"`
-	Reason       string     `json:"reason"` // 可选运营理由 → 审计
+	Reason       string     `json:"reason"` // 必填运营理由 → 审计（M-6，空串/缺省 400）
 }
 
 type revisionDTO struct {
@@ -383,10 +384,23 @@ func actorOf(c *gin.Context) string {
 	return "user:unauthenticated@app:unknown"
 }
 
-// reasonOf 取无请求体写端点（DELETE 系、catalog/publish）的可选运营理由
-// （?reason=）。有请求体的端点从各自 DTO 的 reason 字段取。未传为空串——
-// CatalogManager.firstReason 对空串与未传等价（现状兼容，评审轮2 finding6）。
-func reasonOf(c *gin.Context) string { return c.Query("reason") }
+// requiredReason 校验运营理由非空（安全审查 M-6）：空串/纯空白理由会 unnamed
+// 落审计，与 credentials/accounts 写面同口径——catalog 的每个写变更都必须
+// 带可追责理由。返回去除首尾空白的理由。
+func requiredReason(c *gin.Context, reason string) (string, bool) {
+	r := strings.TrimSpace(reason)
+	if r == "" {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "reason is required"))
+		return "", false
+	}
+	return r, true
+}
+
+// requiredReasonOf 是无请求体写端点（DELETE 系、catalog/publish）的必填
+// 运营理由（?reason=）版本（安全审查 M-6）。
+func requiredReasonOf(c *gin.Context) (string, bool) {
+	return requiredReason(c, c.Query("reason"))
+}
 
 // adminListMaxLimit 是所有管理列表端点 ?limit= 的硬上限（评审轮1 m3：
 // 无上限的 limit=999999999 一次调用即可触发无界扫描）。超限按上限处理
@@ -521,7 +535,11 @@ func (h *AdminModelsHandler) CreateModel(c *gin.Context) {
 		return
 	}
 	m := req.toDomain()
-	if err := h.mgr.CreateModel(c.Request.Context(), actorOf(c), m, req.Reason); err != nil {
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
+		return
+	}
+	if err := h.mgr.CreateModel(c.Request.Context(), actorOf(c), m, reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -549,8 +567,12 @@ func (h *AdminModelsHandler) UpdateModel(c *gin.Context) {
 			"updated_at version token is required (read the model first)"))
 		return
 	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
+		return
+	}
 	req.apply(m)
-	if err := h.mgr.UpdateModel(c.Request.Context(), actorOf(c), m, req.Reason); err != nil {
+	if err := h.mgr.UpdateModel(c.Request.Context(), actorOf(c), m, reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -558,16 +580,25 @@ func (h *AdminModelsHandler) UpdateModel(c *gin.Context) {
 }
 
 // SetModelLifecycle POST /models/:id/lifecycle {"lifecycle":"active","reason":"…"}
+// —— 生命周期状态机的唯一入口；reason 必填（M-6）。
 func (h *AdminModelsHandler) SetModelLifecycle(c *gin.Context) {
 	var req struct {
 		Lifecycle domain.Lifecycle `json:"lifecycle" binding:"required"`
-		Reason    string           `json:"reason"` // 可选运营理由 → 审计
+		Reason    string           `json:"reason"` // 必填运营理由 → 审计（M-6）
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
 		return
 	}
-	if err := h.mgr.SetModelLifecycle(c.Request.Context(), actorOf(c), c.Param("id"), req.Lifecycle, req.Reason); err != nil {
+	if req.Lifecycle == "" {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "lifecycle is required"))
+		return
+	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
+		return
+	}
+	if err := h.mgr.SetModelLifecycle(c.Request.Context(), actorOf(c), c.Param("id"), req.Lifecycle, reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -579,9 +610,13 @@ func (h *AdminModelsHandler) SetModelLifecycle(c *gin.Context) {
 	ok(c, toModelDTO(m))
 }
 
-// DeleteModel DELETE /models/:id（可选 ?reason= 运营理由 → 审计）
+// DeleteModel DELETE /models/:id（必填 ?reason= 运营理由 → 审计，M-6）
 func (h *AdminModelsHandler) DeleteModel(c *gin.Context) {
-	if err := h.mgr.DeleteModel(c.Request.Context(), actorOf(c), c.Param("id"), reasonOf(c)); err != nil {
+	reason, okReason := requiredReasonOf(c)
+	if !okReason {
+		return
+	}
+	if err := h.mgr.DeleteModel(c.Request.Context(), actorOf(c), c.Param("id"), reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -591,15 +626,19 @@ func (h *AdminModelsHandler) DeleteModel(c *gin.Context) {
 // CreateProvider POST /providers
 func (h *AdminModelsHandler) CreateProvider(c *gin.Context) {
 	var req providerWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
+		return
+	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
 		return
 	}
 	p := &domain.Provider{
 		Code: req.Code, DisplayName: req.DisplayName,
 		AccessType: req.AccessType, Status: req.Status,
 	}
-	if err := h.mgr.CreateProvider(c.Request.Context(), actorOf(c), p, req.Reason); err != nil {
+	if err := h.mgr.CreateProvider(c.Request.Context(), actorOf(c), p, reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -613,8 +652,12 @@ func (h *AdminModelsHandler) CreateProvider(c *gin.Context) {
 // UpdateProvider PATCH /providers/:id
 func (h *AdminModelsHandler) UpdateProvider(c *gin.Context) {
 	var req providerWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
+		return
+	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
 		return
 	}
 	p := &domain.Provider{
@@ -624,7 +667,7 @@ func (h *AdminModelsHandler) UpdateProvider(c *gin.Context) {
 	if req.UpdatedAt != nil {
 		p.UpdatedAt = *req.UpdatedAt
 	}
-	if err := h.mgr.UpdateProvider(c.Request.Context(), actorOf(c), p, req.Reason); err != nil {
+	if err := h.mgr.UpdateProvider(c.Request.Context(), actorOf(c), p, reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -635,9 +678,13 @@ func (h *AdminModelsHandler) UpdateProvider(c *gin.Context) {
 	})
 }
 
-// DeleteProvider DELETE /providers/:id（可选 ?reason= 运营理由 → 审计）
+// DeleteProvider DELETE /providers/:id（必填 ?reason= 运营理由 → 审计，M-6）
 func (h *AdminModelsHandler) DeleteProvider(c *gin.Context) {
-	if err := h.mgr.DeleteProvider(c.Request.Context(), actorOf(c), c.Param("id"), reasonOf(c)); err != nil {
+	reason, okReason := requiredReasonOf(c)
+	if !okReason {
+		return
+	}
+	if err := h.mgr.DeleteProvider(c.Request.Context(), actorOf(c), c.Param("id"), reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -647,12 +694,16 @@ func (h *AdminModelsHandler) DeleteProvider(c *gin.Context) {
 // CreateDeployment POST /deployments
 func (h *AdminModelsHandler) CreateDeployment(c *gin.Context) {
 	var req deploymentWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
+		return
+	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
 		return
 	}
 	d := req.toDomain("")
-	if err := h.mgr.CreateDeployment(c.Request.Context(), actorOf(c), d, req.Reason); err != nil {
+	if err := h.mgr.CreateDeployment(c.Request.Context(), actorOf(c), d, reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -662,21 +713,29 @@ func (h *AdminModelsHandler) CreateDeployment(c *gin.Context) {
 // UpdateDeployment PATCH /deployments/:id — requires config_version token.
 func (h *AdminModelsHandler) UpdateDeployment(c *gin.Context) {
 	var req deploymentWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
+		return
+	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
 		return
 	}
 	d := req.toDomain(c.Param("id"))
-	if err := h.mgr.UpdateDeployment(c.Request.Context(), actorOf(c), d, req.Reason); err != nil {
+	if err := h.mgr.UpdateDeployment(c.Request.Context(), actorOf(c), d, reason); err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, toDeploymentDTO(d))
 }
 
-// DeleteDeployment DELETE /deployments/:id（可选 ?reason= 运营理由 → 审计）
+// DeleteDeployment DELETE /deployments/:id（必填 ?reason= 运营理由 → 审计，M-6）
 func (h *AdminModelsHandler) DeleteDeployment(c *gin.Context) {
-	if err := h.mgr.DeleteDeployment(c.Request.Context(), actorOf(c), c.Param("id"), reasonOf(c)); err != nil {
+	reason, okReason := requiredReasonOf(c)
+	if !okReason {
+		return
+	}
+	if err := h.mgr.DeleteDeployment(c.Request.Context(), actorOf(c), c.Param("id"), reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -686,8 +745,12 @@ func (h *AdminModelsHandler) DeleteDeployment(c *gin.Context) {
 // CreateRoute POST /models/:id/routes
 func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 	var req routeWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
+		return
+	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
 		return
 	}
 	r := &domain.ModelRoute{
@@ -698,7 +761,7 @@ func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 	if req.PoolStrategy != "" {
 		r.PoolStrategy = domain.PoolStrategy(req.PoolStrategy)
 	}
-	if err := h.mgr.CreateRoute(c.Request.Context(), actorOf(c), r, req.Reason); err != nil {
+	if err := h.mgr.CreateRoute(c.Request.Context(), actorOf(c), r, reason); err != nil {
 		fail(c, err)
 		return
 	}
@@ -710,8 +773,12 @@ func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 // 实测此前直接以空 model/deployment 提交，任何 PATCH 都 400）。
 func (h *AdminModelsHandler) UpdateRoute(c *gin.Context) {
 	var req routeWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
+		return
+	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
 		return
 	}
 	r, err := h.mgr.GetRoute(c.Request.Context(), c.Param("route_id"))
@@ -727,25 +794,33 @@ func (h *AdminModelsHandler) UpdateRoute(c *gin.Context) {
 	if req.UpdatedAt != nil {
 		r.UpdatedAt = *req.UpdatedAt
 	}
-	if err := h.mgr.UpdateRoute(c.Request.Context(), actorOf(c), r, req.Reason); err != nil {
+	if err := h.mgr.UpdateRoute(c.Request.Context(), actorOf(c), r, reason); err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, toRouteDTO(r))
 }
 
-// DeleteRoute DELETE /routes/:route_id（可选 ?reason= 运营理由 → 审计）
+// DeleteRoute DELETE /routes/:route_id（必填 ?reason= 运营理由 → 审计，M-6）
 func (h *AdminModelsHandler) DeleteRoute(c *gin.Context) {
-	if err := h.mgr.DeleteRoute(c.Request.Context(), actorOf(c), c.Param("route_id"), reasonOf(c)); err != nil {
+	reason, okReason := requiredReasonOf(c)
+	if !okReason {
+		return
+	}
+	if err := h.mgr.DeleteRoute(c.Request.Context(), actorOf(c), c.Param("route_id"), reason); err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, gin.H{"deleted": c.Param("route_id")})
 }
 
-// Publish POST /catalog/publish（可选 ?reason= 运营理由 → 审计）
+// Publish POST /catalog/publish（必填 ?reason= 运营理由 → 审计，M-6）
 func (h *AdminModelsHandler) Publish(c *gin.Context) {
-	rev, err := h.mgr.Publish(c.Request.Context(), actorOf(c), reasonOf(c))
+	reason, okReason := requiredReasonOf(c)
+	if !okReason {
+		return
+	}
+	rev, err := h.mgr.Publish(c.Request.Context(), actorOf(c), reason)
 	if err != nil {
 		fail(c, err)
 		return
@@ -753,17 +828,21 @@ func (h *AdminModelsHandler) Publish(c *gin.Context) {
 	ok(c, gin.H{"revision": rev})
 }
 
-// Rollback POST /catalog/rollback {"to_revision":N,"reason":"…"}
+// Rollback POST /catalog/rollback {"to_revision":N,"reason":"…"} —— reason 必填。
 func (h *AdminModelsHandler) Rollback(c *gin.Context) {
 	var req struct {
 		ToRevision int    `json:"to_revision" binding:"required"`
-		Reason     string `json:"reason"` // 可选运营理由 → 审计
+		Reason     string `json:"reason"` // 必填运营理由 → 审计（M-6）
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
 		return
 	}
-	rev, err := h.mgr.Rollback(c.Request.Context(), actorOf(c), req.ToRevision, req.Reason)
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
+		return
+	}
+	rev, err := h.mgr.Rollback(c.Request.Context(), actorOf(c), req.ToRevision, reason)
 	if err != nil {
 		fail(c, err)
 		return

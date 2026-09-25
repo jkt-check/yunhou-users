@@ -188,9 +188,10 @@ domain.Error.Message（不泄露 cause 链）。
 面同口径）。
 
 幂等比较精度：重放判定时 `effective_from`/`effective_to` 与库存行按
-**微秒**（PG timestamptz 存储精度，四舍五入）比较——客户端带纳秒精度
-RFC3339 的重放仍判 duplicate；省略 `effective_from` 的请求每次重放取新的
-服务器时刻，会判 conflict（协议内禀），dashboard 重放应固定显式值。
+**微秒**（PG timestamptz 存储精度，rint（half-to-even，四舍六入五成双））
+比较——客户端带纳秒精度 RFC3339 的重放仍判 duplicate；省略
+`effective_from` 的请求每次重放取新的服务器时刻，会判 conflict（协议内
+禀），dashboard 重放应固定显式值。
 
 非目标（显式排除）：不提供 update/delete（不可变设计）；不在创建时自动
 闭合前一版本的 `effective_to`（区间重叠允许，`LatestPriceVersion` 按

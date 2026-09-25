@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"math/big"
 	"reflect"
 	"regexp"
 	"time"
@@ -177,7 +178,10 @@ func (s *PriceVersionService) Create(ctx context.Context, actor string, in Creat
 		t := in.EffectiveTo.UTC()
 		to = &t
 	}
-	if to != nil && !to.After(from) {
+	// 与表 CHECK（effective_to > effective_from）同精度校验：CHECK 比较的
+	// 是 µs 舍入（rint）后的存储值，ns 级比较会放过「舍入后相等」的区间，
+	// 留到落库时炸 23514（错误映射会漏约束名）——按存储精度提前 400。
+	if to != nil && pgRoundMicros(*to) <= pgRoundMicros(from) {
 		return nil, domain.NewError(domain.CodeInvalidInput, "effective_to must be after effective_from")
 	}
 	// 与落库 CHECK 同一纯校验（kind/currency/revision/生效区间），防御层。
@@ -361,7 +365,9 @@ func pgRoundMicros(t time.Time) int64 {
 
 // jsonDeepEqual compares two JSON documents by value (key order insensitive).
 // UseNumber 保住大整数（micros 价目可能超 float64 精确范围），不经 float64
-// 坍缩（评审轮2 finding）。
+// 坍缩（评审轮2 finding）；数值叶子按 PG jsonb 的规范化口径比较——jsonb
+// 入库即把 1e2 规范为 100、1.5e-7 规范为 0.00000015，字节相同的指数形
+// extra_rates 重放必须判 duplicate（评审轮3 finding）。
 func jsonDeepEqual(a, b json.RawMessage) bool {
 	decode := func(raw json.RawMessage) (any, bool) {
 		dec := json.NewDecoder(bytes.NewReader(raw))
@@ -377,5 +383,55 @@ func jsonDeepEqual(a, b json.RawMessage) bool {
 	if !oka || !okb {
 		return false
 	}
-	return reflect.DeepEqual(va, vb)
+	return jsonValueEqual(va, vb)
+}
+
+// jsonValueEqual recursively compares two UseNumber-decoded JSON values;
+// json.Number leaves compare numerically (big.Rat 精确处理指数/小数形式),
+// everything else structurally.
+func jsonValueEqual(a, b any) bool {
+	if na, ok := a.(json.Number); ok {
+		nb, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		return jsonNumberEqual(na, nb)
+	}
+	switch ta := a.(type) {
+	case map[string]any:
+		tb, ok := b.(map[string]any)
+		if !ok || len(ta) != len(tb) {
+			return false
+		}
+		for k, va := range ta {
+			vb, ok := tb[k]
+			if !ok || !jsonValueEqual(va, vb) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		tb, ok := b.([]any)
+		if !ok || len(ta) != len(tb) {
+			return false
+		}
+		for i := range ta {
+			if !jsonValueEqual(ta[i], tb[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// jsonNumberEqual compares two JSON numbers by exact rational value; SetString
+// 解析失败（非数值）退化为字符串比较。
+func jsonNumberEqual(a, b json.Number) bool {
+	ra, oka := new(big.Rat).SetString(string(a))
+	rb, okb := new(big.Rat).SetString(string(b))
+	if !oka || !okb {
+		return a == b
+	}
+	return ra.Cmp(rb) == 0
 }

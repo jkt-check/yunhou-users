@@ -265,8 +265,8 @@ func TestPriceVersionCreate_RevisionOutOfRange(t *testing.T) {
 		t.Fatalf("code = %v, want invalid_input", domain.CodeOf(err))
 	}
 	var de *domain.Error
-	if errors.As(err, &de) && de.Message != "revision out of range" {
-		t.Fatalf("message = %q", de.Message)
+	if !errors.As(err, &de) || de.Message != "revision out of range" {
+		t.Fatalf("err = %v, want domain error with fixed message", err)
 	}
 	if fs.lookupCalls != 0 {
 		t.Fatal("out-of-range revision must be rejected before touching the store")
@@ -389,5 +389,88 @@ func TestJSONDeepEqual_UseNumber(t *testing.T) {
 	}
 	if jsonDeepEqual(json.RawMessage(`{"x":1}`), json.RawMessage(`{"x":"1"}`)) {
 		t.Fatal("number vs string must differ")
+	}
+}
+
+// TestJSONDeepEqual_JSONBNumericCanonicalization: PG jsonb 入库即规范化数
+// 值（1e2 → 100、1.5e-7 → 0.00000015）——字节相同的指数形 extra_rates 重
+// 放必须判 duplicate（评审轮3 finding）；真正不同的数值仍 conflict；2^53
+// 附近的大整数依旧可区分。
+func TestJSONDeepEqual_JSONBNumericCanonicalization(t *testing.T) {
+	stored := json.RawMessage(`{"schema_version":1,"rates":{"x":100,"y":0.00000015}}`)
+	replay := json.RawMessage(`{"schema_version":1,"rates":{"x":1e2,"y":1.5e-7}}`)
+	if !jsonDeepEqual(stored, replay) {
+		t.Fatal("exponent form must equal its jsonb-canonicalized decimal form")
+	}
+	diff := json.RawMessage(`{"schema_version":1,"rates":{"x":101,"y":1.5e-7}}`)
+	if jsonDeepEqual(stored, diff) {
+		t.Fatal("genuinely different numbers must stay conflict")
+	}
+	big1 := json.RawMessage(`{"schema_version":1,"rates":{"x":9007199254740993}}`)
+	big2 := json.RawMessage(`{"schema_version":1,"rates":{"x":9007199254740992}}`)
+	if jsonDeepEqual(big1, big2) {
+		t.Fatal("2^53+1 vs 2^53 must differ (big.Rat, not float64)")
+	}
+	// 数值 vs 非同值类型仍不相等。
+	if jsonDeepEqual(json.RawMessage(`{"x":100}`), json.RawMessage(`{"x":"100"}`)) {
+		t.Fatal("number vs string must differ")
+	}
+}
+
+// TestPriceVersionCreate_ReplayExponentFormExtraRatesIsDuplicate: 服务端层
+// 面的同一行为——已存行是 jsonb 规范化后的十进制形式，重放带指数形式，
+// 预检比较必须判 duplicate（Identical=true）。
+func TestPriceVersionCreate_ReplayExponentFormExtraRatesIsDuplicate(t *testing.T) {
+	existing := &PriceVersionInfo{
+		ID: "pv-1", ModelID: "m-1", Kind: "sale_credit", Unit: "microcredit",
+		Revision:      1,
+		EffectiveFrom: time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC),
+		ExtraRates:    json.RawMessage(`{"schema_version":1,"rates":{"web_search":100}}`),
+	}
+	fs := &fakePVStore{existing: existing, maxRevision: 1}
+	svc := NewPriceVersionService(fs, nil, nil)
+	in := validCreateInput()
+	in.ExtraRates = json.RawMessage(`{"schema_version":1,"rates":{"web_search":1e2}}`)
+	_, err := svc.Create(context.Background(), "user:u@app:a", in)
+	var exists *PriceVersionExistsError
+	if !errors.As(err, &exists) || !exists.Identical {
+		t.Fatalf("err = %v, want duplicate replay (jsonb numeric canonicalization)", err)
+	}
+}
+
+// TestPriceVersionCreate_EffectiveToRoundedEqualRejected: 表 CHECK 比较的
+// 是 µs 舍入后的存储值——raw ns 上 to > from 但舍入后相等的区间必须在服
+// 务层以干净文案 400，而不是落库 23514（评审轮3 finding）。
+func TestPriceVersionCreate_EffectiveToRoundedEqualRejected(t *testing.T) {
+	fs := &fakePVStore{uow: &fakeUOW{}}
+	svc := NewPriceVersionService(fs, nil, nil)
+	in := validCreateInput()
+	// 两者都舍入（rint）到 .123456：raw 上 to 比 from 晚 0.2µs。
+	in.EffectiveFrom = time.Date(2026, 9, 25, 8, 0, 0, 123456200, time.UTC)
+	to := time.Date(2026, 9, 25, 8, 0, 0, 123456400, time.UTC)
+	in.EffectiveTo = &to
+	_, err := svc.Create(context.Background(), "user:u@app:a", in)
+	if err == nil {
+		t.Fatal("rounded-equal effective range must be rejected")
+	}
+	var de *domain.Error
+	if !errors.As(err, &de) || de.Message != "effective_to must be after effective_from" {
+		t.Fatalf("err = %v, want clean spec message", err)
+	}
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("code = %v, want invalid_input", domain.CodeOf(err))
+	}
+	if fs.lookupCalls != 0 {
+		t.Fatal("must be rejected before touching the store")
+	}
+
+	// 舍入后仍严格更晚的 to 正常放行（fake store 直通落库）。
+	fs2 := &fakePVStore{failFirstLookup: true, maxRevision: 0, uow: &fakeUOW{}}
+	svc2 := NewPriceVersionService(fs2, nil, nil)
+	in.EffectiveFrom = time.Date(2026, 9, 25, 8, 0, 0, 123456200, time.UTC)
+	to2 := time.Date(2026, 9, 25, 8, 0, 0, 123456600, time.UTC) // 舍入 .123457 > .123456
+	in.EffectiveTo = &to2
+	if _, err := svc2.Create(context.Background(), "user:u@app:a", in); err != nil {
+		t.Fatalf("rounded-later effective_to must pass: %v", err)
 	}
 }

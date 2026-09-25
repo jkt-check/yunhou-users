@@ -301,10 +301,17 @@ func (s *Service) Store() Store { return s.store }
 // --- model CRUD ---
 
 // CreateModel validates and inserts a draft model. Empty modality lists
-// default to text→text, mirroring the DB column default.
+// default to text→text, mirroring the DB column default. An explicit
+// non-draft lifecycle is rejected (安全审查 I-1): new models always start
+// at draft and only move via SetModelLifecycle, so a create can never
+// smuggle a model past the draft→publish state machine.
 func (s *Service) CreateModel(ctx context.Context, m *domain.Model) error {
 	if m.Lifecycle == "" {
 		m.Lifecycle = domain.LifecycleDraft
+	}
+	if m.Lifecycle != domain.LifecycleDraft {
+		return domain.NewError(domain.CodeInvalidInput,
+			"models must be created as draft; promote via SetModelLifecycle")
 	}
 	defaultModalities(m)
 	if err := ValidateModel(m); err != nil {
@@ -325,10 +332,14 @@ func (s *Service) ListModels(ctx context.Context, filter domain.ModelFilter) ([]
 
 // UpdateModel validates and applies an edit. The caller passes the model
 // as previously read (its UpdatedAt is the optimistic-lock token); a
-// concurrent edit surfaces as CodeConflict.
+// concurrent edit surfaces as CodeConflict. An empty lifecycle is rejected
+// rather than defaulted to draft (安全审查 I-1): the previous reset knocked
+// a live active model back to draft whenever a caller passed a partial
+// object, and lifecycle moves belong to SetModelLifecycle alone.
 func (s *Service) UpdateModel(ctx context.Context, m *domain.Model) error {
 	if m.Lifecycle == "" {
-		m.Lifecycle = domain.LifecycleDraft
+		return domain.NewError(domain.CodeInvalidInput,
+			"lifecycle missing: pass the model as previously read; lifecycle changes go through SetModelLifecycle")
 	}
 	if m.UpdatedAt.IsZero() {
 		return domain.NewError(domain.CodeInvalidInput,

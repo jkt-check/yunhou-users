@@ -98,30 +98,30 @@ func toModelDTO(m *domain.Model) modelDTO {
 	}
 }
 
-// modelWriteRequest is the create/update body. ID is only used on create;
-// UpdatedAt is the optimistic-lock token (required on update). Reason 是
-// 可选的运营理由，透传到审计事件（评审轮2 finding6：此前 httpapi 层从未
-// 接线，CatalogManager 的 reason 参数位一直空转）。
-type modelWriteRequest struct {
-	ID                string     `json:"id"`
-	DisplayName       string     `json:"display_name"`
-	Lifecycle         string     `json:"lifecycle"`
-	ModelVersion      string     `json:"model_version"`
-	Aliases           []string   `json:"aliases"`
-	InputModalities   []string   `json:"input_modalities"`
-	OutputModalities  []string   `json:"output_modalities"`
-	ContextTokens     int        `json:"context_tokens"`
-	MaxOutputTokens   int        `json:"max_output_tokens"`
-	Protocols         []string   `json:"protocols"`
-	SupportsTools     bool       `json:"supports_tools"`
-	SupportsReasoning bool       `json:"supports_reasoning"`
-	UpdatedAt         *time.Time `json:"updated_at"`
-	Reason            string     `json:"reason"`
+// modelCreateRequest is the POST /models body. An explicit lifecycle is
+// rejected unless it is "draft" (安全审查 I-1): new models always start as
+// draft and promote only via POST /models/:id/lifecycle, so a create can
+// never skip the draft→publish state machine. Reason 是可选的运营理由，
+// 透传到审计事件（评审轮2 finding6）。
+type modelCreateRequest struct {
+	ID                string   `json:"id"`
+	DisplayName       string   `json:"display_name"`
+	Lifecycle         string   `json:"lifecycle"`
+	ModelVersion      string   `json:"model_version"`
+	Aliases           []string `json:"aliases"`
+	InputModalities   []string `json:"input_modalities"`
+	OutputModalities  []string `json:"output_modalities"`
+	ContextTokens     int      `json:"context_tokens"`
+	MaxOutputTokens   int      `json:"max_output_tokens"`
+	Protocols         []string `json:"protocols"`
+	SupportsTools     bool     `json:"supports_tools"`
+	SupportsReasoning bool     `json:"supports_reasoning"`
+	Reason            string   `json:"reason"`
 }
 
-func (r *modelWriteRequest) toDomain(id string) *domain.Model {
+func (r *modelCreateRequest) toDomain() *domain.Model {
 	m := &domain.Model{
-		ID: id, DisplayName: r.DisplayName, ModelVersion: r.ModelVersion,
+		ID: r.ID, DisplayName: r.DisplayName, ModelVersion: r.ModelVersion,
 		Aliases: r.Aliases, InputModalities: r.InputModalities,
 		OutputModalities: r.OutputModalities, ContextTokens: r.ContextTokens,
 		MaxOutputTokens: r.MaxOutputTokens, SupportsTools: r.SupportsTools,
@@ -133,10 +133,68 @@ func (r *modelWriteRequest) toDomain(id string) *domain.Model {
 	for _, p := range r.Protocols {
 		m.Protocols = append(m.Protocols, domain.Protocol(p))
 	}
+	return m
+}
+
+// modelUpdateRequest is the PATCH /models/:id body: read-modify-write ——
+// 每个字段都是指针，缺省（nil）保留存量值（安全审查 I-1：此前省略字段
+// 会被重置为零值/draft，运营改个 display_name 就能把在售 active 模型打回
+// 草稿）。DTO 刻意不含 lifecycle/id 字段：strictBindJSON 将其按未知字段
+// 拒绝（400），lifecycle 只能经专用的 POST /models/:id/lifecycle 状态机
+// 端点流转（retired→active 这类跳变在状态机层同样被拒）。
+type modelUpdateRequest struct {
+	DisplayName       *string    `json:"display_name"`
+	ModelVersion      *string    `json:"model_version"`
+	Aliases           *[]string  `json:"aliases"`
+	InputModalities   *[]string  `json:"input_modalities"`
+	OutputModalities  *[]string  `json:"output_modalities"`
+	ContextTokens     *int       `json:"context_tokens"`
+	MaxOutputTokens   *int       `json:"max_output_tokens"`
+	Protocols         *[]string  `json:"protocols"`
+	SupportsTools     *bool      `json:"supports_tools"`
+	SupportsReasoning *bool      `json:"supports_reasoning"`
+	UpdatedAt         *time.Time `json:"updated_at"`
+	Reason            string     `json:"reason"`
+}
+
+// apply overlays only the provided fields onto the stored model.
+func (r *modelUpdateRequest) apply(m *domain.Model) {
+	if r.DisplayName != nil {
+		m.DisplayName = *r.DisplayName
+	}
+	if r.ModelVersion != nil {
+		m.ModelVersion = *r.ModelVersion
+	}
+	if r.Aliases != nil {
+		m.Aliases = *r.Aliases
+	}
+	if r.InputModalities != nil {
+		m.InputModalities = *r.InputModalities
+	}
+	if r.OutputModalities != nil {
+		m.OutputModalities = *r.OutputModalities
+	}
+	if r.ContextTokens != nil {
+		m.ContextTokens = *r.ContextTokens
+	}
+	if r.MaxOutputTokens != nil {
+		m.MaxOutputTokens = *r.MaxOutputTokens
+	}
+	if r.Protocols != nil {
+		m.Protocols = m.Protocols[:0]
+		for _, p := range *r.Protocols {
+			m.Protocols = append(m.Protocols, domain.Protocol(p))
+		}
+	}
+	if r.SupportsTools != nil {
+		m.SupportsTools = *r.SupportsTools
+	}
+	if r.SupportsReasoning != nil {
+		m.SupportsReasoning = *r.SupportsReasoning
+	}
 	if r.UpdatedAt != nil {
 		m.UpdatedAt = *r.UpdatedAt
 	}
-	return m
 }
 
 type providerDTO struct {
@@ -449,14 +507,20 @@ func (h *AdminModelsHandler) GetActiveRevision(c *gin.Context) {
 
 // --- write handlers (implemented; Task 4 mounts them after authz) ---
 
-// CreateModel POST /models
+// CreateModel POST /models — new models always start as draft; an explicit
+// non-draft lifecycle is rejected here (400) and again at the service layer.
 func (h *AdminModelsHandler) CreateModel(c *gin.Context) {
-	var req modelWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	var req modelCreateRequest
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
 		return
 	}
-	m := req.toDomain(req.ID)
+	if req.Lifecycle != "" && domain.Lifecycle(req.Lifecycle) != domain.LifecycleDraft {
+		fail(c, domain.NewError(domain.CodeInvalidInput,
+			"lifecycle must not be set on create: new models start as draft; promote via POST /models/:id/lifecycle"))
+		return
+	}
+	m := req.toDomain()
 	if err := h.mgr.CreateModel(c.Request.Context(), actorOf(c), m, req.Reason); err != nil {
 		fail(c, err)
 		return
@@ -464,14 +528,28 @@ func (h *AdminModelsHandler) CreateModel(c *gin.Context) {
 	ok(c, toModelDTO(m))
 }
 
-// UpdateModel PATCH /models/:id — requires updated_at version token.
+// UpdateModel PATCH /models/:id — read-modify-write: omitted fields preserve
+// their stored values (安全审查 I-1), the updated_at version token is
+// required, and lifecycle is not accepted here at all — the DTO has no such
+// field, so strictBindJSON answers any lifecycle smuggle with a 400.
+// Lifecycle moves only via POST /models/:id/lifecycle.
 func (h *AdminModelsHandler) UpdateModel(c *gin.Context) {
-	var req modelWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body: "+err.Error()))
+	var req modelUpdateRequest
+	if err := strictBindJSON(c, &req); err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
 		return
 	}
-	m := req.toDomain(c.Param("id"))
+	m, err := h.mgr.GetModel(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	if req.UpdatedAt == nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput,
+			"updated_at version token is required (read the model first)"))
+		return
+	}
+	req.apply(m)
 	if err := h.mgr.UpdateModel(c.Request.Context(), actorOf(c), m, req.Reason); err != nil {
 		fail(c, err)
 		return

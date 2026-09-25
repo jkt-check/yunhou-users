@@ -318,7 +318,11 @@ type revisionDTO struct {
 	CreatedAt   time.Time  `json:"created_at"`
 }
 
-func toRevisionDTO(r *domain.ConfigRevision) revisionDTO {
+// toRevisionDTO renders revision metadata. There is deliberately NO payload
+// field: the history list is metadata-only (安全审查 M-1 — 修订 blob 不随
+// 列表接口下发); clients load one full revision via GET /catalog/revisions
+// content endpoints when they need the snapshot body.
+func toRevisionDTO(r domain.RevisionMeta) revisionDTO {
 	return revisionDTO{
 		ID: r.ID, Revision: r.Revision, Status: string(r.Status),
 		IsActive: r.IsActive, PublishedAt: r.PublishedAt,
@@ -489,34 +493,49 @@ func (h *AdminModelsHandler) ListDeployments(c *gin.Context) {
 	ok(c, gin.H{"deployments": out})
 }
 
-// ListRevisions GET /catalog/revisions
+// parseAfterRevision parses the revision keyset cursor (?after=): a
+// positive revision number, 0 when absent/invalid (first page).
+func parseAfterRevision(c *gin.Context) int {
+	if raw := c.Query("after"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// ListRevisions GET /catalog/revisions?after=&limit=
+//
+// 安全审查 M-1：列表只返回修订元数据（payload 快照体从不查询/下发），
+// 并按模块惯例 keyset 分页（limit 默认 100、硬上限 500；after 为上一页
+// 最后一条的 revision 号）。响应带 limit/next_after 便于客户端翻页——
+// next_after 非 0 时把它作为下一页的 ?after=；为 0 表示没有更多。
 func (h *AdminModelsHandler) ListRevisions(c *gin.Context) {
-	revs, err := h.mgr.ListRevisions(c.Request.Context())
+	limit := parseLimit(c, 100)
+	revs, err := h.mgr.ListRevisionMetas(c.Request.Context(), parseAfterRevision(c), limit)
 	if err != nil {
 		fail(c, err)
 		return
 	}
 	out := make([]revisionDTO, 0, len(revs))
 	for i := range revs {
-		out = append(out, toRevisionDTO(&revs[i]))
+		out = append(out, toRevisionDTO(revs[i]))
 	}
-	ok(c, gin.H{"revisions": out})
+	nextAfter := 0
+	if len(revs) == limit && len(revs) > 0 {
+		nextAfter = revs[len(revs)-1].Revision
+	}
+	ok(c, gin.H{"revisions": out, "limit": limit, "next_after": nextAfter})
 }
 
-// GetActiveRevision GET /catalog/active
+// GetActiveRevision GET /catalog/active — metadata only (no payload blob).
 func (h *AdminModelsHandler) GetActiveRevision(c *gin.Context) {
-	revs, err := h.mgr.ListRevisions(c.Request.Context())
+	meta, err := h.mgr.ActiveRevisionMeta(c.Request.Context())
 	if err != nil {
 		fail(c, err)
 		return
 	}
-	for i := range revs {
-		if revs[i].IsActive {
-			ok(c, toRevisionDTO(&revs[i]))
-			return
-		}
-	}
-	fail(c, domain.NewError(domain.CodeNotFound, "no active catalog revision"))
+	ok(c, toRevisionDTO(*meta))
 }
 
 // --- write handlers (implemented; Task 4 mounts them after authz) ---

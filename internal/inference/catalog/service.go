@@ -259,9 +259,13 @@ type Store interface {
 	InsertConfigRevision(ctx context.Context, rev *domain.ConfigRevision) error
 	ActivateRevision(ctx context.Context, scope domain.ConfigScope, revision int) error
 	ActiveRevision(ctx context.Context, scope domain.ConfigScope) (*domain.ConfigRevision, error)
+	ActiveRevisionMeta(ctx context.Context, scope domain.ConfigScope) (*domain.RevisionMeta, error)
 	ActiveRevisionHead(ctx context.Context, scope domain.ConfigScope) (int64, int, error)
 	GetRevision(ctx context.Context, scope domain.ConfigScope, revision int) (*domain.ConfigRevision, error)
-	ListRevisions(ctx context.Context, scope domain.ConfigScope) ([]domain.ConfigRevision, error)
+	// ListRevisionMetas lists revision metadata (payload blob never loaded),
+	// newest first, keyset-paginated by revision number: only revisions with
+	// a number below afterRevision are returned.
+	ListRevisionMetas(ctx context.Context, scope domain.ConfigScope, afterRevision, limit int) ([]domain.RevisionMeta, error)
 	LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error)
 }
 
@@ -695,9 +699,18 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 	return rev.Revision, nil
 }
 
-// ListRevisions returns the catalog revision history, newest first.
-func (s *Service) ListRevisions(ctx context.Context) ([]domain.ConfigRevision, error) {
-	return s.store.ListRevisions(ctx, domain.ScopeCatalog)
+// ListRevisionMetas returns the catalog revision history (metadata only —
+// the payload blob is never loaded for listings, 安全审查 M-1), newest
+// first, keyset-paginated by revision number. afterRevision is the cursor:
+// pass the last seen revision number (0 for the first page).
+func (s *Service) ListRevisionMetas(ctx context.Context, afterRevision, limit int) ([]domain.RevisionMeta, error) {
+	return s.store.ListRevisionMetas(ctx, domain.ScopeCatalog, afterRevision, limit)
+}
+
+// ActiveRevisionMeta returns the active catalog revision's metadata without
+// loading its payload.
+func (s *Service) ActiveRevisionMeta(ctx context.Context) (*domain.RevisionMeta, error) {
+	return s.store.ActiveRevisionMeta(ctx, domain.ScopeCatalog)
 }
 
 // LoadSnapshot loads and parses the currently active catalog revision

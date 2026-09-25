@@ -401,20 +401,69 @@ func (s *Store) GetRevision(ctx context.Context, scope domain.ConfigScope, revis
 	return row.toDomain(), nil
 }
 
-// ListRevisions returns every revision of a scope, newest first. Revisions
-// are immutable — this is the audit/history view used by rollback.
-func (s *Store) ListRevisions(ctx context.Context, scope domain.ConfigScope) ([]domain.ConfigRevision, error) {
-	var rows []revisionRow
-	if err := s.db.SelectContext(ctx, &rows,
-		`SELECT * FROM inference_config_revisions WHERE scope = $1 ORDER BY revision DESC`,
-		string(scope)); err != nil {
-		return nil, mapError("list revisions", err)
+// revisionMetaColumns is the metadata-only projection of
+// inference_config_revisions: everything except the payload blob (安全审查
+// M-1 — 修订列表/活跃修订探针不得拉大 JSONB 快照体).
+const revisionMetaColumns = `id, scope, revision, status, is_active, published_at, created_by, created_at`
+
+// revisionMetaRow is the metadata-only scan shape: payload excluded.
+type revisionMetaRow struct {
+	ID          int64      `db:"id"`
+	Scope       string     `db:"scope"`
+	Revision    int        `db:"revision"`
+	Status      string     `db:"status"`
+	IsActive    bool       `db:"is_active"`
+	PublishedAt *time.Time `db:"published_at"`
+	CreatedBy   string     `db:"created_by"`
+	CreatedAt   time.Time  `db:"created_at"`
+}
+
+func (r revisionMetaRow) toDomain() domain.RevisionMeta {
+	return domain.RevisionMeta{
+		ID: r.ID, Scope: domain.ConfigScope(r.Scope), Revision: r.Revision,
+		Status: domain.RevisionStatus(r.Status), IsActive: r.IsActive,
+		PublishedAt: r.PublishedAt, CreatedBy: r.CreatedBy, CreatedAt: r.CreatedAt,
 	}
-	out := make([]domain.ConfigRevision, 0, len(rows))
+}
+
+// ListRevisionMetas lists revision metadata of a scope, newest first,
+// keyset-paginated by revision number (afterRevision is the cursor; <= 0
+// starts from the newest). Revisions are immutable — this is the
+// audit/history view used by rollback; the payload blob is never selected.
+func (s *Store) ListRevisionMetas(ctx context.Context, scope domain.ConfigScope, afterRevision, limit int) ([]domain.RevisionMeta, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := `SELECT ` + revisionMetaColumns + ` FROM inference_config_revisions WHERE scope = $1`
+	args := []any{string(scope)}
+	if afterRevision > 0 {
+		args = append(args, afterRevision)
+		query += ` AND revision < $2`
+	}
+	query += ` ORDER BY revision DESC LIMIT ` + itoa(limit)
+	var rows []revisionMetaRow
+	if err := s.db.SelectContext(ctx, &rows, query, args...); err != nil {
+		return nil, mapError("list revision metas", err)
+	}
+	out := make([]domain.RevisionMeta, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, *r.toDomain())
+		out = append(out, r.toDomain())
 	}
 	return out, nil
+}
+
+// ActiveRevisionMeta loads the active revision's metadata without the
+// payload blob (安全审查 M-1).
+func (s *Store) ActiveRevisionMeta(ctx context.Context, scope domain.ConfigScope) (*domain.RevisionMeta, error) {
+	var row revisionMetaRow
+	err := s.db.GetContext(ctx, &row,
+		`SELECT `+revisionMetaColumns+` FROM inference_config_revisions WHERE scope = $1 AND is_active`,
+		string(scope))
+	if err != nil {
+		return nil, mapError("active revision meta", err)
+	}
+	m := row.toDomain()
+	return &m, nil
 }
 
 // LatestRevision returns the highest revision number of a scope, 0 when the

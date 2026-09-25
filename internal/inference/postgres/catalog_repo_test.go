@@ -268,12 +268,45 @@ func TestRepoRevisionReads(t *testing.T) {
 		t.Errorf("active = %+v", active)
 	}
 
-	revs, err := s.ListRevisions(ctx, domain.ScopeCatalog)
+	revs, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(revs) != 2 || revs[0].Revision != 2 {
 		t.Errorf("list = %+v", revs)
+	}
+
+	// 安全审查 M-1：元数据投影绝不携带 payload；分页游标与 limit 钳制生效。
+	if revs[0].Status == "" || revs[0].CreatedBy == "" {
+		t.Errorf("meta missing fields: %+v", revs[0])
+	}
+	page, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].Revision != 2 {
+		t.Fatalf("first page = %+v, want [2]", page)
+	}
+	rest, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, page[0].Revision, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 1 || rest[0].Revision != 1 {
+		t.Fatalf("second page = %+v, want [1]", rest)
+	}
+	clamped, err := s.ListRevisionMetas(ctx, domain.ScopeCatalog, 0, 999999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clamped) != 2 {
+		t.Errorf("limit 999999 must clamp to the 500 cap, got %d rows", len(clamped))
+	}
+	meta, err := s.ActiveRevisionMeta(ctx, domain.ScopeCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Revision != 1 || !meta.IsActive {
+		t.Errorf("active meta = %+v", meta)
 	}
 
 	if _, err := s.GetRevision(ctx, domain.ScopeCatalog, 99); domain.CodeOf(err) != domain.CodeNotFound {

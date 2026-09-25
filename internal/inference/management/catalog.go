@@ -273,9 +273,16 @@ func (m *CatalogManager) Rollback(ctx context.Context, actor string, toRevision 
 	return rev, nil
 }
 
-// ListRevisions returns the catalog revision history, newest first.
-func (m *CatalogManager) ListRevisions(ctx context.Context) ([]domain.ConfigRevision, error) {
-	return m.svc.ListRevisions(ctx)
+// ListRevisionMetas returns the catalog revision history (metadata only,
+// payload blob never loaded), newest first, keyset-paginated by revision
+// number: afterRevision is the cursor (0 = first page).
+func (m *CatalogManager) ListRevisionMetas(ctx context.Context, afterRevision, limit int) ([]domain.RevisionMeta, error) {
+	return m.svc.ListRevisionMetas(ctx, afterRevision, limit)
+}
+
+// ActiveRevisionMeta returns the active catalog revision's metadata.
+func (m *CatalogManager) ActiveRevisionMeta(ctx context.Context) (*domain.RevisionMeta, error) {
+	return m.svc.ActiveRevisionMeta(ctx)
 }
 
 // GetRevision returns one immutable revision.

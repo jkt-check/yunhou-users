@@ -195,8 +195,30 @@ func (f *fakeCatalogStore) GetRevision(ctx context.Context, scope domain.ConfigS
 	}
 	return nil, domain.NewError(domain.CodeNotFound, "revision")
 }
-func (f *fakeCatalogStore) ListRevisions(ctx context.Context, scope domain.ConfigScope) ([]domain.ConfigRevision, error) {
-	return nil, nil
+func (f *fakeCatalogStore) ListRevisionMetas(ctx context.Context, scope domain.ConfigScope, afterRevision, limit int) ([]domain.RevisionMeta, error) {
+	out := []domain.RevisionMeta{}
+	for _, r := range f.revisions {
+		if afterRevision > 0 && r.Revision >= afterRevision {
+			continue
+		}
+		out = append(out, domain.RevisionMeta{
+			ID: r.ID, Scope: r.Scope, Revision: r.Revision, Status: r.Status,
+			IsActive: r.IsActive, PublishedAt: r.PublishedAt,
+			CreatedBy: r.CreatedBy, CreatedAt: r.CreatedAt,
+		})
+	}
+	return out, nil
+}
+func (f *fakeCatalogStore) ActiveRevisionMeta(ctx context.Context, scope domain.ConfigScope) (*domain.RevisionMeta, error) {
+	if len(f.revisions) == 0 {
+		return nil, domain.NewError(domain.CodeNotFound, "revision")
+	}
+	r := f.revisions[len(f.revisions)-1]
+	return &domain.RevisionMeta{
+		ID: r.ID, Scope: r.Scope, Revision: r.Revision, Status: r.Status,
+		IsActive: r.IsActive, PublishedAt: r.PublishedAt,
+		CreatedBy: r.CreatedBy, CreatedAt: r.CreatedAt,
+	}, nil
 }
 func (f *fakeCatalogStore) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
 	return len(f.revisions), nil

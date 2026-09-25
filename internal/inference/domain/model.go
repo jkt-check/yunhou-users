@@ -162,6 +162,21 @@ type ConfigRevision struct {
 	CreatedAt   time.Time
 }
 
+// RevisionMeta 是 ConfigRevision 的元数据投影（安全审查 M-1）：历史/审计
+// 列表只需要发布信息（谁、何时、什么状态），不读 payload 快照体——修订
+// 的 blob 可能很大，列表查询绝不做全表 SELECT *。Payload 仅经
+// GetRevision/ActiveRevision 按需加载。
+type RevisionMeta struct {
+	ID          int64
+	Scope       ConfigScope
+	Revision    int
+	Status      RevisionStatus
+	IsActive    bool
+	PublishedAt *time.Time
+	CreatedBy   string
+	CreatedAt   time.Time
+}
+
 // ModelFilter filters catalog listings. Limit <= 0 means the
 // implementation's default page size; AfterID is the stable pagination
 // cursor (last seen model ID).

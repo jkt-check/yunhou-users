@@ -323,3 +323,82 @@ func TestAdminDeploymentConfigHeadersRejected(t *testing.T) {
 	body["config"] = map[string]any{"schema_version": 1, "headers": map[string]string{"X-Tenant": "acme"}}
 	do(t, engine, http.MethodPost, "/admin/deployments", body, http.StatusOK)
 }
+
+// 安全审查 M-1：GET /admin/catalog/revisions 只返回修订元数据（响应不得
+// 出现 payload 键），并按模块惯例 keyset 分页（limit 默认/钳制 + after
+// 游标），响应带 limit/next_after 供客户端翻页。
+func TestAdminCatalogRevisionsMetadataAndPagination(t *testing.T) {
+	engine := newTestServer(t)
+
+	// 三次发布 → 三行修订历史。
+	for i := 0; i < 3; i++ {
+		do(t, engine, http.MethodPost, "/admin/catalog/publish?reason=p", nil, http.StatusOK)
+	}
+
+	type page struct {
+		Revisions []map[string]any `json:"revisions"`
+		Limit     int              `json:"limit"`
+		NextAfter int              `json:"next_after"`
+	}
+	var p1 page
+	env := do(t, engine, http.MethodGet, "/admin/catalog/revisions?limit=2", nil, http.StatusOK)
+	if err := json.Unmarshal(env.Data, &p1); err != nil {
+		t.Fatal(err)
+	}
+	if len(p1.Revisions) != 2 {
+		t.Fatalf("page1 revisions = %d, want 2", len(p1.Revisions))
+	}
+	if p1.Limit != 2 {
+		t.Errorf("limit = %d, want echoed 2", p1.Limit)
+	}
+	if p1.NextAfter != 2 { // 修订号从 3 倒序：本页最后一条是 revision 2
+		t.Errorf("next_after = %d, want 2", p1.NextAfter)
+	}
+	for _, rev := range p1.Revisions {
+		if _, ok := rev["payload"]; ok {
+			t.Errorf("metadata-only shape violated: payload key in %+v", rev)
+		}
+		if rev["revision"] == nil || rev["status"] == nil || rev["created_by"] == nil {
+			t.Errorf("meta fields missing in %+v", rev)
+		}
+	}
+
+	// 第二页：after=2 → 只剩 revision 1，next_after=0 表示没有更多。
+	var p2 page
+	env = do(t, engine, http.MethodGet, "/admin/catalog/revisions?after=2&limit=2", nil, http.StatusOK)
+	if err := json.Unmarshal(env.Data, &p2); err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.Revisions) != 1 {
+		t.Fatalf("page2 revisions = %d, want 1", len(p2.Revisions))
+	}
+	if p2.Revisions[0]["revision"] != float64(1) {
+		t.Errorf("page2 revision = %v, want 1", p2.Revisions[0]["revision"])
+	}
+	if p2.NextAfter != 0 {
+		t.Errorf("page2 next_after = %d, want 0 (no more pages)", p2.NextAfter)
+	}
+
+	// limit 超限按 500 上限处理而非报错或全表扫描。
+	var big page
+	env = do(t, engine, http.MethodGet, "/admin/catalog/revisions?limit=999999999", nil, http.StatusOK)
+	if err := json.Unmarshal(env.Data, &big); err != nil {
+		t.Fatal(err)
+	}
+	if big.Limit != 500 || len(big.Revisions) != 3 {
+		t.Errorf("clamped limit = %d rows = %d, want 500/3", big.Limit, len(big.Revisions))
+	}
+
+	// 活跃修订元数据：无 payload，revision 为最新。
+	env = do(t, engine, http.MethodGet, "/admin/catalog/active", nil, http.StatusOK)
+	var active map[string]any
+	if err := json.Unmarshal(env.Data, &active); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := active["payload"]; ok {
+		t.Errorf("active revision must be metadata-only, got %+v", active)
+	}
+	if active["revision"] != float64(3) || active["is_active"] != true {
+		t.Errorf("active = %+v, want revision 3 active", active)
+	}
+}

@@ -42,6 +42,9 @@ type AdminOps struct {
 	// shared-account detection under usage:read; price/policy change
 	// previews under models:manage.
 	Usage *AdminUsageHandler
+	// PriceVersions is the price-version admin surface (创建只追加 + 列表;
+	// spec 2026-09-25-admin-price-versions-design.md); models:manage.
+	PriceVersions *AdminPriceVersionsHandler
 }
 
 // Mount wires the write surface onto g. The caller must already have
@@ -76,5 +79,9 @@ func (o *AdminOps) Mount(g *gin.RouterGroup) {
 	}
 	if o.Usage != nil && o.RequireModels != nil {
 		o.Usage.RegisterPreview(g.Group("", o.RequireModels))
+	}
+	// 售价版本管理面（spec 2026-09-25）：创建只追加 + 列表，同 models:manage。
+	if o.PriceVersions != nil && o.RequireModels != nil {
+		o.PriceVersions.Register(g.Group("", o.RequireModels))
 	}
 }

@@ -564,12 +564,7 @@ func (s *Store) LatestPriceVersionInfo(ctx context.Context, modelID, kind string
 	if err != nil {
 		return nil, err
 	}
-	return &management.PriceVersionInfo{
-		ID: p.ID, ModelID: p.ModelID, Kind: p.Kind, Currency: p.Currency,
-		InputPerMtok: p.InputPerMtok, CacheReadPerMtok: p.CacheReadPerMtok,
-		CacheWritePerMtok: p.CacheWritePerMtok, OutputPerMtok: p.OutputPerMtok,
-		Revision: p.Revision, EffectiveFrom: p.EffectiveFrom, EffectiveTo: p.EffectiveTo,
-	}, nil
+	return priceVersionInfo(p), nil
 }
 
 // LatestPolicyVersionByName returns the latest PUBLISHED revision of a

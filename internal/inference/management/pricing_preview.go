@@ -17,6 +17,7 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/accounting"
@@ -29,14 +30,17 @@ type PriceVersionInfo struct {
 	ID                string
 	ModelID           string
 	Kind              string
+	Unit              string // "microcredit" | "micromoney"（按 kind 派生）
 	Currency          string
 	InputPerMtok      int64
 	CacheReadPerMtok  int64
 	CacheWritePerMtok int64
 	OutputPerMtok     int64
+	ExtraRates        json.RawMessage
 	Revision          int
 	EffectiveFrom     time.Time
 	EffectiveTo       *time.Time
+	CreatedAt         time.Time
 }
 
 // PolicyVersionInfo is the management-side view of one stored policy
@@ -126,12 +130,12 @@ type PriceVersionView struct {
 
 // PriceChangePreviewResult is the assembled impact preview.
 type PriceChangePreviewResult struct {
-	ServerTime    time.Time `json:"server_time"`
-	ModelID       string    `json:"model_id"`
-	ModelLifecycle string   `json:"model_lifecycle"`
-	Kind          string    `json:"kind"`
-	EffectiveFrom time.Time `json:"effective_from"`
-	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	ServerTime     time.Time  `json:"server_time"`
+	ModelID        string     `json:"model_id"`
+	ModelLifecycle string     `json:"model_lifecycle"`
+	Kind           string     `json:"kind"`
+	EffectiveFrom  time.Time  `json:"effective_from"`
+	EffectiveTo    *time.Time `json:"effective_to,omitempty"`
 	// CurrentEffective 是生效时刻被替换的版本；null = 该时刻尚无有效版本
 	// （新定价——此前不可售/不可计费）。
 	CurrentEffective *PriceVersionView `json:"current_effective"`
@@ -158,7 +162,7 @@ func (s *PricingPreviewService) PreviewPriceChange(ctx context.Context, cmd Pric
 	kind := accounting.PriceKind(cmd.Kind)
 	pure := accounting.PriceVersion{
 		ModelID: cmd.ModelID, Kind: kind, Currency: cmd.Currency,
-		Revision: 1, // 占位：Validate 要求 >0；真实 revision 由存储侧分配
+		Revision:      1, // 占位：Validate 要求 >0；真实 revision 由存储侧分配
 		EffectiveFrom: cmd.EffectiveFrom, EffectiveTo: cmd.EffectiveTo,
 	}
 	if err := pure.Validate(); err != nil {
@@ -178,13 +182,13 @@ func (s *PricingPreviewService) PreviewPriceChange(ctx context.Context, cmd Pric
 		ServerTime: now, ModelID: m.ID, ModelLifecycle: string(m.Lifecycle),
 		Kind: string(kind), EffectiveFrom: cmd.EffectiveFrom, EffectiveTo: cmd.EffectiveTo,
 		Proposed: PriceVersionView{
-			Revision: 0, // 未落库——revision 由发布时分配，预览不编造
-			Currency:  cmd.Currency,
+			Revision:          0, // 未落库——revision 由发布时分配，预览不编造
+			Currency:          cmd.Currency,
 			InputPerMtok:      int64Str(cmd.InputPerMtok),
 			CacheReadPerMtok:  int64Str(cmd.CacheReadPerMtok),
 			CacheWritePerMtok: int64Str(cmd.CacheWritePerMtok),
 			OutputPerMtok:     int64Str(cmd.OutputPerMtok),
-			EffectiveFrom: cmd.EffectiveFrom, EffectiveTo: cmd.EffectiveTo,
+			EffectiveFrom:     cmd.EffectiveFrom, EffectiveTo: cmd.EffectiveTo,
 		},
 		ExistingSubscriptionsKeepVersion: true,
 	}
@@ -196,7 +200,7 @@ func (s *PricingPreviewService) PreviewPriceChange(ctx context.Context, cmd Pric
 			CacheReadPerMtok:  int64Str(current.CacheReadPerMtok),
 			CacheWritePerMtok: int64Str(current.CacheWritePerMtok),
 			OutputPerMtok:     int64Str(current.OutputPerMtok),
-			EffectiveFrom: current.EffectiveFrom, EffectiveTo: current.EffectiveTo,
+			EffectiveFrom:     current.EffectiveFrom, EffectiveTo: current.EffectiveTo,
 		}
 	} else if domain.CodeOf(err) != domain.CodeNotFound {
 		return nil, err
@@ -280,14 +284,14 @@ func (s *PricingPreviewService) PreviewPolicyChange(ctx context.Context, cmd Pol
 	res := &PolicyChangePreviewResult{
 		ServerTime: s.clock.Now().UTC(), Name: cmd.Name,
 		Proposed: PolicyVersionView{
-			ModelIDs: cmd.ModelIDs,
+			ModelIDs:      cmd.ModelIDs,
 			FiveHourLimit: microStrPtr(cmd.FiveHourLimit), WeeklyLimit: microStrPtr(cmd.WeeklyLimit),
 			MonthlyLimit: microStrPtr(cmd.MonthlyLimit),
-			RPMLimit: cmd.RPMLimit, TPMLimit: cmd.TPMLimit, ConcurrencyLimit: cmd.ConcurrencyLimit,
+			RPMLimit:     cmd.RPMLimit, TPMLimit: cmd.TPMLimit, ConcurrencyLimit: cmd.ConcurrencyLimit,
 			OveragePolicy: cmd.OveragePolicy,
 		},
-		AddedModels:  []string{},
-		RemovedModels: []string{},
+		AddedModels:                      []string{},
+		RemovedModels:                    []string{},
 		ExistingSubscriptionsKeepVersion: true,
 	}
 	current, err := s.store.LatestPolicyVersionByName(ctx, cmd.Name)
@@ -297,7 +301,7 @@ func (s *PricingPreviewService) PreviewPolicyChange(ctx context.Context, cmd Pol
 			FiveHourLimit: microStrPtr(current.FiveHourLimit),
 			WeeklyLimit:   microStrPtr(current.WeeklyLimit),
 			MonthlyLimit:  microStrPtr(current.MonthlyLimit),
-			RPMLimit: current.RPMLimit, TPMLimit: current.TPMLimit, ConcurrencyLimit: current.ConcurrencyLimit,
+			RPMLimit:      current.RPMLimit, TPMLimit: current.TPMLimit, ConcurrencyLimit: current.ConcurrencyLimit,
 			OveragePolicy: current.OveragePolicy, Status: current.Status,
 		}
 		res.AddedModels, res.RemovedModels = diffStringSets(cmd.ModelIDs, current.ModelIDs)

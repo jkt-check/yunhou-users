@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/lib/pq"
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/management"
 	"github.com/yunhou/users/internal/inference/quota"
 )
 
@@ -25,6 +27,9 @@ const (
 	PriceSaleMoney    PriceKind = "sale_money"
 	PriceUpstreamCost PriceKind = "upstream_cost"
 )
+
+// 编译期契约：运营售价版本管理面（spec 2026-09-25-admin-price-versions）。
+var _ management.PriceVersionStore = (*Store)(nil)
 
 // PriceVersion is the stored shape of one immutable price revision.
 // Rates are micro-units per 1M tokens (unit=microcredit for the credit
@@ -48,6 +53,55 @@ type PriceVersion struct {
 
 // InsertPriceVersion appends one immutable price version.
 func (s *Store) InsertPriceVersion(ctx context.Context, p *PriceVersion) error {
+	return insertPriceVersion(ctx, s.db, p)
+}
+
+// InsertPriceVersionTx appends one immutable price version inside the
+// caller's UnitOfWork — the admin create path (management.PriceVersionService)
+// commits the version row and its audit event in ONE transaction. A UNIQUE
+// (model_id, kind, revision) violation surfaces as CodeConflict (并发创建
+// 竞态兜底). Fills p.ID / p.CreatedAt from the stored row.
+func (s *Store) InsertPriceVersionTx(ctx context.Context, w domain.UnitOfWork, p *management.PriceVersionInfo) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	pv := &PriceVersion{
+		ModelID: p.ModelID, Kind: p.Kind, Unit: p.Unit, Currency: p.Currency,
+		InputPerMtok: p.InputPerMtok, CacheReadPerMtok: p.CacheReadPerMtok,
+		CacheWritePerMtok: p.CacheWritePerMtok, OutputPerMtok: p.OutputPerMtok,
+		ExtraRates: domain.ExtensionConfig{SchemaVersion: 1, Raw: p.ExtraRates},
+		Revision:   p.Revision, EffectiveFrom: p.EffectiveFrom, EffectiveTo: p.EffectiveTo,
+	}
+	if err := insertPriceVersion(ctx, tx, pv); err != nil {
+		return err
+	}
+	p.ID, p.CreatedAt = pv.ID, pv.CreatedAt
+	return nil
+}
+
+// MaxPriceVersionRevisionTx reads MAX(revision) of one (model_id, kind)
+// inside the caller's UnitOfWork (0 when none) — the max+1 monotonicity gate
+// of the admin create path (M-5). 并发同 revision 创建最终由 UNIQUE 定序
+// （输家 409 竞态兜底），本读数只需防止跳号/回退。
+func (s *Store) MaxPriceVersionRevisionTx(ctx context.Context, w domain.UnitOfWork, modelID, kind string) (int, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return 0, err
+	}
+	var max sql.NullInt64
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT MAX(revision) FROM inference_price_versions WHERE model_id = $1 AND kind = $2`,
+		modelID, kind).Scan(&max); err != nil {
+		return 0, mapError("max price version revision", err)
+	}
+	if !max.Valid {
+		return 0, nil
+	}
+	return int(max.Int64), nil
+}
+
+func insertPriceVersion(ctx context.Context, ex sqlxExecutor, p *PriceVersion) error {
 	extra := p.ExtraRates.Raw
 	if len(extra) == 0 {
 		extra = json.RawMessage(`{"schema_version":1}`)
@@ -56,7 +110,7 @@ func (s *Store) InsertPriceVersion(ctx context.Context, p *PriceVersion) error {
 	if p.Currency != "" {
 		currency = p.Currency
 	}
-	err := s.db.QueryRowxContext(ctx,
+	err := ex.QueryRowxContext(ctx,
 		`INSERT INTO inference_price_versions
 		 (model_id, kind, unit, currency,
 		  input_micros_per_mtok, cache_read_micros_per_mtok,
@@ -69,6 +123,61 @@ func (s *Store) InsertPriceVersion(ctx context.Context, p *PriceVersion) error {
 		extra, p.Revision, p.EffectiveFrom, p.EffectiveTo).
 		Scan(&p.ID, &p.CreatedAt)
 	return mapError("insert price version", err)
+}
+
+// priceVersionInfo adapts the stored row to the management DTO (management
+// 不依赖 postgres —— LatestPriceVersionInfo 先例).
+func priceVersionInfo(p *PriceVersion) *management.PriceVersionInfo {
+	return &management.PriceVersionInfo{
+		ID: p.ID, ModelID: p.ModelID, Kind: p.Kind, Unit: p.Unit, Currency: p.Currency,
+		InputPerMtok: p.InputPerMtok, CacheReadPerMtok: p.CacheReadPerMtok,
+		CacheWritePerMtok: p.CacheWritePerMtok, OutputPerMtok: p.OutputPerMtok,
+		ExtraRates: p.ExtraRates.Raw,
+		Revision:   p.Revision, EffectiveFrom: p.EffectiveFrom, EffectiveTo: p.EffectiveTo,
+		CreatedAt: p.CreatedAt,
+	}
+}
+
+// GetPriceVersionByRevision reads the UNIQUE(model_id, kind, revision) row —
+// the idempotent-create pre-check (and race-fallback re-read) of the admin
+// price-version surface.
+func (s *Store) GetPriceVersionByRevision(ctx context.Context, modelID, kind string, revision int) (*management.PriceVersionInfo, error) {
+	var row priceVersionRow
+	err := s.db.GetContext(ctx, &row,
+		`SELECT * FROM inference_price_versions
+		 WHERE model_id = $1 AND kind = $2 AND revision = $3`, modelID, kind, revision)
+	if err != nil {
+		return nil, mapError("get price version by revision", err)
+	}
+	return priceVersionInfo(row.toPriceVersion()), nil
+}
+
+// ListPriceVersions lists immutable revisions filtered by model/kind,
+// ordered (model_id, kind, revision DESC) — stable and pageable. limit/offset
+// are validated bounds from the admin handler (default 100, clamp 500).
+func (s *Store) ListPriceVersions(ctx context.Context, f management.PriceVersionFilter) ([]management.PriceVersionInfo, error) {
+	query := `SELECT * FROM inference_price_versions WHERE TRUE`
+	var args []interface{}
+	if f.ModelID != "" {
+		args = append(args, f.ModelID)
+		query += fmt.Sprintf(" AND model_id = $%d", len(args))
+	}
+	if f.Kind != "" {
+		args = append(args, f.Kind)
+		query += fmt.Sprintf(" AND kind = $%d", len(args))
+	}
+	args = append(args, f.Limit, f.Offset)
+	query += fmt.Sprintf(" ORDER BY model_id, kind, revision DESC LIMIT $%d OFFSET $%d",
+		len(args)-1, len(args))
+	var rows []priceVersionRow
+	if err := s.db.SelectContext(ctx, &rows, query, args...); err != nil {
+		return nil, mapError("list price versions", err)
+	}
+	out := make([]management.PriceVersionInfo, 0, len(rows))
+	for i := range rows {
+		out = append(out, *priceVersionInfo(rows[i].toPriceVersion()))
+	}
+	return out, nil
 }
 
 // priceVersionRow is the storage row of inference_price_versions.

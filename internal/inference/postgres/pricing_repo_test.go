@@ -10,6 +10,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/management"
 )
 
 // pricing_repo_test.go — inference_price_versions 真实库行为（Task 6）：
@@ -227,5 +228,172 @@ func TestPriceVersion_PureRoundTrip(t *testing.T) {
 	// 3 tokens × 2.5 micro/token = 7.5 → 向上取整 8；2 × 5000 = 10000。
 	if c.Money == nil || c.Money.Micros != 10008 || c.Money.Currency != "USD" {
 		t.Errorf("money charge = %+v, want 10008 USD micros", c.Money)
+	}
+}
+
+// TestGetPriceVersionByRevision: UNIQUE(model_id, kind, revision) 自然键读
+// （管理端幂等预检）——命中返回完整视图，未命中 CodeNotFound。
+func TestGetPriceVersionByRevision(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+
+	from := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	v1 := insertCreditPrice(t, s, f.modelID, 1, from, nil, 1_000_000, 2_000_000)
+
+	got, err := s.GetPriceVersionByRevision(ctx, f.modelID, PriceSaleCredit, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != v1.ID || got.ModelID != f.modelID || got.Kind != PriceSaleCredit ||
+		got.Unit != "microcredit" || got.Currency != "" ||
+		got.InputPerMtok != 1_000_000 || got.OutputPerMtok != 2_000_000 ||
+		got.Revision != 1 || !got.EffectiveFrom.Equal(from) || got.EffectiveTo != nil ||
+		got.CreatedAt.IsZero() {
+		t.Fatalf("by revision = %+v", got)
+	}
+	if string(got.ExtraRates) == "" {
+		t.Fatalf("extra_rates must round-trip (default schema doc): %+v", got)
+	}
+
+	// 未命中（revision/kind/model 任一不同）→ not_found。
+	if _, err := s.GetPriceVersionByRevision(ctx, f.modelID, PriceSaleCredit, 2); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("missing revision: %v, want not_found", err)
+	}
+	if _, err := s.GetPriceVersionByRevision(ctx, f.modelID, PriceSaleMoney, 1); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("missing kind: %v, want not_found", err)
+	}
+	if _, err := s.GetPriceVersionByRevision(ctx, "no-such-model", PriceSaleCredit, 1); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Errorf("missing model: %v, want not_found", err)
+	}
+}
+
+// TestListPriceVersions: 过滤（model_id/kind）、固定排序
+// (model_id, kind, revision DESC) 与 limit/offset 分页；空集返回空切片。
+func TestListPriceVersions(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false) // model glm-4.6
+
+	// 第二个模型（FK 要求真实存在）。
+	if err := s.InsertModel(ctx, &domain.Model{
+		ID: "deepseek-chat", DisplayName: "DeepSeek", ContextTokens: 1000, MaxOutputTokens: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	from := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	insertCreditPrice(t, s, f.modelID, 1, from, nil, 100, 200)
+	insertCreditPrice(t, s, f.modelID, 2, from, nil, 300, 400)
+	// 金额口径：unit=micromoney + 币种（表 CHECK 口径）。
+	if err := s.InsertPriceVersion(ctx, &PriceVersion{
+		ModelID: f.modelID, Kind: PriceUpstreamCost, Unit: "micromoney", Currency: "USD",
+		InputPerMtok: 50, OutputPerMtok: 100, Revision: 1, EffectiveFrom: from,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	insertCreditPrice(t, s, "deepseek-chat", 1, from, nil, 1_000_000, 2_000_000)
+
+	all, err := s.ListPriceVersions(ctx, management.PriceVersionFilter{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("list = %d rows, want 4", len(all))
+	}
+	type key struct {
+		model string
+		kind  string
+		rev   int
+	}
+	want := []key{
+		{"deepseek-chat", PriceSaleCredit, 1},
+		{f.modelID, PriceSaleCredit, 2},
+		{f.modelID, PriceSaleCredit, 1},
+		{f.modelID, PriceUpstreamCost, 1},
+	}
+	for i, w := range want {
+		if all[i].ModelID != w.model || all[i].Kind != w.kind || all[i].Revision != w.rev {
+			t.Fatalf("order[%d] = %s/%s/%d, want %v", i, all[i].ModelID, all[i].Kind, all[i].Revision, w)
+		}
+	}
+
+	// model_id 过滤 + 币种行视图字段。
+	byModel, err := s.ListPriceVersions(ctx, management.PriceVersionFilter{ModelID: f.modelID, Limit: 100})
+	if err != nil || len(byModel) != 3 {
+		t.Fatalf("model filter = %d err=%v", len(byModel), err)
+	}
+	if byModel[2].Unit != "micromoney" || byModel[2].Currency != "USD" {
+		t.Fatalf("money row = %+v", byModel[2])
+	}
+
+	// kind 过滤 + 组合过滤。
+	byKind, err := s.ListPriceVersions(ctx, management.PriceVersionFilter{Kind: PriceSaleCredit, Limit: 100})
+	if err != nil || len(byKind) != 3 {
+		t.Fatalf("kind filter = %d err=%v", len(byKind), err)
+	}
+	combo, err := s.ListPriceVersions(ctx, management.PriceVersionFilter{ModelID: f.modelID, Kind: PriceSaleCredit, Limit: 100})
+	if err != nil || len(combo) != 2 || combo[0].Revision != 2 || combo[1].Revision != 1 {
+		t.Fatalf("combo filter = %+v err=%v", combo, err)
+	}
+
+	// 分页：limit=1 offset=1 → 全序第二项（glm sale_credit rev2）。
+	page, err := s.ListPriceVersions(ctx, management.PriceVersionFilter{Limit: 1, Offset: 1})
+	if err != nil || len(page) != 1 || page[0].Revision != 2 || page[0].ModelID != f.modelID {
+		t.Fatalf("page = %+v err=%v", page, err)
+	}
+
+	// 空集：空切片（非 nil 语义由调用方/序列化保证，这里至少不报错）。
+	none, err := s.ListPriceVersions(ctx, management.PriceVersionFilter{ModelID: "no-such-model", Limit: 100})
+	if err != nil || len(none) != 0 {
+		t.Fatalf("empty = %+v err=%v", none, err)
+	}
+}
+
+// TestInsertPriceVersionTx: 管理端同事务写入路径——提交后自然键可读；
+// 同 (model_id, kind, revision) 撞唯一键 → CodeConflict（409 竞态兜底）。
+func TestInsertPriceVersionTx(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+	from := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+
+	info := &management.PriceVersionInfo{
+		ModelID: f.modelID, Kind: PriceSaleCredit, Unit: "microcredit",
+		InputPerMtok: 1_000_000, OutputPerMtok: 2_000_000,
+		ExtraRates: json.RawMessage(`{"schema_version":1}`),
+		Revision:   1, EffectiveFrom: from,
+	}
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertPriceVersionTx(ctx, uow, info); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if info.ID == "" || info.CreatedAt.IsZero() {
+		t.Fatalf("tx insert must fill id/created_at: %+v", info)
+	}
+	got, err := s.GetPriceVersionByRevision(ctx, f.modelID, PriceSaleCredit, 1)
+	if err != nil || got.ID != info.ID {
+		t.Fatalf("readback = %+v err=%v", got, err)
+	}
+
+	// 唯一键竞态兜底：同 (model_id, kind, revision) 再插 → CodeConflict。
+	dup := &management.PriceVersionInfo{
+		ModelID: f.modelID, Kind: PriceSaleCredit, Unit: "microcredit",
+		Revision: 1, EffectiveFrom: from,
+	}
+	uow2, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.InsertPriceVersionTx(ctx, uow2, dup)
+	_ = uow2.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("duplicate insert = %v, want conflict", err)
 	}
 }

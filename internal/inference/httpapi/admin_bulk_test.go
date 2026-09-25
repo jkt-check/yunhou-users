@@ -129,6 +129,8 @@ func newOpsFixture(t *testing.T) *opsFixture {
 	modelsGroup := engine.Group("/adminm", stub, httpapi.OperatorAuthz(store, management.PermModelsManage))
 	bulkH.Register(modelsGroup)
 	usageH.RegisterPreview(modelsGroup)
+	// 售价版本管理面（models:manage）——创建只追加 + 列表。
+	httpapi.NewAdminPriceVersionsHandler(management.NewPriceVersionService(store, store, nil)).Register(modelsGroup)
 	// 既有目录发布面（导入→草稿→发布链路断言用）。Task 16：读写两面都挂
 	// （RegisterReadOnly 提供 GET 列表/详情/revisions/active 覆盖路径）。
 	catalogSvc := catalog.NewService(store)
@@ -242,9 +244,9 @@ func TestAdminBulkImport_HTTPFlow(t *testing.T) {
 	body["dry_run"] = false
 	env = doH(t, f.engine, http.MethodPost, "/adminm/catalog/bulk-import", body, http.StatusCreated, f.headers(op))
 	var committed struct {
-		Committed bool   `json:"committed"`
-		Replayed  bool   `json:"replayed"`
-		Inserted  int    `json:"inserted"`
+		Committed bool `json:"committed"`
+		Replayed  bool `json:"replayed"`
+		Inserted  int  `json:"inserted"`
 	}
 	if err := json.Unmarshal(env.Data, &committed); err != nil {
 		t.Fatal(err)

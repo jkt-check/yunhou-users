@@ -341,6 +341,9 @@ func main() {
 		Bulk: inferencehttpapi.NewAdminBulkHandler(inferencemanagement.NewBulkImportService(infStore, infStore, egressValidator.ValidateURL)),
 		// Task 15: 运营统计/成本分析/异常筛选/共享账号检测/变更预览。
 		Usage: inferencehttpapi.NewAdminUsageHandler(opsViewSvc, inferencemanagement.NewPricingPreviewService(infStore, nil)),
+		// 售价版本管理面（只追加创建 + 列表；revision 自然键幂等，写 + 审计
+		// 同事务）—— spec 2026-09-25-admin-price-versions-design.md。
+		PriceVersions: inferencehttpapi.NewAdminPriceVersionsHandler(inferencemanagement.NewPriceVersionService(infStore, infStore, nil)),
 	}
 
 	// Task 5: customer API keys + caller principal resolution. The

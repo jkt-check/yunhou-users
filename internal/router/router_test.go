@@ -331,6 +331,9 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"GET:/admin/model-adjustments",
 		"POST:/admin/model-prices/preview",
 		"POST:/admin/quota-policies/preview",
+		// 售价版本管理面同样 fail-closed（nil adminOps = 不挂载）。
+		"POST:/admin/price-versions",
+		"GET:/admin/price-versions",
 	} {
 		if have[w] {
 			t.Errorf("Setup registered operator write route %s with nil adminOps", w)

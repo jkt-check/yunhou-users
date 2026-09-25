@@ -281,7 +281,7 @@ type Store interface {
 // concurrent edit mid-drain cannot produce a self-contradictory payload
 // (安全审查 M-3), and (b) insert + activation commit or roll back together
 // (安全审查 M-2). The caller drains and validates, then Commit; any error
-// path rolls the whole thing back.
+// path rolls the whole thing back. Rollback rides the same transaction.
 type PublishTx interface {
 	// ListModels/Providers/Deployments/Routes drain the catalog inside the
 	// snapshot (same filters/cursors as the Store listing methods).
@@ -290,6 +290,10 @@ type PublishTx interface {
 	ListDeployments(ctx context.Context, f domain.DeploymentFilter) ([]domain.Deployment, error)
 	ListRoutes(ctx context.Context, modelID string) ([]domain.ModelRoute, error)
 	LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error)
+	// GetRevision loads one immutable revision (payload included) inside the
+	// transaction — Rollback re-reads its target here so the insert+activate
+	// and the target read share one snapshot.
+	GetRevision(ctx context.Context, scope domain.ConfigScope, revision int) (*domain.ConfigRevision, error)
 	// InsertAndActivateRevision appends the draft revision and switches the
 	// scope's active pointer in the SAME transaction — no orphan draft can
 	// survive an activation failure (安全审查 M-2).
@@ -694,8 +698,18 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 // target revision is only READ, and the new revision gets the next
 // revision number. Only revisions that were published at some point may be
 // rollback targets.
+//
+// 安全审查 M-2（跟进）: 修订插入与激活与目标读取跑在同一事务——激活失败
+// 不会留下孤儿 draft（旧实现先 InsertConfigRevision 再 ActivateRevision,
+// 两步之间崩溃/失败即产生无人引用的 draft 修订）。
 func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string) (int, error) {
-	target, err := s.store.GetRevision(ctx, domain.ScopeCatalog, toRevision)
+	tx, err := s.store.BeginPublish(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	target, err := tx.GetRevision(ctx, domain.ScopeCatalog, toRevision)
 	if err != nil {
 		return 0, err
 	}
@@ -708,7 +722,7 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 	if _, err := ParseSnapshot(target); err != nil {
 		return 0, domain.WrapError(domain.CodeInvalidInput, "rollback target is not a parseable snapshot", err)
 	}
-	latest, err := s.store.LatestRevision(ctx, domain.ScopeCatalog)
+	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
 	if err != nil {
 		return 0, err
 	}
@@ -719,10 +733,10 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 		Status:    domain.RevisionDraft,
 		CreatedBy: createdBy,
 	}
-	if err := s.store.InsertConfigRevision(ctx, rev); err != nil {
-		return 0, err
+	if err := tx.InsertAndActivateRevision(ctx, rev); err != nil {
+		return 0, err // 同事务回滚：激活失败不留孤儿 draft
 	}
-	if err := s.store.ActivateRevision(ctx, domain.ScopeCatalog, rev.Revision); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return rev.Revision, nil

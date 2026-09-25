@@ -289,6 +289,10 @@ func (t *fakePublishTx) LatestRevision(ctx context.Context, scope domain.ConfigS
 	return len(t.store.revisions), nil
 }
 
+func (t *fakePublishTx) GetRevision(ctx context.Context, scope domain.ConfigScope, revision int) (*domain.ConfigRevision, error) {
+	return t.store.GetRevision(ctx, scope, revision)
+}
+
 func (t *fakePublishTx) InsertAndActivateRevision(ctx context.Context, rev *domain.ConfigRevision) error {
 	if t.store.publishErr != nil {
 		return t.store.publishErr // 模拟同事务回滚：一行不留
@@ -379,7 +383,7 @@ func TestCatalogManager_CRUDRecordsAudit(t *testing.T) {
 
 	// 部署写路径的 egress 校验：https 放行。
 	dep := &domain.Deployment{
-		ID: uuid.NewString(),
+		ID:         uuid.NewString(),
 		ProviderID: prov.ID, UpstreamModel: "up", BaseURL: "https://api.glm.example.com",
 		Protocol: domain.ProtocolOpenAIChat, ConnectTimeout: time.Second, RequestTimeout: time.Second,
 		Status: domain.DeploymentDraft, ConfigVersion: 1,
@@ -605,6 +609,39 @@ func TestCatalogManager_PublishDrainsThroughSingleTx(t *testing.T) {
 	// models/providers/deployments/routes 四类抽取都走了事务（路由按模型逐个抽取）。
 	if fs.txReads < 4 {
 		t.Errorf("tx reads = %d, want ≥4 (models/providers/deployments/routes)", fs.txReads)
+	}
+}
+
+// 安全审查 M-2（跟进）：回滚与发布同构——插入+激活在同一事务，激活失败
+// 必须整体回滚，不得留下孤儿 draft 修订；错误干净透出，重试安全。
+func TestCatalogManager_RollbackActivationFailureLeavesNoOrphanDraft(t *testing.T) {
+	fs := newFakeCatalogStore()
+	mgr := NewCatalogManager(catalog.NewService(fs), &spyRecorder{}, nil)
+	ctx := context.Background()
+
+	if _, err := mgr.Publish(ctx, managerActor()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fs.revisions) != 1 {
+		t.Fatalf("revisions = %d, want 1 after publish", len(fs.revisions))
+	}
+
+	fs.publishErr = errors.New("activation boom")
+	if _, err := mgr.Rollback(ctx, managerActor(), 1); err == nil {
+		t.Fatal("activation failure must surface as rollback error")
+	}
+	if len(fs.revisions) != 1 {
+		t.Fatalf("orphan draft revision left after failed rollback: %+v", fs.revisions)
+	}
+
+	// 失败后的重试是安全的：恢复存储后同一回滚成功落到 revision 2。
+	fs.publishErr = nil
+	rev, err := mgr.Rollback(ctx, managerActor(), 1)
+	if err != nil || rev != 2 {
+		t.Fatalf("retry after transient failure = %d, %v; want 2, nil", rev, err)
+	}
+	if len(fs.revisions) != 2 || fs.revisions[1].Status != domain.RevisionPublished || !fs.revisions[1].IsActive {
+		t.Fatalf("retried revision = %+v, want published+active", fs.revisions[1])
 	}
 }
 

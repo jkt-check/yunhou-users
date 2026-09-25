@@ -446,6 +446,20 @@ func (t *publishTx) LatestRevision(ctx context.Context, scope domain.ConfigScope
 	return n, mapError("latest revision", err)
 }
 
+// GetRevision loads one immutable revision (payload included) inside the
+// publish transaction — Rollback re-reads its target here so the target
+// read and the insert+activate share one snapshot.
+func (t *publishTx) GetRevision(ctx context.Context, scope domain.ConfigScope, revision int) (*domain.ConfigRevision, error) {
+	var row revisionRow
+	err := t.tx.GetContext(ctx, &row,
+		`SELECT * FROM inference_config_revisions WHERE scope = $1 AND revision = $2`,
+		string(scope), revision)
+	if err != nil {
+		return nil, mapError("get revision", err)
+	}
+	return row.toDomain(), nil
+}
+
 func (t *publishTx) InsertAndActivateRevision(ctx context.Context, rev *domain.ConfigRevision) error {
 	if err := insertConfigRevisionQ(ctx, t.tx, rev); err != nil {
 		return mapError("insert config revision", err) // UNIQUE(scope, revision) → CodeConflict on racing publishers

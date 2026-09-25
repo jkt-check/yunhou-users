@@ -49,11 +49,11 @@ func TestValidRole(t *testing.T) {
 
 func TestSanitizeDetail(t *testing.T) {
 	in := map[string]any{
-		"label":       "prod",
-		"secret":      "sk-live",
-		"api_key":     "leaked",
-		"nested":      map[string]any{"client_secret": "x", "ok": 1},
-		"list":        []any{map[string]any{"token": "y"}, "fine"},
+		"label":      "prod",
+		"secret":     "sk-live",
+		"api_key":    "leaked",
+		"nested":     map[string]any{"client_secret": "x", "ok": 1},
+		"list":       []any{map[string]any{"token": "y"}, "fine"},
 		"key_version": 2,
 	}
 	out := SanitizeDetail(in)

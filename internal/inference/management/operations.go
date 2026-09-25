@@ -43,11 +43,11 @@ func (g OpsGroupBy) Valid() bool {
 // OpsUsageFilter is the validated input of the operator summary. The
 // [From, To) window reuses ResolveUsageRange (默认最近 30 天，最大 92 天).
 type OpsUsageFilter struct {
-	From, To   time.Time
-	GroupBy    OpsGroupBy
-	ModelID    string
+	From, To  time.Time
+	GroupBy   OpsGroupBy
+	ModelID   string
 	ProviderID string
-	AccountID  string // billing_account_id
+	AccountID string // billing_account_id
 }
 
 // CostSlice is the procurement cost of one (currency, cost_basis) shard.
@@ -65,11 +65,11 @@ type CostSlice struct {
 // attempts 落库事实的分币种/口径分片。
 type OpsGroup struct {
 	// 分组键（按 GroupBy 恰有一个非空）。
-	ModelID      string `json:"model_id,omitempty"`
-	ProviderID   string `json:"provider_id,omitempty"`
+	ModelID    string `json:"model_id,omitempty"`
+	ProviderID string `json:"provider_id,omitempty"`
 	ProviderCode string `json:"provider_code,omitempty"`
-	AccountID    string `json:"billing_account_id,omitempty"`
-	UserID       string `json:"user_id,omitempty"`
+	AccountID  string `json:"billing_account_id,omitempty"`
+	UserID     string `json:"user_id,omitempty"`
 
 	RequestsTotal         int64 `json:"requests"`
 	SettledRequests       int64 `json:"settled"`
@@ -153,29 +153,29 @@ type StuckReservation struct {
 
 // ReauthAccount is one upstream account whose authorization lapsed.
 type ReauthAccount struct {
-	AccountID    string    `json:"account_id"`
-	ProviderID   string    `json:"provider_id"`
-	ProviderCode string    `json:"provider_code"`
-	DisplayName  string    `json:"display_name"`
-	Status       string    `json:"status"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	AccountID    string     `json:"account_id"`
+	ProviderID   string     `json:"provider_id"`
+	ProviderCode string     `json:"provider_code"`
+	DisplayName  string     `json:"display_name"`
+	Status       string     `json:"status"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
 // BacklogJob is one open reconciliation job with an overdue marker.
 type BacklogJob struct {
-	ID         string    `json:"id"`
-	RequestID  *string   `json:"request_id"`
-	Reason     string    `json:"reason"`
-	Status     string    `json:"status"`
-	DeadlineAt time.Time `json:"deadline_at"`
-	Overdue    bool      `json:"overdue"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID         string     `json:"id"`
+	RequestID  *string    `json:"request_id"`
+	Reason     string     `json:"reason"`
+	Status     string     `json:"status"`
+	DeadlineAt time.Time  `json:"deadline_at"`
+	Overdue    bool       `json:"overdue"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 // OpsExceptions is the assembled exception view (kind 决定哪个列表非空).
 type OpsExceptions struct {
-	ServerTime        time.Time
-	Kind              string
+	ServerTime time.Time
+	Kind       string
 	StuckReservations []StuckReservation
 	ReauthAccounts    []ReauthAccount
 	SettlementBacklog []BacklogJob
@@ -210,18 +210,18 @@ type OperationsStore interface {
 // AdjustmentView is the operator-facing adjustment row (有原因、对象、金额、
 // 操作者与幂等键 — 设计 §9.2 /admin/model-adjustments 的读取面).
 type AdjustmentView struct {
-	ID               string    `json:"id"`
-	BillingAccountID string    `json:"billing_account_id"`
-	RequestID        *string   `json:"request_id"`
-	Reason           string    `json:"reason"`
-	AmountMicros     int64     `json:"-"`
-	Direction        string    `json:"direction"`
-	Unit             string    `json:"unit"`
-	Currency         string    `json:"currency,omitempty"`
-	OperatorSubject  string    `json:"operator_subject"`
-	ServiceSubject   string    `json:"service_subject"`
-	IdempotencyKey   string    `json:"idempotency_key"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	BillingAccountID string   `json:"billing_account_id"`
+	RequestID       *string   `json:"request_id"`
+	Reason          string    `json:"reason"`
+	AmountMicros    int64     `json:"-"`
+	Direction       string    `json:"direction"`
+	Unit            string    `json:"unit"`
+	Currency        string    `json:"currency,omitempty"`
+	OperatorSubject string    `json:"operator_subject"`
+	ServiceSubject  string    `json:"service_subject"`
+	IdempotencyKey  string    `json:"idempotency_key"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // OperationsService assembles the operator read models.

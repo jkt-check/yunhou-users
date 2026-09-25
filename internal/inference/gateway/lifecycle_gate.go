@@ -45,9 +45,10 @@ func (m LifecycleGateMode) String() string {
 // lifecycleGateDecision maps (lifecycle, mode) to (observe, blocked).
 // active never triggers anything; deprecated is observed but never blocked
 // (产品口径:放行存量 entitlement;拒新 grant 属 entitlement 层另案);
-// retired/draft block only in enforce mode. Unknown lifecycles are observed
-// (loud) but not blocked — better telemetry than a hard failure on data we
-// do not recognise.
+// retired/draft block only in enforce mode. Empty lifecycle is treated as
+// active and intentionally silent (DB 有 NOT NULL DEFAULT 'draft' + CHECK
+// 兜底,空值只可能来自手工快照);非空未知值只观察不拦截——对不认识的数据
+// 拿遥测胜过硬失败。
 func lifecycleGateDecision(lc domain.Lifecycle, mode LifecycleGateMode) (observe, blocked bool) {
 	switch lc {
 	case "", domain.LifecycleActive:

@@ -81,8 +81,8 @@ func TestRequestCursorCodec(t *testing.T) {
 	if !dec.CreatedAt.Equal(c.CreatedAt) || dec.ID != c.ID {
 		t.Errorf("round trip: %+v", dec)
 	}
-	for _, bad := range []string{"", "not-base64!!", "e30"} {// "{}" — 字段缺失
-
+	for _, bad := range []string{"", "not-base64!!", "e30", // "{}" — 字段缺失
+	} {
 		if _, err := DecodeRequestCursor(bad); err == nil {
 			t.Errorf("malformed cursor %q must fail", bad)
 		}

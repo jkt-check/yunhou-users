@@ -223,6 +223,8 @@ func TestLifecycleGate_DefaultReporterFallback(t *testing.T) {
 
 	var logBuf strings.Builder
 	prevOut := log.Writer()
+	// 全局 logger 替换:本包任何测试不得加 t.Parallel,也不得再断言全局
+	// 日志输出,否则相互污染且难以诊断(见 review 轮2)。
 	log.SetOutput(&logBuf)
 	t.Cleanup(func() { log.SetOutput(prevOut) })
 

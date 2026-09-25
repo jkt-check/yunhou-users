@@ -216,7 +216,11 @@ func (s *Service) CooldownAfterFailure(accountID string) {
 func (s *Service) AcquireUpstreamLease(ctx context.Context, w domain.UnitOfWork, account domain.UpstreamAccount, requestID string, now time.Time) (*domain.ConcurrencyLease, error) {
 	limit := account.ConcurrencyLimit
 	if limit <= 0 {
-		limit = 1
+		// 0 = 备而不用（provisioned but unschedulable）：候选过滤
+		// （orderAccountsWithQuota）应已排除；走到这里说明选型后被调成
+		// 0 —— 按容量耗尽处理让调用方换下一个候选，绝不静默当 1 放行。
+		return nil, domain.NewError(domain.CodeInsufficientCapacity,
+			"upstream account parked (concurrency_limit 0)")
 	}
 	return s.store.AcquireLeaseTx(ctx, w, domain.AcquireLeaseCommand{
 		Scope:      domain.LeaseScopeUpstreamAccount,

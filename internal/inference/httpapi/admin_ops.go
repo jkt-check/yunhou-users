@@ -29,6 +29,9 @@ type AdminOps struct {
 	// OAuth guards the upstream OAuth authorization lifecycle (Task 12);
 	// mounted under the same credentials:manage permission.
 	OAuth *AdminOAuthHandler
+	// Accounts is the schedulable-account operator surface (create binding /
+	// status / tune concurrency); same credentials:manage permission.
+	Accounts *AdminAccountsHandler
 	// Adjustments is the operator wallet surface (Task 14: 运营调整/冲正/
 	// PAYG 发布配置; Task 15 扩展: 补偿列表 + 追加审计); mounted under
 	// billing:adjust.
@@ -53,6 +56,9 @@ func (o *AdminOps) Mount(g *gin.RouterGroup) {
 	}
 	if o.OAuth != nil && o.RequireCredentials != nil {
 		o.OAuth.Register(g.Group("", o.RequireCredentials))
+	}
+	if o.Accounts != nil && o.RequireCredentials != nil {
+		o.Accounts.Register(g.Group("", o.RequireCredentials))
 	}
 	if o.Auth != nil && o.RequireAdmin != nil {
 		o.Auth.RegisterOperators(g.Group("", o.RequireAdmin))

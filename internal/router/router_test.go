@@ -319,6 +319,10 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		"POST:/admin/credentials",
 		"POST:/admin/credentials/:id/rotate",
 		"POST:/admin/operators",
+		// 可调度账号管理面（凭据→账号绑定/启停/调并发）同组 fail-closed。
+		"POST:/admin/upstream-accounts",
+		"POST:/admin/upstream-accounts/:id/status",
+		"PATCH:/admin/upstream-accounts/:id",
 		// Task 15 运营面同样 fail-closed（nil adminOps = 不挂载）。
 		"POST:/admin/catalog/bulk-import",
 		"GET:/admin/model-usage/summary",

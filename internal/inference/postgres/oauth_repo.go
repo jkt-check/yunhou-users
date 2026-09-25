@@ -301,22 +301,7 @@ func (s *Store) ListUpstreamAccountsForHealth(ctx context.Context, cooldownDueBe
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	var rows []struct {
-		ID            string         `db:"id"`
-		ProviderID    string         `db:"provider_id"`
-		CredentialID  string         `db:"credential_id"`
-		ExternalID    string         `db:"external_account_id"`
-		DisplayName   string         `db:"display_name"`
-		Status        string         `db:"status"`
-		ConcLimit     int            `db:"concurrency_limit"`
-		QuotaLimit    sql.NullInt64  `db:"quota_limit_micros"`
-		QuotaRemain   sql.NullInt64  `db:"quota_remaining_micros"`
-		QuotaObserved *time.Time     `db:"quota_observed_at"`
-		QuotaSource   sql.NullString `db:"quota_source"`
-		QuotaReset    *time.Time     `db:"quota_reset_at"`
-		CreatedAt     time.Time      `db:"created_at"`
-		UpdatedAt     time.Time      `db:"updated_at"`
-	}
+	var rows []upstreamAccountRow
 	if err := s.db.SelectContext(ctx, &rows,
 		`SELECT a.* FROM inference_upstream_accounts a
 		 WHERE a.status = 'active'
@@ -327,19 +312,7 @@ func (s *Store) ListUpstreamAccountsForHealth(ctx context.Context, cooldownDueBe
 	}
 	out := make([]domain.UpstreamAccount, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, domain.UpstreamAccount{
-			ID: r.ID, ProviderID: r.ProviderID, CredentialID: r.CredentialID,
-			ExternalAccountID: r.ExternalID, DisplayName: r.DisplayName,
-			Status: domain.UpstreamAccountStatus(r.Status), ConcurrencyLimit: r.ConcLimit,
-			Quota: domain.UpstreamQuota{
-				LimitMicros:     microFromNull(r.QuotaLimit),
-				RemainingMicros: microFromNull(r.QuotaRemain),
-				ObservedAt:      r.QuotaObserved,
-				Source:          strFromNull(r.QuotaSource),
-				ResetAt:         r.QuotaReset,
-			},
-			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		})
+		out = append(out, r.toDomain())
 	}
 	return out, nil
 }
@@ -350,22 +323,7 @@ func (s *Store) ListUpstreamAccounts(ctx context.Context, providerID string, lim
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	var rows []struct {
-		ID            string         `db:"id"`
-		ProviderID    string         `db:"provider_id"`
-		CredentialID  string         `db:"credential_id"`
-		ExternalID    string         `db:"external_account_id"`
-		DisplayName   string         `db:"display_name"`
-		Status        string         `db:"status"`
-		ConcLimit     int            `db:"concurrency_limit"`
-		QuotaLimit    sql.NullInt64  `db:"quota_limit_micros"`
-		QuotaRemain   sql.NullInt64  `db:"quota_remaining_micros"`
-		QuotaObserved *time.Time     `db:"quota_observed_at"`
-		QuotaSource   sql.NullString `db:"quota_source"`
-		QuotaReset    *time.Time     `db:"quota_reset_at"`
-		CreatedAt     time.Time      `db:"created_at"`
-		UpdatedAt     time.Time      `db:"updated_at"`
-	}
+	var rows []upstreamAccountRow
 	if err := s.db.SelectContext(ctx, &rows,
 		`SELECT * FROM inference_upstream_accounts
 		  WHERE provider_id = $1 ORDER BY created_at, id LIMIT $2`, providerID, limit); err != nil {
@@ -373,19 +331,7 @@ func (s *Store) ListUpstreamAccounts(ctx context.Context, providerID string, lim
 	}
 	out := make([]domain.UpstreamAccount, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, domain.UpstreamAccount{
-			ID: r.ID, ProviderID: r.ProviderID, CredentialID: r.CredentialID,
-			ExternalAccountID: r.ExternalID, DisplayName: r.DisplayName,
-			Status: domain.UpstreamAccountStatus(r.Status), ConcurrencyLimit: r.ConcLimit,
-			Quota: domain.UpstreamQuota{
-				LimitMicros:     microFromNull(r.QuotaLimit),
-				RemainingMicros: microFromNull(r.QuotaRemain),
-				ObservedAt:      r.QuotaObserved,
-				Source:          strFromNull(r.QuotaSource),
-				ResetAt:         r.QuotaReset,
-			},
-			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		})
+		out = append(out, r.toDomain())
 	}
 	return out, nil
 }
@@ -402,17 +348,15 @@ func (s *Store) InsertUpstreamAccountTx(ctx context.Context, w domain.UnitOfWork
 	if status == "" {
 		status = string(domain.AccountActive)
 	}
-	conc := a.ConcurrencyLimit
-	if conc == 0 {
-		conc = 1
-	}
+	// ConcurrencyLimit 由调用方显式给定：0 是合法的"备而不用"（管理端
+	// 创建路径），这里不做 0→1 静默改写。
 	err = tx.QueryRowxContext(ctx,
 		`INSERT INTO inference_upstream_accounts
 		 (provider_id, credential_id, external_account_id, display_name, status, concurrency_limit,
 		  quota_limit_micros, quota_remaining_micros, quota_observed_at, quota_source, quota_reset_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 RETURNING id, created_at, updated_at`,
-		a.ProviderID, a.CredentialID, a.ExternalAccountID, a.DisplayName, status, conc,
+		a.ProviderID, a.CredentialID, a.ExternalAccountID, a.DisplayName, status, a.ConcurrencyLimit,
 		microPtr(a.Quota.LimitMicros), microPtr(a.Quota.RemainingMicros),
 		a.Quota.ObservedAt, strPtr(a.Quota.Source), a.Quota.ResetAt).
 		Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)

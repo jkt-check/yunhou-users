@@ -53,6 +53,11 @@ func quotaExhausted(a domain.UpstreamAccount, now time.Time) bool {
 func (s *Service) orderAccountsWithQuota(providerID string, accounts []domain.UpstreamAccount, now time.Time) []domain.UpstreamAccount {
 	live := make([]domain.UpstreamAccount, 0, len(accounts))
 	for _, a := range accounts {
+		// concurrency_limit 0 = 备而不用（provisioned but unschedulable，
+		// 需求文档 §3.1 固定语义）:入池读面不排除,候选序必须排除。
+		if a.ConcurrencyLimit <= 0 {
+			continue
+		}
 		if quotaExhausted(a, now) {
 			continue
 		}
@@ -107,6 +112,7 @@ func (s *Service) HealthOf(a domain.UpstreamAccount) AccountHealth {
 	}
 	s.mu.Unlock()
 	h.Schedulable = a.Status == domain.AccountActive &&
+		a.ConcurrencyLimit > 0 && // 0 = 备而不用，不可调度
 		h.CoolingUntil == nil && !quotaExhausted(a, now)
 	return h
 }

@@ -180,6 +180,43 @@ func (s *Store) GetCredential(ctx context.Context, id string) (*domain.Credentia
 	}, nil
 }
 
+// GetCredentialForUpdateTx re-reads the credential row FOR UPDATE inside an
+// open UnitOfWork. The row lock serializes with a concurrent revoke/restore
+// (both UPDATE the same row), so the account-create path can never commit an
+// active account bound to a credential that was revoked mid-request
+// (审查修复:Create 的状态检查原在事务外,存在 TOCTOU 窗口).
+func (s *Store) GetCredentialForUpdateTx(ctx context.Context, w domain.UnitOfWork, id string) (*domain.Credential, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	var row struct {
+		ID            string     `db:"id"`
+		ProviderID    string     `db:"provider_id"`
+		Label         string     `db:"label"`
+		AuthType      string     `db:"auth_type"`
+		Ciphertext    []byte     `db:"ciphertext"`
+		KeyVersion    int        `db:"key_version"`
+		Generation    int64      `db:"generation"`
+		ExpiresAt     *time.Time `db:"expires_at"`
+		LastRotatedAt *time.Time `db:"last_rotated_at"`
+		Status        string     `db:"status"`
+		Connector     string     `db:"connector"`
+		CreatedAt     time.Time  `db:"created_at"`
+		UpdatedAt     time.Time  `db:"updated_at"`
+	}
+	if err := tx.GetContext(ctx, &row,
+		`SELECT * FROM inference_credentials WHERE id = $1 FOR UPDATE`, id); err != nil {
+		return nil, mapError("get credential for update (tx)", err)
+	}
+	return &domain.Credential{
+		ID: row.ID, ProviderID: row.ProviderID, Label: row.Label, AuthType: row.AuthType,
+		Ciphertext: row.Ciphertext, KeyVersion: row.KeyVersion, Generation: row.Generation,
+		ExpiresAt: row.ExpiresAt, LastRotatedAt: row.LastRotatedAt, Status: row.Status,
+		Connector: row.Connector, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+	}, nil
+}
+
 // ListCredentials returns masked-eligible rows (ciphertext included — the
 // credentials package is the only consumer and treats it as opaque).
 func (s *Store) ListCredentials(ctx context.Context, providerID string, limit int) ([]domain.Credential, error) {
@@ -318,15 +355,13 @@ func disableUpstreamAccountsByCredential(ctx context.Context, ex sqlxExecutor, c
 	return res.RowsAffected()
 }
 
-// InsertUpstreamAccount registers one schedulable upstream account.
+// InsertUpstreamAccount registers one schedulable upstream account. The
+// caller sets ConcurrencyLimit explicitly — 0 is a legitimate "provisioned
+// but unschedulable" value (admin create path), so no silent 0→1 coercion.
 func (s *Store) InsertUpstreamAccount(ctx context.Context, a *domain.UpstreamAccount) error {
 	status := string(a.Status)
 	if status == "" {
 		status = string(domain.AccountActive)
-	}
-	conc := a.ConcurrencyLimit
-	if conc == 0 {
-		conc = 1
 	}
 	err := s.db.QueryRowxContext(ctx,
 		`INSERT INTO inference_upstream_accounts
@@ -334,7 +369,7 @@ func (s *Store) InsertUpstreamAccount(ctx context.Context, a *domain.UpstreamAcc
 		  quota_limit_micros, quota_remaining_micros, quota_observed_at, quota_source, quota_reset_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 RETURNING id, created_at, updated_at`,
-		a.ProviderID, a.CredentialID, a.ExternalAccountID, a.DisplayName, status, conc,
+		a.ProviderID, a.CredentialID, a.ExternalAccountID, a.DisplayName, status, a.ConcurrencyLimit,
 		microPtr(a.Quota.LimitMicros), microPtr(a.Quota.RemainingMicros),
 		a.Quota.ObservedAt, strPtr(a.Quota.Source), a.Quota.ResetAt).
 		Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
@@ -343,62 +378,23 @@ func (s *Store) InsertUpstreamAccount(ctx context.Context, a *domain.UpstreamAcc
 
 // GetUpstreamAccount loads one account with its quota cache.
 func (s *Store) GetUpstreamAccount(ctx context.Context, id string) (*domain.UpstreamAccount, error) {
-	var row struct {
-		ID            string         `db:"id"`
-		ProviderID    string         `db:"provider_id"`
-		CredentialID  string         `db:"credential_id"`
-		ExternalID    string         `db:"external_account_id"`
-		DisplayName   string         `db:"display_name"`
-		Status        string         `db:"status"`
-		ConcLimit     int            `db:"concurrency_limit"`
-		QuotaLimit    sql.NullInt64  `db:"quota_limit_micros"`
-		QuotaRemain   sql.NullInt64  `db:"quota_remaining_micros"`
-		QuotaObserved *time.Time     `db:"quota_observed_at"`
-		QuotaSource   sql.NullString `db:"quota_source"`
-		QuotaReset    *time.Time     `db:"quota_reset_at"`
-		CreatedAt     time.Time      `db:"created_at"`
-		UpdatedAt     time.Time      `db:"updated_at"`
-	}
+	var row upstreamAccountRow
 	err := s.db.GetContext(ctx, &row,
 		`SELECT * FROM inference_upstream_accounts WHERE id = $1`, id)
 	if err != nil {
 		return nil, mapError("get upstream account", err)
 	}
-	return &domain.UpstreamAccount{
-		ID: row.ID, ProviderID: row.ProviderID, CredentialID: row.CredentialID,
-		ExternalAccountID: row.ExternalID, DisplayName: row.DisplayName,
-		Status: domain.UpstreamAccountStatus(row.Status), ConcurrencyLimit: row.ConcLimit,
-		Quota: domain.UpstreamQuota{
-			LimitMicros:     microFromNull(row.QuotaLimit),
-			RemainingMicros: microFromNull(row.QuotaRemain),
-			ObservedAt:      row.QuotaObserved,
-			Source:          strFromNull(row.QuotaSource),
-			ResetAt:         row.QuotaReset,
-		},
-		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
-	}, nil
+	a := row.toDomain()
+	return &a, nil
 }
 
 // ListActiveUpstreamAccounts returns the schedulable (status='active')
 // accounts of one provider, in deterministic id order — the routing layer's
 // account pool (设计 §8: 账号状态机；只有 active 账号可被调度).
+// concurrency_limit 0 的"备而不用"账号也在此返回,由路由层候选序排除
+// （orderAccountsWithQuota）。
 func (s *Store) ListActiveUpstreamAccounts(ctx context.Context, providerID string) ([]domain.UpstreamAccount, error) {
-	var rows []struct {
-		ID            string         `db:"id"`
-		ProviderID    string         `db:"provider_id"`
-		CredentialID  string         `db:"credential_id"`
-		ExternalID    string         `db:"external_account_id"`
-		DisplayName   string         `db:"display_name"`
-		Status        string         `db:"status"`
-		ConcLimit     int            `db:"concurrency_limit"`
-		QuotaLimit    sql.NullInt64  `db:"quota_limit_micros"`
-		QuotaRemain   sql.NullInt64  `db:"quota_remaining_micros"`
-		QuotaObserved *time.Time     `db:"quota_observed_at"`
-		QuotaSource   sql.NullString `db:"quota_source"`
-		QuotaReset    *time.Time     `db:"quota_reset_at"`
-		CreatedAt     time.Time      `db:"created_at"`
-		UpdatedAt     time.Time      `db:"updated_at"`
-	}
+	var rows []upstreamAccountRow
 	if err := s.db.SelectContext(ctx, &rows,
 		`SELECT * FROM inference_upstream_accounts
 		 WHERE provider_id = $1 AND status = 'active' ORDER BY id`, providerID); err != nil {
@@ -406,21 +402,108 @@ func (s *Store) ListActiveUpstreamAccounts(ctx context.Context, providerID strin
 	}
 	out := make([]domain.UpstreamAccount, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, domain.UpstreamAccount{
-			ID: r.ID, ProviderID: r.ProviderID, CredentialID: r.CredentialID,
-			ExternalAccountID: r.ExternalID, DisplayName: r.DisplayName,
-			Status: domain.UpstreamAccountStatus(r.Status), ConcurrencyLimit: r.ConcLimit,
-			Quota: domain.UpstreamQuota{
-				LimitMicros:     microFromNull(r.QuotaLimit),
-				RemainingMicros: microFromNull(r.QuotaRemain),
-				ObservedAt:      r.QuotaObserved,
-				Source:          strFromNull(r.QuotaSource),
-				ResetAt:         r.QuotaReset,
-			},
-			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		})
+		out = append(out, r.toDomain())
 	}
 	return out, nil
+}
+
+// upstreamAccountRow is the shared row shape for every upstream-account read
+// （命名行类型 + 映射方法,避免复制匿名结构体）.
+type upstreamAccountRow struct {
+	ID            string         `db:"id"`
+	ProviderID    string         `db:"provider_id"`
+	CredentialID  string         `db:"credential_id"`
+	ExternalID    string         `db:"external_account_id"`
+	DisplayName   string         `db:"display_name"`
+	Status        string         `db:"status"`
+	ConcLimit     int            `db:"concurrency_limit"`
+	QuotaLimit    sql.NullInt64  `db:"quota_limit_micros"`
+	QuotaRemain   sql.NullInt64  `db:"quota_remaining_micros"`
+	QuotaObserved *time.Time     `db:"quota_observed_at"`
+	QuotaSource   sql.NullString `db:"quota_source"`
+	QuotaReset    *time.Time     `db:"quota_reset_at"`
+	CreatedAt     time.Time      `db:"created_at"`
+	UpdatedAt     time.Time      `db:"updated_at"`
+}
+
+func (r upstreamAccountRow) toDomain() domain.UpstreamAccount {
+	return domain.UpstreamAccount{
+		ID: r.ID, ProviderID: r.ProviderID, CredentialID: r.CredentialID,
+		ExternalAccountID: r.ExternalID, DisplayName: r.DisplayName,
+		Status: domain.UpstreamAccountStatus(r.Status), ConcurrencyLimit: r.ConcLimit,
+		Quota: domain.UpstreamQuota{
+			LimitMicros:     microFromNull(r.QuotaLimit),
+			RemainingMicros: microFromNull(r.QuotaRemain),
+			ObservedAt:      r.QuotaObserved,
+			Source:          strFromNull(r.QuotaSource),
+			ResetAt:         r.QuotaReset,
+		},
+		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}
+}
+
+// GetUpstreamAccountByPair loads the account bound to (provider, credential)
+// — UNIQUE(provider_id, credential_id) 的配对读，供幂等创建在唯一键冲突后
+// 回读已存在账号视图。
+func (s *Store) GetUpstreamAccountByPair(ctx context.Context, providerID, credentialID string) (*domain.UpstreamAccount, error) {
+	var row upstreamAccountRow
+	err := s.db.GetContext(ctx, &row,
+		`SELECT * FROM inference_upstream_accounts WHERE provider_id = $1 AND credential_id = $2`,
+		providerID, credentialID)
+	if err != nil {
+		return nil, mapError("get upstream account by pair", err)
+	}
+	a := row.toDomain()
+	return &a, nil
+}
+
+// UpdateUpstreamAccountProfile applies the operator-editable fields
+// (display_name / concurrency_limit); nil leaves the column untouched.
+// 0 rows = unknown id (CodeNotFound).
+func (s *Store) UpdateUpstreamAccountProfile(ctx context.Context, id string, displayName *string, concurrencyLimit *int) error {
+	return updateUpstreamAccountProfile(ctx, s.db, id, displayName, concurrencyLimit)
+}
+
+// UpdateUpstreamAccountProfileTx is UpdateUpstreamAccountProfile inside an
+// open UnitOfWork — the caller commits it together with the audit row.
+func (s *Store) UpdateUpstreamAccountProfileTx(ctx context.Context, w domain.UnitOfWork, id string, displayName *string, concurrencyLimit *int) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	return updateUpstreamAccountProfile(ctx, tx, id, displayName, concurrencyLimit)
+}
+
+func updateUpstreamAccountProfile(ctx context.Context, ex sqlxExecutor, id string, displayName *string, concurrencyLimit *int) error {
+	res, err := ex.ExecContext(ctx,
+		`UPDATE inference_upstream_accounts
+		    SET display_name = COALESCE($2, display_name),
+		        concurrency_limit = COALESCE($3, concurrency_limit),
+		        updated_at = now()
+		  WHERE id = $1`,
+		id, displayName, concurrencyLimit)
+	if err != nil {
+		return mapError("update upstream account profile", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return mapError("update upstream account profile", sql.ErrNoRows)
+	}
+	return nil
+}
+
+// EndSessionBindingsForAccount terminates every live binding pointing at one
+// account (operator 停用账号的失效传播，非事务变体供顺序回退路径；生产库走
+// EndSessionBindingsForAccountTx 与状态翻转同事务).
+func (s *Store) EndSessionBindingsForAccount(ctx context.Context, accountID, reason string) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inference_session_bindings
+		    SET status = 'ended', ended_reason = $2, updated_at = now()
+		  WHERE account_id = $1 AND status = 'active'`,
+		accountID, reason)
+	if err != nil {
+		return 0, mapError("end session bindings for account", err)
+	}
+	return res.RowsAffected()
 }
 
 // --- nullable helpers -------------------------------------------------------

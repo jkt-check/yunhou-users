@@ -78,6 +78,7 @@
 | `models:manage` | `POST /admin/model-prices/preview`、`POST /admin/quota-policies/preview` | 价格/策略变更只读影响预览 |
 | `credentials:manage` | `POST/GET /admin/credentials*`、`POST /admin/credentials/:id/{rotate,test,status}` | 上游凭据生命周期（脱敏视图） |
 | `credentials:manage` | `POST /admin/oauth/authorizations`、`POST /admin/oauth/callback`、`POST /admin/oauth/credentials/:id/{revoke,refresh}`、`GET /admin/upstream-accounts` | OAuth 连接器授权/撤销/刷新、账号池 |
+| `credentials:manage` | `POST /admin/upstream-accounts`、`POST /admin/upstream-accounts/:id/status`、`PATCH /admin/upstream-accounts/:id` | 可调度账号：凭据→账号绑定（静态 key 接入最后一步，重复建 409+已存在视图）、启停（吊销恢复唯一入口，凭据 revoked 时禁激活）、调并发/显示名；写 + 审计同事务 |
 | `billing:adjust` | `POST /admin/wallet/adjustments`、`POST /admin/wallet/reversals`、`GET /admin/wallet/adjustments`、`GET /admin/wallet` | 补偿/冲正（幂等键 + 原因 + 同事务审计） |
 | `billing:adjust` | `GET/PUT /admin/payg-config` | PAYG 发布配置 |
 | `usage:read` | `GET /admin/model-usage/summary`、`GET /admin/model-usage/exceptions`、`GET /admin/upstream-accounts/shared`、`GET /admin/model-adjustments` | 运营统计/异常筛选/共享账号检测/补偿追踪 |

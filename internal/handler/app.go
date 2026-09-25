@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -149,6 +150,121 @@ func (h *AppHandler) writeAppAudit(c *gin.Context, action, appID, appName string
 	}
 }
 
+// unmaskSecret resolves one secret field during UpdateApp's config merge
+// (audit I-9). GET responses mask secret config values as redactedSecret
+// ("***", see redactAppConfigSecrets); a read-modify-write client that
+// PATCHes the masked document back must not silently overwrite the stored
+// secret with the sentinel. When the incoming value IS the sentinel we
+// preserve the stored value; a sentinel with no stored value to preserve
+// is a client error (400) rather than persisting a literal "***" that
+// would break the provider flow. Any non-sentinel value — including a
+// genuine new secret — passes through unchanged.
+func unmaskSecret(field, incoming, stored string) (string, error) {
+	if incoming != redactedSecret {
+		return incoming, nil
+	}
+	if stored == "" {
+		return "", fmt.Errorf("config %s is the masked sentinel %q but no stored value exists; send the real secret value", field, redactedSecret)
+	}
+	return stored, nil
+}
+
+// restoreMaskedAppConfigSecrets mirrors redactAppConfigSecrets field-for-
+// field: exactly the four secret-bearing config values the GET masking
+// rewrites get sentinel preservation on PATCH, and no other key. Non-
+// secret keys holding a literal "***" (e.g. brand.name) are written as-is
+// — only masked-secret keys are special.
+func restoreMaskedAppConfigSecrets(incoming, stored *model.AppConfig) error {
+	var storedPaypalSecret, storedWeChatPayKey, storedGitHubSecret, storedWeChatSecret string
+	if sp := stored.PaymentProviders; sp != nil {
+		if p := sp.Paypal; p != nil {
+			storedPaypalSecret = p.ClientSecret
+		}
+		if w := sp.WeChatPay; w != nil {
+			storedWeChatPayKey = w.APIv3Key
+		}
+	}
+	if so := stored.OAuthProviders; so != nil {
+		if g := so.GitHub; g != nil {
+			storedGitHubSecret = g.ClientSecret
+		}
+		if w := so.WeChat; w != nil {
+			storedWeChatSecret = w.AppSecret
+		}
+	}
+	if pp := incoming.PaymentProviders; pp != nil {
+		if p := pp.Paypal; p != nil {
+			v, err := unmaskSecret("payment_providers.paypal.client_secret", p.ClientSecret, storedPaypalSecret)
+			if err != nil {
+				return err
+			}
+			p.ClientSecret = v
+		}
+		if w := pp.WeChatPay; w != nil {
+			v, err := unmaskSecret("payment_providers.wechat_pay.api_v3_key", w.APIv3Key, storedWeChatPayKey)
+			if err != nil {
+				return err
+			}
+			w.APIv3Key = v
+		}
+	}
+	if op := incoming.OAuthProviders; op != nil {
+		if g := op.GitHub; g != nil {
+			v, err := unmaskSecret("oauth_providers.github.client_secret", g.ClientSecret, storedGitHubSecret)
+			if err != nil {
+				return err
+			}
+			g.ClientSecret = v
+		}
+		if w := op.WeChat; w != nil {
+			v, err := unmaskSecret("oauth_providers.wechat.app_secret", w.AppSecret, storedWeChatSecret)
+			if err != nil {
+				return err
+			}
+			w.AppSecret = v
+		}
+	}
+	return nil
+}
+
+// rejectMaskedSentinelAtCreate guards CreateApp: on create there is no
+// stored value a "***" sentinel could stand for, and validateAppConfig
+// would happily accept the literal as a real (wrong) secret, silently
+// breaking the provider flow. The sentinel is only meaningful on update.
+func rejectMaskedSentinelAtCreate(cfg *model.AppConfig) error {
+	check := func(field, v string) error {
+		if v == redactedSecret {
+			return fmt.Errorf("config %s must not be the masked sentinel %q on create; send the real secret value", field, redactedSecret)
+		}
+		return nil
+	}
+	if pp := cfg.PaymentProviders; pp != nil {
+		if p := pp.Paypal; p != nil {
+			if err := check("payment_providers.paypal.client_secret", p.ClientSecret); err != nil {
+				return err
+			}
+		}
+		if w := pp.WeChatPay; w != nil {
+			if err := check("payment_providers.wechat_pay.api_v3_key", w.APIv3Key); err != nil {
+				return err
+			}
+		}
+	}
+	if op := cfg.OAuthProviders; op != nil {
+		if g := op.GitHub; g != nil {
+			if err := check("oauth_providers.github.client_secret", g.ClientSecret); err != nil {
+				return err
+			}
+		}
+		if w := op.WeChat; w != nil {
+			if err := check("oauth_providers.wechat.app_secret", w.AppSecret); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // redactAppConfigSecrets returns a copy of app whose Config has every
 // server-side-only credential field masked. apps.config stores provider
 // secrets the server must read (paypal client_secret, oauth app secrets,
@@ -255,6 +371,13 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		}
 		if verr := validateAppConfig(&cfg); verr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": verr.Error()})
+			return
+		}
+		// On create there is no stored value a "***" sentinel could stand
+		// for — reject it rather than persist a literal sentinel as the
+		// app's real provider secret (audit I-9).
+		if serr := rejectMaskedSentinelAtCreate(&cfg); serr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": serr.Error()})
 			return
 		}
 		var merr error
@@ -388,6 +511,25 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 		var cfg model.AppConfig
 		if err := json.Unmarshal(*req.Config, &cfg); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid config: " + err.Error()})
+			return
+		}
+		// Sentinel preservation (audit I-9): recognize the GET masking
+		// sentinel on the four secret fields and keep the stored value
+		// instead of persisting "***" — otherwise a read-modify-write
+		// client silently clobbers the real secret. Must run BEFORE
+		// validateAppConfig so the preserved value satisfies the
+		// required-field checks. Mirror of redactAppConfigSecrets: only
+		// masked-secret keys are treated specially.
+		var storedCfg model.AppConfig
+		if len(app.Config) > 0 {
+			if err := json.Unmarshal(app.Config, &storedCfg); err != nil {
+				log.Printf("update app: stored config for %q not parseable: %v", id, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to load app"})
+				return
+			}
+		}
+		if err := restoreMaskedAppConfigSecrets(&cfg, &storedCfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 			return
 		}
 		if err := validateAppConfig(&cfg); err != nil {

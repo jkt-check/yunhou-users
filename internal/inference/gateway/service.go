@@ -117,6 +117,16 @@ type Service struct {
 	// reconciliation (计费不可静默丢失 — this hook is the alarm; cmd/server
 	// wires loud logging).
 	OnSettleError func(requestID string, err error)
+
+	// LifecycleGate selects observe (default) vs enforce for non-active
+	// model traffic (I-6, 见 lifecycle_gate.go 的两阶段上线说明).
+	LifecycleGate LifecycleGateMode
+	// OnLifecycleGateHit receives one observation per request that resolved
+	// to a non-active model. Default: structured LIFECYCLE_GATE_HIT log +
+	// management.AuditAlertHook (I-7 告警通道); 生产可覆写接 on-call。
+	// 与 AuditAlertHook 同契约:调用方保证非 nil、不 panic(panic 依
+	// OnSettleError 约定向上传播给 gin recovery)。
+	OnLifecycleGateHit func(ctx context.Context, p *domain.Principal, m *domain.Model, blocked bool, cause error)
 }
 
 // NewService builds the gateway. A nil clock uses the system clock (UTC).
@@ -302,6 +312,17 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	m, ok := snap.Model(req.Model)
 	if !ok {
 		return nil, domain.NewError(domain.CodeNotFound, "model "+req.Model+" not found")
+	}
+	// I-6:非 active 模型的直达治理(见 lifecycle_gate.go)。观察模式只记录
+	// +告警;强制模式对 retired/draft 在计量之前 403,零预占零计费。
+	if observe, blocked := lifecycleGateDecision(m.Lifecycle, s.LifecycleGate); observe {
+		cause := fmt.Errorf("model %q lifecycle=%s served via gateway (gate=%s)", m.ID, m.Lifecycle, s.LifecycleGate)
+		if blocked {
+			s.reportLifecycleGate(ctx, p, m, true, cause)
+			return nil, domain.NewError(domain.CodeModelNotAllowed,
+				"model "+m.ID+" is "+string(m.Lifecycle))
+		}
+		s.reportLifecycleGate(ctx, p, m, false, cause)
 	}
 	if !modelSpeaks(m, clientProto) {
 		return nil, domain.NewError(domain.CodeInvalidInput,

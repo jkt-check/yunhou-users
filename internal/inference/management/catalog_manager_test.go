@@ -645,12 +645,13 @@ func TestCatalogManager_RollbackActivationFailureLeavesNoOrphanDraft(t *testing.
 	}
 }
 
-// 安全审查 I-7：审计补写失败必须触发告警钩子（默认 AUDIT_WRITE_FAILED
+// 安全审查 I-7：审计补写失败必须触发告警钩子（默认 AUDIT_ALERT
 // 结构化 ERROR 日志，生产接 on-call 通道），携带正确的动作/对象/归因；操作
 // 结果本身不变——变更已提交是事实，审计缺失是告警而非可回滚状态。
 func TestCatalogManager_AuditFailureInvokesAlertHook(t *testing.T) {
 	fs := newFakeCatalogStore()
-	mgr := NewCatalogManager(catalog.NewService(fs), failingRecorder{err: errors.New("audit backend down")}, nil)
+	sentinel := errors.New("audit backend down")
+	mgr := NewCatalogManager(catalog.NewService(fs), failingRecorder{err: sentinel}, nil)
 	ctx := context.Background()
 
 	var alerts []AuditEvent
@@ -682,8 +683,8 @@ func TestCatalogManager_AuditFailureInvokesAlertHook(t *testing.T) {
 	if ev.ActorUser != "op-1" || ev.ActorApp != "ops" {
 		t.Errorf("alert attribution = %s/%s", ev.ActorUser, ev.ActorApp)
 	}
-	if len(causes) != 1 || causes[0] == nil {
-		t.Errorf("alert cause = %v, want the recorder error", causes)
+	if len(causes) != 1 || !errors.Is(causes[0], sentinel) {
+		t.Errorf("alert cause = %v, want wrap of recorder error (errors.Is)", causes)
 	}
 
 	// Publish 失败审计同样告警（catalog.publish 的 objectID 为空串是既定形状）。

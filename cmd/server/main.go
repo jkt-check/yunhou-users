@@ -377,6 +377,13 @@ func main() {
 	gatewaySvc := inferencegateway.NewService(
 		catalogCache, infStore, entitlementResolver, quotaSvc, routingSvc,
 		credSvc, gatewayHTTPClient, egressValidator, nil)
+	// I-6:非 active 模型直达治理。默认观察(结构化日志 + AuditAlertHook
+	// 告警,不拦截);存量排查确认影响面后经 INFERENCE_LIFECYCLE_ENFORCE=1
+	// 切强制(retired/draft → 403 model_not_allowed)。
+	if cfg.InferenceLifecycleEnforce {
+		gatewaySvc.LifecycleGate = inferencegateway.LifecycleGateEnforce
+		log.Printf("INFERENCE_LIFECYCLE_ENFORCE=1: gateway lifecycle gate in ENFORCE mode (retired/draft → 403)")
+	}
 	// Task 13: sticky-session binder wiring (Responses 会话链钉住上游账号;
 	// 失效显式迁移,绝不静默换号 — Task 12 binder 语义).
 	gatewaySvc.SetSessionBinder(inferencerouting.NewSessionBinder(infStore, nil))

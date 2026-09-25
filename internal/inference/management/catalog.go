@@ -10,6 +10,7 @@ package management
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/yunhou/users/internal/inference/catalog"
@@ -63,10 +64,12 @@ func firstReason(reason []string) string {
 //
 // 变更已先于审计提交（catalog.Service 无同事务审计面），因此审计写失败
 // 不对操作员谎报失败：审计缺失由 AuditAlertHook 响亮告警（默认
-// AUDIT_WRITE_FAILED 结构化 ERROR 日志，生产应接 on-call 通道——安全审查
+// AUDIT_ALERT 结构化 ERROR 日志，生产应接 on-call 通道——安全审查
 // I-7），操作本身照常返回——Publish/Rollback 返回错误会诱导重试产生重复
 // 修订（审查修复 Important-3）。这一契约是刻意的：变更已生效是事实，
-// 审计缺失是需要人工补录的告警，不是可回滚的状态。
+// 审计缺失是需要人工补录的告警，不是可回滚的状态；「需人工补录」语义封装
+// 在 cause 里，告警日志陈述始终属实（I-6 复用同一通道上报生命周期命中，
+// 不得谎报 AUDIT_WRITE_FAILED）。
 func (m *CatalogManager) record(ctx context.Context, actor, action, objectType, objectID, reason string, detail map[string]any) {
 	if m.recorder == nil {
 		return
@@ -77,7 +80,7 @@ func (m *CatalogManager) record(ctx context.Context, actor, action, objectType, 
 		ActorUser: userID, ActorApp: appID, Detail: SanitizeDetail(detail),
 	}
 	if err := m.recorder.Record(ctx, ev); err != nil {
-		AuditAlertHook(ctx, ev, err)
+		AuditAlertHook(ctx, ev, fmt.Errorf("变更已生效但审计缺失，需人工补录: %w", err))
 	}
 }
 

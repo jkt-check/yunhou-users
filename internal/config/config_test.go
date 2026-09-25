@@ -1315,3 +1315,28 @@ func TestLoad_DashboardAppIDs(t *testing.T) {
 		}
 	})
 }
+
+// I-6:生命周期门开关默认观察(关闭),仅 INFERENCE_LIFECYCLE_ENFORCE=1 切强制。
+func TestLoad_LifecycleEnforce(t *testing.T) {
+	orig, had := os.LookupEnv("INFERENCE_LIFECYCLE_ENFORCE")
+	os.Unsetenv("INFERENCE_LIFECYCLE_ENFORCE")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("INFERENCE_LIFECYCLE_ENFORCE", orig)
+		} else {
+			os.Unsetenv("INFERENCE_LIFECYCLE_ENFORCE")
+		}
+	})
+
+	if Load().InferenceLifecycleEnforce {
+		t.Error("unset: want observe mode (false)")
+	}
+	t.Setenv("INFERENCE_LIFECYCLE_ENFORCE", "1")
+	if !Load().InferenceLifecycleEnforce {
+		t.Error(`"1": want enforce mode (true)`)
+	}
+	t.Setenv("INFERENCE_LIFECYCLE_ENFORCE", "true")
+	if Load().InferenceLifecycleEnforce {
+		t.Error(`"true" is not the accepted spelling; only "1" enables enforce`)
+	}
+}

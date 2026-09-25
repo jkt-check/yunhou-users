@@ -105,6 +105,18 @@ type Config struct {
 	RelayWSURL            string   // 可选:覆盖 /relay/ticket 返回的 ws_url(空 = 按请求 Host 推导)
 	AppEnv                string   // metrics env label + mock/backdoor production gate; default "prod" (see IsProductionEnv)
 
+	// DashboardAppIDs is the allowlist of app IDs permitted to use the
+	// dashboard 运营 surface (/admin/ops/metrics, /admin/users/* — user
+	// search returning email PII and VIP write endpoints). Sourced from
+	// DASHBOARD_APP_IDS (comma-separated). Fail closed: cmd/server refuses
+	// to start when the list is empty (a loud startup failure is easier to
+	// diagnose than a dashboard silently 403ing for deploy-history
+	// reasons), and middleware.DashboardAllowlist denies every app when
+	// the list is empty as defence in depth for callers that mount the
+	// router without main's startup gate (audit I-2). Enforcement lives on
+	// the router's dashboard group.
+	DashboardAppIDs []string
+
 	// Payment channel webhook secrets. Loaded but not strictly required
 	// at startup — if a channel's secret is empty, webhooks for that channel
 	// return 404 (signature verifier is nil for that channel). Operators
@@ -272,6 +284,8 @@ func Load() *Config {
 		RelayAllowedOrigins:   splitCSV(os.Getenv("RELAY_ALLOWED_ORIGINS")),
 		RelayWSURL:            os.Getenv("RELAY_WS_URL"),
 		AppEnv:                envOr("APP_ENV", "prod"),
+
+		DashboardAppIDs: splitCSV(os.Getenv("DASHBOARD_APP_IDS")),
 
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
 		WeChatAPIv3Key:      os.Getenv("WECHAT_PAY_API_V3_KEY"),

@@ -229,17 +229,18 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		nil,      // chatSvc
 		nil,      // chatAccessLog
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
-		false, // wechatOAuthMock
-		false, // wechatPayMock
-		"dev", // appEnv — non-production, so /test/login may mount
-		nil,   // usageSvc
-		nil,   // adminModelsHandler
-		nil,   // adminOps
-		nil,   // accessOps
-		nil,   // llmUsageSvc
-		nil,   // relayHandler
-		nil,   // adminOpsSvc
-		nil,   // adminUsersSvc
+		false,               // wechatOAuthMock
+		false,               // wechatPayMock
+		"dev",               // appEnv — non-production, so /test/login may mount
+		nil,                 // usageSvc
+		nil,                 // adminModelsHandler
+		nil,                 // adminOps
+		nil,                 // accessOps
+		nil,                 // llmUsageSvc
+		nil,                 // relayHandler
+		nil,                 // adminOpsSvc
+		nil,                 // adminUsersSvc
+		[]string{"yundash"}, // dashboardAppIDs — 白名单非空即可,Routes() 自省不触达中间件
 	)
 
 	routes := engine.Routes()
@@ -384,17 +385,18 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		nil,      // chatSvc
 		nil,      // chatAccessLog
 		nil, nil, // githubOAuthSvc, wechatOAuthSvc
-		false, // wechatOAuthMock
-		false, // wechatPayMock
-		"dev", // appEnv — non-production, so /test/login may mount
-		nil,   // usageSvc
-		nil,   // adminModelsHandler
-		nil,   // adminOps
-		nil,   // accessOps
-		nil,   // llmUsageSvc
-		nil,   // relayHandler
-		nil,   // adminOpsSvc
-		nil,   // adminUsersSvc
+		false,               // wechatOAuthMock
+		false,               // wechatPayMock
+		"dev",               // appEnv — non-production, so /test/login may mount
+		nil,                 // usageSvc
+		nil,                 // adminModelsHandler
+		nil,                 // adminOps
+		nil,                 // accessOps
+		nil,                 // llmUsageSvc
+		nil,                 // relayHandler
+		nil,                 // adminOpsSvc
+		nil,                 // adminUsersSvc
+		[]string{"yundash"}, // dashboardAppIDs — 白名单非空即可,Routes() 自省不触达中间件
 	)
 
 	for _, r := range engine.Routes() {
@@ -429,17 +431,18 @@ func TestSetup_TestLoginRefusedUnderProductionEnv(t *testing.T) {
 			nil,      // chatSvc
 			nil,      // chatAccessLog
 			nil, nil, // githubOAuthSvc, wechatOAuthSvc
-			false,  // wechatOAuthMock
-			false,  // wechatPayMock
-			appEnv, // production signal — /test/login must stay unmounted
-			nil,    // usageSvc
-			nil,    // adminModelsHandler
-			nil,    // adminOps
-			nil,    // accessOps
-			nil,    // llmUsageSvc
-			nil,    // relayHandler
-			nil,    // adminOpsSvc
-			nil,    // adminUsersSvc
+			false,               // wechatOAuthMock
+			false,               // wechatPayMock
+			appEnv,              // production signal — /test/login must stay unmounted
+			nil,                 // usageSvc
+			nil,                 // adminModelsHandler
+			nil,                 // adminOps
+			nil,                 // accessOps
+			nil,                 // llmUsageSvc
+			nil,                 // relayHandler
+			nil,                 // adminOpsSvc
+			nil,                 // adminUsersSvc
+			[]string{"yundash"}, // dashboardAppIDs
 		)
 
 		for _, r := range engine.Routes() {
@@ -481,6 +484,7 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 		handler.NewRelayHandler(nil), // relayHandler 非 nil = relay 启用
 		nil,                          // adminOpsSvc
 		nil,                          // adminUsersSvc
+		[]string{"yundash"},          // dashboardAppIDs
 	)
 
 	have := make(map[string]bool)

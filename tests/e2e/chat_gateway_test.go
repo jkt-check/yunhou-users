@@ -163,7 +163,8 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 		tokenSvc, authSvc, nil, nil, nil,
 		&middleware.MultiChannelVerifier{}, nil,
 		nil, nil, chatSvc, nil, nil, nil, false, false, "e2e",
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil)
+		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil,
+		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 }
 
 // setupChatE2E builds the engine in LEGACY mode: a real ChatService pointed

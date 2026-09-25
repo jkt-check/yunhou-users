@@ -1279,3 +1279,39 @@ func TestValidate_LLMCatalog(t *testing.T) {
 		}
 	})
 }
+
+// TestLoad_DashboardAppIDs covers the audit-I-2 allowlist parsing:
+// comma-separated env, whitespace trimming, empty items dropped, and an
+// unset env yielding a nil (empty) list — the value the cmd/server
+// startup gate refuses to run with.
+func TestLoad_DashboardAppIDs(t *testing.T) {
+	orig, had := os.LookupEnv("DASHBOARD_APP_IDS")
+	os.Unsetenv("DASHBOARD_APP_IDS")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("DASHBOARD_APP_IDS", orig)
+		} else {
+			os.Unsetenv("DASHBOARD_APP_IDS")
+		}
+	})
+
+	t.Run("unset yields empty list", func(t *testing.T) {
+		if got := Load().DashboardAppIDs; len(got) != 0 {
+			t.Errorf("unset: got %v, want empty", got)
+		}
+	})
+
+	t.Run("csv parsed with trimming", func(t *testing.T) {
+		t.Setenv("DASHBOARD_APP_IDS", " yundash , yundian ,, ")
+		got := Load().DashboardAppIDs
+		want := []string{"yundash", "yundian"}
+		if len(got) != len(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("index %d: got %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+}

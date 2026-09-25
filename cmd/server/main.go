@@ -60,6 +60,14 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config validation failed: %v", err)
 	}
+	// Dashboard 运营面白名单(audit I-2):空名单 = 缺省拒启。刻意放在
+	// Validate 之外、与 PAYPAL_ENV 检查同级的部署级门禁:若只在请求期
+	// fail closed,dashboard 会因部署历史深处的原因静默 403;启动时响亮
+	// 失败更容易诊断。DashboardAllowlist 对空名单同样拒一切,为绕过
+	// 本检查的 router 挂载(测试/替代 main)提供纵深防御。
+	if len(cfg.DashboardAppIDs) == 0 {
+		log.Fatalf("DASHBOARD_APP_IDS is required: comma-separated app IDs permitted to use the dashboard ops surface (/admin/ops/*, /admin/users/*); refusing to start with an empty allowlist (fail closed, audit I-2)")
+	}
 
 	// WeChat Pay client: real mode loads cert + key from disk and builds a
 	// Signer + Client. Mock mode skips both file loads and returns a
@@ -576,7 +584,8 @@ func main() {
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
 		cfg.WeChatOAuthMock, cfg.WeChatPayMock, cfg.AppEnv, usageSvc, adminModelsHandler, adminOps, accessOps,
-		service.NewLLMUsageService(llmUsageRepo), relayHandler, adminOpsSvc, adminUsersSvc)
+		service.NewLLMUsageService(llmUsageRepo), relayHandler, adminOpsSvc, adminUsersSvc,
+		cfg.DashboardAppIDs)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

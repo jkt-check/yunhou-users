@@ -53,6 +53,12 @@ func Setup(
 	relayHandler *handler.RelayHandler,
 	adminOpsSvc *service.AdminOpsService,
 	adminUsersSvc *service.AdminUsersService,
+	// dashboardAppIDs is cfg.DashboardAppIDs: the allowlist of app IDs
+	// permitted to use the dashboard 运营 surface below (audit I-2). An
+	// empty list denies every app (fail closed) — cmd/server refuses to
+	// start without DASHBOARD_APP_IDS, and this middleware is the defence-
+	// in-depth gate for router mounts that bypass the startup check.
+	dashboardAppIDs []string,
 ) {
 	// Health check
 	healthHandler := handler.NewHealthHandler(healthPinger)
@@ -292,13 +298,18 @@ func Setup(
 		adminGroup.GET("/stats/llm-usage", llmUsageHandler.GetByModel)
 
 		// Dashboard 运营 API(dashboard-admin-api spec):运营指标、用户
-		// 搜索/详情、VIP 加时长。与 /admin/stats/* 同一条 InternalAppAuth
-		// 链(任何持有效 app secret 的内部服务可调);不挂 opsGroup——那是
-		// inference catalog 的 operator JWT 体系,与本组端点无关。
-		adminGroup.GET("/ops/metrics", adminOpsHandler.GetMetrics)
-		adminGroup.GET("/users/search", adminUsersHandler.SearchUsers)
-		adminGroup.GET("/users/:id", adminUsersHandler.GetUser)
-		adminGroup.POST("/users/:id/vip", adminUsersHandler.AddVip)
+		// 搜索/详情、VIP 加时长。挂在 InternalAppAuth 链内的一个子组,
+		// 外加 DashboardAllowlist(audit I-2):仅 DASHBOARD_APP_IDS 白名单
+		// 内的 app 可用 —— 否则任一持有效 app secret 的内部服务都能读
+		// 邮箱 PII / 写 VIP。白名单为空 = 全部 403(fail closed),cmd/server
+		// 在启动时即以空名单拒启。审计归因沿用 admin:<appID>(见
+		// adminActorID);按人归因需 dashboard 鉴权改造,不在本次范围。
+		dashboardGroup := adminGroup.Group("")
+		dashboardGroup.Use(middleware.DashboardAllowlist(dashboardAppIDs))
+		dashboardGroup.GET("/ops/metrics", adminOpsHandler.GetMetrics)
+		dashboardGroup.GET("/users/search", adminUsersHandler.SearchUsers)
+		dashboardGroup.GET("/users/:id", adminUsersHandler.GetUser)
+		dashboardGroup.POST("/users/:id/vip", adminUsersHandler.AddVip)
 	}
 
 	// Payment routes (JWT auth, user-scoped).

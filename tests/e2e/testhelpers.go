@@ -289,6 +289,10 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		// wechat mocks, which config.Validate refuses under a production
 		// APP_ENV (default "prod").
 		AppEnv: "e2e",
+		// Dashboard 运营面白名单(audit I-2):dashboard 端点以 superAppID
+		// (yundian)与 yundash 双 app 互证(admin_users_test.go 幂等键
+		// 按 app 隔离用例)。
+		DashboardAppIDs: []string{"yundian", "yundash"},
 	}
 
 	// Repos
@@ -351,7 +355,8 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		cfg.DashboardAppIDs)
 
 	return engine, nil, db
 }
@@ -395,6 +400,10 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		// wechat mocks, which config.Validate refuses under a production
 		// APP_ENV (default "prod").
 		AppEnv: "e2e",
+		// Dashboard 运营面白名单(audit I-2):dashboard 端点以 superAppID
+		// (yundian)与 yundash 双 app 互证(admin_users_test.go 幂等键
+		// 按 app 隔离用例)。
+		DashboardAppIDs: []string{"yundian", "yundash"},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("config validate: %v", err)
@@ -444,7 +453,8 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		cfg.DashboardAppIDs)
 
 	return &E2EServer{
 		Engine:             engine,
@@ -626,6 +636,10 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		// wechat mocks, which config.Validate refuses under a production
 		// APP_ENV (default "prod").
 		AppEnv: "e2e",
+		// Dashboard 运营面白名单(audit I-2):dashboard 端点以 superAppID
+		// (yundian)与 yundash 双 app 互证(admin_users_test.go 幂等键
+		// 按 app 隔离用例)。
+		DashboardAppIDs: []string{"yundian", "yundash"},
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -715,7 +729,8 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		cfg.DashboardAppIDs)
 
 	alipayPrivHolder.Store(alipayPriv)
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/middleware"
@@ -40,6 +41,10 @@ func Setup(
 	wechatOAuthSvc *service.WeChatOAuthService,
 	wechatOAuthMock bool,
 	wechatPayMock bool,
+	// appEnv is cfg.AppEnv: the production signal gating the dev-only
+	// /test/login route. Anything not in config's non-production allowlist
+	// (including the "prod" default) keeps the route unmounted.
+	appEnv string,
 	usageSvc *service.UsageService,
 	adminModelsHandler *httpapi.AdminModelsHandler,
 	adminOps *httpapi.AdminOps,
@@ -86,12 +91,14 @@ func Setup(
 	wechatOAuthGroup := engine.Group("/auth/wechat", publicLimiter)
 	handler.RegisterWeChatOAuthRoutes(wechatOAuthGroup, wechatOAuthSvc, appRepo, authSvc, wechatOAuthMock)
 	// Dev-only login endpoint for the L3 e2e-ui suite. The route is only
-	// registered when PAYPAL_L3_E2E_MODE=1 — anywhere else the path does not
-	// exist at all, so a stray env line in a production .env is the ONLY way
-	// to expose it, and config.Validate hard-fails when that combines with
-	// PAYPAL_ENV=live. The handler keeps its own env check as defence in
-	// depth. Mounted behind the public limiter for rate-limit friction.
-	if os.Getenv("PAYPAL_L3_E2E_MODE") == "1" {
+	// registered when PAYPAL_L3_E2E_MODE=1 AND APP_ENV is a non-production
+	// value — anywhere else the path does not exist at all, so a stray env
+	// line in a production .env is the ONLY way to expose it, and
+	// config.Validate hard-fails when that combines with a production
+	// APP_ENV (the primary signal, independent of PAYPAL_ENV — audit C-1)
+	// or PAYPAL_ENV=live. The handler keeps its own env check as defence
+	// in depth. Mounted behind the public limiter for rate-limit friction.
+	if os.Getenv("PAYPAL_L3_E2E_MODE") == "1" && !config.IsProductionEnv(appEnv) {
 		engine.POST("/test/login", publicLimiter, authHandler.TestLogin)
 	}
 

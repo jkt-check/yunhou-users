@@ -575,7 +575,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, usageSvc, adminModelsHandler, adminOps, accessOps,
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, cfg.AppEnv, usageSvc, adminModelsHandler, adminOps, accessOps,
 		service.NewLLMUsageService(llmUsageRepo), relayHandler, adminOpsSvc, adminUsersSvc)
 
 	srv := &http.Server{

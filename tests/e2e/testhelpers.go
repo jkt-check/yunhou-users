@@ -285,6 +285,10 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		SweeperInterval:        1 * time.Minute,
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
+		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
+		// wechat mocks, which config.Validate refuses under a production
+		// APP_ENV (default "prod").
+		AppEnv: "e2e",
 	}
 
 	// Repos
@@ -347,7 +351,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
 
 	return engine, nil, db
 }
@@ -387,6 +391,10 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		SweeperInterval:        1 * time.Minute,
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
+		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
+		// wechat mocks, which config.Validate refuses under a production
+		// APP_ENV (default "prod").
+		AppEnv: "e2e",
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("config validate: %v", err)
@@ -436,7 +444,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
 
 	return &E2EServer{
 		Engine:             engine,
@@ -614,6 +622,10 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		SweeperInterval:        1 * time.Minute,
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
+		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
+		// wechat mocks, which config.Validate refuses under a production
+		// APP_ENV (default "prod").
+		AppEnv: "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -703,7 +715,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)))
 
 	alipayPrivHolder.Store(alipayPriv)
 

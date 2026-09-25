@@ -62,6 +62,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     1 * time.Minute,
 		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		AppEnv:              "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -127,12 +128,14 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
-	// Last two args: wechatOAuthMock=true, wechatPayMock=true.
+	// Last args: wechatOAuthMock=true, wechatPayMock=true, appEnv="e2e"
+	// (non-production signal — the mock switches refuse to arm under a
+	// production APP_ENV).
 	router.Setup(setupCtx, engine, db,
 		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil)
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil)
 
 	alipayPrivHolder.Store(alipayPriv)
 

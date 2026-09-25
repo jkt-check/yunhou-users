@@ -91,6 +91,7 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
 		InferenceRecoveryGrace: 15 * time.Minute,
 		InferenceAccountRPM:    120,
+		AppEnv:                 "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -261,7 +262,7 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 		service.NewChatService(nil, subRepo, planRepo, repo.NewLLMUsageRepo(db)), nil,
 		service.NewGitHubOAuthService(cfg.OAuthStateSecret),
 		service.NewWeChatOAuthService(cfg.OAuthStateSecret),
-		false, true, /* wechatPayMock */
+		false, true, "e2e", /* wechatPayMock, appEnv */
 		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil)
 
 	// 在售商品 + 支付/权益配置（029 快照源）。

@@ -138,6 +138,7 @@ func chatE2EBase(t *testing.T) (*sqlx.DB, *service.TokenService, *service.AuthSe
 		OrderExpiryDuration: 30 * time.Minute,
 		SweeperInterval:     time.Minute,
 		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		AppEnv:              "e2e",
 	}
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
@@ -161,7 +162,7 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 		repo.NewPlanRepo(db), repo.NewSubscriptionRepo(db), repo.NewSessionRepo(db),
 		tokenSvc, authSvc, nil, nil, nil,
 		&middleware.MultiChannelVerifier{}, nil,
-		nil, nil, chatSvc, nil, nil, nil, false, false,
+		nil, nil, chatSvc, nil, nil, nil, false, false, "e2e",
 		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil)
 }
 

@@ -7,8 +7,9 @@
 //     任务 400，一行不写（绝不半发布）。不存在"只发布有效子集"的隐式
 //     路径；运营要导入子集就删掉错误项重新提交（新 task_id）。
 //   - 幂等任务 ID：commit 与目录写入同一事务，inference_bulk_imports 的
-//     task_id 唯一键兜底；重复提交重放已记录的结果（replayed=true），
-//     不重复创建。
+//     task_id 唯一键兜底；同文档重复提交重放已记录的结果（replayed=true），
+//     不重复创建；同 task_id 异文档是键复用 → 409（M-4，migration 039
+//     document_hash 比对，与 wallet adjustments 同键异载荷同口径）。
 //   - 大小上限：条目总数 ≤ MaxBulkImportItems（防御性上限；HTTP 层另有
 //     全局 1 MiB body 上限）。
 //   - 落库即草稿：providers/models/deployments 均以 draft 进入（模型默认
@@ -19,6 +20,9 @@ package management
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -114,7 +118,9 @@ type BulkItemResult struct {
 
 // BulkImportResult is the assembled result of one import run (dry-run or
 // committed). Committed results are persisted (inference_bulk_imports) and
-// replayed verbatim on task_id resubmission.
+// replayed verbatim on task_id resubmission — but ONLY when the resubmitted
+// document hashes to the same digest the task row recorded (migration 039,
+// M-4): same task_id + different document is caller task_id reuse, 409.
 type BulkImportResult struct {
 	TaskID    string           `json:"task_id"`
 	DryRun    bool             `json:"dry_run"`
@@ -125,6 +131,29 @@ type BulkImportResult struct {
 	Inserted int `json:"inserted"`
 	Skipped  int `json:"skipped"`
 	Errors   int `json:"errors"`
+	// DocumentHash is the sha256 digest of the committed document
+	// (BulkDocumentHash). Populated on replay reads; compared against the
+	// incoming document before a stored result may be replayed. Never
+	// serialized — internal integrity metadata only.
+	DocumentHash string `json:"-"`
+}
+
+// BulkDocumentHash is the canonical digest of an import document, recorded
+// on the task row at commit time and re-checked on replay. json.Marshal of
+// the struct is deterministic (no maps in the document shape), so the same
+// logical document always hashes identically regardless of request wire
+// formatting (key order, whitespace). The write path (postgres
+// ApplyBulkImportTx) and the replay check both call THIS function — one
+// computation, no drift.
+func BulkDocumentHash(doc *BulkCatalog) string {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		// BulkCatalog is marshal-able by construction; a failure here is a
+		// programmer error, not caller input. Panic surfaces it in tests.
+		panic("bulk import: marshal document for hash: " + err.Error())
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // HasErrors reports whether any item failed validation/resolution.
@@ -334,8 +363,14 @@ func (s *BulkImportService) Import(ctx context.Context, actor, taskID string, do
 		return res, nil
 	}
 
-	// 幂等重放快速路径：任务已提交过则原样返回已记录结果。
+	// 幂等重放快速路径：任务已提交过则原样返回已记录结果——但仅当
+	// 重放文档与任务行记录的摘要用同一函数算出一致（migration 039，M-4）；
+	// 同 task_id 异文档是调用方键复用，409，不得静默返回旧任务的结果。
+	docHash := BulkDocumentHash(doc)
 	if stored, err := s.store.GetBulkImportByTaskID(ctx, taskID); err == nil {
+		if err := checkReplayDocument(taskID, stored, docHash); err != nil {
+			return nil, err
+		}
 		stored.Replayed = true
 		return stored, nil
 	} else if domain.CodeOf(err) != domain.CodeNotFound {
@@ -350,11 +385,15 @@ func (s *BulkImportService) Import(ctx context.Context, actor, taskID string, do
 	if err != nil {
 		_ = uow.Rollback(ctx)
 		if domain.CodeOf(err) == domain.CodeConflict {
-			// 并发撞 task_id：赢家已提交（或即将），重读已记录结果。
+			// 并发撞 task_id：赢家已提交（或即将），重读已记录结果——
+			// 与快速路径同一摘要校验（并发重放不同文档同样是键复用）。
 			stored, rerr := s.store.GetBulkImportByTaskID(ctx, taskID)
 			if rerr != nil {
 				return nil, domain.WrapError(domain.CodeConflict,
 					"bulk import: task_id committed concurrently; re-read failed", rerr)
+			}
+			if err := checkReplayDocument(taskID, stored, docHash); err != nil {
+				return nil, err
 			}
 			stored.Replayed = true
 			return stored, nil
@@ -388,6 +427,20 @@ func (s *BulkImportService) Import(ctx context.Context, actor, taskID string, do
 	}
 	committed.Committed = true
 	return committed, nil
+}
+
+// checkReplayDocument gates replay of a committed task: the stored digest
+// must match the incoming document's digest. Empty stored digest means a
+// pre-039 legacy row — no digest was recorded, replay as before (mirrors the
+// admin idempotency request_hash NULL rule). A recorded digest that differs
+// is caller task_id reuse, not a benign retry → 409 (aligned with the
+// wallet-adjustments / VIP payload-mismatch surfaces).
+func checkReplayDocument(taskID string, stored *BulkImportResult, docHash string) error {
+	if stored.DocumentHash == "" || stored.DocumentHash == docHash {
+		return nil
+	}
+	return domain.NewError(domain.CodeConflict,
+		"bulk import: task_id "+taskID+" already committed with a different document")
 }
 
 // markExisting annotates dry-run items with the would_skip status by probing

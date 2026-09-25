@@ -8,8 +8,8 @@
 //   - dry_run=true → 逐项预演（would_insert/would_skip/error），一行不写；
 //     部分错误的预览只存在于 dry-run。
 //   - dry_run=false → 全部有效才落库（任一 error → 400 + 逐项错误，一行
-//     不写——绝不半发布）；task_id 幂等（重复提交 200 + replayed=true，
-//     不重复创建）。
+//     不写——绝不半发布）；task_id 幂等（同文档重复提交 200 + replayed=true，
+//     不重复创建；异文档同 task_id → 409，M-4）。
 //   - 落库即草稿；发布走既有 POST /admin/catalog/publish。
 
 package httpapi

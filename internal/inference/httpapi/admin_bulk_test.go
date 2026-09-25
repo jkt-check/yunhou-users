@@ -274,9 +274,9 @@ func TestAdminBulkImport_HTTPFlow(t *testing.T) {
 		t.Fatalf("audit attribution = %s/%s/%s", actorUser, actorApp, action)
 	}
 
-	// 重放：同 task_id（哪怕文档不同）→ 200 replayed，行数不变。
-	replayBody := map[string]any{"task_id": "imp-http-1",
-		"providers": []map[string]any{{"code": "other", "display_name": "O", "access_type": "official_api"}}}
+	// 重放：同 task_id 同文档 → 200 replayed，行数不变。
+	replayBody := bulkDoc()
+	replayBody["task_id"] = "imp-http-1"
 	env = doH(t, f.engine, http.MethodPost, "/adminm/catalog/bulk-import", replayBody, http.StatusOK, f.headers(op))
 	var replayed struct {
 		Replayed bool `json:"replayed"`
@@ -290,6 +290,14 @@ func TestAdminBulkImport_HTTPFlow(t *testing.T) {
 	}
 	if n := tableCount(t, f, "inference_providers"); n != 1 {
 		t.Fatalf("replay created rows: providers = %d", n)
+	}
+
+	// M-4：同 task_id 不同文档 → 409（task_id 复用，不是良性重试）。
+	conflictBody := map[string]any{"task_id": "imp-http-1",
+		"providers": []map[string]any{{"code": "other", "display_name": "O", "access_type": "official_api"}}}
+	doH(t, f.engine, http.MethodPost, "/adminm/catalog/bulk-import", conflictBody, http.StatusConflict, f.headers(op))
+	if n := tableCount(t, f, "inference_providers"); n != 1 {
+		t.Fatalf("mismatch replay created rows: providers = %d", n)
 	}
 
 	// 导入→草稿→发布：catalog publish 成功且发布不翻生命周期（仍是草稿，

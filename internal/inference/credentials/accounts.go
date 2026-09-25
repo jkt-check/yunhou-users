@@ -134,6 +134,31 @@ func (s *AccountService) runAtomicAccounts(ctx context.Context, fn func(w domain
 	return true, nil
 }
 
+// assertCredentialActiveTx re-checks the bound credential's status FOR
+// UPDATE inside the current UnitOfWork (审查修复 I-5). The pre-tx read is
+// only an early-exit optimization — a revoke landing between the pre-check
+// and the commit would otherwise reactivate an account on a revoked
+// credential. The FOR UPDATE read serializes with revoke/restore (both
+// UPDATE the same row): either ordering ends consistent (revoke first →
+// this 409s and the whole tx rolls back; activate first → the revoke
+// cascade disables the account right after). Stores without the lock
+// interface keep the pre-tx check as their only guard.
+func (s *AccountService) assertCredentialActiveTx(ctx context.Context, w domain.UnitOfWork, credID string) error {
+	cl, ok := s.store.(credentialLockTx)
+	if !ok {
+		return nil
+	}
+	fresh, err := cl.GetCredentialForUpdateTx(ctx, w, credID)
+	if err != nil {
+		return err
+	}
+	if fresh.Status == "revoked" {
+		return domain.NewError(domain.CodeConflict,
+			"credential is revoked; restore the credential before reactivating its account")
+	}
+	return nil
+}
+
 func accountAuditEvent(op Operator, action, objectID, reason string, detail map[string]any) management.AuditEvent {
 	return management.AuditEvent{
 		Action:     action,
@@ -320,6 +345,30 @@ func (s *AccountService) SetStatus(ctx context.Context, op Operator, id, status,
 				return nil, domain.NewError(domain.CodeConflict,
 					"credential is revoked; restore the credential before reactivating its account")
 			}
+			noopDetail := map[string]any{
+				"from": string(from), "to": string(to),
+				"credential_id": account.CredentialID, "provider_id": account.ProviderID,
+				"noop": true,
+			}
+			// 审查修复 I-5: 事务内持行锁复查凭据（与 Create 同模式）。
+			// 预检与审计提交之间存在竞态窗口——凭据在预检后、审计前被
+			// 吊销会留下"账号 active + 凭据 revoked"的稳态;FOR UPDATE 复查
+			// 与并发吊销 UPDATE 同一行互斥,两种定序都一致。
+			if ran, err := s.runAtomicAccounts(ctx, func(w domain.UnitOfWork) error {
+				if err := s.assertCredentialActiveTx(ctx, w, account.CredentialID); err != nil {
+					return err
+				}
+				return s.audit.(TxRecorder).RecordTx(ctx, w, accountAuditEvent(op, "upstream_account.status", id, reason, noopDetail))
+			}); ran {
+				if err != nil {
+					return nil, err
+				}
+				return account, nil
+			}
+			if err := s.recordAccount(ctx, op, "upstream_account.status", id, reason, noopDetail); err != nil {
+				return nil, err
+			}
+			return account, nil
 		}
 		if err := s.recordAccount(ctx, op, "upstream_account.status", id, reason, map[string]any{
 			"from": string(from), "to": string(to),
@@ -377,6 +426,16 @@ func (s *AccountService) SetStatus(ctx context.Context, op Operator, id, status,
 		return nil
 	}
 	if ran, err := s.runAtomicAccounts(ctx, func(w domain.UnitOfWork) error {
+		if to == domain.AccountActive {
+			// 审查修复 I-5: 凭据 revoked 复查必须在事务内完成——预检
+			// （下方）与状态写入之间存在竞态窗口，凭据在两者之间被吊销
+			// 会提交出"账号 active + 凭据 revoked"。GetCredentialForUpdateTx
+			// 与并发吊销 UPDATE 同一行互斥，先吊销→这里见 revoked 409 整体
+			// 回滚；先激活→吊销级联随后停用本账号，两种定序都一致。
+			if err := s.assertCredentialActiveTx(ctx, w, account.CredentialID); err != nil {
+				return err
+			}
+		}
 		ts := s.store.(AccountTxStore)
 		var ended []string
 		err := apply(

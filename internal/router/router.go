@@ -21,6 +21,7 @@ func Setup(
 	engine *gin.Engine,
 	healthPinger handler.Pinger,
 	appRepo repo.AppRepo,
+	auditLogRepo repo.AuditLogRepo,
 	userRepo repo.UserRepo,
 	identityRepo repo.SocialIdentityRepo,
 	planRepo repo.PlanRepo,
@@ -66,7 +67,7 @@ func Setup(
 
 	// Handlers
 	authHandler := handler.NewAuthHandler(authSvc, tokenSvc)
-	appHandler := handler.NewAppHandler(appRepo, providerTokenSvc)
+	appHandler := handler.NewAppHandler(appRepo, providerTokenSvc, auditLogRepo)
 	subHandler := handler.NewSubscriptionHandler(subSvc)
 	planHandler := handler.NewPlanHandler(planSvc, appRepo, quoteSvc)
 	userHandler := handler.NewUserHandler(userRepo, identityRepo)

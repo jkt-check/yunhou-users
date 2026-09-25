@@ -158,7 +158,7 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 	tokenSvc *service.TokenService, authSvc *service.AuthService,
 	chatSvc *service.ChatService, accessOps *httpapi.AccessOps) {
 	router.Setup(ctx, engine, db,
-		repo.NewAppRepo(db), repo.NewUserRepo(db), repo.NewSocialIdentityRepo(db),
+		repo.NewAppRepo(db), repo.NewAuditLogRepo(db), repo.NewUserRepo(db), repo.NewSocialIdentityRepo(db),
 		repo.NewPlanRepo(db), repo.NewSubscriptionRepo(db), repo.NewSessionRepo(db),
 		tokenSvc, authSvc, nil, nil, nil,
 		&middleware.MultiChannelVerifier{}, nil,

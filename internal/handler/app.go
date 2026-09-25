@@ -40,13 +40,28 @@ type AppRepoInterface interface {
 	RotateSecretHash(ctx context.Context, appID, newHash string) error
 }
 
+// AuditLogWriter is the subset of repo.AuditLogRepo the app handler uses
+// to record admin mutations. Defined here so handler tests can inject a
+// fake without a DB.
+//
+// NewAppHandler tolerates a nil audit writer ONLY for unit tests that
+// don't exercise CreateApp / UpdateApp / RotateSecret (the same
+// test-only nil contract as providerToken). The production router MUST
+// pass a non-nil writer: the mutation handlers log loudly and skip the
+// record rather than panicking mid-request, but a deployment wiring nil
+// is a misconfiguration that must show up in startup review.
+type AuditLogWriter interface {
+	Insert(ctx context.Context, a *model.AuditLog) error
+}
+
 type AppHandler struct {
 	appRepo       AppRepoInterface
 	providerToken ProviderTokenLookup
+	audit         AuditLogWriter
 }
 
-func NewAppHandler(appRepo AppRepoInterface, providerToken ProviderTokenLookup) *AppHandler {
-	return &AppHandler{appRepo: appRepo, providerToken: providerToken}
+func NewAppHandler(appRepo AppRepoInterface, providerToken ProviderTokenLookup, audit AuditLogWriter) *AppHandler {
+	return &AppHandler{appRepo: appRepo, providerToken: providerToken, audit: audit}
 }
 
 // redactedSecret masks server-side-only credential fields in API responses.
@@ -86,6 +101,52 @@ func callerAppID(c *gin.Context) string {
 		return app.AppID
 	}
 	return ""
+}
+
+// callerAppName returns the authenticated caller's display name for audit
+// context, or "" when the middleware didn't run (bare unit-test mounts).
+func callerAppName(c *gin.Context) string {
+	if app := callerApp(c); app != nil {
+		return app.Name
+	}
+	return ""
+}
+
+// writeAppAudit appends an audit_log row for an app admin mutation
+// (audit I-3 — CreateApp / UpdateApp / RotateSecret previously wrote
+// nothing, despite the router comment claiming rotate-secret had "its own
+// audit trail"). The record carries the authenticated caller (admin:<appID>
+// via adminActorID), the app identity, and a structured context — and
+// NEVER any secret material: UpdateApp's context lists which fields
+// changed but never config values (they hold live provider credentials),
+// and RotateSecret records only that a rotation happened (the plaintext
+// exists solely in the one-time response body).
+//
+// The mutation itself has already committed when this runs (the app repo
+// has no tx-scoped variants), so an audit-insert failure cannot roll the
+// mutation back — it is logged loudly for operator follow-up instead.
+// A nil writer (unit tests only) is likewise logged loudly and skipped.
+func (h *AppHandler) writeAppAudit(c *gin.Context, action, appID, appName string, ctxData map[string]any) {
+	actor := adminActorID(c)
+	if h.audit == nil {
+		log.Printf("FATAL: app audit disabled (nil writer): action=%s app=%s actor=%s", action, appID, actor)
+		return
+	}
+	target := "app:" + appID
+	data, err := json.Marshal(ctxData)
+	if err != nil {
+		log.Printf("app audit marshal failed: action=%s app=%s actor=%s: %v", action, appID, actor, err)
+		return
+	}
+	if err := h.audit.Insert(c.Request.Context(), &model.AuditLog{
+		Actor:   actor,
+		Action:  action,
+		Target:  &target,
+		Tags:    []string{"app_admin"},
+		Context: data,
+	}); err != nil {
+		log.Printf("app audit insert failed (mutation already committed): action=%s app=%s actor=%s: %v", action, appID, actor, err)
+	}
 }
 
 // redactAppConfigSecrets returns a copy of app whose Config has every
@@ -228,6 +289,12 @@ func (h *AppHandler) CreateApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to create app"})
 		return
 	}
+	h.writeAppAudit(c, "app.create", app.AppID, app.Name, map[string]any{
+		"name":            app.Name,
+		"description":     app.Description,
+		"config_provided": configBytes != nil,
+		"note":            "endpoint has no operator reason field",
+	})
 
 	// data.secret is the only place the plaintext ever appears — capture it
 	// client-side. After this response the server only has the bcrypt hash.
@@ -265,6 +332,13 @@ func (h *AppHandler) RotateSecret(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to rotate app secret"})
 		return
 	}
+	// Must-record (audit I-3): the row proves WHICH app had its credential
+	// rotated and by WHOM, never the new value — the plaintext exists only
+	// in the one-time response below.
+	h.writeAppAudit(c, "app.rotate_secret", id, callerAppName(c), map[string]any{
+		"rotated": true,
+		"note":    "plaintext returned once in the response; never written to audit",
+	})
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"secret": plaintext}})
 }
@@ -340,6 +414,26 @@ func (h *AppHandler) UpdateApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update app"})
 		return
 	}
+	// Audit I-3: record which fields changed, never the config values
+	// (apps.config holds live provider credentials).
+	changed := make([]string, 0, 4)
+	if req.Name != nil {
+		changed = append(changed, "name")
+	}
+	if req.Description != nil {
+		changed = append(changed, "description")
+	}
+	if req.IsActive != nil {
+		changed = append(changed, "is_active")
+	}
+	if req.Config != nil {
+		changed = append(changed, "config")
+	}
+	h.writeAppAudit(c, "app.update", app.AppID, app.Name, map[string]any{
+		"fields_changed": changed,
+		"config_changed": req.Config != nil,
+		"note":           "endpoint has no operator reason field; config values never audited",
+	})
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": redactAppConfigSecrets(app)})
 }

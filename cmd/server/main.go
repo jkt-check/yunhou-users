@@ -579,7 +579,7 @@ func main() {
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 
 	router.Setup(rootCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, auditLogRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,

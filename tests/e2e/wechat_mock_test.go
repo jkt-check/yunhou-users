@@ -132,7 +132,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	// (non-production signal — the mock switches refuse to arm under a
 	// production APP_ENV).
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
 		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil,

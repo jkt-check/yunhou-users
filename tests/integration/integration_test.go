@@ -182,7 +182,7 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 	githubOAuthSvc := service.NewGitHubOAuthService(cfg.OAuthStateSecret)
 	wechatOAuthSvc := service.NewWeChatOAuthService(cfg.OAuthStateSecret)
 	router.Setup(context.Background(), engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc, nil, nil, nil, nil, nil, nil, nil, githubOAuthSvc, wechatOAuthSvc, false, false, cfg.AppEnv, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, nil, nil, nil, nil,
 		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 
@@ -763,7 +763,7 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 	// wechatPayMock=true flips the webhook verifier + handler mock branches
 	// in lockstep (plaintext body accepted, HMAC bypassed).
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, nil,
 		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, true, cfg.AppEnv, service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil,

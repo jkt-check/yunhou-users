@@ -218,8 +218,8 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 	engine := gin.New()
 
 	Setup(t.Context(), engine,
-		nil,                          // healthPinger
-		nil, nil, nil, nil, nil, nil, // repos
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
 		nil,           // tokenSvc
 		nil,           // authSvc
 		nil, nil, nil, // subSvc, planSvc, paymentSvc
@@ -374,8 +374,8 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 	engine := gin.New()
 
 	Setup(t.Context(), engine,
-		nil,                          // healthPinger
-		nil, nil, nil, nil, nil, nil, // repos
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
 		nil,           // tokenSvc
 		nil,           // authSvc
 		nil, nil, nil, // subSvc, planSvc, paymentSvc
@@ -420,8 +420,8 @@ func TestSetup_TestLoginRefusedUnderProductionEnv(t *testing.T) {
 		engine := gin.New()
 
 		Setup(t.Context(), engine,
-			nil,                          // healthPinger
-			nil, nil, nil, nil, nil, nil, // repos
+			nil,                               // healthPinger
+			nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
 			nil,           // tokenSvc
 			nil,           // authSvc
 			nil, nil, nil, // subSvc, planSvc, paymentSvc
@@ -464,8 +464,8 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 	// NewRelayHandler(nil):svc 不会被触达(无 token 的请求在 JWTAuth
 	// 就被 401 拦截);未 SetHub 时 ServeWS 固定 503,足以区分路由存在性。
 	Setup(t.Context(), engine,
-		nil,                          // healthPinger
-		nil, nil, nil, nil, nil, nil, // repos
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
 		nil,           // tokenSvc
 		nil,           // authSvc
 		nil, nil, nil, // subSvc, planSvc, paymentSvc

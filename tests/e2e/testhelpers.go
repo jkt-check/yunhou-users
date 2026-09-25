@@ -352,7 +352,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
 		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
@@ -450,7 +450,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
 		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
@@ -726,7 +726,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
 		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),

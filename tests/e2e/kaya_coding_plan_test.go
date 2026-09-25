@@ -255,7 +255,7 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	t.Cleanup(cancelSetup)
 	router.Setup(setupCtx, engine, db,
-		appRepo, userRepo, identityRepo, planRepo, subRepo, sessionRepo,
+		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
 		service.NewProviderTokenService(appRepo, nil), quoteSvc,

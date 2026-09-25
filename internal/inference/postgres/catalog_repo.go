@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 
 	"github.com/yunhou/users/internal/inference/catalog"
@@ -303,19 +304,48 @@ func (s *Store) RoutesForModel(ctx context.Context, modelID string) ([]domain.Mo
 	return out, nil
 }
 
-// InsertConfigRevision appends an immutable draft revision.
-func (s *Store) InsertConfigRevision(ctx context.Context, rev *domain.ConfigRevision) error {
+// insertConfigRevisionQ is the INSERT shared by the standalone path and the
+// publish transaction (安全审查 M-2): it appends an immutable draft revision
+// and fills rev.ID/rev.CreatedAt from the RETURNING clause.
+func insertConfigRevisionQ(ctx context.Context, q sqlx.ExtContext, rev *domain.ConfigRevision) error {
 	payload := rev.Payload.Raw
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{"schema_version":1}`)
 	}
-	err := s.db.QueryRowxContext(ctx,
+	return q.QueryRowxContext(ctx,
 		`INSERT INTO inference_config_revisions (scope, revision, payload, status, created_by)
 		 VALUES ($1,$2,$3, COALESCE(NULLIF($4,''),'draft'), $5)
 		 RETURNING id, created_at`,
 		string(rev.Scope), rev.Revision, payload, string(rev.Status), rev.CreatedBy).
 		Scan(&rev.ID, &rev.CreatedAt)
-	return mapError("insert config revision", err)
+}
+
+func (s *Store) InsertConfigRevision(ctx context.Context, rev *domain.ConfigRevision) error {
+	return mapError("insert config revision", insertConfigRevisionQ(ctx, s.db, rev))
+}
+
+// activateRevisionQ switches the scope's active pointer: the previous active
+// revision is superseded and this one becomes published+active in one
+// statement pair guarded by the partial unique index. Shared by the
+// standalone ActivateRevision and the publish transaction.
+func activateRevisionQ(ctx context.Context, q sqlx.ExtContext, scope domain.ConfigScope, revision int) error {
+	if _, err := q.ExecContext(ctx,
+		`UPDATE inference_config_revisions
+		 SET is_active = false, status = 'superseded'
+		 WHERE scope = $1 AND is_active`, string(scope)); err != nil {
+		return mapError("activate revision: supersede", err)
+	}
+	res, err := q.ExecContext(ctx,
+		`UPDATE inference_config_revisions
+		 SET is_active = true, status = 'published', published_at = now()
+		 WHERE scope = $1 AND revision = $2`, string(scope), revision)
+	if err != nil {
+		return mapError("activate revision: publish", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return mapError("activate revision", errNoSuchRevision(scope, revision))
+	}
+	return nil
 }
 
 // ActivateRevision atomically switches the scope's active revision (设计
@@ -328,24 +358,59 @@ func (s *Store) ActivateRevision(ctx context.Context, scope domain.ConfigScope, 
 		return mapError("activate revision: begin", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE inference_config_revisions
-		 SET is_active = false, status = 'superseded'
-		 WHERE scope = $1 AND is_active`, string(scope)); err != nil {
-		return mapError("activate revision: supersede", err)
-	}
-	res, err := tx.ExecContext(ctx,
-		`UPDATE inference_config_revisions
-		 SET is_active = true, status = 'published', published_at = now()
-		 WHERE scope = $1 AND revision = $2`, string(scope), revision)
-	if err != nil {
-		return mapError("activate revision: publish", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return mapError("activate revision", errNoSuchRevision(scope, revision))
+	if err := activateRevisionQ(ctx, tx, scope, revision); err != nil {
+		return err
 	}
 	return mapError("activate revision: commit", tx.Commit())
+}
+
+// publishTx is the single implementation of catalog.PublishTx: one live
+// transaction carrying the revision insert + activation of a single
+// publish, so the two commit or roll back together (安全审查 M-2).
+type publishTx struct {
+	tx   *sqlx.Tx
+	done bool
+}
+
+// BeginPublish opens the transaction of one publish (insert + activate in
+// one atomic unit — no orphan draft revision on activation failure).
+func (s *Store) BeginPublish(ctx context.Context) (catalog.PublishTx, error) {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, mapError("begin publish", err)
+	}
+	return &publishTx{tx: tx}, nil
+}
+
+func (t *publishTx) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
+	var n int
+	err := t.tx.GetContext(ctx, &n,
+		`SELECT COALESCE(MAX(revision), 0) FROM inference_config_revisions WHERE scope = $1`,
+		string(scope))
+	return n, mapError("latest revision", err)
+}
+
+func (t *publishTx) InsertAndActivateRevision(ctx context.Context, rev *domain.ConfigRevision) error {
+	if err := insertConfigRevisionQ(ctx, t.tx, rev); err != nil {
+		return mapError("insert config revision", err) // UNIQUE(scope, revision) → CodeConflict on racing publishers
+	}
+	return activateRevisionQ(ctx, t.tx, rev.Scope, rev.Revision)
+}
+
+func (t *publishTx) Commit(ctx context.Context) error {
+	if t.done {
+		return domain.NewError(domain.CodeConflict, "publish transaction already finished")
+	}
+	t.done = true
+	return mapError("publish: commit", t.tx.Commit())
+}
+
+func (t *publishTx) Rollback(ctx context.Context) error {
+	if t.done {
+		return nil
+	}
+	t.done = true
+	return t.tx.Rollback()
 }
 
 // ActiveRevision implements domain.CatalogReader.

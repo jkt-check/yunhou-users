@@ -26,6 +26,8 @@ type fakeCatalogStore struct {
 	deployments map[string]*domain.Deployment
 	routes      map[string]*domain.ModelRoute
 	revisions   []*domain.ConfigRevision
+	// publishErr 注入发布事务失败（安全审查 M-2：激活失败模拟）。
+	publishErr error
 }
 
 func newFakeCatalogStore() *fakeCatalogStore {
@@ -172,8 +174,10 @@ func (f *fakeCatalogStore) ActivateRevision(ctx context.Context, scope domain.Co
 	for _, r := range f.revisions {
 		if r.Revision == revision {
 			r.Status = domain.RevisionPublished
-		} else if r.Status == domain.RevisionPublished {
+			r.IsActive = true
+		} else if r.IsActive {
 			r.Status = domain.RevisionSuperseded
+			r.IsActive = false
 		}
 	}
 	return nil
@@ -222,6 +226,42 @@ func (f *fakeCatalogStore) ActiveRevisionMeta(ctx context.Context, scope domain.
 }
 func (f *fakeCatalogStore) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
 	return len(f.revisions), nil
+}
+
+// fakePublishTx models catalog.PublishTx：InsertAndActivateRevision 先失败后
+// 追加（模拟同一事务的提交/回滚原子性——失败路径不留任何修订行）。
+type fakePublishTx struct {
+	store      *fakeCatalogStore
+	committed  bool
+	rolledBack bool
+}
+
+func (f *fakeCatalogStore) BeginPublish(ctx context.Context) (catalog.PublishTx, error) {
+	return &fakePublishTx{store: f}, nil
+}
+
+func (t *fakePublishTx) LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error) {
+	return len(t.store.revisions), nil
+}
+
+func (t *fakePublishTx) InsertAndActivateRevision(ctx context.Context, rev *domain.ConfigRevision) error {
+	if t.store.publishErr != nil {
+		return t.store.publishErr // 模拟同事务回滚：一行不留
+	}
+	t.store.revisions = append(t.store.revisions, rev)
+	return t.store.ActivateRevision(ctx, rev.Scope, rev.Revision)
+}
+
+func (t *fakePublishTx) Commit(ctx context.Context) error {
+	t.committed = true
+	return nil
+}
+
+func (t *fakePublishTx) Rollback(ctx context.Context) error {
+	if !t.committed {
+		t.rolledBack = true
+	}
+	return nil
 }
 
 // spyRecorder captures audit events.
@@ -460,5 +500,31 @@ func TestCatalogManager_AuditFailureStillSucceeds(t *testing.T) {
 	}
 	if _, err := fs.GetModel(ctx, "m-audit-fail"); err != nil {
 		t.Fatal("mutation must be effective despite audit failure")
+	}
+}
+
+// 安全审查 M-2：发布事务内激活失败必须整体回滚——不得留下孤儿 draft 修订，
+// 错误本身要干净透出（调用方重试是安全的）。
+func TestCatalogManager_PublishActivationFailureLeavesNoOrphanDraft(t *testing.T) {
+	fs := newFakeCatalogStore()
+	fs.publishErr = errors.New("activation boom")
+	mgr := NewCatalogManager(catalog.NewService(fs), &spyRecorder{}, nil)
+	ctx := context.Background()
+
+	if _, err := mgr.Publish(ctx, managerActor()); err == nil {
+		t.Fatal("activation failure must surface as publish error")
+	}
+	if len(fs.revisions) != 0 {
+		t.Fatalf("orphan draft revision left after failed activation: %+v", fs.revisions)
+	}
+
+	// 失败后的重试是安全的：恢复存储后同一发布成功落到 revision 1。
+	fs.publishErr = nil
+	rev, err := mgr.Publish(ctx, managerActor())
+	if err != nil || rev != 1 {
+		t.Fatalf("retry after transient failure = %d, %v; want 1, nil", rev, err)
+	}
+	if len(fs.revisions) != 1 || fs.revisions[0].Status != domain.RevisionPublished || !fs.revisions[0].IsActive {
+		t.Fatalf("retried revision = %+v, want published+active", fs.revisions[0])
 	}
 }

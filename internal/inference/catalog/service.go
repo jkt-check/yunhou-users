@@ -267,6 +267,25 @@ type Store interface {
 	// a number below afterRevision are returned.
 	ListRevisionMetas(ctx context.Context, scope domain.ConfigScope, afterRevision, limit int) ([]domain.RevisionMeta, error)
 	LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error)
+
+	// BeginPublish opens the transaction that carries one publish
+	// (安全审查 M-2/M-3): the revision insert and the active-pointer switch
+	// commit or roll back together — an activation failure can never leave an
+	// orphan draft revision behind.
+	BeginPublish(ctx context.Context) (PublishTx, error)
+}
+
+// PublishTx is the transactional surface of one publish. The caller drains
+// and validates the catalog, then InsertAndActivateRevision + Commit; any
+// error path rolls the whole thing back.
+type PublishTx interface {
+	LatestRevision(ctx context.Context, scope domain.ConfigScope) (int, error)
+	// InsertAndActivateRevision appends the draft revision and switches the
+	// scope's active pointer in the SAME transaction — no orphan draft can
+	// survive an activation failure (安全审查 M-2).
+	InsertAndActivateRevision(ctx context.Context, rev *domain.ConfigRevision) error
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
 }
 
 // AccessCheck decides whether one caller may see/use one published model.
@@ -582,10 +601,11 @@ func (s *Service) allDeployments(ctx context.Context) ([]domain.Deployment, erro
 // Publish validates the current draft catalog, appends an immutable
 // revision and atomically switches the active pointer to it. The returned
 // number is the new revision. Validation happens BEFORE anything is
-// written; the revision insert + activation is the atomic switch
-// (ActivateRevision runs in a single DB transaction with the partial
-// unique index as the safety net). The catalog is drained with keyset
-// pagination so no entity is ever silently dropped from the snapshot.
+// written; the revision insert + activation run in ONE transaction
+// (BeginPublish), so an activation failure rolls the draft insert back
+// instead of leaving an orphan draft revision (安全审查 M-2). The catalog is
+// drained with keyset pagination so no entity is ever silently dropped from
+// the snapshot.
 func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 	models, err := s.allModels(ctx)
 	if err != nil {
@@ -611,7 +631,12 @@ func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 		routes = append(routes, rs...)
 	}
 
-	latest, err := s.store.LatestRevision(ctx, domain.ScopeCatalog)
+	tx, err := s.store.BeginPublish(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
 	if err != nil {
 		return 0, err
 	}
@@ -622,10 +647,10 @@ func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 		Status:    domain.RevisionDraft,
 		CreatedBy: createdBy,
 	}
-	if err := s.store.InsertConfigRevision(ctx, rev); err != nil {
-		return 0, err // UNIQUE(scope, revision) → CodeConflict on racing publishers
+	if err := tx.InsertAndActivateRevision(ctx, rev); err != nil {
+		return 0, err // 同事务回滚：UNIQUE(scope, revision) → CodeConflict on racing publishers
 	}
-	if err := s.store.ActivateRevision(ctx, domain.ScopeCatalog, rev.Revision); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return rev.Revision, nil

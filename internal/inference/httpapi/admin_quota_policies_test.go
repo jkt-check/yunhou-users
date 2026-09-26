@@ -535,3 +535,33 @@ func TestAdminQuotaPolicies_MalformedID400(t *testing.T) {
 	doH(t, f.engine, http.MethodPost, "/adminm/quota-policies/not-a-uuid/retire",
 		map[string]any{"reason": "x"}, http.StatusBadRequest, h)
 }
+
+// 配置级引用(评审轮3 finding 2):PAYG 配置指向该版本 → 详情带
+// referenced_by_configs;retire 默认 409(data 双计数);force 放行。
+func TestAdminQuotaPolicies_ConfigRefsGuard(t *testing.T) {
+	f := newOpsFixture(t)
+	op := uuid.NewString()
+	f.grantOp(t, op, management.RoleOperator)
+	h := f.headers(op)
+	seedPVModel(t, f, "deepseek-chat")
+
+	id := createQPPolicy(t, f, h, "kaya-gift", "deepseek-chat")
+	publishQP(t, f, h, id)
+	if _, err := f.store.PutPAYGConfig(context.Background(), id, []string{"deepseek-chat"}, "user:ops@app:test"); err != nil {
+		t.Fatal(err)
+	}
+
+	env := doH(t, f.engine, http.MethodGet, "/adminm/quota-policies/"+id, nil, http.StatusOK, h)
+	v := decodeQPView(t, env)
+	if v["referenced_by_configs"] != float64(1) || v["referenced_by"] != float64(0) {
+		t.Fatalf("detail refs = %v/%v, want configs=1 ents=0", v["referenced_by_configs"], v["referenced_by"])
+	}
+
+	env = doH(t, f.engine, http.MethodPost, "/adminm/quota-policies/"+id+"/retire",
+		map[string]any{"reason": "退役"}, http.StatusConflict, h)
+	if !strings.Contains(string(env.Data), "referenced_by_configs") {
+		t.Fatalf("409 data must carry referenced_by_configs: %s", env.Data)
+	}
+	doH(t, f.engine, http.MethodPost, "/adminm/quota-policies/"+id+"/retire?force=true",
+		map[string]any{"reason": "先退役,配置稍后轮换"}, http.StatusOK, h)
+}

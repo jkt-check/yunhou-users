@@ -71,6 +71,9 @@ type quotaPolicyView struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	PublishedAt      *time.Time `json:"published_at,omitempty"`
 	ReferencedBy     *int       `json:"referenced_by,omitempty"`
+	// ConfigRefs 是配置级引用数(plan_benefit_configs + PAYG 配置行),
+	// 仅详情/退役 409 出现(评审轮3 finding 2)。
+	ConfigRefs *int `json:"referenced_by_configs,omitempty"`
 }
 
 func i64str(p *int64) *string {
@@ -81,7 +84,7 @@ func i64str(p *int64) *string {
 	return &s
 }
 
-func toQuotaPolicyView(p *management.QuotaPolicyInfo, referencedBy *int) quotaPolicyView {
+func toQuotaPolicyView(p *management.QuotaPolicyInfo, referencedBy, configRefs *int) quotaPolicyView {
 	var published *time.Time
 	if p.PublishedAt != nil {
 		t := p.PublishedAt.UTC()
@@ -99,7 +102,7 @@ func toQuotaPolicyView(p *management.QuotaPolicyInfo, referencedBy *int) quotaPo
 		ConcurrencyLimit: p.ConcurrencyLimit,
 		OveragePolicy:    p.OveragePolicy, Status: p.Status,
 		CreatedAt: p.CreatedAt.UTC(), PublishedAt: published,
-		ReferencedBy: referencedBy,
+		ReferencedBy: referencedBy, ConfigRefs: configRefs,
 	}
 }
 
@@ -134,7 +137,7 @@ func (h *AdminQuotaPoliciesHandler) Create(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": toQuotaPolicyView(created, nil)})
+	c.JSON(http.StatusCreated, gin.H{"code": 0, "data": toQuotaPolicyView(created, nil, nil)})
 }
 
 // quotaPolicyMutableFields 是 PATCH 可修改字段全集(presence 检测与未知
@@ -209,7 +212,7 @@ func (h *AdminQuotaPoliciesHandler) Update(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	ok(c, toQuotaPolicyView(updated, nil))
+	ok(c, toQuotaPolicyView(updated, nil, nil))
 }
 
 // Publish POST /quota-policies/:id/publish — draft → published;同事务把
@@ -227,7 +230,7 @@ func (h *AdminQuotaPoliciesHandler) Publish(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	ok(c, toQuotaPolicyView(published, nil))
+	ok(c, toQuotaPolicyView(published, nil, nil))
 }
 
 // Retire POST /quota-policies/:id/retire?force=true — Q1:有 active 权益
@@ -248,25 +251,25 @@ func (h *AdminQuotaPoliciesHandler) Retire(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{
 				"code":    http.StatusConflict,
 				"message": refErr.Error(),
-				"data":    toQuotaPolicyView(refErr.Info, &refErr.ReferencedBy),
+				"data":    toQuotaPolicyView(refErr.Info, &refErr.ReferencedBy, &refErr.ConfigRefs),
 			})
 			return
 		}
 		fail(c, err)
 		return
 	}
-	ok(c, toQuotaPolicyView(retired, nil))
+	ok(c, toQuotaPolicyView(retired, nil, nil))
 }
 
-// Get GET /quota-policies/:id — 详情 + referenced_by(active 权益引用数,
-// 退役前评估,只读统计)。
+// Get GET /quota-policies/:id — 详情 + referenced_by(active 权益引用数)
+// + referenced_by_configs(配置级引用数)(退役前评估,只读统计)。
 func (h *AdminQuotaPoliciesHandler) Get(c *gin.Context) {
-	info, referencedBy, err := h.svc.Get(c.Request.Context(), c.Param("id"))
+	info, referencedBy, configRefs, err := h.svc.Get(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		fail(c, err)
 		return
 	}
-	ok(c, toQuotaPolicyView(info, &referencedBy))
+	ok(c, toQuotaPolicyView(info, &referencedBy, &configRefs))
 }
 
 // List GET /quota-policies?name=&status=&limit=&offset= — items 空时为
@@ -300,7 +303,7 @@ func (h *AdminQuotaPoliciesHandler) List(c *gin.Context) {
 	}
 	out := make([]quotaPolicyView, 0, len(items))
 	for i := range items {
-		out = append(out, toQuotaPolicyView(&items[i], nil))
+		out = append(out, toQuotaPolicyView(&items[i], nil, nil))
 	}
 	ok(c, gin.H{"items": out, "limit": filter.Limit, "offset": filter.Offset})
 }

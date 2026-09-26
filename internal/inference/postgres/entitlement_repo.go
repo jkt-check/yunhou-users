@@ -44,6 +44,24 @@ func (r entitlementRow) toDomain() *domain.Entitlement {
 	}
 }
 
+// PolicyRetiredError reports a grant attempt pinning a RETIRED quota
+// policy version (Q1:retire = 不再允许新发放引用)。独立类型的原因:
+// entitlement-sync worker 把 CodeConflict 当「并发发放者先到」的良性竞争
+// 立即重排——退役拒绝若只凭 code 区分会被误归类成热循环(评审轮3
+// finding 1),调用方必须 errors.As 先判类型再看 code。
+type PolicyRetiredError struct {
+	PolicyVersionID string
+}
+
+func (e *PolicyRetiredError) Error() string {
+	return "quota policy version " + e.PolicyVersionID + " is retired (不再允许新发放引用)"
+}
+
+// Unwrap keeps the domain mapping at CodeConflict (HTTP 面仍是 409)。
+func (e *PolicyRetiredError) Unwrap() error {
+	return domain.NewError(domain.CodeConflict, e.Error())
+}
+
 // lockPolicyForGrantTx locks the policy row FOR KEY SHARE and rejects
 // grants pinning a RETIRED version (Q1 的运营语义:retire = 不再允许新发放
 // 引用)。锁与 retire 的 FOR UPDATE 互斥:grant 先拿锁则 retire 的引用
@@ -60,8 +78,7 @@ func lockPolicyForGrantTx(ctx context.Context, tx *sqlx.Tx, policyVersionID stri
 		return mapError("lock policy for grant", err)
 	}
 	if status == "retired" {
-		return domain.NewError(domain.CodeConflict,
-			"quota policy version is retired (不再允许新发放引用)")
+		return &PolicyRetiredError{PolicyVersionID: policyVersionID}
 	}
 	return nil
 }
@@ -69,6 +86,9 @@ func lockPolicyForGrantTx(ctx context.Context, tx *sqlx.Tx, policyVersionID stri
 // InsertEntitlement creates an entitlement. Duplicate grants from the same
 // source+revision hit the idempotency UNIQUE key (CodeConflict).退休策略
 // 版本拒绝新发放(行锁 + 同事务校验,见 lockPolicyForGrantTx)。
+// 注意:本方法自持事务(BeginTxx + 锁 + 插入 + 提交)——绝不可在本 store
+// 已持有 UnitOfWork 的调用栈里调用(原子性会静默拆分;MaxOpenConns(1)
+// 下直接死锁)。组合事务请用 InsertEntitlementTx。
 func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) error {
 	tx, err := s.db.BeginTxx(ctx, nil)
 	if err != nil {
@@ -149,15 +169,30 @@ func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e 
 // abort the whole tx (25P02) and poison every subsequent statement,
 // including the read-back (评审轮2 N-1: 并发 PAYG 开启的输家确定性 500).
 func (s *Store) insertEntitlementOrReadWinnerTx(ctx context.Context, tx *sqlx.Tx, e *domain.Entitlement) (*domain.Entitlement, error) {
+	if e.Revision == 0 {
+		e.Revision = 1
+	}
+	// 幂等无操作短路先于退役守卫(评审轮3 finding 3):已持有同键权益的
+	// 调用方 re-ensure 不因其后策略退役而报错;退役守卫只拦真正的新发放。
+	{
+		var row entitlementRow
+		err := tx.QueryRowxContext(ctx,
+			`SELECT * FROM inference_entitlements
+			 WHERE source_type = $1 AND source_id = $2 AND revision = $3`,
+			string(e.SourceType), e.SourceID, e.Revision).StructScan(&row)
+		switch {
+		case err == nil:
+			return row.toDomain(), nil
+		case !errors.Is(err, sql.ErrNoRows):
+			return nil, mapError("read entitlement by source key", err)
+		}
+	}
 	if err := lockPolicyForGrantTx(ctx, tx, e.PolicyVersionID); err != nil {
 		return nil, err
 	}
 	status := string(e.Status)
 	if status == "" {
 		status = string(domain.EntitlementActive)
-	}
-	if e.Revision == 0 {
-		e.Revision = 1
 	}
 	var row entitlementRow
 	err := tx.QueryRowxContext(ctx,

@@ -85,6 +85,10 @@ type QuotaPolicyStore interface {
 	// CountActiveEntitlementsByPolicyTx is the reference count inside the
 	// caller's transaction (与行锁配套使用).
 	CountActiveEntitlementsByPolicyTx(ctx context.Context, w domain.UnitOfWork, policyVersionID string) (int, error)
+	// CountConfigReferencesByPolicy counts CONFIG-level references
+	// (plan_benefit_configs + PAYG 配置行) — retire 保护第二维度。
+	CountConfigReferencesByPolicy(ctx context.Context, policyVersionID string) (int, error)
+	CountConfigReferencesByPolicyTx(ctx context.Context, w domain.UnitOfWork, policyVersionID string) (int, error)
 }
 
 // CreateQuotaPolicyInput is the payload of POST /admin/quota-policies after
@@ -124,11 +128,14 @@ type UpdateQuotaPolicyInput struct {
 type QuotaPolicyRetireConflictError struct {
 	Info         *QuotaPolicyInfo
 	ReferencedBy int
+	// ConfigRefs 是配置级引用数(plan_benefit_configs + PAYG 配置行)——
+	// grant 守卫下这些配置的后续发放会硬失败,与权益引用同权阻断。
+	ConfigRefs int
 }
 
 func (e *QuotaPolicyRetireConflictError) Error() string {
-	return fmt.Sprintf("quota policy %s r%d is referenced by %d active entitlement(s); use ?force=true to retire anyway (存量权益继续按 pinned 版本执行)",
-		e.Info.Name, e.Info.Revision, e.ReferencedBy)
+	return fmt.Sprintf("quota policy %s r%d is referenced by %d active entitlement(s) and %d config(s); use ?force=true to retire anyway (存量权益继续按 pinned 版本执行)",
+		e.Info.Name, e.Info.Revision, e.ReferencedBy, e.ConfigRefs)
 }
 
 func (e *QuotaPolicyRetireConflictError) Unwrap() error {
@@ -470,8 +477,12 @@ func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason strin
 	if err != nil {
 		return nil, err
 	}
-	if locked.Status != "draft" && referencedBy > 0 && !force {
-		return nil, &QuotaPolicyRetireConflictError{Info: locked, ReferencedBy: referencedBy}
+	configRefs, err := s.store.CountConfigReferencesByPolicyTx(ctx, uow, id)
+	if err != nil {
+		return nil, err
+	}
+	if locked.Status != "draft" && (referencedBy+configRefs) > 0 && !force {
+		return nil, &QuotaPolicyRetireConflictError{Info: locked, ReferencedBy: referencedBy, ConfigRefs: configRefs}
 	}
 	if err := s.store.RetireQuotaPolicyTx(ctx, uow, locked.ID); err != nil {
 		return nil, err
@@ -479,7 +490,7 @@ func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason strin
 	if err := s.txAudit(ctx, uow, actor, "quota_policy.retire", locked.ID, reason, map[string]any{
 		"name": locked.Name, "revision": locked.Revision,
 		"status_from": locked.Status, "status_to": "retired",
-		"referenced_by": referencedBy, "force": force,
+		"referenced_by": referencedBy, "referenced_by_configs": configRefs, "force": force,
 	}); err != nil {
 		return nil, domain.WrapError(domain.CodeInternal, "quota policy audit write failed", err)
 	}
@@ -492,17 +503,22 @@ func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason strin
 	return &retired, nil
 }
 
-// Get loads one revision with its referenced_by count (详情页)。
-func (s *QuotaPolicyService) Get(ctx context.Context, id string) (*QuotaPolicyInfo, int, error) {
+// Get loads one revision with its referenced_by counts (详情页;第二个
+// 返回值是 active 权益引用数,第三个是配置级引用数)。
+func (s *QuotaPolicyService) Get(ctx context.Context, id string) (*QuotaPolicyInfo, int, int, error) {
 	info, err := s.store.GetQuotaPolicyVersion(ctx, id)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	n, err := s.store.CountActiveEntitlementsByPolicy(ctx, id)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return info, n, nil
+	cn, err := s.store.CountConfigReferencesByPolicy(ctx, id)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return info, n, cn, nil
 }
 
 // List returns the filtered page; the handler owns query-parameter

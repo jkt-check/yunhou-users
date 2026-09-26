@@ -866,3 +866,35 @@ func TestEntitlementSync_PanicInMessageNeverCrashes(t *testing.T) {
 		t.Fatalf("fail marks = %d (last id %d), want 2 reschedules of message 42", store.failMarks, store.failLastID)
 	}
 }
+
+// 评审轮3 finding 1:退役策略的发放拒绝是永久性错误,必须走 Failed
+// (有界退避 + ERROR),绝不误归类良性竞争(即时重排 = 热循环 + 已支付
+// 客户静默丢权益)。
+func TestEntitlementSync_RetiredPolicyFailsNotRaces(t *testing.T) {
+	f := newSyncFixture(t)
+	f.seedPlan(t, "cp_basic", model.ProductCodingPlan, 30, 29.9)
+	f.seedBenefitConfig(t, "cp_basic", f.policyID, []string{"glm-4.6"}, model.BenefitGrantModeSubscription)
+	orderID := f.seedPaidOrderFull(t, "cp_basic", &f.policyID, []string{"glm-4.6"}, model.BenefitGrantModeSubscription, model.OrderKindNew)
+	f.seedSubscription(t, "cp_basic", model.ProductCodingPlan, "active", futureExpiry(30))
+
+	// 运营在支付后、同步前退役了策略版本。
+	if _, err := f.db.Exec(`UPDATE inference_policy_versions SET status = 'retired' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	dedup := access.PaidSyncDedupKey("pay-ret-1")
+	f.enqueue(t, access.EntitlementSyncMessage{
+		UserID: f.userID, ProductCode: model.ProductCodingPlan,
+		Reason: access.SyncReasonPaymentPaid, OrderID: orderID, PaymentID: "pay-ret-1",
+	}, &dedup)
+
+	stats, err := f.worker.RunPass(context.Background())
+	if err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if stats.Failed != 1 || stats.Racing != 0 || stats.Delivered != 0 {
+		t.Fatalf("stats = %+v, want Failed=1 (退役拒绝必须走 Failed,不进热循环)", stats)
+	}
+	if n := f.countEntitlements(t); n != 0 {
+		t.Fatalf("entitlements = %d, want 0", n)
+	}
+}

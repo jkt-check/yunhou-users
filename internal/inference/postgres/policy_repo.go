@@ -325,3 +325,35 @@ func (s *Store) CountActiveEntitlementsByPolicyTx(ctx context.Context, w domain.
 	}
 	return n, nil
 }
+
+// CountConfigReferencesByPolicy counts CONFIG-level references to this
+// version: plan_benefit_configs rows + the PAYG config row (retire 保护的
+// 第二维度,评审轮3 finding 2 —— grant 守卫落地后,配置仍指向被退役版本
+// 会让后续发放硬失败,默认阻断退役)。
+func (s *Store) CountConfigReferencesByPolicy(ctx context.Context, policyVersionID string) (int, error) {
+	var n int
+	if err := s.db.QueryRowxContext(ctx,
+		`SELECT (SELECT COUNT(*) FROM plan_benefit_configs WHERE policy_version_id = $1)
+		      + (SELECT COUNT(*) FROM inference_payg_config WHERE policy_version_id = $1)`,
+		policyVersionID).Scan(&n); err != nil {
+		return 0, mapError("count config references by policy", err)
+	}
+	return n, nil
+}
+
+// CountConfigReferencesByPolicyTx is CountConfigReferencesByPolicy inside
+// the caller's transaction (与策略行锁配套,见 GetQuotaPolicyForUpdateTx)。
+func (s *Store) CountConfigReferencesByPolicyTx(ctx context.Context, w domain.UnitOfWork, policyVersionID string) (int, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT (SELECT COUNT(*) FROM plan_benefit_configs WHERE policy_version_id = $1)
+		      + (SELECT COUNT(*) FROM inference_payg_config WHERE policy_version_id = $1)`,
+		policyVersionID).Scan(&n); err != nil {
+		return 0, mapError("count config references by policy tx", err)
+	}
+	return n, nil
+}

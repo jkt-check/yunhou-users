@@ -19,6 +19,7 @@ type fakeQPStore struct {
 	rows     map[string]*QuotaPolicyInfo // by id
 	models   map[string]bool
 	refCount int
+	cfgRefs  int
 	maxRev   int
 	uow      *fakeUOW
 	inserted *QuotaPolicyInfo
@@ -68,6 +69,10 @@ func (f *fakeQPStore) ListQuotaPolicies(_ context.Context, filter QuotaPolicyFil
 
 func (f *fakeQPStore) CountActiveEntitlementsByPolicy(_ context.Context, id string) (int, error) {
 	return f.refCount, nil
+}
+
+func (f *fakeQPStore) CountConfigReferencesByPolicy(_ context.Context, id string) (int, error) {
+	return f.cfgRefs, nil
 }
 
 func (f *fakeQPStore) Begin(context.Context) (domain.UnitOfWork, error) { return f.uow, nil }
@@ -128,6 +133,10 @@ func (f *fakeQPStore) GetQuotaPolicyForUpdateTx(_ context.Context, _ domain.Unit
 
 func (f *fakeQPStore) CountActiveEntitlementsByPolicyTx(_ context.Context, _ domain.UnitOfWork, id string) (int, error) {
 	return f.refCount, nil
+}
+
+func (f *fakeQPStore) CountConfigReferencesByPolicyTx(_ context.Context, _ domain.UnitOfWork, id string) (int, error) {
+	return f.cfgRefs, nil
 }
 
 // --- fake audit ---
@@ -364,5 +373,25 @@ func TestQuotaPolicyRetire_RacedRetireIdempotent(t *testing.T) {
 	}
 	if fs.retire.calls != 0 || len(audit.events) != 0 {
 		t.Fatalf("loser must not retire/audit: calls=%d audits=%d", fs.retire.calls, len(audit.events))
+	}
+}
+
+// 配置级引用同权阻断(评审轮3 finding 2):published + 配置引用 → 409 带
+// referenced_by_configs;force 放行。
+func TestQuotaPolicyRetire_ConfigRefsGuard(t *testing.T) {
+	svc, fs, audit := newQPService()
+	fs.rows["pub"] = &QuotaPolicyInfo{ID: "pub", Name: "n", Revision: 1, Status: "published", ModelIDs: []string{"deepseek-chat"}, WeeklyLimit: i64(1)}
+	fs.cfgRefs = 2 // 一条 plan_benefit_configs + PAYG 配置行
+
+	_, err := svc.Retire(context.Background(), "user:op@app:ops", "pub", "退役", false)
+	var refErr *QuotaPolicyRetireConflictError
+	if !errors.As(err, &refErr) || refErr.ConfigRefs != 2 || refErr.ReferencedBy != 0 {
+		t.Fatalf("err = %v, want typed conflict with config_refs=2", err)
+	}
+	if _, err := svc.Retire(context.Background(), "user:op@app:ops", "pub", "强制", true); err != nil {
+		t.Fatalf("forced retire with config refs: %v", err)
+	}
+	if len(audit.events) != 1 || audit.events[0].Detail["referenced_by_configs"] != 2 {
+		t.Fatalf("audit = %+v, want one retire event with referenced_by_configs=2", audit.events)
 	}
 }

@@ -3,6 +3,7 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"time"
 
@@ -387,6 +388,13 @@ func (w *EntitlementSync) applyPlans(ctx context.Context, userID string, plans [
 			}
 			ent.BillingAccountID = accountID
 			if err := w.store.InsertEntitlementTx(ctx, uow, ent); err != nil {
+				// 退役策略拒绝是永久性错误,绝不按良性竞争重排(否则即时
+				// 重排 + 永不 deliver = 热循环且已支付客户静默丢权益,
+				// 评审轮3 finding 1)——走 Failed 路径(有界退避 + ERROR)。
+				var retired *postgres.PolicyRetiredError
+				if errors.As(err, &retired) {
+					return false, err
+				}
 				// UNIQUE(source_type, source_id, revision=1) collision =
 				// a concurrent granter won; the retry pass re-reads + noops.
 				if domain.CodeOf(err) == domain.CodeConflict {
@@ -468,8 +476,14 @@ func (w *EntitlementSync) IssueMigrationGift(ctx context.Context, userID, ruleID
 	}
 	defer uow.Rollback(ctx) //nolint:errcheck
 	if err := w.store.InsertEntitlementTx(ctx, uow, ent); err != nil {
+		// 退役策略拒绝:永久性错误,如实上抛(Failed + 告警),不得静默
+		// 吞成「已发放」(评审轮3 finding 1)。
+		var retired *postgres.PolicyRetiredError
+		if errors.As(err, &retired) {
+			return false, err
+		}
 		if domain.CodeOf(err) == domain.CodeConflict {
-			return false, nil // 独立幂等来源键：同一规则对同一用户只发一次
+			return false, nil // 独立幂等来源键:同一规则对同一用户只发一次
 		}
 		return false, err
 	}

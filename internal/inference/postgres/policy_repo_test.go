@@ -341,3 +341,42 @@ func TestEnsurePAYGEntitlement_RejectsRetiredPolicy(t *testing.T) {
 		t.Fatalf("payg enable on retired policy: code = %v, want conflict", domain.CodeOf(err))
 	}
 }
+
+// 配置级引用计数:plan_benefit_configs + PAYG 配置行(评审轮3 finding 2)。
+func TestCountConfigReferencesByPolicy(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+
+	n, err := s.CountConfigReferencesByPolicy(ctx, f.policyID)
+	if err != nil || n != 0 {
+		t.Fatalf("baseline = %d err=%v, want 0", n, err)
+	}
+	// plan_benefit_configs 一条(plan 用唯一 id:plans 表不在 wipe 清单)。
+	if _, err := s.db.Exec(
+		`INSERT INTO plans (id, name, price, interval_days, apps, currency, product_code)
+		 VALUES ('cp_cfgref_probe', 'cp_cfgref_probe', 29.9, 30, '{}', 'CNY', 'coding-plan')
+		 ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO plan_benefit_configs (plan_id, policy_version_id, model_ids, grant_mode)
+		 VALUES ('cp_cfgref_probe', $1, '{"glm-4.6"}', 'subscription')`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.CountConfigReferencesByPolicy(ctx, f.policyID)
+	if err != nil || n != 1 {
+		t.Fatalf("after benefit config = %d err=%v, want 1", n, err)
+	}
+	// PAYG 配置行一条。
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'published' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutPAYGConfig(ctx, f.policyID, []string{f.modelID}, "user:ops@app:test"); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.CountConfigReferencesByPolicy(ctx, f.policyID)
+	if err != nil || n != 2 {
+		t.Fatalf("after payg config = %d err=%v, want 2", n, err)
+	}
+}

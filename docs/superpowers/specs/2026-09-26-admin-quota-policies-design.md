@@ -74,6 +74,12 @@ cn-staging 已核验零重复(2026-09-26);cn-prod / intl-prod 部署前由运维
   published/superseded → retired 走 referenced_by 保护(默认 409,
   ?force=true 放行)。superseded 版本仍可能被存量权益 pin,故同样走
   保护(超出需求字面、属保守扩展,已在此注明)。
+- **grant 侧退役拒发**(评审轮2 补强):权益写入三路径
+  (InsertEntitlement/InsertEntitlementTx/PAYG 开启)先 `FOR KEY SHARE`
+  锁策略行,retired 版本拒绝新发放引用(与 retire 的 FOR UPDATE 互斥
+  双向定序)。**superseded 放行**:支付链路 plan_benefit_configs 可能仍
+  指向被替代版本,拒 superseded 会让已支付订单激活失败;严格「读侧只认
+  published」如产品需要,另行拍板。
 - **pin 不变性**(需求 §5.1,验收 A13):权益持有 policy_version_id 不变;
   发布新 revision 不影响存量权益的配额口径。网关按 id 读取,superseded/
   retired 版本照常服务存量 pin;仅新发放(PAYG config、人工发放)不得

@@ -78,6 +78,13 @@ type QuotaPolicyStore interface {
 	// RetireQuotaPolicyTx marks draft/published/superseded → retired;
 	// 已 retired → CodeConflict。
 	RetireQuotaPolicyTx(ctx context.Context, w domain.UnitOfWork, id string) error
+	// GetQuotaPolicyForUpdateTx locks the policy row (FOR UPDATE) inside the
+	// caller's transaction — retire 引用保护的 TOCTOU 闭合:行锁与并发
+	// grant 的 FK KEY SHARE 互斥,事务内计数在提交前不失效。
+	GetQuotaPolicyForUpdateTx(ctx context.Context, w domain.UnitOfWork, id string) (*QuotaPolicyInfo, error)
+	// CountActiveEntitlementsByPolicyTx is the reference count inside the
+	// caller's transaction (与行锁配套使用).
+	CountActiveEntitlementsByPolicyTx(ctx context.Context, w domain.UnitOfWork, policyVersionID string) (int, error)
 }
 
 // CreateQuotaPolicyInput is the payload of POST /admin/quota-policies after
@@ -390,6 +397,15 @@ func (s *QuotaPolicyService) Publish(ctx context.Context, actor, id, reason stri
 	}()
 	at := s.clock.Now().UTC()
 	if err := s.store.PublishQuotaPolicyTx(ctx, uow, cur.ID, cur.Name, at); err != nil {
+		if domain.CodeOf(err) == domain.CodeConflict {
+			// 并发双发同 id:输家在事务内撞「非 draft」或部分唯一索引;
+			// 重读已被赢家发布则按幂等 200 返回(评审轮1 finding 3/5,
+			// 冲突文案固定,不外泄索引名)。
+			if again, rerr := s.store.GetQuotaPolicyVersion(ctx, id); rerr == nil && again.Status == "published" {
+				return again, nil
+			}
+			return nil, domain.NewError(domain.CodeConflict, "quota policy publish conflict for (name)")
+		}
 		return nil, err
 	}
 	if err := s.txAudit(ctx, uow, actor, "quota_policy.publish", cur.ID, reason, map[string]any{
@@ -411,7 +427,8 @@ func (s *QuotaPolicyService) Publish(ctx context.Context, actor, id, reason stri
 // Retire:draft 直接转 retired(等同废弃草稿);retired 幂等返回;
 // published/superseded 遇 active 权益引用默认 409 + referenced_by(Q1),
 // force=true 放行 —— 存量权益继续按 pinned 版本执行,仅不再允许新发放
-// 引用。
+// 引用。引用计数在持行锁的事务内做(FOR UPDATE 与并发 grant 的 FK
+// KEY SHARE 互斥),审计里的 referenced_by 是退役时刻的真实值。
 func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason string, force bool) (*QuotaPolicyInfo, error) {
 	if reason == "" {
 		return nil, domain.NewError(domain.CodeInvalidInput, "reason is required")
@@ -422,16 +439,6 @@ func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason strin
 	}
 	if cur.Status == "retired" {
 		return cur, nil // 幂等重放(需求 §5.4)
-	}
-	referencedBy := 0
-	if cur.Status != "draft" {
-		referencedBy, err = s.store.CountActiveEntitlementsByPolicy(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if referencedBy > 0 && !force {
-			return nil, &QuotaPolicyRetireConflictError{Info: cur, ReferencedBy: referencedBy}
-		}
 	}
 
 	uow, err := s.store.Begin(ctx)
@@ -444,12 +451,30 @@ func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason strin
 			_ = uow.Rollback(ctx)
 		}
 	}()
-	if err := s.store.RetireQuotaPolicyTx(ctx, uow, cur.ID); err != nil {
+	// 行锁内重读:与并发 retire/grant 定序;锁内状态才参与决策。
+	locked, err := s.store.GetQuotaPolicyForUpdateTx(ctx, uow, id)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.txAudit(ctx, uow, actor, "quota_policy.retire", cur.ID, reason, map[string]any{
-		"name": cur.Name, "revision": cur.Revision,
-		"status_from": cur.Status, "status_to": "retired",
+	if locked.Status == "retired" {
+		return locked, nil // 并发 retire 先到者已生效,后来者幂等
+	}
+	referencedBy := 0
+	if locked.Status != "draft" {
+		referencedBy, err = s.store.CountActiveEntitlementsByPolicyTx(ctx, uow, id)
+		if err != nil {
+			return nil, err
+		}
+		if referencedBy > 0 && !force {
+			return nil, &QuotaPolicyRetireConflictError{Info: locked, ReferencedBy: referencedBy}
+		}
+	}
+	if err := s.store.RetireQuotaPolicyTx(ctx, uow, locked.ID); err != nil {
+		return nil, err
+	}
+	if err := s.txAudit(ctx, uow, actor, "quota_policy.retire", locked.ID, reason, map[string]any{
+		"name": locked.Name, "revision": locked.Revision,
+		"status_from": locked.Status, "status_to": "retired",
 		"referenced_by": referencedBy, "force": force,
 	}); err != nil {
 		return nil, domain.WrapError(domain.CodeInternal, "quota policy audit write failed", err)
@@ -458,7 +483,7 @@ func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason strin
 		return nil, domain.WrapError(domain.CodeInternal, "commit transaction", err)
 	}
 	committed = true
-	retired := *cur
+	retired := *locked
 	retired.Status = "retired"
 	return &retired, nil
 }

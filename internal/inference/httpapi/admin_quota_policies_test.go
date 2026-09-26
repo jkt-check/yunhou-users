@@ -521,3 +521,17 @@ func TestAdminQuotaPolicies_ListAndGet(t *testing.T) {
 	doH(t, f.engine, http.MethodGet, "/adminm/quota-policies?offset=-1", nil, http.StatusBadRequest, h)
 	doH(t, f.engine, http.MethodGet, "/adminm/quota-policies?status=bogus", nil, http.StatusBadRequest, h)
 }
+
+// 非 UUID 的 :id 不得漏成 500(22P02 已映射 invalid_input;评审轮1)。
+func TestAdminQuotaPolicies_MalformedID400(t *testing.T) {
+	f := newOpsFixture(t)
+	op := uuid.NewString()
+	f.grantOp(t, op, management.RoleOperator)
+	h := f.headers(op)
+
+	doH(t, f.engine, http.MethodGet, "/adminm/quota-policies/not-a-uuid", nil, http.StatusBadRequest, h)
+	doH(t, f.engine, http.MethodPost, "/adminm/quota-policies/not-a-uuid/publish",
+		map[string]any{"reason": "x"}, http.StatusBadRequest, h)
+	doH(t, f.engine, http.MethodPost, "/adminm/quota-policies/not-a-uuid/retire",
+		map[string]any{"reason": "x"}, http.StatusBadRequest, h)
+}

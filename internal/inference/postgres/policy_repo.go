@@ -263,3 +263,65 @@ func i64OrNil(p *int64) interface{} {
 	}
 	return *p
 }
+
+// GetQuotaPolicyForUpdateTx locks the policy row (SELECT ... FOR UPDATE)
+// inside the caller's transaction — retire 的引用保护把「计数」放进同一
+// 事务,锁与 FK 的 KEY SHARE 互斥,并发 grant(INSERT 引用本行)被定序,
+// 计数结果在提交前不可能失效(评审轮1 TOCTOU 修复)。
+func (s *Store) GetQuotaPolicyForUpdateTx(ctx context.Context, w domain.UnitOfWork, id string) (*management.QuotaPolicyInfo, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	var row struct {
+		ID        string         `db:"id"`
+		Name      string         `db:"name"`
+		Revision  int            `db:"revision"`
+		ModelIDs  pq.StringArray `db:"model_ids"`
+		FiveHour  sql.NullInt64  `db:"five_hour_limit_micros"`
+		Weekly    sql.NullInt64  `db:"weekly_limit_micros"`
+		Monthly   sql.NullInt64  `db:"monthly_limit_micros"`
+		RPM       sql.NullInt64  `db:"rpm_limit"`
+		TPM       sql.NullInt64  `db:"tpm_limit"`
+		Conc      sql.NullInt64  `db:"concurrency_limit"`
+		Overage   string         `db:"overage_policy"`
+		Status    string         `db:"status"`
+		CreatedAt time.Time      `db:"created_at"`
+		Published *time.Time     `db:"published_at"`
+	}
+	if err := tx.GetContext(ctx, &row,
+		`SELECT id, name, revision, model_ids,
+		 five_hour_limit_micros, weekly_limit_micros, monthly_limit_micros,
+		 rpm_limit, tpm_limit, concurrency_limit, overage_policy, status,
+		 created_at, published_at
+		 FROM inference_policy_versions WHERE id = $1 FOR UPDATE`, id); err != nil {
+		return nil, mapError("lock quota policy", err)
+	}
+	return policyToInfo(&PolicyVersion{
+		ID: row.ID, Name: row.Name, Revision: row.Revision, ModelIDs: []string(row.ModelIDs),
+		FiveHourLimit: microFromNull(row.FiveHour), WeeklyLimit: microFromNull(row.Weekly),
+		MonthlyLimit: microFromNull(row.Monthly),
+		RPMLimit:     intFromNull(row.RPM), TPMLimit: int64FromNull(row.TPM),
+		ConcurrencyLimit: intFromNull(row.Conc),
+		OveragePolicy:    row.Overage, Status: row.Status,
+		CreatedAt: row.CreatedAt, PublishedAt: row.Published,
+	}), nil
+}
+
+// CountActiveEntitlementsByPolicyTx is CountActiveEntitlementsByPolicy
+// inside the caller's transaction (与策略行锁配套,见 GetQuotaPolicyForUpdateTx)。
+func (s *Store) CountActiveEntitlementsByPolicyTx(ctx context.Context, w domain.UnitOfWork, policyVersionID string) (int, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT COUNT(*) FROM inference_entitlements
+		 WHERE policy_version_id = $1 AND status = 'active'
+		   AND (effective_to IS NULL OR effective_to > now())`,
+		policyVersionID).Scan(&n); err != nil {
+		return 0, mapError("count active entitlements by policy tx", err)
+	}
+	return n, nil
+}

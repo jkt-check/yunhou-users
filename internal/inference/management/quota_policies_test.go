@@ -102,6 +102,14 @@ func (f *fakeQPStore) RetireQuotaPolicyTx(_ context.Context, _ domain.UnitOfWork
 	return nil
 }
 
+func (f *fakeQPStore) GetQuotaPolicyForUpdateTx(_ context.Context, _ domain.UnitOfWork, id string) (*QuotaPolicyInfo, error) {
+	return f.GetQuotaPolicyVersion(context.Background(), id)
+}
+
+func (f *fakeQPStore) CountActiveEntitlementsByPolicyTx(_ context.Context, _ domain.UnitOfWork, id string) (int, error) {
+	return f.refCount, nil
+}
+
 // --- fake audit ---
 
 type fakeQPAudit struct {

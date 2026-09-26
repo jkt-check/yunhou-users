@@ -46,6 +46,15 @@
 2. 部分唯一索引 `UNIQUE(name) WHERE status='published'`(每 name 至多一条
    published 的不变量在 DB 层兜底,写侧同事务转 superseded 是常态路径)。
 
+**部署预检(各环境应用 040 前必跑,重复 name 必须先处置)**:
+
+```sql
+SELECT name FROM inference_policy_versions
+WHERE status='published' GROUP BY name HAVING COUNT(*) > 1;
+```
+
+cn-staging 已核验零重复(2026-09-26);cn-prod / intl-prod 部署前由运维执行。
+
 除此之外零表结构变更。
 
 ## 3. 语义细节

@@ -44,9 +44,45 @@ func (r entitlementRow) toDomain() *domain.Entitlement {
 	}
 }
 
+// lockPolicyForGrantTx locks the policy row FOR KEY SHARE and rejects
+// grants pinning a RETIRED version (Q1 的运营语义:retire = 不再允许新发放
+// 引用)。锁与 retire 的 FOR UPDATE 互斥:grant 先拿锁则 retire 的引用
+// 计数必然等到本次提交后;retire 先提交则此处读到 retired 直接拒——两个
+// 方向都定序,补全评审轮2 finding 1 的 TOCTOU 残余。superseded 放行:
+// 支付链路(plan_benefit_configs)可能仍指向被替代版本,拒 superseded 会
+// 让已支付订单的激活静默失败;严格「读侧只认 published」需产品另行拍板
+// (见 spec 2026-09-26 §3)。
+func lockPolicyForGrantTx(ctx context.Context, tx *sqlx.Tx, policyVersionID string) error {
+	var status string
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT status FROM inference_policy_versions WHERE id = $1 FOR KEY SHARE`,
+		policyVersionID).Scan(&status); err != nil {
+		return mapError("lock policy for grant", err)
+	}
+	if status == "retired" {
+		return domain.NewError(domain.CodeConflict,
+			"quota policy version is retired (不再允许新发放引用)")
+	}
+	return nil
+}
+
 // InsertEntitlement creates an entitlement. Duplicate grants from the same
-// source+revision hit the idempotency UNIQUE key (CodeConflict).
+// source+revision hit the idempotency UNIQUE key (CodeConflict).退休策略
+// 版本拒绝新发放(行锁 + 同事务校验,见 lockPolicyForGrantTx)。
 func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) error {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return mapError("insert entitlement begin", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if err := lockPolicyForGrantTx(ctx, tx, e.PolicyVersionID); err != nil {
+		return err
+	}
 	status := string(e.Status)
 	if status == "" {
 		status = string(domain.EntitlementActive)
@@ -54,7 +90,7 @@ func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) er
 	if e.Revision == 0 {
 		e.Revision = 1
 	}
-	err := s.db.QueryRowxContext(ctx,
+	err = tx.QueryRowxContext(ctx,
 		`INSERT INTO inference_entitlements
 		 (billing_account_id, source_type, source_id, model_ids, policy_version_id,
 		  anchor_at, effective_from, effective_to, revision, stackable, status)
@@ -64,15 +100,25 @@ func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) er
 		e.PolicyVersionID, e.AnchorAt, e.EffectiveFrom, e.EffectiveTo,
 		e.Revision, e.Stackable, status).
 		Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
-	return mapError("insert entitlement", err)
+	if err != nil {
+		return mapError("insert entitlement", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return mapError("insert entitlement commit", err)
+	}
+	committed = true
+	return nil
 }
 
 // InsertEntitlementTx is InsertEntitlement inside the caller's UnitOfWork —
 // the entitlement-sync worker commits the grant and the outbox delivery
-// mark in one transaction (Task 10).
+// mark in one transaction (Task 10).退休策略版本同样拒绝新发放。
 func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e *domain.Entitlement) error {
 	tx, err := sqlTx(w)
 	if err != nil {
+		return err
+	}
+	if err := lockPolicyForGrantTx(ctx, tx, e.PolicyVersionID); err != nil {
 		return err
 	}
 	status := string(e.Status)
@@ -103,6 +149,9 @@ func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e 
 // abort the whole tx (25P02) and poison every subsequent statement,
 // including the read-back (评审轮2 N-1: 并发 PAYG 开启的输家确定性 500).
 func (s *Store) insertEntitlementOrReadWinnerTx(ctx context.Context, tx *sqlx.Tx, e *domain.Entitlement) (*domain.Entitlement, error) {
+	if err := lockPolicyForGrantTx(ctx, tx, e.PolicyVersionID); err != nil {
+		return nil, err
+	}
 	status := string(e.Status)
 	if status == "" {
 		status = string(domain.EntitlementActive)

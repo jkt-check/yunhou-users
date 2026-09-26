@@ -279,3 +279,65 @@ func TestPutPAYGConfig_RejectsSupersededAndRetired(t *testing.T) {
 
 // 防止 management.QuotaPolicyFilter 与本文件未使用变量告警的编译锚点。
 var _ = uuid.NewString
+
+// grant 侧守卫(评审轮2 finding 1):retired 策略版本拒绝新发放引用;
+// superseded/draft 放行(支付链路兼容,见 lockPolicyForGrantTx 注释)。
+func TestGrantRejectsRetiredPolicy(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'retired' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	err := s.InsertEntitlement(ctx, &domain.Entitlement{
+		BillingAccountID: f.accountID, SourceType: domain.SourceGrant,
+		SourceID: "grant-retired-" + uuid.NewString(), ModelIDs: []string{f.modelID},
+		PolicyVersionID: f.policyID, AnchorAt: now, EffectiveFrom: now,
+	})
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("grant on retired policy: code = %v, want conflict", domain.CodeOf(err))
+	}
+
+	// 同事务路径(InsertEntitlementTx)同样拒绝。
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'draft' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	uow, _ := s.Begin(ctx)
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'retired' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	err = s.InsertEntitlementTx(ctx, uow, &domain.Entitlement{
+		BillingAccountID: f.accountID, SourceType: domain.SourceGrant,
+		SourceID: "grant-retired-tx-" + uuid.NewString(), ModelIDs: []string{f.modelID},
+		PolicyVersionID: f.policyID, AnchorAt: now, EffectiveFrom: now,
+	})
+	_ = uow.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("tx grant on retired policy: code = %v, want conflict", domain.CodeOf(err))
+	}
+}
+
+// PAYG 开启路径:配置引用的策略被退役后,新开启被拒(既有权益不受影响)。
+func TestEnsurePAYGEntitlement_RejectsRetiredPolicy(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'published' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutPAYGConfig(ctx, f.policyID, []string{f.modelID}, "user:ops@app:test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE inference_policy_versions SET status = 'retired' WHERE id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	uow, _ := s.Begin(ctx)
+	_, err := s.EnsurePAYGEntitlementTx(ctx, uow, f.accountID, time.Now().UTC())
+	_ = uow.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("payg enable on retired policy: code = %v, want conflict", domain.CodeOf(err))
+	}
+}

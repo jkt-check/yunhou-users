@@ -23,7 +23,12 @@ type fakeQPStore struct {
 	uow      *fakeUOW
 	inserted *QuotaPolicyInfo
 	updated  *QuotaPolicyInfo
-	publish  struct {
+	// publishConflict 模拟并发双发的输家:PublishQuotaPolicyTx 返回
+	// CodeConflict 并把行置为 published(赢家已提交的形态)。
+	publishConflict bool
+	// lockSeesRetired 模拟并发 retire 的后来者:锁内读到的已是 retired。
+	lockSeesRetired bool
+	publish         struct {
 		calls int
 		id    string
 		name  string
@@ -87,6 +92,12 @@ func (f *fakeQPStore) UpdateDraftQuotaPolicyTx(_ context.Context, _ domain.UnitO
 func (f *fakeQPStore) PublishQuotaPolicyTx(_ context.Context, _ domain.UnitOfWork, id, name string, at time.Time) error {
 	f.publish.calls++
 	f.publish.id, f.publish.name = id, name
+	if f.publishConflict {
+		if r, ok := f.rows[id]; ok {
+			r.Status = "published" // 赢家已提交
+		}
+		return domain.NewError(domain.CodeConflict, "quota policy is not draft")
+	}
 	if r, ok := f.rows[id]; ok {
 		r.Status = "published"
 	}
@@ -103,7 +114,16 @@ func (f *fakeQPStore) RetireQuotaPolicyTx(_ context.Context, _ domain.UnitOfWork
 }
 
 func (f *fakeQPStore) GetQuotaPolicyForUpdateTx(_ context.Context, _ domain.UnitOfWork, id string) (*QuotaPolicyInfo, error) {
-	return f.GetQuotaPolicyVersion(context.Background(), id)
+	r, err := f.GetQuotaPolicyVersion(context.Background(), id)
+	if err != nil {
+		return nil, err
+	}
+	if f.lockSeesRetired {
+		locked := *r
+		locked.Status = "retired" // 并发 retire 先到者已提交
+		return &locked, nil
+	}
+	return r, nil
 }
 
 func (f *fakeQPStore) CountActiveEntitlementsByPolicyTx(_ context.Context, _ domain.UnitOfWork, id string) (int, error) {
@@ -313,5 +333,36 @@ func TestQuotaPolicyRetire_Guard(t *testing.T) {
 	}
 	if audit.events[0].Action != "quota_policy.retire" || audit.events[1].Action != "quota_policy.retire" {
 		t.Fatalf("audit = %+v", audit.events)
+	}
+}
+
+// 并发双发同 id:输家撞冲突后重读已被赢家发布 → 幂等 200,零新增审计
+// (评审轮2:该分支此前不可达,错误注入固化)。
+func TestQuotaPolicyPublish_RacedReplayReturns200(t *testing.T) {
+	svc, fs, audit := newQPService()
+	fs.rows["p9"] = &QuotaPolicyInfo{ID: "p9", Name: "n", Revision: 1, Status: "draft", ModelIDs: []string{"deepseek-chat"}, WeeklyLimit: i64(1)}
+	fs.publishConflict = true
+
+	got, err := svc.Publish(context.Background(), "user:op@app:ops", "p9", "双击")
+	if err != nil || got.Status != "published" {
+		t.Fatalf("raced publish: got=%+v err=%v, want published/nil", got, err)
+	}
+	if fs.publish.calls != 1 || len(audit.events) != 0 {
+		t.Fatalf("loser must not audit: calls=%d audits=%d", fs.publish.calls, len(audit.events))
+	}
+}
+
+// 并发 retire 后来者:锁内读到 retired → 幂等 200,不再写/审计(评审轮2)。
+func TestQuotaPolicyRetire_RacedRetireIdempotent(t *testing.T) {
+	svc, fs, audit := newQPService()
+	fs.rows["p10"] = &QuotaPolicyInfo{ID: "p10", Name: "n", Revision: 1, Status: "published", ModelIDs: []string{"deepseek-chat"}, WeeklyLimit: i64(1)}
+	fs.lockSeesRetired = true
+
+	got, err := svc.Retire(context.Background(), "user:op@app:ops", "p10", "双击", false)
+	if err != nil || got.Status != "retired" {
+		t.Fatalf("raced retire: got=%+v err=%v, want retired/nil", got, err)
+	}
+	if fs.retire.calls != 0 || len(audit.events) != 0 {
+		t.Fatalf("loser must not retire/audit: calls=%d audits=%d", fs.retire.calls, len(audit.events))
 	}
 }

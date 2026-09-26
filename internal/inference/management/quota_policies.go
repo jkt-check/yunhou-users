@@ -400,8 +400,13 @@ func (s *QuotaPolicyService) Publish(ctx context.Context, actor, id, reason stri
 		if domain.CodeOf(err) == domain.CodeConflict {
 			// 并发双发同 id:输家在事务内撞「非 draft」或部分唯一索引;
 			// 重读已被赢家发布则按幂等 200 返回(评审轮1 finding 3/5,
-			// 冲突文案固定,不外泄索引名)。
-			if again, rerr := s.store.GetQuotaPolicyVersion(ctx, id); rerr == nil && again.Status == "published" {
+			// 冲突文案固定,不外泄索引名)。重读本身是瞬时故障时如实上抛
+			// 500,绝不谎报 409(评审轮2)。
+			again, rerr := s.store.GetQuotaPolicyVersion(ctx, id)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if again.Status == "published" {
 				return again, nil
 			}
 			return nil, domain.NewError(domain.CodeConflict, "quota policy publish conflict for (name)")
@@ -459,15 +464,14 @@ func (s *QuotaPolicyService) Retire(ctx context.Context, actor, id, reason strin
 	if locked.Status == "retired" {
 		return locked, nil // 并发 retire 先到者已生效,后来者幂等
 	}
-	referencedBy := 0
-	if locked.Status != "draft" {
-		referencedBy, err = s.store.CountActiveEntitlementsByPolicyTx(ctx, uow, id)
-		if err != nil {
-			return nil, err
-		}
-		if referencedBy > 0 && !force {
-			return nil, &QuotaPolicyRetireConflictError{Info: locked, ReferencedBy: referencedBy}
-		}
+	// draft 也计数(审计里的 referenced_by 始终为退役时刻真实值——直连
+	// SQL 种出的 draft 引用不留盲点),但 draft 退役永不阻断(需求 §3)。
+	referencedBy, err := s.store.CountActiveEntitlementsByPolicyTx(ctx, uow, id)
+	if err != nil {
+		return nil, err
+	}
+	if locked.Status != "draft" && referencedBy > 0 && !force {
+		return nil, &QuotaPolicyRetireConflictError{Info: locked, ReferencedBy: referencedBy}
 	}
 	if err := s.store.RetireQuotaPolicyTx(ctx, uow, locked.ID); err != nil {
 		return nil, err

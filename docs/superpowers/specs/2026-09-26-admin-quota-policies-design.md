@@ -70,16 +70,27 @@ cn-staging 已核验零重复(2026-09-26);cn-prod / intl-prod 部署前由运维
   缺省 reject。
 - **幂等**(需求 §5.4):publish/retire 对同 id 重复调用 → 200 返回当前
   状态,不产生第二条审计;create 不幂等(409)。
-- **retire 状态机**:draft → retired(直接);retired → 200(幂等);
-  published/superseded → retired 走 referenced_by 保护(默认 409,
-  ?force=true 放行)。superseded 版本仍可能被存量权益 pin,故同样走
-  保护(超出需求字面、属保守扩展,已在此注明)。
+- **retire 状态机**:draft → retired(直接,永不阻断但引用数照计入
+  审计);retired → 200(幂等);published/superseded → retired 走双维度
+  引用保护(默认 409,?force=true 放行):`referenced_by`(active 权益)
+  + `referenced_by_configs`(plan_benefit_configs + PAYG 配置行,评审
+  轮3 补强——grant 守卫落地后配置级引用会让后续发放硬失败)。配置计数
+  口径偏保守:不 join plans 过滤 is_active,误报方向安全、force 可放行。
+  superseded 版本仍可能被存量权益 pin,故同样走保护(超出需求字面、属
+  保守扩展,已在此注明)。详情页 GET 同样返回双计数。
 - **grant 侧退役拒发**(评审轮2 补强):权益写入三路径
   (InsertEntitlement/InsertEntitlementTx/PAYG 开启)先 `FOR KEY SHARE`
   锁策略行,retired 版本拒绝新发放引用(与 retire 的 FOR UPDATE 互斥
   双向定序)。**superseded 放行**:支付链路 plan_benefit_configs 可能仍
   指向被替代版本,拒 superseded 会让已支付订单激活失败;严格「读侧只认
   published」如产品需要,另行拍板。
+- **Revise/Revive 刻意豁免**(评审轮4):续费/升级/复购修订的是既有
+  消费主体,不加退役守卫——阻断会打断已支付客户的服务连续性,与
+  superseded 放行同理。「升级不得切换到退役版本」如产品需要,另行拍板。
+- **退役拒发的归类**:拒发错误是 typed `postgres.PolicyRetiredError`
+  (Unwrap 仍 CodeConflict);entitlement-sync worker 先 errors.As 判型
+  再看 code——退役拒绝走 Failed(有界退避 + ERROR),绝不按 UNIQUE
+  良性竞争即时重排(否则热循环 + 已支付客户静默丢权益)。
 - **pin 不变性**(需求 §5.1,验收 A13):权益持有 policy_version_id 不变;
   发布新 revision 不影响存量权益的配额口径。网关按 id 读取,superseded/
   retired 版本照常服务存量 pin;仅新发放(PAYG config、人工发放)不得
@@ -89,7 +100,7 @@ cn-staging 已核验零重复(2026-09-26);cn-prod / intl-prod 部署前由运维
 
 action:quota_policy.create / .update / .publish / .retire;
 detail:name、revision、前后 status、reason(及 retire 的 referenced_by/
-force)。写 + 审计同事务。
+referenced_by_configs/force;update 的 changed_fields)。写 + 审计同事务。
 
 ## 5. 验收矩阵 → 测试映射
 

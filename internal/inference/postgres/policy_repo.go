@@ -329,7 +329,9 @@ func (s *Store) CountActiveEntitlementsByPolicyTx(ctx context.Context, w domain.
 // CountConfigReferencesByPolicy counts CONFIG-level references to this
 // version: plan_benefit_configs rows + the PAYG config row (retire 保护的
 // 第二维度,评审轮3 finding 2 —— grant 守卫落地后,配置仍指向被退役版本
-// 会让后续发放硬失败,默认阻断退役)。
+// 会让后续发放硬失败,默认阻断退役)。口径偏保守:不 join plans 过滤
+// is_active(已下架套餐的配置行也计数,评审轮4 finding 3),运营可经
+// ?force=true 放行——误报方向安全,漏报方向不安全。
 func (s *Store) CountConfigReferencesByPolicy(ctx context.Context, policyVersionID string) (int, error) {
 	var n int
 	if err := s.db.QueryRowxContext(ctx,

@@ -174,6 +174,9 @@ func (s *Store) insertEntitlementOrReadWinnerTx(ctx context.Context, tx *sqlx.Tx
 	}
 	// 幂等无操作短路先于退役守卫(评审轮3 finding 3):已持有同键权益的
 	// 调用方 re-ensure 不因其后策略退役而报错;退役守卫只拦真正的新发放。
+	// 注:当前唯一调用方(EnsurePAYGEntitlementTx)在进入本函数前已按来源
+	// 键短路,此探测是为未来调用方留的防御(评审轮4 finding 2,语义是
+	// 精确 revision 行,与下方竞态读回的 latest-revision 不同)。
 	{
 		var row entitlementRow
 		err := tx.QueryRowxContext(ctx,
@@ -253,6 +256,10 @@ func (s *Store) getLatestEntitlementBySourceTx(ctx context.Context, tx *sqlx.Tx,
 }
 
 // ReviseEntitlementTx is ReviseEntitlement inside the caller's UnitOfWork.
+// 退役守卫的刻意豁免(评审轮4 finding 1,与 superseded 放行同理):续费/
+// 升级/复购修订的是既有消费主体,阻断 retired 目标会打断已支付客户的
+// 服务连续性;Q1 的「不再允许新发放引用」字面只约束全新发放(三条
+// INSERT 路径已锁)。如产品要求升级也不得切换到退役版本,另行拍板。
 func (s *Store) ReviseEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error) {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -283,6 +290,7 @@ func (s *Store) ReviseEntitlementTx(ctx context.Context, w domain.UnitOfWork, id
 // active while applying the patch — the re-purchase-after-refund path.
 // Same optimistic guard as ReviseEntitlement; the anchor and the
 // consumption subject (ID) never change, so quota history stays attached.
+// 退役守卫豁免同 ReviseEntitlementTx(消费主体连续性,见该函数注释)。
 func (s *Store) ReviveEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error) {
 	tx, err := sqlTx(w)
 	if err != nil {

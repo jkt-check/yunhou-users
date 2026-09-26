@@ -986,7 +986,10 @@ func (s *Store) getPAYGConfigTx(ctx context.Context, tx *sqlx.Tx) (*PAYGConfig, 
 	}, nil
 }
 
-// PutPAYGConfig publishes the PAYG default. The policy version must exist
+// PutPAYGConfig publishes the PAYG default.已知残余竞态(评审轮4
+// finding 4,可接受):published 校验不在策略行锁内,与并发 retire 交错
+// 时配置可能落在刚退役的版本上——后果是下次开启 PAYG 被
+// PolicyRetiredError 响亮拒绝(可见、可恢复),不会静默发放。The policy version must exist
 // and be published (没有配置的商品保持不可购买，设计 §4.3).
 func (s *Store) PutPAYGConfig(ctx context.Context, policyVersionID string, modelIDs []string, updatedBy string) (*PAYGConfig, error) {
 	if updatedBy == "" {

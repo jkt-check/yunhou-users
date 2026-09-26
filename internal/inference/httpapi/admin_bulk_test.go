@@ -131,6 +131,8 @@ func newOpsFixture(t *testing.T) *opsFixture {
 	usageH.RegisterPreview(modelsGroup)
 	// 售价版本管理面（models:manage）——创建只追加 + 列表。
 	httpapi.NewAdminPriceVersionsHandler(management.NewPriceVersionService(store, store, nil)).Register(modelsGroup)
+	// 配额策略管理面（models:manage，Q2 过渡口径）——生命周期六端点。
+	httpapi.NewAdminQuotaPoliciesHandler(management.NewQuotaPolicyService(store, store, nil)).Register(modelsGroup)
 	// 既有目录发布面（导入→草稿→发布链路断言用）。Task 16：读写两面都挂
 	// （RegisterReadOnly 提供 GET 列表/详情/revisions/active 覆盖路径）。
 	catalogSvc := catalog.NewService(store)

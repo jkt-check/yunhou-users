@@ -44,9 +44,65 @@ func (r entitlementRow) toDomain() *domain.Entitlement {
 	}
 }
 
+// PolicyRetiredError reports a grant attempt pinning a RETIRED quota
+// policy version (Q1:retire = 不再允许新发放引用)。独立类型的原因:
+// entitlement-sync worker 把 CodeConflict 当「并发发放者先到」的良性竞争
+// 立即重排——退役拒绝若只凭 code 区分会被误归类成热循环(评审轮3
+// finding 1),调用方必须 errors.As 先判类型再看 code。
+type PolicyRetiredError struct {
+	PolicyVersionID string
+}
+
+func (e *PolicyRetiredError) Error() string {
+	return "quota policy version " + e.PolicyVersionID + " is retired (不再允许新发放引用)"
+}
+
+// Unwrap keeps the domain mapping at CodeConflict (HTTP 面仍是 409)。
+func (e *PolicyRetiredError) Unwrap() error {
+	return domain.NewError(domain.CodeConflict, e.Error())
+}
+
+// lockPolicyForGrantTx locks the policy row FOR KEY SHARE and rejects
+// grants pinning a RETIRED version (Q1 的运营语义:retire = 不再允许新发放
+// 引用)。锁与 retire 的 FOR UPDATE 互斥:grant 先拿锁则 retire 的引用
+// 计数必然等到本次提交后;retire 先提交则此处读到 retired 直接拒——两个
+// 方向都定序,补全评审轮2 finding 1 的 TOCTOU 残余。superseded 放行:
+// 支付链路(plan_benefit_configs)可能仍指向被替代版本,拒 superseded 会
+// 让已支付订单的激活静默失败;严格「读侧只认 published」需产品另行拍板
+// (见 spec 2026-09-26 §3)。
+func lockPolicyForGrantTx(ctx context.Context, tx *sqlx.Tx, policyVersionID string) error {
+	var status string
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT status FROM inference_policy_versions WHERE id = $1 FOR KEY SHARE`,
+		policyVersionID).Scan(&status); err != nil {
+		return mapError("lock policy for grant", err)
+	}
+	if status == "retired" {
+		return &PolicyRetiredError{PolicyVersionID: policyVersionID}
+	}
+	return nil
+}
+
 // InsertEntitlement creates an entitlement. Duplicate grants from the same
-// source+revision hit the idempotency UNIQUE key (CodeConflict).
+// source+revision hit the idempotency UNIQUE key (CodeConflict).退休策略
+// 版本拒绝新发放(行锁 + 同事务校验,见 lockPolicyForGrantTx)。
+// 注意:本方法自持事务(BeginTxx + 锁 + 插入 + 提交)——绝不可在本 store
+// 已持有 UnitOfWork 的调用栈里调用(原子性会静默拆分;MaxOpenConns(1)
+// 下直接死锁)。组合事务请用 InsertEntitlementTx。
 func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) error {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return mapError("insert entitlement begin", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if err := lockPolicyForGrantTx(ctx, tx, e.PolicyVersionID); err != nil {
+		return err
+	}
 	status := string(e.Status)
 	if status == "" {
 		status = string(domain.EntitlementActive)
@@ -54,7 +110,7 @@ func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) er
 	if e.Revision == 0 {
 		e.Revision = 1
 	}
-	err := s.db.QueryRowxContext(ctx,
+	err = tx.QueryRowxContext(ctx,
 		`INSERT INTO inference_entitlements
 		 (billing_account_id, source_type, source_id, model_ids, policy_version_id,
 		  anchor_at, effective_from, effective_to, revision, stackable, status)
@@ -64,15 +120,25 @@ func (s *Store) InsertEntitlement(ctx context.Context, e *domain.Entitlement) er
 		e.PolicyVersionID, e.AnchorAt, e.EffectiveFrom, e.EffectiveTo,
 		e.Revision, e.Stackable, status).
 		Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
-	return mapError("insert entitlement", err)
+	if err != nil {
+		return mapError("insert entitlement", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return mapError("insert entitlement commit", err)
+	}
+	committed = true
+	return nil
 }
 
 // InsertEntitlementTx is InsertEntitlement inside the caller's UnitOfWork —
 // the entitlement-sync worker commits the grant and the outbox delivery
-// mark in one transaction (Task 10).
+// mark in one transaction (Task 10).退休策略版本同样拒绝新发放。
 func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e *domain.Entitlement) error {
 	tx, err := sqlTx(w)
 	if err != nil {
+		return err
+	}
+	if err := lockPolicyForGrantTx(ctx, tx, e.PolicyVersionID); err != nil {
 		return err
 	}
 	status := string(e.Status)
@@ -103,12 +169,33 @@ func (s *Store) InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e 
 // abort the whole tx (25P02) and poison every subsequent statement,
 // including the read-back (评审轮2 N-1: 并发 PAYG 开启的输家确定性 500).
 func (s *Store) insertEntitlementOrReadWinnerTx(ctx context.Context, tx *sqlx.Tx, e *domain.Entitlement) (*domain.Entitlement, error) {
+	if e.Revision == 0 {
+		e.Revision = 1
+	}
+	// 幂等无操作短路先于退役守卫(评审轮3 finding 3):已持有同键权益的
+	// 调用方 re-ensure 不因其后策略退役而报错;退役守卫只拦真正的新发放。
+	// 注:当前唯一调用方(EnsurePAYGEntitlementTx)在进入本函数前已按来源
+	// 键短路,此探测是为未来调用方留的防御(评审轮4 finding 2,语义是
+	// 精确 revision 行,与下方竞态读回的 latest-revision 不同)。
+	{
+		var row entitlementRow
+		err := tx.QueryRowxContext(ctx,
+			`SELECT * FROM inference_entitlements
+			 WHERE source_type = $1 AND source_id = $2 AND revision = $3`,
+			string(e.SourceType), e.SourceID, e.Revision).StructScan(&row)
+		switch {
+		case err == nil:
+			return row.toDomain(), nil
+		case !errors.Is(err, sql.ErrNoRows):
+			return nil, mapError("read entitlement by source key", err)
+		}
+	}
+	if err := lockPolicyForGrantTx(ctx, tx, e.PolicyVersionID); err != nil {
+		return nil, err
+	}
 	status := string(e.Status)
 	if status == "" {
 		status = string(domain.EntitlementActive)
-	}
-	if e.Revision == 0 {
-		e.Revision = 1
 	}
 	var row entitlementRow
 	err := tx.QueryRowxContext(ctx,
@@ -169,6 +256,10 @@ func (s *Store) getLatestEntitlementBySourceTx(ctx context.Context, tx *sqlx.Tx,
 }
 
 // ReviseEntitlementTx is ReviseEntitlement inside the caller's UnitOfWork.
+// 退役守卫的刻意豁免(评审轮4 finding 1,与 superseded 放行同理):续费/
+// 升级/复购修订的是既有消费主体,阻断 retired 目标会打断已支付客户的
+// 服务连续性;Q1 的「不再允许新发放引用」字面只约束全新发放(三条
+// INSERT 路径已锁)。如产品要求升级也不得切换到退役版本,另行拍板。
 func (s *Store) ReviseEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error) {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -199,6 +290,7 @@ func (s *Store) ReviseEntitlementTx(ctx context.Context, w domain.UnitOfWork, id
 // active while applying the patch — the re-purchase-after-refund path.
 // Same optimistic guard as ReviseEntitlement; the anchor and the
 // consumption subject (ID) never change, so quota history stays attached.
+// 退役守卫豁免同 ReviseEntitlementTx(消费主体连续性,见该函数注释)。
 func (s *Store) ReviveEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error) {
 	tx, err := sqlTx(w)
 	if err != nil {

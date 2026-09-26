@@ -607,7 +607,7 @@ func TestV1ChatCompletions_ToolsCapabilityRejected(t *testing.T) {
 	// 加进权益并让它的快照模型不支持工具。)
 	ctx := context.Background()
 	pol := &postgres.PolicyVersion{
-		Name: "coding-plan", Revision: 2, ModelIDs: []string{f.modelID, "kimi-k2"},
+		Name: "coding-plan-k2", Revision: 1, ModelIDs: []string{f.modelID, "kimi-k2"},
 		FiveHourLimit: microP(1_000_000_000), WeeklyLimit: microP(10_000_000_000),
 		MonthlyLimit: microP(100_000_000_000), Status: "published",
 	}

@@ -112,6 +112,8 @@ type sqlxExecutor interface {
 //   - 23P01 exclusion violation     → CodeConflict
 //   - 23514 check violation         → CodeInvalidInput
 //   - 23503 foreign-key violation   → CodeInvalidInput
+//   - 22P02 invalid input syntax    → CodeInvalidInput(如非 UUID 的 id 撞
+//     uuid 列——不设此映射会漏成 500,评审轮1 finding)
 //   - sql.ErrNoRows                 → CodeNotFound
 func mapError(op string, err error) error {
 	if err == nil {
@@ -128,6 +130,8 @@ func mapError(op string, err error) error {
 			return domain.WrapError(domain.CodeInvalidInput, op+": check violation ("+pqErr.Constraint+")", err)
 		case "23503":
 			return domain.WrapError(domain.CodeInvalidInput, op+": foreign key violation ("+pqErr.Constraint+")", err)
+		case "22P02":
+			return domain.WrapError(domain.CodeInvalidInput, op+": invalid input syntax", err)
 		}
 	}
 	if errors.Is(err, sql.ErrNoRows) {

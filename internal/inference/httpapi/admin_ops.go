@@ -45,6 +45,10 @@ type AdminOps struct {
 	// PriceVersions is the price-version admin surface (创建只追加 + 列表;
 	// spec 2026-09-25-admin-price-versions-design.md); models:manage.
 	PriceVersions *AdminPriceVersionsHandler
+	// QuotaPolicies is the quota-policy lifecycle admin surface (spec
+	// 2026-09-26-admin-quota-policies-design.md); models:manage (Q2 过渡口径,
+	// 未来收敛 quota:manage).
+	QuotaPolicies *AdminQuotaPoliciesHandler
 }
 
 // Mount wires the write surface onto g. The caller must already have
@@ -83,5 +87,9 @@ func (o *AdminOps) Mount(g *gin.RouterGroup) {
 	// 售价版本管理面（spec 2026-09-25）：创建只追加 + 列表，同 models:manage。
 	if o.PriceVersions != nil && o.RequireModels != nil {
 		o.PriceVersions.Register(g.Group("", o.RequireModels))
+	}
+	// 配额策略管理面（spec 2026-09-26）：生命周期六端点，同 models:manage。
+	if o.QuotaPolicies != nil && o.RequireModels != nil {
+		o.QuotaPolicies.Register(g.Group("", o.RequireModels))
 	}
 }

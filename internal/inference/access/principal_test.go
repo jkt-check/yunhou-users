@@ -46,11 +46,17 @@ func TestAuthenticate_Rejections(t *testing.T) {
 	r := NewResolver(fs, nil)
 	plaintext, _, _ := mintKey(t, fs, svc, "user-a")
 
+	// wrongSecret 的末字符必须与真值不同:真值末字符恰好是 "A" 时
+	// 直接拼接会得到正确的 key(每跑约 1.6% 的随机 flake,评审轮5)。
+	wrongLast := "A"
+	if plaintext[len(plaintext)-1] == 'A' {
+		wrongLast = "B"
+	}
 	for name, presented := range map[string]string{
 		"empty":         "",
 		"malformed":     "sk-not-ours",
 		"unknownPrefix": "yk-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-		"wrongSecret":   plaintext[:len(plaintext)-1] + "A",
+		"wrongSecret":   plaintext[:len(plaintext)-1] + wrongLast,
 	} {
 		if _, err := r.Authenticate(context.Background(), presented); err == nil || domain.CodeOf(err) != domain.CodeInvalidKey {
 			t.Errorf("%s: want invalid_key, got %v", name, err)

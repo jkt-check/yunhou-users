@@ -166,8 +166,9 @@ func TestCreateOrder_CodingPlanUpgradeRules(t *testing.T) {
 	uid := seedUser(t, db)
 	seedCodingPlan(t, db, stack.store, "cp_basic", 29.9, 30, "cp-policy", 1, []string{"glm-4.6"})
 	// cp_pro 与 cp_basic 同为 30 天周期 —— 旧逻辑会认为"不构成升级"（周期相同），
-	// 新规则只看显式规则行。
-	seedCodingPlan(t, db, stack.store, "cp_pro", 99.9, 30, "cp-policy", 2, []string{"glm-4.6", "kimi-k2"})
+	// 新规则只看显式规则行。两档各有独立策略名（迁移 040：每 name 至多一条
+	// published；测试只按 id 引用策略，name 无语义）。
+	seedCodingPlan(t, db, stack.store, "cp_pro", 99.9, 30, "cp-policy-pro", 1, []string{"glm-4.6", "kimi-k2"})
 
 	// 先买 basic 并支付激活。
 	order1, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
@@ -338,6 +339,12 @@ func TestCodingPlan_SnapshotHonoredAfterPlanEdit(t *testing.T) {
 	uid := seedUser(t, db)
 	polID := seedCodingPlan(t, db, stack.store, "cp_basic", 29.9, 30, "cp-policy", 1, []string{"glm-4.6"})
 	// 运营发布的新版本（更大配额 + 更多模型）——下单后才挂到配置上的。
+	// 迁移 040 的「每 name 单 published」不变量:发布新版即旧版转
+	// superseded(与 PublishQuotaPolicyTx 同事务的等价落库形态)。
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE inference_policy_versions SET status = 'superseded' WHERE id = $1`, polID); err != nil {
+		t.Fatal(err)
+	}
 	pol2 := &inferencepostgres.PolicyVersion{
 		Name: "cp-policy", Revision: 2, ModelIDs: []string{"glm-4.6", "kimi-k2"},
 		FiveHourLimit: microcredits(9_000_000), Status: "published",

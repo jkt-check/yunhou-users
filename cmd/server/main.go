@@ -352,6 +352,9 @@ func main() {
 		// 售价版本管理面（只追加创建 + 列表；revision 自然键幂等，写 + 审计
 		// 同事务）—— spec 2026-09-25-admin-price-versions-design.md。
 		PriceVersions: inferencehttpapi.NewAdminPriceVersionsHandler(inferencemanagement.NewPriceVersionService(infStore, infStore, nil)),
+		// 配额策略管理面（生命周期六端点；publish 同事务 supersede，retire
+		// 引用保护，写 + 审计同事务）—— spec 2026-09-26-admin-quota-policies-design.md。
+		QuotaPolicies: inferencehttpapi.NewAdminQuotaPoliciesHandler(inferencemanagement.NewQuotaPolicyService(infStore, infStore, nil)),
 	}
 
 	// Task 5: customer API keys + caller principal resolution. The

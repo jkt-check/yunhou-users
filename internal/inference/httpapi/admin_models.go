@@ -868,6 +868,13 @@ func (h *AdminModelsHandler) Publish(c *gin.Context) {
 		return
 	}
 	if dryRunOf(c) {
+		// 评审修复（R7-N7 轮1）：在类型转换前判空——h.prober 是具体类型
+		// *ProbeService，直接传给 DeploymentProber 接口会得到非 nil 的
+		// typed-nil，manager 层的 prober==nil fail-closed 检查永远打不中。
+		if h.prober == nil {
+			fail(c, domain.NewError(domain.CodeInternal, "probe service not configured"))
+			return
+		}
 		report, err := h.mgr.PublishDryRun(c.Request.Context(), h.prober)
 		if err != nil {
 			fail(c, err)

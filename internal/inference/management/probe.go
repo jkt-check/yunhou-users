@@ -78,18 +78,13 @@ type ProbeService struct {
 
 // NewProbeService builds the probe service. validateURL is the egress/SSRF
 // policy — nil fails closed on any non-empty base_url（与 CatalogManager 写
-// 路径同口径）; client should be providers.NewHTTPClient(egress) in
-// production so every dialed IP is validated at connection time（DNS
-// rebinding 兜底）, nil falls back to http.DefaultClient.
+// 路径同口径）; client MUST be providers.NewHTTPClient(egress) in production
+// so every dialed IP is validated at connection time（DNS rebinding 兜底）。
+// nil client 是装配错误：探测时 fail-closed 报 CodeInternal，绝不回落
+// http.DefaultClient（它跟随重定向、无 egress 重校验、无 dial 时 IP 绑定
+// ——SSRF 边界不允许静默降级，评审修复 R7-N7 轮1）。
 func NewProbeService(store ProbeStore, resolver BearerResolver, validateURL func(context.Context, string) error, client *http.Client) *ProbeService {
 	return &ProbeService{store: store, resolver: resolver, validateURL: validateURL, client: client, Timeout: DefaultProbeTimeout}
-}
-
-func (s *ProbeService) httpClient() *http.Client {
-	if s.client != nil {
-		return s.client
-	}
-	return http.DefaultClient
 }
 
 func (s *ProbeService) timeout() time.Duration {
@@ -107,6 +102,10 @@ func (s *ProbeService) ProbeDeployment(ctx context.Context, deploymentID string)
 	dep, err := s.store.GetDeployment(ctx, deploymentID)
 	if err != nil {
 		return nil, err
+	}
+	// SSRF 边界 fail-closed：client 未装配 = 配置错误，硬失败且绝不出站。
+	if s.client == nil {
+		return nil, domain.NewError(domain.CodeInternal, "probe http client not configured")
 	}
 	base := strings.TrimSuffix(strings.TrimSpace(dep.BaseURL), "/")
 	if base == "" {
@@ -138,7 +137,7 @@ func (s *ProbeService) ProbeDeployment(ctx context.Context, deploymentID string)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	start := time.Now()
-	resp, err := s.httpClient().Do(req)
+	resp, err := s.client.Do(req)
 	res.LatencyMS = time.Since(start).Milliseconds()
 	if err != nil {
 		res.ErrorSummary = capProbeSummary(redactProbeSecret(s.transportErrorSummary(pctx, err), token))

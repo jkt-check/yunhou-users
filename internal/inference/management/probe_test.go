@@ -103,7 +103,7 @@ func TestProbeDeployment_OK(t *testing.T) {
 	defer srv.Close()
 
 	store, resolver := probeTestFixture(srv.URL)
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -135,7 +135,7 @@ func TestProbeDeployment_MissingV1Shape(t *testing.T) {
 	defer srv.Close()
 
 	store, resolver := probeTestFixture(srv.URL) // 刻意不带 /v1
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -154,7 +154,7 @@ func TestProbeDeployment_ConnectionRefused(t *testing.T) {
 	srv.Close() // 立即关闭：dial 必拒绝
 
 	store, resolver := probeTestFixture(url)
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -172,7 +172,7 @@ func TestProbeDeployment_Timeout(t *testing.T) {
 	defer srv.Close()
 
 	store, resolver := probeTestFixture(srv.URL)
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	svc.Timeout = 50 * time.Millisecond
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
@@ -193,7 +193,7 @@ func TestProbeDeployment_SecretNeverLeaks(t *testing.T) {
 	defer srv.Close()
 
 	store, resolver := probeTestFixture(srv.URL)
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -211,7 +211,7 @@ func TestProbeDeployment_SecretNeverLeaks(t *testing.T) {
 func TestProbeDeployment_ResolveFailureNoLeak(t *testing.T) {
 	store, resolver := probeTestFixture("https://api.example.com/v1")
 	resolver.errs = map[string]error{"cred-1": errors.New("vault boom: key bytes sk-probe-secret corrupt")}
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -227,7 +227,7 @@ func TestProbeDeployment_ResolveFailureNoLeak(t *testing.T) {
 func TestProbeDeployment_NoCredential(t *testing.T) {
 	store, resolver := probeTestFixture("https://api.example.com/v1")
 	store.credentials = nil
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -253,7 +253,7 @@ func TestProbeDeployment_RevokedSkippedRotatingUsed(t *testing.T) {
 		{ID: "cred-rot", ProviderID: "prov-1", AuthType: "api_key", Status: "rotating", Generation: 4},
 	}
 	resolver.tokens = map[string]string{"cred-rot": "sk-rotating"}
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -280,7 +280,7 @@ func TestProbeDeployment_EgressRejected(t *testing.T) {
 
 	store, resolver := probeTestFixture(srv.URL)
 	svc := NewProbeService(store, resolver,
-		func(context.Context, string) error { return errors.New("policy: host not allowed") }, nil)
+		func(context.Context, string) error { return errors.New("policy: host not allowed") }, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -297,7 +297,7 @@ func TestProbeDeployment_EgressRejected(t *testing.T) {
 // 非空 base_url（与 CatalogManager 写路径同一 fail-closed 口径）。
 func TestProbeDeployment_EgressNilFailsClosed(t *testing.T) {
 	store, resolver := probeTestFixture("https://api.example.com/v1")
-	svc := NewProbeService(store, resolver, nil, nil)
+	svc := NewProbeService(store, resolver, nil, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -307,9 +307,30 @@ func TestProbeDeployment_EgressNilFailsClosed(t *testing.T) {
 	}
 }
 
+// TestProbeDeployment_NilClientFailsClosed 钉住评审修复（R7-N7 轮1 finding2）：
+// nil client 是装配错误 → 硬失败 CodeInternal 且绝不 dial（绝不静默回落
+// http.DefaultClient——它跟随重定向、无 egress 重校验、无 dial 时 IP 绑定）。
+func TestProbeDeployment_NilClientFailsClosed(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store, resolver := probeTestFixture(srv.URL)
+	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	if _, err := svc.ProbeDeployment(context.Background(), "dep-1"); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("nil client must fail closed with CodeInternal, got %v", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("no dial allowed with nil client, hits=%d", hits.Load())
+	}
+}
+
 func TestProbeDeployment_EmptyBaseURL(t *testing.T) {
 	store, resolver := probeTestFixture("")
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	res, err := svc.ProbeDeployment(context.Background(), "dep-1")
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -321,7 +342,7 @@ func TestProbeDeployment_EmptyBaseURL(t *testing.T) {
 
 func TestProbeDeployment_NotFound(t *testing.T) {
 	store, resolver := probeTestFixture("https://api.example.com/v1")
-	svc := NewProbeService(store, resolver, permissiveURL, nil)
+	svc := NewProbeService(store, resolver, permissiveURL, &http.Client{})
 	if _, err := svc.ProbeDeployment(context.Background(), "dep-unknown"); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("want CodeNotFound, got %v", err)
 	}

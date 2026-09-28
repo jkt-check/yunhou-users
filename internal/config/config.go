@@ -173,15 +173,14 @@ type Config struct {
 	// body (e.g. deepseek-v4-flash). Default "deepseek-v4-flash".
 	DeepSeekModel string
 	// LLMProvidersJSON is the multi-model catalog (providers + logical
-	// models) as one JSON object, consumed two ways at boot: (1) parsed and
-	// validated by llm.ParseCatalog as the /chat runtime catalog (takes
-	// precedence over the legacy DEEPSEEK_* triple; when empty those envs
-	// synthesize a one-model catalog, back-compat); (2) ONE explicit
-	// idempotent import into the inference catalog DB (基线报告差距 1) —
-	// entities missing from the database are inserted as DRAFT, anything
-	// already present is left untouched, and the inference runtime truth is
-	// the published DB revision, never this env. Invalid JSON fails startup
-	// loudly. See docs/api-integration-guide.md.
+	// models) as one JSON object, parsed and validated by llm.ParseCatalog
+	// as the /chat runtime catalog (takes precedence over the legacy
+	// DEEPSEEK_* triple; when empty those envs synthesize a one-model
+	// catalog, back-compat). Invalid JSON fails startup loudly.
+	// See docs/api-integration-guide.md. NOTE: this var is /chat-only —
+	// the inference catalog env import reads INFERENCE_CATALOG_JSON
+	// instead (the two schemas are incompatible; sharing one var made any
+	// /chat catalog crash boot on the inference import's stricter schema).
 	LLMProvidersJSON string
 	// ChatLogPath is the file for chat access logs (one JSON line per
 	// request: user_id, session_id, input messages, output text, status,
@@ -218,6 +217,17 @@ type Config struct {
 	// applies when the client sends no model (旧无 model 默认). Required
 	// when InferenceKayaChatGateway is on.
 	KayaChatModel string
+
+	// InferenceCatalogJSON is the inference catalog env import payload
+	// (EnvCatalog schema, see internal/inference/catalog/import.go): ONE
+	// explicit idempotent import at boot (基线报告差距 1) — entities
+	// missing from the database are inserted as DRAFT, anything already
+	// present is left untouched, and the inference runtime truth is the
+	// published DB revision, never this env. Empty = no import. This is a
+	// different schema from LLM_PROVIDERS_JSON (the /chat catalog); the
+	// two were split after sharing one var made every /chat catalog config
+	// fatal at boot.
+	InferenceCatalogJSON string
 
 	// InferenceLifecycleEnforce switches the gateway's non-active-model
 	// lifecycle gate from observe (log + alert only, 默认) to enforce
@@ -322,6 +332,7 @@ func Load() *Config {
 		InferenceAccountRPM:        parseIntOr(envOr("INFERENCE_ACCOUNT_RPM", "120"), 120),
 		InferenceKayaChatGateway:   os.Getenv("INFERENCE_KAYA_CHAT_GATEWAY") == "1",
 		KayaChatModel:              os.Getenv("KAYA_CHAT_MODEL"),
+		InferenceCatalogJSON:       os.Getenv("INFERENCE_CATALOG_JSON"),
 		InferenceLifecycleEnforce:  os.Getenv("INFERENCE_LIFECYCLE_ENFORCE") == "1",
 
 		InferenceRecoveryInterval:        parseDurationOr(envOr("INFERENCE_RECOVERY_INTERVAL", "30s"), 30*time.Second),

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// import_edges_test.go — Task 16 覆盖率补强：LLM_PROVIDERS_JSON 解析的
+// import_edges_test.go — Task 16 覆盖率补强：INFERENCE_CATALOG_JSON 解析的
 // 校验分支（纯解析，不落库；幂等导入主路径已在 import_test.go）。
 
 func TestParseEnvCatalog_ValidationBranches(t *testing.T) {

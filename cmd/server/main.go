@@ -257,7 +257,7 @@ func main() {
 
 	// Inference model catalog (Kaya Coding Plan Task 3): draft CRUD with
 	// optimistic locking, atomic publish/rollback and immutable snapshots
-	// over migration 024. The LLM_PROVIDERS_JSON import is explicit and
+	// over migration 024. The INFERENCE_CATALOG_JSON import is explicit and
 	// idempotent: it inserts only what is missing and never overwrites
 	// DB-operational config on restart (基线报告差距 1).
 	infStore := inferencepostgres.NewStore(db)
@@ -432,12 +432,12 @@ func main() {
 		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, cfg.KayaChatModel)
 		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}
-	if cfg.LLMProvidersJSON != "" {
-		res, err := catalogSvc.ImportEnvCatalog(context.Background(), cfg.LLMProvidersJSON)
+	if cfg.InferenceCatalogJSON != "" {
+		res, err := catalogSvc.ImportEnvCatalog(context.Background(), cfg.InferenceCatalogJSON)
 		if err != nil {
-			log.Fatalf("LLM_PROVIDERS_JSON import failed: %v", err)
+			log.Fatalf("INFERENCE_CATALOG_JSON import failed: %v", err)
 		}
-		log.Printf("LLM_PROVIDERS_JSON import: +%d providers, +%d models, +%d deployments, +%d routes, %d already present (skipped)",
+		log.Printf("INFERENCE_CATALOG_JSON import: +%d providers, +%d models, +%d deployments, +%d routes, %d already present (skipped)",
 			res.ProvidersInserted, res.ModelsInserted, res.DeploymentsInserted, res.RoutesInserted, res.Skipped)
 	}
 	// 评审修复（批次8 Minor-3）：/chat 网关开启时 KAYA_CHAT_MODEL 必须在

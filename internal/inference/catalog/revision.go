@@ -2,7 +2,7 @@
 // CRUD with optimistic locking, validation, atomic publish/rollback of
 // immutable config revisions, the immutable runtime Snapshot, the
 // refresh-fail-safe snapshot cache, and the explicit idempotent
-// LLM_PROVIDERS_JSON compatibility import (设计 §5, 基线报告差距 1/2).
+// INFERENCE_CATALOG_JSON compatibility import (设计 §5, 基线报告差距 1/2).
 //
 // The package depends only on internal/inference/domain. The postgres
 // store satisfies the Store interface defined in service.go.

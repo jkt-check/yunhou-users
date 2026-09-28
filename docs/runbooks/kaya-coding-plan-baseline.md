@@ -43,6 +43,8 @@
 | 7 | `float64` 模型价格（`InputPerMtok/OutputPerMtok`） | 定点金额与有理数/Decimal 换算、版本化售价及成本 | **拒绝继承 float64 计价**。可借鉴的是 `cost_micros` 整数微金额落库方向；inference 按设计 §7.1 用整数微额度 + Decimal/有理数价格 + 版本化 PriceVersion，禁止 float64 累计 |
 | 8 | 随用户删除用量行（`ON DELETE CASCADE`） | 账本保留去标识化主体 | **拒绝继承**。022 的 `user_id ... ON DELETE CASCADE` 仅适用于该非账本流水；inference 账本/计量事实不级联删除，走去标识化 |
 
+> **2026-09-28 更正（第 1 行）**：「复用 `LLM_PROVIDERS_JSON` 变量名」未落地——/chat 目录（`internal/llm`，map 形态）与 inference 导入（`EnvCatalog`，数组形态）schema 不兼容且两边都 `DisallowUnknownFields`，共用一个变量导致设置 /chat 目录时 inference 导入必然 fail-fast。inference 环境变量导入已改用独立变量 **`INFERENCE_CATALOG_JSON`**；`LLM_PROVIDERS_JSON` 归 /chat 目录专用。
+
 ### 3.2 定向复用清单（文件与测试，归属 `feat/multi-model-gateway` 24 个提交）
 
 改造后复用（协议适配与流式计量，移入 `internal/inference/providers/` 并补齐）：

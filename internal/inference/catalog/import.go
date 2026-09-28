@@ -9,17 +9,17 @@ import (
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
-// import.go — LLM_PROVIDERS_JSON compatibility import (基线报告差距 1:
+// import.go — INFERENCE_CATALOG_JSON compatibility import (基线报告差距 1:
 // 环境变量目录只做兼容导入，运行期真相是数据库草稿 + 发布快照).
 //
 // Contract (任务书): the import is EXPLICIT (runs only when the operator
-// sets LLM_PROVIDERS_JSON) and IDEMPOTENT. Existing rows are never updated
+// sets INFERENCE_CATALOG_JSON) and IDEMPOTENT. Existing rows are never updated
 // or overwritten — the database is the operational truth and an env line
 // must not clobber operator edits on every boot. Imported entities start as
 // DRAFT and stay unsellable until an operator validates, prices, authorizes
 // and publishes them (设计 §5).
 
-// EnvCatalog is the decoded shape of LLM_PROVIDERS_JSON. Unknown fields are
+// EnvCatalog is the decoded shape of INFERENCE_CATALOG_JSON. Unknown fields are
 // rejected (a typo'd field must fail loudly at startup, not silently drop a
 // deployment).
 type EnvCatalog struct {
@@ -85,7 +85,7 @@ func ParseEnvCatalog(raw string) (*EnvCatalog, error) {
 	dec.DisallowUnknownFields()
 	var ec EnvCatalog
 	if err := dec.Decode(&ec); err != nil {
-		return nil, domain.WrapError(domain.CodeInvalidInput, "LLM_PROVIDERS_JSON is not valid catalog JSON", err)
+		return nil, domain.WrapError(domain.CodeInvalidInput, "INFERENCE_CATALOG_JSON is not valid catalog JSON", err)
 	}
 	for i := range ec.Providers {
 		p := &ec.Providers[i]

@@ -588,6 +588,47 @@ func drainPages[T any](ctx context.Context, page func(after string, limit int) (
 	}
 }
 
+// drainCatalogForPublish 抽取并校验整个目录（Publish 与 PublishPreview 共用
+// 同一快照、同一口径）：任何实体都不会被悄悄丢出快照，结构破损的目录在此
+// 被拒（draft/disabled 实体可发布——快照标记其不可路由）。
+func drainCatalogForPublish(ctx context.Context, tx PublishTx) (models []domain.Model, providers []domain.Provider, deployments []domain.Deployment, routes []domain.ModelRoute, err error) {
+	models, err = drainPages(ctx,
+		func(after string, limit int) ([]domain.Model, error) {
+			return tx.ListModels(ctx, domain.ModelFilter{AfterID: after, Limit: limit})
+		},
+		func(m domain.Model) string { return m.ID })
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	providers, err = drainPages(ctx,
+		func(after string, limit int) ([]domain.Provider, error) {
+			return tx.ListProviders(ctx, after, limit)
+		},
+		func(p domain.Provider) string { return p.ID })
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	deployments, err = drainPages(ctx,
+		func(after string, limit int) ([]domain.Deployment, error) {
+			return tx.ListDeployments(ctx, domain.DeploymentFilter{AfterID: after, Limit: limit})
+		},
+		func(d domain.Deployment) string { return d.ID })
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if err := validateCatalogForPublish(models, providers, deployments); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for _, m := range models {
+		rs, err := tx.ListRoutes(ctx, m.ID)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		routes = append(routes, rs...)
+	}
+	return models, providers, deployments, routes, nil
+}
+
 // Publish validates the current draft catalog, appends an immutable
 // revision and atomically switches the active pointer to it. The returned
 // number is the new revision.
@@ -608,40 +649,9 @@ func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	models, err := drainPages(ctx,
-		func(after string, limit int) ([]domain.Model, error) {
-			return tx.ListModels(ctx, domain.ModelFilter{AfterID: after, Limit: limit})
-		},
-		func(m domain.Model) string { return m.ID })
+	models, providers, deployments, routes, err := drainCatalogForPublish(ctx, tx)
 	if err != nil {
 		return 0, err
-	}
-	providers, err := drainPages(ctx,
-		func(after string, limit int) ([]domain.Provider, error) {
-			return tx.ListProviders(ctx, after, limit)
-		},
-		func(p domain.Provider) string { return p.ID })
-	if err != nil {
-		return 0, err
-	}
-	deployments, err := drainPages(ctx,
-		func(after string, limit int) ([]domain.Deployment, error) {
-			return tx.ListDeployments(ctx, domain.DeploymentFilter{AfterID: after, Limit: limit})
-		},
-		func(d domain.Deployment) string { return d.ID })
-	if err != nil {
-		return 0, err
-	}
-	if err := validateCatalogForPublish(models, providers, deployments); err != nil {
-		return 0, err
-	}
-	var routes []domain.ModelRoute
-	for _, m := range models {
-		rs, err := tx.ListRoutes(ctx, m.ID)
-		if err != nil {
-			return 0, err
-		}
-		routes = append(routes, rs...)
 	}
 
 	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
@@ -662,6 +672,43 @@ func (s *Service) Publish(ctx context.Context, createdBy string) (int, error) {
 		return 0, err
 	}
 	return rev.Revision, nil
+}
+
+// PublishPreview 是 publish 的 dry_run 候选集（R7-N7）：与 Publish 共享同一
+// 事务快照、同一抽取与校验，但绝不写库——事务只读即回滚。管理面用它枚举
+// "发布即生效"的 deployment 集合并给出 next revision 预告。
+type PublishPreview struct {
+	NextRevision int
+	Models       []domain.Model
+	Providers    []domain.Provider
+	Deployments  []domain.Deployment
+	Routes       []domain.ModelRoute
+}
+
+// PublishPreview drains and validates the draft catalog exactly like Publish
+// and rolls the transaction back without inserting anything.
+func (s *Service) PublishPreview(ctx context.Context) (*PublishPreview, error) {
+	tx, err := s.store.BeginPublish(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	models, providers, deployments, routes, err := drainCatalogForPublish(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
+	if err != nil {
+		return nil, err
+	}
+	return &PublishPreview{
+		NextRevision: latest + 1,
+		Models:       models,
+		Providers:    providers,
+		Deployments:  deployments,
+		Routes:       routes,
+	}, nil
 }
 
 // validateCatalogForPublish is the pre-publish gate: every entity must be

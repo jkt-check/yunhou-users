@@ -266,6 +266,63 @@ func (m *CatalogManager) Publish(ctx context.Context, actor string, reason ...st
 	return rev, nil
 }
 
+// PublishDryRunReport 是 publish ?dry_run=1 的 advisory 报告（R7-N7）：
+// 发布候选集摘要 + 每个将生效（active）deployment 的上游探测结论。本路径
+// 零写库、零审计事件；探测失败只在报告内如实标注，绝不返回错误（运营判断
+// 是否继续正式发布；正式 publish 路径不跑探测、不受探测结果影响）。
+type PublishDryRunReport struct {
+	WouldPublish PublishPreviewSummary `json:"would_publish"`
+	Probes       []ProbeResult         `json:"probes"`
+}
+
+// PublishPreviewSummary 是发布候选集的内容摘要（计数 + next revision 预告）。
+type PublishPreviewSummary struct {
+	NextRevision      int `json:"next_revision"`
+	Models            int `json:"models"`
+	Providers         int `json:"providers"`
+	Deployments       int `json:"deployments"`
+	ActiveDeployments int `json:"active_deployments"`
+	Routes            int `json:"routes"`
+}
+
+// PublishDryRun validates the draft catalog exactly like Publish（校验失败原样
+// 返回，与正式发布同一错误）并探测每个 active deployment，WITHOUT publishing。
+// 草稿/停用部署不上线、不探测（避免半编辑状态噪声）。探测器自身的硬错误也
+// 折叠为 in-band 失败条目，绝不阻断报告。
+func (m *CatalogManager) PublishDryRun(ctx context.Context, prober DeploymentProber) (*PublishDryRunReport, error) {
+	if prober == nil {
+		return nil, domain.NewError(domain.CodeInternal, "probe service not configured")
+	}
+	prev, err := m.svc.PublishPreview(ctx)
+	if err != nil {
+		return nil, err
+	}
+	report := &PublishDryRunReport{
+		WouldPublish: PublishPreviewSummary{
+			NextRevision: prev.NextRevision,
+			Models:       len(prev.Models),
+			Providers:    len(prev.Providers),
+			Deployments:  len(prev.Deployments),
+			Routes:       len(prev.Routes),
+		},
+		Probes: []ProbeResult{},
+	}
+	for i := range prev.Deployments {
+		d := &prev.Deployments[i]
+		if d.Status != domain.DeploymentActive {
+			continue
+		}
+		report.WouldPublish.ActiveDeployments++
+		res, perr := prober.ProbeDeployment(ctx, d.ID)
+		if perr != nil {
+			// 探测器自身失败（如部署在抽取后被并发删除）同样不阻断。
+			res = &ProbeResult{DeploymentID: d.ID, ErrorSummary: safeProbeErrorSummary("probe failed", perr)}
+		}
+		report.Probes = append(report.Probes, *res)
+	}
+	return report, nil
+}
+
 // Rollback publishes a new revision carrying the content of toRevision;
 // history is never rewritten.
 func (m *CatalogManager) Rollback(ctx context.Context, actor string, toRevision int, reason ...string) (int, error) {

@@ -858,10 +858,22 @@ func (h *AdminModelsHandler) DeleteRoute(c *gin.Context) {
 	ok(c, gin.H{"deleted": c.Param("route_id")})
 }
 
-// Publish POST /catalog/publish（必填 ?reason= 运营理由 → 审计，M-6）
+// Publish POST /catalog/publish（必填 ?reason= 运营理由 → 审计，M-6）。
+// 可选 ?dry_run=1（R7-N7）：不发布，返回发布候选集摘要 + 各 active
+// deployment 的上游探测报告（advisory——探测失败绝不阻断，由运营判断是否
+// 继续正式发布）；缺省 dry_run 时行为与既有发布完全一致。
 func (h *AdminModelsHandler) Publish(c *gin.Context) {
 	reason, okReason := requiredReasonOf(c)
 	if !okReason {
+		return
+	}
+	if dryRunOf(c) {
+		report, err := h.mgr.PublishDryRun(c.Request.Context(), h.prober)
+		if err != nil {
+			fail(c, err)
+			return
+		}
+		ok(c, report)
 		return
 	}
 	rev, err := h.mgr.Publish(c.Request.Context(), actorOf(c), reason)
@@ -870,6 +882,16 @@ func (h *AdminModelsHandler) Publish(c *gin.Context) {
 		return
 	}
 	ok(c, gin.H{"revision": rev})
+}
+
+// dryRunOf 解析可选 ?dry_run=（1/true/yes 视为真）。与 ?reason= 同走 query
+// ——publish 无请求体。
+func dryRunOf(c *gin.Context) bool {
+	switch strings.ToLower(strings.TrimSpace(c.Query("dry_run"))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }
 
 // Rollback POST /catalog/rollback {"to_revision":N,"reason":"…"} —— reason 必填。

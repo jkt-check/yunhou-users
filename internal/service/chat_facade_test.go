@@ -99,10 +99,13 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 	}{
 		// Minor-4：运营定价配置错误 → 500 类（与真实权益拒绝区分开）。
 		{"unpriced_capability", domain.NewError(domain.CodeUnpricedCapability, "no price"), ErrChatUpstreamError},
-		// 真实权益拒绝保持 403 语义。
-		{"model_not_allowed", domain.NewError(domain.CodeModelNotAllowed, "denied"), ErrChatNoAccess},
+		// N4b 拆分（对齐 legacy）：
+		// 目录查无此模型 id → ErrChatUnknownModel（400，picker 回退默认）；
+		// 模型存在但无权益 → ErrChatModelNotAllowed（403 legacy checkAccess 文案）；
+		// 账户停用 → ErrChatNoAccess（403）。
+		{"model_not_allowed", domain.NewError(domain.CodeModelNotAllowed, "denied"), ErrChatModelNotAllowed},
 		{"invalid_key", domain.NewError(domain.CodeInvalidKey, "denied"), ErrChatNoAccess},
-		{"not_found", domain.NewError(domain.CodeNotFound, "no account"), ErrChatNoAccess},
+		{"not_found", domain.NewError(domain.CodeNotFound, "no such model"), ErrChatUnknownModel},
 		{"rate_limited", domain.NewError(domain.CodeRateLimited, "slow down"), ErrChatRateLimited},
 		{"internal", domain.NewError(domain.CodeInternal, "boom"), ErrChatUpstreamError},
 		// R7-N1：目录冷启动（无已验证快照）哨兵 → 503，不得伪装成 403/500。
@@ -217,6 +220,28 @@ func TestChatFacade_StreamChat_ReadinessBeforeResolveUserSession(t *testing.T) {
 	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
 	if !errors.Is(err, ErrChatNotReady) {
 		t.Fatalf("err = %v, want ErrChatNotReady（服务未就绪优先于用户权限分层）", err)
+	}
+}
+
+// N4b：resolver CodeNotFound（无计费账户）必须在 resolver 分支显式映射为
+// ErrChatNoAccess（403）——mapGatewayError 拆分后 CodeNotFound 已改指
+// ErrChatUnknownModel（400 未知模型），若无显式分支，无账户用户会被误报
+// 成「未知模型」。gw 传 nil：解析失败时不会触达。
+func TestChatFacade_StreamChat_NoAccountResolverIsNoAccess(t *testing.T) {
+	t.Parallel()
+	resolver := access.NewResolver(&facadeKeyStore{
+		accountErr: domain.NewError(domain.CodeNotFound, "billing account not found"),
+	}, nil)
+	snaps := stubSnapshotSource{snap: &catalog.Snapshot{
+		Models: map[string]domain.Model{"glm-4.6": {ID: "glm-4.6"}},
+	}}
+	f := NewChatGatewayFacade(nil, resolver, nil, snaps, "glm-4.6")
+	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("err = %v, want ErrChatNoAccess（无计费账户 → 403，不得误报未知模型）", err)
+	}
+	if errors.Is(err, ErrChatUnknownModel) {
+		t.Fatal("resolver CodeNotFound 不得落入 ErrChatUnknownModel（那是 gateway 目录查无此 id 的语义）")
 	}
 }
 

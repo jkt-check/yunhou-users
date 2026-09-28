@@ -150,6 +150,9 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOv
 	// DB 故障等）走 mapGatewayError 透传为 500 类，不得伪装成 403。
 	p, err := f.resolver.ResolveUserSession(ctx, userID)
 	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return nil, ErrChatNoAccess // 无计费账户 = 无访问权限（403）
+		}
 		return nil, mapGatewayError(err)
 	}
 	modelID := modelOverride
@@ -215,8 +218,13 @@ func mapGatewayError(err error) error {
 		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
 	}
 	switch domain.CodeOf(err) {
-	case domain.CodeModelNotAllowed, domain.CodeInvalidKey, domain.CodeNotFound:
-		// 无权益/模型未授权/默认模型未上架 → 旧的"无访问权限"语义。
+	case domain.CodeNotFound:
+		// N4b：目录查无此模型 id → 400 未知模型（picker 回退默认）。
+		// 无计费账户的 CodeNotFound 已在 resolver 分支拦截，不到这里。
+		return ErrChatUnknownModel
+	case domain.CodeModelNotAllowed:
+		return ErrChatModelNotAllowed // 模型存在但无权益 → 403（对齐 legacy 文案）
+	case domain.CodeInvalidKey:
 		return ErrChatNoAccess
 	case domain.CodeQuotaExceeded, domain.CodeRateLimited, domain.CodeInsufficientCapacity:
 		return ErrChatRateLimited

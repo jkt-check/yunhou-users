@@ -604,6 +604,32 @@ func TestChatFacade_ModelsPickerContract(t *testing.T) {
 	}
 }
 
+// N4b 契约用例：facade 模式下带未知 model 字段 → 400 + legacy envelope
+// "unknown chat model"（picker 回退默认语义），与无权益/无账户的 403 严格
+// 分层。用户需先持有权益（有 billing account），否则 resolver 分支先以
+// 403 拦截。
+func TestChatFacade_UnknownModelIs400(t *testing.T) {
+	up := newChatStubUpstream(t)
+	engine, db, store := setupChatFacadeE2E(t, up)
+	login := loginAndGetTokens(t, engine, "chatunknownmodel", "yundian")
+	grantKayaModelEntitlement(t, db, store, login.User.ID, "deepseek-chat")
+
+	w := chatPost(t, engine, login.AccessToken, map[string]any{
+		"model":    "no-such-model",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown-model facade /chat = %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+	var env map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env["code"] != float64(400) || env["message"] != "unknown chat model" {
+		t.Errorf("envelope = %v, want the legacy 400 unknown-model shape/message", env)
+	}
+}
+
 // Facade 模式下无 JWT 仍是 401 envelope(JWT 链不变)。
 func TestChatFacade_StillRequiresJWT(t *testing.T) {
 	up := newChatStubUpstream(t)

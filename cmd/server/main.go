@@ -428,7 +428,7 @@ func main() {
 	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
 	if cfg.InferenceKayaChatGateway {
-		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, cfg.KayaChatModel)
+		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, catalogCache, cfg.KayaChatModel)
 		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, cfg.KayaChatModel)
 		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}

@@ -37,6 +37,7 @@ type ChatGatewayFacade struct {
 	gw           *gateway.Service
 	resolver     *access.Resolver
 	catalog      *catalog.Service
+	snapshots    gateway.SnapshotSource
 	defaultModel string
 
 	// lastNotReadyLog 节流「服务未就绪」ERROR 日志（unix 秒，≤1 条/30s），
@@ -48,9 +49,13 @@ type ChatGatewayFacade struct {
 // id applied when the client sends no model (旧无 model 默认); a default
 // missing from the published catalog makes every call fail as not-ready
 // (503, R7-N1 — misconfiguration is loud, not silently routed). cat backs
-// AllowedModels (GET /chat/models contract) and the readiness gate.
-func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *catalog.Service, defaultModel string) *ChatGatewayFacade {
-	return &ChatGatewayFacade{gw: gw, resolver: resolver, catalog: cat, defaultModel: defaultModel}
+// AllowedModels' listing (GET /chat/models contract); snapshots is the
+// readiness-gate/snapshot pin source — the shared SnapshotCache, so cold
+// start carries ErrNoVerifiedSnapshot and transient refresh failures keep
+// serving the last verified snapshot (评审修复 C1/I1：不得绕开 cache 直接
+// 打 store，否则哨兵不可达且每请求全量 SELECT+ParseSnapshot)。
+func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *catalog.Service, snapshots gateway.SnapshotSource, defaultModel string) *ChatGatewayFacade {
+	return &ChatGatewayFacade{gw: gw, resolver: resolver, catalog: cat, snapshots: snapshots, defaultModel: defaultModel}
 }
 
 // StreamChat implements the /chat service surface. The request always
@@ -102,7 +107,7 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 	if err != nil {
 		return nil, err
 	}
-	snap, err := f.catalog.LoadSnapshot(ctx)
+	snap, err := f.snapshots.Current(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -125,9 +130,11 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
 	// N1/N2 就绪闸门：目录不可用（冷启动）或默认模型不在已发布目录 → 503，
 	// 进程不死、不回退 legacy。先于 ResolveUserSession，使「服务未就绪」
-	// 与「用户无权限」严格分层。
-	snap, err := f.catalog.LoadSnapshot(ctx)
+	// 与「用户无权限」严格分层。走共享 SnapshotCache：冷启动携带
+	// ErrNoVerifiedSnapshot 哨兵，瞬时刷新失败由 cache 兜底旧快照。
+	snap, err := f.snapshots.Current(ctx)
 	if err != nil {
+		f.logNotReadyErr(err) // 结构化 ERROR，30s 节流（评审修复 I2：冷启动不得静默）
 		return nil, mapGatewayError(err) // ErrNoVerifiedSnapshot → ErrChatNotReady
 	}
 	if _, ok := snap.Model(f.defaultModel); !ok {
@@ -170,13 +177,27 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOv
 // 每个 /chat 请求都会走到这里，不节流会刷爆日志）。结构化 key=value，
 // 含默认模型 id 与当前快照 revision，便于运营定位「模型未上架」。
 func (f *ChatGatewayFacade) logNotReady(snap *catalog.Snapshot) {
-	now := time.Now().Unix()
-	last := f.lastNotReadyLog.Load()
-	if now-last < 30 || !f.lastNotReadyLog.CompareAndSwap(last, now) {
+	if !f.notReadyLogDue() {
 		return
 	}
 	log.Printf("ERROR chat facade not ready: default_model=%q revision_id=%d revision=%d",
 		f.defaultModel, snap.RevisionID, snap.Revision)
+}
+
+// logNotReadyErr 是冷启动/快照不可用路径的同款节流 ERROR（评审修复 I2：
+// facade 不再绕过 SnapshotCache 打 store，但该路径仍需运营可见）。
+func (f *ChatGatewayFacade) logNotReadyErr(err error) {
+	if !f.notReadyLogDue() {
+		return
+	}
+	log.Printf("ERROR chat facade not ready: default_model=%q err=%v", f.defaultModel, err)
+}
+
+// notReadyLogDue 30s 节流闸（CAS 抢占，并发下只放行一条）。
+func (f *ChatGatewayFacade) notReadyLogDue() bool {
+	now := time.Now().Unix()
+	last := f.lastNotReadyLog.Load()
+	return now-last >= 30 && f.lastNotReadyLog.CompareAndSwap(last, now)
 }
 
 // mapGatewayError projects the unified internal error codes onto the legacy

@@ -4,6 +4,8 @@
 // display_name, provider, default}]}}（管理 envelope —— /chat 是 Kaya 面，
 // 不是 /v1 标准协议面）。内容 = 调用者权益可见且已发布的模型集合（与
 // /v1/models 同一判定：catalog.ListPublishedModels + 权益 AccessCheck）。
+// 无计费账户 = 无有效订阅 → 403 ErrChatNoAccess 形状（N4a，对齐 legacy
+// GetModels/writeChatError），不是 200 空列表。
 //
 // 该路由只在 /chat 网关迁移开关启用时挂载（见 router）。
 
@@ -52,7 +54,7 @@ type kayaModelEntry struct {
 // List handles GET /chat/models.
 func (h *KayaModelsHandler) List(c *gin.Context) {
 	// N2 就绪闸门：目录冷启动无已验证快照 → 503 + Retry-After（服务未就绪），
-	// 先于 ResolveUserSession——与「已发布但无权限」（403/空列表）严格分层；
+	// 先于 ResolveUserSession——与「已发布但无权限」（N4a 403）严格分层；
 	// 新库无 revision 时无账户用户也拿 503（验收 §7.2）。非哨兵错误走 fail()
 	// 口径（500），不得伪装成冷启动。快照 pin 一次复用到下方条目组装。
 	snap, err := h.Snapshots.Current(c.Request.Context())
@@ -68,11 +70,11 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	p, err := h.Resolver.ResolveUserSession(c.Request.Context(), userID)
 	if err != nil {
+		// N4a（E6 决策，推翻原 200 空数组设计）：无计费账户 = 无有效订阅，
+		// 对齐 legacy 403 ErrChatNoAccess —— picker 对 403 已有处理（隐藏
+		// 选择器），而 200 空数组会让 picker 静默消失且与服务故障无法区分。
 		if domain.CodeOf(err) == domain.CodeNotFound {
-			// No model billing account → the picker legitimately shows an
-			// empty list (the user never purchased/received a model grant),
-			// not an error — same UX as "no models available".
-			c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": []kayaModelEntry{}}})
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "data": nil, "message": "active subscription with access to this app is required"})
 			return
 		}
 		// 其余错误（DB 故障、账户停用等）必须响亮报错（评审轮1 m5）：

@@ -21,7 +21,8 @@ import (
 )
 
 // kaya_models_test.go — Task 16 覆盖率补强：GET /chat/models 的三个分支
-// （无账户→空列表；有权益→条目带 provider/default；未授权模型不出现）。
+// （N4a：无账户→403 对齐 legacy；有权益→条目带 provider/default；未授权
+// 模型不出现）。
 
 func TestKayaModels_ListBranches(t *testing.T) {
 	f := newAccessFixture(t, 0)
@@ -95,11 +96,21 @@ func TestKayaModels_ListBranches(t *testing.T) {
 		return w.Code, env.Data.Models
 	}
 
-	// 分支 1：无计费账户（从未购买/获赠）→ 200 空列表（非错误）。
+	// 分支 1（N4a，推翻原 200 空数组设计）：无计费账户（从未购买/获赠）=
+	// 无有效订阅 → 403，envelope 与 legacy ErrChatNoAccess 逐字节一致——
+	// picker 对 403 已有处理（隐藏选择器），而 200 空数组会让 picker 静默
+	// 消失且与服务故障无法区分。
 	userID, _ := f.addUser(t)
-	code, models := call(userID)
-	if code != http.StatusOK || len(models) != 0 {
-		t.Fatalf("no-account picker = %d %v, want 200 []", code, models)
+	req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+	req.Header.Set("X-Test-User", userID)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("no-account picker = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	const wantBody = `{"code":403,"data":null,"message":"active subscription with access to this app is required"}`
+	if w.Body.String() != wantBody {
+		t.Errorf("no-account envelope = %s, want byte-exact legacy shape %s", w.Body.String(), wantBody)
 	}
 
 	// 分支 2：有 deepseek-chat 权益 → 恰一条，provider=deepseek，default=true。
@@ -122,7 +133,7 @@ func TestKayaModels_ListBranches(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	code, models = call(userID)
+	code, models := call(userID)
 	if code != http.StatusOK || len(models) != 1 {
 		t.Fatalf("picker = %d %v, want exactly the entitled model", code, models)
 	}
@@ -139,7 +150,7 @@ func TestKayaModels_ListBranches(t *testing.T) {
 // ErrNoVerifiedSnapshot 哨兵）→ 503 + Retry-After: 5 + envelope
 // {code:503,data:null,message:"chat catalog is not ready"}。就绪检查先于
 // ResolveUserSession：无计费账户的用户在冷启动时也必须拿 503（验收 §7.2），
-// 而不是「无账户 → 200 空列表」——「服务未就绪」与「用户无权限」严格分层。
+// 而不是「无账户 → 403」——「服务未就绪」与「用户无权限」严格分层。
 func TestKayaModels_ColdStartIs503BeforeUserResolution(t *testing.T) {
 	f := newAccessFixture(t, 0)
 	catalogSvc := catalog.NewService(f.store)

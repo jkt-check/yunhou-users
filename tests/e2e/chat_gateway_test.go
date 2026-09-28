@@ -567,22 +567,15 @@ func TestChatFacade_ModelsPickerContract(t *testing.T) {
 		return w
 	}
 
-	// 无权益 → 空列表(不是错误)。
+	// N4a：无计费账户（从未购买/获赠）→ 403，envelope 与 legacy
+	// ErrChatNoAccess 逐字节一致（不再是 200 空列表）。
 	w := newReq()
-	if w.Code != http.StatusOK {
-		t.Fatalf("GET /chat/models = %d", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("GET /chat/models = %d, want 403: %s", w.Code, w.Body.String())
 	}
-	var emptyEnv struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []any `json:"models"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &emptyEnv); err != nil {
-		t.Fatalf("decode: %v (%s)", err, w.Body.String())
-	}
-	if emptyEnv.Code != 0 || len(emptyEnv.Data.Models) != 0 {
-		t.Errorf("models = %+v, want empty list", emptyEnv)
+	const wantNoAcctBody = `{"code":403,"data":null,"message":"active subscription with access to this app is required"}`
+	if w.Body.String() != wantNoAcctBody {
+		t.Errorf("no-account envelope = %s, want byte-exact legacy shape %s", w.Body.String(), wantNoAcctBody)
 	}
 
 	// 有权益 → 候选分支对齐形状 {id, display_name, provider, default}。

@@ -80,16 +80,19 @@ func (f *ChatGatewayFacade) RecordUsage(ctx context.Context, userID, appID strin
 }
 
 // AllowedModels backs GET /chat/models from the inference catalog — same
-// judgment as /v1/models (published ∩ entitled); a user without a model
-// billing account gets an empty list, not an error (picker UX).
+// judgment as /v1/models (published ∩ entitled); N4a: a user without a model
+// billing account gets ErrChatNoAccess (403, 对齐 legacy accessPlan)，不再
+// 返回空列表。注意：生产上开关打开时 GET /chat/models 由 router 挂载到
+// KayaModelsHandler，本方法返回的原始哨兵透传是 dead path（仅 legacy
+// handler 路径或测试触达）。
 func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID string) ([]ChatModelInfo, error) {
 	p, err := f.resolver.ResolveUserSession(ctx, userID)
 	if err != nil {
-		// 评审批次7 Minor-5：仅「无计费账户」哨兵是正常态（picker 显示空
-		// 列表）；其余错误（瞬时 DB 故障等）记录日志并透传——吞掉会把
-		// 故障伪装成「该用户无可用模型」。
+		// N4a（推翻评审批次7 Minor-5 的空列表设计）：「无计费账户」哨兵 =
+		// 无有效订阅 → ErrChatNoAccess（403 对齐 legacy）；其余错误（瞬时
+		// DB 故障等）记录日志并透传——吞掉会把故障伪装成权限语义。
 		if domain.CodeOf(err) == domain.CodeNotFound {
-			return []ChatModelInfo{}, nil
+			return nil, ErrChatNoAccess
 		}
 		log.Printf("chat facade: resolve user session for models (user=%s): %v", userID, err)
 		return nil, err

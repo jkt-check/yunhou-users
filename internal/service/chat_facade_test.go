@@ -13,10 +13,12 @@ import (
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
-// chat_facade_test.go — 评审批次7 Minor-4/5 验收：
+// chat_facade_test.go — 评审批次7 Minor-4/5 验收 + R7-N4a/N4b 契约对齐：
 // Minor-4：CodeUnpricedCapability（运营定价配置错误）映射为 500 类而不是
-// 403「无权限」；Minor-5：AllowedModels 只吞「无计费账户」哨兵，其余错误
-// 记录日志并透传。
+// 403「无权限」；Minor-5：AllowedModels 非哨兵错误记录日志并透传。
+// N4a：AllowedModels 的「无计费账户」哨兵 → ErrChatNoAccess（403 对齐
+// legacy）；N4b：CodeNotFound/CodeModelNotAllowed/CodeInvalidKey 拆分
+// 为未知模型 400 / 无权益 403 / 无访问 403。
 
 // facadeKeyStore 是 access.KeyStore 的手写桩（CLAUDE.md：hand-rolled
 // doubles）；只有 GetBillingAccountByUser 的返回对本测试有意义。
@@ -120,18 +122,21 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 	}
 }
 
-func TestChatFacade_AllowedModels_NoAccountIsEmptyList(t *testing.T) {
+// N4a：无计费账户 = 无有效订阅 → ErrChatNoAccess（403），对齐 legacy
+// accessPlan；不再是 200 空列表（picker 对 403 隐藏选择器，200 空数组会
+// 让 picker 静默消失且与服务故障无法区分）。
+func TestChatFacade_AllowedModels_NoAccountIsNoAccess(t *testing.T) {
 	t.Parallel()
 	resolver := access.NewResolver(&facadeKeyStore{
 		accountErr: domain.NewError(domain.CodeNotFound, "billing account not found"),
 	}, nil)
 	f := NewChatGatewayFacade(nil, resolver, nil, nil, "m")
 	models, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website")
-	if err != nil {
-		t.Fatalf("AllowedModels: %v（无计费账户是正常态，不得报错）", err)
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("err = %v, want ErrChatNoAccess（无计费账户 → 403，对齐 legacy）", err)
 	}
-	if len(models) != 0 {
-		t.Errorf("models = %+v, want empty (picker UX)", models)
+	if models != nil {
+		t.Errorf("models = %+v, want nil（403 下不返回列表）", models)
 	}
 }
 
@@ -142,7 +147,7 @@ func TestChatFacade_AllowedModels_TransientErrorPropagates(t *testing.T) {
 	f := NewChatGatewayFacade(nil, resolver, nil, nil, "m")
 	_, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website")
 	if !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want 透传 %v（瞬时故障不得吞掉伪装成空列表）", err, boom)
+		t.Fatalf("err = %v, want 透传 %v（瞬时故障不得吞掉伪装成权限语义）", err, boom)
 	}
 }
 

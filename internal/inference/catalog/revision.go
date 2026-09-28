@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync/atomic"
@@ -19,6 +20,11 @@ import (
 
 	"github.com/yunhou/users/internal/inference/domain"
 )
+
+// ErrNoVerifiedSnapshot marks the cold-start failure: no active revision
+// reachable and no verified snapshot in hand. Callers map it to 503
+// (service-not-ready), never to a client error or an empty catalog.
+var ErrNoVerifiedSnapshot = errors.New("catalog: no verified snapshot")
 
 // catalogPayloadSchemaVersion is the only payload schema this binary can
 // build or parse. A revision carrying any other version is rejected on
@@ -380,7 +386,7 @@ func (c *SnapshotCache) Current(ctx context.Context) (*Snapshot, error) {
 			c.absorb(err)
 			return old, nil
 		}
-		return nil, fmt.Errorf("catalog: no verified snapshot and active revision unavailable: %w", err)
+		return nil, fmt.Errorf("%w: active revision unavailable: %v", ErrNoVerifiedSnapshot, err)
 	}
 	if old := c.current.Load(); old != nil && old.RevisionID == headID {
 		return old, nil
@@ -391,7 +397,7 @@ func (c *SnapshotCache) Current(ctx context.Context) (*Snapshot, error) {
 			c.absorb(err)
 			return old, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrNoVerifiedSnapshot, err)
 	}
 	// If a publish landed between the probe and this load, rev is already
 	// the newer active row — revision ids are a monotonic BIGSERIAL, so
@@ -402,7 +408,7 @@ func (c *SnapshotCache) Current(ctx context.Context) (*Snapshot, error) {
 			c.absorb(err)
 			return old, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrNoVerifiedSnapshot, err)
 	}
 	c.current.Store(snap)
 	return snap, nil

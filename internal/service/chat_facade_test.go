@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -211,5 +212,84 @@ func TestChatFacade_StreamChat_ReadinessBeforeResolveUserSession(t *testing.T) {
 	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
 	if !errors.Is(err, ErrChatNotReady) {
 		t.Fatalf("err = %v, want ErrChatNotReady（服务未就绪优先于用户权限分层）", err)
+	}
+}
+
+// --- R7-N3：目录刷新失败继续服务旧快照（facade 层钉） ---
+// SnapshotCache 层的 absorb 语义已由 snapshot_cache_edges_test.go /
+// service_test.go 覆盖，这里只钉 facade 侧的可观察行为：刷新失败窗口内
+// 就绪闸门照常放行（请求推进到用户解析 = 业务继续，绝不退化成 503），且
+// OnRefreshError 告警被调用。
+
+// flakyFacadeRevisionSource 手搓桩：healthy 翻 false 后 head 探针与全量
+// 加载都失败——模拟「已发布后 DB 故障」的刷新失败窗口（对比
+// facadeRevisionSource 的固定冷启动形态）。
+type flakyFacadeRevisionSource struct {
+	healthy bool
+	rev     *domain.ConfigRevision
+	err     error
+}
+
+func (s *flakyFacadeRevisionSource) ActiveRevisionHead(context.Context, domain.ConfigScope) (int64, int, error) {
+	if !s.healthy {
+		return 0, 0, s.err
+	}
+	return s.rev.ID, s.rev.Revision, nil
+}
+
+func (s *flakyFacadeRevisionSource) ActiveRevision(context.Context, domain.ConfigScope) (*domain.ConfigRevision, error) {
+	if !s.healthy {
+		return nil, s.err
+	}
+	return s.rev, nil
+}
+
+// facadeReadyRevision 是含默认模型 glm-4.6 的最小合法修订（就绪闸门第二段
+// ——默认模型必须在快照内——也要能过）。
+func facadeReadyRevision() *domain.ConfigRevision {
+	return &domain.ConfigRevision{
+		ID: 7, Scope: domain.ScopeCatalog, Revision: 3, IsActive: true,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: json.RawMessage(
+			`{"schema_version":1,` +
+				`"models":[{"id":"glm-4.6","display_name":"GLM","lifecycle":"active","model_version":"",` +
+				`"aliases":[],"input_modalities":["text"],"output_modalities":["text"],` +
+				`"context_tokens":1000,"max_output_tokens":100,"protocols":["kaya_chat"],` +
+				`"supports_tools":false,"supports_reasoning":false}],` +
+				`"providers":[],"deployments":[],"routes":[]}`)},
+	}
+}
+
+func TestChatFacade_RefreshFailureServesLastVerifiedSnapshot(t *testing.T) {
+	t.Parallel()
+	errBoom := errors.New("db gone")
+	src := &flakyFacadeRevisionSource{healthy: true, rev: facadeReadyRevision(), err: errBoom}
+	absorbed := 0
+	cache := catalog.NewSnapshotCache(src, func(error) { absorbed++ })
+	// 无计费账户的 resolver：闸门放行后的下一站是 ResolveUserSession →
+	// ErrChatNoAccess（403 语义）。gw 传 nil：若闸门误判 503 之前推进到
+	// gateway 会 nil deref 立刻暴露；正常路径根本不触达 gw。
+	resolver := access.NewResolver(&facadeKeyStore{
+		accountErr: domain.NewError(domain.CodeNotFound, "billing account not found"),
+	}, nil)
+	f := NewChatGatewayFacade(nil, resolver, nil, cache, "glm-4.6")
+
+	// 首次：快照加载成功，闸门放行 → 推进到用户解析（403 语义证明过了闸门）。
+	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("warm err = %v, want ErrChatNoAccess（就绪闸门放行后推进到用户解析）", err)
+	}
+	// 刷新失败窗口：cache 兜底旧快照，闸门继续放行——可观察行为是不退化
+	// 成 503（ErrChatNotReady），业务继续；告警必须触发（静默兜底会藏住
+	// 卡死的目录）。
+	src.healthy = false
+	_, _, err = f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if errors.Is(err, ErrChatNotReady) {
+		t.Fatal("refresh failure with a verified snapshot must NOT degrade to 503（继续服务旧快照）")
+	}
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("post-failure err = %v, want ErrChatNoAccess（请求照常推进到用户解析）", err)
+	}
+	if absorbed == 0 {
+		t.Error("OnRefreshError must fire on the absorbed refresh failure")
 	}
 }

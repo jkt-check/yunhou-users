@@ -76,6 +76,9 @@ var (
 	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
 	ErrChatUpstreamError    = errors.New("chat upstream error")
 	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")
+	// ErrChatNotReady: 服务未就绪（目录冷启动无快照 / 默认模型未发布）。
+	// 映射 503 + Retry-After，与 403（无权限）严格区分。
+	ErrChatNotReady = errors.New("chat service is temporarily unavailable")
 
 	// Usage analytics (/user/usage/heartbeat + /admin/stats/*). Wrapped
 	// with a detail message (fmt.Errorf %w); handlers map it to 400.

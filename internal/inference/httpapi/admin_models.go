@@ -25,12 +25,19 @@ import (
 // exist even for a moment (任务书: 完成 Task 4 的运营授权前不挂载可写管理路由).
 type AdminModelsHandler struct {
 	mgr *management.CatalogManager
+	// prober 是 deployment 上游连通性探测服务（R7-N7，预发布防线）。
+	// 可选：未装配时探测端点与 publish dry_run 都 fail-closed 报 500。
+	prober *management.ProbeService
 }
 
 // NewAdminModelsHandler builds the handler over the catalog manager.
 func NewAdminModelsHandler(mgr *management.CatalogManager) *AdminModelsHandler {
 	return &AdminModelsHandler{mgr: mgr}
 }
+
+// SetProber wires the on-demand upstream probe service (R7-N7). Read-only:
+// it never writes the DB and never blocks a real publish.
+func (h *AdminModelsHandler) SetProber(p *management.ProbeService) { h.prober = p }
 
 // RegisterReadOnly mounts the read-only catalog queries. Called by
 // router.Setup today.
@@ -57,6 +64,8 @@ func (h *AdminModelsHandler) RegisterWrite(g *gin.RouterGroup) {
 	g.POST("/deployments", h.CreateDeployment)
 	g.PATCH("/deployments/:id", h.UpdateDeployment)
 	g.DELETE("/deployments/:id", h.DeleteDeployment)
+	// R7-N7: deployment 上游连通性探测（只读 advisory，永不写库）。
+	g.POST("/deployments/:id/probe", h.ProbeDeployment)
 	g.POST("/models/:id/routes", h.CreateRoute)
 	g.PATCH("/routes/:route_id", h.UpdateRoute)
 	g.DELETE("/routes/:route_id", h.DeleteRoute)
@@ -761,7 +770,23 @@ func (h *AdminModelsHandler) DeleteDeployment(c *gin.Context) {
 	ok(c, gin.H{"deleted": c.Param("id")})
 }
 
-// CreateRoute POST /models/:id/routes
+// ProbeDeployment POST /deployments/:id/probe —— 用真实凭据对 base_url 发
+// GET {base}/models 的只读连通性探测（R7-N7 预发布防线，针对 "base_url 缺
+// /v1 → 上线后 404" 事故类）。永不写库、不要求 reason（无审计对象）；
+// 探测级失败一律 in-band {ok:false} 返回，只有 deployment 不存在等硬错误
+// 才走 envelope 错误。
+func (h *AdminModelsHandler) ProbeDeployment(c *gin.Context) {
+	if h.prober == nil {
+		fail(c, domain.NewError(domain.CodeInternal, "probe service not configured"))
+		return
+	}
+	res, err := h.prober.ProbeDeployment(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, res)
+}
 func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 	var req routeWriteRequest
 	if err := strictBindJSON(c, &req); err != nil {

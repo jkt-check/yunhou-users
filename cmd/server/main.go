@@ -429,7 +429,9 @@ func main() {
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
 	if cfg.InferenceKayaChatGateway {
 		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, catalogCache, cfg.KayaChatModel)
-		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, cfg.KayaChatModel)
+		// R7-N2：/chat/models 就绪闸门与 facade 同一快照源（catalogCache）——
+		// 冷启动携带 ErrNoVerifiedSnapshot → 503 + Retry-After。
+		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, catalogCache, cfg.KayaChatModel)
 		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}
 	if cfg.InferenceCatalogJSON != "" {

@@ -317,7 +317,7 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream) (*gin.Engine, *sqlx.
 
 	accessOps := &httpapi.AccessOps{
 		KayaChat:       service.NewChatGatewayFacade(gw, resolver, catalogSvc, staticSnapE2E{snap}, modelID),
-		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, modelID),
+		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, staticSnapE2E{snap}, modelID),
 	}
 
 	gin.SetMode(gin.ReleaseMode)

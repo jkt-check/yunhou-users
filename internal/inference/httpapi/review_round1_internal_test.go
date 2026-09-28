@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/yunhou/users/internal/inference/access"
+	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/middleware"
@@ -195,6 +196,14 @@ func (s stubResolverStore) TouchAPIKeyLastUsed(context.Context, string, time.Tim
 	return nil
 }
 
+// healthySnapshots 手搓桩（gateway.SnapshotSource）：就绪闸门放行——返回空
+// 快照即可，本套件只测用户解析错误的映射，快照内容不触达。
+type healthySnapshots struct{}
+
+func (healthySnapshots) Current(context.Context) (*catalog.Snapshot, error) {
+	return &catalog.Snapshot{}, nil
+}
+
 func TestKayaModels_InternalErrorIs500NotEmptyList(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	call := func(storeErr error) *httptest.ResponseRecorder {
@@ -203,8 +212,9 @@ func TestKayaModels_InternalErrorIs500NotEmptyList(t *testing.T) {
 			c.Set(middleware.ContextUserID, "u1")
 			c.Next()
 		})
-		// 解析失败时不会触达 catalog，nil 安全。
-		h := NewKayaModelsHandler(nil, access.NewResolver(stubResolverStore{accountErr: storeErr}, nil), "")
+		// R7-N2 后就绪闸门先于用户解析：健康快照桩放行闸门，catalog 仍 nil
+		// 安全（解析失败时不会触达）。
+		h := NewKayaModelsHandler(nil, access.NewResolver(stubResolverStore{accountErr: storeErr}, nil), healthySnapshots{}, "")
 		engine.GET("/chat/models", h.List)
 		req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
 		w := httptest.NewRecorder()

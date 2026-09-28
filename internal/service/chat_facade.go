@@ -20,6 +20,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/catalog"
@@ -36,12 +38,17 @@ type ChatGatewayFacade struct {
 	resolver     *access.Resolver
 	catalog      *catalog.Service
 	defaultModel string
+
+	// lastNotReadyLog 节流「服务未就绪」ERROR 日志（unix 秒，≤1 条/30s），
+	// 避免目录故障期每个 /chat 请求刷一行。
+	lastNotReadyLog atomic.Int64
 }
 
 // NewChatGatewayFacade builds the facade. defaultModel is the public model
-// id applied when the client sends no model (旧无 model 默认); an empty
-// default makes every call fail as no-access (misconfiguration is loud, not
-// silently routed). cat backs AllowedModels (GET /chat/models contract).
+// id applied when the client sends no model (旧无 model 默认); a default
+// missing from the published catalog makes every call fail as not-ready
+// (503, R7-N1 — misconfiguration is loud, not silently routed). cat backs
+// AllowedModels (GET /chat/models contract) and the readiness gate.
 func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *catalog.Service, defaultModel string) *ChatGatewayFacade {
 	return &ChatGatewayFacade{gw: gw, resolver: resolver, catalog: cat, defaultModel: defaultModel}
 }
@@ -116,6 +123,17 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 }
 
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
+	// N1/N2 就绪闸门：目录不可用（冷启动）或默认模型不在已发布目录 → 503，
+	// 进程不死、不回退 legacy。先于 ResolveUserSession，使「服务未就绪」
+	// 与「用户无权限」严格分层。
+	snap, err := f.catalog.LoadSnapshot(ctx)
+	if err != nil {
+		return nil, mapGatewayError(err) // ErrNoVerifiedSnapshot → ErrChatNotReady
+	}
+	if _, ok := snap.Model(f.defaultModel); !ok {
+		f.logNotReady(snap) // 结构化 ERROR，30s 节流，含 model id + 快照 revision
+		return nil, ErrChatNotReady
+	}
 	// Kaya JWT → unified principal (kind=kaya_jwt). A user without a model
 	// billing account maps onto the legacy "no access" outcome (403),
 	// never an implicit account creation on a read path. 其余错误（瞬时
@@ -148,6 +166,19 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOv
 	}, nil
 }
 
+// logNotReady emits the not-ready ERROR at most once per 30s (目录故障期
+// 每个 /chat 请求都会走到这里，不节流会刷爆日志）。结构化 key=value，
+// 含默认模型 id 与当前快照 revision，便于运营定位「模型未上架」。
+func (f *ChatGatewayFacade) logNotReady(snap *catalog.Snapshot) {
+	now := time.Now().Unix()
+	last := f.lastNotReadyLog.Load()
+	if now-last < 30 || !f.lastNotReadyLog.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("ERROR chat facade not ready: default_model=%q revision_id=%d revision=%d",
+		f.defaultModel, snap.RevisionID, snap.Revision)
+}
+
 // mapGatewayError projects the unified internal error codes onto the legacy
 // ErrChat* sentinels, keeping the /chat error shape (envelope + statuses)
 // byte-compatible.
@@ -155,6 +186,9 @@ func mapGatewayError(err error) error {
 	var qe *domain.QuotaExceededError
 	if errors.As(err, &qe) {
 		return ErrChatRateLimited // 额度不足 → 429 (设计 §9.1)
+	}
+	if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
+		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
 	}
 	switch domain.CodeOf(err) {
 	case domain.CodeModelNotAllowed, domain.CodeInvalidKey, domain.CodeNotFound:

@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/access"
+	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
@@ -58,6 +61,126 @@ func (f *facadeKeyStore) TouchAPIKeyLastUsed(context.Context, string, time.Time)
 	return errors.New("not implemented")
 }
 
+// facadeCatalogStore 是 catalog.Store 的手写桩（同 facadeKeyStore 风格）：
+// 只有 ActiveRevision 对本测试有意义（Service.LoadSnapshot = ActiveRevision
+// + ParseSnapshot），其余方法一律 not implemented。
+type facadeCatalogStore struct {
+	rev *domain.ConfigRevision
+	err error
+}
+
+var _ catalog.Store = (*facadeCatalogStore)(nil)
+
+func (s *facadeCatalogStore) ActiveRevision(context.Context, domain.ConfigScope) (*domain.ConfigRevision, error) {
+	return s.rev, s.err
+}
+
+func (s *facadeCatalogStore) InsertModel(context.Context, *domain.Model) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetModel(context.Context, string) (*domain.Model, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListModels(context.Context, domain.ModelFilter) ([]domain.Model, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateModel(context.Context, *domain.Model) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteModel(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertProvider(context.Context, *domain.Provider) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetProvider(context.Context, string) (*domain.Provider, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetProviderByCode(context.Context, string) (*domain.Provider, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListProviders(context.Context, string, int) ([]domain.Provider, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateProvider(context.Context, *domain.Provider) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteProvider(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertDeployment(context.Context, *domain.Deployment) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetDeployment(context.Context, string) (*domain.Deployment, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) FindDeployment(context.Context, string, string, string) (*domain.Deployment, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListDeployments(context.Context, domain.DeploymentFilter) ([]domain.Deployment, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateDeployment(context.Context, *domain.Deployment) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteDeployment(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertRoute(context.Context, *domain.ModelRoute) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetRoute(context.Context, string) (*domain.ModelRoute, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListRoutes(context.Context, string) ([]domain.ModelRoute, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateRoute(context.Context, *domain.ModelRoute) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteRoute(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertConfigRevision(context.Context, *domain.ConfigRevision) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ActivateRevision(context.Context, domain.ConfigScope, int) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ActiveRevisionMeta(context.Context, domain.ConfigScope) (*domain.RevisionMeta, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ActiveRevisionHead(context.Context, domain.ConfigScope) (int64, int, error) {
+	return 0, 0, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetRevision(context.Context, domain.ConfigScope, int) (*domain.ConfigRevision, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListRevisionMetas(context.Context, domain.ConfigScope, int, int) ([]domain.RevisionMeta, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) LatestRevision(context.Context, domain.ConfigScope) (int, error) {
+	return 0, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) BeginPublish(context.Context) (catalog.PublishTx, error) {
+	return nil, errors.New("not implemented")
+}
+
+// emptyCatalogRevision 是能通过 ParseSnapshot 的最小合法修订（空目录合法：
+// 修订体完整即可，模型集合可为空；仿 catalog 包 validCatalogRevision）。
+func emptyCatalogRevision() *domain.ConfigRevision {
+	return &domain.ConfigRevision{
+		ID:       1,
+		Scope:    domain.ScopeCatalog,
+		Revision: 1,
+		IsActive: true,
+		Payload: domain.ExtensionConfig{
+			SchemaVersion: 1,
+			Raw:           json.RawMessage(`{"schema_version":1,"models":[],"providers":[],"deployments":[],"routes":[]}`),
+		},
+	}
+}
+
 func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -73,6 +196,8 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 		{"not_found", domain.NewError(domain.CodeNotFound, "no account"), ErrChatNoAccess},
 		{"rate_limited", domain.NewError(domain.CodeRateLimited, "slow down"), ErrChatRateLimited},
 		{"internal", domain.NewError(domain.CodeInternal, "boom"), ErrChatUpstreamError},
+		// R7-N1：目录冷启动（无已验证快照）哨兵 → 503，不得伪装成 403/500。
+		{"no_verified_snapshot", fmt.Errorf("%w: active revision unavailable: db gone", catalog.ErrNoVerifiedSnapshot), ErrChatNotReady},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -106,5 +231,53 @@ func TestChatFacade_AllowedModels_TransientErrorPropagates(t *testing.T) {
 	_, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website")
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want 透传 %v（瞬时故障不得吞掉伪装成空列表）", err, boom)
+	}
+}
+
+// --- R7-N1：facade 请求期就绪闸门（替代 boot 期 log.Fatalf） ---
+
+// 默认模型不在已发布快照 → ErrChatNotReady（503），且不触碰 gateway。
+// gw 传 nil：闸门若未短路，ChatCompletions 会 nil deref 让测试立刻失败。
+func TestChatFacade_StreamChat_DefaultModelMissingIsNotReady(t *testing.T) {
+	t.Parallel()
+	resolver := access.NewResolver(&facadeKeyStore{
+		accountErr: domain.NewError(domain.CodeNotFound, "billing account not found"),
+	}, nil)
+	cat := catalog.NewService(&facadeCatalogStore{rev: emptyCatalogRevision()})
+	f := NewChatGatewayFacade(nil, resolver, cat, "glm-4.6")
+	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if !errors.Is(err, ErrChatNotReady) {
+		t.Fatalf("err = %v, want ErrChatNotReady（默认模型不在快照 → 503，gateway 不得被调用）", err)
+	}
+}
+
+// 快照冷启动错误（携带 ErrNoVerifiedSnapshot 哨兵）→ ErrChatNotReady。
+func TestChatFacade_StreamChat_ColdStartSentinelIsNotReady(t *testing.T) {
+	t.Parallel()
+	cold := fmt.Errorf("%w: active revision unavailable: db gone", catalog.ErrNoVerifiedSnapshot)
+	cat := catalog.NewService(&facadeCatalogStore{err: cold})
+	f := NewChatGatewayFacade(nil, nil, cat, "glm-4.6")
+	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if !errors.Is(err, ErrChatNotReady) {
+		t.Fatalf("err = %v, want ErrChatNotReady（冷启动哨兵 → 503）", err)
+	}
+	if errors.Is(err, ErrChatNoAccess) {
+		t.Fatal("冷启动失败不得伪装成 403 无权限")
+	}
+}
+
+// 就绪检查在 ResolveUserSession 之前：无计费账户的用户（旧语义 403）在
+// 目录冷启动失败时也必须拿到 503 —— 验收 §7.1/7.2 与用户状态无关。
+func TestChatFacade_StreamChat_ReadinessBeforeResolveUserSession(t *testing.T) {
+	t.Parallel()
+	resolver := access.NewResolver(&facadeKeyStore{
+		accountErr: domain.NewError(domain.CodeNotFound, "billing account not found"),
+	}, nil)
+	cold := fmt.Errorf("%w: active revision unavailable: db gone", catalog.ErrNoVerifiedSnapshot)
+	cat := catalog.NewService(&facadeCatalogStore{err: cold})
+	f := NewChatGatewayFacade(nil, resolver, cat, "glm-4.6")
+	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if !errors.Is(err, ErrChatNotReady) {
+		t.Fatalf("err = %v, want ErrChatNotReady（服务未就绪优先于用户权限分层）", err)
 	}
 }

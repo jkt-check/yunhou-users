@@ -228,7 +228,7 @@ func Setup(
 	chatHandler := handler.NewChatHandler(chatStreamSvc, chatAccessLog)
 	engine.POST("/chat", chatLimiter, middleware.JWTAuth(tokenSvc), chatHandler.StreamChat)
 	// GET /chat/models (Kaya 模型选择契约):facade 路径用 inference 目录
-	// (无计费账号时空列表而非报错);否则用多模型 ChatService 的权益视图。
+	// (N4a:无计费账号 → 403 对齐 legacy);否则用多模型 ChatService 的权益视图。
 	if accessOps != nil && accessOps.KayaChatModels != nil {
 		engine.GET("/chat/models", chatLimiter, middleware.JWTAuth(tokenSvc), accessOps.KayaChatModels.List)
 	} else {

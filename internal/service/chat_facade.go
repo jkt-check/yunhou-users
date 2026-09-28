@@ -80,16 +80,19 @@ func (f *ChatGatewayFacade) RecordUsage(ctx context.Context, userID, appID strin
 }
 
 // AllowedModels backs GET /chat/models from the inference catalog — same
-// judgment as /v1/models (published ∩ entitled); a user without a model
-// billing account gets an empty list, not an error (picker UX).
+// judgment as /v1/models (published ∩ entitled); N4a: a user without a model
+// billing account gets ErrChatNoAccess (403, 对齐 legacy accessPlan)，不再
+// 返回空列表。注意：生产上开关打开时 GET /chat/models 由 router 挂载到
+// KayaModelsHandler，本方法返回的原始哨兵透传是 dead path（仅 legacy
+// handler 路径或测试触达）。
 func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID string) ([]ChatModelInfo, error) {
 	p, err := f.resolver.ResolveUserSession(ctx, userID)
 	if err != nil {
-		// 评审批次7 Minor-5：仅「无计费账户」哨兵是正常态（picker 显示空
-		// 列表）；其余错误（瞬时 DB 故障等）记录日志并透传——吞掉会把
-		// 故障伪装成「该用户无可用模型」。
+		// N4a（推翻评审批次7 Minor-5 的空列表设计）：「无计费账户」哨兵 =
+		// 无有效订阅 → ErrChatNoAccess（403 对齐 legacy）；其余错误（瞬时
+		// DB 故障等）记录日志并透传——吞掉会把故障伪装成权限语义。
 		if domain.CodeOf(err) == domain.CodeNotFound {
-			return []ChatModelInfo{}, nil
+			return nil, ErrChatNoAccess
 		}
 		log.Printf("chat facade: resolve user session for models (user=%s): %v", userID, err)
 		return nil, err
@@ -147,6 +150,9 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOv
 	// DB 故障等）走 mapGatewayError 透传为 500 类，不得伪装成 403。
 	p, err := f.resolver.ResolveUserSession(ctx, userID)
 	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return nil, ErrChatNoAccess // 无计费账户 = 无访问权限（403）
+		}
 		return nil, mapGatewayError(err)
 	}
 	modelID := modelOverride
@@ -211,9 +217,34 @@ func mapGatewayError(err error) error {
 	if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
 		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
 	}
+	// R7-N4 契约差异修复：网关把上游 HTTP 拒绝包成 CodeUpstreamUnavailable
+	// （failover 语义），若只按 code 映射会丢掉 legacy 的结构化分类——kaya
+	// 依赖 data.upstream_code 区分「改写可重试」（context_length_exceeded）
+	// 与余额/内容政策拒绝，429 则触发客户端退避。错误链中的
+	// *providers.DispatchError 携真实状态码与上游错误体，用与 legacy
+	// 完全相同的 classifyUpstreamRejection 规则重建（同一函数，同一
+	// 脱敏/截断口径），保证两种模式 envelope 逐字节一致：
+	//   - 上游 4xx（≠429，重试耗尽或不可重试）→ ChatUpstreamRejection
+	//     （handler 映射 502 + data{upstream_status,code,message}）；
+	//   - 上游 429（候选全部限流）→ ErrChatRateLimited（429），对齐 legacy
+	//     重试耗尽后的 429 语义。
+	var de *providers.DispatchError
+	if errors.As(err, &de) && de.StatusCode != 0 {
+		if de.StatusCode == http.StatusTooManyRequests {
+			return ErrChatRateLimited
+		}
+		if de.StatusCode >= 400 && de.StatusCode < 500 {
+			return classifyUpstreamRejection(de.StatusCode, []byte(de.Body))
+		}
+	}
 	switch domain.CodeOf(err) {
-	case domain.CodeModelNotAllowed, domain.CodeInvalidKey, domain.CodeNotFound:
-		// 无权益/模型未授权/默认模型未上架 → 旧的"无访问权限"语义。
+	case domain.CodeNotFound:
+		// N4b：目录查无此模型 id → 400 未知模型（picker 回退默认）。
+		// 无计费账户的 CodeNotFound 已在 resolver 分支拦截，不到这里。
+		return ErrChatUnknownModel
+	case domain.CodeModelNotAllowed:
+		return ErrChatModelNotAllowed // 模型存在但无权益 → 403（对齐 legacy 文案）
+	case domain.CodeInvalidKey:
 		return ErrChatNoAccess
 	case domain.CodeQuotaExceeded, domain.CodeRateLimited, domain.CodeInsufficientCapacity:
 		return ErrChatRateLimited

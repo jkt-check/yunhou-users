@@ -234,10 +234,12 @@ func TestKayaModels_InternalErrorIs500NotEmptyList(t *testing.T) {
 		!strings.Contains(w.Body.String(), `"code":401`) || !strings.Contains(w.Body.String(), `"data":null`) {
 		t.Fatalf("suspended account = %d, want 401 + data:null envelope: %s", w.Code, w.Body.String())
 	}
-	// 无计费账户（NotFound）→ 合法的 200 空列表。
+	// 无计费账户（NotFound）→ N4a：403，envelope 与 legacy ErrChatNoAccess
+	// 逐字节一致（推翻原 200 空列表设计；picker 对 403 隐藏选择器）。
 	w := call(domain.NewError(domain.CodeNotFound, "no billing account"))
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"code":0`) {
-		t.Fatalf("no account = %d, want 200 code:0: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden ||
+		w.Body.String() != `{"code":403,"data":null,"message":"active subscription with access to this app is required"}` {
+		t.Fatalf("no account = %d, want 403 legacy byte-exact envelope: %s", w.Code, w.Body.String())
 	}
 }
 

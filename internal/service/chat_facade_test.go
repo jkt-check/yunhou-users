@@ -11,6 +11,7 @@ import (
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/providers"
 )
 
 // chat_facade_test.go — 评审批次7 Minor-4/5 验收 + R7-N4a/N4b 契约对齐：
@@ -115,6 +116,19 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 		// 哨兵穿透 WrapError 后仍被 errors.Is 命中。
 		{"wrapped_no_verified_snapshot", domain.WrapError(domain.CodeInternal, "gateway: catalog snapshot unavailable",
 			fmt.Errorf("%w: active revision unavailable: db gone", catalog.ErrNoVerifiedSnapshot)), ErrChatNotReady},
+		// R7-N4 契约差异修复：failover 包装（CodeUpstreamUnavailable +
+		// DispatchError cause）按链上真实状态码分类，对齐 legacy：
+		// 上游 429（候选全限流）→ 429；上游 4xx → ChatUpstreamRejection
+		// （errors.Is 命中 ErrChatUpstreamRejected）；上游 5xx / 传输错误
+		// 仍落 ErrChatUpstreamError（502）。
+		{"upstream_429_exhausted", domain.WrapError(domain.CodeUpstreamUnavailable, "all compatible upstreams failed",
+			&providers.DispatchError{StatusCode: 429, Body: `{"error":{"message":"slow down"}}`}), ErrChatRateLimited},
+		{"upstream_4xx_rejected", domain.WrapError(domain.CodeUpstreamUnavailable, "upstream rejected the request",
+			&providers.DispatchError{StatusCode: 400, Body: `{"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}`}), ErrChatUpstreamRejected},
+		{"upstream_500", domain.WrapError(domain.CodeUpstreamUnavailable, "all compatible upstreams failed",
+			&providers.DispatchError{StatusCode: 500, Body: `{"error":{"message":"boom"}}`}), ErrChatUpstreamError},
+		{"upstream_transport", domain.WrapError(domain.CodeUpstreamUnavailable, "all compatible upstreams failed",
+			&providers.DispatchError{Err: errors.New("connection refused")}), ErrChatUpstreamError},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -122,6 +136,24 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 				t.Errorf("mapGatewayError(%v) = %v, want %v", c.err, got, c.want)
 			}
 		})
+	}
+}
+
+// R7-N4：facade 的上游 4xx 拒绝必须与 legacy classifyUpstreamRejection
+// 产生逐字段相同的结构化分类（status/code/message），kaya 依赖
+// data.upstream_code 区分失败类别。
+func TestMapGatewayError_UpstreamRejectionMatchesLegacyClassification(t *testing.T) {
+	t.Parallel()
+	body := `{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`
+	legacy := classifyUpstreamRejection(400, []byte(body))
+	got := mapGatewayError(domain.WrapError(domain.CodeUpstreamUnavailable,
+		"upstream rejected the request", &providers.DispatchError{StatusCode: 400, Body: body}))
+	var rej *ChatUpstreamRejection
+	if !errors.As(got, &rej) {
+		t.Fatalf("err = %v, want *ChatUpstreamRejection", got)
+	}
+	if rej.Status != legacy.Status || rej.Code != legacy.Code || rej.Message != legacy.Message {
+		t.Errorf("facade rejection = %+v, want legacy classification %+v", rej, legacy)
 	}
 }
 

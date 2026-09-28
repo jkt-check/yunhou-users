@@ -217,6 +217,26 @@ func mapGatewayError(err error) error {
 	if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
 		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
 	}
+	// R7-N4 契约差异修复：网关把上游 HTTP 拒绝包成 CodeUpstreamUnavailable
+	// （failover 语义），若只按 code 映射会丢掉 legacy 的结构化分类——kaya
+	// 依赖 data.upstream_code 区分「改写可重试」（context_length_exceeded）
+	// 与余额/内容政策拒绝，429 则触发客户端退避。错误链中的
+	// *providers.DispatchError 携真实状态码与上游错误体，用与 legacy
+	// 完全相同的 classifyUpstreamRejection 规则重建（同一函数，同一
+	// 脱敏/截断口径），保证两种模式 envelope 逐字节一致：
+	//   - 上游 4xx（≠429，重试耗尽或不可重试）→ ChatUpstreamRejection
+	//     （handler 映射 502 + data{upstream_status,code,message}）；
+	//   - 上游 429（候选全部限流）→ ErrChatRateLimited（429），对齐 legacy
+	//     重试耗尽后的 429 语义。
+	var de *providers.DispatchError
+	if errors.As(err, &de) && de.StatusCode != 0 {
+		if de.StatusCode == http.StatusTooManyRequests {
+			return ErrChatRateLimited
+		}
+		if de.StatusCode >= 400 && de.StatusCode < 500 {
+			return classifyUpstreamRejection(de.StatusCode, []byte(de.Body))
+		}
+	}
 	switch domain.CodeOf(err) {
 	case domain.CodeNotFound:
 		// N4b：目录查无此模型 id → 400 未知模型（picker 回退默认）。

@@ -285,9 +285,11 @@ func (s *Store) Reserve(ctx context.Context, w domain.UnitOfWork, cmd domain.Res
 
 	// 2./3. Apply holds.
 	for _, h := range holds {
-		if h.Amount <= 0 {
-			return nil, domain.WrapError(domain.CodeInvalidInput, "reserve: hold amount must be > 0", domain.ErrNegativeValue)
+		if h.Amount < 0 {
+			return nil, domain.WrapError(domain.CodeInvalidInput, "reserve: hold amount must be >= 0", domain.ErrNegativeValue)
 		}
+		// R7-N5：零额预占行照常落库（amount_micros >= 0，migration 041）——
+		// 0 价模型的 held→settled/released 状态机与非 0 价完全一致。
 		switch h.TargetKind {
 		case domain.TargetKeyBudget:
 			if h.APIKeyID == nil {

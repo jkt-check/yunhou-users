@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"fmt"
 	"time"
 
@@ -404,6 +405,29 @@ func (s *Service) ResolveSecret(ctx context.Context, id string, pinGeneration *i
 		return nil, nil, domain.WrapError(domain.CodeInternal, "credential decrypt failed", err)
 	}
 	return plain, cred, nil
+}
+
+// ResolveBearerToken resolves the token usable as an Authorization: Bearer
+// header（R7-N7 预发布探测面）：静态凭据（api_key/service）返回明文本身；
+// oauth 凭据的明文是 bundle，取其 access token。代次钉扎与 ResolveSecret
+// 完全一致。bundle 格式由本包独占，调用方（management 探测服务）经接口
+// 消费本方法，无需知晓 bundle 形状。
+func (s *Service) ResolveBearerToken(ctx context.Context, id string, pinGeneration *int64) (string, *domain.Credential, error) {
+	plain, cred, err := s.ResolveSecret(ctx, id, pinGeneration)
+	if err != nil {
+		return "", nil, err
+	}
+	if cred.AuthType != "oauth" {
+		return strings.TrimSpace(string(plain)), cred, nil
+	}
+	bundle, err := UnmarshalBundle(plain)
+	if err != nil {
+		return "", nil, err
+	}
+	if bundle.AccessToken == "" {
+		return "", nil, domain.NewError(domain.CodeConflict, "oauth credential has no access token")
+	}
+	return bundle.AccessToken, cred, nil
 }
 
 func (s *Service) mustActive(ctx context.Context, id string) (*domain.Credential, error) {

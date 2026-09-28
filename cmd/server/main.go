@@ -308,6 +308,11 @@ func main() {
 	credSvc := inferencecredentials.NewService(credVault, infStore, infStore)
 	catalogMgr := inferencemanagement.NewCatalogManager(catalogSvc, infStore, egressValidator.ValidateURL)
 	adminModelsHandler := inferencehttpapi.NewAdminModelsHandler(catalogMgr)
+	// R7-N7: deployment 上游连通性探测（预发布防线）。与网关/connector 共用
+	// 同一 egress 策略的 HTTP client（dial 时 IP 校验兜底 DNS rebinding）；
+	// 探测只读，永不写库。
+	adminModelsHandler.SetProber(inferencemanagement.NewProbeService(
+		infStore, credSvc, egressValidator.ValidateURL, inferenceproviders.NewHTTPClient(egressValidator)))
 
 	// Task 15: 运营读模型（统计/异常/补偿追踪/变更预览）——只读派生路径，
 	// 直读权威表（inference_requests/attempts/usage_records/ledger_entries），

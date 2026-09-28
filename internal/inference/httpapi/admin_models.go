@@ -25,12 +25,19 @@ import (
 // exist even for a moment (任务书: 完成 Task 4 的运营授权前不挂载可写管理路由).
 type AdminModelsHandler struct {
 	mgr *management.CatalogManager
+	// prober 是 deployment 上游连通性探测服务（R7-N7，预发布防线）。
+	// 可选：未装配时探测端点与 publish dry_run 都 fail-closed 报 500。
+	prober *management.ProbeService
 }
 
 // NewAdminModelsHandler builds the handler over the catalog manager.
 func NewAdminModelsHandler(mgr *management.CatalogManager) *AdminModelsHandler {
 	return &AdminModelsHandler{mgr: mgr}
 }
+
+// SetProber wires the on-demand upstream probe service (R7-N7). Read-only:
+// it never writes the DB and never blocks a real publish.
+func (h *AdminModelsHandler) SetProber(p *management.ProbeService) { h.prober = p }
 
 // RegisterReadOnly mounts the read-only catalog queries. Called by
 // router.Setup today.
@@ -57,6 +64,8 @@ func (h *AdminModelsHandler) RegisterWrite(g *gin.RouterGroup) {
 	g.POST("/deployments", h.CreateDeployment)
 	g.PATCH("/deployments/:id", h.UpdateDeployment)
 	g.DELETE("/deployments/:id", h.DeleteDeployment)
+	// R7-N7: deployment 上游连通性探测（只读 advisory，永不写库）。
+	g.POST("/deployments/:id/probe", h.ProbeDeployment)
 	g.POST("/models/:id/routes", h.CreateRoute)
 	g.PATCH("/routes/:route_id", h.UpdateRoute)
 	g.DELETE("/routes/:route_id", h.DeleteRoute)
@@ -761,7 +770,23 @@ func (h *AdminModelsHandler) DeleteDeployment(c *gin.Context) {
 	ok(c, gin.H{"deleted": c.Param("id")})
 }
 
-// CreateRoute POST /models/:id/routes
+// ProbeDeployment POST /deployments/:id/probe —— 用真实凭据对 base_url 发
+// GET {base}/models 的只读连通性探测（R7-N7 预发布防线，针对 "base_url 缺
+// /v1 → 上线后 404" 事故类）。永不写库、不要求 reason（无审计对象）；
+// 探测级失败一律 in-band {ok:false} 返回，只有 deployment 不存在等硬错误
+// 才走 envelope 错误。
+func (h *AdminModelsHandler) ProbeDeployment(c *gin.Context) {
+	if h.prober == nil {
+		fail(c, domain.NewError(domain.CodeInternal, "probe service not configured"))
+		return
+	}
+	res, err := h.prober.ProbeDeployment(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, res)
+}
 func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 	var req routeWriteRequest
 	if err := strictBindJSON(c, &req); err != nil {
@@ -833,10 +858,29 @@ func (h *AdminModelsHandler) DeleteRoute(c *gin.Context) {
 	ok(c, gin.H{"deleted": c.Param("route_id")})
 }
 
-// Publish POST /catalog/publish（必填 ?reason= 运营理由 → 审计，M-6）
+// Publish POST /catalog/publish（必填 ?reason= 运营理由 → 审计，M-6）。
+// 可选 ?dry_run=1（R7-N7）：不发布，返回发布候选集摘要 + 各 active
+// deployment 的上游探测报告（advisory——探测失败绝不阻断，由运营判断是否
+// 继续正式发布）；缺省 dry_run 时行为与既有发布完全一致。
 func (h *AdminModelsHandler) Publish(c *gin.Context) {
 	reason, okReason := requiredReasonOf(c)
 	if !okReason {
+		return
+	}
+	if dryRunOf(c) {
+		// 评审修复（R7-N7 轮1）：在类型转换前判空——h.prober 是具体类型
+		// *ProbeService，直接传给 DeploymentProber 接口会得到非 nil 的
+		// typed-nil，manager 层的 prober==nil fail-closed 检查永远打不中。
+		if h.prober == nil {
+			fail(c, domain.NewError(domain.CodeInternal, "probe service not configured"))
+			return
+		}
+		report, err := h.mgr.PublishDryRun(c.Request.Context(), h.prober)
+		if err != nil {
+			fail(c, err)
+			return
+		}
+		ok(c, report)
 		return
 	}
 	rev, err := h.mgr.Publish(c.Request.Context(), actorOf(c), reason)
@@ -845,6 +889,16 @@ func (h *AdminModelsHandler) Publish(c *gin.Context) {
 		return
 	}
 	ok(c, gin.H{"revision": rev})
+}
+
+// dryRunOf 解析可选 ?dry_run=（1/true/yes 视为真）。与 ?reason= 同走 query
+// ——publish 无请求体。
+func dryRunOf(c *gin.Context) bool {
+	switch strings.ToLower(strings.TrimSpace(c.Query("dry_run"))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }
 
 // Rollback POST /catalog/rollback {"to_revision":N,"reason":"…"} —— reason 必填。

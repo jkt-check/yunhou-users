@@ -190,7 +190,7 @@ func setupAccountE2E(t *testing.T, up *chatStubUpstream) *accountE2EEnv {
 	setupCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	chatRouterSetup(setupCtx, engine, db, tokenSvc, authSvc,
-		service.NewChatService(nil, repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db), repo.NewLLMUsageRepo(db)), accessOps)
+		service.NewChatService(nil, repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db), repo.NewLLMUsageRepo(db)), accessOps, nil)
 
 	// admin 面：凭据 + 可调度账号端点（credentials:manage；身份双腿打桩，
 	// 权限检查走真实 OperatorAuthz）。

@@ -180,8 +180,8 @@ func setupAccountE2E(t *testing.T, up *chatStubUpstream) *accountE2EEnv {
 		quota.NewService(store, nil), routingSvc, credSvc, providers.NewHTTPClient(egress), egress, nil)
 
 	accessOps := &httpapi.AccessOps{
-		KayaChat:       service.NewChatGatewayFacade(gw, resolver, catalogSvc, modelID),
-		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, modelID),
+		KayaChat:       service.NewChatGatewayFacade(gw, resolver, catalogSvc, staticSnapE2E{snap}, modelID),
+		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, staticSnapE2E{snap}, modelID),
 	}
 
 	gin.SetMode(gin.ReleaseMode)

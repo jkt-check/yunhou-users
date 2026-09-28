@@ -11,6 +11,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/gateway"
 	"github.com/yunhou/users/internal/middleware"
 )
 
@@ -26,13 +28,17 @@ import (
 type KayaModelsHandler struct {
 	Catalog      *catalog.Service
 	Resolver     *access.Resolver
+	Snapshots    gateway.SnapshotSource
 	DefaultModel string
 }
 
 // NewKayaModelsHandler builds the handler; defaultModel marks the entry the
-// client should preselect.
-func NewKayaModelsHandler(cat *catalog.Service, resolver *access.Resolver, defaultModel string) *KayaModelsHandler {
-	return &KayaModelsHandler{Catalog: cat, Resolver: resolver, DefaultModel: defaultModel}
+// client should preselect. snapshots is the readiness-gate/snapshot pin
+// source — the shared SnapshotCache, so cold start carries
+// ErrNoVerifiedSnapshot (评审裁定：不得用 Catalog.LoadSnapshot，它绕开 cache、
+// 哨兵不可达且每请求全量 SELECT+ParseSnapshot；与 facade 同一来源）。
+func NewKayaModelsHandler(cat *catalog.Service, resolver *access.Resolver, snapshots gateway.SnapshotSource, defaultModel string) *KayaModelsHandler {
+	return &KayaModelsHandler{Catalog: cat, Resolver: resolver, Snapshots: snapshots, DefaultModel: defaultModel}
 }
 
 // kayaModelEntry is the candidate-branch return shape (对齐基准).
@@ -45,6 +51,20 @@ type kayaModelEntry struct {
 
 // List handles GET /chat/models.
 func (h *KayaModelsHandler) List(c *gin.Context) {
+	// N2 就绪闸门：目录冷启动无已验证快照 → 503 + Retry-After（服务未就绪），
+	// 先于 ResolveUserSession——与「已发布但无权限」（403/空列表）严格分层；
+	// 新库无 revision 时无账户用户也拿 503（验收 §7.2）。非哨兵错误走 fail()
+	// 口径（500），不得伪装成冷启动。快照 pin 一次复用到下方条目组装。
+	snap, err := h.Snapshots.Current(c.Request.Context())
+	if err != nil {
+		if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
+			c.Header("Retry-After", "5")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"code": 503, "data": nil, "message": "chat catalog is not ready"})
+			return
+		}
+		fail(c, err)
+		return
+	}
 	userID := c.GetString(middleware.ContextUserID)
 	p, err := h.Resolver.ResolveUserSession(c.Request.Context(), userID)
 	if err != nil {
@@ -74,11 +94,6 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 	}
 	models, err := h.Catalog.ListPublishedModels(c.Request.Context(),
 		func(_ context.Context, modelID string) (bool, error) { return allowSet[modelID], nil })
-	if err != nil {
-		fail(c, err)
-		return
-	}
-	snap, err := h.Catalog.LoadSnapshot(c.Request.Context())
 	if err != nil {
 		fail(c, err)
 		return

@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -65,13 +66,16 @@ func TestKayaModels_ListBranches(t *testing.T) {
 	}
 
 	resolver := access.NewResolver(store, nil)
+	// 快照源 = 共享 SnapshotCache（评审裁定：不得用 Catalog.LoadSnapshot——
+	// 它绕开 cache，冷启动哨兵不可达）。
+	cache := catalog.NewSnapshotCache(store, func(error) {})
 	engine := gin.New()
 	engine.GET("/chat/models", func(c *gin.Context) {
 		if u := c.GetHeader("X-Test-User"); u != "" {
 			c.Set(middleware.ContextUserID, u)
 		}
 		c.Next()
-	}, httpapi.NewKayaModelsHandler(catalogSvc, resolver, "deepseek-chat").List)
+	}, httpapi.NewKayaModelsHandler(catalogSvc, resolver, cache, "deepseek-chat").List)
 
 	call := func(userID string) (int, []map[string]any) {
 		t.Helper()
@@ -128,5 +132,78 @@ func TestKayaModels_ListBranches(t *testing.T) {
 	}
 	if _, unentitled := m["display_name"]; !unentitled {
 		t.Errorf("display_name missing: %v", m)
+	}
+}
+
+// R7-N2：目录冷启动（从未发布 → 真实 SnapshotCache 无已验证快照，携带
+// ErrNoVerifiedSnapshot 哨兵）→ 503 + Retry-After: 5 + envelope
+// {code:503,data:null,message:"chat catalog is not ready"}。就绪检查先于
+// ResolveUserSession：无计费账户的用户在冷启动时也必须拿 503（验收 §7.2），
+// 而不是「无账户 → 200 空列表」——「服务未就绪」与「用户无权限」严格分层。
+func TestKayaModels_ColdStartIs503BeforeUserResolution(t *testing.T) {
+	f := newAccessFixture(t, 0)
+	catalogSvc := catalog.NewService(f.store)
+	// 真实 cache 直连真实 store：本用例不发布任何 revision = 真实冷启动形态。
+	cache := catalog.NewSnapshotCache(f.store, func(error) {})
+	resolver := access.NewResolver(f.store, nil)
+
+	engine := gin.New()
+	engine.GET("/chat/models", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "u-no-account")
+		c.Next()
+	}, httpapi.NewKayaModelsHandler(catalogSvc, resolver, cache, "deepseek-chat").List)
+
+	req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cold-start /chat/models = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q, want %q", got, "5")
+	}
+	var env struct {
+		Code    int             `json:"code"`
+		Data    json.RawMessage `json:"data"`
+		Message string          `json:"message"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if env.Code != 503 || string(env.Data) != "null" || env.Message != "chat catalog is not ready" {
+		t.Errorf("envelope = %s, want {code:503,data:null,message:\"chat catalog is not ready\"}", w.Body.String())
+	}
+}
+
+// failingSnapshotSource 手搓桩：注入非哨兵快照错误（真实 SnapshotCache 在冷
+// 启动时一律包哨兵，非哨兵错误只可能来自其它实现——防御性口径仍需钉住）。
+type failingSnapshotSource struct{ err error }
+
+func (s failingSnapshotSource) Current(context.Context) (*catalog.Snapshot, error) {
+	return nil, s.err
+}
+
+// 非哨兵快照错误不得伪装成 503 冷启动：走包内 fail() 口径 → 500。
+func TestKayaModels_NonSentinelSnapshotErrorIs500(t *testing.T) {
+	f := newAccessFixture(t, 0)
+	catalogSvc := catalog.NewService(f.store)
+	resolver := access.NewResolver(f.store, nil)
+	boom := errors.New("snapshot store gone")
+
+	engine := gin.New()
+	engine.GET("/chat/models", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, "u1")
+		c.Next()
+	}, httpapi.NewKayaModelsHandler(catalogSvc, resolver, failingSnapshotSource{err: boom}, "deepseek-chat").List)
+
+	req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("non-sentinel snapshot error = %d, want 500: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") != "" {
+		t.Errorf("Retry-After must not be set on non-sentinel errors: %q", w.Header().Get("Retry-After"))
 	}
 }

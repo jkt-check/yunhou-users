@@ -128,6 +128,10 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		status, msg := chatErrorMapping(err)
 		var rej *service.ChatUpstreamRejection
 		errors.As(err, &rej)
+		if errors.Is(err, service.ErrChatNotReady) {
+			// Retry-After 取 5s：短于 chatLimiter refill,避免重试风暴放大。
+			c.Header("Retry-After", "5")
+		}
 		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", rej)
 		writeChatError(c, status, msg, rej)
 		return
@@ -229,6 +233,8 @@ func (h *ChatHandler) GetModels(c *gin.Context) {
 // ChatUpstreamRejection surfaced via writeChatError's data field.
 func chatErrorMapping(err error) (int, string) {
 	switch {
+	case errors.Is(err, service.ErrChatNotReady):
+		return http.StatusServiceUnavailable, service.ErrChatNotReady.Error()
 	case errors.Is(err, service.ErrChatNotEnabled):
 		return http.StatusNotFound, service.ErrChatNotEnabled.Error()
 	case errors.Is(err, service.ErrChatNoAccess):

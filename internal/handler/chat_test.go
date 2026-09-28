@@ -758,6 +758,44 @@ func TestChatHandler_AccessLog_Error(t *testing.T) {
 	}
 }
 
+// TestChatHandler_ChatNotReady503 locks the R7-N1/N2 mapping: a
+// service-not-ready failure (catalog cold start / default model not
+// published) degrades to 503 + Retry-After, never to a client error.
+func TestChatHandler_ChatNotReady503(t *testing.T) {
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamFails(service.ErrChatNotReady)})
+	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q, want %q", got, "5")
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if resp["code"] != float64(http.StatusServiceUnavailable) {
+		t.Errorf("code = %v, want 503", resp["code"])
+	}
+	if resp["data"] != nil {
+		t.Errorf("data = %v, want null", resp["data"])
+	}
+	if resp["message"] != service.ErrChatNotReady.Error() {
+		t.Errorf("message = %v, want %q", resp["message"], service.ErrChatNotReady.Error())
+	}
+	lines := strings.Split(strings.TrimSpace(logBuf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("log lines = %d, want 1: %q", len(lines), logBuf.String())
+	}
+	var entry chatAccessEntry
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("log line not JSON: %v", err)
+	}
+	if entry.Status != "error" {
+		t.Errorf("audit status = %q, want error", entry.Status)
+	}
+}
+
 func TestExtractChatOutput(t *testing.T) {
 	cases := []struct {
 		name string

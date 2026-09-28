@@ -428,8 +428,10 @@ func main() {
 	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
 	if cfg.InferenceKayaChatGateway {
-		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, cfg.KayaChatModel)
-		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, cfg.KayaChatModel)
+		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, catalogCache, cfg.KayaChatModel)
+		// R7-N2：/chat/models 就绪闸门与 facade 同一快照源（catalogCache）——
+		// 冷启动携带 ErrNoVerifiedSnapshot → 503 + Retry-After。
+		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, catalogCache, cfg.KayaChatModel)
 		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}
 	if cfg.InferenceCatalogJSON != "" {
@@ -440,14 +442,9 @@ func main() {
 		log.Printf("INFERENCE_CATALOG_JSON import: +%d providers, +%d models, +%d deployments, +%d routes, %d already present (skipped)",
 			res.ProvidersInserted, res.ModelsInserted, res.DeploymentsInserted, res.RoutesInserted, res.Skipped)
 	}
-	// 评审修复（批次8 Minor-3）：/chat 网关开启时 KAYA_CHAT_MODEL 必须在
-	// 目录中真实存在（env 导入之后校验，只读查询）——拼错的 model id 在
-	// 启动即失败，而不是每个 /chat 请求期才报错。
-	if cfg.InferenceKayaChatGateway {
-		if _, err := catalogSvc.GetModel(context.Background(), cfg.KayaChatModel); err != nil {
-			log.Fatalf("KAYA_CHAT_MODEL %q is not in the inference catalog: %v", cfg.KayaChatModel, err)
-		}
-	}
+	// R7-N1: KAYA_CHAT_MODEL 不在已发布目录不再 fatal —— facade 请求期返回
+	// 503 + Retry-After 并输出结构化 ERROR（进程其余端点不受影响）。部署期
+	// env 错误（KAYA_CHAT_MODEL 为空）仍由 config.Validate 当场 fatal。
 
 	// Chat access audit log: one JSON line per request (user_id, session_id,
 	// input, output, status, duration). Optional — empty CHAT_LOG_PATH

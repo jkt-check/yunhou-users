@@ -160,7 +160,10 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 	router.Setup(ctx, engine, db,
 		repo.NewAppRepo(db), repo.NewAuditLogRepo(db), repo.NewUserRepo(db), repo.NewSocialIdentityRepo(db),
 		repo.NewPlanRepo(db), repo.NewSubscriptionRepo(db), repo.NewSessionRepo(db),
-		tokenSvc, authSvc, nil, nil, nil,
+		tokenSvc, authSvc, nil,
+		// planSvc 真实接线：无关端点存活探针（/apps/:id/plans，R7-N3 step 4）
+		// 需要它；nil 会让该端点 panic。
+		service.NewPlanService(repo.NewPlanRepo(db), repo.NewAppRepo(db), repo.NewPlanChangeLogRepo(db)), nil,
 		&middleware.MultiChannelVerifier{}, nil,
 		nil, nil, chatSvc, nil, nil, nil, false, false, "e2e",
 		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil,
@@ -316,8 +319,8 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream) (*gin.Engine, *sqlx.
 		quota.NewService(store, nil), routingSvc, credSvc, providers.NewHTTPClient(egress), egress, nil)
 
 	accessOps := &httpapi.AccessOps{
-		KayaChat:       service.NewChatGatewayFacade(gw, resolver, catalogSvc, modelID),
-		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, modelID),
+		KayaChat:       service.NewChatGatewayFacade(gw, resolver, catalogSvc, staticSnapE2E{snap}, modelID),
+		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, staticSnapE2E{snap}, modelID),
 	}
 
 	gin.SetMode(gin.ReleaseMode)
@@ -617,5 +620,91 @@ func TestChatFacade_StillRequiresJWT(t *testing.T) {
 	})
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("facade no-JWT = %d, want 401", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R7-N1/N2 行为级（Task 5 step 4）：空目录冷启动下 facade 进程存活，只有
+// /chat 面退化 503 + Retry-After；健康检查与无关端点照常。
+// ---------------------------------------------------------------------------
+
+// setupChatFacadeEmptyCatalogE2E builds the facade-mode engine WITHOUT any
+// published catalog revision: facade 与 /chat/models 共享真实 SnapshotCache
+// （直连真实 store），两者都看到真实的冷启动哨兵形态。gateway 按生产形态
+// 接线但永不触达（就绪闸门在它之前短路）。
+func setupChatFacadeEmptyCatalogE2E(t *testing.T) *gin.Engine {
+	t.Helper()
+	db, tokenSvc, authSvc := chatE2EBase(t)
+	store := postgres.NewStore(db)
+	catalogSvc := catalog.NewService(store)
+	// 真实冷启动：本用例不发布任何 revision → cache.Current 携带
+	// ErrNoVerifiedSnapshot。
+	cache := catalog.NewSnapshotCache(store, func(error) {})
+	resolver := access.NewResolver(store, nil)
+	adapters := map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}
+	gw := infgateway.NewService(cache, store, access.NewEntitlementResolver(store, nil),
+		quota.NewService(store, nil), routing.NewService(store, adapters, nil),
+		nil, nil, nil, nil)
+
+	accessOps := &httpapi.AccessOps{
+		KayaChat:       service.NewChatGatewayFacade(gw, resolver, catalogSvc, cache, "deepseek-chat"),
+		KayaChatModels: httpapi.NewKayaModelsHandler(catalogSvc, resolver, cache, "deepseek-chat"),
+	}
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+	setupCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	chatRouterSetup(setupCtx, engine, db, tokenSvc, authSvc,
+		service.NewChatService(nil, repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db), repo.NewLLMUsageRepo(db)), accessOps)
+	return engine
+}
+
+func TestChatFacade_EmptyCatalogDegradesOnlyChatSurface(t *testing.T) {
+	engine := setupChatFacadeEmptyCatalogE2E(t)
+	login := loginAndGetTokens(t, engine, "chatemptycatalog", "yundian")
+
+	// 进程存活：健康检查不受目录冷启动影响。
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("/healthz = %d, want 200（进程存活）", w.Code)
+	}
+	// 无关端点照常：套餐列表与 inference 目录无涉。
+	req = httptest.NewRequest(http.MethodGet, "/apps/yundian/plans", nil)
+	w = httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /apps/yundian/plans = %d, want 200（无关端点照常）: %s", w.Code, w.Body.String())
+	}
+
+	// POST /chat → 503 + Retry-After（N1：facade 就绪闸门 → ErrChatNotReady
+	// → handler 底座映射 503）。
+	w = chatPost(t, engine, login.AccessToken, map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cold-start facade /chat = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("POST /chat Retry-After = %q, want %q", got, "5")
+	}
+
+	// GET /chat/models → 503 + Retry-After + 冷启动 envelope（N2）。
+	req = httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+	req.Header.Set("Authorization", "Bearer "+login.AccessToken)
+	w = httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cold-start GET /chat/models = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("GET /chat/models Retry-After = %q, want %q", got, "5")
+	}
+	if !strings.Contains(w.Body.String(), `"message":"chat catalog is not ready"`) {
+		t.Errorf("GET /chat/models envelope = %s, want the cold-start message", w.Body.String())
 	}
 }

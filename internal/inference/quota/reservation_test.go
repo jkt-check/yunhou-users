@@ -149,9 +149,11 @@ func TestReserveAmountExtras(t *testing.T) {
 
 func TestReserveAmountRejectsDegenerate(t *testing.T) {
 	p := creditPrice(t, 0, 0, nil)
-	// 全零价目 → 预占额为 0 → 拒绝（零价上界会放行无约束的免费负载）。
-	if _, err := ReserveAmount(p, ReserveBounds{InputBoundTokens: 1000, OutputCapTokens: 100}); err == nil {
-		t.Error("zero-priced reservation must reject")
+	// R7-N5：全零价目 → 预占额为 0，合法放行（免费负载仍受权益门控、
+	// RPM/TPM 限流、并发租约与强制输出上限约束，不再以"预占必须为正"拦截）。
+	got, err := ReserveAmount(p, ReserveBounds{InputBoundTokens: 1000, OutputCapTokens: 100})
+	if err != nil || got != 0 {
+		t.Errorf("zero-priced reservation = %d, %v; want 0, nil", got, err)
 	}
 	// 输出上限为 0 → 拒绝（不允许无限输出）。
 	p2 := creditPrice(t, 1_000_000, 1_000_000, nil)

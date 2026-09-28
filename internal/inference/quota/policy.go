@@ -92,9 +92,12 @@ func (p Policy) EnabledWindows() []domain.WindowKind {
 // Every blocking window is reported together so the API layer can answer
 // 429 with full detail (设计 §9.1: 多个窗口共同阻断时计算全部约束).
 func EvaluateAdmission(p Policy, windows []domain.QuotaWindow, hold domain.Microcredit, at time.Time) error {
-	if hold <= 0 {
-		return domain.WrapError(domain.CodeInvalidInput, "quota: hold must be > 0", domain.ErrNegativeValue)
+	if hold < 0 {
+		return domain.WrapError(domain.CodeInvalidInput, "quota: hold must be >= 0", domain.ErrNegativeValue)
 	}
+	// R7-N5：hold = 0（0 价模型）不阻断 —— 零消费预占对任何窗口都必然
+	// 满足 available >= 0 的充分性检查（下方逐窗口比较照常执行，只有已透
+	// 支的异常窗口才拦截零额预占）。
 	var blocked []domain.WindowBlock
 	for _, kind := range p.EnabledWindows() {
 		limit, _ := p.LimitFor(kind)

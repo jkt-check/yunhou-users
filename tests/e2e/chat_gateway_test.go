@@ -141,6 +141,10 @@ func wipeInferenceTables(t *testing.T, db *sqlx.DB) {
 	tables := []string{
 		"inference_audit_log", "operator_roles",
 		"inference_reconciliation_jobs", "inference_outbox",
+		// wallet 表组（migration 030）存在行间 FK：audits/entries/holds →
+		// wallets，entries → adjustments —— 子表先删。
+		"inference_wallet_audits", "inference_wallet_entries",
+		"inference_wallet_holds",
 		"inference_ledger_entries", "inference_adjustments",
 		"inference_concurrency_leases", "inference_reservations",
 		"inference_usage_records",
@@ -148,6 +152,8 @@ func wipeInferenceTables(t *testing.T, db *sqlx.DB) {
 		"inference_quota_windows",
 		"inference_entitlements", "inference_policy_versions",
 		"inference_price_versions",
+		// wallets reference billing accounts (FK) — delete first.
+		"inference_wallets", "inference_payg_config",
 		"inference_api_keys", "inference_billing_accounts",
 		"inference_upstream_accounts", "inference_credentials",
 		"inference_config_revisions", "inference_model_routes",

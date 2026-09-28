@@ -139,8 +139,12 @@ func TestEvaluateAdmission_FailsClosedOnUnresolvedWindow(t *testing.T) {
 		{Kind: domain.WindowWeekly, Start: at.Add(-time.Hour), End: at.Add(time.Hour), Limit: 10_000_000},
 		{Kind: domain.WindowMonthly, Start: at.Add(-time.Hour), End: at.Add(time.Hour), Limit: 100_000_000},
 	}
-	if err := EvaluateAdmission(p, full, 0, at); domain.CodeOf(err) != domain.CodeInvalidInput {
-		t.Errorf("zero hold: err = %v, want invalid_input", err)
+	// R7-N5：hold = 0（0 价模型）合法放行；负 hold 仍拒绝。
+	if err := EvaluateAdmission(p, full, 0, at); err != nil {
+		t.Errorf("zero hold: err = %v, want nil (R7-N5 zero-price admit)", err)
+	}
+	if err := EvaluateAdmission(p, full, -1, at); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("negative hold: err = %v, want invalid_input", err)
 	}
 
 	// 禁用窗口不要求行。

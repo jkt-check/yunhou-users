@@ -226,6 +226,31 @@ func TestChatFacade_StreamChat_DefaultModelMissingIsNotReady(t *testing.T) {
 	}
 }
 
+// 错误随行 route（ChatStreamer 契约）：就绪闸门失败也带回 resolved
+// route，审计错误行才能按生效模型归因；客户端显式带 model 时
+// LogicalModel == 客户端原值。
+func TestChatFacade_StreamChat_ErrorReturnsResolvedRoute(t *testing.T) {
+	t.Parallel()
+	snaps := stubSnapshotSource{snap: &catalog.Snapshot{Models: map[string]domain.Model{}}}
+	f := NewChatGatewayFacade(nil, nil, nil, snaps, "glm-4.6")
+
+	_, route, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if !errors.Is(err, ErrChatNotReady) {
+		t.Fatalf("err = %v, want ErrChatNotReady", err)
+	}
+	if route == nil || route.LogicalModel != "glm-4.6" {
+		t.Errorf("route = %+v, want resolved LogicalModel glm-4.6（空 model → 默认模型）", route)
+	}
+
+	_, route2, err2 := f.StreamChat(context.Background(), "u-1", "yunhou-website", "glm-x", nil, nil, nil)
+	if !errors.Is(err2, ErrChatNotReady) {
+		t.Fatalf("err = %v, want ErrChatNotReady", err2)
+	}
+	if route2 == nil || route2.LogicalModel != "glm-x" {
+		t.Errorf("route = %+v, want LogicalModel glm-x（客户端原值）", route2)
+	}
+}
+
 // 快照冷启动错误（携带 ErrNoVerifiedSnapshot 哨兵）→ ErrChatNotReady。
 func TestChatFacade_StreamChat_ColdStartSentinelIsNotReady(t *testing.T) {
 	t.Parallel()
@@ -268,12 +293,17 @@ func TestChatFacade_StreamChat_NoAccountResolverIsNoAccess(t *testing.T) {
 		Models: map[string]domain.Model{"glm-4.6": {ID: "glm-4.6"}},
 	}}
 	f := NewChatGatewayFacade(nil, resolver, nil, snaps, "glm-4.6")
-	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	_, route, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
 	if !errors.Is(err, ErrChatNoAccess) {
 		t.Fatalf("err = %v, want ErrChatNoAccess（无计费账户 → 403，不得误报未知模型）", err)
 	}
 	if errors.Is(err, ErrChatUnknownModel) {
 		t.Fatal("resolver CodeNotFound 不得落入 ErrChatUnknownModel（那是 gateway 目录查无此 id 的语义）")
+	}
+	// 验收场景钉：无 model 字段 + pre-stream 403 → route 随行，审计错误行
+	// 记 resolved 默认模型 id（ChatStreamer 契约）。
+	if route == nil || route.LogicalModel != "glm-4.6" {
+		t.Errorf("route = %+v, want resolved LogicalModel glm-4.6（403 错误行按默认模型归因）", route)
 	}
 }
 

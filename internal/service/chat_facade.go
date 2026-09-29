@@ -60,17 +60,21 @@ func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *c
 
 // StreamChat implements the /chat service surface. The request always
 // streams (SSE), exactly like the multi-model ChatService path. logicalModel
-// is the optional ChatRequest.Model (旧客户端不带 → defaultModel).
+// is the optional ChatRequest.Model (旧客户端不带 → defaultModel). Per the
+// ChatStreamer contract the resolved route rides along on error too, so the
+// handler's audit line carries the effective model (modelID == 客户端原值
+// when the client supplied one — that semantic is unchanged).
 func (f *ChatGatewayFacade) StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *ChatRoute, error) {
-	resp, err := f.streamChatModel(ctx, userID, logicalModel, messages, tools, thinkingEnabled)
-	if err != nil {
-		return nil, nil, err
-	}
 	modelID := logicalModel
 	if modelID == "" {
 		modelID = f.defaultModel
 	}
-	return resp, &ChatRoute{LogicalModel: modelID, Provider: "inference", UpstreamModel: modelID}, nil
+	route := &ChatRoute{LogicalModel: modelID, Provider: "inference", UpstreamModel: modelID}
+	resp, err := f.streamChatModel(ctx, userID, modelID, messages, tools, thinkingEnabled)
+	if err != nil {
+		return nil, route, err
+	}
+	return resp, route, nil
 }
 
 // RecordUsage is a no-op for the facade: the inference gateway settles
@@ -130,7 +134,7 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 	return out, nil
 }
 
-func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOverride string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
+func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
 	// N1/N2 就绪闸门：目录不可用（冷启动）或默认模型不在已发布目录 → 503，
 	// 进程不死、不回退 legacy。先于 ResolveUserSession，使「服务未就绪」
 	// 与「用户无权限」严格分层。走共享 SnapshotCache：冷启动携带
@@ -155,10 +159,8 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelOv
 		}
 		return nil, mapGatewayError(err)
 	}
-	modelID := modelOverride
-	if modelID == "" {
-		modelID = f.defaultModel
-	}
+	// modelID 已由 StreamChat 解析（空 → defaultModel）；这里不再重复解析，
+	// 否则审计行的 LogicalModel 与实际上游模型可能因两处规则漂移而分叉。
 	outcome, err := f.gw.ChatCompletions(ctx, p, nil, domain.ProtocolKayaChat, &providers.ChatRequest{
 		Model:           modelID,
 		Messages:        messages,

@@ -293,12 +293,17 @@ func TestChatFacade_StreamChat_NoAccountResolverIsNoAccess(t *testing.T) {
 		Models: map[string]domain.Model{"glm-4.6": {ID: "glm-4.6"}},
 	}}
 	f := NewChatGatewayFacade(nil, resolver, nil, snaps, "glm-4.6")
-	_, _, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	_, route, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
 	if !errors.Is(err, ErrChatNoAccess) {
 		t.Fatalf("err = %v, want ErrChatNoAccess（无计费账户 → 403，不得误报未知模型）", err)
 	}
 	if errors.Is(err, ErrChatUnknownModel) {
 		t.Fatal("resolver CodeNotFound 不得落入 ErrChatUnknownModel（那是 gateway 目录查无此 id 的语义）")
+	}
+	// 验收场景钉：无 model 字段 + pre-stream 403 → route 随行，审计错误行
+	// 记 resolved 默认模型 id（ChatStreamer 契约）。
+	if route == nil || route.LogicalModel != "glm-4.6" {
+		t.Errorf("route = %+v, want resolved LogicalModel glm-4.6（403 错误行按默认模型归因）", route)
 	}
 }
 

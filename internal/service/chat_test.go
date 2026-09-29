@@ -114,8 +114,7 @@ func TestChatService_UnknownModel(t *testing.T) {
 // model → 默认模型 id)。
 func TestChatService_ErrorReturnsResolvedRoute(t *testing.T) {
 	// Access denied (no subscription) — resolution succeeded, gate failed.
-	svc, _, planRepo, _ := chatTestFixture(t, nil)
-	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc, _, _, _ := chatTestFixture(t, nil)
 	_, route, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
 	if !errors.Is(err, ErrChatNoAccess) {
 		t.Fatalf("err = %v, want ErrChatNoAccess", err)

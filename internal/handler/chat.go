@@ -45,16 +45,21 @@ func NewChatHandler(svc service.ChatStreamer, accessLog *log.Logger) *ChatHandle
 // against syscall overhead for the SSE relay loop.
 const chatStreamBufSize = 32 << 10
 
-// chatMaxBodyBytes caps the total request body size. Legal payloads:
-// messages ≤256 KiB + tools ≤32 KiB + JSON overhead ≈ 290 KiB — 320 KiB
-// leaves ~30 KiB headroom while bounding MaxBytesReader allocation for
-// hostile bodies (spec §5.1: 128 KiB → 320 KiB).
-const chatMaxBodyBytes = 320 << 10
+// chatMaxBodyBytes caps the total request body size. Legal payloads after
+// the R6 context unlock: message contents ≤4 MiB (ChatMaxTotalBytes) +
+// reasoning_content replay (unbounded by design — long thinking chains are
+// legitimate input, see model.ChatMessage) + tools ≤32 KiB + JSON overhead —
+// 8 MiB covers the message budget twice over while still bounding
+// MaxBytesReader allocation for hostile bodies. Must stay below the nginx
+// /chat client_max_body_size (10m in deploy ops/nginx/gateway.conf) with
+// enough margin that over-limit requests reach this handler's 400 JSON
+// rather than an nginx 413.
+const chatMaxBodyBytes = 8 << 20
 
 // chatWriteTimeout is the per-response write deadline for /chat streams,
-// set via http.ResponseController. Slightly above ChatService's 5m upstream
+// set via http.ResponseController. Slightly above ChatService's 15m upstream
 // timeout so the stream ends by ctx cancellation, never by a write kill.
-const chatWriteTimeout = 6 * time.Minute
+const chatWriteTimeout = 16 * time.Minute
 
 // chatRawLogCap caps how much of the raw SSE stream is captured for the
 // audit log. A typical answer is a few KiB; 256 KiB covers pathological
@@ -90,8 +95,8 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
 	appID := c.GetString(middleware.ContextAppID)
 
-	// 请求体总大小上限(滥用面):tools 字段加入后 body 面略增,320 KiB
-	// 覆盖 messages(≤256 KiB)+ tools(≤32 KiB)的合法组合,超限拒绝。
+	// 请求体总大小上限(滥用面):R6 后合法负载 = messages(≤4 MiB 内容)
+	// + reasoning_content 回放 + tools(≤32 KiB),8 MiB 兜底,超限拒绝。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, chatMaxBodyBytes)
 
 	var req model.ChatRequest
@@ -149,7 +154,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 	// The global http.Server.WriteTimeout (25s) is an absolute deadline set
 	// once per request — it would hard-cut a stream that legitimately runs
 	// longer. Give this response its own, chat-sized write deadline instead:
-	// slightly above chatUpstreamTimeout (5m) so the stream ends by timeout
+	// slightly above chatUpstreamTimeout (15m) so the stream ends by timeout
 	// cancellation, never by a mid-stream write kill. SetWriteDeadline only
 	// fails when a wrapper hides the underlying connection — log it, because
 	// then the 25s WriteTimeout silently comes back into force.
@@ -178,7 +183,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		// for a completed exchange.
 		status = "disconnected"
 	case chatRelayUpstreamBroke:
-		// Upstream broke mid-stream (connection error or the 5m upstream
+		// Upstream broke mid-stream (connection error or the 15m upstream
 		// timeout) — also a partial answer, but the cause is on the
 		// DeepSeek side, which an operator wants to distinguish from a
 		// user closing their tab.
@@ -426,7 +431,7 @@ func truncateUTF8(s string, cap int) (string, bool) {
 
 // chatRelayResult reports how an SSE relay ended, so the audit trail can
 // distinguish a completed answer from a client disconnect and from an
-// upstream break (connection error or the 5m upstream timeout) — the last
+// upstream break (connection error or the 15m upstream timeout) — the last
 // is the one an operator needs to notice.
 type chatRelayResult int
 

@@ -988,7 +988,11 @@ func TestChatHandler_UpstreamBrokeInjectsErrorEvent(t *testing.T) {
 func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 	// Validation-failed requests carry unvalidated content — the audit line
 	// must cap it (per message) instead of mirroring the full payload.
-	long := strings.Repeat("滥", model.ChatMaxMessageBytes) // fails the per-message validation
+	// "滥" is 3 bytes: cap/3+1 runes = cap+3 bytes — over the per-message cap
+	// (validation must fire) but well under chatMaxBodyBytes (the body must
+	// pass MaxBytesReader, or binding fails before validation and the log
+	// entry carries no parsed input at all).
+	long := strings.Repeat("滥", model.ChatMaxMessageBytes/3+1) // fails the per-message validation
 	body := `{"messages":[{"role":"user","content":"` + long + `"}]}`
 	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{})
 	w := performChatRequest(r, body)

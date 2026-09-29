@@ -46,8 +46,10 @@ type ResponseChainStore interface {
 const responsesChainTTL = 24 * time.Hour
 
 // maxResponsesTranscriptBytes caps the persisted transcript (abuse surface:
-// each chained request re-sends the replay upstream).
-const maxResponsesTranscriptBytes = 512 << 10
+// each chained request re-sends the replay upstream). R6: 512 KiB → 4 MiB
+// so chained sessions can carry the same near-1M-token contexts the raised
+// body caps admit; oversized transcripts are still served but not chained.
+const maxResponsesTranscriptBytes = 4 << 20
 
 // ResponsesHandler serves POST /v1/responses.
 type ResponsesHandler struct {

@@ -22,11 +22,14 @@ import (
 )
 
 // chatUpstreamTimeout bounds one chat request end-to-end (headers + SSE
-// stream). Long enough for a full streamed answer; short enough that a hung
-// upstream can't pin a connection forever. The context is bound to the
-// upstream connection, so the client disconnecting (gin request ctx cancel)
-// also tears the stream down at the transport level.
-const chatUpstreamTimeout = 5 * time.Minute
+// stream). R6: 5m → 15m — a near-1M-token prompt spends minutes in upstream
+// prefill before the first token, and the inference catalog now allows
+// output caps up to 384K tokens; 15m covers prefill + a long (though not
+// worst-case) generation. Still short enough that a hung upstream can't pin
+// a connection forever. The context is bound to the upstream connection, so
+// the client disconnecting (gin request ctx cancel) also tears the stream
+// down at the transport level.
+const chatUpstreamTimeout = 15 * time.Minute
 
 // chatAccessTimeout bounds the pre-upstream phase (subscription + plan DB
 // reads). /chat skips the global 20s timeoutMiddleware so the SSE stream can
@@ -115,7 +118,7 @@ func NewChatService(catalog *llm.Catalog, subRepo repo.SubscriptionRepo, planRep
 		// No client-level Timeout: the SSE stream length is bounded by ctx
 		// (chatUpstreamTimeout). But the transport gets explicit dial and
 		// response-header deadlines so a silently-hung upstream fails in
-		// seconds instead of pinning the connection until the 5m ctx fires.
+		// seconds instead of pinning the connection until the 15m ctx fires.
 		httpClient: &http.Client{Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{

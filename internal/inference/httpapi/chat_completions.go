@@ -29,9 +29,11 @@ import (
 
 // v1ChatMaxBodyBytes caps the standard chat-completions body. Standard
 // clients legitimately exceed the Kaya /chat limits (long tool schemas,
-// many turns); the engine-level 1 MiB MaxBytesReader remains the outer
+// many turns). R6: 1 MiB → 8 MiB, aligned with the /chat body cap
+// (chatMaxBodyBytes) so near-1M-token catalog contexts are reachable on the
+// API-key surface too. The engine-level MaxBytesReader remains the outer
 // guard, and this per-route cap matches it.
-const v1ChatMaxBodyBytes = 1 << 20
+const v1ChatMaxBodyBytes = 8 << 20
 
 // v1ChatMaxMessages / v1ChatMaxTools bound collection sizes for abuse
 // control WITHOUT inheriting the Kaya /chat contract (20 messages / 16

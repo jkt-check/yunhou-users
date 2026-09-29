@@ -499,3 +499,43 @@ func TestAmend_SourcePlanSelectorPassesThrough(t *testing.T) {
 		t.Errorf("scanned = %d, want fake's 3 rows", rep.Scanned)
 	}
 }
+
+func TestRevise_RemoveToEmptySet(t *testing.T) {
+	// 红线 1 边界：remove 至空集合是合法的显式空集（= 无任何模型），
+	// 不得被当作 nil/未变处理。
+	st := newFakeEntStore(activeEnt("e1", "acct-1", "m-only"))
+	au := &fakeAudit{}
+	svc := NewEntitlementAdminService(st, au)
+
+	res, err := svc.Revise(context.Background(), testOp, "e1", ReviseInput{
+		RemoveModelIDs: []string{"m-only"}, Reason: "下架唯一模型",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Changed {
+		t.Fatal("remove-to-empty is a real change")
+	}
+	if res.Entitlement.ModelIDs == nil || len(res.Entitlement.ModelIDs) != 0 {
+		t.Errorf("stored set = %#v, want explicit empty (non-nil)", res.Entitlement.ModelIDs)
+	}
+	if got := st.ents["e1"].ModelIDs; got == nil || len(got) != 0 {
+		t.Errorf("db set = %#v, want explicit empty", got)
+	}
+}
+
+func TestAmend_ZeroMatchNote(t *testing.T) {
+	// selector 命中 0 行（典型：plan id 打错）→ report 带防呆 note。
+	st := amendFixture()
+	st.amendRows = nil
+	svc := NewEntitlementAdminService(st, &fakeAudit{})
+	rep, err := svc.AmendModels(context.Background(), testOp, AmendRequest{
+		ModelID: "m-new", Action: "add", Selector: "source_plan:no-such-plan", Reason: "r",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Scanned != 0 || rep.Note == "" {
+		t.Errorf("zero-match report = %+v, want scanned=0 with note", rep)
+	}
+}

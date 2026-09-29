@@ -38,6 +38,10 @@ const (
 // 部署可能命中成千上万行；计数字段始终是权威全量，明细只作排障抽样）。
 const maxAmendSkippedDetail = 500
 
+// maxAmendErrors 是 errors[] 明细的硬上限（与 skipped_detail 同一模式：
+// 大批量中途故障时响应体必须有界，计数字段仍是权威全量）。
+const maxAmendErrors = 500
+
 // maxAmendSample 是 dry_run 抽样行数上限。
 const maxAmendSample = 50
 
@@ -228,9 +232,14 @@ type AmendReport struct {
 	Conflicts int `json:"conflicts"`
 
 	Errors                 []AmendRowInfo `json:"errors"`
+	ErrorsTruncated        bool           `json:"errors_truncated,omitempty"`
 	SkippedDetail          []AmendRowInfo `json:"skipped_detail"`
 	SkippedDetailTruncated bool           `json:"skipped_detail_truncated,omitempty"`
 	Samples                []AmendSample  `json:"samples"`
+
+	// Note 是防呆提示（目前唯一场景：selector 命中 0 行——operator 打错
+	// plan id 时不至于把「成功，0 行」误读为「无事可做」）。
+	Note string `json:"note,omitempty"`
 }
 
 // AmendModels executes R2。selector 解析：all_active（全部 active 权益）/
@@ -271,6 +280,9 @@ func (s *EntitlementAdminService) AmendModels(ctx context.Context, op Entitlemen
 		return nil, err
 	}
 	rep.Scanned = len(rows)
+	if rep.Scanned == 0 {
+		rep.Note = "selector matched 0 rows — check the selector / plan id"
+	}
 
 	var add, remove []string
 	if in.Action == AmendActionAdd {
@@ -317,10 +329,10 @@ func (s *EntitlementAdminService) AmendModels(ctx context.Context, op Entitlemen
 			case domain.CodeOf(rerr) == domain.CodeConflict:
 				note = "conflict: " + rerr.Error()
 				rep.Conflicts++
-				rep.Errors = append(rep.Errors, AmendRowInfo{ent.ID, ent.BillingAccountID, note})
+				rep.appendError(ent, note)
 			default:
 				note = "error: " + rerr.Error()
-				rep.Errors = append(rep.Errors, AmendRowInfo{ent.ID, ent.BillingAccountID, note})
+				rep.appendError(ent, note)
 			}
 		}
 		if len(rep.Samples) < sampleN {
@@ -385,6 +397,16 @@ func reviseAuditDetail(before, after *domain.Entitlement, extra map[string]any) 
 		d[k] = v
 	}
 	return d
+}
+
+// appendError 追加行级失败明细（超上限置 truncated 标记，与
+// skipped_detail 同一有界模式）。
+func (r *AmendReport) appendError(ent *domain.Entitlement, note string) {
+	if len(r.Errors) >= maxAmendErrors {
+		r.ErrorsTruncated = true
+		return
+	}
+	r.Errors = append(r.Errors, AmendRowInfo{ent.ID, ent.BillingAccountID, note})
 }
 
 // appendSkipped 追加 skipped 明细（超上限置 truncated 标记，计数字段始终

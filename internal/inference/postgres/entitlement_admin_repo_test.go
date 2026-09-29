@@ -181,3 +181,110 @@ func TestListEntitlementsForAmend(t *testing.T) {
 		t.Fatalf("bogus selector: err = %v, want CodeInvalidInput", err)
 	}
 }
+
+// TestReviseEntitlement_ConcurrentConflict（AC4 实证）：两个事务以同一
+// revision 并发修订同一权益——恰一方成功，另一方 CodeConflict，无半更新
+// （最终 model_ids 是胜者的完整结果，revision 只 +1）。
+func TestReviseEntitlement_ConcurrentConflict(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+
+	ent, err := s.GetEntitlement(ctx, f.entID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchOf := func(models []string) domain.EntitlementPatch {
+		return domain.EntitlementPatch{ExpectedRevision: ent.Revision, ModelIDs: models}
+	}
+
+	type result struct {
+		rev *domain.Entitlement
+		err error
+	}
+	revise := func(models []string) result {
+		uow, err := s.Begin(ctx)
+		if err != nil {
+			return result{err: err}
+		}
+		defer uow.Rollback(ctx) //nolint:errcheck
+		rev, err := s.ReviseEntitlementTx(ctx, uow, f.entID, patchOf(models))
+		if err != nil {
+			return result{err: err}
+		}
+		if err := uow.Commit(ctx); err != nil {
+			return result{err: err}
+		}
+		return result{rev: rev}
+	}
+
+	// 两个 goroutine 同时以 revision=N 开写：PG 行锁让后到者阻塞至前者
+	// 提交，随后 WHERE revision=N 重评估失败 → CodeConflict。
+	chA, chB := make(chan result, 1), make(chan result, 1)
+	go func() { chA <- revise([]string{f.modelID, "m-winner-a"}) }()
+	go func() { chB <- revise([]string{f.modelID, "m-winner-b"}) }()
+	ra, rb := <-chA, <-chB
+
+	var wins, conflicts int
+	var winner *domain.Entitlement
+	for _, r := range []result{ra, rb} {
+		switch {
+		case r.err == nil:
+			wins++
+			winner = r.rev
+		case domain.CodeOf(r.err) == domain.CodeConflict:
+			conflicts++
+		default:
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+	}
+	if wins != 1 || conflicts != 1 {
+		t.Fatalf("wins=%d conflicts=%d, want exactly 1/1", wins, conflicts)
+	}
+	if winner.Revision != ent.Revision+1 {
+		t.Errorf("winner revision = %d, want %d", winner.Revision, ent.Revision+1)
+	}
+	// 最终行是胜者的完整结果（无交错半更新）。
+	final, err := s.GetEntitlement(ctx, f.entID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Revision != winner.Revision || len(final.ModelIDs) != 2 {
+		t.Errorf("final row = rev %d models %v, want winner's complete result",
+			final.Revision, final.ModelIDs)
+	}
+}
+
+// TestReviseEntitlement_EmptySetIsExplicitEmpty（红线 1 落库面）：remove 至
+// 空集合落库为 '{}'（显式空集 = 无任何模型），不是 NULL。
+func TestReviseEntitlement_EmptySetIsExplicitEmpty(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+
+	ent, err := s.GetEntitlement(ctx, f.entID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev, err := s.ReviseEntitlement(ctx, f.entID, domain.EntitlementPatch{
+		ExpectedRevision: ent.Revision, ModelIDs: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev.ModelIDs == nil || len(rev.ModelIDs) != 0 {
+		t.Errorf("revised set = %#v, want explicit empty", rev.ModelIDs)
+	}
+	var isEmpty, isNull bool
+	if err := s.db.Get(&isEmpty,
+		`SELECT model_ids = '{}'::text[] FROM inference_entitlements WHERE id = $1`, f.entID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Get(&isNull,
+		`SELECT model_ids IS NULL FROM inference_entitlements WHERE id = $1`, f.entID); err != nil {
+		t.Fatal(err)
+	}
+	if !isEmpty || isNull {
+		t.Errorf("stored model_ids: empty=%v null=%v, want '{}'非 NULL", isEmpty, isNull)
+	}
+}

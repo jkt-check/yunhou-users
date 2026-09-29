@@ -109,8 +109,11 @@ POST /admin/entitlements/amend-models
 - **行级隔离**：每行独立事务 + 行级乐观锁；乐观锁冲突计入 `conflicts`
   并进 `errors[]`（reason 前缀 `conflict:`），其它行故障也进 `errors[]`——
   **行级失败不置整体失败**，调用方解析 body 而非只看 HTTP 状态（N6 迁移
-  工具先例）。`skipped_detail` 上限 500 行（超出见
-  `skipped_detail_truncated`）；计数始终是权威全量。
+  工具先例）。`errors[]` 与 `skipped_detail` 明细各上限 500 行（超出见
+  `errors_truncated` / `skipped_detail_truncated`）；计数始终是权威全量。
+  `selector` 命中 0 行时 report 带 `note` 提示核对选择器（防 plan id 打错）。
+  `all_active` 一次把候选集载入内存逐行处理，适用于万行级以内；更大规模
+  分批按 `source_plan` 执行。
 - **语义红线**：只改 `model_ids`；权益 ID/anchor/有效期不动，配额窗口
   used/reserved 不清零（AC8）；仅 active 可修订，绝不复活退役权益；
   生效即时（每请求查库，无缓存）。

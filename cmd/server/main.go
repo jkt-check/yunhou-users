@@ -360,6 +360,9 @@ func main() {
 		// 配额策略管理面（生命周期六端点；publish 同事务 supersede，retire
 		// 引用保护，写 + 审计同事务）—— spec 2026-09-26-admin-quota-policies-design.md。
 		QuotaPolicies: inferencehttpapi.NewAdminQuotaPoliciesHandler(inferencemanagement.NewQuotaPolicyService(infStore, infStore, nil)),
+		// 存量权益增补面（entitlement-model-amendment，deploy PR #345）：
+		// 修订/增补写 + 审计同事务，写 billing:adjust、读 usage:read。
+		Entitlements: inferencehttpapi.NewAdminEntitlementsHandler(inferencemanagement.NewEntitlementAdminService(infStore, infStore)),
 	}
 
 	// Task 5: customer API keys + caller principal resolution. The

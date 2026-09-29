@@ -71,3 +71,75 @@ GET /admin/upstream-accounts/shared?from=&to=&limit=
 补偿必须有原因、权限（billing:adjust）、幂等键；幂等键重放返回
 `applied=false` 不重复补偿。追踪读面：`GET /admin/model-adjustments`
 （usage:read）与 `GET /admin/wallet/adjustments`（billing:adjust），同一口径。
+
+## 权益增补（entitlement-model-amendment，deploy PR #345）
+
+模型发布的固定收尾动作：存量订阅的 `inference_entitlements.model_ids` 是
+购买时快照的显式集合，新模型上线后需增补，否则存量用户调新模型 403、
+picker 不可见。**全程无 SQL。**
+
+**推荐发布顺序（红线 6）**：目录 publish + 配价 → 权益增补。反过来不炸
+（增补了一个目录未发布的模型时，调用走 unknown model 400，`/chat/models`
+只列已发布模型），但先增补会让用户权益里出现一个还调不通的模型，应避免。
+
+### 端点
+
+| 端点 | 权限 | 角色 |
+|---|---|---|
+| `POST /admin/entitlements/:id/revise`（R1 单权益修订） | `billing:adjust` | admin |
+| `POST /admin/entitlements/amend-models`（R2 批量增补） | `billing:adjust` | admin |
+| `GET /admin/entitlements/:id`、`GET /admin/entitlements`（R3 只读） | `usage:read` | admin / operator / auditor |
+
+### R2 批量增补（模型发布主路径）
+
+```
+POST /admin/entitlements/amend-models
+{"model_id":"kimi-k4","action":"add","selector":"all_active","reason":"发布 kimi-k4"}
+```
+
+- **dry_run 默认 true**：预演只返回将影响行数（`amended`）+ 抽样
+  （`samples`，扫描顺序前 N 行含前后集合，默认 10、`sample` 上限 50），
+  一行不写。正式执行显式传 `"dry_run":false`。
+- **selector**：`all_active`（全部 active 权益）；`source_plan:<plan_id>`
+  （按权益来源订阅的套餐过滤，命中**全部状态**行——revoked/expired 行
+  不被修改，出现在 `skipped_detail` 明细，AC6）。按计费账户单个增补走
+  R1（先 `GET /admin/entitlements?billing_account_id=` 定位）。
+- **幂等（AC3）**：已含/已不含目标模型的行计入 `skipped`；重跑同一增补
+  `amended=0`，无报错，不重复写审计。
+- **行级隔离**：每行独立事务 + 行级乐观锁；乐观锁冲突计入 `conflicts`
+  并进 `errors[]`（reason 前缀 `conflict:`），其它行故障也进 `errors[]`——
+  **行级失败不置整体失败**，调用方解析 body 而非只看 HTTP 状态（N6 迁移
+  工具先例）。`errors[]` 与 `skipped_detail` 明细各上限 500 行（超出见
+  `errors_truncated` / `skipped_detail_truncated`）；计数始终是权威全量。
+  `selector` 命中 0 行时 report 带 `note` 提示核对选择器（防 plan id 打错）。
+  `all_active` 一次把候选集载入内存逐行处理，适用于万行级以内；更大规模
+  分批按 `source_plan` 执行。
+- **语义红线**：只改 `model_ids`；权益 ID/anchor/有效期不动，配额窗口
+  used/reserved 不清零（AC8）；仅 active 可修订，绝不复活退役权益；
+  生效即时（每请求查库，无缓存）。
+
+### R1 单权益修订
+
+```
+POST /admin/entitlements/<id>/revise
+{"add_model_ids":["kimi-k4"],"reason":"..."}   # 或 remove_model_ids
+```
+
+集合无变化 → 200 `changed=false`（幂等短路，不写库不审计）；权益非
+active → 409；乐观锁冲突 → 409。`add` 与 `remove` 不得含同一模型（400）。
+响应携带修订后完整视图（id/revision/model_ids/effective range/status）。
+
+### 审计（AC5）
+
+每次实际变更（`changed=true` / 每个 amended 行）落一条
+`inference_audit_log`：`entitlement.revise` / `entitlement.amend`，含
+actor 双腿归因、reason、前后 model_ids、前后 policy_version_id、前后
+revision，与变更同事务提交。查询：
+
+```sql
+SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
+  FROM inference_audit_log
+ WHERE action IN ('entitlement.revise','entitlement.amend')
+   AND object_id = '<entitlement_id>'
+ ORDER BY occurred_at DESC;
+```

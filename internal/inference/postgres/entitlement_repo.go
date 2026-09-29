@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/management"
 )
 
 // entitlement_repo.go — inference_entitlements (migration 026)。
@@ -430,6 +433,99 @@ func (s *Store) ListActiveEntitlements(ctx context.Context, billingAccountID str
 		billingAccountID, at)
 	if err != nil {
 		return nil, mapError("list entitlements", err)
+	}
+	out := make([]domain.Entitlement, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, *r.toDomain())
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// 权益 admin 面（entitlement-model-amendment 需求 R1–R3）
+// ---------------------------------------------------------------------------
+
+// GetEntitlementTx is GetEntitlement on the caller's UnitOfWork（持 tx 期间
+// 不得用 s.db 第二连接读——池饱和时第二连接等不到可用连接即死锁，先例
+// getLatestEntitlementBySourceTx）。修订链路在同一事务内「读→算→写→审计」，
+// 乐观锁的 revision 必须来自本事务内的读。
+func (s *Store) GetEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string) (*domain.Entitlement, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	var row entitlementRow
+	err = tx.GetContext(ctx, &row,
+		`SELECT * FROM inference_entitlements WHERE id = $1`, id)
+	if err != nil {
+		return nil, mapError("get entitlement", err)
+	}
+	return row.toDomain(), nil
+}
+
+// ListEntitlementsAdmin is the operator read surface (R3): optional filters
+// on billing account / status, newest first, LIMIT/OFFSET paging. 不过滤任何
+// 状态——operator 核对增补结果需要看到 revoked/expired 行（AC6 的核对面）。
+// （与 customer 读面的 ListEntitlements(billingAccountID) 区分：那个是客户
+// 视图专用。）
+func (s *Store) ListEntitlementsAdmin(ctx context.Context, f management.EntitlementListFilter) ([]domain.Entitlement, error) {
+	q := `SELECT * FROM inference_entitlements`
+	var conds []string
+	var args []interface{}
+	if f.BillingAccountID != "" {
+		args = append(args, f.BillingAccountID)
+		conds = append(conds, fmt.Sprintf("billing_account_id = $%d", len(args)))
+	}
+	if f.Status != "" {
+		args = append(args, f.Status)
+		conds = append(conds, fmt.Sprintf("status = $%d", len(args)))
+	}
+	if len(conds) > 0 {
+		q += " WHERE " + strings.Join(conds, " AND ")
+	}
+	q += " ORDER BY created_at DESC, id"
+	if f.Limit > 0 {
+		args = append(args, f.Limit)
+		q += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	if f.Offset > 0 {
+		args = append(args, f.Offset)
+		q += fmt.Sprintf(" OFFSET $%d", len(args))
+	}
+	var rows []entitlementRow
+	if err := s.db.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, mapError("list entitlements", err)
+	}
+	out := make([]domain.Entitlement, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, *r.toDomain())
+	}
+	return out, nil
+}
+
+// ListEntitlementsForAmend resolves an R2 batch selector to the candidate
+// rows. all_active 只回 active（选择器语义即「全部活跃权益」）；
+// source_plan 回该套餐来源订阅的**全部状态**行——非 active 行不被修改，
+// 由服务层计入 skipped 明细（AC6：命中的 revoked/expired 行要在预演/报告
+// 中可见）。ORDER BY id 保证批处理与抽样的确定性。
+func (s *Store) ListEntitlementsForAmend(ctx context.Context, selectorKey, selectorVal string) ([]domain.Entitlement, error) {
+	var q string
+	var args []interface{}
+	switch selectorKey {
+	case management.SelectorAllActive:
+		q = `SELECT * FROM inference_entitlements WHERE status = 'active' ORDER BY id`
+	case management.SelectorSourcePlan:
+		q = `SELECT * FROM inference_entitlements
+		     WHERE source_type = 'subscription'
+		       AND source_id IN (SELECT id::text FROM subscriptions WHERE plan_id = $1)
+		     ORDER BY id`
+		args = append(args, selectorVal)
+	default:
+		return nil, domain.NewError(domain.CodeInvalidInput, "unknown amend selector: "+selectorKey)
+	}
+	var rows []entitlementRow
+	if err := s.db.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, mapError("list entitlements for amend", err)
 	}
 	out := make([]domain.Entitlement, 0, len(rows))
 	for _, r := range rows {

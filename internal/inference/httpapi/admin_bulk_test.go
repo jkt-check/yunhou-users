@@ -145,6 +145,12 @@ func newOpsFixture(t *testing.T) *opsFixture {
 	billingGroup := engine.Group("/adminb", stub, httpapi.OperatorAuthz(store, management.PermBillingAdjust))
 	adjH.Register(billingGroup)
 
+	// 权益增补面（entitlement-model-amendment）：写 billing:adjust、
+	// 读 usage:read。
+	entH := httpapi.NewAdminEntitlementsHandler(management.NewEntitlementAdminService(store, store))
+	entH.RegisterWrite(billingGroup)
+	entH.RegisterRead(usageGroup)
+
 	// 凭据/可调度账号面（credentials:manage）：OAuth handler 提供既有的
 	// GET /upstream-accounts 读面（oauth/refresh 服务在本夹具中不调用）。
 	keyBytes := make([]byte, credentials.KeyLen)

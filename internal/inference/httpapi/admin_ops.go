@@ -49,6 +49,10 @@ type AdminOps struct {
 	// 2026-09-26-admin-quota-policies-design.md); models:manage (Q2 过渡口径,
 	// 未来收敛 quota:manage).
 	QuotaPolicies *AdminQuotaPoliciesHandler
+	// Entitlements is the entitlement amendment surface
+	// (entitlement-model-amendment, deploy PR #345): R1 单权益修订 + R2 批量
+	// 增补挂 billing:adjust（增补本质是计费权益变更），R3 只读挂 usage:read。
+	Entitlements *AdminEntitlementsHandler
 }
 
 // Mount wires the write surface onto g. The caller must already have
@@ -91,5 +95,13 @@ func (o *AdminOps) Mount(g *gin.RouterGroup) {
 	// 配额策略管理面（spec 2026-09-26）：生命周期六端点，同 models:manage。
 	if o.QuotaPolicies != nil && o.RequireModels != nil {
 		o.QuotaPolicies.Register(g.Group("", o.RequireModels))
+	}
+	// 权益增补面（entitlement-model-amendment）：写 billing:adjust，
+	// 读 usage:read（auditor 可达，增补前定位/核对是只读动作）。
+	if o.Entitlements != nil && o.RequireBilling != nil {
+		o.Entitlements.RegisterWrite(g.Group("", o.RequireBilling))
+	}
+	if o.Entitlements != nil && o.RequireUsage != nil {
+		o.Entitlements.RegisterRead(g.Group("", o.RequireUsage))
 	}
 }

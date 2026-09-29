@@ -80,10 +80,15 @@ type ChatRequest struct {
 const ChatMaxMessages = 20
 
 // ChatMaxMessageBytes bounds a single non-system message's content length in
-// BYTES (len(), not runes — CJK content counts ~3 bytes per character). Long
-// paste-in of documents should be chunked by the caller. Matches the client's
-// MAX_MESSAGE_BYTES (v1.2.3: 8000 → 32768).
-const ChatMaxMessageBytes = 32768
+// BYTES (len(), not runes — CJK content counts ~3 bytes per character).
+// R6: raised 32768 → 4 MiB so a single message can carry a near-1M-token
+// context (~4 bytes/token English worst case), matching the inference
+// catalog's context_tokens=1048576. The server cap is deliberately ABOVE the
+// kaya client's MAX_MESSAGE_BYTES (still 32768): the client truncates to its
+// own budget before sending, so a more permissive server never rejects
+// client-shaped payloads — the client's constants are raised by a separate
+// kaya release, until which the effective ceiling stays client-side.
+const ChatMaxMessageBytes = 4 << 20
 
 // ChatMaxSystemBytes bounds a single system message's content length. kaya's
 // rendered system prompt is ~21-23 KB, so system messages get their own
@@ -92,8 +97,11 @@ const ChatMaxMessageBytes = 32768
 const ChatMaxSystemBytes = 24576
 
 // ChatMaxTotalBytes bounds the total request size in bytes across all
-// messages. Matches the client's MAX_TOTAL_BYTES (v1.2.3: 65536 → 262144).
-const ChatMaxTotalBytes = 262144
+// messages. R6: raised 262144 → 4 MiB (same 1M-token rationale as
+// ChatMaxMessageBytes; the invariant total ≥ per-message is preserved so a
+// single full-context message is not rejected by the aggregate budget).
+// Server ≥ client MAX_TOTAL_BYTES (262144) — see ChatMaxMessageBytes.
+const ChatMaxTotalBytes = 4 << 20
 
 // ChatMaxSessionIDLen bounds the optional session_id field — it is only an
 // audit-log grouping key, so anything longer is rejected rather than stored.

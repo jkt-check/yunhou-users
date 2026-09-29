@@ -132,7 +132,7 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 			// Retry-After 取 5s：短于 chatLimiter refill,避免重试风暴放大。
 			c.Header("Retry-After", "5")
 		}
-		h.logAccess(started, userID, appID, req.Model, req, "error", msg, "", rej)
+		h.logAccess(started, userID, appID, routeModel(route, req.Model), req, "error", msg, "", rej)
 		writeChatError(c, status, msg, rej)
 		return
 	}

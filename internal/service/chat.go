@@ -71,6 +71,11 @@ type ChatModelInfo struct {
 // satisfy it. Exported so the inference httpapi can wire the facade
 // without importing the handler.
 type ChatStreamer interface {
+	// StreamChat opens the upstream stream. On error it still returns the
+	// resolved route when model resolution succeeded (resp == nil), so the
+	// handler's audit line can attribute the failure to the effective
+	// model; a nil route means resolution never happened (unknown model)
+	// and the handler falls back to the raw client value.
 	StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *ChatRoute, error)
 	// RecordUsage meters one completed upstream call; it never fails the
 	// request. The facade's implementation is a no-op (the inference
@@ -145,6 +150,11 @@ func (s *ChatService) SetHTTPClient(c *http.Client) {
 // caller owns closing Body. The response body is bound to ctx: cancelling
 // ctx (client disconnect) closes the upstream connection and fails the read.
 //
+// On error after model resolution the resolved route is still returned
+// (resp == nil) so the handler's audit line can attribute the failure to
+// the effective model; a nil route means resolution never happened
+// (unknown model) and the handler falls back to the raw client value.
+//
 // The access decision mirrors resolvePlanForTokenIssuanceWithPlan: an active
 // subscription whose plan is active, whose apps include appID, and whose
 // chat_models (when non-NULL) include the resolved model.
@@ -173,7 +183,7 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 	accessErr := s.checkAccess(accessCtx, userID, appID, resolvedID, time.Now())
 	accessCancel()
 	if accessErr != nil {
-		return nil, nil, accessErr
+		return nil, route, accessErr
 	}
 
 	var body []byte
@@ -187,12 +197,12 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 			// by Anthropic protocol), an unsupported role, or an undecodable
 			// tool — the final marshal cannot fail. All of it is a client
 			// shape problem, not a server fault: mark it for a 400 mapping.
-			return nil, nil, fmt.Errorf("encode chat request: %w: %v", ErrChatRequestShape, err)
+			return nil, route, fmt.Errorf("encode chat request: %w: %v", ErrChatRequestShape, err)
 		}
 	default:
 		body, err = llm.BuildOpenAIPayload(m.UpstreamModel, messages, tools, thinkingEnabled)
 		if err != nil {
-			return nil, nil, fmt.Errorf("encode chat request: %w", err)
+			return nil, route, fmt.Errorf("encode chat request: %w", err)
 		}
 	}
 
@@ -218,7 +228,7 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 		resp, err := s.doUpstream(reqCtx, provider, key, body)
 		if err != nil {
 			cancel()
-			return nil, nil, fmt.Errorf("%w: %v", ErrChatUpstreamError, err)
+			return nil, route, fmt.Errorf("%w: %v", ErrChatUpstreamError, err)
 		}
 		if resp.StatusCode == http.StatusOK {
 			if provider.Protocol == llm.ProtocolAnthropic {
@@ -240,7 +250,7 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 		}
 		cancel()
 		if resp.StatusCode == http.StatusTooManyRequests {
-			return nil, nil, fmt.Errorf("%w (status %d): %s", ErrChatRateLimited, resp.StatusCode, errBody)
+			return nil, route, fmt.Errorf("%w (status %d): %s", ErrChatRateLimited, resp.StatusCode, errBody)
 		}
 		// Upstream 4xx (other than 429) rejects the request itself — a
 		// permanent error that retrying the same bytes will never fix. The
@@ -248,14 +258,14 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 		// retryable-by-rewrite cause (context length) from billing and
 		// content-policy ones.
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return nil, nil, classifyUpstreamRejection(resp.StatusCode, errBody)
+			return nil, route, classifyUpstreamRejection(resp.StatusCode, errBody)
 		}
-		return nil, nil, fmt.Errorf("%w (status %d): %s", ErrChatUpstreamError, resp.StatusCode, errBody)
+		return nil, route, fmt.Errorf("%w (status %d): %s", ErrChatUpstreamError, resp.StatusCode, errBody)
 	}
 	// Unreachable: the loop's last attempt always returns. Kept so the
 	// compiler sees a terminating statement.
 	cancel()
-	return nil, nil, ErrChatUpstreamError
+	return nil, route, ErrChatUpstreamError
 }
 
 // doUpstream performs one HTTP call against the provider. Path and auth

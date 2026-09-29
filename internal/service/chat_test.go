@@ -99,9 +99,42 @@ func TestChatService_UnknownModel(t *testing.T) {
 	svc, subRepo, planRepo, _ := chatTestFixture(t, nil)
 	seedChatActiveSub(subRepo, "u-1", "monthly")
 	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
-	_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "ghost-model", chatMessages(), nil, nil)
+	_, route, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "ghost-model", chatMessages(), nil, nil)
 	if !errors.Is(err, ErrChatUnknownModel) {
 		t.Fatalf("err = %v, want ErrChatUnknownModel", err)
+	}
+	if route != nil {
+		t.Errorf("route = %+v, want nil — 解析从未发生，handler 回退裸客户端值", route)
+	}
+}
+
+// TestChatService_ErrorReturnsResolvedRoute: per the ChatStreamer contract,
+// errors AFTER model resolution carry the resolved route, so the handler's
+// audit line attributes the failure to the effective model (旧客户端不带
+// model → 默认模型 id)。
+func TestChatService_ErrorReturnsResolvedRoute(t *testing.T) {
+	// Access denied (no subscription) — resolution succeeded, gate failed.
+	svc, _, planRepo, _ := chatTestFixture(t, nil)
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	_, route, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("err = %v, want ErrChatNoAccess", err)
+	}
+	if route == nil || route.LogicalModel != "deepseek-flash" {
+		t.Errorf("route = %+v, want resolved LogicalModel deepseek-flash", route)
+	}
+
+	// Upstream unreachable (gate passed) — same contract on the post-gate
+	// failure path.
+	svc2, subRepo2, planRepo2, _ := chatTestFixture(t, nil)
+	seedChatActiveSub(subRepo2, "u-1", "monthly")
+	planRepo2.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	_, route2, err2 := svc2.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if !errors.Is(err2, ErrChatUpstreamError) {
+		t.Fatalf("err = %v, want ErrChatUpstreamError", err2)
+	}
+	if route2 == nil || route2.LogicalModel != "deepseek-flash" {
+		t.Errorf("route = %+v, want resolved LogicalModel deepseek-flash", route2)
 	}
 }
 

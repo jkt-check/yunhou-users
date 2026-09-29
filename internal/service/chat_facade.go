@@ -60,17 +60,21 @@ func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *c
 
 // StreamChat implements the /chat service surface. The request always
 // streams (SSE), exactly like the multi-model ChatService path. logicalModel
-// is the optional ChatRequest.Model (旧客户端不带 → defaultModel).
+// is the optional ChatRequest.Model (旧客户端不带 → defaultModel). Per the
+// ChatStreamer contract the resolved route rides along on error too, so the
+// handler's audit line carries the effective model (modelID == 客户端原值
+// when the client supplied one — that semantic is unchanged).
 func (f *ChatGatewayFacade) StreamChat(ctx context.Context, userID, appID, logicalModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, *ChatRoute, error) {
-	resp, err := f.streamChatModel(ctx, userID, logicalModel, messages, tools, thinkingEnabled)
-	if err != nil {
-		return nil, nil, err
-	}
 	modelID := logicalModel
 	if modelID == "" {
 		modelID = f.defaultModel
 	}
-	return resp, &ChatRoute{LogicalModel: modelID, Provider: "inference", UpstreamModel: modelID}, nil
+	route := &ChatRoute{LogicalModel: modelID, Provider: "inference", UpstreamModel: modelID}
+	resp, err := f.streamChatModel(ctx, userID, logicalModel, messages, tools, thinkingEnabled)
+	if err != nil {
+		return nil, route, err
+	}
+	return resp, route, nil
 }
 
 // RecordUsage is a no-op for the facade: the inference gateway settles

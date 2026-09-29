@@ -83,10 +83,21 @@ func streamReply(sse string, got *chatCall) streamFunc {
 }
 
 // streamFails returns a streamFn that fails with err before any upstream
-// response exists (no route either).
+// response exists (no route either — the resolution-never-happened shape,
+// e.g. unknown model).
 func streamFails(err error) streamFunc {
 	return func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
 		return nil, nil, err
+	}
+}
+
+// streamFailsWithRoute returns a streamFn that fails with err AFTER model
+// resolution, carrying the resolved route like the real services do per the
+// ChatStreamer contract (the audit line attributes the failure to the
+// effective model).
+func streamFailsWithRoute(err error, route *service.ChatRoute) streamFunc {
+	return func(context.Context, string, string, string, []model.ChatMessage, []json.RawMessage, *bool) (*http.Response, *service.ChatRoute, error) {
+		return nil, route, err
 	}
 }
 
@@ -755,6 +766,46 @@ func TestChatHandler_AccessLog_Error(t *testing.T) {
 	}
 	if entry.Output != "" {
 		t.Errorf("output = %q, want empty for failed request", entry.Output)
+	}
+}
+
+// TestChatHandler_AccessLog_ErrorResolvedModel: a pre-stream failure AFTER
+// model resolution records the resolved (effective) model on the error line
+// — 旧客户端不带 model 时也能按模型归因排障（R7 follow-up，对齐成功路径
+// 的 routeModel 语义）。
+func TestChatHandler_AccessLog_ErrorResolvedModel(t *testing.T) {
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamFailsWithRoute(service.ErrChatNoAccess, &service.ChatRoute{LogicalModel: "deepseek-flash"})})
+	w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	var entry chatAccessEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(logBuf.String())), &entry); err != nil {
+		t.Fatalf("log line not JSON: %v", err)
+	}
+	if entry.Status != "error" {
+		t.Errorf("status = %q, want error", entry.Status)
+	}
+	if entry.Model != "deepseek-flash" {
+		t.Errorf("model = %q, want the resolved route model deepseek-flash", entry.Model)
+	}
+}
+
+// TestChatHandler_AccessLog_ErrorNilRouteKeepsRaw: when model resolution
+// never happened (nil route — e.g. unknown model 400), the error line keeps
+// the raw client value, unchanged from before.
+func TestChatHandler_AccessLog_ErrorNilRouteKeepsRaw(t *testing.T) {
+	r, logBuf := chatTestRouterWithLog(&mockChatStreamer{streamFn: streamFails(service.ErrChatUnknownModel)})
+	w := performChatRequest(r, `{"model":"glm-typo","messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	var entry chatAccessEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(logBuf.String())), &entry); err != nil {
+		t.Fatalf("log line not JSON: %v", err)
+	}
+	if entry.Model != "glm-typo" {
+		t.Errorf("model = %q, want the raw client value glm-typo", entry.Model)
 	}
 }
 

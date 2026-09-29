@@ -150,9 +150,11 @@ func ReserveAmount(price accounting.PriceVersion, b ReserveBounds) (domain.Micro
 			"quota: negative reservation amount", domain.ErrNegativeValue)
 	}
 	// R7-N5：0 价模型（全费率 0）的预占额为 0，合法放行 —— 免费不等于无
-	// 约束：权益门控、RPM/TPM 限流、并发租约与强制输出上限（output cap >
-	// 0 已在上方校验）照常约束这次调用；零额预占行照常落库（migration
-	// 041），结算/释放状态机与非 0 价同一路径。
+	// 约束：权益门控、并发租约与强制输出上限（output cap > 0 已在上方
+	// 校验）照常约束这次调用；/chat 路径当前不执行按账户/Key 的
+	// RPM/TPM 限额（该控制挂在 /v1 的 API Key 鉴权中间件上；/chat 仍
+	// 有按 IP 的入口限流）。零额预占行照常落库（migration 041），结
+	// 算/释放状态机与非 0 价同一路径。
 	return total, nil
 }
 

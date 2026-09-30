@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -50,5 +52,61 @@ func TestTimeoutMiddleware_SkipList(t *testing.T) {
 	}
 	if normalRemaining <= 0 || normalRemaining > 50*time.Millisecond {
 		t.Errorf("/other: deadline in %v, want within (0, 50ms]", normalRemaining)
+	}
+}
+
+// TestMaxRequestBodyBytes_SkipList locks in the /chat + /v1 exemption (R6
+// hotfix): without it the engine-level 1 MiB reader truncates bodies before
+// the handler-level 8 MiB caps ever fire — clients were 400'd at exactly
+// 1 MiB. Every skipped route receives the body untouched (its own handler
+// cap decides); a normal route is still capped at exactly n. Registering
+// stubs for all four skip paths pins each entry string against typos.
+func TestMaxRequestBodyBytes_SkipList(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	skipPaths := []string{"/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses"}
+	r := gin.New()
+	r.Use(maxRequestBodyBytes(1<<20, skipPaths...))
+
+	// 2 MiB: above the engine cap, below the handler-level 8 MiB caps.
+	body := bytes.Repeat([]byte("a"), 2<<20)
+
+	readN := map[string]int{}
+	readErr := map[string]error{}
+	readAll := func(path string) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			b, err := io.ReadAll(c.Request.Body)
+			readN[path] = len(b)
+			readErr[path] = err
+			c.Status(http.StatusOK)
+		}
+	}
+	for _, p := range skipPaths {
+		r.POST(p, readAll(p))
+	}
+	r.POST("/other", readAll("/other"))
+
+	post := func(path string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", path, w.Code)
+		}
+	}
+
+	for _, p := range skipPaths {
+		post(p)
+		if readErr[p] != nil || readN[p] != len(body) {
+			t.Errorf("%s: read %d bytes, err = %v; want full %d-byte body (skip list)", p, readN[p], readErr[p], len(body))
+		}
+	}
+
+	post("/other")
+	if readErr["/other"] == nil || readErr["/other"].Error() != "http: request body too large" {
+		t.Errorf("/other: err = %v, want \"http: request body too large\"", readErr["/other"])
+	}
+	if readN["/other"] != 1<<20 {
+		t.Errorf("/other: read %d bytes, want exactly %d (the 1 MiB cap)", readN["/other"], 1<<20)
 	}
 }

@@ -392,13 +392,10 @@ func TestFixture_ModelQuotas_CrossMonth(t *testing.T) {
 		t.Errorf("monthly bounds = %v..%v, want %v..%v",
 			wins["monthly"]["window_start"], wins["monthly"]["resets_at"], iv.Start, iv.End)
 	}
-	// 锚点日裁剪钉死：当前为 2026-09 → 周期 [Aug 31 10:00, Sep 30 10:00)。
-	if iv.Start.Day() != 31 || iv.Start.Month() != time.August {
-		t.Errorf("clamped start = %v, want Aug 31", iv.Start)
-	}
-	if iv.End.Day() != 30 || iv.End.Month() != time.September {
-		t.Errorf("clamped end = %v, want Sep 30 (Sep has 30 days)", iv.End)
-	}
+	// 锚点日裁剪/恢复语义(Feb 裁剪到月末、Mar 恢复 31 日、闰年、跨年)
+	// 由 internal/inference/quota/window_test.go 的 TestAddMonthsClamped 用
+	// 固定时间穷举钉死;此处不断言具体日历月份——as_of 是真实时钟,硬编码
+	// 月份断言会在窗口滚动后永久红(2026-09-30 10:00 UTC 实证)。
 	assertFixture(t, "model-quotas-cross-month.json", w.Body.String())
 }
 

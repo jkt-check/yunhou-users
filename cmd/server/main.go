@@ -516,10 +516,16 @@ func main() {
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,
 	// misconfigured proxy) would otherwise let ShouldBindJSON handlers and
-	// decodeAdminPlanRequest read unbounded bodies into memory. /chat keeps
-	// its own tighter cap (320 KiB) inside the handler and webhooks cap at
-	// 1 MiB in the signature middleware; this outer 1 MiB matches both.
-	engine.Use(maxRequestBodyBytes(1 << 20))
+	// decodeAdminPlanRequest read unbounded bodies into memory. 1 MiB is the
+	// backstop for un-exempted routes: webhooks have their own 1 MiB cap
+	// (webhook_sig.go), while admin decode paths (ShouldBindJSON /
+	// decodeAdminPlanRequest) rely on this middleware alone. /chat and the
+	// three /v1 inference routes are exempt: their effective bounds are the
+	// handler-level 8 MiB caps (chatMaxBodyBytes / v1ChatMaxBodyBytes) under
+	// nginx's 10m — without the exemption this outer reader would truncate
+	// their bodies at 1 MiB before the handler cap ever fired (R6 hotfix).
+	engine.Use(maxRequestBodyBytes(1<<20,
+		"/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses"))
 
 	// Security headers at the app layer. nginx sets the same trio, but any
 	// path that bypasses nginx (direct container port, health probes) must
@@ -740,8 +746,18 @@ func (noChannelRefundAPI) Refund(_ context.Context, _, _, _ string, _ float64, _
 
 // maxRequestBodyBytes caps every request body at n bytes (see engine.Use
 // above for why this exists even though nginx has client_max_body_size).
-func maxRequestBodyBytes(n int64) gin.HandlerFunc {
+//
+// Routes listed in skipPaths are exempt — used for /chat and the /v1
+// inference surfaces, whose handler-level 8 MiB caps are the effective
+// bound under nginx's 10m (same skip-list pattern as timeoutMiddleware).
+func maxRequestBodyBytes(n int64, skipPaths ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		for _, p := range skipPaths {
+			if c.FullPath() == p {
+				c.Next()
+				return
+			}
+		}
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, n)
 		c.Next()
 	}

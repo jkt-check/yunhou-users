@@ -31,8 +31,10 @@ import (
 // clients legitimately exceed the Kaya /chat limits (long tool schemas,
 // many turns). R6: 1 MiB → 8 MiB, aligned with the /chat body cap
 // (chatMaxBodyBytes) so near-1M-token catalog contexts are reachable on the
-// API-key surface too. The engine-level MaxBytesReader remains the outer
-// guard, and this per-route cap matches it.
+// API-key surface too. This route is exempt from the engine-level 1 MiB
+// body-cap middleware (main.go maxRequestBodyBytes skip list), so this
+// per-route 8 MiB cap is the effective bound, under nginx's 10m
+// client_max_body_size.
 const v1ChatMaxBodyBytes = 8 << 20
 
 // v1ChatMaxMessages / v1ChatMaxTools bound collection sizes for abuse

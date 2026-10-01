@@ -249,6 +249,12 @@ func writeOpenAIUsage(w io.Writer, b domain.UsageBuckets) error {
 		}
 		usage["prompt_tokens_details"] = details
 	}
+	if b.ReasoningTokens != nil {
+		// Responses-origin reasoning detail rides the wire so the client
+		// surfaces can render it natively (Anthropic never sets the bucket —
+		// its reasoning is inseparable from output).
+		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": *b.ReasoningTokens}
+	}
 	if b.CacheWriteTokens != nil {
 		// Anthropic-origin cache creation has no chat-completions home; the
 		// extension key keeps it on the wire for the Messages surface (Task

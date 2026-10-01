@@ -261,180 +261,78 @@ func TestValidateChannel(t *testing.T) {
 }
 
 // ============================================================================
-// isPaymentSuccess / isPaymentFailed / isRefundEvent / isDisputeCreated/Closed
+// dispatchBranch — per-channel webhook event → branch mapping
+// (replaces the old channel-agnostic is*(eventType) switches; the old
+// TestIs* cases below carry over with an explicit channel column)
 // ============================================================================
 
-func TestIsPaymentSuccess(t *testing.T) {
+func TestDispatchBranch(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
+		channel   string
 		eventType string
-		want      bool
+		want      webhookBranch
 	}{
 		// Stripe
-		{"payment_intent.succeeded", true},
-		{"payment_intent.Succeeded", false}, // case-sensitive
+		{"stripe", "payment_intent.succeeded", branchPaymentSuccess},
+		{"stripe", "payment_intent.Succeeded", branchNone}, // case-sensitive
+		{"stripe", "payment_intent.payment_failed", branchPaymentFailed},
+		{"stripe", "payment_intent.canceled", branchPaymentFailed},
+		{"stripe", "charge.refunded", branchRefund},
+		{"stripe", "charge.dispute.created", branchDisputeCreated},
+		{"stripe", "charge.dispute.closed", branchDisputeClosed},
 		// WeChat (uppercase per legacy docs)
-		{"TRANSACTION.SUCCESS", true},
+		{"wechat_pay", "TRANSACTION.SUCCESS", branchPaymentSuccess},
+		{"wechat_pay", "TRANSACTION.PAY_FAILED", branchPaymentFailed},
+		{"wechat_pay", "TRANSACTION.REVOKED", branchPaymentFailed},
+		{"wechat_pay", "TRANSACTION.REFUND", branchRefund},
+		{"wechat_pay", "REFUND.SUCCESS", branchRefund},
+		{"wechat_pay", "REFUND.ABNORMAL", branchRefundFailed},
+		{"wechat_pay", "REFUND.CLOSED", branchRefundFailed},
 		// Alipay
-		{"trade_status_sync", true},
-		{"TRADE_SUCCESS", true},
+		{"alipay", "TRADE_SUCCESS", branchPaymentSuccess},
+		{"alipay", "trade_status_sync", branchPaymentSuccess},
+		{"alipay", "TRADE_CLOSED", branchRefund},
+		{"alipay", "trade_closed", branchRefund},
+		{"alipay", "trade_refund", branchRefund},
 		// PayPal: ACTIVATED (post-approval, has custom_id + next_billing_time)
 		// activates the order; CREATED is pre-approval (APPROVAL_PENDING)
 		// and must not.
-		{"BILLING.SUBSCRIPTION.ACTIVATED", true},
-		{"BILLING.SUBSCRIPTION.CREATED", false},
+		{"paypal", "PAYMENT.CAPTURE.COMPLETED", branchPaymentSuccess},
+		{"paypal", "BILLING.SUBSCRIPTION.ACTIVATED", branchPaymentSuccess},
+		{"paypal", "BILLING.SUBSCRIPTION.CREATED", branchNone},
+		{"paypal", "PAYMENT.CAPTURE.DENIED", branchPaymentFailed},
+		{"paypal", "PAYMENT.CAPTURE.FAILED", branchPaymentFailed},
+		{"paypal", "PAYMENT.CAPTURE.REFUNDED", branchRefund},
+		{"paypal", "PAYMENT.SALE.REFUNDED", branchRefund},
+		{"paypal", "PAYMENT.SALE.COMPLETED", branchRenewal},
+		// Paddle: settlement anchored on transaction.* money events;
+		// subscription.*/adjustment.* stay audit-only.
+		{"paddle", "transaction.completed", branchPaymentSuccess},
+		{"paddle", "transaction.billed", branchRenewal},
+		{"paddle", "transaction.payment_failed", branchPaymentFailed},
+		{"paddle", "subscription.activated", branchNone},
+		{"paddle", "subscription.canceled", branchNone},
+		{"paddle", "subscription.updated", branchNone},
+		{"paddle", "adjustment.created", branchNone},
 		// LemonSqueezy-era names — dead since the channel was dropped
-		// (migration 008); must NOT dispatch.
-		{"order_created", false},
-		{"subscription_created", false},
-		{"subscription_payment_success", false}, // renewal — v1 ack-200 no-op
-		// unrelated
-		{"charge.refunded", false},
-		{"", false},
+		// (migration 008); must NOT dispatch on any channel.
+		{"stripe", "order_created", branchNone},
+		{"stripe", "subscription_created", branchNone},
+		{"stripe", "subscription_payment_success", branchNone},
+		{"paypal", "order_refunded", branchNone},
+		{"wechat_pay", "subscription_payment_refunded", branchNone},
+		// unknown channel / empty event type
+		{"stripe", "", branchNone},
+		{"", "payment_intent.succeeded", branchNone},
+		{"unknown_channel", "transaction.completed", branchNone},
 	}
 	for _, c := range cases {
-		t.Run(c.eventType, func(t *testing.T) {
-			if got := isPaymentSuccess(c.eventType); got != c.want {
-				t.Errorf("isPaymentSuccess(%q) = %v, want %v", c.eventType, got, c.want)
-			}
-		})
-	}
-}
-
-func TestIsPaymentFailed(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		eventType string
-		want      bool
-	}{
-		{"payment_intent.payment_failed", true},
-		{"payment_intent.canceled", true},
-		{"TRANSACTION.PAY_FAILED", true},
-		{"TRANSACTION.REVOKED", true},
-		{"payment_intent.succeeded", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		t.Run(c.eventType, func(t *testing.T) {
-			if got := isPaymentFailed(c.eventType); got != c.want {
-				t.Errorf("isPaymentFailed(%q) = %v, want %v", c.eventType, got, c.want)
-			}
-		})
-	}
-}
-
-func TestIsRefundEvent(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		eventType string
-		want      bool
-	}{
-		{"charge.refunded", true},
-		{"TRANSACTION.REFUND", true},
-		{"trade_closed", true},
-		{"TRADE_CLOSED", true},
-		// 退款终态失败事件走 isRefundFailedEvent，不是成功退款。
-		{"REFUND.ABNORMAL", false},
-		{"REFUND.CLOSED", false},
-		// LemonSqueezy-era names — dead since the channel was dropped
-		// (migration 008); must NOT dispatch.
-		{"order_refunded", false},
-		{"subscription_payment_refunded", false},
-		{"subscription_updated", false},
-		{"payment_intent.succeeded", false},
-		{"payment_intent.payment_failed", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		t.Run(c.eventType, func(t *testing.T) {
-			if got := isRefundEvent(c.eventType); got != c.want {
-				t.Errorf("isRefundEvent(%q) = %v, want %v", c.eventType, got, c.want)
-			}
-		})
-	}
-}
-
-func TestIsRefundFailedEvent(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		eventType string
-		want      bool
-	}{
-		{"REFUND.ABNORMAL", true},
-		{"REFUND.CLOSED", true},
-		{"REFUND.SUCCESS", false},
-		{"TRANSACTION.REFUND", false},
-		{"charge.refunded", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		t.Run(c.eventType, func(t *testing.T) {
-			if got := isRefundFailedEvent(c.eventType); got != c.want {
-				t.Errorf("isRefundFailedEvent(%q) = %v, want %v", c.eventType, got, c.want)
-			}
-		})
-	}
-}
-
-func TestIsDisputeCreated(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		eventType string
-		want      bool
-	}{
-		{"charge.dispute.created", true},
-		{"payment_intent.succeeded", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		t.Run(c.eventType, func(t *testing.T) {
-			if got := isDisputeCreated(c.eventType); got != c.want {
-				t.Errorf("isDisputeCreated(%q) = %v, want %v", c.eventType, got, c.want)
-			}
-		})
-	}
-}
-
-func TestIsDisputeClosed(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		eventType string
-		want      bool
-	}{
-		{"charge.dispute.closed", true},
-		{"payment_intent.succeeded", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		t.Run(c.eventType, func(t *testing.T) {
-			if got := isDisputeClosed(c.eventType); got != c.want {
-				t.Errorf("isDisputeClosed(%q) = %v, want %v", c.eventType, got, c.want)
-			}
-		})
-	}
-}
-
-// ============================================================================
-// isPaypalRenewal — handles PAYMENT.SALE.COMPLETED (subscription auto-renewal)
-// ============================================================================
-
-func TestIsPaypalRenewal(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		eventType string
-		want      bool
-	}{
-		{"PAYMENT.SALE.COMPLETED", true},
-		{"PAYMENT.CAPTURE.COMPLETED", false},
-		{"BILLING.SUBSCRIPTION.CREATED", false},
-		{"order_created", false}, // LS, not PayPal
-		{"", false},
-	}
-	for _, c := range cases {
-		t.Run(c.eventType, func(t *testing.T) {
+		c := c
+		t.Run(c.channel+"/"+c.eventType, func(t *testing.T) {
 			t.Parallel()
-			if got := isPaypalRenewal(c.eventType); got != c.want {
-				t.Errorf("isPaypalRenewal(%q) = %v, want %v", c.eventType, got, c.want)
+			if got := dispatchBranch(c.channel, c.eventType); got != c.want {
+				t.Errorf("dispatchBranch(%q, %q) = %v, want %v", c.channel, c.eventType, got, c.want)
 			}
 		})
 	}

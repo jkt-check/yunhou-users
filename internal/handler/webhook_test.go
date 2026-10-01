@@ -1157,7 +1157,8 @@ func TestParsePaddle_TransactionCompleted(t *testing.T) {
 	    "origin": "web",
 	    "currency_code": "USD",
 	    "custom_data": {"order_id": "order-uuid-1"},
-	    "totals": {"total": "999", "subtotal": "999", "tax": "0", "grand_total": "999"}
+	    "totals": null,
+	    "details": {"totals": {"total": "999", "subtotal": "999", "tax": "0", "grand_total": "999"}}
 	  }
 	}`)
 	we, err := h.parsePaddle(raw)
@@ -1197,7 +1198,8 @@ func TestParsePaddle_RenewalCompleted(t *testing.T) {
 	    "origin": "subscription_recurring",
 	    "currency_code": "USD",
 	    "custom_data": {"order_id": "order-uuid-ORIGINAL"},
-	    "totals": {"total": "999"}
+	    "totals": null,
+	    "details": {"totals": {"total": "999"}}
 	  }
 	}`)
 	we, err := h.parsePaddle(raw)
@@ -1225,7 +1227,8 @@ func TestParsePaddle_TransactionBilled(t *testing.T) {
 	    "subscription_id": "sub_01m3x",
 	    "origin": "subscription_recurring",
 	    "currency_code": "USD",
-	    "totals": {"total": "999"}
+	    "totals": null,
+	    "details": {"totals": {"total": "999"}}
 	  }
 	}`)
 	we, err := h.parsePaddle(raw)
@@ -1246,10 +1249,10 @@ func TestParsePaddle_LenientOnMissingFields(t *testing.T) {
 		name string
 		raw  string
 	}{
-		{"completed missing order_id", `{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","totals":{"total":"999"}}}`},
+		{"completed missing order_id", `{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","details":{"totals":{"total":"999"}}}}`},
 		{"completed missing totals", `{"event_id":"evt_2","event_type":"transaction.completed","data":{"id":"txn_2","currency_code":"USD","custom_data":{"order_id":"o-1"}}}`},
-		{"completed unparseable total", `{"event_id":"evt_3","event_type":"transaction.completed","data":{"id":"txn_3","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"abc"}}}`},
-		{"billed missing subscription_id", `{"event_id":"evt_4","event_type":"transaction.billed","data":{"id":"txn_4","currency_code":"USD","totals":{"total":"999"}}}`},
+		{"completed unparseable total", `{"event_id":"evt_3","event_type":"transaction.completed","data":{"id":"txn_3","currency_code":"USD","custom_data":{"order_id":"o-1"},"details":{"totals":{"total":"abc"}}}}`},
+		{"billed missing subscription_id", `{"event_id":"evt_4","event_type":"transaction.billed","data":{"id":"txn_4","currency_code":"USD","details":{"totals":{"total":"999"}}}}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1296,6 +1299,20 @@ func TestParsePaddle_SubscriptionUpdated(t *testing.T) {
 	}
 	if we.SubExpiresAt == nil || we.SubExpiresAt.Format(time.RFC3339) != "2026-11-01T00:00:00Z" {
 		t.Fatalf("bad next_billed_at: %v", we.SubExpiresAt)
+	}
+}
+
+// API-shaped bodies (top-level totals) still parse — details.totals wins
+// when both are present (webhook payloads carry null top-level totals).
+func TestParsePaddle_TopLevelTotalsFallback(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"999"}}}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Amount != 9.99 {
+		t.Fatalf("fallback amount: %v", we.Amount)
 	}
 }
 

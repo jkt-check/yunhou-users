@@ -11,19 +11,21 @@ import (
 	"github.com/google/uuid"
 )
 
-// paddleTransactionBody builds a Paddle webhook envelope. total is in
-// minor units ("999" = $9.99), mirroring the real payload shape; empty
-// orderID/total omit those blocks. origin mirrors data.origin: "web" for
-// initial checkout transactions, "subscription_recurring" for channel-side
-// auto-renewal charges (the service routes renewals on this field).
+// paddleTransactionBody builds a Paddle webhook envelope matching the REAL
+// notification shape (verified against live sandbox payloads 2026-10-01):
+// money lives under data.details.totals; top-level data.totals is null.
+// total is in minor units ("999" = $9.99); empty orderID/total omit those
+// blocks. origin mirrors data.origin: "web" for initial checkout
+// transactions, "subscription_recurring" for channel-side auto-renewal
+// charges (the service routes renewals on this field).
 func paddleTransactionBody(eventID, eventType, txnID, subID, orderID, total, currency, origin string) []byte {
 	custom := ""
 	if orderID != "" {
 		custom = `"custom_data":{"order_id":"` + orderID + `"},`
 	}
-	totals := ""
+	totals := `"totals":null,`
 	if total != "" {
-		totals = `"totals":{"total":"` + total + `","subtotal":"` + total + `","tax":"0","grand_total":"` + total + `"},`
+		totals = `"totals":null,"details":{"totals":{"total":"` + total + `","subtotal":"` + total + `","tax":"0","grand_total":"` + total + `"}},`
 	}
 	return []byte(`{
 	  "event_id": "` + eventID + `",

@@ -679,6 +679,12 @@ func isPaypalLifecycleEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "BILLING.")
 }
 
+// paddleTotals mirrors the minor-unit money block Paddle nests under
+// data.details.totals (webhook payloads) or data.totals (API-shaped).
+type paddleTotals struct {
+	Total string `json:"total"` // minor units, e.g. "999"
+}
+
 // parsePaddle extracts fields from a Paddle Billing webhook. Paddle's
 // event envelope is uniform across event types:
 //
@@ -690,8 +696,10 @@ func isPaypalLifecycleEvent(eventType string) bool {
 //	}
 //
 // transaction.* data: id (txn_...), subscription_id, origin, custom_data,
-// currency_code, totals.total — the total is a MINOR-unit string
+// currency_code, details.totals.total — the total is a MINOR-unit string
 // ("999" = $9.99), normalized to major units like the Stripe cents path.
+// (Webhook payloads nest totals under details; the top-level totals field
+// is null there. Verified against live sandbox payloads 2026-10-01.)
 // origin="subscription_recurring" marks a channel-side auto-renewal charge;
 // initial checkout transactions are origin="web"/"api". Paddle propagates
 // subscription custom_data onto renewal transactions, so a renewal
@@ -735,9 +743,15 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 			Origin         string         `json:"origin"`
 			CurrencyCode   string         `json:"currency_code"`
 			CustomData     map[string]any `json:"custom_data"`
-			Totals         struct {
-				Total string `json:"total"` // minor units, e.g. "999"
-			} `json:"totals"`
+			// Real webhook payloads carry the settled money under
+			// details.totals — the transaction object's top-level
+			// `totals` is null in notifications (verified against live
+			// sandbox transaction.completed payloads, 2026-10-01). The
+			// top-level Totals stays as a fallback for API-shaped bodies.
+			Totals  paddleTotals `json:"totals"`
+			Details struct {
+				Totals paddleTotals `json:"totals"`
+			} `json:"details"`
 		}
 		if err := json.Unmarshal(evt.Data, &txn); err != nil {
 			return nil, fmt.Errorf("paddle transaction data: %w", err)
@@ -766,10 +780,14 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 			// routes on we.Origin. transaction.billed fires at invoice
 			// ISSUANCE, before collection, and stays audit-only — the
 			// amount is lifted purely for the audit trail.
-			if txn.Totals.Total != "" {
-				v, err := strconv.ParseFloat(txn.Totals.Total, 64)
+			total := txn.Details.Totals.Total
+			if total == "" {
+				total = txn.Totals.Total
+			}
+			if total != "" {
+				v, err := strconv.ParseFloat(total, 64)
 				if err != nil {
-					log.Printf("paddle: event %s has unparseable totals.total %q: %v", evt.EventID, txn.Totals.Total, err)
+					log.Printf("paddle: event %s has unparseable totals.total %q: %v", evt.EventID, total, err)
 				} else {
 					we.Amount = v / 100 // minor units → major units
 				}

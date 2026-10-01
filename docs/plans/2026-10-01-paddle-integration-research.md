@@ -50,7 +50,7 @@
 - Webhook 泛型路由 `/webhooks/payment/:channel`(`internal/router/router.go:344-351`),**加渠道不改路由**。
 - 三层幂等与 Paddle 官方建议 1:1:`webhook_events UNIQUE(channel,event_id)`、`payments UNIQUE(channel,external_txn_id)`、refunds 唯一键;失败返 500 触发渠道重投。
 - 结算主流程 `onPaymentSucceeded`(`service/payment.go:1786`):查单(两段式)→ 金额/币种校验 → INSERT payment → `resolveSubExpiry` 算到期 → UPSERT 订阅 → outbox 发权益。
-- PayPal 续费模式:`PAYMENT.SALE.COMPLETED` → `onPaypalRenewalSucceeded`(:2692),按 `subscriptions.external_subscription_id` 找订阅、造合成 renewal order、按渠道给的下一期时间延期。**Paddle 续费可复用/泛化此模式**(改用 `subscription.updated`/`transaction.billed` 事件与 `next_billed_at`)。
+- PayPal 续费模式:`PAYMENT.SALE.COMPLETED` → `onPaypalRenewalSucceeded`(:2692),按 `subscriptions.external_subscription_id` 找订阅、造合成 renewal order、按渠道给的下一期时间延期。**Paddle 续费可复用/泛化此模式**(续费结算锚定 `transaction.completed` + `origin=subscription_recurring`,经 API 查 `next_billed_at`;见 §6 勘误)。
 - 事件类型分发 switch 有既定 TODO(:3274 "refactor to per-channel predicate maps at 5+ channels"),Paddle 是第 5 渠道,顺手重构。
 - 每用户每产品一个活跃订阅(`idx_subscriptions_user_product_active`);PayPal 渠道"有活跃订阅禁止再下单"防双重扣费——**并存时需把该守卫扩展到跨渠道**(任一渠道有活跃订阅则其他渠道不可再订同产品,决策 2)。
 - 环境:代码一份,env 区分 cn(微信)/ intl(PayPal,Phase 4);mock 开关与生产信号互斥 fail-closed(`internal/config/config.go:477-514`)。
@@ -67,7 +67,7 @@
    - 方案 a(推荐):创建 checkout 用的 transaction 草稿或直接用 price_id 生成 hosted checkout / Paddle.js 会话,`custom_data={order_id, user_id}`,把 checkout URL/client token 写入 `orders.provider_intent` 返回前端。
    - 前端在 Paddle checkout 完成支付(overlay 或跳转)。
 3. Webhook `transaction.completed` / `subscription.activated` → 走现有 `onPaymentSucceeded` 主流程结算(金额以 order 快照为准校验),并把 `subscription.id` 写入 `subscriptions.external_subscription_id`(复用现有列,无需迁移)。
-4. 续费:Paddle 渠道侧自动扣费 → webhook `transaction.billed`(+ `subscription.updated`)→ 泛化 `onPaypalRenewalSucceeded` 为 per-channel renewal handler,按 `next_billed_at` 延期。
+4. 续费:Paddle 渠道侧自动扣费 → webhook `transaction.completed`(`origin=subscription_recurring`)→ 泛化 `onPaypalRenewalSucceeded` 为 per-channel renewal handler,经 API 查 `next_billed_at` 延期。
 5. 取消/过期:`subscription.canceled` / `subscription.past_due`(dunning 失败)→ 状态机处理(参照现有取消/退款翻订阅逻辑)。
 
 ### 3.2 后端改动清单
@@ -128,10 +128,23 @@
 
 ### 实施状态(2026-10-01,分支 feat/paddle-channel)
 
-- ✅ 迁移 042(CHECK 加 'paddle')、config `PADDLE_*`(mock/生产 fail-closed)、`internal/billing/paddle` SDK 封装(mock 模式)、`PaddleVerifier`(HMAC-SHA256 `ts:body`,分号分隔头)、`parsePaddle`、`channelWebhookBranches` 分发表(顺手完成 :3274 重构)、CreateOrder paddle 分支(provider_intent 带 checkout_url/transaction_id/client_token)、续费 handler 泛化(transaction.billed → API 查 next_billed_at)、跨渠道活跃订阅守卫、e2e 5 用例(下单 intent/首购结算+盖章/续费延期/生命周期 audit-only/守卫 409/验签 400)。
-- 已知限制:Paddle 退款(`adjustment.*`)audit-only,运营手工处理;`coding-plan` 未接入(仅 kaya-membership);webhook 5s 应答预算未压测(上线前待办)。
+- ✅ 迁移 042(CHECK 加 'paddle')、config `PADDLE_*`(mock/生产 fail-closed,含"只配凭证不配 PADDLE_ENV 启动即报错")、`internal/billing/paddle` SDK 封装(mock 模式)、`PaddleVerifier`(HMAC-SHA256 `ts:body`,分号分隔头)、`parsePaddle`(宽松解析,结算事件缺字段也落 webhook_events 审计而非 400 死循环)、`channelWebhookBranches` 分发表(顺手完成 :3274 重构)、CreateOrder paddle 分支(provider_intent 带 checkout_url/transaction_id/client_token)、续费 handler 泛化(transaction.completed + `origin=subscription_recurring` → API 查 next_billed_at)、跨渠道活跃订阅守卫、e2e 6 用例(下单 intent/首购结算+盖章+billed audit-only+续费延期+生命周期 audit-only/拒付重试/守卫 409/验签 400)。
+- 已知限制:Paddle 退款(`adjustment.*`)audit-only,运营手工处理;`coding-plan` 未接入(仅 kaya-membership);续费扣款失败(dunning)只出 `transaction.past_due`/`subscription.past_due` 审计,无自动回收(与 PayPal 现状一致);webhook 5s 应答预算未压测(上线前待办)。
 - 前端待办(其他仓库):yunhou.ai/checkout 页托管 Paddle.js,读 `?_ptxn=` 打开 checkout;overlay 形态用 provider_intent 的 `client_token` + `transaction_id`。
 - 实施计划:`docs/superpowers/plans/2026-10-01-paddle-channel.md`。
+
+### 6. 复审勘误(2026-10-01,code review 修正)
+
+调研初版把续费结算锚在 `transaction.billed` 上——**错误**。Paddle 官方 webhook simulator(subscription renewed 场景)确认事件序列为:
+
+1. `subscription.updated` / `transaction.created` / **`transaction.billed`** —— 续费账单**开具**(status=billed),此时尚未扣款;
+2. 仅当扣款成功才发 `transaction.paid` → `transaction.completed`(status=completed)。
+
+若锚在 billed,续费卡被拒(最常见的续费失败)时会先延期 + 记一笔幽灵 paid 收入,而失败只以 `transaction.past_due`/`subscription.past_due` 出现(audit-only),无回收路径。已修正为:
+
+- **续费结算锚定 `transaction.completed` 且 `data.origin=subscription_recurring`**(扣款成功后才发);`transaction.billed`/`transaction.paid` audit-only。
+- Paddle 会把订阅的 `custom_data` 传播到续费 transaction,续费 completed 可能**带回原始 order_id**——路由按 origin 判断,绝不按 custom_data 有无判断(否则续费会误进首购路径报 duplicate)。
+- `transaction.payment_failed` 改 audit-only:checkout 内拒付重试**复用同一 transaction**,若按失败翻单,后续成功重试的 completed 会被 `unexpected_state_transition` 卡死,客户付了钱不激活。
 
 ### 备注
 

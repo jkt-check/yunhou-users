@@ -306,14 +306,20 @@ func TestDispatchBranch(t *testing.T) {
 		{"paypal", "PAYMENT.CAPTURE.REFUNDED", branchRefund},
 		{"paypal", "PAYMENT.SALE.REFUNDED", branchRefund},
 		{"paypal", "PAYMENT.SALE.COMPLETED", branchRenewal},
-		// Paddle: settlement anchored on transaction.* money events;
-		// subscription.*/adjustment.* stay audit-only.
+		// Paddle: settlement anchored on transaction.completed only.
+		// transaction.billed fires at invoice ISSUANCE (pre-collection)
+		// and must never settle; transaction.paid is an intermediate
+		// status change; payment_failed retries inside the same
+		// transaction — all audit-only. subscription.*/adjustment.* too.
 		{"paddle", "transaction.completed", branchPaymentSuccess},
-		{"paddle", "transaction.billed", branchRenewal},
-		{"paddle", "transaction.payment_failed", branchPaymentFailed},
+		{"paddle", "transaction.billed", branchNone},
+		{"paddle", "transaction.paid", branchNone},
+		{"paddle", "transaction.past_due", branchNone},
+		{"paddle", "transaction.payment_failed", branchNone},
 		{"paddle", "subscription.activated", branchNone},
 		{"paddle", "subscription.canceled", branchNone},
 		{"paddle", "subscription.updated", branchNone},
+		{"paddle", "subscription.past_due", branchNone},
 		{"paddle", "adjustment.created", branchNone},
 		// LemonSqueezy-era names — dead since the channel was dropped
 		// (migration 008); must NOT dispatch on any channel.
@@ -333,6 +339,55 @@ func TestDispatchBranch(t *testing.T) {
 			t.Parallel()
 			if got := dispatchBranch(c.channel, c.eventType); got != c.want {
 				t.Errorf("dispatchBranch(%q, %q) = %v, want %v", c.channel, c.eventType, got, c.want)
+			}
+		})
+	}
+}
+
+// TestResolveBranch_PaddleCompleted pins the origin-based routing of
+// Paddle's transaction.completed: renewal charges (origin=
+// subscription_recurring) go to branchRenewal even when Paddle echoes the
+// ORIGINAL order_id in custom_data; order-less non-renewal completions
+// degrade to audit-only instead of erroring.
+func TestResolveBranch_PaddleCompleted(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		e    WebhookEvent
+		want webhookBranch
+	}{
+		{"initial checkout", WebhookEvent{
+			Channel: "paddle", EventType: "transaction.completed",
+			OrderID: "order-1", Origin: "web",
+		}, branchPaymentSuccess},
+		{"renewal, no custom_data", WebhookEvent{
+			Channel: "paddle", EventType: "transaction.completed",
+			ExternalSubscriptionID: "sub-1", Origin: "subscription_recurring",
+		}, branchRenewal},
+		{"renewal with echoed original order_id still routes to renewal", WebhookEvent{
+			Channel: "paddle", EventType: "transaction.completed",
+			OrderID: "order-1", ExternalSubscriptionID: "sub-1",
+			Origin: "subscription_recurring",
+		}, branchRenewal},
+		{"no order_id and not a renewal → audit-only", WebhookEvent{
+			Channel: "paddle", EventType: "transaction.completed",
+			TransactionID: "txn-1", Origin: "web",
+		}, branchNone},
+		{"empty origin + order_id → initial settlement", WebhookEvent{
+			Channel: "paddle", EventType: "transaction.completed",
+			OrderID: "order-1",
+		}, branchPaymentSuccess},
+		{"other channels unaffected", WebhookEvent{
+			Channel: "paypal", EventType: "PAYMENT.SALE.COMPLETED",
+			Origin: "subscription_recurring",
+		}, branchRenewal},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if got := resolveBranch(c.e); got != c.want {
+				t.Errorf("resolveBranch(%+v) = %v, want %v", c.e, got, c.want)
 			}
 		})
 	}

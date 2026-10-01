@@ -1154,6 +1154,7 @@ func TestParsePaddle_TransactionCompleted(t *testing.T) {
 	    "id": "txn_01m3x",
 	    "status": "completed",
 	    "subscription_id": "sub_01m3x",
+	    "origin": "web",
 	    "currency_code": "USD",
 	    "custom_data": {"order_id": "order-uuid-1"},
 	    "totals": {"total": "999", "subtotal": "999", "tax": "0", "grand_total": "999"}
@@ -1175,6 +1176,43 @@ func TestParsePaddle_TransactionCompleted(t *testing.T) {
 	if we.ExternalSubscriptionID != "sub_01m3x" {
 		t.Fatalf("external sub id: %q", we.ExternalSubscriptionID)
 	}
+	if we.Origin != "web" {
+		t.Fatalf("origin: %q", we.Origin)
+	}
+}
+
+// Renewal settlement arrives as transaction.completed with
+// origin=subscription_recurring. Paddle may echo the ORIGINAL order_id via
+// propagated subscription custom_data — parse must surface both fields and
+// let the service route on origin.
+func TestParsePaddle_RenewalCompleted(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3r",
+	  "event_type": "transaction.completed",
+	  "data": {
+	    "id": "txn_01m3r",
+	    "status": "completed",
+	    "subscription_id": "sub_01m3x",
+	    "origin": "subscription_recurring",
+	    "currency_code": "USD",
+	    "custom_data": {"order_id": "order-uuid-ORIGINAL"},
+	    "totals": {"total": "999"}
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Origin != "subscription_recurring" {
+		t.Fatalf("origin: %q", we.Origin)
+	}
+	if we.OrderID != "order-uuid-ORIGINAL" || we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("ids: %+v", we)
+	}
+	if we.Amount != 9.99 || we.Currency != "USD" {
+		t.Fatalf("amount/currency: %v %s", we.Amount, we.Currency)
+	}
 }
 
 func TestParsePaddle_TransactionBilled(t *testing.T) {
@@ -1185,6 +1223,7 @@ func TestParsePaddle_TransactionBilled(t *testing.T) {
 	  "data": {
 	    "id": "txn_01m3y",
 	    "subscription_id": "sub_01m3x",
+	    "origin": "subscription_recurring",
 	    "currency_code": "USD",
 	    "totals": {"total": "999"}
 	  }
@@ -1194,15 +1233,34 @@ func TestParsePaddle_TransactionBilled(t *testing.T) {
 		t.Fatal(err)
 	}
 	if we.Amount != 9.99 || we.Currency != "USD" || we.ExternalSubscriptionID != "sub_01m3x" {
-		t.Fatalf("bad renewal event: %+v", we)
+		t.Fatalf("bad billed event: %+v", we)
 	}
 }
 
-func TestParsePaddle_TransactionBilledMissingSubID(t *testing.T) {
+// Money events parse leniently: a settlement event missing optional fields
+// must still reach the service (and the webhook_events audit row) instead
+// of 400ing before the insert and retrying forever with zero trace.
+func TestParsePaddle_LenientOnMissingFields(t *testing.T) {
 	h := &WebhookHandler{}
-	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.billed","data":{"id":"txn_1","currency_code":"USD","totals":{"total":"999"}}}`)
-	if _, err := h.parsePaddle(raw); err == nil {
-		t.Fatal("expected error for missing subscription_id on renewal")
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"completed missing order_id", `{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","totals":{"total":"999"}}}`},
+		{"completed missing totals", `{"event_id":"evt_2","event_type":"transaction.completed","data":{"id":"txn_2","currency_code":"USD","custom_data":{"order_id":"o-1"}}}`},
+		{"completed unparseable total", `{"event_id":"evt_3","event_type":"transaction.completed","data":{"id":"txn_3","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"abc"}}}`},
+		{"billed missing subscription_id", `{"event_id":"evt_4","event_type":"transaction.billed","data":{"id":"txn_4","currency_code":"USD","totals":{"total":"999"}}}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			we, err := h.parsePaddle([]byte(c.raw))
+			if err != nil {
+				t.Fatalf("lenient parse must not error: %v", err)
+			}
+			if we.TransactionID == "" {
+				t.Fatalf("transaction id must still be lifted: %+v", we)
+			}
+		})
 	}
 }
 
@@ -1238,14 +1296,6 @@ func TestParsePaddle_SubscriptionUpdated(t *testing.T) {
 	}
 	if we.SubExpiresAt == nil || we.SubExpiresAt.Format(time.RFC3339) != "2026-11-01T00:00:00Z" {
 		t.Fatalf("bad next_billed_at: %v", we.SubExpiresAt)
-	}
-}
-
-func TestParsePaddle_CompletedMissingOrderID(t *testing.T) {
-	h := &WebhookHandler{}
-	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","totals":{"total":"999"}}}`)
-	if _, err := h.parsePaddle(raw); err == nil {
-		t.Fatal("expected error for missing custom_data.order_id")
 	}
 }
 

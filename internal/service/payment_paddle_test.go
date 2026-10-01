@@ -16,6 +16,7 @@ type stubPaddle struct {
 	txnID    string
 	checkout string
 	next     *time.Time
+	nextErr  error
 	calls    int
 	gotPrice string
 	gotCurr  string
@@ -34,7 +35,7 @@ func (s *stubPaddle) CreateCheckoutTransaction(_ context.Context, priceID string
 	return &billingpaddle.CheckoutTransaction{TransactionID: s.txnID, CheckoutURL: s.checkout}, nil
 }
 func (s *stubPaddle) GetSubscriptionNextBilledAt(_ context.Context, _ string) (*time.Time, error) {
-	return s.next, nil
+	return s.next, s.nextErr
 }
 
 func TestValidateChannel_Paddle(t *testing.T) {

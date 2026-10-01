@@ -689,9 +689,21 @@ func isPaypalLifecycleEvent(eventType string) bool {
 //	  "data":        { ...transaction or subscription object... }
 //	}
 //
-// transaction.* data: id (txn_...), subscription_id, custom_data,
+// transaction.* data: id (txn_...), subscription_id, origin, custom_data,
 // currency_code, totals.total — the total is a MINOR-unit string
 // ("999" = $9.99), normalized to major units like the Stripe cents path.
+// origin="subscription_recurring" marks a channel-side auto-renewal charge;
+// initial checkout transactions are origin="web"/"api". Paddle propagates
+// subscription custom_data onto renewal transactions, so a renewal
+// transaction.completed may echo the ORIGINAL order_id — routing keys on
+// origin, never on custom_data presence.
+//
+// Parsing is deliberately lenient for money events: a settlement event we
+// cannot make sense of must still reach the service so the webhook_events
+// row (raw payload) is written as the audit trail — a parse error here
+// would 400 before that insert and Paddle would retry forever with zero
+// trace. Field-level problems surface as domain audits downstream.
+//
 // subscription.* data: id (sub_...), next_billed_at (RFC3339), status.
 // subscription.* events carry no transaction: settlement is anchored on
 // transaction.* money events only, so these ride the audit-only default
@@ -720,6 +732,7 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 		var txn struct {
 			ID             string         `json:"id"`
 			SubscriptionID string         `json:"subscription_id"`
+			Origin         string         `json:"origin"`
 			CurrencyCode   string         `json:"currency_code"`
 			CustomData     map[string]any `json:"custom_data"`
 			Totals         struct {
@@ -738,47 +751,34 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 		we.TransactionID = txn.ID
 		we.Currency = strings.ToUpper(txn.CurrencyCode)
 		we.ExternalSubscriptionID = txn.SubscriptionID
+		we.Origin = txn.Origin
 		if orderID, _ := txn.CustomData["order_id"].(string); orderID != "" {
 			we.OrderID = orderID
 		}
 
 		switch evt.EventType {
-		case "transaction.completed":
-			// Initial settlement: order binding + amount are mandatory.
-			if we.OrderID == "" {
-				return nil, fmt.Errorf("paddle missing custom_data.order_id for %s", evt.EventType)
-			}
-			if txn.Totals.Total == "" {
-				return nil, fmt.Errorf("paddle missing totals.total")
-			}
-			v, err := strconv.ParseFloat(txn.Totals.Total, 64)
-			if err != nil {
-				return nil, fmt.Errorf("paddle totals.total %q: %w", txn.Totals.Total, err)
-			}
-			we.Amount = v / 100 // minor units → major units
-			if we.Currency == "" {
-				return nil, fmt.Errorf("paddle missing currency_code for %s", evt.EventType)
-			}
-		case "transaction.billed":
-			// Renewal settlement: same strictness — money moved, and the
-			// renewal handler finds the subscription by this id.
-			if txn.Totals.Total == "" {
-				return nil, fmt.Errorf("paddle missing totals.total for %s", evt.EventType)
-			}
-			v, err := strconv.ParseFloat(txn.Totals.Total, 64)
-			if err != nil {
-				return nil, fmt.Errorf("paddle totals.total %q: %w", txn.Totals.Total, err)
-			}
-			we.Amount = v / 100
-			if we.Currency == "" {
-				return nil, fmt.Errorf("paddle missing currency_code for %s", evt.EventType)
-			}
-			if we.ExternalSubscriptionID == "" {
-				return nil, fmt.Errorf("paddle missing data.subscription_id for %s", evt.EventType)
+		case "transaction.completed", "transaction.billed":
+			// Money events: lift the settled amount when present and
+			// well-formed, but never hard-fail — see the leniency note in
+			// the parsePaddle doc comment. transaction.completed doubles
+			// as initial settlement (origin=web/api) and renewal
+			// settlement (origin=subscription_recurring); the service
+			// routes on we.Origin. transaction.billed fires at invoice
+			// ISSUANCE, before collection, and stays audit-only — the
+			// amount is lifted purely for the audit trail.
+			if txn.Totals.Total != "" {
+				v, err := strconv.ParseFloat(txn.Totals.Total, 64)
+				if err != nil {
+					log.Printf("paddle: event %s has unparseable totals.total %q: %v", evt.EventID, txn.Totals.Total, err)
+				} else {
+					we.Amount = v / 100 // minor units → major units
+				}
 			}
 		case "transaction.payment_failed":
-			// No settlement: amount stays 0; the failed branch keys on
-			// (channel, external_txn_id) and never INSERTs an amount.
+			// No settlement: amount stays 0. Audit-only in the service —
+			// a declined checkout attempt retries inside the same Paddle
+			// transaction, so flipping anything failed here would strand
+			// the paid retry.
 		}
 
 	case strings.HasPrefix(evt.EventType, "subscription."):

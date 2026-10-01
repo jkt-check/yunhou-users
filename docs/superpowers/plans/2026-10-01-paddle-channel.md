@@ -10,6 +10,8 @@
 
 **Spec:** `docs/plans/2026-10-01-paddle-integration-research.md`(§3 方案、§4 Dashboard 实况、已实测验证)。
 
+> **⚠️ 实施后勘误(2026-10-01 code review):** 本计划原稿把续费结算锚在 `transaction.billed`——经 Paddle 官方 webhook simulator 核实,billed 在**账单开具时**触发(未扣款),扣款成功后才发 `transaction.paid`/`transaction.completed`。已修正为:续费锚定 `transaction.completed` + `data.origin=subscription_recurring`(origin 路由,Paddle 会把订阅 custom_data 传播到续费 transaction,可能带回原始 order_id,故不能按 custom_data 判断);`transaction.billed`/`transaction.paid`/`transaction.payment_failed` 全部 audit-only(payment_failed 在 checkout 拒付重试场景与成功重试共用同一 transaction,翻单会卡死后续激活);`parsePaddle` 宽松化(结算事件缺字段不再 400,落 webhook_events 审计);config 增加"只配凭证不配 PADDLE_ENV 启动即报错"。详见调研报告 §6。
+
 ## Global Constraints
 
 - 渠道名固定为 `"paddle"`;事件类型原样使用 Paddle Billing 字符串(`transaction.completed` 等,小写点分)。

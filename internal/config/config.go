@@ -550,6 +550,16 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("PADDLE_ENV must be empty, sandbox, or live, got %q", c.PaddleEnv)
 	}
+	// Half-configured deployments must fail fast at boot, not at runtime:
+	// main.go wires the webhook verifier on the secret alone, so a
+	// secret-without-env deployment would accept webhooks while refusing
+	// orders and 500ing every renewal (paddle client never wired) — an
+	// infinite Paddle retry loop with no startup signal.
+	if c.PaddleEnv == "" && !c.PaddleMock {
+		if c.PaddleAPIKey != "" || c.PaddleWebhookSecret != "" || c.PaddleClientToken != "" {
+			return errors.New("PADDLE_ENV is required when PADDLE_API_KEY / PADDLE_WEBHOOK_SECRET / PADDLE_CLIENT_TOKEN is set (or enable PADDLE_MOCK for dev/e2e)")
+		}
+	}
 	if c.PaddleMock {
 		if IsProductionEnv(c.AppEnv) {
 			return errors.New("PADDLE_MOCK must not be enabled when APP_ENV is production (set APP_ENV to a non-production value like dev/staging to use mock switches)")

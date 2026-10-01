@@ -3245,6 +3245,256 @@ func TestPaymentService_OnWebhook_PaypalRenewal_SubNotActive(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// Paddle renewal — transaction.completed with origin=subscription_recurring
+// ============================================================================
+
+// paddleRenewalEvent builds the service-level event the handler produces
+// for a renewal settlement. origin drives resolveBranch → branchRenewal;
+// the original order_id may ride along (Paddle propagates subscription
+// custom_data) and must be ignored by the renewal path.
+func paddleRenewalEvent(eventID, txnID, extSubID string) WebhookEvent {
+	return WebhookEvent{
+		Channel: "paddle", EventID: eventID, EventType: "transaction.completed",
+		TransactionID: txnID, ExternalSubscriptionID: extSubID,
+		OrderID: mustNewUUID(), Origin: "subscription_recurring",
+		Amount: 9.99, Currency: "USD",
+		RawPayload: json.RawMessage(`{}`),
+	}
+}
+
+func seedPaddleSub(t *testing.T, db *sqlx.DB, uid, extSubID string, expAt time.Time) string {
+	t.Helper()
+	subID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'active', $3, $4)
+	`, subID, uid, expAt, extSubID); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+	return subID
+}
+
+func TestPaymentService_OnWebhook_PaddleRenewal_Success(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_paddle_" + mustNewUUID()[:8]
+	subID := seedPaddleSub(t, db, uid, extSubID, time.Now().Add(15*24*time.Hour))
+
+	next := time.Now().Add(45 * 24 * time.Hour).UTC().Truncate(time.Second)
+	svc.SetPaddleClient(&stubPaddle{next: &next})
+
+	txnID := "txn_pd_renew_" + mustNewUUID()[:8]
+	_, err := svc.OnWebhook(context.Background(),
+		paddleRenewalEvent("evt-pd-renew-"+mustNewUUID()[:8], txnID, extSubID))
+	if err != nil {
+		t.Fatalf("OnWebhook paddle renewal: %v", err)
+	}
+
+	// expires_at extended to the API-resolved next_billed_at.
+	var gotExp time.Time
+	if err := db.GetContext(context.Background(), &gotExp,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if gotExp.Unix() != next.Unix() {
+		t.Errorf("expires_at: got %v, want %v", gotExp, next)
+	}
+
+	// Renewal payment row keyed by (paddle, txn); the echoed original
+	// order_id must NOT be touched.
+	var payCount int
+	if err := db.GetContext(context.Background(), &payCount,
+		`SELECT COUNT(*) FROM payments WHERE channel='paddle' AND external_txn_id=$1 AND status='paid'`, txnID); err != nil {
+		t.Fatalf("read payments: %v", err)
+	}
+	if payCount != 1 {
+		t.Errorf("renewal payment rows: %d, want 1", payCount)
+	}
+	var synCount int
+	_ = db.GetContext(context.Background(), &synCount,
+		`SELECT COUNT(*) FROM orders o JOIN payments p ON p.order_id = o.id WHERE p.external_txn_id=$1`, txnID)
+	if synCount != 1 {
+		t.Errorf("synthetic renewal orders: %d, want 1", synCount)
+	}
+}
+
+// transaction.billed fires at invoice ISSUANCE, before money is collected
+// (verified against Paddle's webhook simulator). It must NEVER settle:
+// no payment row, no expiry extension — just the webhook_events audit row.
+func TestPaymentService_OnWebhook_PaddleBilled_AuditOnly(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_paddle_" + mustNewUUID()[:8]
+	expAt := time.Now().Add(15 * 24 * time.Hour).UTC().Truncate(time.Second)
+	subID := seedPaddleSub(t, db, uid, extSubID, expAt)
+	svc.SetPaddleClient(&stubPaddle{})
+
+	eventID := "evt-pd-billed-" + mustNewUUID()[:8]
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paddle", EventID: eventID, EventType: "transaction.billed",
+		TransactionID: "txn_pd_billed_" + mustNewUUID()[:8], ExternalSubscriptionID: extSubID,
+		Origin: "subscription_recurring", Amount: 9.99, Currency: "USD",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("billed must ack, got %v", err)
+	}
+	var payCount int
+	_ = db.GetContext(context.Background(), &payCount,
+		`SELECT COUNT(*) FROM payments WHERE channel='paddle'`)
+	if payCount != 0 {
+		t.Errorf("billed must not book payments, got %d", payCount)
+	}
+	var gotExp time.Time
+	_ = db.GetContext(context.Background(), &gotExp,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID)
+	if gotExp.Unix() != expAt.Unix() {
+		t.Errorf("billed must not extend expires_at: got %v, want %v", gotExp, expAt)
+	}
+	var evtCount int
+	_ = db.GetContext(context.Background(), &evtCount,
+		`SELECT COUNT(*) FROM webhook_events WHERE channel='paddle' AND event_id=$1`, eventID)
+	if evtCount != 1 {
+		t.Errorf("webhook_events audit row missing (count=%d)", evtCount)
+	}
+}
+
+// A decline at Paddle checkout fires transaction.payment_failed on the
+// SAME transaction the successful retry will use. The event must be
+// audit-only: no payment row, no order flip — otherwise the later
+// transaction.completed (paid retry) would be stranded.
+func TestPaymentService_OnWebhook_PaddlePaymentFailed_AuditOnly(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_paddle_" + mustNewUUID()[:8]
+	seedPaddleSub(t, db, uid, extSubID, time.Now().Add(15*24*time.Hour))
+	svc.SetPaddleClient(&stubPaddle{})
+
+	txnID := "txn_pd_failed_" + mustNewUUID()[:8]
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paddle", EventID: "evt-pd-failed-" + mustNewUUID()[:8], EventType: "transaction.payment_failed",
+		TransactionID: txnID, ExternalSubscriptionID: extSubID,
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("payment_failed must ack, got %v", err)
+	}
+	var payCount int
+	_ = db.GetContext(context.Background(), &payCount,
+		`SELECT COUNT(*) FROM payments WHERE channel='paddle' AND external_txn_id=$1`, txnID)
+	if payCount != 0 {
+		t.Errorf("payment_failed must not write payment rows, got %d", payCount)
+	}
+}
+
+// A transaction.completed that is neither a renewal nor bound to an order
+// degrades to audit-only (the webhook_events row is the trail) instead of
+// erroring into an infinite Paddle retry loop.
+func TestPaymentService_OnWebhook_PaddleCompleted_NoOrderAuditOnly(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	svc.SetPaddleClient(&stubPaddle{})
+
+	eventID := "evt-pd-noorder-" + mustNewUUID()[:8]
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paddle", EventID: eventID, EventType: "transaction.completed",
+		TransactionID: "txn_pd_noorder_" + mustNewUUID()[:8],
+		Origin: "web", Amount: 9.99, Currency: "USD",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("order-less completion must ack, got %v", err)
+	}
+	var payCount int
+	_ = db.GetContext(context.Background(), &payCount,
+		`SELECT COUNT(*) FROM payments WHERE channel='paddle'`)
+	if payCount != 0 {
+		t.Errorf("order-less completion must not settle, got %d payments", payCount)
+	}
+	var evtCount int
+	_ = db.GetContext(context.Background(), &evtCount,
+		`SELECT COUNT(*) FROM webhook_events WHERE channel='paddle' AND event_id=$1`, eventID)
+	if evtCount != 1 {
+		t.Errorf("webhook_events audit row missing (count=%d)", evtCount)
+	}
+}
+
+// The Paddle API returning no next_billed_at (e.g. the subscription was
+// canceled channel-side after the charge): the payment is recorded (Paddle
+// did charge) but expires_at is NOT extended, and a
+// paddle_renewal_no_expiry_hint audit row flags the reconciliation.
+func TestPaymentService_OnWebhook_PaddleRenewal_NoExpiryHint(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_paddle_" + mustNewUUID()[:8]
+	expAt := time.Now().Add(15 * 24 * time.Hour).UTC().Truncate(time.Second)
+	subID := seedPaddleSub(t, db, uid, extSubID, expAt)
+	svc.SetPaddleClient(&stubPaddle{next: nil})
+
+	eventID := "evt-pd-nohint-" + mustNewUUID()[:8]
+	txnID := "txn_pd_nohint_" + mustNewUUID()[:8]
+	_, err := svc.OnWebhook(context.Background(), paddleRenewalEvent(eventID, txnID, extSubID))
+	if err != nil {
+		t.Fatalf("OnWebhook no-hint renewal: %v", err)
+	}
+	var payCount int
+	_ = db.GetContext(context.Background(), &payCount,
+		`SELECT COUNT(*) FROM payments WHERE channel='paddle' AND external_txn_id=$1`, txnID)
+	if payCount != 1 {
+		t.Errorf("charged renewal must still book the payment, got %d", payCount)
+	}
+	var gotExp time.Time
+	_ = db.GetContext(context.Background(), &gotExp,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID)
+	if gotExp.Unix() != expAt.Unix() {
+		t.Errorf("expires_at must not move without a hint: got %v, want %v", gotExp, expAt)
+	}
+	var n int
+	// The no_expiry_hint audit context carries payment/order/subscription
+	// ids but no event_id — filter on the external subscription id.
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT COUNT(*) FROM audit_log WHERE action='paddle_renewal_no_expiry_hint' AND context->>'external_subscription_id'=$1`, extSubID)
+	if n == 0 {
+		t.Error("expected audit_log row for paddle_renewal_no_expiry_hint")
+	}
+}
+
+// A transient Paddle API failure resolving next_billed_at must surface as
+// an error so the handler 500s and Paddle retries — nothing is booked.
+func TestPaymentService_OnWebhook_PaddleRenewal_FetchError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_paddle_" + mustNewUUID()[:8]
+	expAt := time.Now().Add(15 * 24 * time.Hour).UTC().Truncate(time.Second)
+	subID := seedPaddleSub(t, db, uid, extSubID, expAt)
+	svc.SetPaddleClient(&stubPaddle{nextErr: errors.New("paddle api boom")})
+
+	txnID := "txn_pd_fetcherr_" + mustNewUUID()[:8]
+	_, err := svc.OnWebhook(context.Background(),
+		paddleRenewalEvent("evt-pd-fetcherr-"+mustNewUUID()[:8], txnID, extSubID))
+	if err == nil {
+		t.Fatal("expected error so the handler 500s for a Paddle retry")
+	}
+	var payCount int
+	_ = db.GetContext(context.Background(), &payCount,
+		`SELECT COUNT(*) FROM payments WHERE channel='paddle' AND external_txn_id=$1`, txnID)
+	if payCount != 0 {
+		t.Errorf("failed renewal must not book payments, got %d", payCount)
+	}
+	var gotExp time.Time
+	_ = db.GetContext(context.Background(), &gotExp,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID)
+	if gotExp.Unix() != expAt.Unix() {
+		t.Errorf("expires_at must not move on fetch error: got %v, want %v", gotExp, expAt)
+	}
+}
+
 // TestResolveSubExpiry_HintForwarded covers the hint branch of
 // resolveSubExpiry: when a channel-authoritative hint (webhook payload on
 // channels that ship sub_expires_at, e.g. Stripe metadata) is supplied AND

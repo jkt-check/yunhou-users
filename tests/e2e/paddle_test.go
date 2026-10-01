@@ -13,8 +13,10 @@ import (
 
 // paddleTransactionBody builds a Paddle webhook envelope. total is in
 // minor units ("999" = $9.99), mirroring the real payload shape; empty
-// orderID/total omit those blocks (renewals don't echo custom_data).
-func paddleTransactionBody(eventID, eventType, txnID, subID, orderID, total, currency string) []byte {
+// orderID/total omit those blocks. origin mirrors data.origin: "web" for
+// initial checkout transactions, "subscription_recurring" for channel-side
+// auto-renewal charges (the service routes renewals on this field).
+func paddleTransactionBody(eventID, eventType, txnID, subID, orderID, total, currency, origin string) []byte {
 	custom := ""
 	if orderID != "" {
 		custom = `"custom_data":{"order_id":"` + orderID + `"},`
@@ -33,7 +35,7 @@ func paddleTransactionBody(eventID, eventType, txnID, subID, orderID, total, cur
 	    "subscription_id": "` + subID + `",
 	    "currency_code": "` + currency + `",
 	    ` + custom + totals + `
-	    "origin": "web"
+	    "origin": "` + origin + `"
 	  }
 	}`)
 }
@@ -99,7 +101,8 @@ func TestE2E_Paddle_CreateOrder_ProviderIntent(t *testing.T) {
 
 // ============================================================================
 // Paddle — transaction.completed settles the order and stamps the sub id;
-// transaction.billed renews through the (mock) subscription lookup
+// transaction.billed is audit-only; renewal settles on completed with
+// origin=subscription_recurring via the (mock) subscription lookup
 // ============================================================================
 
 func TestE2E_Paddle_TransactionCompleted_HappyPath(t *testing.T) {
@@ -112,7 +115,7 @@ func TestE2E_Paddle_TransactionCompleted_HappyPath(t *testing.T) {
 		"evt-e2e-paddle-"+uuid.NewString(),
 		"transaction.completed",
 		"txn-e2e-"+uuid.NewString(),
-		subID, orderID, "2990", "USD",
+		subID, orderID, "2990", "USD", "web",
 	)
 	resp := postPaddleWebhook(t, srv, body)
 	if resp.StatusCode != http.StatusOK {
@@ -156,13 +159,37 @@ func TestE2E_Paddle_TransactionCompleted_HappyPath(t *testing.T) {
 		t.Fatalf("external_subscription_id not stamped: %q", extSubID)
 	}
 
-	// Renewal: transaction.billed. The mock client returns now+1mo as
+	// transaction.billed fires at invoice ISSUANCE (pre-collection) and
+	// must be audit-only: ack 200, no payment row, no expiry change.
+	billedTxn := "txn-e2e-billed-" + uuid.NewString()
+	billedBody := paddleTransactionBody(
+		"evt-e2e-paddle-billed-"+uuid.NewString(),
+		"transaction.billed",
+		billedTxn, subID, "", "2990", "USD", "subscription_recurring",
+	)
+	resp = postPaddleWebhook(t, srv, billedBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("billed webhook: %d %s", resp.StatusCode, string(resp.Body))
+	}
+	var billedCount int
+	if err := srv.DB.GetContext(context.Background(), &billedCount,
+		`SELECT COUNT(*) FROM payments WHERE channel='paddle' AND external_txn_id = $1`, billedTxn); err != nil {
+		t.Fatal(err)
+	}
+	if billedCount != 0 {
+		t.Fatalf("transaction.billed must not book payments, got %d", billedCount)
+	}
+
+	// Renewal settlement: transaction.completed with
+	// origin=subscription_recurring. Paddle propagates the subscription's
+	// custom_data, so the ORIGINAL order_id rides along — routing must key
+	// on origin, not custom_data. The mock client returns now+1mo as
 	// next_billed_at (real mode would hit the Paddle API).
 	renewBody := paddleTransactionBody(
 		"evt-e2e-paddle-renew-"+uuid.NewString(),
-		"transaction.billed",
+		"transaction.completed",
 		"txn-e2e-renew-"+uuid.NewString(),
-		subID, "", "2990", "USD",
+		subID, orderID, "2990", "USD", "subscription_recurring",
 	)
 	resp = postPaddleWebhook(t, srv, renewBody)
 	if resp.StatusCode != http.StatusOK {
@@ -210,12 +237,66 @@ func TestE2E_Paddle_TransactionCompleted_HappyPath(t *testing.T) {
 }
 
 // ============================================================================
+// Paddle — a declined checkout attempt retries inside the SAME transaction:
+// payment_failed must be audit-only so the later completed (paid retry)
+// still activates the order
+// ============================================================================
+
+func TestE2E_Paddle_CheckoutDeclineThenRetry(t *testing.T) {
+	srv := setupE2EServerWithVerifier(t)
+	token := loginAndGetTokens(t, srv.Engine, "paddle-retry", "yundian").AccessToken
+	orderID := createPaddleOrder(t, srv, token, "paddle-retry")
+
+	subID := "sub_e2e_" + uuid.NewString()
+	txnID := "txn-e2e-retry-" + uuid.NewString()
+
+	failBody := paddleTransactionBody(
+		"evt-e2e-paddle-fail-"+uuid.NewString(),
+		"transaction.payment_failed",
+		txnID, subID, orderID, "", "", "web",
+	)
+	resp := postPaddleWebhook(t, srv, failBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("payment_failed webhook: %d %s", resp.StatusCode, string(resp.Body))
+	}
+
+	// The order must NOT be flipped failed — the customer is retrying in
+	// the same Paddle checkout.
+	var status string
+	if err := srv.DB.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("order status after decline: %s, want pending", status)
+	}
+
+	// The successful retry completes the SAME transaction and activates.
+	okBody := paddleTransactionBody(
+		"evt-e2e-paddle-ok-"+uuid.NewString(),
+		"transaction.completed",
+		txnID, subID, orderID, "2990", "USD", "web",
+	)
+	resp = postPaddleWebhook(t, srv, okBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("completed webhook: %d %s", resp.StatusCode, string(resp.Body))
+	}
+	if err := srv.DB.GetContext(context.Background(), &status,
+		`SELECT status FROM orders WHERE id = $1`, orderID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "paid" {
+		t.Fatalf("order status after retry: %s, want paid", status)
+	}
+}
+
+// ============================================================================
 // Paddle — bad signature / missing header → 400
 // ============================================================================
 
 func TestE2E_Paddle_MissingSignature_400(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	body := paddleTransactionBody("evt-x", "transaction.completed", "txn-x", "sub-x", "order-x", "999", "USD")
+	body := paddleTransactionBody("evt-x", "transaction.completed", "txn-x", "sub-x", "order-x", "999", "USD", "web")
 	resp := doRequest(t, srv.Engine, http.MethodPost,
 		"/webhooks/payment/paddle", string(body), map[string]string{})
 	if resp.StatusCode != http.StatusBadRequest {
@@ -225,7 +306,7 @@ func TestE2E_Paddle_MissingSignature_400(t *testing.T) {
 
 func TestE2E_Paddle_TamperedBody_400(t *testing.T) {
 	srv := setupE2EServerWithVerifier(t)
-	body := paddleTransactionBody("evt-x", "transaction.completed", "txn-x", "sub-x", "order-x", "999", "USD")
+	body := paddleTransactionBody("evt-x", "transaction.completed", "txn-x", "sub-x", "order-x", "999", "USD", "web")
 	headers := paddleSignatureHeaders(e2ePaddleSecret, body)
 	resp := doRequest(t, srv.Engine, http.MethodPost,
 		"/webhooks/payment/paddle", string(body)+` `, headers) // body no longer matches the hmac
@@ -245,7 +326,7 @@ func TestE2E_Paddle_ActiveSubBlocksNewOrder(t *testing.T) {
 
 	subID := "sub_e2e_" + uuid.NewString()
 	body := paddleTransactionBody("evt-g-"+uuid.NewString(), "transaction.completed",
-		"txn-g-"+uuid.NewString(), subID, orderID, "2990", "USD")
+		"txn-g-"+uuid.NewString(), subID, orderID, "2990", "USD", "web")
 	if resp := postPaddleWebhook(t, srv, body); resp.StatusCode != http.StatusOK {
 		t.Fatalf("settle: %d %s", resp.StatusCode, string(resp.Body))
 	}

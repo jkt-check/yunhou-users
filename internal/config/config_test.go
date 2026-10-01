@@ -1364,6 +1364,26 @@ func TestValidate_PaddleDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestValidate_PaddleCredentialsWithoutEnv(t *testing.T) {
+	t.Parallel()
+	// Secret/key set without PADDLE_ENV: main.go wires the webhook
+	// verifier on the secret alone, so this half-configured state would
+	// accept webhooks while the paddle client stays nil — orders refused
+	// and every renewal 500ing forever. Must fail fast at boot.
+	c := validPaddleConfig()
+	c.PaddleEnv = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_ENV") {
+		t.Fatalf("expected PADDLE_ENV required when credentials are set, got %v", err)
+	}
+
+	c = validRealWeChatConfig()
+	c.AppEnv = "staging"
+	c.PaddleClientToken = "test_client_token"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_ENV") {
+		t.Fatalf("expected PADDLE_ENV required when client token is set, got %v", err)
+	}
+}
+
 func TestValidate_PaddleEnvInvalid(t *testing.T) {
 	t.Parallel()
 	c := validPaddleConfig()

@@ -1703,6 +1703,13 @@ type WebhookEvent struct {
 	RefundAmount           float64 // for refund events
 	ExternalRefundID       string  // channel's refund ID
 	ExternalSubscriptionID string  // PayPal: subscription ID (`I-...`) — used by renewal branch to find the active sub
+	// Origin is Paddle's transaction origin (data.origin). Only populated
+	// for paddle transaction.* events. "subscription_recurring" marks a
+	// channel-side auto-renewal charge — the renewal routing keys on this,
+	// NOT on custom_data, because Paddle propagates the subscription's
+	// custom_data (including the original order_id) onto renewal
+	// transactions. Initial checkout transactions arrive as "web"/"api".
+	Origin string
 	// SkipAmountCheck exempts PayPal lifecycle events
 	// (BILLING.SUBSCRIPTION.ACTIVATED etc.) from the amount/currency
 	// validation in onPaymentSucceeded: PayPal omits resource.amount from
@@ -1773,7 +1780,7 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 
 	var domainAction string
 
-	switch branch := dispatchBranch(e.Channel, e.EventType); branch {
+	switch branch := resolveBranch(e); branch {
 	case branchPaymentSuccess:
 		domainAction = branch.domainAction()
 		if err := s.onPaymentSucceeded(ctx, e); err != nil {
@@ -2754,12 +2761,15 @@ func (s *PaymentService) onDisputeClosed(ctx context.Context, e WebhookEvent) er
 //   PayPal's product definition and our Plan. The
 //   paypal_renewal_no_expiry_hint audit log lets ops reconcile manually.
 // - Paddle renewal: sub_expires_at is structurally ABSENT from
-//   transaction.billed; the handler resolves next_billed_at through the
-//   billing client before this runs (same audit when even the API has no
-//   hint — e.g. Paddle billed a canceled subscription).
+//   transaction.completed (origin=subscription_recurring); the handler
+//   resolves next_billed_at through the billing client before this runs
+//   (same audit when even the API has no hint — e.g. Paddle billed a
+//   canceled subscription).
 
 // onRenewalSucceeded handles the channel-side auto-renewal charge:
-// PAYMENT.SALE.COMPLETED (PayPal) and transaction.billed (Paddle). We
+// PAYMENT.SALE.COMPLETED (PayPal) and transaction.completed with
+// origin=subscription_recurring (Paddle — post-collection only; the
+// issuance-time transaction.billed is audit-only). We
 // don't have an `orders` row for renewals (the original order was months
 // ago); instead we mint a synthetic orders row keyed to
 // the renewal payment, INSERT the payments row, and extend
@@ -2780,7 +2790,7 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 	}
 
 	// Resolve the post-renewal expiry. PayPal ships next_billing_time in
-	// the webhook; Paddle's transaction.billed does not — the hint lives
+	// the webhook; Paddle's transaction.completed does not — the hint lives
 	// on the subscription object, so fetch it through the billing client.
 	// A fetch failure is transient (500): the channel retries per its
 	// schedule. nil nextBilled = "charged but no hint" — audited loudly
@@ -3458,17 +3468,35 @@ var channelWebhookBranches = map[string]map[string]webhookBranch{
 		"PAYMENT.SALE.COMPLETED":         branchRenewal,
 	},
 	"paddle": {
-		// Initial subscription settlement (checkout completed). The
-		// subscription id rides data.subscription_id so activation can
+		// Initial subscription settlement (checkout completed,
+		// origin=web/api). Renewal settlement arrives as the SAME event
+		// type with origin=subscription_recurring and is rerouted to
+		// branchRenewal by resolveBranch — Paddle's event semantics
+		// (verified against the webhook simulator, 2026-10):
+		//
+		//   subscription.updated / transaction.created / transaction.billed
+		//     → renewal invoice ISSUED (no money moved yet)
+		//   transaction.paid / transaction.completed
+		//     → renewal charge COLLECTED (only fired post-collection)
+		//
+		// so transaction.billed must NEVER settle: on a declined renewal
+		// card it would extend the subscription and book phantom paid
+		// revenue, and the failure surfaces only as transaction.past_due /
+		// subscription.past_due (audit-only) with no clawback path here.
+		// The subscription id rides data.subscription_id so activation can
 		// stamp subscriptions.external_subscription_id for renewals.
 		"transaction.completed": branchPaymentSuccess,
-		// Renewal charge fired by Paddle's channel-side auto-billing.
-		"transaction.billed": branchRenewal,
-		// Renewal failure (dunning). subscription.created/activated/
-		// updated/canceled/past_due and adjustment.* stay audit-only:
-		// settlement is anchored on transaction.* money events only, and
-		// refunds remain webhook-unhandled for paddle (ops manual).
-		"transaction.payment_failed": branchPaymentFailed,
+		// transaction.payment_failed stays audit-only: a declined checkout
+		// attempt is retried INSIDE the same Paddle transaction, so
+		// flipping the order/payment failed here would strand the later
+		// paid retry behind onPaymentSucceeded's unexpected_state_transition
+		// guard. Renewal dunning surfaces as transaction.past_due /
+		// subscription.past_due (also audit-only).
+		//
+		// transaction.billed / transaction.paid, subscription.*,
+		// adjustment.* are likewise audit-only: settlement is anchored on
+		// transaction.completed money events only, and refunds remain
+		// webhook-unhandled for paddle (ops manual).
 	},
 }
 
@@ -3481,6 +3509,36 @@ func dispatchBranch(channel, eventType string) webhookBranch {
 		}
 	}
 	return branchNone
+}
+
+// paddleOriginSubscriptionRecurring is Paddle's data.origin value for
+// channel-side auto-renewal charges.
+const paddleOriginSubscriptionRecurring = "subscription_recurring"
+
+// resolveBranch is the event-aware wrapper over dispatchBranch. Paddle's
+// transaction.completed doubles as initial settlement and renewal
+// settlement; data.origin distinguishes them. Two paddle-specific
+// reroutings:
+//
+//   - origin=subscription_recurring → branchRenewal. Renewal completed
+//     events may echo the ORIGINAL order_id (Paddle propagates
+//     subscription custom_data onto renewal transactions), so origin —
+//     not custom_data presence — drives the routing. onRenewalSucceeded
+//     keys on ExternalSubscriptionID and never touches the stale order.
+//   - no origin match AND no order_id → branchNone: there is nothing to
+//     settle, but the webhook_events row written by OnWebhook keeps the
+//     audit trail (the handler parses leniently precisely so these events
+//     reach this point instead of 400ing before the insert).
+func resolveBranch(e WebhookEvent) webhookBranch {
+	if e.Channel == "paddle" && e.EventType == "transaction.completed" {
+		if e.Origin == paddleOriginSubscriptionRecurring {
+			return branchRenewal
+		}
+		if e.OrderID == "" {
+			return branchNone
+		}
+	}
+	return dispatchBranch(e.Channel, e.EventType)
 }
 
 // resolveSubExpiry returns the expires_at to write on a subscription

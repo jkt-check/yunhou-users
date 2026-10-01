@@ -110,7 +110,7 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 }
 
 // GetSubscriptionNextBilledAt returns the subscription's next_billed_at.
-// transaction.billed webhooks don't carry the next billing date (it lives
+// transaction.completed webhooks don't carry the next billing date (it lives
 // on the subscription object), so the renewal path resolves it here.
 // nil = the subscription has no next billing date (e.g. canceled).
 func (c *Client) GetSubscriptionNextBilledAt(ctx context.Context, subscriptionID string) (*time.Time, error) {

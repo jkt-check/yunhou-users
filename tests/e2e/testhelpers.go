@@ -33,6 +33,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"github.com/yunhou/users/internal/billing/paddle"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	inferencepostgres "github.com/yunhou/users/internal/inference/postgres"
@@ -50,6 +51,7 @@ import (
 const (
 	e2eStripeSecret = "whsec_e2e_test_secret"
 	e2eWeChatKey    = "01234567890123456789012345678901" // 32 bytes
+	e2ePaddleSecret = "e2e-paddle-webhook-secret"
 	// Alipay uses RSA2 with a real key pair; generated in setupE2EServerWithVerifier.
 )
 
@@ -672,6 +674,14 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		&wechat.Client{MockMode: true},
 		cfg.OrderExpiryDuration,
 	)
+	// Paddle channel: mock client (canned checkout txn + next_billed_at)
+	// and a plan → price map, mirroring the production wiring in
+	// cmd/server/main.go.
+	paymentSvc.SetPaddleClient(&paddle.Client{MockMode: true})
+	paymentSvc.SetPaddlePrices(map[string]string{
+		"monthly_usd": "pri_e2e_monthly_usd",
+		"yearly_usd":  "pri_e2e_yearly_usd",
+	})
 	// Task 10: wire the payment → entitlement loop exactly like
 	// cmd/server does — coding-plan orders snapshot their benefit spec at
 	// creation and the webhook/confirm paths enqueue the sync message in
@@ -705,6 +715,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 			PlatformKeys: newE2EPlatformKeySource(t),
 		},
 		Alipay: &middleware.AlipayVerifier{PublicKey: mustParseAlipayPubKey(t, alipayPubPEM)},
+		Paddle: &middleware.PaddleVerifier{Secret: []byte(e2ePaddleSecret)},
 		Paypal: &middleware.PaypalVerifier{
 			HTTPClient:       &http.Client{Timeout: 2 * time.Second},
 			SandboxWebhookID: cfg.PaypalWebhookIDSandbox,
@@ -1099,4 +1110,16 @@ func paypalSaleCompletedBody(eventID, saleID, billingAgreementID, customID, next
 			"billing_info": {"next_billing_time": %q}
 		}
 	}`, eventID, saleID, billingAgreementID, customID, nextBillingTime))
+}
+
+// paddleSignatureHeaders builds a real Paddle-Signature header
+// (ts=<unix>;h1=HMAC-SHA256(secret, "ts:"+body)) so the e2e suite drives
+// the paddle channel through the production verifier.
+func paddleSignatureHeaders(secret string, body []byte) map[string]string {
+	ts := time.Now().Unix()
+	mac := hmac.New(sha256.New, []byte(secret))
+	fmt.Fprintf(mac, "%d:%s", ts, body)
+	return map[string]string{
+		"Paddle-Signature": fmt.Sprintf("ts=%d;h1=%x", ts, mac.Sum(nil)),
+	}
 }

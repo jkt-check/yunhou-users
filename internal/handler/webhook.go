@@ -34,6 +34,9 @@ import (
 //     registered merchant.
 //   - Alipay  : application/x-www-form-urlencoded, out_trade_no IS the order_id,
 //     total_amount is in major units (no conversion)
+//   - Paddle  : application/json, uniform envelope {event_id, event_type, data};
+//     transaction.* data carries custom_data.order_id + totals.total (MINOR
+//     units → divide by 100); subscription.* data carries id + next_billed_at
 type WebhookHandler struct {
 	svc           service.PaymentServiceInterface
 	wechatKey     []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
@@ -435,7 +438,7 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 	// 创建"触发）、TRADE_INVALID 及任何未来新增状态映射为惰性类型
 	// "trade_pending"——OnWebhook 落 default 分支（domain_action="none"
 	// 的 audit-only ack 200，零域动作）。缺 default 时未识别状态会穿透
-	// notify_type=trade_status_sync 被 isPaymentSuccess 当支付成功：金额
+	// notify_type=trade_status_sync 被 dispatchBranch 当支付成功：金额
 	// 校验通过 → 钱未到账权益永久生效。
 	eventType := notifyType
 	switch tradeStatus {
@@ -664,8 +667,8 @@ func isPaypalRefundEvent(eventType string) bool {
 }
 
 // isPaypalSubscriptionEvent is local to the handler — it covers BILLING.SUBSCRIPTION.*
-// (created/updated/cancelled). The renewal predicate `isPaypalRenewal` lives
-// in service/payment.go because it's part of the OnWebhook dispatch table.
+// (created/updated/cancelled). The renewal mapping for PAYMENT.SALE.COMPLETED
+// lives in service.channelWebhookBranches (the OnWebhook dispatch table).
 func isPaypalSubscriptionEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "BILLING.SUBSCRIPTION.")
 }

@@ -1887,7 +1887,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `plan_id` | 是 | 要购买的 Plan ID；Plan 必须启用且接受新订阅 |
-| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `paypal`；PayPal 要求 `plan.currency=USD`，WeChat Pay 要求 `plan.currency=CNY` |
+| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `paypal` / `paddle`；PayPal 与 Paddle 要求 `plan.currency=USD`，WeChat Pay 要求 `plan.currency=CNY` |
 
 **响应（201）**：
 ```json
@@ -2013,7 +2013,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `paypal` |
+| `channel` | 是 | `stripe` / `wechat_pay` / `alipay` / `paypal` / `paddle` |
 | `external_txn_id` | 是 | 渠道侧交易 ID（wechat_pay 会与上游查询结果比对） |
 | `expires_at` | 否 | **已废弃：服务端不信任并忽略该 hint**。订阅过期时间由服务端按 `plan.interval_days` 推导（webhook 携带的渠道权威值会被 clamp 到同一上界） |
 
@@ -2039,7 +2039,7 @@ BFF 在前端读 `window.location.hash` 解析参数。**fragment 不会被浏�
 
 | HTTP | message | 触发条件 |
 |------|---------|----------|
-| 400 | `invalid channel` | `channel` 取值不在 `stripe` / `wechat_pay` / `alipay` / `paypal` 之内 |
+| 400 | `invalid channel` | `channel` 取值不在 `stripe` / `wechat_pay` / `alipay` / `paypal` / `paddle` 之内 |
 | 400 | `invalid request body` | 请求体缺失或字段类型错误 |
 | 400 | `payment confirmation is unavailable for this channel; the order will be settled by the channel webhook` | 该渠道无服务端查询能力（stripe/paypal/alipay），由 webhook 结算 |
 | 400 | `payment not confirmed by the channel` | 上游查询未显示与订单匹配的已结算交易（未支付 / txn 不匹配 / 金额不足） |

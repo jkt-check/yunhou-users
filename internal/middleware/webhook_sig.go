@@ -31,7 +31,7 @@ import (
 )
 
 // ChannelSignatureVerifier is the per-channel abstraction. Production wires
-// one verifier per channel (Stripe / WeChat / Alipay) with real secrets loaded
+// one verifier per channel (Stripe / WeChat / Alipay / PayPal / Paddle) with real secrets loaded
 // from env at startup. Tests inject stubs.
 //
 // VerifySignature must:

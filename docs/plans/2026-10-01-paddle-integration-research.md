@@ -146,6 +146,23 @@
 - Paddle 会把订阅的 `custom_data` 传播到续费 transaction,续费 completed 可能**带回原始 order_id**——路由按 origin 判断,绝不按 custom_data 有无判断(否则续费会误进首购路径报 duplicate)。
 - `transaction.payment_failed` 改 audit-only:checkout 内拒付重试**复用同一 transaction**,若按失败翻单,后续成功重试的 completed 会被 `unexpected_state_transition` 卡死,客户付了钱不激活。
 
+---
+
+## 7. Sandbox 实测(2026-10-01,Billing sandbox 真实 webhook 端到端)
+
+**Sandbox 账号**:Billing 后台(paddle.com)左上角直接切 Sandbox 即可,无需单独注册;后台域名同为 sandbox-vendors.paddle.com。之前 vendor_id 126667 的 Classic sandbox 账号弃用(只能生成 legacy auth code,Billing API 一律 403)。
+
+**已配好(API + 后台实操)**:sandbox API key(`pdl_sdbx_apikey_…`)+ client token(`test_…`)、product `pro_01m3vsyck6ng9b0k1k74f0m73y`(kaya-Membership)、月付 price($29.90,对齐本地 plans.monthly_usd)、年付 price($99.99)、default payment link(`https://yunhou.ai/checkout`,域名批准账号级共享,带绿勾)、notification destination(cloudflared 隧道 → 本地 `/webhooks/payment/paddle`,全量 transaction.*/subscription.*/adjustment.* 事件,`pdl_ntfset_…` secret)。
+
+**首购链路实测全绿**:本地 server(真实 sandbox 模式,非 mock)→ `POST /payments/orders`(channel=paddle)→ Paddle checkout 付测试卡 → 真实签名 webhook `transaction.paid`/`completed`/`subscription.created`/`activated` 到达 → order=paid、payment(paddle, $29.90, paid)、subscription active + `external_subscription_id` 盖章、expires_at 按 plan 周期 +30d。webhook 处理耗时毫秒级(5s 预算宽裕)。
+
+**实测抓出并已修的两个真 bug(mock e2e 都测不出来)**:
+
+1. **金额字段位置**:webhook payload 里钱在 `data.details.totals.total`,顶层 `data.totals` 恒为 null(只有 API 返回的 transaction 对象顶层才有 totals)。原实现读顶层 → 真实结算全部 `webhook_amount_mismatch`(event_amount=0)拒结。已改为 details.totals 优先、顶层兜底(commit 7a484fd)。
+2. **税模式与金额校验冲突**:price `tax_mode=location`(默认)时美国买家总价 = 单价 + 税($29.90+$2.65),而严格金额校验拿 webhook 总额对订单快照 → 必拒。**生产 prices 必须设 `tax_mode=internal`(税含价)**,客户看到/付出的就是标价,税从标价里拆。sandbox 两个 price 已改;**live 的 pri_01m36ttg84y5favjtgdjwhy76p / pri_01m36tvbr7pjg4g70bjhx2mq42 上线前必须同样 PATCH**(或确认账号级税设置为含价)。
+
+**其他实测事实**:API 创建的 checkout transaction 的 `origin="api"`(非 "web",路由只特判 `subscription_recurring`,兼容);`include_sensitive_fields` 不影响 details.totals;续费可用 `PATCH /subscriptions {next_billed_at}` 提前(最早 +30min)触发真实续费。
+
 ### 备注
 
 - Onboarding 任务 02(Build checkout)与 03(fulfillment)已由上述 API key + webhook 创建自动变为 In progress;完成代码集成与一次端到端测试后 05(Test and go live)即可点亮。

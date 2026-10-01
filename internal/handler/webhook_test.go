@@ -1139,3 +1139,124 @@ func TestLastPathSegment(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================================
+// Paddle Billing webhook parsing
+// ============================================================================
+
+func TestParsePaddle_TransactionCompleted(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3x",
+	  "event_type": "transaction.completed",
+	  "occurred_at": "2026-10-01T08:00:00Z",
+	  "data": {
+	    "id": "txn_01m3x",
+	    "status": "completed",
+	    "subscription_id": "sub_01m3x",
+	    "currency_code": "USD",
+	    "custom_data": {"order_id": "order-uuid-1"},
+	    "totals": {"total": "999", "subtotal": "999", "tax": "0", "grand_total": "999"}
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Channel != "paddle" || we.EventID != "evt_01m3x" || we.EventType != "transaction.completed" {
+		t.Fatalf("bad envelope: %+v", we)
+	}
+	if we.OrderID != "order-uuid-1" || we.TransactionID != "txn_01m3x" {
+		t.Fatalf("bad ids: %+v", we)
+	}
+	if we.Amount != 9.99 || we.Currency != "USD" {
+		t.Fatalf("amount/currency: %v %s", we.Amount, we.Currency)
+	}
+	if we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("external sub id: %q", we.ExternalSubscriptionID)
+	}
+}
+
+func TestParsePaddle_TransactionBilled(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3y",
+	  "event_type": "transaction.billed",
+	  "data": {
+	    "id": "txn_01m3y",
+	    "subscription_id": "sub_01m3x",
+	    "currency_code": "USD",
+	    "totals": {"total": "999"}
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Amount != 9.99 || we.Currency != "USD" || we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("bad renewal event: %+v", we)
+	}
+}
+
+func TestParsePaddle_TransactionBilledMissingSubID(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.billed","data":{"id":"txn_1","currency_code":"USD","totals":{"total":"999"}}}`)
+	if _, err := h.parsePaddle(raw); err == nil {
+		t.Fatal("expected error for missing subscription_id on renewal")
+	}
+}
+
+func TestParsePaddle_PaymentFailed(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.payment_failed","data":{"id":"txn_1","subscription_id":"sub_1"}}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Amount != 0 || we.TransactionID != "txn_1" || we.ExternalSubscriptionID != "sub_1" {
+		t.Fatalf("bad failed event: %+v", we)
+	}
+}
+
+func TestParsePaddle_SubscriptionUpdated(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3z",
+	  "event_type": "subscription.updated",
+	  "data": {
+	    "id": "sub_01m3x",
+	    "status": "active",
+	    "next_billed_at": "2026-11-01T00:00:00Z"
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("bad sub id: %+v", we)
+	}
+	if we.SubExpiresAt == nil || we.SubExpiresAt.Format(time.RFC3339) != "2026-11-01T00:00:00Z" {
+		t.Fatalf("bad next_billed_at: %v", we.SubExpiresAt)
+	}
+}
+
+func TestParsePaddle_CompletedMissingOrderID(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","totals":{"total":"999"}}}`)
+	if _, err := h.parsePaddle(raw); err == nil {
+		t.Fatal("expected error for missing custom_data.order_id")
+	}
+}
+
+func TestParseEvent_RoutesPaddle(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.payment_failed","data":{"id":"txn_1","subscription_id":"sub_1"}}`)
+	we, err := h.parseEvent("paddle", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Channel != "paddle" || we.TransactionID != "txn_1" {
+		t.Fatalf("bad route: %+v", we)
+	}
+}

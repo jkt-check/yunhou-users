@@ -91,10 +91,14 @@ const ChatMaxMessages = 20
 const ChatMaxMessageBytes = 4 << 20
 
 // ChatMaxSystemBytes bounds a single system message's content length. kaya's
-// rendered system prompt is ~21-23 KB, so system messages get their own
-// budget that matches the client (see MAX_SYSTEM_BYTES in yunhou_chat.rs).
-// This must stay in sync with the client.
-const ChatMaxSystemBytes = 24576
+// rendered system prompt is ~21-24 KB (commander role section, 2026-09-25:
+// en/Windows worst form measured 7 bytes below the old 24576 cap, and the
+// trusted-root path is interpolated ~21x so longer home paths overflow at
+// runtime), so system messages get their own budget that matches the client
+// (see MAX_SYSTEM_BYTES in yunhou_chat.rs). This must stay in sync with the
+// client. Deploy server-first: bumping the client before this lands makes
+// built-in chat hard-fail with 400 "message content too long".
+const ChatMaxSystemBytes = 32768
 
 // ChatMaxTotalBytes bounds the total request size in bytes across all
 // messages. R6: raised 262144 → 4 MiB (same 1M-token rationale as

@@ -36,6 +36,9 @@ func (c *Client) SetClientToken(tok string) { c.clientToken = tok }
 // ClientToken returns the Paddle.js client-side token ("" if unset).
 func (c *Client) ClientToken() string { return c.clientToken }
 
+// IsMockMode reports mock mode (PADDLE_MOCK=1).
+func (c *Client) IsMockMode() bool { return c.MockMode }
+
 // NewClient builds a real-mode client. env selects the API base:
 // "sandbox" → sandbox-api.paddle.com, "live" → api.paddle.com.
 func NewClient(apiKey, env string) (*Client, error) {

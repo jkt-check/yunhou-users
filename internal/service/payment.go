@@ -658,7 +658,8 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 			if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
 				// 渠道侧自动续费订阅（PayPal / Paddle）与 WeChat 的根本差
 				// 异：渠道侧自动扣费（PAYMENT.SALE.COMPLETED /
-				// transaction.billed webhook 延期），用户无需也不应手动
+				// transaction.completed (origin=subscription_recurring)
+				// webhook 延期），用户无需也不应手动
 				// "续费"。这里每放行一单，BFF 就在渠道侧创建一个全新的
 				// subscription 对象（重新吃 plan 内嵌的 trial），而旧订阅仍在
 				// 自动扣费 → 双重扣费（2026-08-17 intl-staging 验收实测同一

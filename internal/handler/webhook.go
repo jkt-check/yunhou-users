@@ -786,6 +786,13 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 			}
 			if total != "" {
 				v, err := strconv.ParseFloat(total, 64)
+				if err != nil && txn.Totals.Total != "" && txn.Totals.Total != total {
+					// details value malformed but an API-shaped
+					// top-level total exists — try it before
+					// giving up on the amount.
+					total = txn.Totals.Total
+					v, err = strconv.ParseFloat(total, 64)
+				}
 				if err != nil {
 					log.Printf("paddle: event %s has unparseable totals.total %q: %v", evt.EventID, total, err)
 				} else {

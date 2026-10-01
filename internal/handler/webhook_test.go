@@ -1306,13 +1306,25 @@ func TestParsePaddle_SubscriptionUpdated(t *testing.T) {
 // when both are present (webhook payloads carry null top-level totals).
 func TestParsePaddle_TopLevelTotalsFallback(t *testing.T) {
 	h := &WebhookHandler{}
-	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"999"}}}`)
-	we, err := h.parsePaddle(raw)
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name   string
+		raw    string
+		amount float64
+	}{
+		{"details absent falls back to top-level", `{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"999"}}}`, 9.99},
+		{"details wins on conflict", `{"event_id":"evt_2","event_type":"transaction.completed","data":{"id":"txn_2","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"111"},"details":{"totals":{"total":"999"}}}}`, 9.99},
+		{"malformed details falls back to top-level", `{"event_id":"evt_3","event_type":"transaction.completed","data":{"id":"txn_3","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"999"},"details":{"totals":{"total":"abc"}}}}`, 9.99},
 	}
-	if we.Amount != 9.99 {
-		t.Fatalf("fallback amount: %v", we.Amount)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			we, err := h.parsePaddle([]byte(c.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if we.Amount != c.amount {
+				t.Fatalf("amount: got %v want %v", we.Amount, c.amount)
+			}
+		})
 	}
 }
 

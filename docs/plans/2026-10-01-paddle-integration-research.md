@@ -163,6 +163,8 @@
 
 **其他实测事实**:API 创建的 checkout transaction 的 `origin="api"`(非 "web",路由只特判 `subscription_recurring`,兼容);`include_sensitive_fields` 不影响 details.totals;续费可用 `PATCH /subscriptions {next_billed_at}` 提前(最早 +30min)触发真实续费。
 
+**续费链路实测全绿(复审 Critical 修复的真实验收)**:把订阅 `next_billed_at` 提前 31 分钟触发真实续费,实际事件序列与官方文档完全一致:`subscription.updated` → `transaction.created` → `transaction.billed`(22:48:36,开票)→ `transaction.paid` → `transaction.completed`(22:49:14,收款完成)。我方行为逐项验证:① billed 到达时**零记账**(payment 的 paid_at=22:49:14 而非 billed 时刻);② 续费 completed 的 `origin=subscription_recurring` 且**确实带回了原始 order_id**(custom_data 传播实锤,origin 路由必要性的真实证据);③ 合成续费 order + payment(paddle, $29.90, paid)正确入账,原订单不受影响;④ `expires_at` 延期到 Paddle API 返回的新 `next_billed_at`(2026-11-01 22:48:36,渠道权威值,非 plan.interval_days 兜底);⑤ 审计行只有一条 `paddle_subscription_renewed`,无 no_expiry_hint/amount_mismatch。
+
 ### 备注
 
 - Onboarding 任务 02(Build checkout)与 03(fulfillment)已由上述 API key + webhook 创建自动变为 In progress;完成代码集成与一次端到端测试后 05(Test and go live)即可点亮。

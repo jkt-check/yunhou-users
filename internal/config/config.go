@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -142,6 +143,24 @@ type Config struct {
 	// every delivery 401s — main.go warns loudly at startup.
 	PaypalClientID     string
 	PaypalClientSecret string
+
+	// Paddle Billing:sandbox + live 共用一套变量,PaddleEnv 选择环境。
+	// 空 PaddleEnv = 渠道未启用(webhook 404、下单拒绝)。PADDLE_MOCK=1
+	// 时全部凭据可空(mock 只查签名头存在性 + 时间窗,客户端返回 canned 值,
+	// 与 WECHAT_PAY_MOCK 同款语义,仅允许非生产 APP_ENV)。
+	PaddleEnv           string // "" | "sandbox" | "live"
+	PaddleAPIKey        string
+	PaddleWebhookSecret string
+	// PaddleClientToken is the Paddle.js client-side token. Safe to hand to
+	// the BFF — it only authorizes opening checkouts / previewing prices.
+	// Echoed in orders.provider_intent.client_token for overlay checkouts.
+	PaddleClientToken string
+	PaddleMock        bool
+	// PaddlePricesJSON is the raw PADDLE_PRICES_JSON env (plan_id → Paddle
+	// price_id map); Validate parses it into PaddlePrices. Empty = paddle
+	// orders refused at runtime (ErrPaddlePriceNotConfigured).
+	PaddlePricesJSON string
+	PaddlePrices     map[string]string
 
 	// Order expiry: how long a pending order is valid before the sweeper
 	// flips it to 'expired'. Default 30 min per design doc §"v1 decisions".
@@ -314,6 +333,13 @@ func Load() *Config {
 		PaypalAPIBaseLive:      envOr("PAYPAL_API_BASE_LIVE", "https://api-m.paypal.com"),
 		PaypalClientID:         os.Getenv("PAYPAL_CLIENT_ID"),
 		PaypalClientSecret:     os.Getenv("PAYPAL_CLIENT_SECRET"),
+
+		PaddleEnv:           envOr("PADDLE_ENV", ""),
+		PaddleAPIKey:        os.Getenv("PADDLE_API_KEY"),
+		PaddleWebhookSecret: os.Getenv("PADDLE_WEBHOOK_SECRET"),
+		PaddleClientToken:   os.Getenv("PADDLE_CLIENT_TOKEN"),
+		PaddleMock:          os.Getenv("PADDLE_MOCK") == "1",
+		PaddlePricesJSON:    os.Getenv("PADDLE_PRICES_JSON"),
 
 		OrderExpiryDuration: parseDurationOr(envOr("ORDER_EXPIRY_DURATION", "30m"), 30*time.Minute),
 		SweeperInterval:     parseDurationOr(envOr("SWEEPER_INTERVAL", "1m"), 1*time.Minute),
@@ -517,6 +543,59 @@ func (c *Config) Validate() error {
 	// the PayPal-side analog of the WeChat guard above.
 	if c.PaypalL3E2EMode && c.PaypalClientID != "" && c.PaypalClientSecret != "" {
 		return errors.New("PAYPAL_L3_E2E_MODE must not be enabled when real PayPal client credentials (PAYPAL_CLIENT_ID/PAYPAL_CLIENT_SECRET) are configured")
+	}
+	// Paddle Billing:PaddleEnv 为空 = 渠道未启用,全部校验跳过。
+	switch c.PaddleEnv {
+	case "", "sandbox", "live":
+	default:
+		return fmt.Errorf("PADDLE_ENV must be empty, sandbox, or live, got %q", c.PaddleEnv)
+	}
+	// Half-configured deployments must fail fast at boot, not at runtime:
+	// main.go wires the webhook verifier on the secret alone, so a
+	// secret-without-env deployment would accept webhooks while refusing
+	// orders and 500ing every renewal (paddle client never wired) — an
+	// infinite Paddle retry loop with no startup signal.
+	if c.PaddleEnv == "" && !c.PaddleMock {
+		if c.PaddleAPIKey != "" || c.PaddleWebhookSecret != "" || c.PaddleClientToken != "" {
+			return errors.New("PADDLE_ENV is required when PADDLE_API_KEY / PADDLE_WEBHOOK_SECRET / PADDLE_CLIENT_TOKEN is set (or enable PADDLE_MOCK for dev/e2e)")
+		}
+	}
+	if c.PaddleMock {
+		if IsProductionEnv(c.AppEnv) {
+			return errors.New("PADDLE_MOCK must not be enabled when APP_ENV is production (set APP_ENV to a non-production value like dev/staging to use mock switches)")
+		}
+		if c.PaddleEnv == "live" {
+			return errors.New("PADDLE_MOCK must not be enabled when PADDLE_ENV=live")
+		}
+		if c.PaddleAPIKey != "" {
+			return errors.New("PADDLE_MOCK must not be enabled when real PADDLE_API_KEY is configured")
+		}
+	}
+	if c.PaddleEnv != "" && !c.PaddleMock {
+		if c.PaddleAPIKey == "" {
+			return errors.New("PADDLE_API_KEY is required when PADDLE_ENV is set (or enable PADDLE_MOCK for dev/e2e)")
+		}
+		if c.PaddleWebhookSecret == "" {
+			return errors.New("PADDLE_WEBHOOK_SECRET is required when PADDLE_ENV is set")
+		}
+		if c.PaddlePricesJSON == "" {
+			return errors.New("PADDLE_PRICES_JSON is required when PADDLE_ENV is set (plan_id → price_id map)")
+		}
+	}
+	if c.PaddlePricesJSON != "" {
+		m := map[string]string{}
+		if err := json.Unmarshal([]byte(c.PaddlePricesJSON), &m); err != nil {
+			return fmt.Errorf("PADDLE_PRICES_JSON must be a JSON object of plan_id → price_id: %v", err)
+		}
+		for planID, priceID := range m {
+			if planID == "" || !strings.HasPrefix(priceID, "pri_") {
+				return fmt.Errorf("PADDLE_PRICES_JSON entry %q must map to a price_id (pri_...), got %q", planID, priceID)
+			}
+		}
+		if c.PaddleEnv != "" && !c.PaddleMock && len(m) == 0 {
+			return errors.New("PADDLE_PRICES_JSON must not be empty when PADDLE_ENV is set")
+		}
+		c.PaddlePrices = m
 	}
 	// APIv3Key is 32 bytes exactly — used both as the HMAC key for
 	// inbound signature verification and as the AES-GCM key for resource

@@ -34,6 +34,9 @@ import (
 //     registered merchant.
 //   - Alipay  : application/x-www-form-urlencoded, out_trade_no IS the order_id,
 //     total_amount is in major units (no conversion)
+//   - Paddle  : application/json, uniform envelope {event_id, event_type, data};
+//     transaction.* data carries custom_data.order_id + totals.total (MINOR
+//     units → divide by 100); subscription.* data carries id + next_billed_at
 type WebhookHandler struct {
 	svc           service.PaymentServiceInterface
 	wechatKey     []byte // WECHAT_PAY_API_V3_KEY — fallback if verifier can't decrypt
@@ -120,6 +123,8 @@ func (h *WebhookHandler) parseEvent(channel string, raw []byte) (*service.Webhoo
 		return h.parseAlipay(raw)
 	case "paypal":
 		return h.parsePaypal(raw)
+	case "paddle":
+		return h.parsePaddle(raw)
 	default:
 		return nil, fmt.Errorf("unsupported channel: %s", channel)
 	}
@@ -433,7 +438,7 @@ func (h *WebhookHandler) parseAlipay(raw []byte) (*service.WebhookEvent, error) 
 	// 创建"触发）、TRADE_INVALID 及任何未来新增状态映射为惰性类型
 	// "trade_pending"——OnWebhook 落 default 分支（domain_action="none"
 	// 的 audit-only ack 200，零域动作）。缺 default 时未识别状态会穿透
-	// notify_type=trade_status_sync 被 isPaymentSuccess 当支付成功：金额
+	// notify_type=trade_status_sync 被 dispatchBranch 当支付成功：金额
 	// 校验通过 → 钱未到账权益永久生效。
 	eventType := notifyType
 	switch tradeStatus {
@@ -662,8 +667,8 @@ func isPaypalRefundEvent(eventType string) bool {
 }
 
 // isPaypalSubscriptionEvent is local to the handler — it covers BILLING.SUBSCRIPTION.*
-// (created/updated/cancelled). The renewal predicate `isPaypalRenewal` lives
-// in service/payment.go because it's part of the OnWebhook dispatch table.
+// (created/updated/cancelled). The renewal mapping for PAYMENT.SALE.COMPLETED
+// lives in service.channelWebhookBranches (the OnWebhook dispatch table).
 func isPaypalSubscriptionEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "BILLING.SUBSCRIPTION.")
 }
@@ -672,6 +677,158 @@ func isPaypalSubscriptionEvent(eventType string) bool {
 // do not. Use this to drive amount-parsing strictness in parsePaypal.
 func isPaypalLifecycleEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "BILLING.")
+}
+
+// paddleTotals mirrors the minor-unit money block Paddle nests under
+// data.details.totals (webhook payloads) or data.totals (API-shaped).
+type paddleTotals struct {
+	Total string `json:"total"` // minor units, e.g. "999"
+}
+
+// parsePaddle extracts fields from a Paddle Billing webhook. Paddle's
+// event envelope is uniform across event types:
+//
+//	{
+//	  "event_id":    "evt_...",
+//	  "event_type":  "transaction.completed" | "transaction.billed" | ...,
+//	  "occurred_at": "...",
+//	  "data":        { ...transaction or subscription object... }
+//	}
+//
+// transaction.* data: id (txn_...), subscription_id, origin, custom_data,
+// currency_code, details.totals.total — the total is a MINOR-unit string
+// ("999" = $9.99), normalized to major units like the Stripe cents path.
+// (Webhook payloads nest totals under details; the top-level totals field
+// is null there. Verified against live sandbox payloads 2026-10-01.)
+// origin="subscription_recurring" marks a channel-side auto-renewal charge;
+// initial checkout transactions are origin="web"/"api". Paddle propagates
+// subscription custom_data onto renewal transactions, so a renewal
+// transaction.completed may echo the ORIGINAL order_id — routing keys on
+// origin, never on custom_data presence.
+//
+// Parsing is deliberately lenient for money events: a settlement event we
+// cannot make sense of must still reach the service so the webhook_events
+// row (raw payload) is written as the audit trail — a parse error here
+// would 400 before that insert and Paddle would retry forever with zero
+// trace. Field-level problems surface as domain audits downstream.
+//
+// subscription.* data: id (sub_...), next_billed_at (RFC3339), status.
+// subscription.* events carry no transaction: settlement is anchored on
+// transaction.* money events only, so these ride the audit-only default
+// branch in the service — we lift just the identifiers for visibility.
+func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) {
+	var evt struct {
+		EventID   string          `json:"event_id"`
+		EventType string          `json:"event_type"`
+		Data      json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &evt); err != nil {
+		return nil, fmt.Errorf("paddle body: %w", err)
+	}
+	if evt.EventID == "" || evt.EventType == "" {
+		return nil, fmt.Errorf("paddle missing event_id or event_type")
+	}
+
+	we := &service.WebhookEvent{
+		Channel:   "paddle",
+		EventID:   evt.EventID,
+		EventType: evt.EventType,
+	}
+
+	switch {
+	case strings.HasPrefix(evt.EventType, "transaction."):
+		var txn struct {
+			ID             string         `json:"id"`
+			SubscriptionID string         `json:"subscription_id"`
+			Origin         string         `json:"origin"`
+			CurrencyCode   string         `json:"currency_code"`
+			CustomData     map[string]any `json:"custom_data"`
+			// Real webhook payloads carry the settled money under
+			// details.totals — the transaction object's top-level
+			// `totals` is null in notifications (verified against live
+			// sandbox transaction.completed payloads, 2026-10-01). The
+			// top-level Totals stays as a fallback for API-shaped bodies.
+			Totals  paddleTotals `json:"totals"`
+			Details struct {
+				Totals paddleTotals `json:"totals"`
+			} `json:"details"`
+		}
+		if err := json.Unmarshal(evt.Data, &txn); err != nil {
+			return nil, fmt.Errorf("paddle transaction data: %w", err)
+		}
+		if txn.ID == "" {
+			// data.id is the channel-side transaction id; empty would
+			// collapse payments.(channel, external_txn_id) dedupe onto
+			// one row for every malformed event.
+			return nil, fmt.Errorf("paddle missing data.id")
+		}
+		we.TransactionID = txn.ID
+		we.Currency = strings.ToUpper(txn.CurrencyCode)
+		we.ExternalSubscriptionID = txn.SubscriptionID
+		we.Origin = txn.Origin
+		if orderID, _ := txn.CustomData["order_id"].(string); orderID != "" {
+			we.OrderID = orderID
+		}
+
+		switch evt.EventType {
+		case "transaction.completed", "transaction.billed":
+			// Money events: lift the settled amount when present and
+			// well-formed, but never hard-fail — see the leniency note in
+			// the parsePaddle doc comment. transaction.completed doubles
+			// as initial settlement (origin=web/api) and renewal
+			// settlement (origin=subscription_recurring); the service
+			// routes on we.Origin. transaction.billed fires at invoice
+			// ISSUANCE, before collection, and stays audit-only — the
+			// amount is lifted purely for the audit trail.
+			total := txn.Details.Totals.Total
+			if total == "" {
+				total = txn.Totals.Total
+			}
+			if total != "" {
+				v, err := strconv.ParseFloat(total, 64)
+				if err != nil && txn.Totals.Total != "" && txn.Totals.Total != total {
+					// details value malformed but an API-shaped
+					// top-level total exists — try it before
+					// giving up on the amount.
+					total = txn.Totals.Total
+					v, err = strconv.ParseFloat(total, 64)
+				}
+				if err != nil {
+					log.Printf("paddle: event %s has unparseable totals.total %q: %v", evt.EventID, total, err)
+				} else {
+					we.Amount = v / 100 // minor units → major units
+				}
+			}
+		case "transaction.payment_failed":
+			// No settlement: amount stays 0. Audit-only in the service —
+			// a declined checkout attempt retries inside the same Paddle
+			// transaction, so flipping anything failed here would strand
+			// the paid retry.
+		}
+
+	case strings.HasPrefix(evt.EventType, "subscription."):
+		var sub struct {
+			ID           string `json:"id"`
+			NextBilledAt string `json:"next_billed_at"`
+		}
+		if err := json.Unmarshal(evt.Data, &sub); err != nil {
+			return nil, fmt.Errorf("paddle subscription data: %w", err)
+		}
+		if sub.ID == "" {
+			return nil, fmt.Errorf("paddle missing data.id")
+		}
+		we.ExternalSubscriptionID = sub.ID
+		if sub.NextBilledAt != "" {
+			if t, err := time.Parse(time.RFC3339, sub.NextBilledAt); err == nil {
+				we.SubExpiresAt = &t
+			} else {
+				// Don't fail the whole event for a malformed hint — the
+				// renewal path falls back to "audit + no extension".
+				log.Printf("paddle: invalid next_billed_at %q for event %s: %v", sub.NextBilledAt, evt.EventID, err)
+			}
+		}
+	}
+	return we, nil
 }
 
 // lastPathSegment returns the trailing non-empty path segment of a URL.

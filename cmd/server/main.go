@@ -22,6 +22,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/yunhou/users/internal/billing/paypal"
+	"github.com/yunhou/users/internal/billing/paddle"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/handler"
@@ -113,6 +114,23 @@ func main() {
 		wechatClient = nil
 	}
 
+	// Paddle Billing client. Mock mode (PADDLE_MOCK=1) needs no
+	// credentials and serves canned responses; real mode requires
+	// PADDLE_API_KEY + PADDLE_ENV (validated in config.Validate). Built as
+	// *paddle.Client here; the payment service is only handed a non-nil
+	// interface below (typed-nil would defeat the providerPreAuth gate).
+	var paddleClient *paddle.Client
+	if cfg.PaddleMock {
+		paddleClient = &paddle.Client{MockMode: true}
+	} else if cfg.PaddleEnv != "" {
+		pc, err := paddle.NewClient(cfg.PaddleAPIKey, cfg.PaddleEnv)
+		if err != nil {
+			log.Fatalf("paddle: %v", err)
+		}
+		pc.SetClientToken(cfg.PaddleClientToken)
+		paddleClient = pc
+	}
+
 	db, err := sqlx.Connect("postgres", cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("failed to connect to database: %v", err)
@@ -169,6 +187,15 @@ func main() {
 		wechatClient,
 		cfg.OrderExpiryDuration,
 	)
+	// Paddle wiring is gated on a constructed client: assigning a typed-nil
+	// *paddle.Client to the interface would make s.paddle non-nil and
+	// bypass the providerPreAuth gate.
+	if paddleClient != nil {
+		paymentSvc.SetPaddleClient(paddleClient)
+	}
+	if len(cfg.PaddlePrices) > 0 {
+		paymentSvc.SetPaddlePrices(cfg.PaddlePrices)
+	}
 
 	// Validate PayPal environment BEFORE building anything that depends on it.
 	// config.PaypalEnv 默认 ""（cn 域不启用 PayPal）。空值 = 未启用：webhook
@@ -732,6 +759,16 @@ func buildWebhookVerifier(cfg *config.Config, wechatSigner *wechat.Signer, wecha
 		mv.Paypal = pv
 	} else if cfg.PaypalEnv != "" {
 		log.Printf("paypal: PAYPAL_ENV=%q is not sandbox|live, channel will return 404", cfg.PaypalEnv)
+	}
+	// Paddle verifier: wired when EITHER a webhook secret is present OR
+	// mock mode is enabled (mock short-circuits on header presence, like
+	// the WeChat mock verifier — an empty secret is safe there). Otherwise
+	// the paddle channel returns 404 (not configured).
+	if cfg.PaddleWebhookSecret != "" || cfg.PaddleMock {
+		mv.Paddle = &middleware.PaddleVerifier{
+			Secret:   []byte(cfg.PaddleWebhookSecret),
+			MockMode: cfg.PaddleMock,
+		}
 	}
 	return mv
 }

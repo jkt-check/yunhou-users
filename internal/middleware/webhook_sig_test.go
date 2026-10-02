@@ -1618,3 +1618,80 @@ func TestWeChatPayV3_UnknownPlatformSerial_Transient(t *testing.T) {
 		t.Errorf("expected non-nil error")
 	}
 }
+
+// ============================================================================
+// Paddle Billing — HMAC-SHA256 over "ts:body" (semicolon-separated header)
+// ============================================================================
+
+func signPaddle(secret string, body []byte, ts int64) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(fmt.Sprintf("%d:%s", ts, body)))
+	return fmt.Sprintf("ts=%d;h1=%x", ts, mac.Sum(nil))
+}
+
+func TestPaddleVerifier_OK(t *testing.T) {
+	v := &PaddleVerifier{Secret: []byte("whsec_test")}
+	body := []byte(`{"event_id":"evt_1"}`)
+	hdr := signPaddle("whsec_test", body, time.Now().Unix())
+	if err := v.VerifySignature("paddle", body, map[string]string{"Paddle-Signature": hdr}); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestPaddleVerifier_RotationAcceptsAnyH1(t *testing.T) {
+	v := &PaddleVerifier{Secret: []byte("whsec_test")}
+	body := []byte(`{"event_id":"evt_1"}`)
+	ts := time.Now().Unix()
+	hdr := signPaddle("whsec_old", body, ts) + ";" + signPaddle("whsec_test", body, ts)[strings.IndexByte(signPaddle("whsec_test", body, ts), ';')+1:]
+	if err := v.VerifySignature("paddle", body, map[string]string{"Paddle-Signature": hdr}); err != nil {
+		t.Fatalf("rotation: expected match on second h1, got %v", err)
+	}
+}
+
+func TestPaddleVerifier_BadSignature(t *testing.T) {
+	v := &PaddleVerifier{Secret: []byte("whsec_test")}
+	body := []byte(`{"event_id":"evt_1"}`)
+	hdr := signPaddle("whsec_OTHER", body, time.Now().Unix())
+	if err := v.VerifySignature("paddle", body, map[string]string{"Paddle-Signature": hdr}); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("expected ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestPaddleVerifier_MissingHeader(t *testing.T) {
+	v := &PaddleVerifier{Secret: []byte("whsec_test")}
+	if err := v.VerifySignature("paddle", []byte(`{}`), map[string]string{}); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("expected ErrInvalidSignature, got %v", err)
+	}
+}
+
+func TestPaddleVerifier_StaleTimestamp(t *testing.T) {
+	v := &PaddleVerifier{Secret: []byte("whsec_test")}
+	body := []byte(`{}`)
+	hdr := signPaddle("whsec_test", body, time.Now().Add(-10*time.Minute).Unix())
+	if err := v.VerifySignature("paddle", body, map[string]string{"Paddle-Signature": hdr}); !errors.Is(err, ErrTimestampOutOfRange) {
+		t.Fatalf("expected ErrTimestampOutOfRange, got %v", err)
+	}
+}
+
+func TestPaddleVerifier_MockModeHeaderPresence(t *testing.T) {
+	v := &PaddleVerifier{MockMode: true}
+	body := []byte(`{}`)
+	hdr := signPaddle("any", body, time.Now().Unix())
+	if err := v.VerifySignature("paddle", body, map[string]string{"Paddle-Signature": hdr}); err != nil {
+		t.Fatalf("mock mode should accept, got %v", err)
+	}
+	if err := v.VerifySignature("paddle", body, map[string]string{}); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("mock mode must still require the header, got %v", err)
+	}
+}
+
+func TestMultiChannelVerifier_PaddleRouting(t *testing.T) {
+	mv := &MultiChannelVerifier{Paddle: &PaddleVerifier{Secret: []byte("s")}}
+	if err := mv.VerifySignature("paddle", []byte(`{}`), map[string]string{"Paddle-Signature": "ts=1;h1=aa"}); !errors.Is(err, ErrTimestampOutOfRange) {
+		t.Fatalf("expected paddle routing + timestamp rejection, got %v", err)
+	}
+	mvNil := &MultiChannelVerifier{}
+	if err := mvNil.VerifySignature("paddle", []byte(`{}`), map[string]string{"Paddle-Signature": "x"}); !errors.Is(err, ErrUnsupportedChannel) {
+		t.Fatalf("expected ErrUnsupportedChannel for nil paddle, got %v", err)
+	}
+}

@@ -1139,3 +1139,203 @@ func TestLastPathSegment(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================================
+// Paddle Billing webhook parsing
+// ============================================================================
+
+func TestParsePaddle_TransactionCompleted(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3x",
+	  "event_type": "transaction.completed",
+	  "occurred_at": "2026-10-01T08:00:00Z",
+	  "data": {
+	    "id": "txn_01m3x",
+	    "status": "completed",
+	    "subscription_id": "sub_01m3x",
+	    "origin": "web",
+	    "currency_code": "USD",
+	    "custom_data": {"order_id": "order-uuid-1"},
+	    "totals": null,
+	    "details": {"totals": {"total": "999", "subtotal": "999", "tax": "0", "grand_total": "999"}}
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Channel != "paddle" || we.EventID != "evt_01m3x" || we.EventType != "transaction.completed" {
+		t.Fatalf("bad envelope: %+v", we)
+	}
+	if we.OrderID != "order-uuid-1" || we.TransactionID != "txn_01m3x" {
+		t.Fatalf("bad ids: %+v", we)
+	}
+	if we.Amount != 9.99 || we.Currency != "USD" {
+		t.Fatalf("amount/currency: %v %s", we.Amount, we.Currency)
+	}
+	if we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("external sub id: %q", we.ExternalSubscriptionID)
+	}
+	if we.Origin != "web" {
+		t.Fatalf("origin: %q", we.Origin)
+	}
+}
+
+// Renewal settlement arrives as transaction.completed with
+// origin=subscription_recurring. Paddle may echo the ORIGINAL order_id via
+// propagated subscription custom_data — parse must surface both fields and
+// let the service route on origin.
+func TestParsePaddle_RenewalCompleted(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3r",
+	  "event_type": "transaction.completed",
+	  "data": {
+	    "id": "txn_01m3r",
+	    "status": "completed",
+	    "subscription_id": "sub_01m3x",
+	    "origin": "subscription_recurring",
+	    "currency_code": "USD",
+	    "custom_data": {"order_id": "order-uuid-ORIGINAL"},
+	    "totals": null,
+	    "details": {"totals": {"total": "999"}}
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Origin != "subscription_recurring" {
+		t.Fatalf("origin: %q", we.Origin)
+	}
+	if we.OrderID != "order-uuid-ORIGINAL" || we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("ids: %+v", we)
+	}
+	if we.Amount != 9.99 || we.Currency != "USD" {
+		t.Fatalf("amount/currency: %v %s", we.Amount, we.Currency)
+	}
+}
+
+func TestParsePaddle_TransactionBilled(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3y",
+	  "event_type": "transaction.billed",
+	  "data": {
+	    "id": "txn_01m3y",
+	    "subscription_id": "sub_01m3x",
+	    "origin": "subscription_recurring",
+	    "currency_code": "USD",
+	    "totals": null,
+	    "details": {"totals": {"total": "999"}}
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Amount != 9.99 || we.Currency != "USD" || we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("bad billed event: %+v", we)
+	}
+}
+
+// Money events parse leniently: a settlement event missing optional fields
+// must still reach the service (and the webhook_events audit row) instead
+// of 400ing before the insert and retrying forever with zero trace.
+func TestParsePaddle_LenientOnMissingFields(t *testing.T) {
+	h := &WebhookHandler{}
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"completed missing order_id", `{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","details":{"totals":{"total":"999"}}}}`},
+		{"completed missing totals", `{"event_id":"evt_2","event_type":"transaction.completed","data":{"id":"txn_2","currency_code":"USD","custom_data":{"order_id":"o-1"}}}`},
+		{"completed unparseable total", `{"event_id":"evt_3","event_type":"transaction.completed","data":{"id":"txn_3","currency_code":"USD","custom_data":{"order_id":"o-1"},"details":{"totals":{"total":"abc"}}}}`},
+		{"billed missing subscription_id", `{"event_id":"evt_4","event_type":"transaction.billed","data":{"id":"txn_4","currency_code":"USD","details":{"totals":{"total":"999"}}}}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			we, err := h.parsePaddle([]byte(c.raw))
+			if err != nil {
+				t.Fatalf("lenient parse must not error: %v", err)
+			}
+			if we.TransactionID == "" {
+				t.Fatalf("transaction id must still be lifted: %+v", we)
+			}
+		})
+	}
+}
+
+func TestParsePaddle_PaymentFailed(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.payment_failed","data":{"id":"txn_1","subscription_id":"sub_1"}}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Amount != 0 || we.TransactionID != "txn_1" || we.ExternalSubscriptionID != "sub_1" {
+		t.Fatalf("bad failed event: %+v", we)
+	}
+}
+
+func TestParsePaddle_SubscriptionUpdated(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_01m3z",
+	  "event_type": "subscription.updated",
+	  "data": {
+	    "id": "sub_01m3x",
+	    "status": "active",
+	    "next_billed_at": "2026-11-01T00:00:00Z"
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.ExternalSubscriptionID != "sub_01m3x" {
+		t.Fatalf("bad sub id: %+v", we)
+	}
+	if we.SubExpiresAt == nil || we.SubExpiresAt.Format(time.RFC3339) != "2026-11-01T00:00:00Z" {
+		t.Fatalf("bad next_billed_at: %v", we.SubExpiresAt)
+	}
+}
+
+// API-shaped bodies (top-level totals) still parse — details.totals wins
+// when both are present (webhook payloads carry null top-level totals).
+func TestParsePaddle_TopLevelTotalsFallback(t *testing.T) {
+	h := &WebhookHandler{}
+	cases := []struct {
+		name   string
+		raw    string
+		amount float64
+	}{
+		{"details absent falls back to top-level", `{"event_id":"evt_1","event_type":"transaction.completed","data":{"id":"txn_1","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"999"}}}`, 9.99},
+		{"details wins on conflict", `{"event_id":"evt_2","event_type":"transaction.completed","data":{"id":"txn_2","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"111"},"details":{"totals":{"total":"999"}}}}`, 9.99},
+		{"malformed details falls back to top-level", `{"event_id":"evt_3","event_type":"transaction.completed","data":{"id":"txn_3","currency_code":"USD","custom_data":{"order_id":"o-1"},"totals":{"total":"999"},"details":{"totals":{"total":"abc"}}}}`, 9.99},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			we, err := h.parsePaddle([]byte(c.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if we.Amount != c.amount {
+				t.Fatalf("amount: got %v want %v", we.Amount, c.amount)
+			}
+		})
+	}
+}
+
+func TestParseEvent_RoutesPaddle(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_1","event_type":"transaction.payment_failed","data":{"id":"txn_1","subscription_id":"sub_1"}}`)
+	we, err := h.parseEvent("paddle", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.Channel != "paddle" || we.TransactionID != "txn_1" {
+		t.Fatalf("bad route: %+v", we)
+	}
+}

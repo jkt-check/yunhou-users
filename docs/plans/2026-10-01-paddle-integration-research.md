@@ -105,10 +105,10 @@
 1. **Live API key 已创建并验证可用**:名称 `yunhou-users-prod`,权限 Read+Write 全量(本想最小权限,但 Dashboard 权限列表虚拟化导致单项勾选不可用,先全量、后续可在 Dashboard 收紧),**永不过期**(未选 90 天,避免 12 月 30 日过期导致支付中断)。已用 `GET https://api.paddle.com/products` 实测返回正常。
 2. **Client-side token 已创建**(Paddle.js 前端用):名称 `yunhou-web-prod`,`live_7248d1ffd31c6ce970817c8e8b4`。
 3. **Webhook 通知目的地已创建(Active)**:
-   - URL:`https://api.yunhouai.com/webhooks/payment/paddle`(api.yunhouai.com 已实测 `/healthz` 200)
+   - URL:`https://api.yunhou.ai/webhooks/payment/paddle`(**2026-10-02 已从 api.yunhouai.com 修正**——Paddle 只上国际站,与 PayPal 一致;国际站 API 域名是 api.yunhou.ai,intl-prod 47.77.204.127,Cloudflare 前置。api.yunhouai.com 指向国内 prod,是错误目标)
    - 描述:yunhou-users paddle webhook (prod);API version 1;Usage: Platform
    - 事件:All(56 个;后端解析器会忽略不处理的类型,后续可在 Dashboard 收紧为 transaction.*/subscription.*/adjustment.*)
-   - Secret key 已获取(`pdl_ntfset_01m3v0c...`,见 `.env`)
+   - Secret key 已获取(`pdl_ntfset_01m3v0c...`,见 `.env`;改 destination 不轮换 secret)
 4. **价格已核对**:Paddle Catalog $9.99/月、$99.99/年 与官网 yunhou.ai/terminal#pricing 的 USD 定价完全一致 ✅(Paddle 是 intl USD 定价的权威源,PayPal intl 尚未启用)。
 5. **三个凭证已存入项目 `.env`**(已被 .gitignore 忽略,chmod 600):`PADDLE_ENV=live`、`PADDLE_API_KEY`、`PADDLE_CLIENT_TOKEN`、`PADDLE_WEBHOOK_SECRET`。
 
@@ -159,7 +159,7 @@
 **实测抓出并已修的两个真 bug(mock e2e 都测不出来)**:
 
 1. **金额字段位置**:webhook payload 里钱在 `data.details.totals.total`,顶层 `data.totals` 恒为 null(只有 API 返回的 transaction 对象顶层才有 totals)。原实现读顶层 → 真实结算全部 `webhook_amount_mismatch`(event_amount=0)拒结。已改为 details.totals 优先、顶层兜底(commit 7a484fd)。
-2. **税模式与金额校验冲突**:price `tax_mode=location`(默认)时美国买家总价 = 单价 + 税($29.90+$2.65),而严格金额校验拿 webhook 总额对订单快照 → 必拒。**生产 prices 必须设 `tax_mode=internal`(税含价)**,客户看到/付出的就是标价,税从标价里拆。sandbox 两个 price 已改;**live 的 pri_01m36ttg84y5favjtgdjwhy76p / pri_01m36tvbr7pjg4g70bjhx2mq42 上线前必须同样 PATCH**(或确认账号级税设置为含价)。
+2. **税模式与金额校验冲突**:price `tax_mode=location`(默认)时美国买家总价 = 单价 + 税($29.90+$2.65),而严格金额校验拿 webhook 总额对订单快照 → 必拒。**生产 prices 必须设 `tax_mode=internal`(税含价)**,客户看到/付出的就是标价,税从标价里拆。sandbox 两个 price 已改;**live 的 pri_01m36ttg84y5favjtgdjwhy76p / pri_01m36tvbr7pjg4g70bjhx2mq42 已于 2026-10-02 用 live API key PATCH 为 internal** ✅。
 
 **其他实测事实**:API 创建的 checkout transaction 的 `origin="api"`(非 "web",路由只特判 `subscription_recurring`,兼容);`include_sensitive_fields` 不影响 details.totals;续费可用 `PATCH /subscriptions {next_billed_at}` 提前(最早 +30min)触发真实续费。
 
@@ -176,9 +176,21 @@
 
 1. ~~前端结账形态~~:client-side token 已生成,Paddle.js overlay 与 hosted checkout 都可用,建议 overlay;最终形态在代码集成时定。
 2. ~~定价核对~~:已核对,与官网 USD 定价一致。
-3. webhook 公网域名:已确认为 `api.yunhouai.com`(healthz 200)。
-4. `coding-plan`(模型 API 套餐)是否也要走 Paddle,还是先只接 `kaya-membership`?(影响 `PaymentProvidersConfig.Paddle` 的 plan 映射范围)
+3. ~~webhook 公网域名~~:已修正为 `api.yunhou.ai`(国际站,Paddle 只上国际站与 PayPal 一致;2026-10-02 PATCH 生效,secret 不变)。
+4. `coding-plan`(模型 API 套餐)是否也要走 Paddle,还是先只接 `kaya-membership`?(影响 `PaymentProvidersConfig.Paddle` 的 plan 映射范围)— **已定:只做 kaya-membership**。
 5. 跨渠道互斥守卫:先只接 `kaya-membership` 单一产品时守卫简单;若多产品需按产品维度判断。
+
+---
+
+## 8. 上线进展(2026-10-02)
+
+- ✅ 代码 PR:https://github.com/jkt-check/yunhou-users/pull/48(master 受保护,走 PR)
+- ✅ live 两个 price `tax_mode=internal`(API PATCH 实测返回 internal)
+- ✅ live webhook destination 修正为 `https://api.yunhou.ai/webhooks/payment/paddle`(secret 不变)
+- ✅ intl-prod 环境变量已配:`/home/deploy/yunhou-deploy/env/intl.prod.env` 第 27-31 行(PADDLE_ENV/API_KEY/CLIENT_TOKEN/WEBHOOK_SECRET/PRICES_JSON,与 PayPal 同文件)
+- ⬜ 合并 PR #48 → 走 yunhou-deploy 正常发版(迁移 042 自动跑)
+- ⬜ 前端 checkout 页(yunhou-website 仓库,Paddle.js 读 ?_ptxn)
+- ⬜ 上线后真实首购验收
 
 ---
 

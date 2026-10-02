@@ -3,6 +3,9 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -74,6 +77,10 @@ func newUUID() string {
 // each test goroutine) sets the matching X-App-Secret header on every admin
 // /apps request.
 const integrationAppSecret = "integration-test-app-secret"
+
+// integrationStripeSecret keys the StripeVerifier wired by setupFullServer;
+// signStripeWebhook signs bodies with it.
+const integrationStripeSecret = "whsec_integration_test_secret"
 
 func setupDB(t *testing.T) *sqlx.DB {
 	t.Helper()
@@ -754,11 +761,14 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 	t.Cleanup(cancel)
 	// MultiChannelVerifier must carry a WeChat verifier (mock mode) or the
 	// wechat_pay webhook route 404s with "unknown channel" (nil verifier).
+	// Stripe has no mock mode: dispute events are Stripe-native, so the
+	// dispute test signs real HMAC headers against integrationStripeSecret.
 	mv := &middleware.MultiChannelVerifier{
 		WeChat: &middleware.WeChatPayV3Verifier{
 			APIv3Key: []byte("integration-test-api-v3-key-1234567890"),
 			MockMode: true,
 		},
+		Stripe: &middleware.StripeVerifier{Secret: []byte(integrationStripeSecret)},
 	}
 	// wechatPayMock=true flips the webhook verifier + handler mock branches
 	// in lockstep (plaintext body accepted, HMAC bypassed).
@@ -1298,7 +1308,13 @@ func TestWebhookPaymentFailed(t *testing.T) {
 }
 
 // TestWebhookDisputeEvent drives charge.dispute.created: a confirmed
-// payment gets flagged disputed.
+// payment gets flagged disputed. charge.dispute.* is Stripe-native
+// vocabulary — since the webhook dispatch table became per-channel
+// (feat/paddle-channel), these events only dispatch on the stripe route,
+// so the order settles via a signed payment_intent.succeeded and the
+// dispute fires on /webhooks/payment/stripe. (The pre-refactor dispatch
+// was channel-agnostic, which is why this test previously drove the
+// stripe event type over the wechat_pay mock route.)
 func TestWebhookDisputeEvent(t *testing.T) {
 	db := setupDB(t)
 	srv := setupFullServer(t, db)
@@ -1307,42 +1323,44 @@ func TestWebhookDisputeEvent(t *testing.T) {
 	tok, _ := testLogin(t, srv, "dispute-user@yundian.test", "yundian")
 
 	resp := doJSONWithAuth(t, http.MethodPost, srv.URL+"/payments/orders",
-		"Bearer "+tok, map[string]interface{}{"plan_id": "monthly", "channel": "wechat_pay"})
+		"Bearer "+tok, map[string]interface{}{"plan_id": "monthly", "channel": "stripe"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create order: %d", resp.StatusCode)
 	}
 	orderID := parseJSON(t, resp)["data"].(map[string]interface{})["id"].(string)
-	// Settle via the mock channel webhook; the payment's external_txn_id
-	// is the helper's "tx-integration-<orderID>".
-	txnID := "tx-integration-" + orderID
-	settleResp := mockWechatPayWebhook(t, srv, orderID)
+	// Settle via a signed stripe webhook; the payment's external_txn_id is
+	// the payment_intent id. amount is 1990 cents = ¥19.90, the monthly
+	// plan's order snapshot (onPaymentSucceeded rejects under-settlement).
+	txnID := "pi-integration-" + orderID
+	settleBody := map[string]interface{}{
+		"id":   "evt-settle-" + orderID,
+		"type": "payment_intent.succeeded",
+		"data": map[string]interface{}{"object": map[string]interface{}{
+			"id":       txnID,
+			"amount":   1990,
+			"currency": "cny",
+			"metadata": map[string]interface{}{"order_id": orderID},
+		}},
+	}
+	sb, _ := json.Marshal(settleBody)
+	settleResp := postStripeWebhook(t, srv, sb)
 	if settleResp.StatusCode != http.StatusOK {
-		t.Fatalf("settle webhook: %d", settleResp.StatusCode)
+		bb, _ := io.ReadAll(settleResp.Body)
+		settleResp.Body.Close()
+		t.Fatalf("settle webhook: %d, body %s", settleResp.StatusCode, string(bb))
 	}
 	settleResp.Body.Close()
 
 	body := map[string]interface{}{
-		"id":         "evt-dispute-" + orderID,
-		"event_type": "charge.dispute.created",
-		"resource": map[string]interface{}{
-			"transaction_id": txnID,
-			"out_trade_no":   orderID,
-			"amount":         map[string]interface{}{"total": 1, "refund": 0},
-		},
+		"id":   "evt-dispute-" + orderID,
+		"type": "charge.dispute.created",
+		"data": map[string]interface{}{"object": map[string]interface{}{
+			"id":     txnID,
+			"amount": 1990,
+		}},
 	}
 	b, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/webhooks/payment/wechat_pay", bytes.NewReader(b))
-	if err != nil {
-		t.Fatalf("build dispute webhook: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Wechatpay-Signature", "mock-sig-"+orderID)
-	req.Header.Set("Wechatpay-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
-	req.Header.Set("Wechatpay-Nonce", "mock-nonce-"+orderID)
-	whResp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("fire dispute webhook: %v", err)
-	}
+	whResp := postStripeWebhook(t, srv, b)
 	if whResp.StatusCode != http.StatusOK {
 		bb, _ := io.ReadAll(whResp.Body)
 		whResp.Body.Close()
@@ -1358,6 +1376,33 @@ func TestWebhookDisputeEvent(t *testing.T) {
 	if !disputed {
 		t.Error("expected payment flagged disputed after charge.dispute.created")
 	}
+}
+
+// signStripeWebhook produces a Stripe-Signature header (t=<ts>,v1=<hex>)
+// for body at the current time, keyed on integrationStripeSecret.
+func signStripeWebhook(body []byte) string {
+	ts := time.Now().Unix()
+	mac := hmac.New(sha256.New, []byte(integrationStripeSecret))
+	mac.Write([]byte(fmt.Sprintf("%d.", ts)))
+	mac.Write(body)
+	return fmt.Sprintf("t=%d,v1=%s", ts, hex.EncodeToString(mac.Sum(nil)))
+}
+
+// postStripeWebhook fires a signed stripe webhook event against the test
+// server — the stripe analogue of mockWechatPayWebhook.
+func postStripeWebhook(t *testing.T, srv *httptest.Server, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/webhooks/payment/stripe", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build stripe webhook request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", signStripeWebhook(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fire stripe webhook: %v", err)
+	}
+	return resp
 }
 
 // TestWeChatRedirectNoConfig covers the wechat OAuth redirect shape

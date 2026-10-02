@@ -406,6 +406,7 @@ func main() {
 	// pin；发布原子切换在各进程有界延迟内生效).
 	adapters := map[inferencedomain.Protocol]inferenceproviders.Adapter{
 		inferencedomain.ProtocolOpenAIChat:       inferenceproviders.NewOpenAIChat(),
+		inferencedomain.ProtocolOpenAIResponses:  inferenceproviders.NewOpenAIResponses(),
 		inferencedomain.ProtocolAnthropicMessage: inferenceproviders.NewAnthropicMessages(),
 	}
 	routingSvc := inferencerouting.NewService(infStore, adapters, nil)

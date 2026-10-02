@@ -228,6 +228,9 @@ func TestEndpointURL_AndUpstreamRequestID(t *testing.T) {
 	if got := EndpointURL(testDeployment(domain.ProtocolOpenAIChat, "https://api.b.com")); got != "https://api.b.com/chat/completions" {
 		t.Errorf("openai endpoint = %q", got)
 	}
+	if got := EndpointURL(testDeployment(domain.ProtocolOpenAIResponses, "https://api.c.com/v1/")); got != "https://api.c.com/v1/responses" {
+		t.Errorf("openai_responses endpoint = %q", got)
+	}
 	resp := &http.Response{Header: http.Header{"Request-Id": []string{"r-2"}}}
 	if got := upstreamRequestID(resp); got != "r-2" {
 		t.Errorf("request id fallback = %q", got)

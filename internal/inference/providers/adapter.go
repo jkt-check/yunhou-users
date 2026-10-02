@@ -374,6 +374,8 @@ func EndpointURL(d *domain.Deployment) string {
 	switch d.Protocol {
 	case domain.ProtocolAnthropicMessage:
 		return strings.TrimSuffix(d.BaseURL, "/") + "/v1/messages"
+	case domain.ProtocolOpenAIResponses:
+		return strings.TrimSuffix(d.BaseURL, "/") + "/responses"
 	default:
 		return strings.TrimSuffix(d.BaseURL, "/") + "/chat/completions"
 	}

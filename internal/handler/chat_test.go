@@ -213,11 +213,11 @@ func TestChatHandler_ModelTooLong(t *testing.T) {
 // TestChatHandler_SystemMessageBudget verifies that a system message is
 // judged against the system budget (ChatMaxSystemBytes), not the general
 // per-message cap (ChatMaxMessageBytes). The per-message cap now exceeds
-// the system budget (32 KiB vs 24 KiB), so the system budget is the binding
+// the system budget (4 MiB vs 32 KiB), so the system budget is the binding
 // constraint — a system message right at the budget must be accepted.
 func TestChatHandler_SystemMessageBudget(t *testing.T) {
-	// kaya's rendered system prompt is ~21 KB; build one right at the
-	// 24576-byte system budget.
+	// kaya's rendered system prompt is ~21-24 KB; build one right at the
+	// 32768-byte system budget.
 	bigSystem := strings.Repeat("a", model.ChatMaxSystemBytes)
 	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
 	var got chatCall

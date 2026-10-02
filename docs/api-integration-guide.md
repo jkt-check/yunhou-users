@@ -635,7 +635,7 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 | `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
 | `thinking_enabled` | 否 | 布尔值；为 `true` 时请求启用上游推理模式，行为取决于所选模型的 provider 协议——OpenAI 协议原样下发 `thinking: {"type": "enabled"}`（不支持该字段的 provider 可能 400 → 客户端收到 502）；Anthropic 协议映射为扩展思考（`budget_tokens=4096`，`max_tokens` 下限相应抬高）。省略/`false` 时不下发。开启后响应 chunk 的 `delta` 中可能出现 `reasoning_content` 字段（两种协议都会产出），客户端不展示时可安全忽略 |
 
-**限制**（超出返回 400）：请求体整体 ≤320 KiB；1–20 条消息；每条 `content` ≤32768 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息走独立上限 ≤24576 字节；全部消息总字节数 ≤262144。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
+**限制**（超出返回 400）：请求体整体 ≤8 MiB；1–20 条消息；每条 `content` ≤4 MiB 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息走独立上限 ≤32768 字节；全部消息总字节数 ≤4 MiB。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
 
 **Anthropic 协议模型的历史约束**（仅当所选 `model` 路由到 Anthropic 协议 provider 时适用；OpenAI 协议模型无此约束）：剔除 `system` 消息后历史不能为空（纯 system 请求会被拒），且首条非 system 消息必须是 `user` 轮。违反时返回 400 `chat request shape is not supported by the selected model`。
 
@@ -683,7 +683,7 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 
 | HTTP | message | 触发条件 |
 |---|---|---|
-| 400 | `invalid request body` | JSON 解析失败，或请求体超过 320 KiB 上限 |
+| 400 | `invalid request body` | JSON 解析失败，或请求体超过 8 MiB 上限 |
 | 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` / `model id too long` / `too many tools` / `tools too large` / `invalid tool definition` | 请求体、消息或 tools 不符合限制 |
 | 400 | `unknown chat model` | `model` 字段不在服务端目录中 |
 | 400 | `chat request shape is not supported by the selected model` | 消息历史不满足所选模型的协议约束（仅 Anthropic 协议模型：剔除 system 后历史为空，或首条非 system 消息不是 user 轮） |

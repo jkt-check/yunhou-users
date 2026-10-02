@@ -151,7 +151,7 @@ Exceptions: `GET /.well-known/jwks.json` returns a raw JWKS object, while succes
 - `GET /admin/stats/new-users?from=&to=` — signups per day from `users.created_at` in the SERVER timezone (note the deliberately different day boundary from the client-local `local_date` metrics)
 
 **Channel webhooks** (signature verification, NOT JWT; rate-limited 200/s burst 400 per IP — looser bucket because traffic is upstream-driven):
-- `POST /webhooks/payment/:channel` — `:channel` is `stripe` / `wechat_pay` / `alipay` / `paypal`. Returns 404 when the corresponding webhook secret env var is empty. Unknown channels also return 404 (defence-in-depth — the CHECK constraint is the backstop).
+- `POST /webhooks/payment/:channel` — `:channel` is `stripe` / `wechat_pay` / `alipay` / `paypal` / `paddle`. Returns 404 when the corresponding webhook secret env var is empty. Unknown channels also return 404 (defence-in-depth — the CHECK constraint is the backstop).
 
 ## Design Principles
 

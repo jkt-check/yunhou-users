@@ -1340,3 +1340,141 @@ func TestLoad_LifecycleEnforce(t *testing.T) {
 		t.Error(`"true" is not the accepted spelling; only "1" enables enforce`)
 	}
 }
+
+// ============================================================================
+// Paddle Billing channel (docs/plans/2026-10-01-paddle-integration-research.md)
+// ============================================================================
+
+// validPaddleConfig returns a non-production config with a complete real-mode
+// Paddle tuple (env + api key + webhook secret + price map).
+func validPaddleConfig() *Config {
+	c := validRealWeChatConfig()
+	c.AppEnv = "staging"
+	c.PaddleEnv = "live"
+	c.PaddleAPIKey = "pdl_live_apikey_01m3v04av1tyfjjnx6s9cnssg5_xxx"
+	c.PaddleWebhookSecret = "pdl_ntfset_xxx"
+	c.PaddlePricesJSON = `{"monthly_usd":"pri_01m36ttg84y5favjtgdjwhy76p","yearly_usd":"pri_01m36tvbr7pjg4g70bjhx2mq42"}`
+	return c
+}
+
+func TestValidate_PaddleDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	if err := validRealWeChatConfig().Validate(); err != nil {
+		t.Fatalf("empty PADDLE_* must stay valid: %v", err)
+	}
+}
+
+func TestValidate_PaddleCredentialsWithoutEnv(t *testing.T) {
+	t.Parallel()
+	// Secret/key set without PADDLE_ENV: main.go wires the webhook
+	// verifier on the secret alone, so this half-configured state would
+	// accept webhooks while the paddle client stays nil — orders refused
+	// and every renewal 500ing forever. Must fail fast at boot.
+	c := validPaddleConfig()
+	c.PaddleEnv = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_ENV") {
+		t.Fatalf("expected PADDLE_ENV required when credentials are set, got %v", err)
+	}
+
+	c = validRealWeChatConfig()
+	c.AppEnv = "staging"
+	c.PaddleClientToken = "test_client_token"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_ENV") {
+		t.Fatalf("expected PADDLE_ENV required when client token is set, got %v", err)
+	}
+}
+
+func TestValidate_PaddleEnvInvalid(t *testing.T) {
+	t.Parallel()
+	c := validPaddleConfig()
+	c.PaddleEnv = "staging"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_ENV") {
+		t.Fatalf("expected PADDLE_ENV error, got %v", err)
+	}
+}
+
+func TestValidate_PaddleRealModeRequiresTuple(t *testing.T) {
+	t.Parallel()
+
+	c := validPaddleConfig()
+	c.PaddleAPIKey = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_API_KEY") {
+		t.Fatalf("expected PADDLE_API_KEY required, got %v", err)
+	}
+
+	c = validPaddleConfig()
+	c.PaddleWebhookSecret = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_WEBHOOK_SECRET") {
+		t.Fatalf("expected PADDLE_WEBHOOK_SECRET required, got %v", err)
+	}
+
+	c = validPaddleConfig()
+	c.PaddlePricesJSON = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_PRICES_JSON") {
+		t.Fatalf("expected PADDLE_PRICES_JSON required, got %v", err)
+	}
+
+	c = validPaddleConfig()
+	c.PaddlePricesJSON = `{"monthly_usd":"not-a-price-id"}`
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "pri_") {
+		t.Fatalf("expected price_id prefix validation, got %v", err)
+	}
+
+	c = validPaddleConfig()
+	c.PaddlePricesJSON = `{bad json`
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_PRICES_JSON") {
+		t.Fatalf("expected JSON parse error, got %v", err)
+	}
+}
+
+func TestValidate_PaddlePricesParse(t *testing.T) {
+	t.Parallel()
+	c := validPaddleConfig()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected valid, got %v", err)
+	}
+	if c.PaddlePrices["monthly_usd"] != "pri_01m36ttg84y5favjtgdjwhy76p" {
+		t.Fatalf("price map not populated: %v", c.PaddlePrices)
+	}
+}
+
+func TestValidate_PaddleMockProductionGate(t *testing.T) {
+	t.Parallel()
+
+	c := validPaddleConfig()
+	c.AppEnv = "prod"
+	c.PaddleMock = true
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_MOCK") {
+		t.Fatalf("expected PADDLE_MOCK + APP_ENV=prod to fail, got %v", err)
+	}
+
+	c = validPaddleConfig()
+	c.AppEnv = "staging"
+	c.PaddleMock = true
+	c.PaddleEnv = ""
+	c.PaddleAPIKey = ""
+	c.PaddleWebhookSecret = ""
+	c.PaddlePricesJSON = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("mock-only deployment must pass under staging: %v", err)
+	}
+}
+
+func TestValidate_PaddleMockWithLiveEnv(t *testing.T) {
+	t.Parallel()
+	c := validPaddleConfig()
+	c.PaddleMock = true
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PADDLE_ENV=live") {
+		t.Fatalf("expected PADDLE_MOCK + PADDLE_ENV=live to fail, got %v", err)
+	}
+}
+
+func TestValidate_PaddleMockWithRealKey(t *testing.T) {
+	t.Parallel()
+	c := validPaddleConfig()
+	c.PaddleMock = true
+	c.PaddleEnv = "sandbox"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected PADDLE_MOCK + PADDLE_API_KEY to fail")
+	}
+}

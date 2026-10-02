@@ -342,6 +342,14 @@ func writePaymentError(c *gin.Context, err error) {
 		// channel on this deployment just isn't enabled) and not a 503
 		// (we're not temporarily down — we never wire this channel).
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "wechat pay not configured on this deployment"})
+	case errors.Is(err, service.ErrPaddleNotConfigured):
+		// 400 — same contract as ErrWechatPayNotConfigured: the route
+		// exists, this deployment just doesn't wire the paddle channel.
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "paddle not configured on this deployment"})
+	case errors.Is(err, service.ErrPaddlePriceNotConfigured):
+		// 400 — operator error: the plan has no entry in
+		// PADDLE_PRICES_JSON. Terminal until the config is fixed.
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "paddle price not configured for this plan"})
 	case errors.Is(err, wechat.ErrWechatMisconfigured):
 		// 500 — the deployment is in real-mode (MockMode=false) but the
 		// AppID/Signer/MchID is unset. Operator-fixable and logged with

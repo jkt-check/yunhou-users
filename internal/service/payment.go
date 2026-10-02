@@ -15,6 +15,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
+	billingpaddle "github.com/yunhou/users/internal/billing/paddle"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/accounting"
@@ -33,6 +34,34 @@ type wechatClient interface {
 	AppID() string
 	UnifiedOrder(ctx context.Context, req wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error)
 	QueryOrder(ctx context.Context, outTradeNo string) (*wechat.OrderQueryResult, error)
+}
+
+// paddleClient is the narrow Paddle Billing surface PaymentService needs.
+// Production wires *billing/paddle.Client; tests/e2e inject stubs. nil =
+// paddle not accepted on this deployment (mirrors the wechat contract).
+type paddleClient interface {
+	IsMockMode() bool
+	ClientToken() string
+	CreateCheckoutTransaction(ctx context.Context, priceID string, customData map[string]any, currency string) (*billingpaddle.CheckoutTransaction, error)
+	GetSubscriptionNextBilledAt(ctx context.Context, subscriptionID string) (*time.Time, error)
+}
+
+// ErrPaddleNotConfigured is returned by CreateOrder when channel="paddle"
+// but no paddle client is wired (same shape as ErrWechatPayNotConfigured).
+var ErrPaddleNotConfigured = errors.New("paddle not configured on this deployment")
+
+// ErrPaddlePriceNotConfigured is returned by CreateOrder when the operator
+// hasn't mapped the plan to a Paddle price_id in PADDLE_PRICES_JSON.
+var ErrPaddlePriceNotConfigured = errors.New("paddle price not configured for this plan")
+
+// channelAutoRenews reports whether the channel bills the buyer
+// automatically on the channel side (subscriptions). For those channels an
+// active, unexpired subscription must block new orders — each new order
+// would mint a fresh channel-side subscription while the old one keeps
+// charging (intl-staging 2026-08-17 PayPal double-charge incident). WeChat
+// has no auto-renewal: manual renewal with rollover is correct there.
+func channelAutoRenews(channel string) bool {
+	return channel == "paypal" || channel == "paddle"
 }
 
 // ErrWechatPayNotConfigured is returned by CreateOrder when channel="wechat_pay"
@@ -99,6 +128,7 @@ var ErrOrderActivationConflict = errors.New("activation blocked: order conflicts
 var channelRequiredCurrency = map[string]string{
 	"wechat_pay": "CNY",
 	"paypal":     "USD",
+	"paddle":     "USD",
 }
 
 // PaymentService implements the v1 payment data flow primitives:
@@ -135,6 +165,11 @@ type PaymentService struct {
 	// wechat is optional; nil deployments can still create orders for
 	// non-WeChat channels.
 	wechat wechatClient
+
+	// paddle is optional; nil deployments refuse paddle orders at
+	// providerPreAuth, mirroring the wechat client contract.
+	paddle       paddleClient
+	paddlePrices map[string]string // plan_id → Paddle price_id (PADDLE_PRICES_JSON)
 
 	// confirmVerifier, when non-nil, replaces the upstream verification
 	// Confirm runs before marking an order paid. Production leaves it nil
@@ -178,6 +213,16 @@ func (s *PaymentService) SetBenefitRepo(r repo.PlanBenefitRepo) { s.benefitRepo 
 // SetBenefitSync wires the transactional outbox enqueue used to drive
 // entitlement grants after payment state transitions.
 func (s *PaymentService) SetBenefitSync(o BenefitSyncOutbox) { s.benefitSync = o }
+
+// SetPaddleClient wires the Paddle Billing client. Only call it when a
+// client was actually constructed — assigning a typed-nil *paddle.Client
+// to the interface would make s.paddle non-nil and bypass the
+// providerPreAuth gate (the wechat untyped-nil precedent).
+func (s *PaymentService) SetPaddleClient(c paddleClient) { s.paddle = c }
+
+// SetPaddlePrices wires the plan_id → price_id map parsed from
+// PADDLE_PRICES_JSON.
+func (s *PaymentService) SetPaddlePrices(m map[string]string) { s.paddlePrices = m }
 
 // enqueueBenefitSync appends one entitlement-sync message inside the
 // caller's payment transaction. A nil benefitSync (unit tests) or a fake
@@ -611,20 +656,22 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		}
 		if existing, err := s.subRepo.FindActiveByUserAndProduct(ctx, userID, requestedPlan.ProductCode); err == nil {
 			if existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now()) {
-				// PayPal 订阅制与 WeChat 的根本差异：渠道侧自动续费
-				// （PAYMENT.SALE.COMPLETED webhook 延期），用户无需也不应手动
-				// "续费"。这里每放行一单，BFF 就在 PayPal 创建一个全新的
+				// 渠道侧自动续费订阅（PayPal / Paddle）与 WeChat 的根本差
+				// 异：渠道侧自动扣费（PAYMENT.SALE.COMPLETED /
+				// transaction.completed (origin=subscription_recurring)
+				// webhook 延期），用户无需也不应手动
+				// "续费"。这里每放行一单，BFF 就在渠道侧创建一个全新的
 				// subscription 对象（重新吃 plan 内嵌的 trial），而旧订阅仍在
 				// 自动扣费 → 双重扣费（2026-08-17 intl-staging 验收实测同一
 				// 用户 3 个 ACTIVE PayPal 订阅并存、到期叠到两个月后）。
 				// 改签（月↔年）需要专门的"取消旧订阅+建新订阅"流程，落地前
-				// PayPal 渠道对任何未过期 active 订阅一律拒绝新单（409）。
+				// 这两个渠道对任何未过期 active 订阅一律拒绝新单（409）。
 				// WeChat 无自动续费，手动续费 rollover 是正确行为，不受影响。
 				// trial 订阅是 OAuth 首登赠予的（migration 018），**不是**
-				// PayPal 订阅：渠道侧没有对应的自动扣费 subscription，豁免
+				// 渠道侧订阅：没有对应的自动扣费 subscription，豁免
 				// 它不会造成双重扣费，反而正是 trial→付费 的核心转化漏斗
 				// （review users-1, 2026-08-17）。
-				if channel == "paypal" && existing.PlanID != "trial" {
+				if channelAutoRenews(channel) && existing.PlanID != "trial" {
 					return nil, ErrUserHasActiveSub
 				}
 				if requestedPlan.ProductCode == model.ProductCodingPlan {
@@ -738,6 +785,38 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		// into a nil pointer, which then trips omitempty on the JSON
 		// response. The marshalled intent is addressable here (we just
 		// allocated it), so the pointer is safe to share with the row.
+		order.ProviderIntent = &intent
+	}
+
+	// Paddle Billing: mint a checkout transaction server-side so the
+	// order binding (custom_data.order_id) and the charge currency are
+	// pinned by us, not by the frontend. provider_intent carries the
+	// hosted checkout URL (default payment link + ?_ptxn=<id>), the
+	// transaction id, and the Paddle.js client-side token for overlay
+	// checkouts. The BFF either redirects to checkout_url or opens
+	// Paddle.js with transaction_id + client_token.
+	if channel == "paddle" {
+		priceID := s.paddlePrices[planID]
+		if priceID == "" {
+			// Order row already exists; returning it with the error
+			// mirrors the wechat UnifiedOrder failure shape (caller may
+			// cancel/retry; the sweeper expires it otherwise).
+			return order, ErrPaddlePriceNotConfigured
+		}
+		res, err := s.paddle.CreateCheckoutTransaction(ctx, priceID,
+			map[string]any{"order_id": order.ID}, order.Currency)
+		if err != nil {
+			return order, fmt.Errorf("paddle checkout transaction: %w", err)
+		}
+		intentBytes, _ := json.Marshal(map[string]string{
+			"transaction_id": res.TransactionID,
+			"checkout_url":   res.CheckoutURL,
+			"client_token":   s.paddle.ClientToken(),
+		})
+		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intentBytes); err != nil {
+			return order, fmt.Errorf("persist provider intent: %w", err)
+		}
+		intent := json.RawMessage(intentBytes)
 		order.ProviderIntent = &intent
 	}
 
@@ -1625,6 +1704,13 @@ type WebhookEvent struct {
 	RefundAmount           float64 // for refund events
 	ExternalRefundID       string  // channel's refund ID
 	ExternalSubscriptionID string  // PayPal: subscription ID (`I-...`) — used by renewal branch to find the active sub
+	// Origin is Paddle's transaction origin (data.origin). Only populated
+	// for paddle transaction.* events. "subscription_recurring" marks a
+	// channel-side auto-renewal charge — the renewal routing keys on this,
+	// NOT on custom_data, because Paddle propagates the subscription's
+	// custom_data (including the original order_id) onto renewal
+	// transactions. Initial checkout transactions arrive as "web"/"api".
+	Origin string
 	// SkipAmountCheck exempts PayPal lifecycle events
 	// (BILLING.SUBSCRIPTION.ACTIVATED etc.) from the amount/currency
 	// validation in onPaymentSucceeded: PayPal omits resource.amount from
@@ -1695,49 +1781,49 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 
 	var domainAction string
 
-	switch {
-	case isPaymentSuccess(e.EventType):
-		domainAction = "payment_paid"
+	switch branch := resolveBranch(e); branch {
+	case branchPaymentSuccess:
+		domainAction = branch.domainAction()
 		if err := s.onPaymentSucceeded(ctx, e); err != nil {
 			return nil, err
 		}
-	case isPaypalRenewal(e.EventType):
-		domainAction = "payment_paid"
-		if err := s.onPaypalRenewalSucceeded(ctx, e); err != nil {
+	case branchRenewal:
+		domainAction = branch.domainAction()
+		if err := s.onRenewalSucceeded(ctx, e); err != nil {
 			return nil, err
 		}
-	case isPaymentFailed(e.EventType):
-		domainAction = "payment_failed"
+	case branchPaymentFailed:
+		domainAction = branch.domainAction()
 		if err := s.onPaymentFailed(ctx, e); err != nil {
 			return nil, err
 		}
-	case isRefundEvent(e.EventType):
-		domainAction = "refund_paid"
+	case branchRefund:
+		domainAction = branch.domainAction()
 		if err := s.onRefundSucceeded(ctx, e); err != nil {
 			return nil, err
 		}
-	case isRefundFailedEvent(e.EventType):
-		domainAction = "refund_failed"
+	case branchRefundFailed:
+		domainAction = branch.domainAction()
 		if err := s.onRefundFailed(ctx, e); err != nil {
 			return nil, err
 		}
-	case isDisputeCreated(e.EventType):
-		domainAction = "payment_disputed"
+	case branchDisputeCreated:
+		domainAction = branch.domainAction()
 		if err := s.onDisputeCreated(ctx, e); err != nil {
 			return nil, err
 		}
-	case isDisputeClosed(e.EventType):
+	case branchDisputeClosed:
 		// v1 only reacts when the merchant wins (clear disputed=true).
 		// Loss path is handled via the chargeback's charge.refunded event
 		// — see webhook doc §7.
-		domainAction = "payment_dispute_closed"
+		domainAction = branch.domainAction()
 		if err := s.onDisputeClosed(ctx, e); err != nil {
 			return nil, err
 		}
 	default:
 		// Unknown / uninteresting event types: log to webhook_events
 		// (done above) and ack 200. No domain action.
-		domainAction = "none"
+		domainAction = branch.domainAction()
 	}
 
 	// Mark processed regardless of whether a domain action ran. The
@@ -2675,11 +2761,18 @@ func (s *PaymentService) onDisputeClosed(ctx context.Context, e WebhookEvent) er
 //   when it's missing would silently mask a contract drift between
 //   PayPal's product definition and our Plan. The
 //   paypal_renewal_no_expiry_hint audit log lets ops reconcile manually.
+// - Paddle renewal: sub_expires_at is structurally ABSENT from
+//   transaction.completed (origin=subscription_recurring); the handler
+//   resolves next_billed_at through the billing client before this runs
+//   (same audit when even the API has no hint — e.g. Paddle billed a
+//   canceled subscription).
 
-// onPaypalRenewalSucceeded handles PAYMENT.SALE.COMPLETED — the renewal
-// charge that PayPal fires automatically when a PayPal subscription
-// auto-renews. We don't have an `orders` row for renewals (the original
-// order was months ago); instead we mint a synthetic orders row keyed to
+// onRenewalSucceeded handles the channel-side auto-renewal charge:
+// PAYMENT.SALE.COMPLETED (PayPal) and transaction.completed with
+// origin=subscription_recurring (Paddle — post-collection only; the
+// issuance-time transaction.billed is audit-only). We
+// don't have an `orders` row for renewals (the original order was months
+// ago); instead we mint a synthetic orders row keyed to
 // the renewal payment, INSERT the payments row, and extend
 // subscriptions.expires_at from resource.billing_info.next_billing_time.
 //
@@ -2689,12 +2782,30 @@ func (s *PaymentService) onDisputeClosed(ctx context.Context, e WebhookEvent) er
 // adds one, routing it to isRefundEvent + onRefundSucceeded will Just
 // Work because the channel=paypal + external_txn_id are populated the
 // same way.
-func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e WebhookEvent) error {
+func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent) error {
 	if e.ExternalSubscriptionID == "" {
-		return s.writeAudit(ctx, "service", "paypal_renewal_missing_external_sub_id",
+		return s.writeAudit(ctx, "service", fmt.Sprintf("%s_renewal_missing_external_sub_id", e.Channel),
 			fmt.Sprintf("event:%s", e.EventID),
-			[]string{"webhook", "paypal", "renewal", "missing_field"},
+			[]string{"webhook", e.Channel, "renewal", "missing_field"},
 			map[string]any{"event_id": e.EventID})
+	}
+
+	// Resolve the post-renewal expiry. PayPal ships next_billing_time in
+	// the webhook; Paddle's transaction.completed does not — the hint lives
+	// on the subscription object, so fetch it through the billing client.
+	// A fetch failure is transient (500): the channel retries per its
+	// schedule. nil nextBilled = "charged but no hint" — audited loudly
+	// below instead of extending the subscription.
+	nextBilled := e.SubExpiresAt
+	if nextBilled == nil && e.Channel == "paddle" {
+		if s.paddle == nil {
+			return errors.New("paddle renewal: paddle client not wired")
+		}
+		t, err := s.paddle.GetSubscriptionNextBilledAt(ctx, e.ExternalSubscriptionID)
+		if err != nil {
+			return fmt.Errorf("paddle renewal fetch next_billed_at: %w", err)
+		}
+		nextBilled = t
 	}
 
 	tx, err := s.dbBeginTx(ctx)
@@ -2720,9 +2831,9 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		e.ExternalSubscriptionID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return s.writeAudit(ctx, "service", "paypal_renewal_unknown_subscription",
+			return s.writeAudit(ctx, "service", fmt.Sprintf("%s_renewal_unknown_subscription", e.Channel),
 				fmt.Sprintf("event:%s", e.EventID),
-				[]string{"webhook", "paypal", "renewal", "unknown_sub"},
+				[]string{"webhook", e.Channel, "renewal", "unknown_sub"},
 				map[string]any{
 					"event_id":                 e.EventID,
 					"external_subscription_id": e.ExternalSubscriptionID,
@@ -2746,9 +2857,9 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		// Already processed — skip the renew side-effects, audit-log only,
 		// ack 200. The webhook_events table earlier should have made this
 		// impossible, but if we got here it's a defensive guard.
-		return s.writeAudit(ctx, "service", "paypal_renewal_payment_already_exists",
+		return s.writeAudit(ctx, "service", fmt.Sprintf("%s_renewal_payment_already_exists", e.Channel),
 			fmt.Sprintf("event:%s", e.EventID),
-			[]string{"webhook", "paypal", "renewal", "duplicate"},
+			[]string{"webhook", e.Channel, "renewal", "duplicate"},
 			map[string]any{
 				"event_id":                 e.EventID,
 				"existing_payment_id":      existingPaymentID,
@@ -2771,8 +2882,8 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	// sub_expires_at hint, mirror it on the order so any operator query
 	// joining orders→subscriptions sees a consistent timeline.
 	orderExpiresAt := time.Now().AddDate(100, 0, 0) // +100y sentinel
-	if e.SubExpiresAt != nil {
-		orderExpiresAt = *e.SubExpiresAt
+	if nextBilled != nil {
+		orderExpiresAt = *nextBilled
 	}
 	// Amount/currency sanity check (review users-1, 2026-08-17): the
 	// signature proves the event came from PayPal, not that the settled
@@ -2795,9 +2906,9 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		// Missing plan is not this event's fault — proceed with the renewal
 		// but flag it so ops can reconcile (mirrors onPaymentSucceeded's
 		// lenient plan lookup).
-		_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_plan_lookup_failed",
+		_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_plan_lookup_failed", e.Channel),
 			fmt.Sprintf("subscription:%s", sub.ID),
-			[]string{"webhook", "paypal", "renewal", "plan_lookup"},
+			[]string{"webhook", e.Channel, "renewal", "plan_lookup"},
 			map[string]any{
 				"plan_id":  sub.PlanID,
 				"event_id": e.EventID,
@@ -2805,9 +2916,9 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 	} else {
 		planRow = plan
 		if !strings.EqualFold(e.Currency, plan.Currency) {
-			_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_currency_mismatch",
+			_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_currency_mismatch", e.Channel),
 				fmt.Sprintf("subscription:%s", sub.ID),
-				[]string{"webhook", "paypal", "renewal", "currency_mismatch"},
+				[]string{"webhook", e.Channel, "renewal", "currency_mismatch"},
 				map[string]any{
 					"event_id":       e.EventID,
 					"event_currency": e.Currency,
@@ -2817,9 +2928,9 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 					"order_id":       "",
 				})
 		} else if toCents(e.Amount) < toCents(plan.Price) {
-			_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_amount_below_plan",
+			_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_amount_below_plan", e.Channel),
 				fmt.Sprintf("subscription:%s", sub.ID),
-				[]string{"webhook", "paypal", "renewal", "amount_mismatch"},
+				[]string{"webhook", e.Channel, "renewal", "amount_mismatch"},
 				map[string]any{
 					"event_id":     e.EventID,
 					"event_amount": e.Amount,
@@ -2864,25 +2975,25 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 		return fmt.Errorf("insert renewal payment: %w", err)
 	}
 
-	if e.SubExpiresAt != nil {
+	if nextBilled != nil {
 		// The sub may be cancelled/expired since activation; in that case
-		// we still INSERT the payment row (PayPal did charge) but we must
+		// we still INSERT the payment row (the channel did charge) but we must
 		// NOT extend expires_at. We audit-log when the UPDATE didn't fire
-		// so operators see the "PayPal charging a sub our DB says is dead"
+		// so operators see the "channel charging a sub our DB says is dead"
 		// mismatch.
 		res, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
 			SET expires_at = $1, updated_at = now()
 			WHERE id = $2 AND status = 'active'
-		`, *e.SubExpiresAt, sub.ID)
+		`, *nextBilled, sub.ID)
 		if err != nil {
 			return fmt.Errorf("extend expires_at on renewal: %w", err)
 		}
 		n, _ := res.RowsAffected()
 		if n == 0 && sub.Status != "active" {
-			_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_sub_not_active",
+			_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_sub_not_active", e.Channel),
 				fmt.Sprintf("subscription:%s", sub.ID),
-				[]string{"webhook", "paypal", "renewal", "sub_not_active"},
+				[]string{"webhook", e.Channel, "renewal", "sub_not_active"},
 				map[string]any{
 					"payment_id":               paymentID,
 					"order_id":                 orderID,
@@ -2891,15 +3002,17 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 				})
 		}
 	} else {
-		// PayPal charged the customer but didn't ship a next_billing_time
-		// hint. Recording the payment without extending the subscription
+		// The channel charged the customer but no next-billing hint
+		// resolved (PayPal omitted next_billing_time, or Paddle's API
+		// returned no next_billed_at). Recording the payment without
+		// extending the subscription
 		// would leave a paying customer without access — silently fail and
 		// let the operator investigate. Audit-log loudly so the
 		// reconciliation job (or ops) can match the payment to a manual
 		// subscription fix-up.
-		_ = writeAuditOnTx(ctx, tx, "service", "paypal_renewal_no_expiry_hint",
+		_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_no_expiry_hint", e.Channel),
 			fmt.Sprintf("subscription:%s", sub.ID),
-			[]string{"webhook", "paypal", "renewal", "no_expiry_hint"},
+			[]string{"webhook", e.Channel, "renewal", "no_expiry_hint"},
 			map[string]any{
 				"payment_id":               paymentID,
 				"order_id":                 orderID,
@@ -2909,9 +3022,9 @@ func (s *PaymentService) onPaypalRenewalSucceeded(ctx context.Context, e Webhook
 			})
 	}
 
-	if err := writeAuditOnTx(ctx, tx, "service", "paypal_subscription_renewed",
+	if err := writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_subscription_renewed", e.Channel),
 		fmt.Sprintf("subscription:%s", sub.ID),
-		[]string{"payment", "paypal", "renewal"},
+		[]string{"payment", e.Channel, "renewal"},
 		map[string]any{
 			"payment_id":               paymentID,
 			"order_id":                 orderID,
@@ -3117,7 +3230,7 @@ func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx dbTx, e
 
 func validateChannel(channel string) error {
 	switch channel {
-	case "stripe", "wechat_pay", "alipay", "paypal":
+	case "stripe", "wechat_pay", "alipay", "paypal", "paddle":
 		return nil
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidChannel, channel)
@@ -3140,6 +3253,11 @@ func (s *PaymentService) providerPreAuth(channel string) error {
 	if channel == "wechat_pay" {
 		if s.wechat == nil {
 			return ErrWechatPayNotConfigured
+		}
+	}
+	if channel == "paddle" {
+		if s.paddle == nil {
+			return ErrPaddleNotConfigured
 		}
 	}
 	// Other channels either don't need an upstream pre-auth (stripe uses
@@ -3271,74 +3389,157 @@ func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID
 	return nil
 }
 
-// TODO: refactor to per-channel predicate maps at 5+ channels — the flat
-// switch lists are getting hard to scan as channels multiply.
-func isPaymentSuccess(eventType string) bool {
-	switch eventType {
-	case "payment_intent.succeeded", "TRANSACTION.SUCCESS",
-		"TRADE_SUCCESS", "trade_status_sync",
-		"PAYMENT.CAPTURE.COMPLETED", "BILLING.SUBSCRIPTION.ACTIVATED":
+// webhookBranch identifies the domain action a webhook event maps to.
+type webhookBranch int
+
+const (
+	branchNone webhookBranch = iota
+	branchPaymentSuccess
+	branchPaymentFailed
+	branchRefund
+	branchRefundFailed
+	branchDisputeCreated
+	branchDisputeClosed
+	branchRenewal
+)
+
+// domainAction is the OnWebhookResult.DomainAction value for a branch.
+func (b webhookBranch) domainAction() string {
+	switch b {
+	case branchPaymentSuccess, branchRenewal:
+		return "payment_paid"
+	case branchPaymentFailed:
+		return "payment_failed"
+	case branchRefund:
+		return "refund_paid"
+	case branchRefundFailed:
+		return "refund_failed"
+	case branchDisputeCreated:
+		return "payment_disputed"
+	case branchDisputeClosed:
+		return "payment_dispute_closed"
+	default:
+		return "none"
+	}
+}
+
+// channelWebhookBranches is the per-channel dispatch table (the
+// 5+-channels TODO refactor — paddle is the 5th channel). Event-type
+// strings are globally unique across channels, but scoping each
+// channel's vocabulary to its own map keeps the table auditable per
+// channel and makes a new channel a pure data addition.
+var channelWebhookBranches = map[string]map[string]webhookBranch{
+	"stripe": {
+		"payment_intent.succeeded":      branchPaymentSuccess,
+		"payment_intent.payment_failed": branchPaymentFailed,
+		"payment_intent.canceled":       branchPaymentFailed,
+		"charge.refunded":               branchRefund,
+		"charge.dispute.created":        branchDisputeCreated,
+		"charge.dispute.closed":         branchDisputeClosed,
+	},
+	"wechat_pay": {
+		"TRANSACTION.SUCCESS":    branchPaymentSuccess,
+		"TRANSACTION.PAY_FAILED": branchPaymentFailed,
+		"TRANSACTION.REVOKED":    branchPaymentFailed,
+		"TRANSACTION.REFUND":     branchRefund,
+		"REFUND.SUCCESS":         branchRefund,
+		"REFUND.ABNORMAL":        branchRefundFailed,
+		"REFUND.CLOSED":          branchRefundFailed,
+	},
+	"alipay": {
+		"TRADE_SUCCESS":     branchPaymentSuccess,
+		"trade_status_sync": branchPaymentSuccess,
+		"TRADE_CLOSED":      branchRefund,
+		"trade_closed":      branchRefund,
+		"trade_refund":      branchRefund,
+	},
+	"paypal": {
 		// ACTIVATED is the subscription activation trigger: its resource
 		// carries custom_id (the order UUID the BFF set at creation),
 		// status=ACTIVE (the buyer actually approved) and
 		// billing_info.next_billing_time (expiry hint — 7-day trial end).
 		// CREATED fires pre-approval with status=APPROVAL_PENDING and must
 		// NOT activate: the buyer may abandon at the PayPal login.
-		return true
+		"PAYMENT.CAPTURE.COMPLETED":      branchPaymentSuccess,
+		"BILLING.SUBSCRIPTION.ACTIVATED": branchPaymentSuccess,
+		"PAYMENT.CAPTURE.DENIED":         branchPaymentFailed,
+		"PAYMENT.CAPTURE.FAILED":         branchPaymentFailed,
+		"PAYMENT.CAPTURE.REFUNDED":       branchRefund,
+		"PAYMENT.SALE.REFUNDED":          branchRefund,
+		"PAYMENT.SALE.COMPLETED":         branchRenewal,
+	},
+	"paddle": {
+		// Initial subscription settlement (checkout completed,
+		// origin=web/api). Renewal settlement arrives as the SAME event
+		// type with origin=subscription_recurring and is rerouted to
+		// branchRenewal by resolveBranch — Paddle's event semantics
+		// (verified against the webhook simulator, 2026-10):
+		//
+		//   subscription.updated / transaction.created / transaction.billed
+		//     → renewal invoice ISSUED (no money moved yet)
+		//   transaction.paid / transaction.completed
+		//     → renewal charge COLLECTED (only fired post-collection)
+		//
+		// so transaction.billed must NEVER settle: on a declined renewal
+		// card it would extend the subscription and book phantom paid
+		// revenue, and the failure surfaces only as transaction.past_due /
+		// subscription.past_due (audit-only) with no clawback path here.
+		// The subscription id rides data.subscription_id so activation can
+		// stamp subscriptions.external_subscription_id for renewals.
+		"transaction.completed": branchPaymentSuccess,
+		// transaction.payment_failed stays audit-only: a declined checkout
+		// attempt is retried INSIDE the same Paddle transaction, so
+		// flipping the order/payment failed here would strand the later
+		// paid retry behind onPaymentSucceeded's unexpected_state_transition
+		// guard. Renewal dunning surfaces as transaction.past_due /
+		// subscription.past_due (also audit-only).
+		//
+		// transaction.billed / transaction.paid, subscription.*,
+		// adjustment.* are likewise audit-only: settlement is anchored on
+		// transaction.completed money events only, and refunds remain
+		// webhook-unhandled for paddle (ops manual).
+	},
+}
+
+// dispatchBranch resolves (channel, event_type) → branch. Unknown channels
+// and unlisted event types land on branchNone (audit-only ack 200).
+func dispatchBranch(channel, eventType string) webhookBranch {
+	if m, ok := channelWebhookBranches[channel]; ok {
+		if b, ok := m[eventType]; ok {
+			return b
+		}
 	}
-	return false
+	return branchNone
 }
 
-func isPaymentFailed(eventType string) bool {
-	switch eventType {
-	case "payment_intent.payment_failed", "payment_intent.canceled",
-		"TRANSACTION.PAY_FAILED", "TRANSACTION.REVOKED",
-		"PAYMENT.CAPTURE.DENIED", "PAYMENT.CAPTURE.FAILED":
-		return true
+// paddleOriginSubscriptionRecurring is Paddle's data.origin value for
+// channel-side auto-renewal charges.
+const paddleOriginSubscriptionRecurring = "subscription_recurring"
+
+// resolveBranch is the event-aware wrapper over dispatchBranch. Paddle's
+// transaction.completed doubles as initial settlement and renewal
+// settlement; data.origin distinguishes them. Two paddle-specific
+// reroutings:
+//
+//   - origin=subscription_recurring → branchRenewal. Renewal completed
+//     events may echo the ORIGINAL order_id (Paddle propagates
+//     subscription custom_data onto renewal transactions), so origin —
+//     not custom_data presence — drives the routing. onRenewalSucceeded
+//     keys on ExternalSubscriptionID and never touches the stale order.
+//   - no origin match AND no order_id → branchNone: there is nothing to
+//     settle, but the webhook_events row written by OnWebhook keeps the
+//     audit trail (the handler parses leniently precisely so these events
+//     reach this point instead of 400ing before the insert).
+func resolveBranch(e WebhookEvent) webhookBranch {
+	if e.Channel == "paddle" && e.EventType == "transaction.completed" {
+		if e.Origin == paddleOriginSubscriptionRecurring {
+			return branchRenewal
+		}
+		if e.OrderID == "" {
+			return branchNone
+		}
 	}
-	return false
-}
-
-func isRefundEvent(eventType string) bool {
-	switch eventType {
-	case "charge.refunded", "TRANSACTION.REFUND",
-		"TRADE_CLOSED", "trade_closed",
-		// 评审轮4：trade_refund = Alipay TRADE_SUCCESS/TRADE_FINISHED 携带
-		// refund_fee 的部分退款通知；REFUND.SUCCESS = 真实 WeChat v3 退款
-		// 事件类型（TRANSACTION.REFUND 为既有 mock 契约，两者并容）。
-		"trade_refund", "REFUND.SUCCESS",
-		"PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED":
-		return true
-	}
-	return false
-}
-
-// isRefundFailedEvent — 退款终态失败事件（评审批次7 Important-2）。微信
-// v3 REFUND.ABNORMAL（退款异常）/ REFUND.CLOSED（退款关闭）：此前不在任
-// 何分发分支里，落进 audit-only 默认分支，失败退款永远卡 pending。路由
-// 到 onRefundFailed 翻 failed。
-func isRefundFailedEvent(eventType string) bool {
-	switch eventType {
-	case "REFUND.ABNORMAL", "REFUND.CLOSED":
-		return true
-	}
-	return false
-}
-
-func isDisputeCreated(eventType string) bool {
-	return eventType == "charge.dispute.created"
-}
-
-func isDisputeClosed(eventType string) bool {
-	return eventType == "charge.dispute.closed"
-}
-
-// isPaypalRenewal — handler-implementation detail lifted here because the
-// OnWebhook dispatch table is in service. PAYMENT.SALE.COMPLETED is the
-// auto-renewal charge PayPal fires when a subscription's billing period
-// completes.
-func isPaypalRenewal(eventType string) bool {
-	return eventType == "PAYMENT.SALE.COMPLETED"
+	return dispatchBranch(e.Channel, e.EventType)
 }
 
 // resolveSubExpiry returns the expires_at to write on a subscription

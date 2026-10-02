@@ -31,7 +31,7 @@ import (
 )
 
 // ChannelSignatureVerifier is the per-channel abstraction. Production wires
-// one verifier per channel (Stripe / WeChat / Alipay) with real secrets loaded
+// one verifier per channel (Stripe / WeChat / Alipay / PayPal / Paddle) with real secrets loaded
 // from env at startup. Tests inject stubs.
 //
 // VerifySignature must:
@@ -205,6 +205,99 @@ func parseStripeSignatureHeader(h string) (int64, [][]byte, error) {
 	}
 	if ts == 0 || len(sigHexes) == 0 {
 		return 0, nil, fmt.Errorf("missing t or v1")
+	}
+	decoded := make([][]byte, 0, len(sigHexes))
+	for _, sh := range sigHexes {
+		b, err := hex.DecodeString(sh)
+		if err != nil {
+			return 0, nil, fmt.Errorf("bad hex: %w", err)
+		}
+		decoded = append(decoded, b)
+	}
+	return ts, decoded, nil
+}
+
+// ============================================================================
+// Paddle Billing — HMAC-SHA256 over `ts:body`, replay window enforced
+// ============================================================================
+
+// PaddleVerifier verifies Paddle Billing webhooks. Paddle signs the raw
+// body with HMAC-SHA256 keyed on the notification destination's secret:
+//
+//	signed payload  = "<ts>:" + rawBody         (timestamp + colon + body)
+//	Paddle-Signature: ts=<unix>;h1=<hex>        (SEMICOLON-separated kv pairs)
+//
+// Multiple h1= values may be present while secrets are rotated — accept any
+// that matches (same scheme as StripeVerifier's multi-v1 handling).
+type PaddleVerifier struct {
+	Secret       []byte
+	ReplayWindow time.Duration // default 5 min if zero
+	// MockMode (PADDLE_MOCK=1) bypasses the HMAC match while still
+	// requiring the Paddle-Signature header and an in-window timestamp.
+	// Production MUST leave this false.
+	MockMode bool
+}
+
+func (v *PaddleVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
+	// MultiChannelVerifier already routes by channel before calling us;
+	// the per-channel channel-name guard is defensive scaffolding.
+	_ = channel
+	sigHeader := headers["Paddle-Signature"]
+	if sigHeader == "" {
+		return ErrInvalidSignature
+	}
+	ts, expectedHMACs, err := parsePaddleSignatureHeader(sigHeader)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSignature, err)
+	}
+	window := v.ReplayWindow
+	if window == 0 {
+		window = 5 * time.Minute
+	}
+	if delta := time.Since(time.Unix(ts, 0)); delta > window || delta < -window {
+		return ErrTimestampOutOfRange
+	}
+	if v.MockMode {
+		return nil
+	}
+	mac := hmac.New(sha256.New, v.Secret)
+	mac.Write([]byte(strconv.FormatInt(ts, 10)))
+	mac.Write([]byte(":"))
+	mac.Write(body)
+	sum := mac.Sum(nil)
+	for _, expected := range expectedHMACs {
+		if hmac.Equal(expected, sum) {
+			return nil
+		}
+	}
+	return ErrInvalidSignature
+}
+
+// parsePaddleSignatureHeader parses `ts=<unix>;h1=<hex>[;h1=<hex>...]`.
+// Paddle uses SEMICOLON separators (Stripe uses commas) and may send more
+// than one h1 during secret rotation — the caller must try each.
+func parsePaddleSignatureHeader(h string) (int64, [][]byte, error) {
+	var ts int64
+	var sigHexes []string
+	for _, kv := range strings.Split(h, ";") {
+		kv = strings.TrimSpace(kv)
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		switch kv[:eq] {
+		case "ts":
+			n, err := strconv.ParseInt(kv[eq+1:], 10, 64)
+			if err != nil {
+				return 0, nil, fmt.Errorf("bad timestamp")
+			}
+			ts = n
+		case "h1":
+			sigHexes = append(sigHexes, kv[eq+1:])
+		}
+	}
+	if ts == 0 || len(sigHexes) == 0 {
+		return 0, nil, fmt.Errorf("missing ts or h1")
 	}
 	decoded := make([][]byte, 0, len(sigHexes))
 	for _, sh := range sigHexes {
@@ -748,6 +841,7 @@ type MultiChannelVerifier struct {
 	WeChat ChannelSignatureVerifier
 	Alipay ChannelSignatureVerifier
 	Paypal ChannelSignatureVerifier
+	Paddle ChannelSignatureVerifier
 }
 
 func (m *MultiChannelVerifier) VerifySignature(channel string, body []byte, headers map[string]string) error {
@@ -761,6 +855,8 @@ func (m *MultiChannelVerifier) VerifySignature(channel string, body []byte, head
 		v = m.Alipay
 	case "paypal":
 		v = m.Paypal
+	case "paddle":
+		v = m.Paddle
 	default:
 		return ErrUnsupportedChannel
 	}

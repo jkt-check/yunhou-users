@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -66,4 +67,31 @@ func TestPaymentMetrics_LatePaymentHonored(t *testing.T) {
 func TestPaymentMetrics_NilSafe(t *testing.T) {
 	var m *PaymentMetrics
 	m.LatePaymentHonored("stripe") // must not panic
+}
+
+// webhook 兑付路径(review R1 finding 3):微信以外的渠道 Confirm 被
+// ErrConfirmVerificationUnavailable 拒,过期兑付全部走 onPaymentSucceeded,
+// 指标必须在该路径同样递增——否则 paddle/stripe/paypal 的 late honor 恒为 0。
+func TestPaymentMetrics_LatePaymentHonored_WebhookPath(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	m := NewPaymentMetrics(prometheus.NewRegistry(), "test")
+	svc.SetMetrics(m)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE orders SET status = 'expired' WHERE id = $1`, order.ID); err != nil {
+		t.Fatalf("force expired: %v", err)
+	}
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-late-metric-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
+		TransactionID: "pi-late-metric-1", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("OnWebhook late: %v", err)
+	}
+	if v := lateHonorMetricValue(t, m, "stripe"); v != 1 {
+		t.Fatalf("webhook-path late counter = %v, want 1", v)
+	}
 }

@@ -1477,9 +1477,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// 客诉雷达:订单已过期但渠道侧实际已扣款,Confirm 仍按 §5.3 兑付。
 		// 频率升高 = "success 页显示失败但其实已兑付"类客诉的前兆,配
 		// payment_late_payment_honored_total{channel} 告警。
-		log.Printf("late payment honored post-expiry: order=%s payment=%s channel=%s user=%s amount=%.2f %s",
-			order.ID, paymentID, in.Channel, order.UserID, order.Amount, order.Currency)
-		s.metrics.LatePaymentHonored(in.Channel)
+		s.noteLatePaymentHonored(order, paymentID, in.Channel)
 	}
 
 	return &ConfirmResult{
@@ -2247,7 +2245,15 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if wasLate && orderUpdated {
+		// webhook 兑付路径的 late-honor 观测(Confirm 路径同款):微信以外
+		// 渠道的过期兑付全部流经此处。
+		s.noteLatePaymentHonored(order, paymentID, e.Channel)
+	}
+	return nil
 }
 
 // onPaymentFailed: payment_intent.payment_failed / .canceled (Stripe) and

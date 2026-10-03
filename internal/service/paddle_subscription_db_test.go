@@ -253,15 +253,19 @@ func TestOnWebhook_PaddleSubscriptionCancelled_Flips(t *testing.T) {
 		t.Error("expected audit row paddle_subscription_cancelled")
 	}
 
-	// Redelivery (same event id) → duplicate ack, still cancelled, no error.
+	// 第二个*不同* event id 的取消事件(自助取消 + 运营后台取消各发一次
+	// 的场景):已 cancelled 的行是 no-op,不重复审计、不报错。注意同 event
+	// id 的真重投在 OnWebhook 入口就被 webhook_events 去重,到不了这里。
 	res2, err := svc.OnWebhook(context.Background(),
 		paddleCancelEvent("evt-pd-cancel-"+mustNewUUID()[:8], extSubID))
 	if err != nil {
-		t.Fatalf("redelivery: %v", err)
+		t.Fatalf("second distinct cancel event: %v", err)
 	}
-	_ = res2
+	if res2.DomainAction != "subscription_cancelled" {
+		t.Fatalf("second cancel DomainAction = %q", res2.DomainAction)
+	}
 	if countAudit(t, db, "paddle_subscription_cancelled") != 1 {
-		t.Error("redelivery must not duplicate the cancel audit")
+		t.Error("second cancel event must not duplicate the cancel audit")
 	}
 }
 

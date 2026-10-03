@@ -100,8 +100,14 @@ type ChannelUpgradeResult struct {
 // The prorated charge arrives later as transaction.completed with
 // origin="subscription_update" — NOT subscription_recurring — so it stays
 // on the initial-settlement branch and no-ops against the already-paid
-// original order (amount-mismatch audit only). Local state here is driven
-// synchronously by the Paddle API response, not by that webhook.
+// original order (duplicate-paid-order audit only). Local state here is
+// driven synchronously by the Paddle API response, not by that webhook.
+//
+// Note: Paddle silently DISCARDS a subscription's pending scheduled_change
+// when items are updated, so cancel-then-upgrade lifts the pending
+// cancellation channel-side (no subscription.canceled webhook will ever
+// arrive for it). That's the desired outcome — the user re-committed to a
+// longer cycle — and the local row simply stays active on the new plan.
 func (s *PaymentService) UpgradeChannelSubscription(ctx context.Context, userID, targetPlanID string) (*ChannelUpgradeResult, error) {
 	if s.paddle == nil {
 		return nil, ErrPaddleNotConfigured
@@ -143,6 +149,55 @@ func (s *PaymentService) UpgradeChannelSubscription(ctx context.Context, userID,
 		return nil, ErrPaddlePriceNotConfigured
 	}
 	extID, _ := paddleManagedSubID(sub) // guaranteed by activePaddleSub
+
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin upgrade tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Lock the row and re-verify it's still active BEFORE moving money
+	// channel-side. onPaddleSubscriptionCancelled takes the same FOR UPDATE
+	// lock; without it, a cancel webhook's flip could land between the
+	// unlocked activePaddleSub read and the final UPDATE (0 rows → user
+	// sees an error AFTER Paddle already switched the price), and two
+	// concurrent upgrade requests could both reach Paddle → two proration
+	// charges.
+	var locked model.Subscription
+	err = tx.GetContext(ctx, &locked,
+		`SELECT * FROM subscriptions WHERE id = $1 FOR UPDATE`, sub.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrSubscriptionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock subscription: %w", err)
+	}
+	if locked.Status != "active" {
+		// Lost the race with a cancel (webhook or local) while validating.
+		return nil, ErrSubscriptionNotFound
+	}
+
+	// From the Paddle call onward, money may move channel-side
+	// (prorated_immediately charges the difference). Any local failure
+	// after this point must leave a loud audit trail for ops
+	// reconciliation — a silent 5xx here would invite a retry that
+	// double-charges.
+	failSync := func(cause error) (*ChannelUpgradeResult, error) {
+		if aerr := s.writeAudit(ctx, "user:"+userID, "paddle_upgrade_local_sync_failed",
+			fmt.Sprintf("subscription:%s", sub.ID),
+			[]string{"paddle", "subscription", "upgrade", "diverged"},
+			map[string]any{
+				"subscription_id":          sub.ID,
+				"external_subscription_id": extID,
+				"from_plan_id":             sub.PlanID,
+				"to_plan_id":               targetPlanID,
+				"error":                    cause.Error(),
+			}); aerr != nil {
+			log.Printf("paddle upgrade: divergence audit write failed for subscription %s: %v", sub.ID, aerr)
+		}
+		return nil, cause
+	}
+
 	nextBilled, err := s.paddle.UpdateSubscriptionPrice(ctx, extID, priceID)
 	if err != nil {
 		return nil, fmt.Errorf("paddle update subscription: %w", err)
@@ -154,21 +209,17 @@ func (s *PaymentService) UpgradeChannelSubscription(ctx context.Context, userID,
 		expiresAt = *nextBilled
 	}
 
-	tx, err := s.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin upgrade tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
 	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET plan_id = $1, expires_at = $2, updated_at = now()
 		WHERE id = $3 AND status = 'active'
 	`, targetPlanID, expiresAt, sub.ID)
 	if err != nil {
-		return nil, fmt.Errorf("switch subscription plan: %w", err)
+		return failSync(fmt.Errorf("switch subscription plan: %w", err))
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		// Raced a concurrent local cancel between the read and the write.
-		return nil, ErrSubscriptionNotFound
+		// The FOR UPDATE lock makes this near-impossible; keep the guard as
+		// a divergence-audited failure rather than a silent error.
+		return failSync(ErrSubscriptionNotFound)
 	}
 	if err := writeAuditOnTx(ctx, &sqlxTx{tx}, "user:"+userID, "paddle_subscription_upgraded",
 		fmt.Sprintf("subscription:%s", sub.ID),
@@ -180,10 +231,10 @@ func (s *PaymentService) UpgradeChannelSubscription(ctx context.Context, userID,
 			"to_plan_id":               targetPlanID,
 			"next_billed_at":           expiresAt,
 		}); err != nil {
-		return nil, fmt.Errorf("write upgrade audit: %w", err)
+		return failSync(fmt.Errorf("write upgrade audit: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit upgrade tx: %w", err)
+		return failSync(fmt.Errorf("commit upgrade tx: %w", err))
 	}
 	return &ChannelUpgradeResult{
 		SubscriptionID: sub.ID,

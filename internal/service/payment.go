@@ -198,6 +198,10 @@ type PaymentService struct {
 	// commits, and the entitlement-sync worker converges idempotently.
 	// Nil = feature off (unit tests); production wires it always.
 	benefitSync BenefitSyncOutbox
+
+	// metrics holds the Prometheus collectors (late-payment observability).
+	// Nil = metrics off (unit tests); all call sites are nil-safe.
+	metrics *PaymentMetrics
 }
 
 // BenefitSyncOutbox is the narrow surface PaymentService needs from the
@@ -215,6 +219,10 @@ func (s *PaymentService) SetBenefitRepo(r repo.PlanBenefitRepo) { s.benefitRepo 
 // SetBenefitSync wires the transactional outbox enqueue used to drive
 // entitlement grants after payment state transitions.
 func (s *PaymentService) SetBenefitSync(o BenefitSyncOutbox) { s.benefitSync = o }
+
+// SetMetrics wires the Prometheus collectors. Production calls it with the
+// default registerer; tests may leave it nil (all call sites are nil-safe).
+func (s *PaymentService) SetMetrics(m *PaymentMetrics) { s.metrics = m }
 
 // SetPaddleClient wires the Paddle Billing client. Only call it when a
 // client was actually constructed — assigning a typed-nil *paddle.Client
@@ -1463,6 +1471,15 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit confirm tx: %w", err)
+	}
+
+	if wasLate && orderUpdated {
+		// 客诉雷达:订单已过期但渠道侧实际已扣款,Confirm 仍按 §5.3 兑付。
+		// 频率升高 = "success 页显示失败但其实已兑付"类客诉的前兆,配
+		// payment_late_payment_honored_total{channel} 告警。
+		log.Printf("late payment honored post-expiry: order=%s payment=%s channel=%s user=%s amount=%.2f %s",
+			order.ID, paymentID, in.Channel, order.UserID, order.Amount, order.Currency)
+		s.metrics.LatePaymentHonored(in.Channel)
 	}
 
 	return &ConfirmResult{

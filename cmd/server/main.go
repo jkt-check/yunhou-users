@@ -196,6 +196,7 @@ func main() {
 	if len(cfg.PaddlePrices) > 0 {
 		paymentSvc.SetPaddlePrices(cfg.PaddlePrices)
 	}
+	paymentSvc.SetMetrics(service.NewPaymentMetrics(prometheus.DefaultRegisterer, cfg.AppEnv))
 
 	// Validate PayPal environment BEFORE building anything that depends on it.
 	// config.PaypalEnv 默认 ""（cn 域不启用 PayPal）。空值 = 未启用：webhook

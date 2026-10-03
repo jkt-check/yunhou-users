@@ -317,7 +317,7 @@ func TestDispatchBranch(t *testing.T) {
 		{"paddle", "transaction.past_due", branchNone},
 		{"paddle", "transaction.payment_failed", branchNone},
 		{"paddle", "subscription.activated", branchNone},
-		{"paddle", "subscription.canceled", branchNone},
+		{"paddle", "subscription.canceled", branchSubscriptionCancelled},
 		{"paddle", "subscription.updated", branchNone},
 		{"paddle", "subscription.past_due", branchNone},
 		{"paddle", "adjustment.created", branchNone},

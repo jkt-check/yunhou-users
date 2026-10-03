@@ -64,4 +64,6 @@ type PaymentServiceInterface interface {
 	GetPayment(ctx context.Context, paymentID, userID string) (*model.Payment, error)
 	ListPaymentRefunds(ctx context.Context, paymentID, userID string) ([]model.Refund, error)
 	GetRefund(ctx context.Context, refundID, userID string) (*model.Refund, error)
+	CancelChannelSubscription(ctx context.Context, userID string) (*model.Subscription, error)
+	UpgradeChannelSubscription(ctx context.Context, userID, targetPlanID string) (*ChannelUpgradeResult, error)
 }

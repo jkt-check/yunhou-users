@@ -44,6 +44,8 @@ type paddleClient interface {
 	ClientToken() string
 	CreateCheckoutTransaction(ctx context.Context, priceID string, customData map[string]any, currency string) (*billingpaddle.CheckoutTransaction, error)
 	GetSubscriptionNextBilledAt(ctx context.Context, subscriptionID string) (*time.Time, error)
+	CancelSubscription(ctx context.Context, subscriptionID string) error
+	UpdateSubscriptionPrice(ctx context.Context, subscriptionID, priceID string) (*time.Time, error)
 }
 
 // ErrPaddleNotConfigured is returned by CreateOrder when channel="paddle"
@@ -1820,6 +1822,11 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 		if err := s.onDisputeClosed(ctx, e); err != nil {
 			return nil, err
 		}
+	case branchSubscriptionCancelled:
+		domainAction = branch.domainAction()
+		if err := s.onPaddleSubscriptionCancelled(ctx, e); err != nil {
+			return nil, err
+		}
 	default:
 		// Unknown / uninteresting event types: log to webhook_events
 		// (done above) and ack 200. No domain action.
@@ -3401,6 +3408,7 @@ const (
 	branchDisputeCreated
 	branchDisputeClosed
 	branchRenewal
+	branchSubscriptionCancelled
 )
 
 // domainAction is the OnWebhookResult.DomainAction value for a branch.
@@ -3418,6 +3426,8 @@ func (b webhookBranch) domainAction() string {
 		return "payment_disputed"
 	case branchDisputeClosed:
 		return "payment_dispute_closed"
+	case branchSubscriptionCancelled:
+		return "subscription_cancelled"
 	default:
 		return "none"
 	}
@@ -3498,6 +3508,14 @@ var channelWebhookBranches = map[string]map[string]webhookBranch{
 		// adjustment.* are likewise audit-only: settlement is anchored on
 		// transaction.completed money events only, and refunds remain
 		// webhook-unhandled for paddle (ops manual).
+		//
+		// subscription.canceled is the ONE subscription.* event with a
+		// domain action: the cancellation has taken effect channel-side
+		// (period end after a self-serve cancel, or immediate after an
+		// ops dashboard cancel), so the local sub flips + entitlement
+		// revokes here (CancelChannelSubscription deliberately leaves the
+		// local row active until this arrives).
+		"subscription.canceled": branchSubscriptionCancelled,
 	},
 }
 

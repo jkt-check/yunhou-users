@@ -21,6 +21,16 @@ type stubPaddle struct {
 	gotPrice string
 	gotCurr  string
 	gotData  map[string]any
+
+	cancelErr   error
+	cancelCalls int
+	cancelGotID string
+
+	updateNext     *time.Time
+	updateErr      error
+	updateCalls    int
+	updateGotID    string
+	updateGotPrice string
 }
 
 func (s *stubPaddle) IsMockMode() bool { return false }
@@ -36,6 +46,17 @@ func (s *stubPaddle) CreateCheckoutTransaction(_ context.Context, priceID string
 }
 func (s *stubPaddle) GetSubscriptionNextBilledAt(_ context.Context, _ string) (*time.Time, error) {
 	return s.next, s.nextErr
+}
+func (s *stubPaddle) CancelSubscription(_ context.Context, subscriptionID string) error {
+	s.cancelCalls++
+	s.cancelGotID = subscriptionID
+	return s.cancelErr
+}
+func (s *stubPaddle) UpdateSubscriptionPrice(_ context.Context, subscriptionID, priceID string) (*time.Time, error) {
+	s.updateCalls++
+	s.updateGotID = subscriptionID
+	s.updateGotPrice = priceID
+	return s.updateNext, s.updateErr
 }
 
 func TestValidateChannel_Paddle(t *testing.T) {

@@ -115,6 +115,61 @@ func (h *PaymentHandler) CancelOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "cancelled"})
 }
 
+// CancelChannelSubscription — POST /payments/subscription/cancel
+//
+// Paddle-managed subscriptions only: cancels the channel-side subscription
+// with Paddle's default effective_from (next_billing_period) — the buyer
+// keeps access until the paid period ends, no more charges. The local
+// status flips when Paddle's subscription.canceled webhook arrives.
+func (h *PaymentHandler) CancelChannelSubscription(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+	sub, err := h.svc.CancelChannelSubscription(c.Request.Context(), userID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
+		"subscription_id": sub.ID,
+		"plan_id":         sub.PlanID,
+		"expires_at":      sub.ExpiresAt,
+		"message":         "subscription will cancel at the end of the current billing period",
+	}})
+}
+
+// UpgradeChannelSubscription — POST /payments/subscription/upgrade
+//
+// Paddle-managed subscriptions only: monthly → yearly via Paddle
+// subscription update + proration (charged the difference immediately).
+func (h *PaymentHandler) UpgradeChannelSubscription(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+	var req struct {
+		PlanID string `json:"plan_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+	res, err := h.svc.UpgradeChannelSubscription(c.Request.Context(), userID, req.PlanID)
+	if err != nil {
+		writePaymentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
+		"subscription_id": res.SubscriptionID,
+		"from_plan_id":    res.FromPlanID,
+		"to_plan_id":      res.ToPlanID,
+		"next_billed_at":  res.NextBilledAt,
+	}})
+}
+
 // ConfirmOrder — POST /payments/orders/:order_id/confirm
 func (h *PaymentHandler) ConfirmOrder(c *gin.Context) {
 	userID := c.GetString(middleware.ContextUserID)
@@ -350,6 +405,17 @@ func writePaymentError(c *gin.Context, err error) {
 		// 400 — operator error: the plan has no entry in
 		// PADDLE_PRICES_JSON. Terminal until the config is fixed.
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "paddle price not configured for this plan"})
+	case errors.Is(err, service.ErrSubscriptionNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "no active subscription"})
+	case errors.Is(err, service.ErrSubscriptionNotChannelManaged):
+		// 409 — the active subscription is local/WeChat/PayPal-managed;
+		// its lifecycle lives elsewhere (DELETE /subscriptions/:id, the
+		// PayPal dashboard).
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "active subscription is not managed by an auto-renewing channel"})
+	case errors.Is(err, service.ErrSamePlanChange):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "subscription is already on this plan"})
+	case errors.Is(err, service.ErrPlanChangeNotUpgrade):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan change is not an upgrade; downgrade stays manual (cancel + re-purchase)"})
 	case errors.Is(err, wechat.ErrWechatMisconfigured):
 		// 500 — the deployment is in real-mode (MockMode=false) but the
 		// AppID/Signer/MchID is unset. Operator-fixable and logged with

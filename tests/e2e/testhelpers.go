@@ -168,6 +168,7 @@ func seedTestData(t *testing.T, db *sqlx.DB) {
 		{"free", "免费", "CNY", 0, 0, "{yundian}", 0, "免费版（已下线）", false, false, 0},
 		{"monthly", "按月订阅", "CNY", 19.9, 30, "{yundian,yundash}", 0, "按月订阅 ¥19.9，自动续费，可随时取消", true, true, 10},
 		{"monthly_usd", "Monthly PayPal Test", "USD", 29.9, 30, "{}", 0, "PayPal USD test fixture", false, true, 0},
+		{"yearly_usd", "Yearly PayPal Test", "USD", 299.9, 365, "{}", 0, "PayPal USD yearly test fixture (paddle upgrade target)", false, true, 0},
 		// trial mirrors migration 018 (grantable by auth on first login,
 		// never purchasable, never listed). is_active is not in the
 		// INSERT column list and defaults to true, matching the migration.

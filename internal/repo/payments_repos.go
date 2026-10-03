@@ -59,6 +59,18 @@ type OrderRepo interface {
 	// which is safe: they predate the auto-renew channels.
 	FindPendingByUserAndProduct(ctx context.Context, userID, productCode string) (*model.Order, error)
 
+	// FailPending atomically transitions pending → failed. Used as
+	// compensation when post-insert provider pre-auth fails (Paddle
+	// transaction creation / WeChat UnifiedOrder): the order would
+	// otherwise sit pending until the sweeper expires it
+	// (ORDER_EXPIRY_DURATION, default 30m), and for auto-renew channels
+	// the pending-order guard rejects every retry in that window
+	// (2026-10-03 intl-prod: a misconfigured PADDLE_PRICES_JSON blocked
+	// a real subscriber's retries for 30 minutes). The WHERE clause is
+	// the guard: a concurrently-settled order is never flipped. Returns
+	// false when the row was no longer pending.
+	FailPending(ctx context.Context, id string) (bool, error)
+
 	// CreateInTx performs the same INSERT as Create, but inside the
 	// caller-managed *sqlx.Tx. Used by PaymentService.CreateOrder to make
 	// the order INSERT part of the same transaction that locks the plan
@@ -212,6 +224,24 @@ func (r *orderRepo) CancelPending(ctx context.Context, id, userID string) (bool,
 		UPDATE orders SET status = 'cancelled', updated_at = now()
 		WHERE id = $1 AND user_id = $2 AND status = 'pending'
 	`, id, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// FailPending mirrors CancelPending's atomic-WHERE pattern, minus the
+// ownership check: the only caller is CreateOrder's pre-auth compensation,
+// which flips the row it just inserted for the same user.
+func (r *orderRepo) FailPending(ctx context.Context, id string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE orders SET status = 'failed', updated_at = now()
+		WHERE id = $1 AND status = 'pending'
+	`, id)
 	if err != nil {
 		return false, err
 	}

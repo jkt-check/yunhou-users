@@ -192,6 +192,20 @@ func TestPaymentHandler_CreateOrder(t *testing.T) {
 		}
 	})
 
+	t.Run("unfinished pending checkout → 409 with distinct wording", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: service.ErrUserHasPendingOrder}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{"plan_id": "monthly", "channel": "paddle"})
+
+		if rec.Code != http.StatusConflict {
+			t.Errorf("status: got %d, want 409", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "unfinished checkout") {
+			t.Errorf("body should carry the pending-checkout wording, got %s", rec.Body.String())
+		}
+	})
+
 	t.Run("missing plan_id → 400 (binding)", func(t *testing.T) {
 		t.Parallel()
 		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")

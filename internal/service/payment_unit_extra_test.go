@@ -44,6 +44,12 @@ type stubOrderRepoLookup struct {
 	// FindPendingByUserAndProduct to drive the "an unexpired pending
 	// order already exists" branch. Nil = no pending order (sql.ErrNoRows).
 	pendingByProduct *model.Order
+	// FailPending observability for the pre-auth failure compensation
+	// (pending → failed flip): failSeen records the order ID, failOK /
+	// failErr drive the return.
+	failSeen string
+	failOK   bool
+	failErr  error
 }
 
 func (s *stubOrderRepoLookup) Create(_ context.Context, order *model.Order) error {
@@ -102,6 +108,13 @@ func (s *stubOrderRepoLookup) FindPendingByUserAndProduct(_ context.Context, _, 
 		return s.pendingByProduct, nil
 	}
 	return nil, sql.ErrNoRows
+}
+func (s *stubOrderRepoLookup) FailPending(_ context.Context, id string) (bool, error) {
+	s.failSeen = id
+	if s.failErr != nil {
+		return false, s.failErr
+	}
+	return s.failOK, nil
 }
 
 // stubPaymentRepoLookup — minimal PaymentRepo for GetPayment / GetRefund.
@@ -556,10 +569,40 @@ func TestCreateOrder_WeChat_Real_UnifiedOrderErr(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	if order == nil || orderRepo.created == nil {
-		t.Fatal("pending order should remain after UnifiedOrder failure")
+		t.Fatal("the order row is created before UnifiedOrder runs")
+	}
+	// Pre-auth compensation: the failed UnifiedOrder must flip the fresh
+	// order pending → failed (failOrderOnPreAuthError), not leave it to
+	// the sweeper.
+	if orderRepo.failSeen != orderRepo.created.ID {
+		t.Fatalf("FailPending(%q), want the fresh order %s", orderRepo.failSeen, orderRepo.created.ID)
 	}
 	if orderRepo.updateIntentCalled {
 		t.Fatal("UpdateProviderIntent should not be called when UnifiedOrder fails")
+	}
+}
+
+// TestCreateOrder_WeChat_Real_IntentPersistErr_MarksOrderFailed covers the
+// sibling failure: UnifiedOrder succeeded but writing provider_intent to
+// the DB failed. The fresh order must be flipped to failed too.
+func TestCreateOrder_WeChat_Real_IntentPersistErr_MarksOrderFailed(t *testing.T) {
+	stub := &stubWechat{
+		unifiedFn: func(_ context.Context, _ wechat.UnifiedOrderRequest) (*wechat.UnifiedOrderResponse, error) {
+			return &wechat.UnifiedOrderResponse{CodeURL: "weixin://wxpay/bizpayurl?pr=x"}, nil
+		},
+	}
+	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
+	orderRepo.updateIntentErr = errors.New("db down")
+
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	if err == nil || !strings.Contains(err.Error(), "persist provider intent") {
+		t.Fatalf("expected persist provider intent error, got %v", err)
+	}
+	if orderRepo.created == nil {
+		t.Fatal("expected the order row to be created before the intent write")
+	}
+	if orderRepo.failSeen != orderRepo.created.ID {
+		t.Fatalf("FailPending(%q), want the fresh order %s", orderRepo.failSeen, orderRepo.created.ID)
 	}
 }
 

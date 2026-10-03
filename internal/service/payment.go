@@ -724,16 +724,25 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		// channel mints TWO auto-renewing subscriptions, the local
 		// external_subscription_id is overwritten by the later one, and the
 		// earlier subscription keeps charging with no local handle to
-		// cancel it. Reject with the same ErrUserHasActiveSub the handler
-		// already maps to 409. WeChat has no auto-renewal: multiple
+		// cancel it. Reject with ErrUserHasPendingOrder (409, distinct
+		// wording since 2026-10-03: the user has not paid anything yet —
+		// the active-sub message read as "checkout is impossible" instead
+		// of "retry shortly"). WeChat has no auto-renewal: multiple
 		// pending orders there are fine (paying any one of them rolls
 		// over), so it is unaffected. The retried-request trade-off (a
 		// client retry of the SAME checkout intent also 409s until the
 		// first order expires or is cancelled) is accepted: double
 		// channel-side subscriptions are unrecoverable, a 409 is not.
+		// The guard matches pending orders of ANY channel under the same
+		// (user, product) — an unpaid WeChat QR blocks a paddle checkout
+		// for the same product until expiry. Conservative by design; the
+		// DB-level test pins this cross-channel semantics.
+		// Post-insert pre-auth failures flip their order to failed, so the
+		// common "checkout never opened" retry is NOT held for the full
+		// ORDER_EXPIRY_DURATION window — only a genuinely open checkout is.
 		if channelAutoRenews(channel) {
 			if _, err := s.orderRepo.FindPendingByUserAndProduct(ctx, userID, requestedPlan.ProductCode); err == nil {
-				return nil, ErrUserHasActiveSub
+				return nil, ErrUserHasPendingOrder
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return nil, fmt.Errorf("check pending order: %w", err)
 			}
@@ -747,6 +756,33 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	err := s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, orderKind, upgradeFromPlanID, &order)
 	if err != nil {
 		return nil, err
+	}
+
+	// failOrderOnPreAuthError compensates a post-insert pre-auth failure:
+	// the fresh order would otherwise sit pending until the sweeper
+	// expires it (ORDER_EXPIRY_DURATION, default 30m), and for
+	// auto-renew channels the pending-order guard rejects every retry in
+	// that window (2026-10-03 intl-prod: a misconfigured
+	// PADDLE_PRICES_JSON left a real subscriber staring at 409s for 30
+	// minutes without ever seeing a card form). Best-effort: the flip is
+	// WHERE status='pending' guarded so a concurrently-settled order is
+	// never stomped; a failed flip leaves the sweeper as backstop
+	// (pre-fix behavior), so the original error is what propagates.
+	failOrderOnPreAuthError := func() {
+		// Detached context: when the pre-auth failure was itself caused by
+		// the request ctx being cancelled (client disconnect, gateway
+		// deadline — a common cause of the paddle API error path), reusing
+		// it would fail the compensation instantly with context.Canceled
+		// and the order would linger pending anyway — the exact incident
+		// shape this fix exists for (review Major-1).
+		compCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		ok, ferr := s.orderRepo.FailPending(compCtx, order.ID)
+		if ferr != nil {
+			log.Printf("create order: flip order %s to failed after pre-auth error: %v", order.ID, ferr)
+		} else if !ok {
+			log.Printf("create order: order %s no longer pending at pre-auth error compensation (settled elsewhere?)", order.ID)
+		}
 	}
 
 	// WeChat Pay NATIVE: mint code_url so the BFF can render a QR. The
@@ -771,6 +807,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		normalized := strings.ReplaceAll(amountStr, ".", "")
 		amountFen, err := strconv.ParseInt(normalized, 10, 64)
 		if err != nil {
+			failOrderOnPreAuthError()
 			return order, fmt.Errorf("amount to fen: %w", err)
 		}
 
@@ -786,8 +823,10 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 			TradeType:   wechat.TradeTypeNative,
 		})
 		if err != nil {
-			// The pending order already exists. The caller may cancel and retry,
-			// or the sweeper will eventually expire it.
+			// The fresh pending order is flipped to failed so the caller
+			// can retry immediately instead of waiting out the sweeper
+			// window (failOrderOnPreAuthError).
+			failOrderOnPreAuthError()
 			return order, fmt.Errorf("wechat unified order: %w", err)
 		}
 
@@ -802,6 +841,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		})
 		intent := json.RawMessage(intentBytes)
 		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intentBytes); err != nil {
+			failOrderOnPreAuthError()
 			return order, fmt.Errorf("persist provider intent: %w", err)
 		}
 		// Stamp LastReconciledAt = now so the first FE poll after
@@ -829,14 +869,16 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	if channel == "paddle" {
 		priceID := s.paddlePrices[planID]
 		if priceID == "" {
-			// Order row already exists; returning it with the error
-			// mirrors the wechat UnifiedOrder failure shape (caller may
-			// cancel/retry; the sweeper expires it otherwise).
+			// Order row already exists; flip it to failed so the pending
+			// guard does not hold the user's retries for the full sweeper
+			// window (the 2026-10-03 intl-prod incident shape).
+			failOrderOnPreAuthError()
 			return order, ErrPaddlePriceNotConfigured
 		}
 		res, err := s.paddle.CreateCheckoutTransaction(ctx, priceID,
 			map[string]any{"order_id": order.ID}, order.Currency)
 		if err != nil {
+			failOrderOnPreAuthError()
 			return order, fmt.Errorf("paddle checkout transaction: %w", err)
 		}
 		intentBytes, _ := json.Marshal(map[string]string{
@@ -845,6 +887,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 			"client_token":   s.paddle.ClientToken(),
 		})
 		if err := s.orderRepo.UpdateProviderIntent(ctx, order.ID, intentBytes); err != nil {
+			failOrderOnPreAuthError()
 			return order, fmt.Errorf("persist provider intent: %w", err)
 		}
 		intent := json.RawMessage(intentBytes)

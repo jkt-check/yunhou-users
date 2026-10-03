@@ -350,6 +350,11 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan currency does not match order currency"})
 	case errors.Is(err, service.ErrUserHasActiveSub):
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
+	case errors.Is(err, service.ErrUserHasPendingOrder):
+		// 未完成的 checkout（用户尚未付款）——与 active 订阅的 409 区分
+		// 文案，避免 "already has an active subscription" 让用户误以为
+		// 无法订阅（2026-10-03 intl-prod 真实用户被误导）。
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "you have an unfinished checkout in progress — it expires within 30 minutes, then you can retry"})
 	case errors.Is(err, service.ErrPlanDowngrade):
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "downgrade to a shorter billing cycle is not allowed with an active subscription"})
 	case errors.Is(err, service.ErrPlanNotPurchasable):

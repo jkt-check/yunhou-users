@@ -86,6 +86,33 @@ func TestOrderRepo_CreateFindCancelSweep(t *testing.T) {
 		}
 	})
 
+	t.Run("FailPending transitions pending → failed", func(t *testing.T) {
+		order3 := &model.Order{
+			ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+			Amount: 29.9, Currency: "CNY", Status: "pending",
+			ExpiresAt: time.Now().Add(30 * time.Minute),
+		}
+		_ = r.Create(context.Background(), order3)
+		ok, err := r.FailPending(context.Background(), order3.ID)
+		if err != nil || !ok {
+			t.Fatalf("FailPending: ok=%v err=%v", ok, err)
+		}
+		got, _ := r.FindByID(context.Background(), order3.ID)
+		if got.Status != "failed" {
+			t.Errorf("Status = %q, want failed", got.Status)
+		}
+	})
+
+	t.Run("FailPending refuses non-pending", func(t *testing.T) {
+		ok, err := r.FailPending(context.Background(), order.ID)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if ok {
+			t.Errorf("expected ok=false on already-cancelled order")
+		}
+	})
+
 	t.Run("ListByUserID", func(t *testing.T) {
 		list, err := r.ListByUserID(context.Background(), alice.ID)
 		if err != nil {

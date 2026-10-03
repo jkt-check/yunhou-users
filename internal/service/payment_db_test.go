@@ -350,7 +350,7 @@ func TestPaymentService_CreateOrder_PaypalTrialSubExempt(t *testing.T) {
 // external_subscription_id overwritten by the later one, the earlier one
 // charging forever with no local cancel handle. An unexpired pending
 // order in the same product must reject the second CreateOrder (409 via
-// ErrUserHasActiveSub); a manual-renewal channel (stripe) stays allowed.
+// ErrUserHasPendingOrder); a manual-renewal channel (stripe) stays allowed.
 func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
@@ -371,12 +371,12 @@ func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
 		t.Fatalf("first order status = %q, want pending", first.Status)
 	}
 	// Second paddle order while the first checkout is still open → 409.
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasActiveSub) {
-		t.Fatalf("second paddle order: err = %v, want ErrUserHasActiveSub", err)
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasPendingOrder) {
+		t.Fatalf("second paddle order: err = %v, want ErrUserHasPendingOrder", err)
 	}
 	// PayPal shares the auto-renew shape → also blocked.
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal"); !errors.Is(err, ErrUserHasActiveSub) {
-		t.Fatalf("paypal order with pending paddle order: err = %v, want ErrUserHasActiveSub", err)
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal"); !errors.Is(err, ErrUserHasPendingOrder) {
+		t.Fatalf("paypal order with pending paddle order: err = %v, want ErrUserHasPendingOrder", err)
 	}
 	// WeChat/stripe have no channel-side auto-renewal: a parallel pending
 	// order there is the long-standing manual-renewal shape, still allowed.
@@ -390,8 +390,8 @@ func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
 	if err := svc.CancelOrder(context.Background(), first.ID, uid); err != nil {
 		t.Fatalf("cancel first order: %v", err)
 	}
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasActiveSub) {
-		t.Fatalf("paddle order with a pending stripe order: err = %v, want ErrUserHasActiveSub", err)
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasPendingOrder) {
+		t.Fatalf("paddle order with a pending stripe order: err = %v, want ErrUserHasPendingOrder", err)
 	}
 	if err := svc.CancelOrder(context.Background(), stripeOrder.ID, uid); err != nil {
 		t.Fatalf("cancel stripe order: %v", err)

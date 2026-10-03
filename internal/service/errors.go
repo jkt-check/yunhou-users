@@ -34,6 +34,13 @@ var (
 	ErrCannotRenewCancelled = errors.New("cannot renew a cancelled subscription")
 	ErrInvalidExpiresAt     = errors.New("expires_at must be non-nil and in the future")
 	ErrUserHasActiveSub     = errors.New("user already has an active subscription")
+	// ErrUserHasPendingOrder: an auto-renew channel (Paddle) checkout is
+	// already open for this user+product — a second one would mint two
+	// channel-side auto-renew subscriptions if both get paid. Distinct
+	// from ErrUserHasActiveSub since 2026-10-03: the user has NOT paid
+	// anything yet, and the active-sub wording made a real subscriber
+	// believe checkout was impossible rather than "retry shortly".
+	ErrUserHasPendingOrder  = errors.New("you have an unfinished checkout in progress")
 	ErrPlanDowngrade        = errors.New("downgrade to a shorter billing cycle is not allowed with an active subscription")
 	ErrSubscriptionExists   = errors.New("subscription already exists for this user")
 	ErrAppNotFound          = errors.New("app not found")

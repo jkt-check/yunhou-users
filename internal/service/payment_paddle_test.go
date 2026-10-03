@@ -15,6 +15,7 @@ import (
 type stubPaddle struct {
 	txnID    string
 	checkout string
+	txnErr   error
 	next     *time.Time
 	nextErr  error
 	calls    int
@@ -42,6 +43,9 @@ func (s *stubPaddle) CreateCheckoutTransaction(_ context.Context, priceID string
 	s.gotPrice = priceID
 	s.gotData = customData
 	s.gotCurr = currency
+	if s.txnErr != nil {
+		return nil, s.txnErr
+	}
 	return &billingpaddle.CheckoutTransaction{TransactionID: s.txnID, CheckoutURL: s.checkout}, nil
 }
 func (s *stubPaddle) GetSubscriptionNextBilledAt(_ context.Context, _ string) (*time.Time, error) {
@@ -148,6 +152,9 @@ func TestCreateOrder_Paddle_PersistsIntent(t *testing.T) {
 	if stub.calls != 1 {
 		t.Fatalf("CreateCheckoutTransaction called %d times, want 1", stub.calls)
 	}
+	if orderRepo.failSeen != "" {
+		t.Fatalf("happy path must not flip the order to failed, got FailPending(%q)", orderRepo.failSeen)
+	}
 	if stub.gotPrice != "pri_test_1" {
 		t.Fatalf("priceID = %q", stub.gotPrice)
 	}
@@ -200,6 +207,98 @@ func TestCreateOrder_Paddle_MissingPrice(t *testing.T) {
 	if !errors.Is(err, ErrPaddlePriceNotConfigured) {
 		t.Fatalf("expected ErrPaddlePriceNotConfigured, got %v (order=%+v)", err, order)
 	}
+	// Pre-auth compensation: the orphan pending order must be flipped to
+	// failed so the pending-order guard does not hold the user's retry
+	// for the full ORDER_EXPIRY_DURATION window (2026-10-03 intl-prod
+	// incident: misconfigured PADDLE_PRICES_JSON blocked a subscriber's
+	// retries for 30 minutes).
+	if orderRepo.created == nil {
+		t.Fatal("expected the order row to be created before the price lookup")
+	}
+	if orderRepo.failSeen != orderRepo.created.ID {
+		t.Fatalf("FailPending(%q), want the fresh order %s", orderRepo.failSeen, orderRepo.created.ID)
+	}
+}
+
+// TestCreateOrder_Paddle_TransactionError_MarksOrderFailed covers the
+// sibling failure: the Paddle API call itself fails (bad key, unknown
+// price id, network). The fresh order must be flipped to failed as
+// well, for the same reason as MissingPrice above.
+func TestCreateOrder_Paddle_TransactionError_MarksOrderFailed(t *testing.T) {
+	stub := &stubPaddle{txnErr: errors.New("paddle api: 401 unauthorized")}
+	orderRepo := &stubOrderRepoLookup{}
+	svc := NewPaymentService(
+		nil,
+		orderRepo,
+		nil,
+		nil,
+		&stubSubRepo{},
+		&stubPlanRepo{plan: &model.Plan{
+			ID:                        "plan-1",
+			Price:                     9.99,
+			IsActive:                  true,
+			AcceptingNewSubscriptions: true,
+			Currency:                  "USD",
+		}},
+		nil,
+		nil,
+		nil,
+		&stubRefundAPI{},
+		nil,
+		0,
+	)
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
+
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	if err == nil || !strings.Contains(err.Error(), "paddle checkout transaction") {
+		t.Fatalf("expected paddle checkout transaction error, got %v", err)
+	}
+	if orderRepo.created == nil {
+		t.Fatal("expected the order row to be created before the transaction call")
+	}
+	if orderRepo.failSeen != orderRepo.created.ID {
+		t.Fatalf("FailPending(%q), want the fresh order %s", orderRepo.failSeen, orderRepo.created.ID)
+	}
+}
+
+// TestCreateOrder_Paddle_IntentPersistError_MarksOrderFailed: the Paddle
+// transaction was minted channel-side but writing provider_intent failed.
+// The fresh order must be flipped to failed; the minted transaction is
+// unreachable (no URL leaked to the client), so it can never be paid.
+func TestCreateOrder_Paddle_IntentPersistError_MarksOrderFailed(t *testing.T) {
+	stub := &stubPaddle{txnID: "txn_persist_1", checkout: "https://yunhou.ai/checkout?_ptxn=txn_persist_1"}
+	orderRepo := &stubOrderRepoLookup{updateIntentErr: errors.New("db down")}
+	svc := NewPaymentService(
+		nil,
+		orderRepo,
+		nil,
+		nil,
+		&stubSubRepo{},
+		&stubPlanRepo{plan: &model.Plan{
+			ID:                        "plan-1",
+			Price:                     9.99,
+			IsActive:                  true,
+			AcceptingNewSubscriptions: true,
+			Currency:                  "USD",
+		}},
+		nil,
+		nil,
+		nil,
+		&stubRefundAPI{},
+		nil,
+		0,
+	)
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
+
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	if err == nil || !strings.Contains(err.Error(), "persist provider intent") {
+		t.Fatalf("expected persist provider intent error, got %v", err)
+	}
+	if orderRepo.failSeen != orderRepo.created.ID {
+		t.Fatalf("FailPending(%q), want the fresh order %s", orderRepo.failSeen, orderRepo.created.ID)
+	}
 }
 
 // TestCreateOrder_Paddle_PendingOrderRejected pins the pending-order guard
@@ -209,8 +308,9 @@ func TestCreateOrder_Paddle_MissingPrice(t *testing.T) {
 // up with two channel-side auto-renew subscriptions — the later payment
 // overwrites external_subscription_id and the earlier one keeps charging
 // with no local cancel handle. An unexpired pending order in the same
-// product must reject the second CreateOrder with ErrUserHasActiveSub
-// (the handler already maps it to 409).
+// product must reject the second CreateOrder with ErrUserHasPendingOrder
+// (the handler maps it to 409 with "unfinished checkout" wording —
+// distinct from the active-sub message since 2026-10-03).
 func TestCreateOrder_Paddle_PendingOrderRejected(t *testing.T) {
 	stub := &stubPaddle{txnID: "txn_pending_1", checkout: "https://yunhou.ai/checkout?_ptxn=txn_pending_1"}
 	orderRepo := &stubOrderRepoLookup{
@@ -240,8 +340,8 @@ func TestCreateOrder_Paddle_PendingOrderRejected(t *testing.T) {
 	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
 
 	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
-	if !errors.Is(err, ErrUserHasActiveSub) {
-		t.Fatalf("expected ErrUserHasActiveSub, got %v", err)
+	if !errors.Is(err, ErrUserHasPendingOrder) {
+		t.Fatalf("expected ErrUserHasPendingOrder, got %v", err)
 	}
 	if stub.calls != 0 {
 		t.Fatal("CreateCheckoutTransaction must not run when a pending order blocks the request")

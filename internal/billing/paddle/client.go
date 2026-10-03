@@ -109,6 +109,64 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 	return &CheckoutTransaction{TransactionID: res.ID, CheckoutURL: *res.Checkout.URL}, nil
 }
 
+// CancelSubscription cancels the channel-side subscription with the
+// DEFAULT effective_from (next_billing_period): the buyer keeps access
+// until the paid period ends and is never charged again. Paddle applies
+// it as a scheduled_change and fires subscription.canceled when the
+// cancellation takes effect — the local status flip hangs off that
+// webhook (service.onPaddleSubscriptionCancelled), so access and billing
+// end at the same moment.
+func (c *Client) CancelSubscription(ctx context.Context, subscriptionID string) error {
+	if c.MockMode {
+		return nil
+	}
+	if c.SDK == nil {
+		return errors.New("paddle client: SDK not wired")
+	}
+	if _, err := c.SDK.CancelSubscription(ctx, &paddle.CancelSubscriptionRequest{SubscriptionID: subscriptionID}); err != nil {
+		return fmt.Errorf("paddle cancel subscription: %w", err)
+	}
+	return nil
+}
+
+// UpdateSubscriptionPrice swaps the subscription's catalog price (e.g.
+// monthly → yearly) with proration_billing_mode=prorated_immediately:
+// Paddle charges the prorated difference NOW and re-anchors billing on
+// the new price's cycle. Returns the new next_billed_at (nil when the
+// response doesn't carry one — callers fall back to the plan interval).
+func (c *Client) UpdateSubscriptionPrice(ctx context.Context, subscriptionID, priceID string) (*time.Time, error) {
+	if c.MockMode {
+		t := time.Now().AddDate(1, 0, 0).UTC()
+		return &t, nil
+	}
+	if c.SDK == nil {
+		return nil, errors.New("paddle client: SDK not wired")
+	}
+	res, err := c.SDK.UpdateSubscription(ctx, &paddle.UpdateSubscriptionRequest{
+		SubscriptionID: subscriptionID,
+		Items: paddle.NewPatchField([]paddle.UpdateSubscriptionItems{
+			{
+				SubscriptionUpdateItemFromCatalog: &paddle.SubscriptionUpdateItemFromCatalog{
+					PriceID:  priceID,
+					Quantity: 1,
+				},
+			},
+		}),
+		ProrationBillingMode: paddle.NewPatchField(paddle.ProrationBillingModeProratedImmediately),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("paddle update subscription: %w", err)
+	}
+	if res.NextBilledAt == nil || *res.NextBilledAt == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, *res.NextBilledAt)
+	if err != nil {
+		return nil, fmt.Errorf("paddle next_billed_at %q: %w", *res.NextBilledAt, err)
+	}
+	return &t, nil
+}
+
 // GetSubscriptionNextBilledAt returns the subscription's next_billed_at.
 // transaction.completed webhooks don't carry the next billing date (it lives
 // on the subscription object), so the renewal path resolves it here.

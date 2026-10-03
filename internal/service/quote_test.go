@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -363,5 +364,29 @@ func TestQuote_Get_AmountOverride_NoFallback(t *testing.T) {
 	}
 	if quote.Amount != 199.9 {
 		t.Errorf("quote.Amount = %v; want 199.9 (yearly not in override map)", quote.Amount)
+	}
+}
+
+// TestQuote_Get_ClampsHugeCycleDays pins the day→time.Duration overflow
+// guard on the quote path (2026-10 review): trial_days + interval_days are
+// operator-controlled (validated only for non-negativity), so a huge value
+// would wrap the days*24h multiply and quote a sub_expires_at in the past.
+// The clamp (maxIntervalDays) keeps it far-future.
+func TestQuote_Get_ClampsHugeCycleDays(t *testing.T) {
+	plan := &model.Plan{
+		ID: "monthly", Name: "Monthly", Price: 29.9, IntervalDays: math.MaxInt32,
+		Currency: "USD", TrialDays: 0,
+		Apps: pq.StringArray{"yundian"}, IsActive: true,
+	}
+	app := &model.App{AppID: "yundian", Name: "Yundian", IsActive: true}
+	svc := NewQuoteService(&mockPlanRepo{plans: map[string]*model.Plan{"monthly": plan}}, &stubQuoteAppRepo{app: app})
+
+	quote, err := svc.Get(context.Background(), "yundian", "monthly", "user-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if lo, hi := now.AddDate(200, 0, 0), now.AddDate(300, 0, 0); quote.SubExpiresAt.Before(lo) || quote.SubExpiresAt.After(hi) {
+		t.Errorf("SubExpiresAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", quote.SubExpiresAt)
 	}
 }

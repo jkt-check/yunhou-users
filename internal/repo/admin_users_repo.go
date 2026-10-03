@@ -96,6 +96,8 @@ type AdminUsersTx interface {
 	// ExtendMembershipSub adds days to the active kaya-membership row
 	// (GREATEST(expires_at, now()) + days). updated=false means the UPDATE
 	// matched 0 rows — the pre-read active row was concurrently cancelled.
+	// Lifetime rows (expires_at NULL) keep NULL — 终身保持终身 — and
+	// expiresAt comes back as the zero time.
 	ExtendMembershipSub(ctx context.Context, userID string, days int) (updated bool, planID string, expiresAt time.Time, err error)
 	// GetIdempotencyRecord returns the stored first-success record for
 	// (appID, key), or (nil, nil) when the key has never succeeded.
@@ -417,10 +419,14 @@ func (t *adminUsersTx) InsertMembershipSub(ctx context.Context, userID string, d
 
 func (t *adminUsersTx) ExtendMembershipSub(ctx context.Context, userID string, days int) (bool, string, time.Time, error) {
 	var planID string
-	var expiresAt time.Time
+	var expiresAt sql.NullTime
+	// 终身订阅(expires_at NULL)保持 NULL:GREATEST 会把 NULL 当 -inf
+	// 改写成有限期,把终身会员悄悄变成限时会员。service 层已按 Rule 2
+	// 拒掉终身加时长,这里是并发/未来调用路径下的防御语义。
 	err := t.tx.QueryRowxContext(ctx, `
 		UPDATE subscriptions
-		   SET expires_at = GREATEST(expires_at, now()) + make_interval(days => $2),
+		   SET expires_at = CASE WHEN expires_at IS NULL THEN NULL
+		                         ELSE GREATEST(expires_at, now()) + make_interval(days => $2) END,
 		       updated_at = now()
 		 WHERE user_id = $1 AND status = 'active' AND product_code = $3
 		RETURNING plan_id, expires_at
@@ -432,7 +438,7 @@ func (t *adminUsersTx) ExtendMembershipSub(ctx context.Context, userID string, d
 		}
 		return false, "", time.Time{}, err
 	}
-	return true, planID, expiresAt, nil
+	return true, planID, expiresAt.Time, nil
 }
 
 func (t *adminUsersTx) GetIdempotencyRecord(ctx context.Context, appID, key string) (*AdminIdempotencyRecord, error) {

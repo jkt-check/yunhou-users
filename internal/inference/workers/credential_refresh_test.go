@@ -42,7 +42,10 @@ type refreshVendor struct {
 	calls     int
 	onCall    func()
 	health    int // health endpoint status (default 200)
-	quotaBody string
+	// healthBlock: 非 nil 时 /health 挂起直到通道关闭或客户端断开（模拟厂
+	// 商 stall——worker 厂商调用超时的对抗测试）。
+	healthBlock <-chan struct{}
+	quotaBody   string
 }
 
 type stubResponse struct {
@@ -83,7 +86,15 @@ func newRefreshVendor(t *testing.T) *refreshVendor {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		v.mu.Lock()
 		status := v.health
+		block := v.healthBlock
 		v.mu.Unlock()
+		if block != nil {
+			select {
+			case <-block:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		fmt.Fprint(w, `{}`)
@@ -378,5 +389,47 @@ func TestCredentialRefreshWorkerConnectorDown(t *testing.T) {
 	env.db.QueryRow(`SELECT generation FROM inference_credentials c JOIN inference_upstream_accounts a ON a.credential_id = c.id WHERE a.id = $1`, accountID).Scan(&gen)
 	if acctStatus != "active" || gen != 1 {
 		t.Fatalf("connector down must not touch state: acct=%s gen=%d", acctStatus, gen)
+	}
+}
+
+// 评审修复（组5-A）：厂商 token 端点挂起（永不返回响应头）不得冻结顺序
+// 执行的 pass——VendorTimeout 子 ctx 超时后经 connector 归为可重试失败，
+// 账号状态不动，pass 返回并可继续后续轮次。
+func TestCredentialRefreshWorkerVendorStallBoundsPass(t *testing.T) {
+	env := newRefreshEnv(t)
+	credID, accountID := env.seedExpiringCredential(t)
+
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	env.vendor.push(stubResponse{block: stall, status: 200, body: `{}`})
+
+	w := NewCredentialRefresh(env.store, env.refresher(),
+		CredentialRefreshConfig{VendorTimeout: 300 * time.Millisecond}, nil)
+	type passResult struct {
+		m   CredentialRefreshMetrics
+		err error
+	}
+	done := make(chan passResult, 1)
+	go func() {
+		m, err := w.RunPass(context.Background())
+		done <- passResult{m, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.m.Retryable != 1 || r.m.Rotated != 0 || r.m.ReauthRequired != 0 {
+			t.Fatalf("stalled vendor must be retryable only: %+v", r.m)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh pass froze on stalled vendor")
+	}
+	var acctStatus string
+	var gen int64
+	env.db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, accountID).Scan(&acctStatus)
+	env.db.QueryRow(`SELECT generation FROM inference_credentials WHERE id = $1`, credID).Scan(&gen)
+	if acctStatus != "active" || gen != 1 {
+		t.Fatalf("vendor stall must not touch state: acct=%s gen=%d", acctStatus, gen)
 	}
 }

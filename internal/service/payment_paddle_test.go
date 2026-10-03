@@ -21,6 +21,16 @@ type stubPaddle struct {
 	gotPrice string
 	gotCurr  string
 	gotData  map[string]any
+
+	cancelErr   error
+	cancelCalls int
+	cancelGotID string
+
+	updateNext     *time.Time
+	updateErr      error
+	updateCalls    int
+	updateGotID    string
+	updateGotPrice string
 }
 
 func (s *stubPaddle) IsMockMode() bool { return false }
@@ -36,6 +46,17 @@ func (s *stubPaddle) CreateCheckoutTransaction(_ context.Context, priceID string
 }
 func (s *stubPaddle) GetSubscriptionNextBilledAt(_ context.Context, _ string) (*time.Time, error) {
 	return s.next, s.nextErr
+}
+func (s *stubPaddle) CancelSubscription(_ context.Context, subscriptionID string) error {
+	s.cancelCalls++
+	s.cancelGotID = subscriptionID
+	return s.cancelErr
+}
+func (s *stubPaddle) UpdateSubscriptionPrice(_ context.Context, subscriptionID, priceID string) (*time.Time, error) {
+	s.updateCalls++
+	s.updateGotID = subscriptionID
+	s.updateGotPrice = priceID
+	return s.updateNext, s.updateErr
 }
 
 func TestValidateChannel_Paddle(t *testing.T) {
@@ -178,5 +199,54 @@ func TestCreateOrder_Paddle_MissingPrice(t *testing.T) {
 	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
 	if !errors.Is(err, ErrPaddlePriceNotConfigured) {
 		t.Fatalf("expected ErrPaddlePriceNotConfigured, got %v (order=%+v)", err, order)
+	}
+}
+
+// TestCreateOrder_Paddle_PendingOrderRejected pins the pending-order guard
+// for auto-renewing channels (2026-10 review): the active-sub guard only
+// fires AFTER the first checkout settles, so without this check a user
+// could open two hosted checkouts for the same product, pay both, and end
+// up with two channel-side auto-renew subscriptions — the later payment
+// overwrites external_subscription_id and the earlier one keeps charging
+// with no local cancel handle. An unexpired pending order in the same
+// product must reject the second CreateOrder with ErrUserHasActiveSub
+// (the handler already maps it to 409).
+func TestCreateOrder_Paddle_PendingOrderRejected(t *testing.T) {
+	stub := &stubPaddle{txnID: "txn_pending_1", checkout: "https://yunhou.ai/checkout?_ptxn=txn_pending_1"}
+	orderRepo := &stubOrderRepoLookup{
+		pendingByProduct: &model.Order{ID: "ord-existing", UserID: "user-1", PlanID: "plan-1", Status: "pending"},
+	}
+	svc := NewPaymentService(
+		nil,
+		orderRepo,
+		nil,
+		nil,
+		&stubSubRepo{},
+		&stubPlanRepo{plan: &model.Plan{
+			ID:                        "plan-1",
+			Price:                     9.99,
+			IsActive:                  true,
+			AcceptingNewSubscriptions: true,
+			Currency:                  "USD",
+		}},
+		nil,
+		nil,
+		nil,
+		&stubRefundAPI{},
+		nil,
+		0,
+	)
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
+
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	if !errors.Is(err, ErrUserHasActiveSub) {
+		t.Fatalf("expected ErrUserHasActiveSub, got %v", err)
+	}
+	if stub.calls != 0 {
+		t.Fatal("CreateCheckoutTransaction must not run when a pending order blocks the request")
+	}
+	if orderRepo.created != nil {
+		t.Fatal("no second order row may be created while a pending order exists")
 	}
 }

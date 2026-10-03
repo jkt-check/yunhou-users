@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -115,4 +116,78 @@ func TestIdempotencyRecordRoundTrip(t *testing.T) {
 	if legacy == nil || legacy.RequestHash != nil {
 		t.Fatalf("legacy record: %+v, want nil hash", legacy)
 	}
+}
+
+// TestExtendMembershipSub pins the extend semantics in both directions:
+// finite rows extend from max(expires_at, now()); lifetime rows
+// (expires_at NULL) must stay NULL — GREATEST alone would treat NULL as
+// -inf and silently rewrite a lifetime membership into a finite one.
+func TestExtendMembershipSub(t *testing.T) {
+	db := setupDB(t)
+	ctx := context.Background()
+	r := NewAdminUsersRepo(db)
+
+	seed := func(t *testing.T, expiresAt interface{}) string {
+		t.Helper()
+		uid := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO users (id) VALUES ($1)`, uid); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO subscriptions (user_id, plan_id, status, expires_at, product_code)
+			VALUES ($1, 'monthly', 'active', $2, 'kaya-membership')
+		`, uid, expiresAt); err != nil {
+			t.Fatalf("seed membership: %v", err)
+		}
+		return uid
+	}
+
+	t.Run("lifetime row stays NULL", func(t *testing.T) {
+		uid := seed(t, nil)
+		err := r.WithTx(ctx, func(tx AdminUsersTx) error {
+			updated, planID, expiresAt, err := tx.ExtendMembershipSub(ctx, uid, 30)
+			if err != nil {
+				return err
+			}
+			if !updated || planID != "monthly" {
+				t.Errorf("updated=%v planID=%q, want true/monthly", updated, planID)
+			}
+			if !expiresAt.IsZero() {
+				t.Errorf("expiresAt = %v, want zero (lifetime preserved)", expiresAt)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("tx: %v", err)
+		}
+		var isNull bool
+		if err := db.GetContext(ctx, &isNull,
+			`SELECT expires_at IS NULL FROM subscriptions WHERE user_id = $1`, uid); err != nil || !isNull {
+			t.Fatalf("expires_at IS NULL = %v (err %v), want true", isNull, err)
+		}
+	})
+
+	t.Run("finite row extends from expiry", func(t *testing.T) {
+		base := time.Now().Add(10 * 24 * time.Hour).UTC().Truncate(time.Microsecond)
+		uid := seed(t, base)
+		var got time.Time
+		err := r.WithTx(ctx, func(tx AdminUsersTx) error {
+			updated, _, expiresAt, err := tx.ExtendMembershipSub(ctx, uid, 30)
+			if err != nil {
+				return err
+			}
+			if !updated {
+				t.Error("updated = false, want true")
+			}
+			got = expiresAt
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("tx: %v", err)
+		}
+		want := base.Add(30 * 24 * time.Hour)
+		if !got.Equal(want) {
+			t.Errorf("expiresAt = %v, want %v (base + 30d)", got, want)
+		}
+	})
 }

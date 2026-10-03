@@ -192,3 +192,50 @@ func TestParseSnapshot_RejectsHalfVersions(t *testing.T) {
 		t.Fatalf("snapshot = %+v", snap)
 	}
 }
+
+// 评审修复（组6-A）：跨 model alias 必须唯一。重复 alias 会让 Snapshot.Model
+// 的 map 遍历解析变成随机路由（同一请求被打到不同 upstream、按不同价格版本
+// 计费）；alias 撞 model ID 则被 exact-ID 查找静默遮蔽成死配置。发布闸与
+// ParseSnapshot 双侧拒绝，歧义目录既发不出也载不入。
+func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
+	mk := func(id string, aliases ...string) domain.Model {
+		return domain.Model{ID: id, DisplayName: "M", Aliases: aliases,
+			ContextTokens: 1000, MaxOutputTokens: 100,
+			Protocols:       []domain.Protocol{domain.ProtocolOpenAIChat},
+			InputModalities: []string{"text"}, OutputModalities: []string{"text"}}
+	}
+	prov := []domain.Provider{{ID: "p1", Code: "p", DisplayName: "P", AccessType: domain.AccessOfficialAPI, Status: "active"}}
+	parse := func(models ...domain.Model) error {
+		raw := BuildCatalogPayload(models, prov, nil, nil)
+		_, err := ParseSnapshot(&domain.ConfigRevision{Scope: domain.ScopeCatalog, Revision: 1,
+			Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: raw}})
+		return err
+	}
+
+	// 各自 alias 互不冲突 → 双侧放行（同一 model 重复列出同一 alias 无害）。
+	ok := []domain.Model{mk("m1", "latest", "latest"), mk("m2", "stable")}
+	if err := validateCatalogForPublish(ok, prov, nil); err != nil {
+		t.Errorf("distinct aliases rejected by publish gate: %v", err)
+	}
+	if err := parse(ok...); err != nil {
+		t.Errorf("distinct aliases rejected by ParseSnapshot: %v", err)
+	}
+
+	// 两个 model 配同一 alias → 双侧拒绝。
+	dup := []domain.Model{mk("m1", "latest"), mk("m2", "latest")}
+	if err := validateCatalogForPublish(dup, prov, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("duplicate alias, publish gate: err = %v, want invalid_input", err)
+	}
+	if err := parse(dup...); err == nil {
+		t.Error("duplicate alias: ParseSnapshot must fail (non-deterministic dispatch resolution)")
+	}
+
+	// alias 等于另一个 model 的 ID → 双侧拒绝。
+	shadow := []domain.Model{mk("m1"), mk("m2", "m1")}
+	if err := validateCatalogForPublish(shadow, prov, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("alias shadowing a model id, publish gate: err = %v, want invalid_input", err)
+	}
+	if err := parse(shadow...); err == nil {
+		t.Error("alias shadowing a model id: ParseSnapshot must fail (dead config)")
+	}
+}

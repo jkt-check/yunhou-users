@@ -217,8 +217,9 @@ func TestE2E_Paddle_TransactionCompleted_HappyPath(t *testing.T) {
 		t.Fatalf("renewal payment rows: %d", renewCount)
 	}
 
-	// Lifecycle events are audit-only: subscription.canceled must ack 200
-	// without touching the subscription.
+	// subscription.canceled 是生命周期事件中唯一有域动作的:渠道侧取消
+	// 已生效,本地订阅翻 cancelled(paddle_subscription_test.go 另有全链路
+	// 用例钉这条契约;其余 subscription.* 事件仍是 audit-only)。
 	cancelBody := []byte(`{
 	  "event_id": "evt-e2e-paddle-cancel-` + uuid.NewString() + `",
 	  "event_type": "subscription.canceled",
@@ -233,8 +234,8 @@ func TestE2E_Paddle_TransactionCompleted_HappyPath(t *testing.T) {
 	).Scan(&subStatus); err != nil {
 		t.Fatal(err)
 	}
-	if subStatus != "active" {
-		t.Fatalf("lifecycle event must not flip the subscription: %s", subStatus)
+	if subStatus != "cancelled" {
+		t.Fatalf("subscription.canceled must flip the subscription to cancelled: %s", subStatus)
 	}
 }
 

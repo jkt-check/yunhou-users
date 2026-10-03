@@ -443,9 +443,11 @@ func (v *WeChatPayV3Verifier) VerifySignature(channel string, body []byte, heade
 // Alipay — RSA2 (SHA256WithRSA) over canonical-string of form params
 // ============================================================================
 
-// AlipayVerifier verifies Alipay RSA2 (SHA256WithRSA) signatures. The signed
-// canonical string is the URL-encoded form params (excluding sign / sign_type)
-// sorted alphabetically by key. Public key is loaded once at startup.
+// AlipayVerifier verifies Alipay RSA2 (SHA256WithRSA) signatures. Per the
+// official async-notify spec, the signed canonical string is the form params
+// (excluding sign / sign_type) sorted alphabetically by key and joined as
+// key=value&... using the URL-DECODED values — Alipay signs the decoded
+// string, not a re-encoded one. Public key is loaded once at startup.
 //
 // Note: Alipay sends the payload as application/x-www-form-urlencoded in the
 // request body, NOT in headers — the middleware hands us the body.
@@ -479,7 +481,15 @@ func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers ma
 		return fmt.Errorf("%w: unsupported sign_type %s", ErrInvalidSignature, signType)
 	}
 
-	// Canonical string: keys sorted, excluding sign/sign_type, Alipay-encoded.
+	// Canonical string: keys sorted, excluding sign/sign_type, values used
+	// in their URL-DECODED form. url.ParseQuery above has already decoded
+	// them, so join k+"="+values.Get(k) directly. Re-encoding the decoded
+	// values here (the pre-fix behaviour) produced a byte-different string
+	// than the one Alipay signed — every real notification carries dots
+	// (total_amount=29.90), '-'/':'/' ' (gmt_create) or Chinese (subject),
+	// so the channel would have 400'd 100% of deliveries once enabled.
+	// Same incident class as the 2026-07-23 WeChat note above: verify the
+	// scheme the channel documents, not a mirror of our own guess.
 	keys := make([]string, 0, len(values))
 	for k := range values {
 		if k == "sign" || k == "sign_type" {
@@ -490,7 +500,7 @@ func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers ma
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		parts = append(parts, alipayURLEncode(k)+"="+alipayURLEncode(values.Get(k)))
+		parts = append(parts, k+"="+values.Get(k))
 	}
 	canonical := strings.Join(parts, "&")
 
@@ -521,27 +531,6 @@ func (v *AlipayVerifier) VerifySignature(channel string, body []byte, headers ma
 		log.Printf("alipay verifier: notify_time missing (informational; replay dedup is handled by webhook_events)")
 	}
 	return nil
-}
-
-// alipayURLEncode mirrors Alipay's encoding (space → %20, not '+').
-// Standard net/url uses '+' for space; this differs.
-func alipayURLEncode(s string) string {
-	const hexChars = "0123456789ABCDEF"
-	var sb strings.Builder
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == ' ':
-			sb.WriteString("%20")
-		case (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'):
-			sb.WriteByte(c)
-		default:
-			sb.WriteByte('%')
-			sb.WriteByte(hexChars[c>>4])
-			sb.WriteByte(hexChars[c&0xF])
-		}
-	}
-	return sb.String()
 }
 
 // LoadAlipayPublicKeyFromPEM parses either PKCS#1 or PKCS#8 PEM-encoded RSA

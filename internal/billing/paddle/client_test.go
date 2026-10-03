@@ -63,3 +63,36 @@ func TestClientToken_RoundTrip(t *testing.T) {
 		t.Fatalf("token round trip failed: %q", c.ClientToken())
 	}
 }
+
+func TestMock_CancelSubscription(t *testing.T) {
+	c := &Client{MockMode: true}
+	if err := c.CancelSubscription(context.Background(), "sub_x"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReal_CancelSubscription_RequiresSDK(t *testing.T) {
+	c := &Client{}
+	if err := c.CancelSubscription(context.Background(), "sub_x"); err == nil {
+		t.Fatal("expected error when SDK not wired")
+	}
+}
+
+func TestMock_UpdateSubscriptionPrice(t *testing.T) {
+	c := &Client{MockMode: true}
+	before := time.Now()
+	at, err := c.UpdateSubscriptionPrice(context.Background(), "sub_x", "pri_yearly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if at == nil || !at.After(before.AddDate(0, 11, 0)) {
+		t.Fatalf("expected ~1 year in the future, got %v", at)
+	}
+}
+
+func TestReal_UpdateSubscriptionPrice_RequiresSDK(t *testing.T) {
+	c := &Client{}
+	if _, err := c.UpdateSubscriptionPrice(context.Background(), "sub_x", "pri_yearly"); err == nil {
+		t.Fatal("expected error when SDK not wired")
+	}
+}

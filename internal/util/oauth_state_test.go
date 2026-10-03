@@ -2,6 +2,8 @@ package util
 
 import (
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -203,4 +205,37 @@ func flipChar(s string) string {
 
 func errIs(err, target error) bool {
 	return err != nil && (err == target || strings.Contains(err.Error(), target.Error()))
+}
+
+// TestVerifyOAuthState_ConcurrentReplay admits exactly one winner: a captured
+// state verified concurrently N times within its expiry window must succeed
+// once and fail N-1 times. Guards the Load-then-Store TOCTOU that let two
+// simultaneous first-uses both pass the replay gate.
+func TestVerifyOAuthState_ConcurrentReplay(t *testing.T) {
+	t.Parallel()
+	// Real wall-clock times: rememberNonce compares entry expiry against
+	// time.Now(), so a fake past clock would read every fresh entry as a
+	// stale leftover and defeat the guard under test.
+	now := time.Now()
+	tok, err := IssueOAuthState(testStateSecret, "yundian", 0, now)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	const n = 32
+	var wg sync.WaitGroup
+	var successes int32
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := VerifyOAuthState(testStateSecret, tok, "yundian", time.Now()); err == nil {
+				atomic.AddInt32(&successes, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if successes != 1 {
+		t.Errorf("concurrent replays succeeded %d times, want exactly 1", successes)
+	}
 }

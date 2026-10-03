@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -101,7 +102,7 @@ func TestInternalAppAuth(t *testing.T) {
 	})
 
 	t.Run("invalid app_id", func(t *testing.T) {
-		appRepo := &mockAppRepoForMiddleware{err: errors.New("not found")}
+		appRepo := &mockAppRepoForMiddleware{err: sql.ErrNoRows}
 		handler := InternalAppAuth(appRepo)
 
 		router := gin.New()
@@ -117,6 +118,31 @@ func TestInternalAppAuth(t *testing.T) {
 
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("expected 401, got %d", w.Code)
+		}
+	})
+
+	t.Run("transient repo error returns 500", func(t *testing.T) {
+		// A connection reset / timeout / pool-exhausted error is
+		// infrastructure, not a credential failure: it must surface as
+		// 500 (not 401) so callers retry instead of treating their
+		// app_secret as wrong.
+		appRepo := &mockAppRepoForMiddleware{err: errors.New("connection reset by peer")}
+		handler := InternalAppAuth(appRepo)
+
+		router := gin.New()
+		router.Use(handler)
+		router.GET("/test", func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("X-App-ID", "test-app")
+		req.Header.Set("X-App-Secret", "correct-secret")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("expected 500 for transient repo error, got %d", w.Code)
 		}
 	})
 
@@ -253,7 +279,7 @@ func TestInternalAppAuth_MissingAppBurnsDummyCompare(t *testing.T) {
 	}
 	defer func() { checkSecret = orig }()
 
-	appRepo := &mockAppRepoForMiddleware{err: errors.New("not found")}
+	appRepo := &mockAppRepoForMiddleware{err: sql.ErrNoRows}
 	router := gin.New()
 	router.Use(InternalAppAuth(appRepo))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -311,5 +337,40 @@ func TestInternalAppAuth_DisabledAppBurnsDummyCompare(t *testing.T) {
 	}
 	if !burned {
 		t.Fatal("disabled-app path did not run the dummy compare (timing oracle open)")
+	}
+}
+
+// TestInternalAppAuth_TransientErrorSkipsBurn: the transient-DB-error path
+// returns 500, which tells the caller nothing about whether the appID
+// exists, so it must NOT pay the bcrypt burn — and the existing subtests
+// pin the 500 mapping. This spies on checkSecret to prove no comparison
+// runs on that path.
+func TestInternalAppAuth_TransientErrorSkipsBurn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var compared bool
+	orig := checkSecret
+	checkSecret = func(hashed, plain string) bool {
+		compared = true
+		return false
+	}
+	defer func() { checkSecret = orig }()
+
+	appRepo := &mockAppRepoForMiddleware{err: errors.New("driver: bad connection")}
+	router := gin.New()
+	router.Use(InternalAppAuth(appRepo))
+	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("X-App-ID", "test-app")
+	req.Header.Set("X-App-Secret", "guess")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+	if compared {
+		t.Fatal("transient-error path ran a bcrypt compare (wasted work; 500 needs no timing burn)")
 	}
 }

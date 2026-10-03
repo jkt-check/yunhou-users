@@ -326,6 +326,11 @@ func Setup(
 		paymentGroup.DELETE("/orders/:id", paymentHandler.CancelOrder)
 		paymentGroup.POST("/orders/:order_id/confirm", paymentHandler.ConfirmOrder)
 
+		// Channel-managed subscription self-service (Paddle): cancel takes
+		// effect at period end; upgrade is monthly→yearly with proration.
+		paymentGroup.POST("/subscription/cancel", paymentHandler.CancelChannelSubscription)
+		paymentGroup.POST("/subscription/upgrade", paymentHandler.UpgradeChannelSubscription)
+
 		// Payment reads
 		paymentGroup.GET("", paymentHandler.ListPayments)
 		paymentGroup.GET("/:id", paymentHandler.GetPayment)

@@ -297,3 +297,48 @@ func TestCachedClient_FetchToken_OAuthError(t *testing.T) {
 		t.Error("expected error on OAuth 401, got nil")
 	}
 }
+
+// TestTokenCache_GetOrFetch_HitReturnsRemainingTTL pins the cache-hit
+// ExpiresIn semantics: the leader's fresh token carries the as-issued
+// value, but a hit must hand back the REMAINING seconds — otherwise a
+// caller near the end of the cache window overestimates the token's
+// remaining life by the full original TTL.
+func TestTokenCache_GetOrFetch_HitReturnsRemainingTTL(t *testing.T) {
+	calls := 0
+	fetcher := func() (*Token, error) {
+		calls++
+		return &Token{AccessToken: "AT", ExpiresIn: 100}, nil
+	}
+	cache := NewTokenCache(0)
+
+	fresh, err := cache.GetOrFetch("cid", fetcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.ExpiresIn != 100 {
+		t.Errorf("fresh token ExpiresIn = %d, want 100 (as issued)", fresh.ExpiresIn)
+	}
+	hit1, err := cache.GetOrFetch("cid", fetcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit1.ExpiresIn < 99 || hit1.ExpiresIn > 100 {
+		t.Errorf("immediate hit ExpiresIn = %d, want in [99,100]", hit1.ExpiresIn)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	hit2, err := cache.GetOrFetch("cid", fetcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1.2s 的间隔保证截断后的整数秒至少差 1。
+	if hit2.ExpiresIn >= hit1.ExpiresIn {
+		t.Errorf("later hit ExpiresIn = %d, want < earlier hit's %d (remaining TTL must shrink)", hit2.ExpiresIn, hit1.ExpiresIn)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (all hits served from cache)", calls)
+	}
+	// The shared cache entry must not have been mutated by the copies.
+	if fresh.ExpiresIn != 100 {
+		t.Errorf("leader's token was mutated via hit copy: ExpiresIn = %d", fresh.ExpiresIn)
+	}
+}

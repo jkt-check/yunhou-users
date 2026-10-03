@@ -332,8 +332,16 @@ func TestAlipayVerifier_Accept(t *testing.T) {
 		t.Fatalf("load PEM: %v", err)
 	}
 
-	// Build the canonical string manually (matching the verifier's algorithm).
-	body := "out_trade_no=order_1&total_amount=29.90&trade_no=2023110"
+	// Build a realistic notify body per the official Alipay async-notify
+	// spec: values containing '.', '-', ' ', ':' and Chinese are exactly
+	// what real notifications carry, and they are URL-encoded on the wire
+	// while Alipay signs the DECODED values. Signing the decoded-join
+	// canonical here (via alipayCanonicalForTest) means this test would
+	// fail against the pre-fix verifier, which re-encoded the values.
+	body := "out_trade_no=order_1" +
+		"&total_amount=29.90" +
+		"&gmt_create=" + urlEncodeFormValue("2023-11-10 12:01:30") +
+		"&subject=" + urlEncodeFormValue("云厚会员·月度")
 	canonical := alipayCanonicalForTest(t, body)
 	hashed := sha256.Sum256([]byte(canonical))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hashed[:])
@@ -754,22 +762,36 @@ func rsaTestKey(t *testing.T) (*rsa.PrivateKey, *rsa.PublicKey) {
 	return priv, &priv.PublicKey
 }
 
-// alipayCanonicalForTest builds the same canonical string the verifier does,
-// but only for testing. We re-implement the encoding here so the test stays
-// decoupled from private alipayURLEncode internals.
+// alipayCanonicalForTest builds the canonical string exactly as the official
+// Alipay async-notify spec defines it: keys sorted alphabetically, sign and
+// sign_type excluded, values in their URL-DECODED form, joined key=value&...
+// We re-implement it here instead of calling into the verifier so the test
+// stays decoupled from private internals — if the verifier's canonicalisation
+// drifts from the spec again (as the re-encoding bug did), this fixture
+// catches it.
 func alipayCanonicalForTest(t *testing.T, body string) string {
 	t.Helper()
 	parts := strings.Split(body, "&")
 	keys := make([]string, 0, len(parts))
+	valueByKey := map[string]string{}
 	for _, p := range parts {
 		eq := strings.IndexByte(p, '=')
-		if eq < 0 {
-			keys = append(keys, p)
+		key, rawVal := p, ""
+		if eq >= 0 {
+			key, rawVal = p[:eq], p[eq+1:]
+		}
+		if key == "sign" || key == "sign_type" {
 			continue
 		}
-		keys = append(keys, p[:eq])
+		keys = append(keys, key)
+		// The wire form is application/x-www-form-urlencoded; the spec
+		// signs the decoded values, so decode before joining.
+		if decoded, err := url.QueryUnescape(rawVal); err == nil {
+			valueByKey[key] = decoded
+		} else {
+			valueByKey[key] = rawVal
+		}
 	}
-	// Sort but skip "sign"/"sign_type" — they're not in the test body anyway.
 	// Simple bubble sort for test brevity.
 	for i := 0; i < len(keys); i++ {
 		for j := i + 1; j < len(keys); j++ {
@@ -778,26 +800,9 @@ func alipayCanonicalForTest(t *testing.T, body string) string {
 			}
 		}
 	}
-	// Rebuild with sorted keys + values, URL-decoded first (matching what
-	// the verifier does via url.ParseQuery). Without this, spaces and other
-	// percent-encoded chars would be double-encoded by alipayURLEncode and
-	// the helper's canonical string wouldn't match the verifier's.
-	valueByKey := map[string]string{}
-	for _, p := range parts {
-		eq := strings.IndexByte(p, '=')
-		if eq < 0 {
-			valueByKey[p] = ""
-		} else {
-			if decoded, err := url.QueryUnescape(p[eq+1:]); err == nil {
-				valueByKey[p[:eq]] = decoded
-			} else {
-				valueByKey[p[:eq]] = p[eq+1:]
-			}
-		}
-	}
 	out := make([]string, 0, len(keys))
 	for _, k := range keys {
-		out = append(out, alipayURLEncode(k)+"="+alipayURLEncode(valueByKey[k]))
+		out = append(out, k+"="+valueByKey[k])
 	}
 	return strings.Join(out, "&")
 }
@@ -990,30 +995,6 @@ func TestCollectHeaders(t *testing.T) {
 	}
 	if _, ok := h["X-Missing"]; ok {
 		t.Errorf("missing header should not exist")
-	}
-}
-
-// ============================================================================
-// alipayURLEncode — corner cases (space, mixed-case, +, =)
-// ============================================================================
-
-func TestAlipayURLEncode(t *testing.T) {
-	t.Parallel()
-	cases := map[string]string{
-		"hello":       "hello",
-		"hello world": "hello%20world", // space → %20 (NOT +)
-		"a+b":         "a%2Bb",         // + → %2B (NOT space-encoded)
-		"x=y":         "x%3Dy",         // = → %3D
-		"中文":          "%E4%B8%AD%E6%96%87",
-		"":            "",
-	}
-	for in, want := range cases {
-		t.Run(in, func(t *testing.T) {
-			t.Parallel()
-			if got := alipayURLEncode(in); got != want {
-				t.Errorf("alipayURLEncode(%q) = %q, want %q", in, got, want)
-			}
-		})
 	}
 }
 

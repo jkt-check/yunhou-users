@@ -31,6 +31,10 @@ type OrderSweeper struct {
 	stop      chan struct{}
 	done      chan struct{}
 	once      sync.Once
+	// startOnce makes Start idempotent: a second Start must not spawn a
+	// second goroutine — both would close(s.done) on exit and the double
+	// close panics inside Stop.
+	startOnce sync.Once
 
 	// entitlements, when wired (production), receives the periodic
 	// expiry-marking pass. Nil in tests that only exercise order sweeping.
@@ -61,9 +65,12 @@ func NewOrderSweeper(orderRepo repo.OrderRepo, interval time.Duration) *OrderSwe
 func (s *OrderSweeper) SetEntitlementExpirer(e EntitlementExpirer) { s.entitlements = e }
 
 // Start kicks off the sweeper goroutine. It returns immediately; call
-// Stop to terminate. Safe to call once; subsequent calls are no-ops.
+// Stop to terminate. Idempotent: subsequent calls are no-ops (a second
+// goroutine would double-close s.done on exit and panic Stop).
 func (s *OrderSweeper) Start(ctx context.Context) {
-	go s.run(ctx)
+	s.startOnce.Do(func() {
+		go s.run(ctx)
+	})
 }
 
 // Stop signals the sweeper to exit and waits for the goroutine to

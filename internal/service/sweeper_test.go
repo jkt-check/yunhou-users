@@ -51,6 +51,9 @@ func (m *mockOrderRepo) FindByProviderOutTradeNo(_ context.Context, _ string) (*
 func (m *mockOrderRepo) CreateInTx(_ context.Context, _ *sqlx.Tx, _ *model.Order) error {
 	return nil
 }
+func (m *mockOrderRepo) FindPendingByUserAndProduct(_ context.Context, _, _ string) (*model.Order, error) {
+	return nil, errors.New("not used")
+}
 
 func TestOrderSweeper_SweepOnce(t *testing.T) {
 	t.Parallel()
@@ -99,6 +102,23 @@ func TestOrderSweeper_StartStop(t *testing.T) {
 		s := NewOrderSweeper(repo, 50*time.Millisecond)
 		s.Start(context.Background())
 		// Give the goroutine a moment to run the initial tick.
+		time.Sleep(30 * time.Millisecond)
+		s.Stop()
+
+		if repo.callCount.Load() < 1 {
+			t.Errorf("expected at least 1 sweep call, got %d", repo.callCount.Load())
+		}
+	})
+
+	t.Run("Start is idempotent", func(t *testing.T) {
+		t.Parallel()
+		repo := &mockOrderRepo{}
+		s := NewOrderSweeper(repo, 50*time.Millisecond)
+		s.Start(context.Background())
+		// A second Start must be a no-op: previously it spawned a second
+		// goroutine, and both run() loops would close(s.done) on Stop —
+		// a "close of closed channel" panic.
+		s.Start(context.Background())
 		time.Sleep(30 * time.Millisecond)
 		s.Stop()
 

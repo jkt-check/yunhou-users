@@ -1,0 +1,344 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+)
+
+// ============================================================================
+// CancelChannelSubscription — POST /payments/subscription/cancel (Paddle)
+// ============================================================================
+
+func countAudit(t *testing.T, db *sqlx.DB, action string) int {
+	t.Helper()
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = $1`, action); err != nil {
+		t.Fatalf("count audit %s: %v", action, err)
+	}
+	return n
+}
+
+func TestCancelChannelSubscription_Success(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_cancel_" + mustNewUUID()[:8]
+	subID := seedPaddleSub(t, db, uid, extSubID, time.Now().Add(15*24*time.Hour))
+
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+
+	sub, err := svc.CancelChannelSubscription(context.Background(), uid)
+	if err != nil {
+		t.Fatalf("CancelChannelSubscription: %v", err)
+	}
+	if stub.cancelCalls != 1 || stub.cancelGotID != extSubID {
+		t.Fatalf("paddle cancel calls=%d id=%q, want 1/%s", stub.cancelCalls, stub.cancelGotID, extSubID)
+	}
+	if sub.ID != subID {
+		t.Fatalf("sub id = %q, want %q", sub.ID, subID)
+	}
+	// Local status stays active — the flip hangs off the
+	// subscription.canceled webhook (period end), so the buyer keeps the
+	// access they paid for.
+	var status string
+	if err := db.GetContext(context.Background(), &status,
+		`SELECT status FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if status != "active" {
+		t.Fatalf("status = %q, want active (flip deferred to webhook)", status)
+	}
+	if countAudit(t, db, "paddle_subscription_cancel_requested") != 1 {
+		t.Error("expected audit row paddle_subscription_cancel_requested")
+	}
+}
+
+func TestCancelChannelSubscription_NoActiveSub(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	svc.SetPaddleClient(&stubPaddle{})
+
+	if _, err := svc.CancelChannelSubscription(context.Background(), uid); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("expected ErrSubscriptionNotFound, got %v", err)
+	}
+}
+
+func TestCancelChannelSubscription_NotChannelManaged(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	// Local/WeChat-style sub: no external_subscription_id.
+	seedActiveSub(t, db, uid, "monthly", time.Now().Add(15*24*time.Hour))
+
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	if _, err := svc.CancelChannelSubscription(context.Background(), uid); !errors.Is(err, ErrSubscriptionNotChannelManaged) {
+		t.Fatalf("expected ErrSubscriptionNotChannelManaged, got %v", err)
+	}
+	if stub.cancelCalls != 0 {
+		t.Fatal("paddle must not be called for a non-channel-managed sub")
+	}
+}
+
+func TestCancelChannelSubscription_UpstreamError(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_cancel_err_" + mustNewUUID()[:8]
+	seedPaddleSub(t, db, uid, extSubID, time.Now().Add(15*24*time.Hour))
+
+	svc.SetPaddleClient(&stubPaddle{cancelErr: errors.New("paddle 503")})
+	if _, err := svc.CancelChannelSubscription(context.Background(), uid); err == nil || !strings.Contains(err.Error(), "paddle cancel subscription") {
+		t.Fatalf("expected wrapped paddle error, got %v", err)
+	}
+}
+
+func TestCancelChannelSubscription_NoPaddleClient(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	if _, err := svc.CancelChannelSubscription(context.Background(), uid); !errors.Is(err, ErrPaddleNotConfigured) {
+		t.Fatalf("expected ErrPaddleNotConfigured, got %v", err)
+	}
+}
+
+// ============================================================================
+// UpgradeChannelSubscription — POST /payments/subscription/upgrade (Paddle)
+// ============================================================================
+
+func TestUpgradeChannelSubscription_Success(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_up_" + mustNewUUID()[:8]
+	subID := seedPaddleSub(t, db, uid, extSubID, time.Now().Add(15*24*time.Hour))
+
+	next := time.Now().Add(365 * 24 * time.Hour).UTC().Truncate(time.Second)
+	stub := &stubPaddle{updateNext: &next}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"yearly": "pri_yearly_test"})
+
+	res, err := svc.UpgradeChannelSubscription(context.Background(), uid, "yearly")
+	if err != nil {
+		t.Fatalf("UpgradeChannelSubscription: %v", err)
+	}
+	if stub.updateCalls != 1 || stub.updateGotID != extSubID || stub.updateGotPrice != "pri_yearly_test" {
+		t.Fatalf("paddle update calls=%d id=%q price=%q", stub.updateCalls, stub.updateGotID, stub.updateGotPrice)
+	}
+	if res.FromPlanID != "monthly" || res.ToPlanID != "yearly" {
+		t.Fatalf("result = %+v", res)
+	}
+	var planID string
+	var expAt time.Time
+	if err := db.GetContext(context.Background(), &planID,
+		`SELECT plan_id FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if err := db.GetContext(context.Background(), &expAt,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub expiry: %v", err)
+	}
+	if planID != "yearly" {
+		t.Fatalf("plan_id = %q, want yearly", planID)
+	}
+	if !expAt.Equal(next) {
+		t.Fatalf("expires_at = %v, want channel next_billed_at %v", expAt, next)
+	}
+	if countAudit(t, db, "paddle_subscription_upgraded") != 1 {
+		t.Error("expected audit row paddle_subscription_upgraded")
+	}
+}
+
+func TestUpgradeChannelSubscription_Guards(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_guard_" + mustNewUUID()[:8]
+	seedPaddleSub(t, db, uid, extSubID, time.Now().Add(15*24*time.Hour))
+	svc.SetPaddleClient(&stubPaddle{})
+	svc.SetPaddlePrices(map[string]string{"yearly": "pri_yearly_test", "monthly": "pri_monthly_test"})
+
+	ctx := context.Background()
+	if _, err := svc.UpgradeChannelSubscription(ctx, uid, "monthly"); !errors.Is(err, ErrSamePlanChange) {
+		t.Fatalf("same plan: expected ErrSamePlanChange, got %v", err)
+	}
+	if _, err := svc.UpgradeChannelSubscription(ctx, uid, "no-such-plan"); !errors.Is(err, ErrPlanNotFound) {
+		t.Fatalf("unknown plan: expected ErrPlanNotFound, got %v", err)
+	}
+	if _, err := svc.UpgradeChannelSubscription(ctx, uid, "free"); !errors.Is(err, ErrPlanChangeNotUpgrade) {
+		t.Fatalf("shorter cycle: expected ErrPlanChangeNotUpgrade, got %v", err)
+	}
+}
+
+func TestUpgradeChannelSubscription_NoPriceConfigured(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	seedPaddleSub(t, db, uid, "sub_nopri_"+mustNewUUID()[:8], time.Now().Add(15*24*time.Hour))
+	svc.SetPaddleClient(&stubPaddle{})
+	// no SetPaddlePrices — operator forgot the yearly entry
+	if _, err := svc.UpgradeChannelSubscription(context.Background(), uid, "yearly"); !errors.Is(err, ErrPaddlePriceNotConfigured) {
+		t.Fatalf("expected ErrPaddlePriceNotConfigured, got %v", err)
+	}
+}
+
+// TestUpgradeChannelSubscription_RetiredPlanRejected pins the
+// accepting_new_subscriptions gate on the upgrade path (2026-10 review):
+// IsActive alone is not enough — a retired plan (active but no longer
+// accepting new subscriptions) must reject upgrades with
+// ErrPlanNotAcceptingNew, the same sentinel CreateOrder's eligibility tx
+// uses, before any channel-side call.
+func TestUpgradeChannelSubscription_RetiredPlanRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	seedPaddleSub(t, db, uid, "sub_retired_"+mustNewUUID()[:8], time.Now().Add(15*24*time.Hour))
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active, accepting_new_subscriptions)
+		VALUES ('yearly-retired', 'Yearly Retired', 149.9, 365, '{}', true, false)
+	`); err != nil {
+		t.Fatalf("seed retired plan: %v", err)
+	}
+
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"yearly-retired": "pri_retired"})
+	if _, err := svc.UpgradeChannelSubscription(context.Background(), uid, "yearly-retired"); !errors.Is(err, ErrPlanNotAcceptingNew) {
+		t.Fatalf("expected ErrPlanNotAcceptingNew, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Fatal("paddle must not be called for a retired target plan")
+	}
+}
+
+func TestUpgradeChannelSubscription_DowngradeRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	// Yearly sub trying to "upgrade" to monthly = downgrade.
+	subID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'yearly', 'active', $3, $4)
+	`, subID, uid, time.Now().Add(200*24*time.Hour), "sub_down_"+mustNewUUID()[:8]); err != nil {
+		t.Fatalf("seed yearly sub: %v", err)
+	}
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_m", "yearly": "pri_y"})
+	if _, err := svc.UpgradeChannelSubscription(context.Background(), uid, "monthly"); !errors.Is(err, ErrPlanChangeNotUpgrade) {
+		t.Fatalf("expected ErrPlanChangeNotUpgrade, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Fatal("paddle must not be called for a downgrade attempt")
+	}
+}
+
+// ============================================================================
+// Webhook: subscription.canceled → local flip + audit
+// ============================================================================
+
+func paddleCancelEvent(eventID, extSubID string) WebhookEvent {
+	return WebhookEvent{
+		Channel: "paddle", EventID: eventID, EventType: "subscription.canceled",
+		ExternalSubscriptionID: extSubID,
+		RawPayload:             json.RawMessage(`{}`),
+	}
+}
+
+func TestOnWebhook_PaddleSubscriptionCancelled_Flips(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_wcancel_" + mustNewUUID()[:8]
+	subID := seedPaddleSub(t, db, uid, extSubID, time.Now().Add(15*24*time.Hour))
+
+	res, err := svc.OnWebhook(context.Background(),
+		paddleCancelEvent("evt-pd-cancel-"+mustNewUUID()[:8], extSubID))
+	if err != nil {
+		t.Fatalf("OnWebhook subscription.canceled: %v", err)
+	}
+	if res.DomainAction != "subscription_cancelled" {
+		t.Fatalf("DomainAction = %q", res.DomainAction)
+	}
+	var status string
+	if err := db.GetContext(context.Background(), &status,
+		`SELECT status FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("status = %q, want cancelled", status)
+	}
+	if countAudit(t, db, "paddle_subscription_cancelled") != 1 {
+		t.Error("expected audit row paddle_subscription_cancelled")
+	}
+
+	// 第二个*不同* event id 的取消事件(自助取消 + 运营后台取消各发一次
+	// 的场景):已 cancelled 的行是 no-op,不重复审计、不报错。注意同 event
+	// id 的真重投在 OnWebhook 入口就被 webhook_events 去重,到不了这里。
+	res2, err := svc.OnWebhook(context.Background(),
+		paddleCancelEvent("evt-pd-cancel-"+mustNewUUID()[:8], extSubID))
+	if err != nil {
+		t.Fatalf("second distinct cancel event: %v", err)
+	}
+	if res2.DomainAction != "subscription_cancelled" {
+		t.Fatalf("second cancel DomainAction = %q", res2.DomainAction)
+	}
+	if countAudit(t, db, "paddle_subscription_cancelled") != 1 {
+		t.Error("second cancel event must not duplicate the cancel audit")
+	}
+}
+
+func TestOnWebhook_PaddleSubscriptionCancelled_UnknownSub(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	_, err := svc.OnWebhook(context.Background(),
+		paddleCancelEvent("evt-pd-cancel-unk-"+mustNewUUID()[:8], "sub_unknown_"+mustNewUUID()[:8]))
+	if err != nil {
+		t.Fatalf("unknown sub must ack, got %v", err)
+	}
+	if countAudit(t, db, "paddle_cancel_unknown_subscription") != 1 {
+		t.Error("expected audit row paddle_cancel_unknown_subscription")
+	}
+}
+
+// TestUpgradeChannelSubscription_IntervalFallbackClamped pins the
+// day→time.Duration overflow guard on the upgrade fallback path (2026-10
+// review): when Paddle's update response carries no next_billed_at, the
+// local expiry falls back to now()+plan.interval_days — and a huge
+// operator-set interval would wrap the multiply into the past. The clamp
+// (maxIntervalDays) keeps it far-future.
+func TestUpgradeChannelSubscription_IntervalFallbackClamped(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	seedPaddleSub(t, db, uid, "sub_clamp_"+mustNewUUID()[:8], time.Now().Add(15*24*time.Hour))
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active, accepting_new_subscriptions)
+		VALUES ('yearly-huge', 'Yearly Huge', 149.9, 2147483647, '{}', true, true)
+	`); err != nil {
+		t.Fatalf("seed huge-interval plan: %v", err)
+	}
+
+	// updateNext nil → the plan-interval fallback computes expires_at.
+	svc.SetPaddleClient(&stubPaddle{})
+	svc.SetPaddlePrices(map[string]string{"yearly-huge": "pri_huge"})
+	res, err := svc.UpgradeChannelSubscription(context.Background(), uid, "yearly-huge")
+	if err != nil {
+		t.Fatalf("UpgradeChannelSubscription: %v", err)
+	}
+	now := time.Now()
+	if lo, hi := now.AddDate(200, 0, 0), now.AddDate(300, 0, 0); res.NextBilledAt.Before(lo) || res.NextBilledAt.After(hi) {
+		t.Errorf("NextBilledAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", res.NextBilledAt)
+	}
+}

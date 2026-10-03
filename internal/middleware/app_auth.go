@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"database/sql"
+	"errors"
 	"log"
 	"net/http"
 
@@ -36,6 +38,19 @@ func InternalAppAuth(appRepo repo.AppRepo) gin.HandlerFunc {
 
 		app, err := appRepo.FindByID(c.Request.Context(), appID)
 		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				// Transient infrastructure failure (connection reset,
+				// timeout, pool exhausted) — NOT a credential problem.
+				// Return 500 so callers distinguish it from 401 and their
+				// retry logic kicks in; no timing burn is needed because a
+				// 500 reveals nothing about whether the appID exists.
+				log.Printf("internal app auth: app %q lookup transient error: %v", appID, err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+					"code":    500,
+					"message": "internal error",
+				})
+				return
+			}
 			// Don't differentiate "no such app" from "app disabled" —
 			// the response code and message are the same as a wrong
 			// secret, so an attacker can't enumerate X-App-ID values by

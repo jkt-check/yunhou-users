@@ -453,12 +453,14 @@ func int64PtrVal(v *int64) interface{} {
 //
 //  1. lock the billing account (anchor) then the wallet row — the fixed
 //     lock order every wallet mutation follows;
-//  2. gate on the explicit overage settings + the UTC-month spend limit
-//     (未开启 = ErrOverageDisabled，余额一分不动);
+//  2. gate on the explicit overage settings + the UTC-month spend limit,
+//     counting the month spend already settled AND the holds still in
+//     flight (未开启 = ErrOverageDisabled，余额一分不动);
 //  3. derive the balance from the ledger and split the freeze bonus-first;
 //     insufficient → ErrInsufficientBalance. Because every mutation takes
 //     the same two locks, the check-and-freeze is atomic against
-//     concurrent admissions (并发最后余额不双花);
+//     concurrent admissions (并发最后余额不双花). A zero hold (0 价模型,
+//     migration 043) freezes an empty split and never touches the balance;
 //  4. persist the request (charge_source='wallet', pinned price), the
 //     wallet hold (request_id unique = 幂等业务键) and the mirrored
 //     reservation row — all in the caller's transaction.
@@ -467,8 +469,9 @@ func (s *Store) ReserveWallet(ctx context.Context, w domain.UnitOfWork, cmd doma
 	if err != nil {
 		return nil, err
 	}
-	if cmd.HoldMicros <= 0 {
-		return nil, domain.WrapError(domain.CodeInvalidInput, "reserve wallet: hold must be > 0", domain.ErrNegativeValue)
+	// 0 价模型的合法冻结是 0（价格版本全费率 = 0 是合法配置）；负值仍拒绝。
+	if cmd.HoldMicros < 0 {
+		return nil, domain.WrapError(domain.CodeInvalidInput, "reserve wallet: hold must be >= 0", domain.ErrNegativeValue)
 	}
 
 	// 1. Fixed lock order: account → wallet.
@@ -483,27 +486,36 @@ func (s *Store) ReserveWallet(ctx context.Context, w domain.UnitOfWork, cmd doma
 		return nil, domain.NewError(domain.CodeInvalidInput, "reserve wallet: wallet does not belong to the account")
 	}
 
-	// 2. Spend gate (explicit opt-in + monthly cap).
-	spent, err := monthSpendLocked(ctx, tx, wallet.ID, cmd.MonthStart, cmd.MonthEnd)
-	if err != nil {
-		return nil, err
-	}
-	if err := accounting.CheckWalletSpend(wallet.Settings(), spent, cmd.HoldMicros); err != nil {
-		return nil, err
-	}
-
-	// 3. Derived balance + bonus-first freeze split.
+	// 2. Spend gate (explicit opt-in + monthly cap). 门控数值 = 本月已结算
+	// 支出 + 仍在途的冻结 + 本笔——与窗口配额的 used+reserved+amount 同口
+	// 径（quota_repo.go）：只看已结算时两个并发 hold 各见 spent=0 双双过
+	// 闸，月度总额超限。
 	sums, err := walletSumsLocked(ctx, tx, wallet.ID)
 	if err != nil {
 		return nil, err
 	}
+	spent, err := monthSpendLocked(ctx, tx, wallet.ID, cmd.MonthStart, cmd.MonthEnd)
+	if err != nil {
+		return nil, err
+	}
+	if err := accounting.CheckWalletSpend(wallet.Settings(),
+		spent+sums.HeldCash+sums.HeldBonus, cmd.HoldMicros); err != nil {
+		return nil, err
+	}
+
+	// 3. Derived balance + bonus-first freeze split. 0 额冻结为空拆分
+	// （cash=bonus=0，hold 行 CHECK 允许 0，migration 043）：不触碰余额，
+	// 状态机与正额冻结同路径。
 	bal, err := accounting.DeriveWalletBalance(wallet.Currency, sums)
 	if err != nil {
 		return nil, err
 	}
-	cash, bonus, err := accounting.SplitFreeze(bal.BonusAvailable, bal.CashAvailable, cmd.HoldMicros)
-	if err != nil {
-		return nil, err
+	var cash, bonus int64
+	if cmd.HoldMicros > 0 {
+		cash, bonus, err = accounting.SplitFreeze(bal.BonusAvailable, bal.CashAvailable, cmd.HoldMicros)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// 4. Persist request + hold + mirrored reservation. The pinned

@@ -45,6 +45,12 @@ type mockPaymentSvc struct {
 	getRefundErr     error
 	onWebhookResult  *service.OnWebhookResult
 	onWebhookErr     error
+	cancelChanResp   *model.Subscription
+	cancelChanErr    error
+	gotCancelUserID  string
+	upgradeResp      *service.ChannelUpgradeResult
+	upgradeErr       error
+	gotUpgradePlanID string
 }
 
 func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _, channel string) (*model.Order, error) {
@@ -82,6 +88,14 @@ func (m *mockPaymentSvc) ListPaymentRefunds(_ context.Context, _, _ string) ([]m
 func (m *mockPaymentSvc) GetRefund(_ context.Context, _, _ string) (*model.Refund, error) {
 	return m.getRefundResp, m.getRefundErr
 }
+func (m *mockPaymentSvc) CancelChannelSubscription(_ context.Context, userID string) (*model.Subscription, error) {
+	m.gotCancelUserID = userID
+	return m.cancelChanResp, m.cancelChanErr
+}
+func (m *mockPaymentSvc) UpgradeChannelSubscription(_ context.Context, _, targetPlanID string) (*service.ChannelUpgradeResult, error) {
+	m.gotUpgradePlanID = targetPlanID
+	return m.upgradeResp, m.upgradeErr
+}
 
 // Compile-time check: mockPaymentSvc must satisfy the interface.
 var _ service.PaymentServiceInterface = (*mockPaymentSvc)(nil)
@@ -105,6 +119,8 @@ func paymentTestEngine(svc service.PaymentServiceInterface, userID string) *gin.
 	engine.GET("/payments/orders/:id", h.GetOrder)
 	engine.DELETE("/payments/orders/:id", h.CancelOrder)
 	engine.POST("/payments/orders/:order_id/confirm", h.ConfirmOrder)
+	engine.POST("/payments/subscription/cancel", h.CancelChannelSubscription)
+	engine.POST("/payments/subscription/upgrade", h.UpgradeChannelSubscription)
 	engine.GET("/payments", h.ListPayments)
 	engine.GET("/payments/:id", h.GetPayment)
 	engine.GET("/payments/:id/refunds", h.ListPaymentRefunds)
@@ -934,5 +950,107 @@ func TestWritePaymentError_Branches(t *testing.T) {
 				t.Errorf("body missing %q: %s", tc.wantMessage, rec.Body.String())
 			}
 		})
+	}
+}
+
+// ============================================================================
+// Channel subscription self-service (Paddle)
+// ============================================================================
+
+func TestCancelChannelSubscription_Success(t *testing.T) {
+	exp := time.Now().Add(15 * 24 * time.Hour).UTC().Truncate(time.Second)
+	svc := &mockPaymentSvc{cancelChanResp: &model.Subscription{
+		ID: "sub-local-1", PlanID: "monthly", ExpiresAt: &exp,
+	}}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, "POST", "/payments/subscription/cancel", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.gotCancelUserID != "user-1" {
+		t.Fatalf("userID = %q", svc.gotCancelUserID)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"sub-local-1", "monthly"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("response missing %s: %s", want, body)
+		}
+	}
+}
+
+func TestCancelChannelSubscription_ErrorMapping(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"no active sub", service.ErrSubscriptionNotFound, 404},
+		{"not channel managed", service.ErrSubscriptionNotChannelManaged, 409},
+		{"paddle not configured", service.ErrPaddleNotConfigured, 400},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &mockPaymentSvc{cancelChanErr: tc.err}
+			engine := paymentTestEngine(svc, "user-1")
+			rec := doRequest(engine, "POST", "/payments/subscription/cancel", nil)
+			if rec.Code != tc.code {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestUpgradeChannelSubscription_Success(t *testing.T) {
+	next := time.Now().Add(365 * 24 * time.Hour).UTC().Truncate(time.Second)
+	svc := &mockPaymentSvc{upgradeResp: &service.ChannelUpgradeResult{
+		SubscriptionID: "sub-local-1", FromPlanID: "monthly", ToPlanID: "yearly", NextBilledAt: next,
+	}}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, "POST", "/payments/subscription/upgrade", map[string]string{"plan_id": "yearly"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.gotUpgradePlanID != "yearly" {
+		t.Fatalf("planID = %q", svc.gotUpgradePlanID)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"monthly", "yearly"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("response missing %s: %s", want, body)
+		}
+	}
+}
+
+func TestUpgradeChannelSubscription_ErrorMapping(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"no active sub", service.ErrSubscriptionNotFound, 404},
+		{"not channel managed", service.ErrSubscriptionNotChannelManaged, 409},
+		{"same plan", service.ErrSamePlanChange, 409},
+		{"not an upgrade", service.ErrPlanChangeNotUpgrade, 409},
+		{"plan not found", service.ErrPlanNotFound, 400},
+		{"price not configured", service.ErrPaddlePriceNotConfigured, 400},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &mockPaymentSvc{upgradeErr: tc.err}
+			engine := paymentTestEngine(svc, "user-1")
+			rec := doRequest(engine, "POST", "/payments/subscription/upgrade", map[string]string{"plan_id": "yearly"})
+			if rec.Code != tc.code {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestUpgradeChannelSubscription_MissingPlanID(t *testing.T) {
+	svc := &mockPaymentSvc{}
+	engine := paymentTestEngine(svc, "user-1")
+	rec := doRequest(engine, "POST", "/payments/subscription/upgrade", map[string]string{})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }

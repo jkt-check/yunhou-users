@@ -1126,3 +1126,166 @@ func TestWalletAdjustment_SourcePersisted(t *testing.T) {
 		}
 	}
 }
+
+// TestWalletZeroPriceHold_ReserveSettleRelease: 0 价模型的钱包冻结（hold=0）
+// 是合法配置——空拆分落 hold 行 + 镜像 reservation，余额一分不动，走与正
+// 额相同的 settle/release 状态机（migration 043 对齐 041 的零额裁定）；
+// 负额仍拒绝。
+func TestWalletZeroPriceHold_ReserveSettleRelease(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+	priceID := seedMoneyPrice(t, s, f.modelID, "CNY", 1, time.Now().Add(-time.Hour))
+	// 零余额也要放行：0 额冻结不触碰余额。
+	enableOverage(t, s, f.accountID, "CNY", 1_000_000)
+	w, err := s.GetWalletByAccount(ctx, f.accountID, "CNY")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reserve := func() *domain.Admission {
+		t.Helper()
+		uow, _ := s.Begin(ctx)
+		adm, err := s.ReserveWallet(ctx, uow, reserveWalletCmd(t, s, f, w.ID, priceID, 0))
+		if err != nil {
+			_ = uow.Rollback(ctx)
+			t.Fatalf("zero hold must be admitted: %v", err)
+		}
+		if err := uow.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return adm
+	}
+	admSettle := reserve()
+	admRelease := reserve()
+
+	// hold 行 + 镜像 reservation：零额、held，"已冻结(0)"与"无冻结"可区分。
+	var amount, cash, bonus int64
+	var state string
+	if err := s.db.QueryRow(
+		`SELECT amount_micros, cash_micros, bonus_micros, state FROM inference_wallet_holds
+		 WHERE request_id = $1`, admSettle.RequestID).Scan(&amount, &cash, &bonus, &state); err != nil {
+		t.Fatal(err)
+	}
+	if amount != 0 || cash != 0 || bonus != 0 || state != "held" {
+		t.Fatalf("zero hold = %d/%d/%d %s, want 0/0/0 held", amount, cash, bonus, state)
+	}
+	var resAmount int64
+	var resState string
+	if err := s.db.QueryRow(
+		`SELECT amount_micros, state FROM inference_reservations
+		 WHERE request_id = $1 AND target_kind = 'wallet'`, admSettle.RequestID).
+		Scan(&resAmount, &resState); err != nil {
+		t.Fatal(err)
+	}
+	if resAmount != 0 || resState != "held" {
+		t.Fatalf("mirrored reservation = %d %s, want 0 held", resAmount, resState)
+	}
+
+	// 结算 0 消费：hold→settled，零额分录不落行（entries CHECK amount > 0）。
+	attID := uuid.NewString()
+	uow1, _ := s.Begin(ctx)
+	if err := insertAttempt(ctx, mustTx(t, uow1), &domain.Attempt{ID: attID, RequestID: admSettle.RequestID, AttemptNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := domain.NewMoney(0, "CNY")
+	in := int64(1000)
+	if err := s.Settle(ctx, uow1, domain.SettleCommand{
+		RequestID: admSettle.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: admSettle.RequestID, AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in},
+		},
+		ChargeMicros: 0, WalletCharge: &cm, SettledAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("zero settle: %v", err)
+	}
+	if err := uow1.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 释放另一笔：hold→released，与正额同状态机。
+	uow2, _ := s.Begin(ctx)
+	if err := s.Release(ctx, uow2, admRelease.RequestID); err != nil {
+		t.Fatalf("zero release: %v", err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var states []string
+	if err := s.db.Select(&states,
+		`SELECT state FROM inference_wallet_holds ORDER BY created_at, request_id`); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(states) != "[settled released]" {
+		t.Fatalf("hold states = %v, want [settled released]", states)
+	}
+	var entries int
+	if err := s.db.Get(&entries, `SELECT COUNT(*) FROM inference_wallet_entries`); err != nil {
+		t.Fatal(err)
+	}
+	if entries != 0 {
+		t.Fatalf("zero flow must write no wallet entries, got %d", entries)
+	}
+	view, err := s.WalletBalance(ctx, f.accountID, "CNY", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Balance.CashAvailable != 0 || view.Balance.CashHeld != 0 || view.Balance.BonusHeld != 0 {
+		t.Fatalf("balance = %+v, want all zero (0 额冻结不动余额)", view.Balance)
+	}
+	req, err := s.GetRequest(ctx, admSettle.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqSettled || req.SettledMicros == nil || *req.SettledMicros != 0 {
+		t.Fatalf("settled request = %+v, want settled/0", req)
+	}
+
+	// 负额仍拒绝。
+	uow3, _ := s.Begin(ctx)
+	_, err = s.ReserveWallet(ctx, uow3, reserveWalletCmd(t, s, f, w.ID, priceID, -1))
+	_ = uow3.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("negative hold must reject, got %v", err)
+	}
+}
+
+// TestWalletSpendLimitGate_InFlightHoldsCounted: 月支出上限的门控数值 = 已
+// 结算支出 + 在途冻结 + 本笔（与窗口配额 used+reserved+amount 同口径）——
+// 只看已结算时两个并发 hold 各见 spent=0 会双双过闸、月度总额超限。
+func TestWalletSpendLimitGate_InFlightHoldsCounted(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+	priceID := seedMoneyPrice(t, s, f.modelID, "CNY", 1, time.Now().Add(-time.Hour))
+	fundWallet(t, s, f.accountID, "CNY", 100_000_000, 0)
+	enableOverage(t, s, f.accountID, "CNY", 3_000_000) // 月上限 3 CNY
+	w, _ := s.GetWalletByAccount(ctx, f.accountID, "CNY")
+
+	// 第一笔 hold 2 CNY 在途（未结算）：已结算支出仍是 0。
+	uow, _ := s.Begin(ctx)
+	if _, err := s.ReserveWallet(ctx, uow, reserveWalletCmd(t, s, f, w.ID, priceID, 2_000_000)); err != nil {
+		t.Fatalf("first reserve: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 第二笔 hold 2 CNY：0 已结算 + 2 在途 + 2 本笔 > 3 → 拒绝（旧口径
+	// 只看已结算会放行）。
+	uow2, _ := s.Begin(ctx)
+	_, err := s.ReserveWallet(ctx, uow2, reserveWalletCmd(t, s, f, w.ID, priceID, 2_000_000))
+	_ = uow2.Rollback(ctx)
+	if !errors.Is(err, accounting.ErrSpendLimitExceeded) {
+		t.Fatalf("in-flight hold must count toward the monthly cap, got %v", err)
+	}
+	// 恰好到顶的 1 CNY（0+2+1 = 3）放行。
+	uow3, _ := s.Begin(ctx)
+	if _, err := s.ReserveWallet(ctx, uow3, reserveWalletCmd(t, s, f, w.ID, priceID, 1_000_000)); err != nil {
+		_ = uow3.Rollback(ctx)
+		t.Fatalf("exact-limit reserve must pass: %v", err)
+	}
+	if err := uow3.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

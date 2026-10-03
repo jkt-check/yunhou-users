@@ -80,7 +80,9 @@ func (s *SubscriptionService) Create(ctx context.Context, userID, planID string,
 	// user can't extend the lifetime of a free plan arbitrarily.
 	var derivedExpiry *time.Time
 	if plan.IntervalDays > 0 {
-		t := time.Now().Add(time.Duration(plan.IntervalDays) * 24 * time.Hour)
+		// Clamp before the day→Duration multiply (int64-ns wrap); see
+		// maxIntervalDays.
+		t := time.Now().Add(time.Duration(min(plan.IntervalDays, maxIntervalDays)) * 24 * time.Hour)
 		derivedExpiry = &t
 	}
 

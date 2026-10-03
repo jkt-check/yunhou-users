@@ -284,8 +284,12 @@ func resolvePolicy(ctx context.Context, g getter, planID string) (string, error)
 		return "", fmt.Errorf("read plan_benefit_configs for plan %s: %w", planID, err)
 	}
 	var status string
+	// FOR KEY SHARE 对齐 postgres.lockPolicyForGrantTx:实跑路径在逐用户
+	// 事务内持锁至提交,与 retire 的 FOR UPDATE 互斥定序(grant 先锁则
+	// retire 等待,retire 先提交则读到 retired 拒绝)。dry-run 在自动提交
+	// 的单条 SELECT 里,锁随语句结束释放,行为不变。
 	if err := g.GetContext(ctx, &status,
-		`SELECT status FROM inference_policy_versions WHERE id = $1`, policyID); err != nil {
+		`SELECT status FROM inference_policy_versions WHERE id = $1 FOR KEY SHARE`, policyID); err != nil {
 		return "", fmt.Errorf("read policy version %s: %w", policyID, err)
 	}
 	if status == "retired" {

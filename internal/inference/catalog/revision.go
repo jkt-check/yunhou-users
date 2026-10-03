@@ -52,7 +52,9 @@ type Snapshot struct {
 
 // Model resolves a public model ID or alias to the model. Aliases ('latest'
 // and model-specific ones) resolve to the same stable entry — the DB never
-// stores one row per alias (migration 024 comment).
+// stores one row per alias (migration 024 comment). Cross-model alias
+// uniqueness is enforced by ParseSnapshot and the publish gate, so the
+// map-iteration scan below can never match two models.
 func (s *Snapshot) Model(idOrAlias string) (*domain.Model, bool) {
 	if m, ok := s.Models[idOrAlias]; ok {
 		return &m, true
@@ -263,6 +265,7 @@ func ParseSnapshot(rev *domain.ConfigRevision) (*Snapshot, error) {
 		Deployments:   make(map[string]domain.Deployment, len(p.Deployments)),
 		RoutesByModel: make(map[string][]domain.ModelRoute, len(p.Models)),
 	}
+	models := make([]domain.Model, 0, len(p.Models))
 	for _, pm := range p.Models {
 		protocols := make([]domain.Protocol, 0, len(pm.Protocols))
 		for _, proto := range pm.Protocols {
@@ -280,6 +283,13 @@ func ParseSnapshot(rev *domain.ConfigRevision) (*Snapshot, error) {
 			return nil, fmt.Errorf("catalog: revision %d: %w", rev.Revision, err)
 		}
 		snap.Models[m.ID] = m
+		models = append(models, m)
+	}
+	// Alias ambiguity fails the whole parse (fail loudly, never serve half a
+	// version): a duplicate alias would make Snapshot.Model's map-iteration
+	// resolution non-deterministic on the dispatch path.
+	if err := validateModelAliasUniqueness(models); err != nil {
+		return nil, fmt.Errorf("catalog: revision %d: %w", rev.Revision, err)
 	}
 	for _, pp := range p.Providers {
 		snap.Providers[pp.ID] = domain.Provider{

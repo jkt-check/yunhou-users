@@ -60,6 +60,12 @@ func (m *mockWebhookSvc) ListPaymentRefunds(_ context.Context, _, _ string) ([]m
 func (m *mockWebhookSvc) GetRefund(_ context.Context, _, _ string) (*model.Refund, error) {
 	return nil, nil
 }
+func (m *mockWebhookSvc) CancelChannelSubscription(_ context.Context, _ string) (*model.Subscription, error) {
+	return nil, nil
+}
+func (m *mockWebhookSvc) UpgradeChannelSubscription(_ context.Context, _, _ string) (*service.ChannelUpgradeResult, error) {
+	return nil, nil
+}
 
 func webhookTestEngine(svc service.PaymentServiceInterface) *gin.Engine {
 	gin.SetMode(gin.TestMode)
@@ -223,6 +229,47 @@ func TestWebhookHandler_Stripe_BadJSON(t *testing.T) {
 	rec := postRaw(engine, "/webhooks/payment/stripe", []byte(`{not-json}`))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+}
+
+// TestWebhookHandler_Stripe_MissingIDOrType pins the parsePaypal-style guard:
+// an event without id or type must be rejected up front — otherwise every
+// malformed event dedups onto one empty key and the first one wins.
+func TestWebhookHandler_Stripe_MissingIDOrType(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{}
+	h := NewWebhookHandler(svc, nil, nil, true)
+	for name, body := range map[string]string{
+		"missing id":   `{"type":"payment_intent.succeeded","data":{"object":{"id":"pi_x"}}}`,
+		"missing type": `{"id":"evt_x","data":{"object":{"id":"pi_x"}}}`,
+	} {
+		if _, err := h.parseStripe([]byte(body)); err == nil ||
+			!strings.Contains(err.Error(), "stripe missing id or type") {
+			t.Errorf("%s: err = %v, want 'stripe missing id or type'", name, err)
+		}
+	}
+	if _, err := h.parseStripe([]byte(`{"id":"evt_x","type":"payment_intent.succeeded","data":{"object":{"id":"pi_x"}}}`)); err != nil {
+		t.Errorf("valid envelope should parse, got: %v", err)
+	}
+}
+
+// TestWebhookHandler_WeChat_MissingIDOrEventType: the real (non-mock) path
+// rejects an empty id/event_type before paying the AES-GCM decrypt cost —
+// same guard class as parsePaypal.
+func TestWebhookHandler_WeChat_MissingIDOrEventType(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockWebhookSvc{}
+	h := NewWebhookHandler(svc, nil, nil, false)
+	for name, body := range map[string]string{
+		"missing id":         `{"event_type":"TRANSACTION.SUCCESS","resource":{"ciphertext":"eA==","nonce":"0123456789ab","associated_data":""}}`,
+		"missing event_type": `{"id":"WH-X","resource":{"ciphertext":"eA==","nonce":"0123456789ab","associated_data":""}}`,
+	} {
+		if _, err := h.parseWeChat([]byte(body)); err == nil ||
+			!strings.Contains(err.Error(), "wechat missing id or event_type") {
+			t.Errorf("%s: err = %v, want 'wechat missing id or event_type'", name, err)
+		}
 	}
 }
 

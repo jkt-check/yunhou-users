@@ -100,7 +100,9 @@ func (s *QuoteService) Get(ctx context.Context, appID, planID, userID string) (*
 		BillingCycleDays: plan.IntervalDays,
 		Base:             model.CycleBaseFormula,
 	}
-	subExpires := time.Now().Add(time.Duration(cycle.TrialDays+cycle.BillingCycleDays) * 24 * time.Hour)
+	// Clamp before the day→Duration multiply (int64-ns wrap); see
+	// maxIntervalDays.
+	subExpires := time.Now().Add(time.Duration(min(cycle.TrialDays+cycle.BillingCycleDays, maxIntervalDays)) * 24 * time.Hour)
 
 	return &model.Quote{
 		PlanID: plan.ID,

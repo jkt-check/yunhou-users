@@ -450,6 +450,11 @@ func (c *Config) Validate() error {
 	if c.RelayTicketSecret != "" && len(c.RelayTicketSecret) < 32 {
 		return errors.New("RELAY_TICKET_SECRET must be at least 32 characters (use `openssl rand -hex 32`)")
 	}
+	// 轮换期旧 secret 与主 secret 同强度下限:校验期它同样签发信任
+	// (接受旧 ticket),弱旧 secret 与弱主 secret 一样可被暴力伪造。
+	if c.RelayTicketSecretPrev != "" && len(c.RelayTicketSecretPrev) < 32 {
+		return errors.New("RELAY_TICKET_SECRET_PREVIOUS must be at least 32 characters (use `openssl rand -hex 32`)")
+	}
 	// RELAY_WS_URL 为空 = 按请求 Host 推导 ws_url,合法;一旦设置必须是
 	// 带 host 的 ws:// 或 wss:// URL —— 填错 scheme(如 https://)或空
 	// host 会让客户端拿到永远连不上的地址且无任何报错,比不配置更难排查。
@@ -523,6 +528,22 @@ func (c *Config) Validate() error {
 		}
 		if c.WeChatOAuthMock {
 			return errors.New("WECHAT_OAUTH_MOCK must not be enabled when PAYPAL_ENV=live")
+		}
+	}
+	// PADDLE_ENV=live is the same class of independent production signal as
+	// PAYPAL_ENV=live: a deployment wired to the live Paddle channel must
+	// refuse every mock switch even when APP_ENV is misconfigured to a
+	// non-production value — otherwise WECHAT_PAY_MOCK would start on a
+	// live-billing host and accept unsigned payment webhooks.
+	if c.PaddleEnv == "live" {
+		if c.PaypalL3E2EMode {
+			return errors.New("PAYPAL_L3_E2E_MODE must not be enabled when PADDLE_ENV=live")
+		}
+		if c.WeChatPayMock {
+			return errors.New("WECHAT_PAY_MOCK must not be enabled when PADDLE_ENV=live")
+		}
+		if c.WeChatOAuthMock {
+			return errors.New("WECHAT_OAUTH_MOCK must not be enabled when PADDLE_ENV=live")
 		}
 	}
 	// A fully-populated real WeChat Pay credential tuple alongside a mock

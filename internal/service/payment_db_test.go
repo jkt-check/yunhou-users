@@ -342,6 +342,65 @@ func TestPaymentService_CreateOrder_PaypalTrialSubExempt(t *testing.T) {
 	}
 }
 
+// TestPaymentService_CreateOrder_PaddlePendingOrderRejected pins the
+// pending-order half of the double-subscription guard (2026-10 review):
+// the active-sub check (TestPaymentService_CreateOrder_PaypalActiveSubRejected)
+// only fires after the first checkout SETTLES. Two open hosted checkouts
+// can both be paid → two channel-side auto-renew subscriptions, the local
+// external_subscription_id overwritten by the later one, the earlier one
+// charging forever with no local cancel handle. An unexpired pending
+// order in the same product must reject the second CreateOrder (409 via
+// ErrUserHasActiveSub); a manual-renewal channel (stripe) stays allowed.
+func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	// Paddle settles USD (channelRequiredCurrency); mirror the intl seed.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE plans SET currency = 'USD' WHERE id = 'monthly'`); err != nil {
+		t.Fatalf("set monthly currency: %v", err)
+	}
+	svc.SetPaddleClient(&stubPaddle{txnID: "txn_db_1", checkout: "https://yunhou.ai/checkout?_ptxn=txn_db_1"})
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_db"})
+
+	first, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle")
+	if err != nil {
+		t.Fatalf("first paddle order: %v", err)
+	}
+	if first.Status != "pending" {
+		t.Fatalf("first order status = %q, want pending", first.Status)
+	}
+	// Second paddle order while the first checkout is still open → 409.
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasActiveSub) {
+		t.Fatalf("second paddle order: err = %v, want ErrUserHasActiveSub", err)
+	}
+	// PayPal shares the auto-renew shape → also blocked.
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal"); !errors.Is(err, ErrUserHasActiveSub) {
+		t.Fatalf("paypal order with pending paddle order: err = %v, want ErrUserHasActiveSub", err)
+	}
+	// WeChat/stripe have no channel-side auto-renewal: a parallel pending
+	// order there is the long-standing manual-renewal shape, still allowed.
+	stripeOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("stripe order alongside a pending paddle order must stay allowed; got %v", err)
+	}
+	// The guard keys on (user, product) pending — any channel's pending
+	// order counts, so the stripe pending order must be cleared too before
+	// the next paddle attempt. Once nothing pending remains, paddle opens.
+	if err := svc.CancelOrder(context.Background(), first.ID, uid); err != nil {
+		t.Fatalf("cancel first order: %v", err)
+	}
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasActiveSub) {
+		t.Fatalf("paddle order with a pending stripe order: err = %v, want ErrUserHasActiveSub", err)
+	}
+	if err := svc.CancelOrder(context.Background(), stripeOrder.ID, uid); err != nil {
+		t.Fatalf("cancel stripe order: %v", err)
+	}
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); err != nil {
+		t.Fatalf("paddle order after cancelling the pending ones must be allowed; got %v", err)
+	}
+}
+
 // TestCreateOrder_TrialPlanNotPurchasable: the trial plan is granted by
 // auth on first login and must never be orderable — even for a user
 // with no subscription at all. eligibilityAndInsertOrderTx rejects it
@@ -768,6 +827,62 @@ func TestConfirm_LifetimeOrderBlockedAfterUpgrade(t *testing.T) {
 	planID, _ := readSub(t, db, uid)
 	if planID != "yearly" {
 		t.Errorf("plan = %q, want yearly (interval=0 stale order must be blocked)", planID)
+	}
+}
+
+// TestConfirm_LifetimeSubExpiryPreservedOnRepurchase (2026-10 review): a
+// user whose active subscription NEVER expires (expires_at IS NULL, e.g. a
+// lifetime grant) buys a finite-cycle plan. The payment is honored and the
+// plan switches, but the replacement must NOT shrink the never-expire
+// entitlement into now()+interval — expires_at stays NULL.
+func TestConfirm_LifetimeSubExpiryPreservedOnRepurchase(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps)
+		VALUES ('lifetime', 'Lifetime', 999, 0, ARRAY['yundian'])
+		ON CONFLICT (id) DO NOTHING
+	`); err != nil {
+		t.Fatalf("seed lifetime plan: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at)
+		VALUES (gen_random_uuid(), $1, 'lifetime', 'active', now(), NULL)
+	`, uid); err != nil {
+		t.Fatalf("seed lifetime sub: %v", err)
+	}
+
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if err != nil {
+		t.Fatalf("repurchase order: %v", err)
+	}
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-lifetime-keep",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	var planID string
+	var expiresAt sql.NullTime
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT plan_id, expires_at FROM subscriptions WHERE user_id = $1 AND status = 'active'
+	`, uid).Scan(&planID, &expiresAt); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if planID != "monthly" {
+		t.Errorf("plan = %q, want monthly (plan switch proceeds)", planID)
+	}
+	if expiresAt.Valid {
+		t.Errorf("expires_at = %v, want NULL (lifetime entitlement must not shrink to a finite window)", expiresAt.Time)
+	}
+	var orderStatus string
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT status FROM orders WHERE id = $1`, order.ID).Scan(&orderStatus); err != nil {
+		t.Fatalf("read order: %v", err)
+	}
+	if orderStatus != "paid" {
+		t.Errorf("order status = %q, want paid (payment honored)", orderStatus)
 	}
 }
 
@@ -2095,26 +2210,61 @@ func TestPaymentService_OnWebhook_UnexpectedStateTransition(t *testing.T) {
 }
 
 // TestPaymentService_OnWebhook_DisputeCreated_NoPayment covers the
-// "no matching payment row" early-return in onDisputeCreated. The handler
-// should not error; it just no-ops because there's nothing to flag.
+// out-of-order delivery window (2026-10 review): a dispute event that
+// arrives BEFORE the payment success event must NOT be acked — ack 200
+// would mark the event processed and lose the disputed flag forever.
+// Aligned with the refund path (评审轮1 C2): audit the miss and return an
+// error so the channel redelivers; the redelivery after settlement flags
+// the payment disputed.
 func TestPaymentService_OnWebhook_DisputeCreated_NoPayment(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
 
+	txnID := "pi-disp-oo-" + mustNewUUID()[:8]
+	eventID := "evt-disp-oo-" + mustNewUUID()[:8]
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
-		Channel: "stripe", EventID: "evt-disp-nopay-" + mustNewUUID()[:8], EventType: "charge.dispute.created",
-		TransactionID: "pi-nopay-" + mustNewUUID()[:8], Amount: 1, Currency: "CNY",
+		Channel: "stripe", EventID: eventID, EventType: "charge.dispute.created",
+		TransactionID: txnID, Amount: 1, Currency: "CNY",
 		RawPayload: json.RawMessage(`{}`),
 	})
-	if err != nil {
-		t.Fatalf("OnWebhook dispute-no-payment: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown payment") {
+		t.Fatalf("err = %v, want unknown-payment error so the channel retries", err)
 	}
-	// No payments row was created by the dispute handler.
+	// The miss is audited...
 	var n int
 	_ = db.GetContext(context.Background(), &n,
-		`SELECT count(*) FROM payments WHERE external_txn_id LIKE 'pi-nopay-%'`)
-	if n != 0 {
-		t.Errorf("expected 0 payments rows for no-payment dispute, got %d", n)
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_dispute_unknown_payment'`)
+	if n != 1 {
+		t.Errorf("audit rows = %d, want 1", n)
+	}
+	// ...and the event is NOT marked processed, so a channel redelivery
+	// re-runs the domain action instead of hitting the dedupe ack.
+	var processedAt sql.NullTime
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT processed_at FROM webhook_events WHERE channel = 'stripe' AND event_id = $1`,
+		eventID).Scan(&processedAt); err != nil {
+		t.Fatalf("read webhook event: %v", err)
+	}
+	if processedAt.Valid {
+		t.Error("out-of-order dispute must stay unprocessed (channel redelivery re-runs it)")
+	}
+
+	// The payment settles (dispute redelivery comes after).
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	res, _ := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
+	})
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: eventID, EventType: "charge.dispute.created",
+		TransactionID: txnID, OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("dispute redelivery: %v", err)
+	}
+	got, _ := svc.GetPayment(context.Background(), res.PaymentID, uid)
+	if !got.Disputed {
+		t.Error("Disputed = false after redelivery post-settlement")
 	}
 }
 
@@ -2185,6 +2335,51 @@ func TestPaymentService_OnWebhook_PaymentFailed_AfterPaid(t *testing.T) {
 		t.Error("expected audit row for subscription_deactivated_failed_payment")
 	}
 	_ = res // silence unused
+}
+
+// TestPaymentService_OnWebhook_PaymentFailed_DifferentTxnKeepsPaid pins the
+// 2026-10 double-checkout fix: a payment_failed arriving with a DIFFERENT
+// txn id than the one that settled the order must NOT flip the paid order
+// to failed (Stripe payment_intent.payment_failed / PayPal CAPTURE.FAILED
+// for a second checkout attempt against the same order). The failed state
+// is unrecoverable — onPaymentSucceeded's order UPDATE only fires from
+// pending/expired/cancelled — so the order, the paid payment row, and the
+// subscription must all survive, and no new payment row is minted.
+func TestPaymentService_OnWebhook_PaymentFailed_DifferentTxnKeepsPaid(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	if _, err := svc.Confirm(context.Background(), ConfirmInput{
+		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-settled",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "stripe", EventID: "evt-pf-other-" + mustNewUUID()[:8], EventType: "payment_intent.payment_failed",
+		TransactionID: "pi-other-attempt", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook different-txn failure: %v", err)
+	}
+	got, _ := svc.GetOrder(context.Background(), order.ID, uid)
+	if got.Status != "paid" {
+		t.Errorf("order.Status = %q, want paid (different-txn failure must not flip a settled order)", got.Status)
+	}
+	var payCount int
+	_ = db.GetContext(context.Background(), &payCount,
+		`SELECT count(*) FROM payments WHERE order_id = $1`, order.ID)
+	if payCount != 1 {
+		t.Errorf("payments for order = %d, want 1 (no pending row minted for the failed second attempt)", payCount)
+	}
+	var subStatus string
+	_ = db.GetContext(context.Background(), &subStatus,
+		`SELECT status FROM subscriptions WHERE user_id = $1 AND plan_id = 'monthly'`, uid)
+	if subStatus != "active" {
+		t.Errorf("sub.Status = %q, want active (no cascade on a different-txn failure)", subStatus)
+	}
 }
 
 // 评审轮3 D-1：Alipay trade_closed 真未支付关单（订单 pending，永不
@@ -2961,6 +3156,53 @@ func TestPaymentService_OnWebhook_PaypalRenewal_Success(t *testing.T) {
 	}
 	if newExp.Unix() != newExpAt.Unix() {
 		t.Errorf("expires_at: got %v, want %v", newExp, newExpAt)
+	}
+}
+
+// TestPaymentService_OnWebhook_PaypalRenewal_OutOfOrderKeepsMaxExpiry pins
+// the GREATEST guard (2026-10 review): renewal events processed out of
+// order (period N+1 settled before period N's redelivery) must not roll
+// expires_at BACK to the earlier period's next_billing_time. The payment
+// row is still recorded — the channel did charge.
+func TestPaymentService_OnWebhook_PaypalRenewal_OutOfOrderKeepsMaxExpiry(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := mustNewUUID()
+	laterExp := time.Now().Add(45 * 24 * time.Hour)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'active', $3, 'I-PP-OOO')
+	`, subID, uid, laterExp); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	// Period-N event arrives AFTER period N+1 already extended the sub:
+	// its next_billing_time sits BEFORE the stored expires_at.
+	earlierHint := time.Now().Add(15 * 24 * time.Hour)
+	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paypal", EventID: "evt-ooo-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
+		TransactionID: "txn-ooo-" + mustNewUUID()[:8], ExternalSubscriptionID: "I-PP-OOO",
+		Amount: 29.9, Currency: "USD",
+		SubExpiresAt: &earlierHint,
+		RawPayload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("OnWebhook out-of-order renewal: %v", err)
+	}
+	var gotExp time.Time
+	if err := db.GetContext(context.Background(), &gotExp,
+		`SELECT expires_at FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub: %v", err)
+	}
+	if gotExp.Unix() != laterExp.Unix() {
+		t.Errorf("expires_at rolled back: got %v, want %v (GREATEST keeps the later period)", gotExp, laterExp)
+	}
+	var payCount int
+	_ = db.GetContext(context.Background(), &payCount,
+		`SELECT count(*) FROM payments WHERE channel = 'paypal' AND external_txn_id LIKE 'txn-ooo-%'`)
+	if payCount != 1 {
+		t.Errorf("renewal payment rows = %d, want 1 (charge still recorded)", payCount)
 	}
 }
 

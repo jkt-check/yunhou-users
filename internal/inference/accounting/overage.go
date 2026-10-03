@@ -50,10 +50,11 @@ var ErrSpendLimitExceeded = domain.NewError(domain.CodeQuotaExceeded,
 	"accounting: monthly wallet spend limit reached")
 
 // CheckWalletSpend gates ONE wallet hold against the overage settings and
-// the month's already-spent amount. monthSpent is ledger-derived (consume
-// debits net of their reversals within MonthBoundsUTC(now)); hold is the
-// safe upper bound about to be frozen. Pure — the repo supplies the sums
-// under the wallet row lock.
+// the month's spend. monthSpent is settled spend (consume debits net of
+// their reversals within MonthBoundsUTC(now)) PLUS any in-flight held
+// amounts, so concurrent holds cannot race past the cap; hold is the safe
+// upper bound about to be frozen. Pure — the repo supplies the sums under
+// the wallet row lock.
 func CheckWalletSpend(s OverageSettings, monthSpent, hold int64) error {
 	if err := s.Validate(); err != nil {
 		return err

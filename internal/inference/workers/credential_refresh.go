@@ -34,6 +34,13 @@ type CredentialRefreshConfig struct {
 	// (default 5min — covers several worker intervals of vendor outage
 	// before the access token actually dies).
 	RefreshSkew time.Duration
+	// VendorTimeout 是单次凭据轮换（含厂商 token 端点调用）的子 ctx 上限
+	// （default 60s）。共享 transport（providers.NewHTTPClient）刻意不设
+	// client Timeout——只限 dial/TLS/响应头——厂商挂起会永久阻塞 body 读
+	// 取；本 worker 的 pass 顺序执行，一次挂起即冻结后续所有凭据轮换。
+	// DeadlineExceeded 经 connector 归为 KindRetryable（冷却/重试语义不
+	// 变，绝不动账号状态）。
+	VendorTimeout time.Duration
 }
 
 func (c *CredentialRefreshConfig) withDefaults() CredentialRefreshConfig {
@@ -46,6 +53,9 @@ func (c *CredentialRefreshConfig) withDefaults() CredentialRefreshConfig {
 	}
 	if out.RefreshSkew <= 0 {
 		out.RefreshSkew = 5 * time.Minute
+	}
+	if out.VendorTimeout <= 0 {
+		out.VendorTimeout = time.Minute
 	}
 	return out
 }
@@ -88,7 +98,9 @@ func (w *CredentialRefresh) RunPass(ctx context.Context) (CredentialRefreshMetri
 	}
 	m.Scanned = len(creds)
 	for i := range creds {
-		outcome, err := w.refresher.RefreshCredential(ctx, creds[i].ID, "scheduled refresh")
+		rctx, cancel := context.WithTimeout(ctx, w.cfg.VendorTimeout)
+		outcome, err := w.refresher.RefreshCredential(rctx, creds[i].ID, "scheduled refresh")
+		cancel()
 		if err != nil {
 			if domain.CodeOf(err) == domain.CodeInvalidInput {
 				m.Misconfigured++

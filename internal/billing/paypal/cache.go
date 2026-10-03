@@ -45,11 +45,9 @@ type TokenCache struct {
 }
 
 type inflightCall struct {
-	done       chan struct{} // closed when leader's fetch returns
-	leaderCtx  context.Context
-	cancelLead context.CancelFunc // cancels leaderCtx when no waiters remain
-	tok        *Token
-	err        error
+	done chan struct{} // closed when leader's fetch returns
+	tok  *Token
+	err  error
 }
 
 type cachedToken struct {
@@ -75,62 +73,44 @@ func NewTokenCache(safetyMargin time.Duration) *TokenCache {
 // return 503 would otherwise see N parallel retries from every Yunhou
 // instance).
 //
-// The fetch callback receives a context that is cancelled when ALL waiting
-// callers' contexts are cancelled (whichever fires first). The leader's
-// fetch is therefore guaranteed to make forward progress while any caller
-// is still waiting — preventing the "leader stalled forever → followers
-// wedged" pattern that the bare <-call.done wait used to allow.
+// fetch takes no context: cancellation is the callback's own concern —
+// CachedClient.FetchToken binds the request ctx into its closure, so the
+// leader's upstream call dies with that request. A waiter that abandons the
+// call does not cancel the shared fetch; the result still lands in the
+// cache for the next caller.
 func (c *TokenCache) GetOrFetch(cacheKey string, fetch func() (*Token, error)) (*Token, error) {
 	c.mu.Lock()
 	if e, ok := c.entries[cacheKey]; ok && time.Now().Before(e.expiresAt) {
+		// 命中时把 ExpiresIn 折算成剩余秒数 —— 签发时的原值会让调用方在
+		// 缓存窗口尾部高估 token 余命。expiresAt 已扣过 safetyMargin,
+		// 折算值偏保守,方向正确。返回副本,不回写共享的缓存条目。
+		tok := *e.token
+		tok.ExpiresIn = int(time.Until(e.expiresAt).Seconds())
 		c.mu.Unlock()
-		return e.token, nil
+		return &tok, nil
 	}
 	if call, ok := c.inflight[cacheKey]; ok {
-		// Join the inflight: remember the leader's context so we can
-		// cancel it when all followers (including us) lose interest.
-		// A new entry's leaderCtx is set right after we register;
-		// without that lock dance we'd race the leader writing it.
-		leaderCtx := call.leaderCtx
 		c.mu.Unlock()
-		select {
-		case <-call.done:
-			// Either the leader stored an entry (call.tok non-nil) or
-			// it errored (call.err). Return whichever it set; do not
-			// retry. A nil token alongside a nil error means the fetch
-			// callback returned (nil, nil) — treat as upstream failure
-			// rather than dereferencing nil and panicking in the
-			// caller's AccessToken read.
-			if call.err != nil {
-				return nil, fmt.Errorf("%w: %w", ErrUpstreamFailed, call.err)
-			}
-			if call.tok == nil {
-				return nil, fmt.Errorf("%w: leader returned nil token", ErrUpstreamFailed)
-			}
-			return call.tok, nil
-		case <-leaderCtx.Done():
-			// The leader's fetch saw its ctx cancelled (e.g. every
-			// caller's ctx cancelled). The leader will return
-			// ErrUpstreamFailed and close call.done momentarily, so we
-			// fall through and let the next GetOrFetch either become a
-			// fresh leader or join the next leader.
-			return nil, fmt.Errorf("%w: leader context cancelled", ErrUpstreamFailed)
+		<-call.done
+		// Either the leader stored an entry (call.tok non-nil) or it
+		// errored (call.err). Return whichever it set; do not retry. A
+		// nil token alongside a nil error means the fetch callback
+		// returned (nil, nil) — treat as upstream failure rather than
+		// dereferencing nil and panicking in the caller's AccessToken
+		// read.
+		if call.err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrUpstreamFailed, call.err)
 		}
+		if call.tok == nil {
+			return nil, fmt.Errorf("%w: leader returned nil token", ErrUpstreamFailed)
+		}
+		return call.tok, nil
 	}
-	// We're the leader for this key. Build a derived ctx so we can
-	// cancel the upstream call if every waiter (including us) loses
-	// interest — preventing a stuck-leader wedge when the request ctx
-	// is cancelled while fetch() is mid-flight.
-	leaderCtx, cancelLead := context.WithCancel(context.Background())
-	call := &inflightCall{
-		done:       make(chan struct{}),
-		leaderCtx:  leaderCtx,
-		cancelLead: cancelLead,
-	}
+	// We're the leader for this key.
+	call := &inflightCall{done: make(chan struct{})}
 	c.inflight[cacheKey] = call
 	c.mu.Unlock()
 
-	defer cancelLead()
 	call.tok, call.err = fetch()
 
 	if call.err == nil && call.tok != nil {

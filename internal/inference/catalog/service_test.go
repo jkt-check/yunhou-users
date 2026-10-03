@@ -403,8 +403,11 @@ func TestListPublishedModelsAppliesSellablePriceAndAccessHooks(t *testing.T) {
 	_, _, svc := testDB(t)
 	ctx := context.Background()
 	seedProviderModelDeployment(t, svc, "glm-4.6")
-	// A second model, same protocol, still draft.
+	// A second model, same protocol, still draft. Its alias must differ from
+	// the seeded model's ("latest"): duplicate aliases are a publish-time
+	// error now (非确定路由防护).
 	draft := sampleModel("glm-draft")
+	draft.Aliases = []string{"draft-latest"}
 	if err := svc.CreateModel(ctx, &draft); err != nil {
 		t.Fatal(err)
 	}
@@ -545,6 +548,9 @@ func TestPublishDrainsMoreThanOnePage(t *testing.T) {
 	store.InsertProvider(ctx, &domain.Provider{Code: "bulk", DisplayName: "Bulk", AccessType: domain.AccessOfficialAPI})
 	for i := 0; i < totalModels; i++ {
 		m := sampleModel(fmt.Sprintf("bulk-%04d", i))
+		// Aliases must be unique across models — the publish gate rejects
+		// duplicates (非确定路由防护), so the shared sample alias won't do.
+		m.Aliases = []string{m.ID + "-latest"}
 		if err := store.InsertModel(ctx, &m); err != nil {
 			t.Fatalf("seed model %d: %v", i, err)
 		}

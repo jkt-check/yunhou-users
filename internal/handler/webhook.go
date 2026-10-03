@@ -163,6 +163,11 @@ func (h *WebhookHandler) parseStripe(raw []byte) (*service.WebhookEvent, error) 
 	if err := json.Unmarshal(raw, &evt); err != nil {
 		return nil, fmt.Errorf("stripe body: %w", err)
 	}
+	if evt.ID == "" || evt.Type == "" {
+		// Same guard as parsePaypal/parsePaddle: an empty id or type would
+		// dedup every malformed event onto one row (payments unique keys).
+		return nil, fmt.Errorf("stripe missing id or type")
+	}
 
 	pi := evt.Data.Object
 	we := &service.WebhookEvent{
@@ -210,6 +215,11 @@ func (h *WebhookHandler) parseWeChat(raw []byte) (*service.WebhookEvent, error) 
 	}
 	if err := json.Unmarshal(raw, &evt); err != nil {
 		return nil, fmt.Errorf("wechat body: %w", err)
+	}
+	if evt.ID == "" || evt.EventType == "" {
+		// Guard before paying the AES-GCM decrypt cost; empty id/event_type
+		// would collapse distinct malformed events onto one dedup key.
+		return nil, fmt.Errorf("wechat missing id or event_type")
 	}
 
 	plaintext, err := h.decryptWeChatResource(evt.Resource.Ciphertext, evt.Resource.Nonce, evt.Resource.AssociatedData)

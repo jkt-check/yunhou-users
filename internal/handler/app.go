@@ -1024,6 +1024,11 @@ func validatePlanName(name string) (string, error) {
 	return trimmed, nil
 }
 
+// maxPlanDays caps interval_days/trial_days at 100 年。下游把天数换算成
+// time.Duration(int64 纳秒):int32 上限的天数换算后溢出回绕成负时长,
+// 36500 天换算后约 3.15e18 ns,仍在 int64 内且超出任何真实套餐语义。
+const maxPlanDays = 36500
+
 func isSupportedPlanCurrency(currency string) bool {
 	switch currency {
 	case "", "CNY", "USD", "EUR":
@@ -1096,8 +1101,16 @@ func (h *PlanHandler) CreatePlan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be non-negative"})
 		return
 	}
+	if req.IntervalDays > maxPlanDays {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must not exceed 36500 (100 years)"})
+		return
+	}
 	if req.TrialDays < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must be non-negative"})
+		return
+	}
+	if req.TrialDays > maxPlanDays {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must not exceed 36500 (100 years)"})
 		return
 	}
 	if req.Currency != nil && !isSupportedPlanCurrency(*req.Currency) {
@@ -1172,8 +1185,16 @@ func (h *PlanHandler) UpdatePlan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must be non-negative"})
 		return
 	}
+	if req.IntervalDays != nil && *req.IntervalDays > maxPlanDays {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "interval_days must not exceed 36500 (100 years)"})
+		return
+	}
 	if req.TrialDays != nil && *req.TrialDays < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must be non-negative"})
+		return
+	}
+	if req.TrialDays != nil && *req.TrialDays > maxPlanDays {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "trial_days must not exceed 36500 (100 years)"})
 		return
 	}
 	if req.Currency != nil && !isSupportedPlanCurrency(*req.Currency) {

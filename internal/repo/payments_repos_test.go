@@ -714,3 +714,66 @@ func TestAuditLogRepo_Insert(t *testing.T) {
 		t.Errorf("Target = %v", got.Target)
 	}
 }
+
+// TestOrderRepo_FindPendingByUserAndProduct covers the auto-renew-channel
+// pending-order lookup: only UNEXPIRED pending rows in the requested
+// (user, product) scope match — other users, other products, non-pending
+// statuses, lapsed pending rows, and pre-029 NULL-product rows all miss.
+func TestOrderRepo_FindPendingByUserAndProduct(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), alice)
+	r := NewOrderRepo(db)
+	kaya := model.ProductKayaMembership
+	coding := model.ProductCodingPlan
+
+	live := &model.Order{
+		ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+		Amount: 29.9, Currency: "CNY", Status: "pending",
+		ExpiresAt:   time.Now().Add(30 * time.Minute),
+		ProductCode: &kaya,
+	}
+	if err := r.Create(context.Background(), live); err != nil {
+		t.Fatalf("Create live: %v", err)
+	}
+	// Distractors: lapsed pending, paid, other product, other user, and a
+	// pre-029 NULL-product pending row (must NOT match — see interface doc).
+	bob := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), bob)
+	for _, o := range []*model.Order{
+		{ID: newUUID(), UserID: alice.ID, PlanID: "monthly", Amount: 29.9, Currency: "CNY",
+			Status: "pending", ExpiresAt: time.Now().Add(-time.Minute), ProductCode: &kaya},
+		{ID: newUUID(), UserID: alice.ID, PlanID: "monthly", Amount: 29.9, Currency: "CNY",
+			Status: "paid", ExpiresAt: time.Now().Add(30 * time.Minute), ProductCode: &kaya},
+		{ID: newUUID(), UserID: alice.ID, PlanID: "monthly", Amount: 29.9, Currency: "CNY",
+			Status: "pending", ExpiresAt: time.Now().Add(30 * time.Minute), ProductCode: &coding},
+		{ID: newUUID(), UserID: bob.ID, PlanID: "monthly", Amount: 29.9, Currency: "CNY",
+			Status: "pending", ExpiresAt: time.Now().Add(30 * time.Minute), ProductCode: &kaya},
+		{ID: newUUID(), UserID: alice.ID, PlanID: "monthly", Amount: 29.9, Currency: "CNY",
+			Status: "pending", ExpiresAt: time.Now().Add(30 * time.Minute)},
+	} {
+		if err := r.Create(context.Background(), o); err != nil {
+			t.Fatalf("Create distractor %s: %v", o.ID, err)
+		}
+	}
+
+	got, err := r.FindPendingByUserAndProduct(context.Background(), alice.ID, kaya)
+	if err != nil {
+		t.Fatalf("FindPendingByUserAndProduct: %v", err)
+	}
+	if got.ID != live.ID {
+		t.Errorf("got order %s, want live pending %s", got.ID, live.ID)
+	}
+
+	t.Run("no match → ErrNoRows", func(t *testing.T) {
+		// wallet-topup has no pending rows for alice (the coding-plan
+		// distractor above deliberately DOES match its own product).
+		if _, err := r.FindPendingByUserAndProduct(context.Background(), alice.ID, model.ProductWalletTopup); !errors.Is(err, sql.ErrNoRows) {
+			t.Errorf("product without pending rows: err = %v, want ErrNoRows", err)
+		}
+		if _, err := r.FindPendingByUserAndProduct(context.Background(), newUUID(), kaya); !errors.Is(err, sql.ErrNoRows) {
+			t.Errorf("other user: err = %v, want ErrNoRows", err)
+		}
+	})
+}

@@ -317,7 +317,9 @@ func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string)
 		return
 	}
 	now := time.Now()
-	expiresAt := now.Add(time.Duration(plan.TrialDays) * 24 * time.Hour)
+	// Clamp before the day→Duration multiply (int64-ns wrap); see
+	// maxIntervalDays.
+	expiresAt := now.Add(time.Duration(min(plan.TrialDays, maxIntervalDays)) * 24 * time.Hour)
 	if err := s.subRepo.Create(ctx, &model.Subscription{
 		ID:        GenerateUUID(),
 		UserID:    userID,
@@ -349,13 +351,19 @@ func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string)
 func (s *AuthService) resolveOrCreateUser(ctx context.Context, info *ProviderUserInfo) (string, bool, error) {
 	if info.Email != "" {
 		byEmail, err := s.identityRepo.FindByEmail(ctx, info.Email)
-		if err == nil {
-			for _, ident := range byEmail {
-				if isTestIdentityProviderUID(ident.ProviderUID) {
-					continue
-				}
-				return ident.UserID, false, nil
+		if err != nil {
+			// A lookup failure is NOT "user unknown": treating a transient
+			// DB error as no-match would mint a duplicate account for an
+			// existing email on the next OAuth login. Propagate instead.
+			// (FindByEmail is a slice query — "no rows" is an empty slice
+			// with a nil error, never sql.ErrNoRows.)
+			return "", false, fmt.Errorf("find identities by email: %w", err)
+		}
+		for _, ident := range byEmail {
+			if isTestIdentityProviderUID(ident.ProviderUID) {
+				continue
 			}
+			return ident.UserID, false, nil
 		}
 	}
 	user := &model.User{

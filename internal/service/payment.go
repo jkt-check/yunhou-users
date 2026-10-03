@@ -717,6 +717,27 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("check active sub: %w", err)
 		}
+		// Pending-order guard for auto-renewing channels (2026-10 review):
+		// the active-sub check above only fires AFTER the first checkout
+		// settles. While a paddle/paypal hosted checkout is still open, a
+		// second CreateOrder would open another one — if both get paid the
+		// channel mints TWO auto-renewing subscriptions, the local
+		// external_subscription_id is overwritten by the later one, and the
+		// earlier subscription keeps charging with no local handle to
+		// cancel it. Reject with the same ErrUserHasActiveSub the handler
+		// already maps to 409. WeChat has no auto-renewal: multiple
+		// pending orders there are fine (paying any one of them rolls
+		// over), so it is unaffected. The retried-request trade-off (a
+		// client retry of the SAME checkout intent also 409s until the
+		// first order expires or is cancelled) is accepted: double
+		// channel-side subscriptions are unrecoverable, a 409 is not.
+		if channelAutoRenews(channel) {
+			if _, err := s.orderRepo.FindPendingByUserAndProduct(ctx, userID, requestedPlan.ProductCode); err == nil {
+				return nil, ErrUserHasActiveSub
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return nil, fmt.Errorf("check pending order: %w", err)
+			}
+		}
 		if requestedPlan.ProductCode == model.ProductCodingPlan && orderKind == "" {
 			orderKind = model.OrderKindNew
 		}
@@ -1600,6 +1621,18 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 			return nil, ErrPaymentNotFound // hide existence from non-owner
 		}
 	}
+	// Canonical-owner replay check: the refund row is INSERTed under
+	// o.UserID below, but the pre-check above ran under in.UserID — which
+	// is EMPTY for internal-app callers, so their idempotent replay would
+	// always miss and re-call the channel (double refund). Re-check under
+	// the canonical owner whenever it differs.
+	if o.UserID != in.UserID {
+		if existing, err := s.refundRepo.FindByIdempotencyKey(ctx, o.UserID, in.IdempotencyKey); err == nil && existing != nil {
+			return &RefundResult{Refund: existing, Existing: true}, nil
+		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("check idempotency: %w", err)
+		}
+	}
 	if payment.Status != "paid" {
 		return nil, ErrPaymentNotPaid
 	}
@@ -1912,7 +1945,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		if errors.Is(err, sql.ErrNoRows) {
 			// Webhook arrived for an order that doesn't exist in our DB.
 			// Write audit log + 404 (channel retries per schedule).
-			return s.writeAudit(ctx, "service", "webhook_for_unknown_order",
+			return auditAndCommit(ctx, tx, "service", "webhook_for_unknown_order",
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "unknown_order"},
 				map[string]any{"channel": e.Channel, "order_id": e.OrderID, "event_id": e.EventID},
@@ -1935,7 +1968,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		order.ID); err == nil {
 		if existing.Channel != e.Channel {
 			// Log and skip — webhook for a payment on a different channel that already paid.
-			return s.writeAudit(ctx, "service", "webhook_channel_mismatch",
+			return auditAndCommit(ctx, tx, "service", "webhook_channel_mismatch",
 				fmt.Sprintf("order:%s", order.ID),
 				[]string{"webhook", "channel_mismatch"},
 				map[string]any{"order_id": order.ID, "webhook_channel": e.Channel, "existing_channel": existing.Channel},
@@ -1949,7 +1982,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 			// dedupe: ack 200 + audit. A matching txn id is a legitimate
 			// redelivery and falls through to the
 			// (channel, external_txn_id) dedupe below.
-			return s.writeAudit(ctx, "service", "webhook_duplicate_paid_order",
+			return auditAndCommit(ctx, tx, "service", "webhook_duplicate_paid_order",
 				fmt.Sprintf("order:%s", order.ID),
 				[]string{"webhook", "duplicate_paid_order"},
 				map[string]any{
@@ -1969,7 +2002,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// case-insensitive. Ack 200 (non-retryable) + audit so channels
 	// don't retry forever and ops can reconcile manually.
 	if !e.SkipAmountCheck && (toCents(e.Amount) < toCents(order.Amount) || !strings.EqualFold(e.Currency, order.Currency)) {
-		return s.writeAudit(ctx, "service", "webhook_amount_mismatch",
+		return auditAndCommit(ctx, tx, "service", "webhook_amount_mismatch",
 			fmt.Sprintf("order:%s", order.ID),
 			[]string{"webhook", "amount_mismatch"},
 			map[string]any{
@@ -2053,7 +2086,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 			// order than this event resolved. Activating here would grant
 			// this event's order a subscription another order paid for.
 			// Audit + skip activation; ack 200 (non-retryable).
-			return s.writeAudit(ctx, "service", "webhook_payment_order_mismatch",
+			return auditAndCommit(ctx, tx, "service", "webhook_payment_order_mismatch",
 				fmt.Sprintf("payment:%s", existing.ID),
 				[]string{"webhook", "payment_order_mismatch"},
 				map[string]any{
@@ -2065,7 +2098,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		if existing.Status != "paid" {
 			// Defensive: SQL guard will make UPDATE a no-op + audit log
 			// if the existing row is `failed`. See webhook doc §5.6.
-			return s.writeAudit(ctx, "service", "unexpected_state_transition",
+			return auditAndCommit(ctx, tx, "service", "unexpected_state_transition",
 				fmt.Sprintf("payment:%s", existing.ID),
 				[]string{"webhook", "defensive_transition"},
 				map[string]any{"from": existing.Status, "to": "paid", "event_id": e.EventID},
@@ -2297,10 +2330,24 @@ func (s *PaymentService) onPaymentFailed(ctx context.Context, e WebhookEvent) er
 	if err := tx.GetContext(ctx, &order, `SELECT * FROM orders WHERE id = $1`, payment.OrderID); err != nil {
 		return fmt.Errorf("find order: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	// The paid→failed order flip is reserved for the wasPaid cascade
+	// (same-txn failure after settlement, webhook doc §7). When wasPaid is
+	// false the payment row was pending — the order may meanwhile have
+	// been paid by a DIFFERENT txn (the payments partial unique index
+	// only excludes a second PAID row; pending rows coexist), and flipping
+	// a paid order to failed is unrecoverable: the success path's order
+	// UPDATE only fires from pending/expired/cancelled.
+	orderFlip := `
 		UPDATE orders SET status = 'failed', updated_at = now()
-		WHERE id = $1 AND status IN ('pending', 'paid', 'expired', 'cancelled')
-	`, order.ID); err != nil {
+		WHERE id = $1 AND status IN ('pending', 'expired', 'cancelled')
+	`
+	if wasPaid {
+		orderFlip = `
+			UPDATE orders SET status = 'failed', updated_at = now()
+			WHERE id = $1 AND status IN ('pending', 'paid', 'expired', 'cancelled')
+		`
+	}
+	if _, err := tx.ExecContext(ctx, orderFlip, order.ID); err != nil {
 		return fmt.Errorf("flip order: %w", err)
 	}
 
@@ -2407,7 +2454,7 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 				case oerr == nil:
 					if order.Status == "pending" || order.Status == "expired" ||
 						order.Status == "cancelled" || order.Status == "failed" {
-						return s.writeAudit(ctx, "service", "webhook_refund_unpaid_order",
+						return auditAndCommit(ctx, tx, "service", "webhook_refund_unpaid_order",
 							fmt.Sprintf("event:%s", e.EventID),
 							[]string{"webhook", "unpaid_order"},
 							map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID,
@@ -2419,11 +2466,14 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 				}
 			}
 			// 评审轮1 C2：退款事件可能先于支付成功事件到达（渠道乱序投递）。
-			// 审计照留（writeAudit 独立连接提交，不随本事务回滚），但必须返回
+			// 审计照留（writeAudit 独立连接提交，不随本事务回滚——故先显式
+			// 回滚释放 tx 连接再写，持连接时 writeAudit 向池申请第二条连接
+			// 是 MaxOpenConns 死锁类），但必须返回
 			// 错误让 handler 映射为非 2xx —— 渠道按其重投计划再次投递；ack
 			// 200 会让 OnWebhook 标记 processed、渠道不再重投，之后支付成功
 			// 照常给钱包充值而退款永久丢失（双花）。订单不存在或订单已支付
 			// 但支付行缺失都落此分支。
+			tx.Rollback() //nolint:errcheck
 			if aerr := s.writeAudit(ctx, "service", "webhook_refund_unknown_payment",
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "unknown_payment"},
@@ -2661,7 +2711,9 @@ func (s *PaymentService) onRefundFailed(ctx context.Context, e WebhookEvent) err
 		if errors.Is(err, sql.ErrNoRows) {
 			// 乱序：支付成功事件尚未处理。与退款成功同一哲学（评审轮1
 			// C2）——审计照留但返错让渠道重投，ack 200 会把失败事实永久
-			// 丢掉（退款行卡 pending，堵住合计不变量）。
+			// 丢掉（退款行卡 pending，堵住合计不变量）。先显式回滚释放
+			// tx 连接再写审计（writeAudit 独立连接提交，不随本事务回滚）。
+			tx.Rollback() //nolint:errcheck
 			if aerr := s.writeAudit(ctx, "service", "webhook_refund_failed_unknown_payment",
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "unknown_payment", "refund_failed"},
@@ -2678,7 +2730,7 @@ func (s *PaymentService) onRefundFailed(ctx context.Context, e WebhookEvent) err
 	if extID == "" {
 		// 事件未携商户退款单号（解析层未覆盖该事件类型）：无法键控匹配，
 		// 审计后 ack —— 返错重投也永远匹配不上，只会空转重投窗口。
-		return s.writeAudit(ctx, "service", "webhook_refund_failed_missing_refund_no",
+		return auditAndCommit(ctx, tx, "service", "webhook_refund_failed_missing_refund_no",
 			fmt.Sprintf("event:%s", e.EventID),
 			[]string{"webhook", "refund_failed", "missing_key"},
 			map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID, "event_id": e.EventID},
@@ -2749,7 +2801,19 @@ func (s *PaymentService) onDisputeCreated(ctx context.Context, e WebhookEvent) e
 		SELECT * FROM payments WHERE channel = $1 AND external_txn_id = $2 FOR UPDATE
 	`, e.Channel, e.TransactionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil // ignore — no matching payment
+			// 乱序：dispute 先于 payment succeeded 到达。与退款路径同一哲
+			// 学（评审轮1 C2）——审计照留（先回滚释放 tx 连接，writeAudit
+			// 独立连接提交）但返错让渠道重投；ack 200 会让 OnWebhook 标记
+			// processed，disputed 标志永久丢失。
+			tx.Rollback() //nolint:errcheck
+			if aerr := s.writeAudit(ctx, "service", "webhook_dispute_unknown_payment",
+				fmt.Sprintf("event:%s", e.EventID),
+				[]string{"webhook", "unknown_payment", "dispute"},
+				map[string]any{"channel": e.Channel, "transaction_id": e.TransactionID, "event_id": e.EventID},
+			); aerr != nil {
+				return fmt.Errorf("write audit: %w", aerr)
+			}
+			return fmt.Errorf("dispute for unknown payment (channel=%s txn=%s): payment success event not processed yet — returning an error so the channel retries", e.Channel, e.TransactionID)
 		}
 		return fmt.Errorf("find payment: %w", err)
 	}
@@ -2861,7 +2925,7 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 		e.ExternalSubscriptionID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return s.writeAudit(ctx, "service", fmt.Sprintf("%s_renewal_unknown_subscription", e.Channel),
+			return auditAndCommit(ctx, tx, "service", fmt.Sprintf("%s_renewal_unknown_subscription", e.Channel),
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", e.Channel, "renewal", "unknown_sub"},
 				map[string]any{
@@ -2887,7 +2951,7 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 		// Already processed — skip the renew side-effects, audit-log only,
 		// ack 200. The webhook_events table earlier should have made this
 		// impossible, but if we got here it's a defensive guard.
-		return s.writeAudit(ctx, "service", fmt.Sprintf("%s_renewal_payment_already_exists", e.Channel),
+		return auditAndCommit(ctx, tx, "service", fmt.Sprintf("%s_renewal_payment_already_exists", e.Channel),
 			fmt.Sprintf("event:%s", e.EventID),
 			[]string{"webhook", e.Channel, "renewal", "duplicate"},
 			map[string]any{
@@ -3011,9 +3075,12 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 		// NOT extend expires_at. We audit-log when the UPDATE didn't fire
 		// so operators see the "channel charging a sub our DB says is dead"
 		// mismatch.
+		// GREATEST guards out-of-order renewal processing: if the period-N+1
+		// charge is handled before period-N's (channel redelivery shuffles),
+		// the later-arriving period-N event must not roll expires_at BACK.
 		res, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
-			SET expires_at = $1, updated_at = now()
+			SET expires_at = GREATEST(COALESCE(expires_at, $1), $1), updated_at = now()
 			WHERE id = $2 AND status = 'active'
 		`, *nextBilled, sub.ID)
 		if err != nil {
@@ -3197,9 +3264,28 @@ func writeAuditOnTx(ctx context.Context, tx dbTx, actor, action, target string, 
 	return err
 }
 
+// auditAndCommit is the "audit + ack" early-return shape for webhook
+// branches whose tx has nothing else to commit: the audit row rides the
+// open tx and commits with it. Using s.writeAudit there instead would grab
+// a SECOND pool connection while the tx holds one — the MaxOpenConns
+// deadlock class documented on onPaymentSucceeded's channel-mismatch
+// pre-check. Branches that must return an error (so the channel retries)
+// can't use this — the audit would roll back; they explicitly
+// tx.Rollback() first and then call s.writeAudit.
+func auditAndCommit(ctx context.Context, tx dbTx, actor, action, target string, tags []string, ctxData map[string]any) error {
+	if err := writeAuditOnTx(ctx, tx, actor, action, target, tags, ctxData); err != nil {
+		return fmt.Errorf("write audit: %w", err)
+	}
+	return tx.Commit()
+}
+
 // writeAudit is the non-transactional variant. Used for events that need to
 // be recorded but don't fit inside a larger tx (e.g. unknown-order webhooks
-// where the tx has already rolled back).
+// where the tx has already rolled back). It acquires its own pool
+// connection, so it must NEVER be called while the caller holds an open
+// tx: under MaxOpenConns pressure the second-connection wait deadlocks
+// against the pool connections held by sibling transactions. Either ride
+// the tx (auditAndCommit) or roll the tx back first.
 func (s *PaymentService) writeAudit(ctx context.Context, actor, action, target string, tags []string, ctxData map[string]any) error {
 	return s.auditRepo.Insert(ctx, &model.AuditLog{
 		Actor:   actor,
@@ -3231,6 +3317,15 @@ func (s *PaymentService) findOrInsertPendingOnTx(ctx context.Context, tx dbTx, e
 			return nil, nil // no order either; nothing to do
 		}
 		return nil, fmt.Errorf("find order: %w", err)
+	}
+	if order.Status == "paid" {
+		// The order was already settled by a DIFFERENT txn: this failure
+		// event belongs to another checkout attempt against the same
+		// order. Inserting a fresh pending row here would let
+		// onPaymentFailed flip the paid order to failed — a state the
+		// success path can never recover from (its order UPDATE only
+		// fires from pending/expired/cancelled). Ack without a row.
+		return nil, nil
 	}
 	now := time.Now()
 	p = model.Payment{
@@ -3583,6 +3678,14 @@ func resolveBranch(e WebhookEvent) webhookBranch {
 	return dispatchBranch(e.Channel, e.EventType)
 }
 
+// maxIntervalDays caps operator-controlled day counts (plan interval_days /
+// trial_days) at ~290 years before they are multiplied into a time.Duration.
+// days*24h in int64 nanoseconds wraps at ~106.7 million days, and the admin
+// APIs only validate non-negativity — an INT32-max day count would wrap the
+// multiply into a wildly past expires_at. resolveSubExpiry treats a breach
+// as an operator error; the other call sites clamp.
+const maxIntervalDays = 365 * 290
+
 // resolveSubExpiry returns the expires_at to write on a subscription
 // activation. Priority:
 //
@@ -3642,12 +3745,6 @@ func (s *PaymentService) resolveSubExpiry(
 	if preservedExpiry != nil {
 		return preservedExpiry, nil
 	}
-
-	// Cap at ~290 years to keep the time.Duration multiply well below
-	// int64 nanosecond overflow. Plan.IntervalDays is operator-controlled;
-	// a defensive check prevents a typo from turning into a wildly past
-	// or future expires_at.
-	const maxIntervalDays = 365 * 290
 
 	// The new plan row is loaded lazily and at most once: the fallback
 	// branch needs its interval, the rollover branch needs it for the
@@ -3717,7 +3814,9 @@ func (s *PaymentService) resolveSubExpiry(
 	// including the two edge shapes that carry no rollable date:
 	// interval_days=0 plans (lifetime/free; 0 is the SMALLEST interval
 	// here, so a stale lifetime order paid after an upgrade is blocked
-	// by the same comparison) and expires_at=NULL rows (never-expire).
+	// by the same comparison) and expires_at=NULL rows (never-expire —
+	// those are preserved verbatim by the lifetime branch below, never
+	// rewritten to a finite window).
 	// Rollover itself needs a concrete old expires_at AND a positive
 	// new interval; anything else just skips the extension.
 	if existing != nil && (existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now())) {
@@ -3739,7 +3838,15 @@ func (s *PaymentService) resolveSubExpiry(
 		if oldPlan != nil && oldPlan.IntervalDays > intervalOf(p) {
 			return nil, ErrDowngradeActivationBlocked
 		}
-		if existing.ExpiresAt != nil && intervalOf(p) > 0 {
+		if existing.ExpiresAt == nil {
+			// Lifetime subscription (expires_at IS NULL): a replacement
+			// must NOT shrink never-expire into now()+interval — the
+			// lifetime was paid for. Returning nil keeps expires_at NULL
+			// at activation; the payment is still honored and the plan
+			// switch proceeds.
+			return nil, nil
+		}
+		if intervalOf(p) > 0 {
 			if intervalOf(p) > maxIntervalDays {
 				return nil, fmt.Errorf("plan %s interval_days=%d exceeds %d-day cap", planID, intervalOf(p), maxIntervalDays)
 			}

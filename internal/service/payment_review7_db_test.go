@@ -435,6 +435,16 @@ func TestOnWebhook_RefundFailedEvent_UnknownPayment(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unknown payment") {
 		t.Fatalf("err = %v, want unknown-payment error（返错让渠道重投）", err)
 	}
+	// 返错分支的审计必须独立于回滚落库（先 tx.Rollback 再 writeAudit —
+	// 持有 tx 连接时 writeAudit 申请第二条池连接是 MaxOpenConns 死锁类）。
+	var n int
+	if err := db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM audit_log WHERE action = 'webhook_refund_failed_unknown_payment'`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("audit rows = %d, want 1（返错重投也要留审计）", n)
+	}
 }
 
 // TestPaymentFailed_AfterPaid_PartialRefund_DebitsOnlyDifference — 评审轮2

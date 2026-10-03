@@ -191,6 +191,35 @@ func TestUpgradeChannelSubscription_NoPriceConfigured(t *testing.T) {
 	}
 }
 
+// TestUpgradeChannelSubscription_RetiredPlanRejected pins the
+// accepting_new_subscriptions gate on the upgrade path (2026-10 review):
+// IsActive alone is not enough — a retired plan (active but no longer
+// accepting new subscriptions) must reject upgrades with
+// ErrPlanNotAcceptingNew, the same sentinel CreateOrder's eligibility tx
+// uses, before any channel-side call.
+func TestUpgradeChannelSubscription_RetiredPlanRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	seedPaddleSub(t, db, uid, "sub_retired_"+mustNewUUID()[:8], time.Now().Add(15*24*time.Hour))
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active, accepting_new_subscriptions)
+		VALUES ('yearly-retired', 'Yearly Retired', 149.9, 365, '{}', true, false)
+	`); err != nil {
+		t.Fatalf("seed retired plan: %v", err)
+	}
+
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"yearly-retired": "pri_retired"})
+	if _, err := svc.UpgradeChannelSubscription(context.Background(), uid, "yearly-retired"); !errors.Is(err, ErrPlanNotAcceptingNew) {
+		t.Fatalf("expected ErrPlanNotAcceptingNew, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Fatal("paddle must not be called for a retired target plan")
+	}
+}
+
 func TestUpgradeChannelSubscription_DowngradeRejected(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
@@ -280,5 +309,36 @@ func TestOnWebhook_PaddleSubscriptionCancelled_UnknownSub(t *testing.T) {
 	}
 	if countAudit(t, db, "paddle_cancel_unknown_subscription") != 1 {
 		t.Error("expected audit row paddle_cancel_unknown_subscription")
+	}
+}
+
+// TestUpgradeChannelSubscription_IntervalFallbackClamped pins the
+// day→time.Duration overflow guard on the upgrade fallback path (2026-10
+// review): when Paddle's update response carries no next_billed_at, the
+// local expiry falls back to now()+plan.interval_days — and a huge
+// operator-set interval would wrap the multiply into the past. The clamp
+// (maxIntervalDays) keeps it far-future.
+func TestUpgradeChannelSubscription_IntervalFallbackClamped(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	seedPaddleSub(t, db, uid, "sub_clamp_"+mustNewUUID()[:8], time.Now().Add(15*24*time.Hour))
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active, accepting_new_subscriptions)
+		VALUES ('yearly-huge', 'Yearly Huge', 149.9, 2147483647, '{}', true, true)
+	`); err != nil {
+		t.Fatalf("seed huge-interval plan: %v", err)
+	}
+
+	// updateNext nil → the plan-interval fallback computes expires_at.
+	svc.SetPaddleClient(&stubPaddle{})
+	svc.SetPaddlePrices(map[string]string{"yearly-huge": "pri_huge"})
+	res, err := svc.UpgradeChannelSubscription(context.Background(), uid, "yearly-huge")
+	if err != nil {
+		t.Fatalf("UpgradeChannelSubscription: %v", err)
+	}
+	now := time.Now()
+	if lo, hi := now.AddDate(200, 0, 0), now.AddDate(300, 0, 0); res.NextBilledAt.Before(lo) || res.NextBilledAt.After(hi) {
+		t.Errorf("NextBilledAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", res.NextBilledAt)
 	}
 }

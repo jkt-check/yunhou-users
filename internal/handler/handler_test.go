@@ -547,6 +547,29 @@ func TestPlanHandler_Create_RejectsNegativeTrialDays(t *testing.T) {
 	}
 }
 
+func TestPlanHandler_Create_RejectsExcessiveDays(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	// int32 上限的天数换算成 time.Duration 会溢出;36500(100 年)是硬上限。
+	for field, body := range map[string]string{
+		"interval_days": `{"id":"x","name":"x","interval_days":36501}`,
+		"trial_days":    `{"id":"x","name":"x","trial_days":36501}`,
+	} {
+		w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400 (body: %s)", field, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), field+" must not exceed 36500") {
+			t.Errorf("%s: body missing upper-bound message: %s", field, w.Body.String())
+		}
+	}
+	// 边界值 36500 本身合法。
+	w := performPlanHandlerRequest(t, &mockPlanSvc{}, http.MethodPost, "/admin/plans",
+		`{"id":"x","name":"x","interval_days":36500,"trial_days":36500}`)
+	if w.Code != http.StatusCreated {
+		t.Errorf("boundary 36500: status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
 func TestPlanHandler_Create_AcceptsNewFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &mockPlanSvc{}
@@ -687,6 +710,23 @@ func TestPlanHandler_Patch_RejectsNegativeTrialDays(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "trial_days must be non-negative") {
 		t.Errorf("body missing trial_days validation message: %s", w.Body.String())
+	}
+}
+
+func TestPlanHandler_Patch_RejectsExcessiveDays(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &mockPlanSvc{plan: &model.Plan{ID: "monthly", Name: "Monthly"}}
+	for field, body := range map[string]string{
+		"interval_days": `{"interval_days":36501}`,
+		"trial_days":    `{"trial_days":36501}`,
+	} {
+		w := performPlanHandlerRequest(t, svc, http.MethodPatch, "/admin/plans/monthly", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400 (body: %s)", field, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), field+" must not exceed 36500") {
+			t.Errorf("%s: body missing upper-bound message: %s", field, w.Body.String())
+		}
 	}
 }
 

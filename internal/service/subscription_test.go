@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -655,3 +656,32 @@ type fakeDupKeyErr struct{}
 
 func (fakeDupKeyErr) Error() string      { return "fake dup" }
 func (fakeDupKeyErr) DuplicateKey() bool { return true }
+
+// TestSubscriptionService_Create_ClampsHugeIntervalDays pins the
+// day→time.Duration overflow guard (2026-10 review): plan.interval_days is
+// operator-controlled and the admin API only validates non-negativity, so
+// an INT32-max value would wrap the days*24h multiply in int64 nanoseconds
+// and produce a wildly PAST expires_at. The clamp (maxIntervalDays, same
+// cap resolveSubExpiry enforces) keeps the derived expiry far-future.
+func TestSubscriptionService_Create_ClampsHugeIntervalDays(t *testing.T) {
+	t.Parallel()
+	sr := newMockSubscriptionRepo()
+	pr := newMockPlanRepo()
+	pr.plans["free-huge"] = &model.Plan{
+		ID: "free-huge", Name: "Free Huge", IsActive: true,
+		AcceptingNewSubscriptions: true, IntervalDays: math.MaxInt32,
+	}
+	subSvc := NewSubscriptionService(sr, &PlanService{planRepo: pr})
+
+	sub, err := subSvc.Create(context.Background(), "user-huge", "free-huge", nil)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if sub.ExpiresAt == nil {
+		t.Fatal("ExpiresAt = nil, want clamped far-future expiry")
+	}
+	now := time.Now()
+	if lo, hi := now.AddDate(200, 0, 0), now.AddDate(300, 0, 0); sub.ExpiresAt.Before(lo) || sub.ExpiresAt.After(hi) {
+		t.Errorf("ExpiresAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", sub.ExpiresAt)
+	}
+}

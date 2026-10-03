@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -371,5 +372,44 @@ func TestApply_RealMigrationsFromRepo(t *testing.T) {
 	}
 	if applied2 != 0 || skipped2 != len(migs) {
 		t.Errorf("rerun: applied=%d skipped=%d, want 0/%d", applied2, skipped2, len(migs))
+	}
+}
+
+// TestStatus_RowsErrorSurfaces: 迭代途中连接死亡必须返回错误 —— 缺
+// rows.Err() 检查时,半截 ledger 会被静默吞掉,所有未读到的 migration
+// 误标 ⏳ pending。通过 pg_terminate_backend 在 100 万行 ledger 的流式
+// 读取中段杀掉连接。
+func TestStatus_RowsErrorSurfaces(t *testing.T) {
+	db := freshTestDB(t)
+	// 单连接池:pid 探测与 Status 复用同一条连接,杀掉的一定是正在迭代的
+	// 那条。ledger 直接手写(不走 Apply —— Apply 全程持有 advisory-lock
+	// 事务,MaxOpenConns(1) 下 applyOne 的第二个事务会饿死)。killer 必须
+	// 走另一个数据库句柄(本池连接正被 Status 占用);pg_terminate_backend
+	// 按 pid 全集群生效,与连到哪个库无关。
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(ledgerDDL); err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	// 100 万行 ledger:流式迭代足够久,kill 才能落在迭代中段(若提前落在
+	// QueryContext/ledgerDDL 阶段,走的是既有错误路径,同样必须返回错误)。
+	if _, err := db.Exec(
+		`INSERT INTO _migrations SELECT 'pad-' || i FROM generate_series(1, 1000000) AS i`); err != nil {
+		t.Fatalf("pad ledger: %v", err)
+	}
+	var pid int
+	if err := db.Get(&pid, `SELECT pg_backend_pid()`); err != nil {
+		t.Fatalf("probe backend pid: %v", err)
+	}
+
+	killer := freshTestDB(t)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		_, _ = killer.Exec(`SELECT pg_terminate_backend($1)`, pid)
+	}()
+
+	captureLog(t)
+	migs := []Migration{{ID: "001_init", SQL: `CREATE TABLE users (id INT PRIMARY KEY);`}}
+	if err := Status(context.Background(), db, migs); err == nil {
+		t.Fatal("Status must return the mid-iteration connection error, got nil")
 	}
 }

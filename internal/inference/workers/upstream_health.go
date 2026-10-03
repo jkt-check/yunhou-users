@@ -67,6 +67,14 @@ type UpstreamHealthConfig struct {
 	// leases are kept before the reaper deletes them (default 7d; fencing
 	// 单调性只需对 held 行成立，终态行只服务短期排查).
 	LeaseRetention time.Duration
+	// VendorTimeout 是单次 per-account 厂商调用（健康/额度探测、即时刷新）
+	// 的子 ctx 上限（default 60s）。共享 transport（providers.NewHTTPClient）
+	// 刻意不设 client Timeout——只限 dial/TLS/响应头——厂商返回响应头后挂
+	// 起时 body 读取会永久阻塞；本 worker 的 pass 顺序执行，一次挂起即冻
+	// 结后续所有账号探测/冷却恢复/清扫。DeadlineExceeded 经 connector 归
+	// 为 KindRetryable（Do 传输错误显式 retryable，KindOf 对未知错误默认
+	// retryable），冷却/退避语义自然正确。
+	VendorTimeout time.Duration
 }
 
 func (c *UpstreamHealthConfig) withDefaults() UpstreamHealthConfig {
@@ -82,6 +90,9 @@ func (c *UpstreamHealthConfig) withDefaults() UpstreamHealthConfig {
 	}
 	if out.LeaseRetention <= 0 {
 		out.LeaseRetention = 7 * 24 * time.Hour
+	}
+	if out.VendorTimeout <= 0 {
+		out.VendorTimeout = time.Minute
 	}
 	return out
 }
@@ -205,7 +216,9 @@ func (w *UpstreamHealth) probeOAuth(ctx context.Context, a *domain.UpstreamAccou
 		m.Errors++
 		return
 	}
-	err = w.client.Health(ctx, spec, bundle.AccessToken)
+	pctx, cancel := context.WithTimeout(ctx, w.cfg.VendorTimeout)
+	err = w.client.Health(pctx, spec, bundle.AccessToken)
+	cancel()
 	if err == nil {
 		w.onHealthy(ctx, a, m)
 		w.observeQuota(ctx, a, spec, bundle.AccessToken, m)
@@ -214,7 +227,9 @@ func (w *UpstreamHealth) probeOAuth(ctx context.Context, a *domain.UpstreamAccou
 	if connector.KindOf(err) == connector.KindReauthRequired {
 		// 访问令牌死了但 refresh 可能仍有效：立刻刷新一次，让 Refresher
 		// 决定轮换或 reauth_required（含绑定终止与审计）。
-		outcome, rerr := w.refresher.RefreshCredential(ctx, cred.ID, "health probe 401")
+		rctx, rcancel := context.WithTimeout(ctx, w.cfg.VendorTimeout)
+		outcome, rerr := w.refresher.RefreshCredential(rctx, cred.ID, "health probe 401")
+		rcancel()
 		switch {
 		case rerr != nil:
 			// 连接器暂时不可用：冷却而非误判失效。
@@ -276,7 +291,9 @@ func (w *UpstreamHealth) probeStatic(ctx context.Context, a *domain.UpstreamAcco
 	if len(deploys) == 0 {
 		return // 无 active 部署：没有可探测端点，账号状态不变
 	}
-	err = w.service.Check(ctx, strings.TrimSuffix(deploys[0].BaseURL, "/")+"/", plain)
+	pctx, cancel := context.WithTimeout(ctx, w.cfg.VendorTimeout)
+	err = w.service.Check(pctx, strings.TrimSuffix(deploys[0].BaseURL, "/")+"/", plain)
+	cancel()
 	if err == nil {
 		w.onHealthy(ctx, a, m)
 		return
@@ -384,7 +401,10 @@ func (w *UpstreamHealth) onRetryableFailure(ctx context.Context, a *domain.Upstr
 }
 
 func (w *UpstreamHealth) observeQuota(ctx context.Context, a *domain.UpstreamAccount, spec connector.Spec, accessToken string, m *UpstreamHealthMetrics) {
-	snap, err := w.client.Quota(ctx, spec, accessToken, w.clock.Now())
+	// 与健康探测同一挂起面：限额读取也是顺序 pass 内的厂商调用。
+	pctx, cancel := context.WithTimeout(ctx, w.cfg.VendorTimeout)
+	snap, err := w.client.Quota(pctx, spec, accessToken, w.clock.Now())
+	cancel()
 	if err != nil {
 		// 限额读取失败不影响健康结论；下一轮再试。
 		return

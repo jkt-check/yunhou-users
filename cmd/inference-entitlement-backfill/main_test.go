@@ -440,3 +440,31 @@ func TestBackfillValidation(t *testing.T) {
 		}
 	}
 }
+
+// 退休策略版本拒绝新发放(锁语义对齐 postgres.lockPolicyForGrantTx):
+// plan 钉住 retired policy version 的候选计入 errors,不产生账户/权益。
+func TestBackfillRejectsRetiredPolicy(t *testing.T) {
+	db := setupBackfillDB(t)
+	seedCatalog(t, db, []string{"bf-m1"}, nil)
+	policyID := seedPlan(t, db, "bf-ret", nil, true)
+	if _, err := db.Exec(`UPDATE inference_policy_versions SET status = 'retired' WHERE id = $1`, policyID); err != nil {
+		t.Fatal(err)
+	}
+	exp := time.Now().Add(30 * 24 * time.Hour)
+	userID, _ := seedUserSub(t, db, "bf-ret", &exp)
+
+	rep, err := run(backfillTestDSN(), false, 10, "yunhou-website", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Processed != 1 || rep.EntitlementsCreated != 0 || len(rep.Errors) != 1 {
+		t.Fatalf("report: %+v", rep)
+	}
+	if !strings.Contains(rep.Errors[0].Reason, "retired") {
+		t.Fatalf("error reason should name the retired policy: %s", rep.Errors[0].Reason)
+	}
+	if n := countWhere(t, db,
+		`SELECT COUNT(*) FROM inference_billing_accounts WHERE user_id = $1`, userID); n != 0 {
+		t.Fatalf("retired-policy user must not get a half-applied account, got %d", n)
+	}
+}

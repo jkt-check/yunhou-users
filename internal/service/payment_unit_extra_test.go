@@ -40,6 +40,10 @@ type stubOrderRepoLookup struct {
 	updateIntentCalled  bool   // set when UpdateProviderIntent is invoked
 	updateIntentPayload []byte // last payload passed to UpdateProviderIntent
 	updateIntentErr     error  // optional error to return from UpdateProviderIntent
+	// pendingByProduct, when non-nil, is returned by
+	// FindPendingByUserAndProduct to drive the "an unexpired pending
+	// order already exists" branch. Nil = no pending order (sql.ErrNoRows).
+	pendingByProduct *model.Order
 }
 
 func (s *stubOrderRepoLookup) Create(_ context.Context, order *model.Order) error {
@@ -89,6 +93,14 @@ func (s *stubOrderRepoLookup) FindByProviderOutTradeNo(_ context.Context, _ stri
 	// makes the test suite exercise the by-id path. Tests that
 	// specifically want to exercise the JSONB fallback can swap
 	// s.findByOutTradeNoErr / s.findByOutTradeNoResult.
+	return nil, sql.ErrNoRows
+}
+func (s *stubOrderRepoLookup) FindPendingByUserAndProduct(_ context.Context, _, _ string) (*model.Order, error) {
+	// Default: no pending order. Tests for the auto-renew-channel
+	// pending-order guard populate pendingByProduct directly.
+	if s.pendingByProduct != nil {
+		return s.pendingByProduct, nil
+	}
 	return nil, sql.ErrNoRows
 }
 
@@ -149,9 +161,17 @@ func (s *stubPaymentRepoLookup) ClearDisputed(_ context.Context, _ string) error
 type stubRefundRepoLookup struct {
 	byID    map[string]*model.Refund
 	findErr error
+	// byKey, when non-nil, serves FindByIdempotencyKey lookups keyed
+	// "userID|key" — Refund's idempotent-replay tests populate it.
+	byKey map[string]*model.Refund
 }
 
-func (s *stubRefundRepoLookup) FindByIdempotencyKey(_ context.Context, _, _ string) (*model.Refund, error) {
+func (s *stubRefundRepoLookup) FindByIdempotencyKey(_ context.Context, userID, key string) (*model.Refund, error) {
+	if s.byKey != nil {
+		if r, ok := s.byKey[userID+"|"+key]; ok {
+			return r, nil
+		}
+	}
 	return nil, sql.ErrNoRows
 }
 func (s *stubRefundRepoLookup) InsertPending(_ context.Context, _ *model.Refund) error { return nil }
@@ -1247,4 +1267,55 @@ func TestPaymentService_OnPaymentFailed_OnWebhookErrorPath_RepoErrors(t *testing
 	svc := newPaymentServiceForLookup(&stubOrderRepoLookup{}, &stubPaymentRepoLookup{}, &stubRefundRepoLookup{})
 	_ = svc
 	_ = math.NaN // keep the math import live — toCents tests need it
+}
+
+// ============================================================================
+// Refund — internal-app idempotent replay (canonical-owner re-check)
+// ============================================================================
+
+// TestPaymentService_Unit_Refund_InternalAppIdempotentReplay pins the
+// 2026-10 fix: the refund row is INSERTed under the order's user_id
+// (canonical owner), so an internal-app caller (in.UserID == "") replaying
+// the same Idempotency-Key must still hit the replay gate — the first
+// lookup under in.UserID structurally misses. Without the canonical-owner
+// re-check, every internal retry re-called the channel (double refund).
+func TestPaymentService_Unit_Refund_InternalAppIdempotentReplay(t *testing.T) {
+	t.Parallel()
+	existing := &model.Refund{
+		ID: "ref_existing", PaymentID: "pay_1", Channel: "stripe",
+		UserID: "u_1", Amount: 10.0, IdempotencyKey: "idem-1", Status: "pending",
+	}
+	orderRepo := &stubOrderRepoLookup{byID: map[string]*model.Order{
+		"ord_1": {ID: "ord_1", UserID: "u_1", PlanID: "monthly", Status: "paid"},
+	}}
+	paymentRepo := &stubPaymentRepoLookup{byID: map[string]*model.Payment{
+		"pay_1": {ID: "pay_1", OrderID: "ord_1", Channel: "stripe", Status: "paid", Amount: 29.9},
+	}}
+	refundRepo := &stubRefundRepoLookup{byKey: map[string]*model.Refund{
+		"u_1|idem-1": existing,
+	}}
+	refundAPI := &stubRefundAPI{}
+	svc := NewPaymentService(
+		(*sqlx.DB)(nil),
+		orderRepo, paymentRepo, refundRepo,
+		nil, nil, nil, nil, nil,
+		refundAPI, nil,
+		0)
+
+	res, err := svc.Refund(context.Background(), RefundInput{
+		PaymentID: "pay_1", UserID: "", InternalApp: true,
+		IdempotencyKey: "idem-1", Amount: 10.0,
+	})
+	if err != nil {
+		t.Fatalf("Refund replay: %v", err)
+	}
+	if !res.Existing {
+		t.Fatal("internal-app replay must hit the idempotency gate (Existing=true)")
+	}
+	if res.Refund == nil || res.Refund.ID != "ref_existing" {
+		t.Fatalf("replayed refund = %+v, want ref_existing", res.Refund)
+	}
+	if refundAPI.called {
+		t.Fatal("channel refund API must NOT be called on an idempotent replay")
+	}
 }

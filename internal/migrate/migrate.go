@@ -207,6 +207,13 @@ func Status(ctx context.Context, db *sqlx.DB, migrations []Migration) error {
 		}
 		appliedSet[id] = struct{}{}
 	}
+	// A mid-iteration failure (conn dropped, ctx cancelled) surfaces here,
+	// not at Scan: without this check a half-read ledger would silently mark
+	// every unread migration as ⏳ pending.
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate applied ids: %w", err)
+	}
 	rows.Close()
 
 	if len(migrations) == 0 {

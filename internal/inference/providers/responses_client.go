@@ -649,8 +649,13 @@ type ResponsesStreamState struct {
 	// 一个 call 的 open 绝不得关闭另一个 call 的 item。
 	toolItems map[int]*responsesToolItem
 
-	outputItems []json.RawMessage
-	completed   bool
+	// outputItems 是链 transcript（message/function_call；reasoning 除外—
+	// —回放语义不接受推理项，对齐非流式 ResponsesFromCompletion 的拆分）；
+	// responseItems 是终结帧 response.completed 的 output（含 reasoning—
+	// —事件流已发出该项的 added/done，终结帧必须自洽）。
+	outputItems   []json.RawMessage
+	responseItems []json.RawMessage
+	completed     bool
 }
 
 // responsesToolItem is one in-flight function_call item keyed by the wire
@@ -780,7 +785,7 @@ func (s *ResponsesStreamState) finishClean(w io.Writer) error {
 	} else {
 		resp["status"] = "completed"
 	}
-	resp["output"] = json.RawMessage(mustJSON(s.outputItems))
+	resp["output"] = json.RawMessage(mustJSON(s.responseItems))
 	if u := ResponsesUsageShape(s.usage, s.cacheReadInInput); u != nil {
 		resp["usage"] = u
 	}
@@ -963,13 +968,15 @@ func (s *ResponsesStreamState) closeToolItem(w io.Writer, ti *responsesToolItem)
 	}
 	b, _ := json.Marshal(item)
 	s.outputItems = append(s.outputItems, b)
+	s.responseItems = append(s.responseItems, b)
 	return nil
 }
 
 // closeTextualItem emits the *.done events of the open message/reasoning
-// item and appends its canonical form to the assembled output (reasoning
-// items join the response output but are excluded from chain transcripts at
-// persistence time).
+// item and appends its canonical form to the assembled output: reasoning
+// items join only the response output (responseItems — 终结帧与事件流自
+// 洽), message items additionally join the chain transcript (outputItems;
+// 回放语义不接受推理项).
 func (s *ResponsesStreamState) closeTextualItem(w io.Writer) error {
 	if s.openKind == "" {
 		return nil
@@ -1006,6 +1013,7 @@ func (s *ResponsesStreamState) closeTextualItem(w io.Writer) error {
 		}
 		b, _ := json.Marshal(item)
 		s.outputItems = append(s.outputItems, b)
+		s.responseItems = append(s.responseItems, b)
 	case "reasoning":
 		reason := s.reasonBuf.String()
 		if err := s.emit(w, "response.reasoning_summary_text.done", map[string]any{
@@ -1029,6 +1037,8 @@ func (s *ResponsesStreamState) closeTextualItem(w io.Writer) error {
 		}); err != nil {
 			return err
 		}
+		b, _ := json.Marshal(item)
+		s.responseItems = append(s.responseItems, b)
 	}
 	return nil
 }

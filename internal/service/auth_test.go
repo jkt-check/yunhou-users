@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -2017,6 +2018,25 @@ func TestAuthService_resolveOrCreateUser(t *testing.T) {
 			t.Fatal("expected error from user create, got nil")
 		}
 	})
+
+	t.Run("FindByEmail DB error propagated — no duplicate account", func(t *testing.T) {
+		ur := newMockUserRepo()
+		sir := newMockSocialIdentityRepo()
+		// A transient DB failure is NOT "user unknown": the pre-fix code
+		// swallowed any FindByEmail error and minted a duplicate account
+		// for an existing email on the next OAuth login.
+		sir.findByEmailErr = errors.New("db connection lost")
+		svc := &AuthService{userRepo: ur, identityRepo: sir}
+		_, _, err := svc.resolveOrCreateUser(ctx, &ProviderUserInfo{
+			Provider: "github", ProviderUID: "gh-new", Email: "found@x.com",
+		})
+		if err == nil {
+			t.Fatal("expected FindByEmail error to propagate, got nil")
+		}
+		if len(ur.users) != 0 {
+			t.Errorf("no user may be created on a lookup failure, got %d rows", len(ur.users))
+		}
+	})
 }
 
 // ============================================================================
@@ -2814,4 +2834,35 @@ func (r *ctxCheckingSubscriptionRepo) Create(ctx context.Context, s *model.Subsc
 		return err
 	}
 	return r.mockSubscriptionRepo.Create(ctx, s)
+}
+
+// TestAuthService_GrantTrialSubscription_ClampsHugeTrialDays pins the
+// day→time.Duration overflow guard on the trial grant (2026-10 review):
+// trial.trial_days is operator-controlled (validated only for
+// non-negativity), so a huge value would wrap the days*24h multiply and
+// grant a trial that is already expired. The clamp (maxIntervalDays) keeps
+// it far-future.
+func TestAuthService_GrantTrialSubscription_ClampsHugeTrialDays(t *testing.T) {
+	t.Parallel()
+	ur, sir, pr, sr, ssr, ar := newAuthMocks()
+	pr.plans["trial"] = &model.Plan{
+		ID: "trial", Name: "Free Trial", Apps: []string{"yundian"},
+		IsActive: true, AcceptingNewSubscriptions: false, TrialDays: math.MaxInt32,
+	}
+	tokenSvc := newTokenServiceWithMocks(ssr, sr)
+	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
+
+	svc.grantTrialSubscription(context.Background(), "user-huge-trial")
+
+	sub := sr.byUserID["user-huge-trial"]
+	if sub == nil {
+		t.Fatal("expected a trial subscription row")
+	}
+	if sub.ExpiresAt == nil {
+		t.Fatal("ExpiresAt = nil, want clamped far-future expiry")
+	}
+	now := time.Now()
+	if lo, hi := now.AddDate(200, 0, 0), now.AddDate(300, 0, 0); sub.ExpiresAt.Before(lo) || sub.ExpiresAt.After(hi) {
+		t.Errorf("ExpiresAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", sub.ExpiresAt)
+	}
 }

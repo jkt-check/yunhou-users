@@ -115,3 +115,48 @@ func TestServiceSetStatusBranches(t *testing.T) {
 		t.Error("restored credential must resolve")
 	}
 }
+
+// 评审修复（组6-B）：rotate 只替换秘密材料，不做生命周期状态迁移——
+// rotating 状态的凭据 rotate 后，响应 View 与库存行都必须仍是 rotating
+// （rotateCredentialSecret SQL 不碰 status；状态迁移归 SetStatus 所有）。
+// 旧实现把 View 谎报成 active，与库存真实状态不一致。
+func TestServiceRotateKeepsLifecycleStatus(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	store := newMemStore()
+	svc := NewService(v, store, &memRecorder{})
+	ctx := context.Background()
+
+	view, err := svc.Create(ctx, testOp(), "prov", "k", "api_key", "sk-1", "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SetStatus(ctx, testOp(), view.ID, "rotating", "key swap underway"); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := svc.Rotate(ctx, testOp(), view.ID, "sk-2", "swap secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.Status != "rotating" {
+		t.Errorf("rotated view status = %q, want rotating", rotated.Status)
+	}
+	stored, err := store.GetCredential(ctx, view.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "rotating" || stored.Generation != 2 {
+		t.Errorf("stored row = status %q generation %d, want rotating/2", stored.Status, stored.Generation)
+	}
+
+	// 顺向不变量：active 凭据 rotate 后仍是 active。
+	if _, err := svc.SetStatus(ctx, testOp(), view.ID, "active", "swap done"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := svc.Rotate(ctx, testOp(), view.ID, "sk-3", "second swap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Status != "active" {
+		t.Errorf("active credential rotated: status = %q, want active", again.Status)
+	}
+}

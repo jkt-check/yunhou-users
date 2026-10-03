@@ -129,6 +129,13 @@ func (s *PaymentService) UpgradeChannelSubscription(ctx context.Context, userID,
 	if !toPlan.IsActive {
 		return nil, ErrPlanInactive
 	}
+	if !toPlan.AcceptingNewSubscriptions {
+		// Same retirement gate as CreateOrder's eligibility check
+		// (eligibilityAndInsertOrderTx): an active-but-retired plan must
+		// not acquire new billing relationships through the upgrade path
+		// either — upgrading IS a new channel-side price attachment.
+		return nil, ErrPlanNotAcceptingNew
+	}
 	if toPlan.ProductCode != sub.ProductCode {
 		// Cross-product plan changes are out of scope (coding-plan has its
 		// own plan_upgrade_rules flow).
@@ -183,6 +190,12 @@ func (s *PaymentService) UpgradeChannelSubscription(ctx context.Context, userID,
 	// reconciliation — a silent 5xx here would invite a retry that
 	// double-charges.
 	failSync := func(cause error) (*ChannelUpgradeResult, error) {
+		// Roll the tx back BEFORE writeAudit: the divergence audit must
+		// commit independently (the error return below discards the tx),
+		// and writeAudit grabs a second pool connection — calling it while
+		// this tx still holds one is the MaxOpenConns deadlock class.
+		// Rollback after a failed Commit is a harmless sql.ErrTxDone.
+		tx.Rollback() //nolint:errcheck
 		if aerr := s.writeAudit(ctx, "user:"+userID, "paddle_upgrade_local_sync_failed",
 			fmt.Sprintf("subscription:%s", sub.ID),
 			[]string{"paddle", "subscription", "upgrade", "diverged"},
@@ -203,8 +216,9 @@ func (s *PaymentService) UpgradeChannelSubscription(ctx context.Context, userID,
 		return nil, fmt.Errorf("paddle update subscription: %w", err)
 	}
 	// Channel-authoritative anchor preferred; fall back to the plan
-	// interval when the response carries no next_billed_at.
-	expiresAt := time.Now().Add(time.Duration(toPlan.IntervalDays) * 24 * time.Hour)
+	// interval when the response carries no next_billed_at. Clamp before
+	// the day→Duration multiply (int64-ns wrap); see maxIntervalDays.
+	expiresAt := time.Now().Add(time.Duration(min(toPlan.IntervalDays, maxIntervalDays)) * 24 * time.Hour)
 	if nextBilled != nil {
 		expiresAt = *nextBilled
 	}
@@ -293,7 +307,7 @@ func (s *PaymentService) onPaddleSubscriptionCancelled(ctx context.Context, e We
 		if errors.Is(err, sql.ErrNoRows) {
 			// A Paddle subscription we never stamped (e.g. dashboard-created).
 			// Audit-only ack — nothing local to flip.
-			return s.writeAudit(ctx, "service", "paddle_cancel_unknown_subscription",
+			return auditAndCommit(ctx, tx, "service", "paddle_cancel_unknown_subscription",
 				fmt.Sprintf("event:%s", e.EventID),
 				[]string{"webhook", "paddle", "cancel", "unknown_sub"},
 				map[string]any{

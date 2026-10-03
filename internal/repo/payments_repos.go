@@ -48,6 +48,17 @@ type OrderRepo interface {
 	// (provider_intent->>'out_trade_no') later.
 	FindByProviderOutTradeNo(ctx context.Context, outTradeNo string) (*model.Order, error)
 
+	// FindPendingByUserAndProduct returns the user's newest UNEXPIRED
+	// pending order in the given product, or sql.ErrNoRows when none
+	// exists. CreateOrder uses it for auto-renewing channels (PayPal /
+	// Paddle): a live pending order means a hosted checkout is already
+	// open, and letting a second one through would mint two channel-side
+	// auto-renew subscriptions when both get paid — the active-sub guard
+	// only fires AFTER the first one settles. Product scoping matches the
+	// 029 snapshot column; pre-029 orders (product_code NULL) never match,
+	// which is safe: they predate the auto-renew channels.
+	FindPendingByUserAndProduct(ctx context.Context, userID, productCode string) (*model.Order, error)
+
 	// CreateInTx performs the same INSERT as Create, but inside the
 	// caller-managed *sqlx.Tx. Used by PaymentService.CreateOrder to make
 	// the order INSERT part of the same transaction that locks the plan
@@ -263,6 +274,25 @@ func (r *orderRepo) FindByProviderOutTradeNo(ctx context.Context, outTradeNo str
 		  AND provider_intent->>'out_trade_no' = $1
 		LIMIT 1
 	`, outTradeNo)
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
+}
+
+// FindPendingByUserAndProduct mirrors the interface doc: newest unexpired
+// pending order for (user, product), sql.ErrNoRows when none.
+func (r *orderRepo) FindPendingByUserAndProduct(ctx context.Context, userID, productCode string) (*model.Order, error) {
+	var o model.Order
+	err := r.db.GetContext(ctx, &o, `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		  AND product_code = $2
+		  AND status = 'pending'
+		  AND expires_at > now()
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, userID, productCode)
 	if err != nil {
 		return nil, err
 	}

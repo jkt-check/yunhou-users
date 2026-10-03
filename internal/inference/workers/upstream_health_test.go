@@ -505,3 +505,63 @@ func TestUpstreamHealthReapsTerminalLeases(t *testing.T) {
 		t.Fatalf("held and in-window terminal leases must survive: remaining = %d, want 2", remaining)
 	}
 }
+
+// 评审修复（组5-A）：厂商 /health 挂起（永不返回响应头）不得冻结顺序执
+// 行的 pass——VendorTimeout 子 ctx 超时后归为可重试失败（cooldown），pass
+// 返回并继续探测后续账号；stall 解除后下一轮正常恢复。
+func TestUpstreamHealthVendorStallBoundsPass(t *testing.T) {
+	env := newRefreshEnv(t)
+	_, acct1 := env.seedExpiringCredential(t)
+	_, acct2 := env.seedExpiringCredential(t)
+	ctx := context.Background()
+
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	env.vendor.mu.Lock()
+	env.vendor.healthBlock = stall
+	env.vendor.mu.Unlock()
+
+	w := NewUpstreamHealth(env.store, env.vault,
+		&connector.Client{HTTP: env.vendor.srv.Client()}, env.refresher(), env.registry, env.store,
+		UpstreamHealthConfig{Cooldown: 5 * time.Minute, VendorTimeout: 300 * time.Millisecond}, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.RunPass(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("health pass froze on stalled vendor")
+	}
+	// 两个账号都被探测并冷却：第一个 stall 账号未冻结后续账号的探测。
+	for _, id := range []string{acct1, acct2} {
+		var status string
+		env.db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, id).Scan(&status)
+		if status != "cooldown" {
+			t.Fatalf("stalled probe must cool down account %s: %s", id, status)
+		}
+	}
+
+	// stall 解除 + 回拨 updated_at 越过冷却期 → 下一轮正常恢复 active。
+	env.vendor.mu.Lock()
+	env.vendor.healthBlock = nil
+	env.vendor.mu.Unlock()
+	if _, err := env.db.Exec(`UPDATE inference_upstream_accounts SET updated_at = now() - interval '10 minutes' WHERE id IN ($1, $2)`, acct1, acct2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.RunPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{acct1, acct2} {
+		var status string
+		env.db.QueryRow(`SELECT status FROM inference_upstream_accounts WHERE id = $1`, id).Scan(&status)
+		if status != "active" {
+			t.Fatalf("pass after stall must recover account %s: %s", id, status)
+		}
+	}
+}

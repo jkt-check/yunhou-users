@@ -957,7 +957,10 @@ func signAlipay(t *testing.T, params map[string]string) string {
 	}
 	priv := privAny.(*rsa.PrivateKey)
 
-	// Build canonical string (matching the verifier's algorithm).
+	// Build canonical string per Alipay's official async-notify spec:
+	// exclude sign/sign_type, sort keys, join key=value with the DECODED
+	// (plaintext) values. params is already plaintext, matching what
+	// url.ParseQuery yields on the verifier side.
 	keys := make([]string, 0, len(params))
 	for k := range params {
 		if k == "sign" || k == "sign_type" {
@@ -968,7 +971,7 @@ func signAlipay(t *testing.T, params map[string]string) string {
 	sortStrings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		parts = append(parts, alipayURLEncodeForTest(k)+"="+alipayURLEncodeForTest(params[k]))
+		parts = append(parts, k+"="+params[k])
 	}
 	canonical := strings.Join(parts, "&")
 
@@ -1007,14 +1010,10 @@ func sortStrings(s []string) {
 	sort.Strings(s)
 }
 
-// alipayURLEncodeForTest mirrors middleware.alipayURLEncode — kept in
-// sync with that helper. Alipay's URL encoding is more aggressive than
-// net/url's QueryEscape: it percent-encodes EVERY non-alphanumeric character
-// including `_`, `-`, `.`, while QueryEscape only encodes characters that
-// genuinely need encoding (and uses `+` for space instead of `%20`).
-//
-// The verifier (production) uses alipayURLEncode; this test signer must
-// match it exactly, or signatures don't verify.
+// alipayURLEncodeForTest percent-encodes every non-alphanumeric byte. It is
+// used ONLY to render the form-encoded POST body (any valid form encoding
+// works — the verifier runs url.ParseQuery); it no longer participates in
+// the signed canonical string, which Alipay defines over decoded values.
 func alipayURLEncodeForTest(s string) string {
 	const hexChars = "0123456789ABCDEF"
 	var sb strings.Builder

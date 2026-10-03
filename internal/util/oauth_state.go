@@ -51,13 +51,22 @@ var seenNonces sync.Map // map[string]time.Time (nonceHex → expiresAt)
 func rememberNonce(nonce []byte, expiresAt time.Time) (fresh bool) {
 	key := string(nonce)
 	now := time.Now()
-	if prev, ok := seenNonces.Load(key); ok {
-		if exp, ok := prev.(time.Time); ok && now.Before(exp) {
-			return false
-		}
+	// LoadOrStore is the atomic claim: a Load-then-Store pair would let two
+	// concurrent first-uses of the same captured state both pass the replay
+	// gate (TOCTOU).
+	prev, loaded := seenNonces.LoadOrStore(key, expiresAt)
+	if !loaded {
+		return true
 	}
-	seenNonces.Store(key, expiresAt)
-	return true
+	// A pre-existing entry whose expiry has passed is a leftover from an
+	// earlier use of the same nonce — the token carrying it would already
+	// have failed VerifyOAuthState's expiry gate, so it is safe to replace
+	// and count the new (still-valid) nonce as fresh.
+	if exp, ok := prev.(time.Time); ok && !now.Before(exp) {
+		seenNonces.Store(key, expiresAt)
+		return true
+	}
+	return false
 }
 
 // State payload. The wire format is:

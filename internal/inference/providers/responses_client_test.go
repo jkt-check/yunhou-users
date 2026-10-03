@@ -402,3 +402,66 @@ func TestResponsesReplayToChat_ChainReplay(t *testing.T) {
 		t.Fatalf("replayed = %+v", msgs)
 	}
 }
+
+// 评审修复（组5-B）：流式 reasoning 项必须进 response.completed 的
+// output——事件流已发出该项的 added/done，终结帧须自洽（对齐非流式路径
+// 529-537）；但仍不进 FinalOutputItems() 链 transcript（回放语义不接受
+// 推理项）。
+func TestTranslateOpenAIToResponsesStream_ReasoningInCompletedNotTranscript(t *testing.T) {
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"think "}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"hard"}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+	}
+	var wire strings.Builder
+	for _, c := range chunks {
+		wire.WriteString("data: " + c + "\n\n")
+	}
+	wire.WriteString("data: [DONE]\n\n")
+
+	r, state := TranslateOpenAIToResponsesStream(io.NopCloser(strings.NewReader(wire.String())),
+		"resp_rs", "m", 1, true)
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !state.Completed() {
+		t.Fatal("state.Completed must be true after [DONE]")
+	}
+
+	// 终结帧 output：reasoning + message 两项，顺序与事件流一致。
+	var completed map[string]any
+	for _, block := range strings.Split(string(out), "\n\n") {
+		if !strings.HasPrefix(block, "event: response.completed") {
+			continue
+		}
+		_, data, _ := strings.Cut(block, "\n")
+		d, _ := strings.CutPrefix(data, "data: ")
+		if err := json.Unmarshal([]byte(d), &completed); err != nil {
+			t.Fatalf("completed frame not json: %v", err)
+		}
+	}
+	if completed == nil {
+		t.Fatalf("missing response.completed frame:\n%s", out)
+	}
+	resp, _ := completed["response"].(map[string]any)
+	output, _ := resp["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("completed output = %d items, want 2 (reasoning + message): %v", len(output), output)
+	}
+	first, _ := output[0].(map[string]any)
+	if first["type"] != "reasoning" {
+		t.Errorf("output[0].type = %v, want reasoning (added/done 已发出)", first["type"])
+	}
+	second, _ := output[1].(map[string]any)
+	if second["type"] != "message" {
+		t.Errorf("output[1].type = %v, want message", second["type"])
+	}
+
+	// 链 transcript：只含 message（reasoning 不回放）。
+	items := state.FinalOutputItems()
+	if len(items) != 1 || !strings.Contains(string(items[0]), `"type":"message"`) {
+		t.Fatalf("transcript items = %v, want message only", items)
+	}
+}

@@ -728,6 +728,9 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 			return err
 		}
 	}
+	if err := validateModelAliasUniqueness(models); err != nil {
+		return err
+	}
 	for i := range deployments {
 		if err := ValidateDeployment(&deployments[i]); err != nil {
 			return err
@@ -735,6 +738,36 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 		if !providerIDs[deployments[i].ProviderID] {
 			return domain.NewError(domain.CodeInvalidInput,
 				"deployment "+deployments[i].ID+" references unknown provider "+deployments[i].ProviderID)
+		}
+	}
+	return nil
+}
+
+// validateModelAliasUniqueness enforces cross-model alias uniqueness on a
+// drained/parsed model set. Snapshot.Model resolves an alias by iterating
+// the models map, so two models sharing one alias (典型的运营误配：都配
+// "latest") would route the same request to a random upstream and bill it
+// under a random price version; an alias equal to a model ID would be
+// silently shadowed by the exact-ID lookup, i.e. dead config. Both are
+// rejected here and in ParseSnapshot so an ambiguous catalog can neither be
+// published nor loaded.
+func validateModelAliasUniqueness(models []domain.Model) error {
+	modelIDs := make(map[string]bool, len(models))
+	for i := range models {
+		modelIDs[models[i].ID] = true
+	}
+	aliasOwner := make(map[string]string)
+	for i := range models {
+		for _, a := range models[i].Aliases {
+			if modelIDs[a] {
+				return domain.NewError(domain.CodeInvalidInput,
+					fmt.Sprintf("model %s alias %q collides with a model id (the exact-id lookup would shadow it)", models[i].ID, a))
+			}
+			if owner, dup := aliasOwner[a]; dup && owner != models[i].ID {
+				return domain.NewError(domain.CodeInvalidInput,
+					fmt.Sprintf("alias %q is bound to both %s and %s (resolution would be non-deterministic)", a, owner, models[i].ID))
+			}
+			aliasOwner[a] = models[i].ID
 		}
 	}
 	return nil

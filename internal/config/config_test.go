@@ -210,6 +210,42 @@ func TestValidate_RelayTicketSecretStrength(t *testing.T) {
 	}
 }
 
+// TestValidate_RelayTicketSecretPreviousStrength pins the same 32-char floor
+// for the rotation-window previous secret: while set it is trusted for
+// ticket verification exactly like the primary, so a weak previous secret is
+// just as forgeable.
+func TestValidate_RelayTicketSecretPreviousStrength(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		secret  string
+		wantErr bool
+	}{
+		{"empty (no rotation) ok", "", false},
+		{"32 chars ok", strings.Repeat("b", 32), false},
+		{"31 chars rejected", strings.Repeat("b", 31), true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validRealWeChatConfig()
+			cfg.RelayTicketSecretPrev = tc.secret
+			err := cfg.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %d-char previous secret, got nil", len(tc.secret))
+				}
+				if !strings.Contains(err.Error(), "RELAY_TICKET_SECRET_PREVIOUS") {
+					t.Errorf("error message missing RELAY_TICKET_SECRET_PREVIOUS: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("want nil for %d-char previous secret, got %v", len(tc.secret), err)
+			}
+		})
+	}
+}
+
 // TestValidate_RelayWSURLScheme pins the optional ws_url override: empty =
 // derive from request Host (valid); ws:// and wss:// accepted; anything else
 // (https://, bare host, garbage) is rejected — a typo'd override would
@@ -1055,6 +1091,37 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "WECHAT_OAUTH_MOCK") {
 			t.Errorf("want WECHAT_OAUTH_MOCK rejection, got: %v", err)
+		}
+	})
+
+	t.Run("mock flags + PADDLE_ENV=live → rejected", func(t *testing.T) {
+		t.Parallel()
+		// PADDLE_ENV=live is an independent production signal: a staging
+		// APP_ENV must not let the mock switches through on a live-billing
+		// host. The guard fires before the PADDLE_API_KEY/secret
+		// requirements, so the bare env is enough to reach it.
+		for switchName, enable := range map[string]func(*Config){
+			"PAYPAL_L3_E2E_MODE": func(c *Config) { c.PaypalL3E2EMode = true },
+			"WECHAT_PAY_MOCK":    func(c *Config) { c.WeChatPayMock = true },
+			"WECHAT_OAUTH_MOCK":  func(c *Config) { c.WeChatOAuthMock = true },
+		} {
+			cfg := base()
+			cfg.AppEnv = "staging"
+			cfg.PaddleEnv = "live"
+			enable(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), switchName) {
+				t.Errorf("PADDLE_ENV=live: want %s rejection, got: %v", switchName, err)
+			}
+		}
+	})
+
+	t.Run("PADDLE_ENV=live without mock flags → ok", func(t *testing.T) {
+		t.Parallel()
+		// Control: the guard must not reject a legitimate live Paddle
+		// deployment (validPaddleConfig: AppEnv=staging, full real tuple).
+		if err := validPaddleConfig().Validate(); err != nil {
+			t.Errorf("legitimate PADDLE_ENV=live config should validate, got: %v", err)
 		}
 	})
 

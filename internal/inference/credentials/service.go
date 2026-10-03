@@ -238,10 +238,12 @@ func (s *Service) Rotate(ctx context.Context, op Operator, id, newPlaintext, rea
 		return nil, domain.WrapError(domain.CodeInternal, "encrypt credential", err)
 	}
 	// Optimistic in-memory view of the CAS bump the SQL performs; on commit
-	// this matches the stored row.
+	// this matches the stored row. Status is deliberately NOT touched: rotate
+	// replaces secret material only and never moves the lifecycle state — a
+	// 'rotating' credential stays 'rotating' (the SQL does not update status
+	// either); status transitions belong to SetStatus alone.
 	cred.KeyVersion = version
 	cred.Generation++
-	cred.Status = "active"
 	rotateDetail := map[string]any{
 		"provider_id": cred.ProviderID, "key_version": version, "generation": cred.Generation,
 	}

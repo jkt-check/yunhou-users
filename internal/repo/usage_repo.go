@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/yunhou/users/internal/model"
@@ -60,29 +61,36 @@ func usageGroupColumn(groupBy string) (string, error) {
 }
 
 func (r *usageRepo) InsertBeats(ctx context.Context, userID, appID string, beats []model.UsageBeat) (int, error) {
-	tx, err := r.db.BeginTxx(ctx, nil)
+	if len(beats) == 0 {
+		return 0, nil
+	}
+	// 单条多行 INSERT：原实现事务内逐条 Exec，上限 100 条/请求即最坏 100
+	// 次往返；拼一条语句后恒为 1 次。单语句天然原子，不再需要显式事务。
+	// 列名固定不走拼接，只按行递增 VALUES 占位符（$1..$8N）。
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO usage_events
+		(user_id, app_id, client_event_id, occurred_at, local_date, active_seconds, platform, app_version)
+		VALUES `)
+	args := make([]any, 0, len(beats)*8)
+	for i, b := range beats {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		base := i * 8
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8)
+		args = append(args, userID, appID, b.ClientEventID, b.OccurredAt, b.LocalDate,
+			b.ActiveSeconds, b.Platform, b.AppVersion)
+	}
+	sb.WriteString(` ON CONFLICT (user_id, client_event_id) DO NOTHING`)
+	res, err := r.db.ExecContext(ctx, sb.String(), args...)
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback() // no-op after Commit
-
-	inserted := 0
-	const stmt = `INSERT INTO usage_events
-		(user_id, app_id, client_event_id, occurred_at, local_date, active_seconds, platform, app_version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (user_id, client_event_id) DO NOTHING`
-	for _, b := range beats {
-		res, err := tx.ExecContext(ctx, stmt,
-			userID, appID, b.ClientEventID, b.OccurredAt, b.LocalDate,
-			b.ActiveSeconds, b.Platform, b.AppVersion)
-		if err != nil {
-			return 0, err
-		}
-		if n, err := res.RowsAffected(); err == nil {
-			inserted += int(n)
-		}
-	}
-	return inserted, tx.Commit()
+	// 多行 INSERT 的 RowsAffected 即实际插入行数（冲突行不计），与逐条
+	// 累加的语义一致。
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (r *usageRepo) CountActiveUsers(ctx context.Context, from, to string) (int, error) {

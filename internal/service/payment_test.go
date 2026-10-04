@@ -295,11 +295,12 @@ func TestDispatchBranch(t *testing.T) {
 		{"alipay", "TRADE_CLOSED", branchRefund},
 		{"alipay", "trade_closed", branchRefund},
 		{"alipay", "trade_refund", branchRefund},
-		// PayPal: ACTIVATED (post-approval, has custom_id + next_billing_time)
-		// activates the order; CREATED is pre-approval (APPROVAL_PENDING)
-		// and must not.
+		// PayPal: ACTIVATED 已降级 audit-only(安全审计 2026-10:PayPal 已
+		// 从前端退役,激活路径存在 custom_id 信任锚漏洞;合法续费由
+		// PAYMENT.SALE.COMPLETED 处理);CREATED 是 pre-approval
+		// (APPROVAL_PENDING),同样不得激活。
 		{"paypal", "PAYMENT.CAPTURE.COMPLETED", branchPaymentSuccess},
-		{"paypal", "BILLING.SUBSCRIPTION.ACTIVATED", branchPaymentSuccess},
+		{"paypal", "BILLING.SUBSCRIPTION.ACTIVATED", branchNone},
 		{"paypal", "BILLING.SUBSCRIPTION.CREATED", branchNone},
 		{"paypal", "PAYMENT.CAPTURE.DENIED", branchPaymentFailed},
 		{"paypal", "PAYMENT.CAPTURE.FAILED", branchPaymentFailed},

@@ -241,6 +241,25 @@ func (s *Store) SetUpstreamAccountStatusConditionalTx(ctx context.Context, w dom
 	return n > 0, nil
 }
 
+// GetUpstreamAccountStatusForUpdateTx reads one account's status inside the
+// caller's UnitOfWork under a row lock（FOR SHARE：与并发 UPDATE/停用事务
+// 互斥，但允许并发派发共享锁——评审 Minor 跟进，账号行不做无谓串行化）。
+// 供 dispatch 前的租约事务做 active 复查（候选来自 1s TTL 缓存，选型与
+// 派发之间账号可能已被停用——pr-ci 第三轮 FullLifecycleE2E）。纯读不写：
+// 不像 active→active 条件翻转那样每请求 bump updated_at。
+func (s *Store) GetUpstreamAccountStatusForUpdateTx(ctx context.Context, w domain.UnitOfWork, id string) (domain.UpstreamAccountStatus, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return "", err
+	}
+	var status string
+	if err := tx.GetContext(ctx, &status,
+		`SELECT status FROM inference_upstream_accounts WHERE id = $1 FOR SHARE`, id); err != nil {
+		return "", mapError("get upstream account status (tx)", err)
+	}
+	return domain.UpstreamAccountStatus(status), nil
+}
+
 // SetUpstreamAccountsStatusByCredentialTx flips every account bound to a
 // credential from `from` to `to` inside the caller's UnitOfWork (refresh
 // reauth propagation commits with the audit row). Returns the flipped ids

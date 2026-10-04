@@ -11,8 +11,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -48,6 +50,20 @@ const chatUpstreamErrorBodyCap = 8 << 10
 // audit log records only upstream_status/upstream_code — not the message
 // (upstream text can echo request content).
 const chatUpstreamMessageCap = 300
+
+// defaultChatMaxOutputTokens 是输出 token 硬上限默认值（评审安全补丁：无
+// max_tokens 上限时恶意订阅者可开超长生成流造成不受控上游成本，参照
+// inference 网关设计 §7.2「不允许无限输出」）。客户端请求（model.ChatRequest）
+// 不携带 max_tokens，故该上限直接写入上游 payload，不存在客户端值封顶问题。
+// 仅作用于 Anthropic 协议路径（协议必传 max_tokens）；OpenAI 协议路径按
+// DualBackend 契约不携带该字段（见 catalog.go：MaxTokens 仅发 Anthropic
+// provider），其滥用面由并发流上限与上游超时收敛。
+const defaultChatMaxOutputTokens = 8192
+
+// defaultChatMaxStreamsPerUser 是单用户并发流式请求上限默认值（评审安全
+// 补丁：legacy /chat 仅有 router 层按 IP 限流，单用户可并发开大量流式请求
+// 放大上游成本）。
+const defaultChatMaxStreamsPerUser = 8
 
 // ChatRoute describes where one chat request was actually sent. The handler
 // uses it for usage metering and the audit log; it is nil on error.
@@ -103,6 +119,13 @@ type ChatService struct {
 	planRepo   repo.PlanRepo
 	usageRepo  repo.LLMUsageRepo // nil = metering disabled
 	httpClient *http.Client
+	// maxOutputTokens / maxStreamsPerUser：两项安全补丁阈值，<=0 时回落默认
+	// 值（见 outputTokenCap / streamSlotLimit），保证零值构造也可用。后续由
+	// 主装配线通过 setter 接入配置（internal/config 不在本补丁范围内）。
+	maxOutputTokens   int
+	maxStreamsPerUser int
+	slotsMu           sync.Mutex
+	slots             map[string]int // userID → 进行中的流式请求数
 }
 
 // NewChatService builds the multi-model chat router. catalog nil → every
@@ -125,13 +148,33 @@ func NewChatService(catalog *llm.Catalog, subRepo repo.SubscriptionRepo, planRep
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
+			ForceAttemptHTTP2: true,
+			MaxIdleConns:      100,
+			// 与 providers/adapter.go 同款：上游集中在少数 host，默认
+			// MaxIdleConnsPerHost=2 会让 keep-alive 形同虚设（每请求重做
+			// TCP+TLS 握手），抬高首 token 延迟。
+			MaxIdleConnsPerHost:   64,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 			ResponseHeaderTimeout: 60 * time.Second,
 		}},
+		slots: map[string]int{},
+	}
+	// 评审安全补丁（凭证边界）：跨 origin 重定向绝不跟随。Go 的 http.Client
+	// 跨主机跳转只剥 Authorization/Cookie，x-api-key 与 Provider.Headers 里
+	// 的运营商自定义鉴权头会被逐字拷给新主机（307/308 还会重发完整请求
+	// 体）。返回 ErrUseLastResponse 让 3xx 响应按上游错误处理（StreamChat
+	// 的非 200 分支）。与 internal/inference/providers/adapter.go 的
+	// NewHTTPClient 策略一致。
+	s.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return fmt.Errorf("chat: too many redirects")
+		}
+		if len(via) > 0 && !sameOrigin(req.URL, via[0].URL) {
+			return http.ErrUseLastResponse
+		}
+		return nil
 	}
 	if catalog != nil {
 		for name, p := range catalog.Providers {
@@ -144,6 +187,92 @@ func NewChatService(catalog *llm.Catalog, subRepo repo.SubscriptionRepo, planRep
 // SetHTTPClient overrides the HTTP client. Tests inject httptest servers here.
 func (s *ChatService) SetHTTPClient(c *http.Client) {
 	s.httpClient = c
+}
+
+// SetMaxOutputTokens 设置输出 token 硬上限（n<=0 时忽略，保持当前值）。
+// 仅作用于 Anthropic 协议路径（协议必传 max_tokens）；OpenAI 协议路径按
+// DualBackend 契约不携带该字段。后续由主装配线从配置接入。
+func (s *ChatService) SetMaxOutputTokens(n int) {
+	if n > 0 {
+		s.maxOutputTokens = n
+	}
+}
+
+// SetMaxStreamsPerUser 设置单用户并发流式请求上限（n<=0 时忽略，保持当前值）。
+func (s *ChatService) SetMaxStreamsPerUser(n int) {
+	if n > 0 {
+		s.maxStreamsPerUser = n
+	}
+}
+
+// outputTokenCap 返回生效的输出 token 硬上限（未配置/零值回落默认值）。
+func (s *ChatService) outputTokenCap() int {
+	if s.maxOutputTokens > 0 {
+		return s.maxOutputTokens
+	}
+	return defaultChatMaxOutputTokens
+}
+
+// streamSlotLimit 返回生效的单用户并发流上限（未配置/零值回落默认值）。
+func (s *ChatService) streamSlotLimit() int {
+	if s.maxStreamsPerUser > 0 {
+		return s.maxStreamsPerUser
+	}
+	return defaultChatMaxStreamsPerUser
+}
+
+// acquireStreamSlot 占用 userID 的一个并发流名额；已达上限返回 ok=false。
+// 返回的 release 幂等（sync.Once），调用方可在多个退出路径安全重复调用。
+func (s *ChatService) acquireStreamSlot(userID string) (release func(), ok bool) {
+	s.slotsMu.Lock()
+	if s.slots == nil {
+		s.slots = map[string]int{}
+	}
+	if s.slots[userID] >= s.streamSlotLimit() {
+		s.slotsMu.Unlock()
+		return nil, false
+	}
+	s.slots[userID]++
+	s.slotsMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.slotsMu.Lock()
+			if n := s.slots[userID] - 1; n > 0 {
+				s.slots[userID] = n
+			} else {
+				delete(s.slots, userID)
+			}
+			s.slotsMu.Unlock()
+		})
+	}, true
+}
+
+// sameOrigin 判定两个 URL 是否同 scheme+host（重定向凭证边界）。
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
+// ErrChatConcurrencyLimited：单用户并发流式请求超过上限（评审安全补丁）。
+// ChatConcurrencyLimitError 同时 unwrap 到 ErrChatRateLimited —— handler
+// 的 chatErrorMapping 已为它加了独立 case（置于 ErrChatRateLimited 之前，
+// handler/chat.go），客户端拿到准确文案的 429。
+var ErrChatConcurrencyLimited = errors.New("too many concurrent chat streams")
+
+// ChatConcurrencyLimitError 携带触发拒绝时的上限值，Error() 面向服务端
+// 日志；Unwrap 同时匹配 ErrChatConcurrencyLimited 与 ErrChatRateLimited
+// （Go 1.20+ 多 unwrap），兼容 handler 现有 429 映射。
+type ChatConcurrencyLimitError struct {
+	Limit int
+}
+
+func (e *ChatConcurrencyLimitError) Error() string {
+	return fmt.Sprintf("%s (limit %d)", ErrChatConcurrencyLimited, e.Limit)
+}
+
+func (e *ChatConcurrencyLimitError) Unwrap() []error {
+	return []error{ErrChatConcurrencyLimited, ErrChatRateLimited}
 }
 
 // StreamChat resolves the logical model, checks the caller's subscription
@@ -165,6 +294,18 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 	if s.catalog == nil {
 		return nil, nil, ErrChatNotEnabled
 	}
+	// 按用户并发流上限（评审安全补丁）：进入即占名额，成功路径把名额转交
+	// 给响应 body 的生命周期（见下方成功分支），所有错误路径由 defer 释放。
+	release, ok := s.acquireStreamSlot(userID)
+	if !ok {
+		return nil, nil, &ChatConcurrencyLimitError{Limit: s.streamSlotLimit()}
+	}
+	slotHeld := true
+	defer func() {
+		if slotHeld {
+			release()
+		}
+	}()
 	resolvedID, m, ok := s.catalog.Resolve(logicalModel)
 	if !ok {
 		return nil, nil, fmt.Errorf("%w: %s", ErrChatUnknownModel, logicalModel)
@@ -191,9 +332,23 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 
 	var body []byte
 	var err error
+	// 评审安全补丁（无 max_tokens 上限）：客户端请求不携带 max_tokens
+	// （model.ChatRequest 无此字段）。Anthropic 协议必传 max_tokens，故该
+	// 路径写入硬上限；OpenAI 协议路径按 DualBackend 契约（e2e
+	// chat_gateway_test 钉死：legacy upstream payload 不得携带
+	// max_tokens）与 catalog 设计（MaxTokens 仅发 Anthropic provider）
+	// 不注入该字段，滥用面由并发流上限 + 上游超时 + 计量收费收敛。
+	outCap := s.outputTokenCap()
 	switch provider.Protocol {
 	case llm.ProtocolAnthropic:
-		body, err = llm.BuildAnthropicPayload(m.UpstreamModel, m.MaxTokens, messages, tools, thinkingEnabled)
+		// Anthropic API 要求必传 max_tokens：目录里的 operator 配置值
+		// （m.MaxTokens）被 honored，但以硬上限封顶；缺省或超上限一律用
+		// 硬上限。
+		maxTok := m.MaxTokens
+		if maxTok <= 0 || maxTok > outCap {
+			maxTok = outCap
+		}
+		body, err = llm.BuildAnthropicPayload(m.UpstreamModel, maxTok, outCap, messages, tools, thinkingEnabled)
 		if err != nil {
 			// Anthropic translation only fails on un-encodable client input:
 			// the shape guards (history legal per chat validation, forbidden
@@ -237,8 +392,19 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 			if provider.Protocol == llm.ProtocolAnthropic {
 				resp.Body = llm.TranslateAnthropicStream(resp.Body)
 			}
-			// Bind cancel to the body's lifetime (see NOTE above).
-			resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+			// 名额随 body 生命周期释放：cancelOnCloseBody 在 Close 时同时
+			// cancel ctx 并释放 slot（与现有包装模式一致）；watcher 兜底
+			// body 未关闭但 ctx 已取消的路径（客户端断连 / 15m 超时），
+			// release 幂等，两条路径同时触发也安全。
+			slotHeld = false
+			resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: func() {
+				cancel()
+				release()
+			}}
+			go func() {
+				<-reqCtx.Done()
+				release()
+			}()
 			return resp, route, nil
 		}
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, chatUpstreamErrorBodyCap))

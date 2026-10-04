@@ -21,8 +21,9 @@ const (
 // speaks Anthropic protocol (Kimi for Coding, GLM Coding Plan, MiniMax
 // /anthropic). The thinking flag maps to Anthropic's extended-thinking
 // parameter with a fixed budget; the OpenAI "thinking":{"type":"enabled"}
-// shape is never sent to an Anthropic endpoint.
-func BuildAnthropicPayload(upstreamModel string, maxTokens int, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
+// shape is never sent to an Anthropic endpoint. hardCap bounds the final
+// max_tokens (<= 0 表示不设上限）——thinking 模式的协议提升也不得突破它。
+func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
 	if maxTokens <= 0 {
 		maxTokens = anthropicDefaultMaxTokens
 	}
@@ -161,6 +162,12 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens int, messages []model
 	if thinkingEnabled != nil && *thinkingEnabled {
 		if maxTokens <= anthropicThinkingBudget {
 			maxTokens = anthropicThinkingBudget + anthropicDefaultMaxTokens
+			// 协议提升不得突破调用方硬上限（2026-10 评审）：operator 把输出
+			// 上限配到 ≤budget 时，封顶后 max_tokens 可能 ≤ budget → 上游
+			// 400——那是配置错误的显式信号，好过静默超支。
+			if hardCap > 0 && maxTokens > hardCap {
+				maxTokens = hardCap
+			}
 			payload["max_tokens"] = maxTokens
 		}
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": anthropicThinkingBudget}

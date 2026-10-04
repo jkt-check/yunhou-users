@@ -1098,6 +1098,9 @@ func paypalCaptureCompletedBody(eventID, captureID, customID string, amount stri
 }
 
 // paypalSaleCompletedBody builds a PAYMENT.SALE.COMPLETED renewal body.
+// Amount must match the seeded monthly_usd plan price (29.90 USD): the
+// 2026-10 hardening hard-rejects renewals below plan price when
+// PLAN_AMOUNT_OVERRIDE_JSON is not active.
 func paypalSaleCompletedBody(eventID, saleID, billingAgreementID, customID, nextBillingTime string) []byte {
 	return []byte(fmt.Sprintf(`{
 		"id": %q,
@@ -1106,7 +1109,7 @@ func paypalSaleCompletedBody(eventID, saleID, billingAgreementID, customID, next
 			"id": %q,
 			"billing_agreement_id": %q,
 			"custom_id": %q,
-			"amount": {"value": "9.99", "currency_code": "USD"},
+			"amount": {"value": "29.90", "currency_code": "USD"},
 			"billing_info": {"next_billing_time": %q}
 		}
 	}`, eventID, saleID, billingAgreementID, customID, nextBillingTime))

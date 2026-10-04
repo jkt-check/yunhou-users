@@ -109,6 +109,12 @@ func (s *stubOrderRepoLookup) FindPendingByUserAndProduct(_ context.Context, _, 
 	}
 	return nil, sql.ErrNoRows
 }
+func (s *stubOrderRepoLookup) FindPendingByUserAndProductTx(_ context.Context, _ *sqlx.Tx, _, _ string) (*model.Order, error) {
+	// Mirrors FindPendingByUserAndProduct: the in-tx re-check follows the
+	// advisory lock in eligibilityAndInsertOrderTx (unit tests never take
+	// the real lock — planRepo.WithTx needs a DB).
+	return s.FindPendingByUserAndProduct(context.Background(), "", "")
+}
 func (s *stubOrderRepoLookup) FailPending(_ context.Context, id string) (bool, error) {
 	s.failSeen = id
 	if s.failErr != nil {
@@ -1360,5 +1366,70 @@ func TestPaymentService_Unit_Refund_InternalAppIdempotentReplay(t *testing.T) {
 	}
 	if refundAPI.called {
 		t.Fatal("channel refund API must NOT be called on an idempotent replay")
+	}
+}
+
+// recordingRefundRepo wraps stubRefundRepoLookup and records every
+// FindByIdempotencyKey (userID, key) pair — the regression pin for the
+// internal-app 空 UserID 预查 bug（pr-ci：POST /refunds 500，
+// pq 22P02 invalid input syntax for type uuid: ""）。
+type recordingRefundRepo struct {
+	stubRefundRepoLookup
+	calls []string
+}
+
+func (r *recordingRefundRepo) FindByIdempotencyKey(ctx context.Context, userID, key string) (*model.Refund, error) {
+	r.calls = append(r.calls, userID+"|"+key)
+	return r.stubRefundRepoLookup.FindByIdempotencyKey(ctx, userID, key)
+}
+
+// TestRefund_InternalAppSkipsEmptyUserIDPreCheck: InternalApp 调用方
+// UserID 为空，预查必须跳过（空串打进 uuid 列 = 22P02 → 500）；重放由
+// canonical-owner 复查覆盖。payment 未 paid 让流程在幂等检查后终止，
+// 恰好把两次幂等查询的调用序列完整暴露出来。
+func TestRefund_InternalAppSkipsEmptyUserIDPreCheck(t *testing.T) {
+	orderRepo := &stubOrderRepoLookup{byID: map[string]*model.Order{
+		"o-1": {ID: "o-1", UserID: "u-owner"},
+	}}
+	paymentRepo := &stubPaymentRepoLookup{byID: map[string]*model.Payment{
+		"p-1": {ID: "p-1", OrderID: "o-1", Status: "pending", Amount: 10},
+	}}
+	refundRepo := &recordingRefundRepo{}
+	svc := newPaymentServiceForLookup(orderRepo, paymentRepo, refundRepo)
+
+	_, err := svc.Refund(context.Background(), RefundInput{
+		PaymentID: "p-1", InternalApp: true, IdempotencyKey: "k-12345678", Amount: 5,
+	})
+	if !errors.Is(err, ErrPaymentNotPaid) {
+		t.Fatalf("err = %v, want ErrPaymentNotPaid", err)
+	}
+	if len(refundRepo.calls) != 1 || refundRepo.calls[0] != "u-owner|k-12345678" {
+		t.Fatalf("idempotency calls = %v, want only the canonical-owner recheck", refundRepo.calls)
+	}
+}
+
+// TestRefund_InternalAppReplayHitsCanonicalOwner: InternalApp 重放（同幂等键）
+// 必须经 canonical-owner 复查命中既有退款行，不得重复出账。
+func TestRefund_InternalAppReplayHitsCanonicalOwner(t *testing.T) {
+	existing := &model.Refund{ID: "r-1", PaymentID: "p-1", UserID: "u-owner"}
+	orderRepo := &stubOrderRepoLookup{byID: map[string]*model.Order{
+		"o-1": {ID: "o-1", UserID: "u-owner"},
+	}}
+	paymentRepo := &stubPaymentRepoLookup{byID: map[string]*model.Payment{
+		"p-1": {ID: "p-1", OrderID: "o-1", Status: "paid", Amount: 10},
+	}}
+	refundRepo := &recordingRefundRepo{stubRefundRepoLookup: stubRefundRepoLookup{
+		byKey: map[string]*model.Refund{"u-owner|k-12345678": existing},
+	}}
+	svc := newPaymentServiceForLookup(orderRepo, paymentRepo, refundRepo)
+
+	res, err := svc.Refund(context.Background(), RefundInput{
+		PaymentID: "p-1", InternalApp: true, IdempotencyKey: "k-12345678", Amount: 5,
+	})
+	if err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	if !res.Existing || res.Refund.ID != "r-1" {
+		t.Fatalf("res = %+v, want existing r-1", res)
 	}
 }

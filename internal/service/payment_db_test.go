@@ -401,6 +401,71 @@ func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
 	}
 }
 
+// TestPaymentService_CreateOrder_ConcurrentRaceSingleWinner pins the
+// advisory-lock invariant behind the pending-order guard (2026-10 audit):
+// the outer fast-path check is check-then-act across two transactions, so
+// only the in-tx pg_advisory_xact_lock + re-check in
+// eligibilityAndInsertOrderTx makes "one open checkout per (user, product)"
+// a real invariant. N concurrent CreateOrder calls for the same
+// (user, product) on an auto-renew channel must yield EXACTLY one pending
+// order; every loser must see ErrUserHasPendingOrder (not a generic 500).
+// Requires real PG (advisory locks + READ COMMITTED visibility); skipped
+// with the rest of the DB suite when no database is reachable.
+func TestPaymentService_CreateOrder_ConcurrentRaceSingleWinner(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	// Paddle settles USD (channelRequiredCurrency); mirror the intl seed.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE plans SET currency = 'USD' WHERE id = 'monthly'`); err != nil {
+		t.Fatalf("set monthly currency: %v", err)
+	}
+	svc.SetPaddleClient(&stubPaddle{txnID: "txn_race", checkout: "https://yunhou.ai/checkout?_ptxn=txn_race"})
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_race"})
+
+	const racers = 8
+	start := make(chan struct{})
+	errs := make(chan error, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle")
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	success, rejected := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, ErrUserHasPendingOrder):
+			rejected++
+		default:
+			t.Errorf("unexpected CreateOrder error from racer: %v", err)
+		}
+	}
+	if success != 1 {
+		t.Errorf("success = %d, want exactly 1 (rejected = %d, want %d)", success, rejected, racers-1)
+	}
+
+	// DB 层面同判：同一 (user, product) 最多一行 pending。
+	var pending int
+	if err := db.GetContext(context.Background(), &pending,
+		`SELECT count(*) FROM orders WHERE user_id = $1 AND status = 'pending'`, uid); err != nil {
+		t.Fatalf("count pending orders: %v", err)
+	}
+	if pending != 1 {
+		t.Errorf("pending orders = %d, want 1", pending)
+	}
+}
+
 // TestCreateOrder_TrialPlanNotPurchasable: the trial plan is granted by
 // auth on first login and must never be orderable — even for a user
 // with no subscription at all. eligibilityAndInsertOrderTx rejects it
@@ -2961,24 +3026,23 @@ func TestPaymentService_OnWebhook_BadCurrency(t *testing.T) {
 	}
 }
 
-// TestPaymentService_OnWebhook_PaypalActivated_NoAmount pins the
-// 2026-08-17 intl-staging fix: BILLING.SUBSCRIPTION.ACTIVATED is the
-// subscription activation trigger, and PayPal lifecycle payloads carry NO
-// resource.amount — Amount=0/Currency="" is by construction
-// (SkipAmountCheck=true), not underpayment. The event must activate the
-// order (payment_paid), insert the payment row, and stamp
-// external_subscription_id on the subscription for the renewal path.
-// Pre-fix the amount check rejected these events with
-// webhook_amount_mismatch and the order stayed pending until expiry.
-func TestPaymentService_OnWebhook_PaypalActivated_NoAmount(t *testing.T) {
+// TestPaymentService_OnWebhook_PaypalActivated_AuditOnly pins the 2026-10
+// security-audit downgrade: BILLING.SUBSCRIPTION.ACTIVATED 已从
+// branchPaymentSuccess 移除(PayPal 收银台已从前端退役,且激活路径只凭
+// custom_id 定位订单、SkipAmountCheck 跳过金额校验、无 plan 映射校验,
+// 可用廉价自建订阅激活高价套餐)。事件必须 ack 200 但 audit-only:
+// 不建支付行、订单保持 pending、不激活订阅;webhook_events 行保留审计
+// 痕迹。合法续费由 PAYMENT.SALE.COMPLETED(branchRenewal)处理。
+func TestPaymentService_OnWebhook_PaypalActivated_AuditOnly(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
 	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
 
 	hint := time.Now().Add(7 * 24 * time.Hour).UTC().Truncate(time.Second)
+	eventID := "WH-ACT-" + mustNewUUID()[:8]
 	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
-		Channel: "paypal", EventID: "WH-ACT-" + mustNewUUID()[:8], EventType: "BILLING.SUBSCRIPTION.ACTIVATED",
+		Channel: "paypal", EventID: eventID, EventType: "BILLING.SUBSCRIPTION.ACTIVATED",
 		TransactionID: "I-ACT" + mustNewUUID()[:8], OrderID: order.ID,
 		Amount: 0, Currency: "", SkipAmountCheck: true,
 		ExternalSubscriptionID: "I-ACT" + mustNewUUID()[:8],
@@ -2986,30 +3050,30 @@ func TestPaymentService_OnWebhook_PaypalActivated_NoAmount(t *testing.T) {
 		RawPayload:             json.RawMessage(`{}`),
 	})
 	if err != nil {
-		t.Fatalf("lifecycle event must be acked, got err: %v", err)
+		t.Fatalf("lifecycle event must be acked (non-retryable), got err: %v", err)
 	}
-	if res.DomainAction != "payment_paid" {
-		t.Errorf("DomainAction = %q, want payment_paid", res.DomainAction)
+	if res.DomainAction != "none" {
+		t.Errorf("DomainAction = %q, want none (audit-only)", res.DomainAction)
 	}
 	var n int
-	_ = db.GetContext(context.Background(), &n,
-		`SELECT count(*) FROM audit_log WHERE action = 'webhook_amount_mismatch'`)
-	if n != 0 {
-		t.Error("SkipAmountCheck event must not write webhook_amount_mismatch")
-	}
 	_ = db.GetContext(context.Background(), &n, `SELECT count(*) FROM payments`)
-	if n != 1 {
-		t.Errorf("expected 1 payment row, got %d", n)
+	if n != 0 {
+		t.Errorf("expected 0 payment rows (ACTIVATED must not activate), got %d", n)
 	}
 	got, _ := svc.GetOrder(context.Background(), order.ID, uid)
-	if got.Status != "paid" {
-		t.Errorf("order.Status = %q, want paid", got.Status)
+	if got.Status != "pending" {
+		t.Errorf("order.Status = %q, want pending (ACTIVATED must not mark paid)", got.Status)
 	}
-	var extID string
-	_ = db.GetContext(context.Background(), &extID,
-		`SELECT coalesce(external_subscription_id,'') FROM subscriptions WHERE user_id = $1 AND status = 'active'`, uid)
-	if extID == "" {
-		t.Error("active subscription must carry external_subscription_id for the renewal path")
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM subscriptions WHERE user_id = $1 AND status = 'active'`, uid)
+	if n != 0 {
+		t.Errorf("expected no active subscription after audit-only ACTIVATED, got %d", n)
+	}
+	// webhook_events 行是 audit-only 路径的审计痕迹。
+	_ = db.GetContext(context.Background(), &n,
+		`SELECT count(*) FROM webhook_events WHERE channel = 'paypal' AND event_id = $1`, eventID)
+	if n != 1 {
+		t.Errorf("expected webhook_events audit row, got %d", n)
 	}
 }
 
@@ -3140,7 +3204,9 @@ func TestPaymentService_OnWebhook_PaypalRenewal_Success(t *testing.T) {
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: eventID, EventType: "PAYMENT.SALE.COMPLETED",
 		TransactionID: txnID, ExternalSubscriptionID: "I-PAYPAL-SUB-1",
-		Amount: 29.9, Currency: "USD",
+		// 金额/币种需与 plan(monthly=19.9 CNY)一致:安全加固 2026-10 后
+		// override 未激活时币种不符/低于 plan 价会被硬拒绝。
+		Amount: 29.9, Currency: "CNY",
 		SubExpiresAt: &newExpAt,
 		RawPayload:   json.RawMessage(`{}`),
 	})
@@ -3183,7 +3249,7 @@ func TestPaymentService_OnWebhook_PaypalRenewal_OutOfOrderKeepsMaxExpiry(t *test
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: "evt-ooo-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
 		TransactionID: "txn-ooo-" + mustNewUUID()[:8], ExternalSubscriptionID: "I-PP-OOO",
-		Amount: 29.9, Currency: "USD",
+		Amount: 29.9, Currency: "CNY", // 与 plan 同币种且不低于 plan 价(2026-10 硬拒绝适配)
 		SubExpiresAt: &earlierHint,
 		RawPayload:   json.RawMessage(`{}`),
 	})
@@ -3269,14 +3335,24 @@ func TestPaymentService_OnWebhook_PaypalRenewal_UnknownSubscription(t *testing.T
 }
 
 // TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit pins the
-// renewal amount/currency sanity audit (review users-1, 2026-08-17): a
-// below-plan or wrong-currency PAYMENT.SALE.COMPLETED must still process
-// the renewal (order + payment + expiry extension — plan-amount-override
-// and the L3 $4.99 renewals legitimately deviate) BUT write an audit row
-// so ops can spot a genuine undercharge. Note: setupPaymentDB seeds
-// monthly with currency='CNY' (migration default), so a USD renewal is
-// exactly the currency_mismatch case.
+// override-ACTIVE flavour of the renewal amount/currency sanity check
+// (review users-1, 2026-08-17; hardened 安全审计 2026-10): while
+// plan-amount-override is engaged (intl-staging $0.01/$0.10 sandbox
+// charges, L3 $4.99 renewals), a below-plan or wrong-currency
+// PAYMENT.SALE.COMPLETED must still process the renewal (order + payment +
+// expiry extension) BUT write an audit row so ops can spot a genuine
+// undercharge. The override-inactive (production) hard-reject path is
+// covered by TestPaymentService_OnWebhook_PaypalRenewal_MismatchRejected.
+// Note: setupPaymentDB seeds monthly with currency='CNY' (migration
+// default), so a USD renewal is exactly the currency_mismatch case.
 func TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit(t *testing.T) {
+	// 激活 override(本用例钉的是 override 激活时的放行语义)。
+	// cleanup 登记在 t.Setenv 之前:LIFO 保证先恢复 env 再 Reload,
+	// overrideMap 回到 nil,不影响后续用例。
+	t.Cleanup(ReloadOverrideFromEnv)
+	t.Setenv("PLAN_AMOUNT_OVERRIDE_JSON", `{"monthly":0.01}`)
+	ReloadOverrideFromEnv()
+
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
@@ -3360,6 +3436,88 @@ func TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit(t *testing.T
 	}
 }
 
+// TestPaymentService_OnWebhook_PaypalRenewal_MismatchRejected pins the
+// 安全审计 2026-10 hardening: with plan-amount-override INACTIVE
+// (production default), a wrong-currency or below-plan
+// PAYMENT.SALE.COMPLETED must be hard-rejected — a *_rejected audit row is
+// written and committed, but NO synthetic order, NO payment row, and NO
+// expiry extension. (override 激活时的 audit-only 放行由
+// TestPaymentService_OnWebhook_PaypalRenewal_AmountCurrencyAudit 覆盖。)
+func TestPaymentService_OnWebhook_PaypalRenewal_MismatchRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+
+	subID := mustNewUUID()
+	expAt := time.Now().Add(15 * 24 * time.Hour)
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id)
+		VALUES ($1, $2, 'monthly', 'active', $3, 'I-PP-REJ')
+	`, subID, uid, expAt); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		amount    float64
+		currency  string
+		wantAudit string
+	}{
+		// USD vs monthly-plan CNY → currency_mismatch_rejected。
+		{"wrong currency", 29.9, "USD", "paypal_renewal_currency_mismatch_rejected"},
+		// CNY + below-plan → amount_below_plan_rejected。
+		{"below plan amount", 1.0, "CNY", "paypal_renewal_amount_below_plan_rejected"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			txnID := "txn-rej-" + mustNewUUID()[:8]
+			eventID := "evt-rej-" + mustNewUUID()[:8]
+			newExpAt := time.Now().Add(45 * 24 * time.Hour)
+			_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+				Channel: "paypal", EventID: eventID, EventType: "PAYMENT.SALE.COMPLETED",
+				TransactionID: txnID, ExternalSubscriptionID: "I-PP-REJ",
+				Amount: tc.amount, Currency: tc.currency,
+				SubExpiresAt: &newExpAt,
+				RawPayload:   json.RawMessage(`{}`),
+			})
+			if err != nil {
+				t.Fatalf("rejected renewal must still ack 200, got err: %v", err)
+			}
+
+			// 硬拒绝:不写支付行、不建 synthetic 订单、不顺延。
+			var payCount int
+			_ = db.GetContext(context.Background(), &payCount,
+				`SELECT COUNT(*) FROM payments WHERE channel='paypal' AND external_txn_id=$1`, txnID)
+			if payCount != 0 {
+				t.Errorf("rejected renewal must not create a payment row, got %d", payCount)
+			}
+			var orderCount int
+			_ = db.GetContext(context.Background(), &orderCount,
+				`SELECT COUNT(*) FROM orders WHERE user_id=$1`, uid)
+			if orderCount != 0 {
+				t.Errorf("rejected renewal must not mint a synthetic order, got %d", orderCount)
+			}
+			var gotExp time.Time
+			if err := db.GetContext(context.Background(), &gotExp,
+				`SELECT expires_at FROM subscriptions WHERE id=$1`, subID); err != nil {
+				t.Fatalf("read sub: %v", err)
+			}
+			if gotExp.Unix() != expAt.Unix() {
+				t.Errorf("rejected renewal must not extend expires_at: got %v, want %v", gotExp, expAt)
+			}
+
+			// *_rejected audit 行已随事务提交。
+			var auditCount int
+			_ = db.GetContext(context.Background(), &auditCount,
+				`SELECT COUNT(*) FROM audit_log WHERE action=$1 AND context->>'event_id'=$2`, tc.wantAudit, eventID)
+			if auditCount == 0 {
+				t.Errorf("expected audit action %q, got none", tc.wantAudit)
+			}
+		})
+	}
+}
+
 // TestPaymentService_OnWebhook_PaypalRenewal_DuplicatePayment covers
 // the "dedupe-check existing renewal payment" branch in
 // onPaypalRenewalSucceeded: a payment row already exists for the same
@@ -3383,7 +3541,7 @@ func TestPaymentService_OnWebhook_PaypalRenewal_DuplicatePayment(t *testing.T) {
 	first := WebhookEvent{
 		Channel: "paypal", EventID: "evt-pp-dup-first-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
 		TransactionID: txnID, ExternalSubscriptionID: "I-PP-DUP",
-		Amount: 29.9, Currency: "USD",
+		Amount: 29.9, Currency: "CNY", // 与 plan 同币种且不低于 plan 价(2026-10 硬拒绝适配)
 		SubExpiresAt: &expAt,
 		RawPayload:   json.RawMessage(`{}`),
 	}
@@ -3428,7 +3586,7 @@ func TestPaymentService_OnWebhook_PaypalRenewal_NoExpiryHint(t *testing.T) {
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: "evt-pp-noexp-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
 		TransactionID: "txn-pp-noexp-" + mustNewUUID()[:8], ExternalSubscriptionID: "I-PP-NOEXP",
-		Amount: 29.9, Currency: "USD",
+		Amount: 29.9, Currency: "CNY", // 与 plan 同币种且不低于 plan 价(2026-10 硬拒绝适配)
 		// No SubExpiresAt — drives the "no expiry hint" branch.
 		RawPayload: json.RawMessage(`{}`),
 	})
@@ -3465,7 +3623,7 @@ func TestPaymentService_OnWebhook_PaypalRenewal_SubNotActive(t *testing.T) {
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: "evt-pp-cancel-" + mustNewUUID()[:8], EventType: "PAYMENT.SALE.COMPLETED",
 		TransactionID: "txn-pp-cancel-" + mustNewUUID()[:8], ExternalSubscriptionID: "I-PP-CANCEL",
-		Amount: 29.9, Currency: "USD",
+		Amount: 29.9, Currency: "CNY", // 与 plan 同币种且不低于 plan 价(2026-10 硬拒绝适配)
 		SubExpiresAt: &newExpAt,
 		RawPayload:   json.RawMessage(`{}`),
 	})
@@ -3500,7 +3658,9 @@ func paddleRenewalEvent(eventID, txnID, extSubID string) WebhookEvent {
 		Channel: "paddle", EventID: eventID, EventType: "transaction.completed",
 		TransactionID: txnID, ExternalSubscriptionID: extSubID,
 		OrderID: mustNewUUID(), Origin: "subscription_recurring",
-		Amount: 9.99, Currency: "USD",
+		// 与种子 plan(monthly=19.9 CNY)同币种且不低于 plan 价:
+		// 2026-10 起 override 未激活时金额/币种不符会被硬拒绝。
+		Amount: 19.9, Currency: "CNY",
 		RawPayload: json.RawMessage(`{}`),
 	}
 }

@@ -356,6 +356,11 @@ type revisionSource interface {
 	ActiveRevision(ctx context.Context, scope domain.ConfigScope) (*domain.ConfigRevision, error)
 }
 
+// headProbeTTL 是 head 探测结果的有效期：距上次「探测命中现有快照」不足
+// 1s 时直接复用 current，不再每请求打一次探测往返（项目所有者裁定：TTL
+// 一律 1s，不做主动失效，TTL 本身限制发布可见延迟的增量）。
+const headProbeTTL = time.Second
+
 // SnapshotCache serves the current active catalog snapshot with bounded
 // publish delay and refresh-failure safety (设计 §5: 发布原子切换 active
 // revision，各进程在有界延迟内加载完整快照；快照刷新失败继续用已验证
@@ -367,12 +372,23 @@ type revisionSource interface {
 // a complete Snapshot BEFORE the atomic swap — a parse/build failure never
 // publishes a partial snapshot. Any refresh failure with a verified
 // snapshot in hand keeps serving it and invokes OnRefreshError (告警).
+//
+// 探测本身带 1s TTL：命中的探测会把热路径稳态探测频率降到每秒约一次。
+// 注意 TTL 只在「探测命中现有快照」时记录——新快照加载（或刷新失败）后
+// 的下一次请求照常探测，发布与刷新故障的发现延迟不因 TTL 而累积。
 type SnapshotCache struct {
 	src revisionSource
 
 	// current is the last fully parsed, verified snapshot. Written only
 	// after a complete successful ParseSnapshot.
 	current atomic.Pointer[Snapshot]
+
+	// lastProbe 是最近一次「探测命中 current」的时刻；仅在该快速路径上
+	// 写入（见类型注释）。
+	lastProbe atomic.Pointer[time.Time]
+
+	// Now 是可注入时钟（测试用）；nil 用真实时钟。
+	Now func() time.Time
 
 	// OnRefreshError is invoked on every refresh failure that is absorbed
 	// by serving the previous snapshot. Required — a silent absorb would
@@ -385,11 +401,24 @@ func NewSnapshotCache(src revisionSource, onRefreshError func(error)) *SnapshotC
 	return &SnapshotCache{src: src, OnRefreshError: onRefreshError}
 }
 
+func (c *SnapshotCache) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+	return time.Now()
+}
+
 // Current returns the verified active snapshot. Cold start with no
 // reachable/active revision returns an error — there is no verified
 // version to fall back to, and serving an empty catalog would be a
 // half-version in disguise.
 func (c *SnapshotCache) Current(ctx context.Context) (*Snapshot, error) {
+	// TTL 内直接复用已验证快照，省一次探测往返。
+	if old := c.current.Load(); old != nil {
+		if t := c.lastProbe.Load(); t != nil && c.now().Sub(*t) < headProbeTTL {
+			return old, nil
+		}
+	}
 	headID, _, err := c.src.ActiveRevisionHead(ctx, domain.ScopeCatalog)
 	if err != nil {
 		if old := c.current.Load(); old != nil {
@@ -399,6 +428,8 @@ func (c *SnapshotCache) Current(ctx context.Context) (*Snapshot, error) {
 		return nil, fmt.Errorf("%w: active revision unavailable: %v", ErrNoVerifiedSnapshot, err)
 	}
 	if old := c.current.Load(); old != nil && old.RevisionID == headID {
+		probeAt := c.now()
+		c.lastProbe.Store(&probeAt)
 		return old, nil
 	}
 	rev, err := c.src.ActiveRevision(ctx, domain.ScopeCatalog)

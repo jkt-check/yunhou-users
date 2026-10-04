@@ -90,6 +90,20 @@ func TestApplyPlanAmountOverride_MalformedJSON(t *testing.T) {
 	}
 }
 
+// TestOverridesActive_EmptyJSONObject — `{}` 是合法 JSON 但不是有效覆盖：
+// 空 map 等于没配置，OverridesActive 必须报 false，否则续费金额核对会
+// 落入 audit-only 旁路（三轮评审 M1）。
+func TestOverridesActive_EmptyJSONObject(t *testing.T) {
+	withOverrideEnv(t, `{}`)
+
+	if OverridesActive() {
+		t.Fatal("OverridesActive() = true with `{}`; want false (empty override is no override)")
+	}
+	if got := ApplyPlanAmountOverride("monthly", 19.9); got != 19.9 {
+		t.Errorf("ApplyPlanAmountOverride(monthly, 19.9) = %v; want 19.9", got)
+	}
+}
+
 // TestApplyPlanAmountOverride_PartialJSON — a JSON object with one
 // unparseable value (string instead of number) must follow the same
 // log-and-noop path. Operators who hand-craft the env shouldn't be able

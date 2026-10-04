@@ -3,6 +3,7 @@ package access
 import (
 	"context"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/domain"
@@ -109,9 +110,30 @@ type EntitlementStore interface {
 // EntitlementResolver implements domain.EntitlementResolver: it picks THE
 // ONE entitlement governing a call. It never stacks entitlements — no
 // merge rule is published in the first phase.
+//
+// 零时刻 at 的解析（热路径）走 1s TTL 的进程内缓存：项目所有者裁定 TTL
+// 一律 1s、不做主动失效，TTL 本身限制脏读窗口。显式非零 at（测试/对账）
+// 绕过缓存直查，语义不受 TTL 影响。
 type EntitlementResolver struct {
 	store EntitlementStore
 	clock domain.Clock
+
+	cacheMu     sync.RWMutex
+	cache       map[string]entCacheEntry // billingAccountID → 权益列表 + 缓存时刻
+	cacheWrites int                      // 写入计数，驱动定期清扫
+}
+
+// entitlementCacheTTL 是权益列表缓存 TTL（见类型注释的所有者裁定）。
+const entitlementCacheTTL = time.Second
+
+// entitlementCacheSweepEvery 控制缓存清扫节奏：每 N 次写入清掉超过
+// 2×TTL 未命中的条目，防止缓存随账户数无界增长（账户是长期实体，TTL
+// 只约束脏读不约束内存）。确定性计数而非概率清扫，行为可测。
+const entitlementCacheSweepEvery = 64
+
+type entCacheEntry struct {
+	ents     []domain.Entitlement
+	cachedAt time.Time
 }
 
 // NewEntitlementResolver builds the resolver; a nil clock uses the system
@@ -120,7 +142,7 @@ func NewEntitlementResolver(store EntitlementStore, clock domain.Clock) *Entitle
 	if clock == nil {
 		clock = domain.SystemClock{}
 	}
-	return &EntitlementResolver{store: store, clock: clock}
+	return &EntitlementResolver{store: store, clock: clock, cache: map[string]entCacheEntry{}}
 }
 
 // Resolve implements domain.EntitlementResolver. A zero `at` reads the
@@ -131,12 +153,49 @@ func (r *EntitlementResolver) Resolve(ctx context.Context, billingAccountID, mod
 	}
 	if at.IsZero() {
 		at = r.clock.Now()
+		ents, err := r.listActiveCached(ctx, billingAccountID, at)
+		if err != nil {
+			return nil, err
+		}
+		return SelectEntitlement(ents, modelID, at)
 	}
+	// 非零 at 的请求绕过缓存直接查库（保证测试/对账语义）。
 	ents, err := r.store.ListActiveEntitlements(ctx, billingAccountID, at)
 	if err != nil {
 		return nil, err
 	}
 	return SelectEntitlement(ents, modelID, at)
+}
+
+// listActiveCached 返回账户的活跃权益列表，TTL 内命中进程内缓存，过期
+// 重查并刷新缓存。错误不缓存。双重检查避免并发过期时同一账户的重复查库。
+func (r *EntitlementResolver) listActiveCached(ctx context.Context, billingAccountID string, at time.Time) ([]domain.Entitlement, error) {
+	now := r.clock.Now()
+	r.cacheMu.RLock()
+	e, ok := r.cache[billingAccountID]
+	r.cacheMu.RUnlock()
+	if ok && now.Sub(e.cachedAt) < entitlementCacheTTL {
+		return e.ents, nil
+	}
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if e, ok := r.cache[billingAccountID]; ok && now.Sub(e.cachedAt) < entitlementCacheTTL {
+		return e.ents, nil
+	}
+	ents, err := r.store.ListActiveEntitlements(ctx, billingAccountID, at)
+	if err != nil {
+		return nil, err
+	}
+	r.cache[billingAccountID] = entCacheEntry{ents: ents, cachedAt: now}
+	r.cacheWrites++
+	if r.cacheWrites%entitlementCacheSweepEvery == 0 {
+		for id, e := range r.cache {
+			if now.Sub(e.cachedAt) > 2*entitlementCacheTTL {
+				delete(r.cache, id)
+			}
+		}
+	}
+	return ents, nil
 }
 
 // SelectEntitlement is the pure selection rule:

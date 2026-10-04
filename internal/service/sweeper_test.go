@@ -54,6 +54,9 @@ func (m *mockOrderRepo) CreateInTx(_ context.Context, _ *sqlx.Tx, _ *model.Order
 func (m *mockOrderRepo) FindPendingByUserAndProduct(_ context.Context, _, _ string) (*model.Order, error) {
 	return nil, errors.New("not used")
 }
+func (m *mockOrderRepo) FindPendingByUserAndProductTx(_ context.Context, _ *sqlx.Tx, _, _ string) (*model.Order, error) {
+	return nil, errors.New("not used")
+}
 func (m *mockOrderRepo) FailPending(_ context.Context, _ string) (bool, error) {
 	return false, errors.New("not used")
 }

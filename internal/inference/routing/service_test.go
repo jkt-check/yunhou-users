@@ -351,3 +351,60 @@ func TestCandidates_StoreErrorPropagates(t *testing.T) {
 		t.Fatal("store error must propagate (fail closed)")
 	}
 }
+
+// statusRecheckFakeStore 给 fakeStore 加上可选的派发时事务内状态复查接口
+// （accountActiveRecheckTx），statuses 缺省（无行）按 CodeNotFound 处理。
+type statusRecheckFakeStore struct {
+	*fakeStore
+	statuses map[string]domain.UpstreamAccountStatus
+}
+
+func (s *statusRecheckFakeStore) GetUpstreamAccountStatusForUpdateTx(_ context.Context, _ domain.UnitOfWork, id string) (domain.UpstreamAccountStatus, error) {
+	st, ok := s.statuses[id]
+	if !ok {
+		return "", domain.NewError(domain.CodeNotFound, "not found")
+	}
+	return st, nil
+}
+
+// TestAcquireUpstreamLease_DispatchStatusRecheck: 派发时事务内复查
+// status='active'（pr-ci 第三轮 FullLifecycleE2E：候选来自 1s TTL 缓存，
+// 选型之后账号被管理面停用必须拦在派发前）。非 active / 行不存在 →
+// ErrAccountInactiveAtDispatch（gateway 据此 failover 且不冷却）；active →
+// 照常签发租约。
+func TestAcquireUpstreamLease_DispatchStatusRecheck(t *testing.T) {
+	fs := &statusRecheckFakeStore{fakeStore: newFakeStore(), statuses: map[string]domain.UpstreamAccountStatus{
+		"a-disabled": domain.AccountDisabled,
+		"a-active":   domain.AccountActive,
+	}}
+	svc := NewService(fs, nil, nil)
+	ctx := context.Background()
+	now := time.Now()
+
+	_, err := svc.AcquireUpstreamLease(ctx, nil, account("a-disabled", "prov", 1), "r1", now)
+	if !errors.Is(err, ErrAccountInactiveAtDispatch) {
+		t.Fatalf("disabled account: err = %v, want ErrAccountInactiveAtDispatch", err)
+	}
+	_, err = svc.AcquireUpstreamLease(ctx, nil, account("a-gone", "prov", 1), "r2", now)
+	if !errors.Is(err, ErrAccountInactiveAtDispatch) {
+		t.Fatalf("missing account: err = %v, want ErrAccountInactiveAtDispatch", err)
+	}
+	lease, err := svc.AcquireUpstreamLease(ctx, nil, account("a-active", "prov", 1), "r3", now)
+	if err != nil {
+		t.Fatalf("active account: %v", err)
+	}
+	if lease == nil || lease.ScopeID != "a-active" {
+		t.Fatalf("lease = %+v, want scope a-active", lease)
+	}
+}
+
+// TestAcquireUpstreamLease_RecheckOptional: store 不实现复查接口（窄 fake）
+// 时签发行为与之前一致（可选升级惯例，同 quotaStore）。
+func TestAcquireUpstreamLease_RecheckOptional(t *testing.T) {
+	svc := NewService(newFakeStore(), nil, nil)
+	lease, err := svc.AcquireUpstreamLease(context.Background(), nil,
+		account("a1", "prov", 1), "r1", time.Now())
+	if err != nil || lease == nil {
+		t.Fatalf("AcquireUpstreamLease without recheck support = %v/%+v", err, lease)
+	}
+}

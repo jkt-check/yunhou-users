@@ -988,6 +988,151 @@ func TestParseDurationOr(t *testing.T) {
 // with a production signal (APP_ENV=prod — the primary signal, independent
 // of PayPal; PAYPAL_ENV=live; or fully-populated real credentials) must
 // refuse to start.
+func TestValidate_DatabaseURLSSLModeProductionGuard(t *testing.T) {
+	t.Parallel()
+	base := func() *Config {
+		return &Config{
+			RSAPrivate:             "priv",
+			RSAPublic:              "pub",
+			JWTAccessTTL:           15 * time.Minute,
+			JWTRefreshTTL:          168 * time.Hour,
+			OrderExpiryDuration:    30 * time.Minute,
+			SweeperInterval:        1 * time.Minute,
+			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace: 15 * time.Minute,
+			AppEnv:                 "prod",
+		}
+	}
+
+	t.Run("remote host + sslmode=disable → rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.DatabaseURL = "postgres://user:pass@db.internal:5432/yunhou?sslmode=disable"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "sslmode=disable") {
+			t.Errorf("want sslmode=disable rejection, got: %v", err)
+		}
+	})
+
+	t.Run("remote host + sslmode=require → ok", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.DatabaseURL = "postgres://user:pass@db.internal:5432/yunhou?sslmode=require"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("remote TLS DSN should validate, got: %v", err)
+		}
+	})
+
+	t.Run("loopback + sslmode=disable → ok (本机 PG / 本机隧道豁免)", func(t *testing.T) {
+		t.Parallel()
+		for _, dsn := range []string{
+			"postgres://localhost/yunhou_users?sslmode=disable",
+			"postgres://user:pass@127.0.0.1:5432/yunhou?sslmode=disable",
+			"postgres://user:pass@[::1]:5432/yunhou?sslmode=disable",
+		} {
+			cfg := base()
+			cfg.DatabaseURL = dsn
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("loopback DSN %q should validate, got: %v", dsn, err)
+			}
+		}
+	})
+
+	t.Run("compose 服务名（单标签）+ sslmode=disable → ok (docker 单机内网豁免)", func(t *testing.T) {
+		t.Parallel()
+		// cn-prod / intl-prod 的实际形态：host 是 compose 服务名 postgres，
+		// PG 容器默认 ssl=off。单标签名只能经 docker 内嵌 DNS 解析到同机
+		// 容器，与 loopback 同等信任面。
+		for _, dsn := range []string{
+			"postgres://user:pass@postgres:5432/yunhou_users?sslmode=disable",
+			"postgres://user:pass@db/yunhou_users?sslmode=disable",
+		} {
+			cfg := base()
+			cfg.DatabaseURL = dsn
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("compose service-name DSN %q should validate, got: %v", dsn, err)
+			}
+		}
+	})
+
+	t.Run("私有网段 IP + sslmode=disable → rejected (可能是跨机 LAN DB)", func(t *testing.T) {
+		t.Parallel()
+		for _, dsn := range []string{
+			"postgres://user:pass@10.0.0.5:5432/yunhou?sslmode=disable",
+			"postgres://user:pass@172.18.0.2:5432/yunhou?sslmode=disable",
+			"postgres://user:pass@192.168.1.10:5432/yunhou?sslmode=disable",
+		} {
+			cfg := base()
+			cfg.DatabaseURL = dsn
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "sslmode=disable") {
+				t.Errorf("private-IP DSN %q: want sslmode=disable rejection, got: %v", dsn, err)
+			}
+		}
+	})
+
+	t.Run("非 URL 形式 DSN 同样受守卫约束", func(t *testing.T) {
+		t.Parallel()
+		rejected := []string{
+			// keyword 形式 + 远端多标签域名
+			"host=db.internal port=5432 dbname=yunhou sslmode=disable user=u password=p",
+			// keyword 形式 + 带空格引号值（password='a b' 不得让守卫漏判）
+			"host=db.internal dbname=yunhou sslmode=disable user=u password='a b'",
+			// keyword 形式 + 私有网段 IP
+			"host=10.0.0.5 dbname=yunhou sslmode=disable",
+			// host 进 query 的 URL 变体 + 远端域名
+			"postgres:///yunhou?host=db.internal&sslmode=disable",
+		}
+		for _, dsn := range rejected {
+			cfg := base()
+			cfg.DatabaseURL = dsn
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "sslmode=disable") {
+				t.Errorf("DSN %q: want sslmode=disable rejection, got: %v", dsn, err)
+			}
+		}
+		allowed := []string{
+			// keyword 形式 + compose 服务名（单标签）
+			"host=postgres dbname=yunhou sslmode=disable user=u",
+			// keyword 形式 + 带空格引号值 + compose 服务名
+			"host=postgres dbname=yunhou sslmode=disable password='a b'",
+			// keyword 形式 + loopback
+			"host=127.0.0.1 dbname=yunhou sslmode=disable",
+			// keyword 形式 + unix socket 路径
+			"host=/var/run/postgresql dbname=yunhou sslmode=disable",
+			// host 进 query + compose 服务名
+			"postgres:///yunhou?host=postgres&sslmode=disable",
+		}
+		for _, dsn := range allowed {
+			cfg := base()
+			cfg.DatabaseURL = dsn
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("DSN %q should validate, got: %v", dsn, err)
+			}
+		}
+	})
+
+	t.Run("staging + remote sslmode=disable → ok (非生产跳过守卫)", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.AppEnv = "staging"
+		cfg.DatabaseURL = "postgres://user:pass@db.internal:5432/yunhou?sslmode=disable"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("staging remote DSN should validate, got: %v", err)
+		}
+	})
+
+	t.Run("non-production env + remote sslmode=disable → ok (dev 不拦)", func(t *testing.T) {
+		t.Parallel()
+		cfg := base()
+		cfg.AppEnv = "dev"
+		cfg.DatabaseURL = "postgres://user:pass@db.internal:5432/yunhou?sslmode=disable"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("dev remote DSN should validate, got: %v", err)
+		}
+	})
+}
+
 func TestValidate_MockModeProductionGuards(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {

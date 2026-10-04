@@ -33,7 +33,7 @@ func stickyFixture(t *testing.T) (*fixture, []routing.Candidate) {
 func TestPinSessionCandidates_NotConfigured(t *testing.T) {
 	f, cands := stickyFixture(t)
 	// 未 SetSessionBinder → 显式内部错误（不静默换号也不 panic）。
-	_, err := f.gateway.pinSessionCandidates(context.Background(), "sess-x", f.modelID, cands)
+	_, err := f.gateway.pinSessionCandidates(context.Background(), "sess-x", f.modelID, cands, nil)
 	if err == nil || domain.CodeOf(err) != domain.CodeInternal {
 		t.Fatalf("err = %v, want internal (sticky not configured)", err)
 	}
@@ -45,7 +45,7 @@ func TestPinSessionCandidates_BindResolveMigrate(t *testing.T) {
 	f.gateway.SetSessionBinder(routing.NewSessionBinder(f.store, nil))
 
 	// 首轮：无绑定 → 绑定到首选账号并钉住。
-	pinned, err := f.gateway.pinSessionCandidates(ctx, "sess-1", f.modelID, cands)
+	pinned, err := f.gateway.pinSessionCandidates(ctx, "sess-1", f.modelID, cands, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,13 +59,13 @@ func TestPinSessionCandidates_BindResolveMigrate(t *testing.T) {
 	}
 
 	// 次轮：已有绑定 → 直接钉住（不重复绑定）。
-	pinned, err = f.gateway.pinSessionCandidates(ctx, "sess-1", f.modelID, cands)
+	pinned, err = f.gateway.pinSessionCandidates(ctx, "sess-1", f.modelID, cands, nil)
 	if err != nil || len(pinned) != 1 {
 		t.Fatalf("re-pin = %+v/%v", pinned, err)
 	}
 
 	// 会话不同 → 独立绑定（失效前完成，避免候选全失真的路径混合）。
-	pinned2, err := f.gateway.pinSessionCandidates(ctx, "sess-2", f.modelID, cands)
+	pinned2, err := f.gateway.pinSessionCandidates(ctx, "sess-2", f.modelID, cands, nil)
 	if err != nil || len(pinned2) != 1 {
 		t.Fatalf("second session pin = %+v/%v", pinned2, err)
 	}
@@ -76,7 +76,7 @@ func TestPinSessionCandidates_BindResolveMigrate(t *testing.T) {
 		[]domain.UpstreamAccountStatus{domain.AccountActive}, domain.AccountDisabled); err != nil {
 		t.Fatal(err)
 	}
-	pinned, err = f.gateway.pinSessionCandidates(ctx, "sess-1", f.modelID, cands)
+	pinned, err = f.gateway.pinSessionCandidates(ctx, "sess-1", f.modelID, cands, nil)
 	if err == nil && len(pinned) == 1 && pinned[0].Account.ID == f.accountUpID {
 		t.Fatal("disabled bound account must not keep serving silently")
 	}

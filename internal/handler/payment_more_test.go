@@ -272,19 +272,22 @@ func TestPaymentHandler_CreateRefund_BadJSON(t *testing.T) {
 	}
 }
 
+// TestPaymentHandler_CreateRefund_MissingAuth:无 app 上下文(未过
+// InternalAppAuth)一律 403——JWT 回退已删除(审计 2026-10 防御纵深),
+// 不再返回旧的 401。
 func TestPaymentHandler_CreateRefund_MissingAuth(t *testing.T) {
-	g := paymentTestEngine(&mockPaymentSvc{}, "")
+	g := paymentRefundEngineNoApp(&mockPaymentSvc{}, "")
 	w := doPayRequest(g, http.MethodPost, "/refunds",
-		`{"payment_id":"p-1","amount":1.0}`)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status=%d, want 401", w.Code)
+		`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1.0}`)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status=%d, want 403", w.Code)
 	}
 }
 
 func TestPaymentHandler_CreateRefund_MissingIdemKey(t *testing.T) {
 	g := paymentTestEngine(&mockPaymentSvc{}, "u-1")
 	w := doPayRequest(g, http.MethodPost, "/refunds",
-		`{"payment_id":"p-1","amount":1.0}`)
+		`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1.0}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status=%d, want 400", w.Code)
 	}
@@ -293,7 +296,7 @@ func TestPaymentHandler_CreateRefund_MissingIdemKey(t *testing.T) {
 func TestPaymentHandler_CreateRefund_ShortIdemKey(t *testing.T) {
 	g := paymentTestEngine(&mockPaymentSvc{}, "u-1")
 	w := doPayRequestWithHeaders(g, http.MethodPost, "/refunds",
-		`{"payment_id":"p-1","amount":1.0}`, map[string]string{
+		`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1.0}`, map[string]string{
 			"Authorization":   "Bearer x",
 			"Idempotency-Key": "short",
 		})
@@ -305,7 +308,7 @@ func TestPaymentHandler_CreateRefund_ShortIdemKey(t *testing.T) {
 func TestPaymentHandler_CreateRefund_BadIdemKeyChars(t *testing.T) {
 	g := paymentTestEngine(&mockPaymentSvc{}, "u-1")
 	w := doPayRequestWithHeaders(g, http.MethodPost, "/refunds",
-		`{"payment_id":"p-1","amount":1.0}`, map[string]string{
+		`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1.0}`, map[string]string{
 			"Authorization":   "Bearer x",
 			"Idempotency-Key": "valid-length-but-bad!chars",
 		})
@@ -341,7 +344,7 @@ func TestPaymentHandler_CreateRefund_AllErrorTypes(t *testing.T) {
 			svc := &mockPaymentSvc{refundErr: c.err}
 			g := paymentTestEngine(svc, "u-1")
 			w := doPayRequestWithHeaders(g, http.MethodPost, "/refunds",
-				`{"payment_id":"p-1","amount":1.0}`, map[string]string{
+				`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1.0}`, map[string]string{
 					"Authorization":   "Bearer x",
 					"Idempotency-Key": "valid-length-key-1",
 				})

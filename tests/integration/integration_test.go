@@ -1067,7 +1067,9 @@ func TestRefundFlow(t *testing.T) {
 		t.Fatalf("read paid payment: %v", err)
 	}
 
-	// Refund with an idempotency key.
+	// Refund with an idempotency key. POST /refunds 已收紧为 InternalAppAuth
+	// （安全审计 2026-10：资金出账操作不对用户 JWT 开放），用 setupDB 播种的
+	// yundian 应用凭证认证。
 	body, _ := json.Marshal(map[string]interface{}{"payment_id": paymentID, "amount": 19.9})
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/refunds", bytes.NewReader(body))
 	if err != nil {
@@ -1075,7 +1077,8 @@ func TestRefundFlow(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "integration-refund-"+orderID)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-App-ID", "yundian")
+	req.Header.Set("X-App-Secret", integrationAppSecret)
 	refundResp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("fire refund: %v", err)

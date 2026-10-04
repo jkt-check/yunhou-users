@@ -30,6 +30,10 @@ import (
 // reduces an account's DB state.
 const cooldownAfterRetryable = 60 * time.Second
 
+// accountsCacheTTL 是 upstream 账号列表缓存 TTL：项目所有者裁定一律 1s、
+// 不做主动失效，TTL 本身限制脏读窗口。
+const accountsCacheTTL = time.Second
+
 // AccountStore is the persistence surface routing needs; satisfied by
 // inference/postgres.Store.
 type AccountStore interface {
@@ -81,6 +85,16 @@ type Service struct {
 	mu     sync.Mutex
 	cooled map[string]time.Time // accountID → skip until
 	rr     map[string]int       // providerID → round-robin cursor
+
+	// 账号池缓存：热路径上每请求/每条候选 route 一次的
+	// ListActiveUpstreamAccounts 往返降为每 provider 每秒最多一次。
+	acctMu    sync.RWMutex
+	acctCache map[string]cachedAccounts // providerID → 账号列表 + 缓存时刻
+}
+
+type cachedAccounts struct {
+	accounts []domain.UpstreamAccount
+	cachedAt time.Time
 }
 
 // NewService builds the routing service over the account store. A nil clock
@@ -95,6 +109,7 @@ func NewService(store AccountStore, adapters map[domain.Protocol]providers.Adapt
 		LeaseTTL:   10 * time.Minute,
 		cooled:     map[string]time.Time{},
 		rr:         map[string]int{},
+		acctCache:  map[string]cachedAccounts{},
 	}
 }
 
@@ -117,8 +132,27 @@ func (s *Service) AdapterFor(p domain.Protocol) (providers.Adapter, bool) {
 // An empty result means upstream_unavailable — never silently route to an
 // incompatible deployment.
 func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelID string, needs Needs) ([]Candidate, error) {
+	out, consulted, err := s.candidates(ctx, snap, modelID, needs, false)
+	if err != nil || len(out) > 0 || len(consulted) == 0 {
+		return out, err
+	}
+	// 空候选可能建立在 1s TTL 账号缓存的过期额度/状态快照上（额度刚
+	// reset、账号刚被恢复——绕过应用层的变更没有失效钩子）。「容量耗尽」
+	// 的判定不该用陈旧快照：驱逐相关 provider 的缓存、绕过重查一次，
+	// 仍为空才判定 upstream_unavailable。
+	for providerID := range consulted {
+		s.InvalidateAccounts(providerID)
+	}
+	out, _, err = s.candidates(ctx, snap, modelID, needs, true)
+	return out, err
+}
+
+// candidates 是 Candidates 的实体；bypassCache=true 时账号池跳过缓存直查
+// 并回写新鲜结果。consulted 记录走到账号池查询的 provider（其余空结果是
+// 路由/部署/能力层面的结构性为空，重查无意义）。
+func (s *Service) candidates(ctx context.Context, snap *catalog.Snapshot, modelID string, needs Needs, bypassCache bool) (out []Candidate, consulted map[string]struct{}, err error) {
 	now := s.clock.Now()
-	var out []Candidate
+	consulted = map[string]struct{}{}
 	for _, route := range snap.RoutesByModel[modelID] {
 		if !route.Enabled || !routeCovers(route, needs) {
 			continue
@@ -135,15 +169,55 @@ func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 		if (needs.Tools && !caps.Tools) || (needs.Reasoning && !caps.Reasoning) {
 			continue
 		}
-		accounts, err := s.store.ListActiveUpstreamAccounts(ctx, d.ProviderID)
-		if err != nil {
-			return nil, err
+		consulted[d.ProviderID] = struct{}{}
+		accounts, aerr := s.activeAccounts(ctx, d.ProviderID, bypassCache)
+		if aerr != nil {
+			return nil, nil, aerr
 		}
 		for _, a := range s.orderAccountsWithQuota(d.ProviderID, accounts, now) {
 			out = append(out, Candidate{Route: route, Deployment: d, Account: a})
 		}
 	}
-	return out, nil
+	return out, consulted, nil
+}
+
+// InvalidateAccounts 驱逐某 provider 的账号池缓存。供两类路径使用：
+// Candidates 空结果重查（见上），以及 gateway 会话迁移冲突时发现缓存
+// 候选里的账号在库里已失效（绕过应用层的变更没有失效钩子）。
+func (s *Service) InvalidateAccounts(providerID string) {
+	s.acctMu.Lock()
+	delete(s.acctCache, providerID)
+	s.acctMu.Unlock()
+}
+
+// activeAccounts 返回某 provider 的活跃账号池，带 1s TTL 进程内缓存。
+// 错误不缓存；双重检查避免并发过期时同一 provider 的重复查库。fresh=true
+// 跳过缓存读直查库并回写（用于空候选重查/迁移冲突后的刷新）。返回的
+// 切片在 TTL 内被多请求共享——orderAccounts/配额过滤都只读它（各自构建
+// 新切片），调用方不得原地修改。
+func (s *Service) activeAccounts(ctx context.Context, providerID string, fresh bool) ([]domain.UpstreamAccount, error) {
+	now := s.clock.Now()
+	if !fresh {
+		s.acctMu.RLock()
+		e, ok := s.acctCache[providerID]
+		s.acctMu.RUnlock()
+		if ok && now.Sub(e.cachedAt) < accountsCacheTTL {
+			return e.accounts, nil
+		}
+	}
+	s.acctMu.Lock()
+	defer s.acctMu.Unlock()
+	if !fresh {
+		if e, ok := s.acctCache[providerID]; ok && now.Sub(e.cachedAt) < accountsCacheTTL {
+			return e.accounts, nil
+		}
+	}
+	accounts, err := s.store.ListActiveUpstreamAccounts(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+	s.acctCache[providerID] = cachedAccounts{accounts: accounts, cachedAt: now}
+	return accounts, nil
 }
 
 // routeCovers reports whether a route's capability list covers the call's
@@ -213,6 +287,20 @@ func (s *Service) CooldownAfterFailure(accountID string) {
 // AcquireUpstreamLease takes the per-account concurrency lease inside the
 // caller's transaction (the gateway persists the attempt row in the same
 // tx, so lease and attempt intent commit or roll back together).
+// ErrAccountInactiveAtDispatch 是派发时事务内复查（AcquireUpstreamLease）
+// 发现账号已非 active 的哨兵错误：候选来自 1s TTL 账号池缓存，管理面停用
+// /凭据吊销级联可能落在选型之后（pr-ci 第三轮 FullLifecycleE2E）。gateway
+// 据此换下一个候选且不喂 60s 冷却（状态问题，非上游瞬时故障）。
+var ErrAccountInactiveAtDispatch = domain.NewError(domain.CodeConflict,
+	"upstream account not active at dispatch")
+
+// accountActiveRecheckTx 是 store 的可选升级：派发事务内 FOR UPDATE 复查
+// 账号状态。postgres.Store 实现；窄 fake 不实现则跳过复查（与 quotaStore /
+// credentialLockTx 同一惯例）。
+type accountActiveRecheckTx interface {
+	GetUpstreamAccountStatusForUpdateTx(ctx context.Context, w domain.UnitOfWork, id string) (domain.UpstreamAccountStatus, error)
+}
+
 func (s *Service) AcquireUpstreamLease(ctx context.Context, w domain.UnitOfWork, account domain.UpstreamAccount, requestID string, now time.Time) (*domain.ConcurrencyLease, error) {
 	limit := account.ConcurrencyLimit
 	if limit <= 0 {
@@ -221,6 +309,21 @@ func (s *Service) AcquireUpstreamLease(ctx context.Context, w domain.UnitOfWork,
 		// 0 —— 按容量耗尽处理让调用方换下一个候选，绝不静默当 1 放行。
 		return nil, domain.NewError(domain.CodeInsufficientCapacity,
 			"upstream account parked (concurrency_limit 0)")
+	}
+	// 派发时事务内复查 status='active'：FOR SHARE 行锁与并发的管理面
+	// 停用事务互斥，读取定序在两者之一之后。复查失败返回哨兵，调用方
+	// failover 且不冷却。
+	if rc, ok := s.store.(accountActiveRecheckTx); ok {
+		status, err := rc.GetUpstreamAccountStatusForUpdateTx(ctx, w, account.ID)
+		if err != nil {
+			if domain.CodeOf(err) == domain.CodeNotFound {
+				return nil, ErrAccountInactiveAtDispatch
+			}
+			return nil, domain.WrapError(domain.CodeInternal, "lease: account status recheck", err)
+		}
+		if status != domain.AccountActive {
+			return nil, ErrAccountInactiveAtDispatch
+		}
 	}
 	return s.store.AcquireLeaseTx(ctx, w, domain.AcquireLeaseCommand{
 		Scope:      domain.LeaseScopeUpstreamAccount,

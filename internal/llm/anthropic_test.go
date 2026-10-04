@@ -174,7 +174,7 @@ func TestBuildOpenAIPayload_AcceptsShapesAnthropicRejects(t *testing.T) {
 		{{Role: "system", Content: "be brief"}},
 		{{Role: "assistant", Content: "hello"}, {Role: "user", Content: "hi"}},
 	} {
-		if _, err := BuildOpenAIPayload("m", 8192, messages, nil, nil); err != nil {
+		if _, err := BuildOpenAIPayload("m", messages, nil, nil); err != nil {
 			t.Errorf("BuildOpenAIPayload(%v): %v, want success (OpenAI-protocol behavior unchanged)", messages, err)
 		}
 	}

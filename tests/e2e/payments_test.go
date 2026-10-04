@@ -202,10 +202,12 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 
 	paymentID := payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_refund_"+orderID)
 
-	// First refund.
+	// First refund. POST /refunds 已收紧为 InternalAppAuth（安全审计
+	// 2026-10：资金出账操作不对用户 JWT 开放）。
+	refundHeaders := appAuthHeaders(superAppID)
+	refundHeaders["Idempotency-Key"] = "idem-refund-1"
 	refund1 := fmt.Sprintf(`{"payment_id":%q,"amount":5.0,"reason":"first call"}`, paymentID)
-	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1,
-		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "idem-refund-1"})
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1, refundHeaders)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first refund: %d %s", resp.StatusCode, string(resp.Body))
 	}
@@ -217,8 +219,7 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 	resp.JSON(t, &rr1)
 
 	// Second refund with the SAME Idempotency-Key → must return the SAME id.
-	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1,
-		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "idem-refund-1"})
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1, refundHeaders)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("second refund: %d %s", resp.StatusCode, string(resp.Body))
 	}
@@ -248,11 +249,12 @@ func TestPayments_RefundIdempotency(t *testing.T) {
 func TestPayments_RefundMissingIdempotencyKey(t *testing.T) {
 
 	srv := setupE2EServerWithVerifier(t)
-	token := loginAndGetTokens(t, srv.Engine, "refund-noidem", "yundian").AccessToken
 
+	// 缺 Idempotency-Key → 400（handler 校验）。POST /refunds 走
+	// InternalAppAuth，不再使用用户 JWT。
 	resp := doRequest(t, srv.Engine, http.MethodPost, "/refunds",
 		`{"payment_id":"00000000-0000-0000-0000-000000000000","amount":5.0}`,
-		authHeader(token))
+		appAuthHeaders(superAppID))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", resp.StatusCode)
 	}
@@ -279,18 +281,20 @@ func TestPayments_RefundSumInvariant(t *testing.T) {
 
 	paymentID := payOrderViaStripeWebhook(t, srv, orderID, "pi_e2e_sum_"+orderID)
 
-	// First refund of 10 — OK (< payment 19.90).
+	// First refund of 10 — OK (< payment 19.90). POST /refunds 走
+	// InternalAppAuth（安全审计 2026-10）。
+	refundHeaders := appAuthHeaders(superAppID)
+	refundHeaders["Idempotency-Key"] = "sum-1-key-1"
 	refund1 := fmt.Sprintf(`{"payment_id":%q,"amount":10.0}`, paymentID)
-	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1,
-		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-1-key-1"})
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund1, refundHeaders)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first refund: %d %s", resp.StatusCode, string(resp.Body))
 	}
 
 	// Second refund of 12 — would push total to 22, exceeding 19.90. Must fail.
+	refundHeaders["Idempotency-Key"] = "sum-2-key-2"
 	refund2 := fmt.Sprintf(`{"payment_id":%q,"amount":12.0}`, paymentID)
-	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund2,
-		map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "sum-2-key-2"})
+	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund2, refundHeaders)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400 (sum invariant), got %d — body: %s", resp.StatusCode, string(resp.Body))
 	}
@@ -326,12 +330,15 @@ func TestPayments_OwnershipIsolation(t *testing.T) {
 		t.Errorf("expected 404 for cross-owner read, got %d", resp.StatusCode)
 	}
 
-	// B tries to refund A's payment → 404.
+	// B tries to refund A's payment → 401: POST /refunds 已收紧为
+	// InternalAppAuth（安全审计 2026-10），用户 JWT 连路由都进不来，
+	// 跨 owner 退款场景在 HTTP 层不复存在（internal app 路径跳过
+	// ownership 校验，由调用方内部系统负责鉴权边界）。
 	refundBody := fmt.Sprintf(`{"payment_id":%q,"amount":1.0}`, paymentID)
 	resp = doRequest(t, srv.Engine, http.MethodPost, "/refunds", refundBody,
 		map[string]string{"Authorization": "Bearer " + tokenB, "Idempotency-Key": "cross-owner"})
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("expected 404 for cross-owner refund, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 for user-JWT refund (internal apps only), got %d", resp.StatusCode)
 	}
 }
 
@@ -489,11 +496,10 @@ func TestPayments_ConcurrentRefundRace(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func(idx int) {
 			refund := fmt.Sprintf(`{"payment_id":%q,"amount":%v}`, paymentID, refundAmt)
-			r := doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund,
-				map[string]string{
-					"Authorization":   "Bearer " + token,
-					"Idempotency-Key": fmt.Sprintf("race-%d-%s", idx, orderID),
-				})
+			// POST /refunds 走 InternalAppAuth（安全审计 2026-10）。
+			headers := appAuthHeaders(superAppID)
+			headers["Idempotency-Key"] = fmt.Sprintf("race-%d-%s", idx, orderID)
+			r := doRequest(t, srv.Engine, http.MethodPost, "/refunds", refund, headers)
 			results <- r.StatusCode
 		}(i)
 	}

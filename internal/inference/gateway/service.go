@@ -428,7 +428,19 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	// Sticky session: narrow the candidate set to the bound account (Task
 	// 13). Failures here release the reservation — no upstream spend.
 	if sessionKey != "" {
-		cands, err = s.pinSessionCandidates(ctx, sessionKey, m.ID, cands)
+		// 迁移冲突时候选集可能来自 routing 的 1s TTL 账号缓存（过期快照里
+		// 的账号在库里已失效）——驱逐相关 provider 缓存并绕过缓存重建一次。
+		refresh := func() ([]routing.Candidate, error) {
+			seen := map[string]struct{}{}
+			for _, c := range cands {
+				if _, ok := seen[c.Deployment.ProviderID]; !ok {
+					seen[c.Deployment.ProviderID] = struct{}{}
+					s.routingSvc.InvalidateAccounts(c.Deployment.ProviderID)
+				}
+			}
+			return s.routingSvc.Candidates(ctx, snap, m.ID, needs)
+		}
+		cands, err = s.pinSessionCandidates(ctx, sessionKey, m.ID, cands, refresh)
 		if err != nil {
 			s.releaseAdmission(requestID, adm.AccountLease)
 			return nil, err
@@ -505,10 +517,16 @@ func (s *Service) admitWallet(ctx context.Context, request domain.Request, ent d
 //     explicit Migrate to the first candidate (同事务终止旧绑定+建新), never
 //     a silent account switch. The protocol layer carries the full
 //     transcript, so the migration IS the protocol-level session rebuild.
-func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID string, cands []routing.Candidate) ([]routing.Candidate, error) {
+//
+// refreshCandidates 在迁移目标被库里判定不可调度（Migrate CodeConflict）时
+// 调用一次：候选集可能来自 routing 的 1s TTL 账号缓存（绕过应用层的账号
+// 状态变更没有失效钩子），拿着过期候选集空转只会耗尽重试并把真实原因
+// （陈旧候选）误报成 "session binding raced"。刷新后仍无解才报错。
+func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID string, cands []routing.Candidate, refreshCandidates func() ([]routing.Candidate, error)) ([]routing.Candidate, error) {
 	if s.sessions == nil {
 		return nil, domain.NewError(domain.CodeInternal, "gateway: sticky sessions not configured")
 	}
+	refreshed := false
 	for tries := 0; tries < 2; tries++ {
 		binding, _, err := s.sessions.Resolve(ctx, sessionKey, modelID)
 		switch {
@@ -530,7 +548,19 @@ func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID 
 		case domain.CodeOf(err) == domain.CodeConflict:
 			if _, merr := s.sessions.Migrate(ctx, sessionKey, modelID, cands[0].Account.ID); merr != nil {
 				if domain.CodeOf(merr) == domain.CodeConflict {
-					continue // concurrent migration — re-resolve
+					if !refreshed && refreshCandidates != nil {
+						refreshed = true
+						fresh, rerr := refreshCandidates()
+						if rerr != nil {
+							return nil, domain.WrapError(domain.CodeInternal, "gateway: refresh candidates", rerr)
+						}
+						if len(fresh) == 0 {
+							return nil, domain.NewError(domain.CodeUpstreamUnavailable,
+								"no compatible deployment with capacity for model "+modelID)
+						}
+						cands = fresh
+					}
+					continue // concurrent migration or stale candidates — re-resolve
 				}
 				return nil, domain.WrapError(domain.CodeInternal, "gateway: migrate session", merr)
 			}

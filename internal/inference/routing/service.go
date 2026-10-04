@@ -132,8 +132,27 @@ func (s *Service) AdapterFor(p domain.Protocol) (providers.Adapter, bool) {
 // An empty result means upstream_unavailable — never silently route to an
 // incompatible deployment.
 func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelID string, needs Needs) ([]Candidate, error) {
+	out, consulted, err := s.candidates(ctx, snap, modelID, needs, false)
+	if err != nil || len(out) > 0 || len(consulted) == 0 {
+		return out, err
+	}
+	// 空候选可能建立在 1s TTL 账号缓存的过期额度/状态快照上（额度刚
+	// reset、账号刚被恢复——绕过应用层的变更没有失效钩子）。「容量耗尽」
+	// 的判定不该用陈旧快照：驱逐相关 provider 的缓存、绕过重查一次，
+	// 仍为空才判定 upstream_unavailable。
+	for providerID := range consulted {
+		s.InvalidateAccounts(providerID)
+	}
+	out, _, err = s.candidates(ctx, snap, modelID, needs, true)
+	return out, err
+}
+
+// candidates 是 Candidates 的实体；bypassCache=true 时账号池跳过缓存直查
+// 并回写新鲜结果。consulted 记录走到账号池查询的 provider（其余空结果是
+// 路由/部署/能力层面的结构性为空，重查无意义）。
+func (s *Service) candidates(ctx context.Context, snap *catalog.Snapshot, modelID string, needs Needs, bypassCache bool) (out []Candidate, consulted map[string]struct{}, err error) {
 	now := s.clock.Now()
-	var out []Candidate
+	consulted = map[string]struct{}{}
 	for _, route := range snap.RoutesByModel[modelID] {
 		if !route.Enabled || !routeCovers(route, needs) {
 			continue
@@ -150,33 +169,48 @@ func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 		if (needs.Tools && !caps.Tools) || (needs.Reasoning && !caps.Reasoning) {
 			continue
 		}
-		accounts, err := s.activeAccounts(ctx, d.ProviderID)
-		if err != nil {
-			return nil, err
+		consulted[d.ProviderID] = struct{}{}
+		accounts, aerr := s.activeAccounts(ctx, d.ProviderID, bypassCache)
+		if aerr != nil {
+			return nil, nil, aerr
 		}
 		for _, a := range s.orderAccountsWithQuota(d.ProviderID, accounts, now) {
 			out = append(out, Candidate{Route: route, Deployment: d, Account: a})
 		}
 	}
-	return out, nil
+	return out, consulted, nil
+}
+
+// InvalidateAccounts 驱逐某 provider 的账号池缓存。供两类路径使用：
+// Candidates 空结果重查（见上），以及 gateway 会话迁移冲突时发现缓存
+// 候选里的账号在库里已失效（绕过应用层的变更没有失效钩子）。
+func (s *Service) InvalidateAccounts(providerID string) {
+	s.acctMu.Lock()
+	delete(s.acctCache, providerID)
+	s.acctMu.Unlock()
 }
 
 // activeAccounts 返回某 provider 的活跃账号池，带 1s TTL 进程内缓存。
-// 错误不缓存；双重检查避免并发过期时同一 provider 的重复查库。返回的
+// 错误不缓存；双重检查避免并发过期时同一 provider 的重复查库。fresh=true
+// 跳过缓存读直查库并回写（用于空候选重查/迁移冲突后的刷新）。返回的
 // 切片在 TTL 内被多请求共享——orderAccounts/配额过滤都只读它（各自构建
 // 新切片），调用方不得原地修改。
-func (s *Service) activeAccounts(ctx context.Context, providerID string) ([]domain.UpstreamAccount, error) {
+func (s *Service) activeAccounts(ctx context.Context, providerID string, fresh bool) ([]domain.UpstreamAccount, error) {
 	now := s.clock.Now()
-	s.acctMu.RLock()
-	e, ok := s.acctCache[providerID]
-	s.acctMu.RUnlock()
-	if ok && now.Sub(e.cachedAt) < accountsCacheTTL {
-		return e.accounts, nil
+	if !fresh {
+		s.acctMu.RLock()
+		e, ok := s.acctCache[providerID]
+		s.acctMu.RUnlock()
+		if ok && now.Sub(e.cachedAt) < accountsCacheTTL {
+			return e.accounts, nil
+		}
 	}
 	s.acctMu.Lock()
 	defer s.acctMu.Unlock()
-	if e, ok := s.acctCache[providerID]; ok && now.Sub(e.cachedAt) < accountsCacheTTL {
-		return e.accounts, nil
+	if !fresh {
+		if e, ok := s.acctCache[providerID]; ok && now.Sub(e.cachedAt) < accountsCacheTTL {
+			return e.accounts, nil
+		}
 	}
 	accounts, err := s.store.ListActiveUpstreamAccounts(ctx, providerID)
 	if err != nil {

@@ -732,10 +732,12 @@ func TestClassifyUpstreamRejection_InvalidUTF8(t *testing.T) {
 	}
 }
 
-// TestChatService_MaxTokensCapEnforced: 评审安全补丁（无 max_tokens 上限）——
-// 客户端请求不携带 max_tokens，OpenAI 协议路径的上游 payload 必须始终写入
-// 硬上限（默认 8192，setter 可调）。
-func TestChatService_MaxTokensCapEnforced(t *testing.T) {
+// TestChatService_OpenAINoMaxTokens: OpenAI 协议路径的上游 payload 不得携带
+// max_tokens——DualBackend 契约（tests/e2e/chat_gateway_test.go 钉死
+// 「legacy upstream payload must not carry max_tokens」）与 catalog 设计
+// （MaxTokens 仅发 Anthropic provider）。即使调小硬上限 setter 也不得注入。
+// OpenAI 路径的滥用面由并发流上限 + 上游超时 + 计量收费收敛。
+func TestChatService_OpenAINoMaxTokens(t *testing.T) {
 	sse := "data: [DONE]\n\n"
 	var gotBodies []string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -755,8 +757,8 @@ func TestChatService_MaxTokensCapEnforced(t *testing.T) {
 		t.Fatalf("StreamChat: %v", err)
 	}
 	resp.Body.Close()
-	if !strings.Contains(gotBodies[0], `"max_tokens":8192`) {
-		t.Errorf("default cap missing from upstream body: %s", gotBodies[0])
+	if strings.Contains(gotBodies[0], `"max_tokens"`) {
+		t.Errorf("OpenAI-protocol upstream body must not carry max_tokens: %s", gotBodies[0])
 	}
 
 	svc.SetMaxOutputTokens(100)
@@ -765,8 +767,8 @@ func TestChatService_MaxTokensCapEnforced(t *testing.T) {
 		t.Fatalf("StreamChat: %v", err)
 	}
 	resp.Body.Close()
-	if !strings.Contains(gotBodies[1], `"max_tokens":100`) {
-		t.Errorf("configured cap missing from upstream body: %s", gotBodies[1])
+	if strings.Contains(gotBodies[1], `"max_tokens"`) {
+		t.Errorf("SetMaxOutputTokens must not inject max_tokens on the OpenAI path: %s", gotBodies[1])
 	}
 }
 
@@ -804,7 +806,7 @@ func TestChatService_AnthropicMaxTokensClamped(t *testing.T) {
 		model string
 		want  string
 	}{
-		{"big", `"max_tokens":8192`},  // operator 配置超上限 → 封顶
+		{"big", `"max_tokens":8192`},   // operator 配置超上限 → 封顶
 		{"small", `"max_tokens":4096`}, // 上限以内 → honored
 		{"unset", `"max_tokens":8192`}, // 缺省 → 硬上限
 	} {

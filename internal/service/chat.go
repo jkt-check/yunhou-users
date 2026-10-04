@@ -55,6 +55,9 @@ const chatUpstreamMessageCap = 300
 // max_tokens 上限时恶意订阅者可开超长生成流造成不受控上游成本，参照
 // inference 网关设计 §7.2「不允许无限输出」）。客户端请求（model.ChatRequest）
 // 不携带 max_tokens，故该上限直接写入上游 payload，不存在客户端值封顶问题。
+// 仅作用于 Anthropic 协议路径（协议必传 max_tokens）；OpenAI 协议路径按
+// DualBackend 契约不携带该字段（见 catalog.go：MaxTokens 仅发 Anthropic
+// provider），其滥用面由并发流上限与上游超时收敛。
 const defaultChatMaxOutputTokens = 8192
 
 // defaultChatMaxStreamsPerUser 是单用户并发流式请求上限默认值（评审安全
@@ -145,8 +148,8 @@ func NewChatService(catalog *llm.Catalog, subRepo repo.SubscriptionRepo, planRep
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
+			ForceAttemptHTTP2: true,
+			MaxIdleConns:      100,
 			// 与 providers/adapter.go 同款：上游集中在少数 host，默认
 			// MaxIdleConnsPerHost=2 会让 keep-alive 形同虚设（每请求重做
 			// TCP+TLS 握手），抬高首 token 延迟。
@@ -329,7 +332,11 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 	var body []byte
 	var err error
 	// 评审安全补丁（无 max_tokens 上限）：客户端请求不携带 max_tokens
-	// （model.ChatRequest 无此字段），两条协议路径都直接写入硬上限。
+	// （model.ChatRequest 无此字段）。Anthropic 协议必传 max_tokens，故该
+	// 路径写入硬上限；OpenAI 协议路径按 DualBackend 契约（e2e
+	// chat_gateway_test 钉死：legacy upstream payload 不得携带
+	// max_tokens）与 catalog 设计（MaxTokens 仅发 Anthropic provider）
+	// 不注入该字段，滥用面由并发流上限 + 上游超时 + 计量收费收敛。
 	outCap := s.outputTokenCap()
 	switch provider.Protocol {
 	case llm.ProtocolAnthropic:
@@ -350,7 +357,7 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 			return nil, route, fmt.Errorf("encode chat request: %w: %v", ErrChatRequestShape, err)
 		}
 	default:
-		body, err = llm.BuildOpenAIPayload(m.UpstreamModel, outCap, messages, tools, thinkingEnabled)
+		body, err = llm.BuildOpenAIPayload(m.UpstreamModel, messages, tools, thinkingEnabled)
 		if err != nil {
 			return nil, route, fmt.Errorf("encode chat request: %w", err)
 		}

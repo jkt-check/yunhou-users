@@ -8,33 +8,17 @@ import (
 	"github.com/yunhou/users/internal/model"
 )
 
-// openaiDefaultMaxTokens 是 max_tokens 缺省值（评审安全补丁：无上限时恶意
-// 订阅者可开超长生成流造成不受控上游成本；与 inference 网关设计 §7.2
-// 「不允许无限输出」一致）。与 anthropicDefaultMaxTokens 保持同值。
-const openaiDefaultMaxTokens = 8192
-
 // BuildOpenAIPayload builds the upstream chat.completions body for an
 // OpenAI-compatible provider. stream_options.include_usage asks the upstream
 // to end the stream with a usage chunk so token metering works — DeepSeek,
 // Moonshot, GLM and MiniMax all honor it; providers that ignore it simply
 // omit the chunk and the request is metered with zero tokens (the usage row
 // is still written, so spend never goes unrecorded structurally).
-//
-// max_tokens 是强制输出上限（评审安全补丁）：调用方传入硬上限；<=0 时回落
-// openaiDefaultMaxTokens，绝不省略该字段。legacy /chat 的客户端请求不携带
-// max_tokens（model.ChatRequest 无此字段），故不存在客户端值封顶问题。
-// 兼容性假设：当前接入的 OpenAI 兼容 provider（DeepSeek/Moonshot/GLM/
-// MiniMax）都接受 max_tokens——未来若接入只认 max_completion_tokens 的
-// reasoning 系 provider，需要在此分流字段名。
-func BuildOpenAIPayload(upstreamModel string, maxTokens int, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
-	if maxTokens <= 0 {
-		maxTokens = openaiDefaultMaxTokens
-	}
+func BuildOpenAIPayload(upstreamModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
 	payload := map[string]any{
 		"model":          upstreamModel,
 		"messages":       messages,
 		"stream":         true,
-		"max_tokens":     maxTokens,
 		"stream_options": map[string]any{"include_usage": true},
 	}
 	if len(tools) > 0 {

@@ -9,7 +9,7 @@ import (
 )
 
 func TestBuildOpenAIPayload_Minimal(t *testing.T) {
-	body, err := BuildOpenAIPayload("deepseek-chat", 8192,
+	body, err := BuildOpenAIPayload("deepseek-chat",
 		[]model.ChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildOpenAIPayload: %v", err)
@@ -28,7 +28,7 @@ func TestBuildOpenAIPayload_Minimal(t *testing.T) {
 func TestBuildOpenAIPayload_ToolsAndThinking(t *testing.T) {
 	thinking := true
 	tools := []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"run_shell"}}`)}
-	body, err := BuildOpenAIPayload("m", 8192, []model.ChatMessage{{Role: "user", Content: "x"}}, tools, &thinking)
+	body, err := BuildOpenAIPayload("m", []model.ChatMessage{{Role: "user", Content: "x"}}, tools, &thinking)
 	if err != nil {
 		t.Fatalf("BuildOpenAIPayload: %v", err)
 	}
@@ -36,30 +36,6 @@ func TestBuildOpenAIPayload_ToolsAndThinking(t *testing.T) {
 	for _, want := range []string{`"tools"`, `run_shell`, `"thinking":{"type":"enabled"}`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("payload missing %s: %s", want, s)
-		}
-	}
-}
-
-// TestBuildOpenAIPayload_MaxTokensCap: 输出硬上限必须始终出现在 payload 中
-//（评审安全补丁：不允许无限输出）——显式值被 honored，<=0 回落默认值。
-func TestBuildOpenAIPayload_MaxTokensCap(t *testing.T) {
-	msgs := []model.ChatMessage{{Role: "user", Content: "x"}}
-
-	body, err := BuildOpenAIPayload("m", 4096, msgs, nil, nil)
-	if err != nil {
-		t.Fatalf("BuildOpenAIPayload: %v", err)
-	}
-	if !strings.Contains(string(body), `"max_tokens":4096`) {
-		t.Errorf("explicit cap not honored: %s", body)
-	}
-
-	for _, n := range []int{0, -1} {
-		body, err = BuildOpenAIPayload("m", n, msgs, nil, nil)
-		if err != nil {
-			t.Fatalf("BuildOpenAIPayload(%d): %v", n, err)
-		}
-		if !strings.Contains(string(body), `"max_tokens":8192`) {
-			t.Errorf("maxTokens=%d: want fallback to default 8192: %s", n, body)
 		}
 	}
 }

@@ -190,7 +190,8 @@ func (s *ChatService) SetHTTPClient(c *http.Client) {
 }
 
 // SetMaxOutputTokens 设置输出 token 硬上限（n<=0 时忽略，保持当前值）。
-// 后续由主装配线从配置接入。
+// 仅作用于 Anthropic 协议路径（协议必传 max_tokens）；OpenAI 协议路径按
+// DualBackend 契约不携带该字段。后续由主装配线从配置接入。
 func (s *ChatService) SetMaxOutputTokens(n int) {
 	if n > 0 {
 		s.maxOutputTokens = n

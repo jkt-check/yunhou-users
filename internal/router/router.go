@@ -338,11 +338,20 @@ func Setup(
 	}
 
 	// Refund routes (separate prefix per design doc).
-	// /refunds is also JWT-protected; ownership is enforced in service.
+	// POST /refunds 是资金出账操作:service 层只做金额上限校验、部分退款
+	// 不回收权益,任意用户 JWT 直调在 v2 接入真实渠道退款客户端后即为
+	// 套现漏洞(安全审计 2026-10)。因此收紧为 InternalAppAuth(内部应用/
+	// 运营工具专用,与 /admin 组同一信任锚);代码库目前无 admin 角色 JWT
+	// 判定手段,若未来引入 operator JWT 可按 opsGroup 模式追加。
+	// GET /refunds/:id 保持用户 JWT(service 层做 ownership 校验)。
+	refundWriteGroup := engine.Group("/refunds")
+	refundWriteGroup.Use(middleware.RateLimit(ctx, 30, 60), middleware.InternalAppAuth(appRepo))
+	{
+		refundWriteGroup.POST("", paymentHandler.CreateRefund)
+	}
 	refundGroup := engine.Group("/refunds")
 	refundGroup.Use(middleware.JWTAuth(tokenSvc), middleware.RateLimit(ctx, 30, 60))
 	{
-		refundGroup.POST("", paymentHandler.CreateRefund)
 		refundGroup.GET("/:id", paymentHandler.GetRefund)
 	}
 

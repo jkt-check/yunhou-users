@@ -244,6 +244,10 @@ func chatErrorMapping(err error) (int, string) {
 		return http.StatusNotFound, service.ErrChatNotEnabled.Error()
 	case errors.Is(err, service.ErrChatNoAccess):
 		return http.StatusForbidden, service.ErrChatNoAccess.Error()
+	case errors.Is(err, service.ErrChatConcurrencyLimited):
+		// 单用户并发流上限（2026-10 审计加固）——放在 ErrChatRateLimited
+		// 之前：ChatConcurrencyLimitError 的 Unwrap 同时匹配两者。
+		return http.StatusTooManyRequests, service.ErrChatConcurrencyLimited.Error()
 	case errors.Is(err, service.ErrChatRateLimited):
 		log.Printf("chat: upstream rate limited: %v", err)
 		return http.StatusTooManyRequests, service.ErrChatRateLimited.Error()
@@ -273,10 +277,10 @@ func chatErrorMapping(err error) (int, string) {
 // (before truncation) so cost analysis isn't skewed by the log cap; the
 // same real-bytes rule holds for InputBytes, which counts content AND
 // reasoning even though the logged input is cut. Two input truncations
-// apply: on error lines the (unvalidated, potentially near-32 KiB) content
-// is capped per message, and on every line reasoning_content is capped at
-// chatReasoningLogCap — thinking traces are bounded only by the body cap
-// and would otherwise dominate the log.
+// apply on every line: content is capped per message at chatInputLogCap
+// (PII 收敛：成功行曾原样镜像完整 prompt，2026-10 安全审计后统一截断），
+// and reasoning_content is capped at chatReasoningLogCap — thinking traces
+// are bounded only by the body cap and would otherwise dominate the log.
 func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string, req model.ChatRequest, status, errMsg, output string, rej *service.ChatUpstreamRejection) {
 	if h.accessLog == nil {
 		return
@@ -290,11 +294,7 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string
 	}
 	realBytes := len(output)
 	output, truncated := truncateChatOutput(output)
-	input := req.Messages
-	inputTruncated := false
-	if status == "error" {
-		input, inputTruncated = truncateChatInput(req.Messages)
-	}
+	input, inputTruncated := truncateChatInput(req.Messages)
 	if capped, reasoningCut := capChatReasoning(input); reasoningCut {
 		input = capped
 		inputTruncated = true
@@ -345,10 +345,12 @@ func chatTotalBytes(messages []model.ChatMessage) int {
 // chatOutputLogCap bounds the output text stored in one audit line.
 const chatOutputLogCap = 64 << 10
 
-// chatErrInputLogCap bounds each message's content in an ERROR audit line.
-// Error lines log input that failed validation — i.e. content whose size is
-// precisely what validation rejected — so it needs its own, smaller cap.
-const chatErrInputLogCap = 1 << 10
+// chatInputLogCap bounds each message's content in EVERY audit line. The
+// per-message cap started as an error-line-only defence (error lines log
+// unvalidated content whose size is what validation rejected); the 2026-10
+// security audit moved it to all lines — success lines mirroring full
+// prompts made the audit file a complete PII transcript.
+const chatInputLogCap = 1 << 10
 
 // chatReasoningLogCap bounds each message's reasoning_content in EVERY audit
 // line. Thinking traces are model-internal text bounded only by the request
@@ -362,8 +364,8 @@ func truncateChatOutput(s string) (string, bool) {
 	return truncateUTF8(s, chatOutputLogCap)
 }
 
-// truncateChatInput caps every message's content at chatErrInputLogCap for
-// error-path audit lines. Returns the (possibly copied) slice and whether
+// truncateChatInput caps every message's content at chatInputLogCap for
+// audit lines. Returns the (possibly copied) slice and whether
 // any content was cut. Cutting only replaces Content — the turn's other
 // relay fields (reasoning_content, tool_calls, tool_call_id) are preserved
 // so the audit line still shows the real message shape.
@@ -371,13 +373,13 @@ func truncateChatInput(messages []model.ChatMessage) ([]model.ChatMessage, bool)
 	truncated := false
 	out := messages
 	for i, m := range messages {
-		if len(m.Content) > chatErrInputLogCap {
+		if len(m.Content) > chatInputLogCap {
 			if !truncated {
 				// First cut: copy the slice so the caller's request is untouched.
 				out = make([]model.ChatMessage, len(messages))
 				copy(out, messages[:i])
 			}
-			cut, _ := truncateUTF8(m.Content, chatErrInputLogCap)
+			cut, _ := truncateUTF8(m.Content, chatInputLogCap)
 			cutMsg := m
 			cutMsg.Content = cut
 			out[i] = cutMsg

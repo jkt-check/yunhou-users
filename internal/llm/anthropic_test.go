@@ -19,7 +19,7 @@ func decode(t *testing.T, body []byte) map[string]any {
 }
 
 func TestBuildAnthropicPayload_BasicAndSystem(t *testing.T) {
-	body, err := BuildAnthropicPayload("kimi-k3", 0, []model.ChatMessage{
+	body, err := BuildAnthropicPayload("kimi-k3", 0, 0, []model.ChatMessage{
 		{Role: "system", Content: "be brief"},
 		{Role: "system", Content: "answer in Chinese"},
 		{Role: "user", Content: "hi"},
@@ -55,7 +55,7 @@ func TestBuildAnthropicPayload_BasicAndSystem(t *testing.T) {
 }
 
 func TestBuildAnthropicPayload_ToolLoop(t *testing.T) {
-	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+	body, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{
 		{Role: "user", Content: "list files"},
 		{Role: "assistant", ToolCalls: []model.ToolCall{
 			{ID: "call_1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: `{"cmd":"ls"}`}},
@@ -108,7 +108,7 @@ func TestBuildAnthropicPayload_ToolsTranslation(t *testing.T) {
 		json.RawMessage(`{"type":"function","function":{"name":"run_shell","description":"run cmd","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}}`),
 		json.RawMessage(`{"name":"list_dir","input_schema":{"type":"object"}}`),
 	}
-	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{{Role: "user", Content: "x"}}, tools, nil)
+	body, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{{Role: "user", Content: "x"}}, tools, nil)
 	if err != nil {
 		t.Fatalf("BuildAnthropicPayload: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestBuildAnthropicPayload_RejectsAnthropicIllegalShapes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			body, err := BuildAnthropicPayload("m", 0, tc.messages, nil, nil)
+			body, err := BuildAnthropicPayload("m", 0, 0, tc.messages, nil, nil)
 			if err == nil {
 				t.Errorf("BuildAnthropicPayload succeeded, want a deliberate error; payload: %s", body)
 			}
@@ -174,7 +174,7 @@ func TestBuildOpenAIPayload_AcceptsShapesAnthropicRejects(t *testing.T) {
 		{{Role: "system", Content: "be brief"}},
 		{{Role: "assistant", Content: "hello"}, {Role: "user", Content: "hi"}},
 	} {
-		if _, err := BuildOpenAIPayload("m", messages, nil, nil); err != nil {
+		if _, err := BuildOpenAIPayload("m", 8192, messages, nil, nil); err != nil {
 			t.Errorf("BuildOpenAIPayload(%v): %v, want success (OpenAI-protocol behavior unchanged)", messages, err)
 		}
 	}
@@ -188,7 +188,7 @@ func TestBuildAnthropicPayload_SkipsNamelessTools(t *testing.T) {
 		json.RawMessage(`{"type":"function","function":{"description":"no name here","parameters":{"type":"object"}}}`),
 		json.RawMessage(`{"name":"list_dir","input_schema":{"type":"object"}}`),
 	}
-	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{{Role: "user", Content: "x"}}, tools, nil)
+	body, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{{Role: "user", Content: "x"}}, tools, nil)
 	if err != nil {
 		t.Fatalf("BuildAnthropicPayload: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestBuildAnthropicPayload_SkipsNamelessTools(t *testing.T) {
 	}
 
 	allNameless := []json.RawMessage{json.RawMessage(`{"type":"function","function":{"description":"no name"}}`)}
-	body, err = BuildAnthropicPayload("m", 0, []model.ChatMessage{{Role: "user", Content: "x"}}, allNameless, nil)
+	body, err = BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{{Role: "user", Content: "x"}}, allNameless, nil)
 	if err != nil {
 		t.Fatalf("BuildAnthropicPayload: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestBuildAnthropicPayload_SkipsNamelessTools(t *testing.T) {
 
 func TestBuildAnthropicPayload_Thinking(t *testing.T) {
 	thinking := true
-	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking)
+	body, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking)
 	if err != nil {
 		t.Fatalf("BuildAnthropicPayload: %v", err)
 	}
@@ -224,12 +224,50 @@ func TestBuildAnthropicPayload_Thinking(t *testing.T) {
 	}
 }
 
+// TestBuildAnthropicPayload_ThinkingHardCap pins the 2026-10 review fix:
+// the protocol-mandated raise (max_tokens > thinking budget) must not
+// exceed the caller's hard cap. hardCap=0 keeps the legacy uncapped raise.
+// (maxTokens=2048 ≤ budget is what triggers the raise path.)
+func TestBuildAnthropicPayload_ThinkingHardCap(t *testing.T) {
+	thinking := true
+	msgs := []model.ChatMessage{{Role: "user", Content: "x"}}
+
+	// Cap below the raise target (12288): clamp wins, even though the
+	// result may violate max_tokens > budget (operator misconfig →
+	// explicit upstream 400 instead of a silent cost overrun).
+	body, err := BuildAnthropicPayload("m", 2048, 4096, msgs, nil, &thinking)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	if got := decode(t, body)["max_tokens"].(float64); got != 4096 {
+		t.Errorf("max_tokens = %v, want clamped to hardCap 4096", got)
+	}
+
+	// Cap above the raise target: raise survives intact.
+	body, err = BuildAnthropicPayload("m", 2048, 16384, msgs, nil, &thinking)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	if got := decode(t, body)["max_tokens"].(float64); got != 12288 {
+		t.Errorf("max_tokens = %v, want raised 12288", got)
+	}
+
+	// hardCap=0: legacy uncapped behavior.
+	body, err = BuildAnthropicPayload("m", 2048, 0, msgs, nil, &thinking)
+	if err != nil {
+		t.Fatalf("BuildAnthropicPayload: %v", err)
+	}
+	if got := decode(t, body)["max_tokens"].(float64); got != 12288 {
+		t.Errorf("max_tokens = %v, want raised 12288 (no cap)", got)
+	}
+}
+
 // TestBuildAnthropicPayload_MergesConsecutiveSameRole: handler validation
 // deliberately allows consecutive same-role messages (OpenAI accepts them),
 // but Anthropic requires strict user/assistant alternation and 400s — the
 // translation must merge such turns into one.
 func TestBuildAnthropicPayload_MergesConsecutiveSameRole(t *testing.T) {
-	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+	body, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{
 		{Role: "user", Content: "one"},
 		{Role: "user", Content: "two"},
 		{Role: "assistant", Content: "a1"},
@@ -269,7 +307,7 @@ func TestBuildAnthropicPayload_MergesConsecutiveSameRole(t *testing.T) {
 // a plain user message must not open a second adjacent user turn; the
 // tool_result block merges in ahead of the text (tool_results lead the turn).
 func TestBuildAnthropicPayload_ToolAfterPlainUserMerges(t *testing.T) {
-	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+	body, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{
 		{Role: "user", Content: "hi"},
 		{Role: "tool", Content: "res", ToolCallID: "c1"},
 	}, nil, nil)
@@ -296,7 +334,7 @@ func TestBuildAnthropicPayload_ToolAfterPlainUserMerges(t *testing.T) {
 // following tool results merges into the same user turn, tool_result blocks
 // first, then the text (the shape Anthropic accepts).
 func TestBuildAnthropicPayload_UserTextAfterToolResult(t *testing.T) {
-	body, err := BuildAnthropicPayload("m", 0, []model.ChatMessage{
+	body, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{
 		{Role: "user", Content: "list files"},
 		{Role: "assistant", ToolCalls: []model.ToolCall{
 			{ID: "c1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: `{"cmd":"ls"}`}},

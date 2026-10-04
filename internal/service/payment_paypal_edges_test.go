@@ -29,7 +29,7 @@ func TestPaypalRenewal_ExtendsAndReplaysIdempotent(t *testing.T) {
 		if _, err := svc.OnWebhook(ctx, WebhookEvent{
 			Channel: "paypal", EventID: eventID, EventType: "PAYMENT.SALE.COMPLETED",
 			TransactionID: txnID, ExternalSubscriptionID: "I-PPSUB-1",
-			Amount: 19.9, Currency: "USD", SubExpiresAt: &hint,
+			Amount: 19.9, Currency: "CNY", SubExpiresAt: &hint, // 与 plan 一致(2026-10 硬拒绝适配)
 			RawPayload: []byte(`{"mock":true}`),
 		}); err != nil {
 			t.Fatal(err)

@@ -109,6 +109,12 @@ func (s *stubOrderRepoLookup) FindPendingByUserAndProduct(_ context.Context, _, 
 	}
 	return nil, sql.ErrNoRows
 }
+func (s *stubOrderRepoLookup) FindPendingByUserAndProductTx(_ context.Context, _ *sqlx.Tx, _, _ string) (*model.Order, error) {
+	// Mirrors FindPendingByUserAndProduct: the in-tx re-check follows the
+	// advisory lock in eligibilityAndInsertOrderTx (unit tests never take
+	// the real lock — planRepo.WithTx needs a DB).
+	return s.FindPendingByUserAndProduct(context.Background(), "", "")
+}
 func (s *stubOrderRepoLookup) FailPending(_ context.Context, id string) (bool, error) {
 	s.failSeen = id
 	if s.failErr != nil {

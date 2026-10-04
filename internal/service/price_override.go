@@ -89,9 +89,11 @@ func ApplyPlanAmountOverride(planID string, originalPrice float64) float64 {
 }
 
 // OverridesActive reports whether override mode is currently engaged.
-// Tests use it to assert they ran Reload() correctly; production code
-// shouldn't need it (every call site uses ApplyPlanAmountOverride and
-// gets a fall-through if not active).
+// Tests use it to assert they ran Reload() correctly; production call
+// sites mostly go through ApplyPlanAmountOverride's fall-through — except
+// onRenewalSucceeded (payment.go), which uses it to choose between
+// audit-only (override on, staging/test flows) and hard-reject (override
+// off, production) for renewal amount/currency mismatches.
 func OverridesActive() bool {
 	overrideMu.RLock()
 	defer overrideMu.RUnlock()

@@ -30,6 +30,10 @@ import (
 // reduces an account's DB state.
 const cooldownAfterRetryable = 60 * time.Second
 
+// accountsCacheTTL 是 upstream 账号列表缓存 TTL：项目所有者裁定一律 1s、
+// 不做主动失效，TTL 本身限制脏读窗口。
+const accountsCacheTTL = time.Second
+
 // AccountStore is the persistence surface routing needs; satisfied by
 // inference/postgres.Store.
 type AccountStore interface {
@@ -81,6 +85,16 @@ type Service struct {
 	mu     sync.Mutex
 	cooled map[string]time.Time // accountID → skip until
 	rr     map[string]int       // providerID → round-robin cursor
+
+	// 账号池缓存：热路径上每请求/每条候选 route 一次的
+	// ListActiveUpstreamAccounts 往返降为每 provider 每秒最多一次。
+	acctMu    sync.RWMutex
+	acctCache map[string]cachedAccounts // providerID → 账号列表 + 缓存时刻
+}
+
+type cachedAccounts struct {
+	accounts []domain.UpstreamAccount
+	cachedAt time.Time
 }
 
 // NewService builds the routing service over the account store. A nil clock
@@ -95,6 +109,7 @@ func NewService(store AccountStore, adapters map[domain.Protocol]providers.Adapt
 		LeaseTTL:   10 * time.Minute,
 		cooled:     map[string]time.Time{},
 		rr:         map[string]int{},
+		acctCache:  map[string]cachedAccounts{},
 	}
 }
 
@@ -135,7 +150,7 @@ func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 		if (needs.Tools && !caps.Tools) || (needs.Reasoning && !caps.Reasoning) {
 			continue
 		}
-		accounts, err := s.store.ListActiveUpstreamAccounts(ctx, d.ProviderID)
+		accounts, err := s.activeAccounts(ctx, d.ProviderID)
 		if err != nil {
 			return nil, err
 		}
@@ -144,6 +159,31 @@ func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 		}
 	}
 	return out, nil
+}
+
+// activeAccounts 返回某 provider 的活跃账号池，带 1s TTL 进程内缓存。
+// 错误不缓存；双重检查避免并发过期时同一 provider 的重复查库。返回的
+// 切片在 TTL 内被多请求共享——orderAccounts/配额过滤都只读它（各自构建
+// 新切片），调用方不得原地修改。
+func (s *Service) activeAccounts(ctx context.Context, providerID string) ([]domain.UpstreamAccount, error) {
+	now := s.clock.Now()
+	s.acctMu.RLock()
+	e, ok := s.acctCache[providerID]
+	s.acctMu.RUnlock()
+	if ok && now.Sub(e.cachedAt) < accountsCacheTTL {
+		return e.accounts, nil
+	}
+	s.acctMu.Lock()
+	defer s.acctMu.Unlock()
+	if e, ok := s.acctCache[providerID]; ok && now.Sub(e.cachedAt) < accountsCacheTTL {
+		return e.accounts, nil
+	}
+	accounts, err := s.store.ListActiveUpstreamAccounts(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+	s.acctCache[providerID] = cachedAccounts{accounts: accounts, cachedAt: now}
+	return accounts, nil
 }
 
 // routeCovers reports whether a route's capability list covers the call's

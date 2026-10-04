@@ -224,10 +224,13 @@ func NewHTTPClient(egress EgressChecker) *http.Client {
 		}
 	}
 	c := &http.Client{Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dial,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
+		Proxy:             http.ProxyFromEnvironment,
+		DialContext:       dial,
+		ForceAttemptHTTP2: true,
+		MaxIdleConns:      100,
+		// 上游集中在少数几个 host，默认 MaxIdleConnsPerHost=2 会让 keep-alive
+		// 形同虚设（每请求重做 TCP+TLS 握手），抬高首 token 延迟。
+		MaxIdleConnsPerHost:   64,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

@@ -252,10 +252,17 @@ func (h *PaymentHandler) GetPayment(c *gin.Context) {
 // CreateRefund — POST /refunds
 //
 // Requires Idempotency-Key header (caller retry → no double-refund).
+//
+// 鉴权(安全审计 2026-10):本端点是资金出账操作——service 层只做金额上限
+// 校验、部分退款不回收权益,任意用户 JWT 直调在 v2 接入真实渠道退款客户
+// 端后即为套现漏洞。因此 handler 层硬要求 InternalAppAuth 认证的 app 上
+// 下文(ContextApp),无 app 上下文一律 403,不设 JWT 回退——防御纵深:
+// 即使未来路由被误挂回 JWT 组,用户 JWT 也无法通过此 handler。退款请求
+// 走 RefundInput.InternalApp 路径(跳过 ownership 校验,userID 由
+// service 层按订单归属回填)。
 func (h *PaymentHandler) CreateRefund(c *gin.Context) {
-	userID := c.GetString(middleware.ContextUserID)
-	if userID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+	if app := callerApp(c); app == nil {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "internal apps only"})
 		return
 	}
 
@@ -288,7 +295,7 @@ func (h *PaymentHandler) CreateRefund(c *gin.Context) {
 
 	in := service.RefundInput{
 		PaymentID:      req.PaymentID,
-		UserID:         userID,
+		InternalApp:    true,
 		IdempotencyKey: idemKey,
 		Amount:         req.Amount,
 		Reason:         req.Reason,

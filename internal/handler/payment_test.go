@@ -31,6 +31,7 @@ type mockPaymentSvc struct {
 	gotConfirmInput  *service.ConfirmInput // captures the input Confirm was called with
 	refundResult     *service.RefundResult
 	refundErr        error
+	gotRefundInput   *service.RefundInput // captures the input Refund was called with
 	getOrderResp     *model.Order
 	getOrderErr      error
 	listOrders       []model.Order
@@ -64,7 +65,8 @@ func (m *mockPaymentSvc) Confirm(_ context.Context, in service.ConfirmInput) (*s
 	m.gotConfirmInput = &in
 	return m.confirmResult, m.confirmErr
 }
-func (m *mockPaymentSvc) Refund(_ context.Context, _ service.RefundInput) (*service.RefundResult, error) {
+func (m *mockPaymentSvc) Refund(_ context.Context, in service.RefundInput) (*service.RefundResult, error) {
+	m.gotRefundInput = &in
 	return m.refundResult, m.refundErr
 }
 func (m *mockPaymentSvc) OnWebhook(_ context.Context, _ service.WebhookEvent) (*service.OnWebhookResult, error) {
@@ -103,14 +105,18 @@ var _ service.PaymentServiceInterface = (*mockPaymentSvc)(nil)
 // paymentTestEngine builds a Gin engine with /payments and /refunds routes
 // wired up against the supplied mock service, with a fake user_id injected
 // (bypassing JWT verification — the JWT path is exercised in e2e tests).
+// A fake InternalAppAuth app context is injected too: POST /refunds 的
+// handler 层硬要求 ContextApp(无 app 上下文一律 403,审计 2026-10),
+// 其余端点不读 ContextApp,注入对它们无影响。
 func paymentTestEngine(svc service.PaymentServiceInterface, userID string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	h := NewPaymentHandler(svc)
 
-	// Inject fake user_id for every request.
+	// Inject fake user_id + app context for every request.
 	engine.Use(func(c *gin.Context) {
 		c.Set(middleware.ContextUserID, userID)
+		c.Set(middleware.ContextApp, &model.App{AppID: "testapp", IsActive: true})
 		c.Next()
 	})
 
@@ -124,6 +130,22 @@ func paymentTestEngine(svc service.PaymentServiceInterface, userID string) *gin.
 	engine.GET("/payments", h.ListPayments)
 	engine.GET("/payments/:id", h.GetPayment)
 	engine.GET("/payments/:id/refunds", h.ListPaymentRefunds)
+	engine.POST("/refunds", h.CreateRefund)
+	engine.GET("/refunds/:id", h.GetRefund)
+	return engine
+}
+
+// paymentRefundEngineNoApp builds only the /refunds routes WITHOUT the app
+// context — used to pin the 403 gate on POST /refunds (无 ContextApp 一律
+// 403,即使携带合法 user_id)。
+func paymentRefundEngineNoApp(svc service.PaymentServiceInterface, userID string) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	h := NewPaymentHandler(svc)
+	engine.Use(func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, userID)
+		c.Next()
+	})
 	engine.POST("/refunds", h.CreateRefund)
 	engine.GET("/refunds/:id", h.GetRefund)
 	return engine
@@ -629,6 +651,76 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 			t.Errorf("status: got %d, want 400", rec.Code)
 		}
 	})
+}
+
+// TestPaymentHandler_CreateRefund_InternalApp pins the 安全审计 2026-10
+// auth model: POST /refunds 的路由层已收紧为 InternalAppAuth,handler 必须
+// 识别 ContextApp(InternalAppAuth 已认证)并走 RefundInput.InternalApp
+// 路径(跳过 ownership 校验,userID 由 service 层按订单归属回填)——即使
+// 请求不带任何 JWT user_id 也不应 401。
+func TestPaymentHandler_CreateRefund_InternalApp(t *testing.T) {
+	t.Parallel()
+	svc := &mockPaymentSvc{
+		refundResult: &service.RefundResult{
+			Refund: &model.Refund{ID: "r-1", PaymentID: "p-1", Amount: 5.0, Status: "pending"},
+		},
+	}
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	h := NewPaymentHandler(svc)
+	// 模拟 InternalAppAuth 已运行的上下文(不注入 user_id)。
+	engine.Use(func(c *gin.Context) {
+		c.Set(middleware.ContextApp, &model.App{AppID: "yunops", IsActive: true})
+		c.Next()
+	})
+	engine.POST("/refunds", h.CreateRefund)
+
+	req := httptest.NewRequest(http.MethodPost, "/refunds",
+		bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "idem-internal-001")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotRefundInput == nil {
+		t.Fatal("service.Refund was not called")
+	}
+	if !svc.gotRefundInput.InternalApp {
+		t.Error("RefundInput.InternalApp = false, want true for app-authenticated caller")
+	}
+	if svc.gotRefundInput.UserID != "" {
+		t.Errorf("RefundInput.UserID = %q, want empty (service adopts the order owner)", svc.gotRefundInput.UserID)
+	}
+}
+
+// TestPaymentHandler_CreateRefund_JWTFallback pins the 403 gate (安全审计
+// 2026-10 防御纵深):JWT 回退已删除——即使请求携带合法 user_id,只要没有
+// InternalAppAuth 的 app 上下文,CreateRefund 一律 403 且不得调用
+// service。如此即使未来路由被误挂回 JWT 组,用户 JWT 也无法发起退款。
+func TestPaymentHandler_CreateRefund_JWTFallback(t *testing.T) {
+	t.Parallel()
+	svc := &mockPaymentSvc{
+		refundResult: &service.RefundResult{
+			Refund: &model.Refund{ID: "r-1", PaymentID: "p-1", Amount: 5.0, Status: "pending"},
+		},
+	}
+	engine := paymentRefundEngineNoApp(svc, "user-1")
+	req := httptest.NewRequest(http.MethodPost, "/refunds",
+		bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "idem-jwt-001")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status: got %d, want 403 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotRefundInput != nil {
+		t.Error("service.Refund must NOT be called without an app context")
+	}
 }
 
 // ============================================================================

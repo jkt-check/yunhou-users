@@ -731,3 +731,281 @@ func TestClassifyUpstreamRejection_InvalidUTF8(t *testing.T) {
 		t.Errorf("Message = %.50q, want capped content preserved", rej.Message)
 	}
 }
+
+// TestChatService_MaxTokensCapEnforced: 评审安全补丁（无 max_tokens 上限）——
+// 客户端请求不携带 max_tokens，OpenAI 协议路径的上游 payload 必须始终写入
+// 硬上限（默认 8192，setter 可调）。
+func TestChatService_MaxTokensCapEnforced(t *testing.T) {
+	sse := "data: [DONE]\n\n"
+	var gotBodies []string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, string(b))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	})
+
+	svc, subRepo, planRepo, _ := chatTestFixture(t, upstream)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	resp, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("StreamChat: %v", err)
+	}
+	resp.Body.Close()
+	if !strings.Contains(gotBodies[0], `"max_tokens":8192`) {
+		t.Errorf("default cap missing from upstream body: %s", gotBodies[0])
+	}
+
+	svc.SetMaxOutputTokens(100)
+	resp, _, err = svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("StreamChat: %v", err)
+	}
+	resp.Body.Close()
+	if !strings.Contains(gotBodies[1], `"max_tokens":100`) {
+		t.Errorf("configured cap missing from upstream body: %s", gotBodies[1])
+	}
+}
+
+// TestChatService_AnthropicMaxTokensClamped: Anthropic 协议路径——目录里的
+// operator 配置值（Model.MaxTokens）被 honored，但以硬上限封顶；缺省（0）
+// 也回落硬上限。
+func TestChatService_AnthropicMaxTokensClamped(t *testing.T) {
+	var gotBodies []string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, string(b))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	})
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+
+	catalog := &llm.Catalog{
+		DefaultModel: "big",
+		Providers:    map[string]llm.Provider{"kimi": {Protocol: llm.ProtocolAnthropic, BaseURL: srv.URL, APIKeys: []string{"sk-1"}}},
+		Models: map[string]llm.Model{
+			"big":   {Provider: "kimi", UpstreamModel: "u-big", MaxTokens: 16384},
+			"small": {Provider: "kimi", UpstreamModel: "u-small", MaxTokens: 4096},
+			"unset": {Provider: "kimi", UpstreamModel: "u-unset"},
+		},
+	}
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(catalog, subRepo, planRepo, &mockLLMUsageRepo{})
+
+	for i, tc := range []struct {
+		model string
+		want  string
+	}{
+		{"big", `"max_tokens":8192`},  // operator 配置超上限 → 封顶
+		{"small", `"max_tokens":4096`}, // 上限以内 → honored
+		{"unset", `"max_tokens":8192`}, // 缺省 → 硬上限
+	} {
+		resp, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", tc.model, chatMessages(), nil, nil)
+		if err != nil {
+			t.Fatalf("StreamChat(%s): %v", tc.model, err)
+		}
+		resp.Body.Close()
+		if !strings.Contains(gotBodies[i], tc.want) {
+			t.Errorf("model %s: upstream body = %s, want %s", tc.model, gotBodies[i], tc.want)
+		}
+	}
+}
+
+// blockingChatUpstream returns a handler that sends SSE headers immediately
+// then holds the stream open until the request ctx ends — a stand-in for a
+// long generation, used by the concurrency-limit tests.
+func blockingChatUpstream() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	})
+}
+
+// TestChatService_ConcurrencyLimit: 评审安全补丁（按用户并发约束）——同一
+// 用户的并发流式请求超过上限即拒绝；错误同时匹配 ErrChatConcurrencyLimited
+// 与 ErrChatRateLimited（后者让 handler 现有映射返回 429）。名额按用户
+// 隔离，body 关闭后立即释放。
+func TestChatService_ConcurrencyLimit(t *testing.T) {
+	svc, subRepo, planRepo, _ := chatTestFixture(t, blockingChatUpstream())
+	svc.SetMaxStreamsPerUser(2)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	seedChatActiveSub(subRepo, "u-2", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	ctx := context.Background()
+
+	r1, _, err := svc.StreamChat(ctx, "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("stream 1: %v", err)
+	}
+	r2, _, err := svc.StreamChat(ctx, "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("stream 2: %v", err)
+	}
+
+	_, _, err = svc.StreamChat(ctx, "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if !errors.Is(err, ErrChatConcurrencyLimited) {
+		t.Fatalf("err = %v, want ErrChatConcurrencyLimited", err)
+	}
+	if !errors.Is(err, ErrChatRateLimited) {
+		t.Errorf("err = %v, want errors.Is ErrChatRateLimited (handler 429 映射)", err)
+	}
+
+	// 名额按用户隔离：u-2 不受 u-1 占满影响。
+	r3, _, err := svc.StreamChat(ctx, "u-2", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("u-2 stream: %v (per-user isolation)", err)
+	}
+	defer r3.Body.Close()
+
+	// body 关闭即释放名额：u-1 可以立刻再开一条。
+	r1.Body.Close()
+	r4, _, err := svc.StreamChat(ctx, "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("stream after Close: %v (slot must be released)", err)
+	}
+	r4.Body.Close()
+	r2.Body.Close()
+}
+
+// TestChatService_ConcurrencySlotReleasedOnCtxCancel: body 未关闭但 ctx 取消
+// （客户端断连）的路径也必须释放名额——由 reqCtx watcher 兜底。
+func TestChatService_ConcurrencySlotReleasedOnCtxCancel(t *testing.T) {
+	svc, subRepo, planRepo, _ := chatTestFixture(t, blockingChatUpstream())
+	svc.SetMaxStreamsPerUser(1)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resp, _, err := svc.StreamChat(ctx, "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	// 模拟调用方泄漏：不 Close body，直接取消 ctx。
+	cancel()
+	defer resp.Body.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+		if err == nil {
+			r.Body.Close()
+			return // 名额已释放
+		}
+		if !errors.Is(err, ErrChatConcurrencyLimited) {
+			t.Fatalf("err = %v, want ErrChatConcurrencyLimited while waiting", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("slot not released after ctx cancel (watcher 兜底失效)")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestChatService_ConcurrencySlotReleasedOnError: 上游立即失败的路径不能
+// 占用名额——连续 N（N>上限）次失败请求后仍能再发起新请求。
+func TestChatService_ConcurrencySlotReleasedOnError(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"boom"}`))
+	})
+	svc, subRepo, planRepo, _ := chatTestFixture(t, upstream)
+	svc.SetMaxStreamsPerUser(1)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	for i := 0; i < 5; i++ {
+		_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+		if !errors.Is(err, ErrChatUpstreamError) {
+			t.Fatalf("attempt %d: err = %v, want ErrChatUpstreamError (名额泄漏会报 ErrChatConcurrencyLimited)", i, err)
+		}
+	}
+}
+
+// TestChatService_CrossOriginRedirectNotFollowed: 评审安全补丁（凭证边
+// 界）——跨 origin 重定向绝不跟随，x-api-key/Authorization 与运营商自定义
+// 鉴权头不能落进另一台主机；3xx 响应按上游错误处理。
+func TestChatService_CrossOriginRedirectNotFollowed(t *testing.T) {
+	var bHits int32
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&bHits, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(srvB.Close)
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srvB.URL+"/chat/completions", http.StatusFound)
+	}))
+	t.Cleanup(srvA.Close)
+
+	svc, subRepo, planRepo, _ := chatTestFixture(t, nil)
+	svc.catalog = testCatalog(srvA.URL)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if !errors.Is(err, ErrChatUpstreamError) {
+		t.Fatalf("err = %v, want ErrChatUpstreamError (3xx surfaced as upstream error)", err)
+	}
+	if n := atomic.LoadInt32(&bHits); n != 0 {
+		t.Errorf("redirect target received %d requests, want 0 (凭证未外泄)", n)
+	}
+}
+
+// TestChatService_SameOriginRedirectFollowed: 同 origin 跳转（换路径不换主
+// 机）仍被允许——凭证不出主机边界，兼容性不受影响。
+func TestChatService_SameOriginRedirectFollowed(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/v2/chat/completions", http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/v2/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: [DONE]\n\n"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	svc, subRepo, planRepo, _ := chatTestFixture(t, nil)
+	svc.catalog = testCatalog(srv.URL)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	resp, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if err != nil {
+		t.Fatalf("StreamChat: %v (same-origin redirect must be followed)", err)
+	}
+	resp.Body.Close()
+}
+
+// TestChatService_RedirectLoopFails: 同 origin 重定向循环在 5 跳后报错，
+// 按上游错误处理（不会无限跳转）。
+func TestChatService_RedirectLoopFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/chat/completions", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+
+	svc, subRepo, planRepo, _ := chatTestFixture(t, nil)
+	svc.catalog = testCatalog(srv.URL)
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+
+	_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "", chatMessages(), nil, nil)
+	if !errors.Is(err, ErrChatUpstreamError) {
+		t.Fatalf("err = %v, want ErrChatUpstreamError (redirect loop)", err)
+	}
+}

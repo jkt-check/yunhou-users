@@ -1009,8 +1009,8 @@ func TestChatHandler_AccessLog_ErrorInputTruncated(t *testing.T) {
 	if !entry.InputTruncated {
 		t.Error("input_truncated = false, want true")
 	}
-	if len(entry.Input) != 1 || len(entry.Input[0].Content) > chatErrInputLogCap {
-		t.Errorf("logged input content len = %d, want <= %d", len(entry.Input[0].Content), chatErrInputLogCap)
+	if len(entry.Input) != 1 || len(entry.Input[0].Content) > chatInputLogCap {
+		t.Errorf("logged input content len = %d, want <= %d", len(entry.Input[0].Content), chatInputLogCap)
 	}
 	if !utf8.ValidString(entry.Input[0].Content) {
 		t.Error("logged input is not valid UTF-8")

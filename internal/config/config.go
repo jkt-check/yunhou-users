@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -399,6 +400,135 @@ func IsProductionEnv(appEnv string) bool {
 	return !nonProductionEnvs[strings.ToLower(strings.TrimSpace(appEnv))]
 }
 
+// dbURLDisablesTLSForRemoteHost reports whether the DSN explicitly disables
+// TLS for a database whose traffic leaves the machine. Two host shapes are
+// exempt as same-machine trust surfaces:
+//
+//   - loopback（localhost / 127.0.0.1 / ::1）——本机 PG、本机端口转发隧道。
+//   - 单标签主机名（无 "."，如 compose 服务名 "postgres"）——公网 DNS 不
+//     存在单标签主机名，它只能经 docker 内嵌 DNS 解析到同机 compose 网络
+//     里的容器（compose 单机网络不出宿主机），信任面与 loopback 等同。
+//
+// 明确不豁免的两类：
+//
+//   - 私有网段 IP 字面量（10/8、172.16/12、192.168/16 等）——可能是跨机器
+//     的 LAN DB，明文仍可被同网段嗅探；
+//   - 多标签域名（db.internal、db.example.com）——可能是真实远端。
+//
+// Unparseable DSNs return false — they fail elsewhere with a clearer error.
+func dbURLDisablesTLSForRemoteHost(dsn string) bool {
+	host, sslDisabled := parseDBHostAndSSLMode(dsn)
+	if !sslDisabled || host == "" {
+		return false
+	}
+	// Unix socket 路径（keyword 形 host=/var/run/... 或 query 形
+	// host=/tmp/...）——本机 IPC，无可嗅探面。
+	if strings.HasPrefix(host, "/") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsLoopback()
+	}
+	// 非 IP 字面量：单标签 = docker/compose 服务名（豁免），多标签 = 可能
+	// 真实远端（要求 TLS）。
+	return strings.Contains(host, ".")
+}
+
+// parseDBHostAndSSLMode extracts the effective host and whether TLS is
+// explicitly disabled from the DSN shapes lib/pq accepts:
+//
+//   - URL 形式：postgres://[user[:pass]@]host[:port]/db?sslmode=disable
+//     （含 host 进 query 的变体 postgres:///db?host=x&sslmode=disable）
+//   - keyword 形式：host=x dbname=y sslmode=disable（lib/pq 同样接受）
+//
+// 只按 URL 解析会漏掉 keyword 形式（Hostname()=="" 直接被豁免），而守卫
+// 的目的恰恰是抓误配置——DSN 格式选择本身就是误配置面。
+func parseDBHostAndSSLMode(dsn string) (host string, sslDisabled bool) {
+	if strings.Contains(dsn, "://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", false
+		}
+		host = u.Hostname()
+		if host == "" {
+			host = u.Query().Get("host")
+		}
+		return strings.ToLower(host), strings.EqualFold(u.Query().Get("sslmode"), "disable")
+	}
+	// keyword 形式：lib/pq 语法（空白分隔 key=value，值可单引号包裹并含
+	// 空格/转义）。解析失败（不是 keyword 形）返回空——无法识别的 DSN 交
+	// 给 lib/pq 自身报错，守卫 fail-open 不误伤。
+	kv := parseKeywordDSN(dsn)
+	if kv == nil {
+		return "", false
+	}
+	return strings.ToLower(kv["host"]), strings.EqualFold(kv["sslmode"], "disable")
+}
+
+// parseKeywordDSN 按 lib/pq 的 keyword DSN 语法切分 key=value：空白分隔，
+// 值可用单引号包裹（引号内允许空格，\\ 与 \' 为转义）。strings.Fields 的
+// 朴素切分会在 password='a b' 这类带空格引号值上误判整串非法而漏过守卫
+// （2026-10 评审轮2 Minor-1），故用引号感知 lexer。返回 nil 表示不是
+// keyword 形。
+func parseKeywordDSN(dsn string) map[string]string {
+	kv := map[string]string{}
+	i, n := 0, len(dsn)
+	isSep := func(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+	for i < n {
+		for i < n && isSep(dsn[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		eq := strings.IndexByte(dsn[i:], '=')
+		if eq <= 0 {
+			return nil // key 为空或段内无 "="：不是 keyword 形
+		}
+		key := strings.ToLower(dsn[i : i+eq])
+		i += eq + 1
+		var val strings.Builder
+		if i < n && dsn[i] == '\'' {
+			i++
+			closed := false
+			for i < n && !closed {
+				switch dsn[i] {
+				case '\\':
+					if i+1 >= n {
+						return nil
+					}
+					val.WriteByte(dsn[i+1])
+					i += 2
+				case '\'':
+					closed = true
+					i++
+				default:
+					val.WriteByte(dsn[i])
+					i++
+				}
+			}
+			if !closed {
+				return nil
+			}
+			// 引号闭合后必须紧跟分隔空白或结尾
+			if i < n && !isSep(dsn[i]) {
+				return nil
+			}
+		} else {
+			start := i
+			for i < n && !isSep(dsn[i]) {
+				i++
+			}
+			val.WriteString(dsn[start:i])
+		}
+		kv[key] = val.String()
+	}
+	if len(kv) == 0 {
+		return nil
+	}
+	return kv
+}
+
 // hasFullRealWeChatPayCredentials mirrors the six-field all-or-none real
 // WeChat Pay credential tuple validated in Validate().
 func (c *Config) hasFullRealWeChatPayCredentials() bool {
@@ -514,6 +644,13 @@ func (c *Config) Validate() error {
 		}
 		if c.WeChatOAuthMock {
 			return errors.New("WECHAT_OAUTH_MOCK must not be enabled when APP_ENV is production (set APP_ENV to a non-production value like dev/staging to use mock switches)")
+		}
+		// 2026-10 安全审计：DATABASE_URL 的代码默认值带 sslmode=disable，
+		// 对流量离开本机的数据库意味着凭据与查询（含 PII、支付流水）明文
+		// 过网。loopback 与 docker/compose 单机内网（单标签服务名）豁免—
+		// 同机明文无可嗅探面；私有网段 IP 与多标签域名仍强制 TLS。
+		if dbURLDisablesTLSForRemoteHost(c.DatabaseURL) {
+			return errors.New("DATABASE_URL must not use sslmode=disable for a non-loopback database when APP_ENV is production (use sslmode=require or higher)")
 		}
 	}
 	// Keep the PayPal-specific semantics: the live PayPal channel is an

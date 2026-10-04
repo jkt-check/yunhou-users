@@ -59,6 +59,14 @@ type OrderRepo interface {
 	// which is safe: they predate the auto-renew channels.
 	FindPendingByUserAndProduct(ctx context.Context, userID, productCode string) (*model.Order, error)
 
+	// FindPendingByUserAndProductTx is the tx-scoped twin of
+	// FindPendingByUserAndProduct. CreateOrder calls it inside
+	// eligibilityAndInsertOrderTx AFTER taking the per-(user, product)
+	// advisory lock, closing the check-then-act race the outer fast-path
+	// guard cannot see (two concurrent CreateOrder txs both passing the
+	// guard before either commits).
+	FindPendingByUserAndProductTx(ctx context.Context, tx *sqlx.Tx, userID, productCode string) (*model.Order, error)
+
 	// FailPending atomically transitions pending → failed. Used as
 	// compensation when post-insert provider pre-auth fails (Paddle
 	// transaction creation / WeChat UnifiedOrder): the order would
@@ -315,6 +323,28 @@ func (r *orderRepo) FindByProviderOutTradeNo(ctx context.Context, outTradeNo str
 func (r *orderRepo) FindPendingByUserAndProduct(ctx context.Context, userID, productCode string) (*model.Order, error) {
 	var o model.Order
 	err := r.db.GetContext(ctx, &o, `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		  AND product_code = $2
+		  AND status = 'pending'
+		  AND expires_at > now()
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, userID, productCode)
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
+}
+
+// FindPendingByUserAndProductTx runs the same lookup inside the caller's
+// transaction. Correctness depends on the caller holding the per-(user,
+// product) advisory lock first (see PaymentService.eligibilityAndInsertOrderTx):
+// the lock serializes concurrent CreateOrder txs so this re-check observes
+// the winner's committed pending row.
+func (r *orderRepo) FindPendingByUserAndProductTx(ctx context.Context, tx *sqlx.Tx, userID, productCode string) (*model.Order, error) {
+	var o model.Order
+	err := tx.GetContext(ctx, &o, `
 		SELECT * FROM orders
 		WHERE user_id = $1
 		  AND product_code = $2

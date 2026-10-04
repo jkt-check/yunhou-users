@@ -740,6 +740,9 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 		// Post-insert pre-auth failures flip their order to failed, so the
 		// common "checkout never opened" retry is NOT held for the full
 		// ORDER_EXPIRY_DURATION window — only a genuinely open checkout is.
+		// This outer check is only the fast path: the race-proof variant
+		// (advisory lock + re-check) lives inside eligibilityAndInsertOrderTx
+		// (2026-10 审计：check-then-act 可被两个并发 CreateOrder 同时穿透）.
 		if channelAutoRenews(channel) {
 			if _, err := s.orderRepo.FindPendingByUserAndProduct(ctx, userID, requestedPlan.ProductCode); err == nil {
 				return nil, ErrUserHasPendingOrder
@@ -3022,15 +3025,18 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 	if nextBilled != nil {
 		orderExpiresAt = *nextBilled
 	}
-	// Amount/currency sanity check (review users-1, 2026-08-17): the
-	// signature proves the event came from PayPal, not that the settled
-	// amount matches the plan. A wrong-currency or below-plan renewal must
-	// NOT silently extend the subscription. Unlike the order-activation
-	// path (webhook_amount_mismatch → reject), the renewal path audit-logs
-	// mismatches but still processes: intl-staging runs plan-amount-override
-	// ($0.01/$0.10 sandbox charges) and the L3 suite fires $4.99 renewals,
-	// so hard-rejecting on amount would break legitimate test/staging flows.
-	// The audit row is the ops signal to investigate a genuine undercharge.
+	// Amount/currency sanity check (review users-1, 2026-08-17; hardened
+	// 安全审计 2026-10): the signature proves the event came from the
+	// channel, not that the settled amount matches the plan. A
+	// wrong-currency or below-plan renewal must NOT silently extend the
+	// subscription:
+	//   - plan-amount-override 未激活(生产):写 *_rejected audit 后硬拒绝
+	//     —— 不顺延订阅、不建 synthetic 订单/支付行。渠道确实扣了款,但
+	//     金额/币种对不上时先止损,由 ops 按 audit 人工核对后退款或手工
+	//     补偿;签名验证通过≠金额可信。
+	//   - override 激活(intl-staging 的 $0.01/$0.10 sandbox 扣款、L3
+	//     套件的 $4.99 续费):保持原 audit-only 放行,合法测试/预发流程
+	//     不受影响,audit 行仍是 ops 发现真实少收的信号。
 	//
 	// planRow is also the source of the synthetic order's snapshot
 	// descriptors (product_code / plan_interval_days, migration 029). The
@@ -3053,30 +3059,49 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 	} else {
 		planRow = plan
 		if !strings.EqualFold(e.Currency, plan.Currency) {
-			_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_currency_mismatch", e.Channel),
-				fmt.Sprintf("subscription:%s", sub.ID),
-				[]string{"webhook", e.Channel, "renewal", "currency_mismatch"},
-				map[string]any{
-					"event_id":       e.EventID,
-					"event_currency": e.Currency,
-					"plan_currency":  plan.Currency,
-					"amount":         e.Amount,
-					"payment_id":     "",
-					"order_id":       "",
-				})
+			ctxData := map[string]any{
+				"event_id":       e.EventID,
+				"event_currency": e.Currency,
+				"plan_currency":  plan.Currency,
+				"amount":         e.Amount,
+				"payment_id":     "",
+				"order_id":       "",
+			}
+			if OverridesActive() {
+				// override 激活:audit-only 放行(见上方注释)。
+				_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_currency_mismatch", e.Channel),
+					fmt.Sprintf("subscription:%s", sub.ID),
+					[]string{"webhook", e.Channel, "renewal", "currency_mismatch"},
+					ctxData)
+			} else {
+				// 生产硬拒绝:audit 随事务提交,不建订单/支付、不顺延。
+				return auditAndCommit(ctx, tx, "service", fmt.Sprintf("%s_renewal_currency_mismatch_rejected", e.Channel),
+					fmt.Sprintf("subscription:%s", sub.ID),
+					[]string{"webhook", e.Channel, "renewal", "currency_mismatch", "rejected"},
+					ctxData)
+			}
 		} else if toCents(e.Amount) < toCents(plan.Price) {
-			_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_amount_below_plan", e.Channel),
-				fmt.Sprintf("subscription:%s", sub.ID),
-				[]string{"webhook", e.Channel, "renewal", "amount_mismatch"},
-				map[string]any{
-					"event_id":     e.EventID,
-					"event_amount": e.Amount,
-					"plan_amount":  plan.Price,
-					"currency":     e.Currency,
-					"payment_id":   "",
-					"order_id":     "",
-					"note":         "audit-only; renewal still processed (plan-amount-override / test flows)",
-				})
+			ctxData := map[string]any{
+				"event_id":     e.EventID,
+				"event_amount": e.Amount,
+				"plan_amount":  plan.Price,
+				"currency":     e.Currency,
+				"payment_id":   "",
+				"order_id":     "",
+			}
+			if OverridesActive() {
+				ctxData["note"] = "audit-only; renewal still processed (plan-amount-override / test flows)"
+				_ = writeAuditOnTx(ctx, tx, "service", fmt.Sprintf("%s_renewal_amount_below_plan", e.Channel),
+					fmt.Sprintf("subscription:%s", sub.ID),
+					[]string{"webhook", e.Channel, "renewal", "amount_mismatch"},
+					ctxData)
+			} else {
+				ctxData["note"] = "rejected; renewal NOT processed (override inactive)"
+				return auditAndCommit(ctx, tx, "service", fmt.Sprintf("%s_renewal_amount_below_plan_rejected", e.Channel),
+					fmt.Sprintf("subscription:%s", sub.ID),
+					[]string{"webhook", e.Channel, "renewal", "amount_mismatch", "rejected"},
+					ctxData)
+			}
 		}
 	}
 	// Snapshot descriptors for the synthetic order: product comes from the
@@ -3476,6 +3501,27 @@ func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID
 			return ErrPlanCurrencyMismatch
 		}
 
+		// 2026-10 审计（双订阅竞态）：自动续费渠道的 pending 守卫原来是
+		// check-then-act——外层 FindPendingByUserAndProduct 与下面的 INSERT
+		// 分属不同事务，两个并发 CreateOrder 可同时通过守卫、各开一个
+		// 渠道侧自动续费订阅（双扣费不可恢复，见 2026-08-17 事故）。此处
+		// 在 tx 内按 (user, product) 取咨询锁串行化并锁后复查：后到者
+		// 看到先到者已提交的 pending 订单，按 ErrUserHasPendingOrder 拒绝。
+		// 取锁顺序固定为 plan FOR SHARE → advisory（本函数唯一路径），无
+		// 死锁面；一次性渠道（微信）不经过此路径，多单并行行为不受影响。
+		if channelAutoRenews(channel) && plan.ProductCode != "" {
+			if _, err := tx.ExecContext(ctx,
+				`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+				userID+"|"+plan.ProductCode); err != nil {
+				return fmt.Errorf("lock order scope: %w", err)
+			}
+			if _, err := s.orderRepo.FindPendingByUserAndProductTx(ctx, tx, userID, plan.ProductCode); err == nil {
+				return ErrUserHasPendingOrder
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("recheck pending order: %w", err)
+			}
+		}
+
 		// Benefit snapshot (migration 029): freeze the product, billing
 		// cycle, entitlement spec and upgrade-rule outcome ON the order.
 		// The payment callback honors only this snapshot — later operator
@@ -3625,19 +3671,22 @@ var channelWebhookBranches = map[string]map[string]webhookBranch{
 		"trade_refund":      branchRefund,
 	},
 	"paypal": {
-		// ACTIVATED is the subscription activation trigger: its resource
-		// carries custom_id (the order UUID the BFF set at creation),
-		// status=ACTIVE (the buyer actually approved) and
-		// billing_info.next_billing_time (expiry hint — 7-day trial end).
-		// CREATED fires pre-approval with status=APPROVAL_PENDING and must
-		// NOT activate: the buyer may abandon at the PayPal login.
-		"PAYMENT.CAPTURE.COMPLETED":      branchPaymentSuccess,
-		"BILLING.SUBSCRIPTION.ACTIVATED": branchPaymentSuccess,
-		"PAYMENT.CAPTURE.DENIED":         branchPaymentFailed,
-		"PAYMENT.CAPTURE.FAILED":         branchPaymentFailed,
-		"PAYMENT.CAPTURE.REFUNDED":       branchRefund,
-		"PAYMENT.SALE.REFUNDED":          branchRefund,
-		"PAYMENT.SALE.COMPLETED":         branchRenewal,
+		"PAYMENT.CAPTURE.COMPLETED": branchPaymentSuccess,
+		// BILLING.SUBSCRIPTION.ACTIVATED 已降级为 audit-only(branchNone,
+		// 安全审计 2026-10):PayPal 收银台已从前端退役,不会再有合法的新
+		// 订阅激活;且该激活路径只凭 custom_id 定位订单、SkipAmountCheck
+		// 跳过金额校验、无 plan 映射校验——攻击者用廉价自建订阅的
+		// ACTIVATED 即可激活高价套餐(custom_id 信任锚漏洞)。合法续费由
+		// PAYMENT.SALE.COMPLETED(branchRenewal)处理。若未来重新启用
+		// PayPal 收银台,必须先补 plan_id 映射校验再恢复
+		// branchPaymentSuccess。CREATED 本就不在表内(pre-approval,
+		// status=APPROVAL_PENDING,买家可能在 PayPal 登录页放弃),
+		// 保持 audit-only。
+		"PAYMENT.CAPTURE.DENIED":   branchPaymentFailed,
+		"PAYMENT.CAPTURE.FAILED":   branchPaymentFailed,
+		"PAYMENT.CAPTURE.REFUNDED": branchRefund,
+		"PAYMENT.SALE.REFUNDED":    branchRefund,
+		"PAYMENT.SALE.COMPLETED":   branchRenewal,
 	},
 	"paddle": {
 		// Initial subscription settlement (checkout completed,

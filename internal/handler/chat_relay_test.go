@@ -152,7 +152,7 @@ func TestRelayChatSSE_UsageRecordedOnClientGone(t *testing.T) {
 }
 
 func TestTruncateChatInput(t *testing.T) {
-	long := strings.Repeat("长", chatErrInputLogCap) // well over the byte cap
+	long := strings.Repeat("长", chatInputLogCap) // well over the byte cap
 	short := "hi"
 
 	out, truncated := truncateChatInput(nil)
@@ -181,8 +181,8 @@ func TestTruncateChatInput(t *testing.T) {
 	if len(out) != 3 || out[0].Content != short || out[2].Content != short {
 		t.Errorf("untouched messages changed: %+v", out)
 	}
-	if len(out[1].Content) > chatErrInputLogCap {
-		t.Errorf("long content len = %d > cap %d", len(out[1].Content), chatErrInputLogCap)
+	if len(out[1].Content) > chatInputLogCap {
+		t.Errorf("long content len = %d > cap %d", len(out[1].Content), chatInputLogCap)
 	}
 	if !utf8.ValidString(out[1].Content) {
 		t.Error("truncated content is not valid UTF-8 (rune boundary broken)")
@@ -198,7 +198,7 @@ func TestTruncateChatInput(t *testing.T) {
 // them would make the audit trail unreliable for debugging exactly the
 // thinking-mode/tool-calling relay issues it exists for.
 func TestTruncateChatInput_PreservesRelayFields(t *testing.T) {
-	long := strings.Repeat("长", chatErrInputLogCap)
+	long := strings.Repeat("长", chatInputLogCap)
 	big := []model.ChatMessage{
 		{Role: "assistant", Content: long, ReasoningContent: "trace",
 			ToolCalls: []model.ToolCall{{ID: "call_1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: "{}"}}}},

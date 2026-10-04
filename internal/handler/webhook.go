@@ -570,7 +570,10 @@ func (h *WebhookHandler) parsePaypal(raw []byte) (*service.WebhookEvent, error) 
 	// resource.billing_agreement_id. Lifecycle events
 	// (BILLING.SUBSCRIPTION.*) DO echo the custom_id the BFF set at
 	// subscription creation (verified against live sandbox events
-	// 2026-08-17), which is how ACTIVATED finds the order row. Requiring
+	// 2026-08-17). Since the 2026-10 security audit ACTIVATED no longer
+	// activates anything (PayPal retired from the frontend; the custom_id
+	// trust anchor was exploitable) — it lands on branchNone audit-only,
+	// but parsing is kept so the audit trail stays complete. Requiring
 	// custom_id globally would silently drop every renewal webhook,
 	// leaving paid customers without an extended subscription.
 	// PAYMENT.CAPTURE.COMPLETED for one-time purchases still requires

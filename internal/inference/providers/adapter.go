@@ -126,6 +126,12 @@ type DispatchError struct {
 	// reservation must be held for reconciliation, never silently released
 	// (设计 §7.2).
 	ExecutedUnknown bool
+	// NoCooldown marks failures that must NOT feed the 60s retry cooldown
+	// （pr-ci 第三轮 FullLifecycleE2E）：凭据解析失败、派发时账号已非
+	// active 这类「状态问题」不是上游瞬时故障——冷却 60s 会让管理面
+	// reactivate 后账号仍被 cooled map 挡在候选之外（全线 502）。 failover
+	// 到下一候选照常，只是不冷却。
+	NoCooldown bool
 }
 
 func (e *DispatchError) Error() string {

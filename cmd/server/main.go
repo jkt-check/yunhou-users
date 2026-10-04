@@ -362,8 +362,6 @@ func main() {
 	oauthSvc := inferencecredentials.NewOAuthService(credVault, infStore, infStore, connectorClient, oauthRegistry, credSvc, nil)
 	credRefresher := inferencecredentials.NewRefresher(credVault, infStore, infStore, connectorClient, oauthRegistry, nil)
 
-	accountSvc := inferencecredentials.NewAccountService(infStore, infStore)
-
 	adminOps := &inferencehttpapi.AdminOps{
 		RequireModels:      inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermModelsManage),
 		RequireCredentials: inferencehttpapi.OperatorAuthz(infStore, inferencemanagement.PermCredentialsManage),
@@ -377,7 +375,7 @@ func main() {
 		Auth:         inferencehttpapi.NewAdminAuthHandler(infStore, infStore),
 		OAuth:        inferencehttpapi.NewAdminOAuthHandler(oauthSvc, credRefresher, infStore),
 		// 可调度账号管理面（凭据→账号绑定/启停/调并发），同 credentials:manage。
-		Accounts: inferencehttpapi.NewAdminAccountsHandler(accountSvc),
+		Accounts: inferencehttpapi.NewAdminAccountsHandler(inferencecredentials.NewAccountService(infStore, infStore)),
 		// Task 15: 补偿/冲正带同事务追加审计；补偿列表经运营读模型。
 		Adjustments: inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil, infStore, opsViewSvc),
 		// Task 15: 批量导入（dry-run/逐项错误/幂等任务 ID/绝不半发布）。
@@ -413,12 +411,6 @@ func main() {
 		inferencedomain.ProtocolAnthropicMessage: inferenceproviders.NewAnthropicMessages(),
 	}
 	routingSvc := inferencerouting.NewService(infStore, adapters, nil)
-	// 管理面账号变更（创建/启停/调并发）提交后主动失效 routing 的 1s TTL
-	// 账号池缓存——否则 reactivate 后 TTL 窗口内调度仍看到 disabled 快照，
-	// 全线调用 502（pr-ci 回归：FullLifecycleE2E；「管理面改账号状态后
-	// 1s 内全线 502」在线上真实可感）。钩子跨包解耦：credentials 不
-	// import routing。
-	accountSvc.OnAccountsChanged = routingSvc.InvalidateAllAccounts
 	quotaSvc := inferencequota.NewService(infStore, nil)
 	entitlementResolver := inferenceaccess.NewEntitlementResolver(infStore, nil)
 	gatewayHTTPClient := inferenceproviders.NewHTTPClient(egressValidator)

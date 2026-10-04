@@ -23,6 +23,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -644,7 +645,12 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 			continue
 		default:
 			// Retryable (429/5xx/transport): cool the account and fail over.
-			s.routingSvc.CooldownAfterFailure(cand.Account.ID)
+			// NoCooldown 的失败（凭据解析失败 / 派发时账号已非 active）是
+			// 状态问题不是上游瞬时故障——换下一个候选但不冷却（pr-ci 第三轮：
+			// 冷却会让管理面 reactivate 后账号仍被 cooled map 挡 60s）。
+			if !de.NoCooldown {
+				s.routingSvc.CooldownAfterFailure(cand.Account.ID)
+			}
 			continue
 		}
 	}
@@ -687,6 +693,11 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	}
 	lease, err := s.persistAttempt(ctx, attempt, cand, now)
 	if err != nil {
+		if errors.Is(err, routing.ErrAccountInactiveAtDispatch) {
+			// 选型之后账号被停用（管理面/级联，候选来自 1s TTL 缓存）：
+			// 换下一个候选，不喂冷却（pr-ci 第三轮 FullLifecycleE2E）。
+			return nil, &providers.DispatchError{Err: err, NoCooldown: true}
+		}
 		if domain.CodeOf(err) == domain.CodeInsufficientCapacity {
 			return nil, &providers.DispatchError{Err: err}
 		}
@@ -721,10 +732,13 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 
 	// Secret resolution (Task 4). A rotated/disabled credential rejects
 	// this candidate, not the whole request.
+	// NoCooldown（pr-ci 第三轮）：凭据不可用是状态问题（吊销/轮换），
+	// 不是上游瞬时故障——喂 60s 重试型冷却会让 reactivate 后账号仍被
+	// cooled map 挡在候选外（FullLifecycleE2E 502 的真因）。
 	secret, _, err := s.secrets.ResolveSecret(ctx, cand.Account.CredentialID, nil)
 	if err != nil {
 		failAttempt("failed", "credential")
-		return nil, &providers.DispatchError{Err: err}
+		return nil, &providers.DispatchError{Err: err, NoCooldown: true}
 	}
 
 	extraHeaders, err := domain.ExtensionHeaders(cand.Deployment.Config)

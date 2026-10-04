@@ -97,5 +97,8 @@ func ApplyPlanAmountOverride(planID string, originalPrice float64) float64 {
 func OverridesActive() bool {
 	overrideMu.RLock()
 	defer overrideMu.RUnlock()
-	return overrideMap != nil
+	// len>0 而非 != nil：PLAN_AMOUNT_OVERRIDE_JSON="{}" 解析成功但为空
+	// map——空覆盖等于没覆盖，不得让续费核对落入 audit-only 旁路
+	// （三轮评审 M1）。
+	return len(overrideMap) > 0
 }

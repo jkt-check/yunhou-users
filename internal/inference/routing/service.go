@@ -190,16 +190,6 @@ func (s *Service) InvalidateAccounts(providerID string) {
 	s.acctMu.Unlock()
 }
 
-// InvalidateAllAccounts 清空全部 provider 的账号池缓存。账号池规模小
-// （每 provider 一次查库），管理面写路径（创建/启停/调并发）提交后调用，
-// 避免 1s TTL 窗口内调度看到过期账号状态——reactivate 后缓存仍标
-// disabled 会让全线调用 502（pr-ci 回归：FullLifecycleE2E）。
-func (s *Service) InvalidateAllAccounts() {
-	s.acctMu.Lock()
-	s.acctCache = map[string]cachedAccounts{}
-	s.acctMu.Unlock()
-}
-
 // activeAccounts 返回某 provider 的活跃账号池，带 1s TTL 进程内缓存。
 // 错误不缓存；双重检查避免并发过期时同一 provider 的重复查库。fresh=true
 // 跳过缓存读直查库并回写（用于空候选重查/迁移冲突后的刷新）。返回的
@@ -297,6 +287,20 @@ func (s *Service) CooldownAfterFailure(accountID string) {
 // AcquireUpstreamLease takes the per-account concurrency lease inside the
 // caller's transaction (the gateway persists the attempt row in the same
 // tx, so lease and attempt intent commit or roll back together).
+// ErrAccountInactiveAtDispatch 是派发时事务内复查（AcquireUpstreamLease）
+// 发现账号已非 active 的哨兵错误：候选来自 1s TTL 账号池缓存，管理面停用
+// /凭据吊销级联可能落在选型之后（pr-ci 第三轮 FullLifecycleE2E）。gateway
+// 据此换下一个候选且不喂 60s 冷却（状态问题，非上游瞬时故障）。
+var ErrAccountInactiveAtDispatch = domain.NewError(domain.CodeConflict,
+	"upstream account not active at dispatch")
+
+// accountActiveRecheckTx 是 store 的可选升级：派发事务内 FOR UPDATE 复查
+// 账号状态。postgres.Store 实现；窄 fake 不实现则跳过复查（与 quotaStore /
+// credentialLockTx 同一惯例）。
+type accountActiveRecheckTx interface {
+	GetUpstreamAccountStatusForUpdateTx(ctx context.Context, w domain.UnitOfWork, id string) (domain.UpstreamAccountStatus, error)
+}
+
 func (s *Service) AcquireUpstreamLease(ctx context.Context, w domain.UnitOfWork, account domain.UpstreamAccount, requestID string, now time.Time) (*domain.ConcurrencyLease, error) {
 	limit := account.ConcurrencyLimit
 	if limit <= 0 {
@@ -305,6 +309,21 @@ func (s *Service) AcquireUpstreamLease(ctx context.Context, w domain.UnitOfWork,
 		// 0 —— 按容量耗尽处理让调用方换下一个候选，绝不静默当 1 放行。
 		return nil, domain.NewError(domain.CodeInsufficientCapacity,
 			"upstream account parked (concurrency_limit 0)")
+	}
+	// 派发时事务内复查 status='active'：FOR SHARE 行锁与并发的管理面
+	// 停用事务互斥，读取定序在两者之一之后。复查失败返回哨兵，调用方
+	// failover 且不冷却。
+	if rc, ok := s.store.(accountActiveRecheckTx); ok {
+		status, err := rc.GetUpstreamAccountStatusForUpdateTx(ctx, w, account.ID)
+		if err != nil {
+			if domain.CodeOf(err) == domain.CodeNotFound {
+				return nil, ErrAccountInactiveAtDispatch
+			}
+			return nil, domain.WrapError(domain.CodeInternal, "lease: account status recheck", err)
+		}
+		if status != domain.AccountActive {
+			return nil, ErrAccountInactiveAtDispatch
+		}
 	}
 	return s.store.AcquireLeaseTx(ctx, w, domain.AcquireLeaseCommand{
 		Scope:      domain.LeaseScopeUpstreamAccount,

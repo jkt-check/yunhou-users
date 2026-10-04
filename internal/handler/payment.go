@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/service"
@@ -290,6 +291,12 @@ func (h *PaymentHandler) CreateRefund(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+	// payment_id 必须是合法 uuid——非法值（含空串）直接 400，不能放到
+	// service 层让 pq 22P02 以 500 形态漏出（pr-ci 回归反馈）。
+	if _, err := uuid.Parse(req.PaymentID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid payment_id"})
 		return
 	}
 

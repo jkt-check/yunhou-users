@@ -123,10 +123,23 @@ type CreateAccountInput struct {
 type AccountService struct {
 	store AccountStore
 	audit management.AuditRecorder
+	// OnAccountsChanged 在每次账号变更（创建/启停/调并发）提交后触发
+	// ——装配线接 routing.Service.InvalidateAllAccounts，让管理面写入对
+	// 1s TTL 账号池缓存立即可见（reactivate 后 TTL 窗口内全线 502 的
+	// pr-ci 回归）。跨包解耦：credentials 不 import routing。可选，
+	// 单测不接钩子时语义不变。
+	OnAccountsChanged func()
 }
 
 func NewAccountService(store AccountStore, audit management.AuditRecorder) *AccountService {
 	return &AccountService{store: store, audit: audit}
+}
+
+// notifyAccountsChanged 在变更提交后触发钩子（未设置时 no-op）。
+func (s *AccountService) notifyAccountsChanged() {
+	if s.OnAccountsChanged != nil {
+		s.OnAccountsChanged()
+	}
 }
 
 func (s *AccountService) runAtomicAccounts(ctx context.Context, fn func(w domain.UnitOfWork) error) (bool, error) {
@@ -311,6 +324,7 @@ func (s *AccountService) Create(ctx context.Context, op Operator, in CreateAccou
 		if err != nil {
 			return nil, s.createConflictView(ctx, in.ProviderID, in.CredentialID, err)
 		}
+		s.notifyAccountsChanged()
 		return account, nil
 	}
 	// Sequential fallback for plain (non-transactional) test stores.
@@ -320,6 +334,7 @@ func (s *AccountService) Create(ctx context.Context, op Operator, in CreateAccou
 	if err := s.recordAccount(ctx, op, "upstream_account.create", account.ID, in.Reason, detail); err != nil {
 		return nil, err
 	}
+	s.notifyAccountsChanged()
 	return account, nil
 }
 
@@ -503,6 +518,7 @@ func (s *AccountService) SetStatus(ctx context.Context, op Operator, id, status,
 		}
 	}
 	account.Status = to
+	s.notifyAccountsChanged()
 	return account, nil
 }
 
@@ -562,5 +578,6 @@ func (s *AccountService) Update(ctx context.Context, op Operator, id string, dis
 	if concurrencyLimit != nil {
 		account.ConcurrencyLimit = *concurrencyLimit
 	}
+	s.notifyAccountsChanged()
 	return account, nil
 }

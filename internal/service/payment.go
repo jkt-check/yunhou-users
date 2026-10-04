@@ -1642,10 +1642,16 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 	// Caller-retry gate: same (user, key) → same row, no channel call.
 	// Scoped to in.UserID — a global key lookup would let user B see user
 	// A's refund response by reusing the same key (IDOR).
-	if existing, err := s.refundRepo.FindByIdempotencyKey(ctx, in.UserID, in.IdempotencyKey); err == nil && existing != nil {
-		return &RefundResult{Refund: existing, Existing: true}, nil
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("check idempotency: %w", err)
+	// InternalApp 调用方 in.UserID 为空：refunds.user_id 是 uuid 列，空串
+	// 查询直接 22P02（pr-ci 回归）；且该路径的 refund 行一律落在订单归属
+	// 用户名下（见下），空 UserID 的预查永远不可能命中——跳过，重放由
+	// 下方 canonical-owner 复查覆盖。
+	if in.UserID != "" {
+		if existing, err := s.refundRepo.FindByIdempotencyKey(ctx, in.UserID, in.IdempotencyKey); err == nil && existing != nil {
+			return &RefundResult{Refund: existing, Existing: true}, nil
+		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("check idempotency: %w", err)
+		}
 	}
 
 	payment, err := s.paymentRepo.FindByID(ctx, in.PaymentID)
@@ -1669,9 +1675,10 @@ func (s *PaymentService) Refund(ctx context.Context, in RefundInput) (*RefundRes
 	}
 	// Canonical-owner replay check: the refund row is INSERTed under
 	// o.UserID below, but the pre-check above ran under in.UserID — which
-	// is EMPTY for internal-app callers, so their idempotent replay would
-	// always miss and re-call the channel (double refund). Re-check under
-	// the canonical owner whenever it differs.
+	// is EMPTY for internal-app callers (pre-check skipped entirely), so
+	// their idempotent replay would always miss and re-call the channel
+	// (double refund). Re-check under the canonical owner whenever it
+	// differs.
 	if o.UserID != in.UserID {
 		if existing, err := s.refundRepo.FindByIdempotencyKey(ctx, o.UserID, in.IdempotencyKey); err == nil && existing != nil {
 			return &RefundResult{Refund: existing, Existing: true}, nil

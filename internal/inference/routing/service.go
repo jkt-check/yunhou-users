@@ -190,6 +190,16 @@ func (s *Service) InvalidateAccounts(providerID string) {
 	s.acctMu.Unlock()
 }
 
+// InvalidateAllAccounts 清空全部 provider 的账号池缓存。账号池规模小
+// （每 provider 一次查库），管理面写路径（创建/启停/调并发）提交后调用，
+// 避免 1s TTL 窗口内调度看到过期账号状态——reactivate 后缓存仍标
+// disabled 会让全线调用 502（pr-ci 回归：FullLifecycleE2E）。
+func (s *Service) InvalidateAllAccounts() {
+	s.acctMu.Lock()
+	s.acctCache = map[string]cachedAccounts{}
+	s.acctMu.Unlock()
+}
+
 // activeAccounts 返回某 provider 的活跃账号池，带 1s TTL 进程内缓存。
 // 错误不缓存；双重检查避免并发过期时同一 provider 的重复查库。fresh=true
 // 跳过缓存读直查库并回写（用于空候选重查/迁移冲突后的刷新）。返回的

@@ -525,7 +525,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		t.Parallel()
 		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
 		rec := doRequest(engine, http.MethodPost, "/refunds", map[string]any{
-			"payment_id": "p-1",
+			"payment_id": "11111111-1111-1111-1111-111111111111",
 			"amount":     5.0,
 		})
 
@@ -538,7 +538,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		t.Parallel()
 		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
 		req := httptest.NewRequest(http.MethodPost, "/refunds",
-			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+			bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":5.0}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", "short")
 		rec := httptest.NewRecorder()
@@ -553,7 +553,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		t.Parallel()
 		engine := paymentTestEngine(&mockPaymentSvc{}, "user-1")
 		req := httptest.NewRequest(http.MethodPost, "/refunds",
-			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+			bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":5.0}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", "has spaces here!")
 		rec := httptest.NewRecorder()
@@ -573,7 +573,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		}
 		engine := paymentTestEngine(svc, "user-1")
 		req := httptest.NewRequest(http.MethodPost, "/refunds",
-			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+			bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":5.0}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", "uuid_abc-123.def:42")
 		rec := httptest.NewRecorder()
@@ -593,7 +593,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		}
 		engine := paymentTestEngine(svc, "user-1")
 		req := httptest.NewRequest(http.MethodPost, "/refunds",
-			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+			bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":5.0}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", "idem-001")
 		rec := httptest.NewRecorder()
@@ -609,7 +609,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		svc := &mockPaymentSvc{refundErr: service.ErrRefundAmountInvalid}
 		engine := paymentTestEngine(svc, "user-1")
 		req := httptest.NewRequest(http.MethodPost, "/refunds",
-			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":-1}`)))
+			bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":-1}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", "idem-bad")
 		rec := httptest.NewRecorder()
@@ -625,7 +625,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		svc := &mockPaymentSvc{refundErr: service.ErrRefundChannelFailed}
 		engine := paymentTestEngine(svc, "user-1")
 		req := httptest.NewRequest(http.MethodPost, "/refunds",
-			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+			bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":5.0}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", "idem-channel-fail")
 		rec := httptest.NewRecorder()
@@ -641,7 +641,7 @@ func TestPaymentHandler_CreateRefund(t *testing.T) {
 		svc := &mockPaymentSvc{refundErr: service.ErrRefundSumExceedsPayment}
 		engine := paymentTestEngine(svc, "user-1")
 		req := httptest.NewRequest(http.MethodPost, "/refunds",
-			bytes.NewReader([]byte(`{"payment_id":"p-1","amount":1000.0}`)))
+			bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1000.0}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", "idem-sum")
 		rec := httptest.NewRecorder()
@@ -676,7 +676,7 @@ func TestPaymentHandler_CreateRefund_InternalApp(t *testing.T) {
 	engine.POST("/refunds", h.CreateRefund)
 
 	req := httptest.NewRequest(http.MethodPost, "/refunds",
-		bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+		bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":5.0}`)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "idem-internal-001")
 	rec := httptest.NewRecorder()
@@ -709,7 +709,7 @@ func TestPaymentHandler_CreateRefund_JWTFallback(t *testing.T) {
 	}
 	engine := paymentRefundEngineNoApp(svc, "user-1")
 	req := httptest.NewRequest(http.MethodPost, "/refunds",
-		bytes.NewReader([]byte(`{"payment_id":"p-1","amount":5.0}`)))
+		bytes.NewReader([]byte(`{"payment_id":"11111111-1111-1111-1111-111111111111","amount":5.0}`)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "idem-jwt-001")
 	rec := httptest.NewRecorder()
@@ -1002,32 +1002,32 @@ func TestWritePaymentError_Branches(t *testing.T) {
 		// Refund branches (need Idempotency-Key header to pass entry guard)
 		{"CreateRefund_ErrRefundAmountInvalid_400",
 			&mockPaymentSvc{refundErr: service.ErrRefundAmountInvalid},
-			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":-1}`,
+			http.MethodPost, "/refunds", `{"payment_id":"11111111-1111-1111-1111-111111111111","amount":-1}`,
 			map[string]string{"Idempotency-Key": "test-key-12345"},
 			http.StatusBadRequest, "refund amount"},
 		{"CreateRefund_ErrRefundSumExceedsPayment_400",
 			&mockPaymentSvc{refundErr: service.ErrRefundSumExceedsPayment},
-			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			http.MethodPost, "/refunds", `{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1}`,
 			map[string]string{"Idempotency-Key": "test-key-12345"},
 			http.StatusBadRequest, "sum of refunds"},
 		{"CreateRefund_ErrRefundChannelFailed_502",
 			&mockPaymentSvc{refundErr: service.ErrRefundChannelFailed},
-			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			http.MethodPost, "/refunds", `{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1}`,
 			map[string]string{"Idempotency-Key": "test-key-12345"},
 			http.StatusBadGateway, "channel refund"},
 		{"CreateRefund_ErrPaymentNotFound_404",
 			&mockPaymentSvc{refundErr: service.ErrPaymentNotFound},
-			http.MethodPost, "/refunds", `{"payment_id":"missing","amount":1}`,
+			http.MethodPost, "/refunds", `{"payment_id":"22222222-2222-2222-2222-222222222222","amount":1}`,
 			map[string]string{"Idempotency-Key": "test-key-12345"},
 			http.StatusNotFound, "not found"},
 		{"CreateRefund_ErrPaymentNotPaid_409",
 			&mockPaymentSvc{refundErr: service.ErrPaymentNotPaid},
-			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			http.MethodPost, "/refunds", `{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1}`,
 			map[string]string{"Idempotency-Key": "test-key-12345"},
 			http.StatusConflict, "not in paid"},
 		{"CreateRefund_unknown_500",
 			&mockPaymentSvc{refundErr: errors.New("db exploded")},
-			http.MethodPost, "/refunds", `{"payment_id":"p-1","amount":1}`,
+			http.MethodPost, "/refunds", `{"payment_id":"11111111-1111-1111-1111-111111111111","amount":1}`,
 			map[string]string{"Idempotency-Key": "test-key-12345"},
 			http.StatusInternalServerError, "internal"},
 

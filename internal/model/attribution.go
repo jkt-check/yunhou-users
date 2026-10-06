@@ -1,6 +1,9 @@
 package model
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // attributionFieldMaxLen caps every string sub-field of an attribution
 // touch. The website-side tracker can hand us arbitrarily long URLs and
@@ -59,6 +62,15 @@ func SanitizeAttribution(raw json.RawMessage) (json.RawMessage, error) {
 func (t *AttributionTouch) truncate() {
 	if t == nil {
 		return
+	}
+	// landing_path keeps only the path: query/fragment are cut BEFORE
+	// truncation — the server is the last enforcement point before
+	// PostHog, and a website-side bug could otherwise leak PII
+	// (/checkout?email=…) into event properties.
+	if t.LandingPath != nil {
+		if i := strings.IndexAny(*t.LandingPath, "?#"); i >= 0 {
+			*t.LandingPath = (*t.LandingPath)[:i]
+		}
 	}
 	for _, p := range []*string{
 		t.UtmSource, t.UtmMedium, t.UtmCampaign, t.UtmContent,

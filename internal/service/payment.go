@@ -274,8 +274,11 @@ func billingCycleFromInterval(days *int) string {
 // emitRefundCompleted captures the M3 refund_completed event (paddle
 // surface only) after the refund row reached paid. The uuid keys on the
 // internal refund row id — find-or-insert keeps that id stable across
-// replays, so PostHog dedupes redeliveries. Nil-safe, fire-and-forget.
-func (s *PaymentService) emitRefundCompleted(payment *model.Payment, order *model.Order, refundID string, amount float64) {
+// replays, so PostHog dedupes redeliveries. extID is the channel-side
+// refund key (paddle adjustment id) — carrying it in properties makes
+// PostHog↔Paddle reconciliation a single lookup. Nil-safe,
+// fire-and-forget.
+func (s *PaymentService) emitRefundCompleted(payment *model.Payment, order *model.Order, refundID, extID string, amount float64) {
 	if s.analytics == nil {
 		return
 	}
@@ -285,14 +288,15 @@ func (s *PaymentService) emitRefundCompleted(payment *model.Payment, order *mode
 		UUID:       analytics.EventUUID("refund:" + refundID),
 		Timestamp:  time.Now(),
 		Properties: map[string]any{
-			"refund_id":       refundID,
-			"transaction_id":  payment.ExternalTxnID,
-			"order_id":        payment.OrderID,
-			"amount_refunded": amount,
-			"currency":        payment.Currency,
-			"channel":         "paddle",
-			"region":          "intl",
-			"environment":     s.analytics.Environment(),
+			"refund_id":          refundID,
+			"external_refund_id": extID,
+			"transaction_id":     payment.ExternalTxnID,
+			"order_id":           payment.OrderID,
+			"amount_refunded":    amount,
+			"currency":           payment.Currency,
+			"channel":            "paddle",
+			"region":             "intl",
+			"environment":        s.analytics.Environment(),
 		},
 	})
 }
@@ -1922,6 +1926,14 @@ type WebhookEvent struct {
 	// custom_data (including the original order_id) onto renewal
 	// transactions. Initial checkout transactions arrive as "web"/"api".
 	Origin string
+	// AdjustmentAction is Paddle's adjustment action (data.action), only
+	// populated for approved adjustment.updated events. "refund" is
+	// signalled via ExternalRefundID instead (it keys the refund row);
+	// "chargeback" / "chargeback_reverse" ride here so resolveBranch can
+	// route them to an alertable audit marker without touching the
+	// refund/entitlement machinery (M3 review — entitlement handling on
+	// chargebacks is deliberately deferred).
+	AdjustmentAction string
 	// SkipAmountCheck exempts PayPal lifecycle events
 	// (BILLING.SUBSCRIPTION.ACTIVATED etc.) from the amount/currency
 	// validation in onPaymentSucceeded: PayPal omits resource.amount from
@@ -2034,6 +2046,13 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 	case branchSubscriptionCancelled:
 		domainAction = branch.domainAction()
 		if err := s.onPaddleSubscriptionCancelled(ctx, e); err != nil {
+			return nil, err
+		}
+	case branchChargebackUnhandled:
+		// Audit-only marker; domainAction stays "none" so the handler
+		// response shape is unchanged.
+		domainAction = branch.domainAction()
+		if err := s.onPaddleChargebackUnhandled(ctx, e); err != nil {
 			return nil, err
 		}
 	default:
@@ -2448,7 +2467,9 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		s.noteLatePaymentHonored(order, paymentID, e.Channel)
 	}
 	// M3 analytics: purchase_completed for the paddle surface only.
-	// Zero-amount settlements (trial transactions) never emit.
+	// Zero-amount settlements (trial transactions) never emit. Amount
+	// semantics: first purchase reports the CATALOG price (order.Amount) —
+	// the renewal path reports the settled amount instead (see below).
 	if e.Channel == "paddle" && order.Amount > 0 {
 		s.emitPurchaseCompleted(e, order, order.PlanIntervalDays, "first_purchase")
 	}
@@ -2862,7 +2883,7 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	// the stable internal refund row id. 无归属行的重投（refundID 为空）
 	// 没有事件可发——金额效应已由首次投递承载。
 	if e.Channel == "paddle" && refundID != "" {
-		s.emitRefundCompleted(&payment, &order, refundID, rowAmount)
+		s.emitRefundCompleted(&payment, &order, refundID, extID, rowAmount)
 	}
 	return nil
 }
@@ -3354,7 +3375,10 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 	}
 	// M3 analytics: paddle renewals are purchases too (purchase_type=
 	// "renewal"). The synthetic renewal order carries no attribution — the
-	// snapshot lives on the original purchase's event.
+	// snapshot lives on the original purchase's event. Amount semantics
+	// diverge from first purchase by design: renewals report the SETTLED
+	// amount (e.Amount, tax-inclusive as charged), since a synthetic order
+	// has no catalog price of its own beyond what the channel collected.
 	if e.Channel == "paddle" && e.Amount > 0 {
 		s.emitPurchaseCompleted(e, &model.Order{
 			ID: orderID, UserID: sub.UserID, PlanID: sub.PlanID,
@@ -3758,6 +3782,11 @@ const (
 	branchDisputeClosed
 	branchRenewal
 	branchSubscriptionCancelled
+	// branchChargebackUnhandled: an approved paddle chargeback /
+	// chargeback_reverse adjustment. Money moved channel-side via a
+	// dispute; we record an alertable audit marker and ack — entitlement
+	// revocation on chargebacks is deliberately deferred (M3 review).
+	branchChargebackUnhandled
 )
 
 // domainAction is the OnWebhookResult.DomainAction value for a branch.
@@ -3864,6 +3893,9 @@ var channelWebhookBranches = map[string]map[string]webhookBranch{
 		// including console-initiated manual refunds — is action="refund"
 		// + status="approved". resolveBranch only lets parser-populated
 		// refund adjustments (ExternalRefundID set) reach branchRefund;
+		// approved chargebacks / chargeback_reverses are parsed and routed
+		// to branchChargebackUnhandled (alertable audit marker only —
+		// entitlement handling on chargebacks is deliberately deferred);
 		// credits, pending/rejected and adjustment.created stay
 		// audit-only.
 		"adjustment.updated": branchRefund,
@@ -3916,12 +3948,18 @@ func resolveBranch(e WebhookEvent) webhookBranch {
 			return branchNone
 		}
 	}
-	// Paddle adjustment.updated is dual-purpose: only completed refunds
+	// Paddle adjustment.updated is triple-purpose: completed refunds
 	// (action=refund + status=approved, signalled by the parser populating
-	// ExternalRefundID) settle a refund; every other adjustment is
-	// audit-only.
-	if e.Channel == "paddle" && e.EventType == "adjustment.updated" && e.ExternalRefundID == "" {
-		return branchNone
+	// ExternalRefundID) settle a refund; approved chargebacks route to an
+	// alertable audit marker (entitlement handling deliberately deferred);
+	// every other adjustment is audit-only.
+	if e.Channel == "paddle" && e.EventType == "adjustment.updated" {
+		if e.AdjustmentAction == "chargeback" || e.AdjustmentAction == "chargeback_reverse" {
+			return branchChargebackUnhandled
+		}
+		if e.ExternalRefundID == "" {
+			return branchNone
+		}
 	}
 	return dispatchBranch(e.Channel, e.EventType)
 }

@@ -847,14 +847,38 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 			if adj.TransactionID == "" {
 				return nil, fmt.Errorf("paddle refund adjustment missing data.transaction_id")
 			}
+			// totals.total must be present and parseable: RefundAmount=0
+			// would violate refunds.amount CHECK (amount > 0) downstream,
+			// turning one malformed event into an infinite 500/retry loop.
+			if adj.Totals.Total == "" {
+				return nil, fmt.Errorf("paddle refund adjustment missing totals.total")
+			}
+			v, err := strconv.ParseFloat(adj.Totals.Total, 64)
+			if err != nil {
+				return nil, fmt.Errorf("paddle refund adjustment totals.total %q: %w", adj.Totals.Total, err)
+			}
+			// Non-positive parseable values ("0", negatives) fail the same
+			// refunds.amount CHECK (amount > 0) downstream — reject here.
+			if v <= 0 {
+				return nil, fmt.Errorf("paddle refund adjustment non-positive totals.total %q", adj.Totals.Total)
+			}
 			we.ExternalRefundID = adj.ID
 			we.TransactionID = adj.TransactionID
 			we.Currency = strings.ToUpper(adj.CurrencyCode)
+			we.RefundAmount = v / 100 // minor units → major units
+		}
+		// Chargebacks (dispute-driven money movement, incl. console-side)
+		// are parsed just enough to be alertable — action, transaction,
+		// amount, currency — but deliberately stay off the refund fields
+		// so they never reach branchRefund/entitlement logic.
+		if evt.EventType == "adjustment.updated" && adj.Status == "approved" &&
+			(adj.Action == "chargeback" || adj.Action == "chargeback_reverse") {
+			we.AdjustmentAction = adj.Action
+			we.TransactionID = adj.TransactionID
+			we.Currency = strings.ToUpper(adj.CurrencyCode)
 			if adj.Totals.Total != "" {
-				if v, err := strconv.ParseFloat(adj.Totals.Total, 64); err != nil {
-					log.Printf("paddle: event %s has unparseable adjustment totals.total %q: %v", evt.EventID, adj.Totals.Total, err)
-				} else {
-					we.RefundAmount = v / 100 // minor units → major units
+				if v, err := strconv.ParseFloat(adj.Totals.Total, 64); err == nil {
+					we.Amount = v / 100
 				}
 			}
 		}

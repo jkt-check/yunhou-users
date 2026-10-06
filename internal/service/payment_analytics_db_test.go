@@ -326,14 +326,15 @@ func TestOnWebhook_PaddleAdjustmentRefund_Full(t *testing.T) {
 		t.Errorf("uuid = %q, want EventUUID(refund:%s)", evt.UUID, refundID)
 	}
 	for k, want := range map[string]any{
-		"refund_id":       refundID,
-		"transaction_id":  txnID,
-		"order_id":        orderID,
-		"amount_refunded": 19.9,
-		"currency":        "CNY",
-		"channel":         "paddle",
-		"region":          "intl",
-		"environment":     "production",
+		"refund_id":          refundID,
+		"external_refund_id": adjID,
+		"transaction_id":     txnID,
+		"order_id":           orderID,
+		"amount_refunded":    19.9,
+		"currency":           "CNY",
+		"channel":            "paddle",
+		"region":             "intl",
+		"environment":        "production",
 	} {
 		if evt.Properties[k] != want {
 			t.Errorf("properties[%q] = %v, want %v", k, evt.Properties[k], want)
@@ -395,6 +396,9 @@ func TestOnWebhook_PaddleAdjustmentRefund_Partial(t *testing.T) {
 	}
 	if evts[0].Properties["amount_refunded"] != 5.0 {
 		t.Errorf("amount_refunded = %v, want 5.0", evts[0].Properties["amount_refunded"])
+	}
+	if evts[0].Properties["external_refund_id"] != adjID {
+		t.Errorf("external_refund_id = %v, want %s (paddle adjustment id)", evts[0].Properties["external_refund_id"], adjID)
 	}
 }
 
@@ -478,5 +482,63 @@ func TestOnWebhook_PaddleAdjustmentRefund_ReplayDedup(t *testing.T) {
 		`SELECT id FROM refunds WHERE channel = 'paddle' AND external_refund_id = $1`, adjID)
 	if wantUUID != analytics.EventUUID("refund:"+refundID) {
 		t.Errorf("uuid = %q, want EventUUID(refund:%s)", wantUUID, refundID)
+	}
+}
+
+// Approved chargeback / chargeback_reverse adjustments (money gone via a
+// dispute, not a refund) must leave a distinct, alertable audit marker —
+// but must NOT touch the refund/entitlement machinery: no refund row, no
+// payment/order/subscription flip, no PostHog event.
+func TestOnWebhook_PaddleAdjustment_Chargeback_AuditedNotRefunded(t *testing.T) {
+	for _, action := range []string{"chargeback", "chargeback_reverse"} {
+		t.Run(action, func(t *testing.T) {
+			db := setupPaymentDB(t)
+			svc := newTestPaymentService(t, db)
+			rec := &recordingAnalytics{env: "production"}
+			svc.SetAnalytics(rec)
+			uid := seedUser(t, db)
+			txnID := "txn_pd_" + mustNewUUID()[:8]
+			_, paymentID := seedPaidPaddlePayment(t, db, uid, "monthly", txnID, 19.9)
+
+			_, err := svc.OnWebhook(context.Background(), WebhookEvent{
+				Channel: "paddle", EventID: "evt-pd-cb-" + mustNewUUID()[:8],
+				EventType: "adjustment.updated", AdjustmentAction: action,
+				TransactionID: txnID, Amount: 19.9, Currency: "CNY",
+				RawPayload: json.RawMessage(`{}`),
+			})
+			if err != nil {
+				t.Fatalf("OnWebhook chargeback: %v", err)
+			}
+
+			// Distinct audit marker for ops alerting.
+			var n int
+			if err := db.GetContext(context.Background(), &n,
+				`SELECT COUNT(*) FROM audit_log WHERE action = 'paddle_chargeback_unhandled'`); err != nil {
+				t.Fatalf("read audit: %v", err)
+			}
+			if n != 1 {
+				t.Errorf("paddle_chargeback_unhandled audit rows = %d, want 1", n)
+			}
+
+			// No refund row, payment stays paid, zero analytics events.
+			if err := db.GetContext(context.Background(), &n,
+				`SELECT COUNT(*) FROM refunds WHERE channel = 'paddle'`); err != nil {
+				t.Fatalf("count refunds: %v", err)
+			}
+			if n != 0 {
+				t.Errorf("refund rows = %d, want 0 (chargebacks are not refunds)", n)
+			}
+			var payStatus string
+			if err := db.GetContext(context.Background(), &payStatus,
+				`SELECT status FROM payments WHERE id = $1`, paymentID); err != nil {
+				t.Fatalf("read payment: %v", err)
+			}
+			if payStatus != "paid" {
+				t.Errorf("payment status = %q, want paid (chargeback handling deferred)", payStatus)
+			}
+			if len(rec.events()) != 0 {
+				t.Errorf("emitted %d analytics events, want 0", len(rec.events()))
+			}
+		})
 	}
 }

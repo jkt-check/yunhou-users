@@ -87,3 +87,63 @@ func TestParsePaddle_AdjustmentRefundMissingID(t *testing.T) {
 		t.Fatal("refund-approved adjustment with empty data.id must error")
 	}
 }
+
+// Approved chargeback / chargeback_reverse adjustments must be
+// distinguishable for ops alerting: parsed enough to carry the action,
+// transaction id, amount and currency through — but NEVER onto the refund
+// fields (they must not reach branchRefund / entitlement logic).
+func TestParsePaddle_AdjustmentChargeback(t *testing.T) {
+	h := &WebhookHandler{}
+	for _, action := range []string{"chargeback", "chargeback_reverse"} {
+		t.Run(action, func(t *testing.T) {
+			raw := []byte(`{
+			  "event_id": "evt_cb_` + action + `",
+			  "event_type": "adjustment.updated",
+			  "data": {
+			    "id": "adj_cb_1",
+			    "action": "` + action + `",
+			    "status": "approved",
+			    "transaction_id": "txn_cb_1",
+			    "currency_code": "USD",
+			    "totals": {"total": "1990", "subtotal": "1990", "tax": "0", "fee": "0"}
+			  }
+			}`)
+			we, err := h.parsePaddle(raw)
+			if err != nil {
+				t.Fatalf("chargeback adjustment must parse: %v", err)
+			}
+			if we.AdjustmentAction != action {
+				t.Errorf("AdjustmentAction = %q, want %q", we.AdjustmentAction, action)
+			}
+			if we.TransactionID != "txn_cb_1" || we.Amount != 19.90 || we.Currency != "USD" {
+				t.Errorf("ops context not carried: %+v", we)
+			}
+			if we.ExternalRefundID != "" || we.RefundAmount != 0 {
+				t.Errorf("chargeback must NOT populate refund fields: %+v", we)
+			}
+		})
+	}
+}
+
+// An approved refund adjustment with missing or unparseable totals.total
+// would otherwise reach onRefundSucceeded with RefundAmount=0 and violate
+// refunds.amount CHECK (amount > 0) → 500 → Paddle retries forever.
+// Hard-fail at parse, consistent with the data.id / data.transaction_id
+// guards.
+func TestParsePaddle_AdjustmentRefundBadTotals(t *testing.T) {
+	h := &WebhookHandler{}
+	cases := map[string]string{
+		"missing totals":    `{"event_id":"evt_bt1","event_type":"adjustment.updated","data":{"id":"adj_bt1","action":"refund","status":"approved","transaction_id":"txn_1","currency_code":"USD"}}`,
+		"empty total":       `{"event_id":"evt_bt2","event_type":"adjustment.updated","data":{"id":"adj_bt2","action":"refund","status":"approved","transaction_id":"txn_1","currency_code":"USD","totals":{"total":""}}}`,
+		"unparseable total": `{"event_id":"evt_bt3","event_type":"adjustment.updated","data":{"id":"adj_bt3","action":"refund","status":"approved","transaction_id":"txn_1","currency_code":"USD","totals":{"total":"abc"}}}`,
+		"zero total":        `{"event_id":"evt_bt4","event_type":"adjustment.updated","data":{"id":"adj_bt4","action":"refund","status":"approved","transaction_id":"txn_1","currency_code":"USD","totals":{"total":"0"}}}`,
+		"negative total":    `{"event_id":"evt_bt5","event_type":"adjustment.updated","data":{"id":"adj_bt5","action":"refund","status":"approved","transaction_id":"txn_1","currency_code":"USD","totals":{"total":"-500"}}}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := h.parsePaddle([]byte(raw)); err == nil {
+				t.Fatal("approved refund adjustment with bad totals.total must error")
+			}
+		})
+	}
+}

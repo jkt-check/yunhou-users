@@ -149,3 +149,33 @@ func strconv(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+// The server is the last enforcement point before PostHog: a website-side
+// bug sending /checkout?email=x@y.com would otherwise ride into
+// purchase_completed's attribution property verbatim. landing_path keeps
+// only the path — query and fragment are cut before truncation.
+func TestSanitizeAttribution_StripsLandingPathQueryFragment(t *testing.T) {
+	t.Parallel()
+	in := json.RawMessage(`{"last_touch":{"landing_path":"/checkout?email=x@y.com&plan=pro#token=abc","utm_source":"google"}}`)
+	out, err := SanitizeAttribution(in)
+	if err != nil {
+		t.Fatalf("SanitizeAttribution: %v", err)
+	}
+	var got Attribution
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	if got.LastTouch == nil || got.LastTouch.LandingPath == nil {
+		t.Fatal("landing_path lost")
+	}
+	if *got.LastTouch.LandingPath != "/checkout" {
+		t.Errorf("landing_path = %q, want /checkout (query+fragment stripped)", *got.LastTouch.LandingPath)
+	}
+	if strings.Contains(string(out), "x@y.com") || strings.Contains(string(out), "token=abc") {
+		t.Errorf("PII/query leaked into sanitized output: %s", out)
+	}
+	// Other fields are untouched by the strip.
+	if got.LastTouch.UtmSource == nil || *got.LastTouch.UtmSource != "google" {
+		t.Errorf("utm_source = %v, want google", got.LastTouch.UtmSource)
+	}
+}

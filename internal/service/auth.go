@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/yunhou/users/internal/analytics"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 )
@@ -49,6 +50,23 @@ type AuthService struct {
 	sessionRepo  repo.SessionRepo
 	appRepo      repo.AppRepo
 	tokenSvc     *TokenService
+	// analytics is the M2 PostHog emitter (signup_completed /
+	// trial_started). Nil-safe: unwired services emit nothing.
+	analytics AnalyticsEmitter
+}
+
+// AnalyticsEmitter is the narrow consumption-point surface for analytics
+// events (repo idiom, cf. paddleClient). *analytics.Emitter satisfies it;
+// tests inject a recording fake.
+type AnalyticsEmitter interface {
+	Capture(evt analytics.Event)
+	Environment() string
+}
+
+// SetAnalytics wires the analytics emitter after construction (main.go
+// builds it from POSTHOG_* config; empty token = disabled emitter).
+func (s *AuthService) SetAnalytics(a AnalyticsEmitter) {
+	s.analytics = a
 }
 
 func NewAuthService(
@@ -183,7 +201,7 @@ func (s *AuthService) LoginWithProfile(ctx context.Context, req LoginWithProfile
 	}
 
 	// 2. Find or create user + identity
-	user, err := s.getOrCreateUser(ctx, providerUser)
+	user, isNew, err := s.getOrCreateUser(ctx, providerUser)
 	if err != nil {
 		return nil, fmt.Errorf("get or create user: %w", err)
 	}
@@ -222,21 +240,57 @@ func (s *AuthService) LoginWithProfile(ctx context.Context, req LoginWithProfile
 	// proved that conflation wrong — login and subscription are
 	// independent concerns, so peekSubscription is invoked inside
 	// issueTokensForUser only.
-	return s.issueTokensForUser(ctx, user, appID, nil)
+	resp, err := s.issueTokensForUser(ctx, user, appID, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// M2 analytics: signup_completed fires only for a brand-new user on
+	// the intl (github) surface — wechat logins are cn and never emit.
+	// Emission is fire-and-forget and follows successful issuance so a
+	// failed login never records a signup.
+	if isNew && providerUser.Provider == "github" {
+		s.emitSignupCompleted(user.ID, appID)
+	}
+	return resp, nil
 }
 
-func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInfo) (*model.User, error) {
+// emitSignupCompleted captures the M2 signup_completed event. Nil-safe.
+func (s *AuthService) emitSignupCompleted(userID, appID string) {
+	if s.analytics == nil {
+		return
+	}
+	s.analytics.Capture(analytics.Event{
+		Name:       "signup_completed",
+		DistinctID: userID,
+		UUID:       analytics.EventUUID("signup:" + userID),
+		Timestamp:  time.Now(),
+		Properties: map[string]any{
+			"region":        "intl",
+			"auth_provider": "github",
+			"app_id":        appID,
+			"environment":   s.analytics.Environment(),
+		},
+	})
+}
+
+// getOrCreateUser resolves the login to a user row, creating one on the
+// first-ever login. isNew reports whether this call created the user —
+// it drives the trial grant and the M2 signup_completed event; the
+// existing-identity and duplicate-key race branches report false.
+func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInfo) (*model.User, bool, error) {
 	// 1. Identity already exists? Bind to that user.
 	existing, err := s.identityRepo.FindByProviderUID(ctx, info.Provider, info.ProviderUID)
 	if err == nil && existing != nil {
-		return s.userRepo.FindByID(ctx, existing.UserID)
+		u, err := s.userRepo.FindByID(ctx, existing.UserID)
+		return u, false, err
 	}
 
 	// 2. Resolve the target user: either by email-merge (if a verified
 	//    identity is bound to that email already) or as a new account.
 	userID, isNew, err := s.resolveOrCreateUser(ctx, info)
 	if err != nil {
-		return nil, fmt.Errorf("resolve user: %w", err)
+		return nil, false, fmt.Errorf("resolve user: %w", err)
 	}
 
 	// 3. Bind the new social identity. If another concurrent request
@@ -259,14 +313,15 @@ func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInf
 			// each end up with their own binding.
 			winner, retryErr := s.identityRepo.FindByProviderUID(ctx, info.Provider, info.ProviderUID)
 			if retryErr == nil && winner != nil {
-				return s.userRepo.FindByID(ctx, winner.UserID)
+				u, err := s.userRepo.FindByID(ctx, winner.UserID)
+				return u, false, err
 			}
 			// If we created a brand-new user in step 2 and lost the
 			// race, the orphan row is harmless (no identities bound
 			// to it) but we still want to surface a usable user.
 			// Orphan cleanup is a sweeper concern.
 		}
-		return nil, fmt.Errorf("create identity: %w", err)
+		return nil, false, fmt.Errorf("create identity: %w", err)
 	}
 
 	// 4. First-ever login: best-effort grant of the free trial. Grant
@@ -275,10 +330,11 @@ func (s *AuthService) getOrCreateUser(ctx context.Context, info *ProviderUserInf
 	//    Only the created=true branch grants: email-merge and
 	//    existing-identity logins are not new users (spec: 只发新用户).
 	if isNew {
-		s.grantTrialSubscription(ctx, userID)
+		s.grantTrialSubscription(ctx, userID, info.Provider)
 	}
 
-	return s.userRepo.FindByID(ctx, userID)
+	u, err := s.userRepo.FindByID(ctx, userID)
+	return u, isNew, err
 }
 
 // trialPlanID is the catalog id of the free-trial plan row seeded by
@@ -294,7 +350,9 @@ const trialPlanID = "trial"
 // 027, scoped per user+product) turns a concurrent duplicate grant into a
 // DB-level no-op (unique violation, logged here).
 // There is deliberately no backfill for pre-existing users (spec: 只发新用户).
-func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string) {
+// provider gates the M2 trial_started event: only the intl (github)
+// surface emits; wechat/desktop-cn grants stay silent.
+func (s *AuthService) grantTrialSubscription(ctx context.Context, userID, provider string) {
 	// The grant must outlive the request: a client disconnect mid-login
 	// (mobile norm) cancels the request ctx and would silently cost the
 	// user their only trial — grants are never retried (spec: 只发新用户).
@@ -320,19 +378,49 @@ func (s *AuthService) grantTrialSubscription(ctx context.Context, userID string)
 	// Clamp before the day→Duration multiply (int64-ns wrap); see
 	// maxIntervalDays.
 	expiresAt := now.Add(time.Duration(min(plan.TrialDays, maxIntervalDays)) * 24 * time.Hour)
-	if err := s.subRepo.Create(ctx, &model.Subscription{
-		ID:        GenerateUUID(),
-		UserID:    userID,
-		PlanID:    plan.ID,
+	sub := &model.Subscription{
+		ID:     GenerateUUID(),
+		UserID: userID,
+		PlanID: plan.ID,
 		// Trial is a kaya-membership grant (migration 018); the 027
 		// trigger would also fill this from the plan row.
 		ProductCode: model.ProductKayaMembership,
 		Status:      "active",
 		StartedAt:   now,
 		ExpiresAt:   &expiresAt,
-	}); err != nil {
-		log.Printf("trial grant: create subscription: %v (user %s)", err, userID)
 	}
+	if err := s.subRepo.Create(ctx, sub); err != nil {
+		log.Printf("trial grant: create subscription: %v (user %s)", err, userID)
+		return
+	}
+
+	// M2 analytics: trial_started only after the row actually exists, and
+	// only for the intl (github) surface. `source` is deliberately
+	// omitted — web vs desktop is unknowable at this layer. Emission is
+	// fire-and-forget; a failure can never affect the grant.
+	if provider == "github" {
+		s.emitTrialStarted(userID, plan, sub)
+	}
+}
+
+// emitTrialStarted captures the M2 trial_started event. Nil-safe.
+func (s *AuthService) emitTrialStarted(userID string, plan *model.Plan, sub *model.Subscription) {
+	if s.analytics == nil {
+		return
+	}
+	s.analytics.Capture(analytics.Event{
+		Name:       "trial_started",
+		DistinctID: userID,
+		UUID:       analytics.EventUUID("trial:" + sub.ID),
+		Timestamp:  time.Now(),
+		Properties: map[string]any{
+			"region":           "intl",
+			"plan_id":          plan.ID,
+			"entitlement_type": "trial",
+			"trial_days":       plan.TrialDays,
+			"environment":      s.analytics.Environment(),
+		},
+	})
 }
 
 // resolveOrCreateUser returns the user_id to bind this login to, plus a

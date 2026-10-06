@@ -1734,7 +1734,7 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 			ProviderUID: "gh-1", Email: &email,
 		}
 		svc := &AuthService{userRepo: ur, identityRepo: sir}
-		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+		u, _, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-1", Email: "ex@x.com",
 		})
 		if err != nil {
@@ -1752,7 +1752,7 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 		// fires a best-effort trial grant (no trial plan seeded here,
 		// so the grant is a logged no-op).
 		svc := &AuthService{userRepo: ur, identityRepo: sir, planRepo: pr, subRepo: sr}
-		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+		u, _, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-fresh", Email: "fresh@x.com",
 		})
 		if err != nil {
@@ -1784,7 +1784,7 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 			winnerUserID: "u-winner",
 		}
 		svc := &AuthService{userRepo: ur, identityRepo: identityRepo}
-		u, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+		u, _, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-race", Email: "race@x.com",
 		})
 		if err != nil {
@@ -1807,7 +1807,7 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 			winnerLookupErr: errors.New("db down on winner lookup"),
 		}
 		svc := &AuthService{userRepo: ur, identityRepo: identityRepo}
-		_, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+		_, _, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-race-2", Email: "race2@x.com",
 		})
 		if err == nil {
@@ -1824,7 +1824,7 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 		// Inject a non-duplicate-key error on Create.
 		sir.createErr = errors.New("db down")
 		svc := &AuthService{userRepo: ur, identityRepo: sir}
-		_, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+		_, _, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-wrap", Email: "wrap@x.com",
 		})
 		if err == nil {
@@ -1843,7 +1843,7 @@ func TestAuthService_getOrCreateUser(t *testing.T) {
 		// as "resolve user: ..." inside getOrCreateUser.
 		ur.err = errors.New("db down on create user")
 		svc := &AuthService{userRepo: ur, identityRepo: sir}
-		_, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
+		_, _, err := svc.getOrCreateUser(ctx, &ProviderUserInfo{
 			Provider: "github", ProviderUID: "gh-resolve", Email: "resolve@x.com",
 		})
 		if err == nil {
@@ -2782,7 +2782,7 @@ func TestAuthService_LoginWithProfile_TrialGrant(t *testing.T) {
 		// retried), so the row must still be inserted.
 		cancelled, cancel := context.WithCancel(context.Background())
 		cancel()
-		svc.grantTrialSubscription(cancelled, "user-disconnect")
+		svc.grantTrialSubscription(cancelled, "user-disconnect", "github")
 
 		sub := sr.byUserID["user-disconnect"]
 		if sub == nil {
@@ -2852,7 +2852,7 @@ func TestAuthService_GrantTrialSubscription_ClampsHugeTrialDays(t *testing.T) {
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
-	svc.grantTrialSubscription(context.Background(), "user-huge-trial")
+	svc.grantTrialSubscription(context.Background(), "user-huge-trial", "github")
 
 	sub := sr.byUserID["user-huge-trial"]
 	if sub == nil {

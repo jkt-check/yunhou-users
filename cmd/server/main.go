@@ -21,6 +21,7 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/yunhou/users/internal/analytics"
 	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/paddle"
 	"github.com/yunhou/users/internal/billing/wechat"
@@ -173,6 +174,14 @@ func main() {
 
 	planSvc := service.NewPlanService(planRepo, appRepo, planChangeLogRepo)
 	authSvc := service.NewAuthService(userRepo, identityRepo, planRepo, subRepo, sessionRepo, appRepo, tokenSvc)
+	// M2 analytics: empty POSTHOG_PROJECT_TOKEN = disabled emitter (no-op,
+	// zero outbound requests). The environment label rides every event's
+	// properties via the emitter.
+	analyticsEnv := "staging"
+	if config.IsProductionEnv(cfg.AppEnv) {
+		analyticsEnv = "production"
+	}
+	authSvc.SetAnalytics(analytics.NewEmitter(cfg.PostHogProjectToken, cfg.PostHogHost, analyticsEnv))
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
 	// Payment service. Channel refund API is wired in v2 (real Stripe/WeChat/Alipay

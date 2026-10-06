@@ -181,7 +181,8 @@ func main() {
 	if config.IsProductionEnv(cfg.AppEnv) {
 		analyticsEnv = "production"
 	}
-	authSvc.SetAnalytics(analytics.NewEmitter(cfg.PostHogProjectToken, cfg.PostHogHost, analyticsEnv))
+	analyticsEmitter := analytics.NewEmitter(cfg.PostHogProjectToken, cfg.PostHogHost, analyticsEnv)
+	authSvc.SetAnalytics(analyticsEmitter)
 	subSvc := service.NewSubscriptionService(subRepo, planSvc)
 
 	// Payment service. Channel refund API is wired in v2 (real Stripe/WeChat/Alipay
@@ -206,6 +207,7 @@ func main() {
 		paymentSvc.SetPaddlePrices(cfg.PaddlePrices)
 	}
 	paymentSvc.SetMetrics(service.NewPaymentMetrics(prometheus.DefaultRegisterer, cfg.AppEnv))
+	paymentSvc.SetAnalytics(analyticsEmitter)
 
 	// Validate PayPal environment BEFORE building anything that depends on it.
 	// config.PaypalEnv 默认 ""（cn 域不启用 PayPal）。空值 = 未启用：webhook

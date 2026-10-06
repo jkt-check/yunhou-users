@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -349,4 +350,72 @@ func TestCreateOrder_Paddle_PendingOrderRejected(t *testing.T) {
 	if orderRepo.created != nil {
 		t.Fatal("no second order row may be created while a pending order exists")
 	}
+}
+
+// M3: the order's sanitized attribution.last_touch UTM triple rides the
+// Paddle checkout's custom_data (alongside the order_id the webhook
+// lookup depends on), so channel-side records carry the marketing context.
+// Only non-nil values are merged; first_touch stays out of custom_data.
+func TestCreateOrder_Paddle_CustomData_CarriesLastTouchUTM(t *testing.T) {
+	newSvc := func(stub *stubPaddle) *PaymentService {
+		svc := NewPaymentService(
+			nil,
+			&stubOrderRepoLookup{},
+			nil,
+			nil,
+			&stubSubRepo{},
+			&stubPlanRepo{plan: &model.Plan{
+				ID:                        "plan-1",
+				Price:                     9.99,
+				IsActive:                  true,
+				AcceptingNewSubscriptions: true,
+				Currency:                  "USD",
+			}},
+			nil,
+			nil,
+			nil,
+			&stubRefundAPI{},
+			nil,
+			0,
+		)
+		svc.SetPaddleClient(stub)
+		svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
+		return svc
+	}
+
+	t.Run("last_touch utm params merged, nil fields omitted", func(t *testing.T) {
+		stub := &stubPaddle{txnID: "txn_utm_1", checkout: "https://x/?_ptxn=txn_utm_1"}
+		svc := newSvc(stub)
+		attr := json.RawMessage(`{"first_touch":{"utm_source":"first"},"last_touch":{"utm_source":"google","utm_medium":"cpc","utm_campaign":null}}`)
+		order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle", attr)
+		if err != nil {
+			t.Fatalf("CreateOrder: %v", err)
+		}
+		if stub.gotData["order_id"] != order.ID {
+			t.Errorf("custom_data order_id = %v, want %s", stub.gotData["order_id"], order.ID)
+		}
+		if stub.gotData["utm_source"] != "google" || stub.gotData["utm_medium"] != "cpc" {
+			t.Errorf("custom_data utm = %v/%v, want google/cpc", stub.gotData["utm_source"], stub.gotData["utm_medium"])
+		}
+		if _, has := stub.gotData["utm_campaign"]; has {
+			t.Errorf("utm_campaign was null — key must be omitted: %v", stub.gotData)
+		}
+		if len(stub.gotData) != 3 {
+			t.Errorf("custom_data = %v, want exactly order_id + utm_source + utm_medium", stub.gotData)
+		}
+	})
+
+	t.Run("no attribution → order_id only", func(t *testing.T) {
+		stub := &stubPaddle{txnID: "txn_utm_2", checkout: "https://x/?_ptxn=txn_utm_2"}
+		svc := newSvc(stub)
+		if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle", nil); err != nil {
+			t.Fatalf("CreateOrder: %v", err)
+		}
+		if len(stub.gotData) != 1 {
+			t.Errorf("custom_data = %v, want only order_id", stub.gotData)
+		}
+		if _, has := stub.gotData["order_id"]; !has {
+			t.Errorf("order_id missing from custom_data: %v", stub.gotData)
+		}
+	})
 }

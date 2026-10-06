@@ -819,6 +819,46 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 			// the paid retry.
 		}
 
+	case strings.HasPrefix(evt.EventType, "adjustment."):
+		// M3: Paddle fires adjustment.updated with action="refund" +
+		// status="approved" when a refund completes — including
+		// console-initiated manual refunds. Only that combination carries
+		// domain meaning; credits, pending/rejected states and
+		// adjustment.created stay audit-only by leaving the refund fields
+		// empty (resolveBranch keys the refund routing on them).
+		var adj struct {
+			ID            string       `json:"id"`
+			Action        string       `json:"action"`
+			Status        string       `json:"status"`
+			TransactionID string       `json:"transaction_id"`
+			CurrencyCode  string       `json:"currency_code"`
+			Totals        paddleTotals `json:"totals"`
+		}
+		if err := json.Unmarshal(evt.Data, &adj); err != nil {
+			return nil, fmt.Errorf("paddle adjustment data: %w", err)
+		}
+		if evt.EventType == "adjustment.updated" && adj.Action == "refund" && adj.Status == "approved" {
+			// data.id keys refunds.(channel, external_refund_id); empty
+			// would collapse every malformed event onto one dedupe row —
+			// same invariant as the transaction missing-data.id guard.
+			if adj.ID == "" {
+				return nil, fmt.Errorf("paddle refund adjustment missing data.id")
+			}
+			if adj.TransactionID == "" {
+				return nil, fmt.Errorf("paddle refund adjustment missing data.transaction_id")
+			}
+			we.ExternalRefundID = adj.ID
+			we.TransactionID = adj.TransactionID
+			we.Currency = strings.ToUpper(adj.CurrencyCode)
+			if adj.Totals.Total != "" {
+				if v, err := strconv.ParseFloat(adj.Totals.Total, 64); err != nil {
+					log.Printf("paddle: event %s has unparseable adjustment totals.total %q: %v", evt.EventID, adj.Totals.Total, err)
+				} else {
+					we.RefundAmount = v / 100 // minor units → major units
+				}
+			}
+		}
+
 	case strings.HasPrefix(evt.EventType, "subscription."):
 		var sub struct {
 			ID           string `json:"id"`

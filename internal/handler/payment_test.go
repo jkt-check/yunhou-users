@@ -22,40 +22,42 @@ import (
 // Each method has a configurable error + return value, which is the pattern
 // used elsewhere in this package (auth_test.go, app handler tests).
 type mockPaymentSvc struct {
-	createOrderResp  *model.Order
-	createOrderErr   error
-	gotCreateChannel string
-	cancelOrderErr   error
-	confirmResult    *service.ConfirmResult
-	confirmErr       error
-	gotConfirmInput  *service.ConfirmInput // captures the input Confirm was called with
-	refundResult     *service.RefundResult
-	refundErr        error
-	gotRefundInput   *service.RefundInput // captures the input Refund was called with
-	getOrderResp     *model.Order
-	getOrderErr      error
-	listOrders       []model.Order
-	listOrdersErr    error
-	listPayments     []model.Payment
-	listPaymentsErr  error
-	getPaymentResp   *model.Payment
-	getPaymentErr    error
-	listRefunds      []model.Refund
-	listRefundsErr   error
-	getRefundResp    *model.Refund
-	getRefundErr     error
-	onWebhookResult  *service.OnWebhookResult
-	onWebhookErr     error
-	cancelChanResp   *model.Subscription
-	cancelChanErr    error
-	gotCancelUserID  string
-	upgradeResp      *service.ChannelUpgradeResult
-	upgradeErr       error
-	gotUpgradePlanID string
+	createOrderResp      *model.Order
+	createOrderErr       error
+	gotCreateChannel     string
+	gotCreateAttribution json.RawMessage
+	cancelOrderErr       error
+	confirmResult        *service.ConfirmResult
+	confirmErr           error
+	gotConfirmInput      *service.ConfirmInput // captures the input Confirm was called with
+	refundResult         *service.RefundResult
+	refundErr            error
+	gotRefundInput       *service.RefundInput // captures the input Refund was called with
+	getOrderResp         *model.Order
+	getOrderErr          error
+	listOrders           []model.Order
+	listOrdersErr        error
+	listPayments         []model.Payment
+	listPaymentsErr      error
+	getPaymentResp       *model.Payment
+	getPaymentErr        error
+	listRefunds          []model.Refund
+	listRefundsErr       error
+	getRefundResp        *model.Refund
+	getRefundErr         error
+	onWebhookResult      *service.OnWebhookResult
+	onWebhookErr         error
+	cancelChanResp       *model.Subscription
+	cancelChanErr        error
+	gotCancelUserID      string
+	upgradeResp          *service.ChannelUpgradeResult
+	upgradeErr           error
+	gotUpgradePlanID     string
 }
 
-func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _, channel string) (*model.Order, error) {
+func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _, channel string, attribution json.RawMessage) (*model.Order, error) {
 	m.gotCreateChannel = channel
+	m.gotCreateAttribution = attribution
 	return m.createOrderResp, m.createOrderErr
 }
 func (m *mockPaymentSvc) CancelOrder(_ context.Context, _, _ string) error {
@@ -1159,4 +1161,71 @@ func TestUpgradeChannelSubscription_MissingPlanID(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
+}
+
+// ============================================================================
+// CreateOrder — attribution (M1)
+// ============================================================================
+
+func TestPaymentHandler_CreateOrder_Attribution(t *testing.T) {
+	t.Parallel()
+
+	t.Run("attribution forwarded verbatim to the service", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			createOrderResp: &model.Order{ID: "o-1", UserID: "user-1", PlanID: "monthly", Status: "pending"},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]any{
+			"plan_id": "monthly",
+			"channel": "stripe",
+			"attribution": map[string]any{
+				"first_touch": map[string]any{"utm_source": "google", "captured_at": "2026-10-01T08:30:00Z"},
+				"last_touch":  nil,
+			},
+		})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status: got %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if svc.gotCreateAttribution == nil {
+			t.Fatal("service received nil attribution, want the raw payload")
+		}
+		if !strings.Contains(string(svc.gotCreateAttribution), `"utm_source":"google"`) {
+			t.Errorf("attribution payload = %s, want utm_source=google", svc.gotCreateAttribution)
+		}
+	})
+
+	t.Run("absent attribution → nil, 201 as today", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{
+			createOrderResp: &model.Order{ID: "o-2", UserID: "user-1", PlanID: "monthly", Status: "pending"},
+		}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]string{
+			"plan_id": "monthly", "channel": "stripe",
+		})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status: got %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if svc.gotCreateAttribution != nil {
+			t.Errorf("service received attribution %s, want nil", svc.gotCreateAttribution)
+		}
+		// Backward compatibility: no attribution key in the response either.
+		if strings.Contains(rec.Body.String(), "attribution") {
+			t.Errorf("response should omit attribution, got %s", rec.Body.String())
+		}
+	})
+
+	t.Run("invalid attribution → 400", func(t *testing.T) {
+		t.Parallel()
+		svc := &mockPaymentSvc{createOrderErr: service.ErrInvalidAttribution}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/payments/orders", map[string]any{
+			"plan_id": "monthly", "channel": "stripe",
+			"attribution": map[string]any{"first_touch": 42},
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
 }

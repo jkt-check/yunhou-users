@@ -589,9 +589,19 @@ func (s *PaymentService) txLookupPaymentByChannelTxnID(ctx context.Context, tx *
 // orphan pending order that the sweeper eventually expires. The plan
 // eligibility lookup (FOR SHARE) only happens once we know the user is
 // allowed to create an order.
-func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channel string) (*model.Order, error) {
+func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channel string, attribution json.RawMessage) (*model.Order, error) {
 	if err := validateChannel(channel); err != nil {
 		return nil, err
+	}
+
+	// M1: sanitize the optional attribution payload BEFORE anything is
+	// persisted — an undecodable payload is a client error (400 via
+	// ErrInvalidAttribution) and must not leave an orphan pending order.
+	// Sanitized-but-empty (nil / {} / both touches null) collapses to nil
+	// so the column stores SQL NULL.
+	sanitizedAttribution, err := model.SanitizeAttribution(attribution)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidAttribution, err)
 	}
 
 	// Channel-specific pre-auth gate (D1): some channels refuse to mint
@@ -756,7 +766,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	}
 
 	var order *model.Order
-	err := s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, orderKind, upgradeFromPlanID, &order)
+	err = s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, orderKind, upgradeFromPlanID, sanitizedAttribution, &order)
 	if err != nil {
 		return nil, err
 	}
@@ -3488,7 +3498,7 @@ func (s *PaymentService) providerPreAuth(channel string) error {
 // pre-D8 no-tx fallback made it easy to ship a regression). The
 // repo implementation owns begin/commit/rollback; the closure here
 // only threads the tx through FindByIDForShareTx and CreateInTx.
-func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel, orderKind string, upgradeFromPlanID *string, out **model.Order) error {
+func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel, orderKind string, upgradeFromPlanID *string, attribution json.RawMessage, out **model.Order) error {
 	var order *model.Order
 	err := s.planRepo.WithTx(ctx, func(tx *sqlx.Tx) error {
 		plan, err := s.planRepo.FindByIDForShareTx(ctx, tx, planID)
@@ -3597,6 +3607,7 @@ func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID
 			BenefitGrantMode:       ptrIfNotEmpty(benefitGrantMode),
 			OrderKind:              ptrIfNotEmpty(orderKind),
 			UpgradeFromPlanID:      upgradeFromPlanID,
+			Attribution:            ptrRawMessageIfNotEmpty(attribution),
 		}
 		if err := s.orderRepo.CreateInTx(ctx, tx, order); err != nil {
 			return fmt.Errorf("create order: %w", err)
@@ -4093,6 +4104,16 @@ func ptrIfNotEmpty(s string) *string {
 // ptrInt returns a pointer to n (snapshot interval; 0 is a meaningful
 // "lifetime plan" value and must round-trip as 0, not NULL).
 func ptrInt(n int) *int { return &n }
+
+// ptrRawMessageIfNotEmpty returns nil for empty input so the order row
+// stores SQL NULL (orders without an attribution payload), a pointer
+// otherwise.
+func ptrRawMessageIfNotEmpty(m json.RawMessage) *json.RawMessage {
+	if len(m) == 0 {
+		return nil
+	}
+	return &m
+}
 
 // toCents converts a major-units float64 (DECIMAL(10,2) round-trip) to
 // integer cents. Used for exact monetary comparisons that must not

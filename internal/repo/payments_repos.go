@@ -103,10 +103,10 @@ func (r *orderRepo) Create(ctx context.Context, o *model.Order) error {
 	_, err := r.db.NamedExecContext(ctx, `
 		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent,
 			product_code, plan_interval_days, benefit_policy_version_id, benefit_model_ids,
-			benefit_grant_mode, order_kind, upgrade_from_plan_id)
+			benefit_grant_mode, order_kind, upgrade_from_plan_id, attribution)
 		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent,
 			:product_code, :plan_interval_days, :benefit_policy_version_id, :benefit_model_ids,
-			:benefit_grant_mode, :order_kind, :upgrade_from_plan_id)
+			:benefit_grant_mode, :order_kind, :upgrade_from_plan_id, :attribution)
 	`, flattenOrderForInsert(o))
 	return err
 }
@@ -120,10 +120,10 @@ func (r *orderRepo) CreateInTx(ctx context.Context, tx *sqlx.Tx, o *model.Order)
 	_, err := tx.NamedExecContext(ctx, `
 		INSERT INTO orders (id, user_id, plan_id, amount, currency, status, expires_at, provider_intent,
 			product_code, plan_interval_days, benefit_policy_version_id, benefit_model_ids,
-			benefit_grant_mode, order_kind, upgrade_from_plan_id)
+			benefit_grant_mode, order_kind, upgrade_from_plan_id, attribution)
 		VALUES (:id, :user_id, :plan_id, :amount, :currency, :status, :expires_at, :provider_intent,
 			:product_code, :plan_interval_days, :benefit_policy_version_id, :benefit_model_ids,
-			:benefit_grant_mode, :order_kind, :upgrade_from_plan_id)
+			:benefit_grant_mode, :order_kind, :upgrade_from_plan_id, :attribution)
 	`, flattenOrderForInsert(o))
 	return err
 }
@@ -156,6 +156,9 @@ type orderInsertRow struct {
 	BenefitGrantMode       *string        `db:"benefit_grant_mode"`
 	OrderKind              *string        `db:"order_kind"`
 	UpgradeFromPlanID      *string        `db:"upgrade_from_plan_id"`
+	// Attribution (migration 044) reuses the nullableJSONB wrapper:
+	// nil/empty snapshot → SQL NULL, non-empty → verbatim JSONB bytes.
+	Attribution *nullableJSONB `db:"attribution"`
 }
 
 func flattenOrderForInsert(o *model.Order) *orderInsertRow {
@@ -176,6 +179,7 @@ func flattenOrderForInsert(o *model.Order) *orderInsertRow {
 		BenefitGrantMode:       o.BenefitGrantMode,
 		OrderKind:              o.OrderKind,
 		UpgradeFromPlanID:      o.UpgradeFromPlanID,
+		Attribution:            wrapNullableJSONB(o.Attribution),
 	}
 }
 

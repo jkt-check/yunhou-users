@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -56,15 +57,16 @@ func (h *PaymentHandler) CreateOrder(c *gin.Context) {
 		return
 	}
 	var req struct {
-		PlanID  string `json:"plan_id" binding:"required"`
-		Channel string `json:"channel" binding:"required"`
+		PlanID      string          `json:"plan_id" binding:"required"`
+		Channel     string          `json:"channel" binding:"required"`
+		Attribution json.RawMessage `json:"attribution"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
 		return
 	}
 
-	order, err := h.svc.CreateOrder(c.Request.Context(), userID, req.PlanID, req.Channel)
+	order, err := h.svc.CreateOrder(c.Request.Context(), userID, req.PlanID, req.Channel, req.Attribution)
 	if err != nil {
 		writePaymentError(c, err)
 		return
@@ -362,6 +364,8 @@ func writePaymentError(c *gin.Context, err error) {
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is not accepting new subscriptions"})
 	case errors.Is(err, service.ErrPlanCurrencyMismatch):
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan currency does not match order currency"})
+	case errors.Is(err, service.ErrInvalidAttribution):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid attribution"})
 	case errors.Is(err, service.ErrUserHasActiveSub):
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "user already has an active subscription"})
 	case errors.Is(err, service.ErrUserHasPendingOrder):

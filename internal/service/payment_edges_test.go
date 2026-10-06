@@ -18,7 +18,7 @@ func TestPaymentFailed_PendingFlipsOrderFailed(t *testing.T) {
 	uid := seedUser(t, db)
 	ctx := context.Background()
 
-	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestPaymentFailed_AfterSuccessCancelsSubscription(t *testing.T) {
 	uid := seedUser(t, db)
 	ctx := context.Background()
 
-	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestRefund_FullAmountRevokesSubscription_Idempotent(t *testing.T) {
 	uid := seedUser(t, db)
 	ctx := context.Background()
 
-	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestConfirm_WechatMockNotPayRejected(t *testing.T) {
 	uid := seedUser(t, db)
 	ctx := context.Background()
 
-	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -145,7 +145,7 @@ func TestCreateOrder_Paddle_PersistsIntent(t *testing.T) {
 	svc.SetPaddleClient(stub)
 	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
 
-	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestCreateOrder_Paddle_MissingPrice(t *testing.T) {
 	svc.SetPaddleClient(&stubPaddle{})
 	// no SetPaddlePrices — operator forgot PADDLE_PRICES_JSON entry
 
-	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle", nil)
 	if !errors.Is(err, ErrPaddlePriceNotConfigured) {
 		t.Fatalf("expected ErrPaddlePriceNotConfigured, got %v (order=%+v)", err, order)
 	}
@@ -250,7 +250,7 @@ func TestCreateOrder_Paddle_TransactionError_MarksOrderFailed(t *testing.T) {
 	svc.SetPaddleClient(stub)
 	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
 
-	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle", nil)
 	if err == nil || !strings.Contains(err.Error(), "paddle checkout transaction") {
 		t.Fatalf("expected paddle checkout transaction error, got %v", err)
 	}
@@ -292,7 +292,7 @@ func TestCreateOrder_Paddle_IntentPersistError_MarksOrderFailed(t *testing.T) {
 	svc.SetPaddleClient(stub)
 	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
 
-	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle", nil)
 	if err == nil || !strings.Contains(err.Error(), "persist provider intent") {
 		t.Fatalf("expected persist provider intent error, got %v", err)
 	}
@@ -339,7 +339,7 @@ func TestCreateOrder_Paddle_PendingOrderRejected(t *testing.T) {
 	svc.SetPaddleClient(stub)
 	svc.SetPaddlePrices(map[string]string{"plan-1": "pri_test_1"})
 
-	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle")
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "paddle", nil)
 	if !errors.Is(err, ErrUserHasPendingOrder) {
 		t.Fatalf("expected ErrUserHasPendingOrder, got %v", err)
 	}

@@ -73,6 +73,11 @@ var (
 	ErrRefundChannelFailed     = errors.New("channel refund API call failed")
 	ErrMissingIdempotencyKey   = errors.New("missing Idempotency-Key header")
 	ErrInvalidChannel          = errors.New("invalid channel")
+	// ErrInvalidAttribution: the optional attribution payload on
+	// POST /payments/orders is not a decodable attribution object
+	// (e.g. a scalar or array where an object is required). Mapped to
+	// 400 in the payment handler; the order row is not created.
+	ErrInvalidAttribution = errors.New("invalid attribution")
 
 	// Chat proxy (POST /chat → LLM upstream, SSE).
 	ErrChatNotEnabled       = errors.New("chat is not enabled")

@@ -804,3 +804,103 @@ func TestOrderRepo_FindPendingByUserAndProduct(t *testing.T) {
 		}
 	})
 }
+
+// TestOrderRepo_Attribution_RoundTrip pins the migration-044 JSONB column:
+// an order inserted with an attribution snapshot reads it back verbatim
+// (modulo Postgres JSONB normalization), and an order inserted without one
+// reads SQL NULL back as a nil *json.RawMessage. Both the plain Create and
+// the transactional CreateInTx insert paths carry the column.
+func TestOrderRepo_Attribution_RoundTrip(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), alice)
+	r := NewOrderRepo(db)
+
+	attr := json.RawMessage(`{"first_touch":{"utm_source":"google","captured_at":"2026-10-01T08:30:00Z"},"last_touch":{"utm_medium":"cpc"}}`)
+
+	t.Run("Create persists and reads back attribution", func(t *testing.T) {
+		order := &model.Order{
+			ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+			Amount: 29.9, Currency: "CNY", Status: "pending",
+			ExpiresAt:   time.Now().Add(30 * time.Minute),
+			Attribution: &attr,
+		}
+		if err := r.Create(context.Background(), order); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		got, err := r.FindByID(context.Background(), order.ID)
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if got.Attribution == nil {
+			t.Fatal("Attribution = nil after round-trip, want snapshot")
+		}
+		var decoded model.Attribution
+		if err := json.Unmarshal(*got.Attribution, &decoded); err != nil {
+			t.Fatalf("read-back is not the attribution shape: %v (%s)", err, *got.Attribution)
+		}
+		if decoded.FirstTouch == nil || decoded.FirstTouch.UtmSource == nil ||
+			*decoded.FirstTouch.UtmSource != "google" {
+			t.Errorf("first_touch.utm_source lost: %s", *got.Attribution)
+		}
+		if decoded.LastTouch == nil || decoded.LastTouch.UtmMedium == nil ||
+			*decoded.LastTouch.UtmMedium != "cpc" {
+			t.Errorf("last_touch.utm_medium lost: %s", *got.Attribution)
+		}
+	})
+
+	t.Run("Create without attribution reads back NULL as nil", func(t *testing.T) {
+		order := &model.Order{
+			ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+			Amount: 29.9, Currency: "CNY", Status: "pending",
+			ExpiresAt: time.Now().Add(30 * time.Minute),
+		}
+		if err := r.Create(context.Background(), order); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		got, err := r.FindByID(context.Background(), order.ID)
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if got.Attribution != nil {
+			t.Errorf("Attribution = %s, want nil (SQL NULL)", *got.Attribution)
+		}
+	})
+
+	t.Run("CreateInTx persists attribution", func(t *testing.T) {
+		planRepo := NewPlanRepo(db)
+		orderID := newUUID()
+		err := planRepo.WithTx(context.Background(), func(tx *sqlx.Tx) error {
+			if _, err := planRepo.FindByIDForShareTx(context.Background(), tx, "monthly"); err != nil {
+				return err
+			}
+			return r.CreateInTx(context.Background(), tx, &model.Order{
+				ID: orderID, UserID: alice.ID, PlanID: "monthly",
+				Amount: 29.9, Currency: "CNY", Status: "pending",
+				ExpiresAt:   time.Now().Add(30 * time.Minute),
+				Attribution: &attr,
+			})
+		})
+		if err != nil {
+			t.Fatalf("WithTx(CreateInTx): %v", err)
+		}
+		got, err := r.FindByID(context.Background(), orderID)
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if got.Attribution == nil {
+			t.Fatal("Attribution = nil after CreateInTx round-trip")
+		}
+		// Decode rather than substring-match: Postgres JSONB normalizes
+		// key order and whitespace on store.
+		var decoded model.Attribution
+		if err := json.Unmarshal(*got.Attribution, &decoded); err != nil {
+			t.Fatalf("read-back is not the attribution shape: %v (%s)", err, *got.Attribution)
+		}
+		if decoded.FirstTouch == nil || decoded.FirstTouch.UtmSource == nil ||
+			*decoded.FirstTouch.UtmSource != "google" {
+			t.Errorf("first_touch.utm_source lost: %s", *got.Attribution)
+		}
+	})
+}

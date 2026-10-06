@@ -98,7 +98,7 @@ func TestDualProduct_PurchaseCodingPlanLeavesKayaUntouched(t *testing.T) {
 	// Pre-027 this CreateOrder would have hit the global active-sub guard
 	// (ErrUserHasActiveSub / ErrPlanDowngrade comparisons against the kaya
 	// row). Product-scoped, the coding-plan order must be allowed.
-	order, err := s.CreateOrder(context.Background(), uid, "coding-monthly", "stripe")
+	order, err := s.CreateOrder(context.Background(), uid, "coding-monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder coding-monthly with active kaya sub: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestDualProduct_CancelAndRefundAreProductScoped(t *testing.T) {
 	seedActiveSub(t, db, uid, "monthly", kayaExpiry)
 
 	// Buy coding plan (same pipeline as the purchase test).
-	order, err := s.CreateOrder(context.Background(), uid, "coding-monthly", "stripe")
+	order, err := s.CreateOrder(context.Background(), uid, "coding-monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestDualProduct_CancelAndRefundAreProductScoped(t *testing.T) {
 
 	// Re-activate coding via a second order, then full-refund it: the refund
 	// cascade must cancel ONLY the coding sub.
-	order2, err := s.CreateOrder(context.Background(), uid, "coding-monthly", "stripe")
+	order2, err := s.CreateOrder(context.Background(), uid, "coding-monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder 2: %v", err)
 	}

@@ -1482,3 +1482,40 @@ func TestParsePaddle_SubscriptionUpdated_MalformedScheduledChange(t *testing.T) 
 		t.Errorf("ScheduledChangeAction = %q, want empty on malformed block", we.ScheduledChangeAction)
 	}
 }
+
+// M3 review: the envelope's occurred_at must be lifted so the service can
+// detect stale deliveries (out-of-order subscription.updated).
+func TestParsePaddle_OccurredAt(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_occ_1",
+	  "event_type": "subscription.updated",
+	  "occurred_at": "2026-10-01T12:34:56Z",
+	  "data": {"id": "sub_occ_1", "status": "active"}
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.OccurredAt == nil || we.OccurredAt.Format(time.RFC3339) != "2026-10-01T12:34:56Z" {
+		t.Errorf("OccurredAt = %v, want 2026-10-01T12:34:56Z", we.OccurredAt)
+	}
+}
+
+// Malformed occurred_at must be lenient (log + nil), never a hard error.
+func TestParsePaddle_OccurredAt_Malformed(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_occ_2",
+	  "event_type": "subscription.updated",
+	  "occurred_at": "not-a-timestamp",
+	  "data": {"id": "sub_occ_2", "status": "active"}
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatalf("malformed occurred_at must be lenient: %v", err)
+	}
+	if we.OccurredAt != nil {
+		t.Errorf("OccurredAt = %v, want nil on malformed", we.OccurredAt)
+	}
+}

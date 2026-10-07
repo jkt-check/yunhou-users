@@ -1940,6 +1940,11 @@ type WebhookEvent struct {
 	// status/expires_at stay untouched (the status flip belongs to
 	// subscription.canceled).
 	ScheduledChangeAction string
+	// OccurredAt is the channel's event timestamp (Paddle envelope
+	// occurred_at), used to detect stale deliveries: a subscription.updated
+	// that predates the local row's updated_at must not regress plan_id.
+	// nil when absent/malformed — treated as fresh (can't prove stale).
+	OccurredAt *time.Time
 	// PriceIDs carries the subscription items' price ids
 	// (data.items[].price.id), only populated for subscription.updated —
 	// the service reverse-maps them through PADDLE_PRICES to a local

@@ -282,6 +282,9 @@ func writeSubSelfServiceError(c *gin.Context, err error, action string) {
 		log.Printf("change-plan blocked: paddle price not configured: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "payment provider unavailable"})
 	case errors.Is(err, service.ErrChannelUnavailable):
+		// Log the wrapped upstream error (the client only gets the generic
+		// message — provider detail stays server-side for ops).
+		log.Printf("subscription self-service: channel call failed: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "payment provider unavailable"})
 	case errors.Is(err, service.ErrPaddleNotConfigured):
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "paddle not configured on this deployment"})

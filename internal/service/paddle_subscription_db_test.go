@@ -590,3 +590,96 @@ func TestOnWebhook_PaddleSubscriptionCancelled_MissingExternalSubID(t *testing.T
 		t.Error("expected audit row paddle_cancel_missing_external_sub_id")
 	}
 }
+
+// ============================================================================
+// M3 review: stale subscription.updated deliveries must not regress
+// plan_id / expires_at; expires_at is monotonic (GREATEST, same rationale
+// as the renewal path's out-of-order guard).
+// ============================================================================
+
+// A delayed PRE-change event (old occurred_at, old items) arriving after a
+// change-plan must not flip plan_id back to the old plan and must not
+// shrink expires_at. The scheduled-cancel flip still applies (idempotent).
+func TestOnWebhook_PaddleSubscriptionUpdated_StaleEvent_NoRegression(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_stale_" + mustNewUUID()[:8]
+	// The row is ALREADY on yearly (change-plan happened), expiry far out.
+	farExpiry := time.Now().Add(380 * 24 * time.Hour).UTC().Truncate(time.Second)
+	subID := seedChannelSub(t, db, uid, "yearly", "active", extSubID, "paddle", true, farExpiry)
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_test", "yearly": "pri_yearly_test"})
+
+	staleTime := time.Now().Add(-time.Hour).UTC() // predates the row's updated_at
+	oldExpiry := time.Now().Add(10 * 24 * time.Hour).UTC().Truncate(time.Second)
+	e := paddleUpdatedEvent("evt-pd-stale-"+mustNewUUID()[:8], extSubID)
+	e.OccurredAt = &staleTime
+	e.PriceIDs = []string{"pri_monthly_test"} // the OLD plan's price
+	e.SubExpiresAt = &oldExpiry               // smaller than the row's expiry
+	if _, err := svc.OnWebhook(context.Background(), e); err != nil {
+		t.Fatalf("stale event must ack: %v", err)
+	}
+	planID, _, _, gotExpiry := readChannelState(t, db, subID)
+	if planID != "yearly" {
+		t.Errorf("plan_id regressed to %q by a stale event", planID)
+	}
+	if !gotExpiry.Equal(farExpiry) {
+		t.Errorf("expires_at = %v, shrank from %v on a stale event", gotExpiry, farExpiry)
+	}
+}
+
+// A fresh event (occurred_at after the row's updated_at) syncs as before.
+func TestOnWebhook_PaddleSubscriptionUpdated_FreshEvent_Syncs(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_fresh_" + mustNewUUID()[:8]
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, time.Now().Add(15*24*time.Hour))
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_test", "yearly": "pri_yearly_test"})
+
+	freshTime := time.Now().Add(time.Hour).UTC()
+	periodEnd := time.Now().Add(380 * 24 * time.Hour).UTC().Truncate(time.Second)
+	e := paddleUpdatedEvent("evt-pd-fresh-"+mustNewUUID()[:8], extSubID)
+	e.OccurredAt = &freshTime
+	e.PriceIDs = []string{"pri_yearly_test"}
+	e.SubExpiresAt = &periodEnd
+	if _, err := svc.OnWebhook(context.Background(), e); err != nil {
+		t.Fatalf("fresh event: %v", err)
+	}
+	planID, _, _, gotExpiry := readChannelState(t, db, subID)
+	if planID != "yearly" {
+		t.Errorf("plan_id = %q, want synced yearly", planID)
+	}
+	if !gotExpiry.Equal(periodEnd) {
+		t.Errorf("expires_at = %v, want synced %v", gotExpiry, periodEnd)
+	}
+}
+
+// Even on a FRESH plan-change sync, expires_at never shrinks: GREATEST
+// keeps the larger value (mirror of the renewal out-of-order guard).
+func TestOnWebhook_PaddleSubscriptionUpdated_ExpiryNeverShrinks(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_greatest_" + mustNewUUID()[:8]
+	farExpiry := time.Now().Add(400 * 24 * time.Hour).UTC().Truncate(time.Second)
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, farExpiry)
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_test", "yearly": "pri_yearly_test"})
+
+	freshTime := time.Now().Add(time.Hour).UTC()
+	smallExpiry := time.Now().Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
+	e := paddleUpdatedEvent("evt-pd-grt-"+mustNewUUID()[:8], extSubID)
+	e.OccurredAt = &freshTime
+	e.PriceIDs = []string{"pri_yearly_test"}
+	e.SubExpiresAt = &smallExpiry
+	if _, err := svc.OnWebhook(context.Background(), e); err != nil {
+		t.Fatalf("fresh event: %v", err)
+	}
+	planID, _, _, gotExpiry := readChannelState(t, db, subID)
+	if planID != "yearly" {
+		t.Errorf("plan_id = %q, want synced yearly", planID)
+	}
+	if !gotExpiry.Equal(farExpiry) {
+		t.Errorf("expires_at = %v, want GREATEST (unchanged %v)", gotExpiry, farExpiry)
+	}
+}

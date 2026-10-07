@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	billingpaddle "github.com/yunhou/users/internal/billing/paddle"
 	"github.com/yunhou/users/internal/model"
 )
 
@@ -62,6 +63,16 @@ func channelSelfServiceGate(sub *model.Subscription) (string, error) {
 // effective_from, then flips ONLY auto_renew locally — status/expires_at
 // stay untouched (access continues to period end; the subscription.canceled
 // webhook flips status).
+//
+// Race discipline (review): the row is locked FOR UPDATE and auto_renew is
+// re-checked inside the lock before any channel-side call, so two
+// concurrent cancels produce exactly one Paddle call; the loser takes the
+// idempotent path. The post-Paddle flip is conditional
+// (WHERE auto_renew = true) so a lost race is a harmless no-op, and a flip
+// FAILURE is log-and-continue with a divergence audit (matching
+// CancelChannelSubscription) — the user is never wedged: Paddle's
+// already-canceled error class is treated as a heal signal, so a retry
+// after any divergence completes the local flip.
 func (s *PaymentService) CancelSubscriptionByID(ctx context.Context, userID, subID, effectiveFrom string) (*model.Subscription, error) {
 	sub, err := s.subRepo.FindByID(ctx, subID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -90,20 +101,93 @@ func (s *PaymentService) CancelSubscriptionByID(ctx context.Context, userID, sub
 	if s.paddle == nil {
 		return nil, ErrPaddleNotConfigured
 	}
+
+	tx, err := s.dbBeginTx(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin cancel tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Lock the row and re-verify state BEFORE moving money channel-side —
+	// the unlocked read above is stale by construction; a concurrent cancel
+	// that already committed must short-circuit here without a second
+	// Paddle call.
+	var locked model.Subscription
+	err = tx.GetContext(ctx, &locked,
+		`SELECT * FROM subscriptions WHERE id = $1 FOR UPDATE`, sub.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrSubscriptionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock subscription: %w", err)
+	}
+	if locked.Status != "active" {
+		return nil, ErrSubscriptionAlreadyEnded
+	}
+	if !locked.AutoRenew {
+		return &locked, nil // lost the race with a concurrent cancel
+	}
+
+	// From the Paddle call onward the channel state may change. Any local
+	// failure after this point must leave a loud audit trail for ops
+	// reconciliation and must NOT wedge the user — see the doc comment.
+	diverge := func(cause error) (*model.Subscription, error) {
+		tx.Rollback() //nolint:errcheck
+		if aerr := s.writeAudit(ctx, "user:"+userID, "paddle_cancel_local_sync_failed",
+			fmt.Sprintf("subscription:%s", sub.ID),
+			[]string{"paddle", "subscription", "cancel", "diverged"},
+			map[string]any{
+				"subscription_id":          sub.ID,
+				"external_subscription_id": extID,
+				"error":                    cause.Error(),
+			}); aerr != nil {
+			log.Printf("cancel by id: divergence audit write failed for subscription %s: %v", sub.ID, aerr)
+		}
+		log.Printf("cancel by id: local sync failed for subscription %s after paddle cancel: %v", sub.ID, cause)
+		locked.AutoRenew = false // channel-side the cancel DID happen
+		return &locked, nil
+	}
+
 	if err := s.paddle.CancelSubscription(ctx, extID); err != nil {
+		if billingpaddle.IsSubscriptionGoneError(err) {
+			// Heal (review): the channel-side billing relationship is
+			// already over (a lost subscription.canceled webhook, a
+			// dashboard cancel). Flip the local flag with a loud audit
+			// instead of wedging the user on 502 forever.
+			if _, uerr := tx.ExecContext(ctx, `
+				UPDATE subscriptions SET auto_renew = false, updated_at = now()
+				WHERE id = $1 AND auto_renew = true
+			`, sub.ID); uerr != nil {
+				return nil, fmt.Errorf("heal auto_renew after gone-class paddle error: %w", uerr)
+			}
+			if aerr := writeAuditOnTx(ctx, tx, "user:"+userID, "paddle_cancel_already_canceled_healed",
+				fmt.Sprintf("subscription:%s", sub.ID),
+				[]string{"paddle", "subscription", "cancel", "healed"},
+				map[string]any{
+					"subscription_id":          sub.ID,
+					"external_subscription_id": extID,
+					"paddle_error":             err.Error(),
+				}); aerr != nil {
+				return nil, fmt.Errorf("write heal audit: %w", aerr)
+			}
+			if cerr := tx.Commit(); cerr != nil {
+				return nil, fmt.Errorf("commit heal tx: %w", cerr)
+			}
+			locked.AutoRenew = false
+			return &locked, nil
+		}
 		return nil, fmt.Errorf("%w: %v", ErrChannelUnavailable, err)
 	}
-	if _, err := s.db.ExecContext(ctx, `
-		UPDATE subscriptions SET auto_renew = false, updated_at = now() WHERE id = $1
+
+	// Conditional flip: 0 rows means a concurrent flip already landed —
+	// idempotent success, not an error.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE subscriptions SET auto_renew = false, updated_at = now()
+		WHERE id = $1 AND auto_renew = true
 	`, sub.ID); err != nil {
-		// The channel-side cancel already succeeded; a failed local flip
-		// must surface loudly (ops reconciles via log) while the user sees
-		// a retryable error.
-		log.Printf("cancel by id: auto_renew flip failed for subscription %s after paddle cancel: %v", sub.ID, err)
-		return nil, fmt.Errorf("flip auto_renew: %w", err)
+		return diverge(fmt.Errorf("flip auto_renew: %w", err))
 	}
-	sub.AutoRenew = false
-	if err := s.writeAudit(ctx, "user:"+userID, "paddle_subscription_cancel_requested",
+	if err := writeAuditOnTx(ctx, tx, "user:"+userID, "paddle_subscription_cancel_requested",
 		fmt.Sprintf("subscription:%s", sub.ID),
 		[]string{"paddle", "subscription", "cancel"},
 		map[string]any{
@@ -112,9 +196,13 @@ func (s *PaymentService) CancelSubscriptionByID(ctx context.Context, userID, sub
 			"plan_id":                  sub.PlanID,
 			"effective_from":           effectiveFrom,
 		}); err != nil {
-		log.Printf("cancel by id: audit write failed for subscription %s: %v", sub.ID, err)
+		return diverge(fmt.Errorf("write cancel audit: %w", err))
 	}
-	return sub, nil
+	if err := tx.Commit(); err != nil {
+		return diverge(fmt.Errorf("commit cancel tx: %w", err))
+	}
+	locked.AutoRenew = false
+	return &locked, nil
 }
 
 // ChangePlanByID implements POST /user/subscriptions/:id/change-plan:
@@ -166,6 +254,14 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 	if err != nil {
 		return nil, err
 	}
+	if !sub.AutoRenew {
+		// Review (contract gap): a scheduled-cancel-pending sub must NOT be
+		// plan-changed — Paddle silently DROPS scheduled_change on an items
+		// update, resurrecting billing while local reads auto_renew=false.
+		// Reject with the no-auto-renew class (change-plan only; cancel on
+		// the same state stays idempotent-200).
+		return nil, ErrSubscriptionNoAutoRenew
+	}
 	if s.paddle == nil {
 		return nil, ErrPaddleNotConfigured
 	}
@@ -176,7 +272,7 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 		return nil, ErrPaddlePriceNotConfigured
 	}
 
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.dbBeginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin change-plan tx: %w", err)
 	}
@@ -243,9 +339,15 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 		return failSync(fmt.Errorf("switch subscription plan: %w", err))
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return failSync(ErrSubscriptionNotFound)
+		// The row flipped non-active between the FOR UPDATE lock and the
+		// plan write — but Paddle already CHARGED the proration. Surfacing
+		// 404 "subscription not found" here would tell a just-charged user
+		// their subscription vanished; report the channel-unavailable
+		// class (502 bucket) instead — the divergence audit above already
+		// captured the mismatch for ops.
+		return failSync(fmt.Errorf("%w: subscription not active at plan write after channel-side charge", ErrChannelUnavailable))
 	}
-	if err := writeAuditOnTx(ctx, &sqlxTx{tx}, "user:"+userID, "paddle_subscription_plan_changed",
+	if err := writeAuditOnTx(ctx, tx, "user:"+userID, "paddle_subscription_plan_changed",
 		fmt.Sprintf("subscription:%s", sub.ID),
 		[]string{"paddle", "subscription", "change_plan"},
 		map[string]any{

@@ -196,3 +196,16 @@ func (c *Client) GetSubscriptionNextBilledAt(ctx context.Context, subscriptionID
 	}
 	return &t, nil
 }
+
+// IsSubscriptionGoneError reports whether err is Paddle's "channel-side
+// billing relationship is already over" class: the subscription does not
+// exist (`not_found`, 404) or the requested action is invalid because the
+// subscription is already canceled (`subscription_is_canceled_action_invalid`).
+// Detection uses the SDK's typed sentinels (paddle-go-sdk v5:
+// *paddleerr.Error matches on Type+Code via errors.Is); the client's own
+// %w wrapping preserves the chain. Callers treat this class as a heal
+// signal (align local state), never as a retryable failure.
+func IsSubscriptionGoneError(err error) bool {
+	return errors.Is(err, paddle.ErrNotFound) ||
+		errors.Is(err, paddle.ErrSubscriptionIsCanceledActionInvalid)
+}

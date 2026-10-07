@@ -11,7 +11,16 @@
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS channel TEXT;
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN NOT NULL DEFAULT false;
 
--- Backfill (idempotent — safe to re-run).
+-- Backfill.
+-- The DDL above is idempotent (IF NOT EXISTS) and safe to re-run. The
+-- backfill UPDATEs below are a ONE-SHOT data migration, NOT safe to re-run
+-- after go-live: the auto_renew arm matches (channel, status='active',
+-- auto_renew=false) and would silently re-arm auto_renew=true for users
+-- who cancelled in the meantime (their rows are still active until period
+-- end). The paddle/paypal channel backfills ARE re-runnable (channel IS
+-- NULL guard), but once 045 has been applied to an environment, do not
+-- re-execute this file against it.
+--
 -- Channel was previously inferred from the external_subscription_id prefix
 -- (internal/service/paddle_subscription.go): 'sub_' = Paddle Billing,
 -- 'I-' = PayPal. These two MUST be exact — the self-management feature keys

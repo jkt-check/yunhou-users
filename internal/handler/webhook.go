@@ -733,9 +733,10 @@ type paddleTotals struct {
 // transaction.* money events only.
 func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) {
 	var evt struct {
-		EventID   string          `json:"event_id"`
-		EventType string          `json:"event_type"`
-		Data      json.RawMessage `json:"data"`
+		EventID    string          `json:"event_id"`
+		EventType  string          `json:"event_type"`
+		OccurredAt string          `json:"occurred_at"`
+		Data       json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &evt); err != nil {
 		return nil, fmt.Errorf("paddle body: %w", err)
@@ -748,6 +749,15 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 		Channel:   "paddle",
 		EventID:   evt.EventID,
 		EventType: evt.EventType,
+	}
+	if evt.OccurredAt != "" {
+		if t, err := time.Parse(time.RFC3339, evt.OccurredAt); err == nil {
+			we.OccurredAt = &t
+		} else {
+			// Lenient like every other hint field: the service treats nil
+			// as "can't prove stale" and processes the event.
+			log.Printf("paddle: invalid occurred_at %q for event %s: %v", evt.OccurredAt, evt.EventID, err)
+		}
 	}
 
 	switch {

@@ -492,21 +492,42 @@ func (s *PaymentService) onPaddleSubscriptionUpdated(ctx context.Context, e Webh
 
 	// (b) Plan re-sync. Only meaningful while the sub is live; a stale
 	// update racing a cancel/expiry must not resurrect plan data onto an
-	// ended row. expires_at follows the payload hint when present, else
-	// keeps the current value.
+	// ended row. Recency guard: an event whose occurred_at predates the
+	// row's updated_at is a delayed PRE-change delivery — flipping plan_id
+	// from it would regress the row (e.g. back to monthly after a
+	// change-plan), so only the regression-safe expires_at GREATEST
+	// extension applies (nil occurred_at = "can't prove stale" = fresh).
+	// expires_at itself is monotonic via GREATEST, mirroring the renewal
+	// path's out-of-order guard.
 	if sub.Status == "active" {
+		stale := e.OccurredAt != nil && e.OccurredAt.Before(sub.UpdatedAt)
 		planID := planIDForSubscriptionPrices(s.paddlePrices, e.PriceIDs)
-		if planID != "" && planID != sub.PlanID {
+		switch {
+		case planID != "" && planID != sub.PlanID && !stale:
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE subscriptions
-				SET plan_id = $1, expires_at = COALESCE($2, expires_at), updated_at = now()
+				SET plan_id = $1,
+				    expires_at = GREATEST(COALESCE($2, expires_at), expires_at),
+				    updated_at = now()
 				WHERE id = $3 AND status = 'active'
 			`, planID, e.SubExpiresAt, sub.ID); err != nil {
 				return fmt.Errorf("sync plan from subscription.updated: %w", err)
 			}
 			auditCtx["plan_synced_from"] = sub.PlanID
 			auditCtx["plan_synced_to"] = planID
-		} else if planID == "" && len(e.PriceIDs) > 0 {
+		case planID != "" && planID != sub.PlanID && stale:
+			// Stale: skip the plan flip, keep only the monotonic expiry.
+			if e.SubExpiresAt != nil {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE subscriptions
+					SET expires_at = GREATEST($1, expires_at), updated_at = now()
+					WHERE id = $2 AND status = 'active'
+				`, *e.SubExpiresAt, sub.ID); err != nil {
+					return fmt.Errorf("extend expiry from stale subscription.updated: %w", err)
+				}
+			}
+			auditCtx["plan_sync_skipped_stale"] = planID
+		case planID == "" && len(e.PriceIDs) > 0:
 			// Unknown or ambiguous price mapping — skip loudly (ops can
 			// fix PADDLE_PRICES), never fail the event.
 			log.Printf("paddle subscription.updated: no unambiguous plan for prices %v (event %s)", e.PriceIDs, e.EventID)

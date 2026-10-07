@@ -790,7 +790,7 @@ func (h *SubscriptionHandler) ListUserSubscriptions(c *gin.Context) {
 	// explicit multi-product view reserved for future consoles.
 	product := c.Query("product")
 	var (
-		subs []model.Subscription
+		subs []service.SubscriptionView
 		err  error
 	)
 	if product == "" {

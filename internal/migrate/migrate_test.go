@@ -413,3 +413,108 @@ func TestStatus_RowsErrorSurfaces(t *testing.T) {
 		t.Fatal("Status must return the mid-iteration connection error, got nil")
 	}
 }
+
+// TestMigration045_ChannelAutoRenewBackfill applies every migration up to
+// 044, seeds legacy subscription rows (channel inferred from
+// external_subscription_id prefix pre-045), then applies 045 and asserts
+// the backfill: 'sub_' → paddle, 'I-' → paypal, auto_renew only for ACTIVE
+// channel subs, and NULL external id → channel stays NULL. Re-applying 045
+// must be a no-op (idempotent).
+func TestMigration045_ChannelAutoRenewBackfill(t *testing.T) {
+	db := freshTestDB(t)
+	migs, err := LoadFiles(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Skipf("no migrations/ dir (%v)", err)
+	}
+	var pre, post []Migration
+	for _, m := range migs {
+		if strings.HasPrefix(m.ID, "045_") {
+			post = append(post, m)
+		} else if m.ID < "045_" {
+			pre = append(pre, m)
+		}
+	}
+	if len(post) != 1 {
+		t.Fatalf("expected exactly one 045_* migration, got %d", len(post))
+	}
+	captureLog(t)
+	if _, _, err := Apply(context.Background(), db, pre); err != nil {
+		t.Fatalf("apply pre-045: %v", err)
+	}
+
+	// Seed legacy rows: a paddle sub (active), a paypal sub (active), an
+	// expired paddle sub (auto_renew must stay false), and a local free sub
+	// (no external id → channel stays NULL).
+	seed := func(extID *string, status string) {
+		t.Helper()
+		uid := uuid.New().String()
+		if _, err := db.Exec(`INSERT INTO users (id) VALUES ($1)`, uid); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		if _, err := db.Exec(`
+			INSERT INTO subscriptions (user_id, plan_id, status, product_code, external_subscription_id)
+			VALUES ($1, 'free', $2, 'kaya-membership', $3)
+		`, uid, status, extID); err != nil {
+			t.Fatalf("seed subscription: %v", err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO plans (id, name) VALUES ('free', 'Free') ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatalf("seed plan: %v", err)
+	}
+	paddleExt := "sub_legacy_paddle"
+	paypalExt := "I-LEGACY-PAYPAL"
+	expiredPaddleExt := "sub_legacy_expired"
+	seed(&paddleExt, "active")
+	seed(&paypalExt, "active")
+	seed(&expiredPaddleExt, "expired")
+	seed(nil, "active")
+
+	if _, _, err := Apply(context.Background(), db, post); err != nil {
+		t.Fatalf("apply 045: %v", err)
+	}
+
+	type row struct {
+		ExtID     *string `db:"external_subscription_id"`
+		Channel   *string `db:"channel"`
+		AutoRenew bool    `db:"auto_renew"`
+	}
+	var rows []row
+	if err := db.Select(&rows, `SELECT external_subscription_id, channel, auto_renew FROM subscriptions ORDER BY created_at`); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("rows = %d, want 4", len(rows))
+	}
+	want := []struct {
+		channel   *string
+		autoRenew bool
+	}{
+		{strPtr("paddle"), true},
+		{strPtr("paypal"), true},
+		{strPtr("paddle"), false}, // expired → no auto_renew
+		{nil, false},              // local → channel NULL
+	}
+	for i, r := range rows {
+		if (r.Channel == nil) != (want[i].channel == nil) || (r.Channel != nil && *r.Channel != *want[i].channel) {
+			t.Errorf("row %d channel = %v, want %v", i, r.Channel, want[i].channel)
+		}
+		if r.AutoRenew != want[i].autoRenew {
+			t.Errorf("row %d auto_renew = %v, want %v", i, r.AutoRenew, want[i].autoRenew)
+		}
+	}
+
+	// Idempotent: re-applying 045's statements must not error or change
+	// rows (Apply itself skips via the ledger; run the raw SQL again).
+	if _, err := db.Exec(post[0].SQL); err != nil {
+		t.Fatalf("re-apply 045 raw SQL: %v", err)
+	}
+	var after int
+	if err := db.Get(&after, `SELECT count(*) FROM subscriptions WHERE channel IN ('paddle','paypal')`); err != nil {
+		t.Fatalf("count after re-apply: %v", err)
+	}
+	if after != 3 {
+		t.Errorf("channel rows after re-apply = %d, want 3", after)
+	}
+}
+
+func strPtr(s string) *string { return &s }

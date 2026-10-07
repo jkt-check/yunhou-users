@@ -31,6 +31,12 @@ type Subscription struct {
 	StartedAt              time.Time  `db:"started_at" json:"started_at"`
 	ExpiresAt              *time.Time `db:"expires_at" json:"expires_at"`
 	ExternalSubscriptionID *string    `db:"external_subscription_id" json:"external_subscription_id,omitempty"` // PayPal subscription ID (`I-...`); NULL for non-PayPal subs
-	CreatedAt              time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt              time.Time  `db:"updated_at" json:"updated_at"`
+	// Channel / AutoRenew are server-internal: json:"-" keeps them out of
+	// every response that serializes this model directly (admin, paddle
+	// cancel). Member-facing reads expose them through dedicated DTOs
+	// (service.SubscriptionView, service.SubscriptionInfo).
+	Channel   *string   `db:"channel" json:"-"` // paddle/paypal/wechat_pay; NULL = non-channel sub
+	AutoRenew bool      `db:"auto_renew" json:"-"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
 }

@@ -86,7 +86,7 @@ func (m *mockTokenSvc) Refresh(ctx context.Context, refreshToken, appID string) 
 }
 
 type mockSubSvc struct {
-	subs      []model.Subscription
+	subs      []service.SubscriptionView
 	createErr error
 	cancelErr error
 }
@@ -110,11 +110,11 @@ func (m *mockSubSvc) GetUserSubscription(ctx context.Context, userID string) (*m
 	return nil, nil, nil
 }
 
-func (m *mockSubSvc) ListUserSubscriptions(ctx context.Context, userID string) ([]model.Subscription, error) {
+func (m *mockSubSvc) ListUserSubscriptions(ctx context.Context, userID string) ([]service.SubscriptionView, error) {
 	return m.subs, nil
 }
 
-func (m *mockSubSvc) ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error) {
+func (m *mockSubSvc) ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]service.SubscriptionView, error) {
 	return m.subs, nil
 }
 
@@ -1051,8 +1051,10 @@ func TestSubscriptionHandler_ListUserSubscriptions(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	t.Run("list subscriptions success", func(t *testing.T) {
-		subs := []model.Subscription{
+		paddle := "paddle"
+		subs := []service.SubscriptionView{
 			{ID: "sub-1", UserID: "user-1", PlanID: "free"},
+			{ID: "sub-2", UserID: "user-1", PlanID: "monthly", Status: "active", Channel: &paddle, AutoRenew: true},
 		}
 		subSvc := &mockSubSvc{subs: subs}
 		handler := NewSubscriptionHandler(subSvc)
@@ -1066,6 +1068,18 @@ func TestSubscriptionHandler_ListUserSubscriptions(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", w.Code)
+		}
+		body := w.Body.String()
+		// M1 contract: the response surfaces channel + auto_renew...
+		if !strings.Contains(body, `"channel":"paddle"`) {
+			t.Errorf("body missing channel: %s", body)
+		}
+		if !strings.Contains(body, `"auto_renew":true`) {
+			t.Errorf("body missing auto_renew: %s", body)
+		}
+		// ...and the Paddle subscription id never leaves the server.
+		if strings.Contains(body, "external_subscription_id") {
+			t.Errorf("body leaks external_subscription_id: %s", body)
 		}
 	})
 

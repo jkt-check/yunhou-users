@@ -66,7 +66,7 @@ func TestChangePlanByID_PostPaddleZeroRows_ChannelUnavailable(t *testing.T) {
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &subFillingTx{
 			sub: &model.Subscription{
-				ID: subID, UserID: uid, PlanID: "monthly", Status: "active",
+				ID: subID, UserID: uid, PlanID: "monthly", Status: "active", AutoRenew: true,
 			},
 			rowsAffected: 0, // the plan write matches no row
 		}, nil
@@ -339,4 +339,35 @@ func TestCancelSubscriptionByID_TxBranches(t *testing.T) {
 			t.Errorf("paddle calls = %d, want 0 for the race loser", stub.cancelCalls)
 		}
 	})
+}
+
+// N1 (review): a cancel landing between ChangePlanByID's unlocked pre-read
+// (auto_renew=true) and the row lock must still block the plan change — the
+// in-lock re-check covers auto_renew, not just status. Otherwise Paddle's
+// items update silently drops the scheduled_change and resurrects billing
+// while local reads auto_renew=false.
+func TestChangePlanByID_InLockAutoRenewRecheck(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	// The unlocked pre-read sees auto_renew=true...
+	subID := seedChannelSub(t, db, uid, "monthly", "active", "sub_lock_"+mustNewUUID()[:8], "paddle", true, time.Now().Add(15*24*time.Hour))
+
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"yearly": "pri_y"})
+	// ...but by the time the FOR UPDATE lock is acquired, a cancel has
+	// committed auto_renew=false under the same row lock.
+	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
+		return &subFillingTx{
+			sub: &model.Subscription{ID: subID, UserID: uid, PlanID: "monthly", Status: "active", AutoRenew: false},
+		}, nil
+	}
+
+	if _, err := svc.ChangePlanByID(context.Background(), uid, subID, "yearly"); !errors.Is(err, ErrSubscriptionNoAutoRenew) {
+		t.Fatalf("expected ErrSubscriptionNoAutoRenew, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Errorf("paddle calls = %d, want 0 (reject before any channel-side call)", stub.updateCalls)
+	}
 }

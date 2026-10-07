@@ -295,6 +295,14 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 	if locked.Status != "active" {
 		return nil, ErrSubscriptionAlreadyEnded
 	}
+	if !locked.AutoRenew {
+		// A cancel (endpoint or subscription.updated webhook — both commit
+		// auto_renew=false under this same row lock) landed between the
+		// unlocked pre-read and here. Reject: an items update would drop
+		// the scheduled_change channel-side and resurrect billing while
+		// local reads auto_renew=false.
+		return nil, ErrSubscriptionNoAutoRenew
+	}
 
 	// From the Paddle call onward, money may move channel-side. Any local
 	// failure after this point leaves a loud audit trail for ops
@@ -318,6 +326,13 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 
 	nextBilled, err := s.paddle.UpdateSubscriptionPrice(ctx, extID, priceID)
 	if err != nil {
+		// A gone-class error here (subscription already canceled / not
+		// found channel-side) also surfaces as plain 502 with the row left
+		// active+auto_renew=true — no special-case: the recovery path is
+		// the user retrying via the cancel endpoint, which heals
+		// (IsSubscriptionGoneError → local auto_renew=false), and the
+		// subscription.updated / subscription.canceled webhooks reconcile
+		// the row independently.
 		return nil, fmt.Errorf("%w: %v", ErrChannelUnavailable, err)
 	}
 	// Channel-authoritative anchor preferred; fall back to the plan

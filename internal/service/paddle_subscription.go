@@ -499,6 +499,12 @@ func (s *PaymentService) onPaddleSubscriptionUpdated(ctx context.Context, e Webh
 	// extension applies (nil occurred_at = "can't prove stale" = fresh).
 	// expires_at itself is monotonic via GREATEST, mirroring the renewal
 	// path's out-of-order guard.
+	//
+	// Cross-clock assumption: occurred_at is Paddle's clock, updated_at is
+	// our DB's — multi-second skew can misclassify events at the margins.
+	// The failure direction is conservative: a marginal fresh event may be
+	// skipped as "stale" (plan stays, skip is audited), but a stale event
+	// can never regress plan_id.
 	if sub.Status == "active" {
 		stale := e.OccurredAt != nil && e.OccurredAt.Before(sub.UpdatedAt)
 		planID := planIDForSubscriptionPrices(s.paddlePrices, e.PriceIDs)

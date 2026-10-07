@@ -1934,6 +1934,17 @@ type WebhookEvent struct {
 	// refund/entitlement machinery (M3 review — entitlement handling on
 	// chargebacks is deliberately deferred).
 	AdjustmentAction string
+	// ScheduledChangeAction is Paddle's data.scheduled_change.action, only
+	// populated for subscription.* events. "cancel" means the buyer's cancel
+	// is scheduled at period end: the local row flips auto_renew=false while
+	// status/expires_at stay untouched (the status flip belongs to
+	// subscription.canceled).
+	ScheduledChangeAction string
+	// PriceIDs carries the subscription items' price ids
+	// (data.items[].price.id), only populated for subscription.updated —
+	// the service reverse-maps them through PADDLE_PRICES to a local
+	// plan_id as a reconciliation fallback.
+	PriceIDs []string
 	// SkipAmountCheck exempts PayPal lifecycle events
 	// (BILLING.SUBSCRIPTION.ACTIVATED etc.) from the amount/currency
 	// validation in onPaymentSucceeded: PayPal omits resource.amount from
@@ -2046,6 +2057,11 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 	case branchSubscriptionCancelled:
 		domainAction = branch.domainAction()
 		if err := s.onPaddleSubscriptionCancelled(ctx, e); err != nil {
+			return nil, err
+		}
+	case branchSubscriptionUpdated:
+		domainAction = branch.domainAction()
+		if err := s.onPaddleSubscriptionUpdated(ctx, e); err != nil {
 			return nil, err
 		}
 	case branchChargebackUnhandled:
@@ -3793,6 +3809,10 @@ const (
 	branchDisputeClosed
 	branchRenewal
 	branchSubscriptionCancelled
+	// branchSubscriptionUpdated: paddle subscription.updated — scheduled
+	// cancel flip (auto_renew=false) + plan re-sync from items' price ids
+	// (M3). Both idempotent; unknown subscription → audit-only ack.
+	branchSubscriptionUpdated
 	// branchChargebackUnhandled: an approved paddle chargeback /
 	// chargeback_reverse adjustment. Money moved channel-side via a
 	// dispute; we record an alertable audit marker and ack — entitlement
@@ -3817,6 +3837,8 @@ func (b webhookBranch) domainAction() string {
 		return "payment_dispute_closed"
 	case branchSubscriptionCancelled:
 		return "subscription_cancelled"
+	case branchSubscriptionUpdated:
+		return "subscription_updated"
 	default:
 		return "none"
 	}
@@ -3918,6 +3940,11 @@ var channelWebhookBranches = map[string]map[string]webhookBranch{
 		// revokes here (CancelChannelSubscription deliberately leaves the
 		// local row active until this arrives).
 		"subscription.canceled": branchSubscriptionCancelled,
+		// subscription.updated (M3): carries the scheduled_change
+		// (self-serve cancel scheduled at period end → auto_renew flip)
+		// and the current items (plan re-sync as reconciliation fallback).
+		// past_due / created / activated / trialing stay audit-only.
+		"subscription.updated": branchSubscriptionUpdated,
 	},
 }
 

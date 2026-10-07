@@ -725,10 +725,12 @@ type paddleTotals struct {
 // would 400 before that insert and Paddle would retry forever with zero
 // trace. Field-level problems surface as domain audits downstream.
 //
-// subscription.* data: id (sub_...), next_billed_at (RFC3339), status.
-// subscription.* events carry no transaction: settlement is anchored on
-// transaction.* money events only, so these ride the audit-only default
-// branch in the service — we lift just the identifiers for visibility.
+// subscription.* data: id (sub_...), next_billed_at (RFC3339), status,
+// scheduled_change.action, items[].price.id, current_billing_period.ends_at.
+// subscription.canceled flips the local sub (period end); subscription.updated
+// carries the scheduled-cancel signal and the plan re-sync fields (M3); the
+// rest ride the audit-only default branch. Settlement stays anchored on
+// transaction.* money events only.
 func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) {
 	var evt struct {
 		EventID   string          `json:"event_id"`
@@ -887,6 +889,20 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 		var sub struct {
 			ID           string `json:"id"`
 			NextBilledAt string `json:"next_billed_at"`
+			// scheduled_change rides as RawMessage: a malformed block
+			// (not the object Paddle documents) must not hard-error the
+			// event — unlike data.id it keys no dedupe. Lenient-parse
+			// below, mirroring the money-event philosophy in the doc
+			// comment.
+			ScheduledChange json.RawMessage `json:"scheduled_change"`
+			Items           []struct {
+				Price struct {
+					ID string `json:"id"`
+				} `json:"price"`
+			} `json:"items"`
+			CurrentBillingPeriod *struct {
+				EndsAt string `json:"ends_at"`
+			} `json:"current_billing_period"`
 		}
 		if err := json.Unmarshal(evt.Data, &sub); err != nil {
 			return nil, fmt.Errorf("paddle subscription data: %w", err)
@@ -895,13 +911,38 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 			return nil, fmt.Errorf("paddle missing data.id")
 		}
 		we.ExternalSubscriptionID = sub.ID
-		if sub.NextBilledAt != "" {
-			if t, err := time.Parse(time.RFC3339, sub.NextBilledAt); err == nil {
+		if len(sub.ScheduledChange) > 0 && string(sub.ScheduledChange) != "null" {
+			var sc struct {
+				Action string `json:"action"`
+			}
+			if err := json.Unmarshal(sub.ScheduledChange, &sc); err != nil {
+				log.Printf("paddle: malformed scheduled_change for event %s: %v", evt.EventID, err)
+			} else {
+				we.ScheduledChangeAction = sc.Action
+			}
+		}
+		for _, item := range sub.Items {
+			if item.Price.ID != "" {
+				we.PriceIDs = append(we.PriceIDs, item.Price.ID)
+			}
+		}
+		// Expiry hint: the current billing period's end is authoritative
+		// for "when does the paid period run out"; next_billed_at is the
+		// fallback (it equals the period end for a plain renewal cycle).
+		hint := ""
+		if sub.CurrentBillingPeriod != nil {
+			hint = sub.CurrentBillingPeriod.EndsAt
+		}
+		if hint == "" {
+			hint = sub.NextBilledAt
+		}
+		if hint != "" {
+			if t, err := time.Parse(time.RFC3339, hint); err == nil {
 				we.SubExpiresAt = &t
 			} else {
 				// Don't fail the whole event for a malformed hint — the
 				// renewal path falls back to "audit + no extension".
-				log.Printf("paddle: invalid next_billed_at %q for event %s: %v", sub.NextBilledAt, evt.EventID, err)
+				log.Printf("paddle: invalid billing-period/next-billed hint %q for event %s: %v", hint, evt.EventID, err)
 			}
 		}
 	}

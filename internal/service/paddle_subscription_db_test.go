@@ -342,3 +342,251 @@ func TestUpgradeChannelSubscription_IntervalFallbackClamped(t *testing.T) {
 		t.Errorf("NextBilledAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", res.NextBilledAt)
 	}
 }
+
+// ============================================================================
+// Webhook: subscription.updated — scheduled cancel flip + plan re-sync (M3)
+// ============================================================================
+
+func paddleUpdatedEvent(eventID, extSubID string) WebhookEvent {
+	return WebhookEvent{
+		Channel: "paddle", EventID: eventID, EventType: "subscription.updated",
+		ExternalSubscriptionID: extSubID,
+		RawPayload:             json.RawMessage(`{}`),
+	}
+}
+
+// scheduled_change.action="cancel": flip auto_renew locally, leave
+// status/expires_at untouched (the cancel takes effect at period end —
+// the status flip belongs to subscription.canceled).
+func TestOnWebhook_PaddleSubscriptionUpdated_ScheduledCancel(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_updc_" + mustNewUUID()[:8]
+	expiry := time.Now().Add(15 * 24 * time.Hour).UTC().Truncate(time.Second)
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, expiry)
+
+	e := paddleUpdatedEvent("evt-pd-updc-"+mustNewUUID()[:8], extSubID)
+	e.ScheduledChangeAction = "cancel"
+	res, err := svc.OnWebhook(context.Background(), e)
+	if err != nil {
+		t.Fatalf("OnWebhook subscription.updated: %v", err)
+	}
+	if res.DomainAction != "subscription_updated" {
+		t.Errorf("DomainAction = %q, want subscription_updated", res.DomainAction)
+	}
+	planID, status, autoRenew, gotExpiry := readChannelState(t, db, subID)
+	if autoRenew {
+		t.Error("auto_renew still true after scheduled-cancel webhook")
+	}
+	if status != "active" {
+		t.Errorf("status = %q, want active (cancel takes effect at period end)", status)
+	}
+	if planID != "monthly" {
+		t.Errorf("plan_id = %q, want untouched monthly", planID)
+	}
+	if !gotExpiry.Equal(expiry) {
+		t.Errorf("expires_at = %v, want untouched %v", gotExpiry, expiry)
+	}
+
+	// Idempotent replay (distinct event id, same content): no error, no
+	// state change, no duplicate side effects.
+	e2 := paddleUpdatedEvent("evt-pd-updc-"+mustNewUUID()[:8], extSubID)
+	e2.ScheduledChangeAction = "cancel"
+	if _, err := svc.OnWebhook(context.Background(), e2); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, status, autoRenew, _ := readChannelState(t, db, subID); autoRenew || status != "active" {
+		t.Errorf("after replay: autoRenew=%v status=%q", autoRenew, status)
+	}
+}
+
+// items change with a known price_id → plan_id + expires_at re-synced from
+// the payload (reconciliation fallback for our change-plan and Paddle-side
+// changes).
+func TestOnWebhook_PaddleSubscriptionUpdated_PlanSync(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_upds_" + mustNewUUID()[:8]
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, time.Now().Add(15*24*time.Hour))
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_test", "yearly": "pri_yearly_test"})
+
+	periodEnd := time.Now().Add(380 * 24 * time.Hour).UTC().Truncate(time.Second)
+	e := paddleUpdatedEvent("evt-pd-upds-"+mustNewUUID()[:8], extSubID)
+	e.PriceIDs = []string{"pri_yearly_test"}
+	e.SubExpiresAt = &periodEnd
+	if _, err := svc.OnWebhook(context.Background(), e); err != nil {
+		t.Fatalf("OnWebhook subscription.updated: %v", err)
+	}
+	planID, _, autoRenew, gotExpiry := readChannelState(t, db, subID)
+	if planID != "yearly" {
+		t.Errorf("plan_id = %q, want synced yearly", planID)
+	}
+	if !gotExpiry.Equal(periodEnd) {
+		t.Errorf("expires_at = %v, want synced %v", gotExpiry, periodEnd)
+	}
+	if !autoRenew {
+		t.Error("auto_renew must be preserved by a plan sync")
+	}
+}
+
+// Unknown price_id: plan must NOT be touched, but the event still acks
+// (scheduled-cancel flips in the same event would still apply).
+func TestOnWebhook_PaddleSubscriptionUpdated_UnknownPrice(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_updu_" + mustNewUUID()[:8]
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, time.Now().Add(15*24*time.Hour))
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_test"})
+
+	e := paddleUpdatedEvent("evt-pd-updu-"+mustNewUUID()[:8], extSubID)
+	e.PriceIDs = []string{"pri_no_such_price"}
+	if _, err := svc.OnWebhook(context.Background(), e); err != nil {
+		t.Fatalf("unknown price must not error: %v", err)
+	}
+	if planID, _, _, _ := readChannelState(t, db, subID); planID != "monthly" {
+		t.Errorf("plan_id = %q, want untouched monthly", planID)
+	}
+}
+
+// Ambiguous reverse mapping (two plans sharing one price) → skip the plan
+// sync, no error.
+func TestOnWebhook_PaddleSubscriptionUpdated_AmbiguousPrice(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_upda_" + mustNewUUID()[:8]
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, time.Now().Add(15*24*time.Hour))
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_shared", "yearly": "pri_shared"})
+
+	e := paddleUpdatedEvent("evt-pd-upda-"+mustNewUUID()[:8], extSubID)
+	e.PriceIDs = []string{"pri_shared"}
+	if _, err := svc.OnWebhook(context.Background(), e); err != nil {
+		t.Fatalf("ambiguous price must not error: %v", err)
+	}
+	if planID, _, _, _ := readChannelState(t, db, subID); planID != "monthly" {
+		t.Errorf("plan_id = %q, want untouched monthly", planID)
+	}
+}
+
+// Unknown subscription → audit-only ack 200 (a Paddle sub we never stamped).
+func TestOnWebhook_PaddleSubscriptionUpdated_UnknownSub(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	e := paddleUpdatedEvent("evt-pd-updunk-"+mustNewUUID()[:8], "sub_unknown_"+mustNewUUID()[:8])
+	e.ScheduledChangeAction = "cancel"
+	if _, err := svc.OnWebhook(context.Background(), e); err != nil {
+		t.Fatalf("unknown sub must ack, got %v", err)
+	}
+	if countAudit(t, db, "paddle_updated_unknown_subscription") != 1 {
+		t.Error("expected audit row paddle_updated_unknown_subscription")
+	}
+}
+
+// subscription.past_due stays audit-only: ack 200, no state change.
+func TestOnWebhook_PaddleSubscriptionPastDue_AuditOnly(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_pd_due_" + mustNewUUID()[:8]
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, time.Now().Add(15*24*time.Hour))
+
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paddle", EventID: "evt-pd-due-" + mustNewUUID()[:8], EventType: "subscription.past_due",
+		ExternalSubscriptionID: extSubID,
+		RawPayload:             json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("past_due must ack: %v", err)
+	}
+	if res.DomainAction != "none" {
+		t.Errorf("DomainAction = %q, want none", res.DomainAction)
+	}
+	if _, _, autoRenew, _ := readChannelState(t, db, subID); !autoRenew {
+		t.Error("past_due must not change subscription state")
+	}
+}
+
+// subscription.canceled also flips auto_renew=false (M3 contract addition).
+func TestOnWebhook_PaddleSubscriptionCancelled_FlipsAutoRenew(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_wcar_" + mustNewUUID()[:8]
+	subID := seedChannelSub(t, db, uid, "monthly", "active", extSubID, "paddle", true, time.Now().Add(15*24*time.Hour))
+
+	if _, err := svc.OnWebhook(context.Background(),
+		paddleCancelEvent("evt-pd-cancel-ar-"+mustNewUUID()[:8], extSubID)); err != nil {
+		t.Fatalf("OnWebhook subscription.canceled: %v", err)
+	}
+	_, status, autoRenew, _ := readChannelState(t, db, subID)
+	if status != "cancelled" {
+		t.Errorf("status = %q, want cancelled", status)
+	}
+	if autoRenew {
+		t.Error("auto_renew still true after subscription.canceled")
+	}
+}
+
+// Already-cancelled replay with a stale auto_renew=true (pre-M2 row): the
+// flag is healed idempotently, no duplicate side effects.
+func TestOnWebhook_PaddleSubscriptionCancelled_AlreadyCancelledHealsAutoRenew(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_wcheal_" + mustNewUUID()[:8]
+	subID := seedChannelSub(t, db, uid, "monthly", "cancelled", extSubID, "paddle", true, time.Now().Add(-time.Hour))
+
+	if _, err := svc.OnWebhook(context.Background(),
+		paddleCancelEvent("evt-pd-cancel-heal-"+mustNewUUID()[:8], extSubID)); err != nil {
+		t.Fatalf("replay cancel: %v", err)
+	}
+	_, status, autoRenew, _ := readChannelState(t, db, subID)
+	if status != "cancelled" {
+		t.Errorf("status = %q, want cancelled", status)
+	}
+	if autoRenew {
+		t.Error("auto_renew not healed on already-cancelled replay")
+	}
+}
+
+// A subscription.updated without data.id never reaches the domain handler
+// (parse hard-errors), but the service stays defensive: audit-only ack.
+func TestOnWebhook_PaddleSubscriptionUpdated_MissingExternalSubID(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paddle", EventID: "evt-pd-updmiss-" + mustNewUUID()[:8], EventType: "subscription.updated",
+		RawPayload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("missing external sub id must ack: %v", err)
+	}
+	if res.DomainAction != "subscription_updated" {
+		t.Errorf("DomainAction = %q, want subscription_updated", res.DomainAction)
+	}
+	if countAudit(t, db, "paddle_updated_missing_external_sub_id") != 1 {
+		t.Error("expected audit row paddle_updated_missing_external_sub_id")
+	}
+}
+
+// subscription.canceled without an external sub id: audit-only ack
+// (defensive branch — parse hard-errors these upstream).
+func TestOnWebhook_PaddleSubscriptionCancelled_MissingExternalSubID(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+
+	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
+		Channel: "paddle", EventID: "evt-pd-canmiss-" + mustNewUUID()[:8], EventType: "subscription.canceled",
+		RawPayload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("missing external sub id must ack: %v", err)
+	}
+	if countAudit(t, db, "paddle_cancel_missing_external_sub_id") != 1 {
+		t.Error("expected audit row paddle_cancel_missing_external_sub_id")
+	}
+}

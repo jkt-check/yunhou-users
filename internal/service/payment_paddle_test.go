@@ -419,3 +419,37 @@ func TestCreateOrder_Paddle_CustomData_CarriesLastTouchUTM(t *testing.T) {
 		}
 	})
 }
+
+// paddleManagedSubID keys on the M1 channel column going forward; the sub_
+// prefix remains as a fallback for pre-M1 rows whose channel is still NULL.
+func TestPaddleManagedSubID_ChannelKeying(t *testing.T) {
+	paddleCh, paypalCh, wechatCh := "paddle", "paypal", "wechat_pay"
+	paddleExt, paypalExt := "sub_x1", "I-X1"
+	cases := []struct {
+		name    string
+		sub     *model.Subscription
+		wantID  string
+		wantErr bool
+	}{
+		{"channel=paddle with sub_ id", &model.Subscription{Channel: &paddleCh, ExternalSubscriptionID: &paddleExt}, "sub_x1", false},
+		{"channel=paypal rejected", &model.Subscription{Channel: &paypalCh, ExternalSubscriptionID: &paypalExt}, "", true},
+		{"channel=wechat_pay rejected", &model.Subscription{Channel: &wechatCh, ExternalSubscriptionID: nil}, "", true},
+		{"NULL channel falls back to sub_ prefix (legacy row)", &model.Subscription{ExternalSubscriptionID: &paddleExt}, "sub_x1", false},
+		{"NULL channel + I- id rejected (legacy paypal row)", &model.Subscription{ExternalSubscriptionID: &paypalExt}, "", true},
+		{"NULL channel + no external id rejected (local sub)", &model.Subscription{}, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := paddleManagedSubID(tc.sub)
+			if tc.wantErr {
+				if !errors.Is(err, ErrSubscriptionNotChannelManaged) {
+					t.Fatalf("expected ErrSubscriptionNotChannelManaged, got %v", err)
+				}
+				return
+			}
+			if err != nil || id != tc.wantID {
+				t.Fatalf("got (%q, %v), want (%q, nil)", id, err, tc.wantID)
+			}
+		})
+	}
+}

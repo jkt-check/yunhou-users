@@ -302,6 +302,79 @@ func TestChangePlanByID_DowngradeRejected(t *testing.T) {
 	}
 }
 
+// M1: cross-product target plan must be rejected BEFORE any Paddle call —
+// same gate as UpgradeChannelSubscription. Without it Paddle charges the
+// proration and only then the subscriptions_enforce_plan_product trigger
+// aborts the local write → handler 500 + money divergence.
+func TestChangePlanByID_CrossProductRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := seedChannelSub(t, db, uid, "monthly", "active", "sub_xp_"+mustNewUUID()[:8], "paddle", true, time.Now().Add(15*24*time.Hour))
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active, product_code)
+		VALUES ('yearly-xproduct', 'Yearly XProduct', 149.9, 365, '{}', true, 'coding-plan')
+	`); err != nil {
+		t.Fatalf("seed cross-product plan: %v", err)
+	}
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"yearly-xproduct": "pri_yx"})
+
+	if _, err := svc.ChangePlanByID(context.Background(), uid, subID, "yearly-xproduct"); !errors.Is(err, ErrPlanChangeNotUpgrade) {
+		t.Fatalf("expected ErrPlanChangeNotUpgrade, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Fatal("paddle must not be called for a cross-product plan change")
+	}
+}
+
+// M1: an active-but-retired plan must not acquire a new billing
+// relationship through change-plan either — same retirement gate as
+// UpgradeChannelSubscription and CreateOrder.
+func TestChangePlanByID_RetiredPlanRejected(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := seedChannelSub(t, db, uid, "monthly", "active", "sub_ret_"+mustNewUUID()[:8], "paddle", true, time.Now().Add(15*24*time.Hour))
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active, accepting_new_subscriptions)
+		VALUES ('yearly-retired', 'Yearly Retired', 149.9, 365, '{}', true, false)
+	`); err != nil {
+		t.Fatalf("seed retired plan: %v", err)
+	}
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"yearly-retired": "pri_yr"})
+
+	if _, err := svc.ChangePlanByID(context.Background(), uid, subID, "yearly-retired"); !errors.Is(err, ErrPlanNotAcceptingNew) {
+		t.Fatalf("expected ErrPlanNotAcceptingNew, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Fatal("paddle must not be called for a retired target plan")
+	}
+}
+
+// Minor 4 (review): a cancelled subscription must report "already ended"
+// even when the target plan equals the current one — the ended check runs
+// before the same-plan check.
+func TestChangePlanByID_CancelledSubSamePlan_ReturnsAlreadyEnded(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	subID := seedChannelSub(t, db, uid, "monthly", "cancelled", "sub_cesp_"+mustNewUUID()[:8], "paddle", false, time.Now().Add(time.Hour))
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"monthly": "pri_m"})
+
+	if _, err := svc.ChangePlanByID(context.Background(), uid, subID, "monthly"); !errors.Is(err, ErrSubscriptionAlreadyEnded) {
+		t.Fatalf("expected ErrSubscriptionAlreadyEnded, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Fatal("paddle must not be called for an ended subscription")
+	}
+}
+
 func TestChangePlanByID_ExpiredSub(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)

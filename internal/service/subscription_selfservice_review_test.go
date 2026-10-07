@@ -371,3 +371,41 @@ func TestChangePlanByID_InLockAutoRenewRecheck(t *testing.T) {
 		t.Errorf("paddle calls = %d, want 0 (reject before any channel-side call)", stub.updateCalls)
 	}
 }
+
+// Minor 2 (review): the plan comparison must be re-verified INSIDE the row
+// lock. The unlocked fromPlan read is stale when a concurrent change-plan
+// committed a longer-cycle plan on this row between the pre-read and the
+// FOR UPDATE lock — the in-lock downgrade判定 must reject instead of
+// charging a downgrade against the stale view.
+func TestChangePlanByID_InLockDowngradeRecheck(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	// Unlocked pre-read: monthly, target quarterly (90d) — reads as an
+	// upgrade and passes every pre-lock check.
+	subID := seedChannelSub(t, db, uid, "monthly", "active", "sub_lockd_"+mustNewUUID()[:8], "paddle", true, time.Now().Add(15*24*time.Hour))
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO plans (id, name, price, interval_days, apps, is_active)
+		VALUES ('quarterly', 'Quarterly', 49.9, 90, '{}', true)
+	`); err != nil {
+		t.Fatalf("seed quarterly plan: %v", err)
+	}
+
+	stub := &stubPaddle{}
+	svc.SetPaddleClient(stub)
+	svc.SetPaddlePrices(map[string]string{"quarterly": "pri_q"})
+	// By lock time a concurrent change-plan already moved the row to
+	// yearly — quarterly is now a downgrade against the locked row.
+	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
+		return &subFillingTx{
+			sub: &model.Subscription{ID: subID, UserID: uid, PlanID: "yearly", Status: "active", AutoRenew: true},
+		}, nil
+	}
+
+	if _, err := svc.ChangePlanByID(context.Background(), uid, subID, "quarterly"); !errors.Is(err, ErrPlanDowngradeNotSupported) {
+		t.Fatalf("expected ErrPlanDowngradeNotSupported, got %v", err)
+	}
+	if stub.updateCalls != 0 {
+		t.Errorf("paddle calls = %d, want 0 (reject before any channel-side call)", stub.updateCalls)
+	}
+}

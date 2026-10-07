@@ -224,6 +224,13 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 	if sub.UserID != userID {
 		return nil, ErrSubscriptionNotFound
 	}
+	// Minor 4 (review): the ended check runs BEFORE the same-plan check —
+	// a cancelled subscription must report "already ended", not "already
+	// on plan" (the message would mislead the caller about why the
+	// change is impossible).
+	if sub.Status != "active" {
+		return nil, ErrSubscriptionAlreadyEnded
+	}
 	if sub.PlanID == targetPlanID {
 		return nil, ErrSamePlanChange
 	}
@@ -237,6 +244,23 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 	if !toPlan.IsActive {
 		return nil, ErrPlanInactive
 	}
+	if !toPlan.AcceptingNewSubscriptions {
+		// Same retirement gate as UpgradeChannelSubscription (and
+		// CreateOrder's eligibility check): an active-but-retired plan
+		// must not acquire a new billing relationship through the
+		// change-plan path either — the plan switch IS a new channel-side
+		// price attachment.
+		return nil, ErrPlanNotAcceptingNew
+	}
+	if toPlan.ProductCode != sub.ProductCode {
+		// Cross-product plan changes are out of scope (coding-plan has
+		// its own plan_upgrade_rules flow). Without this gate Paddle
+		// charges the proration and only then the
+		// subscriptions_enforce_plan_product trigger aborts the local
+		// write → handler 500 + money divergence. Same gate as
+		// UpgradeChannelSubscription.
+		return nil, ErrPlanChangeNotUpgrade
+	}
 	fromPlan, err := s.planRepo.FindByID(ctx, sub.PlanID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrPlanNotFound
@@ -246,9 +270,6 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 	}
 	if toPlan.IntervalDays <= fromPlan.IntervalDays {
 		return nil, ErrPlanDowngradeNotSupported
-	}
-	if sub.Status != "active" {
-		return nil, ErrSubscriptionAlreadyEnded
 	}
 	extID, err := channelSelfServiceGate(sub)
 	if err != nil {
@@ -303,6 +324,29 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 		// local reads auto_renew=false.
 		return nil, ErrSubscriptionNoAutoRenew
 	}
+	// Minor 2 (review): re-verify the plan comparison INSIDE the row lock.
+	// The unlocked fromPlan read above is stale when a concurrent
+	// change-plan committed a different plan_id on this row between the
+	// pre-read and the FOR UPDATE lock — the "upgrades only" contract
+	// must hold against the row we actually hold, or a downgrade判定
+	// based on the stale view would pass and Paddle would charge a
+	// downgrade.
+	if locked.PlanID == targetPlanID {
+		return nil, ErrSamePlanChange
+	}
+	lockedFromPlan, err := s.planRepo.FindByID(ctx, locked.PlanID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrPlanNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find locked current plan: %w", err)
+	}
+	if toPlan.ProductCode != lockedFromPlan.ProductCode {
+		return nil, ErrPlanChangeNotUpgrade
+	}
+	if toPlan.IntervalDays <= lockedFromPlan.IntervalDays {
+		return nil, ErrPlanDowngradeNotSupported
+	}
 
 	// From the Paddle call onward, money may move channel-side. Any local
 	// failure after this point leaves a loud audit trail for ops
@@ -315,7 +359,7 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 			map[string]any{
 				"subscription_id":          sub.ID,
 				"external_subscription_id": extID,
-				"from_plan_id":             sub.PlanID,
+				"from_plan_id":             locked.PlanID,
 				"to_plan_id":               targetPlanID,
 				"error":                    cause.Error(),
 			}); aerr != nil {
@@ -368,7 +412,7 @@ func (s *PaymentService) ChangePlanByID(ctx context.Context, userID, subID, targ
 		map[string]any{
 			"subscription_id":          sub.ID,
 			"external_subscription_id": extID,
-			"from_plan_id":             sub.PlanID,
+			"from_plan_id":             locked.PlanID,
 			"to_plan_id":               targetPlanID,
 			"next_billed_at":           expiresAt,
 		}); err != nil {

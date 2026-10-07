@@ -272,6 +272,14 @@ func writeSubSelfServiceError(c *gin.Context, err error, action string) {
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "already on plan"})
 	case errors.Is(err, service.ErrPlanDowngradeNotSupported):
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan downgrade not supported"})
+	case errors.Is(err, service.ErrPlanChangeNotUpgrade):
+		// Cross-product plan change (M1 guard): 409, same class as the
+		// legacy channel-upgrade route.
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan change is not an upgrade"})
+	case errors.Is(err, service.ErrPlanNotAcceptingNew):
+		// Retired target plan (M1 guard): 409, same message as the
+		// CreateOrder / plan-catalog surfaces.
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is not accepting new subscriptions"})
 	case errors.Is(err, service.ErrPlanNotFound):
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan not found"})
 	case errors.Is(err, service.ErrPlanInactive):

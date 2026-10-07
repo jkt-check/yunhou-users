@@ -1428,6 +1428,8 @@ func TestChangeSubscriptionPlanByIDEndpoint(t *testing.T) {
 		{"unknown/other-user sub → 404", service.ErrSubscriptionNotFound, 404, "subscription not found"},
 		{"same plan → 409", service.ErrSamePlanChange, 409, "already on plan"},
 		{"downgrade → 409", service.ErrPlanDowngradeNotSupported, 409, "plan downgrade not supported"},
+		{"cross-product plan → 409", service.ErrPlanChangeNotUpgrade, 409, "plan change is not an upgrade"},
+		{"retired plan → 409", service.ErrPlanNotAcceptingNew, 409, "plan is not accepting new subscriptions"},
 		{"ended sub → 409", service.ErrSubscriptionAlreadyEnded, 409, "subscription already ended"},
 		{"non-channel sub → 409", service.ErrSubscriptionNoAutoRenew, 409, "subscription has no auto-renew to change"},
 		{"paypal sub → 409", service.ErrSubscriptionNotChannelManaged, 409, "not managed by an auto-renewing channel"},

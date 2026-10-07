@@ -35,7 +35,7 @@ func TestPaymentMetrics_LatePaymentHonored(t *testing.T) {
 	uid := seedUser(t, db)
 
 	// On-time confirm: no late-honor signal.
-	onTime, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	onTime, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if _, err := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: onTime.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi_ontime_1",
 	}); err != nil {
@@ -46,7 +46,7 @@ func TestPaymentMetrics_LatePaymentHonored(t *testing.T) {
 	}
 
 	// Expired order honored late: counter increments once.
-	late, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	late, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	_, _ = db.ExecContext(context.Background(),
 		`UPDATE orders SET status = 'expired' WHERE id = $1`, late.ID)
 	res, err := svc.Confirm(context.Background(), ConfirmInput{
@@ -78,7 +78,7 @@ func TestPaymentMetrics_LatePaymentHonored_WebhookPath(t *testing.T) {
 	m := NewPaymentMetrics(prometheus.NewRegistry(), "test")
 	svc.SetMetrics(m)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	if _, err := db.ExecContext(context.Background(),
 		`UPDATE orders SET status = 'expired' WHERE id = $1`, order.ID); err != nil {

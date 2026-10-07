@@ -819,6 +819,70 @@ func (h *WebhookHandler) parsePaddle(raw []byte) (*service.WebhookEvent, error) 
 			// the paid retry.
 		}
 
+	case strings.HasPrefix(evt.EventType, "adjustment."):
+		// M3: Paddle fires adjustment.updated with action="refund" +
+		// status="approved" when a refund completes — including
+		// console-initiated manual refunds. Only that combination carries
+		// domain meaning; credits, pending/rejected states and
+		// adjustment.created stay audit-only by leaving the refund fields
+		// empty (resolveBranch keys the refund routing on them).
+		var adj struct {
+			ID            string       `json:"id"`
+			Action        string       `json:"action"`
+			Status        string       `json:"status"`
+			TransactionID string       `json:"transaction_id"`
+			CurrencyCode  string       `json:"currency_code"`
+			Totals        paddleTotals `json:"totals"`
+		}
+		if err := json.Unmarshal(evt.Data, &adj); err != nil {
+			return nil, fmt.Errorf("paddle adjustment data: %w", err)
+		}
+		if evt.EventType == "adjustment.updated" && adj.Action == "refund" && adj.Status == "approved" {
+			// data.id keys refunds.(channel, external_refund_id); empty
+			// would collapse every malformed event onto one dedupe row —
+			// same invariant as the transaction missing-data.id guard.
+			if adj.ID == "" {
+				return nil, fmt.Errorf("paddle refund adjustment missing data.id")
+			}
+			if adj.TransactionID == "" {
+				return nil, fmt.Errorf("paddle refund adjustment missing data.transaction_id")
+			}
+			// totals.total must be present and parseable: RefundAmount=0
+			// would violate refunds.amount CHECK (amount > 0) downstream,
+			// turning one malformed event into an infinite 500/retry loop.
+			if adj.Totals.Total == "" {
+				return nil, fmt.Errorf("paddle refund adjustment missing totals.total")
+			}
+			v, err := strconv.ParseFloat(adj.Totals.Total, 64)
+			if err != nil {
+				return nil, fmt.Errorf("paddle refund adjustment totals.total %q: %w", adj.Totals.Total, err)
+			}
+			// Non-positive parseable values ("0", negatives) fail the same
+			// refunds.amount CHECK (amount > 0) downstream — reject here.
+			if v <= 0 {
+				return nil, fmt.Errorf("paddle refund adjustment non-positive totals.total %q", adj.Totals.Total)
+			}
+			we.ExternalRefundID = adj.ID
+			we.TransactionID = adj.TransactionID
+			we.Currency = strings.ToUpper(adj.CurrencyCode)
+			we.RefundAmount = v / 100 // minor units → major units
+		}
+		// Chargebacks (dispute-driven money movement, incl. console-side)
+		// are parsed just enough to be alertable — action, transaction,
+		// amount, currency — but deliberately stay off the refund fields
+		// so they never reach branchRefund/entitlement logic.
+		if evt.EventType == "adjustment.updated" && adj.Status == "approved" &&
+			(adj.Action == "chargeback" || adj.Action == "chargeback_reverse") {
+			we.AdjustmentAction = adj.Action
+			we.TransactionID = adj.TransactionID
+			we.Currency = strings.ToUpper(adj.CurrencyCode)
+			if adj.Totals.Total != "" {
+				if v, err := strconv.ParseFloat(adj.Totals.Total, 64); err == nil {
+					we.Amount = v / 100
+				}
+			}
+		}
+
 	case strings.HasPrefix(evt.EventType, "subscription."):
 		var sub struct {
 			ID           string `json:"id"`

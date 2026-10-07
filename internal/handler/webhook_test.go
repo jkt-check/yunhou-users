@@ -28,7 +28,7 @@ type mockWebhookSvc struct {
 	err      error
 }
 
-func (m *mockWebhookSvc) CreateOrder(_ context.Context, _, _, _ string) (*model.Order, error) {
+func (m *mockWebhookSvc) CreateOrder(_ context.Context, _, _, _ string, _ json.RawMessage) (*model.Order, error) {
 	return nil, nil
 }
 func (m *mockWebhookSvc) CancelOrder(_ context.Context, _, _ string) error { return nil }

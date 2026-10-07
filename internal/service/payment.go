@@ -15,6 +15,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
+	"github.com/yunhou/users/internal/analytics"
 	billingpaddle "github.com/yunhou/users/internal/billing/paddle"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/inference/access"
@@ -202,6 +203,102 @@ type PaymentService struct {
 	// metrics holds the Prometheus collectors (late-payment observability).
 	// Nil = metrics off (unit tests); all call sites are nil-safe.
 	metrics *PaymentMetrics
+
+	// analytics is the M2/M3 PostHog emitter (purchase_completed /
+	// refund_completed on the paddle surface). Nil = emit nothing.
+	analytics AnalyticsEmitter
+}
+
+// SetAnalytics wires the analytics emitter (same instance as AuthService's;
+// main.go builds it from POSTHOG_* config).
+func (s *PaymentService) SetAnalytics(a AnalyticsEmitter) { s.analytics = a }
+
+// emitPurchaseCompleted captures the M3 purchase_completed event. Called
+// only on the paddle surface, after the settlement tx commits. The
+// idempotency uuid keys on the paddle transaction id, so a redelivery of
+// the same transaction under a fresh event_id re-derives the same uuid and
+// PostHog dedupes. Nil-safe, fire-and-forget.
+func (s *PaymentService) emitPurchaseCompleted(e WebhookEvent, order *model.Order, intervalDays *int, purchaseType string) {
+	if s.analytics == nil {
+		return
+	}
+	props := map[string]any{
+		"order_id":       order.ID,
+		"transaction_id": e.TransactionID,
+		"plan_id":        order.PlanID,
+		"currency":       order.Currency,
+		"amount":         order.Amount,
+		"purchase_type":  purchaseType,
+		"channel":        "paddle",
+		"region":         "intl",
+		"environment":    s.analytics.Environment(),
+	}
+	// billing_cycle is optional per the handoff: derive only from an
+	// unambiguous plan interval, otherwise omit the key (don't guess).
+	if cycle := billingCycleFromInterval(intervalDays); cycle != "" {
+		props["billing_cycle"] = cycle
+	}
+	// The M1 snapshot rides verbatim under `attribution` when the order
+	// carries one.
+	if order.Attribution != nil && len(*order.Attribution) > 0 {
+		var snap any
+		if err := json.Unmarshal(*order.Attribution, &snap); err == nil {
+			props["attribution"] = snap
+		}
+	}
+	s.analytics.Capture(analytics.Event{
+		Name:       "purchase_completed",
+		DistinctID: order.UserID,
+		UUID:       analytics.EventUUID("purchase:" + e.TransactionID),
+		Timestamp:  time.Now(),
+		Properties: props,
+	})
+}
+
+// billingCycleFromInterval maps a plan interval to "monthly"/"yearly";
+// anything ambiguous or absent returns "" (caller omits the key).
+func billingCycleFromInterval(days *int) string {
+	if days == nil {
+		return ""
+	}
+	switch {
+	case *days >= 28 && *days <= 31:
+		return "monthly"
+	case *days >= 360 && *days <= 370:
+		return "yearly"
+	default:
+		return ""
+	}
+}
+
+// emitRefundCompleted captures the M3 refund_completed event (paddle
+// surface only) after the refund row reached paid. The uuid keys on the
+// internal refund row id — find-or-insert keeps that id stable across
+// replays, so PostHog dedupes redeliveries. extID is the channel-side
+// refund key (paddle adjustment id) — carrying it in properties makes
+// PostHog↔Paddle reconciliation a single lookup. Nil-safe,
+// fire-and-forget.
+func (s *PaymentService) emitRefundCompleted(payment *model.Payment, order *model.Order, refundID, extID string, amount float64) {
+	if s.analytics == nil {
+		return
+	}
+	s.analytics.Capture(analytics.Event{
+		Name:       "refund_completed",
+		DistinctID: order.UserID,
+		UUID:       analytics.EventUUID("refund:" + refundID),
+		Timestamp:  time.Now(),
+		Properties: map[string]any{
+			"refund_id":          refundID,
+			"external_refund_id": extID,
+			"transaction_id":     payment.ExternalTxnID,
+			"order_id":           payment.OrderID,
+			"amount_refunded":    amount,
+			"currency":           payment.Currency,
+			"channel":            "paddle",
+			"region":             "intl",
+			"environment":        s.analytics.Environment(),
+		},
+	})
 }
 
 // BenefitSyncOutbox is the narrow surface PaymentService needs from the
@@ -589,9 +686,19 @@ func (s *PaymentService) txLookupPaymentByChannelTxnID(ctx context.Context, tx *
 // orphan pending order that the sweeper eventually expires. The plan
 // eligibility lookup (FOR SHARE) only happens once we know the user is
 // allowed to create an order.
-func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channel string) (*model.Order, error) {
+func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channel string, attribution json.RawMessage) (*model.Order, error) {
 	if err := validateChannel(channel); err != nil {
 		return nil, err
+	}
+
+	// M1: sanitize the optional attribution payload BEFORE anything is
+	// persisted — an undecodable payload is a client error (400 via
+	// ErrInvalidAttribution) and must not leave an orphan pending order.
+	// Sanitized-but-empty (nil / {} / both touches null) collapses to nil
+	// so the column stores SQL NULL.
+	sanitizedAttribution, err := model.SanitizeAttribution(attribution)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidAttribution, err)
 	}
 
 	// Channel-specific pre-auth gate (D1): some channels refuse to mint
@@ -756,7 +863,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 	}
 
 	var order *model.Order
-	err := s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, orderKind, upgradeFromPlanID, &order)
+	err = s.eligibilityAndInsertOrderTx(ctx, userID, planID, channel, orderKind, upgradeFromPlanID, sanitizedAttribution, &order)
 	if err != nil {
 		return nil, err
 	}
@@ -878,8 +985,13 @@ func (s *PaymentService) CreateOrder(ctx context.Context, userID, planID, channe
 			failOrderOnPreAuthError()
 			return order, ErrPaddlePriceNotConfigured
 		}
+		customData := map[string]any{"order_id": order.ID}
+		// M3: the sanitized attribution last_touch UTM triple rides the
+		// checkout's custom_data (non-nil values only). order_id is left
+		// untouched — the webhook lookup depends on it.
+		mergeAttributionUTM(customData, order.Attribution)
 		res, err := s.paddle.CreateCheckoutTransaction(ctx, priceID,
-			map[string]any{"order_id": order.ID}, order.Currency)
+			customData, order.Currency)
 		if err != nil {
 			failOrderOnPreAuthError()
 			return order, fmt.Errorf("paddle checkout transaction: %w", err)
@@ -1814,6 +1926,14 @@ type WebhookEvent struct {
 	// custom_data (including the original order_id) onto renewal
 	// transactions. Initial checkout transactions arrive as "web"/"api".
 	Origin string
+	// AdjustmentAction is Paddle's adjustment action (data.action), only
+	// populated for approved adjustment.updated events. "refund" is
+	// signalled via ExternalRefundID instead (it keys the refund row);
+	// "chargeback" / "chargeback_reverse" ride here so resolveBranch can
+	// route them to an alertable audit marker without touching the
+	// refund/entitlement machinery (M3 review — entitlement handling on
+	// chargebacks is deliberately deferred).
+	AdjustmentAction string
 	// SkipAmountCheck exempts PayPal lifecycle events
 	// (BILLING.SUBSCRIPTION.ACTIVATED etc.) from the amount/currency
 	// validation in onPaymentSucceeded: PayPal omits resource.amount from
@@ -1926,6 +2046,13 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 	case branchSubscriptionCancelled:
 		domainAction = branch.domainAction()
 		if err := s.onPaddleSubscriptionCancelled(ctx, e); err != nil {
+			return nil, err
+		}
+	case branchChargebackUnhandled:
+		// Audit-only marker; domainAction stays "none" so the handler
+		// response shape is unchanged.
+		domainAction = branch.domainAction()
+		if err := s.onPaddleChargebackUnhandled(ctx, e); err != nil {
 			return nil, err
 		}
 	default:
@@ -2339,6 +2466,13 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 		// 渠道的过期兑付全部流经此处。
 		s.noteLatePaymentHonored(order, paymentID, e.Channel)
 	}
+	// M3 analytics: purchase_completed for the paddle surface only.
+	// Zero-amount settlements (trial transactions) never emit. Amount
+	// semantics: first purchase reports the CATALOG price (order.Amount) —
+	// the renewal path reports the settled amount instead (see below).
+	if e.Channel == "paddle" && order.Amount > 0 {
+		s.emitPurchaseCompleted(e, order, order.PlanIntervalDays, "first_purchase")
+	}
 	return nil
 }
 
@@ -2742,7 +2876,16 @@ func (s *PaymentService) onRefundSucceeded(ctx context.Context, e WebhookEvent) 
 	// 金额侧由 refunds 行与渠道对账承载。Alipay 累计语义下 eventRefundAmount
 	// 是本笔增量（评审轮4 B），全额判定用的累计值在 e.RefundAmount。
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// M3 analytics: refund_completed on the paddle surface only, keyed on
+	// the stable internal refund row id. 无归属行的重投（refundID 为空）
+	// 没有事件可发——金额效应已由首次投递承载。
+	if e.Channel == "paddle" && refundID != "" {
+		s.emitRefundCompleted(&payment, &order, refundID, extID, rowAmount)
+	}
+	return nil
 }
 
 // onRefundFailed: 微信 REFUND.ABNORMAL / REFUND.CLOSED（渠道终态退款失
@@ -3227,7 +3370,22 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// M3 analytics: paddle renewals are purchases too (purchase_type=
+	// "renewal"). The synthetic renewal order carries no attribution — the
+	// snapshot lives on the original purchase's event. Amount semantics
+	// diverge from first purchase by design: renewals report the SETTLED
+	// amount (e.Amount, tax-inclusive as charged), since a synthetic order
+	// has no catalog price of its own beyond what the channel collected.
+	if e.Channel == "paddle" && e.Amount > 0 {
+		s.emitPurchaseCompleted(e, &model.Order{
+			ID: orderID, UserID: sub.UserID, PlanID: sub.PlanID,
+			Amount: e.Amount, Currency: e.Currency,
+		}, synInterval, "renewal")
+	}
+	return nil
 }
 
 // planHasBenefitConfig is the renewal-path gate for kaya bundle plans:
@@ -3488,7 +3646,7 @@ func (s *PaymentService) providerPreAuth(channel string) error {
 // pre-D8 no-tx fallback made it easy to ship a regression). The
 // repo implementation owns begin/commit/rollback; the closure here
 // only threads the tx through FindByIDForShareTx and CreateInTx.
-func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel, orderKind string, upgradeFromPlanID *string, out **model.Order) error {
+func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID, planID, channel, orderKind string, upgradeFromPlanID *string, attribution json.RawMessage, out **model.Order) error {
 	var order *model.Order
 	err := s.planRepo.WithTx(ctx, func(tx *sqlx.Tx) error {
 		plan, err := s.planRepo.FindByIDForShareTx(ctx, tx, planID)
@@ -3597,6 +3755,7 @@ func (s *PaymentService) eligibilityAndInsertOrderTx(ctx context.Context, userID
 			BenefitGrantMode:       ptrIfNotEmpty(benefitGrantMode),
 			OrderKind:              ptrIfNotEmpty(orderKind),
 			UpgradeFromPlanID:      upgradeFromPlanID,
+			Attribution:            ptrRawMessageIfNotEmpty(attribution),
 		}
 		if err := s.orderRepo.CreateInTx(ctx, tx, order); err != nil {
 			return fmt.Errorf("create order: %w", err)
@@ -3623,6 +3782,11 @@ const (
 	branchDisputeClosed
 	branchRenewal
 	branchSubscriptionCancelled
+	// branchChargebackUnhandled: an approved paddle chargeback /
+	// chargeback_reverse adjustment. Money moved channel-side via a
+	// dispute; we record an alertable audit marker and ack — entitlement
+	// revocation on chargebacks is deliberately deferred (M3 review).
+	branchChargebackUnhandled
 )
 
 // domainAction is the OnWebhookResult.DomainAction value for a branch.
@@ -3721,10 +3885,20 @@ var channelWebhookBranches = map[string]map[string]webhookBranch{
 		// guard. Renewal dunning surfaces as transaction.past_due /
 		// subscription.past_due (also audit-only).
 		//
-		// transaction.billed / transaction.paid, subscription.*,
-		// adjustment.* are likewise audit-only: settlement is anchored on
-		// transaction.completed money events only, and refunds remain
-		// webhook-unhandled for paddle (ops manual).
+		// transaction.billed / transaction.paid, subscription.* stay
+		// audit-only: settlement is anchored on transaction.completed
+		// money events only.
+		//
+		// adjustment.updated (M3): Paddle's refund-completed signal —
+		// including console-initiated manual refunds — is action="refund"
+		// + status="approved". resolveBranch only lets parser-populated
+		// refund adjustments (ExternalRefundID set) reach branchRefund;
+		// approved chargebacks / chargeback_reverses are parsed and routed
+		// to branchChargebackUnhandled (alertable audit marker only —
+		// entitlement handling on chargebacks is deliberately deferred);
+		// credits, pending/rejected and adjustment.created stay
+		// audit-only.
+		"adjustment.updated": branchRefund,
 		//
 		// subscription.canceled is the ONE subscription.* event with a
 		// domain action: the cancellation has taken effect channel-side
@@ -3771,6 +3945,19 @@ func resolveBranch(e WebhookEvent) webhookBranch {
 			return branchRenewal
 		}
 		if e.OrderID == "" {
+			return branchNone
+		}
+	}
+	// Paddle adjustment.updated is triple-purpose: completed refunds
+	// (action=refund + status=approved, signalled by the parser populating
+	// ExternalRefundID) settle a refund; approved chargebacks route to an
+	// alertable audit marker (entitlement handling deliberately deferred);
+	// every other adjustment is audit-only.
+	if e.Channel == "paddle" && e.EventType == "adjustment.updated" {
+		if e.AdjustmentAction == "chargeback" || e.AdjustmentAction == "chargeback_reverse" {
+			return branchChargebackUnhandled
+		}
+		if e.ExternalRefundID == "" {
 			return branchNone
 		}
 	}
@@ -4093,6 +4280,40 @@ func ptrIfNotEmpty(s string) *string {
 // ptrInt returns a pointer to n (snapshot interval; 0 is a meaningful
 // "lifetime plan" value and must round-trip as 0, not NULL).
 func ptrInt(n int) *int { return &n }
+
+// ptrRawMessageIfNotEmpty returns nil for empty input so the order row
+// stores SQL NULL (orders without an attribution payload), a pointer
+// otherwise.
+func ptrRawMessageIfNotEmpty(m json.RawMessage) *json.RawMessage {
+	if len(m) == 0 {
+		return nil
+	}
+	return &m
+}
+
+// mergeAttributionUTM copies the sanitized attribution's last_touch UTM
+// triple into a Paddle checkout's custom_data. Only non-nil values are
+// merged; first_touch stays out (custom_data is propagated onto renewal
+// transactions channel-side, and the last touch is the conversion
+// context). Missing/unparseable snapshots are a no-op.
+func mergeAttributionUTM(customData map[string]any, attribution *json.RawMessage) {
+	if attribution == nil || len(*attribution) == 0 {
+		return
+	}
+	var a model.Attribution
+	if err := json.Unmarshal(*attribution, &a); err != nil || a.LastTouch == nil {
+		return
+	}
+	if a.LastTouch.UtmSource != nil {
+		customData["utm_source"] = *a.LastTouch.UtmSource
+	}
+	if a.LastTouch.UtmMedium != nil {
+		customData["utm_medium"] = *a.LastTouch.UtmMedium
+	}
+	if a.LastTouch.UtmCampaign != nil {
+		customData["utm_campaign"] = *a.LastTouch.UtmCampaign
+	}
+}
 
 // toCents converts a major-units float64 (DECIMAL(10,2) round-trip) to
 // integer cents. Used for exact monetary comparisons that must not

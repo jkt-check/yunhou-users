@@ -122,13 +122,13 @@ func TestCreateOrder_CodingPlanSnapshotAndConfigGate(t *testing.T) {
 		VALUES ('cp_naked', 'Naked', 9.9, 30, '{}', 'CNY', 'coding-plan')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stack.svc.CreateOrder(context.Background(), uid, "cp_naked", "stripe"); !errors.Is(err, ErrPlanNotPurchasable) {
+	if _, err := stack.svc.CreateOrder(context.Background(), uid, "cp_naked", "stripe", nil); !errors.Is(err, ErrPlanNotPurchasable) {
 		t.Fatalf("no-config coding plan: err = %v, want ErrPlanNotPurchasable", err)
 	}
 
 	// 有配置 → 订单冻结完整快照。
 	polID := seedCodingPlan(t, db, stack.store, "cp_basic", 29.9, 30, "cp-policy", 1, []string{"glm-4.6"})
-	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestCreateOrder_CodingPlanSnapshotAndConfigGate(t *testing.T) {
 	}
 
 	// Kaya 套餐保持原样：无快照权益、无 kind。
-	kayaOrder, err := stack.svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	kayaOrder, err := stack.svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("kaya CreateOrder: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestCreateOrder_CodingPlanUpgradeRules(t *testing.T) {
 	seedCodingPlan(t, db, stack.store, "cp_pro", 99.9, 30, "cp-policy-pro", 1, []string{"glm-4.6", "kimi-k2"})
 
 	// 先买 basic 并支付激活。
-	order1, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order1, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestCreateOrder_CodingPlanUpgradeRules(t *testing.T) {
 	}
 
 	// 同套餐续费：允许，kind=renewal。
-	renew, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	renew, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatalf("renewal order: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestCreateOrder_CodingPlanUpgradeRules(t *testing.T) {
 	}
 
 	// 跨档无规则 → 409（即使周期相同/更长都不推导）。
-	if _, err := stack.svc.CreateOrder(context.Background(), uid, "cp_pro", "stripe"); !errors.Is(err, ErrPlanUpgradeNotConfigured) {
+	if _, err := stack.svc.CreateOrder(context.Background(), uid, "cp_pro", "stripe", nil); !errors.Is(err, ErrPlanUpgradeNotConfigured) {
 		t.Fatalf("cross-tier without rule: err = %v", err)
 	}
 
@@ -197,7 +197,7 @@ func TestCreateOrder_CodingPlanUpgradeRules(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO plan_upgrade_rules (from_plan_id, to_plan_id) VALUES ('cp_basic', 'cp_pro')`); err != nil {
 		t.Fatal(err)
 	}
-	up, err := stack.svc.CreateOrder(context.Background(), uid, "cp_pro", "stripe")
+	up, err := stack.svc.CreateOrder(context.Background(), uid, "cp_pro", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestCreateOrder_CodingPlanUpgradeRules(t *testing.T) {
 	// Kaya 商品仍用旧周期比较规则（保留原会员购买规则）：yearly 活跃订阅
 	// 买 monthly = 降级拒绝；再买 yearly = 允许（续费 rollover）。
 	uid2 := seedUser(t, db)
-	yOrder, err := stack.svc.CreateOrder(context.Background(), uid2, "yearly", "stripe")
+	yOrder, err := stack.svc.CreateOrder(context.Background(), uid2, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,10 +219,10 @@ func TestCreateOrder_CodingPlanUpgradeRules(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stack.svc.CreateOrder(context.Background(), uid2, "monthly", "stripe"); !errors.Is(err, ErrPlanDowngrade) {
+	if _, err := stack.svc.CreateOrder(context.Background(), uid2, "monthly", "stripe", nil); !errors.Is(err, ErrPlanDowngrade) {
 		t.Fatalf("legacy downgrade rule broken: err = %v, want ErrPlanDowngrade", err)
 	}
-	if _, err := stack.svc.CreateOrder(context.Background(), uid2, "yearly", "stripe"); err != nil {
+	if _, err := stack.svc.CreateOrder(context.Background(), uid2, "yearly", "stripe", nil); err != nil {
 		t.Fatalf("legacy same-cycle renewal must stay allowed: %v", err)
 	}
 }
@@ -241,7 +241,7 @@ func TestCodingPlan_OrderToEntitlementEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestCodingPlan_SnapshotHonoredAfterPlanEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +399,7 @@ func TestCodingPlan_FullRefundRevokes_Idempotent(t *testing.T) {
 	uid := seedUser(t, db)
 	seedCodingPlan(t, db, stack.store, "cp_basic", 29.9, 30, "cp-policy", 1, []string{"glm-4.6"})
 
-	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +471,7 @@ func TestCodingPlan_RenewalIdempotentNoDoubleExtend(t *testing.T) {
 	uid := seedUser(t, db)
 	seedCodingPlan(t, db, stack.store, "cp_basic", 29.9, 30, "cp-policy", 1, []string{"glm-4.6"})
 
-	order1, _ := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order1, _ := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if _, err := stack.svc.OnWebhook(context.Background(), codingWebhookEvent(order1.ID, "evt-n1", "txn-n1", 29.9)); err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +483,7 @@ func TestCodingPlan_RenewalIdempotentNoDoubleExtend(t *testing.T) {
 	ent1 := entitlementForSub(t, stack.store, sub.ID)
 
 	// 续费订单（rollover：从当前到期点 +30d）。
-	order2, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order2, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +536,7 @@ func TestCodingPlan_ConfirmWebhookRaceSingleGrant(t *testing.T) {
 	uid := seedUser(t, db)
 	seedCodingPlan(t, db, stack.store, "cp_basic", 29.9, 30, "cp-policy", 1, []string{"glm-4.6"})
 
-	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order, err := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +600,7 @@ func TestSubscription_CancelEnqueuesBenefitSync(t *testing.T) {
 	uid := seedUser(t, db)
 	seedCodingPlan(t, db, stack.store, "cp_basic", 29.9, 30, "cp-policy", 1, []string{"glm-4.6"})
 
-	order, _ := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe")
+	order, _ := stack.svc.CreateOrder(context.Background(), uid, "cp_basic", "stripe", nil)
 	if _, err := stack.svc.OnWebhook(context.Background(), codingWebhookEvent(order.ID, "evt-c1", "txn-c1", 29.9)); err != nil {
 		t.Fatal(err)
 	}

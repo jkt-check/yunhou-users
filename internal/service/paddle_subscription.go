@@ -350,3 +350,23 @@ func (s *PaymentService) onPaddleSubscriptionCancelled(ctx context.Context, e We
 	}
 	return tx.Commit()
 }
+
+// onPaddleChargebackUnhandled handles an approved paddle chargeback /
+// chargeback_reverse adjustment (M3 review): dispute-driven money movement
+// — including console-side — must be distinguishable for ops alerting, so
+// we write a dedicated audit_log action and ack 200. It deliberately does
+// NOT route through the refund/entitlement machinery: no refund row, no
+// payment/order/subscription flip, no analytics event. Entitlement
+// revocation on chargebacks is a separate product decision, deferred.
+func (s *PaymentService) onPaddleChargebackUnhandled(ctx context.Context, e WebhookEvent) error {
+	return s.writeAudit(ctx, "service", "paddle_chargeback_unhandled",
+		fmt.Sprintf("event:%s", e.EventID),
+		[]string{"webhook", "paddle", "chargeback", "unhandled"},
+		map[string]any{
+			"event_id":          e.EventID,
+			"adjustment_action": e.AdjustmentAction,
+			"transaction_id":    e.TransactionID,
+			"amount":            e.Amount,
+			"currency":          e.Currency,
+		})
+}

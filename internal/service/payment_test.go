@@ -101,7 +101,7 @@ func TestPaymentService_CreateOrder_RejectsNotAcceptingNew(t *testing.T) {
 		AcceptingNewSubscriptions: false,
 		Currency:                  "USD",
 	})
-	_, err := svc.CreateOrder(context.Background(), "user-1", "quarterly", "paypal")
+	_, err := svc.CreateOrder(context.Background(), "user-1", "quarterly", "paypal", nil)
 	if !errors.Is(err, ErrPlanNotAcceptingNew) {
 		t.Fatalf("CreateOrder error = %v, want ErrPlanNotAcceptingNew", err)
 	}
@@ -121,7 +121,7 @@ func TestPaymentService_CreateOrder_RejectsCurrencyMismatch(t *testing.T) {
 		AcceptingNewSubscriptions: true,
 		Currency:                  "CNY",
 	})
-	_, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal")
+	_, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal", nil)
 	if !errors.Is(err, ErrPlanCurrencyMismatch) {
 		t.Fatalf("CreateOrder error = %v, want ErrPlanCurrencyMismatch", err)
 	}
@@ -139,7 +139,7 @@ func TestPaymentService_CreateOrder_ReadsCurrencyFromPlan(t *testing.T) {
 		AcceptingNewSubscriptions: true,
 		Currency:                  "USD",
 	})
-	order, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestPaymentService_CreateOrder_AmountOverride(t *testing.T) {
 		AcceptingNewSubscriptions: true,
 		Currency:                  "USD",
 	})
-	order, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "monthly", "paypal", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestPaymentService_CreateOrder_AmountOverride_NoFallback(t *testing.T) {
 		AcceptingNewSubscriptions: true,
 		Currency:                  "USD",
 	})
-	order, err := svc.CreateOrder(context.Background(), "user-1", "yearly", "paypal")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "yearly", "paypal", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}

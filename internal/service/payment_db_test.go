@@ -169,7 +169,7 @@ func TestPaymentService_CreateOrder_Success(t *testing.T) {
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
 
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestPaymentService_CreateOrder_PlanNotFound(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	_, err := svc.CreateOrder(context.Background(), uid, "missing", "stripe")
+	_, err := svc.CreateOrder(context.Background(), uid, "missing", "stripe", nil)
 	if !errors.Is(err, ErrPlanNotFound) {
 		t.Errorf("err = %v, want ErrPlanNotFound", err)
 	}
@@ -197,7 +197,7 @@ func TestPaymentService_CreateOrder_PlanInactive(t *testing.T) {
 	uid := seedUser(t, db)
 	_, _ = db.ExecContext(context.Background(),
 		`INSERT INTO plans (id, name, price, interval_days, apps, is_active) VALUES ('inactive', 'X', 0, 0, '{}', false)`)
-	_, err := svc.CreateOrder(context.Background(), uid, "inactive", "stripe")
+	_, err := svc.CreateOrder(context.Background(), uid, "inactive", "stripe", nil)
 	if !errors.Is(err, ErrPlanInactive) {
 		t.Errorf("err = %v, want ErrPlanInactive", err)
 	}
@@ -213,7 +213,7 @@ func TestPaymentService_CreateOrder_SamePlanRenewalAllowed(t *testing.T) {
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
 	// First order + confirm activates subscription.
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("first order: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestPaymentService_CreateOrder_SamePlanRenewalAllowed(t *testing.T) {
 		t.Fatalf("confirm: %v", err)
 	}
 	// Second CreateOrder for the SAME plan — renewal, allowed.
-	if _, err = svc.CreateOrder(context.Background(), uid, "monthly", "stripe"); err != nil {
+	if _, err = svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil); err != nil {
 		t.Errorf("same-plan renewal must be allowed (2026-07-28 repurchase rule); got %v", err)
 	}
 }
@@ -234,7 +234,7 @@ func TestPaymentService_CreateOrder_UpgradeAllowed(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("first order: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestPaymentService_CreateOrder_UpgradeAllowed(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
-	up, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	up, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("monthly→yearly upgrade must be allowed; got %v", err)
 	}
@@ -259,7 +259,7 @@ func TestPaymentService_CreateOrder_DowngradeRejected(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("first order: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestPaymentService_CreateOrder_DowngradeRejected(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
-	_, err = svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	_, err = svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if !errors.Is(err, ErrPlanDowngrade) {
 		t.Errorf("err = %v, want ErrPlanDowngrade", err)
 	}
@@ -286,7 +286,7 @@ func TestPaymentService_CreateOrder_PaypalActiveSubRejected(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("first order: %v", err)
 	}
@@ -298,12 +298,12 @@ func TestPaymentService_CreateOrder_PaypalActiveSubRejected(t *testing.T) {
 	// Same plan AND upgrade are both rejected on paypal — any new order
 	// would mint a parallel PayPal subscription.
 	for _, planID := range []string{"monthly", "yearly"} {
-		if _, err := svc.CreateOrder(context.Background(), uid, planID, "paypal"); !errors.Is(err, ErrUserHasActiveSub) {
+		if _, err := svc.CreateOrder(context.Background(), uid, planID, "paypal", nil); !errors.Is(err, ErrUserHasActiveSub) {
 			t.Errorf("paypal %s: err = %v, want ErrUserHasActiveSub", planID, err)
 		}
 	}
 	// Same user on a manual-renewal channel stays allowed.
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe"); err != nil {
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil); err != nil {
 		t.Errorf("stripe same-plan renewal must stay allowed; got %v", err)
 	}
 }
@@ -337,7 +337,7 @@ func TestPaymentService_CreateOrder_PaypalTrialSubExempt(t *testing.T) {
 	}
 
 	// Trial user must be able to start their first paid order on paypal.
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal"); err != nil {
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal", nil); err != nil {
 		t.Fatalf("trial user's first paypal order must be allowed; got %v", err)
 	}
 }
@@ -363,7 +363,7 @@ func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
 	svc.SetPaddleClient(&stubPaddle{txnID: "txn_db_1", checkout: "https://yunhou.ai/checkout?_ptxn=txn_db_1"})
 	svc.SetPaddlePrices(map[string]string{"monthly": "pri_monthly_db"})
 
-	first, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle")
+	first, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle", nil)
 	if err != nil {
 		t.Fatalf("first paddle order: %v", err)
 	}
@@ -371,16 +371,16 @@ func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
 		t.Fatalf("first order status = %q, want pending", first.Status)
 	}
 	// Second paddle order while the first checkout is still open → 409.
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasPendingOrder) {
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle", nil); !errors.Is(err, ErrUserHasPendingOrder) {
 		t.Fatalf("second paddle order: err = %v, want ErrUserHasPendingOrder", err)
 	}
 	// PayPal shares the auto-renew shape → also blocked.
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal"); !errors.Is(err, ErrUserHasPendingOrder) {
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paypal", nil); !errors.Is(err, ErrUserHasPendingOrder) {
 		t.Fatalf("paypal order with pending paddle order: err = %v, want ErrUserHasPendingOrder", err)
 	}
 	// WeChat/stripe have no channel-side auto-renewal: a parallel pending
 	// order there is the long-standing manual-renewal shape, still allowed.
-	stripeOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	stripeOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("stripe order alongside a pending paddle order must stay allowed; got %v", err)
 	}
@@ -390,13 +390,13 @@ func TestPaymentService_CreateOrder_PaddlePendingOrderRejected(t *testing.T) {
 	if err := svc.CancelOrder(context.Background(), first.ID, uid); err != nil {
 		t.Fatalf("cancel first order: %v", err)
 	}
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); !errors.Is(err, ErrUserHasPendingOrder) {
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle", nil); !errors.Is(err, ErrUserHasPendingOrder) {
 		t.Fatalf("paddle order with a pending stripe order: err = %v, want ErrUserHasPendingOrder", err)
 	}
 	if err := svc.CancelOrder(context.Background(), stripeOrder.ID, uid); err != nil {
 		t.Fatalf("cancel stripe order: %v", err)
 	}
-	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle"); err != nil {
+	if _, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle", nil); err != nil {
 		t.Fatalf("paddle order after cancelling the pending ones must be allowed; got %v", err)
 	}
 }
@@ -432,7 +432,7 @@ func TestPaymentService_CreateOrder_ConcurrentRaceSingleWinner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle")
+			_, err := svc.CreateOrder(context.Background(), uid, "monthly", "paddle", nil)
 			errs <- err
 		}()
 	}
@@ -475,7 +475,7 @@ func TestCreateOrder_TrialPlanNotPurchasable(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	_, err := svc.CreateOrder(context.Background(), uid, "trial", "stripe")
+	_, err := svc.CreateOrder(context.Background(), uid, "trial", "stripe", nil)
 	if !errors.Is(err, ErrPlanNotAcceptingNew) {
 		t.Fatalf("expected ErrPlanNotAcceptingNew, got %v", err)
 	}
@@ -530,7 +530,7 @@ func TestConfirm_RolloverSamePlanRenewal(t *testing.T) {
 	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
 	seedActiveSub(t, db, uid, "monthly", oldExpiry)
 
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("renewal order: %v", err)
 	}
@@ -556,7 +556,7 @@ func TestConfirm_RolloverUpgrade(t *testing.T) {
 	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
 	seedActiveSub(t, db, uid, "monthly", oldExpiry)
 
-	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestConfirm_TrialRolloverOnFirstPurchase(t *testing.T) {
 	trialExpiry := time.Now().Add(72 * time.Hour)
 	seedActiveSub(t, db, uid, "trial", trialExpiry)
 
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("first purchase order: %v", err)
 	}
@@ -650,7 +650,7 @@ func TestConfirm_RetryNoDoubleRollover(t *testing.T) {
 	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
 	seedActiveSub(t, db, uid, "monthly", oldExpiry)
 
-	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -677,12 +677,12 @@ func TestConfirm_DowngradeActivationBlocked(t *testing.T) {
 	uid := seedUser(t, db)
 
 	// Stale monthly QR minted while the user had no subscription.
-	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("stale order: %v", err)
 	}
 	// User upgrades to yearly.
-	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -737,11 +737,11 @@ func TestConfirm_DowngradeActivationBlocked_RetryStaysBlocked(t *testing.T) {
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
 
-	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("stale order: %v", err)
 	}
-	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -784,11 +784,11 @@ func TestOnWebhook_DowngradeActivationBlocked(t *testing.T) {
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
 
-	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("stale order: %v", err)
 	}
-	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -836,7 +836,7 @@ func TestConfirm_RolloverBeatsSmallerHint(t *testing.T) {
 	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
 	seedActiveSub(t, db, uid, "monthly", oldExpiry)
 
-	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -869,11 +869,11 @@ func TestConfirm_LifetimeOrderBlockedAfterUpgrade(t *testing.T) {
 		t.Fatalf("seed lifetime plan: %v", err)
 	}
 
-	staleOrder, err := svc.CreateOrder(context.Background(), uid, "lifetime", "stripe")
+	staleOrder, err := svc.CreateOrder(context.Background(), uid, "lifetime", "stripe", nil)
 	if err != nil {
 		t.Fatalf("stale lifetime order: %v", err)
 	}
-	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	upOrder, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -918,7 +918,7 @@ func TestConfirm_LifetimeSubExpiryPreservedOnRepurchase(t *testing.T) {
 		t.Fatalf("seed lifetime sub: %v", err)
 	}
 
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("repurchase order: %v", err)
 	}
@@ -964,7 +964,7 @@ func TestConfirm_PlanMissing_ExistingSubUntouched(t *testing.T) {
 	seededExpiry := time.Now().Add(10 * 24 * time.Hour)
 	seedActiveSub(t, db, uid, "monthly", seededExpiry)
 
-	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "yearly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("upgrade order: %v", err)
 	}
@@ -1039,7 +1039,7 @@ func TestPaymentService_CreateOrder_StaleActiveSubAllowsRenewal(t *testing.T) {
 	// CreateOrder must NOT return ErrUserHasActiveSub; the user is
 	// permitted to renew. After payment, activateSubscriptionOnTx
 	// transitions this same row to expires_at = NOW() + interval.
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder must NOT reject a stale-active sub (cn-staging 2026-07-23 fix); got %v", err)
 	}
@@ -1056,7 +1056,7 @@ func TestPaymentService_CancelOrder_OwnerCancelsPending(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -1078,7 +1078,7 @@ func TestPaymentService_CancelOrder_NotOwner(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	err := svc.CancelOrder(context.Background(), order.ID, mustNewUUID())
 	if !errors.Is(err, ErrOrderNotFound) {
 		t.Errorf("err = %v, want ErrOrderNotFound (hidden for non-owner)", err)
@@ -1089,7 +1089,7 @@ func TestPaymentService_CancelOrder_NotPending(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	// Flip to paid directly.
 	_, _ = db.ExecContext(context.Background(),
 		`UPDATE orders SET status = 'paid' WHERE id = $1`, order.ID)
@@ -1108,7 +1108,7 @@ func TestPaymentService_GetOrder_Owner(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	got, err := svc.GetOrder(context.Background(), order.ID, uid)
 	if err != nil {
 		t.Fatalf("GetOrder: %v", err)
@@ -1122,7 +1122,7 @@ func TestPaymentService_GetOrder_NotOwner(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	_, err := svc.GetOrder(context.Background(), order.ID, mustNewUUID())
 	if !errors.Is(err, ErrOrderNotFound) {
 		t.Errorf("err = %v, want ErrOrderNotFound", err)
@@ -1175,7 +1175,7 @@ func TestPaymentService_GetOrder_ReconcilesPaidWeChatOrder(t *testing.T) {
 	svc := newTestPaymentServiceWith(t, db, stub)
 
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -1222,7 +1222,7 @@ func TestPaymentService_GetOrder_ReconcileThrottled(t *testing.T) {
 	svc := newTestPaymentServiceWith(t, db, stub)
 
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay", nil)
 	if _, err := db.ExecContext(context.Background(),
 		`UPDATE orders SET last_reconciled_at = now() - interval '1 minute' WHERE id = $1`, order.ID); err != nil {
 		t.Fatalf("age last_reconciled_at: %v", err)
@@ -1246,7 +1246,7 @@ func TestPaymentService_Confirm_FreshOrder(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, err := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID:       order.ID,
 		UserID:        uid,
@@ -1274,7 +1274,7 @@ func TestPaymentService_Confirm_ExpiredOrder_LatePayment(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	// Force to expired.
 	_, _ = db.ExecContext(context.Background(),
 		`UPDATE orders SET status = 'expired' WHERE id = $1`, order.ID)
@@ -1304,7 +1304,7 @@ func TestPaymentService_Confirm_InvalidChannel(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	_, err := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "bogus_channel", ExternalTxnID: "x",
 	})
@@ -1328,7 +1328,7 @@ func TestPaymentService_Confirm_TerminalState(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	_, _ = db.ExecContext(context.Background(),
 		`UPDATE orders SET status = 'failed' WHERE id = $1`, order.ID)
 	_, err := svc.Confirm(context.Background(), ConfirmInput{
@@ -1343,7 +1343,7 @@ func TestPaymentService_Confirm_ChannelMismatch(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// First confirm on stripe.
 	if _, err := svc.Confirm(context.Background(), ConfirmInput{
@@ -1366,7 +1366,7 @@ func TestPaymentService_Confirm_Idempotent(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	in := ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-idem",
 	}
@@ -1390,7 +1390,7 @@ func TestPaymentService_Confirm_ExistingFailedPayment(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// Pre-insert a payment row in 'failed' state for the same
 	// (channel, external_txn_id) the Confirm is about to use. This
@@ -1423,7 +1423,7 @@ func TestPaymentService_Refund_NotOwner(t *testing.T) {
 	svc := newTestPaymentService(t, db)
 	ownerID := seedUser(t, db)
 	otherID := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), ownerID, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), ownerID, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: ownerID, Channel: "stripe", ExternalTxnID: "pi-other-owner",
 	})
@@ -1443,7 +1443,7 @@ func TestPaymentService_Refund_Success(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, err := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-r1",
 	})
@@ -1474,7 +1474,7 @@ func TestPaymentService_Refund_Idempotent(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-r2",
 	})
@@ -1527,7 +1527,7 @@ func TestPaymentService_Refund_PaymentNotPaid(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// Insert a pending payment row directly.
 	pendingID := mustNewUUID()
@@ -1548,7 +1548,7 @@ func TestPaymentService_Refund_AmountTooLarge(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-big",
 	})
@@ -1564,7 +1564,7 @@ func TestPaymentService_Refund_SumExceedsPayment(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-sum",
 	})
@@ -1593,7 +1593,7 @@ func TestPaymentService_Refund_ChannelFailed(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-fail",
 	})
@@ -1628,7 +1628,7 @@ func TestPaymentService_Refund_MerchantRefundNoDeterministic(t *testing.T) {
 	paymentIDs := make([]string, 0, 2)
 	for i, txn := range []string{"pi-n2-a", "pi-n2-b"} {
 		uid := seedUser(t, db)
-		order, _ := svc.CreateOrder(ctx, uid, "monthly", "stripe")
+		order, _ := svc.CreateOrder(ctx, uid, "monthly", "stripe", nil)
 		res, err := svc.Confirm(ctx, ConfirmInput{OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txn})
 		if err != nil {
 			t.Fatalf("confirm %d: %v", i, err)
@@ -1656,7 +1656,7 @@ func TestPaymentService_Refund_MerchantRefundNoDeterministic(t *testing.T) {
 
 	// M1：渠道回显非空不同值 → 仍按已发送单号入库，回显仅记日志。
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(ctx, uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(ctx, uid, "monthly", "stripe", nil)
 	res, err := svc.Confirm(ctx, ConfirmInput{OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-n2-echo"})
 	if err != nil {
 		t.Fatalf("confirm echo: %v", err)
@@ -1687,7 +1687,7 @@ func TestPaymentService_ListUserPayments(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	_, _ = svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-list",
 	})
@@ -1705,7 +1705,7 @@ func TestPaymentService_GetPayment_Owner(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-get",
 	})
@@ -1722,7 +1722,7 @@ func TestPaymentService_GetPayment_NotOwner(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-no",
 	})
@@ -1745,7 +1745,7 @@ func TestPaymentService_GetRefund_Owner(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-rf",
 	})
@@ -1774,7 +1774,7 @@ func TestPaymentService_GetRefund_NotOwner(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-rfno",
 	})
@@ -1791,7 +1791,7 @@ func TestPaymentService_ListPaymentRefunds(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-lpr",
 	})
@@ -1815,7 +1815,7 @@ func TestPaymentService_ListPaymentRefunds_PaymentNotFound(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-lpr-nf",
 	})
@@ -1835,7 +1835,7 @@ func TestPaymentService_OnWebhook_StripePaymentSucceeded(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	raw := json.RawMessage(`{"id":"evt-1","type":"payment_intent.succeeded"}`)
 	res, err := svc.OnWebhook(context.Background(), WebhookEvent{
@@ -1884,7 +1884,7 @@ func TestPaymentService_OnWebhook_Duplicate(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	ev := WebhookEvent{
 		Channel: "stripe", EventID: "evt-dup", EventType: "payment_intent.succeeded",
 		TransactionID: "pi-dup", OrderID: order.ID, Amount: 29.9, Currency: "CNY",
@@ -1953,7 +1953,7 @@ func TestPaymentService_OnWebhook_RefundFull(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-rf",
 	})
@@ -1982,7 +1982,7 @@ func TestPaymentService_OnWebhook_DisputeCreated(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-disp",
 	})
@@ -2107,7 +2107,7 @@ func TestPaymentService_OnPaymentSucceeded_ClosedDBError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// Close the DB to force the call chain to fail.
 	_ = db.Close()
@@ -2130,7 +2130,7 @@ func TestPaymentService_OnWebhook_ChannelMismatch(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	// Pay the order via stripe (frontend Confirm).
 	if _, err := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-paid-1",
@@ -2177,7 +2177,7 @@ func TestPaymentService_OnWebhook_LatePayment(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// Force the order to 'expired' so the wasLate path is taken.
 	if _, err := db.ExecContext(context.Background(),
@@ -2213,7 +2213,7 @@ func TestPaymentService_OnWebhook_PaypalStampsExternalSubID(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: "evt-stamp-" + mustNewUUID()[:8], EventType: "PAYMENT.CAPTURE.COMPLETED",
@@ -2244,7 +2244,7 @@ func TestPaymentService_OnWebhook_UnexpectedStateTransition(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// Pre-insert a payment row that's already 'failed' for a txn_id
 	// we're about to redeliver as payment_succeeded.
@@ -2316,7 +2316,7 @@ func TestPaymentService_OnWebhook_DisputeCreated_NoPayment(t *testing.T) {
 	}
 
 	// The payment settles (dispute redelivery comes after).
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
 	})
@@ -2340,7 +2340,7 @@ func TestPaymentService_OnWebhook_Refund_Partial(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-partial",
 	})
@@ -2370,7 +2370,7 @@ func TestPaymentService_OnWebhook_PaymentFailed_AfterPaid(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-paid-then-failed",
 	})
@@ -2414,7 +2414,7 @@ func TestPaymentService_OnWebhook_PaymentFailed_DifferentTxnKeepsPaid(t *testing
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if _, err := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-settled",
 	}); err != nil {
@@ -2456,7 +2456,7 @@ func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2498,7 +2498,7 @@ func TestPaymentService_OnWebhook_Refund_UnpaidOrderClose_OutTradeNo(t *testing.
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2532,7 +2532,7 @@ func TestPaymentService_OnWebhook_Refund_PaidOrderMissingPaymentRow(t *testing.T
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2567,7 +2567,7 @@ func TestPaymentService_OnWebhook_AlipayRefund_CumulativeSemantics(t *testing.T)
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2670,7 +2670,7 @@ func TestPaymentService_OnWebhook_AlipayTradePending_Inert(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "alipay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2765,7 +2765,7 @@ func TestPaymentService_OnWebhook_Refund_ZeroAmount(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-rf-zero",
 	})
@@ -2861,7 +2861,7 @@ func TestPaymentService_OnWebhook_Refund_ReRun(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	res, _ := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-rerun",
 	})
@@ -2898,7 +2898,7 @@ func TestPaymentService_OnWebhook_ReRunAfterCrash(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// Manually insert a webhook_events row with processed_at NULL.
 	// This simulates "prior run crashed before MarkProcessed".
@@ -2944,7 +2944,7 @@ func TestPaymentService_OnWebhook_ReRunSameTxnID(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	// Pre-insert a paid payment + a webhook_events row that
 	// references the same (channel, external_txn_id). When the new
@@ -2998,7 +2998,7 @@ func TestPaymentService_OnWebhook_BadCurrency(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "stripe", EventID: "evt-bad-cur-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
@@ -3037,7 +3037,7 @@ func TestPaymentService_OnWebhook_PaypalActivated_AuditOnly(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	hint := time.Now().Add(7 * 24 * time.Hour).UTC().Truncate(time.Second)
 	eventID := "WH-ACT-" + mustNewUUID()[:8]
@@ -3084,7 +3084,7 @@ func TestPaymentService_OnWebhook_PaypalCaptureStillAmountChecked(t *testing.T) 
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paypal", EventID: "WH-CAP-" + mustNewUUID()[:8], EventType: "PAYMENT.CAPTURE.COMPLETED",
@@ -3129,7 +3129,7 @@ func TestPaymentService_CreateOrder_GenericErrors(t *testing.T) {
 			planRepo: planRepo,
 			subRepo:  repo.NewSubscriptionRepo(db),
 		}
-		_, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+		_, err := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 		if err == nil {
 			t.Fatal("expected error from closed db, got nil")
 		}
@@ -3805,7 +3805,7 @@ func TestPaymentService_OnWebhook_PaddleCompleted_NoOrderAuditOnly(t *testing.T)
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "paddle", EventID: eventID, EventType: "transaction.completed",
 		TransactionID: "txn_pd_noorder_" + mustNewUUID()[:8],
-		Origin: "web", Amount: 9.99, Currency: "USD",
+		Origin:        "web", Amount: 9.99, Currency: "USD",
 		RawPayload: json.RawMessage(`{}`),
 	})
 	if err != nil {
@@ -4455,7 +4455,7 @@ func TestConfirm_UnverifiableChannelRejected(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newSecureTestPaymentService(t, db, nil)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	_, err := svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: "pi-unverified",
@@ -4482,7 +4482,7 @@ func TestConfirm_WeChatUpstreamVerified(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newSecureTestPaymentService(t, db, confirmableWechatStub("wx-txn-ok", 1990))
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -4521,7 +4521,7 @@ func TestConfirm_WeChatNotVerified(t *testing.T) {
 			db := setupPaymentDB(t)
 			svc := newSecureTestPaymentService(t, db, tc.stub)
 			uid := seedUser(t, db)
-			order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+			order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay", nil)
 			if err != nil {
 				t.Fatalf("CreateOrder: %v", err)
 			}
@@ -4555,7 +4555,7 @@ func TestConfirm_WeChatUpstreamError(t *testing.T) {
 	}
 	svc := newSecureTestPaymentService(t, db, stub)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -4574,7 +4574,7 @@ func TestConfirm_ExpiresAtHintIgnored(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newSecureTestPaymentService(t, db, confirmableWechatStub("wx-txn-hint", 1990))
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -4604,7 +4604,7 @@ func TestOnWebhook_UnderpaidEvent(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe") // 19.9 CNY
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil) // 19.9 CNY
 
 	_, err := svc.OnWebhook(context.Background(), WebhookEvent{
 		Channel: "stripe", EventID: "evt-underpaid-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
@@ -4636,7 +4636,7 @@ func TestOnWebhook_DuplicatePaidOrderSameChannel(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 
 	first := WebhookEvent{
 		Channel: "stripe", EventID: "evt-dpo-1-" + mustNewUUID()[:8], EventType: "payment_intent.succeeded",
@@ -4673,8 +4673,8 @@ func TestOnWebhook_DedupeOrderMismatch(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid1, uid2 := seedUser(t, db), seedUser(t, db)
-	order1, _ := svc.CreateOrder(context.Background(), uid1, "monthly", "stripe")
-	order2, _ := svc.CreateOrder(context.Background(), uid2, "monthly", "stripe")
+	order1, _ := svc.CreateOrder(context.Background(), uid1, "monthly", "stripe", nil)
+	order2, _ := svc.CreateOrder(context.Background(), uid2, "monthly", "stripe", nil)
 
 	// Pay order1 via webhook with txn T.
 	if _, err := svc.OnWebhook(context.Background(), WebhookEvent{
@@ -4725,7 +4725,7 @@ func TestPaymentService_Refund_SumInvariantCents(t *testing.T) {
 	}
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(context.Background(), uid, "micro", "stripe")
+	order, err := svc.CreateOrder(context.Background(), uid, "micro", "stripe", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}

@@ -61,7 +61,7 @@ func TestWalletTopup_PaidCreditsWalletOnce(t *testing.T) {
 	seedTopupPlan(t, db, "topup-30", 29.99)
 	uid := seedUser(t, db)
 
-	order, err := svc.CreateOrder(ctx, uid, "topup-30", "stripe")
+	order, err := svc.CreateOrder(ctx, uid, "topup-30", "stripe", nil)
 	if err != nil {
 		t.Fatalf("create topup order: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestWalletTopup_RefundCashBack(t *testing.T) {
 
 	seedTopupPlan(t, db, "topup-50", 50.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-50", "stripe")
+	order, err := svc.CreateOrder(ctx, uid, "topup-50", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestWalletTopup_RefundGuardPaidOnly(t *testing.T) {
 
 	seedTopupPlan(t, db, "topup-60", 60.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-60", "stripe")
+	order, err := svc.CreateOrder(ctx, uid, "topup-60", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func TestWalletTopup_RefundArrivesBeforePayment_OutOfOrder(t *testing.T) {
 
 	seedTopupPlan(t, db, "topup-ooo", 50.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-ooo", "stripe")
+	order, err := svc.CreateOrder(ctx, uid, "topup-ooo", "stripe", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestWalletTopup_TradeClosedWithRefundAmount_OutOfOrder(t *testing.T) {
 
 	seedTopupPlan(t, db, "topup-tc", 50.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-tc", "alipay")
+	order, err := svc.CreateOrder(ctx, uid, "topup-tc", "alipay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +429,7 @@ func TestWalletTopup_AlipayRefund_CumulativeDelta(t *testing.T) {
 
 	seedTopupPlan(t, db, "topup-cum", 50.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-cum", "alipay")
+	order, err := svc.CreateOrder(ctx, uid, "topup-cum", "alipay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

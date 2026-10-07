@@ -52,6 +52,12 @@ type Order struct {
 	// Scan, storing driver.Value type <nil> into type *json.RawMessage").
 	ProviderIntent *json.RawMessage `db:"provider_intent" json:"provider_intent,omitempty"`
 
+	// Attribution is the sanitized marketing-attribution snapshot accepted
+	// on POST /payments/orders (migration 044). Same NULL/omitempty
+	// semantics as ProviderIntent: orders created without an attribution
+	// payload scan SQL NULL into a nil pointer and omit the key in JSON.
+	Attribution *json.RawMessage `db:"attribution" json:"attribution,omitempty"`
+
 	// ---- Benefit snapshot (migration 029, Kaya Coding Plan Task 10) ----
 	// Frozen at order-creation time from the plan row and its
 	// plan_benefit_configs row. The payment callback path (webhook /

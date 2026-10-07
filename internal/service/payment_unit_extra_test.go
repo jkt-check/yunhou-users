@@ -409,7 +409,7 @@ func TestCreateOrder_WeChat_Real_PersistsIntent(t *testing.T) {
 	}
 	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 
-	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestCreateOrder_WeChat_Real_PersistsIntent(t *testing.T) {
 func TestCreateOrder_WeChat_NilClient_Fourxx(t *testing.T) {
 	svc, orderRepo := newPaymentServiceForCreateOrder(nil)
 
-	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay", nil)
 	if !errors.Is(err, ErrWechatPayNotConfigured) {
 		t.Fatalf("expected ErrWechatPayNotConfigured, got %v (order=%+v)", err, order)
 	}
@@ -472,7 +472,7 @@ func TestCreateOrder_WeChat_NilClient_Fourxx(t *testing.T) {
 func TestPaymentService_CreateOrder_WeChatNotConfigured_NoOrphanOrder(t *testing.T) {
 	svc, orderRepo := newPaymentServiceForCreateOrder(nil)
 
-	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay", nil)
 	if !errors.Is(err, ErrWechatPayNotConfigured) {
 		t.Fatalf("expected ErrWechatPayNotConfigured, got %v (order=%+v)", err, order)
 	}
@@ -513,7 +513,7 @@ func TestPaymentService_CreateOrder_PlanDeactivatedDuringTx(t *testing.T) {
 		&stubRefundAPI{}, nil,
 		0,
 	)
-	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe")
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe", nil)
 	if !errors.Is(err, ErrPlanInactive) {
 		t.Fatalf("CreateOrder error = %v, want ErrPlanInactive", err)
 	}
@@ -570,7 +570,7 @@ func TestCreateOrder_WeChat_Real_UnifiedOrderErr(t *testing.T) {
 	}
 	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 
-	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay", nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -600,7 +600,7 @@ func TestCreateOrder_WeChat_Real_IntentPersistErr_MarksOrderFailed(t *testing.T)
 	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 	orderRepo.updateIntentErr = errors.New("db down")
 
-	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay", nil)
 	if err == nil || !strings.Contains(err.Error(), "persist provider intent") {
 		t.Fatalf("expected persist provider intent error, got %v", err)
 	}
@@ -632,7 +632,7 @@ func TestCreateOrder_WeChat_Mock_CallsClientAndSetsIntent(t *testing.T) {
 	}
 	svc, orderRepo := newPaymentServiceForCreateOrder(asWechatClient(stub))
 
-	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay")
+	order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "wechat_pay", nil)
 	if err != nil {
 		t.Fatalf("CreateOrder mock: %v", err)
 	}
@@ -659,14 +659,14 @@ func TestCreateOrder_WeChat_Mock_CallsClientAndSetsIntent(t *testing.T) {
 
 func TestCreateOrder_Stripe_NilWeChat_OK(t *testing.T) {
 	svc, _ := newPaymentServiceForCreateOrder(nil)
-	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe"); err != nil {
+	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe", nil); err != nil {
 		t.Fatalf("CreateOrder stripe: %v", err)
 	}
 }
 
 func TestCreateOrder_InvalidChannel(t *testing.T) {
 	svc, orderRepo := newPaymentServiceForCreateOrder(nil)
-	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "fakechan"); err == nil {
+	if _, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "fakechan", nil); err == nil {
 		t.Fatal("expected error for invalid channel")
 	}
 	if orderRepo.created != nil {
@@ -696,7 +696,7 @@ func TestPaymentService_Unit_CreateOrder_SubRepoError(t *testing.T) {
 
 		0)
 
-	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe")
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe", nil)
 	if err == nil {
 		t.Fatal("expected error from subRepo.FindActiveByUserID")
 	}
@@ -718,7 +718,7 @@ func TestPaymentService_Unit_CreateOrder_PlanNotFound(t *testing.T) {
 
 		0)
 
-	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe")
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe", nil)
 	if !errors.Is(err, ErrPlanNotFound) {
 		t.Errorf("expected ErrPlanNotFound, got %v", err)
 	}
@@ -737,7 +737,7 @@ func TestPaymentService_Unit_CreateOrder_PlanInactive(t *testing.T) {
 
 		0)
 
-	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe")
+	_, err := svc.CreateOrder(context.Background(), "u_1", "monthly", "stripe", nil)
 	if !errors.Is(err, ErrPlanInactive) {
 		t.Errorf("expected ErrPlanInactive, got %v", err)
 	}
@@ -1432,4 +1432,98 @@ func TestRefund_InternalAppReplayHitsCanonicalOwner(t *testing.T) {
 	if !res.Existing || res.Refund.ID != "r-1" {
 		t.Fatalf("res = %+v, want existing r-1", res)
 	}
+}
+
+// ============================================================================
+// CreateOrder — attribution (M1)
+// ============================================================================
+
+// TestCreateOrder_Attribution pins the M1 contract: an optional attribution
+// payload is sanitized (unknown keys dropped, >200-rune strings truncated)
+// and attached to the order row before insert; absent / empty / null
+// payloads leave order.Attribution nil (SQL NULL) and keep the pre-M1
+// behavior byte-for-byte.
+func TestCreateOrder_Attribution(t *testing.T) {
+	t.Run("sanitized snapshot attached to the created order", func(t *testing.T) {
+		svc, orderRepo := newPaymentServiceForCreateOrder(nil)
+		raw := json.RawMessage(`{"first_touch":{"utm_source":"google","captured_at":"2026-10-01T08:30:00Z","session_id":"drop-me"},"last_touch":null,"unknown_root":1}`)
+		order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe", raw)
+		if err != nil {
+			t.Fatalf("CreateOrder: %v", err)
+		}
+		if order.Attribution == nil {
+			t.Fatal("order.Attribution = nil, want sanitized snapshot")
+		}
+		s := string(*order.Attribution)
+		if !strings.Contains(s, `"utm_source":"google"`) || !strings.Contains(s, `"captured_at":"2026-10-01T08:30:00Z"`) {
+			t.Errorf("Attribution = %s, want utm_source + captured_at", s)
+		}
+		for _, dropped := range []string{"session_id", "unknown_root"} {
+			if strings.Contains(s, dropped) {
+				t.Errorf("Attribution contains unknown key %q: %s", dropped, s)
+			}
+		}
+		// The same snapshot must be what the repo was asked to insert.
+		if orderRepo.created == nil || orderRepo.created.Attribution == nil ||
+			string(*orderRepo.created.Attribution) != s {
+			t.Errorf("repo insert Attribution = %v, want %s", orderRepo.created.Attribution, s)
+		}
+	})
+
+	t.Run("nil attribution → order.Attribution nil", func(t *testing.T) {
+		svc, orderRepo := newPaymentServiceForCreateOrder(nil)
+		order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe", nil)
+		if err != nil {
+			t.Fatalf("CreateOrder: %v", err)
+		}
+		if order.Attribution != nil {
+			t.Errorf("order.Attribution = %s, want nil", *order.Attribution)
+		}
+		if orderRepo.created == nil || orderRepo.created.Attribution != nil {
+			t.Errorf("repo insert Attribution = %v, want nil", orderRepo.created.Attribution)
+		}
+	})
+
+	t.Run("empty object → SQL NULL (nil)", func(t *testing.T) {
+		svc, _ := newPaymentServiceForCreateOrder(nil)
+		order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe", json.RawMessage(`{}`))
+		if err != nil {
+			t.Fatalf("CreateOrder: %v", err)
+		}
+		if order.Attribution != nil {
+			t.Errorf("order.Attribution = %s, want nil for empty object", *order.Attribution)
+		}
+	})
+
+	t.Run("invalid attribution → ErrInvalidAttribution before insert", func(t *testing.T) {
+		svc, orderRepo := newPaymentServiceForCreateOrder(nil)
+		_, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe", json.RawMessage(`{"first_touch": 42}`))
+		if !errors.Is(err, ErrInvalidAttribution) {
+			t.Fatalf("err = %v, want ErrInvalidAttribution", err)
+		}
+		if orderRepo.created != nil {
+			t.Errorf("no order row should be inserted on invalid attribution, got %+v", orderRepo.created)
+		}
+	})
+
+	t.Run("over-long strings truncated to 200 runes", func(t *testing.T) {
+		svc, _ := newPaymentServiceForCreateOrder(nil)
+		long := strings.Repeat("x", 250)
+		raw := json.RawMessage(`{"first_touch":{"utm_source":"` + long + `"}}`)
+		order, err := svc.CreateOrder(context.Background(), "user-1", "plan-1", "stripe", raw)
+		if err != nil {
+			t.Fatalf("CreateOrder: %v", err)
+		}
+		if order.Attribution == nil {
+			t.Fatal("order.Attribution = nil")
+		}
+		var decoded model.Attribution
+		if err := json.Unmarshal(*order.Attribution, &decoded); err != nil {
+			t.Fatalf("re-decode: %v", err)
+		}
+		if decoded.FirstTouch == nil || decoded.FirstTouch.UtmSource == nil ||
+			len(*decoded.FirstTouch.UtmSource) != 200 {
+			t.Errorf("utm_source len = %d, want 200", len(*decoded.FirstTouch.UtmSource))
+		}
+	})
 }

@@ -45,7 +45,7 @@ func newReview7WechatService(t *testing.T, db *sqlx.DB) *PaymentService {
 func apiRefundRowThenWebhook(t *testing.T, db *sqlx.DB, svc *PaymentService, uid, channel, payEventType, txnID string, amount float64) (orderID, paymentID, merchantNo string) {
 	t.Helper()
 	ctx := context.Background()
-	order, err := svc.CreateOrder(ctx, uid, "monthly", channel)
+	order, err := svc.CreateOrder(ctx, uid, "monthly", channel, nil)
 	if err != nil {
 		t.Fatalf("create order: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestAlipay_APIRefundRowThenWebhook_WalletRefundEnqueued(t *testing.T) {
 
 	seedTopupPlan(t, db, "topup-r7", 50.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-r7", "alipay")
+	order, err := svc.CreateOrder(ctx, uid, "topup-r7", "alipay", nil)
 	if err != nil {
 		t.Fatalf("create topup order: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestPaymentFailed_AfterPaid_WalletTopupDebitsWallet(t *testing.T) {
 
 	seedTopupPlan(t, db, "topup-fail", 30.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-fail", "stripe")
+	order, err := svc.CreateOrder(ctx, uid, "topup-fail", "stripe", nil)
 	if err != nil {
 		t.Fatalf("create topup order: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestOnWebhook_RefundFailedEvent_FlipsPendingRow(t *testing.T) {
 	uid := seedUser(t, db)
 	ctx := context.Background()
 
-	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay")
+	order, err := svc.CreateOrder(ctx, uid, "monthly", "wechat_pay", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +460,7 @@ func TestPaymentFailed_AfterPaid_PartialRefund_DebitsOnlyDifference(t *testing.T
 
 	seedTopupPlan(t, db, "topup-partial-fail", 50.00)
 	uid := seedUser(t, db)
-	order, err := svc.CreateOrder(ctx, uid, "topup-partial-fail", "stripe")
+	order, err := svc.CreateOrder(ctx, uid, "topup-partial-fail", "stripe", nil)
 	if err != nil {
 		t.Fatalf("create topup order: %v", err)
 	}

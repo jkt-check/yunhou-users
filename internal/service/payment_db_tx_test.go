@@ -151,7 +151,7 @@ func TestOnDisputeCreated_SetDisputedError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	txnID := "pi-sde-" + mustNewUUID()[:8]
 	svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
@@ -206,7 +206,7 @@ func TestOnPaymentSucceeded_ActivateSubError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	txnID := "pi-ase-" + mustNewUUID()[:8]
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &countingFakeTx{
@@ -241,7 +241,7 @@ func TestOnPaymentSucceeded_UpdateOrderError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	txnID := "pi-uoe-" + mustNewUUID()[:8]
 	svc.dbBeginTx = func(_ context.Context) (dbTx, error) {
 		return &countingFakeTx{
@@ -294,7 +294,7 @@ func TestOnPaymentFailed_MarkFailedError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	txnID := "pi-mfe-" + mustNewUUID()[:8]
 	svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,
@@ -326,7 +326,7 @@ func TestOnPaymentFailed_FlipOrderError(t *testing.T) {
 	db := setupPaymentDB(t)
 	svc := newTestPaymentService(t, db)
 	uid := seedUser(t, db)
-	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe")
+	order, _ := svc.CreateOrder(context.Background(), uid, "monthly", "stripe", nil)
 	txnID := "pi-floe-" + mustNewUUID()[:8]
 	svc.Confirm(context.Background(), ConfirmInput{
 		OrderID: order.ID, UserID: uid, Channel: "stripe", ExternalTxnID: txnID,

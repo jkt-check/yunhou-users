@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yunhou/users/internal/analytics"
 	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/providers/connector"
 	"github.com/yunhou/users/internal/llm"
@@ -192,6 +193,15 @@ type Config struct {
 	// DeepSeekModel is the model name sent in the upstream chat.completions
 	// body (e.g. deepseek-v4-flash). Default "deepseek-v4-flash".
 	DeepSeekModel string
+
+	// PostHogProjectToken enables the M2 server-side analytics emitter
+	// (signup_completed / trial_started). Empty = analytics disabled (the
+	// emitter no-ops and makes zero HTTP requests — same posture as
+	// DeepSeekAPIKey). Server-side only; consumer apps never see it.
+	PostHogProjectToken string
+	// PostHogHost is the capture API origin. Default
+	// https://us.i.posthog.com.
+	PostHogHost string
 	// LLMProvidersJSON is the multi-model catalog (providers + logical
 	// models) as one JSON object, parsed and validated by llm.ParseCatalog
 	// as the /chat runtime catalog (takes precedence over the legacy
@@ -350,7 +360,10 @@ func Load() *Config {
 		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekBaseURL: envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 		DeepSeekModel:   envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-		ChatLogPath:     os.Getenv("CHAT_LOG_PATH"),
+
+		PostHogProjectToken: os.Getenv("POSTHOG_PROJECT_TOKEN"),
+		PostHogHost:         envOr("POSTHOG_HOST", analytics.DefaultHost),
+		ChatLogPath:         os.Getenv("CHAT_LOG_PATH"),
 
 		LLMProvidersJSON: os.Getenv("LLM_PROVIDERS_JSON"),
 

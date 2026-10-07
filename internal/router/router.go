@@ -125,6 +125,12 @@ func Setup(
 		userGroup.GET("/subscriptions", subHandler.ListUserSubscriptions)
 		userGroup.POST("/subscriptions", subHandler.CreateSubscription)
 		userGroup.DELETE("/subscriptions/:id", subHandler.CancelSubscription)
+		// M2: channel-aware self-management (Paddle). These live on the
+		// payment handler because they drive the channel client + tx
+		// machinery; the routes hang under /user/subscriptions per the
+		// website contract.
+		userGroup.POST("/subscriptions/:id/cancel", paymentHandler.CancelSubscriptionByID)
+		userGroup.POST("/subscriptions/:id/change-plan", paymentHandler.ChangeSubscriptionPlanByID)
 
 		// Usage heartbeat (2026-09-04-usage-analytics-design.md §3.3):
 		// kaya sends one 5-min beat per login session, batched ≤100 when

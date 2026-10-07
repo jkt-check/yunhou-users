@@ -67,4 +67,7 @@ type PaymentServiceInterface interface {
 	GetRefund(ctx context.Context, refundID, userID string) (*model.Refund, error)
 	CancelChannelSubscription(ctx context.Context, userID string) (*model.Subscription, error)
 	UpgradeChannelSubscription(ctx context.Context, userID, targetPlanID string) (*ChannelUpgradeResult, error)
+	// M2 contract endpoints (:id-scoped self-management).
+	CancelSubscriptionByID(ctx context.Context, userID, subID, effectiveFrom string) (*model.Subscription, error)
+	ChangePlanByID(ctx context.Context, userID, subID, planID string) (*model.Subscription, error)
 }

@@ -109,8 +109,9 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 	return &CheckoutTransaction{TransactionID: res.ID, CheckoutURL: *res.Checkout.URL}, nil
 }
 
-// CancelSubscription cancels the channel-side subscription with the
-// DEFAULT effective_from (next_billing_period): the buyer keeps access
+// CancelSubscription cancels the channel-side subscription with
+// effective_from=next_billing_period (sent explicitly, though the Paddle
+// API also defaults to it for active subscriptions): the buyer keeps access
 // until the paid period ends and is never charged again. Paddle applies
 // it as a scheduled_change and fires subscription.canceled when the
 // cancellation takes effect — the local status flip hangs off that
@@ -123,7 +124,10 @@ func (c *Client) CancelSubscription(ctx context.Context, subscriptionID string) 
 	if c.SDK == nil {
 		return errors.New("paddle client: SDK not wired")
 	}
-	if _, err := c.SDK.CancelSubscription(ctx, &paddle.CancelSubscriptionRequest{SubscriptionID: subscriptionID}); err != nil {
+	if _, err := c.SDK.CancelSubscription(ctx, &paddle.CancelSubscriptionRequest{
+		SubscriptionID: subscriptionID,
+		EffectiveFrom:  paddle.PtrTo(paddle.EffectiveFromNextBillingPeriod),
+	}); err != nil {
 		return fmt.Errorf("paddle cancel subscription: %w", err)
 	}
 	return nil

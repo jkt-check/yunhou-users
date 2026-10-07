@@ -1137,6 +1137,26 @@ func TestSubscriptionHandler_CancelSubscription(t *testing.T) {
 			t.Errorf("expected 200, got %d", w.Code)
 		}
 	})
+
+	t.Run("auto-renewing channel sub → 409 pointing at the cancel endpoint", func(t *testing.T) {
+		subSvc := &mockSubSvc{cancelErr: service.ErrSubscriptionAutoRenewActive}
+		handler := NewSubscriptionHandler(subSvc)
+
+		router := gin.New()
+		router.DELETE("/user/subscriptions/:id", func(c *gin.Context) { c.Set("user_id", "user-123") }, handler.CancelSubscription)
+
+		req := httptest.NewRequest(http.MethodDelete, "/user/subscriptions/sub-1", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Errorf("expected 409, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		want := "use POST /user/subscriptions/:id/cancel for auto-renewing channel subscriptions"
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("body %s missing %q", w.Body.String(), want)
+		}
+	})
 }
 
 // --- AppHandler Tests ---

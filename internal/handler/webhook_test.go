@@ -66,6 +66,12 @@ func (m *mockWebhookSvc) CancelChannelSubscription(_ context.Context, _ string) 
 func (m *mockWebhookSvc) UpgradeChannelSubscription(_ context.Context, _, _ string) (*service.ChannelUpgradeResult, error) {
 	return nil, nil
 }
+func (m *mockWebhookSvc) CancelSubscriptionByID(_ context.Context, _, _, _ string) (*model.Subscription, error) {
+	return nil, nil
+}
+func (m *mockWebhookSvc) ChangePlanByID(_ context.Context, _, _, _ string) (*model.Subscription, error) {
+	return nil, nil
+}
 
 func webhookTestEngine(svc service.PaymentServiceInterface) *gin.Engine {
 	gin.SetMode(gin.TestMode)

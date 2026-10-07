@@ -685,3 +685,66 @@ func TestSubscriptionService_Create_ClampsHugeIntervalDays(t *testing.T) {
 		t.Errorf("ExpiresAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", sub.ExpiresAt)
 	}
 }
+
+// TestSubscriptionService_Cancel_AutoRenewGuard pins the M2 DELETE guard:
+// a subscription whose channel auto-renew is still active (auto_renew=true)
+// must NOT be locally cancelled via DELETE /user/subscriptions/:id — the
+// caller is sent to POST /user/subscriptions/:id/cancel instead, and the
+// row is left untouched. auto_renew=false channel subs and non-channel subs
+// keep the legacy local-cancel behavior.
+func TestSubscriptionService_Cancel_AutoRenewGuard(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	newSvcWith := func(sub *model.Subscription) (*SubscriptionService, *mockSubscriptionRepo) {
+		sr := newMockSubscriptionRepo()
+		pr := newMockPlanRepo()
+		sr.subs[sub.ID] = sub
+		sr.byUserID[sub.UserID] = sub
+		return NewSubscriptionService(sr, &PlanService{planRepo: pr}), sr
+	}
+
+	t.Run("auto_renew=true rejects with guard sentinel", func(t *testing.T) {
+		t.Parallel()
+		paddle := "paddle"
+		svc, sr := newSvcWith(&model.Subscription{
+			ID: "sub-ar", UserID: "user-1", PlanID: "monthly", Status: "active",
+			Channel: &paddle, AutoRenew: true,
+		})
+		err := svc.Cancel(ctx, "sub-ar", "user-1")
+		if !errors.Is(err, ErrSubscriptionAutoRenewActive) {
+			t.Fatalf("expected ErrSubscriptionAutoRenewActive, got %v", err)
+		}
+		if sr.subs["sub-ar"].Status != "active" {
+			t.Errorf("status flipped to %q despite the guard", sr.subs["sub-ar"].Status)
+		}
+	})
+
+	t.Run("auto_renew=false channel sub cancels locally", func(t *testing.T) {
+		t.Parallel()
+		paddle := "paddle"
+		svc, sr := newSvcWith(&model.Subscription{
+			ID: "sub-off", UserID: "user-1", PlanID: "monthly", Status: "active",
+			Channel: &paddle, AutoRenew: false,
+		})
+		if err := svc.Cancel(ctx, "sub-off", "user-1"); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		if sr.subs["sub-off"].Status != "cancelled" {
+			t.Errorf("status = %q, want cancelled", sr.subs["sub-off"].Status)
+		}
+	})
+
+	t.Run("non-channel sub cancels locally", func(t *testing.T) {
+		t.Parallel()
+		svc, sr := newSvcWith(&model.Subscription{
+			ID: "sub-free", UserID: "user-1", PlanID: "free", Status: "active",
+		})
+		if err := svc.Cancel(ctx, "sub-free", "user-1"); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		if sr.subs["sub-free"].Status != "cancelled" {
+			t.Errorf("status = %q, want cancelled", sr.subs["sub-free"].Status)
+		}
+	})
+}

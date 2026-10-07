@@ -187,6 +187,11 @@ func (s *SubscriptionService) cancelWithBenefitSync(ctx context.Context, id, use
 	if sub.Status == "cancelled" {
 		return ErrAlreadyCancelled
 	}
+	if sub.AutoRenew {
+		// M2 guard: a local-only flip would leave the channel billing the
+		// user — channel auto-renew must be cancelled channel-side first.
+		return ErrSubscriptionAutoRenewActive
+	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET status = 'cancelled', updated_at = now()
 		WHERE id = $1 AND status <> 'cancelled'
@@ -230,6 +235,11 @@ func (s *SubscriptionService) cancelLegacy(ctx context.Context, id, userID strin
 	}
 	if sub.Status == "cancelled" {
 		return ErrAlreadyCancelled
+	}
+	if sub.AutoRenew {
+		// M2 guard: see cancelWithBenefitSync — channel auto-renew must be
+		// cancelled channel-side first.
+		return ErrSubscriptionAutoRenewActive
 	}
 	// The repo's UpdateStatus is a plain UPDATE; without a
 	// `WHERE status <> 'cancelled'` guard, a concurrent Cancel racing a

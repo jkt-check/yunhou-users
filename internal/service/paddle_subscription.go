@@ -64,6 +64,18 @@ func (s *PaymentService) CancelChannelSubscription(ctx context.Context, userID s
 	if err := s.paddle.CancelSubscription(ctx, extID); err != nil {
 		return nil, fmt.Errorf("paddle cancel subscription: %w", err)
 	}
+	// Contract 2.1 step 5: the cancel is scheduled channel-side — record
+	// locally that no further auto-renewal will happen. status/expires_at
+	// stay untouched (access continues to period end; the
+	// subscription.canceled webhook flips status).
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE subscriptions SET auto_renew = false, updated_at = now() WHERE id = $1
+	`, sub.ID); err != nil {
+		// The channel-side cancel already succeeded; a failed local flip
+		// must not surface as a failure (the user would retry and Paddle
+		// would 4xx the double-cancel). Log and continue.
+		log.Printf("paddle cancel: auto_renew flip failed for subscription %s: %v", sub.ID, err)
+	}
 	if err := s.writeAudit(ctx, "user:"+userID, "paddle_subscription_cancel_requested",
 		fmt.Sprintf("subscription:%s", sub.ID),
 		[]string{"paddle", "subscription", "cancel"},

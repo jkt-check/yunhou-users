@@ -147,3 +147,47 @@ func TestParsePaddle_AdjustmentRefundBadTotals(t *testing.T) {
 		})
 	}
 }
+
+// A chargeback with an unparseable totals.total still parses (amount is
+// ops context, not a ledger key) — the amount just stays zero.
+func TestParsePaddle_AdjustmentChargebackBadTotalsLenient(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_cb_bad",
+	  "event_type": "adjustment.updated",
+	  "data": {"id": "adj_cb_bad", "action": "chargeback", "status": "approved",
+	           "transaction_id": "txn_cb_2", "currency_code": "USD",
+	           "totals": {"total": "abc"}}
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatalf("chargeback parse must stay lenient on totals: %v", err)
+	}
+	if we.AdjustmentAction != "chargeback" || we.Amount != 0 {
+		t.Errorf("got %+v, want action=chargeback with amount 0", we)
+	}
+}
+
+// Symmetric with the data.id guard: an approved refund without
+// data.transaction_id can't key the payment lookup, and malformed
+// adjustment data JSON hard-fails like every other branch's data.
+func TestParsePaddle_AdjustmentRefundMissingTransactionID(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_adj_notxn",
+	  "event_type": "adjustment.updated",
+	  "data": {"id": "adj_1", "action": "refund", "status": "approved",
+	           "transaction_id": "", "currency_code": "USD", "totals": {"total": "100"}}
+	}`)
+	if _, err := h.parsePaddle(raw); err == nil {
+		t.Fatal("refund-approved adjustment with empty data.transaction_id must error")
+	}
+}
+
+func TestParsePaddle_AdjustmentMalformedData(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{"event_id":"evt_adj_broken","event_type":"adjustment.updated","data":{"id":`)
+	if _, err := h.parsePaddle(raw); err == nil {
+		t.Fatal("malformed adjustment data must error")
+	}
+}

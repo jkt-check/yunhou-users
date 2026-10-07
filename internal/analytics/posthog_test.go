@@ -199,3 +199,69 @@ func TestEmitter_Environment(t *testing.T) {
 		t.Errorf("Environment = %q, want production", got)
 	}
 }
+
+// errRoundTripper fails every request — drives send's transport-error
+// branch deterministically (no real network).
+type errRoundTripper struct{}
+
+func (errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errBoom
+}
+
+var errBoom = &boomError{}
+
+type boomError struct{}
+
+func (*boomError) Error() string { return "boom" }
+
+func TestEmitter_SetHTTPClient_AndTransportErrorDropped(t *testing.T) {
+	t.Parallel()
+	srv, _, calls := batchServer(t, http.StatusOK)
+	e := NewEmitter("phc_testtoken", srv.URL, "staging")
+	// SetHTTPClient is the test hook (GitHubOAuthService idiom); an
+	// always-erroring transport drives the Do-failure branch.
+	e.SetHTTPClient(&http.Client{Transport: errRoundTripper{}})
+	e.Capture(Event{Name: "signup_completed", DistinctID: "u-1"})
+
+	select {
+	case r := <-waitChan(srv, calls):
+		t.Fatalf("request reached the server despite the failing transport: %+v", r)
+	case <-time.After(200 * time.Millisecond):
+		// transport error logged and dropped, as required
+	}
+}
+
+func TestEmitter_SetHTTPClient_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var e *Emitter
+	e.SetHTTPClient(nil) // must not panic
+}
+
+func TestEmitter_Send_UnmarshalablePropertiesDropped(t *testing.T) {
+	t.Parallel()
+	srv, _, calls := batchServer(t, http.StatusOK)
+	e := NewEmitter("phc_testtoken", srv.URL, "staging")
+	// A chan property can never marshal — send must log and drop BEFORE
+	// building the request.
+	e.Capture(Event{
+		Name:       "signup_completed",
+		DistinctID: "u-1",
+		Properties: map[string]any{"bad": make(chan int)},
+	})
+
+	select {
+	case r := <-waitChan(srv, calls):
+		t.Fatalf("unmarshalable event reached the server: %+v", r)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestEmitter_Send_BadHostDropped(t *testing.T) {
+	t.Parallel()
+	// A host that fails url.Parse drives the NewRequest error branch.
+	e := NewEmitter("phc_testtoken", "://no-scheme", "staging")
+	e.Capture(Event{Name: "trial_started", DistinctID: "u-1"})
+	// Nothing to observe server-side; the assertion is that the goroutine
+	// logs and returns without panicking (race detector watches it).
+	time.Sleep(100 * time.Millisecond)
+}

@@ -217,8 +217,12 @@ func (s *PaymentService) SetAnalytics(a AnalyticsEmitter) { s.analytics = a }
 // only on the paddle surface, after the settlement tx commits. The
 // idempotency uuid keys on the paddle transaction id, so a redelivery of
 // the same transaction under a fresh event_id re-derives the same uuid and
-// PostHog dedupes. Nil-safe, fire-and-forget.
-func (s *PaymentService) emitPurchaseCompleted(e WebhookEvent, order *model.Order, intervalDays *int, purchaseType string) {
+// PostHog dedupes. amountBasis documents the amount semantics:
+// "catalog_ex_tax" (first purchase: order.Amount is the catalog price,
+// tax-excluded) vs "settled_inc_tax" (renewal: the synthetic order's
+// amount is the channel-collected, tax-inclusive settled amount). Nil-safe,
+// fire-and-forget.
+func (s *PaymentService) emitPurchaseCompleted(e WebhookEvent, order *model.Order, intervalDays *int, purchaseType, amountBasis string) {
 	if s.analytics == nil {
 		return
 	}
@@ -229,6 +233,7 @@ func (s *PaymentService) emitPurchaseCompleted(e WebhookEvent, order *model.Orde
 		"currency":       order.Currency,
 		"amount":         order.Amount,
 		"purchase_type":  purchaseType,
+		"amount_basis":   amountBasis,
 		"channel":        "paddle",
 		"region":         "intl",
 		"environment":    s.analytics.Environment(),
@@ -239,11 +244,19 @@ func (s *PaymentService) emitPurchaseCompleted(e WebhookEvent, order *model.Orde
 		props["billing_cycle"] = cycle
 	}
 	// The M1 snapshot rides verbatim under `attribution` when the order
-	// carries one.
+	// carries one, and is additionally flattened onto scalar
+	// first_touch_*/last_touch_* keys — PostHog filters nested objects
+	// poorly. Flattened values come ONLY from the order snapshot: a
+	// purchase event must never leak the user's current attribution state.
 	if order.Attribution != nil && len(*order.Attribution) > 0 {
 		var snap any
 		if err := json.Unmarshal(*order.Attribution, &snap); err == nil {
 			props["attribution"] = snap
+		}
+		var attr model.Attribution
+		if err := json.Unmarshal(*order.Attribution, &attr); err == nil {
+			flattenAttributionTouch(props, "first_touch", attr.FirstTouch)
+			flattenAttributionTouch(props, "last_touch", attr.LastTouch)
 		}
 	}
 	s.analytics.Capture(analytics.Event{
@@ -253,6 +266,29 @@ func (s *PaymentService) emitPurchaseCompleted(e WebhookEvent, order *model.Orde
 		Timestamp:  time.Now(),
 		Properties: props,
 	})
+}
+
+// flattenAttributionTouch copies a snapshot touch's non-nil fields onto
+// props as scalar `<prefix>_utm_source`-style keys.
+func flattenAttributionTouch(props map[string]any, prefix string, t *model.AttributionTouch) {
+	if t == nil {
+		return
+	}
+	for _, f := range []struct {
+		key string
+		val *string
+	}{
+		{prefix + "_utm_source", t.UtmSource},
+		{prefix + "_utm_medium", t.UtmMedium},
+		{prefix + "_utm_campaign", t.UtmCampaign},
+		{prefix + "_utm_content", t.UtmContent},
+		{prefix + "_referrer_domain", t.ReferrerDomain},
+		{prefix + "_landing_path", t.LandingPath},
+	} {
+		if f.val != nil {
+			props[f.key] = *f.val
+		}
+	}
 }
 
 // billingCycleFromInterval maps a plan interval to "monthly"/"yearly";
@@ -2492,7 +2528,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 	// semantics: first purchase reports the CATALOG price (order.Amount) —
 	// the renewal path reports the settled amount instead (see below).
 	if e.Channel == "paddle" && order.Amount > 0 {
-		s.emitPurchaseCompleted(e, order, order.PlanIntervalDays, "first_purchase")
+		s.emitPurchaseCompleted(e, order, order.PlanIntervalDays, "first_purchase", "catalog_ex_tax")
 	}
 	return nil
 }
@@ -3404,7 +3440,7 @@ func (s *PaymentService) onRenewalSucceeded(ctx context.Context, e WebhookEvent)
 		s.emitPurchaseCompleted(e, &model.Order{
 			ID: orderID, UserID: sub.UserID, PlanID: sub.PlanID,
 			Amount: e.Amount, Currency: e.Currency,
-		}, synInterval, "renewal")
+		}, synInterval, "renewal", "settled_inc_tax")
 	}
 	return nil
 }

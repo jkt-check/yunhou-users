@@ -2,9 +2,14 @@ package paddle
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	paddle "github.com/PaddleHQ/paddle-go-sdk/v5"
+	paddleerr "github.com/PaddleHQ/paddle-go-sdk/v5/pkg/paddleerr"
 )
 
 func TestNewClient_UnknownEnv(t *testing.T) {
@@ -94,5 +99,38 @@ func TestReal_UpdateSubscriptionPrice_RequiresSDK(t *testing.T) {
 	c := &Client{}
 	if _, err := c.UpdateSubscriptionPrice(context.Background(), "sub_x", "pri_yearly"); err == nil {
 		t.Fatal("expected error when SDK not wired")
+	}
+}
+
+// IsSubscriptionGoneError classifies the "channel-side billing relationship
+// is already over" errors via the SDK's typed sentinels (Type+Code match).
+func TestIsSubscriptionGoneError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"not_found (unknown subscription)", fmt.Errorf("paddle cancel subscription: %w", &paddleerr.Error{
+			Type: paddleerr.ErrorTypeRequestError, Code: "not_found",
+		}), true},
+		{"is_canceled_action_invalid (double cancel)", fmt.Errorf("paddle cancel subscription: %w", &paddleerr.Error{
+			Type: paddleerr.ErrorTypeRequestError, Code: "subscription_is_canceled_action_invalid",
+		}), true},
+		{"unwrapped sentinel matches too", paddle.ErrNotFound, true},
+		{"other request error is NOT gone-class", &paddleerr.Error{
+			Type: paddleerr.ErrorTypeRequestError, Code: "subscription_locked_renewal",
+		}, false},
+		{"api error type is NOT gone-class", &paddleerr.Error{
+			Type: paddleerr.ErrorTypeAPIError, Code: "not_found",
+		}, false},
+		{"plain error", errors.New("paddle 503"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsSubscriptionGoneError(tc.err); got != tc.want {
+				t.Errorf("IsSubscriptionGoneError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

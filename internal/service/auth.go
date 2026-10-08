@@ -172,6 +172,11 @@ type SubscriptionInfo struct {
 	HasAccess      bool       `json:"has_access"`
 	ExpiresAt      *time.Time `json:"expires_at"`
 	IsAcceptingNew bool       `json:"is_accepting_new"`
+	// Channel / AutoRenew mirror the subscription row (M1): paddle/paypal/
+	// wechat_pay, NULL (omitted) for non-channel subs; auto_renew is true
+	// only while the channel bills the buyer automatically. Purely additive.
+	Channel   *string `json:"channel,omitempty"`
+	AutoRenew bool    `json:"auto_renew"`
 }
 
 // LoginWithProfile is the Login flow that accepts a pre-fetched
@@ -588,7 +593,7 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 	// a subscription that expires between the two reads would yield
 	// hasAccess=true with scope=[] — a quietly broken token.
 	now := time.Now()
-	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuanceWithPlan(ctx, user.ID, appID, requestedPlan, now)
+	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, channel, autoRenew, err := s.resolvePlanForTokenIssuanceWithPlan(ctx, user.ID, appID, requestedPlan, now)
 	if err != nil {
 		return nil, err
 	}
@@ -641,6 +646,8 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 			HasAccess:      hasAccess,
 			ExpiresAt:      expiresAt,
 			IsAcceptingNew: chosenPlan != nil && chosenPlan.IsActive && chosenPlan.AcceptingNewSubscriptions,
+			Channel:        channel,
+			AutoRenew:      autoRenew,
 		},
 	}, nil
 }
@@ -655,7 +662,7 @@ func (s *AuthService) issueTokensForUserWithPlan(ctx context.Context, user *mode
 // threaded explicitly (a subscription expiring between hasAccess
 // evaluation and scope computation would otherwise produce a quietly
 // inconsistent response).
-func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, appID string, now time.Time) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
+func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, appID string, now time.Time) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, channel *string, autoRenew bool, err error) {
 	return s.resolvePlanForTokenIssuanceWithPlan(ctx, userID, appID, nil, now)
 }
 
@@ -672,10 +679,10 @@ func (s *AuthService) resolvePlanForTokenIssuance(ctx context.Context, userID, a
 // (and a security smell: the response says "you have access" but the
 // token can't reach any app). Callers should always pass the time they
 // want the policy evaluated against.
-func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, userID, appID string, requestedPlan *model.Plan, now time.Time) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, err error) {
+func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, userID, appID string, requestedPlan *model.Plan, now time.Time) (chosenPlan *model.Plan, surfacePlanID, surfacePlanName string, hasAccess bool, expiresAt *time.Time, channel *string, autoRenew bool, err error) {
 	sub, expired, err := s.peekSubscription(ctx, userID, now)
 	if err != nil {
-		return nil, "", "", false, nil, err
+		return nil, "", "", false, nil, nil, false, err
 	}
 	// Compute expired against the SAME `now` we pass to
 	// scopeForTokenIssuance so the two decisions can't disagree.
@@ -683,10 +690,10 @@ func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, u
 
 	if sub == nil {
 		if requestedPlan == nil {
-			return nil, "", "", false, nil, nil
+			return nil, "", "", false, nil, nil, false, nil
 		}
 		hasAccess = requestedPlan.IsActive && slices.Contains(requestedPlan.Apps, appID)
-		return requestedPlan, requestedPlan.ID, requestedPlan.Name, hasAccess, nil, nil
+		return requestedPlan, requestedPlan.ID, requestedPlan.Name, hasAccess, nil, nil, false, nil
 	}
 
 	plan, err := s.planRepo.FindByID(ctx, sub.PlanID)
@@ -696,9 +703,9 @@ func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, u
 			// temporarily unavailable. The placeholder carries only the
 			// subscription id; scopeForTokenIssuance fails closed because
 			// the placeholder is not active.
-			return &model.Plan{ID: sub.PlanID}, sub.PlanID, "", false, sub.ExpiresAt, nil
+			return &model.Plan{ID: sub.PlanID}, sub.PlanID, "", false, sub.ExpiresAt, sub.Channel, sub.AutoRenew, nil
 		}
-		return nil, "", "", false, nil, fmt.Errorf("get plan: %w", err)
+		return nil, "", "", false, nil, nil, false, fmt.Errorf("get plan: %w", err)
 	}
 	// expired is already computed against `now` (see peekSubscription
 	// call site above), so the two branches agree on whether the
@@ -707,11 +714,11 @@ func (s *AuthService) resolvePlanForTokenIssuanceWithPlan(ctx context.Context, u
 	// inconsistent hasAccess=true / scope=[] result the D9 fix guards
 	// against.
 	if expired {
-		return plan, plan.ID, plan.Name, false, sub.ExpiresAt, nil
+		return plan, plan.ID, plan.Name, false, sub.ExpiresAt, sub.Channel, sub.AutoRenew, nil
 	}
 
 	hasAccess = plan.IsActive && slices.Contains(plan.Apps, appID)
-	return plan, plan.ID, plan.Name, hasAccess, sub.ExpiresAt, nil
+	return plan, plan.ID, plan.Name, hasAccess, sub.ExpiresAt, sub.Channel, sub.AutoRenew, nil
 }
 
 // scopeForTokenIssuance returns the currently authorized plan apps. Expired
@@ -865,7 +872,7 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 	// app). See resolvePlanForTokenIssuanceWithPlan for the full
 	// rationale.
 	now := time.Now()
-	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, err := s.resolvePlanForTokenIssuance(ctx, user.ID, appID, now)
+	chosenPlan, surfacePlanID, surfacePlanName, hasAccess, expiresAt, channel, autoRenew, err := s.resolvePlanForTokenIssuance(ctx, user.ID, appID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -975,6 +982,8 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, appID stri
 			HasAccess:      hasAccess,
 			ExpiresAt:      expiresAt,
 			IsAcceptingNew: chosenPlan != nil && chosenPlan.IsActive && chosenPlan.AcceptingNewSubscriptions,
+			Channel:        channel,
+			AutoRenew:      autoRenew,
 		},
 	}, nil
 }

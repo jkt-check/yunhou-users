@@ -1603,7 +1603,7 @@ func (s *PaymentService) Confirm(ctx context.Context, in ConfirmInput) (*Confirm
 		// FK would reject the INSERT/UPDATE), so skip activation; the order
 		// still goes paid below and ops follows up from the audit log.
 		if !downgradeBlocked && !activationConflict && !planMissing {
-			activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry)
+			activated, err = activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry, in.Channel)
 			if err != nil {
 				return nil, fmt.Errorf("activate sub: %w", err)
 			}
@@ -1934,6 +1934,22 @@ type WebhookEvent struct {
 	// refund/entitlement machinery (M3 review — entitlement handling on
 	// chargebacks is deliberately deferred).
 	AdjustmentAction string
+	// ScheduledChangeAction is Paddle's data.scheduled_change.action, only
+	// populated for subscription.* events. "cancel" means the buyer's cancel
+	// is scheduled at period end: the local row flips auto_renew=false while
+	// status/expires_at stay untouched (the status flip belongs to
+	// subscription.canceled).
+	ScheduledChangeAction string
+	// OccurredAt is the channel's event timestamp (Paddle envelope
+	// occurred_at), used to detect stale deliveries: a subscription.updated
+	// that predates the local row's updated_at must not regress plan_id.
+	// nil when absent/malformed — treated as fresh (can't prove stale).
+	OccurredAt *time.Time
+	// PriceIDs carries the subscription items' price ids
+	// (data.items[].price.id), only populated for subscription.updated —
+	// the service reverse-maps them through PADDLE_PRICES to a local
+	// plan_id as a reconciliation fallback.
+	PriceIDs []string
 	// SkipAmountCheck exempts PayPal lifecycle events
 	// (BILLING.SUBSCRIPTION.ACTIVATED etc.) from the amount/currency
 	// validation in onPaymentSucceeded: PayPal omits resource.amount from
@@ -2046,6 +2062,11 @@ func (s *PaymentService) OnWebhook(ctx context.Context, e WebhookEvent) (*OnWebh
 	case branchSubscriptionCancelled:
 		domainAction = branch.domainAction()
 		if err := s.onPaddleSubscriptionCancelled(ctx, e); err != nil {
+			return nil, err
+		}
+	case branchSubscriptionUpdated:
+		domainAction = branch.domainAction()
+		if err := s.onPaddleSubscriptionUpdated(ctx, e); err != nil {
 			return nil, err
 		}
 	case branchChargebackUnhandled:
@@ -2381,7 +2402,7 @@ func (s *PaymentService) onPaymentSucceeded(ctx context.Context, e WebhookEvent)
 			return fmt.Errorf("resolve sub expiry: %w", rerr)
 		}
 		if !downgradeBlocked && !activationConflict && !planMissing {
-			if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry); err != nil {
+			if _, err := activateSubscriptionOnTx(ctx, tx, order.UserID, order.PlanID, orderProduct, subExpiry, e.Channel); err != nil {
 				return fmt.Errorf("activate sub: %w", err)
 			}
 			// 同事务 outbox（Task 10）：权益同步消息随支付状态翻转同一事务
@@ -3440,7 +3461,16 @@ func insertPaymentOnTx(ctx context.Context, tx dbTx, p *model.Payment) (string, 
 // this call; false if they already had one or we reactivated an existing
 // row). The product scope means a payment for product A never mutates the
 // user's product-B subscription row.
-func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID, productCode string, expiresAt *time.Time) (bool, error) {
+//
+// channel is the settling payment's channel; it is stamped on the row
+// together with auto_renew (true only for channels that bill the buyer
+// automatically — see channelAutoRenews). A re-purchase after a cancel
+// therefore re-arms auto_renew for paddle/paypal, while a WeChat
+// (manual-renewal) payment records its channel with auto_renew=false. The
+// renewal webhook path (onRenewalSucceeded) does NOT go through here, so a
+// renewal can never clobber a post-cancel auto_renew=false.
+func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID, productCode string, expiresAt *time.Time, channel string) (bool, error) {
+	autoRenew := channelAutoRenews(channel)
 	// Step 1: UPDATE the target row within this product (active first, else
 	// most recent). The 027 trigger validates plan↔product consistency on
 	// the plan_id write; a mismatch aborts the whole activation tx.
@@ -3449,14 +3479,16 @@ func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID, prod
 			plan_id = $1,
 			started_at = COALESCE(started_at, now()),
 			expires_at = $2,
-			status = 'active'
+			status = 'active',
+			channel = $5,
+			auto_renew = $6
 		WHERE id = (
 			SELECT id FROM subscriptions
 			WHERE user_id = $3 AND product_code = $4
 			ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, created_at DESC
 			LIMIT 1
 		)
-	`, planID, expiresAt, userID, productCode)
+	`, planID, expiresAt, userID, productCode, channel, autoRenew)
 	if err != nil {
 		return false, fmt.Errorf("update subscription: %w", err)
 	}
@@ -3470,9 +3502,9 @@ func activateSubscriptionOnTx(ctx context.Context, tx dbTx, userID, planID, prod
 		// unique index idx_subscriptions_user_product_active rejects a
 		// concurrent duplicate activation for the same (user, product).
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at, product_code)
-			VALUES ($1, $2, $3, 'active', now(), $4, $5)
-		`, GenerateUUID(), userID, planID, expiresAt, productCode)
+			INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at, product_code, channel, auto_renew)
+			VALUES ($1, $2, $3, 'active', now(), $4, $5, $6, $7)
+		`, GenerateUUID(), userID, planID, expiresAt, productCode, channel, autoRenew)
 		if err != nil {
 			return false, fmt.Errorf("insert subscription: %w", err)
 		}
@@ -3782,6 +3814,10 @@ const (
 	branchDisputeClosed
 	branchRenewal
 	branchSubscriptionCancelled
+	// branchSubscriptionUpdated: paddle subscription.updated — scheduled
+	// cancel flip (auto_renew=false) + plan re-sync from items' price ids
+	// (M3). Both idempotent; unknown subscription → audit-only ack.
+	branchSubscriptionUpdated
 	// branchChargebackUnhandled: an approved paddle chargeback /
 	// chargeback_reverse adjustment. Money moved channel-side via a
 	// dispute; we record an alertable audit marker and ack — entitlement
@@ -3806,6 +3842,8 @@ func (b webhookBranch) domainAction() string {
 		return "payment_dispute_closed"
 	case branchSubscriptionCancelled:
 		return "subscription_cancelled"
+	case branchSubscriptionUpdated:
+		return "subscription_updated"
 	default:
 		return "none"
 	}
@@ -3907,6 +3945,11 @@ var channelWebhookBranches = map[string]map[string]webhookBranch{
 		// revokes here (CancelChannelSubscription deliberately leaves the
 		// local row active until this arrives).
 		"subscription.canceled": branchSubscriptionCancelled,
+		// subscription.updated (M3): carries the scheduled_change
+		// (self-serve cancel scheduled at period end → auto_renew flip)
+		// and the current items (plan re-sync as reconciliation fallback).
+		// past_due / created / activated / trialing stay audit-only.
+		"subscription.updated": branchSubscriptionUpdated,
 	},
 }
 

@@ -32,10 +32,18 @@ var ErrSamePlanChange = errors.New("subscription is already on this plan")
 
 // paddleManagedSubID returns the Paddle-side subscription id for a locally
 // active subscription whose lifecycle is managed channel-side by Paddle.
-// Paddle Billing ids carry the sub_ prefix (PayPal legacy ids are I-...,
-// WeChat/local subs have no external id).
+// M1+ rows key on the channel column ('paddle'); the `sub_` prefix check
+// remains as a fallback for pre-M1 rows whose channel is still NULL
+// (PayPal legacy ids are I-..., WeChat/local subs have no external id).
 func paddleManagedSubID(sub *model.Subscription) (string, error) {
-	if sub.ExternalSubscriptionID == nil || !strings.HasPrefix(*sub.ExternalSubscriptionID, "sub_") {
+	if sub.ExternalSubscriptionID == nil {
+		return "", ErrSubscriptionNotChannelManaged
+	}
+	if sub.Channel != nil {
+		if *sub.Channel != "paddle" {
+			return "", ErrSubscriptionNotChannelManaged
+		}
+	} else if !strings.HasPrefix(*sub.ExternalSubscriptionID, "sub_") {
 		return "", ErrSubscriptionNotChannelManaged
 	}
 	return *sub.ExternalSubscriptionID, nil
@@ -63,6 +71,18 @@ func (s *PaymentService) CancelChannelSubscription(ctx context.Context, userID s
 	extID, _ := paddleManagedSubID(sub) // guaranteed by activePaddleSub
 	if err := s.paddle.CancelSubscription(ctx, extID); err != nil {
 		return nil, fmt.Errorf("paddle cancel subscription: %w", err)
+	}
+	// Contract 2.1 step 5: the cancel is scheduled channel-side — record
+	// locally that no further auto-renewal will happen. status/expires_at
+	// stay untouched (access continues to period end; the
+	// subscription.canceled webhook flips status).
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE subscriptions SET auto_renew = false, updated_at = now() WHERE id = $1
+	`, sub.ID); err != nil {
+		// The channel-side cancel already succeeded; a failed local flip
+		// must not surface as a failure (the user would retry and Paddle
+		// would 4xx the double-cancel). Log and continue.
+		log.Printf("paddle cancel: auto_renew flip failed for subscription %s: %v", sub.ID, err)
 	}
 	if err := s.writeAudit(ctx, "user:"+userID, "paddle_subscription_cancel_requested",
 		fmt.Sprintf("subscription:%s", sub.ID),
@@ -282,9 +302,11 @@ func (s *PaymentService) activePaddleSub(ctx context.Context, userID string) (*m
 // onPaddleSubscriptionCancelled handles Paddle's subscription.canceled
 // webhook: the cancellation has TAKEN EFFECT channel-side (period end for
 // a user self-cancel via CancelChannelSubscription, or immediate for an
-// ops dashboard cancel). Flip the local subscription and revoke the
-// entitlement in one transaction. Idempotent: an already-cancelled local
-// row is a no-op (webhook redelivery).
+// ops dashboard cancel). Flip the local subscription (status='cancelled',
+// auto_renew=false — M3) and revoke the entitlement in one transaction.
+// Idempotent: an already-cancelled local row only heals a stale
+// auto_renew=true (pre-M2 rows); a fully-flipped row is a no-op (webhook
+// redelivery).
 func (s *PaymentService) onPaddleSubscriptionCancelled(ctx context.Context, e WebhookEvent) error {
 	if e.ExternalSubscriptionID == "" {
 		return s.writeAudit(ctx, "service", "paddle_cancel_missing_external_sub_id",
@@ -318,11 +340,18 @@ func (s *PaymentService) onPaddleSubscriptionCancelled(ctx context.Context, e We
 		return fmt.Errorf("find subscription by external sub id: %w", err)
 	}
 	if sub.Status == "cancelled" {
-		// Webhook redelivery after we already flipped — no-op.
-		return nil
+		// Webhook redelivery after we already flipped — heal a stale
+		// auto_renew=true (pre-M2 rows) idempotently, otherwise no-op.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE subscriptions SET auto_renew = false, updated_at = now()
+			WHERE id = $1 AND auto_renew = true
+		`, sub.ID); err != nil {
+			return fmt.Errorf("heal auto_renew on cancelled subscription: %w", err)
+		}
+		return tx.Commit()
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE subscriptions SET status = 'cancelled', updated_at = now()
+		UPDATE subscriptions SET status = 'cancelled', auto_renew = false, updated_at = now()
 		WHERE id = $1 AND status <> 'cancelled'
 	`, sub.ID); err != nil {
 		return fmt.Errorf("cancel subscription: %w", err)
@@ -369,4 +398,154 @@ func (s *PaymentService) onPaddleChargebackUnhandled(ctx context.Context, e Webh
 			"amount":            e.Amount,
 			"currency":          e.Currency,
 		})
+}
+
+// planIDForSubscriptionPrices reverse-maps Paddle price ids (from a
+// subscription.updated payload's items) through the operator's
+// PADDLE_PRICES map to a local plan_id. Returns "" when no price matches
+// or the mapping is ambiguous (two plans sharing a price) — callers skip
+// the plan sync in both cases but never error.
+func planIDForSubscriptionPrices(prices map[string]string, priceIDs []string) string {
+	if len(priceIDs) == 0 {
+		return ""
+	}
+	want := make(map[string]bool, len(priceIDs))
+	for _, id := range priceIDs {
+		want[id] = true
+	}
+	match := ""
+	for planID, priceID := range prices {
+		if !want[priceID] {
+			continue
+		}
+		if match != "" && match != planID {
+			return "" // ambiguous
+		}
+		match = planID
+	}
+	return match
+}
+
+// onPaddleSubscriptionUpdated handles Paddle's subscription.updated webhook
+// (M3), two idempotent reconciliations:
+//
+//	(a) scheduled_change.action == "cancel" — the buyer's self-serve cancel
+//	    is scheduled at period end: flip auto_renew=false locally. status
+//	    and expires_at are NOT touched (access continues to period end; the
+//	    status flip belongs to subscription.canceled).
+//	(b) items changed (our change-plan, or any Paddle-side change) — sync
+//	    local plan_id (+ expires_at from the billing-period hint) when the
+//	    items' price ids reverse-map unambiguously through PADDLE_PRICES.
+//	    Unknown/ambiguous prices skip the plan sync without failing; the
+//	    scheduled-cancel flip in the same event still applies.
+//
+// Unknown subscription → audit-only ack (a Paddle sub we never stamped,
+// e.g. dashboard-created).
+func (s *PaymentService) onPaddleSubscriptionUpdated(ctx context.Context, e WebhookEvent) error {
+	if e.ExternalSubscriptionID == "" {
+		return s.writeAudit(ctx, "service", "paddle_updated_missing_external_sub_id",
+			fmt.Sprintf("event:%s", e.EventID),
+			[]string{"webhook", "paddle", "subscription_updated", "missing_field"},
+			map[string]any{"event_id": e.EventID})
+	}
+
+	tx, err := s.dbBeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin subscription-updated tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var sub model.Subscription
+	err = tx.GetContext(ctx, &sub,
+		`SELECT * FROM subscriptions WHERE external_subscription_id = $1 LIMIT 1 FOR UPDATE`,
+		e.ExternalSubscriptionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return auditAndCommit(ctx, tx, "service", "paddle_updated_unknown_subscription",
+				fmt.Sprintf("event:%s", e.EventID),
+				[]string{"webhook", "paddle", "subscription_updated", "unknown_sub"},
+				map[string]any{
+					"event_id":                 e.EventID,
+					"external_subscription_id": e.ExternalSubscriptionID,
+				})
+		}
+		return fmt.Errorf("find subscription by external sub id: %w", err)
+	}
+
+	auditCtx := map[string]any{
+		"event_id":                 e.EventID,
+		"subscription_id":          sub.ID,
+		"external_subscription_id": e.ExternalSubscriptionID,
+		"user_id":                  sub.UserID,
+	}
+
+	// (a) Scheduled-cancel flip.
+	if e.ScheduledChangeAction == "cancel" && sub.AutoRenew {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE subscriptions SET auto_renew = false, updated_at = now()
+			WHERE id = $1 AND auto_renew = true
+		`, sub.ID); err != nil {
+			return fmt.Errorf("flip auto_renew for scheduled cancel: %w", err)
+		}
+		auditCtx["auto_renew_flipped"] = true
+	}
+
+	// (b) Plan re-sync. Only meaningful while the sub is live; a stale
+	// update racing a cancel/expiry must not resurrect plan data onto an
+	// ended row. Recency guard: an event whose occurred_at predates the
+	// row's updated_at is a delayed PRE-change delivery — flipping plan_id
+	// from it would regress the row (e.g. back to monthly after a
+	// change-plan), so only the regression-safe expires_at GREATEST
+	// extension applies (nil occurred_at = "can't prove stale" = fresh).
+	// expires_at itself is monotonic via GREATEST, mirroring the renewal
+	// path's out-of-order guard.
+	//
+	// Cross-clock assumption: occurred_at is Paddle's clock, updated_at is
+	// our DB's — multi-second skew can misclassify events at the margins.
+	// The failure direction is conservative: a marginal fresh event may be
+	// skipped as "stale" (plan stays, skip is audited), but a stale event
+	// can never regress plan_id.
+	if sub.Status == "active" {
+		stale := e.OccurredAt != nil && e.OccurredAt.Before(sub.UpdatedAt)
+		planID := planIDForSubscriptionPrices(s.paddlePrices, e.PriceIDs)
+		switch {
+		case planID != "" && planID != sub.PlanID && !stale:
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE subscriptions
+				SET plan_id = $1,
+				    expires_at = GREATEST(COALESCE($2, expires_at), expires_at),
+				    updated_at = now()
+				WHERE id = $3 AND status = 'active'
+			`, planID, e.SubExpiresAt, sub.ID); err != nil {
+				return fmt.Errorf("sync plan from subscription.updated: %w", err)
+			}
+			auditCtx["plan_synced_from"] = sub.PlanID
+			auditCtx["plan_synced_to"] = planID
+		case planID != "" && planID != sub.PlanID && stale:
+			// Stale: skip the plan flip, keep only the monotonic expiry.
+			if e.SubExpiresAt != nil {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE subscriptions
+					SET expires_at = GREATEST($1, expires_at), updated_at = now()
+					WHERE id = $2 AND status = 'active'
+				`, *e.SubExpiresAt, sub.ID); err != nil {
+					return fmt.Errorf("extend expiry from stale subscription.updated: %w", err)
+				}
+			}
+			auditCtx["plan_sync_skipped_stale"] = planID
+		case planID == "" && len(e.PriceIDs) > 0:
+			// Unknown or ambiguous price mapping — skip loudly (ops can
+			// fix PADDLE_PRICES), never fail the event.
+			log.Printf("paddle subscription.updated: no unambiguous plan for prices %v (event %s)", e.PriceIDs, e.EventID)
+			auditCtx["plan_sync_skipped"] = e.PriceIDs
+		}
+	}
+
+	if err := writeAuditOnTx(ctx, tx, "service", "paddle_subscription_updated",
+		fmt.Sprintf("subscription:%s", sub.ID),
+		[]string{"webhook", "paddle", "subscription", "updated"},
+		auditCtx); err != nil {
+		return fmt.Errorf("write subscription-updated audit: %w", err)
+	}
+	return tx.Commit()
 }

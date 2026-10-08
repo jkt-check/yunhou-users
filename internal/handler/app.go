@@ -790,7 +790,7 @@ func (h *SubscriptionHandler) ListUserSubscriptions(c *gin.Context) {
 	// explicit multi-product view reserved for future consoles.
 	product := c.Query("product")
 	var (
-		subs []model.Subscription
+		subs []service.SubscriptionView
 		err  error
 	)
 	if product == "" {
@@ -884,6 +884,11 @@ func (h *SubscriptionHandler) CancelSubscription(c *gin.Context) {
 			return
 		case errors.Is(err, service.ErrAlreadyCancelled):
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "already cancelled"})
+			return
+		case errors.Is(err, service.ErrSubscriptionAutoRenewActive):
+			// M2: the channel would keep billing after a local-only flip —
+			// send the caller to the channel-aware cancel endpoint.
+			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": service.ErrSubscriptionAutoRenewActive.Error()})
 			return
 		default:
 			log.Printf("cancel subscription error: %v", err)

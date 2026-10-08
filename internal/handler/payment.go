@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/service"
 )
 
@@ -171,6 +172,134 @@ func (h *PaymentHandler) UpgradeChannelSubscription(c *gin.Context) {
 		"to_plan_id":      res.ToPlanID,
 		"next_billed_at":  res.NextBilledAt,
 	}})
+}
+
+// CancelSubscriptionByID — POST /user/subscriptions/:id/cancel
+//
+// M2 contract: cancels the subscription's channel auto-renew (Paddle only
+// this milestone) with effective_from=next_billing_period — the buyer keeps
+// access until the paid period ends. Local status/expires_at stay
+// untouched; only auto_renew flips to false.
+func (h *PaymentHandler) CancelSubscriptionByID(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+	// The body is optional; omitted/empty effective_from defaults to
+	// next_billing_period, and any other value is a 400.
+	var req struct {
+		EffectiveFrom string `json:"effective_from"`
+	}
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+			return
+		}
+	}
+	switch req.EffectiveFrom {
+	case "", "next_billing_period":
+		req.EffectiveFrom = "next_billing_period"
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	sub, err := h.svc.CancelSubscriptionByID(c.Request.Context(), userID, c.Param("id"), req.EffectiveFrom)
+	if err != nil {
+		writeSubSelfServiceError(c, err, "cancel")
+		return
+	}
+	writeSubSelfServiceOK(c, sub)
+}
+
+// ChangeSubscriptionPlanByID — POST /user/subscriptions/:id/change-plan
+//
+// M2 contract: moves the subscription to a longer-cycle plan via Paddle
+// subscription update with proration (charged the difference immediately).
+// Upgrades only; downgrades stay manual (cancel + re-purchase).
+func (h *PaymentHandler) ChangeSubscriptionPlanByID(c *gin.Context) {
+	userID := c.GetString(middleware.ContextUserID)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "missing auth"})
+		return
+	}
+	var req struct {
+		PlanID string `json:"plan_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid request body"})
+		return
+	}
+
+	sub, err := h.svc.ChangePlanByID(c.Request.Context(), userID, c.Param("id"), req.PlanID)
+	if err != nil {
+		writeSubSelfServiceError(c, err, "change")
+		return
+	}
+	writeSubSelfServiceOK(c, sub)
+}
+
+// writeSubSelfServiceOK emits the contract's shared subscription object
+// shape for both self-management endpoints.
+func writeSubSelfServiceOK(c *gin.Context, sub *model.Subscription) {
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
+		"id":         sub.ID,
+		"plan_id":    sub.PlanID,
+		"status":     sub.Status,
+		"auto_renew": sub.AutoRenew,
+		"expires_at": sub.ExpiresAt,
+	}})
+}
+
+// writeSubSelfServiceError maps the M2 contract's error rows. action is
+// "cancel" or "change" — the no-auto-renew 409 message is endpoint-specific.
+func writeSubSelfServiceError(c *gin.Context, err error, action string) {
+	switch {
+	case errors.Is(err, service.ErrSubscriptionNotFound):
+		// Same response whether the subscription belongs to someone else or
+		// doesn't exist, so callers can't enumerate subscription IDs.
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "subscription not found"})
+	case errors.Is(err, service.ErrSubscriptionAlreadyEnded):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "subscription already ended"})
+	case errors.Is(err, service.ErrSubscriptionNoAutoRenew):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "subscription has no auto-renew to " + action})
+	case errors.Is(err, service.ErrSubscriptionNotChannelManaged):
+		// PayPal-managed sub: the symmetric endpoint is P1 (no frontend
+		// entry); same 409 semantics as the legacy channel routes.
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "active subscription is not managed by an auto-renewing channel"})
+	case errors.Is(err, service.ErrSamePlanChange):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "already on plan"})
+	case errors.Is(err, service.ErrPlanDowngradeNotSupported):
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan downgrade not supported"})
+	case errors.Is(err, service.ErrPlanChangeNotUpgrade):
+		// Cross-product plan change (M1 guard): 409, same class as the
+		// legacy channel-upgrade route.
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan change is not an upgrade"})
+	case errors.Is(err, service.ErrPlanNotAcceptingNew):
+		// Retired target plan (M1 guard): 409, same message as the
+		// CreateOrder / plan-catalog surfaces.
+		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": "plan is not accepting new subscriptions"})
+	case errors.Is(err, service.ErrPlanNotFound):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan not found"})
+	case errors.Is(err, service.ErrPlanInactive):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "plan is inactive"})
+	case errors.Is(err, service.ErrPaddlePriceNotConfigured):
+		// Config gap (PADDLE_PRICES_JSON missing the plan), not a user
+		// error — log server-side, surface the provider-unavailable 502.
+		log.Printf("change-plan blocked: paddle price not configured: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "payment provider unavailable"})
+	case errors.Is(err, service.ErrChannelUnavailable):
+		// Log the wrapped upstream error (the client only gets the generic
+		// message — provider detail stays server-side for ops).
+		log.Printf("subscription self-service: channel call failed: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"code": 502, "message": "payment provider unavailable"})
+	case errors.Is(err, service.ErrPaddleNotConfigured):
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "paddle not configured on this deployment"})
+	default:
+		log.Printf("subscription self-service error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
+	}
 }
 
 // ConfirmOrder — POST /payments/orders/:order_id/confirm

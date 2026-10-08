@@ -66,6 +66,12 @@ func (m *mockWebhookSvc) CancelChannelSubscription(_ context.Context, _ string) 
 func (m *mockWebhookSvc) UpgradeChannelSubscription(_ context.Context, _, _ string) (*service.ChannelUpgradeResult, error) {
 	return nil, nil
 }
+func (m *mockWebhookSvc) CancelSubscriptionByID(_ context.Context, _, _, _ string) (*model.Subscription, error) {
+	return nil, nil
+}
+func (m *mockWebhookSvc) ChangePlanByID(_ context.Context, _, _, _ string) (*model.Subscription, error) {
+	return nil, nil
+}
 
 func webhookTestEngine(svc service.PaymentServiceInterface) *gin.Engine {
 	gin.SetMode(gin.TestMode)
@@ -1384,5 +1390,132 @@ func TestParseEvent_RoutesPaddle(t *testing.T) {
 	}
 	if we.Channel != "paddle" || we.TransactionID != "txn_1" {
 		t.Fatalf("bad route: %+v", we)
+	}
+}
+
+// M3: subscription.updated payloads must lift scheduled_change.action (the
+// scheduled-cancel signal), the items' price ids (plan re-sync), and
+// current_billing_period.ends_at (preferred over next_billed_at).
+func TestParsePaddle_SubscriptionUpdated_ScheduledCancelAndItems(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_upd_1",
+	  "event_type": "subscription.updated",
+	  "data": {
+	    "id": "sub_upd_1",
+	    "status": "active",
+	    "next_billed_at": "2026-11-01T00:00:00Z",
+	    "scheduled_change": {"action": "cancel", "effective_at": "2026-11-01T00:00:00Z"},
+	    "items": [{"price": {"id": "pri_monthly_1"}}, {"price": {"id": "pri_addon_1"}}],
+	    "current_billing_period": {"starts_at": "2026-10-01T00:00:00Z", "ends_at": "2026-10-31T00:00:00Z"}
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.ExternalSubscriptionID != "sub_upd_1" {
+		t.Fatalf("bad sub id: %+v", we)
+	}
+	if we.ScheduledChangeAction != "cancel" {
+		t.Errorf("ScheduledChangeAction = %q, want cancel", we.ScheduledChangeAction)
+	}
+	if len(we.PriceIDs) != 2 || we.PriceIDs[0] != "pri_monthly_1" || we.PriceIDs[1] != "pri_addon_1" {
+		t.Errorf("PriceIDs = %v", we.PriceIDs)
+	}
+	// current_billing_period.ends_at wins over next_billed_at.
+	if we.SubExpiresAt == nil || we.SubExpiresAt.Format(time.RFC3339) != "2026-10-31T00:00:00Z" {
+		t.Errorf("SubExpiresAt = %v, want period end 2026-10-31", we.SubExpiresAt)
+	}
+}
+
+func TestParsePaddle_SubscriptionUpdated_NoScheduledChange(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_upd_2",
+	  "event_type": "subscription.updated",
+	  "data": {
+	    "id": "sub_upd_2",
+	    "status": "active",
+	    "next_billed_at": "2026-11-01T00:00:00Z",
+	    "scheduled_change": null,
+	    "items": [{"price": {"id": "pri_yearly_1"}}]
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.ScheduledChangeAction != "" {
+		t.Errorf("ScheduledChangeAction = %q, want empty (no false positive)", we.ScheduledChangeAction)
+	}
+	if len(we.PriceIDs) != 1 || we.PriceIDs[0] != "pri_yearly_1" {
+		t.Errorf("PriceIDs = %v", we.PriceIDs)
+	}
+	// No current_billing_period → next_billed_at fallback.
+	if we.SubExpiresAt == nil || we.SubExpiresAt.Format(time.RFC3339) != "2026-11-01T00:00:00Z" {
+		t.Errorf("SubExpiresAt = %v, want next_billed_at fallback", we.SubExpiresAt)
+	}
+}
+
+// A malformed scheduled_change (string where Paddle would send an object)
+// must NOT hard-error the event — unlike data.id, it is not a dedupe key.
+func TestParsePaddle_SubscriptionUpdated_MalformedScheduledChange(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_upd_3",
+	  "event_type": "subscription.updated",
+	  "data": {
+	    "id": "sub_upd_3",
+	    "status": "active",
+	    "scheduled_change": "oops"
+	  }
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatalf("malformed scheduled_change must be lenient: %v", err)
+	}
+	if we.ExternalSubscriptionID != "sub_upd_3" {
+		t.Fatalf("sub id must still be lifted: %+v", we)
+	}
+	if we.ScheduledChangeAction != "" {
+		t.Errorf("ScheduledChangeAction = %q, want empty on malformed block", we.ScheduledChangeAction)
+	}
+}
+
+// M3 review: the envelope's occurred_at must be lifted so the service can
+// detect stale deliveries (out-of-order subscription.updated).
+func TestParsePaddle_OccurredAt(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_occ_1",
+	  "event_type": "subscription.updated",
+	  "occurred_at": "2026-10-01T12:34:56Z",
+	  "data": {"id": "sub_occ_1", "status": "active"}
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if we.OccurredAt == nil || we.OccurredAt.Format(time.RFC3339) != "2026-10-01T12:34:56Z" {
+		t.Errorf("OccurredAt = %v, want 2026-10-01T12:34:56Z", we.OccurredAt)
+	}
+}
+
+// Malformed occurred_at must be lenient (log + nil), never a hard error.
+func TestParsePaddle_OccurredAt_Malformed(t *testing.T) {
+	h := &WebhookHandler{}
+	raw := []byte(`{
+	  "event_id": "evt_occ_2",
+	  "event_type": "subscription.updated",
+	  "occurred_at": "not-a-timestamp",
+	  "data": {"id": "sub_occ_2", "status": "active"}
+	}`)
+	we, err := h.parsePaddle(raw)
+	if err != nil {
+		t.Fatalf("malformed occurred_at must be lenient: %v", err)
+	}
+	if we.OccurredAt != nil {
+		t.Errorf("OccurredAt = %v, want nil on malformed", we.OccurredAt)
 	}
 }

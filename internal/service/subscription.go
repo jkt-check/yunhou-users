@@ -187,6 +187,11 @@ func (s *SubscriptionService) cancelWithBenefitSync(ctx context.Context, id, use
 	if sub.Status == "cancelled" {
 		return ErrAlreadyCancelled
 	}
+	if sub.AutoRenew {
+		// M2 guard: a local-only flip would leave the channel billing the
+		// user — channel auto-renew must be cancelled channel-side first.
+		return ErrSubscriptionAutoRenewActive
+	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE subscriptions SET status = 'cancelled', updated_at = now()
 		WHERE id = $1 AND status <> 'cancelled'
@@ -230,6 +235,11 @@ func (s *SubscriptionService) cancelLegacy(ctx context.Context, id, userID strin
 	}
 	if sub.Status == "cancelled" {
 		return ErrAlreadyCancelled
+	}
+	if sub.AutoRenew {
+		// M2 guard: see cancelWithBenefitSync — channel auto-renew must be
+		// cancelled channel-side first.
+		return ErrSubscriptionAutoRenewActive
 	}
 	// The repo's UpdateStatus is a plain UPDATE; without a
 	// `WHERE status <> 'cancelled'` guard, a concurrent Cancel racing a
@@ -275,10 +285,45 @@ func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID st
 	return sub, plan, nil
 }
 
+// SubscriptionView is the member-facing read DTO for GET /user/subscriptions
+// (M1): today's model fields PLUS channel/auto_renew, MINUS
+// external_subscription_id — the Paddle `sub_...` id never leaves the
+// server. model.Subscription itself keeps json:"-" on Channel/AutoRenew so
+// every other serialization path (admin, paddle cancel) is unchanged.
+type SubscriptionView struct {
+	ID          string     `json:"id"`
+	UserID      string     `json:"user_id"`
+	PlanID      string     `json:"plan_id"`
+	ProductCode string     `json:"product_code"`
+	Status      string     `json:"status"`
+	StartedAt   time.Time  `json:"started_at"`
+	ExpiresAt   *time.Time `json:"expires_at"`
+	Channel     *string    `json:"channel,omitempty"`
+	AutoRenew   bool       `json:"auto_renew"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+func subscriptionViewFromModel(s model.Subscription) SubscriptionView {
+	return SubscriptionView{
+		ID:          s.ID,
+		UserID:      s.UserID,
+		PlanID:      s.PlanID,
+		ProductCode: s.ProductCode,
+		Status:      s.Status,
+		StartedAt:   s.StartedAt,
+		ExpiresAt:   s.ExpiresAt,
+		Channel:     s.Channel,
+		AutoRenew:   s.AutoRenew,
+		CreatedAt:   s.CreatedAt,
+		UpdatedAt:   s.UpdatedAt,
+	}
+}
+
 // ListUserSubscriptions returns the user's KAYA-MEMBERSHIP subscriptions —
 // the legacy contract of GET /user/subscriptions when no product is named.
 // Use ListUserSubscriptionsByProduct for an explicit product scope.
-func (s *SubscriptionService) ListUserSubscriptions(ctx context.Context, userID string) ([]model.Subscription, error) {
+func (s *SubscriptionService) ListUserSubscriptions(ctx context.Context, userID string) ([]SubscriptionView, error) {
 	return s.ListUserSubscriptionsByProduct(ctx, userID, model.ProductKayaMembership)
 }
 
@@ -286,14 +331,27 @@ func (s *SubscriptionService) ListUserSubscriptions(ctx context.Context, userID 
 // statuses) for one product. The sentinel productCode "all" returns every
 // product's rows — reserved for future multi-product consoles; the legacy
 // list endpoint never passes it by default.
-func (s *SubscriptionService) ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error) {
-	if productCode == "all" {
-		return s.subRepo.ListByUserID(ctx, userID)
+func (s *SubscriptionService) ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]SubscriptionView, error) {
+	var (
+		subs []model.Subscription
+		err  error
+	)
+	switch {
+	case productCode == "all":
+		subs, err = s.subRepo.ListByUserID(ctx, userID)
+	case productCode == "":
+		subs, err = s.subRepo.ListByUserAndProduct(ctx, userID, model.ProductKayaMembership)
+	default:
+		subs, err = s.subRepo.ListByUserAndProduct(ctx, userID, productCode)
 	}
-	if productCode == "" {
-		productCode = model.ProductKayaMembership
+	if err != nil {
+		return nil, err
 	}
-	return s.subRepo.ListByUserAndProduct(ctx, userID, productCode)
+	views := make([]SubscriptionView, 0, len(subs))
+	for _, sub := range subs {
+		views = append(views, subscriptionViewFromModel(sub))
+	}
+	return views, nil
 }
 
 // isDuplicateKey reports whether err is a Postgres unique-constraint violation

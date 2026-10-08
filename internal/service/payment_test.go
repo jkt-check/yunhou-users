@@ -319,7 +319,7 @@ func TestDispatchBranch(t *testing.T) {
 		{"paddle", "transaction.payment_failed", branchNone},
 		{"paddle", "subscription.activated", branchNone},
 		{"paddle", "subscription.canceled", branchSubscriptionCancelled},
-		{"paddle", "subscription.updated", branchNone},
+		{"paddle", "subscription.updated", branchSubscriptionUpdated},
 		{"paddle", "subscription.past_due", branchNone},
 		{"paddle", "adjustment.created", branchNone},
 		// LemonSqueezy-era names — dead since the channel was dropped

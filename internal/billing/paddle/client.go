@@ -109,8 +109,9 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 	return &CheckoutTransaction{TransactionID: res.ID, CheckoutURL: *res.Checkout.URL}, nil
 }
 
-// CancelSubscription cancels the channel-side subscription with the
-// DEFAULT effective_from (next_billing_period): the buyer keeps access
+// CancelSubscription cancels the channel-side subscription with
+// effective_from=next_billing_period (sent explicitly, though the Paddle
+// API also defaults to it for active subscriptions): the buyer keeps access
 // until the paid period ends and is never charged again. Paddle applies
 // it as a scheduled_change and fires subscription.canceled when the
 // cancellation takes effect — the local status flip hangs off that
@@ -123,7 +124,10 @@ func (c *Client) CancelSubscription(ctx context.Context, subscriptionID string) 
 	if c.SDK == nil {
 		return errors.New("paddle client: SDK not wired")
 	}
-	if _, err := c.SDK.CancelSubscription(ctx, &paddle.CancelSubscriptionRequest{SubscriptionID: subscriptionID}); err != nil {
+	if _, err := c.SDK.CancelSubscription(ctx, &paddle.CancelSubscriptionRequest{
+		SubscriptionID: subscriptionID,
+		EffectiveFrom:  paddle.PtrTo(paddle.EffectiveFromNextBillingPeriod),
+	}); err != nil {
 		return fmt.Errorf("paddle cancel subscription: %w", err)
 	}
 	return nil
@@ -191,4 +195,17 @@ func (c *Client) GetSubscriptionNextBilledAt(ctx context.Context, subscriptionID
 		return nil, fmt.Errorf("paddle next_billed_at %q: %w", *res.NextBilledAt, err)
 	}
 	return &t, nil
+}
+
+// IsSubscriptionGoneError reports whether err is Paddle's "channel-side
+// billing relationship is already over" class: the subscription does not
+// exist (`not_found`, 404) or the requested action is invalid because the
+// subscription is already canceled (`subscription_is_canceled_action_invalid`).
+// Detection uses the SDK's typed sentinels (paddle-go-sdk v5:
+// *paddleerr.Error matches on Type+Code via errors.Is); the client's own
+// %w wrapping preserves the chain. Callers treat this class as a heal
+// signal (align local state), never as a retryable failure.
+func IsSubscriptionGoneError(err error) bool {
+	return errors.Is(err, paddle.ErrNotFound) ||
+		errors.Is(err, paddle.ErrSubscriptionIsCanceledActionInvalid)
 }

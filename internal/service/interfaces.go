@@ -29,11 +29,11 @@ type SubscriptionServiceInterface interface {
 	Renew(ctx context.Context, id string, expiresAt *time.Time) (*model.Subscription, error)
 	Cancel(ctx context.Context, id, userID string) error
 	GetUserSubscription(ctx context.Context, userID string) (*model.Subscription, *model.Plan, error)
-	ListUserSubscriptions(ctx context.Context, userID string) ([]model.Subscription, error)
+	ListUserSubscriptions(ctx context.Context, userID string) ([]SubscriptionView, error)
 	// ListUserSubscriptionsByProduct lists subscriptions for one product
 	// (productCode "all" returns every product). The legacy
 	// ListUserSubscriptions is fixed to kaya-membership.
-	ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]model.Subscription, error)
+	ListUserSubscriptionsByProduct(ctx context.Context, userID, productCode string) ([]SubscriptionView, error)
 }
 
 // PlanServiceInterface defines the interface for plan operations
@@ -67,4 +67,7 @@ type PaymentServiceInterface interface {
 	GetRefund(ctx context.Context, refundID, userID string) (*model.Refund, error)
 	CancelChannelSubscription(ctx context.Context, userID string) (*model.Subscription, error)
 	UpgradeChannelSubscription(ctx context.Context, userID, targetPlanID string) (*ChannelUpgradeResult, error)
+	// M2 contract endpoints (:id-scoped self-management).
+	CancelSubscriptionByID(ctx context.Context, userID, subID, effectiveFrom string) (*model.Subscription, error)
+	ChangePlanByID(ctx context.Context, userID, subID, planID string) (*model.Subscription, error)
 }

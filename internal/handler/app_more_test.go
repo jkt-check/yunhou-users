@@ -20,7 +20,7 @@ import (
 
 func TestSubscriptionHandler_ListUserSubscriptions_OK(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	svc := &mockSubSvc{subs: []model.Subscription{
+	svc := &mockSubSvc{subs: []service.SubscriptionView{
 		{ID: "s1", PlanID: "free", Status: "active"},
 		{ID: "s2", PlanID: "monthly", Status: "cancelled"},
 	}}

@@ -1703,3 +1703,68 @@ func TestSubscriptionRepo_ProductScope(t *testing.T) {
 		t.Errorf("ListByUserID = %d rows, want 3", len(all))
 	}
 }
+
+// TestSubscriptionRepo_ChannelAutoRenew pins the M1 contract: the
+// subscriptions.channel / auto_renew columns round-trip through Create and
+// every SELECT, and a row created without a channel reads back NULL/false
+// (free self-serve / trial shape).
+func TestSubscriptionRepo_ChannelAutoRenew(t *testing.T) {
+	db := setupDB(t)
+	u := NewUserRepo(db)
+	alice := &model.User{ID: newUUID(), Status: "active"}
+	_ = u.Create(context.Background(), alice)
+	r := NewSubscriptionRepo(db)
+
+	paddle := "paddle"
+	sub := &model.Subscription{
+		ID: newUUID(), UserID: alice.ID, PlanID: "monthly",
+		Status: "active", StartedAt: time.Now(),
+		Channel: &paddle, AutoRenew: true,
+	}
+	if err := r.Create(context.Background(), sub); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	t.Run("FindByID round-trips channel/auto_renew", func(t *testing.T) {
+		got, err := r.FindByID(context.Background(), sub.ID)
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if got.Channel == nil || *got.Channel != "paddle" {
+			t.Errorf("Channel = %v, want paddle", got.Channel)
+		}
+		if !got.AutoRenew {
+			t.Error("AutoRenew = false, want true")
+		}
+	})
+
+	t.Run("FindActiveByUserID populates channel/auto_renew", func(t *testing.T) {
+		got, err := r.FindActiveByUserID(context.Background(), alice.ID)
+		if err != nil {
+			t.Fatalf("FindActiveByUserID: %v", err)
+		}
+		if got.Channel == nil || *got.Channel != "paddle" || !got.AutoRenew {
+			t.Errorf("Channel/AutoRenew = %v/%v, want paddle/true", got.Channel, got.AutoRenew)
+		}
+	})
+
+	t.Run("omitted channel reads back NULL/false", func(t *testing.T) {
+		free := &model.Subscription{
+			ID: newUUID(), UserID: alice.ID, PlanID: "free",
+			Status: "expired", StartedAt: time.Now(),
+		}
+		if err := r.Create(context.Background(), free); err != nil {
+			t.Fatalf("Create free: %v", err)
+		}
+		got, err := r.FindByID(context.Background(), free.ID)
+		if err != nil {
+			t.Fatalf("FindByID free: %v", err)
+		}
+		if got.Channel != nil {
+			t.Errorf("Channel = %v, want nil", *got.Channel)
+		}
+		if got.AutoRenew {
+			t.Error("AutoRenew = true, want false (column default)")
+		}
+	})
+}

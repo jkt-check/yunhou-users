@@ -4761,3 +4761,122 @@ func TestPaymentService_Refund_SumInvariantCents(t *testing.T) {
 		t.Errorf("err = %v, want ErrRefundSumExceedsPayment", err)
 	}
 }
+
+// TestOnPaymentSucceeded_PaddleStampsChannelAutoRenew pins the M1 write
+// path: a Paddle first-purchase settlement marks the activated subscription
+// row channel='paddle', auto_renew=true.
+func TestOnPaymentSucceeded_PaddleStampsChannelAutoRenew(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	userID := seedUser(t, db)
+	orderID := seedPaidOrder(t, db, userID, "monthly", 19.9)
+
+	e := WebhookEvent{
+		Channel: "paddle", EventID: "evt-pd-chan-" + mustNewUUID()[:8], EventType: "transaction.completed",
+		TransactionID: "txn-pd-chan-" + mustNewUUID()[:8], OrderID: orderID, Amount: 19.9, Currency: "CNY",
+		ExternalSubscriptionID: "sub_pd_chan_" + mustNewUUID()[:8],
+		RawPayload:             json.RawMessage(`{}`),
+	}
+	if err := s.onPaymentSucceeded(context.Background(), e); err != nil {
+		t.Fatalf("onPaymentSucceeded: %v", err)
+	}
+
+	var channel sql.NullString
+	var autoRenew bool
+	if err := db.GetContext(context.Background(), &channel,
+		`SELECT channel FROM subscriptions WHERE user_id = $1 AND status = 'active' LIMIT 1`, userID); err != nil {
+		t.Fatalf("read sub channel: %v", err)
+	}
+	if err := db.GetContext(context.Background(), &autoRenew,
+		`SELECT auto_renew FROM subscriptions WHERE user_id = $1 AND status = 'active' LIMIT 1`, userID); err != nil {
+		t.Fatalf("read sub auto_renew: %v", err)
+	}
+	if !channel.Valid || channel.String != "paddle" {
+		t.Errorf("channel = %v, want paddle", channel)
+	}
+	if !autoRenew {
+		t.Error("auto_renew = false, want true for paddle activation")
+	}
+}
+
+// TestOnPaymentSucceeded_WeChatStampsChannelNoAutoRenew: a WeChat pay
+// settlement marks the row channel='wechat_pay' but auto_renew stays false
+// — WeChat has no channel-side auto-renewal (channelAutoRenews).
+func TestOnPaymentSucceeded_WeChatStampsChannelNoAutoRenew(t *testing.T) {
+	db := setupPaymentDB(t)
+	s := newTestPaymentService(t, db)
+
+	userID := seedUser(t, db)
+	orderID := seedPaidOrder(t, db, userID, "monthly", 19.9)
+
+	e := WebhookEvent{
+		Channel: "wechat_pay", EventID: "evt-wc-chan-" + mustNewUUID()[:8], EventType: "TRANSACTION.SUCCESS",
+		TransactionID: "txn-wc-chan-" + mustNewUUID()[:8], OrderID: orderID, Amount: 19.9, Currency: "CNY",
+		RawPayload: json.RawMessage(`{}`),
+	}
+	if err := s.onPaymentSucceeded(context.Background(), e); err != nil {
+		t.Fatalf("onPaymentSucceeded: %v", err)
+	}
+
+	var channel sql.NullString
+	var autoRenew bool
+	if err := db.GetContext(context.Background(), &channel,
+		`SELECT channel FROM subscriptions WHERE user_id = $1 AND status = 'active' LIMIT 1`, userID); err != nil {
+		t.Fatalf("read sub channel: %v", err)
+	}
+	if err := db.GetContext(context.Background(), &autoRenew,
+		`SELECT auto_renew FROM subscriptions WHERE user_id = $1 AND status = 'active' LIMIT 1`, userID); err != nil {
+		t.Fatalf("read sub auto_renew: %v", err)
+	}
+	if !channel.Valid || channel.String != "wechat_pay" {
+		t.Errorf("channel = %v, want wechat_pay", channel)
+	}
+	if autoRenew {
+		t.Error("auto_renew = true, want false for wechat_pay activation")
+	}
+}
+
+// TestOnWebhook_PaddleRenewal_PreservesChannelAutoRenew: a renewal webhook
+// extends expires_at only — it must NOT flip auto_renew back to true after
+// the user cancelled (auto_renew=false, still in the paid period), and must
+// not touch channel.
+func TestOnWebhook_PaddleRenewal_PreservesChannelAutoRenew(t *testing.T) {
+	db := setupPaymentDB(t)
+	svc := newTestPaymentService(t, db)
+	uid := seedUser(t, db)
+	extSubID := "sub_paddle_" + mustNewUUID()[:8]
+	subID := mustNewUUID()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (id, user_id, plan_id, status, expires_at, external_subscription_id, channel, auto_renew)
+		VALUES ($1, $2, 'monthly', 'active', $3, $4, 'paddle', false)
+	`, subID, uid, time.Now().Add(15*24*time.Hour), extSubID); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+
+	next := time.Now().Add(45 * 24 * time.Hour).UTC().Truncate(time.Second)
+	svc.SetPaddleClient(&stubPaddle{next: &next})
+
+	txnID := "txn_pd_renew_keep_" + mustNewUUID()[:8]
+	if _, err := svc.OnWebhook(context.Background(),
+		paddleRenewalEvent("evt-pd-renew-keep-"+mustNewUUID()[:8], txnID, extSubID)); err != nil {
+		t.Fatalf("OnWebhook paddle renewal: %v", err)
+	}
+
+	var channel sql.NullString
+	var autoRenew bool
+	if err := db.GetContext(context.Background(), &channel,
+		`SELECT channel FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub channel: %v", err)
+	}
+	if err := db.GetContext(context.Background(), &autoRenew,
+		`SELECT auto_renew FROM subscriptions WHERE id = $1`, subID); err != nil {
+		t.Fatalf("read sub auto_renew: %v", err)
+	}
+	if !channel.Valid || channel.String != "paddle" {
+		t.Errorf("channel = %v after renewal, want paddle (unchanged)", channel)
+	}
+	if autoRenew {
+		t.Error("auto_renew flipped to true after renewal — cancel state clobbered")
+	}
+}

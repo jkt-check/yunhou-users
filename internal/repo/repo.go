@@ -597,8 +597,8 @@ func (r *subscriptionRepo) Create(ctx context.Context, s *model.Subscription) er
 	// by the same trigger. Callers creating rows for a specific product
 	// (e.g. coding-plan) should set ProductCode explicitly.
 	_, err := r.db.NamedExecContext(ctx, `
-		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at, product_code)
-		VALUES (:id, :user_id, :plan_id, :status, :started_at, :expires_at, NULLIF(:product_code, ''))
+		INSERT INTO subscriptions (id, user_id, plan_id, status, started_at, expires_at, product_code, channel, auto_renew)
+		VALUES (:id, :user_id, :plan_id, :status, :started_at, :expires_at, NULLIF(:product_code, ''), :channel, :auto_renew)
 	`, s)
 	return err
 }

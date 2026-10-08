@@ -2171,7 +2171,7 @@ func TestResolvePlanForTokenIssuance_NoSub_ReturnsNilChosenPlan(t *testing.T) {
 	// Seed the former default so this test proves the resolver ignores it.
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
 
-	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-no-sub", "yundian", time.Now())
+	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, _, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-no-sub", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -2207,7 +2207,7 @@ func TestResolvePlanForTokenIssuance_ExpiredSub_ScopeEmpty(t *testing.T) {
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
-	chosenPlan, surfaceID, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, user.ID, "yundian", time.Now())
+	chosenPlan, surfaceID, _, hasAccess, _, _, _, err := svc.resolvePlanForTokenIssuance(ctx, user.ID, "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -2250,7 +2250,7 @@ func TestResolvePlanForTokenIssuance_ActiveSub_PlanDeactivated(t *testing.T) {
 	}
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr))
 
-	chosenPlan, _, _, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-deactivated", "yundian", time.Now())
+	chosenPlan, _, _, hasAccess, _, _, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-deactivated", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -2312,7 +2312,7 @@ func TestResolvePlanForTokenIssuance_ExpiredSub(t *testing.T) {
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
-	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian", time.Now())
+	chosenPlan, surfaceID, surfaceName, hasAccess, expiresAt, _, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance: %v", err)
 	}
@@ -2351,7 +2351,7 @@ func TestResolvePlanForTokenIssuance_ExpiredSub_OriginalPlanMissing(t *testing.T
 	tokenSvc := newTokenServiceWithMocks(ssr, sr)
 	svc := NewAuthService(ur, sir, pr, sr, ssr, ar, tokenSvc)
 
-	chosenPlan, surfaceID, surfaceName, hasAccess, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian", time.Now())
+	chosenPlan, surfaceID, surfaceName, hasAccess, _, _, _, err := svc.resolvePlanForTokenIssuance(ctx, "u-1", "yundian", time.Now())
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuance must preserve degraded mode; got %v", err)
 	}
@@ -2553,7 +2553,7 @@ func TestResolvePlanForTokenIssuance_SingleTimeReference(t *testing.T) {
 
 	// Now issued at one moment; both decisions see the same `now`.
 	now := time.Now()
-	chosenPlan, _, _, hasAccess, _, err := svc.resolvePlanForTokenIssuanceWithPlan(ctx, "u-edge", "yundian", nil, now)
+	chosenPlan, _, _, hasAccess, _, _, _, err := svc.resolvePlanForTokenIssuanceWithPlan(ctx, "u-edge", "yundian", nil, now)
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuanceWithPlan: %v", err)
 	}
@@ -2572,7 +2572,7 @@ func TestResolvePlanForTokenIssuance_SingleTimeReference(t *testing.T) {
 	// expiry (i.e. the subscription was still active at that
 	// reference time), both decisions must agree it was active.
 	beforeExpiry := expiredAt.Add(-time.Second)
-	chosenPlan2, _, _, hasAccess2, _, err := svc.resolvePlanForTokenIssuanceWithPlan(ctx, "u-edge", "yundian", nil, beforeExpiry)
+	chosenPlan2, _, _, hasAccess2, _, _, _, err := svc.resolvePlanForTokenIssuanceWithPlan(ctx, "u-edge", "yundian", nil, beforeExpiry)
 	if err != nil {
 		t.Fatalf("resolvePlanForTokenIssuanceWithPlan (before expiry): %v", err)
 	}
@@ -2865,4 +2865,88 @@ func TestAuthService_GrantTrialSubscription_ClampsHugeTrialDays(t *testing.T) {
 	if lo, hi := now.AddDate(200, 0, 0), now.AddDate(300, 0, 0); sub.ExpiresAt.Before(lo) || sub.ExpiresAt.After(hi) {
 		t.Errorf("ExpiresAt = %v, want within [now+200y, now+300y] (clamped, not wrapped)", sub.ExpiresAt)
 	}
+}
+
+// TestAuthService_SubscriptionInfo_ChannelAutoRenew pins the M1 contract:
+// LoginResponse.Subscription surfaces the subscription row's channel and
+// auto_renew on BOTH SubscriptionInfo build sites (the shared
+// issueTokensForUser tail and RefreshToken's own literal). A user with no
+// channel-managed sub keeps nil/false.
+func TestAuthService_SubscriptionInfo_ChannelAutoRenew(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	setup := func(channel *string, autoRenew bool) (*AuthService, *mockSubscriptionRepo) {
+		ur, sir, pr, sr, ssr, ar := newAuthMocks()
+		ur.users["user-1"] = &model.User{ID: "user-1", Status: "active"}
+		pr.plans["monthly"] = &model.Plan{ID: "monthly", Name: "按月订阅", Apps: []string{"yundian"}, IsActive: true}
+		ar.seedActive("yundian", "云店")
+		expiresAt := time.Now().Add(30 * 24 * time.Hour)
+		sub := &model.Subscription{
+			ID: "sub-1", UserID: "user-1", PlanID: "monthly",
+			Status: "active", ExpiresAt: &expiresAt,
+			Channel: channel, AutoRenew: autoRenew,
+		}
+		sr.subs[sub.ID] = sub
+		sr.byUserID["user-1"] = sub
+		session := &model.Session{
+			ID: "sess-1", UserID: "user-1", AppID: "yundian", SessionType: "refresh",
+			RefreshToken: hashToken("refresh-token-1"), Revoked: false,
+			ExpiresAt: time.Now().Add(time.Hour),
+		}
+		ssr.sessions[session.ID] = session
+		ssr.byToken[session.RefreshToken] = session
+		return NewAuthService(ur, sir, pr, sr, ssr, ar, newTokenServiceWithMocks(ssr, sr)), sr
+	}
+
+	t.Run("paddle sub surfaces channel/auto_renew on refresh", func(t *testing.T) {
+		t.Parallel()
+		paddle := "paddle"
+		svc, _ := setup(&paddle, true)
+		resp, err := svc.RefreshToken(ctx, "refresh-token-1", "yundian")
+		if err != nil {
+			t.Fatalf("RefreshToken: %v", err)
+		}
+		if resp.Subscription == nil {
+			t.Fatal("Subscription is nil")
+		}
+		if resp.Subscription.Channel == nil || *resp.Subscription.Channel != "paddle" {
+			t.Errorf("Subscription.Channel = %v, want paddle", resp.Subscription.Channel)
+		}
+		if !resp.Subscription.AutoRenew {
+			t.Error("Subscription.AutoRenew = false, want true")
+		}
+	})
+
+	t.Run("non-channel sub stays nil/false on refresh", func(t *testing.T) {
+		t.Parallel()
+		svc, _ := setup(nil, false)
+		resp, err := svc.RefreshToken(ctx, "refresh-token-1", "yundian")
+		if err != nil {
+			t.Fatalf("RefreshToken: %v", err)
+		}
+		if resp.Subscription.Channel != nil {
+			t.Errorf("Subscription.Channel = %v, want nil", *resp.Subscription.Channel)
+		}
+		if resp.Subscription.AutoRenew {
+			t.Error("Subscription.AutoRenew = true, want false")
+		}
+	})
+
+	t.Run("paddle sub surfaces channel/auto_renew on login-issue tail", func(t *testing.T) {
+		t.Parallel()
+		paddle := "paddle"
+		svc, _ := setup(&paddle, true)
+		user := &model.User{ID: "user-1", Status: "active"}
+		resp, err := svc.issueTokensForUser(ctx, user, "yundian", nil)
+		if err != nil {
+			t.Fatalf("issueTokensForUser: %v", err)
+		}
+		if resp.Subscription.Channel == nil || *resp.Subscription.Channel != "paddle" {
+			t.Errorf("Subscription.Channel = %v, want paddle", resp.Subscription.Channel)
+		}
+		if !resp.Subscription.AutoRenew {
+			t.Error("Subscription.AutoRenew = false, want true")
+		}
+	})
 }

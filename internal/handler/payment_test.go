@@ -53,6 +53,14 @@ type mockPaymentSvc struct {
 	upgradeResp          *service.ChannelUpgradeResult
 	upgradeErr           error
 	gotUpgradePlanID     string
+	cancelByIDResp       *model.Subscription
+	cancelByIDErr        error
+	gotCancelByIDSubID   string
+	gotCancelByIDEff     string
+	changePlanResp       *model.Subscription
+	changePlanErr        error
+	gotChangePlanSubID   string
+	gotChangePlanPlanID  string
 }
 
 func (m *mockPaymentSvc) CreateOrder(_ context.Context, _, _, channel string, attribution json.RawMessage) (*model.Order, error) {
@@ -100,6 +108,17 @@ func (m *mockPaymentSvc) UpgradeChannelSubscription(_ context.Context, _, target
 	m.gotUpgradePlanID = targetPlanID
 	return m.upgradeResp, m.upgradeErr
 }
+func (m *mockPaymentSvc) CancelSubscriptionByID(_ context.Context, userID, subID, effectiveFrom string) (*model.Subscription, error) {
+	m.gotCancelUserID = userID
+	m.gotCancelByIDSubID = subID
+	m.gotCancelByIDEff = effectiveFrom
+	return m.cancelByIDResp, m.cancelByIDErr
+}
+func (m *mockPaymentSvc) ChangePlanByID(_ context.Context, _, subID, planID string) (*model.Subscription, error) {
+	m.gotChangePlanSubID = subID
+	m.gotChangePlanPlanID = planID
+	return m.changePlanResp, m.changePlanErr
+}
 
 // Compile-time check: mockPaymentSvc must satisfy the interface.
 var _ service.PaymentServiceInterface = (*mockPaymentSvc)(nil)
@@ -129,6 +148,8 @@ func paymentTestEngine(svc service.PaymentServiceInterface, userID string) *gin.
 	engine.POST("/payments/orders/:order_id/confirm", h.ConfirmOrder)
 	engine.POST("/payments/subscription/cancel", h.CancelChannelSubscription)
 	engine.POST("/payments/subscription/upgrade", h.UpgradeChannelSubscription)
+	engine.POST("/user/subscriptions/:id/cancel", h.CancelSubscriptionByID)
+	engine.POST("/user/subscriptions/:id/change-plan", h.ChangeSubscriptionPlanByID)
 	engine.GET("/payments", h.ListPayments)
 	engine.GET("/payments/:id", h.GetPayment)
 	engine.GET("/payments/:id/refunds", h.ListPaymentRefunds)
@@ -1228,4 +1249,206 @@ func TestPaymentHandler_CreateOrder_Attribution(t *testing.T) {
 			t.Errorf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// ============================================================================
+// POST /user/subscriptions/:id/cancel (M2 contract)
+// ============================================================================
+
+func TestCancelSubscriptionByIDEndpoint(t *testing.T) {
+	expiry := time.Now().Add(15 * 24 * time.Hour).UTC().Truncate(time.Second)
+	happySub := &model.Subscription{ID: "sub-1", PlanID: "monthly", Status: "active", AutoRenew: false, ExpiresAt: &expiry}
+
+	t.Run("happy path → 200 with contract shape", func(t *testing.T) {
+		svc := &mockPaymentSvc{cancelByIDResp: happySub}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/cancel", map[string]string{
+			"effective_from": "next_billing_period",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Code int `json:"code"`
+			Data struct {
+				ID        string  `json:"id"`
+				PlanID    string  `json:"plan_id"`
+				Status    string  `json:"status"`
+				AutoRenew bool    `json:"auto_renew"`
+				ExpiresAt *string `json:"expires_at"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v (body: %s)", err, rec.Body.String())
+		}
+		if body.Code != 0 || body.Data.ID != "sub-1" || body.Data.PlanID != "monthly" ||
+			body.Data.Status != "active" || body.Data.AutoRenew || body.Data.ExpiresAt == nil {
+			t.Errorf("unexpected data shape: %s", rec.Body.String())
+		}
+		if svc.gotCancelByIDSubID != "sub-1" || svc.gotCancelUserID != "user-1" {
+			t.Errorf("service got subID=%q userID=%q", svc.gotCancelByIDSubID, svc.gotCancelUserID)
+		}
+	})
+
+	t.Run("empty body defaults to next_billing_period", func(t *testing.T) {
+		svc := &mockPaymentSvc{cancelByIDResp: happySub}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/cancel", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if svc.gotCancelByIDEff != "next_billing_period" {
+			t.Errorf("effective_from passed to service = %q, want next_billing_period", svc.gotCancelByIDEff)
+		}
+	})
+
+	t.Run("unsupported effective_from → 400", func(t *testing.T) {
+		svc := &mockPaymentSvc{cancelByIDResp: happySub}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/cancel", map[string]string{
+			"effective_from": "immediately",
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "invalid request body") {
+			t.Errorf("body: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("malformed JSON → 400", func(t *testing.T) {
+		svc := &mockPaymentSvc{cancelByIDResp: happySub}
+		engine := paymentTestEngine(svc, "user-1")
+		req := httptest.NewRequest(http.MethodPost, "/user/subscriptions/sub-1/cancel", strings.NewReader("{oops"))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	errCases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantMsg    string
+	}{
+		{"unknown/other-user sub → 404", service.ErrSubscriptionNotFound, 404, "subscription not found"},
+		{"non-channel sub → 409", service.ErrSubscriptionNoAutoRenew, 409, "subscription has no auto-renew to cancel"},
+		{"paypal sub → 409", service.ErrSubscriptionNotChannelManaged, 409, "not managed by an auto-renewing channel"},
+		{"ended sub → 409", service.ErrSubscriptionAlreadyEnded, 409, "subscription already ended"},
+		{"paddle failure → 502", service.ErrChannelUnavailable, 502, "payment provider unavailable"},
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &mockPaymentSvc{cancelByIDErr: tc.err}
+			engine := paymentTestEngine(svc, "user-1")
+			rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/cancel", nil)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantMsg) {
+				t.Errorf("body %s missing %q", rec.Body.String(), tc.wantMsg)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// POST /user/subscriptions/:id/change-plan (M2 contract)
+// ============================================================================
+
+func TestChangeSubscriptionPlanByIDEndpoint(t *testing.T) {
+	expiry := time.Now().Add(365 * 24 * time.Hour).UTC().Truncate(time.Second)
+	happySub := &model.Subscription{ID: "sub-1", PlanID: "yearly", Status: "active", AutoRenew: true, ExpiresAt: &expiry}
+
+	t.Run("happy path → 200 with contract shape", func(t *testing.T) {
+		svc := &mockPaymentSvc{changePlanResp: happySub}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/change-plan", map[string]string{
+			"plan_id": "yearly",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Code int `json:"code"`
+			Data struct {
+				ID        string  `json:"id"`
+				PlanID    string  `json:"plan_id"`
+				Status    string  `json:"status"`
+				AutoRenew bool    `json:"auto_renew"`
+				ExpiresAt *string `json:"expires_at"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v (body: %s)", err, rec.Body.String())
+		}
+		if body.Code != 0 || body.Data.ID != "sub-1" || body.Data.PlanID != "yearly" ||
+			body.Data.Status != "active" || !body.Data.AutoRenew || body.Data.ExpiresAt == nil {
+			t.Errorf("unexpected data shape: %s", rec.Body.String())
+		}
+		if svc.gotChangePlanSubID != "sub-1" || svc.gotChangePlanPlanID != "yearly" {
+			t.Errorf("service got subID=%q planID=%q", svc.gotChangePlanSubID, svc.gotChangePlanPlanID)
+		}
+	})
+
+	t.Run("missing plan_id → 400", func(t *testing.T) {
+		svc := &mockPaymentSvc{changePlanResp: happySub}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/change-plan", map[string]string{})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "invalid request body") {
+			t.Errorf("body: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("wrong-type plan_id → 400", func(t *testing.T) {
+		svc := &mockPaymentSvc{changePlanResp: happySub}
+		engine := paymentTestEngine(svc, "user-1")
+		rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/change-plan", map[string]any{
+			"plan_id": 123,
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status: got %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	errCases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantMsg    string
+	}{
+		{"unknown plan → 400", service.ErrPlanNotFound, 400, "plan not found"},
+		{"inactive plan → 400", service.ErrPlanInactive, 400, "plan is inactive"},
+		{"unknown/other-user sub → 404", service.ErrSubscriptionNotFound, 404, "subscription not found"},
+		{"same plan → 409", service.ErrSamePlanChange, 409, "already on plan"},
+		{"downgrade → 409", service.ErrPlanDowngradeNotSupported, 409, "plan downgrade not supported"},
+		{"cross-product plan → 409", service.ErrPlanChangeNotUpgrade, 409, "plan change is not an upgrade"},
+		{"retired plan → 409", service.ErrPlanNotAcceptingNew, 409, "plan is not accepting new subscriptions"},
+		{"ended sub → 409", service.ErrSubscriptionAlreadyEnded, 409, "subscription already ended"},
+		{"non-channel sub → 409", service.ErrSubscriptionNoAutoRenew, 409, "subscription has no auto-renew to change"},
+		{"paypal sub → 409", service.ErrSubscriptionNotChannelManaged, 409, "not managed by an auto-renewing channel"},
+		{"missing price mapping → 502", service.ErrPaddlePriceNotConfigured, 502, "payment provider unavailable"},
+		{"paddle failure → 502", service.ErrChannelUnavailable, 502, "payment provider unavailable"},
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &mockPaymentSvc{changePlanErr: tc.err}
+			engine := paymentTestEngine(svc, "user-1")
+			rec := doRequest(engine, http.MethodPost, "/user/subscriptions/sub-1/change-plan", map[string]string{
+				"plan_id": "yearly",
+			})
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status: got %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantMsg) {
+				t.Errorf("body %s missing %q", rec.Body.String(), tc.wantMsg)
+			}
+		})
+	}
 }

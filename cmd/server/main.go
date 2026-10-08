@@ -580,6 +580,20 @@ func main() {
 
 	sweeper.Start(rootCtx)
 
+	// Analytics outbox: failed PostHog captures persist to analytics_outbox
+	// (same transaction-less path as the emitter itself) and a retry worker
+	// redelivers them with exponential backoff — PostHog dedupes on the
+	// stable event uuid, so a late retry overlapping the original attempt
+	// is harmless. Wired only when the emitter is live (a token exists);
+	// otherwise there is nothing to retry.
+	if cfg.PostHogProjectToken != "" {
+		outboxStore := analytics.NewPostgresStore(db)
+		analyticsEmitter.SetFailureStore(outboxStore)
+		retryWorker := analytics.NewRetryWorker(outboxStore, analyticsEmitter.Redeliver, 30*time.Second)
+		log.Printf("analytics: outbox retry worker started (interval 30s)")
+		go retryWorker.Run(rootCtx)
+	}
+
 	// Task 9: settlement recovery worker — crash recovery for stranded
 	// in-flight requests (conservative-estimate settlement = reserved hold,
 	// reconciliation queue, deadline escalation, ledger/window rebuild

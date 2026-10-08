@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,7 +77,7 @@ func TestOnWebhook_PaddlePurchase_EmitsPurchaseCompleted(t *testing.T) {
 		// billing_cycle is derivable.
 		if _, err := db.ExecContext(context.Background(), `
 			UPDATE orders SET attribution = $1, plan_interval_days = 30 WHERE id = $2
-		`, `{"first_touch":{"utm_source":"google"},"last_touch":{"utm_medium":"cpc"}}`, orderID); err != nil {
+		`, `{"first_touch":{"utm_source":"google","utm_medium":"cpc","utm_campaign":"spring","referrer_domain":"google.com","landing_path":"/pricing"},"last_touch":{"utm_source":"newsletter","utm_medium":"email","utm_content":"hero"}}`, orderID); err != nil {
 			t.Fatalf("set attribution: %v", err)
 		}
 
@@ -105,6 +106,7 @@ func TestOnWebhook_PaddlePurchase_EmitsPurchaseCompleted(t *testing.T) {
 			"currency":       "CNY",
 			"amount":         19.9,
 			"purchase_type":  "first_purchase",
+			"amount_basis":   "catalog_ex_tax",
 			"channel":        "paddle",
 			"region":         "intl",
 			"environment":    "production",
@@ -121,6 +123,34 @@ func TestOnWebhook_PaddlePurchase_EmitsPurchaseCompleted(t *testing.T) {
 		ft, ok := attr["first_touch"].(map[string]any)
 		if !ok || ft["utm_source"] != "google" {
 			t.Errorf("attribution snapshot not verbatim: %v", attr)
+		}
+		// Flattened scalars mirror the snapshot so PostHog can filter on
+		// them directly. Values must come from the ORDER snapshot only.
+		for k, want := range map[string]any{
+			"first_touch_utm_source":      "google",
+			"first_touch_utm_medium":      "cpc",
+			"first_touch_utm_campaign":    "spring",
+			"first_touch_referrer_domain": "google.com",
+			"first_touch_landing_path":    "/pricing",
+			"last_touch_utm_source":       "newsletter",
+			"last_touch_utm_medium":       "email",
+			"last_touch_utm_content":      "hero",
+		} {
+			if evt.Properties[k] != want {
+				t.Errorf("properties[%q] = %v, want %v", k, evt.Properties[k], want)
+			}
+		}
+		// Fields the snapshot leaves nil must stay absent (e.g.
+		// first_touch has no utm_content; neither touch sets captured_at).
+		for _, absent := range []string{
+			"first_touch_utm_content",
+			"last_touch_utm_campaign",
+			"last_touch_referrer_domain",
+			"last_touch_landing_path",
+		} {
+			if _, has := evt.Properties[absent]; has {
+				t.Errorf("properties[%q] must be omitted when the snapshot field is nil: %+v", absent, evt.Properties)
+			}
 		}
 	})
 
@@ -144,6 +174,11 @@ func TestOnWebhook_PaddlePurchase_EmitsPurchaseCompleted(t *testing.T) {
 		}
 		if _, has := found.Properties["attribution"]; has {
 			t.Errorf("attribution key must be omitted when the order has none: %+v", found.Properties)
+		}
+		for k := range found.Properties {
+			if strings.HasPrefix(k, "first_touch_") || strings.HasPrefix(k, "last_touch_") {
+				t.Errorf("scalar attribution key %q must be omitted when the order has none: %+v", k, found.Properties)
+			}
 		}
 		if _, has := found.Properties["billing_cycle"]; has {
 			t.Errorf("billing_cycle must be omitted without a snapshot interval: %+v", found.Properties)
@@ -182,6 +217,15 @@ func TestOnWebhook_PaddleRenewal_EmitsPurchaseCompletedRenewal(t *testing.T) {
 	}
 	if evt.Properties["purchase_type"] != "renewal" {
 		t.Errorf("purchase_type = %v, want renewal", evt.Properties["purchase_type"])
+	}
+	if evt.Properties["amount_basis"] != "settled_inc_tax" {
+		t.Errorf("amount_basis = %v, want settled_inc_tax (renewal reports the settled, tax-inclusive amount)",
+			evt.Properties["amount_basis"])
+	}
+	for k := range evt.Properties {
+		if k == "attribution" || strings.HasPrefix(k, "first_touch_") || strings.HasPrefix(k, "last_touch_") {
+			t.Errorf("renewal event must carry no attribution keys, got %q: %+v", k, evt.Properties)
+		}
 	}
 	if evt.Properties["plan_id"] != "monthly" || evt.Properties["billing_cycle"] != "monthly" {
 		t.Errorf("plan/billing_cycle = %v/%v, want monthly/monthly",

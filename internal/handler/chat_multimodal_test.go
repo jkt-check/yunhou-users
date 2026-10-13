@@ -75,6 +75,41 @@ func TestValidateChatMessages_RejectsMagicBytesMismatch(t *testing.T) {
 	}
 }
 
+func TestValidateChatMessages_RejectsUndecodableBase64AsInvalidURL(t *testing.T) {
+	// base64 前缀无法解码是 data URI 形态错误（invalid image_url）；只有
+	// 解码成功但 magic bytes 不匹配才是 invalid image data。
+	msgs := []model.ChatMessage{
+		mustPartsMsg(t, `{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,!!!not-base64!!!"}}]}`),
+	}
+	if msg := validateChatMessages(msgs); msg != "invalid image_url" {
+		t.Fatalf("msg=%q", msg)
+	}
+}
+
+func TestValidateChatMessages_RejectsEmptyTextOnlyParts(t *testing.T) {
+	// 与 content:"" 同口径:text parts 全为空且无图片的 parts 数组不是
+	// 合法 content;content:[] 归位为 "" 后同样被拒(归一化行为不变)。
+	for _, raw := range []string{
+		`{"role":"user","content":[{"type":"text","text":""}]}`,
+		`{"role":"user","content":[{"type":"text","text":""},{"type":"text","text":""}]}`,
+		`{"role":"user","content":[]}`,
+	} {
+		msgs := []model.ChatMessage{mustPartsMsg(t, raw)}
+		if msg := validateChatMessages(msgs); msg != "message content is required" {
+			t.Fatalf("%s: msg=%q", raw, msg)
+		}
+	}
+}
+
+func TestValidateChatMessages_EmptyTextPartWithImagePasses(t *testing.T) {
+	msgs := []model.ChatMessage{
+		mustPartsMsg(t, `{"role":"user","content":[{"type":"text","text":""},{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`),
+	}
+	if msg := validateChatMessages(msgs); msg != "" {
+		t.Fatalf("rejected: %s", msg)
+	}
+}
+
 func TestValidateChatMessages_ImageLimits(t *testing.T) {
 	part := `{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}`
 	parts := strings.Repeat(part+",", model.ChatMaxImages) + part

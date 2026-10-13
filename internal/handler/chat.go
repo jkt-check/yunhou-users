@@ -562,8 +562,12 @@ func validateChatMessages(messages []model.ChatMessage) string {
 		// (DeepSeek accepts empty content there): role=tool — a tool result
 		// that may legitimately be empty — and assistant turns that carry
 		// tool_calls (a pure tool-call turn, content empty by OpenAI
-		// convention). Everything else with empty content is rejected.
-		if m.Content == "" && len(m.ContentParts) == 0 && m.Role != "tool" && len(m.ToolCalls) == 0 {
+		// convention). Everything else with empty content is rejected —
+		// including a parts array whose text parts are all empty and which
+		// carries no image parts: Content is the concatenation of the text
+		// parts, so it is "" there too, and HasImages is the only remaining
+		// legitimate content carrier (a pure-image message).
+		if m.Content == "" && !m.HasImages() && m.Role != "tool" && len(m.ToolCalls) == 0 {
 			return "message content is required"
 		}
 		if m.HasImages() {
@@ -628,14 +632,17 @@ func validateChatImageURL(u string) string {
 	}
 	// Magic-bytes check: decode only the first 24 base64 chars (18 bytes —
 	// covers PNG/JPEG/GIF/WEBP signatures), never the whole image. The
-	// declared type must agree with the sniffed one (jpg ≡ jpeg).
+	// declared type must agree with the sniffed one (jpg ≡ jpeg). An
+	// undecodable payload is a malformed data URI ("invalid image_url");
+	// decoded bytes that match no/the wrong signature are "invalid image
+	// data".
 	prefix := data
 	if len(prefix) > 24 {
 		prefix = prefix[:24]
 	}
 	raw, err := base64.StdEncoding.DecodeString(prefix)
 	if err != nil {
-		return "invalid image data"
+		return "invalid image_url"
 	}
 	sniffed := model.SniffImageMediaType(raw)
 	if sniffed == "" || sniffed != normalizeImageMediaType(mt) {

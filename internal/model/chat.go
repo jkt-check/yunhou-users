@@ -22,7 +22,9 @@ type ContentPart struct {
 type ImageURL struct {
 	URL string `json:"url"`
 	// Detail 是 OpenAI 视觉分档参数("low"/"high"/"auto"),透传上游;
-	// Anthropic 无此概念,转换时忽略。
+	// Anthropic 无此概念,转换时忽略。透传是有意为之的规格决定(向前兼
+	// 容):不设取值白名单,上游未来新增 detail 值无需服务端变更即可生效;
+	// 非法值由上游 400 拒绝并透传为客户端错误。
 	Detail string `json:"detail,omitempty"`
 }
 
@@ -252,6 +254,11 @@ func (m ChatMessage) OpenAIWireContent() any {
 		case "text":
 			parts = append(parts, map[string]any{"type": "text", "text": p.Text})
 		case "image_url":
+			// 防御性跳过:Unmarshal 保证 image_url part 的 ImageURL 非 nil,
+			// 这里保护进程内手工构造 ContentParts 的调用方。
+			if p.ImageURL == nil {
+				continue
+			}
 			img := map[string]any{"url": p.ImageURL.URL}
 			if p.ImageURL.Detail != "" {
 				img["detail"] = p.ImageURL.Detail
@@ -274,6 +281,31 @@ func AnthropicImageBlock(u string) map[string]any {
 		return map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": mt, "data": data}}
 	}
 	return map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": u}}
+}
+
+// AnthropicUserBlocks builds the Anthropic user-turn content blocks: one text
+// block for legacy string content (byte-identical to the pre-multimodal
+// shape), or one block per part for multimodal messages. Shared by both
+// Anthropic adapters (internal/llm, internal/inference/providers) so their
+// user-turn translation stays identical. A nil ImageURL is skipped
+// defensively — Unmarshal guarantees non-nil, in-process constructors may not.
+func AnthropicUserBlocks(m ChatMessage) []any {
+	if m.ContentParts == nil {
+		return []any{map[string]any{"type": "text", "text": m.Content}}
+	}
+	blocks := make([]any, 0, len(m.ContentParts))
+	for _, p := range m.ContentParts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
+		case "image_url":
+			if p.ImageURL == nil {
+				continue
+			}
+			blocks = append(blocks, AnthropicImageBlock(p.ImageURL.URL))
+		}
+	}
+	return blocks
 }
 
 // ParseDataImageURI splits "data:image/png;base64,<data>" into media type and

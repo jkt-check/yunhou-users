@@ -77,7 +77,7 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 				systemParts = append(systemParts, m.Content)
 			}
 		case "user":
-			blocks := anthropicContentBlocks(m)
+			blocks := model.AnthropicUserBlocks(m)
 			// Anthropic requires strict user/assistant alternation (400
 			// otherwise): merge into the previous user turn. Text goes after
 			// any tool_result blocks already there — tool_results lead.
@@ -225,25 +225,6 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 		}
 	}
 	return json.Marshal(payload)
-}
-
-// anthropicContentBlocks builds the user-turn content blocks: one text block
-// for legacy string content (byte-identical to the pre-multimodal shape), or
-// one block per part for multimodal messages.
-func anthropicContentBlocks(m model.ChatMessage) []any {
-	if m.ContentParts == nil {
-		return []any{map[string]any{"type": "text", "text": m.Content}}
-	}
-	blocks := make([]any, 0, len(m.ContentParts))
-	for _, p := range m.ContentParts {
-		switch p.Type {
-		case "text":
-			blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
-		case "image_url":
-			blocks = append(blocks, model.AnthropicImageBlock(p.ImageURL.URL))
-		}
-	}
-	return blocks
 }
 
 // translateAnthropicTools maps the OpenAI tool envelope

@@ -37,7 +37,7 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, message
 				systemParts = append(systemParts, m.Content)
 			}
 		case "user":
-			blocks := anthropicContentBlocks(m)
+			blocks := model.AnthropicUserBlocks(m)
 			// Anthropic requires strict user/assistant alternation (400
 			// otherwise) while handler validation deliberately allows
 			// consecutive same-role messages: merge into the previous user
@@ -173,23 +173,4 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, message
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": anthropicThinkingBudget}
 	}
 	return json.Marshal(payload)
-}
-
-// anthropicContentBlocks builds the user-turn content blocks: one text block
-// for legacy string content (byte-identical to the pre-multimodal shape), or
-// one block per part for multimodal messages.
-func anthropicContentBlocks(m model.ChatMessage) []any {
-	if m.ContentParts == nil {
-		return []any{map[string]any{"type": "text", "text": m.Content}}
-	}
-	blocks := make([]any, 0, len(m.ContentParts))
-	for _, p := range m.ContentParts {
-		switch p.Type {
-		case "text":
-			blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
-		case "image_url":
-			blocks = append(blocks, model.AnthropicImageBlock(p.ImageURL.URL))
-		}
-	}
-	return blocks
 }

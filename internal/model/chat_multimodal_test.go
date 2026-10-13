@@ -152,6 +152,51 @@ func TestAnthropicImageBlock(t *testing.T) {
 	}
 }
 
+func TestAnthropicUserBlocks(t *testing.T) {
+	// legacy 字符串 content:单个 text block(与多模态前的形状逐字节一致)
+	legacy := AnthropicUserBlocks(ChatMessage{Role: "user", Content: "hi"})
+	if len(legacy) != 1 {
+		t.Fatalf("legacy blocks=%v", legacy)
+	}
+	b := legacy[0].(map[string]any)
+	if b["type"] != "text" || b["text"] != "hi" {
+		t.Fatalf("legacy block=%v", b)
+	}
+
+	var m ChatMessage
+	raw := `{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://x.test/i.png"}}]}`
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	blocks := AnthropicUserBlocks(m)
+	if len(blocks) != 2 {
+		t.Fatalf("blocks=%v", blocks)
+	}
+	if tb := blocks[0].(map[string]any); tb["type"] != "text" || tb["text"] != "look" {
+		t.Fatalf("text block=%v", tb)
+	}
+	img := blocks[1].(map[string]any)
+	if img["type"] != "image" || img["source"].(map[string]any)["type"] != "url" {
+		t.Fatalf("image block=%v", img)
+	}
+}
+
+func TestWireBuilders_SkipNilImageURL(t *testing.T) {
+	// 进程内手工构造(绕过 Unmarshal)的 image_url part 可能 ImageURL==nil;
+	// 两个转换路径都必须防御性跳过而不是 panic。
+	m := ChatMessage{Role: "user", Content: "x", ContentParts: []ContentPart{
+		{Type: "text", Text: "x"},
+		{Type: "image_url"},
+	}}
+	parts, ok := m.OpenAIWireContent().([]any)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("wire parts=%v", m.OpenAIWireContent())
+	}
+	if blocks := AnthropicUserBlocks(m); len(blocks) != 1 {
+		t.Fatalf("blocks=%v", blocks)
+	}
+}
+
 func TestParseDataImageURI(t *testing.T) {
 	if mt, data, ok := ParseDataImageURI("data:image/png;base64,AAA"); !ok || mt != "image/png" || data != "AAA" {
 		t.Fatalf("mt=%q data=%q ok=%v", mt, data, ok)

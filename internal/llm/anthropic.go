@@ -24,12 +24,6 @@ const (
 // shape is never sent to an Anthropic endpoint. hardCap bounds the final
 // max_tokens (<= 0 表示不设上限）——thinking 模式的协议提升也不得突破它。
 func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
-	// Fail closed: image parts are relayed only after the multimodal relay
-	// lands (batch ②); until then an image must error loudly, never be
-	// silently dropped into a text-only payload.
-	if model.MessagesHaveImages(messages) {
-		return nil, fmt.Errorf("image input is not relayed by this builder")
-	}
 	if maxTokens <= 0 {
 		maxTokens = anthropicDefaultMaxTokens
 	}
@@ -43,17 +37,17 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, message
 				systemParts = append(systemParts, m.Content)
 			}
 		case "user":
-			block := map[string]any{"type": "text", "text": m.Content}
+			blocks := anthropicContentBlocks(m)
 			// Anthropic requires strict user/assistant alternation (400
 			// otherwise) while handler validation deliberately allows
 			// consecutive same-role messages: merge into the previous user
 			// turn. Text goes after any tool_result blocks already there —
 			// tool_results must lead the turn.
 			if n := len(msgs); n > 0 && msgs[n-1]["role"] == "user" {
-				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), block)
+				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), blocks...)
 				continue
 			}
-			msgs = append(msgs, map[string]any{"role": "user", "content": []any{block}})
+			msgs = append(msgs, map[string]any{"role": "user", "content": blocks})
 		case "assistant":
 			var blocks []any
 			if m.Content != "" {
@@ -179,4 +173,23 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, message
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": anthropicThinkingBudget}
 	}
 	return json.Marshal(payload)
+}
+
+// anthropicContentBlocks builds the user-turn content blocks: one text block
+// for legacy string content (byte-identical to the pre-multimodal shape), or
+// one block per part for multimodal messages.
+func anthropicContentBlocks(m model.ChatMessage) []any {
+	if m.ContentParts == nil {
+		return []any{map[string]any{"type": "text", "text": m.Content}}
+	}
+	blocks := make([]any, 0, len(m.ContentParts))
+	for _, p := range m.ContentParts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
+		case "image_url":
+			blocks = append(blocks, model.AnthropicImageBlock(p.ImageURL.URL))
+		}
+	}
+	return blocks
 }

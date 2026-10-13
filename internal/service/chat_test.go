@@ -1062,14 +1062,16 @@ func TestStreamChat_RejectsImagesForTextOnlyModel(t *testing.T) {
 	}
 }
 
-// TestStreamChat_VisionModelPassesGate: 声明了 image 模态的模型不被门控拒。
-// 批次① 的上行 builder 仍 fail-closed（Task 3），故这里断言错误存在但
-// 不是 ErrChatModelNoVision，且错误发生在 payload 构造阶段（上游零调用）。
+// TestStreamChat_VisionModelPassesGate: 声明了 image 模态的模型不被门控拒，
+// 且 builder 已透传（批次② Task 5/6）——mock 上游收到含图片 part 的 payload。
 func TestStreamChat_VisionModelPassesGate(t *testing.T) {
 	var hits int32
+	var gotBody []byte
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
+		gotBody, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: [DONE]\n\n"))
 	})
 	srv := httptest.NewServer(upstream)
 	t.Cleanup(srv.Close)
@@ -1084,11 +1086,16 @@ func TestStreamChat_VisionModelPassesGate(t *testing.T) {
 	if errors.Is(err, ErrChatModelNoVision) {
 		t.Fatalf("err = %v, vision 模型不得被视觉门控拦截", err)
 	}
-	if err == nil {
-		t.Fatal("err = nil, 批次① 的 builder fail-closed 守卫应显式报错（图片暂不透传上游）")
+	if err != nil {
+		t.Fatalf("err = %v, vision 模型带图请求应透传到上游", err)
 	}
-	if n := atomic.LoadInt32(&hits); n != 0 {
-		t.Errorf("upstream called %d times, want 0（builder fail-closed 在花费之前）", n)
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("upstream called %d times, want 1（图片应真实透传）", n)
+	}
+	for _, want := range []string{`"image_url"`, `"url":"https://example.com/cat.png"`} {
+		if !strings.Contains(string(gotBody), want) {
+			t.Errorf("upstream payload missing %s: %s", want, gotBody)
+		}
 	}
 
 	// 同一 vision 模型的纯文本请求不受门控影响（走到上游失败为止）。

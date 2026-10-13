@@ -78,11 +78,14 @@ type ChatRoute struct {
 
 // ChatModelInfo is the public view of one catalog model, returned by
 // AllowedModels and served at GET /chat/models for kaya's model picker.
+// InputModalities tells the picker which models accept image input; empty
+// catalog values are normalized to ["text"] (fail closed, 与视觉门控同口径).
 type ChatModelInfo struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name"`
-	Provider    string `json:"provider"`
-	Default     bool   `json:"default"`
+	ID              string   `json:"id"`
+	DisplayName     string   `json:"display_name"`
+	Provider        string   `json:"provider"`
+	Default         bool     `json:"default"`
+	InputModalities []string `json:"input_modalities"`
 }
 
 // ChatStreamer is the /chat service surface: the multi-model ChatService
@@ -522,7 +525,11 @@ func (s *ChatService) AllowedModels(ctx context.Context, userID, appID string) (
 		if name == "" {
 			name = id
 		}
-		out = append(out, ChatModelInfo{ID: id, DisplayName: name, Provider: m.Provider, Default: id == s.catalog.DefaultModel})
+		mods := m.InputModalities
+		if len(mods) == 0 {
+			mods = []string{"text"}
+		}
+		out = append(out, ChatModelInfo{ID: id, DisplayName: name, Provider: m.Provider, Default: id == s.catalog.DefaultModel, InputModalities: mods})
 	}
 	return out, nil
 }

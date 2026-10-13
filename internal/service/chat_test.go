@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -588,6 +589,33 @@ func TestChatService_AllowedModels(t *testing.T) {
 	_, err = svc.AllowedModels(context.Background(), "u-nope", "yunhou-website")
 	if !errors.Is(err, ErrChatNoAccess) {
 		t.Errorf("err = %v, want ErrChatNoAccess", err)
+	}
+}
+
+// TestChatService_AllowedModels_InputModalities: GET /chat/models 透出
+// input_modalities —— vision 模型 ["text","image"] 原样透出，未配置
+// InputModalities 的 plain 模型按 fail-closed 缺省归一为 ["text"]（kaya
+// picker 据此决定哪些模型允许发图，与视觉门控同口径）。
+func TestChatService_AllowedModels_InputModalities(t *testing.T) {
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(visionTestCatalog("https://upstream.invalid"), subRepo, planRepo, &mockLLMUsageRepo{})
+
+	models, err := svc.AllowedModels(context.Background(), "u-1", "yunhou-website")
+	if err != nil {
+		t.Fatalf("AllowedModels: %v", err)
+	}
+	byID := map[string]ChatModelInfo{}
+	for _, m := range models {
+		byID[m.ID] = m
+	}
+	if got := byID["vision"].InputModalities; !slices.Equal(got, []string{"text", "image"}) {
+		t.Errorf("vision input_modalities = %v, want [text image]", got)
+	}
+	if got := byID["plain"].InputModalities; !slices.Equal(got, []string{"text"}) {
+		t.Errorf("plain input_modalities = %v, want [text]（空值 fail-closed 归一）", got)
 	}
 }
 

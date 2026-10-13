@@ -128,9 +128,13 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 				provider = pv.Code
 			}
 		}
+		mods := m.InputModalities
+		if len(mods) == 0 {
+			mods = []string{"text"}
+		}
 		out = append(out, ChatModelInfo{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
-			Default: m.ID == f.defaultModel,
+			Default: m.ID == f.defaultModel, InputModalities: mods,
 		})
 	}
 	return out, nil

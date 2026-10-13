@@ -218,3 +218,103 @@ func TestKayaModels_NonSentinelSnapshotErrorIs500(t *testing.T) {
 		t.Errorf("Retry-After must not be set on non-sentinel errors: %q", w.Header().Get("Retry-After"))
 	}
 }
+
+// Task 10：GET /chat/models 透出 input_modalities —— kaya picker 据此决定
+// 哪些内置模型允许发图。vision 模型（["text","image"]）原样透出。
+// 空值归一（["text"]）端对端不可达：Publish 与 ParseSnapshot 两道
+// ValidateModel 都拒绝空 modalities，已发布快照里不存在空值模型——
+// 该防御分支由包内测试钉住（见 kaya_models_internal_test.go）。
+func TestKayaModels_ListInputModalities(t *testing.T) {
+	f := newAccessFixture(t, 0)
+	store := f.store
+	ctx := context.Background()
+
+	catalogSvc := catalog.NewService(store)
+	if err := store.InsertModel(ctx, &domain.Model{
+		ID: "glm-4.6v", DisplayName: "GLM 4.6V", Lifecycle: domain.LifecycleActive,
+		ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols:       []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
+		InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prov := &domain.Provider{Code: "zhipu", DisplayName: "Zhipu",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}
+	if err := store.InsertProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	dep := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "glm-4.6v-up", BaseURL: "https://api.zhipu.example.com",
+		Protocol: domain.ProtocolOpenAIChat, ConnectTimeout: time.Second, RequestTimeout: time.Second,
+		Status: domain.DeploymentActive,
+	}
+	if err := store.InsertDeployment(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRoute(ctx, &domain.ModelRoute{
+		ModelID: "glm-4.6v", DeploymentID: dep.ID, Weight: 1, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	catalogSvc.SetPriceCheck(func(ctx context.Context, id string) (bool, error) { return true, nil })
+	if _, err := catalogSvc.Publish(ctx, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := access.NewResolver(store, nil)
+	cache := catalog.NewSnapshotCache(store, func(error) {})
+	engine := gin.New()
+	engine.GET("/chat/models", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, c.GetHeader("X-Test-User"))
+		c.Next()
+	}, httpapi.NewKayaModelsHandler(catalogSvc, resolver, cache, "glm-4.6v").List)
+
+	// 有 glm-4.6v 权益的用户 → 条目带 input_modalities=["text","image"]。
+	userID, _ := f.addUser(t)
+	acct, err := store.EnsureBillingAccount(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := &postgres.PolicyVersion{
+		Name: "kaya-gift", Revision: 1, ModelIDs: []string{"glm-4.6v"},
+		FiveHourLimit: microP(1_000), WeeklyLimit: microP(2_000), MonthlyLimit: microP(3_000),
+	}
+	if err := store.InsertPolicyVersion(ctx, pol); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	if err := store.InsertEntitlement(ctx, &domain.Entitlement{
+		BillingAccountID: acct.ID, SourceType: domain.SourceGrant,
+		SourceID: "gift-" + uuid.NewString(), ModelIDs: []string{"glm-4.6v"},
+		PolicyVersionID: pol.ID, AnchorAt: now, EffectiveFrom: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+	req.Header.Set("X-Test-User", userID)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("picker = %d: %s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Code int `json:"code"`
+		Data struct {
+			Models []map[string]any `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if len(env.Data.Models) != 1 {
+		t.Fatalf("models = %v, want exactly the entitled model", env.Data.Models)
+	}
+	mods, ok := env.Data.Models[0]["input_modalities"].([]any)
+	if !ok {
+		t.Fatalf("input_modalities missing or wrong type: %v", env.Data.Models[0])
+	}
+	if len(mods) != 2 || mods[0] != "text" || mods[1] != "image" {
+		t.Errorf("input_modalities = %v, want [text image]", mods)
+	}
+}

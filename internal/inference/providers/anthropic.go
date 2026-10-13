@@ -62,13 +62,6 @@ const anthropicVersionHeader = "2023-06-01"
 // with the stream flag and the gateway-forced output cap as parameters.
 func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
-	// Fail closed: image parts are relayed only after the multimodal relay
-	// lands (batch ②, Task 8); until then an image must error loudly, never
-	// be silently dropped into a text-only payload.
-	if model.MessagesHaveImages(r.Messages) {
-		return nil, domain.NewError(domain.CodeInvalidInput,
-			"providers: image input is not supported by this adapter")
-	}
 	maxTokens := call.OutputCap
 	if maxTokens <= 0 {
 		return nil, domain.NewError(domain.CodeInvalidInput,
@@ -84,15 +77,15 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 				systemParts = append(systemParts, m.Content)
 			}
 		case "user":
-			block := map[string]any{"type": "text", "text": m.Content}
+			blocks := anthropicContentBlocks(m)
 			// Anthropic requires strict user/assistant alternation (400
 			// otherwise): merge into the previous user turn. Text goes after
 			// any tool_result blocks already there — tool_results lead.
 			if n := len(msgs); n > 0 && msgs[n-1]["role"] == "user" {
-				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), block)
+				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), blocks...)
 				continue
 			}
-			msgs = append(msgs, map[string]any{"role": "user", "content": []any{block}})
+			msgs = append(msgs, map[string]any{"role": "user", "content": blocks})
 		case "assistant":
 			var blocks []any
 			if m.Content != "" {
@@ -232,6 +225,25 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 		}
 	}
 	return json.Marshal(payload)
+}
+
+// anthropicContentBlocks builds the user-turn content blocks: one text block
+// for legacy string content (byte-identical to the pre-multimodal shape), or
+// one block per part for multimodal messages.
+func anthropicContentBlocks(m model.ChatMessage) []any {
+	if m.ContentParts == nil {
+		return []any{map[string]any{"type": "text", "text": m.Content}}
+	}
+	blocks := make([]any, 0, len(m.ContentParts))
+	for _, p := range m.ContentParts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
+		case "image_url":
+			blocks = append(blocks, model.AnthropicImageBlock(p.ImageURL.URL))
+		}
+	}
+	return blocks
 }
 
 // translateAnthropicTools maps the OpenAI tool envelope

@@ -70,6 +70,60 @@ func TestChatMessage_UnmarshalNullAndEmptyContent(t *testing.T) {
 	}
 }
 
+func TestChatMessage_UnmarshalEmptyPartsArray(t *testing.T) {
+	for _, raw := range []string{
+		`{"role":"user","content":[]}`,
+		`{"role":"assistant","content":[],"tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{}"}}]}`,
+	} {
+		var m ChatMessage
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if m.ContentParts != nil {
+			t.Fatalf("%s: empty parts array should normalize to nil, got %v", raw, m.ContentParts)
+		}
+		b, _ := json.Marshal(m)
+		var wire map[string]any
+		if err := json.Unmarshal(b, &wire); err != nil {
+			t.Fatal(err)
+		}
+		c, ok := wire["content"].(string)
+		if !ok || c != "" {
+			t.Fatalf("%s: marshal content should be string \"\", got %s", raw, b)
+		}
+	}
+}
+
+func TestOpenAIWireContent_ImageDetailPassthrough(t *testing.T) {
+	var m ChatMessage
+	raw := `{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/i.png","detail":"high"}}]}`
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.ContentParts[0].ImageURL.Detail != "high" {
+		t.Fatalf("detail dropped at unmarshal: %+v", m.ContentParts[0].ImageURL)
+	}
+	parts, ok := m.OpenAIWireContent().([]any)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("wire=%v", m.OpenAIWireContent())
+	}
+	imgURL := parts[0].(map[string]any)["image_url"].(map[string]any)
+	if imgURL["detail"] != "high" {
+		t.Fatalf("wire image_url missing detail: %v", imgURL)
+	}
+
+	var plain ChatMessage
+	rawNoDetail := `{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/i.png"}}]}`
+	if err := json.Unmarshal([]byte(rawNoDetail), &plain); err != nil {
+		t.Fatal(err)
+	}
+	pParts := plain.OpenAIWireContent().([]any)
+	pImgURL := pParts[0].(map[string]any)["image_url"].(map[string]any)
+	if _, exists := pImgURL["detail"]; exists {
+		t.Fatalf("wire image_url should omit detail when unset: %v", pImgURL)
+	}
+}
+
 func TestOpenAIWireContent(t *testing.T) {
 	textOnly := ChatMessage{Role: "user", Content: "hi"}
 	if got := textOnly.OpenAIWireContent(); got != "hi" {

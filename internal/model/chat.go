@@ -21,6 +21,9 @@ type ContentPart struct {
 // data:image/...;base64 URI.
 type ImageURL struct {
 	URL string `json:"url"`
+	// Detail 是 OpenAI 视觉分档参数("low"/"high"/"auto"),透传上游;
+	// Anthropic 无此概念,转换时忽略。
+	Detail string `json:"detail,omitempty"`
 }
 
 // ChatMessage is one turn of a chat conversation, in the OpenAI-compatible
@@ -192,6 +195,13 @@ func (m *ChatMessage) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(wire.Content, &parts); err != nil {
 		return err
 	}
+	if len(parts) == 0 {
+		// "content":[] 归位为 content:""(ContentParts 保持 nil,走 legacy
+		// 路径),否则空数组会让 role=tool / 带 tool_calls 的 assistant 轮以
+		// ContentParts != nil 通过校验,上行 content 变成 [] 而非 ""——
+		// 比 master 的 400 绑定错误放得更宽。
+		parts = nil
+	}
 	var sb strings.Builder
 	for _, p := range parts {
 		switch p.Type {
@@ -242,7 +252,11 @@ func (m ChatMessage) OpenAIWireContent() any {
 		case "text":
 			parts = append(parts, map[string]any{"type": "text", "text": p.Text})
 		case "image_url":
-			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": p.ImageURL.URL}})
+			img := map[string]any{"url": p.ImageURL.URL}
+			if p.ImageURL.Detail != "" {
+				img["detail"] = p.ImageURL.Detail
+			}
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": img})
 		}
 	}
 	return parts

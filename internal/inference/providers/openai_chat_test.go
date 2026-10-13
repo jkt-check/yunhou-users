@@ -101,15 +101,30 @@ func TestOpenAIPayload_AcceptsShapesAnthropicRejects(t *testing.T) {
 	}
 }
 
-// Fail closed until batch ② (Task 7) replaces this with real image relay.
-func TestOpenAIChatPayload_RejectsImagesUntilRelayed(t *testing.T) {
+// Multimodal parts pass through as the OpenAI content array; text-only
+// messages keep the original string shape (byte-identical payload).
+func TestOpenAIChatBuildPayload_Multimodal(t *testing.T) {
 	var m model.ChatMessage
-	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
 		t.Fatal(err)
 	}
-	_, err := NewOpenAIChat().BuildPayload(testCall("m", true, 8192, []model.ChatMessage{m}, nil, nil))
-	if domain.CodeOf(err) != domain.CodeInvalidInput {
-		t.Fatalf("err = %v, want invalid_input (image must fail explicitly, never be silently dropped)", err)
+	body, err := NewOpenAIChat().BuildPayload(testCall("m", true, 8192,
+		[]model.ChatMessage{{Role: "system", Content: "s"}, m}, nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := decode(t, body)
+	msgs := payload["messages"].([]any)
+	if msgs[0].(map[string]any)["content"] != "s" {
+		t.Fatalf("text message shape changed: %v", msgs[0])
+	}
+	parts, ok := msgs[1].(map[string]any)["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("multimodal message not array: %v", msgs[1])
+	}
+	img := parts[1].(map[string]any)
+	if img["type"] != "image_url" || img["image_url"].(map[string]any)["url"] != "https://x.test/a.png" {
+		t.Fatalf("image part lost or reshaped: %v", img)
 	}
 }
 

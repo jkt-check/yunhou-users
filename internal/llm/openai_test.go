@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -151,5 +152,24 @@ func TestUsageTracker_OverlongLineDropped(t *testing.T) {
 	tr.Feed([]byte(stream))
 	if u := tr.Usage(); !u.OK || u.InputTokens != 1 || u.OutputTokens != 2 {
 		t.Errorf("Usage = %+v, want {1 2 true} after an overlong line", u)
+	}
+}
+
+func TestLegacyBuilders_HandleImagesExplicitly(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	for name, build := range map[string]func() ([]byte, error){
+		"openai":    func() ([]byte, error) { return BuildOpenAIPayload("m", []model.ChatMessage{m}, nil, nil) },
+		"anthropic": func() ([]byte, error) { return BuildAnthropicPayload("m", 0, 8192, []model.ChatMessage{m}, nil, nil) },
+	} {
+		body, err := build()
+		if err != nil {
+			t.Fatalf("%s: unexpected error %v (legacy builders must relay images)", name, err)
+		}
+		if !bytes.Contains(body, []byte("iVBORw0KGgoAAAANSUhEUg==")) {
+			t.Fatalf("%s: image silently dropped", name)
+		}
 	}
 }

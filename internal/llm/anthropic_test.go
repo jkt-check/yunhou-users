@@ -18,6 +18,16 @@ func decode(t *testing.T, body []byte) map[string]any {
 	return m
 }
 
+func TestBuildAnthropicPayload_RejectsImagesUntilRelayed(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildAnthropicPayload("m", 0, 0, []model.ChatMessage{m}, nil, nil); err == nil {
+		t.Fatal("image-bearing request must fail explicitly, never silently drop the image")
+	}
+}
+
 func TestBuildAnthropicPayload_BasicAndSystem(t *testing.T) {
 	body, err := BuildAnthropicPayload("kimi-k3", 0, 0, []model.ChatMessage{
 		{Role: "system", Content: "be brief"},

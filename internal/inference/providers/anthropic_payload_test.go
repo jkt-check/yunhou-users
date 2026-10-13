@@ -22,6 +22,18 @@ func anthropicCall(msgs []model.ChatMessage) *Call {
 	}
 }
 
+// Fail closed until batch ② (Task 8) replaces this with real image relay.
+func TestAnthropicBuildPayload_RejectsImagesUntilRelayed(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewAnthropicMessages().BuildPayload(anthropicCall([]model.ChatMessage{m}))
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("err = %v, want invalid_input (image must fail explicitly, never be silently dropped)", err)
+	}
+}
+
 func TestAnthropicBuildPayload_RoleMerging(t *testing.T) {
 	a := NewAnthropicMessages()
 	out, err := a.BuildPayload(anthropicCall([]model.ChatMessage{

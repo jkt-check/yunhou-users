@@ -416,11 +416,7 @@ func main() {
 	// concurrency leases), quota admission, and the orchestration service
 	// that pins ONE catalog snapshot per call (设计 §5: catalogCache 按请求
 	// pin；发布原子切换在各进程有界延迟内生效).
-	adapters := map[inferencedomain.Protocol]inferenceproviders.Adapter{
-		inferencedomain.ProtocolOpenAIChat:       inferenceproviders.NewOpenAIChat(),
-		inferencedomain.ProtocolOpenAIResponses:  inferenceproviders.NewOpenAIResponses(),
-		inferencedomain.ProtocolAnthropicMessage: inferenceproviders.NewAnthropicMessages(),
-	}
+	adapters := inferenceproviders.RegisteredAdapters()
 	routingSvc := inferencerouting.NewService(infStore, adapters, nil)
 	quotaSvc := inferencequota.NewService(infStore, nil)
 	entitlementResolver := inferenceaccess.NewEntitlementResolver(infStore, nil)

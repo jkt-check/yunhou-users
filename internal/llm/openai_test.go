@@ -40,6 +40,16 @@ func TestBuildOpenAIPayload_ToolsAndThinking(t *testing.T) {
 	}
 }
 
+func TestBuildOpenAIPayload_RejectsImagesUntilRelayed(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildOpenAIPayload("m", []model.ChatMessage{m}, nil, nil); err == nil {
+		t.Fatal("image-bearing request must fail explicitly, never silently drop the image")
+	}
+}
+
 func TestExtractStreamUsage(t *testing.T) {
 	raw := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n" +
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"total_tokens\":46}}\n\n" +

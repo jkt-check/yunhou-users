@@ -278,6 +278,19 @@ func TestOpenAIResponsesInclusion(t *testing.T) {
 	}
 }
 
+// 永久拒绝（本期不转换）：Responses 协议面不开放图片输入（批次②只透传
+// openai_chat / anthropic_messages）。
+func TestOpenAIResponsesPayload_RejectsImages(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewOpenAIResponses().BuildPayload(testCall("m", true, 100, []model.ChatMessage{m}, nil, nil))
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("err = %v, want invalid_input (Responses 协议面本期不开放图片)", err)
+	}
+}
+
 // M1：缺 call_id 的工具回合在付费往返之前本地 400（不外包给上游）。
 func TestOpenAIResponsesPayload_MissingCallIDRejected(t *testing.T) {
 	cases := map[string][]model.ChatMessage{

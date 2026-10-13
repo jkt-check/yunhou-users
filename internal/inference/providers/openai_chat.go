@@ -19,6 +19,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/model"
 )
 
 // OpenAIChat is the adapter for openai_chat deployments (OpenAI,
@@ -55,6 +56,13 @@ var passthroughKeys = []string{"temperature", "top_p", "stop", "presence_penalty
 // 丢字段; e.g. Anthropic's top_k has no chat-completions equivalent).
 func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
+	// Fail closed: image parts are relayed only after the multimodal relay
+	// lands (batch ②, Task 7); until then an image must error loudly, never
+	// be silently dropped into a text-only payload.
+	if model.MessagesHaveImages(r.Messages) {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: image input is not supported by this adapter")
+	}
 	payload := map[string]any{
 		"model":      call.Deployment.UpstreamModel,
 		"messages":   r.Messages,

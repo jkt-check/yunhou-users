@@ -21,6 +21,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/model"
 )
 
 // AnthropicMessages is the adapter for anthropic_messages deployments
@@ -61,6 +62,13 @@ const anthropicVersionHeader = "2023-06-01"
 // with the stream flag and the gateway-forced output cap as parameters.
 func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
+	// Fail closed: image parts are relayed only after the multimodal relay
+	// lands (batch ②, Task 8); until then an image must error loudly, never
+	// be silently dropped into a text-only payload.
+	if model.MessagesHaveImages(r.Messages) {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: image input is not supported by this adapter")
+	}
 	maxTokens := call.OutputCap
 	if maxTokens <= 0 {
 		return nil, domain.NewError(domain.CodeInvalidInput,

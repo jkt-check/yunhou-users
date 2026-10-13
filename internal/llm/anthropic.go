@@ -24,6 +24,12 @@ const (
 // shape is never sent to an Anthropic endpoint. hardCap bounds the final
 // max_tokens (<= 0 表示不设上限）——thinking 模式的协议提升也不得突破它。
 func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
+	// Fail closed: image parts are relayed only after the multimodal relay
+	// lands (batch ②); until then an image must error loudly, never be
+	// silently dropped into a text-only payload.
+	if model.MessagesHaveImages(messages) {
+		return nil, fmt.Errorf("image input is not relayed by this builder")
+	}
 	if maxTokens <= 0 {
 		maxTokens = anthropicDefaultMaxTokens
 	}

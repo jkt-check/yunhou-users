@@ -3,6 +3,7 @@ package llm
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/yunhou/users/internal/model"
@@ -15,6 +16,12 @@ import (
 // omit the chunk and the request is metered with zero tokens (the usage row
 // is still written, so spend never goes unrecorded structurally).
 func BuildOpenAIPayload(upstreamModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
+	// Fail closed: image parts are relayed only after the multimodal relay
+	// lands (batch ②); until then an image must error loudly, never be
+	// silently dropped into a text-only payload.
+	if model.MessagesHaveImages(messages) {
+		return nil, fmt.Errorf("image input is not relayed by this builder")
+	}
 	payload := map[string]any{
 		"model":          upstreamModel,
 		"messages":       messages,

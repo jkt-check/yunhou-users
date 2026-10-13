@@ -101,6 +101,18 @@ func TestOpenAIPayload_AcceptsShapesAnthropicRejects(t *testing.T) {
 	}
 }
 
+// Fail closed until batch ② (Task 7) replaces this with real image relay.
+func TestOpenAIChatPayload_RejectsImagesUntilRelayed(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewOpenAIChat().BuildPayload(testCall("m", true, 8192, []model.ChatMessage{m}, nil, nil))
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("err = %v, want invalid_input (image must fail explicitly, never be silently dropped)", err)
+	}
+}
+
 func TestOpenAIDecodeNonStream_FullUsage(t *testing.T) {
 	body := []byte(`{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
 		"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46,

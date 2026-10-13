@@ -24,7 +24,7 @@ type ImageURL struct {
 	// Detail 是 OpenAI 视觉分档参数("low"/"high"/"auto"),透传上游;
 	// Anthropic 无此概念,转换时忽略。透传是有意为之的规格决定(向前兼
 	// 容):不设取值白名单,上游未来新增 detail 值无需服务端变更即可生效;
-	// 非法值由上游 400 拒绝并透传为客户端错误。
+	// 非法值由上游 400 拒绝,客户端收到 502 固定文案,不会重试成功。
 	Detail string `json:"detail,omitempty"`
 }
 

@@ -128,16 +128,22 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 				provider = pv.Code
 			}
 		}
-		mods := m.InputModalities
-		if len(mods) == 0 {
-			mods = []string{"text"}
-		}
+		mods := modalitiesOrText(m.InputModalities)
 		out = append(out, ChatModelInfo{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
 			Default: m.ID == f.defaultModel, InputModalities: mods,
 		})
 	}
 	return out, nil
+}
+
+// modalitiesOrText 防御性兜底:catalog 发布校验已拒绝空 modalities(见
+// catalog.ValidateModel),正常路径不会走到空分支;兜底保证透出契约至少含 "text"。
+func modalitiesOrText(mods []string) []string {
+	if len(mods) == 0 {
+		return []string{"text"}
+	}
+	return mods
 }
 
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {

@@ -681,3 +681,28 @@ func TestChatFacade_RefreshFailureServesLastVerifiedSnapshot(t *testing.T) {
 		t.Error("OnRefreshError must fire on the absorbed refresh failure")
 	}
 }
+
+func TestModalitiesOrText(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"nil defaults to text", nil, []string{"text"}},
+		{"empty defaults to text", []string{}, []string{"text"}},
+		{"passthrough", []string{"text", "image"}, []string{"text", "image"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := modalitiesOrText(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("modalitiesOrText(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("modalitiesOrText(%v) = %v, want %v", tc.in, got, tc.want)
+				}
+			}
+		})
+	}
+}

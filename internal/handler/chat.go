@@ -3,11 +3,13 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -265,6 +267,8 @@ func chatErrorMapping(err error) (int, string) {
 		return http.StatusForbidden, service.ErrChatModelNotAllowed.Error()
 	case errors.Is(err, service.ErrChatRequestShape):
 		return http.StatusBadRequest, service.ErrChatRequestShape.Error()
+	case errors.Is(err, service.ErrChatModelNoVision):
+		return http.StatusBadRequest, service.ErrChatModelNoVision.Error()
 	default:
 		log.Printf("chat: internal error: %v", err)
 		return http.StatusInternalServerError, "internal error"
@@ -329,7 +333,8 @@ func (h *ChatHandler) logAccess(started time.Time, userID, appID, modelID string
 	h.accessLog.Println(string(b))
 }
 
-// chatTotalBytes sums message content + reasoning lengths in bytes (len() —
+// chatTotalBytes sums message content + reasoning + image_url lengths in
+// bytes (len() —
 // CJK content counts ~3 bytes per rune; the field names say bytes, not
 // chars). reasoning_content counts because it is billed upstream input on
 // thinking-mode continuations; this metric feeds cost analysis, so it must
@@ -338,6 +343,11 @@ func chatTotalBytes(messages []model.ChatMessage) int {
 	total := 0
 	for _, m := range messages {
 		total += len(m.Content) + len(m.ReasoningContent)
+		for _, p := range m.ContentParts {
+			if p.ImageURL != nil {
+				total += len(p.ImageURL.URL)
+			}
+		}
 	}
 	return total
 }
@@ -541,6 +551,7 @@ func validateChatMessages(messages []model.ChatMessage) string {
 		return "too many messages"
 	}
 	total := 0
+	images, imageBytes := 0, 0
 	for _, m := range messages {
 		switch m.Role {
 		case "system", "user", "assistant", "tool":
@@ -552,8 +563,35 @@ func validateChatMessages(messages []model.ChatMessage) string {
 		// that may legitimately be empty — and assistant turns that carry
 		// tool_calls (a pure tool-call turn, content empty by OpenAI
 		// convention). Everything else with empty content is rejected.
-		if m.Content == "" && m.Role != "tool" && len(m.ToolCalls) == 0 {
+		if m.Content == "" && len(m.ContentParts) == 0 && m.Role != "tool" && len(m.ToolCalls) == 0 {
 			return "message content is required"
+		}
+		if m.HasImages() {
+			// 图片只允许 user 轮（OpenAI/Anthropic 的交集；system/tool 带图
+			// 上游行为不一，入口统一拒绝好过歧义）。
+			if m.Role != "user" {
+				return "image parts are only allowed in user messages"
+			}
+			for _, p := range m.ContentParts {
+				if p.Type != "image_url" || p.ImageURL == nil {
+					continue
+				}
+				images++
+				if images > model.ChatMaxImages {
+					return "too many images"
+				}
+				u := p.ImageURL.URL // 限额按 wire 字节（len），见 model 常量注释
+				if len(u) > model.ChatMaxImageBytes {
+					return "image too large"
+				}
+				imageBytes += len(u)
+				if imageBytes > model.ChatMaxTotalImageBytes {
+					return "images too large in total"
+				}
+				if msg := validateChatImageURL(u); msg != "" {
+					return msg
+				}
+			}
 		}
 		// System messages get their own budget (ChatMaxSystemBytes, synced
 		// with kaya's MAX_SYSTEM_BYTES). kaya's rendered system prompt is
@@ -571,6 +609,46 @@ func validateChatMessages(messages []model.ChatMessage) string {
 		}
 	}
 	return ""
+}
+
+// validateChatImageURL accepts an http(s) URL (the upstream fetches it — this
+// server never does) or a data:image/<allowlisted>;base64 URI whose decoded
+// magic bytes match the declared type. Returns "" when valid.
+func validateChatImageURL(u string) string {
+	if !strings.HasPrefix(u, "data:") {
+		parsed, err := url.Parse(u)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return "invalid image_url"
+		}
+		return ""
+	}
+	mt, data, ok := model.ParseDataImageURI(u)
+	if !ok || !model.IsAllowedImageMediaType(mt) || len(data) == 0 {
+		return "invalid image_url"
+	}
+	// Magic-bytes check: decode only the first 24 base64 chars (18 bytes —
+	// covers PNG/JPEG/GIF/WEBP signatures), never the whole image. The
+	// declared type must agree with the sniffed one (jpg ≡ jpeg).
+	prefix := data
+	if len(prefix) > 24 {
+		prefix = prefix[:24]
+	}
+	raw, err := base64.StdEncoding.DecodeString(prefix)
+	if err != nil {
+		return "invalid image data"
+	}
+	sniffed := model.SniffImageMediaType(raw)
+	if sniffed == "" || sniffed != normalizeImageMediaType(mt) {
+		return "invalid image data"
+	}
+	return ""
+}
+
+func normalizeImageMediaType(mt string) string {
+	if mt == "image/jpg" {
+		return "image/jpeg"
+	}
+	return mt
 }
 
 // validateChatTools enforces the abuse bounds on the optional tools array.

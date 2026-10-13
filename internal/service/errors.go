@@ -85,6 +85,7 @@ var (
 	ErrChatUnknownModel     = errors.New("unknown chat model")
 	ErrChatModelNotAllowed  = errors.New("chat model is not allowed for the current plan")
 	ErrChatRequestShape     = errors.New("chat request shape is not supported by the selected model")
+	ErrChatModelNoVision    = errors.New("the selected model does not support image input")
 	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
 	ErrChatUpstreamError    = errors.New("chat upstream error")
 	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")

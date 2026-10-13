@@ -128,6 +128,68 @@ func TestOpenAIChatBuildPayload_Multimodal(t *testing.T) {
 	}
 }
 
+// Tool 字段随行 wire-map 分支（与 candidate BuildOpenAIPayload 同契约）：
+// parts 形态的 assistant 轮携带 tool_calls/reasoning_content，tool 结果轮
+// 携带 tool_call_id；未设置的键必须缺席。
+func TestOpenAIPayload_WireToolFields(t *testing.T) {
+	messages := []model.ChatMessage{
+		{
+			Role:             "assistant",
+			ContentParts:     []model.ContentPart{{Type: "text", Text: "let me check"}},
+			ToolCalls:        []model.ToolCall{{ID: "call_1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: `{"cmd":"ls"}`}}},
+			ReasoningContent: "need to inspect the filesystem",
+		},
+		{
+			Role:         "tool",
+			ContentParts: []model.ContentPart{{Type: "text", Text: "ls output"}},
+			ToolCallID:   "call_1",
+		},
+		{
+			Role:         "user",
+			ContentParts: []model.ContentPart{{Type: "text", Text: "plain parts"}},
+		},
+	}
+	body, err := NewOpenAIChat().BuildPayload(testCall("m", true, 8192, messages, nil, nil))
+	if err != nil {
+		t.Fatalf("BuildPayload: %v", err)
+	}
+	msgs := decode(t, body)["messages"].([]any)
+
+	assistant := msgs[0].(map[string]any)
+	calls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant tool_calls = %v", assistant["tool_calls"])
+	}
+	call := calls[0].(map[string]any)
+	if call["id"] != "call_1" || call["function"].(map[string]any)["name"] != "run_shell" {
+		t.Fatalf("tool_call = %v", call)
+	}
+	if assistant["reasoning_content"] != "need to inspect the filesystem" {
+		t.Fatalf("reasoning_content = %v", assistant["reasoning_content"])
+	}
+	if _, present := assistant["tool_call_id"]; present {
+		t.Fatalf("assistant must not carry tool_call_id: %v", assistant)
+	}
+
+	tool := msgs[1].(map[string]any)
+	if tool["tool_call_id"] != "call_1" {
+		t.Fatalf("tool_call_id = %v", tool["tool_call_id"])
+	}
+	if _, present := tool["tool_calls"]; present {
+		t.Fatalf("tool turn must not carry tool_calls: %v", tool)
+	}
+	if _, present := tool["reasoning_content"]; present {
+		t.Fatalf("tool turn must not carry reasoning_content: %v", tool)
+	}
+
+	plain := msgs[2].(map[string]any)
+	for _, k := range []string{"tool_calls", "tool_call_id", "reasoning_content"} {
+		if _, present := plain[k]; present {
+			t.Fatalf("empty fields must be omitted, found %s: %v", k, plain)
+		}
+	}
+}
+
 func TestOpenAIDecodeNonStream_FullUsage(t *testing.T) {
 	body := []byte(`{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
 		"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46,

@@ -23,22 +23,29 @@ import (
 // 为未知模型 400 / 无权益 403 / 无访问 403。
 
 // facadeKeyStore 是 access.KeyStore 的手写桩（CLAUDE.md：hand-rolled
-// doubles）；只有 GetBillingAccountByUser 的返回对本测试有意义。
+// doubles）；只有 GetBillingAccountByUser / ListActiveEntitlements 的返回
+// 对本测试有意义。
 type facadeKeyStore struct {
 	accountErr error
+	account    *domain.BillingAccount
+	ents       []domain.Entitlement
+	entsErr    error
 }
 
 func (f *facadeKeyStore) EnsureBillingAccount(context.Context, string) (*domain.BillingAccount, error) {
 	return nil, errors.New("not implemented")
 }
 func (f *facadeKeyStore) GetBillingAccountByUser(context.Context, string) (*domain.BillingAccount, error) {
+	if f.account != nil {
+		return f.account, nil
+	}
 	return nil, f.accountErr
 }
 func (f *facadeKeyStore) GetBillingAccountByID(context.Context, string) (*domain.BillingAccount, error) {
 	return nil, errors.New("not implemented")
 }
 func (f *facadeKeyStore) ListActiveEntitlements(context.Context, string, time.Time) ([]domain.Entitlement, error) {
-	return nil, nil
+	return f.ents, f.entsErr
 }
 func (f *facadeKeyStore) InsertAPIKey(context.Context, *domain.APIKey, string) error {
 	return errors.New("not implemented")
@@ -91,6 +98,224 @@ func (s *facadeRevisionSource) ActiveRevision(context.Context, domain.ConfigScop
 	return s.rev, s.revErr
 }
 
+// facadeCatalogStore 是 catalog.Store 的手写桩（同 facadeKeyStore 风格）：
+// 只有 ActiveRevision 对 AllowedModels 的 ListPublishedModels 读路径有意义，
+// 其余方法永不触达。
+type facadeCatalogStore struct {
+	rev *domain.ConfigRevision
+	err error
+}
+
+func (s *facadeCatalogStore) ActiveRevision(context.Context, domain.ConfigScope) (*domain.ConfigRevision, error) {
+	return s.rev, s.err
+}
+func (s *facadeCatalogStore) InsertModel(context.Context, *domain.Model) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetModel(context.Context, string) (*domain.Model, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListModels(context.Context, domain.ModelFilter) ([]domain.Model, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateModel(context.Context, *domain.Model) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteModel(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertProvider(context.Context, *domain.Provider) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetProvider(context.Context, string) (*domain.Provider, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetProviderByCode(context.Context, string) (*domain.Provider, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListProviders(context.Context, string, int) ([]domain.Provider, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateProvider(context.Context, *domain.Provider) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteProvider(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertDeployment(context.Context, *domain.Deployment) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetDeployment(context.Context, string) (*domain.Deployment, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) FindDeployment(context.Context, string, string, string) (*domain.Deployment, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListDeployments(context.Context, domain.DeploymentFilter) ([]domain.Deployment, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateDeployment(context.Context, *domain.Deployment) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteDeployment(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertRoute(context.Context, *domain.ModelRoute) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetRoute(context.Context, string) (*domain.ModelRoute, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListRoutes(context.Context, string) ([]domain.ModelRoute, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) UpdateRoute(context.Context, *domain.ModelRoute) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) DeleteRoute(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) InsertConfigRevision(context.Context, *domain.ConfigRevision) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ActivateRevision(context.Context, domain.ConfigScope, int) error {
+	return errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ActiveRevisionMeta(context.Context, domain.ConfigScope) (*domain.RevisionMeta, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ActiveRevisionHead(context.Context, domain.ConfigScope) (int64, int, error) {
+	return 0, 0, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) GetRevision(context.Context, domain.ConfigScope, int) (*domain.ConfigRevision, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) ListRevisionMetas(context.Context, domain.ConfigScope, int, int) ([]domain.RevisionMeta, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) LatestRevision(context.Context, domain.ConfigScope) (int, error) {
+	return 0, errors.New("not implemented")
+}
+func (s *facadeCatalogStore) BeginPublish(context.Context) (catalog.PublishTx, error) {
+	return nil, errors.New("not implemented")
+}
+
+// AllowedModels 全路径：已发布 ∩ 有权益的模型映射为视图模型——目录声明的
+// input_modalities 原样透传，Default 仅默认模型为 true，Provider 取首个
+// active deployment 的 provider code。
+func TestChatFacade_AllowedModels_ModalitiesPassthroughAndDefault(t *testing.T) {
+	t.Parallel()
+	resolver := access.NewResolver(&facadeKeyStore{
+		account: &domain.BillingAccount{ID: "ba-1", UserID: "u-1", Status: "active"},
+		ents:    []domain.Entitlement{{ID: "e-1", ModelIDs: []string{"glm-4.6", "glm-4.6v"}}},
+	}, nil)
+	rev := &domain.ConfigRevision{
+		ID: 1, Scope: domain.ScopeCatalog, Revision: 1, IsActive: true,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: catalog.BuildCatalogPayload(
+			[]domain.Model{
+				{ID: "glm-4.6", DisplayName: "GLM 4.6", Lifecycle: domain.LifecycleActive,
+					InputModalities: []string{"text"}, OutputModalities: []string{"text"},
+					ContextTokens: 1000, MaxOutputTokens: 100, Protocols: []domain.Protocol{domain.ProtocolKayaChat}},
+				{ID: "glm-4.6v", DisplayName: "GLM 4.6V", Lifecycle: domain.LifecycleActive,
+					InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"},
+					ContextTokens: 1000, MaxOutputTokens: 100, Protocols: []domain.Protocol{domain.ProtocolKayaChat}},
+			},
+			[]domain.Provider{{ID: "prov-1", Code: "zhipu", DisplayName: "Zhipu", AccessType: domain.AccessOfficialAPI, Status: "active"}},
+			[]domain.Deployment{{ID: "dep-1", ProviderID: "prov-1", UpstreamModel: "glm-4.6",
+				BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIChat,
+				ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second,
+				Status: domain.DeploymentActive}},
+			[]domain.ModelRoute{
+				{ID: "r-1", ModelID: "glm-4.6", DeploymentID: "dep-1", Weight: 1, Enabled: true},
+				{ID: "r-2", ModelID: "glm-4.6v", DeploymentID: "dep-1", Weight: 1, Enabled: true},
+			})},
+	}
+	cat := catalog.NewService(&facadeCatalogStore{rev: rev})
+	cat.SetPriceCheck(func(context.Context, string) (bool, error) { return true, nil })
+	snap, err := catalog.ParseSnapshot(rev)
+	if err != nil {
+		t.Fatalf("ParseSnapshot: %v", err)
+	}
+	f := NewChatGatewayFacade(nil, resolver, cat, stubSnapshotSource{snap: snap}, "glm-4.6")
+
+	models, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website")
+	if err != nil {
+		t.Fatalf("AllowedModels: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("models = %+v, want 2（已发布 ∩ 有权益）", models)
+	}
+	byID := make(map[string]ChatModelInfo, len(models))
+	for _, m := range models {
+		byID[m.ID] = m
+	}
+	def, ok := byID["glm-4.6"]
+	if !ok {
+		t.Fatalf("glm-4.6 missing: %+v", models)
+	}
+	if !def.Default {
+		t.Errorf("glm-4.6 Default = false, want true（默认模型）")
+	}
+	if len(def.InputModalities) != 1 || def.InputModalities[0] != "text" {
+		t.Errorf("glm-4.6 InputModalities = %v, want [text]", def.InputModalities)
+	}
+	if def.Provider != "zhipu" {
+		t.Errorf("glm-4.6 Provider = %q, want zhipu（active deployment 的 provider code）", def.Provider)
+	}
+	vis, ok := byID["glm-4.6v"]
+	if !ok {
+		t.Fatalf("glm-4.6v missing: %+v", models)
+	}
+	if vis.Default {
+		t.Errorf("glm-4.6v Default = true, want false（非默认模型）")
+	}
+	if len(vis.InputModalities) != 2 || vis.InputModalities[0] != "text" || vis.InputModalities[1] != "image" {
+		t.Errorf("glm-4.6v InputModalities = %v, want [text image]（目录声明原样透传）", vis.InputModalities)
+	}
+}
+
+// AllowedModels 读路径中段的瞬时错误（权益加载 / 目录加载 / 快照源）一律
+// 透传，不吞掉伪装成空列表或权限语义（对齐 Minor-5 的透传裁定）。
+func TestChatFacade_AllowedModels_MidPathErrorsPropagate(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("db connection reset")
+	activeAccount := &domain.BillingAccount{ID: "ba-1", UserID: "u-1", Status: "active"}
+
+	// AuthorizedModelIDs：权益加载失败 → 透传。
+	resolver := access.NewResolver(&facadeKeyStore{account: activeAccount, entsErr: boom}, nil)
+	f := NewChatGatewayFacade(nil, resolver, nil, nil, "glm-4.6")
+	if _, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website"); !errors.Is(err, boom) {
+		t.Fatalf("entitlements err = %v, want 透传 %v", err, boom)
+	}
+
+	// ListPublishedModels：目录加载失败 → 透传。
+	resolver = access.NewResolver(&facadeKeyStore{account: activeAccount}, nil)
+	cat := catalog.NewService(&facadeCatalogStore{err: boom})
+	f = NewChatGatewayFacade(nil, resolver, cat, nil, "glm-4.6")
+	if _, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website"); !errors.Is(err, boom) {
+		t.Fatalf("catalog err = %v, want 透传 %v", err, boom)
+	}
+
+	// snapshots.Current：快照源失败 → 透传。
+	snaplessCat := catalog.NewService(&facadeCatalogStore{rev: &domain.ConfigRevision{
+		ID: 1, Scope: domain.ScopeCatalog, Revision: 1, IsActive: true,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: catalog.BuildCatalogPayload(
+			[]domain.Model{{ID: "glm-4.6", DisplayName: "GLM 4.6", Lifecycle: domain.LifecycleActive,
+				InputModalities: []string{"text"}, OutputModalities: []string{"text"},
+				ContextTokens: 1000, MaxOutputTokens: 100, Protocols: []domain.Protocol{domain.ProtocolKayaChat}}},
+			[]domain.Provider{{ID: "prov-1", Code: "zhipu", DisplayName: "Zhipu", AccessType: domain.AccessOfficialAPI, Status: "active"}},
+			[]domain.Deployment{{ID: "dep-1", ProviderID: "prov-1", UpstreamModel: "glm-4.6",
+				BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIChat,
+				ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second,
+				Status: domain.DeploymentActive}},
+			[]domain.ModelRoute{{ID: "r-1", ModelID: "glm-4.6", DeploymentID: "dep-1", Weight: 1, Enabled: true}})},
+	}})
+	snaplessCat.SetPriceCheck(func(context.Context, string) (bool, error) { return true, nil })
+	f = NewChatGatewayFacade(nil, resolver, snaplessCat, stubSnapshotSource{err: boom}, "glm-4.6")
+	if _, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website"); !errors.Is(err, boom) {
+		t.Fatalf("snapshots err = %v, want 透传 %v", err, boom)
+	}
+}
 
 func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 	t.Parallel()

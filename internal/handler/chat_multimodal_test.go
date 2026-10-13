@@ -144,6 +144,33 @@ func TestValidateChatMessages_PureImageMessageIsContent(t *testing.T) {
 	}
 }
 
+// 声明 image/jpg + 真实 JPEG magic bytes 必须放行：sniff 返回规范名
+// image/jpeg，normalizeImageMediaType 把声明的 jpg 归一后再比对（jpg ≡ jpeg）。
+func TestValidateChatMessages_AcceptsDeclaredJpgWithJpegBytes(t *testing.T) {
+	jpg := "data:image/jpg;base64," + base64.StdEncoding.EncodeToString([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0})
+	msgs := []model.ChatMessage{
+		mustPartsMsg(t, `{"role":"user","content":[{"type":"image_url","image_url":{"url":"`+jpg+`"}}]}`),
+	}
+	if msg := validateChatMessages(msgs); msg != "" {
+		t.Fatalf("rejected: %s", msg)
+	}
+}
+
+func TestNormalizeImageMediaType(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"image/jpg", "image/jpeg"},  // 归一化：jpg ≡ jpeg（sniff 只产规范名）
+		{"image/jpeg", "image/jpeg"}, // 已规范：原样返回
+		{"image/png", "image/png"},
+		{"image/gif", "image/gif"},
+		{"image/webp", "image/webp"},
+	}
+	for _, tc := range cases {
+		if got := normalizeImageMediaType(tc.in); got != tc.want {
+			t.Errorf("normalizeImageMediaType(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestChatTotalBytesCountsImages(t *testing.T) {
 	msgs := []model.ChatMessage{
 		mustPartsMsg(t, `{"role":"user","content":[{"type":"text","text":"ab"},{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`),

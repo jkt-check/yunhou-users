@@ -155,7 +155,7 @@ func TestUsageTracker_OverlongLineDropped(t *testing.T) {
 	}
 }
 
-func TestLegacyBuilders_HandleImagesExplicitly(t *testing.T) {
+func TestLegacyBuilders_HandlesImagesExplicitly(t *testing.T) {
 	var m model.ChatMessage
 	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}}]}`)); err != nil {
 		t.Fatal(err)

@@ -1493,7 +1493,7 @@ git commit -m "test(e2e): multimodal /chat, vision gate, and /v1 rejection pins"
 - [ ] **Step 2:** 更新：
   - `POST /chat`：`messages[].content` 支持 string 或 `[{type:"text"}, {type:"image_url"}]` 数组；图片仅 user 轮、≤4 张、单张 wire ≤1 MiB、合计 ≤3 MiB；data URI 需 magic bytes 与声明 MIME 一致；非视觉模型带图 → 400 `the selected model does not support image input`；
   - `GET /chat/models`：条目新增 `input_modalities`；
-  - 运营点亮步骤：legacy 在 `LLM_PROVIDERS_JSON` 模型条目加 `"input_modalities":["text","image"]`；网关用 `PUT /admin/inference/models` 设 `input_modalities` 后发布 catalog revision；缺省/不配置 = 纯文本（fail closed）；
+  - 运营点亮步骤：legacy 在 `LLM_PROVIDERS_JSON` 模型条目加 `"input_modalities":["text","image"]`；网关用 `PATCH /admin/models/:id` 设 `input_modalities` 后 `POST /admin/catalog/publish` 发布 catalog revision；缺省/不配置 = 纯文本（fail closed）；
   - 注明 `openai_responses` 协议部署不接受图片（显式 502/InvalidInput），视觉模型不要部署在该协议上。
 
 - [ ] **Step 3: Commit**

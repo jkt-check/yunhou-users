@@ -76,7 +76,7 @@ kaya 客户端已支持多模态输入，但内置模型入口（平台代理的
 **缺省一律 fail-closed：缺失/空 `input_modalities` = 纯文本模型。**
 
 - legacy：`LLM_PROVIDERS_JSON` 模型条目新增可选 `input_modalities`，不配 = `["text"]`，`AcceptsImages()` 为 false。视觉模型必须由运营显式加字段才放行——失败方向永远是"视觉模型暂时拒绝图片"（安全），绝不会"文本模型误放行"。env JSON 是配置不是数据，**无需迁移/回填**；
-- 网关：DB schema 默认 `'{text}'` 已就位，存量行天然 text-only；运营通过既有管理 API（`PUT /admin/inference/models`，`admin_models.go:159` 已支持该字段）设置后发布 catalog revision，**无需新迁移**；
+- 网关：DB schema 默认 `'{text}'` 已就位，存量行天然 text-only；运营通过既有管理 API（`PATCH /admin/models/:id`，`admin_models.go` 已支持该字段）设置后发布 catalog revision，**无需新迁移**；
 - 检查点三处：
   1. legacy `ChatService.StreamChat`：Resolve + 订阅检查之后、构造上行 payload 之前 → `ErrChatModelNoVision`（新哨兵，400）；
   2. facade `streamChatModel`：快照在手，查 `snap.Model(modelID).InputModalities` → 同一哨兵（400 文案对齐 legacy）；

@@ -40,13 +40,30 @@ func TestBuildOpenAIPayload_ToolsAndThinking(t *testing.T) {
 	}
 }
 
-func TestBuildOpenAIPayload_RejectsImagesUntilRelayed(t *testing.T) {
+func TestBuildOpenAIPayload_MultimodalPassthrough(t *testing.T) {
 	var m model.ChatMessage
-	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := BuildOpenAIPayload("m", []model.ChatMessage{m}, nil, nil); err == nil {
-		t.Fatal("image-bearing request must fail explicitly, never silently drop the image")
+	body, err := BuildOpenAIPayload("gpt-x", []model.ChatMessage{{Role: "system", Content: "s"}, m}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	msgs := payload["messages"].([]any)
+	if msgs[0].(map[string]any)["content"] != "s" { // 文本-only 形状不变（pin）
+		t.Fatalf("text message changed shape: %v", msgs[0])
+	}
+	parts, ok := msgs[1].(map[string]any)["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("multimodal message not an array: %v", msgs[1])
+	}
+	img := parts[1].(map[string]any)
+	if img["type"] != "image_url" || img["image_url"].(map[string]any)["url"] != "data:image/png;base64,AAA" {
+		t.Fatalf("image part=%v", img)
 	}
 }
 

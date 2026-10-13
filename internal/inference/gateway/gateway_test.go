@@ -1481,6 +1481,37 @@ func TestExecutedUnknown_NoBlindReplay(t *testing.T) {
 	}
 }
 
+// TestGateway_ImageGateRejectsTextOnlyModel: 网关内兜底防御层——快照模型
+// InputModalities 不含 image 时，带图请求在任何计量/上游花费之前以
+// CodeInvalidInput 拒绝（能力校验在边缘层完成；此为防未来新入口面漏检的
+// 网关兜底，空 modalities = text-only fail closed）。fixture 快照模型即
+// InputModalities=["text"]。
+func TestGateway_ImageGateRejectsTextOnlyModel(t *testing.T) {
+	up := newUpstream(t, sseHandler(chunkB, chunkDone))
+	f := newFixture(t, up)
+	p, key := f.principal()
+	req := chatReq(true, "what is this")
+	req.Messages[1].Content = "what is this"
+	req.Messages[1].ContentParts = []model.ContentPart{
+		{Type: "text", Text: "what is this"},
+		{Type: "image_url", ImageURL: &model.ImageURL{URL: "https://example.com/cat.png"}},
+	}
+
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, req)
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("err = %v, want code %s", err, domain.CodeInvalidInput)
+	}
+	// 必须命中网关兜底自身的文案——provider adapter 的 fail-closed 报错
+	// （"providers: image input is not supported..."）在更下游，若断言放宽到
+	// 仅看 code，删掉网关兜底这测试也会假绿。
+	if err == nil || !strings.Contains(err.Error(), "does not accept image input") {
+		t.Fatalf("err = %v, want 网关兜底文案 %q", err, "does not accept image input")
+	}
+	if n := up.calls.Load(); n != 0 {
+		t.Errorf("upstream calls = %d, want 0（图片在任何花费之前被拒）", n)
+	}
+}
+
 // nilStreamAdapter 模拟适配器缺陷:WrapStream 返回 nil —— Dispatch 成功但
 // onStreamDispatch 组装 StreamBody 时 disp.Stream.Tap 解引用 panic
 // (keeper 创建到交接之间的 panic 场景)。

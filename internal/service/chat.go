@@ -330,6 +330,12 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 		return nil, route, accessErr
 	}
 
+	// 视觉门控：图片输入只对声明了 image 模态的模型开放——其余在上游花钱
+	// 之前用固定文案 400 拒绝。
+	if model.MessagesHaveImages(messages) && !m.AcceptsImages() {
+		return nil, route, fmt.Errorf("%w: %s", ErrChatModelNoVision, resolvedID)
+	}
+
 	var body []byte
 	var err error
 	// 评审安全补丁（无 max_tokens 上限）：客户端请求不携带 max_tokens

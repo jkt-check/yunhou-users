@@ -85,6 +85,11 @@ func TestCatalog_Validate(t *testing.T) {
 			c.Models["deepseek-flash"] = m
 		}, "upstream_model"},
 		{"negative price", func(c *Catalog) { m := c.Models["deepseek-flash"]; m.InputPerMtok = -1; c.Models["deepseek-flash"] = m }, "price"},
+		{"unsupported input modality", func(c *Catalog) {
+			m := c.Models["deepseek-flash"]
+			m.InputModalities = []string{"text", "audio"}
+			c.Models["deepseek-flash"] = m
+		}, "unsupported input_modality"},
 		{"unknown default", func(c *Catalog) { c.DefaultModel = "ghost" }, "default_model"},
 	}
 	for _, tc := range cases {
@@ -111,6 +116,50 @@ func TestCatalog_DefaultInferredFromSingleModel(t *testing.T) {
 	}
 	if c.DefaultModel != "only" {
 		t.Errorf("DefaultModel = %q, want inferred \"only\"", c.DefaultModel)
+	}
+}
+
+// TestModel_AcceptsImages: 缺省/未配置 InputModalities 一律 text-only
+// （fail closed——视觉模型在 operator 显式配置前拒绝图片，绝不反向）。
+func TestModel_AcceptsImages(t *testing.T) {
+	cases := []struct {
+		name       string
+		modalities []string
+		want       bool
+	}{
+		{"missing (nil)", nil, false},
+		{"explicit empty", []string{}, false},
+		{"text only", []string{"text"}, false},
+		{"text + image", []string{"text", "image"}, true},
+		{"image only", []string{"image"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (Model{InputModalities: tc.modalities}).AcceptsImages(); got != tc.want {
+				t.Errorf("AcceptsImages(%v) = %v, want %v", tc.modalities, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseCatalog_InputModalities: input_modalities 从 LLM_PROVIDERS_JSON
+// 解析进 Model，缺省的模型保持 nil（fail closed 由 AcceptsImages 保证）。
+func TestParseCatalog_InputModalities(t *testing.T) {
+	raw := `{"default_model":"vision",
+		"providers":{"p":{"protocol":"openai","base_url":"https://x.example","api_keys":["k"]}},
+		"models":{
+			"vision":{"provider":"p","upstream_model":"u-v","input_modalities":["text","image"]},
+			"plain":{"provider":"p","upstream_model":"u-p"}
+		}}`
+	c, err := ParseCatalog(raw)
+	if err != nil {
+		t.Fatalf("ParseCatalog: %v", err)
+	}
+	if !c.Models["vision"].AcceptsImages() {
+		t.Error("vision model must accept images")
+	}
+	if c.Models["plain"].AcceptsImages() {
+		t.Error("model without input_modalities must be text-only (fail closed)")
 	}
 }
 

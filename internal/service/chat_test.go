@@ -993,6 +993,111 @@ func TestChatService_SameOriginRedirectFollowed(t *testing.T) {
 	resp.Body.Close()
 }
 
+// imageChatMessages returns a request carrying one image_url part — the
+// vision-gate trigger shape (model.MessagesHaveImages == true).
+func imageChatMessages() []model.ChatMessage {
+	return []model.ChatMessage{{
+		Role:    "user",
+		Content: "what is this",
+		ContentParts: []model.ContentPart{
+			{Type: "text", Text: "what is this"},
+			{Type: "image_url", ImageURL: &model.ImageURL{URL: "https://example.com/cat.png"}},
+		},
+	}}
+}
+
+// visionTestCatalog: "plain" 未配置 InputModalities（缺省 = text-only，
+// fail closed），"vision" 显式声明 ["text","image"]。
+func visionTestCatalog(baseURL string) *llm.Catalog {
+	return &llm.Catalog{
+		DefaultModel: "plain",
+		Providers: map[string]llm.Provider{
+			"p": {Protocol: llm.ProtocolOpenAI, BaseURL: baseURL, APIKeys: []string{"k"}},
+		},
+		Models: map[string]llm.Model{
+			"plain":  {Provider: "p", UpstreamModel: "plain-up"},
+			"vision": {Provider: "p", UpstreamModel: "vision-up", InputModalities: []string{"text", "image"}},
+		},
+	}
+}
+
+// TestStreamChat_RejectsImagesForTextOnlyModel: 未声明 image 模态的模型
+// （含缺省未配置的 fail-closed 情形）对带图请求在上游花钱之前 400——
+// errors.Is 命中 ErrChatModelNoVision，上游零调用，错误随 resolved route。
+func TestStreamChat_RejectsImagesForTextOnlyModel(t *testing.T) {
+	var hits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(visionTestCatalog(srv.URL), subRepo, planRepo, &mockLLMUsageRepo{})
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{"explicit text-only model", "plain", "plain"},
+		{"empty model falls to text-only default", "", "plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, route, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", tc.model, imageChatMessages(), nil, nil)
+			if !errors.Is(err, ErrChatModelNoVision) {
+				t.Fatalf("err = %v, want ErrChatModelNoVision", err)
+			}
+			if route == nil || route.LogicalModel != tc.want {
+				t.Errorf("route = %+v, want resolved LogicalModel %q（审计按生效模型归因）", route, tc.want)
+			}
+		})
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("upstream called %d times, want 0（门控在任何花费之前拒绝）", n)
+	}
+}
+
+// TestStreamChat_VisionModelPassesGate: 声明了 image 模态的模型不被门控拒。
+// 批次① 的上行 builder 仍 fail-closed（Task 3），故这里断言错误存在但
+// 不是 ErrChatModelNoVision，且错误发生在 payload 构造阶段（上游零调用）。
+func TestStreamChat_VisionModelPassesGate(t *testing.T) {
+	var hits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(visionTestCatalog(srv.URL), subRepo, planRepo, &mockLLMUsageRepo{})
+
+	_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "vision", imageChatMessages(), nil, nil)
+	if errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("err = %v, vision 模型不得被视觉门控拦截", err)
+	}
+	if err == nil {
+		t.Fatal("err = nil, 批次① 的 builder fail-closed 守卫应显式报错（图片暂不透传上游）")
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("upstream called %d times, want 0（builder fail-closed 在花费之前）", n)
+	}
+
+	// 同一 vision 模型的纯文本请求不受门控影响（走到上游失败为止）。
+	_, _, err = svc.StreamChat(context.Background(), "u-1", "yunhou-website", "vision", chatMessages(), nil, nil)
+	if errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("text-only request err = %v, want 不受视觉门控影响", err)
+	}
+}
+
 // TestChatService_RedirectLoopFails: 同 origin 重定向循环在 5 跳后报错，
 // 按上游错误处理（不会无限跳转）。
 func TestChatService_RedirectLoopFails(t *testing.T) {

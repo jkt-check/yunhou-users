@@ -41,6 +41,7 @@ import (
 	"github.com/yunhou/users/internal/inference/providers"
 	"github.com/yunhou/users/internal/inference/quota"
 	"github.com/yunhou/users/internal/inference/routing"
+	"github.com/yunhou/users/internal/model"
 )
 
 // SnapshotSource pins one catalog snapshot per call (设计 §5: 一次调用固定
@@ -328,6 +329,11 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	if !modelSpeaks(m, clientProto) {
 		return nil, domain.NewError(domain.CodeInvalidInput,
 			"model "+m.ID+" is not served on protocol "+string(clientProto))
+	}
+	// 防御性模态检查（设计: 能力校验在边缘层完成；此为网关内兜底，防未来
+	// 新入口面漏检）。空 InputModalities = text-only（fail closed）。
+	if model.MessagesHaveImages(req.Messages) && !contains(m.InputModalities, "image") {
+		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not accept image input")
 	}
 	// 2. Capability validation BEFORE any spend (设计: 不支持的工具/模态明
 	// 确报错). Modality/field-shape validation happened at the API edge.

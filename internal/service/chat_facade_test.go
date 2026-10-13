@@ -12,6 +12,7 @@ import (
 	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/providers"
+	"github.com/yunhou/users/internal/model"
 )
 
 // chat_facade_test.go — 评审批次7 Minor-4/5 验收 + R7-N4a/N4b 契约对齐：
@@ -304,6 +305,76 @@ func TestChatFacade_StreamChat_NoAccountResolverIsNoAccess(t *testing.T) {
 	// 记 resolved 默认模型 id（ChatStreamer 契约）。
 	if route == nil || route.LogicalModel != "glm-4.6" {
 		t.Errorf("route = %+v, want resolved LogicalModel glm-4.6（403 错误行按默认模型归因）", route)
+	}
+}
+
+// --- 视觉门控（对齐 legacy StreamChat）：带图请求只对声明了 image 模态的
+// 模型放行，其余在上游花钱之前 400（ErrChatModelNoVision）；缺省
+// input_modalities 按 text-only（fail closed）。 ---
+
+// facadeImageMessages：一条带 image_url part 的用户消息（门控触发形态）。
+func facadeImageMessages() []model.ChatMessage {
+	return []model.ChatMessage{{
+		Role:    "user",
+		Content: "what is this",
+		ContentParts: []model.ContentPart{
+			{Type: "text", Text: "what is this"},
+			{Type: "image_url", ImageURL: &model.ImageURL{URL: "https://example.com/cat.png"}},
+		},
+	}}
+}
+
+func TestChatFacade_StreamChat_ImageGate(t *testing.T) {
+	t.Parallel()
+	// resolver 永远命中「无计费账户」：门控放行的请求下一站拿到
+	// ErrChatNoAccess（403 语义）——用它作为「过了门控」的可观察证据，
+	// gw 传 nil：正常路径不触达 gateway。
+	resolver := access.NewResolver(&facadeKeyStore{
+		accountErr: domain.NewError(domain.CodeNotFound, "billing account not found"),
+	}, nil)
+	snaps := stubSnapshotSource{snap: &catalog.Snapshot{Models: map[string]domain.Model{
+		"glm-4.6":    {ID: "glm-4.6", InputModalities: []string{"text"}},
+		"glm-4.6v":   {ID: "glm-4.6v", InputModalities: []string{"text", "image"}},
+		"glm-legacy": {ID: "glm-legacy"}, // 缺省 modalities = text-only（fail closed）
+	}}}
+	f := NewChatGatewayFacade(nil, resolver, nil, snaps, "glm-4.6")
+	img := facadeImageMessages()
+
+	// text-only 模型（默认模型路径）+ 带图 → ErrChatModelNoVision，且错误随
+	// resolved route（审计按生效模型归因）。
+	_, route, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", img, nil, nil)
+	if !errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("err = %v, want ErrChatModelNoVision", err)
+	}
+	if route == nil || route.LogicalModel != "glm-4.6" {
+		t.Errorf("route = %+v, want resolved LogicalModel glm-4.6", route)
+	}
+
+	// 缺省 input_modalities 一律按 text-only 拒绝（fail closed）。
+	_, _, err = f.StreamChat(context.Background(), "u-1", "yunhou-website", "glm-legacy", img, nil, nil)
+	if !errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("err = %v, want ErrChatModelNoVision（缺省 modalities fail closed）", err)
+	}
+
+	// vision 模型过门控 → 推进到用户解析（403 证明未被门控拦截）。
+	_, _, err = f.StreamChat(context.Background(), "u-1", "yunhou-website", "glm-4.6v", img, nil, nil)
+	if errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("err = %v, vision 模型不得被门控拦截", err)
+	}
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("err = %v, want ErrChatNoAccess（过门控后推进到用户解析）", err)
+	}
+
+	// 无图请求不受门控影响。
+	_, _, err = f.StreamChat(context.Background(), "u-1", "yunhou-website", "", nil, nil, nil)
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("text-only err = %v, want ErrChatNoAccess（不受门控影响）", err)
+	}
+
+	// 带图 + 未知模型 id → ErrChatUnknownModel（与无图路径的未知模型语义对齐）。
+	_, _, err = f.StreamChat(context.Background(), "u-1", "yunhou-website", "ghost", img, nil, nil)
+	if !errors.Is(err, ErrChatUnknownModel) {
+		t.Fatalf("err = %v, want ErrChatUnknownModel（带图请求查无此模型）", err)
 	}
 }
 

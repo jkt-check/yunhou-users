@@ -41,6 +41,7 @@ import (
 	"github.com/yunhou/users/internal/inference/providers"
 	"github.com/yunhou/users/internal/inference/quota"
 	"github.com/yunhou/users/internal/inference/routing"
+	"github.com/yunhou/users/internal/model"
 )
 
 // SnapshotSource pins one catalog snapshot per call (设计 §5: 一次调用固定
@@ -328,6 +329,11 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	if !modelSpeaks(m, clientProto) {
 		return nil, domain.NewError(domain.CodeInvalidInput,
 			"model "+m.ID+" is not served on protocol "+string(clientProto))
+	}
+	// 防御性模态检查（设计: 能力校验在边缘层完成；此为网关内兜底，防未来
+	// 新入口面漏检）。空 InputModalities = text-only（fail closed）。
+	if model.MessagesHaveImages(req.Messages) && !contains(m.InputModalities, "image") {
+		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not accept image input")
 	}
 	// 2. Capability validation BEFORE any spend (设计: 不支持的工具/模态明
 	// 确报错). Modality/field-shape validation happened at the API edge.
@@ -1250,14 +1256,27 @@ func (s *Service) estimateUsage(adm *quota.AdmissionResult, contentBytes int64) 
 	return domain.UsageBuckets{InputTokens: &in, OutputTokens: &out}
 }
 
+// imageInputTokenEstimate is the per-image admission estimate (OpenAI
+// high-detail worst case ≈ 85 + 170×6 tiles). Admission is a safe upper
+// bound corrected by the real usage chunk at settlement (设计 §7.1/7.2) —
+// it never bills directly; the rare no-usage fallback shares this
+// conservative direction with the bytes/2 text heuristic.
+const imageInputTokenEstimate = 1105
+
 // EstimateInputTokens is the admission input estimate: a conservative
 // bytes-based upper bound (CJK ~3 bytes/token, English ~4 bytes/token; /2
 // over-estimates both — a reservation is a SAFE UPPER BOUND, 设计 §7.2),
 // narrowed to the model context limit by quota.InputBound.
 func EstimateInputTokens(req *providers.ChatRequest) int64 {
 	var b int64
+	var images int64
 	for _, m := range req.Messages {
 		b += int64(len(m.Content)) + 8
+		for _, p := range m.ContentParts {
+			if p.Type == "image_url" {
+				images++
+			}
+		}
 		for _, tc := range m.ToolCalls {
 			b += int64(len(tc.Function.Name)+len(tc.Function.Arguments)) + 16
 		}
@@ -1268,7 +1287,7 @@ func EstimateInputTokens(req *providers.ChatRequest) int64 {
 	if len(req.ToolChoice) > 0 {
 		b += int64(len(req.ToolChoice))
 	}
-	return b/2 + 16
+	return b/2 + 16 + images*imageInputTokenEstimate
 }
 
 func modelSpeaks(m *domain.Model, p domain.Protocol) bool {

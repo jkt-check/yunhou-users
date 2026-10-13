@@ -55,9 +55,31 @@ var passthroughKeys = []string{"temperature", "top_p", "stop", "presence_penalty
 // 丢字段; e.g. Anthropic's top_k has no chat-completions equivalent).
 func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
+	// Multimodal relay: a message with content parts is rendered as a map
+	// with the parts array (OpenAIWireContent); text-only messages keep the
+	// original struct so the payload stays byte-identical (model.go 注释:
+	// ContentParts json:"-", 逐字节不变契约).
+	msgs := make([]any, 0, len(r.Messages))
+	for _, m := range r.Messages {
+		if m.ContentParts == nil {
+			msgs = append(msgs, m)
+			continue
+		}
+		w := map[string]any{"role": m.Role, "content": m.OpenAIWireContent()}
+		if len(m.ToolCalls) > 0 {
+			w["tool_calls"] = m.ToolCalls
+		}
+		if m.ToolCallID != "" {
+			w["tool_call_id"] = m.ToolCallID
+		}
+		if m.ReasoningContent != "" {
+			w["reasoning_content"] = m.ReasoningContent
+		}
+		msgs = append(msgs, w)
+	}
 	payload := map[string]any{
 		"model":      call.Deployment.UpstreamModel,
-		"messages":   r.Messages,
+		"messages":   msgs,
 		"stream":     r.Stream,
 		"max_tokens": call.OutputCap,
 	}

@@ -139,3 +139,15 @@ func TestEstimateInputTokens_ToolPayloads(t *testing.T) {
 		t.Errorf("tool-bearing estimate %d <= plain %d", EstimateInputTokens(req), EstimateInputTokens(plain))
 	}
 }
+
+func TestEstimateInputTokens_ImageParts(t *testing.T) {
+	plain := &providers.ChatRequest{Messages: []model.ChatMessage{{Role: "user", Content: "hi"}}}
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	withImg := &providers.ChatRequest{Messages: []model.ChatMessage{m}}
+	if got := EstimateInputTokens(withImg) - EstimateInputTokens(plain); got != 1105 {
+		t.Fatalf("image estimate delta=%d want 1105", got)
+	}
+}

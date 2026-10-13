@@ -644,3 +644,49 @@ func TestV1ChatCompletions_ToolsCapabilityRejected(t *testing.T) {
 		t.Errorf("attempts = %d, want 0 (capability rejection precedes any spend)", cnt)
 	}
 }
+
+// /v1 拒绝回归 pin（多模态批次 Task 12，评审意见 5）：/v1 面不绑定
+// model.ChatRequest，content 数组必须在协议边界拿到**显式拒绝文案**的 400
+// —— 不能退化成笼统的 JSON 绑定错误，也不能静默丢字段拼成文本。
+// e2e harness 不挂 /v1 面，故此 pin 放在协议面测试文件。
+func TestV1ChatCompletions_ContentArrayExplicitlyRejected(t *testing.T) {
+	f := newV1Fixture(t)
+	w := f.call(t, http.MethodPost, "/v1/chat/completions", f.keyPlain, map[string]any{
+		"model": "glm-4.6",
+		"messages": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "text", "text": "describe this image"},
+				{"type": "image_url", "image_url": map[string]any{"url": "https://x.test/i.png"}},
+			},
+		}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	var errBody struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("error body not decodable: %v (%s)", err, w.Body.String())
+	}
+	if errBody.Error.Code != "invalid_input" {
+		t.Errorf("error code = %q, want invalid_input (%s)", errBody.Error.Code, w.Body.String())
+	}
+	if !strings.Contains(errBody.Error.Message, "content arrays (multimodal parts) are not supported") {
+		t.Errorf("error message = %q, want the explicit multimodal rejection", errBody.Error.Message)
+	}
+	// 拒绝发生在协议边界：零上游触达、零账本痕迹。
+	select {
+	case b := <-f.bodies:
+		t.Errorf("upstream was hit despite the protocol-edge rejection: %s", b)
+	default:
+	}
+	var cnt int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM inference_attempts`).Scan(&cnt); err != nil || cnt != 0 {
+		t.Errorf("attempts = %d, want 0 (rejection precedes any spend)", cnt)
+	}
+}

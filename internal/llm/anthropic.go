@@ -37,17 +37,17 @@ func BuildAnthropicPayload(upstreamModel string, maxTokens, hardCap int, message
 				systemParts = append(systemParts, m.Content)
 			}
 		case "user":
-			block := map[string]any{"type": "text", "text": m.Content}
+			blocks := model.AnthropicUserBlocks(m)
 			// Anthropic requires strict user/assistant alternation (400
 			// otherwise) while handler validation deliberately allows
 			// consecutive same-role messages: merge into the previous user
 			// turn. Text goes after any tool_result blocks already there —
 			// tool_results must lead the turn.
 			if n := len(msgs); n > 0 && msgs[n-1]["role"] == "user" {
-				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), block)
+				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), blocks...)
 				continue
 			}
-			msgs = append(msgs, map[string]any{"role": "user", "content": []any{block}})
+			msgs = append(msgs, map[string]any{"role": "user", "content": blocks})
 		case "assistant":
 			var blocks []any
 			if m.Content != "" {

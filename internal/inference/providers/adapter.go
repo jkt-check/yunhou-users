@@ -106,6 +106,18 @@ type Adapter interface {
 	DecodeNonStream(body []byte) (*NonStreamResult, error)
 }
 
+// RegisteredAdapters is the ONE source of the protocol→adapter registry:
+// cmd/server wires it into routing.NewService, and the multimodal guard test
+// (multimodal_guard_test.go) iterates it so a newly registered adapter that
+// forgets image handling fails CI instead of silently dropping images.
+func RegisteredAdapters() map[domain.Protocol]Adapter {
+	return map[domain.Protocol]Adapter{
+		domain.ProtocolOpenAIChat:       NewOpenAIChat(),
+		domain.ProtocolOpenAIResponses:  NewOpenAIResponses(),
+		domain.ProtocolAnthropicMessage: NewAnthropicMessages(),
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------

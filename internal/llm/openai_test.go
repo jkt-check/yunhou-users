@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -36,6 +37,99 @@ func TestBuildOpenAIPayload_ToolsAndThinking(t *testing.T) {
 	for _, want := range []string{`"tools"`, `run_shell`, `"thinking":{"type":"enabled"}`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("payload missing %s: %s", want, s)
+		}
+	}
+}
+
+func TestBuildOpenAIPayload_MultimodalPassthrough(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	body, err := BuildOpenAIPayload("gpt-x", []model.ChatMessage{{Role: "system", Content: "s"}, m}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	msgs := payload["messages"].([]any)
+	if msgs[0].(map[string]any)["content"] != "s" { // 文本-only 形状不变（pin）
+		t.Fatalf("text message changed shape: %v", msgs[0])
+	}
+	parts, ok := msgs[1].(map[string]any)["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("multimodal message not an array: %v", msgs[1])
+	}
+	img := parts[1].(map[string]any)
+	if img["type"] != "image_url" || img["image_url"].(map[string]any)["url"] != "data:image/png;base64,AAA" {
+		t.Fatalf("image part=%v", img)
+	}
+}
+
+// Multimodal 消息走 wire-map 分支时必须携带 tool_calls / tool_call_id /
+// reasoning_content（tools 回合的 assistant 调用与 tool 结果轮同样可以是
+// parts 形态）；未设置的键必须缺席，不得序列化成 null 干扰上游。
+func TestBuildOpenAIPayload_WireToolFields(t *testing.T) {
+	msgs := []model.ChatMessage{
+		{
+			Role:             "assistant",
+			ContentParts:     []model.ContentPart{{Type: "text", Text: "let me check"}},
+			ToolCalls:        []model.ToolCall{{ID: "call_1", Type: "function", Function: model.ToolCallFunction{Name: "run_shell", Arguments: `{"cmd":"ls"}`}}},
+			ReasoningContent: "need to inspect the filesystem",
+		},
+		{
+			Role:         "tool",
+			ContentParts: []model.ContentPart{{Type: "text", Text: "ls output"}},
+			ToolCallID:   "call_1",
+		},
+		{
+			Role:         "user",
+			ContentParts: []model.ContentPart{{Type: "text", Text: "plain parts"}},
+		},
+	}
+	body, err := BuildOpenAIPayload("m", msgs, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildOpenAIPayload: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := payload["messages"].([]any)
+
+	assistant := got[0].(map[string]any)
+	calls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant tool_calls = %v", assistant["tool_calls"])
+	}
+	call := calls[0].(map[string]any)
+	if call["id"] != "call_1" || call["function"].(map[string]any)["name"] != "run_shell" {
+		t.Fatalf("tool_call = %v", call)
+	}
+	if assistant["reasoning_content"] != "need to inspect the filesystem" {
+		t.Fatalf("reasoning_content = %v", assistant["reasoning_content"])
+	}
+	if _, present := assistant["tool_call_id"]; present {
+		t.Fatalf("assistant must not carry tool_call_id: %v", assistant)
+	}
+
+	tool := got[1].(map[string]any)
+	if tool["tool_call_id"] != "call_1" {
+		t.Fatalf("tool_call_id = %v", tool["tool_call_id"])
+	}
+	if _, present := tool["tool_calls"]; present {
+		t.Fatalf("tool turn must not carry tool_calls: %v", tool)
+	}
+	if _, present := tool["reasoning_content"]; present {
+		t.Fatalf("tool turn must not carry reasoning_content: %v", tool)
+	}
+
+	plain := got[2].(map[string]any)
+	for _, k := range []string{"tool_calls", "tool_call_id", "reasoning_content"} {
+		if _, present := plain[k]; present {
+			t.Fatalf("empty fields must be omitted, found %s: %v", k, plain)
 		}
 	}
 }
@@ -124,5 +218,24 @@ func TestUsageTracker_OverlongLineDropped(t *testing.T) {
 	tr.Feed([]byte(stream))
 	if u := tr.Usage(); !u.OK || u.InputTokens != 1 || u.OutputTokens != 2 {
 		t.Errorf("Usage = %+v, want {1 2 true} after an overlong line", u)
+	}
+}
+
+func TestLegacyBuilders_HandlesImagesExplicitly(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	for name, build := range map[string]func() ([]byte, error){
+		"openai":    func() ([]byte, error) { return BuildOpenAIPayload("m", []model.ChatMessage{m}, nil, nil) },
+		"anthropic": func() ([]byte, error) { return BuildAnthropicPayload("m", 0, 8192, []model.ChatMessage{m}, nil, nil) },
+	} {
+		body, err := build()
+		if err != nil {
+			t.Fatalf("%s: unexpected error %v (legacy builders must relay images)", name, err)
+		}
+		if !bytes.Contains(body, []byte("iVBORw0KGgoAAAANSUhEUg==")) {
+			t.Fatalf("%s: image silently dropped", name)
+		}
 	}
 }

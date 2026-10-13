@@ -22,6 +22,37 @@ func anthropicCall(msgs []model.ChatMessage) *Call {
 	}
 }
 
+// Image parts translate into Anthropic content blocks: text stays text,
+// data-URI images become base64 sources, http(s) URLs become url sources.
+func TestAnthropicBuildPayload_ImageBlocks(t *testing.T) {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}},{"type":"image_url","image_url":{"url":"https://x.test/b.jpg"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	out, err := NewAnthropicMessages().BuildPayload(anthropicCall([]model.ChatMessage{m}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	content := payload["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(content) != 3 || content[0].(map[string]any)["type"] != "text" {
+		t.Fatalf("blocks=%v", content)
+	}
+	src1 := content[1].(map[string]any)["source"].(map[string]any)
+	if content[1].(map[string]any)["type"] != "image" ||
+		src1["type"] != "base64" || src1["media_type"] != "image/png" || src1["data"] != "AAA" {
+		t.Fatalf("block1=%v", content[1])
+	}
+	src2 := content[2].(map[string]any)["source"].(map[string]any)
+	if content[2].(map[string]any)["type"] != "image" ||
+		src2["type"] != "url" || src2["url"] != "https://x.test/b.jpg" {
+		t.Fatalf("block2=%v", content[2])
+	}
+}
+
 func TestAnthropicBuildPayload_RoleMerging(t *testing.T) {
 	a := NewAnthropicMessages()
 	out, err := a.BuildPayload(anthropicCall([]model.ChatMessage{

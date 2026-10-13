@@ -1,16 +1,49 @@
 package model
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// ContentPart is one element of a multimodal message content array (OpenAI
+// shape). Only "text" and "image_url" are accepted at unmarshal time —
+// anything else is a client error surfaced as 400, never silently dropped.
+type ContentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+}
+
+// ImageURL carries one image reference: an http(s) URL the upstream fetches
+// itself (this server never fetches it — no SSRF surface), or an inline
+// data:image/...;base64 URI.
+type ImageURL struct {
+	URL string `json:"url"`
+	// Detail 是 OpenAI 视觉分档参数("low"/"high"/"auto"),透传上游;
+	// Anthropic 无此概念,转换时忽略。透传是有意为之的规格决定(向前兼
+	// 容):不设取值白名单,上游未来新增 detail 值无需服务端变更即可生效;
+	// 非法值由上游 400 拒绝,客户端收到 502 固定文案,不会重试成功。
+	Detail string `json:"detail,omitempty"`
+}
 
 // ChatMessage is one turn of a chat conversation, in the OpenAI-compatible
 // shape that the DeepSeek chat.completions API consumes. The server proxies
 // these verbatim upstream — kaya owns conversation history and sends the
 // full context each request (stateless proxy, no server-side sessions).
 type ChatMessage struct {
-	Role       string     `json:"role"` // "system" | "user" | "assistant" | "tool"
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 轮发起的工具调用(透传上游)
-	ToolCallID string     `json:"tool_call_id,omitempty"` // role=tool 时关联的 assistant tool_call id
+	Role    string `json:"role"` // "system" | "user" | "assistant" | "tool"
+	Content string `json:"content"`
+	// ContentParts is non-nil when the client sent content as a multimodal
+	// array. json:"-" so default marshaling (audit logs) stays string-only
+	// and never leaks base64 image data; upstream builders call
+	// OpenAIWireContent / AnthropicImageBlock explicitly. Content then holds
+	// the concatenated text parts so size validation and byte metrics keep
+	// working unchanged.
+	ContentParts []ContentPart `json:"-"`
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`   // assistant 轮发起的工具调用(透传上游)
+	ToolCallID   string        `json:"tool_call_id,omitempty"` // role=tool 时关联的 assistant tool_call id
 	// ReasoningContent 是 thinking 模式下 assistant 轮的推理内容(透传上游)。
 	// DeepSeek 要求:带 tool_calls 的 assistant 轮在后续请求中必须原样回传
 	// reasoning_content,否则上游 400 拒绝。omitempty 保证非 thinking 会话
@@ -123,3 +156,195 @@ const ChatMaxTools = 16
 // Tool schemas are typically a few hundred bytes each (kaya ships 4 tools);
 // 32 KiB covers pathological schemas while bounding memory per request.
 const ChatMaxToolsBytes = 32 << 10
+
+// ChatMaxImages bounds image parts per request (each is billed upstream
+// vision tokens).
+const ChatMaxImages = 4
+
+// ChatMaxImageBytes bounds one image_url value in WIRE bytes — base64
+// characters for data URIs (~768 KiB decoded) or URL characters. Wire bytes
+// are what the body cap sees and what len() measures at validation, so there
+// is no post-decode expansion window.
+const ChatMaxImageBytes = 1 << 20
+
+// ChatMaxTotalImageBytes bounds summed image_url wire bytes per request.
+// 3 MiB (not 4): worst legal body = 4 MiB text + 3 MiB images + JSON/
+// reasoning overhead stays under the 8 MiB chatMaxBodyBytes cap, so the
+// precise validation 400 always fires before the generic body-cap rejection.
+const ChatMaxTotalImageBytes = 3 << 20
+
+// UnmarshalJSON accepts content as a plain string (unchanged legacy form), a
+// multimodal parts array, or null (legal on assistant tool-call turns).
+func (m *ChatMessage) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Role             string          `json:"role"`
+		Content          json.RawMessage `json:"content"`
+		ToolCalls        []ToolCall      `json:"tool_calls"`
+		ToolCallID       string          `json:"tool_call_id"`
+		ReasoningContent string          `json:"reasoning_content"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	m.Role, m.ToolCalls, m.ToolCallID, m.ReasoningContent = wire.Role, wire.ToolCalls, wire.ToolCallID, wire.ReasoningContent
+	if len(wire.Content) == 0 || string(wire.Content) == "null" {
+		return nil
+	}
+	if wire.Content[0] != '[' {
+		return json.Unmarshal(wire.Content, &m.Content)
+	}
+	var parts []ContentPart
+	if err := json.Unmarshal(wire.Content, &parts); err != nil {
+		return err
+	}
+	if len(parts) == 0 {
+		// "content":[] 归位为 content:""(ContentParts 保持 nil,走 legacy
+		// 路径),否则空数组会让 role=tool / 带 tool_calls 的 assistant 轮以
+		// ContentParts != nil 通过校验,上行 content 变成 [] 而非 ""——
+		// 比 master 的 400 绑定错误放得更宽。
+		parts = nil
+	}
+	var sb strings.Builder
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			sb.WriteString(p.Text)
+		case "image_url":
+			if p.ImageURL == nil || p.ImageURL.URL == "" {
+				return fmt.Errorf("image_url part requires image_url.url")
+			}
+		default:
+			return fmt.Errorf("unsupported content part type %q", p.Type)
+		}
+	}
+	m.ContentParts = parts
+	m.Content = sb.String()
+	return nil
+}
+
+// HasImages reports whether the message carries at least one image part.
+func (m *ChatMessage) HasImages() bool {
+	for _, p := range m.ContentParts {
+		if p.Type == "image_url" {
+			return true
+		}
+	}
+	return false
+}
+
+// MessagesHaveImages is the vision-gate trigger for a whole request.
+func MessagesHaveImages(messages []ChatMessage) bool {
+	for i := range messages {
+		if messages[i].HasImages() {
+			return true
+		}
+	}
+	return false
+}
+
+// OpenAIWireContent returns the OpenAI wire form of the message content: the
+// plain string, or the parts array when ContentParts is set.
+func (m ChatMessage) OpenAIWireContent() any {
+	if m.ContentParts == nil {
+		return m.Content
+	}
+	parts := make([]any, 0, len(m.ContentParts))
+	for _, p := range m.ContentParts {
+		switch p.Type {
+		case "text":
+			parts = append(parts, map[string]any{"type": "text", "text": p.Text})
+		case "image_url":
+			// 防御性跳过:Unmarshal 保证 image_url part 的 ImageURL 非 nil,
+			// 这里保护进程内手工构造 ContentParts 的调用方。
+			if p.ImageURL == nil {
+				continue
+			}
+			img := map[string]any{"url": p.ImageURL.URL}
+			if p.ImageURL.Detail != "" {
+				img["detail"] = p.ImageURL.Detail
+			}
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": img})
+		}
+	}
+	return parts
+}
+
+// AnthropicImageBlock converts one image_url value into an Anthropic image
+// block: data URIs become base64 sources (image/jpg normalized to
+// image/jpeg), http(s) URLs become url sources. The media type is the
+// entry-validated declared type (validated against magic bytes at the edge).
+func AnthropicImageBlock(u string) map[string]any {
+	if mt, data, ok := ParseDataImageURI(u); ok {
+		if mt == "image/jpg" {
+			mt = "image/jpeg"
+		}
+		return map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": mt, "data": data}}
+	}
+	return map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": u}}
+}
+
+// AnthropicUserBlocks builds the Anthropic user-turn content blocks: one text
+// block for legacy string content (byte-identical to the pre-multimodal
+// shape), or one block per part for multimodal messages. Shared by both
+// Anthropic adapters (internal/llm, internal/inference/providers) so their
+// user-turn translation stays identical. A nil ImageURL is skipped
+// defensively — Unmarshal guarantees non-nil, in-process constructors may not.
+func AnthropicUserBlocks(m ChatMessage) []any {
+	if m.ContentParts == nil {
+		return []any{map[string]any{"type": "text", "text": m.Content}}
+	}
+	blocks := make([]any, 0, len(m.ContentParts))
+	for _, p := range m.ContentParts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
+		case "image_url":
+			if p.ImageURL == nil {
+				continue
+			}
+			blocks = append(blocks, AnthropicImageBlock(p.ImageURL.URL))
+		}
+	}
+	return blocks
+}
+
+// ParseDataImageURI splits "data:image/png;base64,<data>" into media type and
+// payload. ok=false for any other shape (including non-base64 data URIs).
+func ParseDataImageURI(u string) (mediaType, data string, ok bool) {
+	if !strings.HasPrefix(u, "data:") {
+		return "", "", false
+	}
+	rest := u[len("data:"):]
+	i := strings.Index(rest, ";base64,")
+	if i <= 0 {
+		return "", "", false
+	}
+	return rest[:i], rest[i+len(";base64,"):], true
+}
+
+// IsAllowedImageMediaType gates the data-URI formats we relay upstream. SVG
+// is deliberately excluded (scriptable markup, not an image to models).
+func IsAllowedImageMediaType(mt string) bool {
+	switch mt {
+	case "image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp":
+		return true
+	}
+	return false
+}
+
+// SniffImageMediaType identifies an image from its decoded magic bytes.
+// Returns the canonical MIME type ("image/jpeg" for jpg too) or "" when the
+// prefix matches no supported signature. 18 bytes cover every signature.
+func SniffImageMediaType(prefix []byte) string {
+	switch {
+	case len(prefix) >= 8 && bytes.Equal(prefix[:8], []byte("\x89PNG\r\n\x1a\n")):
+		return "image/png"
+	case len(prefix) >= 3 && prefix[0] == 0xFF && prefix[1] == 0xD8 && prefix[2] == 0xFF:
+		return "image/jpeg"
+	case len(prefix) >= 6 && (string(prefix[:6]) == "GIF87a" || string(prefix[:6]) == "GIF89a"):
+		return "image/gif"
+	case len(prefix) >= 12 && string(prefix[:4]) == "RIFF" && string(prefix[8:12]) == "WEBP":
+		return "image/webp"
+	}
+	return ""
+}

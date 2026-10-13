@@ -1,11 +1,13 @@
 // kaya_models.go — GET /chat/models（Task 8，设计 §9.1：Kaya 模型选择契约）。
 //
 // 返回形状对齐候选分支的既有契约：{code:0, data:{models:[{id,
-// display_name, provider, default}]}}（管理 envelope —— /chat 是 Kaya 面，
-// 不是 /v1 标准协议面）。内容 = 调用者权益可见且已发布的模型集合（与
-// /v1/models 同一判定：catalog.ListPublishedModels + 权益 AccessCheck）。
-// 无计费账户 = 无有效订阅 → 403 ErrChatNoAccess 形状（N4a，对齐 legacy
-// GetModels/writeChatError），不是 200 空列表。
+// display_name, provider, default, input_modalities}]}}（管理 envelope ——
+// /chat 是 Kaya 面，不是 /v1 标准协议面）。内容 = 调用者权益可见且已发布的
+// 模型集合（与 /v1/models 同一判定：catalog.ListPublishedModels + 权益
+// AccessCheck）。input_modalities 供 picker 判定哪些模型允许发图；空值按
+// ["text"] 透出（fail closed，与视觉门控同口径）。无计费账户 = 无有效订阅
+// → 403 ErrChatNoAccess 形状（N4a，对齐 legacy GetModels/writeChatError），
+// 不是 200 空列表。
 //
 // 该路由只在 /chat 网关迁移开关启用时挂载（见 router）。
 
@@ -45,10 +47,21 @@ func NewKayaModelsHandler(cat *catalog.Service, resolver *access.Resolver, snaps
 
 // kayaModelEntry is the candidate-branch return shape (对齐基准).
 type kayaModelEntry struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name"`
-	Provider    string `json:"provider"`
-	Default     bool   `json:"default"`
+	ID              string   `json:"id"`
+	DisplayName     string   `json:"display_name"`
+	Provider        string   `json:"provider"`
+	Default         bool     `json:"default"`
+	InputModalities []string `json:"input_modalities"`
+}
+
+// normalizeInputModalities 空值按 text-only 透出（fail closed，与网关视觉
+// 门控同口径）。已发布快照经 Publish / ParseSnapshot 的 ValidateModel 拒绝
+// 空 modalities，此归一为防御性兜底。
+func normalizeInputModalities(mods []string) []string {
+	if len(mods) == 0 {
+		return []string{"text"}
+	}
+	return mods
 }
 
 // List handles GET /chat/models.
@@ -110,7 +123,7 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 		}
 		out = append(out, kayaModelEntry{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
-			Default: m.ID == h.DefaultModel,
+			Default: m.ID == h.DefaultModel, InputModalities: normalizeInputModalities(m.InputModalities),
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": out}})

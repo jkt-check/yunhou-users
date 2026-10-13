@@ -21,6 +21,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/model"
 )
 
 // AnthropicMessages is the adapter for anthropic_messages deployments
@@ -76,15 +77,15 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 				systemParts = append(systemParts, m.Content)
 			}
 		case "user":
-			block := map[string]any{"type": "text", "text": m.Content}
+			blocks := model.AnthropicUserBlocks(m)
 			// Anthropic requires strict user/assistant alternation (400
 			// otherwise): merge into the previous user turn. Text goes after
 			// any tool_result blocks already there — tool_results lead.
 			if n := len(msgs); n > 0 && msgs[n-1]["role"] == "user" {
-				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), block)
+				msgs[n-1]["content"] = append(msgs[n-1]["content"].([]any), blocks...)
 				continue
 			}
-			msgs = append(msgs, map[string]any{"role": "user", "content": []any{block}})
+			msgs = append(msgs, map[string]any{"role": "user", "content": blocks})
 		case "assistant":
 			var blocks []any
 			if m.Content != "" {

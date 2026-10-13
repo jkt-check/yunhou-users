@@ -17,9 +17,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -126,12 +128,22 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 				provider = pv.Code
 			}
 		}
+		mods := modalitiesOrText(m.InputModalities)
 		out = append(out, ChatModelInfo{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
-			Default: m.ID == f.defaultModel,
+			Default: m.ID == f.defaultModel, InputModalities: mods,
 		})
 	}
 	return out, nil
+}
+
+// modalitiesOrText 防御性兜底:catalog 发布校验已拒绝空 modalities(见
+// catalog.ValidateModel),正常路径不会走到空分支;兜底保证透出契约至少含 "text"。
+func modalitiesOrText(mods []string) []string {
+	if len(mods) == 0 {
+		return []string{"text"}
+	}
+	return mods
 }
 
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
@@ -147,6 +159,17 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID
 	if _, ok := snap.Model(f.defaultModel); !ok {
 		f.logNotReady(snap) // 结构化 ERROR，30s 节流，含 model id + 快照 revision
 		return nil, ErrChatNotReady
+	}
+	// 视觉门控（对齐 legacy）：快照 input_modalities 不含 image 的模型，带图
+	// 请求在上游花钱之前 400；空 modalities 按 text-only（fail closed）。
+	if model.MessagesHaveImages(messages) {
+		mm, ok := snap.Model(modelID)
+		if !ok {
+			return nil, ErrChatUnknownModel
+		}
+		if !slices.Contains(mm.InputModalities, "image") {
+			return nil, fmt.Errorf("%w: %s", ErrChatModelNoVision, modelID)
+		}
 	}
 	// Kaya JWT → unified principal (kind=kaya_jwt). A user without a model
 	// billing account maps onto the legacy "no access" outcome (403),

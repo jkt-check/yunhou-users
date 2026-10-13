@@ -590,6 +590,8 @@ Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-
 | `n>1` / logprobs / prediction / 结构化输出（`response_format`、`text.format=json_*`） | ❌ 400 | n/a | ❌ 400 |
 | `background:true` / 非空 `include` / `max_tool_calls` / `truncation:auto` | n/a | n/a | ❌ 400（无异步面/附加数据面；服务端静默裁剪上下文违反不静默原则） |
 
+**多模态现状**：`/v1/*` 对外协议面本期仍显式拒绝多模态 parts（例如 `/v1/chat/completions` 收到 content 数组返回 400 `content arrays (multimodal parts) are not supported; send plain string content`），放开是后续工作。图片输入目前仅在内置 `POST /chat` 面支持（规则与限额见「Chat 接口」章节）。
+
 **接受但不保证生效的字段（已在文档明示，非静默丢弃）**：`metadata`（客户端标记，不消费）、`cache_control`（成本提示，上游不保证生效）、Messages 历史中的 `thinking`/`redacted_thinking` 块（chat 形状上游无回放语义，接受并丢弃；文本与工具调用连续性不受影响）、`tool_result.is_error` 标志（无对应上游字段，错误文本照常传递）、Responses 输入中的 `reasoning` 项（同上，不回放）。模型未声明支持工具/推理时携带对应字段 → 400（先于任何计费）。
 
 **用法/用量映射**：Messages 面 `usage.input_tokens` 不含 cache_read（Anthropic 口径），`cache_read_input_tokens`/`cache_creation_input_tokens` 单列；Responses 面 `input_tokens` 含 cached（OpenAI 口径）+ `input_tokens_details.cached_tokens`。流式 `message_start.usage` 是协议占位（0/0），真实值在终止 `message_delta.usage`（含 `input_tokens`，当前 Anthropic SDK 的 `MessageDeltaUsage` 支持该字段）。非流式响应在上游确实未报 usage 时不伪造 usage 字段。
@@ -635,7 +637,15 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 | `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
 | `thinking_enabled` | 否 | 布尔值；为 `true` 时请求启用上游推理模式，行为取决于所选模型的 provider 协议——OpenAI 协议原样下发 `thinking: {"type": "enabled"}`（不支持该字段的 provider 可能 400 → 客户端收到 502）；Anthropic 协议映射为扩展思考（`budget_tokens=4096`，`max_tokens` 下限相应抬高）。省略/`false` 时不下发。开启后响应 chunk 的 `delta` 中可能出现 `reasoning_content` 字段（两种协议都会产出），客户端不展示时可安全忽略 |
 
-**限制**（超出返回 400）：请求体整体 ≤8 MiB；1–20 条消息；每条 `content` ≤4 MiB 字节（`len()` 字节数，CJK 每字约 3 字节），其中 `system` 消息走独立上限 ≤32768 字节；全部消息总字节数 ≤4 MiB。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。
+**图片输入（多模态）**：`messages[].content` 除纯字符串外，还接受 OpenAI 兼容的 parts 数组——`[{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"..."}}]`，`text` 与 `image_url` 可任意混排（parts 中的文本拼接后与字符串 content 同等计量与审计）。规则：
+
+- 图片只允许出现在 `user` 消息（`system` / `assistant` / `tool` 轮带图 → 400）；
+- `image_url.url` 支持两种形态：`https?://` 公网 URL（**原样透传**给上游模型，本服务不抓取、不代理，URL 可达性由上游保证）或 `data:image/<type>;base64,...` 内联数据；
+- data URI 声明的类型限 `image/png` / `image/jpeg` / `image/jpg` / `image/gif` / `image/webp`，且解码后的 magic bytes 必须与声明类型一致（不一致 → 400，防止以图片名义夹带任意字节）；
+- 数量与大小按 **wire 字节**计（data URI 即 base64 字符数，URL 即字符数）：每请求 ≤4 张、单张 `image_url` ≤1 MiB、全部图片合计 ≤3 MiB；
+- 所选模型未声明视觉能力（目录 `input_modalities` 不含 `"image"`）时携带图片 → 400 `the selected model does not support image input`（先于任何上游调用，不产生计费）。客户端用 `GET /chat/models` 返回的 `input_modalities` 判定哪些模型允许发图。
+
+**限制**（超出返回 400）：请求体整体 ≤8 MiB；1–20 条消息；每条 `content` ≤4 MiB 字节（`len()` 字节数，CJK 每字约 3 字节；parts 数组按拼接后的文本计），其中 `system` 消息走独立上限 ≤32768 字节；全部消息总字节数 ≤4 MiB。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。图片限额见上文「图片输入」段。
 
 **Anthropic 协议模型的历史约束**（仅当所选 `model` 路由到 Anthropic 协议 provider 时适用；OpenAI 协议模型无此约束）：剔除 `system` 消息后历史不能为空（纯 system 请求会被拒），且首条非 system 消息必须是 `user` 轮。违反时返回 400 `chat request shape is not supported by the selected model`。
 
@@ -685,6 +695,8 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 |---|---|---|
 | 400 | `invalid request body` | JSON 解析失败，或请求体超过 8 MiB 上限 |
 | 400 | `messages is required` / `too many messages` / `invalid message role` / `message content is required` / `message content too long` / `total message content too long` / `session_id too long` / `model id too long` / `too many tools` / `tools too large` / `invalid tool definition` | 请求体、消息或 tools 不符合限制 |
+| 400 | `image parts are only allowed in user messages` / `too many images` / `image too large` / `images too large in total` / `invalid image_url` / `invalid image data` | 图片输入不符合「图片输入」段的规则（轮次、数量、大小、URL/data URI 形态、magic bytes 与声明类型不一致）。parts 数组形状本身非法（未知 part type、`image_url` 缺 `url`）在 JSON 解析阶段即失败，归 `invalid request body` |
+| 400 | `the selected model does not support image input` | 请求携带图片，但所选模型的 `input_modalities` 不含 `"image"`（换视觉模型或移除图片；先于上游调用，不计费） |
 | 400 | `unknown chat model` | `model` 字段不在服务端目录中 |
 | 400 | `chat request shape is not supported by the selected model` | 消息历史不满足所选模型的协议约束（仅 Anthropic 协议模型：剔除 system 后历史为空，或首条非 system 消息不是 user 轮） |
 | 401 | `missing or invalid authorization header` / `invalid or expired token` | 未携带或无效 JWT（由 `JWTAuth` 中间件统一返回） |
@@ -711,8 +723,8 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
   "code": 0,
   "data": {
     "models": [
-      {"id": "deepseek-flash", "display_name": "DeepSeek Flash", "provider": "deepseek", "default": true},
-      {"id": "kimi-k3", "display_name": "Kimi K3", "provider": "kimi", "default": false}
+      {"id": "deepseek-flash", "display_name": "DeepSeek Flash", "provider": "deepseek", "default": true, "input_modalities": ["text"]},
+      {"id": "kimi-k3", "display_name": "Kimi K3", "provider": "kimi", "default": false, "input_modalities": ["text", "image"]}
     ]
   }
 }
@@ -724,6 +736,7 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 | `display_name` | 展示名（目录中为空时回退为 `id`） |
 | `provider` | 所属 provider 名（目录中的 key，仅供展示） |
 | `default` | 是否为目录默认模型（`POST /chat` 省略 `model` 时使用） |
+| `input_modalities` | 模型声明的输入模态（`["text"]` 或 `["text","image"]`）；目录未配置时按 `["text"]` 透出（fail closed）。picker 据此决定是否允许发图——不含 `"image"` 的模型带图调用会被 400 拒绝 |
 
 错误：401（未携带/无效 JWT）、403（无有效订阅）、404（chat 未启用，同 `POST /chat`）。
 
@@ -749,17 +762,21 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
       "display_name": "展示名",
       "input_price_per_mtok": 2,
       "output_price_per_mtok": 8,
-      "max_tokens": 16384
+      "max_tokens": 16384,
+      "input_modalities": ["text", "image"]
     }
   }
 }
 ```
 
 - 价格为**每百万 token 的人民币元数**（成本核算用，可为 0）；`max_tokens` 仅 Anthropic 协议需要（缺省 8192）。多模型目录必须显式指定 `default_model`；单模型目录可省略（自动取唯一模型）。
+- **输入模态（视觉点亮）**：模型条目的 `input_modalities` 声明接受的输入类型，加入 `"image"` 即允许该模型接收图片输入（`POST /chat` 的图片规则与限额见「Chat 接口」章节）。**缺省/不配置 = 纯文本**（fail closed：未声明 `"image"` 的模型收到带图请求一律 400 `the selected model does not support image input`，先于上游调用）。`GET /chat/models` 会透出该字段供 picker 判定。
+- **`DEEPSEEK_*` 合成的单模型目录（LegacyCatalog）无法配置模态，永久纯文本**——要支持图片必须迁移到 `LLM_PROVIDERS_JSON` 目录并显式点亮 `"image"`。
 - JSON 在启动时解析并强校验（未知字段、空 api_keys、模型引用不存在的 provider、非法 base_url 等均**启动即失败**），改配置需重启生效。
 - **Key 池**：每个 provider 的 `api_keys` 组成轮询池；某 key 收到 429/5xx 后冷却 60s；池内 ≥2 个可用 key 时，单个 key 的临时失败会**透明换 key 重试一次**。全部 key 冷却中对客户端返回 429 `chat upstream rate limit exceeded`。
 - **计量**：每次请求结束后写入 `llm_usage_events` 表（user/app/模型/token 数/成本，迁移 022）；聚合查询走内部接口 `GET /admin/stats/llm-usage`（详见「管理接口」章节的正式文档），按模型分组返回 token 与成本合计。上游不返回 usage 的 provider 记为 0 token（行仍会写入）。
 - **按 Plan 限制可用模型**：`plans.chat_models` 列为白名单（NULL/空 = 放开全部目录模型）。示例：`UPDATE plans SET chat_models = '{deepseek-flash,kimi-k3}' WHERE id = 'monthly';`
+- **网关部署（`INFERENCE_KAYA_CHAT_GATEWAY=1`）的模态不在 env 里配**：用 `PATCH /admin/models/:id` 的 `input_modalities` 字段（需 `models:manage` 权限）修改模型后 `POST /admin/catalog/publish` 发布目录版本生效；`/chat/models` 与 `/chat` 的视觉门控都读已发布快照，空值同样按纯文本（fail closed）。**协议约束：`openai_responses` 协议的部署不接受图片**——带图请求会被适配层显式拒绝（`InvalidInput`，绝不静默丢弃图片），视觉模型只能部署在 `openai_chat` / `anthropic_messages` 协议的部署上。
 
 ---
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -591,6 +592,33 @@ func TestChatService_AllowedModels(t *testing.T) {
 	}
 }
 
+// TestChatService_AllowedModels_InputModalities: GET /chat/models 透出
+// input_modalities —— vision 模型 ["text","image"] 原样透出，未配置
+// InputModalities 的 plain 模型按 fail-closed 缺省归一为 ["text"]（kaya
+// picker 据此决定哪些模型允许发图，与视觉门控同口径）。
+func TestChatService_AllowedModels_InputModalities(t *testing.T) {
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(visionTestCatalog("https://upstream.invalid"), subRepo, planRepo, &mockLLMUsageRepo{})
+
+	models, err := svc.AllowedModels(context.Background(), "u-1", "yunhou-website")
+	if err != nil {
+		t.Fatalf("AllowedModels: %v", err)
+	}
+	byID := map[string]ChatModelInfo{}
+	for _, m := range models {
+		byID[m.ID] = m
+	}
+	if got := byID["vision"].InputModalities; !slices.Equal(got, []string{"text", "image"}) {
+		t.Errorf("vision input_modalities = %v, want [text image]", got)
+	}
+	if got := byID["plain"].InputModalities; !slices.Equal(got, []string{"text"}) {
+		t.Errorf("plain input_modalities = %v, want [text]（空值 fail-closed 归一）", got)
+	}
+}
+
 // TestChatService_ReasoningContentRelay locks the thinking-mode pass-through:
 // DeepSeek's thinking mode rejects a continuation whose assistant tool_calls
 // turn doesn't carry back the reasoning_content it was generated with ("The
@@ -991,6 +1019,118 @@ func TestChatService_SameOriginRedirectFollowed(t *testing.T) {
 		t.Fatalf("StreamChat: %v (same-origin redirect must be followed)", err)
 	}
 	resp.Body.Close()
+}
+
+// imageChatMessages returns a request carrying one image_url part — the
+// vision-gate trigger shape (model.MessagesHaveImages == true).
+func imageChatMessages() []model.ChatMessage {
+	return []model.ChatMessage{{
+		Role:    "user",
+		Content: "what is this",
+		ContentParts: []model.ContentPart{
+			{Type: "text", Text: "what is this"},
+			{Type: "image_url", ImageURL: &model.ImageURL{URL: "https://example.com/cat.png"}},
+		},
+	}}
+}
+
+// visionTestCatalog: "plain" 未配置 InputModalities（缺省 = text-only，
+// fail closed），"vision" 显式声明 ["text","image"]。
+func visionTestCatalog(baseURL string) *llm.Catalog {
+	return &llm.Catalog{
+		DefaultModel: "plain",
+		Providers: map[string]llm.Provider{
+			"p": {Protocol: llm.ProtocolOpenAI, BaseURL: baseURL, APIKeys: []string{"k"}},
+		},
+		Models: map[string]llm.Model{
+			"plain":  {Provider: "p", UpstreamModel: "plain-up"},
+			"vision": {Provider: "p", UpstreamModel: "vision-up", InputModalities: []string{"text", "image"}},
+		},
+	}
+}
+
+// TestStreamChat_RejectsImagesForTextOnlyModel: 未声明 image 模态的模型
+// （含缺省未配置的 fail-closed 情形）对带图请求在上游花钱之前 400——
+// errors.Is 命中 ErrChatModelNoVision，上游零调用，错误随 resolved route。
+func TestStreamChat_RejectsImagesForTextOnlyModel(t *testing.T) {
+	var hits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(visionTestCatalog(srv.URL), subRepo, planRepo, &mockLLMUsageRepo{})
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{"explicit text-only model", "plain", "plain"},
+		{"empty model falls to text-only default", "", "plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, route, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", tc.model, imageChatMessages(), nil, nil)
+			if !errors.Is(err, ErrChatModelNoVision) {
+				t.Fatalf("err = %v, want ErrChatModelNoVision", err)
+			}
+			if route == nil || route.LogicalModel != tc.want {
+				t.Errorf("route = %+v, want resolved LogicalModel %q（审计按生效模型归因）", route, tc.want)
+			}
+		})
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("upstream called %d times, want 0（门控在任何花费之前拒绝）", n)
+	}
+}
+
+// TestStreamChat_VisionModelPassesGate: 声明了 image 模态的模型不被门控拒，
+// 且 builder 已透传（批次② Task 5/6）——mock 上游收到含图片 part 的 payload。
+func TestStreamChat_VisionModelPassesGate(t *testing.T) {
+	var hits int32
+	var gotBody []byte
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: [DONE]\n\n"))
+	})
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(visionTestCatalog(srv.URL), subRepo, planRepo, &mockLLMUsageRepo{})
+
+	_, _, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "vision", imageChatMessages(), nil, nil)
+	if errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("err = %v, vision 模型不得被视觉门控拦截", err)
+	}
+	if err != nil {
+		t.Fatalf("err = %v, vision 模型带图请求应透传到上游", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("upstream called %d times, want 1（图片应真实透传）", n)
+	}
+	for _, want := range []string{`"image_url"`, `"url":"https://example.com/cat.png"`} {
+		if !strings.Contains(string(gotBody), want) {
+			t.Errorf("upstream payload missing %s: %s", want, gotBody)
+		}
+	}
+
+	// 同一 vision 模型的纯文本请求不受门控影响（走到上游失败为止）。
+	_, _, err = svc.StreamChat(context.Background(), "u-1", "yunhou-website", "vision", chatMessages(), nil, nil)
+	if errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("text-only request err = %v, want 不受视觉门控影响", err)
+	}
 }
 
 // TestChatService_RedirectLoopFails: 同 origin 重定向循环在 5 跳后报错，

@@ -30,6 +30,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/model"
 )
 
 // OpenAIResponses is the adapter for openai_responses deployments (the
@@ -70,6 +71,14 @@ var responsesPassthroughKeys = []string{"temperature", "top_p", "parallel_tool_c
 // body (input items + instructions + max_output_tokens).
 func (a *OpenAIResponses) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
+	// Fail closed PERMANENTLY: the Responses protocol surface does not open
+	// image input this iteration (批次②只透传 openai_chat /
+	// anthropic_messages); an image must error loudly, never be silently
+	// dropped into a text-only input item.
+	if model.MessagesHaveImages(r.Messages) {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: image input is not supported by this adapter")
+	}
 	if call.OutputCap <= 0 {
 		return nil, domain.NewError(domain.CodeInvalidInput,
 			"providers: openai_responses dispatch requires a positive output cap (不允许无限输出)")

@@ -15,9 +15,27 @@ import (
 // omit the chunk and the request is metered with zero tokens (the usage row
 // is still written, so spend never goes unrecorded structurally).
 func BuildOpenAIPayload(upstreamModel string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) ([]byte, error) {
+	msgs := make([]any, 0, len(messages))
+	for _, m := range messages {
+		if m.ContentParts == nil {
+			msgs = append(msgs, m) // 文本-only：按 struct 序列化，逐字节不变
+			continue
+		}
+		w := map[string]any{"role": m.Role, "content": m.OpenAIWireContent()}
+		if len(m.ToolCalls) > 0 {
+			w["tool_calls"] = m.ToolCalls
+		}
+		if m.ToolCallID != "" {
+			w["tool_call_id"] = m.ToolCallID
+		}
+		if m.ReasoningContent != "" {
+			w["reasoning_content"] = m.ReasoningContent
+		}
+		msgs = append(msgs, w)
+	}
 	payload := map[string]any{
 		"model":          upstreamModel,
-		"messages":       messages,
+		"messages":       msgs,
 		"stream":         true,
 		"stream_options": map[string]any{"include_usage": true},
 	}

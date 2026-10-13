@@ -45,6 +45,21 @@ type Model struct {
 	// MaxTokens is only sent to Anthropic-protocol providers (the API
 	// requires it). 0 → provider default 8192 at translation time.
 	MaxTokens int `json:"max_tokens,omitempty"`
+	// InputModalities lists accepted input modalities ("text", "image");
+	// empty/missing means text-only (fail closed). Gates multimodal /chat.
+	InputModalities []string `json:"input_modalities,omitempty"`
+}
+
+// AcceptsImages reports whether the catalog entry opts into image input.
+// Missing modalities mean text-only (fail closed — a vision model rejects
+// images until the operator configures it, never the reverse).
+func (m Model) AcceptsImages() bool {
+	for _, v := range m.InputModalities {
+		if v == "image" {
+			return true
+		}
+	}
+	return false
 }
 
 // Catalog is the parsed LLM_PROVIDERS_JSON.
@@ -119,6 +134,11 @@ func (c *Catalog) Validate() error {
 		}
 		if m.InputPerMtok < 0 || m.OutputPerMtok < 0 {
 			return fmt.Errorf("model %q: price must be >= 0", id)
+		}
+		for _, v := range m.InputModalities {
+			if v != "text" && v != "image" {
+				return fmt.Errorf("model %q: unsupported input_modality %q (allowed: text, image)", id, v)
+			}
 		}
 	}
 	// Single-model catalogs get an implicit default so a one-model deployment

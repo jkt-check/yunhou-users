@@ -141,6 +141,11 @@ func wipeInferenceTables(t *testing.T, db *sqlx.DB) {
 	tables := []string{
 		"inference_audit_log", "operator_roles",
 		"inference_reconciliation_jobs", "inference_outbox",
+		// migration 032-034 的子表：response_chains → requests/accounts/
+		// models，session_bindings → models/upstream_accounts，oauth_grants
+		// → providers/users；bulk_imports 无 FK。均须在下方父表之前删。
+		"inference_response_chains", "inference_session_bindings",
+		"inference_oauth_grants", "inference_bulk_imports",
 		// wallet 表组（migration 030）存在行间 FK：audits/entries/holds →
 		// wallets，entries → adjustments —— 子表先删。
 		"inference_wallet_audits", "inference_wallet_entries",
@@ -248,6 +253,15 @@ func setupChatE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logger) (*g
 // upstream (迁移开关开启的等价接线). accessLog 同 setupChatE2E。
 func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logger) (*gin.Engine, *sqlx.DB, *postgres.Store) {
 	t.Helper()
+	return buildChatFacadeE2E(t, up, accessLog, false)
+}
+
+// buildChatFacadeE2E 是 facade 接线的底座。withVision 额外上架一个 vision
+// 模型（deepseek-vision，input_modalities=["text","image"]，独立 deployment/
+// route/price 指向同一 stub 上游），供 Task 12 多模态用例；false 时与既有
+// fixture 逐字节等价。
+func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logger, withVision bool) (*gin.Engine, *sqlx.DB, *postgres.Store) {
+	t.Helper()
 	db, tokenSvc, authSvc := chatE2EBase(t)
 	ctx := context.Background()
 	store := postgres.NewStore(db)
@@ -257,6 +271,7 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 	// deliberately — publish validation is covered by the catalog tests),
 	// route, policy, price, credential, upstream account.
 	const modelID = "deepseek-chat"
+	const visionModelID = "deepseek-vision"
 	if err := store.InsertModel(ctx, &domain.Model{
 		ID: modelID, DisplayName: "DeepSeek Chat", Lifecycle: domain.LifecycleActive,
 		ContextTokens: 128000, MaxOutputTokens: 8192,
@@ -266,12 +281,27 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 	}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
+	if withVision {
+		if err := store.InsertModel(ctx, &domain.Model{
+			ID: visionModelID, DisplayName: "DeepSeek Vision", Lifecycle: domain.LifecycleActive,
+			ContextTokens: 128000, MaxOutputTokens: 8192,
+			Protocols:       []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
+			InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"},
+			SupportsTools: true, SupportsReasoning: true,
+		}); err != nil {
+			t.Fatalf("vision model: %v", err)
+		}
+	}
 	prov := &domain.Provider{Code: "deepseek", DisplayName: "DeepSeek", AccessType: domain.AccessOfficialAPI, Status: "active"}
 	if err := store.InsertProvider(ctx, prov); err != nil {
 		t.Fatalf("provider: %v", err)
 	}
+	catalogModels := []string{modelID}
+	if withVision {
+		catalogModels = append(catalogModels, visionModelID)
+	}
 	pol := &postgres.PolicyVersion{
-		Name: "kaya-gift", Revision: 1, ModelIDs: []string{modelID},
+		Name: "kaya-gift", Revision: 1, ModelIDs: catalogModels,
 		FiveHourLimit: microE2E(1_000_000_000), WeeklyLimit: microE2E(10_000_000_000),
 		MonthlyLimit: microE2E(100_000_000_000), Status: "published",
 	}
@@ -279,13 +309,15 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 		t.Fatalf("policy: %v", err)
 	}
 	now := time.Now().Add(-time.Minute)
-	pv := &postgres.PriceVersion{
-		ModelID: modelID, Kind: postgres.PriceSaleCredit, Unit: "microcredit",
-		InputPerMtok: 1_000_000, OutputPerMtok: 2_000_000,
-		Revision: 1, EffectiveFrom: now,
-	}
-	if err := store.InsertPriceVersion(ctx, pv); err != nil {
-		t.Fatalf("price: %v", err)
+	for _, pm := range catalogModels {
+		pv := &postgres.PriceVersion{
+			ModelID: pm, Kind: postgres.PriceSaleCredit, Unit: "microcredit",
+			InputPerMtok: 1_000_000, OutputPerMtok: 2_000_000,
+			Revision: 1, EffectiveFrom: now,
+		}
+		if err := store.InsertPriceVersion(ctx, pv); err != nil {
+			t.Fatalf("price %s: %v", pm, err)
+		}
 	}
 	catalogSvc := catalog.NewService(store)
 	catalogSvc.SetPriceCheck(func(ctx context.Context, id string) (bool, error) {
@@ -310,10 +342,12 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 	if err := store.InsertDeployment(ctx, depPub); err != nil {
 		t.Fatalf("publish deployment: %v", err)
 	}
-	if err := store.InsertRoute(ctx, &domain.ModelRoute{
-		ModelID: modelID, DeploymentID: depPub.ID, Weight: 1, Enabled: true,
-	}); err != nil {
-		t.Fatalf("publish route: %v", err)
+	for _, pm := range catalogModels {
+		if err := store.InsertRoute(ctx, &domain.ModelRoute{
+			ModelID: pm, DeploymentID: depPub.ID, Weight: 1, Enabled: true,
+		}); err != nil {
+			t.Fatalf("publish route %s: %v", pm, err)
+		}
 	}
 	if _, err := catalogSvc.Publish(ctx, "e2e"); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -331,6 +365,23 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 		ModelID: modelID, DeploymentID: dep.ID, Weight: 1, Enabled: true,
 	}); err != nil {
 		t.Fatalf("route: %v", err)
+	}
+	var depV *domain.Deployment
+	if withVision {
+		depV = &domain.Deployment{
+			ProviderID: prov.ID, UpstreamModel: "deepseek-v4-vision", BaseURL: up.URL,
+			Protocol:       domain.ProtocolOpenAIChat,
+			ConnectTimeout: 2 * time.Second, RequestTimeout: 30 * time.Second,
+			Status: domain.DeploymentActive,
+		}
+		if err := store.InsertDeployment(ctx, depV); err != nil {
+			t.Fatalf("vision deployment: %v", err)
+		}
+		if err := store.InsertRoute(ctx, &domain.ModelRoute{
+			ModelID: visionModelID, DeploymentID: depV.ID, Weight: 1, Enabled: true,
+		}); err != nil {
+			t.Fatalf("vision route: %v", err)
+		}
 	}
 	vault, err := credentials.NewVault(map[int][]byte{1: []byte("0123456789abcdef0123456789abcdef")}, 1)
 	if err != nil {
@@ -362,6 +413,19 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 		RoutesByModel: map[string][]domain.ModelRoute{modelID: {{
 			ModelID: modelID, DeploymentID: dep.ID, Weight: 1, Enabled: true,
 		}}},
+	}
+	if withVision {
+		snap.Models[visionModelID] = domain.Model{
+			ID: visionModelID, DisplayName: "DeepSeek Vision", Lifecycle: domain.LifecycleActive,
+			ContextTokens: 128000, MaxOutputTokens: 8192,
+			Protocols:       []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
+			InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"},
+			SupportsTools: true, SupportsReasoning: true,
+		}
+		snap.Deployments[depV.ID] = *depV
+		snap.RoutesByModel[visionModelID] = []domain.ModelRoute{{
+			ModelID: visionModelID, DeploymentID: depV.ID, Weight: 1, Enabled: true,
+		}}
 	}
 	egress, err := credentials.NewEgressValidator([]string{"127.0.0.0/8"})
 	if err != nil {
@@ -1552,4 +1616,158 @@ func TestChatContract_FacadeQuotaExceededIs429(t *testing.T) {
 		t.Errorf("upstream was hit despite quota exhaustion: %s", sent)
 	default:
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 多模态（Task 12）：图片透传与视觉门控，legacy / facade 两种接线各跑一遍。
+// 文本-only 请求的上行 payload 与 SSE 形状已由 TestChatContract_DualBackend
+// 逐字节钉住（success_stream 双后端比对 + assertUpstreamPayload +
+// caseChatContractModels 的 input_modalities 钉），此处不重复。
+// ---------------------------------------------------------------------------
+
+// e2ePNGDataURI 是合法 PNG data URI（magic bytes 校验可过），两种模式共用。
+const e2ePNGDataURI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA=="
+
+// multimodalChatBody 构造带图请求体：一个 user 轮携带文本 + PNG data URI。
+// modelID 为空时不带 model 字段（服务端默认模型语义）。
+func multimodalChatBody(modelID string) map[string]any {
+	body := map[string]any{
+		"messages": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "text", "text": "describe this image"},
+				{"type": "image_url", "image_url": map[string]any{"url": e2ePNGDataURI}},
+			},
+		}},
+	}
+	if modelID != "" {
+		body["model"] = modelID
+	}
+	return body
+}
+
+// assertUpstreamImageRelay drains the stub and pins the multimodal relay: the
+// user message's content must arrive as a parts ARRAY carrying the image_url
+// value verbatim（不降级为文本、不丢图、不改 data URI）。
+func assertUpstreamImageRelay(t *testing.T, up *chatStubUpstream, upstreamModel string) {
+	t.Helper()
+	select {
+	case sent := <-up.lastBody:
+		s := string(sent)
+		for _, want := range []string{
+			`"model":"` + upstreamModel + `"`,
+			`"content":[`,
+			`"type":"text"`,
+			`"type":"image_url"`,
+			`"image_url":{"url":"` + e2ePNGDataURI + `"}`,
+		} {
+			if !strings.Contains(s, want) {
+				t.Errorf("upstream payload missing %s: %s", want, s)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never saw the multimodal request")
+	}
+}
+
+// assertVisionGate pins the text-only rejection: 400 + 固定文案 envelope
+// （逐字节），且 stub 上游零触达——门控发生在任何上游花费之前。
+func assertVisionGate(t *testing.T, w *httptest.ResponseRecorder, up *chatStubUpstream) {
+	t.Helper()
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("vision gate = %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+	const wantBody = `{"code":400,"data":null,"message":"the selected model does not support image input"}`
+	if w.Body.String() != wantBody {
+		t.Errorf("gate envelope = %s, want byte-exact %s", w.Body.String(), wantBody)
+	}
+	select {
+	case sent := <-up.lastBody:
+		t.Errorf("upstream was hit despite the vision gate: %s", sent)
+	default:
+	}
+}
+
+// setupChatVisionLegacyE2E builds a legacy-mode engine whose catalog（等价
+// LLM_PROVIDERS_JSON 的数据面）携带一个 vision 模型（image 模态）与一个
+// text-only 模型 —— 多模态透传与门控用例共用。
+func setupChatVisionLegacyE2E(t *testing.T, up *chatStubUpstream) (*gin.Engine, *sqlx.DB) {
+	t.Helper()
+	db, tokenSvc, authSvc := chatE2EBase(t)
+	cat, err := llm.ParseCatalog(`{
+		"default_model": "vision-chat",
+		"providers": {"deepseek": {"protocol": "openai", "base_url": "` + up.URL + `", "api_keys": ["sk-legacy-test"]}},
+		"models": {
+			"vision-chat": {"provider": "deepseek", "upstream_model": "deepseek-v4-vision", "display_name": "Vision Chat", "input_modalities": ["text", "image"]},
+			"text-chat":   {"provider": "deepseek", "upstream_model": "deepseek-v4-flash", "display_name": "Text Chat", "input_modalities": ["text"]}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("vision catalog: %v", err)
+	}
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+	chatSvc := service.NewChatService(cat,
+		repo.NewSubscriptionRepo(db), repo.NewPlanRepo(db), repo.NewLLMUsageRepo(db))
+	setupCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	chatRouterSetup(setupCtx, engine, db, tokenSvc, authSvc, chatSvc, nil, nil)
+	return engine, db
+}
+
+func TestChatLegacy_MultimodalVision(t *testing.T) {
+	up := newChatStubUpstream(t)
+	engine, db := setupChatVisionLegacyE2E(t, up)
+
+	// 透传：vision 模型收到 content 数组，image_url 原样上行。
+	t.Run("passthrough", func(t *testing.T) {
+		login := loginAndGetTokens(t, engine, "mm-legacy-ok", "yundian")
+		seedMembershipSub(t, db, login.User.ID)
+		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("vision-chat"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("multimodal legacy /chat = %d %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "data: [DONE]") {
+			t.Errorf("multimodal relay missing [DONE]: %s", w.Body.String())
+		}
+		assertUpstreamImageRelay(t, up, "deepseek-v4-vision")
+	})
+
+	// 门控：同一带图请求发向 text-only 模型 → 400 固定文案，上游零触达。
+	t.Run("gate_text_only_model", func(t *testing.T) {
+		login := loginAndGetTokens(t, engine, "mm-legacy-gate", "yundian")
+		seedMembershipSub(t, db, login.User.ID)
+		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("text-chat"))
+		assertVisionGate(t, w, up)
+	})
+}
+
+func TestChatFacade_MultimodalVision(t *testing.T) {
+	up := newChatStubUpstream(t)
+	engine, db, store := buildChatFacadeE2E(t, up, nil, true)
+
+	// 透传：vision 模型（DB catalog InputModalities 含 image，快照同步）
+	// 经网关收到 content 数组，image_url 原样上行。
+	t.Run("passthrough", func(t *testing.T) {
+		login := loginAndGetTokens(t, engine, "mm-facade-ok", "yundian")
+		grantKayaModelEntitlement(t, db, store, login.User.ID, "deepseek-vision")
+		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("deepseek-vision"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("multimodal facade /chat = %d %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "data: [DONE]") {
+			t.Errorf("multimodal relay missing [DONE]: %s", w.Body.String())
+		}
+		assertUpstreamImageRelay(t, up, "deepseek-v4-vision")
+	})
+
+	// 门控：目录里已有 vision 模型，但带图请求发向 text-only 默认模型仍
+	// → 400 固定文案（按模型门控，不是按目录门控），上游零触达。
+	t.Run("gate_text_only_model", func(t *testing.T) {
+		login := loginAndGetTokens(t, engine, "mm-facade-gate", "yundian")
+		grantKayaModelEntitlement(t, db, store, login.User.ID, "deepseek-chat")
+		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("deepseek-chat"))
+		assertVisionGate(t, w, up)
+	})
 }

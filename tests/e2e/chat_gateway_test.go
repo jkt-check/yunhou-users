@@ -640,7 +640,8 @@ func TestChatFacade_ModelsPickerContract(t *testing.T) {
 		t.Errorf("no-account envelope = %s, want byte-exact legacy shape %s", w.Body.String(), wantNoAcctBody)
 	}
 
-	// 有权益 → 候选分支对齐形状 {id, display_name, provider, default}。
+	// 有权益 → 候选分支对齐形状 {id, display_name, provider, default,
+	// input_modalities}（Task 10 透出，picker 据此判定可发图模型）。
 	grantKayaModelEntitlement(t, db, store, login.User.ID, "deepseek-chat")
 	w = newReq()
 	var env struct {
@@ -1353,8 +1354,10 @@ func caseChatContractToolTurn(t *testing.T, env *chatContractEnv, up *chatStubUp
 }
 
 // caseChatContractModels pins GET /chat/models: 无访问前提 → 403 逐字节一
-// 致；有访问前提 → {code:0,data:{models:[{id,display_name,provider,default}]}}
-// 且恰好默认模型带 default:true（客户端预选择语义）。
+// 致；有访问前提 → {code:0,data:{models:[{id,display_name,provider,default,
+// input_modalities}]}} 且恰好默认模型带 default:true（客户端预选择语义）。
+// input_modalities 为 Task 10 透出（空值归一 ["text"]），两种后端的 fixture
+// 模型均为 text-only。
 func caseChatContractModels(t *testing.T, env *chatContractEnv) {
 	login := loginAndGetTokens(t, env.engine, "contract-models", "yundian")
 	get := func() *httptest.ResponseRecorder {
@@ -1379,7 +1382,7 @@ func caseChatContractModels(t *testing.T, env *chatContractEnv) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /chat/models = %d: %s", w.Code, w.Body.String())
 	}
-	want := fmt.Sprintf(`{"code":0,"data":{"models":[{"id":%q,"display_name":%q,"provider":"deepseek","default":true}]}}`,
+	want := fmt.Sprintf(`{"code":0,"data":{"models":[{"id":%q,"display_name":%q,"provider":"deepseek","default":true,"input_modalities":["text"]}]}}`,
 		env.defaultModelID, env.defaultDisplay)
 	if w.Body.String() != want {
 		t.Errorf("/chat/models body = %s, want byte-exact %s", w.Body.String(), want)

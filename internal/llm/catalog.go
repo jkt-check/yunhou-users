@@ -51,16 +51,14 @@ type Model struct {
 	InputModalities []string `json:"input_modalities,omitempty"`
 }
 
-// DefaultInputModalities is the effective modality list for catalog entries
-// that do not declare input_modalities: image input is allowed by default.
-var DefaultInputModalities = []string{"text", "image"}
-
 // NormalizedInputModalities returns the effective input modalities: an
-// empty/undeclared list defaults to DefaultInputModalities; an explicit
-// list (e.g. ["text"] to stay text-only) is honored as-is.
+// empty/undeclared list defaults to ["text","image"]; an explicit list
+// (e.g. ["text"] to stay text-only) is honored as-is. The default is a
+// fresh slice on every call so a consumer can never mutate the shared
+// fallback (append/sort would otherwise poison every later call).
 func (m Model) NormalizedInputModalities() []string {
 	if len(m.InputModalities) == 0 {
-		return DefaultInputModalities
+		return []string{"text", "image"}
 	}
 	return m.InputModalities
 }

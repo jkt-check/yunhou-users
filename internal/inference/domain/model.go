@@ -80,18 +80,14 @@ type Model struct {
 	CreatedAt, UpdatedAt time.Time
 }
 
-// DefaultInputModalities is the effective input modality list for models
-// that do not declare one: image input is allowed by default. Declare
-// ["text"] explicitly to keep a model text-only.
-var DefaultInputModalities = []string{"text", "image"}
-
 // NormalizeInputModalities is the single normalization point for the
 // default-on rule (empty/undeclared → ["text","image"]); every consumer
 // (gateway vision gate, /chat/models projection, facade) must go through
-// it instead of hardcoding the fallback list.
+// it instead of hardcoding the fallback list. The default is a fresh slice
+// on every call so a consumer can never mutate the shared fallback.
 func NormalizeInputModalities(mods []string) []string {
 	if len(mods) == 0 {
-		return DefaultInputModalities
+		return []string{"text", "image"}
 	}
 	return mods
 }

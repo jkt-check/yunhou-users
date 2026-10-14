@@ -70,6 +70,12 @@ func ValidateModel(m *domain.Model) error {
 			return domain.NewError(domain.CodeInvalidInput, "unknown protocol: "+string(p))
 		}
 	}
+	for _, v := range m.InputModalities {
+		if v != "text" && v != "image" {
+			return domain.NewError(domain.CodeInvalidInput,
+				"unknown input modality: "+v+" (allowed: text, image)")
+		}
+	}
 	if len(m.OutputModalities) == 0 {
 		return domain.NewError(domain.CodeInvalidInput, "output modalities must not be empty")
 	}

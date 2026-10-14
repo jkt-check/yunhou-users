@@ -594,8 +594,9 @@ func TestChatService_AllowedModels(t *testing.T) {
 
 // TestChatService_AllowedModels_InputModalities: GET /chat/models 透出
 // input_modalities —— vision 模型 ["text","image"] 原样透出，未配置
-// InputModalities 的 plain 模型按 fail-closed 缺省归一为 ["text"]（kaya
-// picker 据此决定哪些模型允许发图，与视觉门控同口径）。
+// InputModalities 的 plain 模型按缺省放行归一为 ["text","image"]，显式
+// ["text"] 的 textonly 模型透出 ["text"]（kaya picker 据此决定哪些模型
+// 允许发图，与视觉门控同口径）。
 func TestChatService_AllowedModels_InputModalities(t *testing.T) {
 	subRepo := newMockSubscriptionRepo()
 	planRepo := newMockPlanRepo()
@@ -614,8 +615,11 @@ func TestChatService_AllowedModels_InputModalities(t *testing.T) {
 	if got := byID["vision"].InputModalities; !slices.Equal(got, []string{"text", "image"}) {
 		t.Errorf("vision input_modalities = %v, want [text image]", got)
 	}
-	if got := byID["plain"].InputModalities; !slices.Equal(got, []string{"text"}) {
-		t.Errorf("plain input_modalities = %v, want [text]（空值 fail-closed 归一）", got)
+	if got := byID["plain"].InputModalities; !slices.Equal(got, []string{"text", "image"}) {
+		t.Errorf("plain input_modalities = %v, want [text image]（空值缺省放行归一）", got)
+	}
+	if got := byID["textonly"].InputModalities; !slices.Equal(got, []string{"text"}) {
+		t.Errorf("textonly input_modalities = %v, want [text]（显式纯文本原样透出）", got)
 	}
 }
 
@@ -1034,8 +1038,9 @@ func imageChatMessages() []model.ChatMessage {
 	}}
 }
 
-// visionTestCatalog: "plain" 未配置 InputModalities（缺省 = text-only，
-// fail closed），"vision" 显式声明 ["text","image"]。
+// visionTestCatalog: "plain" 未配置 InputModalities（缺省放行 =
+// ["text","image"]），"vision" 显式声明 ["text","image"]，"textonly"
+// 显式钉死 ["text"]（纯文本，拒绝带图）。
 func visionTestCatalog(baseURL string) *llm.Catalog {
 	return &llm.Catalog{
 		DefaultModel: "plain",
@@ -1043,15 +1048,16 @@ func visionTestCatalog(baseURL string) *llm.Catalog {
 			"p": {Protocol: llm.ProtocolOpenAI, BaseURL: baseURL, APIKeys: []string{"k"}},
 		},
 		Models: map[string]llm.Model{
-			"plain":  {Provider: "p", UpstreamModel: "plain-up"},
-			"vision": {Provider: "p", UpstreamModel: "vision-up", InputModalities: []string{"text", "image"}},
+			"plain":    {Provider: "p", UpstreamModel: "plain-up"},
+			"vision":   {Provider: "p", UpstreamModel: "vision-up", InputModalities: []string{"text", "image"}},
+			"textonly": {Provider: "p", UpstreamModel: "textonly-up", InputModalities: []string{"text"}},
 		},
 	}
 }
 
-// TestStreamChat_RejectsImagesForTextOnlyModel: 未声明 image 模态的模型
-// （含缺省未配置的 fail-closed 情形）对带图请求在上游花钱之前 400——
-// errors.Is 命中 ErrChatModelNoVision，上游零调用，错误随 resolved route。
+// TestStreamChat_RejectsImagesForTextOnlyModel: 显式声明 ["text"]（不含
+// image）的模型对带图请求在上游花钱之前 400——errors.Is 命中
+// ErrChatModelNoVision，上游零调用，错误随 resolved route。
 func TestStreamChat_RejectsImagesForTextOnlyModel(t *testing.T) {
 	var hits int32
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1067,26 +1073,61 @@ func TestStreamChat_RejectsImagesForTextOnlyModel(t *testing.T) {
 	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
 	svc := NewChatService(visionTestCatalog(srv.URL), subRepo, planRepo, &mockLLMUsageRepo{})
 
+	_, route, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", "textonly", imageChatMessages(), nil, nil)
+	if !errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("err = %v, want ErrChatModelNoVision", err)
+	}
+	if route == nil || route.LogicalModel != "textonly" {
+		t.Errorf("route = %+v, want resolved LogicalModel %q（审计按生效模型归因）", route, "textonly")
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("upstream called %d times, want 0（门控在任何花费之前拒绝）", n)
+	}
+}
+
+// TestStreamChat_UndeclaredModelPassesImageGate: 未声明 input_modalities
+// 的模型（含空 model 落到缺省模型的路径）按缺省放行——带图请求过门控、
+// 真实触达上游。
+func TestStreamChat_UndeclaredModelPassesImageGate(t *testing.T) {
+	var hits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: [DONE]\n\n"))
+	})
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+
+	subRepo := newMockSubscriptionRepo()
+	planRepo := newMockPlanRepo()
+	seedChatActiveSub(subRepo, "u-1", "monthly")
+	planRepo.plans["monthly"] = &model.Plan{ID: "monthly", IsActive: true, Apps: pq.StringArray{"yunhou-website"}}
+	svc := NewChatService(visionTestCatalog(srv.URL), subRepo, planRepo, &mockLLMUsageRepo{})
+
 	for _, tc := range []struct {
 		name  string
 		model string
 		want  string
 	}{
-		{"explicit text-only model", "plain", "plain"},
-		{"empty model falls to text-only default", "", "plain"},
+		{"undeclared model accepts images", "plain", "plain"},
+		{"empty model falls to undeclared default", "", "plain"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, route, err := svc.StreamChat(context.Background(), "u-1", "yunhou-website", tc.model, imageChatMessages(), nil, nil)
-			if !errors.Is(err, ErrChatModelNoVision) {
-				t.Fatalf("err = %v, want ErrChatModelNoVision", err)
+			if errors.Is(err, ErrChatModelNoVision) {
+				t.Fatalf("err = %v, 未声明 input_modalities 的模型不得被视觉门控拦截", err)
+			}
+			if err != nil {
+				t.Fatalf("err = %v, 缺省放行的带图请求应透传到上游", err)
 			}
 			if route == nil || route.LogicalModel != tc.want {
-				t.Errorf("route = %+v, want resolved LogicalModel %q（审计按生效模型归因）", route, tc.want)
+				t.Errorf("route = %+v, want resolved LogicalModel %q", route, tc.want)
 			}
 		})
 	}
-	if n := atomic.LoadInt32(&hits); n != 0 {
-		t.Errorf("upstream called %d times, want 0（门控在任何花费之前拒绝）", n)
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Errorf("upstream called %d times, want 2（缺省放行真实透传）", n)
 	}
 }
 

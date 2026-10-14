@@ -79,7 +79,8 @@ type ChatRoute struct {
 // ChatModelInfo is the public view of one catalog model, returned by
 // AllowedModels and served at GET /chat/models for kaya's model picker.
 // InputModalities tells the picker which models accept image input; empty
-// catalog values are normalized to ["text"] (fail closed, 与视觉门控同口径).
+// catalog values are normalized to ["text","image"]（缺省放行，与视觉门控
+// 同口径——显式 ["text"] 才是纯文本）。
 type ChatModelInfo struct {
 	ID              string   `json:"id"`
 	DisplayName     string   `json:"display_name"`
@@ -333,8 +334,8 @@ func (s *ChatService) StreamChat(ctx context.Context, userID, appID, logicalMode
 		return nil, route, accessErr
 	}
 
-	// 视觉门控：图片输入只对声明了 image 模态的模型开放——其余在上游花钱
-	// 之前用固定文案 400 拒绝。
+	// 视觉门控：图片输入对缺省/显式声明 image 模态的模型开放；显式声明
+	// 不含 image（如 ["text"]）的模型在上游花钱之前用固定文案 400 拒绝。
 	if model.MessagesHaveImages(messages) && !m.AcceptsImages() {
 		return nil, route, fmt.Errorf("%w: %s", ErrChatModelNoVision, resolvedID)
 	}
@@ -525,11 +526,7 @@ func (s *ChatService) AllowedModels(ctx context.Context, userID, appID string) (
 		if name == "" {
 			name = id
 		}
-		mods := m.InputModalities
-		if len(mods) == 0 {
-			mods = []string{"text"}
-		}
-		out = append(out, ChatModelInfo{ID: id, DisplayName: name, Provider: m.Provider, Default: id == s.catalog.DefaultModel, InputModalities: mods})
+		out = append(out, ChatModelInfo{ID: id, DisplayName: name, Provider: m.Provider, Default: id == s.catalog.DefaultModel, InputModalities: m.NormalizedInputModalities()})
 	}
 	return out, nil
 }

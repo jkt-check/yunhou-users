@@ -125,11 +125,23 @@ type fixture struct {
 	// modelLifecycle overrides the snapshot model lifecycle (I-6 gate tests);
 	// zero value = active.
 	modelLifecycle domain.Lifecycle
+	// modelInputModalities overrides the snapshot model's input modalities;
+	// nil means the fixture default ["text"] (explicit text-only). Use
+	// withModelInputModalities([]string{}) to exercise the undeclared
+	// default-on path.
+	modelInputModalities    []string
+	modelModalitiesOverride bool
 }
 
 // withModelLifecycle pins the snapshot model at a non-active lifecycle.
 func withModelLifecycle(lc domain.Lifecycle) fixtureOpt {
 	return func(f *fixture) { f.modelLifecycle = lc }
+}
+
+// withModelInputModalities pins the snapshot model's input modalities
+// (empty slice = undeclared, the default-on path).
+func withModelInputModalities(mods []string) fixtureOpt {
+	return func(f *fixture) { f.modelInputModalities, f.modelModalitiesOverride = mods, true }
 }
 
 type fixtureOpt func(f *fixture)
@@ -329,13 +341,17 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 	if modelLC == "" {
 		modelLC = domain.LifecycleActive
 	}
+	inputModalities := []string{"text"}
+	if f.modelModalitiesOverride {
+		inputModalities = f.modelInputModalities
+	}
 	f.snap = &catalog.Snapshot{
 		Revision: 1,
 		Models: map[string]domain.Model{f.modelID: {
 			ID: f.modelID, DisplayName: "GLM 4.6", Lifecycle: modelLC,
 			ContextTokens: 200000, MaxOutputTokens: 8192,
 			Protocols:         []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
-			InputModalities:   []string{"text"},
+			InputModalities:   inputModalities,
 			OutputModalities:  []string{"text"},
 			SupportsTools:     true,
 			SupportsReasoning: true,
@@ -1482,10 +1498,9 @@ func TestExecutedUnknown_NoBlindReplay(t *testing.T) {
 }
 
 // TestGateway_ImageGateRejectsTextOnlyModel: 网关内兜底防御层——快照模型
-// InputModalities 不含 image 时，带图请求在任何计量/上游花费之前以
-// CodeInvalidInput 拒绝（能力校验在边缘层完成；此为防未来新入口面漏检的
-// 网关兜底，空 modalities = text-only fail closed）。fixture 快照模型即
-// InputModalities=["text"]。
+// 显式声明 InputModalities=["text"]（不含 image）时，带图请求在任何计量/
+// 上游花费之前以 CodeInvalidInput 拒绝（能力校验在边缘层完成；此为防未来
+// 新入口面漏检的网关兜底）。fixture 快照模型即 InputModalities=["text"]。
 func TestGateway_ImageGateRejectsTextOnlyModel(t *testing.T) {
 	up := newUpstream(t, sseHandler(chunkB, chunkDone))
 	f := newFixture(t, up)
@@ -1509,6 +1524,38 @@ func TestGateway_ImageGateRejectsTextOnlyModel(t *testing.T) {
 	}
 	if n := up.calls.Load(); n != 0 {
 		t.Errorf("upstream calls = %d, want 0（图片在任何花费之前被拒）", n)
+	}
+}
+
+// TestGateway_ImageGateAllowsUndeclaredModel: 未声明 InputModalities 的快照
+// 模型按缺省放行（["text","image"]）——带图请求过网关兜底、真实触达上游
+// 且图片进入上行 payload（adapter 透传，不降级不丢图）。
+func TestGateway_ImageGateAllowsUndeclaredModel(t *testing.T) {
+	up := newUpstream(t, sseHandler(chunkB, chunkDone))
+	f := newFixture(t, up, withModelInputModalities([]string{}))
+	p, key := f.principal()
+	req := chatReq(true, "what is this")
+	req.Messages[1].Content = "what is this"
+	req.Messages[1].ContentParts = []model.ContentPart{
+		{Type: "text", Text: "what is this"},
+		{Type: "image_url", ImageURL: &model.ImageURL{URL: "https://example.com/cat.png"}},
+	}
+
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, req)
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v, 未声明 modalities 的模型不得被视觉门控拦截", err)
+	}
+	drainStream(t, out, EndCompleted)
+	if n := up.calls.Load(); n != 1 {
+		t.Fatalf("upstream calls = %d, want 1（缺省放行真实透传）", n)
+	}
+	select {
+	case body := <-up.bodies:
+		if !strings.Contains(string(body), `"image_url"`) {
+			t.Errorf("upstream payload missing image_url（缺省放行后图片必须透传）: %s", body)
+		}
+	default:
+		t.Error("upstream body not captured（缺省放行后图片必须透传）")
 	}
 }
 

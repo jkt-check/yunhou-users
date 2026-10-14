@@ -70,9 +70,11 @@ func ValidateModel(m *domain.Model) error {
 			return domain.NewError(domain.CodeInvalidInput, "unknown protocol: "+string(p))
 		}
 	}
-	if len(m.InputModalities) == 0 || len(m.OutputModalities) == 0 {
-		return domain.NewError(domain.CodeInvalidInput, "input/output modalities must not be empty")
+	if len(m.OutputModalities) == 0 {
+		return domain.NewError(domain.CodeInvalidInput, "output modalities must not be empty")
 	}
+	// InputModalities 允许为空：缺省放行（未声明 = ["text","image"]，见
+	// domain.NormalizeInputModalities）；显式 ["text"] 才是纯文本钉死。
 	return nil
 }
 
@@ -337,8 +339,11 @@ func (s *Service) Store() Store { return s.store }
 
 // --- model CRUD ---
 
-// CreateModel validates and inserts a draft model. Empty modality lists
-// default to text→text, mirroring the DB column default. An explicit
+// CreateModel validates and inserts a draft model. An empty output modality
+// list defaults to text, mirroring the DB column default; input modalities
+// stay as declared — empty means default-on (["text","image"]) and is NOT
+// materialized, so the stored row keeps the "undeclared" semantics (see
+// domain.NormalizeInputModalities). An explicit
 // non-draft lifecycle is rejected (安全审查 I-1): new models always start
 // at draft and only move via SetModelLifecycle, so a create can never
 // smuggle a model past the draft→publish state machine.
@@ -406,10 +411,11 @@ func (s *Service) SetModelLifecycle(ctx context.Context, id string, to domain.Li
 	return s.store.UpdateModel(ctx, m)
 }
 
+// defaultModalities fills only the output side: empty input modalities are
+// kept empty on purpose — undeclared input means default-on
+// (["text","image"]) per domain.NormalizeInputModalities, and persisting
+// the empty form preserves the distinction from an explicit ["text"].
 func defaultModalities(m *domain.Model) {
-	if len(m.InputModalities) == 0 {
-		m.InputModalities = []string{"text"}
-	}
 	if len(m.OutputModalities) == 0 {
 		m.OutputModalities = []string{"text"}
 	}

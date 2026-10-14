@@ -272,6 +272,9 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 	// route, policy, price, credential, upstream account.
 	const modelID = "deepseek-chat"
 	const visionModelID = "deepseek-vision"
+	// undeclaredModelID 未声明 input_modalities：缺省放行（["text","image"]）
+	// 的钉死用例——上游若不支持视觉会 400→502，属预期暴露而非门控拒绝。
+	const undeclaredModelID = "deepseek-undeclared"
 	if err := store.InsertModel(ctx, &domain.Model{
 		ID: modelID, DisplayName: "DeepSeek Chat", Lifecycle: domain.LifecycleActive,
 		ContextTokens: 128000, MaxOutputTokens: 8192,
@@ -291,6 +294,16 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 		}); err != nil {
 			t.Fatalf("vision model: %v", err)
 		}
+		// 未声明 input_modalities（空值入库）——缺省放行语义的端到端钉。
+		if err := store.InsertModel(ctx, &domain.Model{
+			ID: undeclaredModelID, DisplayName: "DeepSeek Undeclared", Lifecycle: domain.LifecycleActive,
+			ContextTokens: 128000, MaxOutputTokens: 8192,
+			Protocols:        []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
+			OutputModalities: []string{"text"},
+			SupportsTools:    true, SupportsReasoning: true,
+		}); err != nil {
+			t.Fatalf("undeclared model: %v", err)
+		}
 	}
 	prov := &domain.Provider{Code: "deepseek", DisplayName: "DeepSeek", AccessType: domain.AccessOfficialAPI, Status: "active"}
 	if err := store.InsertProvider(ctx, prov); err != nil {
@@ -298,7 +311,7 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 	}
 	catalogModels := []string{modelID}
 	if withVision {
-		catalogModels = append(catalogModels, visionModelID)
+		catalogModels = append(catalogModels, visionModelID, undeclaredModelID)
 	}
 	pol := &postgres.PolicyVersion{
 		Name: "kaya-gift", Revision: 1, ModelIDs: catalogModels,
@@ -366,7 +379,7 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 	}); err != nil {
 		t.Fatalf("route: %v", err)
 	}
-	var depV *domain.Deployment
+	var depV, depU *domain.Deployment
 	if withVision {
 		depV = &domain.Deployment{
 			ProviderID: prov.ID, UpstreamModel: "deepseek-v4-vision", BaseURL: up.URL,
@@ -381,6 +394,20 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 			ModelID: visionModelID, DeploymentID: depV.ID, Weight: 1, Enabled: true,
 		}); err != nil {
 			t.Fatalf("vision route: %v", err)
+		}
+		depU = &domain.Deployment{
+			ProviderID: prov.ID, UpstreamModel: "deepseek-v4-undeclared", BaseURL: up.URL,
+			Protocol:       domain.ProtocolOpenAIChat,
+			ConnectTimeout: 2 * time.Second, RequestTimeout: 30 * time.Second,
+			Status: domain.DeploymentActive,
+		}
+		if err := store.InsertDeployment(ctx, depU); err != nil {
+			t.Fatalf("undeclared deployment: %v", err)
+		}
+		if err := store.InsertRoute(ctx, &domain.ModelRoute{
+			ModelID: undeclaredModelID, DeploymentID: depU.ID, Weight: 1, Enabled: true,
+		}); err != nil {
+			t.Fatalf("undeclared route: %v", err)
 		}
 	}
 	vault, err := credentials.NewVault(map[int][]byte{1: []byte("0123456789abcdef0123456789abcdef")}, 1)
@@ -425,6 +452,19 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 		snap.Deployments[depV.ID] = *depV
 		snap.RoutesByModel[visionModelID] = []domain.ModelRoute{{
 			ModelID: visionModelID, DeploymentID: depV.ID, Weight: 1, Enabled: true,
+		}}
+		// 未声明 input_modalities：运行面快照同样保持空值（缺省放行由
+		// domain.Model.AcceptsImages 归一，不在快照里物化默认列表）。
+		snap.Models[undeclaredModelID] = domain.Model{
+			ID: undeclaredModelID, DisplayName: "DeepSeek Undeclared", Lifecycle: domain.LifecycleActive,
+			ContextTokens: 128000, MaxOutputTokens: 8192,
+			Protocols:        []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
+			OutputModalities: []string{"text"},
+			SupportsTools:    true, SupportsReasoning: true,
+		}
+		snap.Deployments[depU.ID] = *depU
+		snap.RoutesByModel[undeclaredModelID] = []domain.ModelRoute{{
+			ModelID: undeclaredModelID, DeploymentID: depU.ID, Weight: 1, Enabled: true,
 		}}
 	}
 	egress, err := credentials.NewEgressValidator([]string{"127.0.0.0/8"})
@@ -1420,8 +1460,8 @@ func caseChatContractToolTurn(t *testing.T, env *chatContractEnv, up *chatStubUp
 // caseChatContractModels pins GET /chat/models: 无访问前提 → 403 逐字节一
 // 致；有访问前提 → {code:0,data:{models:[{id,display_name,provider,default,
 // input_modalities}]}} 且恰好默认模型带 default:true（客户端预选择语义）。
-// input_modalities 为 Task 10 透出（空值归一 ["text"]），两种后端的 fixture
-// 模型均为 text-only。
+// input_modalities 为 Task 10 透出（空值缺省放行归一 ["text","image"]），两种后端的 fixture
+// 模型均显式声明 ["text"]（text-only）。
 func caseChatContractModels(t *testing.T, env *chatContractEnv) {
 	login := loginAndGetTokens(t, env.engine, "contract-models", "yundian")
 	get := func() *httptest.ResponseRecorder {
@@ -1689,8 +1729,9 @@ func assertVisionGate(t *testing.T, w *httptest.ResponseRecorder, up *chatStubUp
 }
 
 // setupChatVisionLegacyE2E builds a legacy-mode engine whose catalog（等价
-// LLM_PROVIDERS_JSON 的数据面）携带一个 vision 模型（image 模态）与一个
-// text-only 模型 —— 多模态透传与门控用例共用。
+// LLM_PROVIDERS_JSON 的数据面）携带一个 vision 模型（image 模态）、一个显式
+// text-only 模型与一个未声明 modalities 的模型（缺省放行）—— 多模态透传
+// 与门控用例共用。
 func setupChatVisionLegacyE2E(t *testing.T, up *chatStubUpstream) (*gin.Engine, *sqlx.DB) {
 	t.Helper()
 	db, tokenSvc, authSvc := chatE2EBase(t)
@@ -1699,7 +1740,8 @@ func setupChatVisionLegacyE2E(t *testing.T, up *chatStubUpstream) (*gin.Engine, 
 		"providers": {"deepseek": {"protocol": "openai", "base_url": "` + up.URL + `", "api_keys": ["sk-legacy-test"]}},
 		"models": {
 			"vision-chat": {"provider": "deepseek", "upstream_model": "deepseek-v4-vision", "display_name": "Vision Chat", "input_modalities": ["text", "image"]},
-			"text-chat":   {"provider": "deepseek", "upstream_model": "deepseek-v4-flash", "display_name": "Text Chat", "input_modalities": ["text"]}
+			"text-chat":   {"provider": "deepseek", "upstream_model": "deepseek-v4-flash", "display_name": "Text Chat", "input_modalities": ["text"]},
+			"undeclared-chat": {"provider": "deepseek", "upstream_model": "deepseek-v4-undeclared", "display_name": "Undeclared Chat"}
 		}
 	}`)
 	if err != nil {
@@ -1734,12 +1776,23 @@ func TestChatLegacy_MultimodalVision(t *testing.T) {
 		assertUpstreamImageRelay(t, up, "deepseek-v4-vision")
 	})
 
-	// 门控：同一带图请求发向 text-only 模型 → 400 固定文案，上游零触达。
+	// 门控：同一带图请求发向显式 text-only 模型 → 400 固定文案，上游零触达。
 	t.Run("gate_text_only_model", func(t *testing.T) {
 		login := loginAndGetTokens(t, engine, "mm-legacy-gate", "yundian")
 		seedMembershipSub(t, db, login.User.ID)
 		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("text-chat"))
 		assertVisionGate(t, w, up)
+	})
+
+	// 缺省放行：未声明 input_modalities 的模型带图请求过门控、原样上行。
+	t.Run("passthrough_undeclared_model", func(t *testing.T) {
+		login := loginAndGetTokens(t, engine, "mm-legacy-undeclared", "yundian")
+		seedMembershipSub(t, db, login.User.ID)
+		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("undeclared-chat"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("multimodal legacy /chat (undeclared) = %d %s", w.Code, w.Body.String())
+		}
+		assertUpstreamImageRelay(t, up, "deepseek-v4-undeclared")
 	})
 }
 
@@ -1762,12 +1815,24 @@ func TestChatFacade_MultimodalVision(t *testing.T) {
 		assertUpstreamImageRelay(t, up, "deepseek-v4-vision")
 	})
 
-	// 门控：目录里已有 vision 模型，但带图请求发向 text-only 默认模型仍
+	// 门控：目录里已有 vision 模型，但带图请求发向显式 text-only 默认模型仍
 	// → 400 固定文案（按模型门控，不是按目录门控），上游零触达。
 	t.Run("gate_text_only_model", func(t *testing.T) {
 		login := loginAndGetTokens(t, engine, "mm-facade-gate", "yundian")
 		grantKayaModelEntitlement(t, db, store, login.User.ID, "deepseek-chat")
 		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("deepseek-chat"))
 		assertVisionGate(t, w, up)
+	})
+
+	// 缺省放行：未声明 input_modalities 的模型（DB/快照均空值）带图请求
+	// 过 facade 门控与网关兜底，原样上行。
+	t.Run("passthrough_undeclared_model", func(t *testing.T) {
+		login := loginAndGetTokens(t, engine, "mm-facade-undeclared", "yundian")
+		grantKayaModelEntitlement(t, db, store, login.User.ID, "deepseek-undeclared")
+		w := chatPost(t, engine, login.AccessToken, multimodalChatBody("deepseek-undeclared"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("multimodal facade /chat (undeclared) = %d %s", w.Code, w.Body.String())
+		}
+		assertUpstreamImageRelay(t, up, "deepseek-v4-undeclared")
 	})
 }

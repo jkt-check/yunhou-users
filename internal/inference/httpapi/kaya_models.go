@@ -5,7 +5,8 @@
 // /chat 是 Kaya 面，不是 /v1 标准协议面）。内容 = 调用者权益可见且已发布的
 // 模型集合（与 /v1/models 同一判定：catalog.ListPublishedModels + 权益
 // AccessCheck）。input_modalities 供 picker 判定哪些模型允许发图；空值按
-// ["text"] 透出（fail closed，与视觉门控同口径）。无计费账户 = 无有效订阅
+// ["text","image"] 透出（缺省放行，与视觉门控同口径——显式 ["text"] 才是
+// 纯文本）。无计费账户 = 无有效订阅
 // → 403 ErrChatNoAccess 形状（N4a，对齐 legacy GetModels/writeChatError），
 // 不是 200 空列表。
 //
@@ -54,14 +55,11 @@ type kayaModelEntry struct {
 	InputModalities []string `json:"input_modalities"`
 }
 
-// normalizeInputModalities 空值按 text-only 透出（fail closed，与网关视觉
-// 门控同口径）。已发布快照经 Publish / ParseSnapshot 的 ValidateModel 拒绝
-// 空 modalities，此归一为防御性兜底。
+// normalizeInputModalities 透出归一：空值按缺省放行透出 ["text","image"]
+// （与网关视觉门控同口径——显式 ["text"] 才是纯文本）。统一走 domain 的
+// 单一归一点，避免透出层与门控各自写死兜底列表。
 func normalizeInputModalities(mods []string) []string {
-	if len(mods) == 0 {
-		return []string{"text"}
-	}
-	return mods
+	return domain.NormalizeInputModalities(mods)
 }
 
 // List handles GET /chat/models.

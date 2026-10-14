@@ -144,22 +144,27 @@ SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
  ORDER BY occurred_at DESC;
 ```
 
-## 模型模态（input_modalities）：点亮视觉
+## 模型模态（input_modalities）：缺省放行与关闭视觉
 
-`/chat` 的图片输入按模型 `input_modalities` 门控：**缺省/空 = 纯文本
-（fail closed）**，未含 `"image"` 的模型收到带图请求一律 400
+`/chat` 的图片输入按模型 `input_modalities` 门控：**缺省/空 = 放行图片
+（default-on，等效 `["text","image"]`）**；要关闭某模型的视觉能力，显式
+声明 `["text"]`——未含 `"image"` 的显式声明收到带图请求一律 400
 `the selected model does not support image input`（先于上游调用，不计费）；
-`GET /chat/models` 透出该字段供 picker 判定。
+`GET /chat/models` 透出该字段（空值归一为 `["text","image"]`）供 picker 判定。
+注意：未声明模型的上游若实际无视觉能力，带图请求会在上游报错（400→502），
+属预期暴露——确认上游支持视觉的模型才保持未声明或显式点亮。
 
-- **网关目录（本条路径）**：`PATCH /admin/models/:id`（models:manage）设
-  `{"input_modalities":["text","image"],"reason":"..."}`，然后
+- **网关目录（本条路径）**：无需逐模型配置即可放行图片；要**关闭**视觉，
+  `PATCH /admin/models/:id`（models:manage）设
+  `{"input_modalities":["text"],"reason":"..."}`，然后
   `POST /admin/catalog/publish` 发布目录版本生效——`/chat/models` 与
   视觉门控都读已发布快照，未发布不生效。协议约束：`openai_responses`
   协议的部署**不接受图片**（适配层显式 `InvalidInput`，绝不静默丢弃），
   视觉模型只能挂 `openai_chat` / `anthropic_messages` 部署。
-- **legacy `/chat` 目录**：在 `LLM_PROVIDERS_JSON` 的模型条目加
-  `"input_modalities":["text","image"]` 并重启。`DEEPSEEK_*` 合成的
-  单模型目录（LegacyCatalog）无法配置模态，永久纯文本。
+- **legacy `/chat` 目录**：`LLM_PROVIDERS_JSON` 中未声明
+  `input_modalities` 的模型缺省放行；显式 `"input_modalities":["text"]`
+  并重启即关闭。`DEEPSEEK_*` 合成的单模型目录（LegacyCatalog）在代码里
+  **钉死 `["text"]`**（DeepSeek 上游无视觉模型），不随缺省放行。
 - 客户端侧契约（parts 数组、≤4 张、单张 ≤1 MiB wire、合计 ≤3 MiB、
   magic bytes 校验）见 `docs/api-integration-guide.md`「Chat 接口」；
   `/v1/*` 对外协议面本期仍显式拒绝多模态（后续工作）。

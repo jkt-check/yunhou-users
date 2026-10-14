@@ -58,6 +58,10 @@ type ExtensionConfig struct {
 
 // Model is the public catalog entry. ID is the stable public model ID
 // (the /v1/models id), deliberately not a UUID (设计 §5).
+//
+// InputModalities follows the default-on rule: an empty/undeclared list is
+// effective ["text","image"] (see NormalizeInputModalities); only an
+// explicit list without "image" (e.g. ["text"]) keeps a model text-only.
 type Model struct {
 	ID               string
 	DisplayName      string
@@ -74,6 +78,30 @@ type Model struct {
 	SupportsTools        bool
 	SupportsReasoning    bool
 	CreatedAt, UpdatedAt time.Time
+}
+
+// NormalizeInputModalities is the single normalization point for the
+// default-on rule (empty/undeclared → ["text","image"]); every consumer
+// (gateway vision gate, /chat/models projection, facade) must go through
+// it instead of hardcoding the fallback list. The default is a fresh slice
+// on every call so a consumer can never mutate the shared fallback.
+func NormalizeInputModalities(mods []string) []string {
+	if len(mods) == 0 {
+		return []string{"text", "image"}
+	}
+	return mods
+}
+
+// AcceptsImages reports whether the model accepts image input under the
+// default-on rule: undeclared modalities accept images; an explicit list
+// without "image" (e.g. ["text"]) rejects them.
+func (m Model) AcceptsImages() bool {
+	for _, v := range NormalizeInputModalities(m.InputModalities) {
+		if v == "image" {
+			return true
+		}
+	}
+	return false
 }
 
 // Provider is a vendor/upstream family; never bound to a single account.

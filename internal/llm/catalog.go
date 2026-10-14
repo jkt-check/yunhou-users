@@ -46,15 +46,28 @@ type Model struct {
 	// requires it). 0 → provider default 8192 at translation time.
 	MaxTokens int `json:"max_tokens,omitempty"`
 	// InputModalities lists accepted input modalities ("text", "image");
-	// empty/missing means text-only (fail closed). Gates multimodal /chat.
+	// empty/missing defaults to ["text","image"] (default-on) — declare
+	// ["text"] explicitly to keep a model text-only. Gates multimodal /chat.
 	InputModalities []string `json:"input_modalities,omitempty"`
 }
 
-// AcceptsImages reports whether the catalog entry opts into image input.
-// Missing modalities mean text-only (fail closed — a vision model rejects
-// images until the operator configures it, never the reverse).
+// NormalizedInputModalities returns the effective input modalities: an
+// empty/undeclared list defaults to ["text","image"]; an explicit list
+// (e.g. ["text"] to stay text-only) is honored as-is. The default is a
+// fresh slice on every call so a consumer can never mutate the shared
+// fallback (append/sort would otherwise poison every later call).
+func (m Model) NormalizedInputModalities() []string {
+	if len(m.InputModalities) == 0 {
+		return []string{"text", "image"}
+	}
+	return m.InputModalities
+}
+
+// AcceptsImages reports whether the catalog entry accepts image input.
+// Undeclared modalities default-on (["text","image"]); only an explicit
+// list without "image" (e.g. ["text"]) keeps the model text-only.
 func (m Model) AcceptsImages() bool {
-	for _, v := range m.InputModalities {
+	for _, v := range m.NormalizedInputModalities() {
 		if v == "image" {
 			return true
 		}
@@ -182,6 +195,9 @@ func (c *Catalog) ModelIDs() []string {
 // LegacyCatalog synthesizes a single-provider, single-model catalog from the
 // DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL envs so existing
 // deployments keep working unchanged. Empty apiKey → nil (chat disabled).
+// InputModalities is pinned to ["text"] explicitly: DeepSeek upstream has no
+// vision model, so the default-on rule must not apply here (an image request
+// would otherwise sail through the gate and surface as an upstream 502).
 func LegacyCatalog(apiKey, baseURL, upstreamModel string) *Catalog {
 	if apiKey == "" {
 		return nil
@@ -192,7 +208,7 @@ func LegacyCatalog(apiKey, baseURL, upstreamModel string) *Catalog {
 			"deepseek": {Protocol: ProtocolOpenAI, BaseURL: baseURL, APIKeys: []string{apiKey}},
 		},
 		Models: map[string]Model{
-			upstreamModel: {Provider: "deepseek", UpstreamModel: upstreamModel, DisplayName: upstreamModel},
+			upstreamModel: {Provider: "deepseek", UpstreamModel: upstreamModel, DisplayName: upstreamModel, InputModalities: []string{"text"}},
 		},
 	}
 }

@@ -221,9 +221,8 @@ func TestKayaModels_NonSentinelSnapshotErrorIs500(t *testing.T) {
 
 // Task 10：GET /chat/models 透出 input_modalities —— kaya picker 据此决定
 // 哪些内置模型允许发图。vision 模型（["text","image"]）原样透出。
-// 空值归一（["text"]）端对端不可达：Publish 与 ParseSnapshot 两道
-// ValidateModel 都拒绝空 modalities，已发布快照里不存在空值模型——
-// 该防御分支由包内测试钉住（见 kaya_models_internal_test.go）。
+// 空值归一（缺省放行 ["text","image"]）由包内测试钉住（见
+// kaya_models_internal_test.go）。
 func TestKayaModels_ListInputModalities(t *testing.T) {
 	f := newAccessFixture(t, 0)
 	store := f.store

@@ -42,7 +42,8 @@ func TestParseEnvCatalog_ValidationBranches(t *testing.T) {
 	if _, err := ParseEnvCatalog(badModel); err == nil {
 		t.Error("invalid model accepted")
 	}
-	// 合法最小目录：modalities 默认 text。
+	// 合法最小目录：input modalities 未声明保持为空（缺省放行语义由消费侧
+	// domain.NormalizeInputModalities 归一），output modalities 默认 text。
 	ok, err := ParseEnvCatalog(`{"providers":[{"code":"glm","display_name":"GLM","access_type":"official_api"}],
 		"models":[{"id":"glm-1","display_name":"GLM 1","context_tokens":1000,"max_output_tokens":100,
 		"protocols":["openai_chat"],
@@ -50,8 +51,11 @@ func TestParseEnvCatalog_ValidationBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ok.Models) != 1 || len(ok.Models[0].InputModalities) != 1 || ok.Models[0].InputModalities[0] != "text" {
-		t.Errorf("modalities default = %+v", ok.Models[0])
+	if len(ok.Models) != 1 || len(ok.Models[0].InputModalities) != 0 {
+		t.Errorf("input modalities undeclared must stay empty（default-on） = %+v", ok.Models[0])
+	}
+	if len(ok.Models[0].OutputModalities) != 1 || ok.Models[0].OutputModalities[0] != "text" {
+		t.Errorf("output modalities default = %+v", ok.Models[0])
 	}
 	if !strings.Contains(ok.Providers[0].Code, "glm") {
 		t.Errorf("provider = %+v", ok.Providers[0])

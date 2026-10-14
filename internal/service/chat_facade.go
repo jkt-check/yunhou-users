@@ -21,7 +21,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"slices"
 	"sync/atomic"
 	"time"
 
@@ -128,7 +127,7 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 				provider = pv.Code
 			}
 		}
-		mods := modalitiesOrText(m.InputModalities)
+		mods := modalitiesOrDefault(m.InputModalities)
 		out = append(out, ChatModelInfo{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
 			Default: m.ID == f.defaultModel, InputModalities: mods,
@@ -137,13 +136,10 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 	return out, nil
 }
 
-// modalitiesOrText 防御性兜底:catalog 发布校验已拒绝空 modalities(见
-// catalog.ValidateModel),正常路径不会走到空分支;兜底保证透出契约至少含 "text"。
-func modalitiesOrText(mods []string) []string {
-	if len(mods) == 0 {
-		return []string{"text"}
-	}
-	return mods
+// modalitiesOrDefault 透出归一：空 modalities = 缺省放行（["text","image"]，
+// 与网关视觉门控同口径），显式声明原样透出。统一走 domain 的单一归一点。
+func modalitiesOrDefault(mods []string) []string {
+	return domain.NormalizeInputModalities(mods)
 }
 
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
@@ -160,14 +156,15 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID
 		f.logNotReady(snap) // 结构化 ERROR，30s 节流，含 model id + 快照 revision
 		return nil, ErrChatNotReady
 	}
-	// 视觉门控（对齐 legacy）：快照 input_modalities 不含 image 的模型，带图
-	// 请求在上游花钱之前 400；空 modalities 按 text-only（fail closed）。
+	// 视觉门控（对齐 legacy）：快照 input_modalities 显式声明且不含 image
+	// 的模型，带图请求在上游花钱之前 400；空 modalities 缺省放行
+	// （["text","image"]，domain.Model.AcceptsImages 统一口径）。
 	if model.MessagesHaveImages(messages) {
 		mm, ok := snap.Model(modelID)
 		if !ok {
 			return nil, ErrChatUnknownModel
 		}
-		if !slices.Contains(mm.InputModalities, "image") {
+		if !mm.AcceptsImages() {
 			return nil, fmt.Errorf("%w: %s", ErrChatModelNoVision, modelID)
 		}
 	}

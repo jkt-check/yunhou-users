@@ -201,13 +201,13 @@ func (s *facadeCatalogStore) BeginPublish(context.Context) (catalog.PublishTx, e
 }
 
 // AllowedModels 全路径：已发布 ∩ 有权益的模型映射为视图模型——目录声明的
-// input_modalities 原样透传，Default 仅默认模型为 true，Provider 取首个
-// active deployment 的 provider code。
+// input_modalities 原样透传，未声明的模型按缺省放行归一为 ["text","image"]，
+// Default 仅默认模型为 true，Provider 取首个 active deployment 的 provider code。
 func TestChatFacade_AllowedModels_ModalitiesPassthroughAndDefault(t *testing.T) {
 	t.Parallel()
 	resolver := access.NewResolver(&facadeKeyStore{
 		account: &domain.BillingAccount{ID: "ba-1", UserID: "u-1", Status: "active"},
-		ents:    []domain.Entitlement{{ID: "e-1", ModelIDs: []string{"glm-4.6", "glm-4.6v"}}},
+		ents:    []domain.Entitlement{{ID: "e-1", ModelIDs: []string{"glm-4.6", "glm-4.6v", "glm-legacy"}}},
 	}, nil)
 	rev := &domain.ConfigRevision{
 		ID: 1, Scope: domain.ScopeCatalog, Revision: 1, IsActive: true,
@@ -219,6 +219,10 @@ func TestChatFacade_AllowedModels_ModalitiesPassthroughAndDefault(t *testing.T) 
 				{ID: "glm-4.6v", DisplayName: "GLM 4.6V", Lifecycle: domain.LifecycleActive,
 					InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"},
 					ContextTokens: 1000, MaxOutputTokens: 100, Protocols: []domain.Protocol{domain.ProtocolKayaChat}},
+				// 未声明 input_modalities：缺省放行，透出归一为 ["text","image"]。
+				{ID: "glm-legacy", DisplayName: "GLM Legacy", Lifecycle: domain.LifecycleActive,
+					OutputModalities: []string{"text"},
+					ContextTokens:    1000, MaxOutputTokens: 100, Protocols: []domain.Protocol{domain.ProtocolKayaChat}},
 			},
 			[]domain.Provider{{ID: "prov-1", Code: "zhipu", DisplayName: "Zhipu", AccessType: domain.AccessOfficialAPI, Status: "active"}},
 			[]domain.Deployment{{ID: "dep-1", ProviderID: "prov-1", UpstreamModel: "glm-4.6",
@@ -228,6 +232,7 @@ func TestChatFacade_AllowedModels_ModalitiesPassthroughAndDefault(t *testing.T) 
 			[]domain.ModelRoute{
 				{ID: "r-1", ModelID: "glm-4.6", DeploymentID: "dep-1", Weight: 1, Enabled: true},
 				{ID: "r-2", ModelID: "glm-4.6v", DeploymentID: "dep-1", Weight: 1, Enabled: true},
+				{ID: "r-3", ModelID: "glm-legacy", DeploymentID: "dep-1", Weight: 1, Enabled: true},
 			})},
 	}
 	cat := catalog.NewService(&facadeCatalogStore{rev: rev})
@@ -242,8 +247,8 @@ func TestChatFacade_AllowedModels_ModalitiesPassthroughAndDefault(t *testing.T) 
 	if err != nil {
 		t.Fatalf("AllowedModels: %v", err)
 	}
-	if len(models) != 2 {
-		t.Fatalf("models = %+v, want 2（已发布 ∩ 有权益）", models)
+	if len(models) != 3 {
+		t.Fatalf("models = %+v, want 3（已发布 ∩ 有权益）", models)
 	}
 	byID := make(map[string]ChatModelInfo, len(models))
 	for _, m := range models {
@@ -271,6 +276,13 @@ func TestChatFacade_AllowedModels_ModalitiesPassthroughAndDefault(t *testing.T) 
 	}
 	if len(vis.InputModalities) != 2 || vis.InputModalities[0] != "text" || vis.InputModalities[1] != "image" {
 		t.Errorf("glm-4.6v InputModalities = %v, want [text image]（目录声明原样透传）", vis.InputModalities)
+	}
+	legacy, ok := byID["glm-legacy"]
+	if !ok {
+		t.Fatalf("glm-legacy missing: %+v", models)
+	}
+	if len(legacy.InputModalities) != 2 || legacy.InputModalities[0] != "text" || legacy.InputModalities[1] != "image" {
+		t.Errorf("glm-legacy InputModalities = %v, want [text image]（未声明缺省放行归一）", legacy.InputModalities)
 	}
 }
 
@@ -533,9 +545,9 @@ func TestChatFacade_StreamChat_NoAccountResolverIsNoAccess(t *testing.T) {
 	}
 }
 
-// --- 视觉门控（对齐 legacy StreamChat）：带图请求只对声明了 image 模态的
-// 模型放行，其余在上游花钱之前 400（ErrChatModelNoVision）；缺省
-// input_modalities 按 text-only（fail closed）。 ---
+// --- 视觉门控（对齐 legacy StreamChat）：带图请求对缺省/显式声明 image
+// 模态的模型放行；显式声明 ["text"]（不含 image）的模型在上游花钱之前
+// 400（ErrChatModelNoVision）。 ---
 
 // facadeImageMessages：一条带 image_url part 的用户消息（门控触发形态）。
 func facadeImageMessages() []model.ChatMessage {
@@ -560,12 +572,12 @@ func TestChatFacade_StreamChat_ImageGate(t *testing.T) {
 	snaps := stubSnapshotSource{snap: &catalog.Snapshot{Models: map[string]domain.Model{
 		"glm-4.6":    {ID: "glm-4.6", InputModalities: []string{"text"}},
 		"glm-4.6v":   {ID: "glm-4.6v", InputModalities: []string{"text", "image"}},
-		"glm-legacy": {ID: "glm-legacy"}, // 缺省 modalities = text-only（fail closed）
+		"glm-legacy": {ID: "glm-legacy"}, // 缺省 modalities = 放行图片（default-on）
 	}}}
 	f := NewChatGatewayFacade(nil, resolver, nil, snaps, "glm-4.6")
 	img := facadeImageMessages()
 
-	// text-only 模型（默认模型路径）+ 带图 → ErrChatModelNoVision，且错误随
+	// 显式 ["text"] 模型（默认模型路径）+ 带图 → ErrChatModelNoVision，且错误随
 	// resolved route（审计按生效模型归因）。
 	_, route, err := f.StreamChat(context.Background(), "u-1", "yunhou-website", "", img, nil, nil)
 	if !errors.Is(err, ErrChatModelNoVision) {
@@ -575,10 +587,14 @@ func TestChatFacade_StreamChat_ImageGate(t *testing.T) {
 		t.Errorf("route = %+v, want resolved LogicalModel glm-4.6", route)
 	}
 
-	// 缺省 input_modalities 一律按 text-only 拒绝（fail closed）。
+	// 缺省 input_modalities 一律放行（default-on）——过门控后推进到用户
+	// 解析，403 语义作为「未被门控拦截」的可观察证据。
 	_, _, err = f.StreamChat(context.Background(), "u-1", "yunhou-website", "glm-legacy", img, nil, nil)
-	if !errors.Is(err, ErrChatModelNoVision) {
-		t.Fatalf("err = %v, want ErrChatModelNoVision（缺省 modalities fail closed）", err)
+	if errors.Is(err, ErrChatModelNoVision) {
+		t.Fatalf("err = %v, 缺省 modalities 不得被门控拦截（default-on）", err)
+	}
+	if !errors.Is(err, ErrChatNoAccess) {
+		t.Fatalf("err = %v, want ErrChatNoAccess（缺省放行后推进到用户解析）", err)
 	}
 
 	// vision 模型过门控 → 推进到用户解析（403 证明未被门控拦截）。
@@ -682,25 +698,26 @@ func TestChatFacade_RefreshFailureServesLastVerifiedSnapshot(t *testing.T) {
 	}
 }
 
-func TestModalitiesOrText(t *testing.T) {
+func TestModalitiesOrDefault(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []string
 		want []string
 	}{
-		{"nil defaults to text", nil, []string{"text"}},
-		{"empty defaults to text", []string{}, []string{"text"}},
+		{"nil defaults to text+image", nil, []string{"text", "image"}},
+		{"empty defaults to text+image", []string{}, []string{"text", "image"}},
+		{"explicit text-only passthrough", []string{"text"}, []string{"text"}},
 		{"passthrough", []string{"text", "image"}, []string{"text", "image"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := modalitiesOrText(tc.in)
+			got := modalitiesOrDefault(tc.in)
 			if len(got) != len(tc.want) {
-				t.Fatalf("modalitiesOrText(%v) = %v, want %v", tc.in, got, tc.want)
+				t.Fatalf("modalitiesOrDefault(%v) = %v, want %v", tc.in, got, tc.want)
 			}
 			for i := range got {
 				if got[i] != tc.want[i] {
-					t.Fatalf("modalitiesOrText(%v) = %v, want %v", tc.in, got, tc.want)
+					t.Fatalf("modalitiesOrDefault(%v) = %v, want %v", tc.in, got, tc.want)
 				}
 			}
 		})

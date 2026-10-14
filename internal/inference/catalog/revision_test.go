@@ -190,3 +190,47 @@ func TestBuildPayloadDeterministic(t *testing.T) {
 		t.Error("equal catalogs must serialize byte-identically")
 	}
 }
+
+// TestPayloadRoundTrip_UndeclaredInputModalitiesStayEmpty pins the
+// default-on rule across the publish serialization boundary: a model with
+// undeclared input_modalities survives BuildCatalogPayload → JSON →
+// ParseSnapshot with the list still EMPTY (never materialized as ["text"]),
+// and the parsed snapshot model accepts images (消费端缺省放行口径).
+func TestPayloadRoundTrip_UndeclaredInputModalitiesStayEmpty(t *testing.T) {
+	m := sampleModel("glm-4.6")
+	m.Lifecycle = domain.LifecycleActive
+	m.InputModalities = nil // 未声明：缺省放行语义必须跨越序列化往返
+	prov := domain.Provider{ID: "prov-1", Code: "example", DisplayName: "Example", AccessType: domain.AccessOfficialAPI, Status: "active"}
+	dep := sampleDeployment()
+	route := sampleRoute()
+
+	raw := catalog.BuildCatalogPayload([]domain.Model{m}, []domain.Provider{prov}, []domain.Deployment{dep}, []domain.ModelRoute{route})
+	// wire 形态钉：序列化出的 input_modalities 是空数组，不是 ["text"]。
+	var wire struct {
+		Models []struct {
+			ID              string   `json:"id"`
+			InputModalities []string `json:"input_modalities"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(wire.Models) != 1 || len(wire.Models[0].InputModalities) != 0 {
+		t.Fatalf("wire input_modalities = %+v, want empty array（未声明语义入快照）", wire.Models)
+	}
+
+	snap, err := catalog.ParseSnapshot(&domain.ConfigRevision{ID: 8, Revision: 4, Payload: domain.ExtensionConfig{Raw: raw}})
+	if err != nil {
+		t.Fatalf("ParseSnapshot: %v（空 input modalities 必须过校验）", err)
+	}
+	got, ok := snap.Model("glm-4.6")
+	if !ok {
+		t.Fatal("model missing after round trip")
+	}
+	if len(got.InputModalities) != 0 {
+		t.Errorf("round-tripped InputModalities = %v, want empty", got.InputModalities)
+	}
+	if !got.AcceptsImages() {
+		t.Error("undeclared model must accept images after snapshot round trip（default-on）")
+	}
+}

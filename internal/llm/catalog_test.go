@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -119,16 +120,17 @@ func TestCatalog_DefaultInferredFromSingleModel(t *testing.T) {
 	}
 }
 
-// TestModel_AcceptsImages: 缺省/未配置 InputModalities 一律 text-only
-// （fail closed——视觉模型在 operator 显式配置前拒绝图片，绝不反向）。
+// TestModel_AcceptsImages: 缺省/未配置 InputModalities 一律放行图片
+// （default-on——未声明 = ["text","image"]）；只有显式声明不含 image 的
+// 列表（如 ["text"]）保持纯文本拒绝。
 func TestModel_AcceptsImages(t *testing.T) {
 	cases := []struct {
 		name       string
 		modalities []string
 		want       bool
 	}{
-		{"missing (nil)", nil, false},
-		{"explicit empty", []string{}, false},
+		{"missing (nil)", nil, true},
+		{"explicit empty", []string{}, true},
 		{"text only", []string{"text"}, false},
 		{"text + image", []string{"text", "image"}, true},
 		{"image only", []string{"image"}, true},
@@ -143,13 +145,15 @@ func TestModel_AcceptsImages(t *testing.T) {
 }
 
 // TestParseCatalog_InputModalities: input_modalities 从 LLM_PROVIDERS_JSON
-// 解析进 Model，缺省的模型保持 nil（fail closed 由 AcceptsImages 保证）。
+// 解析进 Model；缺省（未声明）的模型按 default-on 放行图片，显式
+// ["text"] 的模型保持纯文本。
 func TestParseCatalog_InputModalities(t *testing.T) {
 	raw := `{"default_model":"vision",
 		"providers":{"p":{"protocol":"openai","base_url":"https://x.example","api_keys":["k"]}},
 		"models":{
 			"vision":{"provider":"p","upstream_model":"u-v","input_modalities":["text","image"]},
-			"plain":{"provider":"p","upstream_model":"u-p"}
+			"plain":{"provider":"p","upstream_model":"u-p"},
+			"textonly":{"provider":"p","upstream_model":"u-t","input_modalities":["text"]}
 		}}`
 	c, err := ParseCatalog(raw)
 	if err != nil {
@@ -158,8 +162,14 @@ func TestParseCatalog_InputModalities(t *testing.T) {
 	if !c.Models["vision"].AcceptsImages() {
 		t.Error("vision model must accept images")
 	}
-	if c.Models["plain"].AcceptsImages() {
-		t.Error("model without input_modalities must be text-only (fail closed)")
+	if !c.Models["plain"].AcceptsImages() {
+		t.Error("model without input_modalities must default-on (accept images)")
+	}
+	if got := c.Models["plain"].NormalizedInputModalities(); !slices.Equal(got, []string{"text", "image"}) {
+		t.Errorf("undeclared NormalizedInputModalities = %v, want [text image]", got)
+	}
+	if c.Models["textonly"].AcceptsImages() {
+		t.Error("explicit [text] model must stay text-only")
 	}
 }
 
@@ -176,5 +186,14 @@ func TestLegacyCatalog(t *testing.T) {
 	}
 	if c.Providers["deepseek"].APIKeys[0] != "sk-x" {
 		t.Errorf("legacy key not carried over: %+v", c.Providers["deepseek"])
+	}
+	// DEEPSEEK_* 兜底目录钉死 text-only：DeepSeek 上游无视觉模型，不得
+	// 跟随 default-on（否则带图请求只会在上游 400→502）。
+	_, m, _ := c.Resolve("")
+	if got := m.InputModalities; !slices.Equal(got, []string{"text"}) {
+		t.Errorf("legacy InputModalities = %v, want explicit [text]", got)
+	}
+	if m.AcceptsImages() {
+		t.Error("legacy DEEPSEEK_* catalog must stay text-only (pinned, not default-on)")
 	}
 }

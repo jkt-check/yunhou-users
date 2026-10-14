@@ -112,9 +112,10 @@ func (s *Store) ApplyBulkImportTx(ctx context.Context, w domain.UnitOfWork, task
 			protocols = []string{}
 		}
 		input, output := m.InputModalities, m.OutputModalities
-		if len(input) == 0 {
-			input = []string{"text"}
-		}
+		// 输入模态空值不补：缺省放行（["text","image"]）由消费侧
+		// domain.NormalizeInputModalities 归一，落库保留「未声明」语义
+		// （显式 ["text"] 才是纯文本钉死）。strArr：pq.Array(nil) 编码为
+		// NULL，而 input_modalities 是 NOT NULL（migration 024）。
 		if len(output) == 0 {
 			output = []string{"text"}
 		}
@@ -129,7 +130,7 @@ func (s *Store) ApplyBulkImportTx(ctx context.Context, w domain.UnitOfWork, task
 			  supports_tools, supports_reasoning)
 			 VALUES ($1,$2,'draft',$3,$4,$5,$6,$7,$8,$9,$10,$11)
 			 ON CONFLICT (id) DO NOTHING`,
-			m.ID, m.DisplayName, m.ModelVersion, pq.Array(aliases), pq.Array(input),
+			m.ID, m.DisplayName, m.ModelVersion, pq.Array(aliases), strArr(input),
 			pq.Array(output), m.ContextTokens, m.MaxOutputTokens, pq.Array(protocols),
 			m.SupportsTools, m.SupportsReasoning)
 		if err != nil {

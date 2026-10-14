@@ -104,9 +104,8 @@ func ParseEnvCatalog(raw string) (*EnvCatalog, error) {
 	}
 	for i := range ec.Models {
 		m := &ec.Models[i]
-		if len(m.InputModalities) == 0 {
-			m.InputModalities = []string{"text"}
-		}
+		// 输入模态保持原样（空 = 缺省放行 ["text","image"]，见
+		// domain.NormalizeInputModalities）；只有输出模态缺省补 text。
 		if len(m.OutputModalities) == 0 {
 			m.OutputModalities = []string{"text"}
 		}

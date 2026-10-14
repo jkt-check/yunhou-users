@@ -262,9 +262,9 @@ func (s *BulkImportService) validateDocument(ctx context.Context, doc *BulkCatal
 			ContextTokens: m.ContextTokens, MaxOutputTokens: m.MaxOutputTokens,
 			SupportsTools: m.SupportsTools, SupportsReasoning: m.SupportsReasoning,
 		}
-		if len(dm.InputModalities) == 0 {
-			dm.InputModalities = []string{"text"}
-		}
+		// 输入模态空值不补：缺省放行（["text","image"]）由消费侧
+		// domain.NormalizeInputModalities 归一，保留「未声明」语义；
+		// 只有输出模态缺省补 text。
 		if len(dm.OutputModalities) == 0 {
 			dm.OutputModalities = []string{"text"}
 		}

@@ -2,6 +2,10 @@
 
 > 日期:2026-09-15 · 版本:v1.0(定稿)· 读者:yunhou-users 服务端团队
 >
+> **delta 2026-10-16(跨机协同联调前提)**:① 发送方身份盖章(§6.1);
+> ② device→device 定向路由(§6.1/§6.2);③ presence 扩投 device + 入会
+> 快照(§5.3)。哑管道语义、限额、ticket 鉴权、信封字段名均不变。
+>
 > 本文是**自包含**的服务端实施规格,不依赖 kaya 仓库上下文。
 > 目标:在 yunhou-users(Go 服务)内新增一个轻量 WebSocket relay 模块,
 > 支撑 kaya 桌面端的「浏览器 / 手机 APP 远程控制」功能。
@@ -152,10 +156,19 @@ Content-Type: application/json
 
 - device 连接建立 → 向 room 内全部 client 广播
   `presence { device_id, online: true, meta }`;
-- device 断开(**任何原因**,含超时/踢出/停机)→ 广播
-  `presence { device_id, online: false }`;
+- device 断开(超时/异常/停机等)→ 广播
+  `presence { device_id, online: false }`;**同 device_id 踢旧连的替换
+  场景除外**——旧连被 `replaced` 踢出后不产生 offline(device_id 已被新连
+  接管,设备仍在线,广播 offline 会把在线设备错误定格为离线);
 - client 加入时,`hello_ok` 的 `room_devices` 给出当前全量在线 device 表;
 - client 的连接/断开**不**广播(v1 不需要,device 不感知 client 在线数)。
+
+**delta 2026-10-16(跨机协同,改动 3)**:presence(含 LWT 离线)投递范围
+扩为「房间内全部 client **+ 全部 device**(不含事件主体自身)」,wire 形状
+不变。device 入会(hello_ok 之后)relay 向其**逐台分帧**补发当前房间内其他
+在线 device 的 presence 快照——每台一帧标准 `presence { device_id,
+online: true, meta }`(按 device_id 升序),与常规上线 presence 逐字节同形,
+零协议变更;快照只含 device_id + meta(device_name / app_version)。
 
 ---
 
@@ -182,7 +195,17 @@ Content-Type: application/json
 
 // 业务帧:device → 广播给 room 内全部 client
 { "v": 1, "type": "app", "payload": { … } }
+
+// 业务帧:device → 定向另一台 device(delta 2026-10-16 改动 2)
+{ "v": 1, "type": "app", "target_device_id": "…", "payload": { … } }
 ```
+
+**发送方身份字段(delta 2026-10-16 改动 1)**:连接方在 app 帧上自填的
+`from_device_id` / `from_client_id` relay **一律不解析、不采信**;所有出站
+副本的 sender 由 relay 按入站连接的认证身份(hello + ticket 校验结果)
+重新盖章——device 连接 → `from_device_id` = 该连接 device_id 且
+`from_client_id` 恒缺省;client 连接 → 反之。发送方不填 sender 时同样
+盖为正确值。目的:防同房间连接伪造身份。
 
 ### 6.2 relay → 连接方
 
@@ -193,18 +216,24 @@ Content-Type: application/json
                       "app_version": "…", "connected_at": 1726000000 } ],
   "server_time": 1726000000 }
 
-// device 上下线(广播给 room 内全部 client;client 角色不触发)
+// device 上下线(广播给 room 内全部 client + 全部其他 device;client 角色不触发;
+// delta 2026-10-16 改动 3 扩投 device,形状不变)
 { "v": 1, "type": "presence", "device_id": "…", "online": true,
   "meta": { "device_name": "…", "app_version": "…" } }
 
 // ticket 即将过期:exp 前 60s 发送一次
 { "v": 1, "type": "ticket_expiring", "retry_after_ms": 30000 }
 
-// 业务帧转发(原样透传 payload;补充来源信息)
-{ "v": 1, "type": "app", "from_device_id": "…", "payload": { … } }   // device→client
+// 业务帧转发(原样透传 payload;sender 由 relay 按认证身份盖章,见 §6.1 改动 1)
+{ "v": 1, "type": "app", "from_device_id": "…", "payload": { … } }   // device→client(广播,无 target)
 { "v": 1, "type": "app", "from_client_id": "…", "payload": { … } }   // client→device
+// device→device 定向投递(delta 2026-10-16 改动 2):只投目标 device,不广播 client;
+// target_device_id 盖为收件人
+{ "v": 1, "type": "app", "from_device_id": "…", "target_device_id": "…", "payload": { … } }
 
-// client 指定的 device 不在线(仅回给发送方 client)
+// 指定的 device 不可达(client 定向或 device 定向均同;仅回给发送方,不泄露存在性):
+// 目标离线/不存在/跨房;device 定向的 target 为发送方自身时同样回 undeliverable
+// (不回声自己的帧,防干扰对端握手状态机 —— delta 2026-10-16 review 追加)
 { "v": 1, "type": "undeliverable", "target_device_id": "…" }
 
 // 连接即将被服务端关闭(关闭前发送,能发尽发)

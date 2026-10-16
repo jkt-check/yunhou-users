@@ -123,11 +123,41 @@ func (h *Hub) Register(c Conn) (Conn, error) {
 		r.clients[c.ClientID()] = c
 	}
 
-	// 收集 presence 广播目标(device 上线才广播);发送在解锁后进行
-	var clients []Conn
+	// presence 广播与入会快照(device 上线才广播)的收集与 Enqueue 全部放在
+	// 持锁内进行。Enqueue 契约非阻塞(见 Conn 注释,wsConn 用 select/default
+	// 且关闭路径异步,不会同步重入 h.mu);持锁发送可消除「快照收集后、入队前
+	// 目标恰好并发 Unregister」的窗口——否则离场的 presence offline 可能排在
+	// 快照 online 之前进入新连接的出站缓冲,给新入会 device 留下永不纠正的
+	// 陈旧在线状态。relay delta 2026-10-16 改动 3:presence 投递范围由
+	// 「房间内全部 client」扩为「全部 client + 全部其他 device(不含事件
+	// 主体自身)」;同时向新入会 device 逐台分帧补发其他在线 device 的
+	// presence online 快照(wire 形状与常规 presence 完全一致,零协议变更)。
+	// 快照帧在 Register 内 Enqueue,先于 conn 层 writer goroutine 启动,
+	// 而 hello_ok 走 sendDirect 同步写——因此对端线上顺序恒为
+	// hello_ok → 快照帧,满足「HelloOk 之后补发」。
+	// 注意:持锁内 Enqueue 触发的 slow_consumer 路径会同步走 warn.Logf
+	// (stderr,节流 1/min/key);日志实现不得改为阻塞式 writer,否则
+	// Register 会拖住整个 hub。
 	if c.GetRole() == RoleDevice {
+		meta := c.DeviceMeta()
+		frame := PresenceFrame(c.DeviceID(), true, &meta)
+		var snapshot []DeviceInfo
 		for _, cl := range r.clients {
-			clients = append(clients, cl)
+			cl.Enqueue(frame)
+		}
+		for _, d := range r.devices {
+			if d == c {
+				continue // 事件主体自身不收自己的 presence/快照
+			}
+			d.Enqueue(frame)
+			snapshot = append(snapshot, d.DeviceMeta())
+		}
+		// map 迭代序随机;排序保证快照帧序稳定(逐台分帧按 device_id 升序)。
+		sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].DeviceID < snapshot[j].DeviceID })
+		// 入会快照:向新 device 逐台补发其他在线 device 的 presence online。
+		for i := range snapshot {
+			m := snapshot[i]
+			c.Enqueue(PresenceFrame(m.DeviceID, true, &m))
 		}
 	}
 	roomCount := len(h.rooms)
@@ -144,18 +174,13 @@ func (h *Hub) Register(c Conn) (Conn, error) {
 	if kicked != nil && kicked != c {
 		kicked.Enqueue(ClosedFrame(ReasonReplaced))
 	}
-	if c.GetRole() == RoleDevice {
-		meta := c.DeviceMeta()
-		frame := PresenceFrame(c.DeviceID(), true, &meta)
-		for _, cl := range clients {
-			cl.Enqueue(frame)
-		}
-	}
 	return kicked, nil
 }
 
-// Unregister 摘除连接;device 断开往 room 内全部 client 广播 presence
-// offline。仅当 map 里存的仍是该连接时才摘除(防旧连踢掉新连)。
+// Unregister 摘除连接;device 断开往 room 内全部 client + 全部其他 device
+// 广播 presence offline(LWT,relay delta 2026-10-16 改动 3;事件主体已从
+// map 摘除,天然不含自身)。仅当 map 里存的仍是该连接时才摘除(防旧连踢掉新连,
+// 踢连替换场景 removed=false 不发 offline——该 device_id 仍在线)。
 func (h *Hub) Unregister(c Conn) {
 	h.mu.Lock()
 	r := h.rooms[c.UserID()]
@@ -175,10 +200,19 @@ func (h *Hub) Unregister(c Conn) {
 			removed = true
 		}
 	}
-	var clients []Conn
+	// presence offline 广播与摘除同在 h.mu 临界区内完成,与 Register 侧
+	// 对齐(论证见 Register 注释;Enqueue 非阻塞、关闭路径异步、不重入
+	// h.mu,持锁发送安全)。若 Enqueue 推迟到解锁之后,同 device_id 重连
+	// 交错时会出现:旧连摘除解锁(removed=true)→ 新连 Register 在锁内
+	// 广播 online → 旧连的 offline 才入队——成员看到 online→offline 乱序,
+	// 实际在线的设备被定格为离线。
 	if removed && c.GetRole() == RoleDevice {
+		frame := PresenceFrame(c.DeviceID(), false, nil)
 		for _, cl := range r.clients {
-			clients = append(clients, cl)
+			cl.Enqueue(frame)
+		}
+		for _, d := range r.devices {
+			d.Enqueue(frame)
 		}
 	}
 	if len(r.devices) == 0 && len(r.clients) == 0 {
@@ -191,13 +225,6 @@ func (h *Hub) Unregister(c Conn) {
 		h.metrics.connUnregistered(c.GetRole(), connAge(c))
 	}
 	h.metrics.roomsActiveSet(roomCount)
-
-	if removed && c.GetRole() == RoleDevice {
-		frame := PresenceFrame(c.DeviceID(), false, nil)
-		for _, cl := range clients {
-			cl.Enqueue(frame)
-		}
-	}
 }
 
 // OnlineDevices 返回 user 房间当前在线 device 全量表(hello_ok 数据源)。
@@ -217,10 +244,20 @@ func (h *Hub) OnlineDevices(userID string) []DeviceInfo {
 	return out
 }
 
-// RouteApp 按 spec §6 路由业务帧:
-//   - device → 广播给 room 内全部 client(附 from_device_id)
-//   - client → 指定 device(附 from_client_id);不在线 → 仅回发送方
+// RouteApp 按 spec §6 + relay delta 2026-10-16 路由业务帧:
+//   - device 无 target → 广播给 room 内全部 client(附盖章 from_device_id)
+//   - device 带非空 target(改动 2)→ 只定向投给同房在线的目标 device
+//     (盖章 from_device_id=发送方、target_device_id=收件人,不广播 client);
+//     目标离线/不存在/跨房/为发送方自身 → 沿用 undeliverable 语义只回发送方,
+//     不泄露存在性(自身定向按 undeliverable 处理,避免回声帧干扰对端
+//     握手状态机)
+//   - client → 指定 device(附盖章 from_client_id);不在线 → 仅回发送方
 //     undeliverable;跨 room 目标同样 undeliverable,不泄露存在性。
+//
+// 改动 1(发送方身份盖章):所有出站副本的 sender 字段全部由本函数按入站
+// 连接的认证身份重新构造——发送方在信封上自填的 from_device_id /
+// from_client_id 从未被解析(conn.go 的 AppFrame 解码结构不含这两个字段),
+// 天然是「覆写」而非「透传」;发送方不填 sender 时同样盖为正确值。
 func (h *Hub) RouteApp(from Conn, targetDeviceID string, payload json.RawMessage) {
 	h.metrics.frameIn(from.GetRole())
 	h.mu.RLock()
@@ -229,6 +266,20 @@ func (h *Hub) RouteApp(from Conn, targetDeviceID string, payload json.RawMessage
 	case RoleDevice:
 		if r == nil {
 			h.mu.RUnlock()
+			return
+		}
+		if targetDeviceID != "" {
+			dev := r.devices[targetDeviceID]
+			h.mu.RUnlock()
+			// dev == from:目标为发送方自身,按 undeliverable 处理,
+			// 不向发送方回声自己的帧(防对端握手状态机混淆)。
+			if dev == nil || dev == from {
+				h.metrics.undeliverableInc()
+				from.Enqueue(UndeliverableFrame(targetDeviceID))
+				return
+			}
+			dev.Enqueue(AppFromDeviceDirectedFrame(from.DeviceID(), targetDeviceID, payload))
+			h.metrics.frameOut(RoleDevice)
 			return
 		}
 		targets := make([]Conn, 0, len(r.clients))
@@ -257,10 +308,11 @@ func (h *Hub) RouteApp(from Conn, targetDeviceID string, payload json.RawMessage
 	}
 }
 
-// Shutdown 停止接受新连接,先对每个 device 向其 room 的 client 广播
-// presence offline(停机也触发 presence,spec §5.3),再给全部连接发
-// closed shutdown。顺序不能反过来:wsConn.Enqueue 对 closed 帧会同步
-// 置 closing 标志,之后入队的 presence 帧会被直接丢弃。
+// Shutdown 停止接受新连接,先对每个 device 向其 room 的 client + 其他
+// device 广播 presence offline(relay delta 2026-10-16 改动 3;停机也触发
+// presence,spec §5.3),再给全部连接发 closed shutdown。顺序不能反过来:
+// wsConn.Enqueue 对 closed 帧会同步置 closing 标志,之后入队的 presence
+// 帧会被直接丢弃。
 // 随后等待连接收尾:wsConn 收到 closed 帧后 flush 并 Unregister,
 // 这里轮询房间清空即返回;wait 为等待上限(≤0 表示不等待,立即返回)。
 func (h *Hub) Shutdown(wait time.Duration) {
@@ -270,7 +322,7 @@ func (h *Hub) Shutdown(wait time.Duration) {
 	var conns []Conn
 	type devBroadcast struct {
 		deviceID string
-		clients  []Conn
+		targets  []Conn
 	}
 	var broadcasts []devBroadcast
 	for _, r := range h.rooms {
@@ -278,7 +330,13 @@ func (h *Hub) Shutdown(wait time.Duration) {
 			conns = append(conns, d)
 			b := devBroadcast{deviceID: d.DeviceID()}
 			for _, c := range r.clients {
-				b.clients = append(b.clients, c)
+				b.targets = append(b.targets, c)
+			}
+			for _, od := range r.devices {
+				if od == d {
+					continue // 事件主体自身不收自己的 presence
+				}
+				b.targets = append(b.targets, od)
 			}
 			broadcasts = append(broadcasts, b)
 		}
@@ -290,10 +348,12 @@ func (h *Hub) Shutdown(wait time.Duration) {
 
 	// presence 先行:此时各连接尚未置 closing,帧能进入出站缓冲;
 	// 随后的 closed 帧触发统一关闭路径,writer 按序 flush(presence
-	// 先于 closed 到达对端)。
+	// 先于 closed 到达对端)。解锁后广播在此处无 Register 侧那种乱序
+	// 风险:shutdown 标志先于持锁快照置位,新注册必然被拒(Register
+	// 锁内复查),不存在并发 online 插队到 offline 之前的窗口。
 	for _, b := range broadcasts {
 		frame := PresenceFrame(b.deviceID, false, nil)
-		for _, c := range b.clients {
+		for _, c := range b.targets {
 			c.Enqueue(frame)
 		}
 	}

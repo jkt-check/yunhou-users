@@ -179,7 +179,8 @@ func (h *Hub) Register(c Conn) (Conn, error) {
 
 // Unregister 摘除连接;device 断开往 room 内全部 client + 全部其他 device
 // 广播 presence offline(LWT,relay delta 2026-10-16 改动 3;事件主体已从
-// map 摘除,天然不含自身)。仅当 map 里存的仍是该连接时才摘除(防旧连踢掉新连)。
+// map 摘除,天然不含自身)。仅当 map 里存的仍是该连接时才摘除(防旧连踢掉新连,
+// 踢连替换场景 removed=false 不发 offline——该 device_id 仍在线)。
 func (h *Hub) Unregister(c Conn) {
 	h.mu.Lock()
 	r := h.rooms[c.UserID()]
@@ -199,13 +200,19 @@ func (h *Hub) Unregister(c Conn) {
 			removed = true
 		}
 	}
-	var presenceTargets []Conn
+	// presence offline 广播与摘除同在 h.mu 临界区内完成,与 Register 侧
+	// 对齐(论证见 Register 注释;Enqueue 非阻塞、关闭路径异步、不重入
+	// h.mu,持锁发送安全)。若 Enqueue 推迟到解锁之后,同 device_id 重连
+	// 交错时会出现:旧连摘除解锁(removed=true)→ 新连 Register 在锁内
+	// 广播 online → 旧连的 offline 才入队——成员看到 online→offline 乱序,
+	// 实际在线的设备被定格为离线。
 	if removed && c.GetRole() == RoleDevice {
+		frame := PresenceFrame(c.DeviceID(), false, nil)
 		for _, cl := range r.clients {
-			presenceTargets = append(presenceTargets, cl)
+			cl.Enqueue(frame)
 		}
 		for _, d := range r.devices {
-			presenceTargets = append(presenceTargets, d)
+			d.Enqueue(frame)
 		}
 	}
 	if len(r.devices) == 0 && len(r.clients) == 0 {
@@ -218,13 +225,6 @@ func (h *Hub) Unregister(c Conn) {
 		h.metrics.connUnregistered(c.GetRole(), connAge(c))
 	}
 	h.metrics.roomsActiveSet(roomCount)
-
-	if removed && c.GetRole() == RoleDevice {
-		frame := PresenceFrame(c.DeviceID(), false, nil)
-		for _, t := range presenceTargets {
-			t.Enqueue(frame)
-		}
-	}
 }
 
 // OnlineDevices 返回 user 房间当前在线 device 全量表(hello_ok 数据源)。
@@ -348,7 +348,9 @@ func (h *Hub) Shutdown(wait time.Duration) {
 
 	// presence 先行:此时各连接尚未置 closing,帧能进入出站缓冲;
 	// 随后的 closed 帧触发统一关闭路径,writer 按序 flush(presence
-	// 先于 closed 到达对端)。
+	// 先于 closed 到达对端)。解锁后广播在此处无 Register 侧那种乱序
+	// 风险:shutdown 标志先于持锁快照置位,新注册必然被拒(Register
+	// 锁内复查),不存在并发 online 插队到 offline 之前的窗口。
 	for _, b := range broadcasts {
 		frame := PresenceFrame(b.deviceID, false, nil)
 		for _, c := range b.targets {

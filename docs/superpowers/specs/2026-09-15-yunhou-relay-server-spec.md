@@ -156,8 +156,10 @@ Content-Type: application/json
 
 - device 连接建立 → 向 room 内全部 client 广播
   `presence { device_id, online: true, meta }`;
-- device 断开(**任何原因**,含超时/踢出/停机)→ 广播
-  `presence { device_id, online: false }`;
+- device 断开(超时/异常/停机等)→ 广播
+  `presence { device_id, online: false }`;**同 device_id 踢旧连的替换
+  场景除外**——旧连被 `replaced` 踢出后不产生 offline(device_id 已被新连
+  接管,设备仍在线,广播 offline 会把在线设备错误定格为离线);
 - client 加入时,`hello_ok` 的 `room_devices` 给出当前全量在线 device 表;
 - client 的连接/断开**不**广播(v1 不需要,device 不感知 client 在线数)。
 

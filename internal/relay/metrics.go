@@ -47,7 +47,7 @@ func NewMetrics(reg prometheus.Registerer, env string) *Metrics {
 		}, []string{"direction", "role"}),
 		undeliverable: prometheus.NewCounter(prometheus.CounterOpts{
 			Name:        "relay_undeliverable_total",
-			Help:        "Client app frames whose target device was unreachable.",
+			Help:        "App frames whose target device was unreachable (client-directed and device-directed).",
 			ConstLabels: constLabels,
 		}),
 		helloFailures: prometheus.NewCounterVec(prometheus.CounterOpts{

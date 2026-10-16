@@ -795,3 +795,95 @@ func TestHubRegisterSnapshotUnregisterRace(t *testing.T) {
 		c.mu.Unlock()
 	}
 }
+
+// blockingOfflineConn 包装 fakeConn:收到 watchDeviceID 的 presence offline
+// 帧时先关闭 offlineHit 通知测试、再阻塞到 release 关闭才真正入队——用于
+// 制造「Unregister 已摘除旧连、offline 广播卡在入队前」的确定性交错。
+type blockingOfflineConn struct {
+	fakeConn
+	watchDeviceID string
+	offlineHit    chan struct{}
+	release       chan struct{}
+	hitOnce       sync.Once
+}
+
+func (b *blockingOfflineConn) Enqueue(frame []byte) {
+	var m map[string]any
+	if err := json.Unmarshal(frame, &m); err == nil &&
+		m["type"] == "presence" && m["device_id"] == b.watchDeviceID && m["online"] == false {
+		b.hitOnce.Do(func() { close(b.offlineHit) })
+		<-b.release
+	}
+	b.fakeConn.Enqueue(frame)
+}
+
+// TestHubUnregisterOfflineRegisterRace 回归测试:同 device_id 重连交错下,
+// 既有成员收到的 presence 帧序绝不能是 online 之后接 stale offline——否则
+// 实际在线的设备被定格为离线。offline 入队必须与摘除同在 h.mu 临界区内
+// (与 Register 侧对齐)。用 blockingOfflineConn 把旧连的 offline 广播卡在
+// 入队前,确定性地制造「旧连先摘除(removed=true)、新连后注册」的交错,
+// 而非依赖概率调度;配合 -race 运行。
+func TestHubUnregisterOfflineRegisterRace(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		h := NewHub(DefaultOptions(), nil)
+		member := &blockingOfflineConn{
+			fakeConn:      fakeConn{userID: "u1", role: RoleClient, clientID: "cli-1"},
+			watchDeviceID: "dev-x",
+			offlineHit:    make(chan struct{}),
+			release:       make(chan struct{}),
+		}
+		mustRegister(t, h, member)
+		oldConn := newDeviceConn("u1", "dev-x", "old")
+		mustRegister(t, h, oldConn) // member 收到 online#1
+
+		unregDone := make(chan struct{})
+		go func() { defer close(unregDone); h.Unregister(oldConn) }()
+		<-member.offlineHit // 旧连已摘除(removed=true),offline 卡在入队前
+
+		newConn := newDeviceConn("u1", "dev-x", "new")
+		regErr := make(chan error, 1)
+		go func() { _, err := h.Register(newConn); regErr <- err }()
+		// 修复形态:Register 阻塞在 h.mu 上,等 release 放行后才能广播
+		// online;回归形态(offline 广播退回到解锁后):Register 立即完成,
+		// online 先入队——等它完成再放行,确定性暴露 online→offline 乱序。
+		consumed := false
+		select {
+		case err := <-regErr:
+			consumed = true
+			if err != nil {
+				t.Fatalf("iter %d: Register new conn: %v", i, err)
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(member.release)
+		<-unregDone
+		if !consumed {
+			if err := <-regErr; err != nil {
+				t.Fatalf("iter %d: Register new conn: %v", i, err)
+			}
+		}
+
+		// 合法序列:online→offline→online(旧连先摘除,offline 在锁内先行
+		// 入队)或 online→online(踢连替换,旧连 removed=false 不发 offline);
+		// 第二个 online 之后再出现 offline 即为陈旧离线。
+		seenOnlines := 0
+		member.mu.Lock()
+		for _, raw := range member.frames {
+			var m map[string]any
+			if err := json.Unmarshal(raw, &m); err != nil {
+				member.mu.Unlock()
+				t.Fatalf("iter %d: bad frame: %v", i, err)
+			}
+			if m["type"] != "presence" || m["device_id"] != "dev-x" {
+				continue
+			}
+			if m["online"] == true {
+				seenOnlines++
+			} else if seenOnlines >= 2 {
+				member.mu.Unlock()
+				t.Fatalf("iter %d: member received presence offline AFTER re-register online for dev-x (stale offline)", i)
+			}
+		}
+		member.mu.Unlock()
+	}
+}

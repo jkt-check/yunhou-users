@@ -70,6 +70,7 @@ func testOptions() Options {
 // X-Forwarded-For 不再参与限流键,伪造 XFF 分摊限流桶的场景由
 // TestWSHelloFailSpoofedXFF 守护。
 const testClientIP = "203.0.113.1"
+
 type wsTestEnv struct {
 	server  *httptest.Server
 	hub     *Hub
@@ -782,4 +783,220 @@ func TestWSHelloFailNilLimiter(t *testing.T) {
 	})
 	expectClosedReason(t, c, "auth")
 	expectConnClosed(t, c, 2*time.Second)
+}
+
+// ---- relay delta(2026-10-16,跨机协同)WS 级验收 ----
+
+// TestWSDeviceDirectedRoutingAndStamping:改动 1+2 的端到端验收——
+// device 定向帧只投目标 device(不广播 client、不回投发送方),信封 sender
+// 由服务端按入站连接认证身份覆写(发送方自填/伪造一律不采信),投递帧
+// 带 target_device_id = 收件人;目标离线/跨房 → undeliverable 只回发送方。
+//
+// 注意:coder/websocket 在读 ctx 超时会硬关连接,expectNoFrame 会杀死被测
+// 连接——每条连接的 expectNoFrame 必须是其最后一次使用,负向断言全部排在
+// 正向流量之后。
+func TestWSDeviceDirectedRoutingAndStamping(t *testing.T) {
+	env := newWSTestEnv(t, testOptions(), 5, nil)
+	ticket := env.tickets.issue("u1", 10*time.Second)
+
+	devA := env.dial(t, "")
+	defer devA.CloseNow()
+	helloDevice(t, devA, ticket, "dev-a")
+	devB := env.dial(t, "")
+	defer devB.CloseNow()
+	helloDevice(t, devB, ticket, "dev-b")
+	// 改动 3 的附带流量先消费掉:devB 收 devA 入会快照,devA 收 devB 上线 presence。
+	if m := readFrame(t, devB); m["type"] != "presence" || m["device_id"] != "dev-a" {
+		t.Fatalf("devB join snapshot = %v, want presence dev-a", m)
+	}
+	if m := readFrame(t, devA); m["type"] != "presence" || m["device_id"] != "dev-b" {
+		t.Fatalf("devA peer presence = %v, want presence dev-b", m)
+	}
+	cl := env.dial(t, "")
+	defer cl.CloseNow()
+	helloClient(t, cl, ticket, "c1")
+
+	payload := map[string]any{"kind": "peer", "frame": map[string]any{"kind": "hello"}}
+
+	// 回归先行:不带 target 的 device 帧维持原语义——只广播房间内全部
+	// client;伪造 sender 仍被覆写。
+	writeFrame(t, devA, map[string]any{
+		"v": 1, "type": "app", "from_device_id": "fake", "from_client_id": "fake-client",
+		"payload": payload,
+	})
+	m := readFrame(t, cl)
+	if m["type"] != "app" || m["from_device_id"] != "dev-a" {
+		t.Fatalf("client broadcast frame = %v, want app from_device_id=dev-a (盖章)", m)
+	}
+	if _, ok := m["from_client_id"]; ok {
+		t.Fatalf("device 广播帧 from_client_id 必须清零: %v", m)
+	}
+	if _, ok := m["target_device_id"]; ok {
+		t.Fatalf("device 广播帧不得带 target_device_id: %v", m)
+	}
+
+	// dev-a 定向 dev-b,恶意自填 from_device_id="fake" 与 from_client_id。
+	writeFrame(t, devA, map[string]any{
+		"v": 1, "type": "app", "target_device_id": "dev-b",
+		"from_device_id": "fake", "from_client_id": "fake-client",
+		"payload": payload,
+	})
+	m = readFrame(t, devB)
+	if m["type"] != "app" {
+		t.Fatalf("devB got %v, want app", m)
+	}
+	if m["from_device_id"] != "dev-a" {
+		t.Fatalf("from_device_id = %v, want dev-a (服务端盖章覆写伪造值)", m["from_device_id"])
+	}
+	if _, ok := m["from_client_id"]; ok {
+		t.Fatalf("device 帧 from_client_id 必须清零: %v", m)
+	}
+	if m["target_device_id"] != "dev-b" {
+		t.Fatalf("target_device_id = %v, want dev-b (定向投递盖章收件人)", m["target_device_id"])
+	}
+	gotPayload, _ := json.Marshal(m["payload"])
+	wantPayload, _ := json.Marshal(payload)
+	if string(gotPayload) != string(wantPayload) {
+		t.Fatalf("payload = %s, want %s (payload 原样透传)", gotPayload, wantPayload)
+	}
+
+	// 发送方不填 sender → 同样盖章为正确值。
+	writeFrame(t, devA, map[string]any{
+		"v": 1, "type": "app", "target_device_id": "dev-b", "payload": payload,
+	})
+	m = readFrame(t, devB)
+	if m["from_device_id"] != "dev-a" || m["target_device_id"] != "dev-b" {
+		t.Fatalf("无 sender 定向帧盖章 = %v, want from_device_id=dev-a target=dev-b", m)
+	}
+	if _, ok := m["from_client_id"]; ok {
+		t.Fatalf("device 帧 from_client_id 必须清零: %v", m)
+	}
+
+	// 目标离线/不存在 → undeliverable 只回发送方(若误回投了前面的定向帧,
+	// 这里会先读到 app 帧而断言失败,兼作「不回投发送方」的顺序保障)。
+	writeFrame(t, devA, map[string]any{
+		"v": 1, "type": "app", "target_device_id": "ghost", "payload": payload,
+	})
+	m = readFrame(t, devA)
+	if m["type"] != "undeliverable" || m["target_device_id"] != "ghost" {
+		t.Fatalf("got %v, want undeliverable ghost", m)
+	}
+
+	// 跨 room 目标:undeliverable,不泄露存在性(devC 此后不再使用)。
+	ticketB := env.tickets.issue("u2", 10*time.Second)
+	devC := env.dial(t, "")
+	defer devC.CloseNow()
+	helloDevice(t, devC, ticketB, "dev-c")
+	writeFrame(t, devA, map[string]any{
+		"v": 1, "type": "app", "target_device_id": "dev-c", "payload": payload,
+	})
+	m = readFrame(t, devA)
+	if m["type"] != "undeliverable" || m["target_device_id"] != "dev-c" {
+		t.Fatalf("cross-room: got %v, want undeliverable dev-c", m)
+	}
+	expectNoFrame(t, devC, 300*time.Millisecond)
+
+	// 负向断言收尾:最后一发定向帧,devB 确实收到(证明窗口内投递已发生),
+	// 而 cl 全程收不到任何定向帧、devA 全程无回投。expectNoFrame 之后
+	// 对应连接不再使用。
+	writeFrame(t, devA, map[string]any{
+		"v": 1, "type": "app", "target_device_id": "dev-b", "payload": payload,
+	})
+	m = readFrame(t, devB)
+	if m["type"] != "app" || m["from_device_id"] != "dev-a" {
+		t.Fatalf("devB final directed frame = %v", m)
+	}
+	expectNoFrame(t, cl, 300*time.Millisecond)   // 定向帧不广播 client(client 离会无 presence)
+	expectNoFrame(t, devA, 300*time.Millisecond) // 不回投发送方
+	// 注意链条终点:上面的 expectNoFrame 硬关 devA 会触发 presence dev-a
+	// offline 发往 devB(改动 3 的正常行为),devB 不能再做 expectNoFrame;
+	// 「恰好一份、不重复投递」由 TestHubRouteDeviceDirected 的帧计数锁定。
+}
+
+// TestWSClientAppSenderStamped:改动 1 的 client 侧——client 发出的 App 帧,
+// from_client_id 覆写为连接认证身份、from_device_id 清零;伪造与不填
+// sender 两种形态都盖章为正确值。
+func TestWSClientAppSenderStamped(t *testing.T) {
+	env := newWSTestEnv(t, testOptions(), 5, nil)
+	ticket := env.tickets.issue("u1", 10*time.Second)
+
+	dev := env.dial(t, "")
+	defer dev.CloseNow()
+	helloDevice(t, dev, ticket, "dev1")
+	cl := env.dial(t, "")
+	defer cl.CloseNow()
+	helloClient(t, cl, ticket, "c-real")
+
+	payload := map[string]any{"kind": "cmd", "cmd": "ping"}
+
+	// 伪造:client 自填 device 身份发帧(防 SPA 伪造 device 发 peer 帧)。
+	writeFrame(t, cl, map[string]any{
+		"v": 1, "type": "app", "target_device_id": "dev1",
+		"from_device_id": "fake-device", "from_client_id": "fake-client",
+		"payload": payload,
+	})
+	m := readFrame(t, dev)
+	if m["type"] != "app" || m["from_client_id"] != "c-real" {
+		t.Fatalf("device got %v, want app from_client_id=c-real (盖章覆写)", m)
+	}
+	if _, ok := m["from_device_id"]; ok {
+		t.Fatalf("client 帧 from_device_id 必须清零: %v", m)
+	}
+
+	// 不填 sender → 盖章为正确值。
+	writeFrame(t, cl, map[string]any{
+		"v": 1, "type": "app", "target_device_id": "dev1", "payload": payload,
+	})
+	m = readFrame(t, dev)
+	if m["from_client_id"] != "c-real" {
+		t.Fatalf("无 sender 帧 from_client_id = %v, want c-real", m["from_client_id"])
+	}
+	if _, ok := m["from_device_id"]; ok {
+		t.Fatalf("client 帧 from_device_id 必须清零: %v", m)
+	}
+}
+
+// TestWSDevicePresenceSnapshotAndLWT:改动 3 的端到端验收——B 后于 A 入会,
+// B 在 hello_ok 之后收到 A 的在线 presence 快照(逐台分帧,wire 形状与
+// 常规 presence 完全一致),A 收到 B 的上线 presence;B 离线(LWT)后
+// A 收到 B 的离线 presence(此前只有 client 收到)。
+func TestWSDevicePresenceSnapshotAndLWT(t *testing.T) {
+	env := newWSTestEnv(t, testOptions(), 5, nil)
+	ticket := env.tickets.issue("u1", 10*time.Second)
+
+	devA := env.dial(t, "")
+	defer devA.CloseNow()
+	helloDevice(t, devA, ticket, "dev-a")
+	// 「无其他 device 时无快照」由 TestHubPresenceToDevicesAndSnapshot 锁定;
+	// WS 层不做此负向断言(expectNoFrame 的读超时会硬关连接)。
+
+	devB := env.dial(t, "")
+	defer devB.CloseNow()
+	helloDevice(t, devB, ticket, "dev-b")
+
+	// B 收到含 A 的在线快照(hello_ok 之后逐台分帧;device_name + app_version)。
+	m := readFrame(t, devB)
+	if m["type"] != "presence" || m["device_id"] != "dev-a" || m["online"] != true {
+		t.Fatalf("B join snapshot = %v, want presence dev-a online", m)
+	}
+	meta, _ := m["meta"].(map[string]any)
+	if meta["device_name"] != "Test Mac" || meta["app_version"] != "2.4.0" {
+		t.Fatalf("snapshot meta = %v, want Test Mac / 2.4.0", meta)
+	}
+
+	// A 收到 B 的上线 presence。
+	m = readFrame(t, devA)
+	if m["type"] != "presence" || m["device_id"] != "dev-b" || m["online"] != true {
+		t.Fatalf("A peer presence = %v, want presence dev-b online", m)
+	}
+
+	// B 离线(LWT)→ A 收到 B 的离线 presence(无 meta)。
+	devB.CloseNow()
+	m = readFrame(t, devA)
+	if m["type"] != "presence" || m["device_id"] != "dev-b" || m["online"] != false {
+		t.Fatalf("A got %v, want presence dev-b offline (LWT 扩投 device)", m)
+	}
+	if _, hasMeta := m["meta"]; hasMeta {
+		t.Fatalf("offline presence must not carry meta: %v", m)
+	}
 }

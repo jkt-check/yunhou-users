@@ -226,13 +226,19 @@ func TestHubRouteClientToDevice(t *testing.T) {
 	c := newClientConn("u1", "cli-1")
 	mustRegister(t, h, c)
 
+	// presence 扩投 device(改动 3)后的基线:d1 收到 d2 的上线 presence,
+	// d2 收到 d1 的入会快照,各 1 帧;app 帧在此之后到达。
+	if d1.frameCount() != 1 || d2.frameCount() != 1 {
+		t.Fatalf("presence baseline: d1=%d d2=%d, want 1/1", d1.frameCount(), d2.frameCount())
+	}
+
 	payload := json.RawMessage(`{"cmd":"sync"}`)
 	h.RouteApp(c, "dev-1", payload)
 
-	if d1.frameCount() != 1 {
-		t.Fatalf("target device frames = %d, want 1", d1.frameCount())
+	if d1.frameCount() != 2 {
+		t.Fatalf("target device frames = %d, want 2 (presence + app)", d1.frameCount())
 	}
-	m := d1.decoded(t, 0)
+	m := d1.decoded(t, 1)
 	if m["type"] != "app" || m["from_client_id"] != "cli-1" {
 		t.Fatalf("app frame = %v, want from_client_id=cli-1", m)
 	}
@@ -240,8 +246,8 @@ func TestHubRouteClientToDevice(t *testing.T) {
 	if err != nil || string(pm) != `{"cmd":"sync"}` {
 		t.Fatalf("payload = %s, err=%v", pm, err)
 	}
-	if d2.frameCount() != 0 {
-		t.Fatalf("other device received %d frames, want 0", d2.frameCount())
+	if d2.frameCount() != 1 {
+		t.Fatalf("other device received %d frames, want 1 (仅入会快照,不收 app)", d2.frameCount())
 	}
 }
 
@@ -484,7 +490,308 @@ func TestHubRegisterShutdownRace(t *testing.T) {
 	t.Logf("%d conns registered before shutdown, all received closed shutdown", n)
 
 	// 停机后注册一律被拒
-	if _, err := h.Register(newClientConn("u-race", "cli-late")); err == nil {
+	_, err := h.Register(newClientConn("u-race", "cli-late"))
+	if err == nil {
 		t.Fatal("Register after shutdown succeeded, want *RejectError{shutdown}")
+	}
+}
+
+// ---- relay delta(2026-10-16,跨机协同):发送方盖章 / device→device 定向 /
+// presence 扩投 device + 入会快照 ----
+
+// TestHubRouteDeviceDirected:device 连接发出的 App 帧带非空 target_device_id
+// 时只定向投递(改动 2),信封 sender 一律按入站连接认证身份盖章(改动 1,
+// 发送方自填字段不解析、不采信,出站帧由 relay 重新构造)。
+func TestHubRouteDeviceDirected(t *testing.T) {
+	h := NewHub(DefaultOptions(), nil)
+	devA := newDeviceConn("u1", "dev-a", "A")
+	devB := newDeviceConn("u1", "dev-b", "B")
+	mustRegister(t, h, devA)
+	mustRegister(t, h, devB)
+	cl := newClientConn("u1", "cli-1")
+	mustRegister(t, h, cl)
+	// 基线:devA 收到 devB 上线 presence;devB 收到 devA 入会快照;cl 无帧。
+	baseA, baseB, baseC := devA.frameCount(), devB.frameCount(), cl.frameCount()
+	if baseA != 1 || baseB != 1 || baseC != 0 {
+		t.Fatalf("presence baseline: A=%d B=%d C=%d, want 1/1/0", baseA, baseB, baseC)
+	}
+
+	payload := json.RawMessage(`{"kind":"peer","frame":{"kind":"hello"}}`)
+
+	// 定向:dev-a → dev-b,只有 B 收到;client 与发送方都收不到。
+	h.RouteApp(devA, "dev-b", payload)
+	if devB.frameCount() != baseB+1 {
+		t.Fatalf("directed target frames = %d, want %d", devB.frameCount(), baseB+1)
+	}
+	m := devB.decoded(t, baseB)
+	if m["type"] != "app" {
+		t.Fatalf("directed frame = %v, want type=app", m)
+	}
+	// 改动 1 盖章:from_device_id = 发送连接的真实 device_id,from_client_id 清零。
+	if m["from_device_id"] != "dev-a" {
+		t.Fatalf("directed frame from_device_id = %v, want dev-a (server-stamped)", m)
+	}
+	if _, ok := m["from_client_id"]; ok {
+		t.Fatalf("device-sourced frame must not carry from_client_id: %v", m)
+	}
+	// 改动 2:定向投递帧带 target_device_id = 收件人(客户端纵深防御依赖)。
+	if m["target_device_id"] != "dev-b" {
+		t.Fatalf("directed frame target_device_id = %v, want dev-b", m)
+	}
+	pm, err := json.Marshal(m["payload"])
+	// 解码再序列化后 map 键按字典序重排;断言语义内容而非字节序
+	// (payload 字节级原样透传由 WS 级测试锁定)。
+	if err != nil || string(pm) != `{"frame":{"kind":"hello"},"kind":"peer"}` {
+		t.Fatalf("payload = %s, err=%v", pm, err)
+	}
+	if devA.frameCount() != baseA {
+		t.Fatalf("sender received %d frames, want %d (不回投)", devA.frameCount(), baseA)
+	}
+	if cl.frameCount() != baseC {
+		t.Fatalf("client received %d frames, want %d (定向帧不广播 client)", cl.frameCount(), baseC)
+	}
+
+	// 目标离线/不存在 → 沿用 undeliverable 语义,只回发送方。
+	h.RouteApp(devA, "ghost", payload)
+	if devA.frameCount() != baseA+1 {
+		t.Fatalf("sender frames after offline target = %d, want %d", devA.frameCount(), baseA+1)
+	}
+	m = devA.decoded(t, baseA)
+	if m["type"] != "undeliverable" || m["target_device_id"] != "ghost" {
+		t.Fatalf("undeliverable frame = %v", m)
+	}
+	if devB.frameCount() != baseB+1 {
+		t.Fatalf("other device frames after undeliverable = %d, want %d", devB.frameCount(), baseB+1)
+	}
+
+	// 跨 room 目标:同样 undeliverable,不泄露存在性。
+	devC := newDeviceConn("u2", "dev-c", "C")
+	mustRegister(t, h, devC)
+	h.RouteApp(devA, "dev-c", payload)
+	if devA.frameCount() != baseA+2 {
+		t.Fatalf("sender frames after cross-room target = %d, want %d", devA.frameCount(), baseA+2)
+	}
+	m = devA.decoded(t, baseA+1)
+	if m["type"] != "undeliverable" || m["target_device_id"] != "dev-c" {
+		t.Fatalf("cross-room undeliverable frame = %v", m)
+	}
+	if devC.frameCount() != 0 {
+		t.Fatalf("cross-room device received %d frames, want 0 (existence must not leak)", devC.frameCount())
+	}
+
+	// 目标为发送方自身:同样回 undeliverable,不向自己回声(防回声帧干扰
+	// 对端握手状态机)。
+	h.RouteApp(devA, "dev-a", payload)
+	if devA.frameCount() != baseA+3 {
+		t.Fatalf("sender frames after self target = %d, want %d (undeliverable)", devA.frameCount(), baseA+3)
+	}
+	m = devA.decoded(t, baseA+2)
+	if m["type"] != "undeliverable" || m["target_device_id"] != "dev-a" {
+		t.Fatalf("self-target frame = %v, want undeliverable target_device_id=dev-a", m)
+	}
+	if devB.frameCount() != baseB+1 || cl.frameCount() != baseC {
+		t.Fatalf("self-target leaked: B=%d C=%d", devB.frameCount(), cl.frameCount())
+	}
+
+	// 回归:不带 target 的 device 帧维持原语义——只广播房间内全部 client,
+	// 不到其他 device;信封仍由服务端盖章。
+	h.RouteApp(devA, "", payload)
+	if cl.frameCount() != baseC+1 {
+		t.Fatalf("client frames after broadcast = %d, want %d", cl.frameCount(), baseC+1)
+	}
+	m = cl.decoded(t, baseC)
+	if m["type"] != "app" || m["from_device_id"] != "dev-a" {
+		t.Fatalf("broadcast frame = %v, want app from_device_id=dev-a", m)
+	}
+	if _, ok := m["from_client_id"]; ok {
+		t.Fatalf("device broadcast must not carry from_client_id: %v", m)
+	}
+	if _, ok := m["target_device_id"]; ok {
+		t.Fatalf("device broadcast must not carry target_device_id: %v", m)
+	}
+	if devB.frameCount() != baseB+1 || devA.frameCount() != baseA+3 {
+		t.Fatalf("device broadcast leaked to devices: A=%d B=%d", devA.frameCount(), devB.frameCount())
+	}
+}
+
+// TestHubPresenceToDevicesAndSnapshot:presence(含 LWT 离线)投递范围扩为
+// 房间内全部 client + 全部 device(不含事件主体自身);device 入会补发其他
+// 在线 device 的 presence 快照,逐台分帧(改动 3)。
+func TestHubPresenceToDevicesAndSnapshot(t *testing.T) {
+	h := NewHub(DefaultOptions(), nil)
+	devA := newDeviceConn("u1", "dev-a", "Alpha")
+	mustRegister(t, h, devA)
+	if devA.frameCount() != 0 {
+		t.Fatalf("sole device frames = %d, want 0 (无其他 device,无快照)", devA.frameCount())
+	}
+
+	// B 后于 A 入会:B 收到含 A 的在线快照,A 收到 B 的上线 presence。
+	devB := newDeviceConn("u1", "dev-b", "Beta")
+	mustRegister(t, h, devB)
+	if devB.frameCount() != 1 {
+		t.Fatalf("joiner snapshot frames = %d, want 1", devB.frameCount())
+	}
+	m := devB.decoded(t, 0)
+	if m["type"] != "presence" || m["device_id"] != "dev-a" || m["online"] != true {
+		t.Fatalf("snapshot frame = %v, want presence dev-a online", m)
+	}
+	meta, ok := m["meta"].(map[string]any)
+	if !ok || meta["device_name"] != "Alpha" {
+		t.Fatalf("snapshot meta = %v, want device_name=Alpha", m)
+	}
+	if devA.frameCount() != 1 {
+		t.Fatalf("existing device frames = %d, want 1 (peer online presence)", devA.frameCount())
+	}
+	m = devA.decoded(t, 0)
+	if m["type"] != "presence" || m["device_id"] != "dev-b" || m["online"] != true {
+		t.Fatalf("peer online frame = %v, want presence dev-b online", m)
+	}
+
+	// client 入会/离会不触达 device(client 侧 presence 语义不变)。
+	cl := newClientConn("u1", "cli-1")
+	mustRegister(t, h, cl)
+	h.Unregister(cl)
+	if devA.frameCount() != 1 || devB.frameCount() != 1 {
+		t.Fatalf("client join/leave leaked to devices: A=%d B=%d, want 1/1",
+			devA.frameCount(), devB.frameCount())
+	}
+
+	// B 离线(LWT)→ A 收到 B 的离线 presence(此前只有 client 收到);
+	// 事件主体自身不收自己的 presence。
+	h.Unregister(devB)
+	if devA.frameCount() != 2 {
+		t.Fatalf("peer frames after LWT = %d, want 2", devA.frameCount())
+	}
+	m = devA.decoded(t, 1)
+	if m["type"] != "presence" || m["device_id"] != "dev-b" || m["online"] != false {
+		t.Fatalf("peer offline frame = %v, want presence dev-b offline", m)
+	}
+	if _, hasMeta := m["meta"]; hasMeta {
+		t.Fatalf("offline presence must not carry meta: %v", m)
+	}
+	if devB.frameCount() != 1 {
+		t.Fatalf("subject received own offline presence: frames = %d, want 1", devB.frameCount())
+	}
+}
+
+// TestHubShutdownPresenceToDevices:优雅停机的 presence offline 同样扩投
+// 房间内其他 device,且仍先于 closed shutdown 入队。
+func TestHubShutdownPresenceToDevices(t *testing.T) {
+	h := NewHub(DefaultOptions(), nil)
+	devA := newDeviceConn("u1", "dev-a", "A")
+	devB := newDeviceConn("u1", "dev-b", "B")
+	mustRegister(t, h, devA)
+	mustRegister(t, h, devB)
+	cl := newClientConn("u1", "cli-1")
+	mustRegister(t, h, cl)
+	baseA, baseB, baseC := devA.frameCount(), devB.frameCount(), cl.frameCount()
+
+	h.Shutdown(0)
+
+	// 每台 device:对方 offline presence 先于自己的 closed shutdown。
+	for _, tc := range []struct {
+		conn   *fakeConn
+		base   int
+		peerID string
+	}{{devA, baseA, "dev-b"}, {devB, baseB, "dev-a"}} {
+		if tc.conn.frameCount() != tc.base+2 {
+			t.Fatalf("%s frames = %d, want %d (peer offline presence + closed)",
+				tc.conn.deviceID, tc.conn.frameCount(), tc.base+2)
+		}
+		m := tc.conn.decoded(t, tc.base)
+		if m["type"] != "presence" || m["device_id"] != tc.peerID || m["online"] != false {
+			t.Fatalf("%s shutdown frame[0] = %v, want presence %s offline", tc.conn.deviceID, m, tc.peerID)
+		}
+		m = tc.conn.decoded(t, tc.base+1)
+		if m["type"] != "closed" || m["reason"] != string(ReasonShutdown) {
+			t.Fatalf("%s shutdown frame[1] = %v, want closed shutdown", tc.conn.deviceID, m)
+		}
+	}
+
+	// client:两台 device 的 offline presence(顺序不限)先于 closed。
+	if cl.frameCount() != baseC+3 {
+		t.Fatalf("client frames = %d, want %d (2 presence + closed)", cl.frameCount(), baseC+3)
+	}
+	seen := map[string]bool{}
+	for i := baseC; i < baseC+2; i++ {
+		m := cl.decoded(t, i)
+		if m["type"] != "presence" || m["online"] != false {
+			t.Fatalf("client shutdown frame[%d] = %v, want presence offline", i, m)
+		}
+		seen[m["device_id"].(string)] = true
+	}
+	if !seen["dev-a"] || !seen["dev-b"] {
+		t.Fatalf("client shutdown presence set = %v, want dev-a+dev-b", seen)
+	}
+	m := cl.decoded(t, baseC+2)
+	if m["type"] != "closed" || m["reason"] != string(ReasonShutdown) {
+		t.Fatalf("client shutdown last frame = %v, want closed shutdown", m)
+	}
+}
+
+// TestHubSnapshotSortedByDeviceID:入会快照逐台分帧按 device_id 升序
+// (map 迭代序随机,排序是显式行为,回归时不得丢失)。
+func TestHubSnapshotSortedByDeviceID(t *testing.T) {
+	h := NewHub(DefaultOptions(), nil)
+	// 乱序注册三台在先 device。
+	mustRegister(t, h, newDeviceConn("u1", "dev-c", "C"))
+	mustRegister(t, h, newDeviceConn("u1", "dev-a", "A"))
+	mustRegister(t, h, newDeviceConn("u1", "dev-b", "B"))
+
+	joiner := newDeviceConn("u1", "dev-d", "D")
+	mustRegister(t, h, joiner)
+
+	if joiner.frameCount() != 3 {
+		t.Fatalf("snapshot frames = %d, want 3", joiner.frameCount())
+	}
+	want := []string{"dev-a", "dev-b", "dev-c"}
+	for i, id := range want {
+		m := joiner.decoded(t, i)
+		if m["type"] != "presence" || m["device_id"] != id || m["online"] != true {
+			t.Fatalf("snapshot frame[%d] = %v, want presence %s online (sorted)", i, m, id)
+		}
+	}
+}
+
+// TestHubRegisterSnapshotUnregisterRace 回归测试:device 入会快照的收集与
+// 入队都在 h.mu 临界区内完成,与并发 Unregister 互斥——新入会 device 对同一
+// peer 收到的 presence 帧序必须 online 在前、offline 在后(或仅有其一),
+// 绝不能 offline 之后又收到 online(陈旧在线状态永不纠正)。配合 -race 运行。
+func TestHubRegisterSnapshotUnregisterRace(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		h := NewHub(DefaultOptions(), nil)
+		d := newDeviceConn("u1", "dev-d", "D")
+		mustRegister(t, h, d)
+		c := newDeviceConn("u1", "dev-c", "C")
+
+		var wg sync.WaitGroup
+		var regErr error
+		wg.Add(2)
+		go func() { defer wg.Done(); _, regErr = h.Register(c) }()
+		go func() { defer wg.Done(); h.Unregister(d) }()
+		wg.Wait()
+		if regErr != nil {
+			t.Fatalf("iter %d: Register joiner: %v", i, regErr)
+		}
+
+		seenOffline := false
+		c.mu.Lock()
+		for _, raw := range c.frames {
+			var m map[string]any
+			if err := json.Unmarshal(raw, &m); err != nil {
+				c.mu.Unlock()
+				t.Fatalf("iter %d: bad frame: %v", i, err)
+			}
+			if m["type"] != "presence" || m["device_id"] != "dev-d" {
+				continue
+			}
+			if m["online"] == false {
+				seenOffline = true
+			} else if seenOffline {
+				c.mu.Unlock()
+				t.Fatalf("iter %d: joiner received presence online AFTER offline for dev-d (stale online)", i)
+			}
+		}
+		c.mu.Unlock()
 	}
 }

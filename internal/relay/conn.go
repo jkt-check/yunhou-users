@@ -198,7 +198,10 @@ func (c *wsConn) run(ip string, tickets ticketVerifier, fails *HelloFailLimiter)
 	}
 	defer c.hub.Unregister(c)
 
-	// 阶段 4:hello_ok(client 带全量在线 device;device 也发,表为空)
+	// 阶段 4:hello_ok(两角色都带全量在线 device 表,含自己)。
+	// device 角色的入会 presence 快照(relay delta 2026-10-16 改动 3)已在
+	// Register 内逐台 Enqueue 进出站缓冲,本帧经 sendDirect 同步先写,
+	// 因此对端恒先收到 hello_ok、再收到快照 presence 分帧。
 	c.sendDirect(HelloOKFrame(c.hub.OnlineDevices(c.userID), time.Now().Unix()))
 	logConnect(c)
 
@@ -306,9 +309,12 @@ func (c *wsConn) readLoop(ctx context.Context, tickets ticketVerifier) {
 				c.initiateClose(ReasonProtocol)
 				return
 			}
-			// client 缺 target_device_id → protocol;device 带 target 字段
-			// 忽略(RouteApp 对 device 角色本就不读 target);payload 为空
-			// 允许——是合法 JSON 即可,不解析内容。
+			// client 缺 target_device_id → protocol;device 带非空 target →
+			// device→device 定向路由(relay delta 2026-10-16 改动 2,见
+			// Hub.RouteApp);device 不带 target → 维持广播全部 client 的
+			// 原语义。payload 为空允许——是合法 JSON 即可,不解析内容;
+			// 发送方自填的 from_device_id/from_client_id 不参与解码,
+			// 出站帧 sender 由 Hub 按连接认证身份盖章(改动 1)。
 			if c.role == RoleClient && af.TargetDeviceID == "" {
 				c.initiateClose(ReasonProtocol)
 				return

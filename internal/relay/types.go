@@ -48,6 +48,9 @@ type RenewFrame struct {
 }
 
 // AppFrame 是业务帧;Payload 对 relay 不透明(不解析、不记录)。
+// 发送方可能自填 from_device_id/from_client_id——relay 刻意不解析这两个
+// 字段:所有出站副本的 sender 一律按入站连接的认证身份重新盖章
+// (relay delta 2026-10-16 改动 1,防同房间连接伪造身份)。
 type AppFrame struct {
 	V              int             `json:"v"`
 	Type           string          `json:"type"`
@@ -121,6 +124,19 @@ func AppFromDeviceFrame(deviceID string, payload json.RawMessage) []byte {
 	return marshalFrame(map[string]any{
 		"v": ProtocolVersion, "type": "app",
 		"from_device_id": deviceID, "payload": payload,
+	})
+}
+
+// AppFromDeviceDirectedFrame 是 device→device 定向投递帧(relay delta
+// 2026-10-16 改动 1/2):from_device_id 由 relay 按发送连接的认证身份盖章
+// (发送方自填/伪造的一律不采信,from_client_id 恒缺省),target_device_id
+// 盖为收件人——kaya relay_client 的纵深防御(target 存在且 ≠ 本机 → 丢帧)
+// 依赖该字段放行定向帧。
+func AppFromDeviceDirectedFrame(fromDeviceID, targetDeviceID string, payload json.RawMessage) []byte {
+	return marshalFrame(map[string]any{
+		"v": ProtocolVersion, "type": "app",
+		"from_device_id": fromDeviceID, "target_device_id": targetDeviceID,
+		"payload": payload,
 	})
 }
 

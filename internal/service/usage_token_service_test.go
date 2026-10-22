@@ -331,6 +331,26 @@ func TestUsageTokenTimeseries_Validation(t *testing.T) {
 			t.Errorf("window = [%s, %s), want [2026-10-19T16:00:00Z, 2026-10-20T16:00:00Z)", gotFrom, gotTo)
 		}
 	})
+	// 缺省窗口的"今天"按 tz 本地日锚定（复审 M-c）：Asia/Shanghai 凌晨而
+	// UTC 还在前一天时，默认视图不能少当天。
+	t.Run("default window anchors today in tz", func(t *testing.T) {
+		var gotTo time.Time
+		r := &mockUsageTokenRepo{
+			timeseriesFn: func(_ context.Context, _, _, _, _, _ string, _, to time.Time, _ model.UsageTokenFilter) ([]model.UsageTimeseriesItem, error) {
+				gotTo = to
+				return nil, nil
+			},
+		}
+		if _, err := newUsageTokenSvc(r).Timeseries(context.Background(), "u1", "day", "none", "Asia/Shanghai", "", "", model.UsageTokenFilter{}); err != nil {
+			t.Fatal(err)
+		}
+		loc, _ := time.LoadLocation("Asia/Shanghai")
+		nowLoc := time.Now().In(loc)
+		wantTo := time.Date(nowLoc.Year(), nowLoc.Month(), nowLoc.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, 1).UTC()
+		if !gotTo.Equal(wantTo) {
+			t.Errorf("to = %s, want tz-local today+1 00:00 = %s", gotTo, wantTo)
+		}
+	})
 	t.Run("provider_model group gets display_name", func(t *testing.T) {
 		r := &mockUsageTokenRepo{
 			timeseriesFn: func(_ context.Context, _, _, _, _, _ string, _, _ time.Time, _ model.UsageTokenFilter) ([]model.UsageTimeseriesItem, error) {

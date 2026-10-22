@@ -179,8 +179,15 @@ func (h *UsageTokenHandler) ingest(c *gin.Context, isBackfill bool) {
 		return
 	}
 	// 拒绝尾随垃圾：合法 JSON 之后还有内容即整个请求不合法
-	//（invalid_request），不能静默截着用。
+	//（invalid_request）；但超 256 KiB 上限的要保持 payload_too_large
+	//（复审 M-a：第一个 JSON 文档在限长内完整时，超限错误会在第二次
+	// Decode 才暴露）。
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeUsageTokenError(c, http.StatusBadRequest, "payload_too_large", "request body exceeds 256 KiB", nil)
+			return
+		}
 		writeUsageTokenError(c, http.StatusBadRequest, "invalid_request", "request body has trailing data after the JSON document", nil)
 		return
 	}

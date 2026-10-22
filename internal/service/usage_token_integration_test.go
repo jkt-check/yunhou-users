@@ -843,23 +843,27 @@ func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
 		}
 	}
 
-	// DeleteAll（用户级水位）与摄入并发：同一断言。bucket_start 必须避开
-	// 循环一的墓碑覆盖范围（day+1h..day+30h），否则摄入恒被墓碑丢弃，
-	// 水位路径测不到。
-	bucketStart2 := day.Add(48 * time.Hour)
-	clearedBefore := service.CeilToBucket(time.Now().UTC(), "hour")
+	// DeleteAll（用户级水位）与摄入并发。水位是半开区间（bucket_start <
+	// cleared_before），所以"水位之上的新桶在删除后写入"是契约 §3.4 允许
+	// 的合法行为，不是复活——bs 必须恒在水位之下断言才成立。为让每轮都
+	// 是真实竞态（而非第二轮起恒被水位预丢弃），水位逐轮推进、bs 取上一
+	// 轮的水位值：摄入先（读到上轮水位，bs 等于它不 blocked → 写入 →
+	// DeleteAll 随后删掉）或删除先（bs < 新水位 → discarded），终态恒 0。
+	base := service.CeilToBucket(time.Now().UTC(), "hour")
 	for i := 0; i < rounds; i++ {
+		bs := base.Add(time.Duration(i) * time.Hour)
+		wm := base.Add(time.Duration(i+1) * time.Hour)
 		var wg sync.WaitGroup
 		var delErr, ingErr error
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, delErr = r.DeleteAll(ctx, user, clearedBefore)
+			_, delErr = r.DeleteAll(ctx, user, wm)
 		}()
 		go func() {
 			defer wg.Done()
 			b := newBucket()
-			b.BucketStart = bucketStart2
+			b.BucketStart = bs
 			_, ingErr = r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
 				DeviceID: "d_concurrencym4", Buckets: []model.UsageTokenBucket{b},
 			})
@@ -874,7 +878,7 @@ func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
 		var n int
 		if err := db.GetContext(ctx, &n,
 			`SELECT COUNT(*) FROM usage_token_buckets WHERE user_id = $1 AND bucket_start = $2`,
-			user, bucketStart2); err != nil {
+			user, bs); err != nil {
 			t.Fatalf("count: %v", err)
 		}
 		if n != 0 {

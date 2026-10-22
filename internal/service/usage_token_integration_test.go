@@ -888,11 +888,13 @@ func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
 
 	// RevokeDevice(purge=true) 与摄入并发：purge 是唯一"在摄入 revoked
 	// 检查之后才删桶"的路径。每轮换新设备（撤销是终态）；设备行先登记，
-	// 否则 revoke 先跑会 ErrUsageDeviceNotFound。终态：桶行数恒 0——
-	// 摄入先（purge 随后删掉）或撤销先（摄入被 ErrUsageDeviceRevoked 拒）。
+	// 否则 revoke 先跑会 ErrUsageDeviceNotFound。bs 恒取循环二终态水位
+	//（base+30h）之上，否则部分轮次会被水位预丢弃、purge 失去并发对手
+	//（复审第三轮）。终态：桶行数恒 0——摄入先（purge 随后删掉）或撤销
+	// 先（摄入被 ErrUsageDeviceRevoked 拒）。
 	for i := 0; i < rounds; i++ {
 		dev := fmt.Sprintf("d_purgerace%02d", i)
-		bs := day.Add(time.Duration(72+i) * time.Hour) // 避开上面的墓碑/水位
+		bs := base.Add(time.Duration(48+i) * time.Hour)
 		if _, err := r.UpsertDevice(ctx, user, model.UsageDeviceRegisterInput{DeviceID: dev}); err != nil {
 			t.Fatalf("round %d: register device: %v", i, err)
 		}

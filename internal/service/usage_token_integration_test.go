@@ -880,3 +880,68 @@ func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
 		}
 	}
 }
+
+// TestUsageTokenIntegration_TombstoneMerge 是 PR #61 review M6 的回归：
+// 重叠窗口删除的墓碑合并为一条（不无界增长），且合并后的墓碑仍拦截
+// 重传；不相交窗口各自保留。
+func TestUsageTokenIntegration_TombstoneMerge(t *testing.T) {
+	db := usageTokenTestDB(t)
+	r := repo.NewUsageTokenRepo(db)
+	user := usageTokenUser(t, db)
+	ctx := context.Background()
+	day := usageTokenFixtureDay()
+	h := func(n int) time.Time { return day.Add(time.Duration(n) * time.Hour) }
+
+	// 相交窗口 [h1,h3] + [h2,h4] → 合并为一条 [h1,h4]。
+	if _, err := r.DeleteWindow(ctx, user, nil, h(1), h(3)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.DeleteWindow(ctx, user, nil, h(2), h(4)); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.GetContext(ctx, &n,
+		`SELECT COUNT(*) FROM usage_token_tombstones WHERE user_id = $1`, user); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("tombstones = %d, want 1 merged row", n)
+	}
+	var fromB, toB time.Time
+	if err := db.QueryRowxContext(ctx,
+		`SELECT from_bucket, to_bucket FROM usage_token_tombstones WHERE user_id = $1`, user).
+		Scan(&fromB, &toB); err != nil {
+		t.Fatal(err)
+	}
+	if !fromB.Equal(h(1)) || !toB.Equal(h(4)) {
+		t.Errorf("merged = [%s, %s], want [%s, %s]", fromB, toB, h(1), h(4))
+	}
+
+	// 不相交窗口不合并且各留一行。
+	if _, err := r.DeleteWindow(ctx, user, nil, h(10), h(11)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetContext(ctx, &n,
+		`SELECT COUNT(*) FROM usage_token_tombstones WHERE user_id = $1`, user); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("tombstones = %d, want 2 (disjoint window not merged)", n)
+	}
+
+	// 合并后的墓碑仍拦截窗口内重传（摄入侧按批范围过滤不能漏判）。
+	res, err := r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
+		DeviceID: "d_tombstonemerge",
+		Buckets: []model.UsageTokenBucket{{
+			BucketStart: h(2), BucketSize: "hour", Source: "chat",
+			AgentKey: "chat", ProviderKey: "builtin", ModelKey: "default",
+			PromptTokens: 1, TotalTokens: 1, Requests: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Accepted != 0 || len(res.Discarded) != 1 {
+		t.Errorf("accepted=%d discarded=%d, want 0/1", res.Accepted, len(res.Discarded))
+	}
+}

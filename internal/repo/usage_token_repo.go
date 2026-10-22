@@ -153,11 +153,24 @@ func (r *usageTokenRepo) IngestBuckets(ctx context.Context, userID string, in mo
 		return nil, fmt.Errorf("ingest watermark read: %w", err)
 	}
 
+	// 只读本批可能命中的墓碑（M6）：窗口重叠判定 from_bucket <= 本批
+	// maxStart AND to_bucket >= 本批 minStart。否则墓碑随删除次数无界
+	// 增长，每次摄入都把全部历史墓碑读进内存。
 	var tombstones []usageTombstoneRow
+	minStart, maxStart := in.Buckets[0].BucketStart, in.Buckets[0].BucketStart
+	for _, b := range in.Buckets[1:] {
+		if b.BucketStart.Before(minStart) {
+			minStart = b.BucketStart
+		}
+		if b.BucketStart.After(maxStart) {
+			maxStart = b.BucketStart
+		}
+	}
 	if err := tx.SelectContext(ctx, &tombstones, `
 		SELECT device_id, from_bucket, to_bucket FROM usage_token_tombstones
-		WHERE user_id = $1 AND (device_id IS NULL OR device_id = $2)`,
-		userID, in.DeviceID); err != nil {
+		WHERE user_id = $1 AND (device_id IS NULL OR device_id = $2)
+			AND from_bucket <= $3 AND to_bucket >= $4`,
+		userID, in.DeviceID, maxStart, minStart); err != nil {
 		return nil, fmt.Errorf("ingest tombstone read: %w", err)
 	}
 
@@ -689,6 +702,37 @@ func (r *usageTokenRepo) DeleteWindow(ctx context.Context, userID string, device
 	}
 	deleted, _ := res.RowsAffected()
 
+	// 合并重叠墓碑（M6）：同一 (user_id, device_id) 下与新窗口相交的墓碑
+	// 并入一条 [min(from_bucket), max(to_bucket)]，每次窗口删除不再恒增一
+	// 行。摄入/删除同用户已被 advisory lock 串行化（M4），合并无并发写竞。
+	var overlaps []struct {
+		ID         int64     `db:"id"`
+		FromBucket time.Time `db:"from_bucket"`
+		ToBucket   time.Time `db:"to_bucket"`
+	}
+	if err := tx.SelectContext(ctx, &overlaps, `
+		SELECT id, from_bucket, to_bucket FROM usage_token_tombstones
+		WHERE user_id = $1 AND device_id IS NOT DISTINCT FROM $2
+			AND from_bucket <= $4 AND to_bucket >= $3`,
+		userID, deviceID, fromBucket, toBucket); err != nil {
+		return 0, err
+	}
+	if len(overlaps) > 0 {
+		ids := make([]int64, 0, len(overlaps))
+		for _, o := range overlaps {
+			ids = append(ids, o.ID)
+			if o.FromBucket.Before(fromBucket) {
+				fromBucket = o.FromBucket
+			}
+			if o.ToBucket.After(toBucket) {
+				toBucket = o.ToBucket
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM usage_token_tombstones WHERE id = ANY($1)`, pq.Array(ids)); err != nil {
+			return 0, err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO usage_token_tombstones (user_id, device_id, from_bucket, to_bucket)
 		VALUES ($1, $2, $3, $4)`, userID, deviceID, fromBucket, toBucket); err != nil {

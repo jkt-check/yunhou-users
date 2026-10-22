@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/yunhou/users/internal/model"
@@ -43,7 +44,18 @@ func (s *UsageTokenService) ExportMaxRows() int { return s.exportMaxRows }
 // Ingest 落库一批已校验桶。设备撤销 / 水位墓碑丢弃在 repo 的单事务里完成；
 // ErrUsageDeviceRevoked 原样透传给 handler 映射 403。
 func (s *UsageTokenService) Ingest(ctx context.Context, userID string, in model.UsageTokenIngestInput) (*model.UsageIngestResult, error) {
-	return s.repo.IngestBuckets(ctx, userID, in)
+	result, err := s.repo.IngestBuckets(ctx, userID, in)
+	if err != nil {
+		// batch_id 是客户端建议的追踪 id（契约 §3.2「用于日志追踪」）——
+		// 失败与丢弃两条路径都必须带上它，否则该字段从未落地。
+		log.Printf("usage tokens: ingest failed: user=%s device=%s batch=%s: %v", userID, in.DeviceID, in.BatchID, err)
+		return nil, err
+	}
+	if len(result.Discarded) > 0 {
+		log.Printf("usage tokens: ingest discarded %d bucket(s) by watermark/tombstone: user=%s device=%s batch=%s",
+			len(result.Discarded), userID, in.DeviceID, in.BatchID)
+	}
+	return result, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +95,10 @@ func ParseUsageTokenWindow(fromStr, toStr string, now time.Time) (time.Time, tim
 	if to.Before(from) {
 		return time.Time{}, time.Time{}, usageTokenErr(400, "invalid_request", "to must not be before from")
 	}
-	if to.Sub(from) > model.UsageTokenMaxWindowDays*24*time.Hour {
+	// 契约 §4.1 的窗口上限按自然日计：from/to 均为含端点的日期，故
+	// to-from 相差 180 天即 181 个自然日，已超上限。用 >= 把边界卡死在
+	// 180 个自然日（PR #61 review S5）。
+	if to.Sub(from) >= model.UsageTokenMaxWindowDays*24*time.Hour {
 		return time.Time{}, time.Time{}, usageTokenErr(400, "window_too_large",
 			fmt.Sprintf("window must not exceed %d days", model.UsageTokenMaxWindowDays))
 	}
@@ -349,7 +364,8 @@ func (s *UsageTokenService) Delete(ctx context.Context, userID, deviceID, fromSt
 	if to.Before(from) {
 		return nil, usageTokenErr(400, "invalid_request", "to must not be before from")
 	}
-	if to.Sub(from) > model.UsageTokenMaxWindowDays*24*time.Hour {
+	// 与 ParseUsageTokenWindow 同口径：自然日计，>= 卡死 180 天上限。
+	if to.Sub(from) >= model.UsageTokenMaxWindowDays*24*time.Hour {
 		return nil, usageTokenErr(400, "window_too_large",
 			fmt.Sprintf("window must not exceed %d days", model.UsageTokenMaxWindowDays))
 	}
@@ -452,6 +468,5 @@ func utcTimePtr(t *time.Time) *time.Time {
 	return &u
 }
 
-// IsUsageDeviceNotFound / IsUsageDeviceRevoked 是 handler 的错误映射辅助。
+// IsUsageDeviceNotFound 是 handler 的错误映射辅助。
 func IsUsageDeviceNotFound(err error) bool { return errors.Is(err, model.ErrUsageDeviceNotFound) }
-func IsUsageDeviceRevoked(err error) bool  { return errors.Is(err, model.ErrUsageDeviceRevoked) }

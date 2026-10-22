@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -324,10 +325,11 @@ func (h *UsageTokenHandler) validateBucket(raw *usageTokenBucketRaw, index int, 
 	if len(raw.AgentKey) < 1 || len(raw.AgentKey) > 64 || !usageAgentKeyPattern.MatchString(raw.AgentKey) {
 		return nil, fail("invalid_bucket", "agent_key must be 1-64 chars of [A-Za-z0-9._-]")
 	}
-	if len(raw.ProviderKey) < 1 || len(raw.ProviderKey) > 128 || usageHasControlChar(raw.ProviderKey) {
+	// 契约 §3.2 的长度上限按字符计（中文模型名/标签不按字节误拒）。
+	if utf8.RuneCountInString(raw.ProviderKey) < 1 || utf8.RuneCountInString(raw.ProviderKey) > 128 || usageHasControlChar(raw.ProviderKey) {
 		return nil, fail("invalid_bucket", "provider_key must be 1-128 chars without control characters")
 	}
-	if len(raw.ModelKey) < 1 || len(raw.ModelKey) > 200 || usageHasControlChar(raw.ModelKey) {
+	if utf8.RuneCountInString(raw.ModelKey) < 1 || utf8.RuneCountInString(raw.ModelKey) > 200 || usageHasControlChar(raw.ModelKey) {
 		return nil, fail("invalid_bucket", "model_key must be 1-200 chars without control characters")
 	}
 

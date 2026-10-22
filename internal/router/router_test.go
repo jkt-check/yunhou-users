@@ -529,7 +529,7 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 }
 
 // TestSetup_UsageTokenRoutesWired 验证 kaya token 用量统计面（usage-stats.md
-// v1.1）在 usageTokenSvc 非 nil 时全部挂载；nil 时整块不挂载（fail
+// v1.2）在 usageTokenSvc 非 nil 时全部挂载；nil 时整块不挂载（fail
 // closed，与 accessOps 同姿势）。service 带 nil repo：Setup 只注册路由，
 // 不触达依赖。
 func TestSetup_UsageTokenRoutesWired(t *testing.T) {

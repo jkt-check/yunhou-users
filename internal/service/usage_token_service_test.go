@@ -21,7 +21,6 @@ type mockUsageTokenRepo struct {
 	deleteAllFn    func(ctx context.Context, userID string, clearedBefore time.Time) (int64, error)
 	deleteDeviceFn func(ctx context.Context, userID, deviceID string, clearedBefore time.Time) (int64, error)
 	deleteWindowFn func(ctx context.Context, userID string, deviceID *string, fromBucket, toBucket time.Time) (int64, error)
-	getDeviceFn    func(ctx context.Context, userID, deviceID string) (*model.UsageDevice, error)
 	upsertDeviceFn func(ctx context.Context, userID string, in model.UsageDeviceRegisterInput) (*model.UsageDevice, error)
 	listDevicesFn  func(ctx context.Context, userID string) ([]model.UsageDevice, error)
 	updateLabelFn  func(ctx context.Context, userID, deviceID string, label *string) error
@@ -55,9 +54,6 @@ func (m *mockUsageTokenRepo) DeleteByDevice(ctx context.Context, userID, deviceI
 }
 func (m *mockUsageTokenRepo) DeleteWindow(ctx context.Context, userID string, deviceID *string, fromBucket, toBucket time.Time) (int64, error) {
 	return m.deleteWindowFn(ctx, userID, deviceID, fromBucket, toBucket)
-}
-func (m *mockUsageTokenRepo) GetDevice(ctx context.Context, userID, deviceID string) (*model.UsageDevice, error) {
-	return m.getDeviceFn(ctx, userID, deviceID)
 }
 func (m *mockUsageTokenRepo) UpsertDevice(ctx context.Context, userID string, in model.UsageDeviceRegisterInput) (*model.UsageDevice, error) {
 	return m.upsertDeviceFn(ctx, userID, in)
@@ -120,9 +116,15 @@ func TestParseUsageTokenWindow(t *testing.T) {
 			t.Errorf("code = %q", usageTokenErrCode(t, err))
 		}
 	})
-	t.Run("exactly 180 days is allowed", func(t *testing.T) {
-		if _, _, err := ParseUsageTokenWindow("2026-04-25", "2026-10-22", now); err != nil {
-			t.Errorf("180-day window must pass: %v", err)
+	t.Run("exactly 180 natural days is allowed", func(t *testing.T) {
+		if _, _, err := ParseUsageTokenWindow("2026-04-26", "2026-10-22", now); err != nil {
+			t.Errorf("179-day diff (180 natural days) must pass: %v", err)
+		}
+	})
+	t.Run("181 natural days rejected", func(t *testing.T) {
+		_, _, err := ParseUsageTokenWindow("2026-04-25", "2026-10-22", now)
+		if usageTokenErrCode(t, err) != "window_too_large" {
+			t.Errorf("180-day diff (181 natural days) must be rejected, code = %q", usageTokenErrCode(t, err))
 		}
 	})
 	t.Run("to before from", func(t *testing.T) {

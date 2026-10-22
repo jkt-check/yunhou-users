@@ -68,8 +68,6 @@ type UsageTokenRepo interface {
 	// 并写一条墓碑（deviceID nil = 全设备）。单事务。
 	DeleteWindow(ctx context.Context, userID string, deviceID *string, fromBucket, toBucket time.Time) (int64, error)
 
-	// GetDevice 读设备行；不存在 → ErrUsageDeviceNotFound。
-	GetDevice(ctx context.Context, userID, deviceID string) (*model.UsageDevice, error)
 	// UpsertDevice 是 POST /user/devices 的落库：不存在则插入；已存在只
 	// 更新非空字段（COALESCE，空值不覆盖已有 label）；已撤销 → 整个写入
 	// 回滚并返回 ErrUsageDeviceRevoked。
@@ -691,20 +689,6 @@ func (r *usageDeviceRow) toModel() *model.UsageDevice {
 		LastSeenAt:     r.LastSeenAt,
 		RevokedAt:      r.RevokedAt,
 	}
-}
-
-func (r *usageTokenRepo) GetDevice(ctx context.Context, userID, deviceID string) (*model.UsageDevice, error) {
-	var row usageDeviceRow
-	err := r.db.GetContext(ctx, &row,
-		`SELECT `+usageDeviceColumns+` FROM usage_devices WHERE user_id = $1 AND device_id = $2`,
-		userID, deviceID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, model.ErrUsageDeviceNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return row.toModel(), nil
 }
 
 func (r *usageTokenRepo) UpsertDevice(ctx context.Context, userID string, in model.UsageDeviceRegisterInput) (*model.UsageDevice, error) {

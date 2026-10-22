@@ -145,10 +145,11 @@ type UsageDeviceView struct {
 	ConsentedAt    *time.Time `json:"consented_at"`
 	LastSeenAt     *time.Time `json:"last_seen_at"`
 	// LastBucketAt / EarliestBucket / LatestBucket 仅 coverage 填充
-	//（该设备自身桶在当前 bucket_size 下的 MIN/MAX）。
+	//（该设备自身桶在当前 bucket_size 下的 MIN/MAX）。契约 §4.5：无桶时
+	// 必须是 null 而非字段消失，故不带 omitempty。
 	LastBucketAt   *time.Time `json:"last_bucket_at"`
-	EarliestBucket *time.Time `json:"earliest_bucket,omitempty"`
-	LatestBucket   *time.Time `json:"latest_bucket,omitempty"`
+	EarliestBucket *time.Time `json:"earliest_bucket"`
+	LatestBucket   *time.Time `json:"latest_bucket"`
 	Revoked        bool       `json:"revoked"`
 }
 

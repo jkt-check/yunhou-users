@@ -554,7 +554,12 @@ func main() {
 	// /relay/ws is exempt too: it is a WebSocket long connection that must
 	// never sit under the 20s cap (its liveness bounds are the relay
 	// ping/idle timers in internal/relay).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses", "/relay/ws"))
+	// /user/usage/tokens/export is exempt: a capped-but-large CSV (up to
+	// USAGE_TOKEN_EXPORT_MAX_ROWS rows) can legitimately outlive 20s; its
+	// bound is the per-response write deadline set in GetExport (same
+	// SetWriteDeadline pattern as /chat), without which the 20s ctx cancel
+	// + 25s WriteTimeout would silently truncate the file.
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses", "/relay/ws", "/user/usage/tokens/export"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,

@@ -479,6 +479,13 @@ func (h *UsageTokenHandler) GetCoverage(c *gin.Context) {
 // 恒定携带，未截断时 X-Result-Truncated 为 false）。
 const usageExportExposeHeaders = "X-Result-Truncated, X-Result-Returned, X-Result-Limit"
 
+// usageExportWriteTimeout 是导出响应的独立写截止（PR #61 review M1）：
+// export 已豁免 20s timeoutMiddleware，而 http.Server.WriteTimeout(25s)
+// 是每请求的绝对截止——500k 行 CSV 合法地可能超过它。与 chat.go 同姿势：
+// SetWriteDeadline 只在 wrapper 藏住底层连接时失败，届时 25s 上限仍会
+// 生效，所以失败必须记日志。
+const usageExportWriteTimeout = 5 * time.Minute
+
 // GetExport 处理 GET /user/usage/tokens/export。csv = 直接文件流（无
 // envelope）；json = envelope，data 带 items/truncated/returned/limit。
 // 超限语义（v1.2 §4.6，fail-closed）：service 在同一数据库快照里先计数，
@@ -522,6 +529,13 @@ func (h *UsageTokenHandler) GetExport(c *gin.Context) {
 	c.Header("X-Result-Truncated", strconv.FormatBool(truncated))
 	c.Header("X-Result-Returned", strconv.Itoa(len(rows)))
 	c.Header("X-Result-Limit", strconv.Itoa(h.svc.ExportMaxRows()))
+
+	// 本路由已豁免 20s timeoutMiddleware；用独立写截止替代 25s 全局
+	// WriteTimeout（绝对值会硬切一个合法的大 CSV）。
+	rc := http.NewResponseController(c.Writer)
+	if err := rc.SetWriteDeadline(time.Now().Add(usageExportWriteTimeout)); err != nil {
+		log.Printf("usage tokens: export set write deadline: %v", err)
+	}
 
 	if format == "json" {
 		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{

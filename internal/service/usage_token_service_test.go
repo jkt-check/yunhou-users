@@ -43,8 +43,20 @@ func (m *mockUsageTokenRepo) Timeseries(ctx context.Context, userID, bucketSize,
 func (m *mockUsageTokenRepo) CoverageDevices(ctx context.Context, userID, bucketSize string) ([]model.UsageDeviceView, error) {
 	return m.coverageFn(ctx, userID, bucketSize)
 }
-func (m *mockUsageTokenRepo) ExportRows(ctx context.Context, userID, bucketSize string, from, to time.Time, f model.UsageTokenFilter, rowCap int) ([]model.UsageExportRow, int64, error) {
-	return m.exportFn(ctx, userID, bucketSize, from, to, f, rowCap)
+func (m *mockUsageTokenRepo) ExportRows(ctx context.Context, userID, bucketSize string, from, to time.Time, f model.UsageTokenFilter, rowCap int, decide func(total int64) (bool, error)) ([]model.UsageExportRow, int64, error) {
+	rows, total, err := m.exportFn(ctx, userID, bucketSize, from, to, f, rowCap)
+	if err != nil {
+		return nil, 0, err
+	}
+	// 与真实 repo 同语义：decide 在取行之前判定，报错/放弃则不返回行。
+	fetch, derr := decide(total)
+	if derr != nil {
+		return nil, total, derr
+	}
+	if !fetch {
+		return nil, total, nil
+	}
+	return rows, total, nil
 }
 func (m *mockUsageTokenRepo) DeleteAll(ctx context.Context, userID string, clearedBefore time.Time) (int64, error) {
 	return m.deleteAllFn(ctx, userID, clearedBefore)

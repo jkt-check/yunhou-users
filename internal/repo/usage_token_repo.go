@@ -48,15 +48,18 @@ type UsageTokenRepo interface {
 	// bucket_size 下的桶 MIN/MAX；顶层汇总由 service 在排除撤销设备后
 	// 计算（契约 §4.5：coverage 是三过滤的唯一例外）。
 	CoverageDevices(ctx context.Context, userID, bucketSize string) ([]model.UsageDeviceView, error)
-	// ExportRows 在同一数据库快照里"先计数、后取行"（v1.2 §4.6 MUST）：
-	// BEGIN READ ONLY + REPEATABLE READ 事务内，先按同一 where 计
-	// COUNT(*)，再按 cap 限行取数。为什么不能在流式阶段才发现超限：
-	// CSV 响应头在写出第一个字节时就已提交，读到第 cap+1 行才改主意
-	// 已无法回退状态码/响应头；HTTP trailer 在浏览器 fetch 中不可见，
-	// 也不能当信号。所以只能先计数、后写头——且计数与取数必须同快照，
-	// 否则计数后新摄入的桶会让流式阶段再次超限。total 是窗口内命中
-	// 行数（不受 cap 影响），rows 至多 cap 行。
-	ExportRows(ctx context.Context, userID, bucketSize string, from, to time.Time, f model.UsageTokenFilter, rowCap int) (rows []model.UsageExportRow, total int64, err error)
+	// ExportRows 在同一数据库快照里"先计数、由调用方判定、再取行"
+	//（v1.2 §4.6 MUST）：BEGIN READ ONLY + REPEATABLE READ 事务内，先按同
+	// 一 where 计 COUNT(*)，然后把 total 交给 decide 判定；decide 返回错
+	// 误（如 fail-closed 的 export_too_large）或 fetch=false 时直接提交返
+	// 回，**不取数据行**——否则超限路径会白取 cap 行（约 50MB）再丢弃
+	//（PR #61 review M3）。为什么不能在流式阶段才发现超限：CSV 响应头在
+	// 写出第一个字节时就已提交，读到第 cap+1 行才改主意已无法回退状态码/
+	// 响应头；HTTP trailer 在浏览器 fetch 中不可见，也不能当信号。所以只
+	// 能先计数、后写头——且计数与取数必须同快照，否则计数后新摄入的桶会
+	// 让流式阶段再次超限。total 是窗口内命中行数（不受 cap 影响，decide
+	// 报错时也透传，供日志/诊断），rows 至多 cap 行。
+	ExportRows(ctx context.Context, userID, bucketSize string, from, to time.Time, f model.UsageTokenFilter, rowCap int, decide func(total int64) (fetch bool, err error)) (rows []model.UsageExportRow, total int64, err error)
 
 	// DeleteAll 删该用户全部桶（不分 bucket_size）并把用户级水位推进到
 	// clearedBefore（单调前进，GREATEST）。单事务。
@@ -501,12 +504,12 @@ func (r *usageTokenRepo) CoverageDevices(ctx context.Context, userID, bucketSize
 	return out, nil
 }
 
-func (r *usageTokenRepo) ExportRows(ctx context.Context, userID, bucketSize string, from, to time.Time, f model.UsageTokenFilter, rowCap int) ([]model.UsageExportRow, int64, error) {
+func (r *usageTokenRepo) ExportRows(ctx context.Context, userID, bucketSize string, from, to time.Time, f model.UsageTokenFilter, rowCap int, decide func(total int64) (bool, error)) ([]model.UsageExportRow, int64, error) {
 	where, args := usageTokenBaseWhere(f)
 	base := append([]any{userID, bucketSize, from, to}, args...)
 
-	// 先计数后取行，同一 REPEATABLE READ 只读事务 = 同一快照（契约 v1.2
-	// §4.6 的 MUST；理由见接口注释）。
+	// 先计数、由 decide 判定、后取行，同一 REPEATABLE READ 只读事务 =
+	// 同一快照（契约 v1.2 §4.6 的 MUST；理由见接口注释）。
 	tx, err := r.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
 		return nil, 0, err
@@ -517,6 +520,18 @@ func (r *usageTokenRepo) ExportRows(ctx context.Context, userID, bucketSize stri
 	if err := tx.GetContext(ctx, &total,
 		`SELECT COUNT(*)`+where, base...); err != nil {
 		return nil, 0, err
+	}
+
+	// fail-closed / 调用方放弃取数：直接提交，不拉取数据行（M3）。
+	fetch, derr := decide(total)
+	if derr != nil {
+		return nil, total, derr
+	}
+	if !fetch {
+		if err := tx.Commit(); err != nil {
+			return nil, 0, err
+		}
+		return nil, total, nil
 	}
 
 	query := `SELECT b.device_id, b.bucket_start, b.source, b.agent_key, b.provider_key, b.model_key,

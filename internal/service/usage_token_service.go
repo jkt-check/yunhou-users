@@ -285,21 +285,26 @@ func (s *UsageTokenService) Export(ctx context.Context, userID, fromStr, toStr s
 	if err != nil {
 		return nil, 0, false, err
 	}
-	rows, total, err = s.repo.ExportRows(ctx, userID, s.bucketSize, from, to.AddDate(0, 0, 1), f, s.exportMaxRows)
+	// fail-closed 判定放进 repo 同事务的 decide 回调（M3）：超限即报错，
+	// repo 不取数据行；total 由 repo 透传供诊断。
+	rows, total, err = s.repo.ExportRows(ctx, userID, s.bucketSize, from, to.AddDate(0, 0, 1), f, s.exportMaxRows,
+		func(total int64) (bool, error) {
+			if total > int64(s.exportMaxRows) && !allowTruncated {
+				return false, &model.UsageTokenError{
+					Status: 400, Code: "export_too_large",
+					Message: fmt.Sprintf("export has %d rows, exceeding the %d row limit; narrow the window or add device_id/source filters, or pass allow_truncated=true for a partial export",
+						total, s.exportMaxRows),
+					Data: map[string]any{
+						"max_rows": s.exportMaxRows,
+						"from":     from.Format(usageTokenDateLayout),
+						"to":       to.Format(usageTokenDateLayout),
+					},
+				}
+			}
+			return true, nil
+		})
 	if err != nil {
-		return nil, 0, false, err
-	}
-	if total > int64(s.exportMaxRows) && !allowTruncated {
-		return nil, total, false, &model.UsageTokenError{
-			Status: 400, Code: "export_too_large",
-			Message: fmt.Sprintf("export has %d rows, exceeding the %d row limit; narrow the window or add device_id/source filters, or pass allow_truncated=true for a partial export",
-				total, s.exportMaxRows),
-			Data: map[string]any{
-				"max_rows": s.exportMaxRows,
-				"from":     from.Format(usageTokenDateLayout),
-				"to":       to.Format(usageTokenDateLayout),
-			},
-		}
+		return nil, total, false, err
 	}
 	truncated = total > int64(len(rows))
 	for i := range rows {

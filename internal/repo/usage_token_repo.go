@@ -104,12 +104,29 @@ type usageTombstoneRow struct {
 	ToBucket   time.Time `db:"to_bucket"`
 }
 
+// usageTokenAdvisoryLock 在事务内对该用户取咨询锁（PR #61 review M4）：
+// 摄入「读水位/墓碑 → 写桶」与删除「写水位/墓碑 → 删桶」之间存在竞态
+// 窗口——删除在摄入的读之后、写之前提交，刚删的数据就会随摄入复活。
+// 摄入与所有删除/撤销 purge 路径对同一 user_id 取
+// pg_advisory_xact_lock 后，两侧按用户串行化，窗口关闭。锁随事务结束
+// 自动释放；hashtextextended 的跨用户冲突只是假共享，无害。
+func usageTokenAdvisoryLock(ctx context.Context, tx *sqlx.Tx, userID string) error {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, userID); err != nil {
+		return fmt.Errorf("usage token advisory lock: %w", err)
+	}
+	return nil
+}
+
 func (r *usageTokenRepo) IngestBuckets(ctx context.Context, userID string, in model.UsageTokenIngestInput) (*model.UsageIngestResult, error) {
 	tx, err := r.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	if err := usageTokenAdvisoryLock(ctx, tx, userID); err != nil {
+		return nil, err
+	}
 
 	// 设备行 auto-upsert（契约 §3.2 末段）：不存在则插入 label=NULL 的占位
 	// 行；存在则刷新 last_seen_at。RETURNING 顺带取回撤销/水位状态。
@@ -585,6 +602,11 @@ func (r *usageTokenRepo) DeleteAll(ctx context.Context, userID string, clearedBe
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// 与摄入互斥（M4）：水位推进与桶删除必须在同一串行区内。
+	if err := usageTokenAdvisoryLock(ctx, tx, userID); err != nil {
+		return 0, err
+	}
+
 	res, err := tx.ExecContext(ctx, `DELETE FROM usage_token_buckets WHERE user_id = $1`, userID)
 	if err != nil {
 		return 0, err
@@ -611,6 +633,11 @@ func (r *usageTokenRepo) DeleteByDevice(ctx context.Context, userID, deviceID st
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// 与摄入互斥（M4）。
+	if err := usageTokenAdvisoryLock(ctx, tx, userID); err != nil {
+		return 0, err
+	}
 
 	// 先推进水位：设备行不存在时 0 行命中 → 回滚 + 404，桶删除不落库。
 	res, err := tx.ExecContext(ctx, `
@@ -641,6 +668,11 @@ func (r *usageTokenRepo) DeleteWindow(ctx context.Context, userID string, device
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// 与摄入互斥（M4）：墓碑写入与窗口删桶必须在同一串行区内。
+	if err := usageTokenAdvisoryLock(ctx, tx, userID); err != nil {
+		return 0, err
+	}
 
 	// 墓碑区间是闭区间（契约 §3.4：from_bucket <= bucket_start <= to_bucket
 	// 即丢弃），删除用同一闭区间，保证"删掉的"与"以后拒收的"完全一致。
@@ -772,6 +804,13 @@ func (r *usageTokenRepo) RevokeDevice(ctx context.Context, userID, deviceID stri
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// 与摄入互斥（M4）：purge 删桶与摄入写桶之间同样存在复活窗口——
+	// 摄入先过了 revoked 检查、purge 提交、摄入再写入，桶就会在已撤销
+	// 设备下复活。
+	if err := usageTokenAdvisoryLock(ctx, tx, userID); err != nil {
+		return err
+	}
 
 	// 撤销幂等：已撤销的行再撤销一次仍是 now() 覆盖，对外语义不变。
 	res, err := tx.ExecContext(ctx,

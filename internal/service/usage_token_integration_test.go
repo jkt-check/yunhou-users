@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 
 	"github.com/yunhou/users/internal/handler"
 	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/service"
 )
@@ -776,5 +778,105 @@ func TestUsageTokenIntegration_ExportLimits(t *testing.T) {
 	}
 	if expose := w.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(expose, "X-Result-Truncated") {
 		t.Errorf("400 Expose-Headers = %q", expose)
+	}
+}
+
+// TestUsageTokenIntegration_ConcurrentIngestVsDelete 是 PR #61 review M4 的
+// 并发回归：摄入（读水位/墓碑 → 写桶）与删除（写水位/墓碑 → 删桶）并发
+// 时，落在被删窗口内的桶绝不复活。repo 两侧对同一 user_id 取
+// pg_advisory_xact_lock 后，每轮的终态只能是两种串行序之一——摄入先
+// （删除随后删掉）或删除先（摄入命中水位/墓碑被 discarded）——桶行数恒
+// 为 0。无锁实现下存在第三种交错（摄入读到无墓碑 → 删除提交 → 摄入写
+// 入），本测试正是那条交错的回归网。
+func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
+	db := usageTokenTestDB(t)
+	r := repo.NewUsageTokenRepo(db)
+	user := usageTokenUser(t, db)
+	ctx := context.Background()
+	day := usageTokenFixtureDay()
+	bucketStart := day.Add(time.Hour)
+
+	newBucket := func() model.UsageTokenBucket {
+		return model.UsageTokenBucket{
+			BucketStart: bucketStart, BucketSize: "hour", Source: "chat",
+			AgentKey: "chat", ProviderKey: "builtin", ModelKey: "default",
+			PromptTokens: 1, CompletionTokens: 0, TotalTokens: 1, Requests: 1,
+		}
+	}
+	countRows := func() int {
+		t.Helper()
+		var n int
+		if err := db.GetContext(ctx, &n,
+			`SELECT COUNT(*) FROM usage_token_buckets WHERE user_id = $1 AND bucket_start = $2`,
+			user, bucketStart); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+
+	const rounds = 30
+	for i := 0; i < rounds; i++ {
+		var wg sync.WaitGroup
+		var delErr, ingErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, delErr = r.DeleteWindow(ctx, user, nil, bucketStart, bucketStart)
+		}()
+		go func() {
+			defer wg.Done()
+			_, ingErr = r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
+				DeviceID: "d_concurrencym4", Buckets: []model.UsageTokenBucket{newBucket()},
+			})
+		}()
+		wg.Wait()
+		if delErr != nil {
+			t.Fatalf("round %d: DeleteWindow: %v", i, delErr)
+		}
+		if ingErr != nil {
+			t.Fatalf("round %d: IngestBuckets: %v", i, ingErr)
+		}
+		if n := countRows(); n != 0 {
+			t.Fatalf("round %d: deleted bucket resurrected (%d rows)", i, n)
+		}
+	}
+
+	// DeleteAll（用户级水位）与摄入并发：同一断言。换一个新的
+	// bucket_start——循环一的墓碑已覆盖旧桶，不换的话本轮摄入恒被墓碑
+	// 丢弃，水位路径就测不到。
+	bucketStart2 := day.Add(2 * time.Hour)
+	clearedBefore := service.CeilToBucket(time.Now().UTC(), "hour")
+	for i := 0; i < rounds; i++ {
+		var wg sync.WaitGroup
+		var delErr, ingErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, delErr = r.DeleteAll(ctx, user, clearedBefore)
+		}()
+		go func() {
+			defer wg.Done()
+			b := newBucket()
+			b.BucketStart = bucketStart2
+			_, ingErr = r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
+				DeviceID: "d_concurrencym4", Buckets: []model.UsageTokenBucket{b},
+			})
+		}()
+		wg.Wait()
+		if delErr != nil {
+			t.Fatalf("round %d: DeleteAll: %v", i, delErr)
+		}
+		if ingErr != nil {
+			t.Fatalf("round %d: IngestBuckets: %v", i, ingErr)
+		}
+		var n int
+		if err := db.GetContext(ctx, &n,
+			`SELECT COUNT(*) FROM usage_token_buckets WHERE user_id = $1 AND bucket_start = $2`,
+			user, bucketStart2); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("round %d: bucket resurrected after DeleteAll (%d rows)", i, n)
+		}
 	}
 }

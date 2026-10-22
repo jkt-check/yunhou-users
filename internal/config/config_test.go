@@ -160,6 +160,9 @@ func TestValidate_HappyPath(t *testing.T) {
 		JWTRefreshTTL:              168 * time.Hour,
 		OrderExpiryDuration:        30 * time.Minute,
 		SweeperInterval:            1 * time.Minute,
+		UsageTokenBucketSize:       "hour",
+		UsageTokenRetentionDays:    180,
+		UsageTokenExportMaxRows:    500000,
 		OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
 		WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef", // 32 bytes
 		WeChatPayMchID:             "1900000001",
@@ -353,17 +356,20 @@ func TestValidate_ErrorPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			cfg := &Config{
-				DatabaseURL:            "postgres://x",
-				RSAPrivate:             "priv",
-				RSAPublic:              "pub",
-				JWTAccessTTL:           15 * time.Minute,
-				JWTRefreshTTL:          168 * time.Hour,
-				OrderExpiryDuration:    30 * time.Minute,
-				SweeperInterval:        1 * time.Minute,
-				OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
-				InferenceRecoveryGrace: 15 * time.Minute,
-				WeChatAPIv3Key:         "0123456789abcdef0123456789abcdef",
-				WeChatPayMchID:         "1900000001",
+				DatabaseURL:             "postgres://x",
+				RSAPrivate:              "priv",
+				RSAPublic:               "pub",
+				JWTAccessTTL:            15 * time.Minute,
+				JWTRefreshTTL:           168 * time.Hour,
+				OrderExpiryDuration:     30 * time.Minute,
+				SweeperInterval:         1 * time.Minute,
+				UsageTokenBucketSize:    "hour",
+				UsageTokenRetentionDays: 180,
+				UsageTokenExportMaxRows: 500000,
+				OAuthStateSecret:        "test-state-secret-thirty-two-bytes-min-len",
+				InferenceRecoveryGrace:  15 * time.Minute,
+				WeChatAPIv3Key:          "0123456789abcdef0123456789abcdef",
+				WeChatPayMchID:          "1900000001",
 			}
 			tc.mutate(cfg)
 			err := cfg.Validate()
@@ -385,14 +391,17 @@ func TestValidate_RecoveryGraceFloor(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
 		return &Config{
-			DatabaseURL:         "postgres://x",
-			RSAPrivate:          "priv",
-			RSAPublic:           "pub",
-			JWTAccessTTL:        15 * time.Minute,
-			JWTRefreshTTL:       168 * time.Hour,
-			OrderExpiryDuration: 30 * time.Minute,
-			SweeperInterval:     1 * time.Minute,
-			OAuthStateSecret:    "test-state-secret-thirty-two-bytes-min-len",
+			DatabaseURL:             "postgres://x",
+			RSAPrivate:              "priv",
+			RSAPublic:               "pub",
+			JWTAccessTTL:            15 * time.Minute,
+			JWTRefreshTTL:           168 * time.Hour,
+			OrderExpiryDuration:     30 * time.Minute,
+			SweeperInterval:         1 * time.Minute,
+			UsageTokenBucketSize:    "hour",
+			UsageTokenRetentionDays: 180,
+			UsageTokenExportMaxRows: 500000,
+			OAuthStateSecret:        "test-state-secret-thirty-two-bytes-min-len",
 		}
 	}
 	cfg := base()
@@ -422,6 +431,9 @@ func TestValidate_DeepSeek(t *testing.T) {
 			JWTRefreshTTL:              168 * time.Hour,
 			OrderExpiryDuration:        30 * time.Minute,
 			SweeperInterval:            1 * time.Minute,
+			UsageTokenBucketSize:       "hour",
+			UsageTokenRetentionDays:    180,
+			UsageTokenExportMaxRows:    500000,
 			OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
 			WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef",
 			WeChatPayMchID:             "1900000001",
@@ -865,6 +877,9 @@ func validRealWeChatConfig() *Config {
 		JWTRefreshTTL:              168 * time.Hour,
 		OrderExpiryDuration:        30 * time.Minute,
 		SweeperInterval:            1 * time.Minute,
+		UsageTokenBucketSize:       "hour",
+		UsageTokenRetentionDays:    180,
+		UsageTokenExportMaxRows:    500000,
 		OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
 		WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef", // 32 bytes
 		WeChatPayMchID:             "1900000001",
@@ -883,15 +898,18 @@ func TestValidate_WeChatPayMchID(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
 		return &Config{
-			DatabaseURL:            "postgres://x",
-			RSAPrivate:             "priv",
-			RSAPublic:              "pub",
-			JWTAccessTTL:           15 * time.Minute,
-			JWTRefreshTTL:          168 * time.Hour,
-			OrderExpiryDuration:    30 * time.Minute,
-			SweeperInterval:        1 * time.Minute,
-			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
-			InferenceRecoveryGrace: 15 * time.Minute,
+			DatabaseURL:             "postgres://x",
+			RSAPrivate:              "priv",
+			RSAPublic:               "pub",
+			JWTAccessTTL:            15 * time.Minute,
+			JWTRefreshTTL:           168 * time.Hour,
+			OrderExpiryDuration:     30 * time.Minute,
+			SweeperInterval:         1 * time.Minute,
+			UsageTokenBucketSize:    "hour",
+			UsageTokenRetentionDays: 180,
+			UsageTokenExportMaxRows: 500000,
+			OAuthStateSecret:        "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace:  15 * time.Minute,
 		}
 	}
 
@@ -992,15 +1010,18 @@ func TestValidate_DatabaseURLSSLModeProductionGuard(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
 		return &Config{
-			RSAPrivate:             "priv",
-			RSAPublic:              "pub",
-			JWTAccessTTL:           15 * time.Minute,
-			JWTRefreshTTL:          168 * time.Hour,
-			OrderExpiryDuration:    30 * time.Minute,
-			SweeperInterval:        1 * time.Minute,
-			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
-			InferenceRecoveryGrace: 15 * time.Minute,
-			AppEnv:                 "prod",
+			RSAPrivate:              "priv",
+			RSAPublic:               "pub",
+			JWTAccessTTL:            15 * time.Minute,
+			JWTRefreshTTL:           168 * time.Hour,
+			OrderExpiryDuration:     30 * time.Minute,
+			SweeperInterval:         1 * time.Minute,
+			UsageTokenBucketSize:    "hour",
+			UsageTokenRetentionDays: 180,
+			UsageTokenExportMaxRows: 500000,
+			OAuthStateSecret:        "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace:  15 * time.Minute,
+			AppEnv:                  "prod",
 		}
 	}
 
@@ -1137,16 +1158,19 @@ func TestValidate_MockModeProductionGuards(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
 		return &Config{
-			DatabaseURL:            "postgres://x",
-			RSAPrivate:             "priv",
-			RSAPublic:              "pub",
-			JWTAccessTTL:           15 * time.Minute,
-			JWTRefreshTTL:          168 * time.Hour,
-			OrderExpiryDuration:    30 * time.Minute,
-			SweeperInterval:        1 * time.Minute,
-			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
-			InferenceRecoveryGrace: 15 * time.Minute,
-			AppEnv:                 "dev",
+			DatabaseURL:             "postgres://x",
+			RSAPrivate:              "priv",
+			RSAPublic:               "pub",
+			JWTAccessTTL:            15 * time.Minute,
+			JWTRefreshTTL:           168 * time.Hour,
+			OrderExpiryDuration:     30 * time.Minute,
+			SweeperInterval:         1 * time.Minute,
+			UsageTokenBucketSize:    "hour",
+			UsageTokenRetentionDays: 180,
+			UsageTokenExportMaxRows: 500000,
+			OAuthStateSecret:        "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace:  15 * time.Minute,
+			AppEnv:                  "dev",
 			// WeChat Pay disabled (all six fields empty) — valid real mode.
 		}
 	}
@@ -1345,16 +1369,19 @@ func TestConfig_CNProd_RefusesMockSwitches(t *testing.T) {
 	t.Parallel()
 	cnProd := func() *Config {
 		return &Config{
-			DatabaseURL:            "postgres://x",
-			RSAPrivate:             "priv",
-			RSAPublic:              "pub",
-			JWTAccessTTL:           15 * time.Minute,
-			JWTRefreshTTL:          168 * time.Hour,
-			OrderExpiryDuration:    30 * time.Minute,
-			SweeperInterval:        1 * time.Minute,
-			OAuthStateSecret:       "test-state-secret-thirty-two-bytes-min-len",
-			InferenceRecoveryGrace: 15 * time.Minute,
-			AppEnv:                 "prod",
+			DatabaseURL:             "postgres://x",
+			RSAPrivate:              "priv",
+			RSAPublic:               "pub",
+			JWTAccessTTL:            15 * time.Minute,
+			JWTRefreshTTL:           168 * time.Hour,
+			OrderExpiryDuration:     30 * time.Minute,
+			SweeperInterval:         1 * time.Minute,
+			UsageTokenBucketSize:    "hour",
+			UsageTokenRetentionDays: 180,
+			UsageTokenExportMaxRows: 500000,
+			OAuthStateSecret:        "test-state-secret-thirty-two-bytes-min-len",
+			InferenceRecoveryGrace:  15 * time.Minute,
+			AppEnv:                  "prod",
 			// cn-prod: WeChat-Pay deployment, PayPal never configured.
 			PaypalEnv: "",
 			// Real WeChat Pay credentials fully configured.
@@ -1439,6 +1466,9 @@ func TestValidate_LLMCatalog(t *testing.T) {
 			JWTRefreshTTL:              168 * time.Hour,
 			OrderExpiryDuration:        30 * time.Minute,
 			SweeperInterval:            1 * time.Minute,
+			UsageTokenBucketSize:       "hour",
+			UsageTokenRetentionDays:    180,
+			UsageTokenExportMaxRows:    500000,
 			OAuthStateSecret:           "test-state-secret-thirty-two-bytes-min-len",
 			WeChatAPIv3Key:             "0123456789abcdef0123456789abcdef",
 			WeChatPayMchID:             "1900000001",
@@ -1689,4 +1719,78 @@ func TestValidate_PaddleMockWithRealKey(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected PADDLE_MOCK + PADDLE_API_KEY to fail")
 	}
+}
+
+// TestLoad_UsageTokenConfig covers the kaya token-usage deployment knobs
+// (usage-stats.md §3.1/§4.9): USAGE_TOKEN_BUCKET_SIZE defaults to "hour" and
+// is enum-checked; USAGE_TOKEN_RETENTION_DAYS defaults to 180 and must be
+// positive (0/负数会让 sweeper 清光全表或摄入把一切判 too_old).
+func TestLoad_UsageTokenConfig(t *testing.T) {
+	for _, k := range []string{"USAGE_TOKEN_BUCKET_SIZE", "USAGE_TOKEN_RETENTION_DAYS", "USAGE_TOKEN_EXPORT_MAX_ROWS"} {
+		orig, had := os.LookupEnv(k)
+		os.Unsetenv(k)
+		if had {
+			t.Cleanup(func() { os.Setenv(k, orig) })
+		} else {
+			t.Cleanup(func() { os.Unsetenv(k) })
+		}
+	}
+
+	cfg := Load()
+	if cfg.UsageTokenBucketSize != "hour" {
+		t.Errorf("UsageTokenBucketSize default: got %q, want hour", cfg.UsageTokenBucketSize)
+	}
+	if cfg.UsageTokenRetentionDays != 180 {
+		t.Errorf("UsageTokenRetentionDays default: got %d, want 180", cfg.UsageTokenRetentionDays)
+	}
+	if cfg.UsageTokenExportMaxRows != 500000 {
+		t.Errorf("UsageTokenExportMaxRows default: got %d, want 500000", cfg.UsageTokenExportMaxRows)
+	}
+
+	t.Setenv("USAGE_TOKEN_BUCKET_SIZE", "day")
+	t.Setenv("USAGE_TOKEN_RETENTION_DAYS", "90")
+	t.Setenv("USAGE_TOKEN_EXPORT_MAX_ROWS", "1000")
+	cfg = Load()
+	if cfg.UsageTokenBucketSize != "day" || cfg.UsageTokenRetentionDays != 90 || cfg.UsageTokenExportMaxRows != 1000 {
+		t.Errorf("override: got %q/%d/%d", cfg.UsageTokenBucketSize, cfg.UsageTokenRetentionDays, cfg.UsageTokenExportMaxRows)
+	}
+}
+
+// TestValidate_UsageTokenConfig pins the Validate() side: bad enum values and
+// non-positive retention are rejected at boot.
+func TestValidate_UsageTokenConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("bad bucket size rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := validRealWeChatConfig()
+		cfg.UsageTokenBucketSize = "minute"
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "USAGE_TOKEN_BUCKET_SIZE") {
+			t.Errorf("want USAGE_TOKEN_BUCKET_SIZE rejection, got %v", err)
+		}
+	})
+	t.Run("day accepted", func(t *testing.T) {
+		t.Parallel()
+		cfg := validRealWeChatConfig()
+		cfg.UsageTokenBucketSize = "day"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("day must validate, got %v", err)
+		}
+	})
+	t.Run("non-positive retention rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := validRealWeChatConfig()
+		cfg.UsageTokenRetentionDays = 0
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "USAGE_TOKEN_RETENTION_DAYS") {
+			t.Errorf("want USAGE_TOKEN_RETENTION_DAYS rejection, got %v", err)
+		}
+	})
+	t.Run("non-positive export cap rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := validRealWeChatConfig()
+		cfg.UsageTokenExportMaxRows = 0
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "USAGE_TOKEN_EXPORT_MAX_ROWS") {
+			t.Errorf("want USAGE_TOKEN_EXPORT_MAX_ROWS rejection, got %v", err)
+		}
+	})
 }

@@ -21,6 +21,17 @@ test:
 ci-test:
 	go test -race -coverprofile=coverage.out -p 1 ./internal/... ./cmd/...
 
+# ci-e2e mirrors the go-e2e GitHub Actions job. Migrations must already be
+# applied to $DATABASE_URL (make migrate) — the e2e setups wipe and re-seed
+# tables but never create them.
+ci-e2e:
+	go test -race -count=1 ./tests/e2e/...
+
+# ci-local is the local pre-push acceptance gate: both CI jobs (go-ci +
+# go-e2e). Added after PR #61 review B1 — ci-test alone never compiled the
+# e2e package, so a broken tests/e2e build/config literal slipped to CI red.
+ci-local: ci-test ci-e2e
+
 e2e:
 	go test -race -count=1 -v ./tests/e2e/
 

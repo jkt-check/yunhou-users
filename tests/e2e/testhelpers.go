@@ -276,18 +276,21 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                   "0",
-		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:             privPath,
-		RSAPublic:              pubPath,
-		GitHubClientID:         "e2e-fake-client-id",
-		GitHubClientSecret:     "e2e-fake-client-secret",
-		JWTAccessTTL:           15 * time.Minute,
-		JWTRefreshTTL:          168 * time.Hour,
-		OrderExpiryDuration:    30 * time.Minute,
-		SweeperInterval:        1 * time.Minute,
-		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		InferenceRecoveryGrace: 15 * time.Minute,
+		Port:                    "0",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		GitHubClientID:          "e2e-fake-client-id",
+		GitHubClientSecret:      "e2e-fake-client-secret",
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         1 * time.Minute,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace:  15 * time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
 		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
 		// wechat mocks, which config.Validate refuses under a production
 		// APP_ENV (default "prod").
@@ -387,18 +390,21 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                   "0",
-		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:             privPath,
-		RSAPublic:              pubPath,
-		GitHubClientID:         "Iv1.e2e_test_client_id",
-		GitHubClientSecret:     "e2e_test_client_secret_padded",
-		JWTAccessTTL:           15 * time.Minute,
-		JWTRefreshTTL:          168 * time.Hour,
-		OrderExpiryDuration:    30 * time.Minute,
-		SweeperInterval:        1 * time.Minute,
-		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		InferenceRecoveryGrace: 15 * time.Minute,
+		Port:                    "0",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		GitHubClientID:          "Iv1.e2e_test_client_id",
+		GitHubClientSecret:      "e2e_test_client_secret_padded",
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         1 * time.Minute,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace:  15 * time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
 		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
 		// wechat mocks, which config.Validate refuses under a production
 		// APP_ENV (default "prod").
@@ -623,18 +629,21 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                   "0",
-		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:             privPath,
-		RSAPublic:              pubPath,
-		GitHubClientID:         "e2e-fake-client-id",
-		GitHubClientSecret:     "e2e-fake-fake-client-secret",
-		JWTAccessTTL:           15 * time.Minute,
-		JWTRefreshTTL:          168 * time.Hour,
-		OrderExpiryDuration:    30 * time.Minute,
-		SweeperInterval:        1 * time.Minute,
-		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		InferenceRecoveryGrace: 15 * time.Minute,
+		Port:                    "0",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		GitHubClientID:          "e2e-fake-client-id",
+		GitHubClientSecret:      "e2e-fake-fake-client-secret",
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         1 * time.Minute,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace:  15 * time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
 		// Non-production signal: the e2e suite arms PAYPAL_L3_E2E_MODE /
 		// wechat mocks, which config.Validate refuses under a production
 		// APP_ENV (default "prod").

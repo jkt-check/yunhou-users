@@ -51,18 +51,21 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                "0",
-		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:          privPath,
-		RSAPublic:           pubPath,
-		GitHubClientID:      "e2e-fake-client-id",
-		GitHubClientSecret:  "e2e-fake-fake-client-secret",
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     1 * time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		AppEnv:              "e2e",
+		Port:                    "0",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		GitHubClientID:          "e2e-fake-client-id",
+		GitHubClientSecret:      "e2e-fake-fake-client-secret",
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         1 * time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		AppEnv:                  "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)

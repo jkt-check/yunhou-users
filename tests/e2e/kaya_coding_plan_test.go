@@ -80,18 +80,21 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                   "0",
-		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:             privPath,
-		RSAPublic:              pubPath,
-		JWTAccessTTL:           15 * time.Minute,
-		JWTRefreshTTL:          168 * time.Hour,
-		OrderExpiryDuration:    30 * time.Minute,
-		SweeperInterval:        time.Minute,
-		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		InferenceRecoveryGrace: 15 * time.Minute,
-		InferenceAccountRPM:    120,
-		AppEnv:                 "e2e",
+		Port:                    "0",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         time.Minute,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace:  15 * time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
+		InferenceAccountRPM:     120,
+		AppEnv:                  "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)

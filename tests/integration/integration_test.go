@@ -154,12 +154,15 @@ func setupServer(db *sqlx.DB) *httptest.Server {
 		panic(fmt.Sprintf("set PAYPAL_L3_E2E_MODE: %v", err))
 	}
 	cfg := &config.Config{
-		Port:             "8080",
-		JWTAccessTTL:     15 * time.Minute,
-		JWTRefreshTTL:    168 * time.Hour,
-		RSAPrivate:       testKeyPriv,
-		RSAPublic:        testKeyPub,
-		OAuthStateSecret: "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		Port:                    "8080",
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		RSAPrivate:              testKeyPriv,
+		RSAPublic:               testKeyPub,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
 		// Non-production signal: PAYPAL_L3_E2E_MODE is set below, and the
 		// mock/backdoor switches refuse to arm under a production APP_ENV.
 		AppEnv: "e2e",
@@ -702,14 +705,17 @@ func setupFullServer(t *testing.T, db *sqlx.DB) *httptest.Server {
 	}
 
 	cfg := &config.Config{
-		Port:                "8080",
-		DatabaseURL:         dbURL(),
-		RSAPrivate:          testKeyPriv,
-		RSAPublic:           testKeyPub,
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		Port:                    "8080",
+		DatabaseURL:             dbURL(),
+		RSAPrivate:              testKeyPriv,
+		RSAPublic:               testKeyPub,
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
 		// Non-production signal: wechatPayMock + PAYPAL_L3_E2E_MODE are
 		// armed below; the mock/backdoor switches refuse to arm under a
 		// production APP_ENV.

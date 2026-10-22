@@ -191,15 +191,18 @@ func chatE2EBase(t *testing.T) (*sqlx.DB, *service.TokenService, *service.AuthSe
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:          privPath,
-		RSAPublic:           pubPath,
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		AppEnv:              "e2e",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		AppEnv:                  "e2e",
 	}
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)

@@ -1238,7 +1238,7 @@ func caseChatContractErrorMatrix(t *testing.T, env *chatContractEnv) {
 			token:      "",
 			body:       map[string]any{"messages": []map[string]any{{"role": "user", "content": "hi"}}},
 			wantStatus: http.StatusUnauthorized,
-			wantBody:   `{"code":401,"message":"missing or invalid authorization header"}`,
+			wantBody:   `{"code":401,"error":"unauthorized","message":"missing or invalid authorization header"}`,
 		},
 		{
 			name:       "bad_token",
@@ -1246,7 +1246,7 @@ func caseChatContractErrorMatrix(t *testing.T, env *chatContractEnv) {
 			badToken:   true,
 			body:       map[string]any{"messages": []map[string]any{{"role": "user", "content": "hi"}}},
 			wantStatus: http.StatusUnauthorized,
-			wantBody:   `{"code":401,"message":"invalid or expired token"}`,
+			wantBody:   `{"code":401,"error":"unauthorized","message":"invalid or expired token"}`,
 		},
 		{
 			name:       "no_access",

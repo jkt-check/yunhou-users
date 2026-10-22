@@ -534,6 +534,46 @@ func TestUsageTokenDelete(t *testing.T) {
 			t.Errorf("code = %q", usageTokenErrCode(t, err))
 		}
 	})
+
+	// 未来窗口防护（PR #61 复审）：整体在未来的窗口拒绝（否则会留下拦截
+	// 未来摄入的墓碑）；部分覆盖未来的窗口把 to_bucket 钳到当前桶起点。
+	t.Run("future window rejected", func(t *testing.T) {
+		called := false
+		r := &mockUsageTokenRepo{
+			deleteWindowFn: func(_ context.Context, _ string, _ *string, _, _ time.Time) (int64, error) {
+				called = true
+				return 0, nil
+			},
+		}
+		_, err := newUsageTokenSvc(r).Delete(context.Background(), "u1", "", "2099-01-01", "2099-01-02")
+		if usageTokenErrCode(t, err) != "invalid_request" {
+			t.Errorf("code = %q", usageTokenErrCode(t, err))
+		}
+		if called {
+			t.Error("deleteWindowFn must not be called for a fully-future window")
+		}
+	})
+
+	t.Run("partially future window clamps to current bucket", func(t *testing.T) {
+		var gotTo time.Time
+		r := &mockUsageTokenRepo{
+			deleteWindowFn: func(_ context.Context, _ string, _ *string, _, to time.Time) (int64, error) {
+				gotTo = to
+				return 1, nil
+			},
+		}
+		before := time.Now().UTC()
+		yesterday := before.AddDate(0, 0, -1).Format("2006-01-02")
+		dayAfterTomorrow := before.AddDate(0, 0, 2).Format("2006-01-02")
+		if _, err := newUsageTokenSvc(r).Delete(context.Background(), "u1", "", yesterday, dayAfterTomorrow); err != nil {
+			t.Fatal(err)
+		}
+		// to_bucket 被钳到当前小时桶起点（hour 部署）。
+		want := before.Truncate(time.Hour)
+		if !gotTo.Equal(want) {
+			t.Errorf("to_bucket = %s, want clamped to current hour %s", gotTo, want)
+		}
+	})
 }
 
 // TestUsageTokenRetentionSweeper 覆盖保留期 sweeper：cutoff = now -

@@ -383,6 +383,22 @@ func (s *UsageTokenService) Delete(ctx context.Context, userID, deviceID, fromSt
 	} else {
 		toBucket = time.Date(to.Year(), to.Month(), to.Day(), 23, 0, 0, 0, time.UTC)
 	}
+	// 未来窗口防护（PR #61 复审）：整体在未来的窗口没有现存桶可删，却会
+	// 留下一条拦截未来摄入的墓碑（要等保留期才被 sweeper 清掉）——直接
+	// 拒绝；部分覆盖未来的窗口把 to_bucket 钳到当前桶起点，未来部分本无
+	// 数据，钳制不改删除语义。
+	if fromBucket.After(now) {
+		return nil, usageTokenErr(400, "invalid_request", "from must not be in the future")
+	}
+	var curBucket time.Time
+	if s.bucketSize == model.UsageBucketSizeDay {
+		curBucket = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	} else {
+		curBucket = now.Truncate(time.Hour)
+	}
+	if toBucket.After(curBucket) {
+		toBucket = curBucket
+	}
 	var devPtr *string
 	if deviceID != "" {
 		devPtr = &deviceID

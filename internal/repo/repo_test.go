@@ -46,7 +46,7 @@ func setupDB(t *testing.T) *sqlx.DB {
 	// orders_plan_id_fkey (both ON DELETE RESTRICT) are also truncated
 	// via the CASCADE keyword.
 	if _, err := db.ExecContext(context.Background(),
-		`TRUNCATE plan_change_log, refunds, payments, webhook_events, audit_log, orders, sessions, subscriptions, social_identities, plans, apps, users RESTART IDENTITY CASCADE;`); err != nil {
+		`TRUNCATE plan_change_log, refunds, payments, webhook_events, audit_log, orders, sessions, subscriptions, social_identities, plans, apps, users, usage_token_buckets, usage_devices, usage_token_watermarks, usage_token_tombstones RESTART IDENTITY CASCADE;`); err != nil {
 		t.Fatalf("wipe tables: %v", err)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -96,8 +97,20 @@ func (s *UsageTokenRetentionSweeper) run(ctx context.Context) {
 			return
 		case <-t.C:
 			s.tick(runCtx)
+			// 多实例并发清理同一批行是幂等无害的,但同刻命中会行锁争抢;
+			// ±10% 抖动削峰(PR #61 review M2)。
+			t.Reset(usageTokenSweepJitter(s.interval))
 		}
 	}
+}
+
+// usageTokenSweepJitter 返回 ±10% 抖动后的间隔。
+func usageTokenSweepJitter(d time.Duration) time.Duration {
+	j := int64(d / 10)
+	if j <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int63n(2*j)) - time.Duration(j)
 }
 
 // usageTokenSweepTickTimeout 是单轮清理的超时（PR #61 review M7）：

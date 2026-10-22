@@ -152,8 +152,9 @@ func Setup(
 		//（RateLimitWithKey 在 JWTAuth 之后跑，ContextUserID 必已设置）：
 		// batch 2/s burst 20，backfill ~10/min burst 2，查询+设备读 1/s
 		// burst 30，export ~5/min burst 2（契约 §8 限流建议的每秒换算）。
-		// DELETE ~6/min burst 3（PR #61 review M6：窗口删除每次写墓碑，
-		// 不限流则墓碑无界增长）。nil = 整块不挂载（fail closed）。
+		// DELETE ~6/min burst 3、设备写 ~10/min burst 5（PR #61 review M6：
+		// 窗口删除每次写墓碑，不限流则墓碑无界增长）。nil = 整块不挂载
+		//（fail closed）。
 		if usageTokenSvc != nil {
 			usageTokenHandler := handler.NewUsageTokenHandler(usageTokenSvc)
 			userKey := func(c *gin.Context) string { return c.GetString(middleware.ContextUserID) }
@@ -162,6 +163,7 @@ func Setup(
 			tokenQueryLimiter := middleware.RateLimitWithKey(ctx, 1, 30, userKey)
 			tokenExportLimiter := middleware.RateLimitWithKey(ctx, 0.0834, 2, userKey)
 			tokenDeleteLimiter := middleware.RateLimitWithKey(ctx, 0.1, 3, userKey)
+			tokenDeviceWriteLimiter := middleware.RateLimitWithKey(ctx, 0.167, 5, userKey)
 
 			userGroup.POST("/usage/tokens/batch", tokenBatchLimiter, usageTokenHandler.PostBatch)
 			userGroup.POST("/usage/tokens/backfill", tokenBackfillLimiter, usageTokenHandler.PostBackfill)
@@ -171,10 +173,10 @@ func Setup(
 			userGroup.GET("/usage/tokens/coverage", tokenQueryLimiter, usageTokenHandler.GetCoverage)
 			userGroup.GET("/usage/tokens/export", tokenExportLimiter, usageTokenHandler.GetExport)
 			userGroup.DELETE("/usage/tokens", tokenDeleteLimiter, usageTokenHandler.DeleteTokens)
-			userGroup.POST("/devices", usageTokenHandler.PostDevice)
+			userGroup.POST("/devices", tokenDeviceWriteLimiter, usageTokenHandler.PostDevice)
 			userGroup.GET("/devices", tokenQueryLimiter, usageTokenHandler.ListDevices)
-			userGroup.PATCH("/devices/:id", usageTokenHandler.PatchDevice)
-			userGroup.DELETE("/devices/:id", usageTokenHandler.DeleteDevice)
+			userGroup.PATCH("/devices/:id", tokenDeviceWriteLimiter, usageTokenHandler.PatchDevice)
+			userGroup.DELETE("/devices/:id", tokenDeviceWriteLimiter, usageTokenHandler.DeleteDevice)
 		}
 
 		// Kaya Coding Plan Task 5: customer API-key self-management

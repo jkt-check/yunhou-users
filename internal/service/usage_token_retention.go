@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -53,46 +54,73 @@ func (s *UsageTokenRetentionSweeper) Start(ctx context.Context) {
 	})
 }
 
-// Stop 通知退出并等待当前一轮跑完；幂等。
+// Stop 通知退出并打断在跑的一轮（分批删除在批次间响应取消）；等待退出
+// 是有界的（M7：一轮最多 1 分钟 + 单批中断余量），兜底超时后不再阻塞
+// 停机流程。幂等。
 func (s *UsageTokenRetentionSweeper) Stop() {
 	s.once.Do(func() {
 		close(s.stop)
 	})
-	<-s.done
+	select {
+	case <-s.done:
+	case <-time.After(10 * time.Second):
+		log.Printf("usage token retention: stop wait timed out; sweep aborted in background")
+	}
 }
 
 func (s *UsageTokenRetentionSweeper) run(ctx context.Context) {
 	defer close(s.done)
+	// runCtx 把父 ctx 与 Stop 合并：Stop 打断在跑的一轮（M7——分批删除
+	// 后批次间取消是安全的，半截进度下轮续跑）。
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-s.stop:
+			cancel()
+		case <-runCtx.Done():
+		}
+	}()
+
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
 
 	// 启动即跑一轮：重启后不必等一个 interval 才清理积压。
-	s.tick(ctx)
+	s.tick(runCtx)
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return
 		case <-s.stop:
 			return
 		case <-t.C:
-			s.tick(ctx)
+			s.tick(runCtx)
 		}
 	}
 }
 
+// usageTokenSweepTickTimeout 是单轮清理的超时（PR #61 review M7）：
+// 5 分钟会卡住停机（Stop 等当前轮）；分批删除后 1 分钟足够，删不完下轮
+// 续跑（DELETE 幂等）。
+const usageTokenSweepTickTimeout = time.Minute
+
 // tick 执行一轮删除；错误只记日志不打断循环（瞬时 DB 错误下轮重试）。
 func (s *UsageTokenRetentionSweeper) tick(ctx context.Context) {
 	if _, _, err := s.sweep(ctx); err != nil {
+		// Stop/停机触发的取消不是故障，不打错误日志。
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return
+		}
 		log.Printf("usage token retention: tick failed: %v", err)
 	}
 }
 
 // sweep 是实际删除逻辑（SweepOnce 与 tick 共用）。
 func (s *UsageTokenRetentionSweeper) sweep(ctx context.Context) (buckets, tombstones int64, err error) {
-	// 用 background + 超时而非父 ctx：父 ctx 取消不应让半截删除停在中途
-	//（下轮会重跑，DELETE 幂等）。
-	tickCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 单轮 1 分钟上限（M7）；父 ctx 取消（Stop/停机）在批次间中断，删除
+	// 按批原子，半截进度下轮重跑，幂等无害。
+	tickCtx, cancel := context.WithTimeout(ctx, usageTokenSweepTickTimeout)
 	defer cancel()
 	cutoff := time.Now().Add(-time.Duration(s.retentionDays) * 24 * time.Hour)
 	buckets, tombstones, err = s.repo.SweepRetention(tickCtx, cutoff)

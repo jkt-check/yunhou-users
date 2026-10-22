@@ -797,18 +797,41 @@ func (r *usageTokenRepo) RevokeDevice(ctx context.Context, userID, deviceID stri
 // 保留期
 // ---------------------------------------------------------------------------
 
+// usageSweepBatchSize 是保留期清理的单批行数（PR #61 review M2）：单语句
+// DELETE 全量过期行会持锁过久，分批循环让每批成为独立短事务；批次间
+// ctx 取消即中断（下轮 tick 续跑，DELETE 幂等）。
+const usageSweepBatchSize = 10000
+
 func (r *usageTokenRepo) SweepRetention(ctx context.Context, cutoff time.Time) (int64, int64, error) {
-	res, err := r.db.ExecContext(ctx,
-		`DELETE FROM usage_token_buckets WHERE bucket_start < $1`, cutoff)
+	// buckets 表单行无代理主键，按 ctid 分批；tombstones 有 BIGSERIAL id。
+	buckets, err := r.sweepBatched(ctx,
+		`DELETE FROM usage_token_buckets WHERE ctid IN (
+			SELECT ctid FROM usage_token_buckets WHERE bucket_start < $1 LIMIT $2)`, cutoff)
 	if err != nil {
 		return 0, 0, err
 	}
-	buckets, _ := res.RowsAffected()
-	res, err = r.db.ExecContext(ctx,
-		`DELETE FROM usage_token_tombstones WHERE to_bucket < $1`, cutoff)
+	tombstones, err := r.sweepBatched(ctx,
+		`DELETE FROM usage_token_tombstones WHERE id IN (
+			SELECT id FROM usage_token_tombstones WHERE to_bucket < $1 LIMIT $2)`, cutoff)
 	if err != nil {
 		return buckets, 0, err
 	}
-	tombstones, _ := res.RowsAffected()
 	return buckets, tombstones, nil
+}
+
+// sweepBatched 循环执行带 LIMIT 子查询的 DELETE，直到删净；where 子句走
+// 048 的 sweep 索引（bucket_start / to_bucket）。
+func (r *usageTokenRepo) sweepBatched(ctx context.Context, query string, cutoff time.Time) (int64, error) {
+	var total int64
+	for {
+		res, err := r.db.ExecContext(ctx, query, cutoff, usageSweepBatchSize)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n < usageSweepBatchSize {
+			return total, nil
+		}
+	}
 }

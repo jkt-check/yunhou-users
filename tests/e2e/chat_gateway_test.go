@@ -227,7 +227,7 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 		service.NewPlanService(repo.NewPlanRepo(db), repo.NewAppRepo(db), repo.NewPlanChangeLogRepo(db)), nil,
 		&middleware.MultiChannelVerifier{}, nil,
 		nil, nil, chatSvc, chatAccessLog, nil, nil, false, false, "e2e",
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil,
+		service.NewUsageService(repo.NewUsageRepo(db)), service.NewUsageTokenService(repo.NewUsageTokenRepo(db), "hour", 180, 500000), nil, nil, accessOps, nil, nil, nil, nil,
 		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 }
 

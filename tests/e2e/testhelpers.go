@@ -358,7 +358,7 @@ func setupE2EServer(t *testing.T) (*gin.Engine, *httptest.Server, *sqlx.DB) {
 		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), service.NewUsageTokenService(repo.NewUsageTokenRepo(db), "hour", 180, 500000), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
 		cfg.DashboardAppIDs)
 
 	return engine, nil, db
@@ -456,7 +456,7 @@ func setupE2EServerWithGH(t *testing.T) (*E2EServer, *sqlx.DB) {
 		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, &middleware.MultiChannelVerifier{}, nil,
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, false, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), service.NewUsageTokenService(repo.NewUsageTokenRepo(db), "hour", 180, 500000), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
 		cfg.DashboardAppIDs)
 
 	return &E2EServer{
@@ -741,7 +741,7 @@ func setupE2EServerWithVerifierOpts(t *testing.T, wechatPayMock bool) *E2EServer
 		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, false, wechatPayMock, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), service.NewUsageTokenService(repo.NewUsageTokenRepo(db), "hour", 180, 500000), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, service.NewAdminOpsService(repo.NewAdminUsersRepo(db)), service.NewAdminUsersService(repo.NewAdminUsersRepo(db)),
 		cfg.DashboardAppIDs)
 
 	alipayPrivHolder.Store(alipayPriv)

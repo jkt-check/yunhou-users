@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -167,13 +168,20 @@ func (h *UsageTokenHandler) ingest(c *gin.Context, isBackfill bool) {
 	//    invalid_request。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, model.UsageTokenMaxBatchBody)
 	var req usageTokenBatchRaw
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(c.Request.Body)
+	if err := dec.Decode(&req); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeUsageTokenError(c, http.StatusBadRequest, "payload_too_large", "request body exceeds 256 KiB", nil)
 			return
 		}
 		writeUsageTokenError(c, http.StatusBadRequest, "invalid_request", "request body is not valid JSON", nil)
+		return
+	}
+	// 拒绝尾随垃圾：合法 JSON 之后还有内容即整个请求不合法
+	//（invalid_request），不能静默截着用。
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeUsageTokenError(c, http.StatusBadRequest, "invalid_request", "request body has trailing data after the JSON document", nil)
 		return
 	}
 

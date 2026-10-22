@@ -473,7 +473,7 @@ func TestUsageTokenDelete(t *testing.T) {
 			},
 		}
 		_, err := newUsageTokenSvc(r).Delete(context.Background(), "u1", "d_missing", "", "")
-		if !IsUsageDeviceNotFound(err) {
+		if !errors.Is(err, model.ErrUsageDeviceNotFound) {
 			t.Errorf("err = %v, want ErrUsageDeviceNotFound", err)
 		}
 	})

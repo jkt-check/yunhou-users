@@ -13,6 +13,7 @@ package service_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -803,30 +804,25 @@ func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
 			PromptTokens: 1, CompletionTokens: 0, TotalTokens: 1, Requests: 1,
 		}
 	}
-	countRows := func() int {
-		t.Helper()
-		var n int
-		if err := db.GetContext(ctx, &n,
-			`SELECT COUNT(*) FROM usage_token_buckets WHERE user_id = $1 AND bucket_start = $2`,
-			user, bucketStart); err != nil {
-			t.Fatalf("count: %v", err)
-		}
-		return n
-	}
 
 	const rounds = 30
 	for i := 0; i < rounds; i++ {
+		// 每轮换一个新 bucket_start：上一轮的墓碑已覆盖旧桶，不换则摄入
+		// 恒被墓碑丢弃，测不到竞态。
+		bs := day.Add(time.Duration(i+1) * time.Hour)
 		var wg sync.WaitGroup
 		var delErr, ingErr error
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, delErr = r.DeleteWindow(ctx, user, nil, bucketStart, bucketStart)
+			_, delErr = r.DeleteWindow(ctx, user, nil, bs, bs)
 		}()
 		go func() {
 			defer wg.Done()
+			b := newBucket()
+			b.BucketStart = bs
 			_, ingErr = r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
-				DeviceID: "d_concurrencym4", Buckets: []model.UsageTokenBucket{newBucket()},
+				DeviceID: "d_concurrencym4", Buckets: []model.UsageTokenBucket{b},
 			})
 		}()
 		wg.Wait()
@@ -836,15 +832,21 @@ func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
 		if ingErr != nil {
 			t.Fatalf("round %d: IngestBuckets: %v", i, ingErr)
 		}
-		if n := countRows(); n != 0 {
+		var n int
+		if err := db.GetContext(ctx, &n,
+			`SELECT COUNT(*) FROM usage_token_buckets WHERE user_id = $1 AND bucket_start = $2`,
+			user, bs); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if n != 0 {
 			t.Fatalf("round %d: deleted bucket resurrected (%d rows)", i, n)
 		}
 	}
 
-	// DeleteAll（用户级水位）与摄入并发：同一断言。换一个新的
-	// bucket_start——循环一的墓碑已覆盖旧桶，不换的话本轮摄入恒被墓碑
-	// 丢弃，水位路径就测不到。
-	bucketStart2 := day.Add(2 * time.Hour)
+	// DeleteAll（用户级水位）与摄入并发：同一断言。bucket_start 必须避开
+	// 循环一的墓碑覆盖范围（day+1h..day+30h），否则摄入恒被墓碑丢弃，
+	// 水位路径测不到。
+	bucketStart2 := day.Add(48 * time.Hour)
 	clearedBefore := service.CeilToBucket(time.Now().UTC(), "hour")
 	for i := 0; i < rounds; i++ {
 		var wg sync.WaitGroup
@@ -877,6 +879,49 @@ func TestUsageTokenIntegration_ConcurrentIngestVsDelete(t *testing.T) {
 		}
 		if n != 0 {
 			t.Fatalf("round %d: bucket resurrected after DeleteAll (%d rows)", i, n)
+		}
+	}
+
+	// RevokeDevice(purge=true) 与摄入并发：purge 是唯一"在摄入 revoked
+	// 检查之后才删桶"的路径。每轮换新设备（撤销是终态）；设备行先登记，
+	// 否则 revoke 先跑会 ErrUsageDeviceNotFound。终态：桶行数恒 0——
+	// 摄入先（purge 随后删掉）或撤销先（摄入被 ErrUsageDeviceRevoked 拒）。
+	for i := 0; i < rounds; i++ {
+		dev := fmt.Sprintf("d_purgerace%02d", i)
+		bs := day.Add(time.Duration(72+i) * time.Hour) // 避开上面的墓碑/水位
+		if _, err := r.UpsertDevice(ctx, user, model.UsageDeviceRegisterInput{DeviceID: dev}); err != nil {
+			t.Fatalf("round %d: register device: %v", i, err)
+		}
+		var wg sync.WaitGroup
+		var revErr, ingErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			revErr = r.RevokeDevice(ctx, user, dev, true)
+		}()
+		go func() {
+			defer wg.Done()
+			b := newBucket()
+			b.BucketStart = bs
+			_, ingErr = r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
+				DeviceID: dev, Buckets: []model.UsageTokenBucket{b},
+			})
+		}()
+		wg.Wait()
+		if revErr != nil {
+			t.Fatalf("round %d: RevokeDevice: %v", i, revErr)
+		}
+		if ingErr != nil && !errors.Is(ingErr, model.ErrUsageDeviceRevoked) {
+			t.Fatalf("round %d: IngestBuckets: %v", i, ingErr)
+		}
+		var n int
+		if err := db.GetContext(ctx, &n,
+			`SELECT COUNT(*) FROM usage_token_buckets WHERE user_id = $1 AND bucket_start = $2`,
+			user, bs); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("round %d: bucket resurrected after revoke+purge (%d rows)", i, n)
 		}
 	}
 }
@@ -943,5 +988,90 @@ func TestUsageTokenIntegration_TombstoneMerge(t *testing.T) {
 	}
 	if res.Accepted != 0 || len(res.Discarded) != 1 {
 		t.Errorf("accepted=%d discarded=%d, want 0/1", res.Accepted, len(res.Discarded))
+	}
+
+	// 设备维度隔离：设备级墓碑只拦该设备；与全设备（NULL）墓碑不互并。
+	devA, devB := "d_deviceisoa01", "d_deviceisob01"
+	if _, err := r.DeleteWindow(ctx, user, &devA, h(20), h(21)); err != nil {
+		t.Fatal(err)
+	}
+	mkAt := func(start time.Time) model.UsageTokenBucket {
+		return model.UsageTokenBucket{
+			BucketStart: start, BucketSize: "hour", Source: "chat",
+			AgentKey: "chat", ProviderKey: "builtin", ModelKey: "default",
+			PromptTokens: 1, TotalTokens: 1, Requests: 1,
+		}
+	}
+	resA, err := r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
+		DeviceID: devA, Buckets: []model.UsageTokenBucket{mkAt(h(20))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resA.Accepted != 0 || len(resA.Discarded) != 1 {
+		t.Errorf("device A: accepted=%d discarded=%d, want 0/1", resA.Accepted, len(resA.Discarded))
+	}
+	resB, err := r.IngestBuckets(ctx, user, model.UsageTokenIngestInput{
+		DeviceID: devB, Buckets: []model.UsageTokenBucket{mkAt(h(20))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resB.Accepted != 1 {
+		t.Errorf("device B: accepted=%d, want 1 (设备级墓碑不得误伤其它设备)", resB.Accepted)
+	}
+	// 同范围的全设备墓碑与 devA 的设备级墓碑不互并（不同设备域）。
+	if _, err := r.DeleteWindow(ctx, user, nil, h(20), h(21)); err != nil {
+		t.Fatal(err)
+	}
+	var nullCount, devACount int
+	if err := db.GetContext(ctx, &nullCount,
+		`SELECT COUNT(*) FROM usage_token_tombstones WHERE user_id = $1 AND device_id IS NULL`, user); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetContext(ctx, &devACount,
+		`SELECT COUNT(*) FROM usage_token_tombstones WHERE user_id = $1 AND device_id = $2`, user, devA); err != nil {
+		t.Fatal(err)
+	}
+	if nullCount != 3 || devACount != 1 {
+		t.Errorf("null/devA tombstones = %d/%d, want 3/1（设备域不互并）", nullCount, devACount)
+	}
+}
+
+// TestUsageTokenIntegration_MixedBucketSizeNotDoubleCounted（契约 §6 MUST-2 /
+// §10.7）：hour 部署下库内混存 day 桶（如配置变更前的遗留）时，所有读查询
+// 只统计当前 bucket_size 的桶，不双计。
+func TestUsageTokenIntegration_MixedBucketSizeNotDoubleCounted(t *testing.T) {
+	db := usageTokenTestDB(t)
+	e := usageTokenTestEngine(t, db, "hour", 180, 500000)
+	user := usageTokenUser(t, db)
+	day := usageTokenFixtureDay()
+	dev := "d_mixbucketsize"
+
+	// 正常上传一个 hour 桶（total 15）。
+	w := usageTokenReq(t, e, http.MethodPost, "/user/usage/tokens/batch", user,
+		usageTokenBatchBody(dev, usageTokenBucketJSON(day.Add(time.Hour), "chat", "chat", "builtin", "default", 10, 5, 15, 1)))
+	decodeOK(t, w)
+
+	// 直接 SQL 种一条同窗口的 day 桶（摄入侧 MUST-1 会拒绝这种上传，只能
+	// 经库内遗留进入）。
+	if _, err := db.Exec(`INSERT INTO usage_token_buckets
+		(user_id, device_id, bucket_start, bucket_size, source, agent_key, provider_key, model_key, prompt_tokens, completion_tokens, total_tokens, requests)
+		VALUES ($1, $2, $3, 'day', 'chat', 'chat', 'builtin', 'default', 100, 100, 200, 9)`,
+		user, dev, day); err != nil {
+		t.Fatalf("seed day bucket: %v", err)
+	}
+
+	// summary 只计 hour 桶。
+	if got := summaryTotal(t, e, user); got != 15 {
+		t.Errorf("summary total = %v, want 15（day 桶不得计入）", got)
+	}
+	// export 同理：只返回 hour 桶一行。
+	w = usageTokenReq(t, e, http.MethodGet, "/user/usage/tokens/export", user, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("export: got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Result-Returned"); got != "1" {
+		t.Errorf("X-Result-Returned = %q, want 1（day 桶不得出现在导出）", got)
 	}
 }

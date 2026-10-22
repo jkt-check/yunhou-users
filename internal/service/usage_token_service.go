@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -44,16 +43,21 @@ func (s *UsageTokenService) ExportMaxRows() int { return s.exportMaxRows }
 // Ingest 落库一批已校验桶。设备撤销 / 水位墓碑丢弃在 repo 的单事务里完成；
 // ErrUsageDeviceRevoked 原样透传给 handler 映射 403。
 func (s *UsageTokenService) Ingest(ctx context.Context, userID string, in model.UsageTokenIngestInput) (*model.UsageIngestResult, error) {
+	// batch_id 是客户端建议的追踪 id（契约 §3.2「用于日志追踪」）——失败
+	// 与丢弃两条路径都必须带上它，否则该字段从未落地。它来自请求体：限长
+	// + %q，防日志注入（换行伪造日志行）。
+	batch := in.BatchID
+	if len(batch) > 64 {
+		batch = batch[:64] + "…"
+	}
 	result, err := s.repo.IngestBuckets(ctx, userID, in)
 	if err != nil {
-		// batch_id 是客户端建议的追踪 id（契约 §3.2「用于日志追踪」）——
-		// 失败与丢弃两条路径都必须带上它，否则该字段从未落地。
-		log.Printf("usage tokens: ingest failed: user=%s device=%s batch=%s: %v", userID, in.DeviceID, in.BatchID, err)
+		log.Printf("usage tokens: ingest failed: user=%s device=%s batch=%q: %v", userID, in.DeviceID, batch, err)
 		return nil, err
 	}
 	if len(result.Discarded) > 0 {
-		log.Printf("usage tokens: ingest discarded %d bucket(s) by watermark/tombstone: user=%s device=%s batch=%s",
-			len(result.Discarded), userID, in.DeviceID, in.BatchID)
+		log.Printf("usage tokens: ingest discarded %d bucket(s) by watermark/tombstone: user=%s device=%s batch=%q",
+			len(result.Discarded), userID, in.DeviceID, batch)
 	}
 	return result, nil
 }
@@ -72,6 +76,12 @@ const usageTokenDateLayout = "2006-01-02"
 // 得到半开区间上界。
 func ParseUsageTokenWindow(fromStr, toStr string, now time.Time) (time.Time, time.Time, error) {
 	today := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	return parseUsageTokenWindowAt(fromStr, toStr, today)
+}
+
+// parseUsageTokenWindowAt 以给定的"今天"（UTC 日期标签）解析窗口；
+// timeseries 在带 tz 时用 tz 本地日期锚定，其余路径用 UTC 日期。
+func parseUsageTokenWindowAt(fromStr, toStr string, today time.Time) (time.Time, time.Time, error) {
 	var from, to time.Time
 	var err error
 	if toStr == "" {
@@ -219,8 +229,12 @@ func (s *UsageTokenService) Timeseries(ctx context.Context, userID, interval, gr
 	if err := validateUsageTokenSourceFilter(&f); err != nil {
 		return nil, err
 	}
-	// 窗口长度按日历日校验（与 tz 无关），边界再按 tz 换算。
-	from, to, err := ParseUsageTokenWindow(fromStr, toStr, time.Now())
+	// 窗口长度按日历日校验（与 tz 无关），边界再按 tz 换算。缺省窗口的
+	//"今天"按用户时区锚定（PR #61 复审）：UTC 还是前一天而 tz 本地已
+	// 凌晨时，UTC 锚定会让默认视图静默少当天。
+	nowLoc := time.Now().In(loc)
+	today := time.Date(nowLoc.Year(), nowLoc.Month(), nowLoc.Day(), 0, 0, 0, 0, time.UTC)
+	from, to, err := parseUsageTokenWindowAt(fromStr, toStr, today)
 	if err != nil {
 		return nil, err
 	}
@@ -488,6 +502,3 @@ func utcTimePtr(t *time.Time) *time.Time {
 	u := t.UTC()
 	return &u
 }
-
-// IsUsageDeviceNotFound 是 handler 的错误映射辅助。
-func IsUsageDeviceNotFound(err error) bool { return errors.Is(err, model.ErrUsageDeviceNotFound) }

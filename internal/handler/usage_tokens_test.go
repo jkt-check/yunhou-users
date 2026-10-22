@@ -285,6 +285,7 @@ func TestUsageTokenBatch_ValidationOrder(t *testing.T) {
 	}{
 		{"payload too large", bigBody, "payload_too_large", nil},
 		{"malformed json", `{"schema_version":`, "invalid_request", nil},
+		{"trailing garbage after json", `{"schema_version":1,"device_id":"d_7f3a9c2e5b104d8e","buckets":[]} garbage`, "invalid_request", nil},
 		{"missing schema_version", `{"device_id":"d_7f3a9c2e5b104d8e","buckets":[` + validBucketJSON(1) + `]}`, "invalid_request", nil},
 		{"schema_version 2 beats bad device_id", `{"schema_version":2,"device_id":"nope","buckets":[]}`, "unsupported_schema_version", nil},
 		{"schema_version string", `{"schema_version":"1","device_id":"d_7f3a9c2e5b104d8e","buckets":[]}`, "invalid_request", nil},

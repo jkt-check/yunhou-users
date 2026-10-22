@@ -81,7 +81,8 @@ type UsageTokenRepo interface {
 	// ErrUsageDeviceNotFound。
 	UpdateDeviceLabel(ctx context.Context, userID, deviceID string, label *string) error
 	// RevokeDevice 置 revoked_at=now()；purge 时同事务删除该设备全部桶；
-	// 不存在 → ErrUsageDeviceNotFound。重复撤销幂等（revoked_at 不变）。
+	// 不存在 → ErrUsageDeviceNotFound。重复撤销对外语义不变（revoked_at
+	// 会被 now() 覆盖刷新，但对外只暴露 revoked 布尔）。
 	RevokeDevice(ctx context.Context, userID, deviceID string, purge bool) error
 
 	// SweepRetention 删除 bucket_start 早于 cutoff 的桶与 to_bucket 早于
@@ -118,6 +119,11 @@ func usageTokenAdvisoryLock(ctx context.Context, tx *sqlx.Tx, userID string) err
 }
 
 func (r *usageTokenRepo) IngestBuckets(ctx context.Context, userID string, in model.UsageTokenIngestInput) (*model.UsageIngestResult, error) {
+	// 前置条件由 handler 保证（1–500 条），repo 层兜底防空调用取下标。
+	if len(in.Buckets) == 0 {
+		return &model.UsageIngestResult{Discarded: []model.UsageDiscardedBucket{}}, nil
+	}
+
 	tx, err := r.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, err

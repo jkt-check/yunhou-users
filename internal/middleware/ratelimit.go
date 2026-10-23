@@ -132,8 +132,11 @@ func RateLimitWithKey(ctx context.Context, r float64, burst int, key func(*gin.C
 		}
 		if !limiter.allow(k) {
 			c.Header("Retry-After", retryAfterSeconds(limiter, k))
+			// error 符号名对齐 usage-stats.md §8（rate_limited）；附加字段，
+			// 不改变既有 code/message 形状。
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"code":    429,
+				"error":   "rate_limited",
 				"message": "too many requests",
 			})
 			return

@@ -191,15 +191,18 @@ func chatE2EBase(t *testing.T) (*sqlx.DB, *service.TokenService, *service.AuthSe
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:          privPath,
-		RSAPublic:           pubPath,
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		AppEnv:              "e2e",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		AppEnv:                  "e2e",
 	}
 	userRepo := repo.NewUserRepo(db)
 	identityRepo := repo.NewSocialIdentityRepo(db)
@@ -227,7 +230,7 @@ func chatRouterSetup(ctx context.Context, engine *gin.Engine, db *sqlx.DB,
 		service.NewPlanService(repo.NewPlanRepo(db), repo.NewAppRepo(db), repo.NewPlanChangeLogRepo(db)), nil,
 		&middleware.MultiChannelVerifier{}, nil,
 		nil, nil, chatSvc, chatAccessLog, nil, nil, false, false, "e2e",
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil,
+		service.NewUsageService(repo.NewUsageRepo(db)), service.NewUsageTokenService(repo.NewUsageTokenRepo(db), "hour", 180, 500000), nil, nil, accessOps, nil, nil, nil, nil,
 		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 }
 
@@ -1235,7 +1238,7 @@ func caseChatContractErrorMatrix(t *testing.T, env *chatContractEnv) {
 			token:      "",
 			body:       map[string]any{"messages": []map[string]any{{"role": "user", "content": "hi"}}},
 			wantStatus: http.StatusUnauthorized,
-			wantBody:   `{"code":401,"message":"missing or invalid authorization header"}`,
+			wantBody:   `{"code":401,"error":"unauthorized","message":"missing or invalid authorization header"}`,
 		},
 		{
 			name:       "bad_token",
@@ -1243,7 +1246,7 @@ func caseChatContractErrorMatrix(t *testing.T, env *chatContractEnv) {
 			badToken:   true,
 			body:       map[string]any{"messages": []map[string]any{{"role": "user", "content": "hi"}}},
 			wantStatus: http.StatusUnauthorized,
-			wantBody:   `{"code":401,"message":"invalid or expired token"}`,
+			wantBody:   `{"code":401,"error":"unauthorized","message":"invalid or expired token"}`,
 		},
 		{
 			name:       "no_access",

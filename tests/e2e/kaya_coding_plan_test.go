@@ -80,18 +80,21 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                   "0",
-		DatabaseURL:            envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:             privPath,
-		RSAPublic:              pubPath,
-		JWTAccessTTL:           15 * time.Minute,
-		JWTRefreshTTL:          168 * time.Hour,
-		OrderExpiryDuration:    30 * time.Minute,
-		SweeperInterval:        time.Minute,
-		OAuthStateSecret:       "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		InferenceRecoveryGrace: 15 * time.Minute,
-		InferenceAccountRPM:    120,
-		AppEnv:                 "e2e",
+		Port:                    "0",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         time.Minute,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		InferenceRecoveryGrace:  15 * time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
+		InferenceAccountRPM:     120,
+		AppEnv:                  "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -263,7 +266,7 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 		service.NewGitHubOAuthService(cfg.OAuthStateSecret),
 		service.NewWeChatOAuthService(cfg.OAuthStateSecret),
 		false, true, "e2e", /* wechatPayMock, appEnv */
-		service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, accessOps, nil, nil, nil, nil,
+		service.NewUsageService(repo.NewUsageRepo(db)), service.NewUsageTokenService(repo.NewUsageTokenRepo(db), "hour", 180, 500000), nil, nil, accessOps, nil, nil, nil, nil,
 		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 
 	// 在售商品 + 支付/权益配置（029 快照源）。

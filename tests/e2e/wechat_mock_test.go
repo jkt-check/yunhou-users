@@ -51,18 +51,21 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 	genRSAKeys(t, privPath, pubPath)
 
 	cfg := &config.Config{
-		Port:                "0",
-		DatabaseURL:         envOr("E2E_DATABASE_URL", defaultDBURL),
-		RSAPrivate:          privPath,
-		RSAPublic:           pubPath,
-		GitHubClientID:      "e2e-fake-client-id",
-		GitHubClientSecret:  "e2e-fake-fake-client-secret",
-		JWTAccessTTL:        15 * time.Minute,
-		JWTRefreshTTL:       168 * time.Hour,
-		OrderExpiryDuration: 30 * time.Minute,
-		SweeperInterval:     1 * time.Minute,
-		OAuthStateSecret:    "e2e-test-oauth-state-secret-padded-to-32-bytes",
-		AppEnv:              "e2e",
+		Port:                    "0",
+		DatabaseURL:             envOr("E2E_DATABASE_URL", defaultDBURL),
+		RSAPrivate:              privPath,
+		RSAPublic:               pubPath,
+		GitHubClientID:          "e2e-fake-client-id",
+		GitHubClientSecret:      "e2e-fake-fake-client-secret",
+		JWTAccessTTL:            15 * time.Minute,
+		JWTRefreshTTL:           168 * time.Hour,
+		OrderExpiryDuration:     30 * time.Minute,
+		SweeperInterval:         1 * time.Minute,
+		UsageTokenBucketSize:    "hour",
+		UsageTokenRetentionDays: 180,
+		UsageTokenExportMaxRows: 500000,
+		OAuthStateSecret:        "e2e-test-oauth-state-secret-padded-to-32-bytes",
+		AppEnv:                  "e2e",
 	}
 
 	userRepo := repo.NewUserRepo(db)
@@ -135,7 +138,7 @@ func setupE2EServerWithMockWeChat(t *testing.T) *E2EServer {
 		appRepo, repo.NewAuditLogRepo(db), userRepo, identityRepo, planRepo, subRepo, sessionRepo,
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, mv, []byte(e2eWeChatKey),
-		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil,
+		providerTokenSvc, quoteSvc, chatSvc, nil, githubOAuthSvc, wechatOAuthSvc, true, true, "e2e", service.NewUsageService(repo.NewUsageRepo(db)), service.NewUsageTokenService(repo.NewUsageTokenRepo(db), "hour", 180, 500000), nil, nil, nil, service.NewLLMUsageService(repo.NewLLMUsageRepo(db)), nil, nil, nil,
 		nil) // dashboardAppIDs — dashboard 运营面在本套件不触发
 
 	alipayPrivHolder.Store(alipayPriv)

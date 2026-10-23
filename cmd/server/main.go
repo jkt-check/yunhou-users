@@ -288,6 +288,13 @@ func main() {
 	usageRepo := repo.NewUsageRepo(db)
 	usageSvc := service.NewUsageService(usageRepo)
 
+	// kaya token 用量统计（usage-stats.md v1.2，migration 047）：客户端自报
+	// 聚合桶的摄入 + 用户自助查询。保留期 sweeper 日级清理过期桶与墓碑
+	//（USAGE_TOKEN_RETENTION_DAYS，默认 180 天）。
+	usageTokenRepo := repo.NewUsageTokenRepo(db)
+	usageTokenSvc := service.NewUsageTokenService(usageTokenRepo, cfg.UsageTokenBucketSize, cfg.UsageTokenRetentionDays, cfg.UsageTokenExportMaxRows)
+	usageTokenRetention := service.NewUsageTokenRetentionSweeper(usageTokenRepo, cfg.UsageTokenRetentionDays, 24*time.Hour)
+
 	// Dashboard 运营 admin API(dashboard-admin-api spec):运营指标 +
 	// 用户搜索/详情 + VIP 加时长(幂等键表见 migration 037)。
 	adminUsersRepo := repo.NewAdminUsersRepo(db)
@@ -547,7 +554,12 @@ func main() {
 	// /relay/ws is exempt too: it is a WebSocket long connection that must
 	// never sit under the 20s cap (its liveness bounds are the relay
 	// ping/idle timers in internal/relay).
-	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses", "/relay/ws"))
+	// /user/usage/tokens/export is exempt: a capped-but-large CSV (up to
+	// USAGE_TOKEN_EXPORT_MAX_ROWS rows) can legitimately outlive 20s; its
+	// bound is the per-response write deadline set in GetExport (same
+	// SetWriteDeadline pattern as /chat), without which the 20s ctx cancel
+	// + 25s WriteTimeout would silently truncate the file.
+	engine.Use(timeoutMiddleware(20*time.Second, "/chat", "/v1/chat/completions", "/v1/messages", "/v1/responses", "/relay/ws", "/user/usage/tokens/export"))
 
 	// Global request-body cap — defence in depth behind nginx's
 	// client_max_body_size. Any direct-to-Go exposure (alternate ingress,
@@ -575,6 +587,7 @@ func main() {
 	defer cancel()
 
 	sweeper.Start(rootCtx)
+	usageTokenRetention.Start(rootCtx)
 
 	// Analytics outbox: failed PostHog captures persist to analytics_outbox
 	// (same transaction-less path as the emitter itself) and a retry worker
@@ -654,7 +667,7 @@ func main() {
 		tokenSvc, authSvc, subSvc, planSvc,
 		paymentSvc, webhookVerifier, []byte(cfg.WeChatAPIv3Key),
 		providerTokenSvc, quoteSvc, chatSvc, chatAccessLog, githubOAuthSvc, wechatOAuthSvc,
-		cfg.WeChatOAuthMock, cfg.WeChatPayMock, cfg.AppEnv, usageSvc, adminModelsHandler, adminOps, accessOps,
+		cfg.WeChatOAuthMock, cfg.WeChatPayMock, cfg.AppEnv, usageSvc, usageTokenSvc, adminModelsHandler, adminOps, accessOps,
 		service.NewLLMUsageService(llmUsageRepo), relayHandler, adminOpsSvc, adminUsersSvc,
 		cfg.DashboardAppIDs)
 
@@ -686,6 +699,7 @@ func main() {
 	case <-rootCtx.Done():
 		log.Printf("shutdown signal received, draining...")
 		sweeper.Stop()
+		usageTokenRetention.Stop()
 		if relayHub != nil {
 			// 停机序列:停接新连(handler 层 503)→ 全部在线连接先收
 			// presence offline、再收 closed shutdown(conn 层 initiateClose

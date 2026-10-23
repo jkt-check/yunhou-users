@@ -170,6 +170,26 @@ type Config struct {
 	// Sweeper interval: how often the in-process goroutine runs. Default 1 min.
 	SweeperInterval time.Duration
 
+	// UsageTokenBucketSize is the deployment-wide kaya token-usage bucket
+	// granularity (usage-stats.md §3.1): "hour" (default) or "day". Clients
+	// discover it via GET /user/usage/tokens/coverage; mismatched uploads are
+	// rejected with bucket_size_mismatch and every read query pins
+	// bucket_size = this value (§6 防双计 MUST-2). Changing hour↔day requires
+	// the one-shot purge/migration runbook — old buckets never re-enter reads.
+	UsageTokenBucketSize string
+	// UsageTokenRetentionDays is the cloud retention window for
+	// usage_token_buckets (default 180, aligned with the client-local
+	// ~/.kaya/usage rolling window; §4.9). The in-process retention sweeper
+	// deletes older buckets and tombstones daily.
+	UsageTokenRetentionDays int
+	// UsageTokenExportMaxRows is the per-request row cap for
+	// GET /user/usage/tokens/export (usage-stats.md v1.2 §4.6; the contract
+	// calls the deployment knob EXPORT_MAX_ROWS, here prefixed per the
+	// USAGE_TOKEN_* family). Default 500,000. Over-cap exports are
+	// fail-closed (400 export_too_large) unless the client explicitly passes
+	// allow_truncated=true. Must be positive.
+	UsageTokenExportMaxRows int
+
 	// PlanAmountOverrideJSON is the (plan_id → amount-yuan) override map
 	// parsed once at boot by internal/service/price_override.go. When
 	// non-empty, QuoteService.Get() and PaymentService.CreateOrder()
@@ -354,6 +374,10 @@ func Load() *Config {
 
 		OrderExpiryDuration: parseDurationOr(envOr("ORDER_EXPIRY_DURATION", "30m"), 30*time.Minute),
 		SweeperInterval:     parseDurationOr(envOr("SWEEPER_INTERVAL", "1m"), 1*time.Minute),
+
+		UsageTokenBucketSize:    envOr("USAGE_TOKEN_BUCKET_SIZE", "hour"),
+		UsageTokenRetentionDays: parseIntOr(envOr("USAGE_TOKEN_RETENTION_DAYS", "180"), 180),
+		UsageTokenExportMaxRows: parseIntOr(envOr("USAGE_TOKEN_EXPORT_MAX_ROWS", "500000"), 500000),
 
 		PlanAmountOverrideJSON: os.Getenv("PLAN_AMOUNT_OVERRIDE_JSON"),
 
@@ -577,6 +601,20 @@ func (c *Config) Validate() error {
 	}
 	if c.SweeperInterval >= c.OrderExpiryDuration {
 		return errors.New("SWEEPER_INTERVAL must be strictly less than ORDER_EXPIRY_DURATION")
+	}
+	// kaya token 用量统计（usage-stats.md §3.1/§4.9）：bucket_size 是部署级
+	// 固定值，只接受 hour|day；retention 必须为正（0/负数会让保留期
+	// sweeper 清光全表或摄入把一切都判 too_old）。
+	if c.UsageTokenBucketSize != "hour" && c.UsageTokenBucketSize != "day" {
+		return fmt.Errorf("USAGE_TOKEN_BUCKET_SIZE must be hour or day, got %q", c.UsageTokenBucketSize)
+	}
+	if c.UsageTokenRetentionDays <= 0 {
+		return errors.New("USAGE_TOKEN_RETENTION_DAYS must be a positive integer")
+	}
+	// v1.2 §4.6：导出行数上限（契约名 EXPORT_MAX_ROWS）。0/负数会让一切
+	// 导出都撞 export_too_large。
+	if c.UsageTokenExportMaxRows <= 0 {
+		return errors.New("USAGE_TOKEN_EXPORT_MAX_ROWS must be a positive integer")
 	}
 	if c.OAuthStateSecret == "" {
 		return errors.New("OAUTH_STATE_SECRET is required")

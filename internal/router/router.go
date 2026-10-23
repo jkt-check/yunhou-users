@@ -47,6 +47,10 @@ func Setup(
 	// (including the "prod" default) keeps the route unmounted.
 	appEnv string,
 	usageSvc *service.UsageService,
+	// usageTokenSvc backs the kaya token-usage surface (usage-stats.md v1.2:
+	// /user/usage/tokens/* + /user/devices). Nil leaves the whole surface
+	// unmounted (fail closed, same posture as accessOps).
+	usageTokenSvc *service.UsageTokenService,
 	adminModelsHandler *httpapi.AdminModelsHandler,
 	adminOps *httpapi.AdminOps,
 	accessOps *httpapi.AccessOps,
@@ -142,6 +146,38 @@ func Setup(
 			return c.GetString(middleware.ContextUserID)
 		})
 		userGroup.POST("/usage/heartbeat", usageLimiter, usageHandler.PostHeartbeat)
+
+		// kaya token 用量统计（usage-stats.md v1.2，migration 047）。全部
+		// 端点身份只来自 JWT sub；请求体 user_id 一律忽略。限流全部 per-user
+		//（RateLimitWithKey 在 JWTAuth 之后跑，ContextUserID 必已设置）：
+		// batch 2/s burst 20，backfill ~10/min burst 2，查询+设备读 1/s
+		// burst 30，export ~5/min burst 2（契约 §8 限流建议的每秒换算）。
+		// DELETE ~6/min burst 3、设备写 ~10/min burst 5（PR #61 review M6：
+		// 窗口删除每次写墓碑，不限流则墓碑无界增长）。nil = 整块不挂载
+		//（fail closed）。
+		if usageTokenSvc != nil {
+			usageTokenHandler := handler.NewUsageTokenHandler(usageTokenSvc)
+			userKey := func(c *gin.Context) string { return c.GetString(middleware.ContextUserID) }
+			tokenBatchLimiter := middleware.RateLimitWithKey(ctx, 2, 20, userKey)
+			tokenBackfillLimiter := middleware.RateLimitWithKey(ctx, 0.167, 2, userKey)
+			tokenQueryLimiter := middleware.RateLimitWithKey(ctx, 1, 30, userKey)
+			tokenExportLimiter := middleware.RateLimitWithKey(ctx, 0.0834, 2, userKey)
+			tokenDeleteLimiter := middleware.RateLimitWithKey(ctx, 0.1, 3, userKey)
+			tokenDeviceWriteLimiter := middleware.RateLimitWithKey(ctx, 0.167, 5, userKey)
+
+			userGroup.POST("/usage/tokens/batch", tokenBatchLimiter, usageTokenHandler.PostBatch)
+			userGroup.POST("/usage/tokens/backfill", tokenBackfillLimiter, usageTokenHandler.PostBackfill)
+			userGroup.GET("/usage/tokens/summary", tokenQueryLimiter, usageTokenHandler.GetSummary)
+			userGroup.GET("/usage/tokens/breakdown", tokenQueryLimiter, usageTokenHandler.GetBreakdown)
+			userGroup.GET("/usage/tokens/timeseries", tokenQueryLimiter, usageTokenHandler.GetTimeseries)
+			userGroup.GET("/usage/tokens/coverage", tokenQueryLimiter, usageTokenHandler.GetCoverage)
+			userGroup.GET("/usage/tokens/export", tokenExportLimiter, usageTokenHandler.GetExport)
+			userGroup.DELETE("/usage/tokens", tokenDeleteLimiter, usageTokenHandler.DeleteTokens)
+			userGroup.POST("/devices", tokenDeviceWriteLimiter, usageTokenHandler.PostDevice)
+			userGroup.GET("/devices", tokenQueryLimiter, usageTokenHandler.ListDevices)
+			userGroup.PATCH("/devices/:id", tokenDeviceWriteLimiter, usageTokenHandler.PatchDevice)
+			userGroup.DELETE("/devices/:id", tokenDeviceWriteLimiter, usageTokenHandler.DeleteDevice)
+		}
 
 		// Kaya Coding Plan Task 5: customer API-key self-management
 		// (/user/api-keys). Ownership derives from ContextUserID set by

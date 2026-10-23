@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
+	"github.com/yunhou/users/internal/service"
 )
 
 func TestSetupRoutes(t *testing.T) {
@@ -233,6 +234,7 @@ func TestSetup_RegistersAllRoutes(t *testing.T) {
 		false,               // wechatPayMock
 		"dev",               // appEnv — non-production, so /test/login may mount
 		nil,                 // usageSvc
+		nil,                 // usageTokenSvc
 		nil,                 // adminModelsHandler
 		nil,                 // adminOps
 		nil,                 // accessOps
@@ -389,6 +391,7 @@ func TestSetup_TestLoginGatedOnEnv(t *testing.T) {
 		false,               // wechatPayMock
 		"dev",               // appEnv — non-production, so /test/login may mount
 		nil,                 // usageSvc
+		nil,                 // usageTokenSvc
 		nil,                 // adminModelsHandler
 		nil,                 // adminOps
 		nil,                 // accessOps
@@ -435,6 +438,7 @@ func TestSetup_TestLoginRefusedUnderProductionEnv(t *testing.T) {
 			false,               // wechatPayMock
 			appEnv,              // production signal — /test/login must stay unmounted
 			nil,                 // usageSvc
+			nil,                 // usageTokenSvc
 			nil,                 // adminModelsHandler
 			nil,                 // adminOps
 			nil,                 // accessOps
@@ -479,6 +483,7 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 		false,         // wechatPayMock
 		"dev",         // appEnv
 		nil,           // usageSvc
+		nil,           // usageTokenSvc
 		nil, nil, nil, // adminModelsHandler, adminOps, accessOps
 		nil,                          // llmUsageSvc
 		handler.NewRelayHandler(nil), // relayHandler 非 nil = relay 启用
@@ -520,5 +525,76 @@ func TestSetup_RelayRoutesWired(t *testing.T) {
 	}
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("GET /relay/ws: got %d, want 503 (handler 未 SetHub 的停机响应,证明路由已接线)", w.Code)
+	}
+}
+
+// TestSetup_UsageTokenRoutesWired 验证 kaya token 用量统计面（usage-stats.md
+// v1.2）在 usageTokenSvc 非 nil 时全部挂载；nil 时整块不挂载（fail
+// closed，与 accessOps 同姿势）。service 带 nil repo：Setup 只注册路由，
+// 不触达依赖。
+func TestSetup_UsageTokenRoutesWired(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	setup := func(usageTokenSvc *service.UsageTokenService) map[string]bool {
+		engine := gin.New()
+		Setup(t.Context(), engine,
+			nil,                               // healthPinger
+			nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
+			nil,           // tokenSvc
+			nil,           // authSvc
+			nil, nil, nil, // subSvc, planSvc, paymentSvc
+			nil,      // webhookVerifier
+			nil,      // wechatAPIv3Key
+			nil, nil, // providerTokenSvc, quoteSvc
+			nil,      // chatSvc
+			nil,      // chatAccessLog
+			nil, nil, // githubOAuthSvc, wechatOAuthSvc
+			false,               // wechatOAuthMock
+			false,               // wechatPayMock
+			"dev",               // appEnv
+			nil,                 // usageSvc
+			usageTokenSvc,       // usageTokenSvc — 被测参数
+			nil,                 // adminModelsHandler
+			nil,                 // adminOps
+			nil,                 // accessOps
+			nil,                 // llmUsageSvc
+			nil,                 // relayHandler
+			nil,                 // adminOpsSvc
+			nil,                 // adminUsersSvc
+			[]string{"yundash"}, // dashboardAppIDs
+		)
+		have := make(map[string]bool)
+		for _, r := range engine.Routes() {
+			have[r.Method+":"+r.Path] = true
+		}
+		return have
+	}
+
+	want := []string{
+		"POST:/user/usage/tokens/batch",
+		"POST:/user/usage/tokens/backfill",
+		"GET:/user/usage/tokens/summary",
+		"GET:/user/usage/tokens/breakdown",
+		"GET:/user/usage/tokens/timeseries",
+		"GET:/user/usage/tokens/coverage",
+		"GET:/user/usage/tokens/export",
+		"DELETE:/user/usage/tokens",
+		"POST:/user/devices",
+		"GET:/user/devices",
+		"PATCH:/user/devices/:id",
+		"DELETE:/user/devices/:id",
+	}
+	mounted := setup(service.NewUsageTokenService(nil, "hour", 180, 500000))
+	for _, w := range want {
+		if !mounted[w] {
+			t.Errorf("Setup did not register route %s with non-nil usageTokenSvc", w)
+		}
+	}
+	unmounted := setup(nil)
+	for _, w := range want {
+		if unmounted[w] {
+			t.Errorf("Setup registered route %s with nil usageTokenSvc (must stay fail-closed)", w)
+		}
 	}
 }

@@ -1,12 +1,22 @@
 package router
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
+	"github.com/yunhou/users/internal/middleware"
+	"github.com/yunhou/users/internal/model"
+	"github.com/yunhou/users/internal/repo"
 	"github.com/yunhou/users/internal/service"
 )
 
@@ -596,5 +606,448 @@ func TestSetup_UsageTokenRoutesWired(t *testing.T) {
 		if unmounted[w] {
 			t.Errorf("Setup registered route %s with nil usageTokenSvc (must stay fail-closed)", w)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// kaya token 用量面：限流桶拆分 + 看板查询缓存的接线（Task 2）
+//
+// 这组测试打的是真实的 router.Setup 装配出来的路由：JWT → per-user 限流器
+// → 查询缓存 → handler。"被限流"只能由 429 表达——所以 repo 换成只回空结果
+// 的假实现，让 handler 正常返回 200，不会被 nil repo 的 panic 掩盖。
+// ---------------------------------------------------------------------------
+
+// fakeUsageTokenRepo 是 router 测试用的 in-memory repo.UsageTokenRepo：回空
+// 结果，并统计下游调用次数（用来验证看板查询被缓存合并）。
+type fakeUsageTokenRepo struct {
+	mu                sync.Mutex
+	summaryCalls      int
+	coverageCalls     int
+	exportCalls       int
+	listDevicesCalls  int
+	upsertDeviceCalls int
+}
+
+var _ repo.UsageTokenRepo = (*fakeUsageTokenRepo)(nil)
+
+func (f *fakeUsageTokenRepo) countSummary() {
+	f.mu.Lock()
+	f.summaryCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeUsageTokenRepo) countCoverage() {
+	f.mu.Lock()
+	f.coverageCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeUsageTokenRepo) countExport() {
+	f.mu.Lock()
+	f.exportCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeUsageTokenRepo) countListDevices() {
+	f.mu.Lock()
+	f.listDevicesCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeUsageTokenRepo) countUpsertDevice() {
+	f.mu.Lock()
+	f.upsertDeviceCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeUsageTokenRepo) callCount(kind string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch kind {
+	case "summary":
+		return f.summaryCalls
+	case "coverage":
+		return f.coverageCalls
+	case "export":
+		return f.exportCalls
+	case "listDevices":
+		return f.listDevicesCalls
+	case "upsertDevice":
+		return f.upsertDeviceCalls
+	}
+	return -1
+}
+
+func (f *fakeUsageTokenRepo) IngestBuckets(_ context.Context, _ string, in model.UsageTokenIngestInput) (*model.UsageIngestResult, error) {
+	return &model.UsageIngestResult{Accepted: len(in.Buckets), Updated: len(in.Buckets)}, nil
+}
+
+func (f *fakeUsageTokenRepo) Summary(_ context.Context, _, _ string, _, _ time.Time, _ model.UsageTokenFilter) (*model.UsageTokenSummary, error) {
+	f.countSummary()
+	return &model.UsageTokenSummary{}, nil
+}
+
+func (f *fakeUsageTokenRepo) Breakdown(_ context.Context, _, _, _ string, _, _ time.Time, _ model.UsageTokenFilter, _ int) ([]model.UsageBreakdownItem, error) {
+	return nil, nil
+}
+
+func (f *fakeUsageTokenRepo) Timeseries(_ context.Context, _, _, _, _, _ string, _, _ time.Time, _ model.UsageTokenFilter) ([]model.UsageTimeseriesItem, error) {
+	return nil, nil
+}
+
+func (f *fakeUsageTokenRepo) CoverageDevices(_ context.Context, _, _ string) ([]model.UsageDeviceView, error) {
+	f.countCoverage()
+	return nil, nil
+}
+
+func (f *fakeUsageTokenRepo) ExportRows(_ context.Context, _, _ string, _, _ time.Time, _ model.UsageTokenFilter, _ int, decide func(total int64) (bool, error)) ([]model.UsageExportRow, int64, error) {
+	f.countExport()
+	if _, err := decide(0); err != nil {
+		return nil, 0, err
+	}
+	return nil, 0, nil
+}
+
+func (f *fakeUsageTokenRepo) DeleteAll(_ context.Context, _ string, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeUsageTokenRepo) DeleteByDevice(_ context.Context, _, _ string, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeUsageTokenRepo) DeleteWindow(_ context.Context, _ string, _ *string, _, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeUsageTokenRepo) UpsertDevice(_ context.Context, userID string, in model.UsageDeviceRegisterInput) (*model.UsageDevice, error) {
+	f.countUpsertDevice()
+	return &model.UsageDevice{UserID: userID, DeviceID: in.DeviceID}, nil
+}
+
+func (f *fakeUsageTokenRepo) ListDevices(_ context.Context, _ string) ([]model.UsageDevice, error) {
+	f.countListDevices()
+	return nil, nil
+}
+
+func (f *fakeUsageTokenRepo) UpdateDeviceLabel(_ context.Context, _, _ string, _ *string) error {
+	return nil
+}
+
+func (f *fakeUsageTokenRepo) RevokeDevice(_ context.Context, _, _ string, _ bool) error { return nil }
+
+func (f *fakeUsageTokenRepo) SweepRetention(_ context.Context, _ time.Time) (int64, int64, error) {
+	return 0, 0, nil
+}
+
+// usageTokenTestKey 是测试用 RSA 密钥对：整个包只生成一次（RSA 生成在负载
+// 高的机器上不便宜），JWTAuth 需要能验签的公钥。
+var usageTokenTestKey struct {
+	once sync.Once
+	priv *rsa.PrivateKey
+	err  error
+}
+
+// usageTokenTestTokenSvc 返回一个能签发/验签 access token 的 TokenService。
+func usageTokenTestTokenSvc(t *testing.T) *service.TokenService {
+	t.Helper()
+	usageTokenTestKey.once.Do(func() {
+		usageTokenTestKey.priv, usageTokenTestKey.err = rsa.GenerateKey(rand.Reader, 2048)
+	})
+	if usageTokenTestKey.err != nil {
+		t.Fatalf("generate rsa key: %v", usageTokenTestKey.err)
+	}
+	return &service.TokenService{
+		PrivateKey: usageTokenTestKey.priv,
+		PublicKey:  &usageTokenTestKey.priv.PublicKey,
+		AccessTTL:  time.Hour,
+	}
+}
+
+// newUsageTokenTestEngine 用真实的 router.Setup 装配整条 Usage 路由链
+// （JWT → per-user 限流器 → 查询缓存 → handler），并注入假 repo。
+func newUsageTokenTestEngine(t *testing.T, fake *fakeUsageTokenRepo) (*gin.Engine, *service.TokenService) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+	tokenSvc := usageTokenTestTokenSvc(t)
+
+	Setup(t.Context(), engine,
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
+		tokenSvc,      // tokenSvc
+		nil,           // authSvc
+		nil, nil, nil, // subSvc, planSvc, paymentSvc
+		nil,      // webhookVerifier
+		nil,      // wechatAPIv3Key
+		nil, nil, // providerTokenSvc, quoteSvc
+		nil,      // chatSvc
+		nil,      // chatAccessLog
+		nil, nil, // githubOAuthSvc, wechatOAuthSvc
+		false, // wechatOAuthMock
+		false, // wechatPayMock
+		"dev", // appEnv
+		nil,   // usageSvc
+		service.NewUsageTokenService(fake, "hour", 180, 500000), // usageTokenSvc
+		nil,                 // adminModelsHandler
+		nil,                 // adminOps
+		nil,                 // accessOps
+		nil,                 // llmUsageSvc
+		nil,                 // relayHandler
+		nil,                 // adminOpsSvc
+		nil,                 // adminUsersSvc
+		[]string{"yundash"}, // dashboardAppIDs
+	)
+	return engine, tokenSvc
+}
+
+// usageTokenMint 签一个该用户的 access token。
+func usageTokenMint(t *testing.T, tokenSvc *service.TokenService, userID string) string {
+	t.Helper()
+	token, err := tokenSvc.SignAccessToken(userID, "app-test", nil)
+	if err != nil {
+		t.Fatalf("sign access token for %s: %v", userID, err)
+	}
+	return token
+}
+
+// usageTokenDo 发一个带 JWT 的请求，返回响应记录。写请求带一个空 JSON 体
+// （handler 会在落库前拒掉它，够用来消耗限流额度）。
+func usageTokenDo(engine *gin.Engine, method, path, token string) *httptest.ResponseRecorder {
+	body := ""
+	if method == http.MethodPost || method == http.MethodPatch {
+		body = "{}"
+	}
+	return usageTokenDoBody(engine, method, path, token, body)
+}
+
+// usageTokenDoBody 发一个带 JWT 与指定请求体的请求，返回响应记录。
+func usageTokenDoBody(engine *gin.Engine, method, path, token, body string) *httptest.ResponseRecorder {
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	return w
+}
+
+// usageTokenDrainUntilLimited 反复打同一路径直到限流器挡下（429），返回那次
+// 响应。max 是安全上限：配置错了也不至于死循环。
+func usageTokenDrainUntilLimited(t *testing.T, engine *gin.Engine, method, path, token string, max int) *httptest.ResponseRecorder {
+	t.Helper()
+	for i := 0; i < max; i++ {
+		w := usageTokenDo(engine, method, path, token)
+		if w.Code == http.StatusTooManyRequests {
+			return w
+		}
+	}
+	t.Fatalf("%s %s: never rate limited within %d requests", method, path, max)
+	return nil
+}
+
+// usageTokenAssertBurst 复核一路限流器的突发额度：先放行 burst 个请求，第
+// burst+1 个必须 429。
+func usageTokenAssertBurst(t *testing.T, engine *gin.Engine, method, path, token string, burst int) {
+	t.Helper()
+	for i := 0; i < burst; i++ {
+		if code := usageTokenDo(engine, method, path, token).Code; code == http.StatusTooManyRequests {
+			t.Fatalf("%s %s: request %d of the %d allowed burst was rate limited", method, path, i+1, burst)
+		}
+	}
+	if code := usageTokenDo(engine, method, path, token).Code; code != http.StatusTooManyRequests {
+		t.Fatalf("%s %s: request %d should be rate limited, got %d", method, path, burst+1, code)
+	}
+}
+
+// TestSetup_UsageTokenQueryRateLimitAllowsDesignedBurst 验证看板查询桶的实际
+// 装配：新用户的 80 个并发看板查询必须全部放行（桶是 20 QPS / burst 100），
+// 桶耗尽后返回 429 且带非空 Retry-After。
+func TestSetup_UsageTokenQueryRateLimitAllowsDesignedBurst(t *testing.T) {
+	t.Parallel()
+
+	// 桶的装配值：看板查询+设备读 20 QPS / burst 100。
+	limiters := newUsageTokenLimiters(t.Context(), func(c *gin.Context) string {
+		return c.GetString(middleware.ContextUserID)
+	})
+	if limiters.query.rate != 20 || limiters.query.burst != 100 {
+		t.Errorf("query limiter: got %g/%d, want 20/100", limiters.query.rate, limiters.query.burst)
+	}
+
+	fake := &fakeUsageTokenRepo{}
+	engine, tokenSvc := newUsageTokenTestEngine(t, fake)
+	token := usageTokenMint(t, tokenSvc, "user-query-burst")
+
+	const burst = 80
+	codes := make([]int, burst)
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i] = usageTokenDo(engine, http.MethodGet, "/user/usage/tokens/summary", token).Code
+		}(i)
+	}
+	wg.Wait()
+	for i, code := range codes {
+		if code == http.StatusTooManyRequests {
+			t.Fatalf("dashboard query %d/%d was rate limited: the query bucket must let a fresh user's burst through", i+1, burst)
+		}
+	}
+
+	// 桶耗尽后必须 429，且带非空 Retry-After（客户端据此退避）。
+	limited := usageTokenDrainUntilLimited(t, engine, http.MethodGet, "/user/usage/tokens/summary", token, 500)
+	if retry := limited.Header().Get("Retry-After"); retry == "" {
+		t.Error("429 response carries an empty Retry-After header")
+	}
+}
+
+// TestSetup_UsageTokenCoverageHasIndependentBucket 验证 coverage 有自己独立的
+// 限流桶：打空看板桶不影响 coverage，打空 coverage 桶也不影响看板查询。
+func TestSetup_UsageTokenCoverageHasIndependentBucket(t *testing.T) {
+	t.Parallel()
+
+	// coverage 的装配值：独立 1 QPS / burst 30 桶。
+	limiters := newUsageTokenLimiters(t.Context(), func(c *gin.Context) string {
+		return c.GetString(middleware.ContextUserID)
+	})
+	if limiters.coverage.rate != 1 || limiters.coverage.burst != 30 {
+		t.Errorf("coverage limiter: got %g/%d, want 1/30", limiters.coverage.rate, limiters.coverage.burst)
+	}
+
+	fake := &fakeUsageTokenRepo{}
+	engine, tokenSvc := newUsageTokenTestEngine(t, fake)
+
+	// 用户 A：打空看板桶 → coverage 仍必须放行。
+	tokenA := usageTokenMint(t, tokenSvc, "user-coverage-dashboard")
+	usageTokenDrainUntilLimited(t, engine, http.MethodGet, "/user/usage/tokens/summary", tokenA, 500)
+	if w := usageTokenDo(engine, http.MethodGet, "/user/usage/tokens/coverage", tokenA); w.Code == http.StatusTooManyRequests {
+		t.Fatal("coverage was rate limited by the exhausted dashboard bucket: coverage must own an independent bucket")
+	}
+
+	// 用户 B：打空 coverage 桶 → 看板查询仍必须放行。
+	tokenB := usageTokenMint(t, tokenSvc, "user-coverage-coverage")
+	usageTokenDrainUntilLimited(t, engine, http.MethodGet, "/user/usage/tokens/coverage", tokenB, 200)
+	if w := usageTokenDo(engine, http.MethodGet, "/user/usage/tokens/summary", tokenB); w.Code == http.StatusTooManyRequests {
+		t.Fatal("dashboard query was rate limited by the exhausted coverage bucket: coverage must own an independent bucket")
+	}
+}
+
+// TestSetup_UsageTokenUnchangedWriteLimiters 验证摄入/导出/删除/设备写的限流
+// 配置一字未改：batch 2/20、backfill 0.167/2、export 0.0834/2、delete
+// 0.1/3、设备写 0.167/5。值从 Setup 实际挂载的那批限流器（同一个构造函数
+// newUsageTokenLimiters）读；burst 再用真实路由行为复核一遍。
+func TestSetup_UsageTokenUnchangedWriteLimiters(t *testing.T) {
+	t.Parallel()
+
+	limiters := newUsageTokenLimiters(t.Context(), func(c *gin.Context) string {
+		return c.GetString(middleware.ContextUserID)
+	})
+	for _, tc := range []struct {
+		name  string
+		lim   usageTokenLimiter
+		rate  float64
+		burst int
+	}{
+		{"batch", limiters.batch, 2, 20},
+		{"backfill", limiters.backfill, 0.167, 2},
+		{"export", limiters.export, 0.0834, 2},
+		{"delete", limiters.delete, 0.1, 3},
+		{"deviceWrite", limiters.deviceWrite, 0.167, 5},
+	} {
+		if tc.lim.rate != tc.rate || tc.lim.burst != tc.burst {
+			t.Errorf("%s limiter: got %g/%d, want %g/%d", tc.name, tc.lim.rate, tc.lim.burst, tc.rate, tc.burst)
+		}
+	}
+
+	// burst 用真实路由复核（请求体故意非法 → handler 400，既不落库也不
+	// 需要 repo）。
+	fake := &fakeUsageTokenRepo{}
+	engine, tokenSvc := newUsageTokenTestEngine(t, fake)
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		burst  int
+	}{
+		{"batch", http.MethodPost, "/user/usage/tokens/batch", 20},
+		{"backfill", http.MethodPost, "/user/usage/tokens/backfill", 2},
+		{"export", http.MethodGet, "/user/usage/tokens/export?format=bogus", 2},
+		{"delete", http.MethodDelete, "/user/usage/tokens?device_id=not-a-device-id", 3},
+		{"deviceWrite", http.MethodPost, "/user/devices", 5},
+	} {
+		token := usageTokenMint(t, tokenSvc, "user-write-"+tc.name)
+		usageTokenAssertBurst(t, engine, tc.method, tc.path, token, tc.burst)
+	}
+}
+
+// TestSetup_UsageTokenQueryCacheMountedOnlyOnDashboardQueries 验证查询缓存的
+// 挂载面：只挂看板查询（summary / breakdown / timeseries / GET devices），
+// coverage 与 export 不缓存；写成功后该用户的缓存立即失效。
+func TestSetup_UsageTokenQueryCacheMountedOnlyOnDashboardQueries(t *testing.T) {
+	t.Parallel()
+	fake := &fakeUsageTokenRepo{}
+	engine, tokenSvc := newUsageTokenTestEngine(t, fake)
+	token := usageTokenMint(t, tokenSvc, "user-cache")
+
+	// 看板查询：同一组参数的重复请求只打一次下游。
+	for i := 0; i < 10; i++ {
+		if code := usageTokenDo(engine, http.MethodGet, "/user/usage/tokens/summary", token).Code; code != http.StatusOK {
+			t.Fatalf("summary request %d: got %d, want 200", i+1, code)
+		}
+	}
+	// 缓存条目最长活到 5 秒时间桶结束，跨桶会再打一次下游，所以上界给 2。
+	if calls := fake.callCount("summary"); calls > 2 {
+		t.Errorf("summary downstream calls = %d, want <= 2 (dashboard queries must be cached)", calls)
+	}
+
+	// 设备列表同样在缓存面上。
+	for i := 0; i < 5; i++ {
+		if code := usageTokenDo(engine, http.MethodGet, "/user/devices", token).Code; code != http.StatusOK {
+			t.Fatalf("devices request %d: got %d, want 200", i+1, code)
+		}
+	}
+	if calls := fake.callCount("listDevices"); calls > 2 {
+		t.Errorf("listDevices downstream calls = %d, want <= 2 (GET devices must be cached)", calls)
+	}
+
+	// coverage 是配置发现，不进缓存。
+	for i := 0; i < 5; i++ {
+		if code := usageTokenDo(engine, http.MethodGet, "/user/usage/tokens/coverage", token).Code; code != http.StatusOK {
+			t.Fatalf("coverage request %d: got %d, want 200", i+1, code)
+		}
+	}
+	if calls := fake.callCount("coverage"); calls != 5 {
+		t.Errorf("coverage downstream calls = %d, want 5 (coverage must not be cached)", calls)
+	}
+
+	// export 直出文件流（带 X-Result-* 头），不进缓存；限流器 burst 只有 2，
+	// 所以只发两个。
+	for i := 0; i < 2; i++ {
+		if code := usageTokenDo(engine, http.MethodGet, "/user/usage/tokens/export?format=json", token).Code; code != http.StatusOK {
+			t.Fatalf("export request %d: got %d, want 200", i+1, code)
+		}
+	}
+	if calls := fake.callCount("export"); calls != 2 {
+		t.Errorf("export downstream calls = %d, want 2 (export must not be cached)", calls)
+	}
+
+	// 写成功后失效：设备注册成功后，下一次 GET devices 必须重新打下游，
+	// 不能复用写之前的缓存条目。
+	before := fake.callCount("listDevices")
+	if code := usageTokenDoBody(engine, http.MethodPost, "/user/devices", token, `{"device_id":"d_abcdefgh"}`).Code; code != http.StatusOK {
+		t.Fatalf("device registration: got %d, want 200", code)
+	}
+	if writes := fake.callCount("upsertDevice"); writes != 1 {
+		t.Fatalf("device writes = %d, want 1 (the write must reach the repo)", writes)
+	}
+	if code := usageTokenDo(engine, http.MethodGet, "/user/devices", token).Code; code != http.StatusOK {
+		t.Fatalf("devices after write: got %d, want 200", code)
+	}
+	if after := fake.callCount("listDevices"); after != before+1 {
+		t.Errorf("listDevices downstream calls after a successful write = %d, want %d (writes must invalidate the user's cache)", after, before+1)
 	}
 }

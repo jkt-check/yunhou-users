@@ -16,6 +16,53 @@ import (
 	"github.com/yunhou/users/internal/service"
 )
 
+// usageTokenLimiter 是一路 per-user 限流器。handler 是 Setup 实际挂到路由上
+// 的那个实例；rate/burst 是构造它时传给 middleware.RateLimitWithKey 的参数
+// ——同一份值（不是另抄一份常量），所以读到的就是线上生效的配置。
+type usageTokenLimiter struct {
+	handler gin.HandlerFunc
+	rate    float64
+	burst   int
+}
+
+// usageTokenLimiters 持有 kaya token 用量面全部 per-user 限流器。字段就是
+// Setup 挂到路由上的那些 handler；测试通过同一个构造函数拿同一批限流器，
+// 避免"测试里另写一份常量"的假验证。
+type usageTokenLimiters struct {
+	batch       usageTokenLimiter
+	backfill    usageTokenLimiter
+	query       usageTokenLimiter
+	coverage    usageTokenLimiter
+	export      usageTokenLimiter
+	delete      usageTokenLimiter
+	deviceWrite usageTokenLimiter
+}
+
+// newUsageTokenLimiters 按 usage-stats.md §8 的每秒换算值构造用量面的 per-user
+// 限流器：batch 2/s burst 20，backfill ~10/min burst 2，看板查询+设备读
+// 20/s burst 100，coverage 1/s burst 30（独立桶），export ~5/min burst 2，
+// DELETE ~6/min burst 3，设备写 ~10/min burst 5。
+func newUsageTokenLimiters(ctx context.Context, userKey func(*gin.Context) string) usageTokenLimiters {
+	return usageTokenLimiters{
+		batch:       newUsageTokenLimiter(ctx, 2, 20, userKey),
+		backfill:    newUsageTokenLimiter(ctx, 0.167, 2, userKey),
+		query:       newUsageTokenLimiter(ctx, 20, 100, userKey),
+		coverage:    newUsageTokenLimiter(ctx, 1, 30, userKey),
+		export:      newUsageTokenLimiter(ctx, 0.0834, 2, userKey),
+		delete:      newUsageTokenLimiter(ctx, 0.1, 3, userKey),
+		deviceWrite: newUsageTokenLimiter(ctx, 0.167, 5, userKey),
+	}
+}
+
+// newUsageTokenLimiter 构造一路限流器，并把构造参数一并记在返回值里。
+func newUsageTokenLimiter(ctx context.Context, r float64, burst int, userKey func(*gin.Context) string) usageTokenLimiter {
+	return usageTokenLimiter{
+		handler: middleware.RateLimitWithKey(ctx, r, burst, userKey),
+		rate:    r,
+		burst:   burst,
+	}
+}
+
 func Setup(
 	ctx context.Context,
 	engine *gin.Engine,
@@ -150,33 +197,41 @@ func Setup(
 		// kaya token 用量统计（usage-stats.md v1.2，migration 047）。全部
 		// 端点身份只来自 JWT sub；请求体 user_id 一律忽略。限流全部 per-user
 		//（RateLimitWithKey 在 JWTAuth 之后跑，ContextUserID 必已设置）：
-		// batch 2/s burst 20，backfill ~10/min burst 2，查询+设备读 1/s
-		// burst 30，export ~5/min burst 2（契约 §8 限流建议的每秒换算）。
-		// DELETE ~6/min burst 3、设备写 ~10/min burst 5（PR #61 review M6：
-		// 窗口删除每次写墓碑，不限流则墓碑无界增长）。nil = 整块不挂载
-		//（fail closed）。
+		// batch 2/s burst 20，backfill ~10/min burst 2，看板查询+设备读
+		// 20/s burst 100，coverage 1/s burst 30（独立桶），export ~5/min
+		// burst 2（契约 §8 限流建议的每秒换算）。DELETE ~6/min burst 3、
+		// 设备写 ~10/min burst 5（PR #61 review M6：窗口删除每次写墓碑，
+		// 不限流则墓碑无界增长）。nil = 整块不挂载（fail closed）。
+		//
+		// 中间件顺序：JWT → per-user 限流器 → 查询缓存（仅 GET 查询）→
+		// handler。限流在缓存之前，所以缓存命中同样消耗令牌——看板 10 个
+		// 页面 × 8 个查询的突发要靠 20/100 放行，不能指望缓存兜底。
 		if usageTokenSvc != nil {
 			usageTokenHandler := handler.NewUsageTokenHandler(usageTokenSvc)
 			userKey := func(c *gin.Context) string { return c.GetString(middleware.ContextUserID) }
-			tokenBatchLimiter := middleware.RateLimitWithKey(ctx, 2, 20, userKey)
-			tokenBackfillLimiter := middleware.RateLimitWithKey(ctx, 0.167, 2, userKey)
-			tokenQueryLimiter := middleware.RateLimitWithKey(ctx, 1, 30, userKey)
-			tokenExportLimiter := middleware.RateLimitWithKey(ctx, 0.0834, 2, userKey)
-			tokenDeleteLimiter := middleware.RateLimitWithKey(ctx, 0.1, 3, userKey)
-			tokenDeviceWriteLimiter := middleware.RateLimitWithKey(ctx, 0.167, 5, userKey)
+			limiters := newUsageTokenLimiters(ctx, userKey)
+			// 看板查询的进程内响应缓存：5 秒桶内同一用户 + 同一路由 + 同一组
+			// 查询参数的请求共享结果，并发 miss 合并成一次下游执行；写成功后
+			// 按用户代次失效。缓存是进程内的，多实例新鲜度由 TTL 兜底。
+			queryCache := middleware.NewUsageQueryCache(5*time.Second, nil)
+			queryCacheRead := queryCache.Handle(userKey)
+			queryCacheInvalidate := queryCache.InvalidateOnSuccess(userKey)
 
-			userGroup.POST("/usage/tokens/batch", tokenBatchLimiter, usageTokenHandler.PostBatch)
-			userGroup.POST("/usage/tokens/backfill", tokenBackfillLimiter, usageTokenHandler.PostBackfill)
-			userGroup.GET("/usage/tokens/summary", tokenQueryLimiter, usageTokenHandler.GetSummary)
-			userGroup.GET("/usage/tokens/breakdown", tokenQueryLimiter, usageTokenHandler.GetBreakdown)
-			userGroup.GET("/usage/tokens/timeseries", tokenQueryLimiter, usageTokenHandler.GetTimeseries)
-			userGroup.GET("/usage/tokens/coverage", tokenQueryLimiter, usageTokenHandler.GetCoverage)
-			userGroup.GET("/usage/tokens/export", tokenExportLimiter, usageTokenHandler.GetExport)
-			userGroup.DELETE("/usage/tokens", tokenDeleteLimiter, usageTokenHandler.DeleteTokens)
-			userGroup.POST("/devices", tokenDeviceWriteLimiter, usageTokenHandler.PostDevice)
-			userGroup.GET("/devices", tokenQueryLimiter, usageTokenHandler.ListDevices)
-			userGroup.PATCH("/devices/:id", tokenDeviceWriteLimiter, usageTokenHandler.PatchDevice)
-			userGroup.DELETE("/devices/:id", tokenDeviceWriteLimiter, usageTokenHandler.DeleteDevice)
+			userGroup.POST("/usage/tokens/batch", limiters.batch.handler, queryCacheInvalidate, usageTokenHandler.PostBatch)
+			userGroup.POST("/usage/tokens/backfill", limiters.backfill.handler, queryCacheInvalidate, usageTokenHandler.PostBackfill)
+			userGroup.GET("/usage/tokens/summary", limiters.query.handler, queryCacheRead, usageTokenHandler.GetSummary)
+			userGroup.GET("/usage/tokens/breakdown", limiters.query.handler, queryCacheRead, usageTokenHandler.GetBreakdown)
+			userGroup.GET("/usage/tokens/timeseries", limiters.query.handler, queryCacheRead, usageTokenHandler.GetTimeseries)
+			// coverage 是配置发现（bucket_size/retention_days/export_max_rows），
+			// 独立 1/s burst 30 桶且不缓存——看板流量不该挤掉上传前的发现请求。
+			userGroup.GET("/usage/tokens/coverage", limiters.coverage.handler, usageTokenHandler.GetCoverage)
+			// export 直出文件流且带 X-Result-* 头，不进缓存。
+			userGroup.GET("/usage/tokens/export", limiters.export.handler, usageTokenHandler.GetExport)
+			userGroup.DELETE("/usage/tokens", limiters.delete.handler, queryCacheInvalidate, usageTokenHandler.DeleteTokens)
+			userGroup.POST("/devices", limiters.deviceWrite.handler, queryCacheInvalidate, usageTokenHandler.PostDevice)
+			userGroup.GET("/devices", limiters.query.handler, queryCacheRead, usageTokenHandler.ListDevices)
+			userGroup.PATCH("/devices/:id", limiters.deviceWrite.handler, queryCacheInvalidate, usageTokenHandler.PatchDevice)
+			userGroup.DELETE("/devices/:id", limiters.deviceWrite.handler, queryCacheInvalidate, usageTokenHandler.DeleteDevice)
 		}
 
 		// Kaya Coding Plan Task 5: customer API-key self-management

@@ -23,6 +23,7 @@ type mockUsageRepo struct {
 	gotFrom, gotTo  string
 	gotGranularity  string
 	gotGroupBy      string
+	gotTimezone     string
 	insertCallCount int
 }
 
@@ -31,23 +32,23 @@ func (m *mockUsageRepo) InsertBeats(_ context.Context, _, _ string, _ []model.Us
 	return m.inserted, m.insertErr
 }
 
-func (m *mockUsageRepo) CountActiveUsers(_ context.Context, from, to string) (int, error) {
-	m.gotFrom, m.gotTo = from, to
+func (m *mockUsageRepo) CountActiveUsers(_ context.Context, from, to, timezone string) (int, error) {
+	m.gotFrom, m.gotTo, m.gotTimezone = from, to, timezone
 	return m.activeTotal, m.activeErr
 }
 
-func (m *mockUsageRepo) CountActiveUsersGrouped(_ context.Context, from, to, groupBy string) ([]model.ActiveStatsRow, error) {
-	m.gotFrom, m.gotTo, m.gotGroupBy = from, to, groupBy
+func (m *mockUsageRepo) CountActiveUsersGrouped(_ context.Context, from, to, groupBy, timezone string) ([]model.ActiveStatsRow, error) {
+	m.gotFrom, m.gotTo, m.gotGroupBy, m.gotTimezone = from, to, groupBy, timezone
 	return m.groups, nil
 }
 
-func (m *mockUsageRepo) UsageDurationStats(_ context.Context, from, to, granularity, groupBy string) ([]model.UsageDurationRow, error) {
-	m.gotFrom, m.gotTo, m.gotGranularity, m.gotGroupBy = from, to, granularity, groupBy
+func (m *mockUsageRepo) UsageDurationStats(_ context.Context, from, to, granularity, groupBy, timezone string) ([]model.UsageDurationRow, error) {
+	m.gotFrom, m.gotTo, m.gotGranularity, m.gotGroupBy, m.gotTimezone = from, to, granularity, groupBy, timezone
 	return m.duration, nil
 }
 
-func (m *mockUsageRepo) CountNewUsers(_ context.Context, from, to string) ([]model.NewUsersRow, error) {
-	m.gotFrom, m.gotTo = from, to
+func (m *mockUsageRepo) CountNewUsers(_ context.Context, from, to, timezone string) ([]model.NewUsersRow, error) {
+	m.gotFrom, m.gotTo, m.gotTimezone = from, to, timezone
 	return m.newUsers, nil
 }
 
@@ -68,7 +69,7 @@ func TestUsageService_ActiveStatsWindows(t *testing.T) {
 		t.Run(tc.granularity, func(t *testing.T) {
 			repo := &mockUsageRepo{activeTotal: 7}
 			svc := NewUsageService(repo)
-			stats, err := svc.ActiveStats(context.Background(), "2026-09-04", tc.granularity, "")
+			stats, err := svc.ActiveStats(context.Background(), "2026-09-04", tc.granularity, "", UsageDefaultTimezone)
 			if err != nil {
 				t.Fatalf("ActiveStats: %v", err)
 			}
@@ -93,7 +94,7 @@ func TestUsageService_ActiveStatsGrouped(t *testing.T) {
 		{Group: "windows", Users: 3},
 	}}
 	svc := NewUsageService(repo)
-	stats, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "platform")
+	stats, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "platform", UsageDefaultTimezone)
 	if err != nil {
 		t.Fatalf("ActiveStats: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestUsageService_ActiveStatsValidation(t *testing.T) {
 		{"2026-09-04", "year", ""},
 		{"2026-09-04", "day", "nickname"}, // PII dimension must never be groupable
 	} {
-		_, err := svc.ActiveStats(context.Background(), args[0], args[1], args[2])
+		_, err := svc.ActiveStats(context.Background(), args[0], args[1], args[2], UsageDefaultTimezone)
 		if !errors.Is(err, ErrUsageInvalidParam) {
 			t.Errorf("ActiveStats(%v): err = %v, want ErrUsageInvalidParam", args, err)
 		}
@@ -135,7 +136,7 @@ func TestUsageService_DurationStats(t *testing.T) {
 		{Period: "2026-09-04", TotalSeconds: 300, ActiveUsers: 0}, // defensive: zero-users row
 	}}
 	svc := NewUsageService(repo)
-	rows, err := svc.DurationStats(context.Background(), "2026-09-03", "2026-09-04", "day", "")
+	rows, err := svc.DurationStats(context.Background(), "2026-09-03", "2026-09-04", "day", "", UsageDefaultTimezone)
 	if err != nil {
 		t.Fatalf("DurationStats: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestUsageService_DurationStatsValidation(t *testing.T) {
 		{"bad", "2026-09-04", "day", ""},             // bad from
 		{"2025-01-01", "2026-09-04", "day", ""},      // range > 366 days
 	} {
-		_, err := svc.DurationStats(context.Background(), args[0], args[1], args[2], args[3])
+		_, err := svc.DurationStats(context.Background(), args[0], args[1], args[2], args[3], UsageDefaultTimezone)
 		if !errors.Is(err, ErrUsageInvalidParam) {
 			t.Errorf("DurationStats(%v): err = %v, want ErrUsageInvalidParam", args, err)
 		}
@@ -173,7 +174,7 @@ func TestUsageService_NewUsersStats(t *testing.T) {
 
 	repo := &mockUsageRepo{newUsers: []model.NewUsersRow{{Date: "2026-09-04", Users: 3}}}
 	svc := NewUsageService(repo)
-	rows, err := svc.NewUsersStats(context.Background(), "2026-09-01", "2026-09-04")
+	rows, err := svc.NewUsersStats(context.Background(), "2026-09-01", "2026-09-04", UsageDefaultTimezone)
 	if err != nil {
 		t.Fatalf("NewUsersStats: %v", err)
 	}
@@ -184,7 +185,7 @@ func TestUsageService_NewUsersStats(t *testing.T) {
 		t.Errorf("repo got [%s, %s]", repo.gotFrom, repo.gotTo)
 	}
 
-	if _, err := svc.NewUsersStats(context.Background(), "2026-09-04", "2026-09-01"); !errors.Is(err, ErrUsageInvalidParam) {
+	if _, err := svc.NewUsersStats(context.Background(), "2026-09-04", "2026-09-01", UsageDefaultTimezone); !errors.Is(err, ErrUsageInvalidParam) {
 		t.Errorf("reversed range: err = %v, want ErrUsageInvalidParam", err)
 	}
 }
@@ -200,5 +201,49 @@ func TestUsageService_RecordBeatsPassthrough(t *testing.T) {
 	}
 	if n != 2 || repo.insertCallCount != 1 {
 		t.Errorf("inserted = %d, calls = %d; want 2 and 1", n, repo.insertCallCount)
+	}
+}
+
+func TestUsageService_StatsTimezone(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockUsageRepo{}
+	svc := NewUsageService(repo)
+	if _, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "", "Asia/Shanghai"); err != nil {
+		t.Fatalf("ActiveStats with valid timezone: %v", err)
+	}
+	if repo.gotTimezone != "Asia/Shanghai" {
+		t.Errorf("repo timezone = %q, want Asia/Shanghai", repo.gotTimezone)
+	}
+
+	for name, call := range map[string]func() error{
+		"active": func() error {
+			_, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "", "Invalid/Zone")
+			return err
+		},
+		"duration": func() error {
+			_, err := svc.DurationStats(context.Background(), "2026-09-01", "2026-09-04", "day", "", "Invalid/Zone")
+			return err
+		},
+		"new users": func() error {
+			_, err := svc.NewUsersStats(context.Background(), "2026-09-01", "2026-09-04", "Invalid/Zone")
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, ErrUsageInvalidParam) {
+				t.Errorf("invalid timezone error = %v, want ErrUsageInvalidParam", err)
+			}
+		})
+	}
+
+	if _, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "", ""); err != nil {
+		t.Fatalf("empty timezone should use the default: %v", err)
+	}
+	if repo.gotTimezone != UsageDefaultTimezone {
+		t.Errorf("empty timezone forwarded as %q, want %q", repo.gotTimezone, UsageDefaultTimezone)
+	}
+	if _, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "", "Local"); !errors.Is(err, ErrUsageInvalidParam) {
+		t.Errorf("Local timezone error = %v, want ErrUsageInvalidParam", err)
 	}
 }

@@ -12,11 +12,11 @@ type UsageBeat struct {
 	// the JWT user_id it forms the idempotency key: offline-buffered beats
 	// are replayed in batches and the server's UNIQUE constraint swallows
 	// duplicates.
-	ClientEventID string `json:"client_event_id"`
+	ClientEventID string    `json:"client_event_id"`
 	OccurredAt    time.Time `json:"occurred_at"`
-	// LocalDate is the CLIENT-local calendar date (YYYY-MM-DD) the beat's
-	// active_seconds are attributed to. The server trusts it verbatim — this
-	// is an ops-metrics surface, not billing.
+	// LocalDate is the CLIENT-local calendar date (YYYY-MM-DD), retained in
+	// the intake contract for compatibility. Admin statistics use OccurredAt
+	// in the requested timezone instead of trusting this field for bucketing.
 	LocalDate     string `json:"local_date"`
 	ActiveSeconds int    `json:"active_seconds"`
 	Platform      string `json:"platform"` // macos | windows | linux
@@ -53,8 +53,8 @@ type ActiveStatsRow struct {
 }
 
 // ActiveStats is the /admin/stats/active payload. Day granularity reports
-// DAU for Date itself; week = [Date-6, Date], month = [Date-29, Date]
-// (rolling windows over client-local local_date).
+// DAU for Date itself; week = [Date-6, Date], month = [Date-29, Date].
+// Events are assigned to days by occurred_at in the requested timezone.
 type ActiveStats struct {
 	Date        string           `json:"date"`
 	From        string           `json:"from"`
@@ -76,8 +76,7 @@ type UsageDurationRow struct {
 }
 
 // NewUsersRow is one day's signup count in /admin/stats/new-users. Date is
-// derived from users.created_at in the SERVER's timezone — unlike the
-// local_date-based metrics, which follow the client-local calendar.
+// derived from users.created_at in the requested timezone.
 type NewUsersRow struct {
 	Date  string `json:"date"`
 	Users int    `json:"users"`

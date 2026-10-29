@@ -36,8 +36,8 @@ func (r *llmUsageRepo) InsertEvent(ctx context.Context, ev model.LLMUsageEvent) 
 }
 
 func (r *llmUsageRepo) SumByModel(ctx context.Context, from, to string) ([]model.LLMUsageRow, error) {
-	// Half-open range on raw TIMESTAMPTZ (sargable), same pattern as
-	// usageRepo.CountNewUsers.
+	// Half-open range on raw TIMESTAMPTZ (sargable), using the database
+	// session timezone for this legacy LLM usage endpoint.
 	const query = `SELECT model,
 		COUNT(*) AS requests,
 		COALESCE(SUM(input_tokens), 0)  AS input_tokens,

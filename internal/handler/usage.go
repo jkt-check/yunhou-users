@@ -109,10 +109,17 @@ func validateUsageBeats(beats []model.UsageBeat) string {
 	return ""
 }
 
+func usageStatsTimezone(c *gin.Context) string {
+	if timezone := c.Query("tz"); timezone != "" {
+		return timezone
+	}
+	return service.UsageDefaultTimezone
+}
+
 // GetActiveStats handles GET /admin/stats/active. date defaults to today
 // in tz (Asia/Shanghai by default), granularity to "day"; group_by is optional.
 func (h *UsageHandler) GetActiveStats(c *gin.Context) {
-	timezone := c.DefaultQuery("tz", service.UsageDefaultTimezone)
+	timezone := usageStatsTimezone(c)
 	date := c.Query("date")
 	if date == "" {
 		location, err := time.LoadLocation(timezone)
@@ -143,7 +150,7 @@ func (h *UsageHandler) GetUsageDuration(c *gin.Context) {
 	}
 	granularity := c.DefaultQuery("granularity", "day")
 	groupBy := c.Query("group_by")
-	timezone := c.DefaultQuery("tz", service.UsageDefaultTimezone)
+	timezone := usageStatsTimezone(c)
 
 	rows, err := h.svc.DurationStats(c.Request.Context(), from, to, granularity, groupBy, timezone)
 	if err != nil {
@@ -160,7 +167,7 @@ func (h *UsageHandler) GetNewUsers(c *gin.Context) {
 		writeUsageError(c, http.StatusBadRequest, "from and to are required")
 		return
 	}
-	timezone := c.DefaultQuery("tz", service.UsageDefaultTimezone)
+	timezone := usageStatsTimezone(c)
 	rows, err := h.svc.NewUsersStats(c.Request.Context(), from, to, timezone)
 	if err != nil {
 		writeUsageStatsError(c, err)

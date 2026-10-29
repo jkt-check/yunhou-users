@@ -99,21 +99,25 @@ func validateUsageRange(from, to string) (time.Time, time.Time, error) {
 	return f, t, nil
 }
 
-func validateUsageTimezone(timezone string) error {
-	if timezone == "" || timezone == "Local" {
-		return fmt.Errorf("%w: invalid tz", ErrUsageInvalidParam)
+func normalizeUsageTimezone(timezone string) (string, error) {
+	if timezone == "" {
+		timezone = UsageDefaultTimezone
+	}
+	if timezone == "Local" {
+		return "", fmt.Errorf("%w: invalid tz", ErrUsageInvalidParam)
 	}
 	if _, err := time.LoadLocation(timezone); err != nil {
-		return fmt.Errorf("%w: invalid tz", ErrUsageInvalidParam)
+		return "", fmt.Errorf("%w: invalid tz", ErrUsageInvalidParam)
 	}
-	return nil
+	return timezone, nil
 }
 
 // ActiveStats answers /admin/stats/active: distinct login users with ≥1
 // heartbeat in the window, optionally broken down by platform/app_version.
 func (s *UsageService) ActiveStats(ctx context.Context, date, granularity, groupBy, timezone string) (*model.ActiveStats, error) {
-	if err := validateUsageTimezone(timezone); err != nil {
-		return nil, err
+	timezone, tzErr := normalizeUsageTimezone(timezone)
+	if tzErr != nil {
+		return nil, tzErr
 	}
 	d, err := parseUsageDate(date)
 	if err != nil {
@@ -158,8 +162,9 @@ func (s *UsageService) ActiveStats(ctx context.Context, date, granularity, group
 // PerUserSeconds is total/users — average app-alive seconds per active user
 // in the period.
 func (s *UsageService) DurationStats(ctx context.Context, from, to, granularity, groupBy, timezone string) ([]model.UsageDurationRow, error) {
-	if err := validateUsageTimezone(timezone); err != nil {
-		return nil, err
+	timezone, tzErr := normalizeUsageTimezone(timezone)
+	if tzErr != nil {
+		return nil, tzErr
 	}
 	if _, _, err := validateUsageRange(from, to); err != nil {
 		return nil, err
@@ -185,8 +190,9 @@ func (s *UsageService) DurationStats(ctx context.Context, from, to, granularity,
 // NewUsersStats answers /admin/stats/new-users: signups per calendar day in
 // [from, to], bucketed by users.created_at in the requested timezone.
 func (s *UsageService) NewUsersStats(ctx context.Context, from, to, timezone string) ([]model.NewUsersRow, error) {
-	if err := validateUsageTimezone(timezone); err != nil {
-		return nil, err
+	timezone, tzErr := normalizeUsageTimezone(timezone)
+	if tzErr != nil {
+		return nil, tzErr
 	}
 	if _, _, err := validateUsageRange(from, to); err != nil {
 		return nil, err

@@ -273,6 +273,9 @@ func TestUsageRepo_UsageStatsUseRequestedTimezone(t *testing.T) {
 	if n, err := r.CountActiveUsers(ctx, "2026-09-03", "2026-09-03", "Asia/Shanghai"); err != nil || n != 0 {
 		t.Errorf("previous-day DAU = %d, err = %v; want 0", n, err)
 	}
+	if n, err := r.CountActiveUsers(ctx, "2026-09-03", "2026-09-03", "UTC"); err != nil || n != 1 {
+		t.Errorf("UTC DAU = %d, err = %v; want 1", n, err)
+	}
 	groups, err := r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "platform", "Asia/Shanghai")
 	if err != nil || len(groups) != 1 || groups[0].Users != 1 {
 		t.Errorf("Beijing grouped DAU = %+v, err = %v; want one user", groups, err)
@@ -280,6 +283,10 @@ func TestUsageRepo_UsageStatsUseRequestedTimezone(t *testing.T) {
 	duration, err := r.UsageDurationStats(ctx, "2026-09-04", "2026-09-04", "day", "", "Asia/Shanghai")
 	if err != nil || len(duration) != 1 || duration[0].Period != "2026-09-04" || duration[0].TotalSeconds != 300 {
 		t.Errorf("Beijing duration = %+v, err = %v; want 300 seconds on 2026-09-04", duration, err)
+	}
+	duration, err = r.UsageDurationStats(ctx, "2026-09-03", "2026-09-03", "day", "", "UTC")
+	if err != nil || len(duration) != 1 || duration[0].Period != "2026-09-03" || duration[0].TotalSeconds != 300 {
+		t.Errorf("UTC duration = %+v, err = %v; want 300 seconds on 2026-09-03", duration, err)
 	}
 }
 
@@ -300,5 +307,9 @@ func TestUsageRepo_NewUsersUseRequestedTimezone(t *testing.T) {
 	rows, err = r.CountNewUsers(ctx, "2026-09-03", "2026-09-03", "Asia/Shanghai")
 	if err != nil || len(rows) != 0 {
 		t.Errorf("previous-day new users = %+v, err = %v; want none", rows, err)
+	}
+	rows, err = r.CountNewUsers(ctx, "2026-09-03", "2026-09-03", "UTC")
+	if err != nil || len(rows) != 1 || rows[0].Date != "2026-09-03" || rows[0].Users != 1 {
+		t.Errorf("UTC new users = %+v, err = %v; want one user on 2026-09-03", rows, err)
 	}
 }

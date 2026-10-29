@@ -95,8 +95,8 @@ func (r *usageRepo) CountActiveUsers(ctx context.Context, from, to, timezone str
 	var n int
 	err := r.db.QueryRowContext(ctx,
 		`SELECT COUNT(DISTINCT user_id) FROM usage_events
-		WHERE occurred_at >= $1::date AT TIME ZONE $3
-		  AND occurred_at < ($2::date + 1) AT TIME ZONE $3`,
+		WHERE occurred_at >= $1::date::timestamp AT TIME ZONE $3
+		  AND occurred_at < ($2::date + 1)::timestamp AT TIME ZONE $3`,
 		from, to, timezone).Scan(&n)
 	return n, err
 }
@@ -114,8 +114,8 @@ func (r *usageRepo) CountActiveUsersGrouped(ctx context.Context, from, to, group
 	}
 	query := `SELECT ` + col + ` AS grp, COUNT(DISTINCT user_id) AS users
 		FROM usage_events
-		WHERE occurred_at >= $1::date AT TIME ZONE $3
-		  AND occurred_at < ($2::date + 1) AT TIME ZONE $3
+		WHERE occurred_at >= $1::date::timestamp AT TIME ZONE $3
+		  AND occurred_at < ($2::date + 1)::timestamp AT TIME ZONE $3
 		GROUP BY ` + col + ` ORDER BY users DESC, ` + col
 	var rows []activeRow
 	if err := r.db.SelectContext(ctx, &rows, query, from, to, timezone); err != nil {
@@ -163,8 +163,8 @@ func (r *usageRepo) UsageDurationStats(ctx context.Context, from, to, granularit
 	query := `SELECT ` + periodExpr + ` AS period` + selectGroup + `,
 		SUM(active_seconds) AS total_seconds, COUNT(DISTINCT user_id) AS active_users
 		FROM usage_events
-		WHERE occurred_at >= $1::date AT TIME ZONE $3
-		  AND occurred_at < ($2::date + 1) AT TIME ZONE $3
+		WHERE occurred_at >= $1::date::timestamp AT TIME ZONE $3
+		  AND occurred_at < ($2::date + 1)::timestamp AT TIME ZONE $3
 		GROUP BY period` + groupClause + ` ORDER BY period` + orderGroup
 
 	var rows []durationRow
@@ -195,8 +195,8 @@ func (r *usageRepo) CountNewUsers(ctx context.Context, from, to, timezone string
 	// timezone rather than the database session timezone.
 	const query = `SELECT (created_at AT TIME ZONE $3)::date::text AS d, COUNT(*) AS users
 		FROM users
-		WHERE created_at >= $1::date AT TIME ZONE $3
-		  AND created_at < ($2::date + 1) AT TIME ZONE $3
+		WHERE created_at >= $1::date::timestamp AT TIME ZONE $3
+		  AND created_at < ($2::date + 1)::timestamp AT TIME ZONE $3
 		GROUP BY d ORDER BY d`
 	var rows []newUsersRow
 	if err := r.db.SelectContext(ctx, &rows, query, from, to, timezone); err != nil {

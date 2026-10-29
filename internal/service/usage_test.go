@@ -237,9 +237,13 @@ func TestUsageService_StatsTimezone(t *testing.T) {
 		})
 	}
 
-	for _, timezone := range []string{"", "Local"} {
-		if _, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "", timezone); !errors.Is(err, ErrUsageInvalidParam) {
-			t.Errorf("timezone %q error = %v, want ErrUsageInvalidParam", timezone, err)
-		}
+	if _, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "", ""); err != nil {
+		t.Fatalf("empty timezone should use the default: %v", err)
+	}
+	if repo.gotTimezone != UsageDefaultTimezone {
+		t.Errorf("empty timezone forwarded as %q, want %q", repo.gotTimezone, UsageDefaultTimezone)
+	}
+	if _, err := svc.ActiveStats(context.Background(), "2026-09-04", "day", "", "Local"); !errors.Is(err, ErrUsageInvalidParam) {
+		t.Errorf("Local timezone error = %v, want ErrUsageInvalidParam", err)
 	}
 }

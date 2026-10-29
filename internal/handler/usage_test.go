@@ -198,9 +198,12 @@ func TestGetActiveStats(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
 		}
-		// date defaults to today (server tz), granularity to day, no group_by
+		// date defaults to today in the default requested timezone.
 		if svc.gotArgs[1] != "day" || svc.gotArgs[2] != "" {
 			t.Errorf("granularity/group_by = %q/%q, want day/empty", svc.gotArgs[1], svc.gotArgs[2])
+		}
+		if svc.gotArgs[3] != service.UsageDefaultTimezone {
+			t.Errorf("timezone = %q, want %q", svc.gotArgs[3], service.UsageDefaultTimezone)
 		}
 		if _, err := time.Parse("2006-01-02", svc.gotArgs[0]); err != nil {
 			t.Errorf("default date %q is not YYYY-MM-DD", svc.gotArgs[0])
@@ -227,6 +230,29 @@ func TestGetActiveStats(t *testing.T) {
 			if svc.gotArgs[i] != v {
 				t.Errorf("arg %d = %q, want %q", i, svc.gotArgs[i], v)
 			}
+		}
+	})
+
+	t.Run("empty timezone uses the default", func(t *testing.T) {
+		svc := &mockUsageSvc{activeResp: &model.ActiveStats{}}
+		engine := usageTestEngine(svc)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/admin/stats/active?tz=", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		if svc.gotArgs[3] != service.UsageDefaultTimezone {
+			t.Errorf("timezone = %q, want %q", svc.gotArgs[3], service.UsageDefaultTimezone)
+		}
+	})
+
+	t.Run("invalid timezone maps to 400 before service", func(t *testing.T) {
+		svc := &mockUsageSvc{activeResp: &model.ActiveStats{}}
+		engine := usageTestEngine(svc)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/admin/stats/active?tz=Bad%2FZone", nil))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400, got %d", w.Code)
 		}
 	})
 
@@ -277,12 +303,15 @@ func TestGetUsageDurationAndNewUsers(t *testing.T) {
 		engine := usageTestEngine(svc)
 		w := httptest.NewRecorder()
 		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet,
-			"/admin/stats/usage-duration?from=2026-09-01&to=2026-09-04&granularity=month", nil))
+			"/admin/stats/usage-duration?from=2026-09-01&to=2026-09-04&granularity=month&tz=UTC", nil))
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
 		if svc.gotArgs[2] != "month" {
 			t.Errorf("granularity = %q, want month", svc.gotArgs[2])
+		}
+		if svc.gotArgs[4] != "UTC" {
+			t.Errorf("timezone = %q, want UTC", svc.gotArgs[4])
 		}
 		if !strings.Contains(w.Body.String(), `"per_user_seconds":400`) {
 			t.Errorf("response missing per_user_seconds: %s", w.Body.String())
@@ -294,12 +323,15 @@ func TestGetUsageDurationAndNewUsers(t *testing.T) {
 		engine := usageTestEngine(svc)
 		w := httptest.NewRecorder()
 		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet,
-			"/admin/stats/new-users?from=2026-09-01&to=2026-09-04", nil))
+			"/admin/stats/new-users?from=2026-09-01&to=2026-09-04&tz=UTC", nil))
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
 		if svc.gotArgs[0] != "2026-09-01" || svc.gotArgs[1] != "2026-09-04" {
 			t.Errorf("args = %v", svc.gotArgs)
+		}
+		if svc.gotArgs[2] != "UTC" {
+			t.Errorf("timezone = %q, want UTC", svc.gotArgs[2])
 		}
 		if !strings.Contains(w.Body.String(), `"users":5`) {
 			t.Errorf("response missing users: %s", w.Body.String())

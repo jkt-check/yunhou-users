@@ -20,9 +20,9 @@ import (
 // chatStreamer in chat.go).
 type usageService interface {
 	RecordBeats(ctx context.Context, userID, appID string, beats []model.UsageBeat) (int, error)
-	ActiveStats(ctx context.Context, date, granularity, groupBy string) (*model.ActiveStats, error)
-	DurationStats(ctx context.Context, from, to, granularity, groupBy string) ([]model.UsageDurationRow, error)
-	NewUsersStats(ctx context.Context, from, to string) ([]model.NewUsersRow, error)
+	ActiveStats(ctx context.Context, date, granularity, groupBy, timezone string) (*model.ActiveStats, error)
+	DurationStats(ctx context.Context, from, to, granularity, groupBy, timezone string) ([]model.UsageDurationRow, error)
+	NewUsersStats(ctx context.Context, from, to, timezone string) ([]model.NewUsersRow, error)
 }
 
 // UsageHandler serves POST /user/usage/heartbeat (JWT user route) and the
@@ -110,13 +110,22 @@ func validateUsageBeats(beats []model.UsageBeat) string {
 }
 
 // GetActiveStats handles GET /admin/stats/active. date defaults to today
-// (server timezone), granularity to "day"; group_by is optional.
+// in tz (Asia/Shanghai by default), granularity to "day"; group_by is optional.
 func (h *UsageHandler) GetActiveStats(c *gin.Context) {
-	date := c.DefaultQuery("date", time.Now().Format("2006-01-02"))
+	timezone := c.DefaultQuery("tz", service.UsageDefaultTimezone)
+	date := c.Query("date")
+	if date == "" {
+		location, err := time.LoadLocation(timezone)
+		if err != nil {
+			writeUsageError(c, http.StatusBadRequest, "invalid tz")
+			return
+		}
+		date = time.Now().In(location).Format("2006-01-02")
+	}
 	granularity := c.DefaultQuery("granularity", "day")
 	groupBy := c.Query("group_by")
 
-	stats, err := h.svc.ActiveStats(c.Request.Context(), date, granularity, groupBy)
+	stats, err := h.svc.ActiveStats(c.Request.Context(), date, granularity, groupBy, timezone)
 	if err != nil {
 		writeUsageStatsError(c, err)
 		return
@@ -134,8 +143,9 @@ func (h *UsageHandler) GetUsageDuration(c *gin.Context) {
 	}
 	granularity := c.DefaultQuery("granularity", "day")
 	groupBy := c.Query("group_by")
+	timezone := c.DefaultQuery("tz", service.UsageDefaultTimezone)
 
-	rows, err := h.svc.DurationStats(c.Request.Context(), from, to, granularity, groupBy)
+	rows, err := h.svc.DurationStats(c.Request.Context(), from, to, granularity, groupBy, timezone)
 	if err != nil {
 		writeUsageStatsError(c, err)
 		return
@@ -150,7 +160,8 @@ func (h *UsageHandler) GetNewUsers(c *gin.Context) {
 		writeUsageError(c, http.StatusBadRequest, "from and to are required")
 		return
 	}
-	rows, err := h.svc.NewUsersStats(c.Request.Context(), from, to)
+	timezone := c.DefaultQuery("tz", service.UsageDefaultTimezone)
+	rows, err := h.svc.NewUsersStats(c.Request.Context(), from, to, timezone)
 	if err != nil {
 		writeUsageStatsError(c, err)
 		return

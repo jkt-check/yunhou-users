@@ -37,18 +37,18 @@ func (m *mockUsageSvc) RecordBeats(_ context.Context, userID, appID string, beat
 	return m.inserted, m.recordErr
 }
 
-func (m *mockUsageSvc) ActiveStats(_ context.Context, date, granularity, groupBy string) (*model.ActiveStats, error) {
-	m.gotArgs = []string{date, granularity, groupBy}
+func (m *mockUsageSvc) ActiveStats(_ context.Context, date, granularity, groupBy, timezone string) (*model.ActiveStats, error) {
+	m.gotArgs = []string{date, granularity, groupBy, timezone}
 	return m.activeResp, m.activeErr
 }
 
-func (m *mockUsageSvc) DurationStats(_ context.Context, from, to, granularity, groupBy string) ([]model.UsageDurationRow, error) {
-	m.gotArgs = []string{from, to, granularity, groupBy}
+func (m *mockUsageSvc) DurationStats(_ context.Context, from, to, granularity, groupBy, timezone string) ([]model.UsageDurationRow, error) {
+	m.gotArgs = []string{from, to, granularity, groupBy, timezone}
 	return m.duration, nil
 }
 
-func (m *mockUsageSvc) NewUsersStats(_ context.Context, from, to string) ([]model.NewUsersRow, error) {
-	m.gotArgs = []string{from, to}
+func (m *mockUsageSvc) NewUsersStats(_ context.Context, from, to, timezone string) ([]model.NewUsersRow, error) {
+	m.gotArgs = []string{from, to, timezone}
 	return m.newUsers, nil
 }
 
@@ -215,11 +215,14 @@ func TestGetActiveStats(t *testing.T) {
 		engine := usageTestEngine(svc)
 		w := httptest.NewRecorder()
 		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet,
-			"/admin/stats/active?date=2026-09-01&granularity=week&group_by=platform", nil))
+			"/admin/stats/active?date=2026-09-01&granularity=week&group_by=platform&tz=Asia%2FShanghai", nil))
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
-		want := []string{"2026-09-01", "week", "platform"}
+		want := []string{"2026-09-01", "week", "platform", "Asia/Shanghai"}
+		if len(svc.gotArgs) != len(want) {
+			t.Fatalf("args = %v, want %v", svc.gotArgs, want)
+		}
 		for i, v := range want {
 			if svc.gotArgs[i] != v {
 				t.Errorf("arg %d = %q, want %q", i, svc.gotArgs[i], v)

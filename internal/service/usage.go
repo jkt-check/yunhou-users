@@ -24,7 +24,10 @@ func NewUsageService(usageRepo repo.UsageRepo) *UsageService {
 	return &UsageService{usageRepo: usageRepo}
 }
 
-// usageDateLayout is the client-local calendar date format (local_date).
+// UsageDefaultTimezone keeps all admin statistics on the operations calendar.
+const UsageDefaultTimezone = "Asia/Shanghai"
+
+// usageDateLayout is the calendar date format used by admin statistics.
 const usageDateLayout = "2006-01-02"
 
 // usageMaxRangeDays bounds any stats query window so a typo'd range can't
@@ -51,9 +54,9 @@ func parseUsageDate(s string) (time.Time, error) {
 
 func formatUsageDate(t time.Time) string { return t.Format(usageDateLayout) }
 
-// usageWindow resolves granularity into the [from, to] local_date window:
+// usageWindow resolves granularity into an inclusive calendar-date window:
 // day = date itself (DAU), week = [date-6, date] (WAU), month = [date-29,
-// date] (MAU). Windows are inclusive calendar-day ranges.
+// date] (MAU).
 func usageWindow(date time.Time, granularity string) (from, to string, err error) {
 	to = formatUsageDate(date)
 	switch granularity {
@@ -96,9 +99,22 @@ func validateUsageRange(from, to string) (time.Time, time.Time, error) {
 	return f, t, nil
 }
 
+func validateUsageTimezone(timezone string) error {
+	if timezone == "" || timezone == "Local" {
+		return fmt.Errorf("%w: invalid tz", ErrUsageInvalidParam)
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return fmt.Errorf("%w: invalid tz", ErrUsageInvalidParam)
+	}
+	return nil
+}
+
 // ActiveStats answers /admin/stats/active: distinct login users with ≥1
 // heartbeat in the window, optionally broken down by platform/app_version.
-func (s *UsageService) ActiveStats(ctx context.Context, date, granularity, groupBy string) (*model.ActiveStats, error) {
+func (s *UsageService) ActiveStats(ctx context.Context, date, granularity, groupBy, timezone string) (*model.ActiveStats, error) {
+	if err := validateUsageTimezone(timezone); err != nil {
+		return nil, err
+	}
 	d, err := parseUsageDate(date)
 	if err != nil {
 		return nil, err
@@ -119,14 +135,14 @@ func (s *UsageService) ActiveStats(ctx context.Context, date, granularity, group
 		GroupBy:     groupBy,
 	}
 	if groupBy == "" {
-		total, err := s.usageRepo.CountActiveUsers(ctx, from, to)
+		total, err := s.usageRepo.CountActiveUsers(ctx, from, to, timezone)
 		if err != nil {
 			return nil, err
 		}
 		out.Total = total
 		return out, nil
 	}
-	groups, err := s.usageRepo.CountActiveUsersGrouped(ctx, from, to, groupBy)
+	groups, err := s.usageRepo.CountActiveUsersGrouped(ctx, from, to, groupBy, timezone)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +157,10 @@ func (s *UsageService) ActiveStats(ctx context.Context, date, granularity, group
 // and distinct users per day or month in [from, to], optionally grouped.
 // PerUserSeconds is total/users — average app-alive seconds per active user
 // in the period.
-func (s *UsageService) DurationStats(ctx context.Context, from, to, granularity, groupBy string) ([]model.UsageDurationRow, error) {
+func (s *UsageService) DurationStats(ctx context.Context, from, to, granularity, groupBy, timezone string) ([]model.UsageDurationRow, error) {
+	if err := validateUsageTimezone(timezone); err != nil {
+		return nil, err
+	}
 	if _, _, err := validateUsageRange(from, to); err != nil {
 		return nil, err
 	}
@@ -151,7 +170,7 @@ func (s *UsageService) DurationStats(ctx context.Context, from, to, granularity,
 	if err := validateUsageGroupBy(groupBy); err != nil {
 		return nil, err
 	}
-	rows, err := s.usageRepo.UsageDurationStats(ctx, from, to, granularity, groupBy)
+	rows, err := s.usageRepo.UsageDurationStats(ctx, from, to, granularity, groupBy, timezone)
 	if err != nil {
 		return nil, err
 	}
@@ -164,11 +183,13 @@ func (s *UsageService) DurationStats(ctx context.Context, from, to, granularity,
 }
 
 // NewUsersStats answers /admin/stats/new-users: signups per calendar day in
-// [from, to], bucketed by users.created_at in the server's timezone (note
-// the deliberately different day boundary from the local_date metrics).
-func (s *UsageService) NewUsersStats(ctx context.Context, from, to string) ([]model.NewUsersRow, error) {
+// [from, to], bucketed by users.created_at in the requested timezone.
+func (s *UsageService) NewUsersStats(ctx context.Context, from, to, timezone string) ([]model.NewUsersRow, error) {
+	if err := validateUsageTimezone(timezone); err != nil {
+		return nil, err
+	}
 	if _, _, err := validateUsageRange(from, to); err != nil {
 		return nil, err
 	}
-	return s.usageRepo.CountNewUsers(ctx, from, to)
+	return s.usageRepo.CountNewUsers(ctx, from, to, timezone)
 }

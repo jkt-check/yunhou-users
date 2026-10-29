@@ -39,12 +39,12 @@ type stubUsageSvc struct{}
 func (stubUsageSvc) RecordBeats(ctx context.Context, userID, appID string, beats []model.UsageBeat) (int, error) {
 	return len(beats), nil
 }
-func (stubUsageSvc) ActiveStats(ctx context.Context, date, granularity, groupBy string) (*model.ActiveStats, error) {
+func (stubUsageSvc) ActiveStats(ctx context.Context, date, granularity, groupBy, timezone string) (*model.ActiveStats, error) {
 	return &model.ActiveStats{}, nil
 }
-func (stubUsageSvc) DurationStats(ctx context.Context, from, to, granularity, groupBy string) ([]model.UsageDurationRow, error) {
+func (stubUsageSvc) DurationStats(ctx context.Context, from, to, granularity, groupBy, timezone string) ([]model.UsageDurationRow, error) {
 	return nil, nil
 }
-func (stubUsageSvc) NewUsersStats(ctx context.Context, from, to string) ([]model.NewUsersRow, error) {
+func (stubUsageSvc) NewUsersStats(ctx context.Context, from, to, timezone string) ([]model.NewUsersRow, error) {
 	return nil, nil
 }

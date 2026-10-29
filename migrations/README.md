@@ -92,3 +92,4 @@ syntax, **not** transaction control — those are fine.
 | `041_zero_price_reservations.sql` | 0 价模型通路（R7-N5）：`inference_reservations.amount_micros` CHECK 放宽为 `>= 0`，对齐 031 对 ledger charge 的同款裁定（零额行由唯一键/状态机统一保护） |
 | `047_kaya_usage_token_stats.sql` | kaya token 用量统计表组（契约 yunhou-terminal `docs/api/usage-stats.md` v1.2）：`usage_token_buckets`（客户端自报聚合桶，唯一键 = 幂等覆盖键，非计费依据）/ `usage_devices`（设备注册/撤销 + 设备级删除水位 + consent）/ `usage_token_watermarks`（全量删除用户级水位）/ `usage_token_tombstones`（窗口删除墓碑）；全部 FK users(id) ON DELETE CASCADE；本仓第四套用量表，与 021 心跳、022 /chat 计量、026 起 inference 计量表组的边界及 v1 无 RLS 的补偿措施见文件头注释 |
 | `048_usage_token_sweep_indexes.sql` | 保留期 sweeper 索引（PR #61 review M2）：047 的 `(user_id, bucket_start)` 联合索引服务不了不带 user_id 谓词的全表清理 DELETE，补 `usage_token_buckets(bucket_start)` 与 `usage_token_tombstones(to_bucket)`；DELETE 分批循环在 repo 层 |
+| `049_usage_events_occurred_at_index.sql` | admin 使用统计统一按请求时区对 `occurred_at` 归日，补时间戳范围查询索引；保留旧 `local_date` 字段及索引以维持上报契约 |

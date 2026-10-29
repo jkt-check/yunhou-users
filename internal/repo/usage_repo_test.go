@@ -25,9 +25,13 @@ func seedUsageUser(t *testing.T, db *sqlx.DB) string {
 }
 
 func usageBeat(localDate string, activeSeconds int, platform, version string) model.UsageBeat {
+	occurredAt, err := time.Parse(time.RFC3339, localDate+"T12:00:00Z")
+	if err != nil {
+		panic(err)
+	}
 	return model.UsageBeat{
 		ClientEventID: newUUID(),
-		OccurredAt:    time.Now(),
+		OccurredAt:    occurredAt,
 		LocalDate:     localDate,
 		ActiveSeconds: activeSeconds,
 		Platform:      platform,
@@ -97,15 +101,15 @@ func TestUsageRepo_CountActiveUsers(t *testing.T) {
 	}
 
 	// DAU for 09-04: both users (u1's two beats count once — DISTINCT).
-	if n, err := r.CountActiveUsers(ctx, "2026-09-04", "2026-09-04"); err != nil || n != 2 {
+	if n, err := r.CountActiveUsers(ctx, "2026-09-04", "2026-09-04", "Asia/Shanghai"); err != nil || n != 2 {
 		t.Errorf("DAU = %d, err = %v; want 2", n, err)
 	}
 	// Rolling window covering both days: still 2 distinct users.
-	if n, err := r.CountActiveUsers(ctx, "2026-08-29", "2026-09-04"); err != nil || n != 2 {
+	if n, err := r.CountActiveUsers(ctx, "2026-08-29", "2026-09-04", "Asia/Shanghai"); err != nil || n != 2 {
 		t.Errorf("window count = %d, err = %v; want 2", n, err)
 	}
 	// Window before any beat: 0.
-	if n, err := r.CountActiveUsers(ctx, "2026-09-01", "2026-09-02"); err != nil || n != 0 {
+	if n, err := r.CountActiveUsers(ctx, "2026-09-01", "2026-09-02", "Asia/Shanghai"); err != nil || n != 0 {
 		t.Errorf("empty window = %d, err = %v; want 0", n, err)
 	}
 }
@@ -127,7 +131,7 @@ func TestUsageRepo_CountActiveUsersGrouped(t *testing.T) {
 		t.Fatalf("seed u2: %v", err)
 	}
 
-	rows, err := r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "platform")
+	rows, err := r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "platform", "Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("grouped: %v", err)
 	}
@@ -139,7 +143,7 @@ func TestUsageRepo_CountActiveUsersGrouped(t *testing.T) {
 		t.Errorf("by platform = %v, want macos:1 windows:1", got)
 	}
 
-	rows, err = r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "app_version")
+	rows, err = r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "app_version", "Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("grouped by version: %v", err)
 	}
@@ -153,7 +157,7 @@ func TestUsageRepo_CountActiveUsersGrouped(t *testing.T) {
 
 	// The column name reaches SQL text — a non-whitelisted value must be
 	// rejected before it can become injection.
-	if _, err := r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "user_id; DROP TABLE users--"); err == nil {
+	if _, err := r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "user_id; DROP TABLE users--", "Asia/Shanghai"); err == nil {
 		t.Error("non-whitelisted group_by must return an error")
 	}
 }
@@ -176,9 +180,9 @@ func TestUsageRepo_UsageDurationStats(t *testing.T) {
 		t.Fatalf("seed u2: %v", err)
 	}
 
-	// Day granularity, cross-month range: beats stay in their own
-	// local_date buckets (no cross-midnight split — client-side semantics).
-	rows, err := r.UsageDurationStats(ctx, "2026-08-31", "2026-09-04", "day", "")
+	// Day granularity, cross-month range: occurred_at determines each beat's
+	// bucket in the requested timezone (no cross-midnight split).
+	rows, err := r.UsageDurationStats(ctx, "2026-08-31", "2026-09-04", "day", "", "Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("day stats: %v", err)
 	}
@@ -193,7 +197,7 @@ func TestUsageRepo_UsageDurationStats(t *testing.T) {
 	}
 
 	// Month granularity: the 08-31 beat lands in 2026-08, the rest in 2026-09.
-	rows, err = r.UsageDurationStats(ctx, "2026-08-01", "2026-09-30", "month", "")
+	rows, err = r.UsageDurationStats(ctx, "2026-08-01", "2026-09-30", "month", "", "Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("month stats: %v", err)
 	}
@@ -205,7 +209,7 @@ func TestUsageRepo_UsageDurationStats(t *testing.T) {
 	}
 
 	// Grouped by platform within one day.
-	rows, err = r.UsageDurationStats(ctx, "2026-09-04", "2026-09-04", "day", "platform")
+	rows, err = r.UsageDurationStats(ctx, "2026-09-04", "2026-09-04", "day", "platform", "Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("grouped stats: %v", err)
 	}
@@ -223,11 +227,15 @@ func TestUsageRepo_CountNewUsers(t *testing.T) {
 	r := NewUsageRepo(db)
 	ctx := context.Background()
 
-	today := time.Now().Format("2006-01-02")
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	today := time.Now().In(location).Format("2006-01-02")
+	yesterday := time.Now().In(location).AddDate(0, 0, -1).Format("2006-01-02")
 
 	// Empty range → no rows (not an error).
-	rows, err := r.CountNewUsers(ctx, yesterday, yesterday)
+	rows, err := r.CountNewUsers(ctx, yesterday, yesterday, "Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("empty range: %v", err)
 	}
@@ -238,11 +246,59 @@ func TestUsageRepo_CountNewUsers(t *testing.T) {
 	seedUsageUser(t, db)
 	seedUsageUser(t, db)
 
-	rows, err = r.CountNewUsers(ctx, today, today)
+	rows, err = r.CountNewUsers(ctx, today, today, "Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("today: %v", err)
 	}
 	if len(rows) != 1 || rows[0].Date != today || rows[0].Users != 2 {
 		t.Errorf("today rows = %v, want one row with 2 users", rows)
+	}
+}
+
+func TestUsageRepo_UsageStatsUseRequestedTimezone(t *testing.T) {
+	db := setupDB(t)
+	r := NewUsageRepo(db)
+	ctx := context.Background()
+	uid := seedUsageUser(t, db)
+
+	beat := usageBeat("2026-09-03", 300, "macos", "2.1.14")
+	beat.OccurredAt = time.Date(2026, 9, 3, 16, 30, 0, 0, time.UTC)
+	if _, err := r.InsertBeats(ctx, uid, usageTestApp, []model.UsageBeat{beat}); err != nil {
+		t.Fatalf("insert boundary beat: %v", err)
+	}
+
+	if n, err := r.CountActiveUsers(ctx, "2026-09-04", "2026-09-04", "Asia/Shanghai"); err != nil || n != 1 {
+		t.Errorf("Beijing DAU = %d, err = %v; want 1", n, err)
+	}
+	if n, err := r.CountActiveUsers(ctx, "2026-09-03", "2026-09-03", "Asia/Shanghai"); err != nil || n != 0 {
+		t.Errorf("previous-day DAU = %d, err = %v; want 0", n, err)
+	}
+	groups, err := r.CountActiveUsersGrouped(ctx, "2026-09-04", "2026-09-04", "platform", "Asia/Shanghai")
+	if err != nil || len(groups) != 1 || groups[0].Users != 1 {
+		t.Errorf("Beijing grouped DAU = %+v, err = %v; want one user", groups, err)
+	}
+	duration, err := r.UsageDurationStats(ctx, "2026-09-04", "2026-09-04", "day", "", "Asia/Shanghai")
+	if err != nil || len(duration) != 1 || duration[0].Period != "2026-09-04" || duration[0].TotalSeconds != 300 {
+		t.Errorf("Beijing duration = %+v, err = %v; want 300 seconds on 2026-09-04", duration, err)
+	}
+}
+
+func TestUsageRepo_NewUsersUseRequestedTimezone(t *testing.T) {
+	db := setupDB(t)
+	r := NewUsageRepo(db)
+	ctx := context.Background()
+	uid := seedUsageUser(t, db)
+	if _, err := db.ExecContext(ctx, `UPDATE users SET created_at = $1 WHERE id = $2`,
+		time.Date(2026, 9, 3, 16, 30, 0, 0, time.UTC), uid); err != nil {
+		t.Fatalf("set boundary created_at: %v", err)
+	}
+
+	rows, err := r.CountNewUsers(ctx, "2026-09-04", "2026-09-04", "Asia/Shanghai")
+	if err != nil || len(rows) != 1 || rows[0].Date != "2026-09-04" || rows[0].Users != 1 {
+		t.Errorf("Beijing new users = %+v, err = %v; want one user on 2026-09-04", rows, err)
+	}
+	rows, err = r.CountNewUsers(ctx, "2026-09-03", "2026-09-03", "Asia/Shanghai")
+	if err != nil || len(rows) != 0 {
+		t.Errorf("previous-day new users = %+v, err = %v; want none", rows, err)
 	}
 }

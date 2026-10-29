@@ -491,7 +491,7 @@ Authorization: Bearer <access_token>
 |---|---|
 | `client_event_id` | 每拍一个 UUIDv4，幂等键：`(user_id, client_event_id)` 唯一约束，重试/补发的重复拍会被吞掉（仍返回 200） |
 | `occurred_at` | 拍发生时刻（RFC3339） |
-| `local_date` | **客户端本地日期**（YYYY-MM-DD），该拍的 `active_seconds` 计入这一天；统计日界以此为准 |
+| `local_date` | **客户端本地日期**（YYYY-MM-DD），为兼容客户端保留的上报字段；admin 统计按 `occurred_at` 和请求 `tz` 归日，不使用该字段决定日界 |
 | `active_seconds` | 距上次成功心跳的存活秒数，客户端每拍封顶 300；服务端接受 0–3600 |
 | `platform` | `macos` / `windows` / `linux` |
 | `app_version` | 客户端版本号（≤64 字符） |
@@ -1340,13 +1340,14 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### GET /admin/stats/active
 
-活跃用户统计（DAU/WAU/MAU），基于 `usage_events` 心跳表。日界按**客户端本地日期**（`local_date`），与 `/admin/stats/new-users` 的服务器时区口径不同。
+活跃用户统计（DAU/WAU/MAU），基于 `usage_events` 心跳表。按 `occurred_at` 在请求 `tz` 对应的时区归日，与 `/admin/stats/new-users` 使用同一日界口径。
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `date` | 否 | 基准日 YYYY-MM-DD，默认今天（服务器时区） |
+| `date` | 否 | 基准日 YYYY-MM-DD，默认 `tz` 对应时区的今天 |
 | `granularity` | 否 | `day`（默认，当天 DAU）/ `week`（`[date-6, date]` 共 7 天 WAU）/ `month`（`[date-29, date]` 共 30 天 MAU） |
 | `group_by` | 否 | `platform` / `app_version`，按维度拆分；`total` 为各组之和（同一用户跨平台会重复计入，与未分组口径不同） |
+| `tz` | 否 | IANA 时区名，缺省或空值使用 `Asia/Shanghai`；非法值及 `Local` 返回 400 |
 
 **响应（200）**：
 
@@ -1363,7 +1364,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### GET /admin/stats/usage-duration
 
-使用时长统计（应用存活时长口径，非交互活跃）。`from` / `to` 必填（闭区间，跨度 ≤366 天），`granularity` = `day`（默认）/ `month`，`group_by` 可选。
+使用时长统计（应用存活时长口径，非交互活跃）。`from` / `to` 必填（闭区间，跨度 ≤366 天），`granularity` = `day`（默认）/ `month`，`group_by` 可选。按 `occurred_at` 在 `tz` 对应时区归入每日/每月，时区参数规则同 `/admin/stats/active`。
 
 **响应（200）**：
 
@@ -1380,7 +1381,7 @@ App 相关接口分散在三种鉴权风格下，BFF 接入时务必看清楚：
 
 #### GET /admin/stats/new-users
 
-新增用户统计，直查 `users.created_at` 按天分组（**服务器时区**日界）。`from` / `to` 必填（闭区间）。
+新增用户统计，直查 `users.created_at`，按 `tz` 对应时区归日（默认 `Asia/Shanghai`）。`from` / `to` 必填（闭区间），时区参数规则同 `/admin/stats/active`。
 
 **响应（200）**：
 

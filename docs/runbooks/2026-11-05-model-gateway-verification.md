@@ -1147,6 +1147,142 @@ skipped=0`).
 | `internal/inference/postgres/quota_settlement_test.go` | T2 store cases (window-less settle, deleted reservations, concurrent finalize, window-less release) |
 | `internal/inference/workers/settlement_recovery_test.go` | T2 recovery cases (durable estimate, evidence-less row) |
 
+#### 4.16 T2 fix round — terminal-outcome classification, typed release outcome, reason persistence
+
+Recorded on 2026-11-06, base SHA `b8439fe` (the T2 commit). Three review
+findings were fixed with TDD; the fix round adds **one** appended migration
+(`051`) and touches the domain, the store, the gateway, the recovery worker
+and the reconciliation vocabulary.
+
+**Environment.** Same recipe as §4.9: a fresh trap-cleaned disposable
+PostgreSQL per run, explicit `DATABASE_URL` / `E2E_DATABASE_URL`, `-p 1`,
+`-race`, `GOPROXY=off` + `GOFLAGS=-mod=readonly`, `go.mod` / `go.sum`
+untouched.
+
+##### 4.16.1 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | **RED** `go test -count=1 -run 'TestSettle_SettledWithoutChargeRow_ClassifiesLedgerDrift\|TestSettle_SettledWithDifferentCharge_ClassifiesChargeMismatch\|TestSettle_MoreHeldThanExpected_ClassifiesReservationDrift\|TestRelease_MissingReservation_ReturnsTypedOutcome\|TestReconciliationJob_ManualOnlyReasonTakesOver' -v ./internal/inference/postgres` | **1** | the three terminal classes were indistinguishable, the release path was untyped, the reason was not taken over — see §4.16.2 |
+| 2 | **RED** `go test -count=1 -run 'TestRecover_TerminalOutcomeClassification\|TestRecover_MissingReservationRelease_ParksWithoutReplay\|TestRecover_ManualOnlyJobIsNotDriven\|TestRecover_InsufficientEvidence_DoesNotReDriveEveryPass' -v ./internal/inference/workers` | **1** | the drift classes were swallowed as a benign race; the release anomaly was invisible; the manual-only job was driven — see §4.16.3 |
+| 3 | `go run ./cmd/migrate` (run 1) | **0** | `applied=51 skipped=0` (50 + 051) |
+| 4 | `go run ./cmd/migrate` (run 2) | **0** | `applied=0 skipped=51` (idempotent) |
+| 5 | **GREEN** the same command as #1 | **0** | 5/5 pass |
+| 6 | **GREEN** the same command as #2 | **0** | 4/4 pass (10 subtests) |
+| 7 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/quota ./internal/inference/postgres ./internal/inference/gateway ./internal/inference/workers` | **0** | 4 packages `ok` (1.553s / 14.057s / 9.674s / 8.401s) |
+| 8 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, 1154 PASS / 1 SKIP / 0 FAIL |
+| 9 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 52 PASS / 2 SKIP / 0 FAIL |
+| 10 | `go test -race -count=1 ./tests/e2e/...` | **0** | `ok github.com/yunhou/users/tests/e2e 210.998s` |
+| 11 | `go vet ./internal/... ./cmd/...` + `go build ./...` | **0** / **0** | lint + build green |
+| 12 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` + coverage floor | **0** | 33 packages `ok`, 0 `FAIL`, `total coverage: 80.4%` ≥ the 80% floor (T2 80.3%) |
+
+##### 4.16.2 RED — the store classification (command #1)
+
+```
+=== RUN   TestSettle_SettledWithoutChargeRow_ClassifiesLedgerDrift
+    quota_settlement_test.go:997: outcome = "mismatch", want ledger_drift (账本无 charge 行 ≠ 金额不一致)
+--- FAIL: TestSettle_SettledWithoutChargeRow_ClassifiesLedgerDrift (0.10s)
+=== RUN   TestSettle_SettledWithDifferentCharge_ClassifiesChargeMismatch
+    quota_settlement_test.go:1015: outcome = "mismatch", want charge_mismatch (金额不一致的重复结算)
+--- FAIL: TestSettle_SettledWithDifferentCharge_ClassifiesChargeMismatch (0.11s)
+=== RUN   TestSettle_MoreHeldThanExpected_ClassifiesReservationDrift
+    quota_settlement_test.go:1069: outcome = "mismatch", want reservation_drift (held 数多于准入创建)
+--- FAIL: TestSettle_MoreHeldThanExpected_ClassifiesReservationDrift (0.11s)
+=== RUN   TestRelease_MissingReservation_ReturnsTypedOutcome
+    quota_settlement_test.go:1105: err = inference/conflict: release: the expected monetary reservation is missing (accounting anomaly), want a typed settlement outcome (缺预占必须可识别)
+--- FAIL: TestRelease_MissingReservation_ReturnsTypedOutcome (0.12s)
+=== RUN   TestReconciliationJob_ManualOnlyReasonTakesOver
+    recovery_test.go:1087: job reason = "unknown_usage", want missing_reservation (人工原因必须接管)
+--- FAIL: TestReconciliationJob_ManualOnlyReasonTakesOver (0.10s)
+```
+
+All three "already terminal" cases collapsed into one `mismatch` kind, the
+release path returned an **untyped** conflict, and an open job kept its
+evidence-driven reason.
+
+##### 4.16.3 RED — the recovery classification (command #2)
+
+```
+=== RUN   TestRecover_TerminalOutcomeClassification/ledger_drift
+    settlement_recovery_outcomes_test.go:157: stats = {… RacingSkipped:1 … Errors:0}, want an alarm (账务异常必须响亮)
+    settlement_recovery_outcomes_test.go:160: stats = {… RacingSkipped:1 …}, want no benign skip (账务异常不得当竞态)
+    settlement_recovery_outcomes_test.go:164: reconciliation reason = [], want [ledger_drift]
+--- FAIL: TestRecover_TerminalOutcomeClassification/ledger_drift (0.00s)
+=== RUN   TestRecover_TerminalOutcomeClassification/reservation_drift
+    … want an alarm (账务异常必须响亮) …
+--- FAIL: TestRecover_TerminalOutcomeClassification/reservation_drift (0.00s)
+    --- PASS: …/duplicate, …/charge_mismatch, …/missing_reservation, …/released
+--- FAIL: TestRecover_TerminalOutcomeClassification (0.00s)
+=== RUN   TestRecover_MissingReservationRelease_ParksWithoutReplay
+    settlement_recovery_outcomes_test.go:188: stats = {… RacingSkipped:1 …}, want an alarm (缺预占必须响亮)
+    settlement_recovery_outcomes_test.go:201: request status = "reserved", want reconciliation_required (停放进专门核对)
+    settlement_recovery_outcomes_test.go:205: no reconciliation job: 缺预占必须进入专门核对
+--- FAIL: TestRecover_MissingReservationRelease_ParksWithoutReplay (0.07s)
+=== RUN   TestRecover_ManualOnlyJobIsNotDriven/insufficient_evidence
+    settlement_recovery_outcomes_test.go:271: stats = {… SettledConservative:1 …}, want no automatic settlement (人工原因不得被驱动)
+    settlement_recovery_outcomes_test.go:278: request status = "settled", want reconciliation_required (保持停放)
+    settlement_recovery_outcomes_test.go:281: settled = 50000, want 0 (人工原因不得自动入账)
+--- FAIL: TestRecover_ManualOnlyJobIsNotDriven/insufficient_evidence (0.08s)
+    --- PASS: …/missing_reservation, …/late_usage_after_release, …/settlement_mismatch
+--- FAIL: TestRecover_ManualOnlyJobIsNotDriven (0.31s)
+=== RUN   TestRecover_InsufficientEvidence_DoesNotReDriveEveryPass
+    settlement_recovery_outcomes_test.go:347: pass 2 stats = {… ParkedNoEvidence:1 …}, want no re-drive (已停放的任务不得每轮重放)
+    settlement_recovery_outcomes_test.go:347: pass 3 stats = {… ParkedNoEvidence:1 …}, want no re-drive
+--- FAIL: TestRecover_InsufficientEvidence_DoesNotReDriveEveryPass (0.09s)
+```
+
+The four subtests that already passed (`duplicate`, `charge_mismatch`,
+`missing_reservation`, `released`) are **protection evidence** for the
+behaviour that must not change.
+
+##### 4.16.4 GREEN
+
+Command #5 (exit 0): 5/5 store cases pass. Command #6 (exit 0): 4/4
+recovery cases pass, all 10 subtests green — including the two drift classes
+that now alarm and file their dedicated job, the release-path anomaly that
+now parks the request without a terminal success, and the manual-only job
+that is no longer driven.
+
+##### 4.16.5 Migration
+
+**One appended migration: `migrations/051_inference_reconciliation_reasons.sql`**
+(51 = the re-checked latest number; 050 was the T2 baseline). It only widens
+the `inference_reconciliation_jobs.reason` CHECK with the two new dedicated
+classes `ledger_drift` and `reservation_drift` — the reason vocabulary is
+enforced by a DB CHECK, and Finding 1 requires the two genuine drift classes
+to be persisted and queryable **distinctly** (the previous single `mismatch`
+reason is what let the recovery treat them as a benign race). No historical
+migration was rewritten and no historical ledger row was touched; the
+pre-existing reasons keep their meaning.
+
+##### 4.16.6 What the fix round changed
+
+| Area | Change |
+|---|---|
+| `internal/inference/domain/settlement_outcome.go` | the single `mismatch` kind is split into `charge_mismatch` (an inconsistent duplicate — the gateway alarms, the recovery's estimate yields), `ledger_drift` (settled but no charge row) and `reservation_drift` (held count ≠ admission) |
+| `internal/inference/postgres/ledger_repo.go` | the settled classification returns the three distinct kinds; the reservation-count check returns `missing_reservation` (fewer) or `reservation_drift` (more) |
+| `internal/inference/postgres/reservation_repo.go` | the **release** path returns the same typed outcomes (`missing_reservation` / `reservation_drift`) instead of an untyped conflict |
+| `internal/inference/postgres/reconciliation_reasons.go` | **new** — the single reason vocabulary and the `ManualOnlyReconciliationReasons` set (the evidence-driven vs manual-only split), shared by the upsert and the recovery skip list |
+| `internal/inference/postgres/reconciliation_repo.go` | the upsert takes over an open job's reason when the incoming reason is manual-only (and never downgrades a manual-only reason); the detail merge keeps the prior audit content and a `reason_history` array records the replaced reason |
+| `internal/inference/gateway/service.go` | the classification maps each kind to its own reconciliation reason (`settlement_mismatch`, `ledger_drift`, `reservation_drift`, `missing_reservation`, `late_usage_after_release`); the inconsistent-duplicate anomaly behaviour is unchanged |
+| `internal/inference/workers/settlement_recovery.go` | only `duplicate` and `charge_mismatch` are benign skips; every other kind alarms and is parked or filed; the skip list is the shared manual-only vocabulary (so `insufficient_evidence` is skipped too); `parkForManual` no longer returns early without correcting the reason |
+| `migrations/051_inference_reconciliation_reasons.sql` | **new** — the two new reasons |
+
+**Compatibility.** No client-visible contract changes (no new enum, field or
+error shape on the wire); the OpenAPI spec and the integration guide need no
+update. The store's transaction boundaries, the fixed lock order, the
+one-charge-per-request uniqueness, the legacy no-backfill behaviour and the
+T1 credential behaviour are untouched. The only behavioural change is that
+the two genuine drift classes and the release-path anomaly are now **loud**
+(alarm + dedicated reconciliation job) instead of being swallowed as a
+benign race.
+
+##### 4.16.7 Skips
+
+The skip inventory is unchanged: `TestQuotaWorkerProcess`
+(`KAYA_QUOTA_WORKER=1`), `TestLoadDrill_Throughput` and
+`TestLoadDrill_LongConnections` (`KAYA_LOAD=1`). **Database-test skips: 0.**
+
 #### 4.15 Notes (root cause, compatibility, honesty)
 
 - **Root cause (three defects, one symptom).** (1) `postgres.Store.Settle`

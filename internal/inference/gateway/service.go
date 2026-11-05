@@ -682,7 +682,7 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 // holdForReconciliation parks the request with its reservation intact and
 // reports the dispatch failure.
 func (s *Service) holdForReconciliation(requestID string, cause error) error {
-	s.markReconciliation(requestID, "unknown_usage",
+	s.markReconciliation(requestID, postgres.ReasonUnknownUsage,
 		fmt.Sprintf("dispatch failed with unknown execution state: %v", cause))
 	return domain.WrapError(domain.CodeUpstreamUnavailable,
 		"upstream execution state unknown; reservation held for reconciliation", cause)
@@ -990,7 +990,7 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 		case !tap.SawUsage && !tap.Terminal:
 			// Interrupted with NO usage read: hold the reservation, park for
 			// reconciliation — 不记零、不静默释放 (设计 §7.2).
-			s.markReconciliation(requestID, "unknown_usage",
+			s.markReconciliation(requestID, postgres.ReasonUnknownUsage,
 				"stream interrupted before any usage was reported")
 			return nil
 		case tap.SawUsage && tap.Terminal && !emptyBuckets(tap.Buckets):
@@ -1071,7 +1071,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		RawUsage: domain.ExtensionConfig{SchemaVersion: 1, Raw: raw},
 	}, price, adapter.Inclusion(), adm.HoldMicros)
 	if err != nil {
-		s.parkSettleFailure(requestID, "unknown_usage", fmt.Errorf("settle decision: %w", err))
+		s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, fmt.Errorf("settle decision: %w", err))
 		return
 	}
 
@@ -1088,7 +1088,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		// 钱包路径（Task 14）：金额计费，货币随冻结钱包；charge 与
 		// ChargeMicros 同源（settle 事务内校验一致）。
 		if decision.Charge.Money == nil {
-			s.parkSettleFailure(requestID, "unknown_usage", fmt.Errorf("settle decision: wallet path produced no money charge"))
+			s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, fmt.Errorf("settle decision: wallet path produced no money charge"))
 			return
 		}
 		cmd.WalletCharge = decision.Charge.Money
@@ -1142,13 +1142,13 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		}
 		if domain.CodeOf(lastErr) == domain.CodeConflict {
 			// 不是已分类的终态结果的冲突 = 账本漂移，绝不静默当成功。
-			s.parkSettleFailure(requestID, "unknown_usage",
+			s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage,
 				fmt.Errorf("settle: unclassified conflict: %w", lastErr))
 			return
 		}
 	}
 parked:
-	s.parkSettleFailure(requestID, "unknown_usage", fmt.Errorf("settle: %w", lastErr))
+	s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, fmt.Errorf("settle: %w", lastErr))
 }
 
 // classifySettleOutcome maps a typed terminal settlement result onto the
@@ -1169,16 +1169,26 @@ func (s *Service) classifySettleOutcome(requestID string, se *domain.SettleError
 		if se.Trivial {
 			return // released 之后到来的零用量投递：无事可记，不告警。
 		}
-		s.reportSettlementAnomaly(requestID, "late_usage_after_release", se)
+		s.reportSettlementAnomaly(requestID, postgres.ReasonLateUsageAfterRelease, se)
 		return
-	case domain.SettleOutcomeMismatch:
-		s.reportSettlementAnomaly(requestID, "settlement_mismatch", se)
+	case domain.SettleOutcomeChargeMismatch:
+		// 不一致的重复结算 = 双扣风险：告警并进入专门核对（绝不静默吞掉）。
+		s.reportSettlementAnomaly(requestID, postgres.ReasonSettlementMismatch, se)
+		return
+	case domain.SettleOutcomeLedgerDrift:
+		// 账本漂移（已结算却无 charge 行）：告警并进入专门核对。
+		s.reportSettlementAnomaly(requestID, postgres.ReasonLedgerDrift, se)
+		return
+	case domain.SettleOutcomeReservationDrift:
+		// 预占漂移（held 数与准入不符）：请求无法结算 → 停放并告警。
+		s.parkSettleFailure(requestID, postgres.ReasonReservationDrift, se)
 		return
 	case domain.SettleOutcomeMissingReservation:
-		s.parkSettleFailure(requestID, "missing_reservation", se)
+		// 缺预占：请求无法结算 → 停放并告警。
+		s.parkSettleFailure(requestID, postgres.ReasonMissingReservation, se)
 		return
 	}
-	s.parkSettleFailure(requestID, "unknown_usage", se)
+	s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, se)
 }
 
 // reportSettlementAnomaly alarms and files a dedicated reconciliation job

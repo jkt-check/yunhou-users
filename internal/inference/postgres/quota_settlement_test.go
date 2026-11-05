@@ -897,3 +897,225 @@ func TestReleaseWithoutMonetaryHoldFinalizesWindowlessRequest(t *testing.T) {
 		t.Errorf("charges = %d, want 0 (确认零消费不入账)", charges)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T2 fix round — 终态投递的分类必须可区分（账本漂移 / 金额不一致 / 预占漂移）
+// ---------------------------------------------------------------------------
+
+// settleOutcomeKind extracts the typed terminal outcome of a failed
+// settlement/release.
+//
+// The kind is compared as a plain string literal (not a typed constant) on
+// purpose: these regression tests pin the *classification* of each terminal
+// outcome, and they stay compilable against the pre-fix code — so the RED
+// evidence can be reproduced by reverting the production files alone.
+func settleOutcomeKind(err error) (string, bool) {
+	var se *domain.SettleError
+	if !errors.As(err, &se) {
+		return "", false
+	}
+	return string(se.Kind), true
+}
+
+// settledRequestWithCharge reserves one request, settles it at `charge` and
+// returns (requestID, attemptID).
+func settledRequestWithCharge(t *testing.T, s *Store, f fixture, w5, ww, wm string,
+	hold, charge domain.Microcredit) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, hold))
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatalf("reserve: %v", err)
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatal(err)
+	}
+	in, out := int64(10), int64(5)
+	err = s.Settle(ctx, uow, domain.SettleCommand{
+		RequestID: adm.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: charge, SettledAt: time.Now().UTC(),
+	})
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatalf("settle: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return adm.RequestID, attID
+}
+
+// settleAgain re-delivers a settlement for an already-settled request.
+func settleAgain(t *testing.T, s *Store, requestID, attemptID string, charge domain.Microcredit) error {
+	t.Helper()
+	ctx := context.Background()
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, out := int64(10), int64(5)
+	err = s.Settle(ctx, uow, domain.SettleCommand{
+		RequestID: requestID,
+		Usage: domain.UsageRecord{
+			RequestID: requestID, AttemptID: attemptID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: charge, SettledAt: time.Now().UTC(),
+	})
+	_ = uow.Rollback(ctx)
+	return err
+}
+
+// TestSettle_SettledWithoutChargeRow_ClassifiesLedgerDrift — 请求已结算但
+// 账本上没有 charge 行 = 真正的账本漂移，必须与"金额不一致的重复结算"分开
+// 分类（否则恢复 worker 会把它当良性竞态吞掉）。
+func TestSettle_SettledWithoutChargeRow_ClassifiesLedgerDrift(t *testing.T) {
+	_, s := testDB(t)
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	reqID, attID := settledRequestWithCharge(t, s, f, w5, ww, wm, 100_000, 60_000)
+	// 账本漂移：charge 行不见了，请求仍是 settled。
+	if _, err := s.db.Exec(
+		`DELETE FROM inference_ledger_entries WHERE request_id = $1 AND entry_type = 'charge'`, reqID); err != nil {
+		t.Fatal(err)
+	}
+
+	err := settleAgain(t, s, reqID, attID, 90_000)
+	kind, ok := settleOutcomeKind(err)
+	if !ok {
+		t.Fatalf("err = %v, want a typed settlement outcome", err)
+	}
+	if kind != "ledger_drift" {
+		t.Errorf("outcome = %q, want ledger_drift (账本无 charge 行 ≠ 金额不一致)", kind)
+	}
+}
+
+// TestSettle_SettledWithDifferentCharge_ClassifiesChargeMismatch — 已结算
+// 但金额不一致 = 不一致的重复结算（双扣风险），必须与账本漂移分开分类。
+func TestSettle_SettledWithDifferentCharge_ClassifiesChargeMismatch(t *testing.T) {
+	_, s := testDB(t)
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	reqID, attID := settledRequestWithCharge(t, s, f, w5, ww, wm, 100_000, 60_000)
+	err := settleAgain(t, s, reqID, attID, 90_000)
+	kind, ok := settleOutcomeKind(err)
+	if !ok {
+		t.Fatalf("err = %v, want a typed settlement outcome", err)
+	}
+	if kind != "charge_mismatch" {
+		t.Errorf("outcome = %q, want charge_mismatch (金额不一致的重复结算)", kind)
+	}
+}
+
+// TestSettle_MoreHeldThanExpected_ClassifiesReservationDrift — held 预占数
+// 多于准入创建的 = 预占漂移，必须与上面两类分开（否则恢复 worker 把它当
+// 良性竞态，窗口的预占会一直悬挂）。
+func TestSettle_MoreHeldThanExpected_ClassifiesReservationDrift(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatal(err)
+	}
+	// 多出一条不属于该准入的 held 预占（准入只创建 4 条）。
+	if _, err := mustTx(t, uow).ExecContext(ctx,
+		`INSERT INTO inference_reservations (id, request_id, target_kind, amount_micros, state)
+		 VALUES ($1, $2, 'wallet', 1000, 'held')`, uuid.NewString(), adm.RequestID); err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatal(err)
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	in, out := int64(10), int64(5)
+	uow2, _ := s.Begin(ctx)
+	err = s.Settle(ctx, uow2, domain.SettleCommand{
+		RequestID: adm.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: 60_000, SettledAt: time.Now().UTC(),
+	})
+	_ = uow2.Rollback(ctx)
+	kind, ok := settleOutcomeKind(err)
+	if !ok {
+		t.Fatalf("err = %v, want a typed settlement outcome", err)
+	}
+	if kind != "reservation_drift" {
+		t.Errorf("outcome = %q, want reservation_drift (held 数多于准入创建)", kind)
+	}
+}
+
+// TestRelease_MissingReservation_ReturnsTypedOutcome — 释放路径发现"本应存在
+// 的金额预占不见了"时必须返回可识别的 typed 结果（恢复 worker 才能把它与
+// 良性竞态分开：响亮地停放/核对，而不是当成竞态跳过）。
+func TestRelease_MissingReservation_ReturnsTypedOutcome(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 预占消失（丢失/被篡改）。
+	if _, err := s.db.Exec(
+		`DELETE FROM inference_reservations WHERE request_id = $1 AND state = 'held'`, adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+
+	uow2, _ := s.Begin(ctx)
+	err = s.Release(ctx, uow2, adm.RequestID)
+	_ = uow2.Rollback(ctx)
+	kind, ok := settleOutcomeKind(err)
+	if !ok {
+		t.Fatalf("err = %v, want a typed settlement outcome (缺预占必须可识别)", err)
+	}
+	if kind != "missing_reservation" {
+		t.Errorf("outcome = %q, want missing_reservation", kind)
+	}
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status == domain.ReqReleased {
+		t.Error("status = released — 缺预占时释放绝不能静默成功（不得伪造终态）")
+	}
+}

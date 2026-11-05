@@ -1027,3 +1027,66 @@ func TestReleaseKeyBudgetGuardConflict(t *testing.T) {
 		t.Errorf("status = %q, want not released after guard conflict", req.Status)
 	}
 }
+
+// TestReconciliationJob_ManualOnlyReasonTakesOver — 一个仍挂起的核对任务
+// （reason=unknown_usage）后来发现属于"只能人工处理"的异常类别时，任务的
+// reason 必须被纠正为该异常原因：否则恢复 worker 会继续按证据驱动路径反复
+// 重放并重复告警（no-re-drive 保证失效）。detail 的既有审计内容不得丢失。
+func TestReconciliationJob_ManualOnlyReasonTakesOver(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().UTC().Add(24 * time.Hour)
+
+	// 第一次投递：证据驱动的原因（网关停放未知用量），带审计细节。
+	uow2, _ := s.Begin(ctx)
+	if err := s.EnqueueReconciliationJobTx(ctx, uow2, EnqueueReconciliationCommand{
+		RequestID: &adm.RequestID, Reason: "unknown_usage",
+		Detail:   json.RawMessage(`{"schema_version":1,"audit":"first-delivery"}`),
+		Deadline: deadline,
+	}); err != nil {
+		_ = uow2.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第二次投递：只能人工处理的异常原因（缺预占）。
+	uow3, _ := s.Begin(ctx)
+	if err := s.EnqueueReconciliationJobTx(ctx, uow3, EnqueueReconciliationCommand{
+		RequestID: &adm.RequestID, Reason: "missing_reservation",
+		Detail:   json.RawMessage(`{"schema_version":1,"outcome":"missing_reservation"}`),
+		Deadline: deadline,
+	}); err != nil {
+		_ = uow3.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow3.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var reason, detail string
+	if err := s.db.QueryRow(
+		`SELECT reason, detail::text FROM inference_reconciliation_jobs WHERE request_id = $1`,
+		adm.RequestID).Scan(&reason, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "missing_reservation" {
+		t.Errorf("job reason = %q, want missing_reservation (人工原因必须接管)", reason)
+	}
+	if !strings.Contains(detail, "first-delivery") {
+		t.Errorf("job detail = %s, want the first delivery's audit detail preserved", detail)
+	}
+}

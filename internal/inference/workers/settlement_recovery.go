@@ -360,10 +360,10 @@ func (w *SettlementRecovery) processJob(ctx context.Context, job postgres.Reconc
 		stats.JobsAwaitingEvidence++
 		return
 	}
-	// 账务异常任务（缺预占 / released 后晚到用量 / 结算不一致）等人工与证
-	// 据：不再自动驱动结算 —— 缺预占永远结不成，反复重试只会每轮重复告警。
-	switch job.Reason {
-	case "missing_reservation", "late_usage_after_release", "settlement_mismatch":
+	// 只能人工处理的任务（缺预占 / 终态后晚到用量 / 金额不一致 / 账本漂移 /
+	// 预占漂移 / 证据不足）等人工与证据：不再自动驱动结算 —— 这些异常按定义
+	// 就结不成，反复驱动只会每轮重复告警。
+	if postgres.IsManualOnlyReconciliationReason(job.Reason) {
 		stats.JobsAwaitingEvidence++
 		return
 	}
@@ -452,7 +452,7 @@ func (w *SettlementRecovery) settleUnknownCharge(ctx context.Context, req *domai
 	if !ok {
 		stats.ParkedNoEvidence++
 		log.Printf("ALARM inference recovery: request %s carries no recoverable estimate — kept for manual reconciliation (不得按 0 记零放行)", req.ID)
-		w.parkForManual(ctx, req, "insufficient_evidence", stats)
+		w.parkForManual(ctx, req, postgres.ReasonInsufficientEvidence, stats)
 		return
 	}
 
@@ -484,8 +484,10 @@ func (w *SettlementRecovery) settleUnknownCharge(ctx context.Context, req *domai
 // reconciliation queue: nothing is charged, nothing is released and the hold
 // stays (禁止仅凭 TTL 释放/记零 —— 设计 §7.2).
 func (w *SettlementRecovery) parkForManual(ctx context.Context, req *domain.Request, reason string, stats *PassStats) {
-	if req.Status == domain.ReqReconciliationRequired {
-		return // already parked — its job tracks it
+	if req.Status == domain.ReqSettled || req.Status == domain.ReqReleased {
+		// 终态请求：只登记核对任务，绝不改写终态。
+		w.reportAnomaly(ctx, req.ID, reason, nil)
+		return
 	}
 	uow, err := w.store.Begin(ctx)
 	if err != nil {
@@ -617,12 +619,7 @@ func (w *SettlementRecovery) noteConflictOrError(ctx context.Context, req *domai
 		case domain.SettleOutcomeDuplicate:
 			stats.RacingSkipped++
 			return
-		case domain.SettleOutcomeReleased:
-			stats.Errors++
-			log.Printf("ALARM inference recovery: %s %s: late usage after release — accounting anomaly", op, requestID)
-			w.reportAnomaly(ctx, requestID, "late_usage_after_release", se)
-			return
-		case domain.SettleOutcomeMismatch:
+		case domain.SettleOutcomeChargeMismatch:
 			// The live path already booked a charge and the recovery's
 			// CONSERVATIVE ESTIMATE differs from it. The estimate yields to
 			// the recorded charge (设计 §7.2: 估算可被真实证据冲正) — nothing
@@ -633,12 +630,27 @@ func (w *SettlementRecovery) noteConflictOrError(ctx context.Context, req *domai
 			stats.RacingSkipped++
 			log.Printf("WARN inference recovery: %s %s: already settled with a different amount — the conservative estimate yields (不重复入账)", op, requestID)
 			return
+		case domain.SettleOutcomeReleased:
+			stats.Errors++
+			log.Printf("ALARM inference recovery: %s %s: late usage after release — accounting anomaly", op, requestID)
+			w.reportAnomaly(ctx, requestID, postgres.ReasonLateUsageAfterRelease, se)
+			return
+		case domain.SettleOutcomeLedgerDrift:
+			stats.Errors++
+			log.Printf("ALARM inference recovery: %s %s: ledger drift — the request is settled but the ledger holds no charge", op, requestID)
+			w.parkForManual(ctx, req, postgres.ReasonLedgerDrift, stats)
+			return
+		case domain.SettleOutcomeReservationDrift:
+			stats.Errors++
+			log.Printf("ALARM inference recovery: %s %s: reservation drift — the held reservations do not match the admission", op, requestID)
+			w.parkForManual(ctx, req, postgres.ReasonReservationDrift, stats)
+			return
 		case domain.SettleOutcomeMissingReservation:
 			stats.Errors++
 			log.Printf("ALARM inference recovery: %s %s: the expected monetary reservation is missing — accounting anomaly", op, requestID)
 			// The request can never settle (its holds are gone): park it so
 			// the sweep stops re-alarming, and file the dedicated job.
-			w.parkForManual(ctx, req, "missing_reservation", stats)
+			w.parkForManual(ctx, req, postgres.ReasonMissingReservation, stats)
 			return
 		}
 	}
@@ -654,13 +666,16 @@ func (w *SettlementRecovery) noteConflictOrError(ctx context.Context, req *domai
 // whose settlement hit an accounting anomaly (the terminal state itself is
 // never rewritten).
 func (w *SettlementRecovery) reportAnomaly(ctx context.Context, requestID, reason string, se *domain.SettleError) {
-	detail, _ := json.Marshal(map[string]interface{}{
-		"schema_version":          1,
-		"reason":                  reason,
-		"outcome":                 string(se.Kind),
-		"status":                  string(se.Status),
-		"requested_charge_micros": int64(se.RequestedChargeMicros),
-	})
+	doc := map[string]interface{}{
+		"schema_version": 1,
+		"reason":         reason,
+	}
+	if se != nil {
+		doc["outcome"] = string(se.Kind)
+		doc["status"] = string(se.Status)
+		doc["requested_charge_micros"] = int64(se.RequestedChargeMicros)
+	}
+	detail, _ := json.Marshal(doc)
 	uow, err := w.store.Begin(ctx)
 	if err != nil {
 		log.Printf("ERROR inference recovery: anomaly report begin %s: %v", requestID, err)

@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/lib/pq"
+
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
 )
@@ -60,31 +62,58 @@ func (s *Store) EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfW
 		detail = json.RawMessage(`{"schema_version":1}`)
 	}
 	if cmd.RequestID != nil {
-		// Upsert: merge detail, extend the deadline. A new reason over a
-		// resolved/escalated job is NEW information (e.g. the correction that
-		// resolved crash_recovery just detected an overage) → reopen pending
-		// under the new reason; the merged detail keeps the prior history.
-		// Same-reason re-delivery over an open job is the idempotent merge.
+		// Upsert: merge detail, extend the deadline.
+		//
+		// 原因的**接管规则**（T2 修复轮）：一个请求至多一个核对任务，任务
+		// 的原因就是恢复 worker 判断"能不能自动驱动"的唯一依据，因此原因
+		// 必须与实际分类保持一致：
+		//   - 只能人工处理的原因（$6 = ManualOnlyReconciliationReasons）必须
+		//     接管一个仍挂起的、证据驱动原因的任务 —— 否则恢复 worker 会继续
+		//     按证据驱动路径反复重放并重复告警；
+		//   - 人工原因永不被降级回证据驱动原因（既有的人工结论不被覆盖）；
+		//   - 已关闭（resolved/escalated）且原因是新的 → 重开为 pending
+		//     （新信息），detail 合并保留既有审计内容，reason_history 记录
+		//     被替换掉的原因。
+		//
+		// changed（下面 SQL 里重复使用的同一条件）：
+		//   非人工原因 AND（人工新原因 OR（已关闭 AND 原因不同））。
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO inference_reconciliation_jobs (id, request_id, reason, detail, deadline_at)
 			 VALUES ($1,$2,$3,$4,$5)
 			 ON CONFLICT (request_id) DO UPDATE
-			 SET detail = inference_reconciliation_jobs.detail || EXCLUDED.detail,
+			 SET detail = inference_reconciliation_jobs.detail || EXCLUDED.detail
+			         || CASE WHEN (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			                   AND (EXCLUDED.reason = ANY($6)
+			                        OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                            AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
+			              THEN jsonb_build_object('reason_history',
+			                   COALESCE(inference_reconciliation_jobs.detail->'reason_history', '[]'::jsonb)
+			                   || jsonb_build_array(inference_reconciliation_jobs.reason))
+			              ELSE '{}'::jsonb END,
 			     deadline_at = GREATEST(inference_reconciliation_jobs.deadline_at, EXCLUDED.deadline_at),
 			     status = CASE
 			         WHEN inference_reconciliation_jobs.status IN ('resolved','escalated')
-			          AND inference_reconciliation_jobs.reason <> EXCLUDED.reason
+			          AND (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			               AND (EXCLUDED.reason = ANY($6)
+			                    OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                        AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
 			         THEN 'pending' ELSE inference_reconciliation_jobs.status END,
 			     reason = CASE
-			         WHEN inference_reconciliation_jobs.status IN ('resolved','escalated')
-			          AND inference_reconciliation_jobs.reason <> EXCLUDED.reason
+			         WHEN (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			               AND (EXCLUDED.reason = ANY($6)
+			                    OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                        AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
 			         THEN EXCLUDED.reason ELSE inference_reconciliation_jobs.reason END,
 			     resolved_at = CASE
 			         WHEN inference_reconciliation_jobs.status IN ('resolved','escalated')
-			          AND inference_reconciliation_jobs.reason <> EXCLUDED.reason
+			          AND (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			               AND (EXCLUDED.reason = ANY($6)
+			                    OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                        AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
 			         THEN NULL ELSE inference_reconciliation_jobs.resolved_at END,
 			     updated_at = now()`,
-			uuid.NewString(), *cmd.RequestID, cmd.Reason, detail, cmd.Deadline)
+			uuid.NewString(), *cmd.RequestID, cmd.Reason, detail, cmd.Deadline,
+			pq.Array(ManualOnlyReconciliationReasons))
 		return mapError("reconciliation: enqueue request job", err)
 	}
 	if cmd.WindowID == "" {

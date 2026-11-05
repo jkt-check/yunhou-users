@@ -104,8 +104,8 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		kind := domain.SettleOutcomeMissingReservation
 		message := "settle: the expected monetary reservation is missing"
 		if len(rows) > expected {
-			kind = domain.SettleOutcomeMismatch
-			message = "settle: more held reservations than the admission created (ledger drift)"
+			kind = domain.SettleOutcomeReservationDrift
+			message = "settle: more held reservations than the admission created (reservation drift)"
 		}
 		return &domain.SettleError{
 			Kind: kind, Code: domain.CodeConflict, Message: message,
@@ -225,9 +225,10 @@ func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 		 WHERE request_id = $1 AND entry_type = 'charge'`, cmd.RequestID).Scan(&amount)
 	if err != nil {
 		if domain.CodeOf(mapError("settle: load charge", err)) == domain.CodeNotFound {
-			// 已结算却没有 charge 行 = 账本漂移，绝不当作重复成功。
+			// 已结算却没有 charge 行 = 账本漂移，绝不当作重复成功（调用方
+			// 必须告警并核对，不能当"良性竞态"跳过）。
 			return &domain.SettleError{
-				Kind: domain.SettleOutcomeMismatch, Code: domain.CodeConflict,
+				Kind: domain.SettleOutcomeLedgerDrift, Code: domain.CodeConflict,
 				Message: "settle: request is settled but the ledger holds no charge (ledger drift)",
 				Status:  status, RequestedChargeMicros: cmd.ChargeMicros,
 			}
@@ -237,7 +238,7 @@ func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 	existing := domain.Microcredit(amount)
 	if existing != cmd.ChargeMicros {
 		return &domain.SettleError{
-			Kind: domain.SettleOutcomeMismatch, Code: domain.CodeConflict,
+			Kind: domain.SettleOutcomeChargeMismatch, Code: domain.CodeConflict,
 			Message: "settle: request is settled with a different charge (inconsistent duplicate)",
 			Status:  status, ExistingChargeMicros: &existing,
 			RequestedChargeMicros: cmd.ChargeMicros,
@@ -245,7 +246,7 @@ func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 	}
 	if !usageFactConsistent(ctx, tx, cmd.Usage) {
 		return &domain.SettleError{
-			Kind: domain.SettleOutcomeMismatch, Code: domain.CodeConflict,
+			Kind: domain.SettleOutcomeChargeMismatch, Code: domain.CodeConflict,
 			Message: "settle: request is settled with a different usage fact (inconsistent duplicate)",
 			Status:  status, ExistingChargeMicros: &existing,
 			RequestedChargeMicros: cmd.ChargeMicros,

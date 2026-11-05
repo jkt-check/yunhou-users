@@ -139,12 +139,19 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 		ChargeSource:    domain.ChargeSource(chargeSource),
 	}))
 	switch {
-	case len(rows) == 0 && expected > 0:
-		return domain.NewError(domain.CodeConflict,
-			"release: the expected monetary reservation is missing (accounting anomaly)")
-	case len(rows) != expected:
-		return domain.NewError(domain.CodeConflict,
-			"release: held reservations do not match the admission (ledger drift)")
+	case len(rows) < expected:
+		// 准入应当存在的金额预占不见了 = 账务异常：必须返回**可识别**的
+		// typed 结果，恢复 worker 才能把它与"良性竞态"分开（响亮地停放/
+		// 核对），而不是当成竞态静默跳过、每轮重复盲放。
+		return &domain.SettleError{
+			Kind: domain.SettleOutcomeMissingReservation, Code: domain.CodeConflict,
+			Message: "release: the expected monetary reservation is missing (accounting anomaly)",
+		}
+	case len(rows) > expected:
+		return &domain.SettleError{
+			Kind: domain.SettleOutcomeReservationDrift, Code: domain.CodeConflict,
+			Message: "release: more held reservations than the admission created (reservation drift)",
+		}
 	}
 
 	var fiveHourWindow *string

@@ -740,17 +740,15 @@ second run).
   OpenAI-compatible protocols, `x-api-key` on Anthropic) — pinned by
   `TestGateway_StaticCredentialHeadersUnchanged` and
   `TestAuthHeaders_StaticCredentialsUnchanged`.
-- **Anthropic + OAuth.** The Anthropic adapter renders an OAuth credential
-  with the OAuth bearer method (`Authorization: Bearer <access token>`) and
-  keeps the API-key slot (`x-api-key`) for static keys only — an OAuth token
-  in the API-key slot would be exactly the "unpacked fine, therefore
-  compatible" mistake the brief forbids. **Boundary stated, not hidden:** this
-  says nothing about *any* vendor's OAuth token being accepted by *any*
-  Anthropic-shaped endpoint — a vendor mismatch surfaces upstream as a 401,
-  never as a silently mis-slotted credential. Anthropic's own claude.ai OAuth
-  additionally requires Anthropic's `anthropic-beta: oauth-2025-04-20` flag,
-  which this deployment does not send, so a stock-Anthropic OAuth credential
-  is **not** claimed as supported here.
+- **Anthropic + OAuth — supported set is explicit (see §4.8).** The
+  Anthropic adapter keeps the API-key slot (`x-api-key`) for static keys and
+  **refuses** `auth_type='oauth'` outright: the protocol's documented support
+  set contains no OAuth vendor (the repo's own OAuth connectors speak
+  OpenAI-compatible protocols, and Anthropic's official claude.ai OAuth needs
+  an `anthropic-beta: oauth-2025-04-20` flag this deployment does not send).
+  An OAuth credential aimed at an `anthropic_messages` deployment is therefore
+  refused **before** any upstream call — never mis-slotted into `x-api-key`,
+  never sent as a bearer that only a 401 would disprove.
 - **Unusable credentials fail closed before the outbound call**: an empty
   access token, an unparsable bundle, a revoked credential and a stale
   generation all refuse the candidate (`NoCooldown`, no upstream request). The
@@ -764,6 +762,119 @@ second run).
 - **No new dependency, no migration, no API-surface change**: no new enum,
   response field or client-visible error — the OpenAPI spec and the
   integration guide need no update for T1.
+
+#### 4.8 T1 fix round — supported-set refusal + single-sourced bundle decode
+
+Recorded on 2026-11-06, after the T1 commit `52b7864`. Two **Important**
+findings from the T1 review were fixed with TDD; the fix is one extra commit
+(§4.9). Nothing else was touched — deferred minors stayed deferred.
+
+**Finding 1 — `anthropic_messages` accepted `oauth` although its documented
+support set contains no OAuth vendor.** `AuthHeaders` returned
+`Authorization: Bearer` for `AuthTypeOAuth`, while §4.7 declared that
+Anthropic-official OAuth is *not* supported and the repo's OAuth connectors
+speak OpenAI-compatible protocols. Code and docs disagreed, and a vendor
+mismatch surfaced only as an upstream 401 — which is not the fail-closed
+behaviour the explicit supported-set rule asks for.
+
+**Finding 2 — the bundle-decode invariant lived in two divergent places.**
+`ResolveBearerToken` (probe surface) and `ResolveOutboundAuth` (hot path)
+each unmarshalled the bundle and rejected an empty access token, but the
+probe path attached the raw JSON/unmarshal cause (a JSON syntax error can
+echo one character of the sealed plaintext) and used a different message than
+the hot path.
+
+##### 4.8.1 RED (production code still at `52b7864`)
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go test -count=1 -run 'TestResolveOAuthBundle_SharedDecodePath\|TestResolveStaticCredentialBehaviourPreserved' -v ./internal/inference/credentials` | **1** | the two public paths diverge; the probe path attaches the raw parse cause |
+| 2 | `go test -count=1 -run 'TestAuthHeaders' -v ./internal/inference/providers` | **1** | `anthropic_messages` returns headers for an oauth credential instead of refusing |
+| 3 | `DATABASE_URL=<disposable> go test -run 'TestGateway_OAuth' -count=1 -v ./internal/inference/gateway` | **1** | the oauth credential **was** dispatched upstream to the anthropic deployment |
+
+```
+=== RUN   TestResolveOAuthBundle_SharedDecodePath/corrupt_bundle
+    service_test.go:446: the two public paths must reject identically (bearer message="oauth bundle unparsable", outbound message="oauth credential bundle is unreadable")
+    service_test.go:452: the failure attached a raw json parse cause
+--- FAIL: TestResolveOAuthBundle_SharedDecodePath (0.00s)
+    --- FAIL: TestResolveOAuthBundle_SharedDecodePath/corrupt_bundle (0.00s)
+=== RUN   TestAuthHeaders_AnthropicRefusesOAuth
+    adapter_dispatch_test.go:377: anthropic_messages must refuse oauth credentials (header count=2)
+--- FAIL: TestAuthHeaders_AnthropicRefusesOAuth (0.00s)
+=== RUN   TestGateway_OAuthAnthropicIsRefusedBeforeDispatch
+    gateway_test.go:1792: an oauth credential must not be dispatched to the anthropic protocol
+--- FAIL: TestGateway_OAuthAnthropicIsRefusedBeforeDispatch (0.05s)
+```
+
+The failure messages print header counts, codes and domain messages only —
+never a token, a bundle or a parse cause.
+
+##### 4.8.2 The fix
+
+* `internal/inference/providers/anthropic.go` — `AuthTypeOAuth` is now
+  **refused** (`domain.CodeInvalidInput`, "providers: anthropic_messages does
+  not support oauth credentials"). `Dispatch` turns that into a
+  `DispatchError{NoCooldown: true}`: **nothing is sent**, the account is not
+  cooled, and the gateway fails over to the next candidate. No beta header was
+  added and no Anthropic-official OAuth support is claimed. Static
+  `api_key`/`service` behaviour (`x-api-key` + `anthropic-version`) is
+  unchanged.
+* `internal/inference/credentials/service.go` — one internal helper
+  `decodeOAuthAccessToken(plain []byte) (string, error)` is now the single
+  place where a sealed bundle is decoded for an outbound bearer token. Both
+  public resolvers call it, so a corrupt bundle and an empty access token are
+  rejected **identically** (same code, same message) and the returned error
+  never carries the raw JSON/unmarshal cause nor any part of the sealed
+  material. The static `api_key`/`service` behaviour of each public method is
+  untouched — the probe path still trims (`ResolveBearerToken`), the hot path
+  still returns the plaintext byte-identical (`ResolveOutboundAuth`).
+
+##### 4.8.3 GREEN and re-verification
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go test -count=1 -run 'TestResolveOAuthBundle_SharedDecodePath\|TestResolveStaticCredentialBehaviourPreserved\|TestResolveOutboundAuth' -v ./internal/inference/credentials` | **0** | 3 test funcs / 7 cases pass |
+| 2 | `go test -count=1 -run 'TestAuthHeaders' -v ./internal/inference/providers` | **0** | 4 test funcs pass |
+| 3 | `DATABASE_URL=<disposable> go test -race -count=1 -p 1 -run 'TestGateway_OAuth\|TestGateway_StaticCredential\|TestGateway_DisabledCredential\|TestGateway_RotatedOAuth' -v ./internal/inference/gateway` | **0** | all T1 gateway cases pass |
+| 4 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/credentials ./internal/inference/providers/... ./internal/inference/gateway` | **0** | 4 packages `ok` |
+| 5 | `go vet ./internal/... ./cmd/...` + `go build ./...` | **0** / **0** | lint + build green |
+| 6 | `go run ./cmd/migrate` (x2, idempotency) | **0** / **0** | `applied=49 skipped=0` → `applied=0 skipped=49` |
+| 7 | `DATABASE_URL=<disposable> go test -race -count=1 -p 1 -v ./internal/inference/... ./tests/integration/...` | **0** | 1166 PASS / 3 SKIP / 0 FAIL |
+| 8 | `E2E_DATABASE_URL=<disposable> go test -race -count=1 ./tests/e2e/...` | **0** | `ok github.com/yunhou/users/tests/e2e 166.253s` |
+| 9 | CI `go-ci` gate + coverage floor | **0** | 33 packages `ok`, `total coverage: 80.5%` ≥ 80% |
+
+Acceptance command output:
+
+```
+ok  	github.com/yunhou/users/internal/inference/credentials	2.050s
+ok  	github.com/yunhou/users/internal/inference/providers	1.721s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	1.672s
+ok  	github.com/yunhou/users/internal/inference/gateway	5.965s
+```
+
+**Skip inventory (fix round)** — unchanged from §4.4 and the T0 baseline:
+`TestQuotaWorkerProcess` (`KAYA_QUOTA_WORKER=1` child-process entry point),
+`TestLoadDrill_Throughput` and `TestLoadDrill_LongConnections`
+(`KAYA_LOAD=1`). **Database-test skips: 0.**
+
+**Files changed in the fix round**
+
+| File | Change |
+|---|---|
+| `internal/inference/providers/anthropic.go` | refuse `AuthTypeOAuth` before dispatch |
+| `internal/inference/credentials/service.go` | one shared `decodeOAuthAccessToken` helper for both public resolvers |
+| `internal/inference/providers/adapter_dispatch_test.go` | oauth bearer now asserted for the OpenAI-compatible adapters only + a new anthropic-refusal case |
+| `internal/inference/gateway/gateway_test.go` | the anthropic case is now a zero-dispatch / secret-free-error refusal test |
+| `internal/inference/credentials/service_test.go` | shared-decode-path identity test + a static-behaviour-preserved test |
+
+**Compatibility boundary (restated for the fix).** `anthropic_messages` +
+`auth_type='oauth'` is an explicitly unsupported combination: the request is
+refused before the outbound call, the client sees the ordinary
+`upstream_unavailable` shape of a failed dispatch, and no credential material
+appears in the error, the attempt record or the logs. `api_key`/`service` on
+`anthropic_messages` are unchanged (`x-api-key` + `anthropic-version`).
+OAuth credentials remain dispatchable on the OpenAI-compatible protocols
+(`openai_chat`, `openai_responses`) via `Authorization: Bearer <access token>`.
 
 ### T2 — Window-less settlement and conflict classification
 

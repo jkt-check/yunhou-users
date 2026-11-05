@@ -407,3 +407,96 @@ func TestResolveOutboundAuth_StatusAndGenerationPreserved(t *testing.T) {
 		t.Errorf("revoked credential error code = %v, want conflict", domain.CodeOf(err))
 	}
 }
+
+// TestResolveOAuthBundle_SharedDecodePath: 两个公开出口必须共用同一套
+// bundle 解码口径 —— 坏 bundle / 空 access token 一律拒绝，且拒绝完全一致
+// （同 code、同 message）、不挂原始 JSON 解析原因、不带任何凭据材料。
+func TestResolveOAuthBundle_SharedDecodePath(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const refresh = "shared-refresh-token"
+
+	cases := []struct {
+		name   string
+		bundle string
+		code   domain.Code
+	}{
+		{"empty access token", oauthBundleFor(t, "", refresh), domain.CodeConflict},
+		{"corrupt bundle", "not-a-json-bundle-" + refresh, domain.CodeInternal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			view, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", tc.bundle, "r", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, bearerErr := svc.ResolveBearerToken(context.Background(), view.ID, nil)
+			_, _, outboundErr := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+			if bearerErr == nil || outboundErr == nil {
+				t.Fatalf("both paths must refuse an unusable oauth credential")
+			}
+			if domain.CodeOf(bearerErr) != tc.code || domain.CodeOf(outboundErr) != tc.code {
+				t.Errorf("error codes = %v / %v, want %v",
+					domain.CodeOf(bearerErr), domain.CodeOf(outboundErr), tc.code)
+			}
+			// 只比对 domain.Error 的 Message（不含 cause 链），失败信息里
+			// 不会出现任何凭据材料。
+			bMsg, oMsg := domainMessage(bearerErr), domainMessage(outboundErr)
+			if bMsg != oMsg {
+				t.Errorf("the two public paths must reject identically (bearer message=%q, outbound message=%q)", bMsg, oMsg)
+			}
+			// 原始 JSON 解析原因不得挂进错误（它会回显明文的一个字符）。
+			for _, err := range []error{bearerErr, outboundErr} {
+				for _, parser := range []string{"invalid character", "unexpected end of JSON", "cannot unmarshal"} {
+					if strings.Contains(err.Error(), parser) {
+						t.Errorf("the failure attached a raw json parse cause")
+					}
+				}
+			}
+			for _, forbidden := range []string{refresh, tc.bundle, "not-a-json-bundle"} {
+				for _, err := range []error{bearerErr, outboundErr} {
+					if strings.Contains(err.Error(), forbidden) {
+						t.Errorf("the failure surfaced credential material")
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestResolveStaticCredentialBehaviourPreserved: 共享解码只作用于 oauth 分支
+// —— 两个公开出口各自的静态 api_key/service 行为保持原样（探测出口继续
+// trim，热路径出口保持逐字节明文）。
+func TestResolveStaticCredentialBehaviourPreserved(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const secret = "  sk-static-padded  "
+	view, err := svc.Create(context.Background(), testOp(), "p", "l", "api_key", secret, "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bearer, _, err := svc.ResolveBearerToken(context.Background(), view.ID, nil)
+	if err != nil {
+		t.Fatalf("bearer path: %v", err)
+	}
+	if bearer != "sk-static-padded" {
+		t.Errorf("the probe path must keep trimming static credentials")
+	}
+	outbound, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+	if err != nil {
+		t.Fatalf("outbound path: %v", err)
+	}
+	if outbound.Token != secret {
+		t.Errorf("the hot path must keep the static plaintext byte-identical")
+	}
+}
+
+// domainMessage extracts the domain error message (never the cause chain, so
+// a failure message can be printed without leaking credential material).
+func domainMessage(err error) string {
+	var de *domain.Error
+	if errors.As(err, &de) {
+		return de.Message
+	}
+	return ""
+}

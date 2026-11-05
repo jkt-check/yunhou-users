@@ -343,11 +343,11 @@ func TestAuthHeaders_StaticCredentialsUnchanged(t *testing.T) {
 	}
 }
 
-// TestAuthHeaders_OAuthUsesBearerOnly: oauth 凭据只以 bearer 出站；封存的
-// bundle JSON 与 refresh token 到不了任何头。
+// TestAuthHeaders_OAuthUsesBearerOnly: OpenAI 兼容协议里 oauth 凭据只以
+// bearer 出站；封存的 bundle JSON 与 refresh token 到不了任何头。
 func TestAuthHeaders_OAuthUsesBearerOnly(t *testing.T) {
 	const access = "acc-token-adapter"
-	for _, a := range []Adapter{NewOpenAIChat(), NewOpenAIResponses(), NewAnthropicMessages()} {
+	for _, a := range []Adapter{NewOpenAIChat(), NewOpenAIResponses()} {
 		h, err := a.AuthHeaders(Auth{Type: AuthTypeOAuth, Token: access})
 		if err != nil {
 			t.Fatalf("%s: oauth: %v", a.Protocol(), err)
@@ -362,6 +362,29 @@ func TestAuthHeaders_OAuthUsesBearerOnly(t *testing.T) {
 			if strings.Contains(v, "access_token") || strings.Contains(v, "refresh_token") || strings.Contains(v, "{") {
 				t.Errorf("%s: header %q carries bundle material", a.Protocol(), name)
 			}
+		}
+	}
+}
+
+// TestAuthHeaders_AnthropicRefusesOAuth: anthropic_messages 的明确支持集里
+// 没有 OAuth 供应商 —— 仓库自有的 OAuth 连接器说 OpenAI 兼容协议，而
+// Anthropic 官方 claude.ai OAuth 需要本部署不发的 anthropic-beta 头。凭据
+// 能解包不等于该协议兼容：明确拒绝、不猜头槽、错误不带凭据材料。
+func TestAuthHeaders_AnthropicRefusesOAuth(t *testing.T) {
+	const access = "acc-token-anthropic"
+	h, err := NewAnthropicMessages().AuthHeaders(Auth{Type: AuthTypeOAuth, Token: access})
+	if err == nil {
+		t.Fatalf("anthropic_messages must refuse oauth credentials (header count=%d)", len(h))
+	}
+	if h != nil {
+		t.Errorf("a refused oauth credential must not produce headers")
+	}
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("refusal code = %v, want invalid_input", domain.CodeOf(err))
+	}
+	for _, forbidden := range []string{access, "access_token", "refresh_token"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("the refusal surfaced credential material")
 		}
 	}
 }

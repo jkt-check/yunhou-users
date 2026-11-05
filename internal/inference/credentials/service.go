@@ -411,6 +411,27 @@ func (s *Service) ResolveSecret(ctx context.Context, id string, pinGeneration *i
 	return plain, cred, nil
 }
 
+// decodeOAuthAccessToken is the ONE place where a sealed OAuth bundle is
+// decoded for an outbound bearer token. Both public resolvers go through it,
+// so a corrupt bundle or an empty access token is rejected identically for
+// every caller (the probe surface included) and the next credential bug has
+// a single site to be fixed at.
+//
+// The returned error never carries the parse cause nor any part of the
+// sealed material: a JSON syntax error can echo one character of the
+// plaintext, and the cause chain is what ends up in logs and operator
+// summaries.
+func decodeOAuthAccessToken(plain []byte) (string, error) {
+	bundle, err := UnmarshalBundle(plain)
+	if err != nil {
+		return "", domain.NewError(domain.CodeInternal, "oauth credential bundle is unreadable")
+	}
+	if bundle.AccessToken == "" {
+		return "", domain.NewError(domain.CodeConflict, "oauth credential has no access token")
+	}
+	return bundle.AccessToken, nil
+}
+
 // ResolveBearerToken resolves the token usable as an Authorization: Bearer
 // header（R7-N7 预发布探测面）：静态凭据（api_key/service）返回明文本身；
 // oauth 凭据的明文是 bundle，取其 access token。代次钉扎与 ResolveSecret
@@ -424,14 +445,11 @@ func (s *Service) ResolveBearerToken(ctx context.Context, id string, pinGenerati
 	if cred.AuthType != "oauth" {
 		return strings.TrimSpace(string(plain)), cred, nil
 	}
-	bundle, err := UnmarshalBundle(plain)
+	token, err := decodeOAuthAccessToken(plain)
 	if err != nil {
 		return "", nil, err
 	}
-	if bundle.AccessToken == "" {
-		return "", nil, domain.NewError(domain.CodeConflict, "oauth credential has no access token")
-	}
-	return bundle.AccessToken, cred, nil
+	return token, cred, nil
 }
 
 // OutboundAuth is the credential material ONE dispatch may use: the auth
@@ -453,8 +471,10 @@ type OutboundAuth struct {
 //
 // The oauth branch yields the access token alone: the bundle JSON and the
 // refresh token are never handed out, so they can not reach an upstream
-// header. A malformed bundle fails closed with a message that carries no
-// part of the sealed material (the parse cause is dropped on purpose).
+// header. The decode itself is shared with ResolveBearerToken (see
+// decodeOAuthAccessToken), so both public paths reject an unusable bundle
+// identically and with a message that carries no part of the sealed
+// material.
 func (s *Service) ResolveOutboundAuth(ctx context.Context, id string, pinGeneration *int64) (OutboundAuth, *domain.Credential, error) {
 	plain, cred, err := s.ResolveSecret(ctx, id, pinGeneration)
 	if err != nil {
@@ -464,14 +484,11 @@ func (s *Service) ResolveOutboundAuth(ctx context.Context, id string, pinGenerat
 		// 静态凭据：明文本身就是出站秘密（逐字节保持旧热路径口径）。
 		return OutboundAuth{AuthType: cred.AuthType, Token: string(plain)}, cred, nil
 	}
-	bundle, err := UnmarshalBundle(plain)
+	token, err := decodeOAuthAccessToken(plain)
 	if err != nil {
-		return OutboundAuth{}, nil, domain.NewError(domain.CodeInternal, "oauth credential bundle is unreadable")
+		return OutboundAuth{}, nil, err
 	}
-	if bundle.AccessToken == "" {
-		return OutboundAuth{}, nil, domain.NewError(domain.CodeConflict, "oauth credential has no access token")
-	}
-	return OutboundAuth{AuthType: cred.AuthType, Token: bundle.AccessToken}, cred, nil
+	return OutboundAuth{AuthType: cred.AuthType, Token: token}, cred, nil
 }
 
 func (s *Service) mustActive(ctx context.Context, id string) (*domain.Credential, error) {

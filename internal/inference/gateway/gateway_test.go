@@ -1759,10 +1759,12 @@ func TestGateway_OAuthUsesAccessTokenOnly(t *testing.T) {
 	})
 }
 
-// TestGateway_OAuthAnthropicUsesAccessTokenOnly: 同一个封存 bundle 派发到
-// anthropic_messages 部署时，出站头必须符合目标协议（OAuth 的 bearer 接法），
-// 且 OAuth 令牌绝不占用 API-key 槽（x-api-key）。
-func TestGateway_OAuthAnthropicUsesAccessTokenOnly(t *testing.T) {
+// TestGateway_OAuthAnthropicIsRefusedBeforeDispatch: anthropic_messages 的
+// 明确支持集里没有 OAuth 供应商（仓库自有的 OAuth 连接器说 OpenAI 兼容
+// 协议；Anthropic 官方 claude.ai OAuth 需要本部署不发的 anthropic-beta 头）。
+// 凭据能解包不等于该协议兼容：必须在上游调用之前拒绝，上游零调用，错误里
+// 不得出现任何凭据材料。
+func TestGateway_OAuthAnthropicIsRefusedBeforeDispatch(t *testing.T) {
 	const (
 		accessToken  = "t1-anthropic-access-token"
 		refreshToken = "t1-anthropic-refresh-token"
@@ -1776,6 +1778,7 @@ func TestGateway_OAuthAnthropicUsesAccessTokenOnly(t *testing.T) {
 			"usage":{"input_tokens":7,"output_tokens":3}}`)
 	})
 	f := newFixture(t, up, withCredential("oauth", oauthBundleJSON(t, accessToken, refreshToken)))
+	// 部署协议切换为 anthropic_messages(DB 行与快照同步)。
 	if _, err := f.db.Exec(`UPDATE inference_deployments SET protocol = 'anthropic_messages' WHERE id = $1`, f.deploymentID); err != nil {
 		t.Fatal(err)
 	}
@@ -1784,41 +1787,17 @@ func TestGateway_OAuthAnthropicUsesAccessTokenOnly(t *testing.T) {
 	f.snap.Deployments[f.deploymentID] = dep
 
 	p, key := f.principal()
-	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
-	if err != nil {
-		t.Fatalf("ChatCompletions: %v", err)
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err == nil {
+		t.Fatal("an oauth credential must not be dispatched to the anthropic protocol")
 	}
-	if len(out.Payload) == 0 {
-		t.Fatal("empty payload")
+	if rec.count() != 0 {
+		t.Errorf("upstream was called %d times, want 0", rec.count())
 	}
-	h := rec.last()
-	if h == nil {
-		t.Fatal("upstream was never called")
-	}
-	for name, values := range h {
-		for _, v := range values {
-			if v == "Bearer "+accessToken {
-				continue
-			}
-			switch {
-			case strings.Contains(v, "refresh_token"):
-				t.Errorf("outbound header %q leaked the refresh token", name)
-			case strings.Contains(v, "access_token"):
-				t.Errorf("outbound header %q leaked the sealed oauth bundle", name)
-			case strings.Contains(v, "{"):
-				t.Errorf("outbound header %q leaked json credential material", name)
-			}
+	for _, forbidden := range []string{accessToken, refreshToken, "access_token", "refresh_token"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("the failure surfaced credential material")
 		}
-	}
-	if got := h.Get("Authorization"); got != "Bearer "+accessToken {
-		t.Errorf("anthropic oauth must use the bearer method (bytes=%d json=%v)",
-			len(got), strings.Contains(got, "{"))
-	}
-	if got := h.Get("x-api-key"); got != "" {
-		t.Errorf("an oauth access token must not occupy the api-key slot (bytes=%d)", len(got))
-	}
-	if h.Get("anthropic-version") == "" {
-		t.Error("anthropic-version header missing")
 	}
 }
 

@@ -307,13 +307,13 @@ func (a *AnthropicMessages) AuthHeaders(auth Auth) (map[string]string, error) {
 			h["x-api-key"] = auth.Token
 		}
 	case AuthTypeOAuth:
-		// OAuth 的接法是 bearer（Authorization: Bearer <access token>）。
-		// OAuth 令牌绝不占用 API-key 槽（x-api-key）——那会把一个 OAuth
-		// 令牌当成 API key 送出，等于把解包成功当成任意供应商 OAuth 已
-		// 兼容。目标协议不认这个令牌时的表现是上游 401，而不是静默改槽。
-		if auth.Token != "" {
-			h["Authorization"] = "Bearer " + auth.Token
-		}
+		// anthropic_messages 的明确支持集里没有 OAuth 供应商：仓库自有的
+		// OAuth 连接器说 OpenAI 兼容协议，而 Anthropic 官方 claude.ai OAuth
+		// 需要本部署不发的 anthropic-beta 头。凭据能解包不等于该协议兼容，
+		// 因此明确拒绝（不出站、不猜头槽）——绝不把 OAuth 令牌塞进 API-key
+		// 槽，那等于把解包成功当成任意供应商 OAuth 已兼容。
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: anthropic_messages does not support oauth credentials")
 	default:
 		return nil, domain.NewError(domain.CodeInvalidInput,
 			"providers: anthropic_messages does not support auth type "+auth.Type)

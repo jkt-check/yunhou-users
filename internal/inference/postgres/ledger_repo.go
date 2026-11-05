@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,7 +24,8 @@ import (
 // (设计 §7.2):
 //
 //  1. lock the request row FOR UPDATE (serializes against a concurrent
-//     release/settlement of the same request — 并发释放均一致),
+//     release/settlement of the same request — 并发释放均一致) and
+//     CLASSIFY an already-terminal request (see below),
 //  2. persist the normalized usage fact,
 //  3. append the customer ledger charge (UNIQUE per request → idempotent),
 //  4. convert held reservations — in the fixed lock order (windows
@@ -32,6 +34,11 @@ import (
 //     an over-hold is returned, reservations marked settled with a
 //     state='held' guard,
 //  5. move the request to settled with its usage status.
+//
+// 已终态的投递必须**分类**，绝不一律当成功（设计 §7.2）：只有"已 settled 且
+// 账本上存在唯一且一致的 charge/usage"才是幂等重复成功；released 之后才到的
+// 非零用量、缺预占、金额不一致都是账务异常 —— 返回 typed 的
+// domain.SettleError，由调用方告警并送进专门核对流程。
 func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -46,18 +53,35 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	// request's PINNED price version (read from the locked row, never
 	// caller-supplied) so a later price change can never rewrite which
 	// version settled this request (设计 §7.1).
-	var accountID, status string
+	var accountID, status, chargeSource string
 	var priceVersionID *string
-	var chargeSource string
+	var apiKeyID, win5h, winW, winM sql.NullString
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT billing_account_id, price_version_id, status, charge_source
+		`SELECT billing_account_id, price_version_id, status, charge_source,
+		        api_key_id, window_five_hour_id, window_weekly_id, window_monthly_id
 		 FROM inference_requests WHERE id = $1 FOR UPDATE`,
-		cmd.RequestID).Scan(&accountID, &priceVersionID, &status, &chargeSource); err != nil {
+		cmd.RequestID).Scan(&accountID, &priceVersionID, &status, &chargeSource,
+		&apiKeyID, &win5h, &winW, &winM); err != nil {
 		return mapError("settle: lock request", err)
 	}
-	if domain.RequestStatus(status) == domain.ReqSettled || domain.RequestStatus(status) == domain.ReqReleased {
-		return domain.NewError(domain.CodeConflict,
-			"settle: request already finalized ("+status+")")
+	reqStatus := domain.RequestStatus(status)
+	req := &domain.Request{
+		ID: cmd.RequestID, APIKeyID: strFromNull(apiKeyID),
+		WindowFiveHourID: strFromNull(win5h), WindowWeeklyID: strFromNull(winW),
+		WindowMonthlyID: strFromNull(winM), ChargeSource: domain.ChargeSource(chargeSource),
+	}
+	// 已终态：分类（绝不一律当成功）。
+	switch reqStatus {
+	case domain.ReqSettled:
+		return classifySettledDelivery(ctx, tx, cmd, reqStatus)
+	case domain.ReqReleased:
+		return &domain.SettleError{
+			Kind: domain.SettleOutcomeReleased, Code: domain.CodeConflict,
+			Message:    "settle: request already released — a late delivery must be reconciled, not dropped",
+			Status:     reqStatus,
+			Trivial:    cmd.ChargeMicros == 0 && usageBucketsEmpty(cmd.Usage.Buckets),
+			RequestedChargeMicros: cmd.ChargeMicros,
+		}
 	}
 
 	// 钱包路径（Task 14）：micromoney 结算 + 钱包冻结转消费，全程同一事务。
@@ -65,12 +89,36 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		return s.settleWallet(ctx, tx, cmd, accountID, priceVersionID)
 	}
 
-	// 2. Usage fact (UNIQUE(attempt_id, revision)).
+	// 2. The monetary holds the admission created. A request whose policy
+	// has NO monetary window legitimately holds NOTHING (no window hold, no
+	// Key budget hold) — it still settles, with a usage fact, a ledger
+	// charge and a terminal state. A request that DOES expect holds but
+	// cannot show them is an accounting anomaly (缺预占): never settle it,
+	// never let it pass as a duplicate.
+	rows, err := loadHeldReservations(ctx, tx, cmd.RequestID)
+	if err != nil {
+		return err
+	}
+	expected := len(domain.ExpectedMonetaryTargets(req))
+	if len(rows) != expected {
+		kind := domain.SettleOutcomeMissingReservation
+		message := "settle: the expected monetary reservation is missing"
+		if len(rows) > expected {
+			kind = domain.SettleOutcomeMismatch
+			message = "settle: more held reservations than the admission created (ledger drift)"
+		}
+		return &domain.SettleError{
+			Kind: kind, Code: domain.CodeConflict, Message: message,
+			Status: reqStatus, RequestedChargeMicros: cmd.ChargeMicros,
+		}
+	}
+
+	// 3. Usage fact (UNIQUE(attempt_id, revision)).
 	if err := insertUsageRecord(ctx, tx, &cmd.Usage); err != nil {
 		return err
 	}
 
-	// 3. Ledger charge — ALWAYS appended, including a zero charge (Task 9 /
+	// 4. Ledger charge — ALWAYS appended, including a zero charge (Task 9 /
 	// migration 031): the partial unique index on (request_id) WHERE
 	// entry_type='charge' then guards EVERY settlement delivery uniformly
 	// (duplicate → conflict), and "已结算(0)" is distinguishable from
@@ -83,15 +131,7 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		return mapError("settle: ledger charge", err)
 	}
 
-	// 4. Convert held reservations → used/settled, fixed lock order.
-	rows, err := loadHeldReservations(ctx, tx, cmd.RequestID)
-	if err != nil {
-		return err
-	}
-	if len(rows) == 0 {
-		return domain.NewError(domain.CodeConflict,
-			"settle: no held reservations (already released or settled?)")
-	}
+	// 5. Convert held reservations → used/settled, fixed lock order.
 	for _, r := range rows {
 		switch r.TargetKind {
 		case string(domain.TargetKeyBudget):
@@ -164,6 +204,102 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		return mapError("settle: request", err)
 	}
 	return nil
+}
+
+// classifySettledDelivery classifies a settlement delivery for a request
+// that is ALREADY settled:
+//
+//   - the ledger holds exactly one charge and it matches the delivered
+//     amount (and the metering fact of a re-delivered attempt matches) →
+//     an idempotent replay (重复成功): the caller absorbs it silently;
+//   - anything else (no charge row, a different amount, a contradicting
+//     usage fact) → an accounting anomaly (double-billing risk): the
+//     caller must alarm and reconcile.
+//
+// The request row is locked by the caller, so the recorded charge cannot
+// change under this transaction.
+func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.SettleCommand, status domain.RequestStatus) error {
+	var amount int64
+	err := tx.QueryRowxContext(ctx,
+		`SELECT amount_micros FROM inference_ledger_entries
+		 WHERE request_id = $1 AND entry_type = 'charge'`, cmd.RequestID).Scan(&amount)
+	if err != nil {
+		if domain.CodeOf(mapError("settle: load charge", err)) == domain.CodeNotFound {
+			// 已结算却没有 charge 行 = 账本漂移，绝不当作重复成功。
+			return &domain.SettleError{
+				Kind: domain.SettleOutcomeMismatch, Code: domain.CodeConflict,
+				Message: "settle: request is settled but the ledger holds no charge (ledger drift)",
+				Status:  status, RequestedChargeMicros: cmd.ChargeMicros,
+			}
+		}
+		return mapError("settle: load charge", err)
+	}
+	existing := domain.Microcredit(amount)
+	if existing != cmd.ChargeMicros {
+		return &domain.SettleError{
+			Kind: domain.SettleOutcomeMismatch, Code: domain.CodeConflict,
+			Message: "settle: request is settled with a different charge (inconsistent duplicate)",
+			Status:  status, ExistingChargeMicros: &existing,
+			RequestedChargeMicros: cmd.ChargeMicros,
+		}
+	}
+	if !usageFactConsistent(ctx, tx, cmd.Usage) {
+		return &domain.SettleError{
+			Kind: domain.SettleOutcomeMismatch, Code: domain.CodeConflict,
+			Message: "settle: request is settled with a different usage fact (inconsistent duplicate)",
+			Status:  status, ExistingChargeMicros: &existing,
+			RequestedChargeMicros: cmd.ChargeMicros,
+		}
+	}
+	return &domain.SettleError{
+		Kind: domain.SettleOutcomeDuplicate, Code: domain.CodeConflict,
+		Message: "settle: request already settled (consistent duplicate delivery)",
+		Status:  status, ExistingChargeMicros: &existing,
+		RequestedChargeMicros: cmd.ChargeMicros,
+	}
+}
+
+// usageFactConsistent compares the delivered metering fact with the one
+// already recorded for the same attempt revision. A delivery for an attempt
+// that has no recorded fact cannot be compared — it is left consistent (the
+// charge amount is the customer-facing fact that decides the outcome).
+func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord) bool {
+	if u.AttemptID == "" {
+		return true
+	}
+	revision := u.Revision
+	if revision == 0 {
+		revision = 1
+	}
+	var in, out, cacheRead, cacheWrite, reasoning sql.NullInt64
+	err := tx.QueryRowxContext(ctx,
+		`SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens
+		 FROM inference_usage_records WHERE attempt_id = $1 AND revision = $2`,
+		u.AttemptID, revision).Scan(&in, &out, &cacheRead, &cacheWrite, &reasoning)
+	if err != nil {
+		return true
+	}
+	return sameTokens(in, u.Buckets.InputTokens) &&
+		sameTokens(out, u.Buckets.OutputTokens) &&
+		sameTokens(cacheRead, u.Buckets.CacheReadTokens) &&
+		sameTokens(cacheWrite, u.Buckets.CacheWriteTokens) &&
+		sameTokens(reasoning, u.Buckets.ReasoningTokens)
+}
+
+// sameTokens compares a stored (nullable) bucket with a delivered one: an
+// unreported bucket is NULL, never zero.
+func sameTokens(stored sql.NullInt64, delivered *int64) bool {
+	if !stored.Valid {
+		return delivered == nil
+	}
+	return delivered != nil && stored.Int64 == *delivered
+}
+
+// usageBucketsEmpty reports whether the delivered metering fact carries no
+// token at all (nothing to book).
+func usageBucketsEmpty(b domain.UsageBuckets) bool {
+	return b.InputTokens == nil && b.OutputTokens == nil && b.CacheReadTokens == nil &&
+		b.CacheWriteTokens == nil && b.ReasoningTokens == nil
 }
 
 // settleWallet is the charge_source='wallet' settlement (Task 14): same
@@ -303,6 +439,31 @@ func (s *Store) MarkReconciliationRequired(ctx context.Context, w domain.UnitOfW
 	}
 	return s.EnqueueReconciliationJobTx(ctx, w, EnqueueReconciliationCommand{
 		RequestID: &requestID, Reason: reason, Deadline: deadline,
+	})
+}
+
+// ReportTerminalAnomaly records a settlement anomaly against a request whose
+// terminal state must NOT be overwritten (a released request that receives a
+// late usage): the reconciliation job is enqueued in the same transaction and
+// the request's last_error carries the anomaly, but the terminal status
+// (settled/released) stays exactly as it is — 终态不可改写，账务异常必须可
+// 核对、可审计。
+func (s *Store) ReportTerminalAnomaly(ctx context.Context, w domain.UnitOfWork, requestID, reason string, detail json.RawMessage, deadline time.Time) error {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE inference_requests SET last_error = $2, updated_at = now() WHERE id = $1`,
+		requestID, string(detail))
+	if err != nil {
+		return mapError("report terminal anomaly", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return mapError("report terminal anomaly", sql.ErrNoRows)
+	}
+	return s.EnqueueReconciliationJobTx(ctx, w, EnqueueReconciliationCommand{
+		RequestID: &requestID, Reason: reason, Detail: detail, Deadline: deadline,
 	})
 }
 

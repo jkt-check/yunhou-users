@@ -128,8 +128,13 @@ func ConservativeRecord(requestID, attemptID string, req *domain.Request, reason
 		Source: domain.UsageEstimated, Revision: revision,
 	}
 	basis := recoveryBasisJSON{Basis: "conservative_bounds", Reason: reason}
-	if req.ReservedMicros != nil {
-		basis.ChargeMicros = int64(*req.ReservedMicros)
+	// The estimate basis is the request's RECOVERABLE estimate upper bound
+	// (migration 050): the admission-priced amount persisted on the request
+	// row. A row without any monetary evidence carries none — the caller
+	// must keep such a request pending reconciliation instead of settling it
+	// as free (设计 §7.2: 永不静默免费).
+	if estimate, ok := domain.RecoverableEstimate(req); ok {
+		basis.ChargeMicros = int64(estimate)
 	}
 	if b, ok := BoundsOf(req); ok {
 		in, out := b.InputBoundTokens, b.OutputCapTokens

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -598,4 +599,301 @@ func mustTx(t *testing.T, w domain.UnitOfWork) *sqlx.Tx {
 		t.Fatal(err)
 	}
 	return tx
+}
+
+// ---------------------------------------------------------------------------
+// T2 — 无窗口结算与冲突分类（settlement classification）
+// ---------------------------------------------------------------------------
+
+// reserveCmdNoHolds builds an admission with NO monetary hold at all — the
+// legal shape of a window-less policy without a Key budget target. The
+// admission still prices a monetary upper bound; the request row is the only
+// place that fact can live.
+func reserveCmdNoHolds(f fixture) domain.ReserveCommand {
+	admitted := time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC)
+	return domain.ReserveCommand{
+		Request: domain.Request{
+			ID: uuid.NewString(), BillingAccountID: f.accountID,
+			EntitlementID: f.entID, ModelID: f.modelID,
+			Protocol:        domain.ProtocolOpenAIChat,
+			PolicyVersionID: f.policyID,
+		},
+		AdmittedAt: admitted,
+	}
+}
+
+// TestSettleWithoutMonetaryHoldSettlesWindowlessRequest — 无金额窗口的请求
+// 没有任何 held 预占行，但它同样必须完整结算：用量事实 + 一条 charge +
+// 终态 settled（零金额也必须有账本事实）。
+func TestSettleWithoutMonetaryHoldSettlesWindowlessRequest(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false) // no Key → no Key-budget hold target
+
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm, err := s.Reserve(ctx, uow, reserveCmdNoHolds(f))
+	if err != nil {
+		t.Fatalf("reserve (no holds): %v", err)
+	}
+	if len(adm.Holds) != 0 {
+		t.Fatalf("holds = %d, want 0 (无窗口策略没有任何金额预占)", len(adm.Holds))
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	in, out := int64(800), int64(200)
+	err = s.Settle(ctx, uow, domain.SettleCommand{
+		RequestID: adm.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: 60_000, SettledAt: time.Now().UTC(),
+	})
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatalf("settle a window-less request: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqSettled {
+		t.Errorf("status = %q, want settled (无窗口请求也必须终态结算)", req.Status)
+	}
+	if req.SettledMicros == nil || *req.SettledMicros != 60_000 {
+		t.Errorf("settled_micros = %v, want 60000", req.SettledMicros)
+	}
+	if req.UsageStatus != domain.UsageReported {
+		t.Errorf("usage_status = %q, want reported", req.UsageStatus)
+	}
+	var charges int
+	if err := s.db.Get(&charges,
+		`SELECT COUNT(*) FROM inference_ledger_entries WHERE request_id = $1 AND entry_type='charge'`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if charges != 1 {
+		t.Errorf("charges = %d, want 1 (无窗口请求同样有账本事实)", charges)
+	}
+	var usageRows int
+	if err := s.db.Get(&usageRows,
+		`SELECT COUNT(*) FROM inference_usage_records WHERE request_id = $1`, adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if usageRows != 1 {
+		t.Errorf("usage records = %d, want 1", usageRows)
+	}
+}
+
+// TestSettleWithDeletedReservationsDoesNotSettle — 本应存在的金额预占被
+// 删除后，结算绝不能成功（缺预占 = 账务异常）：既不落 charge，也不把请求
+// 终态化。
+func TestSettleWithDeletedReservationsDoesNotSettle(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 预占消失（丢失/被篡改）。
+	if _, err := s.db.Exec(
+		`DELETE FROM inference_reservations WHERE request_id = $1 AND state = 'held'`, adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+
+	uow2, _ := s.Begin(ctx)
+	in, out := int64(10), int64(5)
+	err = s.Settle(ctx, uow2, domain.SettleCommand{
+		RequestID: adm.RequestID,
+		Usage: domain.UsageRecord{
+			RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+		},
+		ChargeMicros: 60_000, SettledAt: time.Now().UTC(),
+	})
+	_ = uow2.Rollback(ctx)
+	if err == nil {
+		t.Fatal("settle succeeded although the expected monetary reservation is missing")
+	}
+	var charges int
+	if err := s.db.Get(&charges,
+		`SELECT COUNT(*) FROM inference_ledger_entries WHERE request_id = $1 AND entry_type='charge'`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if charges != 0 {
+		t.Errorf("charges = %d, want 0 (缺预占时不得落 charge)", charges)
+	}
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status == domain.ReqSettled {
+		t.Errorf("status = %s, want a non-terminal state (缺预占时结算不得成功)", req.Status)
+	}
+}
+
+// TestConcurrentFinalizeSettlesOnce — 同一请求并发结算：只有一个成功，
+// 另一个是"已被并发终态化"的幂等跳过；账本只有一条 charge，窗口只转换一次。
+func TestConcurrentFinalizeSettlesOnce(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attID := uuid.NewString()
+	if err := insertAttempt(ctx, mustTx(t, uow), &domain.Attempt{ID: attID, RequestID: adm.RequestID, AttemptNo: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			uow, err := s.Begin(ctx)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			in, out := int64(10), int64(5)
+			err = s.Settle(ctx, uow, domain.SettleCommand{
+				RequestID: adm.RequestID,
+				Usage: domain.UsageRecord{
+					RequestID: adm.RequestID, AttemptID: attID, Source: domain.UsageReported,
+					Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
+				},
+				ChargeMicros: 60_000, SettledAt: time.Now().UTC(),
+			})
+			if err != nil {
+				_ = uow.Rollback(ctx)
+				errs[i] = err
+				return
+			}
+			errs[i] = uow.Commit(ctx)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	ok, conflicts := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case domain.CodeOf(err) == domain.CodeConflict:
+			conflicts++
+		default:
+			t.Errorf("settle error = %v, want nil or a conflict", err)
+		}
+	}
+	if ok != 1 || conflicts != 1 {
+		t.Errorf("settles = %d ok / %d conflicts, want 1/1", ok, conflicts)
+	}
+	var charges int
+	if err := s.db.Get(&charges,
+		`SELECT COUNT(*) FROM inference_ledger_entries WHERE request_id = $1 AND entry_type='charge'`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if charges != 1 {
+		t.Errorf("charges = %d, want 1 (并发结算只产生一次扣费)", charges)
+	}
+	for _, id := range []string{w5, ww, wm} {
+		used, reserved := windowState(t, s, id)
+		if used != 60_000 || reserved != 0 {
+			t.Errorf("window %s = %d/%d, want 60000/0 (只转换一次)", id, used, reserved)
+		}
+	}
+	if got := keyBudgetUsed(t, s, f.keyID); got != 60_000 {
+		t.Errorf("key budget used = %d, want 60000", got)
+	}
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqSettled {
+		t.Errorf("status = %q, want settled", req.Status)
+	}
+}
+
+// TestReleaseWithoutMonetaryHoldFinalizesWindowlessRequest — 无窗口请求没有
+// 任何金额预占可释放，但确认零消费时仍必须终态化为 released（绝不悬挂成
+// "永远在途"，也绝不伪造成功结算）。
+func TestReleaseWithoutMonetaryHoldFinalizesWindowlessRequest(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, false)
+
+	uow, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm, err := s.Reserve(ctx, uow, reserveCmdNoHolds(f))
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatalf("reserve (no holds): %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	uow2, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Release(ctx, uow2, adm.RequestID); err != nil {
+		_ = uow2.Rollback(ctx)
+		t.Fatalf("release a window-less request: %v", err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	req, err := s.GetRequest(ctx, adm.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != domain.ReqReleased {
+		t.Errorf("status = %q, want released", req.Status)
+	}
+	var charges int
+	if err := s.db.Get(&charges,
+		`SELECT COUNT(*) FROM inference_ledger_entries WHERE request_id = $1 AND entry_type='charge'`,
+		adm.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if charges != 0 {
+		t.Errorf("charges = %d, want 0 (确认零消费不入账)", charges)
+	}
 }

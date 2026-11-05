@@ -263,6 +263,12 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	req.InputBoundTokens = &inputBound
 	req.OutputCapTokens = &outputCap
 	req.ExtraBounds = cmd.ExtraBounds
+	// The admission-priced monetary upper bound is a DURABLE admission fact
+	// (migration 050): a policy with no monetary window creates no hold row
+	// at all, so the request row is the only place this amount can live. The
+	// crash-recovery estimate settles on it — a consumed request must never
+	// be read as free (设计 §7.2: 永不静默免费).
+	req.ExpectedHoldMicros = &hold
 	holds := make([]domain.HoldSpec, 0, len(windows)+1)
 	windowIDs := make(map[domain.WindowKind]string, len(windows))
 	for _, w := range windows {

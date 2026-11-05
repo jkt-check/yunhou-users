@@ -63,6 +63,12 @@ func WrapError(code Code, msg string, cause error) *Error {
 // CodeOf extracts the domain Code from err, falling back to CodeInternal
 // for foreign errors. A nil error yields an empty code.
 func CodeOf(err error) Code {
+	// The typed terminal settlement result carries its own code (always
+	// CodeConflict) — it must be classified by Kind, not by the code.
+	var se *SettleError
+	if errors.As(err, &se) {
+		return se.Code
+	}
 	var de *Error
 	if errors.As(err, &de) {
 		return de.Code

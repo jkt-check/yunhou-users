@@ -878,12 +878,334 @@ OAuth credentials remain dispatchable on the OpenAI-compatible protocols
 
 ### T2 — Window-less settlement and conflict classification
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `fc0674e` (T1 branch tip; T0 base `35cf836`).
+Task report: `.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-2-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the instance
+down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`; every
+database-backed command used `-p 1`; `go.mod` / `go.sum` were never modified
+(`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.9 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1, `t2_app`) | **0** | `applied=50 skipped=0` (49 baseline + 050) |
+| 4 | `go run ./cmd/migrate` (run 2, `t2_app`) | **0** | `applied=0 skipped=50` (idempotent) |
+| 5 | `go run ./cmd/migrate -status` | **0** | 50 × `✅` |
+| 6 | **RED** `go test -count=1 -run 'TestGateway_NoWindowPolicySettles\|TestGateway_MissingExpectedReservationRequiresReconciliation\|TestGateway_DuplicateSettleWithInconsistentChargeIsAnomaly\|TestGateway_LateUsageAfterReleaseIsAnomaly' -v ./internal/inference/gateway` | **1** | the leak reproduced — see §4.10 |
+| 7 | **RED** `go test -count=1 -run 'TestSettleWithoutMonetaryHoldSettlesWindowlessRequest\|TestSettleWithDeletedReservationsDoesNotSettle\|TestConcurrentFinalizeSettlesOnce' -v ./internal/inference/postgres` | **1** | the store-level guard reproduced — see §4.10 |
+| 8 | **RED** `go test -count=1 -run 'TestRecover_WindowlessRequest_SettlesAtDurableEstimate\|TestRecover_LegacyWindowlessRequest_ParksForReconciliation' -v ./internal/inference/workers` | **1** | the recovery path reproduced — see §4.10 |
+| 9 | **RED (release path)** the same two release cases against the pre-fix production code (§4.10.5) | **1** | the release path had the same "no holds ⇒ conflict" guard |
+| 10 | **GREEN** commands #6/#7/#8 re-run after the fix | **0** | all T2 cases pass |
+| 11 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/quota ./internal/inference/postgres ./internal/inference/gateway ./internal/inference/workers` | **0** | 4 packages `ok` (1.657s / 16.898s / 9.879s / 7.909s) |
+| 12 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, 1135 PASS / 1 SKIP / 0 FAIL |
+| 13 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 52 PASS / 2 SKIP / 0 FAIL |
+| 14 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t2_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 178.306s` |
+| 15 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 16 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T0 80.4%, T1 80.5%) |
+
+The whole table above was re-run end to end in **one** trap-protected
+session on a fresh disposable instance (the CI gate was re-run separately
+because the combined script exceeded the 600 s background budget; the gate
+itself is the same command with the same disposable-PostgreSQL recipe).
+
+#### 4.10 RED evidence (before any production edit)
+
+Command #6 ran against the **unmodified** production code at `fc0674e`; the
+new tests were written against the *existing* API surface only (the gateway's
+`ChatCompletions`/`settle`, the store's `Reserve`/`Settle`/`Release`, the
+recovery worker's `RunPass`), so every failure is a behavioural assertion
+failure, never a compile error.
+
+##### 4.10.1 Gateway — no-window settlement (reported + estimated)
+
+```
+=== RUN   TestGateway_NoWindowPolicySettles/nokey_positive_reported
+    gateway_test.go:2179: request status = "non_streaming", want settled (无窗口策略也必须终态结算)
+    gateway_test.go:2182: usage_status = "pending", want "reported"
+    gateway_test.go:2185: ledger charge rows = 0, want exactly 1 (一逻辑请求一次 charge)
+    gateway_test.go:2188: charge = -1, want 20
+    gateway_test.go:2191: settled_micros = 0, want 20
+    gateway_test.go:2195: usage records = 0, want 1 (必须有计量事实)
+=== RUN   TestGateway_NoWindowPolicySettles/nokey_positive_estimated
+    gateway_test.go:2179: request status = "non_streaming", want settled (无窗口策略也必须终态结算)
+    ...
+    gateway_test.go:2195: usage records = 0, want 1 (必须有计量事实)
+=== RUN   TestGateway_NoWindowPolicySettles/nokey_zero_reported
+    gateway_test.go:2179: request status = "non_streaming", want settled (无窗口策略也必须终态结算)
+=== RUN   TestGateway_NoWindowPolicySettles/nokey_zero_estimated
+    gateway_test.go:2179: request status = "non_streaming", want settled (无窗口策略也必须终态结算)
+--- FAIL: TestGateway_NoWindowPolicySettles (0.55s)
+    --- FAIL: TestGateway_NoWindowPolicySettles/nokey_positive_reported (0.07s)
+    --- FAIL: TestGateway_NoWindowPolicySettles/nokey_positive_estimated (0.06s)
+    --- FAIL: TestGateway_NoWindowPolicySettles/nokey_zero_reported (0.06s)
+    --- FAIL: TestGateway_NoWindowPolicySettles/nokey_zero_estimated (0.07s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_positive_reported (0.08s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_positive_estimated (0.07s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_zero_reported (0.07s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_zero_estimated (0.07s)
+```
+
+The four **with-Key** cases already passed at baseline: a Key budget hold is
+a monetary hold, so the request had a `held` reservation row and the store
+settled it. They are recorded as **protection evidence**, not as new
+behaviour. The four **no-Key** cases are the leak: the request stayed in
+`non_streaming` with `usage_status='pending'`, **no usage fact, no ledger
+charge, no terminal state** — the request was consumed upstream and nothing
+was ever billed or recorded.
+
+##### 4.10.2 Gateway — missing expected reservation / duplicate / released
+
+```
+=== RUN   TestGateway_MissingExpectedReservationRequiresReconciliation
+    gateway_test.go:2268: request status = "non_streaming", want reconciliation_required (缺预占必须进入待核对)
+    gateway_test.go:2278: no reconciliation job: a missing expected reservation must enter the reconciliation queue
+--- FAIL: TestGateway_MissingExpectedReservationRequiresReconciliation (0.07s)
+=== RUN   TestGateway_DuplicateSettleWithInconsistentChargeIsAnomaly
+    gateway_test.go:2318: settlement alarms = 0, want 1 (不一致的重复结算必须告警)
+    gateway_test.go:2322: no reconciliation job: an inconsistent duplicate settlement must enter the reconciliation queue
+--- FAIL: TestGateway_DuplicateSettleWithInconsistentChargeIsAnomaly (0.08s)
+=== RUN   TestGateway_LateUsageAfterReleaseIsAnomaly
+    gateway_test.go:2370: settlement alarms = 0, want 1 (released 后的晚到用量必须告警)
+    gateway_test.go:2374: no reconciliation job: late usage after release must enter the reconciliation queue
+--- FAIL: TestGateway_LateUsageAfterReleaseIsAnomaly (0.07s)
+```
+
+All three were swallowed by the same line: the gateway treated **every**
+`CodeConflict` as "already settled". A deleted reservation, an inconsistent
+duplicate and a late usage after release were all silently dropped — no
+alarm, no reconciliation job, no terminal state.
+
+##### 4.10.3 Store level — the exact guard, and the two guards that already held
+
+```
+=== RUN   TestSettleWithoutMonetaryHoldSettlesWindowlessRequest
+    quota_settlement_test.go:659: settle a window-less request: inference/conflict: settle: no held reservations (already released or settled?)
+--- FAIL: TestSettleWithoutMonetaryHoldSettlesWindowlessRequest (0.08s)
+=== RUN   TestSettleWithDeletedReservationsDoesNotSettle
+--- PASS: TestSettleWithDeletedReservationsDoesNotSettle (0.08s)
+=== RUN   TestConcurrentFinalizeSettlesOnce
+--- PASS: TestConcurrentFinalizeSettlesOnce (0.09s)
+```
+
+`TestSettleWithDeletedReservationsDoesNotSettle` (the settle must not
+succeed) and `TestConcurrentFinalizeSettlesOnce` (exactly one charge, the
+loser is a conflict) already passed at baseline — protection evidence for the
+"never double charge" and "never settle without holds" invariants.
+
+##### 4.10.4 Recovery — the free-request leak
+
+```
+=== RUN   TestRecover_WindowlessRequest_SettlesAtDurableEstimate
+    settlement_recovery_test.go:1171: stats = {Scanned:1 ReleasedNotSent:0 SettledConservative:0 ... RacingSkipped:1 ...}, want one conservative settle (无窗口请求也必须结算)
+    settlement_recovery_test.go:1175: request = dispatching/pending, want settled/estimated
+    settlement_recovery_test.go:1178: settled = 0, want 8312 (按可恢复估算上界入账，不得静默免费)
+    settlement_recovery_test.go:1185: ledger = 0 charges/0, want 1/8312
+--- FAIL: TestRecover_WindowlessRequest_SettlesAtDurableEstimate (0.13s)
+=== RUN   TestRecover_LegacyWindowlessRequest_ParksForReconciliation
+    settlement_recovery_test.go:1232: request status = "dispatching", want reconciliation_required (保留待核对)
+    settlement_recovery_test.go:1243: no reconciliation job: an evidence-less request must stay in the reconciliation queue
+--- FAIL: TestRecover_LegacyWindowlessRequest_ParksForReconciliation (0.10s)
+```
+
+The recovery worker could not settle a window-less request at all: the store
+rejected it ("no held reservations"), the worker counted it as a benign
+`racing_skipped`, and the request stayed open forever. Worse, the only
+amount the row carried was `reserved_micros = 0`, so the "conservative
+estimate" the worker *would* have booked was **zero** — a consumed request
+given away for free.
+
+##### 4.10.5 The release path (found during the fix, reproduced on demand)
+
+The same `len(rows) == 0 ⇒ conflict` guard existed in the **release** path:
+a window-less request that the upstream refused could never be released, so
+it hung as "in flight" and the recovery sweep later settled it. The two
+regression cases for it were therefore run against the **pre-fix** production
+code as well — the production files were reverted with
+`git stash push -- <production files>` while the test files stayed in place
+(so the new tests ran against the original code), then restored with
+`git stash pop`:
+
+```
+=== RUN   TestGateway_NoWindowPolicyRejectedRequestReleases
+    gateway_test.go:2406: request status = "dispatching", want released (确认零消费 → 释放并终态化)
+--- FAIL: TestGateway_NoWindowPolicyRejectedRequestReleases (0.12s)
+FAIL	github.com/yunhou/users/internal/inference/gateway	0.840s
+
+=== RUN   TestReleaseWithoutMonetaryHoldFinalizesWindowlessRequest
+    quota_settlement_test.go:878: release a window-less request: inference/conflict: release: no held reservations (already released or settled?)
+--- FAIL: TestReleaseWithoutMonetaryHoldFinalizesWindowlessRequest (0.09s)
+FAIL	github.com/yunhou/users/internal/inference/postgres	0.778s
+```
+
+After `git stash pop` the same two cases pass (the fixed tree is verified
+again below).
+
+#### 4.11 GREEN evidence
+
+Commands #6/#7/#8 re-run after the implementation — exit code **0**:
+
+```
+--- PASS: TestGateway_NoWindowPolicySettles (0.46s)
+    --- PASS: TestGateway_NoWindowPolicySettles/nokey_positive_reported (0.08s)
+    --- PASS: TestGateway_NoWindowPolicySettles/nokey_positive_estimated (0.05s)
+    --- PASS: TestGateway_NoWindowPolicySettles/nokey_zero_reported (0.05s)
+    --- PASS: TestGateway_NoWindowPolicySettles/nokey_zero_estimated (0.05s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_positive_reported (0.06s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_positive_estimated (0.06s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_zero_reported (0.06s)
+    --- PASS: TestGateway_NoWindowPolicySettles/key_zero_estimated (0.06s)
+--- PASS: TestGateway_MissingExpectedReservationRequiresReconciliation (0.06s)
+--- PASS: TestGateway_DuplicateSettleWithInconsistentChargeIsAnomaly (0.06s)
+--- PASS: TestGateway_LateUsageAfterReleaseIsAnomaly (0.06s)
+--- PASS: TestGateway_NoWindowPolicyRejectedRequestReleases (0.12s)
+--- PASS: TestGateway_ConsistentDuplicateSettleIsIdempotent (0.06s)
+ok  	github.com/yunhou/users/internal/inference/gateway	1.297s
+```
+
+```
+--- PASS: TestSettleWithoutMonetaryHoldSettlesWindowlessRequest (0.06s)
+--- PASS: TestSettleWithDeletedReservationsDoesNotSettle (0.05s)
+--- PASS: TestConcurrentFinalizeSettlesOnce (0.05s)
+--- PASS: TestReleaseWithoutMonetaryHoldFinalizesWindowlessRequest (0.11s)
+ok  	github.com/yunhou/users/internal/inference/postgres	0.804s
+```
+
+```
+--- PASS: TestRecover_WindowlessRequest_SettlesAtDurableEstimate (0.06s)
+--- PASS: TestRecover_LegacyWindowlessRequest_ParksForReconciliation (0.05s)
+--- PASS: TestRecover_MissingReservationIsAnomaly (0.12s)
+ok  	github.com/yunhou/users/internal/inference/workers	0.771s
+```
+
+Acceptance command #11 — exit code **0** (final trap-protected run):
+
+```
+ok  	github.com/yunhou/users/internal/inference/quota	1.657s
+ok  	github.com/yunhou/users/internal/inference/postgres	16.898s
+ok  	github.com/yunhou/users/internal/inference/gateway	9.879s
+ok  	github.com/yunhou/users/internal/inference/workers	7.909s
+```
+
+#### 4.12 Skips
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1` (`quota_concurrency_test.go:773`). The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+
+**Database-test skips: 0** — identical to the T0 inventory (§2.6) and to T1
+(§4.4); grepping the skip lines for `postgres` / `no database` / `database
+unavailable` returns nothing.
+
+#### 4.13 Migration
+
+**One appended migration: `migrations/050_inference_request_expected_hold.sql`**
+(50 = the re-checked latest number; 049 was the baseline, nothing was
+rewritten and no historical ledger row was touched).
+
+1. `inference_requests.expected_hold_micros BIGINT` — the admission-priced
+   monetary upper bound (the **recoverable estimate upper bound**). It
+   equals the mirrored hold amount for a request that has monetary windows;
+   for a **window-less** policy it is the *only* place the amount can live
+   (there is no hold row at all). `NULL` = a pre-migration row: the recovery
+   keeps it pending reconciliation — no free settlement, no guessed
+   back-charge, no recomputation of history.
+2. `inference_reconciliation_jobs.reason` — four new dedicated reasons:
+   `missing_reservation`, `late_usage_after_release`, `settlement_mismatch`,
+   `insufficient_evidence`.
+
+Evidence: `go run ./cmd/migrate` (run 1) → `applied=50 skipped=0`;
+(run 2) → `applied=0 skipped=50`; `go run ./cmd/migrate -status` → 50 × `✅`.
+The e2e-side disposable database was migrated the same way (`applied=50
+skipped=0`).
+
+#### 4.14 Files changed
+
+| File | Change |
+|---|---|
+| `migrations/050_inference_request_expected_hold.sql` | **new** — the durable estimate upper bound column + the dedicated reconciliation reasons |
+| `internal/inference/domain/settlement_outcome.go` | **new** — `SettleOutcomeKind` + the typed `SettleError` (duplicate / released / mismatch / missing_reservation) |
+| `internal/inference/domain/usage.go` | `Request.ExpectedHoldMicros`; `ExpectedMonetaryTargets`, `HoldUpperBound`, `RecoverableEstimate` |
+| `internal/inference/domain/errors.go` | `CodeOf` recognises the typed settlement result |
+| `internal/inference/postgres/ledger_repo.go` | `Settle` classifies an already-terminal request; the window-less request settles without holds; a missing expected reservation is an anomaly; `ReportTerminalAnomaly` (terminal state preserved, job filed) |
+| `internal/inference/postgres/reservation_repo.go` | `Release` finalizes a window-less request (no holds ⇒ nothing to release) and refuses loudly when the expected holds are missing |
+| `internal/inference/postgres/request_repo.go` | persists / reads `expected_hold_micros` |
+| `internal/inference/postgres/reconciliation_repo.go` | the overage baseline is the request's monetary upper bound (not `reserved_micros=0`) |
+| `internal/inference/quota/service.go` | the admission persists the priced upper bound on the request row |
+| `internal/inference/accounting/settlement.go` | the conservative-estimate basis is the recoverable estimate |
+| `internal/inference/gateway/service.go` | the settle outcome is classified (duplicate ⇒ silent; released/mismatch/missing ⇒ alarm + dedicated reconciliation); `parkSettleFailure` carries a reason |
+| `internal/inference/workers/settlement_recovery.go` | the recovery settles on the recoverable estimate, parks evidence-less rows, classifies the typed outcomes and files the dedicated jobs |
+| `internal/inference/gateway/gateway_test.go` | T2 gateway cases (no-window matrix, missing reservation, inconsistent duplicate, late usage after release, window-less release) |
+| `internal/inference/postgres/quota_settlement_test.go` | T2 store cases (window-less settle, deleted reservations, concurrent finalize, window-less release) |
+| `internal/inference/workers/settlement_recovery_test.go` | T2 recovery cases (durable estimate, evidence-less row) |
+
+#### 4.15 Notes (root cause, compatibility, honesty)
+
+- **Root cause (three defects, one symptom).** (1) `postgres.Store.Settle`
+  used `len(rows) == 0` — "no held reservation" — as a proxy for "already
+  settled or released". A policy with no monetary window and no Key budget
+  has **no hold row at all**, so its settlement was rejected as a conflict.
+  (2) `gateway.Service.settle` treated **every** `CodeConflict` as "already
+  settled — idempotent delivery, not an error", so the rejection was
+  swallowed: no usage fact, no ledger charge, no terminal state, no alarm.
+  (3) The admission priced a monetary upper bound but persisted it only
+  *through* the hold rows; with no hold row the amount was lost, so the
+  crash-recovery estimate degenerated to `reserved_micros = 0` — a consumed
+  request given away for free.
+- **The fix keeps the transaction boundary.** `Store.Settle(ctx, uow, cmd)`
+  is still one transaction (usage fact + ledger charge + reserved→used
+  conversion + terminal state); the classification happens inside the same
+  locked transaction, before anything is written. No transaction is held
+  across an upstream call; the settlement context is still detached and
+  deadline-bounded; finalize still precedes the lease release; the panic
+  cleanup in `StreamBody.Finish` is untouched.
+- **One charge per logical request.** The ledger's partial unique index is
+  unchanged; a second delivery never appends a second charge. What changed
+  is *what the second delivery means*: a consistent duplicate is absorbed
+  silently, anything else is an alarm.
+- **No fake windows, no forced zero charges.** A window-less policy keeps
+  zero windows (`quota windows = 0` is asserted); its requests still carry
+  usage, a ledger row and a terminal state. The zero-price model still gets
+  a zero charge **with** a ledger row (migration 031 semantics).
+- **Unknown vs estimated vs reported are preserved.** The estimated path is
+  unchanged (`accounting.Decide` still prices the estimate and records
+  `source='estimated'`); the recovery path still records
+  `source='estimated'` with an auditable raw basis. Nothing was collapsed
+  into zero.
+- **Money is still fixed-point.** No float was introduced; the new column is
+  a `BIGINT` micro amount and every amount still comes from the existing
+  rational pricing (`domain.Rate`, `accounting.PriceVersion`).
+- **Compatibility.** No client-visible contract changed: no new enum, no new
+  response field, no new error shape on the wire. The OpenAPI spec and the
+  integration guide need **no** update for T2. The new reconciliation
+  reasons and the new column are internal audit facts.
+- **Behaviour change for operators:** a request whose expected monetary
+  reservation is missing is now parked in reconciliation instead of being
+  silently dropped, and a released request that receives a late nonzero
+  usage now raises an alarm and a dedicated job. The window's
+  `reserved_micros` of a request with deleted holds stays frozen until a
+  human resolves it — that is the point of the dedicated flow, not a silent
+  leak.
+- **The recovery's job reasons are not re-driven.** An anomaly job
+  (`missing_reservation` / `late_usage_after_release` /
+  `settlement_mismatch`) waits for a human instead of retrying a settlement
+  that can never succeed (which would re-alarm every pass).
+- **The recovery yields to the live settlement.** When the recovery's
+  conservative estimate meets a request the live path already settled with a
+  *different* amount, the estimate yields (nothing is booked, no alarm):
+  the recorded charge is authoritative and the estimate is explicitly
+  correctable. The opposite order — the estimate booked first, the real
+  usage arriving later — is the **gateway's** anomaly and is filed there
+  (`settlement_mismatch`), because only the live path can see that the
+  booked amount is no longer the real one.
 
 ### T3 — Provider disable, model state and sticky consistency
 

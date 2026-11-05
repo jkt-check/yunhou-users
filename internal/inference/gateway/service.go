@@ -79,6 +79,11 @@ type Store interface {
 	// Settlement (domain.SettlementStore / QuotaStore release).
 	Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error
 	MarkReconciliationRequired(ctx context.Context, w domain.UnitOfWork, requestID, reason string, deadline time.Time) error
+	// ReportTerminalAnomaly records a settlement anomaly against a request
+	// whose terminal state must NOT be overwritten (a released request with
+	// late usage): the reconciliation job is enqueued in the same
+	// transaction, the terminal status stays.
+	ReportTerminalAnomaly(ctx context.Context, w domain.UnitOfWork, requestID, reason string, detail json.RawMessage, deadline time.Time) error
 	// EnqueueReconciliationJobTx upserts a reconciliation job in the
 	// settlement transaction (Task 9: overage anomaly tracked atomically).
 	EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfWork, cmd postgres.EnqueueReconciliationCommand) error
@@ -1066,7 +1071,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		RawUsage: domain.ExtensionConfig{SchemaVersion: 1, Raw: raw},
 	}, price, adapter.Inclusion(), adm.HoldMicros)
 	if err != nil {
-		s.parkSettleFailure(requestID, fmt.Errorf("settle decision: %w", err))
+		s.parkSettleFailure(requestID, "unknown_usage", fmt.Errorf("settle decision: %w", err))
 		return
 	}
 
@@ -1083,7 +1088,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		// 钱包路径（Task 14）：金额计费，货币随冻结钱包；charge 与
 		// ChargeMicros 同源（settle 事务内校验一致）。
 		if decision.Charge.Money == nil {
-			s.parkSettleFailure(requestID, fmt.Errorf("settle decision: wallet path produced no money charge"))
+			s.parkSettleFailure(requestID, "unknown_usage", fmt.Errorf("settle decision: wallet path produced no money charge"))
 			return
 		}
 		cmd.WalletCharge = decision.Charge.Money
@@ -1128,12 +1133,93 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 			}
 			return
 		}
+		// 已终态的投递必须分类（设计 §7.2）：一致的唯一 charge/usage 才是
+		// 幂等重复成功；released 后的晚到用量、缺预占、金额不一致都是账务
+		// 异常 —— 告警并进入专门核对，绝不当成功吞掉。
+		if se, ok := domain.AsSettleError(lastErr); ok {
+			s.classifySettleOutcome(requestID, se)
+			return
+		}
 		if domain.CodeOf(lastErr) == domain.CodeConflict {
-			return // already settled — idempotent delivery, not an error
+			// 不是已分类的终态结果的冲突 = 账本漂移，绝不静默当成功。
+			s.parkSettleFailure(requestID, "unknown_usage",
+				fmt.Errorf("settle: unclassified conflict: %w", lastErr))
+			return
 		}
 	}
 parked:
-	s.parkSettleFailure(requestID, fmt.Errorf("settle: %w", lastErr))
+	s.parkSettleFailure(requestID, "unknown_usage", fmt.Errorf("settle: %w", lastErr))
+}
+
+// classifySettleOutcome maps a typed terminal settlement result onto the
+// gateway's reaction:
+//
+//   - a consistent duplicate is an idempotent replay (重复成功): absorbed
+//     silently, no alarm, no reconciliation job;
+//   - a late delivery after release and a settlement mismatch are accounting
+//     anomalies: the alarm fires and the request enters the dedicated
+//     reconciliation flow (its terminal state is never rewritten);
+//   - a missing expected reservation is an accounting anomaly on a
+//     non-terminal request: it is parked for reconciliation with its reason.
+func (s *Service) classifySettleOutcome(requestID string, se *domain.SettleError) {
+	switch se.Kind {
+	case domain.SettleOutcomeDuplicate:
+		return // 幂等重投：已结算且 charge/usage 一致 —— 重复成功，不告警。
+	case domain.SettleOutcomeReleased:
+		if se.Trivial {
+			return // released 之后到来的零用量投递：无事可记，不告警。
+		}
+		s.reportSettlementAnomaly(requestID, "late_usage_after_release", se)
+		return
+	case domain.SettleOutcomeMismatch:
+		s.reportSettlementAnomaly(requestID, "settlement_mismatch", se)
+		return
+	case domain.SettleOutcomeMissingReservation:
+		s.parkSettleFailure(requestID, "missing_reservation", se)
+		return
+	}
+	s.parkSettleFailure(requestID, "unknown_usage", se)
+}
+
+// reportSettlementAnomaly alarms and files a dedicated reconciliation job
+// for a request whose terminal state must not be rewritten (设计 §7.2:
+// released 是终态，但晚到的非零用量是账务异常，必须告警并进入专门核对).
+func (s *Service) reportSettlementAnomaly(requestID, reason string, se *domain.SettleError) {
+	log.Printf("ALARM gateway: %s for request %s: %s", reason, requestID, se.Message)
+	ctx, cancel := detached(settleTimeout)
+	defer cancel()
+	detail, _ := json.Marshal(map[string]interface{}{
+		"schema_version":          1,
+		"reason":                  reason,
+		"outcome":                 string(se.Kind),
+		"status":                  string(se.Status),
+		"requested_charge_micros": int64(se.RequestedChargeMicros),
+	})
+	uow, err := s.store.Begin(ctx)
+	if err != nil {
+		log.Printf("ERROR gateway: anomaly report begin %s: %v", requestID, err)
+		s.fireSettleAlarm(requestID, se)
+		return
+	}
+	if err := s.store.ReportTerminalAnomaly(ctx, uow, requestID, reason, detail,
+		s.clock.Now().Add(reconciliationDeadline)); err != nil {
+		_ = uow.Rollback(ctx)
+		log.Printf("ERROR gateway: anomaly report %s: %v", requestID, err)
+		s.fireSettleAlarm(requestID, se)
+		return
+	}
+	if err := uow.Commit(ctx); err != nil {
+		log.Printf("ERROR gateway: anomaly report commit %s: %v", requestID, err)
+	}
+	s.fireSettleAlarm(requestID, se)
+}
+
+// fireSettleAlarm notifies the settlement-error hook (the alarm channel
+// wired by cmd/server).
+func (s *Service) fireSettleAlarm(requestID string, err error) {
+	if s.OnSettleError != nil {
+		s.OnSettleError(requestID, err)
+	}
 }
 
 // settleOnce is one settlement transaction: usage fact + ledger charge +
@@ -1192,13 +1278,13 @@ func (s *Service) attemptCost(ctx context.Context, modelID string, record domain
 }
 
 // parkSettleFailure holds the reservation and enqueues reconciliation —
-// the anti-silent-loss path (设计 §7.2).
-func (s *Service) parkSettleFailure(requestID string, cause error) {
+// the anti-silent-loss path (设计 §7.2). The reason names the anomaly class
+// so the dedicated reconciliation flow can tell a missing reservation from
+// an unknown consumption.
+func (s *Service) parkSettleFailure(requestID, reason string, cause error) {
 	log.Printf("gateway: settlement failed for %s: %v — parking in reconciliation", requestID, cause)
-	s.markReconciliation(requestID, "unknown_usage", cause.Error())
-	if s.OnSettleError != nil {
-		s.OnSettleError(requestID, cause)
-	}
+	s.markReconciliation(requestID, reason, cause.Error())
+	s.fireSettleAlarm(requestID, cause)
 }
 
 // markReconciliation parks a request whose consumption is unknown, keeping

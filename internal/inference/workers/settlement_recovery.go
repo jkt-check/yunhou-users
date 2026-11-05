@@ -76,6 +76,11 @@ type RecoveryStore interface {
 	Release(ctx context.Context, w domain.UnitOfWork, requestID string) error
 	ReleaseFromReconciliation(ctx context.Context, w domain.UnitOfWork, requestID string) error
 	Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error
+	MarkReconciliationRequired(ctx context.Context, w domain.UnitOfWork, requestID, reason string, deadline time.Time) error
+	// ReportTerminalAnomaly files a dedicated reconciliation job for a
+	// request whose terminal state must not be rewritten (a released
+	// request with late usage).
+	ReportTerminalAnomaly(ctx context.Context, w domain.UnitOfWork, requestID, reason string, detail json.RawMessage, deadline time.Time) error
 	EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfWork, cmd postgres.EnqueueReconciliationCommand) error
 	LatestPriceVersion(ctx context.Context, modelID, kind string, at time.Time) (*postgres.PriceVersion, error)
 	ReconcileWindowAggregates(ctx context.Context) ([]accounting.WindowReconciliation, error)
@@ -179,9 +184,13 @@ type PassStats struct {
 	JobsSettled          int
 	JobsAwaitingEvidence int // 已结算/等待证据窗口或人工处置
 	JobsNoEvidence       int // 无尝试无法估算 — 待人工（响亮）
-	Escalated            int
-	WindowMismatches     int
-	Errors               int
+	// ParkedNoEvidence counts the requests parked because their row
+	// carries no recoverable estimate upper bound (migration 050): they
+	// stay pending reconciliation — never settled as free.
+	ParkedNoEvidence int
+	Escalated        int
+	WindowMismatches int
+	Errors           int
 }
 
 // RunPass executes one recovery pass. Exported for tests and for the
@@ -351,6 +360,13 @@ func (w *SettlementRecovery) processJob(ctx context.Context, job postgres.Reconc
 		stats.JobsAwaitingEvidence++
 		return
 	}
+	// 账务异常任务（缺预占 / released 后晚到用量 / 结算不一致）等人工与证
+	// 据：不再自动驱动结算 —— 缺预占永远结不成，反复重试只会每轮重复告警。
+	switch job.Reason {
+	case "missing_reservation", "late_usage_after_release", "settlement_mismatch":
+		stats.JobsAwaitingEvidence++
+		return
+	}
 	attempts, kinds, err := w.loadEvidence(ctx, req.ID)
 	if err != nil {
 		stats.Errors++
@@ -407,7 +423,7 @@ func (w *SettlementRecovery) releaseProvenZero(ctx context.Context, req *domain.
 	}
 	if err := release(ctx, uow, req.ID); err != nil {
 		_ = uow.Rollback(ctx)
-		w.noteConflictOrError(req.ID, "release", err, stats)
+		w.noteConflictOrError(ctx, req, "release", err, stats)
 		return
 	}
 	if err := uow.Commit(ctx); err != nil {
@@ -426,9 +442,17 @@ func (w *SettlementRecovery) releaseProvenZero(ctx context.Context, req *domain.
 // the full reserved hold (设计 §7.2 补充段：估算为主 — 估算须可审计并可被
 // 后续真实证据冲正；永不静默免费、永不双扣、禁止仅凭 TTL 释放).
 func (w *SettlementRecovery) settleUnknownCharge(ctx context.Context, req *domain.Request, anchor *domain.Attempt, reason string, stats *PassStats) {
-	if req.ReservedMicros == nil {
-		stats.Errors++
-		log.Printf("ALARM inference recovery: request %s has no reserved amount — cannot estimate; needs manual handling", req.ID)
+	// The conservative estimate settles on the request's RECOVERABLE estimate
+	// upper bound (migration 050): the admission-priced amount persisted on
+	// the request row. A request whose row carries no monetary evidence at
+	// all (a pre-migration row without any monetary hold) must NOT be
+	// settled as free — reserved_micros=0 is not evidence that nothing was
+	// consumed. Such a row stays pending reconciliation (人工处置).
+	estimate, ok := domain.RecoverableEstimate(req)
+	if !ok {
+		stats.ParkedNoEvidence++
+		log.Printf("ALARM inference recovery: request %s carries no recoverable estimate — kept for manual reconciliation (不得按 0 记零放行)", req.ID)
+		w.parkForManual(ctx, req, "insufficient_evidence", stats)
 		return
 	}
 
@@ -453,7 +477,38 @@ func (w *SettlementRecovery) settleUnknownCharge(ctx context.Context, req *domai
 		return
 	}
 	record := accounting.ConservativeRecord(req.ID, anchor.ID, req, reason, revision+1)
-	w.commitSettlement(ctx, req, anchor, record, *req.ReservedMicros, reason, stats, false)
+	w.commitSettlement(ctx, req, anchor, record, estimate, reason, stats, false)
+}
+
+// parkForManual keeps a request whose consumption cannot be estimated in the
+// reconciliation queue: nothing is charged, nothing is released and the hold
+// stays (禁止仅凭 TTL 释放/记零 —— 设计 §7.2).
+func (w *SettlementRecovery) parkForManual(ctx context.Context, req *domain.Request, reason string, stats *PassStats) {
+	if req.Status == domain.ReqReconciliationRequired {
+		return // already parked — its job tracks it
+	}
+	uow, err := w.store.Begin(ctx)
+	if err != nil {
+		stats.Errors++
+		log.Printf("ERROR inference recovery: park begin %s: %v", req.ID, err)
+		return
+	}
+	deadline := w.clock.Now().Add(w.cfg.ReconciliationDeadline)
+	if err := w.store.MarkReconciliationRequired(ctx, uow, req.ID, reason, deadline); err != nil {
+		_ = uow.Rollback(ctx)
+		stats.Errors++
+		log.Printf("ERROR inference recovery: park %s: %v", req.ID, err)
+		return
+	}
+	if err := uow.Commit(ctx); err != nil {
+		stats.Errors++
+		log.Printf("ERROR inference recovery: park commit %s: %v", req.ID, err)
+		return
+	}
+	// The alarm is counted as a pass error: the request cannot be settled
+	// automatically and needs a human (响亮待人工).
+	stats.Errors++
+	log.Printf("inference recovery: request %s parked for manual reconciliation (no recoverable estimate — 证据不足，不猜补扣)", req.ID)
 }
 
 // commitSettlement runs the one-transaction settlement (usage fact + ledger
@@ -485,7 +540,7 @@ func (w *SettlementRecovery) commitSettlement(ctx context.Context, req *domain.R
 	}
 	if err := w.store.Settle(ctx, uow, cmd); err != nil {
 		_ = uow.Rollback(ctx)
-		w.noteConflictOrError(req.ID, "settle", err, stats)
+		w.noteConflictOrError(ctx, req, "settle", err, stats)
 		return
 	}
 	if !verified {
@@ -550,14 +605,76 @@ func (w *SettlementRecovery) estimateCost(ctx context.Context, modelID string, r
 
 // noteConflictOrError: a guard conflict means a concurrent live path
 // finalized the request between the scan and our transaction — idempotent,
-// not an error (重复工作投递只产生一次结果).
-func (w *SettlementRecovery) noteConflictOrError(requestID, op string, err error, stats *PassStats) {
+// not an error (重复工作投递只产生一次结果). A TYPED terminal settlement
+// result is classified instead: a consistent duplicate is the same benign
+// race, every other outcome is an accounting anomaly that must alarm and
+// enter the dedicated reconciliation flow (设计 §7.2: 不得把账务异常当重复
+// 吞掉).
+func (w *SettlementRecovery) noteConflictOrError(ctx context.Context, req *domain.Request, op string, err error, stats *PassStats) {
+	requestID := req.ID
+	if se, ok := domain.AsSettleError(err); ok {
+		switch se.Kind {
+		case domain.SettleOutcomeDuplicate:
+			stats.RacingSkipped++
+			return
+		case domain.SettleOutcomeReleased:
+			stats.Errors++
+			log.Printf("ALARM inference recovery: %s %s: late usage after release — accounting anomaly", op, requestID)
+			w.reportAnomaly(ctx, requestID, "late_usage_after_release", se)
+			return
+		case domain.SettleOutcomeMismatch:
+			// The live path already booked a charge and the recovery's
+			// CONSERVATIVE ESTIMATE differs from it. The estimate yields to
+			// the recorded charge (设计 §7.2: 估算可被真实证据冲正) — nothing
+			// is booked, nothing is alarmed: this is the benign race between
+			// the live settlement and the sweep. The opposite order (the
+			// estimate first, the real usage later) is the gateway's
+			// anomaly, and it is filed there.
+			stats.RacingSkipped++
+			log.Printf("WARN inference recovery: %s %s: already settled with a different amount — the conservative estimate yields (不重复入账)", op, requestID)
+			return
+		case domain.SettleOutcomeMissingReservation:
+			stats.Errors++
+			log.Printf("ALARM inference recovery: %s %s: the expected monetary reservation is missing — accounting anomaly", op, requestID)
+			// The request can never settle (its holds are gone): park it so
+			// the sweep stops re-alarming, and file the dedicated job.
+			w.parkForManual(ctx, req, "missing_reservation", stats)
+			return
+		}
+	}
 	if domain.CodeOf(err) == domain.CodeConflict {
 		stats.RacingSkipped++
 		return
 	}
 	stats.Errors++
 	log.Printf("ERROR inference recovery: %s %s: %v", op, requestID, err)
+}
+
+// reportAnomaly files a dedicated reconciliation job for a terminal request
+// whose settlement hit an accounting anomaly (the terminal state itself is
+// never rewritten).
+func (w *SettlementRecovery) reportAnomaly(ctx context.Context, requestID, reason string, se *domain.SettleError) {
+	detail, _ := json.Marshal(map[string]interface{}{
+		"schema_version":          1,
+		"reason":                  reason,
+		"outcome":                 string(se.Kind),
+		"status":                  string(se.Status),
+		"requested_charge_micros": int64(se.RequestedChargeMicros),
+	})
+	uow, err := w.store.Begin(ctx)
+	if err != nil {
+		log.Printf("ERROR inference recovery: anomaly report begin %s: %v", requestID, err)
+		return
+	}
+	if err := w.store.ReportTerminalAnomaly(ctx, uow, requestID, reason, detail,
+		w.clock.Now().Add(w.cfg.ReconciliationDeadline)); err != nil {
+		_ = uow.Rollback(ctx)
+		log.Printf("ERROR inference recovery: anomaly report %s: %v", requestID, err)
+		return
+	}
+	if err := uow.Commit(ctx); err != nil {
+		log.Printf("ERROR inference recovery: anomaly report commit %s: %v", requestID, err)
+	}
 }
 
 // enqueueWindowMismatch files a window-level ledger_mismatch job.

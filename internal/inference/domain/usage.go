@@ -225,7 +225,17 @@ type Request struct {
 	// 全部目标（三窗口 + Key 预算），请求行只记一次，不等于各 hold 之和。
 	// ChargeSource='wallet' 时它是钱包币种微金额（money micros）。
 	ReservedMicros *Microcredit
-	SettledMicros  *Microcredit
+	// ExpectedHoldMicros 是准入定价的单次消费金额上界（可恢复估算上界，
+	// migration 050）：有金额窗口的请求它等于各 hold 镜像的同一金额；
+	// **无金额窗口**的策略（只限 RPM/TPM/并发的赠送）没有任何 hold 行可
+	// 承载它，请求行是它唯一的落点 —— 没有这条持久事实，崩溃恢复会读到
+	// reserved_micros=0，把已消费请求当成免费。口径与 ReservedMicros 一致
+	// （wallet 路径是钱包币种微金额）。
+	//
+	// NULL = 迁移之前的老行（证据不足）：恢复对这类行只保留待核对，既不按 0
+	// 记零放行，也不猜测补扣。
+	ExpectedHoldMicros *Microcredit
+	SettledMicros      *Microcredit
 	// ChargeSource 是入场固定的扣费来源（migration 030）；'plan' 行走额度
 	// 窗口，'wallet' 行走钱包冻结，二者绝不中途切换。
 	ChargeSource ChargeSource
@@ -239,6 +249,82 @@ type Request struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	CompletedAt      *time.Time
+}
+
+// ExpectedMonetaryTargets returns the monetary reservation targets the
+// admission created for this request — the durable admission fact that makes
+// "a legal window-less request" distinguishable from "the expected monetary
+// reservation went missing" (设计 §7.2: 缺预占是账务异常，不能当重复结算
+// 吞掉，也不能放行给所有请求).
+//
+// The expectation is derived from the facts the reservation persisted on the
+// request row: a window hold exists iff the window is bound, the Key budget
+// hold exists iff a Key is bound, and the admission-fixed charge source
+// decides whether the money sits in the quota windows or in the wallet.
+func ExpectedMonetaryTargets(r *Request) []ReservationTargetKind {
+	if r == nil {
+		return nil
+	}
+	if r.ChargeSource == ChargeSourceWallet {
+		return []ReservationTargetKind{TargetWallet}
+	}
+	out := make([]ReservationTargetKind, 0, 4)
+	if r.WindowFiveHourID != nil {
+		out = append(out, TargetWindowFiveHour)
+	}
+	if r.WindowWeeklyID != nil {
+		out = append(out, TargetWindowWeekly)
+	}
+	if r.WindowMonthlyID != nil {
+		out = append(out, TargetWindowMonthly)
+	}
+	if r.APIKeyID != nil {
+		out = append(out, TargetKeyBudget)
+	}
+	return out
+}
+
+// HoldUpperBound returns the request's monetary upper bound (the amount the
+// admission priced for ONE consumption): the durable admission fact when the
+// row carries it, else the legacy hold amount. ok=false when the row carries
+// neither — the caller must not invent a bound.
+func HoldUpperBound(r *Request) (Microcredit, bool) {
+	if r == nil {
+		return 0, false
+	}
+	if r.ExpectedHoldMicros != nil {
+		return *r.ExpectedHoldMicros, true
+	}
+	if r.ReservedMicros != nil {
+		return *r.ReservedMicros, true
+	}
+	return 0, false
+}
+
+// RecoverableEstimate resolves the crash-recovery estimate upper bound.
+//
+// ok=false means the row carries NO monetary evidence at all: a pre-migration
+// request without any monetary hold. Such a request must be kept pending
+// reconciliation — never settled as free (reserved_micros=0 is not evidence
+// that nothing was consumed) and never back-charged on a guess.
+func RecoverableEstimate(r *Request) (Microcredit, bool) {
+	if r == nil {
+		return 0, false
+	}
+	if r.ExpectedHoldMicros != nil {
+		return *r.ExpectedHoldMicros, true
+	}
+	if r.ReservedMicros == nil {
+		return 0, false
+	}
+	if r.ChargeSource == ChargeSourceWallet {
+		// 钱包路径永远有一笔冻结：0 是合法的 0 价冻结。
+		return *r.ReservedMicros, true
+	}
+	if *r.ReservedMicros > 0 {
+		return *r.ReservedMicros, true
+	}
+	return 0, false
 }
 
 // LedgerEntry is one append-only ledger fact (设计 §7.3: 追加 + 冲正，

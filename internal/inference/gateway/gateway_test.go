@@ -25,6 +25,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/yunhou/users/internal/inference/access"
+	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
@@ -141,6 +142,23 @@ type fixture struct {
 	// default). The OAuth hot-path tests seal an OAuthBundle JSON instead.
 	credentialAuthType  string
 	credentialPlaintext string
+	// noWindows pins the policy to NO monetary window (only the
+	// concurrency limit remains) — a legal policy shape (赠送只限并发).
+	noWindows bool
+	// zeroPrice pins the customer price list to all-zero rates (a legal
+	// 0-price model: 预占额 0，结算 charge 0，账本/用量/终态照常).
+	zeroPrice bool
+}
+
+// withNoWindows pins the policy to NO monetary window: the entitlement
+// grants the model but sets no credit window at all (赠送只限并发的策略).
+func withNoWindows() fixtureOpt {
+	return func(f *fixture) { f.noWindows = true }
+}
+
+// withZeroPrice pins the sale_credit price list to all-zero rates.
+func withZeroPrice() fixtureOpt {
+	return func(f *fixture) { f.zeroPrice = true }
 }
 
 // withModelLifecycle pins the snapshot model at a non-active lifecycle.
@@ -310,6 +328,12 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 		FiveHourLimit: micro(1_000_000_000), WeeklyLimit: micro(10_000_000_000),
 		MonthlyLimit: micro(100_000_000_000), Status: "published",
 	}
+	if f.noWindows {
+		// 无金额窗口的合法策略：只保留并发限制（不制造虚假额度窗口）。
+		pol.FiveHourLimit, pol.WeeklyLimit, pol.MonthlyLimit = nil, nil, nil
+		conc := 2
+		pol.ConcurrencyLimit = &conc
+	}
 	if err := store.InsertPolicyVersion(ctx, pol); err != nil {
 		t.Fatalf("insert policy: %v", err)
 	}
@@ -333,6 +357,11 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 		ModelID: f.modelID, Kind: postgres.PriceSaleCredit, Unit: "microcredit",
 		InputPerMtok: 1_000_000, OutputPerMtok: 2_000_000,
 		Revision: 1, EffectiveFrom: now,
+	}
+	if f.zeroPrice {
+		// 0 价模型：全费率为 0（预占额 0，结算 charge 0 —— 但账本/用量/
+		// 终态照常落地）。
+		pv.InputPerMtok, pv.OutputPerMtok = 0, 0
 	}
 	if err := store.InsertPriceVersion(ctx, pv); err != nil {
 		t.Fatalf("insert price: %v", err)
@@ -1939,5 +1968,500 @@ func TestGateway_StaticCredentialHeadersUnchanged(t *testing.T) {
 				t.Errorf("Authorization = %q, want the static key as bearer", got)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T2 — 无窗口结算与冲突分类（settlement classification）
+// ---------------------------------------------------------------------------
+
+// principalNoKey is the /chat-style caller: an authenticated principal with
+// NO customer API key (no Key budget hold target at all).
+func (f *fixture) principalNoKey() (*domain.Principal, *domain.APIKey) {
+	return &domain.Principal{Kind: domain.PrincipalKayaJWT, BillingAccountID: f.accountID}, nil
+}
+
+// jsonUsageHandler answers a non-streaming chat request; withUsage=false
+// omits the usage block entirely (the upstream genuinely provides none →
+// the estimated path).
+func jsonUsageHandler(withUsage bool) func(w http.ResponseWriter, r *http.Request, body []byte) {
+	return func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		payload := `{"id":"chatcmpl-ns","object":"chat.completion","created":1,"model":"glm-4.6-upstream",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]`
+		if withUsage {
+			payload += `,"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}`
+		}
+		payload += `}`
+		_, _ = io.WriteString(w, payload)
+	}
+}
+
+// heldReservations counts the request's still-held reservations.
+func (f *fixture) heldReservations(t *testing.T, requestID string) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(
+		`SELECT COUNT(*) FROM inference_reservations WHERE request_id = $1 AND state = 'held'`, requestID).
+		Scan(&n); err != nil {
+		t.Fatalf("held reservations: %v", err)
+	}
+	return n
+}
+
+// heldLeases counts the request's still-held concurrency leases.
+func (f *fixture) heldLeases(t *testing.T, requestID string) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(
+		`SELECT COUNT(*) FROM inference_concurrency_leases WHERE request_id = $1 AND state = 'held'`, requestID).
+		Scan(&n); err != nil {
+		t.Fatalf("held leases: %v", err)
+	}
+	return n
+}
+
+// usageRecords returns the request's persisted metering facts.
+func (f *fixture) usageRecords(t *testing.T, requestID string) []struct {
+	Source                   string
+	Input, Output, CacheRead *int64
+} {
+	t.Helper()
+	rows, err := f.db.Query(`SELECT source, input_tokens, output_tokens, cache_read_tokens
+		FROM inference_usage_records WHERE request_id = $1 ORDER BY recorded_at`, requestID)
+	if err != nil {
+		t.Fatalf("usage records: %v", err)
+	}
+	defer rows.Close()
+	var out []struct {
+		Source                   string
+		Input, Output, CacheRead *int64
+	}
+	for rows.Next() {
+		var r struct {
+			Source                   string
+			Input, Output, CacheRead *int64
+		}
+		if err := rows.Scan(&r.Source, &r.Input, &r.Output, &r.CacheRead); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// chargeRows counts the request's ledger charge rows (exactly one per
+// logical request — 一逻辑请求一次 charge).
+func (f *fixture) chargeRows(t *testing.T, requestID string) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(
+		`SELECT COUNT(*) FROM inference_ledger_entries WHERE request_id = $1 AND entry_type = 'charge'`,
+		requestID).Scan(&n); err != nil {
+		t.Fatalf("charge rows: %v", err)
+	}
+	return n
+}
+
+// reconciliationJob returns the request's reconciliation job (reason/status).
+func (f *fixture) reconciliationJob(t *testing.T, requestID string) (reason, status string, found bool) {
+	t.Helper()
+	err := f.db.QueryRow(
+		`SELECT reason, status FROM inference_reconciliation_jobs WHERE request_id = $1`, requestID).
+		Scan(&reason, &status)
+	if err != nil {
+		return "", "", false
+	}
+	return reason, status, true
+}
+
+// quotaWindowCount counts the entitlement's quota windows (a window-less
+// policy must not fabricate any).
+func (f *fixture) quotaWindowCount(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(
+		`SELECT COUNT(*) FROM inference_quota_windows WHERE entitlement_id = $1`, f.entID).Scan(&n); err != nil {
+		t.Fatalf("quota windows: %v", err)
+	}
+	return n
+}
+
+// attemptID returns the request's first attempt id.
+func (f *fixture) attemptID(t *testing.T, requestID string) string {
+	t.Helper()
+	var id string
+	if err := f.db.QueryRow(
+		`SELECT id FROM inference_attempts WHERE request_id = $1 ORDER BY attempt_no LIMIT 1`, requestID).
+		Scan(&id); err != nil {
+		t.Fatalf("attempt id: %v", err)
+	}
+	return id
+}
+
+// onlyRequestID returns the single request row's id (the fixture runs one
+// logical request per test).
+func (f *fixture) onlyRequestID(t *testing.T) string {
+	t.Helper()
+	var id string
+	if err := f.db.QueryRow(`SELECT id FROM inference_requests LIMIT 1`).Scan(&id); err != nil {
+		t.Fatalf("request id: %v", err)
+	}
+	return id
+}
+
+// settleDirect drives the gateway's own settlement path for one request
+// (the same entry point the stream/non-stream finalizers use).
+func (f *fixture) settleDirect(t *testing.T, requestID string, usage domain.UsageBuckets) {
+	t.Helper()
+	ctx := context.Background()
+	row, err := f.store.LatestPriceVersion(ctx, f.modelID, string(accounting.PriceSaleCredit), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("price version: %v", err)
+	}
+	price, err := row.Pure()
+	if err != nil {
+		t.Fatalf("pure price: %v", err)
+	}
+	adm := &quota.AdmissionResult{RequestID: requestID, HoldMicros: 1_000_000, InputBound: 29}
+	f.gateway.settle(ctx, requestID, f.attemptID(t, requestID), usage,
+		domain.UsageReported, nil, price, providers.NewOpenAIChat(), adm)
+}
+
+// TestGateway_NoWindowPolicySettles — 无金额窗口的策略（只限并发的赠送）
+// 同样必须完整记量/记账：无 Key/有 Key × 零价/正价 × reported/estimated，
+// 每个完成请求恰一条 charge、有 usage、终态 settled、无悬挂预占/租约，
+// 且不得凭空造出额度窗口。零金额也必须有账本事实。
+func TestGateway_NoWindowPolicySettles(t *testing.T) {
+	cases := []struct {
+		name       string
+		withKey    bool
+		zeroPrice  bool
+		reported   bool
+		wantUsage  string
+		wantCharge int64
+	}{
+		{name: "nokey_positive_reported", reported: true, wantUsage: "reported", wantCharge: 20},
+		{name: "nokey_positive_estimated", reported: false, wantUsage: "estimated", wantCharge: 33},
+		{name: "nokey_zero_reported", zeroPrice: true, reported: true, wantUsage: "reported", wantCharge: 0},
+		{name: "nokey_zero_estimated", zeroPrice: true, reported: false, wantUsage: "estimated", wantCharge: 0},
+		{name: "key_positive_reported", withKey: true, reported: true, wantUsage: "reported", wantCharge: 20},
+		{name: "key_positive_estimated", withKey: true, reported: false, wantUsage: "estimated", wantCharge: 33},
+		{name: "key_zero_reported", withKey: true, zeroPrice: true, reported: true, wantUsage: "reported", wantCharge: 0},
+		{name: "key_zero_estimated", withKey: true, zeroPrice: true, reported: false, wantUsage: "estimated", wantCharge: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newUpstream(t, jsonUsageHandler(tc.reported))
+			opts := []fixtureOpt{withNoWindows()}
+			if tc.zeroPrice {
+				opts = append(opts, withZeroPrice())
+			}
+			f := newFixture(t, up, opts...)
+
+			ctx := context.Background()
+			var (
+				p   *domain.Principal
+				key *domain.APIKey
+			)
+			if tc.withKey {
+				p, key = f.principal()
+			} else {
+				p, key = f.principalNoKey()
+			}
+			out, err := f.gateway.ChatCompletions(ctx, p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+			if err != nil {
+				t.Fatalf("ChatCompletions: %v", err)
+			}
+
+			status, usageStatus, _, settled := f.requestRow(t, out.RequestID)
+			if status != "settled" {
+				t.Errorf("request status = %q, want settled (无窗口策略也必须终态结算)", status)
+			}
+			if usageStatus != tc.wantUsage {
+				t.Errorf("usage_status = %q, want %q", usageStatus, tc.wantUsage)
+			}
+			if n := f.chargeRows(t, out.RequestID); n != 1 {
+				t.Errorf("ledger charge rows = %d, want exactly 1 (一逻辑请求一次 charge)", n)
+			}
+			if charge := f.ledgerCharge(t, out.RequestID); charge != tc.wantCharge {
+				t.Errorf("charge = %d, want %d", charge, tc.wantCharge)
+			}
+			if settled != tc.wantCharge {
+				t.Errorf("settled_micros = %d, want %d", settled, tc.wantCharge)
+			}
+			recs := f.usageRecords(t, out.RequestID)
+			if len(recs) != 1 {
+				t.Fatalf("usage records = %d, want 1 (必须有计量事实)", len(recs))
+			}
+			if recs[0].Source != tc.wantUsage {
+				t.Errorf("usage source = %q, want %q", recs[0].Source, tc.wantUsage)
+			}
+			if recs[0].Input == nil || recs[0].Output == nil {
+				t.Errorf("usage buckets = %+v, want non-nil input/output (未知用量不能记零)", recs[0])
+			}
+			if n := f.heldReservations(t, out.RequestID); n != 0 {
+				t.Errorf("held reservations = %d, want 0 (无悬挂预占)", n)
+			}
+			if n := f.heldLeases(t, out.RequestID); n != 0 {
+				t.Errorf("held leases = %d, want 0 (无悬挂租约)", n)
+			}
+			if n := f.quotaWindowCount(t); n != 0 {
+				t.Errorf("quota windows = %d, want 0 (无窗口策略不得凭空造窗口)", n)
+			}
+			if tc.withKey {
+				var used int64
+				if err := f.db.QueryRow(`SELECT budget_used_micros FROM inference_api_keys WHERE id = $1`, f.keyID).
+					Scan(&used); err != nil {
+					t.Fatal(err)
+				}
+				if used != tc.wantCharge {
+					t.Errorf("key budget used = %d, want %d (按实际消费校正)", used, tc.wantCharge)
+				}
+			}
+			if reason, _, found := f.reconciliationJob(t, out.RequestID); found {
+				t.Errorf("reconciliation job = %q, want none (正常完成的请求不入核对队列)", reason)
+			}
+		})
+	}
+}
+
+// TestGateway_MissingExpectedReservationRequiresReconciliation — 本应存在的
+// 金额预占被删除后，结算不能成功：必须暴露异常、告警并进入待核对，而不是
+// 被"已结算"吞掉。
+func TestGateway_MissingExpectedReservationRequiresReconciliation(t *testing.T) {
+	var f *fixture
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		// 注入故障：本应存在的金额预占在结算前消失（预占丢失/被篡改）。
+		var reqID string
+		if err := f.db.QueryRow(
+			`SELECT id FROM inference_requests WHERE status = 'dispatching' ORDER BY created_at DESC LIMIT 1`).
+			Scan(&reqID); err != nil {
+			t.Errorf("find dispatching request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if _, err := f.db.Exec(
+			`DELETE FROM inference_reservations WHERE request_id = $1 AND state = 'held'`, reqID); err != nil {
+			t.Errorf("delete held reservations: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-ns","object":"chat.completion","created":1,"model":"glm-4.6-upstream",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	f = newFixture(t, up)
+
+	var alarms []string
+	f.gateway.OnSettleError = func(requestID string, err error) {
+		alarms = append(alarms, requestID)
+	}
+
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+
+	status, _, _, settled := f.requestRow(t, out.RequestID)
+	if status != "reconciliation_required" {
+		t.Errorf("request status = %q, want reconciliation_required (缺预占必须进入待核对)", status)
+	}
+	if settled != 0 {
+		t.Errorf("settled_micros = %d, want 0 (缺预占时结算不得成功)", settled)
+	}
+	if n := f.chargeRows(t, out.RequestID); n != 0 {
+		t.Errorf("ledger charge rows = %d, want 0 (缺预占时不得落 charge)", n)
+	}
+	reason, jobStatus, found := f.reconciliationJob(t, out.RequestID)
+	if !found {
+		t.Fatal("no reconciliation job: a missing expected reservation must enter the reconciliation queue")
+	}
+	if reason != "missing_reservation" {
+		t.Errorf("reconciliation reason = %q, want missing_reservation", reason)
+	}
+	if jobStatus != "pending" {
+		t.Errorf("reconciliation status = %q, want pending", jobStatus)
+	}
+	if len(alarms) != 1 {
+		t.Errorf("settlement alarms = %d, want 1 (账务异常必须告警)", len(alarms))
+	}
+}
+
+// TestGateway_DuplicateSettleWithInconsistentChargeIsAnomaly — 已结算请求
+// 再次投递但金额不一致：不是"重复成功"，必须告警并进入专门核对；账本仍只
+// 能有一条 charge（绝不双扣）。
+func TestGateway_DuplicateSettleWithInconsistentChargeIsAnomaly(t *testing.T) {
+	up := newUpstream(t, jsonUsageHandler(true))
+	f := newFixture(t, up)
+
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	status, _, _, settled := f.requestRow(t, out.RequestID)
+	if status != "settled" || settled != 20 {
+		t.Fatalf("request = %s/%d, want settled/20", status, settled)
+	}
+
+	var alarms []string
+	f.gateway.OnSettleError = func(requestID string, err error) {
+		alarms = append(alarms, requestID)
+	}
+
+	// 晚到且金额不同的用量：与已入账的 charge 不一致 → 账务异常。
+	in, outTok := int64(1000), int64(1000)
+	f.settleDirect(t, out.RequestID, domain.UsageBuckets{InputTokens: &in, OutputTokens: &outTok})
+
+	if len(alarms) != 1 {
+		t.Errorf("settlement alarms = %d, want 1 (不一致的重复结算必须告警)", len(alarms))
+	}
+	reason, _, found := f.reconciliationJob(t, out.RequestID)
+	if !found {
+		t.Fatal("no reconciliation job: an inconsistent duplicate settlement must enter the reconciliation queue")
+	}
+	if reason != "settlement_mismatch" {
+		t.Errorf("reconciliation reason = %q, want settlement_mismatch", reason)
+	}
+	if n := f.chargeRows(t, out.RequestID); n != 1 {
+		t.Errorf("ledger charge rows = %d, want 1 (绝不双扣)", n)
+	}
+	if charge := f.ledgerCharge(t, out.RequestID); charge != 20 {
+		t.Errorf("charge = %d, want 20 (原入账金额不被改写)", charge)
+	}
+	status, _, _, settled = f.requestRow(t, out.RequestID)
+	if status != "settled" || settled != 20 {
+		t.Errorf("request = %s/%d, want settled/20 (终态不被覆盖)", status, settled)
+	}
+}
+
+// TestGateway_LateUsageAfterReleaseIsAnomaly — 已 released（确认零消费）的
+// 请求晚到非零用量：这是账务异常，必须告警并进入专门核对；released 是终态
+// 但绝不因此吞掉晚到的用量。
+func TestGateway_LateUsageAfterReleaseIsAnomaly(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"message":"unauthorized"}}`)
+	})
+	f := newFixture(t, up)
+
+	var alarms []string
+	f.gateway.OnSettleError = func(requestID string, err error) {
+		alarms = append(alarms, requestID)
+	}
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat,
+		chatReq(false, "hi")); err == nil {
+		t.Fatal("expected the upstream rejection to fail the call")
+	}
+	reqID := f.onlyRequestID(t)
+	status, _, _, _ := f.requestRow(t, reqID)
+	if status != "released" {
+		t.Fatalf("request status = %q, want released (上游明确拒绝 → 释放预占)", status)
+	}
+
+	// 晚到的非零用量：请求已是终态 released —— 不得当作"已结算"吞掉。
+	in, outTok := int64(10), int64(5)
+	f.settleDirect(t, reqID, domain.UsageBuckets{InputTokens: &in, OutputTokens: &outTok})
+
+	if len(alarms) != 1 {
+		t.Errorf("settlement alarms = %d, want 1 (released 后的晚到用量必须告警)", len(alarms))
+	}
+	reason, _, found := f.reconciliationJob(t, reqID)
+	if !found {
+		t.Fatal("no reconciliation job: late usage after release must enter the reconciliation queue")
+	}
+	if reason != "late_usage_after_release" {
+		t.Errorf("reconciliation reason = %q, want late_usage_after_release", reason)
+	}
+	if n := f.chargeRows(t, reqID); n != 0 {
+		t.Errorf("ledger charge rows = %d, want 0 (released 终态不得被悄悄改写)", n)
+	}
+	status, _, _, _ = f.requestRow(t, reqID)
+	if status != "released" {
+		t.Errorf("request status = %q, want released (终态不被覆盖)", status)
+	}
+}
+
+// TestGateway_NoWindowPolicyRejectedRequestReleases — 无窗口策略的请求被上
+// 游明确拒绝时：没有金额预占可释放，但请求仍必须终态化为 released（确认零
+// 消费），绝不悬挂成"永远在途"，也绝不为失败请求伪造成功结算。
+func TestGateway_NoWindowPolicyRejectedRequestReleases(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"message":"unauthorized"}}`)
+	})
+	f := newFixture(t, up, withNoWindows())
+
+	p, key := f.principalNoKey()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat,
+		chatReq(false, "hi")); err == nil {
+		t.Fatal("expected the upstream rejection to fail the call")
+	}
+	reqID := f.onlyRequestID(t)
+	status, usageStatus, _, settled := f.requestRow(t, reqID)
+	if status != "released" {
+		t.Errorf("request status = %q, want released (确认零消费 → 释放并终态化)", status)
+	}
+	if usageStatus == "reported" || usageStatus == "estimated" {
+		t.Errorf("usage_status = %q, want no metering fact (失败请求不得伪造用量)", usageStatus)
+	}
+	if settled != 0 {
+		t.Errorf("settled_micros = %d, want 0 (失败请求不得入账)", settled)
+	}
+	if n := f.chargeRows(t, reqID); n != 0 {
+		t.Errorf("ledger charge rows = %d, want 0 (失败请求不得落 charge)", n)
+	}
+	if n := f.heldReservations(t, reqID); n != 0 {
+		t.Errorf("held reservations = %d, want 0 (无悬挂预占)", n)
+	}
+	if n := f.heldLeases(t, reqID); n != 0 {
+		t.Errorf("held leases = %d, want 0 (无悬挂租约)", n)
+	}
+}
+
+// TestGateway_ConsistentDuplicateSettleIsIdempotent — 已结算请求再次投递
+// **一致**的 charge/usage：这是幂等重复成功 —— 不告警、不入核对队列、账本
+// 仍只有一条 charge（重复投递只产生一次结果）。
+func TestGateway_ConsistentDuplicateSettleIsIdempotent(t *testing.T) {
+	up := newUpstream(t, jsonUsageHandler(true))
+	f := newFixture(t, up)
+
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	status, _, _, settled := f.requestRow(t, out.RequestID)
+	if status != "settled" || settled != 20 {
+		t.Fatalf("request = %s/%d, want settled/20", status, settled)
+	}
+
+	var alarms []string
+	f.gateway.OnSettleError = func(requestID string, err error) {
+		alarms = append(alarms, requestID)
+	}
+
+	// 同一请求、同一笔用量再次投递。
+	in, outTok := int64(10), int64(5)
+	f.settleDirect(t, out.RequestID, domain.UsageBuckets{InputTokens: &in, OutputTokens: &outTok})
+
+	if len(alarms) != 0 {
+		t.Errorf("settlement alarms = %d, want 0 (一致的重复结算是幂等成功，不告警)", len(alarms))
+	}
+	if reason, _, found := f.reconciliationJob(t, out.RequestID); found {
+		t.Errorf("reconciliation job = %q, want none (重复成功不入核对队列)", reason)
+	}
+	if n := f.chargeRows(t, out.RequestID); n != 1 {
+		t.Errorf("ledger charge rows = %d, want 1 (重复投递只产生一次扣费)", n)
+	}
+	if charge := f.ledgerCharge(t, out.RequestID); charge != 20 {
+		t.Errorf("charge = %d, want 20 (原入账金额不变)", charge)
+	}
+	status, _, _, settled = f.requestRow(t, out.RequestID)
+	if status != "settled" || settled != 20 {
+		t.Errorf("request = %s/%d, want settled/20", status, settled)
 	}
 }

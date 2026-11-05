@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"sort"
 
 	"github.com/jmoiron/sqlx"
@@ -90,10 +91,13 @@ func (s *Store) ReleaseFromReconciliation(ctx context.Context, w domain.UnitOfWo
 // resolves the open job in the same tx.
 func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfWork, requestID string, fromReconciliation bool) error {
 	// Locate the owner account, then lock in the fixed order.
-	var accountID, status string
+	var accountID, status, chargeSource string
+	var apiKeyID, win5h, winW, winM sql.NullString
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT billing_account_id, status FROM inference_requests WHERE id = $1`,
-		requestID).Scan(&accountID, &status); err != nil {
+		`SELECT billing_account_id, status, charge_source, api_key_id,
+		        window_five_hour_id, window_weekly_id, window_monthly_id
+		 FROM inference_requests WHERE id = $1`,
+		requestID).Scan(&accountID, &status, &chargeSource, &apiKeyID, &win5h, &winW, &winM); err != nil {
 		return mapError("release: load request", err)
 	}
 	if err := lockAccountTx(ctx, tx, accountID); err != nil {
@@ -122,9 +126,25 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 	if err != nil {
 		return err
 	}
-	if len(rows) == 0 {
+	// A request whose policy has NO monetary window holds nothing at all —
+	// releasing it is a no-op that still finalizes the request (confirmed
+	// zero consumption). A request that DOES expect holds but cannot show
+	// them is an accounting anomaly: the window's reserved amount would
+	// stay frozen forever, so the release refuses loudly instead of
+	// pretending the holds are gone.
+	expected := len(domain.ExpectedMonetaryTargets(&domain.Request{
+		APIKeyID:         strFromNull(apiKeyID),
+		WindowFiveHourID: strFromNull(win5h), WindowWeeklyID: strFromNull(winW),
+		WindowMonthlyID: strFromNull(winM),
+		ChargeSource:    domain.ChargeSource(chargeSource),
+	}))
+	switch {
+	case len(rows) == 0 && expected > 0:
 		return domain.NewError(domain.CodeConflict,
-			"release: no held reservations (already released or settled?)")
+			"release: the expected monetary reservation is missing (accounting anomaly)")
+	case len(rows) != expected:
+		return domain.NewError(domain.CodeConflict,
+			"release: held reservations do not match the admission (ledger drift)")
 	}
 
 	var fiveHourWindow *string

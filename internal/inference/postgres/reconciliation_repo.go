@@ -370,14 +370,14 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	// 1. Lock + require settled. The delta base is the CURRENT settled
 	// amount, never the immutable original charge.
 	var status, accountID, chargeSource string
-	var reserved, settled sql.NullInt64
+	var reserved, settled, expectedHold sql.NullInt64
 	var apiKeyID sql.NullString
 	var win5h, winW, winM sql.NullString
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT status, billing_account_id, reserved_micros, settled_micros, api_key_id,
+		`SELECT status, billing_account_id, reserved_micros, settled_micros, expected_hold_micros, api_key_id,
 		        window_five_hour_id, window_weekly_id, window_monthly_id, charge_source
 		 FROM inference_requests WHERE id = $1 FOR UPDATE`, cmd.RequestID).
-		Scan(&status, &accountID, &reserved, &settled, &apiKeyID, &win5h, &winW, &winM, &chargeSource); err != nil {
+		Scan(&status, &accountID, &reserved, &settled, &expectedHold, &apiKeyID, &win5h, &winW, &winM, &chargeSource); err != nil {
 		return mapError("correction: lock request", err)
 	}
 	// wallet 计费请求显式拒绝（见方法 doc：单位/预算/补偿分录均未适配）。
@@ -524,12 +524,21 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	// enqueue/refresh the anomaly (the open job merges detail and STAYS
 	// pending); back within the hold → the anomaly is addressed by this
 	// correction, so an open overage job resolves with the note.
-	if reserved.Valid && cmd.CorrectedMicros > domain.Microcredit(reserved.Int64) {
+	// 8.1. Overage re-check against the request's monetary upper bound: the
+	// durable admission fact (migration 050) when the row carries it, else
+	// the legacy hold amount. A window-less request has no hold row at all,
+	// so its baseline is the priced upper bound — without it every real
+	// charge would look like an overage.
+	holdMicros, hasHold := domain.HoldUpperBound(&domain.Request{
+		ReservedMicros:     microFromNull(reserved),
+		ExpectedHoldMicros: microFromNull(expectedHold),
+	})
+	if hasHold && cmd.CorrectedMicros > holdMicros {
 		detail := mustJSON(map[string]interface{}{
 			"schema_version":  1,
-			"reserved_micros": reserved.Int64,
+			"reserved_micros": int64(holdMicros),
 			"charge_micros":   int64(cmd.CorrectedMicros),
-			"over_micros":     int64(cmd.CorrectedMicros) - reserved.Int64,
+			"over_micros":     int64(cmd.CorrectedMicros) - int64(holdMicros),
 			"origin":          "correction",
 		})
 		deadline := cmd.At.UTC().Add(24 * time.Hour)
@@ -542,7 +551,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		}); err != nil {
 			return err
 		}
-	} else if reserved.Valid {
+	} else if hasHold {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE inference_reconciliation_jobs
 			 SET status = 'resolved', resolved_at = now(), updated_at = now(),

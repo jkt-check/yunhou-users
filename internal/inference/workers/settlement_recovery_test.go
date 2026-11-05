@@ -13,6 +13,7 @@ import (
 
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/postgres"
+	"github.com/yunhou/users/internal/inference/quota"
 	"github.com/yunhou/users/internal/migrate"
 )
 
@@ -1076,5 +1077,225 @@ func TestWindowMismatchEscalatesAtOriginalDeadline(t *testing.T) {
 	}
 	if stats.Escalated != 1 {
 		t.Errorf("pass @+25h escalated = %d, want 1 (漂移持续 24h 后必须升级告警)", stats.Escalated)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T2 — 无窗口请求的恢复：可恢复估算上界（不是 reserved_micros=0 的免费）
+// ---------------------------------------------------------------------------
+
+// fabricateWindowlessReserved admits a request under a window-less policy
+// (赠送只限并发): the admission creates NO monetary hold, but it still
+// prices a monetary upper bound. The returned estimate is that upper bound
+// — the durable fact the recovery must settle on (never a free request).
+func (f *workerFixture) fabricateWindowlessReserved(t *testing.T) (string, domain.Microcredit) {
+	t.Helper()
+	ctx := context.Background()
+	pol := &postgres.PolicyVersion{
+		Name: "gift-concurrency-only", Revision: 1, ModelIDs: []string{f.modelID},
+		Status: "published",
+	}
+	if err := f.store.InsertPolicyVersion(ctx, pol); err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	ent := &domain.Entitlement{
+		BillingAccountID: f.accountID, SourceType: domain.SourceSubscription,
+		SourceID: "sub-" + uuid.NewString(), ModelIDs: []string{f.modelID},
+		PolicyVersionID: pol.ID, AnchorAt: now, EffectiveFrom: now,
+	}
+	if err := f.store.InsertEntitlement(ctx, ent); err != nil {
+		t.Fatalf("entitlement: %v", err)
+	}
+	pv := &postgres.PriceVersion{
+		ModelID: f.modelID, Kind: postgres.PriceSaleCredit, Unit: "microcredit",
+		InputPerMtok: 1_000_000, OutputPerMtok: 2_000_000,
+		Revision: 1, EffectiveFrom: now,
+	}
+	if err := f.store.InsertPriceVersion(ctx, pv); err != nil {
+		t.Fatalf("price: %v", err)
+	}
+	price, err := pv.Pure()
+	if err != nil {
+		t.Fatalf("pure price: %v", err)
+	}
+	in, out := int64(120), int64(4096)
+	estimate, err := quota.ReserveAmount(price, quota.ReserveBounds{
+		InputBoundTokens: in, OutputCapTokens: out,
+	})
+	if err != nil {
+		t.Fatalf("reserve amount: %v", err)
+	}
+	svc := quota.NewService(f.store, nil)
+	adm, err := svc.Admit(ctx, quota.AdmitCommand{
+		Request: domain.Request{
+			ID: uuid.NewString(), BillingAccountID: f.accountID,
+			EntitlementID: ent.ID, ModelID: f.modelID,
+			Protocol: domain.ProtocolOpenAIChat, Stream: true,
+		},
+		Entitlement:          *ent,
+		Policy:               quota.Policy{Name: pol.Name, Revision: 1, ModelIDs: []string{f.modelID}},
+		CreditPrice:          price,
+		Model:                domain.Model{ID: f.modelID, ContextTokens: 200000, MaxOutputTokens: 8192},
+		EstimatedInputTokens: in,
+		ClientMaxTokens:      &out,
+		At:                   now,
+	})
+	if err != nil {
+		t.Fatalf("admit (window-less policy): %v", err)
+	}
+	if len(adm.WindowIDs) != 0 {
+		t.Fatalf("window ids = %v, want none (无窗口策略不得凭空造窗口)", adm.WindowIDs)
+	}
+	if adm.HoldMicros != estimate {
+		t.Fatalf("hold = %d, want %d", adm.HoldMicros, estimate)
+	}
+	return adm.RequestID, estimate
+}
+
+// TestRecover_WindowlessRequest_SettlesAtDurableEstimate — 无窗口请求崩溃
+// 后必须按准入时定价的可恢复估算上界结算，绝不因"没有金额预占行"而免费。
+func TestRecover_WindowlessRequest_SettlesAtDurableEstimate(t *testing.T) {
+	f := newWorkerFixture(t)
+	reqID, estimate := f.fabricateWindowlessReserved(t)
+	f.fabricateAttempt(t, reqID, "dispatching", "", false)
+	if err := f.store.UpdateRequestStatus(context.Background(), reqID, domain.ReqDispatching, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := f.newWorker().RunPass(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SettledConservative != 1 {
+		t.Errorf("stats = %+v, want one conservative settle (无窗口请求也必须结算)", stats)
+	}
+	status, usage, reserved, settled := f.requestState(t, reqID)
+	if status != "settled" || usage != "estimated" {
+		t.Errorf("request = %s/%s, want settled/estimated", status, usage)
+	}
+	if settled != int64(estimate) {
+		t.Errorf("settled = %d, want %d (按可恢复估算上界入账，不得静默免费)", settled, int64(estimate))
+	}
+	if reserved != 0 {
+		t.Errorf("reserved = %d, want 0 (无窗口请求没有任何金额预占行)", reserved)
+	}
+	charges, total := f.ledgerEntries(t, reqID)
+	if charges != 1 || total != int64(estimate) {
+		t.Errorf("ledger = %d charges/%d, want 1/%d", charges, total, int64(estimate))
+	}
+}
+
+// TestRecover_LegacyWindowlessRequest_ParksForReconciliation — 迁移前的老行
+// （没有可恢复估算证据）证据不足：保留待核对，不自动重算历史、不猜补扣，
+// 绝不按 reserved_micros=0 记零放行。
+func TestRecover_LegacyWindowlessRequest_ParksForReconciliation(t *testing.T) {
+	f := newWorkerFixture(t)
+	ctx := context.Background()
+
+	// 老行形状：没有金额预占行，也没有任何可恢复估算证据。
+	uow, err := f.store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm, err := f.store.Reserve(ctx, uow, domain.ReserveCommand{
+		Request: domain.Request{
+			ID: uuid.NewString(), BillingAccountID: f.accountID,
+			EntitlementID: f.entID, ModelID: f.modelID,
+			Protocol: domain.ProtocolOpenAIChat, Stream: true,
+			PolicyVersionID: f.policyID,
+		},
+		AdmittedAt: time.Now().UTC().Add(-time.Minute),
+	})
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reqID := adm.RequestID
+	f.fabricateAttempt(t, reqID, "dispatching", "", false)
+	if err := f.store.UpdateRequestStatus(ctx, reqID, domain.ReqDispatching, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := f.newWorker().RunPass(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SettledConservative != 0 {
+		t.Errorf("stats = %+v, want no settlement (证据不足不得结算)", stats)
+	}
+	status, _, _, settled := f.requestState(t, reqID)
+	if status != "reconciliation_required" {
+		t.Errorf("request status = %q, want reconciliation_required (保留待核对)", status)
+	}
+	if settled != 0 {
+		t.Errorf("settled = %d, want 0 (证据不足时绝不落 charge)", settled)
+	}
+	charges, _ := f.ledgerEntries(t, reqID)
+	if charges != 0 {
+		t.Errorf("charges = %d, want 0 (不得猜补扣)", charges)
+	}
+	reason, jobStatus, found := f.openJob(t, reqID)
+	if !found {
+		t.Fatal("no reconciliation job: an evidence-less request must stay in the reconciliation queue")
+	}
+	if reason != "insufficient_evidence" {
+		t.Errorf("job reason = %q, want insufficient_evidence", reason)
+	}
+	if jobStatus != "pending" {
+		t.Errorf("job status = %q, want pending", jobStatus)
+	}
+}
+
+// TestRecover_MissingReservationIsAnomaly — 恢复 worker 遇到"本应存在的金额
+// 预占不见了"的请求：结算绝不能成功（不落 charge），必须告警并把请求停放
+// 进专门核对（否则每一轮扫描都会重复告警）。
+func TestRecover_MissingReservationIsAnomaly(t *testing.T) {
+	f := newWorkerFixture(t)
+	ctx := context.Background()
+	reqID := f.fabricateReserved(t)
+	f.fabricateAttempt(t, reqID, "dispatching", "", false)
+	if err := f.store.UpdateRequestStatus(ctx, reqID, domain.ReqDispatching, ""); err != nil {
+		t.Fatal(err)
+	}
+	// 预占消失（丢失/被篡改）。
+	if _, err := f.db.Exec(
+		`DELETE FROM inference_reservations WHERE request_id = $1 AND state = 'held'`, reqID); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := f.newWorker().RunPass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SettledConservative != 0 {
+		t.Errorf("stats = %+v, want no settlement (缺预占时结算绝不成功)", stats)
+	}
+	if stats.Errors == 0 {
+		t.Errorf("stats = %+v, want an alarm (账务异常必须响亮)", stats)
+	}
+	status, _, _, settled := f.requestState(t, reqID)
+	if status != "reconciliation_required" {
+		t.Errorf("request status = %q, want reconciliation_required (停放进专门核对)", status)
+	}
+	if settled != 0 {
+		t.Errorf("settled = %d, want 0 (缺预占时绝不落 charge)", settled)
+	}
+	charges, _ := f.ledgerEntries(t, reqID)
+	if charges != 0 {
+		t.Errorf("charges = %d, want 0", charges)
+	}
+	reason, jobStatus, found := f.openJob(t, reqID)
+	if !found {
+		t.Fatal("no reconciliation job: a missing expected reservation must enter the reconciliation queue")
+	}
+	if reason != "missing_reservation" {
+		t.Errorf("job reason = %q, want missing_reservation", reason)
+	}
+	if jobStatus != "pending" {
+		t.Errorf("job status = %q, want pending", jobStatus)
 	}
 }

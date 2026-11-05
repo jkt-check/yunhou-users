@@ -1,6 +1,8 @@
 // service.go — 上游凭据生命周期：创建 / 轮换 / 测试 / 禁用 + 网关侧密钥
-// 解析（ResolveSecret）。所有写操作记录审计（人员 + 服务双重归因、对象、
-// 原因）；响应、日志与审计 detail 永远不含可用秘密（脱敏后的状态视图）。
+// 解析（ResolveSecret 取原始材料；ResolveOutboundAuth 交出可直接派发的
+// 鉴权材料——oauth 凭据只有 access token 出边界）。所有写操作记录审计
+// （人员 + 服务双重归因、对象、原因）；响应、日志与审计 detail 永远不含
+// 可用秘密（脱敏后的状态视图）。
 
 package credentials
 
@@ -8,8 +10,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"strings"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/domain"
@@ -430,6 +432,46 @@ func (s *Service) ResolveBearerToken(ctx context.Context, id string, pinGenerati
 		return "", nil, domain.NewError(domain.CodeConflict, "oauth credential has no access token")
 	}
 	return bundle.AccessToken, cred, nil
+}
+
+// OutboundAuth is the credential material ONE dispatch may use: the auth
+// type plus the usable secret. It is the only credential shape the gateway
+// hot path sees — the sealed OAuth bundle and the refresh token stay inside
+// this package.
+type OutboundAuth struct {
+	// AuthType is the credential's auth type: "api_key" | "service" | "oauth".
+	AuthType string
+	// Token is the usable outbound secret: the plaintext for a static
+	// credential (api_key/service), the ACCESS TOKEN for an oauth one.
+	Token string
+}
+
+// ResolveOutboundAuth resolves a credential into dispatchable auth material
+// (Task 1: the hot path must never see the bundle). Status, generation CAS
+// and rotation semantics are exactly ResolveSecret's — this method only
+// changes WHAT the caller receives, never WHEN it may be used.
+//
+// The oauth branch yields the access token alone: the bundle JSON and the
+// refresh token are never handed out, so they can not reach an upstream
+// header. A malformed bundle fails closed with a message that carries no
+// part of the sealed material (the parse cause is dropped on purpose).
+func (s *Service) ResolveOutboundAuth(ctx context.Context, id string, pinGeneration *int64) (OutboundAuth, *domain.Credential, error) {
+	plain, cred, err := s.ResolveSecret(ctx, id, pinGeneration)
+	if err != nil {
+		return OutboundAuth{}, nil, err
+	}
+	if cred.AuthType != "oauth" {
+		// 静态凭据：明文本身就是出站秘密（逐字节保持旧热路径口径）。
+		return OutboundAuth{AuthType: cred.AuthType, Token: string(plain)}, cred, nil
+	}
+	bundle, err := UnmarshalBundle(plain)
+	if err != nil {
+		return OutboundAuth{}, nil, domain.NewError(domain.CodeInternal, "oauth credential bundle is unreadable")
+	}
+	if bundle.AccessToken == "" {
+		return OutboundAuth{}, nil, domain.NewError(domain.CodeConflict, "oauth credential has no access token")
+	}
+	return OutboundAuth{AuthType: cred.AuthType, Token: bundle.AccessToken}, cred, nil
 }
 
 func (s *Service) mustActive(ctx context.Context, id string) (*domain.Credential, error) {

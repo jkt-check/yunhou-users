@@ -36,6 +36,7 @@ import (
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/catalog"
+	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/inference/providers"
@@ -50,10 +51,13 @@ type SnapshotSource interface {
 	Current(ctx context.Context) (*catalog.Snapshot, error)
 }
 
-// SecretResolver decrypts the credential bound to an upstream account
-// (Task 4 credentials.Service).
+// SecretResolver resolves the credential bound to an upstream account into
+// the auth material the dispatch may use (Task 4 credentials.Service).
+// The sealed OAuth bundle never crosses this boundary: for an "oauth"
+// credential the resolver yields the ACCESS TOKEN only, so neither the
+// bundle JSON nor the refresh token can reach an upstream header.
 type SecretResolver interface {
-	ResolveSecret(ctx context.Context, id string, pinGeneration *int64) ([]byte, *domain.Credential, error)
+	ResolveOutboundAuth(ctx context.Context, id string, pinGeneration *int64) (credentials.OutboundAuth, *domain.Credential, error)
 }
 
 // Store is the persistence surface the gateway orchestration needs;
@@ -742,7 +746,9 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	// NoCooldown（pr-ci 第三轮）：凭据不可用是状态问题（吊销/轮换），
 	// 不是上游瞬时故障——喂 60s 重试型冷却会让 reactivate 后账号仍被
 	// cooled map 挡在候选外（FullLifecycleE2E 502 的真因）。
-	secret, _, err := s.secrets.ResolveSecret(ctx, cand.Account.CredentialID, nil)
+	// Task 1：解析结果是「可派发的鉴权材料」而不是原始密文——oauth
+	// 凭据只交出 access token，bundle JSON 与 refresh token 到不了适配器。
+	auth, _, err := s.secrets.ResolveOutboundAuth(ctx, cand.Account.CredentialID, nil)
 	if err != nil {
 		failAttempt("failed", "credential")
 		return nil, &providers.DispatchError{Err: err, NoCooldown: true}
@@ -793,7 +799,7 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 
 	disp, err := providers.Dispatch(attemptCtx, s.client, adapter, &providers.Call{
 		Deployment:   &cand.Deployment,
-		Secret:       secret,
+		Auth:         providers.Auth{Type: auth.AuthType, Token: auth.Token},
 		RequestID:    requestID,
 		Request:      req,
 		OutputCap:    adm.OutputCap,

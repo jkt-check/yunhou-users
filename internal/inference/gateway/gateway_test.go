@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -122,6 +123,10 @@ type fixture struct {
 	accountUpID  string
 	policyID     string
 	priceID      string
+	// credentialID / credSvc expose the upstream credential the fixture
+	// sealed, so the OAuth hot-path tests can rotate or disable it.
+	credentialID string
+	credSvc      *credentials.Service
 	// modelLifecycle overrides the snapshot model lifecycle (I-6 gate tests);
 	// zero value = active.
 	modelLifecycle domain.Lifecycle
@@ -131,6 +136,11 @@ type fixture struct {
 	// default-on path.
 	modelInputModalities    []string
 	modelModalitiesOverride bool
+	// credentialAuthType / credentialPlaintext override the upstream
+	// credential the fixture seals ("api_key" + "sk-upstream-test" by
+	// default). The OAuth hot-path tests seal an OAuthBundle JSON instead.
+	credentialAuthType  string
+	credentialPlaintext string
 }
 
 // withModelLifecycle pins the snapshot model at a non-active lifecycle.
@@ -145,6 +155,14 @@ func withModelInputModalities(mods []string) fixtureOpt {
 }
 
 type fixtureOpt func(f *fixture)
+
+// withCredential seals the upstream credential with an explicit auth type
+// and plaintext instead of the default api_key/"sk-upstream-test". The OAuth
+// hot-path tests pass the marshalled OAuthBundle JSON here — the same shape
+// credentials.HandleCallback seals.
+func withCredential(authType, plaintext string) fixtureOpt {
+	return func(f *fixture) { f.credentialAuthType, f.credentialPlaintext = authType, plaintext }
+}
 
 // streamSSE writes an OpenAI SSE stream in fragments (split mid-line across
 // flushes — 拆包 SSE), with the usage chunk at the END and [DONE].
@@ -211,6 +229,9 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 	ctx := context.Background()
 	store := postgres.NewStore(db)
 	f := &fixture{db: db, store: store, up: up, modelID: "glm-4.6"}
+	for _, opt := range opts {
+		opt(f)
+	}
 
 	// user + billing account
 	f.userID = uuid.NewString()
@@ -243,11 +264,17 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 		t.Fatalf("vault: %v", err)
 	}
 	credSvc := credentials.NewService(vault, store, store)
+	credAuthType, credPlaintext := f.credentialAuthType, f.credentialPlaintext
+	if credAuthType == "" {
+		credAuthType, credPlaintext = "api_key", "sk-upstream-test"
+	}
 	cv, err := credSvc.Create(ctx, credentials.Operator{UserID: uuid.NewString(), AppID: "test"},
-		prov.ID, "main", "api_key", "sk-upstream-test", "seed", nil)
+		prov.ID, "main", credAuthType, credPlaintext, "seed", nil)
 	if err != nil {
 		t.Fatalf("create credential: %v", err)
 	}
+	f.credentialID = cv.ID
+	f.credSvc = credSvc
 
 	upAccount := &domain.UpstreamAccount{
 		ProviderID: prov.ID, CredentialID: cv.ID, DisplayName: "pool-1",
@@ -331,10 +358,6 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 		t.Fatalf("insert api key: %v", err)
 	}
 	f.keyID = key.ID
-
-	for _, opt := range opts {
-		opt(f)
-	}
 
 	// Static catalog snapshot pinned over the same rows.
 	modelLC := f.modelLifecycle
@@ -1604,5 +1627,338 @@ func TestStreamAssemblyPanic_ReleasesLeases(t *testing.T) {
 	}
 	if held != 0 {
 		t.Errorf("held leases = %d, want 0 — 交接前 panic 必须停 keeper 释放租约(预占/并发槽不得冻结)", held)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T1 — OAuth 热路径：出站只允许「可用的 access token」，bundle JSON 与
+// refresh token 永远不得进入上游请求头。
+// ---------------------------------------------------------------------------
+
+// oauthBundleJSON seals an OAuthBundle exactly the way
+// credentials.HandleCallback does (access + refresh in one JSON blob).
+func oauthBundleJSON(t *testing.T, access, refresh string) string {
+	t.Helper()
+	raw, err := credentials.MarshalBundle(&credentials.OAuthBundle{
+		AccessToken: access, RefreshToken: refresh, TokenType: "Bearer",
+	})
+	if err != nil {
+		t.Fatalf("marshal oauth bundle: %v", err)
+	}
+	return string(raw)
+}
+
+// headerRecorder captures the outbound headers of the fake upstream.
+type headerRecorder struct {
+	mu sync.Mutex
+	h  []http.Header
+}
+
+func (c *headerRecorder) record(r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.h = append(c.h, r.Header.Clone())
+}
+
+func (c *headerRecorder) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.h)
+}
+
+func (c *headerRecorder) last() http.Header {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.h) == 0 {
+		return nil
+	}
+	return c.h[len(c.h)-1]
+}
+
+// assertOnlyAccessToken fails when an outbound header carries anything
+// besides the expected access token. The failure messages never echo the
+// observed value — the test log must stay free of credential material.
+func assertOnlyAccessToken(t *testing.T, h http.Header, accessToken string) {
+	t.Helper()
+	for name, values := range h {
+		for _, v := range values {
+			if v == "Bearer "+accessToken {
+				continue
+			}
+			switch {
+			case strings.Contains(v, "refresh_token"):
+				t.Errorf("outbound header %q leaked the refresh token", name)
+			case strings.Contains(v, "access_token"):
+				t.Errorf("outbound header %q leaked the sealed oauth bundle", name)
+			case strings.Contains(v, "{"):
+				t.Errorf("outbound header %q leaked json credential material", name)
+			}
+		}
+	}
+	if got := h.Get("Authorization"); got != "Bearer "+accessToken {
+		t.Errorf("Authorization is not the bare access token (bytes=%d json=%v)",
+			len(got), strings.Contains(got, "{"))
+	}
+}
+
+// TestGateway_OAuthUsesAccessTokenOnly: 真实网关 → httptest 出站，非流式与
+// 流式各一次。上游请求头只能出现 access token：既没有封存的 bundle JSON，
+// 也没有 refresh token。
+func TestGateway_OAuthUsesAccessTokenOnly(t *testing.T) {
+	const (
+		accessToken  = "t1-access-token"
+		refreshToken = "t1-refresh-token"
+	)
+	bundle := oauthBundleJSON(t, accessToken, refreshToken)
+
+	t.Run("non-stream", func(t *testing.T) {
+		rec := &headerRecorder{}
+		up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+			rec.record(r)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-oauth","object":"chat.completion","created":1,"model":"glm-4.6-upstream",
+				"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+				"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+		})
+		f := newFixture(t, up, withCredential("oauth", bundle))
+
+		p, key := f.principal()
+		out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+		if err != nil {
+			t.Fatalf("ChatCompletions: %v", err)
+		}
+		if len(out.Payload) == 0 {
+			t.Fatal("empty payload")
+		}
+		h := rec.last()
+		if h == nil {
+			t.Fatal("upstream was never called")
+		}
+		assertOnlyAccessToken(t, h, accessToken)
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		rec := &headerRecorder{}
+		up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+			rec.record(r)
+			sseHandler(chunkA, chunkB, chunkC, chunkUsage, chunkDone)(w, r, body)
+		})
+		f := newFixture(t, up, withCredential("oauth", bundle))
+
+		p, key := f.principal()
+		out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(true, "hi"))
+		if err != nil {
+			t.Fatalf("ChatCompletions: %v", err)
+		}
+		drainStream(t, out, EndCompleted)
+		h := rec.last()
+		if h == nil {
+			t.Fatal("upstream was never called")
+		}
+		assertOnlyAccessToken(t, h, accessToken)
+	})
+}
+
+// TestGateway_OAuthAnthropicUsesAccessTokenOnly: 同一个封存 bundle 派发到
+// anthropic_messages 部署时，出站头必须符合目标协议（OAuth 的 bearer 接法），
+// 且 OAuth 令牌绝不占用 API-key 槽（x-api-key）。
+func TestGateway_OAuthAnthropicUsesAccessTokenOnly(t *testing.T) {
+	const (
+		accessToken  = "t1-anthropic-access-token"
+		refreshToken = "t1-anthropic-refresh-token"
+	)
+	rec := &headerRecorder{}
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		rec.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_oauth","type":"message","role":"assistant","model":"kimi-k2",
+			"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn",
+			"usage":{"input_tokens":7,"output_tokens":3}}`)
+	})
+	f := newFixture(t, up, withCredential("oauth", oauthBundleJSON(t, accessToken, refreshToken)))
+	if _, err := f.db.Exec(`UPDATE inference_deployments SET protocol = 'anthropic_messages' WHERE id = $1`, f.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	dep := f.snap.Deployments[f.deploymentID]
+	dep.Protocol = domain.ProtocolAnthropicMessage
+	f.snap.Deployments[f.deploymentID] = dep
+
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	if len(out.Payload) == 0 {
+		t.Fatal("empty payload")
+	}
+	h := rec.last()
+	if h == nil {
+		t.Fatal("upstream was never called")
+	}
+	for name, values := range h {
+		for _, v := range values {
+			if v == "Bearer "+accessToken {
+				continue
+			}
+			switch {
+			case strings.Contains(v, "refresh_token"):
+				t.Errorf("outbound header %q leaked the refresh token", name)
+			case strings.Contains(v, "access_token"):
+				t.Errorf("outbound header %q leaked the sealed oauth bundle", name)
+			case strings.Contains(v, "{"):
+				t.Errorf("outbound header %q leaked json credential material", name)
+			}
+		}
+	}
+	if got := h.Get("Authorization"); got != "Bearer "+accessToken {
+		t.Errorf("anthropic oauth must use the bearer method (bytes=%d json=%v)",
+			len(got), strings.Contains(got, "{"))
+	}
+	if got := h.Get("x-api-key"); got != "" {
+		t.Errorf("an oauth access token must not occupy the api-key slot (bytes=%d)", len(got))
+	}
+	if h.Get("anthropic-version") == "" {
+		t.Error("anthropic-version header missing")
+	}
+}
+
+// TestGateway_OAuthUnusableCredential_NeverDispatches: 空 access token 与
+// 坏 bundle 一律不派发（上游零调用），错误里不得出现任何凭据材料。
+func TestGateway_OAuthUnusableCredential_NeverDispatches(t *testing.T) {
+	const refreshToken = "t1-unusable-refresh-token"
+	cases := []struct {
+		name   string
+		bundle string
+	}{
+		{"empty access token", oauthBundleJSON(t, "", refreshToken)},
+		{"unparsable bundle", "not-a-json-bundle-" + refreshToken},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &headerRecorder{}
+			up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+				rec.record(r)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"chatcmpl-x","object":"chat.completion","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			})
+			f := newFixture(t, up, withCredential("oauth", tc.bundle))
+
+			p, key := f.principal()
+			_, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+			if err == nil {
+				t.Fatal("an unusable oauth credential must not be dispatched")
+			}
+			if rec.count() != 0 {
+				t.Errorf("upstream was called %d times, want 0", rec.count())
+			}
+			if strings.Contains(err.Error(), refreshToken) {
+				t.Error("the failure surfaced credential material")
+			}
+		})
+	}
+}
+
+// TestGateway_DisabledCredential_NeverDispatches: 停用的凭据不派发。
+func TestGateway_DisabledCredential_NeverDispatches(t *testing.T) {
+	rec := &headerRecorder{}
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		rec.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-x","object":"chat.completion","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	f := newFixture(t, up)
+	if err := f.store.SetCredentialStatus(context.Background(), f.credentialID, "revoked"); err != nil {
+		t.Fatalf("revoke credential: %v", err)
+	}
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi")); err == nil {
+		t.Fatal("a revoked credential must not be dispatched")
+	}
+	if rec.count() != 0 {
+		t.Errorf("upstream was called %d times, want 0", rec.count())
+	}
+}
+
+// TestGateway_RotatedOAuthCredential_DispatchesOnlyCurrentToken: 轮换后旧
+// 凭据材料不可被重放派发，出站只出现当代 access token。
+func TestGateway_RotatedOAuthCredential_DispatchesOnlyCurrentToken(t *testing.T) {
+	const (
+		oldAccess  = "t1-old-access-token"
+		oldRefresh = "t1-old-refresh-token"
+		newAccess  = "t1-new-access-token"
+		newRefresh = "t1-new-refresh-token"
+	)
+	rec := &headerRecorder{}
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		rec.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-x","object":"chat.completion","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	f := newFixture(t, up, withCredential("oauth", oauthBundleJSON(t, oldAccess, oldRefresh)))
+	if _, err := f.credSvc.Rotate(context.Background(),
+		credentials.Operator{UserID: uuid.NewString(), AppID: "test"},
+		f.credentialID, oauthBundleJSON(t, newAccess, newRefresh), "rotate"); err != nil {
+		t.Fatalf("rotate credential: %v", err)
+	}
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi")); err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	h := rec.last()
+	if h == nil {
+		t.Fatal("upstream was never called")
+	}
+	if got := h.Get("Authorization"); got != "Bearer "+newAccess {
+		t.Errorf("Authorization must carry the current access token (bytes=%d json=%v)",
+			len(got), strings.Contains(got, "{"))
+	}
+	for name, values := range h {
+		for _, v := range values {
+			if v == "Bearer "+newAccess {
+				continue
+			}
+			if strings.Contains(v, oldAccess) {
+				t.Errorf("outbound header %q replayed the rotated-out credential", name)
+			}
+			if strings.Contains(v, oldRefresh) || strings.Contains(v, newRefresh) {
+				t.Errorf("outbound header %q leaked a refresh token", name)
+			}
+			if strings.Contains(v, "access_token") || strings.Contains(v, "{") {
+				t.Errorf("outbound header %q leaked the sealed oauth bundle", name)
+			}
+		}
+	}
+}
+
+// TestGateway_StaticCredentialHeadersUnchanged: 静态 api_key / service 凭据
+// 的出站头保持原样（兼容性）。
+func TestGateway_StaticCredentialHeadersUnchanged(t *testing.T) {
+	for _, tc := range []struct{ authType, secret string }{
+		{"api_key", "sk-static-upstream"},
+		{"service", "svc-static-upstream"},
+	} {
+		t.Run(tc.authType, func(t *testing.T) {
+			rec := &headerRecorder{}
+			up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+				rec.record(r)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"chatcmpl-x","object":"chat.completion","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			})
+			f := newFixture(t, up, withCredential(tc.authType, tc.secret))
+
+			p, key := f.principal()
+			if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi")); err != nil {
+				t.Fatalf("ChatCompletions: %v", err)
+			}
+			h := rec.last()
+			if h == nil {
+				t.Fatal("upstream was never called")
+			}
+			if got := h.Get("Authorization"); got != "Bearer "+tc.secret {
+				t.Errorf("Authorization = %q, want the static key as bearer", got)
+			}
+		})
 	}
 }

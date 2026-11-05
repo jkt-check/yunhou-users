@@ -266,11 +266,17 @@ func responsesUpstreamToolChoice(raw json.RawMessage) (any, error) {
 }
 
 // AuthHeaders implements Adapter.
-func (a *OpenAIResponses) AuthHeaders(secret []byte) map[string]string {
-	if len(secret) == 0 {
-		return nil
+func (a *OpenAIResponses) AuthHeaders(auth Auth) (map[string]string, error) {
+	switch auth.Type {
+	case "", AuthTypeAPIKey, AuthTypeService, AuthTypeOAuth:
+	default:
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: openai_responses does not support auth type "+auth.Type)
 	}
-	return map[string]string{"Authorization": "Bearer " + string(secret)}
+	if auth.Token == "" {
+		return nil, nil
+	}
+	return map[string]string{"Authorization": "Bearer " + auth.Token}, nil
 }
 
 // WrapStream implements Adapter (see openai_responses_stream.go).

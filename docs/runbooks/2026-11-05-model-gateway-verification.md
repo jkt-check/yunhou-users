@@ -579,12 +579,191 @@ migration result if it added a migration, and the files changed.
 
 ### T1 — OAuth hot-path authentication
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `b24a328` (T1 branch tip: see §4.1).
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`, and
+every database-backed command used `-p 1`. `go.mod` / `go.sum` were never
+modified (`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.1 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1, `t1_app`) | **0** | `applied=49 skipped=0` |
+| 4 | `go run ./cmd/migrate` (run 2, `t1_app`) | **0** | `applied=0 skipped=49` (idempotent) |
+| 5 | `go run ./cmd/migrate` (`t1_e2e`) | **0** | e2e DB migrated before the e2e job |
+| 6 | **RED** `go test -run 'TestGateway_OAuth\|TestGateway_DisabledCredential\|TestGateway_RotatedOAuth\|TestGateway_StaticCredential' -count=1 -v ./internal/inference/gateway` | **1** | the leak reproduced — see §4.2 |
+| 7 | **GREEN** same command as #6 | **0** | all T1 gateway cases pass |
+| 8 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/credentials ./internal/inference/providers/... ./internal/inference/gateway` | **0** | 4 packages `ok` |
+| 9 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, 1109 PASS / 1 SKIP / 0 FAIL |
+| 10 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 52 PASS / 2 SKIP / 0 FAIL |
+| 11 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t1_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 159.213s` |
+| 12 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 13 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.5%` ≥ the 80% floor (T0 measured 80.4%) |
+
+#### 4.2 RED evidence (before any production edit)
+
+Command #6 ran against the **unmodified** production code at `b24a328`; the
+new tests were written against the *existing* API surface only
+(`credentials.MarshalBundle` + `credentials.Service.Create(..., "oauth", …)`),
+so the failure is a behavioural assertion failure, never a compile error.
+
+```
+=== RUN   TestGateway_OAuthUsesAccessTokenOnly
+=== RUN   TestGateway_OAuthUsesAccessTokenOnly/non-stream
+    gateway_test.go:1737: outbound header "Authorization" leaked the refresh token
+    gateway_test.go:1737: Authorization is not the bare access token (bytes=135 json=true)
+=== RUN   TestGateway_OAuthUsesAccessTokenOnly/stream
+    gateway_test.go:1758: outbound header "Authorization" leaked the refresh token
+    gateway_test.go:1758: Authorization is not the bare access token (bytes=135 json=true)
+--- FAIL: TestGateway_OAuthUsesAccessTokenOnly (0.31s)
+    --- FAIL: TestGateway_OAuthUsesAccessTokenOnly/non-stream (0.20s)
+    --- FAIL: TestGateway_OAuthUsesAccessTokenOnly/stream (0.11s)
+=== RUN   TestGateway_OAuthAnthropicUsesAccessTokenOnly
+    gateway_test.go:1805: outbound header "X-Api-Key" leaked the refresh token
+    gateway_test.go:1814: anthropic oauth must use the bearer method (bytes=0 json=false)
+    gateway_test.go:1818: an oauth access token must not occupy the api-key slot (bytes=148)
+--- FAIL: TestGateway_OAuthAnthropicUsesAccessTokenOnly (0.12s)
+=== RUN   TestGateway_OAuthUnusableCredential_NeverDispatches
+    gateway_test.go:1849: an unusable oauth credential must not be dispatched
+    gateway_test.go:1849: an unusable oauth credential must not be dispatched
+--- FAIL: TestGateway_OAuthUnusableCredential_NeverDispatches (0.25s)
+    --- FAIL: TestGateway_OAuthUnusableCredential_NeverDispatches/empty_access_token (0.12s)
+    --- FAIL: TestGateway_OAuthUnusableCredential_NeverDispatches/unparsable_bundle (0.13s)
+--- FAIL: TestGateway_RotatedOAuthCredential_DispatchesOnlyCurrentToken (0.15s)
+    gateway_test.go:1914: Authorization must carry the current access token (bytes=143 json=true)
+    gateway_test.go:1926: outbound header "Authorization" leaked the refresh token
+    gateway_test.go:1929: outbound header "Authorization" leaked the sealed oauth bundle
+--- PASS: TestGateway_DisabledCredential_NeverDispatches (0.11s)
+--- PASS: TestGateway_StaticCredentialHeadersUnchanged (0.13s)
+FAIL	github.com/yunhou/users/internal/inference/gateway	2.141s
+```
+
+**Why this failure is the expected one.** The gateway resolved the upstream
+credential with `SecretResolver.ResolveSecret`, which returns the *whole
+decrypted plaintext*. For an `auth_type='oauth'` row that plaintext is the
+sealed `OAuthBundle` JSON (`{"access_token":…,"refresh_token":…}`), and
+`Adapter.AuthHeaders` copied it verbatim into the upstream header — 135 bytes
+of JSON on `openai_chat`, 148 bytes on `anthropic_messages` (`x-api-key`).
+The refresh token therefore left the credentials boundary on every dispatch.
+The two "unusable credential" cases failed for the same root cause: an empty
+access token / an unparsable bundle was still dispatched instead of being
+refused before the outbound call. The two cases that already passed at
+baseline (disabled credential, static `api_key`/`service` headers) are
+regression guards, not new behaviour.
+
+The failure messages deliberately print **no** credential material (only the
+header name and a byte count) — the test log itself stays free of secrets.
+
+#### 4.3 GREEN evidence
+
+Command #7 (same tests, production code fixed) — exit code **0**:
+
+```
+--- PASS: TestGateway_OAuthUsesAccessTokenOnly (0.12s)
+    --- PASS: TestGateway_OAuthUsesAccessTokenOnly/non-stream (0.06s)
+    --- PASS: TestGateway_OAuthUsesAccessTokenOnly/stream (0.06s)
+--- PASS: TestGateway_OAuthAnthropicUsesAccessTokenOnly (0.06s)
+--- PASS: TestGateway_OAuthUnusableCredential_NeverDispatches (0.12s)
+    --- PASS: TestGateway_OAuthUnusableCredential_NeverDispatches/empty_access_token (0.06s)
+    --- PASS: TestGateway_OAuthUnusableCredential_NeverDispatches/unparsable_bundle (0.06s)
+--- PASS: TestGateway_DisabledCredential_NeverDispatches (0.06s)
+--- PASS: TestGateway_RotatedOAuthCredential_DispatchesOnlyCurrentToken (0.06s)
+--- PASS: TestGateway_StaticCredentialHeadersUnchanged (0.13s)
+    --- PASS: TestGateway_StaticCredentialHeadersUnchanged/api_key (0.06s)
+    --- PASS: TestGateway_StaticCredentialHeadersUnchanged/service (0.09s)
+ok  	github.com/yunhou/users/internal/inference/gateway	3.495s
+```
+
+Acceptance command #8 — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/credentials	1.977s
+ok  	github.com/yunhou/users/internal/inference/providers	1.729s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	1.665s
+ok  	github.com/yunhou/users/internal/inference/gateway	6.727s
+```
+
+#### 4.4 Skips
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1` (`quota_concurrency_test.go:773`). The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+
+**Database-test skips: 0** — identical to the T0 inventory (§2.6); grepping the
+skip lines for `postgres` / `no database` / `database unavailable` returns
+nothing.
+
+#### 4.5 Migration
+
+**None.** T1 adds no migration: the fix lives entirely in the
+credentials/gateway/provider boundaries. The disposable databases were
+migrated with `cmd/migrate` exactly as in §2.3 (49 files, idempotent on the
+second run).
+
+#### 4.6 Files changed
+
+| File | Change |
+|---|---|
+| `internal/inference/credentials/service.go` | new `OutboundAuth` + `ResolveOutboundAuth` (auth-type-carrying outbound resolver; oauth → access token only) |
+| `internal/inference/providers/adapter.go` | new `Auth` type (`Type`+`Token`), `Call.Secret []byte` → `Call.Auth`, `Adapter.AuthHeaders(Auth) (map, error)` |
+| `internal/inference/providers/openai_chat.go` | bearer for `api_key`/`service`/`oauth`; unknown auth type refused |
+| `internal/inference/providers/openai_responses.go` | same |
+| `internal/inference/providers/anthropic.go` | `api_key`/`service` → `x-api-key` (unchanged); `oauth` → `Authorization: Bearer` and **never** the API-key slot; unknown auth type refused |
+| `internal/inference/gateway/service.go` | `SecretResolver` now resolves `credentials.OutboundAuth`; the dispatch builds `providers.Auth` from it |
+| `internal/inference/gateway/isolation_test.go` | the hand-rolled `failSecretFor` double follows the new resolver signature |
+| `internal/inference/gateway/gateway_test.go` | T1 gateway cases (real gateway → httptest, streaming + non-streaming) |
+| `internal/inference/credentials/service_test.go` | `ResolveOutboundAuth` unit cases |
+| `internal/inference/providers/adapter_dispatch_test.go` | per-protocol auth-header cases |
+| `internal/inference/providers/anthropic_payload_test.go` | `Call.Secret` → `Call.Auth` (mechanical) |
+
+`cmd/server/main.go` needed **no** change: the wiring already passes
+`*credentials.Service`, which satisfies the new `SecretResolver`.
+
+#### 4.7 Notes (compatibility, boundaries, honesty)
+
+- **The bundle no longer leaves the credentials package.** `ResolveSecret`
+  stays for internal code that really needs the raw material (the refresh
+  worker); the hot path now calls `ResolveOutboundAuth`, which yields the
+  access token alone for `oauth` rows and the untouched plaintext for
+  `api_key`/`service` rows.
+- **Static credentials are byte-identical to the old hot path**
+  (`api_key`/`service` → `Authorization: Bearer <plaintext>` on the
+  OpenAI-compatible protocols, `x-api-key` on Anthropic) — pinned by
+  `TestGateway_StaticCredentialHeadersUnchanged` and
+  `TestAuthHeaders_StaticCredentialsUnchanged`.
+- **Anthropic + OAuth.** The Anthropic adapter renders an OAuth credential
+  with the OAuth bearer method (`Authorization: Bearer <access token>`) and
+  keeps the API-key slot (`x-api-key`) for static keys only — an OAuth token
+  in the API-key slot would be exactly the "unpacked fine, therefore
+  compatible" mistake the brief forbids. **Boundary stated, not hidden:** this
+  says nothing about *any* vendor's OAuth token being accepted by *any*
+  Anthropic-shaped endpoint — a vendor mismatch surfaces upstream as a 401,
+  never as a silently mis-slotted credential. Anthropic's own claude.ai OAuth
+  additionally requires Anthropic's `anthropic-beta: oauth-2025-04-20` flag,
+  which this deployment does not send, so a stock-Anthropic OAuth credential
+  is **not** claimed as supported here.
+- **Unusable credentials fail closed before the outbound call**: an empty
+  access token, an unparsable bundle, a revoked credential and a stale
+  generation all refuse the candidate (`NoCooldown`, no upstream request). The
+  failure messages carry no part of the sealed material — the bundle parse
+  cause is dropped on purpose (a JSON syntax error can echo one character of
+  the plaintext).
+- **Preserved:** credential status (`active`/`rotating`/`revoked`), the
+  generation CAS, rotation, the SSRF/egress re-validation and the
+  cross-origin redirect refusal are untouched; the dispatch order (attempt
+  row → lease → egress → credential → dispatch) is unchanged.
+- **No new dependency, no migration, no API-surface change**: no new enum,
+  response field or client-visible error — the OpenAPI spec and the
+  integration guide need no update for T1.
 
 ### T2 — Window-less settlement and conflict classification
 

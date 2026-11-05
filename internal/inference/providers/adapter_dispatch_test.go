@@ -32,7 +32,7 @@ func testDeployment(proto domain.Protocol, baseURL string) *domain.Deployment {
 
 func chatCall(dep *domain.Deployment, stream bool) *Call {
 	return &Call{
-		Deployment: dep, Secret: []byte("sk-test"), RequestID: "req-1",
+		Deployment: dep, Auth: Auth{Type: AuthTypeAPIKey, Token: "sk-test"}, RequestID: "req-1",
 		Request: &ChatRequest{
 			Model: "m1", Stream: stream,
 			Messages: []model.ChatMessage{{Role: "user", Content: "hi"}},
@@ -304,5 +304,82 @@ func TestDispatch_SameOriginRedirectFollowed(t *testing.T) {
 	}
 	if !sawFinal {
 		t.Error("final handler never reached")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T1 — 出站鉴权头：凭据类型 → 协议明确支持的头
+// ---------------------------------------------------------------------------
+
+// TestAuthHeaders_StaticCredentialsUnchanged: 静态 api_key/service 的出站头
+// 保持旧口径（openai 兼容 = Bearer，anthropic = x-api-key）。
+func TestAuthHeaders_StaticCredentialsUnchanged(t *testing.T) {
+	chat, err := NewOpenAIChat().AuthHeaders(Auth{Type: AuthTypeAPIKey, Token: "sk-static"})
+	if err != nil {
+		t.Fatalf("openai_chat api_key: %v", err)
+	}
+	if chat["Authorization"] != "Bearer sk-static" {
+		t.Errorf("openai_chat api_key Authorization = %q", chat["Authorization"])
+	}
+	resp, err := NewOpenAIResponses().AuthHeaders(Auth{Type: AuthTypeService, Token: "svc-static"})
+	if err != nil {
+		t.Fatalf("openai_responses service: %v", err)
+	}
+	if resp["Authorization"] != "Bearer svc-static" {
+		t.Errorf("openai_responses service Authorization = %q", resp["Authorization"])
+	}
+	ant, err := NewAnthropicMessages().AuthHeaders(Auth{Type: AuthTypeAPIKey, Token: "sk-ant-static"})
+	if err != nil {
+		t.Fatalf("anthropic api_key: %v", err)
+	}
+	if ant["x-api-key"] != "sk-ant-static" {
+		t.Errorf("anthropic api_key x-api-key = %q", ant["x-api-key"])
+	}
+	if ant["anthropic-version"] == "" {
+		t.Error("anthropic-version header missing")
+	}
+	if _, ok := ant["Authorization"]; ok {
+		t.Error("a static key must not be presented as a bearer token")
+	}
+}
+
+// TestAuthHeaders_OAuthUsesBearerOnly: oauth 凭据只以 bearer 出站；封存的
+// bundle JSON 与 refresh token 到不了任何头。
+func TestAuthHeaders_OAuthUsesBearerOnly(t *testing.T) {
+	const access = "acc-token-adapter"
+	for _, a := range []Adapter{NewOpenAIChat(), NewOpenAIResponses(), NewAnthropicMessages()} {
+		h, err := a.AuthHeaders(Auth{Type: AuthTypeOAuth, Token: access})
+		if err != nil {
+			t.Fatalf("%s: oauth: %v", a.Protocol(), err)
+		}
+		if h["Authorization"] != "Bearer "+access {
+			t.Errorf("%s: oauth Authorization = %q, want the bare access token", a.Protocol(), h["Authorization"])
+		}
+		if _, ok := h["x-api-key"]; ok {
+			t.Errorf("%s: an oauth access token must not occupy the api-key slot", a.Protocol())
+		}
+		for name, v := range h {
+			if strings.Contains(v, "access_token") || strings.Contains(v, "refresh_token") || strings.Contains(v, "{") {
+				t.Errorf("%s: header %q carries bundle material", a.Protocol(), name)
+			}
+		}
+	}
+}
+
+// TestAuthHeaders_UnsupportedAuthTypeRefused: 协议不支持的凭据类型明确拒绝，
+// 不猜头槽。
+func TestAuthHeaders_UnsupportedAuthTypeRefused(t *testing.T) {
+	for _, a := range []Adapter{NewOpenAIChat(), NewOpenAIResponses(), NewAnthropicMessages()} {
+		h, err := a.AuthHeaders(Auth{Type: "magic", Token: "x"})
+		if err == nil {
+			t.Errorf("%s: an unsupported auth type must be refused (headers=%v)", a.Protocol(), h)
+			continue
+		}
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Errorf("%s: refusal code = %v, want invalid_input", a.Protocol(), domain.CodeOf(err))
+		}
+		if h != nil {
+			t.Errorf("%s: a refused auth type must not produce headers", a.Protocol())
+		}
 	}
 }

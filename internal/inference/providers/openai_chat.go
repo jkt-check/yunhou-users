@@ -120,11 +120,19 @@ func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 }
 
 // AuthHeaders implements Adapter.
-func (a *OpenAIChat) AuthHeaders(secret []byte) map[string]string {
-	if len(secret) == 0 {
-		return nil
+func (a *OpenAIChat) AuthHeaders(auth Auth) (map[string]string, error) {
+	switch auth.Type {
+	case "", AuthTypeAPIKey, AuthTypeService, AuthTypeOAuth:
+	default:
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: openai_chat does not support auth type "+auth.Type)
 	}
-	return map[string]string{"Authorization": "Bearer " + string(secret)}
+	if auth.Token == "" {
+		return nil, nil
+	}
+	// OpenAI 兼容协议只认 bearer：静态 api_key/service 密钥与 OAuth 的
+	// access token 都走 Authorization: Bearer。
+	return map[string]string{"Authorization": "Bearer " + auth.Token}, nil
 }
 
 // WrapStream implements Adapter: the upstream already speaks OpenAI SSE, so

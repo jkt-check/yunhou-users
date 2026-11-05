@@ -63,12 +63,30 @@ type ChatRequest struct {
 	Passthrough map[string]any
 }
 
+// Auth is the resolved outbound credential of one dispatch: the
+// credential's auth type plus the usable secret. The sealed OAuth bundle
+// never reaches this layer — for an "oauth" credential the Token is the
+// ACCESS TOKEN alone (never the bundle JSON, never the refresh token).
+type Auth struct {
+	// Type is the credential's auth type: "api_key" | "service" | "oauth".
+	Type string
+	// Token is the usable outbound secret (never logged).
+	Token string
+}
+
+// The credential auth types the gateway may dispatch.
+const (
+	AuthTypeAPIKey  = "api_key"
+	AuthTypeService = "service"
+	AuthTypeOAuth   = "oauth"
+)
+
 // Call is one upstream dispatch: the routed deployment, the resolved secret
 // material, the forced output cap, and the tracing id.
 type Call struct {
 	Deployment *domain.Deployment
-	// Secret is the decrypted upstream credential (never logged).
-	Secret []byte
+	// Auth is the resolved upstream credential (never logged).
+	Auth Auth
 	// RequestID is the gateway's logical request id, propagated as the
 	// X-Request-Id tracing boundary (operator headers can never override
 	// it — domain.ValidateCustomHeaders).
@@ -93,9 +111,11 @@ type Adapter interface {
 	// BuildPayload renders the upstream request body. OutputCap is always
 	// forwarded as the protocol's hard output limit.
 	BuildPayload(call *Call) ([]byte, error)
-	// AuthHeaders turns the decrypted secret into the protocol's auth
-	// headers (Authorization: Bearer vs x-api-key).
-	AuthHeaders(secret []byte) map[string]string
+	// AuthHeaders turns the resolved credential into the protocol's auth
+	// headers (Authorization: Bearer vs x-api-key). An auth type the
+	// protocol does not support is REFUSED with an error — the adapter
+	// never guesses a header slot for material it does not understand.
+	AuthHeaders(auth Auth) (map[string]string, error)
 	// WrapStream converts an upstream streaming 200 body into an
 	// OpenAI-shaped SSE byte stream plus its incremental usage tap.
 	// Anthropic streams are translated; OpenAI streams pass through.
@@ -293,7 +313,15 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Request-Id", call.RequestID)
-	for k, v := range a.AuthHeaders(call.Secret) {
+	authHeaders, err := a.AuthHeaders(call.Auth)
+	if err != nil {
+		// The adapter does not support this credential kind on its
+		// protocol: NOTHING is sent. NoCooldown — a credential/protocol
+		// mismatch is a configuration fact, not an upstream hiccup, so the
+		// account must not be cooled for it.
+		return nil, &DispatchError{Err: err, NoCooldown: true}
+	}
+	for k, v := range authHeaders {
 		req.Header.Set(k, v)
 	}
 	// Operator-configured headers: validated at write time (Task 4) and

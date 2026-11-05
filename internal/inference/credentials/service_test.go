@@ -268,3 +268,142 @@ func TestServiceRotateDisabledRejected(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T1 — 出站解析：oauth 凭据只交出 access token
+// ---------------------------------------------------------------------------
+
+// oauthBundleFor seals the same bundle shape credentials.HandleCallback
+// stores (access + refresh in one JSON blob).
+func oauthBundleFor(t *testing.T, access, refresh string) string {
+	t.Helper()
+	raw, err := MarshalBundle(&OAuthBundle{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer"})
+	if err != nil {
+		t.Fatalf("marshal bundle: %v", err)
+	}
+	return string(raw)
+}
+
+func TestResolveOutboundAuth_OAuthYieldsAccessTokenOnly(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const access, refresh = "acc-token-unit", "refresh-token-unit"
+	view, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", oauthBundleFor(t, access, refresh), "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, cred, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+	if err != nil {
+		t.Fatalf("resolve outbound auth: %v", err)
+	}
+	if auth.AuthType != "oauth" {
+		t.Errorf("auth type = %q, want oauth", auth.AuthType)
+	}
+	if auth.Token != access {
+		t.Errorf("token is not the bare access token (bytes=%d)", len(auth.Token))
+	}
+	for _, forbidden := range []string{refresh, "access_token", "refresh_token", "{"} {
+		if strings.Contains(auth.Token, forbidden) {
+			t.Errorf("outbound token carries bundle material (%q)", forbidden)
+		}
+	}
+	if cred == nil || cred.ID != view.ID {
+		t.Error("the credential row must come back with the resolution")
+	}
+}
+
+func TestResolveOutboundAuth_StaticCredentialsUnchanged(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	for _, authType := range []string{"api_key", "service"} {
+		t.Run(authType, func(t *testing.T) {
+			const secret = "sk-static-unit-secret"
+			view, err := svc.Create(context.Background(), testOp(), "p", "l", authType, secret, "r", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			auth, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+			if err != nil {
+				t.Fatalf("resolve outbound auth: %v", err)
+			}
+			if auth.AuthType != authType || auth.Token != secret {
+				t.Errorf("static credential must resolve to its plaintext unchanged (type=%q)", auth.AuthType)
+			}
+		})
+	}
+}
+
+func TestResolveOutboundAuth_UnusableOAuthFailsClosed(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const refresh = "refresh-token-unit"
+
+	empty, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", oauthBundleFor(t, "", refresh), "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), empty.ID, nil); err == nil {
+		t.Fatal("an oauth credential without an access token must not resolve")
+	} else if domain.CodeOf(err) != domain.CodeConflict {
+		t.Errorf("empty access token error code = %v, want conflict", domain.CodeOf(err))
+	}
+
+	const broken = "not-a-bundle-" + refresh
+	bad, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", broken, "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = svc.ResolveOutboundAuth(context.Background(), bad.ID, nil)
+	if err == nil {
+		t.Fatal("an unparsable bundle must not resolve")
+	}
+	if domain.CodeOf(err) != domain.CodeInternal {
+		t.Errorf("unparsable bundle error code = %v, want internal", domain.CodeOf(err))
+	}
+	for _, forbidden := range []string{refresh, broken, "not-a-bundle"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("the failure surfaced credential material (%q)", forbidden)
+		}
+	}
+}
+
+func TestResolveOutboundAuth_StatusAndGenerationPreserved(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	store := newMemStore()
+	svc := NewService(v, store, &memRecorder{})
+	view, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", oauthBundleFor(t, "acc-1", "ref-1"), "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 代次钉扎：轮换后旧代次不可再解析（旧凭据不可重放派发）。
+	pin := int64(1)
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, &pin); err != nil {
+		t.Fatalf("pinned resolve: %v", err)
+	}
+	if _, err := svc.Rotate(context.Background(), testOp(), view.ID, oauthBundleFor(t, "acc-2", "ref-2"), "rotate"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, &pin); err == nil {
+		t.Fatal("a stale pinned generation must not resolve")
+	} else if domain.CodeOf(err) != domain.CodeConflict {
+		t.Errorf("stale generation error code = %v, want conflict", domain.CodeOf(err))
+	}
+	auth, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+	if err != nil || auth.Token != "acc-2" {
+		t.Fatalf("current resolve must yield the rotated access token: %v", err)
+	}
+	// 状态：rotating 仍可派发，revoked 不可。
+	if err := store.SetCredentialStatus(context.Background(), view.ID, "rotating"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil); err != nil {
+		t.Errorf("a rotating credential stays dispatchable: %v", err)
+	}
+	if err := store.SetCredentialStatus(context.Background(), view.ID, "revoked"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil); err == nil {
+		t.Error("a revoked credential must not resolve")
+	} else if domain.CodeOf(err) != domain.CodeConflict {
+		t.Errorf("revoked credential error code = %v, want conflict", domain.CodeOf(err))
+	}
+}

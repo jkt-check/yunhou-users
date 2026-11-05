@@ -298,12 +298,27 @@ func translateAnthropicToolChoice(raw json.RawMessage) (any, error) {
 }
 
 // AuthHeaders implements Adapter.
-func (a *AnthropicMessages) AuthHeaders(secret []byte) map[string]string {
+func (a *AnthropicMessages) AuthHeaders(auth Auth) (map[string]string, error) {
 	h := map[string]string{"anthropic-version": anthropicVersionHeader}
-	if len(secret) > 0 {
-		h["x-api-key"] = string(secret)
+	switch auth.Type {
+	case "", AuthTypeAPIKey, AuthTypeService:
+		// 静态密钥（api_key/service）走 anthropic 的 API-key 槽。
+		if auth.Token != "" {
+			h["x-api-key"] = auth.Token
+		}
+	case AuthTypeOAuth:
+		// OAuth 的接法是 bearer（Authorization: Bearer <access token>）。
+		// OAuth 令牌绝不占用 API-key 槽（x-api-key）——那会把一个 OAuth
+		// 令牌当成 API key 送出，等于把解包成功当成任意供应商 OAuth 已
+		// 兼容。目标协议不认这个令牌时的表现是上游 401，而不是静默改槽。
+		if auth.Token != "" {
+			h["Authorization"] = "Bearer " + auth.Token
+		}
+	default:
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: anthropic_messages does not support auth type "+auth.Type)
 	}
-	return h
+	return h, nil
 }
 
 // WrapStream implements Adapter (see anthropic_stream.go).

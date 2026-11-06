@@ -23,6 +23,10 @@ import (
 type fakeProbeStore struct {
 	deployments map[string]domain.Deployment
 	credentials []domain.Credential
+	// accounts 是该 provider 的上游账号清单（发布预演的「无账号」判定）。
+	accounts map[string][]domain.UpstreamAccount
+	// accountsErr 让账号清单读面失败（预演必须说「未知」而不是谎称无账号）。
+	accountsErr error
 }
 
 func (f *fakeProbeStore) GetDeployment(ctx context.Context, id string) (*domain.Deployment, error) {
@@ -44,11 +48,24 @@ func (f *fakeProbeStore) ListCredentials(ctx context.Context, providerID string,
 	return out, nil
 }
 
+// ListActiveUpstreamAccounts 是发布预演读的账号清单面（生产上由
+// postgres.Store 提供）。
+func (f *fakeProbeStore) ListActiveUpstreamAccounts(ctx context.Context, providerID string) ([]domain.UpstreamAccount, error) {
+	if f.accountsErr != nil {
+		return nil, f.accountsErr
+	}
+	return f.accounts[providerID], nil
+}
+
 // fakeBearerResolver 记录 pinGeneration 以钉住代次钉扎语义。
+// authTypes 模拟真实服务返回的凭据行上的 auth_type（生产上
+// ResolveBearerToken/ResolveOutboundAuth 都把完整的 *domain.Credential
+// 一起返回，探测面据此选择协议对应的鉴权槽）。
 type fakeBearerResolver struct {
-	tokens map[string]string
-	errs   map[string]error
-	pins   map[string]int64
+	tokens    map[string]string
+	errs      map[string]error
+	pins      map[string]int64
+	authTypes map[string]string
 }
 
 func (f *fakeBearerResolver) ResolveBearerToken(ctx context.Context, id string, pinGeneration *int64) (string, *domain.Credential, error) {
@@ -65,7 +82,7 @@ func (f *fakeBearerResolver) ResolveBearerToken(ctx context.Context, id string, 
 	if !ok {
 		return "", nil, domain.NewError(domain.CodeNotFound, "credential")
 	}
-	return tok, &domain.Credential{ID: id}, nil
+	return tok, &domain.Credential{ID: id, AuthType: f.authTypes[id]}, nil
 }
 
 func probeTestDeployment(id, baseURL string) domain.Deployment {
@@ -84,7 +101,10 @@ func probeTestFixture(baseURL string) (*fakeProbeStore, *fakeBearerResolver) {
 			{ID: "cred-1", ProviderID: "prov-1", AuthType: "api_key", Status: "active", Generation: 7},
 		},
 	}
-	resolver := &fakeBearerResolver{tokens: map[string]string{"cred-1": "sk-probe-secret"}}
+	resolver := &fakeBearerResolver{
+		tokens:    map[string]string{"cred-1": "sk-probe-secret"},
+		authTypes: map[string]string{"cred-1": "api_key"},
+	}
 	return store, resolver
 }
 

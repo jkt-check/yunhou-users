@@ -1,8 +1,11 @@
-# Kaya Coding Plan 运营面 runbook（Task 15）
+# Kaya Coding Plan 运营面 runbook（Task 15；T9 补探测/预演/告警）
 
 对应实现：`internal/inference/management/{bulk_import,pricing_preview,operations}.go`、
 `internal/inference/httpapi/{admin_bulk,admin_usage}.go`、`admin_adjustments.go`（Task 14 建、
-本任务扩展）。API 契约：`docs/api/kaya-coding-plan.openapi.yaml`（0.14.0）。
+本任务扩展）、`internal/inference/management/{probe,catalog}.go`（T9：上游连通性探测与发布
+预演）、`internal/inference/httpapi/kaya_models.go`（T9：模型能力描述）、
+`internal/inference/quota/service.go` 与 `internal/inference/workers/settlement_recovery.go`
+（T9：运行告警）。API 契约：`docs/api/kaya-coding-plan.openapi.yaml`（0.14.0）。
 
 ## 权限矩阵（server 端强制，自报无效）
 
@@ -154,6 +157,13 @@ SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
 注意：未声明模型的上游若实际无视觉能力，带图请求会在上游报错（400→502），
 属预期暴露——确认上游支持视觉的模型才保持未声明或显式点亮。
 
+**T9：`/chat/models` 还追加了能力字段**（`supports_images` /
+`supports_tools` / `supports_thinking` / `context_tokens` /
+`max_output_tokens` / `capability_description`）。它们是**派发判定**（当前
+已发布入口 + 协议适配层能不能承载），不是模型条目的自我声明；因此一个
+只有 `openai_responses` 部署的模型 `supports_images` 恒为 `false`。
+`GET /v1/models` 保持原生基本形状，**不带**这些字段。
+
 - **网关目录（本条路径）**：无需逐模型配置即可放行图片；要**关闭**视觉，
   `PATCH /admin/models/:id`（models:manage）设
   `{"input_modalities":["text"],"reason":"..."}`，然后
@@ -300,3 +310,110 @@ legacy `/chat` 是 400（能力不兼容哨兵，不是「上游拒绝」的 502
   `connect_timeout` 配得过小会让请求**停在核对**而不是干净地切换候选；
   运维配这个值时按「宁可配大一点」处理。若要让建连超时可切换候选，需要
   单独任务（改的是执行状态判定，不是超时口径）。
+
+## 发布预演（`POST /admin/catalog/publish?dry_run=1`）
+
+预演与正式发布**共用同一套抽取与校验、同一事务快照**，差别只有「写不写库」。
+正式发布**不跑任何探测**、**不引入网络依赖**。
+
+### 报告结构
+
+| 段 | 回答什么 |
+|---|---|
+| `would_publish` | 候选集摘要：`active_deployments` 是**真正会承接流量**的部署数；`disabled_providers` / `deployments_behind_disabled_providers` 如实汇总停用的 provider 与被它带走的部署 |
+| `probes[]` | 每条**会生效**部署的探测结论（语义见下节） |
+| `issues[]` | 发布前**可判定**的问题：`severity=blocker` 是配置问题，`severity=hint` 是网络探测提示 |
+| `summary` | 判定摘要：探测结论分桶 + blocker/hint 计数 + `all_probes_ok` |
+
+### 停用 provider 的部署既不算 active，也不被探测
+
+`PATCH /admin/providers/:id`（`status=disabled`）→ 重新 publish 后，该 provider
+及其**全部**部署退出轮转。预演因此：
+
+- **不**把它们算进 `would_publish.active_deployments`；
+- **不**对它们出站探测（一条永远不会承接流量的部署不值得一次外呼）；
+- 在 `issues[]` 里给一条 `provider_disabled`（**blocker**）；
+- `would_publish.disabled_providers` 如实给出停用 provider 的数量。
+
+> 这是 T3 携带到 T9 的必修发现：预演此前只按 deployment 状态过滤，把停用
+> provider 背后的部署当成「会生效」并真的探测。
+
+### 问题分类：哪些阻断、哪些只是提示
+
+| severity | 含义 | code |
+|---|---|---|
+| `blocker` | **确定性配置问题**：发布这份目录后，某个模型/路由跑起来**不是配的那个**。要么修好再发，要么明确接受 | `provider_disabled`、`deployment_no_account`、`route_capabilities_narrowed`、`model_not_dispatchable` |
+| `hint` | **网络探测提示**：advisory，**不阻断**发布，也**不代表**模型故障 | `probe_failed`、`probe_unsupported`、`probe_unconfirmed`、`account_inventory_unavailable` |
+
+- `deployment_no_account`：该 provider **没有可用上游账号** → 这条路由无法
+  出站（可判定的事实，不是猜测）。
+- `account_inventory_unavailable`：账号清单**读不到** → 该判定被**跳过**，
+  报告说「未知」，**绝不**谎称「无账号」。
+- `route_capabilities_narrowed`：路由的能力清单收窄了模型声明的能力（存量
+  非空清单常常不含 `image`）→ 带图请求在**准入前**被 400 拒绝。
+- `model_not_dispatchable`：模型在这次发布后**没有任何可调度路由**。
+
+**策略/路由不支持**（不在支持集的 `pool_strategy`、词表外的路由
+`capabilities`）由**发布闸**拒绝：预演与正式发布给出**同一个错误**（点名
+对象 ID 与替代配置），因此它出现在**错误**里而不是 200 报告里 —— 预演与
+正式发布的判定口径必须一致。
+
+### HTTP 200 不等于每个 probe.ok 都是 true
+
+200 只说明「预演报告生成成功」。逐条结论看 `probes[].probe_outcome`，汇总看
+`summary`（`probes_ok` / `probes_failed` / `probes_unsupported` /
+`probes_unconfirmed` / `all_probes_ok`）。
+
+## 上游连通性探测（`POST /admin/deployments/:id/probe`）
+
+只读、零写库、**默认零付费**：探测读的是供应商的**模型列表端点**
+（`GET {base_url}/models`），不是推理端点。
+
+### 三件事必须分开看
+
+| 维度 | 字段 | 取值 |
+|---|---|---|
+| 凭据**材料**测试 | `credential_state` | `decrypted` / `missing` / `unusable` |
+| **指定**连通性探测 | `probe_method` + `probe_outcome` | `connectivity`+`verified` / `failed` / `unsupported` / `unconfirmed` |
+| 本次**没有**做真实推理 | `inference_verified` | 恒为 `false` |
+
+- `ok=true` **只**表示「这条部署的上游连通」，**绝不**表示「模型答过」——
+  本次没有发起任何推理（`inference_verified=false` 显式发布出来，免得被
+  读成「模型健康」）。
+- **供应商不提供 `/models`** 时结论是 `unsupported`：此探测方式**无法确认**，
+  **不是**模型故障（`base_url` 缺一段路径也会得到同样的 404 —— 两者在报告里
+  都说清楚，运营据 `status=404` 与文案一起判断）。
+- 没得到任何答复（DNS 失败、拒绝、超时、egress 拒绝、凭据不可用、探测没跑）
+  一律是 `unconfirmed`。
+
+### 鉴权/版本头按协议设置
+
+与**派发路径同一个适配器**的同一份鉴权规则：
+
+| 协议 | 探测头 |
+|---|---|
+| `openai_chat` / `openai_responses` | `Authorization: Bearer <access token 或静态密钥>` |
+| `anthropic_messages` | `x-api-key: <静态密钥>` + `anthropic-version: 2023-06-01` |
+
+- OAuth 凭据在 OpenAI 兼容协议上走 bearer，且**只有 access token** 出边界
+  （密封闭包与 refresh token 永远不出 credentials 包）。
+- **`anthropic_messages` + OAuth 是明确不支持的组合**：出站前拒绝，绝不把
+  OAuth 令牌塞进 API-key 槽。该协议的支持集里没有 OAuth 供应商（仓库自有的
+  OAuth 连接器说 OpenAI 兼容协议；Anthropic 官方 claude.ai OAuth 需要本部署
+  不发的 `anthropic-beta` 头）。
+
+## 运行告警（复用现有结构化日志；未引入新监控平台）
+
+仓库唯一的监控通道是**结构化日志行**（`log.Printf`）。下表是本期明确化的
+四类运行告警 —— 每类都给出**可 grep 的稳定前缀**，运维按前缀配告警规则即可。
+
+| 告警 | 日志前缀 | 触发条件 | 处置 |
+|---|---|---|---|
+| **非幂等结算冲突** | `ALARM gateway: settlement_mismatch` / `ALARM gateway: ledger_drift` / `ALARM gateway: reservation_drift` / `ALARM gateway: missing_reservation` / `ALARM gateway: late_usage_after_release`（另有 `ALARM gateway: request … charge … exceeds hold …` 的超额告警） | 同一请求的**重复结算金额不一致**、已终态请求收到晚到用量、账本无 charge 行、预占数与准入不符、缺预占 —— 这些**不是**幂等重投，绝不当成功吞掉 | 请求进入专门核对（`inference_reconciliation_jobs`，原因与告警里的词一一对应），**只叫人**；人工处置见 `GET /admin/model-usage/exceptions?kind=settlement_backlog` |
+| **未知用量积压** | `ALARM inference recovery: unknown-usage backlog` | 消费事实未知的请求积压超过阈值（默认 10；`RecoveryConfig.UnknownUsageAlarmThreshold`） | 这些请求按**保守估算**入账（绝不静默记零），真实用量要靠人核对；按 `usage_status='unknown'` 查请求，逐笔核对 |
+| **限速存储失败** | `ALARM quota: rate limit store unavailable` | 限速闸门的存储不可用（**不是**限速拒绝） | 准入 **fail-closed**（503 `service_unavailable`，绝不回退成单机放行）；修存储后自动恢复。正常的限速拒绝**不打**这条告警（否则告警会被噪声淹没） |
+| **不支持存量配置** | `UNSUPPORTED_POOL_STRATEGY model=… routes=… strategies=…` + `AUDIT_ALERT` | 已发布快照里存在支持集外的 `pool_strategy`（存量脏配置） | 该路由被标记**不可调度**（绝不静默当 `round_robin`）；模型还有别的可调度路由时正常服务，全部不支持时客户请求在**预占前** 503 `upstream_unavailable`（Anthropic 面 529）。修法：把路由的 `pool_strategy` 改成 `round_robin` 再 publish |
+
+另有两类**期限/账本**告警沿用既有前缀：`ALARM inference recovery:
+reconciliation job … past deadline`（核对任务超期升级）与
+`ALARM inference recovery: ledger mismatch window …`（账本重建差异）。

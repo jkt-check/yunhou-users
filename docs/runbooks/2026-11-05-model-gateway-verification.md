@@ -3937,12 +3937,389 @@ fix must NOT change:
 
 ### T9 — Probe, capability description and operational visibility
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `63bdbd3` (the T8 branch tip; T0 base
+`35cf836`). Task report:
+`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-9-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`;
+every database-backed command used `-p 1` and `-race`; `go.mod` / `go.sum`
+were never modified (`git diff --stat go.mod go.sum` → empty after every
+run).
+
+#### 4.40 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1, `t9_app`) | **0** | `applied=53 skipped=0` |
+| 4 | `go run ./cmd/migrate` (run 2, `t9_app`) | **0** | `applied=0 skipped=53` (idempotent) |
+| 5 | **RED** `go test -count=1 -run 'TestProbeDeployment_\|TestPublishDryRun_' -v ./internal/inference/management` | **1** | the leaks reproduced — see §4.41 |
+| 6 | **RED** `go test -count=1 -run 'TestReserveRateTx_' -v ./internal/inference/quota` | **1** | the rate-store failure was silent — see §4.41 |
+| 7 | **RED** `go test -count=1 -run 'TestRecover_UnknownUsageBacklogAlarms\|TestRecover_NoUnknownUsageBacklogNoAlarm' -v ./internal/inference/workers` | **1** | the backlog was counted but never alarmed — see §4.41 |
+| 8 | **RED** `DATABASE_URL=<disposable> go test -count=1 -run 'TestKayaModels_CapabilityDescriptionIsAccurate' -v ./internal/inference/httpapi` | **1** | the capability fields did not exist — see §4.41 |
+| 9 | **GREEN** the same four commands after the fix | **0** | all T9 cases pass |
+| 10 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/management ./internal/inference/httpapi ./internal/config ./cmd/server` | **0** | 4 packages `ok` (2.440s / 82.775s / 1.661s / 2.331s) |
+| 11 | `go test -race -count=1 -p 1 -v ./internal/inference/... ./tests/integration/...` | **0** | 15 packages `ok`; **1113 PASS / 3 SKIP / 0 FAIL** (see §4.45) |
+| 12 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t9_e2e`) — **first run** | **1** | the e2e byte-exact `/chat/models` contract caught the appended fields — see §4.49 |
+| 12b | the same e2e command after the contract fix | **0** | `ok github.com/yunhou/users/tests/e2e` (see §4.49) |
+| 13 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (`GATE_EXIT=0`; the generated `coverage.out` was deleted afterwards) |
+| 14 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T0 80.4%, T1 80.5%, T2 80.3%) |
+
+#### 4.41 RED evidence (before any production edit)
+
+The four RED commands ran against the **unmodified** production tree at
+`63bdbd3`. Every new test was written against the **existing** API surface
+only — the probe/dry-run results are asserted through their **JSON shape**,
+the capability fields through the **HTTP response body**, and the alarms
+through the **standard log stream** — so every failure is a behavioural
+assertion failure, never a compile error.
+
+**Probe (management)** — the probe was protocol-blind, credential-blind and
+outcome-blind:
+
+```
+=== RUN   TestProbeDeployment_AnthropicUsesProtocolAuthAndVersionHeaders
+    probe_t9_test.go:104: anthropic probe must use the x-api-key slot, got ""
+    probe_t9_test.go:107: anthropic probe must send the protocol version header
+    probe_t9_test.go:110: anthropic probe must not send an Authorization bearer header, got "Bearer sk-anthropic-secret"
+--- FAIL: TestProbeDeployment_AnthropicUsesProtocolAuthAndVersionHeaders (0.00s)
+=== RUN   TestProbeDeployment_AnthropicOAuthRefusedBeforeDispatch
+    probe_t9_test.go:137: an oauth credential must not be dispatched to anthropic, hits=1
+--- FAIL: TestProbeDeployment_AnthropicOAuthRefusedBeforeDispatch (0.00s)
+=== RUN   TestProbeDeployment_VendorWithoutModelsIsUnsupportedNotFault
+    probe_t9_test.go:197: probe_outcome = "", want unsupported (供应商未提供 /models)
+    probe_t9_test.go:206: description "" must state that this is not evidence of an unhealthy model
+--- FAIL: TestProbeDeployment_VendorWithoutModelsIsUnsupportedNotFault (0.00s)
+=== RUN   TestProbeDeployment_SeparatesCredentialProbeAndInference
+    probe_t9_test.go:229: credential_state = "", want decrypted (材料可解密)
+    probe_t9_test.go:232: probe_method = "", want connectivity
+    probe_t9_test.go:235: probe_outcome = "", want verified (指定探测成功)
+    probe_t9_test.go:238: probe_supported must be true when the endpoint answered
+    probe_t9_test.go:244: description must be present (old fields stay, the description is appended)
+--- FAIL: TestProbeDeployment_SeparatesCredentialProbeAndInference (0.00s)
+=== RUN   TestProbeDeployment_MissingCredentialIsUnconfirmed
+    probe_t9_test.go:271: credential_state = "", want missing
+    probe_t9_test.go:274: probe_method = "", want none
+    probe_t9_test.go:277: probe_outcome = "", want unconfirmed
+--- FAIL: TestProbeDeployment_MissingCredentialIsUnconfirmed (0.00s)
+=== RUN   TestProbeDeployment_UnusableCredentialIsUnconfirmed
+    probe_t9_test.go:297: credential_state = "", want unusable
+    probe_t9_test.go:300: probe_outcome = "", want unconfirmed
+--- FAIL: TestProbeDeployment_UnusableCredentialIsUnconfirmed (0.00s)
+--- PASS: TestProbeDeployment_OpenAIOAuthUsesBearer (0.00s)      ← protection evidence
+--- PASS: TestProbeDeployment_OK / _MissingV1Shape / _ConnectionRefused / _Timeout /
+          _SecretNeverLeaks / _ResolveFailureNoLeak / _NoCredential /
+          _RevokedSkippedRotatingUsed / _EgressRejected / _EgressNilFailsClosed /
+          _NilClientFailsClosed / _EmptyBaseURL / _NotFound           ← protection evidence
+FAIL	github.com/yunhou/users/internal/inference/management
+```
+
+Root cause: the probe sent `Authorization: Bearer <token>` to **every**
+protocol (no version header, no API-key slot), ignored the credential's
+`auth_type` entirely (an OAuth credential aimed at `anthropic_messages` was
+dispatched), and reported a single boolean — so a vendor without `/models`
+looked exactly like a broken model, and "the credential decrypted", "the
+upstream answered" and "the model answered" were indistinguishable.
+
+**Publish dry-run (management)** — the carried T3 finding:
+
+```
+=== RUN   TestPublishDryRun_DisabledProviderDeploymentIsNotCountedNorProbed
+    publish_dryrun_t9_test.go:134: a deployment behind a disabled provider must not be probed: [dep-off dep-on]
+--- FAIL: TestPublishDryRun_DisabledProviderDeploymentIsNotCountedNorProbed (0.00s)
+=== RUN   TestPublishDryRun_IssuesSeparateBlockersFromNetworkHints
+    publish_dryrun_t9_test.go:211: issues must report deployment_no_account, got map[]
+    publish_dryrun_t9_test.go:216: issues must report the network hint probe_unsupported, got map[]
+    publish_dryrun_t9_test.go:221: summary probe buckets = {ProbesTotal:0 …} (want total=1 ok=0 unsupported=1)
+    publish_dryrun_t9_test.go:227: summary.hints = 0, want ≥1
+    publish_dryrun_t9_test.go:230: account_inventory_checked must be true when the inventory was read
+--- FAIL: TestPublishDryRun_IssuesSeparateBlockersFromNetworkHints (0.00s)
+=== RUN   TestPublishDryRun_AccountInventoryUnknownIsNotGuessed
+    publish_dryrun_t9_test.go:279: issues must report account_inventory_unavailable, got map[]
+--- FAIL: TestPublishDryRun_AccountInventoryUnknownIsNotGuessed (0.00s)
+=== RUN   TestPublishDryRun_ModelWithoutDispatchableRouteIsABlocker
+    publish_dryrun_t9_test.go:306: issues must report model_not_dispatchable, got map[]
+--- FAIL: TestPublishDryRun_ModelWithoutDispatchableRouteIsABlocker (0.00s)
+=== RUN   TestPublishDryRun_RouteCapabilityNarrowingIsReported
+    publish_dryrun_t9_test.go:346: issues must report route_capabilities_narrowed, got map[]
+--- FAIL: TestPublishDryRun_RouteCapabilityNarrowingIsReported (0.00s)
+--- PASS: TestPublishDryRun_ProbesActiveDeploymentsOnly / _ProbeFailureNeverBlocks /
+          _ValidationFailurePropagates / _NilProberFailsClosed /
+          _NextRevisionFollowsHistory                                     ← protection evidence
+```
+
+Root cause: `PublishDryRun` filtered the preview on `deployment.status`
+**only** — it never read the provider's published status (the T3 rule), so a
+deployment behind a disabled provider was counted as "will take traffic" and
+was **live-probed** (an outbound call to an upstream that can never be
+scheduled). The report had no issue list and no summary at all: HTTP 200
+carried no verdict.
+
+**Rate-store failure alarm (quota)**:
+
+```
+=== RUN   TestReserveRateTx_StoreFailureAlarms
+    rate_alarm_t9_test.go:45: a rate-store failure must raise an ALARM line, log = ""
+--- FAIL: TestReserveRateTx_StoreFailureAlarms (0.00s)
+--- PASS: TestReserveRateTx_RateRejectionIsNotAnAlarm (0.00s)       ← protection evidence
+```
+
+Root cause: the rate reservation failure was surfaced only as the admission's
+error code (`service_unavailable`). The distinction between "the rate store
+is down" (an outage) and "the account is rate limited" (normal traffic) was
+invisible to the operator — the fail-closed behaviour was right, but it was
+silent.
+
+**Unknown-usage backlog alarm (workers)**:
+
+```
+=== RUN   TestRecover_UnknownUsageBacklogAlarms
+    backlog_alarm_t9_test.go:71: an unknown-usage backlog must raise an ALARM line, log = "… inference_recovery pass: scanned=0 … backlog=0 unknown_usage=11 dangling_holds=0 …"
+--- FAIL: TestRecover_UnknownUsageBacklogAlarms (0.00s)
+--- PASS: TestRecover_NoUnknownUsageBacklogNoAlarm (0.00s)          ← protection evidence
+```
+
+Root cause: the recovery pass counted the unknown-usage requests into its
+structured metrics line but never **alarmed** — a backlog nobody is told
+about is a backlog nobody handles.
+
+**Capability description (httpapi)**:
+
+```
+=== RUN   TestKayaModels_CapabilityDescriptionIsAccurate
+    kaya_models_t9_test.go:149: vision-chat supports_images = <nil>, want true (openai_chat 承载图片)
+    kaya_models_t9_test.go:152: vision-chat supports_tools = <nil>, want true
+    kaya_models_t9_test.go:155: vision-chat supports_thinking = <nil>, want true
+    kaya_models_t9_test.go:158: vision-chat context_tokens = <nil>, want 200000
+    kaya_models_t9_test.go:161: vision-chat max_output_tokens = <nil>, want 8192
+    kaya_models_t9_test.go:164: capability_description missing: map[default:true display_name:vision-chat id:vision-chat input_modalities:[text image] provider:zhipu]
+    kaya_models_t9_test.go:173: text-responses supports_images = <nil>, want false (该协议不承载图片)
+    kaya_models_t9_test.go:176: text-responses supports_tools = <nil>, want true
+--- FAIL: TestKayaModels_CapabilityDescriptionIsAccurate (0.12s)
+```
+
+Root cause: the picker only knew the **declared** input modalities; it could
+not say whether a model could carry tools or reasoning, and it never published
+the context/output hard limits the admission enforces.
+
+#### 4.42 GREEN evidence
+
+Command #9 (the same four commands, production code fixed) — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/management	0.998s
+ok  	github.com/yunhou/users/internal/inference/quota	0.935s
+ok  	github.com/yunhou/users/internal/inference/workers	0.713s
+ok  	github.com/yunhou/users/internal/inference/httpapi	1.529s
+```
+
+Acceptance command #10 — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/management	2.440s
+ok  	github.com/yunhou/users/internal/inference/httpapi	82.775s
+ok  	github.com/yunhou/users/internal/inference/config	1.661s
+ok  	github.com/yunhou/users/cmd/server	2.331s
+```
+
+#### 4.43 Probe semantics (the contract T9 pins)
+
+| 维度 | 字段 | 取值 |
+|---|---|---|
+| 凭据**材料**测试 | `credential_state` | `decrypted` / `missing` / `unusable` |
+| **指定**连通性探测 | `probe_method` + `probe_outcome` | `connectivity`+`verified` / `failed` / `unsupported` / `unconfirmed` |
+| 本次**没有**做真实推理 | `inference_verified` | 恒为 `false` |
+
+- `ok=true` **只**表示「这条部署的上游连通」；`inference_verified=false`
+  显式发布出来，免得 `ok` 被读成「模型答过」。
+- **供应商不提供 `/models`**（404/405/501）→ `unsupported`：此探测方式
+  **无法确认**；**不是**模型故障（`base_url` 缺一段路径也会得到同样的 404，
+  摘要与 `description` 都点明这一点）。
+- 鉴权/版本头**按协议**设置，与派发路径**同一个适配器**：
+  `openai_chat`/`openai_responses` → `Authorization: Bearer`；
+  `anthropic_messages` → `x-api-key` + `anthropic-version`。
+  `anthropic_messages` + OAuth 是**明确不支持**的组合 → 出站前拒绝，绝不
+  把 OAuth 令牌塞进 API-key 槽（T1 的明确拒绝在探测面同样成立）。
+- 探测**只读**、零写库、**默认零付费**（读的是供应商的模型列表端点）。
+
+#### 4.44 Dry-run semantics (the contract T9 pins)
+
+- **停用 provider 的部署既不算 active，也不被探测**（T3 携带的必修发现）；
+  `would_publish.disabled_providers` /
+  `deployments_behind_disabled_providers` 如实汇总。
+- `issues[]` 分两类：`severity=blocker`（`provider_disabled` /
+  `deployment_no_account` / `route_capabilities_narrowed` /
+  `model_not_dispatchable`）与 `severity=hint`（`account_inventory_unavailable`
+  / `probe_failed` / `probe_unsupported` / `probe_unconfirmed`）。
+- 账号清单**读不到**时判定被**跳过**（`account_inventory_unavailable`
+  hint），报告说「未知」，**绝不**谎称「无账号」。
+- **策略/路由不支持**的配置由**发布闸**拒绝（预演与正式发布同一错误），
+  因此它出现在**错误**里而不是 200 报告里。
+- **HTTP 200 不等于每个 `probe.ok` 都是 true**：`summary.all_probes_ok` 只在
+  每个探测都 `verified` 时才为 true。
+
+#### 4.45 Skips
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1` (`quota_concurrency_test.go:773`). The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+
+The verbose inventory (command #11, `-v`, **full untruncated output**):
+**1113 PASS / 3 SKIP / 0 FAIL** across the 15 packages
+(`access`, `accounting`, `catalog`, `credentials`, `domain`, `gateway`,
+`httpapi`, `management`, `postgres`, `providers`, `providers/connector`,
+`quota`, `routing`, `workers`, `tests/integration`), every package `ok`.
+
+**Database-test skips: 0** — identical to the T0 (§2.6), T1 (§4.4), T2
+(§4.12), T3 (§4.20), T5 (§4.37), T6 (§4.28) and T8 inventories; the skip
+lines were grepped for `postgres` / `no database` / `database unavailable`
+and returned **nothing**:
+
+```
+[inventory] any skip mentioning postgres / no database / database unavailable
+  (NONE — no database-backed test was skipped)
+```
+
+#### 4.46 Migration
+
+**None.** T9 adds no migration: everything lives in the probe/dry-run
+projections, the capability oracle and the log channels. The disposable
+databases were migrated with `cmd/migrate` exactly as in §2.3 (53 files,
+idempotent on the second run).
+
+#### 4.47 Files changed
+
+| File | Change |
+|---|---|
+| `internal/inference/management/probe.go` | protocol-aware probe (the adapter's own auth/version headers, the explicit `anthropic_messages`+OAuth refusal); `ProbeResult` gains `credential_state` / `probe_method` / `probe_outcome` / `probe_supported` / `inference_verified` / `description`; `ProbeStore` gains the account inventory; `ProbeService` implements `AccountInventory` |
+| `internal/inference/management/catalog.go` | the publish preview filters on the **published provider status** (a disabled provider's deployments are neither counted nor probed), aggregates the determinable issues (`PublishIssue`) and the verdict summary (`PublishDryRunSummary`) |
+| `internal/inference/providers/adapter.go` | `AdapterForProtocol` — the registry lookup the probe uses to pick the protocol's headers |
+| `internal/inference/routing/service.go` | `CapabilityOracle` (images + tools + reasoning, all answered by the dispatch decision) and `ProductionCapabilities()` |
+| `internal/inference/httpapi/kaya_models.go` | `/chat/models` appends `supports_images` / `supports_tools` / `supports_thinking` / `context_tokens` / `max_output_tokens` / `capability_description` |
+| `internal/inference/quota/service.go` | the rate-store failure alarm (a rate **rejection** is not an alarm) |
+| `internal/inference/workers/settlement_recovery.go` | the unknown-usage backlog alarm (`RecoveryConfig.UnknownUsageAlarmThreshold`, default 10) |
+| `internal/inference/management/probe_test.go` | the fake resolver now carries the credential's `auth_type`; the fake store gains the account inventory |
+| `internal/inference/management/probe_t9_test.go` | **new** — the T9 probe cases |
+| `internal/inference/management/publish_dryrun_t9_test.go` | **new** — the T9 dry-run cases (incl. the carried disabled-provider finding) |
+| `internal/inference/httpapi/kaya_models_t9_test.go` | **new** — the T9 capability-description case |
+| `internal/inference/quota/rate_alarm_t9_test.go` | **new** — the rate-store alarm case (+ the "a rejection is not an alarm" guard) |
+| `internal/inference/workers/backlog_alarm_t9_test.go` | **new** — the unknown-usage backlog alarm case (+ the "no backlog, no alarm" guard) |
+| `docs/api/kaya-coding-plan.openapi.yaml` | the probe result, the publish preview report and `/chat/models` (with the capability fields) are now documented; the new enums are pinned |
+| `docs/api-integration-guide.md` | the `/chat/models` capability fields; the new "目录发布与上游探测" operator section |
+| `docs/runbooks/kaya-coding-plan-operations.md` | the publish-preview semantics, the probe semantics and the four operational alarms (with their greppable log prefixes) |
+| `docs/runbooks/kaya-coding-plan-rollout.md` | the stale "凭据 test 端点当前为结构化占位" pre-launch todo corrected (T9 made it a real protocol-aware probe) |
+
+#### 4.48 Notes (root cause, compatibility, honesty, operational limits)
+
+- **Root cause (four independent gaps, one theme):** every operational
+  surface reported a **boolean** where the truth is a **distinction**. The
+  probe reported "ok" for "the credential decrypted", "the upstream answered"
+  and "the model answered"; the dry-run reported "200" for "the report was
+  produced"; the picker reported a declaration where the dispatch decision
+  was the truth; the rate-store outage and the unknown-usage backlog were
+  counted but never announced. T9 replaces each boolean with the
+  distinction it was standing in for, **without removing any old field**.
+- **Compatibility.** No old field was removed or renamed: `ProbeResult`
+  keeps `deployment_id` / `ok` / `status` / `latency_ms` / `error_summary`
+  with their exact meaning, and the publish preview keeps `would_publish` /
+  `probes`. Everything new is **appended** (`credential_state`,
+  `probe_method`, `probe_outcome`, `probe_supported`, `inference_verified`,
+  `description`, `issues`, `summary`, `disabled_providers`,
+  `deployments_behind_disabled_providers`). The `/chat/models` entries gain
+  fields but keep `id` / `display_name` / `provider` / `default` /
+  `input_modalities`. **`/v1/models` is byte-for-byte unchanged** (native
+  OpenAI `object=list` shape, no capability fields).
+- **One behavioural change the operator must know:** a disabled provider's
+  deployments are no longer counted in `would_publish.active_deployments`
+  and are no longer probed. That is the carried T3 finding; the count now
+  means "will actually carry traffic" instead of "the deployment row says
+  active". `deployments_behind_disabled_providers` keeps the old number
+  visible.
+- **The publish gate is unchanged.** The dry-run still validates exactly
+  like the formal publish and returns the **same error** for an invalid
+  draft; the issues list covers the classes the gate does not catch.
+  The formal publish still runs **no probe** and gains **no network
+  dependency**.
+- **Operational limits.** (1) The probe reads a **vendor model-list
+  endpoint**: a vendor without one yields `unsupported` — the method
+  cannot confirm, and the report says so. (2) A 404 is **ambiguous** by
+  nature (no `/models`, or a `base_url` missing a path segment); the
+  summary and the description name both possibilities instead of picking
+  one. (3) The account inventory check is skipped (never guessed) when the
+  read fails. (4) The alarms are **log lines** — the repository has no
+  metrics facility, and T9 deliberately introduced none.
+- **The credential resolver: a deliberate choice, stated plainly.** The
+  probe consumes the T1 outbound-auth **material** through
+  `credentials.Service.ResolveBearerToken` — the probe-side twin of
+  `ResolveOutboundAuth`, which the T1 fix round made share ONE decode helper
+  (`decodeOAuthAccessToken`), so an `oauth` credential yields the **access
+  token alone** and an unusable bundle is rejected identically on both public
+  paths. The probe additionally needs the credential's **`auth_type`** (it
+  selects the protocol's header slot), and `ResolveBearerToken` already
+  returns the complete `*domain.Credential` alongside the token. Calling
+  `ResolveOutboundAuth` directly would have required moving the
+  `OutboundAuth` type into `domain` (a type-level refactor of the hot
+  path's contract) purely to satisfy the RED-first constraint, for no
+  behavioural gain — the two resolvers return the same material for every
+  credential type. The hot path (`gateway.SecretResolver`) is **untouched**
+  and still calls `ResolveOutboundAuth`.
+- **Not built (deliberately):** no generic lossless native protocol
+  passthrough layer, no per-vendor "capability probe" beyond the model
+  list, and no new monitoring platform.
+
+
+#### 4.49 T9 fix round — the e2e byte-exact `/chat/models` contract
+
+Recorded on 2026-11-06, after the **first** full T9 verification run.
+
+**Finding.** The `go-e2e` CI job (a **separate** job with its own Postgres
+service, §1.3) failed while everything else was green: the e2e contract test
+pins `GET /chat/models` **byte-exactly**, and T9 legitimately appended the
+capability fields to that body.
+
+```
+--- FAIL: TestChatContract_DualBackend (4.94s)
+    --- FAIL: TestChatContract_DualBackend/facade/models (2.51s)
+        --- FAIL: TestChatContract_DualBackend/facade/models (0.00s)
+            chat_gateway_test.go:1497: /chat/models body = {"code":0,"data":{"models":[{"id":"deepseek-chat","display_name":"DeepSeek Chat","provider":"deepseek","default":true,"input_modalities":["text"],"supports_images":false,"supports_tools":true,"supports_thinking":true,"context_tokens":128000,"max_output_tokens":8192,"capability_description":"images: no; tools: yes; thinking: yes; context: 128000 tokens; max output: 8192 tokens"}]}}, want byte-exact {"code":0,"data":{"models":[{"id":"deepseek-chat","display_name":"DeepSeek Chat","provider":"deepseek","default":true,"input_modalities":["text"]}]}}
+FAIL	github.com/yunhou/users/tests/e2e	192.503s
+```
+
+**Why this is a contract update, not a defect.** The brief authorises exactly
+this: "/chat/models may only append accurate image/tool/thinking/context/
+output limit fields". The **gateway** surface (`httpapi.KayaModelsHandler`)
+now carries the six appended fields; the **legacy** picker
+(`service.ChatGatewayFacade`) is **unchanged** and keeps its original five
+fields. The e2e contract case runs against **both** backends (the strongest
+way to keep the two client views identical), so the expectation now carries
+the per-backend tail.
+
+**The fix — test-only, no production change:**
+
+| File | Change |
+|---|---|
+| `tests/e2e/chat_gateway_test.go` | `chatContractEnv` gains `modelsCapabilitySuffix` (the T9 capability tail). The **legacy** variant keeps it empty (its byte-exact five-field shape is unchanged); the **facade** variant pins the six appended fields with the values its fixture really produces (`openai_chat` adapter + empty route capability list + a text-only model → `supports_images=false`, `supports_tools=true`, `supports_thinking=true`, `context_tokens=128000`, `max_output_tokens=8192`). |
+
+**Re-verification** — command #12b, exit code **0**:
+
+```
+ok  	github.com/yunhou/users/tests/e2e	308.985s
+```
+
+(The re-run is slower than the first because an unrelated Rust/Playwright
+suite from another project was saturating the machine at the time; the
+result is the same.)
+
+**Compatibility.** The customer-visible `/chat/models` body **grew** (six
+appended fields) — that is the sanctioned T9 change, and it is now pinned
+byte-exactly on both backends. The legacy picker is byte-for-byte unchanged.
 
 ### T10 — Integration acceptance and implementation report
 

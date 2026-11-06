@@ -616,6 +616,107 @@ paths:
         "400": { $ref: "#/components/responses/InvalidInput" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
+  /admin/deployments/{id}/probe:
+    post:
+      tags: [model-admin]
+      summary: 上游连通性探测（models:read；只读、零写库、默认零付费）
+      description: |
+        对一条部署的上游发一次**只读**探测：`GET {base_url}/models`。
+
+        **三件事必须分开看**（读响应里的三个字段）：
+        - `credential_state` —— **凭据材料测试**：`decrypted`（材料解开且
+          可用）/ `missing`（该 provider 没有可用凭据）/ `unusable`（有
+          凭据但材料解不开）。它与「探测成功」无关。
+        - `probe_method` / `probe_outcome` —— **指定探测**做了什么、结论是
+          什么：`connectivity` + `verified`（连通性已确认）/ `failed`（端点
+          存在但没成功）/ `unsupported`（**供应商不提供该端点**，此探测方式
+          无法确认——**不是**模型故障，也**不是**推理成功）/ `unconfirmed`
+          （没得到任何答复：传输错误、超时、凭据不可用、探测没跑）。
+        - `inference_verified` —— **恒为 false**：本探测**从不**发起真实
+          推理（默认不触发付费推理）。`ok=true` 只表示「这条部署的上游
+          连通」，绝不表示「模型答过」。
+
+        **鉴权/版本头按协议设置**（与派发路径同一个适配器）：
+        `openai_chat` / `openai_responses` 走 `Authorization: Bearer`；
+        `anthropic_messages` 走 `x-api-key` + `anthropic-version`。
+        `anthropic_messages` + OAuth 凭据是**明确不支持**的组合：出站前
+        拒绝，绝不把 OAuth 令牌塞进 API-key 槽。
+
+        失败一律 in-band（HTTP 200 + `ok:false`）；只有「部署不存在」这类
+        硬错误才走 envelope。`error_summary` 永不包含凭据材料。
+      operationId: probeDeployment
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: 探测结论（advisory）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ProbeResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/catalog/publish:
+    post:
+      tags: [model-admin]
+      summary: 发布目录（models:manage）；?dry_run=1 为发布预演
+      description: |
+        `?dry_run=1` 是**发布预演**：与正式发布**同一套抽取与校验**、同一
+        事务快照，**一行不写**（零 revision、零审计事件），并给出：
+
+        - `would_publish` —— 候选集摘要。`active_deployments` 是**真正会
+          承接流量**的部署数（部署 active **且**其 provider 未停用）——
+          停用 provider 背后的部署**不算**，也**不**被探测（T3 的发布态
+          语义）。`disabled_providers` / `deployments_behind_disabled_providers`
+          如实汇总停用的 provider 与被它带走的部署。
+        - `probes[]` —— 每条会生效部署的探测结论（语义见
+          `POST /admin/deployments/{id}/probe`）。
+        - `issues[]` —— 发布前**可判定**的问题。`severity=blocker` 是
+          **确定性配置问题**（发布后某个模型/路由跑起来不是配的那个：
+          `provider_disabled` / `deployment_no_account` /
+          `route_capabilities_narrowed` / `model_not_dispatchable`）；
+          `severity=hint` 是**网络探测提示**（`probe_failed` /
+          `probe_unsupported` / `probe_unconfirmed` /
+          `account_inventory_unavailable`），advisory、**不阻断**发布，也
+          **不代表**模型故障。
+        - `summary` —— 判定摘要（探测结论分桶 + blocker/hint 计数）。
+
+        **HTTP 200 只说明预演报告生成成功**：它**不等于**每个 `probe.ok`
+        都是 true（看 `summary.all_probes_ok` 与逐条 `probe_outcome`）。
+
+        草稿里**不支持**的策略/路由配置（不在支持集的 `pool_strategy`、
+        词表外的路由 `capabilities`）由**发布闸**拒绝：预演与正式发布给出
+        **同一个错误**（点名对象 ID 与替代配置），因此它出现在错误里而
+        不是 200 报告里。
+
+        正式发布（不带 `dry_run`）**不跑任何探测**，也不引入网络依赖。
+      operationId: publishCatalog
+      parameters:
+        - { name: dry_run, in: query, schema: { type: string, enum: ["1", "true", "yes"] } }
+        - { name: reason, in: query, required: true, schema: { type: string, description: 运营理由（审计必填） } }
+      responses:
+        "200":
+          description: 正式发布返回新 revision；dry_run 返回预演报告
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        oneOf:
+                          - type: object
+                            properties:
+                              revision: { type: integer }
+                          - $ref: "#/components/schemas/PublishDryRunReport"
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /user/api-keys:
     post:
       tags: [api-keys]
@@ -1127,6 +1228,50 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
 
+  /chat/models:
+    get:
+      tags: [chat]
+      summary: Kaya 模型选择器列表（JWT；同一订阅门禁）
+      description: |
+        Kaya 模型下拉框的数据源：**调用者权益可见**且**已发布**的模型集合
+        （与 `GET /v1/models` 同一判定）。管理 envelope 形状
+        `{code, data:{models:[…]}}`。
+
+        每个条目在既有字段（`id` / `display_name` / `provider` / `default` /
+        `input_modalities`）之上**追加**能力描述：
+
+        - `supports_images` / `supports_tools` / `supports_thinking` ——
+          **派发判定**：有一条已发布路由的能力清单覆盖它、且该协议的适配层
+          承载它。绝不声明超过**当前入口（已发布条目 + 路由）与 adapter**
+          的能力（一个只有 `openai_responses` 部署的模型不会被声明成能收
+          图片）。
+        - `context_tokens` / `max_output_tokens` —— 目录条目上的**硬上限**
+          （准入时强制生效的那两个数），不是估计值。
+        - `capability_description` —— 同一组结论的人话版本。
+
+        `GET /v1/models` 保持**原生基本形状**（OpenAI `object=list`），不带
+        这些字段。
+      operationId: listChatModels
+      responses:
+        "200":
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          models:
+                            type: array
+                            items: { $ref: "#/components/schemas/KayaModelEntry" }
+        "401": { description: 未认证（JWT 缺失/失效） }
+        "403": { description: 无有效订阅（403，picker 隐藏选择器） }
+        "503": { description: "目录冷启动无已验证快照（Retry-After: 5）" }
+
 components:
   securitySchemes:
     BearerAuth:
@@ -1186,6 +1331,152 @@ components:
           example: { code: 404, data: null, message: "inference/not_found: api key not found" }
 
   schemas:
+    ProbeResult:
+      type: object
+      description: |
+        一次上游连通性探测的结论（advisory）。**三件事分开**：
+        凭据材料测试（`credential_state`）、指定连通性探测
+        （`probe_method`/`probe_outcome`）、本次**没有**做真实推理
+        （`inference_verified` 恒为 false）。
+      properties:
+        deployment_id: { type: string, format: uuid }
+        ok:
+          type: boolean
+          description: |
+            只有「指定探测成功」（`probe_outcome=verified`）才为 true。
+            **它不表示模型答过**（本次没有发起任何推理）。
+        status: { type: integer, description: 上游 HTTP 状态码；0 = 没拿到任何答复 }
+        latency_ms: { type: integer, format: int64 }
+        error_summary:
+          type: string
+          description: 失败摘要（永不包含凭据材料）。
+        credential_state:
+          type: string
+          enum: [decrypted, missing, unusable]
+          description: |
+            凭据**材料**测试：`decrypted`（材料解开且可用）/ `missing`
+            （该 provider 没有可用凭据）/ `unusable`（有凭据但材料解不开）。
+        probe_method:
+          type: string
+          enum: [connectivity, none]
+          description: "`connectivity` = 真的向供应商端点发了请求；`none` = 探测没跑起来。"
+        probe_outcome:
+          type: string
+          enum: [verified, failed, unsupported, unconfirmed]
+          description: |
+            诚实的结论：`verified`（连通性已确认）/ `failed`（端点存在但没
+            成功）/ `unsupported`（**供应商不提供该端点**，此探测方式无法
+            确认——**不是**模型故障）/ `unconfirmed`（没得到任何答复）。
+        probe_supported:
+          type: boolean
+          description: |
+            探测是否**确认**了供应商提供该端点。false 表示「没确认」（既包括
+            供应商不提供，也包括探测没得到答复——看 `probe_outcome` 区分）。
+        inference_verified:
+          type: boolean
+          enum: [false]
+          description: 恒为 false：本探测从不发起真实推理（默认不触发付费推理）。
+        description: { type: string, description: 运营可读的一句话结论 }
+      required: [deployment_id, ok, status, latency_ms, credential_state, probe_method, probe_outcome, probe_supported, inference_verified]
+
+    PublishIssue:
+      type: object
+      description: |
+        发布预演里的一条**可判定**问题。`blocker` = 确定性配置问题（发布后
+        某个模型/路由跑起来不是配的那个）；`hint` = 网络探测提示（advisory、
+        不阻断发布、**不代表**模型故障）。
+      properties:
+        code:
+          type: string
+          enum:
+            - provider_disabled
+            - deployment_no_account
+            - route_capabilities_narrowed
+            - model_not_dispatchable
+            - account_inventory_unavailable
+            - probe_failed
+            - probe_unsupported
+            - probe_unconfirmed
+        severity: { type: string, enum: [blocker, hint] }
+        subject: { type: string, description: 问题对象的主键（provider/deployment/model/route ID） }
+        message: { type: string, description: 运营可读的一句话（绝不含凭据材料） }
+      required: [code, severity, subject, message]
+
+    PublishPreviewSummary:
+      type: object
+      description: 发布候选集摘要（计数 + next revision 预告）。
+      properties:
+        next_revision: { type: integer }
+        models: { type: integer }
+        providers: { type: integer }
+        deployments: { type: integer }
+        active_deployments:
+          type: integer
+          description: |
+            **真正会承接流量**的部署数（部署 active **且**其 provider 未停用）。
+            停用 provider 背后的部署不算，也**不**被探测。
+        routes: { type: integer }
+        disabled_providers: { type: integer, description: 草稿里被停用的 provider 数量 }
+        deployments_behind_disabled_providers:
+          type: integer
+          description: 部署本身 active、但其 provider 已停用的部署数（不会承接流量、也不被探测）。
+      required: [next_revision, models, providers, deployments, active_deployments, routes, disabled_providers, deployments_behind_disabled_providers]
+
+    PublishDryRunSummary:
+      type: object
+      description: |
+        预演的判定摘要。**HTTP 200 不等于每个 probe.ok 都是 true** ——
+        `all_probes_ok` 只有在每个探测都 verified 时才为 true。
+      properties:
+        probes_total: { type: integer }
+        probes_ok: { type: integer }
+        probes_failed: { type: integer }
+        probes_unsupported: { type: integer, description: 供应商不提供该探测端点的条数 }
+        probes_unconfirmed: { type: integer, description: 没得到任何答复的条数 }
+        blockers: { type: integer, description: 确定性配置问题的条数 }
+        hints: { type: integer, description: 网络探测提示的条数 }
+        all_probes_ok: { type: boolean }
+        account_inventory_checked:
+          type: boolean
+          description: 「无账号」判定是否真的查过账号清单；false = 该判定被跳过（未知，不是无账号）。
+      required: [probes_total, probes_ok, probes_failed, probes_unsupported, probes_unconfirmed, blockers, hints, all_probes_ok, account_inventory_checked]
+
+    PublishDryRunReport:
+      type: object
+      description: 发布预演报告（零写库、零审计事件）。
+      properties:
+        would_publish: { $ref: "#/components/schemas/PublishPreviewSummary" }
+        probes:
+          type: array
+          items: { $ref: "#/components/schemas/ProbeResult" }
+        issues:
+          type: array
+          items: { $ref: "#/components/schemas/PublishIssue" }
+        summary: { $ref: "#/components/schemas/PublishDryRunSummary" }
+      required: [would_publish, probes, issues, summary]
+
+    KayaModelEntry:
+      type: object
+      description: |
+        Kaya 模型选择器的一条目。能力字段是**派发判定**：它们绝不声明超过
+        当前入口（已发布条目 + 路由）与 adapter 的能力。
+      properties:
+        id: { type: string }
+        display_name: { type: string }
+        provider: { type: string }
+        default: { type: boolean }
+        input_modalities:
+          type: array
+          items: { type: string, enum: [text, image] }
+          description: 模型生效的输入模态；不含 `image` 的模型带图调用会被 400 拒绝。
+        supports_images: { type: boolean, description: 该条目能否承载图片输入（派发判定） }
+        supports_tools: { type: boolean, description: 该条目能否承载带工具的请求（派发判定） }
+        supports_thinking: { type: boolean, description: 该条目能否承载带推理的请求（派发判定） }
+        context_tokens: { type: integer, description: 上下文硬上限（准入强制） }
+        max_output_tokens: { type: integer, description: 输出硬上限（准入强制） }
+        capability_description: { type: string, description: 同一组结论的人话版本 }
+      required: [id, display_name, provider, default, input_modalities, supports_images, supports_tools, supports_thinking, context_tokens, max_output_tokens]
+
     DecimalInt64:
       type: string
       pattern: "^[0-9]+$"

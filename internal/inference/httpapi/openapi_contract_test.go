@@ -247,3 +247,70 @@ func TestOpenAPI_ReasoningEffortContract(t *testing.T) {
 			"minimal is the lowest reasoning level, only none turns reasoning off")
 	}
 }
+
+// TestOpenAPI_T9ProbePreviewAndCapabilityContract pins the T9 contract in
+// the OpenAPI spec — the three distinctions the probe makes, the publish
+// preview's issue/summary shape, and the capability fields /chat/models
+// appends. Every new enum and response field must be documented here
+// (全局约定：新增枚举、响应字段和错误必须同步 OpenAPI).
+func TestOpenAPI_T9ProbePreviewAndCapabilityContract(t *testing.T) {
+	doc := readOpenAPI(t)
+	// 新增的三个路径必须留档。
+	for _, path := range []string{
+		"/admin/deployments/{id}/probe:",
+		"/admin/catalog/publish:",
+		"/chat/models:",
+	} {
+		if !strings.Contains(doc, path) {
+			t.Errorf("openapi missing path %s", path)
+		}
+	}
+	// 探测的三件事：凭据材料测试 / 指定探测 / 本次未做真实推理。
+	for _, kw := range []string{
+		"credential_state", "probe_method", "probe_outcome", "probe_supported",
+		"inference_verified",
+		"enum: [decrypted, missing, unusable]",
+		"enum: [connectivity, none]",
+		"enum: [verified, failed, unsupported, unconfirmed]",
+		"unsupported", // 供应商不提供 /models 时「此探测方式不支持/无法确认」
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing probe contract keyword %q", kw)
+		}
+	}
+	// 发布预演：blocker vs hint、HTTP 200 不等于每个 probe.ok。
+	for _, kw := range []string{
+		"PublishDryRunReport", "PublishIssue", "PublishDryRunSummary",
+		"PublishPreviewSummary",
+		"enum: [blocker, hint]",
+		"provider_disabled", "deployment_no_account", "route_capabilities_narrowed",
+		"model_not_dispatchable", "probe_unsupported", "account_inventory_unavailable",
+		"all_probes_ok", "disabled_providers", "deployments_behind_disabled_providers",
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing publish-preview keyword %q", kw)
+		}
+	}
+	// /chat/models 的能力字段；/v1/models 保持原生基本形状（不带能力字段）。
+	for _, kw := range []string{
+		"supports_images", "supports_tools", "supports_thinking",
+		"context_tokens", "max_output_tokens", "capability_description",
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing /chat/models capability keyword %q", kw)
+		}
+	}
+	i := strings.Index(doc, "    ModelList:")
+	if i < 0 {
+		t.Fatal("openapi missing ModelList schema")
+	}
+	seg := doc[i:]
+	if j := strings.Index(seg, "\n    ChatCompletionsRequest:"); j >= 0 {
+		seg = seg[:j]
+	}
+	for _, kw := range []string{"supports_images", "supports_tools", "context_tokens"} {
+		if strings.Contains(seg, kw) {
+			t.Errorf("/v1/models must keep its native basic shape, but it documents %q", kw)
+		}
+	}
+}

@@ -267,10 +267,49 @@ type ImageCapabilityOracle interface {
 	SupportsImageInput(snap *catalog.Snapshot, modelID string) bool
 }
 
+// CapabilityOracle answers the capability questions a client-facing listing
+// must answer: can this published entry serve image input / tools /
+// reasoning at all? Every answer is the DISPATCH decision (route capability
+// list + registered adapter + the published deployment's schedulability), so
+// a listing can never advertise more than the dispatcher can deliver (T9).
+//
+// The image question is the same one the modality projections have always
+// used (ImageCapabilityOracle); tools and reasoning extend it so a picker
+// can show the real capability instead of guessing from the model
+// declaration.
+type CapabilityOracle interface {
+	ImageCapabilityOracle
+	SupportsTools(snap *catalog.Snapshot, modelID string) bool
+	SupportsThinking(snap *catalog.Snapshot, modelID string) bool
+}
+
 // SupportsImageInput implements ImageCapabilityOracle with the service's own
 // adapter set — identical to the one the dispatcher uses.
 func (s *Service) SupportsImageInput(snap *catalog.Snapshot, modelID string) bool {
 	return SupportsImages(s.adapters, snap, modelID)
+}
+
+// SupportsTools implements CapabilityOracle with the service's own adapter
+// set: the model has at least one published deployment whose route covers
+// tools and whose protocol adapter can carry them.
+func (s *Service) SupportsTools(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(s.adapters, snap, modelID, Needs{Tools: true})
+}
+
+// SupportsThinking implements CapabilityOracle with the service's own
+// adapter set: the model has at least one published deployment whose route
+// covers reasoning and whose protocol adapter can carry it.
+func (s *Service) SupportsThinking(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(s.adapters, snap, modelID, Needs{Reasoning: true})
+}
+
+// SupportsCapability reports whether the model has at least one published
+// deployment that can structurally serve the given capability. It is the
+// SAME decision the dispatcher makes (CompatibleDeployments), so a
+// client-facing listing never claims more than the dispatch path can do.
+func SupportsCapability(adapters map[domain.Protocol]providers.Adapter,
+	snap *catalog.Snapshot, modelID string, needs Needs) bool {
+	return len(CompatibleDeployments(adapters, snap, modelID, needs)) > 0
 }
 
 // registryOracle adapts an adapter registry to the ImageCapabilityOracle.
@@ -281,11 +320,28 @@ func (r registryOracle) SupportsImageInput(snap *catalog.Snapshot, modelID strin
 	return SupportsImages(r, snap, modelID)
 }
 
+// SupportsTools implements CapabilityOracle.
+func (r registryOracle) SupportsTools(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(r, snap, modelID, Needs{Tools: true})
+}
+
+// SupportsThinking implements CapabilityOracle.
+func (r registryOracle) SupportsThinking(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(r, snap, modelID, Needs{Reasoning: true})
+}
+
 // ProductionImageCapability is the oracle over the PRODUCTION adapter
 // registry (providers.RegisteredAdapters) — the same registry cmd/server
 // wires into the routing service. It is the default for the client-facing
 // projections, which have no routing service of their own.
 func ProductionImageCapability() ImageCapabilityOracle {
+	return registryOracle(providers.RegisteredAdapters())
+}
+
+// ProductionCapabilities is the FULL capability oracle over the PRODUCTION
+// adapter registry: images, tools and reasoning, all answered by the
+// dispatch decision (T9).
+func ProductionCapabilities() CapabilityOracle {
 	return registryOracle(providers.RegisteredAdapters())
 }
 

@@ -252,8 +252,13 @@ OpenAI Chat Completions（tools + stream_options.include_usage）——
 **发布前置待办（G2 之前必须完成）**：
 1. 用真实 Claude Code 与 Codex 客户端指向 staging 网关跑通：登录态
    Key 配置、流式长会话、工具调用多轮、中断/重连、超额 429 展示；
-2. 真实上游拨测（凭据 test 端点当前为结构化占位；Task 12 记录的测
-   试账号清单待业务方提供）；
+2. 真实上游拨测（**T9 已把凭据 test 端点做成真的协议感知探测**：
+   `POST /admin/deployments/:id/probe` 按协议设置鉴权/版本头，并把「凭据
+   材料可解密」「指定连通性探测成功」「本次未做真实推理」三件事分开报告；
+   供应商不提供 `/models` 时结论是 `unsupported`（此探测方式无法确认），
+   绝不冒充模型故障。**仍待业务方提供**的是 Task 12 记录的真实上游测试
+   账号清单 —— 拿到后按 `docs/runbooks/kaya-coding-plan-operations.md`
+   §「上游连通性探测」逐条跑一遍再灰度）；
 3. "OOS / SUM TO API" 术语的业务方确认（Task 0 起保持未决；连接器
    评估 runbook 中的 OOS=OAuth 为显式标注的工作假设）。
 

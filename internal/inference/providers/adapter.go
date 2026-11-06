@@ -146,6 +146,15 @@ func RegisteredAdapters() map[domain.Protocol]Adapter {
 	}
 }
 
+// AdapterForProtocol returns the registered adapter of one protocol. The
+// probe surface uses it to pick the PROTOCOL's authentication and version
+// headers — the same adapter the dispatcher uses, so a probe never invents
+// a header shape the dispatch path would refuse (T9).
+func AdapterForProtocol(p domain.Protocol) (Adapter, bool) {
+	a, ok := RegisteredAdapters()[p]
+	return a, ok
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------

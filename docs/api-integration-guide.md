@@ -872,8 +872,8 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
   "code": 0,
   "data": {
     "models": [
-      {"id": "deepseek-flash", "display_name": "DeepSeek Flash", "provider": "deepseek", "default": true, "input_modalities": ["text"]},
-      {"id": "kimi-k3", "display_name": "Kimi K3", "provider": "kimi", "default": false, "input_modalities": ["text", "image"]}
+      {"id": "deepseek-flash", "display_name": "DeepSeek Flash", "provider": "deepseek", "default": true, "input_modalities": ["text"], "supports_images": false, "supports_tools": true, "supports_thinking": false, "context_tokens": 128000, "max_output_tokens": 8192, "capability_description": "images: no; tools: yes; thinking: no; context: 128000 tokens; max output: 8192 tokens"},
+      {"id": "kimi-k3", "display_name": "Kimi K3", "provider": "kimi", "default": false, "input_modalities": ["text", "image"], "supports_images": true, "supports_tools": true, "supports_thinking": true, "context_tokens": 200000, "max_output_tokens": 16384, "capability_description": "images: yes; tools: yes; thinking: yes; context: 200000 tokens; max output: 16384 tokens"}
     ]
   }
 }
@@ -886,8 +886,24 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 | `provider` | 所属 provider 名（目录中的 key，仅供展示） |
 | `default` | 是否为目录默认模型（`POST /chat` 省略 `model` 时使用） |
 | `input_modalities` | 模型生效的输入模态（`["text"]` 或 `["text","image"]`）；目录未配置时按 `["text","image"]` 透出（缺省放行）。picker 据此决定是否允许发图——不含 `"image"` 的模型带图调用会被 400 拒绝 |
+| `supports_images` | **能否承载图片输入**：模型声明接受图片 **且** 有一条已发布部署（路由能力清单覆盖 `image`、协议适配层承载图片）。这是**派发判定**，不是声明复读 |
+| `supports_tools` | **能否承载带工具的请求**：同上（路由能力清单 + 协议适配层） |
+| `supports_thinking` | **能否承载带推理的请求**：同上 |
+| `context_tokens` | 上下文硬上限（目录条目上的准入强制值） |
+| `max_output_tokens` | 输出硬上限（目录条目上的准入强制值；实际输出上限 = min(客户端声明, 该值)） |
+| `capability_description` | 同一组结论的人话版本（给人看；机器读上面的字段） |
 
-错误：401（未携带/无效 JWT）、403（无有效订阅）、404（chat 未启用，同 `POST /chat`）。
+**能力字段的口径（T9）**：它们回答的是「**当前已发布入口（模型 + 路由）与
+协议适配层能不能承载这类请求**」，不是模型条目的自我声明。因此：
+
+- 一个只有 `openai_responses` 部署的模型 `supports_images` 恒为 `false`
+  （该协议的适配层不承载图片）—— 绝不会声明超过入口能力；
+- 路由的 `capabilities` 清单收窄（存量非空清单常常不含 `image`）时，
+  带图请求会在**准入前**被 400 拒绝，模型也就不会被声明成能收图；
+- `GET /v1/models` 保持**原生基本形状**（OpenAI `object=list`），**不带**
+  这些能力字段 —— 标准协议面不扩展。
+
+错误：401（未携带/无效 JWT）、403（无有效订阅）、404（chat 未启用，同 `POST /chat`）、503（目录冷启动无已验证快照，`Retry-After: 5`）。
 
 #### 运营侧：多模型目录配置（LLM_PROVIDERS_JSON）
 
@@ -1568,6 +1584,105 @@ LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游�
 | `cost_micros` | 区间成本合计，**单位微元（1e-6 CNY）**——`cost_micros ÷ 1000000` 即为人民币元数 |
 
 以上统计接口的参数错误均返回 400（message 带具体原因），日期格式为 YYYY-MM-DD，`granularity` / `group_by` 为白名单枚举。
+
+---
+
+### 目录发布与上游探测（`/admin/catalog/publish`、`/admin/deployments/:id/probe`）
+
+模型目录的**发布预演**与**上游连通性探测**是同一组运营面：预演给出「这次
+发布会让什么生效、上游通不通、有哪些可判定的问题」，探测给出「这一条部署
+的上游现在通不通」。两者都**只读**：零写库、零审计事件。
+
+#### POST /admin/catalog/publish?dry_run=1
+
+`?reason=` 必填（审计）；`?dry_run=1` 是**预演**（不带 `dry_run` 就是正式
+发布，正式发布**不跑任何探测**、**不引入网络依赖**）。
+
+预演与正式发布**共用同一套抽取与校验、同一事务快照**，差别只有「写不写库」。
+草稿里**不支持**的配置（不在支持集的 `pool_strategy`、词表外的路由
+`capabilities`）由**发布闸**拒绝：预演与正式发布给出**同一个错误**（点名
+对象 ID 与替代配置），因此它出现在错误里而**不是** 200 报告里。
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "would_publish": {
+      "next_revision": 7, "models": 3, "providers": 2, "deployments": 4,
+      "active_deployments": 1, "routes": 3,
+      "disabled_providers": 1, "deployments_behind_disabled_providers": 2
+    },
+    "probes": [
+      {"deployment_id": "…", "ok": true, "status": 200, "latency_ms": 42,
+       "credential_state": "decrypted", "probe_method": "connectivity",
+       "probe_outcome": "verified", "probe_supported": true,
+       "inference_verified": false,
+       "description": "the connectivity probe succeeded — this is NOT an inference (inference_verified=false)"}
+    ],
+    "issues": [
+      {"code": "provider_disabled", "severity": "blocker", "subject": "…", "message": "provider zhipu is disabled: its deployments will not carry traffic and are not probed"},
+      {"code": "probe_unsupported", "severity": "hint", "subject": "…", "message": "the vendor does not expose a model-list endpoint for deployment …: this probe method cannot confirm connectivity — it is NOT evidence of an unhealthy model (a base_url missing a path segment yields the same 404)"}
+    ],
+    "summary": {
+      "probes_total": 1, "probes_ok": 0, "probes_failed": 0,
+      "probes_unsupported": 1, "probes_unconfirmed": 0,
+      "blockers": 1, "hints": 1, "all_probes_ok": false,
+      "account_inventory_checked": true
+    }
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `would_publish.active_deployments` | **真正会承接流量**的部署数（部署 active **且**其 provider 未停用）。停用 provider 背后的部署**不算**，也**不**被探测 |
+| `would_publish.disabled_providers` | 草稿里被停用的 provider 数量（如实汇总） |
+| `would_publish.deployments_behind_disabled_providers` | 部署本身 active、但其 provider 已停用的部署数 |
+| `issues[].severity` | `blocker` = **确定性配置问题**（发布后某个模型/路由跑起来不是配的那个）；`hint` = **网络探测提示**（advisory、不阻断发布、**不代表**模型故障） |
+| `issues[].code` | `provider_disabled` / `deployment_no_account` / `route_capabilities_narrowed` / `model_not_dispatchable`（blocker）；`account_inventory_unavailable` / `probe_failed` / `probe_unsupported` / `probe_unconfirmed`（hint） |
+| `summary.all_probes_ok` | 只有**每个**探测都 `verified` 才为 true |
+
+**HTTP 200 不等于每个 `probe.ok` 都是 true**：200 只说明「预演报告生成成功」。
+逐条结论看 `probes[]` 的 `probe_outcome`，汇总看 `summary`。
+
+#### POST /admin/deployments/:id/probe
+
+对一条部署的上游发一次**只读**探测：`GET {base_url}/models`。**默认不触发
+付费推理**——探测读的是供应商的模型列表端点，不是推理端点。
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "deployment_id": "…", "ok": false, "status": 404, "latency_ms": 12,
+    "error_summary": "upstream returned HTTP 404 Not Found — the vendor does not expose a model-list endpoint at this base_url; this probe method cannot confirm connectivity (not evidence of an unhealthy model; a base_url missing a path segment yields the same 404)",
+    "credential_state": "decrypted", "probe_method": "connectivity",
+    "probe_outcome": "unsupported", "probe_supported": false,
+    "inference_verified": false,
+    "description": "the vendor does not expose a model-list endpoint here — this probe method cannot confirm connectivity; this is NOT a model fault"
+  }
+}
+```
+
+**三件事必须分开看**：
+
+| 维度 | 字段 | 取值 |
+|---|---|---|
+| 凭据**材料**测试 | `credential_state` | `decrypted`（材料解开且可用）/ `missing`（该 provider 没有可用凭据）/ `unusable`（有凭据但材料解不开） |
+| **指定**连通性探测 | `probe_method` + `probe_outcome` | `connectivity`+`verified`（连通性已确认）/ `failed`（端点存在但没成功）/ `unsupported`（**供应商不提供该端点**，此探测方式无法确认）/ `unconfirmed`（没得到任何答复） |
+| 本次**没有**做真实推理 | `inference_verified` | 恒为 `false` —— `ok:true` 只表示「这条部署的上游连通」，**绝不**表示「模型答过」 |
+
+**鉴权/版本头按协议设置**（与派发路径同一个适配器）：`openai_chat` /
+`openai_responses` 走 `Authorization: Bearer`；`anthropic_messages` 走
+`x-api-key` + `anthropic-version`。`anthropic_messages` + OAuth 凭据是
+**明确不支持**的组合：出站前拒绝，绝不把 OAuth 令牌塞进 API-key 槽。
+
+失败一律 in-band（HTTP 200 + `ok:false`）；只有「部署不存在」这类硬错误才
+走 envelope（404）。`error_summary` 永不包含凭据材料。
 
 ---
 

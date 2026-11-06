@@ -106,6 +106,14 @@ type RecoveryConfig struct {
 	// ReconciliationDeadline is the evidence window for jobs the worker
 	// itself creates (default 24h, 设计 §7.2 恢复时限).
 	ReconciliationDeadline time.Duration
+	// UnknownUsageAlarmThreshold is the number of requests with UNKNOWN
+	// consumption above which the pass raises an operational alarm (T9).
+	// The count itself has always been in the structured metrics line, but
+	// a backlog nobody is told about is a backlog nobody handles: these
+	// requests settle at the conservative estimate and wait for a human to
+	// confirm the real usage. 0 = the default (10); a negative value
+	// disables the alarm.
+	UnknownUsageAlarmThreshold int
 }
 
 func (c *RecoveryConfig) withDefaults() RecoveryConfig {
@@ -122,8 +130,17 @@ func (c *RecoveryConfig) withDefaults() RecoveryConfig {
 	if out.ReconciliationDeadline <= 0 {
 		out.ReconciliationDeadline = 24 * time.Hour
 	}
+	if out.UnknownUsageAlarmThreshold == 0 {
+		out.UnknownUsageAlarmThreshold = defaultUnknownUsageAlarmThreshold
+	}
 	return out
 }
+
+// defaultUnknownUsageAlarmThreshold is the default number of requests with
+// unknown consumption that makes the recovery pass raise an alarm. Ten
+// parked requests is already a backlog a human must confirm; below that the
+// signal would be noise (T9).
+const defaultUnknownUsageAlarmThreshold = 10
 
 // SettlementRecovery is the crash-recovery worker.
 type SettlementRecovery struct {
@@ -267,6 +284,13 @@ func (w *SettlementRecovery) RunPass(ctx context.Context) (PassStats, error) {
 		stats.JobsProcessed, stats.JobsSettled, stats.JobsAwaitingEvidence, stats.JobsNoEvidence, stats.Escalated,
 		metrics.ReconciliationBacklog, metrics.UnknownUsageRequests, metrics.DanglingHolds,
 		metrics.OpenRequests, lag.Seconds(), stats.WindowMismatches, stats.Errors)
+	// T9 运行告警：**未知用量积压**。这些请求的消费事实未知，恢复按保守
+	// 估算入账，但真实用量要靠人核对 —— 积压本身必须有人看见（计数一直
+	// 在上面的结构化日志里，只是从来没人被告知）。
+	if w.cfg.UnknownUsageAlarmThreshold > 0 && metrics.UnknownUsageRequests >= int64(w.cfg.UnknownUsageAlarmThreshold) {
+		log.Printf("ALARM inference recovery: unknown-usage backlog %d (threshold %d) — requests with unknown consumption are settled at the conservative estimate and wait for a human to confirm the real usage",
+			metrics.UnknownUsageRequests, w.cfg.UnknownUsageAlarmThreshold)
+	}
 	return stats, errors.Join(errs...)
 }
 

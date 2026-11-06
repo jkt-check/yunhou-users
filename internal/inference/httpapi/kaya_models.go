@@ -17,6 +17,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 
@@ -43,27 +44,31 @@ type KayaModelsHandler struct {
 	// openai_responses one cannot carry images, so the picker must not
 	// offer them. Defaults to the production adapter registry; cmd/server
 	// overrides it with the routing service so both use ONE adapter set.
-	Capabilities routing.ImageCapabilityOracle
+	//
+	// T9: the oracle also answers the tools/thinking questions, so the
+	// listing can describe the model's real capability instead of
+	// guessing from the declaration.
+	Capabilities routing.CapabilityOracle
 }
 
 // NewKayaModelsHandler builds the handler; defaultModel marks the entry the
 // client should preselect. snapshots is the readiness-gate/snapshot pin
 // source — the shared SnapshotCache, so cold start carries
 // ErrNoVerifiedSnapshot (评审裁定：不得用 Catalog.LoadSnapshot，它绕开 cache、
-// 哨兵不可达且每请求全量 SELECT+ParseSnapshot；与 facade 同一来源）。
+// 哨兵不可达且每请求全量 SELECT+ParseSnapshot；与 facade 同一来源)。
 func NewKayaModelsHandler(cat *catalog.Service, resolver *access.Resolver, snapshots gateway.SnapshotSource, defaultModel string) *KayaModelsHandler {
 	return &KayaModelsHandler{
 		Catalog: cat, Resolver: resolver, Snapshots: snapshots, DefaultModel: defaultModel,
-		Capabilities: routing.ProductionImageCapability(),
+		Capabilities: routing.ProductionCapabilities(),
 	}
 }
 
-// imageCapability returns the capability oracle to use (never nil).
-func (h *KayaModelsHandler) imageCapability() routing.ImageCapabilityOracle {
+// capabilityOracle returns the capability oracle to use (never nil).
+func (h *KayaModelsHandler) capabilityOracle() routing.CapabilityOracle {
 	if h.Capabilities != nil {
 		return h.Capabilities
 	}
-	return routing.ProductionImageCapability()
+	return routing.ProductionCapabilities()
 }
 
 // kayaModelEntry is the candidate-branch return shape (对齐基准).
@@ -73,6 +78,19 @@ type kayaModelEntry struct {
 	Provider        string   `json:"provider"`
 	Default         bool     `json:"default"`
 	InputModalities []string `json:"input_modalities"`
+	// --- T9 追加：当前入口（已发布条目 + 路由）与 adapter 的真实能力 ---
+	// SupportsImages 与 input_modalities 一致（模型声明 ∧ 派发能力）。
+	SupportsImages bool `json:"supports_images"`
+	// SupportsTools / SupportsThinking 是**派发判定**：有一条已发布路由
+	// 的能力清单覆盖它、且该协议的适配层承载它。绝不声明超过入口能力。
+	SupportsTools    bool `json:"supports_tools"`
+	SupportsThinking bool `json:"supports_thinking"`
+	// ContextTokens / MaxOutputTokens 是目录条目上的硬上限（准入时强制
+	// 生效的上界），不是估计值。
+	ContextTokens   int `json:"context_tokens"`
+	MaxOutputTokens int `json:"max_output_tokens"`
+	// CapabilityDescription 是一句话人话描述（给人看；机器读上面的字段）。
+	CapabilityDescription string `json:"capability_description,omitempty"`
 }
 
 // List handles GET /chat/models.
@@ -125,7 +143,7 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 		return
 	}
 	out := make([]kayaModelEntry, 0, len(models))
-	capability := h.imageCapability() // 一次解析（每请求一次），不逐模型取
+	capability := h.capabilityOracle() // 一次解析（每请求一次），不逐模型取
 	for _, m := range models {
 		provider := ""
 		if deps := snap.ActiveDeployments(m.ID); len(deps) > 0 {
@@ -138,11 +156,44 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 		// （否则 picker 让客户发图，网关在准入前当场 400）。判据来自
 		// routing 的同一个能力判定，不另立规则。
 		canServeImages := capability.SupportsImageInput(snap, m.ID)
+		modalities := domain.AdvertisedModalities(m.InputModalities, canServeImages)
+		// T9: 追加的能力描述同样是**派发判定**（工具/思考），绝不声明
+		// 超过当前入口与 adapter 的能力；上下文与输出上限取目录条目上的
+		// 硬上限（准入时强制生效的那两个数）。
+		supportsImages := false
+		for _, mod := range modalities {
+			if mod == "image" {
+				supportsImages = true
+			}
+		}
+		supportsTools := capability.SupportsTools(snap, m.ID)
+		supportsThinking := capability.SupportsThinking(snap, m.ID)
 		out = append(out, kayaModelEntry{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
-			Default:         m.ID == h.DefaultModel,
-			InputModalities: domain.AdvertisedModalities(m.InputModalities, canServeImages),
+			Default:          m.ID == h.DefaultModel,
+			InputModalities:  modalities,
+			SupportsImages:   supportsImages,
+			SupportsTools:    supportsTools,
+			SupportsThinking: supportsThinking,
+			ContextTokens:    m.ContextTokens,
+			MaxOutputTokens:  m.MaxOutputTokens,
+			CapabilityDescription: capabilityDescription(supportsImages, supportsTools, supportsThinking,
+				m.ContextTokens, m.MaxOutputTokens),
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": out}})
+}
+
+// capabilityDescription renders the one-line capability description of one
+// published entry (human-facing; the machine-readable fields are the flat
+// booleans and the two hard limits).
+func capabilityDescription(images, tools, thinking bool, contextTokens, maxOutputTokens int) string {
+	yes := func(b bool) string {
+		if b {
+			return "yes"
+		}
+		return "no"
+	}
+	return fmt.Sprintf("images: %s; tools: %s; thinking: %s; context: %d tokens; max output: %d tokens",
+		yes(images), yes(tools), yes(thinking), contextTokens, maxOutputTokens)
 }

@@ -3,6 +3,7 @@ package quota
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -603,9 +604,14 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 // reservedTokens is the TPM hold of this request: the admission input
 // bound plus the forced output cap (the same upper bound the monetary
 // reservation prices).
+//
+// T9 运行告警：**限速存储失败**与**限速拒绝**是两件事。存储不可用时准入
+// fail-closed（503 service_unavailable，绝不回退成单机放行），但那是运行
+// 故障、必须有人看见 —— 正常的限速拒绝不是故障，逐条打 ALARM 会把告警
+// 淹没成噪声。因此只有非 rate_limited 的失败才响亮告警。
 func (s *Service) reserveRateTx(ctx context.Context, uow domain.UnitOfWork, req domain.Request,
 	requestID string, policy Policy, reservedTokens int64) error {
-	return s.store.ReserveRateTx(ctx, uow, domain.RateReserveCommand{
+	err := s.store.ReserveRateTx(ctx, uow, domain.RateReserveCommand{
 		RequestID:        requestID,
 		BillingAccountID: req.BillingAccountID,
 		APIKeyID:         req.APIKeyID,
@@ -613,6 +619,11 @@ func (s *Service) reserveRateTx(ctx context.Context, uow domain.UnitOfWork, req 
 		Limits:           s.rateLimits(policy),
 		ReservedTokens:   reservedTokens,
 	})
+	if err != nil && domain.CodeOf(err) != domain.CodeRateLimited {
+		log.Printf("ALARM quota: rate limit store unavailable (request=%s account=%s): %v — the admission fails closed (503 service_unavailable; never a single-node fallback)",
+			requestID, req.BillingAccountID, err)
+	}
+	return err
 }
 
 // rateLimits derives the effective business rate limits of one admission.

@@ -959,6 +959,11 @@ type chatContractEnv struct {
 	// output cap (设计 §7.2 不允许无限输出), legacy sends no max_tokens.
 	// Empty = the key must NOT appear.
 	wantMaxTokens string
+	// modelsCapabilitySuffix is the T9 capability tail of the /chat/models
+	// entry. The gateway surface (facade) appends the dispatch-decided
+	// capability description; the legacy picker keeps its original five
+	// fields. Empty = the entry must NOT carry the capability fields.
+	modelsCapabilitySuffix string
 }
 
 func setupChatContractLegacy(t *testing.T, up *chatStubUpstream) *chatContractEnv {
@@ -973,6 +978,8 @@ func setupChatContractLegacy(t *testing.T, up *chatStubUpstream) *chatContractEn
 		defaultModelID: "deepseek-v4-flash", // legacy 目录 id 即上游模型名
 		defaultDisplay: "deepseek-v4-flash",
 		wantMaxTokens:  "",
+		// legacy 的 /chat/models picker 保持既有五个字段（不改它的形状）。
+		modelsCapabilitySuffix: "",
 	}
 }
 
@@ -988,6 +995,13 @@ func setupChatContractFacade(t *testing.T, up *chatStubUpstream) *chatContractEn
 		defaultModelID: "deepseek-chat", // facade 公共模型 id（KAYA_CHAT_MODEL 语义）
 		defaultDisplay: "DeepSeek Chat",
 		wantMaxTokens:  `"max_tokens":8192`,
+		// T9：网关面在既有五个字段之后**追加**能力描述（派发判定 + 上下
+		// 文/输出硬上限）。本 fixture 的部署是 openai_chat（适配层承载工具
+		// 与推理）、路由能力清单为空（= 全部能力），模型只声明 text → 图
+		// 片为 false。
+		modelsCapabilitySuffix: `,"supports_images":false,"supports_tools":true,"supports_thinking":true,` +
+			`"context_tokens":128000,"max_output_tokens":8192,` +
+			`"capability_description":"images: no; tools: yes; thinking: yes; context: 128000 tokens; max output: 8192 tokens"`,
 	}
 }
 
@@ -1491,8 +1505,10 @@ func caseChatContractModels(t *testing.T, env *chatContractEnv) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /chat/models = %d: %s", w.Code, w.Body.String())
 	}
-	want := fmt.Sprintf(`{"code":0,"data":{"models":[{"id":%q,"display_name":%q,"provider":"deepseek","default":true,"input_modalities":["text"]}]}}`,
-		env.defaultModelID, env.defaultDisplay)
+	// T9：网关面（facade）在既有五个字段之后**追加**了能力描述；legacy 的
+	// picker 保持原样。两种后端各自的字节精确形状由 env 给出。
+	want := fmt.Sprintf(`{"code":0,"data":{"models":[{"id":%q,"display_name":%q,"provider":"deepseek","default":true,"input_modalities":["text"]%s}]}}`,
+		env.defaultModelID, env.defaultDisplay, env.modelsCapabilitySuffix)
 	if w.Body.String() != want {
 		t.Errorf("/chat/models body = %s, want byte-exact %s", w.Body.String(), want)
 	}

@@ -200,20 +200,88 @@ func validateBaseURL(raw string) error {
 	return nil
 }
 
-// ValidateRoute checks the route invariants.
+// SupportedPoolStrategy is the ONE pool strategy a route may use: 常规池
+// 只支持 round_robin。least_loaded 与通用 session_sticky 尚未实现 ——
+// 写面明确拒绝（收下它等于「保存后假装生效」：运营以为配了，实际跑的
+// 仍是 round_robin）。
+//
+// 注意：Responses 的 previous_response_id 专用绑定走的是会话绑定器
+// （routing.SessionBinder，按 session key 钉住上游账号），与 route 的
+// pool_strategy 无关 —— 拒绝通用 session_sticky 不影响那条链路。
+const SupportedPoolStrategy = domain.PoolRoundRobin
+
+// knownPoolStrategies are the strategies the system RECOGNIZES. The ones
+// outside the supported set stay LOADABLE from an already-published
+// revision（旧快照必须仍可读，否则整个目录变砖），但它们被标记不可用 ——
+// 绝不静默当成 round_robin。
+var knownPoolStrategies = map[domain.PoolStrategy]bool{
+	domain.PoolRoundRobin:    true,
+	domain.PoolLeastLoaded:   true,
+	domain.PoolSessionSticky: true,
+}
+
+// PoolStrategySupported reports whether a pool strategy is inside the
+// supported set. An empty strategy means "not declared" and is treated as
+// round_robin (the DB column default).
+func PoolStrategySupported(s domain.PoolStrategy) bool {
+	return s == "" || s == SupportedPoolStrategy
+}
+
+// poolStrategyRefusal explains why a pool strategy is refused and what the
+// operator should use instead. It names the replacement so a refusal is
+// actionable in one step.
+func poolStrategyRefusal(s domain.PoolStrategy) string {
+	if knownPoolStrategies[s] {
+		return "pool_strategy " + string(s) + " is not supported: only " + string(SupportedPoolStrategy) +
+			" is implemented — set pool_strategy to " + string(SupportedPoolStrategy)
+	}
+	return "unknown pool strategy: " + string(s) + " (supported: " + string(SupportedPoolStrategy) + ")"
+}
+
+// ValidateRoute checks the route invariants on the WRITE path (operator
+// CRUD, and every other path that funnels a route through this validator).
 func ValidateRoute(r *domain.ModelRoute) error {
+	if err := validateRouteShape(r); err != nil {
+		return err
+	}
+	return validatePoolStrategy(r.PoolStrategy)
+}
+
+// ValidateRouteForRead validates a route loaded from a published snapshot.
+// The KNOWN-but-unsupported strategies stay loadable — an old published
+// revision must remain readable, otherwise the whole catalog bricks on
+// upgrade — while a truly unknown value still fails the parse (不得加载半个
+// 版本). The loaded route is marked unavailable by the snapshot, never
+// dispatched as if it were round_robin.
+func ValidateRouteForRead(r *domain.ModelRoute) error {
+	if err := validateRouteShape(r); err != nil {
+		return err
+	}
+	if knownPoolStrategies[r.PoolStrategy] || r.PoolStrategy == "" {
+		return nil
+	}
+	return domain.NewError(domain.CodeInvalidInput, "unknown pool strategy: "+string(r.PoolStrategy))
+}
+
+// validateRouteShape holds the shape invariants shared by the write and the
+// read path.
+func validateRouteShape(r *domain.ModelRoute) error {
 	if r.ModelID == "" || r.DeploymentID == "" {
 		return domain.NewError(domain.CodeInvalidInput, "model_id and deployment_id are required")
 	}
 	if r.Weight <= 0 {
 		return domain.NewError(domain.CodeInvalidInput, "route weight must be > 0")
 	}
-	switch r.PoolStrategy {
-	case "", domain.PoolRoundRobin, domain.PoolLeastLoaded, domain.PoolSessionSticky:
-	default:
-		return domain.NewError(domain.CodeInvalidInput, "unknown pool strategy: "+string(r.PoolStrategy))
-	}
 	return nil
+}
+
+// validatePoolStrategy is the write-side gate: only the supported set is
+// accepted.
+func validatePoolStrategy(s domain.PoolStrategy) error {
+	if PoolStrategySupported(s) {
+		return nil
+	}
+	return domain.NewError(domain.CodeInvalidInput, poolStrategyRefusal(s))
 }
 
 // ValidateLifecycleTransition reports whether from→to is allowed.
@@ -628,15 +696,18 @@ func drainCatalogForPublish(ctx context.Context, tx PublishTx) (models []domain.
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	if err := validateCatalogForPublish(models, providers, deployments); err != nil {
-		return nil, nil, nil, nil, err
-	}
 	for _, m := range models {
 		rs, err := tx.ListRoutes(ctx, m.ID)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
 		routes = append(routes, rs...)
+	}
+	// 路由也要过闸 —— 与 operator CRUD / 批量导入 / 环境导入同一口径
+	// （pool_strategy 支持集）。校验放在路由抽取之后：路由是发布快照的
+	// 一部分，缺了它就等于发出了一个「跑起来不是配的那个」的版本。
+	if err := validateCatalogForPublish(models, providers, deployments, routes); err != nil {
+		return nil, nil, nil, nil, err
 	}
 	return models, providers, deployments, routes, nil
 }
@@ -727,7 +798,11 @@ func (s *Service) PublishPreview(ctx context.Context) (*PublishPreview, error) {
 // individually valid and cross-references must resolve. Draft/disabled
 // entities are publishable (the snapshot marks them non-routable) — the
 // gate rejects only structurally broken catalogs.
-func validateCatalogForPublish(models []domain.Model, providers []domain.Provider, deployments []domain.Deployment) error {
+//
+// 路由的 pool_strategy 也在这里收口（T7）：与 operator CRUD / 批量导入 /
+// 环境导入共用同一个支持集。发布预演（PublishPreview）走同一个函数，所以
+// 预演与正式发布给出同一个错误 —— 错误里点名对象 ID 与替代配置。
+func validateCatalogForPublish(models []domain.Model, providers []domain.Provider, deployments []domain.Deployment, routes []domain.ModelRoute) error {
 	providerIDs := make(map[string]bool, len(providers))
 	for i := range providers {
 		if err := ValidateProvider(&providers[i]); err != nil {
@@ -750,6 +825,12 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 		if !providerIDs[deployments[i].ProviderID] {
 			return domain.NewError(domain.CodeInvalidInput,
 				"deployment "+deployments[i].ID+" references unknown provider "+deployments[i].ProviderID)
+		}
+	}
+	for i := range routes {
+		if err := ValidateRoute(&routes[i]); err != nil {
+			return domain.NewError(domain.CodeInvalidInput,
+				"route "+routes[i].ID+" is not publishable: "+poolStrategyRefusal(routes[i].PoolStrategy))
 		}
 	}
 	return nil

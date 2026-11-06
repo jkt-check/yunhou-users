@@ -242,6 +242,11 @@ func chatErrorMapping(err error) (int, string) {
 	switch {
 	case errors.Is(err, service.ErrChatNotReady):
 		return http.StatusServiceUnavailable, service.ErrChatNotReady.Error()
+	case errors.Is(err, service.ErrChatConfigUnavailable):
+		// 服务端配置不可用（目录里没有可调度路由 / 策略带未实现的模式）：
+		// 503 + 明确文案，**不承诺 Retry-After** —— 配置不会自愈，重试没有
+		// 意义（与 ErrChatNotReady 的 5s 退避提示严格分开）。
+		return http.StatusServiceUnavailable, service.ErrChatConfigUnavailable.Error()
 	case errors.Is(err, service.ErrChatNotEnabled):
 		return http.StatusNotFound, service.ErrChatNotEnabled.Error()
 	case errors.Is(err, service.ErrChatNoAccess):

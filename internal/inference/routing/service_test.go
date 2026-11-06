@@ -542,3 +542,91 @@ func TestCandidates_ProviderAbsentFromSnapshotIsNotSchedulable(t *testing.T) {
 		t.Fatalf("candidates = [%s], want 0 (provider 不在已发布快照里 → 不可调度)", candidateSummary(cands))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T7 — 配置行为收口：pool_strategy 支持集 + weight 语义
+// ---------------------------------------------------------------------------
+
+// TestCandidates_UnsupportedPoolStrategyIsNotACandidate：存量已发布快照里的
+// 不支持 pool_strategy（least_loaded / 通用 session_sticky）必须被标记
+// 不可用 —— 路由不得把它静默当成 round_robin。
+func TestCandidates_UnsupportedPoolStrategyIsNotACandidate(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}, nil)
+
+	routes := []domain.ModelRoute{
+		{ID: "r-least", ModelID: "m", DeploymentID: "dep-a", Enabled: true, Weight: 1,
+			PoolStrategy: domain.PoolLeastLoaded},
+		{ID: "r-sticky", ModelID: "m", DeploymentID: "dep-b", Enabled: true, Weight: 1,
+			PoolStrategy: domain.PoolSessionSticky},
+		{ID: "r-rr", ModelID: "m", DeploymentID: "dep-c", Enabled: true, Weight: 1,
+			PoolStrategy: domain.PoolRoundRobin},
+	}
+	snap := testSnapshot("m", routes,
+		deployment("dep-a", "prov-a", domain.ProtocolOpenAIChat),
+		deployment("dep-b", "prov-a", domain.ProtocolOpenAIChat),
+		deployment("dep-c", "prov-a", domain.ProtocolOpenAIChat),
+	)
+
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].Route.ID != "r-rr" {
+		t.Fatalf("candidates = [%s], want only the round_robin route (不支持的 pool_strategy 不得静默当 RR)",
+			candidateSummary(cands))
+	}
+}
+
+// TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits：weight 只做
+// 「同 priority 下的候选排序」，不是概率分流 —— 候选一个都不能少。
+func TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}, nil)
+
+	mkDep := func(id string) domain.Deployment {
+		return domain.Deployment{
+			ID: id, ProviderID: "prov-a", UpstreamModel: "up-1",
+			BaseURL: "https://up.example.com", Protocol: domain.ProtocolOpenAIChat,
+			Status: domain.DeploymentActive, ConnectTimeout: time.Second, RequestTimeout: time.Second,
+		}
+	}
+	payload := catalog.BuildCatalogPayload(
+		[]domain.Model{{ID: "m", DisplayName: "M", Lifecycle: domain.LifecycleActive,
+			ContextTokens: 1000, MaxOutputTokens: 100,
+			Protocols:       []domain.Protocol{domain.ProtocolOpenAIChat},
+			InputModalities: []string{"text"}, OutputModalities: []string{"text"}}},
+		[]domain.Provider{{ID: "prov-a", Code: "prov-a", DisplayName: "P",
+			AccessType: domain.AccessOfficialAPI, Status: "active"}},
+		[]domain.Deployment{mkDep("dep-low"), mkDep("dep-mid"), mkDep("dep-high")},
+		[]domain.ModelRoute{
+			{ID: "r-low", ModelID: "m", DeploymentID: "dep-low", Priority: 0, Weight: 1, Enabled: true},
+			{ID: "r-high", ModelID: "m", DeploymentID: "dep-high", Priority: 0, Weight: 10, Enabled: true},
+			{ID: "r-mid", ModelID: "m", DeploymentID: "dep-mid", Priority: 0, Weight: 5, Enabled: true},
+		},
+	)
+	snap, err := catalog.ParseSnapshot(&domain.ConfigRevision{Scope: domain.ScopeCatalog, Revision: 1,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: payload}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 3 {
+		t.Fatalf("candidates = %d, want 3 (weight 只排序,不做概率分流:候选不得被丢)", len(cands))
+	}
+	for i, want := range []string{"r-high", "r-mid", "r-low"} {
+		if cands[i].Route.ID != want {
+			t.Errorf("candidate[%d] = %s, want %s (同 priority 下按 weight 降序)", i, cands[i].Route.ID, want)
+		}
+	}
+}

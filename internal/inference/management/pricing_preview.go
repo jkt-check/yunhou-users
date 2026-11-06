@@ -228,7 +228,7 @@ type PolicyChangePreview struct {
 	RPMLimit         *int
 	TPMLimit         *int64
 	ConcurrencyLimit *int
-	OveragePolicy    string // reject | clamp_if_declared | allow_overage
+	OveragePolicy    string // reject | allow_overage（clamp_if_declared 未实现：存量行仍可读，新写拒绝）
 }
 
 // PolicyChangePreviewResult is the policy impact view.
@@ -270,10 +270,13 @@ func (s *PricingPreviewService) PreviewPolicyChange(ctx context.Context, cmd Pol
 	if cmd.Name == "" {
 		return nil, domain.NewError(domain.CodeInvalidInput, "policy preview: name required")
 	}
+	// T7:预演与正式写共用同一个 overage 支持集 —— clamp_if_declared 未实现,
+	// 预演也不接受(否则预演通过、正式发布被拒,预演就失去意义)。
 	switch cmd.OveragePolicy {
-	case "", "reject", "clamp_if_declared", "allow_overage":
+	case "", "reject", "allow_overage":
 	default:
-		return nil, domain.NewError(domain.CodeInvalidInput, "policy preview: unknown overage_policy")
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"policy preview: "+unsupportedOveragePolicyMessage(cmd.OveragePolicy))
 	}
 	// 模型集合必须真实存在（授权不凭空指向模型）。
 	for _, id := range cmd.ModelIDs {

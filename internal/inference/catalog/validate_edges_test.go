@@ -155,6 +155,36 @@ func TestValidateRoute_Edges(t *testing.T) {
 	}
 }
 
+// T7 — pool_strategy 支持集（写面）：常规池只支持 round_robin；
+// least_loaded 与通用 session_sticky 明确拒绝 —— 不能保存后假装生效
+// （保存即生效的假象比拒绝更坏：运营以为配了，实际跑的是 RR）。
+//
+// 注意：Responses 的 previous_response_id 专用绑定走的是会话绑定器
+// （routing.SessionBinder），与 route 的 pool_strategy 无关 —— 拒绝
+// 通用 session_sticky 不会影响那条链路。
+func TestValidateRoute_PoolStrategySupportedSet(t *testing.T) {
+	for _, ok := range []domain.PoolStrategy{"", domain.PoolRoundRobin} {
+		r := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, PoolStrategy: ok}
+		if err := ValidateRoute(r); err != nil {
+			t.Errorf("write path rejected the supported strategy %q: %v", ok, err)
+		}
+	}
+	for _, bad := range []domain.PoolStrategy{domain.PoolLeastLoaded, domain.PoolSessionSticky, "chaos"} {
+		r := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, PoolStrategy: bad}
+		err := ValidateRoute(r)
+		if err == nil {
+			t.Errorf("write path accepted %q (unsupported pool strategy must be refused, not stored as if it worked)", bad)
+			continue
+		}
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Errorf("%q: code = %v, want invalid_input", bad, domain.CodeOf(err))
+		}
+		if !strings.Contains(err.Error(), string(domain.PoolRoundRobin)) {
+			t.Errorf("%q: the refusal must name the supported replacement: %v", bad, err)
+		}
+	}
+}
+
 func TestParseSnapshot_RejectsHalfVersions(t *testing.T) {
 	// 非 JSON / 缺 schema_version / 半截 payload 全部显式失败（不得加载半
 	// 个版本）。
@@ -214,7 +244,7 @@ func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
 
 	// 各自 alias 互不冲突 → 双侧放行（同一 model 重复列出同一 alias 无害）。
 	ok := []domain.Model{mk("m1", "latest", "latest"), mk("m2", "stable")}
-	if err := validateCatalogForPublish(ok, prov, nil); err != nil {
+	if err := validateCatalogForPublish(ok, prov, nil, nil); err != nil {
 		t.Errorf("distinct aliases rejected by publish gate: %v", err)
 	}
 	if err := parse(ok...); err != nil {
@@ -223,7 +253,7 @@ func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
 
 	// 两个 model 配同一 alias → 双侧拒绝。
 	dup := []domain.Model{mk("m1", "latest"), mk("m2", "latest")}
-	if err := validateCatalogForPublish(dup, prov, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
+	if err := validateCatalogForPublish(dup, prov, nil, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
 		t.Errorf("duplicate alias, publish gate: err = %v, want invalid_input", err)
 	}
 	if err := parse(dup...); err == nil {
@@ -232,7 +262,7 @@ func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
 
 	// alias 等于另一个 model 的 ID → 双侧拒绝。
 	shadow := []domain.Model{mk("m1"), mk("m2", "m1")}
-	if err := validateCatalogForPublish(shadow, prov, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
+	if err := validateCatalogForPublish(shadow, prov, nil, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
 		t.Errorf("alias shadowing a model id, publish gate: err = %v, want invalid_input", err)
 	}
 	if err := parse(shadow...); err == nil {

@@ -289,7 +289,7 @@ type PolicyVersion struct {
 	RPMLimit         *int
 	TPMLimit         *int64
 	ConcurrencyLimit *int
-	OveragePolicy    string // reject | clamp_if_declared | allow_overage
+	OveragePolicy    string // reject | allow_overage（clamp_if_declared 未实现：存量行仍可读，新写拒绝）
 	Status           string // draft | published | retired
 	CreatedAt        time.Time
 	PublishedAt      *time.Time

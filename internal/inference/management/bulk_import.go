@@ -313,9 +313,21 @@ func (s *BulkImportService) validateDocument(ctx context.Context, doc *BulkCatal
 			}
 			seen[key] = true
 			items = append(items, item)
-			items = append(items, BulkItemResult{
+			// 派生路由（priority 0 / weight 1 / round_robin / enabled）必须
+			// 过共享校验器 —— 与 operator CRUD / 环境导入 / 正式 publish 同
+			// 一个 pool_strategy 支持集（常规池仅 round_robin）。派生值本身
+			// 恒合法，这一步是「导入路径不许绕过共享闸」的护栏。
+			routeItem := BulkItemResult{
 				Kind: BulkKindRoute, NaturalKey: m.ID + "|" + key, Status: BulkItemWouldInsert,
-			})
+			}
+			derived := domain.ModelRoute{
+				ModelID: m.ID, DeploymentID: "pending", // 部署 ID 在提交时解析
+				Weight: 1, Enabled: true, PoolStrategy: domain.PoolRoundRobin,
+			}
+			if err := catalog.ValidateRoute(&derived); err != nil {
+				routeItem.Status, routeItem.Error = BulkItemError, err.Error()
+			}
+			items = append(items, routeItem)
 		}
 	}
 	return items

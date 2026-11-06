@@ -97,6 +97,12 @@ var (
 	// ErrChatNotReady: 服务未就绪（目录冷启动无快照 / 默认模型未发布）。
 	// 映射 503 + Retry-After，与 403（无权限）严格区分。
 	ErrChatNotReady = errors.New("chat service is temporarily unavailable")
+	// ErrChatConfigUnavailable: 服务端**配置**不可用（已发布目录里该模型
+	// 没有可调度路由、权益策略带未实现的超额模式……）。它与
+	// ErrChatUpstreamError（上游临时故障）和 ErrChatNotReady（目录未就绪）
+	// 严格分开：配置错误**不会自己恢复**，重试没有意义，因此不承诺
+	// Retry-After（T7）。
+	ErrChatConfigUnavailable = errors.New("chat configuration unavailable")
 
 	// Usage analytics (/user/usage/heartbeat + /admin/stats/*). Wrapped
 	// with a detail message (fmt.Errorf %w); handlers map it to 400.

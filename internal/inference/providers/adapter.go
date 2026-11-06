@@ -202,6 +202,11 @@ func IsCanceled(err error) bool {
 // classifyTransport splits a transport error into definitely-not-executed
 // (DNS failure, connection refused — the request never reached a server)
 // vs unknown-execution (timeout/reset after the request may have left).
+//
+// T7 口径：建连超时（deployment.connect_timeout 到期）也归入 unknown —
+// 传输层无法区分「连接没建成」与「请求已出去但答复没回来」，而仓库的
+// 核心约束是「不确定是否已执行的上游请求不得盲目重放」。因此建连超时
+// 的请求进核对（保留预占），不切换候选。
 func classifyTransport(err error) (executedUnknown bool) {
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
@@ -251,15 +256,32 @@ type egressDialer interface {
 // Authorization/Cookie，x-api-key 与 operator 扩展头会被逐字拷给新主机，
 // 307/308 还会重发完整请求体（客户 prompt）。返回 ErrUseLastResponse 让
 // 3xx 响应体作为上游错误 surfaced（Dispatch 按非 200 处理）。
+//
+// T7：建连阶段由 deployment.connect_timeout 控制 —— 拨号函数按 ctx 上的
+// 建连预算现算一个只覆盖「建连」的截止时间（DNS + TCP connect）。已建立
+// 的连接不受它约束（SSE 长流不被截断），请求总时长仍由
+// deployment.request_timeout 决定（网关在 attemptCtx 上施加）。
+// transport 是共享的**一个**（一个连接池）：绝不每请求新建 transport ——
+// 那会按请求速率泄漏连接池。
 func NewHTTPClient(egress EgressChecker) *http.Client {
-	dial := (&net.Dialer{
-		Timeout:   10 * time.Second,
+	baseDial := (&net.Dialer{
 		KeepAlive: 30 * time.Second,
 	}).DialContext
 	if egress != nil {
 		if ed, ok := egress.(egressDialer); ok {
-			dial = ed.DialContext
+			baseDial = ed.DialContext
 		}
+	}
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		timeout := domain.ConnectTimeoutFrom(ctx)
+		if timeout <= 0 {
+			timeout = domain.DefaultConnectTimeout
+		}
+		// 拨号 ctx 只在「建连」期间有效：拨号返回后立刻取消（返回的 conn
+		// 与 ctx 无绑定），已建立的流不受影响。
+		dctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return baseDial(dctx, network, addr)
 	}
 	c := &http.Client{Transport: &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
@@ -307,6 +329,10 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	if err != nil {
 		return nil, err
 	}
+	// T7：把 deployment 的建连预算挂到 ctx 上 —— transport 的拨号阶段按它
+	// 现算一个只覆盖「建连」的截止时间。已建立的流不受它约束（请求总
+	// 时长由网关的 request_timeout 决定）。
+	ctx = domain.WithConnectTimeout(ctx, call.Deployment.ConnectTimeout)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, EndpointURL(call.Deployment), bytes.NewReader(payload))
 	if err != nil {
 		return nil, domain.WrapError(domain.CodeInternal, "providers: build upstream request", err)

@@ -2929,6 +2929,45 @@ separate symbol field):
 | Business rate / concurrency / quota / balance | `{"code":429,"data":null,"message":"chat request rejected by a usage limit (<rate_limited|insufficient_capacity|quota_exceeded|insufficient_balance>)"}` |
 | Upstream 429 | `{"code":429,"data":null,"message":"chat upstream rate limit exceeded"}` — **byte-identical to legacy** |
 
+#### 4.27.1 One run failed for an environmental reason (recorded, not hidden)
+
+A **later** re-run of the same suite (the one that re-measured the skip
+inventory) reported `20` `--- FAIL` lines **and** the trap printed
+`[cleanup] pg_ctl stop non-zero` — i.e. the disposable PostgreSQL instance
+was **gone** while the tests were running. The host was under heavy
+memory/swap pressure at that moment (a concurrent `cargo test --workspace`
+from an unrelated project; `vm.swapusage` showed 17.3 GiB of 18.9 GiB used
+and the data volume at 98%), and the disposable instance died with it.
+
+The suite was immediately re-run on a **fresh** instance (this time keeping
+the PostgreSQL server log for diagnosis):
+
+```
+ok  	github.com/yunhou/users/internal/inference/access	1.743s
+ok  	github.com/yunhou/users/internal/inference/accounting	1.693s
+ok  	github.com/yunhou/users/internal/inference/catalog	3.835s
+ok  	github.com/yunhou/users/internal/inference/credentials	2.116s
+ok  	github.com/yunhou/users/internal/inference/domain	1.748s
+ok  	github.com/yunhou/users/internal/inference/gateway	13.919s
+ok  	github.com/yunhou/users/internal/inference/httpapi	79.741s
+ok  	github.com/yunhou/users/internal/inference/management	2.080s
+ok  	github.com/yunhou/users/internal/inference/postgres	21.073s
+ok  	github.com/yunhou/users/internal/inference/providers	2.414s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	1.754s
+ok  	github.com/yunhou/users/internal/inference/quota	1.677s
+ok  	github.com/yunhou/users/internal/inference/routing	2.189s
+ok  	github.com/yunhou/users/internal/inference/workers	10.304s
+[cleanup] pg_ctl stop ok
+```
+
+**0 `FAIL` lines.** The preserved `server.log` contains only the expected
+constraint violations of the tests that exercise error paths (duplicate
+`inference_entitlements`, `inference_wallet_entries`, a provider FK
+violation, …) — no crash, no restart, no `PANIC`. Conclusion: the 20 FAIL
+lines were the **database dying**, not a code regression. The authoritative
+green numbers for T7 are the ones in §4.25 (command #14) and in this
+re-run.
+
 #### 4.28 Skips
 
 | # | Skipped test | Package | Reason | Lost coverage? |
@@ -2977,6 +3016,22 @@ there since migration 025. The disposable databases were migrated with
 | `docs/api-integration-guide.md` | a new `/v1` error-shape + `Retry-After` section; the `/chat` error table gains the four local-limit rows and the retry guidance |
 | `CLAUDE.md` | the API-response-format exceptions now name the `/v1/*` native shapes (including the generic middleware's rejection) |
 | `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md` | the T6 section backfills the actual signatures (same convention as T4/T5) |
+
+#### 4.30.1 Commit
+
+| Item | Value |
+|---|---|
+| Subject | `fix(inference): converge the configuration support sets and wire the connect timeout` |
+| Parent | `9ffbe85bb51f9775193adb4a45f1faf287ecef20` (the T6 branch tip) |
+| Change set | 34 files changed, 1700 insertions(+), 49 deletions(-) |
+| Staging | `git add <explicit file list>` — **never** `git add .` |
+| Push / merge / deploy | **none** (local commit only; no adjacent repository touched) |
+| Own SHA | recorded in the task report (`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-7-report.md`) — a runbook naming its own commit SHA would be circular, and the report file is not tracked |
+
+The acceptance command (#13) was re-run **on the committed tree** after the
+commit (worktree clean, `HEAD` = the T7 commit): 6 packages `ok`, exit **0**
+(`catalog` 3.518s / `management` 1.936s / `providers` 2.587s /
+`providers/connector` 1.693s / `routing` 2.032s / `gateway` 13.085s).
 
 #### 4.31 Notes (root cause, compatibility, honesty)
 
@@ -3045,12 +3100,272 @@ there since migration 025. The disposable databases were migrated with
 
 ### T7 — Configuration-behaviour convergence and connect timeouts
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `9ffbe85` (T6 branch tip). Task report:
+`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-7-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`; every
+database-backed command used `-p 1` and `-race`; `go.mod` / `go.sum` were
+never modified (`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.25 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1 / run 2, `t7_app`) | **0** / **0** | `applied=53 skipped=0` → `applied=0 skipped=53` (idempotent) |
+| 4 | `go run ./cmd/migrate -status` | **0** | 53 × `✅` |
+| 5 | `DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate` | **0** | e2e-side DB migrated before the e2e job (`applied=53 skipped=0`) |
+| 6 | **RED** `go test -count=1 -run 'TestValidateRoute_PoolStrategySupportedSet' -v ./internal/inference/catalog` | **1** | the write path accepted `least_loaded` / `session_sticky` — see §4.26 |
+| 7 | **RED** `go test -count=1 -run 'TestPublishedSnapshot_LegacyPoolStrategy\|TestPublish_RejectsUnsupportedPoolStrategy' -v ./internal/inference/catalog` | **1** | the legacy route was a dispatchable deployment and publish accepted it |
+| 8 | **RED** `go test -count=1 -run 'TestCandidates_UnsupportedPoolStrategyIsNotACandidate' -v ./internal/inference/routing` | **1** | the legacy route produced candidates (silently round-robin) |
+| 9 | **RED** `go test -count=1 -run 'TestQuotaPolicy_ClampIfDeclaredRejectedOnWrite' -v ./internal/inference/management` | **1** | the write path accepted `clamp_if_declared` |
+| 10 | **RED** `go test -count=1 -run 'TestDispatch_ConnectTimeout' -v ./internal/inference/providers` | **1** | `connect_timeout` did not bound the dial at all |
+| 11 | **RED** `DATABASE_URL=<disposable> go test -count=1 -run 'TestGateway_UnsupportedPoolStrategy\|TestGateway_ClampIfDeclaredPolicy' -v ./internal/inference/gateway` | **1** | both configuration errors were silently ignored (the call succeeded) |
+| 12 | **GREEN** the same commands as #6–#11 | **0** | all T7 cases pass |
+| 13 | **acceptance（任务书原文）** `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/management ./internal/inference/providers/... ./internal/inference/routing ./internal/inference/gateway` | **0** | 6 packages `ok` (catalog 17.459s / management 2.515s / providers 2.676s / providers/connector 2.500s / routing 3.052s / gateway 41.447s) |
+| 14 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, **1032 PASS / 1 SKIP / 0 FAIL** |
+| 15 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 35 PASS / 2 SKIP / 0 FAIL |
+| 16 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 17 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T6 80.3%, T0 80.4%) |
+| 18 | `E2E_DATABASE_URL=<disposable> go test -race -count=1 ./tests/e2e/...` | **0** | `ok github.com/yunhou/users/tests/e2e 449.247s` |
+| 19 | `go test -race -count=1 -run 'TestMapGatewayError' -v ./internal/service` | **0** | the legacy `/chat` facade maps the configuration error to its own class |
+
+#### 4.26 RED evidence (before any production edit)
+
+Command #6 ran against the **unmodified** production code at `9ffbe85`; the
+new tests were written against the *existing* API surface only, so every
+failure is a behavioural assertion failure, never a compile error.
+
+```
+=== RUN   TestValidateRoute_PoolStrategySupportedSet
+    validate_edges_test.go:176: write path accepted "least_loaded" (unsupported pool strategy must be refused, not stored as if it worked)
+    validate_edges_test.go:176: write path accepted "session_sticky" (unsupported pool strategy must be refused, not stored as if it worked)
+    validate_edges_test.go:183: "chaos": the refusal must name the supported replacement: inference/invalid_input: unknown pool strategy: chaos
+--- FAIL: TestValidateRoute_PoolStrategySupportedSet (0.00s)
+FAIL	github.com/yunhou/users/internal/inference/catalog	0.820s
+```
+
+```
+=== RUN   TestPublishedSnapshot_LegacyPoolStrategyStaysReadableButUnavailable
+    pool_strategy_test.go:60: least_loaded: ActiveDeployments = [{ID:d1 ... Status:active ...}], want 0 (unsupported pool strategy is not a dispatchable deployment)
+    pool_strategy_test.go:60: session_sticky: ActiveDeployments = [{ID:d1 ... Status:active ...}], want 0 (unsupported pool strategy is not a dispatchable deployment)
+--- FAIL: TestPublishedSnapshot_LegacyPoolStrategyStaysReadableButUnavailable (0.00s)
+=== RUN   TestPublish_RejectsUnsupportedPoolStrategyAndNamesTheObject
+    pool_strategy_test.go:103: publish must refuse an unsupported pool strategy
+--- FAIL: TestPublish_RejectsUnsupportedPoolStrategyAndNamesTheObject (0.05s)
+```
+
+```
+=== RUN   TestCandidates_UnsupportedPoolStrategyIsNotACandidate
+    service_test.go:579: candidates = [prov-a/acct-1,prov-a/acct-1,prov-a/acct-1], want only the round_robin route (不支持的 pool_strategy 不得静默当 RR)
+--- FAIL: TestCandidates_UnsupportedPoolStrategyIsNotACandidate (0.00s)
+```
+
+```
+=== RUN   TestQuotaPolicy_ClampIfDeclaredRejectedOnWrite
+    quota_policies_test.go:391: create must refuse the unimplemented clamp_if_declared overage policy
+--- FAIL: TestQuotaPolicy_ClampIfDeclaredRejectedOnWrite (0.00s)
+```
+
+```
+=== RUN   TestDispatch_ConnectTimeoutBoundsConnectionEstablishment
+    adapter_dispatch_test.go:476: a connect timeout must fail the dispatch
+--- FAIL: TestDispatch_ConnectTimeoutBoundsConnectionEstablishment (0.15s)
+```
+
+(0.15 s = the dialer's deliberate 150 ms sleep: `connect_timeout=30ms` had no
+effect whatsoever — the field was a dead letter.)
+
+```
+=== RUN   TestGateway_UnsupportedPoolStrategyFailsBeforeAdmission
+    config_errors_test.go:66: an unsupported pool strategy must fail the call with a configuration error
+--- FAIL: TestGateway_UnsupportedPoolStrategyFailsBeforeAdmission (0.07s)
+=== RUN   TestGateway_ClampIfDeclaredPolicyFailsClearly
+    config_errors_test.go:107: a policy with the unimplemented clamp_if_declared mode must fail the call
+--- FAIL: TestGateway_ClampIfDeclaredPolicyFailsClearly (0.06s)
+```
+
+**Protection evidence (already-correct behaviour, recorded instead of a
+forced change).** These passed at the pre-fix baseline and are guards, not
+new behaviour:
+
+| Case | Guard that already held |
+|---|---|
+| `TestImportEnvCatalog_DerivedRouteUsesSupportedPoolStrategy` | the env import already derives `round_robin` routes |
+| `TestPublish_SupportedPoolStrategyStillPublishes` | a supported catalog still publishes (the new gate must not block it) |
+| `TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits` | `weight` is **ordering within one priority**, never a probabilistic split — every candidate stays in the list |
+| `TestBulkImport_DerivedRouteStaysInsideTheSupportedPoolStrategySet` | the bulk import's derived route is valid |
+| `TestQuotaPolicy_LegacyClampIfDeclaredStaysQueryable` | a legacy policy row stays queryable (the read side never rewrites it) |
+| `TestDispatch_ConnectTimeoutDoesNotTruncateEstablishedStream` | an established SSE stream is not truncated by the connect budget |
+| `TestSlowUpstream_TimeoutHoldsForReconciliation` (pre-existing) | the **overall request timeout** (`request_timeout`) still bounds the whole request: unknown execution → the hold is kept and the request is parked |
+| `TestExecutedUnknown_NoBlindReplay` (pre-existing) | an **unknown execution state is never blindly replayed** on the next candidate |
+
+#### 4.27 GREEN evidence
+
+Command #12 (the same cases, production code fixed) — exit code **0**:
+
+```
+--- PASS: TestValidateRoute_PoolStrategySupportedSet (0.00s)
+--- PASS: TestImportEnvCatalog_DerivedRouteUsesSupportedPoolStrategy (0.11s)
+--- PASS: TestPublishedSnapshot_LegacyPoolStrategyStaysReadableButUnavailable (0.00s)
+--- PASS: TestPublish_RejectsUnsupportedPoolStrategyAndNamesTheObject (0.16s)
+--- PASS: TestPublish_SupportedPoolStrategyStillPublishes (0.16s)
+ok  	github.com/yunhou/users/internal/inference/catalog	2.176s
+--- PASS: TestCandidates_UnsupportedPoolStrategyIsNotACandidate (0.00s)
+--- PASS: TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits (0.00s)
+ok  	github.com/yunhou/users/internal/inference/routing	1.787s
+--- PASS: TestBulkImport_DerivedRouteStaysInsideTheSupportedPoolStrategySet (0.00s)
+--- PASS: TestQuotaPolicy_ClampIfDeclaredRejectedOnWrite (0.00s)
+--- PASS: TestQuotaPolicy_LegacyClampIfDeclaredStaysQueryable (0.00s)
+ok  	github.com/yunhou/users/internal/inference/management	1.956s
+--- PASS: TestDispatch_ConnectTimeoutBoundsConnectionEstablishment (0.20s)
+--- PASS: TestDispatch_ConnectTimeoutDoesNotTruncateEstablishedStream (0.31s)
+--- PASS: TestDispatch_ConnectTimeoutIsUnknownExecution (0.04s)
+ok  	github.com/yunhou/users/internal/inference/providers	2.355s
+--- PASS: TestGateway_UnsupportedPoolStrategyFailsBeforeAdmission (0.15s)
+--- PASS: TestGateway_DisabledLegacyRouteDoesNotBlockTheCall (0.17s)
+--- PASS: TestGateway_ClampIfDeclaredPolicyFailsClearly (0.19s)
+ok  	github.com/yunhou/users/internal/inference/gateway	2.324s
+--- PASS: TestApplyBulkImportTx_DerivedRouteUsesSupportedPoolStrategy (0.07s)
+ok  	github.com/yunhou/users/internal/inference/postgres	1.801s
+--- PASS: TestMapGatewayError_UpstreamRejectionMatchesLegacyClassification (0.00s)
+--- PASS: TestMapGatewayError_LocalLimitsAreNotUpstreamErrors (0.00s)
+--- PASS: TestMapGatewayError_UnpricedCapabilityIsUpstreamError (0.00s)
+ok  	github.com/yunhou/users/internal/service	3.286s
+```
+
+Acceptance command #13 (the brief's exact command) — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/catalog	17.459s
+ok  	github.com/yunhou/users/internal/inference/management	2.515s
+ok  	github.com/yunhou/users/internal/inference/providers	2.676s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	2.500s
+ok  	github.com/yunhou/users/internal/inference/routing	3.052s
+ok  	github.com/yunhou/users/internal/inference/gateway	41.447s
+```
+
+#### 4.28 Skips
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1`. The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+
+**Database-test skips: 0** — identical to the T0 (§2.6), T1 (§4.4), T2
+(§4.12), T3 (§4.20), T5 and T6 inventories; grepping the skip lines for
+`postgres` / `no database` / `database unavailable` returns nothing.
+
+#### 4.29 Migration
+
+**One appended migration:
+`migrations/053_inference_route_pool_strategy_comments.sql`** (53 = the
+re-checked latest number; 052 was the T6 baseline). It only re-states the
+`COMMENT ON COLUMN` of `inference_model_routes.priority` /
+`.weight` / `.account_pool_strategy` — the old comment said
+「同优先级按 weight 加权」, which reads as a *probabilistic* split, while the
+implementation is a deterministic ordering within one priority group. No
+column type, no CHECK and no historical row is touched: the DB CHECK still
+admits the legacy `least_loaded` / `session_sticky` values (those rows must
+remain storable — they are the legacy data the read path has to survive).
+
+Evidence: `go run ./cmd/migrate` (run 1) → `applied=53 skipped=0`;
+(run 2) → `applied=0 skipped=53`; `go run ./cmd/migrate -status` → 53 × `✅`;
+the e2e-side disposable database was migrated the same way.
+
+#### 4.30 Files changed
+
+| File | Change |
+|---|---|
+| `internal/inference/domain/connect_timeout.go` | **new** — the cross-package carrier of the connect budget (a context **value**, because `net/http` strips the request deadline before dialing but keeps the values) |
+| `internal/inference/domain/model.go` | `ModelRoute.Priority` / `.Weight` / `.PoolStrategy` semantics in comments |
+| `internal/inference/catalog/service.go` | the supported set (`SupportedPoolStrategy`, `PoolStrategySupported`, `poolStrategyRefusal`), `ValidateRoute` (write) vs `ValidateRouteForRead` (read), and the publish gate now validates the routes and names the object ID + the replacement |
+| `internal/inference/catalog/revision.go` | `ParseSnapshot` uses the read validator; `ActiveDeployments` skips unsupported routes; `UnsupportedPoolStrategyRoutes` / `PoolStrategyDispatchBlock` |
+| `internal/inference/catalog/import.go` | the env-import derived route goes through the shared validator |
+| `internal/inference/management/bulk_import.go` | the bulk-import derived route goes through the shared validator |
+| `internal/inference/management/quota_policies.go` | the write side refuses `clamp_if_declared` (create **and** update) and names the migration targets |
+| `internal/inference/management/pricing_preview.go` | the preview shares the same overage support set |
+| `internal/inference/routing/service.go` | the candidate filter skips unsupported routes; comments aligned |
+| `internal/inference/providers/adapter.go` | the connect budget is wired into the shared transport (one transport, one connection pool — never a per-request transport); `Dispatch` carries the budget; the `classifyTransport` comment records the conservative verdict |
+| `internal/inference/credentials/egress.go` | the outbound dialer reads the same budget (the DNS/IP validation itself is unchanged) |
+| `internal/inference/gateway/service.go` | the configuration error before admission/dispatch + the alarm + the `clamp_if_declared` refusal + the typed `ErrConfigUnavailable` |
+| `internal/inference/gateway/config_alert.go` | **new** — the legacy-dirty-config alarm channel (structured log + `AuditAlertHook`) |
+| `internal/service/errors.go`, `internal/service/chat_facade.go`, `internal/handler/chat.go` | the legacy `/chat` surface reports the configuration error as 503 `chat configuration unavailable` (no `Retry-After` promise) instead of a generic upstream error |
+| `internal/inference/postgres/pricing_repo.go` | the overage-policy comment |
+| `migrations/053_inference_route_pool_strategy_comments.sql` | **new** (appended) — the three column comments |
+| `docs/api/kaya-coding-plan.openapi.yaml` | the 503 semantics, the bulk-import / quota-policy-preview supported sets; version 0.13.0 → 0.14.0 |
+| `docs/api-integration-guide.md` | the customer-visible configuration errors (`/v1/*` and `/chat`) |
+| `docs/runbooks/kaya-coding-plan-operations.md` | the new「配置支持集（T7）」section (pool_strategy / weight / overage_policy / the deployment timeouts, incl. the manual migration steps) |
+| `docs/api/kaya-coding-plan-website-handoff.md` | the version reference (0.13.0 → 0.14.0) |
+| `internal/inference/catalog/validate_edges_test.go`, `catalog/pool_strategy_test.go` (**new**), `catalog/import_test.go` | the pool-strategy support-set cases |
+| `internal/inference/management/quota_policies_test.go`, `management/bulk_import_test.go`, `postgres/bulk_import_repo_test.go` | the overage-mode and the bulk-import cases |
+| `internal/inference/routing/service_test.go` | the routing cases (unsupported route / weight ordering) |
+| `internal/inference/providers/adapter_dispatch_test.go` | the connect-timeout cases (distinct timeouts, long stream, unknown execution) |
+| `internal/inference/gateway/config_errors_test.go` (**new**), `gateway/gateway_test.go` | the gateway cases (configuration error before admission, the disabled legacy route, the overage-mode refusal) + one fixture option |
+
+#### 4.31 Notes (root cause, compatibility, honesty)
+
+- **Root cause (three「配置收下但没兑现」+ one「配置没接线」).**
+  (1) `catalog.ValidateRoute` accepted `least_robin`/`least_loaded`/
+  `session_sticky` while **no runtime code ever read `route.PoolStrategy`** —
+  an unimplemented strategy was saved, published and then silently executed
+  as round-robin. (2) `overage_policy=clamp_if_declared` was accepted by the
+  write side while the runtime treats it as `reject` — the customer's quota
+  semantics changed silently. (3) the DB column comment said「同优先级按
+  weight 加权」while the implementation is a deterministic ordering.
+  (4) `deployment.connect_timeout` was validated, stored, published and
+  imported — and **never used**: the shared client hard-coded a 10 s dial
+  timeout, so the field was a dead letter.
+- **One supported set, five write paths.** Operator CRUD, bulk import, env
+  import, publish and publish-preview all funnel through
+  `catalog.ValidateRoute`; the two import paths derive `round_robin` routes
+  and validate them through the same gate. The Responses
+  `previous_response_id` binding is untouched — it rides the session binder
+  (`routing.SessionBinder`), not the route's pool strategy.
+- **Legacy published snapshots stay readable.** The read path accepts the
+  known-but-unsupported values (a truly unknown value still fails the
+  parse — 「不得加载半个版本」). Such a route is marked **unavailable**:
+  it is not a candidate, it is not an active deployment (the model list and
+  the dispatch path agree), it raises an alarm, and when it is the model's
+  only **enabled** route the call fails with a configuration error **before
+  the reservation** (zero hold, zero upstream call, zero billing).
+- **`weight` keeps its ordering semantics** — the code comments, the schema
+  comment (migration 053) and the operations runbook now say the same thing:
+  ordering inside one priority group, never a probabilistic split.
+- **The connect budget covers connection establishment only.** It travels as
+  a context **value** (net/http drops the request deadline before dialing
+  but keeps the values — Go 1.27 `transport.go` `getConn`), the dialer turns
+  it into a deadline that covers DNS + TCP connect, and the deadline is
+  cancelled as soon as the dial returns — an established SSE stream is never
+  truncated by it. The **transport is shared** (one connection pool): a
+  per-request transport would leak a pool per request. The outbound DNS/IP
+  validation and the cross-origin redirect ban are untouched.
+- **A connect timeout is still classified as unknown-execution** (recorded,
+  not forced): the transport cannot tell "the connection was never
+  established" from "the request left the box", and the repository's core
+  money-safety rule is「不确定是否已执行的上游请求不得盲目重放」. The
+  consequence is documented for operators (a too-small `connect_timeout`
+  parks the request for reconciliation instead of failing over) — changing
+  the execution verdict is a separate task, not a timeout change.
+- **Compatibility.** Two new customer-visible 503s (the `/v1/*` surfaces and
+  the legacy `/chat` surface), 400s on the operator writes, one appended
+  comment-only migration, and the OpenAPI bumped 0.13.0 → 0.14.0. No
+  client-visible field, enum or request shape changed; no new dependency;
+  T1 (auth), T2 (settlement), T3 (provider filtering), T4 (rate admission),
+  T5 (leases) and T6 (protocol errors) are untouched.
+- **Pre-existing flaky test (not introduced by T7, not fixed here).**
+  `internal/inference/gateway`'s `TestNonStreamDispatch_RenewsAccountLease`
+  sets the lease TTL to 50 ms, so the acquire→check database round trip can
+  exceed it (`lease: expired`). It reproduced on the **unmodified** base
+  `9ffbe85` as well (a separate `git worktree` of the base commit, the
+  gateway package three times: 1 failure), therefore it is not a T7
+  regression — recorded per the「不修无关缺陷」rule.
 
 ### T8 — Capability routing and protocol truthfulness
 

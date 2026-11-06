@@ -12,6 +12,7 @@ import (
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/gateway"
 	"github.com/yunhou/users/internal/inference/providers"
 	"github.com/yunhou/users/internal/model"
 )
@@ -368,6 +369,11 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 			&providers.DispatchError{StatusCode: 500, Body: `{"error":{"message":"boom"}}`}), ErrChatUpstreamError},
 		{"upstream_transport", domain.WrapError(domain.CodeUpstreamUnavailable, "all compatible upstreams failed",
 			&providers.DispatchError{Err: errors.New("connection refused")}), ErrChatUpstreamError},
+		// T7:服务端**配置**不可用（已发布目录里该模型没有可调度路由、权益
+		// 策略带未实现的超额模式……）→ 明确文案，不是「上游错误」，也不
+		// 承诺重试（配置不会自愈）。
+		{"config_unavailable", &gateway.ErrConfigUnavailable{Err: domain.NewError(domain.CodeUpstreamUnavailable,
+			"model m has no dispatchable route")}, ErrChatConfigUnavailable},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

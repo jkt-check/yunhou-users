@@ -2,7 +2,7 @@
 
 对应实现：`internal/inference/management/{bulk_import,pricing_preview,operations}.go`、
 `internal/inference/httpapi/{admin_bulk,admin_usage}.go`、`admin_adjustments.go`（Task 14 建、
-本任务扩展）。API 契约：`docs/api/kaya-coding-plan.openapi.yaml`（0.13.0）。
+本任务扩展）。API 契约：`docs/api/kaya-coding-plan.openapi.yaml`（0.14.0）。
 
 ## 权限矩阵（server 端强制，自报无效）
 
@@ -168,3 +168,91 @@ SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
 - 客户端侧契约（parts 数组、≤4 张、单张 ≤1 MiB wire、合计 ≤3 MiB、
   magic bytes 校验）见 `docs/api-integration-guide.md`「Chat 接口」；
   `/v1/*` 对外协议面本期仍显式拒绝多模态（后续工作）。
+
+## 配置支持集（T7：只支持已实现的那部分）
+
+本期口径是**明确支持集 + 拒绝不支持的配置**：不实现的能力不收下（收下就是
+「保存后假装生效」—— 运营以为配了，实际跑的是别的行为）。下面三处是运营会
+碰到「配了但没生效/被拒」的入口。
+
+### `pool_strategy`（路由的账号池策略）
+
+| 写面 | 口径 |
+|---|---|
+| `POST/PATCH /admin/routes`（operator CRUD） | 只接受 `round_robin`；`least_loaded` / 通用 `session_sticky` **明确 400**（错误点名替代配置 `round_robin`） |
+| `POST /admin/catalog/bulk-import`（批量导入） | 派生路由恒为 `round_robin`（文档里没有 pool_strategy 字段 —— 严格解码会拒绝未知字段） |
+| `INFERENCE_CATALOG_JSON`（环境导入） | 派生路由恒为 `round_robin` |
+| `POST /admin/catalog/publish`（正式发布） | 发布闸与上面同一口径：**拒绝**并点名路由 ID 与替代配置；`?dry_run=1` 的发布预演给出同一个错误 |
+
+**存量已发布快照里的不支持值**：旧快照**仍可读**（读不出来整个目录就变砖），
+但该路由被标记为**不可调度** —— 绝不静默当成 `round_robin`：
+
+- 模型还有其它可调度路由 → 正常服务，只是那条路由不参与调度；运维侧收到
+  告警（结构化日志 `UNSUPPORTED_POOL_STRATEGY` + `AUDIT_ALERT` 通道，动作
+  `model.route.pool_strategy_unsupported`）。
+- 模型的**全部**路由都不支持 → 客户请求在**预占/派发前**失败：HTTP 503
+  `upstream_unavailable`（Anthropic 面 529），message 点名路由与替代配置；
+  零预占、零出站、零计费。
+
+**Responses 的 `previous_response_id` 会话链不受影响**：那条链路走的是会话
+绑定器（`routing.SessionBinder`，按 session key 钉住上游账号），与路由的
+`pool_strategy` 是两件事。
+
+**修法**：把该路由的 `pool_strategy` 改成 `round_robin`（`PATCH /admin/routes/:id`），
+再 `POST /admin/catalog/publish`。发布预演（`?dry_run=1`）会先告诉你哪条路由
+不合格。
+
+**客户面看到的**：`/v1/*` 是 503（`upstream_unavailable` / `service_unavailable`，
+message 点名配置）；legacy `/chat` 是 503 `chat configuration unavailable`
+（**不带 `Retry-After`** —— 配置不会自愈，重试没有意义）。两者都在预占前
+失败：零计费、零出站。
+
+### `weight`（同 priority 下的候选排序，不是比例分流）
+
+`weight` 只决定**同 `priority` 组内**的候选顺序（降序）。它**不是**概率分流：
+组内每个候选都留在候选列表里，只是顺序不同（本期不做比例分流）。`priority`
+决定分组（数字小者优先 = failover 顺序）。
+
+### `overage_policy`（配额策略的超额模式）
+
+| 值 | 口径 |
+|---|---|
+| `reject` | 额度耗尽即停（默认） |
+| `allow_overage` | 允许套餐外消费（走钱包，需客户显式开启） |
+| `clamp_if_declared` | **未实现** —— 依赖客户端「显式声明允许钳制」的协议字段，本期协议层没有该字段。**新写一律拒绝**（400，错误点名 `reject` / `allow_overage` 两个可迁移目标） |
+
+**存量策略行仍可查询**（`GET /admin/quota-policies`、详情页照常返回原值）——
+读面不做隐式改写，**也不自动迁移旧策略**。新推理引用到该模式时会明确报
+「策略配置不可用」（HTTP 503 `service_unavailable`，message 点名策略名与
+版本），**绝不静默当 `reject`**（那会悄悄改变客户的额度语义）。
+
+**人工迁移步骤**（不自动改旧策略）：
+
+1. `GET /admin/quota-policies?name=<name>` 找到仍在使用 `clamp_if_declared` 的
+   已发布版本（`overage_policy` 字段）。
+2. `POST /admin/quota-policies` 用**同一个 name** 出一个新 draft，把
+   `overage_policy` 改成 `reject`（保持客户语义）或 `allow_overage`（若客户
+   已开启钱包），其余限制项照抄。
+3. `POST /admin/quota-policies/:id/publish` 发布新版本（旧 published 自动转
+   superseded）。
+4. 既有权益**钉住**它们发放时的策略版本 —— 已发放的权益继续按旧版本执行，
+   新发放的权益用新版本。老版本要收口时用 `POST /admin/quota-policies/:id/retire`
+   （有活跃权益引用时默认 409，`?force=true` 放行）。
+
+### 部署超时：`connect_timeout` 与 `request_timeout`
+
+| 字段 | 管什么 | 不管什么 |
+|---|---|---|
+| `connect_timeout` | **建连阶段**：DNS 解析 + TCP 建连的上限 | 已建立的连接（长 SSE 流不被它截断） |
+| `request_timeout` | 请求**总时长**（整条响应/流的上限） | 建连之外的调度细节 |
+
+- 两者都在部署写入时校验为正数；`request_timeout` 还必须低于生效的
+  `INFERENCE_RECOVERY_GRACE`（默认 15m）。
+- 建连超时只影响「还没连上」的请求：连接已建立后，流的存活只看
+  `request_timeout`（长 SSE 流不会被 `connect_timeout` 截断）。
+- **建连超时的当前口径是保守的**：传输层把它归入「上游执行状态未知」，
+  请求进核对（保留预占）、**绝不盲目重放到下一候选** —— 这是仓库的核心
+  钱账安全约束（不确定是否已执行的上游请求不得重放）。因此把
+  `connect_timeout` 配得过小会让请求**停在核对**而不是干净地切换候选；
+  运维配这个值时按「宁可配大一点」处理。若要让建连超时可切换候选，需要
+  单独任务（改的是执行状态判定，不是超时口径）。

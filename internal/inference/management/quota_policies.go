@@ -160,8 +160,25 @@ func NewQuotaPolicyService(store QuotaPolicyStore, audit AuditRecorder, clock do
 
 var quotaPolicyNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
+// quotaPolicyOveragePolicies is the SUPPORTED set of overage modes.
+//
+// clamp_if_declared 依赖客户端「显式声明允许钳制」的协议字段，本期协议层
+// 没有该字段 —— 收下它等于「保存后假装生效」：客户以为超支时会被钳制，
+// 实际按 reject 停下（或反过来）。所以新写一律拒绝，并在错误里点名可迁移
+// 的目标（reject / allow_overage）。
+//
+// 存量策略行仍可查询（读面不做隐式改写，也不自动迁移旧策略）—— 迁移由
+// 运营按文档人工完成（出一个 reject / allow_overage 的新 revision）。
 var quotaPolicyOveragePolicies = map[string]bool{
-	"reject": true, "clamp_if_declared": true, "allow_overage": true,
+	"reject": true, "allow_overage": true,
+}
+
+// unsupportedOveragePolicyMessage explains a refused overage mode.
+func unsupportedOveragePolicyMessage(p string) string {
+	if p == "clamp_if_declared" {
+		return "overage_policy clamp_if_declared is not implemented (it needs a client-declared field the protocols do not carry) — use reject or allow_overage"
+	}
+	return "unknown overage_policy " + p + " (supported: reject, allow_overage)"
 }
 
 // validatePolicyContent 是 create/update 合并后内容的统一校验:至少一项
@@ -202,7 +219,7 @@ func (s *QuotaPolicyService) validatePolicyContent(ctx context.Context, p *Quota
 		return domain.NewError(domain.CodeInvalidInput, "策略无任何限制项:至少一项 limit 必须非 null")
 	}
 	if !quotaPolicyOveragePolicies[p.OveragePolicy] {
-		return domain.NewError(domain.CodeInvalidInput, "unknown overage_policy "+p.OveragePolicy)
+		return domain.NewError(domain.CodeInvalidInput, unsupportedOveragePolicyMessage(p.OveragePolicy))
 	}
 	if len(p.ModelIDs) == 0 {
 		return domain.NewError(domain.CodeInvalidInput, "model_ids must be non-empty")

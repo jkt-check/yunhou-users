@@ -148,9 +148,17 @@ type ModelRoute struct {
 	ID           string
 	ModelID      string
 	DeploymentID string
-	Priority     int
+	// Priority orders the candidate groups: the lower the number, the
+	// earlier the group is tried (failover order).
+	Priority int
+	// Weight orders the candidates WITHIN one priority group (higher first).
+	// It is NOT a probabilistic split: every candidate of the group stays in
+	// the list, only the order changes (本期不做比例分流).
 	Weight       int
 	Capabilities []string
+	// PoolStrategy selects the account pool of the route. Only
+	// domain.PoolRoundRobin is supported (T7); the other known values are
+	// legacy rows that stay readable but are never dispatched.
 	PoolStrategy PoolStrategy
 	Enabled      bool
 	CreatedAt    time.Time

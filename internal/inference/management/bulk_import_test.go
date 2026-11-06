@@ -440,3 +440,31 @@ func TestPricingPreview_DiffSets(t *testing.T) {
 		t.Fatalf("removed = %v", removed)
 	}
 }
+
+// T7:批量导入与 operator CRUD 共用同一套 pool_strategy 支持集 —— 派生路由
+// 必须是 round_robin（常规池唯一支持的策略），不得派生出一个「保存后假装
+// 生效」的值。派生路由必须过共享校验器，否则逐项报错、绝不半发布。
+func TestBulkImport_DerivedRouteStaysInsideTheSupportedPoolStrategySet(t *testing.T) {
+	fs := &fakeBulkStore{t: t}
+	svc := NewBulkImportService(fs, nil, func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-pool", validBulkDoc(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HasErrors() {
+		t.Fatalf("the derived route must be inside the supported set: %+v", res.Items)
+	}
+	var routes int
+	for _, it := range res.Items {
+		if it.Kind != BulkKindRoute {
+			continue
+		}
+		routes++
+		if it.Status != BulkItemWouldInsert {
+			t.Errorf("route item = %+v, want would_insert", it)
+		}
+	}
+	if routes != 1 {
+		t.Errorf("route items = %d, want 1", routes)
+	}
+}

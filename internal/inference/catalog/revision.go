@@ -111,11 +111,16 @@ func (s *Snapshot) DeploymentSchedulable(d domain.Deployment) bool {
 // schedulable in this published snapshot are skipped for the same reason —
 // a disabled provider must not receive traffic through any of its
 // deployments.
+//
+// A route whose pool strategy is outside the supported set is skipped too:
+// it stays READABLE (an old published revision must remain loadable) but
+// it is NOT dispatchable — silently treating it as round_robin would make
+// an unimplemented configuration look effective.
 func (s *Snapshot) ActiveDeployments(modelID string) []domain.Deployment {
 	routes := s.RoutesByModel[modelID]
 	out := make([]domain.Deployment, 0, len(routes))
 	for _, r := range routes {
-		if !r.Enabled {
+		if !r.Enabled || !PoolStrategySupported(r.PoolStrategy) {
 			continue
 		}
 		d, ok := s.Deployments[r.DeploymentID]
@@ -125,6 +130,46 @@ func (s *Snapshot) ActiveDeployments(modelID string) []domain.Deployment {
 		out = append(out, d)
 	}
 	return out
+}
+
+// UnsupportedPoolStrategyRoutes returns the model's routes whose pool
+// strategy is outside the supported set. They stay readable (an old
+// published revision must remain loadable) but they are never dispatched:
+// the caller must fail loudly (and alarm) instead of pretending the
+// configuration works.
+func (s *Snapshot) UnsupportedPoolStrategyRoutes(modelID string) []domain.ModelRoute {
+	var out []domain.ModelRoute
+	for _, r := range s.RoutesByModel[modelID] {
+		if !PoolStrategySupported(r.PoolStrategy) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// PoolStrategyDispatchBlock returns the model's enabled routes whose pool
+// strategy is outside the supported set — but ONLY when they are the
+// model's entire enabled route set, i.e. the model has no dispatchable
+// route *because of* an unsupported pool strategy. A model that still has
+// a supported route is served by that one (the unsupported route is simply
+// not a candidate), and a model whose only legacy routes are DISABLED is
+// not blocked either (a disabled route never carried traffic).
+func (s *Snapshot) PoolStrategyDispatchBlock(modelID string) []domain.ModelRoute {
+	enabled := 0
+	var unsupported []domain.ModelRoute
+	for _, r := range s.RoutesByModel[modelID] {
+		if !r.Enabled {
+			continue
+		}
+		enabled++
+		if !PoolStrategySupported(r.PoolStrategy) {
+			unsupported = append(unsupported, r)
+		}
+	}
+	if enabled == 0 || len(unsupported) != enabled {
+		return nil
+	}
+	return unsupported
 }
 
 // Sellable reports whether a model may appear in the published model list:
@@ -364,7 +409,11 @@ func ParseSnapshot(rev *domain.ConfigRevision) (*Snapshot, error) {
 			Priority: pr.Priority, Weight: pr.Weight, Capabilities: pr.Capabilities,
 			PoolStrategy: domain.PoolStrategy(pr.PoolStrategy), Enabled: pr.Enabled,
 		}
-		if err := ValidateRoute(&route); err != nil {
+		// The READ path accepts the known-but-unsupported strategies: an
+		// already-published revision must stay loadable (otherwise the whole
+		// catalog bricks on upgrade). Such a route is marked unavailable by
+		// the snapshot — never dispatched as if it were round_robin.
+		if err := ValidateRouteForRead(&route); err != nil {
 			return nil, fmt.Errorf("catalog: revision %d: %w", rev.Revision, err)
 		}
 		if _, ok := snap.Models[route.ModelID]; !ok {

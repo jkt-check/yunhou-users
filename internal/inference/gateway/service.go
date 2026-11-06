@@ -28,6 +28,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -138,6 +139,11 @@ type Service struct {
 	// 与 AuditAlertHook 同契约:调用方保证非 nil、不 panic(panic 依
 	// OnSettleError 约定向上传播给 gin recovery)。
 	OnLifecycleGateHit func(ctx context.Context, p *domain.Principal, m *domain.Model, blocked bool, cause error)
+	// OnUnsupportedPoolStrategy receives one observation per request whose
+	// model has published routes with an unsupported pool_strategy (T7).
+	// Default: structured UNSUPPORTED_POOL_STRATEGY log +
+	// management.AuditAlertHook. 同 OnLifecycleGateHit 的契约。
+	OnUnsupportedPoolStrategy func(ctx context.Context, p *domain.Principal, m *domain.Model, routes []domain.ModelRoute, cause error)
 }
 
 // NewService builds the gateway. A nil clock uses the system clock (UTC).
@@ -345,6 +351,19 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	if model.MessagesHaveImages(req.Messages) && !m.AcceptsImages() {
 		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not accept image input")
 	}
+	// T7:存量已发布快照可能带未实现的 pool_strategy(least_loaded / 通用
+	// session_sticky)。旧快照可读,但该路由不可调度 —— 绝不静默当
+	// round_robin。模型**全部已启用**的路由都不支持时,在预占/派发前返回
+	// 明确的配置错误(零预占、零出站);还有支持集内的路由时只是不用它,并
+	// 告警。
+	if unsupported := snap.UnsupportedPoolStrategyRoutes(m.ID); len(unsupported) > 0 {
+		cause := fmt.Errorf("model %q has published routes with an unsupported pool_strategy: %v", m.ID, unsupported)
+		s.reportUnsupportedPoolStrategy(ctx, p, m, unsupported, cause)
+	}
+	if blocked := snap.PoolStrategyDispatchBlock(m.ID); len(blocked) > 0 {
+		return nil, newConfigUnavailable(domain.CodeUpstreamUnavailable,
+			unsupportedPoolStrategyMessage(m.ID, blocked))
+	}
 	// 2. Capability validation BEFORE any spend (设计: 不支持的工具/模态明
 	// 确报错). Modality/field-shape validation happened at the API edge.
 	thinking := req.ThinkingEnabled != nil && *req.ThinkingEnabled
@@ -374,6 +393,17 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		return nil, err
 	}
 	policy := polRow.Pure()
+	// T7:存量策略可能仍带未实现的 clamp_if_declared(它依赖客户端显式声明
+	// 字段,本期协议层没有该字段)。新推理必须明确报「策略配置不可用」——
+	// 绝不静默当 reject:那会悄悄改变客户的额度语义(钳制 vs 拒绝)。旧策略
+	// 仍可查询,迁移由运营按文档人工完成(出 reject / allow_overage 新
+	// revision),本服务不自动改写存量策略。
+	if policy.Overage == quota.OverageClampIfDeclared {
+		return nil, newConfigUnavailable(domain.CodeServiceUnavailable,
+			"quota policy "+polRow.Name+" r"+strconv.Itoa(polRow.Revision)+
+				" uses overage_policy=clamp_if_declared, which is not implemented — "+
+				"migrate the policy to reject or allow_overage")
+	}
 
 	var keyID *string
 	if key != nil {
@@ -549,6 +579,32 @@ func (s *Service) admitWallet(ctx context.Context, request domain.Request, ent d
 func noDispatchableUpstreamMessage(modelID string) string {
 	return "no dispatchable upstream for model " + modelID
 }
+
+// ErrConfigUnavailable marks a server-side CONFIGURATION error that the
+// caller cannot fix and that will not heal by retrying: an unimplemented
+// pool_strategy in the published catalog, an unimplemented overage mode in
+// the pinned policy (T7). It carries the ordinary domain code (so the
+// protocol surfaces keep their 503/529 shape) plus a typed value, so the
+// legacy /chat facade can report it as a configuration error instead of an
+// upstream fault — and can promise no retry.
+type ErrConfigUnavailable struct {
+	// Err is the underlying domain error (code + message) — it keeps the
+	// protocol surfaces' 503/529 shape.
+	Err *domain.Error
+}
+
+// newConfigUnavailable builds the typed configuration error.
+func newConfigUnavailable(code domain.Code, msg string) *ErrConfigUnavailable {
+	return &ErrConfigUnavailable{Err: domain.NewError(code, msg)}
+}
+
+// Error renders the underlying domain error (its Message, plus the cause
+// chain when there is one).
+func (e *ErrConfigUnavailable) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the *domain.Error so domain.CodeOf and errors.As keep
+// working on it (the protocol surfaces still answer 503/529).
+func (e *ErrConfigUnavailable) Unwrap() error { return e.Err }
 
 // pinSessionCandidates narrows the failover set to the session's bound
 // account following the Task 12 binder semantics:

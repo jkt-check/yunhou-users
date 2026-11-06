@@ -242,6 +242,13 @@ func mapGatewayError(err error) error {
 		// 额度/预算耗尽 → 本地限制（429）。请求从未出站。
 		return &ChatLimitError{Code: string(domain.CodeQuotaExceeded)}
 	}
+	// T7:服务端**配置**不可用（目录里没有可调度路由、策略带未实现的超额
+	// 模式……）。它不是上游临时故障、也不是目录未就绪 —— 明确分开，客户端
+	// 看到的文案不说成「上游错误」，也不承诺 Retry-After（重试不会自愈）。
+	var cfgErr *gateway.ErrConfigUnavailable
+	if errors.As(err, &cfgErr) {
+		return ErrChatConfigUnavailable
+	}
 	if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
 		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
 	}

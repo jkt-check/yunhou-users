@@ -122,8 +122,10 @@ func (s *Service) AdapterFor(p domain.Protocol) (providers.Adapter, bool) {
 // Candidates lists the dispatchable triples for one call in failover order.
 // A route/deployment/account is eligible only when ALL of:
 //
-//   - the route is enabled and its capability list covers the call's needs
-//     (an empty capability list means "everything the model supports");
+//   - the route is enabled, its pool strategy is inside the supported set
+//     (常规池仅 round_robin —— 不支持的值是存量脏配置，绝不静默当 RR),
+//     and its capability list covers the call's needs (an empty capability
+//     list means "everything the model supports");
 //   - the deployment is active, its provider is schedulable in the pinned
 //     published snapshot, its protocol has a registered adapter, and the
 //     adapter supports the call's needs (能力不兼容的部署不参与选择);
@@ -161,6 +163,12 @@ func (s *Service) candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 	consulted = map[string]struct{}{}
 	for _, route := range snap.RoutesByModel[modelID] {
 		if !route.Enabled || !routeCovers(route, needs) {
+			continue
+		}
+		// T7: 不支持的 pool_strategy（存量已发布快照里的 least_loaded /
+		// 通用 session_sticky）被标记不可用 —— 绝不静默当成 round_robin：
+		// 那条配置没有实现，当成 RR 就是「假装生效」。
+		if !catalog.PoolStrategySupported(route.PoolStrategy) {
 			continue
 		}
 		d, ok := snap.Deployments[route.DeploymentID]

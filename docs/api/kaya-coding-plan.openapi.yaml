@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Kaya Coding Plan — 客户控制台 API（yunhou-users）
-  version: 0.13.0
+  version: 0.14.0
   description: |
     Kaya Coding Plan（独立模型 API 套餐）客户侧契约，供 Website 客户控制台对接。
     本文件与 `internal/inference/httpapi/{user_api_keys,user_quotas,user_usage,
@@ -470,6 +470,10 @@ paths:
           价格后走 `POST /admin/catalog/publish` 发布。停用上游不删除历史
           路由记录（删除接口不触碰既有请求/尝试行）。
         - 每次 commit 追加审计（`catalog.bulk_import`，人员及服务双重归因）。
+        - 派生路由的 `pool_strategy` 恒为 `round_robin`（常规池唯一支持的
+          策略）：导入文档没有 pool_strategy 字段，未知字段一律 400；正式
+          publish 的发布闸同样只接受 `round_robin`（发布预演 `?dry_run=1`
+          给出同一个错误并点名路由 ID 与替代配置）。
       operationId: bulkImportCatalog
       responses:
         "200": { description: dry-run 预演 / 幂等重放（replayed=true） }
@@ -598,6 +602,14 @@ paths:
         权益数（`affected_accounts_kept_on_old`——权益钉住
         policy_version_id，新版本只影响新发权益；旧订阅保留版本恒 true）。
         策略版本按权益发放钉住，不存在全局生效时刻。
+
+        **overage_policy 支持集**：只有 `reject`（默认，额度耗尽即停）与
+        `allow_overage`（套餐外消费，走钱包）。`clamp_if_declared` **未实现**
+        （依赖客户端显式声明字段，本期协议层没有该字段）—— 预演与正式写
+        一致地拒绝它（400）。存量策略行仍可查询；引用到该模式的新推理明确
+        报「策略配置不可用」（503 `service_unavailable`），绝不静默当
+        `reject`。迁移步骤见
+        `docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」。
       operationId: previewQuotaPolicy
       responses:
         "200": { description: 影响预览 }
@@ -834,7 +846,10 @@ paths:
         "503":
           description: |
             service_unavailable（准入存储不可用：网关 fail closed 拒绝新推理，
-            绝不伪装成用户额度耗尽）
+            绝不伪装成用户额度耗尽）/ upstream_unavailable（已发布目录里该模型
+            没有可调度路由 —— 例如其路由带着**未实现**的 pool_strategy；
+            运营修好目录并重新 publish 后恢复。请求在预占前失败：零计费、
+            零出站）
           content:
             application/json:
               schema:
@@ -943,7 +958,14 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "503":
-          description: upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）
+          description: |
+            upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）。
+
+            upstream_unavailable 也覆盖「已发布目录里该模型没有可调度路由」：
+            例如其路由带着**未实现**的 pool_strategy（least_loaded / 通用
+            session_sticky）。这类配置在写面被明确拒绝，旧快照仍可读但路由
+            被标记不可用 —— 绝不静默当成 round_robin。请求在预占前失败：
+            零计费、零出站；运营修好目录并重新 publish 后恢复。
           content:
             application/json:
               schema:
@@ -1043,7 +1065,14 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "503":
-          description: upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）
+          description: |
+            upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）。
+
+            upstream_unavailable 也覆盖「已发布目录里该模型没有可调度路由」：
+            例如其路由带着**未实现**的 pool_strategy（least_loaded / 通用
+            session_sticky）。这类配置在写面被明确拒绝，旧快照仍可读但路由
+            被标记不可用 —— 绝不静默当成 round_robin。请求在预占前失败：
+            零计费、零出站；运营修好目录并重新 publish 后恢复。
           content:
             application/json:
               schema:
@@ -1856,7 +1885,7 @@ components:
               enum: [authentication_error, invalid_request_error, permission_error, rate_limit_error, server_error]
             code:
               type: string
-              description: 统一内部错误码映射(invalid_input/quota_exceeded/model_not_found/model_not_allowed/previous_response_not_found/upstream_unavailable 等)
+              description: 统一内部错误码映射(invalid_input/quota_exceeded/model_not_found/model_not_allowed/previous_response_not_found/upstream_unavailable/service_unavailable 等)
       required: [error]
     AnthropicError:
       type: object

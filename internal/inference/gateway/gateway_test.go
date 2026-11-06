@@ -155,6 +155,10 @@ type fixture struct {
 	// (Task 5: the per-Key slot). nil = the Key sets no limit (no Key
 	// lease is taken at all).
 	keyConcurrencyLimit *int
+	// overagePolicy pins the entitlement policy's overage mode
+	// ("" = the store default "reject"). T7 uses it to pin a legacy policy
+	// row that still carries the unimplemented clamp_if_declared mode.
+	overagePolicy string
 }
 
 // withNoWindows pins the policy to NO monetary window: the entitlement
@@ -192,6 +196,13 @@ func withSnapshotSource(fn func(f *fixture) SnapshotSource) fixtureOpt {
 // admission time, so the fixture only has to persist it.
 func withKeyConcurrencyLimit(n int) fixtureOpt {
 	return func(f *fixture) { f.keyConcurrencyLimit = &n }
+}
+
+// withOveragePolicy pins the entitlement policy's overage mode ("" = the
+// store default "reject"). T7: 存量策略仍带未实现的 clamp_if_declared 时，
+// 新推理必须明确失败而不是静默当 reject。
+func withOveragePolicy(p string) fixtureOpt {
+	return func(f *fixture) { f.overagePolicy = p }
 }
 
 type fixtureOpt func(f *fixture)
@@ -349,6 +360,7 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 		Name: "coding-plan", Revision: 1, ModelIDs: []string{f.modelID},
 		FiveHourLimit: micro(1_000_000_000), WeeklyLimit: micro(10_000_000_000),
 		MonthlyLimit: micro(100_000_000_000), Status: "published",
+		OveragePolicy: f.overagePolicy,
 	}
 	if f.noWindows {
 		// 无金额窗口的合法策略：只保留并发限制（不制造虚假额度窗口）。

@@ -659,6 +659,23 @@ Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改�
 - 字段语义（与 `rpm_limit` 同构）：创建时缺省 = 不加限制；`PATCH` 缺席 = 不修改；`PATCH` 显式 `null` = 清除；非正整数一律 400。
 - Key 的 `budget_micros` 仍**只**表示套餐 microcredit 子预算，与本并发上限无关，也不构成现金预算。
 
+**目录配置错误（503，非客户端错误）**
+
+已发布目录里可能残留**未实现**的配置。这类配置「可读但不可用」：旧的已发布
+版本仍能被加载（否则整个目录变砖），但相关路由被标记为不可调度 —— 绝不静默
+当成已实现的策略。
+
+| 情形 | 客户看到的 | 是否计费/出站 |
+|---|---|---|
+| 模型的**全部**路由都带着未实现的 `pool_strategy`（`least_loaded` / 通用 `session_sticky`；常规池只支持 `round_robin`） | HTTP **503** `upstream_unavailable`（Anthropic 面为 529 `overloaded_error`），message 点名路由与替代配置 | 零预占、零出站、零计费（失败发生在业务准入之前） |
+| 模型的**部分**路由带着未实现的 `pool_strategy` | 正常服务（只用支持集内的路由），运维侧收到告警 | 正常计费 |
+| 当前权益策略仍带未实现的 `overage_policy=clamp_if_declared` | HTTP **503** `service_unavailable`，message 点名策略名与版本 | 零预占、零出站、零计费 |
+
+这两种 503 都是**服务端配置问题**，不是额度、不是速率、不是客户端请求形状问题
+（客户端请求合法）。客户端 SDK 看到 503/529 的常规退避重试是安全的，但重试在
+运营修好目录并重新 publish 之前不会成功 —— 运营侧的修法见
+`docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」。
+
 **WebSocket**：不实现 —— 目标接入（Claude Code / Codex）均走 HTTP SSE，无 WebSocket 需求。
 
 ---
@@ -770,8 +787,9 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 | 429 | `chat request rejected by a usage limit (insufficient_balance)` | **本地**余额/支出上限不足（钱包门控）：请求从未出站 |
 | 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——重试同样的请求必败，但改写请求后可能成功。此时 `data` 不为 null，携带结构化上游信息：`upstream_status`（真实上游状态码）、`upstream_code`（归一化分类：`context_length_exceeded` 上下文超长 / `content_filter` 内容审核拦截 / `insufficient_balance` 上游余额不足 / `invalid_request` 其他请求问题）、`upstream_message`（脱敏截断后的上游错误消息，约 300 字节） |
 | 502 | `chat upstream error` | 上游 5xx 或网络错误（该 provider 所有可用 key 均已尝试） |
+| 503 | `chat configuration unavailable` | **服务端配置**不可用：已发布目录里该模型没有可调度路由（例如其路由带着未实现的 `pool_strategy`），或当前权益策略带未实现的 `overage_policy=clamp_if_declared`。请求从未出站、不计费；**不带 `Retry-After`** —— 配置不会自愈，重试没有意义（运营修好目录并重新 publish 后恢复，见 `docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」） |
 
-**客户端重试指引**：400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试（**例外**：`chat request rejected by a usage limit (insufficient_capacity)` 与 `too many concurrent chat streams` 的正确处理是**等待在途流结束**，`(quota_exceeded)` / `(insufficient_balance)` 需要充值或换套餐，原样重试必败）；502 `chat request rejected by upstream` → 按 `data.upstream_code` 分类处理：`context_length_exceeded` → 裁剪会话历史后重试（改写后的请求可能成功）；`insufficient_balance` / `content_filter` / `invalid_request` → 原样重试必败，需引导用户调整；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
+**客户端重试指引**：503 `chat configuration unavailable` → **不要重试**（服务端配置问题，重试不会自愈；见 `docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」）；400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试（**例外**：`chat request rejected by a usage limit (insufficient_capacity)` 与 `too many concurrent chat streams` 的正确处理是**等待在途流结束**，`(quota_exceeded)` / `(insufficient_balance)` 需要充值或换套餐，原样重试必败）；502 `chat request rejected by upstream` → 按 `data.upstream_code` 分类处理：`context_length_exceeded` → 裁剪会话历史后重试（改写后的请求可能成功）；`insufficient_balance` / `content_filter` / `invalid_request` → 原样重试必败，需引导用户调整；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
 
 **本地限制与上游 429 的区分**：`chat upstream rate limit exceeded` 指**上游**返回 429（请求已出站）；`chat request rejected by a usage limit (<业务码>)` 指**本地**闸门（业务速率 / 并发 / 额度 / 余额）在准入阶段拒绝，请求**从未出站**、不计费。两者都是 429，客户端都应退避重试，但只有后者需要充值/换套餐/等待在途流结束。`/chat` 保留既有 `{code,data,message}` envelope；业务码出现在 `message` 里（envelope 没有独立的符号码字段）。
 

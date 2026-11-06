@@ -111,8 +111,14 @@ type RecoveryConfig struct {
 	// The count itself has always been in the structured metrics line, but
 	// a backlog nobody is told about is a backlog nobody handles: these
 	// requests settle at the conservative estimate and wait for a human to
-	// confirm the real usage. 0 = the default (10); a negative value
-	// disables the alarm.
+	// confirm the real usage.
+	//
+	// 0 = the default (10); a negative value disables the alarm.
+	//
+	// There is deliberately NO env / config knob for it: the server does
+	// not populate this field, so production always runs the default 10.
+	// Changing the threshold means changing code; the negative "disable"
+	// path only makes sense for a custom embedding or a test.
 	UnknownUsageAlarmThreshold int
 }
 

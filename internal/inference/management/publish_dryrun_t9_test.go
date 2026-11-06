@@ -278,6 +278,11 @@ func TestPublishDryRun_AccountInventoryUnknownIsNotGuessed(t *testing.T) {
 	if _, ok := codes["account_inventory_unavailable"]; !ok {
 		t.Errorf("issues must report account_inventory_unavailable, got %v", codes)
 	}
+	// 判定被**跳过** ⇒ 这个标志必须是 false（OpenAPI：false = 「无账号」
+	// 判定被跳过，未知，不是无账号）。清单读失败却报 true = 谎报。
+	if j.Summary.AccountInventory {
+		t.Error("account_inventory_checked must be false when the inventory read failed (the no-account determination was skipped)")
+	}
 }
 
 // TestPublishDryRun_ModelWithoutDispatchableRouteIsABlocker 钉住：发布后

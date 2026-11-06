@@ -4321,6 +4321,101 @@ result is the same.)
 appended fields) — that is the sanctioned T9 change, and it is now pinned
 byte-exactly on both backends. The legacy picker is byte-for-byte unchanged.
 
+#### 4.50 T9 fix round — the four review findings
+
+Recorded on 2026-11-06, after the T9 review of `a6a7226` raised four
+**Important** findings. The fix round touches **one** production file
+(`internal/inference/management/catalog.go`) plus the documentation and the
+focused tests; **no** new prefix, gate or env knob was manufactured.
+
+| # | Finding | Fix | Kind |
+|---|---|---|---|
+| 1 | `summary.account_inventory_checked` was `true` even when an inventory read **failed** — it misreported the very case it was built for | the flag now turns **false** on any failed provider read (it means "the no-account determination was made for **every** provider", not "we read once") | production + docs + test |
+| 2 | the operations runbook advertised two settlement-alarm prefixes the gateway **never emits** (`ALARM gateway: reservation_drift` / `ALARM gateway: missing_reservation`) | the runbook now lists only the three real gateway prefixes and documents the **parked** family (no `ALARM gateway:` prefix, no reason token in the line) with its real lookup (the reconciliation job's `reason`, via `GET /admin/model-usage/exceptions?kind=settlement_backlog`) | docs + test |
+| 3 | the unknown-usage threshold was documented as operator-adjustable, but the server never populates it and no env knob exists | stated plainly as a **code-only** constant (default 10); the server always runs 10; the "negative disables it" path only applies to a custom embedding or a test. **No env knob was added.** | docs + code comment |
+| 4 | the `blocker` class overstated what it does (it is advisory; the formal publish never reads the report) and the OpenAPI did not correct the reader | the OpenAPI, the integration guide and the operations runbook now say: the whole issue list is **advisory**; a `blocker` is an **actionable configuration / usable-traffic finding**; **HTTP 200 + a blocker does not itself refuse the publish**; the things that **do** refuse it are the **shared publish gate's** hard validation failures (unsupported `pool_strategy` / unknown route capability names), which make the dry-run return the **same error** as the formal publish. No hard gate was added for the blocker class. | docs + test |
+
+##### 4.50.1 RED (the fixes stashed, the new tests kept)
+
+The four fixed files were stashed (`git stash push -- internal/inference/management/catalog.go
+docs/api/kaya-coding-plan.openapi.yaml docs/api-integration-guide.md
+docs/runbooks/kaya-coding-plan-operations.md`) while the new tests stayed in
+place — the same "tests in, fixes out" shape the T2 fix round used.
+
+```
+=== RUN   TestPublishDryRun_AccountInventoryUnknownIsNotGuessed
+    publish_dryrun_t9_test.go:284: account_inventory_checked must be false when the inventory read failed (the no-account determination was skipped)
+--- FAIL: TestPublishDryRun_AccountInventoryUnknownIsNotGuessed (0.00s)
+FAIL	github.com/yunhou/users/internal/inference/management	1.496s
+
+--- httpapi doc guards ---
+=== RUN   TestOpenAPI_T9PublishPreviewAdvisorySemantics
+    openapi_contract_test.go:333: openapi missing the advisory-semantics wording "共享发布闸"
+    openapi_contract_test.go:333: openapi missing the advisory-semantics wording "HTTP 200 + 一条 `blocker` 也不等于正式发布会被拒"
+    openapi_contract_test.go:348: account_inventory_checked description must say "读失败"
+--- FAIL: TestOpenAPI_T9PublishPreviewAdvisorySemantics (0.00s)
+=== RUN   TestOpsRunbook_AlarmPrefixesMatchTheGateway
+    openapi_contract_test.go:373: the runbook advertises the non-existent alarm prefix "ALARM gateway: reservation_drift"
+    openapi_contract_test.go:373: the runbook advertises the non-existent alarm prefix "ALARM gateway: missing_reservation"
+    openapi_contract_test.go:393: the runbook must document the parked-reason lookup "parking in reconciliation"
+    openapi_contract_test.go:402: the runbook must state the threshold is code-only (missing "代码内常量")
+--- FAIL: TestOpsRunbook_AlarmPrefixesMatchTheGateway (0.00s)
+FAIL	github.com/yunhou/users/internal/inference/httpapi	0.799s
+```
+
+Every failure is a behavioural/doc assertion failure — never a compile error.
+
+##### 4.50.2 GREEN
+
+```
+=== GREEN run ===
+ok  	github.com/yunhou/users/internal/inference/management	0.578s
+ok  	github.com/yunhou/users/internal/inference/httpapi	1.099s
+```
+
+##### 4.50.3 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `git diff --check` | **0** | no whitespace errors |
+| 2 | `go run ./cmd/migrate` (run 1, `t9_app`) | **0** | `applied=53 skipped=0` |
+| 3 | `go run ./cmd/migrate` (run 2, `t9_app`) | **0** | `applied=0 skipped=53` (idempotent) |
+| 4 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/management ./internal/inference/httpapi ./internal/config ./cmd/server` | **0** | 4 packages `ok` (2.014s / 69.800s / 2.587s / 2.666s) |
+| 5 | the same four packages with `-v` (skip inventory) | **0** | **333 PASS / 0 SKIP / 0 FAIL**; the skip lines were grepped for `postgres` / `no database` / `database unavailable` → **nothing** |
+| 6 | `go test -race -count=1 -p 1 ./internal/inference/... ./tests/integration/...` | **0** | 15 packages `ok` (regression sweep) |
+
+##### 4.50.4 Files changed (the fix round)
+
+| File | Change |
+|---|---|
+| `internal/inference/management/catalog.go` | a failed provider-account inventory read now turns `summary.account_inventory_checked` **false** (Finding 1) + the field's doc comment |
+| `internal/inference/management/publish_dryrun_t9_test.go` | the RED assertion for Finding 1 (the flag must be false when the read failed) |
+| `internal/inference/httpapi/openapi_contract_test.go` | two focused drift guards: `TestOpenAPI_T9PublishPreviewAdvisorySemantics` and `TestOpsRunbook_AlarmPrefixesMatchTheGateway` (Findings 2–4) |
+| `internal/inference/workers/settlement_recovery.go` | the threshold's doc comment now says plainly that there is **no** env / config knob and that the server always runs the default 10 (Finding 3) |
+| `docs/api/kaya-coding-plan.openapi.yaml` | the advisory semantics, the shared publish gate as the only hard rejection, and the corrected `account_inventory_checked` meaning (Findings 1 + 4) |
+| `docs/api-integration-guide.md` | the same two corrections in the operator section (Findings 1 + 4) |
+| `docs/runbooks/kaya-coding-plan-operations.md` | the real gateway/worker alarm prefixes and the parked-reason lookup (Finding 2), the code-only threshold (Finding 3), the advisory semantics (Finding 4) |
+
+##### 4.50.5 Notes (compatibility, honesty)
+
+- **No new prefix was manufactured.** The gateway's alarm family is unchanged:
+  `ALARM gateway: settlement_mismatch` / `ledger_drift` /
+  `late_usage_after_release` are the only ones that carry a reason token;
+  `reservation_drift` / `missing_reservation` / `unknown_usage` are
+  **parked** (`gateway: settlement failed for … — parking in reconciliation`,
+  no reason token) and are looked up by the reconciliation job's `reason`.
+- **No hard gate was added.** The controller ruling stands: the shared
+  publish gate owns the hard rejections (T7's shared validation); the
+  dry-run's `blocker` class is an **actionable configuration / usable-traffic
+  finding**, and HTTP 200 plus a blocker-labelled issue does not by itself
+  refuse the formal publish.
+- **No env knob was added** for the unknown-usage threshold (explicitly out
+  of scope); it is a code-level constant of 10.
+- **Compatibility.** `account_inventory_checked` keeps its name and type; it
+  is now *accurate* rather than optimistic (it can flip from `true` to
+  `false` when a read fails). The OpenAPI's field list is unchanged.
+- **Deferred minors were not touched.**
+
 ### T10 — Integration acceptance and implementation report
 
 - Status: not started

@@ -346,8 +346,9 @@ type PublishDryRunSummary struct {
 	Hints    int `json:"hints"`
 	// AllProbesOK 只有在每个探测都 verified 时才为 true。
 	AllProbesOK bool `json:"all_probes_ok"`
-	// AccountInventoryChecked 报告「无账号」判定是否真的查过账号清单。
-	// false = 清单读面不可用，该判定被**跳过**（报告说未知，不是无账号）。
+	// AccountInventoryChecked 报告「无账号」判定是否**对每个 provider 都
+	// 真的做了**。false = 账号清单读面不可用、或某次读失败 ⇒ 该判定被
+	// **跳过**（报告说未知，不是无账号）。它**不**是「读过一次」的记号。
 	AccountInventoryChecked bool `json:"account_inventory_checked"`
 }
 
@@ -410,6 +411,11 @@ func (m *CatalogManager) PublishDryRun(ctx context.Context, prober DeploymentPro
 			checked[d.ProviderID] = true
 			accts, aerr := inv.ListActiveUpstreamAccounts(ctx, d.ProviderID)
 			if aerr != nil {
+				// 清单读不到 ⇒ 该 provider 的「无账号」判定被**跳过**
+				// （未知，不是无账号）。标志随之置 false：它的含义是
+				// 「每个 provider 的无账号判定都真的做了」——一次失败的读
+				// 就让这个断言不成立（T9 修复轮：曾经读失败也报 true）。
+				report.Summary.AccountInventoryChecked = false
 				report.Issues = append(report.Issues, PublishIssue{
 					Code: "account_inventory_unavailable", Severity: PublishIssueHint, Subject: d.ProviderID,
 					Message: "the upstream account inventory of provider " + d.ProviderID + " could not be read — the account check was skipped (unknown, not empty)",

@@ -314,3 +314,92 @@ func TestOpenAPI_T9ProbePreviewAndCapabilityContract(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenAPI_T9PublishPreviewAdvisorySemantics pins the T9 fix-round
+// wording: the dry-run issue list is **advisory** (the formal publish never
+// reads it), a `blocker`-labelled issue does NOT by itself refuse the
+// publish, and the things that DO refuse it are the shared publish gate's
+// hard validation failures. Without this, a reader could take "blocker" to
+// mean "the publish is refused".
+func TestOpenAPI_T9PublishPreviewAdvisorySemantics(t *testing.T) {
+	doc := readOpenAPI(t)
+	for _, kw := range []string{
+		"advisory",
+		"共享发布闸",
+		"HTTP 200 + 一条 `blocker` 也不等于正式发布会被拒",
+		"不阻断", // the blocker class does not block the formal publish
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing the advisory-semantics wording %q", kw)
+		}
+	}
+	// account_inventory_checked 的语义：false = 判定被跳过（含读失败），
+	// 不是「读过一次」。
+	i := strings.Index(doc, "account_inventory_checked:")
+	if i < 0 {
+		t.Fatal("openapi missing account_inventory_checked")
+	}
+	seg := doc[i:]
+	if j := strings.Index(seg, "required:"); j >= 0 {
+		seg = seg[:j]
+	}
+	for _, kw := range []string{"跳过", "读失败", "不是"} {
+		if !strings.Contains(seg, kw) {
+			t.Errorf("account_inventory_checked description must say %q", kw)
+		}
+	}
+}
+
+// TestOpsRunbook_AlarmPrefixesMatchTheGateway pins the T9 fix round's
+// second finding: the operations runbook must not advertise settlement
+// alarm prefixes the gateway does not emit. The gateway alarms with the
+// reason token ONLY for the terminal-state anomalies
+// (settlement_mismatch / ledger_drift / late_usage_after_release);
+// reservation_drift and missing_reservation are PARKED — the gateway logs
+// "gateway: settlement failed for … — parking in reconciliation" with no
+// reason token, and the reason is looked up on the reconciliation job.
+func TestOpsRunbook_AlarmPrefixesMatchTheGateway(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "runbooks", "kaya-coding-plan-operations.md"))
+	if err != nil {
+		t.Fatalf("operations runbook missing: %v", err)
+	}
+	doc := string(raw)
+	// 不存在的两条前缀：网关从不打它们（它们是**停放**，不是告警）。
+	for _, phantom := range []string{
+		"ALARM gateway: reservation_drift",
+		"ALARM gateway: missing_reservation",
+	} {
+		if strings.Contains(doc, phantom) {
+			t.Errorf("the runbook advertises the non-existent alarm prefix %q", phantom)
+		}
+	}
+	// 真实存在的三条前缀必须留档。
+	for _, real := range []string{
+		"ALARM gateway: settlement_mismatch",
+		"ALARM gateway: ledger_drift",
+		"ALARM gateway: late_usage_after_release",
+	} {
+		if !strings.Contains(doc, real) {
+			t.Errorf("the runbook must document the real alarm prefix %q", real)
+		}
+	}
+	// 停放类的原因必须按**原因**查，而不是按日志前缀查。
+	for _, kw := range []string{
+		"settlement_backlog",
+		"parking in reconciliation",
+		"reason",
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("the runbook must document the parked-reason lookup %q", kw)
+		}
+	}
+	// 未知用量积压阈值：代码内常量，没有 env/config 旋钮。
+	if strings.Contains(doc, "可通过 `RecoveryConfig.UnknownUsageAlarmThreshold` 调整") {
+		t.Error("the runbook claims the unknown-usage threshold is operator-adjustable; it is code-only")
+	}
+	for _, kw := range []string{"代码内常量", "没有", "env"} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("the runbook must state the threshold is code-only (missing %q)", kw)
+		}
+	}
+}

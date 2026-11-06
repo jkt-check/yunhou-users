@@ -338,25 +338,35 @@ legacy `/chat` 是 400（能力不兼容哨兵，不是「上游拒绝」的 502
 > 这是 T3 携带到 T9 的必修发现：预演此前只按 deployment 状态过滤，把停用
 > provider 背后的部署当成「会生效」并真的探测。
 
-### 问题分类：哪些阻断、哪些只是提示
+### 问题分类：可行动的配置发现 vs 网络探测提示
+
+**整份 `issues` 清单都是 advisory**：预演报告**不**参与正式发布的判定。
+正式发布**不读**这份报告。
 
 | severity | 含义 | code |
 |---|---|---|
-| `blocker` | **确定性配置问题**：发布这份目录后，某个模型/路由跑起来**不是配的那个**。要么修好再发，要么明确接受 | `provider_disabled`、`deployment_no_account`、`route_capabilities_narrowed`、`model_not_dispatchable` |
-| `hint` | **网络探测提示**：advisory，**不阻断**发布，也**不代表**模型故障 | `probe_failed`、`probe_unsupported`、`probe_unconfirmed`、`account_inventory_unavailable` |
+| `blocker` | **可行动的配置 / 可用流量发现**：发布这份目录后，某个模型/路由**跑不起来**。要么修好再发，要么明确接受 | `provider_disabled`、`deployment_no_account`、`route_capabilities_narrowed`、`model_not_dispatchable` |
+| `hint` | **网络探测提示**：advisory，也**不代表**模型故障 | `probe_failed`、`probe_unsupported`、`probe_unconfirmed`、`account_inventory_unavailable` |
 
 - `deployment_no_account`：该 provider **没有可用上游账号** → 这条路由无法
   出站（可判定的事实，不是猜测）。
 - `account_inventory_unavailable`：账号清单**读不到** → 该判定被**跳过**，
-  报告说「未知」，**绝不**谎称「无账号」。
+  报告说「未知」，**绝不**谎称「无账号」。此时
+  `summary.account_inventory_checked` 为 **false**（它表示「无账号判定对
+  每个 provider 都真的做了」，**不是**「读过一次」）。
 - `route_capabilities_narrowed`：路由的能力清单收窄了模型声明的能力（存量
   非空清单常常不含 `image`）→ 带图请求在**准入前**被 400 拒绝。
 - `model_not_dispatchable`：模型在这次发布后**没有任何可调度路由**。
 
-**策略/路由不支持**（不在支持集的 `pool_strategy`、词表外的路由
-`capabilities`）由**发布闸**拒绝：预演与正式发布给出**同一个错误**（点名
-对象 ID 与替代配置），因此它出现在**错误**里而不是 200 报告里 —— 预演与
-正式发布的判定口径必须一致。
+**真正会拒绝发布的是共享发布闸的硬校验**：草稿里**不支持**的策略/路由配置
+（不在支持集的 `pool_strategy`、词表外的路由 `capabilities`）由**发布闸**
+拒绝 —— 预演与正式发布给出**同一个错误**（点名对象 ID 与替代配置，
+HTTP 400），因此它出现在**错误**里而不是 200 报告里。
+
+**HTTP 200 + 一条 `blocker` ≠ 正式发布会被拒**：本期**不为** `blocker` 类
+发现加硬闸。停用 provider / 无账号 / 能力收窄由目录发布态与调度判定负责
+（停用的 provider 本来就不会承接流量），预演只负责把它们**如实说出来**，
+由运营决定修还是接受。
 
 ### HTTP 200 不等于每个 probe.ok 都是 true
 
@@ -409,10 +419,22 @@ legacy `/chat` 是 400（能力不兼容哨兵，不是「上游拒绝」的 502
 
 | 告警 | 日志前缀 | 触发条件 | 处置 |
 |---|---|---|---|
-| **非幂等结算冲突** | `ALARM gateway: settlement_mismatch` / `ALARM gateway: ledger_drift` / `ALARM gateway: reservation_drift` / `ALARM gateway: missing_reservation` / `ALARM gateway: late_usage_after_release`（另有 `ALARM gateway: request … charge … exceeds hold …` 的超额告警） | 同一请求的**重复结算金额不一致**、已终态请求收到晚到用量、账本无 charge 行、预占数与准入不符、缺预占 —— 这些**不是**幂等重投，绝不当成功吞掉 | 请求进入专门核对（`inference_reconciliation_jobs`，原因与告警里的词一一对应），**只叫人**；人工处置见 `GET /admin/model-usage/exceptions?kind=settlement_backlog` |
-| **未知用量积压** | `ALARM inference recovery: unknown-usage backlog` | 消费事实未知的请求积压超过阈值（默认 10；`RecoveryConfig.UnknownUsageAlarmThreshold`） | 这些请求按**保守估算**入账（绝不静默记零），真实用量要靠人核对；按 `usage_status='unknown'` 查请求，逐笔核对 |
+| **非幂等结算冲突** | 网关侧**只有**这三条带原因词：`ALARM gateway: settlement_mismatch` / `ALARM gateway: ledger_drift` / `ALARM gateway: late_usage_after_release`（另有 `ALARM gateway: request … charge … exceeds hold …` 的超额告警） | 同一请求的**重复结算金额不一致**、账本无 charge 行、已终态请求收到晚到用量 —— 这些**不是**幂等重投，绝不当成功吞掉 | 请求进入专门核对（`inference_reconciliation_jobs`），**只叫人**；人工处置见 `GET /admin/model-usage/exceptions?kind=settlement_backlog` → 每个任务的 `reason` |
+| **缺预占 / 预占漂移**（与上一行**同一族**，但**没有** `ALARM gateway:` 前缀） | 网关打的是 `gateway: settlement failed for <request id>: … — parking in reconciliation`（**行里没有原因词**）；另有一条 `ERROR gateway: settlement failed for request <id>: … (parked for reconciliation)` | 预占数与准入不符（`reservation_drift`）、缺预占（`missing_reservation`）、消费事实未知（`unknown_usage`）—— 请求被**停放**（保留预占、绝不记零），不是终态异常 | **按原因查**，不要按日志前缀查：`GET /admin/model-usage/exceptions?kind=settlement_backlog` 的 `reason` 字段（`reservation_drift` / `missing_reservation` / `unknown_usage` / …）。**网关从不为这两个原因打带 `ALARM gateway:` 前缀的行** —— 该前缀只属于上一行那三条终态异常 |
+| **未知用量积压** | `ALARM inference recovery: unknown-usage backlog` | 消费事实未知的请求积压 **≥ 10** | 这些请求按**保守估算**入账（绝不静默记零），真实用量要靠人核对；按 `usage_status='unknown'` 查请求，逐笔核对。**阈值目前是代码内的常量（默认 10）**：服务端**没有**暴露 env/config 旋钮，运维改不了它（详见下方说明） |
 | **限速存储失败** | `ALARM quota: rate limit store unavailable` | 限速闸门的存储不可用（**不是**限速拒绝） | 准入 **fail-closed**（503 `service_unavailable`，绝不回退成单机放行）；修存储后自动恢复。正常的限速拒绝**不打**这条告警（否则告警会被噪声淹没） |
 | **不支持存量配置** | `UNSUPPORTED_POOL_STRATEGY model=… routes=… strategies=…` + `AUDIT_ALERT` | 已发布快照里存在支持集外的 `pool_strategy`（存量脏配置） | 该路由被标记**不可调度**（绝不静默当 `round_robin`）；模型还有别的可调度路由时正常服务，全部不支持时客户请求在**预占前** 503 `upstream_unavailable`（Anthropic 面 529）。修法：把路由的 `pool_strategy` 改成 `round_robin` 再 publish |
+
+**三类告警的稳定前缀不是同一族**：`ALARM gateway: …`（网关的终态异常）、
+`ALARM inference recovery: …`（恢复 worker 的期限/账本/积压）、
+`ALARM quota: …`（限速存储故障）。配规则时按**前缀族**分别配置，不要假设
+一个前缀能覆盖另一族。
+
+**未知用量积压阈值目前是「代码内常量」**：`RecoveryConfig.UnknownUsageAlarmThreshold`
+的缺省值是 **10**，而**服务端没有把它接到任何 env / 配置项**上 —— 因此
+运维**无法**在运行期调整它，也没有对应的 env 旋钮（本期不新增）。想改
+阈值只能改代码重新部署；把该字段设成负数会**关闭**这条告警，但那只对
+**自建嵌入**与**测试**有意义，生产服务端永远走缺省值 10。
 
 另有两类**期限/账本**告警沿用既有前缀：`ALARM inference recovery:
 reconciliation job … past deadline`（核对任务超期升级）与

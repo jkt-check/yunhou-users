@@ -1640,12 +1640,21 @@ LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游�
 | `would_publish.active_deployments` | **真正会承接流量**的部署数（部署 active **且**其 provider 未停用）。停用 provider 背后的部署**不算**，也**不**被探测 |
 | `would_publish.disabled_providers` | 草稿里被停用的 provider 数量（如实汇总） |
 | `would_publish.deployments_behind_disabled_providers` | 部署本身 active、但其 provider 已停用的部署数 |
-| `issues[].severity` | `blocker` = **确定性配置问题**（发布后某个模型/路由跑起来不是配的那个）；`hint` = **网络探测提示**（advisory、不阻断发布、**不代表**模型故障） |
+| `issues[].severity` | `blocker` = **可行动的配置 / 可用流量发现**（发布这份目录后某个模型或路由**跑不起来**）；`hint` = **网络探测提示**（advisory、**不代表**模型故障）。**整份 issues 清单都是 advisory** |
 | `issues[].code` | `provider_disabled` / `deployment_no_account` / `route_capabilities_narrowed` / `model_not_dispatchable`（blocker）；`account_inventory_unavailable` / `probe_failed` / `probe_unsupported` / `probe_unconfirmed`（hint） |
 | `summary.all_probes_ok` | 只有**每个**探测都 `verified` 才为 true |
+| `summary.account_inventory_checked` | 「无账号」判定是否**对每个 provider 都真的做了**。false = 清单读面不可用**或某次读失败** ⇒ 判定被**跳过**（未知，不是无账号） |
 
 **HTTP 200 不等于每个 `probe.ok` 都是 true**：200 只说明「预演报告生成成功」。
 逐条结论看 `probes[]` 的 `probe_outcome`，汇总看 `summary`。
+
+**HTTP 200 + 一条 `blocker` 也不等于正式发布会被拒**：`blocker` 是**可行动的
+发现**，不是发布闸。正式发布**不读这份预演报告**。真正会拒绝发布的是
+**共享发布闸的硬校验** —— 草稿里不支持的策略/路由配置（不在支持集的
+`pool_strategy`、词表外的路由 `capabilities`）：预演与正式发布给出**同一个
+错误**（HTTP 400，点名对象 ID 与替代配置），出现在**错误**里而**不是** 200
+报告里。本期**不为** `blocker` 类发现加硬闸 —— 停用 provider / 无账号 /
+能力收窄由目录发布态与调度判定负责，预演只负责把它们**如实说出来**。
 
 #### POST /admin/deployments/:id/probe
 

@@ -675,23 +675,31 @@ paths:
           如实汇总停用的 provider 与被它带走的部署。
         - `probes[]` —— 每条会生效部署的探测结论（语义见
           `POST /admin/deployments/{id}/probe`）。
-        - `issues[]` —— 发布前**可判定**的问题。`severity=blocker` 是
-          **确定性配置问题**（发布后某个模型/路由跑起来不是配的那个：
-          `provider_disabled` / `deployment_no_account` /
-          `route_capabilities_narrowed` / `model_not_dispatchable`）；
-          `severity=hint` 是**网络探测提示**（`probe_failed` /
-          `probe_unsupported` / `probe_unconfirmed` /
-          `account_inventory_unavailable`），advisory、**不阻断**发布，也
-          **不代表**模型故障。
+        - `issues[]` —— 发布前**可判定**的问题（**advisory**：预演报告
+          **不**参与正式发布的判定）。
+          - `severity=blocker` = **可行动的配置 / 可用流量发现**：发布
+            这份目录后，某个模型或路由**跑不起来**（`provider_disabled` /
+            `deployment_no_account` / `route_capabilities_narrowed` /
+            `model_not_dispatchable`）。它**不阻断**正式发布 —— 正式发布
+            **不读这份报告**，由它自己的硬校验决定。运营要么修好再发，
+            要么明确接受。
+          - `severity=hint` = **网络探测提示**（`probe_failed` /
+            `probe_unsupported` / `probe_unconfirmed` /
+            `account_inventory_unavailable`）：advisory、**不阻断**发布，
+            也**不代表**模型故障。
         - `summary` —— 判定摘要（探测结论分桶 + blocker/hint 计数）。
 
         **HTTP 200 只说明预演报告生成成功**：它**不等于**每个 `probe.ok`
-        都是 true（看 `summary.all_probes_ok` 与逐条 `probe_outcome`）。
+        都是 true（看 `summary.all_probes_ok` 与逐条 `probe_outcome`）；
+        **HTTP 200 + 一条 `blocker` 也不等于正式发布会被拒**（见下）。
 
-        草稿里**不支持**的策略/路由配置（不在支持集的 `pool_strategy`、
-        词表外的路由 `capabilities`）由**发布闸**拒绝：预演与正式发布给出
-        **同一个错误**（点名对象 ID 与替代配置），因此它出现在错误里而
-        不是 200 报告里。
+        **真正会拒绝发布的是共享发布闸的硬校验**：草稿里**不支持**的策略/
+        路由配置（不在支持集的 `pool_strategy`、词表外的路由
+        `capabilities`）由**发布闸**拒绝 —— 预演与正式发布给出**同一个
+        错误**（点名对象 ID 与替代配置，HTTP 400），因此它出现在**错误**
+        里而**不是** 200 报告里。本期**不为** `blocker` 类发现加硬闸：
+        停用 provider / 无账号 / 能力收窄这些由目录发布态与调度判定负责，
+        预演只负责把它们**如实说出来**。
 
         正式发布（不带 `dry_run`）**不跑任何探测**，也不引入网络依赖。
       operationId: publishCatalog
@@ -1382,9 +1390,13 @@ components:
     PublishIssue:
       type: object
       description: |
-        发布预演里的一条**可判定**问题。`blocker` = 确定性配置问题（发布后
-        某个模型/路由跑起来不是配的那个）；`hint` = 网络探测提示（advisory、
-        不阻断发布、**不代表**模型故障）。
+        发布预演里的一条**可判定**问题 —— **整份 issues 清单都是 advisory**：
+        预演报告**不**参与正式发布的判定。
+        `blocker` = **可行动的配置 / 可用流量发现**（发布这份目录后某个模型
+        或路由跑不起来）；`hint` = 网络探测提示（不阻断发布、**不代表**模型
+        故障）。**HTTP 200 + 一条 blocker ≠ 正式发布会被拒**；真正拒绝发布的
+        是共享发布闸的硬校验（不支持的 `pool_strategy` / 词表外的能力名），
+        那类问题让预演与正式发布给出**同一个错误**。
       properties:
         code:
           type: string
@@ -1397,7 +1409,12 @@ components:
             - probe_failed
             - probe_unsupported
             - probe_unconfirmed
-        severity: { type: string, enum: [blocker, hint] }
+        severity:
+          type: string
+          enum: [blocker, hint]
+          description: |
+            `blocker` = 可行动的配置 / 可用流量发现（advisory，**不**阻断
+            正式发布）；`hint` = 网络探测提示（advisory）。
         subject: { type: string, description: 问题对象的主键（provider/deployment/model/route ID） }
         message: { type: string, description: 运营可读的一句话（绝不含凭据材料） }
       required: [code, severity, subject, message]
@@ -1433,12 +1450,19 @@ components:
         probes_failed: { type: integer }
         probes_unsupported: { type: integer, description: 供应商不提供该探测端点的条数 }
         probes_unconfirmed: { type: integer, description: 没得到任何答复的条数 }
-        blockers: { type: integer, description: 确定性配置问题的条数 }
+        blockers:
+          type: integer
+          description: |
+            可行动的配置 / 可用流量发现的条数。**advisory**：它们**不**阻断
+            正式发布（正式发布不读预演报告）。
         hints: { type: integer, description: 网络探测提示的条数 }
         all_probes_ok: { type: boolean }
         account_inventory_checked:
           type: boolean
-          description: 「无账号」判定是否真的查过账号清单；false = 该判定被跳过（未知，不是无账号）。
+          description: |
+            「无账号」判定是否**对每个 provider 都真的做了**。false = 账号
+            清单读面不可用，**或某次读失败** ⇒ 该判定被**跳过**（报告说
+            未知，不是无账号）。它**不**是「读过一次」的记号。
       required: [probes_total, probes_ok, probes_failed, probes_unsupported, probes_unconfirmed, blockers, hints, all_probes_ok, account_inventory_checked]
 
     PublishDryRunReport:

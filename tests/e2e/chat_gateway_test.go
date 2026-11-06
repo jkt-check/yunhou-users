@@ -1638,8 +1638,17 @@ func grantTinyQuotaEntitlement(t *testing.T, db *sqlx.DB, store *postgres.Store,
 }
 
 // TestChatContract_FacadeQuotaExceededIs429 pins the facade-native 429
-// source: 配额耗尽 → ErrChatRateLimited → 与 legacy 上游限流完全相同的
-// client envelope，且预占失败发生在任何上游调用之前（stub 不应被触达）。
+// source: 配额耗尽 → 429，且预占失败发生在任何上游调用之前（stub 不应被
+// 触达）。
+//
+// T6 变更：facade 的**本地**限制（业务速率 / 并发 / 额度 / 余额）与上游
+// 429 必须可区分 —— 请求从未出站，说明不得说成"上游限流"（那会让客户端
+// 去退避重试一个永远不会成功的请求）。因此额度耗尽的 message 改为带业务码
+// 的 `chat request rejected by a usage limit (quota_exceeded)`：
+//   - envelope 形状（{code,data,message}）与状态码 429 不变；
+//   - 上游 429 的文案（`chat upstream rate limit exceeded`）逐字节不变
+//     （caseChatContractUpstreamErrors 的 upstream_rate_limited 行仍然钉住它），
+//     legacy 后端与 facade 后端在同一个上游 429 上仍然逐字节一致。
 func TestChatContract_FacadeQuotaExceededIs429(t *testing.T) {
 	up := newChatStubUpstream(t)
 	env := setupChatContractFacade(t, up)
@@ -1652,9 +1661,9 @@ func TestChatContract_FacadeQuotaExceededIs429(t *testing.T) {
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("quota-exceeded facade /chat = %d, want 429 (%s)", w.Code, w.Body.String())
 	}
-	const wantBody = `{"code":429,"data":null,"message":"chat upstream rate limit exceeded"}`
+	const wantBody = `{"code":429,"data":null,"message":"chat request rejected by a usage limit (quota_exceeded)"}`
 	if w.Body.String() != wantBody {
-		t.Errorf("quota envelope = %s, want byte-exact legacy 429 shape %s", w.Body.String(), wantBody)
+		t.Errorf("quota envelope = %s, want byte-exact local-limit 429 shape %s", w.Body.String(), wantBody)
 	}
 	select {
 	case sent := <-up.lastBody:

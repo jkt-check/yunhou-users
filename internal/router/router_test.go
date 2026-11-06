@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yunhou/users/internal/handler"
+	"github.com/yunhou/users/internal/inference/httpapi"
 	"github.com/yunhou/users/internal/middleware"
 	"github.com/yunhou/users/internal/model"
 	"github.com/yunhou/users/internal/repo"
@@ -1049,5 +1051,138 @@ func TestSetup_UsageTokenQueryCacheMountedOnlyOnDashboardQueries(t *testing.T) {
 	}
 	if after := fake.callCount("listDevices"); after != before+1 {
 		t.Errorf("listDevices downstream calls after a successful write = %d, want %d (writes must invalidate the user's cache)", after, before+1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T6：/v1 外围每 IP 限流必须按入口协议渲染错误
+//
+// 外围防滥用桶挂在 /v1 group 的最外层（限流 → API Key 鉴权 → handler）。
+// 它拒绝请求时不能把管理 envelope（{code,error,message}）强塞给 /v1 ——
+// /v1/* 使用各自协议的原生错误形状（设计 §9.1）：OpenAI 的 error 对象，
+// Anthropic 的原生结构。
+// ---------------------------------------------------------------------------
+
+// setupV1Router 用真实的 router.Setup 装配一个引擎（其余依赖全部为 nil：
+// Setup 只注册路由，不触达依赖）。
+func setupV1Router(t *testing.T, accessOps *httpapi.AccessOps) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	Setup(t.Context(), engine,
+		nil,                               // healthPinger
+		nil, nil, nil, nil, nil, nil, nil, // repos (incl. auditLogRepo)
+		nil,           // tokenSvc
+		nil,           // authSvc
+		nil, nil, nil, // subSvc, planSvc, paymentSvc
+		nil,      // webhookVerifier
+		nil,      // wechatAPIv3Key
+		nil, nil, // providerTokenSvc, quoteSvc
+		nil,      // chatSvc
+		nil,      // chatAccessLog
+		nil, nil, // githubOAuthSvc, wechatOAuthSvc
+		false, // wechatOAuthMock
+		false, // wechatPayMock
+		"dev", // appEnv
+		nil,   // usageSvc
+		nil,   // usageTokenSvc
+		nil,   // adminModelsHandler
+		nil,   // adminOps
+		accessOps,
+		nil, // llmUsageSvc
+		nil, // relayHandler
+		nil, // adminOpsSvc
+		nil, // adminUsersSvc
+		[]string{"yundash"},
+	)
+	return engine
+}
+
+// TestSetup_V1PeripheralRateLimitUsesProtocolNativeError 打空 /v1 的每 IP
+// 防滥用桶，断言那个 429 按**实际入口协议**渲染：OpenAI 入口是 error 对象，
+// Anthropic 入口是原生结构；两者都不得带管理 envelope 的顶层 code，且
+// 拒绝发生在鉴权链之前（handler 从未被触达 ⇒ 零上游调用）。
+func TestSetup_V1PeripheralRateLimitUsesProtocolNativeError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var authCalls int
+	accessOps := &httpapi.AccessOps{
+		// 假鉴权：不设置 principal ⇒ handler 会回 401（不触达网关/上游）。
+		V1Auth: func(c *gin.Context) {
+			authCalls++
+			c.Next()
+		},
+		V1ChatCompletions: httpapi.NewChatCompletionsHandler(nil),
+		V1Messages:        httpapi.NewMessagesHandler(nil),
+		V1Responses:       httpapi.NewResponsesHandler(nil, nil, nil),
+	}
+	engine := setupV1Router(t, accessOps)
+
+	post := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"m","messages":[]}`))
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		return w
+	}
+	// 打空每 IP 桶，返回那次 429 与它期间鉴权中间件被触达的次数。
+	drain := func(path string) (*httptest.ResponseRecorder, int) {
+		t.Helper()
+		for i := 0; i < 800; i++ {
+			before := authCalls
+			w := post(path)
+			if w.Code == http.StatusTooManyRequests {
+				return w, authCalls - before
+			}
+		}
+		t.Fatalf("%s: the per-IP bucket never rejected a request", path)
+		return nil, 0
+	}
+
+	cases := []struct {
+		path      string
+		anthropic bool
+	}{
+		{"/v1/chat/completions", false},
+		{"/v1/messages", true},
+		{"/v1/responses", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			w, reached := drain(tc.path)
+			if reached != 0 {
+				t.Errorf("the auth chain ran %d times for a rejected request, want 0 (拒绝必须先于鉴权与上游)", reached)
+			}
+			if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+				t.Errorf("content-type = %q, want application/json", ct)
+			}
+			if w.Header().Get("Retry-After") == "" {
+				t.Error("a rate-limited response must carry Retry-After")
+			}
+			var doc map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+				t.Fatalf("decode: %v (%s)", err, w.Body.String())
+			}
+			if _, leaked := doc["code"]; leaked {
+				t.Errorf("management envelope leaked into %s: %s", tc.path, w.Body.String())
+			}
+			errObj, ok := doc["error"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s: the native error object is missing: %s", tc.path, w.Body.String())
+			}
+			if tc.anthropic {
+				if doc["type"] != "error" {
+					t.Errorf("anthropic envelope = %v, want type=error: %s", doc["type"], w.Body.String())
+				}
+				if errObj["type"] != "rate_limit_error" {
+					t.Errorf("anthropic error.type = %v, want rate_limit_error: %s", errObj["type"], w.Body.String())
+				}
+				return
+			}
+			if errObj["type"] != "rate_limit_error" {
+				t.Errorf("error.type = %v, want rate_limit_error: %s", errObj["type"], w.Body.String())
+			}
+			if errObj["code"] != "rate_limited" {
+				t.Errorf("error.code = %v, want rate_limited: %s", errObj["code"], w.Body.String())
+			}
+		})
 	}
 }

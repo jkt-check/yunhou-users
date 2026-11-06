@@ -76,6 +76,15 @@ type Store interface {
 	// exactly like the Key's RPM limit above — so the cap that applies is
 	// always the one in force now, never a stale authentication snapshot.
 	GetAPIKeyConcurrencyLimitTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (int, error)
+	// GetAPIKeyBudgetTx reads the customer Key's OWN cumulative budget
+	// (limit + used) inside the caller's transaction. A nil limit = the key
+	// sets no budget.
+	//
+	// It is the admission's PERMANENT-blocker probe: the budget is
+	// cumulative (never reset by a window), so a budget that cannot cover
+	// the hold is never unblocked by a window reset. The API layer must
+	// know that before it promises a countdown (设计 §9.1).
+	GetAPIKeyBudgetTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (limit *domain.Microcredit, used domain.Microcredit, err error)
 }
 
 // ActivateWindowsCommand is the input of in-transaction window resolution
@@ -307,7 +316,11 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	// commits. 剩余可用 < 安全预占上界 → quota_exceeded + 缺口信息，不静默
 	// 钳制（设计 §7.2 补充条款）。
 	if err := EvaluateAdmission(cmd.Policy, windows, hold, at); err != nil {
-		return rollback(withDeficit(err, cmd.Policy, windows, hold))
+		// 纯规则只看得见窗口；Key 的累计预算是**永久**阻断项（不按周期
+		// 清零），窗口重置永远解不开它 —— 必须一并报齐，否则 API 层会为
+		// 一个注定失败的请求编造倒计时（设计 §9.1）。
+		return rollback(s.withKeyBudgetBlock(ctx, uow, cmd, hold,
+			withDeficit(err, cmd.Policy, windows, hold)))
 	}
 
 	req := cmd.Request
@@ -654,6 +667,52 @@ func withDeficit(err error, p Policy, windows []domain.QuotaWindow, hold domain.
 	}
 	if deficit > 0 && qe.DeficitMicros == nil {
 		d := deficit
+		qe.DeficitMicros = &d
+	}
+	return qe
+}
+
+// withKeyBudgetBlock completes the blocking set of a pure-rule rejection
+// with the customer Key's CUMULATIVE budget.
+//
+// The pure evaluation (EvaluateAdmission) only sees the window constraints.
+// The Key budget is a separate constraint with NO time-based recovery: it
+// is cumulative (budget_micros 永不按周期清零，只在账务更正时回退), so a
+// window reset can never lift it. Without this step the API layer would
+// answer 429 with the window's reset instant for a request that can never
+// succeed — a fabricated countdown (设计 §9.1: 只有全部阻断条件可确定时
+// 才提供可信的重试时刻).
+//
+// The budget is read as a DATABASE fact inside the admission transaction:
+// the same truth the hold itself applies (postgres.Reserve 的条件 UPDATE:
+// budget_used + hold <= budget_limit). A request without a customer Key
+// (the /chat facade) has no Key budget at all — the pure rule's blocking
+// set is already complete for it.
+func (s *Service) withKeyBudgetBlock(ctx context.Context, uow domain.UnitOfWork, cmd AdmitCommand,
+	hold domain.Microcredit, err error) error {
+	var qe *domain.QuotaExceededError
+	if !errors.As(err, &qe) || cmd.Request.APIKeyID == nil {
+		return err
+	}
+	limit, used, perr := s.store.GetAPIKeyBudgetTx(ctx, uow, *cmd.Request.APIKeyID)
+	if perr != nil {
+		// 存储读失败：fail closed（拒绝新推理），绝不把存储故障伪装成额度耗尽。
+		return domain.WrapError(domain.CodeServiceUnavailable,
+			"inference: key budget unavailable", perr)
+	}
+	if limit == nil {
+		// 该 Key 没有预算 → 纯规则给出的阻断集合已经是完整的。
+		return err
+	}
+	shortfall := used + hold - *limit
+	if shortfall <= 0 {
+		// 预算够用 → Key 预算不是阻断项，窗口的恢复时刻仍然可信。
+		return err
+	}
+	qe.KeyBudgetExhausted = true
+	// 缺口：所有阻断约束里最大的那个（窗口与 Key 预算必须同时满足）。
+	if qe.DeficitMicros == nil || *qe.DeficitMicros < shortfall {
+		d := shortfall
 		qe.DeficitMicros = &d
 	}
 	return qe

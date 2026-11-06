@@ -54,6 +54,12 @@ type fakeStore struct {
 	// read inside the admission transaction). 0 = the Key sets no limit.
 	keyConcurrencyLimit int
 
+	// T6: the customer Key's own cumulative budget (a database fact read
+	// inside the admission transaction). nil limit = the Key sets no budget.
+	keyBudgetLimit *domain.Microcredit
+	keyBudgetUsed  domain.Microcredit
+	keyBudgetErr   error
+
 	// Task 4: the persistent rate reservation (business RPM/TPM gate).
 	rateErr  error
 	rateCmds []domain.RateReserveCommand
@@ -129,6 +135,15 @@ func (s *fakeStore) AcquireLeaseTx(ctx context.Context, uow domain.UnitOfWork, c
 // GetAPIKeyConcurrencyLimitTx: Task 5 —— Key 自己的并发上限（数据库事实）。
 func (s *fakeStore) GetAPIKeyConcurrencyLimitTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (int, error) {
 	return s.keyConcurrencyLimit, nil
+}
+
+// GetAPIKeyBudgetTx: T6 —— Key 自己的累计预算（数据库事实）。nil limit =
+// 该 Key 没有预算。
+func (s *fakeStore) GetAPIKeyBudgetTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (*domain.Microcredit, domain.Microcredit, error) {
+	if s.keyBudgetErr != nil {
+		return nil, 0, s.keyBudgetErr
+	}
+	return s.keyBudgetLimit, s.keyBudgetUsed, nil
 }
 
 func serviceFixture(t *testing.T) (*Service, *fakeStore, AdmitCommand) {
@@ -334,5 +349,70 @@ func TestReleaseAdmissionDelegates(t *testing.T) {
 	}
 	if fs.uow.commits != 1 {
 		t.Errorf("commits = %d, want 1", fs.uow.commits)
+	}
+}
+
+// T6：Key 的累计预算是**永久**阻断项（budget_micros 不按周期清零，只在
+// 账务更正时回退）。当它与窗口同时阻断时，拒绝必须把两项一起报齐 ——
+// 否则 API 层会为一个注定失败的请求编造倒计时（设计 §9.1: 只有全部阻断
+// 条件可确定时才提供可信的重试时刻）。
+func TestAdmitQuotaExceededReportsExhaustedKeyBudget(t *testing.T) {
+	svc, fs, cmd := serviceFixture(t)
+	// 五小时窗口只剩 5_000（预占上界 18_192 → 窗口也阻断）。
+	fs.windows[0].Used = 995_000
+	// Key 预算已用尽：再预占 18_192 必然超限。
+	limit := domain.Microcredit(1_000)
+	fs.keyBudgetLimit = &limit
+	fs.keyBudgetUsed = 1_000
+
+	_, err := svc.Admit(context.Background(), cmd)
+	var qe *domain.QuotaExceededError
+	if !errors.As(err, &qe) {
+		t.Fatalf("err = %v, want QuotaExceededError", err)
+	}
+	if len(qe.BlockedBy) != 1 || qe.BlockedBy[0].Kind != domain.WindowFiveHour {
+		t.Errorf("blocked by %+v, want five_hour", qe.BlockedBy)
+	}
+	if !qe.KeyBudgetExhausted {
+		t.Errorf("the permanent Key budget blocker must be reported: %+v", qe)
+	}
+	// 缺口 = 各阻断约束里最大的缺口（窗口 13_192 / Key 预算 18_192）。
+	if qe.DeficitMicros == nil || *qe.DeficitMicros != 18_192 {
+		t.Errorf("deficit = %v, want 18192", qe.DeficitMicros)
+	}
+	if fs.uow.commits != 0 || fs.uow.rollbacks != 1 {
+		t.Errorf("commits=%d rollbacks=%d, want 0/1", fs.uow.commits, fs.uow.rollbacks)
+	}
+}
+
+// 预算充足（或该 Key 没有预算）时，Key 预算不是阻断项：窗口的恢复时刻
+// 仍然可信，纯规则给出的阻断集合保持完整。
+func TestAdmitQuotaExceededKeepsWindowOnlyWhenKeyBudgetIsHealthy(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		limit *domain.Microcredit
+		used  domain.Microcredit
+	}{
+		{"no_budget", nil, 0},
+		{"budget_available", func() *domain.Microcredit { l := domain.Microcredit(1_000_000); return &l }(), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, fs, cmd := serviceFixture(t)
+			fs.windows[0].Used = 995_000
+			fs.keyBudgetLimit = tc.limit
+			fs.keyBudgetUsed = tc.used
+
+			_, err := svc.Admit(context.Background(), cmd)
+			var qe *domain.QuotaExceededError
+			if !errors.As(err, &qe) {
+				t.Fatalf("err = %v, want QuotaExceededError", err)
+			}
+			if qe.KeyBudgetExhausted {
+				t.Errorf("the Key budget is not a blocker here: %+v", qe)
+			}
+			if qe.DeficitMicros == nil || *qe.DeficitMicros != 18_192-5_000 {
+				t.Errorf("deficit = %v, want %d", qe.DeficitMicros, 18_192-5_000)
+			}
+		})
 	}
 }

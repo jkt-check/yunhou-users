@@ -129,6 +129,38 @@ func (s *Store) GetAPIKeyConcurrencyLimitTx(ctx context.Context, w domain.UnitOf
 	return int(limit.Int64), nil
 }
 
+// GetAPIKeyBudgetTx reads the customer Key's OWN cumulative budget (limit +
+// used) inside the caller's transaction. A nil limit = the Key sets no
+// budget (NULL).
+//
+// The budget is a DATABASE fact read in the admission transaction, exactly
+// like the Key's RPM and concurrency limits (Task 4/Task 5): the state that
+// applies is always the one in force at admission time, never a stale
+// snapshot taken at authentication.
+//
+// It mirrors the condition the hold itself applies in Reserve
+// (budget_used_micros + amount <= budget_limit_micros), so the admission
+// can tell whether the Key budget is one of the blocking constraints.
+func (s *Store) GetAPIKeyBudgetTx(ctx context.Context, w domain.UnitOfWork, keyID string) (*domain.Microcredit, domain.Microcredit, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, 0, err
+	}
+	var limit sql.NullInt64
+	var used int64
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT budget_limit_micros, budget_used_micros
+		   FROM inference_api_keys WHERE id = $1`, keyID).
+		Scan(&limit, &used); err != nil {
+		return nil, 0, mapError("get api key budget", err)
+	}
+	if !limit.Valid {
+		return nil, domain.Microcredit(used), nil
+	}
+	l := domain.Microcredit(limit.Int64)
+	return &l, domain.Microcredit(used), nil
+}
+
 // RevokeAPIKey flips an active key to revoked, stamping revoked_at.
 // Idempotent: an already-revoked/expired row reports changed=false.
 func (s *Store) RevokeAPIKey(ctx context.Context, id string, at time.Time) (bool, error) {

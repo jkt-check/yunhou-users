@@ -246,6 +246,15 @@ func chatErrorMapping(err error) (int, string) {
 		return http.StatusNotFound, service.ErrChatNotEnabled.Error()
 	case errors.Is(err, service.ErrChatNoAccess):
 		return http.StatusForbidden, service.ErrChatNoAccess.Error()
+	case errors.Is(err, service.ErrChatRequestLimited):
+		// 本地限制拒绝（业务速率 / 并发 / 额度 / 余额）：请求从未出站，
+		// 说明必须说清是哪一类限制 —— 不能沿用上游 429 的文案。
+		log.Printf("chat: request rejected by a usage limit: %v", err)
+		var lim *service.ChatLimitError
+		if errors.As(err, &lim) {
+			return http.StatusTooManyRequests, lim.Error()
+		}
+		return http.StatusTooManyRequests, service.ErrChatRequestLimited.Error()
 	case errors.Is(err, service.ErrChatConcurrencyLimited):
 		// 单用户并发流上限（2026-10 审计加固）——放在 ErrChatRateLimited
 		// 之前：ChatConcurrencyLimitError 的 Unwrap 同时匹配两者。

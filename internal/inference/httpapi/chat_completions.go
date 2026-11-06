@@ -447,10 +447,16 @@ func writeV1DomainError(c *gin.Context, err error) {
 // quotaExceededDetails renders the shared quota message and the Retry-After
 // seconds (0 = unknown recovery — 不能编造倒计时). All three protocol
 // surfaces (chat/messages/responses) render the same 429 detail.
+//
+// The Key budget is a CUMULATIVE constraint (budget_micros 永不按周期清零,
+// 只在账务更正时回退) — a window reset can never lift it. So a request
+// blocked by the Key budget has NO determinable recovery instant: promising
+// the window's reset would send the client into a retry loop that cannot
+// succeed (设计 §9.1: 只有全部阻断条件可确定时才提供可信的重试时刻).
 func quotaExceededDetails(qe *domain.QuotaExceededError) (message string, retryAfterSecs int) {
 	message = "quota exceeded"
 	kinds := ""
-	allKnown := len(qe.BlockedBy) > 0
+	allKnown := len(qe.BlockedBy) > 0 && !qe.KeyBudgetExhausted
 	var reset time.Time
 	for i, b := range qe.BlockedBy {
 		if i > 0 {

@@ -814,8 +814,16 @@ paths:
             rate_limit_error（业务速率限制：`rate_limited` = 账户/策略/Key 的
             RPM 或账户级 TPM 上限；`quota_exceeded` = 额度耗尽；
             `insufficient_capacity` = 并发上限（账户级权益策略上限、Key 级
-            `concurrency_limit` 或上游账号容量）已满。可计算恢复时刻
-            时带 Retry-After）
+            `concurrency_limit` 或上游账号容量）已满。
+
+            **Anthropic 原生错误形状没有 `code` 字段**：业务区分落在
+            `error.message`（`rate limit exceeded: blocked by …` /
+            `quota exceeded: blocked by …` / `… at concurrency limit …`）。
+            外围每 IP 防滥用桶的拒绝同样是本形状（`rate_limit_error`）。
+
+            **Retry-After 只在每个阻断条件都有可确定恢复时刻时给出**：Key 的
+            累计预算（`budget_micros`，不按周期清零）是永久阻断项 —— 它与
+            窗口同时阻断时**不带** Retry-After（窗口重置解不开它）。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -922,7 +930,11 @@ paths:
             quota_exceeded / rate_limited / insufficient_capacity（可计算恢复时刻时带
             Retry-After）。`insufficient_capacity` = 并发上限已满（账户级权益策略
             上限、Key 级 `concurrency_limit`、或上游账号容量）—— 与金额/速率限制
-            严格分开。
+            严格分开。外围每 IP 防滥用桶的拒绝同样是本形状（`rate_limited`）。
+
+            **Retry-After 只在每个阻断条件都有可确定恢复时刻时给出**：Key 的
+            累计预算（`budget_micros`，不按周期清零）是永久阻断项 —— 它与
+            窗口同时阻断时**不带** Retry-After（窗口重置解不开它）。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -1018,6 +1030,11 @@ paths:
             RPM 与账户级 TPM 上限）：它与金额额度耗尽（quota_exceeded）严格分开，
             充值/切换 PAYG 不能绕过。`insufficient_capacity` 是**并发上限**已满
             （账户级权益策略上限、Key 级 `concurrency_limit`、或上游账号容量）。
+            外围每 IP 防滥用桶的拒绝同样是本形状（`rate_limited`）。
+
+            **Retry-After 只在每个阻断条件都有可确定恢复时刻时给出**：Key 的
+            累计预算（`budget_micros`，不按周期清零）是永久阻断项 —— 它与
+            窗口同时阻断时**不带** Retry-After（窗口重置解不开它）。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -1055,6 +1072,18 @@ paths:
                 $ref: "#/components/schemas/ModelList"
         "401":
           description: invalid_api_key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+        "429":
+          description: |
+            rate_limited（外围每 IP 防滥用桶；模型列表不进入业务准入，
+            因此不会出现 quota_exceeded / insufficient_capacity）。原生形状 +
+            Retry-After。
+          headers:
+            Retry-After:
+              schema: { type: integer }
           content:
             application/json:
               schema:
@@ -1831,7 +1860,10 @@ components:
       required: [error]
     AnthropicError:
       type: object
-      description: Anthropic 原生错误形状（messages 面）。
+      description: |
+        Anthropic 原生错误形状（messages 面）。原生形状**没有 code 字段** ——
+        业务区分（rate_limited / quota_exceeded / insufficient_capacity）
+        落在 error.message 上。
       properties:
         type: { type: string, enum: [error] }
         error:

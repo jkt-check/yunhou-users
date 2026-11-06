@@ -311,6 +311,51 @@ func leaseIDSet(leases []*domain.ConcurrencyLease) map[string]struct{} // 按租
 **Tests:** `internal/router/router_test.go`、`httpapi/{protocol_error_edges_test,apikey_auth_edges_test,v1_protocol_test}.go`。
 **Interfaces:** 错误按实际入口协议渲染；复用已有 native error helper，通用 middleware 不能将管理 envelope 强塞给 `/v1`。
 
+**实际签名（T6 实施后回填）：**
+
+```go
+// internal/middleware/ratelimit.go —— 限流拒绝的**可注入响应器**
+// 通用中间件只管「谁被限了」，**形状由响应器决定**：管理面用管理 envelope，
+// /v1 协议面用协议原生形状（设计 §9.1：通用中间件不得把管理 envelope 强塞给 /v1）。
+type RateLimitResponder func(c *gin.Context, retryAfter string)
+func ManagementRateLimitResponder(c *gin.Context, retryAfter string) // 默认：{code,error,message}
+func RateLimitWithResponder(ctx context.Context, r float64, burst int, respond RateLimitResponder) gin.HandlerFunc
+func RateLimitWithKeyResponder(ctx context.Context, r float64, burst int, key func(*gin.Context) string, respond RateLimitResponder) gin.HandlerFunc
+// RateLimit / RateLimitWithKey = 上两者的默认组合（管理 envelope）。
+
+// internal/inference/httpapi/apikey_auth.go —— 复用既有 native helper
+func v1Error(c *gin.Context, status int, typ, code, message string)     // OpenAI：{"error":{message,type,code}}
+func anthropicError(c *gin.Context, status int, typ, message string)   // Anthropic：{"type":"error","error":{type,message}}
+func isAnthropicV1Path(path string) bool                              // /v1/messages → Anthropic 形状
+func V1RateLimitResponder(c *gin.Context, retryAfter string)           // 外围每 IP 桶的协议原生拒绝
+
+// internal/router/router.go —— /v1 group 挂协议原生的外围限流器
+v1 := engine.Group("/v1",
+    middleware.RateLimitWithResponder(ctx, 60, 120, httpapi.V1RateLimitResponder),
+    accessOps.V1Auth)
+
+// internal/inference/httpapi/chat_completions.go —— Retry-After 的可信性规则
+// 只有**每个**阻断条件都有可确定恢复时刻时才给倒计时；Key 的累计预算
+// （budget_micros，不按周期清零）是永久阻断项 → 与窗口同时阻断时不给。
+func quotaExceededDetails(qe *domain.QuotaExceededError) (message string, retryAfterSecs int)
+
+// internal/inference/quota/service.go —— 把「永久阻断项」一并报齐
+type Store interface {
+    /* … */
+    // Key 的累计预算是**数据库事实**（与 Key 的 RPM/并发限额同构，准入事务内读）。
+    // 它是准入的**永久阻断探针**：预算不按周期清零，窗口重置永远解不开它 ——
+    // API 层必须先知道这一点，才不会为一个注定失败的请求编造倒计时。
+    GetAPIKeyBudgetTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (limit *domain.Microcredit, used domain.Microcredit, err error)
+}
+func (s *Service) withKeyBudgetBlock(ctx context.Context, uow domain.UnitOfWork, cmd AdmitCommand, hold domain.Microcredit, err error) error
+
+// internal/service/errors.go —— /chat 的本地限制哨兵（保留既有 envelope）
+var ErrChatRequestLimited = errors.New("chat request rejected by a usage limit")
+type ChatLimitError struct{ Code string } // rate_limited / insufficient_capacity / quota_exceeded / insufficient_balance
+func (e *ChatLimitError) Error() string
+func (e *ChatLimitError) Unwrap() []error // {ErrChatRequestLimited, ErrChatRateLimited}：准确语义 + 既有 429 退避路径不变
+```
+
 - [ ] 三个 `/v1` 推理入口分别测试外围 IP 429、业务 RPM/TPM 429、并发/金额配额 429；OpenAI 为 error 对象，Anthropic 为其原生结构，Content-Type 正确，零上游调用。
 - [ ] `/chat` 保留既有 envelope，新增限制映射为准确的业务码/说明，不能全部降为 generic 502。
 - [ ] 修复永久 Key 预算耗尽与窗口同时阻断时的恢复时间表达；只有全部阻断条件可确定时才提供可信的重试时刻。

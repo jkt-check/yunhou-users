@@ -116,6 +116,8 @@ func newProtoFixture(t *testing.T) *protoFixture {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	v1 := engine.Group("/v1", httpapi.APIKeyAuth(f.resolver))
+	// 三个协议入口同挂一个引擎：T6 的协议矩阵需要逐入口对比同一组限制。
+	v1.POST("/chat/completions", httpapi.NewChatCompletionsHandler(f.gw).Create)
 	v1.POST("/messages", httpapi.NewMessagesHandler(f.gw).Create)
 	v1.POST("/responses", f.respHandler.Create)
 	f.engine = engine

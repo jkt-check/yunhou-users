@@ -120,7 +120,7 @@ JSON business endpoints generally return:
 - `data`: response payload on success, null on error
 - `message`: null on success, error description on error
 
-Exceptions: `GET /.well-known/jwks.json` returns a raw JWKS object, while successful OAuth redirect/callback endpoints return HTTP 302 redirects rather than JSON.
+Exceptions: `GET /.well-known/jwks.json` returns a raw JWKS object, while successful OAuth redirect/callback endpoints return HTTP 302 redirects rather than JSON. The `/v1/*` standard-protocol surface is also an exception: it renders **each protocol's native shapes** (OpenAI `{"error":{"message","type","code"}}`, Anthropic `{"type":"error","error":{"type","message"}}`) and never the management envelope — including the rejections of the generic middleware (the per-IP abuse guard answers with the protocol-native shape, not `{code,data,message}`).
 
 ## Endpoints
 

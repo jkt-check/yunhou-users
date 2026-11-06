@@ -629,6 +629,19 @@ Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改�
 - 认证失败、模型未授权、请求形状非法的请求**不进入**业务准入（不占额度）。
 - 数据库不可用时网关 **fail closed**：拒绝新的推理请求并返回 HTTP **503** `service_unavailable` —— 绝不会伪装成"额度耗尽"。
 
+**`/v1/*` 的错误形状（协议原生，绝不套管理 envelope）**
+
+`/v1/*` 的每个入口按**它自己说的协议**渲染错误；通用中间件（外围每 IP 防滥用桶）也遵守同一约定 —— 它拒绝请求时给的是协议原生形状，不是 `{code,data,message}` 管理 envelope。
+
+| 入口 | 错误形状 | 429 的业务区分落在哪 |
+|---|---|---|
+| `POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models` | OpenAI 原生 `{"error":{"message","type","code"}}` | `error.code`：`rate_limited`（业务速率）/ `quota_exceeded`（额度耗尽）/ `insufficient_balance`（余额或支出上限不足）/ `insufficient_capacity`（并发上限已满）；`error.type` 恒为 `rate_limit_error` |
+| `POST /v1/messages` | Anthropic 原生 `{"type":"error","error":{"type","message"}}` | Anthropic 原生形状**没有 code 字段**：业务区分落在 `error.message`（`rate limit exceeded: blocked by …` / `quota exceeded: blocked by …` / `… at concurrency limit …`），`error.type` 恒为 `rate_limit_error` |
+
+- **外围每 IP 防滥用桶**（60 次/秒，突发 120）挂在 `/v1` group 外层：它的拒绝同样是协议原生形状（`rate_limit_error` / `rate_limited`），带 `Retry-After`，且发生在鉴权与准入之前 —— 客户端只会看到这个答复，请求从未出站、零计费。
+- **`Retry-After` 只在每个阻断条件都有可确定恢复时刻时给出**（设计 §9.1：未知恢复不能编造倒计时）。已知的两种"不可确定"：账户级 TPM 被**在途**预占卡住（真实消耗未知）；Key 的**累计预算** `budget_micros` 耗尽 —— 它不按周期清零，**窗口重置永远解不开它**，因此它与窗口同时阻断时答复**不带** `Retry-After`（错误 message 会点名 `key budget exhausted`）。
+- 三类限制的错误码严格分开：业务速率 `rate_limited`、金额额度 `quota_exceeded`（含余额/支出上限不足 `insufficient_balance`）、并发 `insufficient_capacity`。充值/切换 PAYG/换套餐只能解开**金额**那一类；速率与并发限制花钱也解不开。
+
 **Key 级并发限制（`concurrency_limit`，跨实例共享）**
 
 客户可以在 `/user/api-keys` 为**每个 Key** 单独设一个并发上限（`concurrency_limit`）；它与上面的速率限制是**两套独立闸门**，但共享同一个准入事务。
@@ -751,10 +764,16 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 | 404 | `chat is not enabled` | 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` |
 | 429 | `too many requests` | 触发每 IP 限流桶（10 次/秒，突发 20） |
 | 429 | `chat upstream rate limit exceeded` | 上游限流——该 provider 所有可用 key 均被上游限流（冷却中的 key 仍会被取出尝试，返回 429 即最后一次尝试仍被上游 429） |
+| 429 | `chat request rejected by a usage limit (rate_limited)` | **本地**业务速率限制（账户/策略/Key 的 RPM 与账户级 TPM）：请求**从未出站**，充值/切换 PAYG 不能绕过 |
+| 429 | `chat request rejected by a usage limit (insufficient_capacity)` | **本地**并发上限已满（账户级权益策略上限；`/chat` 以用户 JWT 调用，无 Key 级上限）——正确处理是等待在途流结束 |
+| 429 | `chat request rejected by a usage limit (quota_exceeded)` | **本地**额度耗尽（套餐三窗口 / Key 预算耗尽）：请求从未出站 |
+| 429 | `chat request rejected by a usage limit (insufficient_balance)` | **本地**余额/支出上限不足（钱包门控）：请求从未出站 |
 | 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——重试同样的请求必败，但改写请求后可能成功。此时 `data` 不为 null，携带结构化上游信息：`upstream_status`（真实上游状态码）、`upstream_code`（归一化分类：`context_length_exceeded` 上下文超长 / `content_filter` 内容审核拦截 / `insufficient_balance` 上游余额不足 / `invalid_request` 其他请求问题）、`upstream_message`（脱敏截断后的上游错误消息，约 300 字节） |
 | 502 | `chat upstream error` | 上游 5xx 或网络错误（该 provider 所有可用 key 均已尝试） |
 
-**客户端重试指引**：400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试；502 `chat request rejected by upstream` → 按 `data.upstream_code` 分类处理：`context_length_exceeded` → 裁剪会话历史后重试（改写后的请求可能成功）；`insufficient_balance` / `content_filter` / `invalid_request` → 原样重试必败，需引导用户调整；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
+**客户端重试指引**：400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试（**例外**：`chat request rejected by a usage limit (insufficient_capacity)` 与 `too many concurrent chat streams` 的正确处理是**等待在途流结束**，`(quota_exceeded)` / `(insufficient_balance)` 需要充值或换套餐，原样重试必败）；502 `chat request rejected by upstream` → 按 `data.upstream_code` 分类处理：`context_length_exceeded` → 裁剪会话历史后重试（改写后的请求可能成功）；`insufficient_balance` / `content_filter` / `invalid_request` → 原样重试必败，需引导用户调整；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
+
+**本地限制与上游 429 的区分**：`chat upstream rate limit exceeded` 指**上游**返回 429（请求已出站）；`chat request rejected by a usage limit (<业务码>)` 指**本地**闸门（业务速率 / 并发 / 额度 / 余额）在准入阶段拒绝，请求**从未出站**、不计费。两者都是 429，客户端都应退避重试，但只有后者需要充值/换套餐/等待在途流结束。`/chat` 保留既有 `{code,data,message}` envelope；业务码出现在 `message` 里（envelope 没有独立的符号码字段）。
 
 **超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 15 分钟，订阅门禁的 DB 查询另有 10s 上限。Anthropic 协议模型的输出强制封顶 8192 token（超出时上游以 `finish_reason=length` 截断）；OpenAI 协议模型按目录设计不携带 `max_tokens`（该字段仅发 Anthropic provider），输出长度由上游默认行为决定。单用户并发流式请求上限 8 条，超限返回 429（`too many concurrent chat streams`）——此类 429 的正确处理是**等待在途流结束**，与速率限制 429 的退避重试不同。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、上游 4xx 拒绝时的 `upstream_status` / `upstream_code`（与错误响应 `data` 中的分类一致，用于事后统计错误分布）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。所有行的输入都按每条消息 1 KiB 截断（`input_truncated` 标记；2026-10 前仅错误行截断），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII）；`ops/logrotate.conf` 已默认带该文件（`/var/log/yunhou/chat-access.log`）的轮转段——若 `CHAT_LOG_PATH` bind-mount 到其他路径，需同步调整该配置。
 

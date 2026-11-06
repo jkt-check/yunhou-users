@@ -62,15 +62,42 @@ func v1Error(c *gin.Context, status int, typ, code, message string) {
 	})
 }
 
+// isAnthropicV1Path reports whether the request speaks the Anthropic
+// protocol (POST /v1/messages). The Anthropic error taxonomy differs from
+// the OpenAI one, so every renderer that has to pick a shape asks here.
+func isAnthropicV1Path(path string) bool {
+	return strings.HasSuffix(path, "/v1/messages")
+}
+
 // v1AuthError writes the auth-chain error in the shape of the protocol the
 // route speaks: Anthropic-native for /v1/messages (设计 §9.1: 各自协议的
 // 原生错误), the OpenAI /v1 shape elsewhere.
 func v1AuthError(c *gin.Context, status int, typ, code, message string) {
-	if strings.HasSuffix(c.Request.URL.Path, "/v1/messages") {
+	if isAnthropicV1Path(c.Request.URL.Path) {
 		anthropicError(c, status, typ, message)
 		return
 	}
 	v1Error(c, status, typ, code, message)
+}
+
+// V1RateLimitResponder renders the /v1 perimeter rejection (the per-IP abuse
+// guard mounted in front of the /v1 group) in the shape of the protocol the
+// route speaks: Anthropic-native for /v1/messages, the OpenAI /v1 error
+// object elsewhere.
+//
+// It exists because the generic limiter middleware renders the MANAGEMENT
+// envelope — which must never be forced onto /v1 (设计 §9.1: /v1/* 使用
+// 各自协议的原生 body 与错误). The rejection happens before authentication
+// and before any upstream call, so the response is the client's only signal.
+func V1RateLimitResponder(c *gin.Context, retryAfter string) {
+	if retryAfter != "" {
+		c.Header("Retry-After", retryAfter)
+	}
+	if isAnthropicV1Path(c.Request.URL.Path) {
+		anthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "too many requests")
+		return
+	}
+	v1Error(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited", "too many requests")
 }
 
 // APIKeyAuth authenticates /v1/* requests by customer API key.

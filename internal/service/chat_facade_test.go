@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -719,6 +720,48 @@ func TestModalitiesOrDefault(t *testing.T) {
 				if got[i] != tc.want[i] {
 					t.Fatalf("modalitiesOrDefault(%v) = %v, want %v", tc.in, got, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// T6：/chat 保留既有 envelope，但**本地**限制拒绝（业务速率 / 并发 /
+// 额度 / 余额）必须映射成准确的业务码与说明 —— 不得降级成 generic 502
+// （insufficient_balance 之前就是 502 chat upstream error），文案也不得
+// 把一个从未出站的请求说成"上游限流"。
+//
+// 这一层是 /chat 限制语义的根因：facade 决定了 handler 看到的哨兵，
+// handler 只按哨兵映射状态码与文案。
+func TestMapGatewayError_LocalLimitsAreNotUpstreamErrors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"insufficient_balance", domain.NewError(domain.CodeInsufficientBalance, "wallet balance too low")},
+		{"quota_exceeded", domain.NewError(domain.CodeQuotaExceeded, "plan quota exhausted")},
+		{"quota_exceeded_window", domain.NewQuotaExceeded(
+			[]domain.WindowBlock{{Kind: domain.WindowFiveHour}}, false)},
+		{"rate_limited", domain.NewError(domain.CodeRateLimited, "account rpm exceeded")},
+		{"typed_rate_limited", &domain.RateLimitError{
+			Detail: domain.NewError(domain.CodeRateLimited, "account rpm exceeded"),
+		}},
+		{"insufficient_capacity", domain.NewError(domain.CodeInsufficientCapacity, "concurrency limit reached")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := mapGatewayError(c.err)
+			if errors.Is(got, ErrChatUpstreamError) {
+				t.Errorf("a local usage limit must not be degraded to the generic upstream 502: %v", got)
+			}
+			if !errors.Is(got, ErrChatRateLimited) && !errors.Is(got, ErrChatConcurrencyLimited) {
+				t.Errorf("mapGatewayError = %v, want a 429-class limit error", got)
+			}
+			if !errors.Is(got, ErrChatRequestLimited) {
+				t.Errorf("mapGatewayError = %v, want the local-limit sentinel ErrChatRequestLimited", got)
+			}
+			if strings.Contains(got.Error(), "upstream") {
+				t.Errorf("the message must not blame the upstream for a local limit: %q", got.Error())
 			}
 		})
 	}

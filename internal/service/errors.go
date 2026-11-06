@@ -89,6 +89,11 @@ var (
 	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
 	ErrChatUpstreamError    = errors.New("chat upstream error")
 	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")
+	// ErrChatRequestLimited: /chat 的**本地**限制拒绝（业务速率 RPM/TPM、
+	// 并发上限、额度/余额不足、Key 预算耗尽）。这类请求**从未出站** ——
+	// 与 ErrChatRateLimited（上游 429，文案说的是上游）严格分开：客户端
+	// 看到的说明必须说清是本地限制，绝不能把一个没出站的请求说成上游错误。
+	ErrChatRequestLimited = errors.New("chat request rejected by a usage limit")
 	// ErrChatNotReady: 服务未就绪（目录冷启动无快照 / 默认模型未发布）。
 	// 映射 503 + Retry-After，与 403（无权限）严格区分。
 	ErrChatNotReady = errors.New("chat service is temporarily unavailable")
@@ -137,6 +142,31 @@ func (e *ChatUpstreamRejection) Error() string {
 }
 
 func (e *ChatUpstreamRejection) Unwrap() error { return ErrChatUpstreamRejected }
+
+// ChatLimitError is the /chat LOCAL limit rejection (business RPM/TPM,
+// concurrency cap, quota/balance exhaustion, Key budget): it carries the
+// business code so the client can tell the classes apart (the /chat
+// envelope has no separate code field — the HTTP status is the code and
+// the message names the class).
+//
+// It unwraps to BOTH sentinels: ErrChatRequestLimited is the accurate one
+// for a local limit, and ErrChatRateLimited stays as the compatibility
+// bridge so every existing "429 → back off and retry" client path keeps
+// working unchanged (the local limit is a 429 for the client either way).
+type ChatLimitError struct {
+	// Code is the business code: rate_limited / insufficient_capacity /
+	// quota_exceeded / insufficient_balance.
+	Code string
+}
+
+func (e *ChatLimitError) Error() string {
+	return fmt.Sprintf("%s (%s)", ErrChatRequestLimited, e.Code)
+}
+
+// Unwrap exposes both sentinels (Go multi-error unwrapping).
+func (e *ChatLimitError) Unwrap() []error {
+	return []error{ErrChatRequestLimited, ErrChatRateLimited}
+}
 
 // AdminParamError carries a client-safe validation message for the
 // dashboard admin API (invalid tz / empty search query / ...). It unwraps

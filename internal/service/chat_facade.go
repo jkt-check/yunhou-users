@@ -231,10 +231,16 @@ func (f *ChatGatewayFacade) notReadyLogDue() bool {
 // mapGatewayError projects the unified internal error codes onto the legacy
 // ErrChat* sentinels, keeping the /chat error shape (envelope + statuses)
 // byte-compatible.
+//
+// The LOCAL limit classes (business RPM/TPM, concurrency, quota/balance, Key
+// budget) map onto ChatLimitError: the request never reached an upstream,
+// so the client-facing message must say so — ErrChatRateLimited's wording
+// ("chat upstream rate limit exceeded") is reserved for a real upstream 429.
 func mapGatewayError(err error) error {
 	var qe *domain.QuotaExceededError
 	if errors.As(err, &qe) {
-		return ErrChatRateLimited // 额度不足 → 429 (设计 §9.1)
+		// 额度/预算耗尽 → 本地限制（429）。请求从未出站。
+		return &ChatLimitError{Code: string(domain.CodeQuotaExceeded)}
 	}
 	if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
 		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
@@ -268,8 +274,16 @@ func mapGatewayError(err error) error {
 		return ErrChatModelNotAllowed // 模型存在但无权益 → 403（对齐 legacy 文案）
 	case domain.CodeInvalidKey:
 		return ErrChatNoAccess
-	case domain.CodeQuotaExceeded, domain.CodeRateLimited, domain.CodeInsufficientCapacity:
-		return ErrChatRateLimited
+	case domain.CodeRateLimited:
+		// 业务速率限制（账户/策略/Key 的 RPM、账户级 TPM）→ 本地限制 429。
+		return &ChatLimitError{Code: string(domain.CodeRateLimited)}
+	case domain.CodeInsufficientCapacity:
+		// 并发上限已满（账户级权益策略 / Key 级 / 上游账号级）→ 本地限制 429。
+		return &ChatLimitError{Code: string(domain.CodeInsufficientCapacity)}
+	case domain.CodeQuotaExceeded, domain.CodeInsufficientBalance:
+		// 额度耗尽 / 余额不足 → 本地限制 429（绝不降级成 generic 502：
+		// 客户端必须知道是自己的额度问题，而不是"上游错误"）。
+		return &ChatLimitError{Code: string(domain.CodeOf(err))}
 	case domain.CodeServiceUnavailable:
 		// 准入存储不可用：明确的服务错误（503），绝不伪装成额度耗尽。
 		return ErrChatNotReady

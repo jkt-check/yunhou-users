@@ -2659,12 +2659,339 @@ documentation only**.
 
 ### T6 — Protocol error shape and Retry-After
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `6daf677` (T5 branch tip). Task report:
+`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-6-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`; every
+database-backed command used `-p 1` and `-race`; `go.mod` / `go.sum` were
+never modified (`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.24 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1 / run 2, `t6_app`) | **0** / **0** | `applied=52 skipped=0` → `applied=0 skipped=52` (idempotent) |
+| 4 | **RED** `go test -count=1 -run 'TestSetup_V1PeripheralRateLimitUsesProtocolNativeError' -v ./internal/router` | **1** | the management envelope leaked onto `/v1` — see §4.25 |
+| 5 | **RED** `go test -count=1 -run 'TestMapGatewayError' -v ./internal/service` | **1** | `/chat` degraded local limits to upstream wording / generic 502 — see §4.25 |
+| 6 | **RED** `DATABASE_URL=<disposable> go test -count=1 -run 'TestV1ProtocolMatrix' -v ./internal/inference/httpapi` | **1** | the permanent Key budget produced a fabricated `Retry-After` — see §4.25 |
+| 7 | **GREEN** the same commands as #4/#5/#6 | **0** | all T6 cases pass |
+| 8 | **GREEN** `go test -count=1 -run 'TestAdmitQuotaExceeded' -v ./internal/inference/quota` | **0** | the Key-budget probe cases pass |
+| 9 | **GREEN** `go test -count=1 -run 'TestChatHandler_LocalLimitEnvelope' -v ./internal/handler` | **0** | the `/chat` envelope case passes |
+| 10 | **GREEN** `DATABASE_URL=<disposable> go test -count=1 -run 'TestV1AuthChain_NativeErrorShapePerEntrypoint' -v ./internal/inference/httpapi` | **0** | the auth chain's native shape per entrypoint passes |
+| 11 | **acceptance（任务书原文）** `go test -race -count=1 -p 1 ./internal/middleware ./internal/router ./internal/inference/httpapi ./internal/service` | **0** | 4 packages `ok` (13.119s / 2.979s / 75.317s / 25.596s) |
+| 12 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 13 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T5 80.2%, T4 80.1%, T3 80.4%, T0 80.4%) |
+| 14 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t6_e2e`) | **1** → **0** | the `go-e2e` job found ONE contract conflict — the facade's money-quota 429 still wore the upstream wording (§4.25.5); after the deliberate contract update it is green |
+
+#### 4.25 RED evidence (before any production edit)
+
+Command #4 ran against the **unmodified** production code at `6daf677`; the
+new tests are written against the existing API surface only, so every failure
+is a behavioural assertion failure, never a compile error.
+
+##### 4.25.1 The perimeter IP 429 forced the management envelope onto `/v1`
+
+```
+=== RUN   TestSetup_V1PeripheralRateLimitUsesProtocolNativeError//v1/chat/completions
+    router_test.go:1165: management envelope leaked into /v1/chat/completions: {"code":429,"error":"rate_limited","message":"too many requests"}
+    router_test.go:1169: /v1/chat/completions: the native error object is missing: {"code":429,"error":"rate_limited","message":"too many requests"}
+=== RUN   TestSetup_V1PeripheralRateLimitUsesProtocolNativeError//v1/messages
+    router_test.go:1165: management envelope leaked into /v1/messages: {"code":429,"error":"rate_limited","message":"too many requests"}
+    router_test.go:1169: /v1/messages: the native error object is missing: {"code":429,"error":"rate_limited","message":"too many requests"}
+=== RUN   TestSetup_V1PeripheralRateLimitUsesProtocolNativeError//v1/responses
+    router_test.go:1165: management envelope leaked into /v1/responses: {"code":429,"error":"rate_limited","message":"too many requests"}
+    router_test.go:1169: /v1/responses: the native error object is missing: {"code":429,"error":"rate_limited","message":"too many requests"}
+--- FAIL: TestSetup_V1PeripheralRateLimitUsesProtocolNativeError (0.00s)
+    --- FAIL: TestSetup_V1PeripheralRateLimitUsesProtocolNativeError//v1/chat/completions (0.00s)
+    --- FAIL: TestSetup_V1PeripheralRateLimitUsesProtocolNativeError//v1/messages (0.00s)
+    --- FAIL: TestSetup_V1PeripheralRateLimitUsesProtocolNativeError//v1/responses (0.00s)
+FAIL	github.com/yunhou/users/internal/router	3.481s
+```
+
+The generic limiter wrote `{"code":429,"error":"rate_limited",…}` — a
+top-level management `code` and a **string** `error` where the OpenAI shape
+needs an error **object**, and where the Anthropic shape needs the
+`{"type":"error",…}` envelope.
+
+##### 4.25.2 `/chat` degraded the local limits
+
+```
+=== NAME  TestMapGatewayError_LocalLimitsAreNotUpstreamErrors/insufficient_balance
+    chat_facade_test.go:755: a local usage limit must not be degraded to the generic upstream 502: chat upstream error
+    chat_facade_test.go:758: mapGatewayError = chat upstream error, want a 429-class limit error
+    chat_facade_test.go:761: the message must not blame the upstream for a local limit: "chat upstream error"
+=== NAME  TestMapGatewayError_LocalLimitsAreNotUpstreamErrors/quota_exceeded
+    chat_facade_test.go:761: the message must not blame the upstream for a local limit: "chat upstream rate limit exceeded"
+=== NAME  TestMapGatewayError_LocalLimitsAreNotUpstreamErrors/quota_exceeded_window
+    chat_facade_test.go:761: the message must not blame the upstream for a local limit: "chat upstream rate limit exceeded"
+=== NAME  TestMapGatewayError_LocalLimitsAreNotUpstreamErrors/rate_limited
+    chat_facade_test.go:761: the message must not blame the upstream for a local limit: "chat upstream rate limit exceeded"
+=== NAME  TestMapGatewayError_LocalLimitsAreNotUpstreamErrors/typed_rate_limited
+    chat_facade_test.go:761: the message must not blame the upstream for a local limit: "chat upstream rate limit exceeded"
+=== NAME  TestMapGatewayError_LocalLimitsAreNotUpstreamErrors/insufficient_capacity
+    chat_facade_test.go:761: the message must not blame the upstream for a local limit: "chat upstream rate limit exceeded"
+--- FAIL: TestMapGatewayError_LocalLimitsAreNotUpstreamErrors (0.00s)
+FAIL	github.com/yunhou/users/internal/service	0.514s
+```
+
+`insufficient_balance` was a **502 `chat upstream error`**; the other four
+local classes were 429 but with the upstream wording.
+
+**Protection evidence.** The pre-existing case
+`upstream_429_exhausted → ErrChatRateLimited` (a real upstream 429) passed at
+the baseline and still passes — the upstream wording is reserved for upstream
+rejections.
+
+##### 4.25.3 The permanent Key budget produced a fabricated countdown
+
+```
+=== RUN   TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown/chat_completions
+    protocol_error_edges_test.go:403: the permanent blocker must be named: {"error":{"code":"quota_exceeded","message":"quota exceeded: blocked by five_hour; deficit_micros=16404","type":"rate_limit_error"}}
+    protocol_error_edges_test.go:406: Retry-After = "18000", want none (Key 预算耗尽是永久阻断项)
+=== RUN   TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown/messages
+    protocol_error_edges_test.go:403: the permanent blocker must be named: {"error":{"message":"quota exceeded: blocked by five_hour; deficit_micros=148","type":"rate_limit_error"},"type":"error"}
+    protocol_error_edges_test.go:406: Retry-After = "18000", want none (Key 预算耗尽是永久阻断项)
+=== RUN   TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown/responses
+    protocol_error_edges_test.go:403: the permanent blocker must be named: {"error":{"code":"quota_exceeded","message":"quota exceeded: blocked by five_hour; deficit_micros=16404","type":"rate_limit_error"}}
+    protocol_error_edges_test.go:406: Retry-After = "18000", want none (Key 预算耗尽是永久阻断项)
+--- FAIL: TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown (0.90s)
+    --- FAIL: TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown/chat_completions (0.27s)
+    --- FAIL: TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown/messages (0.23s)
+    --- FAIL: TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown/responses (0.40s)
+FAIL	github.com/yunhou/users/internal/inference/httpapi	8.665s
+```
+
+`Retry-After: 18000` (five hours — the window's reset) for a request whose
+Key budget is permanently exhausted, and the message never mentioned the
+permanent blocker.
+
+##### 4.25.4 Protection evidence — the other four limit classes were already right
+
+In the same RED run, the business rate / TPM / concurrency / money-quota
+matrix cells **passed at the baseline** on all three entrypoints (native
+shape, business code, zero upstream calls, `Retry-After` rules). They are
+recorded as guards, not as new behaviour:
+
+```
+--- PASS: TestV1ProtocolMatrix_BusinessRateLimit (1.22s)
+    --- PASS: …/chat_completions (0.41s)   --- PASS: …/messages (0.39s)   --- PASS: …/responses (0.42s)
+--- PASS: TestV1ProtocolMatrix_BusinessTokenLimit (1.48s)
+--- PASS: TestV1ProtocolMatrix_ConcurrencyLimit (1.79s)
+--- PASS: TestV1ProtocolMatrix_MoneyQuota (1.47s)
+```
+
+So the defects were exactly three: the perimeter limiter's shape, the
+`/chat` mapping, and the permanent blocker's countdown.
+
+#### 4.25.5 The e2e job caught a contract conflict the unit tests could not
+
+The first `go-e2e` run (command #14, exit **1**) failed with exactly one
+test — and it is the `go-e2e` job's value: it pins the **client-visible**
+`/chat` envelope byte-exactly, which no unit test does.
+
+```
+=== RUN   TestChatContract_FacadeQuotaExceededIs429
+2026/11/06 14:21:31 chat: request rejected by a usage limit: chat request rejected by a usage limit (quota_exceeded)
+    chat_gateway_test.go:1657: quota envelope = {"code":429,"data":null,"message":"chat request rejected by a usage limit (quota_exceeded)"}, want byte-exact legacy 429 shape {"code":429,"data":null,"message":"chat upstream rate limit exceeded"}
+--- FAIL: TestChatContract_FacadeQuotaExceededIs429 (1.17s)
+```
+
+Every other e2e case passed (the full inventory is in the run log).
+
+**The conflict.** The pre-existing e2e contract pinned the facade's *money
+quota* 429 to the byte-exact legacy **upstream** wording
+(`chat upstream rate limit exceeded`) — its own comment said "同一 client
+envelope，不同触发源" (same envelope, different trigger). T6 requires the
+`/chat` limits to carry an **accurate** business code/description (设计 §9.1):
+a quota exhaustion is a **local** rejection whose request never left, and
+telling the client "upstream rate limit exceeded" invites a back-off retry
+loop that can never succeed.
+
+**The resolution (deliberate, minimal, documented).** The facade's local
+limit classes now answer `{"code":429,"data":null,"message":"chat request
+rejected by a usage limit (<业务码>)"}`, and the single e2e expectation was
+updated to match. What did **not** change:
+
+- the envelope **shape** (`{code,data,message}`) and the status code (429);
+- the **upstream** 429 wording — `chat upstream rate limit exceeded` stays
+  byte-identical, and `caseChatContractUpstreamErrors/upstream_rate_limited`
+  (which runs for the legacy **and** the facade backend) still pins it;
+- the legacy backend entirely;
+- every other facade limit class (the pre-existing upstream-429 path is the
+  only one the facade shares with legacy).
+
+The integration guide's `/chat` error table was updated in the same change
+(§4.30), so the documentation now matches the code: the message
+`chat upstream rate limit exceeded` is documented as the **upstream** 429
+only.
+
+#### 4.26 GREEN evidence
+
+Commands #7–#10 re-run after the fix — exit code **0**:
+
+```
+--- PASS: TestSetup_V1PeripheralRateLimitUsesProtocolNativeError (0.00s)
+    --- PASS: …//v1/chat/completions (0.00s)
+    --- PASS: …//v1/messages (0.00s)
+    --- PASS: …//v1/responses (0.00s)
+--- PASS: TestMapGatewayError_LocalLimitsAreNotUpstreamErrors (0.00s)
+    --- PASS: …/insufficient_balance (0.00s)   --- PASS: …/quota_exceeded (0.00s)
+    --- PASS: …/quota_exceeded_window (0.00s)  --- PASS: …/rate_limited (0.00s)
+    --- PASS: …/typed_rate_limited (0.00s)     --- PASS: …/insufficient_capacity (0.00s)
+--- PASS: TestV1ProtocolMatrix_BusinessRateLimit (0.46s)
+--- PASS: TestV1ProtocolMatrix_BusinessTokenLimit (0.40s)
+--- PASS: TestV1ProtocolMatrix_ConcurrencyLimit (0.50s)
+--- PASS: TestV1ProtocolMatrix_MoneyQuota (0.43s)
+--- PASS: TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown (0.42s)
+--- PASS: TestAdmitQuotaExceededReportsExhaustedKeyBudget (0.00s)
+--- PASS: TestAdmitQuotaExceededKeepsWindowOnlyWhenKeyBudgetIsHealthy (0.00s)
+--- PASS: TestChatHandler_LocalLimitEnvelope (0.00s)
+--- PASS: TestV1AuthChain_NativeErrorShapePerEntrypoint (0.20s)
+```
+
+Acceptance command #11 — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/middleware	13.119s
+ok  	github.com/yunhou/users/internal/router	2.979s
+ok  	github.com/yunhou/users/internal/inference/httpapi	75.317s
+ok  	github.com/yunhou/users/internal/service	25.596s
+```
+
+CI `go-ci` gate (command #12) — exit code **0**, 33 packages `ok`, 0 `FAIL`
+(including `tests/integration`); coverage floor `total coverage: 80.3%` ≥ 80%.
+
+#### 4.27 The protocol matrix (T6 deliverable)
+
+Every cell asserts: status, JSON `Content-Type`, the **protocol-native
+shape**, the business code, **zero upstream calls** and the `Retry-After`
+rule.
+
+| Limit class | `/v1/chat/completions`, `/v1/responses` (OpenAI) | `/v1/messages` (Anthropic) | Upstream calls |
+|---|---|---|---|
+| Perimeter per-IP 429 | `{"error":{"type":"rate_limit_error","code":"rate_limited","message":"too many requests"}}` | `{"type":"error","error":{"type":"rate_limit_error","message":"too many requests"}}` | 0 (rejected before auth) |
+| Business RPM 429 | `error.code=rate_limited`, `error.type=rate_limit_error`, `Retry-After` present | `error.type=rate_limit_error`, message `rate limit exceeded: blocked by key_rpm` | 0 |
+| Business TPM 429 | `error.code=rate_limited`, message names `policy_tpm`, **no** `Retry-After` (recovery not determinable) | same | 0 |
+| Concurrency 429 | `error.code=insufficient_capacity` | message names `concurrency limit` | 0 (the second request never leaves) |
+| Money quota 429 | `error.code=quota_exceeded`, message names the window, `Retry-After` present | same (no `code` field in the native shape) | 0 |
+| Permanent Key budget **+** window | `error.code=quota_exceeded`, message contains `key budget exhausted`, **no** `Retry-After` | same | 0 |
+| Auth 401 | `error.type=authentication_error`, `error.code=invalid_api_key` | `error.type=authentication_error` | 0 |
+
+`/chat` keeps its existing `{code,data,message}` envelope; the local limits
+become 429 with the business code in the `message` (the envelope has no
+separate symbol field):
+
+| Limit class | `/chat` answer |
+|---|---|
+| Business rate / concurrency / quota / balance | `{"code":429,"data":null,"message":"chat request rejected by a usage limit (<rate_limited|insufficient_capacity|quota_exceeded|insufficient_balance>)"}` |
+| Upstream 429 | `{"code":429,"data":null,"message":"chat upstream rate limit exceeded"}` — **byte-identical to legacy** |
+
+#### 4.28 Skips
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1` (`quota_concurrency_test.go:773`). The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+| 4 | `TestUsageTokenAcceptance_TenPagesTwoMinutes` | `tests/e2e` | Explicit non-default gate `USAGE_ACCEPTANCE=1` (`usage_tokens_test.go:226`) — a two-minute dashboard load drill, not a correctness test. | No |
+
+**Database-test skips: 0** — identical to the T0 (§2.6), T1 (§4.4), T2
+(§4.12), T3 (§4.20) and T4/T5 inventories. The `go-e2e` job's only skip is
+the `USAGE_ACCEPTANCE=1` drill above. One honest note: running the new
+auth-chain case **without** `DATABASE_URL` produced `--- SKIP` (the fixture's
+silent fallback) — that run was discarded and the case re-run on the
+disposable instance, where it passed. A skipped database test is not a pass.
+
+#### 4.29 Migration
+
+**None.** T6 adds no migration: the only schema facts it reads
+(`inference_api_keys.budget_limit_micros` / `budget_used_micros`) have been
+there since migration 025. The disposable databases were migrated with
+`cmd/migrate` exactly as in §2.3 (52 files, idempotent on the second run).
+
+#### 4.30 Files changed
+
+| File | Change |
+|---|---|
+| `internal/middleware/ratelimit.go` | new `RateLimitResponder` + `RateLimitWithResponder` / `RateLimitWithKeyResponder`; `RateLimit` / `RateLimitWithKey` become the default (management envelope) combinations |
+| `internal/inference/httpapi/apikey_auth.go` | new `V1RateLimitResponder` (reuses the existing `v1Error` / `anthropicError` native helpers) + the shared `isAnthropicV1Path` predicate |
+| `internal/router/router.go` | the `/v1` group's perimeter limiter is injected with `httpapi.V1RateLimitResponder` (rate/burst/bucket unchanged) |
+| `internal/inference/httpapi/chat_completions.go` | `quotaExceededDetails`: an exhausted Key budget ⇒ **no** `Retry-After` (it is a permanent blocker) |
+| `internal/inference/quota/service.go` | `Store` gains `GetAPIKeyBudgetTx`; new `withKeyBudgetBlock` reports the permanent blocker together with the window blocks |
+| `internal/inference/postgres/apikey_repo.go` | implements `GetAPIKeyBudgetTx` (a database fact read inside the admission transaction) |
+| `internal/service/errors.go` | new `ErrChatRequestLimited` + `ChatLimitError` (unwraps to both the new sentinel and `ErrChatRateLimited`) |
+| `internal/service/chat_facade.go` | `mapGatewayError`: local limits → `ChatLimitError` (429 + business code); the upstream 429 keeps `ErrChatRateLimited` |
+| `internal/handler/chat.go` | `chatErrorMapping` gains the `ErrChatRequestLimited` branch (429 + accurate wording) |
+| `internal/router/router_test.go` | the perimeter-429 native-shape case + the `setupV1Router` helper |
+| `internal/inference/httpapi/protocol_error_edges_test.go` | the protocol matrix (5 groups × 3 entrypoints) + assertion helpers |
+| `internal/inference/httpapi/apikey_auth_edges_test.go` | the auth chain's native shape per entrypoint |
+| `internal/inference/httpapi/protocol_surfaces_test.go` | **fixture repair**: `newProtoFixture` now mounts `/v1/chat/completions` too (the matrix needs the three entrypoints on one engine) |
+| `internal/inference/quota/service_test.go` | the Key-budget probe cases (exhausted / sufficient / no budget) + the fakeStore's new method |
+| `internal/service/chat_facade_test.go` | the `/chat` local-limit mapping case |
+| `internal/handler/chat_test.go` | the `/chat` local-limit envelope case |
+| `tests/e2e/chat_gateway_test.go` | **contract update** (§4.25.5): the facade's money-quota 429 expectation now carries the accurate business code; the upstream-429 wording and the legacy backend are untouched |
+| `docs/api/kaya-coding-plan.openapi.yaml` | the three `/v1` 429 descriptions (perimeter bucket, `Retry-After` trustworthiness, the permanent Key budget), `/v1/models` gains a 429, `AnthropicError` states that the native shape has no `code` field |
+| `docs/api-integration-guide.md` | a new `/v1` error-shape + `Retry-After` section; the `/chat` error table gains the four local-limit rows and the retry guidance |
+| `CLAUDE.md` | the API-response-format exceptions now name the `/v1/*` native shapes (including the generic middleware's rejection) |
+| `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md` | the T6 section backfills the actual signatures (same convention as T4/T5) |
+
+#### 4.31 Notes (root cause, compatibility, honesty)
+
+- **Root cause (three defects, one symptom).** (1) The generic limiter
+  middleware **hard-coded** the management envelope and had no injection
+  point, while the router mounted it in front of the whole `/v1` group — so
+  the perimeter rejection was the only `/v1` answer that was not
+  protocol-native. (2) The `/chat` facade mapped every internal limit class
+  onto the upstream-429 sentinel (wrong wording) and had **no** mapping at
+  all for `insufficient_balance` (a generic 502). (3) The money-side 429
+  computed "is the recovery instant trustworthy?" from the **windows only**,
+  and the pure-rule evaluation short-circuited the admission **before** the
+  Key's cumulative budget was ever checked — so a permanently exhausted Key
+  budget was invisible and the window's reset was promised as the recovery
+  time.
+- **The fix reuses what already existed**: the native error helpers
+  (`v1Error` / `anthropicError`), T4's typed `RateLimitError`/`RateBlock`,
+  T5's `insufficient_capacity` semantics and the
+  `GetAPIKeyConcurrencyLimitTx` pattern (a database fact read inside the
+  admission transaction, never an authentication snapshot).
+- **Admission semantics unchanged**: the pass/reject conditions of RPM, TPM,
+  concurrency and the money windows are untouched — only the *report* of a
+  rejection gained one fact (whether the Key budget is also a blocker).
+- **The countdown is now strictly more conservative**: a permanent blocker
+  removes the `Retry-After` instead of inventing one. The TPM case (an
+  in-flight hold's real consumption is unknown) already behaved that way and
+  is unchanged.
+- **Compatibility.** No new response field, no new enum, no migration, no new
+  dependency. The `/v1` perimeter 429 changes shape (it was unparseable by
+  any OpenAI/Anthropic SDK before); the `/chat` message wording changes for
+  the local-limit classes only (the upstream 429 wording is byte-identical to
+  legacy, in both backends); the envelope shape `{code,data,message}` and
+  the status codes are unchanged. **The one client-visible wording change is
+  deliberate and documented** (§4.25.5): a `/chat` money-quota rejection now
+  says `chat request rejected by a usage limit (quota_exceeded)` instead of
+  claiming an upstream rate limit — the request never left, and the old
+  wording invited a retry loop that can never succeed. The integration
+  guide's `/chat` error table was updated in the same change.
+- **The Anthropic native shape has no `code` field** — the business class is
+  carried by `error.message` there. The OpenAPI previously described the
+  three codes as if they were a `code` field; the document now matches the
+  implementation (the protocol shape was **not** changed to satisfy a
+  document).
+- **Fail-closed preserved**: a storage failure while reading the Key budget
+  answers 503 `service_unavailable`, never a fake quota exhaustion.
+- **`quota.Store` grew one required method** — the same conscious trade-off
+  T5 made: an optional upgrade would silently skip the permanent-blocker
+  probe (and therefore re-introduce a fabricated countdown).
+- **Concurrency still carries no `Retry-After`**: the lease's "earliest slot
+  frees at" instant lives in the message, not in a structured field; making
+  it a structured, trustworthy recovery instant is T7/T10 work. T6 does not
+  invent one.
 
 ### T7 — Configuration-behaviour convergence and connect timeouts
 

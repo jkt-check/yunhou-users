@@ -232,3 +232,78 @@ func TestGateway_KeyLeaseReleasedOnStreamAssemblyPanic(t *testing.T) {
 		t.Errorf("released key leases = %d, want 1 (panic 守卫必须归还 Key 槽)", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 两条「执行状态未知」的路径，租约处置**不同**（评审修复第 1 项：把说明钉
+// 成可验证的事实，而不是一句笼统的「不释放租约」）。
+//
+//   A. 派发级未知（ExecutedUnknown）：请求停放核对，请求级租约**保持 held**
+//      （请求尚未终态、上游可能仍在跑；槽位由租约 TTL 回收）。
+//   B. 流式中断且没读到任何用量：同样停放核对，但 StreamBody.Finish 的
+//      keeper.Stop 把**所有**租约（含 Key 租约）释放掉。
+// ---------------------------------------------------------------------------
+
+// TestGateway_DispatchUnknownExecution_KeepsRequestLeases: 路径 A。
+func TestGateway_DispatchUnknownExecution_KeepsRequestLeases(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		select {
+		case <-time.After(10 * time.Second):
+		case <-r.Context().Done():
+		}
+	})
+	f := newFixture(t, up, withKeyConcurrencyLimit(1))
+	dep := f.snap.Deployments[f.deploymentID]
+	dep.RequestTimeout = 300 * time.Millisecond
+	f.snap.Deployments[f.deploymentID] = dep
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if domain.CodeOf(err) != domain.CodeUpstreamUnavailable {
+		t.Fatalf("err = %v, want upstream_unavailable (parked for reconciliation)", err)
+	}
+	requestID := mustRequestID(t, f.db)
+	status, _, reserved, _ := f.requestRow(t, requestID)
+	if status != "reconciliation_required" || reserved <= 0 {
+		t.Errorf("status=%s reserved=%d, want reconciliation_required with the hold retained", status, reserved)
+	}
+	// 请求级租约保持 held：请求未终态，槽位仍被占用，直到租约 TTL 回收。
+	if got := keyLeaseStates(t, f)["held"]; got != 1 {
+		t.Errorf("held key leases = %d, want 1 (派发级未知执行不释放请求级租约)", got)
+	}
+}
+
+// TestGateway_StreamInterruptedWithoutUsage_ReleasesRequestLeases: 路径 B。
+func TestGateway_StreamInterruptedWithoutUsage_ReleasesRequestLeases(t *testing.T) {
+	up := newUpstream(t, sseHandler(chunkA, chunkB)) // 无 usage 无 [DONE]
+	f := newFixture(t, up, withKeyConcurrencyLimit(1))
+
+	p, key := f.principal()
+	out, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(true, "hi"))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	_, _ = io.ReadAll(out.Stream)
+	if err := out.Stream.Finish(EndUpstreamBroke); err != nil {
+		t.Fatal(err)
+	}
+	_ = out.Stream.Close()
+	status, usageStatus, reserved, _ := f.requestRow(t, out.RequestID)
+	if status != "reconciliation_required" {
+		t.Errorf("status = %s, want reconciliation_required (流式中断且无用量 → 停放核对)", status)
+	}
+	if usageStatus != "unknown" {
+		t.Errorf("usage_status = %s, want unknown (停放 ≠ 记零)", usageStatus)
+	}
+	if reserved <= 0 {
+		t.Errorf("reserved = %d, want the hold retained (预占不静默释放)", reserved)
+	}
+	// 但租约被释放了：StreamBody.Finish 的 keeper.Stop 释放全部租约。
+	if got := heldLeases(t, f); got != 0 {
+		t.Errorf("held leases = %d, want 0 (流式中断路径释放全部租约)", got)
+	}
+	if got := keyLeaseStates(t, f)["released"]; got != 1 {
+		t.Errorf("released key leases = %d, want 1 (流式中断路径归还 Key 槽)", got)
+	}
+}

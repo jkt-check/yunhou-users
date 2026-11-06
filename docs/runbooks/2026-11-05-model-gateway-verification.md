@@ -2477,16 +2477,27 @@ the second run).
   completion, client cancel, failover exhaustion, and the pre-handoff
   assembly panic all leave **zero** held leases (asserted on the DB rows,
   not on an in-process counter).
-- **Recorded boundary — the unknown-execution path keeps its lease.** A
-  dispatch whose upstream execution state is unknown is parked for
-  reconciliation; the request is not terminal, so its leases stay held until
-  the lease TTL (10 min) reclaims them — the **same** semantics the account
-  lease already had. The recovery worker's grace period is 15 min > the
-  10-min TTL, so a recovered request's lease has already expired: the slot
-  is never permanently frozen (`TestKeyConcurrencyLimit_CrashedRequestDoesNotFreezeTheSlot`
-  pins this at the admission level). If the grace period is ever configured
-  **below** the lease TTL, this reasoning stops holding and the recovery
-  worker would have to release the leases explicitly.
+- **Recorded boundary — the two "execution state unknown" paths differ in
+  their lease disposition** (corrected in the T5 review-fix round; the earlier
+  wording "the unknown-execution path keeps its lease" was **too broad**):
+
+  | Path | Trigger | Request | Request-scoped leases (account + Key) |
+  |---|---|---|---|
+  | **A — dispatch-level unknown** | `providers.DispatchError{ExecutedUnknown: true}` (transport timeout / connection reset / 200-body parse failure) → `dispatchLoop` → `holdForReconciliation` | parked for reconciliation (`reconciliation_required`), the monetary hold is retained | **stay held** — the request is not terminal and the upstream may still be running; the slot is reclaimed by the lease TTL (10 min) |
+  | **B — stream interrupted without any usage** | `!tap.SawUsage && !tap.Terminal` → `StreamBody.Finish` → `finalize` → `markReconciliation` | parked for reconciliation (`reconciliation_required`), the monetary hold is retained | **all released** — `Finish`'s `keeper.Stop` releases every lease the keeper holds (upstream + account + Key) |
+
+  Both paths are pinned by tests
+  (`TestGateway_DispatchUnknownExecution_KeepsRequestLeases`,
+  `TestGateway_StreamInterruptedWithoutUsage_ReleasesRequestLeases`).
+  The recovery-side reasoning holds for both: the lease TTL (10 min) is
+  shorter than the recovery sweep's grace period (15 min), so a request old
+  enough to be scanned has either an expired lease (path A — the live-lease
+  guard then lets it through) or no lease at all (path B) — the slot is never
+  permanently frozen. The **worker-level** assertion for that is
+  `TestRecover_KeyLeaseExpired_ThenSubsequentAdmissionSucceeds` (§4.41). If
+  the grace period is ever configured **below** the lease TTL, path A's
+  reasoning stops holding and the recovery worker would have to release the
+  leases explicitly.
 - **No new client-visible error shape.** A Key-level concurrency rejection
   reuses the existing `insufficient_capacity` 429 (`rate_limit_error` on the
   OpenAI/Anthropic protocol surfaces, the management envelope on `/chat`);
@@ -2496,6 +2507,155 @@ the second run).
   the previous behaviour, including no additional `api_key` lease rows.
   The OpenAPI spec and the integration guide were updated for the new field
   and for the newly reachable `insufficient_capacity` code.
+
+#### 4.41 T5 fix round — the two "unknown execution" paths and a worker-level recovery assertion
+
+Recorded on 2026-11-06, after the T5 commit. The T5 review raised two
+**Important** findings; **neither is a behaviour defect** — one is an
+over-broad statement, one is missing evidence. This round therefore
+**changed no production code**: it corrected the wording, pinned the two
+paths with tests, and added the worker-level recovery assertion.
+
+**Environment.** Same recipe as §4.34: a fresh trap-cleaned disposable
+PostgreSQL per run, explicit `DATABASE_URL` / `E2E_DATABASE_URL`, `-p 1`,
+`-race`, `GOPROXY=off` + `GOFLAGS=-mod=readonly`, `go.mod` / `go.sum`
+untouched. **Every command's COMPLETE output was written to
+`/tmp/t5-fix-logs/<step>.log` — outside the repository and untruncated** —
+so that a failure can always be attributed to a named test (the attribution
+gap of §4.37's transient failure can no longer recur).
+
+##### 4.41.1 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no production change, no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1 / run 2 / `-status`) | **0** / **0** / **0** | `applied=52 skipped=0` → `applied=0 skipped=52` → 52 × `✅` (**no migration added**) |
+| 4 | **new** `go test -race -count=1 -p 1 -v -run TestRecover_KeyLeaseExpired_ThenSubsequentAdmissionSucceeds ./internal/inference/workers` | **0** | the new worker-level recovery case passes **on the unchanged production code** |
+| 5 | **new** `go test -race -count=1 -p 1 -v -run "TestGateway_DispatchUnknownExecution_KeepsRequestLeases\|TestGateway_StreamInterruptedWithoutUsage_ReleasesRequestLeases" ./internal/inference/gateway` | **0** | both path-pinning cases pass on the unchanged production code |
+| 6 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/...` | **0** | 14 packages `ok` |
+| 7 | **ad-hoc** `go test -race -count=1 -p 1 -v ./internal/inference/gateway ./internal/inference/quota ./internal/inference/access` | **0** | 3 packages `ok`; **no FAIL / panic / DATA RACE**; the complete output is in `/tmp/t5-fix-logs/adhoc_gateway_quota_access.log` (555 lines, untruncated) |
+| 8 | `go test -race -count=1 -p 1 -v ./internal/inference/... ./tests/integration/...` | **0** | skip inventory — see §4.41.3 |
+
+Command #6 output:
+
+```
+ok  	github.com/yunhou/users/internal/inference/access	1.754s
+ok  	github.com/yunhou/users/internal/inference/accounting	2.155s
+ok  	github.com/yunhou/users/internal/inference/catalog	9.518s
+ok  	github.com/yunhou/users/internal/inference/credentials	3.652s
+ok  	github.com/yunhou/users/internal/inference/domain	1.724s
+ok  	github.com/yunhou/users/internal/inference/gateway	39.268s
+ok  	github.com/yunhou/users/internal/inference/httpapi	185.895s
+ok  	github.com/yunhou/users/internal/inference/management	4.220s
+ok  	github.com/yunhou/users/internal/inference/postgres	67.461s
+ok  	github.com/yunhou/users/internal/inference/providers	2.479s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	1.762s
+ok  	github.com/yunhou/users/internal/inference/quota	1.700s
+ok  	github.com/yunhou/users/internal/inference/routing	1.928s
+ok  	github.com/yunhou/users/internal/inference/workers	13.362s
+```
+
+(The wall-clock numbers are inflated — `httpapi` 185 s against the usual
+~55 s — because an unrelated `cargo test --workspace` was running on the same
+machine during this run; the results are unaffected.)
+
+Command #7 output (the ad-hoc three-package check):
+
+```
+ok  	github.com/yunhou/users/internal/inference/gateway	17.489s
+ok  	github.com/yunhou/users/internal/inference/quota	1.624s
+ok  	github.com/yunhou/users/internal/inference/access	1.671s
+```
+
+##### 4.41.2 Finding 1 — the two "execution state unknown" paths
+
+The previous wording ("the unknown-execution path keeps its lease") was
+**too broad**. The code has **two** distinct paths and their lease
+dispositions differ:
+
+| Path | Trigger | Request | Request-scoped leases (account + Key) |
+|---|---|---|---|
+| **A — dispatch-level unknown** | `providers.DispatchError{ExecutedUnknown: true}` (transport timeout / connection reset / 200-body parse failure) → `dispatchLoop` → `holdForReconciliation` | parked for reconciliation (`reconciliation_required`), the monetary hold is retained | **stay held** — the request is not terminal and the upstream may still be running; the slot is reclaimed by the lease TTL (10 min) |
+| **B — stream interrupted without any usage** | `!tap.SawUsage && !tap.Terminal` → `StreamBody.Finish` → `finalize` → `markReconciliation` | parked for reconciliation (`reconciliation_required`), the monetary hold is retained | **all released** — `Finish`'s `keeper.Stop` releases every lease the keeper holds (upstream + account + Key) |
+
+Both are now **pinned** (command #5), and the wording in §4.40, in the task
+report (§2.4 / §5.1 / §10) was corrected to match:
+
+```
+=== RUN   TestGateway_DispatchUnknownExecution_KeepsRequestLeases
+--- PASS: TestGateway_DispatchUnknownExecution_KeepsRequestLeases (1.22s)
+=== RUN   TestGateway_StreamInterruptedWithoutUsage_ReleasesRequestLeases
+--- PASS: TestGateway_StreamInterruptedWithoutUsage_ReleasesRequestLeases (0.43s)
+ok  	github.com/yunhou/users/internal/inference/gateway	3.529s
+```
+
+**No production behaviour was changed** — the two cases describe what the
+code already does; the finding was about the statement, not the behaviour.
+
+##### 4.41.3 Finding 2 — the worker-level recovery assertion
+
+The brief's "恢复" requirement was previously only **argued** (lease TTL
+10 min < recovery grace 15 min ⇒ a scanned request's lease has expired).
+It is now **pinned at the worker level** by
+`internal/inference/workers/key_concurrency_recovery_test.go`
+(`TestRecover_KeyLeaseExpired_ThenSubsequentAdmissionSucceeds`), against the
+**real recovery worker + the real store + a disposable PostgreSQL**:
+
+1. a real admission (the `quota` service over the real store) commits the
+   request row, the window / Key-budget holds and **one `api_key`-scope
+   lease** (the Key's `concurrency_limit = 1`; the lease TTL is compressed to
+   50 ms so that "the crashed request's lease aged out" needs no wall-clock
+   wait);
+2. the lease is waited out → it is **no longer a live authorization**;
+3. the **real** `SettlementRecovery` worker runs one pass — the live-lease
+   guard (`state='held' AND expires_at > now()`) lets the request through
+   and it is recovered;
+4. a **subsequent admission on the same Key succeeds** — the expired lease
+   is reclaimed at acquisition time (`state='expired'`) and the new lease is
+   `held`.
+
+```
+=== RUN   TestRecover_KeyLeaseExpired_ThenSubsequentAdmissionSucceeds
+2026/11/06 13:16:15 inference recovery: request 651c5da3-... released — zero upstream consumption proven (audit: reservations released)
+2026/11/06 13:16:15 inference_recovery pass: scanned=1 released_not_sent=1 settled_conservative=0 settled_verified=0 racing_skipped=0 jobs_processed=0 jobs_settled=0 jobs_awaiting_evidence=0 jobs_no_evidence=0 escalated=0 backlog=0 unknown_usage=0 dangling_holds=0 open_requests=0 settlement_lag_s=0 ledger_mismatches=0 errors=0
+--- PASS: TestRecover_KeyLeaseExpired_ThenSubsequentAdmissionSucceeds (0.58s)
+ok  	github.com/yunhou/users/internal/inference/workers	6.105s
+```
+
+**This case passes against the unchanged production code** — the existing
+TTL/grace mechanism already guarantees it. It is therefore recorded as
+**protection evidence**, exactly as the finding asked: *no code change was
+manufactured for it*.
+
+##### 4.41.4 Skips
+
+The verbose inventory run (command #8) — exit code **0**:
+
+```
+PASS lines: 1280
+FAIL lines: 0
+1971:--- SKIP: TestQuotaWorkerProcess (0.00s)
+3135:--- SKIP: TestLoadDrill_Throughput (0.00s)
+3138:--- SKIP: TestLoadDrill_LongConnections (0.00s)
+--- skips mentioning postgres / no database ---
+(NONE)
+```
+
+**Database-test skips: 0** — unchanged from §4.37 (the three skips are the
+same `KAYA_QUOTA_WORKER=1` / `KAYA_LOAD=1` gates as in the T0 baseline).
+
+##### 4.41.5 Files changed (fix round)
+
+| File | Change |
+|---|---|
+| `internal/inference/workers/key_concurrency_recovery_test.go` | **new** — the worker-level recovery assertion (real worker + real store + disposable PG) |
+| `internal/inference/gateway/key_concurrency_test.go` | **new cases** — the two "execution state unknown" paths' lease disposition |
+| `docs/runbooks/2026-11-05-model-gateway-verification.md` | §4.40's over-broad bullet corrected into the two-path table; this section |
+| `.superpowers/sdd/…/task-5-report.md` | §2.4 / §5.1 / §10 corrected; §11 added (the report is outside version control) |
+
+**Production code: unchanged.** The fix round touched **tests and
+documentation only**.
 
 ### T6 — Protocol error shape and Retry-After
 

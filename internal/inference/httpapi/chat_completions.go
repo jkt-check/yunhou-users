@@ -401,6 +401,18 @@ func writeV1DomainError(c *gin.Context, err error) {
 		return
 	}
 
+	// 速率拒绝（Task 4）：独立的 429 语义 —— 绝不与金额 quota_exceeded
+	// 混用（后者会触发钱包 fallback）。Retry-After 只在每个阻断约束都
+	// 有可确定恢复时刻时给出。
+	var rle *domain.RateLimitError
+	if errors.As(err, &rle) {
+		if rle.RetryAfterSeconds > 0 {
+			c.Header("Retry-After", strconv.Itoa(rle.RetryAfterSeconds))
+		}
+		v1Error(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited", safeMsg(err))
+		return
+	}
+
 	switch domain.CodeOf(err) {
 	case domain.CodeInvalidKey:
 		v1Error(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid, revoked or expired API key")
@@ -420,6 +432,10 @@ func writeV1DomainError(c *gin.Context, err error) {
 		v1Error(c, http.StatusForbidden, "permission_error", "unpriced_capability", safeMsg(err))
 	case domain.CodeUpstreamUnavailable:
 		v1Error(c, http.StatusServiceUnavailable, "server_error", "upstream_unavailable", safeMsg(err))
+	case domain.CodeServiceUnavailable:
+		// 存储不可用（速率/额度闸门失联）：明确的服务错误，绝不伪装成
+		// 用户额度耗尽（fail closed）。
+		v1Error(c, http.StatusServiceUnavailable, "server_error", "service_unavailable", safeMsg(err))
 	case domain.CodeConflict:
 		v1Error(c, http.StatusConflict, "invalid_request_error", "conflict", safeMsg(err))
 	default:

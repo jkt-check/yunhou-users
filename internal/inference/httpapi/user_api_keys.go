@@ -33,9 +33,6 @@ type AccessOps struct {
 	// group; the auth chain is fixed at mount time so no /v1 route can
 	// exist without it.
 	V1Auth gin.HandlerFunc
-	// RPMCounter backs V1Auth's per-key/account buckets; the router
-	// starts its janitor goroutine when set.
-	RPMCounter *access.RPMCounter
 
 	// V1Models / V1ChatCompletions are the Task 8 standard-protocol
 	// endpoints; both require V1Auth (mounted into the authenticated /v1

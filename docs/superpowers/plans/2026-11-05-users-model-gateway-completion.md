@@ -137,6 +137,67 @@ go test -count=1 ./internal/inference/access ./internal/inference/accounting ./i
 **Modify:** `quota/service.go`、`gateway/service.go`、`httpapi/apikey_auth.go`、`access/ratelimit.go`、`postgres/ledger_repo.go`、`workers/settlement_recovery.go`、`cmd/server/main.go`、必要 config。
 **Interfaces:** 为入场/结算/释放定义持久 rate reservation，以 logical request ID 幂等；存储方法显式接收现有 `domain.UnitOfWork`。确定类型后在本节补充实际签名，T5/T6 复用，禁止在各入口复制计数器。
 
+**实际签名（T4 实施后回填，T5/T6 直接复用）：**
+
+```go
+// internal/inference/domain/rate_limits.go —— 跨包共享的数据形状与可识别的拒绝类型
+type RateScope string
+const (
+    RateScopeAccount RateScope = "account" // 账户级：账户 RPM 计数键 + 账户级 TPM 预占/结算载体
+    RateScopeKey    RateScope = "key"    // Key 级：Key RPM 计数键
+)
+type RateLimits struct { AccountRPM int; PolicyRPM int; PolicyTPM int64; KeyRPM int }
+type RateReserveCommand struct {
+    RequestID        string // logical request id = 幂等身份
+    BillingAccountID string
+    APIKeyID         *string
+    PolicyVersionID  string // 仅审计：计数键不含 policy version
+    Limits           RateLimits
+    ReservedTokens   int64 // TPM 预占 = 输入上界 + 强制输出 cap
+}
+type RateUsage struct {
+    AccountRPMCount, KeyRPMCount int
+    SettledTokens, InflightTokens int64
+    AccountRPMRecoverySeconds, PolicyRPMRecoverySeconds int
+    KeyRPMRecoverySeconds, SettledTokensRecoverySeconds int // 0 = 无法确定恢复时刻
+}
+type RateBlock struct { Scope RateScope; Kind string; Limit, Used int64; RecoverySeconds int }
+type RateLimitError struct { Detail *Error; Blocks []RateBlock; RetryAfterSeconds int }
+
+// internal/inference/access/inference_limits.go —— 纯规则（无数据库、无时钟）
+const RateWindowSeconds = 60
+func NormalizedTokens(b domain.UsageBuckets) int64
+func EvaluateRateLimits(limits domain.RateLimits, usage domain.RateUsage, reservedTokens int64) *domain.RateLimitError
+
+// internal/inference/postgres/inference_limit_repo.go —— 短事务存储（全部显式接收 UnitOfWork）
+func (s *Store) ReserveRateTx(ctx context.Context, w domain.UnitOfWork, cmd domain.RateReserveCommand) error
+func (s *Store) CorrectRateTokensTx(ctx context.Context, w domain.UnitOfWork, requestID string, correctedTokens int64) error
+func (s *Store) PurgeRateReservations(ctx context.Context, cutoff time.Time) (int64, error)
+// 结算/释放与终态事务同事务生效（内部同包调用）：
+func (s *Store) settleRateTx(ctx context.Context, tx *sqlx.Tx, requestID string, tokens int64) error
+func (s *Store) releaseRateTx(ctx context.Context, tx *sqlx.Tx, requestID string) error
+
+// internal/inference/quota/service.go —— 准入编排（速率闸门与金额/并发预占同一事务）
+type Store interface { /* … */ ReserveRateTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.RateReserveCommand) error }
+type Service struct { /* … */ AccountRPM int } // 全局账户 RPM（INFERENCE_ACCOUNT_RPM；0 = 关闭）
+
+// internal/inference/workers/rate_reservation_reaper.go —— 保留期清理（不删未结算预占）
+type RateReservationStore interface { PurgeRateReservations(ctx context.Context, cutoff time.Time) (int64, error) }
+type RateReaperConfig struct { Interval, Retention time.Duration } // 默认 1h / 24h
+func NewRateReservationReaper(store RateReservationStore, clock domain.Clock, cfg RateReaperConfig) *RateReservationReaper
+func (r *RateReservationReaper) RunPass(ctx context.Context) (int64, error)
+```
+
+**实施偏差（已在本任务报告与运行手册记录）：** 共享数据形状落在 `domain` 而不是
+`access` —— `access → quota` 是既有依赖方向，而 `quota` 准入服务必须能命名速率
+预占命令类型，`quota → access` 会成导入环；`domain` 是三方共同依赖的唯一层。
+纯规则仍在 `access/inference_limits.go`（本节最初指定的位置）。`access/ratelimit.go`
+（进程内计数器）已**删除**：它是业务速率限制的重复实现（每实例一份、无法跨实例/
+跨 Key 共享、且会拒绝根本进不了业务准入的请求），权威实现只剩持久速率预占。
+`workers/settlement_recovery.go` 无需改动 —— 速率行的结算/释放挂在 store 的
+`Settle`/`Release` 事务里，恢复 worker 的保守结算与证据释放因此自动收敛同一份
+速率预占；保留期清理独立成 `workers/rate_reservation_reaper.go`。
+
 **确定语义：**
 
 - 推理 admission 统一检查全局账户 RPM（现有 `INFERENCE_ACCOUNT_RPM`）、选中权益策略 RPM、Key RPM；均为硬上限，同时满足，不同 Key 和 `/chat` 共用账户计数。

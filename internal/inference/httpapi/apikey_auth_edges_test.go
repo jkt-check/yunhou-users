@@ -16,7 +16,7 @@ import (
 // 间件（JWT → principal）的三分支：无账户 403 / 正常解析 / 账户停用 403。
 
 func TestUserSessionPrincipal_Branches(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	engine := gin.New()
 	engine.Use(func(c *gin.Context) {
 		if u := c.GetHeader("X-Test-User"); u != "" {

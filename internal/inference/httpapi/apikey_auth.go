@@ -12,7 +12,6 @@ package httpapi
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -74,16 +73,27 @@ func v1AuthError(c *gin.Context, status int, typ, code, message string) {
 	v1Error(c, status, typ, code, message)
 }
 
-// APIKeyAuth authenticates /v1/* requests by customer API key and applies
-// per-Key (when the key carries rpm_limit) and per-account (accountRPM,
-// when > 0) sliding-window rate limits. Rate limiting runs AFTER
-// authentication so buckets key on verified identities, not client input.
+// APIKeyAuth authenticates /v1/* requests by customer API key.
 //
 // Credentials are accepted as `Authorization: Bearer <key>` (OpenAI style)
 // or `X-Api-Key: <key>` (Anthropic style — Task 13: Claude Code 等
 // Anthropic SDK 客户端以 x-api-key 为默认凭据头). Both headers present:
 // Bearer wins. The key VALUE space is identical.
-func APIKeyAuth(resolver *access.Resolver, counter *access.RPMCounter, accountRPM int) gin.HandlerFunc {
+//
+// Task 4: the business rate limits (全局账户 RPM / 选中权益策略 RPM /
+// Key RPM + 账户级策略 TPM) are NOT enforced here any more — they are
+// enforced ONCE in the business admission (quota.Service.Admit), where the
+// counters are shared through PostgreSQL across instances, across Keys and
+// across /chat and /v1. The old process-local buckets were a duplicate,
+// per-instance approximation of that limit: they under-counted globally
+// (N instances ⇒ N× the limit) and they rejected requests that never
+// reached the business admission (model not allowed, invalid shape).
+//
+// What stays here: **authentication** (the key must be valid) and the
+// per-IP abuse guard mounted in front of the group (router.Setup). A
+// request that fails authentication never enters the business admission,
+// so it consumes neither RPM nor TPM.
+func APIKeyAuth(resolver *access.Resolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var rawKey string
 		if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
@@ -105,26 +115,6 @@ func APIKeyAuth(resolver *access.Resolver, counter *access.RPMCounter, accountRP
 			v1AuthError(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key",
 				"invalid, revoked or expired API key")
 			return
-		}
-		if counter != nil {
-			limited := false
-			var scope string
-			if res.Key.RPMLimit != nil {
-				scope = "key:" + res.Key.ID
-				limited = !counter.Allow(scope, *res.Key.RPMLimit)
-			}
-			if !limited && accountRPM > 0 {
-				scope = "acct:" + res.Account.ID
-				limited = !counter.Allow(scope, accountRPM)
-			}
-			if limited {
-				if ra := counter.RetryAfter(scope); ra > 0 {
-					c.Header("Retry-After", strconv.Itoa(int(ra.Seconds())+1))
-				}
-				v1AuthError(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited",
-					"rate limit exceeded")
-				return
-			}
 		}
 		c.Set(ContextCallerPrincipal, res.Principal)
 		c.Set(ContextCallerKey, res.Key)

@@ -109,6 +109,7 @@ func cleanupDB(t *testing.T, db *sqlx.DB) {
 		inference_reconciliation_jobs, inference_outbox,
 		inference_ledger_entries, inference_adjustments,
 		inference_concurrency_leases, inference_reservations,
+		inference_rate_reservations,
 		inference_quota_windows, inference_usage_records,
 		inference_attempts, inference_requests,
 		inference_entitlements, inference_policy_versions,

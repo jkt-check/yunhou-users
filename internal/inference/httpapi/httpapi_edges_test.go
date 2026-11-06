@@ -107,7 +107,7 @@ func TestV1Parse_ThinkingAndPassthroughForwarded(t *testing.T) {
 }
 
 func TestUserAPIKeys_PatchEdges(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	_, token := f.addUser(t)
 	create := func() string {
 		w := f.do(t, http.MethodPost, "/user/api-keys", token, map[string]any{"name": "k1"})

@@ -29,6 +29,11 @@ const (
 	// derived available balance (or the monthly spend limit) cannot cover
 	// the safe upper-bound hold (Task 14: 并发扣减在 DB 层原子，不超扣).
 	CodeInsufficientBalance Code = "insufficient_balance"
+	// CodeServiceUnavailable marks a service-side failure — the storage
+	// that guards admission (rate limits, quota windows) is unreachable.
+	// It is a clear server error, NEVER a user quota exhaustion: a
+	// database outage must not be answered as "your quota is exhausted".
+	CodeServiceUnavailable Code = "service_unavailable"
 	CodeInternal            Code = "internal"
 )
 
@@ -68,6 +73,13 @@ func CodeOf(err error) Code {
 	var se *SettleError
 	if errors.As(err, &se) {
 		return se.Code
+	}
+	// The typed rate rejection carries CodeRateLimited — a rate rejection
+	// must never be confused with the monetary quota_exceeded (which is
+	// the signal for the wallet fallback).
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		return CodeRateLimited
 	}
 	var de *Error
 	if errors.As(err, &de) {

@@ -1719,12 +1719,297 @@ Unchanged from §4.20 — `TestQuotaWorkerProcess` (`KAYA_QUOTA_WORKER=1`),
 
 ### T4 — PostgreSQL-backed RPM/TPM
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `cdb2cdb` (the T3 branch tip; T0 base
+`35cf836`). Task report:
+`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-4-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the instance
+down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`; every
+database-backed command used `-p 1`; `go.mod` / `go.sum` were never modified
+(`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.26 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1, `t4_app`) | **0** | `applied=52 skipped=0` (51 baseline + 052) |
+| 4 | `go run ./cmd/migrate` (run 2, `t4_app`) | **0** | `applied=0 skipped=52` (idempotent) |
+| 5 | `go run ./cmd/migrate -status` | **0** | 52 × `✅` |
+| 6 | `DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate` | **0** | e2e-side DB migrated before the e2e job |
+| 7 | **RED** `go test -count=1 -run 'TestRateLimit_' -v ./internal/inference/gateway` | **1** | the leak reproduced — see §4.27 |
+| 8 | **GREEN** the same command as #7 | **0** | all 13 T4 gateway cases pass |
+| 9 | **GREEN** `go test -count=1 -run 'TestReserveRateTx_|TestRateSettle_|TestRateRelease_|TestCorrectRateTokens_|TestPurgeRateReservations_|TestRateTPM_' -v ./internal/inference/postgres` | **0** | 9 store-level cases pass |
+| 10 | **GREEN** `go test -count=1 ./internal/inference/access` (pure rules) | **0** | 6 pure-rule cases pass |
+| 11 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/... ./internal/router ./internal/config ./cmd/server` | **0** | 17 packages `ok` |
+| 12 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, 0 FAIL |
+| 13 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 52 PASS / 2 SKIP / 0 FAIL |
+| 14 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t4_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 417.807s` (125 PASS / 1 SKIP) |
+| 15 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 16 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.1%` ≥ the 80% floor (T3 80.5%, T2 80.3%, T1 80.5%, T0 80.4%) |
+
+#### 4.27 RED evidence (before any production edit)
+
+Command #7 ran against the **unmodified** production code at `cdb2cdb`. The
+new cases were written against the *existing* API surface only (the gateway's
+`ChatCompletions`, the real PostgreSQL store, the existing policy/Key
+columns), so every failure is a behavioural assertion failure — never a
+compile error, never a skipped database test.
+
+```
+=== RUN   TestRateLimit_PolicyRPM_CapsConcurrentAdmissions
+    rate_limits_test.go:211: admitted = 3, want 2 (RPM=2 是硬上限，第三次必须被拒)
+    rate_limits_test.go:214: rate-limited = 0, want 1
+--- FAIL: TestRateLimit_PolicyRPM_CapsConcurrentAdmissions (0.09s)
+=== RUN   TestRateLimit_TwoInstancesTwoPools_ShareTheAccountCounter
+    rate_limits_test.go:255: admitted = 3, want <= 2 (两个实例必须共享同一个账户计数)
+--- FAIL: TestRateLimit_TwoInstancesTwoPools_ShareTheAccountCounter (0.10s)
+=== RUN   TestRateLimit_CrossKeyAndEntrypointShareTheAccountCounter
+    rate_limits_test.go:282: call 3 err = <nil>, want rate_limited (/chat 与 /v1 共用账户计数)
+--- FAIL: TestRateLimit_CrossKeyAndEntrypointShareTheAccountCounter (0.11s)
+=== RUN   TestRateLimit_KeyRPMIsEnforcedPerKey
+    rate_limits_test.go:302: call 2 err = <nil>, want rate_limited (Key RPM=1)
+--- FAIL: TestRateLimit_KeyRPMIsEnforcedPerKey (0.09s)
+=== RUN   TestRateLimit_PolicyChangeDoesNotResetTheMinute
+    rate_limits_test.go:341: after policy change err = <nil>, want rate_limited (换套餐不得重置一分钟消费)
+--- FAIL: TestRateLimit_PolicyChangeDoesNotResetTheMinute (0.12s)
+=== RUN   TestRateLimit_UpstreamFailureStillCountsTheRequest
+    rate_limits_test.go:383: call 3 err = <nil>, want rate_limited (上游失败后仍计 RPM)
+--- FAIL: TestRateLimit_UpstreamFailureStillCountsTheRequest (0.13s)
+=== RUN   TestRateLimit_TPM_InFlightHoldBlocksAndSettlementReleases
+    rate_limits_test.go:413: call 2 err = <nil>, want rate_limited (60 在途 + 50 预占 > TPM 100)
+--- FAIL: TestRateLimit_TPM_InFlightHoldBlocksAndSettlementReleases (0.11s)
+=== RUN   TestRateLimit_TPM_OverHoldCountsTheActualTotal
+    rate_limits_test.go:440: call 2 err = <nil>, want rate_limited (实际 100 token 全额计入 TPM)
+--- FAIL: TestRateLimit_TPM_OverHoldCountsTheActualTotal (0.11s)
+=== RUN   TestRateLimit_TPM_UnknownUsageKeepsTheHold
+    rate_limits_test.go:475: call 2 err = <nil>, want rate_limited (unknown 用量不得释放预占)
+--- FAIL: TestRateLimit_TPM_UnknownUsageKeepsTheHold (0.12s)
+=== RUN   TestRateLimit_WalletPathAppliesTheSameLimits
+    rate_limits_test.go:517: call 3 err = <nil>, want rate_limited (钱包路径同样受 RPM 限制)
+--- FAIL: TestRateLimit_WalletPathAppliesTheSameLimits (0.11s)
+=== RUN   TestRateLimit_DBOutageFailsClosed
+--- PASS: TestRateLimit_DBOutageFailsClosed (0.09s)
+FAIL
+FAIL	github.com/yunhou/users/internal/inference/gateway	2.024s
+```
+
+**Root cause (one defect, ten surfaces).** The business rate limits did not
+exist in the gateway at all: the policy's `rpm_limit`/`tpm_limit` and the
+Key's `rpm_limit` were persisted and administered, but **nothing read them
+on the inference path**. The only counter was the process-local
+`access.RPMCounter` inside `APIKeyAuth` — per instance, therefore unable to
+hold a global limit, and never applied to `/chat` (which never passes through
+that middleware).
+
+**Protection evidence (already-correct behaviour, recorded instead of a forced
+change).** `TestRateLimit_DBOutageFailsClosed` **passed** at the pre-fix
+baseline: a database outage already refused the admission (fail-closed) and
+was not reported as a quota exhaustion. T4 kept that behaviour and made the
+error shape explicit (503 `service_unavailable` instead of a generic 500).
+
+The store-level cases (command #9) and the pure-rule cases (command #10)
+could not be written before the implementation: they exercise the persistent
+rate reservation itself (idempotency, settle/release/correction, retention),
+which has no pre-T4 API surface. They were written together with the
+implementation and are GREEN-only by construction; the behaviour they pin is
+the brief's own wording (TPM lifecycle, net-delta correction, retention).
+
+#### 4.28 GREEN evidence
+
+Command #8 — exit code **0**:
+
+```
+--- PASS: TestRateLimit_PolicyRPM_CapsConcurrentAdmissions (0.16s)
+--- PASS: TestRateLimit_TwoInstancesTwoPools_ShareTheAccountCounter (0.19s)
+--- PASS: TestRateLimit_CrossKeyAndEntrypointShareTheAccountCounter (0.35s)
+--- PASS: TestRateLimit_KeyRPMIsEnforcedPerKey (0.21s)
+--- PASS: TestRateLimit_PolicyChangeDoesNotResetTheMinute (0.16s)
+--- PASS: TestRateLimit_UpstreamFailureStillCountsTheRequest (0.27s)
+--- PASS: TestRateLimit_TPM_InFlightHoldBlocksAndSettlementReleases (0.14s)
+--- PASS: TestRateLimit_TPM_OverHoldCountsTheActualTotal (0.16s)
+--- PASS: TestRateLimit_TPM_UnknownUsageKeepsTheHold (0.18s)
+--- PASS: TestRateLimit_WalletPathAppliesTheSameLimits (0.21s)
+--- PASS: TestRateLimit_DBOutageFailsClosed (0.10s)
+--- PASS: TestRateLimit_WalletFreezeFailureRollsBackTheWholeAdmission (0.08s)
+--- PASS: TestRateLimit_RetryAfterOnlyWhenTheRecoveryIsDeterminable (0.18s)
+```
+
+Command #9 (store level) — exit code **0**: 9/9 cases pass
+(`TestReserveRateTx_CountsOneLogicalRequestOnce`, `…_RejectionRollsBackEverything`,
+`TestRateSettle_ConvertsTheHoldIntoTheActualTokens`,
+`TestRateSettle_DuplicateSettlementDoesNotDoubleCountTheTokens`,
+`TestRateRelease_DropsTheHoldButKeepsTheCount`,
+`TestCorrectRateTokens_NetDeltaKeepsTheOriginalSettlementTime`,
+`TestCorrectRateTokens_OutOfWindowCorrectionDoesNotConsumeTheCurrentMinute`,
+`TestPurgeRateReservations_NeverDeletesUnsettledReservations`,
+`TestRateTPM_InFlightHoldSurvivesTheWindow`).
+
+Command #10 (pure rules + reaper) — exit code **0**: 6 pure-rule cases and 3
+reaper cases pass.
+
+Command #9 (store level) — exit code **0**: `TestReserveRateTx_CountsOneLogicalRequestOnce`,
+`…_RejectionRollsBackEverything`, `TestRateSettle_ConvertsTheHoldIntoTheActualTokens`,
+`TestRateSettle_DuplicateSettlementDoesNotDoubleCountTheTokens`,
+`TestRateRelease_DropsTheHoldButKeepsTheCount`,
+`TestCorrectRateTokens_NetDeltaKeepsTheOriginalSettlementTime`,
+`TestCorrectRateTokens_OutOfWindowCorrectionDoesNotConsumeTheCurrentMinute`,
+`TestPurgeRateReservations_NeverDeletesUnsettledReservations`,
+`TestRateTPM_InFlightHoldSurvivesTheWindow` — 9/9 pass.
+
+Command #11 (the brief's acceptance command) — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/access	1.709s
+ok  	github.com/yunhou/users/internal/inference/accounting	1.681s
+ok  	github.com/yunhou/users/internal/inference/catalog	5.835s
+ok  	github.com/yunhou/users/internal/inference/credentials	3.254s
+ok  	github.com/yunhou/users/internal/inference/domain	1.679s
+ok  	github.com/yunhou/users/internal/inference/gateway	27.465s
+ok  	github.com/yunhou/users/internal/inference/httpapi	110.179s
+ok  	github.com/yunhou/users/internal/inference/management	3.203s
+ok  	github.com/yunhou/users/internal/inference/postgres	31.509s
+ok  	github.com/yunhou/users/internal/inference/providers	1.782s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	1.672s
+ok  	github.com/yunhou/users/internal/inference/quota	1.635s
+ok  	github.com/yunhou/users/internal/inference/routing	1.897s
+ok  	github.com/yunhou/users/internal/inference/workers	9.798s
+ok  	github.com/yunhou/users/internal/router	2.625s
+ok  	github.com/yunhou/users/internal/config	1.659s
+ok  	github.com/yunhou/users/cmd/server	2.797s
+```
+
+(The final verification run above is the one recorded in this section; the
+wall-clock numbers vary with the machine load — the *results* were identical
+in three consecutive runs.)
+
+#### 4.29 Skips
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1` (`quota_concurrency_test.go:773`). The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+| 4 | `TestUsageTokenAcceptance_TenPagesTwoMinutes` | `tests/e2e` | Explicit non-default gate (usage-stats acceptance drill). | No |
+
+**Database-test skips: 0** — identical to the T0 (§2.6), T1 (§4.4), T2
+(§4.12) and T3 (§4.20) inventories; grepping the skip lines for `postgres` /
+`no database` / `database unavailable` returns nothing.
+
+#### 4.30 Migration
+
+**One appended migration: `migrations/052_inference_rate_reservations.sql`**
+(52 = the re-checked latest number; 051 was the T2-fix-round baseline). It
+creates `inference_rate_reservations`:
+
+| Column | Meaning |
+|---|---|
+| `request_id` | the logical request id — the **idempotency identity** (`UNIQUE (request_id, scope)`) |
+| `billing_account_id` / `api_key_id` | the counting key (account-level and per-Key) |
+| `scope` | `account` (account RPM counter **and** the account-level TPM reservation) or `key` (the per-Key RPM counter) |
+| `counted_at` | the successful-admission instant (**database time**) — the rolling-60s window attribution |
+| `reserved_tokens` / `settled_tokens` | the account-level TPM: the in-flight hold and the settled actual |
+| `state` | `reserved` (in flight) / `settled` / `released` |
+
+Indexes: `(billing_account_id, counted_at DESC) WHERE scope='account'`,
+`(api_key_id, counted_at DESC) WHERE scope='key'`,
+`(billing_account_id) WHERE state='reserved'` (the in-flight TPM sum),
+`(billing_account_id, settled_at DESC) WHERE state='settled'` (the settled
+TPM window sum), `(counted_at) WHERE state <> 'reserved'` (the retention
+sweep). The counting key deliberately does **not** contain the policy
+version — switching plans never resets the minute.
+
+Evidence: `go run ./cmd/migrate` (run 1) → `applied=52 skipped=0`;
+(run 2) → `applied=0 skipped=52`; `go run ./cmd/migrate -status` → 52 × `✅`.
+The e2e-side disposable database was migrated the same way.
+
+**Retention / cleanup.** `workers.RateReservationReaper` sweeps hourly and
+deletes the **terminal** rate reservations (`state <> 'reserved'`) older than
+**24 hours**. An unsettled reservation is **never** deleted by the cleanup —
+it still occupies the TPM budget (a long stream keeps its hold beyond the
+60s window), so a TTL must not release it. The reaper has its own narrow
+store contract (`workers.RateReservationStore`) so the settlement-recovery
+store contract stays untouched.
+
+#### 4.31 Files changed
+
+| File | Change |
+|---|---|
+| `migrations/052_inference_rate_reservations.sql` | **new** — the persistent rate reservation table + indexes |
+| `internal/inference/domain/rate_limits.go` | **new** — the shared shapes (`RateLimits`, `RateReserveCommand`, `RateUsage`, `RateBlock`) and the typed rejection `RateLimitError` |
+| `internal/inference/domain/errors.go` | `CodeOf` recognises the typed rate rejection; new `CodeServiceUnavailable` |
+| `internal/inference/access/inference_limits.go` | **new** — the pure rules (`NormalizedTokens`, `EvaluateRateLimits`, `RecoverySeconds`) |
+| `internal/inference/access/ratelimit.go` (+ its two test files) | **deleted** — the process-local counter was a duplicate, per-instance business limit (see §4.32) |
+| `internal/inference/access/principal_authenticate_edges_test.go` | **new** (renamed from `ratelimit_principal_edges_test.go`) — keeps the `Resolver.Authenticate` branch coverage |
+| `internal/inference/postgres/inference_limit_repo.go` | **new** — `ReserveRateTx` / `CorrectRateTokensTx` / `PurgeRateReservations` + the settle/release writers |
+| `internal/inference/postgres/ledger_repo.go` | the settlement converts the TPM hold into the **actual** normalized tokens (plan and wallet paths) |
+| `internal/inference/postgres/reservation_repo.go` | the release drops the TPM hold (the RPM count stays) |
+| `internal/inference/quota/service.go` | the rate gate runs **inside the admission transaction** (plan and wallet paths); `Service.AccountRPM`; a storage outage is a service error |
+| `internal/inference/gateway/service.go` | one logical request id for the whole call (the plan→wallet fallback reuses it); a rate rejection is never masked by the plan's `quota_exceeded` |
+| `internal/inference/httpapi/apikey_auth.go` | the duplicate business decrement is **removed** (authentication + the per-IP guard stay) |
+| `internal/inference/httpapi/chat_completions.go`, `messages.go`, `admin_models.go` | the typed rate rejection → 429 (+ `Retry-After` only when determinable); `service_unavailable` → 503 |
+| `internal/inference/httpapi/user_api_keys.go`, `internal/router/router.go`, `cmd/server/main.go` | the counter wiring is gone; `quotaSvc.AccountRPM = cfg.InferenceAccountRPM` |
+| `internal/service/chat_facade.go` | the `/chat` facade maps a storage outage to 503 (never a fake quota exhaustion) |
+| `internal/inference/workers/rate_reservation_reaper.go` | **new** — the retention sweep (never deletes an unsettled reservation) |
+| `internal/inference/gateway/rate_limits_test.go` | **new** — 11 T4 gateway cases (two instances/two pools, cross-Key, cross-entrypoint, policy change, TPM lifecycle, wallet path, DB outage, Retry-After) |
+| `internal/inference/postgres/inference_limit_test.go` | **new** — 9 store-level cases (idempotency, rollback, settle/release/correction, retention) |
+| `internal/inference/access/inference_limits_test.go` | **new** — the pure-rule cases (token normalisation, simultaneous limits, Retry-After determinability) |
+| `internal/inference/workers/rate_reservation_reaper_test.go` | **new** — the retention sweep cases |
+| `internal/inference/quota/service_test.go` | the fake store grows `ReserveRateTx` |
+| `internal/inference/httpapi/user_api_keys_test.go` | the auth-layer rate-limit cases are replaced by `TestV1_AuthLayerOnlyAuthenticates` (the business limit moved to the admission) |
+| `tests/e2e/chat_gateway_test.go`, `tests/e2e/testhelpers.go` | the e2e wipe lists the new table (FK-safe order) |
+| `tests/e2e/kaya_coding_plan_test.go`, `tests/integration/*.go`, `internal/inference/httpapi/*_test.go` | the `APIKeyAuth` signature change (the counter argument is gone) |
+| `docs/api/kaya-coding-plan.openapi.yaml`, `docs/api-integration-guide.md`, `CLAUDE.md`, `.env.example`, `internal/config/config.go` | the new 429/503 semantics, the business-rate-limit contract, and the `INFERENCE_ACCOUNT_RPM` meaning |
+| `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md` | the T4 **Interfaces** paragraph now carries the real signatures (required by the plan) |
+
+#### 4.32 Notes (lock order, overhead, retention, compatibility, honesty)
+
+- **Lock order.** The rate gate is part of the **existing** admission
+  transaction, so it inherits the fixed lock order: account (`FOR UPDATE`) →
+  request row → windows (five_hour→weekly→monthly) → Key budget →
+  reservation/lease rows → **rate rows**. The rate reads are plain `SELECT`s
+  (no row locks) and the rate writes touch only the new request's own rows,
+  so the gate can never form a deadlock cycle with the settlement path
+  (request row → rate rows). Same-account admissions still serialize on the
+  account anchor lock, which is what makes the read-then-insert of the
+  counters atomic across instances.
+- **Per-account overhead.** One aggregate statement (5 sub-queries: the
+  account count, the Key count, the in-flight TPM sum, the settled TPM window
+  sum and the Key's `rpm_limit`) plus 1–2 inserts per admission; the
+  recovery-instant window scans run **only on a rejection**. Measured on the
+  disposable PostgreSQL 16 with ~200 rows in the rolling window: **≈0.87 ms
+  per admission** (empty-transaction baseline ≈0.09 ms, with the gate
+  ≈0.97 ms). All scans are index-only over the window's rows (bounded by the
+  account's RPM), not table scans.
+- **Time semantics.** Every timestamp is the **database** clock (`now()`),
+  so instances agree on the window attribution; the settlement instant is
+  recorded once and a later correction never moves it.
+- **Token normalisation.** The TPM counts exactly what the price list bills
+  (`accounting.BillableBuckets` afterwards): input + cache read + cache
+  write + output. The reasoning detail is already inside the output total
+  and the cache buckets are already subtracted from the input — neither is
+  counted twice.
+- **Compatibility.** The wire contract only gained clarity: a rate
+  rejection is the already-documented 429 `rate_limited`; a storage outage
+  is a new, explicit 503 `service_unavailable` (never a fake quota
+  exhaustion). `quota_exceeded` keeps its meaning (money). The OpenAPI spec,
+  the integration guide, `CLAUDE.md` and `.env.example` were updated for
+  both.
+- **Behaviour change for operators.** The account/Key RPM buckets moved from
+  the auth middleware into the business admission: a request that never
+  reaches the admission (invalid shape, model not allowed) no longer
+  consumes a rate token, and the limit is now genuinely global across
+  instances instead of "120 per instance".
+- **Honest limitation.** The **money-side** settlement correction (the
+  ledger reversal/adjustment) is still the reconciliation flow's job; T4 adds
+  the **rate-side** counterpart (`Store.CorrectRateTokensTx`: net delta per
+  request, original settlement instant kept, idempotent) and pins it with
+  tests, but no production flow calls it yet — the evidence window is still
+  driven by the existing reconciliation queue.
 
 ### T5 — Per-key concurrency
 

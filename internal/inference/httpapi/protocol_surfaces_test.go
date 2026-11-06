@@ -115,7 +115,7 @@ func newProtoFixture(t *testing.T) *protoFixture {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	v1 := engine.Group("/v1", httpapi.APIKeyAuth(f.resolver, access.NewRPMCounter(nil), 0))
+	v1 := engine.Group("/v1", httpapi.APIKeyAuth(f.resolver))
 	v1.POST("/messages", httpapi.NewMessagesHandler(f.gw).Create)
 	v1.POST("/responses", f.respHandler.Create)
 	f.engine = engine

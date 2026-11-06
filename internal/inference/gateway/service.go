@@ -381,9 +381,13 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	} else if p.APIKeyID != "" {
 		keyID = &p.APIKeyID
 	}
+	// 逻辑请求 ID 在入场时生成一次（Task 4 幂等身份）：套餐预占失败后转
+	// 钱包的第二次尝试沿用**同一个** ID —— 第一次尝试整笔事务回滚（没有
+	// 请求行、没有速率计数），第二次用同一身份成功准入只计一次。
+	logicalRequestID := uuid.NewString()
 	newRequest := func() domain.Request {
 		return domain.Request{
-			BillingAccountID: p.BillingAccountID, APIKeyID: keyID,
+			ID: logicalRequestID, BillingAccountID: p.BillingAccountID, APIKeyID: keyID,
 			EntitlementID: ent.ID, ModelID: m.ID,
 			Protocol: clientProto, Stream: req.Stream,
 		}
@@ -422,6 +426,12 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 			}
 			wadm, wprice, werr := s.admitWallet(ctx, newRequest(), *ent, policy, m, req, now)
 			if werr != nil {
+				// 速率拒绝是可识别的独立结果：钱包 fallback 同样受同一组业务
+				// 速率限制（RPM/TPM），被拒时必须以 rate_limited 答复，不能被
+				// 套餐的 quota_exceeded 掩盖（否则客户会误以为"充值即可"）。
+				if domain.CodeOf(werr) == domain.CodeRateLimited {
+					return nil, werr
+				}
 				return nil, err
 			}
 			adm, price = wadm, wprice

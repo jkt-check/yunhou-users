@@ -810,10 +810,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/AnthropicError"
         "429":
-          description: rate_limit_error（额度耗尽;可计算恢复时刻时带 Retry-After）
+          description: |
+            rate_limit_error（业务速率限制：`rate_limited` = 账户/策略/Key 的
+            RPM 或账户级 TPM 上限；`quota_exceeded` = 额度耗尽。可计算恢复时刻
+            时带 Retry-After）
           headers:
             Retry-After:
               schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "503":
+          description: |
+            service_unavailable（准入存储不可用：网关 fail closed 拒绝新推理，
+            绝不伪装成用户额度耗尽）
           content:
             application/json:
               schema:
@@ -905,7 +916,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "429":
-          description: quota_exceeded（可计算恢复时刻时带 Retry-After）
+          description: quota_exceeded / rate_limited（可计算恢复时刻时带 Retry-After）
           headers:
             Retry-After:
               schema: { type: integer }
@@ -914,7 +925,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "503":
-          description: upstream_unavailable
+          description: upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）
           content:
             application/json:
               schema:
@@ -994,7 +1005,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "429":
-          description: quota_exceeded / insufficient_balance / rate_limited（可计算恢复时刻时带 Retry-After）
+          description: |
+            quota_exceeded / insufficient_balance / rate_limited（可计算恢复时刻时带
+            Retry-After）。`rate_limited` 是**业务速率限制**（账户/策略/Key 的
+            RPM 与账户级 TPM 上限）：它与金额额度耗尽（quota_exceeded）严格分开，
+            充值/切换 PAYG 不能绕过。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -1003,7 +1018,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "503":
-          description: upstream_unavailable
+          description: upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）
           content:
             application/json:
               schema:
@@ -1018,6 +1033,9 @@ paths:
         且有启用路由与可售价格，且属于调用者有效权益模型集合（Key 的
         model_allow 只能收窄不能放宽）。Anthropic 形状的模型列表端点
         不实现。
+
+        **不占用推理额度**：模型列表不进入业务准入，因此不消耗账户/策略/Key
+        的 RPM，也不预占 TPM（外围每 IP 防滥用保护仍在）。
       security:
         - BearerAuth: []
       responses:
@@ -1674,6 +1692,10 @@ components:
         rpm_limit:
           type: integer
           nullable: true
+          description: |
+            该 Key 的每分钟请求上限（null = 不限）。**业务速率限制**在业务准入
+            里执行（滚动 60 秒、PostgreSQL 共享）：与全局账户 RPM、当前权益
+            策略的 RPM **同时满足**才放行；超限答复 429 `rate_limited`。
         status:
           type: string
           enum: [active, revoked, expired]
@@ -1697,7 +1719,10 @@ components:
           items: { type: string }
         budget_micros:
           $ref: "#/components/schemas/DecimalInt64"
-        rpm_limit: { type: integer, minimum: 1 }
+        rpm_limit:
+          type: integer
+          minimum: 1
+          description: 该 Key 的每分钟请求上限（业务准入执行，跨实例共享）。
         expires_at:
           $ref: "#/components/schemas/RFC3339UTC"
     ApiKeyUpdateRequest:
@@ -1715,6 +1740,7 @@ components:
         rpm_limit:
           type: integer
           nullable: true
+          description: 该 Key 的每分钟请求上限（业务准入执行，跨实例共享）；显式 null 清除。
         expires_at:
           $ref: "#/components/schemas/RFC3339UTC"
           nullable: true

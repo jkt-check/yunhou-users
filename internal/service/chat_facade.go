@@ -270,6 +270,9 @@ func mapGatewayError(err error) error {
 		return ErrChatNoAccess
 	case domain.CodeQuotaExceeded, domain.CodeRateLimited, domain.CodeInsufficientCapacity:
 		return ErrChatRateLimited
+	case domain.CodeServiceUnavailable:
+		// 准入存储不可用：明确的服务错误（503），绝不伪装成额度耗尽。
+		return ErrChatNotReady
 	case domain.CodeInvalidInput:
 		return ErrChatUpstreamRejected
 	default:

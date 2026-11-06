@@ -251,10 +251,14 @@ type Config struct {
 	// though they are not globally routable (self-hosted intranet
 	// deployments, 设计 §5). Empty = only globally routable targets.
 	InferenceUpstreamAllowlist []string
-	// InferenceAccountRPM is the default per-billing-account requests-per-
-	// minute bucket on /v1/* (Task 5; per-Key rpm_limit applies on top when
-	// set). Process-local sliding window; cross-instance coordination is
-	// Task 7's database leases. 0 disables the account-level bucket.
+	// InferenceAccountRPM is the global per-billing-account requests-per-
+	// minute limit (Task 4). It is enforced in the BUSINESS ADMISSION
+	// together with the selected entitlement policy's RPM limit and the
+	// customer Key's rpm_limit — all three are hard limits that must hold
+	// simultaneously, counted in PostgreSQL (rolling 60s window, shared by
+	// every instance, across Keys and across /chat and /v1). 0 disables the
+	// account-level limit (the counter is still kept, so enabling it later
+	// never resets the minute).
 	InferenceAccountRPM int
 
 	// InferenceKayaChatGateway is the /chat 迁移开关 (Task 8): when true,

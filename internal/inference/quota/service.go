@@ -63,6 +63,13 @@ type Store interface {
 	// domain.ReserveWalletCommand contract: 账户→钱包固定锁序、派生余额
 	// 检查、赠送先扣拆分、支出上限门控).
 	ReserveWallet(ctx context.Context, uow domain.UnitOfWork, cmd domain.ReserveWalletCommand) (*domain.Admission, error)
+	// ReserveRateTx evaluates the business rate limits (account/policy/key
+	// RPM + the account-level policy TPM) and records the PERSISTENT rate
+	// reservation of the request inside the caller's transaction (Task 4).
+	// The same UnitOfWork as the monetary/concurrency admission: a rate
+	// rejection rolls the whole admission back (no partial effects), and a
+	// failed transaction leaves no rate count behind.
+	ReserveRateTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.RateReserveCommand) error
 }
 
 // ActivateWindowsCommand is the input of in-transaction window resolution
@@ -139,6 +146,13 @@ type Service struct {
 	AccountLeaseTTL time.Duration
 	// OwnerToken identifies this service instance as lease owner.
 	OwnerToken string
+	// AccountRPM is the GLOBAL per-billing-account requests-per-minute limit
+	// (INFERENCE_ACCOUNT_RPM). It is enforced together with the selected
+	// policy's RPM limit and the customer Key's RPM limit — all three are
+	// hard limits that must hold simultaneously (Task 4). 0 disables the
+	// account-level bucket (the account counter is still kept, so enabling
+	// it later never resets the minute).
+	AccountRPM int
 }
 
 // NewService builds the admission service; a nil clock uses the system
@@ -223,7 +237,11 @@ func (s *Service) Admit(ctx context.Context, cmd AdmitCommand) (*AdmissionResult
 func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time, hold domain.Microcredit, inputBound, outputCap int64, limits map[domain.WindowKind]domain.Microcredit) (*AdmissionResult, error) {
 	uow, err := s.store.Begin(ctx)
 	if err != nil {
-		return nil, err // fail-closed: storage unavailable → not admitted
+		// fail-closed: storage unavailable → not admitted. The failure is a
+		// SERVICE error (the database is unreachable), never a user quota
+		// exhaustion (设计 §7.2: DB 不可用用明确服务错误).
+		return nil, domain.WrapError(domain.CodeServiceUnavailable,
+			"inference: admission storage unavailable", err)
 	}
 	// Every failure path rolls back: no partial holds survive (设计 §7.2).
 	rollback := func(err error) (*AdmissionResult, error) {
@@ -293,6 +311,14 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 		Request: req, Holds: holds, AdmittedAt: at,
 	})
 	if err != nil {
+		return rollback(err)
+	}
+
+	// 速率闸门（Task 4）：与金额/并发预占**同一个事务**。账户级 RPM（全局
+	// 值）、选中权益策略 RPM、Key RPM 同时满足才放行；策略 TPM 是账户级
+	// 上限（预占 = 输入上界 + 强制输出 cap）。被拒时整笔事务回滚：没有
+	// 任何速率计数残留，金额预占也不会留下。
+	if err := s.reserveRateTx(ctx, uow, cmd.Request, adm.RequestID, cmd.Policy, inputBound+outputCap); err != nil {
 		return rollback(err)
 	}
 
@@ -391,7 +417,10 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 
 	uow, err := s.store.Begin(ctx)
 	if err != nil {
-		return nil, err // fail-closed
+		// fail-closed: storage unavailable → not admitted (service error,
+		// never a user quota exhaustion).
+		return nil, domain.WrapError(domain.CodeServiceUnavailable,
+			"inference: admission storage unavailable", err)
 	}
 	rollback := func(err error) (*AdmissionResult, error) {
 		_ = uow.Rollback(ctx)
@@ -414,6 +443,13 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 		AdmittedAt: at, MonthStart: monthStart, MonthEnd: monthEnd,
 	})
 	if err != nil {
+		return rollback(err)
+	}
+
+	// 速率闸门（Task 4）：钱包路径与套餐路径**同一组**业务速率限制 ——
+	// PAYG/套餐外不得用钱包绕过 RPM/TPM。与金额冻结同一事务：冻结失败或
+	// 速率被拒都整笔回滚（钱包零扣款、无速率计数残留）。
+	if err := s.reserveRateTx(ctx, uow, cmd.Request, adm.RequestID, cmd.Policy, inputBound+outputCap); err != nil {
 		return rollback(err)
 	}
 
@@ -447,6 +483,44 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 		return nil, err
 	}
 	return result, nil
+}
+
+// reserveRateTx evaluates and records the persistent rate reservation of
+// one admission inside the caller's transaction (Task 4).
+//
+// The limits applied are the GLOBAL account RPM (Service.AccountRPM), the
+// selected entitlement policy's RPM/TPM (a nil limit adds NO limit — an
+// explicit "no limit", never "unlimited by accident") and the customer
+// Key's RPM limit (read from the key row by the store inside the same
+// transaction).
+//
+// reservedTokens is the TPM hold of this request: the admission input
+// bound plus the forced output cap (the same upper bound the monetary
+// reservation prices).
+func (s *Service) reserveRateTx(ctx context.Context, uow domain.UnitOfWork, req domain.Request,
+	requestID string, policy Policy, reservedTokens int64) error {
+	return s.store.ReserveRateTx(ctx, uow, domain.RateReserveCommand{
+		RequestID:        requestID,
+		BillingAccountID: req.BillingAccountID,
+		APIKeyID:         req.APIKeyID,
+		PolicyVersionID:  req.PolicyVersionID,
+		Limits:           s.rateLimits(policy),
+		ReservedTokens:   reservedTokens,
+	})
+}
+
+// rateLimits derives the effective business rate limits of one admission.
+// A nil / non-positive policy limit adds NO limit (显式关闭 ≠ 无限额度);
+// the global account RPM keeps its documented disable rule (0 = off).
+func (s *Service) rateLimits(policy Policy) domain.RateLimits {
+	limits := domain.RateLimits{AccountRPM: s.AccountRPM}
+	if policy.RPMLimit != nil && *policy.RPMLimit > 0 {
+		limits.PolicyRPM = *policy.RPMLimit
+	}
+	if policy.TPMLimit != nil && *policy.TPMLimit > 0 {
+		limits.PolicyTPM = *policy.TPMLimit
+	}
+	return limits
 }
 
 // ReleaseAdmission confirms zero upstream consumption and drops every hold

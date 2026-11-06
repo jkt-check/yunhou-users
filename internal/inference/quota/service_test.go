@@ -45,6 +45,10 @@ type fakeStore struct {
 
 	leaseErr error
 	leases   []domain.AcquireLeaseCommand
+
+	// Task 4: the persistent rate reservation (business RPM/TPM gate).
+	rateErr  error
+	rateCmds []domain.RateReserveCommand
 }
 
 func (s *fakeStore) Begin(ctx context.Context) (domain.UnitOfWork, error) {
@@ -85,6 +89,14 @@ func (s *fakeStore) Release(ctx context.Context, uow domain.UnitOfWork, requestI
 		return s.releaseErr
 	}
 	s.released = append(s.released, requestID)
+	return nil
+}
+
+func (s *fakeStore) ReserveRateTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.RateReserveCommand) error {
+	if s.rateErr != nil {
+		return s.rateErr
+	}
+	s.rateCmds = append(s.rateCmds, cmd)
 	return nil
 }
 

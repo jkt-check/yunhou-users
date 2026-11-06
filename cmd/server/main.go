@@ -417,7 +417,6 @@ func main() {
 	// backs /user/api-keys with ownership bound to the JWT identity.
 	accessResolver := inferenceaccess.NewResolver(infStore, nil)
 	keySvc := inferenceaccess.NewKeyService(infStore, nil)
-	rpmCounter := inferenceaccess.NewRPMCounter(nil)
 
 	// Task 8: the inference gateway — adapters, routing (account pool +
 	// concurrency leases), quota admission, and the orchestration service
@@ -426,6 +425,11 @@ func main() {
 	adapters := inferenceproviders.RegisteredAdapters()
 	routingSvc := inferencerouting.NewService(infStore, adapters, nil)
 	quotaSvc := inferencequota.NewService(infStore, nil)
+	// Task 4: the global per-billing-account RPM limit is enforced in the
+	// business admission together with the selected policy's RPM limit and
+	// the customer Key's RPM limit (PostgreSQL-backed, shared by all
+	// instances). 0 keeps the documented "disabled" behaviour.
+	quotaSvc.AccountRPM = cfg.InferenceAccountRPM
 	entitlementResolver := inferenceaccess.NewEntitlementResolver(infStore, nil)
 	gatewayHTTPClient := inferenceproviders.NewHTTPClient(egressValidator)
 	gatewaySvc := inferencegateway.NewService(
@@ -458,8 +462,7 @@ func main() {
 
 	accessOps := &inferencehttpapi.AccessOps{
 		UserAPIKeys:       inferencehttpapi.NewUserAPIKeysHandler(keySvc),
-		V1Auth:            inferencehttpapi.APIKeyAuth(accessResolver, rpmCounter, cfg.InferenceAccountRPM),
-		RPMCounter:        rpmCounter,
+		V1Auth:            inferencehttpapi.APIKeyAuth(accessResolver),
 		V1Models:          inferencehttpapi.NewModelsHandler(catalogSvc, accessResolver),
 		V1ChatCompletions: inferencehttpapi.NewChatCompletionsHandler(gatewaySvc),
 		// Task 13: Anthropic Messages / OpenAI Responses 编程工具面（与 chat
@@ -617,6 +620,13 @@ func main() {
 		ReconciliationDeadline: cfg.InferenceReconciliationDeadline,
 	}, nil)
 	go recoveryWorker.Start(rootCtx)
+
+	// Task 4: rate reservation reaper — removes the TERMINAL rate
+	// reservations that fell out of the retention period (default 24h). An
+	// unsettled reservation is never purged (it still occupies the TPM
+	// budget — a long stream keeps its hold beyond the 60s window).
+	rateReaper := inferenceworkers.NewRateReservationReaper(infStore, nil, inferenceworkers.RateReaperConfig{})
+	go rateReaper.Start(rootCtx)
 
 	// Task 10: entitlement sync worker — consumes the inference_outbox
 	// messages the payment pipeline enqueues in the SAME transaction as the

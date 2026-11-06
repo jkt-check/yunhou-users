@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 
+	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/domain"
 )
 
@@ -115,6 +116,14 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 
 	// 3. Usage fact (UNIQUE(attempt_id, revision)).
 	if err := insertUsageRecord(ctx, tx, &cmd.Usage); err != nil {
+		return err
+	}
+
+	// 3b. Rate reservation (Task 4): the TPM hold becomes the ACTUAL
+	// normalized token consumption (an over-hold is counted in full — never
+	// clamped to the hold). The RPM count is untouched: the request was
+	// admitted and counts once.
+	if err := s.settleRateTx(ctx, tx, cmd.RequestID, access.NormalizedTokens(cmd.Usage.Buckets)); err != nil {
 		return err
 	}
 
@@ -319,6 +328,12 @@ func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 
 	// 2. Usage fact (UNIQUE(attempt_id, revision)).
 	if err := insertUsageRecord(ctx, tx, &cmd.Usage); err != nil {
+		return err
+	}
+
+	// 2b. Rate reservation (Task 4): the TPM hold becomes the ACTUAL
+	// normalized token consumption (same口径 as the plan path).
+	if err := s.settleRateTx(ctx, tx, cmd.RequestID, access.NormalizedTokens(cmd.Usage.Buckets)); err != nil {
 		return err
 	}
 

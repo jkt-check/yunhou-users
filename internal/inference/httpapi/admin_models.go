@@ -360,6 +360,9 @@ func fail(c *gin.Context, err error) {
 		status = http.StatusConflict
 	case domain.CodeRateLimited, domain.CodeQuotaExceeded, domain.CodeInsufficientBalance:
 		status = http.StatusTooManyRequests
+	case domain.CodeServiceUnavailable:
+		// 存储不可用：明确的服务错误（绝不伪装成额度耗尽）。
+		status = http.StatusServiceUnavailable
 	}
 	if status == http.StatusInternalServerError {
 		c.JSON(status, gin.H{"code": status, "data": nil, "message": "internal error"})

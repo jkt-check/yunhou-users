@@ -153,6 +153,8 @@ func wipeInferenceTables(t *testing.T, db *sqlx.DB) {
 		"inference_ledger_entries", "inference_adjustments",
 		"inference_concurrency_leases", "inference_reservations",
 		"inference_usage_records",
+		// Task 4: 速率预占行引用 requests（FK）—— 必须先删。
+		"inference_rate_reservations",
 		"inference_attempts", "inference_requests",
 		"inference_quota_windows",
 		"inference_entitlements", "inference_policy_versions",

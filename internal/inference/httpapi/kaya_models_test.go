@@ -25,7 +25,7 @@ import (
 // 模型不出现）。
 
 func TestKayaModels_ListBranches(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	store := f.store
 	ctx := context.Background()
 
@@ -152,7 +152,7 @@ func TestKayaModels_ListBranches(t *testing.T) {
 // ResolveUserSession：无计费账户的用户在冷启动时也必须拿 503（验收 §7.2），
 // 而不是「无账户 → 403」——「服务未就绪」与「用户无权限」严格分层。
 func TestKayaModels_ColdStartIs503BeforeUserResolution(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	catalogSvc := catalog.NewService(f.store)
 	// 真实 cache 直连真实 store：本用例不发布任何 revision = 真实冷启动形态。
 	cache := catalog.NewSnapshotCache(f.store, func(error) {})
@@ -197,7 +197,7 @@ func (s failingSnapshotSource) Current(context.Context) (*catalog.Snapshot, erro
 
 // 非哨兵快照错误不得伪装成 503 冷启动：走包内 fail() 口径 → 500。
 func TestKayaModels_NonSentinelSnapshotErrorIs500(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	catalogSvc := catalog.NewService(f.store)
 	resolver := access.NewResolver(f.store, nil)
 	boom := errors.New("snapshot store gone")
@@ -224,7 +224,7 @@ func TestKayaModels_NonSentinelSnapshotErrorIs500(t *testing.T) {
 // 空值归一（缺省放行 ["text","image"]）由包内测试钉住（见
 // kaya_models_internal_test.go）。
 func TestKayaModels_ListInputModalities(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	store := f.store
 	ctx := context.Background()
 
@@ -322,7 +322,7 @@ func TestKayaModels_ListInputModalities(t *testing.T) {
 // 发布前不影响当前快照（发布快照是权威事实源）。模型列表的可用性必须与
 // 实际调度一致——列表里有的模型必须真的有可用部署。
 func TestKayaModels_DisabledProviderHidesModel(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	store := f.store
 	ctx := context.Background()
 

@@ -215,6 +215,12 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 			return err
 		}
 	}
+	// Rate reservation (Task 4): the TPM hold of a confirmed-zero-consumption
+	// request is released. The RPM count is NOT touched — an admitted
+	// request counts once even when the upstream refused it.
+	if err := s.releaseRateTx(ctx, tx, requestID); err != nil {
+		return err
+	}
 	if fromReconciliation {
 		// Evidence-driven release resolves the open job atomically.
 		if _, err := tx.ExecContext(ctx,

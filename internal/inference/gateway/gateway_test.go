@@ -460,6 +460,10 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 	adapters := map[domain.Protocol]providers.Adapter{
 		domain.ProtocolOpenAIChat:       providers.NewOpenAIChat(),
 		domain.ProtocolAnthropicMessage: providers.NewAnthropicMessages(),
+		// T8: the Responses protocol adapter is registered so the capability
+		// routing tests can publish a Responses deployment next to a Chat one
+		// and prove the incompatible candidate is skipped.
+		domain.ProtocolOpenAIResponses: providers.NewOpenAIResponses(),
 	}
 	f.routing = routing.NewService(store, adapters, nil)
 	quotaSvc := quota.NewService(store, nil)

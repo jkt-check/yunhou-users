@@ -551,6 +551,17 @@ type AdapterCapabilities struct {
 	StreamingUsage bool
 	Tools          bool
 	Reasoning      bool
+	// Images means the upstream protocol can carry image input parts
+	// (T8: 能力路由的第二层 —— 声明层/路由层/adapter 层必须一致).
+	// A protocol without image support must be skipped for an image-bearing
+	// request instead of being asked to carry an image it cannot express.
+	Images bool
+	// ReasoningEfforts lists the reasoning-effort levels the protocol can
+	// EXPRESS (T8: 推理档位必须显式建模，不能只折成开/关).
+	// An empty list means the protocol has no effort knob at all: a
+	// requested level cannot be relayed and the candidate is skipped —
+	// never silently folded into another level.
+	ReasoningEfforts []string
 }
 
 // ProviderAdapter normalizes one upstream protocol. It is deliberately

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -423,5 +424,198 @@ func TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient(t 
 	// 不换号：停用的 provider 与另一个 provider 都不得出站。
 	if up1.calls.Load() != 0 || up2.calls.Load() != 0 {
 		t.Errorf("upstream calls = %d/%d, want 0/0", up1.calls.Load(), up2.calls.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 能力路由（图片）：带图请求只选兼容候选；无兼容候选时在准入前拒绝
+//
+// 三层能力契约（模型声明 → 路由能力 → adapter 能力）必须一致：不支持图片的
+// 上游协议**不参与**带图请求的候选选择；文本请求的候选集合不受影响。
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// imageRequest builds an internal request carrying one image part (the shape
+// the Kaya /chat facade hands over for a vision turn).
+func imageRequest(modelID string) *providers.ChatRequest {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[` +
+		`{"type":"text","text":"what is this?"},` +
+		`{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		panic(err)
+	}
+	return &providers.ChatRequest{
+		Model:    modelID,
+		Stream:   false,
+		Messages: []model.ChatMessage{{Role: "system", Content: "be brief"}, m},
+	}
+}
+
+// responsesUpstream answers the OpenAI Responses wire protocol (the upstream
+// side of a /responses deployment).
+func responsesUpstream(w http.ResponseWriter, r *http.Request, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed","model":"up",` +
+		`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],` +
+		`"usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}}`))
+}
+
+// addProtocolDeployment registers a SECOND deployment for the fixture's model
+// on the given upstream protocol and puts its route FIRST in the published
+// failover order (priority 0 vs the fixture route's priority 1). It returns
+// the new deployment id.
+func addProtocolDeployment(t *testing.T, f *fixture, up *upstream, proto domain.Protocol) string {
+	t.Helper()
+	ctx := context.Background()
+	prov := &domain.Provider{Code: "p-" + string(proto), DisplayName: "P " + string(proto),
+		AccessType: domain.AccessOfficialAPI, Status: "active"}
+	if err := f.store.InsertProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := credentials.NewVault(map[int][]byte{1: []byte("0123456789abcdef0123456789abcdef")}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credSvc := credentials.NewService(vault, f.store, f.store)
+	cv, err := credSvc.Create(ctx, credentials.Operator{UserID: uuid.NewString(), AppID: "test"},
+		prov.ID, "main", "api_key", "sk-second", "seed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct := &domain.UpstreamAccount{ProviderID: prov.ID, CredentialID: cv.ID,
+		Status: domain.AccountActive, ConcurrencyLimit: 4}
+	if err := f.store.InsertUpstreamAccount(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	dep := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "second-upstream", BaseURL: up.URL,
+		Protocol:       proto,
+		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second,
+		Status: domain.DeploymentActive,
+	}
+	if err := f.store.InsertDeployment(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+	route := &domain.ModelRoute{ModelID: f.modelID, DeploymentID: dep.ID,
+		Priority: 0, Weight: 1, Enabled: true, PoolStrategy: domain.PoolRoundRobin}
+	if err := f.store.InsertRoute(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+	f.snap.Providers[prov.ID] = *prov
+	f.snap.Deployments[dep.ID] = *dep
+	// The fixture's own route moves to priority 1 so the published order
+	// (priority/weight) matches the slice order the snapshot carries.
+	own := f.snap.RoutesByModel[f.modelID]
+	for i := range own {
+		own[i].Priority = 1
+	}
+	f.snap.RoutesByModel[f.modelID] = append([]domain.ModelRoute{*route}, own...)
+	return dep.ID
+}
+
+// countRows counts one table (test-only helper for the zero-admission
+// assertions).
+func countRows(t *testing.T, f *fixture, table string) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 能力路由（图片）
+// ---------------------------------------------------------------------------
+
+// TestGateway_ImageRequestSkipsIncompatibleDeployment：带图请求只选兼容
+// 候选。第一候选是**不支持图片**的上游协议（openai_responses），第二候选
+// 是兼容的 openai_chat —— 请求必须由兼容候选服务，不兼容候选零出站。
+func TestGateway_ImageRequestSkipsIncompatibleDeployment(t *testing.T) {
+	responsesUp := newUpstream(t, responsesUpstream)
+	chatUp := newUpstream(t, completionHandler)
+	f := newFixture(t, chatUp, withModelInputModalities([]string{"text", "image"}))
+	// 快照里第一候选 = responses 协议（不支持图片）。
+	addProtocolDeployment(t, f, responsesUp, domain.ProtocolOpenAIResponses)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolKayaChat, imageRequest(f.modelID)); err != nil {
+		t.Fatalf("ChatCompletions (image): %v", err)
+	}
+	if responsesUp.calls.Load() != 0 {
+		t.Errorf("incompatible deployment received %d upstream calls, want 0",
+			responsesUp.calls.Load())
+	}
+	if chatUp.calls.Load() != 1 {
+		t.Errorf("compatible deployment received %d upstream calls, want 1",
+			chatUp.calls.Load())
+	}
+}
+
+// TestGateway_ImageRequestWithoutCompatibleCandidateRejectsBeforeAdmission：
+// 模型只有不支持图片的部署时，带图请求必须在**准入之前**被明确拒绝 ——
+// 零请求行、零尝试行、零租约、零出站（先占额度再失败就是漏洞）。
+func TestGateway_ImageRequestWithoutCompatibleCandidateRejectsBeforeAdmission(t *testing.T) {
+	responsesUp := newUpstream(t, responsesUpstream)
+	f := newFixture(t, responsesUp, withModelInputModalities([]string{"text", "image"}))
+	// 把 fixture 自带的部署换成 responses 协议（唯一候选，不兼容图片）。
+	// 调度读的是**已发布快照**里的部署（routing.Candidates 不查库），所以
+	// 快照这一份就是事实源；DB 行只是 attempt 的 FK 目标，无需改动。
+	d := f.snap.Deployments[f.deploymentID]
+	d.Protocol = domain.ProtocolOpenAIResponses
+	f.snap.Deployments[f.deploymentID] = d
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolKayaChat, imageRequest(f.modelID))
+	if err == nil {
+		t.Fatal("an image request with no compatible deployment must be rejected")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeInvalidInput {
+		t.Fatalf("code = %v, want invalid_input（明确拒绝，不是上游故障）: %v", code, err)
+	}
+	if n := countRows(t, f, "inference_requests"); n != 0 {
+		t.Errorf("requests = %d, want 0 (rejection must precede admission)", n)
+	}
+	if n := countRows(t, f, "inference_attempts"); n != 0 {
+		t.Errorf("attempts = %d, want 0 (rejection must precede dispatch)", n)
+	}
+	if n := countRows(t, f, "inference_concurrency_leases"); n != 0 {
+		t.Errorf("leases = %d, want 0 (rejection must leave no lease)", n)
+	}
+	if n := countRows(t, f, "inference_reservations"); n != 0 {
+		t.Errorf("reservations = %d, want 0 (rejection must leave no hold)", n)
+	}
+	if responsesUp.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d, want 0 (rejection must precede dispatch)",
+			responsesUp.calls.Load())
+	}
+}
+
+// TestGateway_TextRequestKeepsOriginalCandidates：纯文本请求的候选集合不得
+// 被能力路由收窄 —— 第一候选（openai_responses）仍然出站。
+func TestGateway_TextRequestKeepsOriginalCandidates(t *testing.T) {
+	responsesUp := newUpstream(t, responsesUpstream)
+	chatUp := newUpstream(t, completionHandler)
+	f := newFixture(t, chatUp)
+	addProtocolDeployment(t, f, responsesUp, domain.ProtocolOpenAIResponses)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolKayaChat, chatReq(false, "hi")); err != nil {
+		t.Fatalf("ChatCompletions (text): %v", err)
+	}
+	if responsesUp.calls.Load() != 1 {
+		t.Errorf("first candidate received %d upstream calls, want 1 (text keeps the original candidates)",
+			responsesUp.calls.Load())
+	}
+	if chatUp.calls.Load() != 0 {
+		t.Errorf("second candidate received %d upstream calls, want 0 (no failover needed)",
+			chatUp.calls.Load())
 	}
 }

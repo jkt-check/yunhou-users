@@ -630,3 +630,89 @@ func TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits(t *testing.T) 
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T8 — 能力路由（图片 / 推理档位）
+//
+// 路由层是能力契约的第二层：它必须与 adapter 的能力声明一致 ——
+// 不兼容的部署**根本不参与选择**，而不是等出站前才失败。
+// ---------------------------------------------------------------------------
+
+// TestCandidates_ImageNeedSkipsIncompatibleProtocol：带图请求只选兼容的
+// 上游协议；第一候选（openai_responses，本期不支持图片）被跳过。
+func TestCandidates_ImageNeedSkipsIncompatibleProtocol(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat:      providers.NewOpenAIChat(),
+		domain.ProtocolOpenAIResponses: providers.NewOpenAIResponses(),
+	}, nil)
+	routes := []domain.ModelRoute{
+		{ID: "r-responses", ModelID: "m", DeploymentID: "dep-responses", Enabled: true, Weight: 1},
+		{ID: "r-chat", ModelID: "m", DeploymentID: "dep-chat", Enabled: true, Weight: 1},
+	}
+	snap := testSnapshot("m", routes,
+		deployment("dep-responses", "prov-a", domain.ProtocolOpenAIResponses),
+		deployment("dep-chat", "prov-a", domain.ProtocolOpenAIChat),
+	)
+	// 纯文本：两个候选都在（能力路由不得收窄文本调度面）。
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2 || cands[0].Deployment.ID != "dep-responses" {
+		t.Fatalf("text candidates = %+v, want both (responses first)", cands)
+	}
+	// 带图：只剩 chat 候选。
+	cands, err = svc.Candidates(context.Background(), snap, "m", Needs{Images: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].Deployment.ID != "dep-chat" {
+		t.Fatalf("image candidates = %+v, want dep-chat only", cands)
+	}
+	// CompatibleDeployments 是同一个判定（准入前的能力闸门用它）。
+	compat := svc.CompatibleDeployments(snap, "m", Needs{Images: true})
+	if len(compat) != 1 || compat[0].Deployment.ID != "dep-chat" {
+		t.Fatalf("compatible deployments = %+v, want dep-chat only", compat)
+	}
+}
+
+// TestCandidates_ReasoningEffortNeedSkipsProtocolWithoutKnob：显式推理档位
+// 只选**能表达该档位**的上游协议；anthropic_messages 没有 effort 旋钮，
+// 因此被跳过（绝不折成别的档位）。
+func TestCandidates_ReasoningEffortNeedSkipsProtocolWithoutKnob(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat:      providers.NewOpenAIChat(),
+		domain.ProtocolAnthropicMessage: providers.NewAnthropicMessages(),
+	}, nil)
+	routes := []domain.ModelRoute{
+		{ID: "r-anthropic", ModelID: "m", DeploymentID: "dep-anthropic", Enabled: true, Weight: 1},
+		{ID: "r-chat", ModelID: "m", DeploymentID: "dep-chat", Enabled: true, Weight: 1},
+	}
+	snap := testSnapshot("m", routes,
+		deployment("dep-anthropic", "prov-a", domain.ProtocolAnthropicMessage),
+		deployment("dep-chat", "prov-a", domain.ProtocolOpenAIChat),
+	)
+	// 只要推理（不指定档位）：两个协议都能承载。
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{Reasoning: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("reasoning candidates = %d, want 2", len(cands))
+	}
+	// 指定档位：anthropic 无 effort 旋钮 → 跳过。
+	for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+		cands, err = svc.Candidates(context.Background(), snap, "m",
+			Needs{Reasoning: true, ReasoningEffort: effort})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cands) != 1 || cands[0].Deployment.ID != "dep-chat" {
+			t.Fatalf("effort %q candidates = %+v, want dep-chat only", effort, cands)
+		}
+	}
+}

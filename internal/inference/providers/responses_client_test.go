@@ -13,6 +13,10 @@ import (
 
 // Codex 风格多轮:instructions + message + function_call + function_call_output
 // + reasoning(丢弃)。call_id ↔ tool_call_id 逐字保留。
+//
+// T8 兼容性修正:输入里的 reasoning 项不再被接受(无法忠实回放)——旧行为是
+// 「接受后丢弃」。本用例因此改用纯文本 + 工具的多轮(普通工具流必须照常
+// 可用),拒绝路径由 TestParseResponsesRequest_ReasoningItemRejected 钉住。
 func TestParseResponsesRequest_CodexShape(t *testing.T) {
 	body := `{
 	  "model": "gpt-5.2-codex",
@@ -21,7 +25,6 @@ func TestParseResponsesRequest_CodexShape(t *testing.T) {
 	  "stream": true,
 	  "input": [
 	    {"type":"message","role":"user","content":[{"type":"input_text","text":"add tests"}]},
-	    {"type":"reasoning","summary":[{"type":"summary_text","text":"plan"}]},
 	    {"type":"function_call","id":"fc_x","call_id":"call_abc","name":"shell","arguments":"{\"cmd\":\"go test\"}"},
 	    {"type":"function_call_output","call_id":"call_abc","output":"ok"},
 	    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"done?"}]},
@@ -46,6 +49,10 @@ func TestParseResponsesRequest_CodexShape(t *testing.T) {
 	if req.ThinkingEnabled == nil || !*req.ThinkingEnabled {
 		t.Error("reasoning effort=high must enable thinking")
 	}
+	// T8: 档位逐字保留 —— 不得一律折成 medium/开-关。
+	if req.ReasoningEffort != "high" {
+		t.Errorf("reasoning effort = %q, want high (the level must travel verbatim)", req.ReasoningEffort)
+	}
 	var roles []string
 	for _, m := range req.Messages {
 		roles = append(roles, m.Role)
@@ -62,8 +69,8 @@ func TestParseResponsesRequest_CodexShape(t *testing.T) {
 	if req.Messages[3].ToolCallID != "call_abc" || req.Messages[3].Content != "ok" {
 		t.Fatalf("tool output = %+v", req.Messages[3])
 	}
-	if len(in.InputItems) != 6 {
-		t.Fatalf("canonical items = %d, want 6 (verbatim for transcript)", len(in.InputItems))
+	if len(in.InputItems) != 5 {
+		t.Fatalf("canonical items = %d, want 5 (verbatim for transcript)", len(in.InputItems))
 	}
 	// tools flattened → OpenAI envelope
 	if !strings.Contains(string(req.Tools[0]), `"type":"function"`) || !strings.Contains(string(req.Tools[0]), `"name":"shell"`) {
@@ -71,6 +78,19 @@ func TestParseResponsesRequest_CodexShape(t *testing.T) {
 	}
 	if req.Passthrough["parallel_tool_calls"] != true {
 		t.Fatalf("passthrough = %+v", req.Passthrough)
+	}
+}
+
+// T8:reasoning 输入项无法忠实回放 → 明确 400(旧的「接受后丢弃」是兼容
+// 性修正)。
+func TestParseResponsesRequest_ReasoningItemRejected(t *testing.T) {
+	body := `{"model":"m","input":[
+	  {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+	  {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"plan"}]}
+	]}`
+	_, err := ParseResponsesRequest([]byte(body))
+	if err == nil || !strings.Contains(err.Error(), "reasoning") {
+		t.Fatalf("err = %v, want an explicit reasoning-item rejection", err)
 	}
 }
 

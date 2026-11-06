@@ -283,6 +283,9 @@ func chatErrorMapping(err error) (int, string) {
 		return http.StatusBadRequest, service.ErrChatRequestShape.Error()
 	case errors.Is(err, service.ErrChatModelNoVision):
 		return http.StatusBadRequest, service.ErrChatModelNoVision.Error()
+	case errors.Is(err, service.ErrChatCapabilityUnsupported):
+		// T8: 能力不兼容（无部署能承载图片/推理档位）—— 400，零出站。
+		return http.StatusBadRequest, service.ErrChatCapabilityUnsupported.Error()
 	default:
 		log.Printf("chat: internal error: %v", err)
 		return http.StatusInternalServerError, "internal error"

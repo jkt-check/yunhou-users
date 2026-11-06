@@ -104,6 +104,45 @@ func (m Model) AcceptsImages() bool {
 	return false
 }
 
+// ---------------------------------------------------------------------------
+// Reasoning effort (T8)
+// ---------------------------------------------------------------------------
+
+// ReasoningEffort is an explicit reasoning-effort level of one request.
+// The level travels with the request all the way to the adapter — it is
+// never folded into "thinking on/off" nor into another level.
+type ReasoningEffort string
+
+// The reasoning-effort vocabulary the gateway can carry end to end.
+const (
+	ReasoningEffortMinimal ReasoningEffort = "minimal"
+	ReasoningEffortLow    ReasoningEffort = "low"
+	ReasoningEffortMedium ReasoningEffort = "medium"
+	ReasoningEffortHigh   ReasoningEffort = "high"
+	ReasoningEffortXHigh  ReasoningEffort = "xhigh"
+)
+
+// SupportedReasoningEfforts is the ordered vocabulary of effort levels a
+// client may request. It is the ONE list the client surfaces validate
+// against and the adapters declare support for.
+func SupportedReasoningEfforts() []string {
+	return []string{
+		string(ReasoningEffortMinimal), string(ReasoningEffortLow),
+		string(ReasoningEffortMedium), string(ReasoningEffortHigh),
+		string(ReasoningEffortXHigh),
+	}
+}
+
+// ValidReasoningEffort reports whether s is inside the vocabulary.
+func ValidReasoningEffort(s string) bool {
+	for _, v := range SupportedReasoningEfforts() {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 // Provider is a vendor/upstream family; never bound to a single account.
 type Provider struct {
 	ID          string

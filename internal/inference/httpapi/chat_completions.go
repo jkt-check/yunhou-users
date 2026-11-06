@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -92,12 +93,16 @@ type chatCompletionsRequest struct {
 	StreamOptions       json.RawMessage   `json:"stream_options"`
 	ThinkingEnabled     *bool             `json:"thinking_enabled"`
 	Thinking            json.RawMessage   `json:"thinking"`
-	Temperature         *float64          `json:"temperature"`
-	TopP                *float64          `json:"top_p"`
-	Stop                json.RawMessage   `json:"stop"`
-	PresencePenalty     *float64          `json:"presence_penalty"`
-	FrequencyPenalty    *float64          `json:"frequency_penalty"`
-	Seed                *int64            `json:"seed"`
+	// ReasoningEffort is the explicit reasoning-effort level (OpenAI
+	// chat-completions knob). T8: the level travels verbatim to the
+	// upstream — it is never folded into another level.
+	ReasoningEffort  string          `json:"reasoning_effort"`
+	Temperature      *float64        `json:"temperature"`
+	TopP             *float64        `json:"top_p"`
+	Stop             json.RawMessage `json:"stop"`
+	PresencePenalty  *float64        `json:"presence_penalty"`
+	FrequencyPenalty *float64        `json:"frequency_penalty"`
+	Seed             *int64          `json:"seed"`
 
 	// Capability fields we do not serve; any non-null value rejects the
 	// request explicitly rather than silently degrading it.
@@ -200,6 +205,19 @@ func parseChatCompletions(body []byte) (*providers.ChatRequest, error) {
 		if len(trimmed) == 0 || trimmed[0] != '{' {
 			return nil, invalidField("tools", "invalid tool definition")
 		}
+		// T8: 服务端工具（web_search / computer / code_execution / mcp …）
+		// 没有执行面，也没有计量保护 —— 明确拒绝，绝不透传给上游让它
+		// 代跑。只有 function 工具是本入口支持集。
+		var tool struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(trimmed, &tool); err != nil {
+			return nil, invalidField("tools", "invalid tool definition")
+		}
+		if tool.Type != "" && tool.Type != "function" {
+			return nil, invalidField("tools",
+				"server-side tool type "+tool.Type+" is not supported by this gateway")
+		}
 		toolBytes += len(trimmed)
 	}
 	if toolBytes > 256<<10 {
@@ -238,6 +256,16 @@ func parseChatCompletions(body []byte) (*providers.ChatRequest, error) {
 		}
 		on := th.Type == "enabled"
 		req.ThinkingEnabled = &on
+	}
+	// T8: reasoning_effort 是显式档位 —— 逐字保留，不折成别的档位。
+	// 不在词汇表里的值明确拒绝（出站前），绝不静默忽略。
+	if wire.ReasoningEffort != "" {
+		if !domain.ValidReasoningEffort(wire.ReasoningEffort) {
+			return nil, invalidField("reasoning_effort",
+				"unsupported reasoning effort: "+wire.ReasoningEffort+
+					" (supported: "+strings.Join(domain.SupportedReasoningEfforts(), ", ")+")")
+		}
+		req.ReasoningEffort = wire.ReasoningEffort
 	}
 	// Sampling passthrough allowlist (adapters map or reject per protocol).
 	passthrough := map[string]any{}

@@ -3588,12 +3588,259 @@ only, no `git add .`, no push / merge / deploy) — see the task report §11.1.
 
 ### T8 — Capability routing and protocol truthfulness
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `0fc5afb` (T7 branch tip; T0 base
+`35cf836`). Task report:
+`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-8-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`;
+every database-backed command used `-p 1`; `go.mod` / `go.sum` were never
+modified (`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.32 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1 / run 2, `t8_app`) | **0** / **0** | `applied=53 skipped=0` → `applied=0 skipped=53` (idempotent) |
+| 4 | `go run ./cmd/migrate -status` | **0** | 53 × `✅` |
+| 5 | **RED** `go test -count=1 -run 'TestGateway_ImageRequest\|TestGateway_TextRequestKeepsOriginalCandidates' -v ./internal/inference/gateway` | **1** | the image leak reproduced — see §4.33 |
+| 6 | **RED** `go test -count=1 -run 'TestCapabilityMatrix\|TestV1ChatCompletions_ReasoningEffort\|TestV1ChatCompletions_UnsupportedReasoningEffort\|TestV1Responses_ReasoningEffort\|TestV1ChatCompletions_ServerSideTool\|TestV1Messages_ThinkingRequest\|TestV1Responses_ReasoningItem\|TestV1Messages_NoFakedThinkingSignature' -v ./internal/inference/httpapi` | **1** | the protocol-fidelity leaks reproduced — see §4.34 |
+| 7 | **GREEN** the same two commands after the fix | **0** | all T8 cases pass |
+| 8 | **acceptance (brief, verbatim)** `go test -race -count=1 -p 1 ./internal/inference/providers/... ./internal/inference/httpapi ./internal/inference/gateway` | **0** | 4 packages `ok` (`providers` 4.916s / `providers/connector` 1.313s / `httpapi` 121.509s / `gateway` 19.967s) |
+| 9 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, PASS/SKIP/FAIL inventory in §4.36 |
+| 10 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 52 PASS lines / 2 SKIP / 0 FAIL (the T8 fixture case was rewritten, not removed — §4.37) |
+| 11 | `E2E_DATABASE_URL=<disposable> go test -race -count=1 ./tests/e2e/...` | **0** | `ok github.com/yunhou/users/tests/e2e 215.218s` — see §4.36 |
+| 12 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 13 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T0 80.4%, T1 80.5%, T2 80.3%, T3 80.4%) |
+
+#### 4.33 RED evidence — capability routing (gateway layer)
+
+Command #5 ran against the **unmodified** production code at `0fc5afb`; the
+new tests were written against the *existing* API surface only (the gateway's
+`ChatCompletions`, the published snapshot, the real store), so every failure
+is a behavioural assertion failure, never a compile error.
+
+```
+=== RUN   TestGateway_ImageRequestSkipsIncompatibleDeployment
+    t8_capability_routing_test.go:141: ChatCompletions (image): inference/invalid_input: providers: image input is not supported by this adapter
+--- FAIL: TestGateway_ImageRequestSkipsIncompatibleDeployment (0.06s)
+=== RUN   TestGateway_ImageRequestWithoutCompatibleCandidateRejectsBeforeAdmission
+    t8_capability_routing_test.go:176: requests = 1, want 0 (rejection must precede admission)
+    t8_capability_routing_test.go:179: attempts = 1, want 0 (rejection must precede dispatch)
+    t8_capability_routing_test.go:182: leases = 1, want 0 (rejection must leave no lease)
+    t8_capability_routing_test.go:185: reservations = 4, want 0 (rejection must leave no hold)
+--- FAIL: TestGateway_ImageRequestWithoutCompatibleCandidateRejectsBeforeAdmission (0.06s)
+=== RUN   TestGateway_TextRequestKeepsOriginalCandidates
+--- PASS: TestGateway_TextRequestKeepsOriginalCandidates (0.06s)
+```
+
+**Root cause (one defect, two surfaces).** The image capability existed
+**only in the adapter's `BuildPayload`** (`openai_responses` refused an image
+with `CodeInvalidInput`) and in the *model* declaration
+(`input_modalities` / `AcceptsImages`). The **routing layer had no image
+dimension at all** (`routing.Needs` had only `Tools`/`Reasoning`), so:
+
+1. an image-bearing request selected the first candidate **by failover order**
+   — the incompatible `openai_responses` deployment — and only failed when
+   the adapter tried to build the payload (after admission, after the attempt
+   row and the upstream lease were committed);
+2. when *no* candidate could carry the image, the request was still **admitted**
+   (money + TPM holds, a request row, an attempt row, a lease — 4 reservation
+   rows in the RED run) before the shape error surfaced.
+
+The third case (`TestGateway_TextRequestKeepsOriginalCandidates`) **passed at
+the pre-fix baseline**: it is protection evidence that the text candidate set
+must stay exactly as it was.
+
+#### 4.34 RED evidence — protocol fidelity (HTTP entry layer)
+
+Command #6 ran against the same unmodified tree. The failures are the
+"accept-and-drop" / "silently ignore" behaviours the brief names:
+
+```
+--- FAIL: TestCapabilityMatrix_ClientEntryByUpstreamProtocol (4.30s)
+    --- FAIL: .../openai_chat/messages/thinking_replay (0.20s)
+    --- FAIL: .../openai_chat/responses/thinking_replay (0.12s)
+    --- FAIL: .../anthropic_messages/messages/thinking_replay (0.12s)
+    --- FAIL: .../anthropic_messages/responses/thinking_replay (0.13s)
+    --- FAIL: .../openai_responses/messages/thinking_replay (0.11s)
+    --- FAIL: .../openai_responses/responses/thinking_replay (0.11s)
+        t8_capability_matrix_test.go:386: code = 200, want 400（明确拒绝）: {"content":[{"text":"Hello","type":"text"}], ...}
+--- FAIL: TestV1ChatCompletions_ReasoningEffortIsPreservedUpstream (0.50s)
+    --- FAIL: .../low (0.14s)   upstream body does not carry the requested effort "low":
+          {"max_tokens":8192,"messages":[{"role":"user","content":"hi"}],"model":"matrix-upstream","stream":false}
+    --- FAIL: .../medium ... --- FAIL: .../high ... --- FAIL: .../xhigh ...
+--- FAIL: TestV1ChatCompletions_UnsupportedReasoningEffortIsRejected (0.07s)
+    code = 200, want 400: {"id":"chatcmpl-1", ... }          ← the effort was silently ignored
+--- FAIL: TestV1Responses_ReasoningEffortIsPreservedUpstream (0.41s)
+    upstream body does not carry the requested effort "low":
+    {"max_tokens":8192,"messages":[...],"stream":false,"thinking":{"type":"enabled"}}   ← folded to a boolean
+--- FAIL: TestV1ChatCompletions_ServerSideToolIsRejected (0.07s)
+    code = 200, want 400                                        ← a server-side tool was relayed upstream
+--- FAIL: TestV1Messages_ThinkingRequestIsRejected (0.07s)
+    code = 200, want 400                                        ← thinking was accepted
+--- FAIL: TestV1Responses_ReasoningItemIsRejected (0.19s)
+    code = 200, want 400                                        ← the reasoning item was accepted (and dropped)
+--- FAIL: TestV1Messages_NoFakedThinkingSignature (0.12s)
+    the gateway faked an empty thinking signature:
+    {"content":[{"signature":"","thinking":"step-1","type":"thinking"},{"text":"Hello","type":"text"}], ...}
+```
+
+The **other 30 matrix cells passed at the pre-fix baseline** (text / tools /
+images for every entry × upstream protocol) and the whole SSE matrix
+(`TestCapabilityMatrix_SSETermination`, 18 cases: complete end + truncated
+EOF for 3 entries × 3 upstream protocols) passed too — protection evidence
+for the behaviour T8 must **not** change.
+
+#### 4.35 GREEN evidence
+
+Commands #7 (the same two commands, production code fixed) — exit code **0**:
+
+```
+--- PASS: TestGateway_ImageRequestSkipsIncompatibleDeployment (0.06s)
+--- PASS: TestGateway_ImageRequestWithoutCompatibleCandidateRejectsBeforeAdmission (0.05s)
+--- PASS: TestGateway_TextRequestKeepsOriginalCandidates (0.06s)
+--- PASS: TestCapabilityMatrix_ClientEntryByUpstreamProtocol (4.5s)      (36 cells)
+--- PASS: TestCapabilityMatrix_SSETermination (2.3s)                      (18 cells)
+--- PASS: TestV1ChatCompletions_ReasoningEffortIsPreservedUpstream (0.5s)
+--- PASS: TestV1ChatCompletions_UnsupportedReasoningEffortIsRejected (0.07s)
+--- PASS: TestV1Responses_ReasoningEffortIsPreservedUpstream (0.4s)
+--- PASS: TestV1ChatCompletions_ServerSideToolIsRejected (0.07s)
+--- PASS: TestV1Messages_ThinkingRequestIsRejected (0.07s)
+--- PASS: TestV1Responses_ReasoningItemIsRejected (0.19s)
+--- PASS: TestV1Messages_NoFakedThinkingSignature (0.12s)
+```
+
+Acceptance command #8 (the brief's verbatim command) — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/providers	5.384s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	2.331s
+ok  	github.com/yunhou/users/internal/inference/httpapi	69.606s
+ok  	github.com/yunhou/users/internal/inference/gateway	14.489s
+```
+
+#### 4.36 Test inventory and skips
+
+| Suite | Result |
+|---|---|
+| `go test -race -count=1 -p 1 -v ./internal/inference/...` | 14 packages `ok`; **1052 top-level PASS + 314 subtest PASS, 1 SKIP, 0 FAIL**. The only SKIP is `TestQuotaWorkerProcess` (child-process entry point, needs `KAYA_QUOTA_WORKER=1`) |
+| `go test -race -count=1 -p 1 -v ./tests/integration/...` | 35 top-level PASS + 18 subtest PASS / **2 SKIP** (`TestLoadDrill_Throughput`, `TestLoadDrill_LongConnections` — both behind the explicit `KAYA_LOAD=1` gate) / 0 FAIL |
+| `go test -race -count=1 ./tests/e2e/...` | `ok github.com/yunhou/users/tests/e2e 215.218s` (exit **0**) |
+
+**Database-test skips: 0** — identical to the T0 inventory (§2.6); grepping
+the skip lines for `postgres` / `no database` / `database unavailable`
+returns nothing.
+
+**Harness note (not a code defect).** The first e2e attempt in this task
+failed with `pq: relation "inference_audit_log" does not exist` — the
+e2e-side disposable database had not been migrated. `tests/e2e` does **not**
+apply migrations itself (it reads `E2E_DATABASE_URL` and expects a migrated
+schema, exactly as §1.2/§2.3 prescribe). After migrating the e2e database in
+the harness, the same command exits **0**. The failure was a harness
+omission, not a T8 regression.
+
+#### 4.37 Migration
+
+**None.** T8 adds no migration: the fix lives entirely in the capability
+layers (domain / routing / gateway), the adapters and the protocol client
+surfaces. The disposable databases were migrated with `cmd/migrate` exactly
+as in §2.3 (53 files, idempotent on the second run).
+
+#### 4.38 Files changed
+
+| File | Change |
+|---|---|
+| `internal/inference/domain/model.go` | the reasoning-effort vocabulary (`ReasoningEffort`, `SupportedReasoningEfforts`, `ValidReasoningEffort`) |
+| `internal/inference/domain/usage.go` | `AdapterCapabilities.Images` + `AdapterCapabilities.ReasoningEfforts` |
+| `internal/inference/providers/adapter.go` | `ChatRequest.ReasoningEffort` (the explicit level travels with the request) |
+| `internal/inference/providers/openai_chat.go` | declares image + effort support; relays `reasoning_effort` verbatim |
+| `internal/inference/providers/openai_responses.go` | declares **no** image support; relays the requested effort instead of folding it to `medium` |
+| `internal/inference/providers/anthropic.go` | declares image support, **no** effort knob; refuses an effort level defensively |
+| `internal/inference/routing/service.go` | `Needs.Images` + `Needs.ReasoningEffort`; the single `CompatibleDeployments` capability filter (route + deployment + adapter) shared by the candidate builder and the pre-admission gate |
+| `internal/inference/gateway/service.go` | the capability needs; the pre-admission `rejectUnservableNeed` gate (+ the typed `ErrCapabilityUnsupported`); the image-token estimate comment (estimate, not a universal upper bound) |
+| `internal/inference/httpapi/chat_completions.go` | `reasoning_effort` parsing + validation; the server-side tool rejection |
+| `internal/inference/providers/responses_client.go` | the effort is preserved; a `reasoning` input item is now an explicit 400 |
+| `internal/inference/providers/messages_client.go` | `thinking.type=enabled` and signed/redacted thinking history are explicit 400; the surface no longer renders a thinking block (no faked signature) |
+| `internal/service/{errors.go,chat_facade.go}`, `internal/handler/chat.go` | the legacy /chat surface maps the capability rejection onto a 400-class sentinel (not "upstream rejected" 502) |
+| `internal/inference/gateway/sticky_candidates_test.go` | the T8 gateway cases (the capability-routing section appended) |
+| `internal/inference/httpapi/protocol_surfaces_test.go` | the executable capability matrix + the SSE termination matrix (appended) |
+| `internal/inference/providers/multimodal_guard_test.go` | the image/effort capability declarations vs the adapters' actual behaviour |
+| `internal/inference/providers/{messages_client,responses_client}_test.go` | the thinking/reasoning rejection cases; the old accept-and-drop fixtures were rewritten (compatibility correction) |
+| `internal/inference/routing/service_test.go` | the routing-level image/effort candidate cases |
+| `internal/inference/gateway/gateway_test.go` | fixture-only: the Responses adapter is registered so the capability tests can publish one |
+| `tests/integration/kaya_client_contract_test.go` | the thinking-history fixture case now expects the explicit 400; a new case proves the tool history without the thinking block still works |
+| `docs/api-integration-guide.md`, `docs/api/kaya-coding-plan.openapi.yaml`, `docs/api/kaya-coding-plan-website-handoff.md`, `docs/runbooks/kaya-coding-plan-rollout.md`, `docs/api/fixtures/client/client-request-anthropic-messages-thinking-history.json` | the capability matrices, the new field/error, and the compatibility corrections |
+
+#### 4.39 Notes (root cause, compatibility, honesty, unresolved boundaries)
+
+- **Root cause (three classes).** (1) The image capability existed only in the
+  adapter's payload builder and the model declaration — the **routing layer
+  had no image dimension**, so the incompatible candidate was *selected* and
+  the failure came after admission. (2) The reasoning effort was modelled as
+  a **boolean** (`ThinkingEnabled`): the client's level was dropped on the
+  floor and the adapter sent its own default (`medium`) — the "fold
+  everything to medium" behaviour. (3) The protocol surfaces treated
+  "cannot replay faithfully" as "accept and drop": a signed thinking block, a
+  redacted thinking block and a Responses reasoning item were silently
+  swallowed, and the gateway's own Messages output faked `signature: ""`.
+- **The capability contract is now three layers deep and single-sourced**:
+  model declaration (`input_modalities`) → route capabilities
+  (`capabilities`) → adapter capabilities (`AdapterCapabilities.Images` /
+  `.ReasoningEfforts`). The routing package owns the **one** filter
+  (`CompatibleDeployments`), and both the candidate builder and the
+  gateway's pre-admission gate call it — they cannot drift apart.
+- **The pre-admission gate is a capability statement, not a capacity
+  statement.** When the model has **no** compatible deployment at all, the
+  request keeps its previous semantics (`upstream_unavailable`, 503). Only
+  the case "the base demand has a candidate but the extra demand (image /
+  effort) has none" is the new explicit 400.
+- **Compatibility corrections (all documented in the integration guide and
+  the OpenAPI spec):**
+  1. `/v1/messages`: `thinking.type=enabled` → **400**; a signed/redacted
+     thinking block in the history → **400**; the surface no longer renders a
+     `thinking` block (the old `signature: ""` was a fake). Ordinary
+     text/tool flows are unchanged.
+  2. `/v1/responses`: a `reasoning` input item → **400** (it has no
+     replayable encrypted payload; `include=reasoning.encrypted_content` was
+     already rejected). The gateway's own `previous_response_id` chain is
+     unaffected: the stored transcript never contains reasoning items, so a
+     chained call still works.
+  3. `/v1/chat/completions`: a **server-side** tool type
+     (`web_search`/`computer`/`code_execution`/`mcp`…) → **400** (the matrix
+     already promised it; the code did not enforce it).
+  4. `reasoning.effort=minimal` is now the lowest **reasoning level**
+     (OpenAI semantics) instead of "reasoning off" — a documented
+     compatibility correction; only `none` turns reasoning off.
+  5. The legacy `/chat` surface answers the new capability rejection with a
+     400-class sentinel instead of the "upstream rejected" 502 (nothing was
+     sent; blaming the upstream and inviting a doomed retry would be wrong).
+- **The image token estimate is an estimate, not a universal upper bound.**
+  Admission reserves 1105 tokens per image (OpenAI's high-detail worst case,
+  85 + 170×6 tiles) and settlement uses the **upstream-reported** usage
+  (`source=reported`); the estimate is used only on the estimated path
+  (`source=estimated`, correctable by later evidence). **Unresolved
+  supplier boundary:** the visual-token metering convention is the
+  **supplier's** (tiling, scaling, whether cache/reasoning buckets are
+  included differ per vendor, so the same image can be metered several times
+  over). This gateway **cannot** verify a supplier's convention — it can only
+  relay the reported value faithfully, and the hold-vs-settled difference is
+  booked honestly by the settlement overage path.
+- **Preserved (T1–T7):** the OAuth refusal boundaries (T1), the accounting /
+  one-charge-per-request semantics (T2), the scheduling and provider-disable
+  rules (T3), the RPM/TPM admission (T4), the concurrency leases (T5), the
+  protocol-native error shapes (T6) and the connect-timeout / SSRF
+  behaviour (T7) are untouched — the same suites pass, and the T8 change
+  adds no transaction, no migration and no new dependency.
+- **Not built (deliberately):** no generic lossless native protocol
+  passthrough layer, and `/v1` is still a **text subset** — images, files,
+  audio and server-side tools are rejected natively on all three entries with
+  zero admission and zero dispatch.
 
 ### T9 — Probe, capability description and operational visibility
 

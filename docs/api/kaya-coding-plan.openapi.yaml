@@ -763,9 +763,12 @@ paths:
         `temperature`/`top_p`/`top_k`/`stop_sequences`、`metadata`
         （接受但不消费）。
         **明确 400**：`image`/`document` 块、服务端工具类型
-        （web_search/computer/bash/code_execution/mcp 等）、其余未知内容块。
-        **接受不回放**：历史 `thinking`/`redacted_thinking` 块、
-        `tool_result.is_error` 标志、`cache_control` 提示。
+        （web_search/computer/bash/code_execution/mcp 等）、其余未知内容块、
+        `thinking.type=enabled`、历史 `thinking`/`redacted_thinking` 块
+        （T8 兼容性修正：签名思考无法忠实回放 —— 旧行为是「接受后丢弃」；
+        本面也不产出思考块：Anthropic 的 thinking 块必须带原生 signature，
+        网关不伪造空 signature，也不建立通用无损原生透传层）。
+        **接受但不消费**：`tool_result.is_error` 标志、`cache_control` 提示。
 
         响应：`type=message` 原生形状（`usage.input_tokens` 不含
         cache_read，cache 桶单列）。流式事件序列 `message_start →
@@ -871,7 +874,7 @@ paths:
 
         **支持的请求子集**：`model`（必填）、`input`（字符串或 items：
         message（input_text/output_text）、function_call、
-        function_call_output；reasoning 项接受但不回放）、`instructions`、
+        function_call_output；reasoning 项 400）、`instructions`、
         `max_output_tokens`、`stream`、`store`（缺省 true）、
         `previous_response_id`、`tools`（仅 function 类型）、
         `tool_choice`（auto/none/required/指定 function）、
@@ -880,7 +883,11 @@ paths:
         **明确 400**：`input_image`/`input_file` part、服务端工具类型与
         其结果项（web_search_call 等）、`item_reference`、`background:true`、
         非空 `include`、`max_tool_calls`、`truncation:auto`（服务端静默
-        裁剪上下文违反不静默原则）、`text.format` ≠ text。
+        裁剪上下文违反不静默原则）、`text.format` ≠ text、`input` 里的
+        `reasoning` 项（T8 兼容性修正：推理项没有可回放的加密载荷 —— 旧
+        行为是「接受后丢弃」）。
+        `reasoning.effort` 的档位（low/medium/high/xhigh）**逐字**透传给
+        能表达该档位的上游协议；词表外的档位明确 400。
 
         **会话链**：成功响应（store≠false）持久化完整 transcript（24h
         TTL,≤512 KiB）;引用 `previous_response_id` = 上下文回放 + 粘性
@@ -988,11 +995,13 @@ paths:
         `stream`、`max_tokens`/`max_completion_tokens`、`tools`（仅
         function 定义，≤128 个/合计 ≤256 KiB）、`tool_choice`、
         `stream_options`、`thinking_enabled`/`thinking`
-        （{"type":"enabled"}）、`temperature`/`top_p`/
+        （{"type":"enabled"}）、`reasoning_effort`（显式推理档位，逐字
+        透传；词表外 400）、`temperature`/`top_p`/
         `presence_penalty`/`frequency_penalty`/`seed`/`stop`（采样透传）。
         **明确 400**：多模态 content 数组、`modalities`、`audio`、
         `prediction`、`n`≠1、`logprobs`/`top_logprobs`、
-        `response_format.type`≠text。
+        `response_format.type`≠text、服务端工具类型
+        （web_search/computer/code_execution/mcp …：无执行面、无计量保护）。
 
         响应：`object=chat.completion` 原生形状（非流式）；流式为
         `chat.completion.chunk` SSE 序列，以 `data: [DONE]` 终止；上游
@@ -1954,13 +1963,22 @@ components:
           maxItems: 128
           items:
             type: object
-            description: 仅 function 定义（{type:function, function:{name, description?, parameters?}}；合计 ≤256 KiB）
+            description: |
+              仅 function 定义（{type:function, function:{name, description?, parameters?}}；合计 ≤256 KiB）。
+              服务端工具类型（web_search/computer/code_execution/mcp …）无执行面、无计量保护 → 明确 400。
         tool_choice: { description: "auto|none|required|{type:function,function:{name}}" }
         stream_options: { type: object }
         thinking_enabled: { type: boolean, description: kaya 思考开关 }
         thinking:
           type: object
           description: "{type:enabled|disabled}（DeepSeek 风格，与 thinking_enabled 同义）"
+        reasoning_effort:
+          type: string
+          enum: [minimal, low, medium, high, xhigh]
+          description: |
+            显式推理档位（T8）。逐字透传给能表达该档位的上游协议；词表外的值
+            明确 400（不静默忽略）。档位不可表达且无任何兼容部署时，准入前 400
+            （零预占、零派发）。
         temperature: { type: number }
         top_p: { type: number }
         presence_penalty: { type: number }
@@ -1997,7 +2015,10 @@ components:
       type: object
       description: |
         Anthropic Messages 请求子集(2023-06-01)。不支持的字段一律 400:
-        image/document 块、服务端工具类型。历史 thinking 块接受但不回放。
+        image/document 块、服务端工具类型。T8 兼容性修正：历史
+        thinking/redacted_thinking 块 → 400（签名思考无法忠实回放，旧行为是
+        「接受后丢弃」）；thinking.type=enabled → 400（本面不产出思考块：
+        Anthropic 的 thinking 块必须带原生 signature，网关不伪造空签名）。
       properties:
         model: { type: string, maxLength: 128 }
         max_tokens: { type: integer, format: int64, minimum: 1 }
@@ -2009,7 +2030,7 @@ components:
             properties:
               role: { type: string, enum: [user, assistant] }
               content:
-                description: 字符串或内容块数组(text/tool_use/tool_result;thinking 接受不回放;image/document 拒绝)
+                description: 字符串或内容块数组(text/tool_use/tool_result;thinking/redacted_thinking 拒绝;image/document 拒绝)
         system:
           description: 字符串或 text 块数组(cache_control 提示接受但不保证生效)
         stream: { type: boolean, default: false }
@@ -2023,6 +2044,11 @@ components:
           description: "{type:auto|any|none|tool, name?, disable_parallel_tool_use?}"
         thinking:
           type: object
+          description: |
+            只有 {type:disabled} 被接受。{type:enabled} 明确 400：本面不产出
+            思考块（Anthropic 的 thinking 块必须带原生 signature，网关的内部
+            形状承载不了签名，也不建立通用无损原生透传层）。要推理请用
+            /v1/chat/completions 或 /v1/responses。
           properties:
             type: { type: string, enum: [enabled, disabled] }
             budget_tokens: { type: integer, format: int64, minimum: 1024, description: "必须 < max_tokens" }
@@ -2044,7 +2070,10 @@ components:
           type: array
           items:
             type: object
-            description: text / thinking(无签名) / tool_use 块
+            description: |
+              text / tool_use 块。**不含 thinking 块**（T8：Anthropic 的
+              thinking 块必须带原生 signature，网关不伪造空 signature，也不
+              建立通用无损原生透传层；本面因此不呈现上游的推理内容）。
         stop_reason: { type: string, nullable: true, enum: [end_turn, tool_use, max_tokens, null] }
         stop_sequence: { type: string, nullable: true }
         usage:
@@ -2061,10 +2090,12 @@ components:
         OpenAI Responses 请求子集。明确 400:多模态 part、服务端工具
         (含 web_search_call 等结果项与 item_reference)、background:true、
         非空 include、max_tool_calls、truncation:auto、text.format≠text。
+        T8 兼容性修正：input 里的 reasoning 项 → 400（推理项没有可回放的
+        加密载荷；旧行为是「接受后丢弃」）。
       properties:
         model: { type: string, maxLength: 128 }
         input:
-          description: 字符串或 items 数组(message/function_call/function_call_output;reasoning 接受不回放)
+          description: 字符串或 items 数组(message/function_call/function_call_output;reasoning 项拒绝)
         instructions: { type: string, description: "系统提示(→ system 消息)" }
         max_output_tokens: { type: integer, format: int64, minimum: 1 }
         stream: { type: boolean, default: false }
@@ -2087,6 +2118,10 @@ components:
         top_p: { type: number }
         reasoning:
           type: object
+          description: |
+            effort 的档位逐字透传给能表达该档位的上游协议（T8：low/medium/
+            high/xhigh 原样下传，不再一律折成 medium）。none/minimal → 关闭
+            推理。词表外的档位明确 400。
           properties:
             effort: { type: string, enum: [low, medium, high, xhigh, none, minimal] }
         metadata: { type: object, description: "客户端标记,不消费" }

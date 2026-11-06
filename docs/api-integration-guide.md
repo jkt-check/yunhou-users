@@ -589,18 +589,70 @@ Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改�
 |---|---|---|---|
 | 文本对话（多轮） | ✅ | ✅ | ✅ |
 | 工具调用（自定义 function/custom 工具，ID 逐字保留） | ✅ | ✅ | ✅（`function_call`/`function_call_output`） |
-| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled` | ✅ `thinking.type=enabled`（`budget_tokens` 校验 < `max_tokens` 且 ≥1024） | ✅ `reasoning.effort`（low/medium/high → 开；none/minimal → 关） |
+| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled` | ❌ 400 `thinking.type=enabled`（本面不产出思考块，见下） | ✅ `reasoning.effort` |
+| 推理档位（`reasoning_effort` / `reasoning.effort`） | ✅ `minimal`/`low`/`medium`/`high`/`xhigh`（逐字透传上游；词表外值 400） | n/a（Anthropic 协议无 effort 旋钮） | ✅ `minimal`/`low`/`medium`/`high`/`xhigh`（逐字透传上游；`none` → 关） |
 | 流式 SSE | ✅（`[DONE]` 终止） | ✅（`message_stop` 终止） | ✅（`response.completed`/`response.incomplete` 终止） |
 | 采样参数 | `temperature`/`top_p`/`stop`/`presence_penalty`/`frequency_penalty`/`seed` | `temperature`/`top_p`/`top_k`/`stop_sequences` | `temperature`/`top_p`/`parallel_tool_calls` |
 | `tool_choice` | ✅ OpenAI 全形状 | ✅ `auto`/`any`/`none`/`tool`（`disable_parallel_tool_use` 映射 `parallel_tool_calls=false`） | ✅ `auto`/`none`/`required`/指定 function |
 | 多模态（图片/文件/音频输入或输出） | ❌ 400 | ❌ 400（`image`/`document` 块） | ❌ 400（`input_image`/`input_file` part） |
 | 服务端工具（web_search/computer/bash/code_execution/mcp 等） | ❌ 400（无执行面） | ❌ 400 | ❌ 400（含 `web_search_call` 等结果项与 `item_reference`） |
+| 思考历史回放（`thinking`/`redacted_thinking`/`reasoning` 项） | n/a（`reasoning_content` 逐字透传） | ❌ 400（签名思考无法忠实回放） | ❌ 400（推理项无加密载荷可回放） |
 | `n>1` / logprobs / prediction / 结构化输出（`response_format`、`text.format=json_*`） | ❌ 400 | n/a | ❌ 400 |
 | `background:true` / 非空 `include` / `max_tool_calls` / `truncation:auto` | n/a | n/a | ❌ 400（无异步面/附加数据面；服务端静默裁剪上下文违反不静默原则） |
 
 **多模态现状**：`/v1/*` 对外协议面本期仍显式拒绝多模态 parts（例如 `/v1/chat/completions` 收到 content 数组返回 400 `content arrays (multimodal parts) are not supported; send plain string content`），放开是后续工作。图片输入目前仅在内置 `POST /chat` 面支持（规则与限额见「Chat 接口」章节）。
 
-**接受但不保证生效的字段（已在文档明示，非静默丢弃）**：`metadata`（客户端标记，不消费）、`cache_control`（成本提示，上游不保证生效）、Messages 历史中的 `thinking`/`redacted_thinking` 块（chat 形状上游无回放语义，接受并丢弃；文本与工具调用连续性不受影响）、`tool_result.is_error` 标志（无对应上游字段，错误文本照常传递）、Responses 输入中的 `reasoning` 项（同上，不回放）。模型未声明支持工具/推理时携带对应字段 → 400（先于任何计费）。
+**推理档位与思考回放（T8 能力路由与协议真实性）**
+
+- **档位逐字保留**：客户端声明的 `reasoning_effort`（chat 面）/ `reasoning.effort`（responses 面）按 `minimal`/`low`/`medium`/`high`/`xhigh` **原样**下传上游，绝不一律折成 `medium`；词表外的值在出站前 400（不静默忽略）。未声明档位时才用协议默认（OpenAI Responses 的 `medium`）。`minimal` 是最低**推理档**（OpenAI 语义），不是「关闭推理」—— 只有 `none` 才关闭；这是对旧映射（`minimal` → 关）的兼容性修正。
+- **档位受上游协议能力约束**：路由层按「模型声明 → 路由能力 → adapter 能力」三层一致挑选候选。`anthropic_messages` 协议**没有** effort 旋钮（它的推理旋钮是 `budget_tokens`，另一根轴），因此带档位的请求不会落到 Anthropic 协议的上游；若**没有任何**已发布部署能承载该档位，请求在**准入之前**被明确 400（零预占、零派发）。
+- **思考回放明确 4xx**：Responses 输入里的 `reasoning` 项、Anthropic 历史里的 `thinking`/`redacted_thinking` 块都无法忠实回放（本网关不实现 OpenAI 的加密推理存储，也不承载 Anthropic 的原生签名），因此**明确 400**（原生错误形状、零准入、零派发）。这是对旧「接受后丢弃」行为的**兼容性修正** —— 旧行为会让客户端以为自己的回传内容被送达了。
+- **Messages 面不产出思考块**：Anthropic 的 `thinking` 块必须带上游签发的 `signature`；网关的内部形状承载不了签名，旧实现伪造 `signature: ""` 冒充「可回放的原生签名思考」。现在本面**不渲染**思考块，显式开启 thinking 的请求 400，普通文本/工具流照常可用。要推理请用 `/v1/chat/completions`（`reasoning_content`）或 `/v1/responses`（`reasoning` 摘要）。
+
+**能力路由（模型声明 → 路由能力 → adapter 能力三层一致）**
+
+| 层 | 载体 | 语义 |
+|---|---|---|
+| 模型声明 | `inference_models.input_modalities` | 缺省放行（`["text","image"]`）；显式声明不含 `image` 的模型拒绝带图请求（400，先于准入） |
+| 路由能力 | `inference_model_routes.capabilities` | 空 = 全部能力；非空是**限制性**清单，缺 `image` 的路由不承载带图请求 |
+| adapter 能力 | `domain.AdapterCapabilities.Images` / `.ReasoningEfforts` | 上游协议能不能表达：不能表达的部署**不参与候选**（不是等出站前才失败） |
+
+因此内置 `POST /chat` 的带图请求只会落到兼容图片的上游协议（`openai_chat` / `anthropic_messages`）；第一候选是不支持图片的 `openai_responses` 时它被**跳过**；而当**没有任何**兼容候选时，请求在准入前被明确 400（零预占、零派发）。纯文本请求的候选集合**不受影响**。
+
+**上游协议 × 能力（服务端侧：适配器能表达什么）**
+
+| 上游协议 | 文本 | 工具 | 图片 | 思考出站 / 思考回放入站 |
+|---|---|---|---|---|
+| `openai_chat` | ✅ | ✅（`function` 定义） | ✅（`image_url` part 逐字透传） | 出站 ✅（`reasoning_effort` 逐字 / `thinking` 开关）；回放 ✅（`reasoning_content` 逐字透传） |
+| `anthropic_messages` | ✅ | ✅（`custom` 工具） | ✅（`image` 块） | 出站 ✅（`thinking.budget_tokens`；**无档位旋钮**）；回放 ❌ 400（签名/脱敏思考块无法忠实回放） |
+| `openai_responses` | ✅ | ✅（扁平 `function`） | ❌（协议能表达 `input_image`，但本适配器未翻译图片 → 能力路由**跳过**该候选；模型无其它兼容部署时准入前 400） | 出站 ✅（`reasoning.effort` 逐字）；回放 ❌ 400（`reasoning` 项无加密载荷可回放） |
+
+**客户端入口 × 上游协议 × 能力（可执行的支持矩阵）**
+
+矩阵的每一格要么**支持**（200 + 上游真的收到请求），要么**明确拒绝**（协议原生 400 + 零准入 + 零派发）。可执行版本见 `internal/inference/httpapi/t8_capability_matrix_test.go`（`TestCapabilityMatrix_ClientEntryByUpstreamProtocol` 与 `TestCapabilityMatrix_SSETermination`）。
+
+| 客户端入口 | 上游协议 | 文本 | 工具 | 图片 | 思考回放 |
+|---|---|---|---|---|---|
+| `/v1/chat/completions` | `openai_chat` | ✅ | ✅ | ❌ 400（入口是文本子集） | ✅（`reasoning_content` 逐字透传） |
+| `/v1/chat/completions` | `anthropic_messages` | ✅ | ✅ | ❌ 400 | ✅（`reasoning_content` 逐字透传） |
+| `/v1/chat/completions` | `openai_responses` | ✅ | ✅ | ❌ 400 | ✅（`reasoning_content` 逐字透传） |
+| `/v1/messages` | `openai_chat` | ✅ | ✅ | ❌ 400（`image`/`document` 块） | ❌ 400（签名思考） |
+| `/v1/messages` | `anthropic_messages` | ✅ | ✅ | ❌ 400 | ❌ 400（签名思考） |
+| `/v1/messages` | `openai_responses` | ✅ | ✅ | ❌ 400 | ❌ 400（签名思考） |
+| `/v1/responses` | `openai_chat` | ✅ | ✅ | ❌ 400（`input_image`/`input_file` part） | ❌ 400（`reasoning` 项） |
+| `/v1/responses` | `anthropic_messages` | ✅ | ✅ | ❌ 400 | ❌ 400（`reasoning` 项） |
+| `/v1/responses` | `openai_responses` | ✅ | ✅ | ❌ 400 | ❌ 400（`reasoning` 项） |
+| `POST /chat`（Kaya） | `openai_chat` | ✅ | ✅ | ✅ | ✅（`reasoning_content`） |
+| `POST /chat`（Kaya） | `anthropic_messages` | ✅ | ✅ | ✅ | ✅（`reasoning_content`） |
+| `POST /chat`（Kaya） | `openai_responses` | ✅ | ✅ | ❌（该协议不支持图片 → 候选被跳过；模型无其它兼容部署时准入前 400） | ✅（`reasoning_content`） |
+
+矩阵的四个维度还有三条横向约定：
+
+- **SSE 完整结束**：客户端流以**本协议**的终止标记收尾（chat `data: [DONE]`；messages `message_stop`；responses `response.completed`/`response.incomplete`）。
+- **SSE 半截 EOF**：上游流在终止标记之前断开 → 客户端流注入**本协议的**原生错误事件（chat 内联 `{"error":…}`；messages/responses `event: error`），且**绝不**出现终止标记（残缺答案不得被渲染成完整答案）。
+- **多轮工具 + 会话链归属**：工具调用 ID 多轮逐字保留；`previous_response_id` 引用他人/过期/`store:false` 的响应一律 404（`previous_response_not_found`，不泄漏存在性），网关自建 transcript 回放**不含**推理项。
+
+**接受但不保证生效的字段（已在文档明示，非静默丢弃）**：`metadata`（客户端标记，不消费）、`cache_control`（成本提示，上游不保证生效）、`tool_result.is_error` 标志（无对应上游字段，错误文本照常传递）。模型未声明支持工具/推理时携带对应字段 → 400（先于任何计费）。
 
 **用法/用量映射**：Messages 面 `usage.input_tokens` 不含 cache_read（Anthropic 口径），`cache_read_input_tokens`/`cache_creation_input_tokens` 单列；Responses 面 `input_tokens` 含 cached（OpenAI 口径）+ `input_tokens_details.cached_tokens`。流式 `message_start.usage` 是协议占位（0/0），真实值在终止 `message_delta.usage`（含 `input_tokens`，当前 Anthropic SDK 的 `MessageDeltaUsage` 支持该字段）。非流式响应在上游确实未报 usage 时不伪造 usage 字段。
 
@@ -719,7 +771,10 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 - `image_url.url` 支持两种形态：`https?://` 公网 URL（**原样透传**给上游模型，本服务不抓取、不代理，URL 可达性由上游保证）或 `data:image/<type>;base64,...` 内联数据；
 - data URI 声明的类型限 `image/png` / `image/jpeg` / `image/jpg` / `image/gif` / `image/webp`，且解码后的 magic bytes 必须与声明类型一致（不一致 → 400，防止以图片名义夹带任意字节）；
 - 数量与大小按 **wire 字节**计（data URI 即 base64 字符数，URL 即字符数）：每请求 ≤4 张、单张 `image_url` ≤1 MiB、全部图片合计 ≤3 MiB；
-- 所选模型显式声明为纯文本（目录 `input_modalities` 不含 `"image"`，如 `["text"]`）时携带图片 → 400 `the selected model does not support image input`（先于任何上游调用，不产生计费）。未声明 `input_modalities` 的模型**缺省放行**图片（等效 `["text","image"]`）；其上游若无视觉能力会在上游报错（表现为 502），属预期暴露。客户端用 `GET /chat/models` 返回的 `input_modalities` 判定哪些模型允许发图。
+- 所选模型显式声明为纯文本（目录 `input_modalities` 不含 `"image"`，如 `["text"]`）时携带图片 → 400 `the selected model does not support image input`（先于任何上游调用，不产生计费）。未声明 `input_modalities` 的模型**缺省放行**图片（等效 `["text","image"]`）。客户端用 `GET /chat/models` 返回的 `input_modalities` 判定哪些模型允许发图。
+- **能力路由（T8）**：带图请求只会落到**能表达图片**的上游协议（`openai_chat` / `anthropic_messages`）；不支持图片的协议（`openai_responses`）即使排在故障转移顺序的第一位也会被**跳过**。若该模型的**全部**已发布部署都不兼容图片，请求在**准入之前**被明确 400（零额度预占、零速率计数、零派发、零上游字节），而不是先占额度再失败。
+- **图片 token 是估算，不是通用上界**：准入按每张图 1105 token（OpenAI high-detail 最坏情形 85 + 170×6 tiles）**预留**额度，结算以**上游真实上报**的 usage 为准（`source=reported`）；只有上游确实没报 usage 时才走估算路径（`source=estimated`，可被后续真实证据更正）。1105 **不是**对所有模型/供应商成立的数学硬上界 —— 视觉 token 的计费口径由供应商定义（分块、缩放、是否计入缓存/推理桶各不相同），同一张图在不同供应商的计量可相差数倍。本网关**无法**校验供应商的视觉口径，只能如实转述其上报值（未解决的供应商计量边界见验证 runbook 的 T8 记录）。
+- **审计与日志**：图片 base64 永远不进审计行、错误文案或日志（`ChatMessage.ContentParts` 带 `json:"-"`，审计只落拼接后的文本）；错误与日志不含用户完整对话。
 
 **限制**（超出返回 400）：请求体整体 ≤8 MiB；1–20 条消息；每条 `content` ≤4 MiB 字节（`len()` 字节数，CJK 每字约 3 字节；parts 数组按拼接后的文本计），其中 `system` 消息走独立上限 ≤32768 字节；全部消息总字节数 ≤4 MiB。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。图片限额见上文「图片输入」段。
 
@@ -859,7 +914,7 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 - **Key 池**：每个 provider 的 `api_keys` 组成轮询池；某 key 收到 429/5xx 后冷却 60s；池内 ≥2 个可用 key 时，单个 key 的临时失败会**透明换 key 重试一次**。全部 key 冷却中对客户端返回 429 `chat upstream rate limit exceeded`。
 - **计量**：每次请求结束后写入 `llm_usage_events` 表（user/app/模型/token 数/成本，迁移 022）；聚合查询走内部接口 `GET /admin/stats/llm-usage`（详见「管理接口」章节的正式文档），按模型分组返回 token 与成本合计。上游不返回 usage 的 provider 记为 0 token（行仍会写入）。
 - **按 Plan 限制可用模型**：`plans.chat_models` 列为白名单（NULL/空 = 放开全部目录模型）。示例：`UPDATE plans SET chat_models = '{deepseek-flash,kimi-k3}' WHERE id = 'monthly';`
-- **网关部署（`INFERENCE_KAYA_CHAT_GATEWAY=1`）的模态不在 env 里配**：缺省即放行图片；要关闭某模型的视觉，用 `PATCH /admin/models/:id` 的 `input_modalities` 字段（需 `models:manage` 权限）设为 `["text"]` 后 `POST /admin/catalog/publish` 发布目录版本生效；`/chat/models` 与 `/chat` 的视觉门控都读已发布快照，空值按缺省放行（`["text","image"]`）。**协议约束：`openai_responses` 协议的部署不接受图片**——带图请求会被适配层显式拒绝（`InvalidInput`，绝不静默丢弃图片），视觉模型只能部署在 `openai_chat` / `anthropic_messages` 协议的部署上。
+- **网关部署（`INFERENCE_KAYA_CHAT_GATEWAY=1`）的模态不在 env 里配**：缺省即放行图片；要关闭某模型的视觉，用 `PATCH /admin/models/:id` 的 `input_modalities` 字段（需 `models:manage` 权限）设为 `["text"]` 后 `POST /admin/catalog/publish` 发布目录版本生效；`/chat/models` 与 `/chat` 的视觉门控都读已发布快照，空值按缺省放行（`["text","image"]`）。**协议约束：`openai_responses` 协议的部署不接受图片**——该协议在能力路由层被**跳过**（带图请求不会落到它身上，绝不静默丢弃图片），视觉模型只能部署在 `openai_chat` / `anthropic_messages` 协议的部署上；若某模型的**全部**部署都是 `openai_responses`，带图请求在准入前被明确 400（零预占、零派发）。
 
 ---
 

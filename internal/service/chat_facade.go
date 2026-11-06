@@ -249,6 +249,13 @@ func mapGatewayError(err error) error {
 	if errors.As(err, &cfgErr) {
 		return ErrChatConfigUnavailable
 	}
+	// T8: 能力不兼容（图片 / 显式推理档位无部署可承载）—— 请求从未出站、
+	// 零预占、零计费，映射成 400 类的能力拒绝（不是「上游拒绝」的 502：
+	// 那会把责任推给上游并邀请一次注定失败的重试）。
+	var capErr *gateway.ErrCapabilityUnsupported
+	if errors.As(err, &capErr) {
+		return ErrChatCapabilityUnsupported
+	}
 	if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
 		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
 	}

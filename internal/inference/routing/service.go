@@ -64,6 +64,16 @@ type Candidate struct {
 type Needs struct {
 	Tools     bool
 	Reasoning bool
+	// Images means the request carries image parts. A deployment whose
+	// upstream protocol cannot carry images is NOT a candidate for it (T8:
+	// 声明层/路由层/adapter 层必须一致 —— 不兼容的部署根本不参与选择，
+	// 而不是等出站前才失败).
+	Images bool
+	// ReasoningEffort is the explicitly requested reasoning-effort level
+	// ("" = the client asked for reasoning without naming a level). A
+	// deployment whose protocol cannot EXPRESS that level is not a candidate
+	// (T8: 档位不可表达 → 出站前明确拒绝，绝不折成别的档位).
+	ReasoningEffort string
 	// Protocol is the client-facing protocol the request arrived on; the
 	// deployment's protocol only has to be servable by an adapter, the
 	// client-protocol gate is the model's Protocols list (checked by the
@@ -161,6 +171,40 @@ func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 func (s *Service) candidates(ctx context.Context, snap *catalog.Snapshot, modelID string, needs Needs, bypassCache bool) (out []Candidate, consulted map[string]struct{}, err error) {
 	now := s.clock.Now()
 	consulted = map[string]struct{}{}
+	for _, cd := range s.CompatibleDeployments(snap, modelID, needs) {
+		d := cd.Deployment
+		consulted[d.ProviderID] = struct{}{}
+		accounts, aerr := s.activeAccounts(ctx, d.ProviderID, bypassCache)
+		if aerr != nil {
+			return nil, nil, aerr
+		}
+		for _, a := range s.orderAccountsWithQuota(d.ProviderID, accounts, now) {
+			out = append(out, Candidate{Route: cd.Route, Deployment: d, Account: a})
+		}
+	}
+	return out, consulted, nil
+}
+
+// CompatibleDeployment is one (route, deployment) pair that passed every
+// STRUCTURAL capability filter (route enabled, pool strategy supported,
+// deployment + provider schedulable, protocol adapter registered, adapter
+// able to carry the call's needs).
+type CompatibleDeployment struct {
+	Route      domain.ModelRoute
+	Deployment domain.Deployment
+}
+
+// CompatibleDeployments returns the deployments that can structurally serve
+// the call's needs, in failover order. It is the ONE place the capability
+// filters live: the candidate builder and the gateway's pre-admission
+// capability gate both call it, so the two can never disagree.
+//
+// It performs NO account-pool lookup: the result is a capability statement,
+// not a capacity statement. The gateway uses it to reject an unservable
+// request BEFORE admission (zero hold, zero dispatch) — a request that no
+// published deployment can carry is a client error, not a capacity gap.
+func (s *Service) CompatibleDeployments(snap *catalog.Snapshot, modelID string, needs Needs) []CompatibleDeployment {
+	var out []CompatibleDeployment
 	for _, route := range snap.RoutesByModel[modelID] {
 		if !route.Enabled || !routeCovers(route, needs) {
 			continue
@@ -184,20 +228,44 @@ func (s *Service) candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 		if !ok {
 			continue
 		}
-		caps := adapter.Capabilities()
-		if (needs.Tools && !caps.Tools) || (needs.Reasoning && !caps.Reasoning) {
+		if !adapterServes(adapter.Capabilities(), needs) {
 			continue
 		}
-		consulted[d.ProviderID] = struct{}{}
-		accounts, aerr := s.activeAccounts(ctx, d.ProviderID, bypassCache)
-		if aerr != nil {
-			return nil, nil, aerr
-		}
-		for _, a := range s.orderAccountsWithQuota(d.ProviderID, accounts, now) {
-			out = append(out, Candidate{Route: route, Deployment: d, Account: a})
+		out = append(out, CompatibleDeployment{Route: route, Deployment: d})
+	}
+	return out
+}
+
+// adapterServes reports whether one adapter's declared capabilities cover
+// the call's needs. The adapter layer is the THIRD layer of the capability
+// contract (model declaration → route capabilities → adapter support): a
+// deployment whose protocol cannot carry the demand is not a candidate.
+func adapterServes(caps domain.AdapterCapabilities, needs Needs) bool {
+	if needs.Tools && !caps.Tools {
+		return false
+	}
+	if needs.Reasoning && !caps.Reasoning {
+		return false
+	}
+	if needs.Images && !caps.Images {
+		return false
+	}
+	if needs.ReasoningEffort != "" && !supportsEffort(caps, needs.ReasoningEffort) {
+		return false
+	}
+	return true
+}
+
+// supportsEffort reports whether the adapter's protocol can express the
+// requested effort level. An adapter that declares no effort knob cannot
+// express any level.
+func supportsEffort(caps domain.AdapterCapabilities, effort string) bool {
+	for _, e := range caps.ReasoningEfforts {
+		if e == effort {
+			return true
 		}
 	}
-	return out, consulted, nil
+	return false
 }
 
 // InvalidateAccounts 驱逐某 provider 的账号池缓存。供两类路径使用：
@@ -254,6 +322,9 @@ func routeCovers(r domain.ModelRoute, needs Needs) bool {
 		return false
 	}
 	if needs.Reasoning && !has["reasoning"] {
+		return false
+	}
+	if needs.Images && !has["image"] {
 		return false
 	}
 	return true

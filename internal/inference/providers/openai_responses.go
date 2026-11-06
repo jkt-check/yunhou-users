@@ -11,14 +11,18 @@
 //   - assistant 轮的 reasoning_content 不回放：忠实回放需要上游签发的
 //     reasoning item id / encrypted_content，内部 chat 形状不携带；伪造
 //     reasoning 项会被上游 400。丢弃回放与客户端面对称（responses_client.go
-//     「推理项接受但不回放」），推理模型多轮对话由上游重新推理；
+//     「推理项 400」），推理模型多轮对话由上游重新推理；
 //   - store:false 始终发送——网关自建会话链（httpapi/responses.go 的
 //     previous_response_id 由网关侧 transcript 回放实现），不要求上游
 //     存储，prompt 不落上游存储面；
-//   - thinking 开启 → reasoning {effort:medium, summary:auto}（要回推理
-//     文本必须显式请求 summary）；显式关闭 → {effort:none}；
+//   - thinking 开启 → reasoning {effort:<客户端声明的档位, summary:auto}
+//     （要回推理文本必须显式请求 summary）；客户端未声明档位时用 medium
+//     （OpenAI 自己的默认档）——**绝不**把客户端声明的档位折成 medium；
+//     显式关闭 → {effort:none}；
 //   - Responses 没有对应物的采样参数（stop/penalties/seed/top_k）显式
 //     400 —— 不静默丢字段。
+//   - 图片：本适配器**不**支持图片输入（T8：能力路由层据此跳过本协议的
+//     候选，带图请求由兼容协议的服务，否则出站前明确拒绝）。
 
 package providers
 
@@ -46,8 +50,19 @@ func (a *OpenAIResponses) Protocol() domain.Protocol { return domain.ProtocolOpe
 // Capabilities implements Adapter. The Responses terminal frames
 // (response.completed/incomplete) always carry the full response object
 // including usage, so streaming usage is available by construction.
+//
+// Images: the Responses protocol CAN express image parts
+// (input_image), but this adapter does not translate the internal image
+// shape into them yet — the protocol surface therefore declares no image
+// support and an image-bearing request is skipped by the capability
+// routing (never sent as a text-only input item).
+// ReasoningEfforts: the Responses protocol has the reasoning.effort knob,
+// so every level of the vocabulary can be expressed verbatim.
 func (a *OpenAIResponses) Capabilities() domain.AdapterCapabilities {
-	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true}
+	return domain.AdapterCapabilities{
+		StreamingUsage: true, Tools: true, Reasoning: true, Images: false,
+		ReasoningEfforts: domain.SupportedReasoningEfforts(),
+	}
 }
 
 // Inclusion implements Adapter: Responses input_tokens already contains
@@ -167,10 +182,18 @@ func (a *OpenAIResponses) BuildPayload(call *Call) ([]byte, error) {
 		if *r.ThinkingEnabled {
 			// summary:auto 是拿回推理文本的必要条件（无加密存储，摘要即所
 			// 得；responses_client.go 的 reasoning 项映射同一口径）。
-			payload["reasoning"] = map[string]any{"effort": responsesThinkingEffort, "summary": "auto"}
+			// T8: 客户端显式声明的档位逐字使用 —— 绝不一律折成 medium。
+			effort := responsesThinkingEffort
+			if r.ReasoningEffort != "" {
+				effort = r.ReasoningEffort
+			}
+			payload["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
 		} else {
 			payload["reasoning"] = map[string]any{"effort": "none"}
 		}
+	} else if r.ReasoningEffort != "" {
+		// 只有档位没有开关：档位本身即推理请求。
+		payload["reasoning"] = map[string]any{"effort": r.ReasoningEffort, "summary": "auto"}
 	}
 	for _, k := range responsesPassthroughKeys {
 		if v, ok := r.Passthrough[k]; ok {

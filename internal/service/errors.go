@@ -86,6 +86,11 @@ var (
 	ErrChatModelNotAllowed  = errors.New("chat model is not allowed for the current plan")
 	ErrChatRequestShape     = errors.New("chat request shape is not supported by the selected model")
 	ErrChatModelNoVision    = errors.New("the selected model does not support image input")
+	// ErrChatCapabilityUnsupported: T8 —— 请求要的能力（图片 / 显式推理档位）
+	// 在已发布目录里**没有任何部署能承载**。请求从未出站、零预占、零计费，
+	// 因此必须与「上游拒绝」（ErrChatUpstreamRejected，502）严格分开：这是
+	// 客户端可修的能力不兼容，重试同一个请求不会成功。
+	ErrChatCapabilityUnsupported = errors.New("the selected model has no deployment that can serve this request")
 	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
 	ErrChatUpstreamError    = errors.New("chat upstream error")
 	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")

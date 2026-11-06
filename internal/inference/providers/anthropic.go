@@ -37,8 +37,15 @@ func (a *AnthropicMessages) Protocol() domain.Protocol { return domain.ProtocolA
 // Capabilities implements Adapter. Anthropic streams report usage via
 // message_start / message_delta — explicitly part of the protocol, so
 // streaming usage is always requested by construction.
+//
+// Images: the Messages protocol carries image blocks natively and the
+// adapter translates the internal image shape into them.
+// ReasoningEfforts: EMPTY on purpose — the Messages protocol has no
+// effort knob (its reasoning dial is budget_tokens, a different axis). A
+// requested effort therefore cannot be expressed and is refused before
+// dispatch instead of being folded into a budget.
 func (a *AnthropicMessages) Capabilities() domain.AdapterCapabilities {
-	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true}
+	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true, Images: true}
 }
 
 // Inclusion implements Adapter: Anthropic's input_tokens does NOT include
@@ -62,6 +69,15 @@ const anthropicVersionHeader = "2023-06-01"
 // with the stream flag and the gateway-forced output cap as parameters.
 func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
+	// T8: the Messages protocol has NO reasoning-effort knob (its dial is
+	// budget_tokens). An explicitly requested level cannot be expressed —
+	// refuse it loudly instead of folding it into the budget (the routing
+	// layer already skips such candidates; this is the adapter's own
+	// defensive refusal).
+	if r.ReasoningEffort != "" {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: the anthropic_messages protocol cannot express a reasoning effort level ("+r.ReasoningEffort+")")
+	}
 	maxTokens := call.OutputCap
 	if maxTokens <= 0 {
 		return nil, domain.NewError(domain.CodeInvalidInput,

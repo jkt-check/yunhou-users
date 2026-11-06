@@ -367,15 +367,30 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	// 2. Capability validation BEFORE any spend (设计: 不支持的工具/模态明
 	// 确报错). Modality/field-shape validation happened at the API edge.
 	thinking := req.ThinkingEnabled != nil && *req.ThinkingEnabled
+	// T8: 推理档位是**显式**的请求维度 —— 有档位即有推理需求（档位本身
+	// 就是「要推理」），模型不支持推理时同样明确拒绝。
+	effort := req.ReasoningEffort
 	if len(req.Tools) > 0 && !m.SupportsTools {
 		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support tools")
 	}
-	if thinking && !m.SupportsReasoning {
+	if (thinking || effort != "") && !m.SupportsReasoning {
 		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support reasoning")
 	}
 	// Key narrowing can never widen beyond the entitlement set (设计 §4.2).
 	if key != nil && len(key.ModelAllow) > 0 && !contains(key.ModelAllow, m.ID) {
 		return nil, domain.NewError(domain.CodeModelNotAllowed, "model "+m.ID+" is not allowed for this API key")
+	}
+	// T8 能力路由（准入前）：请求要的能力（图片 / 推理档位）若**没有任何**
+	// 已发布部署能承载，就在准入之前明确拒绝 —— 零预占、零派发。
+	// 只有当「不带该额外需求」本来就有兼容候选时，这才是能力不兼容（客户端
+	// 可修的 400）；若本来就没有任何候选，交给既有的路由路径（503
+	// upstream_unavailable），不改变既有语义。
+	needs := routing.Needs{
+		Tools: len(req.Tools) > 0, Reasoning: thinking || effort != "",
+		Images: model.MessagesHaveImages(req.Messages), ReasoningEffort: effort,
+	}
+	if err := s.rejectUnservableNeed(snap, m.ID, needs); err != nil {
+		return nil, err
 	}
 
 	// 3. Entitlement resolution (显式套餐优先，赠送不叠加/不兜底；无套餐时
@@ -471,7 +486,6 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	// From here on, every exit path finalizes the reservation.
 
 	// 6. Route: capability-compatible candidates only (设计 §5).
-	needs := routing.Needs{Tools: len(req.Tools) > 0, Reasoning: thinking}
 	cands, err := s.routingSvc.Candidates(ctx, snap, m.ID, needs)
 	if err != nil {
 		s.releaseAdmission(requestID, adm.Leases)
@@ -511,6 +525,71 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	}
 
 	return s.dispatchLoop(ctx, requestID, adm, req, price, cands)
+}
+
+// ErrCapabilityUnsupported marks a request whose capability demand (image
+// input / an explicit reasoning-effort level) no published deployment can
+// carry. It is a CLIENT error, not an upstream fault: nothing was sent,
+// nothing was reserved, nothing was billed — retrying the same request
+// cannot help. The protocol surfaces keep their native shapes (400
+// invalid_input); the legacy /chat facade maps it onto its own envelope.
+type ErrCapabilityUnsupported struct {
+	// Err is the underlying domain error (code + message).
+	Err *domain.Error
+}
+
+// Error renders the underlying domain error.
+func (e *ErrCapabilityUnsupported) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the *domain.Error so domain.CodeOf and errors.As keep
+// working on it.
+func (e *ErrCapabilityUnsupported) Unwrap() error { return e.Err }
+
+// newCapabilityUnsupported builds the typed capability error.
+func newCapabilityUnsupported(msg string) *ErrCapabilityUnsupported {
+	return &ErrCapabilityUnsupported{Err: domain.NewError(domain.CodeInvalidInput, msg)}
+}
+
+// rejectUnservableNeed refuses a request whose EXTRA capability demand
+// (image input / an explicit reasoning-effort level) no published
+// deployment can carry — BEFORE admission, so the request never takes a
+// monetary hold, a rate reservation, a lease or an upstream byte.
+//
+// The decision is a capability statement, not a capacity statement:
+//
+//   - the "base" demand (tools / reasoning) is compared first. If even the
+//     base demand has no compatible deployment, the request is left to the
+//     ordinary routing path (upstream_unavailable) — that is a catalog /
+//     capacity fact, not a client error, and its semantics stay unchanged;
+//   - only when the base demand HAS a compatible deployment and the extra
+//     demand has none is the request unservable by capability: the client
+//     asked for something this deployment set cannot express, so the answer
+//     is an explicit 400 (invalid_input) — never a silent fold into
+//     another capability and never a paid upstream round-trip.
+func (s *Service) rejectUnservableNeed(snap *catalog.Snapshot, modelID string, needs routing.Needs) error {
+	if !needs.Images && needs.ReasoningEffort == "" {
+		return nil // nothing extra was demanded
+	}
+	base := needs
+	base.Images = false
+	base.ReasoningEffort = ""
+	if len(s.routingSvc.CompatibleDeployments(snap, modelID, base)) == 0 {
+		return nil // the model has no compatible deployment at all — not a capability error
+	}
+	if len(s.routingSvc.CompatibleDeployments(snap, modelID, needs)) > 0 {
+		return nil // a compatible deployment exists
+	}
+	switch {
+	case needs.Images && needs.ReasoningEffort != "":
+		return newCapabilityUnsupported(
+			"model " + modelID + " has no deployment that can carry image input at reasoning effort " + needs.ReasoningEffort)
+	case needs.Images:
+		return newCapabilityUnsupported(
+			"model " + modelID + " has no deployment that can carry image input")
+	default:
+		return newCapabilityUnsupported(
+			"model " + modelID + " has no deployment that can carry reasoning effort " + needs.ReasoningEffort)
+	}
 }
 
 // pinCreditPrice resolves the effective sale_credit revision (plan path).
@@ -1483,10 +1562,18 @@ func (s *Service) estimateUsage(adm *quota.AdmissionResult, contentBytes int64) 
 }
 
 // imageInputTokenEstimate is the per-image admission estimate (OpenAI
-// high-detail worst case ≈ 85 + 170×6 tiles). Admission is a safe upper
-// bound corrected by the real usage chunk at settlement (设计 §7.1/7.2) —
-// it never bills directly; the rare no-usage fallback shares this
-// conservative direction with the bytes/2 text heuristic.
+// high-detail worst case ≈ 85 + 170×6 tiles = 1105).
+//
+// T8 口径修正：这只是**估算**，不是对所有模型/供应商都成立的数学硬上界。
+// 视觉 token 的计费口径由供应商定义（分块方式、缩放、是否计入缓存/
+// 推理桶都各不相同），不同供应商对同一张图的计量可能相差数倍。因此：
+//   - 准入用它是**保守预留**（先占住额度），结算时以**上游真实上报**的
+//     usage 为准（`source=reported`），估算路径（`source=estimated`）才
+//     用它，且带 `estimated` 标记可被后续真实证据更正；
+//   - 准入预占与最终结算的差额由结算事务的 overage 流程如实记账，不隐藏
+//     负差额；
+//   - 未解决的供应商计量边界记录在验证 runbook（T8）里：本网关**无法**
+//     校验供应商的视觉 token 口径，只能如实转述其上报值。
 const imageInputTokenEstimate = 1105
 
 // EstimateInputTokens is the admission input estimate: a conservative

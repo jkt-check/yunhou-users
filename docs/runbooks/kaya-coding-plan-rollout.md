@@ -211,8 +211,13 @@ OpenAI Chat Completions（tools + stream_options.include_usage）——
 - `anthropic-version: 2023-06-01`（Messages 子集）；
 - `truncation:"auto"` → 400（不做服务端上下文管理）；
 - `GET /v1/models` 不提供 Anthropic 形状（路径冲突）；
-- 历史 thinking/redacted_thinking 块接受但不回放（交错 thinking 连续
-  性不在本期；联调若命中需在 `model.ChatMessage` 增回放通道）；
+- 历史 thinking/redacted_thinking 块 → **400**（T8 兼容性修正：签名思考
+  无法忠实回放 —— Anthropic 的思考块必须连同上游签发的 signature 回传，
+  网关的内部形状承载不了签名，旧行为是「接受后丢弃」；联调若命中需要
+  `model.ChatMessage` 增**无损**签名回放通道，本期不建通用无损原生透传层）；
+- `thinking.type=enabled` → 400（本面不产出思考块：不伪造空 signature）；
+  要推理请用 `/v1/chat/completions`（`reasoning_content`）或
+  `/v1/responses`（`reasoning` 摘要）；
 - 多模态块/服务端工具（web_search/computer/bash/code_execution/mcp）
   → 400。
 

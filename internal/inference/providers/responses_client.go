@@ -16,14 +16,17 @@
 //   - 服务端工具调用项（web_search_call/file_search_call/computer_call/
 //     code_interpreter_call/mcp_* 等）与 item_reference 400 —— 本网关无
 //     服务端工具执行面，也不实现 OpenAI 的 stored-items 引用；
-//   - input 中的 reasoning 项接受但不回放（chat 形状上游无对应语义；
-//     OpenAI 的 encrypted_content 存储不在本期范围）；
+//   - input 中的 reasoning 项 400（T8：无法忠实回放 ——本网关不实现
+//     OpenAI 的加密推理存储，include=reasoning.encrypted_content 早已被
+//     拒绝；旧行为是「接受后丢弃」，那是兼容性修正）；
 //   - background:true 与 include 非空 400（无异步执行/附加数据面）；
 //   - truncation:auto 400 —— 服务端静默裁剪上下文违反本网关"不静默丢
 //     字段"原则；truncation:disabled（默认语义）接受；
 //   - text.format 仅 text；json_object/json_schema 400（与 chat 面一致）；
 //   - store:false 不落会话链（OpenAI 语义），引用它的 previous_response_id
 //     得到 404；store 缺省为 true（与 OpenAI 一致）。
+//   - reasoning.effort 的档位逐字保留（T8：low/medium/high/xhigh 原样
+//     下传，不再一律折成 medium）。
 //
 // 终止语义：response.completed / response.incomplete 是仅有的干净结束；
 // 上游中断 → `event: error` 原生错误事件后结束，绝不伪造 completed。
@@ -205,10 +208,14 @@ func ParseResponsesRequest(body []byte) (*ResponsesInput, error) {
 			return nil, invalidMsg("reasoning", "invalid reasoning parameter")
 		}
 		switch rs.Effort {
-		case "low", "medium", "high", "xhigh":
+		case "low", "medium", "high", "xhigh", "minimal":
+			// T8: 档位逐字保留 —— 不再一律折成「开/关」，也不把 minimal
+			// 折成「关闭」（minimal 是最低**推理档**，不是无推理；OpenAI 的
+			// 语义如此）。上游不支持该档位时由能力路由在出站前明确拒绝。
 			on := true
 			req.ThinkingEnabled = &on
-		case "", "none", "minimal":
+			req.ReasoningEffort = rs.Effort
+		case "", "none":
 			if rs.Effort != "" {
 				off := false
 				req.ThinkingEnabled = &off
@@ -331,8 +338,12 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			}
 			out = append(out, model.ChatMessage{Role: "tool", ToolCallID: it.CallID, Content: text})
 		case "reasoning":
-			// 推理项接受但不回放（chat 形状上游无对应语义；能力矩阵明示）。
-			continue
+			// T8: 推理项**无法忠实回放**（本网关不实现 OpenAI 的加密推理
+			// 存储：`include` 里的 reasoning.encrypted_content 早已被拒绝，
+			// reasoning 项本身也没有可回放的加密载荷）。旧行为是「接受后
+			// 丢弃」—— 客户端看不到自己回传的内容被吞掉。现在明确 4xx。
+			return nil, invalidMsg("input",
+				"reasoning items cannot be replayed by this gateway (no lossless encrypted reasoning replay)")
 		case "item_reference":
 			return nil, invalidMsg("input",
 				"item_reference is not supported (stored-items API 不在本期范围)")

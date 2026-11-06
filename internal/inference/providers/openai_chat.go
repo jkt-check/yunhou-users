@@ -33,8 +33,16 @@ func (a *OpenAIChat) Protocol() domain.Protocol { return domain.ProtocolOpenAICh
 
 // Capabilities implements Adapter. include_usage is always requested, so
 // streaming usage is available whenever the upstream honors it.
+//
+// Images: the chat-completions protocol carries image parts natively
+// (image_url content parts) — the adapter relays them.
+// ReasoningEfforts: the chat-completions protocol has the reasoning_effort
+// knob, so every level of the vocabulary can be expressed verbatim.
 func (a *OpenAIChat) Capabilities() domain.AdapterCapabilities {
-	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true}
+	return domain.AdapterCapabilities{
+		StreamingUsage: true, Tools: true, Reasoning: true, Images: true,
+		ReasoningEfforts: domain.SupportedReasoningEfforts(),
+	}
 }
 
 // Inclusion implements Adapter: OpenAI's prompt_tokens already contains
@@ -95,7 +103,13 @@ func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 	if len(r.ToolChoice) > 0 {
 		payload["tool_choice"] = r.ToolChoice
 	}
-	if r.ThinkingEnabled != nil && *r.ThinkingEnabled {
+	// T8: 显式推理档位逐字透传（协议原生字段 reasoning_effort）。
+	// 档位与开关的关系：档位是**更具体**的请求，档位在场时只发档位
+	// （两个方言的旋钮同时发给一个上游不是协议忠实）；开关单独在场时
+	// 仍发 thinking（DeepSeek 风格）。
+	if r.ReasoningEffort != "" {
+		payload["reasoning_effort"] = r.ReasoningEffort
+	} else if r.ThinkingEnabled != nil && *r.ThinkingEnabled {
 		payload["thinking"] = map[string]any{"type": "enabled"}
 	}
 	for _, k := range passthroughKeys {

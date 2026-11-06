@@ -374,6 +374,11 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 		// 承诺重试（配置不会自愈）。
 		{"config_unavailable", &gateway.ErrConfigUnavailable{Err: domain.NewError(domain.CodeUpstreamUnavailable,
 			"model m has no dispatchable route")}, ErrChatConfigUnavailable},
+		// T8:能力不兼容（无部署能承载图片/显式推理档位）→ 明确的能力拒绝
+		// 哨兵（400），**不是**「上游拒绝」（502）：请求从未出站、零预占，
+		// 把责任推给上游并邀请一次注定失败的重试都是错的。
+		{"capability_unsupported", &gateway.ErrCapabilityUnsupported{Err: domain.NewError(domain.CodeInvalidInput,
+			"model m has no deployment that can carry image input")}, ErrChatCapabilityUnsupported},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

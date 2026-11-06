@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -687,5 +688,621 @@ func TestV1Responses_ExplicitRejection(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil ||
 		errBody.Error.Code != "invalid_input" || !strings.Contains(errBody.Error.Message, "background") {
 		t.Errorf("error = %s", w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 可执行能力矩阵：客户端入口 × 上游协议 × 文本/工具/图片/思考回放
+//
+// 每一格要么支持（200 + 上游真的收到请求），要么明确拒绝（协议原生 400 +
+// 零准入 + 零派发）。另含 SSE 终止矩阵（完整结束 / 半截 EOF）。
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Fixture: one model, one deployment on a chosen upstream protocol, all three
+// client entries mounted.
+// ---------------------------------------------------------------------------
+
+// matrixFixture serves the three client entries against ONE upstream
+// protocol, so the matrix can hold "client entry × upstream protocol"
+// apart. The upstream speaks the deployment's protocol; the client surfaces
+// always speak their own.
+type matrixFixture struct {
+	*v1Fixture
+	engine *gin.Engine
+	proto  domain.Protocol
+	// upCalls counts upstream requests; upBodies records their bodies.
+	upCalls  atomic.Int32
+	upBodies chan []byte
+	// upstreamHandler overrides the default non-streaming answer when set.
+	upstreamHandler atomic.Value // func(w http.ResponseWriter, r *http.Request, body []byte)
+	// truncate makes the upstream end its SSE stream WITHOUT the protocol's
+	// terminal frame (半截 EOF).
+	truncate atomic.Bool
+}
+
+func newMatrixFixture(t *testing.T, proto domain.Protocol) *matrixFixture {
+	t.Helper()
+	fx := newV1Fixture(t)
+	f := &matrixFixture{v1Fixture: fx, proto: proto, upBodies: make(chan []byte, 32)}
+
+	// The model must serve all three CLIENT protocols (the client-protocol
+	// gate is the model's protocol list, not the upstream's).
+	if _, err := fx.db.Exec(`UPDATE inference_models
+		SET protocols = ARRAY['openai_chat','anthropic_messages','openai_responses']::text[]
+		WHERE id = $1`, fx.modelID); err != nil {
+		t.Fatal(err)
+	}
+	var provID string
+	if err := fx.db.QueryRow(`SELECT provider_id FROM inference_deployments LIMIT 1`).Scan(&provID); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		f.upCalls.Add(1)
+		select {
+		case f.upBodies <- body:
+		default:
+		}
+		if strings.Contains(string(body), `"stream":true`) {
+			f.writeUpstreamStream(w)
+			return
+		}
+		if h, ok := f.upstreamHandler.Load().(func(http.ResponseWriter, *http.Request, []byte)); ok {
+			h(w, r, body)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, f.upstreamNonStreamBody())
+	}))
+	t.Cleanup(srv.Close)
+
+	dep := &domain.Deployment{
+		ProviderID: provID, UpstreamModel: "matrix-upstream", BaseURL: srv.URL,
+		Protocol:       proto,
+		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second,
+		Status: domain.DeploymentActive,
+	}
+	if err := fx.store.InsertDeployment(context.Background(), dep); err != nil {
+		t.Fatalf("insert deployment: %v", err)
+	}
+	if err := fx.store.InsertRoute(context.Background(), &domain.ModelRoute{
+		ModelID: fx.modelID, DeploymentID: dep.ID, Weight: 1, Enabled: true,
+		PoolStrategy: domain.PoolRoundRobin,
+	}); err != nil {
+		t.Fatalf("insert route: %v", err)
+	}
+
+	snap := &catalog.Snapshot{
+		Models: map[string]domain.Model{fx.modelID: {
+			ID: fx.modelID, DisplayName: "GLM 4.6", Lifecycle: domain.LifecycleActive,
+			ContextTokens: 200000, MaxOutputTokens: 8192,
+			Protocols: []domain.Protocol{
+				domain.ProtocolOpenAIChat, domain.ProtocolAnthropicMessage, domain.ProtocolOpenAIResponses,
+			},
+			InputModalities: []string{"text"}, OutputModalities: []string{"text"},
+			SupportsTools: true, SupportsReasoning: true,
+		}},
+		Providers:     map[string]domain.Provider{},
+		Deployments:   map[string]domain.Deployment{dep.ID: *dep},
+		RoutesByModel: map[string][]domain.ModelRoute{fx.modelID: {{ModelID: fx.modelID, DeploymentID: dep.ID, Weight: 1, Enabled: true}}},
+	}
+	if p, err := fx.store.GetProvider(context.Background(), provID); err == nil {
+		snap.Providers[p.ID] = *p
+	}
+	egress, err := credentials.NewEgressValidator([]string{"127.0.0.1/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapters := map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat:       providers.NewOpenAIChat(),
+		domain.ProtocolAnthropicMessage: providers.NewAnthropicMessages(),
+		domain.ProtocolOpenAIResponses:  providers.NewOpenAIResponses(),
+	}
+	routingSvc := routing.NewService(fx.store, adapters, nil)
+	gw := gateway.NewService(staticSnap{snap}, fx.store,
+		access.NewEntitlementResolver(fx.store, nil), quota.NewService(fx.store, nil),
+		routingSvc, mustCredSvc(t, fx.store), providers.NewHTTPClient(egress), egress, nil)
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	resolver := access.NewResolver(fx.store, nil)
+	v1 := engine.Group("/v1", httpapi.APIKeyAuth(resolver))
+	v1.POST("/chat/completions", httpapi.NewChatCompletionsHandler(gw).Create)
+	v1.POST("/messages", httpapi.NewMessagesHandler(gw).Create)
+	v1.POST("/responses", httpapi.NewResponsesHandler(gw, fx.store, nil).Create)
+	f.engine = engine
+	return f
+}
+
+// upstreamNonStreamBody is the non-streaming answer of the deployment's
+// upstream protocol.
+func (f *matrixFixture) upstreamNonStreamBody() string {
+	switch f.proto {
+	case domain.ProtocolAnthropicMessage:
+		return `{"id":"msg_1","type":"message","role":"assistant","model":"up",` +
+			`"content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn",` +
+			`"usage":{"input_tokens":7,"output_tokens":5}}`
+	case domain.ProtocolOpenAIResponses:
+		return `{"id":"resp_1","object":"response","status":"completed","model":"up",` +
+			`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],` +
+			`"usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}}`
+	default:
+		return `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"up",` +
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],` +
+			`"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`
+	}
+}
+
+// writeUpstreamStream writes the upstream SSE of the deployment's protocol.
+// With truncate set the terminal frame is omitted (半截 EOF).
+func (f *matrixFixture) writeUpstreamStream(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	fl, _ := w.(http.Flusher)
+	var frames []string
+	switch f.proto {
+	case domain.ProtocolAnthropicMessage:
+		frames = []string{
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":7}}}\n\n",
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		}
+	case domain.ProtocolOpenAIResponses:
+		frames = []string{
+			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+			"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}],\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"total_tokens\":12}}}\n\n",
+		}
+	default:
+		frames = []string{
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n",
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":5,\"total_tokens\":12}}\n\n",
+			"data: [DONE]\n\n",
+		}
+	}
+	if f.truncate.Load() {
+		frames = frames[:len(frames)-1] // drop the terminal frame → 半截 EOF
+	}
+	for _, fr := range frames {
+		_, _ = io.WriteString(w, fr)
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+}
+
+// call issues one request against the matrix engine.
+func (f *matrixFixture) call(t *testing.T, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rdr = strings.NewReader(string(raw))
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	req.Header.Set("Authorization", "Bearer "+f.keyPlain)
+	w := httptest.NewRecorder()
+	f.engine.ServeHTTP(w, req)
+	return w
+}
+
+// lastUpstreamBody returns the most recent upstream request body.
+func (f *matrixFixture) lastUpstreamBody(t *testing.T) string {
+	t.Helper()
+	select {
+	case b := <-f.upBodies:
+		return string(b)
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream saw no request")
+		return ""
+	}
+}
+
+// countRows counts one inference table (zero-admission assertions).
+func (f *matrixFixture) countRows(t *testing.T, table string) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+// ---------------------------------------------------------------------------
+// Request builders per client entry
+// ---------------------------------------------------------------------------
+
+// entryBodies returns one request body per capability probe, shaped for the
+// given client entry. A nil body means "not applicable to this entry".
+func entryBodies(entry, capability string) map[string]any {
+	switch entry {
+	case "chat":
+		switch capability {
+		case "text":
+			return map[string]any{"model": "glm-4.6", "messages": []any{
+				map[string]any{"role": "user", "content": "hi"}}}
+		case "tools":
+			return map[string]any{"model": "glm-4.6", "messages": []any{
+				map[string]any{"role": "user", "content": "hi"}},
+				"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+					"name": "run_shell", "parameters": map[string]any{"type": "object"}}}}}
+		case "images":
+			return map[string]any{"model": "glm-4.6", "messages": []any{
+				map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "image_url", "image_url": map[string]any{
+						"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}}}}}}
+		case "thinking_replay":
+			return map[string]any{"model": "glm-4.6", "messages": []any{
+				map[string]any{"role": "user", "content": "hi"},
+				map[string]any{"role": "assistant", "content": "ok", "reasoning_content": "step-1"}}}
+		}
+	case "messages":
+		switch capability {
+		case "text":
+			return map[string]any{"model": "glm-4.6", "max_tokens": 64, "messages": []any{
+				map[string]any{"role": "user", "content": "hi"}}}
+		case "tools":
+			return map[string]any{"model": "glm-4.6", "max_tokens": 64, "messages": []any{
+				map[string]any{"role": "user", "content": "hi"}},
+				"tools": []any{map[string]any{"name": "run_shell", "input_schema": map[string]any{"type": "object"}}}}
+		case "images":
+			return map[string]any{"model": "glm-4.6", "max_tokens": 64, "messages": []any{
+				map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "image", "source": map[string]any{
+						"type": "base64", "media_type": "image/png", "data": "AAAA"}}}}}}
+		case "thinking_replay":
+			// A signed thinking block NEXT TO a text block: the turn carries
+			// replayable content, so the accept-and-drop path is the one under
+			// test (a turn with ONLY thinking was already rejected).
+			return map[string]any{"model": "glm-4.6", "max_tokens": 64, "messages": []any{
+				map[string]any{"role": "user", "content": "hi"},
+				map[string]any{"role": "assistant", "content": []any{
+					map[string]any{"type": "text", "text": "ok"},
+					map[string]any{"type": "thinking", "thinking": "step-1", "signature": "sig-abc"}}}}}
+		}
+	case "responses":
+		switch capability {
+		case "text":
+			return map[string]any{"model": "glm-4.6", "input": "hi"}
+		case "tools":
+			return map[string]any{"model": "glm-4.6", "input": "hi",
+				"tools": []any{map[string]any{"type": "function", "name": "run_shell",
+					"parameters": map[string]any{"type": "object"}}}}
+		case "images":
+			return map[string]any{"model": "glm-4.6", "input": []any{
+				map[string]any{"type": "message", "role": "user", "content": []any{
+					map[string]any{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}}}}}
+		case "thinking_replay":
+			return map[string]any{"model": "glm-4.6", "input": []any{
+				map[string]any{"type": "message", "role": "user", "content": []any{
+					map[string]any{"type": "input_text", "text": "hi"}}},
+				map[string]any{"type": "reasoning", "id": "rs_1",
+					"summary": []any{map[string]any{"type": "summary_text", "text": "step-1"}}}}}
+		}
+	}
+	return nil
+}
+
+func entryPath(entry string) string {
+	switch entry {
+	case "chat":
+		return "/v1/chat/completions"
+	case "messages":
+		return "/v1/messages"
+	default:
+		return "/v1/responses"
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The matrix
+// ---------------------------------------------------------------------------
+
+// TestCapabilityMatrix_ClientEntryByUpstreamProtocol is the executable
+// capability matrix: every cell is either "supported" (200 + the upstream
+// really received the request) or "rejected" (protocol-native 400 + zero
+// admission + zero dispatch). Nothing may be silently degraded.
+//
+// Rejected cells in this matrix:
+//   - images on every /v1 entry: the standard surfaces stay an explicit TEXT
+//     subset (the Kaya /chat surface is the only image-capable entry);
+//   - thinking replay on the messages entry (signed thinking cannot be
+//     replayed faithfully) and on the responses entry (reasoning items carry
+//     no encrypted content this gateway can replay).
+func TestCapabilityMatrix_ClientEntryByUpstreamProtocol(t *testing.T) {
+	entries := []string{"chat", "messages", "responses"}
+	protocols := []domain.Protocol{
+		domain.ProtocolOpenAIChat, domain.ProtocolAnthropicMessage, domain.ProtocolOpenAIResponses,
+	}
+	capabilities := []string{"text", "tools", "images", "thinking_replay"}
+
+	for _, proto := range protocols {
+		for _, entry := range entries {
+			for _, capability := range capabilities {
+				name := string(proto) + "/" + entry + "/" + capability
+				t.Run(name, func(t *testing.T) {
+					f := newMatrixFixture(t, proto)
+					body := entryBodies(entry, capability)
+					if body == nil {
+						t.Skip("capability not applicable to this entry")
+					}
+					w := f.call(t, http.MethodPost, entryPath(entry), body)
+					rejected := (capability == "images") ||
+						(capability == "thinking_replay" && entry != "chat")
+					if rejected {
+						if w.Code != http.StatusBadRequest {
+							t.Fatalf("code = %d, want 400（明确拒绝）: %s", w.Code, w.Body.String())
+						}
+						if n := f.countRows(t, "inference_requests"); n != 0 {
+							t.Errorf("requests = %d, want 0 (rejection precedes admission)", n)
+						}
+						if n := f.countRows(t, "inference_reservations"); n != 0 {
+							t.Errorf("reservations = %d, want 0 (rejection leaves no hold)", n)
+						}
+						if n := f.upCalls.Load(); n != 0 {
+							t.Errorf("upstream calls = %d, want 0 (rejection precedes dispatch)", n)
+						}
+						return
+					}
+					if w.Code != http.StatusOK {
+						t.Fatalf("code = %d, want 200（支持）: %s", w.Code, w.Body.String())
+					}
+					if n := f.upCalls.Load(); n != 1 {
+						t.Errorf("upstream calls = %d, want 1", n)
+					}
+				})
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// reasoning effort — 逐字保留，不可表达/不支持的值明确拒绝
+// ---------------------------------------------------------------------------
+
+// TestV1ChatCompletions_ReasoningEffortIsPreservedUpstream：客户端声明的
+// reasoning effort 必须原样到达上游 —— 不得一律折成 medium。
+func TestV1ChatCompletions_ReasoningEffortIsPreservedUpstream(t *testing.T) {
+	for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+		t.Run(effort, func(t *testing.T) {
+			f := newMatrixFixture(t, domain.ProtocolOpenAIChat)
+			w := f.call(t, http.MethodPost, "/v1/chat/completions", map[string]any{
+				"model": "glm-4.6", "reasoning_effort": effort,
+				"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+			})
+			if w.Code != http.StatusOK {
+				t.Fatalf("code = %d, want 200: %s", w.Code, w.Body.String())
+			}
+			body := f.lastUpstreamBody(t)
+			if !strings.Contains(body, effort) {
+				t.Errorf("upstream body does not carry the requested effort %q: %s", effort, body)
+			}
+			if effort != "medium" && strings.Contains(body, `"reasoning_effort":"medium"`) {
+				t.Errorf("effort %q was folded to medium: %s", effort, body)
+			}
+		})
+	}
+}
+
+// TestV1ChatCompletions_UnsupportedReasoningEffortIsRejected：不支持的 effort
+// 值必须明确拒绝（出站前），不得静默忽略。
+func TestV1ChatCompletions_UnsupportedReasoningEffortIsRejected(t *testing.T) {
+	f := newMatrixFixture(t, domain.ProtocolOpenAIChat)
+	w := f.call(t, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "glm-4.6", "reasoning_effort": "ultra",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if n := f.countRows(t, "inference_requests"); n != 0 {
+		t.Errorf("requests = %d, want 0 (rejection precedes admission)", n)
+	}
+	if n := f.upCalls.Load(); n != 0 {
+		t.Errorf("upstream calls = %d, want 0", n)
+	}
+}
+
+// TestV1Responses_ReasoningEffortIsPreservedUpstream：Responses 入口的
+// reasoning.effort 逐字保留（不得折成 medium）。
+func TestV1Responses_ReasoningEffortIsPreservedUpstream(t *testing.T) {
+	for _, effort := range []string{"low", "high", "xhigh"} {
+		t.Run(effort, func(t *testing.T) {
+			f := newMatrixFixture(t, domain.ProtocolOpenAIChat)
+			w := f.call(t, http.MethodPost, "/v1/responses", map[string]any{
+				"model": "glm-4.6", "input": "hi",
+				"reasoning": map[string]any{"effort": effort},
+			})
+			if w.Code != http.StatusOK {
+				t.Fatalf("code = %d, want 200: %s", w.Code, w.Body.String())
+			}
+			body := f.lastUpstreamBody(t)
+			if !strings.Contains(body, effort) {
+				t.Errorf("upstream body does not carry the requested effort %q: %s", effort, body)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 服务端工具 —— /v1 入口没有服务端执行面，必须原生 400
+// ---------------------------------------------------------------------------
+
+// TestV1ChatCompletions_ServerSideToolIsRejected：/v1/chat/completions 的
+// tools 只接受 function 定义；服务端工具类型（web_search/computer/
+// code_execution/mcp …）没有执行面也没有计量保护，必须明确 400。
+func TestV1ChatCompletions_ServerSideToolIsRejected(t *testing.T) {
+	f := newMatrixFixture(t, domain.ProtocolOpenAIChat)
+	w := f.call(t, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "glm-4.6",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"tools":    []any{map[string]any{"type": "web_search"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if n := f.countRows(t, "inference_requests"); n != 0 {
+		t.Errorf("requests = %d, want 0 (rejection precedes admission)", n)
+	}
+	if n := f.upCalls.Load(); n != 0 {
+		t.Errorf("upstream calls = %d, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 思考回放 —— 无法忠实回放的历史必须原生 4xx
+// ---------------------------------------------------------------------------
+
+// TestV1Messages_ThinkingRequestIsRejected：Anthropic Messages 面不产出
+// 签名思考块（没有无损的签名回放），因此显式开启 thinking 的请求明确
+// 400（普通文本/工具流不受影响）。
+func TestV1Messages_ThinkingRequestIsRejected(t *testing.T) {
+	f := newMatrixFixture(t, domain.ProtocolOpenAIChat)
+	w := f.call(t, http.MethodPost, "/v1/messages", map[string]any{
+		"model": "glm-4.6", "max_tokens": 2048,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": 1024},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if n := f.countRows(t, "inference_requests"); n != 0 {
+		t.Errorf("requests = %d, want 0 (rejection precedes admission)", n)
+	}
+	if n := f.upCalls.Load(); n != 0 {
+		t.Errorf("upstream calls = %d, want 0", n)
+	}
+}
+
+// TestV1Responses_ReasoningItemIsRejected：Responses 输入里的 reasoning 项
+// 无法忠实回放（本网关不实现加密推理存储），必须原生 400 而不是「接受后
+// 丢弃」。
+func TestV1Responses_ReasoningItemIsRejected(t *testing.T) {
+	f := newMatrixFixture(t, domain.ProtocolOpenAIChat)
+	w := f.call(t, http.MethodPost, "/v1/responses", map[string]any{
+		"model": "glm-4.6", "input": []any{
+			map[string]any{"type": "message", "role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": "hi"}}},
+			map[string]any{"type": "reasoning", "id": "rs_1",
+				"summary": []any{map[string]any{"type": "summary_text", "text": "step-1"}}},
+		},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if n := f.countRows(t, "inference_requests"); n != 0 {
+		t.Errorf("requests = %d, want 0 (rejection precedes admission)", n)
+	}
+	if n := f.upCalls.Load(); n != 0 {
+		t.Errorf("upstream calls = %d, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSE 终止语义 —— 完整结束 / 半截 EOF（矩阵的第四个维度）
+// ---------------------------------------------------------------------------
+
+// TestCapabilityMatrix_SSETermination：三个客户端入口 × 三个上游协议的
+// 流式终止语义。
+//
+//   - 完整结束：客户端流必须以**本协议**的终止标记收尾
+//     （chat: `data: [DONE]`；messages: `message_stop`；
+//     responses: `response.completed`）；
+//   - 半截 EOF：上游流在终止标记之前断开 —— 客户端流必须注入**本协议的**
+//     原生错误事件，并且**不得**出现终止标记（残缺答案绝不被渲染成完整
+//     答案）。
+func TestCapabilityMatrix_SSETermination(t *testing.T) {
+	entries := []struct {
+		name    string
+		path    string
+		body    map[string]any
+		term    string
+		errHint string
+	}{
+		{"chat", "/v1/chat/completions", map[string]any{
+			"model": "glm-4.6", "stream": true,
+			"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		}, "data: [DONE]", `"error"`},
+		{"messages", "/v1/messages", map[string]any{
+			"model": "glm-4.6", "max_tokens": 64, "stream": true,
+			"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		}, "message_stop", "event: error"},
+		{"responses", "/v1/responses", map[string]any{
+			"model": "glm-4.6", "input": "hi", "stream": true,
+		}, "response.completed", "event: error"},
+	}
+	protocols := []domain.Protocol{
+		domain.ProtocolOpenAIChat, domain.ProtocolAnthropicMessage, domain.ProtocolOpenAIResponses,
+	}
+	for _, proto := range protocols {
+		for _, e := range entries {
+			t.Run(string(proto)+"/"+e.name+"/complete", func(t *testing.T) {
+				f := newMatrixFixture(t, proto)
+				w := f.call(t, http.MethodPost, e.path, e.body)
+				if w.Code != http.StatusOK {
+					t.Fatalf("code = %d, want 200: %s", w.Code, w.Body.String())
+				}
+				out := w.Body.String()
+				if !strings.Contains(out, e.term) {
+					t.Errorf("client stream is missing the protocol terminal marker %q: %s", e.term, out)
+				}
+			})
+			t.Run(string(proto)+"/"+e.name+"/truncated_eof", func(t *testing.T) {
+				f := newMatrixFixture(t, proto)
+				f.truncate.Store(true)
+				w := f.call(t, http.MethodPost, e.path, e.body)
+				if w.Code != http.StatusOK {
+					t.Fatalf("code = %d, want 200: %s", w.Code, w.Body.String())
+				}
+				out := w.Body.String()
+				if strings.Contains(out, e.term) {
+					t.Errorf("a truncated upstream stream must NOT produce the terminal marker %q: %s", e.term, out)
+				}
+				if !strings.Contains(out, e.errHint) {
+					t.Errorf("a truncated upstream stream must inject the native error event %q: %s", e.errHint, out)
+				}
+			})
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 网关自己生成的 Messages thinking —— 不得伪造空 signature
+// ---------------------------------------------------------------------------
+
+// TestV1Messages_NoFakedThinkingSignature：上游回了推理内容时，Messages
+// 面的答复不得输出 `signature: ""` 冒充可回放的原生签名思考块。
+func TestV1Messages_NoFakedThinkingSignature(t *testing.T) {
+	f := newMatrixFixture(t, domain.ProtocolOpenAIChat)
+	// The upstream answers with reasoning_content.
+	f.upstreamHandler.Store(func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"up",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"Hello","reasoning_content":"step-1"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`)
+	})
+	w := f.call(t, http.MethodPost, "/v1/messages", map[string]any{
+		"model": "glm-4.6", "max_tokens": 64,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	out := w.Body.String()
+	if strings.Contains(out, `"signature":""`) || strings.Contains(out, `"signature": ""`) {
+		t.Errorf("the gateway faked an empty thinking signature: %s", out)
+	}
+	if !strings.Contains(out, "Hello") {
+		t.Errorf("the ordinary text answer must survive: %s", out)
 	}
 }

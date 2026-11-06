@@ -12,6 +12,11 @@ import (
 
 // 多轮工具调用历史:tool_use id 与 tool_result.tool_use_id 必须逐字保留
 // 到内部形状(验收:多轮工具调用 ID 保留).
+//
+// T8 兼容性修正:历史里的 thinking 块与 thinking 参数**不再被接受** ——
+// 签名思考无法忠实回放,旧行为是「接受后丢弃」。本用例因此改用纯文本 +
+// 工具的历史(普通文本/工具流必须照常可用),拒绝路径由
+// TestParseAnthropicMessagesRequest_ThinkingReplayRejected 钉住。
 func TestParseAnthropicMessagesRequest_ToolRoundTripPreservesIDs(t *testing.T) {
 	body := `{
 	  "model": "claude-sonnet-4-5",
@@ -20,7 +25,6 @@ func TestParseAnthropicMessagesRequest_ToolRoundTripPreservesIDs(t *testing.T) {
 	  "messages": [
 	    {"role":"user","content":"list files"},
 	    {"role":"assistant","content":[
-	      {"type":"thinking","thinking":"let me run ls","signature":"sig1"},
 	      {"type":"text","text":"I'll check."},
 	      {"type":"tool_use","id":"toolu_01ABC","name":"Bash","input":{"command":"ls -la"}}
 	    ]},
@@ -31,7 +35,6 @@ func TestParseAnthropicMessagesRequest_ToolRoundTripPreservesIDs(t *testing.T) {
 	  ],
 	  "tools": [{"name":"Bash","description":"run shell","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],
 	  "tool_choice": {"type":"auto"},
-	  "thinking": {"type":"enabled","budget_tokens":2048},
 	  "temperature": 0.5
 	}`
 	req, err := ParseAnthropicMessagesRequest([]byte(body))
@@ -41,8 +44,8 @@ func TestParseAnthropicMessagesRequest_ToolRoundTripPreservesIDs(t *testing.T) {
 	if req.Model != "claude-sonnet-4-5" || req.MaxTokens == nil || *req.MaxTokens != 8192 {
 		t.Fatalf("req = %+v", req)
 	}
-	if req.ThinkingEnabled == nil || !*req.ThinkingEnabled || req.ThinkingBudget == nil || *req.ThinkingBudget != 2048 {
-		t.Fatalf("thinking = %+v/%+v", req.ThinkingEnabled, req.ThinkingBudget)
+	if req.ThinkingEnabled != nil {
+		t.Fatalf("thinking must stay unset: %+v", req.ThinkingEnabled)
 	}
 	// system + user + assistant(tool_calls) + tool + user
 	var roles []string
@@ -74,6 +77,33 @@ func TestParseAnthropicMessagesRequest_ToolRoundTripPreservesIDs(t *testing.T) {
 	}
 	if req.Passthrough["temperature"] != 0.5 {
 		t.Fatalf("passthrough = %+v", req.Passthrough)
+	}
+}
+
+// T8:签名/脱敏思考历史与显式 thinking 请求必须明确 400(旧的「接受后丢
+// 弃」是兼容性修正,不是静默降级)。
+func TestParseAnthropicMessagesRequest_ThinkingReplayRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"signed thinking history", `{"model":"m","max_tokens":64,"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"thinking","thinking":"t","signature":"sig"}]}]}`, "thinking"},
+		{"redacted thinking history", `{"model":"m","max_tokens":64,"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"redacted_thinking","data":"xx"}]}]}`, "redacted_thinking"},
+		{"thinking enabled request", `{"model":"m","max_tokens":2048,"messages":[
+			{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1024}}`, "thinking"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAnthropicMessagesRequest([]byte(tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want substring %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -120,7 +150,6 @@ func TestAnthropicMessageFromCompletion_Shape(t *testing.T) {
 	s := string(out)
 	for _, kw := range []string{
 		`"type":"message"`, `"role":"assistant"`, `"model":"claude-public"`,
-		`"type":"thinking"`, `"thinking":"thinking hard"`,
 		`"type":"tool_use"`, `"id":"call_42"`, `"name":"Bash"`,
 		`"stop_reason":"tool_use"`,
 		`"input_tokens":60`, `"cache_read_input_tokens":40`, `"output_tokens":25`,
@@ -128,6 +157,16 @@ func TestAnthropicMessageFromCompletion_Shape(t *testing.T) {
 		if !strings.Contains(s, kw) {
 			t.Errorf("missing %q in %s", kw, s)
 		}
+	}
+	// T8:本面不得输出 thinking 块,更不得伪造空 signature。
+	if strings.Contains(s, `"type":"thinking"`) {
+		t.Errorf("this surface must not render thinking blocks: %s", s)
+	}
+	if strings.Contains(s, `"signature"`) {
+		t.Errorf("this surface must not fake a thinking signature: %s", s)
+	}
+	if !strings.Contains(s, `"Let me run that."`) {
+		t.Errorf("the ordinary text answer must survive: %s", s)
 	}
 	if strings.Contains(s, "msg_") && !strings.Contains(s, `"id":"msg_`) {
 		t.Errorf("id should be msg_-shaped: %s", s)
@@ -142,9 +181,12 @@ func TestAnthropicMessageFromCompletion_Shape(t *testing.T) {
 	}
 }
 
-// 流式翻译黄金序列:text + tool_use + thinking + usage + [DONE] →
+// 流式翻译黄金序列:text + tool_use + usage + [DONE] →
 // message_start/content_block_*/message_delta/message_stop;ID 与参数片段
 // 逐字;终止 message_delta 携带真实 usage.
+//
+// T8:推理增量**不**开启 thinking 块(本面不产出需要原生签名的块),因此
+// 文本块是 index 0、tool_use 块是 index 1。
 func TestTranslateOpenAIToAnthropicStream_GoldenSequence(t *testing.T) {
 	chunks := []string{
 		`{"id":"chatcmpl-x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"}}]}`,
@@ -174,9 +216,7 @@ func TestTranslateOpenAIToAnthropicStream_GoldenSequence(t *testing.T) {
 	anchors := []string{
 		"event: message_start",
 		`"id":"msg_test1"`, `"model":"claude-public"`,
-		"event: content_block_start\n", `"type":"thinking"`,
-		`"thinking":"think","type":"thinking_delta"`,
-		`"type":"text"`,
+		"event: content_block_start\n", `"type":"text"`,
 		`"text":"Hel","type":"text_delta"`,
 		`"text":"lo","type":"text_delta"`,
 		`"id":"call_7","input":{},"name":"Bash","type":"tool_use"`,
@@ -197,9 +237,13 @@ func TestTranslateOpenAIToAnthropicStream_GoldenSequence(t *testing.T) {
 		}
 		cursor += i + len(a)
 	}
-	// content_block 索引:text=1(thinking=0), tool_use=2.
-	if !strings.Contains(s, `"index":2,"type":"content_block_start"`) {
+	// content_block 索引:text=0, tool_use=1(T8: 不再有 thinking 块)。
+	if !strings.Contains(s, `"index":1,"type":"content_block_start"`) {
 		t.Errorf("tool_use block index mismatch:\n%s", s)
+	}
+	// T8:不得出现 thinking 块,也不得伪造 signature。
+	if strings.Contains(s, `"type":"thinking"`) || strings.Contains(s, `"signature"`) {
+		t.Errorf("this surface must not render thinking blocks or fake a signature:\n%s", s)
 	}
 }
 

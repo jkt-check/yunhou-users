@@ -51,6 +51,14 @@ type ChatRequest struct {
 	// ThinkingEnabled toggles reasoning mode (OpenAI thinking / Anthropic
 	// extended thinking) on models that declare SupportsReasoning.
 	ThinkingEnabled *bool
+	// ReasoningEffort is the EXPLICITLY requested reasoning-effort level
+	// ("low" | "medium" | "high" | "xhigh" | "minimal"). Empty = the client
+	// asked for reasoning without naming a level, and the adapter applies
+	// its protocol's default. A level the upstream protocol cannot express
+	// is REFUSED before dispatch (routing skips the candidate, the adapter
+	// refuses defensively) — it is never folded into another level and
+	// never silently ignored.
+	ReasoningEffort string
 	// ThinkingBudget is the client-declared Anthropic thinking budget
 	// (budget_tokens). Nil means the adapter's default. Only the anthropic
 	// adapter consumes it; other adapters ignore it (their protocols have

@@ -2,11 +2,18 @@ package httpapi_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+
+	"github.com/yunhou/users/internal/inference/catalog"
+	"github.com/yunhou/users/internal/inference/postgres"
 )
 
 type envelope struct {
@@ -400,5 +407,103 @@ func TestAdminCatalogRevisionsMetadataAndPagination(t *testing.T) {
 	}
 	if active["revision"] != float64(3) || active["is_active"] != true {
 		t.Errorf("active = %+v, want revision 3 active", active)
+	}
+}
+
+// publishedCatalogSvc builds a catalog service over the test database so a
+// test can read the PUBLISHED snapshot (the authoritative runtime view).
+func publishedCatalogSvc(t *testing.T) *catalog.Service {
+	t.Helper()
+	if testDSN == "" {
+		t.Skip("skip: no postgres available")
+	}
+	db, err := sqlx.Connect("postgres", testDSN)
+	if err != nil {
+		t.Skipf("skip: no postgres available (%v)", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return catalog.NewService(postgres.NewStore(db))
+}
+
+// T3：运营停用 provider 的完整链路。PATCH /admin/providers/:id 改状态是
+// 草稿编辑——未发布前不改变已发布快照（发布快照是权威事实源，在途请求
+// pin 旧快照天然免疫）；发布后该 provider 的部署不再是可用部署，只挂它
+// 的模型不再可售（模型列表与实际调度一致）。
+func TestAdminCatalogFlow_ProviderDisableRequiresRepublish(t *testing.T) {
+	engine := newTestServer(t)
+	ctx := context.Background()
+
+	env := do(t, engine, http.MethodPost, "/admin/providers", map[string]any{
+		"code": "openai", "display_name": "OpenAI", "access_type": "official_api",
+		"reason": "seed",
+	}, http.StatusOK)
+	var providerID string
+	if err := json.Unmarshal(dataField(t, env, "id"), &providerID); err != nil {
+		t.Fatal(err)
+	}
+	var prov struct {
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+	if err := json.Unmarshal(env.Data, &prov); err != nil {
+		t.Fatal(err)
+	}
+
+	do(t, engine, http.MethodPost, "/admin/models", map[string]any{
+		"id": "deepseek-v4", "display_name": "DeepSeek V4",
+		"context_tokens": 128000, "max_output_tokens": 4096,
+		"protocols": []string{"openai_chat"}, "reason": "seed",
+	}, http.StatusOK)
+	env = do(t, engine, http.MethodPost, "/admin/deployments", map[string]any{
+		"provider_id": providerID, "upstream_model": "deepseek-chat",
+		"base_url": "https://primary.example.com/v1", "protocol": "openai_chat", "status": "active",
+		"reason": "seed",
+	}, http.StatusOK)
+	var depID string
+	if err := json.Unmarshal(dataField(t, env, "id"), &depID); err != nil {
+		t.Fatal(err)
+	}
+	do(t, engine, http.MethodPost, "/admin/models/deepseek-v4/routes", map[string]any{
+		"deployment_id": depID, "weight": 1, "enabled": true, "reason": "seed",
+	}, http.StatusOK)
+	do(t, engine, http.MethodPost, "/admin/models/deepseek-v4/lifecycle", map[string]any{
+		"lifecycle": "active", "reason": "onboard",
+	}, http.StatusOK)
+	do(t, engine, http.MethodPost, "/admin/catalog/publish?reason=ship", nil, http.StatusOK)
+
+	svc := publishedCatalogSvc(t)
+	snap, err := svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Sellable("deepseek-v4") {
+		t.Fatal("the published model must be sellable before the provider is disabled")
+	}
+
+	// 停用 provider（草稿编辑，未发布）。
+	do(t, engine, http.MethodPatch, "/admin/providers/"+providerID, map[string]any{
+		"code": "openai", "display_name": "OpenAI", "access_type": "official_api",
+		"status": "disabled", "updated_at": prov.UpdatedAt, "reason": "停用上游",
+	}, http.StatusOK)
+
+	snap, err = svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Sellable("deepseek-v4") {
+		t.Error("a draft provider disable must not change the published snapshot")
+	}
+
+	// 发布后停用生效。
+	do(t, engine, http.MethodPost, "/admin/catalog/publish?reason=disable", nil, http.StatusOK)
+	snap, err = svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Sellable("deepseek-v4") {
+		t.Error("a model served only by a disabled provider must not be sellable")
+	}
+	if len(snap.ActiveDeployments("deepseek-v4")) != 0 {
+		t.Errorf("ActiveDeployments = %+v, want 0（停用 provider 的部署不再是可用部署）",
+			snap.ActiveDeployments("deepseek-v4"))
 	}
 }

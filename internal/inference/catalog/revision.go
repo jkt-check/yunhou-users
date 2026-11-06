@@ -70,10 +70,47 @@ func (s *Snapshot) Model(idOrAlias string) (*domain.Model, bool) {
 	return nil, false
 }
 
+// providerStatusActive is the only provider status that may carry traffic
+// under a published catalog. The DB column is NOT NULL DEFAULT 'active'
+// with a CHECK ('active','disabled'), and the store coerces an empty status
+// to 'active' on insert — so an empty status only ever comes from a
+// hand-built snapshot and is treated as active.
+const providerStatusActive = "active"
+
+// ProviderSchedulable reports whether a provider may carry traffic under
+// this published snapshot. The published catalog is authoritative: a
+// provider that is absent from the snapshot has no published state at all,
+// and a provider whose published status is not "active" is out of
+// rotation — every deployment behind it stops being dispatchable.
+//
+// This is the provider half of the ONE schedulability decision shared by
+// the normal candidate path (routing.Candidates) and the sticky-session
+// path (gateway.pinSessionCandidates): neither may open its own door.
+func (s *Snapshot) ProviderSchedulable(providerID string) bool {
+	p, ok := s.Providers[providerID]
+	if !ok {
+		return false
+	}
+	return p.Status == "" || p.Status == providerStatusActive
+}
+
+// DeploymentSchedulable is the shared "may this deployment take traffic"
+// decision over the published route/provider/deployment state: the
+// deployment must be active AND its provider must be schedulable. A
+// disabled provider takes its deployments out of rotation with it, so an
+// enabled route to a disabled provider's deployment is not a dispatchable
+// route.
+func (s *Snapshot) DeploymentSchedulable(d domain.Deployment) bool {
+	return d.Status == domain.DeploymentActive && s.ProviderSchedulable(d.ProviderID)
+}
+
 // ActiveDeployments returns the deployments serving a model through
 // enabled routes, ordered by route priority then weight. Deployments whose
 // status is not 'active' are skipped: an enabled route to a disabled
-// upstream must not receive traffic.
+// upstream must not receive traffic. Deployments whose provider is not
+// schedulable in this published snapshot are skipped for the same reason —
+// a disabled provider must not receive traffic through any of its
+// deployments.
 func (s *Snapshot) ActiveDeployments(modelID string) []domain.Deployment {
 	routes := s.RoutesByModel[modelID]
 	out := make([]domain.Deployment, 0, len(routes))
@@ -82,7 +119,7 @@ func (s *Snapshot) ActiveDeployments(modelID string) []domain.Deployment {
 			continue
 		}
 		d, ok := s.Deployments[r.DeploymentID]
-		if !ok || d.Status != domain.DeploymentActive {
+		if !ok || !s.DeploymentSchedulable(d) {
 			continue
 		}
 		out = append(out, d)
@@ -309,6 +346,15 @@ func ParseSnapshot(rev *domain.ConfigRevision) (*Snapshot, error) {
 		}
 		if err := ValidateDeployment(&d); err != nil {
 			return nil, fmt.Errorf("catalog: revision %d: %w", rev.Revision, err)
+		}
+		// The published snapshot is authoritative: a deployment whose
+		// provider is not part of the revision has no published provider
+		// state, so it can never be schedulable. Reject the whole revision
+		// instead of loading half a version (same rule as the dangling
+		// route references below).
+		if _, ok := snap.Providers[d.ProviderID]; !ok {
+			return nil, fmt.Errorf("catalog: revision %d: deployment %s references unknown provider %s",
+				rev.Revision, d.ID, d.ProviderID)
 		}
 		snap.Deployments[d.ID] = d
 	}

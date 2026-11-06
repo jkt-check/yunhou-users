@@ -142,9 +142,13 @@ func (f *protoFixture) protocolSnapshot() *catalog.Snapshot {
 		RoutesByModel: map[string][]domain.ModelRoute{},
 	}
 	ctx := context.Background()
-	var prov domain.Provider
-	if err := f.db.Get(&prov, `SELECT * FROM inference_providers WHERE id = $1`, f.provID); err == nil {
-		base.Providers[prov.ID] = prov
+	// The provider must be in the snapshot with its PUBLISHED status — a
+	// published revision always carries every referenced provider, and a
+	// disabled provider takes its deployments out of rotation. Load it
+	// through the store's typed row mapper (domain.Provider has no db
+	// tags, so a raw `SELECT *` into it would silently fail).
+	if p, err := f.store.GetProvider(ctx, f.provID); err == nil {
+		base.Providers[p.ID] = *p
 	}
 	deps, err := f.store.ListDeployments(ctx, domain.DeploymentFilter{})
 	if err != nil {

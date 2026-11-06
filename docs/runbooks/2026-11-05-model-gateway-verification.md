@@ -1345,12 +1345,237 @@ The skip inventory is unchanged: `TestQuotaWorkerProcess`
 
 ### T3 — Provider disable, model state and sticky consistency
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `4439f92` (the T2 branch tip; T0 base
+`35cf836`). Task report:
+`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-3-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`;
+every database-backed command used `-p 1`; `go.mod` / `go.sum` were never
+modified (`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.17 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1, `t3_app`) | **0** | `applied=51 skipped=0` (T2 baseline 51; T3 adds no migration) |
+| 4 | `go run ./cmd/migrate` (run 2, `t3_app`) | **0** | `applied=0 skipped=51` (idempotent) |
+| 5 | `go run ./cmd/migrate -status` | **0** | 51 × `✅` |
+| 6 | `DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate` | **0** | e2e-side DB migrated before the e2e job |
+| 7 | **RED** the 14 new T3 cases against the pristine `4439f92` production code | **1** | the leak reproduced — see §4.18 |
+| 8 | **GREEN** the same 14 cases after the fix | **0** | all T3 cases pass |
+| 9 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/routing ./internal/inference/gateway ./internal/inference/httpapi` | **0** | 4 packages `ok` (5.707s / 1.875s / 9.031s / 62.150s) |
+| 10 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, 1168 PASS / 1 SKIP / 0 FAIL |
+| 11 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 52 PASS / 2 SKIP / 0 FAIL |
+| 12 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t3_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 170.105s` |
+| 13 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 14 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.4%` ≥ the 80% floor (T0 80.4%, T1 80.5%, T2 80.3%) |
+
+#### 4.18 RED evidence (before any production edit)
+
+The 14 new cases were run against the **pristine `4439f92` production tree**
+(a pristine copy of the base commit with only the T3 *test* files copied
+over it — the same "tests in, production out" shape the T2 fix round used
+via `git stash push -- <production files>`). Every failure is a behavioural
+assertion failure, never a compile error.
+
+```
+--- FAIL: TestCandidates_DisabledProviderExcluded (0.00s)
+    service_test.go:476: candidates = [prov-off/acct-off,prov-on/acct-on], want only acct-on (停用的 provider 不得出站)
+--- FAIL: TestCandidates_DisabledProviderOnlyMeansNoCandidates (0.00s)
+    service_test.go:517: candidates = [prov-off/acct-off], want 0 (只有 disabled provider 的模型不可调度)
+--- FAIL: TestCandidates_ProviderAbsentFromSnapshotIsNotSchedulable (0.00s)
+    service_test.go:542: candidates = [prov-gone/acct-gone], want 0 (provider 不在已发布快照里 → 不可调度)
+--- FAIL: TestSnapshot_DisabledProviderRemovesDeploymentAndSellability (0.00s)
+    revision_test.go:275: ActiveDeployments = [dep-off prov-off …, dep-on prov-on …], want only dep-on（停用 provider 的部署不算可用部署）
+--- FAIL: TestParseSnapshot_RejectsDeploymentWithUnknownProvider (0.00s)
+    revision_test.go:300: a deployment referencing an unknown provider must fail the whole parse
+--- FAIL: TestProviderDisableTakesEffectOnlyOnPublish (0.06s)
+    service_test.go:662: a model served only by a disabled provider must not be sellable
+    service_test.go:665: ActiveDeployments = [dep … prov …], want 0（停用 provider 的部署不再是可用部署）
+--- FAIL: TestGateway_DisabledProviderNeverDispatches (0.07s)
+    sticky_candidates_test.go:233: disabled provider received 1 upstream calls, want 0
+    sticky_candidates_test.go:236: active provider received 0 upstream calls, want 1
+--- FAIL: TestGateway_StickyCandidates_DisabledProviderNotDispatched (0.07s)
+    sticky_candidates_test.go:260: a sticky session bound to a disabled provider must not be served
+--- FAIL: TestGateway_StickyCandidates_NewSessionBindsActiveProvider (0.07s)
+    sticky_candidates_test.go:288: disabled provider received 1 upstream calls, want 0
+    sticky_candidates_test.go:291: active provider received 0 upstream calls, want 1
+    sticky_candidates_test.go:298: session bound to <disabled-provider account>, want the active provider's account <other>
+--- FAIL: TestGateway_AliasToDisabledProviderNotDispatched (0.07s)
+    sticky_candidates_test.go:323: disabled provider received 1 upstream calls via alias, want 0
+    sticky_candidates_test.go:326: active provider received 0 upstream calls, want 1
+--- FAIL: TestGateway_DisabledProviderKeepsInFlightRequestAlive (0.11s)
+    gateway_test.go:2559: code = , want upstream_unavailable (停用后的新请求不得出站): <nil>
+--- FAIL: TestAdminCatalogFlow_ProviderDisableRequiresRepublish (0.05s)
+    catalog_test.go:503: a model served only by a disabled provider must not be sellable
+--- FAIL: TestKayaModels_DisabledProviderHidesModel (0.12s)
+    kaya_models_test.go:435: picker = [map[default:true … id:deepseek-chat … provider:deepseek]], want no model（provider 停用后模型没有可用部署）
+```
+
+**Root cause (one defect, four surfaces).** The published snapshot carried
+the provider's `status`, but **nothing ever read it**: `routing.Candidates`
+filtered on `route.Enabled` + `deployment.Status` only, `Snapshot.ActiveDeployments`
+(the model-list projection) did the same, and the sticky branch simply
+narrowed the candidate set the normal path had built. So a provider that
+the operator disabled (`PATCH /admin/providers/:id` → `status=disabled` →
+publish) kept receiving traffic through **every** entry point — normal
+candidates, aliases, sticky sessions and the published model list.
+
+**Protection evidence (already-correct behaviour, recorded instead of a
+forced change).** Two T3 cases passed at the pre-fix baseline and are
+guards, not new behaviour:
+
+| Case | Guard that already held |
+|---|---|
+| `TestLifecycleGate_SnapshotCacheErrorIsNotPermissionDenial` | the gateway pins the snapshot **before** the lifecycle gate (`gateway/service.go` step 1) and maps a snapshot failure to `CodeInternal` — never `CodeModelNotAllowed` / `CodeNotFound`; zero upstream calls, zero request rows, zero ledger rows |
+| `TestLifecycleGate_DefaultModeIsObserve` | `Service.LifecycleGate` still defaults to `LifecycleGateObserve` (zero value); the enforce mode stays opt-in — the T3 change did not touch the lifecycle defaults |
+
+The lifecycle contract itself was already fully pinned by the pre-existing
+cases (`TestLifecycleGateDecision`, `…_Observe_RetiredAllowedAndReported`,
+`…_Observe_DraftAndDeprecatedAllowed`, `…_Enforce_RetiredBlocked`,
+`…_Enforce_DraftBlocked`, `…_Enforce_DeprecatedAllowed`,
+`…_DefaultReporterFallback`, `…_Enforce_ActiveUnaffected`) — all of them
+still pass.
+
+#### 4.19 GREEN evidence
+
+Command #8 (the same 14 cases, production code fixed) — exit code **0**:
+
+```
+--- PASS: TestCandidates_DisabledProviderExcluded (0.00s)
+--- PASS: TestCandidates_DisabledProviderOnlyMeansNoCandidates (0.00s)
+--- PASS: TestCandidates_ProviderAbsentFromSnapshotIsNotSchedulable (0.00s)
+--- PASS: TestSnapshot_DisabledProviderRemovesDeploymentAndSellability (0.00s)
+--- PASS: TestParseSnapshot_RejectsDeploymentWithUnknownProvider (0.00s)
+--- PASS: TestProviderDisableTakesEffectOnlyOnPublish (0.06s)
+--- PASS: TestGateway_DisabledProviderNeverDispatches (0.07s)
+--- PASS: TestGateway_StickyCandidates_DisabledProviderNotDispatched (0.07s)
+--- PASS: TestGateway_StickyCandidates_NewSessionBindsActiveProvider (0.07s)
+--- PASS: TestGateway_AliasToDisabledProviderNotDispatched (0.09s)
+--- PASS: TestGateway_DisabledProviderKeepsInFlightRequestAlive (0.08s)
+--- PASS: TestLifecycleGate_SnapshotCacheErrorIsNotPermissionDenial (0.06s)
+--- PASS: TestLifecycleGate_DefaultModeIsObserve (0.06s)
+--- PASS: TestAdminCatalogFlow_ProviderDisableRequiresRepublish (0.06s)
+--- PASS: TestKayaModels_DisabledProviderHidesModel (0.19s)
+```
+
+Acceptance command #9 — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/catalog	5.707s
+ok  	github.com/yunhou/users/internal/inference/routing	1.875s
+ok  	github.com/yunhou/users/internal/inference/gateway	9.031s
+ok  	github.com/yunhou/users/internal/inference/httpapi	62.150s
+```
+
+CI `go-ci` gate (command #13) — exit code **0**, 33 packages `ok`, 0 `FAIL`,
+including `tests/integration`; coverage floor `total coverage: 80.4%` ≥ 80%.
+
+#### 4.20 Skips
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1` (`quota_concurrency_test.go:773`). The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+
+**Database-test skips: 0** — identical to the T0 (§2.6), T1 (§4.4) and T2
+(§4.12) inventories; grepping the skip lines for `postgres` / `no database`
+/ `database unavailable` returns nothing.
+
+#### 4.21 Migration
+
+**None.** T3 adds no migration: the fix lives entirely in the published
+snapshot's projection (`catalog/revision.go`) and in the candidate selection
+(`routing/service.go`). The disposable databases were migrated with
+`cmd/migrate` exactly as in §2.3 (51 files, idempotent on the second run).
+
+#### 4.22 Files changed
+
+| File | Change |
+|---|---|
+| `internal/inference/catalog/revision.go` | the shared published-state decision: `Snapshot.ProviderSchedulable` (a provider absent from the snapshot, or whose published status is not `active`, is out of rotation) and `Snapshot.DeploymentSchedulable` (deployment active **and** provider schedulable); `ActiveDeployments` uses it, so the model-list projection and the dispatch path agree; `ParseSnapshot` now rejects a deployment that references a provider missing from the revision |
+| `internal/inference/routing/service.go` | `Candidates` filters on `snap.DeploymentSchedulable(d)` instead of `d.Status != domain.DeploymentActive` — the one shared rule for the normal **and** the sticky candidate set |
+| `internal/inference/gateway/service.go` | comments only: the sticky branch narrows the candidate set the normal path built and never re-derives schedulability (no back door) |
+| `internal/inference/routing/service_test.go` | T3 cases: `TestCandidates_DisabledProviderExcluded`, `…_DisabledProviderOnlyMeansNoCandidates`, `…_ProviderAbsentFromSnapshotIsNotSchedulable`; the shared `testSnapshot` helper now registers each deployment's provider as **active** (a published snapshot always carries it) and the fake store counts account-pool queries per provider |
+| `internal/inference/catalog/revision_test.go` | T3 cases: `TestSnapshot_DisabledProviderRemovesDeploymentAndSellability`, `TestParseSnapshot_RejectsDeploymentWithUnknownProvider` |
+| `internal/inference/catalog/service_test.go` | T3 case: `TestProviderDisableTakesEffectOnlyOnPublish` (draft disable ≠ published change) |
+| `internal/inference/gateway/sticky_candidates_test.go` | T3 cases: `TestGateway_DisabledProviderNeverDispatches`, `…_StickyCandidates_DisabledProviderNotDispatched`, `…_StickyCandidates_NewSessionBindsActiveProvider`, `…_AliasToDisabledProviderNotDispatched` + the `addSecondProvider` helper |
+| `internal/inference/gateway/gateway_test.go` | the `withSnapshotSource` fixture option and `TestGateway_DisabledProviderKeepsInFlightRequestAlive` (in-flight request keeps its pinned snapshot) |
+| `internal/inference/gateway/lifecycle_gate_test.go` | T3 cases: `TestLifecycleGate_SnapshotCacheErrorIsNotPermissionDenial`, `TestLifecycleGate_DefaultModeIsObserve` + the `failingSnapshot` stub |
+| `internal/inference/httpapi/kaya_models_test.go` | T3 case: `TestKayaModels_DisabledProviderHidesModel` |
+| `internal/inference/httpapi/catalog_test.go` | T3 case: `TestAdminCatalogFlow_ProviderDisableRequiresRepublish` + the `publishedCatalogSvc` helper |
+| `internal/inference/httpapi/protocol_surfaces_test.go` | **fixture repair** (see §4.23): the hand-built snapshot loaded its provider with a raw `SELECT *` into the untagged `domain.Provider`, which silently failed — the provider was never in the snapshot. It now uses the store's typed row mapper. |
+
+#### 4.23 Notes (root cause, compatibility, honesty)
+
+- **Root cause: the published provider status was carried but never read.**
+  `routing.Candidates` and `Snapshot.ActiveDeployments` both filtered on the
+  route and the deployment only. One shared decision
+  (`Snapshot.DeploymentSchedulable`) now covers **route + provider +
+  deployment**, and both consumers call it — the normal candidate path and
+  the sticky path (which only narrows the candidate set the normal path
+  built, so it inherits the decision by construction).
+- **A disabled provider takes its deployments with it.** An *enabled* route
+  to a disabled provider's deployment is not a dispatchable route: the
+  provider is out of rotation, so every deployment behind it is out too.
+  The other active provider of the same model stays usable — pinned by
+  `TestGateway_DisabledProviderNeverDispatches` and
+  `…_StickyCandidates_NewSessionBindsActiveProvider`.
+- **Model list ⇔ dispatch now agree.** `Sellable` and `ActiveDeployments`
+  use the same rule, so a model whose only provider is disabled is not
+  presented as an available deployment (`/v1/models`, `/chat/models`,
+  `/chat` facade). The list reads the **active revision** directly
+  (`catalog.Service.LoadSnapshot`) while the dispatch path reads the
+  **1s-TTL snapshot cache** — the list is therefore never staler than the
+  dispatch path, and both apply the same rule. The catalogue snapshot
+  cache convention (1s head probe, refresh-failure keeps the last verified
+  snapshot) is **unchanged**.
+- **In-flight requests keep their admission snapshot.** The provider
+  disable is a catalogue-state change, not a live revocation: a request
+  already in flight continues on its pinned snapshot and is **not**
+  force-stopped; only new requests (after the cache refreshes per the
+  existing convention) see the disable. Pinned by
+  `TestGateway_DisabledProviderKeepsInFlightRequestAlive`.
+- **Sticky sessions do not silently switch accounts.** A binding whose
+  account belongs to a disabled provider fails the call with
+  `upstream_unavailable` — the sticky contract still forbids a silent
+  account switch, and a disabled provider is not a transient capacity gap.
+- **Draft edits never touch the running snapshot.** Disabling a provider is
+  a draft edit (`PATCH /admin/providers/:id`); the published revision — and
+  therefore every pinned snapshot — changes only on `publish`. Pinned by
+  `TestProviderDisableTakesEffectOnlyOnPublish` and
+  `TestAdminCatalogFlow_ProviderDisableRequiresRepublish`.
+- **Lifecycle defaults unchanged.** `observe` stays the default,
+  `enforce` stays opt-in, `deprecated` still passes existing traffic, and
+  a cache failure is still an internal failure — never a permission
+  denial. The lifecycle gate itself was **not** modified.
+- **No new dependency, no migration, no client-visible contract change.**
+  No new enum, response field or error shape: the disable surfaces through
+  the **existing** `upstream_unavailable` (HTTP 503) error, which the
+  OpenAPI spec already documents
+  (`docs/api/kaya-coding-plan.openapi.yaml:917`/`:1006`). The OpenAPI
+  spec and the integration guide therefore need **no** update for T3.
+- **One fixture repair, not a behaviour change.** The httpapi
+  protocol-surfaces fixture built a hand-made snapshot whose provider was
+  loaded with a raw `SELECT *` into the untagged `domain.Provider` — sqlx
+  cannot map `display_name`/`access_type` into it, so the read silently
+  failed and the snapshot never carried a provider. That was invisible
+  while nothing consulted the provider; with the shared decision the
+  fixture now loads it through the store's typed row mapper
+  (`store.GetProvider`). No production behaviour depends on it.
+- **Preserved:** the 1s account-pool cache and the 1s entitlement cache
+  (a disabled provider is rejected **before** the account pool is even
+  consulted — the routing test asserts zero account-pool round trips for
+  it), the T1 credential behaviour, the T2 settlement/recovery behaviour,
+  and the settlement transaction boundaries (untouched).
+
 
 ### T4 — PostgreSQL-backed RPM/TPM
 

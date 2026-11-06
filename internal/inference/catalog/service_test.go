@@ -605,3 +605,65 @@ func TestListPublishedModelsNilAccessCheckFailsClosed(t *testing.T) {
 		t.Errorf("nil AccessCheck returned %d models, want none (fail-closed)", len(models))
 	}
 }
+
+// --- T3: provider 停用只在发布后生效（草稿编辑不得影响当前快照） ---
+
+// TestProviderDisableTakesEffectOnlyOnPublish：停用 provider 是草稿编辑，
+// 未发布前不改变已发布快照（发布快照是权威事实源，在途请求 pin 旧快照
+// 天然免疫）；发布后停用生效——该 provider 的部署不再是可用部署，只挂它
+// 的模型不再可售（模型列表与实际调度一致）。
+func TestProviderDisableTakesEffectOnlyOnPublish(t *testing.T) {
+	_, _, svc := testDB(t)
+	ctx := context.Background()
+	seedProviderModelDeployment(t, svc, "glm-4.6")
+	if _, err := svc.Publish(ctx, "op-1"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	snap, err := svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Sellable("glm-4.6") {
+		t.Fatal("the published model must be sellable before the provider is disabled")
+	}
+
+	// 草稿停用（未发布）→ 已发布快照不变。
+	prov, err := svc.GetProviderByCode(ctx, "prov-glm-4-6")
+	if err != nil {
+		t.Fatalf("get provider: %v", err)
+	}
+	prov.Status = "disabled"
+	if err := svc.UpdateProvider(ctx, prov); err != nil {
+		t.Fatalf("disable provider: %v", err)
+	}
+	draft, err := svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draft.Revision != snap.Revision {
+		t.Errorf("snapshot revision changed without publish: %d → %d", snap.Revision, draft.Revision)
+	}
+	if !draft.Sellable("glm-4.6") {
+		t.Error("a draft provider disable must not change the published snapshot")
+	}
+
+	// 发布后停用生效。
+	if _, err := svc.Publish(ctx, "op-2"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	after, err := svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision == snap.Revision {
+		t.Fatalf("revision unchanged after publish: %d", after.Revision)
+	}
+	if after.Sellable("glm-4.6") {
+		t.Error("a model served only by a disabled provider must not be sellable")
+	}
+	if len(after.ActiveDeployments("glm-4.6")) != 0 {
+		t.Errorf("ActiveDeployments = %+v, want 0（停用 provider 的部署不再是可用部署）",
+			after.ActiveDeployments("glm-4.6"))
+	}
+}
+

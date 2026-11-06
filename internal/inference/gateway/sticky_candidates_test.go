@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/providers"
 	"github.com/yunhou/users/internal/inference/routing"
@@ -151,3 +153,177 @@ func TestEstimateInputTokens_ImageParts(t *testing.T) {
 		t.Fatalf("image estimate delta=%d want 1105", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T3 — provider 停用与 sticky 候选一致性
+//
+// sticky 候选必须复用普通候选的同一个「已发布 route/provider/deployment
+// 可调度」判定：被停用的 provider 不得经由 sticky 会话出站，也不得由
+// sticky 分支另开后门；另一个 active provider 仍然可用。
+// ---------------------------------------------------------------------------
+
+// addSecondProvider 给 fixture 追加第二个 provider/deployment/account/route
+// （同一模型、更高 priority），返回新账号 ID。它让测试能证明「停用一个
+// provider 不得停掉整个模型」。
+func addSecondProvider(t *testing.T, f *fixture, up *upstream) string {
+	t.Helper()
+	ctx := context.Background()
+	prov := &domain.Provider{Code: "moonshot", DisplayName: "Moonshot",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}
+	if err := f.store.InsertProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := credentials.NewVault(map[int][]byte{1: []byte("0123456789abcdef0123456789abcdef")}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credSvc := credentials.NewService(vault, f.store, f.store)
+	cv, err := credSvc.Create(ctx, credentials.Operator{UserID: uuid.NewString(), AppID: "test"},
+		prov.ID, "main", "api_key", "sk-second", "seed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct := &domain.UpstreamAccount{ProviderID: prov.ID, CredentialID: cv.ID,
+		Status: domain.AccountActive, ConcurrencyLimit: 4}
+	if err := f.store.InsertUpstreamAccount(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	dep := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "kimi-k2", BaseURL: up.URL,
+		Protocol:       domain.ProtocolOpenAIChat,
+		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second,
+		Status: domain.DeploymentActive,
+	}
+	if err := f.store.InsertDeployment(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+	route := &domain.ModelRoute{ModelID: f.modelID, DeploymentID: dep.ID,
+		Priority: 2, Weight: 1, Enabled: true}
+	if err := f.store.InsertRoute(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+	f.snap.Providers[prov.ID] = *prov
+	f.snap.Deployments[dep.ID] = *dep
+	f.snap.RoutesByModel[f.modelID] = append(f.snap.RoutesByModel[f.modelID], *route)
+	return acct.ID
+}
+
+// disableFixtureProvider 在已发布快照里停用 fixture 自带的 provider。
+func disableFixtureProvider(f *fixture) {
+	prov := f.snap.Providers[f.providerID]
+	prov.Status = "disabled"
+	f.snap.Providers[f.providerID] = prov
+}
+
+// TestGateway_DisabledProviderNeverDispatches：已发布快照里 provider 被
+// 停用后，它的部署不得出站；同一模型的另一个 active provider 仍然可用。
+func TestGateway_DisabledProviderNeverDispatches(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi")); err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	if up1.calls.Load() != 0 {
+		t.Errorf("disabled provider received %d upstream calls, want 0", up1.calls.Load())
+	}
+	if up2.calls.Load() != 1 {
+		t.Errorf("active provider received %d upstream calls, want 1", up2.calls.Load())
+	}
+}
+
+// TestGateway_StickyCandidates_DisabledProviderNotDispatched：sticky 会话
+// 绑在停用 provider 的账号上 → 不得出站；绑定失效也不得静默切到别的账号
+// （sticky 契约：绝不无条件切号续接）。
+func TestGateway_StickyCandidates_DisabledProviderNotDispatched(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	f.gateway.SetSessionBinder(routing.NewSessionBinder(f.store, nil))
+
+	// 会话绑定到 fixture provider（随后被停用）的账号。
+	if err := f.gateway.BindSession(context.Background(), "sess-1", f.modelID, f.accountUpID); err != nil {
+		t.Fatalf("bind session: %v", err)
+	}
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletionsSticky(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"), "sess-1")
+	if err == nil {
+		t.Fatal("a sticky session bound to a disabled provider must not be served")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeUpstreamUnavailable {
+		t.Fatalf("code = %v, want upstream_unavailable（不得伪装成无权限）: %v", code, err)
+	}
+	if up1.calls.Load() != 0 || up2.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d/%d, want 0/0（停用的 provider 不得出站，绑定也不得静默切号）",
+			up1.calls.Load(), up2.calls.Load())
+	}
+}
+
+// TestGateway_StickyCandidates_NewSessionBindsActiveProvider：停用一个
+// provider 后，新会话仍然绑到另一个 active provider 的账号并出站（sticky
+// 与普通候选共用同一个可调度判定，不因 sticky 另开后门）。
+func TestGateway_StickyCandidates_NewSessionBindsActiveProvider(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	acct2 := addSecondProvider(t, f, up2)
+	f.gateway.SetSessionBinder(routing.NewSessionBinder(f.store, nil))
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletionsSticky(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"), "sess-new"); err != nil {
+		t.Fatalf("ChatCompletionsSticky: %v", err)
+	}
+	if up1.calls.Load() != 0 {
+		t.Errorf("disabled provider received %d upstream calls, want 0", up1.calls.Load())
+	}
+	if up2.calls.Load() != 1 {
+		t.Errorf("active provider received %d upstream calls, want 1", up2.calls.Load())
+	}
+	binding, _, err := routing.NewSessionBinder(f.store, nil).Resolve(context.Background(), "sess-new", f.modelID)
+	if err != nil {
+		t.Fatalf("resolve binding: %v", err)
+	}
+	if binding.AccountID != acct2 {
+		t.Errorf("session bound to %s, want the active provider's account %s", binding.AccountID, acct2)
+	}
+}
+
+// TestGateway_AliasToDisabledProviderNotDispatched：模型别名解析到同一个
+// 模型 → 停用的 provider 不得经由别名出站，另一个 active provider 仍可用。
+func TestGateway_AliasToDisabledProviderNotDispatched(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	// 别名指向同一个模型（发布快照里的 aliases）。
+	m := f.snap.Models[f.modelID]
+	m.Aliases = []string{"glm-latest"}
+	f.snap.Models[f.modelID] = m
+	disableFixtureProvider(f)
+
+	req := chatReq(false, "hi")
+	req.Model = "glm-latest"
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, req); err != nil {
+		t.Fatalf("ChatCompletions (alias): %v", err)
+	}
+	if up1.calls.Load() != 0 {
+		t.Errorf("disabled provider received %d upstream calls via alias, want 0", up1.calls.Load())
+	}
+	if up2.calls.Load() != 1 {
+		t.Errorf("active provider received %d upstream calls, want 1", up2.calls.Load())
+	}
+}
+

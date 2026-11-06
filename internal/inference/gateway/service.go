@@ -444,6 +444,12 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	}
 	// Sticky session: narrow the candidate set to the bound account (Task
 	// 13). Failures here release the reservation — no upstream spend.
+	//
+	// The sticky path narrows the SAME candidate set the normal path built
+	// — it never re-derives "is this deployment schedulable?" on its own,
+	// so a disabled provider cannot be reached through a session binding
+	// either. The refresh closure below re-runs the very same
+	// routing.Candidates decision against the SAME pinned snapshot.
 	if sessionKey != "" {
 		// 迁移冲突时候选集可能来自 routing 的 1s TTL 账号缓存（过期快照里
 		// 的账号在库里已失效）——驱逐相关 provider 缓存并绕过缓存重建一次。
@@ -534,6 +540,14 @@ func (s *Service) admitWallet(ctx context.Context, request domain.Request, ent d
 //     explicit Migrate to the first candidate (同事务终止旧绑定+建新), never
 //     a silent account switch. The protocol layer carries the full
 //     transcript, so the migration IS the protocol-level session rebuild.
+//
+// cands is the candidate set the normal path already built, so the
+// published route/provider/deployment schedulability decision is shared
+// (a disabled provider is absent from it) — the sticky branch opens no
+// door of its own. A binding whose account left the candidate set fails the
+// call with upstream_unavailable: a disabled provider is not a transient
+// capacity gap, and the sticky contract still forbids a silent account
+// switch.
 //
 // refreshCandidates 在迁移目标被库里判定不可调度（Migrate CodeConflict）时
 // 调用一次：候选集可能来自 routing 的 1s TTL 账号缓存（绕过应用层的账号

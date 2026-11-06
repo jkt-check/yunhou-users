@@ -148,6 +148,9 @@ type fixture struct {
 	// zeroPrice pins the customer price list to all-zero rates (a legal
 	// 0-price model: 预占额 0，结算 charge 0，账本/用量/终态照常).
 	zeroPrice bool
+	// snapshotSourceFn replaces the gateway's snapshot source (快照切换 /
+	// 缓存故障路径); nil = the fixture's own static snapshot.
+	snapshotSourceFn func(f *fixture) SnapshotSource
 }
 
 // withNoWindows pins the policy to NO monetary window: the entitlement
@@ -170,6 +173,14 @@ func withModelLifecycle(lc domain.Lifecycle) fixtureOpt {
 // (empty slice = undeclared, the default-on path).
 func withModelInputModalities(mods []string) fixtureOpt {
 	return func(f *fixture) { f.modelInputModalities, f.modelModalitiesOverride = mods, true }
+}
+
+// withSnapshotSource replaces the gateway's snapshot source. The factory
+// runs AFTER the fixture's snapshot exists, so a test can hand back a
+// mutable source (快照切换 / 缓存故障路径). The default is the fixture's
+// own static snapshot.
+func withSnapshotSource(fn func(f *fixture) SnapshotSource) fixtureOpt {
+	return func(f *fixture) { f.snapshotSourceFn = fn }
 }
 
 type fixtureOpt func(f *fixture)
@@ -429,7 +440,11 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 	f.routing = routing.NewService(store, adapters, nil)
 	quotaSvc := quota.NewService(store, nil)
 	entResolver := access.NewEntitlementResolver(store, nil)
-	f.gateway = NewService(&staticSnapshot{f.snap}, store, entResolver, quotaSvc, f.routing,
+	var snapSrc SnapshotSource = &staticSnapshot{f.snap}
+	if f.snapshotSourceFn != nil {
+		snapSrc = f.snapshotSourceFn(f)
+	}
+	f.gateway = NewService(snapSrc, store, entResolver, quotaSvc, f.routing,
 		credSvc, providers.NewHTTPClient(egress), egress, nil)
 	return f
 }
@@ -2463,5 +2478,87 @@ func TestGateway_ConsistentDuplicateSettleIsIdempotent(t *testing.T) {
 	status, _, _, settled = f.requestRow(t, out.RequestID)
 	if status != "settled" || settled != 20 {
 		t.Errorf("request = %s/%d, want settled/20", status, settled)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T3 — provider 停用：在途固定快照与新请求的生效边界
+// ---------------------------------------------------------------------------
+
+// mutableSnapshot 是可切换的快照源（模拟目录快照缓存刷新：一次调用 pin
+// 一个快照，新快照只对新请求生效）。
+type mutableSnapshot struct {
+	mu   sync.RWMutex
+	snap *catalog.Snapshot
+}
+
+func (m *mutableSnapshot) Current(context.Context) (*catalog.Snapshot, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.snap, nil
+}
+
+func (m *mutableSnapshot) set(s *catalog.Snapshot) {
+	m.mu.Lock()
+	m.snap = s
+	m.mu.Unlock()
+}
+
+// TestGateway_DisabledProviderKeepsInFlightRequestAlive：provider 停用是
+// 目录态变更，不是实时撤销在途请求——已在途的调用继续按准入快照跑完
+// （不强停旧流）；停用发布后的新请求不再出站到该 provider。
+func TestGateway_DisabledProviderKeepsInFlightRequestAlive(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		once.Do(func() { close(entered) })
+		<-release
+		completionHandler(w, r, body)
+	})
+	var src *mutableSnapshot
+	f := newFixture(t, up, withSnapshotSource(func(f *fixture) SnapshotSource {
+		src = &mutableSnapshot{snap: f.snap}
+		return src
+	}))
+
+	// 在途请求：上游已收到调用但尚未返回。
+	done := make(chan error, 1)
+	go func() {
+		p, key := f.principal()
+		_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+			domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+		done <- err
+	}()
+	<-entered
+
+	// 下一份已发布快照：provider 被停用（新 map，不影响已 pin 的旧快照）。
+	next := *f.snap
+	next.Providers = make(map[string]domain.Provider, len(f.snap.Providers))
+	for id, p := range f.snap.Providers {
+		next.Providers[id] = p
+	}
+	prov := next.Providers[f.providerID]
+	prov.Status = "disabled"
+	next.Providers[f.providerID] = prov
+	src.set(&next)
+	close(release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("the in-flight request must not be force-stopped by a provider disable: %v", err)
+	}
+	if up.calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", up.calls.Load())
+	}
+
+	// 新请求看到停用后的快照 → 不得再出站到该 provider。
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if domain.CodeOf(err) != domain.CodeUpstreamUnavailable {
+		t.Fatalf("code = %v, want upstream_unavailable (停用后的新请求不得出站): %v", domain.CodeOf(err), err)
+	}
+	if up.calls.Load() != 1 {
+		t.Errorf("upstream calls = %d, want 1 (新请求不得再打到已停用的 provider)", up.calls.Load())
 	}
 }

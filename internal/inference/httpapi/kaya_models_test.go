@@ -317,3 +317,122 @@ func TestKayaModels_ListInputModalities(t *testing.T) {
 		t.Errorf("input_modalities = %v, want [text image]", mods)
 	}
 }
+
+// T3：只有 disabled provider 的模型不得被当作可用部署展示；草稿停用未
+// 发布前不影响当前快照（发布快照是权威事实源）。模型列表的可用性必须与
+// 实际调度一致——列表里有的模型必须真的有可用部署。
+func TestKayaModels_DisabledProviderHidesModel(t *testing.T) {
+	f := newAccessFixture(t, 0)
+	store := f.store
+	ctx := context.Background()
+
+	catalogSvc := catalog.NewService(store)
+	if err := store.InsertModel(ctx, &domain.Model{
+		ID: "deepseek-chat", DisplayName: "DeepSeek Chat", Lifecycle: domain.LifecycleActive,
+		ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols:       []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolKayaChat},
+		InputModalities: []string{"text"}, OutputModalities: []string{"text"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prov := &domain.Provider{Code: "deepseek", DisplayName: "DeepSeek",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}
+	if err := store.InsertProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	dep := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "ds-up", BaseURL: "https://api.deepseek.example.com",
+		Protocol: domain.ProtocolOpenAIChat, ConnectTimeout: time.Second, RequestTimeout: time.Second,
+		Status: domain.DeploymentActive,
+	}
+	if err := store.InsertDeployment(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRoute(ctx, &domain.ModelRoute{
+		ModelID: "deepseek-chat", DeploymentID: dep.ID, Weight: 1, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	catalogSvc.SetPriceCheck(func(ctx context.Context, id string) (bool, error) { return true, nil })
+	if _, err := catalogSvc.Publish(ctx, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := access.NewResolver(store, nil)
+	cache := catalog.NewSnapshotCache(store, func(error) {})
+	engine := gin.New()
+	engine.GET("/chat/models", func(c *gin.Context) {
+		c.Set(middleware.ContextUserID, c.GetHeader("X-Test-User"))
+		c.Next()
+	}, httpapi.NewKayaModelsHandler(catalogSvc, resolver, cache, "deepseek-chat").List)
+
+	call := func(userID string) (int, []map[string]any) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/chat/models", nil)
+		req.Header.Set("X-Test-User", userID)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		var env struct {
+			Code int `json:"code"`
+			Data struct {
+				Models []map[string]any `json:"models"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v (%s)", err, w.Body.String())
+		}
+		return w.Code, env.Data.Models
+	}
+
+	// 有权益的用户。
+	userID, _ := f.addUser(t)
+	acct, err := store.EnsureBillingAccount(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := &postgres.PolicyVersion{
+		Name: "kaya-gift", Revision: 1, ModelIDs: []string{"deepseek-chat"},
+		FiveHourLimit: microP(1_000), WeeklyLimit: microP(2_000), MonthlyLimit: microP(3_000),
+	}
+	if err := store.InsertPolicyVersion(ctx, pol); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	if err := store.InsertEntitlement(ctx, &domain.Entitlement{
+		BillingAccountID: acct.ID, SourceType: domain.SourceGrant,
+		SourceID: "gift-" + uuid.NewString(), ModelIDs: []string{"deepseek-chat"},
+		PolicyVersionID: pol.ID, AnchorAt: now, EffectiveFrom: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// ① 已发布且 provider active → 模型可见。
+	code, models := call(userID)
+	if code != http.StatusOK || len(models) != 1 {
+		t.Fatalf("picker = %d %v, want the entitled model", code, models)
+	}
+
+	// ② 草稿停用 provider（未发布）→ 当前已发布快照不变，模型仍然可见。
+	prov.Status = "disabled"
+	if err := store.UpdateProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	code, models = call(userID)
+	if code != http.StatusOK || len(models) != 1 {
+		t.Fatalf("picker after the draft disable = %d %v, want the model still visible（草稿编辑不影响当前快照）", code, models)
+	}
+
+	// ③ 发布后停用生效 → 模型不再被展示（只有 disabled provider 的模型
+	// 不得被当作可用部署）。
+	if _, err := catalogSvc.Publish(ctx, "test-disable"); err != nil {
+		t.Fatal(err)
+	}
+	code, models = call(userID)
+	if code != http.StatusOK {
+		t.Fatalf("picker = %d, want 200", code)
+	}
+	if len(models) != 0 {
+		t.Errorf("picker = %v, want no model（provider 停用后模型没有可用部署）", models)
+	}
+}
+

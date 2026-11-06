@@ -124,10 +124,16 @@ func (s *Service) AdapterFor(p domain.Protocol) (providers.Adapter, bool) {
 //
 //   - the route is enabled and its capability list covers the call's needs
 //     (an empty capability list means "everything the model supports");
-//   - the deployment is active, its protocol has a registered adapter, and
-//     the adapter supports the call's needs (能力不兼容的部署不参与选择);
+//   - the deployment is active, its provider is schedulable in the pinned
+//     published snapshot, its protocol has a registered adapter, and the
+//     adapter supports the call's needs (能力不兼容的部署不参与选择);
 //   - the deployment's provider has at least one active, non-cooling
 //     account.
+//
+// The route/provider/deployment half of that decision is the snapshot's
+// single shared rule (catalog.Snapshot.DeploymentSchedulable) — the sticky
+// path narrows THIS candidate set, it never re-derives schedulability on
+// its own.
 //
 // An empty result means upstream_unavailable — never silently route to an
 // incompatible deployment.
@@ -158,7 +164,12 @@ func (s *Service) candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 			continue
 		}
 		d, ok := snap.Deployments[route.DeploymentID]
-		if !ok || d.Status != domain.DeploymentActive {
+		// The shared published-state decision: the deployment must be
+		// active AND its provider must be schedulable in this snapshot.
+		// A disabled provider takes every deployment behind it out of
+		// rotation — the route stays enabled, but it is not a dispatchable
+		// route.
+		if !ok || !snap.DeploymentSchedulable(d) {
 			continue
 		}
 		adapter, ok := s.adapters[d.Protocol]

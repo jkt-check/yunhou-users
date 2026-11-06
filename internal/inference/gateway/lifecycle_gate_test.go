@@ -333,4 +333,3 @@ func TestLifecycleGate_DefaultModeIsObserve(t *testing.T) {
 		t.Errorf("enforce.String() = %q, want %q", LifecycleGateEnforce.String(), "enforce")
 	}
 }
-

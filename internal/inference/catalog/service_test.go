@@ -666,4 +666,3 @@ func TestProviderDisableTakesEffectOnlyOnPublish(t *testing.T) {
 			after.ActiveDeployments("glm-4.6"))
 	}
 }
-

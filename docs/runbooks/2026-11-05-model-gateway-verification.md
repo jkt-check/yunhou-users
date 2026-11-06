@@ -2684,10 +2684,41 @@ never modified (`git diff --stat go.mod go.sum` → empty after every run).
 | 8 | **GREEN** `go test -count=1 -run 'TestAdmitQuotaExceeded' -v ./internal/inference/quota` | **0** | the Key-budget probe cases pass |
 | 9 | **GREEN** `go test -count=1 -run 'TestChatHandler_LocalLimitEnvelope' -v ./internal/handler` | **0** | the `/chat` envelope case passes |
 | 10 | **GREEN** `DATABASE_URL=<disposable> go test -count=1 -run 'TestV1AuthChain_NativeErrorShapePerEntrypoint' -v ./internal/inference/httpapi` | **0** | the auth chain's native shape per entrypoint passes |
-| 11 | **acceptance（任务书原文）** `go test -race -count=1 -p 1 ./internal/middleware ./internal/router ./internal/inference/httpapi ./internal/service` | **0** | 4 packages `ok` (13.119s / 2.979s / 75.317s / 25.596s) |
+| 11 | **acceptance（任务书原文）** `go test -race -count=1 -p 1 ./internal/middleware ./internal/router ./internal/inference/httpapi ./internal/service` | **0** | 4 packages `ok` (13.119s / 2.979s / 75.317s / 25.596s) — and re-run on the **committed** tree in the resumed session: exit **0** (router 3.318s / httpapi 68.150s / service 29.549s); see §4.24.1 |
 | 12 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
 | 13 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T5 80.2%, T4 80.1%, T3 80.4%, T0 80.4%) |
 | 14 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t6_e2e`) | **1** → **0** | the `go-e2e` job found ONE contract conflict — the facade's money-quota 429 still wore the upstream wording (§4.25.5); after the deliberate contract update it is green |
+
+#### 4.24.1 Run provenance — T6 ran across two sessions
+
+T6 was implemented across **two sessions**: the first was cut off by a usage
+limit (2056) **before** the commit, the second resumed it. This note records
+which session produced which evidence, so that no result is attributed to a
+command that did not run.
+
+| Phase | Session | What actually ran | Result |
+|---|---|---|---|
+| RED | A (interrupted) | `go test -count=1 -run 'TestSetup_V1PeripheralRateLimitUsesProtocolNativeError' -v ./internal/router`; `go test -count=1 -run 'TestMapGatewayError' -v ./internal/service`; `DATABASE_URL=<disposable> go test -count=1 -run 'TestV1ProtocolMatrix' -v ./internal/inference/httpapi` | exit **1** each — the behavioural failures of §4.25 (the DB-backed run on a fresh trap-cleaned disposable PostgreSQL) |
+| GREEN (targeted) | A | the same three commands after the fix, plus `TestAdmitQuotaExceeded*` (quota), `TestChatHandler_LocalLimitEnvelope` (handler) and `TestV1AuthChain_NativeErrorShapePerEntrypoint` (httpapi) | exit **0** each |
+| acceptance | A | `go test -race -count=1 -p 1 ./internal/middleware ./internal/router ./internal/inference/httpapi ./internal/service` — on the tree that already carried **every** production change | exit **0** (4 packages `ok`) |
+| CI gate (1st) | A | `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | exit **0**, 33 packages `ok`, coverage **80.2%** |
+| `go-e2e` (1st + diagnostic) | A | `go test -race -count=1 ./tests/e2e/...`, then the same with `-v` and a full log | exit **1** — the client-contract conflict of §4.25.5; the diagnostic run confirmed **exactly one** failing test (`TestChatContract_FacadeQuotaExceededIs429`), the rest of the suite passed |
+| **interruption** | — | the usage limit stopped the session **before** the commit: the contract conflict was diagnosed but **not yet fixed**, and the final tree's CI / e2e completion was **not** confirmed at that point | — |
+| contract update | B (resumed) | `tests/e2e/chat_gateway_test.go` expectation updated (§4.25.5) | — |
+| `go-e2e` (final) | B | `go test -race -count=1 ./tests/e2e/...` on the **final** tree | exit **0**, `ok … tests/e2e 286.763s` |
+| CI gate (final) | B | the same `go-ci` command on the **final** tree (the only later edits were a comment inside a test file and documentation) | exit **0**, 33 packages `ok`, coverage **80.3%** |
+| acceptance (final) | B | the exact acceptance command on the **committed** tree | exit **0** (router 3.318s / httpapi 68.150s / service 29.549s) |
+| post-commit targeted | B | `go test -race -count=1 -run 'TestV1ProtocolMatrix|TestV1AuthChain' ./internal/inference/httpapi` and `go test -race -count=1 -run 'TestSetup_V1PeripheralRateLimitUsesProtocolNativeError' ./internal/router` on the committed tree | exit **0** each |
+| migrate idempotency | A + B | `go run ./cmd/migrate` twice per disposable instance | exit **0**, `applied=52 skipped=0` → `applied=0 skipped=52` |
+| lint / build | A + B | `go vet ./internal/... ./cmd/...`, `go build ./...` | exit **0** |
+
+**What is *not* claimed.** The pre-interruption session's numbers above are
+the ones it actually printed; the final tree's numbers are the ones session B
+produced after the contract update. No pre-interruption command is reported
+as having completed on the final tree, and the final acceptance invocation
+on the committed tree **was** actually re-run (row "acceptance (final)"), so
+the committed state is verified by the acceptance command itself, by the
+final CI gate, by the `go-e2e` job and by the post-commit targeted cases.
 
 #### 4.25 RED evidence (before any production edit)
 
@@ -2823,8 +2854,14 @@ updated to match. What did **not** change:
   byte-identical, and `caseChatContractUpstreamErrors/upstream_rate_limited`
   (which runs for the legacy **and** the facade backend) still pins it;
 - the legacy backend entirely;
-- every other facade limit class (the pre-existing upstream-429 path is the
-  only one the facade shares with legacy).
+- the upstream-429 path — the only error class the facade shares with the
+  legacy backend.
+
+**Scope of the change.** The e2e conflict is about the *wording* of the
+facade's **money-quota** class. The facade's local-limit classes changed
+**four** in total — `rate_limited`, `insufficient_capacity`,
+`quota_exceeded` (message only) and `insufficient_balance` (which also
+moved from a generic **502** to **429**); the full table is in §4.31.
 
 The integration guide's `/chat` error table was updated in the same change
 (§4.30), so the documentation now matches the code: the message
@@ -2969,15 +3006,28 @@ there since migration 025. The disposable databases were migrated with
   is unchanged.
 - **Compatibility.** No new response field, no new enum, no migration, no new
   dependency. The `/v1` perimeter 429 changes shape (it was unparseable by
-  any OpenAI/Anthropic SDK before); the `/chat` message wording changes for
-  the local-limit classes only (the upstream 429 wording is byte-identical to
-  legacy, in both backends); the envelope shape `{code,data,message}` and
-  the status codes are unchanged. **The one client-visible wording change is
-  deliberate and documented** (§4.25.5): a `/chat` money-quota rejection now
-  says `chat request rejected by a usage limit (quota_exceeded)` instead of
-  claiming an upstream rate limit — the request never left, and the old
-  wording invited a retry loop that can never succeed. The integration
-  guide's `/chat` error table was updated in the same change.
+  any OpenAI/Anthropic SDK before); the envelope shape `{code,data,message}`
+  is unchanged everywhere. **The `/chat` client-visible change set is four
+  facade classes** — all of them *local* limits whose request never left:
+
+  | business code | before | after | kind of change |
+  |---|---|---|---|
+  | `rate_limited` (business RPM/TPM) | 429 `chat upstream rate limit exceeded` | 429 `chat request rejected by a usage limit (rate_limited)` | **message only** (status unchanged) |
+  | `insufficient_capacity` (concurrency cap) | 429 `chat upstream rate limit exceeded` | 429 `chat request rejected by a usage limit (insufficient_capacity)` | **message only** (status unchanged) |
+  | `quota_exceeded` (money quota / Key budget) | 429 `chat upstream rate limit exceeded` | 429 `chat request rejected by a usage limit (quota_exceeded)` | **message only** (status unchanged) |
+  | `insufficient_balance` (balance / spend cap) | **502** `chat upstream error` | **429** `chat request rejected by a usage limit (insufficient_balance)` | **status 502 → 429 AND message** |
+
+  The upstream 429 wording (`chat upstream rate limit exceeded`) is
+  byte-identical, in the legacy **and** the facade backend, and every other
+  `/chat` message is unchanged. The 502 → 429 of `insufficient_balance` is
+  the **only** status-code change: it used to fall through to the generic
+  `default` branch (502), which is exactly what "不能全部降为 generic 502"
+  forbids. Only the `quota_exceeded` row had a byte-exact e2e contract
+  (`TestChatContract_FacadeQuotaExceededIs429`, updated in §4.25.5); the
+  other three rows had no byte-exact contract, but their existing wording was
+  still rewritten — so the change set is **four classes**, not one. The
+  integration guide's `/chat` error table was updated in the same change
+  (all four rows).
 - **The Anthropic native shape has no `code` field** — the business class is
   carried by `error.message` there. The OpenAPI previously described the
   three codes as if they were a `code` field; the document now matches the

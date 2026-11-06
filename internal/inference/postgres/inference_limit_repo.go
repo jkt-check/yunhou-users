@@ -275,40 +275,81 @@ func (s *Store) releaseRateTx(ctx context.Context, tx *sqlx.Tx, requestID string
 	return nil
 }
 
-// CorrectRateTokensTx applies a settlement correction to the request's
-// rate reservation:
+// CorrectRateTokensTx corrects ONLY the token budget of an already settled
+// request (the rate-side half of a settlement correction). It takes the
+// ABSOLUTE corrected token total; the storage effect is a NET DELTA — the
+// row keeps ONE authoritative total (never an accumulation across usage
+// revisions) and the ORIGINAL settlement instant is kept, so a correction
+// never resets the 60-second window attribution.
 //
-//   - the token total is REPLACED by the corrected total — the net delta
-//     of THIS request, never an accumulation across usage revisions;
-//   - the ORIGINAL settlement instant is kept: a correction never resets
-//     the 60-second window attribution, so correcting a request that
-//     settled outside the window does not create consumption in the
-//     current minute;
-//   - idempotent: applying the same correction twice leaves the same
-//     total.
+// A MISSING rate row is a BENIGN absence, not an anomaly: the request may
+// predate migration 052, or its terminal row may have been purged by the
+// retention sweep. The money correction still applies.
 //
-// This is the rate-side counterpart of the money-side correction (the
-// ledger correction itself stays in the reconciliation flow).
+// The money correction and this one belong in the SAME transaction — see
+// Store.CorrectSettlement, which calls the shared core below.
 func (s *Store) CorrectRateTokensTx(ctx context.Context, w domain.UnitOfWork, requestID string, correctedTokens int64) error {
 	tx, err := sqlTx(w)
 	if err != nil {
 		return err
 	}
+	return s.correctRateTokensTx(ctx, tx, requestID, correctedTokens)
+}
+
+// correctRateTokensTx is the shared core of the token-budget correction
+// (the exported method and the money correction use the same transaction).
+//
+//   - the token total is REPLACED by the corrected absolute total — the net
+//     delta of THIS request, never an accumulation across usage revisions;
+//   - the ORIGINAL settlement instant is kept: a correction never resets the
+//     60-second window attribution, so correcting a request that settled
+//     outside the window does not create consumption in the current minute;
+//   - idempotent: applying the same correction twice leaves the same total;
+//   - a MISSING rate row is a benign absence (pre-052 request / retention
+//     purge) and leaves the money correction untouched;
+//   - a row that IS present but malformed (not settled, or a key row
+//     without its account row) is an anomaly and fails loudly — it must
+//     never be mistaken for a benign absence.
+func (s *Store) correctRateTokensTx(ctx context.Context, tx *sqlx.Tx, requestID string, correctedTokens int64) error {
 	if correctedTokens < 0 {
 		return domain.WrapError(domain.CodeInvalidInput,
-			"rate: corrected token total must be >= 0", domain.ErrNegativeValue)
+			"correction: the corrected token total must be >= 0", domain.ErrNegativeValue)
 	}
-	res, err := tx.ExecContext(ctx,
+	var state string
+	err := tx.QueryRowxContext(ctx,
+		`SELECT state FROM inference_rate_reservations
+		 WHERE request_id = $1 AND scope = 'account' FOR UPDATE`, requestID).Scan(&state)
+	switch {
+	case err == nil:
+	case errors.Is(err, sql.ErrNoRows):
+		// Benign absence — but a key row without its account row is drift
+		// (the two rows are written together): that must NOT be mistaken
+		// for a benign absence.
+		var keyRows int
+		if qerr := tx.QueryRowxContext(ctx,
+			`SELECT COUNT(*) FROM inference_rate_reservations
+			 WHERE request_id = $1 AND scope = 'key'`, requestID).Scan(&keyRows); qerr != nil {
+			return mapError("correction: rate key rows", qerr)
+		}
+		if keyRows > 0 {
+			return domain.NewError(domain.CodeConflict,
+				"correction: the request has a key rate reservation but no account one (rate row drift)")
+		}
+		return nil
+	default:
+		return mapError("correction: rate row", err)
+	}
+	if state != "settled" {
+		return domain.NewError(domain.CodeConflict,
+			"correction: the rate reservation is not settled ("+state+
+				") — the token total cannot be corrected")
+	}
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE inference_rate_reservations
 		 SET settled_tokens = $2
 		 WHERE request_id = $1 AND scope = 'account' AND state = 'settled'`,
-		requestID, correctedTokens)
-	if err != nil {
-		return rateStoreError("rate: correct tokens", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return domain.NewError(domain.CodeConflict,
-			"rate: no settled rate reservation to correct")
+		requestID, correctedTokens); err != nil {
+		return mapError("correction: rate tokens", err)
 	}
 	return nil
 }

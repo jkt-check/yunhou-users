@@ -167,7 +167,9 @@ type RateLimitError struct { Detail *Error; Blocks []RateBlock; RetryAfterSecond
 // internal/inference/access/inference_limits.go —— 纯规则（无数据库、无时钟）
 const RateWindowSeconds = 60
 func NormalizedTokens(b domain.UsageBuckets) int64
+func KnownTokenBuckets(b domain.UsageBuckets) bool // 归一化口径是否有已知 token 量（unknown ≠ 0）
 func EvaluateRateLimits(limits domain.RateLimits, usage domain.RateUsage, reservedTokens int64) *domain.RateLimitError
+func RecoverySeconds(blocks []domain.RateBlock) int // 只有每个阻断约束都有可确定恢复时刻才给倒计时
 
 // internal/inference/postgres/inference_limit_repo.go —— 短事务存储（全部显式接收 UnitOfWork）
 func (s *Store) ReserveRateTx(ctx context.Context, w domain.UnitOfWork, cmd domain.RateReserveCommand) error
@@ -176,6 +178,22 @@ func (s *Store) PurgeRateReservations(ctx context.Context, cutoff time.Time) (in
 // 结算/释放与终态事务同事务生效（内部同包调用）：
 func (s *Store) settleRateTx(ctx context.Context, tx *sqlx.Tx, requestID string, tokens int64) error
 func (s *Store) releaseRateTx(ctx context.Context, tx *sqlx.Tx, requestID string) error
+// 修正的共享内核（金额修正与独立速率修正共用；同一个 *sqlx.Tx）：
+func (s *Store) correctRateTokensTx(ctx context.Context, tx *sqlx.Tx, requestID string, correctedTokens int64) error
+
+// internal/inference/postgres/reconciliation_repo.go —— 金额修正契约（与 token 预算同一个事务）
+type CorrectionCommand struct {
+	RequestID string
+	Corrected domain.UsageRecord // 修正后的用量事实（归一化桶）
+	CorrectedMicros domain.Microcredit
+	// CorrectedTokens 是**绝对**修正后的归一化 token 总量（nil = 修正证据
+	// 没有已知 token 量 → token 预算保留原值，绝不记零）。存储效果是净差额
+	// （行上只有一个权威总量），原结算时刻不动。
+	CorrectedTokens *int64
+	Reason, OperatorSubject, IdempotencyKey string
+	At time.Time
+}
+func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd CorrectionCommand) error
 
 // internal/inference/quota/service.go —— 准入编排（速率闸门与金额/并发预占同一事务）
 type Store interface { /* … */ ReserveRateTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.RateReserveCommand) error }
@@ -197,6 +215,17 @@ func (r *RateReservationReaper) RunPass(ctx context.Context) (int64, error)
 `workers/settlement_recovery.go` 无需改动 —— 速率行的结算/释放挂在 store 的
 `Settle`/`Release` 事务里，恢复 worker 的保守结算与证据释放因此自动收敛同一份
 速率预占；保留期清理独立成 `workers/rate_reservation_reaper.go`。
+
+**修正通道的接线（T4 修复轮）：** `postgres.CorrectionCommand` 增加
+`CorrectedTokens *int64`（**绝对**修正后的归一化 token 总量；nil = 未知 →
+token 预算保留原值，绝不记零），`Store.CorrectSettlement` 在**同一个事务**里
+同时做金额修正与 token 预算修正（`correctRateTokensTx`）：修正证据带了已知
+token 桶却没给总量 → 明确 `invalid_input`（金额修正不得静默漏掉 token 预算）；
+速率行**缺失**（迁移前老请求 / 保留期已清理）→ 良性缺席，金额修正照常生效；
+速率行**存在但畸形**（已结算请求的速率行仍是在途；只剩 Key 行没有账户行）→
+明确冲突，绝不当成良性缺席。已知边界（本期不扩大）：wallet 计费请求的修正仍
+被显式拒绝（`invalid_input`，micromoney 单位与钱包补偿分录未适配），因此钱包
+请求的 token 预算暂不经这条通道修正；金额修正通道仍无生产调用方。
 
 **确定语义：**
 

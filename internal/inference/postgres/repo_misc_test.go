@@ -54,6 +54,9 @@ func TestCorrectSettlement_ReversalAndDelta(t *testing.T) {
 	}
 
 	// 修正到 40_000：冲正 60_000 + 补差 −20_000；窗口 used 60_000→40_000。
+	// 修正后的归一化 token 总量（800+200）随金额一起被修正（T4：钱与 token
+	// 预算同一个事务）。
+	correctedTokens := int64(1000)
 	correct := func(key string) error {
 		uow, err := s.Begin(ctx)
 		if err != nil {
@@ -65,7 +68,8 @@ func TestCorrectSettlement_ReversalAndDelta(t *testing.T) {
 				RequestID: adm.RequestID, AttemptID: attemptID, Source: domain.UsageReported,
 				Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
 			},
-			CorrectedMicros: 40_000, Reason: "上游账单核对后下调",
+			CorrectedMicros: 40_000, CorrectedTokens: &correctedTokens,
+			Reason:          "上游账单核对后下调",
 			OperatorSubject: "user:ops@app:test", IdempotencyKey: key,
 		})
 		if err != nil {
@@ -119,7 +123,8 @@ func TestCorrectSettlement_ReversalAndDelta(t *testing.T) {
 				RequestID: adm.RequestID, AttemptID: attemptID, Source: domain.UsageReported,
 				Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
 			},
-			CorrectedMicros: 0, Reason: "确认未执行",
+			CorrectedMicros: 0, CorrectedTokens: &correctedTokens,
+			Reason:          "确认未执行",
 			OperatorSubject: "user:ops@app:test", IdempotencyKey: "corr-void-1",
 		})
 		if err != nil {

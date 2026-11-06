@@ -412,13 +412,15 @@ func TestCorrectSettlementDebitPreservesHistory(t *testing.T) {
 	reqID, attID := settledRequest(t, s, f, w5, ww, wm, 100_000, 60_000)
 	uow, _ := s.Begin(ctx)
 	in, out := int64(30), int64(12)
+	correctedTokens := in + out
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
 		Corrected: domain.UsageRecord{
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
 		},
-		CorrectedMicros: 95_000, Reason: "provider invoice arrived",
+		CorrectedMicros: 95_000, CorrectedTokens: &correctedTokens,
+		Reason:          "provider invoice arrived",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -500,6 +502,7 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 
 	reqID, attID := settledRequest(t, s, f, w5, ww, wm, 100_000, 60_000)
 	key := "corr-" + uuid.NewString()
+	correctedTokens := int64(11)
 	correct := func() error {
 		uow, _ := s.Begin(ctx)
 		err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
@@ -508,7 +511,8 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 				AttemptID: attID, Source: domain.UsageReported,
 				Buckets: domain.UsageBuckets{InputTokens: ptr(int64(8)), OutputTokens: ptr(int64(3))},
 			},
-			CorrectedMicros: 25_000, Reason: "evidence below estimate",
+			CorrectedMicros: 25_000, CorrectedTokens: &correctedTokens,
+			Reason:          "evidence below estimate",
 			OperatorSubject: "system:recovery", IdempotencyKey: key,
 			At: time.Now().UTC(),
 		})
@@ -550,7 +554,7 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(8))},
 		},
-		CorrectedMicros: 25_000, Reason: "noop",
+		CorrectedMicros: 25_000, CorrectedTokens: &correctedTokens, Reason: "noop",
 		OperatorSubject: "op", IdempotencyKey: "corr-noop-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -561,6 +565,8 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 
 	// 链式修正到 0 = 全额作废 → 冲正分录（reversal 当前剩余效应 25k，
 	// 指向原 charge）；窗口/预算归零；重建口径 charge − credit − reversal。
+	// 证据说"零消费" → 修正后的 token 总量也是 0（绝对值，存储效果是净差额）。
+	zeroTokens := int64(0)
 	uow, _ = s.Begin(ctx)
 	err = s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -568,7 +574,7 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(0)), OutputTokens: ptr(int64(0))},
 		},
-		CorrectedMicros: 0, Reason: "provider confirmed zero consumption",
+		CorrectedMicros: 0, CorrectedTokens: &zeroTokens, Reason: "provider confirmed zero consumption",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-void-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -637,6 +643,7 @@ func TestCorrectSettlementOverageAndJobResolution(t *testing.T) {
 	// 真实证据超出预占：120k > 100k → 补差 20k + settlement_overage 异常
 	// （不隐藏负差额）。原 crash_recovery 任务先被证据 resolve，随后被新
 	// reason 的异常重开为 pending（detail 保留全部历史）。
+	overageTokens := int64(100) // 50 + 50（与修正证据的桶一致）
 	uow, _ = s.Begin(ctx)
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -644,7 +651,7 @@ func TestCorrectSettlementOverageAndJobResolution(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(50)), OutputTokens: ptr(int64(50))},
 		},
-		CorrectedMicros: 120_000, Reason: "invoice exceeds hold",
+		CorrectedMicros: 120_000, CorrectedTokens: &overageTokens, Reason: "invoice exceeds hold",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -846,6 +853,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 
 	// 修正后仍超占（130k > 100k）：超占任务必须仍然 pending 且 detail 合并
 	// （修复前：步骤 8 误 resolve + 同 reason 不重开 → 异常静默消失）。
+	overageTokens := int64(120) // 60 + 60（与修正证据的桶一致）
 	uow, _ = s.Begin(ctx)
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -853,7 +861,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(60)), OutputTokens: ptr(int64(60))},
 		},
-		CorrectedMicros: 130_000, Reason: "invoice higher still",
+		CorrectedMicros: 130_000, CorrectedTokens: &overageTokens, Reason: "invoice higher still",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -884,7 +892,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(40)), OutputTokens: ptr(int64(40))},
 		},
-		CorrectedMicros: 90_000, Reason: "final invoice within hold",
+		CorrectedMicros: 90_000, CorrectedTokens: &overageTokens, Reason: "final invoice within hold",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})

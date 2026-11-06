@@ -60,6 +60,17 @@ func NormalizedTokens(b domain.UsageBuckets) int64 {
 	return total
 }
 
+// KnownTokenBuckets reports whether the buckets carry any KNOWN token
+// amount of the **normalized** measure (input + cache read + cache write +
+// output). A bucket nobody reported stays unknown (nil) — unknown never
+// collapses into zero. The reasoning detail is not part of the measure
+// (it is already inside the output total), so it does not make the total
+// known on its own.
+func KnownTokenBuckets(b domain.UsageBuckets) bool {
+	return b.InputTokens != nil || b.CacheReadTokens != nil ||
+		b.CacheWriteTokens != nil || b.OutputTokens != nil
+}
+
 // EvaluateRateLimits decides whether one admission fits the business rate
 // limits. It returns nil when the request fits, otherwise a typed
 // *domain.RateLimitError (code=rate_limited — never the monetary

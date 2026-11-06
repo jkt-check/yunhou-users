@@ -178,6 +178,8 @@ func correctSettlement(t *testing.T, s *Store, requestID string, corrected domai
 		t.Fatalf("attempt for %s: %v", requestID, err)
 	}
 	in, out := int64(800), int64(250)
+	// 修正后的归一化 token 总量（T4：金额与 token 预算同一个事务）。
+	correctedTokens := in + out
 	uow, err := s.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -189,12 +191,14 @@ func correctSettlement(t *testing.T, s *Store, requestID string, corrected domai
 			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
 		},
 		CorrectedMicros: corrected,
+		CorrectedTokens: &correctedTokens,
 		Reason:          "real evidence arrived (test)",
 		OperatorSubject: "system:test",
 		IdempotencyKey:  idemKey,
 		At:              time.Now().UTC(),
 	})
 	if err != nil {
+		_ = uow.Rollback(ctx)
 		t.Fatalf("correct settlement: %v", err)
 	}
 	if err := uow.Commit(ctx); err != nil {
@@ -694,7 +698,7 @@ func TestCustomerRead_ListEntitlementsAllStatuses(t *testing.T) {
 		SourceID: "order-" + uuid.NewString(), ModelIDs: []string{f.modelID},
 		PolicyVersionID: f.policyID, AnchorAt: past.Add(-24 * time.Hour),
 		EffectiveFrom: past.Add(-24 * time.Hour), EffectiveTo: &past,
-		Status:        domain.EntitlementExpired,
+		Status: domain.EntitlementExpired,
 	}
 	if err := s.InsertEntitlement(ctx, expired); err != nil {
 		t.Fatal(err)

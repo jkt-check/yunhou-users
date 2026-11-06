@@ -2011,6 +2011,184 @@ store contract stays untouched.
   tests, but no production flow calls it yet — the evidence window is still
   driven by the existing reconciliation queue.
 
+#### 4.33 T4 fix round — the correction composition (money + token budget in one transaction)
+
+Recorded on 2026-11-06, after the T4 commit `cde1c5e`. One **Important**
+review finding was fixed with TDD; the fix round is one extra commit
+(one extra commit on top of `cde1c5e`; its SHA is
+recorded in the task report). Nothing else was touched — the deferred
+minors stay deferred.
+
+**The finding (verbatim, condensed).** "The correction composition the report
+prescribes is unsafe, and the estimated→reported lifecycle is not realized
+end-to-end. `CorrectRateTokensTx` has no production caller; money-side
+`CorrectSettlement` is also externally unwired. `CorrectRateTokensTx` returns
+`CodeConflict` when no settled rate row exists, so following the report's
+instruction to call it with money correction rolls back money corrections for
+pre-migration-052 requests and for terminal rows removed by retention. The
+same-transaction consistency is only a convention: `CorrectionCommand` carries
+no corrected bucket/token field, so nothing forces or enables correcting TPM
+with the ledger in one transaction."
+
+**Environment.** Same recipe as §4.26: a fresh trap-cleaned disposable
+PostgreSQL per run, explicit `DATABASE_URL` / `E2E_DATABASE_URL`, `-p 1`,
+`-race`, `GOPROXY=off` + `GOFLAGS=-mod=readonly`, `go.mod` / `go.sum`
+untouched.
+
+##### 4.33.1 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | **RED** `go test -count=1 -run 'TestCorrectSettlement_' -v ./internal/inference/postgres` | **1** | the composition was missing — see §4.33.2 |
+| 2 | `go run ./cmd/migrate` (run 1 / run 2 / `-status`) | **0** / **0** / **0** | `applied=52 skipped=0` → `applied=0 skipped=52` → 52 × `✅` |
+| 3 | **GREEN** the same command as #1 | **0** | 11/11 correction cases pass (9 new + 2 pre-existing) |
+| 4 | **GREEN** `go test -count=1 ./internal/inference/postgres/...` (whole package) | **0** | the package is green (the pre-existing correction tests were updated for the new contract) |
+| 5 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/... ./internal/router ./internal/config ./cmd/server` | **0** | 17 packages `ok` (re-run on the final tree: 17 `ok`, exit 0) |
+| 6 | `go test -race -count=1 -p 1 -v ./internal/inference/... ./tests/integration/...` | **0** | 0 FAIL; the skip inventory is unchanged (3 skips: `TestQuotaWorkerProcess`, `TestLoadDrill_Throughput`, `TestLoadDrill_LongConnections` — **0 database-test skips**) |
+| 7 | CI `go-ci` gate + coverage floor | **0** | 33 packages `ok`, `total coverage: 80.1%` ≥ the 80% floor |
+| 8 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t4_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 291.264s` |
+
+##### 4.33.2 RED evidence (production code still at `cde1c5e`)
+
+The new cases were written against the **existing** API surface
+(`postgres.Store.CorrectSettlement` + the real store), so every failure is a
+behavioural assertion — never a compile error, never a skipped DB test.
+
+```
+=== RUN   TestCorrectSettlement_UpdatesTheLedgerAndTheTokenBudgetOnce
+    correction_rate_test.go:171: settled tokens = 1000, want 1200 (the token budget must be corrected with the money)
+--- FAIL: TestCorrectSettlement_UpdatesTheLedgerAndTheTokenBudgetOnce (0.06s)
+=== RUN   TestCorrectSettlement_MissingRateRowIsABenignAbsence
+--- PASS: TestCorrectSettlement_MissingRateRowIsABenignAbsence (0.05s)
+=== RUN   TestCorrectSettlement_PresentButMalformedRateRowIsNotABenignAbsence/not_settled_row
+    correction_rate_test.go:231: err = <nil>, want conflict (a malformed rate row is not a benign absence)
+=== RUN   TestCorrectSettlement_PresentButMalformedRateRowIsNotABenignAbsence/key_row_without_account_row
+    correction_rate_test.go:251: err = <nil>, want conflict (a key row without its account row is drift)
+--- FAIL: TestCorrectSettlement_PresentButMalformedRateRowIsNotABenignAbsence (0.11s)
+=== RUN   TestCorrectSettlement_LedgerHalfFailureRollsBackTheTokenCorrection
+    correction_rate_test.go:274: settled tokens = 1000, want 1200 after the first correction
+--- FAIL: TestCorrectSettlement_LedgerHalfFailureRollsBackTheTokenCorrection (0.05s)
+=== RUN   TestCorrectSettlement_RateHalfFailureRollsBackTheLedgerCorrection
+    correction_rate_test.go:311: err = <nil>, want conflict (a malformed rate row must fail the correction)
+--- FAIL: TestCorrectSettlement_RateHalfFailureRollsBackTheLedgerCorrection (0.05s)
+=== RUN   TestCorrectSettlement_RepeatedCorrectionIsIdempotent
+--- PASS: TestCorrectSettlement_RepeatedCorrectionIsIdempotent (0.05s)
+=== RUN   TestCorrectSettlement_CorrectionKeepsTheOriginalSettlementInstant
+    correction_rate_test.go:374: settled tokens = 1000, want 5000 (the request fact is corrected)
+--- FAIL: TestCorrectSettlement_CorrectionKeepsTheOriginalSettlementInstant (0.05s)
+=== RUN   TestCorrectSettlement_UnknownTokenEvidenceKeepsThePreviousTotal
+--- PASS: TestCorrectSettlement_UnknownTokenEvidenceKeepsThePreviousTotal (0.05s)
+=== RUN   TestCorrectSettlement_KnownTokenEvidenceRequiresTheCorrectedTotal
+    correction_rate_test.go:426: err = <nil>, want invalid_input (the token total must not be omitted)
+--- FAIL: TestCorrectSettlement_KnownTokenEvidenceRequiresTheCorrectedTotal (0.04s)
+--- PASS: TestCorrectSettlement_ReversalAndDelta (0.05s)
+FAIL	github.com/yunhou/users/internal/inference/postgres	1.209s
+```
+
+**Root cause.** `postgres.CorrectSettlement` corrected only the **money**
+(ledger reversal/adjustment + the window/budget aggregates + the request's
+settled amount). The **token budget** was never touched: the rate
+reservation kept the estimated total, so the TPM and the ledger disagreed
+after every correction — and the T4 report told the reader to wire the two
+together by calling `CorrectRateTokensTx`, whose "no settled rate row ⇒
+`CodeConflict`" behaviour would have rolled back valid money corrections for
+pre-052 requests and for retention-purged terminal rows.
+
+**Protection evidence (already-correct behaviour, recorded instead of a forced
+change).** Three cases passed at the pre-fix baseline:
+
+| Case | Guard that already held |
+|---|---|
+| `…_MissingRateRowIsABenignAbsence` | a money correction is never rolled back by a missing rate row (trivially true before the rate half was wired; a real guard from now on) |
+| `…_RepeatedCorrectionIsIdempotent` | the idempotency key makes a replayed correction a conflict and changes nothing |
+| `…_UnknownTokenEvidenceKeepsThePreviousTotal` | unknown token evidence never collapses into zero |
+
+##### 4.33.3 The fix
+
+* `postgres.CorrectionCommand` gained **`CorrectedTokens *int64`** — the
+  **absolute** corrected normalized token total (the TPM measure: input +
+  cache read + cache write + output, after the overlap normalization the
+  settlement path bills; the caller computes it with
+  `access.NormalizedTokens` over the same normalized buckets it carries in
+  `Corrected`). `nil` = the corrected evidence carries **no known** token
+  total (unknown) → the token-budget correction is a deliberate no-op and
+  the previous total is kept — **unknown never collapses into zero**.
+* `Store.CorrectSettlement` now performs the **token-budget correction in
+  the same transaction** as the ledger correction (step 5b, between the
+  ledger entries and the window/budget deltas): the rate row's total is
+  **replaced** by the absolute corrected total (the storage effect is a
+  **net delta** — one authoritative total, never an accumulation across
+  revisions) and the **original settlement instant is kept** (a correction
+  never resets the 60-second window attribution, so an out-of-window
+  correction does not create consumption in the current minute).
+* **The correction entrypoint can no longer silently omit the TPM**: known
+  token buckets without a corrected total → `CodeInvalidInput` ("the token
+  budget correction must not be omitted").
+* **A missing rate row is a benign absence**, not an anomaly: the request may
+  predate migration 052 or its terminal row may have been purged by the
+  retention sweep → the money correction still applies. **A row that is
+  present but malformed** (a settled request whose rate row is still
+  in-flight, or a key row without its account row) is an **anomaly** and
+  fails loudly with `CodeConflict` — it is never mistaken for an absence.
+* `Store.CorrectRateTokensTx` (the standalone rate-only correction) now
+  shares that core and therefore has the same semantics; it still takes an
+  **absolute corrected total** whose storage effect is a **net delta**.
+* **Recorded boundary (not expanded):** wallet-charged requests are still
+  explicitly rejected by `CorrectSettlement` (`CodeInvalidInput` — the
+  micromoney unit and the wallet compensation entries are not adapted), so a
+  wallet request's token budget is **not** corrected through this channel
+  yet. The money-correction channel still has **no production caller** (the
+  "estimate → later real evidence" flow stays in the reconciliation queue);
+  the fix makes the entrypoint safe, it does not add a new endpoint, a new
+  job or an auto-correction sweep.
+
+##### 4.33.4 GREEN evidence
+
+Command #3 — exit code **0**:
+
+```
+--- PASS: TestCorrectSettlement_UpdatesTheLedgerAndTheTokenBudgetOnce (0.06s)
+--- PASS: TestCorrectSettlement_MissingRateRowIsABenignAbsence (0.07s)
+--- PASS: TestCorrectSettlement_PresentButMalformedRateRowIsNotABenignAbsence (0.09s)
+    --- PASS: …/not_settled_row (0.05s)
+    --- PASS: …/key_row_without_account_row (0.05s)
+--- PASS: TestCorrectSettlement_LedgerHalfFailureRollsBackTheTokenCorrection (0.07s)
+--- PASS: TestCorrectSettlement_RateHalfFailureRollsBackTheLedgerCorrection (0.05s)
+--- PASS: TestCorrectSettlement_RepeatedCorrectionIsIdempotent (0.07s)
+--- PASS: TestCorrectSettlement_CorrectionKeepsTheOriginalSettlementInstant (0.05s)
+--- PASS: TestCorrectSettlement_UnknownTokenEvidenceKeepsThePreviousTotal (0.05s)
+--- PASS: TestCorrectSettlement_KnownTokenEvidenceRequiresTheCorrectedTotal (0.05s)
+--- PASS: TestCorrectSettlement_ReversalAndDelta (0.06s)   (pre-existing)
+```
+
+##### 4.33.5 Files changed (fix round)
+
+| File | Change |
+|---|---|
+| `internal/inference/postgres/reconciliation_repo.go` | `CorrectionCommand.CorrectedTokens *int64`; the guard; the token-budget correction inside the same transaction; the doc (the composition, the benign absence, the malformed row, the wallet boundary, the absolute total / net delta) |
+| `internal/inference/postgres/inference_limit_repo.go` | the shared core `correctRateTokensTx` (benign absence vs malformed row); `CorrectRateTokensTx` delegates to it |
+| `internal/inference/access/inference_limits.go` | the pure rule `KnownTokenBuckets` (does the normalized measure have a known amount?) |
+| `internal/inference/postgres/correction_rate_test.go` | **new** — 9 correction × TPM cases |
+| `internal/inference/postgres/repo_misc_test.go`, `recovery_test.go`, `customer_read_repo_test.go` | the pre-existing correction cases now state the corrected token total (the contract changed) |
+| `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md` | the T4 **Interfaces** paragraph carries the final signatures (`CorrectionCommand.CorrectedTokens`, `CorrectSettlement`, `correctRateTokensTx`, `KnownTokenBuckets`) and the correction-channel notes |
+
+##### 4.33.6 Notes (compatibility, honesty)
+
+* **No client-visible change**: the correction channel has no HTTP surface
+  and no production caller, so the OpenAPI spec and the integration guide
+  need no update for this round.
+* **Preserved:** the net-delta effect (one authoritative total), the
+  original settlement instant, the idempotency key semantics, the
+  out-of-window behaviour, `unknown ≠ zero`, the fixed-point money
+  arithmetic and the one-charge-per-request rule (a correction appends an
+  adjustment/reversal, never a second charge).
+* **Atomicity:** the two halves share one `UnitOfWork` — an injected failure
+  in either half rolls back both (pinned by the two "half failure" cases).
+* **Honest limitation:** the estimated→reported lifecycle is still not
+  realized end-to-end in production (no caller drives `CorrectSettlement`);
+  the fix makes the entrypoint correct and safe so that whoever wires the
+  evidence flow cannot make the ledger and the TPM disagree.
+
 ### T5 — Per-key concurrency
 
 - Status: not started

@@ -10,6 +10,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
 )
@@ -325,9 +326,34 @@ type CorrectionCommand struct {
 	RequestID string
 	// Corrected is the new usage fact (Source/Buckets); AttemptID must name
 	// the attempt it revises — the revision number is assigned as max+1.
+	//
+	// The buckets must be the NORMALIZED ones (the same disjoint shape the
+	// settlement path stores — see accounting.BillableBuckets): the stored
+	// usage history and the token budget are then derived from the same
+	// measure.
 	Corrected domain.UsageRecord
 	// CorrectedMicros is the re-priced customer consumption (microcredit).
 	CorrectedMicros domain.Microcredit
+	// CorrectedTokens is the ABSOLUTE corrected normalized token total (the
+	// TPM budget measure: input + cache read + cache write + output after
+	// the overlap normalization the settlement path bills — the caller
+	// computes it with access.NormalizedTokens over the SAME normalized
+	// buckets it carries in Corrected).
+	//
+	//   - non-nil → the request's rate reservation token total is REPLACED
+	//     by it in the SAME transaction as the ledger correction (the
+	//     storage effect is a net delta: the row keeps ONE authoritative
+	//     total, never an accumulation across usage revisions) and the
+	//     ORIGINAL settlement instant is kept — a correction never resets
+	//     the 60-second window attribution;
+	//   - nil → the corrected evidence carries NO known token total
+	//     (unknown): the token-budget correction is a deliberate no-op and
+	//     the previous total is kept. Unknown never collapses into zero.
+	//
+	// It is REQUIRED whenever the corrected evidence carries known token
+	// buckets: a money correction may not silently omit the token budget
+	// (the ledger and the rate budget would disagree).
+	CorrectedTokens *int64
 	Reason          string
 	// OperatorSubject + IdempotencyKey follow the adjustment contract
 	// (设计 §9.2: 有原因、对象、金额/额度、操作者和幂等键). Recovery-driven
@@ -354,11 +380,15 @@ type CorrectionCommand struct {
 //     (debit = 补差 / credit = 退还) — 补差分录;
 //     either way the inference_adjustments row carries reason + operator +
 //     idempotency key (设计 §9.2; 重复投递撞唯一键只生效一次);
-//  5. correct every bound window's used and the Key budget by the SAME
+//  5. correct the TOKEN BUDGET in the SAME transaction: the rate
+//     reservation's token total is replaced by the corrected ABSOLUTE total
+//     (its storage effect is a net delta) and the original settlement
+//     instant is kept — money and TPM can never disagree;
+//  6. correct every bound window's used and the Key budget by the SAME
 //     signed delta (guards forbid a negative aggregate);
-//  6. update the request's settled amount/usage status;
-//  7. resolve the request's open reconciliation job (evidence landed);
-//  8. re-check the hold: corrected > reserved enqueues settlement_overage
+//  7. update the request's settled amount/usage status;
+//  8. resolve the request's open reconciliation job (evidence landed);
+//  9. re-check the hold: corrected > reserved enqueues settlement_overage
 //     (超出预占显示异常,不隐藏负差额).
 //
 // 账本重建口径随之成立：窗口 used ≡ Σ charge − Σ reversal ± Σ 请求级
@@ -367,12 +397,20 @@ type CorrectionCommand struct {
 // A replayed IdempotencyKey hits the UNIQUE key → CodeConflict: the caller
 // treats it as already-applied.
 //
+// token 预算修正的边界：
+//   - CorrectedTokens = nil（修正证据没有已知 token 总量）→ token 预算
+//     **保留原值**，绝不记零（unknown ≠ 0）；
+//   - 速率行**缺失**（迁移 052 之前的老请求，或终态行已被保留期清理掉）
+//     → 良性缺席：金额修正照常生效，不回滚；
+//   - 速率行**存在但畸形**（已结算请求的速率行仍是在途状态；或只剩 Key 行
+//     而没有账户行）→ 明确冲突，绝不当成良性缺席放过。
+//
 // 仅支持 charge_source='plan' 的请求。wallet 计费请求显式拒绝
 // （CodeInvalidInput，评审轮1 Important-1）：wallet 路径的 settled_micros
 // 是 micromoney 而非 microcredit，入场也未做 key-budget 预占，且更正需要
 // 钱包补偿分录——在完整实现 wallet 分支前统一拒绝，避免通用调用方静默
 // 腐蚀钱包状态（当前本方法无生产调用方，更正通道本期未接线，见计划
-// Task 9 已知限制）。
+// Task 9 已知限制）。钱包请求的 token 预算因此也不会被这条通道修正。
 func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd CorrectionCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -417,6 +455,15 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	if domain.RequestStatus(status) != domain.ReqSettled {
 		return domain.NewError(domain.CodeConflict,
 			"correction: request not settled ("+status+") — settle first, corrections revise a settlement")
+	}
+	// The corrected token evidence must be explicit: known token buckets
+	// without a corrected total would silently omit the token budget (the
+	// ledger and the rate budget would disagree). Checked after the scope
+	// boundary above so the wallet rejection keeps its own message.
+	if cmd.CorrectedTokens == nil && access.KnownTokenBuckets(cmd.Corrected.Buckets) {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: the corrected evidence carries token buckets but no corrected token total"+
+				" (the token budget correction must not be omitted)")
 	}
 	if !settled.Valid {
 		return domain.NewError(domain.CodeConflict,
@@ -483,6 +530,17 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 			 VALUES ($1,$2,'adjustment',$3,'microcredit',$4,$5)`,
 			accountID, cmd.RequestID, int64(delta), adjID, "system:"+cmd.OperatorSubject); err != nil {
 			return mapError("correction: adjustment entry", err)
+		}
+	}
+
+	// 5b. The TOKEN BUDGET correction rides in the SAME transaction as the
+	// ledger correction — money and TPM can never disagree. The rate row
+	// may be legitimately absent (pre-052 request / retention purge): that
+	// is a benign absence and the money correction still applies; a row
+	// that is present but malformed fails loudly.
+	if cmd.CorrectedTokens != nil {
+		if err := s.correctRateTokensTx(ctx, tx, cmd.RequestID, *cmd.CorrectedTokens); err != nil {
+			return err
 		}
 	}
 

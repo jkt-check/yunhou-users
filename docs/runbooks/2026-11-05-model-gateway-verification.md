@@ -4620,12 +4620,18 @@ exactly the two new test files (plus the two documentation files above).
   PostgreSQL, so **two instances** see one account RPM/TPM/concurrency
   budget and one per-Key budget.
 - **Compatibility.** T10 changed **no** interface: no new HTTP route, no new
-  JSON field, no new error code, no new table, no OpenAPI line. The
-  acceptance matrix *pins* the existing contracts instead — the four
-  entry points' native error shapes (`/v1` OpenAI vs Anthropic), the `/chat`
-  `{code,data,message}` envelope, the `429 rate_limited` vs
-  `429 insufficient_capacity` vs `429 quota_exceeded` split, and the
-  `reconciliation_required` terminal state.
+  JSON field, no new error code, no new table, no OpenAPI line. What the new
+  suite actually asserts about the error contract is **narrow**, and it is
+  worth stating exactly: the **OpenAI `/v1` native shape**
+  (`{"error":{"code":…}}`, decoded by `errCode`) for **two** of the three
+  limit codes — `rate_limited` and `insufficient_capacity` — plus the HTTP
+  status of a pre-admission rejection (403) on all four entry points and the
+  `reconciliation_required` terminal state. It does **not** decode the
+  Anthropic native shape, the `/chat` `{code,data,message}` envelope, or
+  `quota_exceeded`; those belong to the **T6 protocol matrix** (§4.27), which
+  is the contract's owner. The new files assert the **accounting** facts
+  (request / attempt / usage / ledger / holds / leases), not the whole
+  protocol matrix.
 - **Unsupported legacy configuration — how it is handled today.** Three
   legacy shapes are *readable but not schedulable*, and the gateway says so
   instead of silently pretending: (1) a published route with
@@ -4651,11 +4657,32 @@ exactly the two new test files (plus the two documentation files above).
   2. **No production deployment.** Nothing was deployed, migrated against a
      production database, or merged. The production prerequisites are listed
      in the task report (§ 上线前置).
-  3. **Correction boundaries.** The correction channel
-     (`CorrectSettlement`) covers the **plan** path only; the wallet path is
-     explicitly refused (`TestCorrectSettlementRejectsWallet`). A settlement
-     that exceeds its hold is **not** silently clamped — the real charge
-     settles and the difference is filed as a `settlement_overage`
+  3. **Correction boundaries — one of them is a real remaining limitation.**
+     The correction channel (`CorrectSettlement`) covers the **plan** path
+     only; the wallet path is refused with `invalid_input`
+     (`TestCorrectSettlementRejectsWallet`: "钱包更正通道未接线"). Two facts
+     must be kept apart:
+     - the **persistent rate reservation** *is* settled / released on the
+       wallet terminal and recovery paths, exactly like the plan path —
+       `ledger_repo.go` settles it in the wallet branch
+       (`settleWallet` → `settleRateTx`) and `reservation_repo.go` releases
+       it (`releaseRateTx`), so T4's literal "套餐与钱包的终态/恢复都释放或
+       校正同一持久 rate reservation" is met for the rate side;
+     - the **post-settlement correction of a wallet request** — the money
+       reversal/adjustment *and* the token-budget correction — is **not
+       wired**. An estimated wallet settlement that later gets real evidence
+       cannot be corrected. The original T4 text asks for plan **and** wallet
+       to release-or-correct the same persistent rate reservation, and the
+       estimated→reported correction is part of that semantics, so this is a
+       **real remaining limitation that needs a final review decision** — not
+       something the plan excludes. (The "已知边界（本期不扩大）" note inside
+       the T4 section of the plan is **branch-era text written by T4**, not a
+       plan-level waiver, and must not be cited as one. Related and already
+       recorded in §4.32: the money-side correction channel has **no
+       production caller** at all — `CorrectRateTokensTx` is pinned by tests
+       but driven only by the reconciliation queue's evidence window.)
+     A settlement that exceeds its hold is **not** silently clamped — the real
+     charge settles and the difference is filed as a `settlement_overage`
      reconciliation job. The recovery worker settles unknown consumption at
      the **conservative estimate** (the admission-priced upper bound); only a
      provider that supports per-request execution lookup could settle at the
@@ -4694,11 +4721,20 @@ exactly the two new test files (plus the two documentation files above).
   7. **What the acceptance matrix does *not* cover.** It does not exercise
      the JWT/OAuth path (the e2e suite owns that), the management surfaces,
      the payment/refund flows, the `/v1/models` and `/chat/models` shapes
-     (T9's e2e contract owns those), nor a **multi-process** deployment
-     (the "two instances" here are two independent Services over two
-     connection pools **inside one process** — the coordination they prove
-     is in PostgreSQL, so it holds across processes too, but that specific
-     claim is not exercised here).
+     (T9's e2e contract owns those), nor the **rate path across processes**.
+     The repository **does** have a cross-process harness —
+     `TestTwoProcessContendLastCredit`
+     (`internal/inference/postgres/quota_concurrency_test.go:880`) re-execs
+     the test binary through the `TestQuotaWorkerProcess` child entry point
+     (`KAYA_QUOTA_WORKER=1`), each process with its own connection pool on the
+     shared disposable database — but it exercises the **quota-window**
+     contention path (the worker's policy carries only the three window
+     limits: no RPM, no TPM, no concurrency cap). The **T4/T5 rate path**
+     (account/Key RPM, account TPM, account and Key concurrency) is covered by
+     T10's suite with **two in-process Service instances over two pools**, and
+     **that suite was not itself exercised cross-process or cross-host**.
+     The gap is actionable: re-use the same `KAYA_QUOTA_WORKER` re-exec
+     pattern and give the worker an RPM/TPM/concurrency-limited policy.
 
 
 ---
@@ -4745,9 +4781,29 @@ exactly the two new test files (plus the two documentation files above).
   waits for a human to confirm it (§4.58, limit 3). The unknown-usage
   backlog alarm fires at 10 parked requests; the backlog needs an operator,
   not a retry loop.
-- **The "two instances" are two Services in one process.** They have
-  independent pools, stores, services and engines, and the coordination they
-  prove lives in PostgreSQL — but a genuinely multi-process deployment
-  (separate binaries, separate hosts) is not exercised by this repository's
-  test suite (§4.58, limit 7).
+- **The "two instances" are two Services in one process — and the repo
+  already has a cross-process harness for a *different* path.** The
+  coordination T10 proves lives in PostgreSQL, so it holds across processes,
+  but T10's rate-path suite was not itself run cross-process. The repository
+  *does* have a cross-process harness:
+  `TestTwoProcessContendLastCredit`
+  (`internal/inference/postgres/quota_concurrency_test.go:880`) re-execs the
+  test binary via the `TestQuotaWorkerProcess` child entry point
+  (`KAYA_QUOTA_WORKER=1`), each process with its own pool on the shared
+  database — but it drives the **quota-window** path (its worker policy sets
+  only the three window limits). Closing the rate-path gap means re-using
+  that same re-exec pattern with an RPM/TPM/concurrency-limited policy
+  (§4.58, limit 7).
+- **The wallet's post-settlement correction is still unwired — a real
+  remaining limitation, not a plan exclusion.** The persistent rate
+  reservation *is* settled/released on the wallet terminal and recovery
+  paths (`settleWallet` → `settleRateTx`, `releaseRateTx`), but
+  `CorrectSettlement` refuses the wallet path with `invalid_input`
+  (`TestCorrectSettlementRejectsWallet`), so an estimated wallet settlement
+  that later gets real evidence **cannot** be corrected. The original T4 text
+  asks for plan **and** wallet to release-or-correct the same persistent rate
+  reservation; this needs a **final review decision**. The "已知边界（本期
+  不扩大）" note inside the plan's T4 section is branch-era text written by
+  T4 — it is **not** a plan-level waiver and must not be cited as one
+  (§4.58, limit 3).
 

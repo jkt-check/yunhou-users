@@ -207,6 +207,42 @@ message 点名配置）；legacy `/chat` 是 503 `chat configuration unavailable
 （**不带 `Retry-After`** —— 配置不会自愈，重试没有意义）。两者都在预占前
 失败：零计费、零出站。
 
+### `capabilities`（路由的能力清单）
+
+路由的 `capabilities` 列声明**这条路由承载哪些能力**。词表是**封闭**的：
+
+| 能力名 | 含义 |
+|---|---|
+| `tools` | 这条路由承载带工具的请求 |
+| `reasoning` | 这条路由承载带推理的请求 |
+| `image` | 这条路由承载带图的请求 |
+
+| 写面 | 口径 |
+|---|---|
+| `POST/PATCH /admin/routes`（operator CRUD） | 词表外的名字 **明确 400**（错误点名那个名字与支持集）；清单先归一（trim / 去空 / 去重）再落库，**不折叠大小写**（`Tools` 是拼写错误，要指出来而不是悄悄接受） |
+| `POST /admin/catalog/publish`（正式发布） | 发布闸与写面同一口径：**拒绝**并点名路由 ID 与那个能力名；`?dry_run=1` 的发布预演给出同一个错误 |
+| 已发布快照的**读**面 | **容忍**未知能力名（旧目录必须仍能加载，否则升级即砖整个目录）：未知名字**不授予任何能力**，存量行**不会被自动改写** |
+
+**空清单 = 全部能力**（数据库默认 `'{}'`）：存量绝大多数路由是空清单，行为
+不变。
+
+**⚠️ 已发布的非空清单被有意收窄（T8）**：`image` 是一把**新钥匙**。存量
+非空清单（例如 `["tools","reasoning"]`）里没有它，因此**不再承载带图请求**：
+
+- 该路由上的带图请求 → 网关在**准入前**明确 400（零预占、零出站、零计费）；
+- 若某个模型的**全部**路由都是这类清单 → 该模型不再 advertise 图片能力
+  （`GET /chat/models` 的 `input_modalities` 与 legacy `/chat` picker 都只
+  透出 `["text"]`），picker 因此不会让客户发图。
+
+**修法**：把要承载图片的路由的 `capabilities` 显式加上 `"image"`
+（`PATCH /admin/routes/:id`），再 `POST /admin/catalog/publish`。发布预演
+（`?dry_run=1`）会先告诉你哪条路由不合格。
+
+**客户面看到的**：带图请求是 400（`invalid_input`，Anthropic 面
+`invalid_request_error`），message 点名模型与「没有能承载图片的部署」；
+legacy `/chat` 是 400（能力不兼容哨兵，不是「上游拒绝」的 502）。都在预占前
+失败：零计费、零出站。
+
 ### `weight`（同 priority 下的候选排序，不是比例分流）
 
 `weight` 只决定**同 `priority` 组内**的候选顺序（降序）。它**不是**概率分流：

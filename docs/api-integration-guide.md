@@ -614,10 +614,21 @@ Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改�
 | 层 | 载体 | 语义 |
 |---|---|---|
 | 模型声明 | `inference_models.input_modalities` | 缺省放行（`["text","image"]`）；显式声明不含 `image` 的模型拒绝带图请求（400，先于准入） |
-| 路由能力 | `inference_model_routes.capabilities` | 空 = 全部能力；非空是**限制性**清单，缺 `image` 的路由不承载带图请求 |
+| 路由能力 | `inference_model_routes.capabilities` | 空 = 全部能力；非空是**限制性**清单，缺 `image` 的路由不承载带图请求。词表封闭（`tools`/`reasoning`/`image`）：写面与发布闸拒绝词表外的名字，已发布快照里的未知名字被忽略（旧目录仍可加载，存量行不自动改写） |
 | adapter 能力 | `domain.AdapterCapabilities.Images` / `.ReasoningEfforts` | 上游协议能不能表达：不能表达的部署**不参与候选**（不是等出站前才失败） |
 
 因此内置 `POST /chat` 的带图请求只会落到兼容图片的上游协议（`openai_chat` / `anthropic_messages`）；第一候选是不支持图片的 `openai_responses` 时它被**跳过**；而当**没有任何**兼容候选时，请求在准入前被明确 400（零预占、零派发）。纯文本请求的候选集合**不受影响**。
+
+**模型选择器与派发同源**：`GET /chat/models`（以及 legacy `/chat` 的 picker）
+透出的 `input_modalities` 现在是「目录声明 ∩ 派发能力」—— 声明了 `image`
+但已发布部署里没有能承载图片的协议时，列表**不再 advertise image**（否则
+picker 让客户发图、网关在准入前当场 400）。判据与派发共用 routing 的同一个
+能力判定（`routing.CompatibleDeployments`），不另立规则。
+
+**存量路由能力清单被有意收窄（T8）**：路由 `capabilities` 的词表封闭后，
+存量**非空**清单（例如 `["tools","reasoning"]`）里没有 `image` → 不再承载
+带图请求，相应模型也不再 advertise 图片能力。空清单（存量默认）行为不变。
+运营修法见 `docs/runbooks/kaya-coding-plan-operations.md` §`capabilities`。
 
 **上游协议 × 能力（服务端侧：适配器能表达什么）**
 

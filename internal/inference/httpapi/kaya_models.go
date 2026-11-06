@@ -26,6 +26,7 @@ import (
 	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/gateway"
+	"github.com/yunhou/users/internal/inference/routing"
 	"github.com/yunhou/users/internal/middleware"
 )
 
@@ -35,6 +36,14 @@ type KayaModelsHandler struct {
 	Resolver     *access.Resolver
 	Snapshots    gateway.SnapshotSource
 	DefaultModel string
+	// Capabilities answers "can this published model serve image input at
+	// all?" — the routing package's capability decision, i.e. the SAME one
+	// the dispatch path uses (T8). The listing must not advertise an image
+	// the dispatcher refuses: a model whose only published deployment is an
+	// openai_responses one cannot carry images, so the picker must not
+	// offer them. Defaults to the production adapter registry; cmd/server
+	// overrides it with the routing service so both use ONE adapter set.
+	Capabilities routing.ImageCapabilityOracle
 }
 
 // NewKayaModelsHandler builds the handler; defaultModel marks the entry the
@@ -43,7 +52,18 @@ type KayaModelsHandler struct {
 // ErrNoVerifiedSnapshot (评审裁定：不得用 Catalog.LoadSnapshot，它绕开 cache、
 // 哨兵不可达且每请求全量 SELECT+ParseSnapshot；与 facade 同一来源）。
 func NewKayaModelsHandler(cat *catalog.Service, resolver *access.Resolver, snapshots gateway.SnapshotSource, defaultModel string) *KayaModelsHandler {
-	return &KayaModelsHandler{Catalog: cat, Resolver: resolver, Snapshots: snapshots, DefaultModel: defaultModel}
+	return &KayaModelsHandler{
+		Catalog: cat, Resolver: resolver, Snapshots: snapshots, DefaultModel: defaultModel,
+		Capabilities: routing.ProductionImageCapability(),
+	}
+}
+
+// imageCapability returns the capability oracle to use (never nil).
+func (h *KayaModelsHandler) imageCapability() routing.ImageCapabilityOracle {
+	if h.Capabilities != nil {
+		return h.Capabilities
+	}
+	return routing.ProductionImageCapability()
 }
 
 // kayaModelEntry is the candidate-branch return shape (对齐基准).
@@ -53,13 +73,6 @@ type kayaModelEntry struct {
 	Provider        string   `json:"provider"`
 	Default         bool     `json:"default"`
 	InputModalities []string `json:"input_modalities"`
-}
-
-// normalizeInputModalities 透出归一：空值按缺省放行透出 ["text","image"]
-// （与网关视觉门控同口径——显式 ["text"] 才是纯文本）。统一走 domain 的
-// 单一归一点，避免透出层与门控各自写死兜底列表。
-func normalizeInputModalities(mods []string) []string {
-	return domain.NormalizeInputModalities(mods)
 }
 
 // List handles GET /chat/models.
@@ -112,6 +125,7 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 		return
 	}
 	out := make([]kayaModelEntry, 0, len(models))
+	capability := h.imageCapability() // 一次解析（每请求一次），不逐模型取
 	for _, m := range models {
 		provider := ""
 		if deps := snap.ActiveDeployments(m.ID); len(deps) > 0 {
@@ -119,9 +133,15 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 				provider = pv.Code
 			}
 		}
+		// T8: 透出的 input_modalities 必须与**派发**能力一致 —— 声明了
+		// image 但已发布部署没有能承载图片的协议时，不再 advertise image
+		// （否则 picker 让客户发图，网关在准入前当场 400）。判据来自
+		// routing 的同一个能力判定，不另立规则。
+		canServeImages := capability.SupportsImageInput(snap, m.ID)
 		out = append(out, kayaModelEntry{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
-			Default: m.ID == h.DefaultModel, InputModalities: normalizeInputModalities(m.InputModalities),
+			Default:         m.ID == h.DefaultModel,
+			InputModalities: domain.AdvertisedModalities(m.InputModalities, canServeImages),
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"models": out}})

@@ -39,10 +39,10 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		accounts:      map[string][]domain.UpstreamAccount{},
+		accounts:       map[string][]domain.UpstreamAccount{},
 		accountQueries: map[string]int{},
-		leases:        map[string]*domain.ConcurrencyLease{},
-		acquireErr:    map[string]error{},
+		leases:         map[string]*domain.ConcurrencyLease{},
+		acquireErr:     map[string]error{},
 	}
 }
 
@@ -685,7 +685,7 @@ func TestCandidates_ReasoningEffortNeedSkipsProtocolWithoutKnob(t *testing.T) {
 	fs := newFakeStore()
 	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
 	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
-		domain.ProtocolOpenAIChat:      providers.NewOpenAIChat(),
+		domain.ProtocolOpenAIChat:       providers.NewOpenAIChat(),
 		domain.ProtocolAnthropicMessage: providers.NewAnthropicMessages(),
 	}, nil)
 	routes := []domain.ModelRoute{
@@ -714,5 +714,41 @@ func TestCandidates_ReasoningEffortNeedSkipsProtocolWithoutKnob(t *testing.T) {
 		if len(cands) != 1 || cands[0].Deployment.ID != "dep-chat" {
 			t.Fatalf("effort %q candidates = %+v, want dep-chat only", effort, cands)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 路由能力清单的两种存量形态
+//
+// 空清单 = 全部能力（存量默认形态，DB 默认 '{}'）；非空清单是**限制性**的：
+// 它列出这条路由承载哪些能力，缺哪一项就不承载那一项。T8 起 "image" 也
+// 是一把钥匙 —— 存量非空清单（例如 ["tools","reasoning"]）因此**不再**
+// 承载带图请求：这是有意的收窄（见兼容性报告），运营要恢复图片能力必须
+// 显式加上 "image"。
+// ---------------------------------------------------------------------------
+
+func TestRouteCovers_LegacyCapabilityLists(t *testing.T) {
+	empty := domain.ModelRoute{ModelID: "m", DeploymentID: "d", Weight: 1, Enabled: true}
+	if !routeCovers(empty, Needs{Images: true}) {
+		t.Error("an empty capability list must keep serving images (legacy default)")
+	}
+	if !routeCovers(empty, Needs{Tools: true}) {
+		t.Error("an empty capability list must keep serving tools (legacy default)")
+	}
+	restrictive := domain.ModelRoute{ModelID: "m", DeploymentID: "d", Weight: 1, Enabled: true,
+		Capabilities: []string{"tools", "reasoning"}}
+	if routeCovers(restrictive, Needs{Images: true}) {
+		t.Error("a restrictive list without image must not serve images (deliberate narrowing)")
+	}
+	if !routeCovers(restrictive, Needs{Tools: true}) {
+		t.Error("a restrictive list must still serve the capabilities it declares")
+	}
+	if !routeCovers(restrictive, Needs{Reasoning: true}) {
+		t.Error("a restrictive list must still serve the capabilities it declares")
+	}
+	withImage := domain.ModelRoute{ModelID: "m", DeploymentID: "d", Weight: 1, Enabled: true,
+		Capabilities: []string{"tools", "reasoning", "image"}}
+	if !routeCovers(withImage, Needs{Images: true}) {
+		t.Error("a list declaring image must serve images")
 	}
 }

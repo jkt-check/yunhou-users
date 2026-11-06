@@ -244,7 +244,52 @@ func ValidateRoute(r *domain.ModelRoute) error {
 	if err := validateRouteShape(r); err != nil {
 		return err
 	}
+	if err := validateRouteCapabilities(r.Capabilities); err != nil {
+		return err
+	}
 	return validatePoolStrategy(r.PoolStrategy)
+}
+
+// NormalizeRouteCapabilities trims the capability names, drops empty ones
+// and de-duplicates the list (first-occurrence order preserved).
+//
+// It does NOT fold case: the vocabulary is lowercase and closed, and
+// silently accepting "Tools" would hide an operator typo instead of
+// pointing at it. The normalized list is what gets persisted, so the routing
+// layer's key comparison is exact.
+func NormalizeRouteCapabilities(caps []string) []string {
+	out := make([]string, 0, len(caps))
+	seen := map[string]bool{}
+	for _, c := range caps {
+		c = strings.TrimSpace(c)
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// validateRouteCapabilities is the write-side gate for the route capability
+// vocabulary: the names are CLOSED (tools / reasoning / image). A name
+// outside the vocabulary grants nothing while looking configured — the exact
+// "配置看起来生效了、实际没生效" trap this gate removes. The error names the
+// offending value and the supported set.
+//
+// The READ path deliberately does NOT enforce this: an already-published
+// revision with an unknown name must stay loadable (otherwise upgrading
+// bricks the whole catalog). Such a name is simply ignored by the routing
+// layer — it grants no capability — and the stored row is never rewritten.
+func validateRouteCapabilities(caps []string) error {
+	for _, c := range caps {
+		if !domain.ValidRouteCapability(c) {
+			return domain.NewError(domain.CodeInvalidInput,
+				"unknown route capability: "+c+
+					" (supported: "+strings.Join(domain.SupportedRouteCapabilities(), ", ")+")")
+		}
+	}
+	return nil
 }
 
 // ValidateRouteForRead validates a route loaded from a published snapshot.
@@ -595,6 +640,9 @@ func (s *Service) CreateRoute(ctx context.Context, r *domain.ModelRoute) error {
 	if r.PoolStrategy == "" {
 		r.PoolStrategy = domain.PoolRoundRobin
 	}
+	// T8: 能力清单先归一（trim / 去空 / 去重）再校验 —— 落库的就是路由层
+	// 逐字比对的那些名字。
+	r.Capabilities = NormalizeRouteCapabilities(r.Capabilities)
 	if err := ValidateRoute(r); err != nil {
 		return err
 	}
@@ -621,6 +669,7 @@ func (s *Service) UpdateRoute(ctx context.Context, r *domain.ModelRoute) error {
 		return domain.NewError(domain.CodeInvalidInput,
 			"updated_at version token is required (read the route first)")
 	}
+	r.Capabilities = NormalizeRouteCapabilities(r.Capabilities)
 	if err := ValidateRoute(r); err != nil {
 		return err
 	}
@@ -837,6 +886,12 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
 		}
 		if err := validatePoolStrategy(routes[i].PoolStrategy); err != nil {
+			return domain.NewError(domain.CodeInvalidInput,
+				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
+		}
+		// 能力词汇表与写面同口径（T8）：未知能力名在发布闸同样明确拒绝 ——
+		// 发出去的版本必须是「跑起来就是配的那个」。
+		if err := validateRouteCapabilities(routes[i].Capabilities); err != nil {
 			return domain.NewError(domain.CodeInvalidInput,
 				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
 		}

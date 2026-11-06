@@ -336,3 +336,99 @@ func TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause(t *testing.T) {
 		t.Errorf("write path: err = %v, want the pool_strategy replacement", err)
 	}
 }
+
+// T8 — 路由能力词汇表（route capabilities）受支持集约束。
+//
+// 「能力」是自由文本的年代留下的坑：运营可以写 "vision"、"images"、"Tools"，
+// 而路由层只认自己那几把钥匙 —— 写进去的能力名与实际行为不一致，配置看起来
+// 生效了（列在清单里），实际不授予任何能力。T8 起词汇表收口：
+//
+//   - 写面（CreateRoute/UpdateRoute/导入）与发布闸：未知能力名明确拒绝，
+//     并给出支持集；
+//   - 读面（已发布快照）：未知能力名**容忍**（忽略），旧目录必须仍能加载
+//     —— 否则升级即砖整个目录。
+func TestValidateRoute_CapabilityVocabulary(t *testing.T) {
+	ok := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true,
+		Capabilities: []string{"tools", "reasoning", "image"}}
+	if err := ValidateRoute(ok); err != nil {
+		t.Fatalf("supported capabilities rejected: %v", err)
+	}
+	// 空清单 = 全部能力（存量默认形态），必须照常接受。
+	empty := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true}
+	if err := ValidateRoute(empty); err != nil {
+		t.Fatalf("empty capability list rejected: %v", err)
+	}
+	for name, caps := range map[string][]string{
+		"unknown": {"vision"},
+		"case":    {"Tools"},
+		"plural":  {"images"},
+		"mixed":   {"tools", "vision"},
+		"blank":   {" "},
+	} {
+		r := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true,
+			Capabilities: caps}
+		err := ValidateRoute(r)
+		if err == nil {
+			t.Errorf("%s: accepted an unsupported capability %v", name, caps)
+			continue
+		}
+		if !strings.Contains(err.Error(), "capabilit") {
+			t.Errorf("%s: error %v must name the capability vocabulary", name, err)
+		}
+	}
+}
+
+// 发布闸与写面同口径：带未知能力名的路由不可发布（错误点名路由 id）。
+func TestValidateCatalogForPublish_CapabilityVocabulary(t *testing.T) {
+	models := []domain.Model{{ID: "m1", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols:        []domain.Protocol{domain.ProtocolOpenAIChat},
+		OutputModalities: []string{"text"}}}
+	providers := []domain.Provider{{ID: "p1", Code: "c", DisplayName: "C",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}}
+	deployments := []domain.Deployment{{ID: "d1", ProviderID: "p1", UpstreamModel: "u",
+		BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIChat,
+		ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second,
+		Status: domain.DeploymentActive}}
+	routes := []domain.ModelRoute{{ID: "r1", ModelID: "m1", DeploymentID: "d1", Weight: 1,
+		Enabled: true, Capabilities: []string{"vision"}}}
+	err := validateCatalogForPublish(models, providers, deployments, routes)
+	if err == nil {
+		t.Fatal("publish accepted a route with an unknown capability")
+	}
+	if !strings.Contains(err.Error(), "r1") || !strings.Contains(err.Error(), "capabilit") {
+		t.Errorf("publish refusal must name the route and the capability: %v", err)
+	}
+	// 支持集内的清单可发布。
+	routes[0].Capabilities = []string{"tools", "reasoning", "image"}
+	if err := validateCatalogForPublish(models, providers, deployments, routes); err != nil {
+		t.Fatalf("publish rejected a supported capability list: %v", err)
+	}
+}
+
+// T8 — 读面容忍未知能力名：已发布的旧目录必须仍能加载（否则升级即砖整个
+// 目录）。未知能力名**不授予任何能力**（路由层只认自己那几把钥匙），但
+// 它不会让整份快照加载失败。存量行不会被自动改写（不自动迁移）。
+func TestParseSnapshot_UnknownRouteCapabilityStaysLoadable(t *testing.T) {
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "models": [{"id":"m1","display_name":"M","lifecycle":"active","context_tokens":1000,
+	    "max_output_tokens":100,"protocols":["openai_chat"],"output_modalities":["text"]}],
+	  "providers": [{"id":"p1","code":"c","display_name":"C","access_type":"official_api","status":"active"}],
+	  "deployments": [{"id":"d1","provider_id":"p1","upstream_model":"u","base_url":"https://api.example.com",
+	    "protocol":"openai_chat","connect_timeout_ms":5000,"request_timeout_ms":30000,"status":"active"}],
+	  "routes": [{"id":"r1","model_id":"m1","deployment_id":"d1","priority":0,"weight":1,
+	    "capabilities":["vision"],"enabled":true}]
+	}`)
+	snap, err := ParseSnapshot(&domain.ConfigRevision{Scope: domain.ScopeCatalog, Revision: 1,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: payload}})
+	if err != nil {
+		t.Fatalf("an old published revision with an unknown capability must stay loadable: %v", err)
+	}
+	routes := snap.RoutesByModel["m1"]
+	if len(routes) != 1 {
+		t.Fatalf("routes = %d, want 1", len(routes))
+	}
+	if got := routes[0].Capabilities; len(got) != 1 || got[0] != "vision" {
+		t.Errorf("the stored capability list must not be rewritten: %v", got)
+	}
+}

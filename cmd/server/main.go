@@ -482,10 +482,16 @@ func main() {
 	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
 	if cfg.InferenceKayaChatGateway {
-		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, catalogCache, cfg.KayaChatModel)
+		// T8：picker 的能力判定与**派发**共用同一个 routing 服务（同一份
+		// adapter 集合、同一套能力规则）—— 列表不得 advertise 一个派发会
+		// 拒绝的图片能力。
+		chatFacade := service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, catalogCache, cfg.KayaChatModel)
+		chatFacade.SetImageCapability(routingSvc)
+		accessOps.KayaChat = chatFacade
 		// R7-N2：/chat/models 就绪闸门与 facade 同一快照源（catalogCache）——
 		// 冷启动携带 ErrNoVerifiedSnapshot → 503 + Retry-After。
 		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, catalogCache, cfg.KayaChatModel)
+		accessOps.KayaChatModels.Capabilities = routingSvc
 		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}
 	if cfg.InferenceCatalogJSON != "" {

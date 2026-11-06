@@ -227,3 +227,23 @@ func TestOpenAPI_ChatCompletionsDocumentsReasoningContent(t *testing.T) {
 		t.Error("ChatCompletionsRequest messages item must document reasoning_content")
 	}
 }
+
+// TestOpenAPI_ReasoningEffortContract pins the T8 effort contract:
+//
+//   - the chat-completions surface exposes the explicit `reasoning_effort`
+//     field (the level travels verbatim upstream — never folded into
+//     medium);
+//   - the Responses surface's `minimal` is the LOWEST REASONING LEVEL, not
+//     "reasoning off" — only `none` turns reasoning off. The stale
+//     "none/minimal → 关闭推理" wording contradicts the shipped code, so
+//     it is pinned here as a drift guard.
+func TestOpenAPI_ReasoningEffortContract(t *testing.T) {
+	doc := readOpenAPI(t)
+	if !strings.Contains(doc, "reasoning_effort") {
+		t.Error("openapi missing the reasoning_effort field (chat completions request)")
+	}
+	if strings.Contains(doc, "none/minimal") {
+		t.Error("openapi still documents the stale minimal semantics (none/minimal → 关闭推理); " +
+			"minimal is the lowest reasoning level, only none turns reasoning off")
+	}
+}

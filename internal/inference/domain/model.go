@@ -104,6 +104,75 @@ func (m Model) AcceptsImages() bool {
 	return false
 }
 
+// AdvertisedModalities returns the input modalities the gateway advertises
+// for a model in a client-facing listing (GET /chat/models, the legacy
+// /chat model picker).
+//
+// The declaration alone is NOT the answer: a model may declare "image" while
+// its published deployments cannot carry an image (e.g. only an
+// openai_responses deployment, whose protocol the gateway does not translate
+// images into). Advertising it would make the picker let the customer send
+// an image that dispatch then refuses. canServeImages must therefore come
+// from the SAME capability decision the dispatch path uses (routing's
+// CompatibleDeployments) — a second rule here would drift from dispatch.
+//
+// The declaration is otherwise passed through unchanged (only the "image"
+// element is gated), so a model that never claimed image is unaffected.
+func AdvertisedModalities(declared []string, canServeImages bool) []string {
+	mods := NormalizeInputModalities(declared)
+	if canServeImages {
+		return mods
+	}
+	out := make([]string, 0, len(mods))
+	for _, v := range mods {
+		if v == "image" {
+			continue
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		// The declaration only claimed image and the deployment set cannot
+		// carry it: keep the (normalized) text modality so the listing still
+		// says what the model can do.
+		out = []string{"text"}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Route capability vocabulary (T8)
+// ---------------------------------------------------------------------------
+
+// The route capability names a route may declare. The vocabulary is CLOSED:
+// a capability name outside it grants nothing and is rejected on the write
+// path — an undeclared name (e.g. "vision") used to look configured while
+// granting no capability at all.
+const (
+	// RouteCapabilityTools marks a route that serves tool-bearing calls.
+	RouteCapabilityTools = "tools"
+	// RouteCapabilityReasoning marks a route that serves reasoning calls.
+	RouteCapabilityReasoning = "reasoning"
+	// RouteCapabilityImage marks a route that serves image-bearing calls.
+	RouteCapabilityImage = "image"
+)
+
+// SupportedRouteCapabilities returns the closed capability vocabulary
+// (sorted) — the single list the write/publish gate validates against and
+// the routing layer interprets.
+func SupportedRouteCapabilities() []string {
+	return []string{RouteCapabilityImage, RouteCapabilityReasoning, RouteCapabilityTools}
+}
+
+// ValidRouteCapability reports whether c is inside the vocabulary.
+func ValidRouteCapability(c string) bool {
+	for _, v := range SupportedRouteCapabilities() {
+		if v == c {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // Reasoning effort (T8)
 // ---------------------------------------------------------------------------
@@ -116,10 +185,10 @@ type ReasoningEffort string
 // The reasoning-effort vocabulary the gateway can carry end to end.
 const (
 	ReasoningEffortMinimal ReasoningEffort = "minimal"
-	ReasoningEffortLow    ReasoningEffort = "low"
-	ReasoningEffortMedium ReasoningEffort = "medium"
-	ReasoningEffortHigh   ReasoningEffort = "high"
-	ReasoningEffortXHigh  ReasoningEffort = "xhigh"
+	ReasoningEffortLow     ReasoningEffort = "low"
+	ReasoningEffortMedium  ReasoningEffort = "medium"
+	ReasoningEffortHigh    ReasoningEffort = "high"
+	ReasoningEffortXHigh   ReasoningEffort = "xhigh"
 )
 
 // SupportedReasoningEfforts is the ordered vocabulary of effort levels a

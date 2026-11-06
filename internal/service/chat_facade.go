@@ -29,6 +29,7 @@ import (
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/gateway"
 	"github.com/yunhou/users/internal/inference/providers"
+	"github.com/yunhou/users/internal/inference/routing"
 	"github.com/yunhou/users/internal/model"
 )
 
@@ -40,6 +41,11 @@ type ChatGatewayFacade struct {
 	catalog      *catalog.Service
 	snapshots    gateway.SnapshotSource
 	defaultModel string
+	// capabilities answers "can this published model serve image input at
+	// all?" — the routing package's capability decision, i.e. the SAME one
+	// the dispatch path uses (T8). The legacy model picker must not
+	// advertise an image the dispatcher refuses.
+	capabilities routing.ImageCapabilityOracle
 
 	// lastNotReadyLog 节流「服务未就绪」ERROR 日志（unix 秒，≤1 条/30s），
 	// 避免目录故障期每个 /chat 请求刷一行。
@@ -56,7 +62,27 @@ type ChatGatewayFacade struct {
 // serving the last verified snapshot (评审修复 C1/I1：不得绕开 cache 直接
 // 打 store，否则哨兵不可达且每请求全量 SELECT+ParseSnapshot)。
 func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *catalog.Service, snapshots gateway.SnapshotSource, defaultModel string) *ChatGatewayFacade {
-	return &ChatGatewayFacade{gw: gw, resolver: resolver, catalog: cat, snapshots: snapshots, defaultModel: defaultModel}
+	return &ChatGatewayFacade{
+		gw: gw, resolver: resolver, catalog: cat, snapshots: snapshots, defaultModel: defaultModel,
+		capabilities: routing.ProductionImageCapability(),
+	}
+}
+
+// SetImageCapability wires the capability oracle (the routing service in
+// production) so the picker and the dispatcher share ONE decision. A nil
+// oracle falls back to the production adapter registry.
+func (f *ChatGatewayFacade) SetImageCapability(o routing.ImageCapabilityOracle) {
+	if o != nil {
+		f.capabilities = o
+	}
+}
+
+// imageCapability returns the capability oracle to use (never nil).
+func (f *ChatGatewayFacade) imageCapability() routing.ImageCapabilityOracle {
+	if f.capabilities != nil {
+		return f.capabilities
+	}
+	return routing.ProductionImageCapability()
 }
 
 // StreamChat implements the /chat service surface. The request always
@@ -120,6 +146,7 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 		return nil, err
 	}
 	out := make([]ChatModelInfo, 0, len(models))
+	capability := f.imageCapability() // 一次解析（每请求一次），不逐模型取
 	for _, m := range models {
 		provider := ""
 		if deps := snap.ActiveDeployments(m.ID); len(deps) > 0 {
@@ -127,19 +154,18 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 				provider = pv.Code
 			}
 		}
-		mods := modalitiesOrDefault(m.InputModalities)
+		// T8: 透出的 input_modalities 必须与**派发**能力一致 —— 声明了
+		// image 但已发布部署没有能承载图片的协议时，不再 advertise image
+		// （picker 让客户发图、网关在准入前当场 400 是最坏的组合）。判据
+		// 来自 routing 的同一个能力判定，不另立规则。
+		mods := domain.AdvertisedModalities(m.InputModalities,
+			capability.SupportsImageInput(snap, m.ID))
 		out = append(out, ChatModelInfo{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
 			Default: m.ID == f.defaultModel, InputModalities: mods,
 		})
 	}
 	return out, nil
-}
-
-// modalitiesOrDefault 透出归一：空 modalities = 缺省放行（["text","image"]，
-// 与网关视觉门控同口径），显式声明原样透出。统一走 domain 的单一归一点。
-func modalitiesOrDefault(mods []string) []string {
-	return domain.NormalizeInputModalities(mods)
 }
 
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {

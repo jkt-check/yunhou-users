@@ -1306,3 +1306,101 @@ func TestV1Messages_NoFakedThinkingSignature(t *testing.T) {
 		t.Errorf("the ordinary text answer must survive: %s", out)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T8 — Responses 面的「产出 vs 回放」不对称
+//
+// 网关在答复里**产出** reasoning 输出项（推理摘要，客户端看得见），但
+// **输入**里的 reasoning 项被明确 400（无法忠实回放：本网关不实现 OpenAI
+// 的加密推理存储，include=reasoning.encrypted_content 早已被拒）。
+//
+// 后果（真实客户端风险，必须写进运维文档）：手动接续（客户端把上一轮的
+// output items 原样回传进 input）的客户端在**第二轮**就会撞上 400。
+// previous_response_id 链不受影响 —— 落链的 transcript 不含 reasoning 项，
+// 因此链式回放永远不撞那个 400。
+// ---------------------------------------------------------------------------
+
+func TestV1Responses_ReasoningOutputItemDoesNotBreakTheChain(t *testing.T) {
+	f := newProtoFixture(t)
+	// 上游回推理内容 → 答复里带 reasoning 输出项。
+	f.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		select {
+		case f.lastBodies <- body:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-r1","object":"chat.completion","created":1,"model":"glm-upstream",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"Hello","reasoning_content":"plan"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`)
+	})
+
+	// 第一轮：答复里必须有 reasoning 输出项（产出侧）。
+	w := f.call(t, http.MethodPost, "/v1/responses", f.keyPlain, map[string]any{
+		"model": "glm-4.6",
+		"input": []map[string]any{{
+			"type": "message", "role": "user",
+			"content": []map[string]any{{"type": "input_text", "text": "remember 42"}},
+		}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		ID     string `json:"id"`
+		Output []struct {
+			Type string `json:"type"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	sawReasoning := false
+	for _, o := range resp.Output {
+		if o.Type == "reasoning" {
+			sawReasoning = true
+		}
+	}
+	if !sawReasoning {
+		t.Fatalf("the response must carry the reasoning output item: %s", w.Body.String())
+	}
+
+	// 落链的 transcript 不得含 reasoning 项（回放侧）：否则链式回放会撞上
+	// 「输入里的 reasoning 项 → 400」。
+	var transcript []byte
+	if err := f.db.QueryRow(`SELECT transcript FROM inference_response_chains WHERE id = $1`,
+		resp.ID).Scan(&transcript); err != nil {
+		t.Fatalf("chain row missing: %v", err)
+	}
+	if strings.Contains(string(transcript), `"type":"reasoning"`) {
+		t.Errorf("the stored transcript must not contain a reasoning item: %s", transcript)
+	}
+
+	// 第二轮：previous_response_id 链必须照常工作（200）。
+	w2 := f.call(t, http.MethodPost, "/v1/responses", f.keyPlain, map[string]any{
+		"model": "glm-4.6", "previous_response_id": resp.ID,
+		"input": []map[string]any{{
+			"type": "message", "role": "user",
+			"content": []map[string]any{{"type": "input_text", "text": "what did I say?"}},
+		}},
+	})
+	if w2.Code != http.StatusOK {
+		t.Fatalf("chained code = %d body = %s (previous_response_id must keep working)",
+			w2.Code, w2.Body.String())
+	}
+
+	// 手动接续（回显 reasoning 项）→ 明确 400，不静默丢弃。
+	w3 := f.call(t, http.MethodPost, "/v1/responses", f.keyPlain, map[string]any{
+		"model": "glm-4.6",
+		"input": []map[string]any{
+			{"type": "message", "role": "user",
+				"content": []map[string]any{{"type": "input_text", "text": "remember 42"}}},
+			{"type": "reasoning", "id": "rs_1",
+				"summary": []map[string]any{{"type": "summary_text", "text": "plan"}}},
+		},
+	})
+	if w3.Code != http.StatusBadRequest {
+		t.Fatalf("manual echo code = %d, want 400 (reasoning 项必须明确拒绝): %s",
+			w3.Code, w3.Body.String())
+	}
+}

@@ -2119,8 +2119,9 @@ components:
         reasoning:
           type: object
           description: |
-            effort 的档位逐字透传给能表达该档位的上游协议（T8：low/medium/
-            high/xhigh 原样下传，不再一律折成 medium）。none/minimal → 关闭
+            effort 的档位逐字透传给能表达该档位的上游协议（T8：minimal/
+            low/medium/high/xhigh 原样下传，不再一律折成 medium）。minimal 是
+            最低**推理档**（OpenAI 语义），不是「关闭推理」——只有 none 才关闭
             推理。词表外的档位明确 400。
           properties:
             effort: { type: string, enum: [low, medium, high, xhigh, none, minimal] }

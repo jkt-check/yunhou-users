@@ -221,6 +221,34 @@ OpenAI Chat Completions（tools + stream_options.include_usage）——
 - 多模态块/服务端工具（web_search/computer/bash/code_execution/mcp）
   → 400。
 
+### T8 的三条真实客户端风险（发布前必须知道）
+
+1. **Responses 面的「产出 vs 回放」不对称**：网关在 `/v1/responses` 的答复里
+   **产出** reasoning 输出项（推理摘要，客户端看得见），但**输入**里的
+   reasoning 项被**明确 400**（本网关不实现 OpenAI 的加密推理存储，
+   `include=reasoning.encrypted_content` 早已被拒，推理项没有可回放的加密
+   载荷）。后果：**手动接续**（客户端把上一轮的 output items 原样回传进
+   `input`）的客户端在**第二轮**就会撞上 400 —— 这是真实客户端风险，不是
+   理论问题。`previous_response_id` 链**不受影响**：落链的 transcript 不含
+   reasoning 项，链式回放永远不撞那个 400（回归用例：
+   `TestV1Responses_ReasoningOutputItemDoesNotBreakTheChain`）。
+   缓解：客户端用 `previous_response_id` 接续，不要手动回显 output items；
+   或走 `/v1/chat/completions`（推理以 `reasoning_content` 逐字透传）。
+2. **Anthropic-only 部署上的 `reasoning.effort` 现在明确 400**（T8 兼容性
+   修正）：`anthropic_messages` 协议**没有** effort 旋钮（它的推理旋钮是
+   `budget_tokens`，另一根轴）。T8 之前 `reasoning.effort` 会被折成布尔开关
+   并照常发给 Anthropic 上游（档位丢失）；现在档位必须**逐字**落到能表达它
+   的协议上，否则请求在**出站前**被拒（400）。只部署了 Anthropic 协议的模型
+   因此**不再接受** `reasoning.effort`（含 `/v1/responses` 面）—— 运营要么给
+   该模型配一条能表达档位的协议，要么客户端别发档位。
+3. **存量路由能力清单被有意收窄（T8）**：路由 `capabilities` 词表封闭
+   （`tools`/`reasoning`/`image`），**存量非空清单**（例如
+   `["tools","reasoning"]`）里没有 `image` → **不再承载带图请求**，相应模型
+   也不再 advertise 图片能力（`GET /chat/models` 的 `input_modalities` 与
+   legacy `/chat` picker 只透出 `["text"]`）。空清单（存量默认）行为不变。
+   灰度前请核对要承载图片的路由是否显式列出了 `"image"`，修法见
+   `docs/runbooks/kaya-coding-plan-operations.md` §`capabilities`。
+
 **发布前置待办（G2 之前必须完成）**：
 1. 用真实 Claude Code 与 Codex 客户端指向 staging 网关跑通：登录态
    Key 配置、流式长会话、工具调用多轮、中断/重连、超额 429 展示；

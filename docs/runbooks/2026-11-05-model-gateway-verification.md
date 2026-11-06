@@ -3777,6 +3777,99 @@ as in §2.3 (53 files, idempotent on the second run).
 | `tests/integration/kaya_client_contract_test.go` | the thinking-history fixture case now expects the explicit 400; a new case proves the tool history without the thinking block still works |
 | `docs/api-integration-guide.md`, `docs/api/kaya-coding-plan.openapi.yaml`, `docs/api/kaya-coding-plan-website-handoff.md`, `docs/runbooks/kaya-coding-plan-rollout.md`, `docs/api/fixtures/client/client-request-anthropic-messages-thinking-history.json` | the capability matrices, the new field/error, and the compatibility corrections |
 
+#### 4.39 T8 fix round — four review findings (OpenAPI semantics, picker vs dispatch, capability vocabulary, emit-vs-echo)
+
+Recorded on 2026-11-06, after the T8 commit `059a904`. Four **Important**
+review findings were fixed with focused TDD; the fix round is one independent
+commit on top of `059a904`. Nothing else was touched — deferred minors stayed
+deferred.
+
+**Environment.** Same recipe as §4.32: a fresh trap-cleaned disposable
+PostgreSQL per run, explicit `DATABASE_URL` / `E2E_DATABASE_URL`, `-p 1`,
+`-race`, `GOPROXY=off` + `GOFLAGS=-mod=readonly`, `go.mod` / `go.sum`
+untouched.
+
+##### 4.39.1 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | **RED** `go test -count=1 -run 'TestOpenAPI_ReasoningEffortContract' -v ./internal/inference/httpapi` | **1** | the stale `minimal` semantics were still documented — §4.39.2 |
+| 4 | **RED** `go test -count=1 -run 'TestKayaModels_ImageModalitiesFollowDispatchCapability' -v ./internal/inference/httpapi` | **1** | the picker still advertised a refused image — §4.39.2 |
+| 5 | **RED** `go test -count=1 -run 'TestChatFacade_AllowedModels_ImageModalitiesFollowDispatchCapability' -v ./internal/service` | **1** | the legacy picker had the same defect — §4.39.2 |
+| 6 | **RED** `go test -count=1 -run 'TestValidateRoute_CapabilityVocabulary\|TestValidateCatalogForPublish_CapabilityVocabulary' -v ./internal/inference/catalog` | **1** | the capability vocabulary was unvalidated — §4.39.2 |
+| 7 | **RED/protection** `go test -count=1 -run 'TestRouteCovers_LegacyCapabilityLists\|TestParseSnapshot_UnknownRouteCapabilityStaysLoadable' -v ./internal/inference/routing ./internal/inference/catalog` | **0** | the legacy empty-vs-restrictive semantics and the read-path tolerance already held — protection evidence |
+| 8 | **protection** `go test -count=1 -run 'TestV1Responses_ReasoningOutputItemDoesNotBreakTheChain' -v ./internal/inference/httpapi` | **0** | the chain already worked (the finding was a documentation gap, not a code gap) |
+| 9 | **acceptance (brief, verbatim)** `go test -race -count=1 -p 1 ./internal/inference/providers/... ./internal/inference/httpapi ./internal/inference/gateway` | **0** | 4 packages `ok` (final tree: `providers` 4.777s / `providers/connector` 1.179s / `httpapi` 66.711s / `gateway` 14.134s) |
+| 10 | `go test -race -count=1 -p 1 ./internal/inference/... ./internal/service/... ./internal/handler/... ./cmd/...` | **0** | 19 packages `ok`, 0 `FAIL` |
+| 11 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | `ok github.com/yunhou/users/tests/integration 39.001s`, 2 SKIP (the `KAYA_LOAD=1` gate) |
+| 12 | `E2E_DATABASE_URL=<disposable> go test -race -count=1 ./tests/e2e/...` | **0** | `ok github.com/yunhou/users/tests/e2e 396.435s` |
+| 13 | CI `go-ci` gate + coverage floor | **0** | 33 packages `ok`, 0 `FAIL`, `total coverage: 80.2%` ≥ the 80% floor |
+
+##### 4.39.2 RED evidence (before the production edits)
+
+Every new case was written against the **existing** API surface (the OpenAPI
+document, the handler/facade constructors, `catalog.ValidateRoute`, the
+routing filters) — so every failure is a behavioural assertion failure, never
+a compile error.
+
+```
+--- FAIL: TestOpenAPI_ReasoningEffortContract (0.00s)
+    openapi_contract_test.go:246: openapi still documents the stale minimal semantics
+    (none/minimal → 关闭推理); minimal is the lowest reasoning level, only none turns reasoning off
+--- FAIL: TestKayaModels_ImageModalitiesFollowDispatchCapability (0.06s)
+    kaya_models_test.go:NNN: glm-vision-v input_modalities = [text image], want [text]
+    (没有能承载图片的部署时不得 advertise image)
+--- FAIL: TestChatFacade_AllowedModels_ImageModalitiesFollowDispatchCapability (0.00s)
+    chat_facade_test.go:837: glm-v InputModalities = [text image], want [text]
+    (只有 openai_responses 部署时不得 advertise image)
+--- FAIL: TestValidateRoute_CapabilityVocabulary (0.00s)
+    validate_edges_test.go:372: unknown: accepted an unsupported capability [vision]
+    validate_edges_test.go:372: case: accepted an unsupported capability [Tools]
+    validate_edges_test.go:372: plural: accepted an unsupported capability [images]
+    validate_edges_test.go:372: mixed: accepted an unsupported capability [tools vision]
+    validate_edges_test.go:372: blank: accepted an unsupported capability [ ]
+--- FAIL: TestValidateCatalogForPublish_CapabilityVocabulary (0.00s)
+    validate_edges_test.go:396: publish accepted a route with an unknown capability
+```
+
+**Protection evidence (already-correct behaviour, recorded instead of forced
+changes).** Three cases passed at the pre-fix baseline and pin behaviour the
+fix must NOT change:
+
+| Case | Guard that already held |
+|---|---|
+| `TestRouteCovers_LegacyCapabilityLists` | an empty capability list still means "everything"; a restrictive list grants exactly what it declares |
+| `TestParseSnapshot_UnknownRouteCapabilityStaysLoadable` | an already-published revision with an unknown capability name stays loadable (no catalog bricking) and the stored row is not rewritten |
+| `TestV1Responses_ReasoningOutputItemDoesNotBreakTheChain` | the Responses surface emits a reasoning output item, the stored transcript excludes it, `previous_response_id` chaining works, and a manual echo of a reasoning item is an explicit 400 |
+
+##### 4.39.3 The fix
+
+| Finding | Fix | Files |
+|---|---|---|
+| 1 — OpenAPI contradicted the shipped `minimal` semantics | the Responses `reasoning.effort` description now states that `minimal` is the lowest **reasoning level** and only `none` turns reasoning off; the OpenAPI contract test pins `reasoning_effort` and **fails** on the stale `none/minimal` wording | `docs/api/kaya-coding-plan.openapi.yaml`, `internal/inference/httpapi/openapi_contract_test.go` |
+| 2 — the picker advertised images dispatch refuses | the advertised modalities are now "declaration ∩ dispatch capability", computed by the **same** decision the dispatcher uses (`routing.CompatibleDeployments`); the shared helper is `domain.AdvertisedModalities` and the oracle is `routing.ImageCapabilityOracle` (implemented by `routing.Service`, defaulting to the production adapter registry; cmd/server wires the routing service so both sides share one adapter set) | `internal/inference/routing/service.go`, `internal/inference/domain/model.go`, `internal/inference/httpapi/kaya_models.go`, `internal/service/chat_facade.go`, `cmd/server/main.go` |
+| 3 — the route capability vocabulary was free-form | the vocabulary is closed (`tools`/`reasoning`/`image`, one definition in `domain`); the **write** path (operator CRUD) and the **publish** gate reject an unknown name with a clear error, the write path normalizes (trim/drop-empty/dedupe, no case folding); the **read** path tolerates unknown names (an old published revision must stay loadable) and the stored row is never rewritten | `internal/inference/domain/model.go`, `internal/inference/catalog/service.go`, `internal/inference/routing/service.go` |
+| 4 — the emit-vs-echo asymmetry and the Anthropic-only effort correction | documentation only (the behaviour itself is spec-compliant and already pinned by a focused regression test): the rollout runbook now states the emit-vs-echo asymmetry and the real second-turn risk for clients that echo output items, the Anthropic-only `reasoning.effort` 400, and the deliberate narrowing of the published non-empty capability lists | `docs/runbooks/kaya-coding-plan-rollout.md`, `docs/runbooks/kaya-coding-plan-operations.md`, `docs/api-integration-guide.md` |
+
+##### 4.39.4 Compatibility notes (the fix round)
+
+- **The published non-empty capability lists are narrowed on purpose.** A
+  stored list such as `["tools","reasoning"]` does not mention `image`, so
+  that route no longer serves image-bearing requests, and a model whose
+  routes are all of that shape no longer advertises the image modality. The
+  empty list (the storage default) is unchanged. The remedy (add `"image"`
+  explicitly) is in the operations runbook; the narrowing is called out in
+  the rollout runbook and the compatibility report.
+- **Old rows are never rewritten.** The write path normalizes only what is
+  written from now on; the read path ignores an unknown capability name
+  instead of failing the whole revision (an upgrade must not brick the
+  catalog) and the publish gate refuses a draft that carries one — loudly,
+  with the route id and the offending name.
+- **`previous_response_id` chains are unchanged** and stay covered by
+  `TestV1Responses_ReasoningOutputItemDoesNotBreakTheChain`.
+
 #### 4.39 Notes (root cause, compatibility, honesty, unresolved boundaries)
 
 - **Root cause (three classes).** (1) The image capability existed only in the

@@ -196,14 +196,16 @@ type CompatibleDeployment struct {
 
 // CompatibleDeployments returns the deployments that can structurally serve
 // the call's needs, in failover order. It is the ONE place the capability
-// filters live: the candidate builder and the gateway's pre-admission
-// capability gate both call it, so the two can never disagree.
+// filters live: the candidate builder, the gateway's pre-admission
+// capability gate and the client-facing modality projections all call it,
+// so they can never disagree.
 //
 // It performs NO account-pool lookup: the result is a capability statement,
 // not a capacity statement. The gateway uses it to reject an unservable
 // request BEFORE admission (zero hold, zero dispatch) — a request that no
 // published deployment can carry is a client error, not a capacity gap.
-func (s *Service) CompatibleDeployments(snap *catalog.Snapshot, modelID string, needs Needs) []CompatibleDeployment {
+func CompatibleDeployments(adapters map[domain.Protocol]providers.Adapter,
+	snap *catalog.Snapshot, modelID string, needs Needs) []CompatibleDeployment {
 	var out []CompatibleDeployment
 	for _, route := range snap.RoutesByModel[modelID] {
 		if !route.Enabled || !routeCovers(route, needs) {
@@ -224,7 +226,7 @@ func (s *Service) CompatibleDeployments(snap *catalog.Snapshot, modelID string, 
 		if !ok || !snap.DeploymentSchedulable(d) {
 			continue
 		}
-		adapter, ok := s.adapters[d.Protocol]
+		adapter, ok := adapters[d.Protocol]
 		if !ok {
 			continue
 		}
@@ -234,6 +236,57 @@ func (s *Service) CompatibleDeployments(snap *catalog.Snapshot, modelID string, 
 		out = append(out, CompatibleDeployment{Route: route, Deployment: d})
 	}
 	return out
+}
+
+// CompatibleDeployments is the Service's view of the shared capability
+// decision (same adapter set the dispatcher uses).
+func (s *Service) CompatibleDeployments(snap *catalog.Snapshot, modelID string, needs Needs) []CompatibleDeployment {
+	return CompatibleDeployments(s.adapters, snap, modelID, needs)
+}
+
+// SupportsImages reports whether the model has at least one published
+// deployment that can carry image input — and at least one dispatchable
+// deployment at all. It is the SAME decision the dispatch path uses, so a
+// client-facing listing can never advertise an image the dispatcher refuses.
+func SupportsImages(adapters map[domain.Protocol]providers.Adapter,
+	snap *catalog.Snapshot, modelID string) bool {
+	if len(CompatibleDeployments(adapters, snap, modelID, Needs{})) == 0 {
+		return false // the model has no dispatchable deployment at all
+	}
+	return len(CompatibleDeployments(adapters, snap, modelID, Needs{Images: true})) > 0
+}
+
+// ImageCapabilityOracle answers whether a published model can serve image
+// input AT ALL. The client-facing modality projections (GET /chat/models and
+// the legacy /chat picker) must use it — advertising an image the dispatcher
+// refuses is a capability lie.
+//
+// The implementation is the routing package's own decision; the interface
+// exists so the projections do not have to own an adapter registry.
+type ImageCapabilityOracle interface {
+	SupportsImageInput(snap *catalog.Snapshot, modelID string) bool
+}
+
+// SupportsImageInput implements ImageCapabilityOracle with the service's own
+// adapter set — identical to the one the dispatcher uses.
+func (s *Service) SupportsImageInput(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsImages(s.adapters, snap, modelID)
+}
+
+// registryOracle adapts an adapter registry to the ImageCapabilityOracle.
+type registryOracle map[domain.Protocol]providers.Adapter
+
+// SupportsImageInput implements ImageCapabilityOracle.
+func (r registryOracle) SupportsImageInput(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsImages(r, snap, modelID)
+}
+
+// ProductionImageCapability is the oracle over the PRODUCTION adapter
+// registry (providers.RegisteredAdapters) — the same registry cmd/server
+// wires into the routing service. It is the default for the client-facing
+// projections, which have no routing service of their own.
+func ProductionImageCapability() ImageCapabilityOracle {
+	return registryOracle(providers.RegisteredAdapters())
 }
 
 // adapterServes reports whether one adapter's declared capabilities cover
@@ -309,7 +362,9 @@ func (s *Service) activeAccounts(ctx context.Context, providerID string, fresh b
 
 // routeCovers reports whether a route's capability list covers the call's
 // needs. An empty list means "everything the model supports" (the model
-// capability gate runs before routing); a non-empty list is restrictive.
+// capability gate runs before routing); a non-empty list is restrictive —
+// it enumerates the capabilities the route carries, and a demand it does
+// not list is NOT served (T8: "image" is one of those keys).
 func routeCovers(r domain.ModelRoute, needs Needs) bool {
 	if len(r.Capabilities) == 0 {
 		return true
@@ -318,13 +373,13 @@ func routeCovers(r domain.ModelRoute, needs Needs) bool {
 	for _, c := range r.Capabilities {
 		has[c] = true
 	}
-	if needs.Tools && !has["tools"] {
+	if needs.Tools && !has[domain.RouteCapabilityTools] {
 		return false
 	}
-	if needs.Reasoning && !has["reasoning"] {
+	if needs.Reasoning && !has[domain.RouteCapabilityReasoning] {
 		return false
 	}
-	if needs.Images && !has["image"] {
+	if needs.Images && !has[domain.RouteCapabilityImage] {
 		return false
 	}
 	return true

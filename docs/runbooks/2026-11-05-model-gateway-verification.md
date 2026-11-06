@@ -4453,7 +4453,7 @@ acceptance task, and the plan puts the acceptance **fixtures** in
 | 9 | `go test -race -count=1 -p 1 ./tests/e2e/...` — **first attempt** | **1** | **procedure error on my side**: the e2e job had its **own** database (`t10_e2e`) and I had migrated only `DATABASE_URL` (`t10_app`) → `relation "inference_audit_log" does not exist` in every e2e case. Not a product failure; re-run in row 10 with the e2e database migrated. The failing output is kept verbatim in §4.55. |
 | 10 | `DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate` ×2, then `go test -race -count=1 -p 1 ./tests/e2e/...` | **0** / **0** / **0** | `applied=53 skipped=0`, then `applied=0 skipped=53`, then `ok github.com/yunhou/users/tests/e2e 139.323s` |
 | 10b | `go test -race -count=1 -p 1 -v ./tests/e2e/...` (e2e skip inventory) | **0** | `ok … 136.614s`; **125 top-level PASS + 55 sub-test PASS / 1 SKIP / 0 FAIL** — §4.54 |
-| 11 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was **deleted** afterwards — see §4.56) |
+| 11 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was **deleted** afterwards — it is not a deliverable, see §4.57) |
 | 12 | coverage floor: `go tool cover -func=coverage.out` → `awk 'BEGIN { exit !(t+0 >= 80) }'` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T0 80.4%, T2 80.3%, T9 80.3%) |
 | 13 | `git diff --check` | **0** | no whitespace error |
 | 14 | `git diff --stat go.mod go.sum` | **0** | empty — the module files were never touched |

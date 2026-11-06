@@ -420,6 +420,19 @@ func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 // (usage records only ever commit inside Settle), so unknown is the honest
 // ledger-level state until recovery settles or corrects it.
 //
+// 终审 Finding 1 —— **速率预占的处置**：一个因为账务异常（缺预占 / 预占漂移 /
+// 证据不足）而停放的请求**永远不会被结算**，它的速率预占若继续停在
+// state='reserved' 就会永久占着账户的 TPM 额度（账户被永久 429 拦住，且没有
+// 任何路径能把它取回来）。因此在**同一个事务**里把该请求的在途速率预占处置
+// 为 state='anomaly'（语义见 inference_limit_repo.go 的 rateStateAnomaly）：
+//
+//   - 只有**只能人工处理**的原因才处置：证据驱动的原因（unknown_usage /
+//     crash_recovery）保留预占 —— 恢复 worker 会按保守估算结算它，额度不能
+//     提前归还；
+//   - 处置**不动金额**：窗口/Key 的金额预占仍在，账本没有 charge，钱既没结
+//     也没放；处置**不动证据**：核对任务的原因与 request.last_error 不变；
+//   - RPM 事实保留：一次逻辑请求仍然计 1 次。
+//
 // 评审轮1 I2 终态守卫：mark 与并发成功 settle 交错时绝不覆盖终态——UPDATE
 // 带 status NOT IN ('settled','released') 谓词，0 行且请求存在 = 已被并发
 // 终态化，静默收敛（与 Release 的对称守卫同口径）：不覆盖 status、不把
@@ -452,6 +465,13 @@ func (s *Store) MarkReconciliationRequired(ctx context.Context, w domain.UnitOfW
 			return mapError("mark reconciliation", sql.ErrNoRows)
 		}
 		return nil
+	}
+	// 只能人工处理的原因 → 在途速率预占显式处置为 anomaly（同一事务）：停放的
+	// 异常不得永久占用账户 TPM 额度（终审 Finding 1）。
+	if IsManualOnlyReconciliationReason(reason) {
+		if err := s.parkRateReservationTx(ctx, tx, requestID, reason); err != nil {
+			return err
+		}
 	}
 	return s.EnqueueReconciliationJobTx(ctx, w, EnqueueReconciliationCommand{
 		RequestID: &requestID, Reason: reason, Deadline: deadline,

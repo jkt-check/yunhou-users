@@ -4737,6 +4737,256 @@ exactly the two new test files (plus the two documentation files above).
      pattern and give the worker an RPM/TPM/concurrency-limited policy.
 
 
+### 4.59 Final-review fix wave — the parked-anomaly TPM leak, the rollout runbook, the wallet follow-up
+
+Recorded on 2026-11-07, base SHA `cb6866e` (the final review's base). The
+final review raised three findings; this section records the evidence for the
+fix wave that closed them.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`;
+every database-backed command used `-p 1`; `go.mod` / `go.sum` were never
+modified (`git diff --stat go.mod go.sum` → empty after the run).
+
+#### 4.59.1 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go build ./...` | **0** | build green (no new dependency) |
+| 2 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 3 | `go run ./cmd/migrate` (run 1, `ff_app`) | **0** | `applied=54 skipped=0` (53 baseline + 054) |
+| 4 | `go run ./cmd/migrate` (run 2, `ff_app`) | **0** | `applied=0 skipped=54` (idempotent) |
+| 5 | `go run ./cmd/migrate -status` (`ff_app`) | **0** | 54 × `✅` |
+| 6 | `go run ./cmd/migrate` ×2 + `-status` (`ff_e2e`, `DATABASE_URL=$E2E_DATABASE_URL`) | **0** / **0** / **0** | the e2e-side database is migrated the same way |
+| 7 | **RED** `go test -count=1 -run 'TestParkedAnomaly\|TestEvidenceDrivenPark' -v ./internal/inference/postgres` | **1** | the leak reproduced — see §4.59.2 |
+| 8 | **GREEN** the same command | **0** | the store-level regressions pass |
+| 9 | **GREEN** `go test -count=1 -run 'TestRecover_ParkedAnomaly' -v ./internal/inference/workers` | **0** | the recovery-level regressions pass |
+| 10 | **GREEN** `go test -count=1 -run 'TestGateway_ParkedAnomaly' -v ./internal/inference/gateway` | **0** | the gateway-level regression passes |
+| 11 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/postgres ./internal/inference/gateway ./internal/inference/workers ./internal/inference/quota ./internal/inference/access` | **0** | 5 packages `ok` |
+| 12 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 13 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor |
+| 14 | `go test -race -count=1 -p 1 -v ./internal/inference/... ./tests/integration/...` (skip audit) | **0** | 1136 top-level PASS + 360 subtest PASS, **3 SKIP**, 0 FAIL — the three skips are the known non-database ones and **no** skip mentions postgres / no database |
+| 15 | `go test -race -count=1 -p 1 -v ./tests/e2e/...` (`E2E_DATABASE_URL` → `ff_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 137.597s` — 125 top-level PASS + 55 subtest PASS, **1 SKIP** (the pre-existing non-default gate `USAGE_ACCEPTANCE=1`), 0 FAIL |
+| 16 | `git diff --check` | **0** | no whitespace errors |
+| 17 | `git status --short` after the run | **0** | only the files of this wave (no generated artefact left behind) |
+
+#### 4.59.2 RED — a parked anomaly permanently consumed the account's TPM
+
+The RED run used the **unmodified production code at `cb6866e`**; the new
+tests were written against the *existing* API surface only
+(`Store.MarkReconciliationRequired`, `Store.ReserveRateTx`,
+`Store.PurgeRateReservations`, the gateway's `ChatCompletions` and the
+recovery worker's `RunPass`), so every failure is a behavioural assertion
+failure, never a compile error.
+
+```
+=== RUN   TestParkedAnomaly_RateHoldLeavesTheLiveTPM
+    rate_anomaly_test.go:49: scope account state = "reserved", want anomaly (停放必须显式处置速率预占，不得停在 reserved)
+    rate_anomaly_test.go:49: scope key state = "reserved", want anomaly (停放必须显式处置速率预占，不得停在 reserved)
+    rate_anomaly_test.go:55: in-flight tokens = 60, want 0 (停放的异常不得永久占用 TPM)
+    rate_anomaly_test.go:102: a parked anomaly must not block the account TPM: inference/rate_limited: rate limit exceeded: blocked by policy_tpm; tpm_used=110 tpm_limit=100
+--- FAIL: TestParkedAnomaly_RateHoldLeavesTheLiveTPM (0.06s)
+=== RUN   TestParkedAnomaly_IsPurgedByTheRetentionSweep
+    rate_anomaly_test.go:140: purged = 0, want 2 (处置后的速率行不再占额度，必须可被保留期清理)
+    rate_anomaly_test.go:143: rate rows = 2, want 0 (处置后的速率行必须可被清理)
+--- FAIL: TestParkedAnomaly_IsPurgedByTheRetentionSweep (0.05s)
+=== RUN   TestEvidenceDrivenPark_KeepsTheRateHold
+--- PASS: TestEvidenceDrivenPark_KeepsTheRateHold (0.05s)
+FAIL	github.com/yunhou/users/internal/inference/postgres	0.825s
+```
+
+**Why this failure is the expected one.** The third line is the finding
+verbatim: after a request was parked with the manual-only reason
+`missing_reservation`, the account's in-flight TPM was still **60**, and the
+next admission was rejected with `rate_limited … tpm_used=110 tpm_limit=100`
+— the account is blocked by a request that can never settle. The retention
+sweep removed **0** rows, because a `state='reserved'` row is never deleted.
+`TestEvidenceDrivenPark_KeepsTheRateHold` already passed at the baseline: it
+is **protection evidence** — an evidence-driven park (`unknown_usage`) must
+keep its hold, because the recovery will settle that request at the
+conservative estimate.
+
+#### 4.59.3 GREEN
+
+Command #8 (same tests, production code fixed) — exit code **0**:
+
+```
+--- PASS: TestParkedAnomaly_RateHoldLeavesTheLiveTPM (0.06s)
+--- PASS: TestParkedAnomaly_IsPurgedByTheRetentionSweep (0.04s)
+--- PASS: TestParkedAnomaly_LaterSettlementBooksTheActualTokens (0.04s)
+--- PASS: TestParkedAnomaly_CorrectionIsExplicit (0.04s)
+--- PASS: TestEvidenceDrivenPark_KeepsTheRateHold (0.05s)
+ok  	github.com/yunhou/users/internal/inference/postgres	2.687s
+```
+
+Command #9 (the recovery level) — exit code **0**:
+
+```
+--- PASS: TestRecover_ParkedAnomaly_DisposesTheRateHoldAndDoesNotReDrive (0.07s)
+--- PASS: TestRecover_ParkedAnomaly_KeepsTheMonetaryHoldsAndTheLedgerEmpty (0.05s)
+ok  	github.com/yunhou/users/internal/inference/workers	0.796s
+```
+
+Command #10 (the gateway level) — exit code **0**:
+
+```
+--- PASS: TestGateway_ParkedAnomaly_DisposesTheRateReservation (0.07s)
+ok  	github.com/yunhou/users/internal/inference/gateway	0.685s
+```
+
+Acceptance command #11 — exit code **0**:
+
+```
+ok  	github.com/yunhou/users/internal/inference/postgres	13.706s
+ok  	github.com/yunhou/users/internal/inference/gateway	9.327s
+ok  	github.com/yunhou/users/internal/inference/workers	7.010s
+ok  	github.com/yunhou/users/internal/inference/quota	1.625s
+ok  	github.com/yunhou/users/internal/inference/access	1.659s
+```
+
+#### 4.59.4 The fix — an explicit rate-reservation disposition
+
+The disposition is a **new state on the rate reservation row**
+(`inference_rate_reservations.state = 'anomaly'`), applied in the **same
+transaction** as the park:
+
+* it **leaves the live TPM budget** (the in-flight sum counts only
+  `state='reserved'` rows) — one anomaly can no longer permanently block an
+  account;
+* it is **neither `released` (confirmed zero) nor `settled` (known usage)**:
+  the consumption stays **unknown** and is never recorded as zero. The
+  request keeps `usage_status='unknown'`, the reconciliation job keeps its
+  reason, and the row keeps `anomaly_reason` + `anomaly_at`;
+* the **RPM fact is preserved** (the row and its `counted_at` stay; the RPM
+  count looks at the age, not the state) — one logical request still counts
+  once;
+* the **money is untouched** — the window / Key monetary holds stay held, the
+  ledger gets no charge, nothing is settled and nothing is released;
+* **only manual-only reasons dispose** — the shared
+  `ManualOnlyReconciliationReasons` vocabulary is the single switch (the
+  evidence-driven `unknown_usage` / `crash_recovery` park keeps its hold,
+  because the recovery will settle that request at the conservative
+  estimate);
+* **retention converges** — an `anomaly` row is terminal, so the retention
+  sweep deletes it like `settled` / `released` rows: the stuck rows no longer
+  accumulate forever;
+* the **later evidence path is explicit** — when the request really settles,
+  `settleRateTx` promotes the row to `settled` with the **actual** normalized
+  tokens (and `releaseRateTx` promotes it to `released` on a confirmed-zero
+  release); the anomaly trace is kept. Until then a token-budget correction
+  against the row fails **loudly** (an explicit conflict: that row holds no
+  settled token total — correcting it would silently keep a total that was
+  never booked).
+
+Implementation: `Store.parkRateReservationTx` +
+`Store.MarkReconciliationRequired` (the single funnel every park path goes
+through — the gateway's `parkSettleFailure` and the recovery worker's
+`parkForManual`), plus `settleRateTx` / `releaseRateTx` /
+`correctRateTokensTx` in `internal/inference/postgres/inference_limit_repo.go`.
+
+#### 4.59.5 Migration
+
+**One appended migration: `migrations/054_inference_rate_reservation_anomaly_state.sql`**
+(54 = the re-checked latest number; 053 was the branch baseline). Nothing was
+rewritten and no historical ledger row was touched:
+
+1. `inference_rate_reservations.state` — the CHECK is widened to
+   `('reserved','settled','released','anomaly')` (drop + re-add, the
+   `migrations/README.md` idempotent-DDL idiom, exactly as migration 051 did
+   for the reconciliation reasons);
+2. `inference_rate_reservations.anomaly_at` / `.anomaly_reason` — the
+   disposition trace, with a one-directional CHECK
+   (`state <> 'anomaly' OR anomaly_reason IS NOT NULL`): an anomaly row always
+   carries its reason, while the trace survives the later promotion to
+   `settled` / `released`;
+3. no index churn — `idx_inference_rate_reservations_open`
+   (`WHERE state = 'reserved'`) already excludes the new state and
+   `idx_inference_rate_reservations_terminal` (`WHERE state <> 'reserved'`)
+   already includes it.
+
+#### 4.59.6 Operator / audit semantics
+
+* A `missing_reservation` / `reservation_drift` / `insufficient_evidence`
+  reconciliation job means: *the request's TPM hold was taken out of the live
+  budget*; the money hold is **still held**; nothing was charged; the anomaly
+  is still yours to resolve. **Freeing the budget is not a statement that the
+  request consumed nothing.**
+* To resolve: repair the monetary reservation and settle the request (the
+  rate row then books the actual tokens), or correct it once it is settled.
+* The evidence lives in `inference_rate_reservations` (state + `anomaly_reason`
+  + `anomaly_at`), `inference_reconciliation_jobs` (reason + detail +
+  `reason_history`), `inference_requests.last_error` and
+  `usage_status='unknown'`. The rate row is a **budget artefact** and is
+  purged with the other terminal rate rows by the retention sweep; the
+  reconciliation job and the request row are **not** purged by it.
+* The operational signals are unchanged: the unknown-usage backlog alarm
+  (threshold 10) and the reconciliation deadline escalation still fire.
+
+**Residual risk (stated, not hidden).**
+
+1. A parked anomaly's real consumption is **not** counted against the
+   account's TPM budget — the deliberate trade-off (keeping the hold would
+   block the account forever). The consumption is *not* recorded as zero; it
+   stays an open anomaly. The exposure is bounded by (open anomalies ×
+   per-request hold) and by the reconciliation deadline (default 24 h).
+2. The rate-side anomaly trace is purged with the retention window (default
+   24 h); the audit evidence survives in the reconciliation job and the
+   request row.
+3. A **terminal** request is never disposed by the park path
+   (`ReportTerminalAnomaly`): in every normal flow a terminal request's rate
+   row is already `settled` / `released`, because the rate update and the
+   terminal state are written in the **same** transaction. The residual risk
+   is structural, not observed.
+4. The correction channel is still unwired (Finding 3) — an `anomaly` row has
+   no *automated* path back to `settled` until that follow-up lands.
+
+#### 4.59.7 Files changed
+
+| File | Change |
+|---|---|
+| `migrations/054_inference_rate_reservation_anomaly_state.sql` | **new** — the `anomaly` state + the disposition trace columns + the widened CHECK |
+| `internal/inference/postgres/inference_limit_repo.go` | `rateStateAnomaly` + `parkRateReservationTx` (the disposition); `settleRateTx` / `releaseRateTx` promote an `anomaly` row; `correctRateTokensTx` refuses an `anomaly` row explicitly; the TPM/RPM aggregate documentation |
+| `internal/inference/postgres/ledger_repo.go` | `MarkReconciliationRequired` disposes the in-flight rate reservation **in the same transaction** when the park reason is manual-only |
+| `internal/inference/postgres/rate_anomaly_test.go` | **new** — the store-level regressions |
+| `internal/inference/workers/settlement_recovery_rate_anomaly_test.go` | **new** — the recovery-level regressions |
+| `internal/inference/gateway/rate_anomaly_test.go` | **new** — the gateway-level regression |
+| `docs/runbooks/kaya-coding-plan-rollout.md` | **Finding 2** — the process-local / N×instance RPM statements swept (§2 switch table, §6 conclusion + a dated correction note, §9 legacy list) |
+| `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md` | §1.1.1 (the 054 row + the widened state vocabulary) and §1.1.6 item 1 (the named follow-up) |
+| `docs/runbooks/2026-11-05-model-gateway-verification.md` | this section + §6 "Named follow-ups (post-delivery)" |
+
+#### 4.59.8 Finding 2 — the rollout runbook
+
+`docs/runbooks/kaya-coding-plan-rollout.md` was the one operator-facing
+document still stating the pre-T4 semantics ("进程内滑动窗口（多实例≈配置×
+实例数）"). Every stale statement was updated to the delivered semantics:
+
+| Location | After |
+|---|---|
+| §2 switch table | "**PostgreSQL 共享**" — rolling 60 s window on DB time, one account counter shared by instances / Keys / `/chat` and `/v1`; fail closed (503) when the database is unavailable |
+| §6 conclusion item 3 | the rate path is **PostgreSQL-shared**, not process-local; the effective multi-instance allowance is the configured value itself; the account-anchor lock serialises the read-then-write so a read-modify-write cannot over-admit; only the upstream account cooldown remains process-local |
+| §6 conclusion item 4 | the **cross-process rate-path acceptance gap** is stated explicitly (evidence-completeness, not correctness), with the actionable next step; **no cross-host test was run** |
+| §6 header | a dated note: the measured numbers still come from the 2026-09-09 campaign (**not re-run**), only the conclusion wording was corrected |
+| §9 legacy list | "多实例 RPM 精确化" split into the **cross-process acceptance** item; the Redis/独立网关层 row drops RPM centralization from its candidate scope; the "Key scope 租约 / TPM / session_sticky" row corrected to **已接** |
+| §0 pre-release checklist | the branch's migrations 035–054 (incl. 052 and 054) must be applied before this branch's traffic |
+
+#### 4.59.9 Finding 3 — the named follow-up
+
+The accurate limitation wording is **kept** (plan §1.1.6 item 1, the T4
+branch-era note, §5 open concerns): the wallet post-settlement correction is
+still refused and the money-correction channel still has **no production
+caller**. A **named follow-up** was added with an owner role and a schedule
+(§6 "Named follow-ups (post-delivery)"):
+
+| Follow-up | Scope | Owner (role) | Schedule |
+|---|---|---|---|
+| `inference-correction-trigger-and-wallet` | (a) the evidence-driven correction **trigger**; (b) the **wallet money-correction semantics** | Users 模型网关维护者 | 未排期 |
+
+**No payment / wallet product change was implemented.**
+
+
 ---
 
 ## 5. Open concerns
@@ -4807,3 +5057,28 @@ exactly the two new test files (plus the two documentation files above).
   T4 — it is **not** a plan-level waiver and must not be cited as one
   (§4.58, limit 3).
 
+
+---
+
+## 6. Named follow-ups (post-delivery)
+
+Items that are **real remaining limitations** of this branch, tracked by name so
+they are not silently dropped. They are **not** "done", and no plan-level
+waiver is implied by their existence here.
+
+| # | Follow-up | Scope | Owner (role) | Schedule |
+|---|---|---|---|---|
+| 1 | `inference-correction-trigger-and-wallet` | (a) The **evidence-driven correction trigger**: who calls `Store.CorrectSettlement` / `Store.CorrectRateTokensTx` when real usage evidence lands (the recovery verifier path, or an operator-facing correction entry point) — today the money-correction channel has **no production caller**; (b) the **wallet money-correction semantics**: `CorrectSettlement` refuses wallet-charged requests with `invalid_input` (micromoney unit, wallet compensation entries and the token-budget sync are not adapted), so an estimated wallet settlement that later gets real evidence cannot be corrected. **No payment / wallet product change is implied** — the scope is the correction channel only. | Users 模型网关维护者 | 未排期 |
+
+The limitation wording in the plan (§1.1.6 item 1), the T4 branch-era note
+"已知边界（本期不扩大）" and §4.58 limit 3 stay **as they are**: they are
+accurate. The T4 note is branch-era text and is still **not** a plan-level
+waiver.
+
+**Why it is not a merge blocker.** The rate-side of the original T4 sentence is
+satisfied for the wallet path (`settleWallet` → `settleRateTx`,
+`releaseRateTx` on release); the missing pieces are the *trigger* and the
+*money* semantics, both of which are pre-existing and outside this branch's
+rate-gate deliverable. No money or rate fact produced by this branch is wrong
+because of them: a recovery-settled request is charged the conservative
+estimate and stays that way.

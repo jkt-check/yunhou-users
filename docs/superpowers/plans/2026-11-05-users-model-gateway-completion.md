@@ -440,6 +440,7 @@ T7 §4.25–4.31 与 §4.42、T8 §4.32–4.39、T9 §4.40–4.50、T10 §4.51�
 | `051_inference_reconciliation_reasons.sql` | `inference_reconciliation_jobs.reason` 词表扩容 | `unknown_usage` / `crash_recovery` / `ledger_mismatch` / `manual` / `settlement_overage` / `missing_reservation` / `late_usage_after_release` / `settlement_mismatch` / `insufficient_evidence` |
 | `052_inference_rate_reservations.sql` | **`inference_rate_reservations`**（新表） | 账户/Key 级 RPM 计数 + 账户级 TPM 预占/结算；`scope ∈ {account,key}`、`UNIQUE(request_id, scope)`、`state ∈ {reserved,settled,released}` |
 | `053_inference_route_pool_strategy_comments.sql` | 仅列注释 | `pool_strategy` / `weight` / `overage_policy` 的语义注释（无 DDL） |
+| `054_inference_rate_reservation_anomaly_state.sql` | `inference_rate_reservations.state` 词表扩容 + `anomaly_at` / `anomaly_reason` | 人工停放的账务异常的**速率预占处置**：`state ∈ {reserved,settled,released,anomaly}`。`anomaly` = 该请求因账务异常被停放、其 TPM 预占已离开在途额度（但**不是**"确认零消费"、**不是**"已知用量"）：异常证据留在行上与核对任务里，RPM 计数事实保留，金额预占不动 |
 
 既有表被复用的关键列：`inference_requests.{status,usage_status,settled_micros,expected_hold_micros,charge_source}`、
 `inference_attempts.{status,error_kind,cost_micros,cost_basis}`、
@@ -505,6 +506,12 @@ Token Plan 商品/权益与统一商品发布、真实渠道退款与改签、�
    - 相关且早已记录的事实：金额侧更正通道目前**没有生产调用方**——
      `Store.CorrectRateTokensTx` 只有测试固定它，证据窗口仍由既有核对队列驱动
      （见 runbook §4.32）。
+   - **已登记为具名跟进项 `inference-correction-trigger-and-wallet`**（负责人角色：
+     Users 模型网关维护者；排期：未排期）——范围：① 证据驱动的更正**触发器**
+     （谁在真实证据到达时调用 `CorrectSettlement`/`CorrectRateTokensTx`：
+     恢复校验路径 / 操作入口）；② 钱包的**金额更正语义**（micromoney 单位、
+     钱包补偿分录、token 预算同步）。本期**不实现**任何支付/钱包产品变更；
+     现状限制（钱包更正被显式拒绝、金额更正无生产调用方）保持原样如实记录。
 2. **速率路径没有跨进程验收。** 仓库**已有**跨进程测试基建：
    `internal/inference/postgres/quota_concurrency_test.go` 的
    `TestTwoProcessContendLastCredit` 通过 `TestQuotaWorkerProcess` 子进程入口

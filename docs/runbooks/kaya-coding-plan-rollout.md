@@ -15,6 +15,11 @@
    登录/聊天鉴权/支付路径直接引用该列，二进制先于迁移滚动会造成大面积
    500——027 未应用的库**不得**滚动双产品代码（Task 2 部署顺序约束）。
    同理 024–034 任一缺失都不得放行对应功能流量。
+   **本分支新增的 035–054 同样适用**（含速率协调表
+   `inference_rate_reservations` 的 052 与速率预占异常处置态的 054）：
+   `cmd/migrate` 会按序号应用它们；`_migrations` 账本必须与代码期望一致
+   才放行本分支流量。本分支的迁移与验收清单以
+   `docs/runbooks/2026-11-05-model-gateway-verification.md` 为准。
 2. 迁移连跑命令：
    ```bash
    DATABASE_URL=... go run ./cmd/migrate        # 第一次：applied=N
@@ -47,7 +52,7 @@
 | OAuth 连接器 | `INFERENCE_OAUTH_CONNECTORS_JSON`（env） | 空 = fail closed | 空注册表时授权端点拒绝一切 connector key |
 | 超额消费（套餐外） | 策略 `allow_overage`（产品门）+ 客户 `PUT /user/wallet/overage`（客户门，默认关，开启必设 UTC 自然月上限） | 双门默认关 | 未开启时耗尽即停，余额一分不动 |
 | PAYG（无套餐按量） | `payg_config` 单行（`GET/PUT /admin/payg-config`，billing:adjust）+ 客户 `POST /user/wallet/payg` | 未发布 | 未发布时客户开启返回 404/409 |
-| 账户/Key RPM | `INFERENCE_ACCOUNT_RPM`（默认 120）+ Key 级 `rpm_limit` | 进程内 | 进程内滑动窗口（多实例≈配置×实例数，见 §6 结论） |
+| 账户/Key RPM + 策略 TPM | `INFERENCE_ACCOUNT_RPM`（默认 120）+ Key 级 `rpm_limit` + 策略 `rpm_limit`/`tpm_limit` | **PostgreSQL 共享** | 计数与额度持久在数据库（滚动 60 秒窗口、DB 时间），多实例/多 Key/`/chat` 与 `/v1` 共享同一份账户计数；数据库不可用时 **fail closed**（503 `service_unavailable`，绝不放行）。详见 §6 结论与 `docs/api-integration-guide.md` §业务速率限制 |
 | 上游出口 | `INFERENCE_UPSTREAM_ALLOWLIST`（env） | 空 | SSRF allowlist；部署 URL 写路径强校验 |
 | 凭据密钥 | `INFERENCE_CREDENTIAL_KEYS`（env） | 空 | 未配置时凭据写面不可用（fail closed） |
 
@@ -167,6 +172,12 @@ socket/TCP 直通），网关/存储池 `MaxOpenConns=20`，单账户单模型�
 mock 上游零延迟——**数字只代表本机量级，用于判断瓶颈位置而非容量
 承诺**。
 
+> **2026-11-07 更正说明（终审 Finding 2）**：本节的**吞吐/内存实测数字仍来自
+> 2026-09-09 那次演练**（未重跑）；但下面结论里的**速率限制语义**已按本分支
+> 的实际交付更正 —— 账户/Key RPM 与账户级策略 TPM 现在是 **PostgreSQL 共享
+> 协调**（进程内计数器已删除），因此"多实例≈配置×实例数"的说法**作废**。
+> 本次只改结论文字，**没有**重跑压测，也**没有**跑任何跨主机测试。
+
 **吞吐相位**（24 worker × 10 次非流式 = 240 次）实测：
 - 吞吐 **145.6 req/s**，0 失败；延迟 p50=160ms / p95=227ms / max=252ms；
 - **结算延迟**（响应返回→请求行终态）p50=159µs / p95=255µs——结算与
@@ -184,17 +195,34 @@ mock 上游零延迟——**数字只代表本机量级，用于判断瓶颈位�
   突发）。
 
 **结论（是否另立 Redis/独立网关任务）：本期不另立。** 依据：
+
 1. 正确性不依赖任何外部协调器：并发封顶/恢复/核对全部以 PG 事务与
    租约为权威；145 req/s 单账户量级下无失败、无账本差异；
 2. 第一可伸缩轴是连接池大小（建议池 ≥ 预期并发准入数，DB 连接预算
    ≈ 2–3× 峰值并发请求）与多实例水平扩展（账户行锁只串行同一账户，
    账户间天然并行）；
-3. 已知进程内限制（不影响正确性，多实例部署时接受或后续治理）：RPM
-   为进程内滑动窗口（多实例≈配置×实例数，Task 5 已记录）；上游账号
-   冷却为进程内（数据库租约兜底，Task 8 已记录）；
-4. SSE 内存 ~93 KiB/流 ⇒ 1 万并发流 ≈ 1 GiB 堆——**网关内存先于 DB
-   成为上限**；需要 >1 万并发流或精确多实例 RPM 时，再立"Redis 协调/
-   独立网关层"任务（候选范围：RPM 集中化、账号池冷却共享、会话亲和）。
+3. **业务速率限制（账户/Key RPM + 账户级策略 TPM）已经是 PostgreSQL
+   共享协调**，不再是进程内计数器：进程内的 `access.RPMCounter` 已删除，
+   权威实现只剩持久速率预占（表 `inference_rate_reservations`，迁移
+   052）。计数与额度写在数据库里，窗口用 **DB 时间**（`now()`），多实例、
+   多 Key、`/chat` 与 `/v1` 共享同一份账户计数；**多实例的有效额度就是配置
+   值本身，不是"配置×实例数"**。准入时在同一事务里取**计费账户锚点锁**
+   （账户行 `FOR UPDATE`），把账户/Key RPM、账户 TPM 与并发额度的判定与
+   写入串行化，因此读-再-写不会并发超放；数据库不可用时 **fail closed**
+   （503 `service_unavailable`），绝不回退成单机无限放行。口径见
+   `docs/api-integration-guide.md` §业务速率限制。
+   **仍属进程内的只剩上游账号冷却**（数据库租约兜底，Task 8 已记录）；
+4. **速率路径的跨进程验收仍缺**：协调逻辑本身全部在数据库侧，按构造与
+   主机无关，但仓库现有的跨进程用例
+   （`TestTwoProcessContendLastCredit`，`KAYA_QUOTA_WORKER=1` re-exec）
+   驱动的是**配额窗口**路径；速率路径只有**进程内两实例两连接池**的用例
+   覆盖，**没有**被跨进程/跨主机跑过。这是**证据完整性缺口，不是正确性
+   缺口**；可执行的下一步是沿用同一个 re-exec 模式给 worker 一个带
+   RPM/TPM/并发的策略（在速率限制被依赖到多主机部署之前完成）。
+5. SSE 内存 ~93 KiB/流 ⇒ 1 万并发流 ≈ 1 GiB 堆——**网关内存先于 DB
+   成为上限**；需要 >1 万并发流或共享账号池冷却/会话亲和时，再立"Redis 协调/
+   独立网关层"任务（候选范围：账号池冷却共享、会话亲和；**RPM 集中化已
+   由 PostgreSQL 完成，不再是该任务的候选范围**）。
 
 ## 7. 真实客户端联调（发布前置待办）
 
@@ -292,7 +320,8 @@ OpenAI Chat Completions（tools + stream_options.include_usage）——
 | outbox 永久失败消息死信态 | 慢车道重试 + pending 可查 | 后续任务 |
 | 窗口核对全量扫描分页 | 数据量大后再做 | 后续任务 |
 | UsageVerifier 生产实现 | 主流上游无按请求查询 API，保持估算+核对 | 视供应商能力 |
-| Key scope 租约 / TPM / session_sticky 调度 | 未接（进程内冷却+DB 租约兜底） | 后续任务 |
+| Key scope 租约 / 账户级策略 TPM / session_sticky 调度 | **已接**（Key 并发租约与账户 TPM 在 PostgreSQL 共享协调；sticky 绑定走已发布快照；上游账号冷却仍是进程内 + DB 租约兜底） | — |
 | PayPal 渠道 coding-plan 跨档改签 | 受既有 PayPal 双扣守卫整体拒绝 | 后续任务 |
-| 多实例 RPM 精确化 / Redis 协调层 | 本期不另立（§6 结论与触发条件） | 触发后再立 |
+| 速率路径的**跨进程/跨主机**验收 | 未做（协调在数据库侧、按构造与主机无关，但速率路径只被**进程内两实例**用例覆盖；跨进程 re-exec 用例目前驱动的是配额窗口路径） | 速率限制被依赖到多主机部署之前 |
+| Redis 协调层 / 独立网关层 | 本期不另立（§6 结论与触发条件）；**RPM 集中化已由 PostgreSQL 完成，不再是该任务的候选范围** | 触发后再立 |
 | kin-openapi schema 级校验 | **不引入**（Task 16 决定，见任务报告） | Website SDK 生成阶段再评估 |

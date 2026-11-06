@@ -2968,6 +2968,80 @@ lines were the **database dying**, not a code regression. The authoritative
 green numbers for T7 are the ones in §4.25 (command #14) and in this
 re-run.
 
+#### 4.27.2 Count reconciliation — the T7 numbers vs the T0–T6 baseline
+
+**The discrepancy was the counting method, not missing tests.** The baseline
+numbers recorded by T0–T6 ("1109 PASS / 1 SKIP", "1154 PASS", "1168 PASS",
+"1171 PASS" for the inference suite and "52 PASS / 2 SKIP" for the
+integration suite) are **line counts of the verbose output**: every line that
+carries a `--- PASS` marker (top-level test lines **plus** subtest lines).
+T7's first run reported "1032 PASS / 1 SKIP" (inference) and "35 PASS /
+2 SKIP" (integration) because that run's filter was `^--- PASS` — **top-level
+lines only**. Same suites, narrower filter.
+
+To replace the assertion with a measurement, both trees were run **in one
+session, on one fresh disposable PostgreSQL, with one documented counting
+method**: the base `9ffbe85` (a separate `git worktree`, pristine — no T7
+code) and the T7 tree.
+
+| Suite | Metric | Base `9ffbe85` | T7 (fixed tree) | Delta |
+|---|---|---|---|---|
+| `./internal/inference/...` | top-level PASS lines (`^--- PASS`) | 1015 | 1033 | **+18** |
+| | subtest PASS lines (`^[[:space:]]+--- PASS`) | 241 | 244 | **+3** |
+| | **PASS lines (the baseline method)** | **1256** | **1277** | **+21** |
+| | PASS occurrences (`grep -o -- '--- PASS'`) | 1256 | 1277 | +21 (no line carries two markers) |
+| | FAIL | **0** | **0** | 0 |
+| | SKIP | 1 (`TestQuotaWorkerProcess`) | 1 (same one) | 0 |
+| | packages `ok` | 14 | 14 | 0 |
+| `./tests/integration/...` | top-level PASS lines | 35 | 35 | 0 |
+| | subtest PASS lines | 17 | 17 | 0 |
+| | **PASS lines (the baseline method)** | **52** | **52** | **0** |
+| | FAIL / SKIP | 0 / 2 (the two load drills) | 0 / 2 (the same two) | 0 |
+
+**The integration suite reproduces the recorded baseline number `52`
+exactly** (35 top-level + 17 subtest lines) on **both** trees — that is the
+proof that the baseline method is the "all PASS lines" one, and that T7's
+earlier "35" was the top-level-only filter rather than a lost suite.
+
+**The inference delta is +21 lines, and every one of them is a T7 case** —
+so no pre-existing test was lost, renamed or skipped (T1–T6 preservation is
+*measured*, not asserted):
+
+| # | New top-level test | Package |
+|---|---|---|
+| 1 | `TestValidateRoute_PoolStrategySupportedSet` | catalog |
+| 2 | `TestPublishedSnapshot_LegacyPoolStrategyStaysReadableButUnavailable` | catalog |
+| 3 | `TestPublish_RejectsUnsupportedPoolStrategyAndNamesTheObject` | catalog |
+| 4 | `TestPublish_SupportedPoolStrategyStillPublishes` | catalog |
+| 5 | `TestImportEnvCatalog_DerivedRouteUsesSupportedPoolStrategy` | catalog |
+| 6 | `TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause` (fix round) | catalog |
+| 7 | `TestQuotaPolicy_ClampIfDeclaredRejectedOnWrite` | management |
+| 8 | `TestQuotaPolicy_LegacyClampIfDeclaredStaysQueryable` | management |
+| 9 | `TestBulkImport_DerivedRouteStaysInsideTheSupportedPoolStrategySet` | management |
+| 10 | `TestApplyBulkImportTx_DerivedRouteUsesSupportedPoolStrategy` | postgres |
+| 11 | `TestCandidates_UnsupportedPoolStrategyIsNotACandidate` | routing |
+| 12 | `TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits` | routing |
+| 13 | `TestDispatch_ConnectTimeoutBoundsConnectionEstablishment` | providers |
+| 14 | `TestDispatch_ConnectTimeoutDoesNotTruncateEstablishedStream` | providers |
+| 15 | `TestDispatch_ConnectTimeoutIsUnknownExecution` | providers |
+| 16 | `TestGateway_UnsupportedPoolStrategyFailsBeforeAdmission` | gateway |
+| 17 | `TestGateway_DisabledLegacyRouteDoesNotBlockTheCall` | gateway |
+| 18 | `TestGateway_ClampIfDeclaredPolicyFailsClearly` | gateway |
+
+plus **3 subtest lines** — the three cases of
+`TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause`
+(`weight_zero_keeps_its_own_cause`, `empty_model_keeps_its_own_cause`,
+`unsupported_strategy_names_the_replacement`).
+
+18 + 3 = **21 = the measured delta exactly**. (The new
+`mapGatewayError` case lives in `internal/service`, which is **not** part of
+`./internal/inference/...` — it is covered by the CI gate, which runs
+`./internal/...`.)
+
+For reference, the recorded baseline progression on the same method is T0
+1088 → T1 1109 → T2 1154 → T3 1168 → T4 1171 → (T5 + T6) **1256 at the
+base `9ffbe85`** → **1277 with T7**.
+
 #### 4.28 Skips
 
 | # | Skipped test | Package | Reason | Lost coverage? |
@@ -3128,8 +3202,8 @@ never modified (`git diff --stat go.mod go.sum` → empty after every run).
 | 11 | **RED** `DATABASE_URL=<disposable> go test -count=1 -run 'TestGateway_UnsupportedPoolStrategy\|TestGateway_ClampIfDeclaredPolicy' -v ./internal/inference/gateway` | **1** | both configuration errors were silently ignored (the call succeeded) |
 | 12 | **GREEN** the same commands as #6–#11 | **0** | all T7 cases pass |
 | 13 | **acceptance（任务书原文）** `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/management ./internal/inference/providers/... ./internal/inference/routing ./internal/inference/gateway` | **0** | 6 packages `ok` (catalog 17.459s / management 2.515s / providers 2.676s / providers/connector 2.500s / routing 3.052s / gateway 41.447s) |
-| 14 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, **1032 PASS / 1 SKIP / 0 FAIL** |
-| 15 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 35 PASS / 2 SKIP / 0 FAIL |
+| 14 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, **1277 PASS lines / 1 SKIP / 0 FAIL**（baseline 口径：含子测试行；与基线 `9ffbe85` 的 1256 相比 **+21**，全部是 T7 新增用例 —— 见 §4.27.2 的对账） |
+| 15 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | **52 PASS lines / 2 SKIP / 0 FAIL**（与基线口径与数字**逐字相同**；T7 未改集成套件） |
 | 16 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
 | 17 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T6 80.3%, T0 80.4%) |
 | 18 | `E2E_DATABASE_URL=<disposable> go test -race -count=1 ./tests/e2e/...` | **0** | `ok github.com/yunhou/users/tests/e2e 449.247s` |
@@ -3353,6 +3427,23 @@ the e2e-side disposable database was migrated the same way.
   consequence is documented for operators (a too-small `connect_timeout`
   parks the request for reconciliation instead of failing over) — changing
   the execution verdict is a separate task, not a timeout change.
+- **The effective connect budget of EXISTING deployments shrank from 10 s to
+  5 s (corrected after the review).** The stored default is 5 s
+  (`inference_deployments.connect_timeout_ms DEFAULT 5000`, and the
+  create / env-import / bulk-import defaults are 5 s too), while the shared
+  client used a **hard-coded 10 s** dial timeout — so a deployment that never
+  declared a value actually got 10 s. Now that the stored value is honoured,
+  every such deployment gets **5 s**. The controller ruled: keep the stored
+  5 s (the field means what it says), change **no** default and migrate
+  **no** live configuration. Consequences an operator must know:
+  (a) explicitly configured values now really control DNS + TCP
+  establishment (before: ignored);
+  (b) deployments on the default lost 5 s of connect budget — a slow-but-
+  reachable upstream may now hit the connect timeout;
+  (c) a connect timeout lands in **reconciliation** (the hold is kept, no
+  failover), not in a clean candidate switch — so the operational remedy is
+  to raise `connect_timeout` (or the upstream's own connect latency), not
+  to wait for a retry.
 - **Compatibility.** Two new customer-visible 503s (the `/v1/*` surfaces and
   the legacy `/chat` surface), 400s on the operator writes, one appended
   comment-only migration, and the OpenAPI bumped 0.13.0 → 0.14.0. No
@@ -3366,6 +3457,134 @@ the e2e-side disposable database was migrated the same way.
   `9ffbe85` as well (a separate `git worktree` of the base commit, the
   gateway package three times: 1 failure), therefore it is not a T7
   regression — recorded per the「不修无关缺陷」rule.
+
+#### 4.42 T7 fix round — the three review findings
+
+Recorded on 2026-11-06, on top of the T7 commit (`d1b6ec8`). The review
+raised **three Important** findings; all three are fixed here, no deferred
+minor was touched.
+
+**Environment.** Same recipe as §4.25: a fresh trap-cleaned disposable
+PostgreSQL per run, explicit `DATABASE_URL` / `E2E_DATABASE_URL`, `-p 1`,
+`-race`, `GOPROXY=off` + `GOFLAGS=-mod=readonly`, `go.mod` / `go.sum`
+untouched.
+
+##### 4.42.1 Finding 1 — the publish gate reported the wrong cause
+
+`validateCatalogForPublish` wrapped **every** `ValidateRoute` error with
+`poolStrategyRefusal(...)`, so a route with `weight <= 0` or an empty
+`model_id` was refused with "pool_strategy round_robin is not supported …
+set pool_strategy to round_robin" — self-contradictory and pointing the
+operator at the wrong knob.
+
+**RED** (the new focused cases, before the fix):
+
+```
+=== RUN   TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/weight_zero_keeps_its_own_cause
+    validate_edges_test.go:321: error = inference/invalid_input: route route-1 is not publishable: unknown pool strategy:  (supported: round_robin), want it to name "weight"
+=== RUN   TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/empty_model_keeps_its_own_cause
+    validate_edges_test.go:321: error = inference/invalid_input: route route-2 is not publishable: unknown pool strategy:  (supported: round_robin), want it to name "model_id"
+--- FAIL: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause (0.00s)
+    --- FAIL: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/weight_zero_keeps_its_own_cause (0.00s)
+    --- FAIL: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/empty_model_keeps_its_own_cause (0.00s)
+    --- PASS: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/unsupported_strategy_names_the_replacement (0.00s)
+```
+
+The third case passed **before** the fix as well — protection evidence: an
+unsupported strategy must still name the replacement.
+
+**Fix.** The publish gate now checks the two invariants separately and lets
+each report its own cause: `validateRouteShape` (weight / model_id /
+deployment_id) keeps its own message; only `validatePoolStrategy` produces
+the "pool_strategy X is not supported — set it to round_robin" text. The
+underlying validation error is preserved (`routeRefusalMessage` renders the
+`domain.Error` message without the code prefix).
+
+**GREEN** (the same command, after the fix) — exit code **0**:
+
+```
+--- PASS: TestValidateRoute_PoolStrategySupportedSet (0.00s)
+--- PASS: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause (0.00s)
+    --- PASS: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/weight_zero_keeps_its_own_cause (0.00s)
+    --- PASS: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/empty_model_keeps_its_own_cause (0.00s)
+    --- PASS: TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause/unsupported_strategy_names_the_replacement (0.00s)
+--- PASS: TestPublish_RejectsUnsupportedPoolStrategyAndNamesTheObject (0.05s)
+ok  	github.com/yunhou/users/internal/inference/catalog	2.534s
+```
+
+##### 4.42.2 Finding 2 — the `connect_timeout` compatibility claim was wrong
+
+The stored default is **5 s** (`inference_deployments.connect_timeout_ms
+DEFAULT 5000`; the create / env-import / bulk-import defaults are 5 s too),
+while the shared client used a **hard-coded 10 s** dial timeout — the field
+was never read. So the deployments that never declared a value actually got
+**10 s** and now get **5 s**: the effective budget **shrank**, it did not
+"stay unchanged".
+
+Controller ruling: **keep the stored 5 s** (the field means what it says),
+change **no** default and migrate **no** live configuration. Therefore the
+fix is a documentation correction, not a behaviour change:
+
+| Where | Correction |
+|---|---|
+| task report §2.4.1 (new) + §8 + §12 | the fact table (DB default 5 s / write-path default 5 s / old hard-coded 10 s / new = stored value) and the three consequences |
+| this runbook §4.31 | the same, incl. "explicitly configured values now really control DNS + TCP establishment" and "a connect timeout lands in reconciliation, not in a failover" |
+| `docs/runbooks/kaya-coding-plan-operations.md` | the default values, the 10 s → 5 s effect for existing deployments and the operational remedy (raise `connect_timeout`, do not wait for a retry) |
+| `internal/inference/domain/connect_timeout.go` | `DefaultConnectTimeout` (10 s) is documented as the "caller declared no budget at all" fallback, with the stored 5 s default named |
+
+##### 4.42.3 Finding 3 — the verification evidence was not comparable
+
+See **§4.27.2** for the full reconciliation (base `9ffbe85` vs the T7 tree,
+one session, one disposable PostgreSQL, one counting method):
+
+| Suite | Metric | Base `9ffbe85` | T7 (fixed tree) | Delta |
+|---|---|---|---|---|
+| `./internal/inference/...` | PASS lines (baseline method) | 1256 | **1277** | **+21** (18 new top-level + 3 new subtests — every one listed in §4.27.2) |
+| | top-level / subtest split | 1015 / 241 | 1033 / 244 | +18 / +3 |
+| | FAIL / SKIP | 0 / 1 | **0 / 1** (the same `TestQuotaWorkerProcess`) | 0 |
+| | packages `ok` | 14 | 14 | 0 |
+| `./tests/integration/...` | PASS lines (baseline method) | **52** | **52** | 0 |
+| | FAIL / SKIP | 0 / 2 | 0 / 2 (the same two load drills) | 0 |
+
+The integration suite reproduces the recorded baseline number **52 exactly**
+on both trees — that is the proof that the baseline method is the "all PASS
+lines" one and that T7's earlier "35" was a top-level-only filter. The
+inference delta of **+21** is accounted for case by case, so no pre-existing
+test was lost, renamed or skipped: **T1–T6's preservation is measured, not
+asserted**.
+
+##### 4.42.4 Fix-round commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1 / run 2) | **0** / **0** | `applied=53 skipped=0` → `applied=0 skipped=53`; `-status` → 53 × `✅` |
+| 4 | `DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate` | **0** | the e2e-side DB migrated before the e2e job (`applied=53 skipped=0`) |
+| 5 | **acceptance（任务书原文）** `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/management ./internal/inference/providers/... ./internal/inference/routing ./internal/inference/gateway` | **0** | 6 packages `ok` (catalog 2.513s / management 1.501s / providers 1.770s / providers/connector 2.641s / routing 2.397s / gateway 9.402s) |
+| 6 | **GREEN** the Finding-1 cases (`-v -run 'TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause\|TestValidateRoute_PoolStrategySupportedSet\|TestPublish_RejectsUnsupportedPoolStrategyAndNamesTheObject'`) | **0** | 3 test funcs / 5 cases pass (see §4.42.1) |
+| 7 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`; **1277 PASS lines / 1033 top-level / 244 subtest / 0 FAIL / 1 SKIP** |
+| 8 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | **52 PASS lines / 35 top-level / 17 subtest / 0 FAIL / 2 SKIP** |
+| 9 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 10 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.3%` ≥ the 80% floor |
+| 11 | `E2E_DATABASE_URL=<disposable> go test -race -count=1 ./tests/e2e/...` | **0** | `ok github.com/yunhou/users/tests/e2e 142.635s` |
+
+**Skip inventory (fix round)** — unchanged from §4.28: `TestQuotaWorkerProcess`
+(`KAYA_QUOTA_WORKER=1` child-process entry point), `TestLoadDrill_Throughput`
+and `TestLoadDrill_LongConnections` (`KAYA_LOAD=1`). **Database-test skips: 0.**
+
+**Files changed in the fix round** (5):
+
+| File | Change |
+|---|---|
+| `internal/inference/catalog/service.go` | the publish gate reports each invariant's own cause; `routeRefusalMessage` helper |
+| `internal/inference/catalog/validate_edges_test.go` | the focused Finding-1 cases (3 subtests + the write-path assertions) |
+| `internal/inference/domain/connect_timeout.go` | the `DefaultConnectTimeout` comment (10 s = the "no budget declared" fallback; the stored default is 5 s) |
+| `docs/runbooks/2026-11-05-model-gateway-verification.md` | §4.27.2 (the count reconciliation), §4.31 (the corrected `connect_timeout` compatibility), this section |
+| `docs/runbooks/kaya-coding-plan-operations.md` | the deployment-timeout section: the defaults, the 10 s → 5 s effect and the remedy |
+
+**Commit.** An independent fix commit on top of `d1b6ec8` (explicit paths
+only, no `git add .`, no push / merge / deploy) — see the task report §11.1.
 
 ### T8 — Capability routing and protocol truthfulness
 

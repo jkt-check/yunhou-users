@@ -269,3 +269,70 @@ func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
 		t.Error("alias shadowing a model id: ParseSnapshot must fail (dead config)")
 	}
 }
+
+// T7 — 发布闸的路由拒绝必须点名**真正**的原因：pool_strategy 不受支持时
+// 给出替代配置；其它不变量（weight / model_id）失败时保留它自己的错误，
+// 绝不把运营指到错误的旋钮上（一个自相矛盾的「round_robin 不受支持，
+// 请设成 round_robin」既无用又误导）。
+func TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause(t *testing.T) {
+	prov := []domain.Provider{{ID: "p1", Code: "p", DisplayName: "P",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}}
+	deps := []domain.Deployment{{ID: "d1", ProviderID: "p1", UpstreamModel: "up",
+		BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIChat,
+		Status: domain.DeploymentActive, ConnectTimeout: time.Second, RequestTimeout: time.Second}}
+
+	cases := []struct {
+		name    string
+		route   domain.ModelRoute
+		wantSub string
+		mustNot string
+	}{
+		{
+			name:    "weight zero keeps its own cause",
+			route:   domain.ModelRoute{ID: "route-1", ModelID: "m1", DeploymentID: "d1", Weight: 0, Enabled: true},
+			wantSub: "weight",
+			mustNot: "round_robin is not supported",
+		},
+		{
+			name:    "empty model keeps its own cause",
+			route:   domain.ModelRoute{ID: "route-2", DeploymentID: "d1", Weight: 1, Enabled: true},
+			wantSub: "model_id",
+			mustNot: "round_robin is not supported",
+		},
+		{
+			name:    "unsupported strategy names the replacement",
+			route:   domain.ModelRoute{ID: "route-3", ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true, PoolStrategy: domain.PoolLeastLoaded},
+			wantSub: "round_robin",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateCatalogForPublish(nil, prov, deps, []domain.ModelRoute{c.route})
+			if err == nil {
+				t.Fatalf("publish must refuse the route")
+			}
+			if domain.CodeOf(err) != domain.CodeInvalidInput {
+				t.Errorf("code = %v, want invalid_input", domain.CodeOf(err))
+			}
+			if !strings.Contains(err.Error(), c.route.ID) {
+				t.Errorf("error = %v, want it to name the route id %q", err, c.route.ID)
+			}
+			if !strings.Contains(err.Error(), c.wantSub) {
+				t.Errorf("error = %v, want it to name %q", err, c.wantSub)
+			}
+			if c.mustNot != "" && strings.Contains(err.Error(), c.mustNot) {
+				t.Errorf("error = %v, must not point the operator at the pool_strategy knob", err)
+			}
+		})
+	}
+
+	// 写面同样保留各自的原因（与发布闸同一口径）。
+	if err := ValidateRoute(&domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 0}); err == nil ||
+		!strings.Contains(err.Error(), "weight") {
+		t.Errorf("write path: err = %v, want the weight cause", err)
+	}
+	if err := ValidateRoute(&domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, PoolStrategy: domain.PoolLeastLoaded}); err == nil ||
+		!strings.Contains(err.Error(), "round_robin") {
+		t.Errorf("write path: err = %v, want the pool_strategy replacement", err)
+	}
+}

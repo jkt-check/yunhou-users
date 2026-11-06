@@ -828,12 +828,30 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 		}
 	}
 	for i := range routes {
-		if err := ValidateRoute(&routes[i]); err != nil {
+		// 每个不变量各自报自己的原因：pool_strategy 不受支持时给出替代
+		// 配置；weight / model_id 等失败时保留它们自己的错误 —— 绝不把
+		// 运营指到错误的旋钮上（一个「round_robin 不受支持，请设成
+		// round_robin」既无用又误导）。
+		if err := validateRouteShape(&routes[i]); err != nil {
 			return domain.NewError(domain.CodeInvalidInput,
-				"route "+routes[i].ID+" is not publishable: "+poolStrategyRefusal(routes[i].PoolStrategy))
+				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
+		}
+		if err := validatePoolStrategy(routes[i].PoolStrategy); err != nil {
+			return domain.NewError(domain.CodeInvalidInput,
+				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
 		}
 	}
 	return nil
+}
+
+// routeRefusalMessage renders an invariant failure without the domain
+// error's code prefix (the publish refusal already carries the route id and
+// the code).
+func routeRefusalMessage(err error) string {
+	if de, ok := err.(*domain.Error); ok {
+		return de.Message
+	}
+	return err.Error()
 }
 
 // validateModelAliasUniqueness enforces cross-model alias uniqueness on a

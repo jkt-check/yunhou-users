@@ -248,6 +248,14 @@ message 点名配置）；legacy `/chat` 是 503 `chat configuration unavailable
 
 - 两者都在部署写入时校验为正数；`request_timeout` 还必须低于生效的
   `INFERENCE_RECOVERY_GRACE`（默认 15m）。
+- **缺省值**：落库缺省 `connect_timeout_ms = 5000`（5s）、`request_timeout_ms
+  = 600000`（600s）；写路径（operator CRUD / env 导入 / 批量导入）未声明时
+  补同样的值。
+- **存量部署的有效建连预算从 10s 变成 5s**：`connect_timeout` 过去是死字段
+  （共享客户端写死 10s 拨号超时），现在按落库值执行 —— 落库是 5s 的那些
+  部署（也就是绝大多数没显式配过的）实际少了 5s 建连预算。慢但可达的上游
+  可能因此撞上建连超时；处置办法是**调大 `connect_timeout`**
+  （`PATCH /admin/deployments/:id` → 重新 publish），不是等重试。
 - 建连超时只影响「还没连上」的请求：连接已建立后，流的存活只看
   `request_timeout`（长 SSE 流不会被 `connect_timeout` 截断）。
 - **建连超时的当前口径是保守的**：传输层把它归入「上游执行状态未知」，

@@ -22,8 +22,14 @@ import (
 // connectTimeoutKey 是私有 context key —— 外部包无法伪造建连预算。
 type connectTimeoutKey struct{}
 
-// DefaultConnectTimeout 是没有声明 connect_timeout 时的建连预算。它与
-// 共享 dispatch client 历史上的硬编码拨号超时一致（10s）。
+// DefaultConnectTimeout is the connect budget used when the caller
+// declares NO budget at all. It equals the historical hard-coded dial
+// timeout of the shared dispatch client (10s) — but it is only a
+// fallback: every deployment written through a supported path carries its
+// own value, and the stored default is 5s
+// (inference_deployments.connect_timeout_ms DEFAULT 5000). Honouring the
+// stored value therefore shrinks the effective budget of the deployments
+// that never declared one from 10s to 5s.
 const DefaultConnectTimeout = 10 * time.Second
 
 // WithConnectTimeout 把建连预算挂到 ctx 上。非正值表示「未声明」——ctx 原样

@@ -88,17 +88,18 @@ func (s *Store) ListAPIKeysByAccount(ctx context.Context, accountID string, limi
 }
 
 // UpdateAPIKey persists the management-editable fields (name, model
-// narrowing, budget, rpm, expiry). Status transitions go through the
-// dedicated methods below, never through this write. BudgetUsed is
-// maintained by the Task 7 quota path and is not writable here either.
+// narrowing, budget, rpm, per-Key concurrency cap, expiry). Status
+// transitions go through the dedicated methods below, never through this
+// write. BudgetUsed is maintained by the Task 7 quota path and is not
+// writable here either.
 func (s *Store) UpdateAPIKey(ctx context.Context, k *domain.APIKey) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE inference_api_keys
 		    SET name = $2, model_allow = $3, budget_limit_micros = $4,
-		        rpm_limit = $5, expires_at = $6, updated_at = now()
+		        rpm_limit = $5, concurrency_limit = $6, expires_at = $7, updated_at = now()
 		  WHERE id = $1`,
 		k.ID, k.Name, pq.Array(k.ModelAllow), microPtr(k.BudgetLimit),
-		intPtr(k.RPMLimit), k.ExpiresAt)
+		intPtr(k.RPMLimit), intPtr(k.ConcurrencyLimit), k.ExpiresAt)
 	if err != nil {
 		return mapError("update api key", err)
 	}
@@ -106,6 +107,26 @@ func (s *Store) UpdateAPIKey(ctx context.Context, k *domain.APIKey) error {
 		return mapError("update api key", sql.ErrNoRows)
 	}
 	return nil
+}
+
+// GetAPIKeyConcurrencyLimitTx reads the customer Key's OWN concurrency limit
+// inside the caller's transaction. 0 = the key sets no limit (NULL).
+//
+// The limit is a DATABASE fact read in the admission transaction, exactly
+// like the Key's RPM limit (Task 4): the cap that applies is always the one
+// in force at admission time, never a stale snapshot taken at authentication.
+func (s *Store) GetAPIKeyConcurrencyLimitTx(ctx context.Context, w domain.UnitOfWork, keyID string) (int, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return 0, err
+	}
+	var limit sql.NullInt64
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT concurrency_limit FROM inference_api_keys WHERE id = $1`, keyID).
+		Scan(&limit); err != nil {
+		return 0, mapError("get api key concurrency limit", err)
+	}
+	return int(limit.Int64), nil
 }
 
 // RevokeAPIKey flips an active key to revoked, stamping revoked_at.

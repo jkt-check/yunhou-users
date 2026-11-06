@@ -812,7 +812,9 @@ paths:
         "429":
           description: |
             rate_limit_error（业务速率限制：`rate_limited` = 账户/策略/Key 的
-            RPM 或账户级 TPM 上限；`quota_exceeded` = 额度耗尽。可计算恢复时刻
+            RPM 或账户级 TPM 上限；`quota_exceeded` = 额度耗尽；
+            `insufficient_capacity` = 并发上限（账户级权益策略上限、Key 级
+            `concurrency_limit` 或上游账号容量）已满。可计算恢复时刻
             时带 Retry-After）
           headers:
             Retry-After:
@@ -916,7 +918,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "429":
-          description: quota_exceeded / rate_limited（可计算恢复时刻时带 Retry-After）
+          description: |
+            quota_exceeded / rate_limited / insufficient_capacity（可计算恢复时刻时带
+            Retry-After）。`insufficient_capacity` = 并发上限已满（账户级权益策略
+            上限、Key 级 `concurrency_limit`、或上游账号容量）—— 与金额/速率限制
+            严格分开。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -1006,10 +1012,12 @@ paths:
                 $ref: "#/components/schemas/V1Error"
         "429":
           description: |
-            quota_exceeded / insufficient_balance / rate_limited（可计算恢复时刻时带
-            Retry-After）。`rate_limited` 是**业务速率限制**（账户/策略/Key 的
+            quota_exceeded / insufficient_balance / rate_limited /
+            insufficient_capacity（可计算恢复时刻时带 Retry-After）。
+            `rate_limited` 是**业务速率限制**（账户/策略/Key 的
             RPM 与账户级 TPM 上限）：它与金额额度耗尽（quota_exceeded）严格分开，
-            充值/切换 PAYG 不能绕过。
+            充值/切换 PAYG 不能绕过。`insufficient_capacity` 是**并发上限**已满
+            （账户级权益策略上限、Key 级 `concurrency_limit`、或上游账号容量）。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -1696,6 +1704,17 @@ components:
             该 Key 的每分钟请求上限（null = 不限）。**业务速率限制**在业务准入
             里执行（滚动 60 秒、PostgreSQL 共享）：与全局账户 RPM、当前权益
             策略的 RPM **同时满足**才放行；超限答复 429 `rate_limited`。
+        concurrency_limit:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: |
+            该 Key 的**独立并发上限**（null = 该 Key 不额外限制并发）。在业务
+            准入里与上游账号/计费账户的并发租约**同一个事务**取锁（PostgreSQL
+            共享，多实例生效）：同一 Key 的并发请求数达到上限即拒绝
+            （429 `insufficient_capacity`），释放后槽位立即归还。该限制**只收窄**
+            共享的账户权益 —— 它不会放宽账户级（权益策略）并发上限；账户上限与
+            Key 上限**同时满足**才放行。
         status:
           type: string
           enum: [active, revoked, expired]
@@ -1723,11 +1742,17 @@ components:
           type: integer
           minimum: 1
           description: 该 Key 的每分钟请求上限（业务准入执行，跨实例共享）。
+        concurrency_limit:
+          type: integer
+          minimum: 1
+          description: |
+            该 Key 的独立并发上限（业务准入执行，跨实例共享）。缺省 = 该 Key 不
+            额外限制并发（账户级上限仍生效）。非正整数一律 400。
         expires_at:
           $ref: "#/components/schemas/RFC3339UTC"
     ApiKeyUpdateRequest:
       type: object
-      description: 仅列出字段被修改；显式 null 清除可选约束（budget/rpm/expires）；未知字段一律 400
+      description: 仅列出字段被修改；显式 null 清除可选约束（budget/rpm/concurrency/expires）；未知字段一律 400
       properties:
         name: { type: string, maxLength: 128 }
         model_ids:
@@ -1741,6 +1766,13 @@ components:
           type: integer
           nullable: true
           description: 该 Key 的每分钟请求上限（业务准入执行，跨实例共享）；显式 null 清除。
+        concurrency_limit:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: |
+            该 Key 的独立并发上限（业务准入执行，跨实例共享）。缺席 = 不修改；
+            显式 null 清除该限制；非正整数一律 400。
         expires_at:
           $ref: "#/components/schemas/RFC3339UTC"
           nullable: true

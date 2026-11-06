@@ -706,7 +706,7 @@ func TestAdmissionLeaseFailureRollsBackEverything(t *testing.T) {
 	f := seedFixture(t, s, true)
 	priceID := seedPrice(t, s, f.modelID)
 	svc := newQuotaService(s)
-	svc.AccountLeaseTTL = time.Minute
+	svc.RequestLeaseTTL = time.Minute
 	big := domain.Microcredit(1 << 40)
 	conc := 1
 
@@ -714,7 +714,7 @@ func TestAdmissionLeaseFailureRollsBackEverything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.AccountLease == nil {
+	if res.AccountLease() == nil {
 		t.Fatal("want account concurrency lease on admission")
 	}
 	// 第二个并发准入：额度充足但并发槽满 → insufficient_capacity，且预占
@@ -732,7 +732,7 @@ func TestAdmissionLeaseFailureRollsBackEverything(t *testing.T) {
 		t.Errorf("requests = %d, want 1", n)
 	}
 	// 释放租约后准入恢复。
-	if err := s.ReleaseLease(ctx, res.AccountLease.ID, svc.OwnerToken, res.AccountLease.FencingToken); err != nil {
+	if err := s.ReleaseLease(ctx, res.AccountLease().ID, svc.OwnerToken, res.AccountLease().FencingToken); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.Admit(ctx, admitCmd(f, priceID, 10_000, big, big, big, &conc)); err != nil {

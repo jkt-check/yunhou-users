@@ -560,6 +560,14 @@ Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-
 
 `POST /user/api-keys`（明文仅创建响应出现一次）、`GET`（分页，永不携带明文）、`GET/PATCH /user/api-keys/:id`（`PATCH` 显式 `null` 清除可选约束）、`DELETE`（幂等撤销，下一次 `/v1` 调用即生效）。字段与错误形状见 OpenAPI 文件。
 
+Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改；`PATCH` 显式 `null` = 清除；非正整数 400）：
+
+| 字段 | 含义 | 生效点 |
+|---|---|---|
+| `budget_micros` | 该 Key 的套餐 microcredit **子预算**（只收窄共享的账户额度，**不是**现金预算） | 额度准入（金额预占） |
+| `rpm_limit` | 该 Key 每 60 秒的逻辑请求数 | 业务准入（速率闸门） |
+| `concurrency_limit` | 该 Key 的**独立并发上限**（在途请求数） | 业务准入（并发租约，与账户/上游上限同时满足才放行） |
+
 ---
 
 ### 标准协议接口 `/v1/*` — 编程工具接入（Claude Code / Codex 等）
@@ -621,6 +629,23 @@ Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-
 - 认证失败、模型未授权、请求形状非法的请求**不进入**业务准入（不占额度）。
 - 数据库不可用时网关 **fail closed**：拒绝新的推理请求并返回 HTTP **503** `service_unavailable` —— 绝不会伪装成"额度耗尽"。
 
+**Key 级并发限制（`concurrency_limit`，跨实例共享）**
+
+客户可以在 `/user/api-keys` 为**每个 Key** 单独设一个并发上限（`concurrency_limit`）；它与上面的速率限制是**两套独立闸门**，但共享同一个准入事务。
+
+| 限制 | 口径 | 来源 |
+|---|---|---|
+| 账户并发 | 每个计费账户的在途请求数 | 权益策略 `concurrency_limit`（null = 不加该限制） |
+| Key 并发 | **每个客户 Key** 的在途请求数 | Key `concurrency_limit`（null = 该 Key 不额外限制） |
+| 上游账号并发 | 每个上游账号的在途请求数 | 上游账号 `concurrency_limit`（0 = 备而不用） |
+
+- 三个上限**同时满足**才放行；Key 上限**只收窄**共享的账户权益，**绝不放宽**账户级上限。账户上限还有余量、但该 Key 的槽位已满时，请求同样被拒。
+- 计数与占槽持久在 PostgreSQL（`inference_concurrency_leases`），多实例共享；上限在**准入事务内**读取并加锁 —— 抢不到槽位就**整笔回滚**（不留请求行、不留金额/速率预占）。
+- 超限答复：HTTP **429**，错误码 `insufficient_capacity`（与 `rate_limited`、`quota_exceeded` 严格分开）。
+- 槽位在请求**终态化之后**释放（结算/释放先于放锁）：流式、非流式、客户端断开、失败切换与 panic 路径都不残留占槽；进程崩溃时由租约 TTL 回收，槽位不会永久冻结。
+- 字段语义（与 `rpm_limit` 同构）：创建时缺省 = 不加限制；`PATCH` 缺席 = 不修改；`PATCH` 显式 `null` = 清除；非正整数一律 400。
+- Key 的 `budget_micros` 仍**只**表示套餐 microcredit 子预算，与本并发上限无关，也不构成现金预算。
+
 **WebSocket**：不实现 —— 目标接入（Claude Code / Codex）均走 HTTP SSE，无 WebSocket 需求。
 
 ---
@@ -633,6 +658,7 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 - 要求有效订阅：订阅未过期、Plan 处于激活态且 `plan.apps` 包含 JWT 的 `app_id`（与登录时 `has_access` 同一判定矩阵），否则 403；
 - 独立限流桶 10 次/秒、突发 20（按 IP，与其他接口桶隔离）；
 - 受与 `/v1/*` **同一组**业务速率限制（账户/策略/Key 的 RPM 与账户级 TPM，跨实例共享；见「标准协议接口」章节的表格）—— 套餐、PAYG 与套餐外三条扣费路径适用同一组限制；
+- 受**同一组**业务并发限制（账户级权益策略并发上限 + 上游账号并发，跨实例共享）；`/chat` 以用户 JWT 调用、**没有客户 Key**，因此不存在 Key 级并发上限（Key 级上限只作用于 `/v1/*` 的客户 Key）；
 - 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` 时整体返回 404（未启用）。
 
 #### POST /chat

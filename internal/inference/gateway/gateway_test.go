@@ -151,6 +151,10 @@ type fixture struct {
 	// snapshotSourceFn replaces the gateway's snapshot source (快照切换 /
 	// 缓存故障路径); nil = the fixture's own static snapshot.
 	snapshotSourceFn func(f *fixture) SnapshotSource
+	// keyConcurrencyLimit pins the customer Key's OWN concurrency limit
+	// (Task 5: the per-Key slot). nil = the Key sets no limit (no Key
+	// lease is taken at all).
+	keyConcurrencyLimit *int
 }
 
 // withNoWindows pins the policy to NO monetary window: the entitlement
@@ -181,6 +185,13 @@ func withModelInputModalities(mods []string) fixtureOpt {
 // own static snapshot.
 func withSnapshotSource(fn func(f *fixture) SnapshotSource) fixtureOpt {
 	return func(f *fixture) { f.snapshotSourceFn = fn }
+}
+
+// withKeyConcurrencyLimit pins the customer Key's own concurrency limit
+// (Task 5: 每个 Key 的独立并发槽). The limit is read from the key row at
+// admission time, so the fixture only has to persist it.
+func withKeyConcurrencyLimit(n int) fixtureOpt {
+	return func(f *fixture) { f.keyConcurrencyLimit = &n }
 }
 
 type fixtureOpt func(f *fixture)
@@ -392,7 +403,8 @@ func newFixture(t *testing.T, up *upstream, opts ...fixtureOpt) *fixture {
 	// the gateway receives the verified principal + key).
 	key := &domain.APIKey{
 		BillingAccountID: acct.ID, Name: "cli",
-		Prefix: "yk-test-" + uuid.NewString()[:8],
+		Prefix:           "yk-test-" + uuid.NewString()[:8],
+		ConcurrencyLimit: f.keyConcurrencyLimit,
 	}
 	if err := store.InsertAPIKey(ctx, key, "sha256:"+uuid.NewString()); err != nil {
 		t.Fatalf("insert api key: %v", err)

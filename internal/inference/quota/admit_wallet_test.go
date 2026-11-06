@@ -75,8 +75,8 @@ func TestAdmitWallet_HappyPathPersistsBoundsAndLease(t *testing.T) {
 		t.Errorf("price version not pinned: %+v", wc.Request.PriceVersionID)
 	}
 	// 无并发限制 → 无租约。
-	if adm.AccountLease != nil {
-		t.Errorf("unexpected account lease: %+v", adm.AccountLease)
+	if adm.AccountLease() != nil {
+		t.Errorf("unexpected account lease: %+v", adm.AccountLease())
 	}
 	if fs.uow.commits != 1 || fs.uow.rollbacks != 0 {
 		t.Errorf("uow = %+v, want one commit no rollback", fs.uow)
@@ -94,7 +94,7 @@ func TestAdmitWallet_ConcurrencyLeaseTakenWhenPolicySetsLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if adm.AccountLease == nil {
+	if adm.AccountLease() == nil {
 		t.Fatal("policy concurrency limit must take the account lease")
 	}
 	if len(fs.leases) != 1 {

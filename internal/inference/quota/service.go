@@ -70,6 +70,12 @@ type Store interface {
 	// rejection rolls the whole admission back (no partial effects), and a
 	// failed transaction leaves no rate count behind.
 	ReserveRateTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.RateReserveCommand) error
+	// GetAPIKeyConcurrencyLimitTx reads the customer Key's OWN concurrency
+	// limit inside the caller's transaction (Task 5). 0 = the key sets no
+	// limit (NULL). The limit is a DATABASE fact read at admission time —
+	// exactly like the Key's RPM limit above — so the cap that applies is
+	// always the one in force now, never a stale authentication snapshot.
+	GetAPIKeyConcurrencyLimitTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (int, error)
 }
 
 // ActivateWindowsCommand is the input of in-transaction window resolution
@@ -120,14 +126,20 @@ type AdmissionResult struct {
 	// HoldMicros is the single-consumption safe upper bound mirrored into
 	// every target (三窗口 + Key 预算各镜像一份，客户只结算一次). For
 	// ChargeSource=wallet it is the money hold in WalletCurrency micros.
-	HoldMicros   domain.Microcredit
-	AdmittedAt   time.Time
-	WindowIDs    map[domain.WindowKind]string
-	OutputCap    int64
-	InputBound   int64
-	PolicyID     string
-	PriceID      string
-	AccountLease *domain.ConcurrencyLease
+	HoldMicros domain.Microcredit
+	AdmittedAt time.Time
+	WindowIDs  map[domain.WindowKind]string
+	OutputCap  int64
+	InputBound int64
+	PolicyID   string
+	PriceID    string
+	// Leases are the REQUEST-scoped concurrency leases of this admission:
+	// the billing-account lease (when the selected policy caps account
+	// concurrency) and the per-Key lease (when the customer Key caps its
+	// OWN concurrency). The list is the single source of truth for the
+	// finalizer: it releases ALL of them, whatever their number — never a
+	// hardcoded "two locks" assumption.
+	Leases []*domain.ConcurrencyLease
 	// ChargeSource is the admission-fixed charge source (Task 14); the zero
 	// value means the plan/quota path.
 	ChargeSource domain.ChargeSource
@@ -137,13 +149,42 @@ type AdmissionResult struct {
 	WalletCurrency string
 }
 
+// AccountLease returns the billing-account lease of the admission, or nil
+// when the policy sets no account-level concurrency limit. The per-Key
+// lease (if any) is reachable through Leases.
+func (r *AdmissionResult) AccountLease() *domain.ConcurrencyLease {
+	if r == nil {
+		return nil
+	}
+	for _, l := range r.Leases {
+		if l != nil && l.Scope == domain.LeaseScopeBillingAccount {
+			return l
+		}
+	}
+	return nil
+}
+
+// KeyLease returns the per-Key lease of the admission, or nil when the
+// customer Key sets no concurrency limit.
+func (r *AdmissionResult) KeyLease() *domain.ConcurrencyLease {
+	if r == nil {
+		return nil
+	}
+	for _, l := range r.Leases {
+		if l != nil && l.Scope == domain.LeaseScopeAPIKey {
+			return l
+		}
+	}
+	return nil
+}
+
 // Service is the quota admission orchestrator.
 type Service struct {
 	store Store
 	clock domain.Clock
-	// AccountLeaseTTL is the lifetime of the per-account concurrency lease
-	// taken with each admission when the policy sets a concurrency limit.
-	AccountLeaseTTL time.Duration
+	// RequestLeaseTTL is the lifetime of every REQUEST-scoped concurrency
+	// lease (the billing-account lease and the per-Key lease).
+	RequestLeaseTTL time.Duration
 	// OwnerToken identifies this service instance as lease owner.
 	OwnerToken string
 	// AccountRPM is the GLOBAL per-billing-account requests-per-minute limit
@@ -164,7 +205,7 @@ func NewService(store Store, clock domain.Clock) *Service {
 	return &Service{
 		store:           store,
 		clock:           clock,
-		AccountLeaseTTL: 10 * time.Minute,
+		RequestLeaseTTL: 10 * time.Minute,
 		OwnerToken:      uuid.NewString(),
 	}
 }
@@ -338,19 +379,65 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 			RequestID:  adm.RequestID,
 			OwnerToken: s.OwnerToken,
 			Limit:      *cmd.Policy.ConcurrencyLimit,
-			TTL:        s.AccountLeaseTTL,
+			TTL:        s.RequestLeaseTTL,
 			Now:        at,
 		})
 		if err != nil {
 			return rollback(err)
 		}
-		result.AccountLease = lease
+		result.Leases = append(result.Leases, lease)
+	}
+
+	// Key-scope concurrency lease (Task 5: 每个 Key 的独立并发槽).
+	if err := s.acquireKeyLeaseTx(ctx, uow, cmd.Request, adm.RequestID, at, result); err != nil {
+		return rollback(err)
 	}
 
 	if err := uow.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// acquireKeyLeaseTx takes the per-Key concurrency lease of one admission
+// inside the caller's transaction.
+//
+// The limit is a DATABASE fact read inside this transaction (exactly like
+// the Key's RPM limit): the cap that applies is the one in force at
+// admission time, never a stale authentication snapshot. A key that sets
+// NO limit takes NO lease — a Key limit only narrows the shared account
+// entitlement, it never adds to it, and the account-level (policy) cap
+// still applies on top.
+//
+// A failure here rolls the WHOLE admission back (the account lease, the
+// money holds, the rate reservation and the request row): there is never a
+// reserved-but-unleased half state.
+func (s *Service) acquireKeyLeaseTx(ctx context.Context, uow domain.UnitOfWork, req domain.Request,
+	requestID string, at time.Time, result *AdmissionResult) error {
+	if req.APIKeyID == nil {
+		return nil
+	}
+	limit, err := s.store.GetAPIKeyConcurrencyLimitTx(ctx, uow, *req.APIKeyID)
+	if err != nil {
+		return err
+	}
+	if limit <= 0 {
+		return nil
+	}
+	lease, err := s.store.AcquireLeaseTx(ctx, uow, domain.AcquireLeaseCommand{
+		Scope:      domain.LeaseScopeAPIKey,
+		ScopeID:    *req.APIKeyID,
+		RequestID:  requestID,
+		OwnerToken: s.OwnerToken,
+		Limit:      limit,
+		TTL:        s.RequestLeaseTTL,
+		Now:        at,
+	})
+	if err != nil {
+		return err
+	}
+	result.Leases = append(result.Leases, lease)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -470,13 +557,19 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 			RequestID:  adm.RequestID,
 			OwnerToken: s.OwnerToken,
 			Limit:      *cmd.Policy.ConcurrencyLimit,
-			TTL:        s.AccountLeaseTTL,
+			TTL:        s.RequestLeaseTTL,
 			Now:        at,
 		})
 		if err != nil {
 			return rollback(err)
 		}
-		result.AccountLease = lease
+		result.Leases = append(result.Leases, lease)
+	}
+
+	// Key 级并发槽（Task 5）：与套餐路径同一机制、同一事务；未设限的 Key
+	// 不取租约（缺省不加 Key 限制）。
+	if err := s.acquireKeyLeaseTx(ctx, uow, cmd.Request, adm.RequestID, at, result); err != nil {
+		return rollback(err)
 	}
 
 	if err := uow.Commit(ctx); err != nil {

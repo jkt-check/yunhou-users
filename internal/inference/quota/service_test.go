@@ -44,7 +44,15 @@ type fakeStore struct {
 	released   []string
 
 	leaseErr error
-	leases   []domain.AcquireLeaseCommand
+	// leaseErrs is consumed one per AcquireLeaseTx call (nil = that call
+	// succeeds). It lets a test fail the SECOND lease of a multi-lease
+	// admission (the account lease succeeds, the Key lease does not).
+	leaseErrs []error
+	leases    []domain.AcquireLeaseCommand
+
+	// Task 5: the customer Key's own concurrency limit (a database fact
+	// read inside the admission transaction). 0 = the Key sets no limit.
+	keyConcurrencyLimit int
 
 	// Task 4: the persistent rate reservation (business RPM/TPM gate).
 	rateErr  error
@@ -101,7 +109,13 @@ func (s *fakeStore) ReserveRateTx(ctx context.Context, uow domain.UnitOfWork, cm
 }
 
 func (s *fakeStore) AcquireLeaseTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.AcquireLeaseCommand) (*domain.ConcurrencyLease, error) {
-	if s.leaseErr != nil {
+	if len(s.leaseErrs) > 0 {
+		err := s.leaseErrs[0]
+		s.leaseErrs = s.leaseErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	} else if s.leaseErr != nil {
 		return nil, s.leaseErr
 	}
 	s.leases = append(s.leases, cmd)
@@ -110,6 +124,11 @@ func (s *fakeStore) AcquireLeaseTx(ctx context.Context, uow domain.UnitOfWork, c
 		RequestID: cmd.RequestID, OwnerToken: cmd.OwnerToken, FencingToken: 1,
 		State: domain.LeaseHeld, AcquiredAt: cmd.Now, ExpiresAt: cmd.Now.Add(cmd.TTL),
 	}, nil
+}
+
+// GetAPIKeyConcurrencyLimitTx: Task 5 —— Key 自己的并发上限（数据库事实）。
+func (s *fakeStore) GetAPIKeyConcurrencyLimitTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (int, error) {
+	return s.keyConcurrencyLimit, nil
 }
 
 func serviceFixture(t *testing.T) (*Service, *fakeStore, AdmitCommand) {
@@ -207,8 +226,8 @@ func TestAdmitTakesAccountLeaseWhenPolicyCapsConcurrency(t *testing.T) {
 	if l.RequestID != res.RequestID || l.Limit != 2 || l.OwnerToken == "" {
 		t.Errorf("lease = %+v", l)
 	}
-	if res.AccountLease == nil || res.AccountLease.FencingToken != 1 {
-		t.Errorf("result lease = %+v", res.AccountLease)
+	if res.AccountLease() == nil || res.AccountLease().FencingToken != 1 {
+		t.Errorf("result lease = %+v", res.AccountLease())
 	}
 }
 

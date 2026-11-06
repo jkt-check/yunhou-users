@@ -255,6 +255,50 @@ token 桶却没给总量 → 明确 `invalid_input`（金额修正不得静默�
 **Tests:** `access/apikey_test.go`、`httpapi/user_api_keys_test.go`、`postgres/lease_repo_test.go`、`gateway/{gateway_test,finish_order_test}.go`。
 **Interfaces:** AdmissionResult 增加 Key lease，或统一为可续租/释放的请求级 lease 列表；LeaseKeeper/finalizer 同时处理账户、Key、上游 lease，不硬编码只有两把锁。
 
+**实际签名（T5 实施后回填）：**
+
+```go
+// internal/inference/quota/service.go —— 请求级租约列表（不再硬编码「两把锁」）
+type AdmissionResult struct {
+    /* … */
+    // Leases 是本次准入的**请求级**并发租约：计费账户租约（权益策略设了账户
+    // 并发上限时）+ 客户 Key 租约（Key 自己设了 concurrency_limit 时）。
+    // 列表是收尾（finalizer）的唯一事实来源：释放全部，不管有几把。
+    Leases []*domain.ConcurrencyLease
+}
+func (r *AdmissionResult) AccountLease() *domain.ConcurrencyLease // nil = 策略未设账户并发上限
+func (r *AdmissionResult) KeyLease() *domain.ConcurrencyLease     // nil = Key 未设并发上限
+
+type Store interface {
+    /* … */
+    // Key 的并发上限是**数据库事实**：与 Key 的 RPM 限额同构，在准入事务内读，
+    // 不信鉴权时的快照。0 = 该 Key 不设 Key 级限制（不取租约）。
+    GetAPIKeyConcurrencyLimitTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (int, error)
+}
+type Service struct { /* … */ RequestLeaseTTL time.Duration } // 账户租约与 Key 租约同一 TTL（原 AccountLeaseTTL）
+// 套餐路径与钱包路径共用同一段取锁代码（并发限制不因换扣费来源而绕过）：
+func (s *Service) acquireKeyLeaseTx(ctx context.Context, uow domain.UnitOfWork, req domain.Request, requestID string, at time.Time, result *AdmissionResult) error
+
+// internal/inference/postgres/apikey_repo.go —— 管理面持久化 + 准入期读取
+func (s *Store) GetAPIKeyConcurrencyLimitTx(ctx context.Context, w domain.UnitOfWork, keyID string) (int, error)
+func (s *Store) UpdateAPIKey(ctx context.Context, k *domain.APIKey) error // 现在也写 concurrency_limit
+
+// internal/inference/access/apikey.go —— 客户自管 DTO（缺省/缺席/显式 null/非正整数）
+type CreateParams struct { /* … */ ConcurrencyLimit *int }  // nil = 不加 Key 级限制
+type KeyPatch struct { /* … */ ConcurrencyLimit *int; ClearConcurrency bool }
+
+// internal/inference/gateway/service.go —— 按**列表**收尾（上游 + 账户 + Key）
+func (s *Service) releaseAdmission(requestID string, leases []*domain.ConcurrencyLease)
+func (s *Service) releaseRequestLeases(ctx context.Context, leases []*domain.ConcurrencyLease)
+func leaseIDSet(leases []*domain.ConcurrencyLease) map[string]struct{} // 按租约 ID 拆分，不按锁的数量
+```
+
+**租约作用域与收尾（不变式）**：`inference_concurrency_leases.scope` 取
+`billing_account`（账户）/ `api_key`（客户 Key）/ `upstream_account`（上游账号）；
+三把（若都有）在**同一个准入/派发事务**里按同一把锁序取得，**先 finalize
+（结算落账、请求终态化）再释放租约**，panic 也必须释放。取不到就整笔回滚，
+不留「已预占但未上锁」的半状态。
+
 - [ ] 对 Key create/patch/read 开放 `concurrency_limit`：缺省不增加 Key 限制、PATCH 缺席不修改、显式 null 清除、非正整数拒绝；保留 owner 检查。
 - [ ] 写同 Key 上限 1 的并发拒绝、不同 Key 互不占 Key 槽但仍受账户总上限、Key 无限制三种情况。
 - [ ] 写第一把租约成功第二把失败的事务回滚；流式/非流式、取消、panic、fencing、失败切换和恢复均无租约泄漏。

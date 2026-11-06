@@ -2191,12 +2191,311 @@ Command #3 — exit code **0**:
 
 ### T5 — Per-key concurrency
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-06, base SHA `2cf99da` (the T4 branch tip; T0 base `35cf836`).
+**T5 commit:** `feat(inference): enforce a per-Key concurrency limit at
+admission` — the commit that carries this section (19 files; **not pushed,
+not merged, not deployed**). The SHA is recorded in the task report (the
+report lives outside version control).
+Task report: `.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-5-report.md`.
+
+**Environment for every row below.** One **fresh disposable PostgreSQL per
+run**, created with the trap-protected recipe of §1.2 (free port proven free
+before the instance exists, `initdb`+`pg_ctl`+`createdb`, `DATABASE_URL` and
+`E2E_DATABASE_URL` exported explicitly, `EXIT/INT/TERM` trap tears the
+instance down). Every run used `GOPROXY=off` and `GOFLAGS=-mod=readonly`;
+every database-backed command used `-p 1`; `go.mod` / `go.sum` were never
+modified (`git diff --stat go.mod go.sum` → empty after every run).
+
+#### 4.34 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 2 | `go build ./...` | **0** | build green (no new dependency) |
+| 3 | `go run ./cmd/migrate` (run 1, `t5_app`) | **0** | `applied=52 skipped=0` (T4 baseline 52; **T5 adds no migration**) |
+| 4 | `go run ./cmd/migrate` (run 2, `t5_app`) | **0** | `applied=0 skipped=52` (idempotent) |
+| 5 | `go run ./cmd/migrate -status` | **0** | 52 × `✅` |
+| 6 | `DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate` | **0** | e2e-side DB migrated before the e2e job |
+| 7 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/...` | **0** | 14 packages `ok` — the brief's exact acceptance command |
+| 8 | `go test -race -count=1 -p 1 -v ./internal/inference/... ./tests/integration/...` | **0** | skip inventory — see §4.37 |
+| 9 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 10 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.2%` ≥ the 80% floor (T0 80.4%, T1 80.5%, T2 80.3%, T3 80.4%, T4 80.1%) |
+| 11 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t5_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 314.854s` |
+
+#### 4.35 RED evidence (before any production edit)
+
+**RED-1a — compile-level RED for the two packages whose new cases must
+reference the new type surface.** `access.CreateParams.ConcurrencyLimit` and
+`quota.AdmissionResult.Leases` did not exist at `2cf99da`, so those two test
+files cannot compile against the unmodified production code. The compile
+errors (verbatim) are the RED for that part:
+
+```
+$ go vet ./internal/inference/access/ ./internal/inference/quota/
+# github.com/yunhou/users/internal/inference/quota
+vet: internal/inference/quota/key_lease_test.go:35:13: res.Leases undefined (type *AdmissionResult has no field or method Leases)
+# github.com/yunhou/users/internal/inference/access
+vet: internal/inference/access/apikey_concurrency_test.go:31:59: unknown field ConcurrencyLimit in struct literal of type CreateParams
+```
+
+Those two files were then moved aside (`mv` to `/tmp`) so the remaining
+packages could be run against the **unmodified** production tree; the
+behavioural RED below is from that state.
+
+**RED-1b — `httpapi` (management surface).** The `concurrency_limit` field did
+not exist on the wire, so every request that carried it was rejected as an
+unknown field:
+
+```
+=== RUN   TestUserAPIKeys_ConcurrencyLimitCreateReadUpdate
+    user_api_keys_concurrency_test.go:52: concurrency_limit = <nil> (present=false), want null (缺省不加 Key 限制)
+    user_api_keys_concurrency_test.go:60: create key: 400 {"code":400,"data":null,"message":"invalid request body (unknown fields rejected): json: unknown field \"concurrency_limit\""}
+--- FAIL: TestUserAPIKeys_ConcurrencyLimitCreateReadUpdate (0.26s)
+=== RUN   TestUserAPIKeys_ConcurrencyLimitRejectsNonPositive
+    user_api_keys_concurrency_test.go:150: create key: 400 {"code":400,"data":null,"message":"invalid request body (unknown fields rejected): json: unknown field \"concurrency_limit\""}
+--- FAIL: TestUserAPIKeys_ConcurrencyLimitRejectsNonPositive (0.20s)
+=== RUN   TestUserAPIKeys_ConcurrencyLimitKeepsOwnerChecks
+    user_api_keys_concurrency_test.go:170: create key: 400 {"code":400,"data":null,"message":"invalid request body (unknown fields rejected): json: unknown field \"concurrency_limit\""}
+--- FAIL: TestUserAPIKeys_ConcurrencyLimitKeepsOwnerChecks (0.11s)
+FAIL	github.com/yunhou/users/internal/inference/httpapi	4.177s
+```
+
+**RED-1c — `postgres` (the admission).** A Key with `concurrency_limit = 1`
+was **not** limited at all: the second concurrent admission was **accepted**
+(`err = <nil>`) and no `api_key`-scope lease row was ever written.
+
+```
+=== RUN   TestKeyConcurrencyLimit_SameKeySecondAdmissionIsRejected
+    key_concurrency_test.go:77: held key leases = 0, want 1 (the admitted request holds the Key slot)
+--- FAIL: TestKeyConcurrencyLimit_SameKeySecondAdmissionIsRejected (0.19s)
+=== RUN   TestKeyConcurrencyLimit_DifferentKeysAreIndependent_AccountCapStillApplies
+    key_concurrency_test.go:157: key leases = 0/0, want 1/1 (each key holds its own slot)
+    key_concurrency_test.go:162: second admission on the same key: err = <nil>, want insufficient_capacity
+--- FAIL: TestKeyConcurrencyLimit_DifferentKeysAreIndependent_AccountCapStillApplies (0.39s)
+=== RUN   TestKeyConcurrencyLimit_UnlimitedKeyTakesNoLease
+--- PASS: TestKeyConcurrencyLimit_UnlimitedKeyTakesNoLease (0.27s)
+=== RUN   TestAPIKeyLeaseScope_IsolatesKeysAndReclaimsAfterTTL
+--- PASS: TestAPIKeyLeaseScope_IsolatesKeysAndReclaimsAfterTTL (0.25s)
+FAIL	github.com/yunhou/users/internal/inference/postgres	2.579s
+```
+
+The two PASSes are **protection evidence** (§4.37), not new behaviour: the
+generic lease protocol already supported the `api_key` scope (per-scope
+isolation + TTL reclamation), and a key without a limit must take no lease.
+
+**RED-1d — `gateway` (the lease lifecycle).** No Key lease was ever taken,
+so the second concurrent request was **not** rejected and none of the five
+terminal paths released a Key lease:
+
+```
+=== RUN   TestGateway_KeyConcurrencyLimit_BlocksConcurrentRequestAndReleasesSlot
+    key_concurrency_test.go:88: held key leases during the request = 0, want 1
+    key_concurrency_test.go:96: second concurrent request: err = <nil>, want insufficient_capacity
+--- FAIL: TestGateway_KeyConcurrencyLimit_BlocksConcurrentRequestAndReleasesSlot (0.25s)
+=== RUN   TestGateway_KeyLeaseReleasedOnStreamCompletion
+    key_concurrency_test.go:132: key lease states = map[], want one released
+--- FAIL: TestGateway_KeyLeaseReleasedOnStreamCompletion (0.38s)
+=== RUN   TestGateway_KeyLeaseReleasedOnClientCancel
+    key_concurrency_test.go:175: released key leases = 0, want 1 (客户端断开必须归还 Key 槽)
+--- FAIL: TestGateway_KeyLeaseReleasedOnClientCancel (0.21s)
+=== RUN   TestGateway_KeyLeaseReleasedOnFailover
+    key_concurrency_test.go:198: released key leases = 0, want 1 (失败切换必须归还 Key 槽)
+--- FAIL: TestGateway_KeyLeaseReleasedOnFailover (0.28s)
+=== RUN   TestGateway_KeyLeaseReleasedOnStreamAssemblyPanic
+    key_concurrency_test.go:232: released key leases = 0, want 1 (panic 守卫必须归还 Key 槽)
+--- FAIL: TestGateway_KeyLeaseReleasedOnStreamAssemblyPanic (0.26s)
+FAIL	github.com/yunhou/users/internal/inference/gateway	2.609s
+```
+
+**Root cause (one missing link, four surfaces).** The column
+`inference_api_keys.concurrency_limit` (migration 025) and the field
+`domain.APIKey.ConcurrencyLimit` existed, but (1) the management surface
+neither exposed nor persisted the field (`postgres.Store.UpdateAPIKey` did not
+even write the column — a PATCH silently dropped it), (2) the admission never
+read it, so no `api_key`-scope lease was ever taken, and (3) the finalizer
+only knew **one** request-scoped lease (`AdmissionResult.AccountLease`), i.e.
+a hardcoded "two locks" shape that would have released a Key lease as if it
+were the attempt-scoped upstream lease.
+
+#### 4.36 GREEN evidence
+
+The new cases after the implementation — exit code **0**:
+
+```
+--- PASS: TestCreateKey_ConcurrencyLimitSemantics (0.00s)
+--- PASS: TestUpdateKey_ConcurrencyLimitPresenceSemantics (0.00s)
+ok  	github.com/yunhou/users/internal/inference/access	0.646s
+
+--- PASS: TestAdmitTakesKeyLeaseWhenTheKeyCapsConcurrency (0.00s)
+--- PASS: TestAdmitAccountAndKeyLeasesCoexist (0.00s)
+--- PASS: TestAdmitTakesNoKeyLeaseWhenTheKeyHasNoLimit (0.00s)
+--- PASS: TestAdmitKeyLeaseFailureRollsBackEverything (0.00s)
+ok  	github.com/yunhou/users/internal/inference/quota	0.622s
+
+--- PASS: TestUserAPIKeys_ConcurrencyLimitCreateReadUpdate (0.23s)
+--- PASS: TestUserAPIKeys_ConcurrencyLimitRejectsNonPositive (0.13s)
+--- PASS: TestUserAPIKeys_ConcurrencyLimitKeepsOwnerChecks (1.82s)
+ok  	github.com/yunhou/users/internal/inference/httpapi	3.598s
+
+--- PASS: TestKeyConcurrencyLimit_SameKeySecondAdmissionIsRejected (0.19s)
+--- PASS: TestKeyConcurrencyLimit_DifferentKeysAreIndependent_AccountCapStillApplies (0.15s)
+--- PASS: TestKeyConcurrencyLimit_UnlimitedKeyTakesNoLease (0.11s)
+--- PASS: TestAPIKeyLeaseScope_IsolatesKeysAndReclaimsAfterTTL (0.13s)
+--- PASS: TestKeyConcurrencyLimit_CrashedRequestDoesNotFreezeTheSlot (0.07s)
+ok  	github.com/yunhou/users/internal/inference/postgres	1.290s
+
+--- PASS: TestGateway_KeyConcurrencyLimit_BlocksConcurrentRequestAndReleasesSlot (0.17s)
+--- PASS: TestGateway_KeyLeaseReleasedOnStreamCompletion (0.13s)
+--- PASS: TestGateway_KeyLeaseReleasedOnClientCancel (0.12s)
+--- PASS: TestGateway_KeyLeaseReleasedOnFailover (0.12s)
+--- PASS: TestGateway_KeyLeaseReleasedOnStreamAssemblyPanic (0.12s)
+--- PASS: TestStreamBodyFinish_FinalizeBeforeLeaseRelease (0.00s)
+--- PASS: TestStreamBodyFinish_ReleasesEveryRequestLease (0.00s)
+--- PASS: TestStreamBodyFinish_PanicStillReleasesLeases (0.00s)
+ok  	github.com/yunhou/users/internal/inference/gateway	1.688s
+```
+
+The acceptance command (#7) — exit code **0** (final trap-protected run):
+
+```
+ok  	github.com/yunhou/users/internal/inference/access	1.615s
+ok  	github.com/yunhou/users/internal/inference/accounting	1.590s
+ok  	github.com/yunhou/users/internal/inference/catalog	3.009s
+ok  	github.com/yunhou/users/internal/inference/credentials	1.866s
+ok  	github.com/yunhou/users/internal/inference/domain	1.581s
+ok  	github.com/yunhou/users/internal/inference/gateway	10.966s
+ok  	github.com/yunhou/users/internal/inference/httpapi	54.484s
+ok  	github.com/yunhou/users/internal/inference/management	1.972s
+ok  	github.com/yunhou/users/internal/inference/postgres	18.262s
+ok  	github.com/yunhou/users/internal/inference/providers	2.126s
+ok  	github.com/yunhou/users/internal/inference/providers/connector	1.647s
+ok  	github.com/yunhou/users/internal/inference/quota	1.992s
+ok  	github.com/yunhou/users/internal/inference/routing	2.215s
+ok  	github.com/yunhou/users/internal/inference/workers	6.801s
+```
+
+The CI `go-ci` gate (#9) — exit code **0**, 33 packages `ok`, 0 `FAIL`
+(including `tests/integration`), and the coverage floor (#10):
+`total coverage: 80.2%` ≥ 80%. The e2e job (#11) — exit code **0**:
+`ok github.com/yunhou/users/tests/e2e 314.854s`.
+
+#### 4.37 Skips
+
+The verbose inventory run (#8) — exit code **0**:
+
+```
+PASS lines: 1277
+FAIL lines: 0
+1967:--- SKIP: TestQuotaWorkerProcess (0.00s)
+3128:--- SKIP: TestLoadDrill_Throughput (0.00s)
+3131:--- SKIP: TestLoadDrill_LongConnections (0.00s)
+--- skips mentioning postgres/no database ---
+(NONE)
+```
+
+| # | Skipped test | Package | Reason | Lost coverage? |
+|---|---|---|---|---|
+| 1 | `TestQuotaWorkerProcess` | `internal/inference/postgres` | Child-process entry point; needs `KAYA_QUOTA_WORKER=1` (`quota_concurrency_test.go:773`). The parent `TestTwoProcessContendLastCredit` re-execs the binary with that flag and passes with real contention output. | No |
+| 2 | `TestLoadDrill_Throughput` | `tests/integration` | Explicit non-default gate `KAYA_LOAD=1`. | No |
+| 3 | `TestLoadDrill_LongConnections` | `tests/integration` | Same `KAYA_LOAD=1` gate. | No |
+
+**Database-test skips: 0** — identical to the T0 (§2.6), T1 (§4.4), T2
+(§4.12), T3 (§4.20) and T4 (§4.29) inventories; the skip lines were grepped
+for `postgres` / `no database` / `database unavailable` and returned nothing.
+
+**One transient failure, honestly recorded.** During an *ad-hoc* re-run of
+`go test -race -count=1 -p 1 ./internal/inference/gateway ./internal/inference/quota
+./internal/inference/access` (a three-package spot check, **not** part of the
+battery above) the command reported `FAIL`. The failing test's name was
+**lost**: that command's output was piped through `tail` twice, and the outer
+`tail -10` cut exactly the lines that carried the failure detail. The command
+was then re-run **11 times** (4 × the same three-package combination, 3 × the
+gateway package alone, 3 × the gateway package under artificial CPU load with
+4 busy loops) — **0 failures** — and the **new** T5 gateway cases were
+re-run **20 times** in isolation — **0 failures**. The three battery runs
+that include the gateway package (steps 7, 8, 9) were all green. The
+transient is therefore recorded as **unreproduced and unattributed**; it was
+**not** observed in any run of the T5 acceptance command, of the CI gate or
+of the e2e job.
+
+#### 4.38 Migration
+
+**None.** T5 adds no migration: `inference_api_keys.concurrency_limit` has
+existed since migration 025 (`CHECK (concurrency_limit IS NULL OR
+concurrency_limit > 0)`) — T5 only wires the existing column up to the
+management surface and to the admission. No historical migration was
+rewritten and no historical ledger row was touched. The disposable databases
+were migrated with `cmd/migrate` exactly as in §2.3 (52 files, idempotent on
+the second run).
+
+#### 4.39 Files changed
+
+| File | Change |
+|---|---|
+| `internal/inference/access/apikey.go` | `CreateParams.ConcurrencyLimit`; `KeyPatch.ConcurrencyLimit` + `ClearConcurrency`; the create/update validation and assignment |
+| `internal/inference/httpapi/user_api_keys.go` | `keyJSON.ConcurrencyLimit`; `createKeyRequest.ConcurrencyLimit`; the create response; `updateKeyAllowed`; the PATCH presence handling |
+| `internal/inference/postgres/apikey_repo.go` | `UpdateAPIKey` now persists `concurrency_limit`; new `GetAPIKeyConcurrencyLimitTx` |
+| `internal/inference/quota/service.go` | `Store.GetAPIKeyConcurrencyLimitTx`; `AdmissionResult.Leases` (+ `AccountLease()` / `KeyLease()`); `AccountLeaseTTL` → `RequestLeaseTTL`; new `acquireKeyLeaseTx` used by **both** the plan and the wallet admission |
+| `internal/inference/gateway/service.go` | `releaseAdmission(requestID, leases)`; `releaseRequestLeases`; `leaseIDSet`; the dispatch keeper carries every request-scoped lease; the non-stream path splits attempt-scoped vs request-scoped leases by ID |
+| `internal/inference/access/apikey_concurrency_test.go` | **new** — create/patch semantics of `concurrency_limit` |
+| `internal/inference/httpapi/user_api_keys_concurrency_test.go` | **new** — the wire contract (create/read/patch/null/non-positive/owner) |
+| `internal/inference/quota/key_lease_test.go` | **new** — the Key lease in the admission, the account+Key coexistence, the rollback |
+| `internal/inference/quota/service_test.go`, `internal/inference/quota/admit_wallet_test.go` | the fake store gained `GetAPIKeyConcurrencyLimitTx` / `keyConcurrencyLimit` / `leaseErrs`; `AccountLease` → `AccountLease()` |
+| `internal/inference/postgres/key_concurrency_test.go` | **new** — same-Key rejection + full rollback, per-Key independence with the account cap, no lease for an unlimited key, the `api_key` lease protocol, crash → TTL reclaim |
+| `internal/inference/postgres/quota_concurrency_test.go` | `AccountLeaseTTL` → `RequestLeaseTTL`; `AccountLease` → `AccountLease()` |
+| `internal/inference/gateway/key_concurrency_test.go` | **new** — the gateway lease lifecycle (concurrent rejection, stream, cancel, failover, panic) |
+| `internal/inference/gateway/gateway_test.go` | the fixture gained `withKeyConcurrencyLimit` |
+| `internal/inference/gateway/finish_order_test.go` | **new case** `TestStreamBodyFinish_ReleasesEveryRequestLease` (three locks); the two named cases are unchanged |
+| `docs/api/kaya-coding-plan.openapi.yaml` | `concurrency_limit` on `ApiKey` / `ApiKeyCreateRequest` / `ApiKeyUpdateRequest`; the three 429 descriptions now name `insufficient_capacity` |
+| `docs/api-integration-guide.md` | the Key field table, a new "Key 级并发限制" section, and the `/chat` note |
+| `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md` | the T5 **Interfaces** paragraph now carries the final signatures |
+| `docs/runbooks/2026-11-05-model-gateway-verification.md` | this section |
+
+#### 4.40 Notes (root cause, compatibility, honesty)
+
+- **Root cause: the Key's concurrency cap existed in the database and in the
+  domain model but was never wired.** The management surface neither exposed
+  nor persisted it (`UpdateAPIKey` did not even write the column), the
+  admission never read it, and the finalizer knew only **one** request-scoped
+  lease — a hardcoded "two locks" shape. The fix wires all three and
+  replaces the single field with a **request-level lease list**.
+- **The Key limit is a DATABASE fact read inside the admission transaction**
+  — exactly like T4's Key RPM limit — so the cap that applies is always the
+  one in force at admission time, never a stale authentication snapshot.
+- **The Key limit only narrows.** The account-level (policy) cap and the
+  upstream-account cap still apply; all of them must hold simultaneously. A
+  key without a limit takes **no** lease (no `api_key` row is written at
+  all). The shared "one billing account per user" entitlement is unchanged.
+- **`budget_micros` keeps its meaning**: a package microcredit **sub-budget**,
+  not a cash budget, and unrelated to the concurrency cap.
+- **Finalize before lease release is preserved**, including under panic: the
+  two named cases (`TestStreamBodyFinish_FinalizeBeforeLeaseRelease`,
+  `TestStreamBodyFinish_PanicStillReleasesLeases`) are **unchanged** and
+  still pass; the new `TestStreamBodyFinish_ReleasesEveryRequestLease`
+  pins the three-lock shape (upstream + account + Key).
+- **No lease leaks on any terminal path**: non-stream success, stream
+  completion, client cancel, failover exhaustion, and the pre-handoff
+  assembly panic all leave **zero** held leases (asserted on the DB rows,
+  not on an in-process counter).
+- **Recorded boundary — the unknown-execution path keeps its lease.** A
+  dispatch whose upstream execution state is unknown is parked for
+  reconciliation; the request is not terminal, so its leases stay held until
+  the lease TTL (10 min) reclaims them — the **same** semantics the account
+  lease already had. The recovery worker's grace period is 15 min > the
+  10-min TTL, so a recovered request's lease has already expired: the slot
+  is never permanently frozen (`TestKeyConcurrencyLimit_CrashedRequestDoesNotFreezeTheSlot`
+  pins this at the admission level). If the grace period is ever configured
+  **below** the lease TTL, this reasoning stops holding and the recovery
+  worker would have to release the leases explicitly.
+- **No new client-visible error shape.** A Key-level concurrency rejection
+  reuses the existing `insufficient_capacity` 429 (`rate_limit_error` on the
+  OpenAI/Anthropic protocol surfaces, the management envelope on `/chat`);
+  only the OpenAPI 429 descriptions were extended to name it.
+- **Compatibility**: `concurrency_limit` is an **optional** field (absent /
+  `null` = no Key-level limit) — a client that never sends it sees exactly
+  the previous behaviour, including no additional `api_key` lease rows.
+  The OpenAPI spec and the integration guide were updated for the new field
+  and for the newly reachable `insufficient_capacity` code.
 
 ### T6 — Protocol error shape and Retry-After
 

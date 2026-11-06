@@ -444,11 +444,11 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	needs := routing.Needs{Tools: len(req.Tools) > 0, Reasoning: thinking}
 	cands, err := s.routingSvc.Candidates(ctx, snap, m.ID, needs)
 	if err != nil {
-		s.releaseAdmission(requestID, adm.AccountLease)
+		s.releaseAdmission(requestID, adm.Leases)
 		return nil, domain.WrapError(domain.CodeInternal, "gateway: route candidates", err)
 	}
 	if len(cands) == 0 {
-		s.releaseAdmission(requestID, adm.AccountLease)
+		s.releaseAdmission(requestID, adm.Leases)
 		return nil, domain.NewError(domain.CodeUpstreamUnavailable,
 			noDispatchableUpstreamMessage(m.ID))
 	}
@@ -475,7 +475,7 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		}
 		cands, err = s.pinSessionCandidates(ctx, sessionKey, m.ID, cands, refresh)
 		if err != nil {
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, err
 		}
 	}
@@ -667,7 +667,7 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 		// reservation releases, and the caller sees the real 400.
 		var de *providers.DispatchError
 		if !errorsAsDispatch(err, &de) {
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, err
 		}
 		lastErr = de
@@ -683,12 +683,12 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 			// The caller is gone: stop spending upstream (设计 §7.2 客户端
 			// 取消后停止上游连接). No consumption is confirmed, so the
 			// reservation releases.
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, domain.WrapError(domain.CodeUpstreamUnavailable, "caller canceled mid-dispatch", de)
 		case !de.Retryable():
 			// Non-retryable upstream rejection (e.g. 400/401/403): the
 			// upstream answered without serving — zero consumption.
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, domain.WrapError(domain.CodeUpstreamUnavailable,
 				"upstream rejected the request", de)
 		case domain.CodeOf(de.Err) == domain.CodeInsufficientCapacity:
@@ -711,7 +711,7 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 	// All attempts failed before any client output with CONFIRMED zero
 	// consumption (unknown-execution failures returned above): release the
 	// reservation (设计 §7.2 reserved → released).
-	s.releaseAdmission(requestID, adm.AccountLease)
+	s.releaseAdmission(requestID, adm.Leases)
 	return nil, domain.WrapError(domain.CodeUpstreamUnavailable,
 		"all compatible upstreams failed", lastErr)
 }
@@ -812,15 +812,18 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 		timeout = 10 * time.Minute
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-	// The keeper renews BOTH leases while the dispatch is in flight (评审轮1
+	// The keeper renews EVERY lease while the dispatch is in flight (评审轮1
 	// M1: the billing-account lease is request-scoped and must be renewed on
 	// the non-streaming path too — previously only the streaming path renewed
-	// it via the stream keeper, an asymmetric lapse window). A renewal
+	// it via the stream keeper, an asymmetric lapse window). The keeper
+	// carries the attempt-scoped upstream lease PLUS every request-scoped
+	// lease of the admission (the account lease and — Task 5 — the per-Key
+	// lease): the lease SET is a list, never a hardcoded pair. A renewal
 	// conflict fences the attempt — the stream guard then stops the upstream
-	// call. Neither lease is released by the keeper: the upstream lease ends
-	// per attempt (explicit release below), the account lease is released by
-	// the finalizer (settle/release), never per attempt.
-	keeper := s.routingSvc.NewLeaseKeeper(lease, adm.AccountLease)
+	// call. No lease is released by the keeper: the upstream lease ends per
+	// attempt (explicit release below), the request-scoped leases are
+	// released by the finalizer (settle/release), never per attempt.
+	keeper := s.routingSvc.NewLeaseKeeper(append([]*domain.ConcurrencyLease{lease}, adm.Leases...)...)
 	// 防泄漏守卫:keeper 创建到交接(Pause 换交流式 keeper / 非流式显式释
 	// 放)之间,若 Dispatch 或 onStream/onNonStream panic(如 disp.Stream
 	// 为 nil、TeeBody 组装失败),gin recover 后 keeper goroutine 会永久续
@@ -911,19 +914,22 @@ func (s *Service) persistAttempt(ctx context.Context, a *domain.Attempt, cand ro
 	return lease, nil
 }
 
-// onNonStreamDispatch settles immediately and returns the payload. Both
-// leases end with the request: upstream explicitly after the keeper pauses,
-// account by the finalizer below.
+// onNonStreamDispatch settles immediately and returns the payload. Every
+// lease ends with the request: the attempt-scoped upstream lease explicitly
+// after the keeper pauses, the request-scoped ones (account + per-Key) by
+// the finalizer below.
 func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
 	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
 	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
 	cancel()
 	kctx, kcancel := detached(settleTimeout)
 	// Pause (no release), then release ONLY the attempt-scoped upstream
-	// lease; the account lease stays held until the finalizer below (M1).
+	// lease; the request-scoped leases stay held until the finalizer below
+	// (M1). The split is by lease ID, not by a hardcoded lock count.
 	keeper.Pause()
+	requestLeases := leaseIDSet(adm.Leases)
 	for _, l := range keeper.Leases() {
-		if adm.AccountLease != nil && l.ID == adm.AccountLease.ID {
+		if _, isRequestLease := requestLeases[l.ID]; isRequestLease {
 			continue
 		}
 		if err := s.routingSvc.ReleaseLease(kctx, l); err != nil {
@@ -955,11 +961,7 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 		raw = nil
 	}
 	s.settle(sctx, requestID, attempt.ID, usage, source, raw, price, adapter, adm)
-	if adm.AccountLease != nil {
-		if err := s.routingSvc.ReleaseLease(sctx, adm.AccountLease); err != nil {
-			log.Printf("gateway: release account lease %s: %v", adm.AccountLease.ID, err)
-		}
-	}
+	s.releaseRequestLeases(sctx, adm.Leases)
 	return &Outcome{RequestID: requestID, ModelID: price.ModelID, Payload: disp.Payload}, nil
 }
 
@@ -1359,15 +1361,43 @@ func (s *Service) markReconciliation(requestID, reason, detail string) {
 // one transaction (reserved → released) and an unused five-hour window is
 // voided in-transaction (设计 §6/§7.2). A failure leaves the hold for
 // Task 9 recovery — loud, never silent.
-func (s *Service) releaseAdmission(requestID string, accountLease *domain.ConcurrencyLease) {
+//
+// Every REQUEST-scoped lease the admission took (the billing-account lease
+// and the per-Key lease — however many there are) is released here: the
+// finalizer works off the admission's lease LIST, never a hardcoded pair of
+// locks.
+func (s *Service) releaseAdmission(requestID string, leases []*domain.ConcurrencyLease) {
 	ctx, cancel := detached(settleTimeout)
 	defer cancel()
 	if err := s.quotaSvc.ReleaseAdmission(ctx, requestID); err != nil {
 		log.Printf("ERROR gateway: release admission %s: %v (reservation held; recovery reconciles)", requestID, err)
 	}
-	if accountLease != nil {
-		if err := s.routingSvc.ReleaseLease(ctx, accountLease); err != nil {
-			log.Printf("gateway: release account lease %s: %v", accountLease.ID, err)
+	s.releaseRequestLeases(ctx, leases)
+}
+
+// leaseIDSet indexes a lease list by lease ID — the finalizer splits the
+// keeper's lease set into "attempt-scoped" and "request-scoped" by identity,
+// never by a hardcoded lock count.
+func leaseIDSet(leases []*domain.ConcurrencyLease) map[string]struct{} {
+	out := make(map[string]struct{}, len(leases))
+	for _, l := range leases {
+		if l != nil {
+			out[l.ID] = struct{}{}
+		}
+	}
+	return out
+}
+
+// releaseRequestLeases releases every request-scoped lease of an admission.
+// A lost lease (already reclaimed/fenced) is not an error — the slot is gone
+// either way; every other failure is logged loudly.
+func (s *Service) releaseRequestLeases(ctx context.Context, leases []*domain.ConcurrencyLease) {
+	for _, l := range leases {
+		if l == nil {
+			continue
+		}
+		if err := s.routingSvc.ReleaseLease(ctx, l); err != nil {
+			log.Printf("gateway: release request lease %s (scope %s): %v", l.ID, l.Scope, err)
 		}
 	}
 }

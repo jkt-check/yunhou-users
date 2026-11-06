@@ -4418,12 +4418,288 @@ ok  	github.com/yunhou/users/internal/inference/httpapi	1.099s
 
 ### T10 — Integration acceptance and implementation report
 
-- Status: not started
-- Commands / exit codes:
-- Skips:
-- Migration:
-- Files changed:
-- Notes:
+Recorded on 2026-11-07, base SHA `babc2c8` (the T9 branch tip; T0 base
+`35cf836`). Task report:
+`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-10-report.md`.
+
+**Environment for every row below.** Same discipline as T1–T9: one **fresh
+disposable PostgreSQL per run**, created with the trap-protected recipe of
+§1.2 (free port proven free before the instance exists, `initdb` + `pg_ctl` +
+`createdb`, `DATABASE_URL` and `E2E_DATABASE_URL` exported explicitly,
+`EXIT/INT/TERM` trap tears the instance down). Every run used `GOPROXY=off`
+and `GOFLAGS=-mod=readonly`; every database-backed command used `-p 1` and
+`-race`; `go.mod` / `go.sum` were never modified (`git diff --stat go.mod
+go.sum` → empty after every run).
+
+**T10 added no production code.** The two new files are test-only
+(`tests/integration/gateway_acceptance_test.go`,
+`tests/integration/gateway_multinstance_test.go`); no `internal/` file, no
+migration and no OpenAPI line changed. That is deliberate: T10 is the
+acceptance task, and the plan puts the acceptance **fixtures** in
+`tests/integration/` (§ "Create/Modify").
+
+#### 4.51 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `go build ./...` | **0** | build green (no new dependency) |
+| 2 | `go vet ./internal/... ./cmd/...` | **0** | lint gate green |
+| 3 | `go run ./cmd/migrate` (run 1, `t10_app`) | **0** | `applied=53 skipped=0` |
+| 4 | `go run ./cmd/migrate` (run 2, `t10_app`) | **0** | `applied=0 skipped=53` (idempotent) |
+| 5 | `go run ./cmd/migrate -status` | **0** | `001`…`053` all ✅ |
+| 6 | **named-case gate** `go test -race -count=1 -p 1 -v -run 'TestExecutedUnknown_NoBlindReplay\|TestFailoverOn429_SettlesOnce\|TestSettleOverHold_OverageJobAndRealCharge\|TestZeroUsageSettle_ChargeRowDistinguishable\|TestListStaleOpenRequests_LiveLeaseGuard\|TestCorrectSettlement' ./internal/inference/gateway/... ./internal/inference/postgres/...` | **0** | **20 PASS / 0 FAIL / 0 SKIP** (4 gateway + 16 postgres) — §4.53 |
+| 7 | `go test -race -count=1 -p 1 ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (`tests/integration` 47.899s) |
+| 8 | `go test -race -count=1 -p 1 -v ./internal/... ./cmd/... ./tests/integration/...` (skip inventory) | **0** | 33 packages `ok`; **2637 top-level PASS + 1470 sub-test PASS / 3 SKIP / 0 FAIL** — §4.54 |
+| 9 | `go test -race -count=1 -p 1 ./tests/e2e/...` — **first attempt** | **1** | **procedure error on my side**: the e2e job had its **own** database (`t10_e2e`) and I had migrated only `DATABASE_URL` (`t10_app`) → `relation "inference_audit_log" does not exist` in every e2e case. Not a product failure; re-run in row 10 with the e2e database migrated. The failing output is kept verbatim in §4.55. |
+| 10 | `DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate` ×2, then `go test -race -count=1 -p 1 ./tests/e2e/...` | **0** / **0** / **0** | `applied=53 skipped=0`, then `applied=0 skipped=53`, then `ok github.com/yunhou/users/tests/e2e 139.323s` |
+| 10b | `go test -race -count=1 -p 1 -v ./tests/e2e/...` (e2e skip inventory) | **0** | `ok … 136.614s`; **125 top-level PASS + 55 sub-test PASS / 1 SKIP / 0 FAIL** — §4.54 |
+| 11 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was **deleted** afterwards — see §4.56) |
+| 12 | coverage floor: `go tool cover -func=coverage.out` → `awk 'BEGIN { exit !(t+0 >= 80) }'` | **0** | `total coverage: 80.3%` ≥ the 80% floor (T0 80.4%, T2 80.3%, T9 80.3%) |
+| 13 | `git diff --check` | **0** | no whitespace error |
+| 14 | `git diff --stat go.mod go.sum` | **0** | empty — the module files were never touched |
+
+#### 4.52 The acceptance matrix T10 added
+
+The T1–T9 evidence is per-package and per-behaviour. What was missing is a
+**single matrix over the client entry points** with **database facts** as the
+assertion, not HTTP bodies. T10 adds exactly that, in two files, reusing the
+existing fixtures (`setupDB`, `writeOpenAIChunks`, `staticSnapshot`, `microc`)
+— no second server stack was built.
+
+`tests/integration/gateway_acceptance_test.go` — four client entry points
+(`/chat` → `kaya_chat`, `/v1/chat/completions` → `openai_chat`,
+`/v1/messages` → `anthropic_messages`, `/v1/responses` → `openai_responses`)
+× seven scenarios. Every assertion reads the persisted facts
+(`inference_requests`, `inference_attempts`, `inference_usage_records`,
+`inference_ledger_entries`, `inference_reservations`,
+`inference_rate_reservations`, `inference_concurrency_leases`,
+`inference_reconciliation_jobs`, `inference_quota_windows`):
+
+| Scenario | Test | What is asserted |
+|---|---|---|
+| success | `TestAcceptance_SuccessSettlesExactlyOncePerEntrypoint` | 1 request row `settled`/`reported`, **exactly one** ledger charge = `settled_micros`, 1 usage record (7/5 tokens), 3 window holds (4 with a Key) all `settled`, **0** held holds, **0** held leases, **0** reconciliation jobs, the three windows' `used_micros` equal the charge |
+| rejection | `TestAcceptance_RejectionLeavesNoTrace` | an unentitled model → 403 on all four entry points with **zero** rows in all eight accounting tables and **zero** upstream calls (pre-admission rejection) |
+| broken stream | `TestAcceptance_BrokenStreamParksWithoutSilentZero` | no usage read → `reconciliation_required`/`unknown`, **no** charge, a `unknown_usage` job, the hold **retained**; usage read before the break → `settled`/`estimated` with the unread bucket **NULL** (never 0) |
+| interruption | `TestAcceptance_ClientInterruptionSettlesAndReleases` | the client write fails mid-stream → attempt `cancelled`, the same two settlement outcomes as above, and the **concurrency slots are given back** (`held` leases = 0) |
+| retry / failover | `TestAcceptance_FailoverAfterRetrySettlesOnce` | candidate 1 answers 429 → candidate 2 serves → **2 attempts** (`failed`/`completed`) and **exactly one** charge + one usage record (a retry never bills twice) |
+| unknown execution | `TestAcceptance_UnknownExecutionParksWithoutReplay` | the upstream hangs past the deployment timeout → the attempt is `unknown`/`transport`, the request parks (`reconciliation_required`, hold retained), and the **healthy backup candidate is never called** (no blind replay) |
+| recovery | `TestAcceptance_RecoverySettlesParkedRequestOnce` | the recovery worker (clock +2 h) settles the parked request **once** at the conservative estimate (charge > 0 — never silently free), the hold becomes `settled`, the **second pass is a no-op**, and the upstream is **not** replayed |
+
+`tests/integration/gateway_multinstance_test.go` — **two independent Service
+instances over two independent DB pools**. The second instance has its own
+`*sqlx.DB` pool, its own `postgres.Store`, its own `quota.Service` /
+`routing.Service` / `gateway.Service` and its own gin engine; the only thing
+they share is PostgreSQL. A process-local goroutine counter would fail every
+one of these:
+
+| Test | What is asserted |
+|---|---|
+| `TestAcceptance_TwoInstancesShareAccountRPM` | policy RPM = 2, three concurrent calls split across the two instances → at most 2 admitted, at least one `429 rate_limited`, and the **account rate rows in PostgreSQL are exactly 2** |
+| `TestAcceptance_TwoInstancesShareAccountTPM` | policy TPM = 100; an in-flight stream on instance 1 holds 60 tokens → instance 2's 50-token request is refused `429 rate_limited` |
+| `TestAcceptance_TwoInstancesShareAccountConcurrency` | policy concurrency = 1 → instance 2 is refused `429 insufficient_capacity` while instance 1 holds the slot |
+| `TestAcceptance_TwoInstancesShareKeyConcurrency` | **Key scope**: `concurrency_limit = 1` on the customer Key → instance 2 is refused `429 insufficient_capacity`, and the held `api_key` lease is visible in `inference_concurrency_leases` |
+| `TestAcceptance_TwoInstancesShareKeyRPM` | **Key scope**: Key RPM = 1 → the same Key on the *other* instance is refused; a **different** Key is unaffected; the key-scope rate rows are 1 and 1 |
+| `TestAcceptance_TwoInstancesShareOneLedger` | two instances write **one** ledger: 2 charge rows, 2 request rows, and the three windows' `used_micros` = 2 × the charge |
+
+#### 4.53 The named cases (row 6) — kept and green
+
+All six names from the brief exist and pass; none was modified or deleted:
+
+```
+--- PASS: TestFailoverOn429_SettlesOnce (0.07s)                       [gateway]
+--- PASS: TestSettleOverHold_OverageJobAndRealCharge (0.05s)          [gateway]
+--- PASS: TestZeroUsageSettle_ChargeRowDistinguishable (0.05s)        [gateway]
+--- PASS: TestExecutedUnknown_NoBlindReplay (0.35s)                   [gateway]
+--- PASS: TestListStaleOpenRequests_LiveLeaseGuard (0.04s)            [postgres]
+--- PASS: TestCorrectSettlement_UpdatesTheLedgerAndTheTokenBudgetOnce (0.05s)
+--- PASS: TestCorrectSettlement_MissingRateRowIsABenignAbsence (0.05s)
+--- PASS: TestCorrectSettlement_PresentButMalformedRateRowIsNotABenignAbsence (0.09s)
+--- PASS: TestCorrectSettlement_LedgerHalfFailureRollsBackTheTokenCorrection (0.05s)
+--- PASS: TestCorrectSettlement_RateHalfFailureRollsBackTheLedgerCorrection (0.04s)
+--- PASS: TestCorrectSettlement_RepeatedCorrectionIsIdempotent (0.05s)
+--- PASS: TestCorrectSettlement_CorrectionKeepsTheOriginalSettlementInstant (0.04s)
+--- PASS: TestCorrectSettlement_UnknownTokenEvidenceKeepsThePreviousTotal (0.04s)
+--- PASS: TestCorrectSettlement_KnownTokenEvidenceRequiresTheCorrectedTotal (0.05s)
+--- PASS: TestCorrectSettlementDebitPreservesHistory (0.05s)           [postgres]
+--- PASS: TestCorrectSettlementCreditAndIdempotency (0.05s)           [postgres]
+--- PASS: TestCorrectSettlementOverageAndJobResolution (0.04s)        [postgres]
+--- PASS: TestCorrectSettlementOverageStaysVisible (0.04s)            [postgres]
+--- PASS: TestCorrectSettlementRejectsWallet (0.04s)                  [postgres]
+--- PASS: TestCorrectSettlement_ReversalAndDelta (0.05s)              [postgres]
+ok  	github.com/yunhou/users/internal/inference/gateway	4.797s
+ok  	github.com/yunhou/users/internal/inference/postgres	2.000s
+```
+
+#### 4.54 Skip inventory — audited, and **no database test skipped**
+
+The verbose app-side run (row 8) reported exactly **three** skips, and the
+verbose e2e run (row 10b) exactly **one**. **None of them is a database
+skip** — every one is an explicitly opt-in drill or a manual entry point:
+
+| Skip | Reason | Verdict |
+|---|---|---|
+| `TestLoadDrill_Throughput` | `load drill: set KAYA_LOAD=1 to run (非默认门禁)` | An **opt-in load gate**, not a missing database. It is a throughput drill with its own `KAYA_LOAD=1` switch; it is excluded from the default gate on purpose. |
+| `TestLoadDrill_LongConnections` | `load drill: set KAYA_LOAD=1 to run (非默认门禁)` | Same. |
+| `TestQuotaWorkerProcess` | `worker process entry point` | A **manual entry point** (it is a worker-process launcher, not an assertion). |
+| `TestUsageTokenAcceptance_TenPagesTwoMinutes` (e2e) | `usage acceptance drill: set USAGE_ACCEPTANCE=1 to run (非默认门禁)` | An **opt-in acceptance drill** with its own switch, in the kaya usage-token area (not the model gateway). |
+
+Every database-backed package ran against the disposable instance: the
+`internal/inference/{access,accounting,catalog,credentials,domain,gateway,httpapi,management,postgres,providers,quota,routing,workers}` suites, `tests/integration` and `tests/e2e` all executed their DB cases — the acceptance matrix would have failed loudly otherwise, since `setupDB` uses `t.Fatalf` (a missing database is a **failure**, never a skip). The skip counts above are the complete inventory: **4 skips in total, 0 of them database-backed**.
+
+#### 4.55 The one failing run, in full — and why it is not a product failure
+
+Row 9 failed with `exit=1`. The **entire** failure mode was one sentence,
+repeated by every e2e case:
+
+```
+--- FAIL: TestAdminUpstreamAccounts_FullLifecycleE2E (0.01s)
+    admin_upstream_accounts_test.go:242: wipe inference_audit_log: pq: relation "inference_audit_log" does not exist at column 13 (42P01)
+--- FAIL: TestE2E_AdminOpsAuthRequired (0.00s)
+    admin_users_test.go:43: cleanup inference tables: pq: relation "inference_audit_log" does not exist (42P01)
+--- FAIL: TestChatLegacy_RelayAndErrorContract (0.00s)
+    chat_gateway_test.go:571: wipe inference_audit_log: pq: relation "inference_audit_log" does not exist at column 13 (42P01)
+... (every e2e case failed the same way)
+FAIL	github.com/yunhou/users/tests/e2e	1.526s
+```
+
+Root cause: **my procedure**, not the code. The e2e suite runs against
+`E2E_DATABASE_URL` — a *different* database from the app-side one (§1.2
+creates `t10_app` **and** `t10_e2e` precisely so the two suites cannot
+contaminate each other). I had applied the migrations only to `DATABASE_URL`
+(`t10_app`), so the e2e database had **no schema at all** and every e2e case
+died in its own wipe step before touching the product.
+
+The fix is the procedure, and it is exactly what CI's `go-e2e` job does
+(§1.3: "apply migrations" is gate 1 of that job):
+
+```
+DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate   → applied=53 skipped=0
+DATABASE_URL=$E2E_DATABASE_URL go run ./cmd/migrate   → applied=0 skipped=53
+go test -race -count=1 -p 1 ./tests/e2e/...            → ok  github.com/yunhou/users/tests/e2e 139.323s
+```
+
+Nothing in the repository was changed to make the e2e suite pass; **no
+production file was touched to "fix" this**. The lesson is recorded because it
+is the exact hazard §1.2 warns about: a silent fallback DSN, or a migration
+applied to the wrong database, looks like a product failure and is not.
+
+#### 4.56 Migration
+
+No new migration. T10 changed **no** schema: the acceptance fixtures only read
+and assert the tables T1–T9 delivered.
+
+- `migrations/050_inference_request_expected_hold.sql` — `inference_requests.expected_hold_micros` (the durable estimate upper bound) + the dedicated reconciliation reasons.
+- `migrations/051_inference_reconciliation_reasons.sql` — the reason vocabulary (`unknown_usage`, `crash_recovery`, `ledger_mismatch`, `manual`, `settlement_overage`, `missing_reservation`, `late_usage_after_release`, `settlement_mismatch`, `insufficient_evidence`).
+- `migrations/052_inference_rate_reservations.sql` — `inference_rate_reservations` (the persistent RPM/TPM coordination: `scope='account'|'key'`, `reserved_tokens` / `settled_tokens`, `UNIQUE(request_id, scope)`).
+- `migrations/053_inference_route_pool_strategy_comments.sql` — comments only (no DDL).
+
+Idempotency was verified twice on **both** databases (`applied=53 skipped=0`
+then `applied=0 skipped=53`), and `go run ./cmd/migrate -status` printed ✅
+for `001`…`053`.
+
+#### 4.57 Files changed
+
+| File | Change |
+|---|---|
+| `tests/integration/gateway_acceptance_test.go` | **new** — the acceptance fixture (two simulated upstreams, two models, one published policy, one entitlement, one customer Key, four client entry points) + the seven scenarios + the DB-fact reader (`readAccFacts`) |
+| `tests/integration/gateway_multinstance_test.go` | **new** — the second independent instance (own pool / store / services / engine) + the six shared-limit cases (account RPM/TPM/concurrency, Key RPM/concurrency, one ledger) |
+| `docs/runbooks/2026-11-05-model-gateway-verification.md` | this section |
+| `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md` | the T0–T10 checkboxes + the "实际交付" appendix (tables / interfaces / compatibility / unsupported legacy configuration) |
+| `.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-10-report.md` | the task report |
+
+**No production file changed.** `git status --short` after the run showed
+exactly the two new test files (plus the two documentation files above).
+
+#### 4.58 Notes (compatibility, boundaries, honesty, known limits)
+
+- **What T10 proved.** Every client entry point ends in **one** charge, or
+  in an **explicit** non-settled terminal state (`reconciliation_required`
+  with a retained hold and an open job) — never a silent zero. The
+  concurrency slots, the monetary holds and the TPM holds are all released
+  or converted when the request ends; the rate counters are shared through
+  PostgreSQL, so **two instances** see one account RPM/TPM/concurrency
+  budget and one per-Key budget.
+- **Compatibility.** T10 changed **no** interface: no new HTTP route, no new
+  JSON field, no new error code, no new table, no OpenAPI line. The
+  acceptance matrix *pins* the existing contracts instead — the four
+  entry points' native error shapes (`/v1` OpenAI vs Anthropic), the `/chat`
+  `{code,data,message}` envelope, the `429 rate_limited` vs
+  `429 insufficient_capacity` vs `429 quota_exceeded` split, and the
+  `reconciliation_required` terminal state.
+- **Unsupported legacy configuration — how it is handled today.** Three
+  legacy shapes are *readable but not schedulable*, and the gateway says so
+  instead of silently pretending: (1) a published route with
+  `pool_strategy` outside the supported set (`least_loaded`, generic
+  `session_sticky`) → the route is excluded from the candidate set, an
+  alarm is raised, and if **no** candidate remains the call fails with an
+  explicit configuration error *before* any hold or dispatch; (2) a policy
+  with `overage_policy = clamp_if_declared` → the policy is still queryable,
+  but a new inference against it is refused with
+  `service_unavailable` ("not implemented") — it is **not** silently
+  downgraded to `reject`, and the operator migrates it by publishing a new
+  revision with `reject` or `allow_overage`; (3) a pre-`050` request row
+  with no `expected_hold_micros` → it carries no recoverable estimate, so it
+  is **parked for manual reconciliation**, never settled as free. The
+  Responses `previous_response_id` session binding remains supported.
+- **Known limits — stated, not glossed over.**
+  1. **No real provider acceptance.** Every upstream in this run is an
+     `httptest` server. Nothing here proves that a real OpenAI / Anthropic /
+     Moonshot deployment bills the way the fixtures assume, and **no real
+     Claude Code / Codex client was exercised** — the protocol surfaces were
+     driven with hand-written request bodies. "Local simulation passes" is
+     not "the real client is accepted".
+  2. **No production deployment.** Nothing was deployed, migrated against a
+     production database, or merged. The production prerequisites are listed
+     in the task report (§ 上线前置).
+  3. **Correction boundaries.** The correction channel
+     (`CorrectSettlement`) covers the **plan** path only; the wallet path is
+     explicitly refused (`TestCorrectSettlementRejectsWallet`). A settlement
+     that exceeds its hold is **not** silently clamped — the real charge
+     settles and the difference is filed as a `settlement_overage`
+     reconciliation job. The recovery worker settles unknown consumption at
+     the **conservative estimate** (the admission-priced upper bound); only a
+     provider that supports per-request execution lookup could settle at the
+     real figure, and no such capability is configured in production, so
+     every recovered request waits for a human to confirm the real usage.
+  4. **Protocol restrictions that remain.** The three `/v1` entry points are
+     a **text subset**: images / files / audio and server-side tools are
+     refused with a native 400 (zero hold, zero dispatch). `/chat` carries
+     the image path, but only to models whose published deployment can
+     carry it. Non-empty Responses `reasoning` / `encrypted` content and
+     Anthropic signed / redacted thinking histories are **refused**, not
+     accepted-and-dropped. There is no lossless native protocol passthrough
+     layer yet.
+  5. **Supplier metering boundaries.** The token figures the gateway bills
+     are the **upstream's** reported usage when it reports any; when it
+     reports none, the gateway falls back to its own estimate (input bound +
+     content bytes), which is auditable (`source = 'estimated'`) but is
+     **not** the supplier's real number. The image token estimate is an
+     OpenAI-style worst case, **not** a mathematical upper bound for every
+     model. The Anthropic `cache_read` / `cache_creation` buckets and the
+     reasoning-token overlap are normalised by the adapter's inclusion
+     declaration; a supplier that changes its usage semantics changes the
+     bill.
+  6. **Measured constraints, not guesses.** The whole
+     `internal/... + cmd/... + tests/integration` suite takes ≈ 4 minutes
+     under `-race -p 1` on this machine, of which `internal/inference/httpapi`
+     alone is 55 s and `internal/util` 27 s; `tests/e2e` takes ≈ 140 s. The
+     coverage floor has thin headroom (**80.3%** against 80%) — a change
+     that adds code without tests fails CI even when every test passes.
+     **No flake was observed in this run** (three consecutive full-suite
+     runs of the acceptance matrix were green), but the load drills
+     (`TestLoadDrill_*`) are excluded from the default gate and therefore
+     carry **no** measured performance baseline — the numbers in
+     `docs/runbooks/kaya-coding-plan-rollout.md` come from a separate
+     campaign.
+  7. **What the acceptance matrix does *not* cover.** It does not exercise
+     the JWT/OAuth path (the e2e suite owns that), the management surfaces,
+     the payment/refund flows, the `/v1/models` and `/chat/models` shapes
+     (T9's e2e contract owns those), nor a **multi-process** deployment
+     (the "two instances" here are two independent Services over two
+     connection pools **inside one process** — the coordination they prove
+     is in PostgreSQL, so it holds across processes too, but that specific
+     claim is not exercised here).
+
 
 ---
 
@@ -4450,4 +4726,28 @@ ok  	github.com/yunhou/users/internal/inference/httpapi	1.099s
 - `make ci-test` / `make ci-local` under-cover relative to `pr-ci.yml`
   because they omit `./tests/integration/...` (§1.3). Use the workflow
   commands, not the Makefile targets, to reproduce a merge gate.
+- **The e2e job needs its own migrated database.** T10's first e2e run
+  failed with `relation "inference_audit_log" does not exist` on **every**
+  case because the migrations had been applied to `DATABASE_URL` only
+  (§4.55). The `go-e2e` CI job has its own Postgres service and runs
+  `go run ./cmd/migrate` as its first gate (§1.3); a local reproduction must
+  do the same **against `E2E_DATABASE_URL`** — otherwise the failure looks
+  like a product regression and is not one.
+- **The acceptance evidence is a simulation, not a provider acceptance.**
+  Every upstream in §4.52 is an `httptest` server; no real OpenAI /
+  Anthropic / Moonshot deployment was billed and **no real Claude Code /
+  Codex client was run** (§4.58, limits 1). The matrix proves the gateway's
+  own accounting and limit semantics, not that a real supplier reports the
+  usage the gateway assumes.
+- **The recovery path bills a conservative estimate, not the real usage.**
+  With no provider-side execution lookup configured, a request whose
+  consumption is unknown settles at the admission-priced upper bound and
+  waits for a human to confirm it (§4.58, limit 3). The unknown-usage
+  backlog alarm fires at 10 parked requests; the backlog needs an operator,
+  not a retry loop.
+- **The "two instances" are two Services in one process.** They have
+  independent pools, stores, services and engines, and the coordination they
+  prove lives in PostgreSQL — but a genuinely multi-process deployment
+  (separate binaries, separate hosts) is not exercised by this repository's
+  test suite (§4.58, limit 7).
 

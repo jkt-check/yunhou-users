@@ -80,11 +80,11 @@
 
 **Read:** `CLAUDE.md`、`Makefile`、`.github/workflows/pr-ci.yml`、`internal/inference/{gateway,httpapi,postgres,catalog}/*test.go` 的 TestMain。
 
-- [ ] 确认当前绝对路径、分支和 `git status --short`，只允许本交接文档产生的变化；记录基线 SHA。
-- [ ] 运行下面的纯单测命令；前一轮分析已经通过过这七组，但本实施开始时仍应记录自己的结果。
-- [ ] 创建一次性 PG，显式配置两种测试 DSN，跑迁移两次并确认第二次零新增；使用 `go run ./cmd/migrate -status` 核对。
-- [ ] 串行运行 inference 和现有 gateway 集成测试；记录 skip，任何数据库测试 skip 不算基线通过。
-- [ ] 新建 `docs/runbooks/2026-11-05-model-gateway-verification.md`，记录环境、命令、退出码、失败/跳过及后续每项证据。不要写密钥或用户对话。
+- [x] 确认当前绝对路径、分支和 `git status --short`，只允许本交接文档产生的变化；记录基线 SHA。
+- [x] 运行下面的纯单测命令；前一轮分析已经通过过这七组，但本实施开始时仍应记录自己的结果。
+- [x] 创建一次性 PG，显式配置两种测试 DSN，跑迁移两次并确认第二次零新增；使用 `go run ./cmd/migrate -status` 核对。
+- [x] 串行运行 inference 和现有 gateway 集成测试；记录 skip，任何数据库测试 skip 不算基线通过。
+- [x] 新建 `docs/runbooks/2026-11-05-model-gateway-verification.md`，记录环境、命令、退出码、失败/跳过及后续每项证据。不要写密钥或用户对话。
 
 ```bash
 go test -count=1 ./internal/inference/access ./internal/inference/accounting ./internal/inference/quota ./internal/inference/management ./internal/inference/domain ./internal/inference/providers ./internal/inference/providers/connector
@@ -98,11 +98,11 @@ go test -count=1 ./internal/inference/access ./internal/inference/accounting ./i
 
 **现状：** `credentials/oauth.go` 封存 access+refresh bundle；gateway `ResolveSecret` 取到整体 JSON，再经 `AuthHeaders` 写入 Bearer/x-api-key。仅管理 probe 正确解包。
 
-- [ ] 写 `TestGateway_OAuthUsesAccessTokenOnly`：通过真实 gateway → httptest 出站，确认 header 只有测试 access token，无 JSON、refresh token；覆盖流式和非流式至少各一次。
-- [ ] 补静态 api_key/service 不变、空 access token/坏 bundle/停用凭据不派发；错误和测试日志无凭据材料。Anthropic 的 auth header 必须与目标协议/明确支持的 OAuth 接法一致，不能把解包成功等同任意供应商 OAuth 已兼容。
-- [ ] 运行定向测试，确认新增断言在基线失败；实现热路径解析并更新相关 fake 接口。
-- [ ] 保留凭据状态、代次/CAS、轮换和 SSRF 保护；测试旧凭据不可被重放派发。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/inference/credentials ./internal/inference/providers/... ./internal/inference/gateway` 后提交。
+- [x] 写 `TestGateway_OAuthUsesAccessTokenOnly`：通过真实 gateway → httptest 出站，确认 header 只有测试 access token，无 JSON、refresh token；覆盖流式和非流式至少各一次。
+- [x] 补静态 api_key/service 不变、空 access token/坏 bundle/停用凭据不派发；错误和测试日志无凭据材料。Anthropic 的 auth header 必须与目标协议/明确支持的 OAuth 接法一致，不能把解包成功等同任意供应商 OAuth 已兼容。
+- [x] 运行定向测试，确认新增断言在基线失败；实现热路径解析并更新相关 fake 接口。
+- [x] 保留凭据状态、代次/CAS、轮换和 SSRF 保护；测试旧凭据不可被重放派发。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/inference/credentials ./internal/inference/providers/... ./internal/inference/gateway` 后提交。
 
 ## T2 — 修复无窗口结算与冲突分类
 
@@ -112,12 +112,12 @@ go test -count=1 ./internal/inference/access ./internal/inference/accounting ./i
 
 **现状：** 仅 RPM/TPM/并发的策略合法；无 Key 的 `/chat` 没有任何 holds。Reserve 仍成功，Settle 因无 held reservation 返回 Conflict，gateway 一律当已结算吞掉。
 
-- [ ] 写 `TestGateway_NoWindowPolicySettles`：无窗口 × 无 Key/有 Key × 零/正价格，至少覆盖 reported 和 estimated；每个完成请求恰一条 charge、有 usage、终态 settled、无悬挂预占/租约。零金额仍有账本事实。
-- [ ] 写 `TestGateway_MissingExpectedReservationRequiresReconciliation`：本应存在的金额预占被测试删除后，结算不能成功，必须暴露异常并进入待核对。
-- [ ] 写重复结算、已 released 请求晚到 usage、同请求并发 finalize 测试：只有 settled 且存在一致的唯一 charge/usage 才是重复成功。released 后晚到非零 usage 是账务异常，必须告警并进入专门核对流程，不能因 released 是终态而吞掉。
-- [ ] 实现无窗口独立计费事实与缺预占异常的区分；不要删掉 `len(rows)==0` 守卫后对所有请求放行，也不要增设虚假窗口。
-- [ ] 修复 recovery 同类路径：新无窗口请求须持久化独立的可恢复估算上界，不能因 `reserved_micros=0` 把已消费请求当免费。追加迁移须区分新旧请求；旧请求证据不足时保留待核对，不自动重算历史或猜测补扣。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/inference/quota ./internal/inference/postgres ./internal/inference/gateway ./internal/inference/workers` 后提交。
+- [x] 写 `TestGateway_NoWindowPolicySettles`：无窗口 × 无 Key/有 Key × 零/正价格，至少覆盖 reported 和 estimated；每个完成请求恰一条 charge、有 usage、终态 settled、无悬挂预占/租约。零金额仍有账本事实。
+- [x] 写 `TestGateway_MissingExpectedReservationRequiresReconciliation`：本应存在的金额预占被测试删除后，结算不能成功，必须暴露异常并进入待核对。
+- [x] 写重复结算、已 released 请求晚到 usage、同请求并发 finalize 测试：只有 settled 且存在一致的唯一 charge/usage 才是重复成功。released 后晚到非零 usage 是账务异常，必须告警并进入专门核对流程，不能因 released 是终态而吞掉。
+- [x] 实现无窗口独立计费事实与缺预占异常的区分；不要删掉 `len(rows)==0` 守卫后对所有请求放行，也不要增设虚假窗口。
+- [x] 修复 recovery 同类路径：新无窗口请求须持久化独立的可恢复估算上界，不能因 `reserved_micros=0` 把已消费请求当免费。追加迁移须区分新旧请求；旧请求证据不足时保留待核对，不自动重算历史或猜测补扣。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/inference/quota ./internal/inference/postgres ./internal/inference/gateway ./internal/inference/workers` 后提交。
 
 ## T3 — Provider 停用、模型状态与 sticky 一致
 
@@ -125,11 +125,11 @@ go test -count=1 ./internal/inference/access ./internal/inference/accounting ./i
 **Tests:** `routing/service_test.go`、`gateway/{sticky_candidates_test,lifecycle_gate_test}.go`、`httpapi/{kaya_models_test,catalog_test}.go`。
 **Interfaces:** 普通候选与 `stickyCandidates` 必须复用同一个“已发布 route/provider/deployment 可调度”判定；不能 sticky 分支另开后门。
 
-- [ ] 写 `TestCandidates_DisabledProviderExcluded` 和 sticky/模型别名/目录缓存刷新变体：快照中 Provider disabled 时不出站，仍能使用另一个 active Provider。
-- [ ] 验证模型列表可用性与实际调度相符：只有 disabled Provider 的模型不能被当作可用部署展示；草稿编辑未发布不影响当前快照。
-- [ ] 保留在途固定快照；新请求在缓存按既有约定刷新后生效，不要求强停旧流。
-- [ ] 验证 lifecycle enforce 拦截 draft/retired，deprecated 按现有契约允许存量；observe 明确只告警。缓存错误不能被伪装成“无权限”。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/routing ./internal/inference/gateway ./internal/inference/httpapi` 后提交。
+- [x] 写 `TestCandidates_DisabledProviderExcluded` 和 sticky/模型别名/目录缓存刷新变体：快照中 Provider disabled 时不出站，仍能使用另一个 active Provider。
+- [x] 验证模型列表可用性与实际调度相符：只有 disabled Provider 的模型不能被当作可用部署展示；草稿编辑未发布不影响当前快照。
+- [x] 保留在途固定快照；新请求在缓存按既有约定刷新后生效，不要求强停旧流。
+- [x] 验证 lifecycle enforce 拦截 draft/retired，deprecated 按现有契约允许存量；observe 明确只告警。缓存错误不能被伪装成“无权限”。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/routing ./internal/inference/gateway ./internal/inference/httpapi` 后提交。
 
 ## T4 — PostgreSQL 统一执行 RPM/TPM
 
@@ -240,14 +240,14 @@ token 桶却没给总量 → 明确 `invalid_input`（金额修正不得静默�
 - DB 故障 fail closed；多实例时间用一致的数据库时间口径。限流拒绝为 429，DB 不可用用明确服务错误，不能伪装成用户额度耗尽。
 - 能确定恢复时间时返回 Retry-After；因在途 TPM/累计 Key 预算等无法确定时不承诺某一秒必然恢复。
 
-- [ ] 写临界测试：RPM=2，两个独立 Service/DB pool 同账户并发 3 次，最多 2 次成功；不同 Key 与 `/chat`/`/v1` 合计受约束；更换策略不能绕过。
-- [ ] 写 TPM=100：已有 60 token 在途，再申请 50 被拒；结算实际 20 后 50 可准入；跨分钟仍在途不得放行；reported/estimated/unknown、缓存和 reasoning 重叠计数正确。
-- [ ] 写实际 token 超预占、estimated→reported 多次校正与幂等测试：按请求净额计一次，修正不改变原结算时刻；过期窗口校正不占当前一分钟额度。
-- [ ] 证明任一金额/速率/并发检查失败后整次准入无部分持久效果；进程重启、数据库短暂失败、重复结算均不漏限或双校正。
-- [ ] 补 PAYG/overage 测试：余额充足但 RPM/TPM 满时仍拒绝且钱包零扣款；套餐金额耗尽后转钱包成功只计一次 RPM/TPM；钱包冻结失败时整次准入回滚。套餐与钱包的终态/恢复都释放或校正同一持久 rate reservation。
-- [ ] 实现持久检查和生命周期接线；从 APIKeyAuth 移除重复的推理业务扣次，认证与外围 IP 防滥用仍保留。
-- [ ] 给新表索引、清理策略和保留期限；清理不得删掉未结算预占。记录锁顺序与单账户性能开销。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/inference/... ./internal/router ./internal/config ./cmd/server`，包含两个独立实例的 PG 集成测试后提交。
+- [x] 写临界测试：RPM=2，两个独立 Service/DB pool 同账户并发 3 次，最多 2 次成功；不同 Key 与 `/chat`/`/v1` 合计受约束；更换策略不能绕过。
+- [x] 写 TPM=100：已有 60 token 在途，再申请 50 被拒；结算实际 20 后 50 可准入；跨分钟仍在途不得放行；reported/estimated/unknown、缓存和 reasoning 重叠计数正确。
+- [x] 写实际 token 超预占、estimated→reported 多次校正与幂等测试：按请求净额计一次，修正不改变原结算时刻；过期窗口校正不占当前一分钟额度。
+- [x] 证明任一金额/速率/并发检查失败后整次准入无部分持久效果；进程重启、数据库短暂失败、重复结算均不漏限或双校正。
+- [x] 补 PAYG/overage 测试：余额充足但 RPM/TPM 满时仍拒绝且钱包零扣款；套餐金额耗尽后转钱包成功只计一次 RPM/TPM；钱包冻结失败时整次准入回滚。套餐与钱包的终态/恢复都释放或校正同一持久 rate reservation。
+- [x] 实现持久检查和生命周期接线；从 APIKeyAuth 移除重复的推理业务扣次，认证与外围 IP 防滥用仍保留。
+- [x] 给新表索引、清理策略和保留期限；清理不得删掉未结算预占。记录锁顺序与单账户性能开销。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/inference/... ./internal/router ./internal/config ./cmd/server`，包含两个独立实例的 PG 集成测试后提交。
 
 ## T5 — 接通 Key 独立并发
 
@@ -299,11 +299,11 @@ func leaseIDSet(leases []*domain.ConcurrencyLease) map[string]struct{} // 按租
 （结算落账、请求终态化）再释放租约**，panic 也必须释放。取不到就整笔回滚，
 不留「已预占但未上锁」的半状态。
 
-- [ ] 对 Key create/patch/read 开放 `concurrency_limit`：缺省不增加 Key 限制、PATCH 缺席不修改、显式 null 清除、非正整数拒绝；保留 owner 检查。
-- [ ] 写同 Key 上限 1 的并发拒绝、不同 Key 互不占 Key 槽但仍受账户总上限、Key 无限制三种情况。
-- [ ] 写第一把租约成功第二把失败的事务回滚；流式/非流式、取消、panic、fencing、失败切换和恢复均无租约泄漏。
-- [ ] 保留 `TestStreamBodyFinish_FinalizeBeforeLeaseRelease`、`TestStreamBodyFinish_PanicStillReleasesLeases`。
-- [ ] 更新 OpenAPI，运行 `go test -race -count=1 -p 1 ./internal/inference/...` 后提交。
+- [x] 对 Key create/patch/read 开放 `concurrency_limit`：缺省不增加 Key 限制、PATCH 缺席不修改、显式 null 清除、非正整数拒绝；保留 owner 检查。
+- [x] 写同 Key 上限 1 的并发拒绝、不同 Key 互不占 Key 槽但仍受账户总上限、Key 无限制三种情况。
+- [x] 写第一把租约成功第二把失败的事务回滚；流式/非流式、取消、panic、fencing、失败切换和恢复均无租约泄漏。
+- [x] 保留 `TestStreamBodyFinish_FinalizeBeforeLeaseRelease`、`TestStreamBodyFinish_PanicStillReleasesLeases`。
+- [x] 更新 OpenAPI，运行 `go test -race -count=1 -p 1 ./internal/inference/...` 后提交。
 
 ## T6 — 统一协议错误与 Retry-After
 
@@ -356,23 +356,23 @@ func (e *ChatLimitError) Error() string
 func (e *ChatLimitError) Unwrap() []error // {ErrChatRequestLimited, ErrChatRateLimited}：准确语义 + 既有 429 退避路径不变
 ```
 
-- [ ] 三个 `/v1` 推理入口分别测试外围 IP 429、业务 RPM/TPM 429、并发/金额配额 429；OpenAI 为 error 对象，Anthropic 为其原生结构，Content-Type 正确，零上游调用。
-- [ ] `/chat` 保留既有 envelope，新增限制映射为准确的业务码/说明，不能全部降为 generic 502。
-- [ ] 修复永久 Key 预算耗尽与窗口同时阻断时的恢复时间表达；只有全部阻断条件可确定时才提供可信的重试时刻。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/middleware ./internal/router ./internal/inference/httpapi ./internal/service` 后提交。
+- [x] 三个 `/v1` 推理入口分别测试外围 IP 429、业务 RPM/TPM 429、并发/金额配额 429；OpenAI 为 error 对象，Anthropic 为其原生结构，Content-Type 正确，零上游调用。
+- [x] `/chat` 保留既有 envelope，新增限制映射为准确的业务码/说明，不能全部降为 generic 502。
+- [x] 修复永久 Key 预算耗尽与窗口同时阻断时的恢复时间表达；只有全部阻断条件可确定时才提供可信的重试时刻。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/middleware ./internal/router ./internal/inference/httpapi ./internal/service` 后提交。
 
 ## T7 — 配置行为收口与连接超时
 
 **Modify:** `catalog/service.go`、`catalog/revision.go`、`management/{bulk_import,quota_policies}.go`、`routing/service.go`、`providers/adapter.go`；必要的配置能力说明。
 **Tests:** `catalog/validate_edges_test.go`、`management/{bulk_import_test,quota_policies_test}.go`、`providers/adapter_dispatch_test.go`。
 
-- [ ] 所有新建/修改/批量导入/环境导入/正式 publish 使用一致支持集：常规池仅支持 round_robin；least_loaded、通用 session_sticky 明确拒绝，不能保存后假装生效。Responses 的 previous_response_id 专用绑定继续可用。
-- [ ] 对存量已发布的不支持 pool_strategy：旧快照可读，路由标记不可用并告警，不能静默当 RR；若无其他候选则在预占/派发前返回明确配置错误。发布预演指出对象 ID 和替代配置。
-- [ ] `weight` 保留“同 priority 下的候选排序”语义，OpenAPI、代码注释和说明一致；本期不实现概率分流。
-- [ ] 新写策略拒绝未实现的 `clamp_if_declared`；旧数据可查询，引用该模式的新推理明确报策略配置不可用，不静默当 reject。文档给出改为 reject/allow_overage 的人工迁移说明，不自动改旧策略。
-- [ ] 让 deployment `ConnectTimeout` 真正控制建连阶段；连接已建立的 SSE 不被它当总超时截断。复用可缓存 transport，不能每请求创建泄漏连接池；保留 DNS/IP 校验。
-- [ ] httptest/可控 dialer 测试不同部署连接超时、长流、请求总超时和未知执行结果不盲重放。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/management ./internal/inference/providers/... ./internal/inference/routing ./internal/inference/gateway` 后提交。
+- [x] 所有新建/修改/批量导入/环境导入/正式 publish 使用一致支持集：常规池仅支持 round_robin；least_loaded、通用 session_sticky 明确拒绝，不能保存后假装生效。Responses 的 previous_response_id 专用绑定继续可用。
+- [x] 对存量已发布的不支持 pool_strategy：旧快照可读，路由标记不可用并告警，不能静默当 RR；若无其他候选则在预占/派发前返回明确配置错误。发布预演指出对象 ID 和替代配置。
+- [x] `weight` 保留“同 priority 下的候选排序”语义，OpenAPI、代码注释和说明一致；本期不实现概率分流。
+- [x] 新写策略拒绝未实现的 `clamp_if_declared`；旧数据可查询，引用该模式的新推理明确报策略配置不可用，不静默当 reject。文档给出改为 reject/allow_overage 的人工迁移说明，不自动改旧策略。
+- [x] 让 deployment `ConnectTimeout` 真正控制建连阶段；连接已建立的 SSE 不被它当总超时截断。复用可缓存 transport，不能每请求创建泄漏连接池；保留 DNS/IP 校验。
+- [x] httptest/可控 dialer 测试不同部署连接超时、长流、请求总超时和未知执行结果不盲重放。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/management ./internal/inference/providers/... ./internal/inference/routing ./internal/inference/gateway` 后提交。
 
 ## T8 — 能力路由与协议真实性
 
@@ -380,38 +380,38 @@ func (e *ChatLimitError) Unwrap() []error // {ErrChatRequestLimited, ErrChatRate
 **Tests:** `providers/{client_surface_matrix_test,multimodal_guard_test,responses_client_test,messages_client_test}.go`、`gateway/sticky_candidates_test.go`、`httpapi/protocol_surfaces_test.go`。
 **Interfaces:** `Needs` 和 adapter 能力增加图片支持判断；模型声明、路由能力、adapter 支持三层一致。reasoning effort 在中间请求显式建模，不能只折成 `ThinkingEnabled`。
 
-- [ ] 写 `/chat` 带图、第一条为不支持图片的 Responses deployment、第二条为可用 Chat/Anthropic deployment 的测试：只选兼容候选；完全无兼容候选时出站前明确拒绝；文本仍能走原候选。
-- [ ] 保留现有图片大小/数量检查、不由本服务抓取远程 image URL、审计不写 base64。核对图片 token 估算标识，不宣称固定 1105 token 对所有模型是数学硬上界；记录未解决的供应商计量边界。
-- [ ] 三个 `/v1` 入口继续明确拒绝图片/文件/音频及服务端工具，测试原生 400、零预占、零派发；不要仅因上游支持就在入口无计量保护地开放。
-- [ ] 写 reasoning effort low/medium/high/xhigh 的参数保持或明确拒绝测试，不能一律 medium；adapter 无能力的值不静默忽略。
-- [ ] 对无法忠实重放的非空 Responses reasoning/encrypted 内容和 Anthropic signed/redacted thinking 历史给出明确 4xx，而非接受后丢弃。同步标明这是对旧“接受但丢弃”行为的兼容性修正。
-- [ ] 检查本网关自己生成的 Messages thinking 输出：不能伪造空 signature 冒充可重放原生签名思考；在没有无损支持前，对相应请求明确不支持，并保持普通文本/工具流可用。
-- [ ] 更新能力矩阵：按“客户端入口 × 上游协议 × 文本/工具/图片/思考回放”列明 supported/rejected；包含 SSE 完整结束、半截 EOF、工具多轮和 previous_response_id 归属隔离测试。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/inference/providers/... ./internal/inference/httpapi ./internal/inference/gateway` 后提交。
+- [x] 写 `/chat` 带图、第一条为不支持图片的 Responses deployment、第二条为可用 Chat/Anthropic deployment 的测试：只选兼容候选；完全无兼容候选时出站前明确拒绝；文本仍能走原候选。
+- [x] 保留现有图片大小/数量检查、不由本服务抓取远程 image URL、审计不写 base64。核对图片 token 估算标识，不宣称固定 1105 token 对所有模型是数学硬上界；记录未解决的供应商计量边界。
+- [x] 三个 `/v1` 入口继续明确拒绝图片/文件/音频及服务端工具，测试原生 400、零预占、零派发；不要仅因上游支持就在入口无计量保护地开放。
+- [x] 写 reasoning effort low/medium/high/xhigh 的参数保持或明确拒绝测试，不能一律 medium；adapter 无能力的值不静默忽略。
+- [x] 对无法忠实重放的非空 Responses reasoning/encrypted 内容和 Anthropic signed/redacted thinking 历史给出明确 4xx，而非接受后丢弃。同步标明这是对旧“接受但丢弃”行为的兼容性修正。
+- [x] 检查本网关自己生成的 Messages thinking 输出：不能伪造空 signature 冒充可重放原生签名思考；在没有无损支持前，对相应请求明确不支持，并保持普通文本/工具流可用。
+- [x] 更新能力矩阵：按“客户端入口 × 上游协议 × 文本/工具/图片/思考回放”列明 supported/rejected；包含 SSE 完整结束、半截 EOF、工具多轮和 previous_response_id 归属隔离测试。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/inference/providers/... ./internal/inference/httpapi ./internal/inference/gateway` 后提交。
 
 ## T9 — 探测、能力描述与运维可见性
 
 **Modify:** `management/probe.go`、`management/catalog.go`、`httpapi/admin_models.go`、`httpapi/kaya_models.go`、相关测试和 API/runbook。
 **Interfaces:** 复用 T1 的出站凭据解析与 adapter 鉴权；保持 probe 端点只读语义，默认不触发付费推理。正式 publish 不自动引入网络依赖。
 
-- [ ] deployment probe 按协议设置鉴权/版本头，支持供应商未提供 `/models` 时准确返回“此探测方式不支持/无法确认”，不能伪装模型故障或推理成功。
-- [ ] 区分 credential test（材料可解密）、connectivity probe（指定探测成功）和 inference verified（本次并未做真实推理）。旧字段能兼容则只追加描述字段。
-- [ ] 发布 dry-run 汇总 disabled provider、无账号、策略/路由不支持等可判定问题，标明哪些阻断正式配置发布、哪些只是网络探测提示；HTTP 返回 200 不等于每个 probe.ok 为 true。
-- [ ] `/chat/models` 在既有字段基础上提供准确的图片/工具/思考/上下文与输出上限描述（只追加字段）；不能声明超过当前入口/adapter 能力。`/v1/models` 保持原生基本形状。
-- [ ] 明确运行告警：非幂等结算冲突、未知用量积压、限速存储失败、不支持存量配置。复用现有日志/监控方式，不在本任务引入新监控平台。
-- [ ] 更新 `docs/api/kaya-coding-plan.openapi.yaml`、`docs/api-integration-guide.md`、`docs/runbooks/kaya-coding-plan-operations.md`，纠正本次涉及的旧待办和错误说明。
-- [ ] 运行 `go test -race -count=1 -p 1 ./internal/inference/management ./internal/inference/httpapi ./internal/config ./cmd/server` 后提交。
+- [x] deployment probe 按协议设置鉴权/版本头，支持供应商未提供 `/models` 时准确返回“此探测方式不支持/无法确认”，不能伪装模型故障或推理成功。
+- [x] 区分 credential test（材料可解密）、connectivity probe（指定探测成功）和 inference verified（本次并未做真实推理）。旧字段能兼容则只追加描述字段。
+- [x] 发布 dry-run 汇总 disabled provider、无账号、策略/路由不支持等可判定问题，标明哪些阻断正式配置发布、哪些只是网络探测提示；HTTP 返回 200 不等于每个 probe.ok 为 true。
+- [x] `/chat/models` 在既有字段基础上提供准确的图片/工具/思考/上下文与输出上限描述（只追加字段）；不能声明超过当前入口/adapter 能力。`/v1/models` 保持原生基本形状。
+- [x] 明确运行告警：非幂等结算冲突、未知用量积压、限速存储失败、不支持存量配置。复用现有日志/监控方式，不在本任务引入新监控平台。
+- [x] 更新 `docs/api/kaya-coding-plan.openapi.yaml`、`docs/api-integration-guide.md`、`docs/runbooks/kaya-coding-plan-operations.md`，纠正本次涉及的旧待办和错误说明。
+- [x] 运行 `go test -race -count=1 -p 1 ./internal/inference/management ./internal/inference/httpapi ./internal/config ./cmd/server` 后提交。
 
 ## T10 — 集成验收与实施报告
 
 **Create/Modify:** `tests/integration/` 中 gateway 集成用例、`docs/runbooks/2026-11-05-model-gateway-verification.md`；测试应复用已有 fixture，避免重复搭整套服务器。
 
-- [ ] 真实临时 PG + 模拟上游跑 `/chat`、Chat Completions、Messages、Responses：成功、拒绝、断流、中断、重试、恢复均核对 request/attempt/usage/ledger/holds/leases。
-- [ ] 两独立 Service + 两 DB pool 验证共享 RPM/TPM/并发，不能只用同一进程单个 counter 的 goroutine 测试替代。
-- [ ] 保留现有重点用例：`TestExecutedUnknown_NoBlindReplay`、`TestFailoverOn429_SettlesOnce`、`TestSettleOverHold_OverageJobAndRealCharge`、`TestZeroUsageSettle_ChargeRowDistinguishable`、`TestListStaleOpenRequests_LiveLeaseGuard`、`TestCorrectSettlement*`。
-- [ ] 跑下方完整检查并记录退出码、测试 skip、迁移幂等结果；任何新增失败均修复，不用“原有功能”掩盖。
-- [ ] 核对工作区只有本阶段范围文件，更新任务复选框、实际新接口/表名、兼容性变更、存量不支持配置处理方法。
-- [ ] 最终报告明确：完成项、未完成项及原因、测试证据、上线前置、回滚方式；本地模拟通过不能称真实 Claude Code/Codex 或真实上游已验收。
+- [x] 真实临时 PG + 模拟上游跑 `/chat`、Chat Completions、Messages、Responses：成功、拒绝、断流、中断、重试、恢复均核对 request/attempt/usage/ledger/holds/leases。
+- [x] 两独立 Service + 两 DB pool 验证共享 RPM/TPM/并发，不能只用同一进程单个 counter 的 goroutine 测试替代。
+- [x] 保留现有重点用例：`TestExecutedUnknown_NoBlindReplay`、`TestFailoverOn429_SettlesOnce`、`TestSettleOverHold_OverageJobAndRealCharge`、`TestZeroUsageSettle_ChargeRowDistinguishable`、`TestListStaleOpenRequests_LiveLeaseGuard`、`TestCorrectSettlement*`。
+- [x] 跑下方完整检查并记录退出码、测试 skip、迁移幂等结果；任何新增失败均修复，不用“原有功能”掩盖。
+- [x] 核对工作区只有本阶段范围文件，更新任务复选框、实际新接口/表名、兼容性变更、存量不支持配置处理方法。
+- [x] 最终报告明确：完成项、未完成项及原因、测试证据、上线前置、回滚方式；本地模拟通过不能称真实 Claude Code/Codex 或真实上游已验收。
 
 ```bash
 go build ./...
@@ -420,6 +420,64 @@ go test -race -count=1 -p 1 ./internal/... ./cmd/... ./tests/integration/...
 go test -race -count=1 -p 1 ./tests/e2e/...
 git diff --check
 ```
+
+## 1.1 实际交付（T10 验收后回填：真实接口/表名、兼容性、存量不支持配置）
+
+本节是 T0–T10 实施结果的**唯一事实索引**：计划正文写的是「意图」，这里写的是
+**真实落地的东西**。逐条证据见
+`docs/runbooks/2026-11-05-model-gateway-verification.md`（T1 §4.1–4.8、
+T2 §4.9–4.16、T3 §4.17–4.25、T4 §4.26–4.33、T5 §4.34–4.41、T6 §4.24–4.31、
+T7 §4.25–4.31 与 §4.42、T8 §4.32–4.39、T9 §4.40–4.50、T10 §4.51–4.58）。
+
+### 1.1.1 新增/变更的表与列（迁移只追加）
+
+| 迁移 | 表/列 | 用途 |
+|---|---|---|
+| `050_inference_request_expected_hold.sql` | `inference_requests.expected_hold_micros` | 准入定价的**可恢复估算上界**（无金额窗口的策略用它承载消费事实；`NULL` = 迁移前老行，证据不足） |
+| `051_inference_reconciliation_reasons.sql` | `inference_reconciliation_jobs.reason` 词表扩容 | `unknown_usage` / `crash_recovery` / `ledger_mismatch` / `manual` / `settlement_overage` / `missing_reservation` / `late_usage_after_release` / `settlement_mismatch` / `insufficient_evidence` |
+| `052_inference_rate_reservations.sql` | **`inference_rate_reservations`**（新表） | 账户/Key 级 RPM 计数 + 账户级 TPM 预占/结算；`scope ∈ {account,key}`、`UNIQUE(request_id, scope)`、`state ∈ {reserved,settled,released}` |
+| `053_inference_route_pool_strategy_comments.sql` | 仅列注释 | `pool_strategy` / `weight` / `overage_policy` 的语义注释（无 DDL） |
+
+既有表被复用的关键列：`inference_requests.{status,usage_status,settled_micros,expected_hold_micros,charge_source}`、
+`inference_attempts.{status,error_kind,cost_micros,cost_basis}`、
+`inference_usage_records.{source,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens}`（缺失即 `NULL`，`NULL ≠ 0`）、
+`inference_ledger_entries.{entry_type,amount_micros}`、
+`inference_reservations.{state,target_kind}`、
+`inference_concurrency_leases.{scope,state,fencing_token}`（`scope ∈ {billing_account,api_key,upstream_account,deployment}`）、
+`inference_quota_windows.{used_micros,reserved_micros,state}`、
+`inference_reconciliation_jobs.{reason,status,deadline_at}`。
+
+### 1.1.2 实际对外接口（新增/变更）
+
+- **HTTP**：`POST /chat`（Kaya 面，走网关 facade，协议标记 `kaya_chat`）、`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/responses`；`GET /chat/models` 追加能力字段（`supports_images` / `supports_tools` / `supports_thinking` / `context_tokens` / `max_output_tokens` / `capability_description`），`GET /v1/models` 形状不变。
+- **错误码**：`429 rate_limited`（业务 RPM/TPM）、`429 insufficient_capacity`（并发/容量）、`429 quota_exceeded`（金额窗口/Key 预算）、`403 model_not_allowed`、`404 model_not_found`、`400 invalid_input`（能力不兼容）、`503 service_unavailable`（准入存储不可用）、`503 upstream_unavailable`、`503 chat configuration unavailable`。`/v1` 用**协议原生**形状（OpenAI `{"error":{message,type,code}}` / Anthropic `{"type":"error","error":{type,message}}`），`/chat` 保留 `{code,data,message}` envelope。
+- **管理面**：Key `concurrency_limit`（create/read/patch，缺省不加限、PATCH 缺席不改、显式 null 清除、非正整数拒绝）；`budget_micros` **仍然只表示套餐 microcredit 子预算**，本期未变成现金预算、也未新增钱包 Key 金额产品。
+- **Go API（跨包）**：`domain.RateLimits` / `RateReserveCommand` / `RateUsage` / `RateBlock` / `RateLimitError`；`domain.SettleError` + `SettleOutcomeKind`（duplicate / released / charge_mismatch / ledger_drift / missing_reservation / reservation_drift）；`domain.RecoverableEstimate`；`domain.AdmissionResult.Leases`（账户 + Key 租约列表）；`Store.ReserveRateTx` / `CorrectRateTokensTx` / `PurgeRateReservations` / `GetAPIKeyConcurrencyLimitTx` / `GetAPIKeyBudgetTx`；`credentials.OutboundAuth` + `ResolveOutboundAuth`（oauth → 仅 access token）。
+
+### 1.1.3 兼容性变更（对调用方可见）
+
+1. **403/404/400 的错误形状**按入口协议渲染（`/v1` 不再套管理 envelope）。
+2. **速率拒绝从「每实例 120/分钟」变成「每账户 60 秒滚动窗口」**（跨实例、跨 Key、跨 `/chat` 与 `/v1` 共享）；准入前被拒（形状非法、模型无权）不再消耗速率令牌。
+3. **准入存储不可用从「假装额度耗尽」变成显式 503 `service_unavailable`**。
+4. **`Retry-After` 只在每个阻断约束都有可确定恢复时刻时出现**；Key 的累计预算（`budget_micros`）不按周期清零 → 与窗口同时阻断时**不给**倒计时。
+5. **上游 OAuth 只发 access token**（不再发整包 JSON / refresh token）；Anthropic 协议用 `x-api-key`，OAuth 用 `Authorization: Bearer`。
+6. **能力拒绝从「接受后丢弃」改成明确 4xx**：非空 Responses `reasoning`/`encrypted` 内容、Anthropic signed/redacted thinking 历史现在被**明确拒绝**（这是对旧行为的兼容性修正，旧客户端会开始收到 400）。
+7. **接口探针结果追加字段**（`credential_state` / `probe_method` / `probe_outcome` / `probe_supported` / `inference_verified` / `description`），**旧字段一个未删**；发布预演追加 `issues` / `summary` 等，旧字段保留。
+
+### 1.1.4 存量不支持配置的处理方法（不静默、不自动改历史）
+
+| 存量配置 | 现在怎么读 | 怎么拒 | 人工迁移动作 |
+|---|---|---|---|
+| 已发布路由的 `pool_strategy` ∉ {`round_robin`}（`least_loaded`、通用 `session_sticky`） | 旧快照**可读**；该路由被标记为不可调度并告警 | 该模型**全部**路由都不支持时，在**预占/派发前**返回明确配置错误（`503 upstream_unavailable` + 配置文案） | 改成 `round_robin` 后**重新 publish**；Responses 的 `previous_response_id` 专用绑定不受影响 |
+| 策略 `overage_policy = clamp_if_declared` | 旧策略**仍可查询** | 引用该模式的新推理明确报**策略配置不可用**（`503 service_unavailable`，文案含策略名与 revision）——**不静默当 `reject`** | 发布新 revision，显式选 `reject` 或 `allow_overage`；**不自动改写存量策略** |
+| 迁移 050 之前、**没有** `expected_hold_micros` 的请求行 | 行保留、可查 | 恢复 worker **不按 0 记零放行**：停放 `insufficient_evidence` 等人工处置 | 人工核对真实用量后走既有核对流程；**不自动重算历史、不猜测补扣** |
+| `weight` | 保留「同 `priority` 下的候选排序」语义 | 不适用 | 无需迁移；本期**不实现**按权重比例分流 |
+
+### 1.1.5 本期明确**不做**（后续边界）
+
+Token Plan 商品/权益与统一商品发布、真实渠道退款与改签、官网/Kaya UI、完整 `/v1`
+多模态、签名思考与 encrypted reasoning 的无损回放、通用 least-loaded/session-sticky
+与按权重比例分流、跨实例上游冷却与供应商刷新竞争治理、生产发布与灰度。
 
 ## 2. 一次性 PostgreSQL 操作参考
 

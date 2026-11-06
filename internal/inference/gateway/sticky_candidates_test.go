@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -327,3 +329,99 @@ func TestGateway_AliasToDisabledProviderNotDispatched(t *testing.T) {
 	}
 }
 
+
+// ---------------------------------------------------------------------------
+// T3 补正 — 停用 provider 的 503 文案不得误述为「容量不足 / 稍后重试」
+//
+// provider 被停用不是容量缺口，也不是瞬时故障：它只在重新启用（或换会话
+// 键）之后才会变化。文案若仍说「with capacity」或「retry shortly」，客户端
+// 会对一个不会自行恢复的条件发起重试循环。
+// 错误码（upstream_unavailable）与 HTTP 503 形状不变，也不新增任何线上
+// 错误码或响应字段。
+// ---------------------------------------------------------------------------
+
+// clientVisibleMessage 取客户端真正看到的那段文案（httpapi.safeMsg 取的
+// 就是 domain.Error.Message）。
+func clientVisibleMessage(t *testing.T, err error) string {
+	t.Helper()
+	var de *domain.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v, want a domain error", err)
+	}
+	return de.Message
+}
+
+// assertNonTransientRejection 钉住「非容量 / 非瞬时 / 不邀请重试」的口径。
+func assertNonTransientRejection(t *testing.T, msg, modelID string) {
+	t.Helper()
+	lower := strings.ToLower(msg)
+	for _, bad := range []string{"capacity", "retry", "temporar"} {
+		if strings.Contains(lower, bad) {
+			t.Errorf("message %q must not mention %q（停用不是容量缺口，也不是瞬时故障）", msg, bad)
+		}
+	}
+	if !strings.Contains(msg, modelID) {
+		t.Errorf("message %q must still name the model %q", msg, modelID)
+	}
+	if !strings.Contains(lower, "dispatchable") {
+		t.Errorf("message %q must state that no upstream is dispatchable", msg)
+	}
+}
+
+// TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient：普通
+// 路径上 provider 被停用时的 503 文案——不得说成容量不足、不得邀请重试；
+// 错误码与 503 形状不变，零出站。
+func TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient(t *testing.T) {
+	up := newUpstream(t, completionHandler)
+	f := newFixture(t, up)
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err == nil {
+		t.Fatal("a disabled provider must fail the call")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeUpstreamUnavailable {
+		t.Fatalf("code = %v, want upstream_unavailable（错误码与 503 形状不变）: %v", code, err)
+	}
+	assertNonTransientRejection(t, clientVisibleMessage(t, err), f.modelID)
+	if up.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d, want 0", up.calls.Load())
+	}
+}
+
+// TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient：
+// sticky 路径上绑定到停用 provider 账号时的 503 文案——同样不得说成瞬时/
+// 容量问题、不得邀请重试，并且必须说明会话没有被改绑（否则客户端会对同一个
+// 永不自行恢复的会话键反复重试）。不换号的行为与错误码保持不变。
+func TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	f.gateway.SetSessionBinder(routing.NewSessionBinder(f.store, nil))
+	if err := f.gateway.BindSession(context.Background(), "sess-1", f.modelID, f.accountUpID); err != nil {
+		t.Fatalf("bind session: %v", err)
+	}
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletionsSticky(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"), "sess-1")
+	if err == nil {
+		t.Fatal("a sticky session bound to a disabled provider must not be served")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeUpstreamUnavailable {
+		t.Fatalf("code = %v, want upstream_unavailable（错误码与 503 形状不变）: %v", code, err)
+	}
+	msg := clientVisibleMessage(t, err)
+	assertNonTransientRejection(t, msg, f.modelID)
+	if !strings.Contains(strings.ToLower(msg), "rebound") {
+		t.Errorf("message %q must state that the session was not rebound to another account", msg)
+	}
+	// 不换号：停用的 provider 与另一个 provider 都不得出站。
+	if up1.calls.Load() != 0 || up2.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d/%d, want 0/0", up1.calls.Load(), up2.calls.Load())
+	}
+}

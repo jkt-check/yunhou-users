@@ -1576,6 +1576,146 @@ snapshot's projection (`catalog/revision.go`) and in the candidate selection
   it), the T1 credential behaviour, the T2 settlement/recovery behaviour,
   and the settlement transaction boundaries (untouched).
 
+#### 4.24 T3 fix round — the two 503 messages must not misdescribe a
+#### provider-disable rejection
+
+Recorded on 2026-11-06, after the T3 commit `d9a5ad3`. One **Important**
+review finding was fixed with TDD; the fix round is one extra commit
+(§4.25). Nothing else was touched — the dry-run/probe finding stays with
+T9 (explicitly owned there), and no unrelated/minor change was made.
+
+**The finding (verbatim).** "Both 503 paths misdescribe a provider-disable
+rejection as transient — `internal/inference/gateway/service.go:442-443`
+says *no compatible deployment with capacity for model …* and
+`:566-569` says *session-bound account is temporarily unavailable; retry
+shortly*. A disabled provider is neither a capacity gap nor temporary. The
+sticky contract (no silent rebind) and existing `upstream_unavailable`
+code/503 shape are correct, but the text invites retry loops against a
+condition that clears only after re-enable or a new session key."
+
+**Environment.** Same recipe as §4.17: a fresh trap-cleaned disposable
+PostgreSQL per run, explicit `DATABASE_URL` / `E2E_DATABASE_URL`, `-p 1`,
+`-race`, `GOPROXY=off` + `GOFLAGS=-mod=readonly`, `go.mod` / `go.sum`
+untouched.
+
+##### 4.24.1 Commands / exit codes
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | **RED** `go test -count=1 -v -run 'TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient\|TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient' ./internal/inference/gateway` | **1** | both messages misdescribed the condition — see §4.24.2 |
+| 2 | **GREEN** the same command after the wording change | **0** | both cases pass |
+| 3 | **GREEN** the whole T3 case set (16 cases) with `-p 1` | **0** | 4 packages `ok` |
+| 4 | **acceptance** `go test -race -count=1 -p 1 ./internal/inference/catalog ./internal/inference/routing ./internal/inference/gateway ./internal/inference/httpapi` | **0** | 4 packages `ok` (3.614s / 1.915s / 11.170s / 64.534s) |
+| 5 | `go test -race -count=1 -p 1 -v ./internal/inference/...` | **0** | 14 packages `ok`, 1171 PASS / 1 SKIP / 0 FAIL |
+| 6 | `go test -race -count=1 -p 1 -v ./tests/integration/...` | **0** | 52 PASS / 2 SKIP / 0 FAIL |
+| 7 | `go vet ./internal/... ./cmd/...` + `go build ./...` | **0** / **0** | lint + build green |
+| 8 | CI `go-ci` gate: `go test -race -count=1 -p 1 -coverprofile=coverage.out ./internal/... ./cmd/... ./tests/integration/...` | **0** | 33 packages `ok`, 0 `FAIL` (the generated `coverage.out` was deleted afterwards) |
+| 9 | coverage floor: `go tool cover -func=coverage.out` | **0** | `total coverage: 80.5%` ≥ the 80% floor (T3 first round 80.4%) |
+| 10 | `go test -race -count=1 ./tests/e2e/...` (`E2E_DATABASE_URL` → `t3_e2e`) | **0** | `ok github.com/yunhou/users/tests/e2e 162.762s` |
+
+##### 4.24.2 RED (production code still at `d9a5ad3`)
+
+```
+=== RUN   TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient
+    sticky_candidates_test.go:388: message "no compatible deployment with capacity for model glm-4.6" must not mention "capacity"（停用不是容量缺口，也不是瞬时故障）
+    sticky_candidates_test.go:388: message "no compatible deployment with capacity for model glm-4.6" must state that no upstream is dispatchable
+--- FAIL: TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient (0.09s)
+=== RUN   TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient
+    sticky_candidates_test.go:419: message "session-bound account is temporarily unavailable; retry shortly" must not mention "retry"（停用不是容量缺口，也不是瞬时故障）
+    sticky_candidates_test.go:419: message "session-bound account is temporarily unavailable; retry shortly" must not mention "temporar"（停用不是容量缺口，也不是瞬时故障）
+    sticky_candidates_test.go:419: message "session-bound account is temporarily unavailable; retry shortly" must still name the model "glm-4.6"
+    sticky_candidates_test.go:419: message "session-bound account is temporarily unavailable; retry shortly" must state that no upstream is dispatchable
+    sticky_candidates_test.go:421: message "session-bound account is temporarily unavailable; retry shortly" must state that the session was not rebound to another account
+--- FAIL: TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient (0.11s)
+```
+
+Both failures are pure **assertion** failures — the error **code**
+assertions (`upstream_unavailable`) passed at baseline, which is the
+proof that the wire code was already right and only the text was wrong.
+
+##### 4.24.3 GREEN
+
+Command #2 — exit code **0**:
+
+```
+--- PASS: TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient (0.08s)
+--- PASS: TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient (0.06s)
+```
+
+Command #3 (the whole T3 case set, `-p 1`) — exit code **0**: 16/16 pass
+(14 earlier T3 cases + the 2 new message regressions).
+
+> **Harness note (honest).** An earlier run of command #3 omitted `-p 1`
+> while listing four database-touching packages: `go test` then runs the
+> package binaries **in parallel**, and the `httpapi` fixture's
+> `TRUNCATE` wiped the gateway package's rows mid-test. Two gateway cases
+> failed for that reason alone (`-p 1` → all green; the same two cases
+> also pass in isolation). It was a **procedure** error in the ad-hoc
+> command, not a code defect — the standing rule of §3.2 is `-p 1` for
+> every DB-touching suite, and the acceptance command itself uses it.
+
+##### 4.24.4 The change
+
+`internal/inference/gateway/service.go` — three message strings, one
+helper, one corrected doc comment. **No logic, no code, no status, no
+field changed.**
+
+| Site | Before | After |
+|---|---|---|
+| normal path — empty candidate set | `no compatible deployment with capacity for model <id>` | `no dispatchable upstream for model <id>` |
+| sticky path — the bound account left the candidate set | `session-bound account is temporarily unavailable; retry shortly` | `session-bound account is not dispatchable for model <id>; the session was not rebound to another account` |
+| sticky refresh path — the refreshed candidate set is empty | `no compatible deployment with capacity for model <id>` | `no dispatchable upstream for model <id>` (same helper) |
+
+`noDispatchableUpstreamMessage(modelID)` is the single source for the two
+"no upstream can take this call" sites, so they cannot drift.
+
+The `pinSessionCandidates` doc comment was corrected too: the old text
+claimed the bound-account failure is "RETRYABLE" (transient fullness),
+which is wrong for a disabled provider — the branch now reads "the call
+fails and the session is NOT rebound".
+
+##### 4.24.5 Compatibility
+
+- **The wire contract is unchanged**: error code `upstream_unavailable`,
+  HTTP **503**, the same `V1Error` shape, no new field, no new enum. Only
+  the free-form `message` string changed.
+- **No OpenAPI / integration-guide change is required**: the spec pins the
+  503 by its **code** (`description: upstream_unavailable`,
+  `docs/api/kaya-coding-plan.openapi.yaml:917`/`:1006`) and declares
+  `message` as a plain `type: string` — it never pins the message text.
+  Neither does `docs/api-integration-guide.md` nor the rollout runbook
+  (they cite the code, not the sentence).
+- **Preserved behaviour**: the sticky contract still forbids a silent
+  rebind (the message now says so explicitly), the active-provider
+  fallback still works for a *new* session, the in-flight request still
+  finishes on its pinned snapshot, and the disabled provider still never
+  receives an outbound call.
+- **The new text is accurate for the other cause too**: an upstream
+  account whose quota is exhausted (`quota_remaining=0`, see
+  `docs/runbooks/kaya-coding-plan-rollout.md`) is likewise *not
+  dispatchable* — the old "with capacity" wording happened to fit that
+  case but misdescribed the disabled case; the new wording covers both
+  without claiming either.
+
+##### 4.24.6 Skips
+
+Unchanged from §4.20 — `TestQuotaWorkerProcess` (`KAYA_QUOTA_WORKER=1`),
+`TestLoadDrill_Throughput` and `TestLoadDrill_LongConnections`
+(`KAYA_LOAD=1`). **Database-test skips: 0.**
+
+
+#### 4.25 T3 fix-round commit
+
+- One independent local commit on `fix/model-gateway-completion`, parent
+  `d9a5ad3`; subject:
+  `fix(inference): stop calling a provider-disable rejection a capacity gap`;
+  3 files changed (1 production, 1 test, 1 runbook). The commit SHA is
+  recorded in the task report
+  (`.superpowers/sdd/2026-11-05-users-model-gateway-completion/task-3-report.md`).
+- Staged by explicit path (`git add <path> …`); `git add .` was never used.
+- No push, no merge, no deploy, no database change on any real system.
+- The dry-run/probe finding was **not** touched — it stays with T9.
+
 
 ### T4 — PostgreSQL-backed RPM/TPM
 

@@ -440,7 +440,7 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	if len(cands) == 0 {
 		s.releaseAdmission(requestID, adm.AccountLease)
 		return nil, domain.NewError(domain.CodeUpstreamUnavailable,
-			"no compatible deployment with capacity for model "+m.ID)
+			noDispatchableUpstreamMessage(m.ID))
 	}
 	// Sticky session: narrow the candidate set to the bound account (Task
 	// 13). Failures here release the reservation — no upstream spend.
@@ -529,11 +529,23 @@ func (s *Service) admitWallet(ctx context.Context, request domain.Request, ent d
 	return adm, moneyPrice, nil
 }
 
+// noDispatchableUpstreamMessage is the 503 text for "no upstream can take
+// this call right now". It must not describe the condition as a capacity
+// gap and must not promise a retry: a provider that was disabled clears
+// only after it is re-enabled (a sticky session: only after a new session
+// key), so "with capacity" / "retry shortly" wording would invite a retry
+// loop against a condition that never heals on its own. The error code
+// (upstream_unavailable) and the HTTP 503 shape are unchanged.
+func noDispatchableUpstreamMessage(modelID string) string {
+	return "no dispatchable upstream for model " + modelID
+}
+
 // pinSessionCandidates narrows the failover set to the session's bound
 // account following the Task 12 binder semantics:
 //   - Resolve OK: dispatch only to the bound account. When routing's live
-//     view excludes it (in-process cooldown / quota race) the call fails
-//     RETRYABLE — transient fullness never rebinds.
+//     view excludes it (in-process cooldown / quota race / a provider that
+//     was disabled) the call fails and the session is NOT rebound — a
+//     session is never silently continued on another account.
 //   - CodeNotFound: bind to the first candidate's account (first turn of a
 //     chain) and dispatch there.
 //   - CodeConflict (account invalidated — reauth/disabled/quota-exhausted):
@@ -565,7 +577,8 @@ func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID 
 			pinned := filterCandidatesByAccount(cands, binding.AccountID)
 			if len(pinned) == 0 {
 				return nil, domain.NewError(domain.CodeUpstreamUnavailable,
-					"session-bound account is temporarily unavailable; retry shortly")
+					"session-bound account is not dispatchable for model "+modelID+
+						"; the session was not rebound to another account")
 			}
 			return pinned, nil
 		case domain.CodeOf(err) == domain.CodeNotFound:
@@ -587,7 +600,7 @@ func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID 
 						}
 						if len(fresh) == 0 {
 							return nil, domain.NewError(domain.CodeUpstreamUnavailable,
-								"no compatible deployment with capacity for model "+modelID)
+								noDispatchableUpstreamMessage(modelID))
 						}
 						cands = fresh
 					}

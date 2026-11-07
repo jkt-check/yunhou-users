@@ -79,9 +79,9 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	case domain.ReqReleased:
 		return &domain.SettleError{
 			Kind: domain.SettleOutcomeReleased, Code: domain.CodeConflict,
-			Message:    "settle: request already released — a late delivery must be reconciled, not dropped",
-			Status:     reqStatus,
-			Trivial:    cmd.ChargeMicros == 0 && usageBucketsEmpty(cmd.Usage.Buckets),
+			Message:               "settle: request already released — a late delivery must be reconciled, not dropped",
+			Status:                reqStatus,
+			Trivial:               cmd.ChargeMicros == 0 && usageBucketsEmpty(cmd.Usage.Buckets),
 			RequestedChargeMicros: cmd.ChargeMicros,
 		}
 	}

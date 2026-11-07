@@ -88,7 +88,7 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 
 	// 钱包路径（Task 14）：micromoney 结算 + 钱包冻结转消费，全程同一事务。
 	if domain.ChargeSource(chargeSource) == domain.ChargeSourceWallet {
-		return s.settleWallet(ctx, tx, cmd, accountID, priceVersionID)
+		return s.settleWallet(ctx, tx, cmd, accountID, priceVersionID, reqStatus)
 	}
 
 	// 2. The monetary holds the admission created. A request whose policy
@@ -101,18 +101,9 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	if err != nil {
 		return err
 	}
-	expected := len(domain.ExpectedMonetaryTargets(req))
-	if len(rows) != expected {
-		kind := domain.SettleOutcomeMissingReservation
-		message := "settle: the expected monetary reservation is missing"
-		if len(rows) > expected {
-			kind = domain.SettleOutcomeReservationDrift
-			message = "settle: more held reservations than the admission created (reservation drift)"
-		}
-		return &domain.SettleError{
-			Kind: kind, Code: domain.CodeConflict, Message: message,
-			Status: reqStatus, RequestedChargeMicros: cmd.ChargeMicros,
-		}
+	if err := reservationOutcome("settle", len(rows),
+		len(domain.ExpectedMonetaryTargets(req)), reqStatus, cmd.ChargeMicros); err != nil {
+		return err
 	}
 
 	// 3. Usage fact (UNIQUE(attempt_id, revision)).
@@ -212,6 +203,93 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		 WHERE id = $1`,
 		cmd.RequestID, settled, string(cmd.Usage.Source), cmd.SettledAt); err != nil {
 		return mapError("settle: request", err)
+	}
+	return nil
+}
+
+// reservationOutcome classifies the difference between the held
+// reservations of a request and the monetary targets its admission created:
+//
+//   - fewer held than expected → missing_reservation: the monetary hold the
+//     admission created is gone — an accounting anomaly the caller must be
+//     able to RECOGNIZE (设计 §7.2: 本应存在的金额预占被删除必须可识别);
+//   - more held than expected → reservation_drift.
+//
+// The comparison is on the loaded reservations only: a storage failure is
+// never mapped to either outcome — it stays an error.
+func reservationOutcome(op string, held, expected int, status domain.RequestStatus, charge domain.Microcredit) error {
+	switch {
+	case held < expected:
+		return &domain.SettleError{
+			Kind: domain.SettleOutcomeMissingReservation, Code: domain.CodeConflict,
+			Message: op + ": the expected monetary reservation is missing",
+			Status:  status, RequestedChargeMicros: charge,
+		}
+	case held > expected:
+		return &domain.SettleError{
+			Kind: domain.SettleOutcomeReservationDrift, Code: domain.CodeConflict,
+			Message: op + ": more held reservations than the admission created (reservation drift)",
+			Status:  status, RequestedChargeMicros: charge,
+		}
+	}
+	return nil
+}
+
+// missingReservationOutcome builds the typed result for "the monetary hold
+// this request was admitted with is gone" — a recognizable accounting
+// anomaly, never an ordinary not-found/conflict the caller would swallow.
+func missingReservationOutcome(op, message string, status domain.RequestStatus, charge domain.Microcredit) error {
+	return &domain.SettleError{
+		Kind: domain.SettleOutcomeMissingReservation, Code: domain.CodeConflict,
+		Message: op + ": " + message, Status: status, RequestedChargeMicros: charge,
+	}
+}
+
+// driftOutcome builds the typed result for "the held reservations do not
+// match what the admission created".
+func driftOutcome(op, message string, status domain.RequestStatus, charge domain.Microcredit) error {
+	return &domain.SettleError{
+		Kind: domain.SettleOutcomeReservationDrift, Code: domain.CodeConflict,
+		Message: op + ": " + message, Status: status, RequestedChargeMicros: charge,
+	}
+}
+
+// checkWalletHolds verifies the wallet request's monetary hold BEFORE any
+// usage/rate/ledger write: the wallet admission created exactly ONE
+// monetary reservation (the mirrored wallet reservation) plus the freeze row
+// it mirrors.
+//
+//   - the mirrored reservation is gone → missing_reservation;
+//   - more than one held reservation → reservation_drift;
+//   - the held reservation is not the wallet hold → reservation_drift;
+//   - the freeze row is gone → missing_reservation (the money the request
+//     was admitted with is gone).
+//
+// A storage failure is never mapped to either outcome: it stays an error.
+func checkWalletHolds(ctx context.Context, tx *sqlx.Tx, requestID string, status domain.RequestStatus, charge domain.Microcredit) error {
+	rows, err := loadHeldReservations(ctx, tx, requestID)
+	if err != nil {
+		return err
+	}
+	expected := len(domain.ExpectedMonetaryTargets(&domain.Request{ChargeSource: domain.ChargeSourceWallet}))
+	if err := reservationOutcome("settle wallet", len(rows), expected, status, charge); err != nil {
+		return err
+	}
+	if rows[0].TargetKind != string(domain.TargetWallet) {
+		return driftOutcome("settle wallet",
+			"the held reservation is not the wallet hold the admission created (reservation drift)",
+			status, charge)
+	}
+	var exists bool
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM inference_wallet_holds WHERE request_id = $1)`, requestID).
+		Scan(&exists); err != nil {
+		return mapError("settle wallet: hold", err)
+	}
+	if !exists {
+		return missingReservationOutcome("settle wallet",
+			"the wallet hold the admission created is missing (accounting anomaly)",
+			status, charge)
 	}
 	return nil
 }
@@ -341,12 +419,26 @@ func usageBucketsEmpty(b domain.UsageBuckets) bool {
 // entries + reservation conversion + request terminal state. The request
 // row lock is already held by the caller.
 //
+// The wallet admission created ONE monetary hold (the mirrored wallet
+// reservation + the freeze row it mirrors). It is checked FIRST, before any
+// usage/rate/ledger write: a hold that went missing is an accounting
+// anomaly and must be classified (missing_reservation / reservation_drift),
+// never settle half of the request and never fall through to an ordinary
+// not-found/conflict the caller would swallow (设计 §7.2: 本应存在的金额预占
+// 被删除必须可识别).
+//
 // Crash recovery calls this with cmd.WalletCharge == nil: the conservative
 // charge then equals the RESERVED hold (cmd.ChargeMicros) in the wallet's
 // own currency (Task 9 口径: 未知费用 → 按预占额保守入账，可冲正).
-func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.SettleCommand, accountID string, priceVersionID *string) error {
+func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.SettleCommand, accountID string, priceVersionID *string, status domain.RequestStatus) error {
 	if cmd.ChargeMicros < 0 {
 		return domain.WrapError(domain.CodeInvalidInput, "settle wallet: negative charge", domain.ErrNegativeValue)
+	}
+
+	// 1. The monetary hold the admission created — checked before ANY
+	// write, so a missing hold leaves no partial effect behind.
+	if err := checkWalletHolds(ctx, tx, cmd.RequestID, status, cmd.ChargeMicros); err != nil {
+		return err
 	}
 
 	// 2. Usage fact (UNIQUE(attempt_id, revision)).
@@ -394,7 +486,7 @@ func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 
 	// 4. Wallet hold → consume entries (bonus-first; over-hold debits cash
 	// honestly).
-	if err := s.settleWalletLocked(ctx, tx, cmd.RequestID, *charge); err != nil {
+	if err := s.settleWalletLocked(ctx, tx, cmd.RequestID, *charge, status); err != nil {
 		return err
 	}
 

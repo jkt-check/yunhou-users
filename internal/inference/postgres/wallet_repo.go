@@ -563,7 +563,12 @@ func (s *Store) ReserveWallet(ctx context.Context, w domain.UnitOfWork, cmd doma
 // entries: bonus-first within the frozen composition; over-hold excess
 // debits cash honestly (超占真实入账，不隐藏负差额). Duplicate delivery
 // hits the per-request charge unique key in the caller.
-func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID string, charge domain.Money) error {
+//
+// A missing hold row is NOT an ordinary not-found: the freeze the admission
+// created is gone, so the monetary hold this request was admitted with is
+// missing — a recognizable accounting anomaly (missing_reservation), never
+// a plain NotFound the caller would treat as "nothing to settle".
+func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID string, charge domain.Money, status domain.RequestStatus) error {
 	var holdID, walletID, currency string
 	var amount, cash, bonus int64
 	if err := tx.QueryRowxContext(ctx,
@@ -572,6 +577,13 @@ func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID s
 		   JOIN inference_wallets w ON w.id = h.wallet_id
 		  WHERE h.request_id = $1 FOR UPDATE OF h`, requestID).
 		Scan(&holdID, &walletID, &currency, &amount, &cash, &bonus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// 冻结行不见了 = 准入时应当存在的金额预占被删除：可识别的账务
+			// 异常（绝不落成普通 NotFound 让调用方当"没找到"吞掉）。
+			return missingReservationOutcome("settle wallet",
+				"the wallet hold the admission created is missing (accounting anomaly)",
+				status, domain.Microcredit(charge.Micros))
+		}
 		return mapError("settle wallet: lock hold", err)
 	}
 	if charge.Currency != currency {

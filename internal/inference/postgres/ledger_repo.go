@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -225,6 +226,11 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 //     usage fact) → an accounting anomaly (double-billing risk): the
 //     caller must alarm and reconcile.
 //
+// A **storage failure** while reading the recorded charge/usage is neither:
+// it is propagated to the caller. A delivery whose consistency could not be
+// checked is never an idempotent replay (设计 §7.2: 只有一致的 charge/usage
+// 才算幂等成功；存储错误必须响亮).
+//
 // The request row is locked by the caller, so the recorded charge cannot
 // change under this transaction.
 func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.SettleCommand, status domain.RequestStatus) error {
@@ -253,7 +259,13 @@ func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 			RequestedChargeMicros: cmd.ChargeMicros,
 		}
 	}
-	if !usageFactConsistent(ctx, tx, cmd.Usage) {
+	consistent, err := usageFactConsistent(ctx, tx, cmd.Usage)
+	if err != nil {
+		// 存储故障：响亮地向上抛。usage 的一致性无从判断，"账本金额一致"
+		// 不足以证明这是一次幂等重投 —— 绝不把它当成重复成功吞掉。
+		return err
+	}
+	if !consistent {
 		return &domain.SettleError{
 			Kind: domain.SettleOutcomeChargeMismatch, Code: domain.CodeConflict,
 			Message: "settle: request is settled with a different usage fact (inconsistent duplicate)",
@@ -273,9 +285,16 @@ func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 // already recorded for the same attempt revision. A delivery for an attempt
 // that has no recorded fact cannot be compared — it is left consistent (the
 // charge amount is the customer-facing fact that decides the outcome).
-func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord) bool {
+//
+// A **storage failure** is NOT a consistent fact and is returned to the
+// caller: only sql.ErrNoRows (no comparable revision — the deliberate
+// compatibility) keeps the delivery comparable. Any other error means the
+// usage fact could not be read, so "the ledger amount matches" proves
+// nothing about idempotency and the failure must surface loudly instead of
+// being absorbed as a duplicate.
+func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord) (bool, error) {
 	if u.AttemptID == "" {
-		return true
+		return true, nil
 	}
 	revision := u.Revision
 	if revision == 0 {
@@ -287,13 +306,17 @@ func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord)
 		 FROM inference_usage_records WHERE attempt_id = $1 AND revision = $2`,
 		u.AttemptID, revision).Scan(&in, &out, &cacheRead, &cacheWrite, &reasoning)
 	if err != nil {
-		return true
+		if errors.Is(err, sql.ErrNoRows) {
+			// 没有可比的 revision（刻意兼容）：交给金额裁决。
+			return true, nil
+		}
+		return false, mapError("settle: load usage fact", err)
 	}
 	return sameTokens(in, u.Buckets.InputTokens) &&
 		sameTokens(out, u.Buckets.OutputTokens) &&
 		sameTokens(cacheRead, u.Buckets.CacheReadTokens) &&
 		sameTokens(cacheWrite, u.Buckets.CacheWriteTokens) &&
-		sameTokens(reasoning, u.Buckets.ReasoningTokens)
+		sameTokens(reasoning, u.Buckets.ReasoningTokens), nil
 }
 
 // sameTokens compares a stored (nullable) bucket with a delivered one: an

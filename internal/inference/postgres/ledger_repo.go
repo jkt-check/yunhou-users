@@ -105,6 +105,12 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		len(domain.ExpectedMonetaryTargets(req)), reqStatus, cmd.ChargeMicros); err != nil {
 		return err
 	}
+	// 数量对得上还不够：每条 held 预占必须是准入创建的那**一笔**（目标身份
+	// 必须与请求行钉住的一致）。错绑的预占绝不能被结算 —— 那会把消费记进
+	// 错误的窗口，而请求照常终态化（账被记到了不属于它的窗口）。
+	if err := checkReservationIdentities("settle", rows, req, reqStatus, cmd.ChargeMicros); err != nil {
+		return err
+	}
 
 	// 3. Usage fact (UNIQUE(attempt_id, revision)).
 	if err := insertUsageRecord(ctx, tx, &cmd.Usage); err != nil {
@@ -263,7 +269,10 @@ func driftOutcome(op, message string, status domain.RequestStatus, charge domain
 //   - more than one held reservation → reservation_drift;
 //   - the held reservation is not the wallet hold → reservation_drift;
 //   - the freeze row is gone → missing_reservation (the money the request
-//     was admitted with is gone).
+//     was admitted with is gone);
+//   - the freeze row exists but is NOT held → reservation_drift (the row is
+//     there, but the money is no longer frozen: the hold drifted, and an
+//     ordinary conflict would be indistinguishable from a benign race).
 //
 // A storage failure is never mapped to either outcome: it stays an error.
 func checkWalletHolds(ctx context.Context, tx *sqlx.Tx, requestID string, status domain.RequestStatus, charge domain.Microcredit) error {
@@ -271,24 +280,31 @@ func checkWalletHolds(ctx context.Context, tx *sqlx.Tx, requestID string, status
 	if err != nil {
 		return err
 	}
-	expected := len(domain.ExpectedMonetaryTargets(&domain.Request{ChargeSource: domain.ChargeSourceWallet}))
+	walletReq := &domain.Request{ChargeSource: domain.ChargeSourceWallet}
+	expected := len(domain.ExpectedMonetaryTargets(walletReq))
 	if err := reservationOutcome("settle wallet", len(rows), expected, status, charge); err != nil {
 		return err
 	}
-	if rows[0].TargetKind != string(domain.TargetWallet) {
-		return driftOutcome("settle wallet",
-			"the held reservation is not the wallet hold the admission created (reservation drift)",
-			status, charge)
+	if err := checkReservationIdentities("settle wallet", rows, walletReq, status, charge); err != nil {
+		return err
 	}
-	var exists bool
-	if err := tx.QueryRowxContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM inference_wallet_holds WHERE request_id = $1)`, requestID).
-		Scan(&exists); err != nil {
-		return mapError("settle wallet: hold", err)
-	}
-	if !exists {
+	// 冻结必须是 **held**：EXISTS 只能证明"行还在"，不能证明"钱还被冻着"。
+	// 非 held（已释放/已结算）的冻结是预占状态漂移 —— 不是 missing（行还
+	// 在），也不是普通 conflict（那是良性竞态的口径，会被恢复 worker 当竞态
+	// 静默跳过）。
+	var state string
+	err = tx.QueryRowxContext(ctx,
+		`SELECT state FROM inference_wallet_holds WHERE request_id = $1`, requestID).Scan(&state)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
 		return missingReservationOutcome("settle wallet",
 			"the wallet hold the admission created is missing (accounting anomaly)",
+			status, charge)
+	case err != nil:
+		return mapError("settle wallet: hold", err)
+	case state != string(domain.ReservationHeld):
+		return driftOutcome("settle wallet",
+			"the wallet freeze is no longer held (reservation drift)",
 			status, charge)
 	}
 	return nil

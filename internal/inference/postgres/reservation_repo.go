@@ -43,6 +43,111 @@ func loadHeldReservations(ctx context.Context, tx *sqlx.Tx, requestID string) ([
 	return rows, nil
 }
 
+// reservationIdentity is the admission fact ONE held reservation must
+// match: the target kind PLUS the concrete target the admission bound it
+// to (a window id, a Key id; the wallet freeze carries neither).
+//
+// The kind alone is not enough. A held row of the right kind but bound to a
+// DIFFERENT window is not the hold the admission created: settling it books
+// the consumption into the wrong window, releasing it returns another
+// request's hold — and the request still reaches a terminal state.
+type reservationIdentity struct {
+	kind     domain.ReservationTargetKind
+	windowID string
+	apiKeyID string
+}
+
+// expectedReservationIdentities returns the identities the held reservations
+// of a request must match — one per monetary target the admission created.
+// It is derived from the SAME source of truth as the count check
+// (domain.ExpectedMonetaryTargets), so "how many targets" and "which
+// targets" can never disagree.
+func expectedReservationIdentities(req *domain.Request) []reservationIdentity {
+	if req == nil {
+		return nil
+	}
+	kinds := domain.ExpectedMonetaryTargets(req)
+	out := make([]reservationIdentity, 0, len(kinds))
+	for _, kind := range kinds {
+		switch kind {
+		case domain.TargetWindowFiveHour:
+			out = append(out, reservationIdentity{kind: kind, windowID: idOrEmpty(req.WindowFiveHourID)})
+		case domain.TargetWindowWeekly:
+			out = append(out, reservationIdentity{kind: kind, windowID: idOrEmpty(req.WindowWeeklyID)})
+		case domain.TargetWindowMonthly:
+			out = append(out, reservationIdentity{kind: kind, windowID: idOrEmpty(req.WindowMonthlyID)})
+		case domain.TargetKeyBudget:
+			out = append(out, reservationIdentity{kind: kind, apiKeyID: idOrEmpty(req.APIKeyID)})
+		case domain.TargetWallet:
+			// 钱包冻结不挂窗口/Key：目标种类一致即身份一致。
+			out = append(out, reservationIdentity{kind: kind})
+		}
+	}
+	return out
+}
+
+// checkReservationIdentities verifies that every held reservation IS the
+// hold the admission created: the same target kind AND the same target
+// identity (the pinned window id / the pinned Key id).
+//
+// A count-only comparison cannot see a mis-bound hold — the same number of
+// rows bound to the WRONG window settles or releases money in the wrong
+// place while the request still reaches a terminal state. A wrong kind or a
+// wrong id is therefore a typed reservation_drift: the caller must be able
+// to tell it apart from a benign race (an ordinary conflict would be
+// skipped as one).
+//
+// Settle and Release share this one helper so the two paths can never drift
+// apart in what they accept as "the admission's hold".
+func checkReservationIdentities(op string, rows []heldReservationRow, req *domain.Request,
+	status domain.RequestStatus, charge domain.Microcredit) error {
+	expected := expectedReservationIdentities(req)
+	for _, r := range rows {
+		kind := domain.ReservationTargetKind(r.TargetKind)
+		want, ok := lookupReservationIdentity(expected, kind)
+		if !ok {
+			return driftOutcome(op,
+				"a held reservation targets "+string(kind)+", which this request was never admitted with (reservation drift)",
+				status, charge)
+		}
+		switch kind {
+		case domain.TargetKeyBudget:
+			if r.APIKeyID == nil || *r.APIKeyID != want.apiKeyID {
+				return driftOutcome(op,
+					"the held Key budget reservation is bound to another Key (reservation drift)",
+					status, charge)
+			}
+		case domain.TargetWallet:
+			// 钱包冻结不挂窗口/Key：种类一致即身份一致。
+		default:
+			if r.WindowID == nil || *r.WindowID != want.windowID {
+				return driftOutcome(op,
+					"the held "+string(kind)+" reservation is bound to another window (reservation drift)",
+					status, charge)
+			}
+		}
+	}
+	return nil
+}
+
+// lookupReservationIdentity finds the admission identity of one target kind.
+func lookupReservationIdentity(expected []reservationIdentity, kind domain.ReservationTargetKind) (reservationIdentity, bool) {
+	for _, e := range expected {
+		if e.kind == kind {
+			return e, true
+		}
+	}
+	return reservationIdentity{}, false
+}
+
+// idOrEmpty dereferences an optional id ("" = absent).
+func idOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
 // Release implements domain.QuotaStore: every held reservation of a
 // request whose upstream consumption is confirmed zero is released inside
 // the shared tx and the request moves to 'released' (设计 §7.2 reserved →
@@ -132,12 +237,13 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 	// them is an accounting anomaly: the window's reserved amount would
 	// stay frozen forever, so the release refuses loudly instead of
 	// pretending the holds are gone.
-	expected := len(domain.ExpectedMonetaryTargets(&domain.Request{
+	req := &domain.Request{
 		APIKeyID:         strFromNull(apiKeyID),
 		WindowFiveHourID: strFromNull(win5h), WindowWeeklyID: strFromNull(winW),
 		WindowMonthlyID: strFromNull(winM),
 		ChargeSource:    domain.ChargeSource(chargeSource),
-	}))
+	}
+	expected := len(domain.ExpectedMonetaryTargets(req))
 	switch {
 	case len(rows) < expected:
 		// 准入应当存在的金额预占不见了 = 账务异常：必须返回**可识别**的
@@ -152,6 +258,13 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 			Kind: domain.SettleOutcomeReservationDrift, Code: domain.CodeConflict,
 			Message: "release: more held reservations than the admission created (reservation drift)",
 		}
+	}
+	// 数量对得上还不够：每条 held 预占必须是准入创建的那**一笔**（目标身份
+	// 必须与请求行钉住的一致）。错绑的预占绝不能被释放 —— 那会归还错误的
+	// 窗口（另一个请求的预占凭空消失），而本请求的五小时预占永远挂着。
+	if err := checkReservationIdentities("release", rows, req,
+		domain.RequestStatus(status), 0); err != nil {
+		return err
 	}
 
 	var fiveHourWindow *string

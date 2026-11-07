@@ -420,10 +420,33 @@ HTTP 400），因此它出现在**错误**里而不是 200 报告里。
 | 告警 | 日志前缀 | 触发条件 | 处置 |
 |---|---|---|---|
 | **非幂等结算冲突** | 网关侧**只有**这三条带原因词：`ALARM gateway: settlement_mismatch` / `ALARM gateway: ledger_drift` / `ALARM gateway: late_usage_after_release`（另有 `ALARM gateway: request … charge … exceeds hold …` 的超额告警） | 同一请求的**重复结算金额不一致**、账本无 charge 行、已终态请求收到晚到用量 —— 这些**不是**幂等重投，绝不当成功吞掉 | 请求进入专门核对（`inference_reconciliation_jobs`），**只叫人**；人工处置见 `GET /admin/model-usage/exceptions?kind=settlement_backlog` → 每个任务的 `reason` |
-| **缺预占 / 预占漂移**（与上一行**同一族**，但**没有** `ALARM gateway:` 前缀） | 网关打的是 `gateway: settlement failed for <request id>: … — parking in reconciliation`（**行里没有原因词**）；另有一条 `ERROR gateway: settlement failed for request <id>: … (parked for reconciliation)` | 预占数与准入不符（`reservation_drift`）、缺预占（`missing_reservation`）、消费事实未知（`unknown_usage`）—— 请求被**停放**（保留预占、绝不记零），不是终态异常 | **按原因查**，不要按日志前缀查：`GET /admin/model-usage/exceptions?kind=settlement_backlog` 的 `reason` 字段（`reservation_drift` / `missing_reservation` / `unknown_usage` / …）。**网关从不为这两个原因打带 `ALARM gateway:` 前缀的行** —— 该前缀只属于上一行那三条终态异常 |
+| **缺预占 / 预占漂移**（与上一行**同一族**，但**没有** `ALARM gateway:` 前缀） | 网关打的是 `gateway: settlement failed for <request id>: … — parking in reconciliation`（**行里没有原因词**）；另有一条 `ERROR gateway: settlement failed for request <id>: … (parked for reconciliation)` | 预占数与准入不符（`reservation_drift`）、缺预占（`missing_reservation`）、消费事实未知（`unknown_usage`）—— 请求被**停放**（绝不记零），不是终态异常。**停放 ≠ 全部释放**：只有**只能人工处理**的原因（`missing_reservation` / `reservation_drift` / `insufficient_evidence` 等）才把在途**速率**预占处置为 `anomaly`；证据驱动的原因（`unknown_usage` / `crash_recovery`）**保留速率预占**等恢复结算 | **按原因查**，不要按日志前缀查：`GET /admin/model-usage/exceptions?kind=settlement_backlog` 的 `reason` 字段（`reservation_drift` / `missing_reservation` / `unknown_usage` / …）。**网关从不为这两个原因打带 `ALARM gateway:` 前缀的行** —— 该前缀只属于上一行那三条终态异常。停放之后各类预占的处置边界见下节 |
 | **未知用量积压** | `ALARM inference recovery: unknown-usage backlog` | 消费事实未知的请求积压 **≥ 10** | 这些请求按**保守估算**入账（绝不静默记零），真实用量要靠人核对；按 `usage_status='unknown'` 查请求，逐笔核对。**阈值目前是代码内的常量（默认 10）**：服务端**没有**暴露 env/config 旋钮，运维改不了它（详见下方说明） |
 | **限速存储失败** | `ALARM quota: rate limit store unavailable` | 限速闸门的存储不可用（**不是**限速拒绝） | 准入 **fail-closed**（503 `service_unavailable`，绝不回退成单机放行）；修存储后自动恢复。正常的限速拒绝**不打**这条告警（否则告警会被噪声淹没） |
 | **不支持存量配置** | `UNSUPPORTED_POOL_STRATEGY model=… routes=… strategies=…` + `AUDIT_ALERT` | 已发布快照里存在支持集外的 `pool_strategy`（存量脏配置） | 该路由被标记**不可调度**（绝不静默当 `round_robin`）；模型还有别的可调度路由时正常服务，全部不支持时客户请求在**预占前** 503 `upstream_unavailable`（Anthropic 面 529）。修法：把路由的 `pool_strategy` 改成 `round_robin` 再 publish |
+
+### 停放之后的预占处置边界（迁移 054）
+
+停放**不等于**所有预占都释放。按停放原因分两类（判据是核对任务的
+`reason`，见 `internal/inference/postgres/reconciliation_reasons.go` 的
+`ManualOnlyReconciliationReasons`）：
+
+| 停放原因 | 类别 | 在途**速率**预占 | 金额窗口 / Key / 钱包预占 | 告警与核对证据 | 真实消费 |
+|---|---|---|---|---|---|
+| `missing_reservation` / `reservation_drift` / `insufficient_evidence` 等 | **只能人工处理** | **转 `anomaly`**（与停放同一事务）：**退出实时 TPM 求和** | **仍在**：不结算、不释放，账本没有 charge | 核对任务原因与 `request.last_error` 不变；速率行上留 `anomaly_reason` / `anomaly_at` | 仍**未知**（既不是「确认零消费」的 `released`，也不是「已知用量」的 `settled`） |
+| `unknown_usage` / `crash_recovery` | **证据驱动** | **保留** `reserved`：等恢复 worker 按保守估算结算 | 仍在 | 证据窗口继续等真实证据冲正 | 未知（恢复 worker 结算后按估算入账） |
+
+为什么只有人工类原因才处置：一个**永远不会被结算**的异常预占若继续停在
+`reserved`，会永久占着账户的 TPM 额度（账户被永久 429 拦住，且没有任何路径能
+把它取回来）。人工类原因按定义就结不成，因此把它的速率预占显式处置为
+`anomaly`；证据驱动的原因恢复 worker 会结算它，额度**不能提前归还**。
+
+- **RPM 事实保留**：行还在、`counted_at` 不变，一次逻辑请求仍然计 1 次
+  （RPM 计数不看 state）。
+- `anomaly` 是**终态**：保留期清理像删除其它终态行一样回收它（滞留行不再无限
+  增长）；若该请求后来真的结算，速率行被提升为 `settled`（按**实际**归一化
+  token），异常痕迹保留；针对未解决 anomaly 行的 token 预算修正会**显式冲突**
+  失败，不会悄悄改写。
 
 **三类告警的稳定前缀不是同一族**：`ALARM gateway: …`（网关的终态异常）、
 `ALARM inference recovery: …`（恢复 worker 的期限/账本/积压）、

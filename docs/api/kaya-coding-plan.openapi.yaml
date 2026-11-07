@@ -1249,10 +1249,11 @@ paths:
         `input_modalities`）之上**追加**能力描述：
 
         - `supports_images` / `supports_tools` / `supports_thinking` ——
-          **派发判定**：有一条已发布路由的能力清单覆盖它、且该协议的适配层
-          承载它。绝不声明超过**当前入口（已发布条目 + 路由）与 adapter**
-          的能力（一个只有 `openai_responses` 部署的模型不会被声明成能收
-          图片）。
+          **派发判定**：**模型条目自己的声明 ∧ 一条已发布路由的能力清单覆盖
+          它 ∧ 该协议的适配层承载它**。三者缺一即为 `false`（模型条目没有声明
+          支持，或没有能承载它的已发布部署，都不声明）。绝不声明超过**当前
+          入口（已发布条目 + 路由）与 adapter** 的能力（一个只有
+          `openai_responses` 部署的模型不会被声明成能收图片）。
         - `context_tokens` / `max_output_tokens` —— 目录条目上的**硬上限**
           （准入时强制生效的那两个数），不是估计值。
         - `capability_description` —— 同一组结论的人话版本。

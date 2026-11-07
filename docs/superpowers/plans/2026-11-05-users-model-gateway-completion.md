@@ -158,10 +158,9 @@ type RateReserveCommand struct {
 type RateUsage struct {
     AccountRPMCount, KeyRPMCount int
     SettledTokens, InflightTokens int64
-    AccountRPMRecoverySeconds, PolicyRPMRecoverySeconds int
-    KeyRPMRecoverySeconds, SettledTokensRecoverySeconds int // 0 = 无法确定恢复时刻
+    KeyRPMLimit int // 该 Key 的 RPM 上限是数据库事实：存储层在同一语句里读出，调用方不传
 }
-type RateBlock struct { Scope RateScope; Kind string; Limit, Used int64; RecoverySeconds int }
+type RateBlock struct { Scope RateScope; Kind string; Limit, Used int64; RecoverySeconds int } // 恢复秒数在 RateBlock 上（0 = 无法确定恢复时刻）
 type RateLimitError struct { Detail *Error; Blocks []RateBlock; RetryAfterSeconds int }
 
 // internal/inference/access/inference_limits.go —— 纯规则（无数据库、无时钟）
@@ -464,7 +463,7 @@ T7 §4.25–4.31 与 §4.42、T8 §4.32–4.39、T9 §4.40–4.50、T10 §4.51�
 2. **速率拒绝从「每实例 120/分钟」变成「每账户 60 秒滚动窗口」**（跨实例、跨 Key、跨 `/chat` 与 `/v1` 共享）；准入前被拒（形状非法、模型无权）不再消耗速率令牌。
 3. **准入存储不可用从「假装额度耗尽」变成显式 503 `service_unavailable`**。
 4. **`Retry-After` 只在每个阻断约束都有可确定恢复时刻时出现**；Key 的累计预算（`budget_micros`）不按周期清零 → 与窗口同时阻断时**不给**倒计时。
-5. **上游 OAuth 只发 access token**（不再发整包 JSON / refresh token）；Anthropic 协议用 `x-api-key`，OAuth 用 `Authorization: Bearer`。
+5. **上游 OAuth 只发 access token**（不再发整包 JSON / refresh token）；**静态凭据**（`api_key` / `service`）在 Anthropic 协议走 `x-api-key`、在 OpenAI 兼容协议走 `Authorization: Bearer`；**`anthropic_messages` + OAuth 是明确拒绝的组合**（出站前拒绝，绝不把 OAuth 令牌塞进 API-key 槽）；OAuth access token **只**用于支持它的 OpenAI 兼容协议（`openai_chat` / `openai_responses`）的 `Authorization: Bearer`。
 6. **能力拒绝从「接受后丢弃」改成明确 4xx**：非空 Responses `reasoning`/`encrypted` 内容、Anthropic signed/redacted thinking 历史现在被**明确拒绝**（这是对旧行为的兼容性修正，旧客户端会开始收到 400）。
 7. **接口探针结果追加字段**（`credential_state` / `probe_method` / `probe_outcome` / `probe_supported` / `inference_verified` / `description`），**旧字段一个未删**；发布预演追加 `issues` / `summary` 等，旧字段保留。
 

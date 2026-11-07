@@ -4970,7 +4970,7 @@ document still stating the pre-T4 semantics ("进程内滑动窗口（多实例�
 | §6 conclusion item 4 | the **cross-process rate-path acceptance gap** is stated explicitly (evidence-completeness, not correctness), with the actionable next step; **no cross-host test was run** |
 | §6 header | a dated note: the measured numbers still come from the 2026-09-09 campaign (**not re-run**), only the conclusion wording was corrected |
 | §9 legacy list | "多实例 RPM 精确化" split into the **cross-process acceptance** item; the Redis/独立网关层 row drops RPM centralization from its candidate scope; the "Key scope 租约 / TPM / session_sticky" row corrected to **已接** |
-| §0 pre-release checklist | the branch's migrations 035–054 (incl. 052 and 054) must be applied before this branch's traffic |
+| §0 pre-release checklist | the branch's migrations 050–054 (incl. 052 and 054) must be applied before this branch's traffic (035–049 are baseline) |
 
 #### 4.59.9 Finding 3 — the named follow-up
 

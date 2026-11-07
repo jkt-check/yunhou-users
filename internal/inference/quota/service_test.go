@@ -99,7 +99,8 @@ func (s *fakeStore) ReserveWallet(ctx context.Context, uow domain.UnitOfWork, cm
 	return &domain.Admission{RequestID: cmd.Request.ID}, nil
 }
 
-func (s *fakeStore) Release(ctx context.Context, uow domain.UnitOfWork, requestID string) error {	if s.releaseErr != nil {
+func (s *fakeStore) Release(ctx context.Context, uow domain.UnitOfWork, requestID string) error {
+	if s.releaseErr != nil {
 		return s.releaseErr
 	}
 	s.released = append(s.released, requestID)

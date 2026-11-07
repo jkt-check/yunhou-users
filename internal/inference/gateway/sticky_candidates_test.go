@@ -330,7 +330,6 @@ func TestGateway_AliasToDisabledProviderNotDispatched(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // T3 补正 — 停用 provider 的 503 文案不得误述为「容量不足 / 稍后重试」
 //

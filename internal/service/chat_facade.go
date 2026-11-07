@@ -175,7 +175,7 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID
 	// ErrNoVerifiedSnapshot 哨兵，瞬时刷新失败由 cache 兜底旧快照。
 	snap, err := f.snapshots.Current(ctx)
 	if err != nil {
-		f.logNotReadyErr(err) // 结构化 ERROR，30s 节流（评审修复 I2：冷启动不得静默）
+		f.logNotReadyErr(err)            // 结构化 ERROR，30s 节流（评审修复 I2：冷启动不得静默）
 		return nil, mapGatewayError(err) // ErrNoVerifiedSnapshot → ErrChatNotReady
 	}
 	if _, ok := snap.Model(f.defaultModel); !ok {

@@ -34,7 +34,7 @@ const (
 	// It is a clear server error, NEVER a user quota exhaustion: a
 	// database outage must not be answered as "your quota is exhausted".
 	CodeServiceUnavailable Code = "service_unavailable"
-	CodeInternal            Code = "internal"
+	CodeInternal           Code = "internal"
 )
 
 // Error is the domain error: a stable Code plus a human-readable message.

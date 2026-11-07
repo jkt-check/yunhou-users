@@ -40,11 +40,11 @@ var (
 	// from ErrUserHasActiveSub since 2026-10-03: the user has NOT paid
 	// anything yet, and the active-sub wording made a real subscriber
 	// believe checkout was impossible rather than "retry shortly".
-	ErrUserHasPendingOrder  = errors.New("you have an unfinished checkout in progress")
-	ErrPlanDowngrade        = errors.New("downgrade to a shorter billing cycle is not allowed with an active subscription")
-	ErrSubscriptionExists   = errors.New("subscription already exists for this user")
-	ErrAppNotFound          = errors.New("app not found")
-	ErrAppInactive          = errors.New("app is inactive")
+	ErrUserHasPendingOrder = errors.New("you have an unfinished checkout in progress")
+	ErrPlanDowngrade       = errors.New("downgrade to a shorter billing cycle is not allowed with an active subscription")
+	ErrSubscriptionExists  = errors.New("subscription already exists for this user")
+	ErrAppNotFound         = errors.New("app not found")
+	ErrAppInactive         = errors.New("app is inactive")
 
 	ErrPlanNotFound      = errors.New("plan not found")
 	ErrPlanInactive      = errors.New("plan is inactive")
@@ -80,20 +80,20 @@ var (
 	ErrInvalidAttribution = errors.New("invalid attribution")
 
 	// Chat proxy (POST /chat → LLM upstream, SSE).
-	ErrChatNotEnabled       = errors.New("chat is not enabled")
-	ErrChatNoAccess         = errors.New("active subscription with access to this app is required")
-	ErrChatUnknownModel     = errors.New("unknown chat model")
-	ErrChatModelNotAllowed  = errors.New("chat model is not allowed for the current plan")
-	ErrChatRequestShape     = errors.New("chat request shape is not supported by the selected model")
-	ErrChatModelNoVision    = errors.New("the selected model does not support image input")
+	ErrChatNotEnabled      = errors.New("chat is not enabled")
+	ErrChatNoAccess        = errors.New("active subscription with access to this app is required")
+	ErrChatUnknownModel    = errors.New("unknown chat model")
+	ErrChatModelNotAllowed = errors.New("chat model is not allowed for the current plan")
+	ErrChatRequestShape    = errors.New("chat request shape is not supported by the selected model")
+	ErrChatModelNoVision   = errors.New("the selected model does not support image input")
 	// ErrChatCapabilityUnsupported: T8 —— 请求要的能力（图片 / 显式推理档位）
 	// 在已发布目录里**没有任何部署能承载**。请求从未出站、零预占、零计费，
 	// 因此必须与「上游拒绝」（ErrChatUpstreamRejected，502）严格分开：这是
 	// 客户端可修的能力不兼容，重试同一个请求不会成功。
 	ErrChatCapabilityUnsupported = errors.New("the selected model has no deployment that can serve this request")
-	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
-	ErrChatUpstreamError    = errors.New("chat upstream error")
-	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")
+	ErrChatRateLimited           = errors.New("chat upstream rate limit exceeded")
+	ErrChatUpstreamError         = errors.New("chat upstream error")
+	ErrChatUpstreamRejected      = errors.New("chat request rejected by upstream")
 	// ErrChatRequestLimited: /chat 的**本地**限制拒绝（业务速率 RPM/TPM、
 	// 并发上限、额度/余额不足、Key 预算耗尽）。这类请求**从未出站** ——
 	// 与 ErrChatRateLimited（上游 429，文案说的是上游）严格分开：客户端

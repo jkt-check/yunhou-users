@@ -436,7 +436,6 @@ func TestKayaModels_DisabledProviderHidesModel(t *testing.T) {
 	}
 }
 
-
 // T8: /chat/models 的 input_modalities 必须与**派发**能力一致 —— 声明了
 // image 但已发布部署里没有能承载图片的协议时，不得再 advertise image
 // （否则 picker 让客户发图，网关在准入前当场 400）。

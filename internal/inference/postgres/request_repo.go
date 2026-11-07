@@ -166,9 +166,9 @@ func (s *Store) GetRequest(ctx context.Context, id string) (*domain.Request, err
 		WindowMonthlyID: strFromNull(row.WinM),
 		ReservedMicros:  microFromNull(row.Reserved), SettledMicros: microFromNull(row.Settled),
 		ExpectedHoldMicros: microFromNull(row.ExpectedHold),
-		UsageStatus:      domain.UsageSource(row.UsageStatus),
-		ChargeSource:     domain.ChargeSource(row.ChargeSource),
-		InputBoundTokens: row.InputBound, OutputCapTokens: row.OutputCap, ExtraBounds: bounds,
+		UsageStatus:        domain.UsageSource(row.UsageStatus),
+		ChargeSource:       domain.ChargeSource(row.ChargeSource),
+		InputBoundTokens:   row.InputBound, OutputCapTokens: row.OutputCap, ExtraBounds: bounds,
 		LastError: row.LastError,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, CompletedAt: row.CompletedAt,
 	}, nil

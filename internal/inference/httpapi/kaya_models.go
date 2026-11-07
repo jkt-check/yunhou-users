@@ -81,8 +81,9 @@ type kayaModelEntry struct {
 	// --- T9 追加：当前入口（已发布条目 + 路由）与 adapter 的真实能力 ---
 	// SupportsImages 与 input_modalities 一致（模型声明 ∧ 派发能力）。
 	SupportsImages bool `json:"supports_images"`
-	// SupportsTools / SupportsThinking 是**派发判定**：有一条已发布路由
-	// 的能力清单覆盖它、且该协议的适配层承载它。绝不声明超过入口能力。
+	// SupportsTools / SupportsThinking 是**派发判定**：模型自己声明支持它、
+	// 且有一条已发布路由的能力清单覆盖它、且该协议的适配层承载它。绝不
+	// 声明超过入口能力。
 	SupportsTools    bool `json:"supports_tools"`
 	SupportsThinking bool `json:"supports_thinking"`
 	// ContextTokens / MaxOutputTokens 是目录条目上的硬上限（准入时强制
@@ -166,8 +167,15 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 				supportsImages = true
 			}
 		}
-		supportsTools := capability.SupportsTools(snap, m.ID)
-		supportsThinking := capability.SupportsThinking(snap, m.ID)
+		// 工具/思考还要与**模型自己的声明**取交集：oracle 回答的是
+		// 「已发布路由 + adapter 能否承载」（route/adapter 层），而派发
+		// 路径另有一道**声明层**闸门（gateway/service.go：模型未声明
+		// SupportsTools / SupportsReasoning 的，带工具或思考的请求当场
+		// 被拒）。两者缺一不可 —— 只看 oracle 会给未声明的模型广告 true，
+		// 让 picker 让用户带上工具然后被网关拒绝（T9：列表不得声明超过
+		// dispatcher 的能力，声明层也是 dispatcher 的一部分）。
+		supportsTools := m.SupportsTools && capability.SupportsTools(snap, m.ID)
+		supportsThinking := m.SupportsReasoning && capability.SupportsThinking(snap, m.ID)
 		out = append(out, kayaModelEntry{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
 			Default:          m.ID == h.DefaultModel,

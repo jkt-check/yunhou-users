@@ -2488,8 +2488,11 @@ func TestGateway_ConsistentDuplicateSettleIsIdempotent(t *testing.T) {
 	}
 
 	// 同一请求、同一笔用量再次投递。
-	in, outTok := int64(10), int64(5)
-	f.settleDirect(t, out.RequestID, domain.UsageBuckets{InputTokens: &in, OutputTokens: &outTok})
+	records, err := f.store.LoadUsageRecords(context.Background(), out.RequestID)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("original usage = %v, %v", records, err)
+	}
+	f.replaySettlement(t, records[0])
 
 	if len(alarms) != 0 {
 		t.Errorf("settlement alarms = %d, want 0 (一致的重复结算是幂等成功，不告警)", len(alarms))

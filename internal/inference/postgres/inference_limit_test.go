@@ -369,9 +369,11 @@ func TestPurgeRateReservations_NeverDeletesUnsettledReservations(t *testing.T) {
 		t.Fatalf("admit 2: %v", err)
 	}
 
-	// 把计数时刻推到保留期之外，模拟陈旧数据。
+	// Both admission and settlement are expired; a recent settlement is live TPM.
 	if _, err := s.db.Exec(
-		`UPDATE inference_rate_reservations SET counted_at = now() - interval '48 hours'`); err != nil {
+		`UPDATE inference_rate_reservations
+		 SET counted_at = now() - interval '48 hours',
+		     settled_at = CASE WHEN settled_at IS NOT NULL THEN now() - interval '48 hours' END`); err != nil {
 		t.Fatal(err)
 	}
 	removed, err := s.PurgeRateReservations(ctx, time.Now().UTC().Add(-24*time.Hour))
@@ -387,6 +389,58 @@ func TestPurgeRateReservations_NeverDeletesUnsettledReservations(t *testing.T) {
 	}
 	if got := inflightTokens(t, s, f.accountID); got != 60 {
 		t.Errorf("in-flight tokens = %d, want 60 (the hold survived the purge)", got)
+	}
+}
+
+func TestPurgeRateReservations_PreservesRecentlySettledOldRequests(t *testing.T) {
+	_, s := testDB(t)
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+	limits := domain.RateLimits{PolicyTPM: 100}
+	requestID, err := admitWithRate(t, s, f, w5, ww, wm, limits, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE inference_rate_reservations SET counted_at = now() - interval '48 hours'
+		 WHERE request_id = $1`, requestID); err != nil {
+		t.Fatal(err)
+	}
+	settleRequest(t, s, requestID, domain.UsageReported, 80, 10)
+	if got := settledTokensInWindow(t, s, f.accountID); got != 90 {
+		t.Fatalf("settled tokens before purge = %d, want 90", got)
+	}
+	if _, err := s.PurgeRateReservations(context.Background(), time.Now().UTC().Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admitWithRate(t, s, f, w5, ww, wm, limits, 20); domain.CodeOf(err) != domain.CodeRateLimited {
+		t.Errorf("90 settled + 20 new tokens: err = %v, want rate_limited after purge", err)
+	}
+	if got := settledTokensInWindow(t, s, f.accountID); got != 90 {
+		t.Errorf("settled tokens after purge = %d, want 90", got)
+	}
+}
+
+func TestPurgeRateReservations_ShortRetentionPreservesLiveRPM(t *testing.T) {
+	_, s := testDB(t)
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+	limits := domain.RateLimits{AccountRPM: 1}
+	requestID, err := admitWithRate(t, s, f, w5, ww, wm, limits, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settleRequest(t, s, requestID, domain.UsageReported, 5, 5)
+	if _, err := s.db.Exec(
+		`UPDATE inference_rate_reservations SET counted_at = now() - interval '30 seconds'
+		 WHERE request_id = $1`, requestID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PurgeRateReservations(context.Background(), time.Now().UTC().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admitWithRate(t, s, f, w5, ww, wm, limits, 10); domain.CodeOf(err) != domain.CodeRateLimited {
+		t.Fatalf("second request: err = %v, want rate_limited with live RPM", err)
 	}
 }
 

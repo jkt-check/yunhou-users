@@ -546,13 +546,13 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 	if n != 2 {
 		t.Errorf("entries = %d, want 2 (replay applied once)", n)
 	}
-	// 无操作修正拒绝（相等金额不追加空历史）——delta 以当前已结算额为基准。
+	// Identical money AND evidence is a no-op; changed metering is not.
 	uow, _ := s.Begin(ctx)
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
 		Corrected: domain.UsageRecord{
 			AttemptID: attID, Source: domain.UsageReported,
-			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(8))},
+			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(8)), OutputTokens: ptr(int64(3))},
 		},
 		CorrectedMicros: 25_000, CorrectedTokens: &correctedTokens, Reason: "noop",
 		OperatorSubject: "op", IdempotencyKey: "corr-noop-" + uuid.NewString(),

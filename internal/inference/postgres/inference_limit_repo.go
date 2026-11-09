@@ -449,10 +449,17 @@ func (s *Store) correctRateTokensTx(ctx context.Context, tx *sqlx.Tx, requestID 
 // frees nothing that is still in flight — it only reclaims table volume.
 // The anomaly evidence stays in the reconciliation job and in the
 // request's last_error.
+//
+// Retention follows both clocks: RPM starts at admission, while settled
+// TPM starts at settlement (which may happen days later during recovery).
+// Even a cutoff inside the live 60-second window must not erase either.
 func (s *Store) PurgeRateReservations(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM inference_rate_reservations
-		 WHERE state <> 'reserved' AND counted_at < $1`, cutoff)
+		 WHERE state <> 'reserved'
+		   AND counted_at < LEAST($1, now() - interval '60 seconds')
+		   AND (state <> 'settled'
+		        OR settled_at < LEAST($1, now() - interval '60 seconds'))`, cutoff)
 	if err != nil {
 		return 0, mapError("rate: purge", err)
 	}

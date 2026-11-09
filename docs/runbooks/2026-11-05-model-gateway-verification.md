@@ -5108,6 +5108,138 @@ review. No existing limitation is waived by a green local test run.
 
 ---
 
+### 4.61 Independent review #12: money and quota fixes (2026-11-09)
+
+**Scope.** Only findings 1 and 2 from the independent review handoff are fixed.
+Findings 3-5 are recorded in section 6, not implemented. Work stays in this
+worktree. No production database, real provider, secret, adjacent repository,
+Kaya restart/termination, push, merge, or deployment is part of this work.
+
+#### 4.61.1 Retention follows admission and settlement
+
+`PurgeRateReservations` now requires expired admission time and, for settled
+rows, expired settlement time. Each cutoff is capped at the live 60-second
+window boundary. Reserved rows remain unconditionally protected.
+
+The regression admits a request 48 hours ago, settles **90 tokens now**,
+purges with 24-hour retention, and attempts another **20 tokens at TPM 100**.
+Before the fix the 90-token fact disappeared and admission succeeded; after
+the fix admission is `rate_limited` and the live 90 tokens remain. A separate
+short-retention regression protects live RPM. The old expired-terminal-row
+test now expires both timestamps instead of treating a live settlement as
+expired data.
+
+#### 4.61.2 Equal money does not imply equal metering
+
+`CorrectSettlement` now accepts changed usage evidence or a changed explicit
+token total even when the monetary amount is unchanged. It appends the usage
+revision, corrects TPM without moving the original settlement instant, and
+updates request usage status in the same transaction. Equal money creates
+neither an adjustment row nor a financial ledger entry, and leaves quota
+window/key monetary aggregates untouched. Identical money and evidence remain
+an invalid no-op; nullable token buckets and JSON evidence compare semantically.
+
+New migration **055** adds `inference_usage_corrections`, an audit receipt for
+every new correction (money-changing or metering-only), with a shared unique
+idempotency key, usage reference, corrected amounts/tokens, reason and operator.
+Financial adjustments retain their strictly positive amount constraint. Legacy
+correction keys remain recognized in `inference_adjustments`. Apply migration
+055 before using the new correction code; no migration was applied to any
+production database in this task.
+
+Regressions cover equal charges **60,000 and zero**, estimated-to-reported
+token changes (50 to 90), source-only/bucket-only/raw-only evidence changes,
+unknown versus reported zero, absence of zero-value financial entries,
+unchanged money aggregates, replay, shared-key concurrent monetary/metering
+corrections, and usage/receipt rollback on rate failure. A deterministic
+same-request concurrency test also exposed a stale pre-lock idempotency check;
+the check now runs after acquiring the request lock.
+
+#### 4.61.3 Local verification evidence
+
+- `run.H9MU4p`: RED for both original findings and short-retention RPM.
+- `run.NjM72t`: purge regressions GREEN; expanded equal-money tests RED.
+- `run.59s7n2`: complete PostgreSQL package under race, **205** test/subtest
+  passes, zero failures, one child-process-entry skip.
+- `run.DzVDAF`: deterministic concurrent replay RED (`invalid_input` instead
+  of already-applied `conflict`).
+- `run.rYbv08`: final focused race tests, **37** passes, zero failures/skips.
+  Command: `go test -race -count=1 -p 1 -json ./internal/inference/postgres
+  -run 'TestCorrectSettlement|TestCorrectRateTokens|TestPurgeRateReservations|TestParkedAnomaly'`.
+- `run.C46zgl`: `go build ./...` and
+  `go vet ./internal/... ./cmd/...` passed.
+- Full race/coverage command:
+  `go test -race -count=1 -p 1 -coverprofile="$RUN/coverage.out" -json
+  ./internal/... ./cmd/... ./tests/integration/...`.
+  **4,268** test/subtest passes across **34** packages, zero failures, three
+  skips: `TestQuotaWorkerProcess` is a child-process entry point;
+  `TestLoadDrill_Throughput` and `TestLoadDrill_LongConnections` require
+  `KAYA_LOAD=1` and are outside the default gate. The parent
+  `TestTwoProcessContendLastCredit` passed; it covers monetary quota, not the
+  cross-process rate path.
+- `go tool cover -func="$RUN/coverage.out"`: total statement coverage
+  **80.5%**, satisfying the **80%** floor. `PurgeRateReservations` is **80.0%**
+  and `CorrectSettlement` is **79.0%**. The separate E2E command is not
+  included in this coverage profile.
+- Race E2E command:
+  `go test -race -count=1 -p 1 -json ./tests/e2e/...`.
+  **180** test/subtest passes, zero failures, one skip:
+  `TestUsageTokenAcceptance_TenPagesTwoMinutes` requires
+  `USAGE_ACCEPTANCE=1` and is outside the default gate.
+- The full runner exited **0**. Both suites together report passing package
+  results for **all 35 Go packages**, checked against `go list ./...`.
+  No missing packages or race failures were reported.
+- Each disposable database applied all **55** migrations, including 055;
+  the second migration invocation reported `applied=0 skipped=55`.
+  `cleanup.log` confirms `server stopped` for this run's owned cluster.
+- Final independent review found no confirmed defects in scope.
+  `gofmt -l` and `git diff --check` were clean. Nine deliverable files remain
+  uncommitted in the requested worktree; no push, merge, or deployment occurred.
+
+All run directories above are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`. Each invocation owns a fresh
+PostgreSQL cluster and two disposable databases with explicit `DATABASE_URL`
+and `E2E_DATABASE_URL`; its exit trap stops only its own data directory.
+An initial test-only compilation error (`run.JNpJCu`, Microcredit/int64
+comparison) was fixed before the behavior RED run; it is not defect evidence.
+
+#### 4.61.4 Boundaries retained
+
+The correction channel still has no production caller and still rejects
+wallet-charged requests. This work completes the repository contract for
+plan corrections, not the production evidence trigger or wallet compensation.
+Provider E2E remains simulated; the cross-process rate-path gap in section 5
+remains open. Findings 3-5 remain known behavioral risks, not waived defects.
+
+#### 4.61.5 Independent review and delivery decisions
+
+The independent read-only review found no confirmed Critical, Important, or
+Minor defects in the scoped diff, including migration 055 and the new tests.
+The reviewer ran formatting/diff checks, not database tests; runtime evidence
+belongs to the main verification run above.
+
+- The requested current worktree is retained, without a new commit or any
+  publishing operation. Integration and production acceptance remain separate.
+- Correction receipts are separate from strictly positive financial entries.
+  Migration 055 is required before this code is invoked. Historical keys are
+  recognized without rewriting accounting history, but concurrent mixed-version
+  safety with legacy-only adjustment writers is not established.
+- Findings 3-5 remain deferred by explicit scope: history ordering, conflicting
+  reasoning parameters, and missing `/chat` retry metadata remain behavioral
+  risks until their follow-ups are implemented.
+- Production correction triggering and wallet compensation remain unsupported
+  here; completing the repository contract does not make those paths available.
+- No claim is made about live providers, cross-process rate admission,
+  production rollout, or migration performance. Local simulated E2E and
+  disposable migrations do not prove those runtime properties.
+
+Additional test opportunities from review, not demonstrated defects: replay of
+a legacy financial key without a receipt, equivalent reordered JSON evidence
+as a no-op, and a direct short-cutoff settled-TPM regression. Callers must still
+roll back their transaction on every correction error.
+
+---
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module
@@ -5188,6 +5320,9 @@ waiver is implied by their existence here.
 | # | Follow-up | Scope | Owner (role) | Schedule |
 |---|---|---|---|---|
 | 1 | `inference-correction-trigger-and-wallet` | (a) The **evidence-driven correction trigger**: who calls `Store.CorrectSettlement` / `Store.CorrectRateTokensTx` when real usage evidence lands (the recovery verifier path, or an operator-facing correction entry point) — today the money-correction channel has **no production caller**; (b) the **wallet money-correction semantics**: `CorrectSettlement` refuses wallet-charged requests with `invalid_input` (micromoney unit, wallet compensation entries and the token-budget sync are not adapted), so an estimated wallet settlement that later gets real evidence cannot be corrected. **No payment / wallet product change is implied** — the scope is the correction channel only. | Users 模型网关维护者 | 未排期 |
+| 2 | `responses-history-order-preservation` (review #12 finding 3) | `internal/inference/providers/responses_client.go:299` merges consecutive assistant items and can turn text-before / tool-call / text-after into text-before+after / tool-call. Preserve order, or explicitly reject combinations that cannot be represented faithfully. This round records the finding only; history replay and subsequent inference remain at risk. | Users 模型网关维护者 | 本轮不修，未排期 |
+| 3 | `reasoning-parameter-conflict-policy` (review #12 finding 4) | `internal/inference/providers/openai_responses.go:191`: `thinking_enabled:false` plus `reasoning_effort:"high"` becomes `effort:"none"` for Responses but remains high for Chat. Define one precedence rule or reject the conflict at ingress with 400. This round records the finding only; candidate protocol can still change request semantics. | Users 模型网关维护者 | 本轮不修，未排期 |
+| 4 | `chat-rate-limit-retry-after` (review #12 finding 5) | `internal/service/chat_facade.go:317` drops `RetryAfterSeconds` while translating to `ChatLimitError`, so `/chat` omits `Retry-After`. Preserve retry metadata and emit it in the handler only when recovery time is known. This round records the finding only. | Users 模型网关维护者 | 本轮不修，未排期 |
 
 The limitation wording in the plan (§1.1.6 item 1), the T4 branch-era note
 "已知边界（本期不扩大）" and §4.58 limit 3 stay **as they are**: they are

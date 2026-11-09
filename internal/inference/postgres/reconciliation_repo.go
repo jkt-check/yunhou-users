@@ -378,8 +378,10 @@ type CorrectionCommand struct {
 //     linked to the compensation row) — 冲正分录;
 //     corrected != 0: append an ADJUSTMENT entry of |corrected − base|
 //     (debit = 补差 / credit = 退还) — 补差分录;
-//     either way the inference_adjustments row carries reason + operator +
-//     idempotency key (设计 §9.2; 重复投递撞唯一键只生效一次);
+//     corrected == base: metering-only correction, no financial entries.
+//     Every correction has an inference_usage_corrections receipt carrying
+//     reason + operator + a shared unique idempotency key. Monetary changes
+//     also retain their inference_adjustments row (设计 §9.2);
 //  5. correct the TOKEN BUDGET in the SAME transaction: the rate
 //     reservation's token total is replaced by the corrected ABSOLUTE total
 //     (its storage effect is a net delta) and the original settlement
@@ -421,19 +423,6 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 			"correction: reason, operator subject and idempotency key are required")
 	}
 
-	// Idempotency first: a replayed delivery is recognized as already-applied
-	// BEFORE the no-op check — after the first application the stored delta
-	// base has moved, so the same command would otherwise misread as a no-op.
-	var seen string
-	if err := tx.QueryRowxContext(ctx,
-		`SELECT id FROM inference_adjustments WHERE idempotency_key = $1`,
-		cmd.IdempotencyKey).Scan(&seen); err == nil {
-		return domain.NewError(domain.CodeConflict,
-			"correction: idempotency key already applied")
-	} else if domain.CodeOf(mapError("correction: idempotency lookup", err)) != domain.CodeNotFound {
-		return mapError("correction: idempotency lookup", err)
-	}
-
 	// 1. Lock + require settled. The delta base is the CURRENT settled
 	// amount, never the immutable original charge.
 	var status, accountID, chargeSource string
@@ -446,6 +435,21 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		 FROM inference_requests WHERE id = $1 FOR UPDATE`, cmd.RequestID).
 		Scan(&status, &accountID, &reserved, &settled, &expectedHold, &apiKeyID, &win5h, &winW, &winM, &chargeSource); err != nil {
 		return mapError("correction: lock request", err)
+	}
+	// Check AFTER acquiring the request lock: another delivery may have
+	// committed while we waited. Replays must conflict before the no-op
+	// check sees the newly corrected money/evidence.
+	var seen string
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT idempotency_key FROM inference_usage_corrections WHERE idempotency_key = $1
+		 UNION ALL
+		 SELECT idempotency_key FROM inference_adjustments WHERE idempotency_key = $1
+		 LIMIT 1`,
+		cmd.IdempotencyKey).Scan(&seen); err == nil {
+		return domain.NewError(domain.CodeConflict,
+			"correction: idempotency key already applied")
+	} else if domain.CodeOf(mapError("correction: idempotency lookup", err)) != domain.CodeNotFound {
+		return mapError("correction: idempotency lookup", err)
 	}
 	// wallet 计费请求显式拒绝（见方法 doc：单位/预算/补偿分录均未适配）。
 	if chargeSource == string(domain.ChargeSourceWallet) {
@@ -470,18 +474,58 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 			"correction: settled request without settled_micros (ledger drift — reconcile first)")
 	}
 	base := domain.Microcredit(settled.Int64)
-	direction, delta, err := accounting.CorrectionDelta(base, cmd.CorrectedMicros)
-	if err != nil {
-		return err
+	var direction string
+	var delta domain.Microcredit
+	if cmd.CorrectedMicros != base {
+		direction, delta, err = accounting.CorrectionDelta(base, cmd.CorrectedMicros)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Equal money is not necessarily equal evidence (e.g. a free model).
+		// Compare nullable buckets and JSON semantically; unknown is not zero.
+		raw := cmd.Corrected.RawUsage.Raw
+		if len(raw) == 0 {
+			raw = json.RawMessage(`{"schema_version":1}`)
+		}
+		var unchanged bool
+		if err := tx.QueryRowxContext(ctx,
+			`SELECT source = $3
+			        AND input_tokens IS NOT DISTINCT FROM $4
+			        AND cache_read_tokens IS NOT DISTINCT FROM $5
+			        AND cache_write_tokens IS NOT DISTINCT FROM $6
+			        AND output_tokens IS NOT DISTINCT FROM $7
+			        AND reasoning_tokens IS NOT DISTINCT FROM $8
+			        AND raw_usage = $9::jsonb
+			        AND ($10::bigint IS NULL OR NOT EXISTS (
+			            SELECT 1 FROM inference_rate_reservations
+			            WHERE request_id = $1 AND scope = 'account'
+			              AND settled_tokens IS DISTINCT FROM $10))
+			 FROM inference_usage_records
+			 WHERE request_id = $1 AND attempt_id = $2
+			 ORDER BY revision DESC LIMIT 1`,
+			cmd.RequestID, cmd.Corrected.AttemptID, string(cmd.Corrected.Source),
+			int64PtrFromPtr(cmd.Corrected.Buckets.InputTokens), int64PtrFromPtr(cmd.Corrected.Buckets.CacheReadTokens),
+			int64PtrFromPtr(cmd.Corrected.Buckets.CacheWriteTokens), int64PtrFromPtr(cmd.Corrected.Buckets.OutputTokens),
+			int64PtrFromPtr(cmd.Corrected.Buckets.ReasoningTokens), raw, int64PtrFromPtr(cmd.CorrectedTokens)).
+			Scan(&unchanged); err != nil {
+			return mapError("correction: compare usage", err)
+		}
+		if unchanged {
+			return domain.NewError(domain.CodeInvalidInput,
+				"correction: money and usage are unchanged (no-op corrections are not appended)")
+		}
 	}
 
 	// 2. The charge row (reversal target when voiding).
 	var chargeID sql.NullInt64
-	if err := tx.QueryRowxContext(ctx,
-		`SELECT id FROM inference_ledger_entries
-		 WHERE request_id = $1 AND entry_type = 'charge'`, cmd.RequestID).
-		Scan(&chargeID); err != nil {
-		return mapError("correction: load charge", err)
+	if delta > 0 {
+		if err := tx.QueryRowxContext(ctx,
+			`SELECT id FROM inference_ledger_entries
+			 WHERE request_id = $1 AND entry_type = 'charge'`, cmd.RequestID).
+			Scan(&chargeID); err != nil {
+			return mapError("correction: load charge", err)
+		}
 	}
 
 	// 3. Corrected usage revision (original preserved).
@@ -501,35 +545,48 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return err
 	}
 
-	// 4. Compensation row (idempotency key lives here) + ledger entry:
-	//    void → reversal of the current effect; otherwise delta adjustment.
-	adjID := uuid.NewString()
+	// The receipt and usage roll back together. Its unique key also arbitrates
+	// concurrent monetary and metering-only deliveries across requests.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO inference_adjustments
-		 (id, billing_account_id, request_id, reason, amount_micros, direction,
-		  unit, operator_subject, service_subject, idempotency_key)
-		 VALUES ($1,$2,$3,$4,$5,$6,'microcredit',$7,'inference-reconciliation',$8)`,
-		adjID, accountID, cmd.RequestID, cmd.Reason, int64(delta), direction,
-		cmd.OperatorSubject, cmd.IdempotencyKey); err != nil {
-		return mapError("correction: adjustment", err)
+		`INSERT INTO inference_usage_corrections
+		 (idempotency_key, request_id, usage_record_id, corrected_micros,
+		  corrected_tokens, reason, operator_subject)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		cmd.IdempotencyKey, cmd.RequestID, usage.ID, int64(cmd.CorrectedMicros),
+		int64PtrFromPtr(cmd.CorrectedTokens), cmd.Reason, cmd.OperatorSubject); err != nil {
+		return mapError("correction: receipt", err)
 	}
-	if cmd.CorrectedMicros == 0 && base > 0 {
+
+	// 4. Nonzero monetary delta only: void -> reversal, otherwise adjustment.
+	if delta > 0 {
+		adjID := uuid.NewString()
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO inference_ledger_entries
-			 (billing_account_id, request_id, entry_type, amount_micros, unit,
-			  reverses_entry_id, adjustment_id, created_by)
-			 VALUES ($1,$2,'reversal',$3,'microcredit',$4,$5,$6)`,
-			accountID, cmd.RequestID, int64(base), chargeID.Int64, adjID,
-			"system:"+cmd.OperatorSubject); err != nil {
-			return mapError("correction: reversal", err)
+			`INSERT INTO inference_adjustments
+			 (id, billing_account_id, request_id, reason, amount_micros, direction,
+			  unit, operator_subject, service_subject, idempotency_key)
+			 VALUES ($1,$2,$3,$4,$5,$6,'microcredit',$7,'inference-reconciliation',$8)`,
+			adjID, accountID, cmd.RequestID, cmd.Reason, int64(delta), direction,
+			cmd.OperatorSubject, cmd.IdempotencyKey); err != nil {
+			return mapError("correction: adjustment", err)
 		}
-	} else {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO inference_ledger_entries
-			 (billing_account_id, request_id, entry_type, amount_micros, unit, adjustment_id, created_by)
-			 VALUES ($1,$2,'adjustment',$3,'microcredit',$4,$5)`,
-			accountID, cmd.RequestID, int64(delta), adjID, "system:"+cmd.OperatorSubject); err != nil {
-			return mapError("correction: adjustment entry", err)
+		if cmd.CorrectedMicros == 0 && base > 0 {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO inference_ledger_entries
+				 (billing_account_id, request_id, entry_type, amount_micros, unit,
+				  reverses_entry_id, adjustment_id, created_by)
+				 VALUES ($1,$2,'reversal',$3,'microcredit',$4,$5,$6)`,
+				accountID, cmd.RequestID, int64(base), chargeID.Int64, adjID,
+				"system:"+cmd.OperatorSubject); err != nil {
+				return mapError("correction: reversal", err)
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO inference_ledger_entries
+				 (billing_account_id, request_id, entry_type, amount_micros, unit, adjustment_id, created_by)
+				 VALUES ($1,$2,'adjustment',$3,'microcredit',$4,$5)`,
+				accountID, cmd.RequestID, int64(delta), adjID, "system:"+cmd.OperatorSubject); err != nil {
+				return mapError("correction: adjustment entry", err)
+			}
 		}
 	}
 
@@ -552,7 +609,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		signed = -signed
 	}
 	for _, wID := range []sql.NullString{win5h, winW, winM} {
-		if !wID.Valid {
+		if !wID.Valid || delta == 0 {
 			continue
 		}
 		res, err := tx.ExecContext(ctx,
@@ -567,7 +624,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 				"correction: window used would go negative (ledger/window drift — reconcile first)")
 		}
 	}
-	if apiKeyID.Valid {
+	if apiKeyID.Valid && delta > 0 {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE inference_api_keys
 			 SET budget_used_micros = budget_used_micros + $2, updated_at = now()

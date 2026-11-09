@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -27,6 +28,12 @@ import (
 // settles it with an ESTIMATE; it returns the request and attempt ids.
 func correctedFixture(t *testing.T, s *Store, f fixture, w5, ww, wm string,
 	in, out int64) (requestID, attemptID string) {
+	t.Helper()
+	return correctedFixtureWithCharge(t, s, f, w5, ww, wm, in, out, 60_000)
+}
+
+func correctedFixtureWithCharge(t *testing.T, s *Store, f fixture, w5, ww, wm string,
+	in, out int64, charge domain.Microcredit) (requestID, attemptID string) {
 	t.Helper()
 	ctx := context.Background()
 	uow, err := s.Begin(ctx)
@@ -61,7 +68,7 @@ func correctedFixture(t *testing.T, s *Store, f fixture, w5, ww, wm string,
 			RequestID: adm.RequestID, AttemptID: attemptID, Source: domain.UsageEstimated,
 			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
 		},
-		ChargeMicros: 60_000, AttemptID: &attemptID,
+		ChargeMicros: charge, AttemptID: &attemptID,
 		SettledAt: time.Now().UTC(),
 	}); err != nil {
 		_ = uow.Rollback(ctx)
@@ -137,6 +144,68 @@ func ledgerTotals(t *testing.T, s *Store, requestID string) (charge, reversal, a
 		t.Fatalf("ledger totals: %v", err)
 	}
 	return
+}
+
+func TestCorrectSettlement_EqualMoneyUpdatesReportedTokens(t *testing.T) {
+	for _, charge := range []domain.Microcredit{60_000, 0} {
+		t.Run(strconv.FormatInt(int64(charge), 10), func(t *testing.T) {
+			_, s := testDB(t)
+			f := seedFixture(t, s, true)
+			w5, ww, wm := makeWindows(t, s, f.entID)
+			requestID, attemptID := correctedFixtureWithCharge(t, s, f, w5, ww, wm, 40, 10, charge)
+			_, beforeAt, _, _ := rateTokens(t, s, requestID)
+			total, input, output := int64(90), int64(80), int64(10)
+			cmd := correctionFixture(requestID, attemptID, charge, &total, "equal-money-tokens")
+			cmd.Corrected.Buckets = domain.UsageBuckets{InputTokens: &input, OutputTokens: &output}
+			if err := applyCorrection(t, s, cmd); err != nil {
+				t.Fatalf("equal-money estimated-to-reported correction: %v", err)
+			}
+			usage, err := s.LoadUsageRecords(context.Background(), requestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(usage) != 2 || usage[0].Source != domain.UsageEstimated ||
+				usage[1].Source != domain.UsageReported || usage[1].Revision != 2 ||
+				usage[1].Buckets.InputTokens == nil || *usage[1].Buckets.InputTokens != 80 {
+				t.Fatalf("usage revisions = %+v, want preserved estimate and corrected report", usage)
+			}
+			tokens, afterAt, _, _ := rateTokens(t, s, requestID)
+			if tokens != 90 || beforeAt == nil || afterAt == nil || !beforeAt.Equal(*afterAt) {
+				t.Errorf("rate tokens/time = %d/%v, want 90/%v", tokens, afterAt, beforeAt)
+			}
+			req, err := s.GetRequest(context.Background(), requestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.UsageStatus != domain.UsageReported || req.SettledMicros == nil || *req.SettledMicros != charge {
+				t.Errorf("request usage/amount = %s/%v, want reported/%d", req.UsageStatus, req.SettledMicros, charge)
+			}
+			var ledgerCount, adjustmentCount int
+			if err := s.db.Get(&ledgerCount, `SELECT COUNT(*) FROM inference_ledger_entries WHERE request_id=$1`, requestID); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Get(&adjustmentCount, `SELECT COUNT(*) FROM inference_adjustments WHERE request_id=$1`, requestID); err != nil {
+				t.Fatal(err)
+			}
+			if ledgerCount != 1 || adjustmentCount != 0 {
+				t.Errorf("ledger/adjustment rows = %d/%d, want 1/0 (no zero financial entries)", ledgerCount, adjustmentCount)
+			}
+			for _, windowID := range []string{w5, ww, wm} {
+				if used, _ := windowState(t, s, windowID); used != charge {
+					t.Errorf("window used = %d, want unchanged %d", used, charge)
+				}
+			}
+			if got := keyBudgetUsed(t, s, f.keyID); got != charge {
+				t.Errorf("key budget = %d, want unchanged %d", got, charge)
+			}
+			if _, err := admitWithRate(t, s, f, w5, ww, wm, domain.RateLimits{PolicyTPM: 100}, 20); domain.CodeOf(err) != domain.CodeRateLimited {
+				t.Errorf("corrected 90 + new 20: err = %v, want rate_limited", err)
+			}
+			if err := applyCorrection(t, s, cmd); domain.CodeOf(err) != domain.CodeConflict {
+				t.Errorf("metering-only replay = %v, want conflict", err)
+			}
+		})
+	}
 }
 
 // TestCorrectSettlement_UpdatesTheLedgerAndTheTokenBudgetOnce: 估算→真实

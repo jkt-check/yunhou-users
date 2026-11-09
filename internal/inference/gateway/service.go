@@ -342,14 +342,14 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		s.reportLifecycleGate(ctx, p, m, false, cause)
 	}
 	if !modelSpeaks(m, clientProto) {
-		return nil, domain.NewError(domain.CodeInvalidInput,
-			"model "+m.ID+" is not served on protocol "+string(clientProto))
+		return nil, newCapabilityUnsupported(
+			"model " + m.ID + " is not served on protocol " + string(clientProto))
 	}
 	// 防御性模态检查（设计: 能力校验在边缘层完成；此为网关内兜底，防未来
 	// 新入口面漏检）。缺省放行：空 InputModalities 走默认 ["text","image"]，
 	// 仅显式声明不含 image 的模型拒绝带图（domain.Model.AcceptsImages）。
 	if model.MessagesHaveImages(req.Messages) && !m.AcceptsImages() {
-		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not accept image input")
+		return nil, newCapabilityUnsupported("model " + m.ID + " does not accept image input")
 	}
 	// T7:存量已发布快照可能带未实现的 pool_strategy(least_loaded / 通用
 	// session_sticky)。旧快照可读,但该路由不可调度 —— 绝不静默当
@@ -371,10 +371,10 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	// 就是「要推理」），模型不支持推理时同样明确拒绝。
 	effort := req.ReasoningEffort
 	if len(req.Tools) > 0 && !m.SupportsTools {
-		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support tools")
+		return nil, newCapabilityUnsupported("model " + m.ID + " does not support tools")
 	}
 	if (thinking || effort != "") && !m.SupportsReasoning {
-		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support reasoning")
+		return nil, newCapabilityUnsupported("model " + m.ID + " does not support reasoning")
 	}
 	// Key narrowing can never widen beyond the entitlement set (设计 §4.2).
 	if key != nil && len(key.ModelAllow) > 0 && !contains(key.ModelAllow, m.ID) {
@@ -529,9 +529,9 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	return s.dispatchLoop(ctx, requestID, adm, req, price, cands)
 }
 
-// ErrCapabilityUnsupported marks a request whose capability demand (image
-// input / an explicit reasoning-effort level) no published deployment can
-// carry. It is a CLIENT error, not an upstream fault: nothing was sent,
+// ErrCapabilityUnsupported marks a request whose protocol or capability
+// demand the model or its published deployments cannot carry.
+// It is a CLIENT error, not an upstream fault: nothing was sent,
 // nothing was reserved, nothing was billed — retrying the same request
 // cannot help. The protocol surfaces keep their native shapes (400
 // invalid_input); the legacy /chat facade maps it onto its own envelope.

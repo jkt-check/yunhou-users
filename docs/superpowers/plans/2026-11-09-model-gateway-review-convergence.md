@@ -89,9 +89,9 @@ PostgreSQL outbox, billing-account and entitlement repositories.
 
 **Files:** `gateway/service.go`, gateway/facade/HTTP regression tests.
 
-- [ ] Reproduce unsupported model tools/reasoning returning `/chat` 502.
-- [ ] Return the existing typed capability error before admission.
-- [ ] Verify capability 400 with no dispatch/reservation, while actual
+- [x] Reproduce unsupported model tools/reasoning returning `/chat` 502.
+- [x] Return the existing typed capability error before admission.
+- [x] Verify capability 400 with no dispatch/reservation, while actual
   upstream invalid-input errors retain their structured 502 mapping.
 
 ## Task 7: Sticky Failed Streams
@@ -200,3 +200,37 @@ expected child-entry/opt-in cases listed in runbook section 4.64.4.
 Both disposable databases passed all 55 migrations and their idempotent
 rerun. Cleanup confirmed the owned PostgreSQL server stopped; kaya was
 untouched. The file manifest and remaining risks are in runbook 4.64.
+
+### Model Capability Checkpoint
+
+The latest commit request checkpoints Task 6 only. Tasks 7-9 and the
+until-clean review goal remain unfinished; this is not a final clean
+review claim.
+
+RED evidence:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.CU2MzY`.
+All five gateway cases returned an untyped capability error; `/chat`
+tools, thinking and protocol refusals returned 502 instead of 400.
+The real upstream invalid-input control already returned structured 502.
+
+The four model-level protocol, image, tools and reasoning checks now
+return the existing typed capability error, before any admission.
+Generic invalid-input and actual upstream rejection mappings are unchanged.
+
+Focused GREEN evidence:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.8l1Q7Q` completed with exit 0:
+11 test/subtest passes across gateway and E2E, no skips or failures.
+The regressions assert zero requests, attempts, money/rate reservations,
+leases, ledger entries and upstream dispatch on capability refusal.
+The upstream-invalid-input control still returns HTTP 502 with its
+original upstream status and code. The runner stopped its owned
+PostgreSQL server.
+
+Full checkpoint verification completed with exit 0 in
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.aqkdPZ`: build/vet passed;
+full race had 4,315 test/subtest passes across 34 packages, E2E had 186,
+and coverage was 80.5%, above the 80% floor. Only the four expected
+child-entry/opt-in cases listed in runbook section 4.65.4 were skipped.
+Both disposable databases passed all 55 migrations and their idempotent
+rerun. Cleanup confirmed the owned PostgreSQL server stopped; kaya was
+untouched. The file manifest and remaining risks are in runbook 4.65.

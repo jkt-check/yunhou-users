@@ -265,7 +265,7 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 // 模型（deepseek-vision，input_modalities=["text","image"]，独立 deployment/
 // route/price 指向同一 stub 上游），供 Task 12 多模态用例；false 时与既有
 // fixture 逐字节等价。
-func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logger, withVision bool) (*gin.Engine, *sqlx.DB, *postgres.Store) {
+func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logger, withVision bool, snapshotEdits ...func(*catalog.Snapshot)) (*gin.Engine, *sqlx.DB, *postgres.Store) {
 	t.Helper()
 	db, tokenSvc, authSvc := chatE2EBase(t)
 	ctx := context.Background()
@@ -471,6 +471,9 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 		snap.RoutesByModel[undeclaredModelID] = []domain.ModelRoute{{
 			ModelID: undeclaredModelID, DeploymentID: depU.ID, Weight: 1, Enabled: true,
 		}}
+	}
+	for _, edit := range snapshotEdits {
+		edit(snap)
 	}
 	egress, err := credentials.NewEgressValidator([]string{"127.0.0.0/8"})
 	if err != nil {

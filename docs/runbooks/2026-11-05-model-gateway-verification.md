@@ -5597,6 +5597,91 @@ was performed.
 
 ---
 
+### 4.65 Model capability error classification checkpoint (2026-11-09)
+
+This local checkpoint addresses Task 6 from the review-convergence plan.
+It does not claim that the until-clean review has finished.
+
+#### 4.65.1 Behavior and regression evidence
+
+Model-level protocol, image, tools and reasoning checks previously
+returned ordinary `invalid_input`. The legacy `/chat` facade treated
+that error as an upstream rejection and returned 502, even though the
+request had never left the gateway.
+
+RED logs:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.CU2MzY`.
+`TestGateway_ModelCapabilityRefusalBeforeAdmission` failed on tools,
+thinking, effort, images and protocol because the errors lacked the
+capability type. `TestChatFacade_ModelCapabilityRefusalBeforeAdmission`
+failed on tools, thinking and protocol with HTTP 502 instead of 400.
+These were behavioral assertion failures, not compilation or setup errors.
+
+The four model-level checks now reuse `ErrCapabilityUnsupported`, just
+like the existing deployment-level capability checks. `/chat` returns its
+existing capability 400 envelope; `/v1` retains native `invalid_input`.
+All checks remain before admission. There is no schema, new error code
+or accounting change, and generic invalid-input mapping is not widened.
+
+Focused GREEN logs:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.8l1Q7Q`.
+The focused race run completed with exit 0: 11 test/subtest passes across
+gateway and E2E, zero failures and zero skips. Refused requests leave
+zero request, attempt, monetary/rate reservation, lease or ledger rows
+and make no upstream call. The real-upstream control,
+`TestChatFacade_UpstreamInvalidInputRemainsStructuredRejection`, still
+returns HTTP 502 with `upstream_status:400` and
+`upstream_code:context_length_exceeded`.
+
+#### 4.65.2 Deliverable file manifest
+
+- `internal/inference/gateway/service.go`
+- `internal/inference/gateway/model_capability_test.go`
+- `tests/e2e/chat_gateway_test.go`
+- `tests/e2e/chat_capability_test.go`
+- `docs/superpowers/plans/2026-11-09-model-gateway-review-convergence.md`
+- `docs/runbooks/2026-11-05-model-gateway-verification.md`
+
+#### 4.65.3 Remaining risks
+
+Tasks 7-9 remain unresolved: a failed stream can later signal success;
+native nonstream text/tool output can be reordered; interrupted
+Anthropic initial output usage can be lost. They are not part of this
+commit checkpoint. The remaining provider/client acceptance, correction
+trigger/wallet, cross-process rate-path and toolchain limitations stay
+as recorded in sections 5-6.
+
+#### 4.65.4 Full verification
+
+Full checkpoint verification completed with exit 0 in
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.aqkdPZ`.
+
+- `go build ./...`: passed.
+- `go vet ./internal/... ./cmd/...`: passed.
+- `go test -race -count=1 -p 1 -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...`:
+  4,315 test/subtest passes across 34 packages, zero failures.
+- `go tool cover -func=...`: total statement coverage 80.5%, above the
+  required 80% floor.
+- `go test -race -count=1 -p 1 -json ./tests/e2e/...`:
+  186 test/subtest passes, zero failures.
+
+The only skips were the `TestQuotaWorkerProcess` child-process entry
+point, the two `KAYA_LOAD=1` load drills
+(`TestLoadDrill_Throughput`, `TestLoadDrill_LongConnections`), and the
+`USAGE_ACCEPTANCE=1` drill
+(`TestUsageTokenAcceptance_TenPagesTwoMinutes`). No database-unavailable
+skip was accepted as verification.
+
+The runner created its own PostgreSQL cluster on loopback port 55489
+and separate `review_app` and `review_e2e` databases, with explicit
+`DATABASE_URL` and `E2E_DATABASE_URL`. Each database applied 55 migrations;
+the idempotent rerun applied none and skipped all 55. Runs used
+`GOPROXY=off` and `GOFLAGS=-mod=readonly`. The runner's `cleanup.log`
+confirms `server stopped`. No production database, provider, configuration
+or kaya process was touched; no push, merge or deployment was performed.
+
+---
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

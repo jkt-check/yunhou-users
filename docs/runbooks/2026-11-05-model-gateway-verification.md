@@ -7286,6 +7286,97 @@ and its production trigger remain unfinished original requirements.
 The until-clean review is not declared complete. No push, merge, deployment,
 adjacent-repository source edit or kaya process operation is included.
 
+### 4.86 Task 26: Resolve Addressed Escalated Correction Jobs
+
+**Scope:** this local checkpoint fixes addressed reconciliation jobs staying
+escalated after a successful authorized `CorrectSettlement`. It does not
+change correction authority, money or token accounting, hold bounds, or the
+policy for re-enqueueing an already-resolved overage.
+
+**Changes and file manifest:**
+
+- `internal/inference/postgres/reconciliation_repo.go` includes `escalated`
+  alongside `pending` and `running` in the two existing resolution
+  predicates. Evidence resolution remains limited to `crash_recovery` and
+  `unknown_usage`. An overage resolves only with a known hold bound and a
+  corrected charge within or equal to that bound.
+- `internal/inference/postgres/correction_jobs_test.go` tests three initial
+  statuses and seven cases each: both evidence reasons, equal-money evidence,
+  below-hold and exact-hold overages, still-over-hold corrections, and an
+  unrelated `settlement_mismatch`. It checks one retained job, original audit
+  detail, resolution timestamp/note, current overage detail, settled request,
+  reported usage revision, TPM total with its original settlement instant,
+  and window/Key aggregates.
+- The convergence plan and this runbook record evidence and remaining scope.
+  There is no schema change or migration.
+
+**Focused RED/GREEN:** evidence lives under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+`run.r53niI/focused.jsonl` reproduced five escalated leaf failures against
+pre-fix production code: correction succeeded, but addressed jobs remained
+escalated without a resolution time or note. Pending/running controls and
+unaddressed-anomaly cases passed. The resolved-state table controls in that
+RED run were removed rather than prescribing policy for subsequent changes
+to already-resolved overages; this remains a separate investigation.
+
+After the two predicate changes, `run.7sIqxD/focused.jsonl` passed all 25
+tests/subtests in 2.777s with no failures or skips:
+
+```bash
+go test -race -count=1 -p 1 -json ./internal/inference/postgres \
+  -run '^TestCorrectSettlement_ClosesOnlyAddressedJobs$' -timeout=5m
+```
+
+The owned runner exports explicit application/E2E DSNs for independent
+disposable databases, `GOMAXPROCS=2`, `GOPROXY=off` and
+`GOFLAGS=-mod=readonly`, and applies all 55 migrations with an idempotent
+rerun. Both focused runs' cleanup logs confirm their owned PostgreSQL servers
+stopped. The GREEN run has no `data/postmaster.pid`.
+
+**Full verification:** fresh `run.2VvYtW` exited 0 on 2026-11-10.
+`go build ./...` and `go vet ./internal/... ./cmd/...` passed. The full
+race command passed 4,984 tests/subtests across 34 packages, zero failures:
+
+```bash
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+```
+
+`go tool cover -func="$RUN/coverage.out"` reports 80.8% total statement
+coverage, above the 80% floor. The three full-suite skips are the
+child-process entry `TestQuotaWorkerProcess` and the two opt-in load drills;
+no database acceptance skipped.
+
+Separate `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`
+passed 186 tests/subtests in 168.228s with zero failures. Only the explicit
+opt-in `TestUsageTokenAcceptance_TenPagesTwoMinutes` skipped. Both independent
+databases applied all 55 migrations, then skipped all 55 on rerun. The
+runner's cleanup log confirms its owned PostgreSQL server stopped;
+`data/postmaster.pid` is absent. Go sources and tests remained unchanged
+throughout the full gate. Formatting and whitespace checks passed.
+
+Evidence is retained under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.2VvYtW/`:
+`build.log`, `vet.log`, `tests.jsonl`, `coverage.out`,
+`coverage-summary.log`, `e2e.jsonl`, both migration logs and `cleanup.log`.
+
+**Bounded independent review:** Singer inspected the Task 26 delta against
+`2649fad`, its requirements, direct neighboring methods and fixture helpers.
+No confirmed issue or local-commit blocker was found. Nonblocking gaps in
+the new matrix are direct immutable ledger/receipt/usage identity assertions,
+job-resolution rollback, and differing durable-versus-legacy hold bounds.
+The review was read-only and ran no tests or databases. It does not establish
+whole-branch or release readiness. Already-resolved overage re-enqueue
+policy was explicitly left outside this patch, not silently approved.
+
+**Remaining boundaries:** late finalizer evidence retention, the recorded
+provider findings, wallet post-settlement correction and its production
+evidence caller remain unfinished. No real-provider/client or cross-host
+acceptance was performed. The until-clean review is not declared complete.
+No push, merge, deployment, adjacent-repository source edit or kaya process
+operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

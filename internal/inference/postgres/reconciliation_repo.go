@@ -681,11 +681,12 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	// settlement_overage anomaly is NOT evidence-resolved; blindly resolving
 	// it here and re-enqueueing it in step 9 would leave a same-reason job
 	// resolved and invisible while the request is still over its hold.
+	// Escalation pages a human; a successful correction can still resolve it.
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE inference_reconciliation_jobs
 		 SET status = 'resolved', resolved_at = now(), updated_at = now(),
 		     detail = detail || $2
-		 WHERE request_id = $1 AND status IN ('pending','running')
+		 WHERE request_id = $1 AND status IN ('pending','running','escalated')
 		   AND reason IN ('crash_recovery','unknown_usage')`,
 		cmd.RequestID, mustJSON(map[string]string{
 			"resolution": "corrected by real evidence: " + cmd.Reason,
@@ -729,7 +730,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 			`UPDATE inference_reconciliation_jobs
 			 SET status = 'resolved', resolved_at = now(), updated_at = now(),
 			     detail = detail || $2
-			 WHERE request_id = $1 AND status IN ('pending','running')
+			 WHERE request_id = $1 AND status IN ('pending','running','escalated')
 			   AND reason = 'settlement_overage'`,
 			cmd.RequestID, mustJSON(map[string]string{
 				"resolution": "correction brought the charge within the hold: " + cmd.Reason,

@@ -1046,6 +1046,50 @@ and `postmaster.pid` is absent. See runbook 4.85 for the manifest,
 commands, evidence and remaining risks. Other pending findings and the
 until-clean review remain unfinished.
 
+## Task 26: Close Addressed Escalated Correction Jobs
+
+**Files:** `postgres/reconciliation_repo.go`,
+`postgres/correction_jobs_test.go`, this plan and the verification runbook.
+
+**Interfaces:** retain `CorrectSettlement` and its one-transaction contract.
+Escalation pages a human; it does not make an evidence/overage job
+ineligible for resolution after a successful authorized correction.
+
+- [x] Reproduce a successful correction leaving escalated `unknown_usage`,
+  `crash_recovery` and addressed `settlement_overage` tasks unresolved.
+- [x] Test pending/running controls, equal-money evidence, exact-hold
+  corrections, still-over-hold anomalies and unrelated manual reasons.
+- [x] Include `escalated` in both existing correction resolution predicates,
+  without broadening the reason or hold guards.
+- [x] Run focused RED/GREEN, full build/vet/race/coverage and E2E with
+  independent owned disposable databases; review the bounded delta.
+- [x] Record the evidence and commit locally, without claiming the pending
+  evidence-retention, wallet-correction or production-trigger work complete.
+
+Ruling: follow the existing `ResolveReconciliationJob` open-state contract
+and reason/hold guards rather than automatically closing every anomaly.
+An escalation remains visible whenever the corrected charge is still over
+its hold or the job needs a different manual action.
+
+**Focused RED/GREEN:** `run.r53niI` reproduced five escalated leaf failures:
+accounting and token corrections succeeded, but addressed jobs stayed
+escalated without a resolution. After the two predicate changes,
+`run.7sIqxD` passed all 25 tests/subtests with zero failures or skips.
+Both runs used owned disposable PostgreSQL; cleanup confirmed each
+server stopped.
+
+**Final verification:** fresh `run.2VvYtW` exited 0 on 2026-11-10.
+Build/vet passed; full race passed 4,984 tests/subtests across 34 packages,
+with zero failures and 80.8% total statement coverage. Separate E2E race
+passed 186 tests/subtests in 168.228s with zero failures. Only the expected
+child entry and opt-in load/usage drills skipped; no database acceptance
+skipped. Both independent disposable databases applied all 55 migrations
+then skipped all 55 on rerun. Cleanup confirmed the owned PostgreSQL
+stopped and `postmaster.pid` is absent. Singer's bounded read-only review
+found no confirmed local-commit blocker; nonblocking test gaps and the
+separate already-resolved-overage question are recorded in runbook 4.86.
+Other pending findings and the until-clean review remain unfinished.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are
@@ -1071,10 +1115,12 @@ not waived scope:
   usage fabricates missing zero/total fields; Anthropic thinking rejects the
   valid 1025-output/1024-budget boundary. The reviewer reproduced these in
   owned temporary provider overlays; checkout regressions and fixes remain open.
-- Boole's read-only review of `bb80c3e` identifies late real finalizer evidence
-  lost on terminal conflict, and correction SQL leaving escalated evidence
-  or resolved-overage tasks open. These are source-confirmed, not yet
-  dynamically reproduced in a disposable database.
+- Boole's finding of late real finalizer evidence lost on terminal conflict
+  remains source-confirmed and needs dynamic reproduction and a fix.
+- Addressed escalated evidence/overage jobs remaining open after correction
+  are reproduced, fixed and verified in Task 26. Re-enqueue policy for a
+  subsequent changed correction to an already-resolved overage remains a
+  separate open investigation, not behavior prescribed by Task 26.
 - Wallet arithmetic overflow is reproduced, fixed and verified in Task 25
   with focused RED/GREEN, bounded review and a fresh full gate.
 

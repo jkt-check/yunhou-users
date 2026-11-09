@@ -803,9 +803,12 @@ type panicOnSubStore struct {
 }
 
 func (p *panicOnSubStore) Begin(context.Context) (domain.UnitOfWork, error) {
-	return nil, domain.NewError(domain.CodeInternal, "panic store: begin not used")
+	return fakeUOW{}, nil
 }
 func (p *panicOnSubStore) EnsureBillingAccount(context.Context, string) (*domain.BillingAccount, error) {
+	return nil, domain.NewError(domain.CodeInternal, "panic store: not used")
+}
+func (p *panicOnSubStore) EnsureBillingAccountTx(context.Context, domain.UnitOfWork, string) (*domain.BillingAccount, error) {
 	return nil, domain.NewError(domain.CodeInternal, "panic store: not used")
 }
 func (p *panicOnSubStore) FetchPendingOutboxByTopic(context.Context, string, int) ([]postgres.OutboxMessage, error) {
@@ -819,13 +822,13 @@ func (p *panicOnSubStore) MarkOutboxFailed(_ context.Context, id int64, _ time.T
 func (p *panicOnSubStore) MarkOutboxDeliveredTx(context.Context, domain.UnitOfWork, int64) error {
 	return nil
 }
-func (p *panicOnSubStore) GetSyncSubscription(context.Context, string, string) (*access.SubscriptionState, error) {
+func (p *panicOnSubStore) GetSyncSubscriptionTx(context.Context, domain.UnitOfWork, string, string) (*access.SubscriptionState, error) {
 	panic("poisoned store: subscription read panics")
 }
-func (p *panicOnSubStore) GetLatestPaidBenefitOrder(context.Context, string, string) (*access.OrderBenefitSnapshot, error) {
+func (p *panicOnSubStore) GetLatestPaidBenefitOrderTx(context.Context, domain.UnitOfWork, string, string) (*access.OrderBenefitSnapshot, error) {
 	return nil, domain.NewError(domain.CodeNotFound, "panic store: not used")
 }
-func (p *panicOnSubStore) GetLatestEntitlementBySource(context.Context, domain.EntitlementSource, string) (*domain.Entitlement, error) {
+func (p *panicOnSubStore) GetLatestEntitlementBySourceTx(context.Context, domain.UnitOfWork, domain.EntitlementSource, string) (*domain.Entitlement, error) {
 	return nil, domain.NewError(domain.CodeNotFound, "panic store: not used")
 }
 func (p *panicOnSubStore) InsertEntitlementTx(context.Context, domain.UnitOfWork, *domain.Entitlement) error {

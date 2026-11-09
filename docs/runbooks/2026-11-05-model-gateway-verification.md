@@ -5505,6 +5505,98 @@ No kaya process, production service, database or provider was accessed.
 
 ---
 
+### 4.64 Refund versus stale entitlement-sync checkpoint (2026-11-09)
+
+This local checkpoint addresses the first remaining finding from section
+4.63.2. It is not a claim that the until-clean review has finished.
+
+#### 4.64.1 Behavior and regression evidence
+
+Previously the worker planned from nontransactional reads, then began its
+applying transaction. A paid-message or direct sync paused between those
+steps could resume after refund/cancellation and after another worker
+noop-delivered both messages, leaving a usable open-ended entitlement
+without any pending message to revoke it.
+
+`TestEntitlementSync_RefundBeforeApplyCannotLeaveStaleGrant` reproduced
+this on both paths before the fix. RED logs:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.wI6xQY`.
+Both subtests failed with a refunded subscription regaining an active
+entitlement, not with setup or compilation failures.
+
+Source reads, convergence, account creation and optional delivery now use
+one transaction. The selected subscription and paid order are held with
+`FOR SHARE` until commit, so refund/cancellation cannot invalidate a
+grant's source facts while it is applied. Account creation uses the same
+connection. Existing entitlement revision/unique guards remain; direct
+optimistic conflicts return `conflict` instead of a successful count.
+No payment/refund product behavior or schema is changed.
+
+Focused GREEN logs:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.4poINd`.
+`go test -race -count=1 -p 1 -json ./internal/inference/workers ./internal/inference/postgres`
+completed with exit 0: 314 test/subtest passes, two package passes, zero
+failures, including the outbox and direct refund regressions. Only the
+`TestQuotaWorkerProcess` child entry point was skipped. Its owned
+PostgreSQL cluster was stopped by the runner.
+
+#### 4.64.2 Deliverable file manifest
+
+- `internal/inference/postgres/billing_account_repo.go`
+- `internal/inference/postgres/entitlement_repo.go`
+- `internal/inference/postgres/outbox_repo.go`
+- `internal/inference/workers/entitlement_sync.go`
+- `internal/inference/workers/entitlement_sync_edges_test.go`
+- `internal/inference/workers/entitlement_sync_test.go`
+- `internal/inference/workers/entitlement_sync_refund_race_test.go`
+- `docs/superpowers/plans/2026-11-09-model-gateway-review-convergence.md`
+- `docs/runbooks/2026-11-05-model-gateway-verification.md`
+
+#### 4.64.3 Remaining risks
+
+The other four section 4.63.2 findings remain unresolved: model capability
+refusal can become `/chat` 502; a failed stream can later signal success;
+native nonstream text/tool output can be reordered; interrupted Anthropic
+initial output usage can be lost. Their regressions and fixes are Tasks
+6-9 in the review-convergence plan, not part of this checkpoint.
+
+Shared source locks can delay concurrent source updates; database errors
+continue to roll back and reschedule the outbox message. The regression
+proves the reproduced stale-plan interleaving, not every lock-contention
+schedule. No real-provider/client acceptance was run. Existing correction
+trigger/wallet, cross-process rate-path and toolchain limitations remain
+as recorded in sections 5-6.
+
+#### 4.64.4 Full verification
+
+Runner completed with exit 0 and `SUCCESS`:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.wgodFl`.
+This run verifies the checkpoint source, not an earlier commit.
+
+| Gate | Result |
+|---|---|
+| `go build ./...` | exit 0 |
+| `go vet ./internal/... ./cmd/...` | exit 0 |
+| `go test -race -count=1 -p 1 -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...` | 4,309 test/subtest passes, 34 package passes, zero failures |
+| `go tool cover -func=...` and 80% floor | 80.5%, passed |
+| `go test -race -count=1 -p 1 -json ./tests/e2e/...` | 181 test/subtest passes, zero failures |
+| Migrations on each disposable database | first pass applied 55; second pass skipped 55 |
+
+Expected skips, not counted as passes: `TestQuotaWorkerProcess` is the
+child-process entry point; `TestLoadDrill_Throughput` and
+`TestLoadDrill_LongConnections` require `KAYA_LOAD=1`;
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` requires `USAGE_ACCEPTANCE=1`.
+No database-dependent test was skipped for a missing DSN.
+
+The owned cluster used loopback port 55489 and separate `review_app` and
+`review_e2e` databases with explicit `DATABASE_URL` and `E2E_DATABASE_URL`.
+`GOPROXY=off` and `GOFLAGS=-mod=readonly` were set. Cleanup confirmed that
+the runner stopped its own PostgreSQL server. No kaya process, production
+service, database or provider was accessed. No push, merge or deployment
+was performed.
+
+---
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -72,6 +72,56 @@ in `internal/inference/providers`.
 - [x] Record evidence, file manifest, compatibility costs and remaining risks.
 - [ ] Commit the final converged review locally, without push, merge or deployment.
 
+## Task 5: Refund Versus Stale Entitlement Sync
+
+**Files:** `workers/entitlement_sync.go`, its regression tests, and the
+PostgreSQL outbox, billing-account and entitlement repositories.
+
+- [x] Reproduce a paused paid-message/direct sync that resumes after refund
+  and after another worker has noop-delivered both pending messages.
+- [x] Read the subscription, paid order and existing entitlement on the
+  applying transaction; hold shared locks on the source rows until commit.
+- [x] Include the empty-plan delivery path and account creation in the
+  transaction; retain revision/unique race handling.
+- [x] Run all worker and PostgreSQL race tests with disposable databases.
+
+## Task 6: Model Capability Error Classification
+
+**Files:** `gateway/service.go`, gateway/facade/HTTP regression tests.
+
+- [ ] Reproduce unsupported model tools/reasoning returning `/chat` 502.
+- [ ] Return the existing typed capability error before admission.
+- [ ] Verify capability 400 with no dispatch/reservation, while actual
+  upstream invalid-input errors retain their structured 502 mapping.
+
+## Task 7: Sticky Failed Streams
+
+**Files:** Chat usage tracker, Messages/Responses renderers, native stream
+adapters and their tests in `internal/inference/providers`.
+
+- [ ] Reproduce error followed by DONE/completion becoming success.
+- [ ] Latch failures without losing known content or usage; never emit a
+  successful terminal or persist a failed Responses chain.
+- [ ] Cover same-read, split-read and EOF across all supported protocols.
+
+## Task 8: Native Nonstream Output Order
+
+**Files:** `anthropic.go`, `openai_responses.go` and provider tests.
+
+- [ ] Reproduce text/tool/text and tool/text/tool folding into reordered
+  Chat output.
+- [ ] Reject unrepresentable nonstream output explicitly while preserving
+  supported arrangements; never persist reordered replay history.
+
+## Task 9: Interrupted Anthropic Start Usage
+
+**Files:** `anthropic_stream.go` and provider stream tests.
+
+- [ ] Reproduce message_start input/output usage followed by error or EOF
+  losing known output usage.
+- [ ] Preserve the initial counters; later cumulative message_delta
+  counters replace, rather than add to, the initial values.
+
 ## Execution Notes
 
 Ruling: use the existing explicit-rejection policy for unrepresentable
@@ -117,3 +167,36 @@ full race had 4,306 test/subtest passes, E2E had 181, coverage was 80.6%.
 The four expected child-entry/opt-in skips are listed in runbook 4.63.4.
 Both disposable databases passed 55 migrations and their idempotent rerun.
 The owned PostgreSQL cluster was stopped by its runner; kaya was untouched.
+
+### Refund Race Checkpoint
+
+The latest commit request checkpoints Task 5 only; Tasks 6-9 and the
+until-clean review goal remain unfinished. The five-finding list above
+describes the preceding checkpoint, not the current resolution status.
+
+RED evidence: both outbox and direct variants of
+`TestEntitlementSync_RefundBeforeApplyCannotLeaveStaleGrant` left an active,
+open-ended entitlement after refund and after both messages were delivered
+as noops. The failing run was
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.wI6xQY`.
+
+The fix reads and applies on one transaction, holding shared subscription
+and paid-order locks until convergence and delivery commit. Account
+creation also uses this transaction, avoiding a second pool connection
+while source locks are held. Direct optimistic conflicts now return a
+retryable conflict instead of a successful action count.
+
+GREEN focused evidence:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.4poINd` completed with exit 0:
+314 test/subtest passes across workers and PostgreSQL, including both
+refund regressions. Only the child-process entry point was skipped.
+Its owned PostgreSQL server was stopped by the runner.
+
+Full checkpoint verification completed with exit 0 in
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.wgodFl`: build/vet passed;
+full race had 4,309 test/subtest passes across 34 packages, E2E had 181,
+and coverage was 80.5%, above the 80% floor. The only skips were the four
+expected child-entry/opt-in cases listed in runbook section 4.64.4.
+Both disposable databases passed all 55 migrations and their idempotent
+rerun. Cleanup confirmed the owned PostgreSQL server stopped; kaya was
+untouched. The file manifest and remaining risks are in runbook 4.64.

@@ -7101,6 +7101,99 @@ unchanged. Wallet correction and the production evidence-to-correction
 trigger remain unfinished original scope. No push, merge, deployment,
 adjacent-repository source edit or kaya process operation is included.
 
+### 4.84 Task 24: Rejected Responses Evidence And Chat Thinking Validation
+
+**Scope:** this local checkpoint finishes the already reproduced Task 24
+changes. It does not start wallet correction or its production trigger,
+and is not a claim that the until-clean review is complete.
+
+**Changes and file manifest:**
+
+- `internal/inference/providers/openai_responses.go` retains identity,
+  reported usage and observed output bytes on failed HTTP-200 executions,
+  returning a nonnil metering result plus error without a success payload.
+  Typed refusal output, including an empty refusal, explicitly rejects.
+- `internal/inference/providers/openai_responses_stream.go` detects refusal
+  delta/done, part, item and terminal output; failure remains sticky while
+  late usage and output bytes are retained. Text, refusal, reasoning
+  summary and tool-argument snapshots add only bytes not already observed
+  for that kind and output/content or summary index.
+- `internal/inference/providers/stream_usage.go` and
+  `internal/inference/gateway/service.go` distinguish fully received
+  rejected completion evidence (`RejectedComplete`) from a bare
+  interruption. The former may estimate absent usage without emitting
+  success; the latter keeps reservations and parks for reconciliation.
+- `internal/inference/httpapi/chat_completions.go` validates every supplied
+  nonnull thinking object before selecting precedence. Only enabled and
+  disabled are accepted; valid boolean and explicit-effort priority stays.
+- `internal/inference/providers/responses_rejected_evidence_test.go` and
+  `internal/inference/httpapi/responses_rejected_evidence_test.go` cover
+  evidence retention, one settlement, TPM, no replay/chain, and interrupted
+  refusal holds across all three `/v1` surfaces. The parser regressions
+  are in the preceding tests-only checkpoint.
+- `docs/api-integration-guide.md`,
+  `docs/api/kaya-coding-plan.openapi.yaml`, the convergence plan and this
+  runbook record compatibility changes, evidence and remaining scope.
+
+**Focused verification:** `run.mUq0Vv/focused.jsonl` passed 133
+tests/subtests across providers, HTTP and gateway under race detection,
+with zero failures or skips. The unknown-usage EOF control passed.
+The owned disposable PostgreSQL cluster stopped successfully. The
+preceding `run.SumfTL` failed only the new interruption fixture's
+one-hold assumption: the fixture correctly retains four reservations
+(three quota windows plus Key budget). Only that assertion changed.
+
+**Bounded review:** Ohm identified that mixed terminal-only refusal
+snapshots counted refusal bytes but omitted text and tool arguments.
+The new `TestResponsesStream_MixedRefusalSnapshotsKeepAllContent`
+reproduced eight failures for completed/incomplete terminals, partial
+deltas, item snapshots and reasoning summaries: 13/16/14 observed bytes
+instead of the independently expected 21/24. Snapshot metering now
+includes all observed output kinds without counting repeated snapshots
+again. Full providers race passed after the fix (2.460s). Ohm's bounded
+follow-up review closed the finding and found no further confirmed delta
+defect; its adjacent pure stream race tests passed (1.634s). This is not
+a whole-branch review or real-provider acceptance.
+
+**Full verification:** `run.Czd9yy` passed build/vet, 4,930 full-race
+tests/subtests across 34 packages, 80.7% statement coverage and 186 E2E
+tests/subtests (144.167s). It predates the mixed-snapshot correction, so
+it is not the final gate. `run.98p2aM` exited 1 after 4,937 passed and
+two failed tests/subtests (the leaf and parent of
+`TestV1Responses_RejectedExecutionSettlesOnce/messages/failed/reported=false`).
+The fixture wipe failed with PostgreSQL 53100, No space left on device;
+the owned server log confirms it. No code or assertion changed for this
+environment failure, and E2E was not reached. Cleanup confirmed the owned
+server stopped. Only verified-stopped owned temporary database data was
+removed, preserving evidence logs.
+
+Fresh final `run.r6xaWn` exited 0 on 2026-11-10, using the existing
+offline runner with `GOMAXPROCS=2`, `GOPROXY=off`,
+`GOFLAGS=-mod=readonly`, `-race -count=1 -p 1` and 30-minute test
+timeouts. Build and vet passed. Full race passed 4,939 tests/subtests
+across 34 packages with zero failures and 80.8% total statement coverage.
+Separate E2E race passed 186 tests/subtests (214.535s), zero failures.
+The only skips were `TestQuotaWorkerProcess` (the child-process entry),
+the two opt-in load drills and the E2E usage-acceptance drill; no database
+acceptance skipped. Independent owned `review_app` and `review_e2e`
+databases each applied all 55 migrations then skipped all 55 on rerun.
+The previously disk-failed HTTP fixture passed in this final gate.
+`cleanup.log` confirms the owned PostgreSQL stopped and `postmaster.pid`
+is absent. Evidence is under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.r6xaWn/`:
+`tests.jsonl`, `coverage-summary.log`, `e2e.jsonl`, build/vet and migration
+logs, and `cleanup.log`.
+
+**Compatibility and remaining risks:** refusal output is an explicit
+translation failure, not a native refusal answer or empty success.
+Invalid thinking objects previously ignored or normalized to false now
+return 400 even alongside another reasoning parameter. Interrupted
+streams retain the existing estimated source label even with reported
+counters. No real-provider/client or cross-host acceptance was performed.
+Wallet post-settlement correction and the production evidence caller
+remain genuinely unfinished original requirements. No push, merge,
+deployment, adjacent-source edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -941,16 +941,16 @@ Streaming rejection is sticky, but continues reading late metering evidence.
 - [x] Reproduce failed HTTP-200 Responses losing identity and usage 10/3.
 - [x] Reproduce nonstream refusals and streaming refusal delta/done, content
   part, output item and terminal-only evidence becoming empty successes.
-- [ ] Retain reported usage or refusal bytes for estimation without counting
+- [x] Retain reported usage or refusal bytes for estimation without counting
   the same refusal again at each cumulative event; never serve success/DONE
   or create a stored Responses chain after the rejection.
-- [ ] Reproduce unsupported/missing Chat thinking types becoming disabled,
+- [x] Reproduce unsupported/missing Chat thinking types becoming disabled,
   then reject invalid types before admission, including with another knob.
-- [ ] Preserve valid enabled/disabled, omitted/null and valid boolean/effort
+- [x] Preserve valid enabled/disabled, omitted/null and valid boolean/effort
   precedence; update the obsolete unknown-type acceptance regression.
-- [ ] Run actual RED/GREEN tests, providers/parser race, authenticated HTTP
+- [x] Run actual RED/GREEN tests, providers/parser race, authenticated HTTP
   race and fresh build/vet/full race/coverage/E2E on disposable databases.
-- [ ] Record evidence and remaining requirements, review and commit locally.
+- [x] Record evidence and remaining requirements, review and commit locally.
 
 Ruling: use the established explicit-rejection policy instead of adding a
 refusal field across every client surface and stored transcript. Cost:
@@ -966,6 +966,38 @@ pass. No production fix, database regression, full-suite coverage or E2E
 verification is included in this checkpoint; the remaining Task 24 steps
 are still open.
 
+Local fix checkpoint (2026-11-10): `run.mUq0Vv` passed focused
+providers, parser, authenticated HTTP and gateway race regressions on an
+owned disposable database. Complete rejected streams without usage now
+retain `RejectedComplete` evidence and estimate without client success;
+bare refusal EOF without usage keeps all four fixture holds (three
+windows plus Key budget) and a pending reconciliation job. The preceding
+`run.SumfTL` failed only that new fixture's incorrect one-hold assertion;
+the production behavior and the assertion that holds remain were unchanged.
+`run.Czd9yy` passed build/vet, 4,930 race tests/subtests, 80.7% coverage
+and 186 E2E tests/subtests. Bounded review then found mixed refusal
+snapshots omitted non-refusal bytes. Eight new completed/incomplete
+snapshot regressions reproduced the undercount; kind/index-aware
+snapshot accounting fixed it and full providers race passed.
+The follow-up bounded review closed that finding with no further confirmed
+delta defect. `run.98p2aM` then failed one HTTP fixture wipe (leaf and
+parent) with PostgreSQL 53100, No space left on device; 4,937 tests/subtests
+passed, E2E was not reached, and the owned PostgreSQL stopped. No code
+changed in response. Removed only verified-stopped owned temporary
+database data while preserving logs. Fresh final `run.r6xaWn` exited 0:
+build/vet passed, full race passed 4,939 tests/subtests across 34 packages
+with zero failures, coverage was 80.8%, and separate E2E race passed 186
+tests/subtests (214.535s), zero failures. Only the expected child entry and
+opt-in drills skipped; no database acceptance skipped. Both independent
+owned databases applied 55 migrations and skipped all 55 on rerun.
+The previously disk-failed fixture passed. Cleanup confirmed PostgreSQL
+stopped and `postmaster.pid` is absent. Runbook 4.84 records the manifest,
+RED/GREEN and final-gate evidence, bounded review and remaining risks.
+Original wallet correction and its production evidence caller remain
+unfinished and outside this local commit checkpoint; the until-clean
+review is not declared complete. No push, merge, deployment, adjacent
+repository edit or kaya process operation is included.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are
@@ -976,12 +1008,12 @@ not waived scope:
 - Explicit reasoning disable is now retained on Chat and Messages egress,
   including Responses `reasoning.effort=none`; fixed and verified in Task 23.
 - Anthropic cache-write inclusion was fixed and verified in Task 21.
-- Failed nonstream Responses lose reported usage and response identity;
-  Task 24 must reproduce and fix this.
-- Responses refusals disappear on both decode paths, permitting an empty
-  success and an input-only replay chain; Task 24 must reproduce and fix it.
-- Unknown or missing Chat thinking types normalize to explicit disable;
-  Task 24 must reproduce and fix it without changing valid precedence.
+- Failed nonstream Responses retain reported usage and response identity;
+  fixed and verified in Task 24.
+- Responses refusals now explicitly reject while retaining metering and
+  suppressing successful terminals and chains; fixed and verified in Task 24.
+- Unknown or missing Chat thinking types now reject before admission;
+  Task 24 valid-precedence controls and fresh full verification pass.
 - The original wallet-correction and production evidence-to-correction
   requirements remain incomplete and need their own implementation audit.
 

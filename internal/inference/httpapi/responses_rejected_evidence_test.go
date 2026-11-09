@@ -162,3 +162,53 @@ func TestV1Chat_InvalidThinkingRejectedBeforeAdmission(t *testing.T) {
 		}
 	}
 }
+
+func TestV1Responses_InterruptedRefusalWithoutUsageKeepsHold(t *testing.T) {
+	for _, surface := range []string{"chat/completions", "messages", "responses"} {
+		t.Run(surface, func(t *testing.T) {
+			f := newMatrixFixture(t, domain.ProtocolOpenAIResponses)
+			f.upstreamHandler.Store(func(w http.ResponseWriter, r *http.Request, _ []byte) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: "+`{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"I cannot help"}`+"\n\n")
+			})
+			body := map[string]any{"model": "glm-4.6", "stream": true}
+			if surface == "responses" {
+				body["input"], body["max_output_tokens"], body["store"] = "hello", 32, true
+			} else {
+				body["messages"] = []map[string]any{{"role": "user", "content": "hello"}}
+				body["max_tokens"] = 32
+			}
+			w := f.call(t, http.MethodPost, "/v1/"+surface, body)
+			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"error"`) ||
+				strings.Contains(w.Body.String(), "[DONE]") {
+				t.Errorf("interrupted refusal status=%d body=%s", w.Code, w.Body.String())
+			}
+			var status, usage string
+			if err := f.db.QueryRow(`SELECT status, usage_status FROM inference_requests`).Scan(&status, &usage); err != nil {
+				t.Fatal(err)
+			}
+			if status != "reconciliation_required" || usage != "unknown" || f.upCalls.Load() != 1 {
+				t.Errorf("interrupted refusal = %s/%s, upstream calls=%d", status, usage, f.upCalls.Load())
+			}
+			for _, check := range []struct {
+				sql  string
+				want int
+			}{
+				{`SELECT COUNT(*) FROM inference_reservations WHERE state='held'`, 4}, // Three windows and the Key budget.
+				{`SELECT COUNT(*) FROM inference_reconciliation_jobs WHERE status='pending'`, 1},
+				{`SELECT COUNT(*) FROM inference_usage_records`, 0},
+				{`SELECT COUNT(*) FROM inference_ledger_entries WHERE entry_type='charge'`, 0},
+				{`SELECT COUNT(*) FROM inference_response_chains`, 0},
+				{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='active'`, 0},
+			} {
+				var n int
+				if err := f.db.QueryRow(check.sql).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				if n != check.want {
+					t.Errorf("%s = %d, want %d", check.sql, n, check.want)
+				}
+			}
+		})
+	}
+}

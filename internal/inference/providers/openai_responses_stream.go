@@ -103,17 +103,27 @@ func (t *responsesTap) markFailed() {
 	t.mu.Unlock()
 }
 
+func (t *responsesTap) markRejectedComplete() {
+	t.mu.Lock()
+	t.res.RejectedComplete = true
+	t.mu.Unlock()
+}
+
 // responsesStreamEvent is the superset of the Responses streaming event
 // shapes we care about; unlisted fields are ignored. delta is RawMessage
 // because textual deltas are strings while some events carry object deltas.
 type responsesStreamEvent struct {
-	Type        string               `json:"type"`
-	OutputIndex int                  `json:"output_index"`
-	Item        *responsesOutputItem `json:"item"`
-	Delta       json.RawMessage      `json:"delta"`
-	Response    *responsesObjectView `json:"response"`
-	Code        string               `json:"code"`
-	Message     string               `json:"message"`
+	Type         string                `json:"type"`
+	OutputIndex  int                   `json:"output_index"`
+	ContentIndex int                   `json:"content_index"`
+	SummaryIndex int                   `json:"summary_index"`
+	Item         *responsesOutputItem  `json:"item"`
+	Part         *responsesContentPart `json:"part"`
+	Refusal      string                `json:"refusal"`
+	Delta        json.RawMessage       `json:"delta"`
+	Response     *responsesObjectView  `json:"response"`
+	Code         string                `json:"code"`
+	Message      string                `json:"message"`
 }
 
 // deltaString decodes a textual delta field (absent/non-string → "").
@@ -140,6 +150,60 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	toolCalls := map[int]struct{}{}
 	terminalSeen := false
 	failed := false
+	refusalRejected := false
+	// Deltas add bytes; later part/item/response snapshots repeat that same
+	// content, so only their previously unseen suffix contributes.
+	type contentKey struct {
+		kind                      string
+		outputIndex, contentIndex int
+	}
+	contentBytes := map[contentKey]int{}
+	recordContent := func(kind string, outputIndex, contentIndex, n int, delta bool) {
+		key := contentKey{kind, outputIndex, contentIndex}
+		if !delta {
+			n -= contentBytes[key]
+		}
+		if n > 0 {
+			contentBytes[key] += n
+			tap.addContent(n)
+		}
+	}
+	recordPart := func(outputIndex, contentIndex int, part *responsesContentPart) bool {
+		if part == nil {
+			return false
+		}
+		switch part.Type {
+		case "refusal":
+			recordContent("refusal", outputIndex, contentIndex, len(part.Refusal), false)
+			return true
+		case "output_text":
+			recordContent("text", outputIndex, contentIndex, len(part.Text), false)
+		}
+		return false
+	}
+	recordItem := func(outputIndex int, item *responsesOutputItem) bool {
+		if item == nil {
+			return false
+		}
+		found := false
+		switch item.Type {
+		case "message":
+			for i, part := range item.Content {
+				if recordPart(outputIndex, i, &part) {
+					found = true
+				}
+			}
+		case "reasoning":
+			for i, part := range item.Summary {
+				if part.Type == "summary_text" {
+					recordContent("summary", outputIndex, i, len(part.Text), false)
+				}
+			}
+		case "function_call":
+			recordContent("arguments", outputIndex, 0, len(item.Arguments), false)
+		}
+		return found
+	}
 
 	for scanner.Scan() {
 		data, ok := strings.CutPrefix(scanner.Text(), "data:")
@@ -152,16 +216,54 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 		}
 		// Keep metering late usage/content after an error without rendering
 		// further output or accepting a subsequent successful terminal.
+		refused := false
 		switch ev.Type {
 		case "response.completed", "response.incomplete", "response.failed":
-			if ev.Response != nil && ev.Response.Usage != nil {
-				tap.recordUsage(ev.Response.Usage)
+			if ev.Response != nil {
+				if ev.Response.Usage != nil {
+					tap.recordUsage(ev.Response.Usage)
+				}
+				for i := range ev.Response.Output {
+					if recordItem(i, &ev.Response.Output[i]) {
+						refused = true
+					}
+				}
 			}
-		case "response.output_text.delta", "response.reasoning_summary_text.delta",
-			"response.reasoning_text.delta", "response.function_call_arguments.delta":
-			tap.addContent(len(ev.deltaString()))
+		case "response.output_text.delta":
+			recordContent("text", ev.OutputIndex, ev.ContentIndex, len(ev.deltaString()), true)
+		case "response.reasoning_summary_text.delta":
+			recordContent("summary", ev.OutputIndex, ev.SummaryIndex, len(ev.deltaString()), true)
+		case "response.reasoning_text.delta":
+			recordContent("reasoning", ev.OutputIndex, ev.ContentIndex, len(ev.deltaString()), true)
+		case "response.function_call_arguments.delta":
+			recordContent("arguments", ev.OutputIndex, 0, len(ev.deltaString()), true)
+		case "response.refusal.delta":
+			refused = true
+			recordContent("refusal", ev.OutputIndex, ev.ContentIndex, len(ev.deltaString()), true)
+		case "response.refusal.done":
+			refused = true
+			recordContent("refusal", ev.OutputIndex, ev.ContentIndex, len(ev.Refusal), false)
+		case "response.content_part.added", "response.content_part.done":
+			refused = recordPart(ev.OutputIndex, ev.ContentIndex, ev.Part)
+		case "response.output_item.added", "response.output_item.done":
+			refused = recordItem(ev.OutputIndex, ev.Item)
+		}
+		if (refused || refusalRejected) && ev.Response != nil &&
+			(ev.Type == "response.completed" || ev.Type == "response.incomplete") {
+			tap.markRejectedComplete()
 		}
 		if failed {
+			continue
+		}
+		if refused {
+			failed = true
+			refusalRejected = true
+			tap.markFailed()
+			if err := writeRawSSE(w, map[string]any{"error": map[string]any{
+				"message": "providers: Responses refusal cannot be translated faithfully",
+			}}); err != nil {
+				return err
+			}
 			continue
 		}
 		var err error

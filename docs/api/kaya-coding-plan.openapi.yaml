@@ -1005,7 +1005,8 @@ paths:
                 $ref: "#/components/schemas/AnthropicError"
         "502":
           description: |
-            api_error（非流式上游文本出现在工具调用之后，无法忠实保序）。
+            api_error（非流式上游文本出现在工具调用之后，无法忠实保序；
+            或 Responses 上游返回无法忠实翻译的 refusal / status=failed）。
             请求已执行：按已报 usage 或完整输出估算结算，不重放、不切换上游，
             不返回改写后的答案，也不保存响应链。
           content:
@@ -1136,7 +1137,8 @@ paths:
         "502":
           description: |
             upstream_response_invalid（非流式上游文本出现在工具调用之后，
-            无法忠实保序）。请求已执行：按已报 usage 或完整输出估算结算，
+            无法忠实保序；或 Responses 上游返回 refusal / status=failed）。
+            请求已执行：按已报 usage 或完整输出估算结算，
             不重放、不切换上游，不返回改写后的答案，也不保存响应链。
           content:
             application/json:
@@ -1174,7 +1176,10 @@ paths:
         function 定义，≤128 个/合计 ≤256 KiB）、`tool_choice`、
         `stream_options`、`thinking_enabled`/`thinking`
         （{"type":"enabled"|"disabled"}；省略保留上游默认，false/disabled
-        显式关闭，Chat/Messages 上游发 thinking.type=disabled，
+        显式关闭；非 null thinking 对象必须带合法 type，即使同时提供其它
+        推理参数，缺失/未知/类型错误的 type 也明确 400。
+        合法对象与 thinking_enabled 同时提供时以布尔值为准，
+        显式 reasoning_effort 优先。Chat/Messages 上游发 thinking.type=disabled，
         Responses 上游发 reasoning.effort=none）、`reasoning_effort`（显式推理档位，逐字
         透传；词表外 400）、`temperature`/`top_p`/
         `presence_penalty`/`frequency_penalty`/`seed`/`stop`（采样透传）。
@@ -1186,6 +1191,9 @@ paths:
         响应：`object=chat.completion` 原生形状（非流式）；流式为
         `chat.completion.chunk` SSE 序列，以 `data: [DONE]` 终止；上游
         中断注入 in-stream error 事件后结束，绝不伪造 `[DONE]`。
+        Responses 上游的 refusal 无法忠实翻译：流内明确报错，无成功终态
+        或响应链；保留拒绝字节与后续 usage。完整收到但未报 usage 的拒绝
+        可估算结算；只有拒绝片段后裸 EOF 且无 usage 时仍冻结预占、挂起核对。
       security:
         - BearerAuth: []
       requestBody:
@@ -1256,7 +1264,8 @@ paths:
         "502":
           description: |
             upstream_response_invalid（非流式上游文本出现在工具调用之后，
-            无法忠实保序）。请求已执行：按已报 usage 或完整输出估算结算，
+            无法忠实保序；或 Responses 上游返回 refusal / status=failed）。
+            请求已执行：按已报 usage 或完整输出估算结算，
             不重放、不切换上游，不返回改写后的答案，也不保存响应链。
           content:
             application/json:
@@ -2382,7 +2391,15 @@ components:
             显式 reasoning_effort 优先于该开关。
         thinking:
           type: object
-          description: "{type:enabled|disabled}（DeepSeek 风格，与 thinking_enabled 同义；disabled 显式关闭而非省略，显式 reasoning_effort 优先）"
+          nullable: true
+          description: |
+            DeepSeek 风格开关；省略/null 不指定，disabled 显式关闭。
+            每个非 null 对象均先校验 type，非法对象不因其它推理参数而被忽略。
+            合法对象与 thinking_enabled 同时提供时以布尔值为准；
+            显式 reasoning_effort 优先。
+          properties:
+            type: { type: string, enum: [enabled, disabled] }
+          required: [type]
         reasoning_effort:
           type: string
           enum: [minimal, low, medium, high, xhigh]

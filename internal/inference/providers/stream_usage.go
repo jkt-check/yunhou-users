@@ -39,8 +39,12 @@ type TapResult struct {
 	// Terminal is true only after the protocol end marker ([DONE] /
 	// message_stop) — never on a bare EOF.
 	Terminal bool
-	// ContentBytes counts generated answer bytes (text + reasoning + tool arguments)
-	// relayed so far — the basis of the estimate fallback when the upstream
+	// RejectedComplete retains a fully received upstream completion whose
+	// output cannot be represented. It permits estimation without treating
+	// the client response as successful; bare interruptions never set it.
+	RejectedComplete bool
+	// ContentBytes counts generated answer bytes (including rejected output)
+	// observed so far — the basis of the estimate fallback when the upstream
 	// never reports usage (设计 §7.1 estimated 路径).
 	ContentBytes int64
 }

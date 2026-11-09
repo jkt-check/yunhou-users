@@ -605,6 +605,7 @@ Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改�
 **推理档位与思考回放（T8 能力路由与协议真实性）**
 
 - **显式关闭与省略不同**：Chat 的 `thinking_enabled:false`/`thinking.type=disabled`、Messages 的 `thinking.type=disabled` 和 Responses 的 `reasoning.effort=none` 都保留关闭意图：Chat/Messages 上游收到 `thinking.type=disabled`，Responses 上游收到 `reasoning.effort=none`；省略则不发送开关，保留上游默认。Chat 同时传显式 `reasoning_effort` 时以档位为准，不再发送相冲突的开关。Chat 上游使用既有 DeepSeek 风格扩展，并非所有 OpenAI 兼容服务都支持。
+- **Chat 思考对象先校验再选优先级**：`thinking` 省略或 `null` 均不指定对象；非空值必须是带 `type: enabled|disabled` 的对象。缺失、未知或类型错误的 `type` 明确 400，即使同时提供 `thinking_enabled` 或 `reasoning_effort`。合法对象与布尔开关同时提供时以布尔值为准，显式档位仍优先。
 - **档位逐字保留**：客户端声明的 `reasoning_effort`（chat 面）/ `reasoning.effort`（responses 面）按 `minimal`/`low`/`medium`/`high`/`xhigh` **原样**下传上游，绝不一律折成 `medium`；词表外的值在出站前 400（不静默忽略）。未声明档位而显式开启开关时才用网关的协议默认档（OpenAI Responses 的 `medium`）。`minimal` 是最低**推理档**（OpenAI 语义），不是「关闭推理」—— 只有 `none` 才关闭；这是对旧映射（`minimal` → 关）的兼容性修正。
 - **档位受上游协议能力约束**：路由层按「模型声明 → 路由能力 → adapter 能力」三层一致挑选候选。`anthropic_messages` 协议**没有** effort 旋钮（它的推理旋钮是 `budget_tokens`，另一根轴），因此带档位的请求不会落到 Anthropic 协议的上游；若**没有任何**已发布部署能承载该档位，请求在**准入之前**被明确 400（零预占、零派发）。
 - **思考回放明确 4xx**：Responses 输入里的 `reasoning` 项、Anthropic 历史里的 `thinking`/`redacted_thinking` 块都无法忠实回放（本网关不实现 OpenAI 的加密推理存储，也不承载 Anthropic 的原生签名），因此**明确 400**（原生错误形状、零准入、零派发）。这是对旧「接受后丢弃」行为的**兼容性修正** —— 旧行为会让客户端以为自己的回传内容被送达了。
@@ -671,6 +672,8 @@ picker 让客户发图、网关在准入前当场 400）。判据与派发共用
 **流式中断语义（三协议一致）**：协议终止标记（`[DONE]`/`message_stop`/`response.completed`）是唯一干净结束；上游中断时向流内注入该协议的原生错误事件（chat：内联 `{"error":...}` 块；messages：`event: error`；responses：`event: error`）后结束，**绝不伪造终止标记**。已读用量照常结算（estimated）；未读用量挂起核对（不记零）。
 
 **非流式输出保序**：Anthropic/Responses 上游的非空文本若出现在工具调用之后（如「文本 → 调用 → 文本」或「调用 → 文本 → 调用」），内部 Chat 形状无法忠实保序，三个 `/v1` 推理入口均返回 **502**，不返回改写后的答案，也不持久化 Responses 会话链。OpenAI 错误码为 `upstream_response_invalid`，Messages 使用 `api_error`。这是**已经执行**的请求：已报 usage 按 reported 结算，缺失 usage 按完整输出内容估算，TPM 同步结算；网关不重放、不切换上游。客户端主动重试属于另一次可能计费的调用。文本在调用之前、空文本穿插调用之间仍支持。
+
+**Responses 拒绝与失败输出**：上游 Responses 的 `refusal` 无法忠实映射到内部 Chat 形状，因此明确返回翻译错误，不改为空成功；非流式返回 502，流式返回协议原生错误且不发送成功终态，也不保存响应链。HTTP 200 内的非流式 `status: failed` 同样保留上游响应 ID 和用量证据后返回错误。完整收到的拒绝响应按已报 usage 或实际观察的输出字节估算结算，拒绝文本的累计快照不重复计量；流式错误后继续读取的 usage 保留，但计量来源仍标为 estimated。只有拒绝片段后裸 EOF、且没有 usage 或完成事件时，仍冻结预占并挂起核对，不按零结算、不重放。
 
 **Responses 会话链（`previous_response_id`）**：成功响应（`store` 缺省 true）仅在完整规范 items transcript 可忠实回放且不超过 4 MiB 时，持久化截至本轮的 transcript + 账户归属 + 实际服务账号（24h TTL）。若合并后的输入/输出包含无法保序转换的历史，例如工具调用后、工具结果前仍有 assistant 文本，则本轮不落链、不建立新会话绑定；流式输出顺序、成功终态、usage 和结算不变，已有父链不受影响。引用链的请求 = transcript 回放（既有上下文 + 新输入），并经粘性会话绑定钉住同一上游账号；账号失效时显式迁移（旧绑定终止 reason=migrated + 新绑定同事务建立），**绝不静默换号续接**。`store:false`、超限或不可回放的响应均不落链；引用不存在/过期/他人或未落链的响应一律 404（`previous_response_not_found`，不泄漏存在性）。`GET /v1/responses/{id}`（OpenAI stored-response 读取面）不实现。
 

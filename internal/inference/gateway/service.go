@@ -1154,7 +1154,7 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 		sctx, scancel := detached(settleTimeout)
 		defer scancel()
 		switch {
-		case !tap.SawUsage && !tap.Terminal:
+		case !tap.SawUsage && !tap.Terminal && !tap.RejectedComplete:
 			// Interrupted with NO usage read: hold the reservation, park for
 			// reconciliation — 不记零、不静默释放 (设计 §7.2).
 			s.markReconciliation(requestID, postgres.ReasonUnknownUsage,
@@ -1167,7 +1167,8 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 			return nil
 		default:
 			// 中断但已读用量 (estimated = 已知实际量), 或完整结束但上游确实
-			// 不提供 usage → estimated 估算路径 (设计 §7.1/§7.2).
+			// 不提供 usage（包括完整收到但无法翻译的拒绝响应）
+			// → estimated 估算路径 (设计 §7.1/§7.2).
 			usage := tap.Buckets
 			raw := tap.Raw
 			if !tap.SawUsage || emptyBuckets(usage) {

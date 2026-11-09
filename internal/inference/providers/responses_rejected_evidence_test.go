@@ -114,7 +114,7 @@ func TestResponsesStream_RefusalRejectsWithoutLosingEvidence(t *testing.T) {
 					t.Errorf("refusal was converted into a successful terminal: %s", wire)
 				}
 				res := st.Tap.Result()
-				if res.Terminal || res.SawUsage != reported || res.ContentBytes != tc.bytes {
+				if res.Terminal || !res.RejectedComplete || res.SawUsage != reported || res.ContentBytes != tc.bytes {
 					t.Errorf("refusal metering = %+v, want failed, reported=%t, bytes=%d", res, reported, tc.bytes)
 				}
 				if reported {
@@ -123,6 +123,50 @@ func TestResponsesStream_RefusalRejectsWithoutLosingEvidence(t *testing.T) {
 						!json.Valid(res.Raw) || !strings.Contains(wire, `"completion_tokens":3`) {
 						t.Errorf("late reported usage must survive rejection: tap=%+v wire=%s", res, wire)
 					}
+				}
+			})
+		}
+	}
+}
+
+func TestResponsesStream_MixedRefusalSnapshotsKeepAllContent(t *testing.T) {
+	const message = `{"type":"message","content":[{"type":"output_text","text":"before"},{"type":"refusal","refusal":"I cannot help"}]}`
+	const call = `{"type":"function_call","call_id":"c","name":"f","arguments":"{}"}`
+	const reasoning = `{"type":"reasoning","summary":[{"type":"summary_text","text":"why"}]}`
+	event := func(s string) string { return "data: " + s + "\n\n" }
+	for _, tc := range []struct {
+		name, prefix, output string
+		bytes                int64
+	}{
+		{"terminal_only", "", "[" + message + "," + call + "]", 21},
+		{"partial_deltas",
+			event(`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"be"}`) +
+				event(`{"type":"response.refusal.delta","output_index":0,"content_index":1,"delta":"I cannot "}`) +
+				event(`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{"}`),
+			"[" + message + "," + call + "]", 21},
+		{"item_snapshots",
+			event(`{"type":"response.output_item.done","output_index":0,"item":`+message+`}`) +
+				event(`{"type":"response.output_item.done","output_index":1,"item":`+call+`}`),
+			"[" + message + "," + call + "]", 21},
+		{"reasoning_snapshot",
+			event(`{"type":"response.reasoning_summary_text.delta","output_index":2,"summary_index":0,"delta":"w"}`),
+			"[" + message + "," + call + "," + reasoning + "]", 24},
+	} {
+		for _, terminal := range []string{"completed", "incomplete"} {
+			t.Run(tc.name+"/"+terminal, func(t *testing.T) {
+				snapshot := event(`{"type":"response.` + terminal + `","response":{"status":"` + terminal + `","output":` + tc.output + `}}`)
+				st := TranslateResponsesStream(io.NopCloser(strings.NewReader(tc.prefix + snapshot + snapshot)))
+				defer st.Body.Close()
+				body, err := io.ReadAll(st.TeeBody())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(body), `"error"`) || strings.Contains(string(body), "[DONE]") {
+					t.Errorf("mixed refusal must remain rejected: %s", body)
+				}
+				res := st.Tap.Result()
+				if res.Terminal || !res.RejectedComplete || res.SawUsage || res.ContentBytes != tc.bytes {
+					t.Errorf("mixed snapshot metering = %+v, want %d bytes exactly once", res, tc.bytes)
 				}
 			})
 		}

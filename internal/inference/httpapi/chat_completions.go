@@ -243,19 +243,20 @@ func parseChatCompletions(body []byte) (*providers.ChatRequest, error) {
 	if len(wire.ToolChoice) > 0 && string(wire.ToolChoice) != "null" {
 		req.ToolChoice = wire.ToolChoice
 	}
-	// thinking: accept kaya's thinking_enabled bool and DeepSeek's
-	// thinking object ({"type":"enabled"}).
-	if wire.ThinkingEnabled != nil {
-		req.ThinkingEnabled = wire.ThinkingEnabled
-	} else if present(wire.Thinking) {
+	// Validate every supplied object before selecting the boolean override.
+	if present(wire.Thinking) {
 		var th struct {
 			Type string `json:"type"`
 		}
-		if err := json.Unmarshal(wire.Thinking, &th); err != nil {
-			return nil, invalidField("thinking", "invalid thinking parameter")
+		if err := json.Unmarshal(wire.Thinking, &th); err != nil ||
+			(th.Type != "enabled" && th.Type != "disabled") {
+			return nil, invalidField("thinking", "thinking.type must be enabled or disabled")
 		}
 		on := th.Type == "enabled"
 		req.ThinkingEnabled = &on
+	}
+	if wire.ThinkingEnabled != nil {
+		req.ThinkingEnabled = wire.ThinkingEnabled
 	}
 	// T8: reasoning_effort 是显式档位 —— 逐字保留，不折成别的档位。
 	// 不在词汇表里的值明确拒绝（出站前），绝不静默忽略。

@@ -323,6 +323,12 @@ type responsesUsage struct {
 	} `json:"output_tokens_details"`
 }
 
+type responsesContentPart struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Refusal string `json:"refusal"`
+}
+
 // responsesOutputItem is the superset of the output item shapes we surface:
 // message (output_text parts), reasoning (summary parts), function_call.
 // Server-side tool items (web_search_call etc.) carry no client-surface
@@ -330,10 +336,7 @@ type responsesUsage struct {
 type responsesOutputItem struct {
 	Type string `json:"type"`
 	// message
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
+	Content []responsesContentPart `json:"content"`
 	// reasoning
 	Summary []struct {
 		Type string `json:"type"`
@@ -450,7 +453,10 @@ func collectResponseOutput(output []responsesOutputItem) (text, reasoning string
 		switch it.Type {
 		case "message":
 			for _, p := range it.Content {
-				if p.Type == "output_text" {
+				switch p.Type {
+				case "refusal":
+					err = fmt.Errorf("providers: Responses refusal cannot be translated faithfully")
+				case "output_text":
 					if len(toolCalls) > 0 && p.Text != "" {
 						err = fmt.Errorf("providers: Responses text after function_call cannot be translated faithfully")
 					}
@@ -491,14 +497,6 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 	if resp.Object != "" && resp.Object != "response" {
 		return nil, fmt.Errorf("providers: unexpected openai_responses payload object %q", resp.Object)
 	}
-	if resp.Status == "failed" {
-		msg := "upstream response failed"
-		if resp.Error != nil && resp.Error.Message != "" {
-			msg = resp.Error.Message
-		}
-		return nil, fmt.Errorf("providers: openai_responses upstream failed: %s", msg)
-	}
-
 	text, reasoning, toolCalls, translationErr := collectResponseOutput(resp.Output)
 	incompleteReason := ""
 	if resp.IncompleteDetails != nil {
@@ -529,12 +527,26 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 		if item.Type == "function_call" {
 			result.ContentBytes += int64(len(item.Arguments))
 		}
+		if item.Type == "message" {
+			for _, part := range item.Content {
+				if part.Type == "refusal" {
+					result.ContentBytes += int64(len(part.Refusal))
+				}
+			}
+		}
 	}
 	if resp.Usage != nil {
 		out["usage"] = resp.Usage.openAIWireUsage()
 		result.UsageReported = true
 		result.Usage = resp.Usage.usageBuckets()
 		result.UsageRaw = marshalResponsesRawUsage(resp.Usage)
+	}
+	if resp.Status == "failed" {
+		msg := "upstream response failed"
+		if resp.Error != nil && resp.Error.Message != "" {
+			msg = resp.Error.Message
+		}
+		return result, fmt.Errorf("providers: openai_responses upstream failed: %s", msg)
 	}
 	if translationErr != nil {
 		return result, translationErr

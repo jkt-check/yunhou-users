@@ -6590,6 +6590,94 @@ correction trigger remain unfinished, not waived. Real-provider/client
 and cross-host acceptance remain unverified. No push, merge, deployment,
 adjacent repository change or kaya process operation is included.
 
+### 4.78 Late Dispatch Markers Preserve Terminal Accounting (2026-11-10)
+
+This checkpoint addresses Task 18, not the entire until-clean review.
+
+**Changed files:**
+
+- `internal/inference/postgres/request_repo.go`: the public dispatch-marker
+  UPDATE atomically excludes settled/released rows and treats their late
+  markers as successful no-ops. A single-statement CTE distinguishes an
+  existing terminal request from a missing request. The private helper
+  used by transactional release remains unchanged.
+- `internal/inference/postgres/request_terminal_marker_test.go`: plan/wallet,
+  zero/positive charge, settled/released and all three dispatch markers.
+  Full accounting snapshots include request timestamps/error, usage,
+  attempts, ledger, rate rows, money holds, windows, Key and wallet facts.
+  Ordinary nonterminal updates and not-found errors have controls.
+- `internal/inference/gateway/terminal_marker_test.go`: a synchronous
+  before-FinishAttempt hook commits a competing settlement or release,
+  then resumes the real nonstream finalizer. Positive and zero prices
+  cover exact replay, different tokens, equal-money estimated source and
+  late usage after release. Assertions require the existing typed
+  duplicate/mismatch/released handling and preserve original accounting.
+- The convergence plan and this runbook record the verification and scope.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.ixZmDC/focused.jsonl` | RED: all 24 repository and 8 gateway leaf cases failed; 50 failure events including parents, 4 passing control events, no skips. Real finalizers incorrectly parked terminal requests as `missing_reservation`. |
+| `run.UU9TZx/focused.jsonl` | GREEN: 54 tests/subtests passed across PostgreSQL (3.478s) and gateway (2.170s), no failures or skips. |
+
+Focused command:
+`go test -race -count=1 -p 1 -json ./internal/inference/postgres ./internal/inference/gateway -run '^(TestUpdateRequestStatus_PreservesTerminalAccounting|TestUpdateRequestStatus_NonterminalAndMissing|TestGateway_NonstreamFinalizerPreservesCompetingTerminal)$' -timeout=5m`.
+
+The gateway snapshots deliberately exclude attempt/lease lifecycle changes
+and the anomaly reporter's intended `last_error`/`updated_at` changes.
+Exact duplicate replays additionally compare the full request. Mismatches
+must queue `settlement_mismatch`; nonempty usage after release must queue
+`late_usage_after_release`, even at zero price. Stored usage, charge,
+completed_at and rate rows (including an original TPM settlement time
+outside the current minute) must not change.
+
+Both focused runs used new owned disposable clusters on loopback port
+55491 with explicit independent application/E2E database DSNs, all 55
+migrations and an idempotent rerun. Their cleanup logs confirm the owned
+PostgreSQL servers stopped. Dependencies stayed offline/read-only and
+packages serialized (`GOPROXY=off`, `GOFLAGS=-mod=readonly`, `-p 1`).
+
+**Verification gate:** `run.DRZo2C` completed build/vet, full race/coverage
+and separate E2E race on the same Go tree:
+
+| Run | Result |
+|---|---|
+| `go build ./...` | Passed; `build.log` is empty. |
+| `go vet ./internal/... ./cmd/...` | Passed; `vet.log` is empty. |
+| Full race (`tests.jsonl`) | 4,630 tests/subtests passed across 34 packages, no failures; all 54 Task 18 tests/subtests passed again. |
+| Statement coverage | 80.7% total, from `coverage.out` and `coverage-summary.log`. |
+| E2E race (`e2e.jsonl`) | 186 tests/subtests passed (148.197s), no failures. |
+
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile="$RUN/coverage.out" -json ./internal/... ./cmd/... ./tests/integration/...`.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+
+The three full-race skips are the child-only `TestQuotaWorkerProcess`
+entry point and the two `KAYA_LOAD=1` load drills. E2E skips only
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` (`USAGE_ACCEPTANCE=1`).
+No database acceptance skipped. Both owned disposable databases applied
+all 55 migrations and skipped all 55 on rerun. The runner finished and
+`cleanup.log` confirms its owned PostgreSQL server stopped. Dependencies
+remained offline/read-only, and packages were serialized.
+
+Boole's bounded read-only review against `0cff06a` found no confirmed
+actionable findings in the Task 18 production/test diff. It did not run
+database tests or independently reproduce the RED/GREEN gate. The tests
+cover a competing terminal commit before the finalizer resumes, not
+overlapping uncommitted SQL lock-wait interleavings. Formatting and diff
+checks passed. This is a local Task 18 checkpoint, not a whole-branch
+until-clean review conclusion.
+
+**Remaining scope:** this fixes late markers against settled/released
+requests; it does not change recovery/reconciliation policy or implement
+wallet corrections and the production evidence-to-correction trigger.
+Other pending review findings remain unwaived. Real-provider/client and
+cross-host acceptance remain unverified. No push, merge, deployment,
+adjacent-repository edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

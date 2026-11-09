@@ -590,17 +590,42 @@ wallet-correction/production evidence-trigger requirements remain open.
 not-found behavior. Transactional settlement/release keep owning terminal
 transitions; a late marker against settled/released is a successful no-op.
 
-- [ ] Reproduce dispatching/streaming/non_streaming overwriting settled or
+- [x] Reproduce dispatching/streaming/non_streaming overwriting settled or
   released requests, including plan/wallet and zero-priced settlement.
-- [ ] Reproduce a real nonstream finalizer resuming after another transaction
+- [x] Reproduce a real nonstream finalizer resuming after another transaction
   has settled or released the request; assert typed duplicate, mismatch or
   released handling rather than missing_reservation.
-- [ ] Guard only the public dispatch-marker path atomically; preserve the
+- [x] Guard only the public dispatch-marker path atomically; preserve the
   transactional release helper and existing nonterminal marker behavior.
-- [ ] Preserve terminal status, timestamps, usage, charge, money holds and
+- [x] Preserve terminal status, timestamps, usage, charge, money holds and
   original TPM settlement time; no double charge or additional usage.
-- [ ] Run focused race, independent review and full race/coverage plus E2E
+- [x] Run focused race, independent review and full race/coverage plus E2E
   against owned disposable databases.
+
+Task 18 focused race passed 54 tests/subtests with no failures/skips in
+`run.UU9TZx`, after `run.ixZmDC` reproduced 32 failing leaves. The public
+marker now uses a guarded single-statement UPDATE/EXISTS CTE, while the
+private transactional release helper is unchanged. Terminal markers do
+not clear anomaly details or move completion/TPM timestamps. Nonterminal
+markers and missing-request errors retain their behavior.
+
+Full gate `run.DRZo2C` completed build/vet, full race (4,630 tests/subtests
+across 34 packages, no failures, 80.7% total statement coverage) and
+separate E2E race (186 tests/subtests, 148.197s, no failures). All 54 new
+tests/subtests passed again in the full run. The three full-race skips
+and one E2E skip are the expected child-entry/opt-in load scenarios,
+not unavailable databases. Both owned disposable databases applied all
+55 migrations and skipped all 55 on rerun; cleanup confirmed the owned
+PostgreSQL server stopped.
+
+Boole's bounded read-only Task 18 diff review against `0cff06a` found no
+confirmed actionable findings; it did not independently run database
+tests. The regressions cover committed-before-resume ordering, not
+overlapping uncommitted SQL lock waits. Formatting and diff checks passed.
+Task 18 is verified for this local checkpoint. Other pending findings,
+wallet corrections and the production evidence-to-correction trigger
+remain open; see runbook 4.78 for the manifest, commands and evidence
+boundaries. This is not a whole-branch until-clean conclusion.
 
 ## Pending Review Findings (2026-11-10)
 

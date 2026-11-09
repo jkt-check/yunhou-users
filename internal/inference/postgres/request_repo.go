@@ -219,9 +219,27 @@ func (s *Store) InsertAttemptTx(ctx context.Context, w domain.UnitOfWork, a *dom
 // UpdateRequestStatus moves a request through the §7.2 lifecycle outside an
 // open UnitOfWork (single-statement). Terminal transitions that must commit
 // with their effects (settled/released/reconciliation_required) have their
-// own transactional paths — this is for the dispatch markers.
+// own transactional paths — this is for the dispatch markers. Late markers
+// against settled/released requests are successful no-ops.
 func (s *Store) UpdateRequestStatus(ctx context.Context, id string, status domain.RequestStatus, lastErr string) error {
-	return s.updateRequestStatus(ctx, s.db, id, status, lastErr)
+	var found bool
+	err := s.db.QueryRowxContext(ctx, `
+		WITH updated AS (
+		    UPDATE inference_requests
+		    SET status = $2, last_error = $3, updated_at = now()
+		    WHERE id = $1 AND status NOT IN ('settled', 'released')
+		    RETURNING id
+		)
+		SELECT EXISTS (SELECT 1 FROM updated)
+		    OR EXISTS (SELECT 1 FROM inference_requests WHERE id = $1)`,
+		id, string(status), lastErr).Scan(&found)
+	if err != nil {
+		return mapError("update request status", err)
+	}
+	if !found {
+		return mapError("update request status", sql.ErrNoRows)
+	}
+	return nil
 }
 
 // FinishAttempt marks an attempt's terminal state (completed | failed |

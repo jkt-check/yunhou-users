@@ -627,6 +627,37 @@ wallet corrections and the production evidence-to-correction trigger
 remain open; see runbook 4.78 for the manifest, commands and evidence
 boundaries. This is not a whole-branch until-clean conclusion.
 
+## Task 19: Refresh Live Window Limits On Policy Revision
+
+**Files:** `quota/service.go`, `postgres/quota_repo.go`, new
+`postgres/quota_upgrade_test.go`, and the verification runbook.
+
+**Interfaces:** add the selected entitlement's `PolicyVersionID` to
+`ActivateWindowsCommand`. After locking the account, read the entitlement
+FOR SHARE on the same transaction and reject a mismatching account or
+policy with `conflict`. Hold that lock through admission commit.
+
+- [ ] Reproduce each live window retaining limit 100 after upgrade to 200,
+  with used 90 and reserved 5; a hold of 20 must admit.
+- [ ] Preserve IDs, boundaries, creation time, used and existing reserved;
+  change only the live enabled row's limit, including effective decreases.
+- [ ] Preserve expired/voided/disabled windows; newly enabled windows
+  activate with the selected policy's limit.
+- [ ] Reject stale-policy snapshots before creating or rewriting windows;
+  verify rejection leaves request, holds, rate and lease state unchanged.
+- [ ] Reproduce overlapping revision/admission in both lock orders and
+  prove no stale rewrite can commit after a policy revision.
+- [ ] Run focused race, full race/coverage and E2E using owned disposable
+  databases; record evidence and commit this fix locally.
+
+Ruling: refresh lazily inside admission, not every entitlement revision
+path. The read model already uses the current policy's limit; admission
+must bring only its live enabled rows into agreement without rewriting
+historical consumption. A rejected admission rolls back the refresh too.
+A stale snapshot fails closed with the existing conflict code rather than
+retrying internally with the same stale limits. Renewal under the same
+policy remains valid; this does not remove the existing bounded cache.
+
 ## Pending Review Findings (2026-11-10)
 
 These are reviewer findings to verify, not completed fixes or waived scope:

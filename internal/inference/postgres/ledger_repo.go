@@ -336,8 +336,8 @@ func checkWalletHolds(ctx context.Context, tx *sqlx.Tx, requestID string, status
 //   - the ledger holds exactly one charge and it matches the delivered
 //     amount (and the metering fact of a re-delivered attempt matches) →
 //     an idempotent replay (重复成功): the caller absorbs it silently;
-//   - anything else (no charge row, a different amount, a contradicting
-//     usage fact) → an accounting anomaly (double-billing risk): the
+//   - anything else (no charge row, a different amount, a missing or
+//     contradicting usage fact) → an accounting anomaly (double-billing risk): the
 //     caller must alarm and reconcile.
 //
 // A **storage failure** while reading the recorded charge/usage is neither:
@@ -382,7 +382,7 @@ func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 	if !consistent {
 		return &domain.SettleError{
 			Kind: domain.SettleOutcomeChargeMismatch, Code: domain.CodeConflict,
-			Message: "settle: request is settled with a different usage fact (inconsistent duplicate)",
+			Message: "settle: request is settled with a missing or different usage fact (inconsistent duplicate)",
 			Status:  status, ExistingChargeMicros: &existing,
 			RequestedChargeMicros: cmd.ChargeMicros,
 		}
@@ -396,20 +396,12 @@ func classifySettledDelivery(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 }
 
 // usageFactConsistent compares the delivered metering fact with the one
-// already recorded for the same attempt revision. A delivery for an attempt
-// that has no recorded fact cannot be compared — it is left consistent (the
-// charge amount is the customer-facing fact that decides the outcome).
+// already recorded for the same attempt revision. Missing evidence cannot
+// prove consistency, even when the charge amount matches.
 //
-// A **storage failure** is NOT a consistent fact and is returned to the
-// caller: only sql.ErrNoRows (no comparable revision — the deliberate
-// compatibility) keeps the delivery comparable. Any other error means the
-// usage fact could not be read, so "the ledger amount matches" proves
-// nothing about idempotency and the failure must surface loudly instead of
-// being absorbed as a duplicate.
+// A storage failure is returned to the caller, distinct from a missing or
+// contradicting fact. Neither may be absorbed as an idempotent replay.
 func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord) (bool, error) {
-	if u.AttemptID == "" {
-		return true, nil
-	}
 	revision := u.Revision
 	if revision == 0 {
 		revision = 1
@@ -421,8 +413,7 @@ func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord)
 		u.AttemptID, revision).Scan(&in, &out, &cacheRead, &cacheWrite, &reasoning)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// 没有可比的 revision（刻意兼容）：交给金额裁决。
-			return true, nil
+			return false, nil
 		}
 		return false, mapError("settle: load usage fact", err)
 	}

@@ -448,9 +448,9 @@ Only an existing, matching attempt revision proves metering consistency.
   and keep real usage-query errors distinguishable from a mismatch.
 - [x] Reproduce gateway replay after deleting usage: one alarm and a pending
   settlement_mismatch job, no second charge or rewritten terminal/TPM.
-- [ ] Reject absent comparable usage without adding evidence, financial
+- [x] Reject absent comparable usage without adding evidence, financial
   entries, rate changes or a new public outcome kind.
-- [ ] Run focused race, full race/coverage and E2E on owned disposable
+- [x] Run focused race, full race/coverage and E2E on owned disposable
   databases; record evidence and checkpoint locally.
 
 Ruling: the original T2 and domain contract require consistent charge AND
@@ -486,6 +486,34 @@ applied all 55 migrations and skipped all 55 on rerun; cleanup.log
 confirms the owned server stopped. No kaya process was operated on.
 Full race/coverage and E2E were not rerun for this RED-only checkpoint;
 earlier green coverage does not describe this tree. Task 16 remains open.
+
+GREEN implementation checkpoint: `usageFactConsistent` now returns false
+when the matching attempt revision is absent, and no longer has an
+empty-attempt compatibility branch (public settlement validates UUIDs
+before classification). The existing charge-mismatch outcome triggers
+the gateway's alarm and reconciliation path. It does not create usage,
+append money entries or change the terminal request or rate reservation.
+The regression tests are already committed in `60cdc45`.
+
+Fresh pre-fix `run.7sjNlN/focused.jsonl` reproduced all 12 repository
+leaves and both gateway cases, with 22 failed test/subtest events.
+The post-fix `run.bpWMlS/focused.jsonl` passed all 24 tests/subtests,
+zero failures or skips, including exact-replay and storage-failure
+controls. Both runs used owned disposable databases, applied all 55
+migrations to each and skipped them on rerun; their cleanup logs confirm
+the owned PostgreSQL servers stopped.
+
+Fresh whole-branch `run.eDLUYE` exited 0 on 2026-11-10 (Asia/Shanghai):
+build/vet passed; full race passed 4,521 tests/subtests across 34 packages,
+zero failures, with total statement coverage 80.7%; E2E race passed 186
+tests/subtests (177.130s), zero failures. The three full-race skips and
+one E2E skip were the expected child-entry/opt-in scenarios, not missing
+databases. Both independent disposable databases applied 55 migrations
+and skipped all 55 on rerun; cleanup confirmed the owned server stopped.
+Formatting and diff checks passed. Runbook 4.76 records the manifest,
+commands and remaining scope. Task 16 is verified for this local commit
+checkpoint; the broader review and original wallet-correction/production
+trigger requirements remain unfinished.
 
 ### Previous Verification Checkpoint
 

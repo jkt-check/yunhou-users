@@ -6462,6 +6462,65 @@ Cross-host and real-provider/client acceptance remain unverified.
 No push, merge, deployment, adjacent repository modification or kaya
 process operation is part of this checkpoint.
 
+### 4.76 Missing Usage Replay Classification (2026-11-10)
+
+This local commit checkpoint fixes Task 16. The repository and gateway
+regressions were committed separately in `60cdc45`; this is not a
+declaration that the broader until-clean review is complete.
+
+**Changed files:**
+
+- `internal/inference/postgres/ledger_repo.go`: missing comparable usage
+  now yields the existing `charge_mismatch` outcome, rather than an
+  amount-only duplicate success. Remove the obsolete empty-attempt
+  fallback; public settlement already validates attempt identity.
+  Storage failures remain errors, and matching revision 0/1 replays
+  remain idempotent.
+- The convergence plan and this runbook: record the implementation,
+  regression evidence and remaining original requirements.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.7sjNlN/focused.jsonl` | Fresh pre-fix RED: all 12 plan/wallet, zero/positive, missing-usage/revision/attempt leaves and both gateway cases reproduced; 22 failed test/subtest events. Both controls passed; no skips. |
+| `run.bpWMlS/focused.jsonl` | Post-fix GREEN: 24 tests/subtests passed with race detection across PostgreSQL and gateway, no failures or skips. |
+| `run.eDLUYE/tests.jsonl` | Build/vet passed; full race passed 4,521 tests/subtests across 34 packages, zero failures. |
+| `run.eDLUYE/coverage-summary.log` | Total statement coverage 80.7%; the 80% floor passed. |
+| `run.eDLUYE/e2e.jsonl` | E2E race passed 186 tests/subtests, zero failures (177.130s). Runner exited 0. |
+
+Focused command:
+`go test -race -count=1 -p 1 -json ./internal/inference/postgres ./internal/inference/gateway -run '^(TestSettle_MissingUsageCannotBeDuplicate|TestGateway_MissingSettledUsageRequiresReconciliation|TestSettle_DuplicateDelivery_UsageLookupFailure_Propagates|TestGateway_ConsistentDuplicateSettleIsIdempotent)$' -timeout=10m`.
+The repository regressions inspect the open transaction for unchanged
+usage, ledger, rate, reservations, windows, Key and wallet accounting.
+Gateway regressions assert one alarm and a pending `settlement_mismatch`
+job, one original charge, unchanged terminal time and settled TPM 15,
+and no fabricated replacement usage. Both focused runs used owned
+disposable databases with explicit DSNs, applied all 55 migrations to
+each database and skipped all 55 on rerun; cleanup confirms their owned
+PostgreSQL servers stopped.
+
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...`.
+It skipped only `TestQuotaWorkerProcess` (the child-process entry) and
+the two `KAYA_LOAD=1` load-drill opt-ins, not unavailable databases.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+It skipped only `TestUsageTokenAcceptance_TenPagesTwoMinutes`
+(`USAGE_ACCEPTANCE=1` opt-in). Both full-run disposable databases applied
+all 55 migrations and skipped all 55 on rerun. The runner exited 0 on
+2026-11-10 (Asia/Shanghai); `cleanup.log` confirms its owned PostgreSQL
+server stopped. Code formatting and diff whitespace checks passed.
+
+**Remaining scope:** this change detects missing evidence; it does not
+repair historical data or automatically reconstruct usage. Existing
+missing facts now require reconciliation/operator attention. Wallet
+correction and the production evidence-driven correction trigger remain
+genuine unfinished original requirements. Real-provider/client and
+cross-host acceptance remain unverified. No push, merge, deployment,
+adjacent repository modification or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

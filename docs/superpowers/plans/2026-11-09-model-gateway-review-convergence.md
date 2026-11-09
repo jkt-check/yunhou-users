@@ -130,6 +130,24 @@ domain error mapping, HTTP handlers, regression tests and API documentation.
 - [x] Preserve the initial counters; later cumulative message_delta
   counters replace, rather than add to, the initial values.
 
+## Task 10: Nonstream Finalization Lease Order
+
+**Files:** `gateway/service.go`, `gateway/nonstream_finish_order_test.go`.
+
+- [x] Reproduce upstream lease release before nonstream finalization, including
+  recovery near a legal deployment timeout just below the grace boundary.
+- [ ] Keep every lease renewed until finalization completes; release with a
+  fresh cleanup budget on success, timeout and panic.
+- [ ] Verify reported settlement wins once, preserves TPM, and leaves no leases.
+
+RED checkpoint (2026-11-09): focused race run
+`go test -race -count=1 -p 1 ./internal/inference/gateway -run '^TestGateway_NonstreamFinal' -timeout=3m`
+against an owned disposable PostgreSQL failed as expected: finalization held 0/1
+or 2/3 live leases, and recovery won the upstream-only case with a conservative
+charge of 16413 instead of reported usage's 20. The panic case also observed
+only 2/3 leases before cleanup. This checkpoint contains tests, not the fix;
+Task 10 remains open. The temporary database was stopped after verification.
+
 ## Execution Notes
 
 Ruling: use the existing explicit-rejection policy for unrepresentable

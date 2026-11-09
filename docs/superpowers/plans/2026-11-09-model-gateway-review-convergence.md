@@ -431,6 +431,62 @@ unfulfilled. Runbook 4.75 records the manifest, scope and evidence.
 Task 15 is verified for this local commit checkpoint, not a declaration
 that the original plan or wider until-clean review is complete.
 
+## Task 16: Missing Usage Is Not An Idempotent Replay
+
+**Files:** `postgres/ledger_repo.go`, new PostgreSQL and gateway missing-usage
+regressions, and the verification runbook.
+
+**Interfaces:** keep `usageFactConsistent(ctx, tx, usage) (bool, error)` and
+the existing `SettleOutcomeChargeMismatch` / `settlement_mismatch` reaction.
+Only an existing, matching attempt revision proves metering consistency.
+
+- [x] Reproduce missing usage, absent revision and a different valid attempt
+  of the same request being silently classified as duplicate.
+- [x] Cover plan/wallet and zero/positive amounts, with both identical and
+  changed token evidence; inspect the still-open transaction for no writes.
+- [x] Preserve exact original replays with default revision 0 and explicit 1,
+  and keep real usage-query errors distinguishable from a mismatch.
+- [x] Reproduce gateway replay after deleting usage: one alarm and a pending
+  settlement_mismatch job, no second charge or rewritten terminal/TPM.
+- [ ] Reject absent comparable usage without adding evidence, financial
+  entries, rate changes or a new public outcome kind.
+- [ ] Run focused race, full race/coverage and E2E on owned disposable
+  databases; record evidence and checkpoint locally.
+
+Ruling: the original T2 and domain contract require consistent charge AND
+usage. Retaining an amount-only compatibility fallback contradicts that
+contract, especially for zero-priced models. Use the existing mismatch
+classification instead of silently repairing missing evidence or inventing
+a new financial policy. Missing evidence now requires operator attention;
+ordinary exact replays remain silent. Wallet correction and its production
+trigger are still genuine unfinished original requirements.
+
+RED commit checkpoint (2026-11-10): the latest user request checkpoints the
+two new regression files and this plan only, without a production fix.
+The focused race run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.1QzRSV/focused.jsonl`
+exited 1, with 22 failed test/subtest events and no skips. All 12
+plan/wallet, zero/positive, missing-usage/revision/attempt combinations
+returned duplicate instead of charge_mismatch for both unchanged and
+changed input tokens. The original revision 0/1 replay controls and
+open-transaction no-write assertions did not fail. Both gateway cases
+reproduced zero alarms and no reconciliation job after usage deletion,
+while their single charge and terminal/TPM invariants remained unchanged.
+
+The separate focused race control run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.lURFCX/focused.jsonl`
+exited 0 with two passes and no failures/skips:
+`TestSettle_DuplicateDelivery_UsageLookupFailure_Propagates` and
+`TestGateway_ConsistentDuplicateSettleIsIdempotent`. It used a fresh owned
+cluster, also stopped on cleanup.
+
+The runner created its own PostgreSQL cluster on loopback port 55491,
+using explicit disposable review_app/review_e2e DSNs. Both databases
+applied all 55 migrations and skipped all 55 on rerun; cleanup.log
+confirms the owned server stopped. No kaya process was operated on.
+Full race/coverage and E2E were not rerun for this RED-only checkpoint;
+earlier green coverage does not describe this tree. Task 16 remains open.
+
 ### Previous Verification Checkpoint
 
 At `814d120`, Noether and Tesla's bounded independent reviews, including

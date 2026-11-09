@@ -6109,6 +6109,71 @@ E2E have not been refreshed at this commit checkpoint; 77.5% is the
 PostgreSQL package coverage, not the whole-branch 80% gate result.
 No push, merge, deployment or kaya process operation.
 
+### 4.71 Whole-branch Verification Refresh (2026-11-09)
+
+Code under test: `814d120`. The latest user request is a local commit
+checkpoint. All implementation changes were already committed and the
+tracked worktree was clean before this documentation refresh.
+
+Artifacts: `/private/tmp/yunhou-review-20261109.3NuMWy/run.3fEfYH`.
+The existing runner creates its own PostgreSQL cluster on an unoccupied
+port, with separate `review_app` and `review_e2e` databases. Both explicit
+test DSNs point only to that cluster. Each database applied all 55
+migrations, then skipped all 55 on its idempotent rerun.
+
+Verification uses `GOMAXPROCS=2`, `GOPROXY=off`, `GOFLAGS=-mod=readonly`
+and serial package execution:
+
+| Check | Result |
+|---|---|
+| `go build ./...` | Passed; `build.log` |
+| `go vet ./internal/... ./cmd/...` | Passed; `vet.log` |
+| `go test -race -count=1 -p 1 -timeout=30m -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...` | Passed: 4,442 tests/subtests, 34 packages, zero failures; `tests.jsonl` |
+| `go tool cover -func=...` and 80% floor | Passed: 80.6% total statement coverage; `coverage.out`, `coverage-summary.log` |
+| `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...` | Passed: 186 tests/subtests, zero failures, 189.043s; `e2e.jsonl` |
+| Owned PostgreSQL cleanup | Passed: `cleanup.log` confirms server stopped; runner exited 0 |
+
+The three full-race skips are expected: parent invocation of the
+child-only `TestQuotaWorkerProcess`, plus opt-in
+`TestLoadDrill_Throughput` and `TestLoadDrill_LongConnections`.
+There are no database-unavailable skips. The re-executed worker children
+actually ran, including all six cross-process rate/concurrency modes.
+The 30-minute package timeout only changes the test runner budget, not
+assertions or individual test deadlines.
+
+E2E has one expected skip: `TestUsageTokenAcceptance_TenPagesTwoMinutes`
+requires the opt-in `USAGE_ACCEPTANCE=1` load scenario. No database
+acceptance skipped. All four skips across the two suites are explicit
+child-entry or opt-in cases, not hidden failures.
+
+The original #12 findings are committed as `5f74ee8` (1/2, including
+migration 055) and `1bec4c4` (3/4/5). This race run passes their key
+regressions: old admission/recent settlement still rejects 90+20 against
+TPM 100; equal-money estimated-to-reported corrections update usage and
+TPM without zero-value financial entries; unrepresentable tool history
+is explicitly rejected; explicit reasoning effort has consistent
+precedence; `/chat` retains known Retry-After and omits unknown recovery.
+The E2E `TestChatFacade_RateRetryAfter` also passed the complete HTTP
+known-recovery/unknown-recovery path.
+
+Independent bounded reviews by Noether and Tesla, including the Task
+10/11 increments at `814d120`, report no confirmed unresolved important
+defects in their respective reviewed scopes. These were read-only
+reviews, not independent executions of this full gate.
+
+Requirement audit retains the genuine original-plan gap in section
+1.1.6 item 1: wallet post-settlement correction is explicitly rejected,
+and the evidence-driven production correction trigger is not wired.
+The named follow-up `inference-correction-trigger-and-wallet` remains
+open; this checkpoint does not claim the entire original T4 delivered.
+Cross-host, real-provider/client acceptance, Go 1.25 CI parity and the
+documented raw Chat passthrough boundary remain unverified or unchanged.
+
+Documentation changes are limited to this runbook, the original plan's
+actual migration/interface inventory and the convergence plan's current
+verification status. No business code, production configuration, adjacent
+repository, remote Git state or kaya process is changed.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module
@@ -6154,8 +6219,9 @@ No push, merge, deployment or kaya process operation.
 - **Cross-process rate-path acceptance is now covered; cross-host is not.**
   Section 4.70 adds two real worker processes and independent pools for
   account/policy/Key RPM, account TPM and account/Key concurrency. The full
-  PostgreSQL race suite passed. This does not refresh the whole-branch
-  race/coverage or E2E gates, nor prove cross-host/provider/client behavior.
+  PostgreSQL race suite passed; section 4.71 also refreshes the whole-branch
+  race/coverage and E2E gates successfully. Neither proves
+  cross-host/provider/client behavior.
 - **The wallet's post-settlement correction is still unwired — a real
   remaining limitation, not a plan exclusion.** The persistent rate
   reservation *is* settled/released on the wallet terminal and recovery

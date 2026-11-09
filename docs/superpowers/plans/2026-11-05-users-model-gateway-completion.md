@@ -292,8 +292,10 @@ type KeyPatch struct { /* … */ ConcurrencyLimit *int; ClearConcurrency bool }
 // internal/inference/gateway/service.go —— 按**列表**收尾（上游 + 账户 + Key）
 func (s *Service) releaseAdmission(requestID string, leases []*domain.ConcurrencyLease)
 func (s *Service) releaseRequestLeases(ctx context.Context, leases []*domain.ConcurrencyLease)
-func leaseIDSet(leases []*domain.ConcurrencyLease) map[string]struct{} // 按租约 ID 拆分，不按锁的数量
 ```
+
+非流式派发与流式派发一样，在 finalization 完成前持续续租全部租约；
+成功、超时与 panic 都用独立的新清理预算停止 keeper，不提前释放上游租约。
 
 **租约作用域与收尾（不变式）**：`inference_concurrency_leases.scope` 取
 `billing_account`（账户）/ `api_key`（客户 Key）/ `upstream_account`（上游账号）；
@@ -353,7 +355,10 @@ func (s *Service) withKeyBudgetBlock(ctx context.Context, uow domain.UnitOfWork,
 
 // internal/service/errors.go —— /chat 的本地限制哨兵（保留既有 envelope）
 var ErrChatRequestLimited = errors.New("chat request rejected by a usage limit")
-type ChatLimitError struct{ Code string } // rate_limited / insufficient_capacity / quota_exceeded / insufficient_balance
+type ChatLimitError struct {
+    Code string // rate_limited / insufficient_capacity / quota_exceeded / insufficient_balance
+    RetryAfterSeconds int // 正值为已知速率恢复时间；非正值不输出 Retry-After
+}
 func (e *ChatLimitError) Error() string
 func (e *ChatLimitError) Unwrap() []error // {ErrChatRequestLimited, ErrChatRateLimited}：准确语义 + 既有 429 退避路径不变
 ```
@@ -440,6 +445,7 @@ T7 §4.25–4.31 与 §4.42、T8 §4.32–4.39、T9 §4.40–4.50、T10 §4.51�
 | `052_inference_rate_reservations.sql` | **`inference_rate_reservations`**（新表） | 账户/Key 级 RPM 计数 + 账户级 TPM 预占/结算；`scope ∈ {account,key}`、`UNIQUE(request_id, scope)`、`state ∈ {reserved,settled,released}` |
 | `053_inference_route_pool_strategy_comments.sql` | 仅列注释 | `pool_strategy` / `weight` / `overage_policy` 的语义注释（无 DDL） |
 | `054_inference_rate_reservation_anomaly_state.sql` | `inference_rate_reservations.state` 词表扩容 + `anomaly_at` / `anomaly_reason` | 人工停放的账务异常的**速率预占处置**：`state ∈ {reserved,settled,released,anomaly}`。`anomaly` = 该请求因账务异常被停放、其 TPM 预占已离开在途额度（但**不是**"确认零消费"、**不是**"已知用量"）：异常证据留在行上与核对任务里，RPM 计数事实保留，金额预占不动 |
+| `055_inference_usage_corrections.sql` | **`inference_usage_corrections`**（新表） | 金额与纯计量更正共用幂等回执，记录用量 revision、绝对金额/token 总量、原因与操作者；金额不变时更新 usage/TPM，不制造零额财务分录。使用新更正代码前须应用此迁移 |
 
 既有表被复用的关键列：`inference_requests.{status,usage_status,settled_micros,expected_hold_micros,charge_source}`、
 `inference_attempts.{status,error_kind,cost_micros,cost_basis}`、
@@ -519,8 +525,10 @@ Token Plan 商品/权益与统一商品发布、真实渠道退款与改签、�
    每组 16 次请求恰好 3 次放行、13 次按对应错误码拒绝，并核对请求、金额预占、
    速率预占、租约及分录无半提交。账户级场景使用不同 Key，Key 级场景共享 Key。
    完整 PostgreSQL race 已通过（213 tests/subtests，包覆盖率 77.5%），
-   证据见 runbook §4.70。全仓 race/覆盖率与 E2E 仍需刷新；本项不声称跨主机、
-   真实供应商或客户端验收完成。
+   证据见 runbook §4.70。全仓验收已在 §4.71 刷新通过：race 4,442 tests/subtests、
+   E2E 186 tests/subtests，总覆盖率 80.6%；四个预期跳过均为子进程入口或显式
+   opt-in 用例，无数据库不可用跳过。本项不声称跨主机、真实供应商或客户端
+   验收完成。
 
 ## 2. 一次性 PostgreSQL 操作参考
 

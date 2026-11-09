@@ -66,8 +66,8 @@ in `internal/inference/providers`.
 ## Task 4: Independent Review And Delivery
 
 - [x] Evaluate read-only accounting and gateway reviewer findings.
-- [ ] Fix confirmed important defects with RED/GREEN tests.
-- [ ] Review the resulting branch independently, including the focus list.
+- [x] Fix confirmed important defects with RED/GREEN tests.
+- [x] Review the resulting branch independently, including the focus list.
 - [x] Run build, vet, full race coverage and E2E with disposable databases.
 - [x] Record evidence, file manifest, compatibility costs and remaining risks.
 - [ ] Commit the final converged review locally, without push, merge or deployment.
@@ -169,7 +169,7 @@ rejection regression now checks the actual `held` lease state.
 - [x] Assert exactly three admissions across both processes, typed
   rejections, and no partial request, monetary, rate or lease effects.
 - [x] Run PostgreSQL race tests.
-- [ ] Include the cases in a fresh whole-branch race/coverage and E2E gate.
+- [x] Include the cases in a fresh whole-branch race/coverage and E2E gate.
 
 Commit checkpoint: focused race `run.MhRoxm` passed 8 tests/subtests;
 full PostgreSQL race `run.16SlWX` passed 213 (24.805s), with package
@@ -180,6 +180,27 @@ reported distinct PIDs. Each of the six rate/concurrency modes admitted
 reservations include all four targets (three windows plus Key budget).
 Both owned disposable PostgreSQL clusters stopped normally. This closes
 the cross-process evidence gap, not cross-host or whole-branch acceptance.
+
+### Current Verification Checkpoint
+
+At `814d120`, Noether and Tesla's bounded independent reviews, including
+Task 10/11 increments, report no confirmed unresolved important defects
+in their respective scopes. They did not independently execute the
+whole-branch gate.
+
+Fresh `run.3fEfYH` passed build, vet and full race: 4,442 tests/subtests,
+34 packages, zero failures, 80.6% total statement coverage. Its three
+skips are the expected child-entry and opt-in load drills; no database
+acceptance skipped. E2E passed 186 tests/subtests (189.043s), with one
+expected `USAGE_ACCEPTANCE=1` opt-in skip. Both databases applied 55
+migrations and skipped all 55 on rerun. Cleanup confirmed the owned
+PostgreSQL server stopped; the runner exited 0. See runbook 4.71.
+
+Original-plan section 1.1.6 item 1 remains a genuine unfulfilled
+requirement: wallet settlement correction and the production evidence
+trigger are not delivered. The named follow-up remains open, not a
+plan exclusion. This commit checkpoint is not a claim that the full
+original T4 or real-provider/client acceptance is complete.
 
 ## Execution Notes
 

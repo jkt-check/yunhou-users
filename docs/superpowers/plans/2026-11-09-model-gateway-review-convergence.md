@@ -360,6 +360,45 @@ commit checkpoint, not a claim that the wider review or the original
 wallet-correction/production-trigger requirement is complete. No push,
 merge, deployment, adjacent repository edit or kaya process operation.
 
+## Task 15: Correction Validation Before SQL Effects
+
+**Files:** `postgres/reconciliation_repo.go`, correction validation regressions
+and verification runbook.
+
+- [x] Reproduce empty/malformed attempt identities and negative reasoning
+  evidence reaching SQL constraints instead of safe input rejection.
+- [x] Reproduce a negative declared total with unknown normalized buckets.
+- [ ] Reject invalid correction evidence before usage, receipt or financial
+  writes; reuse the shared normalized-token validator.
+- [ ] Inspect the open transaction after rejection, then apply a valid
+  estimated-to-reported correction with the same transaction and key.
+- [ ] Preserve reasoning-only unknown totals and exact-Max valid totals.
+- [ ] Run focused and full race/coverage/E2E on owned disposable databases.
+
+Ruling: extend the existing correction evidence boundary, not the wallet
+product contract. Validation must not defer to a database error that aborts
+the caller's transaction. Invalid evidence remains `invalid_input`; unknown
+totals retain their previous TPM value. Wallet correction and its production
+trigger remain genuine unfinished original requirements.
+
+RED commit checkpoint: the latest user `commit` request checkpoints the new
+regression and this plan only; no production fix is included. Fresh focused
+race run `run.s5nzpC` exited 1 on 2026-11-10 (Asia/Shanghai). All five leaf
+cases failed with PostgreSQL `25P02` when inspecting the still-open
+transaction after rejection; no tests skipped. The valid same-transaction
+retry remains unverified because the transaction has already been aborted.
+Task 15 remains open.
+
+Evidence:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.s5nzpC/focused.jsonl`.
+Command: `go test -race -count=1 -p 1 -json ./internal/inference/postgres -run '^TestCorrectSettlement_RejectsInvalidEvidenceBeforeWriting$' -timeout=5m`.
+Both owned disposable databases applied all 55 migrations and skipped them
+on rerun; `cleanup.log` confirms the owned PostgreSQL server stopped.
+Formatting and diff whitespace checks passed. Full race, E2E and coverage
+were not rerun for this intentionally failing reproduction checkpoint;
+the previous 80.6% coverage does not describe the current tree.
+No push, merge, deployment, adjacent repository edit or kaya operation.
+
 ### Previous Verification Checkpoint
 
 At `814d120`, Noether and Tesla's bounded independent reviews, including

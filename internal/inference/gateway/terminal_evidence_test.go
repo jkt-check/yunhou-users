@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,7 @@ type terminalObservation struct {
 	RawUsageSchemaVersion int                        `json:"raw_usage_schema_version"`
 	RawUsage              json.RawMessage            `json:"raw_usage"`
 	RawUsageText          *string                    `json:"raw_usage_text"`
+	RawUsageBase64        []byte                     `json:"raw_usage_base64"`
 	Price                 terminalEvidencePriceTest  `json:"price"`
 	Charge                terminalEvidenceChargeTest `json:"charge"`
 }
@@ -188,14 +190,17 @@ func TestGateway_TerminalEvidenceRetainsDistinctNormalizedObservations(t *testin
 
 func TestGateway_TerminalEvidenceRetainsNullableAndMalformedUsage(t *testing.T) {
 	for _, raw := range []struct {
-		name  string
-		value json.RawMessage
+		name   string
+		value  json.RawMessage
+		binary bool
 	}{
-		{"absent", nil},
-		{"malformed", json.RawMessage(`{"schema_version":1,"usage":`)},
-		{"nul_escape", json.RawMessage(`{"schema_version":1,"usage":{"value":"\u0000"}}`)},
-		{"numeric_overflow", json.RawMessage(`{"schema_version":1,"usage":{"value":1e1000000}}`)},
-		{"lone_surrogate", json.RawMessage(`{"schema_version":1,"usage":{"value":"\ud800"}}`)},
+		{"absent", nil, false},
+		{"malformed", json.RawMessage(`{"schema_version":1,"usage":`), false},
+		{"nul_escape", json.RawMessage(`{"schema_version":1,"usage":{"value":"\u0000"}}`), false},
+		{"numeric_overflow", json.RawMessage(`{"schema_version":1,"usage":{"value":1e1000000}}`), false},
+		{"lone_surrogate", json.RawMessage(`{"schema_version":1,"usage":{"value":"\ud800"}}`), false},
+		{"invalid_utf8", json.RawMessage("{\"schema_version\":1,\"usage\":{\"value\":\"\xff\"}}"), true},
+		{"literal_nul", json.RawMessage("{\"schema_version\":1,\"usage\":\"\x00\"}"), true},
 	} {
 		t.Run(raw.name, func(t *testing.T) {
 			f := newFixture(t, newUpstream(t, nonStreamUsage(10, 5)), withZeroPrice())
@@ -227,7 +232,11 @@ func TestGateway_TerminalEvidenceRetainsNullableAndMalformedUsage(t *testing.T) 
 				if len(observation.RawUsage) != 0 && string(observation.RawUsage) != "null" {
 					t.Errorf("unexpected raw JSON = %s", observation.RawUsage)
 				}
-				if len(raw.value) > 0 {
+				if raw.binary {
+					if observation.RawUsageText != nil || !bytes.Equal(observation.RawUsageBase64, raw.value) {
+						t.Errorf("nontext raw evidence lost: %+v", observation)
+					}
+				} else if len(raw.value) > 0 {
 					if observation.RawUsageText == nil || *observation.RawUsageText != string(raw.value) {
 						t.Errorf("nonrepresentable raw evidence lost: %+v", observation)
 					}
@@ -239,6 +248,74 @@ func TestGateway_TerminalEvidenceRetainsNullableAndMalformedUsage(t *testing.T) 
 			loadTerminalEvidence(t, f, out.RequestID, 1)
 			if after := terminalFinalizerSnapshot(t, f, out.RequestID); after != before {
 				t.Error("nullable/malformed evidence changed authoritative facts")
+			}
+		})
+	}
+}
+
+func TestGateway_ReleasedEvidenceRetainsJSONBIncompatibleUsage(t *testing.T) {
+	for _, raw := range []string{
+		`{"schema_version":1,"usage":{"value":"\u0000"}}`,
+		`{"schema_version":1,"usage":{"value":1e1000000}}`,
+		`{"schema_version":1,"usage":{"value":"\ud800"}}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			f := newFixture(t, newUpstream(t, nonStreamUsage(10, 5)))
+			var attemptID string
+			f.gateway.store = &nonstreamFinalizationStore{
+				Store: f.store,
+				beforeFinish: func(ctx context.Context, id string) {
+					attemptID = id
+					var requestID string
+					if err := f.db.GetContext(ctx, &requestID,
+						`SELECT request_id FROM inference_attempts WHERE id=$1`, id); err != nil {
+						t.Fatal(err)
+					}
+					tx, err := f.store.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer tx.Rollback(ctx)
+					if err := f.store.Release(ctx, tx, requestID); err != nil {
+						t.Fatal(err)
+					}
+					if err := tx.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+				},
+			}
+			p, key := f.principal()
+			out, err := f.gateway.ChatCompletions(context.Background(), p, key,
+				domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			loadTerminalEvidence(t, f, out.RequestID, 1)
+			before := terminalFinalizerSnapshot(t, f, out.RequestID)
+			delivery := domain.UsageRecord{
+				RequestID: out.RequestID, AttemptID: attemptID, Source: domain.UsageReported,
+				Buckets:  domain.UsageBuckets{InputTokens: int64Ptr(10), OutputTokens: int64Ptr(5)},
+				RawUsage: domain.ExtensionConfig{SchemaVersion: 1, Raw: json.RawMessage(raw)},
+			}
+			for i := 0; i < 2; i++ {
+				f.replaySettlement(t, delivery)
+				observations := loadTerminalEvidence(t, f, out.RequestID, 2)
+				found := false
+				for _, observation := range observations {
+					if observation.RawUsageText != nil && *observation.RawUsageText == raw {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("released raw evidence lost: %+v", observations)
+				}
+			}
+			reason, status, found := f.reconciliationJob(t, out.RequestID)
+			if !found || reason != "late_usage_after_release" || status != "pending" {
+				t.Errorf("job = %t/%s/%s", found, reason, status)
+			}
+			if after := terminalFinalizerSnapshot(t, f, out.RequestID); after != before {
+				t.Error("late evidence changed terminal accounting")
 			}
 		})
 	}

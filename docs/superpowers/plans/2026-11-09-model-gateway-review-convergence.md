@@ -515,6 +515,89 @@ commands and remaining scope. Task 16 is verified for this local commit
 checkpoint; the broader review and original wallet-correction/production
 trigger requirements remain unfinished.
 
+## Task 17: Settlement Replay Evidence Equality
+
+**Files:** `postgres/ledger_repo.go`, new
+`postgres/settlement_replay_evidence_test.go`, gateway replay regressions,
+and the verification runbook.
+
+**Interfaces:** preserve `usageFactConsistent(ctx, tx, usage) (bool, error)`.
+An exact replay must match source and semantic JSON as well as all nullable
+token buckets and the attempt revision. Empty raw documents canonicalize to
+`{"schema_version":1}`, matching insertion; revision 0 remains revision 1.
+
+- [x] Reproduce source-only and raw-only changes being absorbed as duplicates,
+  on plan/wallet and zero/positive amounts.
+- [x] Preserve exact replays, JSON key-order/whitespace/numeric equivalence,
+  and implicit/explicit default raw documents; inspect unchanged accounting
+  inside the open replay transaction.
+- [ ] Compare stored source and JSONB equality without changing financial,
+  rate, request or usage state; keep storage failures loud.
+- [ ] Verify the gateway alarms and queues mismatching evidence, but absorbs
+  actual exact replays (including their original raw evidence).
+- [ ] Run focused race and the full disposable-database verification gate.
+
+Ruling: metering source and provider evidence are part of the persisted
+usage fact, not just the token total. A late reported delivery that agrees
+with an estimate's amount and buckets is still different evidence and must
+reach the existing reconciliation path, not be silently discarded. This
+does not implement the still-missing production correction channel.
+
+RED commit checkpoint (2026-11-10): the latest user request checkpoints the
+new repository regression and this plan without a production fix. Fresh
+focused race run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.3toLXZ/focused.jsonl`
+exited 1: 20 of 36 leaf cases reproduced source/raw changes being returned
+as duplicate instead of charge_mismatch, for both revisions 0 and 1.
+The 16 exact/semantic/default replay controls passed; no open-transaction
+accounting snapshot assertion failed. Including parent suites, there were
+27 failed and 16 passed test/subtest events, with no skips.
+
+The runner used its own disposable PostgreSQL cluster on loopback port
+55491 with explicit review_app/review_e2e DSNs. Both databases applied all
+55 migrations and skipped all 55 on rerun; cleanup.log confirms the owned
+server stopped. No kaya process was operated on. Formatting and diff
+checks passed. Full race/coverage and E2E were not rerun for this RED-only
+checkpoint; prior green coverage does not describe this tree. The
+production fix, gateway regression and remaining Task 17 work stay open.
+
+## Task 18: Late Dispatch Markers Preserve Terminal State
+
+**Files:** `postgres/request_repo.go`, new
+`postgres/request_terminal_marker_test.go`,
+`gateway/terminal_marker_test.go`, and the verification runbook.
+
+**Interfaces:** retain `UpdateRequestStatus` for dispatch markers and its
+not-found behavior. Transactional settlement/release keep owning terminal
+transitions; a late marker against settled/released is a successful no-op.
+
+- [ ] Reproduce dispatching/streaming/non_streaming overwriting settled or
+  released requests, including plan/wallet and zero-priced settlement.
+- [ ] Reproduce a real nonstream finalizer resuming after another transaction
+  has settled or released the request; assert typed duplicate, mismatch or
+  released handling rather than missing_reservation.
+- [ ] Guard only the public dispatch-marker path atomically; preserve the
+  transactional release helper and existing nonterminal marker behavior.
+- [ ] Preserve terminal status, timestamps, usage, charge, money holds and
+  original TPM settlement time; no double charge or additional usage.
+- [ ] Run focused race, independent review and full race/coverage plus E2E
+  against owned disposable databases.
+
+## Pending Review Findings (2026-11-10)
+
+These are reviewer findings to verify, not completed fixes or waived scope:
+
+- Existing quota windows may retain the previous policy limit after upgrade.
+- OAuth health scans may repeatedly select the first batch and starve later
+  active/cooldown accounts.
+- Responses stream output with a tool followed by text may be persisted even
+  though the saved chain cannot be faithfully replayed.
+- Responses explicit `reasoning.effort=none` may lose its disable intent on
+  OpenAI Chat egress.
+- Responses usage may omit Anthropic cache-write tokens from input/total.
+- The original wallet-correction and production evidence-to-correction
+  requirements remain incomplete and need their own implementation audit.
+
 ### Previous Verification Checkpoint
 
 At `814d120`, Noether and Tesla's bounded independent reviews, including

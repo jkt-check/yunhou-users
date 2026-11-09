@@ -66,6 +66,41 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 		&apiKeyID, &win5h, &winW, &winM); err != nil {
 		return mapError("settle: lock request", err)
 	}
+	// Validate evidence before writes or duplicate classification. Separate
+	// request/attempt foreign keys do not enforce that both identify this request.
+	if cmd.Usage.RequestID != cmd.RequestID {
+		return domain.NewError(domain.CodeInvalidInput,
+			"settle: usage does not belong to the request")
+	}
+	usageAttemptID, err := uuid.Parse(cmd.Usage.AttemptID)
+	if err != nil {
+		return domain.WrapError(domain.CodeInvalidInput, "settle: invalid usage attempt ID", err)
+	}
+	cmd.Usage.AttemptID = usageAttemptID.String()
+	attemptIDs := []string{cmd.Usage.AttemptID}
+	if cmd.AttemptID != nil {
+		costAttemptID, err := uuid.Parse(*cmd.AttemptID)
+		if err != nil {
+			return domain.WrapError(domain.CodeInvalidInput, "settle: invalid cost attempt ID", err)
+		}
+		id := costAttemptID.String()
+		cmd.AttemptID = &id
+		if id != cmd.Usage.AttemptID {
+			attemptIDs = append(attemptIDs, id)
+		}
+	}
+	for _, attemptID := range attemptIDs {
+		var ownsAttempt bool
+		if err := tx.QueryRowxContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM inference_attempts WHERE id = $1 AND request_id = $2)`,
+			attemptID, cmd.RequestID).Scan(&ownsAttempt); err != nil {
+			return mapError("settle: attempt ownership", err)
+		}
+		if !ownsAttempt {
+			return domain.NewError(domain.CodeInvalidInput,
+				"settle: the attempt does not belong to the request")
+		}
+	}
 	reqStatus := domain.RequestStatus(status)
 	req := &domain.Request{
 		ID: cmd.RequestID, APIKeyID: strFromNull(apiKeyID),

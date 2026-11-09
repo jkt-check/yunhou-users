@@ -595,19 +595,19 @@ func TestRateSettle_DuplicateSettlementDoesNotDoubleCountTheTokens(t *testing.T)
 		t.Fatalf("admit: %v", err)
 	}
 	settleRequest(t, s, requestID, domain.UsageReported, 10, 10)
+	usage, err := s.LoadUsageRecords(ctx, requestID)
+	if err != nil || len(usage) != 1 {
+		t.Fatalf("settled usage = %+v, err = %v; want one record", usage, err)
+	}
 
 	// 第二次结算：同一请求 → 已终态的冲突（typed），不得双记 token。
 	uow, err := s.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, out := int64(10), int64(10)
 	err = s.Settle(ctx, uow, domain.SettleCommand{
-		RequestID: requestID,
-		Usage: domain.UsageRecord{
-			RequestID: requestID, AttemptID: uuid.NewString(), Source: domain.UsageReported,
-			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
-		},
+		RequestID:    requestID,
+		Usage:        usage[0],
 		ChargeMicros: 1_000, SettledAt: time.Now().UTC(),
 	})
 	_ = uow.Rollback(ctx)

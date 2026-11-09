@@ -13,7 +13,10 @@ import (
 func TestSettle_RejectsForeignEvidenceBeforeWriting(t *testing.T) {
 	for _, source := range []string{"plan", "wallet"} {
 		t.Run(source, func(t *testing.T) {
-			for _, mismatch := range []string{"usage_request", "usage_attempt", "missing_usage_attempt", "cost_attempt", "missing_cost_attempt"} {
+			for _, mismatch := range []string{
+				"usage_request", "usage_attempt", "missing_usage_attempt", "empty_usage_attempt", "malformed_usage_attempt",
+				"cost_attempt", "missing_cost_attempt", "empty_cost_attempt", "malformed_cost_attempt",
+			} {
 				t.Run(mismatch, func(t *testing.T) {
 					_, s := testDB(t)
 					ctx := context.Background()
@@ -53,7 +56,12 @@ func TestSettle_RejectsForeignEvidenceBeforeWriting(t *testing.T) {
 					}
 					cost, _ := domain.NewMoney(13, "USD")
 					basis := domain.CostReported
-					valid.AttemptID, valid.AttemptCost, valid.CostBasis = &attemptID, &cost, &basis
+					costAttemptID := uuid.NewString()
+					if err := s.InsertAttempt(ctx, &domain.Attempt{ID: costAttemptID, RequestID: requestID, AttemptNo: 2}); err != nil {
+						t.Fatal(err)
+					}
+					// Cost and usage may refer to different attempts of the same request.
+					valid.AttemptID, valid.AttemptCost, valid.CostBasis = &costAttemptID, &cost, &basis
 					invalid := valid
 					missingID := uuid.NewString()
 					switch mismatch {
@@ -64,10 +72,20 @@ func TestSettle_RejectsForeignEvidenceBeforeWriting(t *testing.T) {
 						invalid.Usage.AttemptID = otherAttemptID
 					case "missing_usage_attempt":
 						invalid.Usage.AttemptID = missingID
+					case "empty_usage_attempt":
+						invalid.Usage.AttemptID = ""
+					case "malformed_usage_attempt":
+						invalid.Usage.AttemptID = "not-a-uuid"
 					case "cost_attempt":
 						invalid.AttemptID = &otherAttemptID
 					case "missing_cost_attempt":
 						invalid.AttemptID = &missingID
+					case "empty_cost_attempt":
+						emptyID := ""
+						invalid.AttemptID = &emptyID
+					case "malformed_cost_attempt":
+						malformedID := "not-a-uuid"
+						invalid.AttemptID = &malformedID
 					}
 
 					uow, err := s.Begin(ctx)
@@ -99,6 +117,14 @@ func TestSettle_RejectsForeignEvidenceBeforeWriting(t *testing.T) {
 					}
 					if err := uow.Commit(ctx); err != nil {
 						t.Fatal(err)
+					}
+					if err := s.db.QueryRowxContext(ctx,
+						`SELECT cost_micros, cost_basis FROM inference_attempts WHERE id=$1`, costAttemptID).
+						Scan(&storedCost, &storedBasis); err != nil {
+						t.Fatal(err)
+					}
+					if storedCost != 13 || storedBasis != "reported" {
+						t.Errorf("own attempt cost = %d/%s, want 13/reported", storedCost, storedBasis)
 					}
 					usage, err := s.LoadUsageRecords(ctx, requestID)
 					if err != nil || len(usage) != 1 || usage[0].AttemptID != attemptID {

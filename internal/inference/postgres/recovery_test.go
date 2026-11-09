@@ -76,14 +76,15 @@ func TestZeroChargeSettleAppendsChargeRow(t *testing.T) {
 	if req.Status != domain.ReqSettled || req.SettledMicros == nil || *req.SettledMicros != 0 {
 		t.Errorf("request = %s/%v, want settled/0", req.Status, req.SettledMicros)
 	}
+	usage, err := s.LoadUsageRecords(ctx, reqID)
+	if err != nil || len(usage) != 1 {
+		t.Fatalf("settled usage = %+v, err = %v; want one record", usage, err)
+	}
 	// 重复投递：唯一键撞 CodeConflict，账本仍只有一条 charge。
 	uow, _ := s.Begin(ctx)
 	err = s.Settle(ctx, uow, domain.SettleCommand{
-		RequestID: reqID,
-		Usage: domain.UsageRecord{
-			RequestID: reqID, AttemptID: uuid.NewString(), Source: domain.UsageReported,
-			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(0)), OutputTokens: ptr(int64(0))},
-		},
+		RequestID:    reqID,
+		Usage:        usage[0],
 		ChargeMicros: 0, SettledAt: time.Now().UTC(),
 	})
 	_ = uow.Rollback(ctx)

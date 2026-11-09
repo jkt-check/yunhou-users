@@ -226,13 +226,13 @@ verification runbook.
 
 - [x] Reproduce usage booked against another request, a foreign usage
   attempt, and a foreign cost attempt on both plan and wallet settlement.
-- [ ] Reject mismatched or missing attempt identities before any write,
+- [x] Reject mismatched or missing attempt identities before any write,
   including when classifying a duplicate delivery.
-- [ ] Inspect the still-open transaction for unchanged usage, ledger,
+- [x] Inspect the still-open transaction for unchanged usage, ledger,
   monetary holds, rate reservations, window/Key aggregates and attempt cost.
-- [ ] Retry the valid command on the same transaction and verify a single
+- [x] Retry the valid command on the same transaction and verify a single
   settlement; preserve valid duplicate classification.
-- [ ] Run focused regressions, whole-branch race/coverage and E2E on owned
+- [x] Run focused regressions, whole-branch race/coverage and E2E on owned
   disposable PostgreSQL; obtain an independent read-only review.
 
 Ruling: this enforces the existing request/attempt accounting boundary;
@@ -246,8 +246,41 @@ and changed accounting state; a missing usage attempt aborted the transaction
 instead of leaving it usable for a valid retry. Evidence:
 `/private/tmp/yunhou-review-20261109.3NuMWy/run.RYh2s8/focused.jsonl`.
 The runner used its own disposable PostgreSQL cluster and explicit test DSNs.
-This checkpoint contains regression tests and this plan only, not a production
-fix. Full race/coverage, E2E and independent review remain pending for Task 13.
+That RED checkpoint contains regression tests and this plan only, not a
+production fix.
+
+GREEN checkpoint: `Settle` now checks the usage request and both attempt
+identities before any write, wallet dispatch or duplicate classification.
+Empty/malformed attempt UUIDs are rejected before SQL, keeping the transaction
+usable for a valid retry. Distinct usage/cost attempts belonging to the same
+request remain supported.
+
+Fresh focused race `run.jvq0Tg` passed 21 tests/subtests, with no failures or
+skips (4.890s). It covers nine invalid-identity cases on both plan and wallet,
+inspects the open transaction before retry, verifies one valid settlement and
+retains typed duplicate classification.
+
+The first whole-branch attempt, `run.6Txzg7`, passed build/vet but failed
+the TPM and zero-charge duplicate tests: both fixtures used random,
+nonexistent attempts and now correctly received `invalid_input`. They
+now replay the persisted original usage without weakening their duplicate,
+single-charge or unchanged-TPM assertions. Focused `run.NfcvZF` passed all
+23 tests/subtests (7.258s), with no failures or skips. Completed runs' owned
+PostgreSQL servers stopped normally.
+
+Fresh `run.N9MTPk` exited 0 after all Go edits: build/vet passed; full
+race passed 4,470 tests/subtests across 34 packages, zero failures, with
+80.6% total statement coverage. E2E race passed 186 tests/subtests
+(236.625s), zero failures. The three full-race skips and one E2E skip
+were the explicit child-entry/opt-in scenarios; no database acceptance
+was skipped. Both owned databases applied 55 migrations and skipped all
+55 on rerun; cleanup confirmed the owned PostgreSQL server stopped.
+
+Euler's bounded read-only review and its follow-up on both duplicate
+fixtures found no confirmed Critical or Important defects. Nonblocking
+test gaps remain recorded in runbook 4.73. This is a local Task 13 commit
+checkpoint, not whole-repository convergence or delivery of the still-open
+wallet-correction/production-trigger requirements.
 
 ### Previous Verification Checkpoint
 

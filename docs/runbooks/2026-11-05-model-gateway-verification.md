@@ -6261,6 +6261,77 @@ Real-provider/client and cross-host acceptance remain unverified.
 No push, merge, deployment, adjacent-repository change or kaya process
 operation is part of this work.
 
+### 4.73 Initial Settlement Identity Checkpoint (2026-11-09)
+
+This local commit checkpoint follows the user's `commit` request and
+completes the already reproduced initial-settlement ownership fix from
+Task 13. It does not reopen the wider review or implement correction
+triggers or wallet corrections.
+
+**Changed files:**
+
+- `internal/inference/postgres/ledger_repo.go`: require usage to identify
+  the locked request; parse usage/cost attempt UUIDs before SQL and verify
+  both attempts belong to that request. Validation precedes writes,
+  plan/wallet dispatch and terminal duplicate classification. Distinct
+  usage/cost attempts from the same request remain valid.
+- `internal/inference/postgres/settlement_identity_test.go`: extend the
+  existing RED regressions with empty/malformed UUIDs on both funding
+  paths and distinct valid usage/cost attempts. Inspect the still-open
+  transaction before retry, preserve the foreign request and attempt,
+  verify one valid settlement, reject foreign duplicate evidence and
+  retain typed duplicate classification for valid evidence.
+- `internal/inference/postgres/inference_limit_test.go` and
+  `internal/inference/postgres/recovery_test.go`: replay persisted usage
+  in the TPM and zero-charge duplicate fixtures, rather than supplying
+  a random, nonexistent attempt. Preserve the typed duplicate/unchanged
+  TPM and single zero-charge assertions.
+- This runbook and the convergence plan: record evidence and boundaries.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.RYh2s8/focused.jsonl` | RED: all 10 original plan/wallet leaf cases failed; foreign evidence was accepted, while a missing usage attempt poisoned the transaction. |
+| `run.jvq0Tg/focused.jsonl` | GREEN: `go test -race -count=1 -p 1 -json ./internal/inference/postgres -run '^TestSettle_RejectsForeignEvidenceBeforeWriting$' -timeout=5m`; 21 tests/subtests, zero failures or skips, 4.890s. |
+| `run.6Txzg7/tests.jsonl` | Non-green whole-branch attempt: build/vet passed; 4,468 tests/subtests passed, but `TestRateSettle_DuplicateSettlementDoesNotDoubleCountTheTokens` and `TestZeroChargeSettleAppendsChargeRow` failed because their duplicate fixtures used nonexistent attempts. The runner exited 1 before the coverage summary and E2E. No production validation was relaxed. |
+| `run.NfcvZF/focused.jsonl` | GREEN after fixture corrections: identity, TPM duplicate and zero-charge duplicate race regressions; 23 tests/subtests, no failures or skips, 7.258s. |
+| `run.N9MTPk/tests.jsonl` | Fresh whole-branch GREEN after all Go edits: build/vet passed; `go test -race -count=1 -p 1 -timeout=30m -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...` passed 4,470 tests/subtests across 34 packages, zero failures. |
+| `run.N9MTPk/coverage-summary.log` | Total statement coverage 80.6%; the 80% floor passed. |
+| `run.N9MTPk/e2e.jsonl` | `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...` passed 186 tests/subtests, zero failures, 236.625s. The runner exited 0. |
+
+The GREEN run covers nine identity-error cases on each funding path.
+Both owned disposable databases applied all 55 migrations and skipped
+all 55 on rerun. Completed runs' cleanup logs confirm their owned
+PostgreSQL servers stopped, including the final `run.N9MTPk`.
+The full-race skips were `TestQuotaWorkerProcess` (child-process entry)
+and `TestLoadDrill_Throughput` / `TestLoadDrill_LongConnections`
+(`KAYA_LOAD=1` opt-in). E2E skipped only
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` (`USAGE_ACCEPTANCE=1`
+opt-in). No database acceptance was skipped.
+
+Euler's read-only review of the delta against `593946d` found no
+confirmed Critical or Important defects and checked gateway/recovery
+caller compatibility. Its follow-up review of both duplicate-fixture
+corrections also found no Critical or Important defects or relevant
+assertion weakening. It did not execute the verification gates.
+Two nonblocking test gaps remain: the usage-request mismatch also
+changes the usage attempt, and the pre-retry inspection does not
+independently assert the legitimate cost attempt is unchanged.
+The production checks precede both writes, but this checkpoint does
+not claim isolated regression coverage for those two assertions.
+The existing duplicate fixtures' rollback-before-state-check limitation
+is unchanged.
+
+**Scope rulings:** unchanged amount-only duplicate compatibility,
+standalone usage insertion and correction behavior remain separate
+review surfaces. The production correction-evidence trigger and wallet
+corrections are still open requirements. This patch has no migration
+or historical-data repair; real-provider/client and cross-host
+acceptance remain unverified. No push, merge, deployment, adjacent
+repository modification or kaya process operation is part of this work.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

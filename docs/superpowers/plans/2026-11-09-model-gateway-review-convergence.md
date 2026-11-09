@@ -705,12 +705,63 @@ retrying. See runbook 4.79 for that failure, the scoped cleanup and final
 evidence. This local implementation checkpoint does not resolve other
 review findings or the original wallet/production-trigger requirements.
 
+## Task 20: Fair Bounded Upstream Health Scans
+
+**Files:** `workers/upstream_health.go`, new
+`workers/upstream_health_scan_test.go`, `postgres/oauth_repo.go`,
+`postgres/oauth_operators_outbox_repo_test.go`, and the verification runbook.
+
+**Interfaces:** change `ListUpstreamAccountsForHealth` to
+`(ctx context.Context, cooldownDueBefore time.Time, afterAccountID string,
+limit int) ([]domain.UpstreamAccount, error)`. Empty cursor starts at the
+first eligible UUID; nonempty cursor returns only greater UUIDs.
+
+- [x] Reproduce batch 2 repeatedly skipping a third, due-cooldown account
+  behind two unchanged healthy/no-quota, static-skip or connector-error
+  accounts. After pass 2 the third account must be active; the prefix
+  status and updated_at must remain unchanged.
+- [x] Cover exact-page wrap, an ineligible tail and newly due lower UUIDs;
+  every pass visits at most its configured batch.
+- [x] Preserve unvisited accounts on cancellation and cursor progress
+  after a guarded probe panic; concurrent passes must not race or lose
+  the next page.
+- [x] Add the UUID predicate without changing eligibility. Keep per-worker
+  cursor state, serialize passes, advance before each attempted probe,
+  wrap once on an empty tail, and reset after a fully visited short page.
+  Normalize batch limits outside 1..500 to 100, matching the repository.
+- [x] Run focused worker race tests, full race/coverage and E2E on owned
+  disposable databases, record evidence and commit locally.
+
+Ruling: use per-worker keyset rotation, not updated_at ordering, offsets,
+or a timestamp write on every skipped/error account. Those alternatives
+either retain starvation paths, skip rows as eligibility changes, or
+change cooldown/status semantics. No migration or cross-instance probe
+ownership is added. Cost: a restart starts a new scan cycle; workers may
+probe the same account independently, and scan latency grows with the
+eligible population and per-account network timeout.
+
+RED evidence: pre-fix `run.5dgAaD` reproduced eight failing behavioral
+leaves, plus a panic fixture error that is not behavioral evidence.
+The corrected panic regression failed at the cursor-progress assertion
+in mutation run `run.M5fEje` when cursor advancement moved after probe.
+After restoring advance-before-probe, focused race `run.E23NcF` passed
+all 13 tests/subtests (1.851s), with no failures or skips. Each run used
+owned disposable PostgreSQL and stopped its owned server.
+
+Full gate `run.hqyAz0` exited 0: build/vet passed, full race passed 4,659
+tests/subtests across 34 packages with no failures, total statement
+coverage was 80.7%, and separate E2E race passed 186 tests/subtests
+(141.800s). Only the expected child-entry and opt-in drills skipped;
+no database acceptance skipped. Both owned databases applied all 55
+migrations and skipped all 55 on rerun. Cleanup confirmed the owned
+server stopped. See runbook 4.80 for the file manifest, commands,
+evidence and remaining scope. This is a local commit checkpoint,
+not a whole-branch until-clean review conclusion.
+
 ## Pending Review Findings (2026-11-10)
 
 These are reviewer findings to verify, not completed fixes or waived scope:
 
-- OAuth health scans may repeatedly select the first batch and starve later
-  active/cooldown accounts.
 - Responses stream output with a tool followed by text may be persisted even
   though the saved chain cannot be faithfully replayed.
 - Responses explicit `reasoning.effort=none` may lose its disable intent on

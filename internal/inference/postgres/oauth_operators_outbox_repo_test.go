@@ -289,7 +289,7 @@ func TestOAuthRepo_ExpiringScanAndStatusAndQuota(t *testing.T) {
 	}
 
 	// 健康扫描与账号列表（limit 钳制路径）。
-	if _, err := s.ListUpstreamAccountsForHealth(ctx, time.Now().UTC().Add(time.Hour), 10); err != nil {
+	if _, err := s.ListUpstreamAccountsForHealth(ctx, time.Now().UTC().Add(time.Hour), "", 10); err != nil {
 		t.Fatal(err)
 	}
 	list, err := s.ListUpstreamAccounts(ctx, provID, 10)

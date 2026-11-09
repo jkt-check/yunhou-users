@@ -6776,6 +6776,85 @@ This is not a whole-branch until-clean review conclusion. No push,
 merge, deployment, adjacent-repository edit or kaya process operation
 is included.
 
+### 4.80 Fair Bounded Upstream Health Scans (2026-11-10)
+
+This checkpoint addresses Task 20 only. It does not claim that the
+whole-branch review or the other pending findings are complete.
+
+**Changed files:**
+
+- `internal/inference/workers/upstream_health.go`: retain a per-worker
+  UUID cursor, serialize passes, advance before each attempted probe,
+  stop before unvisited rows on cancellation, and wrap an empty tail
+  once. Reset after a fully visited short page. Normalize batches
+  outside 1..500 to the repository default of 100.
+- `internal/inference/postgres/oauth_repo.go`: add the exclusive UUID
+  cursor without changing active/due-cooldown/refreshing eligibility.
+- `internal/inference/postgres/oauth_operators_outbox_repo_test.go`:
+  update the existing direct call to pass an empty initial cursor.
+- `internal/inference/workers/upstream_health_scan_test.go`: exercise
+  unchanged healthy/no-quota, static-skip and connector-error prefixes;
+  exact/short pages, deleted/ineligible tails, newly due lower UUIDs,
+  oversized batches, cancellation, guarded panic and concurrent passes.
+- The convergence plan and this runbook record evidence and scope.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.5dgAaD/focused.jsonl` | Pre-fix: eight failing behavioral leaves; two wrap controls passed. The additional panic-test failure was a fixture error, not behavioral RED evidence. |
+| `run.NeqLSY/focused.jsonl` | First post-fix run: all cases except the incorrect panic fixture passed. `runGuarded` deliberately returns nil after recovery. |
+| `run.M5fEje/focused.jsonl` | Corrected panic regression failed at the next-pass recovery assertion when cursor advancement was temporarily moved after probe. |
+| `run.E23NcF/focused.jsonl` | Restored advance-before-probe: 13 tests/subtests passed (1.851s), no failures or skips. |
+
+Focused command:
+`go test -race -count=1 -p 1 -json ./internal/inference/workers -run '^TestUpstreamHealthScan' -timeout=5m`.
+
+The regressions use the real repository and owned disposable PostgreSQL,
+with only the vendor HTTP boundary simulated. Cancellation and panic
+injection wrap the real credential read. Unchanged prefix accounts keep
+their original status and updated_at, while the later due account must
+be recovered. Every completed focused run's cleanup log confirms its
+owned PostgreSQL server stopped.
+
+**Full gate:** `run.hqyAz0` used fresh independent application/E2E
+databases on loopback port 55491 and exited 0:
+
+| Gate | Result |
+|---|---|
+| `go build ./...` | Passed; `build.log` is empty. |
+| `go vet ./internal/... ./cmd/...` | Passed; `vet.log` is empty. |
+| Full race (`tests.jsonl`) | 4,659 tests/subtests passed across 34 packages, no failures; all 13 new health-scan cases passed again. |
+| Statement coverage | 80.7% total; the 80% floor passed. |
+| E2E race (`e2e.jsonl`) | 186 tests/subtests passed (141.800s), no failures. |
+
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile="$RUN/coverage.out" -json ./internal/... ./cmd/... ./tests/integration/...`.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+
+The full-race skips are the child-only `TestQuotaWorkerProcess` entry
+and the two `KAYA_LOAD=1` load drills. E2E skips only
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` (`USAGE_ACCEPTANCE=1`).
+No database acceptance skipped. Both databases applied all 55 migrations
+and skipped all 55 on rerun. Dependencies stayed offline/read-only with
+`GOPROXY=off`, `GOFLAGS=-mod=readonly`; packages were serialized with
+`-p 1` and `GOMAXPROCS=2`. `cleanup.log` confirms the owned PostgreSQL
+server stopped; its `postmaster.pid` is absent. Formatting and diff
+checks passed. This is author self-review of the task diff, not a fresh
+independent whole-branch review.
+
+**Ruling and remaining scope:** use keyset rotation rather than offset
+pagination or timestamp writes. No migration, cooldown-semantic change
+or cross-instance probe ownership is added. Restarts reset the scan
+cycle; independent workers can duplicate probes, and full-cycle latency
+grows with eligible population and existing bounded vendor timeouts.
+Other Responses findings, wallet corrections and the production
+evidence-to-correction trigger remain unfinished. Real-provider/client
+and cross-host acceptance are unverified. No push, merge, deployment,
+adjacent-repository edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

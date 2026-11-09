@@ -219,6 +219,36 @@ unchanged wallet/production-trigger limitations remain documented.
 See runbook 4.72 for the manifest, exact evidence and scope boundaries.
 This is a local commit checkpoint, not whole-repository convergence.
 
+## Task 13: Initial Settlement Identity
+
+**Files:** `postgres/ledger_repo.go`, settlement identity regressions and
+verification runbook.
+
+- [x] Reproduce usage booked against another request, a foreign usage
+  attempt, and a foreign cost attempt on both plan and wallet settlement.
+- [ ] Reject mismatched or missing attempt identities before any write,
+  including when classifying a duplicate delivery.
+- [ ] Inspect the still-open transaction for unchanged usage, ledger,
+  monetary holds, rate reservations, window/Key aggregates and attempt cost.
+- [ ] Retry the valid command on the same transaction and verify a single
+  settlement; preserve valid duplicate classification.
+- [ ] Run focused regressions, whole-branch race/coverage and E2E on owned
+  disposable PostgreSQL; obtain an independent read-only review.
+
+Ruling: this enforces the existing request/attempt accounting boundary;
+it adds no correction trigger or wallet product policy. Standalone usage
+insertion is not itself a settlement and remains a separate review surface.
+
+RED checkpoint (2026-11-09): the focused race run of
+`TestSettle_RejectsForeignEvidenceBeforeWriting` failed all 10 leaf cases
+(plan/wallet, five identity mismatches each). Foreign evidence was accepted
+and changed accounting state; a missing usage attempt aborted the transaction
+instead of leaving it usable for a valid retry. Evidence:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.RYh2s8/focused.jsonl`.
+The runner used its own disposable PostgreSQL cluster and explicit test DSNs.
+This checkpoint contains regression tests and this plan only, not a production
+fix. Full race/coverage, E2E and independent review remain pending for Task 13.
+
 ### Previous Verification Checkpoint
 
 At `814d120`, Noether and Tesla's bounded independent reviews, including

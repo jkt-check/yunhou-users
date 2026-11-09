@@ -926,6 +926,46 @@ rerun and bounded review. This checkpoint does not complete the original
 wallet-correction/production-trigger scope or the until-clean review.
 No push, merge, deployment or kaya process operation is included.
 
+## Task 24: Preserve Rejected Responses Evidence And Validate Thinking
+
+**Files:** `providers/openai_responses.go`,
+`providers/openai_responses_stream.go`, focused provider regressions,
+`httpapi/chat_completions.go`, parser and authenticated HTTP regressions,
+API guide, OpenAPI, verification runbook and this plan.
+
+**Interfaces:** keep the existing nonnil metering result plus error contract
+for fully decoded executions. Refusals have no faithful internal Chat field,
+so reject explicitly rather than convert them into empty successful answers.
+Streaming rejection is sticky, but continues reading late metering evidence.
+
+- [x] Reproduce failed HTTP-200 Responses losing identity and usage 10/3.
+- [x] Reproduce nonstream refusals and streaming refusal delta/done, content
+  part, output item and terminal-only evidence becoming empty successes.
+- [ ] Retain reported usage or refusal bytes for estimation without counting
+  the same refusal again at each cumulative event; never serve success/DONE
+  or create a stored Responses chain after the rejection.
+- [ ] Reproduce unsupported/missing Chat thinking types becoming disabled,
+  then reject invalid types before admission, including with another knob.
+- [ ] Preserve valid enabled/disabled, omitted/null and valid boolean/effort
+  precedence; update the obsolete unknown-type acceptance regression.
+- [ ] Run actual RED/GREEN tests, providers/parser race, authenticated HTTP
+  race and fresh build/vet/full race/coverage/E2E on disposable databases.
+- [ ] Record evidence and remaining requirements, review and commit locally.
+
+Ruling: use the established explicit-rejection policy instead of adding a
+refusal field across every client surface and stored transcript. Cost:
+Responses refusal output returns a translation error rather than a native
+refusal answer. Failed nonstream responses retain metering without a success
+payload. Validate every supplied thinking object before precedence selection;
+valid booleans and explicit efforts retain their existing priority. Cost:
+previously ignored invalid objects now return 400 even with another knob.
+
+Tests-only checkpoint (2026-11-10): focused provider and parser race tests
+both exit 1, reproducing the findings. Valid thinking precedence controls
+pass. No production fix, database regression, full-suite coverage or E2E
+verification is included in this checkpoint; the remaining Task 24 steps
+are still open.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are
@@ -936,6 +976,12 @@ not waived scope:
 - Explicit reasoning disable is now retained on Chat and Messages egress,
   including Responses `reasoning.effort=none`; fixed and verified in Task 23.
 - Anthropic cache-write inclusion was fixed and verified in Task 21.
+- Failed nonstream Responses lose reported usage and response identity;
+  Task 24 must reproduce and fix this.
+- Responses refusals disappear on both decode paths, permitting an empty
+  success and an input-only replay chain; Task 24 must reproduce and fix it.
+- Unknown or missing Chat thinking types normalize to explicit disable;
+  Task 24 must reproduce and fix it without changing valid precedence.
 - The original wallet-correction and production evidence-to-correction
   requirements remain incomplete and need their own implementation audit.
 

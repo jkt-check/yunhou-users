@@ -53,6 +53,10 @@ type settlementCharge struct {
 // The command is already normalized and priced. Observations are evidence,
 // not authoritative usage revisions; delivery times must not defeat dedup.
 func newSettlementEvidence(cmd domain.SettleCommand, price accounting.PriceVersion, source domain.ChargeSource) (settlementEvidence, error) {
+	// AdmissionResult's zero value denotes the plan/quota path.
+	if source == "" {
+		source = domain.ChargeSourcePlan
+	}
 	u := cmd.Usage
 	observation := settlementObservation{
 		RequestID: cmd.RequestID, AttemptID: u.AttemptID, Source: u.Source,

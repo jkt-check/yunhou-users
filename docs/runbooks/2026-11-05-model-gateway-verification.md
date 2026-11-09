@@ -7194,6 +7194,98 @@ Wallet post-settlement correction and the production evidence caller
 remain genuinely unfinished original requirements. No push, merge,
 deployment, adjacent-source edit or kaya process operation is included.
 
+### 4.85 Task 25: Wallet Integer-boundary Admission And Balance Safety
+
+**Scope:** this local checkpoint addresses the reproduced wallet arithmetic
+defects only. It does not implement wallet settlement correction, its
+production evidence caller, or the separately recorded provider findings.
+
+**Changes and file manifest:**
+
+- `internal/inference/accounting/overage.go` compares settled spend, the
+  new hold and each in-flight source against remaining monthly allowance
+  without an overflowing intermediate sum.
+- `internal/inference/postgres/wallet_repo.go` passes held cash and bonus
+  separately to that gate under the existing account/wallet locks.
+- `internal/inference/accounting/wallet.go` avoids overflowing combined
+  availability in `SplitFreeze`, preserves bonus-first allocation and
+  honest deficits, and rejects unrepresentable derived source balances
+  with `CodeInternal` wrapping `ErrOverflow`. No money-unit conversion,
+  floating-point arithmetic, schema change or migration is involved.
+- `internal/inference/accounting/wallet_overflow_test.go` covers cap
+  overflow, exact-cap admission, positive balances above the combined
+  signed range, two extreme deficits, opposite-sign controls, availability
+  underflow and the representable minimum signed balance.
+- `internal/inference/postgres/wallet_overflow_test.go` reproduces a
+  `MaxInt64-5` settled charge followed by a 10-micro hold, and an over-hold
+  settlement plus existing in-flight hold. Both must reject with
+  `quota_exceeded` / `ErrSpendLimitExceeded`, leaving no request, wallet
+  hold, reservation or ledger entry even if the rejected transaction is
+  committed. Derived balances and monthly spend must remain unchanged.
+- The convergence plan and this runbook record evidence and remaining scope.
+
+**Focused RED/GREEN:** evidence lives under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+`run.F0bnUQ/focused.jsonl` fails the new boundary regressions against
+pre-fix production code, including both PostgreSQL cases. The corrected
+fixture pins input tokens to the charged amount at one micro per token;
+the RED run was repeated after that fixture correction and before the fix.
+`run.zpCDQD/focused.jsonl` passes all 20 tests/subtests across two packages,
+with no failures or skips. Command:
+
+```bash
+go test -race -count=1 -p 1 -json \
+  ./internal/inference/accounting ./internal/inference/postgres \
+  -run 'Test(CheckWalletSpend|SplitFreeze|DeriveWalletBalance)_IntegerBoundaries|TestWalletSpendLimit_IntegerOverflowRejectsAdmission'
+```
+
+The owned runner exports explicit app/E2E DSNs for separate disposable
+databases, uses `GOMAXPROCS=2`, `GOPROXY=off` and `GOFLAGS=-mod=readonly`,
+and applies all 55 migrations with an idempotent rerun. The focused GREEN
+run's `cleanup.log` confirms its owned PostgreSQL server stopped.
+**Full verification:** `run.Qp5T7t` exited 0 on 2026-11-10. It passed `go build ./...`
+and `go vet ./internal/... ./cmd/...`. The full race command passed 4,959
+tests/subtests across 34 packages with zero failures:
+
+```bash
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+```
+
+`go tool cover -func="$RUN/coverage.out"` reports 80.7% total statement
+coverage, above the 80% floor. The three full-suite skips are the
+child-process entry `TestQuotaWorkerProcess` and the two opt-in load
+drills; no database acceptance skipped. Both independent databases applied
+all 55 migrations, then skipped all 55 on rerun.
+
+Separate `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`
+passed 186 tests/subtests (147.238s), zero failures. Only the explicit
+opt-in `TestUsageTokenAcceptance_TenPagesTwoMinutes` skipped. The runner's
+`cleanup.log` confirms its owned PostgreSQL server stopped, and
+`data/postmaster.pid` is absent. Evidence is retained under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.Qp5T7t/`:
+`build.log`, `vet.log`, `tests.jsonl`, `coverage.out`,
+`coverage-summary.log`, `e2e.jsonl`, both migration logs and `cleanup.log`.
+Formatting and diff whitespace checks passed.
+
+**Bounded independent review:** Fermat inspected the five Go files
+against `bb80c3e`, the Task 25 requirements, direct callers, aggregation
+queries and adjacent tests/helpers. No confirmed Critical or Important
+issue was found. Two minor test suggestions remain: direct held-cash and
+held-bonus exact-cap/one-over cases, and an explicit zero-count assertion
+on `inference_ledger_entries` in addition to the existing wallet-entry
+assertion. The reviewer found no corresponding admission ledger write
+path and made no edits or test/database runs. This verdict covers this
+local diff, not the whole branch or merge/release readiness.
+
+**Remaining boundaries:** no real-provider/client or cross-host acceptance.
+The pending provider, late-evidence and escalated-reconciliation findings
+remain recorded in the convergence plan. Wallet post-settlement correction
+and its production trigger remain unfinished original requirements.
+The until-clean review is not declared complete. No push, merge, deployment,
+adjacent-repository source edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -998,6 +998,54 @@ unfinished and outside this local commit checkpoint; the until-clean
 review is not declared complete. No push, merge, deployment, adjacent
 repository edit or kaya process operation is included.
 
+## Task 25: Preserve Wallet Gates At Integer Boundaries
+
+**Files:** `accounting/overage.go`, `accounting/wallet.go`,
+`accounting/wallet_overflow_test.go`, `postgres/wallet_repo.go`,
+`postgres/wallet_overflow_test.go`, this plan and the verification runbook.
+
+**Interfaces:** preserve wallet micromoney units and source isolation.
+`CheckWalletSpend` must count settled spend, each in-flight source and the
+new hold without an unchecked intermediate sum. Representable negative
+balances remain visible; unrepresentable balances return `ErrOverflow`.
+
+- [x] Reproduce a monthly cap bypass with `MaxInt64-5` spent and a new
+  10-micro hold, including a real bonus-funded settlement and cash admission.
+- [x] Reproduce pre-summed in-flight holds returning invalid input instead
+  of quota exhaustion after an over-hold settlement.
+- [x] Reproduce two positive source balances falsely rejecting a freeze,
+  two extreme deficits admitting it, and derived availability wrapping positive.
+- [x] Fix the comparisons without floats or converting money to microcredits;
+  retain exact-cap admission, bonus-first splitting and minimum signed balance.
+- [x] Run focused RED/GREEN, accounting/PostgreSQL race, then fresh full
+  build/vet/race/coverage/E2E with separate owned disposable databases.
+- [x] Record independent review, evidence and remaining requirements for
+  this bounded local checkpoint without push, merge or deployment.
+
+**Focused evidence (2026-11-10):** `run.F0bnUQ/focused.jsonl` reproduces
+the overflow failures against the pre-fix production code, including both
+real PostgreSQL admission cases. `run.zpCDQD/focused.jsonl` passes all 20
+tests/subtests across accounting and PostgreSQL under
+`-race -count=1 -p 1`, with zero failures or skips. Both runs use owned
+disposable databases; the GREEN run's cleanup confirms its server stopped.
+Fermat's read-only review found no confirmed Critical or Important issue
+in the five Go files, their callers and adjacent aggregation/test helpers.
+Minor follow-ups are direct held-cash/held-bonus boundary cases and an
+explicit zero-count assertion on `inference_ledger_entries`; the new
+database test already checks wallet entries. No tests were run by that
+reviewer.
+
+**Final verification:** fresh `run.Qp5T7t` exited 0 on 2026-11-10:
+build/vet passed; full race passed 4,959 tests/subtests across 34 packages
+with zero failures and 80.7% statement coverage; separate E2E race passed
+186 tests/subtests (147.238s), zero failures. The four skips are the
+child-process entry and three opt-in drills, not unavailable-database
+acceptance. Each independent disposable database applied all 55
+migrations, then skipped all 55 on rerun. Owned-server cleanup succeeded
+and `postmaster.pid` is absent. See runbook 4.85 for the manifest,
+commands, evidence and remaining risks. Other pending findings and the
+until-clean review remain unfinished.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are
@@ -1016,6 +1064,19 @@ not waived scope:
   Task 24 valid-precedence controls and fresh full verification pass.
 - The original wallet-correction and production evidence-to-correction
   requirements remain incomplete and need their own implementation audit.
+- Ohm's read-only review of `bb80c3e` reports five provider defects:
+  Chat refusal translation loses refusal text and produces empty success;
+  incomplete function arguments are replaced with `{}` and made replayable;
+  incomplete responses without a reason become completed; partial public
+  usage fabricates missing zero/total fields; Anthropic thinking rejects the
+  valid 1025-output/1024-budget boundary. The reviewer reproduced these in
+  owned temporary provider overlays; checkout regressions and fixes remain open.
+- Boole's read-only review of `bb80c3e` identifies late real finalizer evidence
+  lost on terminal conflict, and correction SQL leaving escalated evidence
+  or resolved-overage tasks open. These are source-confirmed, not yet
+  dynamically reproduced in a disposable database.
+- Wallet arithmetic overflow is reproduced, fixed and verified in Task 25
+  with focused RED/GREEN, bounded review and a fresh full gate.
 
 ### Previous Verification Checkpoint
 

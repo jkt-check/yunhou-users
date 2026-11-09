@@ -51,11 +51,11 @@ var ErrSpendLimitExceeded = domain.NewError(domain.CodeQuotaExceeded,
 
 // CheckWalletSpend gates ONE wallet hold against the overage settings and
 // the month's spend. monthSpent is settled spend (consume debits net of
-// their reversals within MonthBoundsUTC(now)) PLUS any in-flight held
-// amounts, so concurrent holds cannot race past the cap; hold is the safe
-// upper bound about to be frozen. Pure — the repo supplies the sums under
-// the wallet row lock.
-func CheckWalletSpend(s OverageSettings, monthSpent, hold int64) error {
+// their reversals within MonthBoundsUTC(now)); held contains each in-flight
+// source amount separately so neither the repo nor this gate needs an
+// overflowing intermediate total. hold is the safe upper bound about to
+// be frozen. Pure — the repo supplies the figures under the wallet row lock.
+func CheckWalletSpend(s OverageSettings, monthSpent, hold int64, held ...int64) error {
 	if err := s.Validate(); err != nil {
 		return err
 	}
@@ -65,9 +65,23 @@ func CheckWalletSpend(s OverageSettings, monthSpent, hold int64) error {
 	if hold < 0 || monthSpent < 0 {
 		return domain.WrapError(domain.CodeInvalidInput, "accounting: negative spend figure", domain.ErrNegativeValue)
 	}
-	if monthSpent+hold > *s.MonthlySpendLimitMicros {
+	for _, amount := range held {
+		if amount < 0 {
+			return domain.WrapError(domain.CodeInvalidInput, "accounting: negative held figure", domain.ErrNegativeValue)
+		}
+	}
+	limit := *s.MonthlySpendLimitMicros
+	if monthSpent > limit || hold > limit-monthSpent {
 		return domain.WrapError(domain.CodeQuotaExceeded,
 			"accounting: monthly spend limit would be exceeded", ErrSpendLimitExceeded)
+	}
+	remaining := limit - monthSpent - hold
+	for _, amount := range held {
+		if amount > remaining {
+			return domain.WrapError(domain.CodeQuotaExceeded,
+				"accounting: monthly spend limit would be exceeded", ErrSpendLimitExceeded)
+		}
+		remaining -= amount
 	}
 	return nil
 }

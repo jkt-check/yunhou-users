@@ -499,7 +499,7 @@ func (s *Store) ReserveWallet(ctx context.Context, w domain.UnitOfWork, cmd doma
 		return nil, err
 	}
 	if err := accounting.CheckWalletSpend(wallet.Settings(),
-		spent+sums.HeldCash+sums.HeldBonus, cmd.HoldMicros); err != nil {
+		spent, cmd.HoldMicros, sums.HeldCash, sums.HeldBonus); err != nil {
 		return nil, err
 	}
 

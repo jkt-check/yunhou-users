@@ -803,6 +803,62 @@ skipped all 55 on rerun. Cleanup confirmed the owned server stopped.
 See runbook 4.81 for the file manifest, commands and remaining scope.
 This is a local commit checkpoint, not whole-branch review convergence.
 
+## Task 22: Persist Only Replayable Responses Transcripts
+
+**Files:** `httpapi/responses.go`, new
+`httpapi/responses_chain_replay_test.go`, shared
+`httpapi/protocol_surfaces_test.go` fixture, API guide/OpenAPI and runbook.
+
+**Interfaces:** keep `ResponsesReplayToChat([]json.RawMessage)` as the
+canonical replay validator; validate the combined input/output transcript
+at `ResponsesHandler.persistChain` before any row or session binding.
+
+- [x] Add real HTTP regressions for tool/text and before/tool/after stream
+  output, with both clean completed and incomplete terminals. Assert
+  output order, reported 7/5 usage, single settlement and no leaked holds.
+- [x] Reproduce saved but unreplayable chains: expect no chain/binding and
+  subsequent reference 404 without a new admission or upstream call.
+- [x] Cover replayable text/tool output, an unrepresentable child that
+  leaves its parent usable, and input/output adjacency that is only
+  unrepresentable in the combined transcript.
+- [ ] Validate replayability centrally before persistence; log and skip
+  only the new chain. Keep successful stream output/accounting unchanged.
+- [ ] Run focused race, full race/coverage and separate E2E on owned
+  disposable databases, document evidence and commit locally.
+
+Ruling: successful ordered streams remain successful; completion does
+not guarantee that their history fits the existing Chat replay model.
+Skip unusable chain state just as oversized transcripts are skipped,
+rather than persist a response ID that deterministically returns 400.
+Do not reorder output or loosen the explicit history rejection policy.
+Cost: such response IDs are not referenceable (404), now documented.
+
+RED-only local commit checkpoint (2026-11-10): the current commit request
+records regressions and the plan, not the production persistence fix.
+Initial focused run `run.OCLfgw` also exposed missing session-binder
+wiring in the shared matrix fixture. Configure the real binder as in
+`newProtoFixture`; do not weaken the chain or binding assertions.
+
+Fresh package race command:
+`GOMAXPROCS=2 zsh /private/tmp/yunhou-review-20261109.3NuMWy/run.zsh ./internal/inference/httpapi -timeout=10m`.
+Artifacts are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.O5mXJY/`.
+The run exited 1 in 58.972s: 364 tests/subtests passed, nine failure
+events (seven cases and two parent tests), no skips. All failures are in
+the new replayability regressions: unrepresentable transcripts are
+persisted, and their later references return 400 instead of the intended
+404. Both replayable before/tool controls passed, as did parent reuse,
+ordered terminal output, reported usage and settlement/hold assertions.
+No shared-fixture consumer outside the new tests failed.
+
+Both owned disposable databases applied all 55 migrations and skipped
+all 55 on rerun; `cleanup.log` confirms the owned server stopped.
+`go vet ./internal/inference/httpapi`, formatting and diff whitespace
+checks passed. Full-repository race, E2E and coverage were not rerun for
+this intentionally non-green checkpoint; Task 21's 80.7% is not coverage
+of this tree. Task 22's production fix, API documentation and full gate
+remain open. No push, merge, deployment or kaya process operation.
+
 ## Pending Review Findings (2026-11-10)
 
 These are reviewer findings to verify, not completed fixes or waived scope:
@@ -811,7 +867,7 @@ These are reviewer findings to verify, not completed fixes or waived scope:
   though the saved chain cannot be faithfully replayed.
 - Responses explicit `reasoning.effort=none` may lose its disable intent on
   OpenAI Chat egress.
-- Responses usage may omit Anthropic cache-write tokens from input/total.
+- Anthropic cache-write inclusion was fixed and verified in Task 21.
 - The original wallet-correction and production evidence-to-correction
   requirements remain incomplete and need their own implementation audit.
 

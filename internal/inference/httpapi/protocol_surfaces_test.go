@@ -804,6 +804,7 @@ func newMatrixFixture(t *testing.T, proto domain.Protocol) *matrixFixture {
 	gw := gateway.NewService(staticSnap{snap}, fx.store,
 		access.NewEntitlementResolver(fx.store, nil), quota.NewService(fx.store, nil),
 		routingSvc, mustCredSvc(t, fx.store), providers.NewHTTPClient(egress), egress, nil)
+	gw.SetSessionBinder(routing.NewSessionBinder(fx.store, nil))
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()

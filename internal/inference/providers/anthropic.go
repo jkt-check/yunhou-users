@@ -211,6 +211,8 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 			budget = maxTokens - 1
 		}
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	} else if r.ThinkingEnabled != nil {
+		payload["thinking"] = map[string]any{"type": "disabled"}
 	}
 	// Passthrough mapping: temperature/top_p/stop map onto Anthropic's
 	// names; parallel_tool_calls=false folds into tool_choice as

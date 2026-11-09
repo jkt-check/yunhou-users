@@ -589,7 +589,7 @@ Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改�
 |---|---|---|---|
 | 文本对话（多轮） | ✅ | ✅ | ✅ |
 | 工具调用（自定义 function/custom 工具，ID 逐字保留） | ✅ | ✅ | ✅（`function_call`/`function_call_output`） |
-| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled` | ❌ 400 `thinking.type=enabled`（本面不产出思考块，见下） | ✅ `reasoning.effort` |
+| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled\|disabled` | ✅ `thinking.type=disabled`；❌ 400 `enabled`（本面不产出思考块，见下） | ✅ `reasoning.effort`（`none` 显式关闭） |
 | 推理档位（`reasoning_effort` / `reasoning.effort`） | ✅ `minimal`/`low`/`medium`/`high`/`xhigh`（逐字透传上游；词表外值 400） | n/a（Anthropic 协议无 effort 旋钮） | ✅ `minimal`/`low`/`medium`/`high`/`xhigh`（逐字透传上游；`none` → 关） |
 | 流式 SSE | ✅（`[DONE]` 终止） | ✅（`message_stop` 终止） | ✅（`response.completed`/`response.incomplete` 终止） |
 | 采样参数 | `temperature`/`top_p`/`stop`/`presence_penalty`/`frequency_penalty`/`seed` | `temperature`/`top_p`/`top_k`/`stop_sequences` | `temperature`/`top_p`/`parallel_tool_calls` |
@@ -604,7 +604,8 @@ Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改�
 
 **推理档位与思考回放（T8 能力路由与协议真实性）**
 
-- **档位逐字保留**：客户端声明的 `reasoning_effort`（chat 面）/ `reasoning.effort`（responses 面）按 `minimal`/`low`/`medium`/`high`/`xhigh` **原样**下传上游，绝不一律折成 `medium`；词表外的值在出站前 400（不静默忽略）。未声明档位时才用协议默认（OpenAI Responses 的 `medium`）。`minimal` 是最低**推理档**（OpenAI 语义），不是「关闭推理」—— 只有 `none` 才关闭；这是对旧映射（`minimal` → 关）的兼容性修正。
+- **显式关闭与省略不同**：Chat 的 `thinking_enabled:false`/`thinking.type=disabled`、Messages 的 `thinking.type=disabled` 和 Responses 的 `reasoning.effort=none` 都保留关闭意图：Chat/Messages 上游收到 `thinking.type=disabled`，Responses 上游收到 `reasoning.effort=none`；省略则不发送开关，保留上游默认。Chat 同时传显式 `reasoning_effort` 时以档位为准，不再发送相冲突的开关。Chat 上游使用既有 DeepSeek 风格扩展，并非所有 OpenAI 兼容服务都支持。
+- **档位逐字保留**：客户端声明的 `reasoning_effort`（chat 面）/ `reasoning.effort`（responses 面）按 `minimal`/`low`/`medium`/`high`/`xhigh` **原样**下传上游，绝不一律折成 `medium`；词表外的值在出站前 400（不静默忽略）。未声明档位而显式开启开关时才用网关的协议默认档（OpenAI Responses 的 `medium`）。`minimal` 是最低**推理档**（OpenAI 语义），不是「关闭推理」—— 只有 `none` 才关闭；这是对旧映射（`minimal` → 关）的兼容性修正。
 - **档位受上游协议能力约束**：路由层按「模型声明 → 路由能力 → adapter 能力」三层一致挑选候选。`anthropic_messages` 协议**没有** effort 旋钮（它的推理旋钮是 `budget_tokens`，另一根轴），因此带档位的请求不会落到 Anthropic 协议的上游；若**没有任何**已发布部署能承载该档位，请求在**准入之前**被明确 400（零预占、零派发）。
 - **思考回放明确 4xx**：Responses 输入里的 `reasoning` 项、Anthropic 历史里的 `thinking`/`redacted_thinking` 块都无法忠实回放（本网关不实现 OpenAI 的加密推理存储，也不承载 Anthropic 的原生签名），因此**明确 400**（原生错误形状、零准入、零派发）。这是对旧「接受后丢弃」行为的**兼容性修正** —— 旧行为会让客户端以为自己的回传内容被送达了。
 - **Messages 面不产出思考块**：Anthropic 的 `thinking` 块必须带上游签发的 `signature`；网关的内部形状承载不了签名，旧实现伪造 `signature: ""` 冒充「可回放的原生签名思考」。现在本面**不渲染**思考块，显式开启 thinking 的请求 400，普通文本/工具流照常可用。要推理请用 `/v1/chat/completions`（`reasoning_content`）或 `/v1/responses`（`reasoning` 摘要）。
@@ -776,7 +777,7 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 | `model` | 否 | 逻辑模型 ID（≤64 **字节**），取值来自 `GET /chat/models` 返回的 `id`。省略时使用目录的默认模型（`default_model`）；旧客户端不传该字段行为不变 |
 | `session_id` | 否 | 会话标识（≤64 **字节**），仅用于服务端访问日志按会话分组，不参与任何业务逻辑 |
 | `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
-| `thinking_enabled` | 否 | 布尔值；为 `true` 时请求启用上游推理模式，行为取决于所选模型的 provider 协议——OpenAI 协议原样下发 `thinking: {"type": "enabled"}`（不支持该字段的 provider 可能 400 → 客户端收到 502）；Anthropic 协议映射为扩展思考（`budget_tokens=4096`，`max_tokens` 下限相应抬高）。省略/`false` 时不下发。开启后响应 chunk 的 `delta` 中可能出现 `reasoning_content` 字段（两种协议都会产出），客户端不展示时可安全忽略 |
+| `thinking_enabled` | 否 | 布尔值；`true` 请求启用推理，`false` 显式关闭，省略保留上游默认值。Chat 上游使用 DeepSeek 风格 `thinking: {"type": "enabled" \| "disabled"}`（不支持该扩展的 provider 可能 400 → 客户端收到 502）；Anthropic 上游使用同名开关，开启时默认 `budget_tokens=4096`，预算必须小于输出 cap，不够时明确拒绝而不抬高 cap；Responses 上游映射为 `reasoning.effort=medium` / `none`。开启后 chunk 的 `delta` 可能出现 `reasoning_content`，客户端不展示时可忽略 |
 
 **图片输入（多模态）**：`messages[].content` 除纯字符串外，还接受 OpenAI 兼容的 parts 数组——`[{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"..."}}]`，`text` 与 `image_url` 可任意混排（parts 中的文本拼接后与字符串 content 同等计量与审计）。规则：
 

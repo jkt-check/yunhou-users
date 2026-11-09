@@ -109,8 +109,12 @@ func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 	// 仍发 thinking（DeepSeek 风格）。
 	if r.ReasoningEffort != "" {
 		payload["reasoning_effort"] = r.ReasoningEffort
-	} else if r.ThinkingEnabled != nil && *r.ThinkingEnabled {
-		payload["thinking"] = map[string]any{"type": "enabled"}
+	} else if r.ThinkingEnabled != nil {
+		kind := "disabled"
+		if *r.ThinkingEnabled {
+			kind = "enabled"
+		}
+		payload["thinking"] = map[string]any{"type": kind}
 	}
 	for _, k := range passthroughKeys {
 		if v, ok := r.Passthrough[k]; ok {

@@ -7010,6 +7010,97 @@ evidence-to-correction trigger remain unfinished. Real-provider/client
 and cross-host acceptance remain unverified. No push, merge, deployment,
 adjacent-repository edit or kaya process operation is included.
 
+### 4.83 Explicit Reasoning Disable (2026-11-10)
+
+This checkpoint addresses Task 23 only, not the remaining original scope
+or a whole-branch until-clean review conclusion.
+
+**Changed files:**
+
+- `internal/inference/providers/openai_chat.go` and `anthropic.go`:
+  preserve explicit false as `thinking.type=disabled`; nil still omits
+  the toggle and true keeps the existing enabled behavior.
+- `internal/inference/providers/adapter.go`: document the pointer's
+  nil/false semantics and enabling capability requirement.
+- `internal/inference/providers/reasoning_disable_test.go`: exercise
+  every registered adapter, streaming/nonstreaming and nil/false/true;
+  reject extra budget/summary fields on disable and a conflicting
+  thinking toggle when explicit effort wins.
+- `internal/inference/httpapi/reasoning_disable_test.go`: 48 HTTP
+  combinations across three upstream protocols, two streaming modes,
+  four ingress forms and omitted/disabled controls; assert the actual
+  outgoing payload, one dispatch and one usage record.
+- The integration guide, OpenAPI, convergence plan and this runbook
+  document explicit disable, effort precedence and verification.
+
+**RED/GREEN evidence:** logs are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `reasoning-disable-red.jsonl` | Pre-fix provider race failed four disabled leaves: Chat/Messages, each streamed and nonstreamed. Omitted/enabled and effort controls passed. |
+| `run.MKSjrr/focused.jsonl` | Pre-fix HTTP race failed all 16 disabled Chat/Messages leaves; the 32 omitted/Responses controls passed. |
+| Provider package race | `GOPROXY=off GOFLAGS=-mod=readonly GOMAXPROCS=2 go test -race -count=1 ./internal/inference/providers` exited 0 (2.409s). |
+| `run.XV7rdy/focused.jsonl` | Complete HTTP package race passed 422 tests/subtests (68.892s), zero failures/skips. |
+
+The HTTP package command was
+`GOMAXPROCS=2 REVIEW_PG_PORT=55491 zsh /private/tmp/yunhou-review-20261109.3NuMWy/run.zsh ./internal/inference/httpapi -timeout=10m`.
+Its owned PostgreSQL stopped successfully; the stopped disposable data
+was later removed while logs were preserved.
+
+**Interrupted full gate:** `run.1dvps8` passed build/vet but the workers
+fixture failed before its business assertions:
+`settlement_recovery_test.go:936: wipe: pq: could not extend file ...:
+No space left on device (53100)`. The owned PostgreSQL server log
+independently records the same disk error. This run is not a passing
+full gate: it exited 1 after 4,797 test/subtest passes, and E2E was not
+reached. Only verified-stopped owned disposable database data was
+removed; no source fix was made in response to this storage failure.
+
+**Successful full gate:** the unchanged Go tree was rerun with
+`GOMAXPROCS=2 REVIEW_PG_PORT=55491 zsh /private/tmp/yunhou-review-20261109.3NuMWy/run.zsh`.
+Run `run.4gNB3I` exited 0 on 2026-11-10 (Asia/Shanghai):
+
+- `go build ./...` and `go vet ./internal/... ./cmd/...` passed.
+- `go test -race -count=1 -p 1 -timeout=30m -coverprofile="$RUN/coverage.out" -json ./internal/... ./cmd/... ./tests/integration/...`
+  passed 4,798 tests/subtests across 34 packages, with zero failures.
+- `go tool cover -func="$RUN/coverage.out"` reported total statement
+  coverage of 80.7%, above the 80% floor.
+- `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`
+  passed 186 tests/subtests in 175.875s, with zero failures.
+- Full race skipped only `TestQuotaWorkerProcess` (child entry) and
+  `TestLoadDrill_Throughput` / `TestLoadDrill_LongConnections` (opt-in
+  `KAYA_LOAD=1`). E2E skipped only
+  `TestUsageTokenAcceptance_TenPagesTwoMinutes` (opt-in
+  `USAGE_ACCEPTANCE=1`). No database acceptance was skipped.
+
+The runner used its own fresh PostgreSQL cluster on loopback port 55491,
+with separate `review_app` and `review_e2e` databases and explicit DSNs.
+Each database applied all 55 migrations and skipped all 55 on rerun.
+`GOPROXY=off` and `GOFLAGS=-mod=readonly` kept dependencies unchanged;
+`-p 1` serialized database-test packages. Evidence is in
+`run.4gNB3I/{build.log,vet.log,tests.jsonl,coverage-summary.log,e2e.jsonl,migrate-app.log,migrate-e2e.log}`.
+`cleanup.log` confirms the owned server stopped, and its
+`data/postmaster.pid` is absent. The previously interrupted
+`TestRecovery_LiveStreamingRequestNeverSwept` passed in this successful
+rerun.
+
+**Bounded review:** Lovelace's read-only review found no confirmed bug
+or documentation mismatch in this task delta. It did not independently
+run the gates or perform a whole-branch review. Direct regressions for
+false on non-reasoning models and false with a leftover thinking budget
+were not added; the relevant guards and false branch were inspected.
+Unknown Chat `thinking.type` values retain their existing normalization
+to false; stricter ingress validation is not introduced by this task.
+
+**Remaining scope:** Chat keeps its existing documented DeepSeek-style
+`thinking` extension, not universal OpenAI-compatible vendor support.
+There are no real-provider/client or cross-host acceptance results.
+Effort vocabulary/routing and enabled budget/output-cap behavior are
+unchanged. Wallet correction and the production evidence-to-correction
+trigger remain unfinished original scope. No push, merge, deployment,
+adjacent-repository source edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

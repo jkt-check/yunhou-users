@@ -51,7 +51,8 @@ type ChatRequest struct {
 	// ToolChoice is relayed verbatim when present.
 	ToolChoice json.RawMessage
 	// ThinkingEnabled toggles reasoning mode (OpenAI thinking / Anthropic
-	// extended thinking) on models that declare SupportsReasoning.
+	// extended thinking). Nil preserves the upstream default; false must
+	// explicitly disable it. Enabling requires SupportsReasoning.
 	ThinkingEnabled *bool
 	// ReasoningEffort is the EXPLICITLY requested reasoning-effort level
 	// ("low" | "medium" | "high" | "xhigh" | "minimal"). Empty = the client

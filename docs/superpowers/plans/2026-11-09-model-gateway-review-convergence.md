@@ -881,6 +881,51 @@ tests or review the whole branch. See runbook 4.82 for the file manifest,
 commands and compatibility limitation. This local checkpoint does not
 complete the remaining review findings.
 
+## Task 23: Preserve Explicit Reasoning Disable
+
+**Files:** `providers/openai_chat.go`, `providers/anthropic.go`,
+`providers/adapter.go`, provider and HTTP regression tests, API guide,
+OpenAPI and verification runbook.
+
+**Interfaces:** retain `ThinkingEnabled *bool`: nil leaves the upstream
+default unchanged, false explicitly disables, true enables. Keep the
+existing explicit `ReasoningEffort` precedence and effort vocabulary.
+Chat uses its existing DeepSeek-style `thinking` dialect; Messages uses
+`thinking.type`, Responses uses `reasoning.effort`.
+
+- [x] Reproduce false disappearing on Chat and Messages egress, using all
+  registered adapters and nil/true controls, streamed and nonstreamed.
+- [x] Reproduce Responses `effort=none`, Messages `thinking=disabled` and
+  both Chat toggle forms through real authenticated HTTP and PostgreSQL.
+- [x] Emit `thinking: {type: disabled}` for an explicit false in the two
+  affected adapters, with no budget and no change to an omitted toggle.
+- [x] Preserve effort precedence and enabled-budget/output-cap behavior.
+- [x] Run providers race, HTTP race and full build/vet/race/coverage/E2E
+  with separate owned disposable databases; record commands and skips.
+- [x] Update the API contract and commit this bounded correction locally.
+
+Ruling: preserve the existing normalized toggle rather than promoting
+`none` into the effort vocabulary. This fixes the lost disable intent
+without treating disabling as a reasoning capability requirement or
+changing effort routing. Cost: Chat retains its documented vendor
+`thinking` dialect, not a claim that every OpenAI-compatible endpoint
+supports that extension. Provider compatibility still needs live
+acceptance; no real-provider call is part of this review.
+
+Local commit checkpoint (2026-11-10): provider race and the full HTTP
+package race passed, including the 48 authenticated ingress/egress
+combinations. Full gate `run.4gNB3I` exited 0: build/vet passed, full race
+passed 4,798 tests/subtests across 34 packages, statement coverage was
+80.7%, and separate E2E race passed 186 tests/subtests (175.875s).
+Only the expected child-entry and opt-in load/usage drills skipped;
+no database acceptance skipped. Both owned disposable databases applied
+55 migrations and skipped all 55 on rerun. Cleanup confirmed the owned
+PostgreSQL stopped and `postmaster.pid` is absent. Runbook 4.83 records
+the manifest, RED/GREEN evidence, interrupted disk-full gate, successful
+rerun and bounded review. This checkpoint does not complete the original
+wallet-correction/production-trigger scope or the until-clean review.
+No push, merge, deployment or kaya process operation is included.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are
@@ -888,8 +933,8 @@ not waived scope:
 
 - Responses stream output with a tool followed by text no longer creates
   an unusable stored chain; fixed and verified in Task 22.
-- Responses explicit `reasoning.effort=none` may lose its disable intent on
-  OpenAI Chat egress.
+- Explicit reasoning disable is now retained on Chat and Messages egress,
+  including Responses `reasoning.effort=none`; fixed and verified in Task 23.
 - Anthropic cache-write inclusion was fixed and verified in Task 21.
 - The original wallet-correction and production evidence-to-correction
   requirements remain incomplete and need their own implementation audit.

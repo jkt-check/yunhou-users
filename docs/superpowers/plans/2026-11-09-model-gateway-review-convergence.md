@@ -758,6 +758,33 @@ server stopped. See runbook 4.80 for the file manifest, commands,
 evidence and remaining scope. This is a local commit checkpoint,
 not a whole-branch until-clean review conclusion.
 
+## Task 21: Include Anthropic Cache Creation In Responses Usage
+
+**Files:** `providers/responses_client.go`, new provider and HTTP cache-usage
+regressions, and the verification runbook.
+
+**Interfaces:** preserve `ResponsesUsageShape(*openAIUsage, bool)`; the
+existing false flag denotes Anthropic-origin exclusive input buckets.
+
+- [ ] Reproduce Anthropic input 2, cache read 3, cache creation 5, output 7
+  rendering Responses input 5/total 12 instead of input 10/total 17.
+  Exercise the real native decoder and stream adapter before rendering.
+- [ ] Cover missing/zero cache buckets and OpenAI-origin inclusive input,
+  with stream fragmentation and both completed/incomplete terminals.
+- [ ] Add cache creation alongside cache reads only for exclusive input;
+  preserve cached_tokens as the cache-read detail, not cache-write.
+- [ ] Verify real HTTP stream/nonstream Responses usage agrees with
+  reported persisted buckets and TPM 17, with one charge/attempt and no
+  held reservations or leases.
+- [ ] Run focused race, full race/coverage and separate E2E against owned
+  disposable databases; record evidence and commit locally.
+
+Ruling: fix the Responses aggregate at its existing inclusion boundary,
+not the canonical accounting buckets or the Anthropic adapter's wire.
+Counting both cache buckets for all origins would double count inclusive
+OpenAI input. Renaming the shared inclusion flag is unnecessary churn.
+No new response fields, migration, price or correction policy.
+
 ## Pending Review Findings (2026-11-10)
 
 These are reviewer findings to verify, not completed fixes or waived scope:

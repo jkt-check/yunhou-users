@@ -6174,6 +6174,93 @@ actual migration/interface inventory and the convergence plan's current
 verification status. No business code, production configuration, adjacent
 repository, remote Git state or kaya process is changed.
 
+### 4.72 Correction Evidence Integrity Checkpoint (2026-11-09)
+
+This local commit checkpoint follows the user's `commit` request. It
+finishes two already reproduced correction-boundary defects; it does not
+expand the review to a new settlement API or implement the wallet and
+production-trigger follow-up.
+
+**Changed files:**
+
+- `internal/inference/postgres/reconciliation_repo.go`: verify that the
+  corrected attempt belongs to the locked request before any write.
+  When normalized token buckets are known, require their declared total
+  to match input + cache read + cache write + output. Subtract buckets
+  from the total rather than adding them, so int64 overflow cannot
+  disguise inconsistent evidence. Reasoning is not counted twice.
+- `internal/inference/postgres/correction_identity_test.go`: cover
+  foreign-account attempts for monetary and metering-only corrections.
+  Both requests' usage, settlement, TPM, ledger, windows and Key budgets
+  stay unchanged; no receipt is consumed, and the right attempt can
+  retry with the same idempotency key.
+- `internal/inference/postgres/correction_evidence_test.go`: reject
+  90-token evidence paired with total zero for paid and free models,
+  and reject overflow evidence that would wrap to 1. The matching
+  90-token retry succeeds, without adding reasoning again, and makes
+  the next 20-token admission fail against TPM 100.
+- `internal/inference/postgres/correction_rate_test.go`: keep the
+  shared correction fixture's buckets consistent with its declared
+  total; the nil-total fixture still carries known buckets for the
+  existing missing-total rejection.
+- `internal/inference/postgres/recovery_test.go`: correct the final
+  overage-resolution fixture to declare 80 tokens for its 40/40 buckets.
+  Monetary and reconciliation assertions are unchanged.
+- This runbook and the convergence plan: record the findings,
+  verification evidence and remaining scope.
+
+**RED/GREEN evidence:**
+
+All paths below are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.rAVmUu/focused.jsonl` | RED: a foreign attempt changed the target request's money and TPM and appended mismatched usage; the metering-only variant returned `not_found` instead of `invalid_input`. |
+| `run.BMonGO/focused.jsonl` | RED: both paid/free 90-token corrections accepted total zero and consumed a receipt; overflowing buckets were accepted with TPM 1. |
+| `run.kBbcB3/focused.jsonl` | GREEN: `go test -race -count=1 -p 1 -json ./internal/inference/postgres -run '^TestCorrectSettlement' -timeout=5m`; 35 tests/subtests, zero failures or skips, 5.163s. |
+
+**Fresh full gate:** `run.ZWo4XY` exited 0. It used
+`GOMAXPROCS=2`, `GOPROXY=off`, `GOFLAGS=-mod=readonly`, explicit
+`DATABASE_URL`/`E2E_DATABASE_URL` and serial package execution:
+
+| Check | Result |
+|---|---|
+| `go build ./...` | Passed; `build.log` |
+| `go vet ./internal/... ./cmd/...` | Passed; `vet.log` |
+| `go test -race -count=1 -p 1 -timeout=30m -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...` | Passed: 4,449 tests/subtests across 34 packages, zero failures; `tests.jsonl` |
+| `go tool cover -func=...` and 80% floor | Passed: 80.6% total statement coverage; `coverage.out`, `coverage-summary.log` |
+| `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...` | Passed: 186 tests/subtests, zero failures, 237.008s; `e2e.jsonl` |
+| Migrations | Both owned disposable databases applied 55 migrations and skipped all 55 on rerun; `migrate-app.log`, `migrate-e2e.log` |
+| Owned PostgreSQL cleanup | Passed: `cleanup.log` confirms server stopped |
+
+The full-race skips are the child-only `TestQuotaWorkerProcess` parent
+invocation and the opt-in `TestLoadDrill_Throughput` and
+`TestLoadDrill_LongConnections`. E2E skips only the opt-in
+`TestUsageTokenAcceptance_TenPagesTwoMinutes`. Worker children actually
+ran; no database-unavailable case skipped. Completed focused runs also
+have cleanup logs confirming their owned PostgreSQL servers stopped.
+
+McClintock's read-only bounded review found no confirmed Critical or
+Important defects in the five Go files. It verified the ownership check
+precedes writes, subtraction prevents overflow, reasoning is not added
+again, and fixture changes preserve accounting assertions. This is not
+a whole-repository clean-review claim or an independent gate execution.
+Minor test gaps remain: the rollback helper does not independently
+prove pre-write rejection, and there are no dedicated 90/91-total or
+valid-MaxInt64 boundary cases. The current implementation was judged
+correct for those paths; this checkpoint does not claim those extra
+cases were tested.
+
+**Remaining scope:** this patch has no migration and does not rewrite
+historical rows. `CorrectSettlement` still has no production evidence
+trigger and explicitly rejects wallet corrections. Those original-plan
+requirements remain open. Initial `Settle`/shared usage-insert identity
+validation has not been claimed covered by this narrow checkpoint.
+Real-provider/client and cross-host acceptance remain unverified.
+No push, merge, deployment, adjacent-repository change or kaya process
+operation is part of this work.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

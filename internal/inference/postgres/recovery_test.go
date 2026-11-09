@@ -885,6 +885,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 	}
 
 	// 修正回到预占之内（90k ≤ 100k）：异常被本次修正处置 → resolve 带说明。
+	withinHoldTokens := int64(80)
 	uow, _ = s.Begin(ctx)
 	err = s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -892,7 +893,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(40)), OutputTokens: ptr(int64(40))},
 		},
-		CorrectedMicros: 90_000, CorrectedTokens: &overageTokens, Reason: "final invoice within hold",
+		CorrectedMicros: 90_000, CorrectedTokens: &withinHoldTokens, Reason: "final invoice within hold",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})

@@ -181,7 +181,45 @@ reservations include all four targets (three windows plus Key budget).
 Both owned disposable PostgreSQL clusters stopped normally. This closes
 the cross-process evidence gap, not cross-host or whole-branch acceptance.
 
-### Current Verification Checkpoint
+## Task 12: Correction Evidence Integrity
+
+**Files:** `postgres/reconciliation_repo.go`, correction identity/evidence
+regressions, correction-rate/recovery fixtures and verification runbook.
+
+- [x] Reproduce a correction using another account's request attempt.
+- [x] Reject a foreign attempt before writing usage, money, TPM or receipts.
+- [x] Reproduce normalized usage of 90 tokens correcting TPM to zero.
+- [x] Reproduce int64-overflow evidence passing with a wrapped total of 1.
+- [x] Require the declared total to match normalized buckets without
+  unchecked addition; reasoning remains included in output exactly once.
+- [x] Verify rejection has no side effects and the corrected command can
+  reuse the same idempotency key; preserve unknown-total behavior.
+- [x] Run all settlement-correction regressions with race detection.
+- [x] Finish a fresh whole-branch race/coverage and E2E gate.
+- [x] Record the gate and narrow independent review for the local checkpoint.
+
+RED evidence is retained in `run.rAVmUu` (foreign attempt) and
+`run.BMonGO` (inconsistent and overflowing totals). Focused GREEN
+`run.kBbcB3` passed 35 tests/subtests without skips. All runs use the
+owned disposable PostgreSQL runner under
+`/private/tmp/yunhou-review-20261109.3NuMWy`; cleanup stopped each
+completed run's owned server.
+
+Full `run.ZWo4XY` exited 0: build/vet passed; full race passed 4,449
+tests/subtests across 34 packages, with 80.6% total statement coverage;
+E2E race passed 186 tests/subtests (237.008s). The three full-race skips
+and one E2E skip are the same explicit child-entry/opt-in scenarios as
+the previous checkpoint, not unavailable databases. Both databases
+applied all 55 migrations and skipped all 55 on rerun; cleanup confirmed
+the owned PostgreSQL server stopped.
+
+McClintock's bounded read-only review found no confirmed Critical or
+Important defects in this five-Go-file delta. Minor test gaps and
+unchanged wallet/production-trigger limitations remain documented.
+See runbook 4.72 for the manifest, exact evidence and scope boundaries.
+This is a local commit checkpoint, not whole-repository convergence.
+
+### Previous Verification Checkpoint
 
 At `814d120`, Noether and Tesla's bounded independent reviews, including
 Task 10/11 increments, report no confirmed unresolved important defects

@@ -351,8 +351,8 @@ type CorrectionCommand struct {
 	//     the previous total is kept. Unknown never collapses into zero.
 	//
 	// It is REQUIRED whenever the corrected evidence carries known token
-	// buckets: a money correction may not silently omit the token budget
-	// (the ledger and the rate budget would disagree).
+	// buckets, and must equal input + cache read + cache write + output.
+	// Reasoning is already included in output and is not added again.
 	CorrectedTokens *int64
 	Reason          string
 	// OperatorSubject + IdempotencyKey follow the adjustment contract
@@ -460,6 +460,16 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return domain.NewError(domain.CodeConflict,
 			"correction: request not settled ("+status+") — settle first, corrections revise a settlement")
 	}
+	var ownsAttempt bool
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM inference_attempts WHERE id = $1 AND request_id = $2)`,
+		cmd.Corrected.AttemptID, cmd.RequestID).Scan(&ownsAttempt); err != nil {
+		return mapError("correction: attempt ownership", err)
+	}
+	if !ownsAttempt {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: the corrected attempt does not belong to the request")
+	}
 	// The corrected token evidence must be explicit: known token buckets
 	// without a corrected total would silently omit the token budget (the
 	// ledger and the rate budget would disagree). Checked after the scope
@@ -468,6 +478,27 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return domain.NewError(domain.CodeInvalidInput,
 			"correction: the corrected evidence carries token buckets but no corrected token total"+
 				" (the token budget correction must not be omitted)")
+	}
+	if cmd.CorrectedTokens != nil && access.KnownTokenBuckets(cmd.Corrected.Buckets) {
+		// Subtract from the declared total so oversized buckets cannot wrap
+		// an int64 sum into an apparently matching total.
+		remaining := *cmd.CorrectedTokens
+		buckets := cmd.Corrected.Buckets
+		for _, bucket := range []*int64{buckets.InputTokens, buckets.CacheReadTokens,
+			buckets.CacheWriteTokens, buckets.OutputTokens} {
+			if bucket == nil {
+				continue
+			}
+			if *bucket < 0 || *bucket > remaining {
+				return domain.NewError(domain.CodeInvalidInput,
+					"correction: corrected token total does not match normalized evidence")
+			}
+			remaining -= *bucket
+		}
+		if remaining != 0 {
+			return domain.NewError(domain.CodeInvalidInput,
+				"correction: corrected token total does not match normalized evidence")
+		}
 	}
 	if !settled.Valid {
 		return domain.NewError(domain.CodeConflict,

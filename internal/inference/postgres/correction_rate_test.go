@@ -84,6 +84,9 @@ func correctedFixtureWithCharge(t *testing.T, s *Store, f fixture, w5, ww, wm st
 func correctionFixture(requestID, attemptID string, correctedMicros domain.Microcredit,
 	correctedTokens *int64, key string) CorrectionCommand {
 	in, out := int64(800), int64(200)
+	if correctedTokens != nil {
+		in, out = *correctedTokens, 0
+	}
 	return CorrectionCommand{
 		RequestID: requestID,
 		Corrected: domain.UsageRecord{

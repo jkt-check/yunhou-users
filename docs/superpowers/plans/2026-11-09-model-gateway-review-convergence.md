@@ -1090,6 +1090,45 @@ found no confirmed local-commit blocker; nonblocking test gaps and the
 separate already-resolved-overage question are recorded in runbook 4.86.
 Other pending findings and the until-clean review remain unfinished.
 
+## Task 27: Retain Conflicting Finalizer Evidence
+
+**Files:** `gateway/service.go`, `gateway/settlement_evidence.go`,
+`gateway/terminal_marker_test.go`, `gateway/terminal_evidence_test.go`,
+`postgres/reconciliation_repo.go`, the operations runbook, this plan and
+the verification runbook.
+
+**Interfaces:** terminal anomaly reporting consumes the incoming normalized
+`SettleCommand` and pinned price. Its versioned `settlement_evidence` object
+retains distinct content-addressed observations, not new authoritative usage
+revisions. Request-job upsert unions that object atomically while preserving
+existing top-level detail, reason, status and deadline rules.
+
+- [ ] Extend `TestGateway_NonstreamFinalizerPreservesCompetingTerminal`:
+  mismatched/released finalizers retain the incoming 10/5 reported usage,
+  attempt, raw usage and pinned price; exact duplicates still create no job.
+- [ ] Add gateway regressions for distinct evidence, exact-retry dedup,
+  normalized cache/reasoning buckets, nullable counters, missing/malformed
+  raw usage, credit/wallet units, and unrelated job-detail refresh.
+  Terminal, usage, ledger, rate and wallet snapshots must stay unchanged.
+- [ ] Run focused race tests with owned disposable databases. Expected RED:
+  missing incoming evidence, not a fixture or connection failure.
+- [ ] Pass the normalized command and pinned price to terminal reporting;
+  retain usage-only raw JSON (malformed input as explicit text evidence),
+  source, nullable buckets, attempt, price identity and charge denomination.
+  Union nested evidence on every request-job refresh, without selecting an
+  authoritative candidate or automatically rewriting accounting.
+- [ ] Run the focused race tests again. Expected GREEN: all new regressions
+  and existing terminal/idempotency controls pass with no database skips.
+- [ ] Run fresh build/vet/full race/coverage/E2E using independent owned
+  disposable databases; record evidence and remaining scope, then commit
+  locally as `fix(inference): retain conflicting settlement evidence`.
+
+Ruling: retain observations in reconciliation detail rather than appending
+usage revisions, because latest-revision reads are accounting authority.
+Exact content retries deduplicate; distinct observations survive unrelated
+refreshes. This is evidence retention, not the production correction caller
+or wallet correction required by the original plan.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

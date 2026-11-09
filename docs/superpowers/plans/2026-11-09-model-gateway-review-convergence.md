@@ -282,6 +282,56 @@ test gaps remain recorded in runbook 4.73. This is a local Task 13 commit
 checkpoint, not whole-repository convergence or delivery of the still-open
 wallet-correction/production-trigger requirements.
 
+## Task 14: Token Arithmetic Boundaries
+
+**Files:** `access/inference_limits.go`, its rule tests,
+`postgres/ledger_repo.go`, new settlement/rate overflow regressions,
+original interface inventory and verification runbook.
+
+**Interfaces:** `NormalizedTokens(domain.UsageBuckets) (int64, error)`;
+invalid or overflowing evidence returns `invalid_input` before writes.
+`EvaluateRateLimits` keeps its typed rate rejection; an unrepresentable
+diagnostic total saturates at MaxInt64 without changing the decision.
+
+- [x] Reproduce positive wrapped settlement totals on plan and wallet,
+  and inspect the still-open transaction.
+- [x] Reproduce combined TPM overflow in the pure rule and PostgreSQL
+  admission, including a MaxInt64 policy and a wrapped-positive sum.
+- [ ] Validate token sums before writes or terminal classification and
+  reject over-limit admission without unchecked arithmetic.
+- [ ] Verify a valid settlement retry on the same transaction after
+  rejecting invalid token evidence.
+- [ ] Verify exact-Max totals, unknown buckets and reasoning counted once;
+  preserve disabled limits and determinable-only Retry-After.
+- [ ] Run focused race, full race/coverage and E2E in owned disposable
+  databases, record evidence and review the delta before local commit.
+
+Ruling: use the existing nonnegative int64 accounting contract rather than
+clamping persisted evidence. Only the customer-facing diagnostic aggregate
+may saturate; a true sum above MaxInt64 must still reject at limit MaxInt64.
+The original wallet-correction/production-trigger gap remains open.
+
+RED commit checkpoint: the user's latest `commit` request checkpoints only
+the three new regression files and this plan, without a production fix.
+Fresh focused race run `run.5pBbzf` exited 1: 12 leaf cases failed, two
+boundary controls passed, and no tests skipped. Including parent tests,
+the JSON log records 17 failures. TPM overflow admitted all three blocked
+cases in both the pure rule and PostgreSQL, changing admission state.
+Wrapped-positive settlement totals were accepted on both plan and wallet,
+with usage, ledger, rate and monetary state changed inside the transaction.
+Negative buckets instead aborted the transaction before a valid retry.
+The retry assertions remain unverified until the missing validation is fixed.
+
+Evidence:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.5pBbzf/focused.jsonl`.
+Command: `go test -race -count=1 -p 1 -json ./internal/inference/access ./internal/inference/postgres -run '^(TestEvaluateRateLimits_TPMCannotWrapIntoAdmission|TestReserveRateTx_TPMOverflowCannotBypassLimit|TestSettle_RejectsInvalidTokenTotalsBeforeWriting)$' -timeout=5m`.
+Both owned disposable databases applied all 55 migrations and skipped all
+55 on rerun; `cleanup.log` confirms the owned PostgreSQL server stopped.
+No production code changed. Full race, E2E and coverage were not rerun for
+this intentionally non-green checkpoint; the previous 80.6% coverage and
+passing gate below describe the earlier commit, not this tree. Task 14
+remains open. No push, merge, deployment or kaya process operation.
+
 ### Previous Verification Checkpoint
 
 At `814d120`, Noether and Tesla's bounded independent reviews, including

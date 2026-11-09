@@ -297,13 +297,13 @@ diagnostic total saturates at MaxInt64 without changing the decision.
   and inspect the still-open transaction.
 - [x] Reproduce combined TPM overflow in the pure rule and PostgreSQL
   admission, including a MaxInt64 policy and a wrapped-positive sum.
-- [ ] Validate token sums before writes or terminal classification and
+- [x] Validate token sums before writes or terminal classification and
   reject over-limit admission without unchecked arithmetic.
-- [ ] Verify a valid settlement retry on the same transaction after
+- [x] Verify a valid settlement retry on the same transaction after
   rejecting invalid token evidence.
-- [ ] Verify exact-Max totals, unknown buckets and reasoning counted once;
+- [x] Verify exact-Max totals, unknown buckets and reasoning counted once;
   preserve disabled limits and determinable-only Retry-After.
-- [ ] Run focused race, full race/coverage and E2E in owned disposable
+- [x] Run focused race, full race/coverage and E2E in owned disposable
   databases, record evidence and review the delta before local commit.
 
 Ruling: use the existing nonnegative int64 accounting contract rather than
@@ -331,6 +331,34 @@ No production code changed. Full race, E2E and coverage were not rerun for
 this intentionally non-green checkpoint; the previous 80.6% coverage and
 passing gate below describe the earlier commit, not this tree. Task 14
 remains open. No push, merge, deployment or kaya process operation.
+
+GREEN implementation checkpoint: `NormalizedTokens` now rejects negative
+bucket/detail values and unrepresentable totals before settlement writes,
+wallet dispatch or terminal classification. Both settlement paths share
+the validated total. TPM admission uses checked addition; an overflow
+blocks even a MaxInt64 policy while saturating only the diagnostic total.
+The original T4 interface inventory now matches the two-result helper.
+
+Fresh focused race `run.1fvhmM` exited 0 with 19 test/subtest passes across
+access and PostgreSQL, no skips or failures. This covers exact-Max and
+disabled-policy controls, three overflow admission cases, and plan/wallet
+invalid evidence followed by a valid retry on the same transaction.
+Both owned disposable databases applied all 55 migrations and skipped
+all 55 on rerun; cleanup confirms the owned PostgreSQL server stopped.
+Fresh full gate `run.hmsZjn` exited 0 on 2026-11-10 (Asia/Shanghai):
+build/vet passed, full race passed 4,489 tests/subtests across 34 packages,
+total statement coverage was 80.6%, and E2E passed 186 tests/subtests
+(241.174s). The three full-race skips and one E2E skip are the expected
+child-entry and opt-in cases; no database acceptance was skipped.
+Both independent disposable databases applied/reran all 55 migrations;
+cleanup confirms the owned PostgreSQL server stopped.
+
+Euler's bounded read-only review found no confirmed Critical or Important
+defects. The minor negative-bucket coverage gap and unchanged review
+surfaces are recorded in runbook 4.74. Task 14 is verified for this local
+commit checkpoint, not a claim that the wider review or the original
+wallet-correction/production-trigger requirement is complete. No push,
+merge, deployment, adjacent repository edit or kaya process operation.
 
 ### Previous Verification Checkpoint
 

@@ -20,22 +20,22 @@ func TestNormalizedTokens_CacheAndReasoningAreNotDoubleCounted(t *testing.T) {
 		InputTokens: intp(8), CacheReadTokens: intp(4),
 		OutputTokens: intp(34), ReasoningTokens: intp(9),
 	}
-	if got := NormalizedTokens(b); got != 46 {
-		t.Errorf("normalized tokens = %d, want 46 (8+4+34, reasoning not added twice)", got)
+	if got, err := NormalizedTokens(b); err != nil || got != 46 {
+		t.Errorf("normalized tokens = %d, err = %v, want 46 (8+4+34, reasoning not added twice)", got, err)
 	}
 	// 未上报的桶不贡献 0（unknown 不塌缩成 0 的事实：总量只加已知桶）。
 	b2 := domain.UsageBuckets{InputTokens: intp(10)}
-	if got := NormalizedTokens(b2); got != 10 {
-		t.Errorf("normalized tokens = %d, want 10", got)
+	if got, err := NormalizedTokens(b2); err != nil || got != 10 {
+		t.Errorf("normalized tokens = %d, err = %v, want 10", got, err)
 	}
 	// 缓存写入单独计入（它不在输入里）。
 	b3 := domain.UsageBuckets{InputTokens: intp(5), CacheWriteTokens: intp(7), OutputTokens: intp(3)}
-	if got := NormalizedTokens(b3); got != 15 {
-		t.Errorf("normalized tokens = %d, want 15", got)
+	if got, err := NormalizedTokens(b3); err != nil || got != 15 {
+		t.Errorf("normalized tokens = %d, err = %v, want 15", got, err)
 	}
 	// 全部未上报 → 0（没有任何已知 token）。
-	if got := NormalizedTokens(domain.UsageBuckets{}); got != 0 {
-		t.Errorf("normalized tokens = %d, want 0", got)
+	if got, err := NormalizedTokens(domain.UsageBuckets{}); err != nil || got != 0 {
+		t.Errorf("normalized tokens = %d, err = %v, want 0", got, err)
 	}
 }
 

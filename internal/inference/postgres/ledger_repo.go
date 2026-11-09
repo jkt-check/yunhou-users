@@ -49,6 +49,10 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	if cmd.ChargeMicros < 0 {
 		return domain.WrapError(domain.CodeInvalidInput, "settle: negative charge", domain.ErrNegativeValue)
 	}
+	tokens, err := access.NormalizedTokens(cmd.Usage.Buckets)
+	if err != nil {
+		return err
+	}
 
 	// 1. Lock the request (fixed order: account is never needed here; the
 	// request row is what release also locks). The charge carries the
@@ -123,7 +127,7 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 
 	// 钱包路径（Task 14）：micromoney 结算 + 钱包冻结转消费，全程同一事务。
 	if domain.ChargeSource(chargeSource) == domain.ChargeSourceWallet {
-		return s.settleWallet(ctx, tx, cmd, accountID, priceVersionID, reqStatus)
+		return s.settleWallet(ctx, tx, cmd, accountID, priceVersionID, reqStatus, tokens)
 	}
 
 	// 2. The monetary holds the admission created. A request whose policy
@@ -156,7 +160,7 @@ func (s *Store) Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.Sett
 	// normalized token consumption (an over-hold is counted in full — never
 	// clamped to the hold). The RPM count is untouched: the request was
 	// admitted and counts once.
-	if err := s.settleRateTx(ctx, tx, cmd.RequestID, access.NormalizedTokens(cmd.Usage.Buckets)); err != nil {
+	if err := s.settleRateTx(ctx, tx, cmd.RequestID, tokens); err != nil {
 		return err
 	}
 
@@ -462,7 +466,7 @@ func usageBucketsEmpty(b domain.UsageBuckets) bool {
 // Crash recovery calls this with cmd.WalletCharge == nil: the conservative
 // charge then equals the RESERVED hold (cmd.ChargeMicros) in the wallet's
 // own currency (Task 9 口径: 未知费用 → 按预占额保守入账，可冲正).
-func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.SettleCommand, accountID string, priceVersionID *string, status domain.RequestStatus) error {
+func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.SettleCommand, accountID string, priceVersionID *string, status domain.RequestStatus, tokens int64) error {
 	if cmd.ChargeMicros < 0 {
 		return domain.WrapError(domain.CodeInvalidInput, "settle wallet: negative charge", domain.ErrNegativeValue)
 	}
@@ -480,7 +484,7 @@ func (s *Store) settleWallet(ctx context.Context, tx *sqlx.Tx, cmd domain.Settle
 
 	// 2b. Rate reservation (Task 4): the TPM hold becomes the ACTUAL
 	// normalized token consumption (same口径 as the plan path).
-	if err := s.settleRateTx(ctx, tx, cmd.RequestID, access.NormalizedTokens(cmd.Usage.Buckets)); err != nil {
+	if err := s.settleRateTx(ctx, tx, cmd.RequestID, tokens); err != nil {
 		return err
 	}
 

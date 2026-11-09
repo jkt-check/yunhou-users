@@ -24,6 +24,7 @@
 package access
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
@@ -50,14 +51,28 @@ const (
 //     already carries it exactly once);
 //   - a bucket nobody reported stays unknown (nil contributes nothing —
 //     unknown never collapses into zero).
-func NormalizedTokens(b domain.UsageBuckets) int64 {
+//
+// Invalid evidence is rejected rather than clamped or allowed to wrap.
+func NormalizedTokens(b domain.UsageBuckets) (int64, error) {
+	if b.ReasoningTokens != nil && *b.ReasoningTokens < 0 {
+		return 0, domain.WrapError(domain.CodeInvalidInput,
+			"normalized tokens: negative reasoning detail", domain.ErrNegativeValue)
+	}
 	total := int64(0)
 	for _, p := range []*int64{b.InputTokens, b.CacheReadTokens, b.CacheWriteTokens, b.OutputTokens} {
 		if p != nil {
+			if *p < 0 {
+				return 0, domain.WrapError(domain.CodeInvalidInput,
+					"normalized tokens: negative bucket", domain.ErrNegativeValue)
+			}
+			if *p > math.MaxInt64-total {
+				return 0, domain.WrapError(domain.CodeInvalidInput,
+					"normalized tokens: total exceeds int64", domain.ErrOverflow)
+			}
 			total += *p
 		}
 	}
-	return total
+	return total, nil
 }
 
 // KnownTokenBuckets reports whether the buckets carry any KNOWN token
@@ -113,8 +128,18 @@ func EvaluateRateLimits(limits domain.RateLimits, usage domain.RateUsage, reserv
 		}
 	}
 	if limits.PolicyTPM > 0 {
-		tpmUsed := usage.SettledTokens + usage.InflightTokens + reservedTokens
-		if tpmUsed > limits.PolicyTPM {
+		var tpmUsed int64
+		overflow := false
+		for _, tokens := range []int64{usage.SettledTokens, usage.InflightTokens, reservedTokens} {
+			if tokens > math.MaxInt64-tpmUsed {
+				// Only the diagnostic saturates. Overflow still blocks a
+				// policy whose limit is itself MaxInt64.
+				tpmUsed, overflow = math.MaxInt64, true
+				break
+			}
+			tpmUsed += tokens
+		}
+		if overflow || tpmUsed > limits.PolicyTPM {
 			// The TPM recovers deterministically only when nothing is in
 			// flight: an in-flight hold's real consumption is unknown, so no
 			// second may be promised. The store leaves RecoverySeconds at 0

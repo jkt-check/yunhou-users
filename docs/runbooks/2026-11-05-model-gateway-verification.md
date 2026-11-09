@@ -6332,6 +6332,69 @@ or historical-data repair; real-provider/client and cross-host
 acceptance remain unverified. No push, merge, deployment, adjacent
 repository modification or kaya process operation is part of this work.
 
+### 4.74 Token Arithmetic Boundaries Checkpoint (2026-11-09/10)
+
+The latest user request is a local commit checkpoint for the existing
+Task 14 implementation. The regression tests were already committed in
+`addd079`; this checkpoint completes their production fix, not the
+broader until-clean review.
+
+**Changed files:**
+
+- `internal/inference/access/inference_limits.go`: return a typed
+  `invalid_input` error for negative token buckets or reasoning detail,
+  or a normalized sum above MaxInt64. Check TPM addition and reject
+  overflow even at a MaxInt64 policy; saturate only diagnostic `Used`.
+- `internal/inference/postgres/ledger_repo.go`: validate tokens before
+  SQL, terminal duplicate classification or wallet dispatch, and pass
+  the checked total to both settlement paths.
+- `internal/inference/access/inference_limits_test.go`: adapt existing
+  normalization assertions to the error-returning helper without
+  changing cache, reasoning or unknown-bucket expectations.
+- `docs/superpowers/plans/2026-11-05-users-model-gateway-completion.md`:
+  update the actual T4 helper signature.
+- The convergence plan and this runbook: record validation and scope.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.C9h1kz/focused.jsonl` | Revalidated pre-fix RED: three TPM overflow cases admitted in both pure and PostgreSQL rules; wrapped-positive settlement accepted on plan and wallet, while negative evidence aborted the transaction. |
+| `run.1fvhmM/focused.jsonl` | GREEN: focused race passed 19 tests/subtests across access and PostgreSQL with no failures or skips. Covers exact-Max and disabled-limit controls, overflow rejection without admission effects, invalid evidence before writes, same-transaction valid retry, reasoning counted once, and invalid duplicate evidence on both funding paths. |
+| `run.hmsZjn/tests.jsonl` | Fresh whole-branch GREEN: build/vet passed; full race passed 4,489 tests/subtests across 34 packages with zero failures. |
+| `run.hmsZjn/coverage-summary.log` | Total statement coverage 80.6%; the 80% floor passed. |
+| `run.hmsZjn/e2e.jsonl` | E2E race passed 186 tests/subtests with zero failures (241.174s). The runner exited 0 on 2026-11-10 (Asia/Shanghai). |
+
+Focused command:
+`go test -race -count=1 -p 1 -json ./internal/inference/access ./internal/inference/postgres -run '^(TestEvaluateRateLimits_TPMCannotWrapIntoAdmission|TestReserveRateTx_TPMOverflowCannotBypassLimit|TestSettle_RejectsInvalidTokenTotalsBeforeWriting)$' -timeout=5m`.
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...`.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+The focused and full runs each used an owned disposable PostgreSQL
+cluster with explicit, separate `DATABASE_URL` and `E2E_DATABASE_URL`.
+Both databases applied all 55 migrations and skipped all 55 on rerun.
+Cleanup logs confirm both owned PostgreSQL servers stopped.
+
+Full race skipped only `TestQuotaWorkerProcess` (the child-process entry)
+and the two `KAYA_LOAD=1` load-drill opt-ins. E2E skipped only
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` (`USAGE_ACCEPTANCE=1`
+opt-in). No database acceptance was skipped.
+
+Euler's bounded read-only review found no confirmed Critical or Important
+issues and did not independently execute tests. One minor coverage gap
+remains: negative cache-read, cache-write and output are not individually
+exercised, although all normalized buckets share the same validation loop.
+
+**Remaining scope:** no migration or historical-data repair is included.
+Unchanged SQL aggregate range exhaustion and standalone usage/correction
+entry points are not covered by this delta. The production correction
+trigger and wallet correction remain open original requirements;
+real-provider/client and cross-host acceptance remain unverified.
+No push, merge, deployment, adjacent repository modification or kaya
+process operation is part of this checkpoint.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

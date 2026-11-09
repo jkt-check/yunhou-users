@@ -165,7 +165,7 @@ type RateLimitError struct { Detail *Error; Blocks []RateBlock; RetryAfterSecond
 
 // internal/inference/access/inference_limits.go —— 纯规则（无数据库、无时钟）
 const RateWindowSeconds = 60
-func NormalizedTokens(b domain.UsageBuckets) int64
+func NormalizedTokens(b domain.UsageBuckets) (int64, error) // 负值/溢出证据在写入前返回 invalid_input
 func KnownTokenBuckets(b domain.UsageBuckets) bool // 归一化口径是否有已知 token 量（unknown ≠ 0）
 func EvaluateRateLimits(limits domain.RateLimits, usage domain.RateUsage, reservedTokens int64) *domain.RateLimitError
 func RecoverySeconds(blocks []domain.RateBlock) int // 只有每个阻断约束都有可确定恢复时刻才给倒计时

@@ -637,7 +637,7 @@ boundaries. This is not a whole-branch until-clean conclusion.
 FOR SHARE on the same transaction and reject a mismatching account or
 policy with `conflict`. Hold that lock through admission commit.
 
-- [ ] Reproduce each live window retaining limit 100 after upgrade to 200,
+- [x] Reproduce each live window retaining limit 100 after upgrade to 200,
   with used 90 and reserved 5; a hold of 20 must admit.
 - [ ] Preserve IDs, boundaries, creation time, used and existing reserved;
   change only the live enabled row's limit, including effective decreases.
@@ -657,6 +657,26 @@ historical consumption. A rejected admission rolls back the refresh too.
 A stale snapshot fails closed with the existing conflict code rather than
 retrying internally with the same stale limits. Renewal under the same
 policy remains valid; this does not remove the existing bounded cache.
+
+RED commit checkpoint (2026-11-10): the latest user `commit` request
+checkpoints `postgres/quota_upgrade_test.go` and this evidence without a
+production fix. Fresh focused race run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.3DxbOU/focused.jsonl`
+exited 1: all 12 leaf cases failed on the intended behavior assertions
+(16 failed test/subtest events including parents, no skips). The cases
+cover all three upgrade bottlenecks, effective decreases and rollback,
+history/disabled-kind preservation, newly enabled monthly windows, stale
+policy snapshots, account ownership, and both revision/admission lock
+orders. Policy-only updates demonstrate that incidental FK KEY SHARE
+does not protect admission from a concurrent policy change.
+
+The runner used its own disposable PostgreSQL cluster on loopback port
+55491 with explicit review_app/review_e2e DSNs. Both databases applied all
+55 migrations and skipped all 55 on rerun; cleanup.log confirms the owned
+server stopped. No kaya process was operated on. Formatting and diff
+checks passed. Full race/coverage and E2E were not rerun for this RED-only
+checkpoint; prior green coverage does not describe this tree. Production
+fixes and the rest of Task 19 remain open.
 
 ## Pending Review Findings (2026-11-10)
 

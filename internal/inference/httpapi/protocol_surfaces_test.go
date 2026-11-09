@@ -714,7 +714,7 @@ type matrixFixture struct {
 	// upCalls counts upstream requests; upBodies records their bodies.
 	upCalls  atomic.Int32
 	upBodies chan []byte
-	// upstreamHandler overrides the default non-streaming answer when set.
+	// upstreamHandler overrides the default answer when set.
 	upstreamHandler atomic.Value // func(w http.ResponseWriter, r *http.Request, body []byte)
 	// truncate makes the upstream end its SSE stream WITHOUT the protocol's
 	// terminal frame (半截 EOF).
@@ -745,12 +745,12 @@ func newMatrixFixture(t *testing.T, proto domain.Protocol) *matrixFixture {
 		case f.upBodies <- body:
 		default:
 		}
-		if strings.Contains(string(body), `"stream":true`) {
-			f.writeUpstreamStream(w)
-			return
-		}
 		if h, ok := f.upstreamHandler.Load().(func(http.ResponseWriter, *http.Request, []byte)); ok {
 			h(w, r, body)
+			return
+		}
+		if strings.Contains(string(body), `"stream":true`) {
+			f.writeUpstreamStream(w)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

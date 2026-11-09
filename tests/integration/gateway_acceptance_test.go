@@ -839,7 +839,7 @@ func TestAcceptance_BrokenStreamParksWithoutSilentZero(t *testing.T) {
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
-				_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_brk\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up\",\"content\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n")
+				_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_brk\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up\",\"content\":[],\"usage\":{\"input_tokens\":7}}}\n\n")
 			})
 			w := st.call(t, e)
 			if w.Code != http.StatusOK {
@@ -942,7 +942,7 @@ func TestAcceptance_ClientInterruptionSettlesAndReleases(t *testing.T) {
 				}
 				accJSONOpenAI(w, r, body)
 			})
-			// Anthropic 口径上游：message_start（已报 input）+ 一段内容后保持
+			// Anthropic 口径上游：message_start（已报 input/output）+ 一段内容后保持
 			// 连接打开 —— 已读到的用量按 estimated 结算。
 			st.anthUp.set(func(w http.ResponseWriter, r *http.Request, body []byte) {
 				if !strings.Contains(string(body), `"stream":true`) {
@@ -978,7 +978,7 @@ func TestAcceptance_ClientInterruptionSettlesAndReleases(t *testing.T) {
 			id := onlyRequestID(t, st.db)
 			f := readAccFacts(t, st.db, id)
 			if e.protocol == "anthropic_messages" {
-				// 已读到用量：按已读量结算（estimated），未报到的桶保持 NULL。
+				// 已读到 input/output：按已读量结算（estimated），不得丢弃初始 output。
 				if f.Status != "settled" {
 					t.Errorf("status = %q, want settled (usage was read before the client left)", f.Status)
 				}
@@ -988,8 +988,8 @@ func TestAcceptance_ClientInterruptionSettlesAndReleases(t *testing.T) {
 				if !f.InputTokens.Valid || f.InputTokens.Int64 != accInputTokens {
 					t.Errorf("input tokens = %v, want %d", f.InputTokens, accInputTokens)
 				}
-				if f.OutputTokens.Valid {
-					t.Errorf("output tokens = %v, want NULL (未报到的桶不得记零)", f.OutputTokens)
+				if !f.OutputTokens.Valid || f.OutputTokens.Int64 != 1 {
+					t.Errorf("output tokens = %v, want 1 from message_start", f.OutputTokens)
 				}
 				if f.ChargeRows != 1 {
 					t.Errorf("ledger charges = %d, want 1", f.ChargeRows)

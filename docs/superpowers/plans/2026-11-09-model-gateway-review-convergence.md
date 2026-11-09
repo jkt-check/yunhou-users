@@ -123,11 +123,11 @@ domain error mapping, HTTP handlers, regression tests and API documentation.
 
 ## Task 9: Interrupted Anthropic Start Usage
 
-**Files:** `anthropic_stream.go` and provider stream tests.
+**Files:** `anthropic_stream.go` and provider/gateway stream tests.
 
-- [ ] Reproduce message_start input/output usage followed by error or EOF
+- [x] Reproduce message_start input/output usage followed by error or EOF
   losing known output usage.
-- [ ] Preserve the initial counters; later cumulative message_delta
+- [x] Preserve the initial counters; later cumulative message_delta
   counters replace, rather than add to, the initial values.
 
 ## Execution Notes
@@ -313,3 +313,57 @@ The file manifest, exact evidence paths and remaining risks are in
 runbook 4.67. Task 9, unresolved relay failures and the until-clean
 review remain open. No push, merge, deployment or kaya process operation
 is part of this checkpoint.
+
+### Interrupted Anthropic Usage Checkpoint
+
+The latest user request is a local Task 9 commit checkpoint, not a new
+whole-branch review. Preserve output usage from `message_start`, including
+reported zero, without changing the existing cumulative replacement rule
+for later `message_delta` usage.
+
+Provider RED reproduced missing output in the tap, raw usage and translated
+wire on EOF, read error, protocol error and a delta without output.
+The disposable-database RED run `run.RwICUb` reproduced a charge of 25
+instead of 59 for known input/output 25/17. The full providers race suite
+passed after the assignment fix (5.438s).
+
+The gateway regression follows the existing relay contract: without a
+terminal marker it calls `Finish(EndUpstreamBroke)`, then verifies that a
+duplicate `Finish(EndCompleted)` cannot change settlement or attempt state.
+The first post-fix test attempt incorrectly passed `EndCompleted` for the
+interrupted stream; that fixture error was corrected, not production
+finalization behavior.
+
+The unfinished `internal/relay/conn_test.go` changes are excluded from this
+checkpoint. Their owner confirmed that `TestWSConnectionCaps` still
+contains a deliberately delayed hello reproducing its timeout; no relay
+production fix has been made. They remain in the worktree, without being
+reverted or presented as completed work.
+
+The corrected database-backed gateway regression passed both interrupted
+endings (three test/subtest passes, 0.33s) in `run.q2GTJf`. Independent
+E2E `run.U9pgJY` exited 0 with 186 test/subtest passes and one expected
+`USAGE_ACCEPTANCE=1` opt-in skip. It used its own disposable PostgreSQL
+cluster, whose cleanup confirmed server stopped.
+
+Full `run.q2GTJf` exited 1: build/vet passed, 4,424 test/subtest passes,
+seven failure events, 32 passing packages and two failing packages.
+Coverage was 80.6% from this non-green run. The three expected skips were
+the quota worker child entry and two opt-in load drills, not unavailable
+databases. Both disposable databases passed all 55 migrations and their
+idempotent rerun, and the owned PostgreSQL cluster stopped.
+
+Besides the excluded relay RED, three Messages integration fixtures
+reported initial output 1 while asserting NULL. Correct the EOF fixture
+to truly omit output, preserving unknown-bucket coverage, and make client
+interruption/protocol-error assertions retain 1. These two integration
+test files are part of the checkpoint; no additional production change.
+
+The complete integration race recheck `run.KdvIFK` exited 0 after those
+corrections: 82 test/subtest passes, two expected opt-in load-drill skips,
+no failures or database-unavailable skips (143.433s). A new owned
+disposable PostgreSQL cluster applied all 55 migrations to both databases,
+skipped all 55 on rerun, and stopped on cleanup. Task 9 implementation
+and its seven-file local checkpoint are verified; the earlier full gate
+is still non-green, relay work remains excluded, and review convergence
+is not complete. No push, merge, deployment or kaya process operation.

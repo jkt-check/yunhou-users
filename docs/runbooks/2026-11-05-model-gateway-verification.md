@@ -5930,6 +5930,106 @@ that non-green run. This local checkpoint does not resolve Task 9 or
 the until-clean review, and performs no push, merge, deployment or
 kaya process operation.
 
+### 4.68 Interrupted Anthropic initial usage checkpoint (2026-11-09)
+
+This local commit checkpoint addresses Task 9 only. It does not claim
+that the whole-branch review has converged.
+
+#### 4.68.1 Behavior and regression evidence
+
+The Anthropic translator parsed `message_start.usage.output_tokens` but
+never copied it into its merged usage state. An interrupted stream with
+no later output counter therefore lost output usage in the authoritative
+tap, raw usage and translated SSE. The fix retains that initial pointer,
+including a reported zero. Later `message_delta` output counters remain
+cumulative replacements, not increments; an absent counter stays unknown.
+
+The provider regression covers EOF, read error, error followed by
+`message_stop`, reported zero, absent output, later cumulative output and
+a delta without output. All seven cases run with one-byte, 23-byte and
+whole-stream reads. Before the fix, the initial-output cases lost their
+tap/raw/wire counts. The complete providers race suite passed after the
+fix (5.438 seconds, `GOMAXPROCS=2`, `GOPROXY=off`,
+`GOFLAGS=-mod=readonly`).
+
+The disposable-database RED run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.RwICUb` reproduced a charge
+of 25 instead of 59 for known input/output usage 25/17. The gateway
+regression covers EOF and protocol error followed by stop. It asserts
+estimated 25/17 usage, a failed interrupted attempt, settled TPM 42, one
+charge of 59, one dispatch and no held money or concurrency leases.
+A duplicate completion cannot change that settlement. The fixture
+reports `EndUpstreamBroke` when no terminal marker is observed, matching
+the existing relay contract.
+
+The corrected gateway regression passed both endings in `run.q2GTJf`
+(three test/subtest passes, 0.33 seconds). Independent E2E
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.U9pgJY` exited 0:
+186 test/subtest passes, one expected `USAGE_ACCEPTANCE=1` opt-in skip,
+no failures or database-unavailable skips. It ran with `GOMAXPROCS=2`,
+`GOPROXY=off`, `GOFLAGS=-mod=readonly` and
+`go test -race -count=1 -p 1 -json ./tests/e2e/... -timeout=30m`.
+Its owned disposable PostgreSQL cluster used port 55490 and separate
+`review_app`/`review_e2e` databases; all 55 migrations applied and skipped
+all 55 on rerun. Cleanup confirmed server stopped.
+
+The full current-worktree run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.q2GTJf` exited 1.
+Build and vet passed. The race command was
+`go test -race -count=1 -p 1 -coverprofile=.../coverage.out -json ./internal/... ./cmd/... ./tests/integration/...`.
+It recorded 4,424 test/subtest passes, seven failure events and three
+expected skips (the quota child-process entry point and two `KAYA_LOAD=1`
+opt-in drills); 32 packages passed and two failed. There were no
+database-unavailable skips. Coverage was 80.6%, measured from this
+non-green run, not a passing gate. Both disposable databases applied 55
+migrations and skipped all 55 on rerun; cleanup stopped the owned cluster.
+
+The failure events were `TestWSConnectionCaps` plus three Messages
+integration subtests and their parents:
+`TestAcceptance_BrokenStreamParksWithoutSilentZero`,
+`TestAcceptance_ClientInterruptionSettlesAndReleases` and
+`TestProtocols_BrokenStreamSequence`. Each integration fixture reported
+initial `output_tokens:1`, but its assertion expected NULL. The missing
+counter assignment had hidden that contradiction. The EOF acceptance
+fixture now genuinely omits output, retaining the unknown-bucket guard;
+client interruption and protocol error assertions retain the reported 1.
+No additional production behavior was changed for these assertions.
+
+The complete integration race recheck
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.KdvIFK` exited 0 after
+those test corrections: 82 test/subtest passes, two expected opt-in load
+drill skips, no failures or database-unavailable skips (143.433 seconds).
+It used a new owned disposable PostgreSQL cluster on port 55490 with
+separate explicit application/E2E database URLs, `GOMAXPROCS=2`,
+`GOPROXY=off`, `GOFLAGS=-mod=readonly` and
+`go test -race -count=1 -p 1 -json ./tests/integration/... -timeout=30m -coverprofile=.../task9-integration-final-coverage.out`.
+Both databases applied all 55 migrations and skipped all 55 on rerun;
+cleanup confirmed server stopped. This recheck clears the three stale
+integration assertions; it does not turn the earlier full run into a
+passing gate or complete the excluded relay work.
+
+#### 4.68.2 Deliverable file manifest and remaining risks
+
+| Files | Change |
+|---|---|
+| `internal/inference/providers/anthropic_stream.go` | Retain initial output usage without changing later cumulative replacement |
+| `internal/inference/providers/anthropic_start_usage_test.go` | Fragmentation, interruption, known-zero/absent and cumulative-counter regressions |
+| `internal/inference/gateway/anthropic_start_usage_test.go` | Database-backed exactly-once charge, usage, TPM and lease assertions |
+| `tests/integration/gateway_acceptance_test.go`, `tests/integration/inference_protocols_test.go` | Align interrupted-stream fixtures and assertions with reported versus absent initial output |
+| `docs/superpowers/plans/2026-11-09-model-gateway-review-convergence.md`, this runbook | Checkpoint scope, evidence, manifest and remaining risks |
+
+The unfinished `internal/relay/conn_test.go` changes are deliberately
+excluded from this commit and left intact in the worktree. Their owner
+reported a passing targeted deterministic slow-consumer check, but the
+connection-cap test still contains an intentionally delayed hello RED
+reproduction and no production repair. These changes are not a completed
+relay fix. Full-worktree verification must report that boundary.
+
+Nonstream upstream-lease release ordering, cross-process rate acceptance,
+the original wallet-correction boundary and the final independent branch
+review remain separate unfinished work. Local simulated upstreams are
+not real supplier acceptance.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

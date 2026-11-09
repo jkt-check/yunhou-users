@@ -565,9 +565,8 @@ func TestProtocols_BrokenStreamSequence(t *testing.T) {
 				t.Fatalf("broken stream must never emit message_stop: %v", events)
 			}
 		}
-		// 中断但 message_start 已携带用量(input=5;output 未报到):已读部分
-		// 按 estimated 结算(设计 §7.1/§7.2:已知实际量不记零、不丢账),
-		// 未报到桶保持 NULL(NULL ≠ 0)。
+		// 中断但 message_start 已携带用量(input=5;output=1):两个桶均
+		// 按 estimated 结算(设计 §7.1/§7.2:已知实际量不记零、不丢账)。
 		var status, usageStatus string
 		var in, out *int64
 		if err := st.db.QueryRow(`SELECT r.status, r.usage_status, u.input_tokens, u.output_tokens
@@ -575,8 +574,8 @@ func TestProtocols_BrokenStreamSequence(t *testing.T) {
 			ORDER BY r.created_at DESC LIMIT 1`).Scan(&status, &usageStatus, &in, &out); err != nil {
 			t.Fatal(err)
 		}
-		if status != "settled" || usageStatus != "estimated" || in == nil || *in != 5 || out != nil {
-			t.Errorf("interrupted-with-usage = %s/%s in=%v out=%v, want settled/estimated in=5 out=NULL",
+		if status != "settled" || usageStatus != "estimated" || in == nil || *in != 5 || out == nil || *out != 1 {
+			t.Errorf("interrupted-with-usage = %s/%s in=%v out=%v, want settled/estimated in=5 out=1",
 				status, usageStatus, in, out)
 		}
 	})

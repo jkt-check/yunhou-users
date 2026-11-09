@@ -106,7 +106,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 
 	var input, output, cacheRead, cacheWrite *int64
 	flushUsage := func() {
-		// message_start already reported input/cache; message_delta carries
+		// message_start reports initial counters; message_delta carries
 		// cumulative output. The tap always holds the latest merged view.
 		if input != nil || output != nil || cacheRead != nil || cacheWrite != nil {
 			tap.recordUsage(input, output, cacheRead, cacheWrite,
@@ -130,6 +130,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 		case "message_start":
 			if ev.Message != nil && ev.Message.Usage != nil {
 				input = ev.Message.Usage.InputTokens
+				output = ev.Message.Usage.OutputTokens
 				cacheRead = ev.Message.Usage.CacheReadTokens
 				cacheWrite = ev.Message.Usage.CacheCreationTokens
 				flushUsage()

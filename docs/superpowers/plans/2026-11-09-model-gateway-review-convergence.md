@@ -821,9 +821,9 @@ at `ResponsesHandler.persistChain` before any row or session binding.
 - [x] Cover replayable text/tool output, an unrepresentable child that
   leaves its parent usable, and input/output adjacency that is only
   unrepresentable in the combined transcript.
-- [ ] Validate replayability centrally before persistence; log and skip
+- [x] Validate replayability centrally before persistence; log and skip
   only the new chain. Keep successful stream output/accounting unchanged.
-- [ ] Run focused race, full race/coverage and separate E2E on owned
+- [x] Run focused race, full race/coverage and separate E2E on owned
   disposable databases, document evidence and commit locally.
 
 Ruling: successful ordered streams remain successful; completion does
@@ -859,12 +859,35 @@ this intentionally non-green checkpoint; Task 21's 80.7% is not coverage
 of this tree. Task 22's production fix, API documentation and full gate
 remain open. No push, merge, deployment or kaya process operation.
 
+Implementation checkpoint (2026-11-10): `persistChain` now validates
+the combined transcript after the existing 4 MiB cap and before any
+chain insert or session binding. API guide/OpenAPI document the explicit
+non-persistence contract and correct the obsolete 512 KiB documentation.
+Fresh pre-fix focused race `run.yy5rWY` reproduced the seven failing
+cases; both valid controls passed. Post-fix complete HTTP package race
+`run.se4rH9` passed all 373 tests/subtests in 58.719s, without failures
+or skips. Its owned PostgreSQL stopped.
+
+Fresh full gate `run.l5HHVZ` exited 0: build/vet passed; full race passed
+4,727 tests/subtests across 34 packages, with zero failures and 80.7%
+statement coverage. Separate E2E race passed 186 tests/subtests in
+154.854s. Only the expected child entry and opt-in load/usage drills
+skipped; no database acceptance skipped. Each owned database applied all
+55 migrations and skipped all 55 on rerun. Cleanup confirmed the owned
+server stopped and `postmaster.pid` is absent. Formatting, API YAML
+parsing and diff checks passed. Lovelace's bounded read-only review found
+no new important issue in this task diff; it did not independently run
+tests or review the whole branch. See runbook 4.82 for the file manifest,
+commands and compatibility limitation. This local checkpoint does not
+complete the remaining review findings.
+
 ## Pending Review Findings (2026-11-10)
 
-These are reviewer findings to verify, not completed fixes or waived scope:
+This list tracks findings and verified closures; unfinished items are
+not waived scope:
 
-- Responses stream output with a tool followed by text may be persisted even
-  though the saved chain cannot be faithfully replayed.
+- Responses stream output with a tool followed by text no longer creates
+  an unusable stored chain; fixed and verified in Task 22.
 - Responses explicit `reasoning.effort=none` may lose its disable intent on
   OpenAI Chat egress.
 - Anthropic cache-write inclusion was fixed and verified in Task 21.

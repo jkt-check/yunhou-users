@@ -1055,10 +1055,13 @@ paths:
         `reasoning.effort` 的档位（low/medium/high/xhigh）**逐字**透传给
         能表达该档位的上游协议；词表外的档位明确 400。
 
-        **会话链**：成功响应（store≠false）持久化完整 transcript（24h
-        TTL,≤512 KiB）;引用 `previous_response_id` = 上下文回放 + 粘性
-        绑定同一上游账号,账号失效显式迁移(不静默换号)。引用不存在/过期/
-        他人/store:false 的响应一律 404 `previous_response_not_found`。
+        **会话链**：成功响应（store≠false）仅在完整输入/输出 transcript
+        可忠实回放且≤4 MiB 时持久化（24h TTL）。工具调用后、工具结果前
+        仍有 assistant 文本等不可保序历史不落链、不建立新会话绑定；
+        流式输出顺序、成功终态、usage 和结算不变，已有父链不受影响。
+        引用 `previous_response_id` = 上下文回放 + 粘性绑定同一上游账号,
+        账号失效显式迁移(不静默换号)。引用不存在/过期/他人/store:false/
+        超限或不可回放的响应一律 404 `previous_response_not_found`。
 
         流式事件序列 `response.created → response.in_progress →
         response.output_item.added → (output_text.delta |
@@ -2506,7 +2509,7 @@ components:
           description: "false = 不落会话链,后续 previous_response_id 引用得 404"
         previous_response_id:
           type: string
-          description: "会话链引用:transcript 回放 + 粘性绑定同一上游账号;跨客户/过期/store:false 一律 404"
+          description: "会话链引用:transcript 回放 + 粘性绑定同一上游账号;跨客户/过期/store:false/超限/不可回放未落链一律 404"
         tools:
           type: array
           maxItems: 128

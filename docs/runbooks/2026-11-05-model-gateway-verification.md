@@ -6938,6 +6938,78 @@ evidence-to-correction trigger remain unfinished. Real-provider/client
 and cross-host acceptance remain unverified. No push, merge, deployment,
 adjacent-repository edit or kaya process operation is included.
 
+### 4.82 Responses Chain Replayability (2026-11-10)
+
+This checkpoint addresses Task 22 only. It is not a whole-branch
+until-clean review conclusion.
+
+**Changed files:**
+
+- `internal/inference/httpapi/responses.go`: validate the full combined
+  transcript with `ResponsesReplayToChat` after the existing byte cap
+  and before any chain insert or first-chain session binding.
+- `docs/api-integration-guide.md` and
+  `docs/api/kaya-coding-plan.openapi.yaml`: document non-persistence of
+  unreplayable transcripts and correct the obsolete 512 KiB text to the
+  existing 4 MiB cap.
+- The convergence plan and this runbook record scope and verification.
+- Regressions and shared fixture wiring were already committed in
+  `0139cf1`: `internal/inference/httpapi/responses_chain_replay_test.go`
+  and `internal/inference/httpapi/protocol_surfaces_test.go`.
+
+**RED/GREEN evidence:** logs are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.yy5rWY/focused.jsonl` | Pre-fix focused race reproduced seven failing cases (nine failure events including parents): unusable chains/bindings were saved and references returned 400 instead of 404. Both replayable controls passed. |
+| `run.se4rH9/focused.jsonl` | Post-fix complete HTTP package race passed 373 tests/subtests in 58.719s, with no failures or skips. |
+| `run.l5HHVZ/tests.jsonl` | Full race passed 4,727 tests/subtests across 34 packages, zero failures. |
+| `run.l5HHVZ/coverage-summary.log` | Total statement coverage 80.7%; the 80% floor passed. |
+| `run.l5HHVZ/e2e.jsonl` | Separate E2E race passed 186 tests/subtests in 154.854s, zero failures. |
+
+The regression matrix covers tool/text and before/tool/after output
+with completed and incomplete stream terminals, valid before/tool
+controls, preservation and reuse of an existing parent, and a combined
+input/output transcript that becomes unreplayable only at the boundary.
+Assertions preserve terminal output order, reported 7/5 usage, one
+settlement per executed request, TPM = 12 and no leaked money/rate holds
+or concurrency leases. Missing-chain references do not admit or execute
+a new request. The helper checks terminal output order, not every
+incremental SSE event; the translator is unchanged.
+
+The full gate command was
+`GOMAXPROCS=2 zsh /private/tmp/yunhou-review-20261109.3NuMWy/run.zsh`.
+It ran `go build ./...`, `go vet ./internal/... ./cmd/...`,
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile="$RUN/coverage.out" -json ./internal/... ./cmd/... ./tests/integration/...`
+and
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+The runner exited 0. Build/vet logs are empty.
+
+Explicit `DATABASE_URL` and `E2E_DATABASE_URL` selected separate fresh
+owned databases on loopback port 55489. Each applied all 55 migrations
+and skipped all 55 on rerun. Dependencies remained offline/read-only
+(`GOPROXY=off`, `GOFLAGS=-mod=readonly`), with `GOMAXPROCS=2` and
+serialized packages. Only the child-only `TestQuotaWorkerProcess`,
+two `KAYA_LOAD=1` load drills and the E2E `USAGE_ACCEPTANCE=1` drill
+skipped; no database acceptance skipped. Cleanup confirmed the owned
+PostgreSQL stopped and `postmaster.pid` is absent. Formatting, API YAML
+parsing and diff whitespace checks passed.
+
+Lovelace's independent read-only review of the task diff found no new
+important issue. It did not independently run tests or review the whole
+branch, DB fault/migration concurrency or real-provider behavior.
+
+**Remaining scope:** successful ordered streams and their accounting
+remain successful, but histories that cannot fit the existing Chat
+replay model are deliberately not stored; referencing those response IDs
+returns 404. Existing parent chains remain usable. This does not add
+native lossless replay support or repair previously stored bad chains.
+The reasoning-none finding, wallet corrections and the production
+evidence-to-correction trigger remain unfinished. Real-provider/client
+and cross-host acceptance remain unverified. No push, merge, deployment,
+adjacent-repository edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

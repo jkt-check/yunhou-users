@@ -25,7 +25,7 @@ func TestGateway_NonstreamFinalizerPreservesCompetingTerminal(t *testing.T) {
 				t.Run(competing, func(t *testing.T) {
 					f := newFixture(t, newUpstream(t, nonStreamUsage(10, 5)), opts...)
 					ctx := context.Background()
-					var requestID, before string
+					var requestID, incomingAttemptID, before string
 					var requestBefore *domain.Request
 					var alarms []error
 					hooks := 0
@@ -39,6 +39,7 @@ func TestGateway_NonstreamFinalizerPreservesCompetingTerminal(t *testing.T) {
 						Store: f.store,
 						beforeFinish: func(ctx context.Context, attemptID string) {
 							hooks++
+							incomingAttemptID = attemptID
 							if err := f.db.GetContext(ctx, &requestID,
 								`SELECT request_id FROM inference_attempts WHERE id=$1`, attemptID); err != nil {
 								t.Fatal(err)
@@ -141,6 +142,33 @@ func TestGateway_NonstreamFinalizerPreservesCompetingTerminal(t *testing.T) {
 							detail.Status != string(requestBefore.Status) {
 							t.Errorf("job detail = %s, %v", raw, err)
 						}
+						evidence := loadTerminalEvidence(t, f, requestID, 1)
+						for _, observation := range evidence {
+							wantCharge := int64(20)
+							if zeroPrice {
+								wantCharge = 0
+							}
+							if observation.RequestID != requestID || observation.AttemptID != incomingAttemptID ||
+								observation.Source != domain.UsageReported || observation.RawUsageSchemaVersion != 1 ||
+								observation.Price.ID != f.priceID || observation.Price.ModelID != f.modelID ||
+								observation.Price.Kind != "sale_credit" || observation.Price.Revision != 1 ||
+								observation.Charge.Source != "plan" || observation.Charge.Unit != "microcredit" ||
+								observation.Charge.Currency != "" || observation.Charge.AmountMicros != wantCharge {
+								t.Errorf("incoming evidence = %+v", observation)
+							}
+							assertTerminalBucket(t, observation.Buckets, "input_tokens", int64Ptr(10))
+							assertTerminalBucket(t, observation.Buckets, "output_tokens", int64Ptr(5))
+							var rawUsage struct {
+								Usage struct {
+									Input  int64 `json:"prompt_tokens"`
+									Output int64 `json:"completion_tokens"`
+								} `json:"usage"`
+							}
+							if err := json.Unmarshal(observation.RawUsage, &rawUsage); err != nil ||
+								rawUsage.Usage.Input != 10 || rawUsage.Usage.Output != 5 {
+								t.Errorf("incoming raw usage = %s, %v", observation.RawUsage, err)
+							}
+						}
 					}
 					if got := heldLeases(t, f); got != 0 {
 						t.Errorf("held leases = %d, want 0", got)
@@ -169,6 +197,13 @@ func terminalFinalizerSnapshot(t *testing.T, f *fixture, requestID string) strin
 		    'windows', (SELECT jsonb_agg(to_jsonb(w) ORDER BY w.id)
 		        FROM inference_quota_windows w
 		        WHERE w.id IN (r.window_five_hour_id, r.window_weekly_id, r.window_monthly_id)),
+		    'wallets', (SELECT jsonb_agg(to_jsonb(w) ORDER BY w.id)
+		        FROM inference_wallets w WHERE w.billing_account_id=r.billing_account_id),
+		    'wallet_holds', (SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id)
+		        FROM inference_wallet_holds h WHERE h.request_id=r.id),
+		    'wallet_entries', (SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id)
+		        FROM inference_wallet_entries e JOIN inference_wallets w ON w.id=e.wallet_id
+		        WHERE w.billing_account_id=r.billing_account_id),
 		    'key', (SELECT to_jsonb(k) FROM inference_api_keys k WHERE k.id=r.api_key_id)
 		)::text FROM inference_requests r WHERE r.id=$1`, requestID)
 	if err != nil {

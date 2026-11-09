@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/jmoiron/sqlx"
@@ -11,6 +13,7 @@ import (
 
 func TestCorrectSettlement_RejectsInvalidEvidenceBeforeWriting(t *testing.T) {
 	input, output, negative := int64(80), int64(10), int64(-1)
+	large, tail, wrapped := int64(math.MaxInt64), int64(3), int64(1)
 	empty, malformed := "", "not-a-uuid"
 	for _, tc := range []struct {
 		name      string
@@ -28,6 +31,9 @@ func TestCorrectSettlement_RejectsInvalidEvidenceBeforeWriting(t *testing.T) {
 			ReasoningTokens: &negative,
 		}},
 		{name: "negative_unknown_total", total: &negative, buckets: &domain.UsageBuckets{}},
+		{name: "overflowing_evidence", total: &wrapped, buckets: &domain.UsageBuckets{
+			InputTokens: &large, CacheReadTokens: &large, OutputTokens: &tail,
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, s := testDB(t)
@@ -94,6 +100,62 @@ func TestCorrectSettlement_RejectsInvalidEvidenceBeforeWriting(t *testing.T) {
 			}
 			if used := keyBudgetUsed(t, s, f.keyID); used != 40_000 {
 				t.Errorf("corrected key budget = %d, want 40000", used)
+			}
+		})
+	}
+}
+
+func TestCorrectSettlement_PreservesValidTokenBoundaries(t *testing.T) {
+	input, output, reasoning := int64(math.MaxInt64-5), int64(5), int64(3)
+	max := int64(math.MaxInt64)
+	for _, tc := range []struct {
+		name       string
+		buckets    domain.UsageBuckets
+		total      *int64
+		wantTokens int64
+	}{
+		{
+			name: "exact_max",
+			buckets: domain.UsageBuckets{
+				InputTokens: &input, OutputTokens: &output, ReasoningTokens: &reasoning,
+			},
+			total: &max, wantTokens: math.MaxInt64,
+		},
+		{
+			name:       "reasoning_only_unknown_total",
+			buckets:    domain.UsageBuckets{ReasoningTokens: &reasoning},
+			wantTokens: 50,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, s := testDB(t)
+			f := seedFixture(t, s, true)
+			w5, ww, wm := makeWindows(t, s, f.entID)
+			requestID, attemptID := correctedFixture(t, s, f, w5, ww, wm, 40, 10)
+			_, beforeAt, _, _ := rateTokens(t, s, requestID)
+			cmd := correctionFixture(requestID, strings.ToUpper(attemptID), 40_000, tc.total, "valid-boundary")
+			cmd.Corrected.Buckets = tc.buckets
+			if err := applyCorrection(t, s, cmd); err != nil {
+				t.Fatalf("valid correction: %v", err)
+			}
+			usage, err := s.LoadUsageRecords(context.Background(), requestID)
+			if err != nil || len(usage) != 2 {
+				t.Fatalf("corrected usage = %+v, err=%v", usage, err)
+			}
+			if got := usage[1]; got.AttemptID != attemptID || got.Revision != 2 ||
+				got.Source != domain.UsageReported || got.Buckets.ReasoningTokens == nil ||
+				*got.Buckets.ReasoningTokens != 3 {
+				t.Errorf("corrected usage = %+v, want canonical attempt, revision 2 and reported reasoning 3", got)
+			}
+			tokens, afterAt, state, present := rateTokens(t, s, requestID)
+			if !present || state != "settled" || tokens != tc.wantTokens ||
+				beforeAt == nil || afterAt == nil || !beforeAt.Equal(*afterAt) {
+				t.Errorf("corrected TPM = %t/%s/%d/%v, want true/settled/%d/%v",
+					present, state, tokens, afterAt, tc.wantTokens, beforeAt)
+			}
+			assertCorrectionReceiptCount(t, s, cmd.IdempotencyKey, 1)
+			if charge, reversal, adjustment := ledgerTotals(t, s, requestID); charge != 60_000 || reversal != 0 || adjustment != 20_000 {
+				t.Errorf("corrected ledger = %d/%d/%d, want 60000/0/20000", charge, reversal, adjustment)
 			}
 		})
 	}

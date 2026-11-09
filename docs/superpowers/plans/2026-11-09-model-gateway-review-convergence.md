@@ -531,11 +531,11 @@ token buckets and the attempt revision. Empty raw documents canonicalize to
 - [x] Preserve exact replays, JSON key-order/whitespace/numeric equivalence,
   and implicit/explicit default raw documents; inspect unchanged accounting
   inside the open replay transaction.
-- [ ] Compare stored source and JSONB equality without changing financial,
+- [x] Compare stored source and JSONB equality without changing financial,
   rate, request or usage state; keep storage failures loud.
-- [ ] Verify the gateway alarms and queues mismatching evidence, but absorbs
+- [x] Verify the gateway alarms and queues mismatching evidence, but absorbs
   actual exact replays (including their original raw evidence).
-- [ ] Run focused race and the full disposable-database verification gate.
+- [x] Run focused race and the full disposable-database verification gate.
 
 Ruling: metering source and provider evidence are part of the persisted
 usage fact, not just the token total. A late reported delivery that agrees
@@ -560,6 +560,25 @@ server stopped. No kaya process was operated on. Formatting and diff
 checks passed. Full race/coverage and E2E were not rerun for this RED-only
 checkpoint; prior green coverage does not describe this tree. The
 production fix, gateway regression and remaining Task 17 work stay open.
+
+Implementation checkpoint (2026-11-10): repository and gateway RED
+regressions are committed in `60d68b9` and `1dce935`. The production
+comparison now includes source and semantic JSONB evidence, using the same
+empty-raw default as insertion. Focused GREEN `run.NusFdg` passed 57
+tests/subtests across PostgreSQL and gateway with no failures or skips.
+Dewey's bounded read-only review found no Critical/Important issue; its
+nonblocking suggestion is to add isolated mutations for all five nullable
+token buckets, including NULL versus zero. The current implementation
+retains all five comparisons. Full gate `run.VdSEsP` exited 0: build/vet
+passed; race passed 4,576 tests/subtests across 34 packages with 80.6%
+statement coverage; separate E2E race passed 186 tests/subtests (149.735s).
+There were no failures; only the three expected full-race and one E2E
+opt-in/child-entry skips. Both disposable databases applied all 55
+migrations and skipped all 55 on rerun; cleanup confirmed the owned server
+stopped. Formatting and diff checks passed. Runbook 4.77 records the
+commands, manifest and limits. Task 17 is verified for this local
+checkpoint; Task 18, other pending findings and the original
+wallet-correction/production evidence-trigger requirements remain open.
 
 ## Task 18: Late Dispatch Markers Preserve Terminal State
 

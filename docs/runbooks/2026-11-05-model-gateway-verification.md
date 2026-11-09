@@ -6521,6 +6521,75 @@ genuine unfinished original requirements. Real-provider/client and
 cross-host acceptance remain unverified. No push, merge, deployment,
 adjacent repository modification or kaya process operation is included.
 
+### 4.77 Settlement Replay Evidence Equality (2026-11-10)
+
+This local checkpoint addresses Task 17 only. Repository and gateway
+regressions are already committed in `60d68b9` and `1dce935`.
+
+**Changed files:**
+
+- `internal/inference/postgres/ledger_repo.go`: compare stored source and
+  semantic JSONB raw evidence as well as all five nullable token buckets
+  for the same attempt revision. Empty raw uses insertion's
+  `{"schema_version":1}` default; revision 0 still means revision 1.
+  Missing facts remain inconsistent, and actual storage failures propagate.
+- The convergence plan and this runbook: record the implementation,
+  review, verification and remaining scope.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.MnGtY2/focused.jsonl` | Pre-fix RED: 28 failing leaf cases reproduced equal-money source/raw mismatches disappearing as duplicates; 19 controls passed. Including parents, 38 test/subtest failures; no skips. |
+| `run.NusFdg/focused.jsonl` | Post-fix GREEN: 57 tests/subtests passed with race detection across PostgreSQL (3.784s) and gateway (2.283s), no failures or skips. |
+| `run.VdSEsP/tests.jsonl` | Build/vet passed; full race passed 4,576 tests/subtests across 34 packages, zero failures. |
+| `run.VdSEsP/coverage-summary.log` | Total statement coverage 80.6%; the 80% floor passed. |
+| `run.VdSEsP/e2e.jsonl` | Separate E2E race passed 186 tests/subtests, zero failures (149.735s). Runner exited 0. |
+
+Focused command:
+`go test -race -count=1 -p 1 -json ./internal/inference/postgres ./internal/inference/gateway -run '^(TestSettle_ReplayRequiresSameSourceAndRawEvidence|TestGateway_ReplayedEvidenceMismatchRequiresReconciliation|TestGateway_ExactEstimatedReplayIsIdempotent|TestGateway_ConsistentDuplicateSettleIsIdempotent|TestSettle_DuplicateDelivery_UsageLookupFailure_Propagates)$' -timeout=5m`.
+
+Repository coverage includes plan/wallet, zero/positive charges,
+estimated/reported source changes, changed/missing/added raw evidence,
+semantic JSON key/order/whitespace/numeric equivalence, implicit/explicit
+default raw, and revisions 0/1. Open-transaction accounting snapshots
+ensure replay detection performs no accounting writes before returning.
+Gateway cases preserve the original usage, terminal completion time, rate
+rows and single charge while requiring one typed equal-money mismatch
+alarm and a pending `settlement_mismatch` job. Exact reported and estimated
+replays remain silent and idempotent with their original raw evidence.
+
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...`.
+The three skips were the `TestQuotaWorkerProcess` child entry and the two
+`KAYA_LOAD=1` load-drill opt-ins, not missing databases.
+The runner used an owned disposable PostgreSQL cluster on loopback port
+55491 with explicit, separate `review_app` and `review_e2e` database DSNs.
+Both databases applied all 55 migrations and skipped all 55 on rerun.
+Dependencies remained offline/read-only with `GOPROXY=off` and
+`GOFLAGS=-mod=readonly`; packages were serialized with `-p 1`.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+It skipped only `TestUsageTokenAcceptance_TenPagesTwoMinutes`
+(`USAGE_ACCEPTANCE=1` opt-in), not database acceptance.
+The full runner exited 0 on 2026-11-10 (Asia/Shanghai); `cleanup.log`
+confirms its owned PostgreSQL server stopped. Formatting and diff checks
+passed.
+
+**Independent review:** Dewey reviewed `6c17e20..1dce935` plus the production
+fix read-only and found no Critical/Important defect. Its nonblocking
+coverage suggestion is isolated mutations for each nullable token bucket,
+including NULL versus zero; all five comparisons remain implemented.
+The reviewer did not execute tests, servers or the coordinator's full gate.
+
+**Remaining scope:** differing evidence now reaches the existing alarm/job
+path; this change does not correct usage automatically. Task 18, other
+pending review findings, wallet correction and the production evidence-driven
+correction trigger remain unfinished, not waived. Real-provider/client
+and cross-host acceptance remain unverified. No push, merge, deployment,
+adjacent repository change or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -406,18 +406,25 @@ func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord)
 	if revision == 0 {
 		revision = 1
 	}
+	raw := u.RawUsage.Raw
+	if len(raw) == 0 {
+		raw = json.RawMessage(`{"schema_version":1}`)
+	}
 	var in, out, cacheRead, cacheWrite, reasoning sql.NullInt64
+	var sameEvidence bool
 	err := tx.QueryRowxContext(ctx,
-		`SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens
+		`SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+		        source = $3 AND raw_usage = $4::jsonb
 		 FROM inference_usage_records WHERE attempt_id = $1 AND revision = $2`,
-		u.AttemptID, revision).Scan(&in, &out, &cacheRead, &cacheWrite, &reasoning)
+		u.AttemptID, revision, string(u.Source), raw).
+		Scan(&in, &out, &cacheRead, &cacheWrite, &reasoning, &sameEvidence)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		return false, mapError("settle: load usage fact", err)
 	}
-	return sameTokens(in, u.Buckets.InputTokens) &&
+	return sameEvidence && sameTokens(in, u.Buckets.InputTokens) &&
 		sameTokens(out, u.Buckets.OutputTokens) &&
 		sameTokens(cacheRead, u.Buckets.CacheReadTokens) &&
 		sameTokens(cacheWrite, u.Buckets.CacheWriteTokens) &&

@@ -114,6 +114,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 		}
 	}
 	stopSeen := false
+	failed := false
 	for scanner.Scan() {
 		data, ok := strings.CutPrefix(scanner.Text(), "data:")
 		if !ok {
@@ -123,7 +124,8 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
 			continue // unknown/malformed event — keep the stream alive
 		}
-		var err error
+		// Meter even after failure: later cumulative counters remain useful
+		// for settlement, but cannot turn the stream back into a success.
 		switch ev.Type {
 		case "message_start":
 			if ev.Message != nil && ev.Message.Usage != nil {
@@ -132,6 +134,29 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 				cacheWrite = ev.Message.Usage.CacheCreationTokens
 				flushUsage()
 			}
+		case "content_block_delta":
+			if ev.Delta != nil {
+				switch ev.Delta.Type {
+				case "text_delta":
+					tap.addContent(len(ev.Delta.Text))
+				case "thinking_delta":
+					tap.addContent(len(ev.Delta.Thinking))
+				case "input_json_delta":
+					tap.addContent(len(ev.Delta.PartialJSON))
+				}
+			}
+		case "message_delta":
+			if ev.Usage != nil && ev.Usage.OutputTokens != nil {
+				output = ev.Usage.OutputTokens // cumulative — latest wins
+				flushUsage()
+			}
+		}
+		if failed {
+			continue
+		}
+		var err error
+		switch ev.Type {
+		case "message_start":
 			err = writeOpenAIChunk(w, map[string]any{"role": "assistant"}, "")
 		case "content_block_start":
 			if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
@@ -148,23 +173,16 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 			}
 			switch ev.Delta.Type {
 			case "text_delta":
-				tap.addContent(len(ev.Delta.Text))
 				err = writeOpenAIChunk(w, map[string]any{"content": ev.Delta.Text}, "")
 			case "thinking_delta":
-				tap.addContent(len(ev.Delta.Thinking))
 				err = writeOpenAIChunk(w, map[string]any{"reasoning_content": ev.Delta.Thinking}, "")
 			case "input_json_delta":
-				tap.addContent(len(ev.Delta.PartialJSON))
 				err = writeOpenAIChunk(w, map[string]any{"tool_calls": []any{map[string]any{
 					"index":    ev.Index,
 					"function": map[string]any{"arguments": ev.Delta.PartialJSON},
 				}}}, "")
 			}
 		case "message_delta":
-			if ev.Usage != nil && ev.Usage.OutputTokens != nil {
-				output = ev.Usage.OutputTokens // cumulative — latest wins
-				flushUsage()
-			}
 			if ev.Delta != nil && ev.Delta.StopReason != "" {
 				err = writeOpenAIChunk(w, map[string]any{}, mapAnthropicStopReason(ev.Delta.StopReason))
 			}
@@ -179,6 +197,8 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 				_, err = io.WriteString(w, "data: [DONE]\n\n")
 			}
 		case "error":
+			failed = true
+			tap.markFailed()
 			// kaya/OpenAI clients parse the {"error":...} chunk convention
 			// (the same shape the gateway injects on upstream breaks).
 			err = writeRawSSE(w, map[string]any{"error": map[string]any{"message": "upstream anthropic error"}})
@@ -195,7 +215,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 	// partial answer as complete — and on the upstream-error path the
 	// gateway's upstream-broke error event must be the last thing the client
 	// sees.
-	if !stopSeen {
+	if !stopSeen || failed {
 		if b := tap.Result(); b.SawUsage {
 			if err := writeOpenAIUsage(w, b.Buckets); err != nil {
 				return err

@@ -643,6 +643,9 @@ func TranslateOpenAIToAnthropicStream(body io.ReadCloser, messageID, model strin
 }
 
 func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
+	if r.errorRelayed {
+		return nil
+	}
 	if ev.done {
 		// [DONE]: close out anything still open. A stream that legitimately
 		// ended always emitted its finish chunk first; a bare [DONE] without

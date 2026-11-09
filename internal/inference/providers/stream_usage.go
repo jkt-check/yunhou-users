@@ -140,11 +140,12 @@ type OpenAIUsageTracker struct {
 	pending []byte
 	res     TapResult
 	err     error
+	failed  bool
 }
 
 // Feed consumes one upstream read. Lines are reassembled across reads (the
 // relay buffer has no line alignment). Only complete `data:` lines
-// containing "usage", "content", "reasoning", "tool_calls" or [DONE] cost more than a
+// containing "usage", "content", "reasoning", "tool_calls", "error" or [DONE] cost more than a
 // prefix scan.
 func (t *OpenAIUsageTracker) Feed(p []byte) error {
 	t.mu.Lock()
@@ -192,7 +193,7 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	}
 	payload := bytes.TrimSpace(line[len("data:"):])
 	if bytes.Equal(payload, []byte("[DONE]")) {
-		t.res.Terminal = true
+		t.res.Terminal = !t.failed
 		return
 	}
 	if len(payload) == 0 || payload[0] != '{' {
@@ -208,7 +209,8 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	wantContent := bytes.Contains(line, []byte(`"content"`))
 	wantReasoning := bytes.Contains(line, []byte("reasoning"))
 	wantTools := bytes.Contains(line, []byte(`"tool_calls"`))
-	if !wantUsage && !wantContent && !wantReasoning && !wantTools {
+	wantError := bytes.Contains(line, []byte(`"error"`))
+	if !wantUsage && !wantContent && !wantReasoning && !wantTools && !wantError {
 		return
 	}
 	var chunk struct {
@@ -223,10 +225,15 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 				} `json:"tool_calls"`
 			} `json:"delta"`
 		} `json:"choices"`
-		Usage *openAIUsage `json:"usage"`
+		Usage *openAIUsage    `json:"usage"`
+		Error json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &chunk); err != nil {
 		return // malformed event: skip, keep the stream alive
+	}
+	if len(chunk.Error) > 0 && !bytes.Equal(bytes.TrimSpace(chunk.Error), []byte("null")) {
+		t.failed = true
+		t.res.Terminal = false
 	}
 	for _, ch := range chunk.Choices {
 		t.res.ContentBytes += int64(len(ch.Delta.Content) + len(ch.Delta.ReasoningContent))
@@ -309,5 +316,11 @@ func (t *anthropicTap) recordUsage(input, output, cacheRead, cacheWrite *int64, 
 func (t *anthropicTap) markTerminal() {
 	t.mu.Lock()
 	t.res.Terminal = true
+	t.mu.Unlock()
+}
+
+func (t *anthropicTap) markFailed() {
+	t.mu.Lock()
+	t.res.Terminal = false
 	t.mu.Unlock()
 }

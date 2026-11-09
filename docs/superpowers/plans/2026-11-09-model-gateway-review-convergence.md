@@ -97,12 +97,19 @@ PostgreSQL outbox, billing-account and entitlement repositories.
 ## Task 7: Sticky Failed Streams
 
 **Files:** Chat usage tracker, Messages/Responses renderers, native stream
-adapters and their tests in `internal/inference/providers`.
+adapters and their tests in `internal/inference/providers`, plus the
+database-backed regression in `internal/inference/httpapi`.
 
-- [ ] Reproduce error followed by DONE/completion becoming success.
-- [ ] Latch failures without losing known content or usage; never emit a
-  successful terminal or persist a failed Responses chain.
-- [ ] Cover same-read, split-read and EOF across all supported protocols.
+- [x] Reproduce error followed by DONE/completion becoming success.
+- [x] Latch failures without losing known content or usage; never synthesize
+  a successful terminal or persist a failed Responses chain.
+- [x] Cover same-read, split-read and EOF across all supported protocols.
+
+Raw OpenAI Chat remains byte passthrough, including an upstream error
+followed by DONE. Its authoritative metering/settlement remains failed;
+the native adapters suppress subsequent content and synthetic success.
+Filtering the raw Chat wire would change its existing passthrough contract
+and is not part of this checkpoint.
 
 ## Task 8: Native Nonstream Output Order
 
@@ -234,3 +241,42 @@ child-entry/opt-in cases listed in runbook section 4.65.4 were skipped.
 Both disposable databases passed all 55 migrations and their idempotent
 rerun. Cleanup confirmed the owned PostgreSQL server stopped; kaya was
 untouched. The file manifest and remaining risks are in runbook 4.65.
+
+### Sticky Failed Stream Checkpoint
+
+The latest commit request checkpoints Task 7 only. Tasks 8-9 and the
+until-clean review goal remain unfinished.
+
+Provider RED logs:
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/task-7-red.jsonl`.
+Error followed by DONE/completion was accepted as a successful terminal,
+Messages/Responses emitted success, and Responses became persistable.
+The database-backed RED run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.I0n7d5` reproduced all
+three surfaces settling as reported with a completed attempt; Messages
+emitted message_stop and Responses emitted response.completed and saved
+one response chain.
+
+Failure is now sticky in the usage tracker and both native upstream
+adapters. Messages/Responses client renderers stop rendering after the
+first error. Later cumulative usage still updates metering without
+restoring successful completion or response-chain persistence.
+
+Focused GREEN evidence: all providers passed
+`go test -race -count=1 ./internal/inference/providers` (2.660s).
+The disposable-database run
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.t5Kh2u` passed all four
+HTTP test/subtest cases, with no skips. It verified failed
+stream_interrupted attempts, estimated 12/9 usage and no response chains
+on all three surfaces. Cleanup stopped the runner's own PostgreSQL
+server. The raw Chat passthrough boundary above remains explicit.
+
+Full checkpoint verification completed with exit 0 in
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.kBQlZC`: build/vet passed;
+full race had 4,358 test/subtest passes across 34 packages, E2E had 186,
+and total statement coverage was 80.6%, above the 80% floor. Only the four
+expected child-entry/opt-in cases listed in runbook 4.66.4 were skipped.
+Both disposable databases applied 55 migrations and skipped all 55 on
+their idempotent rerun. Cleanup confirmed the owned PostgreSQL server
+stopped; kaya was untouched. The file manifest and remaining risks are
+in runbook 4.66. Tasks 8-9 and the until-clean review remain unfinished.

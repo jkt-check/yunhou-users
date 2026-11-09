@@ -753,6 +753,9 @@ func (s *ResponsesStreamState) emit(w io.Writer, event string, v map[string]any)
 
 // Render implements streamRenderer.
 func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
+	if s.errorRelayed {
+		return nil
+	}
 	if ev.done {
 		return s.finishClean(w)
 	}

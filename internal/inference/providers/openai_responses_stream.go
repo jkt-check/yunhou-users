@@ -97,6 +97,12 @@ func (t *responsesTap) markTerminal() {
 	t.mu.Unlock()
 }
 
+func (t *responsesTap) markFailed() {
+	t.mu.Lock()
+	t.res.Terminal = false
+	t.mu.Unlock()
+}
+
 // responsesStreamEvent is the superset of the Responses streaming event
 // shapes we care about; unlisted fields are ignored. delta is RawMessage
 // because textual deltas are strings while some events carry object deltas.
@@ -133,6 +139,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	// stream against the same index — parallel calls interleave freely.
 	toolCalls := map[int]struct{}{}
 	terminalSeen := false
+	failed := false
 
 	for scanner.Scan() {
 		data, ok := strings.CutPrefix(scanner.Text(), "data:")
@@ -142,6 +149,20 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 		var ev responsesStreamEvent
 		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
 			continue // unknown/malformed event — keep the stream alive
+		}
+		// Keep metering late usage/content after an error without rendering
+		// further output or accepting a subsequent successful terminal.
+		switch ev.Type {
+		case "response.completed", "response.incomplete", "response.failed":
+			if ev.Response != nil && ev.Response.Usage != nil {
+				tap.recordUsage(ev.Response.Usage)
+			}
+		case "response.output_text.delta", "response.reasoning_summary_text.delta",
+			"response.reasoning_text.delta", "response.function_call_arguments.delta":
+			tap.addContent(len(ev.deltaString()))
+		}
+		if failed {
+			continue
 		}
 		var err error
 		switch ev.Type {
@@ -159,17 +180,14 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 			}
 		case "response.output_text.delta":
 			if s := ev.deltaString(); s != "" {
-				tap.addContent(len(s))
 				err = writeOpenAIChunk(w, map[string]any{"content": s}, "")
 			}
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 			if s := ev.deltaString(); s != "" {
-				tap.addContent(len(s))
 				err = writeOpenAIChunk(w, map[string]any{"reasoning_content": s}, "")
 			}
 		case "response.function_call_arguments.delta":
 			if s := ev.deltaString(); s != "" {
-				tap.addContent(len(s))
 				err = writeOpenAIChunk(w, map[string]any{"tool_calls": []any{map[string]any{
 					"index":    ev.OutputIndex,
 					"function": map[string]any{"arguments": s},
@@ -186,9 +204,6 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 			if ev.Response != nil {
 				if ev.Response.Status != "" {
 					status = ev.Response.Status
-				}
-				if ev.Response.Usage != nil {
-					tap.recordUsage(ev.Response.Usage)
 				}
 				if ev.Response.IncompleteDetails != nil {
 					incompleteReason = ev.Response.IncompleteDetails.Reason
@@ -211,14 +226,10 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 				}
 			}
 		case "response.failed":
+			failed = true
+			tap.markFailed()
 			msg := "upstream responses error"
 			if ev.Response != nil {
-				// failed 帧可能携带已消耗的部分用量：计入 tap（不置
-				// Terminal——不是干净结束），流末以无 [DONE] 的 usage 块
-				// 冲刷给计量面。
-				if ev.Response.Usage != nil {
-					tap.recordUsage(ev.Response.Usage)
-				}
 				if ev.Response.Error != nil && ev.Response.Error.Message != "" {
 					msg = ev.Response.Error.Message
 				}
@@ -226,6 +237,8 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 			// 非干净结束：错误块后无 [DONE]——半截答案绝不当成完整答案渲染。
 			err = writeRawSSE(w, map[string]any{"error": map[string]any{"message": msg}})
 		case "error":
+			failed = true
+			tap.markFailed()
 			msg := ev.Message
 			if msg == "" {
 				msg = "upstream responses error"
@@ -239,7 +252,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	// The stream ended without response.completed/incomplete. Usage seen so
 	// far flushes WITHOUT [DONE] so downstream metering keeps the tokens but
 	// no client renders the partial answer as complete (同 anthropic 路径).
-	if !terminalSeen {
+	if !terminalSeen || failed {
 		if b := tap.Result(); b.SawUsage {
 			if err := writeOpenAIUsage(w, b.Buckets); err != nil {
 				return err

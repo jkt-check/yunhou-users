@@ -5682,6 +5682,109 @@ or kaya process was touched; no push, merge or deployment was performed.
 
 ---
 
+### 4.66 Sticky failed stream checkpoint (2026-11-09)
+
+This local checkpoint addresses Task 7 from the review-convergence plan.
+It does not claim that the until-clean review has finished.
+
+#### 4.66.1 Behavior and regression evidence
+
+An in-band error followed by DONE could previously restore a successful
+terminal in the Chat usage tracker. Messages/Responses client renderers
+then emitted success, and native Anthropic/Responses upstream adapters
+had the same failed-state gap.
+
+Provider RED logs:
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/task-7-red.jsonl`.
+`TestUsageTracker_ErrorCannotBecomeTerminal`,
+`TestClientStreams_ErrorCannotBecomeTerminal` and
+`TestNativeStreams_ErrorCannotBecomeTerminal` failed on behavior, not
+compilation or setup. Tests cover reads bounded to 1 byte, 23 bytes and
+the full fixture, with error followed by EOF or a later terminal.
+
+Database-backed RED logs:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.I0n7d5`.
+`TestV1Streams_ErrorThenDoneRemainsInterrupted` reproduced all three
+surfaces settling as reported with completed attempts. Messages emitted
+message_stop; Responses emitted response.completed and persisted one
+response chain for the failed stream.
+
+The Chat tracker now latches non-null error payloads, clears Terminal
+and ignores later DONE for success classification. Native upstream
+adapters continue metering later cumulative usage/content but suppress
+subsequent content and successful terminal events after the first error.
+Messages/Responses client renderers likewise suppress later output and
+synthetic completion. Known usage
+is preserved without making failed Responses eligible for persistence.
+
+Focused GREEN: all providers passed
+`go test -race -count=1 ./internal/inference/providers` (2.660s).
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.t5Kh2u` passed all four
+HTTP test/subtest cases, with no skips or failures. All three surfaces
+record estimated 12/9 input/output usage, failed stream_interrupted
+attempts and zero response chains. The runner stopped its owned
+PostgreSQL cluster.
+
+#### 4.66.2 Deliverable file manifest
+
+- `internal/inference/providers/stream_usage.go`
+- `internal/inference/providers/messages_client.go`
+- `internal/inference/providers/responses_client.go`
+- `internal/inference/providers/anthropic_stream.go`
+- `internal/inference/providers/openai_responses_stream.go`
+- `internal/inference/providers/stream_failure_test.go`
+- `internal/inference/httpapi/stream_failure_test.go`
+- `docs/superpowers/plans/2026-11-09-model-gateway-review-convergence.md`
+- `docs/runbooks/2026-11-05-model-gateway-verification.md`
+
+#### 4.66.3 Compatibility boundary and remaining risks
+
+Raw OpenAI Chat remains byte passthrough. If an upstream emits error
+then DONE, its raw DONE is not stripped; the authoritative usage tap
+and settlement still classify the attempt as interrupted. Synthetic
+Messages/Responses/native-adapter success is suppressed. Changing the
+raw Chat filtering contract is outside this checkpoint; clients must
+honor its in-band error rather than treating a later DONE as success.
+
+Tasks 8-9 remain unresolved: native nonstream text/tool output can be
+reordered, and interrupted Anthropic message_start output usage can be
+lost without a later message_delta. No final whole-branch clean review
+has been claimed. The provider/client acceptance, correction trigger
+and wallet, cross-process rate-path and toolchain limitations remain
+as recorded in sections 5-6.
+
+#### 4.66.4 Full verification
+
+Full race verification ran in
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.kBQlZC`.
+
+- `go build ./...`: passed.
+- `go vet ./internal/... ./cmd/...`: passed.
+- `go test -race -count=1 -p 1 -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...`:
+  4,358 test/subtest passes across 34 packages, zero failures.
+- `go tool cover -func=...`: total statement coverage 80.6%, above the
+  required 80% floor.
+- `go test -race -count=1 -p 1 -json ./tests/e2e/...`: 186 test/subtest
+  passes, zero failures.
+
+The only skips were the child-process entry point
+(`TestQuotaWorkerProcess`), the opt-in `KAYA_LOAD=1` drills
+(`TestLoadDrill_Throughput`, `TestLoadDrill_LongConnections`) and the
+`USAGE_ACCEPTANCE=1` drill
+(`TestUsageTokenAcceptance_TenPagesTwoMinutes`). No database-unavailable
+skip was accepted as verification.
+
+The runner used its own PostgreSQL cluster on loopback port 55489 and
+separate `review_app` and `review_e2e` databases, with explicit
+`DATABASE_URL` and `E2E_DATABASE_URL`. Each database applied 55 migrations;
+the idempotent rerun applied none and skipped all 55. Runs used
+`GOPROXY=off` and `GOFLAGS=-mod=readonly`. The runner exited 0 and its
+`cleanup.log` confirms `server stopped`. No production database, provider,
+configuration or kaya process was touched; no push, merge or deployment
+was performed.
+
+---
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

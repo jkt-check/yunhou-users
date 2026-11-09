@@ -6855,6 +6855,89 @@ evidence-to-correction trigger remain unfinished. Real-provider/client
 and cross-host acceptance are unverified. No push, merge, deployment,
 adjacent-repository edit or kaya process operation is included.
 
+### 4.81 Responses Anthropic Cache Creation Usage (2026-11-10)
+
+This checkpoint addresses Task 21 only. It is not a whole-branch
+until-clean review conclusion.
+
+**Changed files:**
+
+- `internal/inference/providers/responses_client.go`: include cache
+  creation alongside cache reads only when the upstream input count
+  excludes those buckets. Keep `cached_tokens` as the cache-read detail.
+- `internal/inference/providers/responses_cache_usage_test.go`: already
+  committed in `bad0e48`; native Anthropic stream/nonstream coverage for
+  cache read/creation combinations, fragmented streams and both terminal
+  statuses, plus inclusive OpenAI controls.
+- `internal/inference/httpapi/responses_cache_usage_test.go`: already
+  committed in `bad0e48`; real HTTP stream/nonstream usage and persisted
+  accounting invariants against owned disposable PostgreSQL.
+- `internal/inference/httpapi/protocol_surfaces_test.go`: already
+  committed in `bad0e48`; allow the existing explicit upstream override
+  to supply stream fixtures as well as nonstream fixtures.
+- The convergence plan and this runbook record evidence and scope.
+
+**RED/GREEN evidence:** logs are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| Pre-fix provider race | Both-cache input/output/total/read was 5/7/12/3 instead of 10/7/17/3; creation-only input/total was 2/9 instead of 7/14. |
+| `run.dwCrJQ/focused.jsonl` | Pre-fix HTTP stream/nonstream returned the same incorrect totals. Persisted bucket/TPM checks and both shared-fixture consumer controls passed. |
+| Post-fix provider race | Complete providers package passed, 2.443s. |
+| `run.cL9GIP/focused.jsonl` | 25 HTTP tests/subtests passed, no failures/skips, 4.272s. |
+
+The HTTP regressions assert client input/output/total/read = 10/7/17/3,
+persisted reported input/output/read/write = 2/7/3/5 and TPM = 17.
+There is one attempt and charge, no held monetary/rate reservations,
+and no active concurrency lease. Inclusive OpenAI totals remain
+unchanged. Both completed focused database runs stopped their owned
+PostgreSQL server.
+
+**Interrupted full gate:** `run.GqtBCB` exited 1 because the filesystem
+filled. PostgreSQL writes and Go compilation reported
+`No space left on device`; E2E and a complete coverage result were not
+reached. This is not a passing gate or behavioral RED evidence.
+Cleanup stopped the owned server. Only confirmed-stopped disposable
+database data under the task's temporary root was subsequently removed;
+verification logs were retained.
+
+**Successful full-gate rerun:** `run.Y5btrk` used fresh independent
+application/E2E databases on loopback port 55491 and exited 0:
+
+| Gate | Result |
+|---|---|
+| `go build ./...` | Passed; `build.log` is empty. |
+| `go vet ./internal/... ./cmd/...` | Passed; `vet.log` is empty. |
+| Full race (`tests.jsonl`) | 4,716 tests/subtests passed across 34 packages, no failures. |
+| Statement coverage | 80.7% total; the 80% floor passed. |
+| E2E race (`e2e.jsonl`) | 186 tests/subtests passed, 147.656s, no failures. |
+
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile="$RUN/coverage.out" -json ./internal/... ./cmd/... ./tests/integration/...`.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+
+The full-race skips are the child-only `TestQuotaWorkerProcess` entry
+and the two `KAYA_LOAD=1` load drills. E2E skips only
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` (`USAGE_ACCEPTANCE=1`).
+No database acceptance skipped. Both owned databases applied all 55
+migrations and skipped all 55 on rerun. Explicit `DATABASE_URL` and
+`E2E_DATABASE_URL` selected separate disposable databases; dependencies
+stayed offline/read-only with `GOPROXY=off`, `GOFLAGS=-mod=readonly`.
+Packages were serialized with `-p 1` and `GOMAXPROCS=2`.
+`cleanup.log` confirms the owned PostgreSQL server stopped, and
+`postmaster.pid` is absent. Formatting and diff checks passed.
+This is author self-review of the task diff, not a fresh independent
+whole-branch review.
+
+**Remaining scope:** this changes only the Responses usage aggregate,
+not normalized usage, charging, TPM, schema or correction policy. Other
+pending Responses findings, wallet corrections and the production
+evidence-to-correction trigger remain unfinished. Real-provider/client
+and cross-host acceptance remain unverified. No push, merge, deployment,
+adjacent-repository edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -766,17 +766,17 @@ regressions, and the verification runbook.
 **Interfaces:** preserve `ResponsesUsageShape(*openAIUsage, bool)`; the
 existing false flag denotes Anthropic-origin exclusive input buckets.
 
-- [ ] Reproduce Anthropic input 2, cache read 3, cache creation 5, output 7
+- [x] Reproduce Anthropic input 2, cache read 3, cache creation 5, output 7
   rendering Responses input 5/total 12 instead of input 10/total 17.
   Exercise the real native decoder and stream adapter before rendering.
-- [ ] Cover missing/zero cache buckets and OpenAI-origin inclusive input,
+- [x] Cover missing/zero cache buckets and OpenAI-origin inclusive input,
   with stream fragmentation and both completed/incomplete terminals.
-- [ ] Add cache creation alongside cache reads only for exclusive input;
+- [x] Add cache creation alongside cache reads only for exclusive input;
   preserve cached_tokens as the cache-read detail, not cache-write.
-- [ ] Verify real HTTP stream/nonstream Responses usage agrees with
+- [x] Verify real HTTP stream/nonstream Responses usage agrees with
   reported persisted buckets and TPM 17, with one charge/attempt and no
   held reservations or leases.
-- [ ] Run focused race, full race/coverage and separate E2E against owned
+- [x] Run focused race, full race/coverage and separate E2E against owned
   disposable databases; record evidence and commit locally.
 
 Ruling: fix the Responses aggregate at its existing inclusion boundary,
@@ -784,6 +784,24 @@ not the canonical accounting buckets or the Anthropic adapter's wire.
 Counting both cache buckets for all origins would double count inclusive
 OpenAI input. Renaming the shared inclusion flag is unnecessary churn.
 No new response fields, migration, price or correction policy.
+
+Evidence: pre-fix provider race reproduced the missing cache-write
+totals, and HTTP `run.dwCrJQ` reproduced both stream/nonstream failures
+while accounting and shared-fixture consumer controls passed.
+Post-fix providers race passed (2.443s), and focused HTTP `run.cL9GIP`
+passed all 25 tests/subtests (4.272s), without failures or skips.
+
+The first full run, `run.GqtBCB`, exited 1 after the filesystem filled;
+it is not a passing gate. After removing only confirmed-stopped
+disposable database data and retaining logs, fresh full gate
+`run.Y5btrk` exited 0: build/vet passed, full race passed 4,716
+tests/subtests across 34 packages with no failures, statement coverage
+was 80.7%, and separate E2E race passed 186 tests/subtests (147.656s).
+Only the expected child-entry and opt-in drills skipped; no database
+acceptance skipped. Both owned databases applied all 55 migrations and
+skipped all 55 on rerun. Cleanup confirmed the owned server stopped.
+See runbook 4.81 for the file manifest, commands and remaining scope.
+This is a local commit checkpoint, not whole-branch review convergence.
 
 ## Pending Review Findings (2026-11-10)
 

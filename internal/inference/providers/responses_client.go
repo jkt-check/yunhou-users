@@ -518,9 +518,9 @@ func responsesToolChoiceToOpenAI(raw json.RawMessage) (json.RawMessage, error) {
 // ---------------------------------------------------------------------------
 
 // ResponsesUsageShape renders the Responses usage object. The Responses API
-// counts input_tokens INCLUDING cached tokens — the opposite of the
-// Anthropic surface — so cacheReadInInput==false (Anthropic-origin wire)
-// ADDS the cache bucket back into input.
+// counts input_tokens INCLUDING cache reads and creation — the opposite of
+// the Anthropic surface — so cacheReadInInput==false (Anthropic-origin wire)
+// adds both cache buckets back into input.
 func ResponsesUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 	if u == nil {
 		return nil
@@ -535,7 +535,7 @@ func ResponsesUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 		reasoning = derefOr(u.CompletionDetails.ReasoningTokens, 0)
 	}
 	if !cacheReadInInput {
-		input += cached
+		input += cached + derefOr(u.CacheCreationTokens, 0)
 	}
 	usage := map[string]any{
 		"input_tokens":         input,

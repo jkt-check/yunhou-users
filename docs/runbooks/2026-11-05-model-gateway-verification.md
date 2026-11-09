@@ -6066,6 +6066,49 @@ Lease cleanup is still best-effort under a database outage; fenced TTL
 recovery remains the fallback. No production/provider acceptance is claimed.
 No push, merge, deployment or kaya process operation.
 
+## 4.70 Cross-Process Rate And Concurrency Acceptance (2026-11-09)
+
+Task 11 extends the existing quota-worker re-exec harness to the rate and
+concurrency paths. Two real OS processes, each with its own connection
+pool, wait at a ready/start file barrier before admitting to one owned
+disposable PostgreSQL database. Distinct worker PIDs are asserted.
+
+The six independent bottlenecks are global account RPM, policy RPM,
+Key RPM, account TPM, account concurrency and Key concurrency. Account
+cases use sibling Keys; Key cases share a Key. Each case admits exactly
+3 of 16 requests and rejects 13 with `rate_limited` or
+`insufficient_capacity`. Persisted assertions check three requests,
+window reservations of 90, twelve monetary holds (three windows and a
+Key budget per request), six rate rows, expected concurrency leases and
+no ledger entries. Rejected admissions leave no partial state.
+
+Files changed: `internal/inference/postgres/quota_concurrency_test.go`,
+`internal/inference/postgres/rate_process_test.go`, the original completion
+plan, convergence plan and this runbook. No production behavior changes.
+The worker adds typed rejection counters, optional synchronized startup
+and bounded admission; the new harness reaps only its own child tests.
+
+Local artifacts under `/private/tmp/yunhou-review-20261109.3NuMWy/`:
+
+| Run | Command after disposable database setup | Result |
+|---|---|---|
+| `run.MhRoxm` | `go test -race -count=1 -p 1 -json ./internal/inference/postgres -run 'TestTwoProcessContend\|TestQuotaWorkerProcess' -timeout=5m` | Exit 0; 8 test/subtest passes, 12.642s |
+| `run.16SlWX` | `go test -race -count=1 -p 1 -json ./internal/inference/postgres -coverprofile=... -timeout=10m` | Exit 0; 213 passes, 24.805s; package statement coverage 77.5% |
+
+Both runs use `GOMAXPROCS=2` and explicit `DATABASE_URL` /
+`E2E_DATABASE_URL`, apply all 55 migrations plus idempotent reruns and stop
+their owned clusters on exit. Each has one expected skip: the parent
+invocation of the child-only `TestQuotaWorkerProcess`. Its re-executed
+children ran; the skip is not missing database acceptance.
+
+This closes the cross-process rate-path evidence gap recorded in section
+4.58 and original plan section 1.1.6 item 2. Historical checkpoint limits
+remain historical. Cross-host, real-provider/client acceptance and the
+wallet correction limitation remain open. Whole-branch race/coverage and
+E2E have not been refreshed at this commit checkpoint; 77.5% is the
+PostgreSQL package coverage, not the whole-branch 80% gate result.
+No push, merge, deployment or kaya process operation.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module
@@ -6108,19 +6151,11 @@ No push, merge, deployment or kaya process operation.
   waits for a human to confirm it (§4.58, limit 3). The unknown-usage
   backlog alarm fires at 10 parked requests; the backlog needs an operator,
   not a retry loop.
-- **The "two instances" are two Services in one process — and the repo
-  already has a cross-process harness for a *different* path.** The
-  coordination T10 proves lives in PostgreSQL, so it holds across processes,
-  but T10's rate-path suite was not itself run cross-process. The repository
-  *does* have a cross-process harness:
-  `TestTwoProcessContendLastCredit`
-  (`internal/inference/postgres/quota_concurrency_test.go:880`) re-execs the
-  test binary via the `TestQuotaWorkerProcess` child entry point
-  (`KAYA_QUOTA_WORKER=1`), each process with its own pool on the shared
-  database — but it drives the **quota-window** path (its worker policy sets
-  only the three window limits). Closing the rate-path gap means re-using
-  that same re-exec pattern with an RPM/TPM/concurrency-limited policy
-  (§4.58, limit 7).
+- **Cross-process rate-path acceptance is now covered; cross-host is not.**
+  Section 4.70 adds two real worker processes and independent pools for
+  account/policy/Key RPM, account TPM and account/Key concurrency. The full
+  PostgreSQL race suite passed. This does not refresh the whole-branch
+  race/coverage or E2E gates, nor prove cross-host/provider/client behavior.
 - **The wallet's post-settlement correction is still unwired — a real
   remaining limitation, not a plan exclusion.** The persistent rate
   reservation *is* settled/released on the wallet terminal and recovery

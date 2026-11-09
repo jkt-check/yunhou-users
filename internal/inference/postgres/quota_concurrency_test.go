@@ -761,9 +761,12 @@ func TestStorageUnavailableFailsClosed(t *testing.T) {
 
 // workerResult is the machine-readable worker summary (last stdout line).
 type workerResult struct {
-	Admitted      int `json:"admitted"`
-	QuotaExceeded int `json:"quota_exceeded"`
-	Other         int `json:"other"`
+	PID                  int `json:"pid"`
+	Admitted             int `json:"admitted"`
+	QuotaExceeded        int `json:"quota_exceeded"`
+	RateLimited          int `json:"rate_limited"`
+	InsufficientCapacity int `json:"insufficient_capacity"`
+	Other                int `json:"other"`
 }
 
 // TestQuotaWorkerProcess is the child-process entry point — it runs ONLY
@@ -774,7 +777,8 @@ func TestQuotaWorkerProcess(t *testing.T) {
 	if os.Getenv("KAYA_QUOTA_WORKER") != "1" {
 		t.Skip("worker process entry point")
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	dsn := os.Getenv("DATABASE_URL")
 	db, err := sqlx.Connect("postgres", dsn)
 	if err != nil {
@@ -819,8 +823,33 @@ func TestQuotaWorkerProcess(t *testing.T) {
 	lim := domain.Microcredit(limit)
 	one := int64(1)
 	svc := quota.NewService(NewStore(db), nil)
+	mode := os.Getenv("KAYA_WORKER_MODE")
+	if mode == "account_rpm" {
+		svc.AccountRPM = 3
+	}
+	if readyPath := os.Getenv("KAYA_WORKER_READY"); readyPath != "" {
+		if err := os.WriteFile(readyPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			_, err := os.Stat(env("KAYA_WORKER_START"))
+			if err == nil {
+				break
+			}
+			if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-ticker.C:
+			}
+		}
+	}
 
-	var res workerResult
+	res := workerResult{PID: os.Getpid()}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	start := make(chan struct{})
@@ -851,6 +880,16 @@ func TestQuotaWorkerProcess(t *testing.T) {
 					EstimatedInputTokens: hold,
 					ClientMaxTokens:      &one,
 				}
+				three := 3
+				switch mode {
+				case "policy_rpm":
+					cmd.Policy.RPMLimit = &three
+				case "account_tpm":
+					tokens := int64(33) // Three holds of 10 input + 1 output.
+					cmd.Policy.TPMLimit = &tokens
+				case "account_concurrency":
+					cmd.Policy.ConcurrencyLimit = &three
+				}
 				_, err := svc.Admit(ctx, cmd)
 				mu.Lock()
 				switch {
@@ -858,6 +897,10 @@ func TestQuotaWorkerProcess(t *testing.T) {
 					res.Admitted++
 				case domain.CodeOf(err) == domain.CodeQuotaExceeded:
 					res.QuotaExceeded++
+				case domain.CodeOf(err) == domain.CodeRateLimited:
+					res.RateLimited++
+				case domain.CodeOf(err) == domain.CodeInsufficientCapacity:
+					res.InsufficientCapacity++
 				default:
 					res.Other++
 					fmt.Fprintf(os.Stderr, "worker error: %v\n", err)

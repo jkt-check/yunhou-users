@@ -511,15 +511,16 @@ Token Plan 商品/权益与统一商品发布、真实渠道退款与改签、�
      恢复校验路径 / 操作入口）；② 钱包的**金额更正语义**（micromoney 单位、
      钱包补偿分录、token 预算同步）。本期**不实现**任何支付/钱包产品变更；
      现状限制（钱包更正被显式拒绝、金额更正无生产调用方）保持原样如实记录。
-2. **速率路径没有跨进程验收。** 仓库**已有**跨进程测试基建：
-   `internal/inference/postgres/quota_concurrency_test.go` 的
-   `TestTwoProcessContendLastCredit` 通过 `TestQuotaWorkerProcess` 子进程入口
-   （`KAYA_QUOTA_WORKER=1`）re-exec 测试二进制，每个进程一个独立连接池、共享同一个
-   一次性库。但它驱动的是**配额窗口**路径（worker 的策略只有三个窗口限额，没有
-   RPM/TPM/并发）。T4/T5 的**速率路径**（账户/Key RPM、账户 TPM、账户与 Key 并发）
-   目前只有 T10 的**进程内两实例两连接池**用例覆盖，**没有**被跨进程/跨主机跑过。
-   可执行的下一步：沿用同一个 `KAYA_QUOTA_WORKER` re-exec 模式，给 worker 一个带
-   RPM/TPM/并发限额的策略。
+2. **速率路径跨进程验收缺口已补齐（2026-11-09）；未做跨主机验收。**
+   `internal/inference/postgres/rate_process_test.go` 的
+   `TestTwoProcessContendRateAndConcurrency` 复用 `TestQuotaWorkerProcess`
+   re-exec 入口，以两个真实 OS 进程、独立连接池、同一个一次性库及同步起跑屏障，
+   分别验证全局账户 RPM、策略 RPM、Key RPM、账户 TPM、账户并发与 Key 并发。
+   每组 16 次请求恰好 3 次放行、13 次按对应错误码拒绝，并核对请求、金额预占、
+   速率预占、租约及分录无半提交。账户级场景使用不同 Key，Key 级场景共享 Key。
+   完整 PostgreSQL race 已通过（213 tests/subtests，包覆盖率 77.5%），
+   证据见 runbook §4.70。全仓 race/覆盖率与 E2E 仍需刷新；本项不声称跨主机、
+   真实供应商或客户端验收完成。
 
 ## 2. 一次性 PostgreSQL 操作参考
 

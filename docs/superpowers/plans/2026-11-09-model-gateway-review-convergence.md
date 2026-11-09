@@ -162,13 +162,24 @@ rejection regression now checks the actual `held` lease state.
 **Files:** `postgres/quota_concurrency_test.go`,
 `postgres/rate_process_test.go`, original plan and verification runbook.
 
-- [ ] Reuse the quota worker with two independent OS processes and pools,
+- [x] Reuse the quota worker with two independent OS processes and pools,
   synchronized before admission on the same disposable PostgreSQL database.
-- [ ] Exercise global/policy/account RPM, Key RPM, account TPM, account
+- [x] Exercise global account RPM, policy RPM, Key RPM, account TPM, account
   concurrency and Key concurrency as independent bottlenecks.
-- [ ] Assert exactly three admissions across both processes, typed
+- [x] Assert exactly three admissions across both processes, typed
   rejections, and no partial request, monetary, rate or lease effects.
-- [ ] Run PostgreSQL race tests and include the cases in the full gate.
+- [x] Run PostgreSQL race tests.
+- [ ] Include the cases in a fresh whole-branch race/coverage and E2E gate.
+
+Commit checkpoint: focused race `run.MhRoxm` passed 8 tests/subtests;
+full PostgreSQL race `run.16SlWX` passed 213 (24.805s), with package
+statement coverage 77.5%. Both skip only the parent invocation of the
+child-only `TestQuotaWorkerProcess`; the re-executed children ran and
+reported distinct PIDs. Each of the six rate/concurrency modes admitted
+3 of 16 requests and rejected 13 with the expected code. Monetary
+reservations include all four targets (three windows plus Key budget).
+Both owned disposable PostgreSQL clusters stopped normally. This closes
+the cross-process evidence gap, not cross-host or whole-branch acceptance.
 
 ## Execution Notes
 

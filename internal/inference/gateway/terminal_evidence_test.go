@@ -193,6 +193,9 @@ func TestGateway_TerminalEvidenceRetainsNullableAndMalformedUsage(t *testing.T) 
 	}{
 		{"absent", nil},
 		{"malformed", json.RawMessage(`{"schema_version":1,"usage":`)},
+		{"nul_escape", json.RawMessage(`{"schema_version":1,"usage":{"value":"\u0000"}}`)},
+		{"numeric_overflow", json.RawMessage(`{"schema_version":1,"usage":{"value":1e1000000}}`)},
+		{"lone_surrogate", json.RawMessage(`{"schema_version":1,"usage":{"value":"\ud800"}}`)},
 	} {
 		t.Run(raw.name, func(t *testing.T) {
 			f := newFixture(t, newUpstream(t, nonStreamUsage(10, 5)), withZeroPrice())
@@ -224,9 +227,9 @@ func TestGateway_TerminalEvidenceRetainsNullableAndMalformedUsage(t *testing.T) 
 				if len(observation.RawUsage) != 0 && string(observation.RawUsage) != "null" {
 					t.Errorf("unexpected raw JSON = %s", observation.RawUsage)
 				}
-				if raw.name == "malformed" {
+				if len(raw.value) > 0 {
 					if observation.RawUsageText == nil || *observation.RawUsageText != string(raw.value) {
-						t.Errorf("malformed raw evidence lost: %+v", observation)
+						t.Errorf("nonrepresentable raw evidence lost: %+v", observation)
 					}
 				} else if observation.RawUsageText != nil {
 					t.Errorf("absent raw usage fabricated: %q", *observation.RawUsageText)

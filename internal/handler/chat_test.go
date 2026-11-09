@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -150,6 +151,34 @@ func performChatRequest(r *gin.Engine, body string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+func TestChatHandler_LocalRateRetryAfter(t *testing.T) {
+	for _, tc := range []struct {
+		seconds int
+		want    string
+	}{{17, "17"}, {0, ""}, {-1, ""}} {
+		t.Run(fmt.Sprint(tc.seconds), func(t *testing.T) {
+			r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamFails(fmt.Errorf("wrapped: %w",
+				&service.ChatLimitError{Code: "rate_limited", RetryAfterSeconds: tc.seconds}))})
+			w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+			if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != tc.want {
+				t.Fatalf("status=%d retry=%q, want 429/%q", w.Code, w.Header().Get("Retry-After"), tc.want)
+			}
+			var envelope struct {
+				Code    int             `json:"code"`
+				Data    json.RawMessage `json:"data"`
+				Message string          `json:"message"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Code != 429 || string(envelope.Data) != "null" ||
+				envelope.Message != "chat request rejected by a usage limit (rate_limited)" {
+				t.Fatalf("unexpected envelope: %s", w.Body.String())
+			}
+		})
+	}
 }
 
 func TestChatHandler_Validation(t *testing.T) {

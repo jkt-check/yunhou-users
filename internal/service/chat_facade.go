@@ -316,7 +316,12 @@ func mapGatewayError(err error) error {
 		return ErrChatNoAccess
 	case domain.CodeRateLimited:
 		// 业务速率限制（账户/策略/Key 的 RPM、账户级 TPM）→ 本地限制 429。
-		return &ChatLimitError{Code: string(domain.CodeRateLimited)}
+		lim := &ChatLimitError{Code: string(domain.CodeRateLimited)}
+		var rateErr *domain.RateLimitError
+		if errors.As(err, &rateErr) {
+			lim.RetryAfterSeconds = rateErr.RetryAfterSeconds
+		}
+		return lim
 	case domain.CodeInsufficientCapacity:
 		// 并发上限已满（账户级权益策略 / Key 级 / 上游账号级）→ 本地限制 429。
 		return &ChatLimitError{Code: string(domain.CodeInsufficientCapacity)}

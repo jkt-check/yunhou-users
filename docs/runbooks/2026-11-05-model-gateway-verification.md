@@ -5238,6 +5238,152 @@ a legacy financial key without a receipt, equivalent reordered JSON evidence
 as a no-op, and a direct short-cutoff settled-TPM regression. Callers must still
 roll back their transaction on every correction error.
 
+### 4.62 Review #12 findings 3-5: protocol intent and retry metadata
+
+The user's November 9, 2026 follow-up supersedes the delivery decisions in
+section 4.61.5: findings 1-2 were committed first as
+`5f74ee8ee3bad49572c9a9fbecb5b591fa83275d`
+(`fix(inference): preserve live TPM and metering corrections`), including
+migration 055, regressions and documentation. Findings 3-5 are now implemented
+and packaged separately as `fix(inference): preserve protocol intent and retry
+metadata`. No push, merge, deployment, neighboring-checkout change or Kaya
+process operation is part of either delivery.
+
+#### 4.62.1 Behavior and compatibility
+
+- **Responses history:** text before function calls, consecutive parallel
+  calls and text after tool results remain representable in the internal
+  Chat turn. Nonempty assistant text after a function call, including text
+  between parallel calls before any results, now returns `invalid_input`
+  rather than silently moving text before the call. Request parsing and
+  stored-transcript replay use the same conversion.
+- **Reasoning precedence:** an explicit `reasoning_effort` wins over the
+  boolean `thinking_enabled`, including false, in both OpenAI adapters.
+  The ingress regression proves false/high remains high for Chat and
+  Responses; the adapter matrix covers every supported effort with true,
+  false and unset toggles. No-effort defaults and capability routing are
+  unchanged.
+- **Local `/chat` retry metadata:** wrapped typed rate errors retain
+  `RetryAfterSeconds` through the facade's `ChatLimitError`. The handler
+  emits integer `Retry-After` only for `rate_limited` with positive known
+  seconds. Unknown/nonpositive recovery omits the header. The existing
+  429 envelope, both compatibility sentinels and cold-catalog
+  `Retry-After: 5` are unchanged.
+
+These are deliberate compatibility decisions: formerly reordered histories
+must now use a representable sequence, and contradictory reasoning flags
+request the explicit effort rather than returning a new ingress 400.
+
+#### 4.62.2 Regression evidence
+
+All artifacts below are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`:
+
+- `protocol-baseline-red.jsonl`: running the new provider regressions with
+  Go's read-only source overlay of the two production files at `5f74ee8`
+  fails as expected. The baseline accepts before/call/after history and
+  turns false plus explicit effort into none. The worktree was not reverted.
+- `run.N1821v`: facade and handler regressions RED; known 17-second recovery
+  is lost and `Retry-After` is absent.
+- `run.D4VkoH`: real local RPM admission through `/chat` is RED; the 429
+  omits the computable recovery header.
+- `run.6cnAkZ`: focused race regressions GREEN, **50** test/subtest passes
+  across **five** packages, zero failures/skips. Coverage includes parse
+  and replay ordering rejection, cross-adapter effort precedence, ingress
+  false/high, wrapped errors, known/unknown/negative recovery, and real
+  RPM versus permanently-over-cap TPM rejection without upstream dispatch.
+- Full provider packages also passed
+  `go test -race -count=1 ./internal/inference/providers/...`.
+- `run.ObuVVi`: `go build ./...` and
+  `go vet ./internal/... ./cmd/...` passed.
+- Full race/coverage command:
+  `go test -race -count=1 -p 1 -coverprofile="$RUN/coverage.out" -json
+  ./internal/... ./cmd/... ./tests/integration/...`.
+  **4,291** test/subtest passes across **34** packages, zero failures and
+  three skips: `TestQuotaWorkerProcess` is the subprocess entry point
+  (parent `TestTwoProcessContendLastCredit` passed);
+  `TestLoadDrill_Throughput` and `TestLoadDrill_LongConnections` require
+  `KAYA_LOAD=1` and are outside the default gate.
+- `go tool cover -func="$RUN/coverage.out"`: total statement coverage
+  **80.5%**, satisfying the **80%** floor. The separate E2E command is
+  not included in this coverage profile.
+- Race E2E command:
+  `go test -race -count=1 -p 1 -json ./tests/e2e/...`.
+  **181** test/subtest passes, zero failures, one skip:
+  `TestUsageTokenAcceptance_TenPagesTwoMinutes` requires
+  `USAGE_ACCEPTANCE=1` and is outside the default gate. The new
+  `TestChatFacade_RateRetryAfter` passed in this full run.
+- The final runner exited **0**. Both suites report passing results for all
+  **35 Go packages**, checked against `go list ./...`, with no missing
+  packages or race failures.
+- Both disposable databases applied all **55** migrations, including 055;
+  each repeat invocation reported `applied=0 skipped=55`. `cleanup.log`
+  confirms `server stopped` for this run's owned cluster.
+- Final `gofmt -l` and `git diff --check` were clean.
+
+The database runner creates an owned PostgreSQL cluster and two
+temporary databases, exports both test DSNs explicitly and stops only that
+cluster on exit. No default or production database is used.
+
+#### 4.62.3 Independent review and boundaries
+
+The fresh-context read-only reviewer found no confirmed bugs or blockers in
+the scoped code and tests. Selected database-free race tests and
+`git diff --check` passed during review; the main runner owns all database
+test evidence.
+
+Rulings on intentionally unexpanded review scope:
+
+- Upstream output folding/SSE ordering and system/developer hoisting are
+  unchanged, not validated by this incoming parse/replay fix; their fidelity
+  is not newly certified.
+- Complete tool-history validation (duplicate IDs and missing/partial results)
+  is outside this ordering fix; malformed histories may still fail upstream.
+- Boolean-only Chat behavior and provider-specific effort vocabulary remain
+  unchanged; this fixes explicit-effort conflicts, not every protocol dialect.
+- Upstream 429 recovery headers remain outside the local domain-rate path;
+  no promise of forwarding supplier retry metadata is made.
+- Prior money/quota internals were excluded from this second review; their
+  evidence is section 4.61, not a new audit of those internals.
+
+Deferred nonblocking test opportunities, not confirmed defects: empty-text
+acceptance, whitespace-only rejection and a stored-call/new-input boundary
+case; positive retry seconds attached to non-rate codes should omit the header.
+The correction trigger still has no production caller, wallet money correction
+is unsupported, provider E2E is simulated and cross-process rate-path
+acceptance remains open (section 5).
+
+#### 4.62.4 Deliverable file manifest
+
+First commit (findings 1-2), nine files:
+
+- `internal/inference/postgres/inference_limit_repo.go`
+- `internal/inference/postgres/reconciliation_repo.go`
+- `internal/inference/postgres/inference_limit_test.go`
+- `internal/inference/postgres/correction_rate_test.go`
+- `internal/inference/postgres/metering_correction_test.go`
+- `internal/inference/postgres/recovery_test.go`
+- `migrations/055_inference_usage_corrections.sql`
+- `docs/superpowers/plans/2026-11-09-model-gateway-money-quota-review-fixes.md`
+- `docs/runbooks/2026-11-05-model-gateway-verification.md`
+
+Second commit (findings 3-5), fourteen files:
+
+- `internal/inference/providers/responses_client.go`
+- `internal/inference/providers/responses_client_test.go`
+- `internal/inference/providers/openai_responses.go`
+- `internal/inference/providers/openai_responses_test.go`
+- `internal/inference/providers/adapter.go`
+- `internal/inference/httpapi/reasoning_precedence_test.go`
+- `internal/service/errors.go`
+- `internal/service/chat_facade.go`
+- `internal/service/chat_facade_test.go`
+- `internal/handler/chat.go`
+- `internal/handler/chat_test.go`
+- `tests/e2e/chat_retry_after_test.go`
+- `docs/superpowers/plans/2026-11-09-model-gateway-protocol-review-fixes.md`
+- `docs/runbooks/2026-11-05-model-gateway-verification.md`
+
 ---
 
 ## 5. Open concerns
@@ -5313,16 +5459,16 @@ roll back their transaction on every correction error.
 
 ## 6. Named follow-ups (post-delivery)
 
-Items that are **real remaining limitations** of this branch, tracked by name so
-they are not silently dropped. They are **not** "done", and no plan-level
-waiver is implied by their existence here.
+Named limitations and their delivery status are retained so they are not
+silently dropped. Open items are **not** "done", and no plan-level waiver is
+implied by their existence here. Closed review findings point to their evidence.
 
 | # | Follow-up | Scope | Owner (role) | Schedule |
 |---|---|---|---|---|
 | 1 | `inference-correction-trigger-and-wallet` | (a) The **evidence-driven correction trigger**: who calls `Store.CorrectSettlement` / `Store.CorrectRateTokensTx` when real usage evidence lands (the recovery verifier path, or an operator-facing correction entry point) — today the money-correction channel has **no production caller**; (b) the **wallet money-correction semantics**: `CorrectSettlement` refuses wallet-charged requests with `invalid_input` (micromoney unit, wallet compensation entries and the token-budget sync are not adapted), so an estimated wallet settlement that later gets real evidence cannot be corrected. **No payment / wallet product change is implied** — the scope is the correction channel only. | Users 模型网关维护者 | 未排期 |
-| 2 | `responses-history-order-preservation` (review #12 finding 3) | `internal/inference/providers/responses_client.go:299` merges consecutive assistant items and can turn text-before / tool-call / text-after into text-before+after / tool-call. Preserve order, or explicitly reject combinations that cannot be represented faithfully. This round records the finding only; history replay and subsequent inference remain at risk. | Users 模型网关维护者 | 本轮不修，未排期 |
-| 3 | `reasoning-parameter-conflict-policy` (review #12 finding 4) | `internal/inference/providers/openai_responses.go:191`: `thinking_enabled:false` plus `reasoning_effort:"high"` becomes `effort:"none"` for Responses but remains high for Chat. Define one precedence rule or reject the conflict at ingress with 400. This round records the finding only; candidate protocol can still change request semantics. | Users 模型网关维护者 | 本轮不修，未排期 |
-| 4 | `chat-rate-limit-retry-after` (review #12 finding 5) | `internal/service/chat_facade.go:317` drops `RetryAfterSeconds` while translating to `ChatLimitError`, so `/chat` omits `Retry-After`. Preserve retry metadata and emit it in the handler only when recovery time is known. This round records the finding only. | Users 模型网关维护者 | 本轮不修，未排期 |
+| 2 | `responses-history-order-preservation` (review #12 finding 3) | Representable history stays ordered; nonempty text after a call before results explicitly returns `invalid_input` in parse and replay. See section 4.62 for regressions and compatibility cost. | Users 模型网关维护者 | 2026-11-09 本轮已修 |
+| 3 | `reasoning-parameter-conflict-policy` (review #12 finding 4) | Explicit reasoning effort takes precedence over the toggle in both OpenAI adapters; false/high remains high. See section 4.62 for the ingress and adapter matrix. | Users 模型网关维护者 | 2026-11-09 本轮已修 |
+| 4 | `chat-rate-limit-retry-after` (review #12 finding 5) | Facade retains known local rate recovery; handler emits positive `Retry-After` and omits unknown recovery. See section 4.62 for real RPM/TPM E2E evidence. | Users 模型网关维护者 | 2026-11-09 本轮已修 |
 
 The limitation wording in the plan (§1.1.6 item 1), the T4 branch-era note
 "已知边界（本期不扩大）" and §4.58 limit 3 stay **as they are**: they are

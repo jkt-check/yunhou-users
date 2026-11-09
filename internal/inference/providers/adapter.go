@@ -59,7 +59,8 @@ type ChatRequest struct {
 	// its protocol's default. A level the upstream protocol cannot express
 	// is REFUSED before dispatch (routing skips the candidate, the adapter
 	// refuses defensively) — it is never folded into another level and
-	// never silently ignored.
+	// never silently ignored. An explicit effort takes precedence over
+	// ThinkingEnabled, including an explicit false toggle.
 	ReasoningEffort string
 	// ThinkingBudget is the client-declared Anthropic thinking budget
 	// (budget_tokens). Nil means the adapter's default. Only the anthropic

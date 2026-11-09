@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/model"
 )
 
@@ -17,7 +18,7 @@ func TestResponsesReplay_ParallelToolGroupingPreservesText(t *testing.T) {
 	for _, withText := range []bool{false, true} {
 		name := "calls_only"
 		if withText {
-			name = "text_before_between_after"
+			name = "text_before_calls"
 		}
 		t.Run(name, func(t *testing.T) {
 			items := []json.RawMessage{json.RawMessage(`{"role":"user","content":"q"}`)}
@@ -25,13 +26,7 @@ func TestResponsesReplay_ParallelToolGroupingPreservesText(t *testing.T) {
 				items = append(items, json.RawMessage(`{"role":"assistant","content":"before "}`))
 			}
 			items = append(items, json.RawMessage(`{"type":"function_call","call_id":"a","name":"lookup","arguments":"{\"q\":1}"}`))
-			if withText {
-				items = append(items, json.RawMessage(`{"role":"assistant","content":[{"type":"output_text","text":"between "}]}`))
-			}
 			items = append(items, json.RawMessage(`{"type":"function_call","call_id":"b","name":"lookup","arguments":"{\"q\":2}"}`))
-			if withText {
-				items = append(items, json.RawMessage(`{"role":"assistant","content":"after"}`))
-			}
 			items = append(items,
 				json.RawMessage(`{"type":"function_call_output","call_id":"a","output":"one"}`),
 				json.RawMessage(`{"type":"function_call_output","call_id":"b","output":"two"}`),
@@ -63,7 +58,7 @@ func TestResponsesReplay_ParallelToolGroupingPreservesText(t *testing.T) {
 				}
 				wantText := ""
 				if withText {
-					wantText = "before between after"
+					wantText = "before "
 				}
 				if turn.Content != wantText {
 					t.Fatalf("text = %q, want %q", turn.Content, wantText)
@@ -78,6 +73,30 @@ func TestResponsesReplay_ParallelToolGroupingPreservesText(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResponsesReplay_RejectsTextAfterUnresolvedCall(t *testing.T) {
+	for _, middle := range []string{
+		`{"role":"assistant","content":"after"}`,
+		`{"role":"assistant","content":[{"type":"output_text","text":"between"}]},
+		 {"type":"function_call","call_id":"b","name":"lookup","arguments":"{}"}`,
+	} {
+		input := `[{"role":"user","content":"q"},
+		 {"role":"assistant","content":"before"},
+		 {"type":"function_call","call_id":"a","name":"lookup","arguments":"{}"},` + middle + `,
+		 {"type":"function_call_output","call_id":"a","output":"one"}]`
+		var items []json.RawMessage
+		if err := json.Unmarshal([]byte(input), &items); err != nil {
+			t.Fatal(err)
+		}
+		_, parseErr := ParseResponsesRequest([]byte(`{"model":"m","input":` + input + `}`))
+		_, replayErr := ResponsesReplayToChat(items)
+		for _, err := range []error{parseErr, replayErr} {
+			if domain.CodeOf(err) != domain.CodeInvalidInput || !strings.Contains(err.Error(), "order") {
+				t.Errorf("want explicit ordering rejection, got %v", err)
+			}
+		}
 	}
 }
 

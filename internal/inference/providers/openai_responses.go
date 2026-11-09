@@ -178,22 +178,19 @@ func (a *OpenAIResponses) BuildPayload(call *Call) ([]byte, error) {
 		}
 		payload["tool_choice"] = tc
 	}
-	if r.ThinkingEnabled != nil {
+	// An explicit effort is the more specific request, matching openai_chat
+	// and capability routing even when the boolean toggle says false.
+	if r.ReasoningEffort != "" {
+		payload["reasoning"] = map[string]any{"effort": r.ReasoningEffort, "summary": "auto"}
+	} else if r.ThinkingEnabled != nil {
 		if *r.ThinkingEnabled {
 			// summary:auto 是拿回推理文本的必要条件（无加密存储，摘要即所
 			// 得；responses_client.go 的 reasoning 项映射同一口径）。
 			// T8: 客户端显式声明的档位逐字使用 —— 绝不一律折成 medium。
-			effort := responsesThinkingEffort
-			if r.ReasoningEffort != "" {
-				effort = r.ReasoningEffort
-			}
-			payload["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
+			payload["reasoning"] = map[string]any{"effort": responsesThinkingEffort, "summary": "auto"}
 		} else {
 			payload["reasoning"] = map[string]any{"effort": "none"}
 		}
-	} else if r.ReasoningEffort != "" {
-		// 只有档位没有开关：档位本身即推理请求。
-		payload["reasoning"] = map[string]any{"effort": r.ReasoningEffort, "summary": "auto"}
 	}
 	for _, k := range responsesPassthroughKeys {
 		if v, ok := r.Passthrough[k]; ok {

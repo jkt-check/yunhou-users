@@ -168,6 +168,8 @@ type ChatLimitError struct {
 	// Code is the business code: rate_limited / insufficient_capacity /
 	// quota_exceeded / insufficient_balance.
 	Code string
+	// RetryAfterSeconds is known rate recovery time; nonpositive means unknown.
+	RetryAfterSeconds int
 }
 
 func (e *ChatLimitError) Error() string {

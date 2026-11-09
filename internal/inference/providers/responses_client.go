@@ -293,8 +293,8 @@ type responsesItemView struct {
 // tool_call id (多轮工具调用 ID 保留).
 func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) {
 	var out []model.ChatMessage
-	// Consecutive assistant items belong to one turn, including text around
-	// parallel function calls. Tool results end that group.
+	// Text before calls and consecutive parallel calls fit one Chat turn.
+	// Text after a call does not: Chat content precedes every tool_call.
 	appendMessage := func(m model.ChatMessage) {
 		if m.Role == "assistant" && len(out) > 0 && out[len(out)-1].Role == "assistant" {
 			last := &out[len(out)-1]
@@ -323,6 +323,13 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			text, err := responsesMessageText(role, it.Content)
 			if err != nil {
 				return nil, err
+			}
+			if role == "assistant" && text != "" && len(out) > 0 {
+				last := out[len(out)-1]
+				if last.Role == "assistant" && len(last.ToolCalls) > 0 {
+					return nil, invalidMsg("input",
+						"assistant text after function_call cannot preserve item order in a Chat turn; send tool outputs before the next assistant message")
+				}
 			}
 			appendMessage(model.ChatMessage{Role: role, Content: text})
 		case "function_call":

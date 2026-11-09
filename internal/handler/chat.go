@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -138,6 +139,11 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		if errors.Is(err, service.ErrChatNotReady) {
 			// Retry-After 取 5s：短于 chatLimiter refill,避免重试风暴放大。
 			c.Header("Retry-After", "5")
+		} else {
+			var lim *service.ChatLimitError
+			if errors.As(err, &lim) && lim.Code == "rate_limited" && lim.RetryAfterSeconds > 0 {
+				c.Header("Retry-After", strconv.Itoa(lim.RetryAfterSeconds))
+			}
 		}
 		h.logAccess(started, userID, appID, routeModel(route, req.Model), req, "error", msg, "", rej)
 		writeChatError(c, status, msg, rej)

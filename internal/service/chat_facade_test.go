@@ -783,6 +783,23 @@ func TestMapGatewayError_LocalLimitsAreNotUpstreamErrors(t *testing.T) {
 	}
 }
 
+func TestMapGatewayError_RetainsKnownRateRecovery(t *testing.T) {
+	for _, seconds := range []int{0, 17} {
+		err := fmt.Errorf("admission: %w", &domain.RateLimitError{
+			Detail:            domain.NewError(domain.CodeRateLimited, "account rpm"),
+			RetryAfterSeconds: seconds,
+		})
+		got := mapGatewayError(err)
+		var lim *ChatLimitError
+		if !errors.As(got, &lim) || !errors.Is(got, ErrChatRequestLimited) {
+			t.Fatalf("want local limit error, got %v", got)
+		}
+		if lim.Code != string(domain.CodeRateLimited) || lim.RetryAfterSeconds != seconds {
+			t.Errorf("mapped limit=%+v, want rate_limited with retry=%d", lim, seconds)
+		}
+	}
+}
+
 // T8: facade 的 AllowedModels 投影（legacy /chat 的模型选择器）与派发能力
 // 一致 —— 只有 openai_responses 部署的模型不得 advertise image（派发会在
 // 准入前 400），有 openai_chat 部署的模型保留 image。

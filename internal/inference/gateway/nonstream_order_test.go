@@ -61,7 +61,7 @@ func TestGateway_NonstreamOrderRejectionDoesNotFailover(t *testing.T) {
 				{`SELECT COUNT(*) FROM inference_attempts`, 1},
 				{`SELECT COUNT(*) FROM inference_ledger_entries WHERE entry_type='charge' AND amount_micros=17`, 1},
 				{`SELECT COUNT(*) FROM inference_reservations WHERE state='held'`, 0},
-				{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='active'`, 0},
+				{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='held'`, 0},
 				{`SELECT COUNT(*) FROM inference_reconciliation_jobs`, 0},
 				{`SELECT COUNT(*) FROM inference_rate_reservations WHERE scope='account' AND state='settled' AND settled_tokens=12`, 1},
 			} {

@@ -959,17 +959,12 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	// lease of the admission (the account lease and — Task 5 — the per-Key
 	// lease): the lease SET is a list, never a hardcoded pair. A renewal
 	// conflict fences the attempt and cancels blocked upstream I/O.
-	// No lease is released by the renewal loop: the upstream lease ends per
-	// attempt (explicit release below), the request-scoped leases are
-	// released by the finalizer (settle/release), never per attempt.
+	// No lease is released by the renewal loop. A failed dispatch releases
+	// only its upstream lease; a completed dispatch keeps the entire set
+	// alive until finalization.
 	keeper := s.routingSvc.NewLeaseKeeperWithCancel(cancel, append([]*domain.ConcurrencyLease{lease}, adm.Leases...)...)
-	// 防泄漏守卫:keeper 创建到交接(流式沿用 keeper / 非流式显式释
-	// 放)之间,若 Dispatch 或 onStream/onNonStream panic(如 disp.Stream
-	// 为 nil、TeeBody 组装失败),gin recover 后 keeper goroutine 会永久续
-	// 租双租约 —— 恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
-	// 对齐 F-1(StreamBody.Finish)的 defer 释放模式:未交接则停 keeper
-	// 并取消 dispatch ctx;正常路径 Pause 已消费 stopMu,Stop 为 no-op,
-	// 零影响。panic 仍向上传播(行为同既有)。
+	// Before handoff, a dispatch/assembly panic must stop renewal and release
+	// the leases. Pause/Stop are idempotent if a callee already cleaned up.
 	handedOff := false
 	defer func() {
 		if handedOff {
@@ -1021,8 +1016,8 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	} else {
 		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter, err)
 	}
-	// keeper 已完成交接(流式: Finish 接管同一 keeper;非流式:
-	// 上游租约已释放、账户租约归 finalizer)。
+	// Streaming Finish owns the keeper; nonstream finalization already
+	// stopped it and released every lease.
 	handedOff = true
 	if outcome != nil {
 		outcome.AccountID = cand.Account.ID
@@ -1053,30 +1048,17 @@ func (s *Service) persistAttempt(ctx context.Context, a *domain.Attempt, cand ro
 	return lease, nil
 }
 
-// onNonStreamDispatch settles immediately and returns the payload. Every
-// lease ends with the request: the attempt-scoped upstream lease explicitly
-// after the keeper pauses, the request-scoped ones (account + per-Key) by
-// the finalizer below.
+// onNonStreamDispatch keeps every lease renewed through finalization, then
+// releases the complete set even if finalization times out or panics.
 func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
 	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
 	price accounting.PriceVersion, adapter providers.Adapter, translationErr error) (*Outcome, error) {
-	defer s.cleanupRequestLeases(adm.Leases)
+	defer func() {
+		kctx, kcancel := detached(settleTimeout)
+		defer kcancel()
+		keeper.Stop(kctx)
+	}()
 	cancel()
-	kctx, kcancel := detached(settleTimeout)
-	// Pause (no release), then release ONLY the attempt-scoped upstream
-	// lease; the request-scoped leases stay held until the finalizer below
-	// (M1). The split is by lease ID, not by a hardcoded lock count.
-	keeper.Pause()
-	requestLeases := leaseIDSet(adm.Leases)
-	for _, l := range keeper.Leases() {
-		if _, isRequestLease := requestLeases[l.ID]; isRequestLease {
-			continue
-		}
-		if err := s.routingSvc.ReleaseLease(kctx, l); err != nil {
-			log.Printf("gateway: release upstream lease %s: %v", l.ID, err)
-		}
-	}
-	kcancel()
 	attemptStatus, kind := "completed", ""
 	if translationErr != nil {
 		attemptStatus, kind = "failed", "response_translation"
@@ -1531,19 +1513,6 @@ func (s *Service) cleanupRequestLeases(leases []*domain.ConcurrencyLease) {
 	ctx, cancel := detached(settleTimeout)
 	defer cancel()
 	s.releaseRequestLeases(ctx, leases)
-}
-
-// leaseIDSet indexes a lease list by lease ID — the finalizer splits the
-// keeper's lease set into "attempt-scoped" and "request-scoped" by identity,
-// never by a hardcoded lock count.
-func leaseIDSet(leases []*domain.ConcurrencyLease) map[string]struct{} {
-	out := make(map[string]struct{}, len(leases))
-	for _, l := range leases {
-		if l != nil {
-			out[l.ID] = struct{}{}
-		}
-	}
-	return out
 }
 
 // releaseRequestLeases releases every request-scoped lease of an admission.

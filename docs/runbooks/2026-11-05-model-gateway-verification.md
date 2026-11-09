@@ -6030,6 +6030,42 @@ the original wallet-correction boundary and the final independent branch
 review remain separate unfinished work. Local simulated upstreams are
 not real supplier acceptance.
 
+## 4.69 Nonstream Finalization Lease Order (2026-11-09)
+
+Task 10 closes the confirmed gap between nonstream finalization and the
+original finalize-before-release invariant. A legal dispatch timeout just
+below the 15m recovery grace can leave too little time for settlement;
+this is not evidence that default 10m requests are immediately recoverable.
+
+RED `run.caxKW6` (local artifacts under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`) reproduced 0/1 or 2/3 live
+leases before finalization. With only an upstream lease, real recovery
+settled conservatively at 16413 instead of the known reported charge 20.
+The panic regression also observed only 2/3 leases before finalization.
+
+The fix keeps the existing keeper renewing until nonstream finalization
+ends and defers `Stop` with its own cleanup budget, matching stream
+finalization. This covers success, exhausted settlement deadlines and
+panic. Failed-dispatch retries retain their existing scoped-release path.
+
+| File | Change |
+|---|---|
+| `internal/inference/gateway/service.go` | Keep renewal through finalization; remove early release and obsolete lease-ID split |
+| `internal/inference/gateway/nonstream_finish_order_test.go` | Previously committed RED regressions: recovery exclusion, renewal, exact reported settlement/TPM and panic cleanup |
+| `internal/inference/gateway/nonstream_order_test.go` | Check real `held` state instead of nonexistent `active` |
+| `docs/superpowers/plans/2026-11-09-model-gateway-review-convergence.md`, this runbook | Progress, evidence and remaining verification boundaries |
+
+Focused race `run.NYjMkE` exited 0: 20 test/subtest passes, no skips.
+Full gateway race `run.2Pn4qs` exited 0: 142 passes, no skips/failures
+(42.169s). Success asserts one charge of 20, reported usage, settled TPM
+15, no reconciliation job and no held leases. Both runs used independent
+owned disposable PostgreSQL clusters and stopped them on exit.
+
+Whole-branch race coverage, E2E and final independent review remain open.
+Lease cleanup is still best-effort under a database outage; fenced TTL
+recovery remains the fallback. No production/provider acceptance is claimed.
+No push, merge, deployment or kaya process operation.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

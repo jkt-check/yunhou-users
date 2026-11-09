@@ -136,9 +136,9 @@ domain error mapping, HTTP handlers, regression tests and API documentation.
 
 - [x] Reproduce upstream lease release before nonstream finalization, including
   recovery near a legal deployment timeout just below the grace boundary.
-- [ ] Keep every lease renewed until finalization completes; release with a
+- [x] Keep every lease renewed until finalization completes; release with a
   fresh cleanup budget on success, timeout and panic.
-- [ ] Verify reported settlement wins once, preserves TPM, and leaves no leases.
+- [x] Verify reported settlement wins once, preserves TPM, and leaves no leases.
 
 RED checkpoint (2026-11-09): focused race run
 `go test -race -count=1 -p 1 ./internal/inference/gateway -run '^TestGateway_NonstreamFinal' -timeout=3m`
@@ -147,6 +147,28 @@ or 2/3 live leases, and recovery won the upstream-only case with a conservative
 charge of 16413 instead of reported usage's 20. The panic case also observed
 only 2/3 leases before cleanup. This checkpoint contains tests, not the fix;
 Task 10 remains open. The temporary database was stopped after verification.
+
+GREEN checkpoint: the same keeper now renews all leases through nonstream
+finalization, then stops with a fresh cleanup deadline. Focused race run
+`run.NYjMkE` passed 20 tests/subtests, including timeout and panic cleanup.
+Full gateway race `run.2Pn4qs` passed 142 tests/subtests (42.169s), no
+failures or skips; reported charge 20, settled TPM 15, one charge, no
+reconciliation jobs or held leases. Both owned clusters stopped normally.
+The obsolete early-release lease-ID split was removed. The translation
+rejection regression now checks the actual `held` lease state.
+
+## Task 11: Cross-Process Rate And Concurrency Acceptance
+
+**Files:** `postgres/quota_concurrency_test.go`,
+`postgres/rate_process_test.go`, original plan and verification runbook.
+
+- [ ] Reuse the quota worker with two independent OS processes and pools,
+  synchronized before admission on the same disposable PostgreSQL database.
+- [ ] Exercise global/policy/account RPM, Key RPM, account TPM, account
+  concurrency and Key concurrency as independent bottlenecks.
+- [ ] Assert exactly three admissions across both processes, typed
+  rejections, and no partial request, monetary, rate or lease effects.
+- [ ] Run PostgreSQL race tests and include the cases in the full gate.
 
 ## Execution Notes
 

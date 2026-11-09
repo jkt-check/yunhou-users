@@ -458,6 +458,8 @@ func writeV1DomainError(c *gin.Context, err error) {
 		v1Error(c, http.StatusTooManyRequests, "rate_limit_error", string(domain.CodeOf(err)), safeMsg(err))
 	case domain.CodeUnpricedCapability:
 		v1Error(c, http.StatusForbidden, "permission_error", "unpriced_capability", safeMsg(err))
+	case domain.CodeUpstreamResponseInvalid:
+		v1Error(c, http.StatusBadGateway, "server_error", "upstream_response_invalid", safeMsg(err))
 	case domain.CodeUpstreamUnavailable:
 		v1Error(c, http.StatusServiceUnavailable, "server_error", "upstream_unavailable", safeMsg(err))
 	case domain.CodeServiceUnavailable:

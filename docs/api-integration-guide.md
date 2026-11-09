@@ -669,6 +669,8 @@ picker 让客户发图、网关在准入前当场 400）。判据与派发共用
 
 **流式中断语义（三协议一致）**：协议终止标记（`[DONE]`/`message_stop`/`response.completed`）是唯一干净结束；上游中断时向流内注入该协议的原生错误事件（chat：内联 `{"error":...}` 块；messages：`event: error`；responses：`event: error`）后结束，**绝不伪造终止标记**。已读用量照常结算（estimated）；未读用量挂起核对（不记零）。
 
+**非流式输出保序**：Anthropic/Responses 上游的非空文本若出现在工具调用之后（如「文本 → 调用 → 文本」或「调用 → 文本 → 调用」），内部 Chat 形状无法忠实保序，三个 `/v1` 推理入口均返回 **502**，不返回改写后的答案，也不持久化 Responses 会话链。OpenAI 错误码为 `upstream_response_invalid`，Messages 使用 `api_error`。这是**已经执行**的请求：已报 usage 按 reported 结算，缺失 usage 按完整输出内容估算，TPM 同步结算；网关不重放、不切换上游。客户端主动重试属于另一次可能计费的调用。文本在调用之前、空文本穿插调用之间仍支持。
+
 **Responses 会话链（`previous_response_id`）**：成功响应（`store` 缺省 true）持久化截至本轮的完整规范 items transcript + 账户归属 + 实际服务账号（24h TTL，超 512 KiB 的 transcript 不落链）。引用链的请求 = transcript 回放（既有上下文 + 新输入），并经粘性会话绑定钉住同一上游账号；账号失效时显式迁移（旧绑定终止 reason=migrated + 新绑定同事务建立），**绝不静默换号续接**。`store:false` 的响应不落链；引用不存在/过期/他人/`store:false` 的响应一律 404（`previous_response_not_found`，不泄漏存在性）。`GET /v1/responses/{id}`（OpenAI stored-response 读取面）不实现。
 
 **限制**：请求体 ≤1 MiB；消息/输入项 ≤512；工具 ≤128（总 ≤256 KiB）；模型 id ≤128 字符。Messages 面 `max_tokens` 必填（Anthropic 语义）。

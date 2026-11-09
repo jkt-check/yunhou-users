@@ -113,11 +113,12 @@ and is not part of this checkpoint.
 
 ## Task 8: Native Nonstream Output Order
 
-**Files:** `anthropic.go`, `openai_responses.go` and provider tests.
+**Files:** native provider decoders/dispatch, gateway nonstream finalizer,
+domain error mapping, HTTP handlers, regression tests and API documentation.
 
-- [ ] Reproduce text/tool/text and tool/text/tool folding into reordered
+- [x] Reproduce text/tool/text and tool/text/tool folding into reordered
   Chat output.
-- [ ] Reject unrepresentable nonstream output explicitly while preserving
+- [x] Reject unrepresentable nonstream output explicitly while preserving
   supported arrangements; never persist reordered replay history.
 
 ## Task 9: Interrupted Anthropic Start Usage
@@ -280,3 +281,35 @@ Both disposable databases applied 55 migrations and skipped all 55 on
 their idempotent rerun. Cleanup confirmed the owned PostgreSQL server
 stopped; kaya was untouched. The file manifest and remaining risks are
 in runbook 4.66. Tasks 8-9 and the until-clean review remain unfinished.
+
+### Native Nonstream Output Checkpoint
+
+The latest commit request checkpoints Task 8 only. Fully decoded native
+output with nonempty text after a tool call now returns a 502 translation
+error without a reordered payload or Responses chain. Complete metering
+survives the rejection, settles once, and prevents gateway replay or
+failover; malformed responses remain unknown execution.
+
+Provider regressions cover text/tool/text, tool/text/tool, reported and
+absent usage, supported arrangements and dispatch metadata. The focused
+disposable-database run `run.gVp6cA` passed 24 gateway/HTTP tests and
+subtests, including single settlement, no fallback and no response chain.
+The complete providers race suite passed again before commit (2.349s).
+
+Full verification in `run.yj5MJY` is non-green: build/vet passed, 4,404
+tests/subtests passed, but `TestWSSlowConsumer` and
+`TestWSConnectionCaps` failed in unchanged `internal/relay`. A separate
+relay recheck still failed the slow-consumer test. Total statement
+coverage was 80.6% from this non-green run, not a passing gate.
+
+The first separate E2E run reached the default package timeout. The
+retry `run.jJtp92`, using `GOMAXPROCS=2` and `-timeout=30m`, exited 0
+with 186 test/subtest passes and one expected opt-in skip. It used new
+independent disposable databases; both passed all 55 migrations and the
+idempotent rerun, and cleanup stopped the owned PostgreSQL server.
+No test assertions or individual deadlines changed.
+
+The file manifest, exact evidence paths and remaining risks are in
+runbook 4.67. Task 9, unresolved relay failures and the until-clean
+review remain open. No push, merge, deployment or kaya process operation
+is part of this checkpoint.

@@ -444,13 +444,16 @@ func responsesFinishReason(status, incompleteReason string, hasToolCalls bool) s
 
 // collectResponseOutput folds the output items of a completed response into
 // the internal message parts (visible text, reasoning text, tool calls).
-func collectResponseOutput(output []responsesOutputItem) (text, reasoning string, toolCalls []any) {
+func collectResponseOutput(output []responsesOutputItem) (text, reasoning string, toolCalls []any, err error) {
 	var textBuf, reasonBuf strings.Builder
 	for _, it := range output {
 		switch it.Type {
 		case "message":
 			for _, p := range it.Content {
 				if p.Type == "output_text" {
+					if len(toolCalls) > 0 && p.Text != "" {
+						err = fmt.Errorf("providers: Responses text after function_call cannot be translated faithfully")
+					}
 					textBuf.WriteString(p.Text)
 				}
 			}
@@ -467,7 +470,7 @@ func collectResponseOutput(output []responsesOutputItem) (text, reasoning string
 			})
 		}
 	}
-	return textBuf.String(), reasonBuf.String(), toolCalls
+	return textBuf.String(), reasonBuf.String(), toolCalls, err
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +499,7 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 		return nil, fmt.Errorf("providers: openai_responses upstream failed: %s", msg)
 	}
 
-	text, reasoning, toolCalls := collectResponseOutput(resp.Output)
+	text, reasoning, toolCalls, translationErr := collectResponseOutput(resp.Output)
 	incompleteReason := ""
 	if resp.IncompleteDetails != nil {
 		incompleteReason = resp.IncompleteDetails.Reason
@@ -532,6 +535,9 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 		result.UsageReported = true
 		result.Usage = resp.Usage.usageBuckets()
 		result.UsageRaw = marshalResponsesRawUsage(resp.Usage)
+	}
+	if translationErr != nil {
+		return result, translationErr
 	}
 	payload, err := json.Marshal(out)
 	if err != nil {

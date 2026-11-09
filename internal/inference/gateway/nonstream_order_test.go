@@ -37,7 +37,7 @@ func TestGateway_NonstreamOrderRejectionDoesNotFailover(t *testing.T) {
 			p, key := f.principal()
 			out, err := f.gateway.ChatCompletions(context.Background(), p, key,
 				domain.ProtocolOpenAIChat, chatReq(false, "hello"))
-			if domain.CodeOf(err) != domain.CodeUpstreamUnavailable {
+			if domain.CodeOf(err) != domain.CodeUpstreamResponseInvalid {
 				t.Errorf("unrepresentable output must fail explicitly, got %v", err)
 			}
 			if out == nil {

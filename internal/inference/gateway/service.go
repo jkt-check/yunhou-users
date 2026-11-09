@@ -187,9 +187,11 @@ func detached(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }
 
-// Outcome is one admitted call's result. Exactly one of Payload / Stream is
-// set. The caller (httpapi handler / Kaya facade) serves Payload or relays
-// Stream, then finalizes the stream with Stream.Finish.
+// Outcome is one admitted call's result. On success, exactly one of Payload /
+// Stream is set. The caller serves Payload or relays Stream, then finalizes
+// the stream with Stream.Finish. A nonnil Outcome plus error identifies an
+// execution already finalized after translation rejection: neither payload
+// nor stream may be served, and the execution must not be retried.
 type Outcome struct {
 	RequestID string
 	ModelID   string
@@ -796,8 +798,8 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 			continue
 		}
 		outcome, err := s.attempt(ctx, requestID, i+1, adm, req, price, cand, adapter)
-		if err == nil {
-			return outcome, nil
+		if outcome != nil || err == nil {
+			return outcome, err
 		}
 		// Client/shape errors (*domain.Error, e.g. an Anthropic-illegal
 		// history) are NOT upstream failures: nothing was sent, the
@@ -863,10 +865,10 @@ func (s *Service) holdForReconciliation(requestID string, cause error) error {
 }
 
 // attempt runs ONE upstream try: persist intent + lease (one tx) → fencing
-// check → egress re-validation → secret resolution → dispatch. A nil error
-// returns the live outcome whose finalization belongs to the caller. A
-// *domain.Error result is a client/shape failure (release + 400); a
-// *providers.DispatchError feeds the retry policy.
+// check → egress re-validation → secret resolution → dispatch. A nonnil
+// outcome stops retries, including an already-finalized translation failure.
+// Without an outcome, a *domain.Error is a client/shape failure (release +
+// 400); a *providers.DispatchError feeds the retry policy.
 func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, adm *quota.AdmissionResult,
 	req *providers.ChatRequest, price accounting.PriceVersion, cand routing.Candidate,
 	adapter providers.Adapter) (*Outcome, error) {
@@ -987,7 +989,7 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 		OutputCap:    adm.OutputCap,
 		ExtraHeaders: extraHeaders,
 	})
-	if err != nil {
+	if err != nil && disp == nil {
 		cancel()
 		// Pause (no release): the account lease survives for the retry/
 		// finalizer; only the attempt-scoped upstream lease is released
@@ -1017,12 +1019,12 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	if req.Stream {
 		outcome, err = s.onStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
 	} else {
-		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
+		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter, err)
 	}
 	// keeper 已完成交接(流式: Finish 接管同一 keeper;非流式:
 	// 上游租约已释放、账户租约归 finalizer)。
 	handedOff = true
-	if err == nil && outcome != nil {
+	if outcome != nil {
 		outcome.AccountID = cand.Account.ID
 		outcome.Inclusion = adapter.Inclusion()
 	}
@@ -1057,7 +1059,7 @@ func (s *Service) persistAttempt(ctx context.Context, a *domain.Attempt, cand ro
 // the finalizer below.
 func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
 	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
-	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
+	price accounting.PriceVersion, adapter providers.Adapter, translationErr error) (*Outcome, error) {
 	defer s.cleanupRequestLeases(adm.Leases)
 	cancel()
 	kctx, kcancel := detached(settleTimeout)
@@ -1075,7 +1077,11 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 		}
 	}
 	kcancel()
-	s.finishAttempt(attempt.ID, "completed", "", disp.UpstreamRequestID)
+	attemptStatus, kind := "completed", ""
+	if translationErr != nil {
+		attemptStatus, kind = "failed", "response_translation"
+	}
+	s.finishAttempt(attempt.ID, attemptStatus, kind, disp.UpstreamRequestID)
 	// 状态标记与结算共用同一个带 deadline 的 detached ctx(设计 §7.2: 结
 	// 算使用独立且有截止时间的 context —— context.Background() 无截止,
 	// 会绕过 settleTimeout 预算)。
@@ -1099,7 +1105,13 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 		raw = nil
 	}
 	s.settle(sctx, requestID, attempt.ID, usage, source, raw, price, adapter, adm)
-	return &Outcome{RequestID: requestID, ModelID: price.ModelID, Payload: disp.Payload}, nil
+	outcome := &Outcome{RequestID: requestID, ModelID: price.ModelID}
+	if translationErr != nil {
+		return outcome, domain.WrapError(domain.CodeUpstreamResponseInvalid,
+			"upstream response cannot be translated faithfully", translationErr)
+	}
+	outcome.Payload = disp.Payload
+	return outcome, nil
 }
 
 // onStreamDispatch hands the live stream to the caller; settlement runs in

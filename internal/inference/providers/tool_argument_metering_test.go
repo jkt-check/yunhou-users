@@ -100,8 +100,15 @@ func TestToolArguments_MeteredOnceAcrossAdapters(t *testing.T) {
 							t.Fatal(err)
 						}
 						res, err := tc.adapter.DecodeNonStream(body)
-						if err != nil {
-							t.Fatal(err)
+						wantRejected := mixed && tc.name != "chat"
+						if (err != nil) != wantRejected {
+							t.Fatalf("translation error=%v, want rejection=%v", err, wantRejected)
+						}
+						if res == nil {
+							t.Fatal("decoded metering must survive translation rejection")
+						}
+						if wantRejected && len(res.Payload) != 0 {
+							t.Fatalf("reordered payload must not be served: %s", res.Payload)
 						}
 						if res.UsageReported || res.ContentBytes != want {
 							t.Fatalf("reported=%v bytes=%d, want false/%d", res.UsageReported, res.ContentBytes, want)

@@ -386,9 +386,13 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	var reasoning strings.Builder
 	var toolCalls []any
 	var argumentBytes int
+	var reordered bool
 	for _, b := range resp.Content {
 		switch b.Type {
 		case "text":
+			if len(toolCalls) > 0 && b.Text != "" {
+				reordered = true
+			}
 			text.WriteString(b.Text)
 		case "thinking":
 			reasoning.WriteString(b.Thinking)
@@ -452,6 +456,9 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 		}
 		result.UsageRaw = marshalAnthropicRawUsage(u.InputTokens, u.OutputTokens,
 			u.CacheReadInputTokens, u.CacheCreationTokens)
+	}
+	if reordered {
+		return result, fmt.Errorf("providers: anthropic text after tool_use cannot be translated faithfully")
 	}
 	payload, err := json.Marshal(out)
 	if err != nil {

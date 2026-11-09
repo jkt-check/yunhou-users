@@ -194,6 +194,8 @@ func writeAnthropicDomainError(c *gin.Context, err error) {
 		// 钱包门控（未开启套餐外/月支出上限/余额不足）按限流类 429 答复，
 		// 与 chat 平面及套餐耗尽同一客户语义（Task 14）。
 		anthropicError(c, http.StatusTooManyRequests, "rate_limit_error", safeMsg(err))
+	case domain.CodeUpstreamResponseInvalid:
+		anthropicError(c, http.StatusBadGateway, "api_error", safeMsg(err))
 	case domain.CodeUpstreamUnavailable:
 		// 529/overloaded 是 Anthropic 语义里最接近"上游暂不可用"的类别,
 		// 也是 SDK/客户端有退避重试行为的类别.

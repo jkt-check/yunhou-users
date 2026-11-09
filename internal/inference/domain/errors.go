@@ -22,6 +22,9 @@ const (
 	CodeNotFound             Code = "not_found"
 	CodeConflict             Code = "conflict"
 	CodeInsufficientCapacity Code = "insufficient_capacity"
+	// CodeUpstreamResponseInvalid marks an executed response that cannot be
+	// translated faithfully, not an unavailable or overloaded upstream.
+	CodeUpstreamResponseInvalid Code = "upstream_response_invalid"
 	// CodeUnpricedCapability rejects a chargeable capability that has no
 	// effective price version (设计 §7.1/Task 6: 拒绝未定价且需扣费的能力).
 	CodeUnpricedCapability Code = "unpriced_capability"

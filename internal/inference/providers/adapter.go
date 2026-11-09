@@ -133,7 +133,10 @@ type Adapter interface {
 	WrapStream(body io.ReadCloser) *Stream
 	// DecodeNonStream parses a non-streaming 200 body: the OpenAI-shaped
 	// chat.completion payload for the client, the normalized usage, and
-	// whether the upstream reported usage at all.
+	// whether the upstream reported usage at all. An unparseable response
+	// returns nil plus error (execution unknown). A fully decoded response
+	// that cannot be translated faithfully returns metering without Payload
+	// plus error: that execution must be settled, never replayed.
 	DecodeNonStream(body []byte) (*NonStreamResult, error)
 }
 
@@ -344,6 +347,8 @@ func sameOrigin(a, b *url.URL) bool {
 // gateway decides retry vs release vs reconcile from the error's
 // Retryable/ExecutedUnknown flags. A BuildPayload failure is a client/shape
 // error (*domain.Error with CodeInvalidInput), not an upstream failure.
+// A nonnil result plus error is a decoded execution rejected by translation:
+// settle its metering once without serving its payload or retrying.
 func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (*DispatchResult, error) {
 	payload, err := a.BuildPayload(call)
 	if err != nil {
@@ -422,7 +427,7 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 		}
 	}
 	ns, err := a.DecodeNonStream(body)
-	if err != nil {
+	if err != nil && ns == nil {
 		// A 200 we cannot parse: consumption unknown, nothing relayed.
 		return nil, &DispatchError{Err: err, ExecutedUnknown: true}
 	}
@@ -434,7 +439,7 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	if d.UpstreamRequestID == "" {
 		d.UpstreamRequestID = ns.UpstreamRequestID
 	}
-	return d, nil
+	return d, err
 }
 
 // DispatchResult is one admitted upstream attempt's live result.
@@ -452,6 +457,8 @@ type DispatchResult struct {
 }
 
 // NonStreamResult is the adapter's decode of a non-streaming response.
+// When returned with an error, only metering and identity are usable;
+// Payload is nil because the response cannot be translated faithfully.
 type NonStreamResult struct {
 	Payload           []byte
 	Usage             domain.UsageBuckets

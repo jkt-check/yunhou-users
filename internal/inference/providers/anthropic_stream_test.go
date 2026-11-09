@@ -93,8 +93,8 @@ func TestTranslateAnthropicStream_Full(t *testing.T) {
 		tap.Buckets.OutputTokens == nil || *tap.Buckets.OutputTokens != 17 {
 		t.Errorf("tap buckets = %+v, want 25/17", tap.Buckets)
 	}
-	if tap.ContentBytes != int64(len("你好，世界")) {
-		t.Errorf("tap content bytes = %d, want %d", tap.ContentBytes, len("你好，世界"))
+	if want := int64(len("你好，世界") + len(`{"cmd":"ls"}`)); tap.ContentBytes != want {
+		t.Errorf("tap content bytes = %d, want %d", tap.ContentBytes, want)
 	}
 	if len(tap.Raw) == 0 || !strings.Contains(string(tap.Raw), `"input_tokens":25`) {
 		t.Errorf("tap raw = %s", tap.Raw)

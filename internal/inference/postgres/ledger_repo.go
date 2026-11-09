@@ -288,26 +288,7 @@ func checkWalletHolds(ctx context.Context, tx *sqlx.Tx, requestID string, status
 	if err := checkReservationIdentities("settle wallet", rows, walletReq, status, charge); err != nil {
 		return err
 	}
-	// 冻结必须是 **held**：EXISTS 只能证明"行还在"，不能证明"钱还被冻着"。
-	// 非 held（已释放/已结算）的冻结是预占状态漂移 —— 不是 missing（行还
-	// 在），也不是普通 conflict（那是良性竞态的口径，会被恢复 worker 当竞态
-	// 静默跳过）。
-	var state string
-	err = tx.QueryRowxContext(ctx,
-		`SELECT state FROM inference_wallet_holds WHERE request_id = $1`, requestID).Scan(&state)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return missingReservationOutcome("settle wallet",
-			"the wallet hold the admission created is missing (accounting anomaly)",
-			status, charge)
-	case err != nil:
-		return mapError("settle wallet: hold", err)
-	case state != string(domain.ReservationHeld):
-		return driftOutcome("settle wallet",
-			"the wallet freeze is no longer held (reservation drift)",
-			status, charge)
-	}
-	return nil
+	return checkWalletFreeze(ctx, tx, "settle wallet", requestID, status, charge)
 }
 
 // classifySettledDelivery classifies a settlement delivery for a request

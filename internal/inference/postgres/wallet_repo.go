@@ -640,6 +640,27 @@ func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID s
 	return nil
 }
 
+// checkWalletFreeze distinguishes accounting anomalies from benign
+// terminal-request races before settlement or release writes anything.
+func checkWalletFreeze(ctx context.Context, tx *sqlx.Tx, op, requestID string, status domain.RequestStatus, charge domain.Microcredit) error {
+	var state string
+	err := tx.QueryRowxContext(ctx,
+		`SELECT state FROM inference_wallet_holds WHERE request_id = $1`, requestID).Scan(&state)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return missingReservationOutcome(op,
+			"the wallet hold the admission created is missing (accounting anomaly)",
+			status, charge)
+	case err != nil:
+		return mapError(op+": hold", err)
+	case state != string(domain.ReservationHeld):
+		return driftOutcome(op,
+			"the wallet freeze is no longer held (reservation drift)",
+			status, charge)
+	}
+	return nil
+}
+
 // releaseWalletLocked drops the request's wallet hold (confirmed zero
 // consumption): a hold-state transition, never a ledger rewrite (与额度
 // 预占释放同口径).

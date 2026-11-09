@@ -166,6 +166,11 @@ type openAINonStream struct {
 		Message struct {
 			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
+				Function struct {
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
 }
@@ -179,6 +184,9 @@ func (a *OpenAIChat) DecodeNonStream(body []byte) (*NonStreamResult, error) {
 	out := &NonStreamResult{Payload: body, UpstreamRequestID: resp.ID}
 	for _, ch := range resp.Choices {
 		out.ContentBytes += int64(len(ch.Message.Content) + len(ch.Message.ReasoningContent))
+		for _, call := range ch.Message.ToolCalls {
+			out.ContentBytes += int64(len(call.Function.Arguments))
+		}
 	}
 	if resp.Usage == nil {
 		// The upstream genuinely did not report usage on a non-streaming

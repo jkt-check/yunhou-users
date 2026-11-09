@@ -406,6 +406,8 @@ func TestKayaModels_DisabledProviderHidesModel(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	cacheNow := time.Now()
+	cache.Now = func() time.Time { return cacheNow }
 	// ① 已发布且 provider active → 模型可见。
 	code, models := call(userID)
 	if code != http.StatusOK || len(models) != 1 {
@@ -427,6 +429,7 @@ func TestKayaModels_DisabledProviderHidesModel(t *testing.T) {
 	if _, err := catalogSvc.Publish(ctx, "test-disable"); err != nil {
 		t.Fatal(err)
 	}
+	cacheNow = cacheNow.Add(2 * time.Second)
 	code, models = call(userID)
 	if code != http.StatusOK {
 		t.Fatalf("picker = %d, want 200", code)

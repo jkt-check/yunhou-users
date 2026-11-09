@@ -5,6 +5,7 @@
 package providers
 
 import (
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -187,6 +188,88 @@ func TestAnthropicMessageFromCompletion_Shape(t *testing.T) {
 //
 // T8:推理增量**不**开启 thinking 块(本面不产出需要原生签名的块),因此
 // 文本块是 index 0、tool_use 块是 index 1。
+func TestTranslateOpenAIToAnthropicStream_InlineUsagePreservesDeltas(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		chunks []string
+		text   string
+		args   string
+		stop   string
+	}{
+		{
+			name: "text",
+			chunks: []string{
+				`{"choices":[{"delta":{"content":"Hel"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`,
+				`{"choices":[{"delta":{"content":"lo"}}],"usage":{"prompt_tokens":3,"completion_tokens":5}}`,
+				`{"choices":[{"delta":{},"finish_reason":"length"}]}`,
+			},
+			text: "Hello", stop: "max_tokens",
+		},
+		{
+			name: "tool",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"lookup","arguments":"{\"q\":"}}]}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}`,
+			},
+			args: `{"q":1}`, stop: "tool_use",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire := "data: " + strings.Join(tc.chunks, "\n\ndata: ") + "\n\ndata: [DONE]\n\n"
+			r := TranslateOpenAIToAnthropicStream(io.NopCloser(strings.NewReader(wire)), "msg_inline", "m", true)
+			defer r.Close()
+			out, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var text, args, stop string
+			var deltas, blockStops, finalOutput int
+			for _, line := range strings.Split(string(out), "\n") {
+				data, ok := strings.CutPrefix(line, "data: ")
+				if !ok {
+					continue
+				}
+				var ev struct {
+					Type  string `json:"type"`
+					Delta struct {
+						Text        string `json:"text"`
+						PartialJSON string `json:"partial_json"`
+						StopReason  string `json:"stop_reason"`
+					} `json:"delta"`
+					Usage struct {
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					t.Fatal(err)
+				}
+				switch ev.Type {
+				case "content_block_delta":
+					if deltas != 0 {
+						t.Error("content emitted after terminal message_delta")
+					}
+					text += ev.Delta.Text
+					args += ev.Delta.PartialJSON
+				case "content_block_stop":
+					blockStops++
+				case "message_delta":
+					deltas++
+					if blockStops == 0 {
+						t.Error("terminal message_delta emitted before content block closed")
+					}
+					stop, finalOutput = ev.Delta.StopReason, ev.Usage.OutputTokens
+				}
+			}
+			if text != tc.text || args != tc.args || stop != tc.stop || deltas != 1 || finalOutput != 5 {
+				t.Fatalf("text=%q args=%q stop=%q terminal deltas=%d output=%d\n%s", text, args, stop, deltas, finalOutput, out)
+			}
+			if !strings.Contains(string(out), "event: message_stop") {
+				t.Fatal("missing message_stop")
+			}
+		})
+	}
+}
+
 func TestTranslateOpenAIToAnthropicStream_GoldenSequence(t *testing.T) {
 	chunks := []string{
 		`{"id":"chatcmpl-x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"}}]}`,

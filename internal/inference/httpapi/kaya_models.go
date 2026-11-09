@@ -137,7 +137,7 @@ func (h *KayaModelsHandler) List(c *gin.Context) {
 	for _, id := range allowed {
 		allowSet[id] = true
 	}
-	models, err := h.Catalog.ListPublishedModels(c.Request.Context(),
+	models, err := h.Catalog.ListPublishedModelsFromSnapshot(c.Request.Context(), snap,
 		func(_ context.Context, modelID string) (bool, error) { return allowSet[modelID], nil })
 	if err != nil {
 		fail(c, err)

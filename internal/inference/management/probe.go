@@ -326,9 +326,24 @@ func (s *ProbeService) probeHeaders(dep *domain.Deployment, token string, cred *
 	if cred != nil {
 		authType = cred.AuthType
 	}
-	headers, err := adapter.AuthHeaders(providers.Auth{Type: authType, Token: strings.TrimSpace(token)})
+	authHeaders, err := adapter.AuthHeaders(providers.Auth{Type: authType, Token: strings.TrimSpace(token)})
 	if err != nil {
 		return nil, err
+	}
+	extra, err := domain.ExtensionHeaders(dep.Config)
+	if err != nil {
+		return nil, err
+	}
+	if err := domain.ValidateCustomHeaders(extra); err != nil {
+		return nil, domain.WrapError(domain.CodeInvalidInput, "deployment headers violate the gateway boundary", err)
+	}
+	// Match dispatch: protocol headers first, validated deployment headers last.
+	headers := make(map[string]string, len(authHeaders)+len(extra))
+	for k, v := range authHeaders {
+		headers[http.CanonicalHeaderKey(k)] = v
+	}
+	for k, v := range extra {
+		headers[http.CanonicalHeaderKey(k)] = v
 	}
 	return headers, nil
 }

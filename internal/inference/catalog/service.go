@@ -1030,6 +1030,20 @@ func (s *Service) ListPublishedModels(ctx context.Context, access AccessCheck) (
 	if err != nil {
 		return nil, err
 	}
+	return s.ListPublishedModelsFromSnapshot(ctx, snap, access)
+}
+
+// ListPublishedModelsFromSnapshot applies the published-list gates to one
+// pinned snapshot without reloading the active revision. Price and access
+// hooks are still evaluated for this request and remain fail-closed.
+func (s *Service) ListPublishedModelsFromSnapshot(ctx context.Context, snap *Snapshot, access AccessCheck) ([]domain.Model, error) {
+	if snap == nil {
+		return nil, domain.NewError(domain.CodeInvalidInput, "snapshot is required to list published models")
+	}
+	if access == nil {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"access check is required to list published models (refusing to answer without an authorization hook)")
+	}
 	out := make([]domain.Model, 0, len(snap.Models))
 	for _, id := range snap.ModelIDs() {
 		if !snap.Sellable(id) {

@@ -142,6 +142,70 @@ func TestProbeDeployment_OK(t *testing.T) {
 	}
 }
 
+func TestProbeDeployment_CustomHeadersMatchDispatch(t *testing.T) {
+	for _, protocol := range []domain.Protocol{domain.ProtocolOpenAIChat, domain.ProtocolAnthropicMessage} {
+		t.Run(string(protocol), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("X-Tenant") != "tenant-test" {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				if protocol == domain.ProtocolAnthropicMessage {
+					if r.Header.Get("X-Api-Key") != "sk-probe-secret" || r.Header.Get("Anthropic-Version") != "2023-06-01" {
+						t.Errorf("protocol headers lost: %v", r.Header)
+					}
+				} else if r.Header.Get("Authorization") != "Bearer sk-probe-secret" {
+					t.Errorf("credential header lost: %v", r.Header)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			store, resolver := probeTestFixture(srv.URL)
+			dep := store.deployments["dep-1"]
+			dep.Protocol = protocol
+			dep.Config.Raw = []byte(`{"headers":{"X-Tenant":"tenant-test"}}`)
+			store.deployments["dep-1"] = dep
+			res, err := NewProbeService(store, resolver, permissiveURL, srv.Client()).ProbeDeployment(context.Background(), "dep-1")
+			if err != nil || !res.OK || res.Status != http.StatusOK {
+				t.Fatalf("tenant-gated probe = %+v, err=%v", res, err)
+			}
+		})
+	}
+}
+
+func TestProbeDeployment_RejectsUnsafeCustomHeadersBeforeDispatch(t *testing.T) {
+	for _, config := range []string{
+		`{"headers":{"authorization":"evil"}}`,
+		`{"headers":{"AUTHORIZATION":"evil"}}`,
+		`{"headers":{"proxy-authorization":"evil"}}`,
+		`{"headers":{"HOST":"evil"}}`,
+		`{"headers":{"x-api-key":"evil"}}`,
+		`{"headers":{"X-REQUEST-ID":"evil"}}`,
+		`{"headers":["bad"]}`,
+		`{"headers":{"X-Tenant":123}}`,
+	} {
+		t.Run(config, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			store, resolver := probeTestFixture(srv.URL)
+			dep := store.deployments["dep-1"]
+			dep.Config.Raw = []byte(config)
+			store.deployments["dep-1"] = dep
+			res, err := NewProbeService(store, resolver, permissiveURL, srv.Client()).ProbeDeployment(context.Background(), "dep-1")
+			if err != nil || res.OK || res.ProbeMethod != ProbeMethodNone || res.ErrorSummary == "" || calls.Load() != 0 {
+				t.Fatalf("unsafe config reached upstream: result=%+v err=%v calls=%d", res, err, calls.Load())
+			}
+			if strings.Contains(res.ErrorSummary, "evil") || strings.Contains(res.ErrorSummary, "sk-probe-secret") {
+				t.Fatalf("unsafe config leaked header value: %q", res.ErrorSummary)
+			}
+		})
+	}
+}
+
 // TestProbeDeployment_MissingV1Shape 钉住 k3 事故形状：base_url 缺 /v1 →
 // 上游 404 → ok=false + status=404 + 摘要含真实状态码。
 func TestProbeDeployment_MissingV1Shape(t *testing.T) {

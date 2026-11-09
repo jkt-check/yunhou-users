@@ -115,12 +115,12 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 	}
 	stopSeen := false
 	for scanner.Scan() {
-		data, ok := strings.CutPrefix(scanner.Text(), "data: ")
+		data, ok := strings.CutPrefix(scanner.Text(), "data:")
 		if !ok {
 			continue // event:/comment/blank lines
 		}
 		var ev anthropicEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
 			continue // unknown/malformed event — keep the stream alive
 		}
 		var err error
@@ -154,6 +154,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 				tap.addContent(len(ev.Delta.Thinking))
 				err = writeOpenAIChunk(w, map[string]any{"reasoning_content": ev.Delta.Thinking}, "")
 			case "input_json_delta":
+				tap.addContent(len(ev.Delta.PartialJSON))
 				err = writeOpenAIChunk(w, map[string]any{"tool_calls": []any{map[string]any{
 					"index":    ev.Index,
 					"function": map[string]any{"arguments": ev.Delta.PartialJSON},

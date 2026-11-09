@@ -135,12 +135,12 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	terminalSeen := false
 
 	for scanner.Scan() {
-		data, ok := strings.CutPrefix(scanner.Text(), "data: ")
+		data, ok := strings.CutPrefix(scanner.Text(), "data:")
 		if !ok {
 			continue // event:/comment/blank lines
 		}
 		var ev responsesStreamEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
 			continue // unknown/malformed event — keep the stream alive
 		}
 		var err error
@@ -169,6 +169,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 			}
 		case "response.function_call_arguments.delta":
 			if s := ev.deltaString(); s != "" {
+				tap.addContent(len(s))
 				err = writeOpenAIChunk(w, map[string]any{"tool_calls": []any{map[string]any{
 					"index":    ev.OutputIndex,
 					"function": map[string]any{"arguments": s},

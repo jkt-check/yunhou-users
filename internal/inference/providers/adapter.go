@@ -20,8 +20,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -380,10 +382,19 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, &DispatchError{Err: err}
+	}
+	// Before a connection is obtained cancellation proves no request was
+	// sent. Afterwards even a missing response can hide a paid execution.
+	var connected atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	}))
 	resp, err := client.Do(req)
 	if err != nil {
 		if IsCanceled(err) {
-			return nil, &DispatchError{Err: err} // caller gone — not retryable
+			return nil, &DispatchError{Err: err, ExecutedUnknown: connected.Load()}
 		}
 		return nil, &DispatchError{Err: err, ExecutedUnknown: classifyTransport(err)}
 	}
@@ -435,7 +446,7 @@ type DispatchResult struct {
 	Usage         domain.UsageBuckets
 	UsageRaw      json.RawMessage
 	UsageReported bool
-	// ContentBytes is the visible answer size for the estimate path.
+	// ContentBytes is the generated answer size for the estimate path.
 	ContentBytes int64
 }
 
@@ -446,7 +457,7 @@ type NonStreamResult struct {
 	UsageRaw          json.RawMessage
 	UsageReported     bool
 	UpstreamRequestID string
-	// ContentBytes is the visible answer size (content + reasoning across
+	// ContentBytes is the generated answer size (text + reasoning + tool arguments across
 	// choices) — the output side of the estimate when the upstream omits
 	// usage (与流式 tap 的 ContentBytes 同口径).
 	ContentBytes int64

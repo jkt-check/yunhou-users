@@ -4989,6 +4989,125 @@ caller**. A **named follow-up** was added with an owner role and a schedule
 
 ---
 
+### 4.60 Review convergence and regression verification (2026-11-09)
+
+This review covers the current worktree on `fix/model-gateway-completion`,
+based on `144e8722e5c372eab97d258a865c5f20e73c90bd` (original plan base
+`299fc49`). The changes remain uncommitted; no push, merge, deployment,
+production database access or real-provider inference was performed.
+
+#### 4.60.1 Corrections reviewed
+
+| Area | Correction and regression coverage |
+|---|---|
+| Wallet release and recovery | Validate the expected wallet freeze before any release/settlement writes. A missing freeze is typed `missing_reservation`; an existing non-held freeze is `reservation_drift`, not a benign race. Both direct release and reconciliation release preserve request, money and job facts on failure. Recovery parks the anomaly once, disposes its in-flight rate reservation through the existing anomaly path, and never fabricates zero usage or a charge. |
+| Dispatch cancellation and fencing | A pre-cancelled dispatch sends nothing. Once a connection has been obtained, cancellation is conservatively `ExecutedUnknown`, never retryable. Lease fencing cancels upstream I/O blocked on headers, a nonstream body or silent SSE. The same keeper and fencing state survive stream handoff. |
+| Blocked lease renewal cleanup | `Stop` and `Pause` cancel the renewal context before waiting for the loop, so an in-flight database renewal cannot indefinitely block cleanup. Shutdown cancellation does not report fencing or cancel dispatch. `Stop` releases the lease; `Pause` keeps it held. |
+| Finalization cleanup | Nonstream settlement and confirmed-no-consumption release give request-lease cleanup a fresh detached deadline, even if finalization exhausted its own deadline. Money and TPM holds remain for recovery when finalization fails. Existing finalize-before-release and panic-cleanup tests remain in force. |
+| Unknown-execution lease contract | Dispatch-level unknown execution stops renewal and retains request-level account/Key leases until TTL, while releasing the attempt-level lease. A handed-off interrupted stream releases its leases through `Finish`. These are intentionally different paths; neither replays the upstream request. |
+| Wallet fallback errors | Only expected wallet spend gates retain the original plan-quota rejection. Storage, rate and concurrency errors retain their real cause rather than being disguised as plan exhaustion. Failed fallback leaves no request, rate reservation, wallet freeze, debit or dispatch. |
+| Provider protocol handling | Group consecutive assistant text/function-call items into one turn, preserve parallel tool history, retain Messages content when usage is inline, and emit terminal usage only after content blocks close. Native SSE accepts the optional space after `data:`. Responses maps `content_filter` to `incomplete` for both stream and nonstream output. |
+| Metering and privacy | Generated tool-argument bytes contribute to fallback output estimates across adapters and stream/nonstream paths. Stored raw usage contains the usage object, not the surrounding conversation/content chunk. Case-insensitive reserved headers cannot override gateway authentication or tracing. |
+| Management and catalog | Route PATCH preserves absent/null fields, applies explicit zero/false/empty values subject to validation, requires the client's nonzero `updated_at`, rejects stale writes and immutable identity fields, and avoids audit writes on rejection. Role grants validate reason and UUID. Probe uses the same validated deployment headers as dispatch. Kaya model listing uses one pinned snapshot while preserving price/access fail-closed checks. |
+
+The disabled-provider picker regression advances the injected clock by two
+seconds after publish. This respects the existing one-second entitlement
+cache contract; no production cache was disabled to make the test pass.
+
+#### 4.60.2 Latest RED/GREEN evidence
+
+Database-backed runs use fresh loopback-only PostgreSQL instances created under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`, explicit disposable
+`DATABASE_URL` and `E2E_DATABASE_URL`, `GOPROXY=off`,
+`GOFLAGS=-mod=readonly`, `-race`, `-count=1` and `-p 1`. The runner is
+`run.zsh` in that temporary directory. It migrates separate app/e2e databases
+twice and trap-stops only its own instance.
+
+| Run | Result | Evidence |
+|---|---|---|
+| `run.8tWHGo` | RED, exit 1 | Before removing the unconditional unknown-path request-lease cleanup, `TestGateway_DispatchUnknownExecution_KeepsRequestLeases` and fencing `headers`/`body` failed because the Key lease was released prematurely. The interrupted handed-off stream and `silent_sse` path passed. |
+| `run.BN476i` | GREEN, exit 0 | After removing that cleanup, 40 test/subtest passes across gateway, providers, postgres, workers and httpapi; zero failures/skips. Includes unknown/interrupted lease contracts, three fencing phases, Finish ordering/panic, cancellation execution boundary, wallet fallback, freeze anomalies/recovery, expired-Key recovery, lifecycle gates and disabled-provider picker. |
+| `run.9OBLsq` | GREEN, exit 0 | `TestCleanup_UsesFreshDeadlineAfterFinalizationTimeout` and its two subtests pass; zero failures/skips. This separate run was necessary because the first focused regex did not select the actual `TestCleanup_` name. |
+| `lease-keeper-red.jsonl` | RED, exit 1 | Before the renewal-context change, both `TestLeaseKeeper_CleanupInterruptsBlockedRenewal` subtests (`stop` and `pause`) failed with `lease cleanup stayed blocked on renewal`. This routing-only run uses a blocking fake store, not PostgreSQL. |
+| `lease-keeper-green.jsonl` | GREEN, exit 0 | After the change, `go test -race -count=1 -run '^TestLeaseKeeper_' -json ./internal/inference/routing` has five test/subtest passes and one package pass, with zero failures/skips. Covers blocked Stop/Pause, normal renewal/release and fencing. |
+
+The unknown-execution production correction is deliberately one line:
+remove unconditional request-lease cleanup from the dispatch-level
+`ExecutedUnknown` branch. The fencing test expects one held Key lease for
+headers/body and zero for a handed-off silent stream, with one
+reconciliation request, zero charges, one dispatch and cancelled upstream
+I/O in every phase.
+
+The blocked-renewal root cause was `RenewLease(context.Background(), ...)`
+combined with Stop/Pause waiting on the loop's `done` channel. PostgreSQL's
+renewal uses `ExecContext`, so the minimal fix gives the loop a separate
+cancellable renewal context and checks its cancellation before treating an
+error as fencing. The upstream dispatch cancellation callback remains
+separate and is invoked only for a real fencing conflict. The regression
+waits for renewal to actually start before requesting cleanup.
+
+Independent text-only reviews found no actionable issue in the supplied
+unknown-execution and renewal-cancellation corrections. Their evidence is
+limited to exact snippets and reported test behavior: neither review
+inspected the final worktree or ran commands. The latest review explicitly
+excluded stream-handoff call sites, lease TTL policy and independent
+verification of the full suite. Main-session source inspection checked the
+same-keeper handoff and actual test output; reviewer verdicts do not replace
+those checks.
+
+#### 4.60.3 Full verification
+
+The pre-renewal-fix full run `run.JRlsR7` completed with exit 0:
+34 package passes, 4,252 test/subtest passes and three skips in the
+race/coverage suite; 80.5% coverage; one package pass, 180 test/subtest
+passes and one skip in E2E. Build and vet passed. Its cleanup log and
+`pg_ctl status` confirm that its PostgreSQL instance stopped. This evidence
+predates the renewal-context fix and is not the final post-fix verdict.
+
+The post-fix full run `run.iOgFJR` completed with exit 0 and printed
+`SUCCESS RUN=/private/tmp/yunhou-review-20261109.3NuMWy/run.iOgFJR`.
+It used a new owned PostgreSQL instance on port 55489. Production and test
+source remained frozen throughout this run.
+
+| Gate | Current evidence |
+|---|---|
+| App/e2e migrations, twice each | Both first runs applied 54 migrations; both second runs applied zero and skipped 54. |
+| `go build ./...` | Passed; empty `build.log`. |
+| `go vet ./internal/... ./cmd/...` | Passed; empty `vet.log`. |
+| Full race/coverage suite | Passed: 34 package passes, 4,255 test/subtest passes, three skips and zero failures. |
+| Coverage floor | Passed: 80.5% statement coverage against the 80% floor. |
+| E2E race suite | Passed: one package pass, 180 test/subtest passes, one skip and zero failures. |
+| OpenAPI structural/contract check | Passed: 29 paths, 30 unique operation IDs, 226 resolved internal references, no duplicate YAML keys, required route version/reason, nullable mutable fields and no writable immutable identity fields. |
+| Scope/format | All 42 changed/new Go files pass `gofmt -l`; `git diff --check` passes; `go.mod`, `go.sum` and migrations are unchanged by this review. |
+
+Focused-run cleanup logs and `pg_ctl status` confirm that the RED and both
+GREEN instances have stopped, as has the pre-fix full-run instance.
+The post-fix full-run cleanup log reports `server stopped`; a subsequent
+`pg_ctl status` reports `no server running` with exit 3. Its runner exited
+with status 0 after completing the EXIT trap.
+
+The main-suite skips are the child-only `TestQuotaWorkerProcess` entry
+point and the opt-in `TestLoadDrill_Throughput` and
+`TestLoadDrill_LongConnections`. E2E skips the opt-in
+`TestUsageTokenAcceptance_TenPagesTwoMinutes`. These skips are not counted
+as successful acceptance tests.
+
+The final review of the corrections in this worktree found no further
+actionable issue within the reviewed scope. This is a local review and
+regression result, not a claim that the code has no defects or is ready
+for production rollout.
+
+#### 4.60.4 Boundaries retained
+
+`inference-correction-trigger-and-wallet` remains a named, unimplemented
+follow-up, not a completed correction channel. Cross-process rate-path
+acceptance remains unperformed (two-Service/two-pool coverage is not renamed
+cross-process coverage). Real provider and real client acceptance, product
+sales, payments/refunds and production rollout remain outside this local
+review. No existing limitation is waived by a green local test run.
+
+---
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -9,7 +9,77 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/yunhou/users/internal/model"
 )
+
+func TestResponsesReplay_ParallelToolGroupingPreservesText(t *testing.T) {
+	for _, withText := range []bool{false, true} {
+		name := "calls_only"
+		if withText {
+			name = "text_before_between_after"
+		}
+		t.Run(name, func(t *testing.T) {
+			items := []json.RawMessage{json.RawMessage(`{"role":"user","content":"q"}`)}
+			if withText {
+				items = append(items, json.RawMessage(`{"role":"assistant","content":"before "}`))
+			}
+			items = append(items, json.RawMessage(`{"type":"function_call","call_id":"a","name":"lookup","arguments":"{\"q\":1}"}`))
+			if withText {
+				items = append(items, json.RawMessage(`{"role":"assistant","content":[{"type":"output_text","text":"between "}]}`))
+			}
+			items = append(items, json.RawMessage(`{"type":"function_call","call_id":"b","name":"lookup","arguments":"{\"q\":2}"}`))
+			if withText {
+				items = append(items, json.RawMessage(`{"role":"assistant","content":"after"}`))
+			}
+			items = append(items,
+				json.RawMessage(`{"type":"function_call_output","call_id":"a","output":"one"}`),
+				json.RawMessage(`{"type":"function_call_output","call_id":"b","output":"two"}`),
+				json.RawMessage(`{"role":"assistant","content":"next turn"}`),
+				json.RawMessage(`{"type":"function_call","call_id":"c","name":"lookup","arguments":"{}"}`),
+				json.RawMessage(`{"type":"function_call_output","call_id":"c","output":"three"}`),
+			)
+			input, err := json.Marshal(items)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseResponsesRequest(append(append([]byte(`{"model":"m","input":`), input...), '}'))
+			if err != nil {
+				t.Fatal(err)
+			}
+			replayed, err := ResponsesReplayToChat(items)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, msgs := range [][]model.ChatMessage{parsed.Request.Messages, replayed} {
+				if len(msgs) != 6 {
+					t.Fatalf("want 6 grouped messages, got %+v", msgs)
+				}
+				turn := msgs[1]
+				if turn.Role != "assistant" || len(turn.ToolCalls) != 2 ||
+					turn.ToolCalls[0].ID != "a" || turn.ToolCalls[1].ID != "b" ||
+					turn.ToolCalls[0].Function.Arguments != `{"q":1}` {
+					t.Fatalf("parallel turn = %+v", turn)
+				}
+				wantText := ""
+				if withText {
+					wantText = "before between after"
+				}
+				if turn.Content != wantText {
+					t.Fatalf("text = %q, want %q", turn.Content, wantText)
+				}
+				if msgs[2].Role != "tool" || msgs[2].ToolCallID != "a" || msgs[2].Content != "one" ||
+					msgs[3].Role != "tool" || msgs[3].ToolCallID != "b" || msgs[3].Content != "two" {
+					t.Fatalf("tool results = %+v", msgs[2:4])
+				}
+				if msgs[4].Content != "next turn" || len(msgs[4].ToolCalls) != 1 || msgs[4].ToolCalls[0].ID != "c" ||
+					msgs[5].ToolCallID != "c" {
+					t.Fatalf("next turn = %+v", msgs[4:])
+				}
+			}
+		})
+	}
+}
 
 // Codex 风格多轮:instructions + message + function_call + function_call_output
 // + reasoning(丢弃)。call_id ↔ tool_call_id 逐字保留。
@@ -189,6 +259,107 @@ func TestResponsesFromCompletion_IncompleteOnLength(t *testing.T) {
 	s := string(body)
 	if !strings.Contains(s, `"status":"incomplete"`) || !strings.Contains(s, `"reason":"max_output_tokens"`) {
 		t.Fatalf("resp = %s", s)
+	}
+}
+
+func TestResponsesRoundTrip_TerminalStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, status, reason, event string
+	}{
+		{"content_filter", "incomplete", "content_filter", "response.incomplete"},
+		{"length", "incomplete", "max_output_tokens", "response.incomplete"},
+		{"stop", "completed", "", "response.completed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			native := map[string]any{
+				"id": "upstream", "object": "response", "status": tc.status,
+				"output": []any{map[string]any{"type": "message", "role": "assistant",
+					"content": []any{map[string]any{"type": "output_text", "text": "partial"}}}},
+			}
+			if tc.reason != "" {
+				native["incomplete_details"] = map[string]any{"reason": tc.reason}
+			}
+			assertResponse := func(t *testing.T, body []byte) {
+				t.Helper()
+				var got struct {
+					Status            string `json:"status"`
+					IncompleteDetails *struct {
+						Reason string `json:"reason"`
+					} `json:"incomplete_details"`
+					Output json.RawMessage `json:"output"`
+				}
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.Status != tc.status {
+					t.Errorf("status=%q, want %q: %s", got.Status, tc.status, body)
+				}
+				if tc.reason == "" {
+					if got.IncompleteDetails != nil {
+						t.Errorf("completed response has incomplete_details: %s", body)
+					}
+				} else if got.IncompleteDetails == nil || got.IncompleteDetails.Reason != tc.reason {
+					t.Errorf("incomplete reason lost, want %q: %s", tc.reason, body)
+				}
+				if !strings.Contains(string(got.Output), `"text":"partial"`) {
+					t.Errorf("partial output lost: %s", body)
+				}
+			}
+			t.Run("nonstream", func(t *testing.T) {
+				wire, err := json.Marshal(native)
+				if err != nil {
+					t.Fatal(err)
+				}
+				internal, err := NewOpenAIResponses().DecodeNonStream(wire)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, _, err := ResponsesFromCompletion(internal.Payload, "resp_status", "model", 1, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertResponse(t, body)
+			})
+			t.Run("stream", func(t *testing.T) {
+				terminal, err := json.Marshal(map[string]any{"type": tc.event, "response": native})
+				if err != nil {
+					t.Fatal(err)
+				}
+				wire := "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n"
+				wire += "data: " + string(terminal) + "\n\n"
+				internal := TranslateResponsesStream(io.NopCloser(strings.NewReader(wire)))
+				r, state := TranslateOpenAIToResponsesStream(internal.TeeBody(), "resp_status", "model", 1, true)
+				defer r.Close()
+				out, err := io.ReadAll(r)
+				if err != nil {
+					t.Fatal(err)
+				}
+				terminalCount := 0
+				for _, line := range strings.Split(string(out), "\n") {
+					data, ok := strings.CutPrefix(line, "data: ")
+					if !ok {
+						continue
+					}
+					var ev struct {
+						Type     string          `json:"type"`
+						Response json.RawMessage `json:"response"`
+					}
+					if err := json.Unmarshal([]byte(data), &ev); err != nil {
+						t.Fatal(err)
+					}
+					if ev.Type == "response.completed" || ev.Type == "response.incomplete" {
+						terminalCount++
+						if ev.Type != tc.event {
+							t.Errorf("terminal event=%q, want %q", ev.Type, tc.event)
+						}
+						assertResponse(t, ev.Response)
+					}
+				}
+				if terminalCount != 1 || !state.Completed() {
+					t.Errorf("terminalCount=%d completed=%v, want 1/true: %s", terminalCount, state.Completed(), out)
+				}
+			})
+		})
 	}
 }
 

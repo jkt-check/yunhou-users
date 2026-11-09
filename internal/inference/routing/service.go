@@ -567,21 +567,30 @@ type LeaseKeeper struct {
 	leases []*domain.ConcurrencyLease
 	ttl    time.Duration
 
-	stop   chan struct{}
-	done   chan struct{}
-	once   sync.Once
-	errMu  sync.Mutex
-	err    error
-	stopMu sync.Once
+	stop    context.CancelFunc
+	done    chan struct{}
+	once    sync.Once
+	errMu   sync.Mutex
+	err     error
+	stopMu  sync.Once
+	onFence context.CancelFunc
 }
 
 // NewLeaseKeeper starts the renewal loop; renew happens at ttl/3 intervals.
 // A nil/empty lease list still works (nothing to renew; Stop releases
 // nothing).
 func (s *Service) NewLeaseKeeper(leases ...*domain.ConcurrencyLease) *LeaseKeeper {
+	return s.NewLeaseKeeperWithCancel(nil, leases...)
+}
+
+// NewLeaseKeeperWithCancel also interrupts blocked upstream I/O on fencing.
+// Normal Pause/Stop do not cancel dispatch; the caller owns that lifetime.
+func (s *Service) NewLeaseKeeperWithCancel(cancel context.CancelFunc, leases ...*domain.ConcurrencyLease) *LeaseKeeper {
+	renewCtx, stop := context.WithCancel(context.Background())
 	k := &LeaseKeeper{
 		svc: s, ttl: s.LeaseTTL,
-		stop: make(chan struct{}), done: make(chan struct{}),
+		stop: stop, done: make(chan struct{}),
+		onFence: cancel,
 	}
 	for _, l := range leases {
 		if l != nil {
@@ -589,14 +598,14 @@ func (s *Service) NewLeaseKeeper(leases ...*domain.ConcurrencyLease) *LeaseKeepe
 		}
 	}
 	if len(k.leases) > 0 {
-		go k.loop()
+		go k.loop(renewCtx)
 	} else {
 		close(k.done)
 	}
 	return k
 }
 
-func (k *LeaseKeeper) loop() {
+func (k *LeaseKeeper) loop(ctx context.Context) {
 	defer close(k.done)
 	interval := k.ttl / 3
 	if interval <= 0 {
@@ -606,12 +615,15 @@ func (k *LeaseKeeper) loop() {
 	defer t.Stop()
 	for {
 		select {
-		case <-k.stop:
+		case <-ctx.Done():
 			return
 		case <-t.C:
 			for _, l := range k.leases {
-				err := k.svc.store.RenewLease(context.Background(), l.ID, l.OwnerToken,
+				err := k.svc.store.RenewLease(ctx, l.ID, l.OwnerToken,
 					l.FencingToken, k.svc.clock.Now().Add(k.ttl))
+				if ctx.Err() != nil {
+					return
+				}
 				if err == nil {
 					continue
 				}
@@ -621,6 +633,9 @@ func (k *LeaseKeeper) loop() {
 						k.err = err
 					}
 					k.errMu.Unlock()
+					if k.onFence != nil {
+						k.onFence()
+					}
 					return // fenced — stop renewing, the dispatcher must stop
 				}
 				// Transient store error: keep trying at the next tick.
@@ -640,7 +655,7 @@ func (k *LeaseKeeper) Err() error {
 // conflicts are already-covered by the fencing protocol).
 func (k *LeaseKeeper) Stop(ctx context.Context) {
 	k.stopMu.Do(func() {
-		close(k.stop)
+		k.stop()
 		<-k.done
 		for _, l := range k.leases {
 			_ = k.svc.ReleaseLease(ctx, l)
@@ -653,7 +668,7 @@ func (k *LeaseKeeper) Stop(ctx context.Context) {
 // MUST hand the leases to another keeper or release them.
 func (k *LeaseKeeper) Pause() {
 	k.stopMu.Do(func() {
-		close(k.stop)
+		k.stop()
 		<-k.done
 	})
 }

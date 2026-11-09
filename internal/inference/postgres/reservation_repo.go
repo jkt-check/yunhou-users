@@ -266,6 +266,11 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 		domain.RequestStatus(status), 0); err != nil {
 		return err
 	}
+	if req.ChargeSource == domain.ChargeSourceWallet {
+		if err := checkWalletFreeze(ctx, tx, "release wallet", requestID, domain.RequestStatus(status), 0); err != nil {
+			return err
+		}
+	}
 
 	var fiveHourWindow *string
 	for _, r := range rows {
@@ -286,8 +291,8 @@ func (s *Store) releaseLocked(ctx context.Context, tx *sqlx.Tx, w domain.UnitOfW
 					"release: key budget no longer covers the hold (concurrent settlement?)")
 			}
 		case string(domain.TargetWallet):
-			// 钱包冻结释放（Task 14）：hold 行状态迁移，不是账本重写；
-			// 与并发结算竞态 → CodeConflict（state='held' 守卫）。
+			// The freeze was validated before any writes; retain the
+			// guarded transition as a final concurrency backstop.
 			if err := s.releaseWalletLocked(ctx, tx, requestID); err != nil {
 				return err
 			}

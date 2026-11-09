@@ -200,8 +200,8 @@ func TestOpenAIResponsesDecodeNonStream_Full(t *testing.T) {
 	if u.ReasoningTokens == nil || *u.ReasoningTokens != 30 {
 		t.Errorf("reasoning = %v, want 30", u.ReasoningTokens)
 	}
-	if res.ContentBytes != int64(len("done")+len("thinking hard")) {
-		t.Errorf("ContentBytes = %d (content + reasoning 口径)", res.ContentBytes)
+	if res.ContentBytes != int64(len("done")+len("thinking hard")+len(`{"cmd":"ls"}`)) {
+		t.Errorf("ContentBytes = %d (text + reasoning + tool arguments)", res.ContentBytes)
 	}
 	// 翻译后的内部 chat.completion：finish_reason=tool_calls，usage 以
 	// OpenAI 形状随线（客户端面渲染 cached/reasoning）。

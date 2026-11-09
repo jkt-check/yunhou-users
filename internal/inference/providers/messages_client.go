@@ -614,7 +614,7 @@ type anthropicStreamRenderer struct {
 	nextBlock     int
 	toolBlocks    map[int]*anthropicToolBlock // wire tool_calls[].index → block
 	finish        string
-	usageEmitted  bool
+	usage         *openAIUsage
 	errorRelayed  bool
 }
 
@@ -648,10 +648,8 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 		if err := r.closeOpenBlock(w); err != nil {
 			return err
 		}
-		if !r.usageEmitted {
-			if err := r.emitMessageDelta(w, nil); err != nil {
-				return err
-			}
+		if err := r.emitMessageDelta(w, r.usage); err != nil {
+			return err
 		}
 		return writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 	}
@@ -676,13 +674,11 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 			return err
 		}
 	}
-	// Terminal usage chunk (choices empty, usage set): message_delta carries
-	// the REAL totals — message_start's usage is a protocol-required
-	// placeholder (input is only known at stream end on chat-shaped
-	// upstreams; 能力矩阵明示).
+	// Compatible providers may attach cumulative usage to content chunks.
+	// Keep the latest totals, but emit message_delta only after all blocks
+	// close at [DONE], so inline usage cannot discard or terminate content.
 	if chunk.Usage != nil {
-		r.usageEmitted = true
-		return r.emitMessageDelta(w, chunk.Usage)
+		r.usage = chunk.Usage
 	}
 	for _, choice := range chunk.Choices {
 		d := choice.Delta

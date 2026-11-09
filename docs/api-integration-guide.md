@@ -1587,6 +1587,25 @@ LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游�
 
 ---
 
+### 模型路由部分更新（`PATCH /admin/routes/:route_id`）
+
+需要同一 app 的人员 JWT 与内部服务凭据，角色具备 `models:manage`。
+只覆盖请求中提供的字段（`priority`、`weight`、`capabilities`、
+`pool_strategy`、`enabled`）；省略或 `null` 保持原值，显式 `0`、`false`、`[]`
+不被忽略，仍须通过字段校验（如 `weight>0`）。`capabilities=[]` 表示不收窄
+能力；模型和部署不可通过此端点改绑。
+
+`updated_at` 必须使用读取路由所得的非零版本，完整保留时间精度；
+`reason` 必须非空且不能只有空白。缺失/零版本为 400，过期版本为 409，
+失败不改路由和审计。成功返回完整路由及新版本，目录发布后才影响新请求。
+
+```json
+{"weight":5,"updated_at":"2026-11-09T08:00:00.123456Z","reason":"调整候选排序"}
+```
+
+运营授权的 `POST /admin/operators` 同样要求非空 `reason`、有效 UUID
+`user_id` 和受支持的 `role`；非法输入在授权或审计写入前以 400 拒绝。
+
 ### 目录发布与上游探测（`/admin/catalog/publish`、`/admin/deployments/:id/probe`）
 
 模型目录的**发布预演**与**上游连通性探测**是同一组运营面：预演给出「这次
@@ -1689,6 +1708,9 @@ LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游�
 `openai_responses` 走 `Authorization: Bearer`；`anthropic_messages` 走
 `x-api-key` + `anthropic-version`。`anthropic_messages` + OAuth 凭据是
 **明确不支持**的组合：出站前拒绝，绝不把 OAuth 令牌塞进 API-key 槽。
+探测还复用部署的 `config.headers`（例如供应商版本、租户或路由头），
+与派发保持一致。非法结构和覆盖认证/追踪边界的保留头在出站前拒绝，
+不把缺少必需自定义头造成的拒绝误当成部署连通性结论。
 
 失败一律 in-band（HTTP 200 + `ok:false`）；只有「部署不存在」这类硬错误才
 走 envelope（404）。`error_summary` 永不包含凭据材料。

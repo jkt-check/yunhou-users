@@ -523,8 +523,13 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 	}
 	result := &NonStreamResult{UpstreamRequestID: resp.ID}
 	// Visible answer size feeds the estimate path when usage is absent —
-	// same 口径 as the streaming tap (content + reasoning bytes).
+	// same 口径 as the streaming tap (text + reasoning + tool arguments).
 	result.ContentBytes = int64(len(text) + len(reasoning))
+	for _, item := range resp.Output {
+		if item.Type == "function_call" {
+			result.ContentBytes += int64(len(item.Arguments))
+		}
+	}
 	if resp.Usage != nil {
 		out["usage"] = resp.Usage.openAIWireUsage()
 		result.UsageReported = true

@@ -38,7 +38,7 @@ type TapResult struct {
 	// Terminal is true only after the protocol end marker ([DONE] /
 	// message_stop) — never on a bare EOF.
 	Terminal bool
-	// ContentBytes counts visible answer bytes (delta content + reasoning)
+	// ContentBytes counts generated answer bytes (text + reasoning + tool arguments)
 	// relayed so far — the basis of the estimate fallback when the upstream
 	// never reports usage (设计 §7.1 estimated 路径).
 	ContentBytes int64
@@ -131,7 +131,7 @@ type OpenAIUsageTracker struct {
 
 // Feed consumes one upstream read. Lines are reassembled across reads (the
 // relay buffer has no line alignment). Only complete `data:` lines
-// containing "usage", "content", "reasoning" or [DONE] cost more than a
+// containing "usage", "content", "reasoning", "tool_calls" or [DONE] cost more than a
 // prefix scan.
 func (t *OpenAIUsageTracker) Feed(p []byte) {
 	t.mu.Lock()
@@ -193,7 +193,8 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	wantUsage := bytes.Contains(line, []byte(`"usage"`))
 	wantContent := bytes.Contains(line, []byte(`"content"`))
 	wantReasoning := bytes.Contains(line, []byte("reasoning"))
-	if !wantUsage && !wantContent && !wantReasoning {
+	wantTools := bytes.Contains(line, []byte(`"tool_calls"`))
+	if !wantUsage && !wantContent && !wantReasoning && !wantTools {
 		return
 	}
 	var chunk struct {
@@ -201,6 +202,11 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 			Delta struct {
 				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
+					Function struct {
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"delta"`
 		} `json:"choices"`
 		Usage *openAIUsage `json:"usage"`
@@ -210,10 +216,13 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	}
 	for _, ch := range chunk.Choices {
 		t.res.ContentBytes += int64(len(ch.Delta.Content) + len(ch.Delta.ReasoningContent))
+		for _, call := range ch.Delta.ToolCalls {
+			t.res.ContentBytes += int64(len(call.Function.Arguments))
+		}
 	}
 	if chunk.Usage != nil {
 		t.res.SawUsage = true
-		t.res.Raw = append(t.res.Raw[:0], payload...)
+		t.res.Raw = rawUsageFromPayload(payload, chunk.Usage)
 		t.res.Buckets = domain.UsageBuckets{
 			InputTokens:      chunk.Usage.PromptTokens,
 			OutputTokens:     chunk.Usage.CompletionTokens,

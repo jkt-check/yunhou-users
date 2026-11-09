@@ -293,6 +293,17 @@ type responsesItemView struct {
 // tool_call id (多轮工具调用 ID 保留).
 func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) {
 	var out []model.ChatMessage
+	// Consecutive assistant items belong to one turn, including text around
+	// parallel function calls. Tool results end that group.
+	appendMessage := func(m model.ChatMessage) {
+		if m.Role == "assistant" && len(out) > 0 && out[len(out)-1].Role == "assistant" {
+			last := &out[len(out)-1]
+			last.Content += m.Content
+			last.ToolCalls = append(last.ToolCalls, m.ToolCalls...)
+			return
+		}
+		out = append(out, m)
+	}
 	for _, raw := range items {
 		var it responsesItemView
 		if err := json.Unmarshal(raw, &it); err != nil {
@@ -313,7 +324,7 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, model.ChatMessage{Role: role, Content: text})
+			appendMessage(model.ChatMessage{Role: role, Content: text})
 		case "function_call":
 			if it.CallID == "" || it.Name == "" {
 				return nil, invalidMsg("input", "function_call items require call_id and name")
@@ -321,7 +332,7 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			if it.Arguments != "" && !json.Valid([]byte(it.Arguments)) {
 				return nil, invalidMsg("input", "function_call arguments must be a JSON-encoded value")
 			}
-			out = append(out, model.ChatMessage{
+			appendMessage(model.ChatMessage{
 				Role: "assistant",
 				ToolCalls: []model.ToolCall{{
 					ID: it.CallID, Type: "function",
@@ -597,9 +608,13 @@ func ResponsesFromCompletion(payload []byte, responseID, publicModel string, cre
 	output := responsesOutputItems(ch.Message.ReasoningContent, ch.Message.Content, calls)
 
 	resp := responseShell(responseID, publicModel, createdAt)
-	if ch.FinishReason == "length" {
+	if ch.FinishReason == "length" || ch.FinishReason == "content_filter" {
+		reason := "max_output_tokens"
+		if ch.FinishReason == "content_filter" {
+			reason = "content_filter"
+		}
 		resp["status"] = "incomplete"
-		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		resp["incomplete_details"] = map[string]any{"reason": reason}
 	} else {
 		resp["status"] = "completed"
 	}
@@ -776,7 +791,7 @@ func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
 }
 
 // finishClean closes the stream with response.completed (or
-// response.incomplete on length truncation) carrying the assembled output
+// response.incomplete on truncation/filtering) carrying the assembled output
 // and usage.
 func (s *ResponsesStreamState) finishClean(w io.Writer) error {
 	if !s.started {
@@ -789,10 +804,14 @@ func (s *ResponsesStreamState) finishClean(w io.Writer) error {
 	}
 	resp := responseShell(s.responseID, s.model, s.createdAt)
 	event := "response.completed"
-	if s.finish == "length" {
+	if s.finish == "length" || s.finish == "content_filter" {
+		reason := "max_output_tokens"
+		if s.finish == "content_filter" {
+			reason = "content_filter"
+		}
 		event = "response.incomplete"
 		resp["status"] = "incomplete"
-		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		resp["incomplete_details"] = map[string]any{"reason": reason}
 	} else {
 		resp["status"] = "completed"
 	}

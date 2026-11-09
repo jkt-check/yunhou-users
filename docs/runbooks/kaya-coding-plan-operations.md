@@ -185,6 +185,19 @@ SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
 「保存后假装生效」—— 运营以为配了，实际跑的是别的行为）。下面三处是运营会
 碰到「配了但没生效/被拒」的入口。
 
+### 路由 PATCH 与并发修改
+
+`PATCH /admin/routes/:route_id` 只覆盖提供的字段；可变字段省略或 `null` 保持原值，显式
+`0` / `false` / `[]` 不被忽略，但仍须通过字段校验（如 `weight>0`）。
+特别注意 `capabilities=[]` 表示全部能力，
+不是关闭能力。模型/部署不可通过 PATCH 改绑。
+
+每次提交必须带读取路由所得的非零 `updated_at`（保留完整时间精度）和
+非空、非纯空白的 `reason`。缺失/零版本为 400，过期为 409；发生冲突时
+重新读取、合并修改后提交，不要直接覆盖版本。成功后发布目录才生效。
+`POST /admin/operators` 的授权理由也必须非空，`user_id` 必须是 UUID；
+非法请求不会写授权或审计。
+
 ### `pool_strategy`（路由的账号池策略）
 
 | 写面 | 口径 |
@@ -404,6 +417,10 @@ HTTP 400），因此它出现在**错误**里而不是 200 报告里。
 |---|---|
 | `openai_chat` / `openai_responses` | `Authorization: Bearer <access token 或静态密钥>` |
 | `anthropic_messages` | `x-api-key: <静态密钥>` + `anthropic-version: 2023-06-01` |
+
+部署 `config.headers` 中的自定义头也用于探测（与实际派发一致）。
+非法结构或试图覆盖网关认证/追踪保留头的配置在出站前拒绝；不要通过
+覆盖 `Authorization`、`x-api-key` 或 `X-Request-ID` 注入凭据。
 
 - OAuth 凭据在 OpenAI 兼容协议上走 bearer，且**只有 access token** 出边界
   （密封闭包与 refresh token 永远不出 credentials 包）。

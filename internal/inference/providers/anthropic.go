@@ -385,6 +385,7 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	var text strings.Builder
 	var reasoning strings.Builder
 	var toolCalls []any
+	var argumentBytes int
 	for _, b := range resp.Content {
 		switch b.Type {
 		case "text":
@@ -392,6 +393,7 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 		case "thinking":
 			reasoning.WriteString(b.Thinking)
 		case "tool_use":
+			argumentBytes += len(b.Input)
 			args := string(b.Input)
 			if args == "" {
 				args = "{}"
@@ -421,8 +423,8 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	}
 	result := &NonStreamResult{UpstreamRequestID: resp.ID}
 	// Visible answer size feeds the estimate path when usage is absent —
-	// same 口径 as the streaming tap (content + reasoning bytes).
-	result.ContentBytes = int64(text.Len() + reasoning.Len())
+	// same 口径 as the streaming tap (text + reasoning + tool arguments).
+	result.ContentBytes = int64(text.Len() + reasoning.Len() + argumentBytes)
 	if resp.Usage != nil {
 		u := resp.Usage
 		usage := map[string]any{

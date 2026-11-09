@@ -616,6 +616,52 @@ paths:
         "400": { $ref: "#/components/responses/InvalidInput" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
+  /admin/routes/{route_id}:
+    patch:
+      tags: [model-admin]
+      summary: 部分更新模型路由（models:manage）
+      description: |
+        只覆盖提供的字段；可变字段省略或 `null` 保持原值，显式 `0`、`false`、`[]` 不被忽略，
+        仍须通过字段校验（例如 `weight` 必须大于 0）。
+        `capabilities=[]` 表示不收窄路由能力，不是禁用路由。
+        `model_id` / `deployment_id` 不可通过 PATCH 改绑。
+        必须带读取路由时获得的非零 `updated_at`（完整保留时间精度）和非空
+        `reason`；缺失/零版本为 400，版本过期为 409，失败不写路由或审计。
+        写入只修改草稿目录，发布后才影响新请求。
+        鉴权要求同一 app 的人员 JWT 与服务凭据，角色须具备 `models:manage`。
+      operationId: updateModelRoute
+      security:
+        - BearerAuth: []
+          InternalAppID: []
+          InternalAppSecret: []
+      parameters:
+        - { name: route_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [updated_at, reason]
+              properties:
+                priority: { type: integer, nullable: true }
+                weight: { type: integer, minimum: 1, nullable: true }
+                capabilities:
+                  type: array
+                  nullable: true
+                  items: { type: string, enum: [tools, reasoning, image] }
+                pool_strategy: { type: string, enum: [round_robin], nullable: true }
+                enabled: { type: boolean, nullable: true }
+                updated_at: { type: string, format: date-time }
+                reason: { type: string, minLength: 1, description: 不允许纯空白 }
+      responses:
+        "200": { description: 更新后的完整路由（envelope data，含新的 updated_at） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: 路由已被并发修改；重新读取后合并修改再提交 }
+
   /admin/deployments/{id}/probe:
     post:
       tags: [model-admin]
@@ -641,6 +687,8 @@ paths:
         `anthropic_messages` 走 `x-api-key` + `anthropic-version`。
         `anthropic_messages` + OAuth 凭据是**明确不支持**的组合：出站前
         拒绝，绝不把 OAuth 令牌塞进 API-key 槽。
+        探测同时复用该部署 `config.headers` 的自定义请求头；与派发一致，
+        非法结构或覆盖认证/追踪边界的保留头在出站前拒绝。
 
         失败一律 in-band（HTTP 200 + `ok:false`）；只有「部署不存在」这类
         硬错误才走 envelope。`error_summary` 永不包含凭据材料。
@@ -1293,6 +1341,16 @@ components:
       in: header
       name: X-Api-Key
       description: Anthropic 风格凭据头（/v1 协议面,与 Bearer 同值域）。
+    InternalAppID:
+      type: apiKey
+      in: header
+      name: X-App-ID
+      description: 受验证的内部服务身份，必须与人员 JWT 的 app claim 一致。
+    InternalAppSecret:
+      type: apiKey
+      in: header
+      name: X-App-Secret
+      description: 内部服务凭据，仅服务端持有。
 
   parameters:
     RangeFrom:
@@ -2455,7 +2513,7 @@ components:
           type: object
           nullable: true
           properties:
-            reason: { type: string, enum: [max_output_tokens] }
+            reason: { type: string, enum: [max_output_tokens, content_filter] }
         model: { type: string, description: 公开模型 id(非上游名) }
         output:
           type: array

@@ -471,13 +471,15 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 			}
 			wadm, wprice, werr := s.admitWallet(ctx, newRequest(), *ent, policy, m, req, now)
 			if werr != nil {
-				// 速率拒绝是可识别的独立结果：钱包 fallback 同样受同一组业务
-				// 速率限制（RPM/TPM），被拒时必须以 rate_limited 答复，不能被
-				// 套餐的 quota_exceeded 掩盖（否则客户会误以为"充值即可"）。
-				if domain.CodeOf(werr) == domain.CodeRateLimited {
-					return nil, werr
+				// Only expected wallet spend gates retain the plan rejection.
+				// Storage, rate and concurrency failures keep their real cause.
+				if errors.Is(werr, accounting.ErrOverageDisabled) ||
+					errors.Is(werr, accounting.ErrInsufficientBalance) ||
+					errors.Is(werr, accounting.ErrSpendLimitExceeded) ||
+					errors.Is(werr, accounting.ErrUnpriced) {
+					return nil, err
 				}
-				return nil, err
+				return nil, werr
 			}
 			adm, price = wadm, wprice
 		}
@@ -954,12 +956,12 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	// carries the attempt-scoped upstream lease PLUS every request-scoped
 	// lease of the admission (the account lease and — Task 5 — the per-Key
 	// lease): the lease SET is a list, never a hardcoded pair. A renewal
-	// conflict fences the attempt — the stream guard then stops the upstream
-	// call. No lease is released by the keeper: the upstream lease ends per
+	// conflict fences the attempt and cancels blocked upstream I/O.
+	// No lease is released by the renewal loop: the upstream lease ends per
 	// attempt (explicit release below), the request-scoped leases are
 	// released by the finalizer (settle/release), never per attempt.
-	keeper := s.routingSvc.NewLeaseKeeper(append([]*domain.ConcurrencyLease{lease}, adm.Leases...)...)
-	// 防泄漏守卫:keeper 创建到交接(Pause 换交流式 keeper / 非流式显式释
+	keeper := s.routingSvc.NewLeaseKeeperWithCancel(cancel, append([]*domain.ConcurrencyLease{lease}, adm.Leases...)...)
+	// 防泄漏守卫:keeper 创建到交接(流式沿用 keeper / 非流式显式释
 	// 放)之间,若 Dispatch 或 onStream/onNonStream panic(如 disp.Stream
 	// 为 nil、TeeBody 组装失败),gin recover 后 keeper goroutine 会永久续
 	// 租双租约 —— 恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
@@ -1017,7 +1019,7 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	} else {
 		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
 	}
-	// keeper 已 Pause 并完成交接(流式: stream keeper 接管双租约;非流式:
+	// keeper 已完成交接(流式: Finish 接管同一 keeper;非流式:
 	// 上游租约已释放、账户租约归 finalizer)。
 	handedOff = true
 	if err == nil && outcome != nil {
@@ -1056,6 +1058,7 @@ func (s *Service) persistAttempt(ctx context.Context, a *domain.Attempt, cand ro
 func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
 	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
 	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
+	defer s.cleanupRequestLeases(adm.Leases)
 	cancel()
 	kctx, kcancel := detached(settleTimeout)
 	// Pause (no release), then release ONLY the attempt-scoped upstream
@@ -1096,7 +1099,6 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 		raw = nil
 	}
 	s.settle(sctx, requestID, attempt.ID, usage, source, raw, price, adapter, adm)
-	s.releaseRequestLeases(sctx, adm.Leases)
 	return &Outcome{RequestID: requestID, ModelID: price.ModelID, Payload: disp.Payload}, nil
 }
 
@@ -1110,12 +1112,9 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 		log.Printf("gateway: mark streaming %s: %v", requestID, err)
 	}
 	stCancel()
-	// The dispatch keeper pauses WITHOUT releasing; the stream keeper takes
-	// over both leases for the whole stream lifetime (the dispatch keeper
-	// already carries the request-scoped account lease since M1 — do NOT
-	// append it twice).
-	keeper.Pause()
-	streamKeeper := s.routingSvc.NewLeaseKeeper(keeper.Leases()...)
+	// Keep the same renewal loop and fencing state across the handoff.
+	// Finish owns stopping it after settlement, including on panic.
+	streamKeeper := keeper
 	// 与 attempt 同款防泄漏守卫:StreamBody 组装期间(tap 为 nil、TeeBody
 	// 失败等)panic 必须停 stream keeper,否则续租 goroutine 永久续租双租
 	// 约,恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
@@ -1203,7 +1202,12 @@ func (r *guardedTeeReader) Read(p []byte) (int, error) {
 		_ = r.body.Close()
 		return 0, fmt.Errorf("gateway: concurrency lease lost (fenced): %w", err)
 	}
-	return r.body.Read(p)
+	n, err := r.body.Read(p)
+	if fenceErr := r.keeper.Err(); fenceErr != nil {
+		_ = r.body.Close()
+		return n, fmt.Errorf("gateway: concurrency lease lost (fenced): %w", fenceErr)
+	}
+	return n, err
 }
 
 func (r *guardedTeeReader) Close() error { return r.body.Close() }
@@ -1502,11 +1506,18 @@ func (s *Service) markReconciliation(requestID, reason, detail string) {
 // finalizer works off the admission's lease LIST, never a hardcoded pair of
 // locks.
 func (s *Service) releaseAdmission(requestID string, leases []*domain.ConcurrencyLease) {
+	defer s.cleanupRequestLeases(leases)
 	ctx, cancel := detached(settleTimeout)
 	defer cancel()
 	if err := s.quotaSvc.ReleaseAdmission(ctx, requestID); err != nil {
 		log.Printf("ERROR gateway: release admission %s: %v (reservation held; recovery reconciles)", requestID, err)
 	}
+}
+
+// Cleanup has a fresh budget even when finalization exhausted its deadline.
+func (s *Service) cleanupRequestLeases(leases []*domain.ConcurrencyLease) {
+	ctx, cancel := detached(settleTimeout)
+	defer cancel()
 	s.releaseRequestLeases(ctx, leases)
 }
 

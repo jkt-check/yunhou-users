@@ -17,6 +17,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
@@ -247,6 +248,16 @@ func (h *AdminAuthHandler) GrantRole(c *gin.Context) {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
 		return
 	}
+	reason, okReason := requiredReason(c, req.Reason)
+	if !okReason {
+		return
+	}
+	userID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "user_id must be a valid UUID"))
+		return
+	}
+	req.UserID = userID.String()
 	if !management.ValidRole(req.Role) {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "role must be admin, operator or auditor"))
 		return
@@ -263,7 +274,7 @@ func (h *AdminAuthHandler) GrantRole(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	granted, err := txStore.GrantRoleTx(ctx, uow, req.UserID, req.Role, strPtrOrNil(op.UserID), req.Reason)
+	granted, err := txStore.GrantRoleTx(ctx, uow, req.UserID, req.Role, strPtrOrNil(op.UserID), reason)
 	if err != nil {
 		_ = uow.Rollback(ctx)
 		fail(c, err)
@@ -271,7 +282,7 @@ func (h *AdminAuthHandler) GrantRole(c *gin.Context) {
 	}
 	if err := txAudit.RecordTx(ctx, uow, management.AuditEvent{
 		Action: "permission.grant", ObjectType: "permission", ObjectID: req.UserID + ":" + req.Role,
-		Reason: req.Reason, ActorUser: op.UserID, ActorApp: op.AppID,
+		Reason: reason, ActorUser: op.UserID, ActorApp: op.AppID,
 		Detail: management.SanitizeDetail(map[string]any{"role": req.Role, "granted": granted}),
 	}); err != nil {
 		_ = uow.Rollback(ctx)

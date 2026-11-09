@@ -639,15 +639,15 @@ policy with `conflict`. Hold that lock through admission commit.
 
 - [x] Reproduce each live window retaining limit 100 after upgrade to 200,
   with used 90 and reserved 5; a hold of 20 must admit.
-- [ ] Preserve IDs, boundaries, creation time, used and existing reserved;
+- [x] Preserve IDs, boundaries, creation time, used and existing reserved;
   change only the live enabled row's limit, including effective decreases.
-- [ ] Preserve expired/voided/disabled windows; newly enabled windows
+- [x] Preserve expired/voided/disabled windows; newly enabled windows
   activate with the selected policy's limit.
-- [ ] Reject stale-policy snapshots before creating or rewriting windows;
+- [x] Reject stale-policy snapshots before creating or rewriting windows;
   verify rejection leaves request, holds, rate and lease state unchanged.
-- [ ] Reproduce overlapping revision/admission in both lock orders and
+- [x] Reproduce overlapping revision/admission in both lock orders and
   prove no stale rewrite can commit after a policy revision.
-- [ ] Run focused race, full race/coverage and E2E using owned disposable
+- [x] Run focused race, full race/coverage and E2E using owned disposable
   databases; record evidence and commit this fix locally.
 
 Ruling: refresh lazily inside admission, not every entitlement revision
@@ -674,15 +674,41 @@ The runner used its own disposable PostgreSQL cluster on loopback port
 55491 with explicit review_app/review_e2e DSNs. Both databases applied all
 55 migrations and skipped all 55 on rerun; cleanup.log confirms the owned
 server stopped. No kaya process was operated on. Formatting and diff
-checks passed. Full race/coverage and E2E were not rerun for this RED-only
-checkpoint; prior green coverage does not describe this tree. Production
-fixes and the rest of Task 19 remain open.
+checks passed. Full race/coverage and E2E were not rerun for that RED-only
+checkpoint; prior green coverage did not describe that tree.
+
+Implementation checkpoint (2026-11-10): admission passes the selected
+policy ID to activation, which validates entitlement account/policy under
+FOR SHARE after locking the account. Reused enabled live windows update
+only limit_micros, including decreases. Rejected admission rolls back the
+refresh, and stale policy snapshots fail with a non-retriable conflict.
+The SHARE lock, unlike KEY SHARE, also blocks policy-only updates until
+the admission commits. No migration or historical-counter rewrite.
+
+Focused GREEN `run.m697te/focused.jsonl` passed all 16 tests/subtests
+(PostgreSQL 4.543s), with no failures or skips. The runner used new owned
+disposable databases, applied/reran all 55 migrations and stopped its
+owned PostgreSQL server.
+
+Full gate `run.RnaqMo` exited 0: build/vet passed; full race passed 4,646
+tests/subtests across 34 packages, including all 16 Task 19 cases, with
+80.7% statement coverage. E2E race passed 186 tests/subtests (146.804s).
+The three full-race and one E2E skips were expected child-entry/opt-in
+cases; no database acceptance skipped. Both new owned databases applied
+55 migrations and skipped all 55 on rerun; cleanup confirms their owned
+PostgreSQL server stopped.
+
+The preceding full attempt `run.MDIhns` failed from filesystem exhaustion,
+not a passing gate. Its logs were preserved; only stopped generated
+temporary database data under the owned runner root were reclaimed before
+retrying. See runbook 4.79 for that failure, the scoped cleanup and final
+evidence. This local implementation checkpoint does not resolve other
+review findings or the original wallet/production-trigger requirements.
 
 ## Pending Review Findings (2026-11-10)
 
 These are reviewer findings to verify, not completed fixes or waived scope:
 
-- Existing quota windows may retain the previous policy limit after upgrade.
 - OAuth health scans may repeatedly select the first batch and starve later
   active/cooldown accounts.
 - Responses stream output with a tool followed by text may be persisted even

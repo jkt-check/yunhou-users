@@ -16,7 +16,7 @@ import (
 // 评估）与 Task 1 的事务骨架（共享 UnitOfWork 的 Reserve/Release）组装成
 // 一次逻辑调用的额度闸门：
 //
-//   - 一个事务内按固定顺序锁定：账户 →（请求）→ 窗口(five_hour→weekly→
+//   - 一个事务内按固定顺序锁定：账户 → 权益 →（请求）→ 窗口(five_hour→weekly→
 //     monthly) → Key 预算（repo 层实现，控制者裁决）；检查并创建请求/预占，
 //     提交后才允许任何网络调用——绝不持有 DB 事务等待上游（设计 §7.2）。
 //   - 三窗口 + Key 预算同时预占成功才放行；任一失败整个事务回滚，不遗留
@@ -46,9 +46,9 @@ const maxActivationRetries = 5
 type Store interface {
 	Begin(ctx context.Context) (domain.UnitOfWork, error)
 	// ActivateWindowsTx locks the billing account FOR UPDATE (fixed lock
-	// order step 1), reads the entitlement's active windows, persists any
-	// missing window the consumption at At activates, and returns the
-	// resolved window rows (with IDs) per enabled kind.
+	// order step 1), locks and validates the selected entitlement policy,
+	// refreshes live limits and persists any missing activated window.
+	// It returns the resolved window rows (with IDs) per enabled kind.
 	ActivateWindowsTx(ctx context.Context, uow domain.UnitOfWork, cmd ActivateWindowsCommand) ([]domain.QuotaWindow, error)
 	// Reserve atomically applies the four holds and persists the request
 	// (domain.QuotaStore contract, 设计 §7.2).
@@ -95,6 +95,7 @@ type Store interface {
 type ActivateWindowsCommand struct {
 	BillingAccountID string
 	EntitlementID    string
+	PolicyVersionID  string
 	Anchor           time.Time
 	At               time.Time
 	Limits           map[domain.WindowKind]domain.Microcredit
@@ -303,6 +304,7 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	windows, err := s.store.ActivateWindowsTx(ctx, uow, ActivateWindowsCommand{
 		BillingAccountID: cmd.Request.BillingAccountID,
 		EntitlementID:    cmd.Entitlement.ID,
+		PolicyVersionID:  cmd.Entitlement.PolicyVersionID,
 		Anchor:           cmd.Entitlement.AnchorAt,
 		At:               at,
 		Limits:           limits,

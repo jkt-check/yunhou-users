@@ -6678,6 +6678,104 @@ Other pending review findings remain unwaived. Real-provider/client and
 cross-host acceptance remain unverified. No push, merge, deployment,
 adjacent-repository edit or kaya process operation is included.
 
+### 4.79 Policy Revision Refreshes Live Quota Limits (2026-11-10)
+
+This checkpoint addresses Task 19 only. Its RED regressions are already
+committed in `f546c99`; other pending findings remain unwaived.
+
+**Changed files:**
+
+- `internal/inference/quota/service.go`: pass the selected entitlement's
+  policy version ID into window activation and document the lock contract.
+- `internal/inference/postgres/quota_repo.go`: after the account lock,
+  read the entitlement account/policy under FOR SHARE until admission
+  commit. Reject mismatched account or policy with non-retriable conflict.
+  Reused enabled live windows update only `limit_micros`, including
+  effective decreases; identity, consumption and history remain intact.
+- The convergence plan and this runbook record verification and scope.
+  `internal/inference/postgres/quota_upgrade_test.go` is in the preceding
+  regression commit and is not rewritten by this implementation.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.3DxbOU/focused.jsonl` | Pre-fix RED: 12 failing leaves, 16 failed test/subtest events including parents, no skips. Failures were behavior assertions, not setup or compilation. |
+| `run.m697te/focused.jsonl` | Post-fix GREEN: 16 tests/subtests passed (4.543s), no failures or skips. |
+
+Focused command:
+`go test -race -count=1 -p 1 -json ./internal/inference/postgres -run '^TestQuotaPolicyRevision_' -timeout=5m`.
+
+The regressions cover each 100-to-200 live-window upgrade with used 90
+and reserved 5 admitting a hold of 20; effective decreases; atomic
+rollback on rejection; unchanged IDs, boundaries, creation times and
+consumption; expired/voided/disabled rows; newly enabled monthly windows;
+and stale-policy/cross-account rejection without request, money hold,
+rate or lease side effects. Bounded real-transaction barriers exercise
+both revision/admission lock orders using actual PostgreSQL lock waits,
+including policy-only updates that FK KEY SHARE does not block.
+
+Both focused runs used new owned disposable PostgreSQL clusters with
+explicit separate application/E2E DSNs, all 55 migrations and an
+idempotent rerun. Their cleanup logs confirm the owned servers stopped.
+No migration is needed for the fix. A rejected admission also rolls back
+any limit refresh. A policy-changing race fails closed with conflict;
+the caller needs a fresh policy snapshot for a retry. Renewal under the
+same policy and the existing bounded-cache behavior remain unchanged.
+The lock does not claim a new guarantee for cached entitlement
+status/expiry/model decisions outside this policy-ID check.
+
+**Interrupted full gate:** `run.MDIhns` passed build/vet but exited 1
+after the filesystem filled. PostgreSQL panicked writing its owned
+cluster WAL, coverage writes and Go compilation failed with
+`no space left on device`, and subsequent database tests skipped.
+Its 2,284 passing test/subtest events, 201 skips and partial coverage
+are not a successful acceptance gate. E2E was not reached and no valid
+coverage total was produced. The runner's fast-stop timed out; after
+freeing space, an explicit immediate stop targeted only that owned
+disposable data directory and confirmed `server stopped`.
+
+Only stopped generated PostgreSQL data directories under this task's
+temporary runner root were removed, after checking cleanup confirmation,
+absence of `postmaster.pid`, a real directory and `PG_VERSION`.
+All evidence logs were retained; no active cluster, repository, general
+cache or kaya process was changed. This recovered about 12 GiB.
+**Final verification gate:** replacement `run.RnaqMo` used new owned
+disposable databases on loopback port 55491 and exited 0:
+
+| Gate | Result |
+|---|---|
+| `go build ./...` | Passed; `build.log` is empty. |
+| `go vet ./internal/... ./cmd/...` | Passed; `vet.log` is empty. |
+| Full race (`tests.jsonl`) | 4,646 tests/subtests passed across 34 packages, no failures; all 16 Task 19 cases passed again. |
+| Statement coverage | 80.7% total; the 80% floor passed. |
+| E2E race (`e2e.jsonl`) | 186 tests/subtests passed (146.804s), no failures. |
+
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile="$RUN/coverage.out" -json ./internal/... ./cmd/... ./tests/integration/...`.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+
+The full-race skips are the child-only `TestQuotaWorkerProcess` entry and
+the two `KAYA_LOAD=1` load drills. E2E skips only
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` (`USAGE_ACCEPTANCE=1`).
+No database acceptance skipped. Both independent application/E2E databases
+applied all 55 migrations and skipped all 55 on rerun. Dependencies stayed
+offline/read-only with `GOPROXY=off`, `GOFLAGS=-mod=readonly`; packages were
+serialized with `-p 1` and `GOMAXPROCS=2`. `cleanup.log` confirms the
+owned PostgreSQL server stopped; its `postmaster.pid` is absent.
+Formatting and diff checks passed. This checkpoint includes author
+self-review of the production diff and regression assertions, not a fresh
+independent whole-branch review.
+
+**Remaining scope:** other pending review findings, wallet corrections
+and the production evidence-to-correction trigger remain unfinished.
+Real-provider/client and cross-host acceptance remain unverified.
+This is not a whole-branch until-clean review conclusion. No push,
+merge, deployment, adjacent-repository edit or kaya process operation
+is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

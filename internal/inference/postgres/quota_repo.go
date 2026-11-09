@@ -24,7 +24,8 @@ import (
 // 全部成功才提交；任何一步失败整个事务回滚，不遗留部分占用。
 //
 // 固定锁序（Task 7 控制者裁决，全部写路径一致，防死锁环）：
-// 账户（FOR UPDATE）→ 请求行 → 窗口（five_hour→weekly→monthly）→ Key 预算
+// 账户（FOR UPDATE）→ 权益（准入时 FOR SHARE）→ 请求行
+// → 窗口（five_hour→weekly→monthly）→ Key 预算
 // → 预占/租约行。检查并创建请求/预占后提交；网络调用在提交之后（不持有
 // DB 事务等待上游，设计 §7.2）。
 
@@ -188,6 +189,10 @@ func (e activationConflict) Is(target error) bool {
 // account lock: a collision surfaces as quota.ErrWindowActivationConflict
 // and the caller retries the whole admission.
 //
+// The selected policy is checked under an entitlement SHARE lock until
+// commit; KEY SHARE would permit concurrent policy-only updates. Reused
+// live windows take the selected limit without resetting any consumption.
+//
 // Disabled windows (no limit in cmd.Limits) are skipped — explicit, never
 // unlimited (设计 §9.1). Reads outside admission must use LoadWindows,
 // which never activates (设计 §6).
@@ -198,6 +203,17 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 	}
 	if err := lockAccountTx(ctx, tx, cmd.BillingAccountID); err != nil {
 		return nil, err
+	}
+	var accountID, policyID string
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT billing_account_id, policy_version_id
+		 FROM inference_entitlements WHERE id=$1 FOR SHARE`,
+		cmd.EntitlementID).Scan(&accountID, &policyID); err != nil {
+		return nil, mapError("activate windows: entitlement", err)
+	}
+	if accountID != cmd.BillingAccountID || policyID != cmd.PolicyVersionID {
+		return nil, domain.NewError(domain.CodeConflict,
+			"activate windows: entitlement account or policy changed")
 	}
 	var rows []windowRow
 	if err := tx.SelectContext(ctx, &rows,
@@ -238,6 +254,16 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 		for _, a := range active {
 			if a.Kind == kind && !a.Voided &&
 				(quota.Interval{Start: a.Start.UTC(), End: a.End.UTC()}).Contains(cmd.At) {
+				if a.Limit != limit {
+					var refreshed windowRow
+					if err := tx.QueryRowxContext(ctx,
+						`UPDATE inference_quota_windows SET limit_micros=$2
+						 WHERE id=$1 RETURNING *`,
+						a.ID, int64(limit)).StructScan(&refreshed); err != nil {
+						return nil, mapError("activate windows: refresh limit", err)
+					}
+					a = refreshed.toDomain()
+				}
 				out = append(out, a)
 				break
 			}

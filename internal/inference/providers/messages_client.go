@@ -319,6 +319,13 @@ func anthropicTurnToChat(role string, content json.RawMessage) ([]model.ChatMess
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
+			if b.Text == "" {
+				continue
+			}
+			if len(toolCalls) > 0 {
+				return nil, invalidMsg("messages",
+					"assistant text after tool_use cannot preserve block order in a Chat turn; send tool results before the next assistant message")
+			}
 			textParts = append(textParts, b.Text)
 		case "thinking", "redacted_thinking":
 			// T8: 签名/脱敏思考块**无法忠实回放** —— Anthropic 的思考块

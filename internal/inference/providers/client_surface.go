@@ -65,13 +65,17 @@ type pumpEvent struct {
 
 // chunkPump incrementally reassembles and parses `data:` lines (the relay
 // buffer has no line alignment), mirroring OpenAIUsageTracker's discipline:
-// overlong lines are dropped (never wedge), malformed payloads are skipped.
+// overlong lines fail the stream; malformed payloads are skipped.
 type chunkPump struct {
 	pending []byte
+	err     error
 }
 
 // Feed consumes one read and returns every complete event it unblocks.
-func (p *chunkPump) Feed(b []byte) []pumpEvent {
+func (p *chunkPump) Feed(b []byte) ([]pumpEvent, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
 	var out []pumpEvent
 	for len(b) > 0 {
 		nl := bytes.IndexByte(b, '\n')
@@ -80,16 +84,13 @@ func (p *chunkPump) Feed(b []byte) []pumpEvent {
 			end = nl
 		}
 		if len(p.pending)+end > trackLineCap {
-			p.pending = p.pending[:0]
-			if nl < 0 {
-				return out
-			}
-			b = b[nl+1:]
-			continue
+			p.pending = nil
+			p.err = errSSELineTooLong
+			return out, p.err
 		}
 		p.pending = append(p.pending, b[:end]...)
 		if nl < 0 {
-			return out
+			return out, nil
 		}
 		if ev, ok := p.scanLine(p.pending); ok {
 			out = append(out, ev)
@@ -97,7 +98,7 @@ func (p *chunkPump) Feed(b []byte) []pumpEvent {
 		p.pending = p.pending[:0]
 		b = b[nl+1:]
 	}
-	return out
+	return out, nil
 }
 
 func (p *chunkPump) scanLine(line []byte) (pumpEvent, bool) {
@@ -179,13 +180,18 @@ func translateStream(src io.ReadCloser, r streamRenderer) io.ReadCloser {
 		for {
 			n, readErr := src.Read(buf)
 			if n > 0 {
-				for _, ev := range pump.Feed(buf[:n]) {
-					if ev.done {
-						terminal = true
-					}
-					if err := r.Render(ev, pw); err != nil {
-						pw.CloseWithError(err)
-						return
+				events, parseErr := pump.Feed(buf[:n])
+				if parseErr != nil {
+					readErr = parseErr
+				} else {
+					for _, ev := range events {
+						if ev.done {
+							terminal = true
+						}
+						if err := r.Render(ev, pw); err != nil {
+							pw.CloseWithError(err)
+							return
+						}
 					}
 				}
 			}

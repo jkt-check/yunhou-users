@@ -63,7 +63,7 @@ type responsesTap struct {
 	res TapResult
 }
 
-func (t *responsesTap) Feed(p []byte) { /* the translator meters internally */ }
+func (t *responsesTap) Feed(p []byte) error { return nil /* translator meters internally */ }
 
 func (t *responsesTap) Result() TapResult {
 	t.mu.Lock()

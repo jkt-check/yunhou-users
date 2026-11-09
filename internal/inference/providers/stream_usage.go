@@ -18,6 +18,7 @@ package providers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 
@@ -49,7 +50,7 @@ type TapResult struct {
 // translator owns its tap internally (Feed is a no-op there) because it
 // meters the RAW Anthropic events before translation.
 type UsageTap interface {
-	Feed(p []byte)
+	Feed(p []byte) error
 	Result() TapResult
 }
 
@@ -68,6 +69,7 @@ type Stream struct {
 type teeReader struct {
 	body io.ReadCloser
 	tap  UsageTap
+	err  error
 }
 
 // TeeStream wraps s.Body so reads feed s.Tap.
@@ -76,10 +78,19 @@ func (s *Stream) TeeBody() io.ReadCloser {
 }
 
 func (t *teeReader) Read(p []byte) (int, error) {
+	if t.err != nil {
+		return 0, t.err
+	}
 	n, err := t.body.Read(p)
 	if n > 0 {
-		t.tap.Feed(p[:n])
+		if tapErr := t.tap.Feed(p[:n]); tapErr != nil {
+			// Do not expose bytes from this read: they may contain a clean
+			// end marker after content or usage we could not safely parse.
+			t.err = tapErr
+			return 0, tapErr
+		}
 	}
+	t.err = err
 	return n, err
 }
 
@@ -89,11 +100,12 @@ func (t *teeReader) Close() error { return t.body.Close() }
 // OpenAI incremental usage tracker
 // ---------------------------------------------------------------------------
 
-// trackLineCap bounds the pending (unterminated) line. Usage chunks are a
-// few hundred bytes; a longer line is a big content delta that cannot be a
-// usage chunk worth buffering — it is dropped and scanning resumes at the
-// next newline (candidate-branch semantics, kept).
-const trackLineCap = 64 << 10
+// Bound complete SSE lines, including large tool/text deltas with inline
+// usage. Above this bound the stream fails; silently skipping would lose
+// both generated content and billable usage.
+const trackLineCap = 1 << 20
+
+var errSSELineTooLong = errors.New("providers: SSE line exceeds 1 MiB")
 
 // openAIUsage is the OpenAI usage object shape, including the detail
 // sub-objects that carry cache/reasoning breakdowns. The
@@ -127,15 +139,19 @@ type OpenAIUsageTracker struct {
 	mu      sync.Mutex
 	pending []byte
 	res     TapResult
+	err     error
 }
 
 // Feed consumes one upstream read. Lines are reassembled across reads (the
 // relay buffer has no line alignment). Only complete `data:` lines
 // containing "usage", "content", "reasoning", "tool_calls" or [DONE] cost more than a
 // prefix scan.
-func (t *OpenAIUsageTracker) Feed(p []byte) {
+func (t *OpenAIUsageTracker) Feed(p []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.err != nil {
+		return t.err
+	}
 	for len(p) > 0 {
 		nl := bytes.IndexByte(p, '\n')
 		end := len(p)
@@ -143,21 +159,19 @@ func (t *OpenAIUsageTracker) Feed(p []byte) {
 			end = nl
 		}
 		if len(t.pending)+end > trackLineCap {
-			t.pending = t.pending[:0] // overlong line: drop, never wedge
-			if nl < 0 {
-				return
-			}
-			p = p[nl+1:]
-			continue
+			t.pending = nil
+			t.err = errSSELineTooLong
+			return t.err
 		}
 		t.pending = append(t.pending, p[:end]...)
 		if nl < 0 {
-			return
+			return nil
 		}
 		t.scanLine(t.pending)
 		t.pending = t.pending[:0]
 		p = p[nl+1:]
 	}
+	return nil
 }
 
 // Result returns the metering state so far. Raw is copied out so the caller
@@ -255,7 +269,7 @@ type anthropicTap struct {
 	res TapResult
 }
 
-func (t *anthropicTap) Feed(p []byte) { /* the translator meters internally */ }
+func (t *anthropicTap) Feed(p []byte) error { return nil /* translator meters internally */ }
 
 func (t *anthropicTap) Result() TapResult {
 	t.mu.Lock()

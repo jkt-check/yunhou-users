@@ -113,16 +113,27 @@ func TestUsageTracker_MalformedEventSkipped(t *testing.T) {
 	}
 }
 
-func TestUsageTracker_OverlongLineDropped(t *testing.T) {
-	// A content delta bigger than the pending-line cap must not wedge the
-	// tracker: the line is dropped and the following usage line still parses.
+func TestUsageTracker_OverlongLineFailsClosed(t *testing.T) {
+	// Losing an oversized line must not turn its suffix or a later DONE
+	// into a successfully metered stream. Previously it was silently dropped.
 	big := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("a", trackLineCap+100) + "\"}}]}\n\n"
-	stream := big + "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n"
-	var tr OpenAIUsageTracker
-	tr.Feed([]byte(stream))
-	u := tr.Result()
-	if !u.SawUsage || *u.Buckets.InputTokens != 1 || *u.Buckets.OutputTokens != 2 {
-		t.Errorf("Result = %+v, want 1/2 after an overlong line", u)
+	for _, size := range []int{8191, len(big)} {
+		var tr OpenAIUsageTracker
+		var err error
+		for offset := 0; offset < len(big); offset += size {
+			if err = tr.Feed([]byte(big[offset:min(offset+size, len(big))])); err != nil {
+				break
+			}
+		}
+		if err == nil {
+			t.Fatalf("chunk=%d: oversized line accepted", size)
+		}
+		if err := tr.Feed([]byte(openAISSEFixture)); err == nil {
+			t.Fatalf("chunk=%d: tracker resumed after overflow", size)
+		}
+		if u := tr.Result(); u.SawUsage || u.Terminal || u.ContentBytes != 0 {
+			t.Errorf("chunk=%d: Result=%+v, want nonterminal with no invented usage", size, u)
+		}
 	}
 }
 

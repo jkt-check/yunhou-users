@@ -5386,6 +5386,125 @@ Second commit (findings 3-5), fourteen files:
 
 ---
 
+### 4.63 Provider stream fidelity review checkpoint (2026-11-09)
+
+This checkpoint follows the user's local-commit request. It is not a claim
+that the open-ended branch review has converged. The earlier findings 1-2
+and 3-5 are already committed as `5f74ee8` and `1bec4c4`, respectively.
+
+#### 4.63.1 Behavior and regression evidence
+
+- Incoming Messages assistant blocks with nonempty text after `tool_use`
+  now return `invalid_input`, rather than moving that text ahead of the
+  call. Text before parallel calls, empty text blocks and results followed
+  by a new user turn remain supported.
+- Responses streaming terminal output and the replay transcript now follow
+  the assigned `output_index`, not item closing order. The transcript
+  omits reasoning without moving earlier calls behind later messages.
+- OpenAI SSE usage tracking and client translation accept lines up to
+  1 MiB, matching the existing native-adapter bound. A 70 KiB text or
+  tool delta with inline usage retains both content and usage. An over-limit
+  line fails explicitly and cannot resume from a suffix or later DONE.
+  The tee latches the failure and does not expose the failing read;
+  translated Messages/Responses emit an error, not a successful terminal.
+
+All three defects were reproduced before the production fixes. The new
+regressions passed after the fixes, and the complete providers package
+passed `go test -race -count=1 ./internal/inference/providers` (2.480s).
+The tests cover fragmented/whole reads, large text/tool deltas, prior usage
+retention after overflow, and completed/incomplete output ordering.
+
+Compatibility costs: previously reordered Messages histories now fail
+explicitly; callers must place later text after tool results. Providers
+emitting SSE lines larger than 1 MiB must send smaller deltas. Malformed
+JSON event handling is unchanged by this checkpoint.
+
+#### 4.63.2 Review status and remaining findings
+
+Read-only reviewers examined money/quota/recovery, gateway/facade
+boundaries at `1bec4c4`, and the providers working diff. They reported
+five additional issues, which are not repaired or dynamically reproduced
+by this commit:
+
+- **P1, entitlement-sync stale plan race:** a pre-refund grant plan can
+  insert an active entitlement after another worker has read cancellation
+  and delivered both pending messages as noops. `planSync` runs outside
+  the apply transaction; noop delivery and insert do not guard source
+  freshness. Next verification needs a disposable-PostgreSQL barrier
+  test fixing this interleaving and checking final authorization.
+- **P2, local capability errors on `/chat`:** model-level tools/reasoning
+  rejection returns untyped `invalid_input`; the facade maps it to a 502
+  upstream rejection instead of the existing typed capability 400 path.
+  Next verification must distinguish local zero-dispatch rejection from
+  real upstream 4xx classification.
+- **P1, error followed by DONE:** client renderers and the Chat tracker
+  can treat a later DONE as success after an in-band error. Native
+  Anthropic/Responses translators also lack a sticky failed state.
+  Next verification must cover same-read and split-read error/terminal
+  pairs, omit successful terminal frames and keep Responses unpersistable.
+- **P1, native non-stream output order:** Anthropic and Responses decoders
+  collect text and calls separately into Chat, potentially moving text
+  around tool calls when rebuilding the client response. Request-history
+  rejection and streaming output-index fixes do not repair this response
+  path. Next verification must reproduce the native output arrangements
+  and preserve them or explicitly reject unrepresentable output.
+- **P2, interrupted Anthropic initial usage:** `message_start` input
+  usage is retained but its output usage is not, so an error/EOF before
+  `message_delta` can discard known output tokens. Next verification
+  must preserve the initial 7/1 usage when no later usage arrives.
+
+These findings prevent a claim that the branch review is complete.
+The providers reviewer passed the package race suite and found no
+confirmed defect in the three checkpoint fixes, but did not complete
+all native item-boundary/refusal/multiturn combinations. All five new
+findings are static-review reports, not new failing-test evidence.
+The correction-trigger/wallet, real-provider/client and cross-process
+rate-path limitations in sections 5-6 remain open.
+
+#### 4.63.3 Deliverable file manifest
+
+- `internal/inference/providers/messages_client.go`
+- `internal/inference/providers/messages_client_order_test.go`
+- `internal/inference/providers/responses_client.go`
+- `internal/inference/providers/responses_stream_order_test.go`
+- `internal/inference/providers/client_surface.go`
+- `internal/inference/providers/stream_usage.go`
+- `internal/inference/providers/stream_usage_test.go`
+- `internal/inference/providers/openai_responses_stream.go`
+- `internal/inference/providers/sse_limits_test.go`
+- `docs/superpowers/plans/2026-11-09-model-gateway-review-convergence.md`
+- `docs/runbooks/2026-11-05-model-gateway-verification.md`
+
+#### 4.63.4 Full verification
+
+Runner completed with exit 0 and `SUCCESS`:
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.dY8W6i`.
+This is fresh evidence for the checkpoint source, not reused HEAD results.
+
+| Gate | Result |
+|---|---|
+| `go build ./...` | exit 0 |
+| `go vet ./internal/... ./cmd/...` | exit 0 |
+| `go test -race -count=1 -p 1 -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...` | 4,306 test/subtest passes, 34 package passes, zero failures |
+| `go tool cover -func=...` and 80% floor | 80.6%, passed |
+| `go test -race -count=1 -p 1 -json ./tests/e2e/...` | 181 test/subtest passes, zero failures |
+| Migrations on each disposable database | first pass applied 55; second pass skipped 55 |
+| `gofmt -l` on all changed Go files; `git diff --cached --check` | no output, passed |
+
+Expected skips, not counted as passes: `TestQuotaWorkerProcess` is the
+child-process entry point; `TestLoadDrill_Throughput` and
+`TestLoadDrill_LongConnections` require `KAYA_LOAD=1`;
+`TestUsageTokenAcceptance_TenPagesTwoMinutes` requires `USAGE_ACCEPTANCE=1`.
+No database-dependent test was skipped for a missing DSN.
+
+The owned cluster bound only to loopback port 55489 and used separate
+`review_app`/`review_e2e` databases with explicit `DATABASE_URL` and
+`E2E_DATABASE_URL`. `GOPROXY=off` and `GOFLAGS=-mod=readonly` were set.
+The runner's cleanup log confirms its own PostgreSQL server stopped.
+No kaya process, production service, database or provider was accessed.
+
+---
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -6395,6 +6395,73 @@ real-provider/client and cross-host acceptance remain unverified.
 No push, merge, deployment, adjacent repository modification or kaya
 process operation is part of this checkpoint.
 
+### 4.75 Correction Validation Transaction Safety (2026-11-10)
+
+This local commit checkpoint completes the Task 15 production fix.
+Its regression tests were committed separately in `ef84a93` and
+`639bb22`; it does not close the broader until-clean review.
+
+**Changed files:**
+
+- `internal/inference/postgres/reconciliation_repo.go`: parse and
+  canonicalize the corrected attempt UUID before its SQL lookup; use the
+  shared normalized-token validator for every correction, including
+  reasoning-only evidence; reject a negative declared total with unknown
+  additive buckets. All checks precede usage/receipt/financial writes.
+- The convergence plan and this runbook: record the actual evidence and
+  replace section 6's unsupported scope-exclusion claim with the remaining
+  original correction-trigger/wallet requirement.
+
+**RED/GREEN evidence:** paths are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+
+| Run | Result |
+|---|---|
+| `run.8HU0A5/focused.jsonl` | Fresh pre-fix RED: empty/malformed attempt IDs, negative reasoning detail, negative reasoning-only evidence and a negative unknown total left the transaction aborted (`25P02`). Overflow rejection and both valid boundary controls already passed. |
+| `run.bGAnnh/focused.jsonl` | Post-fix GREEN: all 45 correction tests/subtests passed with race detection, no failures or skips (4.295s). |
+| `run.qkqGUu/tests.jsonl` | Build/vet passed; full race passed 4,499 tests/subtests across 34 packages, zero failures. |
+| `run.qkqGUu/coverage-summary.log` | Total statement coverage 80.7%; the 80% floor passed. |
+| `run.qkqGUu/e2e.jsonl` | E2E race passed 186 tests/subtests, zero failures (215.356s). Runner exited 0. |
+
+Focused command:
+`go test -race -count=1 -p 1 -json ./internal/inference/postgres -run '^TestCorrectSettlement' -timeout=5m`.
+The regressions inspect unchanged usage, receipt, ledger, TPM, request and
+window/Key aggregates before rollback, then successfully apply reported
+80/10 usage with the same transaction and idempotency key: TPM 90, one
+20,000 credit adjustment and the original settlement timestamp. Positive
+controls retain exact-Max totals without double-counting reasoning and
+preserve TPM 50 for reasoning-only unknown totals. Uppercase attempt UUIDs
+are canonicalized. Completed focused runs used owned disposable databases;
+their cleanup logs confirm the owned PostgreSQL servers stopped.
+
+Full race command:
+`go test -race -count=1 -p 1 -timeout=30m -coverprofile=... -json ./internal/... ./cmd/... ./tests/integration/...`.
+It skipped only `TestQuotaWorkerProcess` (the child-process entry) and
+the two `KAYA_LOAD=1` load-drill opt-ins, not unavailable databases.
+E2E command:
+`go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`.
+It skipped only `TestUsageTokenAcceptance_TenPagesTwoMinutes`
+(`USAGE_ACCEPTANCE=1` opt-in). No database acceptance was skipped.
+Both independent disposable databases applied all 55 migrations and
+skipped all 55 on rerun. The runner exited 0 on 2026-11-10
+(Asia/Shanghai), and `cleanup.log` confirms the owned PostgreSQL server
+stopped. No production database or kaya process was used.
+
+Euler's bounded read-only review of `80fa033` through the current worktree
+found no confirmed new Critical or Important defect in Task 15. It checked
+the shared token/rate logic, same-transaction retry, positive boundary
+controls and existing idempotency/wallet/status rejection precedence. It
+did not independently run tests or verify the full gate.
+
+**Remaining scope:** this is not exhaustive validation of every correction
+field (`Source`, raw JSON and request identity remain separate surfaces).
+No migration or historical-data repair is included. Wallet correction and
+the production evidence-driven trigger are genuine unfinished original
+requirements, not exclusions justified by a named follow-up.
+Cross-host and real-provider/client acceptance remain unverified.
+No push, merge, deployment, adjacent repository modification or kaya
+process operation is part of this checkpoint.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module
@@ -6477,10 +6544,10 @@ The limitation wording in the plan (§1.1.6 item 1), the T4 branch-era note
 accurate. The T4 note is branch-era text and is still **not** a plan-level
 waiver.
 
-**Why it is not a merge blocker.** The rate-side of the original T4 sentence is
-satisfied for the wallet path (`settleWallet` → `settleRateTx`,
-`releaseRateTx` on release); the missing pieces are the *trigger* and the
-*money* semantics, both of which are pre-existing and outside this branch's
-rate-gate deliverable. No money or rate fact produced by this branch is wrong
-because of them: a recovery-settled request is charged the conservative
-estimate and stays that way.
+**Delivery status, not a scope waiver.** Initial wallet settlement and release
+update the rate reservation, but that does not satisfy the original T4
+post-settlement correction requirement. The missing production trigger and
+wallet money/token correction remain genuine unfinished original scope.
+A recovery-settled estimate stays conservative until that channel exists.
+No explicit plan-level waiver has been recorded, so this follow-up cannot
+justify declaring the original plan or the until-clean review complete.

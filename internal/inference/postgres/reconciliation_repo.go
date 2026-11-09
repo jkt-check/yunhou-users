@@ -460,6 +460,12 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return domain.NewError(domain.CodeConflict,
 			"correction: request not settled ("+status+") — settle first, corrections revise a settlement")
 	}
+	attemptID, err := uuid.Parse(cmd.Corrected.AttemptID)
+	if err != nil {
+		return domain.WrapError(domain.CodeInvalidInput,
+			"correction: invalid attempt ID", err)
+	}
+	cmd.Corrected.AttemptID = attemptID.String()
 	var ownsAttempt bool
 	if err := tx.QueryRowxContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM inference_attempts WHERE id = $1 AND request_id = $2)`,
@@ -474,31 +480,23 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	// without a corrected total would silently omit the token budget (the
 	// ledger and the rate budget would disagree). Checked after the scope
 	// boundary above so the wallet rejection keeps its own message.
+	total, err := access.NormalizedTokens(cmd.Corrected.Buckets)
+	if err != nil {
+		return err
+	}
+	if cmd.CorrectedTokens != nil && *cmd.CorrectedTokens < 0 {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: corrected token total must not be negative")
+	}
 	if cmd.CorrectedTokens == nil && access.KnownTokenBuckets(cmd.Corrected.Buckets) {
 		return domain.NewError(domain.CodeInvalidInput,
 			"correction: the corrected evidence carries token buckets but no corrected token total"+
 				" (the token budget correction must not be omitted)")
 	}
-	if cmd.CorrectedTokens != nil && access.KnownTokenBuckets(cmd.Corrected.Buckets) {
-		// Subtract from the declared total so oversized buckets cannot wrap
-		// an int64 sum into an apparently matching total.
-		remaining := *cmd.CorrectedTokens
-		buckets := cmd.Corrected.Buckets
-		for _, bucket := range []*int64{buckets.InputTokens, buckets.CacheReadTokens,
-			buckets.CacheWriteTokens, buckets.OutputTokens} {
-			if bucket == nil {
-				continue
-			}
-			if *bucket < 0 || *bucket > remaining {
-				return domain.NewError(domain.CodeInvalidInput,
-					"correction: corrected token total does not match normalized evidence")
-			}
-			remaining -= *bucket
-		}
-		if remaining != 0 {
-			return domain.NewError(domain.CodeInvalidInput,
-				"correction: corrected token total does not match normalized evidence")
-		}
+	if cmd.CorrectedTokens != nil && access.KnownTokenBuckets(cmd.Corrected.Buckets) &&
+		*cmd.CorrectedTokens != total {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: corrected token total does not match normalized evidence")
 	}
 	if !settled.Valid {
 		return domain.NewError(domain.CodeConflict,

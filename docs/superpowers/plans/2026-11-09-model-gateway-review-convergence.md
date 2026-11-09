@@ -368,12 +368,12 @@ and verification runbook.
 - [x] Reproduce empty/malformed attempt identities and negative reasoning
   evidence reaching SQL constraints instead of safe input rejection.
 - [x] Reproduce a negative declared total with unknown normalized buckets.
-- [ ] Reject invalid correction evidence before usage, receipt or financial
+- [x] Reject invalid correction evidence before usage, receipt or financial
   writes; reuse the shared normalized-token validator.
-- [ ] Inspect the open transaction after rejection, then apply a valid
+- [x] Inspect the open transaction after rejection, then apply a valid
   estimated-to-reported correction with the same transaction and key.
-- [ ] Preserve reasoning-only unknown totals and exact-Max valid totals.
-- [ ] Run focused and full race/coverage/E2E on owned disposable databases.
+- [x] Preserve reasoning-only unknown totals and exact-Max valid totals.
+- [x] Run focused and full race/coverage/E2E on owned disposable databases.
 
 Ruling: extend the existing correction evidence boundary, not the wallet
 product contract. Validation must not defer to a database error that aborts
@@ -398,6 +398,38 @@ Formatting and diff whitespace checks passed. Full race, E2E and coverage
 were not rerun for this intentionally failing reproduction checkpoint;
 the previous 80.6% coverage does not describe the current tree.
 No push, merge, deployment, adjacent repository edit or kaya operation.
+
+GREEN implementation checkpoint: parse and canonicalize the corrected
+attempt UUID before querying it, validate all buckets with the shared
+normalized-token helper, and reject a negative declared total even when
+the additive buckets are unknown. Existing idempotency, wallet and status
+rejection precedence is unchanged.
+
+The regressions are committed in `ef84a93` and `639bb22`. Fresh pre-fix
+`run.8HU0A5` reproduced the five transaction-aborting leaf cases; overflow
+rejection and both valid boundary controls already passed. Post-fix
+`run.bGAnnh` passed all 45 correction tests/subtests with race detection,
+no failures or skips. The same transaction and idempotency key accept a
+valid reported correction after rejection, with unchanged settlement time,
+TPM 90, and the expected single monetary adjustment. Exact-Max, canonical
+uppercase UUID input and reasoning-only unknown totals also pass.
+Both completed runs used owned disposable databases and stopped their
+owned PostgreSQL servers.
+
+Fresh whole-branch `run.qkqGUu` exited 0 on 2026-11-10 (Asia/Shanghai):
+build/vet passed; full race passed 4,499 tests/subtests across 34 packages,
+zero failures, with total statement coverage 80.7%; E2E race passed 186
+tests/subtests (215.356s), zero failures. The three full-race skips and
+one E2E skip were the expected child-entry/opt-in scenarios, not missing
+databases. Both independent disposable databases applied 55 migrations
+and skipped all 55 on rerun; cleanup confirmed the owned server stopped.
+
+Euler's bounded read-only review found no new Critical or Important
+Task 15 defect; it did not independently execute tests. It confirmed
+the original wallet-correction and production-trigger requirements remain
+unfulfilled. Runbook 4.75 records the manifest, scope and evidence.
+Task 15 is verified for this local commit checkpoint, not a declaration
+that the original plan or wider until-clean review is complete.
 
 ### Previous Verification Checkpoint
 

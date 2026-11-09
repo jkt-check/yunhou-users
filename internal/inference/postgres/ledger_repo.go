@@ -410,6 +410,11 @@ func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord)
 	if len(raw) == 0 {
 		raw = json.RawMessage(`{"schema_version":1}`)
 	}
+	// A jsonb fact cannot equal malformed incoming JSON. Classify it as
+	// conflicting evidence instead of aborting the terminal anomaly path.
+	if !json.Valid(raw) {
+		return false, nil
+	}
 	var in, out, cacheRead, cacheWrite, reasoning sql.NullInt64
 	var sameEvidence bool
 	err := tx.QueryRowxContext(ctx,

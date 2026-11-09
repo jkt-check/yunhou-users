@@ -27,9 +27,13 @@ func (f *fixture) replaySettlement(t *testing.T, usage domain.UsageRecord) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	hold, ok := domain.HoldUpperBound(request)
+	if !ok {
+		t.Fatal("settlement replay has no persisted monetary upper bound")
+	}
 	f.gateway.settle(ctx, usage.RequestID, usage.AttemptID, usage.Buckets,
 		usage.Source, usage.RawUsage.Raw, price, providers.NewOpenAIChat(),
-		&quota.AdmissionResult{RequestID: usage.RequestID, HoldMicros: *request.ExpectedHoldMicros,
+		&quota.AdmissionResult{RequestID: usage.RequestID, HoldMicros: hold,
 			ChargeSource: request.ChargeSource})
 }
 

@@ -1310,7 +1310,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		// 幂等重复成功；released 后的晚到用量、缺预占、金额不一致都是账务
 		// 异常 —— 告警并进入专门核对，绝不当成功吞掉。
 		if se, ok := domain.AsSettleError(lastErr); ok {
-			s.classifySettleOutcome(requestID, se)
+			s.classifySettleOutcome(cmd, price, adm.ChargeSource, se)
 			return
 		}
 		if domain.CodeOf(lastErr) == domain.CodeConflict {
@@ -1334,7 +1334,8 @@ parked:
 //     reconciliation flow (its terminal state is never rewritten);
 //   - a missing expected reservation is an accounting anomaly on a
 //     non-terminal request: it is parked for reconciliation with its reason.
-func (s *Service) classifySettleOutcome(requestID string, se *domain.SettleError) {
+func (s *Service) classifySettleOutcome(cmd domain.SettleCommand, price accounting.PriceVersion, source domain.ChargeSource, se *domain.SettleError) {
+	requestID := cmd.RequestID
 	switch se.Kind {
 	case domain.SettleOutcomeDuplicate:
 		return // 幂等重投：已结算且 charge/usage 一致 —— 重复成功，不告警。
@@ -1342,15 +1343,15 @@ func (s *Service) classifySettleOutcome(requestID string, se *domain.SettleError
 		if se.Trivial {
 			return // released 之后到来的零用量投递：无事可记，不告警。
 		}
-		s.reportSettlementAnomaly(requestID, postgres.ReasonLateUsageAfterRelease, se)
+		s.reportSettlementAnomaly(cmd, price, source, postgres.ReasonLateUsageAfterRelease, se)
 		return
 	case domain.SettleOutcomeChargeMismatch:
 		// 不一致的重复结算 = 双扣风险：告警并进入专门核对（绝不静默吞掉）。
-		s.reportSettlementAnomaly(requestID, postgres.ReasonSettlementMismatch, se)
+		s.reportSettlementAnomaly(cmd, price, source, postgres.ReasonSettlementMismatch, se)
 		return
 	case domain.SettleOutcomeLedgerDrift:
 		// 账本漂移（已结算却无 charge 行）：告警并进入专门核对。
-		s.reportSettlementAnomaly(requestID, postgres.ReasonLedgerDrift, se)
+		s.reportSettlementAnomaly(cmd, price, source, postgres.ReasonLedgerDrift, se)
 		return
 	case domain.SettleOutcomeReservationDrift:
 		// 预占漂移（held 数与准入不符）：请求无法结算 → 停放并告警。
@@ -1367,17 +1368,30 @@ func (s *Service) classifySettleOutcome(requestID string, se *domain.SettleError
 // reportSettlementAnomaly alarms and files a dedicated reconciliation job
 // for a request whose terminal state must not be rewritten (设计 §7.2:
 // released 是终态，但晚到的非零用量是账务异常，必须告警并进入专门核对).
-func (s *Service) reportSettlementAnomaly(requestID, reason string, se *domain.SettleError) {
+func (s *Service) reportSettlementAnomaly(cmd domain.SettleCommand, price accounting.PriceVersion, source domain.ChargeSource, reason string, se *domain.SettleError) {
+	requestID := cmd.RequestID
 	log.Printf("ALARM gateway: %s for request %s: %s", reason, requestID, se.Message)
 	ctx, cancel := detached(settleTimeout)
 	defer cancel()
-	detail, _ := json.Marshal(map[string]interface{}{
+	evidence, err := newSettlementEvidence(cmd, price, source)
+	if err != nil {
+		log.Printf("ERROR gateway: anomaly evidence %s: %v", requestID, err)
+		s.fireSettleAlarm(requestID, se)
+		return
+	}
+	detail, err := json.Marshal(map[string]interface{}{
 		"schema_version":          1,
 		"reason":                  reason,
 		"outcome":                 string(se.Kind),
 		"status":                  string(se.Status),
 		"requested_charge_micros": int64(se.RequestedChargeMicros),
+		"settlement_evidence":     evidence,
 	})
+	if err != nil {
+		log.Printf("ERROR gateway: anomaly detail %s: %v", requestID, err)
+		s.fireSettleAlarm(requestID, se)
+		return
+	}
 	uow, err := s.store.Begin(ctx)
 	if err != nil {
 		log.Printf("ERROR gateway: anomaly report begin %s: %v", requestID, err)

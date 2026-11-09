@@ -52,7 +52,8 @@ type EnqueueReconciliationCommand struct {
 // caller's transaction. Request-scoped jobs dedup on UNIQUE(request_id);
 // window-level jobs dedup on the partial (detail->>'window_id') index. A
 // repeat delivery merges detail (jsonb ||, new keys win) and extends the
-// deadline — never spawns a second job for the same subject.
+// deadline. Settlement observations are unioned by content identity rather
+// than replaced, including refreshes without new evidence.
 func (s *Store) EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfWork, cmd EnqueueReconciliationCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -83,6 +84,15 @@ func (s *Store) EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfW
 			 VALUES ($1,$2,$3,$4,$5)
 			 ON CONFLICT (request_id) DO UPDATE
 			 SET detail = inference_reconciliation_jobs.detail || EXCLUDED.detail
+			         || CASE WHEN inference_reconciliation_jobs.detail ? 'settlement_evidence'
+			                   OR EXCLUDED.detail ? 'settlement_evidence'
+			              THEN jsonb_build_object('settlement_evidence',
+			                   COALESCE(inference_reconciliation_jobs.detail->'settlement_evidence', '{}'::jsonb)
+			                   || COALESCE(EXCLUDED.detail->'settlement_evidence', '{}'::jsonb)
+			                   || jsonb_build_object('observations',
+			                        COALESCE(inference_reconciliation_jobs.detail#>'{settlement_evidence,observations}', '{}'::jsonb)
+			                        || COALESCE(EXCLUDED.detail#>'{settlement_evidence,observations}', '{}'::jsonb)))
+			              ELSE '{}'::jsonb END
 			         || CASE WHEN (NOT (inference_reconciliation_jobs.reason = ANY($6))
 			                   AND (EXCLUDED.reason = ANY($6)
 			                        OR (inference_reconciliation_jobs.status IN ('resolved','escalated')

@@ -190,13 +190,62 @@ func TestAnthropicPayload_Thinking(t *testing.T) {
 // max_tokens 提到客户声明的 OutputCap 之上让上游超产多收。
 func TestAnthropicPayload_ThinkingCapTooSmallRejects(t *testing.T) {
 	thinking := true
-	for _, cap := range []int64{1024, 1025} {
+	for _, cap := range []int64{1023, 1024} {
 		_, err := NewAnthropicMessages().BuildPayload(testCall("m", true, cap, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking))
 		if domain.CodeOf(err) != domain.CodeInvalidInput {
 			t.Errorf("cap %d: err = %v, want invalid_input (raise max_tokens or disable thinking)", cap, err)
 		}
 	}
-	// 最小合法 cap：预算钳到 cap-1（≥ 1024 下限），max_tokens 不动。
+}
+
+func TestAnthropicPayload_ThinkingMinimumValidCap(t *testing.T) {
+	thinking := true
+	minimumBudget, oversizedBudget := int64(1024), int64(16384)
+	for _, tc := range []struct {
+		name   string
+		budget *int64
+	}{
+		{name: "default budget"},
+		{name: "explicit minimum budget", budget: &minimumBudget},
+		{name: "oversized budget", budget: &oversizedBudget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			call := testCall("m", true, 1025, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking)
+			call.Request.ThinkingBudget = tc.budget
+			body, err := NewAnthropicMessages().BuildPayload(call)
+			if err != nil {
+				t.Fatalf("cap 1025 must fit budget 1024: %v", err)
+			}
+			p := decode(t, body)
+			if p["max_tokens"] != float64(1025) {
+				t.Errorf("max_tokens = %v, want admitted cap 1025", p["max_tokens"])
+			}
+			th := p["thinking"].(map[string]any)
+			if th["type"] != "enabled" || th["budget_tokens"] != float64(1024) {
+				t.Errorf("thinking = %v, want enabled budget 1024", th)
+			}
+		})
+	}
+}
+
+func TestAnthropicPayload_ThinkingDisabledAtMinimumBudgetCap(t *testing.T) {
+	thinking := false
+	body, err := NewAnthropicMessages().BuildPayload(testCall("m", true, 1024, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking))
+	if err != nil {
+		t.Fatalf("disabled thinking must allow cap 1024: %v", err)
+	}
+	p := decode(t, body)
+	if p["max_tokens"] != float64(1024) {
+		t.Errorf("max_tokens = %v, want admitted cap 1024", p["max_tokens"])
+	}
+	th := p["thinking"].(map[string]any)
+	if th["type"] != "disabled" || th["budget_tokens"] != nil {
+		t.Errorf("thinking = %v, want disabled without budget", th)
+	}
+}
+
+func TestAnthropicPayload_ThinkingClampsBudgetBelowCap(t *testing.T) {
+	thinking := true
 	body, err := NewAnthropicMessages().BuildPayload(testCall("m", true, 1026, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking))
 	if err != nil {
 		t.Fatalf("cap 1026: %v", err)
@@ -215,7 +264,7 @@ func TestAnthropicPayload_ThinkingCapTooSmallRejects(t *testing.T) {
 // budget_tokens < max_tokens。
 func TestAnthropicPayload_ThinkingNeverExceedsOutputCap(t *testing.T) {
 	thinking := true
-	for _, cap := range []int64{1026, 2048, 4096, 5000, 8192, 32768} {
+	for _, cap := range []int64{1025, 1026, 2048, 4096, 5000, 8192, 32768} {
 		for _, budget := range []int64{0, 1024, 4096, 16384, 1 << 20} {
 			call := testCall("m", true, cap, []model.ChatMessage{{Role: "user", Content: "x"}}, nil, &thinking)
 			if budget > 0 {

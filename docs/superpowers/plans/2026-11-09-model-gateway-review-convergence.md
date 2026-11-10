@@ -1160,6 +1160,33 @@ as terminal conflicts: existing JSONB equality may still absorb a replay
 whose only difference is a duplicate key. That classification policy and
 the review's failure-injection gaps remain explicit in runbook 4.87.
 
+## Task 28: Anthropic Minimum Thinking Boundary
+
+**Files:** `providers/anthropic.go`, `providers/anthropic_test.go`, and the
+verification and operations runbooks.
+
+**Interfaces:** `AnthropicMessages.BuildPayload(*Call) ([]byte, error)`
+retains the admitted output cap and clamps the thinking budget below it.
+
+- [ ] Correct the regression's mistaken rejection of output cap 1025.
+  Cover explicit budget 1024, default budget clamped to 1024, and an
+  oversized budget clamped to 1024. Cover caps 1023/1024 rejecting thinking,
+  while disabled thinking remains legal at cap 1024.
+- [ ] Run `go test -race -count=1 -p 1 ./internal/inference/providers
+  -run '^TestAnthropicPayload_Thinking'`. Expected RED: the three valid
+  cap-1025 cases reject before dispatch.
+- [ ] Reject enabled thinking only when the cap cannot contain the
+  documented minimum 1024 budget strictly below it; do not raise the cap.
+- [ ] Repeat the focused race command and full providers race suite.
+  Expected GREEN: minimum valid payload has max_tokens 1025 and budget 1024.
+- [ ] Run fresh build/vet/full race/coverage/E2E with independent owned
+  disposable databases, record evidence and remaining findings, and commit
+  locally as `fix(inference): accept minimum Anthropic thinking cap`.
+
+Ruling: this is an off-by-one repair under the existing output-cap and
+budget-clamping contract, not a new reasoning mode or pricing policy.
+Other provider findings and wallet correction remain open.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

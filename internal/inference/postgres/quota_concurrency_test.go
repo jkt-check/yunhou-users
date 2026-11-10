@@ -382,6 +382,70 @@ func TestCrossWindowCompletion(t *testing.T) {
 	}
 }
 
+// TestAdmitReusesStoredAnchorWithSubMicrosecondCallerTime: 准入的锚点必须取
+// 数据库里已持久化的 anchor_at —— 调用方内存里的锚点可能带亚微秒纳秒，而
+// PostgreSQL 的 TIMESTAMPTZ 只存微秒：按调用方锚点算出的 weekly/monthly
+// 窗口起点写库后被截断成另一个值，第二次准入再也匹配不上已激活的窗口行，
+// 于是重复激活 → EXCLUDE 排他约束冲突（23P01）。
+func TestAdmitReusesStoredAnchorWithSubMicrosecondCallerTime(t *testing.T) {
+	db, s := testDB(t)
+	f := seedFixture(t, s, true)
+	priceID := seedPrice(t, s, f.modelID)
+	stored, err := s.GetEntitlement(context.Background(), f.entID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := admitCmd(f, priceID, 100, 1_000_000, 10_000_000, 100_000_000, nil)
+	cmd.At = stored.AnchorAt.Add(time.Hour)
+	cmd.Entitlement.AnchorAt = stored.AnchorAt.Add(789 * time.Nanosecond)
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("first admission: %v", err)
+	}
+	cmd.Request.ID = uuid.NewString()
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("second admission must reuse stored windows: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inference_quota_windows WHERE entitlement_id=$1`, f.entID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("active windows = %d, want 3", count)
+	}
+}
+
+// TestAdmitReusesFiveHourWindowWithSubMicrosecondConsumptionTime: 五小时窗口
+// 的起点是**消费时刻**本身，因此消费时刻也必须用数据库自己的表示
+// （$2::timestamptz）参与窗口计算 —— 调用方内存里带亚微秒纳秒的消费时刻
+// 写库后被截断成另一个值，第二次准入匹配不上已激活的五小时窗口行，于是
+// 重复激活 → EXCLUDE 排他约束冲突（23P01）。
+func TestAdmitReusesFiveHourWindowWithSubMicrosecondConsumptionTime(t *testing.T) {
+	db, s := testDB(t)
+	f := seedFixture(t, s, true)
+	priceID := seedPrice(t, s, f.modelID)
+	stored, err := s.GetEntitlement(context.Background(), f.entID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := admitCmd(f, priceID, 100, 1_000_000, 10_000_000, 100_000_000, nil)
+	cmd.Entitlement.AnchorAt = stored.AnchorAt
+	cmd.At = stored.AnchorAt.Add(time.Hour).Add(789 * time.Nanosecond)
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("first admission: %v", err)
+	}
+	cmd.Request.ID = uuid.NewString()
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("second admission must reuse stored windows: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inference_quota_windows WHERE entitlement_id=$1`, f.entID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("active windows = %d, want 3", count)
+	}
+}
+
 // TestKeySubBudgetConcurrency: Key 子预算为瓶颈时放行量不超预算（累计上
 // 限语义，不按周期清零 — 控制者裁决）。
 func TestKeySubBudgetConcurrency(t *testing.T) {

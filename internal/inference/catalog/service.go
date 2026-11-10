@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -948,6 +949,12 @@ func validateModelAliasUniqueness(models []domain.Model) error {
 // 安全审查 M-2（跟进）: 修订插入与激活与目标读取跑在同一事务——激活失败
 // 不会留下孤儿 draft（旧实现先 InsertConfigRevision 再 ActivateRevision,
 // 两步之间崩溃/失败即产生无人引用的 draft 修订）。
+//
+// 回滚目标必须同时是**可读**和**可发布**的：ParseSnapshot 保证旧快照仍读得
+// 出来（读不出来就是砖目录），validateCatalogForPublish 保证回滚不会把一个
+// 写面早已拒绝的配置重新上线（例如 legacy pool_strategy）。拒绝发生在
+// LatestRevision/InsertAndActivateRevision 之前 —— 失败的回滚既不新增
+// revision，也不移动 active 指针。
 func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string) (int, error) {
 	tx, err := s.store.BeginPublish(ctx)
 	if err != nil {
@@ -965,8 +972,28 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 	}
 	// The payload must be loadable before we publish it again — rolling
 	// forward to garbage would brick the catalog.
-	if _, err := ParseSnapshot(target); err != nil {
+	snap, err := ParseSnapshot(target)
+	if err != nil {
 		return 0, domain.WrapError(domain.CodeInvalidInput, "rollback target is not a parseable snapshot", err)
+	}
+	// …and it must be publishable: a snapshot the write path would reject
+	// (e.g. a route with an unsupported pool_strategy) must not be
+	// re-activated by a rollback — that is the same "配置看起来生效了、实际
+	// 没生效" trap, only reached through the rollback door. The read
+	// compatibility above is untouched: old snapshots stay loadable, they
+	// just cannot be republished.
+	//
+	// The refusal reason goes into the TOP-LEVEL message (not behind a cause
+	// chain): the HTTP mapper deliberately exposes only domain.Error.Message
+	// to the operator, so a generic wrapper would hide the route id, the
+	// rejected value and the replacement hint — the exact details the
+	// operator needs to fix the catalog. The validator's message is already
+	// sanitized (route id + rejected value + replacement), so it is safe to
+	// surface as-is; the generic error sanitization is not changed here.
+	models, providers, deployments, routes := snapshotEntities(snap)
+	if err := validateCatalogForPublish(models, providers, deployments, routes); err != nil {
+		return 0, domain.NewError(domain.CodeInvalidInput,
+			"rollback target is not publishable: "+routeRefusalMessage(err))
 	}
 	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
 	if err != nil {
@@ -986,6 +1013,37 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 		return 0, err
 	}
 	return rev.Revision, nil
+}
+
+// snapshotEntities flattens a parsed snapshot into the entity slices the
+// publish gate consumes. The order is deterministic — every map is walked
+// in sorted ID order and the routes keep their per-model order — so the
+// gate's verdict (and the refusal it names) never depends on map iteration
+// order.
+func snapshotEntities(snap *Snapshot) (models []domain.Model, providers []domain.Provider, deployments []domain.Deployment, routes []domain.ModelRoute) {
+	for _, id := range snap.ModelIDs() {
+		models = append(models, snap.Models[id])
+	}
+	for _, id := range sortedSnapshotKeys(snap.Providers) {
+		providers = append(providers, snap.Providers[id])
+	}
+	for _, id := range sortedSnapshotKeys(snap.Deployments) {
+		deployments = append(deployments, snap.Deployments[id])
+	}
+	for _, id := range sortedSnapshotKeys(snap.RoutesByModel) {
+		routes = append(routes, snap.RoutesByModel[id]...)
+	}
+	return models, providers, deployments, routes
+}
+
+// sortedSnapshotKeys returns the map keys in ascending ID order.
+func sortedSnapshotKeys[V any](m map[string]V) []string {
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // ListRevisionMetas returns the catalog revision history (metadata only —

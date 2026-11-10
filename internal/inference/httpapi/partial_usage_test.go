@@ -20,13 +20,17 @@ func TestV1PartialUsage_PublicFieldsMatchMetering(t *testing.T) {
 		for _, surface := range []string{"chat/completions", "messages", "responses"} {
 			for _, stream := range []bool{false, true} {
 				for _, tc := range []struct {
-					name, chat, native, public string
-					input, output              sql.NullInt64
-					charge, tokens             int64
+					name, chat, native, publicMessages, publicResponses string
+					input, output                                       sql.NullInt64
+					charge, tokens                                      int64
 				}{
-					{"input_only", `{"prompt_tokens":2}`, `{"input_tokens":2}`, `{"input_tokens":2}`,
+					{"input_only", `{"prompt_tokens":2}`, `{"input_tokens":2}`,
+						`{"input_tokens":2,"output_tokens":0}`,
+						`{"input_tokens":2,"output_tokens":0,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`,
 						sql.NullInt64{Int64: 2, Valid: true}, sql.NullInt64{}, 2, 2},
-					{"output_only", `{"completion_tokens":7}`, `{"output_tokens":7}`, `{"output_tokens":7}`,
+					{"output_only", `{"completion_tokens":7}`, `{"output_tokens":7}`,
+						`{"input_tokens":0,"output_tokens":7}`,
+						`{"input_tokens":0,"output_tokens":7,"total_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`,
 						sql.NullInt64{}, sql.NullInt64{Int64: 7, Valid: true}, 14, 7},
 				} {
 					t.Run(fmt.Sprintf("%s/%s/stream=%t/%s", proto, surface, stream, tc.name), func(t *testing.T) {
@@ -49,9 +53,17 @@ func TestV1PartialUsage_PublicFieldsMatchMetering(t *testing.T) {
 						if w.Code != http.StatusOK || f.upCalls.Load() != 1 {
 							t.Fatalf("status=%d calls=%d body=%s", w.Code, f.upCalls.Load(), w.Body.String())
 						}
-						want := tc.public
-						if surface == "chat/completions" {
+						// 公开协议的必填 usage 字段恒存在：Anthropic 面永远有
+						// input_tokens/output_tokens，Responses 面永远有
+						// input_tokens/output_tokens/total_tokens 与两个 details
+						// 对象；未知计数只在公开序列化时补零（数据库计量仍区分
+						// 未知与零，见下面 sql.NullInt64 断言）。
+						want := tc.publicMessages
+						switch surface {
+						case "chat/completions":
 							want = tc.chat
+						case "responses":
+							want = tc.publicResponses
 						}
 						var gotUsage, wantUsage map[string]any
 						if err := json.Unmarshal(partialHTTPUsage(t, w.Body.Bytes(), surface, stream), &gotUsage); err != nil {
@@ -61,7 +73,7 @@ func TestV1PartialUsage_PublicFieldsMatchMetering(t *testing.T) {
 							t.Fatal(err)
 						}
 						if !reflect.DeepEqual(gotUsage, wantUsage) {
-							t.Errorf("public usage=%v, want %v (unknown counters must be absent)", gotUsage, wantUsage)
+							t.Errorf("public usage=%v, want %v (公开协议的必填计数恒存在,未知补零)", gotUsage, wantUsage)
 						}
 						var status, usageStatus, attemptStatus, source string
 						var input, output sql.NullInt64

@@ -205,12 +205,17 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 		return nil, err
 	}
 	var accountID, policyID string
+	var storedAnchor time.Time
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT billing_account_id, policy_version_id
+		`SELECT billing_account_id, policy_version_id, anchor_at
 		 FROM inference_entitlements WHERE id=$1 FOR SHARE`,
-		cmd.EntitlementID).Scan(&accountID, &policyID); err != nil {
+		cmd.EntitlementID).Scan(&accountID, &policyID, &storedAnchor); err != nil {
 		return nil, mapError("activate windows: entitlement", err)
 	}
+	// 消费时刻同样在写库前截断到微秒（TIMESTAMPTZ 的存储精度）：与准入
+	// 服务层用同一个时刻，写入的五小时窗口起点本身即可精确表示，不依赖
+	// PostgreSQL 的舍入规则。
+	at := cmd.At.UTC().Truncate(time.Microsecond)
 	if accountID != cmd.BillingAccountID || policyID != cmd.PolicyVersionID {
 		return nil, domain.NewError(domain.CodeConflict,
 			"activate windows: entitlement account or policy changed")
@@ -232,7 +237,11 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 		if !ok {
 			continue
 		}
-		iv, activate, err := quota.ConsumptionWindow(kind, cmd.Anchor, active, cmd.At)
+		// anchor_at 取数据库里已持久化的锚点，消费时刻取上面归一后的值：
+		// 调用方内存里的锚点/时刻可能带亚微秒纳秒，按它算出的窗口起点写库
+		// 后会变成另一个值，下次准入匹配不上已激活的窗口行而重复激活
+		// → EXCLUDE 排他约束冲突。
+		iv, activate, err := quota.ConsumptionWindow(kind, storedAnchor, active, at)
 		if err != nil {
 			return nil, err
 		}
@@ -253,7 +262,7 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 		}
 		for _, a := range active {
 			if a.Kind == kind && !a.Voided &&
-				(quota.Interval{Start: a.Start.UTC(), End: a.End.UTC()}).Contains(cmd.At) {
+				(quota.Interval{Start: a.Start.UTC(), End: a.End.UTC()}).Contains(at) {
 				if a.Limit != limit {
 					var refreshed windowRow
 					if err := tx.QueryRowxContext(ctx,

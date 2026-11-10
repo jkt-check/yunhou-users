@@ -15,59 +15,79 @@ type partialUsageCase struct {
 	name, native, chat, messages, responses string
 }
 
+// partialUsageCases 的 messages/responses 列是**公开协议**的必填形状：
+// Anthropic 的 usage 永远有 input_tokens/output_tokens，Responses 的 usage
+// 永远有 input_tokens/output_tokens/total_tokens 与两个 details 对象。内部
+// 计量仍区分「未知」与「零」——未知只在公开序列化时补零（chat 列保持原样）。
 func partialUsageCases(proto domain.Protocol) []partialUsageCase {
 	switch proto {
 	case domain.ProtocolOpenAIChat:
 		return []partialUsageCase{
-			{"input_only", `{"prompt_tokens":2}`, `{"prompt_tokens":2}`, `{"input_tokens":2}`, `{"input_tokens":2}`},
-			{"output_only", `{"completion_tokens":7}`, `{"completion_tokens":7}`, `{"output_tokens":7}`, `{"output_tokens":7}`},
+			{"input_only", `{"prompt_tokens":2}`, `{"prompt_tokens":2}`, `{"input_tokens":2,"output_tokens":0}`,
+				`{"input_tokens":2,"output_tokens":0,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
+			{"output_only", `{"completion_tokens":7}`, `{"completion_tokens":7}`, `{"input_tokens":0,"output_tokens":7}`,
+				`{"input_tokens":0,"output_tokens":7,"total_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"detail_only", `{"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}`,
 				`{"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}`,
-				`{"cache_read_input_tokens":3}`, `{"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}`},
-			{"total_only", `{"total_tokens":9}`, `{"total_tokens":9}`, `{}`, `{"total_tokens":9}`},
+				`{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":3}`,
+				`{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}`},
+			{"total_only", `{"total_tokens":9}`, `{"total_tokens":9}`, `{"input_tokens":0,"output_tokens":0}`,
+				`{"input_tokens":0,"output_tokens":0,"total_tokens":9,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"explicit_zero", `{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"cache_creation_input_tokens":0,"completion_tokens_details":{"reasoning_tokens":0}}`,
 				`{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"cache_creation_input_tokens":0,"completion_tokens_details":{"reasoning_tokens":0}}`,
 				`{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
 				`{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"complete", `{"prompt_tokens":2,"completion_tokens":7}`, `{"prompt_tokens":2,"completion_tokens":7}`,
-				`{"input_tokens":2,"output_tokens":7}`, `{"input_tokens":2,"output_tokens":7,"total_tokens":9}`},
+				`{"input_tokens":2,"output_tokens":7}`,
+				`{"input_tokens":2,"output_tokens":7,"total_tokens":9,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"reported_total", `{"prompt_tokens":2,"completion_tokens":7,"total_tokens":15}`, `{"prompt_tokens":2,"completion_tokens":7,"total_tokens":15}`,
-				`{"input_tokens":2,"output_tokens":7}`, `{"input_tokens":2,"output_tokens":7,"total_tokens":15}`},
+				`{"input_tokens":2,"output_tokens":7}`,
+				`{"input_tokens":2,"output_tokens":7,"total_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 		}
 	case domain.ProtocolOpenAIResponses:
 		return []partialUsageCase{
-			{"input_only", `{"input_tokens":2}`, `{"prompt_tokens":2}`, `{"input_tokens":2}`, `{"input_tokens":2}`},
-			{"output_only", `{"output_tokens":7}`, `{"completion_tokens":7}`, `{"output_tokens":7}`, `{"output_tokens":7}`},
+			{"input_only", `{"input_tokens":2}`, `{"prompt_tokens":2}`, `{"input_tokens":2,"output_tokens":0}`,
+				`{"input_tokens":2,"output_tokens":0,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
+			{"output_only", `{"output_tokens":7}`, `{"completion_tokens":7}`, `{"input_tokens":0,"output_tokens":7}`,
+				`{"input_tokens":0,"output_tokens":7,"total_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"detail_only", `{"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}`,
 				`{"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}`,
-				`{"cache_read_input_tokens":3}`, `{"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}`},
-			{"total_only", `{"total_tokens":9}`, `{"total_tokens":9}`, `{}`, `{"total_tokens":9}`},
+				`{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":3}`,
+				`{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}`},
+			{"total_only", `{"total_tokens":9}`, `{"total_tokens":9}`, `{"input_tokens":0,"output_tokens":0}`,
+				`{"input_tokens":0,"output_tokens":0,"total_tokens":9,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"explicit_zero", `{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`,
 				`{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}`,
 				`{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0}`,
 				`{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"complete", `{"input_tokens":2,"output_tokens":7}`, `{"prompt_tokens":2,"completion_tokens":7,"total_tokens":9}`,
-				`{"input_tokens":2,"output_tokens":7}`, `{"input_tokens":2,"output_tokens":7,"total_tokens":9}`},
+				`{"input_tokens":2,"output_tokens":7}`,
+				`{"input_tokens":2,"output_tokens":7,"total_tokens":9,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"reported_total", `{"input_tokens":2,"output_tokens":7,"total_tokens":15}`, `{"prompt_tokens":2,"completion_tokens":7,"total_tokens":15}`,
-				`{"input_tokens":2,"output_tokens":7}`, `{"input_tokens":2,"output_tokens":7,"total_tokens":15}`},
+				`{"input_tokens":2,"output_tokens":7}`,
+				`{"input_tokens":2,"output_tokens":7,"total_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 		}
 	default:
 		return []partialUsageCase{
-			{"input_only", `{"input_tokens":2}`, `{"prompt_tokens":2}`, `{"input_tokens":2}`, `{"input_tokens":2}`},
-			{"output_only", `{"output_tokens":7}`, `{"completion_tokens":7}`, `{"output_tokens":7}`, `{"output_tokens":7}`},
+			{"input_only", `{"input_tokens":2}`, `{"prompt_tokens":2}`, `{"input_tokens":2,"output_tokens":0}`,
+				`{"input_tokens":2,"output_tokens":0,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
+			{"output_only", `{"output_tokens":7}`, `{"completion_tokens":7}`, `{"input_tokens":0,"output_tokens":7}`,
+				`{"input_tokens":0,"output_tokens":7,"total_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"detail_only", `{"cache_read_input_tokens":3,"cache_creation_input_tokens":5}`,
 				`{"prompt_tokens_details":{"cached_tokens":3},"cache_creation_input_tokens":5}`,
-				`{"cache_read_input_tokens":3,"cache_creation_input_tokens":5}`, `{"input_tokens_details":{"cached_tokens":3}}`},
+				`{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":3,"cache_creation_input_tokens":5}`,
+				`{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"explicit_zero", `{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
 				`{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"cache_creation_input_tokens":0}`,
 				`{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
-				`{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0}}`},
+				`{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"complete", `{"input_tokens":2,"output_tokens":7}`, `{"prompt_tokens":2,"completion_tokens":7,"total_tokens":9}`,
-				`{"input_tokens":2,"output_tokens":7}`, `{"input_tokens":2,"output_tokens":7,"total_tokens":9}`},
+				`{"input_tokens":2,"output_tokens":7}`,
+				`{"input_tokens":2,"output_tokens":7,"total_tokens":9,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`},
 			{"complete_cache", `{"input_tokens":2,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":5}`,
 				`{"prompt_tokens":2,"completion_tokens":7,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":3},"cache_creation_input_tokens":5}`,
 				`{"input_tokens":2,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":5}`,
-				`{"input_tokens":10,"output_tokens":7,"total_tokens":17,"input_tokens_details":{"cached_tokens":3}}`},
+				`{"input_tokens":10,"output_tokens":7,"total_tokens":17,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":0}}`},
 		}
 	}
 }
@@ -183,15 +203,17 @@ func TestPartialUsage_ArithmeticDoesNotInventCounters(t *testing.T) {
 		inclusive                        bool
 	}{
 		{"total_overflow", `{"prompt_tokens":9223372036854775807,"completion_tokens":1}`,
-			`{"input_tokens":9223372036854775807,"output_tokens":1}`, `{"input_tokens":9223372036854775807,"output_tokens":1}`, true},
+			`{"input_tokens":9223372036854775807,"output_tokens":1}`,
+			`{"input_tokens":9223372036854775807,"output_tokens":1,"total_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`, true},
 		{"cache_add_overflow", `{"prompt_tokens":9223372036854775807,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":1}}`,
 			`{"input_tokens":9223372036854775807,"output_tokens":1,"cache_read_input_tokens":1}`,
-			`{"output_tokens":1,"input_tokens_details":{"cached_tokens":1}}`, false},
+			`{"input_tokens":0,"output_tokens":1,"total_tokens":1,"input_tokens_details":{"cached_tokens":1},"output_tokens_details":{"reasoning_tokens":0}}`, false},
 		{"cache_sub_underflow", `{"prompt_tokens":2,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":3}}`,
-			`{"output_tokens":7,"cache_read_input_tokens":3}`,
-			`{"input_tokens":2,"output_tokens":7,"total_tokens":9,"input_tokens_details":{"cached_tokens":3}}`, true},
+			`{"input_tokens":0,"output_tokens":7,"cache_read_input_tokens":3}`,
+			`{"input_tokens":2,"output_tokens":7,"total_tokens":9,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":0}}`, true},
 		{"cache_creation_only", `{"completion_tokens":7,"cache_creation_input_tokens":5}`,
-			`{"output_tokens":7,"cache_creation_input_tokens":5}`, `{"output_tokens":7}`, false},
+			`{"input_tokens":0,"output_tokens":7,"cache_creation_input_tokens":5}`,
+			`{"input_tokens":0,"output_tokens":7,"total_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			payload := []byte(`{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":` + tc.usage + `}`)

@@ -96,9 +96,12 @@ type ActivateWindowsCommand struct {
 	BillingAccountID string
 	EntitlementID    string
 	PolicyVersionID  string
-	Anchor           time.Time
-	At               time.Time
-	Limits           map[domain.WindowKind]domain.Microcredit
+	// Anchor is kept for command compatibility only: the PostgreSQL store
+	// treats the locked persisted anchor_at as authoritative, so the
+	// in-memory anchor never drives the window start.
+	Anchor time.Time
+	At     time.Time
+	Limits map[domain.WindowKind]domain.Microcredit
 }
 
 // AdmitCommand is one logical call entering the quota gate. The caller
@@ -268,6 +271,12 @@ func (s *Service) Admit(ctx context.Context, cmd AdmitCommand) (*AdmissionResult
 		if at.IsZero() {
 			at = s.clock.Now()
 		}
+		// 归一到持久化精度：PostgreSQL 的 TIMESTAMPTZ 只存微秒，准入
+		// 链路上的每一层（窗口解析、纯规则评估、写库）必须共享同一个
+		// 时刻，否则窗口起点与判定用的时刻差开不到 1µs，已激活的窗口行
+		// 匹配不上（重复激活 → 排他约束冲突）。截断在写库前完成：写入的
+		// 五小时窗口起点本身即可精确表示，不依赖数据库如何舍入。
+		at = at.UTC().Truncate(time.Microsecond)
 		res, err := s.admitOnce(ctx, cmd, at, hold, inputBound, outputCap, limits)
 		if err == nil {
 			return res, nil

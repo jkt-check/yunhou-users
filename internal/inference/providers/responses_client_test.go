@@ -76,11 +76,59 @@ func TestResponsesReplay_ParallelToolGroupingPreservesText(t *testing.T) {
 	}
 }
 
+// 连续 assistant message item 必须各自保留成独立 Chat 轮次：普通文本轮绝不
+// 无分隔拼成 "HelloWorld"（两个轮次被合并后语义就丢了）。只有 function_call
+// 才并入前一个 assistant 轮（Chat 的 tool_calls 挂在同一条 assistant 上）。
+func TestResponsesReplay_PreservesAssistantTurns(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"two_texts", `[{"role":"assistant","content":"Hello"},{"role":"assistant","content":"World"}]`,
+			[]string{"Hello", "World"}},
+		{"empty_turn", `[{"role":"assistant","content":"Hello"},{"role":"assistant","content":""}]`,
+			[]string{"Hello", ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var items []json.RawMessage
+			if err := json.Unmarshal([]byte(tc.input), &items); err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseResponsesRequest([]byte(`{"model":"m","input":` + tc.input + `}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			replayed, err := ResponsesReplayToChat(items)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, msgs := range [][]model.ChatMessage{parsed.Request.Messages, replayed} {
+				if len(msgs) != len(tc.want) {
+					t.Fatalf("messages = %+v, want %d separate assistant turns", msgs, len(tc.want))
+				}
+				for i, want := range tc.want {
+					if msgs[i].Role != "assistant" || msgs[i].Content != want {
+						t.Fatalf("message[%d] = %+v, want assistant %q", i, msgs[i], want)
+					}
+					if len(msgs[i].ToolCalls) != 0 {
+						t.Fatalf("message[%d] tool calls = %+v, want none", i, msgs[i].ToolCalls)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestResponsesReplay_RejectsTextAfterUnresolvedCall(t *testing.T) {
 	for _, middle := range []string{
 		`{"role":"assistant","content":"after"}`,
 		`{"role":"assistant","content":[{"type":"output_text","text":"between"}]},
 		 {"type":"function_call","call_id":"b","name":"lookup","arguments":"{}"}`,
+		// 空 assistant 轮不得绕过「未决调用之后不得有文本」的拒绝：调用仍未
+		// 解决时，后续的 assistant 文本同样无法保序。
+		`{"role":"assistant","content":""},
+		 {"role":"assistant","content":"after"}`,
 	} {
 		input := `[{"role":"user","content":"q"},
 		 {"role":"assistant","content":"before"},

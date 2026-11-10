@@ -224,6 +224,32 @@ func TestAdmitHappyPath(t *testing.T) {
 	}
 }
 
+// TestAdmitAlignsAdmissionTimeToPersistencePrecision: 准入时刻必须归一到
+// 持久化精度 —— PostgreSQL 的 TIMESTAMPTZ 只存微秒，准入链路上的每一层
+// （窗口解析、纯规则评估、写库）必须共享同一个时刻。调用方钉的
+// cmd.At 或服务时钟带着亚微秒纳秒时，不归一就会让窗口起点与判定用的
+// 时刻差开不到 1µs：已激活的窗口行匹配不上（重复激活 → 23P01）。
+func TestAdmitAlignsAdmissionTimeToPersistencePrecision(t *testing.T) {
+	svc, fs, cmd := serviceFixture(t)
+	svc.clock = domain.FixedClock{T: time.Date(2026, 9, 8, 4, 0, 0, 789, time.UTC)}
+	want := time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC)
+	res, err := svc.Admit(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.AdmittedAt.Equal(want) {
+		t.Errorf("admitted_at = %s, want %s (persistence precision)",
+			res.AdmittedAt.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+	if len(fs.reserveCmds) != 1 {
+		t.Fatalf("reserve calls = %d, want 1", len(fs.reserveCmds))
+	}
+	if got := fs.reserveCmds[0].AdmittedAt; !got.Equal(want) {
+		t.Errorf("persisted admitted_at = %s, want %s",
+			got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
 func TestAdmitTakesAccountLeaseWhenPolicyCapsConcurrency(t *testing.T) {
 	svc, fs, cmd := serviceFixture(t)
 	conc := 2

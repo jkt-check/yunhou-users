@@ -34,6 +34,26 @@
   `POST /admin/catalog/publish` 发布。停用上游（status=disabled）不删除历史
   路由/尝试记录；有路由或历史尝试的部署不可 DELETE。
 
+## 目录回滚（POST /admin/catalog/rollback）
+
+`{"to_revision":N,"reason":"…"}`（reason 必填，进审计）。
+
+- **回滚不改历史**：发布一个**新** revision（编号 = 当前最新 + 1），内容取自
+  目标旧 revision；旧 revision 原样保留（它是计费与审计的事实来源）。
+- **只有当前发布闸通过才发布**：目标必须在**今天的**校验口径下仍然可发布，
+  否则拒绝 —— 拒绝发生在写入之前。
+- **已知但未实现的旧路由读得到、激活不了**：`least_loaded` 与通用
+  `session_sticky` 属于「认识但不支持」的 pool_strategy：旧快照仍可读（读不
+  出来 = 整个目录变砖），但**不能**被回滚重新激活 —— 否则就成了「配置看起来
+  生效了、实际没生效」。
+- **400 点名路由与替代**：拒绝信息带路由 id、被拒值与受支持的替代
+  （如 `route <id> is not publishable: pool_strategy least_loaded is not
+  supported: only round_robin is implemented — set pool_strategy to
+  round_robin`），一步就能改对。
+- **拒绝不落任何 revision**：既不新增 revision 也不动 active 指针 —— 当前
+  生效版本保持不变。
+- **正确做法**：改草稿再发布（`POST /admin/catalog/publish`），不要改写历史。
+
 ## 一账号一部署（显式运营约束）
 
 **一个上游账号只挂一个部署。** 两部署共享同一上游账号时，故障切换会撞并发

@@ -1,7 +1,9 @@
 package catalog_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -151,5 +153,115 @@ func TestPublish_SupportedPoolStrategyStillPublishes(t *testing.T) {
 	}
 	if rev <= 0 {
 		t.Errorf("revision = %d, want > 0", rev)
+	}
+}
+
+// TestRollbackRejectsLegacyPoolStrategyWithoutActivatingRevision: 回滚目标
+// 必须先过发布闸 —— 旧快照（legacy pool_strategy）仍然**可读**，但已经
+// 不可发布：把它回滚成 active 版本等于把一个「配了却跑不起来」的路由重新
+// 上线。失败的回滚必须原子：既不新增 revision，也不改动 active 指针。
+func TestRollbackRejectsLegacyPoolStrategyWithoutActivatingRevision(t *testing.T) {
+	_, _, svc := testDB(t)
+	ctx := context.Background()
+	seedProviderModelDeployment(t, svc, "glm-4.6")
+
+	if _, err := svc.Publish(ctx, "op-1"); err != nil {
+		t.Fatalf("publish revision 1: %v", err)
+	}
+
+	// 历史快照：把 revision 1 的路由策略换成不受支持的 least_loaded。它必须
+	// 仍可读（旧快照可读 ≠ 旧快照可发布）。
+	target, err := svc.Store().GetRevision(ctx, domain.ScopeCatalog, 1)
+	if err != nil {
+		t.Fatalf("get revision 1: %v", err)
+	}
+	// payload 存的是 JSONB：PostgreSQL 会重新序列化（键序与空格归一化），
+	// 所以这里按**值**匹配策略，而不是按字节匹配某个紧凑写法。
+	if n := bytes.Count(target.Payload.Raw, []byte(`"`+string(domain.PoolRoundRobin)+`"`)); n != 1 {
+		t.Fatalf("legacy fixture: %d %q strategies in the payload, want exactly 1",
+			n, domain.PoolRoundRobin)
+	}
+	raw := bytes.Replace(target.Payload.Raw,
+		[]byte(`"`+string(domain.PoolRoundRobin)+`"`),
+		[]byte(`"`+string(domain.PoolLeastLoaded)+`"`), 1)
+	if bytes.Equal(raw, target.Payload.Raw) {
+		t.Fatal("legacy fixture did not change route strategy")
+	}
+	legacy := &domain.ConfigRevision{Scope: domain.ScopeCatalog, Revision: 2,
+		Status:  domain.RevisionPublished,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: raw}, CreatedBy: "legacy"}
+	if err := svc.Store().InsertConfigRevision(ctx, legacy); err != nil {
+		t.Fatalf("insert legacy revision: %v", err)
+	}
+	if err := svc.Store().ActivateRevision(ctx, domain.ScopeCatalog, 2); err != nil {
+		t.Fatalf("activate legacy revision: %v", err)
+	}
+
+	// 旧快照必须仍可读（读不出来就是砖目录）—— 这一条不因回滚闸而改变。
+	legacySnap, err := catalog.ParseSnapshot(legacy)
+	if err != nil {
+		t.Fatalf("the legacy snapshot must stay parseable: %v", err)
+	}
+	routes := legacySnap.RoutesByModel["glm-4.6"]
+	if len(routes) != 1 {
+		t.Fatalf("legacy routes = %+v, want exactly one", routes)
+	}
+	legacyRouteID := routes[0].ID
+
+	// 回滚到这份旧快照：发布闸必须拒绝。
+	_, err = svc.Rollback(ctx, 2, "operator")
+	if err == nil {
+		t.Fatal("rollback to a legacy pool strategy must be refused")
+	}
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Fatalf("rollback error = %v, want invalid_input", err)
+	}
+	// 操作人员能看到的只有 domain.Error.Message（HTTP 层刻意不输出 cause
+	// 链）：可执行的细节必须在这条消息里 —— 点名对象 ID、legacy 策略与替代
+	// 配置，否则运营只看到「不可发布」却不知道该改哪里。
+	var de *domain.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("rollback error = %v, want a *domain.Error", err)
+	}
+	for _, want := range []string{"rollback target is not publishable", legacyRouteID,
+		string(domain.PoolLeastLoaded), string(domain.PoolRoundRobin)} {
+		if !strings.Contains(de.Message, want) {
+			t.Errorf("rollback message must name %q: %v", want, de.Message)
+		}
+	}
+
+	// 失败的回滚是原子的：没有新 revision，active 指针也没有移动。
+	latest, err := svc.Store().LatestRevision(ctx, domain.ScopeCatalog)
+	if err != nil {
+		t.Fatalf("latest revision: %v", err)
+	}
+	if latest != 2 {
+		t.Errorf("latest revision = %d, want 2 (a refused rollback must not add a revision)", latest)
+	}
+	history, err := svc.ListRevisionMetas(ctx, 0, 100)
+	if err != nil {
+		t.Fatalf("list revision metas: %v", err)
+	}
+	if len(history) != 2 {
+		t.Errorf("revision history = %d rows, want 2 (a refused rollback must not leave an orphan revision behind)", len(history))
+	}
+	active, err := svc.Store().ActiveRevision(ctx, domain.ScopeCatalog)
+	if err != nil {
+		t.Fatalf("active revision: %v", err)
+	}
+	if active.Revision != 2 {
+		t.Errorf("active revision = %d, want 2 (a refused rollback must not move the active pointer)", active.Revision)
+	}
+
+	// 旧快照仍可读，但那条 legacy 路由不可调度。
+	snap, err := svc.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("the legacy snapshot must stay loadable: %v", err)
+	}
+	if snap.Revision != 2 {
+		t.Errorf("snapshot revision = %d, want 2", snap.Revision)
+	}
+	if got := snap.ActiveDeployments("glm-4.6"); len(got) != 0 {
+		t.Errorf("ActiveDeployments = %+v, want 0 (the legacy route must not be dispatchable)", got)
 	}
 }

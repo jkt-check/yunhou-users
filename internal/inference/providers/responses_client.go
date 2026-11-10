@@ -291,19 +291,22 @@ type responsesItemView struct {
 // responsesItemsToChat converts canonical Responses items into internal chat
 // messages. function_call.call_id is preserved VERBATIM as the chat
 // tool_call id (多轮工具调用 ID 保留).
+//
+// 轮次边界（评审修复）：message item 永远自成一条 ChatMessage —— 连续的
+// assistant 文本轮不得无分隔拼成一条（"Hello"+"World" → "HelloWorld" 会
+// 丢掉轮次边界）。只有 function_call 需要并入前一个 assistant 轮（Chat 的
+// tool_calls 挂在同一条 assistant 消息上），否则新建 assistant 轮。
+//
+// 未决调用（评审修复）：一次 function_call 在对应的 function_call_output
+// 之前一直「未决」—— Chat 的 content 永远排在 tool_calls 之前，未决调用
+// 之后的 assistant 文本无法保序，必须拒绝；空的 assistant 轮不成其为文本，
+// 也不能把未决状态清掉（否则空轮就成了绕道）。
 func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) {
 	var out []model.ChatMessage
-	// Text before calls and consecutive parallel calls fit one Chat turn.
-	// Text after a call does not: Chat content precedes every tool_call.
-	appendMessage := func(m model.ChatMessage) {
-		if m.Role == "assistant" && len(out) > 0 && out[len(out)-1].Role == "assistant" {
-			last := &out[len(out)-1]
-			last.Content += m.Content
-			last.ToolCalls = append(last.ToolCalls, m.ToolCalls...)
-			return
-		}
-		out = append(out, m)
-	}
+	// Chat 的 tool_calls 挂在 assistant 消息上：调用前的文本与连续的并行调用
+	// 归入同一个 assistant 轮；调用之后的文本无法保序（Chat 的 content 永远
+	// 排在 tool_calls 之前），只能拒绝。
+	toolCallPending := false
 	for _, raw := range items {
 		var it responsesItemView
 		if err := json.Unmarshal(raw, &it); err != nil {
@@ -324,14 +327,21 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			if err != nil {
 				return nil, err
 			}
-			if role == "assistant" && text != "" && len(out) > 0 {
-				last := out[len(out)-1]
-				if last.Role == "assistant" && len(last.ToolCalls) > 0 {
-					return nil, invalidMsg("input",
-						"assistant text after function_call cannot preserve item order in a Chat turn; send tool outputs before the next assistant message")
+			switch role {
+			case "assistant":
+				if text != "" {
+					if toolCallPending {
+						return nil, invalidMsg("input",
+							"assistant text after function_call cannot preserve item order in a Chat turn; send tool outputs before the next assistant message")
+					}
+					toolCallPending = false
 				}
+				// 空 assistant 轮自成一条 ChatMessage，但**不**清掉未决标记。
+			default:
+				// user / system 消息终结未决调用。
+				toolCallPending = false
 			}
-			appendMessage(model.ChatMessage{Role: role, Content: text})
+			out = append(out, model.ChatMessage{Role: role, Content: text})
 		case "function_call":
 			if it.CallID == "" || it.Name == "" {
 				return nil, invalidMsg("input", "function_call items require call_id and name")
@@ -339,13 +349,16 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			if !json.Valid([]byte(it.Arguments)) {
 				return nil, invalidMsg("input", "function_call arguments must be a JSON-encoded value")
 			}
-			appendMessage(model.ChatMessage{
-				Role: "assistant",
-				ToolCalls: []model.ToolCall{{
-					ID: it.CallID, Type: "function",
-					Function: model.ToolCallFunction{Name: it.Name, Arguments: it.Arguments},
-				}},
-			})
+			call := model.ToolCall{
+				ID: it.CallID, Type: "function",
+				Function: model.ToolCallFunction{Name: it.Name, Arguments: it.Arguments},
+			}
+			if len(out) > 0 && out[len(out)-1].Role == "assistant" {
+				out[len(out)-1].ToolCalls = append(out[len(out)-1].ToolCalls, call)
+			} else {
+				out = append(out, model.ChatMessage{Role: "assistant", ToolCalls: []model.ToolCall{call}})
+			}
+			toolCallPending = true
 		case "function_call_output":
 			if it.CallID == "" {
 				return nil, invalidMsg("input", "function_call_output items require call_id")
@@ -355,6 +368,7 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 				return nil, err
 			}
 			out = append(out, model.ChatMessage{Role: "tool", ToolCallID: it.CallID, Content: text})
+			toolCallPending = false
 		case "reasoning":
 			// T8: 推理项**无法忠实回放**（本网关不实现 OpenAI 的加密推理
 			// 存储：`include` 里的 reasoning.encrypted_content 早已被拒绝，
@@ -521,11 +535,17 @@ func responsesToolChoiceToOpenAI(raw json.RawMessage) (json.RawMessage, error) {
 // counts input_tokens INCLUDING cache reads and creation — the opposite of
 // the Anthropic surface — so cacheReadInInput==false (Anthropic-origin wire)
 // adds both cache buckets back into input.
+//
+// input_tokens/output_tokens/total_tokens 与两个 details 对象都是 Responses
+// usage 的**必填**字段：未知计数在此补零（已报值、显式零、已知 detail 值
+// 原样保留）。total 优先用上游已报的值；没有可用上报值时由两个计数相加
+// 推导（推导失败/溢出则落回零）。
 func ResponsesUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 	if u == nil {
 		return nil
 	}
 	input := u.PromptTokens
+	output := u.CompletionTokens
 	var cached, reasoning *int64
 	if u.PromptDetails != nil {
 		cached = u.PromptDetails.CachedTokens
@@ -538,26 +558,19 @@ func ResponsesUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 		input = addUsageDetails(input, cached, u.CacheCreationTokens)
 		total = nil // The wire total excludes Anthropic cache buckets.
 	}
-	usage := map[string]any{}
-	if input != nil {
-		usage["input_tokens"] = *input
-	}
-	if u.CompletionTokens != nil {
-		usage["output_tokens"] = *u.CompletionTokens
-	}
-	if cached != nil {
-		usage["input_tokens_details"] = map[string]any{"cached_tokens": *cached}
-	}
-	if reasoning != nil {
-		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": *reasoning}
-	}
 	if total == nil {
-		total = derivedUsageTotal(input, u.CompletionTokens)
+		// 必填计数归零后两个操作数都是已知数字 → total 可由两者相加得出；
+		// 溢出/非法时推导失败 → 落回零。
+		wireInput, wireOutput := usageCounter(input), usageCounter(output)
+		total = addUsageDetails(&wireInput, &wireOutput)
 	}
-	if total != nil {
-		usage["total_tokens"] = *total
+	return map[string]any{
+		"input_tokens":          usageCounter(input),
+		"output_tokens":         usageCounter(output),
+		"total_tokens":          usageCounter(total),
+		"input_tokens_details":  map[string]any{"cached_tokens": usageCounter(cached)},
+		"output_tokens_details": map[string]any{"reasoning_tokens": usageCounter(reasoning)},
 	}
-	return usage
 }
 
 // outputToolCall is one completed function call for output assembly.

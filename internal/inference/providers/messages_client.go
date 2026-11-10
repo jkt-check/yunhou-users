@@ -550,9 +550,23 @@ func AnthropicMessageFromCompletion(payload []byte, publicModel string, cacheRea
 	return json.Marshal(out)
 }
 
+// usageCounter renders one possibly-unknown counter for a PUBLIC protocol
+// field. The Messages/Responses usage objects declare these counters as
+// required, so an unknown counter is emitted as 0 on the wire; the internal
+// representation keeps unknown ≠ 0 (计量口径不变 —— 见 usage_wire.go).
+func usageCounter(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
 // anthropicUsageShape maps the wire usage onto the Messages usage object:
 // input_tokens EXCLUDES cache reads (subtracted only when the wire included
 // them); output_tokens includes thinking (Anthropic 口径).
+//
+// input_tokens/output_tokens 是 Anthropic usage 的**必填**字段：未知计数在此
+// 补零。可选的 cache 字段未知时仍然省略（未知 ≠ 0）。
 func anthropicUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 	input := u.PromptTokens
 	var cached *int64
@@ -567,12 +581,9 @@ func anthropicUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 			input = &exclusive
 		}
 	}
-	usage := map[string]any{}
-	if input != nil {
-		usage["input_tokens"] = *input
-	}
-	if u.CompletionTokens != nil {
-		usage["output_tokens"] = *u.CompletionTokens
+	usage := map[string]any{
+		"input_tokens":  usageCounter(input),
+		"output_tokens": usageCounter(u.CompletionTokens),
 	}
 	if cached != nil {
 		usage["cache_read_input_tokens"] = *cached

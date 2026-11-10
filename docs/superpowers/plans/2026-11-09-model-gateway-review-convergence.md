@@ -1204,6 +1204,47 @@ Both independent disposable databases applied all 55 migrations and skipped
 full gate. See runbook 4.88 for the four-file checkpoint and remaining scope.
 This is the user's local commit checkpoint, not a whole-branch clean review.
 
+## Task 29: Retain Chat Refusal Metering Without Empty Native Success
+
+**Files:** `providers/openai_chat.go`, `providers/stream_usage.go`,
+`providers/adapter.go`, `providers/client_surface.go`,
+`providers/messages_client.go`, `providers/responses_client.go`,
+`gateway/service.go`, provider and authenticated HTTP refusal regressions,
+API guide, OpenAPI, operations/verification runbooks and this plan.
+
+**Interfaces:** carry the caller protocol from gateway admission through
+`providers.Call.ClientProtocol`. Preserve raw Chat payloads; use the existing
+nonnil metering result plus error contract for native nonstream rejection.
+Track refusal independently from upstream failure: only complete, otherwise
+successful refused streams may retain `RejectedComplete` for estimation.
+
+- [x] Reproduce 13-byte Chat refusal and mixed 24-byte generated output being
+  undercounted, and Messages/Responses serving empty nonstream/stream success.
+- [ ] Cover present-empty refusal, omitted/null controls, fragmented reads,
+  reported/absent usage, late usage, DONE, EOF and actual error after refusal.
+- [ ] Meter refusal text, reject native conversion before settlement, suppress
+  native success/persistence and drain late evidence without replaying.
+- [ ] Verify one attempt/usage/charge and correct TPM; release all held leases.
+  Bare EOF without usage must retain four monetary holds and reconciliation.
+- [ ] Run provider/HTTP RED then GREEN, all providers race, bounded delta review,
+  fresh build/vet/full race coverage and separate E2E on owned databases.
+- [ ] Document exact evidence, limitations and remaining scope; commit locally.
+
+Ruling: extend Task 24's existing rejection boundary to Chat refusal rather
+than broaden the internal Chat transcript/schema. Absent/null refusal is not
+a refusal; a present empty string still is. Raw Chat remains byte passthrough.
+Cost: native callers receive an explicit translation error for this output,
+but incurred consumption remains metered and is never silently released.
+
+Local test checkpoint (2026-11-10): no production fix is included yet.
+`GOMAXPROCS=2 GOPROXY=off GOFLAGS=-mod=readonly go test -race -count=1 -p 1 -json -run '^TestChatRefusal_' ./internal/inference/providers`
+exited 1, reproducing all three test groups: 24 subtests failed and 10 passed.
+Failures confirm missing refusal bytes, native empty success and content
+emitted after refusal. Evidence is retained locally in
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/chat-refusal-commit-red.jsonl`.
+Formatting and diff whitespace checks passed. No database was used, and full
+race coverage and E2E were not rerun for this RED-only checkpoint.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

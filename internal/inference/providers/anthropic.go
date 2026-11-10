@@ -203,9 +203,9 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 		// 收）。预算下调到 cap 之内；Anthropic 要求 budget_tokens >= 1024 且
 		// 严格小于 max_tokens，cap 容不下合法预算时显式 400（能力错误，客
 		// 户提高 max_tokens 或关闭 thinking）。
-		if maxTokens <= anthropicMinThinkingBudget+1 {
+		if maxTokens <= anthropicMinThinkingBudget {
 			return nil, domain.NewError(domain.CodeInvalidInput,
-				fmt.Sprintf("providers: anthropic thinking requires max_tokens > %d (budget floor %d); raise max_tokens or disable thinking", anthropicMinThinkingBudget+1, anthropicMinThinkingBudget))
+				fmt.Sprintf("providers: anthropic thinking requires max_tokens > %d (budget floor %d); raise max_tokens or disable thinking", anthropicMinThinkingBudget, anthropicMinThinkingBudget))
 		}
 		if budget > maxTokens-1 {
 			budget = maxTokens - 1

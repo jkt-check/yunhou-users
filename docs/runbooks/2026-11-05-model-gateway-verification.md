@@ -7494,6 +7494,71 @@ No real-provider/client or cross-host acceptance is claimed. The until-clean
 review remains open. No push, merge, deployment, adjacent-repository source
 edit or kaya process operation is included.
 
+### 4.88 Task 28: Accept the Minimum Anthropic Thinking Cap
+
+**Scope:** repair the existing thinking-budget boundary without increasing
+the admitted output cap or changing pricing, accounting, routing or
+reasoning modes. `max_tokens=1025` can contain the minimum thinking budget
+1024 strictly below it. The former guard unnecessarily rejected that cap.
+
+**Checkpoint files:**
+
+- `internal/inference/providers/anthropic.go` rejects enabled thinking
+  only when the output cap is at most 1024 and updates the diagnostic.
+  Existing budget clamping still keeps the budget strictly below the cap.
+- `docs/runbooks/kaya-coding-plan-operations.md` documents the minimum
+  legal combination, lower-cap rejection and disabled-thinking boundary.
+- The convergence plan and this runbook record verification, the separate
+  regression-test commit and remaining review scope.
+
+The regression tests are already committed at `928935a`, not new in this
+checkpoint. They cover explicit budget 1024, default and oversized budgets
+clamped to 1024 at cap 1025; rejection at caps 1023/1024; disabled thinking
+at cap 1024; and the invariant that no upstream cap exceeds admission.
+Fresh focused race reproduced the valid-boundary failures before the fix
+(exit 1, 0.753s), then passed after it (1.629s). Complete providers race
+also passed (2.345s). The final full gate independently passed all nine
+thinking test/subtest events, including the three minimum-cap variants.
+
+**Full verification:** fresh `run.O8uL4k` exited 0 on 2026-11-10.
+`go build ./...` and `go vet ./internal/... ./cmd/...` passed.
+
+```bash
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...
+```
+
+The full race run passed 5,033 tests/subtests across 34 packages, with
+zero failures. Total statement coverage was 80.8%, above the 80% floor.
+Only `TestQuotaWorkerProcess` (child entry), `TestLoadDrill_Throughput`
+and `TestLoadDrill_LongConnections` (opt-in drills) skipped.
+Separate E2E race passed 186 tests/subtests in 146.160s, zero failures;
+only the opt-in `TestUsageTokenAcceptance_TenPagesTwoMinutes` skipped.
+No database acceptance was skipped.
+
+The runner used a new owned PostgreSQL cluster with independent application
+and E2E databases, explicit DSNs, `GOMAXPROCS=2`, `GOPROXY=off`,
+`GOFLAGS=-mod=readonly` and serial package execution. Both databases
+applied all 55 migrations and skipped all 55 on rerun. Cleanup confirmed
+the owned PostgreSQL stopped and `data/postmaster.pid` is absent.
+Go sources and tests were unchanged throughout the full gate.
+
+Evidence is retained under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.O8uL4k/`:
+`build.log`, `vet.log`, `tests.jsonl`, `coverage.out`,
+`coverage-summary.log`, `e2e.jsonl`, both migration logs and `cleanup.log`.
+
+**Remaining boundaries:** no real Anthropic/provider/client acceptance is
+claimed. The recorded Chat-refusal translation, incomplete tool arguments,
+incomplete Responses and partial public usage findings remain open.
+Original wallet settlement correction, the production evidence-to-correction
+caller and already-resolved overage re-enqueue policy remain unfinished.
+This local checkpoint is not a whole-branch clean-review or release claim.
+No push, merge, deployment, adjacent-source edit or kaya process operation
+is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

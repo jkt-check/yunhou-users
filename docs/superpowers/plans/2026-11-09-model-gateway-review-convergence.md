@@ -1168,24 +1168,41 @@ verification and operations runbooks.
 **Interfaces:** `AnthropicMessages.BuildPayload(*Call) ([]byte, error)`
 retains the admitted output cap and clamps the thinking budget below it.
 
-- [ ] Correct the regression's mistaken rejection of output cap 1025.
+- [x] Correct the regression's mistaken rejection of output cap 1025.
   Cover explicit budget 1024, default budget clamped to 1024, and an
   oversized budget clamped to 1024. Cover caps 1023/1024 rejecting thinking,
   while disabled thinking remains legal at cap 1024.
-- [ ] Run `go test -race -count=1 -p 1 ./internal/inference/providers
+- [x] Run `go test -race -count=1 -p 1 ./internal/inference/providers
   -run '^TestAnthropicPayload_Thinking'`. Expected RED: the three valid
   cap-1025 cases reject before dispatch.
-- [ ] Reject enabled thinking only when the cap cannot contain the
+- [x] Reject enabled thinking only when the cap cannot contain the
   documented minimum 1024 budget strictly below it; do not raise the cap.
-- [ ] Repeat the focused race command and full providers race suite.
+- [x] Repeat the focused race command and full providers race suite.
   Expected GREEN: minimum valid payload has max_tokens 1025 and budget 1024.
-- [ ] Run fresh build/vet/full race/coverage/E2E with independent owned
+- [x] Run fresh build/vet/full race/coverage/E2E with independent owned
   disposable databases, record evidence and remaining findings, and commit
   locally as `fix(inference): accept minimum Anthropic thinking cap`.
 
 Ruling: this is an off-by-one repair under the existing output-cap and
 budget-clamping contract, not a new reasoning mode or pricing policy.
 Other provider findings and wallet correction remain open.
+
+Regression tests were committed separately at `928935a`. Fresh focused
+race reproduced rejection of all three valid minimum-cap cases before
+the production change (exit 1, 0.753s), then passed after the guard and
+diagnostic were corrected (1.629s). The full providers race suite passed
+(2.345s). Neither the admitted output cap nor budget-clamping logic changed.
+
+Fresh full gate `run.O8uL4k` exited 0 on 2026-11-10: build/vet passed;
+full race passed 5,033 tests/subtests across 34 packages, zero failures,
+with 80.8% total statement coverage. Separate E2E race passed 186
+tests/subtests in 146.160s, zero failures. Only the expected child entry
+and opt-in load/usage drills skipped; no database acceptance skipped.
+Both independent disposable databases applied all 55 migrations and skipped
+55 on rerun. Cleanup confirmed the owned PostgreSQL stopped and its
+`postmaster.pid` is absent. Go sources/tests remained frozen during the
+full gate. See runbook 4.88 for the four-file checkpoint and remaining scope.
+This is the user's local commit checkpoint, not a whole-branch clean review.
 
 ## Pending Review Findings (2026-11-10)
 
@@ -1211,7 +1228,8 @@ not waived scope:
   incomplete responses without a reason become completed; partial public
   usage fabricates missing zero/total fields; Anthropic thinking rejects the
   valid 1025-output/1024-budget boundary. The reviewer reproduced these in
-  owned temporary provider overlays; checkout regressions and fixes remain open.
+  owned temporary provider overlays. The thinking boundary is now reproduced,
+  fixed and verified in Task 28; the first four findings remain open.
 - Boole's finding of late real finalizer evidence lost on terminal conflict
   is reproduced, fixed and verified in Task 27 with focused RED/GREEN,
   complete gateway/PostgreSQL race, bounded review and a fresh full gate.

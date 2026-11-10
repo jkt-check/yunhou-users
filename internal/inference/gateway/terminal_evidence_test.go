@@ -196,6 +196,8 @@ func TestGateway_TerminalEvidenceRetainsNullableAndMalformedUsage(t *testing.T) 
 	}{
 		{"absent", nil, false},
 		{"malformed", json.RawMessage(`{"schema_version":1,"usage":`), false},
+		{"duplicate_keys", json.RawMessage(`{"schema_version":1,"usage":{"value":1,"value":2}}`), false},
+		{"duplicate_escaped_keys", json.RawMessage(`{"schema_version":1,"usage":{"a":1,"\u0061":2}}`), false},
 		{"nul_escape", json.RawMessage(`{"schema_version":1,"usage":{"value":"\u0000"}}`), false},
 		{"numeric_overflow", json.RawMessage(`{"schema_version":1,"usage":{"value":1e1000000}}`), false},
 		{"lone_surrogate", json.RawMessage(`{"schema_version":1,"usage":{"value":"\ud800"}}`), false},

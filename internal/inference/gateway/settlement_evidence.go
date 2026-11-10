@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sort"
+	"unicode/utf8"
 
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
@@ -23,6 +25,7 @@ type settlementObservation struct {
 	RawUsageSchemaVersion int                `json:"raw_usage_schema_version"`
 	RawUsage              json.RawMessage    `json:"raw_usage,omitempty"`
 	RawUsageText          *string            `json:"raw_usage_text,omitempty"`
+	RawUsageBase64        []byte             `json:"raw_usage_base64,omitempty"`
 	Price                 settlementPrice    `json:"price"`
 	Charge                settlementCharge   `json:"charge"`
 }
@@ -78,20 +81,17 @@ func newSettlementEvidence(cmd domain.SettleCommand, price accounting.PriceVersi
 		observation.Charge.Unit = "micromoney"
 		observation.Charge.Currency = price.Currency
 	}
+	var textOnly bool
 	if raw := u.RawUsage.Raw; len(raw) > 0 {
-		if json.Valid(raw) {
-			// Sort object keys without rounding counters through float64.
-			decoder := json.NewDecoder(bytes.NewReader(raw))
-			decoder.UseNumber()
-			var value any
-			if err := decoder.Decode(&value); err != nil {
-				return settlementEvidence{}, err
-			}
-			canonical, err := json.Marshal(value)
+		if !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
+			observation.RawUsageBase64 = raw
+		} else if json.Valid(raw) {
+			canonical, duplicateKeys, err := canonicalUsageJSON(raw)
 			if err != nil {
 				return settlementEvidence{}, err
 			}
 			observation.RawUsage = canonical
+			textOnly = duplicateKeys
 		} else {
 			text := string(raw)
 			observation.RawUsageText = &text
@@ -102,8 +102,120 @@ func newSettlementEvidence(cmd domain.SettleCommand, price accounting.PriceVersi
 		return settlementEvidence{}, err
 	}
 	id := sha256.Sum256(raw)
-	return settlementEvidence{
+	evidence := settlementEvidence{
 		SchemaVersion: 1,
 		Observations:  map[string]json.RawMessage{hex.EncodeToString(id[:]): raw},
-	}, nil
+	}
+	if textOnly {
+		return evidence.withTextUsage(u.RawUsage.Raw)
+	}
+	return evidence, nil
+}
+
+// PostgreSQL may reject otherwise valid JSON. Change only its storage
+// representation, never the content identity calculated before that rejection.
+func (e settlementEvidence) withTextUsage(raw []byte) (settlementEvidence, error) {
+	out := settlementEvidence{SchemaVersion: e.SchemaVersion, Observations: make(map[string]json.RawMessage, len(e.Observations))}
+	for id, value := range e.Observations {
+		var observation settlementObservation
+		if err := json.Unmarshal(value, &observation); err != nil {
+			return settlementEvidence{}, err
+		}
+		observation.RawUsage = nil
+		if !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
+			observation.RawUsageText = nil
+			observation.RawUsageBase64 = raw
+		} else {
+			text := string(raw)
+			observation.RawUsageText = &text
+			observation.RawUsageBase64 = nil
+		}
+		encoded, err := json.Marshal(observation)
+		if err != nil {
+			return settlementEvidence{}, err
+		}
+		out.Observations[id] = encoded
+	}
+	return out, nil
+}
+
+// Decode container boundaries only: decoding string/number values would
+// replace lone surrogates or lose numeric lexemes. Duplicate keys retain
+// their order and require text storage, since jsonb keeps only the last one.
+func canonicalUsageJSON(raw json.RawMessage) (json.RawMessage, bool, error) {
+	raw = bytes.TrimSpace(raw)
+	switch raw[0] {
+	case '{':
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		if _, err := decoder.Token(); err != nil {
+			return nil, false, err
+		}
+		type member struct {
+			key   []byte
+			value json.RawMessage
+		}
+		var members []member
+		seen := map[string]bool{}
+		duplicate, textOnly := false, false
+		for decoder.More() {
+			start := decoder.InputOffset()
+			key, err := decoder.Token()
+			if err != nil {
+				return nil, false, err
+			}
+			rawKey := bytes.TrimSpace(raw[start:decoder.InputOffset()])
+			if rawKey[0] == ',' {
+				rawKey = bytes.TrimSpace(rawKey[1:])
+			}
+			name := key.(string)
+			duplicate = duplicate || seen[name]
+			seen[name] = true
+			var value json.RawMessage
+			if err := decoder.Decode(&value); err != nil {
+				return nil, false, err
+			}
+			value, nestedText, err := canonicalUsageJSON(value)
+			if err != nil {
+				return nil, false, err
+			}
+			textOnly = textOnly || nestedText
+			members = append(members, member{rawKey, value})
+		}
+		if _, err := decoder.Token(); err != nil {
+			return nil, false, err
+		}
+		if !duplicate {
+			sort.Slice(members, func(i, j int) bool { return bytes.Compare(members[i].key, members[j].key) < 0 })
+		}
+		var out bytes.Buffer
+		out.WriteByte('{')
+		for i, m := range members {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			out.Write(m.key)
+			out.WriteByte(':')
+			out.Write(m.value)
+		}
+		out.WriteByte('}')
+		return out.Bytes(), duplicate || textOnly, nil
+	case '[':
+		var values []json.RawMessage
+		if err := json.Unmarshal(raw, &values); err != nil {
+			return nil, false, err
+		}
+		var textOnly bool
+		for i, value := range values {
+			canonical, nestedText, err := canonicalUsageJSON(value)
+			if err != nil {
+				return nil, false, err
+			}
+			values[i] = canonical
+			textOnly = textOnly || nestedText
+		}
+		encoded, err := json.Marshal(values)
+		return encoded, textOnly, err
+	default:
+		return raw, false, nil
+	}
 }

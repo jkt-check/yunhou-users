@@ -1371,44 +1371,54 @@ func (s *Service) classifySettleOutcome(cmd domain.SettleCommand, price accounti
 func (s *Service) reportSettlementAnomaly(cmd domain.SettleCommand, price accounting.PriceVersion, source domain.ChargeSource, reason string, se *domain.SettleError) {
 	requestID := cmd.RequestID
 	log.Printf("ALARM gateway: %s for request %s: %s", reason, requestID, se.Message)
+	defer s.fireSettleAlarm(requestID, se)
 	ctx, cancel := detached(settleTimeout)
 	defer cancel()
 	evidence, err := newSettlementEvidence(cmd, price, source)
 	if err != nil {
 		log.Printf("ERROR gateway: anomaly evidence %s: %v", requestID, err)
-		s.fireSettleAlarm(requestID, se)
 		return
 	}
-	detail, err := json.Marshal(map[string]interface{}{
-		"schema_version":          1,
-		"reason":                  reason,
-		"outcome":                 string(se.Kind),
-		"status":                  string(se.Status),
-		"requested_charge_micros": int64(se.RequestedChargeMicros),
-		"settlement_evidence":     evidence,
-	})
-	if err != nil {
-		log.Printf("ERROR gateway: anomaly detail %s: %v", requestID, err)
-		s.fireSettleAlarm(requestID, se)
+	deadline := s.clock.Now().Add(reconciliationDeadline)
+	for try := 0; try < 2; try++ {
+		detail, err := json.Marshal(map[string]interface{}{
+			"schema_version":          1,
+			"reason":                  reason,
+			"outcome":                 string(se.Kind),
+			"status":                  string(se.Status),
+			"requested_charge_micros": int64(se.RequestedChargeMicros),
+			"settlement_evidence":     evidence,
+		})
+		if err != nil {
+			log.Printf("ERROR gateway: anomaly detail %s: %v", requestID, err)
+			return
+		}
+		uow, err := s.store.Begin(ctx)
+		if err != nil {
+			log.Printf("ERROR gateway: anomaly report begin %s: %v", requestID, err)
+			return
+		}
+		if err := s.store.ReportTerminalAnomaly(ctx, uow, requestID, reason, detail, deadline); err != nil {
+			if rollbackErr := uow.Rollback(ctx); rollbackErr != nil {
+				log.Printf("ERROR gateway: anomaly report rollback %s: %v (report: %v)", requestID, rollbackErr, err)
+				return
+			}
+			if try == 0 && len(cmd.Usage.RawUsage.Raw) > 0 && postgres.IsJSONBInputError(err) {
+				evidence, err = evidence.withTextUsage(cmd.Usage.RawUsage.Raw)
+				if err != nil {
+					log.Printf("ERROR gateway: anomaly text evidence %s: %v", requestID, err)
+					return
+				}
+				continue
+			}
+			log.Printf("ERROR gateway: anomaly report %s: %v", requestID, err)
+			return
+		}
+		if err := uow.Commit(ctx); err != nil {
+			log.Printf("ERROR gateway: anomaly report commit %s: %v", requestID, err)
+		}
 		return
 	}
-	uow, err := s.store.Begin(ctx)
-	if err != nil {
-		log.Printf("ERROR gateway: anomaly report begin %s: %v", requestID, err)
-		s.fireSettleAlarm(requestID, se)
-		return
-	}
-	if err := s.store.ReportTerminalAnomaly(ctx, uow, requestID, reason, detail,
-		s.clock.Now().Add(reconciliationDeadline)); err != nil {
-		_ = uow.Rollback(ctx)
-		log.Printf("ERROR gateway: anomaly report %s: %v", requestID, err)
-		s.fireSettleAlarm(requestID, se)
-		return
-	}
-	if err := uow.Commit(ctx); err != nil {
-		log.Printf("ERROR gateway: anomaly report commit %s: %v", requestID, err)
-	}
-	s.fireSettleAlarm(requestID, se)
 }
 
 // fireSettleAlarm notifies the settlement-error hook (the alarm channel

@@ -415,6 +415,11 @@ func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord)
 	if !json.Valid(raw) {
 		return false, nil
 	}
+	// Valid Go JSON may still be outside jsonb's Unicode/numeric domain.
+	// Keep that mismatch from aborting the caller's settlement transaction.
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT inference_usage_evidence`); err != nil {
+		return false, mapError("settle: save usage comparison", err)
+	}
 	var in, out, cacheRead, cacheWrite, reasoning sql.NullInt64
 	var sameEvidence bool
 	err := tx.QueryRowxContext(ctx,
@@ -424,10 +429,20 @@ func usageFactConsistent(ctx context.Context, tx *sqlx.Tx, u domain.UsageRecord)
 		u.AttemptID, revision, string(u.Source), raw).
 		Scan(&in, &out, &cacheRead, &cacheWrite, &reasoning, &sameEvidence)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+		if !errors.Is(err, sql.ErrNoRows) {
+			if !IsJSONBInputError(err) {
+				return false, mapError("settle: load usage fact", err)
+			}
+			if _, rollbackErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT inference_usage_evidence`); rollbackErr != nil {
+				return false, mapError("settle: recover usage comparison", rollbackErr)
+			}
 		}
-		return false, mapError("settle: load usage fact", err)
+	}
+	if _, releaseErr := tx.ExecContext(ctx, `RELEASE SAVEPOINT inference_usage_evidence`); releaseErr != nil {
+		return false, mapError("settle: release usage comparison", releaseErr)
+	}
+	if err != nil {
+		return false, nil
 	}
 	return sameEvidence && sameTokens(in, u.Buckets.InputTokens) &&
 		sameTokens(out, u.Buckets.OutputTokens) &&

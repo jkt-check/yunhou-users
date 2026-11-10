@@ -7377,6 +7377,123 @@ acceptance was performed. The until-clean review is not declared complete.
 No push, merge, deployment, adjacent-repository source edit or kaya process
 operation is included.
 
+### 4.87 Task 27: Retain Conflicting Terminal Settlement Evidence
+
+**Scope:** retain incoming conflicting finalizer observations without
+selecting a new authoritative usage revision or changing terminal facts,
+money, TPM, job reason/status or deadline policy. Earlier Task 27 regression
+and implementation checkpoints are already committed; this local checkpoint
+completes their raw-evidence compatibility handling.
+
+**Changes and file manifest for this checkpoint:**
+
+- `internal/inference/gateway/settlement_evidence.go` canonicalizes ordinary
+  JSON object keys while preserving string/number lexemes and array order.
+  Duplicate decoded keys, including escaped aliases and nested duplicates,
+  retain object order for identity and original text for storage. Invalid
+  UTF-8 and literal NUL bytes use base64. Storage fallback retains the
+  observation's precomputed content identity.
+- `internal/inference/gateway/service.go` retries a known JSONB input
+  rejection once, after successful rollback, using a fresh transaction with
+  original text/base64 and the same identity and deadline. Failure still
+  logs and triggers the existing settlement alarm.
+- `internal/inference/postgres/ledger_repo.go` protects raw JSONB replay
+  comparison with a savepoint. Recognized JSON-input failures become
+  inconsistent evidence only after successful recovery; unrelated storage
+  failures still propagate.
+- `internal/inference/postgres/postgres.go` recognizes the PostgreSQL JSON
+  input SQLSTATEs at those explicit raw-JSON boundaries.
+- `internal/inference/gateway/settlement_evidence_test.go` asserts canonical
+  fixtures, surrogate/large-number identity, key-order deduplication and
+  duplicate-key preservation.
+- `internal/inference/gateway/terminal_evidence_test.go` adds duplicate-key
+  and escaped-alias storage cases to the real database-backed matrix.
+- The operations runbook documents evidence forms and their non-authoritative
+  status. The convergence plan and this runbook record verification and
+  remaining scope. No migration or dependency changes are included.
+
+**Focused RED/GREEN:** artifacts live under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`.
+`run.dLpQSJ/focused.jsonl` reproduced 37 failing tests/subtests, with 43
+passing and no skips. An additional pure duplicate-key regression failed
+before the canonicalization fix. One original exact-byte assertion was
+corrected to a hand-derived canonical fixture: ordinary key reordering is
+intentionally not distinct evidence, while surrogate and numeric lexemes
+must remain distinct.
+
+`run.iGTrLa/focused.jsonl` passed 98 focused tests/subtests across gateway
+and PostgreSQL with zero failures/skips. These include real terminal
+finalizers, plan/wallet denomination, normalized nullable counters,
+distinct/concurrent observation preservation, exact-retry deduplication,
+JSONB-incompatible Unicode/numbers, text/base64 fallback, transaction
+usability after rejected JSON and real `42703` storage-error propagation.
+The full gateway/PostgreSQL race recheck `run.RVYR3R/focused.jsonl` passed
+624 tests/subtests across two packages with no failures; only the expected
+`TestQuotaWorkerProcess` child entry skipped. Both runners stopped their
+owned PostgreSQL clusters on cleanup.
+
+**Full verification:** fresh `run.EWPuPY` exited 0 on 2026-11-10.
+`go build ./...` and `go vet ./internal/... ./cmd/...` passed. Full race
+passed 5,027 tests/subtests across 34 packages, zero failures:
+
+```bash
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+```
+
+`go tool cover -func="$RUN/coverage.out"` reports 80.8% total statement
+coverage, above the 80% floor. The only full-suite skips are the expected
+`TestQuotaWorkerProcess` child entry, `TestLoadDrill_Throughput` and
+`TestLoadDrill_LongConnections`; no database acceptance skipped.
+
+Separate `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`
+passed 186 tests/subtests in 150.122s, zero failures. Only the explicit
+opt-in `TestUsageTokenAcceptance_TenPagesTwoMinutes` skipped.
+
+The runner created a new owned PostgreSQL cluster and independent
+application/E2E databases, exported both DSNs explicitly and used
+`GOMAXPROCS=2`, `GOPROXY=off`, `GOFLAGS=-mod=readonly` and `-p 1`.
+Both databases applied all 55 migrations and skipped all 55 on rerun.
+Cleanup confirms the owned PostgreSQL server stopped and
+`data/postmaster.pid` is absent. Go sources and tests remained unchanged
+throughout the full gate. Formatting and whitespace checks passed.
+
+Final artifacts are retained under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.EWPuPY/`:
+`build.log`, `vet.log`, `tests.jsonl`, `coverage.out`,
+`coverage-summary.log`, `e2e.jsonl`, both migration logs and `cleanup.log`.
+
+**Bounded independent review:** Darwin reviewed the entire Task 27 delta
+against `9214cdb` through `701aeeb` plus the uncommitted compatibility fixes.
+No confirmed Critical, Important or Minor defect or in-scope local-commit
+blocker was identified. The source-only review supports atomic observation
+union, stable fallback identity, whole-transaction rollback before retry,
+unrelated storage-error propagation and unchanged accounting/job policies.
+It did not independently run tests or verify failure injection for every
+rollback/release/commit, second-retry failure or mixed-refresh interleaving.
+
+The executor source-checked one explicitly unjudged boundary: identical
+attempt/source/buckets/charge with stored `{"x":2}` and incoming
+`{"x":1,"x":2}` can remain a consistent duplicate under the existing JSONB
+equality policy, so evidence construction is never reached. Duplicate-key
+preservation here applies after a delivery is classified as a terminal
+conflict; this patch does not claim raw-byte replay equality. Any change to
+that classification policy requires separate reproduction and verification.
+The operations runbook now states this limitation. Semantic numeric equality,
+trivial released deliveries, extreme nesting and manually corrupted detail
+were not approved as new behavior or established as defects by this review.
+This is not whole-branch clean-review or release approval.
+
+**Remaining boundaries:** evidence candidates may accumulate in the
+existing job detail; this patch does not introduce automatic selection or
+an operator correction API. Original wallet post-settlement correction,
+the production evidence-to-correction caller, already-resolved overage
+re-enqueue policy and the recorded provider findings remain unfinished.
+No real-provider/client or cross-host acceptance is claimed. The until-clean
+review remains open. No push, merge, deployment, adjacent-repository source
+edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -442,6 +442,20 @@ HTTP 400），因此它出现在**错误**里而不是 200 报告里。
 | **限速存储失败** | `ALARM quota: rate limit store unavailable` | 限速闸门的存储不可用（**不是**限速拒绝） | 准入 **fail-closed**（503 `service_unavailable`，绝不回退成单机放行）；修存储后自动恢复。正常的限速拒绝**不打**这条告警（否则告警会被噪声淹没） |
 | **不支持存量配置** | `UNSUPPORTED_POOL_STRATEGY model=… routes=… strategies=…` + `AUDIT_ALERT` | 已发布快照里存在支持集外的 `pool_strategy`（存量脏配置） | 该路由被标记**不可调度**（绝不静默当 `round_robin`）；模型还有别的可调度路由时正常服务，全部不支持时客户请求在**预占前** 503 `upstream_unavailable`（Anthropic 面 529）。修法：把路由的 `pool_strategy` 改成 `round_robin` 再 publish |
 
+终态结算异常的核对任务在 `detail.settlement_evidence` 中保留版本化的
+`observations`，以内容 SHA-256 为键。每条包含收到的 attempt、用量来源、
+五个可空的规范化 token 桶、原始 usage、固定价格版本和计费单位。
+普通 JSON 对象的键顺序和投递时间不产生新候选；不同证据和并发投递合并保留，
+worker 刷新任务详情也不会覆盖已有候选。重复 JSON 键、畸形 JSON 和 JSONB
+不支持的 Unicode/数字保留在 `raw_usage_text`；无效 UTF-8 或实际 NUL 字节
+用 `raw_usage_base64` 无损存储。合法且可表示的 usage 仍在 `raw_usage`。
+此保留规则适用于已判定的终态冲突；现有 JSONB 相等判定仍可能把仅增加重复键、
+但其余字段完全相等的投递视为幂等重投，不产生新的待核对候选。
+这些只是**待核对证据**，不等于权威 usage revision，不会自动更改已入账金额、
+TPM 或请求终态，也不补齐尚未实现的钱包更正和生产更正调用方。
+出现 `ERROR gateway: anomaly …` 时仍须处理记录失败告警，不能把报警钩子触发
+或已有任务当作本次证据一定写入成功。
+
 ### 停放之后的预占处置边界（迁移 054）
 
 停放**不等于**所有预占都释放。按停放原因分两类（判据是核对任务的

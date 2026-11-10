@@ -1093,9 +1093,11 @@ Other pending findings and the until-clean review remain unfinished.
 ## Task 27: Retain Conflicting Finalizer Evidence
 
 **Files:** `gateway/service.go`, `gateway/settlement_evidence.go`,
-`gateway/terminal_marker_test.go`, `gateway/terminal_evidence_test.go`,
-`postgres/reconciliation_repo.go`, the operations runbook, this plan and
-the verification runbook.
+`gateway/settlement_evidence_test.go`, `gateway/terminal_marker_test.go`,
+`gateway/terminal_evidence_test.go`, `gateway/settlement_replay_evidence_test.go`,
+`postgres/ledger_repo.go`, `postgres/postgres.go`,
+`postgres/reconciliation_repo.go`, `postgres/settlement_replay_evidence_test.go`,
+the operations runbook, this plan and the verification runbook.
 
 **Interfaces:** terminal anomaly reporting consumes the incoming normalized
 `SettleCommand` and pinned price. Its versioned `settlement_evidence` object
@@ -1103,23 +1105,23 @@ retains distinct content-addressed observations, not new authoritative usage
 revisions. Request-job upsert unions that object atomically while preserving
 existing top-level detail, reason, status and deadline rules.
 
-- [ ] Extend `TestGateway_NonstreamFinalizerPreservesCompetingTerminal`:
+- [x] Extend `TestGateway_NonstreamFinalizerPreservesCompetingTerminal`:
   mismatched/released finalizers retain the incoming 10/5 reported usage,
   attempt, raw usage and pinned price; exact duplicates still create no job.
-- [ ] Add gateway regressions for distinct evidence, exact-retry dedup,
+- [x] Add gateway regressions for distinct evidence, exact-retry dedup,
   normalized cache/reasoning buckets, nullable counters, missing/malformed
   raw usage, credit/wallet units, and unrelated job-detail refresh.
   Terminal, usage, ledger, rate and wallet snapshots must stay unchanged.
-- [ ] Run focused race tests with owned disposable databases. Expected RED:
+- [x] Run focused race tests with owned disposable databases. Expected RED:
   missing incoming evidence, not a fixture or connection failure.
-- [ ] Pass the normalized command and pinned price to terminal reporting;
+- [x] Pass the normalized command and pinned price to terminal reporting;
   retain usage-only raw JSON (malformed input as explicit text evidence),
   source, nullable buckets, attempt, price identity and charge denomination.
   Union nested evidence on every request-job refresh, without selecting an
   authoritative candidate or automatically rewriting accounting.
-- [ ] Run the focused race tests again. Expected GREEN: all new regressions
+- [x] Run the focused race tests again. Expected GREEN: all new regressions
   and existing terminal/idempotency controls pass with no database skips.
-- [ ] Run fresh build/vet/full race/coverage/E2E using independent owned
+- [x] Run fresh build/vet/full race/coverage/E2E using independent owned
   disposable databases; record evidence and remaining scope, then commit
   locally as `fix(inference): retain conflicting settlement evidence`.
 
@@ -1128,6 +1130,35 @@ usage revisions, because latest-revision reads are accounting authority.
 Exact content retries deduplicate; distinct observations survive unrelated
 refreshes. This is evidence retention, not the production correction caller
 or wallet correction required by the original plan.
+
+Checkpoint evidence: `run.dLpQSJ` reproduced the remaining compatibility
+gaps with 37 failing tests/subtests and no skips. `run.iGTrLa` passed all
+98 focused tests/subtests with no failures or skips. The complete gateway
+and PostgreSQL race recheck `run.RVYR3R` passed 624 tests/subtests; only the
+expected quota-worker child-process entry skipped. Both owned clusters
+stopped on cleanup. Ordinary JSON keys canonicalize without decoding
+string/number lexemes; duplicate decoded keys retain their ordering and
+original text, and invalid UTF-8 or literal NUL bytes use base64.
+JSONB input failures recover through a savepoint or one fresh reporting
+transaction with the same observation identity. Unrelated storage failures
+still propagate.
+
+Fresh full gate `run.EWPuPY` exited 0 on 2026-11-10: build/vet passed;
+full race passed 5,027 tests/subtests across 34 packages, zero failures,
+with 80.8% total statement coverage. Separate E2E race passed 186
+tests/subtests in 150.122s with zero failures. Only the expected child entry
+and opt-in load/usage drills skipped; no database acceptance skipped.
+Both independent disposable databases applied all 55 migrations and skipped
+55 on rerun. Cleanup confirmed the owned PostgreSQL stopped and its
+`postmaster.pid` is absent. Go sources and tests remained unchanged
+throughout the full gate; formatting and whitespace checks passed.
+See runbook 4.87 for the checkpoint manifest and exact evidence paths.
+
+Darwin's bounded source-only review found no in-scope defect or commit
+blocker. Duplicate-key preservation applies to deliveries already classified
+as terminal conflicts: existing JSONB equality may still absorb a replay
+whose only difference is a duplicate key. That classification policy and
+the review's failure-injection gaps remain explicit in runbook 4.87.
 
 ## Pending Review Findings (2026-11-10)
 
@@ -1155,7 +1186,8 @@ not waived scope:
   valid 1025-output/1024-budget boundary. The reviewer reproduced these in
   owned temporary provider overlays; checkout regressions and fixes remain open.
 - Boole's finding of late real finalizer evidence lost on terminal conflict
-  remains source-confirmed and needs dynamic reproduction and a fix.
+  is reproduced, fixed and verified in Task 27 with focused RED/GREEN,
+  complete gateway/PostgreSQL race, bounded review and a fresh full gate.
 - Addressed escalated evidence/overage jobs remaining open after correction
   are reproduced, fixed and verified in Task 26. Re-enqueue policy for a
   subsequent changed correction to an already-resolved overage remains a

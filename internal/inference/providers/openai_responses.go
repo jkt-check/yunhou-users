@@ -130,7 +130,7 @@ func (a *OpenAIResponses) BuildPayload(call *Call) ([]byte, error) {
 				}
 				input = append(input, map[string]any{
 					"type": "function_call", "call_id": tc.ID,
-					"name": tc.Function.Name, "arguments": strOr(tc.Function.Arguments, "{}"),
+					"name": tc.Function.Name, "arguments": tc.Function.Arguments,
 				})
 			}
 		case "tool":
@@ -472,7 +472,7 @@ func collectResponseOutput(output []responsesOutputItem) (text, reasoning string
 		case "function_call":
 			toolCalls = append(toolCalls, map[string]any{
 				"id": it.CallID, "type": "function",
-				"function": map[string]any{"name": it.Name, "arguments": strOr(it.Arguments, "{}")},
+				"function": map[string]any{"name": it.Name, "arguments": it.Arguments},
 			})
 		}
 	}

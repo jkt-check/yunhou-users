@@ -926,6 +926,8 @@ paths:
         本面也不产出思考块：Anthropic 的 thinking 块必须带原生 signature，
         网关不伪造空 signature，也不建立通用无损原生透传层）。
         **接受但不消费**：`tool_result.is_error` 标志、`cache_control` 提示。
+        历史 `tool_use.input` 必须是完整 JSON 对象，缺失、null、标量或数组
+        均 400。对象数字保留精度；不将缺失或非法参数补成 `{}`。
 
         响应：`type=message` 原生形状（`usage.input_tokens` 不含
         cache_read，cache 桶单列）。流式事件序列 `message_start →
@@ -933,6 +935,9 @@ paths:
         `message_start.usage` 为协议占位（0/0），真实值在终止
         `message_delta.usage`（含 input_tokens）。上游中断注入
         `event: error` 后结束，绝不伪造 `message_stop`。
+        上游工具参数为空、截断或非对象，以及多 choice 输出，明确拒绝：
+        非流式 502；流式只发一次原生错误，不发成功终态，继续读取晚到 usage。
+        `content_block_start.input:{}` 是占位，不是生成参数。
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -1007,7 +1012,8 @@ paths:
           description: |
             api_error（非流式上游文本出现在工具调用之后，无法忠实保序；
             或 Responses 上游返回无法忠实翻译的 refusal / status=failed；
-            或 Chat 上游返回非 null refusal，包括空字符串）。
+            或 Chat 上游返回非 null refusal，包括空字符串；
+            或工具参数不是完整 JSON 对象，或上游含多个 choice）。
             请求已执行：按已报 usage 或完整输出估算结算，不重放、不切换上游，
             不返回改写后的答案，也不保存响应链。
             Chat refusal 的流式转换只发一次原生错误，无后续内容或成功终态，
@@ -1058,11 +1064,15 @@ paths:
         行为是「接受后丢弃」）。
         `reasoning.effort` 的档位（low/medium/high/xhigh）**逐字**透传给
         能表达该档位的上游协议；词表外的档位明确 400。
+        输出 `function_call.arguments` 原样保留，包括空字符串和截断 JSON，
+        不补成 `{}`。输入回放要求有效 JSON（允许 null/标量/数组），
+        空字符串或非法 JSON 明确 400。
 
         **会话链**：成功响应（store≠false）仅在完整输入/输出 transcript
         可忠实回放且≤4 MiB 时持久化（24h TTL）。工具调用后、工具结果前
         仍有 assistant 文本等不可保序历史不落链、不建立新会话绑定；
         流式输出顺序、成功终态、usage 和结算不变，已有父链不受影响。
+        空或非法工具参数同样不落可引用会话链。
         引用 `previous_response_id` = 上下文回放 + 粘性绑定同一上游账号,
         账号失效显式迁移(不静默换号)。引用不存在/过期/他人/store:false/
         超限或不可回放的响应一律 404 `previous_response_not_found`。

@@ -7655,6 +7655,111 @@ overage re-enqueue policy remain open. This local checkpoint is not a
 whole-branch clean-review or release claim. No push, merge, deployment,
 adjacent-source edit or kaya process operation is included.
 
+### 4.90 Task 30: Preserve Tool Arguments and Reject Fabricated Objects
+
+**Scope:** preserve Responses argument strings and reject unrepresentable
+Messages object conversion, retaining execution evidence and settlement.
+No JSON repair, price change, new tool execution or monetary correction.
+
+**Checkpoint files:**
+
+- `providers/tool_arguments.go` centralizes complete-object validation with
+  raw JSON and Messages streaming validation. A wrapper tap observes DONE,
+  separates complete rejection from upstream interruption and retains late
+  usage. Alternative/multiple choices reject before tool indexes collide.
+- `providers/adapter.go` installs that tap only for Messages and rejects
+  nonstream conversion before settlement, keeping usage and response identity.
+- `providers/messages_client.go` validates ingress, nonstream conversion and
+  streaming output; one native error suppresses success while draining.
+- `providers/anthropic.go` validates outgoing history without float64
+  conversion and preserves missing upstream arguments instead of `{}`.
+- `providers/openai_responses.go` and `providers/responses_client.go` preserve
+  argument strings; Responses replay requires valid JSON, including when
+  arguments are empty, and incomplete arguments cannot create a stored chain.
+- `providers/tool_arguments_fidelity_test.go` strengthens real late-usage and
+  completion/error/completion fixtures and rejects multiple choices.
+  Earlier provider and authenticated HTTP regressions are already committed
+  in `a944fb7` and `1bbfb6a`; they are not new in this checkpoint.
+- The API guide, OpenAPI, operations runbook and convergence plan document
+  protocol boundaries and verification status.
+
+**RED/GREEN evidence:** expanded provider RED before production edits
+recorded 161 failure events, reproducing fabricated `{}`, float64 rounding
+and invalid Messages completion across upstream protocols. Fresh focused
+GREEN and the entire providers race suite passed (3.799s), including genuine
+late cumulative Anthropic usage and completion/error/completion ordering.
+Evidence is retained under the ignored
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/` directory in
+`task-30-fixtures-red.jsonl`, `task-30-focused-green.jsonl` and
+`task-30-providers-green.jsonl`.
+
+Owned HTTP GREEN `run.BW7WSZ` exited 0: 61 test/subtest passes, zero failures
+or skips (12.567s). It covers reported/absent usage, large integers, empty,
+truncated and non-object arguments, stream/nonstream, actual interruption
+and all three upstream protocols. Assertions verify single settlement,
+correct TPM, response-chain absence for invalid replay, and evidence-based
+lease release or retention. Both disposable databases applied all 55
+migrations and skipped 55 on rerun; cleanup stopped the owned PostgreSQL.
+Artifacts: `/private/tmp/yunhou-review-20261109.3NuMWy/run.BW7WSZ/`.
+
+**Bounded review:** Planck's read-only audit against `4f3c49e` found no
+confirmed Critical/Important defect in the seven-file Go worktree delta,
+the already-committed provider/HTTP regressions and relevant settlement,
+rendering and replay interactions. The review accepted explicit rejection
+of alternative/multiple choices. It did not run tests/builds or validate
+the concurrent documentation edits.
+
+The stream matrix covers EOF and in-band errors but does not inject
+transport read errors in the tool-argument cases; this is a coverage gap,
+not a proven defect. Native snapshot-only argument recovery is unchanged
+and was not audited as new behavior. A valid success already emitted cannot
+be retracted after a later error; those valid-object permutations are
+explicitly excluded by the regression matrix. These boundaries are retained,
+not silently treated as verified. Missing/unknown incomplete reasons and
+partial public usage remain separate open findings; production compatibility,
+whole-branch convergence and merge readiness are not judged by this review.
+
+**Full gate:** `run.ye9Yyw` exited 0 on 2026-11-10 (Asia/Shanghai), using
+`GOMAXPROCS=2`, `GOPROXY=off` and `GOFLAGS=-mod=readonly`:
+
+```sh
+go build ./...
+go vet ./internal/... ./cmd/...
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+go tool cover -func="$RUN/coverage.out"
+go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...
+```
+
+Build and vet passed. Full race passed 5,612 tests/subtests across 34
+packages, zero failures, with 80.8% total statement coverage above the 80%
+floor. Separate E2E race passed 186 tests/subtests in 156.784s, zero failures.
+The only skips were `TestQuotaWorkerProcess`, `TestLoadDrill_Throughput`,
+`TestLoadDrill_LongConnections` and
+`TestUsageTokenAcceptance_TenPagesTwoMinutes`: expected child entry and
+opt-in drills, not unavailable database acceptance.
+
+Both independent disposable databases applied all 55 migrations and skipped
+55 on rerun. Cleanup confirmed the owned PostgreSQL server stopped and
+`data/postmaster.pid` is absent. Go sources/tests remained frozen during
+the full gate. Formatting, OpenAPI YAML parsing and diff whitespace checks
+passed. Artifacts are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.ye9Yyw/`: `build.log`,
+`vet.log`, `tests.jsonl`, `coverage.out`, `coverage-summary.log`, `e2e.jsonl`,
+both migration logs and `cleanup.log`.
+
+**Remaining boundaries:** malformed tool arguments now fail explicitly on
+Messages rather than becoming apparently executable empty objects. Responses
+may deliver incomplete strings, but they are not replayable or persisted as
+referenceable chains. Anthropic stream `content_block_start.input:{}` is a
+placeholder; only actual argument deltas supply generated JSON. No
+real-provider, real-client or cross-host acceptance is claimed.
+Missing/unknown incomplete reasons, partial public usage, wallet correction,
+its production evidence caller and already-resolved overage re-enqueue policy
+remain open. This checkpoint is not a whole-branch clean-review or release
+claim. No push, merge, deployment, adjacent-source edit or kaya operation.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

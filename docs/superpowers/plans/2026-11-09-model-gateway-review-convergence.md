@@ -1287,17 +1287,17 @@ conversion returns an explicit error for empty, truncated or non-object
 arguments, without dropping execution usage/identity or retrying the request.
 Complete rejected streams retain `RejectedComplete`; interruptions do not.
 
-- [ ] Reproduce empty/truncated arguments becoming `{}` in Responses output,
+- [x] Reproduce empty/truncated arguments becoming `{}` in Responses output,
   upstream history and Messages nonstream output.
-- [ ] Cover valid empty objects, large integer objects, scalar/null/array
+- [x] Cover valid empty objects, large integer objects, scalar/null/array
   arguments, fragmented and parallel deltas, late usage and upstream errors.
-- [ ] Remove synthesized arguments; reject invalid replay input and Messages
+- [x] Remove synthesized arguments; reject invalid replay input and Messages
   object conversion before nonstream settlement or successful stream completion.
-- [ ] Verify authenticated HTTP output, absent invalid chains, one charge,
+- [x] Verify authenticated HTTP output, absent invalid chains, one charge,
   correct TPM and released leases, including reported/estimated evidence.
-- [ ] Run focused RED/GREEN, all providers race and a bounded delta review.
-- [ ] Run fresh build/vet/full race coverage and separate E2E on owned databases.
-- [ ] Record evidence and commit the verified checkpoint locally.
+- [x] Run focused RED/GREEN, all providers race and a bounded delta review.
+- [x] Run fresh build/vet/full race coverage and separate E2E on owned databases.
+- [x] Record evidence and commit the verified checkpoint locally.
 
 Ruling: do not repair generated JSON or infer a missing `{}`. Responses can
 carry a partial argument string and must preserve it; chain validation must
@@ -1307,7 +1307,7 @@ Cost: malformed/non-object tool arguments produce explicit Messages errors
 and incomplete Responses histories cannot be referenced by response ID.
 This extends the existing faithful-conversion boundary, not tool execution.
 
-RED commit checkpoint (2026-11-10): the latest user request checkpoints
+Historical RED commit checkpoint (2026-11-10): that request checkpointed
 `tool_arguments_fidelity_test.go` and this evidence only; no production fix
 is included. Fresh focused race exited 1 in 3.024s, recording 195 passing
 test/subtest events and 122 failure events, including 117 failing leaf
@@ -1327,6 +1327,40 @@ was used. Full race, E2E and coverage were not rerun for this intentionally
 non-green checkpoint; the previous 80.8% coverage belongs to Task 29,
 not this tree. Task 30 and the wider review goal remain unfinished.
 No push, merge, deployment or kaya process operation.
+
+Implementation checkpoint (2026-11-10): the latest request is local commit
+only. Shared object validation uses raw JSON, and Messages rejects multiple
+choices instead of merging their tool indexes. A Messages-only tap validates
+normalized chunks before successful settlement, gates native completion on
+its own observed DONE and drains rejected output for late usage and actual
+upstream errors. Responses strings remain unchanged; replay rejects invalid
+JSON rather than fabricating `{}`.
+
+Fresh expanded provider RED recorded 161 failing test/subtest events before
+production edits. Focused GREEN and the entire providers race suite passed
+(3.799s). The authenticated HTTP GREEN run.BW7WSZ exited 0: 61 tests/subtests,
+zero failures or skips (12.567s), covering reported/estimated settlement,
+one charge, correct TPM, no invalid chain and released or retained leases
+as dictated by complete/interrupted evidence. Its owned PostgreSQL stopped.
+Logs are under the ignored Task 30 evidence directory and the owned runner
+directory. Planck's bounded read-only delta review found no confirmed
+Critical/Important defect. Tool-argument-specific injected transport read
+errors remain a coverage gap; native snapshot-only recovery is unchanged,
+and retracting a valid success already emitted is outside this matrix.
+The reviewer did not run tests/builds or validate concurrent docs.
+Runbook 4.90 records the review boundaries.
+
+Fresh full gate run.ye9Yyw exited 0: build/vet passed; full race passed
+5,612 tests/subtests across 34 packages, zero failures, 80.8% total statement
+coverage. Separate E2E race passed 186 tests/subtests in 156.784s, zero
+failures. Only the expected child entry and opt-in drills skipped; no
+database acceptance skipped. Both independent disposable databases applied
+55 migrations and skipped 55 on rerun; cleanup confirmed the owned
+PostgreSQL stopped and postmaster.pid is absent. Go sources/tests remained
+frozen. The 12-file checkpoint includes seven Go files and five documents;
+prior provider/HTTP tests are already in a944fb7 and 1bbfb6a.
+This is a local commit checkpoint, not whole-branch review convergence or
+release acceptance. No push, merge, deployment or kaya process operation.
 
 ## Pending Review Findings (2026-11-10)
 
@@ -1353,8 +1387,9 @@ not waived scope:
   usage fabricates missing zero/total fields; Anthropic thinking rejects the
   valid 1025-output/1024-budget boundary. The reviewer reproduced these in
   owned temporary provider overlays. The thinking boundary is now reproduced,
-  fixed and verified in Task 28. Chat refusal is now fixed and verified
-  in Task 29; the other three findings remain open.
+  fixed and verified in Task 28. Chat refusal is fixed and verified in
+  Task 29, and fabricated tool arguments in Task 30; missing/unknown
+  incomplete reasons and partial public usage remain open.
 - Boole's finding of late real finalizer evidence lost on terminal conflict
   is reproduced, fixed and verified in Task 27 with focused RED/GREEN,
   complete gateway/PostgreSQL race, bounded review and a fresh full gate.

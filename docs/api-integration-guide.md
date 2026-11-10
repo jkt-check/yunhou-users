@@ -677,6 +677,8 @@ picker 让客户发图、网关在准入前当场 400）。判据与派发共用
 
 **Chat 上游拒绝输出**：`openai_chat` 上游的 `message.refusal` / `delta.refusal` 在 `/v1/chat/completions` 与 Kaya `/chat` 保持原样透传，拒绝文本计入缺失 usage 时的输出估算。转换到 `/v1/messages` 或 `/v1/responses` 时无法忠实表示，因此非流式返回 502，流式只发一次原生错误，不发送后续内容或成功终态，也不保存响应链；同一分块内的拒绝在输出该分块内容前判定。空字符串仍表示拒绝，省略或 `null` 不表示拒绝。拒绝后继续读取上游以保留晚到的 usage；完整结束可按已观察输出估算，裸 EOF 且无 usage 时冻结预占并挂起核对。真正的上游错误优先于完成标记，不能被后续 `[DONE]` 改成完整拒绝响应；不自动重放或切换上游。
 
+**工具参数保真**：Responses 的 `function_call.arguments` 原样保留，包括空字符串和截断的 JSON，绝不补成 `{}`；这类无效 JSON 不可作为输入回放，也不落可引用的会话链。有效 `null`、标量和数组仍可在 Responses 中回放。Messages 的历史 `tool_use.input` 必须是完整 JSON 对象，否则入口 400；上游生成的工具参数为空、截断或非对象时，非流式返回 502，流式只发一次原生错误且不发送成功终态，继续读取晚到用量。Messages 同样明确拒绝多 choice 输出，不将不同 choice 的工具索引合并。对象转换保留大整数精度，不经浮点数解析；流式 `content_block_start.input:{}` 只是占位，最终参数以实际片段为准。这些已执行调用保留消费证据、不自动重放；完整拒绝可估算结算，真正的上游错误或裸 EOF 不获得完整拒绝证据。
+
 **Responses 会话链（`previous_response_id`）**：成功响应（`store` 缺省 true）仅在完整规范 items transcript 可忠实回放且不超过 4 MiB 时，持久化截至本轮的 transcript + 账户归属 + 实际服务账号（24h TTL）。若合并后的输入/输出包含无法保序转换的历史，例如工具调用后、工具结果前仍有 assistant 文本，则本轮不落链、不建立新会话绑定；流式输出顺序、成功终态、usage 和结算不变，已有父链不受影响。引用链的请求 = transcript 回放（既有上下文 + 新输入），并经粘性会话绑定钉住同一上游账号；账号失效时显式迁移（旧绑定终止 reason=migrated + 新绑定同事务建立），**绝不静默换号续接**。`store:false`、超限或不可回放的响应均不落链；引用不存在/过期/他人或未落链的响应一律 404（`previous_response_not_found`，不泄漏存在性）。`GET /v1/responses/{id}`（OpenAI stored-response 读取面）不实现。
 
 **限制**：请求体 ≤1 MiB；消息/输入项 ≤512；工具 ≤128（总 ≤256 KiB）；模型 id ≤128 字符。Messages 面 `max_tokens` 必填（Anthropic 语义）。

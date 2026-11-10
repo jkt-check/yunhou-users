@@ -37,7 +37,6 @@ package providers
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -341,12 +340,9 @@ func anthropicTurnToChat(role string, content json.RawMessage) ([]model.ChatMess
 			if b.ID == "" || b.Name == "" {
 				return nil, invalidMsg("messages", "tool_use blocks require id and name")
 			}
-			args := "{}"
-			if len(b.Input) > 0 && string(b.Input) != "null" {
-				if !json.Valid(b.Input) {
-					return nil, invalidMsg("messages", "tool_use input must be a JSON value")
-				}
-				args = string(b.Input)
+			args := string(b.Input)
+			if _, err := toolArgumentObject(args); err != nil {
+				return nil, invalidMsg("messages", "tool_use input must be a JSON object")
 			}
 			toolCalls = append(toolCalls, model.ToolCall{
 				ID: b.ID, Type: "function",
@@ -511,8 +507,8 @@ func AnthropicMessageFromCompletion(payload []byte, publicModel string, cacheRea
 	if err != nil {
 		return nil, err
 	}
-	if len(v.Choices) == 0 {
-		return nil, fmt.Errorf("providers: internal completion has no choices")
+	if err := validateMessagesCompletion(v); err != nil {
+		return nil, err
 	}
 	ch := v.Choices[0]
 
@@ -530,9 +526,9 @@ func AnthropicMessageFromCompletion(payload []byte, publicModel string, cacheRea
 		content = append(content, map[string]any{"type": "text", "text": ch.Message.Content})
 	}
 	for _, tc := range ch.Message.ToolCalls {
-		var input any
-		if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil || input == nil {
-			input = map[string]any{}
+		input, err := toolArgumentObject(tc.Function.Arguments)
+		if err != nil {
+			return nil, err
 		}
 		content = append(content, map[string]any{
 			"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input,
@@ -623,6 +619,7 @@ type anthropicStreamRenderer struct {
 	finish        string
 	usage         *openAIUsage
 	errorRelayed  bool
+	arguments     messagesToolArguments
 }
 
 // anthropicToolBlock is one in-flight tool_use content block keyed by the
@@ -645,6 +642,17 @@ func TranslateOpenAIToAnthropicStream(body io.ReadCloser, messageID, model strin
 func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 	if r.errorRelayed {
 		return nil
+	}
+	if err := r.arguments.observe(ev); err != nil {
+		r.errorRelayed = true
+		if !r.started {
+			if startErr := r.emitStart(w); startErr != nil {
+				return startErr
+			}
+		}
+		return writeSSE(w, "error", map[string]any{
+			"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()},
+		})
 	}
 	if ev.done {
 		// [DONE]: close out anything still open. A stream that legitimately

@@ -336,14 +336,14 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			if it.CallID == "" || it.Name == "" {
 				return nil, invalidMsg("input", "function_call items require call_id and name")
 			}
-			if it.Arguments != "" && !json.Valid([]byte(it.Arguments)) {
+			if !json.Valid([]byte(it.Arguments)) {
 				return nil, invalidMsg("input", "function_call arguments must be a JSON-encoded value")
 			}
 			appendMessage(model.ChatMessage{
 				Role: "assistant",
 				ToolCalls: []model.ToolCall{{
 					ID: it.CallID, Type: "function",
-					Function: model.ToolCallFunction{Name: it.Name, Arguments: strOr(it.Arguments, "{}")},
+					Function: model.ToolCallFunction{Name: it.Name, Arguments: it.Arguments},
 				}},
 			})
 		case "function_call_output":
@@ -610,7 +610,7 @@ func ResponsesFromCompletion(payload []byte, responseID, publicModel string, cre
 
 	var calls []outputToolCall
 	for _, c := range ch.Message.ToolCalls {
-		calls = append(calls, outputToolCall{c.ID, c.Function.Name, strOr(c.Function.Arguments, "{}")})
+		calls = append(calls, outputToolCall{c.ID, c.Function.Name, c.Function.Arguments})
 	}
 	output := responsesOutputItems(ch.Message.ReasoningContent, ch.Message.Content, calls)
 
@@ -1009,9 +1009,6 @@ func (s *ResponsesStreamState) closeToolItem(w io.Writer, ti *responsesToolItem)
 	}
 	ti.open = false
 	args := ti.argsBuf.String()
-	if args == "" {
-		args = "{}"
-	}
 	if err := s.emit(w, "response.function_call_arguments.done", map[string]any{
 		"item_id": ti.itemID, "output_index": ti.outputIndex, "arguments": args,
 	}); err != nil {

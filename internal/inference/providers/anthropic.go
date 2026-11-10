@@ -108,9 +108,9 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 				blocks = append(blocks, map[string]any{"type": "text", "text": m.Content})
 			}
 			for _, tc := range m.ToolCalls {
-				var input any
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil || input == nil {
-					input = map[string]any{}
+				input, err := toolArgumentObject(tc.Function.Arguments)
+				if err != nil {
+					return nil, domain.NewError(domain.CodeInvalidInput, err.Error())
 				}
 				blocks = append(blocks, map[string]any{
 					"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input,
@@ -401,9 +401,6 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 		case "tool_use":
 			argumentBytes += len(b.Input)
 			args := string(b.Input)
-			if args == "" {
-				args = "{}"
-			}
 			toolCalls = append(toolCalls, map[string]any{
 				"id": b.ID, "type": "function",
 				"function": map[string]any{"name": b.Name, "arguments": args},

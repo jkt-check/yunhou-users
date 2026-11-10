@@ -221,7 +221,12 @@ func toolArgumentStream(proto domain.Protocol, args, ending string, reported boo
 	// A valid second call interleaves with the first.
 	switch proto {
 	case domain.ProtocolAnthropicMessage:
+		start := `{"type":"message_start","message":{"id":"msg_args"}}`
+		if reported {
+			start = `{"type":"message_start","message":{"id":"msg_args","usage":{"input_tokens":10,"output_tokens":0}}}`
+		}
 		events = append(events,
+			start,
 			`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_args","name":"lookup","input":{}}}`,
 			`{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_valid","name":"lookup","input":{}}}`,
 			fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":%q}}`, args[:len(args)/2]),
@@ -229,11 +234,14 @@ func toolArgumentStream(proto domain.Protocol, args, ending string, reported boo
 			fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":%q}}`, args[len(args)/2:]),
 			`{"type":"content_block_stop","index":0}`, `{"type":"content_block_stop","index":1}`,
 			`{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`)
-		if reported {
-			events = append(events, `{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":3}}}`)
+		if ending == "done_error_done" {
+			events = append(events, `{"type":"message_stop"}`)
 		}
 		if strings.Contains(ending, "error") {
 			events = append(events, `{"type":"error","error":{"message":"broken"}}`)
+		}
+		if reported {
+			events = append(events, `{"type":"message_delta","usage":{"output_tokens":3}}`)
 		}
 		if ending != "eof" {
 			events = append(events, `{"type":"message_stop"}`)
@@ -248,6 +256,9 @@ func toolArgumentStream(proto domain.Protocol, args, ending string, reported boo
 		usage := ""
 		if reported {
 			usage = `,"usage":{"input_tokens":10,"output_tokens":3}`
+		}
+		if ending == "done_error_done" {
+			events = append(events, `{"type":"response.completed","response":{"id":"resp_args","status":"completed"}}`)
 		}
 		if strings.Contains(ending, "error") {
 			events = append(events, `{"type":"error","error":{"message":"broken"}}`)
@@ -361,5 +372,37 @@ func TestToolArguments_ResponsesStreamVerbatim(t *testing.T) {
 				t.Errorf("stream transcript replay err=%v, want valid=%t", err, tc.valid)
 			}
 		})
+	}
+}
+
+func TestToolArguments_MessagesRejectsMultipleChoices(t *testing.T) {
+	wire := "data: " + `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_zero","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"},{"index":1,"delta":{"tool_calls":[{"index":0,"id":"call_one","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}` +
+		"\n\ndata: [DONE]\n\n"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, wire)
+	}))
+	defer up.Close()
+	call := chatCall(testDeployment(domain.ProtocolOpenAIChat, up.URL), true)
+	call.ClientProtocol = domain.ProtocolAnthropicMessage
+	res, err := Dispatch(context.Background(), NewHTTPClient(nil), NewOpenAIChat(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := TranslateOpenAIToAnthropicStream(res.Stream.TeeBody(), "msg_args", "m", true)
+	defer rendered.Close()
+	body, err := io.ReadAll(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(body), "event: error\n") != 1 || strings.Contains(string(body), "event: message_stop\n") {
+		t.Errorf("multiple choices merged into one Messages response: %s", body)
+	}
+	tap := res.Stream.Tap.Result()
+	if tap.Terminal || !tap.RejectedComplete || tap.ContentBytes != 4 {
+		t.Errorf("multiple choices lost rejection evidence: %+v", tap)
+	}
+	payload := []byte(`{"choices":[{"index":0,"message":{"content":"zero"}},{"index":1,"message":{"content":"one"}}]}`)
+	if body, err := AnthropicMessageFromCompletion(payload, "m", true); err == nil || len(body) != 0 {
+		t.Errorf("multiple nonstream choices silently dropped: %s, %v", body, err)
 	}
 }

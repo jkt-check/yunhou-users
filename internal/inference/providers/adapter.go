@@ -424,6 +424,9 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 			// failure on native surfaces, not a raw Chat upstream failure.
 			tap.rejectRefusal = true
 		}
+		if call.ClientProtocol == domain.ProtocolAnthropicMessage {
+			d.Stream.Tap = &messagesValidationTap{base: d.Stream.Tap}
+		}
 		return d, nil
 	}
 	defer resp.Body.Close()
@@ -445,6 +448,16 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	if ns.hasRefusal && nativeClient {
 		ns.Payload = nil
 		err = errChatRefusal
+	}
+	if err == nil && call.ClientProtocol == domain.ProtocolAnthropicMessage {
+		v, validationErr := parseCompletion(ns.Payload)
+		if validationErr == nil {
+			validationErr = validateMessagesCompletion(v)
+		}
+		if validationErr != nil {
+			ns.Payload = nil
+			err = validationErr
+		}
 	}
 	d.Payload = ns.Payload
 	d.Usage = ns.Usage

@@ -7936,6 +7936,51 @@ overage recurrence policy remain open. This checkpoint is not whole-branch
 review convergence. No push, merge, deployment, adjacent-source edit,
 kaya or inherited-agent operation.
 
+### 4.93 Recurring Corrected Overage (2026-11-10)
+
+**Files:** `internal/inference/postgres/reconciliation_repo.go`,
+`internal/inference/postgres/correction_overage_test.go`, the review
+convergence plan and this runbook.
+
+A changed successful over-hold correction now reopens an already resolved
+`settlement_overage` job in the accounting transaction. It preserves job
+identity, archives each prior resolution and timestamp in ordered
+`detail.resolution_history`, clears the active closure and uses the exact
+fresh deadline. Generic duplicate enqueue, all six manual-only reasons
+and continuing escalated overage retain their existing behavior.
+
+Focused RED `run.FJjaTd` reproduced the missing reopening and unreachable
+reopen-write failure; seven controls passed and two parent cases failed.
+Focused GREEN `run.iW9Qyu` passed nine tests/subtests with no failures or
+skips (6.169s), including repeated recurrence, listing/escalation, replay,
+closure history and atomic rollback with a successful same-key retry.
+Complete PostgreSQL race `run.P95xkF` passed 442 tests/subtests (181.322s),
+only the expected worker-child entry skipped. Owned clusters stopped.
+
+Full gate `run.bq2iKs` completed successfully with sources/tests frozen:
+`go build ./...`, vet, full race with `-count=1 -p 1 -timeout=30m`,
+coverage floor and separate E2E race. Race passed 6,034 tests/subtests
+across 34 packages, zero failures, with 80.9% total statement coverage.
+E2E passed 186 tests/subtests (235.481s), zero failures. Skips were only
+`TestQuotaWorkerProcess`, `TestLoadDrill_Throughput`,
+`TestLoadDrill_LongConnections` and
+`TestUsageTokenAcceptance_TenPagesTwoMinutes`.
+
+Artifacts are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/`: each named run retains its
+JSON test output, migration and cleanup logs; the full gate also contains
+`build.log`, `vet.log`, `coverage.out` and `coverage-summary.log`. Both
+independent disposable databases applied 55 migrations and skipped all
+55 on rerun. Cleanup confirmed the owned PostgreSQL stopped and its
+postmaster PID file is absent. Diff whitespace checks passed.
+
+Helmholtz's bounded independent static review through this change found
+no confirmed actionable defects; it did not run tests and explicitly
+excluded unfinished wallet correction and its production evidence caller.
+Those original requirements remain open. No real-provider/client or
+cross-host acceptance is claimed. No push, merge, deployment, adjacent
+source edit, kaya or inherited-agent operation occurred.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

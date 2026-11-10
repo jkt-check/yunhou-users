@@ -729,6 +729,21 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		if cmd.At.IsZero() {
 			deadline = time.Now().UTC().Add(24 * time.Hour)
 		}
+		// A changed correction is new evidence, not duplicate enqueue delivery.
+		// Archive the addressed incident before reopening only a resolved overage.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE inference_reconciliation_jobs
+			 SET status = 'pending', resolved_at = NULL, updated_at = now(),
+			     deadline_at = $2,
+			     detail = (detail - 'resolution') || jsonb_build_object(
+			         'resolution_history',
+			         COALESCE(detail->'resolution_history', '[]'::jsonb)
+			         || jsonb_build_array(jsonb_build_object(
+			             'resolution', detail->'resolution', 'resolved_at', resolved_at)))
+			 WHERE request_id = $1 AND reason = 'settlement_overage' AND status = 'resolved'`,
+			cmd.RequestID, deadline); err != nil {
+			return mapError("correction: reopen overage job", err)
+		}
 		if err := s.EnqueueReconciliationJobTx(ctx, w, EnqueueReconciliationCommand{
 			RequestID: &cmd.RequestID, Reason: "settlement_overage",
 			Detail: detail, Deadline: deadline,

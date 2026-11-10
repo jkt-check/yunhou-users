@@ -1546,6 +1546,71 @@ skipped 55 on rerun. Cleanup confirmed the owned PostgreSQL stopped and
 `data/postmaster.pid` is absent. Go sources/tests remained frozen throughout
 the gate. This closes Task 32, not whole-branch convergence.
 
+## Task 33: Reopen Recurring Corrected Overage
+
+**Files:** `internal/inference/postgres/reconciliation_repo.go`, new
+`correction_overage_test.go`, this plan and the verification runbook.
+
+**Interfaces:** `CorrectSettlement` keeps its command and transaction.
+Only its over-hold correction branch may reopen an existing resolved
+`settlement_overage`; generic enqueue and manual-only precedence stay intact.
+No migration or production evidence caller is added.
+
+- [x] Add real-database regression `TestCorrectSettlement_RecurringOverage`:
+  hold 100000, initial estimated charge 60000; correct to 120000, escalate,
+  correct to 90000, then 130000. Require one original job, pending, exact
+  new deadline, cleared active resolution and preserved prior note/time in
+  ordered `detail.resolution_history`. A generic duplicate stays resolved.
+- [x] Require pending listing and exact-deadline escalation to see recurrence;
+  replay cannot change accounting/history; ongoing escalated 140000 stays
+  escalated; 95000 then 150000 archives a second closure in order.
+- [x] Add all six resolved manual-only reason controls and an injected
+  resolved-to-pending write failure. The latter must roll back request,
+  usage, receipts, adjustments, ledger, TPM, windows, Key and job together;
+  the same correction key succeeds after removing the injected fault.
+- [x] Run owned PostgreSQL focused race tests and observe the missing
+  reopening/rollback failures before production edits.
+- [x] Add a guarded UPDATE in the correction-overage branch, archiving the
+  old resolution and time before clearing them, setting status pending and
+  the exact fresh deadline; then let existing enqueue refresh money detail.
+- [x] Run focused correction/reconciliation GREEN and full PostgreSQL race,
+  then owned build/vet/full race coverage and separate E2E; record evidence
+  and commit locally.
+
+Ruling: a successful changed correction causing a fresh overage is new
+actionable information, not duplicate delivery of the previously addressed
+finding. Keep job identity and prior closure audit. Cost: the recurrence
+gets a new deadline; continuing escalated findings and unrelated human
+conclusions must not be reset.
+
+Focused command:
+`env GOMAXPROCS=2 zsh /private/tmp/yunhou-review-20261109.3NuMWy/run.zsh ./internal/inference/postgres -run '^TestCorrectSettlement_(RecurringOverage|OveragePreservesManualResolution|OverageReopenFailureRollsBack)$' -timeout=5m`
+
+Expected RED: recurrence stays resolved and the injected reopen failure is
+never reached. Expected GREEN: all three parents and six manual controls
+pass with zero failures/skips. Full gate uses the same runner without
+arguments, with the 80% coverage floor and separate E2E.
+
+Focused RED `run.FJjaTd` exited 1: seven controls passed, while recurrence
+remained resolved with no history/pending/escalation and the injected reopen
+failure was never reached. Its accounting committed and same-key retry then
+conflicted. No compile/fixture failure or skip; owned PostgreSQL stopped.
+Focused GREEN `run.iW9Qyu` exited 0: nine tests/subtests, no failures or
+skips (6.169s). Complete PostgreSQL race `run.P95xkF` exited 0: 442
+tests/subtests (181.322s), no failures; only the expected worker-child
+entry skipped. Both runners stopped their owned PostgreSQL clusters.
+Helmholtz's bounded independent static review found no confirmed actionable
+bug in the branch through Task 33; it did not execute the verification gate
+and explicitly left wallet correction and its production caller unfinished.
+Full gate `run.bq2iKs` completed successfully with Go sources/tests frozen:
+build/vet passed; 6,034 race tests/subtests across 34 packages, zero
+failures, 80.9% total statement coverage; separate E2E race passed 186
+tests/subtests (235.481s), zero failures. Only the expected worker-child
+entry and opt-in load/usage drills skipped. Both independent disposable
+databases applied 55 migrations and skipped 55 on rerun. Cleanup confirmed
+the owned PostgreSQL stopped and `data/postmaster.pid` is absent.
+Runbook 4.93 records the file manifest, evidence and remaining boundaries.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are
@@ -1579,9 +1644,9 @@ not waived scope:
   is reproduced, fixed and verified in Task 27 with focused RED/GREEN,
   complete gateway/PostgreSQL race, bounded review and a fresh full gate.
 - Addressed escalated evidence/overage jobs remaining open after correction
-  are reproduced, fixed and verified in Task 26. Re-enqueue policy for a
-  subsequent changed correction to an already-resolved overage remains a
-  separate open investigation, not behavior prescribed by Task 26.
+  are reproduced, fixed and verified in Task 26. Subsequent changed
+  corrections now reopen resolved overage with ordered closure audit and
+  a fresh exact deadline in Task 33; its full verification passed.
 - Wallet arithmetic overflow is reproduced, fixed and verified in Task 25
   with focused RED/GREEN, bounded review and a fresh full gate.
 

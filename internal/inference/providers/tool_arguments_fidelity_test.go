@@ -124,6 +124,34 @@ func TestToolArguments_MessagesObjectConversion(t *testing.T) {
 	}
 }
 
+func TestToolArguments_MessagesIngressObject(t *testing.T) {
+	for _, tc := range toolArgumentCases {
+		if !tc.valid && tc.args != "" {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			input := ""
+			if tc.args != "" {
+				input = `,"input":` + tc.args
+			}
+			body := `{"model":"m","max_tokens":32,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_args","name":"lookup"` + input + `}]}]}`
+			req, err := ParseAnthropicMessagesRequest([]byte(body))
+			if (err == nil) != tc.object {
+				t.Fatalf("ingress err=%v, want object=%t", err, tc.object)
+			}
+			if !tc.object {
+				if domain.CodeOf(err) != domain.CodeInvalidInput {
+					t.Errorf("invalid object needs input error: %v", err)
+				}
+				return
+			}
+			if got := req.Messages[0].ToolCalls[0].Function.Arguments; got != tc.args {
+				t.Errorf("ingress object changed to %q, want %q", got, tc.args)
+			}
+		})
+	}
+}
+
 func TestToolArguments_MessagesDispatchNonstreamEvidence(t *testing.T) {
 	for _, adapter := range []Adapter{NewOpenAIChat(), NewOpenAIResponses(), NewAnthropicMessages()} {
 		for _, reported := range []bool{false, true} {

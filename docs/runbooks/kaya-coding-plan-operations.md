@@ -201,6 +201,20 @@ estimated。拒绝片段后裸 EOF 且无 usage 时保留预占并挂起核对�
 错误优先于拒绝完成证据，后续 `[DONE]` 不能把失败改成完整拒绝。
 本次不扩展拒绝内容的原生渲染或历史回放 schema。
 
+## Responses incomplete 与真实失败
+
+Responses 的 `incomplete` 仅支持 `max_output_tokens` 和 `content_filter`
+原因。原因缺失、null、为空或未知时明确报翻译错误，不当成正常 `stop`；
+终止事件与响应对象的非空状态冲突也拒绝。非流式返回 502；流式保留此前
+有效文本，只发一次原生错误，不发成功终态或保存会话链，继续读取晚到 usage。
+这是已执行的调用：完整拒绝保留消费证据，按已报 usage 或完整输出估算，
+不自动重放或切换上游。
+
+拒绝之后的真实上游错误、失败对象或读取错误会使完整拒绝证据失效；
+后来的完成事件不能恢复该证据。无 usage 时，金额和 TPM 预占继续冻结并
+进入待核对，不能按零结算；已有 usage 则按 estimated 结算。该规则也适用
+于 Responses refusal。不要把协议翻译失败误当作准入前拒绝而释放预占。
+
 ## 工具参数的保真与对象边界
 
 Responses 输出的 `function_call.arguments` 是原始字符串，空或截断也不补

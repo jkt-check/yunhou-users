@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -84,9 +85,39 @@ func TestResponsesIncomplete_StreamRejectsWithoutFalseTerminal(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						if strings.Count(string(body), `"error"`) != 1 || strings.Contains(string(body), "[DONE]") ||
-							strings.Contains(string(body), `"finish_reason"`) {
-							t.Errorf("incomplete emitted a successful terminal or no error: %s", body)
+						var errors int
+						var content strings.Builder
+						for _, line := range strings.Split(string(body), "\n") {
+							data, ok := strings.CutPrefix(line, "data: ")
+							if !ok {
+								continue
+							}
+							if data == "[DONE]" {
+								t.Errorf("incomplete emitted DONE: %s", body)
+								continue
+							}
+							var chunk struct {
+								Error   *struct{ Message string } `json:"error"`
+								Choices []struct {
+									FinishReason *string                  `json:"finish_reason"`
+									Delta        struct{ Content string } `json:"delta"`
+								} `json:"choices"`
+							}
+							if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+								t.Fatalf("invalid translated chunk %q: %v", data, err)
+							}
+							if chunk.Error != nil {
+								errors++
+							}
+							for _, choice := range chunk.Choices {
+								if choice.FinishReason != nil {
+									t.Errorf("incomplete emitted finish reason %q", *choice.FinishReason)
+								}
+								content.WriteString(choice.Delta.Content)
+							}
+						}
+						if errors != 1 || content.String() != "partial" {
+							t.Errorf("rejection lost partial content or emitted %d errors: %s", errors, body)
 						}
 						tap := st.Tap.Result()
 						if tap.Terminal || !tap.RejectedComplete || tap.ContentBytes != 7 || tap.SawUsage != reported {
@@ -111,7 +142,11 @@ func TestResponsesIncomplete_ActualFailureDominatesCompleteRejection(t *testing.
 		{"failed", "data: " + `{"type":"response.failed","response":{"status":"failed"}}` + "\n\n"},
 		{"read_error", ""},
 	} {
-		for _, position := range []string{"before", "after"} {
+		positions := []string{"before", "after"}
+		if failure.name == "read_error" {
+			positions = []string{"at_eof"}
+		}
+		for _, position := range positions {
 			for _, size := range []int{1, 4096} {
 				t.Run(fmt.Sprintf("%s/%s/chunk=%d", failure.name, position, size), func(t *testing.T) {
 					wire := terminal + failure.wire + late

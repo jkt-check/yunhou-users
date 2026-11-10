@@ -1380,12 +1380,13 @@ only in the absence of a real upstream failure.
 - [x] Add authenticated regressions across all three client surfaces; verify
   one attempt/charge, exact usage/TPM, no chain and no held leases on a complete
   rejected execution. Run them on owned databases and observe RED.
-- [ ] Reject unsupported incomplete reasons before successful settlement or
+- [x] Reject unsupported incomplete reasons before successful settlement or
   stream completion. Real protocol/read errors must dominate rejected-complete
   evidence, even if another terminal and late usage follow.
-- [ ] Run focused GREEN, complete providers race, full build/vet/race coverage
-  and separate E2E with independent owned databases.
-- [ ] Record evidence, remaining gaps and the local commit; no push/merge/deploy.
+- [x] Run focused GREEN and the complete providers race suite.
+- [x] Run full build/vet/race coverage and separate E2E with independent
+  owned databases.
+- [x] Record evidence, remaining gaps and the local commit; no push/merge/deploy.
 
 Ruling: reject rather than map an unknown incomplete reason to `stop`, `length`
 or `content_filter`. The internal Chat representation has no faithful value
@@ -1436,6 +1437,37 @@ not been rerun for this checkpoint. The prior 80.8% coverage remains Task 30
 evidence only. Task 31 implementation/verification checklist items remain
 open. No push, merge, deployment or kaya process operation.
 
+Follow-up verification (2026-11-10): the remaining provider failure was a
+false-positive assertion, not a successful terminal. Valid partial deltas
+contain `finish_reason:null`; the test now parses SSE JSON, rejects DONE and
+non-null finish reasons, requires exactly one error and preserves the exact
+preceding text. Read-error fixture labels now describe the actual trailing
+EOF error, removing two duplicate cases rather than claiming before/after
+transport-error coverage.
+
+The corrected assertion still fails against the pre-fix production adapters
+from `af48394` through a Go overlay: 98 failing tests/subtests and 12 passes
+(5.747s), with all four Task 31 parents failing. Current complete providers
+race passed 1,055 tests/subtests, zero failures/skips (3.470s). Authenticated
+HTTP race `run.inRpgJ` passed 78 tests/subtests, zero failures/skips (45.809s),
+including complete rejected settlement and real-failure/no-usage holds on
+all three client surfaces. Its owned PostgreSQL stopped. API/OpenAPI and
+operations docs now record unsupported reasons and real-failure precedence.
+Runbook 4.91 records evidence and remaining boundaries.
+
+Fresh full gate `run.j5wwP1` exited 0: build/vet passed; full race passed
+5,771 tests/subtests across 34 packages, zero failures, with 80.9% total
+statement coverage. Separate E2E race passed 186 tests/subtests (297.550s),
+zero failures. Only the expected child entry and opt-in drills skipped;
+no unavailable-database acceptance skipped. Both independent disposable
+databases applied 55 migrations and skipped 55 on rerun. Cleanup confirmed
+the owned PostgreSQL stopped and `data/postmaster.pid` is absent.
+Go sources/tests remained frozen throughout this gate. This six-file local
+checkpoint contains the assertion correction and five documents, not new
+production code. No independent Task 31 or whole-branch clean review,
+real-provider/client/cross-host acceptance, push, merge or deployment is
+claimed. Kaya and inherited agents were not operated.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are
@@ -1462,8 +1494,8 @@ not waived scope:
   valid 1025-output/1024-budget boundary. The reviewer reproduced these in
   owned temporary provider overlays. The thinking boundary is now reproduced,
   fixed and verified in Task 28. Chat refusal is fixed and verified in
-  Task 29, and fabricated tool arguments in Task 30; missing/unknown
-  incomplete reasons and partial public usage remain open.
+  Task 29, fabricated tool arguments in Task 30, and missing/unknown
+  incomplete reasons in Task 31. Partial public usage remains open.
 - Boole's finding of late real finalizer evidence lost on terminal conflict
   is reproduced, fixed and verified in Task 27 with focused RED/GREEN,
   complete gateway/PostgreSQL race, bounded review and a fresh full gate.

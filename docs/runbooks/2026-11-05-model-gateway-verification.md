@@ -7760,6 +7760,92 @@ its production evidence caller and already-resolved overage re-enqueue policy
 remain open. This checkpoint is not a whole-branch clean-review or release
 claim. No push, merge, deployment, adjacent-source edit or kaya operation.
 
+### 4.91 Task 31: Reject Unsupported Responses Incomplete Reasons
+
+**Scope:** missing/null/empty/unknown incomplete reasons reject instead of
+becoming a successful `stop`. Only `max_output_tokens` and `content_filter`
+translate faithfully. Nonempty terminal event/object status conflicts also
+reject. Execution identity, output bytes and usage remain available for
+settlement; a real upstream error, failed object or read error invalidates
+complete-rejection evidence even if another terminal follows.
+
+The production changes and additional regressions are already in
+`bc80475`; the earlier RED regressions are in `af48394`. This follow-up
+changes one provider test plus the API guide, OpenAPI, operations runbook,
+convergence plan and this verification record, not production code.
+
+**Assertion correction:** the implementation checkpoint's remaining failures
+were caused by rejecting any `finish_reason` substring, including the valid
+`finish_reason:null` on preceding partial text. The test now parses SSE JSON,
+rejects DONE and non-null finish reasons, requires exactly one error and
+requires the exact preceding text `partial`. It does not hide that text.
+Read-error cases now use the truthful `at_eof` label; two duplicated cases
+were removed, not newly verified as before/after transport failures.
+
+**RED/GREEN evidence:**
+
+- The original assertion reproduced its false positive in
+  `task-31-assertion-before.jsonl`.
+- With the corrected assertion and the pre-fix adapters from `af48394`
+  supplied through a Go overlay, focused provider race exited 1: 98 failing
+  tests/subtests and 12 passes (5.747s), all four Task 31 parents failing.
+  Evidence: `task-31-corrected-assertion-red.jsonl`. This proves the corrected
+  assertion still detects the original false-success/evidence defects.
+- Current complete providers race exited 0: 1,055 passed tests/subtests,
+  zero failures/skips (3.470s). Evidence:
+  `task-31-corrected-providers-green.jsonl`.
+- Authenticated HTTP race `run.inRpgJ` exited 0: 78 passed tests/subtests,
+  zero failures/skips (45.809s). The three-surface matrix checks one attempt,
+  exact money/TPM settlement, no chain and the expected released or retained
+  holds. Real errors, failed objects and read errors after incomplete/refusal
+  rejection without usage keep money/TPM held for reconciliation.
+  Its disposable PostgreSQL stopped and `data/postmaster.pid` is absent.
+
+Provider JSON logs and overlay artifacts are under the ignored
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/` directory.
+HTTP evidence is under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.inRpgJ/`.
+
+**Fresh full gate:** `run.j5wwP1` exited 0 on 2026-11-10 (Asia/Shanghai).
+The owned runner used `GOMAXPROCS=2`, `GOPROXY=off`,
+`GOFLAGS=-mod=readonly` and explicit independent application/E2E database URLs:
+
+```sh
+go build ./...
+go vet ./internal/... ./cmd/...
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+go tool cover -func="$RUN/coverage.out"
+go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...
+```
+
+Build and vet passed. Full race passed 5,771 tests/subtests across 34
+packages, zero failures, with 80.9% total statement coverage above the 80%
+floor. Separate E2E race passed 186 tests/subtests (297.550s), zero failures.
+The only skips were `TestQuotaWorkerProcess`, `TestLoadDrill_Throughput`,
+`TestLoadDrill_LongConnections` and
+`TestUsageTokenAcceptance_TenPagesTwoMinutes`: expected child entry and
+opt-in drills, not unavailable database acceptance.
+
+Both independent disposable databases applied 55 migrations and skipped 55
+on rerun. Cleanup confirmed the owned PostgreSQL stopped and
+`data/postmaster.pid` is absent. Go sources/tests remained frozen throughout
+the full gate. Formatting, OpenAPI YAML parsing and diff whitespace checks
+passed. Artifacts are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.j5wwP1/`: `build.log`,
+`vet.log`, `tests.jsonl`, `coverage.out`, `coverage-summary.log`, `e2e.jsonl`,
+both migration logs and `cleanup.log`.
+
+**Remaining boundaries:** compatible upstreams that omit incomplete reasons
+now fail explicitly instead of fabricating successful completion. A valid
+success already emitted cannot be retracted. No real-provider, real-client
+or cross-host acceptance is claimed. Partial public usage, wallet correction,
+its production evidence caller and already-resolved overage re-enqueue policy
+remain open. No fresh independent Task 31 or whole-branch review is claimed.
+This local checkpoint is not review convergence or release acceptance.
+No push, merge, deployment, adjacent-source edit or kaya process operation.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

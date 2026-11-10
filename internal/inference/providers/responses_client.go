@@ -525,26 +525,37 @@ func ResponsesUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 	if u == nil {
 		return nil
 	}
-	input := derefOr(u.PromptTokens, 0)
-	output := derefOr(u.CompletionTokens, 0)
-	var cached, reasoning int64
+	input := u.PromptTokens
+	var cached, reasoning *int64
 	if u.PromptDetails != nil {
-		cached = derefOr(u.PromptDetails.CachedTokens, 0)
+		cached = u.PromptDetails.CachedTokens
 	}
 	if u.CompletionDetails != nil {
-		reasoning = derefOr(u.CompletionDetails.ReasoningTokens, 0)
+		reasoning = u.CompletionDetails.ReasoningTokens
 	}
+	total := u.TotalTokens
 	if !cacheReadInInput {
-		input += cached + derefOr(u.CacheCreationTokens, 0)
+		input = addUsageDetails(input, cached, u.CacheCreationTokens)
+		total = nil // The wire total excludes Anthropic cache buckets.
 	}
-	usage := map[string]any{
-		"input_tokens":         input,
-		"input_tokens_details": map[string]any{"cached_tokens": cached},
-		"output_tokens":        output,
-		"output_tokens_details": map[string]any{
-			"reasoning_tokens": reasoning,
-		},
-		"total_tokens": input + output,
+	usage := map[string]any{}
+	if input != nil {
+		usage["input_tokens"] = *input
+	}
+	if u.CompletionTokens != nil {
+		usage["output_tokens"] = *u.CompletionTokens
+	}
+	if cached != nil {
+		usage["input_tokens_details"] = map[string]any{"cached_tokens": *cached}
+	}
+	if reasoning != nil {
+		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": *reasoning}
+	}
+	if total == nil {
+		total = derivedUsageTotal(input, u.CompletionTokens)
+	}
+	if total != nil {
+		usage["total_tokens"] = *total
 	}
 	return usage
 }

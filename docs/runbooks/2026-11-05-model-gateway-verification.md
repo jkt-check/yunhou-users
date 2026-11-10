@@ -7846,6 +7846,96 @@ remain open. No fresh independent Task 31 or whole-branch review is claimed.
 This local checkpoint is not review convergence or release acceptance.
 No push, merge, deployment, adjacent-source edit or kaya process operation.
 
+### 4.92 Partial Public Usage Fidelity (2026-11-10)
+
+Task 32 preserves missing-versus-zero usage across native Chat, Responses
+and Anthropic adapters and all three public surfaces, streaming and
+nonstreaming. Missing counters/details are omitted; explicit zero remains.
+Inclusive upstream Chat/Responses totals are preserved, including raw
+Responses evidence. A derived total requires both main counters and
+nonnegative int64-safe arithmetic. Anthropic-exclusive input becomes
+Responses-inclusive input only when the main input is known; cache read
+and creation are added before deriving the new total. Impossible derived
+values are omitted, not wrapped or clamped. Total-only/detail-only usage
+does not invent billable main buckets.
+
+`domain.UsageBuckets`, accounting validation and the initial Messages stream
+0/0 protocol placeholders are unchanged.
+
+**Production files:** `internal/inference/providers/usage_wire.go`,
+`anthropic.go`, `anthropic_stream.go`, `client_surface.go`,
+`messages_client.go`, `openai_responses.go`, `openai_responses_stream.go`
+and `responses_client.go`. Regression files were committed in `a033404`:
+`internal/inference/providers/partial_usage_test.go` and
+`internal/inference/httpapi/partial_usage_test.go`. Documentation changes
+are the API integration guide, this runbook and the review convergence plan.
+
+**RED/GREEN evidence:** the committed tests failed before implementation.
+The resumed provider RED recorded 64 passes and 153 failures, zero skips
+(`task-32-resume-red.jsonl`). Focused provider GREEN recorded 217 passes,
+zero failures/skips (2.627s, `task-32-green.jsonl`). Complete providers race
+after final cleanup recorded 1,272 passes, zero failures/skips (10.271s,
+`task-32-providers.jsonl`):
+
+```sh
+env GOMAXPROCS=2 GOPROXY=off GOFLAGS=-mod=readonly \
+  go test -race -count=1 -json ./internal/inference/providers
+```
+
+Authenticated HTTP GREEN `run.PMOGlV` recorded 37 passing tests/subtests
+(36 leaves), zero failures/skips (52.314s). The three-native by three-public
+matrix checks streaming/nonstreaming input-only and output-only usage.
+Public omission agrees with stored NULL buckets, exact money and TPM:
+known input 2 charges 2/TPM 2; known output 7 charges 14/TPM 7.
+Every request has one completed attempt and charge, without remaining
+money/rate holds, concurrency leases or reconciliation jobs.
+
+```sh
+env GOMAXPROCS=2 zsh /private/tmp/yunhou-review-20261109.3NuMWy/run.zsh \
+  ./internal/inference/httpapi -run '^TestV1PartialUsage_' -timeout=5m
+```
+
+Provider artifacts are under the ignored
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/` workspace;
+HTTP artifacts are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.PMOGlV/`.
+The HTTP runner's independent disposable PostgreSQL stopped on cleanup.
+
+**Full gate:** `run.x0U22A` exited 0 with Go sources/tests frozen:
+
+```sh
+go build ./...
+go vet ./internal/... ./cmd/...
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+go tool cover -func="$RUN/coverage.out"
+go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...
+```
+
+Build and vet passed. Full race passed 6,025 tests/subtests across 34
+packages, zero failures, with 80.9% total statement coverage above the 80%
+floor. Separate E2E race passed 186 tests/subtests (314.193s), zero failures.
+The only skips were `TestQuotaWorkerProcess`, `TestLoadDrill_Throughput`,
+`TestLoadDrill_LongConnections` and
+`TestUsageTokenAcceptance_TenPagesTwoMinutes`: expected child entry and
+opt-in drills, not unavailable database acceptance.
+
+Both independent disposable databases applied 55 migrations and skipped 55
+on rerun. Cleanup confirmed the owned PostgreSQL stopped and
+`data/postmaster.pid` is absent. Formatting and diff whitespace checks passed.
+Artifacts are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.x0U22A/`: `build.log`,
+`vet.log`, `tests.jsonl`, `coverage.out`, `coverage-summary.log`, `e2e.jsonl`,
+both migration logs and `cleanup.log`.
+
+**Remaining boundaries:** callers must tolerate omitted unknown fields.
+No real-provider/client or cross-host acceptance is claimed. Wallet
+correction, its production evidence caller and the already-resolved
+overage recurrence policy remain open. This checkpoint is not whole-branch
+review convergence. No push, merge, deployment, adjacent-source edit,
+kaya or inherited-agent operation.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

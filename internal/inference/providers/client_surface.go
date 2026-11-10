@@ -253,14 +253,6 @@ func NewPublicMessageID() string { return newPublicID("msg_") }
 // NewPublicResponseID returns the public Responses object id (resp_...).
 func NewPublicResponseID() string { return newPublicID("resp_") }
 
-// derefOr returns *p or the fallback.
-func derefOr(p *int64, fallback int64) int64 {
-	if p == nil {
-		return fallback
-	}
-	return *p
-}
-
 // strOr returns v unless empty.
 func strOr(v, fallback string) string {
 	if v == "" {

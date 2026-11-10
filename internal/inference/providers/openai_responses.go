@@ -379,24 +379,10 @@ func (u *responsesUsage) usageBuckets() domain.UsageBuckets {
 }
 
 // openAIWireUsage renders the OpenAI-shaped usage map embedded into the
-// translated internal payload, so the client surfaces (Task 13) can render
-// cache/reasoning natively (cached_tokens in prompt_tokens_details,
-// reasoning_tokens in completion_tokens_details). nil 桶在此渲成 0 是有意
-// 的：nil-vs-zero 纪律约束的是计量桶（UsageBuckets），wire 渲染与
-// anthropic.go 的 DecodeNonStream 同口径。
+// translated internal payload without inventing absent counters or replacing
+// the upstream-reported total.
 func (u *responsesUsage) openAIWireUsage() map[string]any {
-	usage := map[string]any{
-		"prompt_tokens":     derefInt64(u.InputTokens),
-		"completion_tokens": derefInt64(u.OutputTokens),
-		"total_tokens":      derefInt64(u.InputTokens) + derefInt64(u.OutputTokens),
-	}
-	if u.InputDetails != nil && u.InputDetails.CachedTokens != nil {
-		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": *u.InputDetails.CachedTokens}
-	}
-	if u.OutputDetails != nil && u.OutputDetails.ReasoningTokens != nil {
-		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": *u.OutputDetails.ReasoningTokens}
-	}
-	return usage
+	return openAIUsageShape(u.usageBuckets(), u.TotalTokens)
 }
 
 // marshalResponsesRawUsage renders the schema-versioned raw_usage document
@@ -409,6 +395,9 @@ func marshalResponsesRawUsage(u *responsesUsage) json.RawMessage {
 	}
 	if u.OutputTokens != nil {
 		w["output_tokens"] = *u.OutputTokens
+	}
+	if u.TotalTokens != nil {
+		w["total_tokens"] = *u.TotalTokens
 	}
 	if u.InputDetails != nil && u.InputDetails.CachedTokens != nil {
 		w["input_tokens_details"] = map[string]any{"cached_tokens": *u.InputDetails.CachedTokens}

@@ -430,22 +430,6 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	result.ContentBytes = int64(text.Len() + reasoning.Len() + argumentBytes)
 	if resp.Usage != nil {
 		u := resp.Usage
-		usage := map[string]any{
-			"prompt_tokens":     derefInt64(u.InputTokens),
-			"completion_tokens": derefInt64(u.OutputTokens),
-			"total_tokens":      derefInt64(u.InputTokens) + derefInt64(u.OutputTokens),
-		}
-		// Cache buckets ride the wire so the client surfaces (Task 13) can
-		// render them natively: cached_tokens in prompt_tokens_details
-		// (OpenAI-conventional), cache creation via the extension key
-		// (OpenAI consumers ignore unknown keys).
-		if u.CacheReadInputTokens != nil {
-			usage["prompt_tokens_details"] = map[string]any{"cached_tokens": *u.CacheReadInputTokens}
-		}
-		if u.CacheCreationTokens != nil {
-			usage["cache_creation_input_tokens"] = *u.CacheCreationTokens
-		}
-		out["usage"] = usage
 		result.UsageReported = true
 		result.Usage = domain.UsageBuckets{
 			InputTokens:      u.InputTokens,
@@ -453,6 +437,7 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 			CacheReadTokens:  u.CacheReadInputTokens,
 			CacheWriteTokens: u.CacheCreationTokens,
 		}
+		out["usage"] = openAIUsageShape(result.Usage, nil)
 		result.UsageRaw = marshalAnthropicRawUsage(u.InputTokens, u.OutputTokens,
 			u.CacheReadInputTokens, u.CacheCreationTokens)
 	}
@@ -465,13 +450,6 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	}
 	result.Payload = payload
 	return result, nil
-}
-
-func derefInt64(p *int64) int64 {
-	if p == nil {
-		return 0
-	}
-	return *p
 }
 
 // marshalAnthropicRawUsage renders the schema-versioned raw_usage document

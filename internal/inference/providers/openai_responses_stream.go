@@ -153,6 +153,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	terminalSeen := false
 	failed := false
 	translationRejected := false
+	var reportedTotal *int64
 	// Deltas add bytes; later part/item/response snapshots repeat that same
 	// content, so only their previously unseen suffix contributes.
 	type contentKey struct {
@@ -224,6 +225,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 			if ev.Response != nil {
 				if ev.Response.Usage != nil {
 					tap.recordUsage(ev.Response.Usage)
+					reportedTotal = ev.Response.Usage.TotalTokens
 				}
 				for i := range ev.Response.Output {
 					if recordItem(i, &ev.Response.Output[i]) {
@@ -353,7 +355,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 				// 上游从未报 usage 时只发 [DONE]——缺失 usage 绝不渲染为
 				// {"total_tokens":0}（与 anthropic 路径同一纪律）。
 				if res := tap.Result(); res.SawUsage {
-					err = writeOpenAIUsageAndDone(w, res.Buckets)
+					err = writeOpenAIUsageAndDone(w, res.Buckets, reportedTotal)
 				} else {
 					_, err = io.WriteString(w, "data: [DONE]\n\n")
 				}
@@ -372,7 +374,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	// no client renders the partial answer as complete (同 anthropic 路径).
 	if !terminalSeen || failed {
 		if b := tap.Result(); b.SawUsage {
-			if err := writeOpenAIUsage(w, b.Buckets); err != nil {
+			if err := writeOpenAIUsage(w, b.Buckets, reportedTotal); err != nil {
 				return err
 			}
 		}

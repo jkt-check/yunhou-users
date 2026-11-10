@@ -669,6 +669,8 @@ picker 让客户发图、网关在准入前当场 400）。判据与派发共用
 
 **用法/用量映射**：Messages 面 `usage.input_tokens` 不含 cache_read（Anthropic 口径），`cache_read_input_tokens`/`cache_creation_input_tokens` 单列；Responses 面 `input_tokens` 含 cached（OpenAI 口径）+ `input_tokens_details.cached_tokens`。流式 `message_start.usage` 是协议占位（0/0），真实值在终止 `message_delta.usage`（含 `input_tokens`，当前 Anthropic SDK 的 `MessageDeltaUsage` 支持该字段）。非流式响应在上游确实未报 usage 时不伪造 usage 字段。
 
+**部分用量**：上游只报告部分计数时，三个入口均保留已知字段和显式 `0`，未知主计数或明细字段省略，不补零。Chat/Responses 的上游 `total_tokens` 原样保留；没有报告总量时，仅在 input/output 两个主计数都已知且非负、相加不溢出时推导总量。仅有总量或缓存明细不能反推计费主计数。Anthropic 上游转 Responses 时，已知 input 加入 cache_read/cache_creation 后重新推导总量；未知 input 不由缓存明细补出。无法得到非负 int64 的缓存转换字段保持未知，不截零、不溢出。Messages 的初始流式 0/0 占位不变，最终用量才是计量事实；数据库中的未知桶仍为 NULL，金额与 TPM 仅按实际已知桶结算。
+
 **流式中断语义（三协议一致）**：协议终止标记（`[DONE]`/`message_stop`/`response.completed`）是唯一干净结束；上游中断时向流内注入该协议的原生错误事件（chat：内联 `{"error":...}` 块；messages：`event: error`；responses：`event: error`）后结束，**绝不伪造终止标记**。已读用量照常结算（estimated）；未读用量挂起核对（不记零）。
 
 **非流式输出保序**：Anthropic/Responses 上游的非空文本若出现在工具调用之后（如「文本 → 调用 → 文本」或「调用 → 文本 → 调用」），内部 Chat 形状无法忠实保序，三个 `/v1` 推理入口均返回 **502**，不返回改写后的答案，也不持久化 Responses 会话链。OpenAI 错误码为 `upstream_response_invalid`，Messages 使用 `api_error`。这是**已经执行**的请求：已报 usage 按 reported 结算，缺失 usage 按完整输出内容估算，TPM 同步结算；网关不重放、不切换上游。客户端主动重试属于另一次可能计费的调用。文本在调用之前、空文本穿插调用之间仍支持。

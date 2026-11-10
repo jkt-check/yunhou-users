@@ -1484,12 +1484,12 @@ retains the latest reported total separately from accounting buckets.
 - [x] Observe focused RED for fabricated counters and lost reported total.
 - [x] Add authenticated HTTP regressions proving public omission agrees with
   persisted nullable counters, settlement and TPM. Observe owned-database RED.
-- [ ] Preserve known fields and explicit zeros; derive totals only from two
+- [x] Preserve known fields and explicit zeros; derive totals only from two
   known nonnegative counters with safe arithmetic. Preserve reported totals.
-- [ ] Retain Anthropic cache inclusion conversion without manufacturing a main
+- [x] Retain Anthropic cache inclusion conversion without manufacturing a main
   input from detail-only usage. Omit unrepresentable derived fields rather
   than overflow or clamp. Leave initial Messages protocol placeholders alone.
-- [ ] Run focused GREEN, complete providers race, then owned build/vet/full
+- [x] Run focused GREEN, complete providers race, then owned build/vet/full
   race coverage and separate E2E; record evidence and commit locally.
 
 Ruling: missing usage counters stay absent on public output, not zero.
@@ -1520,10 +1520,31 @@ The runner used independently created disposable databases with explicit
 DSNs; cleanup confirmed its PostgreSQL stopped and `postmaster.pid` is
 absent.
 
-This is a verified RED checkpoint, not a fix or convergence claim.
+This was a verified RED checkpoint, not a fix or convergence claim.
 Full race, E2E and coverage were not rerun; prior coverage belongs to
 Task 31, not this tree. Production implementation and GREEN gates remain
 open. No push, merge, deployment, kaya or inherited-agent operation.
+
+Implementation continuation: native wire output and public renderers now
+preserve optional counter presence, explicit zeros and inclusive reported
+totals. Checked arithmetic omits unrepresentable derived counters. Responses
+raw evidence also retains its reported total. Accounting buckets and initial
+Messages placeholders are unchanged. Focused provider race passed 217
+tests/subtests without failures/skips; complete providers race after final
+cleanup passed 1,272 tests/subtests (10.271s), zero failures/skips.
+Authenticated HTTP race `run.PMOGlV` passed 37 tests/subtests (36 leaves,
+52.314s), zero failures/skips: absent input/output stays NULL, known input 2
+charges 2 and TPM 2, known output 7 charges 14 and TPM 7. Each request has
+one completed attempt/charge and no remaining holds, leases or jobs.
+The owned PostgreSQL stopped on cleanup. Full gate `run.x0U22A` exited 0:
+build/vet passed; full race passed 6,025 tests/subtests across 34 packages,
+zero failures, with 80.9% total statement coverage. Separate E2E race passed
+186 tests/subtests (314.193s), zero failures. Only the expected child entry
+and opt-in load/usage drills skipped; no unavailable-database acceptance
+skipped. Both independent disposable databases applied 55 migrations and
+skipped 55 on rerun. Cleanup confirmed the owned PostgreSQL stopped and
+`data/postmaster.pid` is absent. Go sources/tests remained frozen throughout
+the gate. This closes Task 32, not whole-branch convergence.
 
 ## Pending Review Findings (2026-11-10)
 
@@ -1552,7 +1573,8 @@ not waived scope:
   owned temporary provider overlays. The thinking boundary is now reproduced,
   fixed and verified in Task 28. Chat refusal is fixed and verified in
   Task 29, fabricated tool arguments in Task 30, and missing/unknown
-  incomplete reasons in Task 31. Partial public usage remains open.
+  incomplete reasons in Task 31. Partial public usage is fixed and verified
+  in Task 32.
 - Boole's finding of late real finalizer evidence lost on terminal conflict
   is reproduced, fixed and verified in Task 27 with focused RED/GREEN,
   complete gateway/PostgreSQL race, bounded review and a fresh full gate.

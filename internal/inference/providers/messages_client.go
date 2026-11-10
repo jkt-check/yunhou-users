@@ -554,25 +554,30 @@ func AnthropicMessageFromCompletion(payload []byte, publicModel string, cacheRea
 // input_tokens EXCLUDES cache reads (subtracted only when the wire included
 // them); output_tokens includes thinking (Anthropic 口径).
 func anthropicUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
-	input := derefOr(u.PromptTokens, 0)
-	var cached int64
+	input := u.PromptTokens
+	var cached *int64
 	if u.PromptDetails != nil {
-		cached = derefOr(u.PromptDetails.CachedTokens, 0)
+		cached = u.PromptDetails.CachedTokens
 	}
-	if cacheReadInInput {
-		input -= cached
-		if input < 0 {
-			input = 0
+	if cacheReadInInput && input != nil && cached != nil {
+		if *cached < 0 || *input < *cached {
+			input = nil
+		} else {
+			exclusive := *input - *cached
+			input = &exclusive
 		}
 	}
-	usage := map[string]any{
-		"input_tokens":  input,
-		"output_tokens": derefOr(u.CompletionTokens, 0),
+	usage := map[string]any{}
+	if input != nil {
+		usage["input_tokens"] = *input
 	}
-	if cached > 0 {
-		usage["cache_read_input_tokens"] = cached
+	if u.CompletionTokens != nil {
+		usage["output_tokens"] = *u.CompletionTokens
 	}
-	if u.CacheCreationTokens != nil && *u.CacheCreationTokens > 0 {
+	if cached != nil {
+		usage["cache_read_input_tokens"] = *cached
+	}
+	if u.CacheCreationTokens != nil {
 		usage["cache_creation_input_tokens"] = *u.CacheCreationTokens
 	}
 	return usage

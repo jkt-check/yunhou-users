@@ -193,7 +193,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 			// 评审轮2 M5：上游从未报 usage 时只发 [DONE]——缺失 usage 绝不
 			// 渲染为 {"total_tokens":0}（与下方 !stopSeen 分支同一纪律）。
 			if res := tap.Result(); res.SawUsage {
-				err = writeOpenAIUsageAndDone(w, res.Buckets)
+				err = writeOpenAIUsageAndDone(w, res.Buckets, nil)
 			} else {
 				_, err = io.WriteString(w, "data: [DONE]\n\n")
 			}
@@ -218,7 +218,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 	// sees.
 	if !stopSeen || failed {
 		if b := tap.Result(); b.SawUsage {
-			if err := writeOpenAIUsage(w, b.Buckets); err != nil {
+			if err := writeOpenAIUsage(w, b.Buckets, nil); err != nil {
 				return err
 			}
 		}
@@ -242,8 +242,8 @@ func writeOpenAIChunk(w io.Writer, delta map[string]any, finish string) error {
 // writeOpenAIUsageAndDone emits the terminal usage chunk followed by [DONE] —
 // the clean message_stop ending. [DONE] marks the answer COMPLETE, so the
 // abnormal-termination flush (no message_stop) uses writeOpenAIUsage instead.
-func writeOpenAIUsageAndDone(w io.Writer, b domain.UsageBuckets) error {
-	if err := writeOpenAIUsage(w, b); err != nil {
+func writeOpenAIUsageAndDone(w io.Writer, b domain.UsageBuckets, reportedTotal *int64) error {
+	if err := writeOpenAIUsage(w, b, reportedTotal); err != nil {
 		return err
 	}
 	_, err := io.WriteString(w, "data: [DONE]\n\n")
@@ -253,41 +253,11 @@ func writeOpenAIUsageAndDone(w io.Writer, b domain.UsageBuckets) error {
 // writeOpenAIUsage emits just the usage chunk (the shape an OpenAI
 // UsageTracker looks for) — no [DONE]. Nil buckets render as absent keys;
 // a bucket the upstream never reported is never written as 0.
-func writeOpenAIUsage(w io.Writer, b domain.UsageBuckets) error {
-	usage := map[string]any{}
-	var total int64
-	if b.InputTokens != nil {
-		usage["prompt_tokens"] = *b.InputTokens
-		total += *b.InputTokens
-	}
-	if b.OutputTokens != nil {
-		usage["completion_tokens"] = *b.OutputTokens
-		total += *b.OutputTokens
-	}
-	if b.CacheReadTokens != nil || b.CacheWriteTokens != nil {
-		details := map[string]any{}
-		if b.CacheReadTokens != nil {
-			details["cached_tokens"] = *b.CacheReadTokens
-		}
-		usage["prompt_tokens_details"] = details
-	}
-	if b.ReasoningTokens != nil {
-		// Responses-origin reasoning detail rides the wire so the client
-		// surfaces can render it natively (Anthropic never sets the bucket —
-		// its reasoning is inseparable from output).
-		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": *b.ReasoningTokens}
-	}
-	if b.CacheWriteTokens != nil {
-		// Anthropic-origin cache creation has no chat-completions home; the
-		// extension key keeps it on the wire for the Messages surface (Task
-		// 13) and is ignored by OpenAI-shape consumers.
-		usage["cache_creation_input_tokens"] = *b.CacheWriteTokens
-	}
-	usage["total_tokens"] = total
+func writeOpenAIUsage(w io.Writer, b domain.UsageBuckets, reportedTotal *int64) error {
 	return writeRawSSE(w, map[string]any{
 		"object":  "chat.completion.chunk",
 		"choices": []any{},
-		"usage":   usage,
+		"usage":   openAIUsageShape(b, reportedTotal),
 	})
 }
 

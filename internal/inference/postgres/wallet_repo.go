@@ -154,20 +154,25 @@ func walletSumsLocked(ctx context.Context, tx *sqlx.Tx, walletID string) (accoun
 	return sums, nil
 }
 
-// monthSpendLocked is the ledger-derived UTC-month wallet spend: consume
-// debits minus reversal credits of consume entries within [start, end).
+// Corrections and reversals belong to the original consumption month, not
+// their posting month. Account-level adjustments never count as consumption.
+const walletMonthSpendSQL = `SELECT COALESCE(SUM(
+	    CASE WHEN e.direction='debit' THEN e.amount_micros ELSE -e.amount_micros END),0)
+	FROM inference_wallet_entries e
+	LEFT JOIN inference_wallet_entries o ON o.id=e.reverses_entry_id
+	LEFT JOIN inference_wallet_holds h ON h.id=COALESCE(e.hold_id,o.hold_id)
+	WHERE e.wallet_id=$1
+	  AND COALESCE(h.settled_at,o.created_at,e.created_at)>=$2
+	  AND COALESCE(h.settled_at,o.created_at,e.created_at)<$3
+	  AND (e.entry_type='consume'
+	    OR (e.entry_type='adjustment' AND e.request_id IS NOT NULL AND e.hold_id IS NOT NULL)
+	    OR (e.entry_type='reversal' AND (o.entry_type='consume'
+	      OR (o.entry_type='adjustment' AND o.request_id IS NOT NULL AND o.hold_id IS NOT NULL))))`
+
+// monthSpendLocked is the same net consumption measure used by wallet reads.
 func monthSpendLocked(ctx context.Context, tx *sqlx.Tx, walletID string, start, end time.Time) (int64, error) {
 	var spent int64
-	err := tx.QueryRowxContext(ctx,
-		`SELECT COALESCE(SUM(CASE
-		       WHEN e.entry_type = 'consume' AND e.direction = 'debit' THEN e.amount_micros
-		       WHEN e.entry_type = 'reversal' AND e.direction = 'credit'
-		            AND o.entry_type = 'consume' THEN -e.amount_micros
-		       ELSE 0 END), 0)
-		   FROM inference_wallet_entries e
-		   LEFT JOIN inference_wallet_entries o ON e.reverses_entry_id = o.id
-		  WHERE e.wallet_id = $1
-		    AND e.created_at >= $2 AND e.created_at < $3`,
+	err := tx.QueryRowxContext(ctx, walletMonthSpendSQL,
 		walletID, start, end).Scan(&spent)
 	if err != nil {
 		return 0, mapError("wallet month spend", err)
@@ -256,16 +261,7 @@ func (s *Store) walletSums(ctx context.Context, walletID string) (accounting.Wal
 
 func (s *Store) monthSpend(ctx context.Context, walletID string, start, end time.Time) (int64, error) {
 	var spent int64
-	err := s.db.QueryRowxContext(ctx,
-		`SELECT COALESCE(SUM(CASE
-		       WHEN e.entry_type = 'consume' AND e.direction = 'debit' THEN e.amount_micros
-		       WHEN e.entry_type = 'reversal' AND e.direction = 'credit'
-		            AND o.entry_type = 'consume' THEN -e.amount_micros
-		       ELSE 0 END), 0)
-		   FROM inference_wallet_entries e
-		   LEFT JOIN inference_wallet_entries o ON e.reverses_entry_id = o.id
-		  WHERE e.wallet_id = $1
-		    AND e.created_at >= $2 AND e.created_at < $3`,
+	err := s.db.QueryRowxContext(ctx, walletMonthSpendSQL,
 		walletID, start, end).Scan(&spent)
 	if err != nil {
 		return 0, mapError("wallet month spend", err)

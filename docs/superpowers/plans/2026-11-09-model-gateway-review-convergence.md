@@ -70,7 +70,7 @@ in `internal/inference/providers`.
 - [x] Review the resulting branch independently, including the focus list.
 - [x] Run build, vet, full race coverage and E2E with disposable databases.
 - [x] Record evidence, file manifest, compatibility costs and remaining risks.
-- [ ] Commit the final converged review locally, without push, merge or deployment.
+- [x] Commit the final converged review locally, without push, merge or deployment.
 
 ## Task 5: Refund Versus Stale Entitlement Sync
 
@@ -1546,6 +1546,103 @@ skipped 55 on rerun. Cleanup confirmed the owned PostgreSQL stopped and
 `data/postmaster.pid` is absent. Go sources/tests remained frozen throughout
 the gate. This closes Task 32, not whole-branch convergence.
 
+## Task 34: Wallet Settlement Corrections
+
+**Files:** `postgres/reconciliation_repo.go`, new
+`postgres/wallet_correction_repo.go`, `postgres/wallet_correction_test.go`,
+`postgres/wallet_repo.go`, `postgres/recovery_test.go`, this plan and runbook.
+Paths are under `internal/inference` unless otherwise specified.
+
+**Interfaces:** Keep `CorrectionCommand` and its integer amount; the locked
+request and immutable charge determine microcredit versus micromoney and
+currency. Wallet corrections append one explicit-source adjustment, wallet
+entry and generic ledger entry per changed source. The receipt owns external
+idempotency. Account -> request -> wallet/hold lock order; plan corrections
+keep their existing aggregate behavior, wallet corrections never touch Key
+money budgets or quota windows.
+
+- [x] RED: mixed hold cash 60/bonus 40, estimate 80; correct to 30, 120, 0,
+  70, then 0. Assert exact balances, source deltas, immutable original
+  charge/consumes/hold, reported revisions and TPM with original timestamp,
+  replay conflicts, and unchanged Key/window aggregates.
+- [x] RED: equal-money estimated-to-reported tokens, missing hold, reversed
+  consume drift, injected wallet-write rollback, and account-lock contention.
+- [x] RED: a correction posted next month changes the original month's
+  spending, not the new month's cap; both read and admission queries agree.
+- [x] GREEN: validate settled hold, charge unit/currency/account and current
+  request-linked source totals (including reversals); append source deltas
+  using original bonus-first frozen composition, then existing usage/TPM/job
+  transaction. Use receipt-generated adjustment identity keys.
+- [x] Run focused owned PostgreSQL race tests; update evidence. Defer the
+  one final build/vet/full-race/coverage/E2E gate until Task 35 is ready.
+
+Ruling: request-pinned units/currency are authoritative; no second caller
+currency field is necessary. Monthly net corrected consumption belongs to
+the original wallet settlement month. Cost: late corrections can change
+historical spend reports, but cannot release unrelated current-month caps.
+
+Focused owned PostgreSQL race `run.aSRDux` passed 108 tests/subtests,
+zero failures/skips (159.163s), including existing plan correction and wallet
+compatibility. `run.obXIXk` additionally passed the wallet missing-token-total
+control (18.364s). Both owned clusters stopped. The preceding RED
+`run.H0NAjg` reproduced the unsupported wallet path before implementation.
+
+## Task 35: Operator Evidence Correction Caller
+
+**Files:** new `httpapi/admin_corrections.go` and its database-backed tests,
+`httpapi/admin_ops.go`, `cmd/server/main.go`, API guide and runbook.
+
+**Interfaces:** `POST /admin/model-requests/:id/corrections`, mounted only
+behind existing JWT + internal-app identity + `billing:adjust`. Accept
+attempt ID, explicitly normalized reported token buckets, priced extras,
+evidence reference, reason and idempotency key, never caller-supplied money.
+Quote the immutable request price, not latest catalog pricing. Call
+`CorrectSettlement` and record the operator audit in the same transaction.
+
+- [x] RED: plan and wallet estimated-to-reported correction through HTTP,
+  pinned price after catalog changes, repeat key 409, role/app denial and
+  unknown/negative/incomplete buckets rejected without writes.
+- [x] RED: audit-write failure rolls back money, usage, receipt and TPM.
+- [x] GREEN: implement strict evidence validation, server-side quote and
+  transactional audit; wire the handler under RequireBilling in production.
+- [x] Run focused HTTP race and bounded independent review of Tasks 34-35
+  plus integration; fix both Important findings with RED/GREEN regressions.
+- [x] Run the final owned full gate, 80% coverage floor and separate E2E.
+- [x] Record exact evidence and remaining limits; commit locally, no push,
+  merge, deploy, production or kaya operations.
+
+Focused HTTP race `run.0Y7o2s` passed 28 tests/subtests, zero failures/skips
+(71.528s), including equal-money estimated-to-reported corrections for both
+plan and wallet. Prior RED runs returned the missing-route 404 with valid
+fixtures. Cleanup stopped the owned PostgreSQL and its PID file is absent.
+Expanded HTTP `run.iYRY4i` passed 32 tests/subtests (99.469s), zero failures/
+skips. Bacon's bounded independent review found two Important issues:
+unused same-request attempts and historical wallet/generic ledger drift.
+Both reproduced in `run.dGw9zG`; after guards were implemented, focused
+`run.nSuZcv` passed 56 tests/subtests, zero failures/skips (PostgreSQL
+18.692s; HTTP 103.736s). The endpoint-only review found no additional
+Critical/Important issue; its no-op status-code documentation mismatch is
+corrected. Runbook 4.94 records rulings and remaining test limits. The final
+shared gate `run.etPgX4` failed the existing 50ms lease-renewal test at its
+pre-dispatch lease check, before the keeper started. The unchanged test
+passed 20 isolated race repetitions (`run.Pjp3hw`). Its timing assumptions
+are replaced by a 3s lease and bounded database observation of actual
+account renewal; all renewal/release assertions remain. Five focused race
+repetitions passed (`run.3hL38V`, 11.223s). The obsolete full run was stopped
+using only its verified test PIDs and its owned PostgreSQL stopped.
+Fresh full gate `run.c2xaNQ` exited 0: build/vet passed; full race passed
+6,090 tests/subtests across 34 packages, zero failures, with 80.9% statement
+coverage and the 80% floor satisfied. Separate E2E race passed 186
+tests/subtests, zero failures (345.732s). Only the worker entry and explicit
+opt-in load/usage drills skipped; no database acceptance was unavailable.
+Both disposable databases applied 55 migrations and skipped 55 on rerun;
+cleanup stopped the owned PostgreSQL and its PID file is absent. All 618
+Go input hashes still match the frozen manifest; only
+`gateway/gateway_test.go` changed between input manifests. Runbook 4.94
+records the 15-file delivery manifest, exact evidence and remaining limits.
+The local commit completes Tasks 34-35 and this scoped review convergence;
+no confirmed unresolved Important/Critical finding remains in that scope.
+
 ## Task 33: Reopen Recurring Corrected Overage
 
 **Files:** `internal/inference/postgres/reconciliation_repo.go`, new
@@ -1611,10 +1708,10 @@ databases applied 55 migrations and skipped 55 on rerun. Cleanup confirmed
 the owned PostgreSQL stopped and `data/postmaster.pid` is absent.
 Runbook 4.93 records the file manifest, evidence and remaining boundaries.
 
-## Pending Review Findings (2026-11-10)
+## Review Findings And Closure (2026-11-10)
 
-This list tracks findings and verified closures; unfinished items are
-not waived scope:
+This list tracks findings and verified closures. It does not waive
+unfinished scope or claim absence of defects outside the bounded reviews:
 
 - Responses stream output with a tool followed by text no longer creates
   an unusable stored chain; fixed and verified in Task 22.
@@ -1628,7 +1725,9 @@ not waived scope:
 - Unknown or missing Chat thinking types now reject before admission;
   Task 24 valid-precedence controls and fresh full verification pass.
 - The original wallet-correction and production evidence-to-correction
-  requirements remain incomplete and need their own implementation audit.
+  requirements are implemented in Tasks 34-35. The bounded integration
+  review's two Important findings are fixed with RED/GREEN regressions;
+  the final shared build/vet/full-race/coverage/E2E gate passed.
 - Ohm's read-only review of `bb80c3e` reports five provider defects:
   Chat refusal translation loses refusal text and produces empty success;
   incomplete function arguments are replaced with `{}` and made replayable;
@@ -1665,11 +1764,11 @@ expected `USAGE_ACCEPTANCE=1` opt-in skip. Both databases applied 55
 migrations and skipped all 55 on rerun. Cleanup confirmed the owned
 PostgreSQL server stopped; the runner exited 0. See runbook 4.71.
 
-Original-plan section 1.1.6 item 1 remains a genuine unfulfilled
-requirement: wallet settlement correction and the production evidence
-trigger are not delivered. The named follow-up remains open, not a
-plan exclusion. This commit checkpoint is not a claim that the full
-original T4 or real-provider/client acceptance is complete.
+Original-plan section 1.1.6 item 1 was a genuine unfulfilled requirement,
+not a scope exclusion. Tasks 34-35 implement wallet settlement correction
+and an operator evidence trigger; their final gate and bounded independent
+review fix pass are complete. Real-provider/client acceptance remains
+outside the local verification evidence.
 
 ## Execution Notes
 

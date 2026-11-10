@@ -137,9 +137,11 @@ func setupTask4(t *testing.T) *task4Env {
 		RequireModels:      httpapi.OperatorAuthz(store, management.PermModelsManage),
 		RequireCredentials: httpapi.OperatorAuthz(store, management.PermCredentialsManage),
 		RequireAdmin:       httpapi.OperatorRequireRole(store, management.RoleAdmin),
+		RequireBilling:     httpapi.OperatorAuthz(store, management.PermBillingAdjust),
 		Models:             modelsHandler,
 		Credentials:        httpapi.NewAdminCredentialsHandler(credSvc),
 		Auth:               httpapi.NewAdminAuthHandler(store, store),
+		Corrections:        httpapi.NewAdminCorrectionsHandler(store, store, nil),
 	}
 
 	gin.SetMode(gin.TestMode)

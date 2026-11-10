@@ -342,7 +342,8 @@ type CorrectionCommand struct {
 	// usage history and the token budget are then derived from the same
 	// measure.
 	Corrected domain.UsageRecord
-	// CorrectedMicros is the re-priced customer consumption (microcredit).
+	// CorrectedMicros is the re-priced consumption in the request's pinned
+	// unit: microcredit for plan, micromoney for wallet.
 	CorrectedMicros domain.Microcredit
 	// CorrectedTokens is the ABSOLUTE corrected normalized token total (the
 	// TPM budget measure: input + cache read + cache write + output after
@@ -417,12 +418,9 @@ type CorrectionCommand struct {
 //   - 速率行**存在但畸形**（已结算请求的速率行仍是在途状态；或只剩 Key 行
 //     而没有账户行）→ 明确冲突，绝不当成良性缺席放过。
 //
-// 仅支持 charge_source='plan' 的请求。wallet 计费请求显式拒绝
-// （CodeInvalidInput，评审轮1 Important-1）：wallet 路径的 settled_micros
-// 是 micromoney 而非 microcredit，入场也未做 key-budget 预占，且更正需要
-// 钱包补偿分录——在完整实现 wallet 分支前统一拒绝，避免通用调用方静默
-// 腐蚀钱包状态（当前本方法无生产调用方，更正通道本期未接线，见计划
-// Task 9 已知限制）。钱包请求的 token 预算因此也不会被这条通道修正。
+// Wallet corrections append source-specific micromoney adjustments instead
+// of changing plan windows or Key money budgets. Account locking precedes
+// request locking, matching wallet mutations and reservation release.
 func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd CorrectionCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -431,6 +429,14 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	if cmd.IdempotencyKey == "" || cmd.OperatorSubject == "" || cmd.Reason == "" {
 		return domain.NewError(domain.CodeInvalidInput,
 			"correction: reason, operator subject and idempotency key are required")
+	}
+	var accountAnchor string
+	if err := tx.GetContext(ctx, &accountAnchor,
+		`SELECT billing_account_id FROM inference_requests WHERE id = $1`, cmd.RequestID); err != nil {
+		return mapError("correction: account", err)
+	}
+	if err := lockAccountTx(ctx, tx, accountAnchor); err != nil {
+		return err
 	}
 
 	// 1. Lock + require settled. The delta base is the CURRENT settled
@@ -461,11 +467,10 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	} else if domain.CodeOf(mapError("correction: idempotency lookup", err)) != domain.CodeNotFound {
 		return mapError("correction: idempotency lookup", err)
 	}
-	// wallet 计费请求显式拒绝（见方法 doc：单位/预算/补偿分录均未适配）。
-	if chargeSource == string(domain.ChargeSourceWallet) {
-		return domain.NewError(domain.CodeInvalidInput,
-			"correction: wallet-charged requests are not supported (钱包更正通道本期未接线)")
+	if accountID != accountAnchor {
+		return domain.NewError(domain.CodeConflict, "correction: request account changed")
 	}
+	wallet := chargeSource == string(domain.ChargeSourceWallet)
 	if domain.RequestStatus(status) != domain.ReqSettled {
 		return domain.NewError(domain.CodeConflict,
 			"correction: request not settled ("+status+") — settle first, corrections revise a settlement")
@@ -476,20 +481,22 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 			"correction: invalid attempt ID", err)
 	}
 	cmd.Corrected.AttemptID = attemptID.String()
-	var ownsAttempt bool
+	var settledAttempt bool
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM inference_attempts WHERE id = $1 AND request_id = $2)`,
-		cmd.Corrected.AttemptID, cmd.RequestID).Scan(&ownsAttempt); err != nil {
-		return mapError("correction: attempt ownership", err)
+		`SELECT EXISTS (
+		    SELECT 1 FROM inference_attempts a
+		    JOIN inference_usage_records u ON u.attempt_id = a.id AND u.request_id = a.request_id
+		    WHERE a.id = $1 AND a.request_id = $2)`,
+		cmd.Corrected.AttemptID, cmd.RequestID).Scan(&settledAttempt); err != nil {
+		return mapError("correction: settled attempt", err)
 	}
-	if !ownsAttempt {
+	if !settledAttempt {
 		return domain.NewError(domain.CodeInvalidInput,
-			"correction: the corrected attempt does not belong to the request")
+			"correction: the corrected attempt has no settlement usage for the request")
 	}
 	// The corrected token evidence must be explicit: known token buckets
 	// without a corrected total would silently omit the token budget (the
-	// ledger and the rate budget would disagree). Checked after the scope
-	// boundary above so the wallet rejection keeps its own message.
+	// ledger and the rate budget would disagree).
 	total, err := access.NormalizedTokens(cmd.Corrected.Buckets)
 	if err != nil {
 		return err
@@ -558,7 +565,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 
 	// 2. The charge row (reversal target when voiding).
 	var chargeID sql.NullInt64
-	if delta > 0 {
+	if delta > 0 && !wallet {
 		if err := tx.QueryRowxContext(ctx,
 			`SELECT id FROM inference_ledger_entries
 			 WHERE request_id = $1 AND entry_type = 'charge'`, cmd.RequestID).
@@ -596,8 +603,16 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return mapError("correction: receipt", err)
 	}
 
-	// 4. Nonzero monetary delta only: void -> reversal, otherwise adjustment.
-	if delta > 0 {
+	// 4. Wallet source deltas use the original frozen composition.
+	var walletHold int64
+	if wallet {
+		walletHold, err = correctWalletSettlementTx(ctx, tx, accountID, cmd, int64(base))
+		if err != nil {
+			return err
+		}
+	}
+	// Plan only: void -> reversal, otherwise adjustment.
+	if delta > 0 && !wallet {
 		adjID := uuid.NewString()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO inference_adjustments
@@ -648,7 +663,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		signed = -signed
 	}
 	for _, wID := range []sql.NullString{win5h, winW, winM} {
-		if !wID.Valid || delta == 0 {
+		if wallet || !wID.Valid || delta == 0 {
 			continue
 		}
 		res, err := tx.ExecContext(ctx,
@@ -663,7 +678,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 				"correction: window used would go negative (ledger/window drift — reconcile first)")
 		}
 	}
-	if apiKeyID.Valid && delta > 0 {
+	if !wallet && apiKeyID.Valid && delta > 0 {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE inference_api_keys
 			 SET budget_used_micros = budget_used_micros + $2, updated_at = now()
@@ -717,6 +732,9 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		ReservedMicros:     microFromNull(reserved),
 		ExpectedHoldMicros: microFromNull(expectedHold),
 	})
+	if wallet {
+		holdMicros, hasHold = domain.Microcredit(walletHold), true
+	}
 	if hasHold && cmd.CorrectedMicros > holdMicros {
 		detail := mustJSON(map[string]interface{}{
 			"schema_version":  1,

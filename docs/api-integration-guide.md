@@ -1620,6 +1620,60 @@ LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游�
 运营授权的 `POST /admin/operators` 同样要求非空 `reason`、有效 UUID
 `user_id` 和受支持的 `role`；非法输入在授权或审计写入前以 400 拒绝。
 
+### 结算证据更正（`POST /admin/model-requests/:id/corrections`）
+
+需要同一 app 的人员 JWT、内部服务凭据及 `billing:adjust` 权限（现有角色中
+仅 admin 具备，operator / auditor 不具备）。只更正已结算请求，不替代付款、
+充值、退款或人工账户补偿。
+
+```json
+{
+  "attempt_id": "9df8fb9a-2175-46df-8736-899f3d6b7077",
+  "buckets": {
+    "input_tokens": 70,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "output_tokens": 20,
+    "reasoning_tokens": 5
+  },
+  "extras": {},
+  "evidence_ref": "provider-report:123",
+  "reason": "核验供应商用量报告",
+  "idempotency_key": "correction-report-123"
+}
+```
+
+`attempt_id` 必须属于该请求，且已有该请求的结算用量记录；同请求中未结算的重试
+attempt 也拒绝。四个计费 token 桶必须全部显式提供（含零），
+且已归一化为互不重叠的输入、缓存读、缓存写、输出；可选 reasoning 必须
+非负且不超过 output，包含在 output 内，不再额外相加。禁止负数、小数、
+溢出、未知字段或调用方指定金额。`extras` 必须显式覆盖请求历史价格中的
+所有计价维度及准入声明的维度，含零；未知维度即使为零也拒绝。实际证据
+可超过原预占上界，不能截断为预占值。
+
+`evidence_ref` 是运营核验后的证据定位引用，不应放入提示词、响应正文或
+访问凭据；`reason` 和 `idempotency_key` 必须非空。此入口信任有权限的人员
+提交的证据，不自动向供应商拉取或验证报告。服务端只按该请求固定的历史
+价格计价，新目录价格不影响旧请求；原计费单位、钱包币种不能由调用方改写。
+
+成功 201：
+
+```json
+{"code":0,"data":{"request_id":"<uuid>","amount_micros":"110","unit":"microcredit","currency":"","source":"reported"}}
+```
+
+钱包返回 `unit:"micromoney"` 及原钱包币种。金额使用十进制字符串。非法证据
+为 400，权限不足为 403，不属于请求或没有结算用量的 attempt、无实际更正均为
+400；请求未结算或重复幂等键为 409；不存在的请求为 404。历史钱包调整及配对
+账本不一致时以 409 拒绝继续更正，等待核对。失败不产生部分更正。
+
+金额、reported usage revision、TPM、核对任务、幂等收据和
+`settlement.correct` 人员审计在同一事务提交。金额不变但 token 或用量来源
+变化仍可更正，不生成零额财务分录；TPM 保持原结算时间，不重新制造当前分钟
+消费。钱包按原冻结的 bonus-first 组成追加各来源净差额分录，原 charge /
+consume / hold 不改写；不更改套餐窗口或 Key 金额预算。钱包月消费归入原结算
+月份，次月补偿会修订历史月消费，不释放无关的本月消费额度。
+
 ### 目录发布与上游探测（`/admin/catalog/publish`、`/admin/deployments/:id/probe`）
 
 模型目录的**发布预演**与**上游连通性探测**是同一组运营面：预演给出「这次

@@ -1142,19 +1142,46 @@ func TestConcurrencyLease_AcquiredAndReleased(t *testing.T) {
 // 租约初始 expires_at = acquired + AccountLeaseTTL(10m)，dispatch keeper
 // 以 routing TTL 续租会重写 expires_at —— 以此作为续租发生的证据。
 func TestNonStreamDispatch_RenewsAccountLease(t *testing.T) {
+	var f *fixture
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
-		time.Sleep(150 * time.Millisecond) // dispatch 跨越多个续租周期
+		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+		defer cancel()
+		tick := time.NewTicker(25 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			var renewed bool
+			if err := f.db.GetContext(ctx, &renewed, `SELECT EXISTS (
+				SELECT 1 FROM inference_concurrency_leases
+				WHERE scope = 'billing_account' AND state = 'held'
+				  AND expires_at < acquired_at + interval '9 minutes')`); err != nil {
+				t.Errorf("observe account lease renewal: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if renewed {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Errorf("account lease was not renewed during non-stream dispatch: %v", ctx.Err())
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			case <-tick.C:
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"chatcmpl-m1","object":"chat.completion","created":1,
 			"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],
 			"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`)
 	})
-	f := newFixture(t, up)
+	f = newFixture(t, up)
 	conc := 1
 	if _, err := f.db.Exec(`UPDATE inference_policy_versions SET concurrency_limit = $1 WHERE id = $2`, conc, f.policyID); err != nil {
 		t.Fatal(err)
 	}
-	f.routing.LeaseTTL = 50 * time.Millisecond // 续租间隔 TTL/3 ≈ 17ms
+	// Leave time for the real pre-dispatch database transaction; wait for
+	// renewal above instead of assuming it completes within a short sleep.
+	f.routing.LeaseTTL = 3 * time.Second
 
 	p, key := f.principal()
 	if _, err := f.gateway.ChatCompletions(context.Background(), p, key, domain.ProtocolOpenAIChat, chatReq(false, "hi")); err != nil {
@@ -1168,7 +1195,7 @@ func TestNonStreamDispatch_RenewsAccountLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 修复前非流式路径账户租约从不续租：expires_at 恒为 acquired+10m。续租
-	// 发生后被改写为 续租时刻+50ms ≪ acquired+9m。
+	// 发生后被改写为 续租时刻+3s ≪ acquired+9m。
 	if expires.After(acquired.Add(9 * time.Minute)) {
 		t.Errorf("account lease expires_at = %s (acquired %s): no renewal happened during non-stream dispatch (M1)", expires, acquired)
 	}

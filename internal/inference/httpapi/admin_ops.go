@@ -36,6 +36,8 @@ type AdminOps struct {
 	// PAYG 发布配置; Task 15 扩展: 补偿列表 + 追加审计); mounted under
 	// billing:adjust.
 	Adjustments *AdminAdjustmentsHandler
+	// Corrections revises settled usage with verified evidence; billing:adjust.
+	Corrections *AdminCorrectionsHandler
 	// Bulk is the catalog bulk-import surface (Task 15); models:manage.
 	Bulk *AdminBulkHandler
 	// Usage is the operator analytics surface (Task 15): summary/exceptions/
@@ -76,6 +78,9 @@ func (o *AdminOps) Mount(g *gin.RouterGroup) {
 	}
 	if o.Adjustments != nil && o.RequireBilling != nil {
 		o.Adjustments.Register(g.Group("", o.RequireBilling))
+	}
+	if o.Corrections != nil && o.RequireBilling != nil {
+		o.Corrections.Register(g.Group("", o.RequireBilling))
 	}
 	// Task 15: 批量导入与变更预览走 models:manage（目录/价格规则写面）；
 	// 统计/异常/共享账号检测/补偿追踪走 usage:read（只读，auditor 可达）。

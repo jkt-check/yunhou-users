@@ -222,12 +222,13 @@ token 预算保留原值，绝不记零），`Store.CorrectSettlement` 在**同�
 token 桶却没给总量 → 明确 `invalid_input`（金额修正不得静默漏掉 token 预算）；
 速率行**缺失**（迁移前老请求 / 保留期已清理）→ 良性缺席，金额修正照常生效；
 速率行**存在但畸形**（已结算请求的速率行仍是在途；只剩 Key 行没有账户行）→
-明确冲突，绝不当成良性缺席。已知边界（本期不扩大）：wallet 计费请求的修正仍
+明确冲突，绝不当成良性缺席。T4 分支期的历史边界（已由后续 Task 34-35 实现补齐，
+验证状态见 runbook §4.94）：wallet 计费请求的修正当时仍
 被显式拒绝（`invalid_input`，micromoney 单位与钱包补偿分录未适配），因此钱包
 请求的 token 预算暂不经这条通道修正；金额修正通道仍无生产调用方。
 （⚠️ 上面这句「已知边界（本期不扩大）」是 T4 在本分支上写的**分支期说明**，**不是
 计划层面的豁免**：钱包的结算后更正属于原始 T4 语义的一部分，其状态与待办见
-§1.1.6 第 1 条，需一次最终评审。）
+§1.1.6 第 1 条；最终评审修复及本地完整验证已记录在 runbook §4.94。）
 
 **确定语义：**
 
@@ -488,35 +489,25 @@ Token Plan 商品/权益与统一商品发布、真实渠道退款与改签、�
 多模态、签名思考与 encrypted reasoning 的无损回放、通用 least-loaded/session-sticky
 与按权重比例分流、跨实例上游冷却与供应商刷新竞争治理、生产发布与灰度。
 
-### 1.1.6 **仍然遗留、需要最终评审**的限制（不是「计划已排除」）
+### 1.1.6 原遗留项的闭环与验收边界（不是「计划已排除」）
 
-本节列出的项目**不在** §1.1.5 的「本期不做」里：它们是实现到一半、或语义只做了一
-半的遗留项，需要一次最终评审来决定是补齐、还是显式改写原始计划文本。
+本节列出的项目**不在** §1.1.5 的「本期不做」里：它们曾是实现或验证未闭环的
+遗留项。以下记录补齐后的本地证据与仍未执行的外部验收，不将原要求改写为豁免。
 
-1. **钱包请求的结算后更正未接线（金额侧 + token 预算侧）。**
-   - 已经做到的：持久 rate reservation 在**钱包**的终态与恢复路径上同样被结算/释放
-     （`internal/inference/postgres/ledger_repo.go` 的 `settleWallet` → `settleRateTx`；
-     `internal/inference/postgres/reservation_repo.go` 的 `releaseRateTx`）。原始 T4
-     文字「套餐与钱包的终态/恢复都释放或校正同一持久 rate reservation」在**速率侧**
-     是满足的。
-   - 还没做到的：`CorrectSettlement` 对钱包路径**显式拒绝**（`invalid_input`，
-     `TestCorrectSettlementRejectsWallet`：钱包更正通道未接线）。也就是说，一个按
-     估算（estimated）入账的钱包结算，后来拿到真实用量证据时**无法被更正**（金额
-     冲正/分录与 token 预算都改不了）。
-   - 原始计划 T4 要求「套餐**与**钱包」的终态/恢复都释放或校正同一持久 rate
-     reservation，而 estimated→reported 的净差额校正属于该语义的一部分，所以这是
-     **真实遗留限制**，需要最终评审决策。
-   - ⚠️ T4 章节里那句「已知边界（本期不扩大）」是 **T4 在本分支上写的分支期文字**，
-     **不是计划层面的豁免**，不得被当作依据引用。
-   - 相关且早已记录的事实：金额侧更正通道目前**没有生产调用方**——
-     `Store.CorrectRateTokensTx` 只有测试固定它，证据窗口仍由既有核对队列驱动
-     （见 runbook §4.32）。
-   - **已登记为具名跟进项 `inference-correction-trigger-and-wallet`**（负责人角色：
-     Users 模型网关维护者；排期：未排期）——范围：① 证据驱动的更正**触发器**
-     （谁在真实证据到达时调用 `CorrectSettlement`/`CorrectRateTokensTx`：
-     恢复校验路径 / 操作入口）；② 钱包的**金额更正语义**（micromoney 单位、
-     钱包补偿分录、token 预算同步）。本期**不实现**任何支付/钱包产品变更；
-     现状限制（钱包更正被显式拒绝、金额更正无生产调用方）保持原样如实记录。
+1. **钱包结算后更正及生产证据入口已实现并完成本地验证（2026-11-10）。**
+   原先钱包更正被显式拒绝、金额更正无生产调用方，确实是原始 T4 未完成
+   的要求，不能用 T4 分支期「已知边界」当作豁免。Review convergence
+   Tasks 34-35 现已补齐：钱包按原冻结来源追加 micromoney 补偿，usage / TPM /
+   核对任务同事务更正，保持原结算时间及原月份归属；新增
+   `POST /admin/model-requests/:id/corrections`，由具备 `billing:adjust` 的人员
+   提交完整归一化证据，服务端按历史价格计价，并同事务追加人员审计。
+   金额不变的 estimated→reported 计量更正同样生效。既有钱包终态及恢复路径
+   的 rate reservation 结算/释放不变，不涉及支付、充值或钱包产品改造。
+   具名跟进项 `inference-correction-trigger-and-wallet` 的独立集成审核发现已
+   复现、修复并验证。最终 build/vet 通过，完整 race 6,090 tests/subtests、
+   34 包零失败，覆盖率 80.9%；单独 E2E race 186 tests/subtests 零失败。
+   两套独立临时库完成 55 条迁移及幂等复跑并已停止。证据及剩余边界见
+   runbook §4.94；不声称真实供应商、客户端或生产部署已验收。
 2. **速率路径跨进程验收缺口已补齐（2026-11-09）；未做跨主机验收。**
    `internal/inference/postgres/rate_process_test.go` 的
    `TestTwoProcessContendRateAndConcurrency` 复用 `TestQuotaWorkerProcess`

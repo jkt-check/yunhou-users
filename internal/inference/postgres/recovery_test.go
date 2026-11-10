@@ -914,11 +914,8 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 	}
 }
 
-// 评审轮1 Important-1：CorrectSettlement 对 charge_source='wallet' 的请求
-// 显式拒绝（CodeInvalidInput）——wallet 的 settled_micros 是 micromoney、
-// 入场无 key-budget 预占、更正需要钱包补偿分录，在完整 wallet 分支落地前
-// 不得走通用更正通道腐蚀钱包状态。
-func TestCorrectSettlementRejectsWallet(t *testing.T) {
+// Wallet corrections must require the TPM total whenever buckets are known.
+func TestCorrectSettlementWalletRequiresTokenTotal(t *testing.T) {
 	_, s := testDB(t)
 	ctx := context.Background()
 	f := seedFixture(t, s, false)
@@ -968,7 +965,7 @@ func TestCorrectSettlementRejectsWallet(t *testing.T) {
 	})
 	_ = uow2.Rollback(ctx)
 	if domain.CodeOf(err) != domain.CodeInvalidInput {
-		t.Fatalf("wallet correction: err = %v, want invalid_input (wallet 更正通道未接线,必须显式拒绝)", err)
+		t.Fatalf("wallet correction without token total: err = %v, want invalid_input", err)
 	}
 
 	// 拒绝必须零副作用：请求结算额与钱包派生余额保持原样。

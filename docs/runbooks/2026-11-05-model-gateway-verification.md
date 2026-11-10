@@ -7981,6 +7981,150 @@ Those original requirements remain open. No real-provider/client or
 cross-host acceptance is claimed. No push, merge, deployment, adjacent
 source edit, kaya or inherited-agent operation occurred.
 
+### 4.94 Wallet correction and operator evidence entry point (2026-11-10)
+
+This closes the implementation gap recorded in section 4.93. The bounded
+independent review and its focused fix pass are complete; the final shared
+gate `run.c2xaNQ` exited 0 on November 10 at 14:33 CST.
+
+Files changed: `postgres/reconciliation_repo.go`, `wallet_repo.go`, new
+`wallet_correction_repo.go` and `wallet_correction_test.go`,
+`postgres/recovery_test.go`, new `httpapi/admin_corrections.go` and
+`admin_corrections_test.go`, `httpapi/admin_ops.go`,
+`admin_credentials_test.go`, `cmd/server/main.go`, the API guide, this runbook
+and both completion/review-convergence plans, plus `gateway/gateway_test.go` for
+the existing lease test's timing assumptions. Inference paths are relative to
+`internal/inference/`.
+
+Wallet corrections preserve the original charge, consumes and frozen hold.
+Each changed bonus/cash source appends an adjustment and paired wallet /
+generic ledger entries; the original bonus-first frozen composition
+determines the corrected split. External idempotency belongs to the
+correction receipt; source adjustments have independent internal keys.
+Account locking precedes request and hold/wallet locking. Wallet
+corrections never change plan quota windows or Key money budgets. Both
+wallet read and admission use the same net monthly consumption query;
+corrections/reversals belong to the original settlement month rather than
+the posting month. Historical spend can change; late credits cannot release
+unrelated current-month caps.
+
+`POST /admin/model-requests/:id/corrections` is wired in production under
+existing personnel JWT + same-app internal credentials + `billing:adjust`
+(admin only; no role expansion). It accepts explicit normalized reported
+token buckets and priced/admitted extras, not caller-supplied amounts.
+The server quotes the immutable request price and retains the evidence
+reference. Correction and `settlement.correct` personnel audit commit in
+one transaction; injected audit failure rolls back all accounting and
+metering writes. Equal-money estimated-to-reported corrections work for
+plan and wallet without zero financial entries. TPM retains its original
+settlement timestamp. Replay conflicts with 409 and no extra writes.
+
+Focused evidence, under `/private/tmp/yunhou-review-20261109.3NuMWy/`:
+
+- Wallet RED `run.H0NAjg`: five parent tests reproduced the unsupported
+  wallet path before implementation.
+- Wallet/compatibility GREEN `run.aSRDux`: 108 tests/subtests, zero
+  failures/skips (159.163s). Supplement `run.obXIXk` passed the wallet
+  missing-token-total control (18.364s).
+- HTTP RED `run.FyaBMe` / `run.dE9KdJ`: valid fixtures reached runtime
+  missing-route 404, not compile or fixture errors.
+- HTTP GREEN `run.0Y7o2s`: 28 tests/subtests, zero failures/skips (71.528s),
+  including pinned-price changes, repeated key, invalid/unknown/incomplete
+  evidence, foreign attempt, role/app denial, atomic audit failure and
+  equal-money metering on both charge sources.
+
+Final bounded review and fix pass:
+
+- Bacon reviewed `80c4a42` through the tracked and untracked Task 34-35
+  changes plus their integration. The earlier independent review through
+  Task 33 is retained, not repeated. McClintock's narrower endpoint/evidence/
+  audit review found no confirmed Critical/Important issue; its no-op
+  status-code documentation mismatch is corrected to 400.
+- Important: an unused failed attempt from the same request could acquire
+  a first usage revision during correction. The request lock now protects
+  a joined request/attempt settlement-usage check. Plan and wallet HTTP
+  regressions reject the failed attempt without accounting changes, then
+  accept the settled attempt using the rejected command's key.
+- Important: historical wallet adjustments could disagree with their
+  generic ledger pairs. Corrections now require one-to-one adjustment /
+  wallet / generic facts, matching metadata and net consumption equal to
+  the request's current settlement. Drift rejects before new writes.
+- RED `run.dGw9zG` reproduced both plan/wallet wrong-attempt cases and all
+  eight original historical drift cases. GREEN `run.nSuZcv` passed 56
+  tests/subtests, zero failures/skips (PostgreSQL 18.692s; HTTP 103.736s).
+  Additional controls in the final full-gate inputs cover a physically
+  missing generic entry, equal-money wrong-attempt rejection and metering-
+  only drift rollback with same-key recovery after repair.
+- `run.AtBuJ0` was deliberately interrupted after the review findings;
+  it is obsolete, not successful final evidence. Only its verified owned
+  test processes were interrupted, and its PostgreSQL cleanup completed.
+- `run.etPgX4` failed `TestNonStreamDispatch_RenewsAccountLease` at the
+  pre-dispatch lease check with its test-only 50ms TTL, before the keeper
+  or upstream started. The unchanged test passed 20 isolated race runs
+  (`run.Pjp3hw`, 11.844s). It now waits for the actual account renewal in
+  PostgreSQL, with a 3s lease rather than a 150ms blind sleep; the original
+  renewal/release assertions remain. Five focused race repetitions passed
+  (`run.3hL38V`, 11.223s). The obsolete full run was interrupted only through
+  its verified go-test PID 56720 and child httpapi.test PID 60786; owned
+  PostgreSQL cleanup completed. It is not successful final evidence.
+
+Every completed focused run stopped its owned PostgreSQL cluster. The
+fresh final gate `run.c2xaNQ` uses two independently migrated disposable
+databases, `-p 1`, and all 618 Go input hashes are re-frozen in
+`final-go-inputs-v2.json`. Only the gateway test differs from the first
+manifest; no runtime source changed. The post-gate hash check found zero
+changed or missing inputs. No migration or new dependency is needed.
+
+Final owned-database verification, completed without changing Go inputs:
+
+- `go build ./...` and `go vet ./internal/... ./cmd/...` passed.
+- Full race with `-count=1 -p 1 -timeout=30m` over `./internal/...`,
+  `./cmd/...` and `./tests/integration/...` passed 6,090 tests/subtests
+  across 34 packages, zero failures. Total statement coverage is 80.9%;
+  the 80% floor passed. Gateway took 57.361s, HTTP 304.070s,
+  PostgreSQL 91.758s and integration 72.433s.
+- Separate `go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...`
+  passed 186 tests/subtests, zero failures (345.732s).
+- The only skips were the worker-process entry point, two `KAYA_LOAD=1`
+  opt-in load drills and the `USAGE_ACCEPTANCE=1` opt-in E2E drill.
+  No database acceptance was skipped for an unavailable database.
+- Both disposable databases applied all 55 migrations and skipped all 55
+  on rerun. `cleanup.log` confirms the owned PostgreSQL stopped;
+  `data/postmaster.pid` is absent.
+- Changed Go files are gofmt-clean and `git diff --check` passed.
+  The runner retains JSON, coverage, migration, build/vet and cleanup
+  evidence under `/private/tmp/yunhou-review-20261109.3NuMWy/run.c2xaNQ/`.
+
+The two Important findings from the bounded review are fixed and covered
+by the final gate; no confirmed unresolved Important/Critical finding
+remains in that scope. This is not proof that the entire repository is
+free of defects. The local delivery commit includes the 15-file manifest
+above; it does not push, merge or deploy.
+
+Review rulings and remaining limits:
+
+- Standalone wallet reversal keeps its pre-existing accounting contract;
+  correction detects drift and fails closed, but does not automatically
+  repair request/generic/TPM state after unrelated reversal operations.
+- Adjustment and correction endpoints retain separate idempotency
+  namespaces; reusing one key across operation types is not deduplication.
+- Corrections retain the active-account lock policy; no inactive-account
+  override is introduced.
+- The authorized operator remains responsible for evidence authenticity;
+  validation and audit do not prove a supplier report is true.
+- The ledger-pair FULL JOIN has not been benchmarked at production scale.
+  Adversarial settlement/correction scheduling, reversal-of-correction month
+  boundaries and wallet maximum-amount integration remain test limits.
+- Earlier nonblocking test follow-ups remain deferred: isolated replay
+  mutations for every nullable bucket (Task 17) and a real Kaya HTTP refusal
+  case (Task 29). No confirmed unresolved runtime defect is asserted by
+  those missing tests.
+
+The operator must verify the provider evidence before submitting it; this
+is not an automatic supplier lookup. No real-provider/client, cross-host,
+payment/refund or deployment acceptance is claimed. No push, merge,
+deployment, adjacent source edit, kaya or inherited-agent operation.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module
@@ -7988,8 +8132,9 @@ source edit, kaya or inherited-agent operation occurred.
   dependency cannot be verified here — report the blocker instead of
   weakening the verification. `GOPROXY=off` + `GOFLAGS=-mod=readonly` make
   that failure explicit rather than mutating `go.mod` / `go.sum`.
-- `internal/inference/httpapi` takes ~52 s under `-race` and dominates the
-  inference baseline runtime; budget for it when running the full suite.
+- `internal/inference/httpapi` took 304.070s in the latest full race gate
+  (§4.94) and dominates inference test runtime; budget for it when running
+  the full suite.
 - The coverage floor has thin headroom: T0 measures **80.4%** against a floor
   of 80% (§2.8). A task that adds code without tests can drop below the
   floor and fail CI even when every test passes. Re-run the floor check
@@ -8029,18 +8174,14 @@ source edit, kaya or inherited-agent operation occurred.
   PostgreSQL race suite passed; section 4.71 also refreshes the whole-branch
   race/coverage and E2E gates successfully. Neither proves
   cross-host/provider/client behavior.
-- **The wallet's post-settlement correction is still unwired — a real
-  remaining limitation, not a plan exclusion.** The persistent rate
-  reservation *is* settled/released on the wallet terminal and recovery
-  paths (`settleWallet` → `settleRateTx`, `releaseRateTx`), but
-  `CorrectSettlement` refuses the wallet path with `invalid_input`
-  (`TestCorrectSettlementRejectsWallet`), so an estimated wallet settlement
-  that later gets real evidence **cannot** be corrected. The original T4 text
-  asks for plan **and** wallet to release-or-correct the same persistent rate
-  reservation; this needs a **final review decision**. The "已知边界（本期
-  不扩大）" note inside the plan's T4 section is branch-era text written by
-  T4 — it is **not** a plan-level waiver and must not be cited as one
-  (§4.58, limit 3).
+- **Wallet correction and its production caller are implemented and locally
+  verified.** Section 4.94 replaces the earlier unsupported
+  wallet/no-caller limitation with source-specific compensation and an
+  audited operator evidence entry point, bounded independent review and
+  passing build/vet/full-race/coverage/E2E gates. Historical sections retain
+  the facts observed at those checkpoints, not a plan-level waiver.
+  Automatic provider lookup remains unimplemented; operators must verify
+  evidence.
 
 
 ---
@@ -8053,20 +8194,14 @@ implied by their existence here. Closed review findings point to their evidence.
 
 | # | Follow-up | Scope | Owner (role) | Schedule |
 |---|---|---|---|---|
-| 1 | `inference-correction-trigger-and-wallet` | (a) The **evidence-driven correction trigger**: who calls `Store.CorrectSettlement` / `Store.CorrectRateTokensTx` when real usage evidence lands (the recovery verifier path, or an operator-facing correction entry point) — today the money-correction channel has **no production caller**; (b) the **wallet money-correction semantics**: `CorrectSettlement` refuses wallet-charged requests with `invalid_input` (micromoney unit, wallet compensation entries and the token-budget sync are not adapted), so an estimated wallet settlement that later gets real evidence cannot be corrected. **No payment / wallet product change is implied** — the scope is the correction channel only. | Users 模型网关维护者 | 未排期 |
+| 1 | `inference-correction-trigger-and-wallet` | Source-specific wallet micromoney compensation and usage/TPM correction; operator evidence endpoint quotes pinned price and audits atomically. No payment / wallet product change. Bounded review fixes, full race, 80.9% coverage and separate E2E passed (§4.94). | Users 模型网关维护者 | 2026-11-10 已修并完成本地验证 |
 | 2 | `responses-history-order-preservation` (review #12 finding 3) | Representable history stays ordered; nonempty text after a call before results explicitly returns `invalid_input` in parse and replay. See section 4.62 for regressions and compatibility cost. | Users 模型网关维护者 | 2026-11-09 本轮已修 |
 | 3 | `reasoning-parameter-conflict-policy` (review #12 finding 4) | Explicit reasoning effort takes precedence over the toggle in both OpenAI adapters; false/high remains high. See section 4.62 for the ingress and adapter matrix. | Users 模型网关维护者 | 2026-11-09 本轮已修 |
 | 4 | `chat-rate-limit-retry-after` (review #12 finding 5) | Facade retains known local rate recovery; handler emits positive `Retry-After` and omits unknown recovery. See section 4.62 for real RPM/TPM E2E evidence. | Users 模型网关维护者 | 2026-11-09 本轮已修 |
 
-The limitation wording in the plan (§1.1.6 item 1), the T4 branch-era note
-"已知边界（本期不扩大）" and §4.58 limit 3 stay **as they are**: they are
-accurate. The T4 note is branch-era text and is still **not** a plan-level
-waiver.
-
-**Delivery status, not a scope waiver.** Initial wallet settlement and release
-update the rate reservation, but that does not satisfy the original T4
-post-settlement correction requirement. The missing production trigger and
-wallet money/token correction remain genuine unfinished original scope.
-A recovery-settled estimate stays conservative until that channel exists.
-No explicit plan-level waiver has been recorded, so this follow-up cannot
-justify declaring the original plan or the until-clean review complete.
+**Delivery status, not a scope waiver.** The former unsupported-wallet and
+no-production-caller gap was genuine unfinished original scope, not an
+exclusion. Tasks 34-35 close it and section 4.94 records the final evidence.
+Historical dated checkpoints are not rewritten. Recovery estimates remain
+conservative until an authorized operator supplies verified evidence; the
+new entry point does not pretend unknown usage is zero.

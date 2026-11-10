@@ -396,6 +396,7 @@ func main() {
 		Accounts: inferencehttpapi.NewAdminAccountsHandler(inferencecredentials.NewAccountService(infStore, infStore)),
 		// Task 15: 补偿/冲正带同事务追加审计；补偿列表经运营读模型。
 		Adjustments: inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil, infStore, opsViewSvc),
+		Corrections: inferencehttpapi.NewAdminCorrectionsHandler(infStore, infStore, nil),
 		// Task 15: 批量导入（dry-run/逐项错误/幂等任务 ID/绝不半发布）。
 		Bulk: inferencehttpapi.NewAdminBulkHandler(inferencemanagement.NewBulkImportService(infStore, infStore, egressValidator.ValidateURL)),
 		// Task 15: 运营统计/成本分析/异常筛选/共享账号检测/变更预览。

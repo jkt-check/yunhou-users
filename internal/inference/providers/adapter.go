@@ -104,6 +104,9 @@ type Call struct {
 	// it — domain.ValidateCustomHeaders).
 	RequestID string
 	Request   *ChatRequest
+	// ClientProtocol selects the caller's output surface. Empty preserves
+	// raw Chat behavior for callers that do not request native translation.
+	ClientProtocol domain.Protocol
 	// OutputCap is the forced output ceiling forwarded upstream (设计 §7.2:
 	// 不允许无限输出).
 	OutputCap int64
@@ -412,8 +415,15 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	}
 
 	d := &DispatchResult{UpstreamRequestID: upstreamRequestID(resp)}
+	nativeClient := call.ClientProtocol == domain.ProtocolAnthropicMessage ||
+		call.ClientProtocol == domain.ProtocolOpenAIResponses
 	if call.Request.Stream {
 		d.Stream = a.WrapStream(resp.Body)
+		if tap, ok := d.Stream.Tap.(*OpenAIUsageTracker); ok && nativeClient {
+			// Configure before the caller can read; refusal is a translation
+			// failure on native surfaces, not a raw Chat upstream failure.
+			tap.rejectRefusal = true
+		}
 		return d, nil
 	}
 	defer resp.Body.Close()
@@ -431,6 +441,10 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	if err != nil && ns == nil {
 		// A 200 we cannot parse: consumption unknown, nothing relayed.
 		return nil, &DispatchError{Err: err, ExecutedUnknown: true}
+	}
+	if ns.hasRefusal && nativeClient {
+		ns.Payload = nil
+		err = errChatRefusal
 	}
 	d.Payload = ns.Payload
 	d.Usage = ns.Usage
@@ -470,6 +484,7 @@ type NonStreamResult struct {
 	// choices) — the output side of the estimate when the upstream omits
 	// usage (与流式 tap 的 ContentBytes 同口径).
 	ContentBytes int64
+	hasRefusal   bool
 }
 
 // upstreamRequestID prefers the conventional response headers; adapters

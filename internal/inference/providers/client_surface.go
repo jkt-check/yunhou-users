@@ -32,9 +32,10 @@ type openAIStreamChunk struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role             string `json:"role"`
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Role             string  `json:"role"`
+			Content          string  `json:"content"`
+			ReasoningContent string  `json:"reasoning_content"`
+			Refusal          *string `json:"refusal"`
 			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
@@ -55,6 +56,15 @@ type openAIStreamChunk struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
 	} `json:"error"`
+}
+
+func (c *openAIStreamChunk) hasRefusal() bool {
+	for _, choice := range c.Choices {
+		if choice.Delta.Refusal != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // pumpEvent is one parsed line of the internal SSE stream.
@@ -129,9 +139,10 @@ type completionView struct {
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
 		Message      struct {
-			Role             string `json:"role"`
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Role             string  `json:"role"`
+			Content          string  `json:"content"`
+			ReasoningContent string  `json:"reasoning_content"`
+			Refusal          *string `json:"refusal"`
 			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -151,6 +162,11 @@ func parseCompletion(payload []byte) (*completionView, error) {
 	var v completionView
 	if err := json.Unmarshal(payload, &v); err != nil {
 		return nil, fmt.Errorf("providers: decode internal completion: %w", err)
+	}
+	for _, choice := range v.Choices {
+		if choice.Message.Refusal != nil {
+			return nil, errChatRefusal
+		}
 	}
 	return &v, nil
 }

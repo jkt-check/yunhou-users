@@ -1006,9 +1006,12 @@ paths:
         "502":
           description: |
             api_error（非流式上游文本出现在工具调用之后，无法忠实保序；
-            或 Responses 上游返回无法忠实翻译的 refusal / status=failed）。
+            或 Responses 上游返回无法忠实翻译的 refusal / status=failed；
+            或 Chat 上游返回非 null refusal，包括空字符串）。
             请求已执行：按已报 usage 或完整输出估算结算，不重放、不切换上游，
             不返回改写后的答案，也不保存响应链。
+            Chat refusal 的流式转换只发一次原生错误，无后续内容或成功终态，
+            继续读取晚到 usage；裸 EOF 且无 usage 时保留预占并挂起核对。
           content:
             application/json:
               schema:
@@ -1137,9 +1140,12 @@ paths:
         "502":
           description: |
             upstream_response_invalid（非流式上游文本出现在工具调用之后，
-            无法忠实保序；或 Responses 上游返回 refusal / status=failed）。
+            无法忠实保序；或 Responses 上游返回 refusal / status=failed；
+            或 Chat 上游返回非 null refusal，包括空字符串）。
             请求已执行：按已报 usage 或完整输出估算结算，
             不重放、不切换上游，不返回改写后的答案，也不保存响应链。
+            Chat refusal 的流式转换只发一次原生错误，无后续内容或成功终态，
+            继续读取晚到 usage；裸 EOF 且无 usage 时保留预占并挂起核对。
           content:
             application/json:
               schema:
@@ -1194,6 +1200,8 @@ paths:
         Responses 上游的 refusal 无法忠实翻译：流内明确报错，无成功终态
         或响应链；保留拒绝字节与后续 usage。完整收到但未报 usage 的拒绝
         可估算结算；只有拒绝片段后裸 EOF 且无 usage 时仍冻结预占、挂起核对。
+        Chat 上游的 refusal 在本入口原样透传，其文本计入缺失 usage 时的
+        输出估算；只有转到 Messages/Responses 客户端形状时才明确拒绝。
       security:
         - BearerAuth: []
       requestBody:

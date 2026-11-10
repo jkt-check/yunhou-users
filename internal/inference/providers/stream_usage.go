@@ -145,11 +145,14 @@ type OpenAIUsageTracker struct {
 	res     TapResult
 	err     error
 	failed  bool
+	// Set by Dispatch before reads begin. Raw Chat may pass refusals through.
+	rejectRefusal bool
+	refusalSeen   bool
 }
 
 // Feed consumes one upstream read. Lines are reassembled across reads (the
 // relay buffer has no line alignment). Only complete `data:` lines
-// containing "usage", "content", "reasoning", "tool_calls", "error" or [DONE] cost more than a
+// containing "usage", "content", "reasoning", "tool_calls", "refusal", "error" or [DONE] cost more than a
 // prefix scan.
 func (t *OpenAIUsageTracker) Feed(p []byte) error {
 	t.mu.Lock()
@@ -197,7 +200,9 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	}
 	payload := bytes.TrimSpace(line[len("data:"):])
 	if bytes.Equal(payload, []byte("[DONE]")) {
-		t.res.Terminal = !t.failed
+		rejected := t.rejectRefusal && t.refusalSeen
+		t.res.Terminal = !t.failed && !rejected
+		t.res.RejectedComplete = !t.failed && rejected
 		return
 	}
 	if len(payload) == 0 || payload[0] != '{' {
@@ -213,15 +218,17 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	wantContent := bytes.Contains(line, []byte(`"content"`))
 	wantReasoning := bytes.Contains(line, []byte("reasoning"))
 	wantTools := bytes.Contains(line, []byte(`"tool_calls"`))
+	wantRefusal := bytes.Contains(line, []byte(`"refusal"`))
 	wantError := bytes.Contains(line, []byte(`"error"`))
-	if !wantUsage && !wantContent && !wantReasoning && !wantTools && !wantError {
+	if !wantUsage && !wantContent && !wantReasoning && !wantTools && !wantRefusal && !wantError {
 		return
 	}
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+				Content          string  `json:"content"`
+				ReasoningContent string  `json:"reasoning_content"`
+				Refusal          *string `json:"refusal"`
 				ToolCalls        []struct {
 					Function struct {
 						Arguments string `json:"arguments"`
@@ -238,9 +245,18 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	if len(chunk.Error) > 0 && !bytes.Equal(bytes.TrimSpace(chunk.Error), []byte("null")) {
 		t.failed = true
 		t.res.Terminal = false
+		t.res.RejectedComplete = false
 	}
 	for _, ch := range chunk.Choices {
 		t.res.ContentBytes += int64(len(ch.Delta.Content) + len(ch.Delta.ReasoningContent))
+		if ch.Delta.Refusal != nil {
+			t.refusalSeen = true
+			t.res.ContentBytes += int64(len(*ch.Delta.Refusal))
+			if t.rejectRefusal {
+				t.res.Terminal = false
+				t.res.RejectedComplete = false
+			}
+		}
 		for _, call := range ch.Delta.ToolCalls {
 			t.res.ContentBytes += int64(len(call.Function.Arguments))
 		}

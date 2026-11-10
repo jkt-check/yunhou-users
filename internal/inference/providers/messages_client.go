@@ -667,16 +667,20 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 	if chunk == nil {
 		return nil
 	}
-	if chunk.Error != nil {
+	if chunk.Error != nil || chunk.hasRefusal() {
 		r.errorRelayed = true
 		if !r.started {
 			if err := r.emitStart(w); err != nil {
 				return err
 			}
 		}
+		message := errChatRefusal.Error()
+		if chunk.Error != nil {
+			message = chunk.Error.Message
+		}
 		return writeSSE(w, "error", map[string]any{
 			"type":  "error",
-			"error": map[string]any{"type": "api_error", "message": chunk.Error.Message},
+			"error": map[string]any{"type": "api_error", "message": message},
 		})
 	}
 	if !r.started {

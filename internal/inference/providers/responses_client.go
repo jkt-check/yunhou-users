@@ -767,6 +767,10 @@ func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
 		s.errorRelayed = true
 		return s.emitError(w, chunk.Error.Code, chunk.Error.Message)
 	}
+	if chunk.hasRefusal() {
+		s.errorRelayed = true
+		return s.emitError(w, "server_error", errChatRefusal.Error())
+	}
 	if !s.started {
 		if err := s.emitCreated(w); err != nil {
 			return err

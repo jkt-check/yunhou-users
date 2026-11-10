@@ -528,7 +528,7 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		}
 	}
 
-	return s.dispatchLoop(ctx, requestID, adm, req, price, cands)
+	return s.dispatchLoop(ctx, requestID, adm, req, price, cands, clientProto)
 }
 
 // ErrCapabilityUnsupported marks a request whose protocol or capability
@@ -780,7 +780,8 @@ func filterCandidatesByAccount(cands []routing.Candidate, accountID string) []ro
 // attempt persists its intent + lease BEFORE dispatch; retries never bill
 // the customer twice (settlement happens once, on the winning attempt).
 func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota.AdmissionResult,
-	req *providers.ChatRequest, price accounting.PriceVersion, cands []routing.Candidate) (*Outcome, error) {
+	req *providers.ChatRequest, price accounting.PriceVersion, cands []routing.Candidate,
+	clientProto domain.Protocol) (*Outcome, error) {
 
 	maxAttempts := s.MaxAttempts
 	if maxAttempts <= 0 {
@@ -797,7 +798,7 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 		if !ok {
 			continue
 		}
-		outcome, err := s.attempt(ctx, requestID, i+1, adm, req, price, cand, adapter)
+		outcome, err := s.attempt(ctx, requestID, i+1, adm, req, price, cand, adapter, clientProto)
 		if outcome != nil || err == nil {
 			return outcome, err
 		}
@@ -871,7 +872,7 @@ func (s *Service) holdForReconciliation(requestID string, cause error) error {
 // 400); a *providers.DispatchError feeds the retry policy.
 func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, adm *quota.AdmissionResult,
 	req *providers.ChatRequest, price accounting.PriceVersion, cand routing.Candidate,
-	adapter providers.Adapter) (*Outcome, error) {
+	adapter providers.Adapter, clientProto domain.Protocol) (*Outcome, error) {
 
 	// Attempt intent + upstream concurrency lease commit in ONE tx —
 	// before any byte is sent upstream (设计 §7.2).
@@ -977,12 +978,13 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	}()
 
 	disp, err := providers.Dispatch(attemptCtx, s.client, adapter, &providers.Call{
-		Deployment:   &cand.Deployment,
-		Auth:         providers.Auth{Type: auth.AuthType, Token: auth.Token},
-		RequestID:    requestID,
-		Request:      req,
-		OutputCap:    adm.OutputCap,
-		ExtraHeaders: extraHeaders,
+		Deployment:     &cand.Deployment,
+		Auth:           providers.Auth{Type: auth.AuthType, Token: auth.Token},
+		RequestID:      requestID,
+		Request:        req,
+		ClientProtocol: clientProto,
+		OutputCap:      adm.OutputCap,
+		ExtraHeaders:   extraHeaders,
 	})
 	if err != nil && disp == nil {
 		cancel()

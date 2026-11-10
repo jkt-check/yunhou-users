@@ -7559,6 +7559,102 @@ This local checkpoint is not a whole-branch clean-review or release claim.
 No push, merge, deployment, adjacent-source edit or kaya process operation
 is included.
 
+### 4.89 Task 29: Preserve Chat Refusal Metering and Reject Native Empty Success
+
+**Scope:** keep raw Chat/Kaya refusal output unchanged, count its generated
+bytes and explicitly reject unsupported Messages/Responses conversion.
+This extends Task 24's rejection contract; it does not add a replayable
+refusal content type or change pricing, routing or money correction.
+
+**Checkpoint files:**
+
+- `providers/openai_chat.go` meters nonstream refusal text, including a
+  present empty string as a refusal while absent/null remains ordinary.
+- `providers/stream_usage.go` meters refusal deltas and distinguishes
+  completed native rejection from genuine upstream failure. Actual errors
+  remain sticky even after a later DONE, while late usage is retained.
+- `providers/adapter.go` and `gateway/service.go` pass caller protocol
+  into Dispatch before settlement or stream reads. Native nonstream
+  rejection returns execution identity and metering without a payload.
+- `providers/client_surface.go`, `providers/messages_client.go` and
+  `providers/responses_client.go` reject native refusal conversion,
+  inspect every choice before rendering a chunk, emit one explicit error,
+  suppress later content/success/chain persistence and continue draining.
+- `providers/chat_refusal_test.go` adds Dispatch and mixed-chunk
+  regressions. Earlier provider tests are in `89d7db5`; authenticated HTTP
+  accounting regressions are in `8e5659d`, not new in this checkpoint.
+- The API guide, OpenAPI, operations runbook, convergence plan and this
+  verification record document behavior, evidence and remaining scope.
+
+**RED/GREEN evidence:** fresh provider RED before behavioral changes
+reproduced missing 13/24-byte metering, empty native success and leaked
+post-refusal content. Expanded Dispatch/whole-chunk RED also failed before
+the fix. Both logs are retained under the ignored convergence evidence
+directory. Owned HTTP RED `run.eWNAlN` exited 1 (8.368s), with 24 failed
+test/subtest events. Its PostgreSQL cleanup completed.
+
+After the fix, all-providers race passed (4.389s).
+Owned HTTP GREEN `run.kSJjTy` exited 0 (9.774s): both test groups and all
+36 leaf cases passed, 38 pass events, zero failures or skips. It verifies
+reported/absent usage, empty/text refusals, stream/nonstream and all three
+`/v1` surfaces; exactly one attempt/usage/charge, correct TPM and released
+leases. Interrupted streams retain unknown-consumption holds and recovery
+jobs, or settle observed late usage without replay. Dispatch regressions
+also cover default/raw Chat/Kaya/Messages/Responses caller settings,
+one-byte reads, null/absent controls, whole-chunk rejection and an actual
+error after DONE followed by a second DONE.
+
+**Bounded review:** Kuhn's read-only review against `8e5659d` found no
+confirmed Critical/Important defects in the eight-file Go delta and its
+provider/HTTP regressions. Raw passthrough, null/empty distinction,
+mixed-choice rejection, no-retry settlement, late-usage drain and sticky
+upstream failure were explicitly checked. Kaya refusal is covered at
+Dispatch, not by a dedicated authenticated Kaya HTTP refusal case; this
+is retained as a nonblocking coverage limitation. The reviewer did not run
+tests/builds or inspect the concurrent documentation edits. Other recorded
+findings remain outside this delta, not waived.
+
+**Full gate:** `run.0EBPCf` exited 0 on 2026-11-10 (Asia/Shanghai), using
+`GOMAXPROCS=2`, `GOPROXY=off` and `GOFLAGS=-mod=readonly`:
+
+```sh
+go build ./...
+go vet ./internal/... ./cmd/...
+go test -race -count=1 -p 1 -timeout=30m \
+  -coverprofile="$RUN/coverage.out" -json \
+  ./internal/... ./cmd/... ./tests/integration/...
+go tool cover -func="$RUN/coverage.out"
+go test -race -count=1 -p 1 -timeout=30m -json ./tests/e2e/...
+```
+
+Build and vet passed. Full race passed 5,225 tests/subtests across 34
+packages with zero failures; total statement coverage was 80.8%, above
+the 80% floor. Separate E2E race passed 186 tests/subtests in 177.616s
+with zero failures. The only skips were `TestQuotaWorkerProcess`,
+`TestLoadDrill_Throughput`, `TestLoadDrill_LongConnections` and
+`TestUsageTokenAcceptance_TenPagesTwoMinutes`: the expected child entry
+and opt-in drills, not unavailable database acceptance.
+
+Both independent disposable databases applied all 55 migrations and
+skipped all 55 on rerun. Cleanup confirmed the owned PostgreSQL server
+stopped and `data/postmaster.pid` is absent. Go sources/tests remained
+frozen throughout the full gate. Formatting, OpenAPI YAML parsing and
+diff whitespace checks passed.
+
+Artifacts are under
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.0EBPCf/`:
+`build.log`, `vet.log`, `tests.jsonl`, `coverage.out`,
+`coverage-summary.log`, `e2e.jsonl`, both migration logs and `cleanup.log`.
+
+**Remaining boundaries:** Messages/Responses refusal is an explicit
+translation error rather than a native refusal answer. No real-provider,
+real-client or cross-host acceptance is claimed. Incomplete function
+arguments, missing/unknown incomplete reasons, partial public usage,
+wallet correction, its production evidence caller and already-resolved
+overage re-enqueue policy remain open. This local checkpoint is not a
+whole-branch clean-review or release claim. No push, merge, deployment,
+adjacent-source edit or kaya process operation is included.
+
 ## 5. Open concerns
 
 - The Go module proxy is unreachable from this environment; the cached module

@@ -187,6 +187,20 @@ SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
 输出上限不超过 1024 时，开启 thinking 仍被明确拒绝，需提高请求上限或关闭
 thinking；关闭 thinking 不受这条最小预算约束。此修复不改变价格或计费口径。
 
+## Chat 上游 refusal 的转换边界
+
+`openai_chat` 上游返回 `message.refusal` 或 `delta.refusal` 时，
+`/v1/chat/completions` 与 Kaya `/chat` 仍原样透传，拒绝文本参与缺失
+usage 时的估算。Messages/Responses 客户端面不支持忠实表示该输出：
+非流式返回 502；流式发一次原生错误，不再输出内容、成功终态或会话链，
+但继续读取上游以保留晚到用量。空字符串仍是拒绝，省略或 `null` 不是。
+
+这是已经执行的调用，不因翻译失败释放已发生消费或自动重放。完整拒绝响应
+按已报 usage 或观察到的输出估算结算；流式错误后的 usage 来源仍为
+estimated。拒绝片段后裸 EOF 且无 usage 时保留预占并挂起核对。真实上游
+错误优先于拒绝完成证据，后续 `[DONE]` 不能把失败改成完整拒绝。
+本次不扩展拒绝内容的原生渲染或历史回放 schema。
+
 ## 配置支持集（T7：只支持已实现的那部分）
 
 本期口径是**明确支持集 + 拒绝不支持的配置**：不实现的能力不收下（收下就是

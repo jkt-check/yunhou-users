@@ -14,6 +14,7 @@ package providers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -24,6 +25,8 @@ import (
 // OpenAIChat is the adapter for openai_chat deployments (OpenAI,
 // DeepSeek, Moonshot, GLM, MiniMax and other OpenAI-compatible endpoints).
 type OpenAIChat struct{}
+
+var errChatRefusal = errors.New("providers: chat refusal cannot be translated faithfully")
 
 // NewOpenAIChat builds the adapter.
 func NewOpenAIChat() *OpenAIChat { return &OpenAIChat{} }
@@ -168,8 +171,9 @@ type openAINonStream struct {
 	Usage   *openAIUsage `json:"usage"`
 	Choices []struct {
 		Message struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Content          string  `json:"content"`
+			ReasoningContent string  `json:"reasoning_content"`
+			Refusal          *string `json:"refusal"`
 			ToolCalls        []struct {
 				Function struct {
 					Arguments string `json:"arguments"`
@@ -188,6 +192,10 @@ func (a *OpenAIChat) DecodeNonStream(body []byte) (*NonStreamResult, error) {
 	out := &NonStreamResult{Payload: body, UpstreamRequestID: resp.ID}
 	for _, ch := range resp.Choices {
 		out.ContentBytes += int64(len(ch.Message.Content) + len(ch.Message.ReasoningContent))
+		if ch.Message.Refusal != nil {
+			out.hasRefusal = true
+			out.ContentBytes += int64(len(*ch.Message.Refusal))
+		}
 		for _, call := range ch.Message.ToolCalls {
 			out.ContentBytes += int64(len(call.Function.Arguments))
 		}

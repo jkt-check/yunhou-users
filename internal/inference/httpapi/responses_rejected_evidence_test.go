@@ -14,7 +14,8 @@ import (
 func TestV1Responses_RejectedExecutionSettlesOnce(t *testing.T) {
 	const refusal = `{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot help"}]}`
 	for _, surface := range []string{"chat/completions", "messages", "responses"} {
-		for _, kind := range []string{"failed", "refusal", "stream_delta", "stream_terminal"} {
+		for _, kind := range []string{"failed", "refusal", "stream_delta", "stream_terminal",
+			"incomplete_missing", "incomplete_unknown", "stream_incomplete_missing", "stream_incomplete_unknown"} {
 			for _, reported := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/%s/reported=%t", surface, kind, reported), func(t *testing.T) {
 					f := newMatrixFixture(t, domain.ProtocolOpenAIResponses)
@@ -23,8 +24,14 @@ func TestV1Responses_RejectedExecutionSettlesOnce(t *testing.T) {
 					if kind == "failed" {
 						status = "failed"
 						output = `[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]`
+					} else if strings.Contains(kind, "incomplete") {
+						status = "incomplete"
+						output = `[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]`
 					}
 					answer := fmt.Sprintf(`{"id":"resp_rejected","object":"response","status":%q,"output":%s`, status, output)
+					if strings.HasSuffix(kind, "_unknown") {
+						answer += `,"incomplete_details":{"reason":"provider_specific"}`
+					}
 					if reported {
 						answer += `,"usage":{"input_tokens":10,"output_tokens":3}`
 					}
@@ -40,7 +47,7 @@ func TestV1Responses_RejectedExecutionSettlesOnce(t *testing.T) {
 						if kind == "stream_delta" {
 							_, _ = io.WriteString(w, "data: "+`{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"I cannot help"}`+"\n\n")
 						}
-						_, _ = io.WriteString(w, "data: "+`{"type":"response.completed","response":`+answer+"}\n\n")
+						_, _ = io.WriteString(w, "data: "+`{"type":"response.`+status+`","response":`+answer+"}\n\n")
 					})
 					body := map[string]any{"model": "glm-4.6", "stream": stream}
 					if surface == "responses" {
@@ -77,7 +84,7 @@ func TestV1Responses_RejectedExecutionSettlesOnce(t *testing.T) {
 						t.Fatal(err)
 					}
 					wantSource, wantInput, wantOutput := "estimated", int64(22), int64(6)
-					if kind == "failed" {
+					if kind == "failed" || strings.Contains(kind, "incomplete") {
 						wantOutput = 3
 					}
 					if reported {
@@ -107,7 +114,7 @@ func TestV1Responses_RejectedExecutionSettlesOnce(t *testing.T) {
 						{`SELECT COUNT(*) FROM inference_usage_records`, 1},
 						{`SELECT COUNT(*) FROM inference_ledger_entries WHERE entry_type='charge'`, 1},
 						{`SELECT COUNT(*) FROM inference_reservations WHERE state='held'`, 0},
-						{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='active'`, 0},
+						{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='held'`, 0},
 						{`SELECT COUNT(*) FROM inference_response_chains`, 0},
 						{`SELECT COUNT(*) FROM inference_reconciliation_jobs`, 0},
 						{`SELECT COUNT(*) FROM inference_rate_reservations WHERE scope='account' AND state='settled'`, 1},

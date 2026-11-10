@@ -1362,6 +1362,59 @@ prior provider/HTTP tests are already in a944fb7 and 1bbfb6a.
 This is a local commit checkpoint, not whole-branch review convergence or
 release acceptance. No push, merge, deployment or kaya process operation.
 
+## Task 31: Reject Unrepresentable Responses Incomplete Reasons
+
+**Files:** `providers/openai_responses.go`, `openai_responses_stream.go`,
+provider and authenticated HTTP regressions, API/operations/verification docs.
+
+**Interfaces:** `responsesFinishReason` must return an error rather than `stop`
+for incomplete responses without a supported reason. Decode retains the
+nonstream execution result on rejection. Streams drain late usage, do not
+emit DONE/native success, and retain complete rejected execution evidence
+only in the absence of a real upstream failure.
+
+- [x] Add provider regressions for missing/null/empty/unknown incomplete reasons,
+  tools, reported/absent usage, fragmented reads and contradictory stream status.
+- [x] Run focused provider race tests; expect rejection/terminal assertions
+  to fail on the existing `stop` fallback.
+- [x] Add authenticated regressions across all three client surfaces; verify
+  one attempt/charge, exact usage/TPM, no chain and no held leases on a complete
+  rejected execution. Run them on owned databases and observe RED.
+- [ ] Reject unsupported incomplete reasons before successful settlement or
+  stream completion. Real protocol/read errors must dominate rejected-complete
+  evidence, even if another terminal and late usage follow.
+- [ ] Run focused GREEN, complete providers race, full build/vet/race coverage
+  and separate E2E with independent owned databases.
+- [ ] Record evidence, remaining gaps and the local commit; no push/merge/deploy.
+
+Ruling: reject rather than map an unknown incomplete reason to `stop`, `length`
+or `content_filter`. The internal Chat representation has no faithful value
+for this case, and inventing one changes caller-visible execution semantics.
+Known `max_output_tokens` and `content_filter` remain supported unchanged.
+Cost: a compatible upstream omitting its reason now yields an explicit
+translation error instead of a falsely completed answer.
+
+RED commit checkpoint (2026-11-10): the latest request is local commit only.
+This checkpoint includes the provider regressions, authenticated HTTP
+regressions and this plan; no production fix is included. Fresh focused
+provider race exited 1 (3.485s), reproducing false successful terminals
+and rejected-execution evidence gaps. The initial structured provider run
+recorded 91 failing tests/subtests and four passes, plus a package failure.
+
+Command: `env GOPROXY=off GOFLAGS=-mod=readonly GOMAXPROCS=2 go test -race -count=1 -json ./internal/inference/providers -run '^TestResponsesIncomplete_' -timeout=5m`.
+The authenticated HTTP race run.Y2lkkG exited 1 (17.704s): all 24 new
+incomplete cases failed, the existing 24 controls passed, and the parent
+test failed. It used independently owned disposable databases with explicit
+URLs and serialized packages; cleanup confirmed its PostgreSQL stopped
+and postmaster.pid is absent. Its structured evidence is
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.Y2lkkG/focused.jsonl`.
+The HTTP lease assertion now checks the actual `held` state.
+
+Task 31 remains unfinished. Full race, E2E and coverage were not rerun
+for this intentionally RED checkpoint; the previous 80.8% coverage belongs
+to Task 30, not this tree. No push, merge, deployment or kaya process
+operation.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

@@ -1277,6 +1277,36 @@ Runbook 4.89 records the 13-file manifest, commands and evidence.
 This is the user's local commit checkpoint, not whole-branch review
 convergence; other recorded findings remain open.
 
+## Task 30: Preserve Tool Arguments Without Fabricated Empty Objects
+
+**Files:** provider argument validation, Messages/Responses adapters and
+renderers, provider/HTTP regressions and protocol/verification documentation.
+
+**Interfaces:** Responses argument strings remain verbatim. Messages object
+conversion returns an explicit error for empty, truncated or non-object
+arguments, without dropping execution usage/identity or retrying the request.
+Complete rejected streams retain `RejectedComplete`; interruptions do not.
+
+- [ ] Reproduce empty/truncated arguments becoming `{}` in Responses output,
+  upstream history and Messages nonstream output.
+- [ ] Cover valid empty objects, large integer objects, scalar/null/array
+  arguments, fragmented and parallel deltas, late usage and upstream errors.
+- [ ] Remove synthesized arguments; reject invalid replay input and Messages
+  object conversion before nonstream settlement or successful stream completion.
+- [ ] Verify authenticated HTTP output, absent invalid chains, one charge,
+  correct TPM and released leases, including reported/estimated evidence.
+- [ ] Run focused RED/GREEN, all providers race and a bounded delta review.
+- [ ] Run fresh build/vet/full race coverage and separate E2E on owned databases.
+- [ ] Record evidence and commit the verified checkpoint locally.
+
+Ruling: do not repair generated JSON or infer a missing `{}`. Responses can
+carry a partial argument string and must preserve it; chain validation must
+refuse empty/invalid JSON. Messages requires an object, so reject conversion
+rather than invent one. Valid object numbers must not round through float64.
+Cost: malformed/non-object tool arguments produce explicit Messages errors
+and incomplete Responses histories cannot be referenced by response ID.
+This extends the existing faithful-conversion boundary, not tool execution.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

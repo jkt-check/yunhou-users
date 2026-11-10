@@ -1307,6 +1307,27 @@ Cost: malformed/non-object tool arguments produce explicit Messages errors
 and incomplete Responses histories cannot be referenced by response ID.
 This extends the existing faithful-conversion boundary, not tool execution.
 
+RED commit checkpoint (2026-11-10): the latest user request checkpoints
+`tool_arguments_fidelity_test.go` and this evidence only; no production fix
+is included. Fresh focused race exited 1 in 3.024s, recording 195 passing
+test/subtest events and 122 failure events, including 117 failing leaf
+cases across all five test groups. Empty Responses arguments became `{}`,
+invalid replay was accepted, Messages object conversion rounded
+9007199254740993 to 9007199254740992, and invalid/non-object arguments
+still reached successful Messages output or terminal evidence.
+
+Command: `env GOMAXPROCS=2 GOPROXY=off GOFLAGS=-mod=readonly go test -race -count=1 -json ./internal/inference/providers -run '^TestToolArguments_(ResponsesPreserves|MessagesObject|MessagesDispatch|StreamConversion|ResponsesStream)'`.
+Evidence:
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/task-30-commit-red.jsonl`.
+The cases cover verbatim Responses output/history/replay, Messages
+object conversion, nonstream execution evidence, fragmented/interleaved
+stream arguments, late usage and interruption/error controls. Authenticated
+HTTP regressions and the production fix remain outstanding. No database
+was used. Full race, E2E and coverage were not rerun for this intentionally
+non-green checkpoint; the previous 80.8% coverage belongs to Task 29,
+not this tree. Task 30 and the wider review goal remain unfinished.
+No push, merge, deployment or kaya process operation.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

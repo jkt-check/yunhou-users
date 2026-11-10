@@ -14,6 +14,7 @@
 package accounting
 
 import (
+	"math"
 	"strconv"
 	"time"
 
@@ -166,7 +167,15 @@ func SplitFreeze(bonusAvailable, cashAvailable, amount int64) (cash, bonus int64
 	if amount <= 0 {
 		return 0, 0, domain.WrapError(domain.CodeInvalidInput, "accounting: freeze amount must be > 0", domain.ErrNegativeValue)
 	}
-	if bonusAvailable+cashAvailable < amount {
+	if bonusAvailable <= 0 && cashAvailable <= 0 {
+		return 0, 0, ErrInsufficientBalance
+	}
+	if bonusAvailable < 0 || cashAvailable < 0 {
+		// Opposite signs cannot overflow; keep the deficit in the gate.
+		if bonusAvailable+cashAvailable < amount {
+			return 0, 0, ErrInsufficientBalance
+		}
+	} else if bonusAvailable < amount && cashAvailable < amount-bonusAvailable {
 		return 0, 0, ErrInsufficientBalance
 	}
 	if bonusAvailable < 0 {
@@ -241,13 +250,32 @@ func DeriveWalletBalance(currency string, s WalletSums) (WalletBalance, error) {
 	if _, err := domain.NewMoney(0, currency); err != nil {
 		return WalletBalance{}, err
 	}
+	cash, err := walletSourceAvailable(s.CashCredit, s.CashDebit, s.HeldCash)
+	if err != nil {
+		return WalletBalance{}, err
+	}
+	bonus, err := walletSourceAvailable(s.BonusCredit, s.BonusDebit, s.HeldBonus)
+	if err != nil {
+		return WalletBalance{}, err
+	}
 	return WalletBalance{
 		Currency:       currency,
-		CashAvailable:  s.CashCredit - s.CashDebit - s.HeldCash,
-		BonusAvailable: s.BonusCredit - s.BonusDebit - s.HeldBonus,
+		CashAvailable:  cash,
+		BonusAvailable: bonus,
 		CashHeld:       s.HeldCash,
 		BonusHeld:      s.HeldBonus,
 	}, nil
+}
+
+func walletSourceAvailable(credit, debit, held int64) (int64, error) {
+	if credit < 0 || debit < 0 || held < 0 {
+		return 0, domain.WrapError(domain.CodeInternal, "accounting: negative wallet aggregate", domain.ErrNegativeValue)
+	}
+	net := credit - debit
+	if net < math.MinInt64+held {
+		return 0, domain.WrapError(domain.CodeInternal, "accounting: wallet availability underflow", domain.ErrOverflow)
+	}
+	return net - held, nil
 }
 
 // ---------------------------------------------------------------------------

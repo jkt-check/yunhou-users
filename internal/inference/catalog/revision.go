@@ -70,24 +70,106 @@ func (s *Snapshot) Model(idOrAlias string) (*domain.Model, bool) {
 	return nil, false
 }
 
+// providerStatusActive is the only provider status that may carry traffic
+// under a published catalog. The DB column is NOT NULL DEFAULT 'active'
+// with a CHECK ('active','disabled'), and the store coerces an empty status
+// to 'active' on insert — so an empty status only ever comes from a
+// hand-built snapshot and is treated as active.
+const providerStatusActive = "active"
+
+// ProviderSchedulable reports whether a provider may carry traffic under
+// this published snapshot. The published catalog is authoritative: a
+// provider that is absent from the snapshot has no published state at all,
+// and a provider whose published status is not "active" is out of
+// rotation — every deployment behind it stops being dispatchable.
+//
+// This is the provider half of the ONE schedulability decision shared by
+// the normal candidate path (routing.Candidates) and the sticky-session
+// path (gateway.pinSessionCandidates): neither may open its own door.
+func (s *Snapshot) ProviderSchedulable(providerID string) bool {
+	p, ok := s.Providers[providerID]
+	if !ok {
+		return false
+	}
+	return p.Status == "" || p.Status == providerStatusActive
+}
+
+// DeploymentSchedulable is the shared "may this deployment take traffic"
+// decision over the published route/provider/deployment state: the
+// deployment must be active AND its provider must be schedulable. A
+// disabled provider takes its deployments out of rotation with it, so an
+// enabled route to a disabled provider's deployment is not a dispatchable
+// route.
+func (s *Snapshot) DeploymentSchedulable(d domain.Deployment) bool {
+	return d.Status == domain.DeploymentActive && s.ProviderSchedulable(d.ProviderID)
+}
+
 // ActiveDeployments returns the deployments serving a model through
 // enabled routes, ordered by route priority then weight. Deployments whose
 // status is not 'active' are skipped: an enabled route to a disabled
-// upstream must not receive traffic.
+// upstream must not receive traffic. Deployments whose provider is not
+// schedulable in this published snapshot are skipped for the same reason —
+// a disabled provider must not receive traffic through any of its
+// deployments.
+//
+// A route whose pool strategy is outside the supported set is skipped too:
+// it stays READABLE (an old published revision must remain loadable) but
+// it is NOT dispatchable — silently treating it as round_robin would make
+// an unimplemented configuration look effective.
 func (s *Snapshot) ActiveDeployments(modelID string) []domain.Deployment {
 	routes := s.RoutesByModel[modelID]
 	out := make([]domain.Deployment, 0, len(routes))
 	for _, r := range routes {
-		if !r.Enabled {
+		if !r.Enabled || !PoolStrategySupported(r.PoolStrategy) {
 			continue
 		}
 		d, ok := s.Deployments[r.DeploymentID]
-		if !ok || d.Status != domain.DeploymentActive {
+		if !ok || !s.DeploymentSchedulable(d) {
 			continue
 		}
 		out = append(out, d)
 	}
 	return out
+}
+
+// UnsupportedPoolStrategyRoutes returns the model's routes whose pool
+// strategy is outside the supported set. They stay readable (an old
+// published revision must remain loadable) but they are never dispatched:
+// the caller must fail loudly (and alarm) instead of pretending the
+// configuration works.
+func (s *Snapshot) UnsupportedPoolStrategyRoutes(modelID string) []domain.ModelRoute {
+	var out []domain.ModelRoute
+	for _, r := range s.RoutesByModel[modelID] {
+		if !PoolStrategySupported(r.PoolStrategy) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// PoolStrategyDispatchBlock returns the model's enabled routes whose pool
+// strategy is outside the supported set — but ONLY when they are the
+// model's entire enabled route set, i.e. the model has no dispatchable
+// route *because of* an unsupported pool strategy. A model that still has
+// a supported route is served by that one (the unsupported route is simply
+// not a candidate), and a model whose only legacy routes are DISABLED is
+// not blocked either (a disabled route never carried traffic).
+func (s *Snapshot) PoolStrategyDispatchBlock(modelID string) []domain.ModelRoute {
+	enabled := 0
+	var unsupported []domain.ModelRoute
+	for _, r := range s.RoutesByModel[modelID] {
+		if !r.Enabled {
+			continue
+		}
+		enabled++
+		if !PoolStrategySupported(r.PoolStrategy) {
+			unsupported = append(unsupported, r)
+		}
+	}
+	if enabled == 0 || len(unsupported) != enabled {
+		return nil
+	}
+	return unsupported
 }
 
 // Sellable reports whether a model may appear in the published model list:
@@ -310,6 +392,15 @@ func ParseSnapshot(rev *domain.ConfigRevision) (*Snapshot, error) {
 		if err := ValidateDeployment(&d); err != nil {
 			return nil, fmt.Errorf("catalog: revision %d: %w", rev.Revision, err)
 		}
+		// The published snapshot is authoritative: a deployment whose
+		// provider is not part of the revision has no published provider
+		// state, so it can never be schedulable. Reject the whole revision
+		// instead of loading half a version (same rule as the dangling
+		// route references below).
+		if _, ok := snap.Providers[d.ProviderID]; !ok {
+			return nil, fmt.Errorf("catalog: revision %d: deployment %s references unknown provider %s",
+				rev.Revision, d.ID, d.ProviderID)
+		}
 		snap.Deployments[d.ID] = d
 	}
 	for _, pr := range p.Routes {
@@ -318,7 +409,11 @@ func ParseSnapshot(rev *domain.ConfigRevision) (*Snapshot, error) {
 			Priority: pr.Priority, Weight: pr.Weight, Capabilities: pr.Capabilities,
 			PoolStrategy: domain.PoolStrategy(pr.PoolStrategy), Enabled: pr.Enabled,
 		}
-		if err := ValidateRoute(&route); err != nil {
+		// The READ path accepts the known-but-unsupported strategies: an
+		// already-published revision must stay loadable (otherwise the whole
+		// catalog bricks on upgrade). Such a route is marked unavailable by
+		// the snapshot — never dispatched as if it were round_robin.
+		if err := ValidateRouteForRead(&route); err != nil {
 			return nil, fmt.Errorf("catalog: revision %d: %w", rev.Revision, err)
 		}
 		if _, ok := snap.Models[route.ModelID]; !ok {

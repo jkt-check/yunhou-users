@@ -21,7 +21,8 @@ import (
 //   - anthropic-version: 2023-06-01（Messages 子集）；
 //   - truncation:"auto" → 明确 400（不做服务端上下文管理）；
 //   - GET /v1/models 不提供 Anthropic 形状（路径冲突，能力矩阵已声明）；
-//   - 历史 thinking/redacted_thinking 块接受但不回放；
+//   - 历史 thinking/redacted_thinking 块 → 明确 400（T8 兼容性修正：签名
+//     思考无法忠实回放，旧行为是「接受后丢弃」）；
 //   - 真实客户端联调为发布前置待办（本环境无法完成）。
 
 // clientFixturePath resolves one client fixture relative to the repo root.
@@ -175,20 +176,69 @@ func TestClientContract_KnownDifferencesRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("thinking 历史块接受但不回放", func(t *testing.T) {
+	t.Run("thinking 历史块明确拒绝(T8 兼容性修正)", func(t *testing.T) {
 		st := newProtoStack(t)
 		w := clientCall(t, st, "/v1/messages",
 			loadClientFixture(t, "client-request-anthropic-messages-thinking-history.json"),
 			map[string]string{"X-Api-Key": st.keyPlain, "anthropic-version": "2023-06-01"})
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("code = %d body = %s (签名思考无法忠实回放,必须明确 400)", w.Code, w.Body.String())
+		}
+		var errBody struct {
+			Type  string `json:"type"`
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil ||
+			errBody.Type != "error" || errBody.Error.Type != "invalid_request_error" ||
+			!strings.Contains(errBody.Error.Message, "thinking") {
+			t.Errorf("error = %s, want Anthropic 原生信封提及 thinking", w.Body.String())
+		}
+		var n int
+		if err := st.db.Get(&n, `SELECT COUNT(*) FROM inference_requests`); err != nil || n != 0 {
+			t.Errorf("requests = %d, want 0 (拒绝先于准入)", n)
+		}
+	})
+
+	t.Run("工具历史(无思考块)照常可用且 ID 逐字保留", func(t *testing.T) {
+		st := newProtoStack(t)
+		body := loadClientFixture(t, "client-request-anthropic-messages-thinking-history.json")
+		// 去掉签名思考块 —— 剩下的工具历史必须照常工作（普通文本/工具流不受
+		// 思考回放的拒绝影响）。
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(body), &doc); err != nil {
+			t.Fatal(err)
+		}
+		msgs, _ := doc["messages"].([]any)
+		for _, m := range msgs {
+			mm, _ := m.(map[string]any)
+			blocks, _ := mm["content"].([]any)
+			kept := make([]any, 0, len(blocks))
+			for _, b := range blocks {
+				bb, _ := b.(map[string]any)
+				if bb["type"] == "thinking" || bb["type"] == "redacted_thinking" {
+					continue
+				}
+				kept = append(kept, bb)
+			}
+			if len(kept) != len(blocks) {
+				mm["content"] = kept
+			}
+		}
+		raw, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := clientCall(t, st, "/v1/messages", string(raw),
+			map[string]string{"X-Api-Key": st.keyPlain, "anthropic-version": "2023-06-01"})
 		if w.Code != http.StatusOK {
-			t.Fatalf("code = %d body = %s (thinking 历史块必须接受)", w.Code, w.Body.String())
+			t.Fatalf("code = %d body = %s", w.Code, w.Body.String())
 		}
 		up := string(st.anthropicUpstream.lastBody(t))
-		if strings.Contains(up, "thinking") || strings.Contains(up, "redacted_thinking") {
-			t.Errorf("thinking history block replayed upstream (不回放契约): %s", up)
-		}
 		if !strings.Contains(up, "toolu_hist_1") {
-			t.Errorf("tool history id not preserved (工具块不受不回放影响): %s", up)
+			t.Errorf("tool history id not preserved: %s", up)
 		}
 	})
 }

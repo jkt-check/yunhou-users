@@ -12,7 +12,7 @@
 //     routing.SessionBinding 钉住同一上游账号；账号失效走显式 Migrate
 //     （网关内），绝不静默换号续接；
 //   - 跨客户引用、过期链、store:false 的响应：一律 404（不泄漏存在性）；
-//   - transcript 超过 maxResponsesTranscriptBytes 的请求正常服务但不落链
+//   - transcript 超过 maxResponsesTranscriptBytes 或无法忠实回放时正常服务但不落链
 //     （引用它得到明确的 404，不静默丢上下文）。
 
 package httpapi
@@ -255,6 +255,11 @@ func (h *ResponsesHandler) persistChain(responseID string, prevChain *domain.Res
 	if len(raw) > maxResponsesTranscriptBytes {
 		log.Printf("v1/responses: transcript %d bytes exceeds cap; chain row NOT persisted (id=%s)",
 			len(raw), responseID)
+		return
+	}
+	if _, err := providers.ResponsesReplayToChat(items); err != nil {
+		log.Printf("v1/responses: transcript cannot be replayed; chain row NOT persisted (id=%s): %v",
+			responseID, err)
 		return
 	}
 	chainID := responseID

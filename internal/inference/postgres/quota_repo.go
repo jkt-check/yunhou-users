@@ -24,7 +24,8 @@ import (
 // 全部成功才提交；任何一步失败整个事务回滚，不遗留部分占用。
 //
 // 固定锁序（Task 7 控制者裁决，全部写路径一致，防死锁环）：
-// 账户（FOR UPDATE）→ 请求行 → 窗口（five_hour→weekly→monthly）→ Key 预算
+// 账户（FOR UPDATE）→ 权益（准入时 FOR SHARE）→ 请求行
+// → 窗口（five_hour→weekly→monthly）→ Key 预算
 // → 预占/租约行。检查并创建请求/预占后提交；网络调用在提交之后（不持有
 // DB 事务等待上游，设计 §7.2）。
 
@@ -188,6 +189,10 @@ func (e activationConflict) Is(target error) bool {
 // account lock: a collision surfaces as quota.ErrWindowActivationConflict
 // and the caller retries the whole admission.
 //
+// The selected policy is checked under an entitlement SHARE lock until
+// commit; KEY SHARE would permit concurrent policy-only updates. Reused
+// live windows take the selected limit without resetting any consumption.
+//
 // Disabled windows (no limit in cmd.Limits) are skipped — explicit, never
 // unlimited (设计 §9.1). Reads outside admission must use LoadWindows,
 // which never activates (设计 §6).
@@ -198,6 +203,22 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 	}
 	if err := lockAccountTx(ctx, tx, cmd.BillingAccountID); err != nil {
 		return nil, err
+	}
+	var accountID, policyID string
+	var storedAnchor time.Time
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT billing_account_id, policy_version_id, anchor_at
+		 FROM inference_entitlements WHERE id=$1 FOR SHARE`,
+		cmd.EntitlementID).Scan(&accountID, &policyID, &storedAnchor); err != nil {
+		return nil, mapError("activate windows: entitlement", err)
+	}
+	// 消费时刻同样在写库前截断到微秒（TIMESTAMPTZ 的存储精度）：与准入
+	// 服务层用同一个时刻，写入的五小时窗口起点本身即可精确表示，不依赖
+	// PostgreSQL 的舍入规则。
+	at := cmd.At.UTC().Truncate(time.Microsecond)
+	if accountID != cmd.BillingAccountID || policyID != cmd.PolicyVersionID {
+		return nil, domain.NewError(domain.CodeConflict,
+			"activate windows: entitlement account or policy changed")
 	}
 	var rows []windowRow
 	if err := tx.SelectContext(ctx, &rows,
@@ -216,7 +237,11 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 		if !ok {
 			continue
 		}
-		iv, activate, err := quota.ConsumptionWindow(kind, cmd.Anchor, active, cmd.At)
+		// anchor_at 取数据库里已持久化的锚点，消费时刻取上面归一后的值：
+		// 调用方内存里的锚点/时刻可能带亚微秒纳秒，按它算出的窗口起点写库
+		// 后会变成另一个值，下次准入匹配不上已激活的窗口行而重复激活
+		// → EXCLUDE 排他约束冲突。
+		iv, activate, err := quota.ConsumptionWindow(kind, storedAnchor, active, at)
 		if err != nil {
 			return nil, err
 		}
@@ -237,7 +262,17 @@ func (s *Store) ActivateWindowsTx(ctx context.Context, w domain.UnitOfWork, cmd 
 		}
 		for _, a := range active {
 			if a.Kind == kind && !a.Voided &&
-				(quota.Interval{Start: a.Start.UTC(), End: a.End.UTC()}).Contains(cmd.At) {
+				(quota.Interval{Start: a.Start.UTC(), End: a.End.UTC()}).Contains(at) {
+				if a.Limit != limit {
+					var refreshed windowRow
+					if err := tx.QueryRowxContext(ctx,
+						`UPDATE inference_quota_windows SET limit_micros=$2
+						 WHERE id=$1 RETURNING *`,
+						a.ID, int64(limit)).StructScan(&refreshed); err != nil {
+						return nil, mapError("activate windows: refresh limit", err)
+					}
+					a = refreshed.toDomain()
+				}
 				out = append(out, a)
 				break
 			}

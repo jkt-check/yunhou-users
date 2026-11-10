@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -200,20 +201,133 @@ func validateBaseURL(raw string) error {
 	return nil
 }
 
-// ValidateRoute checks the route invariants.
+// SupportedPoolStrategy is the ONE pool strategy a route may use: 常规池
+// 只支持 round_robin。least_loaded 与通用 session_sticky 尚未实现 ——
+// 写面明确拒绝（收下它等于「保存后假装生效」：运营以为配了，实际跑的
+// 仍是 round_robin）。
+//
+// 注意：Responses 的 previous_response_id 专用绑定走的是会话绑定器
+// （routing.SessionBinder，按 session key 钉住上游账号），与 route 的
+// pool_strategy 无关 —— 拒绝通用 session_sticky 不影响那条链路。
+const SupportedPoolStrategy = domain.PoolRoundRobin
+
+// knownPoolStrategies are the strategies the system RECOGNIZES. The ones
+// outside the supported set stay LOADABLE from an already-published
+// revision（旧快照必须仍可读，否则整个目录变砖），但它们被标记不可用 ——
+// 绝不静默当成 round_robin。
+var knownPoolStrategies = map[domain.PoolStrategy]bool{
+	domain.PoolRoundRobin:    true,
+	domain.PoolLeastLoaded:   true,
+	domain.PoolSessionSticky: true,
+}
+
+// PoolStrategySupported reports whether a pool strategy is inside the
+// supported set. An empty strategy means "not declared" and is treated as
+// round_robin (the DB column default).
+func PoolStrategySupported(s domain.PoolStrategy) bool {
+	return s == "" || s == SupportedPoolStrategy
+}
+
+// poolStrategyRefusal explains why a pool strategy is refused and what the
+// operator should use instead. It names the replacement so a refusal is
+// actionable in one step.
+func poolStrategyRefusal(s domain.PoolStrategy) string {
+	if knownPoolStrategies[s] {
+		return "pool_strategy " + string(s) + " is not supported: only " + string(SupportedPoolStrategy) +
+			" is implemented — set pool_strategy to " + string(SupportedPoolStrategy)
+	}
+	return "unknown pool strategy: " + string(s) + " (supported: " + string(SupportedPoolStrategy) + ")"
+}
+
+// ValidateRoute checks the route invariants on the WRITE path (operator
+// CRUD, and every other path that funnels a route through this validator).
 func ValidateRoute(r *domain.ModelRoute) error {
+	if err := validateRouteShape(r); err != nil {
+		return err
+	}
+	if err := validateRouteCapabilities(r.Capabilities); err != nil {
+		return err
+	}
+	return validatePoolStrategy(r.PoolStrategy)
+}
+
+// NormalizeRouteCapabilities trims the capability names, drops empty ones
+// and de-duplicates the list (first-occurrence order preserved).
+//
+// It does NOT fold case: the vocabulary is lowercase and closed, and
+// silently accepting "Tools" would hide an operator typo instead of
+// pointing at it. The normalized list is what gets persisted, so the routing
+// layer's key comparison is exact.
+func NormalizeRouteCapabilities(caps []string) []string {
+	out := make([]string, 0, len(caps))
+	seen := map[string]bool{}
+	for _, c := range caps {
+		c = strings.TrimSpace(c)
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// validateRouteCapabilities is the write-side gate for the route capability
+// vocabulary: the names are CLOSED (tools / reasoning / image). A name
+// outside the vocabulary grants nothing while looking configured — the exact
+// "配置看起来生效了、实际没生效" trap this gate removes. The error names the
+// offending value and the supported set.
+//
+// The READ path deliberately does NOT enforce this: an already-published
+// revision with an unknown name must stay loadable (otherwise upgrading
+// bricks the whole catalog). Such a name is simply ignored by the routing
+// layer — it grants no capability — and the stored row is never rewritten.
+func validateRouteCapabilities(caps []string) error {
+	for _, c := range caps {
+		if !domain.ValidRouteCapability(c) {
+			return domain.NewError(domain.CodeInvalidInput,
+				"unknown route capability: "+c+
+					" (supported: "+strings.Join(domain.SupportedRouteCapabilities(), ", ")+")")
+		}
+	}
+	return nil
+}
+
+// ValidateRouteForRead validates a route loaded from a published snapshot.
+// The KNOWN-but-unsupported strategies stay loadable — an old published
+// revision must remain readable, otherwise the whole catalog bricks on
+// upgrade — while a truly unknown value still fails the parse (不得加载半个
+// 版本). The loaded route is marked unavailable by the snapshot, never
+// dispatched as if it were round_robin.
+func ValidateRouteForRead(r *domain.ModelRoute) error {
+	if err := validateRouteShape(r); err != nil {
+		return err
+	}
+	if knownPoolStrategies[r.PoolStrategy] || r.PoolStrategy == "" {
+		return nil
+	}
+	return domain.NewError(domain.CodeInvalidInput, "unknown pool strategy: "+string(r.PoolStrategy))
+}
+
+// validateRouteShape holds the shape invariants shared by the write and the
+// read path.
+func validateRouteShape(r *domain.ModelRoute) error {
 	if r.ModelID == "" || r.DeploymentID == "" {
 		return domain.NewError(domain.CodeInvalidInput, "model_id and deployment_id are required")
 	}
 	if r.Weight <= 0 {
 		return domain.NewError(domain.CodeInvalidInput, "route weight must be > 0")
 	}
-	switch r.PoolStrategy {
-	case "", domain.PoolRoundRobin, domain.PoolLeastLoaded, domain.PoolSessionSticky:
-	default:
-		return domain.NewError(domain.CodeInvalidInput, "unknown pool strategy: "+string(r.PoolStrategy))
-	}
 	return nil
+}
+
+// validatePoolStrategy is the write-side gate: only the supported set is
+// accepted.
+func validatePoolStrategy(s domain.PoolStrategy) error {
+	if PoolStrategySupported(s) {
+		return nil
+	}
+	return domain.NewError(domain.CodeInvalidInput, poolStrategyRefusal(s))
 }
 
 // ValidateLifecycleTransition reports whether from→to is allowed.
@@ -527,6 +641,9 @@ func (s *Service) CreateRoute(ctx context.Context, r *domain.ModelRoute) error {
 	if r.PoolStrategy == "" {
 		r.PoolStrategy = domain.PoolRoundRobin
 	}
+	// T8: 能力清单先归一（trim / 去空 / 去重）再校验 —— 落库的就是路由层
+	// 逐字比对的那些名字。
+	r.Capabilities = NormalizeRouteCapabilities(r.Capabilities)
 	if err := ValidateRoute(r); err != nil {
 		return err
 	}
@@ -553,6 +670,7 @@ func (s *Service) UpdateRoute(ctx context.Context, r *domain.ModelRoute) error {
 		return domain.NewError(domain.CodeInvalidInput,
 			"updated_at version token is required (read the route first)")
 	}
+	r.Capabilities = NormalizeRouteCapabilities(r.Capabilities)
 	if err := ValidateRoute(r); err != nil {
 		return err
 	}
@@ -628,15 +746,18 @@ func drainCatalogForPublish(ctx context.Context, tx PublishTx) (models []domain.
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	if err := validateCatalogForPublish(models, providers, deployments); err != nil {
-		return nil, nil, nil, nil, err
-	}
 	for _, m := range models {
 		rs, err := tx.ListRoutes(ctx, m.ID)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
 		routes = append(routes, rs...)
+	}
+	// 路由也要过闸 —— 与 operator CRUD / 批量导入 / 环境导入同一口径
+	// （pool_strategy 支持集）。校验放在路由抽取之后：路由是发布快照的
+	// 一部分，缺了它就等于发出了一个「跑起来不是配的那个」的版本。
+	if err := validateCatalogForPublish(models, providers, deployments, routes); err != nil {
+		return nil, nil, nil, nil, err
 	}
 	return models, providers, deployments, routes, nil
 }
@@ -727,7 +848,11 @@ func (s *Service) PublishPreview(ctx context.Context) (*PublishPreview, error) {
 // individually valid and cross-references must resolve. Draft/disabled
 // entities are publishable (the snapshot marks them non-routable) — the
 // gate rejects only structurally broken catalogs.
-func validateCatalogForPublish(models []domain.Model, providers []domain.Provider, deployments []domain.Deployment) error {
+//
+// 路由的 pool_strategy 也在这里收口（T7）：与 operator CRUD / 批量导入 /
+// 环境导入共用同一个支持集。发布预演（PublishPreview）走同一个函数，所以
+// 预演与正式发布给出同一个错误 —— 错误里点名对象 ID 与替代配置。
+func validateCatalogForPublish(models []domain.Model, providers []domain.Provider, deployments []domain.Deployment, routes []domain.ModelRoute) error {
 	providerIDs := make(map[string]bool, len(providers))
 	for i := range providers {
 		if err := ValidateProvider(&providers[i]); err != nil {
@@ -752,7 +877,37 @@ func validateCatalogForPublish(models []domain.Model, providers []domain.Provide
 				"deployment "+deployments[i].ID+" references unknown provider "+deployments[i].ProviderID)
 		}
 	}
+	for i := range routes {
+		// 每个不变量各自报自己的原因：pool_strategy 不受支持时给出替代
+		// 配置；weight / model_id 等失败时保留它们自己的错误 —— 绝不把
+		// 运营指到错误的旋钮上（一个「round_robin 不受支持，请设成
+		// round_robin」既无用又误导）。
+		if err := validateRouteShape(&routes[i]); err != nil {
+			return domain.NewError(domain.CodeInvalidInput,
+				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
+		}
+		if err := validatePoolStrategy(routes[i].PoolStrategy); err != nil {
+			return domain.NewError(domain.CodeInvalidInput,
+				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
+		}
+		// 能力词汇表与写面同口径（T8）：未知能力名在发布闸同样明确拒绝 ——
+		// 发出去的版本必须是「跑起来就是配的那个」。
+		if err := validateRouteCapabilities(routes[i].Capabilities); err != nil {
+			return domain.NewError(domain.CodeInvalidInput,
+				"route "+routes[i].ID+" is not publishable: "+routeRefusalMessage(err))
+		}
+	}
 	return nil
+}
+
+// routeRefusalMessage renders an invariant failure without the domain
+// error's code prefix (the publish refusal already carries the route id and
+// the code).
+func routeRefusalMessage(err error) string {
+	if de, ok := err.(*domain.Error); ok {
+		return de.Message
+	}
+	return err.Error()
 }
 
 // validateModelAliasUniqueness enforces cross-model alias uniqueness on a
@@ -794,6 +949,12 @@ func validateModelAliasUniqueness(models []domain.Model) error {
 // 安全审查 M-2（跟进）: 修订插入与激活与目标读取跑在同一事务——激活失败
 // 不会留下孤儿 draft（旧实现先 InsertConfigRevision 再 ActivateRevision,
 // 两步之间崩溃/失败即产生无人引用的 draft 修订）。
+//
+// 回滚目标必须同时是**可读**和**可发布**的：ParseSnapshot 保证旧快照仍读得
+// 出来（读不出来就是砖目录），validateCatalogForPublish 保证回滚不会把一个
+// 写面早已拒绝的配置重新上线（例如 legacy pool_strategy）。拒绝发生在
+// LatestRevision/InsertAndActivateRevision 之前 —— 失败的回滚既不新增
+// revision，也不移动 active 指针。
 func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string) (int, error) {
 	tx, err := s.store.BeginPublish(ctx)
 	if err != nil {
@@ -811,8 +972,28 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 	}
 	// The payload must be loadable before we publish it again — rolling
 	// forward to garbage would brick the catalog.
-	if _, err := ParseSnapshot(target); err != nil {
+	snap, err := ParseSnapshot(target)
+	if err != nil {
 		return 0, domain.WrapError(domain.CodeInvalidInput, "rollback target is not a parseable snapshot", err)
+	}
+	// …and it must be publishable: a snapshot the write path would reject
+	// (e.g. a route with an unsupported pool_strategy) must not be
+	// re-activated by a rollback — that is the same "配置看起来生效了、实际
+	// 没生效" trap, only reached through the rollback door. The read
+	// compatibility above is untouched: old snapshots stay loadable, they
+	// just cannot be republished.
+	//
+	// The refusal reason goes into the TOP-LEVEL message (not behind a cause
+	// chain): the HTTP mapper deliberately exposes only domain.Error.Message
+	// to the operator, so a generic wrapper would hide the route id, the
+	// rejected value and the replacement hint — the exact details the
+	// operator needs to fix the catalog. The validator's message is already
+	// sanitized (route id + rejected value + replacement), so it is safe to
+	// surface as-is; the generic error sanitization is not changed here.
+	models, providers, deployments, routes := snapshotEntities(snap)
+	if err := validateCatalogForPublish(models, providers, deployments, routes); err != nil {
+		return 0, domain.NewError(domain.CodeInvalidInput,
+			"rollback target is not publishable: "+routeRefusalMessage(err))
 	}
 	latest, err := tx.LatestRevision(ctx, domain.ScopeCatalog)
 	if err != nil {
@@ -832,6 +1013,37 @@ func (s *Service) Rollback(ctx context.Context, toRevision int, createdBy string
 		return 0, err
 	}
 	return rev.Revision, nil
+}
+
+// snapshotEntities flattens a parsed snapshot into the entity slices the
+// publish gate consumes. The order is deterministic — every map is walked
+// in sorted ID order and the routes keep their per-model order — so the
+// gate's verdict (and the refusal it names) never depends on map iteration
+// order.
+func snapshotEntities(snap *Snapshot) (models []domain.Model, providers []domain.Provider, deployments []domain.Deployment, routes []domain.ModelRoute) {
+	for _, id := range snap.ModelIDs() {
+		models = append(models, snap.Models[id])
+	}
+	for _, id := range sortedSnapshotKeys(snap.Providers) {
+		providers = append(providers, snap.Providers[id])
+	}
+	for _, id := range sortedSnapshotKeys(snap.Deployments) {
+		deployments = append(deployments, snap.Deployments[id])
+	}
+	for _, id := range sortedSnapshotKeys(snap.RoutesByModel) {
+		routes = append(routes, snap.RoutesByModel[id]...)
+	}
+	return models, providers, deployments, routes
+}
+
+// sortedSnapshotKeys returns the map keys in ascending ID order.
+func sortedSnapshotKeys[V any](m map[string]V) []string {
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // ListRevisionMetas returns the catalog revision history (metadata only —
@@ -875,6 +1087,20 @@ func (s *Service) ListPublishedModels(ctx context.Context, access AccessCheck) (
 	snap, err := s.LoadSnapshot(ctx)
 	if err != nil {
 		return nil, err
+	}
+	return s.ListPublishedModelsFromSnapshot(ctx, snap, access)
+}
+
+// ListPublishedModelsFromSnapshot applies the published-list gates to one
+// pinned snapshot without reloading the active revision. Price and access
+// hooks are still evaluated for this request and remain fail-closed.
+func (s *Service) ListPublishedModelsFromSnapshot(ctx context.Context, snap *Snapshot, access AccessCheck) ([]domain.Model, error) {
+	if snap == nil {
+		return nil, domain.NewError(domain.CodeInvalidInput, "snapshot is required to list published models")
+	}
+	if access == nil {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"access check is required to list published models (refusing to answer without an authorization hook)")
 	}
 	out := make([]domain.Model, 0, len(snap.Models))
 	for _, id := range snap.ModelIDs() {

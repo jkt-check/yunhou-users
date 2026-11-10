@@ -28,6 +28,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/catalog"
+	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/postgres"
 	"github.com/yunhou/users/internal/inference/providers"
@@ -50,10 +52,13 @@ type SnapshotSource interface {
 	Current(ctx context.Context) (*catalog.Snapshot, error)
 }
 
-// SecretResolver decrypts the credential bound to an upstream account
-// (Task 4 credentials.Service).
+// SecretResolver resolves the credential bound to an upstream account into
+// the auth material the dispatch may use (Task 4 credentials.Service).
+// The sealed OAuth bundle never crosses this boundary: for an "oauth"
+// credential the resolver yields the ACCESS TOKEN only, so neither the
+// bundle JSON nor the refresh token can reach an upstream header.
 type SecretResolver interface {
-	ResolveSecret(ctx context.Context, id string, pinGeneration *int64) ([]byte, *domain.Credential, error)
+	ResolveOutboundAuth(ctx context.Context, id string, pinGeneration *int64) (credentials.OutboundAuth, *domain.Credential, error)
 }
 
 // Store is the persistence surface the gateway orchestration needs;
@@ -75,6 +80,11 @@ type Store interface {
 	// Settlement (domain.SettlementStore / QuotaStore release).
 	Settle(ctx context.Context, w domain.UnitOfWork, cmd domain.SettleCommand) error
 	MarkReconciliationRequired(ctx context.Context, w domain.UnitOfWork, requestID, reason string, deadline time.Time) error
+	// ReportTerminalAnomaly records a settlement anomaly against a request
+	// whose terminal state must NOT be overwritten (a released request with
+	// late usage): the reconciliation job is enqueued in the same
+	// transaction, the terminal status stays.
+	ReportTerminalAnomaly(ctx context.Context, w domain.UnitOfWork, requestID, reason string, detail json.RawMessage, deadline time.Time) error
 	// EnqueueReconciliationJobTx upserts a reconciliation job in the
 	// settlement transaction (Task 9: overage anomaly tracked atomically).
 	EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfWork, cmd postgres.EnqueueReconciliationCommand) error
@@ -129,6 +139,11 @@ type Service struct {
 	// 与 AuditAlertHook 同契约:调用方保证非 nil、不 panic(panic 依
 	// OnSettleError 约定向上传播给 gin recovery)。
 	OnLifecycleGateHit func(ctx context.Context, p *domain.Principal, m *domain.Model, blocked bool, cause error)
+	// OnUnsupportedPoolStrategy receives one observation per request whose
+	// model has published routes with an unsupported pool_strategy (T7).
+	// Default: structured UNSUPPORTED_POOL_STRATEGY log +
+	// management.AuditAlertHook. 同 OnLifecycleGateHit 的契约。
+	OnUnsupportedPoolStrategy func(ctx context.Context, p *domain.Principal, m *domain.Model, routes []domain.ModelRoute, cause error)
 }
 
 // NewService builds the gateway. A nil clock uses the system clock (UTC).
@@ -172,9 +187,11 @@ func detached(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }
 
-// Outcome is one admitted call's result. Exactly one of Payload / Stream is
-// set. The caller (httpapi handler / Kaya facade) serves Payload or relays
-// Stream, then finalizes the stream with Stream.Finish.
+// Outcome is one admitted call's result. On success, exactly one of Payload /
+// Stream is set. The caller serves Payload or relays Stream, then finalizes
+// the stream with Stream.Finish. A nonnil Outcome plus error identifies an
+// execution already finalized after translation rejection: neither payload
+// nor stream may be served, and the execution must not be retried.
 type Outcome struct {
 	RequestID string
 	ModelID   string
@@ -327,27 +344,55 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		s.reportLifecycleGate(ctx, p, m, false, cause)
 	}
 	if !modelSpeaks(m, clientProto) {
-		return nil, domain.NewError(domain.CodeInvalidInput,
-			"model "+m.ID+" is not served on protocol "+string(clientProto))
+		return nil, newCapabilityUnsupported(
+			"model " + m.ID + " is not served on protocol " + string(clientProto))
 	}
 	// 防御性模态检查（设计: 能力校验在边缘层完成；此为网关内兜底，防未来
 	// 新入口面漏检）。缺省放行：空 InputModalities 走默认 ["text","image"]，
 	// 仅显式声明不含 image 的模型拒绝带图（domain.Model.AcceptsImages）。
 	if model.MessagesHaveImages(req.Messages) && !m.AcceptsImages() {
-		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not accept image input")
+		return nil, newCapabilityUnsupported("model " + m.ID + " does not accept image input")
+	}
+	// T7:存量已发布快照可能带未实现的 pool_strategy(least_loaded / 通用
+	// session_sticky)。旧快照可读,但该路由不可调度 —— 绝不静默当
+	// round_robin。模型**全部已启用**的路由都不支持时,在预占/派发前返回
+	// 明确的配置错误(零预占、零出站);还有支持集内的路由时只是不用它,并
+	// 告警。
+	if unsupported := snap.UnsupportedPoolStrategyRoutes(m.ID); len(unsupported) > 0 {
+		cause := fmt.Errorf("model %q has published routes with an unsupported pool_strategy: %v", m.ID, unsupported)
+		s.reportUnsupportedPoolStrategy(ctx, p, m, unsupported, cause)
+	}
+	if blocked := snap.PoolStrategyDispatchBlock(m.ID); len(blocked) > 0 {
+		return nil, newConfigUnavailable(domain.CodeUpstreamUnavailable,
+			unsupportedPoolStrategyMessage(m.ID, blocked))
 	}
 	// 2. Capability validation BEFORE any spend (设计: 不支持的工具/模态明
 	// 确报错). Modality/field-shape validation happened at the API edge.
 	thinking := req.ThinkingEnabled != nil && *req.ThinkingEnabled
+	// T8: 推理档位是**显式**的请求维度 —— 有档位即有推理需求（档位本身
+	// 就是「要推理」），模型不支持推理时同样明确拒绝。
+	effort := req.ReasoningEffort
 	if len(req.Tools) > 0 && !m.SupportsTools {
-		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support tools")
+		return nil, newCapabilityUnsupported("model " + m.ID + " does not support tools")
 	}
-	if thinking && !m.SupportsReasoning {
-		return nil, domain.NewError(domain.CodeInvalidInput, "model "+m.ID+" does not support reasoning")
+	if (thinking || effort != "") && !m.SupportsReasoning {
+		return nil, newCapabilityUnsupported("model " + m.ID + " does not support reasoning")
 	}
 	// Key narrowing can never widen beyond the entitlement set (设计 §4.2).
 	if key != nil && len(key.ModelAllow) > 0 && !contains(key.ModelAllow, m.ID) {
 		return nil, domain.NewError(domain.CodeModelNotAllowed, "model "+m.ID+" is not allowed for this API key")
+	}
+	// T8 能力路由（准入前）：请求要的能力（图片 / 推理档位）若**没有任何**
+	// 已发布部署能承载，就在准入之前明确拒绝 —— 零预占、零派发。
+	// 只有当「不带该额外需求」本来就有兼容候选时，这才是能力不兼容（客户端
+	// 可修的 400）；若本来就没有任何候选，交给既有的路由路径（503
+	// upstream_unavailable），不改变既有语义。
+	needs := routing.Needs{
+		Tools: len(req.Tools) > 0, Reasoning: thinking || effort != "",
+		Images: model.MessagesHaveImages(req.Messages), ReasoningEffort: effort,
+	}
+	if err := s.rejectUnservableNeed(snap, m.ID, needs); err != nil {
+		return nil, err
 	}
 
 	// 3. Entitlement resolution (显式套餐优先，赠送不叠加/不兜底；无套餐时
@@ -365,6 +410,17 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		return nil, err
 	}
 	policy := polRow.Pure()
+	// T7:存量策略可能仍带未实现的 clamp_if_declared(它依赖客户端显式声明
+	// 字段,本期协议层没有该字段)。新推理必须明确报「策略配置不可用」——
+	// 绝不静默当 reject:那会悄悄改变客户的额度语义(钳制 vs 拒绝)。旧策略
+	// 仍可查询,迁移由运营按文档人工完成(出 reject / allow_overage 新
+	// revision),本服务不自动改写存量策略。
+	if policy.Overage == quota.OverageClampIfDeclared {
+		return nil, newConfigUnavailable(domain.CodeServiceUnavailable,
+			"quota policy "+polRow.Name+" r"+strconv.Itoa(polRow.Revision)+
+				" uses overage_policy=clamp_if_declared, which is not implemented — "+
+				"migrate the policy to reject or allow_overage")
+	}
 
 	var keyID *string
 	if key != nil {
@@ -372,9 +428,13 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	} else if p.APIKeyID != "" {
 		keyID = &p.APIKeyID
 	}
+	// 逻辑请求 ID 在入场时生成一次（Task 4 幂等身份）：套餐预占失败后转
+	// 钱包的第二次尝试沿用**同一个** ID —— 第一次尝试整笔事务回滚（没有
+	// 请求行、没有速率计数），第二次用同一身份成功准入只计一次。
+	logicalRequestID := uuid.NewString()
 	newRequest := func() domain.Request {
 		return domain.Request{
-			BillingAccountID: p.BillingAccountID, APIKeyID: keyID,
+			ID: logicalRequestID, BillingAccountID: p.BillingAccountID, APIKeyID: keyID,
 			EntitlementID: ent.ID, ModelID: m.ID,
 			Protocol: clientProto, Stream: req.Stream,
 		}
@@ -413,7 +473,15 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 			}
 			wadm, wprice, werr := s.admitWallet(ctx, newRequest(), *ent, policy, m, req, now)
 			if werr != nil {
-				return nil, err
+				// Only expected wallet spend gates retain the plan rejection.
+				// Storage, rate and concurrency failures keep their real cause.
+				if errors.Is(werr, accounting.ErrOverageDisabled) ||
+					errors.Is(werr, accounting.ErrInsufficientBalance) ||
+					errors.Is(werr, accounting.ErrSpendLimitExceeded) ||
+					errors.Is(werr, accounting.ErrUnpriced) {
+					return nil, err
+				}
+				return nil, werr
 			}
 			adm, price = wadm, wprice
 		}
@@ -422,19 +490,24 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 	// From here on, every exit path finalizes the reservation.
 
 	// 6. Route: capability-compatible candidates only (设计 §5).
-	needs := routing.Needs{Tools: len(req.Tools) > 0, Reasoning: thinking}
 	cands, err := s.routingSvc.Candidates(ctx, snap, m.ID, needs)
 	if err != nil {
-		s.releaseAdmission(requestID, adm.AccountLease)
+		s.releaseAdmission(requestID, adm.Leases)
 		return nil, domain.WrapError(domain.CodeInternal, "gateway: route candidates", err)
 	}
 	if len(cands) == 0 {
-		s.releaseAdmission(requestID, adm.AccountLease)
+		s.releaseAdmission(requestID, adm.Leases)
 		return nil, domain.NewError(domain.CodeUpstreamUnavailable,
-			"no compatible deployment with capacity for model "+m.ID)
+			noDispatchableUpstreamMessage(m.ID))
 	}
 	// Sticky session: narrow the candidate set to the bound account (Task
 	// 13). Failures here release the reservation — no upstream spend.
+	//
+	// The sticky path narrows the SAME candidate set the normal path built
+	// — it never re-derives "is this deployment schedulable?" on its own,
+	// so a disabled provider cannot be reached through a session binding
+	// either. The refresh closure below re-runs the very same
+	// routing.Candidates decision against the SAME pinned snapshot.
 	if sessionKey != "" {
 		// 迁移冲突时候选集可能来自 routing 的 1s TTL 账号缓存（过期快照里
 		// 的账号在库里已失效）——驱逐相关 provider 缓存并绕过缓存重建一次。
@@ -450,12 +523,77 @@ func (s *Service) run(ctx context.Context, p *domain.Principal, key *domain.APIK
 		}
 		cands, err = s.pinSessionCandidates(ctx, sessionKey, m.ID, cands, refresh)
 		if err != nil {
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, err
 		}
 	}
 
-	return s.dispatchLoop(ctx, requestID, adm, req, price, cands)
+	return s.dispatchLoop(ctx, requestID, adm, req, price, cands, clientProto)
+}
+
+// ErrCapabilityUnsupported marks a request whose protocol or capability
+// demand the model or its published deployments cannot carry.
+// It is a CLIENT error, not an upstream fault: nothing was sent,
+// nothing was reserved, nothing was billed — retrying the same request
+// cannot help. The protocol surfaces keep their native shapes (400
+// invalid_input); the legacy /chat facade maps it onto its own envelope.
+type ErrCapabilityUnsupported struct {
+	// Err is the underlying domain error (code + message).
+	Err *domain.Error
+}
+
+// Error renders the underlying domain error.
+func (e *ErrCapabilityUnsupported) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the *domain.Error so domain.CodeOf and errors.As keep
+// working on it.
+func (e *ErrCapabilityUnsupported) Unwrap() error { return e.Err }
+
+// newCapabilityUnsupported builds the typed capability error.
+func newCapabilityUnsupported(msg string) *ErrCapabilityUnsupported {
+	return &ErrCapabilityUnsupported{Err: domain.NewError(domain.CodeInvalidInput, msg)}
+}
+
+// rejectUnservableNeed refuses a request whose EXTRA capability demand
+// (image input / an explicit reasoning-effort level) no published
+// deployment can carry — BEFORE admission, so the request never takes a
+// monetary hold, a rate reservation, a lease or an upstream byte.
+//
+// The decision is a capability statement, not a capacity statement:
+//
+//   - the "base" demand (tools / reasoning) is compared first. If even the
+//     base demand has no compatible deployment, the request is left to the
+//     ordinary routing path (upstream_unavailable) — that is a catalog /
+//     capacity fact, not a client error, and its semantics stay unchanged;
+//   - only when the base demand HAS a compatible deployment and the extra
+//     demand has none is the request unservable by capability: the client
+//     asked for something this deployment set cannot express, so the answer
+//     is an explicit 400 (invalid_input) — never a silent fold into
+//     another capability and never a paid upstream round-trip.
+func (s *Service) rejectUnservableNeed(snap *catalog.Snapshot, modelID string, needs routing.Needs) error {
+	if !needs.Images && needs.ReasoningEffort == "" {
+		return nil // nothing extra was demanded
+	}
+	base := needs
+	base.Images = false
+	base.ReasoningEffort = ""
+	if len(s.routingSvc.CompatibleDeployments(snap, modelID, base)) == 0 {
+		return nil // the model has no compatible deployment at all — not a capability error
+	}
+	if len(s.routingSvc.CompatibleDeployments(snap, modelID, needs)) > 0 {
+		return nil // a compatible deployment exists
+	}
+	switch {
+	case needs.Images && needs.ReasoningEffort != "":
+		return newCapabilityUnsupported(
+			"model " + modelID + " has no deployment that can carry image input at reasoning effort " + needs.ReasoningEffort)
+	case needs.Images:
+		return newCapabilityUnsupported(
+			"model " + modelID + " has no deployment that can carry image input")
+	default:
+		return newCapabilityUnsupported(
+			"model " + modelID + " has no deployment that can carry reasoning effort " + needs.ReasoningEffort)
+	}
 }
 
 // pinCreditPrice resolves the effective sale_credit revision (plan path).
@@ -514,17 +652,63 @@ func (s *Service) admitWallet(ctx context.Context, request domain.Request, ent d
 	return adm, moneyPrice, nil
 }
 
+// noDispatchableUpstreamMessage is the 503 text for "no upstream can take
+// this call right now". It must not describe the condition as a capacity
+// gap and must not promise a retry: a provider that was disabled clears
+// only after it is re-enabled (a sticky session: only after a new session
+// key), so "with capacity" / "retry shortly" wording would invite a retry
+// loop against a condition that never heals on its own. The error code
+// (upstream_unavailable) and the HTTP 503 shape are unchanged.
+func noDispatchableUpstreamMessage(modelID string) string {
+	return "no dispatchable upstream for model " + modelID
+}
+
+// ErrConfigUnavailable marks a server-side CONFIGURATION error that the
+// caller cannot fix and that will not heal by retrying: an unimplemented
+// pool_strategy in the published catalog, an unimplemented overage mode in
+// the pinned policy (T7). It carries the ordinary domain code (so the
+// protocol surfaces keep their 503/529 shape) plus a typed value, so the
+// legacy /chat facade can report it as a configuration error instead of an
+// upstream fault — and can promise no retry.
+type ErrConfigUnavailable struct {
+	// Err is the underlying domain error (code + message) — it keeps the
+	// protocol surfaces' 503/529 shape.
+	Err *domain.Error
+}
+
+// newConfigUnavailable builds the typed configuration error.
+func newConfigUnavailable(code domain.Code, msg string) *ErrConfigUnavailable {
+	return &ErrConfigUnavailable{Err: domain.NewError(code, msg)}
+}
+
+// Error renders the underlying domain error (its Message, plus the cause
+// chain when there is one).
+func (e *ErrConfigUnavailable) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the *domain.Error so domain.CodeOf and errors.As keep
+// working on it (the protocol surfaces still answer 503/529).
+func (e *ErrConfigUnavailable) Unwrap() error { return e.Err }
+
 // pinSessionCandidates narrows the failover set to the session's bound
 // account following the Task 12 binder semantics:
 //   - Resolve OK: dispatch only to the bound account. When routing's live
-//     view excludes it (in-process cooldown / quota race) the call fails
-//     RETRYABLE — transient fullness never rebinds.
+//     view excludes it (in-process cooldown / quota race / a provider that
+//     was disabled) the call fails and the session is NOT rebound — a
+//     session is never silently continued on another account.
 //   - CodeNotFound: bind to the first candidate's account (first turn of a
 //     chain) and dispatch there.
 //   - CodeConflict (account invalidated — reauth/disabled/quota-exhausted):
 //     explicit Migrate to the first candidate (同事务终止旧绑定+建新), never
 //     a silent account switch. The protocol layer carries the full
 //     transcript, so the migration IS the protocol-level session rebuild.
+//
+// cands is the candidate set the normal path already built, so the
+// published route/provider/deployment schedulability decision is shared
+// (a disabled provider is absent from it) — the sticky branch opens no
+// door of its own. A binding whose account left the candidate set fails the
+// call with upstream_unavailable: a disabled provider is not a transient
+// capacity gap, and the sticky contract still forbids a silent account
+// switch.
 //
 // refreshCandidates 在迁移目标被库里判定不可调度（Migrate CodeConflict）时
 // 调用一次：候选集可能来自 routing 的 1s TTL 账号缓存（绕过应用层的账号
@@ -542,7 +726,8 @@ func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID 
 			pinned := filterCandidatesByAccount(cands, binding.AccountID)
 			if len(pinned) == 0 {
 				return nil, domain.NewError(domain.CodeUpstreamUnavailable,
-					"session-bound account is temporarily unavailable; retry shortly")
+					"session-bound account is not dispatchable for model "+modelID+
+						"; the session was not rebound to another account")
 			}
 			return pinned, nil
 		case domain.CodeOf(err) == domain.CodeNotFound:
@@ -564,7 +749,7 @@ func (s *Service) pinSessionCandidates(ctx context.Context, sessionKey, modelID 
 						}
 						if len(fresh) == 0 {
 							return nil, domain.NewError(domain.CodeUpstreamUnavailable,
-								"no compatible deployment with capacity for model "+modelID)
+								noDispatchableUpstreamMessage(modelID))
 						}
 						cands = fresh
 					}
@@ -595,7 +780,8 @@ func filterCandidatesByAccount(cands []routing.Candidate, accountID string) []ro
 // attempt persists its intent + lease BEFORE dispatch; retries never bill
 // the customer twice (settlement happens once, on the winning attempt).
 func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota.AdmissionResult,
-	req *providers.ChatRequest, price accounting.PriceVersion, cands []routing.Candidate) (*Outcome, error) {
+	req *providers.ChatRequest, price accounting.PriceVersion, cands []routing.Candidate,
+	clientProto domain.Protocol) (*Outcome, error) {
 
 	maxAttempts := s.MaxAttempts
 	if maxAttempts <= 0 {
@@ -612,16 +798,16 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 		if !ok {
 			continue
 		}
-		outcome, err := s.attempt(ctx, requestID, i+1, adm, req, price, cand, adapter)
-		if err == nil {
-			return outcome, nil
+		outcome, err := s.attempt(ctx, requestID, i+1, adm, req, price, cand, adapter, clientProto)
+		if outcome != nil || err == nil {
+			return outcome, err
 		}
 		// Client/shape errors (*domain.Error, e.g. an Anthropic-illegal
 		// history) are NOT upstream failures: nothing was sent, the
 		// reservation releases, and the caller sees the real 400.
 		var de *providers.DispatchError
 		if !errorsAsDispatch(err, &de) {
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, err
 		}
 		lastErr = de
@@ -637,12 +823,12 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 			// The caller is gone: stop spending upstream (设计 §7.2 客户端
 			// 取消后停止上游连接). No consumption is confirmed, so the
 			// reservation releases.
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, domain.WrapError(domain.CodeUpstreamUnavailable, "caller canceled mid-dispatch", de)
 		case !de.Retryable():
 			// Non-retryable upstream rejection (e.g. 400/401/403): the
 			// upstream answered without serving — zero consumption.
-			s.releaseAdmission(requestID, adm.AccountLease)
+			s.releaseAdmission(requestID, adm.Leases)
 			return nil, domain.WrapError(domain.CodeUpstreamUnavailable,
 				"upstream rejected the request", de)
 		case domain.CodeOf(de.Err) == domain.CodeInsufficientCapacity:
@@ -665,7 +851,7 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 	// All attempts failed before any client output with CONFIRMED zero
 	// consumption (unknown-execution failures returned above): release the
 	// reservation (设计 §7.2 reserved → released).
-	s.releaseAdmission(requestID, adm.AccountLease)
+	s.releaseAdmission(requestID, adm.Leases)
 	return nil, domain.WrapError(domain.CodeUpstreamUnavailable,
 		"all compatible upstreams failed", lastErr)
 }
@@ -673,20 +859,20 @@ func (s *Service) dispatchLoop(ctx context.Context, requestID string, adm *quota
 // holdForReconciliation parks the request with its reservation intact and
 // reports the dispatch failure.
 func (s *Service) holdForReconciliation(requestID string, cause error) error {
-	s.markReconciliation(requestID, "unknown_usage",
+	s.markReconciliation(requestID, postgres.ReasonUnknownUsage,
 		fmt.Sprintf("dispatch failed with unknown execution state: %v", cause))
 	return domain.WrapError(domain.CodeUpstreamUnavailable,
 		"upstream execution state unknown; reservation held for reconciliation", cause)
 }
 
 // attempt runs ONE upstream try: persist intent + lease (one tx) → fencing
-// check → egress re-validation → secret resolution → dispatch. A nil error
-// returns the live outcome whose finalization belongs to the caller. A
-// *domain.Error result is a client/shape failure (release + 400); a
-// *providers.DispatchError feeds the retry policy.
+// check → egress re-validation → secret resolution → dispatch. A nonnil
+// outcome stops retries, including an already-finalized translation failure.
+// Without an outcome, a *domain.Error is a client/shape failure (release +
+// 400); a *providers.DispatchError feeds the retry policy.
 func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, adm *quota.AdmissionResult,
 	req *providers.ChatRequest, price accounting.PriceVersion, cand routing.Candidate,
-	adapter providers.Adapter) (*Outcome, error) {
+	adapter providers.Adapter, clientProto domain.Protocol) (*Outcome, error) {
 
 	// Attempt intent + upstream concurrency lease commit in ONE tx —
 	// before any byte is sent upstream (设计 §7.2).
@@ -742,7 +928,9 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	// NoCooldown（pr-ci 第三轮）：凭据不可用是状态问题（吊销/轮换），
 	// 不是上游瞬时故障——喂 60s 重试型冷却会让 reactivate 后账号仍被
 	// cooled map 挡在候选外（FullLifecycleE2E 502 的真因）。
-	secret, _, err := s.secrets.ResolveSecret(ctx, cand.Account.CredentialID, nil)
+	// Task 1：解析结果是「可派发的鉴权材料」而不是原始密文——oauth
+	// 凭据只交出 access token，bundle JSON 与 refresh token 到不了适配器。
+	auth, _, err := s.secrets.ResolveOutboundAuth(ctx, cand.Account.CredentialID, nil)
 	if err != nil {
 		failAttempt("failed", "credential")
 		return nil, &providers.DispatchError{Err: err, NoCooldown: true}
@@ -764,22 +952,20 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 		timeout = 10 * time.Minute
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-	// The keeper renews BOTH leases while the dispatch is in flight (评审轮1
+	// The keeper renews EVERY lease while the dispatch is in flight (评审轮1
 	// M1: the billing-account lease is request-scoped and must be renewed on
 	// the non-streaming path too — previously only the streaming path renewed
-	// it via the stream keeper, an asymmetric lapse window). A renewal
-	// conflict fences the attempt — the stream guard then stops the upstream
-	// call. Neither lease is released by the keeper: the upstream lease ends
-	// per attempt (explicit release below), the account lease is released by
-	// the finalizer (settle/release), never per attempt.
-	keeper := s.routingSvc.NewLeaseKeeper(lease, adm.AccountLease)
-	// 防泄漏守卫:keeper 创建到交接(Pause 换交流式 keeper / 非流式显式释
-	// 放)之间,若 Dispatch 或 onStream/onNonStream panic(如 disp.Stream
-	// 为 nil、TeeBody 组装失败),gin recover 后 keeper goroutine 会永久续
-	// 租双租约 —— 恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
-	// 对齐 F-1(StreamBody.Finish)的 defer 释放模式:未交接则停 keeper
-	// 并取消 dispatch ctx;正常路径 Pause 已消费 stopMu,Stop 为 no-op,
-	// 零影响。panic 仍向上传播(行为同既有)。
+	// it via the stream keeper, an asymmetric lapse window). The keeper
+	// carries the attempt-scoped upstream lease PLUS every request-scoped
+	// lease of the admission (the account lease and — Task 5 — the per-Key
+	// lease): the lease SET is a list, never a hardcoded pair. A renewal
+	// conflict fences the attempt and cancels blocked upstream I/O.
+	// No lease is released by the renewal loop. A failed dispatch releases
+	// only its upstream lease; a completed dispatch keeps the entire set
+	// alive until finalization.
+	keeper := s.routingSvc.NewLeaseKeeperWithCancel(cancel, append([]*domain.ConcurrencyLease{lease}, adm.Leases...)...)
+	// Before handoff, a dispatch/assembly panic must stop renewal and release
+	// the leases. Pause/Stop are idempotent if a callee already cleaned up.
 	handedOff := false
 	defer func() {
 		if handedOff {
@@ -792,14 +978,15 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	}()
 
 	disp, err := providers.Dispatch(attemptCtx, s.client, adapter, &providers.Call{
-		Deployment:   &cand.Deployment,
-		Secret:       secret,
-		RequestID:    requestID,
-		Request:      req,
-		OutputCap:    adm.OutputCap,
-		ExtraHeaders: extraHeaders,
+		Deployment:     &cand.Deployment,
+		Auth:           providers.Auth{Type: auth.AuthType, Token: auth.Token},
+		RequestID:      requestID,
+		Request:        req,
+		ClientProtocol: clientProto,
+		OutputCap:      adm.OutputCap,
+		ExtraHeaders:   extraHeaders,
 	})
-	if err != nil {
+	if err != nil && disp == nil {
 		cancel()
 		// Pause (no release): the account lease survives for the retry/
 		// finalizer; only the attempt-scoped upstream lease is released
@@ -829,12 +1016,12 @@ func (s *Service) attempt(ctx context.Context, requestID string, attemptNo int, 
 	if req.Stream {
 		outcome, err = s.onStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
 	} else {
-		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter)
+		outcome, err = s.onNonStreamDispatch(requestID, attempt, disp, keeper, cancel, adm, price, adapter, err)
 	}
-	// keeper 已 Pause 并完成交接(流式: stream keeper 接管双租约;非流式:
-	// 上游租约已释放、账户租约归 finalizer)。
+	// Streaming Finish owns the keeper; nonstream finalization already
+	// stopped it and released every lease.
 	handedOff = true
-	if err == nil && outcome != nil {
+	if outcome != nil {
 		outcome.AccountID = cand.Account.ID
 		outcome.Inclusion = adapter.Inclusion()
 	}
@@ -863,27 +1050,22 @@ func (s *Service) persistAttempt(ctx context.Context, a *domain.Attempt, cand ro
 	return lease, nil
 }
 
-// onNonStreamDispatch settles immediately and returns the payload. Both
-// leases end with the request: upstream explicitly after the keeper pauses,
-// account by the finalizer below.
+// onNonStreamDispatch keeps every lease renewed through finalization, then
+// releases the complete set even if finalization times out or panics.
 func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt, disp *providers.DispatchResult,
 	keeper *routing.LeaseKeeper, cancel context.CancelFunc, adm *quota.AdmissionResult,
-	price accounting.PriceVersion, adapter providers.Adapter) (*Outcome, error) {
+	price accounting.PriceVersion, adapter providers.Adapter, translationErr error) (*Outcome, error) {
+	defer func() {
+		kctx, kcancel := detached(settleTimeout)
+		defer kcancel()
+		keeper.Stop(kctx)
+	}()
 	cancel()
-	kctx, kcancel := detached(settleTimeout)
-	// Pause (no release), then release ONLY the attempt-scoped upstream
-	// lease; the account lease stays held until the finalizer below (M1).
-	keeper.Pause()
-	for _, l := range keeper.Leases() {
-		if adm.AccountLease != nil && l.ID == adm.AccountLease.ID {
-			continue
-		}
-		if err := s.routingSvc.ReleaseLease(kctx, l); err != nil {
-			log.Printf("gateway: release upstream lease %s: %v", l.ID, err)
-		}
+	attemptStatus, kind := "completed", ""
+	if translationErr != nil {
+		attemptStatus, kind = "failed", "response_translation"
 	}
-	kcancel()
-	s.finishAttempt(attempt.ID, "completed", "", disp.UpstreamRequestID)
+	s.finishAttempt(attempt.ID, attemptStatus, kind, disp.UpstreamRequestID)
 	// 状态标记与结算共用同一个带 deadline 的 detached ctx(设计 §7.2: 结
 	// 算使用独立且有截止时间的 context —— context.Background() 无截止,
 	// 会绕过 settleTimeout 预算)。
@@ -907,12 +1089,13 @@ func (s *Service) onNonStreamDispatch(requestID string, attempt *domain.Attempt,
 		raw = nil
 	}
 	s.settle(sctx, requestID, attempt.ID, usage, source, raw, price, adapter, adm)
-	if adm.AccountLease != nil {
-		if err := s.routingSvc.ReleaseLease(sctx, adm.AccountLease); err != nil {
-			log.Printf("gateway: release account lease %s: %v", adm.AccountLease.ID, err)
-		}
+	outcome := &Outcome{RequestID: requestID, ModelID: price.ModelID}
+	if translationErr != nil {
+		return outcome, domain.WrapError(domain.CodeUpstreamResponseInvalid,
+			"upstream response cannot be translated faithfully", translationErr)
 	}
-	return &Outcome{RequestID: requestID, ModelID: price.ModelID, Payload: disp.Payload}, nil
+	outcome.Payload = disp.Payload
+	return outcome, nil
 }
 
 // onStreamDispatch hands the live stream to the caller; settlement runs in
@@ -925,12 +1108,9 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 		log.Printf("gateway: mark streaming %s: %v", requestID, err)
 	}
 	stCancel()
-	// The dispatch keeper pauses WITHOUT releasing; the stream keeper takes
-	// over both leases for the whole stream lifetime (the dispatch keeper
-	// already carries the request-scoped account lease since M1 — do NOT
-	// append it twice).
-	keeper.Pause()
-	streamKeeper := s.routingSvc.NewLeaseKeeper(keeper.Leases()...)
+	// Keep the same renewal loop and fencing state across the handoff.
+	// Finish owns stopping it after settlement, including on panic.
+	streamKeeper := keeper
 	// 与 attempt 同款防泄漏守卫:StreamBody 组装期间(tap 为 nil、TeeBody
 	// 失败等)panic 必须停 stream keeper,否则续租 goroutine 永久续租双租
 	// 约,恢复扫描的活性守卫失效,预占与并发槽冻结到进程重启。
@@ -976,10 +1156,10 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 		sctx, scancel := detached(settleTimeout)
 		defer scancel()
 		switch {
-		case !tap.SawUsage && !tap.Terminal:
+		case !tap.SawUsage && !tap.Terminal && !tap.RejectedComplete:
 			// Interrupted with NO usage read: hold the reservation, park for
 			// reconciliation — 不记零、不静默释放 (设计 §7.2).
-			s.markReconciliation(requestID, "unknown_usage",
+			s.markReconciliation(requestID, postgres.ReasonUnknownUsage,
 				"stream interrupted before any usage was reported")
 			return nil
 		case tap.SawUsage && tap.Terminal && !emptyBuckets(tap.Buckets):
@@ -989,7 +1169,8 @@ func (s *Service) onStreamDispatch(requestID string, attempt *domain.Attempt, di
 			return nil
 		default:
 			// 中断但已读用量 (estimated = 已知实际量), 或完整结束但上游确实
-			// 不提供 usage → estimated 估算路径 (设计 §7.1/§7.2).
+			// 不提供 usage（包括完整收到但无法翻译的拒绝响应）
+			// → estimated 估算路径 (设计 §7.1/§7.2).
 			usage := tap.Buckets
 			raw := tap.Raw
 			if !tap.SawUsage || emptyBuckets(usage) {
@@ -1018,7 +1199,12 @@ func (r *guardedTeeReader) Read(p []byte) (int, error) {
 		_ = r.body.Close()
 		return 0, fmt.Errorf("gateway: concurrency lease lost (fenced): %w", err)
 	}
-	return r.body.Read(p)
+	n, err := r.body.Read(p)
+	if fenceErr := r.keeper.Err(); fenceErr != nil {
+		_ = r.body.Close()
+		return n, fmt.Errorf("gateway: concurrency lease lost (fenced): %w", fenceErr)
+	}
+	return n, err
 }
 
 func (r *guardedTeeReader) Close() error { return r.body.Close() }
@@ -1060,7 +1246,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		RawUsage: domain.ExtensionConfig{SchemaVersion: 1, Raw: raw},
 	}, price, adapter.Inclusion(), adm.HoldMicros)
 	if err != nil {
-		s.parkSettleFailure(requestID, fmt.Errorf("settle decision: %w", err))
+		s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, fmt.Errorf("settle decision: %w", err))
 		return
 	}
 
@@ -1077,7 +1263,7 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 		// 钱包路径（Task 14）：金额计费，货币随冻结钱包；charge 与
 		// ChargeMicros 同源（settle 事务内校验一致）。
 		if decision.Charge.Money == nil {
-			s.parkSettleFailure(requestID, fmt.Errorf("settle decision: wallet path produced no money charge"))
+			s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, fmt.Errorf("settle decision: wallet path produced no money charge"))
 			return
 		}
 		cmd.WalletCharge = decision.Charge.Money
@@ -1122,12 +1308,127 @@ func (s *Service) settle(ctx context.Context, requestID, attemptID string, usage
 			}
 			return
 		}
+		// 已终态的投递必须分类（设计 §7.2）：一致的唯一 charge/usage 才是
+		// 幂等重复成功；released 后的晚到用量、缺预占、金额不一致都是账务
+		// 异常 —— 告警并进入专门核对，绝不当成功吞掉。
+		if se, ok := domain.AsSettleError(lastErr); ok {
+			s.classifySettleOutcome(cmd, price, adm.ChargeSource, se)
+			return
+		}
 		if domain.CodeOf(lastErr) == domain.CodeConflict {
-			return // already settled — idempotent delivery, not an error
+			// 不是已分类的终态结果的冲突 = 账本漂移，绝不静默当成功。
+			s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage,
+				fmt.Errorf("settle: unclassified conflict: %w", lastErr))
+			return
 		}
 	}
 parked:
-	s.parkSettleFailure(requestID, fmt.Errorf("settle: %w", lastErr))
+	s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, fmt.Errorf("settle: %w", lastErr))
+}
+
+// classifySettleOutcome maps a typed terminal settlement result onto the
+// gateway's reaction:
+//
+//   - a consistent duplicate is an idempotent replay (重复成功): absorbed
+//     silently, no alarm, no reconciliation job;
+//   - a late delivery after release and a settlement mismatch are accounting
+//     anomalies: the alarm fires and the request enters the dedicated
+//     reconciliation flow (its terminal state is never rewritten);
+//   - a missing expected reservation is an accounting anomaly on a
+//     non-terminal request: it is parked for reconciliation with its reason.
+func (s *Service) classifySettleOutcome(cmd domain.SettleCommand, price accounting.PriceVersion, source domain.ChargeSource, se *domain.SettleError) {
+	requestID := cmd.RequestID
+	switch se.Kind {
+	case domain.SettleOutcomeDuplicate:
+		return // 幂等重投：已结算且 charge/usage 一致 —— 重复成功，不告警。
+	case domain.SettleOutcomeReleased:
+		if se.Trivial {
+			return // released 之后到来的零用量投递：无事可记，不告警。
+		}
+		s.reportSettlementAnomaly(cmd, price, source, postgres.ReasonLateUsageAfterRelease, se)
+		return
+	case domain.SettleOutcomeChargeMismatch:
+		// 不一致的重复结算 = 双扣风险：告警并进入专门核对（绝不静默吞掉）。
+		s.reportSettlementAnomaly(cmd, price, source, postgres.ReasonSettlementMismatch, se)
+		return
+	case domain.SettleOutcomeLedgerDrift:
+		// 账本漂移（已结算却无 charge 行）：告警并进入专门核对。
+		s.reportSettlementAnomaly(cmd, price, source, postgres.ReasonLedgerDrift, se)
+		return
+	case domain.SettleOutcomeReservationDrift:
+		// 预占漂移（held 数与准入不符）：请求无法结算 → 停放并告警。
+		s.parkSettleFailure(requestID, postgres.ReasonReservationDrift, se)
+		return
+	case domain.SettleOutcomeMissingReservation:
+		// 缺预占：请求无法结算 → 停放并告警。
+		s.parkSettleFailure(requestID, postgres.ReasonMissingReservation, se)
+		return
+	}
+	s.parkSettleFailure(requestID, postgres.ReasonUnknownUsage, se)
+}
+
+// reportSettlementAnomaly alarms and files a dedicated reconciliation job
+// for a request whose terminal state must not be rewritten (设计 §7.2:
+// released 是终态，但晚到的非零用量是账务异常，必须告警并进入专门核对).
+func (s *Service) reportSettlementAnomaly(cmd domain.SettleCommand, price accounting.PriceVersion, source domain.ChargeSource, reason string, se *domain.SettleError) {
+	requestID := cmd.RequestID
+	log.Printf("ALARM gateway: %s for request %s: %s", reason, requestID, se.Message)
+	defer s.fireSettleAlarm(requestID, se)
+	ctx, cancel := detached(settleTimeout)
+	defer cancel()
+	evidence, err := newSettlementEvidence(cmd, price, source)
+	if err != nil {
+		log.Printf("ERROR gateway: anomaly evidence %s: %v", requestID, err)
+		return
+	}
+	deadline := s.clock.Now().Add(reconciliationDeadline)
+	for try := 0; try < 2; try++ {
+		detail, err := json.Marshal(map[string]interface{}{
+			"schema_version":          1,
+			"reason":                  reason,
+			"outcome":                 string(se.Kind),
+			"status":                  string(se.Status),
+			"requested_charge_micros": int64(se.RequestedChargeMicros),
+			"settlement_evidence":     evidence,
+		})
+		if err != nil {
+			log.Printf("ERROR gateway: anomaly detail %s: %v", requestID, err)
+			return
+		}
+		uow, err := s.store.Begin(ctx)
+		if err != nil {
+			log.Printf("ERROR gateway: anomaly report begin %s: %v", requestID, err)
+			return
+		}
+		if err := s.store.ReportTerminalAnomaly(ctx, uow, requestID, reason, detail, deadline); err != nil {
+			if rollbackErr := uow.Rollback(ctx); rollbackErr != nil {
+				log.Printf("ERROR gateway: anomaly report rollback %s: %v (report: %v)", requestID, rollbackErr, err)
+				return
+			}
+			if try == 0 && len(cmd.Usage.RawUsage.Raw) > 0 && postgres.IsJSONBInputError(err) {
+				evidence, err = evidence.withTextUsage(cmd.Usage.RawUsage.Raw)
+				if err != nil {
+					log.Printf("ERROR gateway: anomaly text evidence %s: %v", requestID, err)
+					return
+				}
+				continue
+			}
+			log.Printf("ERROR gateway: anomaly report %s: %v", requestID, err)
+			return
+		}
+		if err := uow.Commit(ctx); err != nil {
+			log.Printf("ERROR gateway: anomaly report commit %s: %v", requestID, err)
+		}
+		return
+	}
+}
+
+// fireSettleAlarm notifies the settlement-error hook (the alarm channel
+// wired by cmd/server).
+func (s *Service) fireSettleAlarm(requestID string, err error) {
+	if s.OnSettleError != nil {
+		s.OnSettleError(requestID, err)
+	}
 }
 
 // settleOnce is one settlement transaction: usage fact + ledger charge +
@@ -1186,13 +1487,13 @@ func (s *Service) attemptCost(ctx context.Context, modelID string, record domain
 }
 
 // parkSettleFailure holds the reservation and enqueues reconciliation —
-// the anti-silent-loss path (设计 §7.2).
-func (s *Service) parkSettleFailure(requestID string, cause error) {
+// the anti-silent-loss path (设计 §7.2). The reason names the anomaly class
+// so the dedicated reconciliation flow can tell a missing reservation from
+// an unknown consumption.
+func (s *Service) parkSettleFailure(requestID, reason string, cause error) {
 	log.Printf("gateway: settlement failed for %s: %v — parking in reconciliation", requestID, cause)
-	s.markReconciliation(requestID, "unknown_usage", cause.Error())
-	if s.OnSettleError != nil {
-		s.OnSettleError(requestID, cause)
-	}
+	s.markReconciliation(requestID, reason, cause.Error())
+	s.fireSettleAlarm(requestID, cause)
 }
 
 // markReconciliation parks a request whose consumption is unknown, keeping
@@ -1220,15 +1521,37 @@ func (s *Service) markReconciliation(requestID, reason, detail string) {
 // one transaction (reserved → released) and an unused five-hour window is
 // voided in-transaction (设计 §6/§7.2). A failure leaves the hold for
 // Task 9 recovery — loud, never silent.
-func (s *Service) releaseAdmission(requestID string, accountLease *domain.ConcurrencyLease) {
+//
+// Every REQUEST-scoped lease the admission took (the billing-account lease
+// and the per-Key lease — however many there are) is released here: the
+// finalizer works off the admission's lease LIST, never a hardcoded pair of
+// locks.
+func (s *Service) releaseAdmission(requestID string, leases []*domain.ConcurrencyLease) {
+	defer s.cleanupRequestLeases(leases)
 	ctx, cancel := detached(settleTimeout)
 	defer cancel()
 	if err := s.quotaSvc.ReleaseAdmission(ctx, requestID); err != nil {
 		log.Printf("ERROR gateway: release admission %s: %v (reservation held; recovery reconciles)", requestID, err)
 	}
-	if accountLease != nil {
-		if err := s.routingSvc.ReleaseLease(ctx, accountLease); err != nil {
-			log.Printf("gateway: release account lease %s: %v", accountLease.ID, err)
+}
+
+// Cleanup has a fresh budget even when finalization exhausted its deadline.
+func (s *Service) cleanupRequestLeases(leases []*domain.ConcurrencyLease) {
+	ctx, cancel := detached(settleTimeout)
+	defer cancel()
+	s.releaseRequestLeases(ctx, leases)
+}
+
+// releaseRequestLeases releases every request-scoped lease of an admission.
+// A lost lease (already reclaimed/fenced) is not an error — the slot is gone
+// either way; every other failure is logged loudly.
+func (s *Service) releaseRequestLeases(ctx context.Context, leases []*domain.ConcurrencyLease) {
+	for _, l := range leases {
+		if l == nil {
+			continue
+		}
+		if err := s.routingSvc.ReleaseLease(ctx, l); err != nil {
+			log.Printf("gateway: release request lease %s (scope %s): %v", l.ID, l.Scope, err)
 		}
 	}
 }
@@ -1258,10 +1581,18 @@ func (s *Service) estimateUsage(adm *quota.AdmissionResult, contentBytes int64) 
 }
 
 // imageInputTokenEstimate is the per-image admission estimate (OpenAI
-// high-detail worst case ≈ 85 + 170×6 tiles). Admission is a safe upper
-// bound corrected by the real usage chunk at settlement (设计 §7.1/7.2) —
-// it never bills directly; the rare no-usage fallback shares this
-// conservative direction with the bytes/2 text heuristic.
+// high-detail worst case ≈ 85 + 170×6 tiles = 1105).
+//
+// T8 口径修正：这只是**估算**，不是对所有模型/供应商都成立的数学硬上界。
+// 视觉 token 的计费口径由供应商定义（分块方式、缩放、是否计入缓存/
+// 推理桶都各不相同），不同供应商对同一张图的计量可能相差数倍。因此：
+//   - 准入用它是**保守预留**（先占住额度），结算时以**上游真实上报**的
+//     usage 为准（`source=reported`），估算路径（`source=estimated`）才
+//     用它，且带 `estimated` 标记可被后续真实证据更正；
+//   - 准入预占与最终结算的差额由结算事务的 overage 流程如实记账，不隐藏
+//     负差额；
+//   - 未解决的供应商计量边界记录在验证 runbook（T8）里：本网关**无法**
+//     校验供应商的视觉 token 口径，只能如实转述其上报值。
 const imageInputTokenEstimate = 1105
 
 // EstimateInputTokens is the admission input estimate: a conservative

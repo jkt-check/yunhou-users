@@ -12,7 +12,6 @@ package httpapi
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -63,27 +62,65 @@ func v1Error(c *gin.Context, status int, typ, code, message string) {
 	})
 }
 
+// isAnthropicV1Path reports whether the request speaks the Anthropic
+// protocol (POST /v1/messages). The Anthropic error taxonomy differs from
+// the OpenAI one, so every renderer that has to pick a shape asks here.
+func isAnthropicV1Path(path string) bool {
+	return strings.HasSuffix(path, "/v1/messages")
+}
+
 // v1AuthError writes the auth-chain error in the shape of the protocol the
 // route speaks: Anthropic-native for /v1/messages (设计 §9.1: 各自协议的
 // 原生错误), the OpenAI /v1 shape elsewhere.
 func v1AuthError(c *gin.Context, status int, typ, code, message string) {
-	if strings.HasSuffix(c.Request.URL.Path, "/v1/messages") {
+	if isAnthropicV1Path(c.Request.URL.Path) {
 		anthropicError(c, status, typ, message)
 		return
 	}
 	v1Error(c, status, typ, code, message)
 }
 
-// APIKeyAuth authenticates /v1/* requests by customer API key and applies
-// per-Key (when the key carries rpm_limit) and per-account (accountRPM,
-// when > 0) sliding-window rate limits. Rate limiting runs AFTER
-// authentication so buckets key on verified identities, not client input.
+// V1RateLimitResponder renders the /v1 perimeter rejection (the per-IP abuse
+// guard mounted in front of the /v1 group) in the shape of the protocol the
+// route speaks: Anthropic-native for /v1/messages, the OpenAI /v1 error
+// object elsewhere.
+//
+// It exists because the generic limiter middleware renders the MANAGEMENT
+// envelope — which must never be forced onto /v1 (设计 §9.1: /v1/* 使用
+// 各自协议的原生 body 与错误). The rejection happens before authentication
+// and before any upstream call, so the response is the client's only signal.
+func V1RateLimitResponder(c *gin.Context, retryAfter string) {
+	if retryAfter != "" {
+		c.Header("Retry-After", retryAfter)
+	}
+	if isAnthropicV1Path(c.Request.URL.Path) {
+		anthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "too many requests")
+		return
+	}
+	v1Error(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited", "too many requests")
+}
+
+// APIKeyAuth authenticates /v1/* requests by customer API key.
 //
 // Credentials are accepted as `Authorization: Bearer <key>` (OpenAI style)
 // or `X-Api-Key: <key>` (Anthropic style — Task 13: Claude Code 等
 // Anthropic SDK 客户端以 x-api-key 为默认凭据头). Both headers present:
 // Bearer wins. The key VALUE space is identical.
-func APIKeyAuth(resolver *access.Resolver, counter *access.RPMCounter, accountRPM int) gin.HandlerFunc {
+//
+// Task 4: the business rate limits (全局账户 RPM / 选中权益策略 RPM /
+// Key RPM + 账户级策略 TPM) are NOT enforced here any more — they are
+// enforced ONCE in the business admission (quota.Service.Admit), where the
+// counters are shared through PostgreSQL across instances, across Keys and
+// across /chat and /v1. The old process-local buckets were a duplicate,
+// per-instance approximation of that limit: they under-counted globally
+// (N instances ⇒ N× the limit) and they rejected requests that never
+// reached the business admission (model not allowed, invalid shape).
+//
+// What stays here: **authentication** (the key must be valid) and the
+// per-IP abuse guard mounted in front of the group (router.Setup). A
+// request that fails authentication never enters the business admission,
+// so it consumes neither RPM nor TPM.
+func APIKeyAuth(resolver *access.Resolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var rawKey string
 		if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
@@ -105,26 +142,6 @@ func APIKeyAuth(resolver *access.Resolver, counter *access.RPMCounter, accountRP
 			v1AuthError(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key",
 				"invalid, revoked or expired API key")
 			return
-		}
-		if counter != nil {
-			limited := false
-			var scope string
-			if res.Key.RPMLimit != nil {
-				scope = "key:" + res.Key.ID
-				limited = !counter.Allow(scope, *res.Key.RPMLimit)
-			}
-			if !limited && accountRPM > 0 {
-				scope = "acct:" + res.Account.ID
-				limited = !counter.Allow(scope, accountRPM)
-			}
-			if limited {
-				if ra := counter.RetryAfter(scope); ra > 0 {
-					c.Header("Retry-After", strconv.Itoa(int(ra.Seconds())+1))
-				}
-				v1AuthError(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited",
-					"rate limit exceeded")
-				return
-			}
 		}
 		c.Set(ContextCallerPrincipal, res.Principal)
 		c.Set(ContextCallerKey, res.Key)

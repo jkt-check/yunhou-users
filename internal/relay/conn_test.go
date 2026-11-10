@@ -1,10 +1,12 @@
 package relay
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -79,6 +81,67 @@ type wsTestEnv struct {
 }
 
 func newWSTestEnv(t *testing.T, opts Options, failLimit int, allowedOrigins []string) *wsTestEnv {
+	return newWSTestEnvWithUpgrade(t, opts, failLimit, allowedOrigins, nil)
+}
+
+type wsTestUpgrade func(*http.Request, net.Conn, *bufio.ReadWriter) (net.Conn, error)
+
+// wsTestResponseWriter keeps the HTTP upgrade and WebSocket codec real while
+// allowing tests to control the transport before HandleWS starts its timers.
+type wsTestResponseWriter struct {
+	http.ResponseWriter
+	request *http.Request
+	upgrade wsTestUpgrade
+}
+
+func (w *wsTestResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c, rw, err := w.ResponseWriter.(http.Hijacker).Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := rw.Flush(); err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	wrapped, err := w.upgrade(w.request, c, rw)
+	if err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	rw.Writer.Reset(wrapped)
+	return wrapped, rw, nil
+}
+
+type wsBlockedWriter struct {
+	net.Conn
+	pause       <-chan struct{}
+	resume      <-chan struct{}
+	blocked     chan struct{}
+	closed      chan struct{}
+	blockedOnce sync.Once
+	closeOnce   sync.Once
+}
+
+func (c *wsBlockedWriter) Write(b []byte) (int, error) {
+	select {
+	case <-c.pause:
+		c.blockedOnce.Do(func() { close(c.blocked) })
+		select {
+		case <-c.resume:
+		case <-c.closed:
+			return 0, net.ErrClosed
+		}
+	default:
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *wsBlockedWriter) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func newWSTestEnvWithUpgrade(t *testing.T, opts Options, failLimit int, allowedOrigins []string, upgrade wsTestUpgrade) *wsTestEnv {
 	t.Helper()
 	e := &wsTestEnv{
 		hub:     NewHub(opts, nil),
@@ -93,6 +156,9 @@ func newWSTestEnv(t *testing.T, opts Options, failLimit int, allowedOrigins []st
 		if origin := r.Header.Get("Origin"); origin != "" && !OriginAllowed(origin, allowedOrigins) {
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
+		}
+		if upgrade != nil {
+			w = &wsTestResponseWriter{ResponseWriter: w, request: r, upgrade: upgrade}
 		}
 		HandleWS(w, r, e.hub, e.tickets, e.fails, testClientIP)
 	}))
@@ -547,61 +613,71 @@ func TestWSReplaceKick(t *testing.T) {
 func TestWSSlowConsumer(t *testing.T) {
 	opts := testOptions()
 	opts.OutboundBuffer = 8
-	env := newWSTestEnv(t, opts, 5, nil)
+	pause, resume := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(resume) })
+	defer unblock()
+	blocked := make(chan struct{})
+	env := newWSTestEnvWithUpgrade(t, opts, 5, nil, func(r *http.Request, c net.Conn, _ *bufio.ReadWriter) (net.Conn, error) {
+		if r.Header.Get("X-Test-Slow-Consumer") == "" {
+			return c, nil
+		}
+		return &wsBlockedWriter{Conn: c, pause: pause, resume: resume, blocked: blocked, closed: make(chan struct{})}, nil
+	})
 	ticket := env.tickets.issue("u1", 30*time.Second)
 
 	dev := env.dial(t, "")
 	defer dev.CloseNow()
 	helloDevice(t, dev, ticket, "d1")
-	slow := env.dial(t, "")
+	slow := env.dialWithHeaders(t, http.Header{"X-Test-Slow-Consumer": []string{"1"}})
 	defer slow.CloseNow()
-	helloClient(t, slow, ticket, "c-slow") // 此后不再读
+	helloClient(t, slow, ticket, "c-slow")
 	fast := env.dial(t, "")
 	defer fast.CloseNow()
 	helloClient(t, fast, ticket, "c-fast")
 
-	// slow_consumer 关闭由 TCP 反压触发:只有内核发送缓冲填满、writer
-	// 阻塞、出站 channel 溢出,Enqueue 才会走 slow_consumer 关闭路径。
-	// 内核缓冲因平台/调参差异巨大(macOS  loopback 数百 KB,Linux
-	// loopback 自调节默认上限 4MB,CI 可能更高),固定小体量帧在某些
-	// 环境根本填不满 —— 原 64KB×20=1.28MB 版本在 CI(Linux loopback)
-	// 被内核全部吃进,writer 从不阻塞,断言超时失败。改为 fast 后台
-	// 排空 + 设备端持续发送,总量 256KB×128=32MB 超过任何常见
-	// loopback 自调节上限;单帧 255KB+信封 < MaxFrameBytes(读循环按整
-	// 帧判定,1024 余量只兜底 WS 库硬掐),不触发帧上限关闭。
-	big := map[string]any{"data": strings.Repeat("x", 255<<10)}
-	fastErr := make(chan error, 1)
-	go func() {
-		// fast 后台排空:既防止 fast 自己的出站缓冲(同为 8)被灌满
-		// 而被误伤为 slow_consumer,也验证正常 client 不受影响。
-		deadline := time.Now().Add(30 * time.Second)
-		for {
-			ctx, cancel := context.WithDeadline(context.Background(), deadline)
-			_, _, err := fast.Read(ctx)
-			cancel()
-			if err != nil {
-				fastErr <- err
-				return
-			}
+	// Stall only the slow socket's writes, not Enqueue or the WebSocket codec.
+	// This models exhausted TCP buffers without flooding platform-sized buffers.
+	close(pause)
+	sendAndReceiveFast := func(i int) {
+		t.Helper()
+		writeFrame(t, dev, map[string]any{"v": 1, "type": "app", "payload": map[string]any{"i": i}})
+		m := readFrame(t, fast)
+		payload, _ := m["payload"].(map[string]any)
+		if m["type"] != "app" || m["from_device_id"] != "d1" || payload["i"] != float64(i) {
+			t.Fatalf("fast client frame %d = %v, want app from d1 with matching payload", i, m)
 		}
-	}()
-	for i := 0; i < 128; i++ {
-		writeFrame(t, dev, map[string]any{"v": 1, "type": "app", "payload": big})
 	}
-	expectConnClosed(t, slow, 10*time.Second)
-	// fast 的 drain goroutine 只能在测试收尾 CloseNow 后才报错退出;
-	// 提前退出 = fast 连接被慢消费者株连。
+	sendAndReceiveFast(0)
 	select {
-	case err := <-fastErr:
-		t.Fatalf("fast client conn broke while slow consumer was dropped: %v", err)
-	default:
+	case <-blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("slow socket writer did not reach backpressure")
 	}
+	// One frame is in-flight; fill the queue, then send exactly one overflow.
+	// Reading fast after each send prevents the producer from outrunning it.
+	for i := 1; i <= opts.OutboundBuffer+1; i++ {
+		sendAndReceiveFast(i)
+	}
+	unblock()
+	expectClosedReason(t, slow, "slow_consumer")
+	expectConnClosed(t, slow, 10*time.Second)
+	sendAndReceiveFast(opts.OutboundBuffer + 2)
 }
 
 func TestWSConnectionCaps(t *testing.T) {
 	opts := testOptions()
 	opts.MaxDevicesPerUser = 2
-	env := newWSTestEnv(t, opts, 5, nil)
+	helloSent := make(chan struct{})
+	releaseHello := sync.OnceFunc(func() { close(helloSent) })
+	defer releaseHello()
+	env := newWSTestEnvWithUpgrade(t, opts, 5, nil, func(r *http.Request, c net.Conn, _ *bufio.ReadWriter) (net.Conn, error) {
+		if r.Header.Get("X-Test-Delayed-Hello") != "" {
+			// Capacity, not hello timing, is under test. Let the real hello
+			// reach the socket before HandleWS starts its hello timer.
+			<-helloSent
+		}
+		return c, nil
+	})
 	ticket := env.tickets.issue("u1", 10*time.Second)
 
 	d1 := env.dial(t, "")
@@ -612,12 +688,15 @@ func TestWSConnectionCaps(t *testing.T) {
 	helloDevice(t, d2, ticket, "d2")
 
 	// 第 3 个 device → closed protocol
-	d3 := env.dial(t, "")
+	d3 := env.dialWithHeaders(t, http.Header{"X-Test-Delayed-Hello": []string{"1"}})
 	defer d3.CloseNow()
+	// Model a descheduled client between receiving the upgrade and writing hello.
+	time.Sleep(2 * opts.HelloTimeout)
 	writeFrame(t, d3, map[string]any{
 		"v": 1, "type": "hello", "ticket": ticket, "role": "device",
 		"device_id": "d3", "device_name": "Mac", "app_version": "2.4.0",
 	})
+	releaseHello()
 	expectClosedReason(t, d3, "protocol")
 }
 

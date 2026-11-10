@@ -1,8 +1,11 @@
-# Kaya Coding Plan 运营面 runbook（Task 15）
+# Kaya Coding Plan 运营面 runbook（Task 15；T9 补探测/预演/告警）
 
 对应实现：`internal/inference/management/{bulk_import,pricing_preview,operations}.go`、
 `internal/inference/httpapi/{admin_bulk,admin_usage}.go`、`admin_adjustments.go`（Task 14 建、
-本任务扩展）。API 契约：`docs/api/kaya-coding-plan.openapi.yaml`（0.13.0）。
+本任务扩展）、`internal/inference/management/{probe,catalog}.go`（T9：上游连通性探测与发布
+预演）、`internal/inference/httpapi/kaya_models.go`（T9：模型能力描述）、
+`internal/inference/quota/service.go` 与 `internal/inference/workers/settlement_recovery.go`
+（T9：运行告警）。API 契约：`docs/api/kaya-coding-plan.openapi.yaml`（0.14.0）。
 
 ## 权限矩阵（server 端强制，自报无效）
 
@@ -30,6 +33,26 @@
 - 落库即草稿（默认不可售）；补齐价格（sale_credit 版本）与授权后
   `POST /admin/catalog/publish` 发布。停用上游（status=disabled）不删除历史
   路由/尝试记录；有路由或历史尝试的部署不可 DELETE。
+
+## 目录回滚（POST /admin/catalog/rollback）
+
+`{"to_revision":N,"reason":"…"}`（reason 必填，进审计）。
+
+- **回滚不改历史**：发布一个**新** revision（编号 = 当前最新 + 1），内容取自
+  目标旧 revision；旧 revision 原样保留（它是计费与审计的事实来源）。
+- **只有当前发布闸通过才发布**：目标必须在**今天的**校验口径下仍然可发布，
+  否则拒绝 —— 拒绝发生在写入之前。
+- **已知但未实现的旧路由读得到、激活不了**：`least_loaded` 与通用
+  `session_sticky` 属于「认识但不支持」的 pool_strategy：旧快照仍可读（读不
+  出来 = 整个目录变砖），但**不能**被回滚重新激活 —— 否则就成了「配置看起来
+  生效了、实际没生效」。
+- **400 点名路由与替代**：拒绝信息带路由 id、被拒值与受支持的替代
+  （如 `route <id> is not publishable: pool_strategy least_loaded is not
+  supported: only round_robin is implemented — set pool_strategy to
+  round_robin`），一步就能改对。
+- **拒绝不落任何 revision**：既不新增 revision 也不动 active 指针 —— 当前
+  生效版本保持不变。
+- **正确做法**：改草稿再发布（`POST /admin/catalog/publish`），不要改写历史。
 
 ## 一账号一部署（显式运营约束）
 
@@ -154,6 +177,13 @@ SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
 注意：未声明模型的上游若实际无视觉能力，带图请求会在上游报错（400→502），
 属预期暴露——确认上游支持视觉的模型才保持未声明或显式点亮。
 
+**T9：`/chat/models` 还追加了能力字段**（`supports_images` /
+`supports_tools` / `supports_thinking` / `context_tokens` /
+`max_output_tokens` / `capability_description`）。它们是**派发判定**（当前
+已发布入口 + 协议适配层能不能承载），不是模型条目的自我声明；因此一个
+只有 `openai_responses` 部署的模型 `supports_images` 恒为 `false`。
+`GET /v1/models` 保持原生基本形状，**不带**这些字段。
+
 - **网关目录（本条路径）**：无需逐模型配置即可放行图片；要**关闭**视觉，
   `PATCH /admin/models/:id`（models:manage）设
   `{"input_modalities":["text"],"reason":"..."}`，然后
@@ -168,3 +198,371 @@ SELECT occurred_at, actor_user_id, actor_app_id, reason, detail
 - 客户端侧契约（parts 数组、≤4 张、单张 ≤1 MiB wire、合计 ≤3 MiB、
   magic bytes 校验）见 `docs/api-integration-guide.md`「Chat 接口」；
   `/v1/*` 对外协议面本期仍显式拒绝多模态（后续工作）。
+
+## Anthropic thinking 的输出预算边界
+
+`anthropic_messages` 开启 thinking 时，`budget_tokens` 至少为 1024，
+且必须严格小于发给上游的 `max_tokens`。因此输出上限 1025 配预算 1024
+是最小合法组合；缺省或更大的预算会下调到 1024，不会提高已准入的输出上限。
+输出上限不超过 1024 时，开启 thinking 仍被明确拒绝，需提高请求上限或关闭
+thinking；关闭 thinking 不受这条最小预算约束。此修复不改变价格或计费口径。
+
+## Chat 上游 refusal 的转换边界
+
+`openai_chat` 上游返回 `message.refusal` 或 `delta.refusal` 时，
+`/v1/chat/completions` 与 Kaya `/chat` 仍原样透传，拒绝文本参与缺失
+usage 时的估算。Messages/Responses 客户端面不支持忠实表示该输出：
+非流式返回 502；流式发一次原生错误，不再输出内容、成功终态或会话链，
+但继续读取上游以保留晚到用量。空字符串仍是拒绝，省略或 `null` 不是。
+
+这是已经执行的调用，不因翻译失败释放已发生消费或自动重放。完整拒绝响应
+按已报 usage 或观察到的输出估算结算；流式错误后的 usage 来源仍为
+estimated。拒绝片段后裸 EOF 且无 usage 时保留预占并挂起核对。真实上游
+错误优先于拒绝完成证据，后续 `[DONE]` 不能把失败改成完整拒绝。
+本次不扩展拒绝内容的原生渲染或历史回放 schema。
+
+## Responses incomplete 与真实失败
+
+Responses 的 `incomplete` 仅支持 `max_output_tokens` 和 `content_filter`
+原因。原因缺失、null、为空或未知时明确报翻译错误，不当成正常 `stop`；
+终止事件与响应对象的非空状态冲突也拒绝。非流式返回 502；流式保留此前
+有效文本，只发一次原生错误，不发成功终态或保存会话链，继续读取晚到 usage。
+这是已执行的调用：完整拒绝保留消费证据，按已报 usage 或完整输出估算，
+不自动重放或切换上游。
+
+拒绝之后的真实上游错误、失败对象或读取错误会使完整拒绝证据失效；
+后来的完成事件不能恢复该证据。无 usage 时，金额和 TPM 预占继续冻结并
+进入待核对，不能按零结算；已有 usage 则按 estimated 结算。该规则也适用
+于 Responses refusal。不要把协议翻译失败误当作准入前拒绝而释放预占。
+
+## 工具参数的保真与对象边界
+
+Responses 输出的 `function_call.arguments` 是原始字符串，空或截断也不补
+`{}`。回放时要求有效 JSON：空或非法参数入口 400，生成这类参数的响应不落
+可引用链；有效 `null`、标量、数组仍可回放。
+
+Messages 历史 `tool_use.input` 必须是完整 JSON 对象，缺失、null、标量、
+数组入口 400。上游生成的无效或非对象参数在非流式返回 502，在流式发一次
+原生错误并停止渲染后续内容和成功终态，但仍读取晚到用量。多 choice 输出
+明确拒绝，不合并相互冲突的工具索引。有效对象通过原始 JSON 转换，保留
+大于 2^53 的整数；Anthropic 流式起始块的 `input:{}` 只是占位。
+
+翻译拒绝不代表未消费：保留已报用量、响应标识和实际参数字节，不自动重放或
+切换上游。完整收到的拒绝输出可按观察值估算；裸 EOF 或真正的上游错误不
+获得完整拒绝证据，缺少消费证据时仍保留预占并挂起核对。不涉及金额更正、
+价格或工具执行。
+
+## 配置支持集（T7：只支持已实现的那部分）
+
+本期口径是**明确支持集 + 拒绝不支持的配置**：不实现的能力不收下（收下就是
+「保存后假装生效」—— 运营以为配了，实际跑的是别的行为）。下面三处是运营会
+碰到「配了但没生效/被拒」的入口。
+
+### 路由 PATCH 与并发修改
+
+`PATCH /admin/routes/:route_id` 只覆盖提供的字段；可变字段省略或 `null` 保持原值，显式
+`0` / `false` / `[]` 不被忽略，但仍须通过字段校验（如 `weight>0`）。
+特别注意 `capabilities=[]` 表示全部能力，
+不是关闭能力。模型/部署不可通过 PATCH 改绑。
+
+每次提交必须带读取路由所得的非零 `updated_at`（保留完整时间精度）和
+非空、非纯空白的 `reason`。缺失/零版本为 400，过期为 409；发生冲突时
+重新读取、合并修改后提交，不要直接覆盖版本。成功后发布目录才生效。
+`POST /admin/operators` 的授权理由也必须非空，`user_id` 必须是 UUID；
+非法请求不会写授权或审计。
+
+### `pool_strategy`（路由的账号池策略）
+
+| 写面 | 口径 |
+|---|---|
+| `POST/PATCH /admin/routes`（operator CRUD） | 只接受 `round_robin`；`least_loaded` / 通用 `session_sticky` **明确 400**（错误点名替代配置 `round_robin`） |
+| `POST /admin/catalog/bulk-import`（批量导入） | 派生路由恒为 `round_robin`（文档里没有 pool_strategy 字段 —— 严格解码会拒绝未知字段） |
+| `INFERENCE_CATALOG_JSON`（环境导入） | 派生路由恒为 `round_robin` |
+| `POST /admin/catalog/publish`（正式发布） | 发布闸与上面同一口径：**拒绝**并点名路由 ID 与替代配置；`?dry_run=1` 的发布预演给出同一个错误 |
+
+**存量已发布快照里的不支持值**：旧快照**仍可读**（读不出来整个目录就变砖），
+但该路由被标记为**不可调度** —— 绝不静默当成 `round_robin`：
+
+- 模型还有其它可调度路由 → 正常服务，只是那条路由不参与调度；运维侧收到
+  告警（结构化日志 `UNSUPPORTED_POOL_STRATEGY` + `AUDIT_ALERT` 通道，动作
+  `model.route.pool_strategy_unsupported`）。
+- 模型的**全部**路由都不支持 → 客户请求在**预占/派发前**失败：HTTP 503
+  `upstream_unavailable`（Anthropic 面 529），message 点名路由与替代配置；
+  零预占、零出站、零计费。
+
+**Responses 的 `previous_response_id` 会话链不受影响**：那条链路走的是会话
+绑定器（`routing.SessionBinder`，按 session key 钉住上游账号），与路由的
+`pool_strategy` 是两件事。
+
+**修法**：把该路由的 `pool_strategy` 改成 `round_robin`（`PATCH /admin/routes/:id`），
+再 `POST /admin/catalog/publish`。发布预演（`?dry_run=1`）会先告诉你哪条路由
+不合格。
+
+**客户面看到的**：`/v1/*` 是 503（`upstream_unavailable` / `service_unavailable`，
+message 点名配置）；legacy `/chat` 是 503 `chat configuration unavailable`
+（**不带 `Retry-After`** —— 配置不会自愈，重试没有意义）。两者都在预占前
+失败：零计费、零出站。
+
+### `capabilities`（路由的能力清单）
+
+路由的 `capabilities` 列声明**这条路由承载哪些能力**。词表是**封闭**的：
+
+| 能力名 | 含义 |
+|---|---|
+| `tools` | 这条路由承载带工具的请求 |
+| `reasoning` | 这条路由承载带推理的请求 |
+| `image` | 这条路由承载带图的请求 |
+
+| 写面 | 口径 |
+|---|---|
+| `POST/PATCH /admin/routes`（operator CRUD） | 词表外的名字 **明确 400**（错误点名那个名字与支持集）；清单先归一（trim / 去空 / 去重）再落库，**不折叠大小写**（`Tools` 是拼写错误，要指出来而不是悄悄接受） |
+| `POST /admin/catalog/publish`（正式发布） | 发布闸与写面同一口径：**拒绝**并点名路由 ID 与那个能力名；`?dry_run=1` 的发布预演给出同一个错误 |
+| 已发布快照的**读**面 | **容忍**未知能力名（旧目录必须仍能加载，否则升级即砖整个目录）：未知名字**不授予任何能力**，存量行**不会被自动改写** |
+
+**空清单 = 全部能力**（数据库默认 `'{}'`）：存量绝大多数路由是空清单，行为
+不变。
+
+**⚠️ 已发布的非空清单被有意收窄（T8）**：`image` 是一把**新钥匙**。存量
+非空清单（例如 `["tools","reasoning"]`）里没有它，因此**不再承载带图请求**：
+
+- 该路由上的带图请求 → 网关在**准入前**明确 400（零预占、零出站、零计费）；
+- 若某个模型的**全部**路由都是这类清单 → 该模型不再 advertise 图片能力
+  （`GET /chat/models` 的 `input_modalities` 与 legacy `/chat` picker 都只
+  透出 `["text"]`），picker 因此不会让客户发图。
+
+**修法**：把要承载图片的路由的 `capabilities` 显式加上 `"image"`
+（`PATCH /admin/routes/:id`），再 `POST /admin/catalog/publish`。发布预演
+（`?dry_run=1`）会先告诉你哪条路由不合格。
+
+**客户面看到的**：带图请求是 400（`invalid_input`，Anthropic 面
+`invalid_request_error`），message 点名模型与「没有能承载图片的部署」；
+legacy `/chat` 是 400（能力不兼容哨兵，不是「上游拒绝」的 502）。都在预占前
+失败：零计费、零出站。
+
+### `weight`（同 priority 下的候选排序，不是比例分流）
+
+`weight` 只决定**同 `priority` 组内**的候选顺序（降序）。它**不是**概率分流：
+组内每个候选都留在候选列表里，只是顺序不同（本期不做比例分流）。`priority`
+决定分组（数字小者优先 = failover 顺序）。
+
+### `overage_policy`（配额策略的超额模式）
+
+| 值 | 口径 |
+|---|---|
+| `reject` | 额度耗尽即停（默认） |
+| `allow_overage` | 允许套餐外消费（走钱包，需客户显式开启） |
+| `clamp_if_declared` | **未实现** —— 依赖客户端「显式声明允许钳制」的协议字段，本期协议层没有该字段。**新写一律拒绝**（400，错误点名 `reject` / `allow_overage` 两个可迁移目标） |
+
+**存量策略行仍可查询**（`GET /admin/quota-policies`、详情页照常返回原值）——
+读面不做隐式改写，**也不自动迁移旧策略**。新推理引用到该模式时会明确报
+「策略配置不可用」（HTTP 503 `service_unavailable`，message 点名策略名与
+版本），**绝不静默当 `reject`**（那会悄悄改变客户的额度语义）。
+
+**人工迁移步骤**（不自动改旧策略）：
+
+1. `GET /admin/quota-policies?name=<name>` 找到仍在使用 `clamp_if_declared` 的
+   已发布版本（`overage_policy` 字段）。
+2. `POST /admin/quota-policies` 用**同一个 name** 出一个新 draft，把
+   `overage_policy` 改成 `reject`（保持客户语义）或 `allow_overage`（若客户
+   已开启钱包），其余限制项照抄。
+3. `POST /admin/quota-policies/:id/publish` 发布新版本（旧 published 自动转
+   superseded）。
+4. 既有权益**钉住**它们发放时的策略版本 —— 已发放的权益继续按旧版本执行，
+   新发放的权益用新版本。老版本要收口时用 `POST /admin/quota-policies/:id/retire`
+   （有活跃权益引用时默认 409，`?force=true` 放行）。
+
+### 部署超时：`connect_timeout` 与 `request_timeout`
+
+| 字段 | 管什么 | 不管什么 |
+|---|---|---|
+| `connect_timeout` | **建连阶段**：DNS 解析 + TCP 建连的上限 | 已建立的连接（长 SSE 流不被它截断） |
+| `request_timeout` | 请求**总时长**（整条响应/流的上限） | 建连之外的调度细节 |
+
+- 两者都在部署写入时校验为正数；`request_timeout` 还必须低于生效的
+  `INFERENCE_RECOVERY_GRACE`（默认 15m）。
+- **缺省值**：落库缺省 `connect_timeout_ms = 5000`（5s）、`request_timeout_ms
+  = 600000`（600s）；写路径（operator CRUD / env 导入 / 批量导入）未声明时
+  补同样的值。
+- **存量部署的有效建连预算从 10s 变成 5s**：`connect_timeout` 过去是死字段
+  （共享客户端写死 10s 拨号超时），现在按落库值执行 —— 落库是 5s 的那些
+  部署（也就是绝大多数没显式配过的）实际少了 5s 建连预算。慢但可达的上游
+  可能因此撞上建连超时；处置办法是**调大 `connect_timeout`**
+  （`PATCH /admin/deployments/:id` → 重新 publish），不是等重试。
+- 建连超时只影响「还没连上」的请求：连接已建立后，流的存活只看
+  `request_timeout`（长 SSE 流不会被 `connect_timeout` 截断）。
+- **建连超时的当前口径是保守的**：传输层把它归入「上游执行状态未知」，
+  请求进核对（保留预占）、**绝不盲目重放到下一候选** —— 这是仓库的核心
+  钱账安全约束（不确定是否已执行的上游请求不得重放）。因此把
+  `connect_timeout` 配得过小会让请求**停在核对**而不是干净地切换候选；
+  运维配这个值时按「宁可配大一点」处理。若要让建连超时可切换候选，需要
+  单独任务（改的是执行状态判定，不是超时口径）。
+
+## 发布预演（`POST /admin/catalog/publish?dry_run=1`）
+
+预演与正式发布**共用同一套抽取与校验、同一事务快照**，差别只有「写不写库」。
+正式发布**不跑任何探测**、**不引入网络依赖**。
+
+### 报告结构
+
+| 段 | 回答什么 |
+|---|---|
+| `would_publish` | 候选集摘要：`active_deployments` 是**真正会承接流量**的部署数；`disabled_providers` / `deployments_behind_disabled_providers` 如实汇总停用的 provider 与被它带走的部署 |
+| `probes[]` | 每条**会生效**部署的探测结论（语义见下节） |
+| `issues[]` | 发布前**可判定**的问题：`severity=blocker` 是配置问题，`severity=hint` 是网络探测提示 |
+| `summary` | 判定摘要：探测结论分桶 + blocker/hint 计数 + `all_probes_ok` |
+
+### 停用 provider 的部署既不算 active，也不被探测
+
+`PATCH /admin/providers/:id`（`status=disabled`）→ 重新 publish 后，该 provider
+及其**全部**部署退出轮转。预演因此：
+
+- **不**把它们算进 `would_publish.active_deployments`；
+- **不**对它们出站探测（一条永远不会承接流量的部署不值得一次外呼）；
+- 在 `issues[]` 里给一条 `provider_disabled`（**blocker**）；
+- `would_publish.disabled_providers` 如实给出停用 provider 的数量。
+
+> 这是 T3 携带到 T9 的必修发现：预演此前只按 deployment 状态过滤，把停用
+> provider 背后的部署当成「会生效」并真的探测。
+
+### 问题分类：可行动的配置发现 vs 网络探测提示
+
+**整份 `issues` 清单都是 advisory**：预演报告**不**参与正式发布的判定。
+正式发布**不读**这份报告。
+
+| severity | 含义 | code |
+|---|---|---|
+| `blocker` | **可行动的配置 / 可用流量发现**：发布这份目录后，某个模型/路由**跑不起来**。要么修好再发，要么明确接受 | `provider_disabled`、`deployment_no_account`、`route_capabilities_narrowed`、`model_not_dispatchable` |
+| `hint` | **网络探测提示**：advisory，也**不代表**模型故障 | `probe_failed`、`probe_unsupported`、`probe_unconfirmed`、`account_inventory_unavailable` |
+
+- `deployment_no_account`：该 provider **没有可用上游账号** → 这条路由无法
+  出站（可判定的事实，不是猜测）。
+- `account_inventory_unavailable`：账号清单**读不到** → 该判定被**跳过**，
+  报告说「未知」，**绝不**谎称「无账号」。此时
+  `summary.account_inventory_checked` 为 **false**（它表示「无账号判定对
+  每个 provider 都真的做了」，**不是**「读过一次」）。
+- `route_capabilities_narrowed`：路由的能力清单收窄了模型声明的能力（存量
+  非空清单常常不含 `image`）→ 带图请求在**准入前**被 400 拒绝。
+- `model_not_dispatchable`：模型在这次发布后**没有任何可调度路由**。
+
+**真正会拒绝发布的是共享发布闸的硬校验**：草稿里**不支持**的策略/路由配置
+（不在支持集的 `pool_strategy`、词表外的路由 `capabilities`）由**发布闸**
+拒绝 —— 预演与正式发布给出**同一个错误**（点名对象 ID 与替代配置，
+HTTP 400），因此它出现在**错误**里而不是 200 报告里。
+
+**HTTP 200 + 一条 `blocker` ≠ 正式发布会被拒**：本期**不为** `blocker` 类
+发现加硬闸。停用 provider / 无账号 / 能力收窄由目录发布态与调度判定负责
+（停用的 provider 本来就不会承接流量），预演只负责把它们**如实说出来**，
+由运营决定修还是接受。
+
+### HTTP 200 不等于每个 probe.ok 都是 true
+
+200 只说明「预演报告生成成功」。逐条结论看 `probes[].probe_outcome`，汇总看
+`summary`（`probes_ok` / `probes_failed` / `probes_unsupported` /
+`probes_unconfirmed` / `all_probes_ok`）。
+
+## 上游连通性探测（`POST /admin/deployments/:id/probe`）
+
+只读、零写库、**默认零付费**：探测读的是供应商的**模型列表端点**
+（`GET {base_url}/models`），不是推理端点。
+
+### 三件事必须分开看
+
+| 维度 | 字段 | 取值 |
+|---|---|---|
+| 凭据**材料**测试 | `credential_state` | `decrypted` / `missing` / `unusable` |
+| **指定**连通性探测 | `probe_method` + `probe_outcome` | `connectivity`+`verified` / `failed` / `unsupported` / `unconfirmed` |
+| 本次**没有**做真实推理 | `inference_verified` | 恒为 `false` |
+
+- `ok=true` **只**表示「这条部署的上游连通」，**绝不**表示「模型答过」——
+  本次没有发起任何推理（`inference_verified=false` 显式发布出来，免得被
+  读成「模型健康」）。
+- **供应商不提供 `/models`** 时结论是 `unsupported`：此探测方式**无法确认**，
+  **不是**模型故障（`base_url` 缺一段路径也会得到同样的 404 —— 两者在报告里
+  都说清楚，运营据 `status=404` 与文案一起判断）。
+- 没得到任何答复（DNS 失败、拒绝、超时、egress 拒绝、凭据不可用、探测没跑）
+  一律是 `unconfirmed`。
+
+### 鉴权/版本头按协议设置
+
+与**派发路径同一个适配器**的同一份鉴权规则：
+
+| 协议 | 探测头 |
+|---|---|
+| `openai_chat` / `openai_responses` | `Authorization: Bearer <access token 或静态密钥>` |
+| `anthropic_messages` | `x-api-key: <静态密钥>` + `anthropic-version: 2023-06-01` |
+
+部署 `config.headers` 中的自定义头也用于探测（与实际派发一致）。
+非法结构或试图覆盖网关认证/追踪保留头的配置在出站前拒绝；不要通过
+覆盖 `Authorization`、`x-api-key` 或 `X-Request-ID` 注入凭据。
+
+- OAuth 凭据在 OpenAI 兼容协议上走 bearer，且**只有 access token** 出边界
+  （密封闭包与 refresh token 永远不出 credentials 包）。
+- **`anthropic_messages` + OAuth 是明确不支持的组合**：出站前拒绝，绝不把
+  OAuth 令牌塞进 API-key 槽。该协议的支持集里没有 OAuth 供应商（仓库自有的
+  OAuth 连接器说 OpenAI 兼容协议；Anthropic 官方 claude.ai OAuth 需要本部署
+  不发的 `anthropic-beta` 头）。
+
+## 运行告警（复用现有结构化日志；未引入新监控平台）
+
+仓库唯一的监控通道是**结构化日志行**（`log.Printf`）。下表是本期明确化的
+四类运行告警 —— 每类都给出**可 grep 的稳定前缀**，运维按前缀配告警规则即可。
+
+| 告警 | 日志前缀 | 触发条件 | 处置 |
+|---|---|---|---|
+| **非幂等结算冲突** | 网关侧**只有**这三条带原因词：`ALARM gateway: settlement_mismatch` / `ALARM gateway: ledger_drift` / `ALARM gateway: late_usage_after_release`（另有 `ALARM gateway: request … charge … exceeds hold …` 的超额告警） | 同一请求的**重复结算金额不一致**、账本无 charge 行、已终态请求收到晚到用量 —— 这些**不是**幂等重投，绝不当成功吞掉 | 请求进入专门核对（`inference_reconciliation_jobs`），**只叫人**；人工处置见 `GET /admin/model-usage/exceptions?kind=settlement_backlog` → 每个任务的 `reason` |
+| **缺预占 / 预占漂移**（与上一行**同一族**，但**没有** `ALARM gateway:` 前缀） | 网关打的是 `gateway: settlement failed for <request id>: … — parking in reconciliation`（**行里没有原因词**）；另有一条 `ERROR gateway: settlement failed for request <id>: … (parked for reconciliation)` | 预占数与准入不符（`reservation_drift`）、缺预占（`missing_reservation`）、消费事实未知（`unknown_usage`）—— 请求被**停放**（绝不记零），不是终态异常。**停放 ≠ 全部释放**：只有**只能人工处理**的原因（`missing_reservation` / `reservation_drift` / `insufficient_evidence` 等）才把在途**速率**预占处置为 `anomaly`；证据驱动的原因（`unknown_usage` / `crash_recovery`）**保留速率预占**等恢复结算 | **按原因查**，不要按日志前缀查：`GET /admin/model-usage/exceptions?kind=settlement_backlog` 的 `reason` 字段（`reservation_drift` / `missing_reservation` / `unknown_usage` / …）。**网关从不为这两个原因打带 `ALARM gateway:` 前缀的行** —— 该前缀只属于上一行那三条终态异常。停放之后各类预占的处置边界见下节 |
+| **未知用量积压** | `ALARM inference recovery: unknown-usage backlog` | 消费事实未知的请求积压 **≥ 10** | 这些请求按**保守估算**入账（绝不静默记零），真实用量要靠人核对；按 `usage_status='unknown'` 查请求，逐笔核对。**阈值目前是代码内的常量（默认 10）**：服务端**没有**暴露 env/config 旋钮，运维改不了它（详见下方说明） |
+| **限速存储失败** | `ALARM quota: rate limit store unavailable` | 限速闸门的存储不可用（**不是**限速拒绝） | 准入 **fail-closed**（503 `service_unavailable`，绝不回退成单机放行）；修存储后自动恢复。正常的限速拒绝**不打**这条告警（否则告警会被噪声淹没） |
+| **不支持存量配置** | `UNSUPPORTED_POOL_STRATEGY model=… routes=… strategies=…` + `AUDIT_ALERT` | 已发布快照里存在支持集外的 `pool_strategy`（存量脏配置） | 该路由被标记**不可调度**（绝不静默当 `round_robin`）；模型还有别的可调度路由时正常服务，全部不支持时客户请求在**预占前** 503 `upstream_unavailable`（Anthropic 面 529）。修法：把路由的 `pool_strategy` 改成 `round_robin` 再 publish |
+
+终态结算异常的核对任务在 `detail.settlement_evidence` 中保留版本化的
+`observations`，以内容 SHA-256 为键。每条包含收到的 attempt、用量来源、
+五个可空的规范化 token 桶、原始 usage、固定价格版本和计费单位。
+普通 JSON 对象的键顺序和投递时间不产生新候选；不同证据和并发投递合并保留，
+worker 刷新任务详情也不会覆盖已有候选。重复 JSON 键、畸形 JSON 和 JSONB
+不支持的 Unicode/数字保留在 `raw_usage_text`；无效 UTF-8 或实际 NUL 字节
+用 `raw_usage_base64` 无损存储。合法且可表示的 usage 仍在 `raw_usage`。
+此保留规则适用于已判定的终态冲突；现有 JSONB 相等判定仍可能把仅增加重复键、
+但其余字段完全相等的投递视为幂等重投，不产生新的待核对候选。
+这些只是**待核对证据**，不等于权威 usage revision，不会自动更改已入账金额、
+TPM 或请求终态，也不补齐尚未实现的钱包更正和生产更正调用方。
+出现 `ERROR gateway: anomaly …` 时仍须处理记录失败告警，不能把报警钩子触发
+或已有任务当作本次证据一定写入成功。
+
+### 停放之后的预占处置边界（迁移 054）
+
+停放**不等于**所有预占都释放。按停放原因分两类（判据是核对任务的
+`reason`，见 `internal/inference/postgres/reconciliation_reasons.go` 的
+`ManualOnlyReconciliationReasons`）：
+
+| 停放原因 | 类别 | 在途**速率**预占 | 金额窗口 / Key / 钱包预占 | 告警与核对证据 | 真实消费 |
+|---|---|---|---|---|---|
+| `missing_reservation` / `reservation_drift` / `insufficient_evidence` 等 | **只能人工处理** | **转 `anomaly`**（与停放同一事务）：**退出实时 TPM 求和** | **仍在**：不结算、不释放，账本没有 charge | 核对任务原因与 `request.last_error` 不变；速率行上留 `anomaly_reason` / `anomaly_at` | 仍**未知**（既不是「确认零消费」的 `released`，也不是「已知用量」的 `settled`） |
+| `unknown_usage` / `crash_recovery` | **证据驱动** | **保留** `reserved`：等恢复 worker 按保守估算结算 | 仍在 | 证据窗口继续等真实证据冲正 | 未知（恢复 worker 结算后按估算入账） |
+
+为什么只有人工类原因才处置：一个**永远不会被结算**的异常预占若继续停在
+`reserved`，会永久占着账户的 TPM 额度（账户被永久 429 拦住，且没有任何路径能
+把它取回来）。人工类原因按定义就结不成，因此把它的速率预占显式处置为
+`anomaly`；证据驱动的原因恢复 worker 会结算它，额度**不能提前归还**。
+
+- **RPM 事实保留**：行还在、`counted_at` 不变，一次逻辑请求仍然计 1 次
+  （RPM 计数不看 state）。
+- `anomaly` 是**终态**：保留期清理像删除其它终态行一样回收它（滞留行不再无限
+  增长）；若该请求后来真的结算，速率行被提升为 `settled`（按**实际**归一化
+  token），异常痕迹保留；针对未解决 anomaly 行的 token 预算修正会**显式冲突**
+  失败，不会悄悄改写。
+
+**三类告警的稳定前缀不是同一族**：`ALARM gateway: …`（网关的终态异常）、
+`ALARM inference recovery: …`（恢复 worker 的期限/账本/积压）、
+`ALARM quota: …`（限速存储故障）。配规则时按**前缀族**分别配置，不要假设
+一个前缀能覆盖另一族。
+
+**未知用量积压阈值目前是「代码内常量」**：`RecoveryConfig.UnknownUsageAlarmThreshold`
+的缺省值是 **10**，而**服务端没有把它接到任何 env / 配置项**上 —— 因此
+运维**无法**在运行期调整它，也没有对应的 env 旋钮（本期不新增）。想改
+阈值只能改代码重新部署；把该字段设成负数会**关闭**这条告警，但那只对
+**自建嵌入**与**测试**有意义，生产服务端永远走缺省值 10。
+
+另有两类**期限/账本**告警沿用既有前缀：`ALARM inference recovery:
+reconciliation job … past deadline`（核对任务超期升级）与
+`ALARM inference recovery: ledger mismatch window …`（账本重建差异）。

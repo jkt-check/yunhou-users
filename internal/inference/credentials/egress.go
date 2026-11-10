@@ -229,7 +229,16 @@ func (v *EgressValidator) DialContext(ctx context.Context, network, addr string)
 	if err != nil {
 		return nil, fmt.Errorf("egress dial: split host/port %q: %v", addr, err)
 	}
-	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	// T7：建连预算由 deployment.connect_timeout 决定（未声明时用 10s 的
+	// 默认值）。DNS 解析与 TCP 建连都在这个截止时间之内 —— 出站 IP 校验
+	// 本身不变（校验通过才拨号）。
+	timeout := domain.ConnectTimeoutFrom(ctx)
+	if timeout <= 0 {
+		timeout = domain.DefaultConnectTimeout
+	}
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	d := &net.Dialer{KeepAlive: 30 * time.Second}
 	allowed := func(host string, ip netip.Addr) (string, bool) {
 		ip = ip.Unmap()
 		if reason := blockedReason(ip); reason != "" && !v.allowlistEntry(host, []netip.Addr{ip.WithZone("")}) {
@@ -241,9 +250,9 @@ func (v *EgressValidator) DialContext(ctx context.Context, network, addr string)
 		if reason, ok := allowed(host, ip); !ok {
 			return nil, fmt.Errorf("egress dial: %s is blocked (%s)", ip.Unmap(), reason)
 		}
-		return d.DialContext(ctx, network, addr)
+		return d.DialContext(dctx, network, addr)
 	}
-	ips, err := v.resolve(ctx, host)
+	ips, err := v.resolve(dctx, host)
 	if err != nil || len(ips) == 0 {
 		return nil, fmt.Errorf("egress dial: host %q does not resolve: %v", host, err)
 	}
@@ -253,7 +262,7 @@ func (v *EgressValidator) DialContext(ctx context.Context, network, addr string)
 			lastErr = fmt.Errorf("egress dial: host %q resolves to %s (%s) — blocked", host, ip.Unmap(), reason)
 			continue
 		}
-		conn, derr := d.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+		conn, derr := d.DialContext(dctx, network, net.JoinHostPort(ip.Unmap().String(), port))
 		if derr == nil {
 			return conn, nil
 		}

@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -92,12 +93,16 @@ type chatCompletionsRequest struct {
 	StreamOptions       json.RawMessage   `json:"stream_options"`
 	ThinkingEnabled     *bool             `json:"thinking_enabled"`
 	Thinking            json.RawMessage   `json:"thinking"`
-	Temperature         *float64          `json:"temperature"`
-	TopP                *float64          `json:"top_p"`
-	Stop                json.RawMessage   `json:"stop"`
-	PresencePenalty     *float64          `json:"presence_penalty"`
-	FrequencyPenalty    *float64          `json:"frequency_penalty"`
-	Seed                *int64            `json:"seed"`
+	// ReasoningEffort is the explicit reasoning-effort level (OpenAI
+	// chat-completions knob). T8: the level travels verbatim to the
+	// upstream — it is never folded into another level.
+	ReasoningEffort  string          `json:"reasoning_effort"`
+	Temperature      *float64        `json:"temperature"`
+	TopP             *float64        `json:"top_p"`
+	Stop             json.RawMessage `json:"stop"`
+	PresencePenalty  *float64        `json:"presence_penalty"`
+	FrequencyPenalty *float64        `json:"frequency_penalty"`
+	Seed             *int64          `json:"seed"`
 
 	// Capability fields we do not serve; any non-null value rejects the
 	// request explicitly rather than silently degrading it.
@@ -200,6 +205,19 @@ func parseChatCompletions(body []byte) (*providers.ChatRequest, error) {
 		if len(trimmed) == 0 || trimmed[0] != '{' {
 			return nil, invalidField("tools", "invalid tool definition")
 		}
+		// T8: 服务端工具（web_search / computer / code_execution / mcp …）
+		// 没有执行面，也没有计量保护 —— 明确拒绝，绝不透传给上游让它
+		// 代跑。只有 function 工具是本入口支持集。
+		var tool struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(trimmed, &tool); err != nil {
+			return nil, invalidField("tools", "invalid tool definition")
+		}
+		if tool.Type != "" && tool.Type != "function" {
+			return nil, invalidField("tools",
+				"server-side tool type "+tool.Type+" is not supported by this gateway")
+		}
 		toolBytes += len(trimmed)
 	}
 	if toolBytes > 256<<10 {
@@ -225,19 +243,30 @@ func parseChatCompletions(body []byte) (*providers.ChatRequest, error) {
 	if len(wire.ToolChoice) > 0 && string(wire.ToolChoice) != "null" {
 		req.ToolChoice = wire.ToolChoice
 	}
-	// thinking: accept kaya's thinking_enabled bool and DeepSeek's
-	// thinking object ({"type":"enabled"}).
-	if wire.ThinkingEnabled != nil {
-		req.ThinkingEnabled = wire.ThinkingEnabled
-	} else if present(wire.Thinking) {
+	// Validate every supplied object before selecting the boolean override.
+	if present(wire.Thinking) {
 		var th struct {
 			Type string `json:"type"`
 		}
-		if err := json.Unmarshal(wire.Thinking, &th); err != nil {
-			return nil, invalidField("thinking", "invalid thinking parameter")
+		if err := json.Unmarshal(wire.Thinking, &th); err != nil ||
+			(th.Type != "enabled" && th.Type != "disabled") {
+			return nil, invalidField("thinking", "thinking.type must be enabled or disabled")
 		}
 		on := th.Type == "enabled"
 		req.ThinkingEnabled = &on
+	}
+	if wire.ThinkingEnabled != nil {
+		req.ThinkingEnabled = wire.ThinkingEnabled
+	}
+	// T8: reasoning_effort 是显式档位 —— 逐字保留，不折成别的档位。
+	// 不在词汇表里的值明确拒绝（出站前），绝不静默忽略。
+	if wire.ReasoningEffort != "" {
+		if !domain.ValidReasoningEffort(wire.ReasoningEffort) {
+			return nil, invalidField("reasoning_effort",
+				"unsupported reasoning effort: "+wire.ReasoningEffort+
+					" (supported: "+strings.Join(domain.SupportedReasoningEfforts(), ", ")+")")
+		}
+		req.ReasoningEffort = wire.ReasoningEffort
 	}
 	// Sampling passthrough allowlist (adapters map or reject per protocol).
 	passthrough := map[string]any{}
@@ -401,6 +430,18 @@ func writeV1DomainError(c *gin.Context, err error) {
 		return
 	}
 
+	// 速率拒绝（Task 4）：独立的 429 语义 —— 绝不与金额 quota_exceeded
+	// 混用（后者会触发钱包 fallback）。Retry-After 只在每个阻断约束都
+	// 有可确定恢复时刻时给出。
+	var rle *domain.RateLimitError
+	if errors.As(err, &rle) {
+		if rle.RetryAfterSeconds > 0 {
+			c.Header("Retry-After", strconv.Itoa(rle.RetryAfterSeconds))
+		}
+		v1Error(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limited", safeMsg(err))
+		return
+	}
+
 	switch domain.CodeOf(err) {
 	case domain.CodeInvalidKey:
 		v1Error(c, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid, revoked or expired API key")
@@ -418,8 +459,14 @@ func writeV1DomainError(c *gin.Context, err error) {
 		v1Error(c, http.StatusTooManyRequests, "rate_limit_error", string(domain.CodeOf(err)), safeMsg(err))
 	case domain.CodeUnpricedCapability:
 		v1Error(c, http.StatusForbidden, "permission_error", "unpriced_capability", safeMsg(err))
+	case domain.CodeUpstreamResponseInvalid:
+		v1Error(c, http.StatusBadGateway, "server_error", "upstream_response_invalid", safeMsg(err))
 	case domain.CodeUpstreamUnavailable:
 		v1Error(c, http.StatusServiceUnavailable, "server_error", "upstream_unavailable", safeMsg(err))
+	case domain.CodeServiceUnavailable:
+		// 存储不可用（速率/额度闸门失联）：明确的服务错误，绝不伪装成
+		// 用户额度耗尽（fail closed）。
+		v1Error(c, http.StatusServiceUnavailable, "server_error", "service_unavailable", safeMsg(err))
 	case domain.CodeConflict:
 		v1Error(c, http.StatusConflict, "invalid_request_error", "conflict", safeMsg(err))
 	default:
@@ -431,10 +478,16 @@ func writeV1DomainError(c *gin.Context, err error) {
 // quotaExceededDetails renders the shared quota message and the Retry-After
 // seconds (0 = unknown recovery — 不能编造倒计时). All three protocol
 // surfaces (chat/messages/responses) render the same 429 detail.
+//
+// The Key budget is a CUMULATIVE constraint (budget_micros 永不按周期清零,
+// 只在账务更正时回退) — a window reset can never lift it. So a request
+// blocked by the Key budget has NO determinable recovery instant: promising
+// the window's reset would send the client into a retry loop that cannot
+// succeed (设计 §9.1: 只有全部阻断条件可确定时才提供可信的重试时刻).
 func quotaExceededDetails(qe *domain.QuotaExceededError) (message string, retryAfterSecs int) {
 	message = "quota exceeded"
 	kinds := ""
-	allKnown := len(qe.BlockedBy) > 0
+	allKnown := len(qe.BlockedBy) > 0 && !qe.KeyBudgetExhausted
 	var reset time.Time
 	for i, b := range qe.BlockedBy {
 		if i > 0 {

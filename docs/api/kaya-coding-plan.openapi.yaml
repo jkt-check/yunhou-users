@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Kaya Coding Plan — 客户控制台 API（yunhou-users）
-  version: 0.13.0
+  version: 0.14.0
   description: |
     Kaya Coding Plan（独立模型 API 套餐）客户侧契约，供 Website 客户控制台对接。
     本文件与 `internal/inference/httpapi/{user_api_keys,user_quotas,user_usage,
@@ -470,6 +470,10 @@ paths:
           价格后走 `POST /admin/catalog/publish` 发布。停用上游不删除历史
           路由记录（删除接口不触碰既有请求/尝试行）。
         - 每次 commit 追加审计（`catalog.bulk_import`，人员及服务双重归因）。
+        - 派生路由的 `pool_strategy` 恒为 `round_robin`（常规池唯一支持的
+          策略）：导入文档没有 pool_strategy 字段，未知字段一律 400；正式
+          publish 的发布闸同样只接受 `round_robin`（发布预演 `?dry_run=1`
+          给出同一个错误并点名路由 ID 与替代配置）。
       operationId: bulkImportCatalog
       responses:
         "200": { description: dry-run 预演 / 幂等重放（replayed=true） }
@@ -598,9 +602,174 @@ paths:
         权益数（`affected_accounts_kept_on_old`——权益钉住
         policy_version_id，新版本只影响新发权益；旧订阅保留版本恒 true）。
         策略版本按权益发放钉住，不存在全局生效时刻。
+
+        **overage_policy 支持集**：只有 `reject`（默认，额度耗尽即停）与
+        `allow_overage`（套餐外消费，走钱包）。`clamp_if_declared` **未实现**
+        （依赖客户端显式声明字段，本期协议层没有该字段）—— 预演与正式写
+        一致地拒绝它（400）。存量策略行仍可查询；引用到该模式的新推理明确
+        报「策略配置不可用」（503 `service_unavailable`），绝不静默当
+        `reject`。迁移步骤见
+        `docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」。
       operationId: previewQuotaPolicy
       responses:
         "200": { description: 影响预览 }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/routes/{route_id}:
+    patch:
+      tags: [model-admin]
+      summary: 部分更新模型路由（models:manage）
+      description: |
+        只覆盖提供的字段；可变字段省略或 `null` 保持原值，显式 `0`、`false`、`[]` 不被忽略，
+        仍须通过字段校验（例如 `weight` 必须大于 0）。
+        `capabilities=[]` 表示不收窄路由能力，不是禁用路由。
+        `model_id` / `deployment_id` 不可通过 PATCH 改绑。
+        必须带读取路由时获得的非零 `updated_at`（完整保留时间精度）和非空
+        `reason`；缺失/零版本为 400，版本过期为 409，失败不写路由或审计。
+        写入只修改草稿目录，发布后才影响新请求。
+        鉴权要求同一 app 的人员 JWT 与服务凭据，角色须具备 `models:manage`。
+      operationId: updateModelRoute
+      security:
+        - BearerAuth: []
+          InternalAppID: []
+          InternalAppSecret: []
+      parameters:
+        - { name: route_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [updated_at, reason]
+              properties:
+                priority: { type: integer, nullable: true }
+                weight: { type: integer, minimum: 1, nullable: true }
+                capabilities:
+                  type: array
+                  nullable: true
+                  items: { type: string, enum: [tools, reasoning, image] }
+                pool_strategy: { type: string, enum: [round_robin], nullable: true }
+                enabled: { type: boolean, nullable: true }
+                updated_at: { type: string, format: date-time }
+                reason: { type: string, minLength: 1, description: 不允许纯空白 }
+      responses:
+        "200": { description: 更新后的完整路由（envelope data，含新的 updated_at） }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: 路由已被并发修改；重新读取后合并修改再提交 }
+
+  /admin/deployments/{id}/probe:
+    post:
+      tags: [model-admin]
+      summary: 上游连通性探测（models:read；只读、零写库、默认零付费）
+      description: |
+        对一条部署的上游发一次**只读**探测：`GET {base_url}/models`。
+
+        **三件事必须分开看**（读响应里的三个字段）：
+        - `credential_state` —— **凭据材料测试**：`decrypted`（材料解开且
+          可用）/ `missing`（该 provider 没有可用凭据）/ `unusable`（有
+          凭据但材料解不开）。它与「探测成功」无关。
+        - `probe_method` / `probe_outcome` —— **指定探测**做了什么、结论是
+          什么：`connectivity` + `verified`（连通性已确认）/ `failed`（端点
+          存在但没成功）/ `unsupported`（**供应商不提供该端点**，此探测方式
+          无法确认——**不是**模型故障，也**不是**推理成功）/ `unconfirmed`
+          （没得到任何答复：传输错误、超时、凭据不可用、探测没跑）。
+        - `inference_verified` —— **恒为 false**：本探测**从不**发起真实
+          推理（默认不触发付费推理）。`ok=true` 只表示「这条部署的上游
+          连通」，绝不表示「模型答过」。
+
+        **鉴权/版本头按协议设置**（与派发路径同一个适配器）：
+        `openai_chat` / `openai_responses` 走 `Authorization: Bearer`；
+        `anthropic_messages` 走 `x-api-key` + `anthropic-version`。
+        `anthropic_messages` + OAuth 凭据是**明确不支持**的组合：出站前
+        拒绝，绝不把 OAuth 令牌塞进 API-key 槽。
+        探测同时复用该部署 `config.headers` 的自定义请求头；与派发一致，
+        非法结构或覆盖认证/追踪边界的保留头在出站前拒绝。
+
+        失败一律 in-band（HTTP 200 + `ok:false`）；只有「部署不存在」这类
+        硬错误才走 envelope。`error_summary` 永不包含凭据材料。
+      operationId: probeDeployment
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: 探测结论（advisory）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ProbeResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/catalog/publish:
+    post:
+      tags: [model-admin]
+      summary: 发布目录（models:manage）；?dry_run=1 为发布预演
+      description: |
+        `?dry_run=1` 是**发布预演**：与正式发布**同一套抽取与校验**、同一
+        事务快照，**一行不写**（零 revision、零审计事件），并给出：
+
+        - `would_publish` —— 候选集摘要。`active_deployments` 是**真正会
+          承接流量**的部署数（部署 active **且**其 provider 未停用）——
+          停用 provider 背后的部署**不算**，也**不**被探测（T3 的发布态
+          语义）。`disabled_providers` / `deployments_behind_disabled_providers`
+          如实汇总停用的 provider 与被它带走的部署。
+        - `probes[]` —— 每条会生效部署的探测结论（语义见
+          `POST /admin/deployments/{id}/probe`）。
+        - `issues[]` —— 发布前**可判定**的问题（**advisory**：预演报告
+          **不**参与正式发布的判定）。
+          - `severity=blocker` = **可行动的配置 / 可用流量发现**：发布
+            这份目录后，某个模型或路由**跑不起来**（`provider_disabled` /
+            `deployment_no_account` / `route_capabilities_narrowed` /
+            `model_not_dispatchable`）。它**不阻断**正式发布 —— 正式发布
+            **不读这份报告**，由它自己的硬校验决定。运营要么修好再发，
+            要么明确接受。
+          - `severity=hint` = **网络探测提示**（`probe_failed` /
+            `probe_unsupported` / `probe_unconfirmed` /
+            `account_inventory_unavailable`）：advisory、**不阻断**发布，
+            也**不代表**模型故障。
+        - `summary` —— 判定摘要（探测结论分桶 + blocker/hint 计数）。
+
+        **HTTP 200 只说明预演报告生成成功**：它**不等于**每个 `probe.ok`
+        都是 true（看 `summary.all_probes_ok` 与逐条 `probe_outcome`）；
+        **HTTP 200 + 一条 `blocker` 也不等于正式发布会被拒**（见下）。
+
+        **真正会拒绝发布的是共享发布闸的硬校验**：草稿里**不支持**的策略/
+        路由配置（不在支持集的 `pool_strategy`、词表外的路由
+        `capabilities`）由**发布闸**拒绝 —— 预演与正式发布给出**同一个
+        错误**（点名对象 ID 与替代配置，HTTP 400），因此它出现在**错误**
+        里而**不是** 200 报告里。本期**不为** `blocker` 类发现加硬闸：
+        停用 provider / 无账号 / 能力收窄这些由目录发布态与调度判定负责，
+        预演只负责把它们**如实说出来**。
+
+        正式发布（不带 `dry_run`）**不跑任何探测**，也不引入网络依赖。
+      operationId: publishCatalog
+      parameters:
+        - { name: dry_run, in: query, schema: { type: string, enum: ["1", "true", "yes"] } }
+        - { name: reason, in: query, required: true, schema: { type: string, description: 运营理由（审计必填） } }
+      responses:
+        "200":
+          description: 正式发布返回新 revision；dry_run 返回预演报告
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        oneOf:
+                          - type: object
+                            properties:
+                              revision: { type: integer }
+                          - $ref: "#/components/schemas/PublishDryRunReport"
         "400": { $ref: "#/components/responses/InvalidInput" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -751,9 +920,14 @@ paths:
         `temperature`/`top_p`/`top_k`/`stop_sequences`、`metadata`
         （接受但不消费）。
         **明确 400**：`image`/`document` 块、服务端工具类型
-        （web_search/computer/bash/code_execution/mcp 等）、其余未知内容块。
-        **接受不回放**：历史 `thinking`/`redacted_thinking` 块、
-        `tool_result.is_error` 标志、`cache_control` 提示。
+        （web_search/computer/bash/code_execution/mcp 等）、其余未知内容块、
+        `thinking.type=enabled`、历史 `thinking`/`redacted_thinking` 块
+        （T8 兼容性修正：签名思考无法忠实回放 —— 旧行为是「接受后丢弃」；
+        本面也不产出思考块：Anthropic 的 thinking 块必须带原生 signature，
+        网关不伪造空 signature，也不建立通用无损原生透传层）。
+        **接受但不消费**：`tool_result.is_error` 标志、`cache_control` 提示。
+        历史 `tool_use.input` 必须是完整 JSON 对象，缺失、null、标量或数组
+        均 400。对象数字保留精度；不将缺失或非法参数补成 `{}`。
 
         响应：`type=message` 原生形状（`usage.input_tokens` 不含
         cache_read，cache 桶单列）。流式事件序列 `message_start →
@@ -761,6 +935,9 @@ paths:
         `message_start.usage` 为协议占位（0/0），真实值在终止
         `message_delta.usage`（含 input_tokens）。上游中断注入
         `event: error` 后结束，绝不伪造 `message_stop`。
+        上游工具参数为空、截断或非对象，以及多 choice 输出，明确拒绝：
+        非流式 502；流式只发一次原生错误，不发成功终态，继续读取晚到 usage。
+        `content_block_start.input:{}` 是占位，不是生成参数。
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -810,10 +987,52 @@ paths:
               schema:
                 $ref: "#/components/schemas/AnthropicError"
         "429":
-          description: rate_limit_error（额度耗尽;可计算恢复时刻时带 Retry-After）
+          description: |
+            rate_limit_error（业务速率限制：`rate_limited` = 账户/策略/Key 的
+            RPM 或账户级 TPM 上限；`quota_exceeded` = 额度耗尽；
+            `insufficient_capacity` = 并发上限（账户级权益策略上限、Key 级
+            `concurrency_limit` 或上游账号容量）已满。
+
+            **Anthropic 原生错误形状没有 `code` 字段**：业务区分落在
+            `error.message`（`rate limit exceeded: blocked by …` /
+            `quota exceeded: blocked by …` / `… at concurrency limit …`）。
+            外围每 IP 防滥用桶的拒绝同样是本形状（`rate_limit_error`）。
+
+            **Retry-After 只在每个阻断条件都有可确定恢复时刻时给出**：Key 的
+            累计预算（`budget_micros`，不按周期清零）是永久阻断项 —— 它与
+            窗口同时阻断时**不带** Retry-After（窗口重置解不开它）。
           headers:
             Retry-After:
               schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "502":
+          description: |
+            api_error（非流式上游文本出现在工具调用之后，无法忠实保序；
+            或 Responses 上游返回无法忠实翻译的 refusal / status=failed；
+            或 incomplete 原因缺失、null、为空或未知；
+            或 Chat 上游返回非 null refusal，包括空字符串；
+            或工具参数不是完整 JSON 对象，或上游含多个 choice）。
+            请求已执行：按已报 usage 或完整输出估算结算，不重放、不切换上游，
+            不返回改写后的答案，也不保存响应链。
+            Chat refusal 的流式转换只发一次原生错误，无后续内容或成功终态，
+            继续读取晚到 usage；裸 EOF 且无 usage 时保留预占并挂起核对。
+            Responses 流式终止事件与非空对象状态冲突也拒绝。真实上游错误、
+            失败对象或读取错误优先于完整拒绝证据，后来的终止事件不能恢复它；
+            无 usage 时继续冻结金额/TPM 预占并挂起核对。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnthropicError"
+        "503":
+          description: |
+            service_unavailable（准入存储不可用：网关 fail closed 拒绝新推理，
+            绝不伪装成用户额度耗尽）/ upstream_unavailable（已发布目录里该模型
+            没有可调度路由 —— 例如其路由带着**未实现**的 pool_strategy；
+            运营修好目录并重新 publish 后恢复。请求在预占前失败：零计费、
+            零出站）
           content:
             application/json:
               schema:
@@ -835,7 +1054,7 @@ paths:
 
         **支持的请求子集**：`model`（必填）、`input`（字符串或 items：
         message（input_text/output_text）、function_call、
-        function_call_output；reasoning 项接受但不回放）、`instructions`、
+        function_call_output；reasoning 项 400）、`instructions`、
         `max_output_tokens`、`stream`、`store`（缺省 true）、
         `previous_response_id`、`tools`（仅 function 类型）、
         `tool_choice`（auto/none/required/指定 function）、
@@ -844,12 +1063,23 @@ paths:
         **明确 400**：`input_image`/`input_file` part、服务端工具类型与
         其结果项（web_search_call 等）、`item_reference`、`background:true`、
         非空 `include`、`max_tool_calls`、`truncation:auto`（服务端静默
-        裁剪上下文违反不静默原则）、`text.format` ≠ text。
+        裁剪上下文违反不静默原则）、`text.format` ≠ text、`input` 里的
+        `reasoning` 项（T8 兼容性修正：推理项没有可回放的加密载荷 —— 旧
+        行为是「接受后丢弃」）。
+        `reasoning.effort` 的档位（low/medium/high/xhigh）**逐字**透传给
+        能表达该档位的上游协议；词表外的档位明确 400。
+        输出 `function_call.arguments` 原样保留，包括空字符串和截断 JSON，
+        不补成 `{}`。输入回放要求有效 JSON（允许 null/标量/数组），
+        空字符串或非法 JSON 明确 400。
 
-        **会话链**：成功响应（store≠false）持久化完整 transcript（24h
-        TTL,≤512 KiB）;引用 `previous_response_id` = 上下文回放 + 粘性
-        绑定同一上游账号,账号失效显式迁移(不静默换号)。引用不存在/过期/
-        他人/store:false 的响应一律 404 `previous_response_not_found`。
+        **会话链**：成功响应（store≠false）仅在完整输入/输出 transcript
+        可忠实回放且≤4 MiB 时持久化（24h TTL）。工具调用后、工具结果前
+        仍有 assistant 文本等不可保序历史不落链、不建立新会话绑定；
+        流式输出顺序、成功终态、usage 和结算不变，已有父链不受影响。
+        空或非法工具参数同样不落可引用会话链。
+        引用 `previous_response_id` = 上下文回放 + 粘性绑定同一上游账号,
+        账号失效显式迁移(不静默换号)。引用不存在/过期/他人/store:false/
+        超限或不可回放的响应一律 404 `previous_response_not_found`。
 
         流式事件序列 `response.created → response.in_progress →
         response.output_item.added → (output_text.delta |
@@ -905,7 +1135,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "429":
-          description: quota_exceeded（可计算恢复时刻时带 Retry-After）
+          description: |
+            quota_exceeded / rate_limited / insufficient_capacity（可计算恢复时刻时带
+            Retry-After）。`insufficient_capacity` = 并发上限已满（账户级权益策略
+            上限、Key 级 `concurrency_limit`、或上游账号容量）—— 与金额/速率限制
+            严格分开。外围每 IP 防滥用桶的拒绝同样是本形状（`rate_limited`）。
+
+            **Retry-After 只在每个阻断条件都有可确定恢复时刻时给出**：Key 的
+            累计预算（`budget_micros`，不按周期清零）是永久阻断项 —— 它与
+            窗口同时阻断时**不带** Retry-After（窗口重置解不开它）。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -913,8 +1151,32 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/V1Error"
+        "502":
+          description: |
+            upstream_response_invalid（非流式上游文本出现在工具调用之后，
+            无法忠实保序；或 Responses 上游返回 refusal / status=failed；
+            或 incomplete 原因缺失、null、为空或未知；
+            或 Chat 上游返回非 null refusal，包括空字符串）。
+            请求已执行：按已报 usage 或完整输出估算结算，
+            不重放、不切换上游，不返回改写后的答案，也不保存响应链。
+            Chat refusal 的流式转换只发一次原生错误，无后续内容或成功终态，
+            继续读取晚到 usage；裸 EOF 且无 usage 时保留预占并挂起核对。
+            Responses 流式终止事件与非空对象状态冲突也拒绝。真实上游错误、
+            失败对象或读取错误优先于完整拒绝证据，后来的终止事件不能恢复它；
+            无 usage 时继续冻结金额/TPM 预占并挂起核对。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
         "503":
-          description: upstream_unavailable
+          description: |
+            upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）。
+
+            upstream_unavailable 也覆盖「已发布目录里该模型没有可调度路由」：
+            例如其路由带着**未实现**的 pool_strategy（least_loaded / 通用
+            session_sticky）。这类配置在写面被明确拒绝，旧快照仍可读但路由
+            被标记不可用 —— 绝不静默当成 round_robin。请求在预占前失败：
+            零计费、零出站；运营修好目录并重新 publish 后恢复。
           content:
             application/json:
               schema:
@@ -937,15 +1199,33 @@ paths:
         `stream`、`max_tokens`/`max_completion_tokens`、`tools`（仅
         function 定义，≤128 个/合计 ≤256 KiB）、`tool_choice`、
         `stream_options`、`thinking_enabled`/`thinking`
-        （{"type":"enabled"}）、`temperature`/`top_p`/
+        （{"type":"enabled"|"disabled"}；省略保留上游默认，false/disabled
+        显式关闭；非 null thinking 对象必须带合法 type，即使同时提供其它
+        推理参数，缺失/未知/类型错误的 type 也明确 400。
+        合法对象与 thinking_enabled 同时提供时以布尔值为准，
+        显式 reasoning_effort 优先。Chat/Messages 上游发 thinking.type=disabled，
+        Responses 上游发 reasoning.effort=none）、`reasoning_effort`（显式推理档位，逐字
+        透传；词表外 400）、`temperature`/`top_p`/
         `presence_penalty`/`frequency_penalty`/`seed`/`stop`（采样透传）。
         **明确 400**：多模态 content 数组、`modalities`、`audio`、
         `prediction`、`n`≠1、`logprobs`/`top_logprobs`、
-        `response_format.type`≠text。
+        `response_format.type`≠text、服务端工具类型
+        （web_search/computer/code_execution/mcp …：无执行面、无计量保护）。
 
         响应：`object=chat.completion` 原生形状（非流式）；流式为
         `chat.completion.chunk` SSE 序列，以 `data: [DONE]` 终止；上游
         中断注入 in-stream error 事件后结束，绝不伪造 `[DONE]`。
+        Responses 上游的 refusal 无法忠实翻译：流内明确报错，无成功终态
+        或响应链；保留拒绝字节与后续 usage。完整收到但未报 usage 的拒绝
+        可估算结算；只有拒绝片段后裸 EOF 且无 usage 时仍冻结预占、挂起核对。
+        incomplete 仅支持 max_output_tokens/content_filter 原因；缺失、null、
+        空值或未知原因明确报错。流式终止事件与对象的非空 status 冲突也拒绝。
+        不撤回此前有效文本，finish_reason:null 不是成功终态。真实上游错误、
+        失败对象或读取错误使完整拒绝证据失效，后续终止事件不能恢复它；
+        无 usage 时继续冻结金额/TPM 预占并挂起核对，已读 usage 按 estimated
+        结算。翻译错误不触发自动重放、上游切换或会话链保存。
+        Chat 上游的 refusal 在本入口原样透传，其文本计入缺失 usage 时的
+        输出估算；只有转到 Messages/Responses 客户端形状时才明确拒绝。
       security:
         - BearerAuth: []
       requestBody:
@@ -994,7 +1274,18 @@ paths:
               schema:
                 $ref: "#/components/schemas/V1Error"
         "429":
-          description: quota_exceeded / insufficient_balance / rate_limited（可计算恢复时刻时带 Retry-After）
+          description: |
+            quota_exceeded / insufficient_balance / rate_limited /
+            insufficient_capacity（可计算恢复时刻时带 Retry-After）。
+            `rate_limited` 是**业务速率限制**（账户/策略/Key 的
+            RPM 与账户级 TPM 上限）：它与金额额度耗尽（quota_exceeded）严格分开，
+            充值/切换 PAYG 不能绕过。`insufficient_capacity` 是**并发上限**已满
+            （账户级权益策略上限、Key 级 `concurrency_limit`、或上游账号容量）。
+            外围每 IP 防滥用桶的拒绝同样是本形状（`rate_limited`）。
+
+            **Retry-After 只在每个阻断条件都有可确定恢复时刻时给出**：Key 的
+            累计预算（`budget_micros`，不按周期清零）是永久阻断项 —— 它与
+            窗口同时阻断时**不带** Retry-After（窗口重置解不开它）。
           headers:
             Retry-After:
               schema: { type: integer }
@@ -1002,8 +1293,29 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/V1Error"
+        "502":
+          description: |
+            upstream_response_invalid（非流式上游文本出现在工具调用之后，
+            无法忠实保序；或 Responses 上游返回 refusal / status=failed；
+            或 incomplete 原因缺失、null、为空或未知）。
+            请求已执行：按已报 usage 或完整输出估算结算，
+            不重放、不切换上游，不返回改写后的答案，也不保存响应链。
+            Responses 流式终止事件与非空对象状态冲突也拒绝。真实上游错误、
+            失败对象或读取错误优先于完整拒绝证据，后来的终止事件不能恢复它；
+            无 usage 时继续冻结金额/TPM 预占并挂起核对。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
         "503":
-          description: upstream_unavailable
+          description: |
+            upstream_unavailable / service_unavailable（准入存储不可用时 fail closed）。
+
+            upstream_unavailable 也覆盖「已发布目录里该模型没有可调度路由」：
+            例如其路由带着**未实现**的 pool_strategy（least_loaded / 通用
+            session_sticky）。这类配置在写面被明确拒绝，旧快照仍可读但路由
+            被标记不可用 —— 绝不静默当成 round_robin。请求在预占前失败：
+            零计费、零出站；运营修好目录并重新 publish 后恢复。
           content:
             application/json:
               schema:
@@ -1018,6 +1330,9 @@ paths:
         且有启用路由与可售价格，且属于调用者有效权益模型集合（Key 的
         model_allow 只能收窄不能放宽）。Anthropic 形状的模型列表端点
         不实现。
+
+        **不占用推理额度**：模型列表不进入业务准入，因此不消耗账户/策略/Key
+        的 RPM，也不预占 TPM（外围每 IP 防滥用保护仍在）。
       security:
         - BearerAuth: []
       responses:
@@ -1033,6 +1348,63 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/V1Error"
+        "429":
+          description: |
+            rate_limited（外围每 IP 防滥用桶；模型列表不进入业务准入，
+            因此不会出现 quota_exceeded / insufficient_capacity）。原生形状 +
+            Retry-After。
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+
+  /chat/models:
+    get:
+      tags: [chat]
+      summary: Kaya 模型选择器列表（JWT；同一订阅门禁）
+      description: |
+        Kaya 模型下拉框的数据源：**调用者权益可见**且**已发布**的模型集合
+        （与 `GET /v1/models` 同一判定）。管理 envelope 形状
+        `{code, data:{models:[…]}}`。
+
+        每个条目在既有字段（`id` / `display_name` / `provider` / `default` /
+        `input_modalities`）之上**追加**能力描述：
+
+        - `supports_images` / `supports_tools` / `supports_thinking` ——
+          **派发判定**：**模型条目自己的声明 ∧ 一条已发布路由的能力清单覆盖
+          它 ∧ 该协议的适配层承载它**。三者缺一即为 `false`（模型条目没有声明
+          支持，或没有能承载它的已发布部署，都不声明）。绝不声明超过**当前
+          入口（已发布条目 + 路由）与 adapter** 的能力（一个只有
+          `openai_responses` 部署的模型不会被声明成能收图片）。
+        - `context_tokens` / `max_output_tokens` —— 目录条目上的**硬上限**
+          （准入时强制生效的那两个数），不是估计值。
+        - `capability_description` —— 同一组结论的人话版本。
+
+        `GET /v1/models` 保持**原生基本形状**（OpenAI `object=list`），不带
+        这些字段。
+      operationId: listChatModels
+      responses:
+        "200":
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          models:
+                            type: array
+                            items: { $ref: "#/components/schemas/KayaModelEntry" }
+        "401": { description: 未认证（JWT 缺失/失效） }
+        "403": { description: 无有效订阅（403，picker 隐藏选择器） }
+        "503": { description: "目录冷启动无已验证快照（Retry-After: 5）" }
 
 components:
   securitySchemes:
@@ -1046,6 +1418,16 @@ components:
       in: header
       name: X-Api-Key
       description: Anthropic 风格凭据头（/v1 协议面,与 Bearer 同值域）。
+    InternalAppID:
+      type: apiKey
+      in: header
+      name: X-App-ID
+      description: 受验证的内部服务身份，必须与人员 JWT 的 app claim 一致。
+    InternalAppSecret:
+      type: apiKey
+      in: header
+      name: X-App-Secret
+      description: 内部服务凭据，仅服务端持有。
 
   parameters:
     RangeFrom:
@@ -1093,6 +1475,168 @@ components:
           example: { code: 404, data: null, message: "inference/not_found: api key not found" }
 
   schemas:
+    ProbeResult:
+      type: object
+      description: |
+        一次上游连通性探测的结论（advisory）。**三件事分开**：
+        凭据材料测试（`credential_state`）、指定连通性探测
+        （`probe_method`/`probe_outcome`）、本次**没有**做真实推理
+        （`inference_verified` 恒为 false）。
+      properties:
+        deployment_id: { type: string, format: uuid }
+        ok:
+          type: boolean
+          description: |
+            只有「指定探测成功」（`probe_outcome=verified`）才为 true。
+            **它不表示模型答过**（本次没有发起任何推理）。
+        status: { type: integer, description: 上游 HTTP 状态码；0 = 没拿到任何答复 }
+        latency_ms: { type: integer, format: int64 }
+        error_summary:
+          type: string
+          description: 失败摘要（永不包含凭据材料）。
+        credential_state:
+          type: string
+          enum: [decrypted, missing, unusable]
+          description: |
+            凭据**材料**测试：`decrypted`（材料解开且可用）/ `missing`
+            （该 provider 没有可用凭据）/ `unusable`（有凭据但材料解不开）。
+        probe_method:
+          type: string
+          enum: [connectivity, none]
+          description: "`connectivity` = 真的向供应商端点发了请求；`none` = 探测没跑起来。"
+        probe_outcome:
+          type: string
+          enum: [verified, failed, unsupported, unconfirmed]
+          description: |
+            诚实的结论：`verified`（连通性已确认）/ `failed`（端点存在但没
+            成功）/ `unsupported`（**供应商不提供该端点**，此探测方式无法
+            确认——**不是**模型故障）/ `unconfirmed`（没得到任何答复）。
+        probe_supported:
+          type: boolean
+          description: |
+            探测是否**确认**了供应商提供该端点。false 表示「没确认」（既包括
+            供应商不提供，也包括探测没得到答复——看 `probe_outcome` 区分）。
+        inference_verified:
+          type: boolean
+          enum: [false]
+          description: 恒为 false：本探测从不发起真实推理（默认不触发付费推理）。
+        description: { type: string, description: 运营可读的一句话结论 }
+      required: [deployment_id, ok, status, latency_ms, credential_state, probe_method, probe_outcome, probe_supported, inference_verified]
+
+    PublishIssue:
+      type: object
+      description: |
+        发布预演里的一条**可判定**问题 —— **整份 issues 清单都是 advisory**：
+        预演报告**不**参与正式发布的判定。
+        `blocker` = **可行动的配置 / 可用流量发现**（发布这份目录后某个模型
+        或路由跑不起来）；`hint` = 网络探测提示（不阻断发布、**不代表**模型
+        故障）。**HTTP 200 + 一条 blocker ≠ 正式发布会被拒**；真正拒绝发布的
+        是共享发布闸的硬校验（不支持的 `pool_strategy` / 词表外的能力名），
+        那类问题让预演与正式发布给出**同一个错误**。
+      properties:
+        code:
+          type: string
+          enum:
+            - provider_disabled
+            - deployment_no_account
+            - route_capabilities_narrowed
+            - model_not_dispatchable
+            - account_inventory_unavailable
+            - probe_failed
+            - probe_unsupported
+            - probe_unconfirmed
+        severity:
+          type: string
+          enum: [blocker, hint]
+          description: |
+            `blocker` = 可行动的配置 / 可用流量发现（advisory，**不**阻断
+            正式发布）；`hint` = 网络探测提示（advisory）。
+        subject: { type: string, description: 问题对象的主键（provider/deployment/model/route ID） }
+        message: { type: string, description: 运营可读的一句话（绝不含凭据材料） }
+      required: [code, severity, subject, message]
+
+    PublishPreviewSummary:
+      type: object
+      description: 发布候选集摘要（计数 + next revision 预告）。
+      properties:
+        next_revision: { type: integer }
+        models: { type: integer }
+        providers: { type: integer }
+        deployments: { type: integer }
+        active_deployments:
+          type: integer
+          description: |
+            **真正会承接流量**的部署数（部署 active **且**其 provider 未停用）。
+            停用 provider 背后的部署不算，也**不**被探测。
+        routes: { type: integer }
+        disabled_providers: { type: integer, description: 草稿里被停用的 provider 数量 }
+        deployments_behind_disabled_providers:
+          type: integer
+          description: 部署本身 active、但其 provider 已停用的部署数（不会承接流量、也不被探测）。
+      required: [next_revision, models, providers, deployments, active_deployments, routes, disabled_providers, deployments_behind_disabled_providers]
+
+    PublishDryRunSummary:
+      type: object
+      description: |
+        预演的判定摘要。**HTTP 200 不等于每个 probe.ok 都是 true** ——
+        `all_probes_ok` 只有在每个探测都 verified 时才为 true。
+      properties:
+        probes_total: { type: integer }
+        probes_ok: { type: integer }
+        probes_failed: { type: integer }
+        probes_unsupported: { type: integer, description: 供应商不提供该探测端点的条数 }
+        probes_unconfirmed: { type: integer, description: 没得到任何答复的条数 }
+        blockers:
+          type: integer
+          description: |
+            可行动的配置 / 可用流量发现的条数。**advisory**：它们**不**阻断
+            正式发布（正式发布不读预演报告）。
+        hints: { type: integer, description: 网络探测提示的条数 }
+        all_probes_ok: { type: boolean }
+        account_inventory_checked:
+          type: boolean
+          description: |
+            「无账号」判定是否**对每个 provider 都真的做了**。false = 账号
+            清单读面不可用，**或某次读失败** ⇒ 该判定被**跳过**（报告说
+            未知，不是无账号）。它**不**是「读过一次」的记号。
+      required: [probes_total, probes_ok, probes_failed, probes_unsupported, probes_unconfirmed, blockers, hints, all_probes_ok, account_inventory_checked]
+
+    PublishDryRunReport:
+      type: object
+      description: 发布预演报告（零写库、零审计事件）。
+      properties:
+        would_publish: { $ref: "#/components/schemas/PublishPreviewSummary" }
+        probes:
+          type: array
+          items: { $ref: "#/components/schemas/ProbeResult" }
+        issues:
+          type: array
+          items: { $ref: "#/components/schemas/PublishIssue" }
+        summary: { $ref: "#/components/schemas/PublishDryRunSummary" }
+      required: [would_publish, probes, issues, summary]
+
+    KayaModelEntry:
+      type: object
+      description: |
+        Kaya 模型选择器的一条目。能力字段是**派发判定**：它们绝不声明超过
+        当前入口（已发布条目 + 路由）与 adapter 的能力。
+      properties:
+        id: { type: string }
+        display_name: { type: string }
+        provider: { type: string }
+        default: { type: boolean }
+        input_modalities:
+          type: array
+          items: { type: string, enum: [text, image] }
+          description: 模型生效的输入模态；不含 `image` 的模型带图调用会被 400 拒绝。
+        supports_images: { type: boolean, description: 该条目能否承载图片输入（派发判定） }
+        supports_tools: { type: boolean, description: 该条目能否承载带工具的请求（派发判定） }
+        supports_thinking: { type: boolean, description: 该条目能否承载带推理的请求（派发判定） }
+        context_tokens: { type: integer, description: 上下文硬上限（准入强制） }
+        max_output_tokens: { type: integer, description: 输出硬上限（准入强制） }
+        capability_description: { type: string, description: 同一组结论的人话版本 }
+      required: [id, display_name, provider, default, input_modalities, supports_images, supports_tools, supports_thinking, context_tokens, max_output_tokens]
+
     DecimalInt64:
       type: string
       pattern: "^[0-9]+$"
@@ -1674,6 +2218,21 @@ components:
         rpm_limit:
           type: integer
           nullable: true
+          description: |
+            该 Key 的每分钟请求上限（null = 不限）。**业务速率限制**在业务准入
+            里执行（滚动 60 秒、PostgreSQL 共享）：与全局账户 RPM、当前权益
+            策略的 RPM **同时满足**才放行；超限答复 429 `rate_limited`。
+        concurrency_limit:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: |
+            该 Key 的**独立并发上限**（null = 该 Key 不额外限制并发）。在业务
+            准入里与上游账号/计费账户的并发租约**同一个事务**取锁（PostgreSQL
+            共享，多实例生效）：同一 Key 的并发请求数达到上限即拒绝
+            （429 `insufficient_capacity`），释放后槽位立即归还。该限制**只收窄**
+            共享的账户权益 —— 它不会放宽账户级（权益策略）并发上限；账户上限与
+            Key 上限**同时满足**才放行。
         status:
           type: string
           enum: [active, revoked, expired]
@@ -1697,12 +2256,21 @@ components:
           items: { type: string }
         budget_micros:
           $ref: "#/components/schemas/DecimalInt64"
-        rpm_limit: { type: integer, minimum: 1 }
+        rpm_limit:
+          type: integer
+          minimum: 1
+          description: 该 Key 的每分钟请求上限（业务准入执行，跨实例共享）。
+        concurrency_limit:
+          type: integer
+          minimum: 1
+          description: |
+            该 Key 的独立并发上限（业务准入执行，跨实例共享）。缺省 = 该 Key 不
+            额外限制并发（账户级上限仍生效）。非正整数一律 400。
         expires_at:
           $ref: "#/components/schemas/RFC3339UTC"
     ApiKeyUpdateRequest:
       type: object
-      description: 仅列出字段被修改；显式 null 清除可选约束（budget/rpm/expires）；未知字段一律 400
+      description: 仅列出字段被修改；显式 null 清除可选约束（budget/rpm/concurrency/expires）；未知字段一律 400
       properties:
         name: { type: string, maxLength: 128 }
         model_ids:
@@ -1715,6 +2283,14 @@ components:
         rpm_limit:
           type: integer
           nullable: true
+          description: 该 Key 的每分钟请求上限（业务准入执行，跨实例共享）；显式 null 清除。
+        concurrency_limit:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: |
+            该 Key 的独立并发上限（业务准入执行，跨实例共享）。缺席 = 不修改；
+            显式 null 清除该限制；非正整数一律 400。
         expires_at:
           $ref: "#/components/schemas/RFC3339UTC"
           nullable: true
@@ -1769,11 +2345,14 @@ components:
               enum: [authentication_error, invalid_request_error, permission_error, rate_limit_error, server_error]
             code:
               type: string
-              description: 统一内部错误码映射(invalid_input/quota_exceeded/model_not_found/model_not_allowed/previous_response_not_found/upstream_unavailable 等)
+              description: 统一内部错误码映射(invalid_input/quota_exceeded/model_not_found/model_not_allowed/previous_response_not_found/upstream_response_invalid/upstream_unavailable/service_unavailable 等)
       required: [error]
     AnthropicError:
       type: object
-      description: Anthropic 原生错误形状（messages 面）。
+      description: |
+        Anthropic 原生错误形状（messages 面）。原生形状**没有 code 字段** ——
+        业务区分（rate_limited / quota_exceeded / insufficient_capacity）
+        落在 error.message 上。
       properties:
         type: { type: string, enum: [error] }
         error:
@@ -1835,13 +2414,35 @@ components:
           maxItems: 128
           items:
             type: object
-            description: 仅 function 定义（{type:function, function:{name, description?, parameters?}}；合计 ≤256 KiB）
+            description: |
+              仅 function 定义（{type:function, function:{name, description?, parameters?}}；合计 ≤256 KiB）。
+              服务端工具类型（web_search/computer/code_execution/mcp …）无执行面、无计量保护 → 明确 400。
         tool_choice: { description: "auto|none|required|{type:function,function:{name}}" }
         stream_options: { type: object }
-        thinking_enabled: { type: boolean, description: kaya 思考开关 }
+        thinking_enabled:
+          type: boolean
+          description: |
+            思考开关。省略保留上游默认；false 显式关闭（Chat/Messages 上游
+            thinking.type=disabled，Responses 上游 reasoning.effort=none）。
+            显式 reasoning_effort 优先于该开关。
         thinking:
           type: object
-          description: "{type:enabled|disabled}（DeepSeek 风格，与 thinking_enabled 同义）"
+          nullable: true
+          description: |
+            DeepSeek 风格开关；省略/null 不指定，disabled 显式关闭。
+            每个非 null 对象均先校验 type，非法对象不因其它推理参数而被忽略。
+            合法对象与 thinking_enabled 同时提供时以布尔值为准；
+            显式 reasoning_effort 优先。
+          properties:
+            type: { type: string, enum: [enabled, disabled] }
+          required: [type]
+        reasoning_effort:
+          type: string
+          enum: [minimal, low, medium, high, xhigh]
+          description: |
+            显式推理档位（T8）。逐字透传给能表达该档位的上游协议；词表外的值
+            明确 400（不静默忽略）。档位不可表达且无任何兼容部署时，准入前 400
+            （零预占、零派发）。
         temperature: { type: number }
         top_p: { type: number }
         presence_penalty: { type: number }
@@ -1878,7 +2479,10 @@ components:
       type: object
       description: |
         Anthropic Messages 请求子集(2023-06-01)。不支持的字段一律 400:
-        image/document 块、服务端工具类型。历史 thinking 块接受但不回放。
+        image/document 块、服务端工具类型。T8 兼容性修正：历史
+        thinking/redacted_thinking 块 → 400（签名思考无法忠实回放，旧行为是
+        「接受后丢弃」）；thinking.type=enabled → 400（本面不产出思考块：
+        Anthropic 的 thinking 块必须带原生 signature，网关不伪造空签名）。
       properties:
         model: { type: string, maxLength: 128 }
         max_tokens: { type: integer, format: int64, minimum: 1 }
@@ -1890,7 +2494,7 @@ components:
             properties:
               role: { type: string, enum: [user, assistant] }
               content:
-                description: 字符串或内容块数组(text/tool_use/tool_result;thinking 接受不回放;image/document 拒绝)
+                description: 字符串或内容块数组(text/tool_use/tool_result;thinking/redacted_thinking 拒绝;image/document 拒绝)
         system:
           description: 字符串或 text 块数组(cache_control 提示接受但不保证生效)
         stream: { type: boolean, default: false }
@@ -1904,6 +2508,11 @@ components:
           description: "{type:auto|any|none|tool, name?, disable_parallel_tool_use?}"
         thinking:
           type: object
+          description: |
+            只有 {type:disabled} 被接受。{type:enabled} 明确 400：本面不产出
+            思考块（Anthropic 的 thinking 块必须带原生 signature，网关的内部
+            形状承载不了签名，也不建立通用无损原生透传层）。要推理请用
+            /v1/chat/completions 或 /v1/responses。
           properties:
             type: { type: string, enum: [enabled, disabled] }
             budget_tokens: { type: integer, format: int64, minimum: 1024, description: "必须 < max_tokens" }
@@ -1925,7 +2534,10 @@ components:
           type: array
           items:
             type: object
-            description: text / thinking(无签名) / tool_use 块
+            description: |
+              text / tool_use 块。**不含 thinking 块**（T8：Anthropic 的
+              thinking 块必须带原生 signature，网关不伪造空 signature，也不
+              建立通用无损原生透传层；本面因此不呈现上游的推理内容）。
         stop_reason: { type: string, nullable: true, enum: [end_turn, tool_use, max_tokens, null] }
         stop_sequence: { type: string, nullable: true }
         usage:
@@ -1942,10 +2554,12 @@ components:
         OpenAI Responses 请求子集。明确 400:多模态 part、服务端工具
         (含 web_search_call 等结果项与 item_reference)、background:true、
         非空 include、max_tool_calls、truncation:auto、text.format≠text。
+        T8 兼容性修正：input 里的 reasoning 项 → 400（推理项没有可回放的
+        加密载荷；旧行为是「接受后丢弃」）。
       properties:
         model: { type: string, maxLength: 128 }
         input:
-          description: 字符串或 items 数组(message/function_call/function_call_output;reasoning 接受不回放)
+          description: 字符串或 items 数组(message/function_call/function_call_output;reasoning 项拒绝)
         instructions: { type: string, description: "系统提示(→ system 消息)" }
         max_output_tokens: { type: integer, format: int64, minimum: 1 }
         stream: { type: boolean, default: false }
@@ -1955,7 +2569,7 @@ components:
           description: "false = 不落会话链,后续 previous_response_id 引用得 404"
         previous_response_id:
           type: string
-          description: "会话链引用:transcript 回放 + 粘性绑定同一上游账号;跨客户/过期/store:false 一律 404"
+          description: "会话链引用:transcript 回放 + 粘性绑定同一上游账号;跨客户/过期/store:false/超限/不可回放未落链一律 404"
         tools:
           type: array
           maxItems: 128
@@ -1968,6 +2582,13 @@ components:
         top_p: { type: number }
         reasoning:
           type: object
+          description: |
+            effort 的档位逐字透传给能表达该档位的上游协议（T8：minimal/
+            low/medium/high/xhigh 原样下传，不再一律折成 medium）。minimal 是
+            最低**推理档**（OpenAI 语义），不是「关闭推理」——只有 none 才关闭
+            推理。none 在 Chat/Messages 上游映射为 thinking.type=disabled，
+            在 Responses 上游保留 reasoning.effort=none；省略保留上游默认。
+            词表外的档位明确 400。
           properties:
             effort: { type: string, enum: [low, medium, high, xhigh, none, minimal] }
         metadata: { type: object, description: "客户端标记,不消费" }
@@ -1984,7 +2605,7 @@ components:
           type: object
           nullable: true
           properties:
-            reason: { type: string, enum: [max_output_tokens] }
+            reason: { type: string, enum: [max_output_tokens, content_filter] }
         model: { type: string, description: 公开模型 id(非上游名) }
         output:
           type: array

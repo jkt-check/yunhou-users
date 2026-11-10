@@ -32,6 +32,7 @@ package providers
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -63,7 +64,7 @@ type responsesTap struct {
 	res TapResult
 }
 
-func (t *responsesTap) Feed(p []byte) { /* the translator meters internally */ }
+func (t *responsesTap) Feed(p []byte) error { return nil /* translator meters internally */ }
 
 func (t *responsesTap) Result() TapResult {
 	t.mu.Lock()
@@ -97,17 +98,34 @@ func (t *responsesTap) markTerminal() {
 	t.mu.Unlock()
 }
 
+func (t *responsesTap) markFailed() {
+	t.mu.Lock()
+	t.res.Terminal = false
+	t.res.RejectedComplete = false
+	t.mu.Unlock()
+}
+
+func (t *responsesTap) markRejectedComplete() {
+	t.mu.Lock()
+	t.res.RejectedComplete = true
+	t.mu.Unlock()
+}
+
 // responsesStreamEvent is the superset of the Responses streaming event
 // shapes we care about; unlisted fields are ignored. delta is RawMessage
 // because textual deltas are strings while some events carry object deltas.
 type responsesStreamEvent struct {
-	Type        string               `json:"type"`
-	OutputIndex int                  `json:"output_index"`
-	Item        *responsesOutputItem `json:"item"`
-	Delta       json.RawMessage      `json:"delta"`
-	Response    *responsesObjectView `json:"response"`
-	Code        string               `json:"code"`
-	Message     string               `json:"message"`
+	Type         string                `json:"type"`
+	OutputIndex  int                   `json:"output_index"`
+	ContentIndex int                   `json:"content_index"`
+	SummaryIndex int                   `json:"summary_index"`
+	Item         *responsesOutputItem  `json:"item"`
+	Part         *responsesContentPart `json:"part"`
+	Refusal      string                `json:"refusal"`
+	Delta        json.RawMessage       `json:"delta"`
+	Response     *responsesObjectView  `json:"response"`
+	Code         string                `json:"code"`
+	Message      string                `json:"message"`
 }
 
 // deltaString decodes a textual delta field (absent/non-string → "").
@@ -133,15 +151,172 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	// stream against the same index — parallel calls interleave freely.
 	toolCalls := map[int]struct{}{}
 	terminalSeen := false
+	failed := false
+	translationRejected := false
+	var reportedTotal *int64
+	// Deltas add bytes; later part/item/response snapshots repeat that same
+	// content, so only their previously unseen suffix contributes.
+	type contentKey struct {
+		kind                      string
+		outputIndex, contentIndex int
+	}
+	contentBytes := map[contentKey]int{}
+	recordContent := func(kind string, outputIndex, contentIndex, n int, delta bool) {
+		key := contentKey{kind, outputIndex, contentIndex}
+		if !delta {
+			n -= contentBytes[key]
+		}
+		if n > 0 {
+			contentBytes[key] += n
+			tap.addContent(n)
+		}
+	}
+	recordPart := func(outputIndex, contentIndex int, part *responsesContentPart) bool {
+		if part == nil {
+			return false
+		}
+		switch part.Type {
+		case "refusal":
+			recordContent("refusal", outputIndex, contentIndex, len(part.Refusal), false)
+			return true
+		case "output_text":
+			recordContent("text", outputIndex, contentIndex, len(part.Text), false)
+		}
+		return false
+	}
+	recordItem := func(outputIndex int, item *responsesOutputItem) bool {
+		if item == nil {
+			return false
+		}
+		found := false
+		switch item.Type {
+		case "message":
+			for i, part := range item.Content {
+				if recordPart(outputIndex, i, &part) {
+					found = true
+				}
+			}
+		case "reasoning":
+			for i, part := range item.Summary {
+				if part.Type == "summary_text" {
+					recordContent("summary", outputIndex, i, len(part.Text), false)
+				}
+			}
+		case "function_call":
+			recordContent("arguments", outputIndex, 0, len(item.Arguments), false)
+		}
+		return found
+	}
 
 	for scanner.Scan() {
-		data, ok := strings.CutPrefix(scanner.Text(), "data: ")
+		data, ok := strings.CutPrefix(scanner.Text(), "data:")
 		if !ok {
 			continue // event:/comment/blank lines
 		}
 		var ev responsesStreamEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
 			continue // unknown/malformed event — keep the stream alive
+		}
+		// Keep metering late usage/content after an error without rendering
+		// further output or accepting a subsequent successful terminal.
+		refused := false
+		switch ev.Type {
+		case "response.completed", "response.incomplete", "response.failed":
+			if ev.Response != nil {
+				if ev.Response.Usage != nil {
+					tap.recordUsage(ev.Response.Usage)
+					reportedTotal = ev.Response.Usage.TotalTokens
+				}
+				for i := range ev.Response.Output {
+					if recordItem(i, &ev.Response.Output[i]) {
+						refused = true
+					}
+				}
+			}
+		case "response.output_text.delta":
+			recordContent("text", ev.OutputIndex, ev.ContentIndex, len(ev.deltaString()), true)
+		case "response.reasoning_summary_text.delta":
+			recordContent("summary", ev.OutputIndex, ev.SummaryIndex, len(ev.deltaString()), true)
+		case "response.reasoning_text.delta":
+			recordContent("reasoning", ev.OutputIndex, ev.ContentIndex, len(ev.deltaString()), true)
+		case "response.function_call_arguments.delta":
+			recordContent("arguments", ev.OutputIndex, 0, len(ev.deltaString()), true)
+		case "response.refusal.delta":
+			refused = true
+			recordContent("refusal", ev.OutputIndex, ev.ContentIndex, len(ev.deltaString()), true)
+		case "response.refusal.done":
+			refused = true
+			recordContent("refusal", ev.OutputIndex, ev.ContentIndex, len(ev.Refusal), false)
+		case "response.content_part.added", "response.content_part.done":
+			refused = recordPart(ev.OutputIndex, ev.ContentIndex, ev.Part)
+		case "response.output_item.added", "response.output_item.done":
+			refused = recordItem(ev.OutputIndex, ev.Item)
+		}
+		terminal := ev.Type == "response.completed" || ev.Type == "response.incomplete"
+		// Real upstream failure dominates translation rejection, including
+		// failures received after a rejected terminal and before late usage.
+		if ev.Type == "error" || ev.Type == "response.failed" ||
+			(terminal && ev.Response != nil && ev.Response.Status == "failed") {
+			alreadyFailed := failed
+			failed = true
+			translationRejected = false
+			tap.markFailed()
+			if !alreadyFailed {
+				msg := ev.Message
+				if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {
+					msg = ev.Response.Error.Message
+				}
+				if msg == "" {
+					msg = "upstream responses error"
+				}
+				if err := writeRawSSE(w, map[string]any{"error": map[string]any{"message": msg}}); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if failed {
+			if translationRejected && terminal && ev.Response != nil {
+				tap.markRejectedComplete()
+			}
+			continue
+		}
+		var translationErr error
+		finishReason := ""
+		if refused {
+			translationErr = fmt.Errorf("providers: Responses refusal cannot be translated faithfully")
+		} else if terminal {
+			status := strings.TrimPrefix(ev.Type, "response.")
+			incompleteReason := ""
+			hasTools := len(toolCalls) > 0
+			if ev.Response != nil {
+				if ev.Response.Status != "" && ev.Response.Status != status {
+					translationErr = fmt.Errorf("providers: Responses terminal event %q conflicts with status %q", ev.Type, ev.Response.Status)
+				}
+				if ev.Response.IncompleteDetails != nil {
+					incompleteReason = ev.Response.IncompleteDetails.Reason
+				}
+				for _, it := range ev.Response.Output {
+					if it.Type == "function_call" {
+						hasTools = true
+					}
+				}
+			}
+			if translationErr == nil {
+				finishReason, translationErr = responsesFinishReason(status, incompleteReason, hasTools)
+			}
+		}
+		if translationErr != nil {
+			failed = true
+			translationRejected = true
+			tap.markFailed()
+			if terminal && ev.Response != nil {
+				tap.markRejectedComplete()
+			}
+			if err := writeRawSSE(w, map[string]any{"error": map[string]any{"message": translationErr.Error()}}); err != nil {
+				return err
+			}
+			continue
 		}
 		var err error
 		switch ev.Type {
@@ -159,12 +334,10 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 			}
 		case "response.output_text.delta":
 			if s := ev.deltaString(); s != "" {
-				tap.addContent(len(s))
 				err = writeOpenAIChunk(w, map[string]any{"content": s}, "")
 			}
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 			if s := ev.deltaString(); s != "" {
-				tap.addContent(len(s))
 				err = writeOpenAIChunk(w, map[string]any{"reasoning_content": s}, "")
 			}
 		case "response.function_call_arguments.delta":
@@ -177,70 +350,31 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 		case "response.completed", "response.incomplete":
 			terminalSeen = true
 			tap.markTerminal()
-			hasTools := len(toolCalls) > 0
-			incompleteReason := ""
-			// status 以帧内对象为准，缺省时以事件类型兜底——兼容端点省略
-			// status 时，incomplete 绝不得被渲染成 stop（截断被伪装成完整）。
-			status := strings.TrimPrefix(ev.Type, "response.")
-			if ev.Response != nil {
-				if ev.Response.Status != "" {
-					status = ev.Response.Status
-				}
-				if ev.Response.Usage != nil {
-					tap.recordUsage(ev.Response.Usage)
-				}
-				if ev.Response.IncompleteDetails != nil {
-					incompleteReason = ev.Response.IncompleteDetails.Reason
-				}
-				for _, it := range ev.Response.Output {
-					if it.Type == "function_call" {
-						hasTools = true
-					}
-				}
-			}
-			err = writeOpenAIChunk(w, map[string]any{},
-				responsesFinishReason(status, incompleteReason, hasTools))
+			err = writeOpenAIChunk(w, map[string]any{}, finishReason)
 			if err == nil {
 				// 上游从未报 usage 时只发 [DONE]——缺失 usage 绝不渲染为
 				// {"total_tokens":0}（与 anthropic 路径同一纪律）。
 				if res := tap.Result(); res.SawUsage {
-					err = writeOpenAIUsageAndDone(w, res.Buckets)
+					err = writeOpenAIUsageAndDone(w, res.Buckets, reportedTotal)
 				} else {
 					_, err = io.WriteString(w, "data: [DONE]\n\n")
 				}
 			}
-		case "response.failed":
-			msg := "upstream responses error"
-			if ev.Response != nil {
-				// failed 帧可能携带已消耗的部分用量：计入 tap（不置
-				// Terminal——不是干净结束），流末以无 [DONE] 的 usage 块
-				// 冲刷给计量面。
-				if ev.Response.Usage != nil {
-					tap.recordUsage(ev.Response.Usage)
-				}
-				if ev.Response.Error != nil && ev.Response.Error.Message != "" {
-					msg = ev.Response.Error.Message
-				}
-			}
-			// 非干净结束：错误块后无 [DONE]——半截答案绝不当成完整答案渲染。
-			err = writeRawSSE(w, map[string]any{"error": map[string]any{"message": msg}})
-		case "error":
-			msg := ev.Message
-			if msg == "" {
-				msg = "upstream responses error"
-			}
-			err = writeRawSSE(w, map[string]any{"error": map[string]any{"message": msg}})
 		}
 		if err != nil {
 			return err // client (pipe reader) is gone
 		}
 	}
-	// The stream ended without response.completed/incomplete. Usage seen so
+	if scanner.Err() != nil {
+		failed = true
+		tap.markFailed()
+	}
+	// The stream ended without a supported response.completed/incomplete. Usage seen so
 	// far flushes WITHOUT [DONE] so downstream metering keeps the tokens but
 	// no client renders the partial answer as complete (同 anthropic 路径).
-	if !terminalSeen {
+	if !terminalSeen || failed {
 		if b := tap.Result(); b.SawUsage {
-			if err := writeOpenAIUsage(w, b.Buckets); err != nil {
+			if err := writeOpenAIUsage(w, b.Buckets, reportedTotal); err != nil {
 				return err
 			}
 		}

@@ -382,6 +382,70 @@ func TestCrossWindowCompletion(t *testing.T) {
 	}
 }
 
+// TestAdmitReusesStoredAnchorWithSubMicrosecondCallerTime: 准入的锚点必须取
+// 数据库里已持久化的 anchor_at —— 调用方内存里的锚点可能带亚微秒纳秒，而
+// PostgreSQL 的 TIMESTAMPTZ 只存微秒：按调用方锚点算出的 weekly/monthly
+// 窗口起点写库后被截断成另一个值，第二次准入再也匹配不上已激活的窗口行，
+// 于是重复激活 → EXCLUDE 排他约束冲突（23P01）。
+func TestAdmitReusesStoredAnchorWithSubMicrosecondCallerTime(t *testing.T) {
+	db, s := testDB(t)
+	f := seedFixture(t, s, true)
+	priceID := seedPrice(t, s, f.modelID)
+	stored, err := s.GetEntitlement(context.Background(), f.entID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := admitCmd(f, priceID, 100, 1_000_000, 10_000_000, 100_000_000, nil)
+	cmd.At = stored.AnchorAt.Add(time.Hour)
+	cmd.Entitlement.AnchorAt = stored.AnchorAt.Add(789 * time.Nanosecond)
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("first admission: %v", err)
+	}
+	cmd.Request.ID = uuid.NewString()
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("second admission must reuse stored windows: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inference_quota_windows WHERE entitlement_id=$1`, f.entID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("active windows = %d, want 3", count)
+	}
+}
+
+// TestAdmitReusesFiveHourWindowWithSubMicrosecondConsumptionTime: 五小时窗口
+// 的起点是**消费时刻**本身，因此消费时刻也必须用数据库自己的表示
+// （$2::timestamptz）参与窗口计算 —— 调用方内存里带亚微秒纳秒的消费时刻
+// 写库后被截断成另一个值，第二次准入匹配不上已激活的五小时窗口行，于是
+// 重复激活 → EXCLUDE 排他约束冲突（23P01）。
+func TestAdmitReusesFiveHourWindowWithSubMicrosecondConsumptionTime(t *testing.T) {
+	db, s := testDB(t)
+	f := seedFixture(t, s, true)
+	priceID := seedPrice(t, s, f.modelID)
+	stored, err := s.GetEntitlement(context.Background(), f.entID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := admitCmd(f, priceID, 100, 1_000_000, 10_000_000, 100_000_000, nil)
+	cmd.Entitlement.AnchorAt = stored.AnchorAt
+	cmd.At = stored.AnchorAt.Add(time.Hour).Add(789 * time.Nanosecond)
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("first admission: %v", err)
+	}
+	cmd.Request.ID = uuid.NewString()
+	if _, err := newQuotaService(s).Admit(context.Background(), cmd); err != nil {
+		t.Fatalf("second admission must reuse stored windows: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inference_quota_windows WHERE entitlement_id=$1`, f.entID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("active windows = %d, want 3", count)
+	}
+}
+
 // TestKeySubBudgetConcurrency: Key 子预算为瓶颈时放行量不超预算（累计上
 // 限语义，不按周期清零 — 控制者裁决）。
 func TestKeySubBudgetConcurrency(t *testing.T) {
@@ -706,7 +770,7 @@ func TestAdmissionLeaseFailureRollsBackEverything(t *testing.T) {
 	f := seedFixture(t, s, true)
 	priceID := seedPrice(t, s, f.modelID)
 	svc := newQuotaService(s)
-	svc.AccountLeaseTTL = time.Minute
+	svc.RequestLeaseTTL = time.Minute
 	big := domain.Microcredit(1 << 40)
 	conc := 1
 
@@ -714,7 +778,7 @@ func TestAdmissionLeaseFailureRollsBackEverything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.AccountLease == nil {
+	if res.AccountLease() == nil {
 		t.Fatal("want account concurrency lease on admission")
 	}
 	// 第二个并发准入：额度充足但并发槽满 → insufficient_capacity，且预占
@@ -732,7 +796,7 @@ func TestAdmissionLeaseFailureRollsBackEverything(t *testing.T) {
 		t.Errorf("requests = %d, want 1", n)
 	}
 	// 释放租约后准入恢复。
-	if err := s.ReleaseLease(ctx, res.AccountLease.ID, svc.OwnerToken, res.AccountLease.FencingToken); err != nil {
+	if err := s.ReleaseLease(ctx, res.AccountLease().ID, svc.OwnerToken, res.AccountLease().FencingToken); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.Admit(ctx, admitCmd(f, priceID, 10_000, big, big, big, &conc)); err != nil {
@@ -761,9 +825,12 @@ func TestStorageUnavailableFailsClosed(t *testing.T) {
 
 // workerResult is the machine-readable worker summary (last stdout line).
 type workerResult struct {
-	Admitted      int `json:"admitted"`
-	QuotaExceeded int `json:"quota_exceeded"`
-	Other         int `json:"other"`
+	PID                  int `json:"pid"`
+	Admitted             int `json:"admitted"`
+	QuotaExceeded        int `json:"quota_exceeded"`
+	RateLimited          int `json:"rate_limited"`
+	InsufficientCapacity int `json:"insufficient_capacity"`
+	Other                int `json:"other"`
 }
 
 // TestQuotaWorkerProcess is the child-process entry point — it runs ONLY
@@ -774,7 +841,8 @@ func TestQuotaWorkerProcess(t *testing.T) {
 	if os.Getenv("KAYA_QUOTA_WORKER") != "1" {
 		t.Skip("worker process entry point")
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	dsn := os.Getenv("DATABASE_URL")
 	db, err := sqlx.Connect("postgres", dsn)
 	if err != nil {
@@ -819,8 +887,33 @@ func TestQuotaWorkerProcess(t *testing.T) {
 	lim := domain.Microcredit(limit)
 	one := int64(1)
 	svc := quota.NewService(NewStore(db), nil)
+	mode := os.Getenv("KAYA_WORKER_MODE")
+	if mode == "account_rpm" {
+		svc.AccountRPM = 3
+	}
+	if readyPath := os.Getenv("KAYA_WORKER_READY"); readyPath != "" {
+		if err := os.WriteFile(readyPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			_, err := os.Stat(env("KAYA_WORKER_START"))
+			if err == nil {
+				break
+			}
+			if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-ticker.C:
+			}
+		}
+	}
 
-	var res workerResult
+	res := workerResult{PID: os.Getpid()}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	start := make(chan struct{})
@@ -851,6 +944,16 @@ func TestQuotaWorkerProcess(t *testing.T) {
 					EstimatedInputTokens: hold,
 					ClientMaxTokens:      &one,
 				}
+				three := 3
+				switch mode {
+				case "policy_rpm":
+					cmd.Policy.RPMLimit = &three
+				case "account_tpm":
+					tokens := int64(33) // Three holds of 10 input + 1 output.
+					cmd.Policy.TPMLimit = &tokens
+				case "account_concurrency":
+					cmd.Policy.ConcurrencyLimit = &three
+				}
 				_, err := svc.Admit(ctx, cmd)
 				mu.Lock()
 				switch {
@@ -858,6 +961,10 @@ func TestQuotaWorkerProcess(t *testing.T) {
 					res.Admitted++
 				case domain.CodeOf(err) == domain.CodeQuotaExceeded:
 					res.QuotaExceeded++
+				case domain.CodeOf(err) == domain.CodeRateLimited:
+					res.RateLimited++
+				case domain.CodeOf(err) == domain.CodeInsufficientCapacity:
+					res.InsufficientCapacity++
 				default:
 					res.Other++
 					fmt.Fprintf(os.Stderr, "worker error: %v\n", err)

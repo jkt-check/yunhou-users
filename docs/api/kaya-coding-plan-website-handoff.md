@@ -4,7 +4,7 @@
 > 后端契约**；页面实现属 Website 工作项，不在本仓库交付范围内。本文不声明
 > 任何页面已完成。
 >
-> 权威契约文件：`docs/api/kaya-coding-plan.openapi.yaml`（0.13.0，客户面
+> 权威契约文件：`docs/api/kaya-coding-plan.openapi.yaml`（0.14.0，客户面
 > 逐字段对齐实现）+ `docs/api/fixtures/`（响应 fixture）。本文是导航与约
 > 定汇总；字段级真相以 OpenAPI 为准。
 
@@ -153,7 +153,7 @@
 - 运营列表 `limit`：默认 100，上限 500（超上限**钳到 500**，与 OpenAPI
   `maximum` 一致；Task 16 起不再静默回退默认值）。
 - 运营统计 `group_by=model|provider|customer`：**零活动分组缺席**（不补
-  零行；OpenAPI 0.13.0 已声明）。
+  零行；OpenAPI 0.14.0 已声明）。
 
 **错误码**：
 - `/user/*`、`/admin/*`：envelope `code = HTTP 状态码`，`message` 可读；
@@ -169,19 +169,21 @@
 
 | 资产 | 位置 |
 |---|---|
-| OpenAPI 契约（0.13.0） | `docs/api/kaya-coding-plan.openapi.yaml` |
+| OpenAPI 契约（0.14.0） | `docs/api/kaya-coding-plan.openapi.yaml` |
 | 三窗口卡片七态响应 fixture | `docs/api/fixtures/model-quotas-{zero-limit,unactivated,exhausted,expired,reserved,cross-month}.json` |
 | 待核对用量明细 fixture | `docs/api/fixtures/model-usage-requests-reconciliation.json` |
 | 官方 SDK 请求形状 fixture（契约核对用） | `docs/api/fixtures/client/client-request-{anthropic-messages,openai-responses,openai-chat}.json` |
-| 已知差异 fixture（多模态 400 / truncation:auto 400 / thinking 历史块不回放） | `docs/api/fixtures/client/client-request-{anthropic-messages-multimodal,openai-responses-truncation,anthropic-messages-thinking-history}.json` |
+| 已知差异 fixture（多模态 400 / truncation:auto 400 / thinking 历史块 400） | `docs/api/fixtures/client/client-request-{anthropic-messages-multimodal,openai-responses-truncation,anthropic-messages-thinking-history}.json` |
 | 客户端集成指南（含能力矩阵与版本记录） | `docs/api-integration-guide.md` |
 | 运营操作手册（批量/补偿/成本口径/一账号一部署） | `docs/runbooks/kaya-coding-plan-operations.md` |
 | 发布演练（灰度/回滚/压测/升级实测） | `docs/runbooks/kaya-coding-plan-rollout.md` |
 
 **已知协议差异**（Website 提示语可直接引用；均已在 OpenAPI/指南声明）：
 `truncation:"auto"` 400；`GET /v1/models` 不提供 Anthropic 形状；历史
-thinking/redacted_thinking 块接受但不回放；多模态/服务端工具
-（web_search/computer/bash 等）400。
+thinking/redacted_thinking 块 400（T8 兼容性修正：签名思考无法忠实回放，
+旧行为是「接受后丢弃」）；`thinking.type=enabled` 400（本面不产出思考块：
+Anthropic 的 thinking 块必须带原生 signature，网关不伪造空签名）；多模态/
+服务端工具（web_search/computer/bash 等）400。
 
 ## 7. 联调环境说明
 

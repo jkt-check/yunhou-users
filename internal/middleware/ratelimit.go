@@ -84,6 +84,29 @@ func (rl *rateLimiter) cleanup() {
 	}
 }
 
+// RateLimitResponder renders the rejection of a rate-limited request. The
+// responder owns the wire shape: the management envelope for the management
+// surfaces, the protocol-native shape for the /v1 protocol surfaces
+// (设计 §9.1: /v1/* 使用各自协议的原生 body 与错误，不能套管理 envelope).
+//
+// retryAfter is the responder's own decision input: the seconds the bucket
+// needs before it lets the next request through ("1" at minimum). A
+// responder that cannot promise a recovery instant may ignore it — but it
+// must never invent one.
+type RateLimitResponder func(c *gin.Context, retryAfter string)
+
+// ManagementRateLimitResponder is the default responder: the standard
+// management envelope. error 符号名对齐 usage-stats.md §8（rate_limited）；
+// 附加字段，不改变既有 code/message 形状。
+func ManagementRateLimitResponder(c *gin.Context, retryAfter string) {
+	c.Header("Retry-After", retryAfter)
+	c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+		"code":    429,
+		"error":   "rate_limited",
+		"message": "too many requests",
+	})
+}
+
 // RateLimit returns a per-IP token-bucket limiter middleware (r is the
 // sustained rate in requests per second — fractional values like 0.5 mean
 // "one request per 2s"). The rate-limiter key is c.ClientIP(), which Gin
@@ -96,9 +119,17 @@ func (rl *rateLimiter) cleanup() {
 // per request to bypass the per-IP bucket. The default of trusting
 // every proxy in Gin's engine is unsafe for a public deployment.
 func RateLimit(ctx context.Context, r float64, burst int) gin.HandlerFunc {
-	return RateLimitWithKey(ctx, r, burst, func(c *gin.Context) string {
+	return RateLimitWithResponder(ctx, r, burst, ManagementRateLimitResponder)
+}
+
+// RateLimitWithResponder is RateLimit with a caller-chosen rejection
+// responder. It exists for the /v1 protocol surfaces: the generic limiter
+// must not force the management envelope onto them (设计 §9.1) — the
+// responder renders the protocol-native shape instead.
+func RateLimitWithResponder(ctx context.Context, r float64, burst int, respond RateLimitResponder) gin.HandlerFunc {
+	return RateLimitWithKeyResponder(ctx, r, burst, func(c *gin.Context) string {
 		return c.ClientIP()
-	})
+	}, respond)
 }
 
 // RateLimitWithKey is RateLimit with a caller-chosen bucket key instead of
@@ -110,6 +141,18 @@ func RateLimit(ctx context.Context, r float64, burst int) gin.HandlerFunc {
 // (defence in depth — an unauthenticated request should never reach here,
 // but a shared fallback bucket is safer than a shared empty key).
 func RateLimitWithKey(ctx context.Context, r float64, burst int, key func(*gin.Context) string) gin.HandlerFunc {
+	return RateLimitWithKeyResponder(ctx, r, burst, key, ManagementRateLimitResponder)
+}
+
+// RateLimitWithKeyResponder is the fully injected form: a caller-chosen
+// bucket key AND a caller-chosen rejection responder.
+func RateLimitWithKeyResponder(ctx context.Context, r float64, burst int,
+	key func(*gin.Context) string, respond RateLimitResponder) gin.HandlerFunc {
+	if respond == nil {
+		// A missing responder must never become a panic on the hot path:
+		// fall back to the management envelope (the pre-T6 behaviour).
+		respond = ManagementRateLimitResponder
+	}
 	limiter := newRateLimiter(r, burst)
 
 	go func() {
@@ -131,14 +174,7 @@ func RateLimitWithKey(ctx context.Context, r float64, burst int, key func(*gin.C
 			k = c.ClientIP()
 		}
 		if !limiter.allow(k) {
-			c.Header("Retry-After", retryAfterSeconds(limiter, k))
-			// error 符号名对齐 usage-stats.md §8（rate_limited）；附加字段，
-			// 不改变既有 code/message 形状。
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"code":    429,
-				"error":   "rate_limited",
-				"message": "too many requests",
-			})
+			respond(c, retryAfterSeconds(limiter, k))
 			return
 		}
 		c.Next()

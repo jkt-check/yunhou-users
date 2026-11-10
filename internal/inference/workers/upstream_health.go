@@ -20,6 +20,7 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/credentials"
@@ -31,7 +32,7 @@ import (
 // UpstreamHealthStore is the persistence surface the worker needs;
 // satisfied by *postgres.Store.
 type UpstreamHealthStore interface {
-	ListUpstreamAccountsForHealth(ctx context.Context, cooldownDueBefore time.Time, limit int) ([]domain.UpstreamAccount, error)
+	ListUpstreamAccountsForHealth(ctx context.Context, cooldownDueBefore time.Time, afterAccountID string, limit int) ([]domain.UpstreamAccount, error)
 	GetUpstreamAccount(ctx context.Context, id string) (*domain.UpstreamAccount, error)
 	GetProvider(ctx context.Context, id string) (*domain.Provider, error)
 	GetCredential(ctx context.Context, id string) (*domain.Credential, error)
@@ -56,7 +57,7 @@ type UpstreamHealthStore interface {
 type UpstreamHealthConfig struct {
 	// Interval between passes (default 60s).
 	Interval time.Duration
-	// BatchLimit caps accounts per pass (default 100).
+	// BatchLimit caps accounts per pass (1..500; default 100).
 	BatchLimit int
 	// Cooldown is how long a failed account stays 'cooldown' before the
 	// next re-probe may flip it back (default 5min; the account is NOT
@@ -82,7 +83,7 @@ func (c *UpstreamHealthConfig) withDefaults() UpstreamHealthConfig {
 	if out.Interval <= 0 {
 		out.Interval = time.Minute
 	}
-	if out.BatchLimit <= 0 {
+	if out.BatchLimit <= 0 || out.BatchLimit > 500 {
 		out.BatchLimit = 100
 	}
 	if out.Cooldown <= 0 {
@@ -108,6 +109,8 @@ type UpstreamHealth struct {
 	audit     management.AuditRecorder
 	clock     domain.Clock
 	cfg       UpstreamHealthConfig
+	passMu    sync.Mutex
+	afterID   string
 }
 
 func NewUpstreamHealth(store UpstreamHealthStore, vault *credentials.Vault, client *connector.Client, refresher *credentials.Refresher, registry connector.Registry, audit management.AuditRecorder, cfg UpstreamHealthConfig, clock domain.Clock) *UpstreamHealth {
@@ -143,7 +146,12 @@ type UpstreamHealthMetrics struct {
 // RunPass executes one health round: first sweep TTL-expired session
 // bindings, response chains and terminal leases, then probe accounts.
 func (w *UpstreamHealth) RunPass(ctx context.Context) (UpstreamHealthMetrics, error) {
+	w.passMu.Lock()
+	defer w.passMu.Unlock()
 	var m UpstreamHealthMetrics
+	if err := ctx.Err(); err != nil {
+		return m, err
+	}
 	expired, err := w.store.EndExpiredSessionBindings(ctx, w.clock.Now(), w.cfg.BatchLimit)
 	if err != nil {
 		return m, err
@@ -160,13 +168,28 @@ func (w *UpstreamHealth) RunPass(ctx context.Context) (UpstreamHealthMetrics, er
 	}
 	m.LeasesReaped = leases
 	dueBefore := w.clock.Now().Add(-w.cfg.Cooldown)
-	accounts, err := w.store.ListUpstreamAccountsForHealth(ctx, dueBefore, w.cfg.BatchLimit)
+	accounts, err := w.store.ListUpstreamAccountsForHealth(ctx, dueBefore, w.afterID, w.cfg.BatchLimit)
 	if err != nil {
 		return m, err
 	}
-	m.Scanned = len(accounts)
+	if len(accounts) == 0 && w.afterID != "" {
+		accounts, err = w.store.ListUpstreamAccountsForHealth(ctx, dueBefore, "", w.cfg.BatchLimit)
+		if err != nil {
+			return m, err
+		}
+	}
 	for i := range accounts {
+		if err := ctx.Err(); err != nil {
+			return m, err
+		}
+		// Advance even when a probe skips, fails or panics; unchanged
+		// prefix accounts must not starve the rest of the eligible pool.
+		w.afterID = accounts[i].ID
+		m.Scanned++
 		w.probe(ctx, &accounts[i], &m)
+	}
+	if len(accounts) < w.cfg.BatchLimit {
+		w.afterID = ""
 	}
 	return m, nil
 }

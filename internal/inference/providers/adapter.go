@@ -20,8 +20,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,8 +51,18 @@ type ChatRequest struct {
 	// ToolChoice is relayed verbatim when present.
 	ToolChoice json.RawMessage
 	// ThinkingEnabled toggles reasoning mode (OpenAI thinking / Anthropic
-	// extended thinking) on models that declare SupportsReasoning.
+	// extended thinking). Nil preserves the upstream default; false must
+	// explicitly disable it. Enabling requires SupportsReasoning.
 	ThinkingEnabled *bool
+	// ReasoningEffort is the EXPLICITLY requested reasoning-effort level
+	// ("low" | "medium" | "high" | "xhigh" | "minimal"). Empty = the client
+	// asked for reasoning without naming a level, and the adapter applies
+	// its protocol's default. A level the upstream protocol cannot express
+	// is REFUSED before dispatch (routing skips the candidate, the adapter
+	// refuses defensively) — it is never folded into another level and
+	// never silently ignored. An explicit effort takes precedence over
+	// ThinkingEnabled, including an explicit false toggle.
+	ReasoningEffort string
 	// ThinkingBudget is the client-declared Anthropic thinking budget
 	// (budget_tokens). Nil means the adapter's default. Only the anthropic
 	// adapter consumes it; other adapters ignore it (their protocols have
@@ -63,17 +75,38 @@ type ChatRequest struct {
 	Passthrough map[string]any
 }
 
+// Auth is the resolved outbound credential of one dispatch: the
+// credential's auth type plus the usable secret. The sealed OAuth bundle
+// never reaches this layer — for an "oauth" credential the Token is the
+// ACCESS TOKEN alone (never the bundle JSON, never the refresh token).
+type Auth struct {
+	// Type is the credential's auth type: "api_key" | "service" | "oauth".
+	Type string
+	// Token is the usable outbound secret (never logged).
+	Token string
+}
+
+// The credential auth types the gateway may dispatch.
+const (
+	AuthTypeAPIKey  = "api_key"
+	AuthTypeService = "service"
+	AuthTypeOAuth   = "oauth"
+)
+
 // Call is one upstream dispatch: the routed deployment, the resolved secret
 // material, the forced output cap, and the tracing id.
 type Call struct {
 	Deployment *domain.Deployment
-	// Secret is the decrypted upstream credential (never logged).
-	Secret []byte
+	// Auth is the resolved upstream credential (never logged).
+	Auth Auth
 	// RequestID is the gateway's logical request id, propagated as the
 	// X-Request-Id tracing boundary (operator headers can never override
 	// it — domain.ValidateCustomHeaders).
 	RequestID string
 	Request   *ChatRequest
+	// ClientProtocol selects the caller's output surface. Empty preserves
+	// raw Chat behavior for callers that do not request native translation.
+	ClientProtocol domain.Protocol
 	// OutputCap is the forced output ceiling forwarded upstream (设计 §7.2:
 	// 不允许无限输出).
 	OutputCap int64
@@ -93,16 +126,21 @@ type Adapter interface {
 	// BuildPayload renders the upstream request body. OutputCap is always
 	// forwarded as the protocol's hard output limit.
 	BuildPayload(call *Call) ([]byte, error)
-	// AuthHeaders turns the decrypted secret into the protocol's auth
-	// headers (Authorization: Bearer vs x-api-key).
-	AuthHeaders(secret []byte) map[string]string
+	// AuthHeaders turns the resolved credential into the protocol's auth
+	// headers (Authorization: Bearer vs x-api-key). An auth type the
+	// protocol does not support is REFUSED with an error — the adapter
+	// never guesses a header slot for material it does not understand.
+	AuthHeaders(auth Auth) (map[string]string, error)
 	// WrapStream converts an upstream streaming 200 body into an
 	// OpenAI-shaped SSE byte stream plus its incremental usage tap.
 	// Anthropic streams are translated; OpenAI streams pass through.
 	WrapStream(body io.ReadCloser) *Stream
 	// DecodeNonStream parses a non-streaming 200 body: the OpenAI-shaped
 	// chat.completion payload for the client, the normalized usage, and
-	// whether the upstream reported usage at all.
+	// whether the upstream reported usage at all. An unparseable response
+	// returns nil plus error (execution unknown). A fully decoded response
+	// that cannot be translated faithfully returns metering without Payload
+	// plus error: that execution must be settled, never replayed.
 	DecodeNonStream(body []byte) (*NonStreamResult, error)
 }
 
@@ -116,6 +154,15 @@ func RegisteredAdapters() map[domain.Protocol]Adapter {
 		domain.ProtocolOpenAIResponses:  NewOpenAIResponses(),
 		domain.ProtocolAnthropicMessage: NewAnthropicMessages(),
 	}
+}
+
+// AdapterForProtocol returns the registered adapter of one protocol. The
+// probe surface uses it to pick the PROTOCOL's authentication and version
+// headers — the same adapter the dispatcher uses, so a probe never invents
+// a header shape the dispatch path would refuse (T9).
+func AdapterForProtocol(p domain.Protocol) (Adapter, bool) {
+	a, ok := RegisteredAdapters()[p]
+	return a, ok
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +229,11 @@ func IsCanceled(err error) bool {
 // classifyTransport splits a transport error into definitely-not-executed
 // (DNS failure, connection refused — the request never reached a server)
 // vs unknown-execution (timeout/reset after the request may have left).
+//
+// T7 口径：建连超时（deployment.connect_timeout 到期）也归入 unknown —
+// 传输层无法区分「连接没建成」与「请求已出去但答复没回来」，而仓库的
+// 核心约束是「不确定是否已执行的上游请求不得盲目重放」。因此建连超时
+// 的请求进核对（保留预占），不切换候选。
 func classifyTransport(err error) (executedUnknown bool) {
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
@@ -231,15 +283,32 @@ type egressDialer interface {
 // Authorization/Cookie，x-api-key 与 operator 扩展头会被逐字拷给新主机，
 // 307/308 还会重发完整请求体（客户 prompt）。返回 ErrUseLastResponse 让
 // 3xx 响应体作为上游错误 surfaced（Dispatch 按非 200 处理）。
+//
+// T7：建连阶段由 deployment.connect_timeout 控制 —— 拨号函数按 ctx 上的
+// 建连预算现算一个只覆盖「建连」的截止时间（DNS + TCP connect）。已建立
+// 的连接不受它约束（SSE 长流不被截断），请求总时长仍由
+// deployment.request_timeout 决定（网关在 attemptCtx 上施加）。
+// transport 是共享的**一个**（一个连接池）：绝不每请求新建 transport ——
+// 那会按请求速率泄漏连接池。
 func NewHTTPClient(egress EgressChecker) *http.Client {
-	dial := (&net.Dialer{
-		Timeout:   10 * time.Second,
+	baseDial := (&net.Dialer{
 		KeepAlive: 30 * time.Second,
 	}).DialContext
 	if egress != nil {
 		if ed, ok := egress.(egressDialer); ok {
-			dial = ed.DialContext
+			baseDial = ed.DialContext
 		}
+	}
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		timeout := domain.ConnectTimeoutFrom(ctx)
+		if timeout <= 0 {
+			timeout = domain.DefaultConnectTimeout
+		}
+		// 拨号 ctx 只在「建连」期间有效：拨号返回后立刻取消（返回的 conn
+		// 与 ctx 无绑定），已建立的流不受影响。
+		dctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return baseDial(dctx, network, addr)
 	}
 	c := &http.Client{Transport: &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
@@ -282,18 +351,32 @@ func sameOrigin(a, b *url.URL) bool {
 // gateway decides retry vs release vs reconcile from the error's
 // Retryable/ExecutedUnknown flags. A BuildPayload failure is a client/shape
 // error (*domain.Error with CodeInvalidInput), not an upstream failure.
+// A nonnil result plus error is a decoded execution rejected by translation:
+// settle its metering once without serving its payload or retrying.
 func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (*DispatchResult, error) {
 	payload, err := a.BuildPayload(call)
 	if err != nil {
 		return nil, err
 	}
+	// T7：把 deployment 的建连预算挂到 ctx 上 —— transport 的拨号阶段按它
+	// 现算一个只覆盖「建连」的截止时间。已建立的流不受它约束（请求总
+	// 时长由网关的 request_timeout 决定）。
+	ctx = domain.WithConnectTimeout(ctx, call.Deployment.ConnectTimeout)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, EndpointURL(call.Deployment), bytes.NewReader(payload))
 	if err != nil {
 		return nil, domain.WrapError(domain.CodeInternal, "providers: build upstream request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Request-Id", call.RequestID)
-	for k, v := range a.AuthHeaders(call.Secret) {
+	authHeaders, err := a.AuthHeaders(call.Auth)
+	if err != nil {
+		// The adapter does not support this credential kind on its
+		// protocol: NOTHING is sent. NoCooldown — a credential/protocol
+		// mismatch is a configuration fact, not an upstream hiccup, so the
+		// account must not be cooled for it.
+		return nil, &DispatchError{Err: err, NoCooldown: true}
+	}
+	for k, v := range authHeaders {
 		req.Header.Set(k, v)
 	}
 	// Operator-configured headers: validated at write time (Task 4) and
@@ -309,10 +392,19 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, &DispatchError{Err: err}
+	}
+	// Before a connection is obtained cancellation proves no request was
+	// sent. Afterwards even a missing response can hide a paid execution.
+	var connected atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	}))
 	resp, err := client.Do(req)
 	if err != nil {
 		if IsCanceled(err) {
-			return nil, &DispatchError{Err: err} // caller gone — not retryable
+			return nil, &DispatchError{Err: err, ExecutedUnknown: connected.Load()}
 		}
 		return nil, &DispatchError{Err: err, ExecutedUnknown: classifyTransport(err)}
 	}
@@ -323,8 +415,18 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	}
 
 	d := &DispatchResult{UpstreamRequestID: upstreamRequestID(resp)}
+	nativeClient := call.ClientProtocol == domain.ProtocolAnthropicMessage ||
+		call.ClientProtocol == domain.ProtocolOpenAIResponses
 	if call.Request.Stream {
 		d.Stream = a.WrapStream(resp.Body)
+		if tap, ok := d.Stream.Tap.(*OpenAIUsageTracker); ok && nativeClient {
+			// Configure before the caller can read; refusal is a translation
+			// failure on native surfaces, not a raw Chat upstream failure.
+			tap.rejectRefusal = true
+		}
+		if call.ClientProtocol == domain.ProtocolAnthropicMessage {
+			d.Stream.Tap = &messagesValidationTap{base: d.Stream.Tap}
+		}
 		return d, nil
 	}
 	defer resp.Body.Close()
@@ -339,9 +441,23 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 		}
 	}
 	ns, err := a.DecodeNonStream(body)
-	if err != nil {
+	if err != nil && ns == nil {
 		// A 200 we cannot parse: consumption unknown, nothing relayed.
 		return nil, &DispatchError{Err: err, ExecutedUnknown: true}
+	}
+	if ns.hasRefusal && nativeClient {
+		ns.Payload = nil
+		err = errChatRefusal
+	}
+	if err == nil && call.ClientProtocol == domain.ProtocolAnthropicMessage {
+		v, validationErr := parseCompletion(ns.Payload)
+		if validationErr == nil {
+			validationErr = validateMessagesCompletion(v)
+		}
+		if validationErr != nil {
+			ns.Payload = nil
+			err = validationErr
+		}
 	}
 	d.Payload = ns.Payload
 	d.Usage = ns.Usage
@@ -351,7 +467,7 @@ func Dispatch(ctx context.Context, client *http.Client, a Adapter, call *Call) (
 	if d.UpstreamRequestID == "" {
 		d.UpstreamRequestID = ns.UpstreamRequestID
 	}
-	return d, nil
+	return d, err
 }
 
 // DispatchResult is one admitted upstream attempt's live result.
@@ -364,21 +480,24 @@ type DispatchResult struct {
 	Usage         domain.UsageBuckets
 	UsageRaw      json.RawMessage
 	UsageReported bool
-	// ContentBytes is the visible answer size for the estimate path.
+	// ContentBytes is the generated answer size for the estimate path.
 	ContentBytes int64
 }
 
 // NonStreamResult is the adapter's decode of a non-streaming response.
+// When returned with an error, only metering and identity are usable;
+// Payload is nil because the response cannot be translated faithfully.
 type NonStreamResult struct {
 	Payload           []byte
 	Usage             domain.UsageBuckets
 	UsageRaw          json.RawMessage
 	UsageReported     bool
 	UpstreamRequestID string
-	// ContentBytes is the visible answer size (content + reasoning across
+	// ContentBytes is the generated answer size (text + reasoning + tool arguments across
 	// choices) — the output side of the estimate when the upstream omits
 	// usage (与流式 tap 的 ContentBytes 同口径).
 	ContentBytes int64
+	hasRefusal   bool
 }
 
 // upstreamRequestID prefers the conventional response headers; adapters

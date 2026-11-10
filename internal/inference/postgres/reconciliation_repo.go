@@ -8,6 +8,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/lib/pq"
+
+	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/accounting"
 	"github.com/yunhou/users/internal/inference/domain"
 )
@@ -49,7 +52,8 @@ type EnqueueReconciliationCommand struct {
 // caller's transaction. Request-scoped jobs dedup on UNIQUE(request_id);
 // window-level jobs dedup on the partial (detail->>'window_id') index. A
 // repeat delivery merges detail (jsonb ||, new keys win) and extends the
-// deadline — never spawns a second job for the same subject.
+// deadline. Settlement observations are unioned by content identity rather
+// than replaced, including refreshes without new evidence.
 func (s *Store) EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfWork, cmd EnqueueReconciliationCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -60,31 +64,67 @@ func (s *Store) EnqueueReconciliationJobTx(ctx context.Context, w domain.UnitOfW
 		detail = json.RawMessage(`{"schema_version":1}`)
 	}
 	if cmd.RequestID != nil {
-		// Upsert: merge detail, extend the deadline. A new reason over a
-		// resolved/escalated job is NEW information (e.g. the correction that
-		// resolved crash_recovery just detected an overage) → reopen pending
-		// under the new reason; the merged detail keeps the prior history.
-		// Same-reason re-delivery over an open job is the idempotent merge.
+		// Upsert: merge detail, extend the deadline.
+		//
+		// 原因的**接管规则**（T2 修复轮）：一个请求至多一个核对任务，任务
+		// 的原因就是恢复 worker 判断"能不能自动驱动"的唯一依据，因此原因
+		// 必须与实际分类保持一致：
+		//   - 只能人工处理的原因（$6 = ManualOnlyReconciliationReasons）必须
+		//     接管一个仍挂起的、证据驱动原因的任务 —— 否则恢复 worker 会继续
+		//     按证据驱动路径反复重放并重复告警；
+		//   - 人工原因永不被降级回证据驱动原因（既有的人工结论不被覆盖）；
+		//   - 已关闭（resolved/escalated）且原因是新的 → 重开为 pending
+		//     （新信息），detail 合并保留既有审计内容，reason_history 记录
+		//     被替换掉的原因。
+		//
+		// changed（下面 SQL 里重复使用的同一条件）：
+		//   非人工原因 AND（人工新原因 OR（已关闭 AND 原因不同））。
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO inference_reconciliation_jobs (id, request_id, reason, detail, deadline_at)
 			 VALUES ($1,$2,$3,$4,$5)
 			 ON CONFLICT (request_id) DO UPDATE
-			 SET detail = inference_reconciliation_jobs.detail || EXCLUDED.detail,
+			 SET detail = inference_reconciliation_jobs.detail || EXCLUDED.detail
+			         || CASE WHEN inference_reconciliation_jobs.detail ? 'settlement_evidence'
+			                   OR EXCLUDED.detail ? 'settlement_evidence'
+			              THEN jsonb_build_object('settlement_evidence',
+			                   COALESCE(inference_reconciliation_jobs.detail->'settlement_evidence', '{}'::jsonb)
+			                   || COALESCE(EXCLUDED.detail->'settlement_evidence', '{}'::jsonb)
+			                   || jsonb_build_object('observations',
+			                        COALESCE(inference_reconciliation_jobs.detail#>'{settlement_evidence,observations}', '{}'::jsonb)
+			                        || COALESCE(EXCLUDED.detail#>'{settlement_evidence,observations}', '{}'::jsonb)))
+			              ELSE '{}'::jsonb END
+			         || CASE WHEN (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			                   AND (EXCLUDED.reason = ANY($6)
+			                        OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                            AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
+			              THEN jsonb_build_object('reason_history',
+			                   COALESCE(inference_reconciliation_jobs.detail->'reason_history', '[]'::jsonb)
+			                   || jsonb_build_array(inference_reconciliation_jobs.reason))
+			              ELSE '{}'::jsonb END,
 			     deadline_at = GREATEST(inference_reconciliation_jobs.deadline_at, EXCLUDED.deadline_at),
 			     status = CASE
 			         WHEN inference_reconciliation_jobs.status IN ('resolved','escalated')
-			          AND inference_reconciliation_jobs.reason <> EXCLUDED.reason
+			          AND (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			               AND (EXCLUDED.reason = ANY($6)
+			                    OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                        AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
 			         THEN 'pending' ELSE inference_reconciliation_jobs.status END,
 			     reason = CASE
-			         WHEN inference_reconciliation_jobs.status IN ('resolved','escalated')
-			          AND inference_reconciliation_jobs.reason <> EXCLUDED.reason
+			         WHEN (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			               AND (EXCLUDED.reason = ANY($6)
+			                    OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                        AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
 			         THEN EXCLUDED.reason ELSE inference_reconciliation_jobs.reason END,
 			     resolved_at = CASE
 			         WHEN inference_reconciliation_jobs.status IN ('resolved','escalated')
-			          AND inference_reconciliation_jobs.reason <> EXCLUDED.reason
+			          AND (NOT (inference_reconciliation_jobs.reason = ANY($6))
+			               AND (EXCLUDED.reason = ANY($6)
+			                    OR (inference_reconciliation_jobs.status IN ('resolved','escalated')
+			                        AND inference_reconciliation_jobs.reason <> EXCLUDED.reason)))
 			         THEN NULL ELSE inference_reconciliation_jobs.resolved_at END,
 			     updated_at = now()`,
-			uuid.NewString(), *cmd.RequestID, cmd.Reason, detail, cmd.Deadline)
+			uuid.NewString(), *cmd.RequestID, cmd.Reason, detail, cmd.Deadline,
+			pq.Array(ManualOnlyReconciliationReasons))
 		return mapError("reconciliation: enqueue request job", err)
 	}
 	if cmd.WindowID == "" {
@@ -296,9 +336,35 @@ type CorrectionCommand struct {
 	RequestID string
 	// Corrected is the new usage fact (Source/Buckets); AttemptID must name
 	// the attempt it revises — the revision number is assigned as max+1.
+	//
+	// The buckets must be the NORMALIZED ones (the same disjoint shape the
+	// settlement path stores — see accounting.BillableBuckets): the stored
+	// usage history and the token budget are then derived from the same
+	// measure.
 	Corrected domain.UsageRecord
-	// CorrectedMicros is the re-priced customer consumption (microcredit).
+	// CorrectedMicros is the re-priced consumption in the request's pinned
+	// unit: microcredit for plan, micromoney for wallet.
 	CorrectedMicros domain.Microcredit
+	// CorrectedTokens is the ABSOLUTE corrected normalized token total (the
+	// TPM budget measure: input + cache read + cache write + output after
+	// the overlap normalization the settlement path bills — the caller
+	// computes it with access.NormalizedTokens over the SAME normalized
+	// buckets it carries in Corrected).
+	//
+	//   - non-nil → the request's rate reservation token total is REPLACED
+	//     by it in the SAME transaction as the ledger correction (the
+	//     storage effect is a net delta: the row keeps ONE authoritative
+	//     total, never an accumulation across usage revisions) and the
+	//     ORIGINAL settlement instant is kept — a correction never resets
+	//     the 60-second window attribution;
+	//   - nil → the corrected evidence carries NO known token total
+	//     (unknown): the token-budget correction is a deliberate no-op and
+	//     the previous total is kept. Unknown never collapses into zero.
+	//
+	// It is REQUIRED whenever the corrected evidence carries known token
+	// buckets, and must equal input + cache read + cache write + output.
+	// Reasoning is already included in output and is not added again.
+	CorrectedTokens *int64
 	Reason          string
 	// OperatorSubject + IdempotencyKey follow the adjustment contract
 	// (设计 §9.2: 有原因、对象、金额/额度、操作者和幂等键). Recovery-driven
@@ -323,13 +389,19 @@ type CorrectionCommand struct {
 //     linked to the compensation row) — 冲正分录;
 //     corrected != 0: append an ADJUSTMENT entry of |corrected − base|
 //     (debit = 补差 / credit = 退还) — 补差分录;
-//     either way the inference_adjustments row carries reason + operator +
-//     idempotency key (设计 §9.2; 重复投递撞唯一键只生效一次);
-//  5. correct every bound window's used and the Key budget by the SAME
+//     corrected == base: metering-only correction, no financial entries.
+//     Every correction has an inference_usage_corrections receipt carrying
+//     reason + operator + a shared unique idempotency key. Monetary changes
+//     also retain their inference_adjustments row (设计 §9.2);
+//  5. correct the TOKEN BUDGET in the SAME transaction: the rate
+//     reservation's token total is replaced by the corrected ABSOLUTE total
+//     (its storage effect is a net delta) and the original settlement
+//     instant is kept — money and TPM can never disagree;
+//  6. correct every bound window's used and the Key budget by the SAME
 //     signed delta (guards forbid a negative aggregate);
-//  6. update the request's settled amount/usage status;
-//  7. resolve the request's open reconciliation job (evidence landed);
-//  8. re-check the hold: corrected > reserved enqueues settlement_overage
+//  7. update the request's settled amount/usage status;
+//  8. resolve the request's open reconciliation job (evidence landed);
+//  9. re-check the hold: corrected > reserved enqueues settlement_overage
 //     (超出预占显示异常,不隐藏负差额).
 //
 // 账本重建口径随之成立：窗口 used ≡ Σ charge − Σ reversal ± Σ 请求级
@@ -338,12 +410,17 @@ type CorrectionCommand struct {
 // A replayed IdempotencyKey hits the UNIQUE key → CodeConflict: the caller
 // treats it as already-applied.
 //
-// 仅支持 charge_source='plan' 的请求。wallet 计费请求显式拒绝
-// （CodeInvalidInput，评审轮1 Important-1）：wallet 路径的 settled_micros
-// 是 micromoney 而非 microcredit，入场也未做 key-budget 预占，且更正需要
-// 钱包补偿分录——在完整实现 wallet 分支前统一拒绝，避免通用调用方静默
-// 腐蚀钱包状态（当前本方法无生产调用方，更正通道本期未接线，见计划
-// Task 9 已知限制）。
+// token 预算修正的边界：
+//   - CorrectedTokens = nil（修正证据没有已知 token 总量）→ token 预算
+//     **保留原值**，绝不记零（unknown ≠ 0）；
+//   - 速率行**缺失**（迁移 052 之前的老请求，或终态行已被保留期清理掉）
+//     → 良性缺席：金额修正照常生效，不回滚；
+//   - 速率行**存在但畸形**（已结算请求的速率行仍是在途状态；或只剩 Key 行
+//     而没有账户行）→ 明确冲突，绝不当成良性缺席放过。
+//
+// Wallet corrections append source-specific micromoney adjustments instead
+// of changing plan windows or Key money budgets. Account locking precedes
+// request locking, matching wallet mutations and reservation release.
 func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd CorrectionCommand) error {
 	tx, err := sqlTx(w)
 	if err != nil {
@@ -353,59 +430,148 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return domain.NewError(domain.CodeInvalidInput,
 			"correction: reason, operator subject and idempotency key are required")
 	}
+	var accountAnchor string
+	if err := tx.GetContext(ctx, &accountAnchor,
+		`SELECT billing_account_id FROM inference_requests WHERE id = $1`, cmd.RequestID); err != nil {
+		return mapError("correction: account", err)
+	}
+	if err := lockAccountTx(ctx, tx, accountAnchor); err != nil {
+		return err
+	}
 
-	// Idempotency first: a replayed delivery is recognized as already-applied
-	// BEFORE the no-op check — after the first application the stored delta
-	// base has moved, so the same command would otherwise misread as a no-op.
+	// 1. Lock + require settled. The delta base is the CURRENT settled
+	// amount, never the immutable original charge.
+	var status, accountID, chargeSource string
+	var reserved, settled, expectedHold sql.NullInt64
+	var apiKeyID sql.NullString
+	var win5h, winW, winM sql.NullString
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT status, billing_account_id, reserved_micros, settled_micros, expected_hold_micros, api_key_id,
+		        window_five_hour_id, window_weekly_id, window_monthly_id, charge_source
+		 FROM inference_requests WHERE id = $1 FOR UPDATE`, cmd.RequestID).
+		Scan(&status, &accountID, &reserved, &settled, &expectedHold, &apiKeyID, &win5h, &winW, &winM, &chargeSource); err != nil {
+		return mapError("correction: lock request", err)
+	}
+	// Check AFTER acquiring the request lock: another delivery may have
+	// committed while we waited. Replays must conflict before the no-op
+	// check sees the newly corrected money/evidence.
 	var seen string
 	if err := tx.QueryRowxContext(ctx,
-		`SELECT id FROM inference_adjustments WHERE idempotency_key = $1`,
+		`SELECT idempotency_key FROM inference_usage_corrections WHERE idempotency_key = $1
+		 UNION ALL
+		 SELECT idempotency_key FROM inference_adjustments WHERE idempotency_key = $1
+		 LIMIT 1`,
 		cmd.IdempotencyKey).Scan(&seen); err == nil {
 		return domain.NewError(domain.CodeConflict,
 			"correction: idempotency key already applied")
 	} else if domain.CodeOf(mapError("correction: idempotency lookup", err)) != domain.CodeNotFound {
 		return mapError("correction: idempotency lookup", err)
 	}
-
-	// 1. Lock + require settled. The delta base is the CURRENT settled
-	// amount, never the immutable original charge.
-	var status, accountID, chargeSource string
-	var reserved, settled sql.NullInt64
-	var apiKeyID sql.NullString
-	var win5h, winW, winM sql.NullString
-	if err := tx.QueryRowxContext(ctx,
-		`SELECT status, billing_account_id, reserved_micros, settled_micros, api_key_id,
-		        window_five_hour_id, window_weekly_id, window_monthly_id, charge_source
-		 FROM inference_requests WHERE id = $1 FOR UPDATE`, cmd.RequestID).
-		Scan(&status, &accountID, &reserved, &settled, &apiKeyID, &win5h, &winW, &winM, &chargeSource); err != nil {
-		return mapError("correction: lock request", err)
+	if accountID != accountAnchor {
+		return domain.NewError(domain.CodeConflict, "correction: request account changed")
 	}
-	// wallet 计费请求显式拒绝（见方法 doc：单位/预算/补偿分录均未适配）。
-	if chargeSource == string(domain.ChargeSourceWallet) {
-		return domain.NewError(domain.CodeInvalidInput,
-			"correction: wallet-charged requests are not supported (钱包更正通道本期未接线)")
-	}
+	wallet := chargeSource == string(domain.ChargeSourceWallet)
 	if domain.RequestStatus(status) != domain.ReqSettled {
 		return domain.NewError(domain.CodeConflict,
 			"correction: request not settled ("+status+") — settle first, corrections revise a settlement")
+	}
+	attemptID, err := uuid.Parse(cmd.Corrected.AttemptID)
+	if err != nil {
+		return domain.WrapError(domain.CodeInvalidInput,
+			"correction: invalid attempt ID", err)
+	}
+	cmd.Corrected.AttemptID = attemptID.String()
+	var settledAttempt bool
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT EXISTS (
+		    SELECT 1 FROM inference_attempts a
+		    JOIN inference_usage_records u ON u.attempt_id = a.id AND u.request_id = a.request_id
+		    WHERE a.id = $1 AND a.request_id = $2)`,
+		cmd.Corrected.AttemptID, cmd.RequestID).Scan(&settledAttempt); err != nil {
+		return mapError("correction: settled attempt", err)
+	}
+	if !settledAttempt {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: the corrected attempt has no settlement usage for the request")
+	}
+	// The corrected token evidence must be explicit: known token buckets
+	// without a corrected total would silently omit the token budget (the
+	// ledger and the rate budget would disagree).
+	total, err := access.NormalizedTokens(cmd.Corrected.Buckets)
+	if err != nil {
+		return err
+	}
+	if cmd.CorrectedTokens != nil && *cmd.CorrectedTokens < 0 {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: corrected token total must not be negative")
+	}
+	if cmd.CorrectedTokens == nil && access.KnownTokenBuckets(cmd.Corrected.Buckets) {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: the corrected evidence carries token buckets but no corrected token total"+
+				" (the token budget correction must not be omitted)")
+	}
+	if cmd.CorrectedTokens != nil && access.KnownTokenBuckets(cmd.Corrected.Buckets) &&
+		*cmd.CorrectedTokens != total {
+		return domain.NewError(domain.CodeInvalidInput,
+			"correction: corrected token total does not match normalized evidence")
 	}
 	if !settled.Valid {
 		return domain.NewError(domain.CodeConflict,
 			"correction: settled request without settled_micros (ledger drift — reconcile first)")
 	}
 	base := domain.Microcredit(settled.Int64)
-	direction, delta, err := accounting.CorrectionDelta(base, cmd.CorrectedMicros)
-	if err != nil {
-		return err
+	var direction string
+	var delta domain.Microcredit
+	if cmd.CorrectedMicros != base {
+		direction, delta, err = accounting.CorrectionDelta(base, cmd.CorrectedMicros)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Equal money is not necessarily equal evidence (e.g. a free model).
+		// Compare nullable buckets and JSON semantically; unknown is not zero.
+		raw := cmd.Corrected.RawUsage.Raw
+		if len(raw) == 0 {
+			raw = json.RawMessage(`{"schema_version":1}`)
+		}
+		var unchanged bool
+		if err := tx.QueryRowxContext(ctx,
+			`SELECT source = $3
+			        AND input_tokens IS NOT DISTINCT FROM $4
+			        AND cache_read_tokens IS NOT DISTINCT FROM $5
+			        AND cache_write_tokens IS NOT DISTINCT FROM $6
+			        AND output_tokens IS NOT DISTINCT FROM $7
+			        AND reasoning_tokens IS NOT DISTINCT FROM $8
+			        AND raw_usage = $9::jsonb
+			        AND ($10::bigint IS NULL OR NOT EXISTS (
+			            SELECT 1 FROM inference_rate_reservations
+			            WHERE request_id = $1 AND scope = 'account'
+			              AND settled_tokens IS DISTINCT FROM $10))
+			 FROM inference_usage_records
+			 WHERE request_id = $1 AND attempt_id = $2
+			 ORDER BY revision DESC LIMIT 1`,
+			cmd.RequestID, cmd.Corrected.AttemptID, string(cmd.Corrected.Source),
+			int64PtrFromPtr(cmd.Corrected.Buckets.InputTokens), int64PtrFromPtr(cmd.Corrected.Buckets.CacheReadTokens),
+			int64PtrFromPtr(cmd.Corrected.Buckets.CacheWriteTokens), int64PtrFromPtr(cmd.Corrected.Buckets.OutputTokens),
+			int64PtrFromPtr(cmd.Corrected.Buckets.ReasoningTokens), raw, int64PtrFromPtr(cmd.CorrectedTokens)).
+			Scan(&unchanged); err != nil {
+			return mapError("correction: compare usage", err)
+		}
+		if unchanged {
+			return domain.NewError(domain.CodeInvalidInput,
+				"correction: money and usage are unchanged (no-op corrections are not appended)")
+		}
 	}
 
 	// 2. The charge row (reversal target when voiding).
 	var chargeID sql.NullInt64
-	if err := tx.QueryRowxContext(ctx,
-		`SELECT id FROM inference_ledger_entries
-		 WHERE request_id = $1 AND entry_type = 'charge'`, cmd.RequestID).
-		Scan(&chargeID); err != nil {
-		return mapError("correction: load charge", err)
+	if delta > 0 && !wallet {
+		if err := tx.QueryRowxContext(ctx,
+			`SELECT id FROM inference_ledger_entries
+			 WHERE request_id = $1 AND entry_type = 'charge'`, cmd.RequestID).
+			Scan(&chargeID); err != nil {
+			return mapError("correction: load charge", err)
+		}
 	}
 
 	// 3. Corrected usage revision (original preserved).
@@ -425,35 +591,67 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		return err
 	}
 
-	// 4. Compensation row (idempotency key lives here) + ledger entry:
-	//    void → reversal of the current effect; otherwise delta adjustment.
-	adjID := uuid.NewString()
+	// The receipt and usage roll back together. Its unique key also arbitrates
+	// concurrent monetary and metering-only deliveries across requests.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO inference_adjustments
-		 (id, billing_account_id, request_id, reason, amount_micros, direction,
-		  unit, operator_subject, service_subject, idempotency_key)
-		 VALUES ($1,$2,$3,$4,$5,$6,'microcredit',$7,'inference-reconciliation',$8)`,
-		adjID, accountID, cmd.RequestID, cmd.Reason, int64(delta), direction,
-		cmd.OperatorSubject, cmd.IdempotencyKey); err != nil {
-		return mapError("correction: adjustment", err)
+		`INSERT INTO inference_usage_corrections
+		 (idempotency_key, request_id, usage_record_id, corrected_micros,
+		  corrected_tokens, reason, operator_subject)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		cmd.IdempotencyKey, cmd.RequestID, usage.ID, int64(cmd.CorrectedMicros),
+		int64PtrFromPtr(cmd.CorrectedTokens), cmd.Reason, cmd.OperatorSubject); err != nil {
+		return mapError("correction: receipt", err)
 	}
-	if cmd.CorrectedMicros == 0 && base > 0 {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO inference_ledger_entries
-			 (billing_account_id, request_id, entry_type, amount_micros, unit,
-			  reverses_entry_id, adjustment_id, created_by)
-			 VALUES ($1,$2,'reversal',$3,'microcredit',$4,$5,$6)`,
-			accountID, cmd.RequestID, int64(base), chargeID.Int64, adjID,
-			"system:"+cmd.OperatorSubject); err != nil {
-			return mapError("correction: reversal", err)
+
+	// 4. Wallet source deltas use the original frozen composition.
+	var walletHold int64
+	if wallet {
+		walletHold, err = correctWalletSettlementTx(ctx, tx, accountID, cmd, int64(base))
+		if err != nil {
+			return err
 		}
-	} else {
+	}
+	// Plan only: void -> reversal, otherwise adjustment.
+	if delta > 0 && !wallet {
+		adjID := uuid.NewString()
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO inference_ledger_entries
-			 (billing_account_id, request_id, entry_type, amount_micros, unit, adjustment_id, created_by)
-			 VALUES ($1,$2,'adjustment',$3,'microcredit',$4,$5)`,
-			accountID, cmd.RequestID, int64(delta), adjID, "system:"+cmd.OperatorSubject); err != nil {
-			return mapError("correction: adjustment entry", err)
+			`INSERT INTO inference_adjustments
+			 (id, billing_account_id, request_id, reason, amount_micros, direction,
+			  unit, operator_subject, service_subject, idempotency_key)
+			 VALUES ($1,$2,$3,$4,$5,$6,'microcredit',$7,'inference-reconciliation',$8)`,
+			adjID, accountID, cmd.RequestID, cmd.Reason, int64(delta), direction,
+			cmd.OperatorSubject, cmd.IdempotencyKey); err != nil {
+			return mapError("correction: adjustment", err)
+		}
+		if cmd.CorrectedMicros == 0 && base > 0 {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO inference_ledger_entries
+				 (billing_account_id, request_id, entry_type, amount_micros, unit,
+				  reverses_entry_id, adjustment_id, created_by)
+				 VALUES ($1,$2,'reversal',$3,'microcredit',$4,$5,$6)`,
+				accountID, cmd.RequestID, int64(base), chargeID.Int64, adjID,
+				"system:"+cmd.OperatorSubject); err != nil {
+				return mapError("correction: reversal", err)
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO inference_ledger_entries
+				 (billing_account_id, request_id, entry_type, amount_micros, unit, adjustment_id, created_by)
+				 VALUES ($1,$2,'adjustment',$3,'microcredit',$4,$5)`,
+				accountID, cmd.RequestID, int64(delta), adjID, "system:"+cmd.OperatorSubject); err != nil {
+				return mapError("correction: adjustment entry", err)
+			}
+		}
+	}
+
+	// 5b. The TOKEN BUDGET correction rides in the SAME transaction as the
+	// ledger correction — money and TPM can never disagree. The rate row
+	// may be legitimately absent (pre-052 request / retention purge): that
+	// is a benign absence and the money correction still applies; a row
+	// that is present but malformed fails loudly.
+	if cmd.CorrectedTokens != nil {
+		if err := s.correctRateTokensTx(ctx, tx, cmd.RequestID, *cmd.CorrectedTokens); err != nil {
+			return err
 		}
 	}
 
@@ -465,7 +663,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		signed = -signed
 	}
 	for _, wID := range []sql.NullString{win5h, winW, winM} {
-		if !wID.Valid {
+		if wallet || !wID.Valid || delta == 0 {
 			continue
 		}
 		res, err := tx.ExecContext(ctx,
@@ -480,7 +678,7 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 				"correction: window used would go negative (ledger/window drift — reconcile first)")
 		}
 	}
-	if apiKeyID.Valid {
+	if !wallet && apiKeyID.Valid && delta > 0 {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE inference_api_keys
 			 SET budget_used_micros = budget_used_micros + $2, updated_at = now()
@@ -508,11 +706,12 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	// settlement_overage anomaly is NOT evidence-resolved; blindly resolving
 	// it here and re-enqueueing it in step 9 would leave a same-reason job
 	// resolved and invisible while the request is still over its hold.
+	// Escalation pages a human; a successful correction can still resolve it.
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE inference_reconciliation_jobs
 		 SET status = 'resolved', resolved_at = now(), updated_at = now(),
 		     detail = detail || $2
-		 WHERE request_id = $1 AND status IN ('pending','running')
+		 WHERE request_id = $1 AND status IN ('pending','running','escalated')
 		   AND reason IN ('crash_recovery','unknown_usage')`,
 		cmd.RequestID, mustJSON(map[string]string{
 			"resolution": "corrected by real evidence: " + cmd.Reason,
@@ -524,17 +723,44 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 	// enqueue/refresh the anomaly (the open job merges detail and STAYS
 	// pending); back within the hold → the anomaly is addressed by this
 	// correction, so an open overage job resolves with the note.
-	if reserved.Valid && cmd.CorrectedMicros > domain.Microcredit(reserved.Int64) {
+	// 8.1. Overage re-check against the request's monetary upper bound: the
+	// durable admission fact (migration 050) when the row carries it, else
+	// the legacy hold amount. A window-less request has no hold row at all,
+	// so its baseline is the priced upper bound — without it every real
+	// charge would look like an overage.
+	holdMicros, hasHold := domain.HoldUpperBound(&domain.Request{
+		ReservedMicros:     microFromNull(reserved),
+		ExpectedHoldMicros: microFromNull(expectedHold),
+	})
+	if wallet {
+		holdMicros, hasHold = domain.Microcredit(walletHold), true
+	}
+	if hasHold && cmd.CorrectedMicros > holdMicros {
 		detail := mustJSON(map[string]interface{}{
 			"schema_version":  1,
-			"reserved_micros": reserved.Int64,
+			"reserved_micros": int64(holdMicros),
 			"charge_micros":   int64(cmd.CorrectedMicros),
-			"over_micros":     int64(cmd.CorrectedMicros) - reserved.Int64,
+			"over_micros":     int64(cmd.CorrectedMicros) - int64(holdMicros),
 			"origin":          "correction",
 		})
 		deadline := cmd.At.UTC().Add(24 * time.Hour)
 		if cmd.At.IsZero() {
 			deadline = time.Now().UTC().Add(24 * time.Hour)
+		}
+		// A changed correction is new evidence, not duplicate enqueue delivery.
+		// Archive the addressed incident before reopening only a resolved overage.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE inference_reconciliation_jobs
+			 SET status = 'pending', resolved_at = NULL, updated_at = now(),
+			     deadline_at = $2,
+			     detail = (detail - 'resolution') || jsonb_build_object(
+			         'resolution_history',
+			         COALESCE(detail->'resolution_history', '[]'::jsonb)
+			         || jsonb_build_array(jsonb_build_object(
+			             'resolution', detail->'resolution', 'resolved_at', resolved_at)))
+			 WHERE request_id = $1 AND reason = 'settlement_overage' AND status = 'resolved'`,
+			cmd.RequestID, deadline); err != nil {
+			return mapError("correction: reopen overage job", err)
 		}
 		if err := s.EnqueueReconciliationJobTx(ctx, w, EnqueueReconciliationCommand{
 			RequestID: &cmd.RequestID, Reason: "settlement_overage",
@@ -542,12 +768,12 @@ func (s *Store) CorrectSettlement(ctx context.Context, w domain.UnitOfWork, cmd 
 		}); err != nil {
 			return err
 		}
-	} else if reserved.Valid {
+	} else if hasHold {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE inference_reconciliation_jobs
 			 SET status = 'resolved', resolved_at = now(), updated_at = now(),
 			     detail = detail || $2
-			 WHERE request_id = $1 AND status IN ('pending','running')
+			 WHERE request_id = $1 AND status IN ('pending','running','escalated')
 			   AND reason = 'settlement_overage'`,
 			cmd.RequestID, mustJSON(map[string]string{
 				"resolution": "correction brought the charge within the hold: " + cmd.Reason,

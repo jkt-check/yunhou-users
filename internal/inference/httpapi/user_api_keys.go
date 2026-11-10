@@ -33,9 +33,6 @@ type AccessOps struct {
 	// group; the auth chain is fixed at mount time so no /v1 route can
 	// exist without it.
 	V1Auth gin.HandlerFunc
-	// RPMCounter backs V1Auth's per-key/account buckets; the router
-	// starts its janitor goroutine when set.
-	RPMCounter *access.RPMCounter
 
 	// V1Models / V1ChatCompletions are the Task 8 standard-protocol
 	// endpoints; both require V1Auth (mounted into the authenticated /v1
@@ -101,23 +98,27 @@ type keyJSON struct {
 	BudgetMicros *string  `json:"budget_micros"`
 	BudgetUsed   string   `json:"budget_used_micros"`
 	RPMLimit     *int     `json:"rpm_limit"`
-	Status       string   `json:"status"`
-	ExpiresAt    *string  `json:"expires_at"`
-	RevokedAt    *string  `json:"revoked_at"`
-	LastUsedAt   *string  `json:"last_used_at"`
-	CreatedAt    string   `json:"created_at"`
+	// ConcurrencyLimit is the per-Key concurrency cap (Task 5); null = this
+	// key adds no Key-level limit (the account policy limit still applies).
+	ConcurrencyLimit *int    `json:"concurrency_limit"`
+	Status           string  `json:"status"`
+	ExpiresAt        *string `json:"expires_at"`
+	RevokedAt        *string `json:"revoked_at"`
+	LastUsedAt       *string `json:"last_used_at"`
+	CreatedAt        string  `json:"created_at"`
 }
 
 func toKeyJSON(k *domain.APIKey) keyJSON {
 	out := keyJSON{
-		ID:         k.ID,
-		Name:       k.Name,
-		Prefix:     k.Prefix,
-		ModelIDs:   k.ModelAllow,
-		BudgetUsed: strconv.FormatInt(int64(k.BudgetUsed), 10),
-		RPMLimit:   k.RPMLimit,
-		Status:     string(k.Status),
-		CreatedAt:  k.CreatedAt.UTC().Format(time.RFC3339),
+		ID:               k.ID,
+		Name:             k.Name,
+		Prefix:           k.Prefix,
+		ModelIDs:         k.ModelAllow,
+		BudgetUsed:       strconv.FormatInt(int64(k.BudgetUsed), 10),
+		RPMLimit:         k.RPMLimit,
+		ConcurrencyLimit: k.ConcurrencyLimit,
+		Status:           string(k.Status),
+		CreatedAt:        k.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if k.BudgetLimit != nil {
 		s := strconv.FormatInt(int64(*k.BudgetLimit), 10)
@@ -144,7 +145,10 @@ type createKeyRequest struct {
 	ModelIDs     []string `json:"model_ids"`
 	BudgetMicros *string  `json:"budget_micros"`
 	RPMLimit     *int     `json:"rpm_limit"`
-	ExpiresAt    *string  `json:"expires_at"`
+	// ConcurrencyLimit is the per-Key concurrency cap (Task 5). Absent or
+	// null = this key adds no Key-level limit.
+	ConcurrencyLimit *int    `json:"concurrency_limit"`
+	ExpiresAt        *string `json:"expires_at"`
 }
 
 // Create POST /user/api-keys — the plaintext is in THIS response only.
@@ -175,6 +179,7 @@ func (h *UserAPIKeysHandler) Create(c *gin.Context) {
 		"budget_micros":      body.BudgetMicros,
 		"budget_used_micros": body.BudgetUsed,
 		"rpm_limit":          body.RPMLimit,
+		"concurrency_limit":  body.ConcurrencyLimit,
 		"status":             body.Status,
 		"expires_at":         body.ExpiresAt,
 		"created_at":         body.CreatedAt,
@@ -182,7 +187,10 @@ func (h *UserAPIKeysHandler) Create(c *gin.Context) {
 }
 
 func (r createKeyRequest) toParams() (access.CreateParams, error) {
-	p := access.CreateParams{Name: r.Name, ModelAllow: r.ModelIDs, RPMLimit: r.RPMLimit}
+	p := access.CreateParams{
+		Name: r.Name, ModelAllow: r.ModelIDs, RPMLimit: r.RPMLimit,
+		ConcurrencyLimit: r.ConcurrencyLimit,
+	}
 	if r.BudgetMicros != nil {
 		v, err := parseMicrosString(*r.BudgetMicros)
 		if err != nil {
@@ -246,7 +254,7 @@ type updateKeyRequest struct {
 
 var updateKeyAllowed = map[string]bool{
 	"name": true, "model_ids": true, "budget_micros": true,
-	"rpm_limit": true, "expires_at": true,
+	"rpm_limit": true, "concurrency_limit": true, "expires_at": true,
 }
 
 func (u *updateKeyRequest) toPatch() (access.KeyPatch, error) {
@@ -295,6 +303,17 @@ func (u *updateKeyRequest) toPatch() (access.KeyPatch, error) {
 				return patch, domain.NewError(domain.CodeInvalidInput, "rpm_limit must be an integer or null")
 			}
 			patch.RPMLimit = &v
+		}
+	}
+	if raw, ok := u.fields["concurrency_limit"]; ok {
+		if isJSONNull(raw) {
+			patch.ClearConcurrency = true
+		} else {
+			var v int
+			if err := json.Unmarshal(raw, &v); err != nil {
+				return patch, domain.NewError(domain.CodeInvalidInput, "concurrency_limit must be an integer or null")
+			}
+			patch.ConcurrencyLimit = &v
 		}
 	}
 	if raw, ok := u.fields["expires_at"]; ok {

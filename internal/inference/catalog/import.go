@@ -277,6 +277,11 @@ func (s *Service) ImportEnvCatalog(ctx context.Context, raw string) (*ImportResu
 				Weight: 1, Enabled: true,
 				PoolStrategy: domain.PoolRoundRobin,
 			}
+			// 派生路由必须过共享校验器（与 operator CRUD / 批量导入同一
+			// 支持集）—— 环境导入不得落下一个「保存后假装生效」的值。
+			if err := ValidateRoute(mr); err != nil {
+				return nil, domain.WrapError(domain.CodeInvalidInput, "env import: derived route", err)
+			}
 			if err := s.store.InsertRoute(ctx, mr); err != nil {
 				if domain.CodeOf(err) == domain.CodeConflict {
 					res.Skipped++ // racing importer created it — still idempotent

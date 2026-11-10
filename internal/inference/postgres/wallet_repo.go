@@ -154,20 +154,25 @@ func walletSumsLocked(ctx context.Context, tx *sqlx.Tx, walletID string) (accoun
 	return sums, nil
 }
 
-// monthSpendLocked is the ledger-derived UTC-month wallet spend: consume
-// debits minus reversal credits of consume entries within [start, end).
+// Corrections and reversals belong to the original consumption month, not
+// their posting month. Account-level adjustments never count as consumption.
+const walletMonthSpendSQL = `SELECT COALESCE(SUM(
+	    CASE WHEN e.direction='debit' THEN e.amount_micros ELSE -e.amount_micros END),0)
+	FROM inference_wallet_entries e
+	LEFT JOIN inference_wallet_entries o ON o.id=e.reverses_entry_id
+	LEFT JOIN inference_wallet_holds h ON h.id=COALESCE(e.hold_id,o.hold_id)
+	WHERE e.wallet_id=$1
+	  AND COALESCE(h.settled_at,o.created_at,e.created_at)>=$2
+	  AND COALESCE(h.settled_at,o.created_at,e.created_at)<$3
+	  AND (e.entry_type='consume'
+	    OR (e.entry_type='adjustment' AND e.request_id IS NOT NULL AND e.hold_id IS NOT NULL)
+	    OR (e.entry_type='reversal' AND (o.entry_type='consume'
+	      OR (o.entry_type='adjustment' AND o.request_id IS NOT NULL AND o.hold_id IS NOT NULL))))`
+
+// monthSpendLocked is the same net consumption measure used by wallet reads.
 func monthSpendLocked(ctx context.Context, tx *sqlx.Tx, walletID string, start, end time.Time) (int64, error) {
 	var spent int64
-	err := tx.QueryRowxContext(ctx,
-		`SELECT COALESCE(SUM(CASE
-		       WHEN e.entry_type = 'consume' AND e.direction = 'debit' THEN e.amount_micros
-		       WHEN e.entry_type = 'reversal' AND e.direction = 'credit'
-		            AND o.entry_type = 'consume' THEN -e.amount_micros
-		       ELSE 0 END), 0)
-		   FROM inference_wallet_entries e
-		   LEFT JOIN inference_wallet_entries o ON e.reverses_entry_id = o.id
-		  WHERE e.wallet_id = $1
-		    AND e.created_at >= $2 AND e.created_at < $3`,
+	err := tx.QueryRowxContext(ctx, walletMonthSpendSQL,
 		walletID, start, end).Scan(&spent)
 	if err != nil {
 		return 0, mapError("wallet month spend", err)
@@ -256,16 +261,7 @@ func (s *Store) walletSums(ctx context.Context, walletID string) (accounting.Wal
 
 func (s *Store) monthSpend(ctx context.Context, walletID string, start, end time.Time) (int64, error) {
 	var spent int64
-	err := s.db.QueryRowxContext(ctx,
-		`SELECT COALESCE(SUM(CASE
-		       WHEN e.entry_type = 'consume' AND e.direction = 'debit' THEN e.amount_micros
-		       WHEN e.entry_type = 'reversal' AND e.direction = 'credit'
-		            AND o.entry_type = 'consume' THEN -e.amount_micros
-		       ELSE 0 END), 0)
-		   FROM inference_wallet_entries e
-		   LEFT JOIN inference_wallet_entries o ON e.reverses_entry_id = o.id
-		  WHERE e.wallet_id = $1
-		    AND e.created_at >= $2 AND e.created_at < $3`,
+	err := s.db.QueryRowxContext(ctx, walletMonthSpendSQL,
 		walletID, start, end).Scan(&spent)
 	if err != nil {
 		return 0, mapError("wallet month spend", err)
@@ -499,7 +495,7 @@ func (s *Store) ReserveWallet(ctx context.Context, w domain.UnitOfWork, cmd doma
 		return nil, err
 	}
 	if err := accounting.CheckWalletSpend(wallet.Settings(),
-		spent+sums.HeldCash+sums.HeldBonus, cmd.HoldMicros); err != nil {
+		spent, cmd.HoldMicros, sums.HeldCash, sums.HeldBonus); err != nil {
 		return nil, err
 	}
 
@@ -563,7 +559,12 @@ func (s *Store) ReserveWallet(ctx context.Context, w domain.UnitOfWork, cmd doma
 // entries: bonus-first within the frozen composition; over-hold excess
 // debits cash honestly (超占真实入账，不隐藏负差额). Duplicate delivery
 // hits the per-request charge unique key in the caller.
-func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID string, charge domain.Money) error {
+//
+// A missing hold row is NOT an ordinary not-found: the freeze the admission
+// created is gone, so the monetary hold this request was admitted with is
+// missing — a recognizable accounting anomaly (missing_reservation), never
+// a plain NotFound the caller would treat as "nothing to settle".
+func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID string, charge domain.Money, status domain.RequestStatus) error {
 	var holdID, walletID, currency string
 	var amount, cash, bonus int64
 	if err := tx.QueryRowxContext(ctx,
@@ -572,6 +573,13 @@ func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID s
 		   JOIN inference_wallets w ON w.id = h.wallet_id
 		  WHERE h.request_id = $1 FOR UPDATE OF h`, requestID).
 		Scan(&holdID, &walletID, &currency, &amount, &cash, &bonus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// 冻结行不见了 = 准入时应当存在的金额预占被删除：可识别的账务
+			// 异常（绝不落成普通 NotFound 让调用方当"没找到"吞掉）。
+			return missingReservationOutcome("settle wallet",
+				"the wallet hold the admission created is missing (accounting anomaly)",
+				status, domain.Microcredit(charge.Micros))
+		}
 		return mapError("settle wallet: lock hold", err)
 	}
 	if charge.Currency != currency {
@@ -624,6 +632,27 @@ func (s *Store) settleWalletLocked(ctx context.Context, tx *sqlx.Tx, requestID s
 	if n, _ := res.RowsAffected(); n == 0 {
 		return domain.NewError(domain.CodeConflict,
 			"settle wallet: hold already transitioned (concurrent release?)")
+	}
+	return nil
+}
+
+// checkWalletFreeze distinguishes accounting anomalies from benign
+// terminal-request races before settlement or release writes anything.
+func checkWalletFreeze(ctx context.Context, tx *sqlx.Tx, op, requestID string, status domain.RequestStatus, charge domain.Microcredit) error {
+	var state string
+	err := tx.QueryRowxContext(ctx,
+		`SELECT state FROM inference_wallet_holds WHERE request_id = $1`, requestID).Scan(&state)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return missingReservationOutcome(op,
+			"the wallet hold the admission created is missing (accounting anomaly)",
+			status, charge)
+	case err != nil:
+		return mapError(op+": hold", err)
+	case state != string(domain.ReservationHeld):
+		return driftOutcome(op,
+			"the wallet freeze is no longer held (reservation drift)",
+			status, charge)
 	}
 	return nil
 }

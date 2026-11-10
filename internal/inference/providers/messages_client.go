@@ -16,8 +16,13 @@
 //   - 仅文本：image/document 等多模态块 400；
 //   - 服务端工具（web_search/computer/bash/code_execution/mcp 等非 custom
 //     type）400 —— 本网关无服务端工具执行面；
-//   - 历史中的 thinking/redacted_thinking 块接受但不回放（chat 形状上游无
-//     对应语义；交错 thinking 连续性不在本期范围），工具与文本块不受影响；
+//   - 历史中的 thinking/redacted_thinking 块 400（T8：签名思考无法忠实
+//     回放 —— chat 形状承载不了上游签发的 signature，伪造签名更糟；旧
+//     行为是「接受后丢弃」，那是兼容性修正）；
+//   - 显式开启 thinking 的请求 400（T8：本面**不产出**思考块 ——
+//     Anthropic 的 thinking 块必须带原生 signature，而网关不伪造空
+//     signature，也不建立通用无损原生透传层；要推理请用
+//     /v1/chat/completions 或 /v1/responses）；
 //   - tool_result 的 is_error 标志不转发（OpenAI chat 无对应字段），错误
 //     内容文本照常传递；
 //   - cache_control 提示接受但不保证生效（成本提示，非正确性语义）；
@@ -32,7 +37,6 @@ package providers
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -193,6 +197,13 @@ func ParseAnthropicMessagesRequest(body []byte) (*ChatRequest, error) {
 				}
 				req.ThinkingBudget = th.BudgetTokens
 			}
+			// T8: 本面**不产出**思考块 —— Anthropic 的 thinking 块必须带
+			// 上游签发的 signature，而网关的内部形状不承载签名，本期也不
+			// 建立通用无损原生透传层。因此显式开启 thinking 的请求明确
+			// 拒绝（而不是返回一个没有签名、也无法回放的思考块）。
+			return nil, invalidMsg("thinking",
+				"thinking output is not supported by this gateway's anthropic_messages surface "+
+					"(a thinking block requires a native signature that cannot be replayed losslessly)")
 		case "disabled":
 			off := false
 			req.ThinkingEnabled = &off
@@ -307,11 +318,21 @@ func anthropicTurnToChat(role string, content json.RawMessage) ([]model.ChatMess
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
+			if b.Text == "" {
+				continue
+			}
+			if len(toolCalls) > 0 {
+				return nil, invalidMsg("messages",
+					"assistant text after tool_use cannot preserve block order in a Chat turn; send tool results before the next assistant message")
+			}
 			textParts = append(textParts, b.Text)
 		case "thinking", "redacted_thinking":
-			// 历史推理块不回放（chat 形状上游无对应语义；能力矩阵明示）。
-			// 接受而不报错：Anthropic 客户端总在多轮回传它们。
-			continue
+			// T8: 签名/脱敏思考块**无法忠实回放** —— Anthropic 的思考块
+			// 必须连同上游签发的 signature 一起回传，chat 形状承载不了，
+			// 伪造一个签名更糟。旧行为是「接受后丢弃」（客户端回传的内容
+			// 被静默吞掉）；现在明确 4xx。
+			return nil, invalidMsg("messages",
+				b.Type+" blocks cannot be replayed by this gateway (no lossless signed thinking replay)")
 		case "tool_use":
 			if role != "assistant" {
 				return nil, invalidMsg("messages", "tool_use blocks are only valid in assistant messages")
@@ -319,12 +340,9 @@ func anthropicTurnToChat(role string, content json.RawMessage) ([]model.ChatMess
 			if b.ID == "" || b.Name == "" {
 				return nil, invalidMsg("messages", "tool_use blocks require id and name")
 			}
-			args := "{}"
-			if len(b.Input) > 0 && string(b.Input) != "null" {
-				if !json.Valid(b.Input) {
-					return nil, invalidMsg("messages", "tool_use input must be a JSON value")
-				}
-				args = string(b.Input)
+			args := string(b.Input)
+			if _, err := toolArgumentObject(args); err != nil {
+				return nil, invalidMsg("messages", "tool_use input must be a JSON object")
 			}
 			toolCalls = append(toolCalls, model.ToolCall{
 				ID: b.ID, Type: "function",
@@ -489,8 +507,8 @@ func AnthropicMessageFromCompletion(payload []byte, publicModel string, cacheRea
 	if err != nil {
 		return nil, err
 	}
-	if len(v.Choices) == 0 {
-		return nil, fmt.Errorf("providers: internal completion has no choices")
+	if err := validateMessagesCompletion(v); err != nil {
+		return nil, err
 	}
 	ch := v.Choices[0]
 
@@ -499,20 +517,18 @@ func AnthropicMessageFromCompletion(payload []byte, publicModel string, cacheRea
 		id = newPublicID("msg_")
 	}
 	var content []any
-	if ch.Message.ReasoningContent != "" {
-		// 非 Anthropic 原生上游无签名可给；signature 为空串（能力矩阵明示：
-		// 展示正常，回传历史按 Anthropic 规则被丢弃——本面本就不回放）。
-		content = append(content, map[string]any{
-			"type": "thinking", "thinking": ch.Message.ReasoningContent, "signature": "",
-		})
-	}
+	// T8: 本面不产出 thinking 块 —— Anthropic 的思考块必须带上游签发的
+	// signature；网关的内部形状不承载签名（旧实现伪造 `signature: ""` 冒充
+	// 可回放的原生签名思考），本期也不建立通用无损原生透传层。因此上游
+	// 的推理内容不在本面呈现（要推理请用 /v1/chat/completions 或
+	// /v1/responses）。
 	if ch.Message.Content != "" {
 		content = append(content, map[string]any{"type": "text", "text": ch.Message.Content})
 	}
 	for _, tc := range ch.Message.ToolCalls {
-		var input any
-		if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil || input == nil {
-			input = map[string]any{}
+		input, err := toolArgumentObject(tc.Function.Arguments)
+		if err != nil {
+			return nil, err
 		}
 		content = append(content, map[string]any{
 			"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input,
@@ -534,29 +550,45 @@ func AnthropicMessageFromCompletion(payload []byte, publicModel string, cacheRea
 	return json.Marshal(out)
 }
 
+// usageCounter renders one possibly-unknown counter for a PUBLIC protocol
+// field. The Messages/Responses usage objects declare these counters as
+// required, so an unknown counter is emitted as 0 on the wire; the internal
+// representation keeps unknown ≠ 0 (计量口径不变 —— 见 usage_wire.go).
+func usageCounter(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
 // anthropicUsageShape maps the wire usage onto the Messages usage object:
 // input_tokens EXCLUDES cache reads (subtracted only when the wire included
 // them); output_tokens includes thinking (Anthropic 口径).
+//
+// input_tokens/output_tokens 是 Anthropic usage 的**必填**字段：未知计数在此
+// 补零。可选的 cache 字段未知时仍然省略（未知 ≠ 0）。
 func anthropicUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
-	input := derefOr(u.PromptTokens, 0)
-	var cached int64
+	input := u.PromptTokens
+	var cached *int64
 	if u.PromptDetails != nil {
-		cached = derefOr(u.PromptDetails.CachedTokens, 0)
+		cached = u.PromptDetails.CachedTokens
 	}
-	if cacheReadInInput {
-		input -= cached
-		if input < 0 {
-			input = 0
+	if cacheReadInInput && input != nil && cached != nil {
+		if *cached < 0 || *input < *cached {
+			input = nil
+		} else {
+			exclusive := *input - *cached
+			input = &exclusive
 		}
 	}
 	usage := map[string]any{
-		"input_tokens":  input,
-		"output_tokens": derefOr(u.CompletionTokens, 0),
+		"input_tokens":  usageCounter(input),
+		"output_tokens": usageCounter(u.CompletionTokens),
 	}
-	if cached > 0 {
-		usage["cache_read_input_tokens"] = cached
+	if cached != nil {
+		usage["cache_read_input_tokens"] = *cached
 	}
-	if u.CacheCreationTokens != nil && *u.CacheCreationTokens > 0 {
+	if u.CacheCreationTokens != nil {
 		usage["cache_creation_input_tokens"] = *u.CacheCreationTokens
 	}
 	return usage
@@ -601,8 +633,9 @@ type anthropicStreamRenderer struct {
 	nextBlock     int
 	toolBlocks    map[int]*anthropicToolBlock // wire tool_calls[].index → block
 	finish        string
-	usageEmitted  bool
+	usage         *openAIUsage
 	errorRelayed  bool
+	arguments     messagesToolArguments
 }
 
 // anthropicToolBlock is one in-flight tool_use content block keyed by the
@@ -623,6 +656,20 @@ func TranslateOpenAIToAnthropicStream(body io.ReadCloser, messageID, model strin
 }
 
 func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
+	if r.errorRelayed {
+		return nil
+	}
+	if err := r.arguments.observe(ev); err != nil {
+		r.errorRelayed = true
+		if !r.started {
+			if startErr := r.emitStart(w); startErr != nil {
+				return startErr
+			}
+		}
+		return writeSSE(w, "error", map[string]any{
+			"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()},
+		})
+	}
 	if ev.done {
 		// [DONE]: close out anything still open. A stream that legitimately
 		// ended always emitted its finish chunk first; a bare [DONE] without
@@ -635,10 +682,8 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 		if err := r.closeOpenBlock(w); err != nil {
 			return err
 		}
-		if !r.usageEmitted {
-			if err := r.emitMessageDelta(w, nil); err != nil {
-				return err
-			}
+		if err := r.emitMessageDelta(w, r.usage); err != nil {
+			return err
 		}
 		return writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 	}
@@ -646,16 +691,20 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 	if chunk == nil {
 		return nil
 	}
-	if chunk.Error != nil {
+	if chunk.Error != nil || chunk.hasRefusal() {
 		r.errorRelayed = true
 		if !r.started {
 			if err := r.emitStart(w); err != nil {
 				return err
 			}
 		}
+		message := errChatRefusal.Error()
+		if chunk.Error != nil {
+			message = chunk.Error.Message
+		}
 		return writeSSE(w, "error", map[string]any{
 			"type":  "error",
-			"error": map[string]any{"type": "api_error", "message": chunk.Error.Message},
+			"error": map[string]any{"type": "api_error", "message": message},
 		})
 	}
 	if !r.started {
@@ -663,27 +712,17 @@ func (r *anthropicStreamRenderer) Render(ev pumpEvent, w io.Writer) error {
 			return err
 		}
 	}
-	// Terminal usage chunk (choices empty, usage set): message_delta carries
-	// the REAL totals — message_start's usage is a protocol-required
-	// placeholder (input is only known at stream end on chat-shaped
-	// upstreams; 能力矩阵明示).
+	// Compatible providers may attach cumulative usage to content chunks.
+	// Keep the latest totals, but emit message_delta only after all blocks
+	// close at [DONE], so inline usage cannot discard or terminate content.
 	if chunk.Usage != nil {
-		r.usageEmitted = true
-		return r.emitMessageDelta(w, chunk.Usage)
+		r.usage = chunk.Usage
 	}
 	for _, choice := range chunk.Choices {
 		d := choice.Delta
-		if d.ReasoningContent != "" {
-			if err := r.openTextualBlock(w, "thinking"); err != nil {
-				return err
-			}
-			if err := writeSSE(w, "content_block_delta", map[string]any{
-				"type": "content_block_delta", "index": r.openTextBlock,
-				"delta": map[string]any{"type": "thinking_delta", "thinking": d.ReasoningContent},
-			}); err != nil {
-				return err
-			}
-		}
+		// T8: 推理增量不在本面呈现（Anthropic 的 thinking 块必须带原生
+		// signature；网关不伪造签名，也不建立无损原生透传层）。普通文本
+		// 与工具增量照常渲染。
 		if d.Content != "" {
 			if err := r.openTextualBlock(w, "text"); err != nil {
 				return err
@@ -744,9 +783,9 @@ func (r *anthropicStreamRenderer) emitStart(w io.Writer) error {
 	})
 }
 
-// openTextualBlock opens a text/thinking block when not already open
-// (kind 切换关闭当前文本块；tool_use 块不受影响——它们按 wire index 独立
-// 保持开启).
+// openTextualBlock opens a text block when not already open (kind 切换关闭
+// 当前文本块；tool_use 块不受影响——它们按 wire index 独立保持开启).
+// T8: 只有 text 一种文本块 —— thinking 块需要原生 signature，本面不产出。
 func (r *anthropicStreamRenderer) openTextualBlock(w io.Writer, kind string) error {
 	if r.openTextKind == kind && r.openTextBlock >= 0 {
 		return nil
@@ -758,12 +797,8 @@ func (r *anthropicStreamRenderer) openTextualBlock(w io.Writer, kind string) err
 	r.nextBlock++
 	r.openTextKind = kind
 	block := map[string]any{"type": kind}
-	switch kind {
-	case "text":
+	if kind == "text" {
 		block["text"] = ""
-	case "thinking":
-		block["thinking"] = ""
-		block["signature"] = ""
 	}
 	return writeSSE(w, "content_block_start", map[string]any{
 		"type": "content_block_start", "index": r.openTextBlock, "content_block": block,

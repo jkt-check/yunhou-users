@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -150,6 +151,34 @@ func performChatRequest(r *gin.Engine, body string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+func TestChatHandler_LocalRateRetryAfter(t *testing.T) {
+	for _, tc := range []struct {
+		seconds int
+		want    string
+	}{{17, "17"}, {0, ""}, {-1, ""}} {
+		t.Run(fmt.Sprint(tc.seconds), func(t *testing.T) {
+			r, _ := chatTestRouter(&mockChatStreamer{streamFn: streamFails(fmt.Errorf("wrapped: %w",
+				&service.ChatLimitError{Code: "rate_limited", RetryAfterSeconds: tc.seconds}))})
+			w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+			if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != tc.want {
+				t.Fatalf("status=%d retry=%q, want 429/%q", w.Code, w.Header().Get("Retry-After"), tc.want)
+			}
+			var envelope struct {
+				Code    int             `json:"code"`
+				Data    json.RawMessage `json:"data"`
+				Message string          `json:"message"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Code != 429 || string(envelope.Data) != "null" ||
+				envelope.Message != "chat request rejected by a usage limit (rate_limited)" {
+				t.Fatalf("unexpected envelope: %s", w.Body.String())
+			}
+		})
+	}
 }
 
 func TestChatHandler_Validation(t *testing.T) {
@@ -1197,5 +1226,44 @@ func TestChatHandler_PlainErrorsKeepNullData(t *testing.T) {
 	}
 	if _, ok := entry["upstream_code"]; ok {
 		t.Errorf("audit upstream_code present on plain error: %v", entry["upstream_code"])
+	}
+}
+
+// T6：/chat 保留既有 envelope（{code,data,message}）；本地限制拒绝
+// （业务速率 / 并发 / 额度 / 余额）必须是 429 + 准确的业务说明 —— 不得
+// 降级成 generic 502，也不得把一个从未出站的请求说成"上游错误"。
+func TestChatHandler_LocalLimitEnvelope(t *testing.T) {
+	for _, tc := range []struct{ name, code string }{
+		{"rate_limited", "rate_limited"},
+		{"insufficient_capacity", "insufficient_capacity"},
+		{"quota_exceeded", "quota_exceeded"},
+		{"insufficient_balance", "insufficient_balance"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := chatTestRouter(&mockChatStreamer{
+				streamFn: streamFails(&service.ChatLimitError{Code: tc.code}),
+			})
+			w := performChatRequest(r, `{"messages":[{"role":"user","content":"hi"}]}`)
+			if w.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", w.Code)
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("response not JSON: %v", err)
+			}
+			if resp["code"] != float64(http.StatusTooManyRequests) {
+				t.Errorf("code = %v, want 429", resp["code"])
+			}
+			if resp["data"] != nil {
+				t.Errorf("data = %v, want null (既有 envelope 形状不变)", resp["data"])
+			}
+			msg, _ := resp["message"].(string)
+			if !strings.Contains(msg, tc.code) {
+				t.Errorf("message = %q, want it to name %q", msg, tc.code)
+			}
+			if strings.Contains(msg, "upstream") {
+				t.Errorf("message = %q, want no upstream wording for a local limit", msg)
+			}
+		})
 	}
 }

@@ -18,6 +18,20 @@ import (
 // back the winner on conflict. Ownership always comes from the
 // server-verified user identity (Task 5; 设计 §4.2).
 func (s *Store) EnsureBillingAccount(ctx context.Context, userID string) (*domain.BillingAccount, error) {
+	return ensureBillingAccount(ctx, s.db, userID)
+}
+
+// EnsureBillingAccountTx establishes the account without opening a second
+// connection while the entitlement-sync transaction holds source locks.
+func (s *Store) EnsureBillingAccountTx(ctx context.Context, w domain.UnitOfWork, userID string) (*domain.BillingAccount, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	return ensureBillingAccount(ctx, tx, userID)
+}
+
+func ensureBillingAccount(ctx context.Context, q sqlxExecutor, userID string) (*domain.BillingAccount, error) {
 	var row struct {
 		ID          string    `db:"id"`
 		UserID      string    `db:"user_id"`
@@ -26,25 +40,25 @@ func (s *Store) EnsureBillingAccount(ctx context.Context, userID string) (*domai
 		CreatedAt   time.Time `db:"created_at"`
 		UpdatedAt   time.Time `db:"updated_at"`
 	}
-	err := s.db.QueryRowxContext(ctx,
+	err := q.QueryRowxContext(ctx,
 		`INSERT INTO inference_billing_accounts (user_id)
 		 VALUES ($1)
 		 ON CONFLICT (user_id) DO NOTHING
 		 RETURNING id, user_id, subject_type, status, created_at, updated_at`,
-		userID).
-		Scan(&row.ID, &row.UserID, &row.SubjectType, &row.Status, &row.CreatedAt, &row.UpdatedAt)
-	if err == nil {
-		return &domain.BillingAccount{
-			ID: row.ID, UserID: row.UserID, SubjectType: row.SubjectType,
-			Status: row.Status, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
-		}, nil
-	}
+		userID).StructScan(&row)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Lost the insert race (or account predates the call) — read the
 		// existing row.
-		return s.GetBillingAccountByUser(ctx, userID)
+		err = q.QueryRowxContext(ctx,
+			`SELECT * FROM inference_billing_accounts WHERE user_id = $1`, userID).StructScan(&row)
 	}
-	return nil, mapError("ensure billing account", err)
+	if err != nil {
+		return nil, mapError("ensure billing account", err)
+	}
+	return &domain.BillingAccount{
+		ID: row.ID, UserID: row.UserID, SubjectType: row.SubjectType,
+		Status: row.Status, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+	}, nil
 }
 
 // GetBillingAccountByID loads an account by primary key — the resolve

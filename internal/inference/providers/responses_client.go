@@ -16,14 +16,17 @@
 //   - 服务端工具调用项（web_search_call/file_search_call/computer_call/
 //     code_interpreter_call/mcp_* 等）与 item_reference 400 —— 本网关无
 //     服务端工具执行面，也不实现 OpenAI 的 stored-items 引用；
-//   - input 中的 reasoning 项接受但不回放（chat 形状上游无对应语义；
-//     OpenAI 的 encrypted_content 存储不在本期范围）；
+//   - input 中的 reasoning 项 400（T8：无法忠实回放 ——本网关不实现
+//     OpenAI 的加密推理存储，include=reasoning.encrypted_content 早已被
+//     拒绝；旧行为是「接受后丢弃」，那是兼容性修正）；
 //   - background:true 与 include 非空 400（无异步执行/附加数据面）；
 //   - truncation:auto 400 —— 服务端静默裁剪上下文违反本网关"不静默丢
 //     字段"原则；truncation:disabled（默认语义）接受；
 //   - text.format 仅 text；json_object/json_schema 400（与 chat 面一致）；
 //   - store:false 不落会话链（OpenAI 语义），引用它的 previous_response_id
 //     得到 404；store 缺省为 true（与 OpenAI 一致）。
+//   - reasoning.effort 的档位逐字保留（T8：low/medium/high/xhigh 原样
+//     下传，不再一律折成 medium）。
 //
 // 终止语义：response.completed / response.incomplete 是仅有的干净结束；
 // 上游中断 → `event: error` 原生错误事件后结束，绝不伪造 completed。
@@ -205,10 +208,14 @@ func ParseResponsesRequest(body []byte) (*ResponsesInput, error) {
 			return nil, invalidMsg("reasoning", "invalid reasoning parameter")
 		}
 		switch rs.Effort {
-		case "low", "medium", "high", "xhigh":
+		case "low", "medium", "high", "xhigh", "minimal":
+			// T8: 档位逐字保留 —— 不再一律折成「开/关」，也不把 minimal
+			// 折成「关闭」（minimal 是最低**推理档**，不是无推理；OpenAI 的
+			// 语义如此）。上游不支持该档位时由能力路由在出站前明确拒绝。
 			on := true
 			req.ThinkingEnabled = &on
-		case "", "none", "minimal":
+			req.ReasoningEffort = rs.Effort
+		case "", "none":
 			if rs.Effort != "" {
 				off := false
 				req.ThinkingEnabled = &off
@@ -284,8 +291,22 @@ type responsesItemView struct {
 // responsesItemsToChat converts canonical Responses items into internal chat
 // messages. function_call.call_id is preserved VERBATIM as the chat
 // tool_call id (多轮工具调用 ID 保留).
+//
+// 轮次边界（评审修复）：message item 永远自成一条 ChatMessage —— 连续的
+// assistant 文本轮不得无分隔拼成一条（"Hello"+"World" → "HelloWorld" 会
+// 丢掉轮次边界）。只有 function_call 需要并入前一个 assistant 轮（Chat 的
+// tool_calls 挂在同一条 assistant 消息上），否则新建 assistant 轮。
+//
+// 未决调用（评审修复）：一次 function_call 在对应的 function_call_output
+// 之前一直「未决」—— Chat 的 content 永远排在 tool_calls 之前，未决调用
+// 之后的 assistant 文本无法保序，必须拒绝；空的 assistant 轮不成其为文本，
+// 也不能把未决状态清掉（否则空轮就成了绕道）。
 func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) {
 	var out []model.ChatMessage
+	// Chat 的 tool_calls 挂在 assistant 消息上：调用前的文本与连续的并行调用
+	// 归入同一个 assistant 轮；调用之后的文本无法保序（Chat 的 content 永远
+	// 排在 tool_calls 之前），只能拒绝。
+	toolCallPending := false
 	for _, raw := range items {
 		var it responsesItemView
 		if err := json.Unmarshal(raw, &it); err != nil {
@@ -306,21 +327,38 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 			if err != nil {
 				return nil, err
 			}
+			switch role {
+			case "assistant":
+				if text != "" {
+					if toolCallPending {
+						return nil, invalidMsg("input",
+							"assistant text after function_call cannot preserve item order in a Chat turn; send tool outputs before the next assistant message")
+					}
+					toolCallPending = false
+				}
+				// 空 assistant 轮自成一条 ChatMessage，但**不**清掉未决标记。
+			default:
+				// user / system 消息终结未决调用。
+				toolCallPending = false
+			}
 			out = append(out, model.ChatMessage{Role: role, Content: text})
 		case "function_call":
 			if it.CallID == "" || it.Name == "" {
 				return nil, invalidMsg("input", "function_call items require call_id and name")
 			}
-			if it.Arguments != "" && !json.Valid([]byte(it.Arguments)) {
+			if !json.Valid([]byte(it.Arguments)) {
 				return nil, invalidMsg("input", "function_call arguments must be a JSON-encoded value")
 			}
-			out = append(out, model.ChatMessage{
-				Role: "assistant",
-				ToolCalls: []model.ToolCall{{
-					ID: it.CallID, Type: "function",
-					Function: model.ToolCallFunction{Name: it.Name, Arguments: strOr(it.Arguments, "{}")},
-				}},
-			})
+			call := model.ToolCall{
+				ID: it.CallID, Type: "function",
+				Function: model.ToolCallFunction{Name: it.Name, Arguments: it.Arguments},
+			}
+			if len(out) > 0 && out[len(out)-1].Role == "assistant" {
+				out[len(out)-1].ToolCalls = append(out[len(out)-1].ToolCalls, call)
+			} else {
+				out = append(out, model.ChatMessage{Role: "assistant", ToolCalls: []model.ToolCall{call}})
+			}
+			toolCallPending = true
 		case "function_call_output":
 			if it.CallID == "" {
 				return nil, invalidMsg("input", "function_call_output items require call_id")
@@ -330,9 +368,14 @@ func responsesItemsToChat(items []json.RawMessage) ([]model.ChatMessage, error) 
 				return nil, err
 			}
 			out = append(out, model.ChatMessage{Role: "tool", ToolCallID: it.CallID, Content: text})
+			toolCallPending = false
 		case "reasoning":
-			// 推理项接受但不回放（chat 形状上游无对应语义；能力矩阵明示）。
-			continue
+			// T8: 推理项**无法忠实回放**（本网关不实现 OpenAI 的加密推理
+			// 存储：`include` 里的 reasoning.encrypted_content 早已被拒绝，
+			// reasoning 项本身也没有可回放的加密载荷）。旧行为是「接受后
+			// 丢弃」—— 客户端看不到自己回传的内容被吞掉。现在明确 4xx。
+			return nil, invalidMsg("input",
+				"reasoning items cannot be replayed by this gateway (no lossless encrypted reasoning replay)")
 		case "item_reference":
 			return nil, invalidMsg("input",
 				"item_reference is not supported (stored-items API 不在本期范围)")
@@ -489,35 +532,45 @@ func responsesToolChoiceToOpenAI(raw json.RawMessage) (json.RawMessage, error) {
 // ---------------------------------------------------------------------------
 
 // ResponsesUsageShape renders the Responses usage object. The Responses API
-// counts input_tokens INCLUDING cached tokens — the opposite of the
-// Anthropic surface — so cacheReadInInput==false (Anthropic-origin wire)
-// ADDS the cache bucket back into input.
+// counts input_tokens INCLUDING cache reads and creation — the opposite of
+// the Anthropic surface — so cacheReadInInput==false (Anthropic-origin wire)
+// adds both cache buckets back into input.
+//
+// input_tokens/output_tokens/total_tokens 与两个 details 对象都是 Responses
+// usage 的**必填**字段：未知计数在此补零（已报值、显式零、已知 detail 值
+// 原样保留）。total 优先用上游已报的值；没有可用上报值时由两个计数相加
+// 推导（推导失败/溢出则落回零）。
 func ResponsesUsageShape(u *openAIUsage, cacheReadInInput bool) map[string]any {
 	if u == nil {
 		return nil
 	}
-	input := derefOr(u.PromptTokens, 0)
-	output := derefOr(u.CompletionTokens, 0)
-	var cached, reasoning int64
+	input := u.PromptTokens
+	output := u.CompletionTokens
+	var cached, reasoning *int64
 	if u.PromptDetails != nil {
-		cached = derefOr(u.PromptDetails.CachedTokens, 0)
+		cached = u.PromptDetails.CachedTokens
 	}
 	if u.CompletionDetails != nil {
-		reasoning = derefOr(u.CompletionDetails.ReasoningTokens, 0)
+		reasoning = u.CompletionDetails.ReasoningTokens
 	}
+	total := u.TotalTokens
 	if !cacheReadInInput {
-		input += cached
+		input = addUsageDetails(input, cached, u.CacheCreationTokens)
+		total = nil // The wire total excludes Anthropic cache buckets.
 	}
-	usage := map[string]any{
-		"input_tokens":         input,
-		"input_tokens_details": map[string]any{"cached_tokens": cached},
-		"output_tokens":        output,
-		"output_tokens_details": map[string]any{
-			"reasoning_tokens": reasoning,
-		},
-		"total_tokens": input + output,
+	if total == nil {
+		// 必填计数归零后两个操作数都是已知数字 → total 可由两者相加得出；
+		// 溢出/非法时推导失败 → 落回零。
+		wireInput, wireOutput := usageCounter(input), usageCounter(output)
+		total = addUsageDetails(&wireInput, &wireOutput)
 	}
-	return usage
+	return map[string]any{
+		"input_tokens":          usageCounter(input),
+		"output_tokens":         usageCounter(output),
+		"total_tokens":          usageCounter(total),
+		"input_tokens_details":  map[string]any{"cached_tokens": usageCounter(cached)},
+		"output_tokens_details": map[string]any{"reasoning_tokens": usageCounter(reasoning)},
+	}
 }
 
 // outputToolCall is one completed function call for output assembly.
@@ -581,14 +634,18 @@ func ResponsesFromCompletion(payload []byte, responseID, publicModel string, cre
 
 	var calls []outputToolCall
 	for _, c := range ch.Message.ToolCalls {
-		calls = append(calls, outputToolCall{c.ID, c.Function.Name, strOr(c.Function.Arguments, "{}")})
+		calls = append(calls, outputToolCall{c.ID, c.Function.Name, c.Function.Arguments})
 	}
 	output := responsesOutputItems(ch.Message.ReasoningContent, ch.Message.Content, calls)
 
 	resp := responseShell(responseID, publicModel, createdAt)
-	if ch.FinishReason == "length" {
+	if ch.FinishReason == "length" || ch.FinishReason == "content_filter" {
+		reason := "max_output_tokens"
+		if ch.FinishReason == "content_filter" {
+			reason = "content_filter"
+		}
 		resp["status"] = "incomplete"
-		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		resp["incomplete_details"] = map[string]any{"reason": reason}
 	} else {
 		resp["status"] = "completed"
 	}
@@ -649,10 +706,9 @@ type ResponsesStreamState struct {
 	// 一个 call 的 open 绝不得关闭另一个 call 的 item。
 	toolItems map[int]*responsesToolItem
 
-	// outputItems 是链 transcript（message/function_call；reasoning 除外—
-	// —回放语义不接受推理项，对齐非流式 ResponsesFromCompletion 的拆分）；
-	// responseItems 是终结帧 response.completed 的 output（含 reasoning—
-	// —事件流已发出该项的 added/done，终结帧必须自洽）。
+	// Both slices are indexed by output_index, not by item closing order.
+	// outputItems leaves reasoning slots nil; FinalOutputItems filters them
+	// without moving earlier calls behind later text in the transcript.
 	outputItems   []json.RawMessage
 	responseItems []json.RawMessage
 	completed     bool
@@ -688,7 +744,24 @@ func (s *ResponsesStreamState) Completed() bool { return s.completed }
 // FinalOutputItems returns the assembled canonical output items (reasoning
 // excluded — 回放语义不接受推理项), valid after EOF.
 func (s *ResponsesStreamState) FinalOutputItems() []json.RawMessage {
-	return s.outputItems
+	var items []json.RawMessage
+	for _, item := range s.outputItems {
+		if item != nil {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (s *ResponsesStreamState) recordOutputItem(index int, raw json.RawMessage, replay bool) {
+	for len(s.responseItems) <= index {
+		s.responseItems = append(s.responseItems, nil)
+		s.outputItems = append(s.outputItems, nil)
+	}
+	s.responseItems[index] = raw
+	if replay {
+		s.outputItems[index] = raw
+	}
 }
 
 func (s *ResponsesStreamState) nextSeq() int {
@@ -704,6 +777,9 @@ func (s *ResponsesStreamState) emit(w io.Writer, event string, v map[string]any)
 
 // Render implements streamRenderer.
 func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
+	if s.errorRelayed {
+		return nil
+	}
 	if ev.done {
 		return s.finishClean(w)
 	}
@@ -714,6 +790,10 @@ func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
 	if chunk.Error != nil {
 		s.errorRelayed = true
 		return s.emitError(w, chunk.Error.Code, chunk.Error.Message)
+	}
+	if chunk.hasRefusal() {
+		s.errorRelayed = true
+		return s.emitError(w, "server_error", errChatRefusal.Error())
 	}
 	if !s.started {
 		if err := s.emitCreated(w); err != nil {
@@ -765,7 +845,7 @@ func (s *ResponsesStreamState) Render(ev pumpEvent, w io.Writer) error {
 }
 
 // finishClean closes the stream with response.completed (or
-// response.incomplete on length truncation) carrying the assembled output
+// response.incomplete on truncation/filtering) carrying the assembled output
 // and usage.
 func (s *ResponsesStreamState) finishClean(w io.Writer) error {
 	if !s.started {
@@ -778,10 +858,14 @@ func (s *ResponsesStreamState) finishClean(w io.Writer) error {
 	}
 	resp := responseShell(s.responseID, s.model, s.createdAt)
 	event := "response.completed"
-	if s.finish == "length" {
+	if s.finish == "length" || s.finish == "content_filter" {
+		reason := "max_output_tokens"
+		if s.finish == "content_filter" {
+			reason = "content_filter"
+		}
 		event = "response.incomplete"
 		resp["status"] = "incomplete"
-		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		resp["incomplete_details"] = map[string]any{"reason": reason}
 	} else {
 		resp["status"] = "completed"
 	}
@@ -949,9 +1033,6 @@ func (s *ResponsesStreamState) closeToolItem(w io.Writer, ti *responsesToolItem)
 	}
 	ti.open = false
 	args := ti.argsBuf.String()
-	if args == "" {
-		args = "{}"
-	}
 	if err := s.emit(w, "response.function_call_arguments.done", map[string]any{
 		"item_id": ti.itemID, "output_index": ti.outputIndex, "arguments": args,
 	}); err != nil {
@@ -967,8 +1048,7 @@ func (s *ResponsesStreamState) closeToolItem(w io.Writer, ti *responsesToolItem)
 		return err
 	}
 	b, _ := json.Marshal(item)
-	s.outputItems = append(s.outputItems, b)
-	s.responseItems = append(s.responseItems, b)
+	s.recordOutputItem(ti.outputIndex, b, true)
 	return nil
 }
 
@@ -1012,8 +1092,7 @@ func (s *ResponsesStreamState) closeTextualItem(w io.Writer) error {
 			return err
 		}
 		b, _ := json.Marshal(item)
-		s.outputItems = append(s.outputItems, b)
-		s.responseItems = append(s.responseItems, b)
+		s.recordOutputItem(ix, b, true)
 	case "reasoning":
 		reason := s.reasonBuf.String()
 		if err := s.emit(w, "response.reasoning_summary_text.done", map[string]any{
@@ -1038,7 +1117,7 @@ func (s *ResponsesStreamState) closeTextualItem(w io.Writer) error {
 			return err
 		}
 		b, _ := json.Marshal(item)
-		s.responseItems = append(s.responseItems, b)
+		s.recordOutputItem(ix, b, false)
 	}
 	return nil
 }

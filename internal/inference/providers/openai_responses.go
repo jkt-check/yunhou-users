@@ -11,14 +11,18 @@
 //   - assistant 轮的 reasoning_content 不回放：忠实回放需要上游签发的
 //     reasoning item id / encrypted_content，内部 chat 形状不携带；伪造
 //     reasoning 项会被上游 400。丢弃回放与客户端面对称（responses_client.go
-//     「推理项接受但不回放」），推理模型多轮对话由上游重新推理；
+//     「推理项 400」），推理模型多轮对话由上游重新推理；
 //   - store:false 始终发送——网关自建会话链（httpapi/responses.go 的
 //     previous_response_id 由网关侧 transcript 回放实现），不要求上游
 //     存储，prompt 不落上游存储面；
-//   - thinking 开启 → reasoning {effort:medium, summary:auto}（要回推理
-//     文本必须显式请求 summary）；显式关闭 → {effort:none}；
+//   - thinking 开启 → reasoning {effort:<客户端声明的档位, summary:auto}
+//     （要回推理文本必须显式请求 summary）；客户端未声明档位时用 medium
+//     （OpenAI 自己的默认档）——**绝不**把客户端声明的档位折成 medium；
+//     显式关闭 → {effort:none}；
 //   - Responses 没有对应物的采样参数（stop/penalties/seed/top_k）显式
 //     400 —— 不静默丢字段。
+//   - 图片：本适配器**不**支持图片输入（T8：能力路由层据此跳过本协议的
+//     候选，带图请求由兼容协议的服务，否则出站前明确拒绝）。
 
 package providers
 
@@ -46,8 +50,19 @@ func (a *OpenAIResponses) Protocol() domain.Protocol { return domain.ProtocolOpe
 // Capabilities implements Adapter. The Responses terminal frames
 // (response.completed/incomplete) always carry the full response object
 // including usage, so streaming usage is available by construction.
+//
+// Images: the Responses protocol CAN express image parts
+// (input_image), but this adapter does not translate the internal image
+// shape into them yet — the protocol surface therefore declares no image
+// support and an image-bearing request is skipped by the capability
+// routing (never sent as a text-only input item).
+// ReasoningEfforts: the Responses protocol has the reasoning.effort knob,
+// so every level of the vocabulary can be expressed verbatim.
 func (a *OpenAIResponses) Capabilities() domain.AdapterCapabilities {
-	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true}
+	return domain.AdapterCapabilities{
+		StreamingUsage: true, Tools: true, Reasoning: true, Images: false,
+		ReasoningEfforts: domain.SupportedReasoningEfforts(),
+	}
 }
 
 // Inclusion implements Adapter: Responses input_tokens already contains
@@ -115,7 +130,7 @@ func (a *OpenAIResponses) BuildPayload(call *Call) ([]byte, error) {
 				}
 				input = append(input, map[string]any{
 					"type": "function_call", "call_id": tc.ID,
-					"name": tc.Function.Name, "arguments": strOr(tc.Function.Arguments, "{}"),
+					"name": tc.Function.Name, "arguments": tc.Function.Arguments,
 				})
 			}
 		case "tool":
@@ -163,10 +178,15 @@ func (a *OpenAIResponses) BuildPayload(call *Call) ([]byte, error) {
 		}
 		payload["tool_choice"] = tc
 	}
-	if r.ThinkingEnabled != nil {
+	// An explicit effort is the more specific request, matching openai_chat
+	// and capability routing even when the boolean toggle says false.
+	if r.ReasoningEffort != "" {
+		payload["reasoning"] = map[string]any{"effort": r.ReasoningEffort, "summary": "auto"}
+	} else if r.ThinkingEnabled != nil {
 		if *r.ThinkingEnabled {
 			// summary:auto 是拿回推理文本的必要条件（无加密存储，摘要即所
 			// 得；responses_client.go 的 reasoning 项映射同一口径）。
+			// T8: 客户端显式声明的档位逐字使用 —— 绝不一律折成 medium。
 			payload["reasoning"] = map[string]any{"effort": responsesThinkingEffort, "summary": "auto"}
 		} else {
 			payload["reasoning"] = map[string]any{"effort": "none"}
@@ -266,11 +286,17 @@ func responsesUpstreamToolChoice(raw json.RawMessage) (any, error) {
 }
 
 // AuthHeaders implements Adapter.
-func (a *OpenAIResponses) AuthHeaders(secret []byte) map[string]string {
-	if len(secret) == 0 {
-		return nil
+func (a *OpenAIResponses) AuthHeaders(auth Auth) (map[string]string, error) {
+	switch auth.Type {
+	case "", AuthTypeAPIKey, AuthTypeService, AuthTypeOAuth:
+	default:
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: openai_responses does not support auth type "+auth.Type)
 	}
-	return map[string]string{"Authorization": "Bearer " + string(secret)}
+	if auth.Token == "" {
+		return nil, nil
+	}
+	return map[string]string{"Authorization": "Bearer " + auth.Token}, nil
 }
 
 // WrapStream implements Adapter (see openai_responses_stream.go).
@@ -297,6 +323,12 @@ type responsesUsage struct {
 	} `json:"output_tokens_details"`
 }
 
+type responsesContentPart struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Refusal string `json:"refusal"`
+}
+
 // responsesOutputItem is the superset of the output item shapes we surface:
 // message (output_text parts), reasoning (summary parts), function_call.
 // Server-side tool items (web_search_call etc.) carry no client-surface
@@ -304,10 +336,7 @@ type responsesUsage struct {
 type responsesOutputItem struct {
 	Type string `json:"type"`
 	// message
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
+	Content []responsesContentPart `json:"content"`
 	// reasoning
 	Summary []struct {
 		Type string `json:"type"`
@@ -350,24 +379,10 @@ func (u *responsesUsage) usageBuckets() domain.UsageBuckets {
 }
 
 // openAIWireUsage renders the OpenAI-shaped usage map embedded into the
-// translated internal payload, so the client surfaces (Task 13) can render
-// cache/reasoning natively (cached_tokens in prompt_tokens_details,
-// reasoning_tokens in completion_tokens_details). nil 桶在此渲成 0 是有意
-// 的：nil-vs-zero 纪律约束的是计量桶（UsageBuckets），wire 渲染与
-// anthropic.go 的 DecodeNonStream 同口径。
+// translated internal payload without inventing absent counters or replacing
+// the upstream-reported total.
 func (u *responsesUsage) openAIWireUsage() map[string]any {
-	usage := map[string]any{
-		"prompt_tokens":     derefInt64(u.InputTokens),
-		"completion_tokens": derefInt64(u.OutputTokens),
-		"total_tokens":      derefInt64(u.InputTokens) + derefInt64(u.OutputTokens),
-	}
-	if u.InputDetails != nil && u.InputDetails.CachedTokens != nil {
-		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": *u.InputDetails.CachedTokens}
-	}
-	if u.OutputDetails != nil && u.OutputDetails.ReasoningTokens != nil {
-		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": *u.OutputDetails.ReasoningTokens}
-	}
-	return usage
+	return openAIUsageShape(u.usageBuckets(), u.TotalTokens)
 }
 
 // marshalResponsesRawUsage renders the schema-versioned raw_usage document
@@ -380,6 +395,9 @@ func marshalResponsesRawUsage(u *responsesUsage) json.RawMessage {
 	}
 	if u.OutputTokens != nil {
 		w["output_tokens"] = *u.OutputTokens
+	}
+	if u.TotalTokens != nil {
+		w["total_tokens"] = *u.TotalTokens
 	}
 	if u.InputDetails != nil && u.InputDetails.CachedTokens != nil {
 		w["input_tokens_details"] = map[string]any{"cached_tokens": *u.InputDetails.CachedTokens}
@@ -399,32 +417,38 @@ func marshalResponsesRawUsage(u *responsesUsage) json.RawMessage {
 // surfaces render it back as response.incomplete); content_filter passes
 // through under its chat.completions name (审核拦截绝不像正常结束); a
 // completed turn that emitted function calls → tool_calls.
-func responsesFinishReason(status, incompleteReason string, hasToolCalls bool) string {
+func responsesFinishReason(status, incompleteReason string, hasToolCalls bool) (string, error) {
 	if status == "incomplete" {
 		switch incompleteReason {
 		case "max_output_tokens":
-			return "length"
+			return "length", nil
 		case "content_filter":
-			return "content_filter"
+			return "content_filter", nil
 		default:
-			return "stop"
+			return "", fmt.Errorf("providers: Responses incomplete reason %q cannot be translated faithfully", incompleteReason)
 		}
 	}
 	if hasToolCalls {
-		return "tool_calls"
+		return "tool_calls", nil
 	}
-	return "stop"
+	return "stop", nil
 }
 
 // collectResponseOutput folds the output items of a completed response into
 // the internal message parts (visible text, reasoning text, tool calls).
-func collectResponseOutput(output []responsesOutputItem) (text, reasoning string, toolCalls []any) {
+func collectResponseOutput(output []responsesOutputItem) (text, reasoning string, toolCalls []any, err error) {
 	var textBuf, reasonBuf strings.Builder
 	for _, it := range output {
 		switch it.Type {
 		case "message":
 			for _, p := range it.Content {
-				if p.Type == "output_text" {
+				switch p.Type {
+				case "refusal":
+					err = fmt.Errorf("providers: Responses refusal cannot be translated faithfully")
+				case "output_text":
+					if len(toolCalls) > 0 && p.Text != "" {
+						err = fmt.Errorf("providers: Responses text after function_call cannot be translated faithfully")
+					}
 					textBuf.WriteString(p.Text)
 				}
 			}
@@ -437,11 +461,11 @@ func collectResponseOutput(output []responsesOutputItem) (text, reasoning string
 		case "function_call":
 			toolCalls = append(toolCalls, map[string]any{
 				"id": it.CallID, "type": "function",
-				"function": map[string]any{"name": it.Name, "arguments": strOr(it.Arguments, "{}")},
+				"function": map[string]any{"name": it.Name, "arguments": it.Arguments},
 			})
 		}
 	}
-	return textBuf.String(), reasonBuf.String(), toolCalls
+	return textBuf.String(), reasonBuf.String(), toolCalls, err
 }
 
 // ---------------------------------------------------------------------------
@@ -462,19 +486,12 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 	if resp.Object != "" && resp.Object != "response" {
 		return nil, fmt.Errorf("providers: unexpected openai_responses payload object %q", resp.Object)
 	}
-	if resp.Status == "failed" {
-		msg := "upstream response failed"
-		if resp.Error != nil && resp.Error.Message != "" {
-			msg = resp.Error.Message
-		}
-		return nil, fmt.Errorf("providers: openai_responses upstream failed: %s", msg)
-	}
-
-	text, reasoning, toolCalls := collectResponseOutput(resp.Output)
+	text, reasoning, toolCalls, translationErr := collectResponseOutput(resp.Output)
 	incompleteReason := ""
 	if resp.IncompleteDetails != nil {
 		incompleteReason = resp.IncompleteDetails.Reason
 	}
+	finishReason, finishErr := responsesFinishReason(resp.Status, incompleteReason, len(toolCalls) > 0)
 	message := map[string]any{"role": "assistant", "content": text}
 	if reasoning != "" {
 		message["reasoning_content"] = reasoning
@@ -489,18 +506,43 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 		"choices": []any{map[string]any{
 			"index":         0,
 			"message":       message,
-			"finish_reason": responsesFinishReason(resp.Status, incompleteReason, len(toolCalls) > 0),
+			"finish_reason": finishReason,
 		}},
 	}
 	result := &NonStreamResult{UpstreamRequestID: resp.ID}
 	// Visible answer size feeds the estimate path when usage is absent —
-	// same 口径 as the streaming tap (content + reasoning bytes).
+	// same 口径 as the streaming tap (text + reasoning + tool arguments).
 	result.ContentBytes = int64(len(text) + len(reasoning))
+	for _, item := range resp.Output {
+		if item.Type == "function_call" {
+			result.ContentBytes += int64(len(item.Arguments))
+		}
+		if item.Type == "message" {
+			for _, part := range item.Content {
+				if part.Type == "refusal" {
+					result.ContentBytes += int64(len(part.Refusal))
+				}
+			}
+		}
+	}
 	if resp.Usage != nil {
 		out["usage"] = resp.Usage.openAIWireUsage()
 		result.UsageReported = true
 		result.Usage = resp.Usage.usageBuckets()
 		result.UsageRaw = marshalResponsesRawUsage(resp.Usage)
+	}
+	if resp.Status == "failed" {
+		msg := "upstream response failed"
+		if resp.Error != nil && resp.Error.Message != "" {
+			msg = resp.Error.Message
+		}
+		return result, fmt.Errorf("providers: openai_responses upstream failed: %s", msg)
+	}
+	if translationErr != nil {
+		return result, translationErr
+	}
+	if finishErr != nil {
+		return result, finishErr
 	}
 	payload, err := json.Marshal(out)
 	if err != nil {

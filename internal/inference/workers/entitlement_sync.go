@@ -19,7 +19,8 @@ import (
 // inference_outbox 消息（同事务 outbox，dedup_key 幂等）；本 worker 消费时
 // 重新读取订阅当前状态与"为该订阅当前套餐最近一次已支付订单"的权益快照，
 // 经 access.DecideSync/Converge 把权益收敛到目标状态，并把"权益变更 +
-// delivered 标记"放进同一个事务提交。收敛语义保证：
+// delivered 标记"放进同一个事务提交。来源读取也在该事务内，订阅和
+// 订单共享行锁持续到提交，防止退款与旧发放计划交错。收敛语义保证：
 //   - 重复/乱序 webhook、Confirm 与后台补单竞争：重复消息重复计算同一目标
 //     状态 → noop；旧消息晚到读到的仍是当前状态 → 不会按旧事件发放；
 //   - 崩溃于事务提交前：整体回滚，消息留在 pending 重试；
@@ -35,12 +36,13 @@ import (
 type EntitlementSyncStore interface {
 	Begin(ctx context.Context) (domain.UnitOfWork, error)
 	EnsureBillingAccount(ctx context.Context, userID string) (*domain.BillingAccount, error)
+	EnsureBillingAccountTx(ctx context.Context, w domain.UnitOfWork, userID string) (*domain.BillingAccount, error)
 	FetchPendingOutboxByTopic(ctx context.Context, topic string, limit int) ([]postgres.OutboxMessage, error)
 	MarkOutboxFailed(ctx context.Context, id int64, nextRetry time.Time) error
 	MarkOutboxDeliveredTx(ctx context.Context, w domain.UnitOfWork, id int64) error
-	GetSyncSubscription(ctx context.Context, userID, productCode string) (*access.SubscriptionState, error)
-	GetLatestPaidBenefitOrder(ctx context.Context, userID, planID string) (*access.OrderBenefitSnapshot, error)
-	GetLatestEntitlementBySource(ctx context.Context, sourceType domain.EntitlementSource, sourceID string) (*domain.Entitlement, error)
+	GetSyncSubscriptionTx(ctx context.Context, w domain.UnitOfWork, userID, productCode string) (*access.SubscriptionState, error)
+	GetLatestPaidBenefitOrderTx(ctx context.Context, w domain.UnitOfWork, userID, planID string) (*access.OrderBenefitSnapshot, error)
+	GetLatestEntitlementBySourceTx(ctx context.Context, w domain.UnitOfWork, sourceType domain.EntitlementSource, sourceID string) (*domain.Entitlement, error)
 	InsertEntitlementTx(ctx context.Context, w domain.UnitOfWork, e *domain.Entitlement) error
 	ReviseEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error)
 	ReviveEntitlementTx(ctx context.Context, w domain.UnitOfWork, id string, patch domain.EntitlementPatch) (*domain.Entitlement, error)
@@ -148,8 +150,8 @@ func (w *EntitlementSync) RunPass(ctx context.Context) (EntitlementSyncStats, er
 	return stats, nil
 }
 
-// processMessage applies one message: plan (pure reads + converge) → apply
-// (one tx with the delivery mark). Failures reschedule with bounded
+// processMessage applies one message: source reads, convergence and delivery
+// share one transaction. Failures reschedule with bounded
 // exponential backoff; the message is never dropped.
 //
 // The recover is the crash-loop guard (审查修复): a panicking message must
@@ -171,15 +173,7 @@ func (w *EntitlementSync) processMessage(ctx context.Context, msg postgres.Outbo
 		stats.Failed++
 		return
 	}
-	plans, err := w.planSync(ctx, syncMsg.UserID, syncMsg.ProductCode, syncMsg.SubscriptionID)
-	if err != nil {
-		log.Printf("ERROR inference entitlement sync: outbox %d plan (%s/%s reason=%s): %v",
-			msg.ID, syncMsg.UserID, syncMsg.ProductCode, syncMsg.Reason, err)
-		w.reschedule(ctx, msg)
-		stats.Failed++
-		return
-	}
-	racing, err := w.applyPlans(ctx, syncMsg.UserID, plans, &msg.ID)
+	plans, racing, err := w.syncUserProduct(ctx, syncMsg.UserID, syncMsg.ProductCode, syncMsg.SubscriptionID, &msg.ID)
 	switch {
 	case err != nil:
 		log.Printf("ERROR inference entitlement sync: outbox %d apply (%s/%s reason=%s): %v",
@@ -246,14 +240,13 @@ type sourcePlan struct {
 }
 
 // planSync computes the converge actions for one (user, product) pair from
-// CURRENT state — the message payload is never trusted for state. Exported
-// so tests can drive the planning directly.
-func (w *EntitlementSync) planSync(ctx context.Context, userID, productCode, subscriptionIDHint string) ([]sourcePlan, error) {
+// CURRENT state protected until the applying transaction commits.
+func (w *EntitlementSync) planSync(ctx context.Context, uow domain.UnitOfWork, userID, productCode, subscriptionIDHint string) ([]sourcePlan, error) {
 	if userID == "" || productCode == "" {
 		return nil, domain.NewError(domain.CodeInvalidInput, "entitlement sync: user and product required")
 	}
 
-	sub, err := w.store.GetSyncSubscription(ctx, userID, productCode)
+	sub, err := w.store.GetSyncSubscriptionTx(ctx, uow, userID, productCode)
 	if err != nil {
 		if domain.CodeOf(err) != domain.CodeNotFound {
 			return nil, err
@@ -263,7 +256,7 @@ func (w *EntitlementSync) planSync(ctx context.Context, userID, productCode, sub
 
 	var paidOrder *access.OrderBenefitSnapshot
 	if sub != nil && sub.Status == "active" {
-		po, perr := w.store.GetLatestPaidBenefitOrder(ctx, userID, sub.PlanID)
+		po, perr := w.store.GetLatestPaidBenefitOrderTx(ctx, uow, userID, sub.PlanID)
 		if perr != nil {
 			if domain.CodeOf(perr) != domain.CodeNotFound {
 				return nil, perr
@@ -303,7 +296,7 @@ func (w *EntitlementSync) planSync(ctx context.Context, userID, productCode, sub
 
 	var plans []sourcePlan
 	for _, src := range candidates {
-		current, cerr := w.store.GetLatestEntitlementBySource(ctx, src.typ, src.id)
+		current, cerr := w.store.GetLatestEntitlementBySourceTx(ctx, uow, src.typ, src.id)
 		if cerr != nil {
 			if domain.CodeOf(cerr) != domain.CodeNotFound {
 				return nil, cerr
@@ -334,27 +327,31 @@ func (w *EntitlementSync) planSync(ctx context.Context, userID, productCode, sub
 	return plans, nil
 }
 
-// applyPlans applies the planned converge actions in ONE transaction,
+// syncUserProduct holds the source locks through every write, including a
+// noop delivery. No stale plan can outlive a refund's converged messages.
+func (w *EntitlementSync) syncUserProduct(ctx context.Context, userID, productCode, subscriptionIDHint string, outboxID *int64) ([]sourcePlan, bool, error) {
+	uow, err := w.store.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer uow.Rollback(ctx) //nolint:errcheck
+	plans, err := w.planSync(ctx, uow, userID, productCode, subscriptionIDHint)
+	if err != nil {
+		return nil, false, err
+	}
+	racing, err := w.applyPlans(ctx, uow, userID, plans, outboxID)
+	if err != nil || racing {
+		return nil, racing, err
+	}
+	return plans, false, uow.Commit(ctx)
+}
+
+// applyPlans applies the planned converge actions on the reading transaction,
 // optionally marking the outbox message delivered in the same commit
 // (outboxID nil for direct SyncUserProduct drives). Returns racing=true
 // when an optimistic guard lost to a concurrent converger — the caller
 // reschedules; nothing was written.
-func (w *EntitlementSync) applyPlans(ctx context.Context, userID string, plans []sourcePlan, outboxID *int64) (racing bool, err error) {
-	if len(plans) == 0 {
-		if outboxID != nil {
-			uow, berr := w.store.Begin(ctx)
-			if berr != nil {
-				return false, berr
-			}
-			defer uow.Rollback(ctx) //nolint:errcheck
-			if err := w.store.MarkOutboxDeliveredTx(ctx, uow, *outboxID); err != nil {
-				return false, err
-			}
-			return false, uow.Commit(ctx)
-		}
-		return false, nil
-	}
-
+func (w *EntitlementSync) applyPlans(ctx context.Context, uow domain.UnitOfWork, userID string, plans []sourcePlan, outboxID *int64) (racing bool, err error) {
 	needsAccount := false
 	for _, p := range plans {
 		if p.action.Op == access.ConvergeInsert {
@@ -365,18 +362,12 @@ func (w *EntitlementSync) applyPlans(ctx context.Context, userID string, plans [
 	if needsAccount {
 		// 首次发放时建立计费账户（每用户一个，所有权来自服务端身份，
 		// 设计 §4.2）。幂等（ON CONFLICT 读回），崩溃后重试无副作用。
-		acct, aerr := w.store.EnsureBillingAccount(ctx, userID)
+		acct, aerr := w.store.EnsureBillingAccountTx(ctx, uow, userID)
 		if aerr != nil {
 			return false, aerr
 		}
 		accountID = acct.ID
 	}
-
-	uow, err := w.store.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer uow.Rollback(ctx) //nolint:errcheck
 
 	for _, p := range plans {
 		a := p.action
@@ -429,19 +420,19 @@ func (w *EntitlementSync) applyPlans(ctx context.Context, userID string, plans [
 			return false, err
 		}
 	}
-	return false, uow.Commit(ctx)
+	return false, nil
 }
 
 // SyncUserProduct converges one (user, product) pair directly, without an
 // outbox message. Exported for tests and future admin/reconciliation
 // tooling; the worker itself only consumes the outbox.
 func (w *EntitlementSync) SyncUserProduct(ctx context.Context, userID, productCode, subscriptionIDHint string) (int, error) {
-	plans, err := w.planSync(ctx, userID, productCode, subscriptionIDHint)
+	plans, racing, err := w.syncUserProduct(ctx, userID, productCode, subscriptionIDHint, nil)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := w.applyPlans(ctx, userID, plans, nil); err != nil {
-		return 0, err
+	if racing {
+		return 0, domain.NewError(domain.CodeConflict, "entitlement sync: concurrent convergence; retry")
 	}
 	return len(plans), nil
 }

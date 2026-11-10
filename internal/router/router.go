@@ -269,10 +269,15 @@ func Setup(
 	// This chain is independent of the operator surface: X-App-Secret is
 	// not a customer credential (设计 §9.2).
 	if accessOps != nil && accessOps.V1Auth != nil {
-		if accessOps.RPMCounter != nil {
-			go accessOps.RPMCounter.RunJanitor(ctx, time.Minute, 2*time.Minute)
-		}
-		v1 := engine.Group("/v1", middleware.RateLimit(ctx, 60, 120), accessOps.V1Auth)
+		// 外围防滥用（每 IP）保留；业务速率限制（RPM/TPM）在业务准入里
+		// 统一执行（Task 4：PostgreSQL 共享，跨实例/跨 Key/跨 /chat 与 /v1）。
+		//
+		// 拒绝形状由入口协议决定：/v1/* 绝不套管理 envelope（设计 §9.1），
+		// 所以这里注入协议原生的响应器（OpenAI error 对象 / Anthropic 原生
+		// 结构），而不是通用中间件默认的管理 envelope。
+		v1 := engine.Group("/v1",
+			middleware.RateLimitWithResponder(ctx, 60, 120, httpapi.V1RateLimitResponder),
+			accessOps.V1Auth)
 		// Task 8 protocol routes: the native OpenAI shapes, never the
 		// management envelope (设计 §9.1). Nil handlers stay unmounted.
 		if accessOps.V1Models != nil {

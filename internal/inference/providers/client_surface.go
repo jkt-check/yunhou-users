@@ -32,9 +32,10 @@ type openAIStreamChunk struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role             string `json:"role"`
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Role             string  `json:"role"`
+			Content          string  `json:"content"`
+			ReasoningContent string  `json:"reasoning_content"`
+			Refusal          *string `json:"refusal"`
 			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
@@ -57,6 +58,15 @@ type openAIStreamChunk struct {
 	} `json:"error"`
 }
 
+func (c *openAIStreamChunk) hasRefusal() bool {
+	for _, choice := range c.Choices {
+		if choice.Delta.Refusal != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // pumpEvent is one parsed line of the internal SSE stream.
 type pumpEvent struct {
 	chunk *openAIStreamChunk
@@ -65,13 +75,17 @@ type pumpEvent struct {
 
 // chunkPump incrementally reassembles and parses `data:` lines (the relay
 // buffer has no line alignment), mirroring OpenAIUsageTracker's discipline:
-// overlong lines are dropped (never wedge), malformed payloads are skipped.
+// overlong lines fail the stream; malformed payloads are skipped.
 type chunkPump struct {
 	pending []byte
+	err     error
 }
 
 // Feed consumes one read and returns every complete event it unblocks.
-func (p *chunkPump) Feed(b []byte) []pumpEvent {
+func (p *chunkPump) Feed(b []byte) ([]pumpEvent, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
 	var out []pumpEvent
 	for len(b) > 0 {
 		nl := bytes.IndexByte(b, '\n')
@@ -80,16 +94,13 @@ func (p *chunkPump) Feed(b []byte) []pumpEvent {
 			end = nl
 		}
 		if len(p.pending)+end > trackLineCap {
-			p.pending = p.pending[:0]
-			if nl < 0 {
-				return out
-			}
-			b = b[nl+1:]
-			continue
+			p.pending = nil
+			p.err = errSSELineTooLong
+			return out, p.err
 		}
 		p.pending = append(p.pending, b[:end]...)
 		if nl < 0 {
-			return out
+			return out, nil
 		}
 		if ev, ok := p.scanLine(p.pending); ok {
 			out = append(out, ev)
@@ -97,7 +108,7 @@ func (p *chunkPump) Feed(b []byte) []pumpEvent {
 		p.pending = p.pending[:0]
 		b = b[nl+1:]
 	}
-	return out
+	return out, nil
 }
 
 func (p *chunkPump) scanLine(line []byte) (pumpEvent, bool) {
@@ -128,9 +139,10 @@ type completionView struct {
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
 		Message      struct {
-			Role             string `json:"role"`
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Role             string  `json:"role"`
+			Content          string  `json:"content"`
+			ReasoningContent string  `json:"reasoning_content"`
+			Refusal          *string `json:"refusal"`
 			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -150,6 +162,11 @@ func parseCompletion(payload []byte) (*completionView, error) {
 	var v completionView
 	if err := json.Unmarshal(payload, &v); err != nil {
 		return nil, fmt.Errorf("providers: decode internal completion: %w", err)
+	}
+	for _, choice := range v.Choices {
+		if choice.Message.Refusal != nil {
+			return nil, errChatRefusal
+		}
 	}
 	return &v, nil
 }
@@ -179,13 +196,18 @@ func translateStream(src io.ReadCloser, r streamRenderer) io.ReadCloser {
 		for {
 			n, readErr := src.Read(buf)
 			if n > 0 {
-				for _, ev := range pump.Feed(buf[:n]) {
-					if ev.done {
-						terminal = true
-					}
-					if err := r.Render(ev, pw); err != nil {
-						pw.CloseWithError(err)
-						return
+				events, parseErr := pump.Feed(buf[:n])
+				if parseErr != nil {
+					readErr = parseErr
+				} else {
+					for _, ev := range events {
+						if ev.done {
+							terminal = true
+						}
+						if err := r.Render(ev, pw); err != nil {
+							pw.CloseWithError(err)
+							return
+						}
 					}
 				}
 			}
@@ -230,14 +252,6 @@ func NewPublicMessageID() string { return newPublicID("msg_") }
 
 // NewPublicResponseID returns the public Responses object id (resp_...).
 func NewPublicResponseID() string { return newPublicID("resp_") }
-
-// derefOr returns *p or the fallback.
-func derefOr(p *int64, fallback int64) int64 {
-	if p == nil {
-		return fallback
-	}
-	return *p
-}
 
 // strOr returns v unless empty.
 func strOr(v, fallback string) string {

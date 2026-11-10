@@ -22,6 +22,9 @@ const (
 	CodeNotFound             Code = "not_found"
 	CodeConflict             Code = "conflict"
 	CodeInsufficientCapacity Code = "insufficient_capacity"
+	// CodeUpstreamResponseInvalid marks an executed response that cannot be
+	// translated faithfully, not an unavailable or overloaded upstream.
+	CodeUpstreamResponseInvalid Code = "upstream_response_invalid"
 	// CodeUnpricedCapability rejects a chargeable capability that has no
 	// effective price version (设计 §7.1/Task 6: 拒绝未定价且需扣费的能力).
 	CodeUnpricedCapability Code = "unpriced_capability"
@@ -29,7 +32,12 @@ const (
 	// derived available balance (or the monthly spend limit) cannot cover
 	// the safe upper-bound hold (Task 14: 并发扣减在 DB 层原子，不超扣).
 	CodeInsufficientBalance Code = "insufficient_balance"
-	CodeInternal            Code = "internal"
+	// CodeServiceUnavailable marks a service-side failure — the storage
+	// that guards admission (rate limits, quota windows) is unreachable.
+	// It is a clear server error, NEVER a user quota exhaustion: a
+	// database outage must not be answered as "your quota is exhausted".
+	CodeServiceUnavailable Code = "service_unavailable"
+	CodeInternal           Code = "internal"
 )
 
 // Error is the domain error: a stable Code plus a human-readable message.
@@ -63,6 +71,19 @@ func WrapError(code Code, msg string, cause error) *Error {
 // CodeOf extracts the domain Code from err, falling back to CodeInternal
 // for foreign errors. A nil error yields an empty code.
 func CodeOf(err error) Code {
+	// The typed terminal settlement result carries its own code (always
+	// CodeConflict) — it must be classified by Kind, not by the code.
+	var se *SettleError
+	if errors.As(err, &se) {
+		return se.Code
+	}
+	// The typed rate rejection carries CodeRateLimited — a rate rejection
+	// must never be confused with the monetary quota_exceeded (which is
+	// the signal for the wallet fallback).
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		return CodeRateLimited
+	}
 	var de *Error
 	if errors.As(err, &de) {
 		return de.Code

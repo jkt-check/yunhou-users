@@ -167,6 +167,17 @@ func writeAnthropicDomainError(c *gin.Context, err error) {
 		return
 	}
 
+	// 速率拒绝（Task 4）：独立的 429 语义，Retry-After 只在恢复时刻可确定
+	// 时给出。
+	var rle *domain.RateLimitError
+	if errors.As(err, &rle) {
+		if rle.RetryAfterSeconds > 0 {
+			c.Header("Retry-After", strconv.Itoa(rle.RetryAfterSeconds))
+		}
+		anthropicError(c, http.StatusTooManyRequests, "rate_limit_error", safeMsg(err))
+		return
+	}
+
 	switch domain.CodeOf(err) {
 	case domain.CodeInvalidKey:
 		anthropicError(c, http.StatusUnauthorized, "authentication_error",
@@ -183,10 +194,15 @@ func writeAnthropicDomainError(c *gin.Context, err error) {
 		// 钱包门控（未开启套餐外/月支出上限/余额不足）按限流类 429 答复，
 		// 与 chat 平面及套餐耗尽同一客户语义（Task 14）。
 		anthropicError(c, http.StatusTooManyRequests, "rate_limit_error", safeMsg(err))
+	case domain.CodeUpstreamResponseInvalid:
+		anthropicError(c, http.StatusBadGateway, "api_error", safeMsg(err))
 	case domain.CodeUpstreamUnavailable:
 		// 529/overloaded 是 Anthropic 语义里最接近"上游暂不可用"的类别,
 		// 也是 SDK/客户端有退避重试行为的类别.
 		anthropicError(c, 529, "overloaded_error", safeMsg(err))
+	case domain.CodeServiceUnavailable:
+		// 存储不可用：明确的服务错误，绝不伪装成额度耗尽。
+		anthropicError(c, http.StatusServiceUnavailable, "api_error", safeMsg(err))
 	case domain.CodeConflict:
 		anthropicError(c, http.StatusConflict, "invalid_request_error", safeMsg(err))
 	default:

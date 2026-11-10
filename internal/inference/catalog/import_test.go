@@ -139,6 +139,27 @@ func TestImportValidationFailures(t *testing.T) {
 	}
 }
 
+// T7:环境导入与批量导入派生同一种路由 —— pool_strategy 必须在支持集内
+// (常规池仅 round_robin),不得派生出一个「保存后假装生效」的值。
+func TestImportEnvCatalog_DerivedRouteUsesSupportedPoolStrategy(t *testing.T) {
+	_, _, svc := testDB(t)
+	ctx := context.Background()
+	if _, err := svc.ImportEnvCatalog(ctx, validEnvCatalog); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	routes, err := svc.ListRoutes(ctx, "glm-4.6")
+	if err != nil {
+		t.Fatalf("list routes: %v", err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("routes = %+v, want 1", routes)
+	}
+	if routes[0].PoolStrategy != domain.PoolRoundRobin {
+		t.Errorf("derived route pool_strategy = %q, want %q (环境导入必须落在支持集内)",
+			routes[0].PoolStrategy, domain.PoolRoundRobin)
+	}
+}
+
 func TestParseEnvCatalogRejectsKayaChatUpstream(t *testing.T) {
 	raw := `{"providers":[{"code":"p","display_name":"P","access_type":"official_api"}],
 		"models":[{"id":"m-1","display_name":"M","context_tokens":1,"max_output_tokens":1,

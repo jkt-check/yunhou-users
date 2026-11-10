@@ -1,6 +1,8 @@
 // service.go — 上游凭据生命周期：创建 / 轮换 / 测试 / 禁用 + 网关侧密钥
-// 解析（ResolveSecret）。所有写操作记录审计（人员 + 服务双重归因、对象、
-// 原因）；响应、日志与审计 detail 永远不含可用秘密（脱敏后的状态视图）。
+// 解析（ResolveSecret 取原始材料；ResolveOutboundAuth 交出可直接派发的
+// 鉴权材料——oauth 凭据只有 access token 出边界）。所有写操作记录审计
+// （人员 + 服务双重归因、对象、原因）；响应、日志与审计 detail 永远不含
+// 可用秘密（脱敏后的状态视图）。
 
 package credentials
 
@@ -8,8 +10,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"strings"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/domain"
@@ -409,6 +411,27 @@ func (s *Service) ResolveSecret(ctx context.Context, id string, pinGeneration *i
 	return plain, cred, nil
 }
 
+// decodeOAuthAccessToken is the ONE place where a sealed OAuth bundle is
+// decoded for an outbound bearer token. Both public resolvers go through it,
+// so a corrupt bundle or an empty access token is rejected identically for
+// every caller (the probe surface included) and the next credential bug has
+// a single site to be fixed at.
+//
+// The returned error never carries the parse cause nor any part of the
+// sealed material: a JSON syntax error can echo one character of the
+// plaintext, and the cause chain is what ends up in logs and operator
+// summaries.
+func decodeOAuthAccessToken(plain []byte) (string, error) {
+	bundle, err := UnmarshalBundle(plain)
+	if err != nil {
+		return "", domain.NewError(domain.CodeInternal, "oauth credential bundle is unreadable")
+	}
+	if bundle.AccessToken == "" {
+		return "", domain.NewError(domain.CodeConflict, "oauth credential has no access token")
+	}
+	return bundle.AccessToken, nil
+}
+
 // ResolveBearerToken resolves the token usable as an Authorization: Bearer
 // header（R7-N7 预发布探测面）：静态凭据（api_key/service）返回明文本身；
 // oauth 凭据的明文是 bundle，取其 access token。代次钉扎与 ResolveSecret
@@ -422,14 +445,50 @@ func (s *Service) ResolveBearerToken(ctx context.Context, id string, pinGenerati
 	if cred.AuthType != "oauth" {
 		return strings.TrimSpace(string(plain)), cred, nil
 	}
-	bundle, err := UnmarshalBundle(plain)
+	token, err := decodeOAuthAccessToken(plain)
 	if err != nil {
 		return "", nil, err
 	}
-	if bundle.AccessToken == "" {
-		return "", nil, domain.NewError(domain.CodeConflict, "oauth credential has no access token")
+	return token, cred, nil
+}
+
+// OutboundAuth is the credential material ONE dispatch may use: the auth
+// type plus the usable secret. It is the only credential shape the gateway
+// hot path sees — the sealed OAuth bundle and the refresh token stay inside
+// this package.
+type OutboundAuth struct {
+	// AuthType is the credential's auth type: "api_key" | "service" | "oauth".
+	AuthType string
+	// Token is the usable outbound secret: the plaintext for a static
+	// credential (api_key/service), the ACCESS TOKEN for an oauth one.
+	Token string
+}
+
+// ResolveOutboundAuth resolves a credential into dispatchable auth material
+// (Task 1: the hot path must never see the bundle). Status, generation CAS
+// and rotation semantics are exactly ResolveSecret's — this method only
+// changes WHAT the caller receives, never WHEN it may be used.
+//
+// The oauth branch yields the access token alone: the bundle JSON and the
+// refresh token are never handed out, so they can not reach an upstream
+// header. The decode itself is shared with ResolveBearerToken (see
+// decodeOAuthAccessToken), so both public paths reject an unusable bundle
+// identically and with a message that carries no part of the sealed
+// material.
+func (s *Service) ResolveOutboundAuth(ctx context.Context, id string, pinGeneration *int64) (OutboundAuth, *domain.Credential, error) {
+	plain, cred, err := s.ResolveSecret(ctx, id, pinGeneration)
+	if err != nil {
+		return OutboundAuth{}, nil, err
 	}
-	return bundle.AccessToken, cred, nil
+	if cred.AuthType != "oauth" {
+		// 静态凭据：明文本身就是出站秘密（逐字节保持旧热路径口径）。
+		return OutboundAuth{AuthType: cred.AuthType, Token: string(plain)}, cred, nil
+	}
+	token, err := decodeOAuthAccessToken(plain)
+	if err != nil {
+		return OutboundAuth{}, nil, err
+	}
+	return OutboundAuth{AuthType: cred.AuthType, Token: token}, cred, nil
 }
 
 func (s *Service) mustActive(ctx context.Context, id string) (*domain.Credential, error) {

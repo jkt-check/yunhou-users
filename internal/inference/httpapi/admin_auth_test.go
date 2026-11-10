@@ -268,7 +268,7 @@ func TestGrantRevokeHandlers(t *testing.T) {
 	}
 
 	// Valid grant → audited with dual attribution, 同事务提交。
-	w = grantRequest(engine, `{"user_id":"u2","role":"operator","reason":"onboard"}`)
+	w = grantRequest(engine, `{"user_id":"f0d132b1-4c32-48ce-8874-1ee7af17f64d","role":"operator","reason":"  onboard  "}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("grant: %d %s", w.Code, w.Body.String())
 	}
@@ -283,7 +283,7 @@ func TestGrantRevokeHandlers(t *testing.T) {
 	}
 
 	// Unknown role → 400.
-	w = grantRequest(engine, `{"user_id":"u2","role":"superuser","reason":"x"}`)
+	w = grantRequest(engine, `{"user_id":"f0d132b1-4c32-48ce-8874-1ee7af17f64d","role":"superuser","reason":"x"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("unknown role: %d", w.Code)
 	}
@@ -327,7 +327,7 @@ func TestGrantRole_AuditAndEffectAtomic(t *testing.T) {
 	}
 	rec := &stubRecorder{txErr: errors.New("audit sink down")}
 	engine := newOperatorAdminEngine(store, rec)
-	w := grantRequest(engine, `{"user_id":"u2","role":"operator","reason":"onboard"}`)
+	w := grantRequest(engine, `{"user_id":"f0d132b1-4c32-48ce-8874-1ee7af17f64d","role":"operator","reason":"onboard"}`)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("audit failure = %d, want 500: %s", w.Code, w.Body.String())
 	}
@@ -338,11 +338,37 @@ func TestGrantRole_AuditAndEffectAtomic(t *testing.T) {
 	// store 无事务能力 → fail-closed 500（不是降级为非原子提交）。
 	plain := &stubOperatorStore{roles: map[string][]string{"adm-1": {"admin"}}}
 	engine2 := newOperatorAdminEngine(plain, &stubRecorder{})
-	w = grantRequest(engine2, `{"user_id":"u2","role":"operator","reason":"onboard"}`)
+	w = grantRequest(engine2, `{"user_id":"f0d132b1-4c32-48ce-8874-1ee7af17f64d","role":"operator","reason":"onboard"}`)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("non-transactional store = %d, want fail-closed 500: %s", w.Code, w.Body.String())
 	}
 	if len(plain.granted) != 0 {
 		t.Fatalf("fail-closed must not apply the grant: %v", plain.granted)
+	}
+}
+
+func TestGrantRole_RejectsMissingReasonAndInvalidUserID(t *testing.T) {
+	for _, body := range []string{
+		`{"user_id":"f0d132b1-4c32-48ce-8874-1ee7af17f64d","role":"operator"}`,
+		`{"user_id":"f0d132b1-4c32-48ce-8874-1ee7af17f64d","role":"operator","reason":" \t\n "}`,
+		`{"role":"operator","reason":"onboard"}`,
+		`{"user_id":"  ","role":"operator","reason":"onboard"}`,
+		`{"user_id":"not-a-uuid","role":"operator","reason":"onboard"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			uow := &stubUow{}
+			store := &stubOperatorTxStore{
+				stubOperatorStore: stubOperatorStore{roles: map[string][]string{"adm-1": {"admin"}}},
+				uow:               uow,
+			}
+			rec := &stubRecorder{}
+			w := grantRequest(newOperatorAdminEngine(store, rec), body)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("invalid grant = %d, want 400: %s", w.Code, w.Body.String())
+			}
+			if len(store.granted) != 0 || len(rec.events) != 0 || uow.committed || uow.rolledBack {
+				t.Errorf("invalid grant reached mutation/audit: grants=%v events=%v tx=%+v", store.granted, rec.events, uow)
+			}
+		})
 	}
 }

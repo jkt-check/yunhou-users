@@ -242,6 +242,16 @@ func (s *Store) GetLatestEntitlementBySource(ctx context.Context, sourceType dom
 	return row.toDomain(), nil
 }
 
+// GetLatestEntitlementBySourceTx reads the current entitlement on the
+// transaction that will converge it.
+func (s *Store) GetLatestEntitlementBySourceTx(ctx context.Context, w domain.UnitOfWork, sourceType domain.EntitlementSource, sourceID string) (*domain.Entitlement, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	return s.getLatestEntitlementBySourceTx(ctx, tx, sourceType, sourceID)
+}
+
 // getLatestEntitlementBySourceTx is GetLatestEntitlementBySource on the
 // caller's transaction (评审轮1 M3：持 tx 期间不得用 s.db 第二连接读——池
 // 饱和时第二连接等不到可用连接即死锁).

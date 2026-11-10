@@ -98,6 +98,64 @@ func TestStreamBodyFinish_FinalizeBeforeLeaseRelease(t *testing.T) {
 	}
 }
 
+// TestStreamBodyFinish_ReleasesEveryRequestLease: keeper 携带的租约是一个
+// **列表**（上游账号 + 计费账户 + 客户 Key，Task 5）—— finalize 之后必须把
+// 列表里的每一把都释放，且一把都不许提前释放（"持有租约"与"未终态"严格同
+// 区间）。这里刻意用三把锁，钉住"不硬编码只有两把锁"。
+func TestStreamBodyFinish_ReleasesEveryRequestLease(t *testing.T) {
+	stub := &leaseOrderStub{}
+	routingSvc := routing.NewService(stub, nil, nil)
+	keeper := routingSvc.NewLeaseKeeper(
+		&domain.ConcurrencyLease{
+			ID: "lease-upstream", Scope: domain.LeaseScopeUpstreamAccount, ScopeID: "acct-1",
+			RequestID: "req-1", OwnerToken: "owner", FencingToken: 1,
+			State: domain.LeaseHeld, ExpiresAt: time.Now().Add(time.Minute),
+		},
+		&domain.ConcurrencyLease{
+			ID: "lease-account", Scope: domain.LeaseScopeBillingAccount, ScopeID: "acct-1",
+			RequestID: "req-1", OwnerToken: "owner", FencingToken: 2,
+			State: domain.LeaseHeld, ExpiresAt: time.Now().Add(time.Minute),
+		},
+		&domain.ConcurrencyLease{
+			ID: "lease-key", Scope: domain.LeaseScopeAPIKey, ScopeID: "key-1",
+			RequestID: "req-1", OwnerToken: "owner", FencingToken: 3,
+			State: domain.LeaseHeld, ExpiresAt: time.Now().Add(time.Minute),
+		},
+	)
+	body := &StreamBody{
+		keeper: keeper,
+		finalize: func(end StreamEnd) error {
+			if got := stub.releasedIDs(); len(got) != 0 {
+				t.Errorf("lease released BEFORE finalize committed: %v", got)
+			}
+			return nil
+		},
+	}
+	if err := body.Finish(EndCompleted); err != nil {
+		t.Fatal(err)
+	}
+	got := stub.releasedIDs()
+	if len(got) != 3 {
+		t.Fatalf("released = %v, want all three leases released after finalize", got)
+	}
+	seen := map[string]bool{}
+	for _, id := range got {
+		seen[id] = true
+	}
+	for _, want := range []string{"lease-upstream", "lease-account", "lease-key"} {
+		if !seen[want] {
+			t.Errorf("lease %s was not released: %v", want, got)
+		}
+	}
+	// 幂等：二次 Finish 不重复释放。
+	if err := body.Finish(EndCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if got := stub.releasedIDs(); len(got) != 3 {
+		t.Fatalf("second Finish released again: %v", got)
+	}
+}
+
 // 评审轮3 F-1：finalize 闭包 panic 时租约仍必须释放——否则 once 已消费
 // 而 Stop 被跳过，续租 goroutine 无限续租，预占/并发槽永久泄漏。panic
 // 向上传播（调用方 recovery 兜底），二次 Finish 不再重复副作用。

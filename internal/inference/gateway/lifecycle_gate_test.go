@@ -10,12 +10,14 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/management"
 )
@@ -271,5 +273,63 @@ func TestLifecycleGate_Enforce_ActiveUnaffected(t *testing.T) {
 	}
 	if out.RequestID == "" {
 		t.Error("empty request id")
+	}
+}
+
+// --- T3：缓存错误不得被伪装成「无权限」；lifecycle 档位默认值不变 ---
+
+// failingSnapshot 手搓桩：快照源（目录快照缓存）故障。
+type failingSnapshot struct{ err error }
+
+func (s failingSnapshot) Current(context.Context) (*catalog.Snapshot, error) {
+	return nil, s.err
+}
+
+// TestLifecycleGate_SnapshotCacheErrorIsNotPermissionDenial：目录快照
+// 缓存故障必须显式失败，不得被伪装成「无权限」——既不是 model_not_allowed
+// 也不是 404；零出站、零请求落库、零计费。
+func TestLifecycleGate_SnapshotCacheErrorIsNotPermissionDenial(t *testing.T) {
+	up := newUpstream(t, completionHandler)
+	boom := errors.New("catalog snapshot cache unavailable")
+	f := newFixture(t, up, withSnapshotSource(func(*fixture) SnapshotSource {
+		return failingSnapshot{err: boom}
+	}))
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err == nil {
+		t.Fatal("a snapshot failure must fail the call")
+	}
+	switch code := domain.CodeOf(err); code {
+	case domain.CodeModelNotAllowed, domain.CodeNotFound:
+		t.Fatalf("code = %v, want an internal failure（缓存错误不得伪装成无权限）: %v", code, err)
+	}
+	if up.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d, want 0", up.calls.Load())
+	}
+	var cnt int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM inference_requests`).Scan(&cnt); err != nil || cnt != 0 {
+		t.Errorf("persisted requests = %d err=%v, want 0", cnt, err)
+	}
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM inference_ledger_entries`).Scan(&cnt); err != nil || cnt != 0 {
+		t.Errorf("ledger entries = %d err=%v, want 0", cnt, err)
+	}
+}
+
+// TestLifecycleGate_DefaultModeIsObserve：lifecycle 门禁的默认档位是
+// observe（只告警不拦截）；enforce 必须显式开启。本次上线不得隐式切换
+// 线上政策。
+func TestLifecycleGate_DefaultModeIsObserve(t *testing.T) {
+	up := newUpstream(t, completionHandler)
+	f := newFixture(t, up)
+	if f.gateway.LifecycleGate != LifecycleGateObserve {
+		t.Fatalf("default lifecycle gate = %v, want observe", f.gateway.LifecycleGate)
+	}
+	if LifecycleGateObserve.String() != "observe" {
+		t.Errorf("observe.String() = %q, want %q", LifecycleGateObserve.String(), "observe")
+	}
+	if LifecycleGateEnforce.String() != "enforce" {
+		t.Errorf("enforce.String() = %q, want %q", LifecycleGateEnforce.String(), "enforce")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/textproto"
 )
 
 // reservedHeaderPrefixes blocks header names the gateway sets itself.
@@ -27,7 +28,7 @@ var reservedHeaderExact = map[string]bool{
 // are canonicalised before comparison so case tricks don't slip through.
 func ValidateCustomHeaders(headers map[string]string) error {
 	for name := range headers {
-		canonical := canonicalHeaderKey(name)
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
 		if reservedHeaderExact[canonical] {
 			return fmt.Errorf("custom header %q is managed by the gateway and must not be overridden", name)
 		}
@@ -38,20 +39,6 @@ func ValidateCustomHeaders(headers map[string]string) error {
 		}
 	}
 	return nil
-}
-
-// canonicalHeaderKey is textproto.CanonicalMIMEHeaderKey without importing
-// net/http into the domain package; kept local for clarity.
-func canonicalHeaderKey(s string) string {
-	upper := true
-	b := []byte(s)
-	for i, c := range b {
-		if upper && 'a' <= c && c <= 'z' {
-			b[i] = c - ('a' - 'A')
-		}
-		upper = c == '-'
-	}
-	return string(b)
 }
 
 // ExtensionHeaders extracts the optional "headers" object from an

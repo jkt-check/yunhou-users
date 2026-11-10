@@ -7,6 +7,7 @@ package management
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -373,6 +374,72 @@ func TestQuotaPolicyRetire_RacedRetireIdempotent(t *testing.T) {
 	}
 	if fs.retire.calls != 0 || len(audit.events) != 0 {
 		t.Fatalf("loser must not retire/audit: calls=%d audits=%d", fs.retire.calls, len(audit.events))
+	}
+}
+
+// T7 — 未实现的超额模式必须被明确拒绝：clamp_if_declared 依赖客户端显式
+// 声明字段，本期协议层没有该字段 —— 收下它等于「保存后假装生效」。新写策略
+// 一律拒绝；旧数据仍可查询（读面不做隐式改写）。
+func TestQuotaPolicy_ClampIfDeclaredRejectedOnWrite(t *testing.T) {
+	svc, fs, audit := newQPService()
+	ctx := context.Background()
+
+	in := baseCreateInput()
+	in.OveragePolicy = "clamp_if_declared"
+	_, err := svc.Create(ctx, "user:op@app:ops", in)
+	if err == nil {
+		t.Fatal("create must refuse the unimplemented clamp_if_declared overage policy")
+	}
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("create: code = %v, want invalid_input", domain.CodeOf(err))
+	}
+	if !strings.Contains(err.Error(), "reject") || !strings.Contains(err.Error(), "allow_overage") {
+		t.Errorf("the refusal must name the supported replacements: %v", err)
+	}
+	if fs.inserted != nil {
+		t.Fatal("a refused policy must not be written")
+	}
+	if len(audit.events) != 0 {
+		t.Errorf("a refused policy must not be audited: %+v", audit.events)
+	}
+
+	// patch 同样拒绝（合并后内容再校验）。
+	draft := &QuotaPolicyInfo{ID: "p-clamp", Name: "n", Revision: 1, Status: "draft",
+		ModelIDs: []string{"deepseek-chat"}, WeeklyLimit: i64(5_000_000),
+		OveragePolicy: "reject"}
+	fs.rows["p-clamp"] = draft
+	_, err = svc.Update(ctx, "user:op@app:ops", "p-clamp", UpdateQuotaPolicyInput{
+		Reason: "x", Set: map[string]bool{"overage_policy": true}, OveragePolicy: "clamp_if_declared",
+	})
+	if err == nil {
+		t.Fatal("update must refuse the unimplemented clamp_if_declared overage policy")
+	}
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("update: code = %v, want invalid_input", domain.CodeOf(err))
+	}
+	if fs.updated != nil {
+		t.Fatal("a refused patch must not be written")
+	}
+}
+
+// TestQuotaPolicy_LegacyClampIfDeclaredStaysQueryable: 存量策略行仍可读 ——
+// 读面不做隐式改写（不自动把旧策略改成 reject），运营按文档人工迁移。
+func TestQuotaPolicy_LegacyClampIfDeclaredStaysQueryable(t *testing.T) {
+	svc, fs, _ := newQPService()
+	legacy := &QuotaPolicyInfo{ID: "legacy-clamp", Name: "n", Revision: 3, Status: "published",
+		ModelIDs: []string{"deepseek-chat"}, WeeklyLimit: i64(5_000_000),
+		OveragePolicy: "clamp_if_declared"}
+	fs.rows["legacy-clamp"] = legacy
+
+	got, refs, cfgRefs, err := svc.Get(context.Background(), "legacy-clamp")
+	if err != nil {
+		t.Fatalf("legacy policy must stay queryable: %v", err)
+	}
+	if got.OveragePolicy != "clamp_if_declared" {
+		t.Errorf("overage_policy = %q, want the stored value (读面不得静默改写旧策略)", got.OveragePolicy)
+	}
+	if got.Revision != 3 || got.Status != "published" || refs != 0 || cfgRefs != 0 {
+		t.Errorf("legacy policy projection = %+v refs=%d cfg=%d", got, refs, cfgRefs)
 	}
 }
 

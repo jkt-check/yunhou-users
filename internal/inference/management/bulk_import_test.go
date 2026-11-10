@@ -133,7 +133,7 @@ func TestBulkImport_PerItemErrorsBlockCommit(t *testing.T) {
 	doc.Models = append(doc.Models, BulkModel{
 		ID: "Bad Model!", // 非法 ID（catalog.ValidateModel 拒绝）
 		Deployments: []BulkDeployment{{
-			ProviderCode: "ghost", // 文档内不存在的 provider
+			ProviderCode:  "ghost", // 文档内不存在的 provider
 			UpstreamModel: "x", Protocol: "openai_chat",
 		}},
 	})
@@ -334,8 +334,8 @@ func (posthocOnlyRecorder) Record(ctx context.Context, ev AuditEvent) error { re
 
 // txSpyRecorder records whether RecordTx ran before Commit.
 type txSpyRecorder struct {
-	uow          *fakeUow
-	txCalls      int
+	uow             *fakeUow
+	txCalls         int
 	committedAtCall bool
 }
 
@@ -438,5 +438,33 @@ func TestPricingPreview_DiffSets(t *testing.T) {
 	}
 	if len(removed) != 1 || removed[0] != "d" {
 		t.Fatalf("removed = %v", removed)
+	}
+}
+
+// T7:批量导入与 operator CRUD 共用同一套 pool_strategy 支持集 —— 派生路由
+// 必须是 round_robin（常规池唯一支持的策略），不得派生出一个「保存后假装
+// 生效」的值。派生路由必须过共享校验器，否则逐项报错、绝不半发布。
+func TestBulkImport_DerivedRouteStaysInsideTheSupportedPoolStrategySet(t *testing.T) {
+	fs := &fakeBulkStore{t: t}
+	svc := NewBulkImportService(fs, nil, func(context.Context, string) error { return nil })
+	res, err := svc.Import(context.Background(), "user:op1@app:ops", "task-pool", validBulkDoc(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HasErrors() {
+		t.Fatalf("the derived route must be inside the supported set: %+v", res.Items)
+	}
+	var routes int
+	for _, it := range res.Items {
+		if it.Kind != BulkKindRoute {
+			continue
+		}
+		routes++
+		if it.Status != BulkItemWouldInsert {
+			t.Errorf("route item = %+v, want would_insert", it)
+		}
+	}
+	if routes != 1 {
+		t.Errorf("route items = %d, want 1", routes)
 	}
 }

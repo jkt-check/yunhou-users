@@ -22,8 +22,8 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/yunhou/users/internal/analytics"
-	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/paddle"
+	"github.com/yunhou/users/internal/billing/paypal"
 	"github.com/yunhou/users/internal/billing/wechat"
 	"github.com/yunhou/users/internal/config"
 	"github.com/yunhou/users/internal/handler"
@@ -396,6 +396,7 @@ func main() {
 		Accounts: inferencehttpapi.NewAdminAccountsHandler(inferencecredentials.NewAccountService(infStore, infStore)),
 		// Task 15: 补偿/冲正带同事务追加审计；补偿列表经运营读模型。
 		Adjustments: inferencehttpapi.NewAdminAdjustmentsHandler(infStore, nil, infStore, opsViewSvc),
+		Corrections: inferencehttpapi.NewAdminCorrectionsHandler(infStore, infStore, nil),
 		// Task 15: 批量导入（dry-run/逐项错误/幂等任务 ID/绝不半发布）。
 		Bulk: inferencehttpapi.NewAdminBulkHandler(inferencemanagement.NewBulkImportService(infStore, infStore, egressValidator.ValidateURL)),
 		// Task 15: 运营统计/成本分析/异常筛选/共享账号检测/变更预览。
@@ -417,7 +418,6 @@ func main() {
 	// backs /user/api-keys with ownership bound to the JWT identity.
 	accessResolver := inferenceaccess.NewResolver(infStore, nil)
 	keySvc := inferenceaccess.NewKeyService(infStore, nil)
-	rpmCounter := inferenceaccess.NewRPMCounter(nil)
 
 	// Task 8: the inference gateway — adapters, routing (account pool +
 	// concurrency leases), quota admission, and the orchestration service
@@ -426,6 +426,11 @@ func main() {
 	adapters := inferenceproviders.RegisteredAdapters()
 	routingSvc := inferencerouting.NewService(infStore, adapters, nil)
 	quotaSvc := inferencequota.NewService(infStore, nil)
+	// Task 4: the global per-billing-account RPM limit is enforced in the
+	// business admission together with the selected policy's RPM limit and
+	// the customer Key's RPM limit (PostgreSQL-backed, shared by all
+	// instances). 0 keeps the documented "disabled" behaviour.
+	quotaSvc.AccountRPM = cfg.InferenceAccountRPM
 	entitlementResolver := inferenceaccess.NewEntitlementResolver(infStore, nil)
 	gatewayHTTPClient := inferenceproviders.NewHTTPClient(egressValidator)
 	gatewaySvc := inferencegateway.NewService(
@@ -458,8 +463,7 @@ func main() {
 
 	accessOps := &inferencehttpapi.AccessOps{
 		UserAPIKeys:       inferencehttpapi.NewUserAPIKeysHandler(keySvc),
-		V1Auth:            inferencehttpapi.APIKeyAuth(accessResolver, rpmCounter, cfg.InferenceAccountRPM),
-		RPMCounter:        rpmCounter,
+		V1Auth:            inferencehttpapi.APIKeyAuth(accessResolver),
 		V1Models:          inferencehttpapi.NewModelsHandler(catalogSvc, accessResolver),
 		V1ChatCompletions: inferencehttpapi.NewChatCompletionsHandler(gatewaySvc),
 		// Task 13: Anthropic Messages / OpenAI Responses 编程工具面（与 chat
@@ -479,10 +483,16 @@ func main() {
 	// /chat 迁移开关（默认关闭 = 旧 DeepSeek 直通）: 开启时 POST /chat 与
 	// GET /chat/models 由网关 facade 承接，JWT/错误 shape/审计 relay 不变。
 	if cfg.InferenceKayaChatGateway {
-		accessOps.KayaChat = service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, catalogCache, cfg.KayaChatModel)
+		// T8：picker 的能力判定与**派发**共用同一个 routing 服务（同一份
+		// adapter 集合、同一套能力规则）—— 列表不得 advertise 一个派发会
+		// 拒绝的图片能力。
+		chatFacade := service.NewChatGatewayFacade(gatewaySvc, accessResolver, catalogSvc, catalogCache, cfg.KayaChatModel)
+		chatFacade.SetImageCapability(routingSvc)
+		accessOps.KayaChat = chatFacade
 		// R7-N2：/chat/models 就绪闸门与 facade 同一快照源（catalogCache）——
 		// 冷启动携带 ErrNoVerifiedSnapshot → 503 + Retry-After。
 		accessOps.KayaChatModels = inferencehttpapi.NewKayaModelsHandler(catalogSvc, accessResolver, catalogCache, cfg.KayaChatModel)
+		accessOps.KayaChatModels.Capabilities = routingSvc
 		log.Printf("kaya /chat gateway facade enabled (default model %s)", cfg.KayaChatModel)
 	}
 	if cfg.InferenceCatalogJSON != "" {
@@ -617,6 +627,13 @@ func main() {
 		ReconciliationDeadline: cfg.InferenceReconciliationDeadline,
 	}, nil)
 	go recoveryWorker.Start(rootCtx)
+
+	// Task 4: rate reservation reaper — removes the TERMINAL rate
+	// reservations that fell out of the retention period (default 24h). An
+	// unsettled reservation is never purged (it still occupies the TPM
+	// budget — a long stream keeps its hold beyond the 60s window).
+	rateReaper := inferenceworkers.NewRateReservationReaper(infStore, nil, inferenceworkers.RateReaperConfig{})
+	go rateReaper.Start(rootCtx)
 
 	// Task 10: entitlement sync worker — consumes the inference_outbox
 	// messages the payment pipeline enqueues in the SAME transaction as the

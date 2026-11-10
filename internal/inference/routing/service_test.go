@@ -3,6 +3,7 @@ package routing
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,11 @@ type fakeStore struct {
 	accounts    map[string][]domain.UpstreamAccount
 	accountsErr error
 
+	// accountQueries counts ListActiveUpstreamAccounts calls per provider so
+	// a test can assert that a non-schedulable provider is never even
+	// consulted (no account-pool round trip for a disabled provider).
+	accountQueries map[string]int
+
 	mu         sync.Mutex
 	leases     map[string]*domain.ConcurrencyLease
 	acquireErr map[string]error // scopeID → error
@@ -33,13 +39,17 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		accounts:   map[string][]domain.UpstreamAccount{},
-		leases:     map[string]*domain.ConcurrencyLease{},
-		acquireErr: map[string]error{},
+		accounts:       map[string][]domain.UpstreamAccount{},
+		accountQueries: map[string]int{},
+		leases:         map[string]*domain.ConcurrencyLease{},
+		acquireErr:     map[string]error{},
 	}
 }
 
 func (s *fakeStore) ListActiveUpstreamAccounts(ctx context.Context, providerID string) ([]domain.UpstreamAccount, error) {
+	s.mu.Lock()
+	s.accountQueries[providerID]++
+	s.mu.Unlock()
 	if s.accountsErr != nil {
 		return nil, s.accountsErr
 	}
@@ -97,7 +107,10 @@ func (s *fakeStore) ReleaseLease(ctx context.Context, leaseID, ownerToken string
 	return nil
 }
 
-// testSnapshot builds a one-model snapshot with the given routes.
+// testSnapshot builds a one-model snapshot with the given routes. Every
+// deployment's provider is registered as an ACTIVE provider so the snapshot
+// mirrors a published catalog (发布快照里 provider 必然在场); the
+// disabled-provider cases override the provider status explicitly.
 func testSnapshot(modelID string, routes []domain.ModelRoute, deployments ...domain.Deployment) *catalog.Snapshot {
 	snap := &catalog.Snapshot{
 		Models:        map[string]domain.Model{},
@@ -107,6 +120,12 @@ func testSnapshot(modelID string, routes []domain.ModelRoute, deployments ...dom
 	}
 	for _, d := range deployments {
 		snap.Deployments[d.ID] = d
+		if _, ok := snap.Providers[d.ProviderID]; !ok {
+			snap.Providers[d.ProviderID] = domain.Provider{
+				ID: d.ProviderID, Code: d.ProviderID, DisplayName: d.ProviderID,
+				AccessType: domain.AccessOfficialAPI, Status: "active",
+			}
+		}
 	}
 	return snap
 }
@@ -406,5 +425,330 @@ func TestAcquireUpstreamLease_RecheckOptional(t *testing.T) {
 		account("a1", "prov", 1), "r1", time.Now())
 	if err != nil || lease == nil {
 		t.Fatalf("AcquireUpstreamLease without recheck support = %v/%+v", err, lease)
+	}
+}
+
+// --- T3: provider 停用与「已发布 route/provider/deployment 可调度」判定 ---
+
+// setProviderStatus 覆盖快照里某个 provider 的已发布状态。
+func setProviderStatus(snap *catalog.Snapshot, providerID, status string) {
+	p := snap.Providers[providerID]
+	p.Status = status
+	snap.Providers[providerID] = p
+}
+
+// candidateSummary 把候选集压成 "provider/account" 列表（失败信息只留
+// 判据，不刷整份结构体）。
+func candidateSummary(cands []Candidate) string {
+	parts := make([]string, 0, len(cands))
+	for _, c := range cands {
+		parts = append(parts, c.Deployment.ProviderID+"/"+c.Account.ID)
+	}
+	return strings.Join(parts, ",")
+}
+
+// TestCandidates_DisabledProviderExcluded：发布快照里 provider 被停用时，
+// 它的部署不再产生任何候选（不得出站）；同一模型挂在另一个 active
+// provider 上的部署仍然可用（停用一个 provider 不得停掉整个模型）。
+func TestCandidates_DisabledProviderExcluded(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-off"] = []domain.UpstreamAccount{account("acct-off", "prov-off", 4)}
+	fs.accounts["prov-on"] = []domain.UpstreamAccount{account("acct-on", "prov-on", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}, nil)
+
+	snap := testSnapshot("m",
+		[]domain.ModelRoute{
+			{ID: "r-off", ModelID: "m", DeploymentID: "dep-off", Enabled: true, Weight: 1},
+			{ID: "r-on", ModelID: "m", DeploymentID: "dep-on", Enabled: true, Weight: 1},
+		},
+		deployment("dep-off", "prov-off", domain.ProtocolOpenAIChat),
+		deployment("dep-on", "prov-on", domain.ProtocolOpenAIChat),
+	)
+	setProviderStatus(snap, "prov-off", "disabled")
+
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].Account.ID != "acct-on" {
+		t.Fatalf("candidates = [%s], want only acct-on (停用的 provider 不得出站)", candidateSummary(cands))
+	}
+	for _, c := range cands {
+		if c.Deployment.ProviderID == "prov-off" {
+			t.Fatalf("a disabled provider produced a candidate: %+v", c)
+		}
+	}
+	// 停用的 provider 连账号池都不必查（结构性空，不是容量问题）。
+	fs.mu.Lock()
+	offQueries := fs.accountQueries["prov-off"]
+	onQueries := fs.accountQueries["prov-on"]
+	fs.mu.Unlock()
+	if offQueries != 0 {
+		t.Errorf("disabled provider account pool queried %d times, want 0", offQueries)
+	}
+	if onQueries == 0 {
+		t.Error("the active provider must still be consulted")
+	}
+}
+
+// TestCandidates_DisabledProviderOnlyMeansNoCandidates：模型只挂在被停用的
+// provider 上时没有任何候选（网关据此回 upstream_unavailable），不得回退
+// 到停用 provider 的账号。
+func TestCandidates_DisabledProviderOnlyMeansNoCandidates(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-off"] = []domain.UpstreamAccount{account("acct-off", "prov-off", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}, nil)
+
+	snap := testSnapshot("m",
+		[]domain.ModelRoute{{ID: "r-off", ModelID: "m", DeploymentID: "dep-off", Enabled: true, Weight: 1}},
+		deployment("dep-off", "prov-off", domain.ProtocolOpenAIChat),
+	)
+	setProviderStatus(snap, "prov-off", "disabled")
+
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("candidates = [%s], want 0 (只有 disabled provider 的模型不可调度)", candidateSummary(cands))
+	}
+}
+
+// TestCandidates_ProviderAbsentFromSnapshotIsNotSchedulable：发布快照是
+// 权威事实源——快照里没有的 provider 没有已发布状态，其部署不得被当成
+// 可调度（fail-closed，不得当成 active 放行）。
+func TestCandidates_ProviderAbsentFromSnapshotIsNotSchedulable(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-gone"] = []domain.UpstreamAccount{account("acct-gone", "prov-gone", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}, nil)
+
+	snap := testSnapshot("m",
+		[]domain.ModelRoute{{ID: "r-gone", ModelID: "m", DeploymentID: "dep-gone", Enabled: true, Weight: 1}},
+		deployment("dep-gone", "prov-gone", domain.ProtocolOpenAIChat),
+	)
+	delete(snap.Providers, "prov-gone")
+
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("candidates = [%s], want 0 (provider 不在已发布快照里 → 不可调度)", candidateSummary(cands))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T7 — 配置行为收口：pool_strategy 支持集 + weight 语义
+// ---------------------------------------------------------------------------
+
+// TestCandidates_UnsupportedPoolStrategyIsNotACandidate：存量已发布快照里的
+// 不支持 pool_strategy（least_loaded / 通用 session_sticky）必须被标记
+// 不可用 —— 路由不得把它静默当成 round_robin。
+func TestCandidates_UnsupportedPoolStrategyIsNotACandidate(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}, nil)
+
+	routes := []domain.ModelRoute{
+		{ID: "r-least", ModelID: "m", DeploymentID: "dep-a", Enabled: true, Weight: 1,
+			PoolStrategy: domain.PoolLeastLoaded},
+		{ID: "r-sticky", ModelID: "m", DeploymentID: "dep-b", Enabled: true, Weight: 1,
+			PoolStrategy: domain.PoolSessionSticky},
+		{ID: "r-rr", ModelID: "m", DeploymentID: "dep-c", Enabled: true, Weight: 1,
+			PoolStrategy: domain.PoolRoundRobin},
+	}
+	snap := testSnapshot("m", routes,
+		deployment("dep-a", "prov-a", domain.ProtocolOpenAIChat),
+		deployment("dep-b", "prov-a", domain.ProtocolOpenAIChat),
+		deployment("dep-c", "prov-a", domain.ProtocolOpenAIChat),
+	)
+
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].Route.ID != "r-rr" {
+		t.Fatalf("candidates = [%s], want only the round_robin route (不支持的 pool_strategy 不得静默当 RR)",
+			candidateSummary(cands))
+	}
+}
+
+// TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits：weight 只做
+// 「同 priority 下的候选排序」，不是概率分流 —— 候选一个都不能少。
+func TestCandidates_WeightOrdersWithinEqualPriorityAndNeverSplits(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat: providers.NewOpenAIChat(),
+	}, nil)
+
+	mkDep := func(id string) domain.Deployment {
+		return domain.Deployment{
+			ID: id, ProviderID: "prov-a", UpstreamModel: "up-1",
+			BaseURL: "https://up.example.com", Protocol: domain.ProtocolOpenAIChat,
+			Status: domain.DeploymentActive, ConnectTimeout: time.Second, RequestTimeout: time.Second,
+		}
+	}
+	payload := catalog.BuildCatalogPayload(
+		[]domain.Model{{ID: "m", DisplayName: "M", Lifecycle: domain.LifecycleActive,
+			ContextTokens: 1000, MaxOutputTokens: 100,
+			Protocols:       []domain.Protocol{domain.ProtocolOpenAIChat},
+			InputModalities: []string{"text"}, OutputModalities: []string{"text"}}},
+		[]domain.Provider{{ID: "prov-a", Code: "prov-a", DisplayName: "P",
+			AccessType: domain.AccessOfficialAPI, Status: "active"}},
+		[]domain.Deployment{mkDep("dep-low"), mkDep("dep-mid"), mkDep("dep-high")},
+		[]domain.ModelRoute{
+			{ID: "r-low", ModelID: "m", DeploymentID: "dep-low", Priority: 0, Weight: 1, Enabled: true},
+			{ID: "r-high", ModelID: "m", DeploymentID: "dep-high", Priority: 0, Weight: 10, Enabled: true},
+			{ID: "r-mid", ModelID: "m", DeploymentID: "dep-mid", Priority: 0, Weight: 5, Enabled: true},
+		},
+	)
+	snap, err := catalog.ParseSnapshot(&domain.ConfigRevision{Scope: domain.ScopeCatalog, Revision: 1,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: payload}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 3 {
+		t.Fatalf("candidates = %d, want 3 (weight 只排序,不做概率分流:候选不得被丢)", len(cands))
+	}
+	for i, want := range []string{"r-high", "r-mid", "r-low"} {
+		if cands[i].Route.ID != want {
+			t.Errorf("candidate[%d] = %s, want %s (同 priority 下按 weight 降序)", i, cands[i].Route.ID, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 能力路由（图片 / 推理档位）
+//
+// 路由层是能力契约的第二层：它必须与 adapter 的能力声明一致 ——
+// 不兼容的部署**根本不参与选择**，而不是等出站前才失败。
+// ---------------------------------------------------------------------------
+
+// TestCandidates_ImageNeedSkipsIncompatibleProtocol：带图请求只选兼容的
+// 上游协议；第一候选（openai_responses，本期不支持图片）被跳过。
+func TestCandidates_ImageNeedSkipsIncompatibleProtocol(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat:      providers.NewOpenAIChat(),
+		domain.ProtocolOpenAIResponses: providers.NewOpenAIResponses(),
+	}, nil)
+	routes := []domain.ModelRoute{
+		{ID: "r-responses", ModelID: "m", DeploymentID: "dep-responses", Enabled: true, Weight: 1},
+		{ID: "r-chat", ModelID: "m", DeploymentID: "dep-chat", Enabled: true, Weight: 1},
+	}
+	snap := testSnapshot("m", routes,
+		deployment("dep-responses", "prov-a", domain.ProtocolOpenAIResponses),
+		deployment("dep-chat", "prov-a", domain.ProtocolOpenAIChat),
+	)
+	// 纯文本：两个候选都在（能力路由不得收窄文本调度面）。
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2 || cands[0].Deployment.ID != "dep-responses" {
+		t.Fatalf("text candidates = %+v, want both (responses first)", cands)
+	}
+	// 带图：只剩 chat 候选。
+	cands, err = svc.Candidates(context.Background(), snap, "m", Needs{Images: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].Deployment.ID != "dep-chat" {
+		t.Fatalf("image candidates = %+v, want dep-chat only", cands)
+	}
+	// CompatibleDeployments 是同一个判定（准入前的能力闸门用它）。
+	compat := svc.CompatibleDeployments(snap, "m", Needs{Images: true})
+	if len(compat) != 1 || compat[0].Deployment.ID != "dep-chat" {
+		t.Fatalf("compatible deployments = %+v, want dep-chat only", compat)
+	}
+}
+
+// TestCandidates_ReasoningEffortNeedSkipsProtocolWithoutKnob：显式推理档位
+// 只选**能表达该档位**的上游协议；anthropic_messages 没有 effort 旋钮，
+// 因此被跳过（绝不折成别的档位）。
+func TestCandidates_ReasoningEffortNeedSkipsProtocolWithoutKnob(t *testing.T) {
+	fs := newFakeStore()
+	fs.accounts["prov-a"] = []domain.UpstreamAccount{account("acct-1", "prov-a", 4)}
+	svc := NewService(fs, map[domain.Protocol]providers.Adapter{
+		domain.ProtocolOpenAIChat:       providers.NewOpenAIChat(),
+		domain.ProtocolAnthropicMessage: providers.NewAnthropicMessages(),
+	}, nil)
+	routes := []domain.ModelRoute{
+		{ID: "r-anthropic", ModelID: "m", DeploymentID: "dep-anthropic", Enabled: true, Weight: 1},
+		{ID: "r-chat", ModelID: "m", DeploymentID: "dep-chat", Enabled: true, Weight: 1},
+	}
+	snap := testSnapshot("m", routes,
+		deployment("dep-anthropic", "prov-a", domain.ProtocolAnthropicMessage),
+		deployment("dep-chat", "prov-a", domain.ProtocolOpenAIChat),
+	)
+	// 只要推理（不指定档位）：两个协议都能承载。
+	cands, err := svc.Candidates(context.Background(), snap, "m", Needs{Reasoning: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("reasoning candidates = %d, want 2", len(cands))
+	}
+	// 指定档位：anthropic 无 effort 旋钮 → 跳过。
+	for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+		cands, err = svc.Candidates(context.Background(), snap, "m",
+			Needs{Reasoning: true, ReasoningEffort: effort})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cands) != 1 || cands[0].Deployment.ID != "dep-chat" {
+			t.Fatalf("effort %q candidates = %+v, want dep-chat only", effort, cands)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 路由能力清单的两种存量形态
+//
+// 空清单 = 全部能力（存量默认形态，DB 默认 '{}'）；非空清单是**限制性**的：
+// 它列出这条路由承载哪些能力，缺哪一项就不承载那一项。T8 起 "image" 也
+// 是一把钥匙 —— 存量非空清单（例如 ["tools","reasoning"]）因此**不再**
+// 承载带图请求：这是有意的收窄（见兼容性报告），运营要恢复图片能力必须
+// 显式加上 "image"。
+// ---------------------------------------------------------------------------
+
+func TestRouteCovers_LegacyCapabilityLists(t *testing.T) {
+	empty := domain.ModelRoute{ModelID: "m", DeploymentID: "d", Weight: 1, Enabled: true}
+	if !routeCovers(empty, Needs{Images: true}) {
+		t.Error("an empty capability list must keep serving images (legacy default)")
+	}
+	if !routeCovers(empty, Needs{Tools: true}) {
+		t.Error("an empty capability list must keep serving tools (legacy default)")
+	}
+	restrictive := domain.ModelRoute{ModelID: "m", DeploymentID: "d", Weight: 1, Enabled: true,
+		Capabilities: []string{"tools", "reasoning"}}
+	if routeCovers(restrictive, Needs{Images: true}) {
+		t.Error("a restrictive list without image must not serve images (deliberate narrowing)")
+	}
+	if !routeCovers(restrictive, Needs{Tools: true}) {
+		t.Error("a restrictive list must still serve the capabilities it declares")
+	}
+	if !routeCovers(restrictive, Needs{Reasoning: true}) {
+		t.Error("a restrictive list must still serve the capabilities it declares")
+	}
+	withImage := domain.ModelRoute{ModelID: "m", DeploymentID: "d", Weight: 1, Enabled: true,
+		Capabilities: []string{"tools", "reasoning", "image"}}
+	if !routeCovers(withImage, Needs{Images: true}) {
+		t.Error("a list declaring image must serve images")
 	}
 }

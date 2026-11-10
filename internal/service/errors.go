@@ -40,11 +40,11 @@ var (
 	// from ErrUserHasActiveSub since 2026-10-03: the user has NOT paid
 	// anything yet, and the active-sub wording made a real subscriber
 	// believe checkout was impossible rather than "retry shortly".
-	ErrUserHasPendingOrder  = errors.New("you have an unfinished checkout in progress")
-	ErrPlanDowngrade        = errors.New("downgrade to a shorter billing cycle is not allowed with an active subscription")
-	ErrSubscriptionExists   = errors.New("subscription already exists for this user")
-	ErrAppNotFound          = errors.New("app not found")
-	ErrAppInactive          = errors.New("app is inactive")
+	ErrUserHasPendingOrder = errors.New("you have an unfinished checkout in progress")
+	ErrPlanDowngrade       = errors.New("downgrade to a shorter billing cycle is not allowed with an active subscription")
+	ErrSubscriptionExists  = errors.New("subscription already exists for this user")
+	ErrAppNotFound         = errors.New("app not found")
+	ErrAppInactive         = errors.New("app is inactive")
 
 	ErrPlanNotFound      = errors.New("plan not found")
 	ErrPlanInactive      = errors.New("plan is inactive")
@@ -80,18 +80,34 @@ var (
 	ErrInvalidAttribution = errors.New("invalid attribution")
 
 	// Chat proxy (POST /chat → LLM upstream, SSE).
-	ErrChatNotEnabled       = errors.New("chat is not enabled")
-	ErrChatNoAccess         = errors.New("active subscription with access to this app is required")
-	ErrChatUnknownModel     = errors.New("unknown chat model")
-	ErrChatModelNotAllowed  = errors.New("chat model is not allowed for the current plan")
-	ErrChatRequestShape     = errors.New("chat request shape is not supported by the selected model")
-	ErrChatModelNoVision    = errors.New("the selected model does not support image input")
-	ErrChatRateLimited      = errors.New("chat upstream rate limit exceeded")
-	ErrChatUpstreamError    = errors.New("chat upstream error")
-	ErrChatUpstreamRejected = errors.New("chat request rejected by upstream")
+	ErrChatNotEnabled      = errors.New("chat is not enabled")
+	ErrChatNoAccess        = errors.New("active subscription with access to this app is required")
+	ErrChatUnknownModel    = errors.New("unknown chat model")
+	ErrChatModelNotAllowed = errors.New("chat model is not allowed for the current plan")
+	ErrChatRequestShape    = errors.New("chat request shape is not supported by the selected model")
+	ErrChatModelNoVision   = errors.New("the selected model does not support image input")
+	// ErrChatCapabilityUnsupported: T8 —— 请求要的能力（图片 / 显式推理档位）
+	// 在已发布目录里**没有任何部署能承载**。请求从未出站、零预占、零计费，
+	// 因此必须与「上游拒绝」（ErrChatUpstreamRejected，502）严格分开：这是
+	// 客户端可修的能力不兼容，重试同一个请求不会成功。
+	ErrChatCapabilityUnsupported = errors.New("the selected model has no deployment that can serve this request")
+	ErrChatRateLimited           = errors.New("chat upstream rate limit exceeded")
+	ErrChatUpstreamError         = errors.New("chat upstream error")
+	ErrChatUpstreamRejected      = errors.New("chat request rejected by upstream")
+	// ErrChatRequestLimited: /chat 的**本地**限制拒绝（业务速率 RPM/TPM、
+	// 并发上限、额度/余额不足、Key 预算耗尽）。这类请求**从未出站** ——
+	// 与 ErrChatRateLimited（上游 429，文案说的是上游）严格分开：客户端
+	// 看到的说明必须说清是本地限制，绝不能把一个没出站的请求说成上游错误。
+	ErrChatRequestLimited = errors.New("chat request rejected by a usage limit")
 	// ErrChatNotReady: 服务未就绪（目录冷启动无快照 / 默认模型未发布）。
 	// 映射 503 + Retry-After，与 403（无权限）严格区分。
 	ErrChatNotReady = errors.New("chat service is temporarily unavailable")
+	// ErrChatConfigUnavailable: 服务端**配置**不可用（已发布目录里该模型
+	// 没有可调度路由、权益策略带未实现的超额模式……）。它与
+	// ErrChatUpstreamError（上游临时故障）和 ErrChatNotReady（目录未就绪）
+	// 严格分开：配置错误**不会自己恢复**，重试没有意义，因此不承诺
+	// Retry-After（T7）。
+	ErrChatConfigUnavailable = errors.New("chat configuration unavailable")
 
 	// Usage analytics (/user/usage/heartbeat + /admin/stats/*). Wrapped
 	// with a detail message (fmt.Errorf %w); handlers map it to 400.
@@ -137,6 +153,33 @@ func (e *ChatUpstreamRejection) Error() string {
 }
 
 func (e *ChatUpstreamRejection) Unwrap() error { return ErrChatUpstreamRejected }
+
+// ChatLimitError is the /chat LOCAL limit rejection (business RPM/TPM,
+// concurrency cap, quota/balance exhaustion, Key budget): it carries the
+// business code so the client can tell the classes apart (the /chat
+// envelope has no separate code field — the HTTP status is the code and
+// the message names the class).
+//
+// It unwraps to BOTH sentinels: ErrChatRequestLimited is the accurate one
+// for a local limit, and ErrChatRateLimited stays as the compatibility
+// bridge so every existing "429 → back off and retry" client path keeps
+// working unchanged (the local limit is a 429 for the client either way).
+type ChatLimitError struct {
+	// Code is the business code: rate_limited / insufficient_capacity /
+	// quota_exceeded / insufficient_balance.
+	Code string
+	// RetryAfterSeconds is known rate recovery time; nonpositive means unknown.
+	RetryAfterSeconds int
+}
+
+func (e *ChatLimitError) Error() string {
+	return fmt.Sprintf("%s (%s)", ErrChatRequestLimited, e.Code)
+}
+
+// Unwrap exposes both sentinels (Go multi-error unwrapping).
+func (e *ChatLimitError) Unwrap() []error {
+	return []error{ErrChatRequestLimited, ErrChatRateLimited}
+}
 
 // AdminParamError carries a client-safe validation message for the
 // dashboard admin API (invalid tz / empty search query / ...). It unwraps

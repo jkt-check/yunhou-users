@@ -76,14 +76,15 @@ func TestZeroChargeSettleAppendsChargeRow(t *testing.T) {
 	if req.Status != domain.ReqSettled || req.SettledMicros == nil || *req.SettledMicros != 0 {
 		t.Errorf("request = %s/%v, want settled/0", req.Status, req.SettledMicros)
 	}
+	usage, err := s.LoadUsageRecords(ctx, reqID)
+	if err != nil || len(usage) != 1 {
+		t.Fatalf("settled usage = %+v, err = %v; want one record", usage, err)
+	}
 	// 重复投递：唯一键撞 CodeConflict，账本仍只有一条 charge。
 	uow, _ := s.Begin(ctx)
 	err = s.Settle(ctx, uow, domain.SettleCommand{
-		RequestID: reqID,
-		Usage: domain.UsageRecord{
-			RequestID: reqID, AttemptID: uuid.NewString(), Source: domain.UsageReported,
-			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(0)), OutputTokens: ptr(int64(0))},
-		},
+		RequestID:    reqID,
+		Usage:        usage[0],
 		ChargeMicros: 0, SettledAt: time.Now().UTC(),
 	})
 	_ = uow.Rollback(ctx)
@@ -412,13 +413,15 @@ func TestCorrectSettlementDebitPreservesHistory(t *testing.T) {
 	reqID, attID := settledRequest(t, s, f, w5, ww, wm, 100_000, 60_000)
 	uow, _ := s.Begin(ctx)
 	in, out := int64(30), int64(12)
+	correctedTokens := in + out
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
 		Corrected: domain.UsageRecord{
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: &in, OutputTokens: &out},
 		},
-		CorrectedMicros: 95_000, Reason: "provider invoice arrived",
+		CorrectedMicros: 95_000, CorrectedTokens: &correctedTokens,
+		Reason:          "provider invoice arrived",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -500,6 +503,7 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 
 	reqID, attID := settledRequest(t, s, f, w5, ww, wm, 100_000, 60_000)
 	key := "corr-" + uuid.NewString()
+	correctedTokens := int64(11)
 	correct := func() error {
 		uow, _ := s.Begin(ctx)
 		err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
@@ -508,7 +512,8 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 				AttemptID: attID, Source: domain.UsageReported,
 				Buckets: domain.UsageBuckets{InputTokens: ptr(int64(8)), OutputTokens: ptr(int64(3))},
 			},
-			CorrectedMicros: 25_000, Reason: "evidence below estimate",
+			CorrectedMicros: 25_000, CorrectedTokens: &correctedTokens,
+			Reason:          "evidence below estimate",
 			OperatorSubject: "system:recovery", IdempotencyKey: key,
 			At: time.Now().UTC(),
 		})
@@ -542,15 +547,15 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 	if n != 2 {
 		t.Errorf("entries = %d, want 2 (replay applied once)", n)
 	}
-	// 无操作修正拒绝（相等金额不追加空历史）——delta 以当前已结算额为基准。
+	// Identical money AND evidence is a no-op; changed metering is not.
 	uow, _ := s.Begin(ctx)
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
 		Corrected: domain.UsageRecord{
 			AttemptID: attID, Source: domain.UsageReported,
-			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(8))},
+			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(8)), OutputTokens: ptr(int64(3))},
 		},
-		CorrectedMicros: 25_000, Reason: "noop",
+		CorrectedMicros: 25_000, CorrectedTokens: &correctedTokens, Reason: "noop",
 		OperatorSubject: "op", IdempotencyKey: "corr-noop-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -561,6 +566,8 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 
 	// 链式修正到 0 = 全额作废 → 冲正分录（reversal 当前剩余效应 25k，
 	// 指向原 charge）；窗口/预算归零；重建口径 charge − credit − reversal。
+	// 证据说"零消费" → 修正后的 token 总量也是 0（绝对值，存储效果是净差额）。
+	zeroTokens := int64(0)
 	uow, _ = s.Begin(ctx)
 	err = s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -568,7 +575,7 @@ func TestCorrectSettlementCreditAndIdempotency(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(0)), OutputTokens: ptr(int64(0))},
 		},
-		CorrectedMicros: 0, Reason: "provider confirmed zero consumption",
+		CorrectedMicros: 0, CorrectedTokens: &zeroTokens, Reason: "provider confirmed zero consumption",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-void-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -637,6 +644,7 @@ func TestCorrectSettlementOverageAndJobResolution(t *testing.T) {
 	// 真实证据超出预占：120k > 100k → 补差 20k + settlement_overage 异常
 	// （不隐藏负差额）。原 crash_recovery 任务先被证据 resolve，随后被新
 	// reason 的异常重开为 pending（detail 保留全部历史）。
+	overageTokens := int64(100) // 50 + 50（与修正证据的桶一致）
 	uow, _ = s.Begin(ctx)
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -644,7 +652,7 @@ func TestCorrectSettlementOverageAndJobResolution(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(50)), OutputTokens: ptr(int64(50))},
 		},
-		CorrectedMicros: 120_000, Reason: "invoice exceeds hold",
+		CorrectedMicros: 120_000, CorrectedTokens: &overageTokens, Reason: "invoice exceeds hold",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -846,6 +854,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 
 	// 修正后仍超占（130k > 100k）：超占任务必须仍然 pending 且 detail 合并
 	// （修复前：步骤 8 误 resolve + 同 reason 不重开 → 异常静默消失）。
+	overageTokens := int64(120) // 60 + 60（与修正证据的桶一致）
 	uow, _ = s.Begin(ctx)
 	err := s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -853,7 +862,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(60)), OutputTokens: ptr(int64(60))},
 		},
-		CorrectedMicros: 130_000, Reason: "invoice higher still",
+		CorrectedMicros: 130_000, CorrectedTokens: &overageTokens, Reason: "invoice higher still",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -877,6 +886,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 	}
 
 	// 修正回到预占之内（90k ≤ 100k）：异常被本次修正处置 → resolve 带说明。
+	withinHoldTokens := int64(80)
 	uow, _ = s.Begin(ctx)
 	err = s.CorrectSettlement(ctx, uow, CorrectionCommand{
 		RequestID: reqID,
@@ -884,7 +894,7 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 			AttemptID: attID, Source: domain.UsageReported,
 			Buckets: domain.UsageBuckets{InputTokens: ptr(int64(40)), OutputTokens: ptr(int64(40))},
 		},
-		CorrectedMicros: 90_000, Reason: "final invoice within hold",
+		CorrectedMicros: 90_000, CorrectedTokens: &withinHoldTokens, Reason: "final invoice within hold",
 		OperatorSubject: "system:recovery", IdempotencyKey: "corr-" + uuid.NewString(),
 		At: time.Now().UTC(),
 	})
@@ -904,11 +914,8 @@ func TestCorrectSettlementOverageStaysVisible(t *testing.T) {
 	}
 }
 
-// 评审轮1 Important-1：CorrectSettlement 对 charge_source='wallet' 的请求
-// 显式拒绝（CodeInvalidInput）——wallet 的 settled_micros 是 micromoney、
-// 入场无 key-budget 预占、更正需要钱包补偿分录，在完整 wallet 分支落地前
-// 不得走通用更正通道腐蚀钱包状态。
-func TestCorrectSettlementRejectsWallet(t *testing.T) {
+// Wallet corrections must require the TPM total whenever buckets are known.
+func TestCorrectSettlementWalletRequiresTokenTotal(t *testing.T) {
 	_, s := testDB(t)
 	ctx := context.Background()
 	f := seedFixture(t, s, false)
@@ -958,7 +965,7 @@ func TestCorrectSettlementRejectsWallet(t *testing.T) {
 	})
 	_ = uow2.Rollback(ctx)
 	if domain.CodeOf(err) != domain.CodeInvalidInput {
-		t.Fatalf("wallet correction: err = %v, want invalid_input (wallet 更正通道未接线,必须显式拒绝)", err)
+		t.Fatalf("wallet correction without token total: err = %v, want invalid_input", err)
 	}
 
 	// 拒绝必须零副作用：请求结算额与钱包派生余额保持原样。
@@ -1025,5 +1032,68 @@ func TestReleaseKeyBudgetGuardConflict(t *testing.T) {
 	}
 	if req.Status == domain.ReqReleased {
 		t.Errorf("status = %q, want not released after guard conflict", req.Status)
+	}
+}
+
+// TestReconciliationJob_ManualOnlyReasonTakesOver — 一个仍挂起的核对任务
+// （reason=unknown_usage）后来发现属于"只能人工处理"的异常类别时，任务的
+// reason 必须被纠正为该异常原因：否则恢复 worker 会继续按证据驱动路径反复
+// 重放并重复告警（no-re-drive 保证失效）。detail 的既有审计内容不得丢失。
+func TestReconciliationJob_ManualOnlyReasonTakesOver(t *testing.T) {
+	_, s := testDB(t)
+	ctx := context.Background()
+	f := seedFixture(t, s, true)
+	w5, ww, wm := makeWindows(t, s, f.entID)
+
+	uow, _ := s.Begin(ctx)
+	adm, err := s.Reserve(ctx, uow, reserveCmd(f, w5, ww, wm, 100_000))
+	if err != nil {
+		_ = uow.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().UTC().Add(24 * time.Hour)
+
+	// 第一次投递：证据驱动的原因（网关停放未知用量），带审计细节。
+	uow2, _ := s.Begin(ctx)
+	if err := s.EnqueueReconciliationJobTx(ctx, uow2, EnqueueReconciliationCommand{
+		RequestID: &adm.RequestID, Reason: "unknown_usage",
+		Detail:   json.RawMessage(`{"schema_version":1,"audit":"first-delivery"}`),
+		Deadline: deadline,
+	}); err != nil {
+		_ = uow2.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第二次投递：只能人工处理的异常原因（缺预占）。
+	uow3, _ := s.Begin(ctx)
+	if err := s.EnqueueReconciliationJobTx(ctx, uow3, EnqueueReconciliationCommand{
+		RequestID: &adm.RequestID, Reason: "missing_reservation",
+		Detail:   json.RawMessage(`{"schema_version":1,"outcome":"missing_reservation"}`),
+		Deadline: deadline,
+	}); err != nil {
+		_ = uow3.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := uow3.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var reason, detail string
+	if err := s.db.QueryRow(
+		`SELECT reason, detail::text FROM inference_reconciliation_jobs WHERE request_id = $1`,
+		adm.RequestID).Scan(&reason, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "missing_reservation" {
+		t.Errorf("job reason = %q, want missing_reservation (人工原因必须接管)", reason)
+	}
+	if !strings.Contains(detail, "first-delivery") {
+		t.Errorf("job detail = %s, want the first delivery's audit detail preserved", detail)
 	}
 }

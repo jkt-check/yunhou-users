@@ -140,6 +140,21 @@ func mapError(op string, err error) error {
 	return fmt.Errorf("postgres: %s: %w", op, err)
 }
 
+// IsJSONBInputError recognizes errors at a known raw-JSON input boundary.
+// It must not be used to suppress failures of unrelated storage operations.
+func IsJSONBInputError(err error) bool {
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) {
+		return false
+	}
+	switch pqErr.Code {
+	case "22P02", "22P05", "22003", "22021":
+		return true
+	default:
+		return false
+	}
+}
+
 // itoa renders a small positive int for LIMIT clauses (page sizes are
 // validated bounds, never user text — no injection surface).
 func itoa(n int) string {

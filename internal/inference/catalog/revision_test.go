@@ -234,3 +234,69 @@ func TestPayloadRoundTrip_UndeclaredInputModalitiesStayEmpty(t *testing.T) {
 		t.Error("undeclared model must accept images after snapshot round trip（default-on）")
 	}
 }
+
+// --- T3: provider 停用与发布快照的权威性 ---
+
+// TestSnapshot_DisabledProviderRemovesDeploymentAndSellability：
+// 已发布快照里 provider 被停用时，它的部署不再算作可用部署（列表与实际
+// 调度必须一致）；只挂停用 provider 的模型不可售；另一个 active provider
+// 仍然让模型保持可售。
+func TestSnapshot_DisabledProviderRemovesDeploymentAndSellability(t *testing.T) {
+	m := sampleModel("glm-4.6")
+	m.Lifecycle = domain.LifecycleActive
+	provOn := domain.Provider{ID: "prov-on", Code: "on", DisplayName: "On",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}
+	provOff := domain.Provider{ID: "prov-off", Code: "off", DisplayName: "Off",
+		AccessType: domain.AccessOfficialAPI, Status: "disabled"}
+	depOn := sampleDeployment()
+	depOn.ID, depOn.ProviderID = "dep-on", "prov-on"
+	depOff := sampleDeployment()
+	depOff.ID, depOff.ProviderID = "dep-off", "prov-off"
+	routeOn := sampleRoute()
+	routeOn.ID, routeOn.DeploymentID = "route-on", "dep-on"
+	routeOff := sampleRoute()
+	routeOff.ID, routeOff.DeploymentID = "route-off", "dep-off"
+
+	parse := func(provs []domain.Provider, deps []domain.Deployment, routes []domain.ModelRoute) *catalog.Snapshot {
+		t.Helper()
+		raw := catalog.BuildCatalogPayload([]domain.Model{m}, provs, deps, routes)
+		snap, err := catalog.ParseSnapshot(&domain.ConfigRevision{Payload: domain.ExtensionConfig{Raw: raw}})
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return snap
+	}
+
+	// 两个 provider：一个 active、一个 disabled。
+	snap := parse([]domain.Provider{provOn, provOff}, []domain.Deployment{depOn, depOff},
+		[]domain.ModelRoute{routeOn, routeOff})
+	active := snap.ActiveDeployments("glm-4.6")
+	if len(active) != 1 || active[0].ID != "dep-on" {
+		t.Fatalf("ActiveDeployments = %+v, want only dep-on（停用 provider 的部署不算可用部署）", active)
+	}
+	if !snap.Sellable("glm-4.6") {
+		t.Error("a model still served by an active provider must stay sellable")
+	}
+
+	// 只挂停用 provider 的模型 → 不可售（列表不得展示无可用部署的模型）。
+	snap = parse([]domain.Provider{provOff}, []domain.Deployment{depOff}, []domain.ModelRoute{routeOff})
+	if snap.Sellable("glm-4.6") {
+		t.Error("a model served only by a disabled provider must not be sellable")
+	}
+	if len(snap.ActiveDeployments("glm-4.6")) != 0 {
+		t.Errorf("ActiveDeployments = %+v, want 0", snap.ActiveDeployments("glm-4.6"))
+	}
+}
+
+// TestParseSnapshot_RejectsDeploymentWithUnknownProvider：发布快照是权威
+// 事实源——部署引用了快照里不存在的 provider 时，整份修订必须拒绝加载
+// （不得加载半个版本，也不得把 provider 当成 active 放行）。
+func TestParseSnapshot_RejectsDeploymentWithUnknownProvider(t *testing.T) {
+	m := sampleModel("glm-4.6")
+	dep := sampleDeployment() // ProviderID "prov-1"
+	raw := catalog.BuildCatalogPayload([]domain.Model{m}, nil, []domain.Deployment{dep},
+		[]domain.ModelRoute{sampleRoute()})
+	if _, err := catalog.ParseSnapshot(&domain.ConfigRevision{Payload: domain.ExtensionConfig{Raw: raw}}); err == nil {
+		t.Fatal("a deployment referencing an unknown provider must fail the whole parse")
+	}
+}

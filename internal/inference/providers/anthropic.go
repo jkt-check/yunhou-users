@@ -37,8 +37,15 @@ func (a *AnthropicMessages) Protocol() domain.Protocol { return domain.ProtocolA
 // Capabilities implements Adapter. Anthropic streams report usage via
 // message_start / message_delta — explicitly part of the protocol, so
 // streaming usage is always requested by construction.
+//
+// Images: the Messages protocol carries image blocks natively and the
+// adapter translates the internal image shape into them.
+// ReasoningEfforts: EMPTY on purpose — the Messages protocol has no
+// effort knob (its reasoning dial is budget_tokens, a different axis). A
+// requested effort therefore cannot be expressed and is refused before
+// dispatch instead of being folded into a budget.
 func (a *AnthropicMessages) Capabilities() domain.AdapterCapabilities {
-	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true}
+	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true, Images: true}
 }
 
 // Inclusion implements Adapter: Anthropic's input_tokens does NOT include
@@ -62,6 +69,15 @@ const anthropicVersionHeader = "2023-06-01"
 // with the stream flag and the gateway-forced output cap as parameters.
 func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 	r := call.Request
+	// T8: the Messages protocol has NO reasoning-effort knob (its dial is
+	// budget_tokens). An explicitly requested level cannot be expressed —
+	// refuse it loudly instead of folding it into the budget (the routing
+	// layer already skips such candidates; this is the adapter's own
+	// defensive refusal).
+	if r.ReasoningEffort != "" {
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: the anthropic_messages protocol cannot express a reasoning effort level ("+r.ReasoningEffort+")")
+	}
 	maxTokens := call.OutputCap
 	if maxTokens <= 0 {
 		return nil, domain.NewError(domain.CodeInvalidInput,
@@ -92,9 +108,9 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 				blocks = append(blocks, map[string]any{"type": "text", "text": m.Content})
 			}
 			for _, tc := range m.ToolCalls {
-				var input any
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil || input == nil {
-					input = map[string]any{}
+				input, err := toolArgumentObject(tc.Function.Arguments)
+				if err != nil {
+					return nil, domain.NewError(domain.CodeInvalidInput, err.Error())
 				}
 				blocks = append(blocks, map[string]any{
 					"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input,
@@ -187,14 +203,16 @@ func (a *AnthropicMessages) BuildPayload(call *Call) ([]byte, error) {
 		// 收）。预算下调到 cap 之内；Anthropic 要求 budget_tokens >= 1024 且
 		// 严格小于 max_tokens，cap 容不下合法预算时显式 400（能力错误，客
 		// 户提高 max_tokens 或关闭 thinking）。
-		if maxTokens <= anthropicMinThinkingBudget+1 {
+		if maxTokens <= anthropicMinThinkingBudget {
 			return nil, domain.NewError(domain.CodeInvalidInput,
-				fmt.Sprintf("providers: anthropic thinking requires max_tokens > %d (budget floor %d); raise max_tokens or disable thinking", anthropicMinThinkingBudget+1, anthropicMinThinkingBudget))
+				fmt.Sprintf("providers: anthropic thinking requires max_tokens > %d (budget floor %d); raise max_tokens or disable thinking", anthropicMinThinkingBudget, anthropicMinThinkingBudget))
 		}
 		if budget > maxTokens-1 {
 			budget = maxTokens - 1
 		}
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	} else if r.ThinkingEnabled != nil {
+		payload["thinking"] = map[string]any{"type": "disabled"}
 	}
 	// Passthrough mapping: temperature/top_p/stop map onto Anthropic's
 	// names; parallel_tool_calls=false folds into tool_choice as
@@ -298,12 +316,27 @@ func translateAnthropicToolChoice(raw json.RawMessage) (any, error) {
 }
 
 // AuthHeaders implements Adapter.
-func (a *AnthropicMessages) AuthHeaders(secret []byte) map[string]string {
+func (a *AnthropicMessages) AuthHeaders(auth Auth) (map[string]string, error) {
 	h := map[string]string{"anthropic-version": anthropicVersionHeader}
-	if len(secret) > 0 {
-		h["x-api-key"] = string(secret)
+	switch auth.Type {
+	case "", AuthTypeAPIKey, AuthTypeService:
+		// 静态密钥（api_key/service）走 anthropic 的 API-key 槽。
+		if auth.Token != "" {
+			h["x-api-key"] = auth.Token
+		}
+	case AuthTypeOAuth:
+		// anthropic_messages 的明确支持集里没有 OAuth 供应商：仓库自有的
+		// OAuth 连接器说 OpenAI 兼容协议，而 Anthropic 官方 claude.ai OAuth
+		// 需要本部署不发的 anthropic-beta 头。凭据能解包不等于该协议兼容，
+		// 因此明确拒绝（不出站、不猜头槽）——绝不把 OAuth 令牌塞进 API-key
+		// 槽，那等于把解包成功当成任意供应商 OAuth 已兼容。
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: anthropic_messages does not support oauth credentials")
+	default:
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: anthropic_messages does not support auth type "+auth.Type)
 	}
-	return h
+	return h, nil
 }
 
 // WrapStream implements Adapter (see anthropic_stream.go).
@@ -354,17 +387,20 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	var text strings.Builder
 	var reasoning strings.Builder
 	var toolCalls []any
+	var argumentBytes int
+	var reordered bool
 	for _, b := range resp.Content {
 		switch b.Type {
 		case "text":
+			if len(toolCalls) > 0 && b.Text != "" {
+				reordered = true
+			}
 			text.WriteString(b.Text)
 		case "thinking":
 			reasoning.WriteString(b.Thinking)
 		case "tool_use":
+			argumentBytes += len(b.Input)
 			args := string(b.Input)
-			if args == "" {
-				args = "{}"
-			}
 			toolCalls = append(toolCalls, map[string]any{
 				"id": b.ID, "type": "function",
 				"function": map[string]any{"name": b.Name, "arguments": args},
@@ -390,26 +426,10 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	}
 	result := &NonStreamResult{UpstreamRequestID: resp.ID}
 	// Visible answer size feeds the estimate path when usage is absent —
-	// same 口径 as the streaming tap (content + reasoning bytes).
-	result.ContentBytes = int64(text.Len() + reasoning.Len())
+	// same 口径 as the streaming tap (text + reasoning + tool arguments).
+	result.ContentBytes = int64(text.Len() + reasoning.Len() + argumentBytes)
 	if resp.Usage != nil {
 		u := resp.Usage
-		usage := map[string]any{
-			"prompt_tokens":     derefInt64(u.InputTokens),
-			"completion_tokens": derefInt64(u.OutputTokens),
-			"total_tokens":      derefInt64(u.InputTokens) + derefInt64(u.OutputTokens),
-		}
-		// Cache buckets ride the wire so the client surfaces (Task 13) can
-		// render them natively: cached_tokens in prompt_tokens_details
-		// (OpenAI-conventional), cache creation via the extension key
-		// (OpenAI consumers ignore unknown keys).
-		if u.CacheReadInputTokens != nil {
-			usage["prompt_tokens_details"] = map[string]any{"cached_tokens": *u.CacheReadInputTokens}
-		}
-		if u.CacheCreationTokens != nil {
-			usage["cache_creation_input_tokens"] = *u.CacheCreationTokens
-		}
-		out["usage"] = usage
 		result.UsageReported = true
 		result.Usage = domain.UsageBuckets{
 			InputTokens:      u.InputTokens,
@@ -417,8 +437,12 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 			CacheReadTokens:  u.CacheReadInputTokens,
 			CacheWriteTokens: u.CacheCreationTokens,
 		}
+		out["usage"] = openAIUsageShape(result.Usage, nil)
 		result.UsageRaw = marshalAnthropicRawUsage(u.InputTokens, u.OutputTokens,
 			u.CacheReadInputTokens, u.CacheCreationTokens)
+	}
+	if reordered {
+		return result, fmt.Errorf("providers: anthropic text after tool_use cannot be translated faithfully")
 	}
 	payload, err := json.Marshal(out)
 	if err != nil {
@@ -426,13 +450,6 @@ func (a *AnthropicMessages) DecodeNonStream(body []byte) (*NonStreamResult, erro
 	}
 	result.Payload = payload
 	return result, nil
-}
-
-func derefInt64(p *int64) int64 {
-	if p == nil {
-		return 0
-	}
-	return *p
 }
 
 // marshalAnthropicRawUsage renders the schema-versioned raw_usage document

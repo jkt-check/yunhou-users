@@ -315,18 +315,20 @@ func (s *Store) UpdateUpstreamAccountQuota(ctx context.Context, id string, q dom
 // ListUpstreamAccountsForHealth returns the accounts the health worker
 // probes this pass: active accounts, plus cooling accounts whose updated_at
 // is at/before cooldownDueBefore (冷却到期复测), plus refreshing accounts
-// (刷新中健康复核). Bounded and deterministically ordered.
-func (s *Store) ListUpstreamAccountsForHealth(ctx context.Context, cooldownDueBefore time.Time, limit int) ([]domain.UpstreamAccount, error) {
+// (刷新中健康复核). Bounded and keyset-paginated by UUID; an empty cursor
+// starts at the beginning of the eligible pool.
+func (s *Store) ListUpstreamAccountsForHealth(ctx context.Context, cooldownDueBefore time.Time, afterAccountID string, limit int) ([]domain.UpstreamAccount, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
 	var rows []upstreamAccountRow
 	if err := s.db.SelectContext(ctx, &rows,
 		`SELECT a.* FROM inference_upstream_accounts a
-		 WHERE a.status = 'active'
+		 WHERE (a.status = 'active'
 		    OR (a.status = 'cooldown' AND a.updated_at <= $1)
-		    OR a.status = 'refreshing'
-		 ORDER BY a.id LIMIT $2`, cooldownDueBefore, limit); err != nil {
+		    OR a.status = 'refreshing')
+		   AND (NULLIF($2, '')::uuid IS NULL OR a.id > NULLIF($2, '')::uuid)
+		 ORDER BY a.id LIMIT $3`, cooldownDueBefore, afterAccountID, limit); err != nil {
 		return nil, mapError("list accounts for health", err)
 	}
 	out := make([]domain.UpstreamAccount, 0, len(rows))

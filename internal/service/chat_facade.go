@@ -29,6 +29,7 @@ import (
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/gateway"
 	"github.com/yunhou/users/internal/inference/providers"
+	"github.com/yunhou/users/internal/inference/routing"
 	"github.com/yunhou/users/internal/model"
 )
 
@@ -40,6 +41,11 @@ type ChatGatewayFacade struct {
 	catalog      *catalog.Service
 	snapshots    gateway.SnapshotSource
 	defaultModel string
+	// capabilities answers "can this published model serve image input at
+	// all?" — the routing package's capability decision, i.e. the SAME one
+	// the dispatch path uses (T8). The legacy model picker must not
+	// advertise an image the dispatcher refuses.
+	capabilities routing.ImageCapabilityOracle
 
 	// lastNotReadyLog 节流「服务未就绪」ERROR 日志（unix 秒，≤1 条/30s），
 	// 避免目录故障期每个 /chat 请求刷一行。
@@ -56,7 +62,27 @@ type ChatGatewayFacade struct {
 // serving the last verified snapshot (评审修复 C1/I1：不得绕开 cache 直接
 // 打 store，否则哨兵不可达且每请求全量 SELECT+ParseSnapshot)。
 func NewChatGatewayFacade(gw *gateway.Service, resolver *access.Resolver, cat *catalog.Service, snapshots gateway.SnapshotSource, defaultModel string) *ChatGatewayFacade {
-	return &ChatGatewayFacade{gw: gw, resolver: resolver, catalog: cat, snapshots: snapshots, defaultModel: defaultModel}
+	return &ChatGatewayFacade{
+		gw: gw, resolver: resolver, catalog: cat, snapshots: snapshots, defaultModel: defaultModel,
+		capabilities: routing.ProductionImageCapability(),
+	}
+}
+
+// SetImageCapability wires the capability oracle (the routing service in
+// production) so the picker and the dispatcher share ONE decision. A nil
+// oracle falls back to the production adapter registry.
+func (f *ChatGatewayFacade) SetImageCapability(o routing.ImageCapabilityOracle) {
+	if o != nil {
+		f.capabilities = o
+	}
+}
+
+// imageCapability returns the capability oracle to use (never nil).
+func (f *ChatGatewayFacade) imageCapability() routing.ImageCapabilityOracle {
+	if f.capabilities != nil {
+		return f.capabilities
+	}
+	return routing.ProductionImageCapability()
 }
 
 // StreamChat implements the /chat service surface. The request always
@@ -120,6 +146,7 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 		return nil, err
 	}
 	out := make([]ChatModelInfo, 0, len(models))
+	capability := f.imageCapability() // 一次解析（每请求一次），不逐模型取
 	for _, m := range models {
 		provider := ""
 		if deps := snap.ActiveDeployments(m.ID); len(deps) > 0 {
@@ -127,19 +154,18 @@ func (f *ChatGatewayFacade) AllowedModels(ctx context.Context, userID, appID str
 				provider = pv.Code
 			}
 		}
-		mods := modalitiesOrDefault(m.InputModalities)
+		// T8: 透出的 input_modalities 必须与**派发**能力一致 —— 声明了
+		// image 但已发布部署没有能承载图片的协议时，不再 advertise image
+		// （picker 让客户发图、网关在准入前当场 400 是最坏的组合）。判据
+		// 来自 routing 的同一个能力判定，不另立规则。
+		mods := domain.AdvertisedModalities(m.InputModalities,
+			capability.SupportsImageInput(snap, m.ID))
 		out = append(out, ChatModelInfo{
 			ID: m.ID, DisplayName: m.DisplayName, Provider: provider,
 			Default: m.ID == f.defaultModel, InputModalities: mods,
 		})
 	}
 	return out, nil
-}
-
-// modalitiesOrDefault 透出归一：空 modalities = 缺省放行（["text","image"]，
-// 与网关视觉门控同口径），显式声明原样透出。统一走 domain 的单一归一点。
-func modalitiesOrDefault(mods []string) []string {
-	return domain.NormalizeInputModalities(mods)
 }
 
 func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID string, messages []model.ChatMessage, tools []json.RawMessage, thinkingEnabled *bool) (*http.Response, error) {
@@ -149,7 +175,7 @@ func (f *ChatGatewayFacade) streamChatModel(ctx context.Context, userID, modelID
 	// ErrNoVerifiedSnapshot 哨兵，瞬时刷新失败由 cache 兜底旧快照。
 	snap, err := f.snapshots.Current(ctx)
 	if err != nil {
-		f.logNotReadyErr(err) // 结构化 ERROR，30s 节流（评审修复 I2：冷启动不得静默）
+		f.logNotReadyErr(err)            // 结构化 ERROR，30s 节流（评审修复 I2：冷启动不得静默）
 		return nil, mapGatewayError(err) // ErrNoVerifiedSnapshot → ErrChatNotReady
 	}
 	if _, ok := snap.Model(f.defaultModel); !ok {
@@ -231,10 +257,30 @@ func (f *ChatGatewayFacade) notReadyLogDue() bool {
 // mapGatewayError projects the unified internal error codes onto the legacy
 // ErrChat* sentinels, keeping the /chat error shape (envelope + statuses)
 // byte-compatible.
+//
+// The LOCAL limit classes (business RPM/TPM, concurrency, quota/balance, Key
+// budget) map onto ChatLimitError: the request never reached an upstream,
+// so the client-facing message must say so — ErrChatRateLimited's wording
+// ("chat upstream rate limit exceeded") is reserved for a real upstream 429.
 func mapGatewayError(err error) error {
 	var qe *domain.QuotaExceededError
 	if errors.As(err, &qe) {
-		return ErrChatRateLimited // 额度不足 → 429 (设计 §9.1)
+		// 额度/预算耗尽 → 本地限制（429）。请求从未出站。
+		return &ChatLimitError{Code: string(domain.CodeQuotaExceeded)}
+	}
+	// T7:服务端**配置**不可用（目录里没有可调度路由、策略带未实现的超额
+	// 模式……）。它不是上游临时故障、也不是目录未就绪 —— 明确分开，客户端
+	// 看到的文案不说成「上游错误」，也不承诺 Retry-After（重试不会自愈）。
+	var cfgErr *gateway.ErrConfigUnavailable
+	if errors.As(err, &cfgErr) {
+		return ErrChatConfigUnavailable
+	}
+	// T8: 能力不兼容（图片 / 显式推理档位无部署可承载）—— 请求从未出站、
+	// 零预占、零计费，映射成 400 类的能力拒绝（不是「上游拒绝」的 502：
+	// 那会把责任推给上游并邀请一次注定失败的重试）。
+	var capErr *gateway.ErrCapabilityUnsupported
+	if errors.As(err, &capErr) {
+		return ErrChatCapabilityUnsupported
 	}
 	if errors.Is(err, catalog.ErrNoVerifiedSnapshot) {
 		return ErrChatNotReady // 目录冷启动无快照 → 503 (R7-N1)
@@ -268,8 +314,24 @@ func mapGatewayError(err error) error {
 		return ErrChatModelNotAllowed // 模型存在但无权益 → 403（对齐 legacy 文案）
 	case domain.CodeInvalidKey:
 		return ErrChatNoAccess
-	case domain.CodeQuotaExceeded, domain.CodeRateLimited, domain.CodeInsufficientCapacity:
-		return ErrChatRateLimited
+	case domain.CodeRateLimited:
+		// 业务速率限制（账户/策略/Key 的 RPM、账户级 TPM）→ 本地限制 429。
+		lim := &ChatLimitError{Code: string(domain.CodeRateLimited)}
+		var rateErr *domain.RateLimitError
+		if errors.As(err, &rateErr) {
+			lim.RetryAfterSeconds = rateErr.RetryAfterSeconds
+		}
+		return lim
+	case domain.CodeInsufficientCapacity:
+		// 并发上限已满（账户级权益策略 / Key 级 / 上游账号级）→ 本地限制 429。
+		return &ChatLimitError{Code: string(domain.CodeInsufficientCapacity)}
+	case domain.CodeQuotaExceeded, domain.CodeInsufficientBalance:
+		// 额度耗尽 / 余额不足 → 本地限制 429（绝不降级成 generic 502：
+		// 客户端必须知道是自己的额度问题，而不是"上游错误"）。
+		return &ChatLimitError{Code: string(domain.CodeOf(err))}
+	case domain.CodeServiceUnavailable:
+		// 准入存储不可用：明确的服务错误（503），绝不伪装成额度耗尽。
+		return ErrChatNotReady
 	case domain.CodeInvalidInput:
 		return ErrChatUpstreamRejected
 	default:

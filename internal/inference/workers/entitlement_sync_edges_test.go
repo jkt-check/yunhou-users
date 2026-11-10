@@ -111,6 +111,11 @@ func TestEntitlementSync_RacingRescheduledImmediately(t *testing.T) {
 		UserID: f.userID, ProductCode: model.ProductCodingPlan,
 		Reason: access.SyncReasonPaymentPaid, OrderID: orderID, PaymentID: "pay-race",
 	}, nil)
+	// Keep account creation outside the collision: the test targets the
+	// entitlement unique key, not an uncommitted account insert.
+	if _, err := f.store.EnsureBillingAccount(ctx, f.userID); err != nil {
+		t.Fatal(err)
+	}
 
 	rs := &racingStore{Store: f.store}
 	rs.collide = func() {

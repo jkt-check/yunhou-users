@@ -16,7 +16,7 @@ import (
 func anthropicCall(msgs []model.ChatMessage) *Call {
 	return &Call{
 		Deployment: &domain.Deployment{UpstreamModel: "claude-up", BaseURL: "https://api.anthropic.example.com"},
-		Secret:     []byte("sk-ant"),
+		Auth:       Auth{Type: AuthTypeAPIKey, Token: "sk-ant"},
 		Request:    &ChatRequest{Model: "claude-pro", Messages: msgs},
 		OutputCap:  64,
 	}

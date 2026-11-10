@@ -156,6 +156,20 @@ type OutboxMessage struct {
 // else most recently created; the 027 partial unique index guarantees at
 // most one active). sql.ErrNoRows when the user never had one.
 func (s *Store) GetSyncSubscription(ctx context.Context, userID, productCode string) (*access.SubscriptionState, error) {
+	return getSyncSubscription(ctx, s.db, userID, productCode, false)
+}
+
+// GetSyncSubscriptionTx protects the selected source against cancellation
+// until its entitlement convergence and outbox delivery commit.
+func (s *Store) GetSyncSubscriptionTx(ctx context.Context, w domain.UnitOfWork, userID, productCode string) (*access.SubscriptionState, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	return getSyncSubscription(ctx, tx, userID, productCode, true)
+}
+
+func getSyncSubscription(ctx context.Context, q sqlxExecutor, userID, productCode string, lock bool) (*access.SubscriptionState, error) {
 	var row struct {
 		ID          string     `db:"id"`
 		UserID      string     `db:"user_id"`
@@ -164,13 +178,16 @@ func (s *Store) GetSyncSubscription(ctx context.Context, userID, productCode str
 		Status      string     `db:"status"`
 		ExpiresAt   *time.Time `db:"expires_at"`
 	}
-	err := s.db.GetContext(ctx, &row, `
+	query := `
 		SELECT id, user_id, plan_id, product_code, status, expires_at
 		  FROM subscriptions
 		 WHERE user_id = $1 AND product_code = $2
 		 ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, created_at DESC
-		 LIMIT 1
-	`, userID, productCode)
+		 LIMIT 1`
+	if lock {
+		query += ` FOR SHARE`
+	}
+	err := q.QueryRowxContext(ctx, query, userID, productCode).StructScan(&row)
 	if err != nil {
 		return nil, mapError("outbox: sync subscription", err)
 	}
@@ -189,20 +206,37 @@ func (s *Store) GetSyncSubscription(ctx context.Context, userID, productCode str
 // when no qualifying order exists — the caller treats that as "no payment
 // evidence, grant nothing".
 func (s *Store) GetLatestPaidBenefitOrder(ctx context.Context, userID, planID string) (*access.OrderBenefitSnapshot, error) {
+	return getLatestPaidBenefitOrder(ctx, s.db, userID, planID, false)
+}
+
+// GetLatestPaidBenefitOrderTx holds the payment evidence stable through the
+// applying transaction, including refunds that only change the order row.
+func (s *Store) GetLatestPaidBenefitOrderTx(ctx context.Context, w domain.UnitOfWork, userID, planID string) (*access.OrderBenefitSnapshot, error) {
+	tx, err := sqlTx(w)
+	if err != nil {
+		return nil, err
+	}
+	return getLatestPaidBenefitOrder(ctx, tx, userID, planID, true)
+}
+
+func getLatestPaidBenefitOrder(ctx context.Context, q sqlxExecutor, userID, planID string, lock bool) (*access.OrderBenefitSnapshot, error) {
 	var row struct {
 		OrderID         string         `db:"id"`
 		PolicyVersionID string         `db:"benefit_policy_version_id"`
 		ModelIDs        pq.StringArray `db:"benefit_model_ids"`
 		GrantMode       string         `db:"benefit_grant_mode"`
 	}
-	err := s.db.GetContext(ctx, &row, `
+	query := `
 		SELECT id, benefit_policy_version_id, benefit_model_ids, benefit_grant_mode
 		  FROM orders
 		 WHERE user_id = $1 AND plan_id = $2 AND status = 'paid'
 		   AND benefit_policy_version_id IS NOT NULL
 		 ORDER BY updated_at DESC, created_at DESC
-		 LIMIT 1
-	`, userID, planID)
+		 LIMIT 1`
+	if lock {
+		query += ` FOR SHARE`
+	}
+	err := q.QueryRowxContext(ctx, query, userID, planID).StructScan(&row)
 	if err != nil {
 		return nil, mapError("outbox: latest paid benefit order", err)
 	}

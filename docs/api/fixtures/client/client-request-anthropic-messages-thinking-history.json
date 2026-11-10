@@ -1,5 +1,5 @@
 {
-  "_comment": "已知差异 ③：Anthropic Messages 历史中的 thinking/redacted_thinking 块——接受（200）但不回放（chat 形状上游无对应语义；交错 thinking 连续性不在本期）。工具与文本块不受影响。期望响应：正常完成。",
+  "_comment": "已知差异 ③（T8 兼容性修正）：Anthropic Messages 历史中的 thinking/redacted_thinking 块——**明确 400**（invalid_request_error）。签名思考无法忠实回放：Anthropic 的思考块必须连同上游签发的 signature 一起回传，本网关的内部形状承载不了签名，伪造空签名更糟；本期也不建立通用无损原生透传层。旧行为是「接受（200）但不回放」，那是兼容性修正 —— 客户端回传的内容被静默吞掉，现在改为出站前明确拒绝（零准入、零派发）。去掉本文件里的 thinking 块后，同一份工具历史照常工作且 tool_use ID 逐字保留（见 kaya_client_contract_test.go 的两个用例）。",
   "model": "claude-pro",
   "max_tokens": 256,
   "messages": [

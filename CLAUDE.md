@@ -103,6 +103,7 @@ All repos are interface-based (`repo.UserRepo`, etc.) for testability. Handler t
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | (empty) | Not consumed by the running redirect flow — `/auth/github/*` reads each app's GitHub OAuth App credentials from `apps.config.oauth_providers.github` in the DB. Safe to leave blank. |
 | `OAUTH_STATE_SECRET` | Yes | (required) | HMAC key for the OAuth `state` parameter (`/auth/{github,wechat}/redirect` + `/auth/{github,wechat}/callback`). The state binding is provider-agnostic — both flows share `util.IssueOAuthState` and bind `(app_id, callback_index)`. Server-side only — multi-instance deployments must share the same value. **Minimum 32 characters** — `Config.Validate` rejects shorter values. Generate with `openssl rand -hex 32`. |
 | `PAYPAL_L3_E2E_MODE` | No | (empty) | Dev-only gate for `POST /test/login?plan_id=<plan-id>`. `1` enables the endpoint; any other value (or unset) makes the handler return 404. Every enabled request must supply an explicit Plan ID. Used by `tests/e2e-ui/` to mint JWTs without OAuth. |
+| `INFERENCE_ACCOUNT_RPM` | No | `120` | Global per-billing-account requests-per-minute limit, enforced in the business admission together with the selected policy's `rpm_limit` and the customer Key's `rpm_limit` (all three are simultaneous hard limits). Counted in PostgreSQL (rolling 60s window) so all instances/Keys and both `/chat` and `/v1` share one account counter. `0` disables the account-level limit. |
 | `DEEPSEEK_API_KEY` | No (empty = chat disabled) | (empty) | Server-side DeepSeek API key backing `POST /chat`. Empty = endpoint returns 404 (same convention as empty webhook secrets). Consumer apps never see it — they call `/chat` with a user JWT. |
 | `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com` | OpenAI-compatible API origin; ChatService appends `/chat/completions`. |
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model name sent in the upstream `chat.completions` body. |
@@ -119,9 +120,20 @@ JSON business endpoints generally return:
 - `data`: response payload on success, null on error
 - `message`: null on success, error description on error
 
-Exceptions: `GET /.well-known/jwks.json` returns a raw JWKS object, while successful OAuth redirect/callback endpoints return HTTP 302 redirects rather than JSON.
+Exceptions: `GET /.well-known/jwks.json` returns a raw JWKS object, while successful OAuth redirect/callback endpoints return HTTP 302 redirects rather than JSON. The `/v1/*` standard-protocol surface is also an exception: it renders **each protocol's native shapes** (OpenAI `{"error":{"message","type","code"}}`, Anthropic `{"type":"error","error":{"type","message"}}`) and never the management envelope — including the rejections of the generic middleware (the per-IP abuse guard answers with the protocol-native shape, not `{code,data,message}`).
 
 ## Endpoints
+
+**Business rate limits (RPM/TPM) are enforced in the business admission, not in the
+auth middleware** (Task 4). The global account RPM (`INFERENCE_ACCOUNT_RPM`), the
+selected entitlement policy's `rpm_limit` and the customer Key's `rpm_limit` are three
+simultaneous hard limits; the policy `tpm_limit` is an account-level token limit
+(rolling 60s settled tokens + all in-flight reservations). The counting is persistent in
+PostgreSQL (`inference_rate_reservations`), so every instance, every Key and both
+`/chat` and `/v1` share one account counter; switching plans never resets the minute.
+A rate rejection is HTTP 429 `rate_limited` — strictly separate from the monetary
+`quota_exceeded`, so money/PAYG can never buy past RPM/TPM. A storage outage fails
+closed with HTTP 503 `service_unavailable` (never a fake quota exhaustion).
 
 **Public** (rate-limited 10/s burst 20 per IP):
 - `GET /.well-known/jwks.json`, `POST /auth/refresh`, `POST /auth/logout`

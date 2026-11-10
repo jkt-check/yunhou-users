@@ -227,3 +227,179 @@ func TestOpenAPI_ChatCompletionsDocumentsReasoningContent(t *testing.T) {
 		t.Error("ChatCompletionsRequest messages item must document reasoning_content")
 	}
 }
+
+// TestOpenAPI_ReasoningEffortContract pins the T8 effort contract:
+//
+//   - the chat-completions surface exposes the explicit `reasoning_effort`
+//     field (the level travels verbatim upstream — never folded into
+//     medium);
+//   - the Responses surface's `minimal` is the LOWEST REASONING LEVEL, not
+//     "reasoning off" — only `none` turns reasoning off. The stale
+//     "none/minimal → 关闭推理" wording contradicts the shipped code, so
+//     it is pinned here as a drift guard.
+func TestOpenAPI_ReasoningEffortContract(t *testing.T) {
+	doc := readOpenAPI(t)
+	if !strings.Contains(doc, "reasoning_effort") {
+		t.Error("openapi missing the reasoning_effort field (chat completions request)")
+	}
+	if strings.Contains(doc, "none/minimal") {
+		t.Error("openapi still documents the stale minimal semantics (none/minimal → 关闭推理); " +
+			"minimal is the lowest reasoning level, only none turns reasoning off")
+	}
+}
+
+// TestOpenAPI_T9ProbePreviewAndCapabilityContract pins the T9 contract in
+// the OpenAPI spec — the three distinctions the probe makes, the publish
+// preview's issue/summary shape, and the capability fields /chat/models
+// appends. Every new enum and response field must be documented here
+// (全局约定：新增枚举、响应字段和错误必须同步 OpenAPI).
+func TestOpenAPI_T9ProbePreviewAndCapabilityContract(t *testing.T) {
+	doc := readOpenAPI(t)
+	// 新增的三个路径必须留档。
+	for _, path := range []string{
+		"/admin/deployments/{id}/probe:",
+		"/admin/catalog/publish:",
+		"/chat/models:",
+	} {
+		if !strings.Contains(doc, path) {
+			t.Errorf("openapi missing path %s", path)
+		}
+	}
+	// 探测的三件事：凭据材料测试 / 指定探测 / 本次未做真实推理。
+	for _, kw := range []string{
+		"credential_state", "probe_method", "probe_outcome", "probe_supported",
+		"inference_verified",
+		"enum: [decrypted, missing, unusable]",
+		"enum: [connectivity, none]",
+		"enum: [verified, failed, unsupported, unconfirmed]",
+		"unsupported", // 供应商不提供 /models 时「此探测方式不支持/无法确认」
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing probe contract keyword %q", kw)
+		}
+	}
+	// 发布预演：blocker vs hint、HTTP 200 不等于每个 probe.ok。
+	for _, kw := range []string{
+		"PublishDryRunReport", "PublishIssue", "PublishDryRunSummary",
+		"PublishPreviewSummary",
+		"enum: [blocker, hint]",
+		"provider_disabled", "deployment_no_account", "route_capabilities_narrowed",
+		"model_not_dispatchable", "probe_unsupported", "account_inventory_unavailable",
+		"all_probes_ok", "disabled_providers", "deployments_behind_disabled_providers",
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing publish-preview keyword %q", kw)
+		}
+	}
+	// /chat/models 的能力字段；/v1/models 保持原生基本形状（不带能力字段）。
+	for _, kw := range []string{
+		"supports_images", "supports_tools", "supports_thinking",
+		"context_tokens", "max_output_tokens", "capability_description",
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing /chat/models capability keyword %q", kw)
+		}
+	}
+	i := strings.Index(doc, "    ModelList:")
+	if i < 0 {
+		t.Fatal("openapi missing ModelList schema")
+	}
+	seg := doc[i:]
+	if j := strings.Index(seg, "\n    ChatCompletionsRequest:"); j >= 0 {
+		seg = seg[:j]
+	}
+	for _, kw := range []string{"supports_images", "supports_tools", "context_tokens"} {
+		if strings.Contains(seg, kw) {
+			t.Errorf("/v1/models must keep its native basic shape, but it documents %q", kw)
+		}
+	}
+}
+
+// TestOpenAPI_T9PublishPreviewAdvisorySemantics pins the T9 fix-round
+// wording: the dry-run issue list is **advisory** (the formal publish never
+// reads it), a `blocker`-labelled issue does NOT by itself refuse the
+// publish, and the things that DO refuse it are the shared publish gate's
+// hard validation failures. Without this, a reader could take "blocker" to
+// mean "the publish is refused".
+func TestOpenAPI_T9PublishPreviewAdvisorySemantics(t *testing.T) {
+	doc := readOpenAPI(t)
+	for _, kw := range []string{
+		"advisory",
+		"共享发布闸",
+		"HTTP 200 + 一条 `blocker` 也不等于正式发布会被拒",
+		"不阻断", // the blocker class does not block the formal publish
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("openapi missing the advisory-semantics wording %q", kw)
+		}
+	}
+	// account_inventory_checked 的语义：false = 判定被跳过（含读失败），
+	// 不是「读过一次」。
+	i := strings.Index(doc, "account_inventory_checked:")
+	if i < 0 {
+		t.Fatal("openapi missing account_inventory_checked")
+	}
+	seg := doc[i:]
+	if j := strings.Index(seg, "required:"); j >= 0 {
+		seg = seg[:j]
+	}
+	for _, kw := range []string{"跳过", "读失败", "不是"} {
+		if !strings.Contains(seg, kw) {
+			t.Errorf("account_inventory_checked description must say %q", kw)
+		}
+	}
+}
+
+// TestOpsRunbook_AlarmPrefixesMatchTheGateway pins the T9 fix round's
+// second finding: the operations runbook must not advertise settlement
+// alarm prefixes the gateway does not emit. The gateway alarms with the
+// reason token ONLY for the terminal-state anomalies
+// (settlement_mismatch / ledger_drift / late_usage_after_release);
+// reservation_drift and missing_reservation are PARKED — the gateway logs
+// "gateway: settlement failed for … — parking in reconciliation" with no
+// reason token, and the reason is looked up on the reconciliation job.
+func TestOpsRunbook_AlarmPrefixesMatchTheGateway(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "runbooks", "kaya-coding-plan-operations.md"))
+	if err != nil {
+		t.Fatalf("operations runbook missing: %v", err)
+	}
+	doc := string(raw)
+	// 不存在的两条前缀：网关从不打它们（它们是**停放**，不是告警）。
+	for _, phantom := range []string{
+		"ALARM gateway: reservation_drift",
+		"ALARM gateway: missing_reservation",
+	} {
+		if strings.Contains(doc, phantom) {
+			t.Errorf("the runbook advertises the non-existent alarm prefix %q", phantom)
+		}
+	}
+	// 真实存在的三条前缀必须留档。
+	for _, real := range []string{
+		"ALARM gateway: settlement_mismatch",
+		"ALARM gateway: ledger_drift",
+		"ALARM gateway: late_usage_after_release",
+	} {
+		if !strings.Contains(doc, real) {
+			t.Errorf("the runbook must document the real alarm prefix %q", real)
+		}
+	}
+	// 停放类的原因必须按**原因**查，而不是按日志前缀查。
+	for _, kw := range []string{
+		"settlement_backlog",
+		"parking in reconciliation",
+		"reason",
+	} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("the runbook must document the parked-reason lookup %q", kw)
+		}
+	}
+	// 未知用量积压阈值：代码内常量，没有 env/config 旋钮。
+	if strings.Contains(doc, "可通过 `RecoveryConfig.UnknownUsageAlarmThreshold` 调整") {
+		t.Error("the runbook claims the unknown-usage threshold is operator-adjustable; it is code-only")
+	}
+	for _, kw := range []string{"代码内常量", "没有", "env"} {
+		if !strings.Contains(doc, kw) {
+			t.Errorf("the runbook must state the threshold is code-only (missing %q)", kw)
+		}
+	}
+}

@@ -155,6 +155,36 @@ func TestValidateRoute_Edges(t *testing.T) {
 	}
 }
 
+// T7 — pool_strategy 支持集（写面）：常规池只支持 round_robin；
+// least_loaded 与通用 session_sticky 明确拒绝 —— 不能保存后假装生效
+// （保存即生效的假象比拒绝更坏：运营以为配了，实际跑的是 RR）。
+//
+// 注意：Responses 的 previous_response_id 专用绑定走的是会话绑定器
+// （routing.SessionBinder），与 route 的 pool_strategy 无关 —— 拒绝
+// 通用 session_sticky 不会影响那条链路。
+func TestValidateRoute_PoolStrategySupportedSet(t *testing.T) {
+	for _, ok := range []domain.PoolStrategy{"", domain.PoolRoundRobin} {
+		r := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, PoolStrategy: ok}
+		if err := ValidateRoute(r); err != nil {
+			t.Errorf("write path rejected the supported strategy %q: %v", ok, err)
+		}
+	}
+	for _, bad := range []domain.PoolStrategy{domain.PoolLeastLoaded, domain.PoolSessionSticky, "chaos"} {
+		r := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, PoolStrategy: bad}
+		err := ValidateRoute(r)
+		if err == nil {
+			t.Errorf("write path accepted %q (unsupported pool strategy must be refused, not stored as if it worked)", bad)
+			continue
+		}
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Errorf("%q: code = %v, want invalid_input", bad, domain.CodeOf(err))
+		}
+		if !strings.Contains(err.Error(), string(domain.PoolRoundRobin)) {
+			t.Errorf("%q: the refusal must name the supported replacement: %v", bad, err)
+		}
+	}
+}
+
 func TestParseSnapshot_RejectsHalfVersions(t *testing.T) {
 	// 非 JSON / 缺 schema_version / 半截 payload 全部显式失败（不得加载半
 	// 个版本）。
@@ -214,7 +244,7 @@ func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
 
 	// 各自 alias 互不冲突 → 双侧放行（同一 model 重复列出同一 alias 无害）。
 	ok := []domain.Model{mk("m1", "latest", "latest"), mk("m2", "stable")}
-	if err := validateCatalogForPublish(ok, prov, nil); err != nil {
+	if err := validateCatalogForPublish(ok, prov, nil, nil); err != nil {
 		t.Errorf("distinct aliases rejected by publish gate: %v", err)
 	}
 	if err := parse(ok...); err != nil {
@@ -223,7 +253,7 @@ func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
 
 	// 两个 model 配同一 alias → 双侧拒绝。
 	dup := []domain.Model{mk("m1", "latest"), mk("m2", "latest")}
-	if err := validateCatalogForPublish(dup, prov, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
+	if err := validateCatalogForPublish(dup, prov, nil, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
 		t.Errorf("duplicate alias, publish gate: err = %v, want invalid_input", err)
 	}
 	if err := parse(dup...); err == nil {
@@ -232,10 +262,173 @@ func TestValidateCatalogRejectsAmbiguousAliases(t *testing.T) {
 
 	// alias 等于另一个 model 的 ID → 双侧拒绝。
 	shadow := []domain.Model{mk("m1"), mk("m2", "m1")}
-	if err := validateCatalogForPublish(shadow, prov, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
+	if err := validateCatalogForPublish(shadow, prov, nil, nil); domain.CodeOf(err) != domain.CodeInvalidInput {
 		t.Errorf("alias shadowing a model id, publish gate: err = %v, want invalid_input", err)
 	}
 	if err := parse(shadow...); err == nil {
 		t.Error("alias shadowing a model id: ParseSnapshot must fail (dead config)")
+	}
+}
+
+// T7 — 发布闸的路由拒绝必须点名**真正**的原因：pool_strategy 不受支持时
+// 给出替代配置；其它不变量（weight / model_id）失败时保留它自己的错误，
+// 绝不把运营指到错误的旋钮上（一个自相矛盾的「round_robin 不受支持，
+// 请设成 round_robin」既无用又误导）。
+func TestValidateCatalogForPublish_RouteRefusalNamesTheRealCause(t *testing.T) {
+	prov := []domain.Provider{{ID: "p1", Code: "p", DisplayName: "P",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}}
+	deps := []domain.Deployment{{ID: "d1", ProviderID: "p1", UpstreamModel: "up",
+		BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIChat,
+		Status: domain.DeploymentActive, ConnectTimeout: time.Second, RequestTimeout: time.Second}}
+
+	cases := []struct {
+		name    string
+		route   domain.ModelRoute
+		wantSub string
+		mustNot string
+	}{
+		{
+			name:    "weight zero keeps its own cause",
+			route:   domain.ModelRoute{ID: "route-1", ModelID: "m1", DeploymentID: "d1", Weight: 0, Enabled: true},
+			wantSub: "weight",
+			mustNot: "round_robin is not supported",
+		},
+		{
+			name:    "empty model keeps its own cause",
+			route:   domain.ModelRoute{ID: "route-2", DeploymentID: "d1", Weight: 1, Enabled: true},
+			wantSub: "model_id",
+			mustNot: "round_robin is not supported",
+		},
+		{
+			name:    "unsupported strategy names the replacement",
+			route:   domain.ModelRoute{ID: "route-3", ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true, PoolStrategy: domain.PoolLeastLoaded},
+			wantSub: "round_robin",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateCatalogForPublish(nil, prov, deps, []domain.ModelRoute{c.route})
+			if err == nil {
+				t.Fatalf("publish must refuse the route")
+			}
+			if domain.CodeOf(err) != domain.CodeInvalidInput {
+				t.Errorf("code = %v, want invalid_input", domain.CodeOf(err))
+			}
+			if !strings.Contains(err.Error(), c.route.ID) {
+				t.Errorf("error = %v, want it to name the route id %q", err, c.route.ID)
+			}
+			if !strings.Contains(err.Error(), c.wantSub) {
+				t.Errorf("error = %v, want it to name %q", err, c.wantSub)
+			}
+			if c.mustNot != "" && strings.Contains(err.Error(), c.mustNot) {
+				t.Errorf("error = %v, must not point the operator at the pool_strategy knob", err)
+			}
+		})
+	}
+
+	// 写面同样保留各自的原因（与发布闸同一口径）。
+	if err := ValidateRoute(&domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 0}); err == nil ||
+		!strings.Contains(err.Error(), "weight") {
+		t.Errorf("write path: err = %v, want the weight cause", err)
+	}
+	if err := ValidateRoute(&domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, PoolStrategy: domain.PoolLeastLoaded}); err == nil ||
+		!strings.Contains(err.Error(), "round_robin") {
+		t.Errorf("write path: err = %v, want the pool_strategy replacement", err)
+	}
+}
+
+// T8 — 路由能力词汇表（route capabilities）受支持集约束。
+//
+// 「能力」是自由文本的年代留下的坑：运营可以写 "vision"、"images"、"Tools"，
+// 而路由层只认自己那几把钥匙 —— 写进去的能力名与实际行为不一致，配置看起来
+// 生效了（列在清单里），实际不授予任何能力。T8 起词汇表收口：
+//
+//   - 写面（CreateRoute/UpdateRoute/导入）与发布闸：未知能力名明确拒绝，
+//     并给出支持集；
+//   - 读面（已发布快照）：未知能力名**容忍**（忽略），旧目录必须仍能加载
+//     —— 否则升级即砖整个目录。
+func TestValidateRoute_CapabilityVocabulary(t *testing.T) {
+	ok := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true,
+		Capabilities: []string{"tools", "reasoning", "image"}}
+	if err := ValidateRoute(ok); err != nil {
+		t.Fatalf("supported capabilities rejected: %v", err)
+	}
+	// 空清单 = 全部能力（存量默认形态），必须照常接受。
+	empty := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true}
+	if err := ValidateRoute(empty); err != nil {
+		t.Fatalf("empty capability list rejected: %v", err)
+	}
+	for name, caps := range map[string][]string{
+		"unknown": {"vision"},
+		"case":    {"Tools"},
+		"plural":  {"images"},
+		"mixed":   {"tools", "vision"},
+		"blank":   {" "},
+	} {
+		r := &domain.ModelRoute{ModelID: "m1", DeploymentID: "d1", Weight: 1, Enabled: true,
+			Capabilities: caps}
+		err := ValidateRoute(r)
+		if err == nil {
+			t.Errorf("%s: accepted an unsupported capability %v", name, caps)
+			continue
+		}
+		if !strings.Contains(err.Error(), "capabilit") {
+			t.Errorf("%s: error %v must name the capability vocabulary", name, err)
+		}
+	}
+}
+
+// 发布闸与写面同口径：带未知能力名的路由不可发布（错误点名路由 id）。
+func TestValidateCatalogForPublish_CapabilityVocabulary(t *testing.T) {
+	models := []domain.Model{{ID: "m1", DisplayName: "M", ContextTokens: 1000, MaxOutputTokens: 100,
+		Protocols:        []domain.Protocol{domain.ProtocolOpenAIChat},
+		OutputModalities: []string{"text"}}}
+	providers := []domain.Provider{{ID: "p1", Code: "c", DisplayName: "C",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}}
+	deployments := []domain.Deployment{{ID: "d1", ProviderID: "p1", UpstreamModel: "u",
+		BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIChat,
+		ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second,
+		Status: domain.DeploymentActive}}
+	routes := []domain.ModelRoute{{ID: "r1", ModelID: "m1", DeploymentID: "d1", Weight: 1,
+		Enabled: true, Capabilities: []string{"vision"}}}
+	err := validateCatalogForPublish(models, providers, deployments, routes)
+	if err == nil {
+		t.Fatal("publish accepted a route with an unknown capability")
+	}
+	if !strings.Contains(err.Error(), "r1") || !strings.Contains(err.Error(), "capabilit") {
+		t.Errorf("publish refusal must name the route and the capability: %v", err)
+	}
+	// 支持集内的清单可发布。
+	routes[0].Capabilities = []string{"tools", "reasoning", "image"}
+	if err := validateCatalogForPublish(models, providers, deployments, routes); err != nil {
+		t.Fatalf("publish rejected a supported capability list: %v", err)
+	}
+}
+
+// T8 — 读面容忍未知能力名：已发布的旧目录必须仍能加载（否则升级即砖整个
+// 目录）。未知能力名**不授予任何能力**（路由层只认自己那几把钥匙），但
+// 它不会让整份快照加载失败。存量行不会被自动改写（不自动迁移）。
+func TestParseSnapshot_UnknownRouteCapabilityStaysLoadable(t *testing.T) {
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "models": [{"id":"m1","display_name":"M","lifecycle":"active","context_tokens":1000,
+	    "max_output_tokens":100,"protocols":["openai_chat"],"output_modalities":["text"]}],
+	  "providers": [{"id":"p1","code":"c","display_name":"C","access_type":"official_api","status":"active"}],
+	  "deployments": [{"id":"d1","provider_id":"p1","upstream_model":"u","base_url":"https://api.example.com",
+	    "protocol":"openai_chat","connect_timeout_ms":5000,"request_timeout_ms":30000,"status":"active"}],
+	  "routes": [{"id":"r1","model_id":"m1","deployment_id":"d1","priority":0,"weight":1,
+	    "capabilities":["vision"],"enabled":true}]
+	}`)
+	snap, err := ParseSnapshot(&domain.ConfigRevision{Scope: domain.ScopeCatalog, Revision: 1,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: payload}})
+	if err != nil {
+		t.Fatalf("an old published revision with an unknown capability must stay loadable: %v", err)
+	}
+	routes := snap.RoutesByModel["m1"]
+	if len(routes) != 1 {
+		t.Fatalf("routes = %d, want 1", len(routes))
+	}
+	if got := routes[0].Capabilities; len(got) != 1 || got[0] != "vision" {
+		t.Errorf("the stored capability list must not be rewritten: %v", got)
 	}
 }

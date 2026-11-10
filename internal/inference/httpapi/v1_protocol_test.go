@@ -61,7 +61,7 @@ func (f *v1Fixture) lastUpstreamBody(t *testing.T) string {
 
 func newV1Fixture(t *testing.T) *v1Fixture {
 	t.Helper()
-	fx := newAccessFixture(t, 0) // reuses the wipe + token service harness
+	fx := newAccessFixture(t) // reuses the wipe + token service harness
 	db := fx.db
 	store := fx.store
 	ctx := context.Background()
@@ -270,7 +270,7 @@ func newV1Fixture(t *testing.T) *v1Fixture {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	v1 := engine.Group("/v1", httpapi.APIKeyAuth(fx.resolver, access.NewRPMCounter(nil), 0))
+	v1 := engine.Group("/v1", httpapi.APIKeyAuth(fx.resolver))
 	v1.GET("/models", httpapi.NewModelsHandler(catalogSvc, fx.resolver).List)
 	v1.POST("/chat/completions", httpapi.NewChatCompletionsHandler(gw).Create)
 	f.engine = engine

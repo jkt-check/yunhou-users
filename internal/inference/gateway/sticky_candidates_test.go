@@ -3,10 +3,15 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/yunhou/users/internal/inference/credentials"
 	"github.com/yunhou/users/internal/inference/domain"
 	"github.com/yunhou/users/internal/inference/providers"
 	"github.com/yunhou/users/internal/inference/routing"
@@ -149,5 +154,467 @@ func TestEstimateInputTokens_ImageParts(t *testing.T) {
 	withImg := &providers.ChatRequest{Messages: []model.ChatMessage{m}}
 	if got := EstimateInputTokens(withImg) - EstimateInputTokens(plain); got != 1105 {
 		t.Fatalf("image estimate delta=%d want 1105", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T3 — provider 停用与 sticky 候选一致性
+//
+// sticky 候选必须复用普通候选的同一个「已发布 route/provider/deployment
+// 可调度」判定：被停用的 provider 不得经由 sticky 会话出站，也不得由
+// sticky 分支另开后门；另一个 active provider 仍然可用。
+// ---------------------------------------------------------------------------
+
+// addSecondProvider 给 fixture 追加第二个 provider/deployment/account/route
+// （同一模型、更高 priority），返回新账号 ID。它让测试能证明「停用一个
+// provider 不得停掉整个模型」。
+func addSecondProvider(t *testing.T, f *fixture, up *upstream) string {
+	t.Helper()
+	ctx := context.Background()
+	prov := &domain.Provider{Code: "moonshot", DisplayName: "Moonshot",
+		AccessType: domain.AccessOfficialAPI, Status: "active"}
+	if err := f.store.InsertProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := credentials.NewVault(map[int][]byte{1: []byte("0123456789abcdef0123456789abcdef")}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credSvc := credentials.NewService(vault, f.store, f.store)
+	cv, err := credSvc.Create(ctx, credentials.Operator{UserID: uuid.NewString(), AppID: "test"},
+		prov.ID, "main", "api_key", "sk-second", "seed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct := &domain.UpstreamAccount{ProviderID: prov.ID, CredentialID: cv.ID,
+		Status: domain.AccountActive, ConcurrencyLimit: 4}
+	if err := f.store.InsertUpstreamAccount(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	dep := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "kimi-k2", BaseURL: up.URL,
+		Protocol:       domain.ProtocolOpenAIChat,
+		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second,
+		Status: domain.DeploymentActive,
+	}
+	if err := f.store.InsertDeployment(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+	route := &domain.ModelRoute{ModelID: f.modelID, DeploymentID: dep.ID,
+		Priority: 2, Weight: 1, Enabled: true}
+	if err := f.store.InsertRoute(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+	f.snap.Providers[prov.ID] = *prov
+	f.snap.Deployments[dep.ID] = *dep
+	f.snap.RoutesByModel[f.modelID] = append(f.snap.RoutesByModel[f.modelID], *route)
+	return acct.ID
+}
+
+// disableFixtureProvider 在已发布快照里停用 fixture 自带的 provider。
+func disableFixtureProvider(f *fixture) {
+	prov := f.snap.Providers[f.providerID]
+	prov.Status = "disabled"
+	f.snap.Providers[f.providerID] = prov
+}
+
+// TestGateway_DisabledProviderNeverDispatches：已发布快照里 provider 被
+// 停用后，它的部署不得出站；同一模型的另一个 active provider 仍然可用。
+func TestGateway_DisabledProviderNeverDispatches(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi")); err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	if up1.calls.Load() != 0 {
+		t.Errorf("disabled provider received %d upstream calls, want 0", up1.calls.Load())
+	}
+	if up2.calls.Load() != 1 {
+		t.Errorf("active provider received %d upstream calls, want 1", up2.calls.Load())
+	}
+}
+
+// TestGateway_StickyCandidates_DisabledProviderNotDispatched：sticky 会话
+// 绑在停用 provider 的账号上 → 不得出站；绑定失效也不得静默切到别的账号
+// （sticky 契约：绝不无条件切号续接）。
+func TestGateway_StickyCandidates_DisabledProviderNotDispatched(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	f.gateway.SetSessionBinder(routing.NewSessionBinder(f.store, nil))
+
+	// 会话绑定到 fixture provider（随后被停用）的账号。
+	if err := f.gateway.BindSession(context.Background(), "sess-1", f.modelID, f.accountUpID); err != nil {
+		t.Fatalf("bind session: %v", err)
+	}
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletionsSticky(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"), "sess-1")
+	if err == nil {
+		t.Fatal("a sticky session bound to a disabled provider must not be served")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeUpstreamUnavailable {
+		t.Fatalf("code = %v, want upstream_unavailable（不得伪装成无权限）: %v", code, err)
+	}
+	if up1.calls.Load() != 0 || up2.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d/%d, want 0/0（停用的 provider 不得出站，绑定也不得静默切号）",
+			up1.calls.Load(), up2.calls.Load())
+	}
+}
+
+// TestGateway_StickyCandidates_NewSessionBindsActiveProvider：停用一个
+// provider 后，新会话仍然绑到另一个 active provider 的账号并出站（sticky
+// 与普通候选共用同一个可调度判定，不因 sticky 另开后门）。
+func TestGateway_StickyCandidates_NewSessionBindsActiveProvider(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	acct2 := addSecondProvider(t, f, up2)
+	f.gateway.SetSessionBinder(routing.NewSessionBinder(f.store, nil))
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletionsSticky(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"), "sess-new"); err != nil {
+		t.Fatalf("ChatCompletionsSticky: %v", err)
+	}
+	if up1.calls.Load() != 0 {
+		t.Errorf("disabled provider received %d upstream calls, want 0", up1.calls.Load())
+	}
+	if up2.calls.Load() != 1 {
+		t.Errorf("active provider received %d upstream calls, want 1", up2.calls.Load())
+	}
+	binding, _, err := routing.NewSessionBinder(f.store, nil).Resolve(context.Background(), "sess-new", f.modelID)
+	if err != nil {
+		t.Fatalf("resolve binding: %v", err)
+	}
+	if binding.AccountID != acct2 {
+		t.Errorf("session bound to %s, want the active provider's account %s", binding.AccountID, acct2)
+	}
+}
+
+// TestGateway_AliasToDisabledProviderNotDispatched：模型别名解析到同一个
+// 模型 → 停用的 provider 不得经由别名出站，另一个 active provider 仍可用。
+func TestGateway_AliasToDisabledProviderNotDispatched(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	// 别名指向同一个模型（发布快照里的 aliases）。
+	m := f.snap.Models[f.modelID]
+	m.Aliases = []string{"glm-latest"}
+	f.snap.Models[f.modelID] = m
+	disableFixtureProvider(f)
+
+	req := chatReq(false, "hi")
+	req.Model = "glm-latest"
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, req); err != nil {
+		t.Fatalf("ChatCompletions (alias): %v", err)
+	}
+	if up1.calls.Load() != 0 {
+		t.Errorf("disabled provider received %d upstream calls via alias, want 0", up1.calls.Load())
+	}
+	if up2.calls.Load() != 1 {
+		t.Errorf("active provider received %d upstream calls, want 1", up2.calls.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T3 补正 — 停用 provider 的 503 文案不得误述为「容量不足 / 稍后重试」
+//
+// provider 被停用不是容量缺口，也不是瞬时故障：它只在重新启用（或换会话
+// 键）之后才会变化。文案若仍说「with capacity」或「retry shortly」，客户端
+// 会对一个不会自行恢复的条件发起重试循环。
+// 错误码（upstream_unavailable）与 HTTP 503 形状不变，也不新增任何线上
+// 错误码或响应字段。
+// ---------------------------------------------------------------------------
+
+// clientVisibleMessage 取客户端真正看到的那段文案（httpapi.safeMsg 取的
+// 就是 domain.Error.Message）。
+func clientVisibleMessage(t *testing.T, err error) string {
+	t.Helper()
+	var de *domain.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v, want a domain error", err)
+	}
+	return de.Message
+}
+
+// assertNonTransientRejection 钉住「非容量 / 非瞬时 / 不邀请重试」的口径。
+func assertNonTransientRejection(t *testing.T, msg, modelID string) {
+	t.Helper()
+	lower := strings.ToLower(msg)
+	for _, bad := range []string{"capacity", "retry", "temporar"} {
+		if strings.Contains(lower, bad) {
+			t.Errorf("message %q must not mention %q（停用不是容量缺口，也不是瞬时故障）", msg, bad)
+		}
+	}
+	if !strings.Contains(msg, modelID) {
+		t.Errorf("message %q must still name the model %q", msg, modelID)
+	}
+	if !strings.Contains(lower, "dispatchable") {
+		t.Errorf("message %q must state that no upstream is dispatchable", msg)
+	}
+}
+
+// TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient：普通
+// 路径上 provider 被停用时的 503 文案——不得说成容量不足、不得邀请重试；
+// 错误码与 503 形状不变，零出站。
+func TestGateway_DisabledProvider_ErrorMessageIsNotCapacityOrTransient(t *testing.T) {
+	up := newUpstream(t, completionHandler)
+	f := newFixture(t, up)
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"))
+	if err == nil {
+		t.Fatal("a disabled provider must fail the call")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeUpstreamUnavailable {
+		t.Fatalf("code = %v, want upstream_unavailable（错误码与 503 形状不变）: %v", code, err)
+	}
+	assertNonTransientRejection(t, clientVisibleMessage(t, err), f.modelID)
+	if up.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d, want 0", up.calls.Load())
+	}
+}
+
+// TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient：
+// sticky 路径上绑定到停用 provider 账号时的 503 文案——同样不得说成瞬时/
+// 容量问题、不得邀请重试，并且必须说明会话没有被改绑（否则客户端会对同一个
+// 永不自行恢复的会话键反复重试）。不换号的行为与错误码保持不变。
+func TestGateway_StickyDisabledProvider_ErrorMessageIsNotTemporaryOrTransient(t *testing.T) {
+	up1 := newUpstream(t, completionHandler)
+	up2 := newUpstream(t, completionHandler)
+	f := newFixture(t, up1)
+	addSecondProvider(t, f, up2)
+	f.gateway.SetSessionBinder(routing.NewSessionBinder(f.store, nil))
+	if err := f.gateway.BindSession(context.Background(), "sess-1", f.modelID, f.accountUpID); err != nil {
+		t.Fatalf("bind session: %v", err)
+	}
+	disableFixtureProvider(f)
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletionsSticky(context.Background(), p, key,
+		domain.ProtocolOpenAIChat, chatReq(false, "hi"), "sess-1")
+	if err == nil {
+		t.Fatal("a sticky session bound to a disabled provider must not be served")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeUpstreamUnavailable {
+		t.Fatalf("code = %v, want upstream_unavailable（错误码与 503 形状不变）: %v", code, err)
+	}
+	msg := clientVisibleMessage(t, err)
+	assertNonTransientRejection(t, msg, f.modelID)
+	if !strings.Contains(strings.ToLower(msg), "rebound") {
+		t.Errorf("message %q must state that the session was not rebound to another account", msg)
+	}
+	// 不换号：停用的 provider 与另一个 provider 都不得出站。
+	if up1.calls.Load() != 0 || up2.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d/%d, want 0/0", up1.calls.Load(), up2.calls.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 能力路由（图片）：带图请求只选兼容候选；无兼容候选时在准入前拒绝
+//
+// 三层能力契约（模型声明 → 路由能力 → adapter 能力）必须一致：不支持图片的
+// 上游协议**不参与**带图请求的候选选择；文本请求的候选集合不受影响。
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// imageRequest builds an internal request carrying one image part (the shape
+// the Kaya /chat facade hands over for a vision turn).
+func imageRequest(modelID string) *providers.ChatRequest {
+	var m model.ChatMessage
+	if err := m.UnmarshalJSON([]byte(`{"role":"user","content":[` +
+		`{"type":"text","text":"what is this?"},` +
+		`{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}`)); err != nil {
+		panic(err)
+	}
+	return &providers.ChatRequest{
+		Model:    modelID,
+		Stream:   false,
+		Messages: []model.ChatMessage{{Role: "system", Content: "be brief"}, m},
+	}
+}
+
+// responsesUpstream answers the OpenAI Responses wire protocol (the upstream
+// side of a /responses deployment).
+func responsesUpstream(w http.ResponseWriter, r *http.Request, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed","model":"up",` +
+		`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],` +
+		`"usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}}`))
+}
+
+// addProtocolDeployment registers a SECOND deployment for the fixture's model
+// on the given upstream protocol and puts its route FIRST in the published
+// failover order (priority 0 vs the fixture route's priority 1). It returns
+// the new deployment id.
+func addProtocolDeployment(t *testing.T, f *fixture, up *upstream, proto domain.Protocol) string {
+	t.Helper()
+	ctx := context.Background()
+	prov := &domain.Provider{Code: "p-" + string(proto), DisplayName: "P " + string(proto),
+		AccessType: domain.AccessOfficialAPI, Status: "active"}
+	if err := f.store.InsertProvider(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := credentials.NewVault(map[int][]byte{1: []byte("0123456789abcdef0123456789abcdef")}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credSvc := credentials.NewService(vault, f.store, f.store)
+	cv, err := credSvc.Create(ctx, credentials.Operator{UserID: uuid.NewString(), AppID: "test"},
+		prov.ID, "main", "api_key", "sk-second", "seed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct := &domain.UpstreamAccount{ProviderID: prov.ID, CredentialID: cv.ID,
+		Status: domain.AccountActive, ConcurrencyLimit: 4}
+	if err := f.store.InsertUpstreamAccount(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	dep := &domain.Deployment{
+		ProviderID: prov.ID, UpstreamModel: "second-upstream", BaseURL: up.URL,
+		Protocol:       proto,
+		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second,
+		Status: domain.DeploymentActive,
+	}
+	if err := f.store.InsertDeployment(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+	route := &domain.ModelRoute{ModelID: f.modelID, DeploymentID: dep.ID,
+		Priority: 0, Weight: 1, Enabled: true, PoolStrategy: domain.PoolRoundRobin}
+	if err := f.store.InsertRoute(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+	f.snap.Providers[prov.ID] = *prov
+	f.snap.Deployments[dep.ID] = *dep
+	// The fixture's own route moves to priority 1 so the published order
+	// (priority/weight) matches the slice order the snapshot carries.
+	own := f.snap.RoutesByModel[f.modelID]
+	for i := range own {
+		own[i].Priority = 1
+	}
+	f.snap.RoutesByModel[f.modelID] = append([]domain.ModelRoute{*route}, own...)
+	return dep.ID
+}
+
+// countRows counts one table (test-only helper for the zero-admission
+// assertions).
+func countRows(t *testing.T, f *fixture, table string) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+// ---------------------------------------------------------------------------
+// T8 — 能力路由（图片）
+// ---------------------------------------------------------------------------
+
+// TestGateway_ImageRequestSkipsIncompatibleDeployment：带图请求只选兼容
+// 候选。第一候选是**不支持图片**的上游协议（openai_responses），第二候选
+// 是兼容的 openai_chat —— 请求必须由兼容候选服务，不兼容候选零出站。
+func TestGateway_ImageRequestSkipsIncompatibleDeployment(t *testing.T) {
+	responsesUp := newUpstream(t, responsesUpstream)
+	chatUp := newUpstream(t, completionHandler)
+	f := newFixture(t, chatUp, withModelInputModalities([]string{"text", "image"}))
+	// 快照里第一候选 = responses 协议（不支持图片）。
+	addProtocolDeployment(t, f, responsesUp, domain.ProtocolOpenAIResponses)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolKayaChat, imageRequest(f.modelID)); err != nil {
+		t.Fatalf("ChatCompletions (image): %v", err)
+	}
+	if responsesUp.calls.Load() != 0 {
+		t.Errorf("incompatible deployment received %d upstream calls, want 0",
+			responsesUp.calls.Load())
+	}
+	if chatUp.calls.Load() != 1 {
+		t.Errorf("compatible deployment received %d upstream calls, want 1",
+			chatUp.calls.Load())
+	}
+}
+
+// TestGateway_ImageRequestWithoutCompatibleCandidateRejectsBeforeAdmission：
+// 模型只有不支持图片的部署时，带图请求必须在**准入之前**被明确拒绝 ——
+// 零请求行、零尝试行、零租约、零出站（先占额度再失败就是漏洞）。
+func TestGateway_ImageRequestWithoutCompatibleCandidateRejectsBeforeAdmission(t *testing.T) {
+	responsesUp := newUpstream(t, responsesUpstream)
+	f := newFixture(t, responsesUp, withModelInputModalities([]string{"text", "image"}))
+	// 把 fixture 自带的部署换成 responses 协议（唯一候选，不兼容图片）。
+	// 调度读的是**已发布快照**里的部署（routing.Candidates 不查库），所以
+	// 快照这一份就是事实源；DB 行只是 attempt 的 FK 目标，无需改动。
+	d := f.snap.Deployments[f.deploymentID]
+	d.Protocol = domain.ProtocolOpenAIResponses
+	f.snap.Deployments[f.deploymentID] = d
+
+	p, key := f.principal()
+	_, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolKayaChat, imageRequest(f.modelID))
+	if err == nil {
+		t.Fatal("an image request with no compatible deployment must be rejected")
+	}
+	if code := domain.CodeOf(err); code != domain.CodeInvalidInput {
+		t.Fatalf("code = %v, want invalid_input（明确拒绝，不是上游故障）: %v", code, err)
+	}
+	if n := countRows(t, f, "inference_requests"); n != 0 {
+		t.Errorf("requests = %d, want 0 (rejection must precede admission)", n)
+	}
+	if n := countRows(t, f, "inference_attempts"); n != 0 {
+		t.Errorf("attempts = %d, want 0 (rejection must precede dispatch)", n)
+	}
+	if n := countRows(t, f, "inference_concurrency_leases"); n != 0 {
+		t.Errorf("leases = %d, want 0 (rejection must leave no lease)", n)
+	}
+	if n := countRows(t, f, "inference_reservations"); n != 0 {
+		t.Errorf("reservations = %d, want 0 (rejection must leave no hold)", n)
+	}
+	if responsesUp.calls.Load() != 0 {
+		t.Errorf("upstream calls = %d, want 0 (rejection must precede dispatch)",
+			responsesUp.calls.Load())
+	}
+}
+
+// TestGateway_TextRequestKeepsOriginalCandidates：纯文本请求的候选集合不得
+// 被能力路由收窄 —— 第一候选（openai_responses）仍然出站。
+func TestGateway_TextRequestKeepsOriginalCandidates(t *testing.T) {
+	responsesUp := newUpstream(t, responsesUpstream)
+	chatUp := newUpstream(t, completionHandler)
+	f := newFixture(t, chatUp)
+	addProtocolDeployment(t, f, responsesUp, domain.ProtocolOpenAIResponses)
+
+	p, key := f.principal()
+	if _, err := f.gateway.ChatCompletions(context.Background(), p, key,
+		domain.ProtocolKayaChat, chatReq(false, "hi")); err != nil {
+		t.Fatalf("ChatCompletions (text): %v", err)
+	}
+	if responsesUp.calls.Load() != 1 {
+		t.Errorf("first candidate received %d upstream calls, want 1 (text keeps the original candidates)",
+			responsesUp.calls.Load())
+	}
+	if chatUp.calls.Load() != 0 {
+		t.Errorf("second candidate received %d upstream calls, want 0 (no failover needed)",
+			chatUp.calls.Load())
 	}
 }

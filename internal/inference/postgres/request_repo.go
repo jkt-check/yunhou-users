@@ -37,14 +37,14 @@ func insertRequest(ctx context.Context, ex sqlxExecutor, r *domain.Request) erro
 		 (id, billing_account_id, api_key_id, entitlement_id, model_id,
 		  protocol, stream, status, admitted_at, price_version_id, policy_version_id,
 		  window_five_hour_id, window_weekly_id, window_monthly_id,
-		  reserved_micros, usage_status,
+		  reserved_micros, expected_hold_micros, usage_status,
 		  input_bound_tokens, output_cap_tokens, extra_bounds,
 		  charge_source)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
 		r.ID, r.BillingAccountID, strPtr(r.APIKeyID), r.EntitlementID, r.ModelID,
 		string(r.Protocol), r.Stream, status, r.AdmittedAt, strPtr(r.PriceVersionID), r.PolicyVersionID,
 		strPtr(r.WindowFiveHourID), strPtr(r.WindowWeeklyID), strPtr(r.WindowMonthlyID),
-		microPtr(r.ReservedMicros), usageStatus,
+		microPtr(r.ReservedMicros), microPtr(r.ExpectedHoldMicros), usageStatus,
 		r.InputBoundTokens, r.OutputCapTokens, extraBounds,
 		chargeSourceOf(r))
 	return mapError("insert request", err)
@@ -136,6 +136,7 @@ func (s *Store) GetRequest(ctx context.Context, id string) (*domain.Request, err
 		WinW          sql.NullString  `db:"window_weekly_id"`
 		WinM          sql.NullString  `db:"window_monthly_id"`
 		Reserved      sql.NullInt64   `db:"reserved_micros"`
+		ExpectedHold  sql.NullInt64   `db:"expected_hold_micros"`
 		Settled       sql.NullInt64   `db:"settled_micros"`
 		UsageStatus   string          `db:"usage_status"`
 		InputBound    *int64          `db:"input_bound_tokens"`
@@ -164,9 +165,10 @@ func (s *Store) GetRequest(ctx context.Context, id string) (*domain.Request, err
 		WindowFiveHourID: strFromNull(row.Win5h), WindowWeeklyID: strFromNull(row.WinW),
 		WindowMonthlyID: strFromNull(row.WinM),
 		ReservedMicros:  microFromNull(row.Reserved), SettledMicros: microFromNull(row.Settled),
-		UsageStatus:      domain.UsageSource(row.UsageStatus),
-		ChargeSource:     domain.ChargeSource(row.ChargeSource),
-		InputBoundTokens: row.InputBound, OutputCapTokens: row.OutputCap, ExtraBounds: bounds,
+		ExpectedHoldMicros: microFromNull(row.ExpectedHold),
+		UsageStatus:        domain.UsageSource(row.UsageStatus),
+		ChargeSource:       domain.ChargeSource(row.ChargeSource),
+		InputBoundTokens:   row.InputBound, OutputCapTokens: row.OutputCap, ExtraBounds: bounds,
 		LastError: row.LastError,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, CompletedAt: row.CompletedAt,
 	}, nil
@@ -217,9 +219,27 @@ func (s *Store) InsertAttemptTx(ctx context.Context, w domain.UnitOfWork, a *dom
 // UpdateRequestStatus moves a request through the §7.2 lifecycle outside an
 // open UnitOfWork (single-statement). Terminal transitions that must commit
 // with their effects (settled/released/reconciliation_required) have their
-// own transactional paths — this is for the dispatch markers.
+// own transactional paths — this is for the dispatch markers. Late markers
+// against settled/released requests are successful no-ops.
 func (s *Store) UpdateRequestStatus(ctx context.Context, id string, status domain.RequestStatus, lastErr string) error {
-	return s.updateRequestStatus(ctx, s.db, id, status, lastErr)
+	var found bool
+	err := s.db.QueryRowxContext(ctx, `
+		WITH updated AS (
+		    UPDATE inference_requests
+		    SET status = $2, last_error = $3, updated_at = now()
+		    WHERE id = $1 AND status NOT IN ('settled', 'released')
+		    RETURNING id
+		)
+		SELECT EXISTS (SELECT 1 FROM updated)
+		    OR EXISTS (SELECT 1 FROM inference_requests WHERE id = $1)`,
+		id, string(status), lastErr).Scan(&found)
+	if err != nil {
+		return mapError("update request status", err)
+	}
+	if !found {
+		return mapError("update request status", sql.ErrNoRows)
+	}
+	return nil
 }
 
 // FinishAttempt marks an attempt's terminal state (completed | failed |

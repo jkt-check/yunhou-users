@@ -36,11 +36,11 @@ type failSecretFor struct {
 	inner SecretResolver
 }
 
-func (s failSecretFor) ResolveSecret(ctx context.Context, id string, pinGeneration *int64) ([]byte, *domain.Credential, error) {
+func (s failSecretFor) ResolveOutboundAuth(ctx context.Context, id string, pinGeneration *int64) (credentials.OutboundAuth, *domain.Credential, error) {
 	if id == s.badID {
-		return nil, nil, s.err
+		return credentials.OutboundAuth{}, nil, s.err
 	}
-	return s.inner.ResolveSecret(ctx, id, pinGeneration)
+	return s.inner.ResolveOutboundAuth(ctx, id, pinGeneration)
 }
 
 // addModelB 在既有 fixture 上接入第二条完全独立的模型链路（provider B /
@@ -79,7 +79,7 @@ func addModelB(t *testing.T, f *fixture, up2 *upstream) {
 	}
 	dep2 := &domain.Deployment{
 		ProviderID: prov2.ID, UpstreamModel: "glm-flash-up", BaseURL: up2.URL,
-		Protocol: domain.ProtocolOpenAIChat,
+		Protocol:       domain.ProtocolOpenAIChat,
 		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second,
 		Status: domain.DeploymentActive,
 	}
@@ -274,7 +274,7 @@ func TestIsolation_CredentialFailure_FailsOverToHealthyDeployment(t *testing.T) 
 	}
 	dep2 := &domain.Deployment{
 		ProviderID: prov2.ID, UpstreamModel: "kimi-k2", BaseURL: upGood.URL,
-		Protocol: domain.ProtocolOpenAIChat,
+		Protocol:       domain.ProtocolOpenAIChat,
 		ConnectTimeout: 2 * time.Second, RequestTimeout: 5 * time.Second, Status: domain.DeploymentActive,
 	}
 	if err := f.store.InsertDeployment(ctx, dep2); err != nil {

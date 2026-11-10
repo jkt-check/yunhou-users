@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"syscall"
 	"testing"
@@ -32,7 +33,7 @@ func testDeployment(proto domain.Protocol, baseURL string) *domain.Deployment {
 
 func chatCall(dep *domain.Deployment, stream bool) *Call {
 	return &Call{
-		Deployment: dep, Secret: []byte("sk-test"), RequestID: "req-1",
+		Deployment: dep, Auth: Auth{Type: AuthTypeAPIKey, Token: "sk-test"}, RequestID: "req-1",
 		Request: &ChatRequest{
 			Model: "m1", Stream: stream,
 			Messages: []model.ChatMessage{{Role: "user", Content: "hi"}},
@@ -304,5 +305,274 @@ func TestDispatch_SameOriginRedirectFollowed(t *testing.T) {
 	}
 	if !sawFinal {
 		t.Error("final handler never reached")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T1 — 出站鉴权头：凭据类型 → 协议明确支持的头
+// ---------------------------------------------------------------------------
+
+// TestAuthHeaders_StaticCredentialsUnchanged: 静态 api_key/service 的出站头
+// 保持旧口径（openai 兼容 = Bearer，anthropic = x-api-key）。
+func TestAuthHeaders_StaticCredentialsUnchanged(t *testing.T) {
+	chat, err := NewOpenAIChat().AuthHeaders(Auth{Type: AuthTypeAPIKey, Token: "sk-static"})
+	if err != nil {
+		t.Fatalf("openai_chat api_key: %v", err)
+	}
+	if chat["Authorization"] != "Bearer sk-static" {
+		t.Errorf("openai_chat api_key Authorization = %q", chat["Authorization"])
+	}
+	resp, err := NewOpenAIResponses().AuthHeaders(Auth{Type: AuthTypeService, Token: "svc-static"})
+	if err != nil {
+		t.Fatalf("openai_responses service: %v", err)
+	}
+	if resp["Authorization"] != "Bearer svc-static" {
+		t.Errorf("openai_responses service Authorization = %q", resp["Authorization"])
+	}
+	ant, err := NewAnthropicMessages().AuthHeaders(Auth{Type: AuthTypeAPIKey, Token: "sk-ant-static"})
+	if err != nil {
+		t.Fatalf("anthropic api_key: %v", err)
+	}
+	if ant["x-api-key"] != "sk-ant-static" {
+		t.Errorf("anthropic api_key x-api-key = %q", ant["x-api-key"])
+	}
+	if ant["anthropic-version"] == "" {
+		t.Error("anthropic-version header missing")
+	}
+	if _, ok := ant["Authorization"]; ok {
+		t.Error("a static key must not be presented as a bearer token")
+	}
+}
+
+// TestAuthHeaders_OAuthUsesBearerOnly: OpenAI 兼容协议里 oauth 凭据只以
+// bearer 出站；封存的 bundle JSON 与 refresh token 到不了任何头。
+func TestAuthHeaders_OAuthUsesBearerOnly(t *testing.T) {
+	const access = "acc-token-adapter"
+	for _, a := range []Adapter{NewOpenAIChat(), NewOpenAIResponses()} {
+		h, err := a.AuthHeaders(Auth{Type: AuthTypeOAuth, Token: access})
+		if err != nil {
+			t.Fatalf("%s: oauth: %v", a.Protocol(), err)
+		}
+		if h["Authorization"] != "Bearer "+access {
+			t.Errorf("%s: oauth Authorization = %q, want the bare access token", a.Protocol(), h["Authorization"])
+		}
+		if _, ok := h["x-api-key"]; ok {
+			t.Errorf("%s: an oauth access token must not occupy the api-key slot", a.Protocol())
+		}
+		for name, v := range h {
+			if strings.Contains(v, "access_token") || strings.Contains(v, "refresh_token") || strings.Contains(v, "{") {
+				t.Errorf("%s: header %q carries bundle material", a.Protocol(), name)
+			}
+		}
+	}
+}
+
+// TestAuthHeaders_AnthropicRefusesOAuth: anthropic_messages 的明确支持集里
+// 没有 OAuth 供应商 —— 仓库自有的 OAuth 连接器说 OpenAI 兼容协议，而
+// Anthropic 官方 claude.ai OAuth 需要本部署不发的 anthropic-beta 头。凭据
+// 能解包不等于该协议兼容：明确拒绝、不猜头槽、错误不带凭据材料。
+func TestAuthHeaders_AnthropicRefusesOAuth(t *testing.T) {
+	const access = "acc-token-anthropic"
+	h, err := NewAnthropicMessages().AuthHeaders(Auth{Type: AuthTypeOAuth, Token: access})
+	if err == nil {
+		t.Fatalf("anthropic_messages must refuse oauth credentials (header count=%d)", len(h))
+	}
+	if h != nil {
+		t.Errorf("a refused oauth credential must not produce headers")
+	}
+	if domain.CodeOf(err) != domain.CodeInvalidInput {
+		t.Errorf("refusal code = %v, want invalid_input", domain.CodeOf(err))
+	}
+	for _, forbidden := range []string{access, "access_token", "refresh_token"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("the refusal surfaced credential material")
+		}
+	}
+}
+
+// TestAuthHeaders_UnsupportedAuthTypeRefused: 协议不支持的凭据类型明确拒绝，
+// 不猜头槽。
+func TestAuthHeaders_UnsupportedAuthTypeRefused(t *testing.T) {
+	for _, a := range []Adapter{NewOpenAIChat(), NewOpenAIResponses(), NewAnthropicMessages()} {
+		h, err := a.AuthHeaders(Auth{Type: "magic", Token: "x"})
+		if err == nil {
+			t.Errorf("%s: an unsupported auth type must be refused (headers=%v)", a.Protocol(), h)
+			continue
+		}
+		if domain.CodeOf(err) != domain.CodeInvalidInput {
+			t.Errorf("%s: refusal code = %v, want invalid_input", a.Protocol(), domain.CodeOf(err))
+		}
+		if h != nil {
+			t.Errorf("%s: a refused auth type must not produce headers", a.Protocol())
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T7 — deployment ConnectTimeout 真正控制建连阶段
+// ---------------------------------------------------------------------------
+
+// fakeEgressDialer is a controllable egress policy: it satisfies the
+// EgressChecker contract AND the dial-time policy hook, so the test can
+// decide exactly when (and whether) a connection is established. No real
+// external provider is ever contacted.
+type fakeEgressDialer struct {
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+func (f *fakeEgressDialer) ValidateURL(context.Context, string) error      { return nil }
+func (f *fakeEgressDialer) ValidateRedirect(context.Context, string) error { return nil }
+func (f *fakeEgressDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return f.dial(ctx, network, addr)
+}
+
+// isTimeoutErr reports whether err is a deadline/timeout error (the shape a
+// connect timeout produces).
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return ne.Timeout()
+	}
+	return false
+}
+
+// TestDispatch_ConnectTimeoutBoundsConnectionEstablishment：部署的
+// connect_timeout 真正控制建连阶段 —— 短超时的那条部署在建连阶段失败，
+// 长超时的那条照常成功（同一个 dialer、同一个上游）。
+func TestDispatch_ConnectTimeoutBoundsConnectionEstablishment(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"up",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`)
+	}))
+	defer srv.Close()
+
+	// 可控 dialer：每次建连先睡 150ms 再连真实地址 —— 建连慢于 30ms 的
+	// connect_timeout，但快于 2s 的那一个。
+	dialer := &fakeEgressDialer{dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		select {
+		case <-time.After(150 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}}
+	client := NewHTTPClient(dialer)
+
+	// 部署 A：connect_timeout 30ms —— 建连阶段必须被切断。
+	depA := testDeployment(domain.ProtocolOpenAIChat, srv.URL)
+	depA.ConnectTimeout = 30 * time.Millisecond
+	start := time.Now()
+	_, err := Dispatch(context.Background(), client, NewOpenAIChat(), chatCall(depA, false))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a connect timeout must fail the dispatch")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("the connect timeout did not bound the dial: elapsed = %v", elapsed)
+	}
+	de, ok := err.(*DispatchError)
+	if !ok {
+		t.Fatalf("err = %#v, want a *DispatchError", err)
+	}
+	if !isTimeoutErr(de.Err) {
+		t.Errorf("err = %v, want a connect timeout", de.Err)
+	}
+
+	// 部署 B：connect_timeout 2s —— 同一个 dialer、同一个上游,照常成功。
+	depB := testDeployment(domain.ProtocolOpenAIChat, srv.URL)
+	depB.ConnectTimeout = 2 * time.Second
+	d, err := Dispatch(context.Background(), client, NewOpenAIChat(), chatCall(depB, false))
+	if err != nil {
+		t.Fatalf("the deployment with the generous connect timeout must succeed: %v", err)
+	}
+	if d == nil || !d.UsageReported {
+		t.Fatalf("result = %+v", d)
+	}
+}
+
+// TestDispatch_ConnectTimeoutDoesNotTruncateEstablishedStream：连接已建立的
+// SSE 不被 connect_timeout 当总超时截断 —— 它只管建连阶段。
+func TestDispatch_ConnectTimeoutDoesNotTruncateEstablishedStream(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		// 长流：建连早已完成,连接保持打开。
+		<-release
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	// connect_timeout 远小于流的时长 —— 若它被当成总超时,流会被截断。
+	dep := testDeployment(domain.ProtocolOpenAIChat, srv.URL)
+	dep.ConnectTimeout = 50 * time.Millisecond
+	client := NewHTTPClient(nil)
+
+	d, err := Dispatch(context.Background(), client, NewOpenAIChat(), chatCall(dep, true))
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if d.Stream == nil {
+		t.Fatal("stream result expected")
+	}
+	body := make(chan string, 1)
+	go func() {
+		raw, _ := io.ReadAll(d.Stream.TeeBody())
+		body <- string(raw)
+	}()
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	select {
+	case raw := <-body:
+		if !strings.Contains(raw, "[DONE]") {
+			t.Fatalf("the established stream was truncated: %q", raw)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never finished")
+	}
+}
+
+// TestDispatch_ConnectTimeoutIsUnknownExecution pins the conservative
+// classification of the newly-enforced connect timeout: the transport
+// cannot tell "the connection was never established" from "the request
+// left the box but the answer did not come back", so it reports
+// unknown-execution. The gateway then parks the request (keeps the hold)
+// instead of blindly replaying it on the next candidate — 不确定是否已执行的
+// 上游请求不得盲目重放.
+func TestDispatch_ConnectTimeoutIsUnknownExecution(t *testing.T) {
+	dialer := &fakeEgressDialer{dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	client := NewHTTPClient(dialer)
+
+	dep := testDeployment(domain.ProtocolOpenAIChat, "http://127.0.0.1:9")
+	dep.ConnectTimeout = 40 * time.Millisecond
+	_, err := Dispatch(context.Background(), client, NewOpenAIChat(), chatCall(dep, false))
+	de, ok := err.(*DispatchError)
+	if !ok {
+		t.Fatalf("err = %#v, want a *DispatchError", err)
+	}
+	if !de.ExecutedUnknown {
+		t.Error("a connect timeout must be reported as unknown-execution (绝不盲目重放)")
+	}
+	if !isTimeoutErr(de.Err) {
+		t.Errorf("err = %v, want a timeout", de.Err)
 	}
 }

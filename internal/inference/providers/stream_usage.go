@@ -18,6 +18,7 @@ package providers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 
@@ -38,8 +39,12 @@ type TapResult struct {
 	// Terminal is true only after the protocol end marker ([DONE] /
 	// message_stop) — never on a bare EOF.
 	Terminal bool
-	// ContentBytes counts visible answer bytes (delta content + reasoning)
-	// relayed so far — the basis of the estimate fallback when the upstream
+	// RejectedComplete retains a fully received upstream completion whose
+	// output cannot be represented. It permits estimation without treating
+	// the client response as successful; bare interruptions never set it.
+	RejectedComplete bool
+	// ContentBytes counts generated answer bytes (including rejected output)
+	// observed so far — the basis of the estimate fallback when the upstream
 	// never reports usage (设计 §7.1 estimated 路径).
 	ContentBytes int64
 }
@@ -49,7 +54,7 @@ type TapResult struct {
 // translator owns its tap internally (Feed is a no-op there) because it
 // meters the RAW Anthropic events before translation.
 type UsageTap interface {
-	Feed(p []byte)
+	Feed(p []byte) error
 	Result() TapResult
 }
 
@@ -68,6 +73,7 @@ type Stream struct {
 type teeReader struct {
 	body io.ReadCloser
 	tap  UsageTap
+	err  error
 }
 
 // TeeStream wraps s.Body so reads feed s.Tap.
@@ -76,10 +82,19 @@ func (s *Stream) TeeBody() io.ReadCloser {
 }
 
 func (t *teeReader) Read(p []byte) (int, error) {
+	if t.err != nil {
+		return 0, t.err
+	}
 	n, err := t.body.Read(p)
 	if n > 0 {
-		t.tap.Feed(p[:n])
+		if tapErr := t.tap.Feed(p[:n]); tapErr != nil {
+			// Do not expose bytes from this read: they may contain a clean
+			// end marker after content or usage we could not safely parse.
+			t.err = tapErr
+			return 0, tapErr
+		}
 	}
+	t.err = err
 	return n, err
 }
 
@@ -89,11 +104,12 @@ func (t *teeReader) Close() error { return t.body.Close() }
 // OpenAI incremental usage tracker
 // ---------------------------------------------------------------------------
 
-// trackLineCap bounds the pending (unterminated) line. Usage chunks are a
-// few hundred bytes; a longer line is a big content delta that cannot be a
-// usage chunk worth buffering — it is dropped and scanning resumes at the
-// next newline (candidate-branch semantics, kept).
-const trackLineCap = 64 << 10
+// Bound complete SSE lines, including large tool/text deltas with inline
+// usage. Above this bound the stream fails; silently skipping would lose
+// both generated content and billable usage.
+const trackLineCap = 1 << 20
+
+var errSSELineTooLong = errors.New("providers: SSE line exceeds 1 MiB")
 
 // openAIUsage is the OpenAI usage object shape, including the detail
 // sub-objects that carry cache/reasoning breakdowns. The
@@ -127,15 +143,23 @@ type OpenAIUsageTracker struct {
 	mu      sync.Mutex
 	pending []byte
 	res     TapResult
+	err     error
+	failed  bool
+	// Set by Dispatch before reads begin. Raw Chat may pass refusals through.
+	rejectRefusal bool
+	refusalSeen   bool
 }
 
 // Feed consumes one upstream read. Lines are reassembled across reads (the
 // relay buffer has no line alignment). Only complete `data:` lines
-// containing "usage", "content", "reasoning" or [DONE] cost more than a
+// containing "usage", "content", "reasoning", "tool_calls", "refusal", "error" or [DONE] cost more than a
 // prefix scan.
-func (t *OpenAIUsageTracker) Feed(p []byte) {
+func (t *OpenAIUsageTracker) Feed(p []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.err != nil {
+		return t.err
+	}
 	for len(p) > 0 {
 		nl := bytes.IndexByte(p, '\n')
 		end := len(p)
@@ -143,21 +167,19 @@ func (t *OpenAIUsageTracker) Feed(p []byte) {
 			end = nl
 		}
 		if len(t.pending)+end > trackLineCap {
-			t.pending = t.pending[:0] // overlong line: drop, never wedge
-			if nl < 0 {
-				return
-			}
-			p = p[nl+1:]
-			continue
+			t.pending = nil
+			t.err = errSSELineTooLong
+			return t.err
 		}
 		t.pending = append(t.pending, p[:end]...)
 		if nl < 0 {
-			return
+			return nil
 		}
 		t.scanLine(t.pending)
 		t.pending = t.pending[:0]
 		p = p[nl+1:]
 	}
+	return nil
 }
 
 // Result returns the metering state so far. Raw is copied out so the caller
@@ -178,7 +200,9 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	}
 	payload := bytes.TrimSpace(line[len("data:"):])
 	if bytes.Equal(payload, []byte("[DONE]")) {
-		t.res.Terminal = true
+		rejected := t.rejectRefusal && t.refusalSeen
+		t.res.Terminal = !t.failed && !rejected
+		t.res.RejectedComplete = !t.failed && rejected
 		return
 	}
 	if len(payload) == 0 || payload[0] != '{' {
@@ -193,27 +217,53 @@ func (t *OpenAIUsageTracker) scanLine(line []byte) {
 	wantUsage := bytes.Contains(line, []byte(`"usage"`))
 	wantContent := bytes.Contains(line, []byte(`"content"`))
 	wantReasoning := bytes.Contains(line, []byte("reasoning"))
-	if !wantUsage && !wantContent && !wantReasoning {
+	wantTools := bytes.Contains(line, []byte(`"tool_calls"`))
+	wantRefusal := bytes.Contains(line, []byte(`"refusal"`))
+	wantError := bytes.Contains(line, []byte(`"error"`))
+	if !wantUsage && !wantContent && !wantReasoning && !wantTools && !wantRefusal && !wantError {
 		return
 	}
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+				Content          string  `json:"content"`
+				ReasoningContent string  `json:"reasoning_content"`
+				Refusal          *string `json:"refusal"`
+				ToolCalls        []struct {
+					Function struct {
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"delta"`
 		} `json:"choices"`
-		Usage *openAIUsage `json:"usage"`
+		Usage *openAIUsage    `json:"usage"`
+		Error json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &chunk); err != nil {
 		return // malformed event: skip, keep the stream alive
 	}
+	if len(chunk.Error) > 0 && !bytes.Equal(bytes.TrimSpace(chunk.Error), []byte("null")) {
+		t.failed = true
+		t.res.Terminal = false
+		t.res.RejectedComplete = false
+	}
 	for _, ch := range chunk.Choices {
 		t.res.ContentBytes += int64(len(ch.Delta.Content) + len(ch.Delta.ReasoningContent))
+		if ch.Delta.Refusal != nil {
+			t.refusalSeen = true
+			t.res.ContentBytes += int64(len(*ch.Delta.Refusal))
+			if t.rejectRefusal {
+				t.res.Terminal = false
+				t.res.RejectedComplete = false
+			}
+		}
+		for _, call := range ch.Delta.ToolCalls {
+			t.res.ContentBytes += int64(len(call.Function.Arguments))
+		}
 	}
 	if chunk.Usage != nil {
 		t.res.SawUsage = true
-		t.res.Raw = append(t.res.Raw[:0], payload...)
+		t.res.Raw = rawUsageFromPayload(payload, chunk.Usage)
 		t.res.Buckets = domain.UsageBuckets{
 			InputTokens:      chunk.Usage.PromptTokens,
 			OutputTokens:     chunk.Usage.CompletionTokens,
@@ -246,7 +296,7 @@ type anthropicTap struct {
 	res TapResult
 }
 
-func (t *anthropicTap) Feed(p []byte) { /* the translator meters internally */ }
+func (t *anthropicTap) Feed(p []byte) error { return nil /* translator meters internally */ }
 
 func (t *anthropicTap) Result() TapResult {
 	t.mu.Lock()
@@ -286,5 +336,11 @@ func (t *anthropicTap) recordUsage(input, output, cacheRead, cacheWrite *int64, 
 func (t *anthropicTap) markTerminal() {
 	t.mu.Lock()
 	t.res.Terminal = true
+	t.mu.Unlock()
+}
+
+func (t *anthropicTap) markFailed() {
+	t.mu.Lock()
+	t.res.Terminal = false
 	t.mu.Unlock()
 }

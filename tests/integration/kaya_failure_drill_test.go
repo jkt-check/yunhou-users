@@ -248,7 +248,7 @@ func newDrillStackDSN(t *testing.T, fiveHourLimit int64, dsn string) *drillStack
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	resolver := access.NewResolver(store, nil)
-	v1 := engine.Group("/v1", httpapi.APIKeyAuth(resolver, access.NewRPMCounter(nil), 0))
+	v1 := engine.Group("/v1", httpapi.APIKeyAuth(resolver))
 	v1.POST("/chat/completions", httpapi.NewChatCompletionsHandler(gw).Create)
 	st.engine = engine
 	return st

@@ -3,6 +3,7 @@ package quota
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,7 +16,7 @@ import (
 // 评估）与 Task 1 的事务骨架（共享 UnitOfWork 的 Reserve/Release）组装成
 // 一次逻辑调用的额度闸门：
 //
-//   - 一个事务内按固定顺序锁定：账户 →（请求）→ 窗口(five_hour→weekly→
+//   - 一个事务内按固定顺序锁定：账户 → 权益 →（请求）→ 窗口(five_hour→weekly→
 //     monthly) → Key 预算（repo 层实现，控制者裁决）；检查并创建请求/预占，
 //     提交后才允许任何网络调用——绝不持有 DB 事务等待上游（设计 §7.2）。
 //   - 三窗口 + Key 预算同时预占成功才放行；任一失败整个事务回滚，不遗留
@@ -45,9 +46,9 @@ const maxActivationRetries = 5
 type Store interface {
 	Begin(ctx context.Context) (domain.UnitOfWork, error)
 	// ActivateWindowsTx locks the billing account FOR UPDATE (fixed lock
-	// order step 1), reads the entitlement's active windows, persists any
-	// missing window the consumption at At activates, and returns the
-	// resolved window rows (with IDs) per enabled kind.
+	// order step 1), locks and validates the selected entitlement policy,
+	// refreshes live limits and persists any missing activated window.
+	// It returns the resolved window rows (with IDs) per enabled kind.
 	ActivateWindowsTx(ctx context.Context, uow domain.UnitOfWork, cmd ActivateWindowsCommand) ([]domain.QuotaWindow, error)
 	// Reserve atomically applies the four holds and persists the request
 	// (domain.QuotaStore contract, 设计 §7.2).
@@ -63,6 +64,28 @@ type Store interface {
 	// domain.ReserveWalletCommand contract: 账户→钱包固定锁序、派生余额
 	// 检查、赠送先扣拆分、支出上限门控).
 	ReserveWallet(ctx context.Context, uow domain.UnitOfWork, cmd domain.ReserveWalletCommand) (*domain.Admission, error)
+	// ReserveRateTx evaluates the business rate limits (account/policy/key
+	// RPM + the account-level policy TPM) and records the PERSISTENT rate
+	// reservation of the request inside the caller's transaction (Task 4).
+	// The same UnitOfWork as the monetary/concurrency admission: a rate
+	// rejection rolls the whole admission back (no partial effects), and a
+	// failed transaction leaves no rate count behind.
+	ReserveRateTx(ctx context.Context, uow domain.UnitOfWork, cmd domain.RateReserveCommand) error
+	// GetAPIKeyConcurrencyLimitTx reads the customer Key's OWN concurrency
+	// limit inside the caller's transaction (Task 5). 0 = the key sets no
+	// limit (NULL). The limit is a DATABASE fact read at admission time —
+	// exactly like the Key's RPM limit above — so the cap that applies is
+	// always the one in force now, never a stale authentication snapshot.
+	GetAPIKeyConcurrencyLimitTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (int, error)
+	// GetAPIKeyBudgetTx reads the customer Key's OWN cumulative budget
+	// (limit + used) inside the caller's transaction. A nil limit = the key
+	// sets no budget.
+	//
+	// It is the admission's PERMANENT-blocker probe: the budget is
+	// cumulative (never reset by a window), so a budget that cannot cover
+	// the hold is never unblocked by a window reset. The API layer must
+	// know that before it promises a countdown (设计 §9.1).
+	GetAPIKeyBudgetTx(ctx context.Context, uow domain.UnitOfWork, keyID string) (limit *domain.Microcredit, used domain.Microcredit, err error)
 }
 
 // ActivateWindowsCommand is the input of in-transaction window resolution
@@ -72,9 +95,13 @@ type Store interface {
 type ActivateWindowsCommand struct {
 	BillingAccountID string
 	EntitlementID    string
-	Anchor           time.Time
-	At               time.Time
-	Limits           map[domain.WindowKind]domain.Microcredit
+	PolicyVersionID  string
+	// Anchor is kept for command compatibility only: the PostgreSQL store
+	// treats the locked persisted anchor_at as authoritative, so the
+	// in-memory anchor never drives the window start.
+	Anchor time.Time
+	At     time.Time
+	Limits map[domain.WindowKind]domain.Microcredit
 }
 
 // AdmitCommand is one logical call entering the quota gate. The caller
@@ -113,14 +140,20 @@ type AdmissionResult struct {
 	// HoldMicros is the single-consumption safe upper bound mirrored into
 	// every target (三窗口 + Key 预算各镜像一份，客户只结算一次). For
 	// ChargeSource=wallet it is the money hold in WalletCurrency micros.
-	HoldMicros   domain.Microcredit
-	AdmittedAt   time.Time
-	WindowIDs    map[domain.WindowKind]string
-	OutputCap    int64
-	InputBound   int64
-	PolicyID     string
-	PriceID      string
-	AccountLease *domain.ConcurrencyLease
+	HoldMicros domain.Microcredit
+	AdmittedAt time.Time
+	WindowIDs  map[domain.WindowKind]string
+	OutputCap  int64
+	InputBound int64
+	PolicyID   string
+	PriceID    string
+	// Leases are the REQUEST-scoped concurrency leases of this admission:
+	// the billing-account lease (when the selected policy caps account
+	// concurrency) and the per-Key lease (when the customer Key caps its
+	// OWN concurrency). The list is the single source of truth for the
+	// finalizer: it releases ALL of them, whatever their number — never a
+	// hardcoded "two locks" assumption.
+	Leases []*domain.ConcurrencyLease
 	// ChargeSource is the admission-fixed charge source (Task 14); the zero
 	// value means the plan/quota path.
 	ChargeSource domain.ChargeSource
@@ -130,15 +163,51 @@ type AdmissionResult struct {
 	WalletCurrency string
 }
 
+// AccountLease returns the billing-account lease of the admission, or nil
+// when the policy sets no account-level concurrency limit. The per-Key
+// lease (if any) is reachable through Leases.
+func (r *AdmissionResult) AccountLease() *domain.ConcurrencyLease {
+	if r == nil {
+		return nil
+	}
+	for _, l := range r.Leases {
+		if l != nil && l.Scope == domain.LeaseScopeBillingAccount {
+			return l
+		}
+	}
+	return nil
+}
+
+// KeyLease returns the per-Key lease of the admission, or nil when the
+// customer Key sets no concurrency limit.
+func (r *AdmissionResult) KeyLease() *domain.ConcurrencyLease {
+	if r == nil {
+		return nil
+	}
+	for _, l := range r.Leases {
+		if l != nil && l.Scope == domain.LeaseScopeAPIKey {
+			return l
+		}
+	}
+	return nil
+}
+
 // Service is the quota admission orchestrator.
 type Service struct {
 	store Store
 	clock domain.Clock
-	// AccountLeaseTTL is the lifetime of the per-account concurrency lease
-	// taken with each admission when the policy sets a concurrency limit.
-	AccountLeaseTTL time.Duration
+	// RequestLeaseTTL is the lifetime of every REQUEST-scoped concurrency
+	// lease (the billing-account lease and the per-Key lease).
+	RequestLeaseTTL time.Duration
 	// OwnerToken identifies this service instance as lease owner.
 	OwnerToken string
+	// AccountRPM is the GLOBAL per-billing-account requests-per-minute limit
+	// (INFERENCE_ACCOUNT_RPM). It is enforced together with the selected
+	// policy's RPM limit and the customer Key's RPM limit — all three are
+	// hard limits that must hold simultaneously (Task 4). 0 disables the
+	// account-level bucket (the account counter is still kept, so enabling
+	// it later never resets the minute).
+	AccountRPM int
 }
 
 // NewService builds the admission service; a nil clock uses the system
@@ -150,7 +219,7 @@ func NewService(store Store, clock domain.Clock) *Service {
 	return &Service{
 		store:           store,
 		clock:           clock,
-		AccountLeaseTTL: 10 * time.Minute,
+		RequestLeaseTTL: 10 * time.Minute,
 		OwnerToken:      uuid.NewString(),
 	}
 }
@@ -202,6 +271,12 @@ func (s *Service) Admit(ctx context.Context, cmd AdmitCommand) (*AdmissionResult
 		if at.IsZero() {
 			at = s.clock.Now()
 		}
+		// 归一到持久化精度：PostgreSQL 的 TIMESTAMPTZ 只存微秒，准入
+		// 链路上的每一层（窗口解析、纯规则评估、写库）必须共享同一个
+		// 时刻，否则窗口起点与判定用的时刻差开不到 1µs，已激活的窗口行
+		// 匹配不上（重复激活 → 排他约束冲突）。截断在写库前完成：写入的
+		// 五小时窗口起点本身即可精确表示，不依赖数据库如何舍入。
+		at = at.UTC().Truncate(time.Microsecond)
 		res, err := s.admitOnce(ctx, cmd, at, hold, inputBound, outputCap, limits)
 		if err == nil {
 			return res, nil
@@ -223,7 +298,11 @@ func (s *Service) Admit(ctx context.Context, cmd AdmitCommand) (*AdmissionResult
 func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time, hold domain.Microcredit, inputBound, outputCap int64, limits map[domain.WindowKind]domain.Microcredit) (*AdmissionResult, error) {
 	uow, err := s.store.Begin(ctx)
 	if err != nil {
-		return nil, err // fail-closed: storage unavailable → not admitted
+		// fail-closed: storage unavailable → not admitted. The failure is a
+		// SERVICE error (the database is unreachable), never a user quota
+		// exhaustion (设计 §7.2: DB 不可用用明确服务错误).
+		return nil, domain.WrapError(domain.CodeServiceUnavailable,
+			"inference: admission storage unavailable", err)
 	}
 	// Every failure path rolls back: no partial holds survive (设计 §7.2).
 	rollback := func(err error) (*AdmissionResult, error) {
@@ -234,6 +313,7 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	windows, err := s.store.ActivateWindowsTx(ctx, uow, ActivateWindowsCommand{
 		BillingAccountID: cmd.Request.BillingAccountID,
 		EntitlementID:    cmd.Entitlement.ID,
+		PolicyVersionID:  cmd.Entitlement.PolicyVersionID,
 		Anchor:           cmd.Entitlement.AnchorAt,
 		At:               at,
 		Limits:           limits,
@@ -248,7 +328,11 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	// commits. 剩余可用 < 安全预占上界 → quota_exceeded + 缺口信息，不静默
 	// 钳制（设计 §7.2 补充条款）。
 	if err := EvaluateAdmission(cmd.Policy, windows, hold, at); err != nil {
-		return rollback(withDeficit(err, cmd.Policy, windows, hold))
+		// 纯规则只看得见窗口；Key 的累计预算是**永久**阻断项（不按周期
+		// 清零），窗口重置永远解不开它 —— 必须一并报齐，否则 API 层会为
+		// 一个注定失败的请求编造倒计时（设计 §9.1）。
+		return rollback(s.withKeyBudgetBlock(ctx, uow, cmd, hold,
+			withDeficit(err, cmd.Policy, windows, hold)))
 	}
 
 	req := cmd.Request
@@ -263,6 +347,12 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 	req.InputBoundTokens = &inputBound
 	req.OutputCapTokens = &outputCap
 	req.ExtraBounds = cmd.ExtraBounds
+	// The admission-priced monetary upper bound is a DURABLE admission fact
+	// (migration 050): a policy with no monetary window creates no hold row
+	// at all, so the request row is the only place this amount can live. The
+	// crash-recovery estimate settles on it — a consumed request must never
+	// be read as free (设计 §7.2: 永不静默免费).
+	req.ExpectedHoldMicros = &hold
 	holds := make([]domain.HoldSpec, 0, len(windows)+1)
 	windowIDs := make(map[domain.WindowKind]string, len(windows))
 	for _, w := range windows {
@@ -290,6 +380,14 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 		return rollback(err)
 	}
 
+	// 速率闸门（Task 4）：与金额/并发预占**同一个事务**。账户级 RPM（全局
+	// 值）、选中权益策略 RPM、Key RPM 同时满足才放行；策略 TPM 是账户级
+	// 上限（预占 = 输入上界 + 强制输出 cap）。被拒时整笔事务回滚：没有
+	// 任何速率计数残留，金额预占也不会留下。
+	if err := s.reserveRateTx(ctx, uow, cmd.Request, adm.RequestID, cmd.Policy, inputBound+outputCap); err != nil {
+		return rollback(err)
+	}
+
 	result := &AdmissionResult{
 		RequestID: adm.RequestID, HoldMicros: hold, AdmittedAt: at,
 		WindowIDs: windowIDs, OutputCap: outputCap, InputBound: inputBound,
@@ -306,19 +404,65 @@ func (s *Service) admitOnce(ctx context.Context, cmd AdmitCommand, at time.Time,
 			RequestID:  adm.RequestID,
 			OwnerToken: s.OwnerToken,
 			Limit:      *cmd.Policy.ConcurrencyLimit,
-			TTL:        s.AccountLeaseTTL,
+			TTL:        s.RequestLeaseTTL,
 			Now:        at,
 		})
 		if err != nil {
 			return rollback(err)
 		}
-		result.AccountLease = lease
+		result.Leases = append(result.Leases, lease)
+	}
+
+	// Key-scope concurrency lease (Task 5: 每个 Key 的独立并发槽).
+	if err := s.acquireKeyLeaseTx(ctx, uow, cmd.Request, adm.RequestID, at, result); err != nil {
+		return rollback(err)
 	}
 
 	if err := uow.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// acquireKeyLeaseTx takes the per-Key concurrency lease of one admission
+// inside the caller's transaction.
+//
+// The limit is a DATABASE fact read inside this transaction (exactly like
+// the Key's RPM limit): the cap that applies is the one in force at
+// admission time, never a stale authentication snapshot. A key that sets
+// NO limit takes NO lease — a Key limit only narrows the shared account
+// entitlement, it never adds to it, and the account-level (policy) cap
+// still applies on top.
+//
+// A failure here rolls the WHOLE admission back (the account lease, the
+// money holds, the rate reservation and the request row): there is never a
+// reserved-but-unleased half state.
+func (s *Service) acquireKeyLeaseTx(ctx context.Context, uow domain.UnitOfWork, req domain.Request,
+	requestID string, at time.Time, result *AdmissionResult) error {
+	if req.APIKeyID == nil {
+		return nil
+	}
+	limit, err := s.store.GetAPIKeyConcurrencyLimitTx(ctx, uow, *req.APIKeyID)
+	if err != nil {
+		return err
+	}
+	if limit <= 0 {
+		return nil
+	}
+	lease, err := s.store.AcquireLeaseTx(ctx, uow, domain.AcquireLeaseCommand{
+		Scope:      domain.LeaseScopeAPIKey,
+		ScopeID:    *req.APIKeyID,
+		RequestID:  requestID,
+		OwnerToken: s.OwnerToken,
+		Limit:      limit,
+		TTL:        s.RequestLeaseTTL,
+		Now:        at,
+	})
+	if err != nil {
+		return err
+	}
+	result.Leases = append(result.Leases, lease)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +529,10 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 
 	uow, err := s.store.Begin(ctx)
 	if err != nil {
-		return nil, err // fail-closed
+		// fail-closed: storage unavailable → not admitted (service error,
+		// never a user quota exhaustion).
+		return nil, domain.WrapError(domain.CodeServiceUnavailable,
+			"inference: admission storage unavailable", err)
 	}
 	rollback := func(err error) (*AdmissionResult, error) {
 		_ = uow.Rollback(ctx)
@@ -411,6 +558,13 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 		return rollback(err)
 	}
 
+	// 速率闸门（Task 4）：钱包路径与套餐路径**同一组**业务速率限制 ——
+	// PAYG/套餐外不得用钱包绕过 RPM/TPM。与金额冻结同一事务：冻结失败或
+	// 速率被拒都整笔回滚（钱包零扣款、无速率计数残留）。
+	if err := s.reserveRateTx(ctx, uow, cmd.Request, adm.RequestID, cmd.Policy, inputBound+outputCap); err != nil {
+		return rollback(err)
+	}
+
 	result := &AdmissionResult{
 		RequestID: adm.RequestID, HoldMicros: domain.Microcredit(hold.Micros),
 		AdmittedAt: at, OutputCap: outputCap, InputBound: inputBound,
@@ -428,19 +582,73 @@ func (s *Service) AdmitWallet(ctx context.Context, cmd AdmitWalletCommand) (*Adm
 			RequestID:  adm.RequestID,
 			OwnerToken: s.OwnerToken,
 			Limit:      *cmd.Policy.ConcurrencyLimit,
-			TTL:        s.AccountLeaseTTL,
+			TTL:        s.RequestLeaseTTL,
 			Now:        at,
 		})
 		if err != nil {
 			return rollback(err)
 		}
-		result.AccountLease = lease
+		result.Leases = append(result.Leases, lease)
+	}
+
+	// Key 级并发槽（Task 5）：与套餐路径同一机制、同一事务；未设限的 Key
+	// 不取租约（缺省不加 Key 限制）。
+	if err := s.acquireKeyLeaseTx(ctx, uow, cmd.Request, adm.RequestID, at, result); err != nil {
+		return rollback(err)
 	}
 
 	if err := uow.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// reserveRateTx evaluates and records the persistent rate reservation of
+// one admission inside the caller's transaction (Task 4).
+//
+// The limits applied are the GLOBAL account RPM (Service.AccountRPM), the
+// selected entitlement policy's RPM/TPM (a nil limit adds NO limit — an
+// explicit "no limit", never "unlimited by accident") and the customer
+// Key's RPM limit (read from the key row by the store inside the same
+// transaction).
+//
+// reservedTokens is the TPM hold of this request: the admission input
+// bound plus the forced output cap (the same upper bound the monetary
+// reservation prices).
+//
+// T9 运行告警：**限速存储失败**与**限速拒绝**是两件事。存储不可用时准入
+// fail-closed（503 service_unavailable，绝不回退成单机放行），但那是运行
+// 故障、必须有人看见 —— 正常的限速拒绝不是故障，逐条打 ALARM 会把告警
+// 淹没成噪声。因此只有非 rate_limited 的失败才响亮告警。
+func (s *Service) reserveRateTx(ctx context.Context, uow domain.UnitOfWork, req domain.Request,
+	requestID string, policy Policy, reservedTokens int64) error {
+	err := s.store.ReserveRateTx(ctx, uow, domain.RateReserveCommand{
+		RequestID:        requestID,
+		BillingAccountID: req.BillingAccountID,
+		APIKeyID:         req.APIKeyID,
+		PolicyVersionID:  req.PolicyVersionID,
+		Limits:           s.rateLimits(policy),
+		ReservedTokens:   reservedTokens,
+	})
+	if err != nil && domain.CodeOf(err) != domain.CodeRateLimited {
+		log.Printf("ALARM quota: rate limit store unavailable (request=%s account=%s): %v — the admission fails closed (503 service_unavailable; never a single-node fallback)",
+			requestID, req.BillingAccountID, err)
+	}
+	return err
+}
+
+// rateLimits derives the effective business rate limits of one admission.
+// A nil / non-positive policy limit adds NO limit (显式关闭 ≠ 无限额度);
+// the global account RPM keeps its documented disable rule (0 = off).
+func (s *Service) rateLimits(policy Policy) domain.RateLimits {
+	limits := domain.RateLimits{AccountRPM: s.AccountRPM}
+	if policy.RPMLimit != nil && *policy.RPMLimit > 0 {
+		limits.PolicyRPM = *policy.RPMLimit
+	}
+	if policy.TPMLimit != nil && *policy.TPMLimit > 0 {
+		limits.PolicyTPM = *policy.TPMLimit
+	}
+	return limits
 }
 
 // ReleaseAdmission confirms zero upstream consumption and drops every hold
@@ -481,6 +689,52 @@ func withDeficit(err error, p Policy, windows []domain.QuotaWindow, hold domain.
 	}
 	if deficit > 0 && qe.DeficitMicros == nil {
 		d := deficit
+		qe.DeficitMicros = &d
+	}
+	return qe
+}
+
+// withKeyBudgetBlock completes the blocking set of a pure-rule rejection
+// with the customer Key's CUMULATIVE budget.
+//
+// The pure evaluation (EvaluateAdmission) only sees the window constraints.
+// The Key budget is a separate constraint with NO time-based recovery: it
+// is cumulative (budget_micros 永不按周期清零，只在账务更正时回退), so a
+// window reset can never lift it. Without this step the API layer would
+// answer 429 with the window's reset instant for a request that can never
+// succeed — a fabricated countdown (设计 §9.1: 只有全部阻断条件可确定时
+// 才提供可信的重试时刻).
+//
+// The budget is read as a DATABASE fact inside the admission transaction:
+// the same truth the hold itself applies (postgres.Reserve 的条件 UPDATE:
+// budget_used + hold <= budget_limit). A request without a customer Key
+// (the /chat facade) has no Key budget at all — the pure rule's blocking
+// set is already complete for it.
+func (s *Service) withKeyBudgetBlock(ctx context.Context, uow domain.UnitOfWork, cmd AdmitCommand,
+	hold domain.Microcredit, err error) error {
+	var qe *domain.QuotaExceededError
+	if !errors.As(err, &qe) || cmd.Request.APIKeyID == nil {
+		return err
+	}
+	limit, used, perr := s.store.GetAPIKeyBudgetTx(ctx, uow, *cmd.Request.APIKeyID)
+	if perr != nil {
+		// 存储读失败：fail closed（拒绝新推理），绝不把存储故障伪装成额度耗尽。
+		return domain.WrapError(domain.CodeServiceUnavailable,
+			"inference: key budget unavailable", perr)
+	}
+	if limit == nil {
+		// 该 Key 没有预算 → 纯规则给出的阻断集合已经是完整的。
+		return err
+	}
+	shortfall := used + hold - *limit
+	if shortfall <= 0 {
+		// 预算够用 → Key 预算不是阻断项，窗口的恢复时刻仍然可信。
+		return err
+	}
+	qe.KeyBudgetExhausted = true
+	// 缺口：所有阻断约束里最大的那个（窗口与 Key 预算必须同时满足）。
+	if qe.DeficitMicros == nil || *qe.DeficitMicros < shortfall {
+		d := shortfall
 		qe.DeficitMicros = &d
 	}
 	return qe

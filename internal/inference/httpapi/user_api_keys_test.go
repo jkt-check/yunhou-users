@@ -49,7 +49,7 @@ type accessFixture struct {
 //   - /v1 group behind the REAL APIKeyAuth middleware with a probe route
 //     that echoes the resolved principal (Task 8 will replace the probe
 //     with the protocol routes; the auth chain is what this task pins).
-func newAccessFixture(t *testing.T, accountRPM int) *accessFixture {
+func newAccessFixture(t *testing.T) *accessFixture {
 	t.Helper()
 	if testDSN == "" {
 		t.Skip("skip: no postgres available")
@@ -89,7 +89,7 @@ func newAccessFixture(t *testing.T, accountRPM int) *accessFixture {
 	userGroup := engine.Group("/user", middleware.JWTAuth(tokenSvc))
 	httpapi.NewUserAPIKeysHandler(keySvc).Register(userGroup)
 
-	v1 := engine.Group("/v1", httpapi.APIKeyAuth(resolver, access.NewRPMCounter(nil), accountRPM))
+	v1 := engine.Group("/v1", httpapi.APIKeyAuth(resolver))
 	v1.GET("/probe", func(c *gin.Context) {
 		p := httpapi.CallerPrincipalOf(c)
 		if p == nil {
@@ -220,7 +220,7 @@ func (f *accessFixture) createKey(t *testing.T, token string, body map[string]an
 }
 
 func TestUserAPIKeys_LifecycleAndCrossCustomerMatrix(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	userA, tokA := f.addUser(t)
 	_, tokB := f.addUser(t)
 	_ = userA
@@ -336,7 +336,7 @@ func TestUserAPIKeys_LifecycleAndCrossCustomerMatrix(t *testing.T) {
 }
 
 func TestUserAPIKeys_ModelScopeCannotExceedEntitlement(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	userA, tokA := f.addUser(t)
 	f.grantEntitlement(t, userA, "glm-4.6", "deepseek-v4")
 
@@ -364,7 +364,7 @@ func TestUserAPIKeys_ModelScopeCannotExceedEntitlement(t *testing.T) {
 }
 
 func TestUserAPIKeys_MultipleKeysShareOneAccountPool(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	userA, tokA := f.addUser(t)
 	f.grantEntitlement(t, userA, "glm-4.6")
 
@@ -400,7 +400,7 @@ func TestUserAPIKeys_MultipleKeysShareOneAccountPool(t *testing.T) {
 }
 
 func TestV1_KeyAuth_RevokeAndExpiryTakeEffect(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	_, tokA := f.addUser(t)
 
 	probe := func(key string) *httptest.ResponseRecorder {
@@ -472,8 +472,13 @@ func TestV1_KeyAuth_RevokeAndExpiryTakeEffect(t *testing.T) {
 	}
 }
 
-func TestV1_RateLimit_PerKeyAndPerAccount(t *testing.T) {
-	f := newAccessFixture(t, 0)
+// TestV1_AuthLayerOnlyAuthenticates: Task 4 把业务速率限制（RPM/TPM）移到
+// 业务准入（quota.Service.Admit —— PostgreSQL 共享，跨实例/跨 Key/跨
+// /chat 与 /v1）。鉴权中间件只做认证：认证通过的请求**不会**被鉴权层以
+// 速率错误拒绝（速率拒绝由业务准入产生，见 gateway/rate_limits_test.go）。
+// 外围防滥用（每 IP）仍在 /v1 group 之前挂载（router.Setup）。
+func TestV1_AuthLayerOnlyAuthenticates(t *testing.T) {
+	f := newAccessFixture(t)
 	_, tokA := f.addUser(t)
 
 	probe := func(key string) *httptest.ResponseRecorder {
@@ -484,46 +489,22 @@ func TestV1_RateLimit_PerKeyAndPerAccount(t *testing.T) {
 		return w
 	}
 
-	// Per-Key bucket: rpm_limit=2 → the third request is 429 with a
-	// computable Retry-After.
+	// 带 rpm_limit=2 的 Key：鉴权层不再自行扣次（业务准入才限速）。
 	limited := f.createKey(t, tokA, map[string]any{"rpm_limit": 2})
 	lk := limited["key"].(string)
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 5; i++ {
 		if w := probe(lk); w.Code != http.StatusOK {
-			t.Fatalf("request %d: %d", i+1, w.Code)
+			t.Fatalf("request %d: %d (the auth layer must not rate-limit)", i+1, w.Code)
 		}
 	}
-	w := probe(lk)
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("3rd request: %d, want 429", w.Code)
-	}
-	if w.Header().Get("Retry-After") == "" {
-		t.Error("429 without Retry-After")
-	}
-	if !strings.Contains(w.Body.String(), `"rate_limited"`) {
-		t.Errorf("429 body: %s", w.Body.String())
-	}
-}
-
-func TestV1_RateLimit_AccountBucketSharedAcrossKeys(t *testing.T) {
-	f := newAccessFixture(t, 1) // account RPM = 1
-	_, tokA := f.addUser(t)
-	k1 := f.createKey(t, tokA, map[string]any{})["key"].(string)
+	// 另一个 Key 同样只受认证约束。
 	k2 := f.createKey(t, tokA, map[string]any{})["key"].(string)
-
-	probe := func(key string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/v1/probe", nil)
-		req.Header.Set("Authorization", "Bearer "+key)
-		w := httptest.NewRecorder()
-		f.engine.ServeHTTP(w, req)
-		return w
+	if w := probe(k2); w.Code != http.StatusOK {
+		t.Fatalf("second key: %d", w.Code)
 	}
-	if w := probe(k1); w.Code != http.StatusOK {
-		t.Fatalf("first key first request: %d", w.Code)
-	}
-	// The second key draws from the SAME account bucket.
-	if w := probe(k2); w.Code != http.StatusTooManyRequests {
-		t.Fatalf("second key should hit the shared account bucket: %d", w.Code)
+	// 认证失败仍然是 401。
+	if w := probe("yk-invalid-invalid-invalid-invalid-invalid"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid key: %d, want 401", w.Code)
 	}
 }
 

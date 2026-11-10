@@ -560,6 +560,14 @@ Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-
 
 `POST /user/api-keys`（明文仅创建响应出现一次）、`GET`（分页，永不携带明文）、`GET/PATCH /user/api-keys/:id`（`PATCH` 显式 `null` 清除可选约束）、`DELETE`（幂等撤销，下一次 `/v1` 调用即生效）。字段与错误形状见 OpenAPI 文件。
 
+Key 可选约束字段（缺省 = 不加该约束；`PATCH` 缺席 = 不修改；`PATCH` 显式 `null` = 清除；非正整数 400）：
+
+| 字段 | 含义 | 生效点 |
+|---|---|---|
+| `budget_micros` | 该 Key 的套餐 microcredit **子预算**（只收窄共享的账户额度，**不是**现金预算） | 额度准入（金额预占） |
+| `rpm_limit` | 该 Key 每 60 秒的逻辑请求数 | 业务准入（速率闸门） |
+| `concurrency_limit` | 该 Key 的**独立并发上限**（在途请求数） | 业务准入（并发租约，与账户/上游上限同时满足才放行） |
+
 ---
 
 ### 标准协议接口 `/v1/*` — 编程工具接入（Claude Code / Codex 等）
@@ -581,26 +589,169 @@ Coding Plan 是独立于 Kaya 会员的模型 API 商品（`product_code=coding-
 |---|---|---|---|
 | 文本对话（多轮） | ✅ | ✅ | ✅ |
 | 工具调用（自定义 function/custom 工具，ID 逐字保留） | ✅ | ✅ | ✅（`function_call`/`function_call_output`） |
-| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled` | ✅ `thinking.type=enabled`（`budget_tokens` 校验 < `max_tokens` 且 ≥1024） | ✅ `reasoning.effort`（low/medium/high → 开；none/minimal → 关） |
+| 推理开关 | ✅ `thinking_enabled`/`thinking.type=enabled\|disabled` | ✅ `thinking.type=disabled`；❌ 400 `enabled`（本面不产出思考块，见下） | ✅ `reasoning.effort`（`none` 显式关闭） |
+| 推理档位（`reasoning_effort` / `reasoning.effort`） | ✅ `minimal`/`low`/`medium`/`high`/`xhigh`（逐字透传上游；词表外值 400） | n/a（Anthropic 协议无 effort 旋钮） | ✅ `minimal`/`low`/`medium`/`high`/`xhigh`（逐字透传上游；`none` → 关） |
 | 流式 SSE | ✅（`[DONE]` 终止） | ✅（`message_stop` 终止） | ✅（`response.completed`/`response.incomplete` 终止） |
 | 采样参数 | `temperature`/`top_p`/`stop`/`presence_penalty`/`frequency_penalty`/`seed` | `temperature`/`top_p`/`top_k`/`stop_sequences` | `temperature`/`top_p`/`parallel_tool_calls` |
 | `tool_choice` | ✅ OpenAI 全形状 | ✅ `auto`/`any`/`none`/`tool`（`disable_parallel_tool_use` 映射 `parallel_tool_calls=false`） | ✅ `auto`/`none`/`required`/指定 function |
 | 多模态（图片/文件/音频输入或输出） | ❌ 400 | ❌ 400（`image`/`document` 块） | ❌ 400（`input_image`/`input_file` part） |
 | 服务端工具（web_search/computer/bash/code_execution/mcp 等） | ❌ 400（无执行面） | ❌ 400 | ❌ 400（含 `web_search_call` 等结果项与 `item_reference`） |
+| 思考历史回放（`thinking`/`redacted_thinking`/`reasoning` 项） | n/a（`reasoning_content` 逐字透传） | ❌ 400（签名思考无法忠实回放） | ❌ 400（推理项无加密载荷可回放） |
 | `n>1` / logprobs / prediction / 结构化输出（`response_format`、`text.format=json_*`） | ❌ 400 | n/a | ❌ 400 |
 | `background:true` / 非空 `include` / `max_tool_calls` / `truncation:auto` | n/a | n/a | ❌ 400（无异步面/附加数据面；服务端静默裁剪上下文违反不静默原则） |
 
 **多模态现状**：`/v1/*` 对外协议面本期仍显式拒绝多模态 parts（例如 `/v1/chat/completions` 收到 content 数组返回 400 `content arrays (multimodal parts) are not supported; send plain string content`），放开是后续工作。图片输入目前仅在内置 `POST /chat` 面支持（规则与限额见「Chat 接口」章节）。
 
-**接受但不保证生效的字段（已在文档明示，非静默丢弃）**：`metadata`（客户端标记，不消费）、`cache_control`（成本提示，上游不保证生效）、Messages 历史中的 `thinking`/`redacted_thinking` 块（chat 形状上游无回放语义，接受并丢弃；文本与工具调用连续性不受影响）、`tool_result.is_error` 标志（无对应上游字段，错误文本照常传递）、Responses 输入中的 `reasoning` 项（同上，不回放）。模型未声明支持工具/推理时携带对应字段 → 400（先于任何计费）。
+**推理档位与思考回放（T8 能力路由与协议真实性）**
+
+- **显式关闭与省略不同**：Chat 的 `thinking_enabled:false`/`thinking.type=disabled`、Messages 的 `thinking.type=disabled` 和 Responses 的 `reasoning.effort=none` 都保留关闭意图：Chat/Messages 上游收到 `thinking.type=disabled`，Responses 上游收到 `reasoning.effort=none`；省略则不发送开关，保留上游默认。Chat 同时传显式 `reasoning_effort` 时以档位为准，不再发送相冲突的开关。Chat 上游使用既有 DeepSeek 风格扩展，并非所有 OpenAI 兼容服务都支持。
+- **Chat 思考对象先校验再选优先级**：`thinking` 省略或 `null` 均不指定对象；非空值必须是带 `type: enabled|disabled` 的对象。缺失、未知或类型错误的 `type` 明确 400，即使同时提供 `thinking_enabled` 或 `reasoning_effort`。合法对象与布尔开关同时提供时以布尔值为准，显式档位仍优先。
+- **档位逐字保留**：客户端声明的 `reasoning_effort`（chat 面）/ `reasoning.effort`（responses 面）按 `minimal`/`low`/`medium`/`high`/`xhigh` **原样**下传上游，绝不一律折成 `medium`；词表外的值在出站前 400（不静默忽略）。未声明档位而显式开启开关时才用网关的协议默认档（OpenAI Responses 的 `medium`）。`minimal` 是最低**推理档**（OpenAI 语义），不是「关闭推理」—— 只有 `none` 才关闭；这是对旧映射（`minimal` → 关）的兼容性修正。
+- **档位受上游协议能力约束**：路由层按「模型声明 → 路由能力 → adapter 能力」三层一致挑选候选。`anthropic_messages` 协议**没有** effort 旋钮（它的推理旋钮是 `budget_tokens`，另一根轴），因此带档位的请求不会落到 Anthropic 协议的上游；若**没有任何**已发布部署能承载该档位，请求在**准入之前**被明确 400（零预占、零派发）。
+- **思考回放明确 4xx**：Responses 输入里的 `reasoning` 项、Anthropic 历史里的 `thinking`/`redacted_thinking` 块都无法忠实回放（本网关不实现 OpenAI 的加密推理存储，也不承载 Anthropic 的原生签名），因此**明确 400**（原生错误形状、零准入、零派发）。这是对旧「接受后丢弃」行为的**兼容性修正** —— 旧行为会让客户端以为自己的回传内容被送达了。
+- **Messages 面不产出思考块**：Anthropic 的 `thinking` 块必须带上游签发的 `signature`；网关的内部形状承载不了签名，旧实现伪造 `signature: ""` 冒充「可回放的原生签名思考」。现在本面**不渲染**思考块，显式开启 thinking 的请求 400，普通文本/工具流照常可用。要推理请用 `/v1/chat/completions`（`reasoning_content`）或 `/v1/responses`（`reasoning` 摘要）。
+
+**能力路由（模型声明 → 路由能力 → adapter 能力三层一致）**
+
+| 层 | 载体 | 语义 |
+|---|---|---|
+| 模型声明 | `inference_models.input_modalities` | 缺省放行（`["text","image"]`）；显式声明不含 `image` 的模型拒绝带图请求（400，先于准入） |
+| 路由能力 | `inference_model_routes.capabilities` | 空 = 全部能力；非空是**限制性**清单，缺 `image` 的路由不承载带图请求。词表封闭（`tools`/`reasoning`/`image`）：写面与发布闸拒绝词表外的名字，已发布快照里的未知名字被忽略（旧目录仍可加载，存量行不自动改写） |
+| adapter 能力 | `domain.AdapterCapabilities.Images` / `.ReasoningEfforts` | 上游协议能不能表达：不能表达的部署**不参与候选**（不是等出站前才失败） |
+
+因此内置 `POST /chat` 的带图请求只会落到兼容图片的上游协议（`openai_chat` / `anthropic_messages`）；第一候选是不支持图片的 `openai_responses` 时它被**跳过**；而当**没有任何**兼容候选时，请求在准入前被明确 400（零预占、零派发）。纯文本请求的候选集合**不受影响**。
+
+**模型选择器与派发同源**：`GET /chat/models`（以及 legacy `/chat` 的 picker）
+透出的 `input_modalities` 现在是「目录声明 ∩ 派发能力」—— 声明了 `image`
+但已发布部署里没有能承载图片的协议时，列表**不再 advertise image**（否则
+picker 让客户发图、网关在准入前当场 400）。判据与派发共用 routing 的同一个
+能力判定（`routing.CompatibleDeployments`），不另立规则。
+
+**存量路由能力清单被有意收窄（T8）**：路由 `capabilities` 的词表封闭后，
+存量**非空**清单（例如 `["tools","reasoning"]`）里没有 `image` → 不再承载
+带图请求，相应模型也不再 advertise 图片能力。空清单（存量默认）行为不变。
+运营修法见 `docs/runbooks/kaya-coding-plan-operations.md` §`capabilities`。
+
+**上游协议 × 能力（服务端侧：适配器能表达什么）**
+
+| 上游协议 | 文本 | 工具 | 图片 | 思考出站 / 思考回放入站 |
+|---|---|---|---|---|
+| `openai_chat` | ✅ | ✅（`function` 定义） | ✅（`image_url` part 逐字透传） | 出站 ✅（`reasoning_effort` 逐字 / `thinking` 开关）；回放 ✅（`reasoning_content` 逐字透传） |
+| `anthropic_messages` | ✅ | ✅（`custom` 工具） | ✅（`image` 块） | 出站 ✅（`thinking.budget_tokens`；**无档位旋钮**）；回放 ❌ 400（签名/脱敏思考块无法忠实回放） |
+| `openai_responses` | ✅ | ✅（扁平 `function`） | ❌（协议能表达 `input_image`，但本适配器未翻译图片 → 能力路由**跳过**该候选；模型无其它兼容部署时准入前 400） | 出站 ✅（`reasoning.effort` 逐字）；回放 ❌ 400（`reasoning` 项无加密载荷可回放） |
+
+**客户端入口 × 上游协议 × 能力（可执行的支持矩阵）**
+
+矩阵的每一格要么**支持**（200 + 上游真的收到请求），要么**明确拒绝**（协议原生 400 + 零准入 + 零派发）。可执行版本见 `internal/inference/httpapi/t8_capability_matrix_test.go`（`TestCapabilityMatrix_ClientEntryByUpstreamProtocol` 与 `TestCapabilityMatrix_SSETermination`）。
+
+| 客户端入口 | 上游协议 | 文本 | 工具 | 图片 | 思考回放 |
+|---|---|---|---|---|---|
+| `/v1/chat/completions` | `openai_chat` | ✅ | ✅ | ❌ 400（入口是文本子集） | ✅（`reasoning_content` 逐字透传） |
+| `/v1/chat/completions` | `anthropic_messages` | ✅ | ✅ | ❌ 400 | ✅（`reasoning_content` 逐字透传） |
+| `/v1/chat/completions` | `openai_responses` | ✅ | ✅ | ❌ 400 | ✅（`reasoning_content` 逐字透传） |
+| `/v1/messages` | `openai_chat` | ✅ | ✅ | ❌ 400（`image`/`document` 块） | ❌ 400（签名思考） |
+| `/v1/messages` | `anthropic_messages` | ✅ | ✅ | ❌ 400 | ❌ 400（签名思考） |
+| `/v1/messages` | `openai_responses` | ✅ | ✅ | ❌ 400 | ❌ 400（签名思考） |
+| `/v1/responses` | `openai_chat` | ✅ | ✅ | ❌ 400（`input_image`/`input_file` part） | ❌ 400（`reasoning` 项） |
+| `/v1/responses` | `anthropic_messages` | ✅ | ✅ | ❌ 400 | ❌ 400（`reasoning` 项） |
+| `/v1/responses` | `openai_responses` | ✅ | ✅ | ❌ 400 | ❌ 400（`reasoning` 项） |
+| `POST /chat`（Kaya） | `openai_chat` | ✅ | ✅ | ✅ | ✅（`reasoning_content`） |
+| `POST /chat`（Kaya） | `anthropic_messages` | ✅ | ✅ | ✅ | ✅（`reasoning_content`） |
+| `POST /chat`（Kaya） | `openai_responses` | ✅ | ✅ | ❌（该协议不支持图片 → 候选被跳过；模型无其它兼容部署时准入前 400） | ✅（`reasoning_content`） |
+
+矩阵的四个维度还有三条横向约定：
+
+- **SSE 完整结束**：客户端流以**本协议**的终止标记收尾（chat `data: [DONE]`；messages `message_stop`；responses `response.completed`/`response.incomplete`）。
+- **SSE 半截 EOF**：上游流在终止标记之前断开 → 客户端流注入**本协议的**原生错误事件（chat 内联 `{"error":…}`；messages/responses `event: error`），且**绝不**出现终止标记（残缺答案不得被渲染成完整答案）。
+- **多轮工具 + 会话链归属**：工具调用 ID 多轮逐字保留；`previous_response_id` 引用他人/过期/`store:false` 的响应一律 404（`previous_response_not_found`，不泄漏存在性），网关自建 transcript 回放**不含**推理项。
+
+**接受但不保证生效的字段（已在文档明示，非静默丢弃）**：`metadata`（客户端标记，不消费）、`cache_control`（成本提示，上游不保证生效）、`tool_result.is_error` 标志（无对应上游字段，错误文本照常传递）。模型未声明支持工具/推理时携带对应字段 → 400（先于任何计费）。
 
 **用法/用量映射**：Messages 面 `usage.input_tokens` 不含 cache_read（Anthropic 口径），`cache_read_input_tokens`/`cache_creation_input_tokens` 单列；Responses 面 `input_tokens` 含 cached（OpenAI 口径）+ `input_tokens_details.cached_tokens`。流式 `message_start.usage` 是协议占位（0/0），真实值在终止 `message_delta.usage`（含 `input_tokens`，当前 Anthropic SDK 的 `MessageDeltaUsage` 支持该字段）。非流式响应在上游确实未报 usage 时不伪造 usage 字段。
 
+**部分用量**：上游只报告部分计数时，三个入口的口径不同。**Chat** 保留已知字段与显式 `0`，未知主计数或明细字段省略、不补零：上游 `total_tokens` 原样保留，没有报告总量时仅在 input/output 两个主计数都已知且非负、相加不溢出时推导，否则省略。**Messages** 的 `usage.input_tokens` 与 `usage.output_tokens` 恒存在，未知的必填值补 `0`；可选的 `cache_read_input_tokens`/`cache_creation_input_tokens` 未知时仍省略。**Responses** 的 `usage.input_tokens`、`usage.output_tokens`、`usage.total_tokens`、`usage.input_tokens_details.cached_tokens`、`usage.output_tokens_details.reasoning_tokens` 恒存在，未知的必填值补 `0`：可用的上报总量原样保留，否则按公开面（已补零）的 input/output 计数推导，相加溢出或非法时回落为 `0`。Anthropic 上游转 Responses 时，已知 input 加入 cache_read/cache_creation 后按同一规则重新推导总量，未知 input 不由缓存明细补出。无法得到非负 int64 的缓存转换字段在内部保持未知，不截零、不溢出 —— 只有公开面的必填计数回落为 `0`，该 `0` 只表示「未测到」，不能据此断言实际用量为零。仅有总量或缓存明细不能反推计费主计数。Messages 的初始流式 0/0 占位不变，最终用量才是计量事实；上游整体未报 usage 时不伪造 usage 字段；数据库中的未知桶仍为 NULL，金额与 TPM 仅按实际已知桶结算。
+
 **流式中断语义（三协议一致）**：协议终止标记（`[DONE]`/`message_stop`/`response.completed`）是唯一干净结束；上游中断时向流内注入该协议的原生错误事件（chat：内联 `{"error":...}` 块；messages：`event: error`；responses：`event: error`）后结束，**绝不伪造终止标记**。已读用量照常结算（estimated）；未读用量挂起核对（不记零）。
 
-**Responses 会话链（`previous_response_id`）**：成功响应（`store` 缺省 true）持久化截至本轮的完整规范 items transcript + 账户归属 + 实际服务账号（24h TTL，超 512 KiB 的 transcript 不落链）。引用链的请求 = transcript 回放（既有上下文 + 新输入），并经粘性会话绑定钉住同一上游账号；账号失效时显式迁移（旧绑定终止 reason=migrated + 新绑定同事务建立），**绝不静默换号续接**。`store:false` 的响应不落链；引用不存在/过期/他人/`store:false` 的响应一律 404（`previous_response_not_found`，不泄漏存在性）。`GET /v1/responses/{id}`（OpenAI stored-response 读取面）不实现。
+**非流式输出保序**：Anthropic/Responses 上游的非空文本若出现在工具调用之后（如「文本 → 调用 → 文本」或「调用 → 文本 → 调用」），内部 Chat 形状无法忠实保序，三个 `/v1` 推理入口均返回 **502**，不返回改写后的答案，也不持久化 Responses 会话链。OpenAI 错误码为 `upstream_response_invalid`，Messages 使用 `api_error`。这是**已经执行**的请求：已报 usage 按 reported 结算，缺失 usage 按完整输出内容估算，TPM 同步结算；网关不重放、不切换上游。客户端主动重试属于另一次可能计费的调用。文本在调用之前、空文本穿插调用之间仍支持。
+
+**Responses 拒绝与失败输出**：上游 Responses 的 `refusal` 无法忠实映射到内部 Chat 形状，因此明确返回翻译错误，不改为空成功；非流式返回 502，流式返回协议原生错误且不发送成功终态，也不保存响应链。HTTP 200 内的非流式 `status: failed` 同样保留上游响应 ID 和用量证据后返回错误。完整收到的拒绝响应按已报 usage 或实际观察的输出字节估算结算，拒绝文本的累计快照不重复计量；流式错误后继续读取的 usage 保留，但计量来源仍标为 estimated。只有拒绝片段后裸 EOF、且没有 usage 或完成事件时，仍冻结预占并挂起核对，不按零结算、不重放。
+
+**Responses incomplete 原因**：仅 `max_output_tokens` 和 `content_filter` 可忠实转换；`incomplete_details` 或 `reason` 缺失、为 null、空值或未知值时，非流式返回 502，流式只发一次原生错误，不输出成功终态或响应链。已经输出的有效文本不撤回，正常增量中的 `finish_reason:null` 不代表成功结束。终止事件与响应对象的非空 `status` 冲突时也明确拒绝。完整拒绝仍保留响应 ID、用量和输出消费证据，不重放；流式后续 usage 继续计量。若之后发生真正的上游 `error`、失败响应或读取错误，则完整拒绝证据失效，后来的完成事件不能恢复它：无 usage 时仍冻结金额和 TPM 预占、挂起核对，不以零用量结算；已读 usage 则按 estimated 结算。
+
+**Chat 上游拒绝输出**：`openai_chat` 上游的 `message.refusal` / `delta.refusal` 在 `/v1/chat/completions` 与 Kaya `/chat` 保持原样透传，拒绝文本计入缺失 usage 时的输出估算。转换到 `/v1/messages` 或 `/v1/responses` 时无法忠实表示，因此非流式返回 502，流式只发一次原生错误，不发送后续内容或成功终态，也不保存响应链；同一分块内的拒绝在输出该分块内容前判定。空字符串仍表示拒绝，省略或 `null` 不表示拒绝。拒绝后继续读取上游以保留晚到的 usage；完整结束可按已观察输出估算，裸 EOF 且无 usage 时冻结预占并挂起核对。真正的上游错误优先于完成标记，不能被后续 `[DONE]` 改成完整拒绝响应；不自动重放或切换上游。
+
+**工具参数保真**：Responses 的 `function_call.arguments` 原样保留，包括空字符串和截断的 JSON，绝不补成 `{}`；这类无效 JSON 不可作为输入回放，也不落可引用的会话链。有效 `null`、标量和数组仍可在 Responses 中回放。Messages 的历史 `tool_use.input` 必须是完整 JSON 对象，否则入口 400；上游生成的工具参数为空、截断或非对象时，非流式返回 502，流式只发一次原生错误且不发送成功终态，继续读取晚到用量。Messages 同样明确拒绝多 choice 输出，不将不同 choice 的工具索引合并。对象转换保留大整数精度，不经浮点数解析；流式 `content_block_start.input:{}` 只是占位，最终参数以实际片段为准。这些已执行调用保留消费证据、不自动重放；完整拒绝可估算结算，真正的上游错误或裸 EOF 不获得完整拒绝证据。
+
+**Responses 会话链（`previous_response_id`）**：成功响应（`store` 缺省 true）仅在完整规范 items transcript 可忠实回放且不超过 4 MiB 时，持久化截至本轮的 transcript + 账户归属 + 实际服务账号（24h TTL）。若合并后的输入/输出包含无法保序转换的历史，例如工具调用后、工具结果前仍有 assistant 文本，则本轮不落链、不建立新会话绑定；流式输出顺序、成功终态、usage 和结算不变，已有父链不受影响。引用链的请求 = transcript 回放（既有上下文 + 新输入），并经粘性会话绑定钉住同一上游账号；账号失效时显式迁移（旧绑定终止 reason=migrated + 新绑定同事务建立），**绝不静默换号续接**。`store:false`、超限或不可回放的响应均不落链；引用不存在/过期/他人或未落链的响应一律 404（`previous_response_not_found`，不泄漏存在性）。`GET /v1/responses/{id}`（OpenAI stored-response 读取面）不实现。
 
 **限制**：请求体 ≤1 MiB；消息/输入项 ≤512；工具 ≤128（总 ≤256 KiB）；模型 id ≤128 字符。Messages 面 `max_tokens` 必填（Anthropic 语义）。
+
+**业务速率限制（RPM/TPM，跨实例共享）**
+
+推理入口（`/v1/*` 与 `/chat` facade）统一受一组业务速率上限约束。判定发生在**业务准入**里：计数持久在 PostgreSQL，多实例、多 Key、`/chat` 与 `/v1` 共享同一份账户计数（鉴权中间件只做认证，不再自行扣次）。
+
+| 限制 | 口径 | 来源 |
+|---|---|---|
+| 账户 RPM | 每个计费账户每 60 秒的**逻辑请求**数 | `INFERENCE_ACCOUNT_RPM`（全局；0 = 关闭该桶） |
+| 策略 RPM | 同上，取值来自**当前选中的权益策略** | 配额策略 `rpm_limit`（null = 不加该限制） |
+| Key RPM | 每个客户 Key 每 60 秒的逻辑请求数 | Key `rpm_limit`（null = 不加该限制） |
+| 策略 TPM | **账户级**：60 秒窗口内已结算的归一化 token + 全部在途预占 | 配额策略 `tpm_limit`（null = 不加该限制） |
+
+- 三个 RPM 上限是**同时满足**的硬上限；账户级计数**跨 Key、跨 `/chat` 与 `/v1` 共享**；切换套餐（策略版本切换）**不重置**这一分钟的消费。
+- 计数口径：一个**逻辑请求**计 1 次（内部上游重试不重复计）；准入事务失败**不计数**；**准入成功后上游失败仍然计数**。
+- TPM 预占 = 准入的输入上界 + 强制输出 cap；结算按真实/明确估算值校正，**实际超过预占时按实际总量计**（不截到预占值）；长流跨过 60 秒窗口仍保留在途预占（不会因为窗口滚动而释放）。
+- 超限答复：HTTP **429**，错误码 `rate_limited`。它与金额额度耗尽（`quota_exceeded`）**严格分开** —— 充值、切换 PAYG 或套餐外消费**不能**绕过速率限制。`Retry-After` 仅在**每个**阻断约束都有可确定恢复时刻时返回（因在途 TPM 等无法确定的场景不编造倒计时）。
+- `GET /v1/models`、`GET /chat/models` 不进入业务准入，**不占用** RPM/TPM（外围每 IP 防滥用保护仍在）。
+- 认证失败、模型未授权、请求形状非法的请求**不进入**业务准入（不占额度）。
+- 数据库不可用时网关 **fail closed**：拒绝新的推理请求并返回 HTTP **503** `service_unavailable` —— 绝不会伪装成"额度耗尽"。
+
+**`/v1/*` 的错误形状（协议原生，绝不套管理 envelope）**
+
+`/v1/*` 的每个入口按**它自己说的协议**渲染错误；通用中间件（外围每 IP 防滥用桶）也遵守同一约定 —— 它拒绝请求时给的是协议原生形状，不是 `{code,data,message}` 管理 envelope。
+
+| 入口 | 错误形状 | 429 的业务区分落在哪 |
+|---|---|---|
+| `POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models` | OpenAI 原生 `{"error":{"message","type","code"}}` | `error.code`：`rate_limited`（业务速率）/ `quota_exceeded`（额度耗尽）/ `insufficient_balance`（余额或支出上限不足）/ `insufficient_capacity`（并发上限已满）；`error.type` 恒为 `rate_limit_error` |
+| `POST /v1/messages` | Anthropic 原生 `{"type":"error","error":{"type","message"}}` | Anthropic 原生形状**没有 code 字段**：业务区分落在 `error.message`（`rate limit exceeded: blocked by …` / `quota exceeded: blocked by …` / `… at concurrency limit …`），`error.type` 恒为 `rate_limit_error` |
+
+- **外围每 IP 防滥用桶**（60 次/秒，突发 120）挂在 `/v1` group 外层：它的拒绝同样是协议原生形状（`rate_limit_error` / `rate_limited`），带 `Retry-After`，且发生在鉴权与准入之前 —— 客户端只会看到这个答复，请求从未出站、零计费。
+- **`Retry-After` 只在每个阻断条件都有可确定恢复时刻时给出**（设计 §9.1：未知恢复不能编造倒计时）。已知的两种"不可确定"：账户级 TPM 被**在途**预占卡住（真实消耗未知）；Key 的**累计预算** `budget_micros` 耗尽 —— 它不按周期清零，**窗口重置永远解不开它**，因此它与窗口同时阻断时答复**不带** `Retry-After`（错误 message 会点名 `key budget exhausted`）。
+- 三类限制的错误码严格分开：业务速率 `rate_limited`、金额额度 `quota_exceeded`（含余额/支出上限不足 `insufficient_balance`）、并发 `insufficient_capacity`。充值/切换 PAYG/换套餐只能解开**金额**那一类；速率与并发限制花钱也解不开。
+
+**Key 级并发限制（`concurrency_limit`，跨实例共享）**
+
+客户可以在 `/user/api-keys` 为**每个 Key** 单独设一个并发上限（`concurrency_limit`）；它与上面的速率限制是**两套独立闸门**，但共享同一个准入事务。
+
+| 限制 | 口径 | 来源 |
+|---|---|---|
+| 账户并发 | 每个计费账户的在途请求数 | 权益策略 `concurrency_limit`（null = 不加该限制） |
+| Key 并发 | **每个客户 Key** 的在途请求数 | Key `concurrency_limit`（null = 该 Key 不额外限制） |
+| 上游账号并发 | 每个上游账号的在途请求数 | 上游账号 `concurrency_limit`（0 = 备而不用） |
+
+- 三个上限**同时满足**才放行；Key 上限**只收窄**共享的账户权益，**绝不放宽**账户级上限。账户上限还有余量、但该 Key 的槽位已满时，请求同样被拒。
+- 计数与占槽持久在 PostgreSQL（`inference_concurrency_leases`），多实例共享；上限在**准入事务内**读取并加锁 —— 抢不到槽位就**整笔回滚**（不留请求行、不留金额/速率预占）。
+- 超限答复：HTTP **429**，错误码 `insufficient_capacity`（与 `rate_limited`、`quota_exceeded` 严格分开）。
+- 槽位在请求**终态化之后**释放（结算/释放先于放锁）：流式、非流式、客户端断开、失败切换与 panic 路径都不残留占槽；进程崩溃时由租约 TTL 回收，槽位不会永久冻结。
+- 字段语义（与 `rpm_limit` 同构）：创建时缺省 = 不加限制；`PATCH` 缺席 = 不修改；`PATCH` 显式 `null` = 清除；非正整数一律 400。
+- Key 的 `budget_micros` 仍**只**表示套餐 microcredit 子预算，与本并发上限无关，也不构成现金预算。
+
+**目录配置错误（503，非客户端错误）**
+
+已发布目录里可能残留**未实现**的配置。这类配置「可读但不可用」：旧的已发布
+版本仍能被加载（否则整个目录变砖），但相关路由被标记为不可调度 —— 绝不静默
+当成已实现的策略。
+
+| 情形 | 客户看到的 | 是否计费/出站 |
+|---|---|---|
+| 模型的**全部**路由都带着未实现的 `pool_strategy`（`least_loaded` / 通用 `session_sticky`；常规池只支持 `round_robin`） | HTTP **503** `upstream_unavailable`（Anthropic 面为 529 `overloaded_error`），message 点名路由与替代配置 | 零预占、零出站、零计费（失败发生在业务准入之前） |
+| 模型的**部分**路由带着未实现的 `pool_strategy` | 正常服务（只用支持集内的路由），运维侧收到告警 | 正常计费 |
+| 当前权益策略仍带未实现的 `overage_policy=clamp_if_declared` | HTTP **503** `service_unavailable`，message 点名策略名与版本 | 零预占、零出站、零计费 |
+
+这两种 503 都是**服务端配置问题**，不是额度、不是速率、不是客户端请求形状问题
+（客户端请求合法）。客户端 SDK 看到 503/529 的常规退避重试是安全的，但重试在
+运营修好目录并重新 publish 之前不会成功 —— 运营侧的修法见
+`docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」。
 
 **WebSocket**：不实现 —— 目标接入（Claude Code / Codex）均走 HTTP SSE，无 WebSocket 需求。
 
@@ -613,6 +764,8 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 - 要求 JWT 认证（与 `/user/*` 同级，引擎级挂载在 `POST /chat`）；
 - 要求有效订阅：订阅未过期、Plan 处于激活态且 `plan.apps` 包含 JWT 的 `app_id`（与登录时 `has_access` 同一判定矩阵），否则 403；
 - 独立限流桶 10 次/秒、突发 20（按 IP，与其他接口桶隔离）；
+- 受与 `/v1/*` **同一组**业务速率限制（账户/策略/Key 的 RPM 与账户级 TPM，跨实例共享；见「标准协议接口」章节的表格）—— 套餐、PAYG 与套餐外三条扣费路径适用同一组限制；
+- 受**同一组**业务并发限制（账户级权益策略并发上限 + 上游账号并发，跨实例共享）；`/chat` 以用户 JWT 调用、**没有客户 Key**，因此不存在 Key 级并发上限（Key 级上限只作用于 `/v1/*` 的客户 Key）；
 - 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` 时整体返回 404（未启用）。
 
 #### POST /chat
@@ -635,7 +788,7 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 | `model` | 否 | 逻辑模型 ID（≤64 **字节**），取值来自 `GET /chat/models` 返回的 `id`。省略时使用目录的默认模型（`default_model`）；旧客户端不传该字段行为不变 |
 | `session_id` | 否 | 会话标识（≤64 **字节**），仅用于服务端访问日志按会话分组，不参与任何业务逻辑 |
 | `tools` | 否 | OpenAI 兼容的 function/tool schema 数组，原样透传到上游 `tools` 字段；服务端不解析内容，只限制条数与总大小。省略即为纯对话 |
-| `thinking_enabled` | 否 | 布尔值；为 `true` 时请求启用上游推理模式，行为取决于所选模型的 provider 协议——OpenAI 协议原样下发 `thinking: {"type": "enabled"}`（不支持该字段的 provider 可能 400 → 客户端收到 502）；Anthropic 协议映射为扩展思考（`budget_tokens=4096`，`max_tokens` 下限相应抬高）。省略/`false` 时不下发。开启后响应 chunk 的 `delta` 中可能出现 `reasoning_content` 字段（两种协议都会产出），客户端不展示时可安全忽略 |
+| `thinking_enabled` | 否 | 布尔值；`true` 请求启用推理，`false` 显式关闭，省略保留上游默认值。Chat 上游使用 DeepSeek 风格 `thinking: {"type": "enabled" \| "disabled"}`（不支持该扩展的 provider 可能 400 → 客户端收到 502）；Anthropic 上游使用同名开关，开启时默认 `budget_tokens=4096`，预算必须小于输出 cap，不够时明确拒绝而不抬高 cap；Responses 上游映射为 `reasoning.effort=medium` / `none`。开启后 chunk 的 `delta` 可能出现 `reasoning_content`，客户端不展示时可忽略 |
 
 **图片输入（多模态）**：`messages[].content` 除纯字符串外，还接受 OpenAI 兼容的 parts 数组——`[{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"..."}}]`，`text` 与 `image_url` 可任意混排（parts 中的文本拼接后与字符串 content 同等计量与审计）。规则：
 
@@ -643,7 +796,10 @@ Chat 代理接口让消费端（如 kaya）**无需配置任何 LLM Key** 即可
 - `image_url.url` 支持两种形态：`https?://` 公网 URL（**原样透传**给上游模型，本服务不抓取、不代理，URL 可达性由上游保证）或 `data:image/<type>;base64,...` 内联数据；
 - data URI 声明的类型限 `image/png` / `image/jpeg` / `image/jpg` / `image/gif` / `image/webp`，且解码后的 magic bytes 必须与声明类型一致（不一致 → 400，防止以图片名义夹带任意字节）；
 - 数量与大小按 **wire 字节**计（data URI 即 base64 字符数，URL 即字符数）：每请求 ≤4 张、单张 `image_url` ≤1 MiB、全部图片合计 ≤3 MiB；
-- 所选模型显式声明为纯文本（目录 `input_modalities` 不含 `"image"`，如 `["text"]`）时携带图片 → 400 `the selected model does not support image input`（先于任何上游调用，不产生计费）。未声明 `input_modalities` 的模型**缺省放行**图片（等效 `["text","image"]`）；其上游若无视觉能力会在上游报错（表现为 502），属预期暴露。客户端用 `GET /chat/models` 返回的 `input_modalities` 判定哪些模型允许发图。
+- 所选模型显式声明为纯文本（目录 `input_modalities` 不含 `"image"`，如 `["text"]`）时携带图片 → 400 `the selected model does not support image input`（先于任何上游调用，不产生计费）。未声明 `input_modalities` 的模型**缺省放行**图片（等效 `["text","image"]`）。客户端用 `GET /chat/models` 返回的 `input_modalities` 判定哪些模型允许发图。
+- **能力路由（T8）**：带图请求只会落到**能表达图片**的上游协议（`openai_chat` / `anthropic_messages`）；不支持图片的协议（`openai_responses`）即使排在故障转移顺序的第一位也会被**跳过**。若该模型的**全部**已发布部署都不兼容图片，请求在**准入之前**被明确 400（零额度预占、零速率计数、零派发、零上游字节），而不是先占额度再失败。
+- **图片 token 是估算，不是通用上界**：准入按每张图 1105 token（OpenAI high-detail 最坏情形 85 + 170×6 tiles）**预留**额度，结算以**上游真实上报**的 usage 为准（`source=reported`）；只有上游确实没报 usage 时才走估算路径（`source=estimated`，可被后续真实证据更正）。1105 **不是**对所有模型/供应商成立的数学硬上界 —— 视觉 token 的计费口径由供应商定义（分块、缩放、是否计入缓存/推理桶各不相同），同一张图在不同供应商的计量可相差数倍。本网关**无法**校验供应商的视觉口径，只能如实转述其上报值（未解决的供应商计量边界见验证 runbook 的 T8 记录）。
+- **审计与日志**：图片 base64 永远不进审计行、错误文案或日志（`ChatMessage.ContentParts` 带 `json:"-"`，审计只落拼接后的文本）；错误与日志不含用户完整对话。
 
 **限制**（超出返回 400）：请求体整体 ≤8 MiB；1–20 条消息；每条 `content` ≤4 MiB 字节（`len()` 字节数，CJK 每字约 3 字节；parts 数组按拼接后的文本计），其中 `system` 消息走独立上限 ≤32768 字节；全部消息总字节数 ≤4 MiB。`content` 一般非空，例外：`role=tool` 与携带 `tool_calls` 的 `assistant` 轮允许空 content。`tools` 至多 16 个、总序列化大小 ≤32 KiB，且每个元素必须是 JSON 对象。图片限额见上文「图片输入」段。
 
@@ -705,10 +861,17 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 | 404 | `chat is not enabled` | 服务端未配置 `LLM_PROVIDERS_JSON` 且未配置 `DEEPSEEK_API_KEY` |
 | 429 | `too many requests` | 触发每 IP 限流桶（10 次/秒，突发 20） |
 | 429 | `chat upstream rate limit exceeded` | 上游限流——该 provider 所有可用 key 均被上游限流（冷却中的 key 仍会被取出尝试，返回 429 即最后一次尝试仍被上游 429） |
+| 429 | `chat request rejected by a usage limit (rate_limited)` | **本地**业务速率限制（账户/策略/Key 的 RPM 与账户级 TPM）：请求**从未出站**，充值/切换 PAYG 不能绕过 |
+| 429 | `chat request rejected by a usage limit (insufficient_capacity)` | **本地**并发上限已满（账户级权益策略上限；`/chat` 以用户 JWT 调用，无 Key 级上限）——正确处理是等待在途流结束 |
+| 429 | `chat request rejected by a usage limit (quota_exceeded)` | **本地**额度耗尽（套餐三窗口 / Key 预算耗尽）：请求从未出站 |
+| 429 | `chat request rejected by a usage limit (insufficient_balance)` | **本地**余额/支出上限不足（钱包门控）：请求从未出站 |
 | 502 | `chat request rejected by upstream` | 上游 4xx（非 429）拒绝请求——重试同样的请求必败，但改写请求后可能成功。此时 `data` 不为 null，携带结构化上游信息：`upstream_status`（真实上游状态码）、`upstream_code`（归一化分类：`context_length_exceeded` 上下文超长 / `content_filter` 内容审核拦截 / `insufficient_balance` 上游余额不足 / `invalid_request` 其他请求问题）、`upstream_message`（脱敏截断后的上游错误消息，约 300 字节） |
 | 502 | `chat upstream error` | 上游 5xx 或网络错误（该 provider 所有可用 key 均已尝试） |
+| 503 | `chat configuration unavailable` | **服务端配置**不可用：已发布目录里该模型没有可调度路由（例如其路由带着未实现的 `pool_strategy`），或当前权益策略带未实现的 `overage_policy=clamp_if_declared`。请求从未出站、不计费；**不带 `Retry-After`** —— 配置不会自愈，重试没有意义（运营修好目录并重新 publish 后恢复，见 `docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」） |
 
-**客户端重试指引**：400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试；502 `chat request rejected by upstream` → 按 `data.upstream_code` 分类处理：`context_length_exceeded` → 裁剪会话历史后重试（改写后的请求可能成功）；`insufficient_balance` / `content_filter` / `invalid_request` → 原样重试必败，需引导用户调整；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
+**客户端重试指引**：503 `chat configuration unavailable` → **不要重试**（服务端配置问题，重试不会自愈；见 `docs/runbooks/kaya-coding-plan-operations.md`「配置支持集（T7）」）；400 → 修正请求体后再试（不要原样重试）；429 → 指数退避重试（**例外**：`chat request rejected by a usage limit (insufficient_capacity)` 与 `too many concurrent chat streams` 的正确处理是**等待在途流结束**，`(quota_exceeded)` / `(insufficient_balance)` 需要充值或换套餐，原样重试必败）；502 `chat request rejected by upstream` → 按 `data.upstream_code` 分类处理：`context_length_exceeded` → 裁剪会话历史后重试（改写后的请求可能成功）；`insufficient_balance` / `content_filter` / `invalid_request` → 原样重试必败，需引导用户调整；502 `chat upstream error`、流内 `{"error":...}` 事件、缺少 `[DONE]` 的流结束 → 可安全重试（服务端无状态，重试是一次独立的新调用）。
+
+**本地限制与上游 429 的区分**：`chat upstream rate limit exceeded` 指**上游**返回 429（请求已出站）；`chat request rejected by a usage limit (<业务码>)` 指**本地**闸门（业务速率 / 并发 / 额度 / 余额）在准入阶段拒绝，请求**从未出站**、不计费。两者都是 429，客户端都应退避重试，但只有后者需要充值/换套餐/等待在途流结束。`/chat` 保留既有 `{code,data,message}` envelope；业务码出现在 `message` 里（envelope 没有独立的符号码字段）。
 
 **超时与审计**：本接口豁免全局 20s 请求超时（流式回答可能超过）；服务端上游超时上限 15 分钟，订阅门禁的 DB 查询另有 10s 上限。Anthropic 协议模型的输出强制封顶 8192 token（超出时上游以 `finish_reason=length` 截断）；OpenAI 协议模型按目录设计不携带 `max_tokens`（该字段仅发 Anthropic provider），输出长度由上游默认行为决定。单用户并发流式请求上限 8 条，超限返回 429（`too many concurrent chat streams`）——此类 429 的正确处理是**等待在途流结束**，与速率限制 429 的退避重试不同。配置 `CHAT_LOG_PATH` 后，每次请求（成功、失败、客户端中途断开、上游中断）都会在该文件追加一行 JSON 审计日志，含 `user_id`、`app_id`、`session_id`、输入 `messages`、解析后的 `output` 文本、`status`（`ok` / `error` / `disconnected` / `upstream_error`）、上游 4xx 拒绝时的 `upstream_status` / `upstream_code`（与错误响应 `data` 中的分类一致，用于事后统计错误分布）、输入输出字节数（`input_bytes` / `output_bytes`，均为截断前的真实长度）与耗时。所有行的输入都按每条消息 1 KiB 截断（`input_truncated` 标记；2026-10 前仅错误行截断），`output` 封顶 64 KiB（`output_truncated` 标记）。文件以 0o600 权限打开（对话内容属 PII）；`ops/logrotate.conf` 已默认带该文件（`/var/log/yunhou/chat-access.log`）的轮转段——若 `CHAT_LOG_PATH` bind-mount 到其他路径，需同步调整该配置。
 
@@ -723,8 +886,8 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
   "code": 0,
   "data": {
     "models": [
-      {"id": "deepseek-flash", "display_name": "DeepSeek Flash", "provider": "deepseek", "default": true, "input_modalities": ["text"]},
-      {"id": "kimi-k3", "display_name": "Kimi K3", "provider": "kimi", "default": false, "input_modalities": ["text", "image"]}
+      {"id": "deepseek-flash", "display_name": "DeepSeek Flash", "provider": "deepseek", "default": true, "input_modalities": ["text"], "supports_images": false, "supports_tools": true, "supports_thinking": false, "context_tokens": 128000, "max_output_tokens": 8192, "capability_description": "images: no; tools: yes; thinking: no; context: 128000 tokens; max output: 8192 tokens"},
+      {"id": "kimi-k3", "display_name": "Kimi K3", "provider": "kimi", "default": false, "input_modalities": ["text", "image"], "supports_images": true, "supports_tools": true, "supports_thinking": true, "context_tokens": 200000, "max_output_tokens": 16384, "capability_description": "images: yes; tools: yes; thinking: yes; context: 200000 tokens; max output: 16384 tokens"}
     ]
   }
 }
@@ -737,8 +900,24 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 | `provider` | 所属 provider 名（目录中的 key，仅供展示） |
 | `default` | 是否为目录默认模型（`POST /chat` 省略 `model` 时使用） |
 | `input_modalities` | 模型生效的输入模态（`["text"]` 或 `["text","image"]`）；目录未配置时按 `["text","image"]` 透出（缺省放行）。picker 据此决定是否允许发图——不含 `"image"` 的模型带图调用会被 400 拒绝 |
+| `supports_images` | **能否承载图片输入**：模型声明接受图片 **且** 有一条已发布部署（路由能力清单覆盖 `image`、协议适配层承载图片）。这是**派发判定**，不是声明复读 |
+| `supports_tools` | **能否承载带工具的请求**：模型条目声明支持工具 **且** 有一条已发布部署（路由能力清单覆盖 `tools`、协议适配层承载工具）。这是**派发判定**，不是声明复读 |
+| `supports_thinking` | **能否承载带推理的请求**：模型条目声明支持推理 **且** 有一条已发布部署（路由能力清单覆盖 `reasoning`、协议适配层承载推理）。这是**派发判定**，不是声明复读 |
+| `context_tokens` | 上下文硬上限（目录条目上的准入强制值） |
+| `max_output_tokens` | 输出硬上限（目录条目上的准入强制值；实际输出上限 = min(客户端声明, 该值)） |
+| `capability_description` | 同一组结论的人话版本（给人看；机器读上面的字段） |
 
-错误：401（未携带/无效 JWT）、403（无有效订阅）、404（chat 未启用，同 `POST /chat`）。
+**能力字段的口径（T9）**：它们是**模型声明 ∧ 已发布路由能力 ∧ 协议适配层
+能力**的三方交集，不是模型条目的自我声明复读。因此：
+
+- 一个只有 `openai_responses` 部署的模型 `supports_images` 恒为 `false`
+  （该协议的适配层不承载图片）—— 绝不会声明超过入口能力；
+- 路由的 `capabilities` 清单收窄（存量非空清单常常不含 `image`）时，
+  带图请求会在**准入前**被 400 拒绝，模型也就不会被声明成能收图；
+- `GET /v1/models` 保持**原生基本形状**（OpenAI `object=list`），**不带**
+  这些能力字段 —— 标准协议面不扩展。
+
+错误：401（未携带/无效 JWT）、403（无有效订阅）、404（chat 未启用，同 `POST /chat`）、503（目录冷启动无已验证快照，`Retry-After: 5`）。
 
 #### 运营侧：多模型目录配置（LLM_PROVIDERS_JSON）
 
@@ -776,7 +955,7 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"
 - **Key 池**：每个 provider 的 `api_keys` 组成轮询池；某 key 收到 429/5xx 后冷却 60s；池内 ≥2 个可用 key 时，单个 key 的临时失败会**透明换 key 重试一次**。全部 key 冷却中对客户端返回 429 `chat upstream rate limit exceeded`。
 - **计量**：每次请求结束后写入 `llm_usage_events` 表（user/app/模型/token 数/成本，迁移 022）；聚合查询走内部接口 `GET /admin/stats/llm-usage`（详见「管理接口」章节的正式文档），按模型分组返回 token 与成本合计。上游不返回 usage 的 provider 记为 0 token（行仍会写入）。
 - **按 Plan 限制可用模型**：`plans.chat_models` 列为白名单（NULL/空 = 放开全部目录模型）。示例：`UPDATE plans SET chat_models = '{deepseek-flash,kimi-k3}' WHERE id = 'monthly';`
-- **网关部署（`INFERENCE_KAYA_CHAT_GATEWAY=1`）的模态不在 env 里配**：缺省即放行图片；要关闭某模型的视觉，用 `PATCH /admin/models/:id` 的 `input_modalities` 字段（需 `models:manage` 权限）设为 `["text"]` 后 `POST /admin/catalog/publish` 发布目录版本生效；`/chat/models` 与 `/chat` 的视觉门控都读已发布快照，空值按缺省放行（`["text","image"]`）。**协议约束：`openai_responses` 协议的部署不接受图片**——带图请求会被适配层显式拒绝（`InvalidInput`，绝不静默丢弃图片），视觉模型只能部署在 `openai_chat` / `anthropic_messages` 协议的部署上。
+- **网关部署（`INFERENCE_KAYA_CHAT_GATEWAY=1`）的模态不在 env 里配**：缺省即放行图片；要关闭某模型的视觉，用 `PATCH /admin/models/:id` 的 `input_modalities` 字段（需 `models:manage` 权限）设为 `["text"]` 后 `POST /admin/catalog/publish` 发布目录版本生效；`/chat/models` 与 `/chat` 的视觉门控都读已发布快照，空值按缺省放行（`["text","image"]`）。**协议约束：`openai_responses` 协议的部署不接受图片**——该协议在能力路由层被**跳过**（带图请求不会落到它身上，绝不静默丢弃图片），视觉模型只能部署在 `openai_chat` / `anthropic_messages` 协议的部署上；若某模型的**全部**部署都是 `openai_responses`，带图请求在准入前被明确 400（零预占、零派发）。
 
 ---
 
@@ -1419,6 +1598,190 @@ LLM token 计量聚合，基于 `llm_usage_events` 表（每次 `/chat` 上游�
 | `cost_micros` | 区间成本合计，**单位微元（1e-6 CNY）**——`cost_micros ÷ 1000000` 即为人民币元数 |
 
 以上统计接口的参数错误均返回 400（message 带具体原因），日期格式为 YYYY-MM-DD，`granularity` / `group_by` 为白名单枚举。
+
+---
+
+### 模型路由部分更新（`PATCH /admin/routes/:route_id`）
+
+需要同一 app 的人员 JWT 与内部服务凭据，角色具备 `models:manage`。
+只覆盖请求中提供的字段（`priority`、`weight`、`capabilities`、
+`pool_strategy`、`enabled`）；省略或 `null` 保持原值，显式 `0`、`false`、`[]`
+不被忽略，仍须通过字段校验（如 `weight>0`）。`capabilities=[]` 表示不收窄
+能力；模型和部署不可通过此端点改绑。
+
+`updated_at` 必须使用读取路由所得的非零版本，完整保留时间精度；
+`reason` 必须非空且不能只有空白。缺失/零版本为 400，过期版本为 409，
+失败不改路由和审计。成功返回完整路由及新版本，目录发布后才影响新请求。
+
+```json
+{"weight":5,"updated_at":"2026-11-09T08:00:00.123456Z","reason":"调整候选排序"}
+```
+
+运营授权的 `POST /admin/operators` 同样要求非空 `reason`、有效 UUID
+`user_id` 和受支持的 `role`；非法输入在授权或审计写入前以 400 拒绝。
+
+### 结算证据更正（`POST /admin/model-requests/:id/corrections`）
+
+需要同一 app 的人员 JWT、内部服务凭据及 `billing:adjust` 权限（现有角色中
+仅 admin 具备，operator / auditor 不具备）。只更正已结算请求，不替代付款、
+充值、退款或人工账户补偿。
+
+```json
+{
+  "attempt_id": "9df8fb9a-2175-46df-8736-899f3d6b7077",
+  "buckets": {
+    "input_tokens": 70,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "output_tokens": 20,
+    "reasoning_tokens": 5
+  },
+  "extras": {},
+  "evidence_ref": "provider-report:123",
+  "reason": "核验供应商用量报告",
+  "idempotency_key": "correction-report-123"
+}
+```
+
+`attempt_id` 必须属于该请求，且已有该请求的结算用量记录；同请求中未结算的重试
+attempt 也拒绝。四个计费 token 桶必须全部显式提供（含零），
+且已归一化为互不重叠的输入、缓存读、缓存写、输出；可选 reasoning 必须
+非负且不超过 output，包含在 output 内，不再额外相加。禁止负数、小数、
+溢出、未知字段或调用方指定金额。`extras` 必须显式覆盖请求历史价格中的
+所有计价维度及准入声明的维度，含零；未知维度即使为零也拒绝。实际证据
+可超过原预占上界，不能截断为预占值。
+
+`evidence_ref` 是运营核验后的证据定位引用，不应放入提示词、响应正文或
+访问凭据；`reason` 和 `idempotency_key` 必须非空。此入口信任有权限的人员
+提交的证据，不自动向供应商拉取或验证报告。服务端只按该请求固定的历史
+价格计价，新目录价格不影响旧请求；原计费单位、钱包币种不能由调用方改写。
+
+成功 201：
+
+```json
+{"code":0,"data":{"request_id":"<uuid>","amount_micros":"110","unit":"microcredit","currency":"","source":"reported"}}
+```
+
+钱包返回 `unit:"micromoney"` 及原钱包币种。金额使用十进制字符串。非法证据
+为 400，权限不足为 403，不属于请求或没有结算用量的 attempt、无实际更正均为
+400；请求未结算或重复幂等键为 409；不存在的请求为 404。历史钱包调整及配对
+账本不一致时以 409 拒绝继续更正，等待核对。失败不产生部分更正。
+
+金额、reported usage revision、TPM、核对任务、幂等收据和
+`settlement.correct` 人员审计在同一事务提交。金额不变但 token 或用量来源
+变化仍可更正，不生成零额财务分录；TPM 保持原结算时间，不重新制造当前分钟
+消费。钱包按原冻结的 bonus-first 组成追加各来源净差额分录，原 charge /
+consume / hold 不改写；不更改套餐窗口或 Key 金额预算。钱包月消费归入原结算
+月份，次月补偿会修订历史月消费，不释放无关的本月消费额度。
+
+### 目录发布与上游探测（`/admin/catalog/publish`、`/admin/deployments/:id/probe`）
+
+模型目录的**发布预演**与**上游连通性探测**是同一组运营面：预演给出「这次
+发布会让什么生效、上游通不通、有哪些可判定的问题」，探测给出「这一条部署
+的上游现在通不通」。两者都**只读**：零写库、零审计事件。
+
+#### POST /admin/catalog/publish?dry_run=1
+
+`?reason=` 必填（审计）；`?dry_run=1` 是**预演**（不带 `dry_run` 就是正式
+发布，正式发布**不跑任何探测**、**不引入网络依赖**）。
+
+预演与正式发布**共用同一套抽取与校验、同一事务快照**，差别只有「写不写库」。
+草稿里**不支持**的配置（不在支持集的 `pool_strategy`、词表外的路由
+`capabilities`）由**发布闸**拒绝：预演与正式发布给出**同一个错误**（点名
+对象 ID 与替代配置），因此它出现在错误里而**不是** 200 报告里。
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "would_publish": {
+      "next_revision": 7, "models": 3, "providers": 2, "deployments": 4,
+      "active_deployments": 1, "routes": 3,
+      "disabled_providers": 1, "deployments_behind_disabled_providers": 2
+    },
+    "probes": [
+      {"deployment_id": "…", "ok": true, "status": 200, "latency_ms": 42,
+       "credential_state": "decrypted", "probe_method": "connectivity",
+       "probe_outcome": "verified", "probe_supported": true,
+       "inference_verified": false,
+       "description": "the connectivity probe succeeded — this is NOT an inference (inference_verified=false)"}
+    ],
+    "issues": [
+      {"code": "provider_disabled", "severity": "blocker", "subject": "…", "message": "provider zhipu is disabled: its deployments will not carry traffic and are not probed"},
+      {"code": "probe_unsupported", "severity": "hint", "subject": "…", "message": "the vendor does not expose a model-list endpoint for deployment …: this probe method cannot confirm connectivity — it is NOT evidence of an unhealthy model (a base_url missing a path segment yields the same 404)"}
+    ],
+    "summary": {
+      "probes_total": 1, "probes_ok": 0, "probes_failed": 0,
+      "probes_unsupported": 1, "probes_unconfirmed": 0,
+      "blockers": 1, "hints": 1, "all_probes_ok": false,
+      "account_inventory_checked": true
+    }
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `would_publish.active_deployments` | **真正会承接流量**的部署数（部署 active **且**其 provider 未停用）。停用 provider 背后的部署**不算**，也**不**被探测 |
+| `would_publish.disabled_providers` | 草稿里被停用的 provider 数量（如实汇总） |
+| `would_publish.deployments_behind_disabled_providers` | 部署本身 active、但其 provider 已停用的部署数 |
+| `issues[].severity` | `blocker` = **可行动的配置 / 可用流量发现**（发布这份目录后某个模型或路由**跑不起来**）；`hint` = **网络探测提示**（advisory、**不代表**模型故障）。**整份 issues 清单都是 advisory** |
+| `issues[].code` | `provider_disabled` / `deployment_no_account` / `route_capabilities_narrowed` / `model_not_dispatchable`（blocker）；`account_inventory_unavailable` / `probe_failed` / `probe_unsupported` / `probe_unconfirmed`（hint） |
+| `summary.all_probes_ok` | 只有**每个**探测都 `verified` 才为 true |
+| `summary.account_inventory_checked` | 「无账号」判定是否**对每个 provider 都真的做了**。false = 清单读面不可用**或某次读失败** ⇒ 判定被**跳过**（未知，不是无账号） |
+
+**HTTP 200 不等于每个 `probe.ok` 都是 true**：200 只说明「预演报告生成成功」。
+逐条结论看 `probes[]` 的 `probe_outcome`，汇总看 `summary`。
+
+**HTTP 200 + 一条 `blocker` 也不等于正式发布会被拒**：`blocker` 是**可行动的
+发现**，不是发布闸。正式发布**不读这份预演报告**。真正会拒绝发布的是
+**共享发布闸的硬校验** —— 草稿里不支持的策略/路由配置（不在支持集的
+`pool_strategy`、词表外的路由 `capabilities`）：预演与正式发布给出**同一个
+错误**（HTTP 400，点名对象 ID 与替代配置），出现在**错误**里而**不是** 200
+报告里。本期**不为** `blocker` 类发现加硬闸 —— 停用 provider / 无账号 /
+能力收窄由目录发布态与调度判定负责，预演只负责把它们**如实说出来**。
+
+#### POST /admin/deployments/:id/probe
+
+对一条部署的上游发一次**只读**探测：`GET {base_url}/models`。**默认不触发
+付费推理**——探测读的是供应商的模型列表端点，不是推理端点。
+
+**响应（200）**：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "deployment_id": "…", "ok": false, "status": 404, "latency_ms": 12,
+    "error_summary": "upstream returned HTTP 404 Not Found — the vendor does not expose a model-list endpoint at this base_url; this probe method cannot confirm connectivity (not evidence of an unhealthy model; a base_url missing a path segment yields the same 404)",
+    "credential_state": "decrypted", "probe_method": "connectivity",
+    "probe_outcome": "unsupported", "probe_supported": false,
+    "inference_verified": false,
+    "description": "the vendor does not expose a model-list endpoint here — this probe method cannot confirm connectivity; this is NOT a model fault"
+  }
+}
+```
+
+**三件事必须分开看**：
+
+| 维度 | 字段 | 取值 |
+|---|---|---|
+| 凭据**材料**测试 | `credential_state` | `decrypted`（材料解开且可用）/ `missing`（该 provider 没有可用凭据）/ `unusable`（有凭据但材料解不开） |
+| **指定**连通性探测 | `probe_method` + `probe_outcome` | `connectivity`+`verified`（连通性已确认）/ `failed`（端点存在但没成功）/ `unsupported`（**供应商不提供该端点**，此探测方式无法确认）/ `unconfirmed`（没得到任何答复） |
+| 本次**没有**做真实推理 | `inference_verified` | 恒为 `false` —— `ok:true` 只表示「这条部署的上游连通」，**绝不**表示「模型答过」 |
+
+**鉴权/版本头按协议设置**（与派发路径同一个适配器）：`openai_chat` /
+`openai_responses` 走 `Authorization: Bearer`；`anthropic_messages` 走
+`x-api-key` + `anthropic-version`。`anthropic_messages` + OAuth 凭据是
+**明确不支持**的组合：出站前拒绝，绝不把 OAuth 令牌塞进 API-key 槽。
+探测还复用部署的 `config.headers`（例如供应商版本、租户或路由头），
+与派发保持一致。非法结构和覆盖认证/追踪边界的保留头在出站前拒绝，
+不把缺少必需自定义头造成的拒绝误当成部署连通性结论。
+
+失败一律 in-band（HTTP 200 + `ok:false`）；只有「部署不存在」这类硬错误才
+走 envelope（404）。`error_summary` 永不包含凭据材料。
 
 ---
 

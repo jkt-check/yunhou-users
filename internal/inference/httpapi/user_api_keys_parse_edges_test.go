@@ -11,7 +11,7 @@ import (
 // 析分支（budget 字符串/裸整数、expires RFC3339、名称上限、未知字段拒绝）。
 
 func TestUserAPIKeys_CreateParseBranches(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	userID, token := f.addUser(t)
 	f.grantEntitlement(t, userID, "glm-4.6")
 

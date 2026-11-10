@@ -268,3 +268,235 @@ func TestServiceRotateDisabledRejected(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T1 — 出站解析：oauth 凭据只交出 access token
+// ---------------------------------------------------------------------------
+
+// oauthBundleFor seals the same bundle shape credentials.HandleCallback
+// stores (access + refresh in one JSON blob).
+func oauthBundleFor(t *testing.T, access, refresh string) string {
+	t.Helper()
+	raw, err := MarshalBundle(&OAuthBundle{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer"})
+	if err != nil {
+		t.Fatalf("marshal bundle: %v", err)
+	}
+	return string(raw)
+}
+
+func TestResolveOutboundAuth_OAuthYieldsAccessTokenOnly(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const access, refresh = "acc-token-unit", "refresh-token-unit"
+	view, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", oauthBundleFor(t, access, refresh), "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, cred, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+	if err != nil {
+		t.Fatalf("resolve outbound auth: %v", err)
+	}
+	if auth.AuthType != "oauth" {
+		t.Errorf("auth type = %q, want oauth", auth.AuthType)
+	}
+	if auth.Token != access {
+		t.Errorf("token is not the bare access token (bytes=%d)", len(auth.Token))
+	}
+	for _, forbidden := range []string{refresh, "access_token", "refresh_token", "{"} {
+		if strings.Contains(auth.Token, forbidden) {
+			t.Errorf("outbound token carries bundle material (%q)", forbidden)
+		}
+	}
+	if cred == nil || cred.ID != view.ID {
+		t.Error("the credential row must come back with the resolution")
+	}
+}
+
+func TestResolveOutboundAuth_StaticCredentialsUnchanged(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	for _, authType := range []string{"api_key", "service"} {
+		t.Run(authType, func(t *testing.T) {
+			const secret = "sk-static-unit-secret"
+			view, err := svc.Create(context.Background(), testOp(), "p", "l", authType, secret, "r", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			auth, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+			if err != nil {
+				t.Fatalf("resolve outbound auth: %v", err)
+			}
+			if auth.AuthType != authType || auth.Token != secret {
+				t.Errorf("static credential must resolve to its plaintext unchanged (type=%q)", auth.AuthType)
+			}
+		})
+	}
+}
+
+func TestResolveOutboundAuth_UnusableOAuthFailsClosed(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const refresh = "refresh-token-unit"
+
+	empty, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", oauthBundleFor(t, "", refresh), "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), empty.ID, nil); err == nil {
+		t.Fatal("an oauth credential without an access token must not resolve")
+	} else if domain.CodeOf(err) != domain.CodeConflict {
+		t.Errorf("empty access token error code = %v, want conflict", domain.CodeOf(err))
+	}
+
+	const broken = "not-a-bundle-" + refresh
+	bad, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", broken, "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = svc.ResolveOutboundAuth(context.Background(), bad.ID, nil)
+	if err == nil {
+		t.Fatal("an unparsable bundle must not resolve")
+	}
+	if domain.CodeOf(err) != domain.CodeInternal {
+		t.Errorf("unparsable bundle error code = %v, want internal", domain.CodeOf(err))
+	}
+	for _, forbidden := range []string{refresh, broken, "not-a-bundle"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("the failure surfaced credential material (%q)", forbidden)
+		}
+	}
+}
+
+func TestResolveOutboundAuth_StatusAndGenerationPreserved(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	store := newMemStore()
+	svc := NewService(v, store, &memRecorder{})
+	view, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", oauthBundleFor(t, "acc-1", "ref-1"), "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 代次钉扎：轮换后旧代次不可再解析（旧凭据不可重放派发）。
+	pin := int64(1)
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, &pin); err != nil {
+		t.Fatalf("pinned resolve: %v", err)
+	}
+	if _, err := svc.Rotate(context.Background(), testOp(), view.ID, oauthBundleFor(t, "acc-2", "ref-2"), "rotate"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, &pin); err == nil {
+		t.Fatal("a stale pinned generation must not resolve")
+	} else if domain.CodeOf(err) != domain.CodeConflict {
+		t.Errorf("stale generation error code = %v, want conflict", domain.CodeOf(err))
+	}
+	auth, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+	if err != nil || auth.Token != "acc-2" {
+		t.Fatalf("current resolve must yield the rotated access token: %v", err)
+	}
+	// 状态：rotating 仍可派发，revoked 不可。
+	if err := store.SetCredentialStatus(context.Background(), view.ID, "rotating"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil); err != nil {
+		t.Errorf("a rotating credential stays dispatchable: %v", err)
+	}
+	if err := store.SetCredentialStatus(context.Background(), view.ID, "revoked"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil); err == nil {
+		t.Error("a revoked credential must not resolve")
+	} else if domain.CodeOf(err) != domain.CodeConflict {
+		t.Errorf("revoked credential error code = %v, want conflict", domain.CodeOf(err))
+	}
+}
+
+// TestResolveOAuthBundle_SharedDecodePath: 两个公开出口必须共用同一套
+// bundle 解码口径 —— 坏 bundle / 空 access token 一律拒绝，且拒绝完全一致
+// （同 code、同 message）、不挂原始 JSON 解析原因、不带任何凭据材料。
+func TestResolveOAuthBundle_SharedDecodePath(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const refresh = "shared-refresh-token"
+
+	cases := []struct {
+		name   string
+		bundle string
+		code   domain.Code
+	}{
+		{"empty access token", oauthBundleFor(t, "", refresh), domain.CodeConflict},
+		{"corrupt bundle", "not-a-json-bundle-" + refresh, domain.CodeInternal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			view, err := svc.Create(context.Background(), testOp(), "p", "l", "oauth", tc.bundle, "r", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, bearerErr := svc.ResolveBearerToken(context.Background(), view.ID, nil)
+			_, _, outboundErr := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+			if bearerErr == nil || outboundErr == nil {
+				t.Fatalf("both paths must refuse an unusable oauth credential")
+			}
+			if domain.CodeOf(bearerErr) != tc.code || domain.CodeOf(outboundErr) != tc.code {
+				t.Errorf("error codes = %v / %v, want %v",
+					domain.CodeOf(bearerErr), domain.CodeOf(outboundErr), tc.code)
+			}
+			// 只比对 domain.Error 的 Message（不含 cause 链），失败信息里
+			// 不会出现任何凭据材料。
+			bMsg, oMsg := domainMessage(bearerErr), domainMessage(outboundErr)
+			if bMsg != oMsg {
+				t.Errorf("the two public paths must reject identically (bearer message=%q, outbound message=%q)", bMsg, oMsg)
+			}
+			// 原始 JSON 解析原因不得挂进错误（它会回显明文的一个字符）。
+			for _, err := range []error{bearerErr, outboundErr} {
+				for _, parser := range []string{"invalid character", "unexpected end of JSON", "cannot unmarshal"} {
+					if strings.Contains(err.Error(), parser) {
+						t.Errorf("the failure attached a raw json parse cause")
+					}
+				}
+			}
+			for _, forbidden := range []string{refresh, tc.bundle, "not-a-json-bundle"} {
+				for _, err := range []error{bearerErr, outboundErr} {
+					if strings.Contains(err.Error(), forbidden) {
+						t.Errorf("the failure surfaced credential material")
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestResolveStaticCredentialBehaviourPreserved: 共享解码只作用于 oauth 分支
+// —— 两个公开出口各自的静态 api_key/service 行为保持原样（探测出口继续
+// trim，热路径出口保持逐字节明文）。
+func TestResolveStaticCredentialBehaviourPreserved(t *testing.T) {
+	v, _ := NewVault(testKeys(t, 1), 1)
+	svc := NewService(v, newMemStore(), &memRecorder{})
+	const secret = "  sk-static-padded  "
+	view, err := svc.Create(context.Background(), testOp(), "p", "l", "api_key", secret, "r", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bearer, _, err := svc.ResolveBearerToken(context.Background(), view.ID, nil)
+	if err != nil {
+		t.Fatalf("bearer path: %v", err)
+	}
+	if bearer != "sk-static-padded" {
+		t.Errorf("the probe path must keep trimming static credentials")
+	}
+	outbound, _, err := svc.ResolveOutboundAuth(context.Background(), view.ID, nil)
+	if err != nil {
+		t.Fatalf("outbound path: %v", err)
+	}
+	if outbound.Token != secret {
+		t.Errorf("the hot path must keep the static plaintext byte-identical")
+	}
+}
+
+// domainMessage extracts the domain error message (never the cause chain, so
+// a failure message can be printed without leaking credential material).
+func domainMessage(err error) string {
+	var de *domain.Error
+	if errors.As(err, &de) {
+		return de.Message
+	}
+	return ""
+}

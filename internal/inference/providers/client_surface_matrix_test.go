@@ -250,3 +250,41 @@ func TestResponsesReplayAndRender_AltBranches(t *testing.T) {
 		t.Errorf("status = %v, want incomplete (length)", doc2["status"])
 	}
 }
+
+// T8: reasoning.effort 的档位**逐字保留** —— 不得一律折成 medium，也不得把
+// minimal 折成「关闭推理」（minimal 是最低推理档，OpenAI 语义；只有 none
+// 才关闭）。
+func TestResponsesParser_EffortLevelsArePreserved(t *testing.T) {
+	for _, effort := range []string{"minimal", "low", "medium", "high", "xhigh"} {
+		t.Run(effort, func(t *testing.T) {
+			in, err := ParseResponsesRequest([]byte(
+				`{"model":"m","input":"hi","reasoning":{"effort":"` + effort + `"}}`))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if in.Request.ReasoningEffort != effort {
+				t.Errorf("effort = %q, want %q (the level must travel verbatim)",
+					in.Request.ReasoningEffort, effort)
+			}
+			if in.Request.ThinkingEnabled == nil || !*in.Request.ThinkingEnabled {
+				t.Errorf("effort %q must enable reasoning", effort)
+			}
+		})
+	}
+	// none → 关闭推理（不携带档位）。
+	in, err := ParseResponsesRequest([]byte(`{"model":"m","input":"hi","reasoning":{"effort":"none"}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if in.Request.ThinkingEnabled == nil || *in.Request.ThinkingEnabled {
+		t.Errorf("effort none must turn reasoning off: %+v", in.Request.ThinkingEnabled)
+	}
+	if in.Request.ReasoningEffort != "" {
+		t.Errorf("effort none must not carry a level: %q", in.Request.ReasoningEffort)
+	}
+	// 词表外的档位 → 明确拒绝（不静默忽略）。
+	if _, err := ParseResponsesRequest([]byte(
+		`{"model":"m","input":"hi","reasoning":{"effort":"ultra"}}`)); err == nil {
+		t.Error("an unsupported effort must be rejected explicitly")
+	}
+}

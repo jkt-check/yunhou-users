@@ -317,6 +317,16 @@ type routeWriteRequest struct {
 	Reason       string     `json:"reason"` // 必填运营理由 → 审计（M-6，空串/缺省 400）
 }
 
+type routePatchRequest struct {
+	Priority     *int       `json:"priority"`
+	Weight       *int       `json:"weight"`
+	Capabilities *[]string  `json:"capabilities"`
+	PoolStrategy *string    `json:"pool_strategy"`
+	Enabled      *bool      `json:"enabled"`
+	UpdatedAt    *time.Time `json:"updated_at"`
+	Reason       string     `json:"reason"`
+}
+
 type revisionDTO struct {
 	ID          int64      `json:"id"`
 	Revision    int        `json:"revision"`
@@ -360,6 +370,9 @@ func fail(c *gin.Context, err error) {
 		status = http.StatusConflict
 	case domain.CodeRateLimited, domain.CodeQuotaExceeded, domain.CodeInsufficientBalance:
 		status = http.StatusTooManyRequests
+	case domain.CodeServiceUnavailable:
+		// 存储不可用：明确的服务错误（绝不伪装成额度耗尽）。
+		status = http.StatusServiceUnavailable
 	}
 	if status == http.StatusInternalServerError {
 		c.JSON(status, gin.H{"code": status, "data": nil, "message": "internal error"})
@@ -816,7 +829,7 @@ func (h *AdminModelsHandler) CreateRoute(c *gin.Context) {
 // 对象（model_id/deployment_id 不在请求体里，由既有路由行带出；Task 16
 // 实测此前直接以空 model/deployment 提交，任何 PATCH 都 400）。
 func (h *AdminModelsHandler) UpdateRoute(c *gin.Context) {
-	var req routeWriteRequest
+	var req routePatchRequest
 	if err := strictBindJSON(c, &req); err != nil {
 		fail(c, domain.NewError(domain.CodeInvalidInput, "invalid request body (unknown fields rejected): "+err.Error()))
 		return
@@ -825,19 +838,31 @@ func (h *AdminModelsHandler) UpdateRoute(c *gin.Context) {
 	if !okReason {
 		return
 	}
+	if req.UpdatedAt == nil || req.UpdatedAt.IsZero() {
+		fail(c, domain.NewError(domain.CodeInvalidInput, "updated_at version token is required (read the route first)"))
+		return
+	}
 	r, err := h.mgr.GetRoute(c.Request.Context(), c.Param("route_id"))
 	if err != nil {
 		fail(c, err)
 		return
 	}
-	r.Priority, r.Weight = req.Priority, req.Weight
-	r.Capabilities, r.Enabled = req.Capabilities, req.Enabled
-	if req.PoolStrategy != "" {
-		r.PoolStrategy = domain.PoolStrategy(req.PoolStrategy)
+	if req.Priority != nil {
+		r.Priority = *req.Priority
 	}
-	if req.UpdatedAt != nil {
-		r.UpdatedAt = *req.UpdatedAt
+	if req.Weight != nil {
+		r.Weight = *req.Weight
 	}
+	if req.Capabilities != nil {
+		r.Capabilities = *req.Capabilities
+	}
+	if req.Enabled != nil {
+		r.Enabled = *req.Enabled
+	}
+	if req.PoolStrategy != nil {
+		r.PoolStrategy = domain.PoolStrategy(*req.PoolStrategy)
+	}
+	r.UpdatedAt = *req.UpdatedAt
 	if err := h.mgr.UpdateRoute(c.Request.Context(), actorOf(c), r, reason); err != nil {
 		fail(c, err)
 		return

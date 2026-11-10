@@ -64,6 +64,16 @@ type Candidate struct {
 type Needs struct {
 	Tools     bool
 	Reasoning bool
+	// Images means the request carries image parts. A deployment whose
+	// upstream protocol cannot carry images is NOT a candidate for it (T8:
+	// 声明层/路由层/adapter 层必须一致 —— 不兼容的部署根本不参与选择，
+	// 而不是等出站前才失败).
+	Images bool
+	// ReasoningEffort is the explicitly requested reasoning-effort level
+	// ("" = the client asked for reasoning without naming a level). A
+	// deployment whose protocol cannot EXPRESS that level is not a candidate
+	// (T8: 档位不可表达 → 出站前明确拒绝，绝不折成别的档位).
+	ReasoningEffort string
 	// Protocol is the client-facing protocol the request arrived on; the
 	// deployment's protocol only has to be servable by an adapter, the
 	// client-protocol gate is the model's Protocols list (checked by the
@@ -122,12 +132,20 @@ func (s *Service) AdapterFor(p domain.Protocol) (providers.Adapter, bool) {
 // Candidates lists the dispatchable triples for one call in failover order.
 // A route/deployment/account is eligible only when ALL of:
 //
-//   - the route is enabled and its capability list covers the call's needs
-//     (an empty capability list means "everything the model supports");
-//   - the deployment is active, its protocol has a registered adapter, and
-//     the adapter supports the call's needs (能力不兼容的部署不参与选择);
+//   - the route is enabled, its pool strategy is inside the supported set
+//     (常规池仅 round_robin —— 不支持的值是存量脏配置，绝不静默当 RR),
+//     and its capability list covers the call's needs (an empty capability
+//     list means "everything the model supports");
+//   - the deployment is active, its provider is schedulable in the pinned
+//     published snapshot, its protocol has a registered adapter, and the
+//     adapter supports the call's needs (能力不兼容的部署不参与选择);
 //   - the deployment's provider has at least one active, non-cooling
 //     account.
+//
+// The route/provider/deployment half of that decision is the snapshot's
+// single shared rule (catalog.Snapshot.DeploymentSchedulable) — the sticky
+// path narrows THIS candidate set, it never re-derives schedulability on
+// its own.
 //
 // An empty result means upstream_unavailable — never silently route to an
 // incompatible deployment.
@@ -153,32 +171,210 @@ func (s *Service) Candidates(ctx context.Context, snap *catalog.Snapshot, modelI
 func (s *Service) candidates(ctx context.Context, snap *catalog.Snapshot, modelID string, needs Needs, bypassCache bool) (out []Candidate, consulted map[string]struct{}, err error) {
 	now := s.clock.Now()
 	consulted = map[string]struct{}{}
-	for _, route := range snap.RoutesByModel[modelID] {
-		if !route.Enabled || !routeCovers(route, needs) {
-			continue
-		}
-		d, ok := snap.Deployments[route.DeploymentID]
-		if !ok || d.Status != domain.DeploymentActive {
-			continue
-		}
-		adapter, ok := s.adapters[d.Protocol]
-		if !ok {
-			continue
-		}
-		caps := adapter.Capabilities()
-		if (needs.Tools && !caps.Tools) || (needs.Reasoning && !caps.Reasoning) {
-			continue
-		}
+	for _, cd := range s.CompatibleDeployments(snap, modelID, needs) {
+		d := cd.Deployment
 		consulted[d.ProviderID] = struct{}{}
 		accounts, aerr := s.activeAccounts(ctx, d.ProviderID, bypassCache)
 		if aerr != nil {
 			return nil, nil, aerr
 		}
 		for _, a := range s.orderAccountsWithQuota(d.ProviderID, accounts, now) {
-			out = append(out, Candidate{Route: route, Deployment: d, Account: a})
+			out = append(out, Candidate{Route: cd.Route, Deployment: d, Account: a})
 		}
 	}
 	return out, consulted, nil
+}
+
+// CompatibleDeployment is one (route, deployment) pair that passed every
+// STRUCTURAL capability filter (route enabled, pool strategy supported,
+// deployment + provider schedulable, protocol adapter registered, adapter
+// able to carry the call's needs).
+type CompatibleDeployment struct {
+	Route      domain.ModelRoute
+	Deployment domain.Deployment
+}
+
+// CompatibleDeployments returns the deployments that can structurally serve
+// the call's needs, in failover order. It is the ONE place the capability
+// filters live: the candidate builder, the gateway's pre-admission
+// capability gate and the client-facing modality projections all call it,
+// so they can never disagree.
+//
+// It performs NO account-pool lookup: the result is a capability statement,
+// not a capacity statement. The gateway uses it to reject an unservable
+// request BEFORE admission (zero hold, zero dispatch) — a request that no
+// published deployment can carry is a client error, not a capacity gap.
+func CompatibleDeployments(adapters map[domain.Protocol]providers.Adapter,
+	snap *catalog.Snapshot, modelID string, needs Needs) []CompatibleDeployment {
+	var out []CompatibleDeployment
+	for _, route := range snap.RoutesByModel[modelID] {
+		if !route.Enabled || !routeCovers(route, needs) {
+			continue
+		}
+		// T7: 不支持的 pool_strategy（存量已发布快照里的 least_loaded /
+		// 通用 session_sticky）被标记不可用 —— 绝不静默当成 round_robin：
+		// 那条配置没有实现，当成 RR 就是「假装生效」。
+		if !catalog.PoolStrategySupported(route.PoolStrategy) {
+			continue
+		}
+		d, ok := snap.Deployments[route.DeploymentID]
+		// The shared published-state decision: the deployment must be
+		// active AND its provider must be schedulable in this snapshot.
+		// A disabled provider takes every deployment behind it out of
+		// rotation — the route stays enabled, but it is not a dispatchable
+		// route.
+		if !ok || !snap.DeploymentSchedulable(d) {
+			continue
+		}
+		adapter, ok := adapters[d.Protocol]
+		if !ok {
+			continue
+		}
+		if !adapterServes(adapter.Capabilities(), needs) {
+			continue
+		}
+		out = append(out, CompatibleDeployment{Route: route, Deployment: d})
+	}
+	return out
+}
+
+// CompatibleDeployments is the Service's view of the shared capability
+// decision (same adapter set the dispatcher uses).
+func (s *Service) CompatibleDeployments(snap *catalog.Snapshot, modelID string, needs Needs) []CompatibleDeployment {
+	return CompatibleDeployments(s.adapters, snap, modelID, needs)
+}
+
+// SupportsImages reports whether the model has at least one published
+// deployment that can carry image input — and at least one dispatchable
+// deployment at all. It is the SAME decision the dispatch path uses, so a
+// client-facing listing can never advertise an image the dispatcher refuses.
+func SupportsImages(adapters map[domain.Protocol]providers.Adapter,
+	snap *catalog.Snapshot, modelID string) bool {
+	if len(CompatibleDeployments(adapters, snap, modelID, Needs{})) == 0 {
+		return false // the model has no dispatchable deployment at all
+	}
+	return len(CompatibleDeployments(adapters, snap, modelID, Needs{Images: true})) > 0
+}
+
+// ImageCapabilityOracle answers whether a published model can serve image
+// input AT ALL. The client-facing modality projections (GET /chat/models and
+// the legacy /chat picker) must use it — advertising an image the dispatcher
+// refuses is a capability lie.
+//
+// The implementation is the routing package's own decision; the interface
+// exists so the projections do not have to own an adapter registry.
+type ImageCapabilityOracle interface {
+	SupportsImageInput(snap *catalog.Snapshot, modelID string) bool
+}
+
+// CapabilityOracle answers the capability questions a client-facing listing
+// must answer: can this published entry serve image input / tools /
+// reasoning at all? Every answer is the DISPATCH decision (route capability
+// list + registered adapter + the published deployment's schedulability), so
+// a listing can never advertise more than the dispatcher can deliver (T9).
+//
+// The image question is the same one the modality projections have always
+// used (ImageCapabilityOracle); tools and reasoning extend it so a picker
+// can show the real capability instead of guessing from the model
+// declaration.
+type CapabilityOracle interface {
+	ImageCapabilityOracle
+	SupportsTools(snap *catalog.Snapshot, modelID string) bool
+	SupportsThinking(snap *catalog.Snapshot, modelID string) bool
+}
+
+// SupportsImageInput implements ImageCapabilityOracle with the service's own
+// adapter set — identical to the one the dispatcher uses.
+func (s *Service) SupportsImageInput(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsImages(s.adapters, snap, modelID)
+}
+
+// SupportsTools implements CapabilityOracle with the service's own adapter
+// set: the model has at least one published deployment whose route covers
+// tools and whose protocol adapter can carry them.
+func (s *Service) SupportsTools(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(s.adapters, snap, modelID, Needs{Tools: true})
+}
+
+// SupportsThinking implements CapabilityOracle with the service's own
+// adapter set: the model has at least one published deployment whose route
+// covers reasoning and whose protocol adapter can carry it.
+func (s *Service) SupportsThinking(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(s.adapters, snap, modelID, Needs{Reasoning: true})
+}
+
+// SupportsCapability reports whether the model has at least one published
+// deployment that can structurally serve the given capability. It is the
+// SAME decision the dispatcher makes (CompatibleDeployments), so a
+// client-facing listing never claims more than the dispatch path can do.
+func SupportsCapability(adapters map[domain.Protocol]providers.Adapter,
+	snap *catalog.Snapshot, modelID string, needs Needs) bool {
+	return len(CompatibleDeployments(adapters, snap, modelID, needs)) > 0
+}
+
+// registryOracle adapts an adapter registry to the ImageCapabilityOracle.
+type registryOracle map[domain.Protocol]providers.Adapter
+
+// SupportsImageInput implements ImageCapabilityOracle.
+func (r registryOracle) SupportsImageInput(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsImages(r, snap, modelID)
+}
+
+// SupportsTools implements CapabilityOracle.
+func (r registryOracle) SupportsTools(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(r, snap, modelID, Needs{Tools: true})
+}
+
+// SupportsThinking implements CapabilityOracle.
+func (r registryOracle) SupportsThinking(snap *catalog.Snapshot, modelID string) bool {
+	return SupportsCapability(r, snap, modelID, Needs{Reasoning: true})
+}
+
+// ProductionImageCapability is the oracle over the PRODUCTION adapter
+// registry (providers.RegisteredAdapters) — the same registry cmd/server
+// wires into the routing service. It is the default for the client-facing
+// projections, which have no routing service of their own.
+func ProductionImageCapability() ImageCapabilityOracle {
+	return registryOracle(providers.RegisteredAdapters())
+}
+
+// ProductionCapabilities is the FULL capability oracle over the PRODUCTION
+// adapter registry: images, tools and reasoning, all answered by the
+// dispatch decision (T9).
+func ProductionCapabilities() CapabilityOracle {
+	return registryOracle(providers.RegisteredAdapters())
+}
+
+// adapterServes reports whether one adapter's declared capabilities cover
+// the call's needs. The adapter layer is the THIRD layer of the capability
+// contract (model declaration → route capabilities → adapter support): a
+// deployment whose protocol cannot carry the demand is not a candidate.
+func adapterServes(caps domain.AdapterCapabilities, needs Needs) bool {
+	if needs.Tools && !caps.Tools {
+		return false
+	}
+	if needs.Reasoning && !caps.Reasoning {
+		return false
+	}
+	if needs.Images && !caps.Images {
+		return false
+	}
+	if needs.ReasoningEffort != "" && !supportsEffort(caps, needs.ReasoningEffort) {
+		return false
+	}
+	return true
+}
+
+// supportsEffort reports whether the adapter's protocol can express the
+// requested effort level. An adapter that declares no effort knob cannot
+// express any level.
+func supportsEffort(caps domain.AdapterCapabilities, effort string) bool {
+	for _, e := range caps.ReasoningEfforts {
+		if e == effort {
+			return true
+		}
+	}
+	return false
 }
 
 // InvalidateAccounts 驱逐某 provider 的账号池缓存。供两类路径使用：
@@ -222,7 +418,9 @@ func (s *Service) activeAccounts(ctx context.Context, providerID string, fresh b
 
 // routeCovers reports whether a route's capability list covers the call's
 // needs. An empty list means "everything the model supports" (the model
-// capability gate runs before routing); a non-empty list is restrictive.
+// capability gate runs before routing); a non-empty list is restrictive —
+// it enumerates the capabilities the route carries, and a demand it does
+// not list is NOT served (T8: "image" is one of those keys).
 func routeCovers(r domain.ModelRoute, needs Needs) bool {
 	if len(r.Capabilities) == 0 {
 		return true
@@ -231,10 +429,13 @@ func routeCovers(r domain.ModelRoute, needs Needs) bool {
 	for _, c := range r.Capabilities {
 		has[c] = true
 	}
-	if needs.Tools && !has["tools"] {
+	if needs.Tools && !has[domain.RouteCapabilityTools] {
 		return false
 	}
-	if needs.Reasoning && !has["reasoning"] {
+	if needs.Reasoning && !has[domain.RouteCapabilityReasoning] {
+		return false
+	}
+	if needs.Images && !has[domain.RouteCapabilityImage] {
 		return false
 	}
 	return true
@@ -366,21 +567,30 @@ type LeaseKeeper struct {
 	leases []*domain.ConcurrencyLease
 	ttl    time.Duration
 
-	stop   chan struct{}
-	done   chan struct{}
-	once   sync.Once
-	errMu  sync.Mutex
-	err    error
-	stopMu sync.Once
+	stop    context.CancelFunc
+	done    chan struct{}
+	once    sync.Once
+	errMu   sync.Mutex
+	err     error
+	stopMu  sync.Once
+	onFence context.CancelFunc
 }
 
 // NewLeaseKeeper starts the renewal loop; renew happens at ttl/3 intervals.
 // A nil/empty lease list still works (nothing to renew; Stop releases
 // nothing).
 func (s *Service) NewLeaseKeeper(leases ...*domain.ConcurrencyLease) *LeaseKeeper {
+	return s.NewLeaseKeeperWithCancel(nil, leases...)
+}
+
+// NewLeaseKeeperWithCancel also interrupts blocked upstream I/O on fencing.
+// Normal Pause/Stop do not cancel dispatch; the caller owns that lifetime.
+func (s *Service) NewLeaseKeeperWithCancel(cancel context.CancelFunc, leases ...*domain.ConcurrencyLease) *LeaseKeeper {
+	renewCtx, stop := context.WithCancel(context.Background())
 	k := &LeaseKeeper{
 		svc: s, ttl: s.LeaseTTL,
-		stop: make(chan struct{}), done: make(chan struct{}),
+		stop: stop, done: make(chan struct{}),
+		onFence: cancel,
 	}
 	for _, l := range leases {
 		if l != nil {
@@ -388,14 +598,14 @@ func (s *Service) NewLeaseKeeper(leases ...*domain.ConcurrencyLease) *LeaseKeepe
 		}
 	}
 	if len(k.leases) > 0 {
-		go k.loop()
+		go k.loop(renewCtx)
 	} else {
 		close(k.done)
 	}
 	return k
 }
 
-func (k *LeaseKeeper) loop() {
+func (k *LeaseKeeper) loop(ctx context.Context) {
 	defer close(k.done)
 	interval := k.ttl / 3
 	if interval <= 0 {
@@ -405,12 +615,15 @@ func (k *LeaseKeeper) loop() {
 	defer t.Stop()
 	for {
 		select {
-		case <-k.stop:
+		case <-ctx.Done():
 			return
 		case <-t.C:
 			for _, l := range k.leases {
-				err := k.svc.store.RenewLease(context.Background(), l.ID, l.OwnerToken,
+				err := k.svc.store.RenewLease(ctx, l.ID, l.OwnerToken,
 					l.FencingToken, k.svc.clock.Now().Add(k.ttl))
+				if ctx.Err() != nil {
+					return
+				}
 				if err == nil {
 					continue
 				}
@@ -420,6 +633,9 @@ func (k *LeaseKeeper) loop() {
 						k.err = err
 					}
 					k.errMu.Unlock()
+					if k.onFence != nil {
+						k.onFence()
+					}
 					return // fenced — stop renewing, the dispatcher must stop
 				}
 				// Transient store error: keep trying at the next tick.
@@ -439,7 +655,7 @@ func (k *LeaseKeeper) Err() error {
 // conflicts are already-covered by the fencing protocol).
 func (k *LeaseKeeper) Stop(ctx context.Context) {
 	k.stopMu.Do(func() {
-		close(k.stop)
+		k.stop()
 		<-k.done
 		for _, l := range k.leases {
 			_ = k.svc.ReleaseLease(ctx, l)
@@ -452,7 +668,7 @@ func (k *LeaseKeeper) Stop(ctx context.Context) {
 // MUST hand the leases to another keeper or release them.
 func (k *LeaseKeeper) Pause() {
 	k.stopMu.Do(func() {
-		close(k.stop)
+		k.stop()
 		<-k.done
 	})
 }

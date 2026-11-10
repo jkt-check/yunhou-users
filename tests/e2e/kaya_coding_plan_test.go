@@ -235,11 +235,9 @@ func setupCodingPlanChain(t *testing.T, up *chatStubUpstream) *chainServer {
 	gw := infgateway.NewService(staticSnapE2E{snap}, store, access.NewEntitlementResolver(store, nil),
 		quota.NewService(store, nil), routingSvc, credSvc, providers.NewHTTPClient(egress), egress, nil)
 
-	rpmCounter := access.NewRPMCounter(nil)
 	accessOps := &httpapi.AccessOps{
 		UserAPIKeys:       httpapi.NewUserAPIKeysHandler(access.NewKeyService(store, nil)),
-		V1Auth:            httpapi.APIKeyAuth(accessResolver, rpmCounter, cfg.InferenceAccountRPM),
-		RPMCounter:        rpmCounter,
+		V1Auth:            httpapi.APIKeyAuth(accessResolver),
 		V1Models:          httpapi.NewModelsHandler(catalogSvc, accessResolver),
 		V1ChatCompletions: httpapi.NewChatCompletionsHandler(gw),
 		UserQuotas:        httpapi.NewUserQuotasHandler(management.NewQuotaViewService(store, nil)),

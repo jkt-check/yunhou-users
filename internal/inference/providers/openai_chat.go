@@ -14,6 +14,7 @@ package providers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -25,6 +26,8 @@ import (
 // DeepSeek, Moonshot, GLM, MiniMax and other OpenAI-compatible endpoints).
 type OpenAIChat struct{}
 
+var errChatRefusal = errors.New("providers: chat refusal cannot be translated faithfully")
+
 // NewOpenAIChat builds the adapter.
 func NewOpenAIChat() *OpenAIChat { return &OpenAIChat{} }
 
@@ -33,8 +36,16 @@ func (a *OpenAIChat) Protocol() domain.Protocol { return domain.ProtocolOpenAICh
 
 // Capabilities implements Adapter. include_usage is always requested, so
 // streaming usage is available whenever the upstream honors it.
+//
+// Images: the chat-completions protocol carries image parts natively
+// (image_url content parts) — the adapter relays them.
+// ReasoningEfforts: the chat-completions protocol has the reasoning_effort
+// knob, so every level of the vocabulary can be expressed verbatim.
 func (a *OpenAIChat) Capabilities() domain.AdapterCapabilities {
-	return domain.AdapterCapabilities{StreamingUsage: true, Tools: true, Reasoning: true}
+	return domain.AdapterCapabilities{
+		StreamingUsage: true, Tools: true, Reasoning: true, Images: true,
+		ReasoningEfforts: domain.SupportedReasoningEfforts(),
+	}
 }
 
 // Inclusion implements Adapter: OpenAI's prompt_tokens already contains
@@ -95,8 +106,18 @@ func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 	if len(r.ToolChoice) > 0 {
 		payload["tool_choice"] = r.ToolChoice
 	}
-	if r.ThinkingEnabled != nil && *r.ThinkingEnabled {
-		payload["thinking"] = map[string]any{"type": "enabled"}
+	// T8: 显式推理档位逐字透传（协议原生字段 reasoning_effort）。
+	// 档位与开关的关系：档位是**更具体**的请求，档位在场时只发档位
+	// （两个方言的旋钮同时发给一个上游不是协议忠实）；开关单独在场时
+	// 仍发 thinking（DeepSeek 风格）。
+	if r.ReasoningEffort != "" {
+		payload["reasoning_effort"] = r.ReasoningEffort
+	} else if r.ThinkingEnabled != nil {
+		kind := "disabled"
+		if *r.ThinkingEnabled {
+			kind = "enabled"
+		}
+		payload["thinking"] = map[string]any{"type": kind}
 	}
 	for _, k := range passthroughKeys {
 		if v, ok := r.Passthrough[k]; ok {
@@ -120,11 +141,19 @@ func (a *OpenAIChat) BuildPayload(call *Call) ([]byte, error) {
 }
 
 // AuthHeaders implements Adapter.
-func (a *OpenAIChat) AuthHeaders(secret []byte) map[string]string {
-	if len(secret) == 0 {
-		return nil
+func (a *OpenAIChat) AuthHeaders(auth Auth) (map[string]string, error) {
+	switch auth.Type {
+	case "", AuthTypeAPIKey, AuthTypeService, AuthTypeOAuth:
+	default:
+		return nil, domain.NewError(domain.CodeInvalidInput,
+			"providers: openai_chat does not support auth type "+auth.Type)
 	}
-	return map[string]string{"Authorization": "Bearer " + string(secret)}
+	if auth.Token == "" {
+		return nil, nil
+	}
+	// OpenAI 兼容协议只认 bearer：静态 api_key/service 密钥与 OAuth 的
+	// access token 都走 Authorization: Bearer。
+	return map[string]string{"Authorization": "Bearer " + auth.Token}, nil
 }
 
 // WrapStream implements Adapter: the upstream already speaks OpenAI SSE, so
@@ -142,8 +171,14 @@ type openAINonStream struct {
 	Usage   *openAIUsage `json:"usage"`
 	Choices []struct {
 		Message struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Content          string  `json:"content"`
+			ReasoningContent string  `json:"reasoning_content"`
+			Refusal          *string `json:"refusal"`
+			ToolCalls        []struct {
+				Function struct {
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
 }
@@ -157,6 +192,13 @@ func (a *OpenAIChat) DecodeNonStream(body []byte) (*NonStreamResult, error) {
 	out := &NonStreamResult{Payload: body, UpstreamRequestID: resp.ID}
 	for _, ch := range resp.Choices {
 		out.ContentBytes += int64(len(ch.Message.Content) + len(ch.Message.ReasoningContent))
+		if ch.Message.Refusal != nil {
+			out.hasRefusal = true
+			out.ContentBytes += int64(len(*ch.Message.Refusal))
+		}
+		for _, call := range ch.Message.ToolCalls {
+			out.ContentBytes += int64(len(call.Function.Arguments))
+		}
 	}
 	if resp.Usage == nil {
 		// The upstream genuinely did not report usage on a non-streaming

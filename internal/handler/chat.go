@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -138,6 +139,11 @@ func (h *ChatHandler) StreamChat(c *gin.Context) {
 		if errors.Is(err, service.ErrChatNotReady) {
 			// Retry-After 取 5s：短于 chatLimiter refill,避免重试风暴放大。
 			c.Header("Retry-After", "5")
+		} else {
+			var lim *service.ChatLimitError
+			if errors.As(err, &lim) && lim.Code == "rate_limited" && lim.RetryAfterSeconds > 0 {
+				c.Header("Retry-After", strconv.Itoa(lim.RetryAfterSeconds))
+			}
 		}
 		h.logAccess(started, userID, appID, routeModel(route, req.Model), req, "error", msg, "", rej)
 		writeChatError(c, status, msg, rej)
@@ -242,10 +248,24 @@ func chatErrorMapping(err error) (int, string) {
 	switch {
 	case errors.Is(err, service.ErrChatNotReady):
 		return http.StatusServiceUnavailable, service.ErrChatNotReady.Error()
+	case errors.Is(err, service.ErrChatConfigUnavailable):
+		// 服务端配置不可用（目录里没有可调度路由 / 策略带未实现的模式）：
+		// 503 + 明确文案，**不承诺 Retry-After** —— 配置不会自愈，重试没有
+		// 意义（与 ErrChatNotReady 的 5s 退避提示严格分开）。
+		return http.StatusServiceUnavailable, service.ErrChatConfigUnavailable.Error()
 	case errors.Is(err, service.ErrChatNotEnabled):
 		return http.StatusNotFound, service.ErrChatNotEnabled.Error()
 	case errors.Is(err, service.ErrChatNoAccess):
 		return http.StatusForbidden, service.ErrChatNoAccess.Error()
+	case errors.Is(err, service.ErrChatRequestLimited):
+		// 本地限制拒绝（业务速率 / 并发 / 额度 / 余额）：请求从未出站，
+		// 说明必须说清是哪一类限制 —— 不能沿用上游 429 的文案。
+		log.Printf("chat: request rejected by a usage limit: %v", err)
+		var lim *service.ChatLimitError
+		if errors.As(err, &lim) {
+			return http.StatusTooManyRequests, lim.Error()
+		}
+		return http.StatusTooManyRequests, service.ErrChatRequestLimited.Error()
 	case errors.Is(err, service.ErrChatConcurrencyLimited):
 		// 单用户并发流上限（2026-10 审计加固）——放在 ErrChatRateLimited
 		// 之前：ChatConcurrencyLimitError 的 Unwrap 同时匹配两者。
@@ -269,6 +289,9 @@ func chatErrorMapping(err error) (int, string) {
 		return http.StatusBadRequest, service.ErrChatRequestShape.Error()
 	case errors.Is(err, service.ErrChatModelNoVision):
 		return http.StatusBadRequest, service.ErrChatModelNoVision.Error()
+	case errors.Is(err, service.ErrChatCapabilityUnsupported):
+		// T8: 能力不兼容（无部署能承载图片/推理档位）—— 400，零出站。
+		return http.StatusBadRequest, service.ErrChatCapabilityUnsupported.Error()
 	default:
 		log.Printf("chat: internal error: %v", err)
 		return http.StatusInternalServerError, "internal error"

@@ -153,6 +153,8 @@ func wipeInferenceTables(t *testing.T, db *sqlx.DB) {
 		"inference_ledger_entries", "inference_adjustments",
 		"inference_concurrency_leases", "inference_reservations",
 		"inference_usage_records",
+		// Task 4: 速率预占行引用 requests（FK）—— 必须先删。
+		"inference_rate_reservations",
 		"inference_attempts", "inference_requests",
 		"inference_quota_windows",
 		"inference_entitlements", "inference_policy_versions",
@@ -263,7 +265,7 @@ func setupChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 // 模型（deepseek-vision，input_modalities=["text","image"]，独立 deployment/
 // route/price 指向同一 stub 上游），供 Task 12 多模态用例；false 时与既有
 // fixture 逐字节等价。
-func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logger, withVision bool) (*gin.Engine, *sqlx.DB, *postgres.Store) {
+func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logger, withVision bool, snapshotEdits ...func(*catalog.Snapshot)) (*gin.Engine, *sqlx.DB, *postgres.Store) {
 	t.Helper()
 	db, tokenSvc, authSvc := chatE2EBase(t)
 	ctx := context.Background()
@@ -469,6 +471,9 @@ func buildChatFacadeE2E(t *testing.T, up *chatStubUpstream, accessLog *log.Logge
 		snap.RoutesByModel[undeclaredModelID] = []domain.ModelRoute{{
 			ModelID: undeclaredModelID, DeploymentID: depU.ID, Weight: 1, Enabled: true,
 		}}
+	}
+	for _, edit := range snapshotEdits {
+		edit(snap)
 	}
 	egress, err := credentials.NewEgressValidator([]string{"127.0.0.0/8"})
 	if err != nil {
@@ -957,6 +962,11 @@ type chatContractEnv struct {
 	// output cap (设计 §7.2 不允许无限输出), legacy sends no max_tokens.
 	// Empty = the key must NOT appear.
 	wantMaxTokens string
+	// modelsCapabilitySuffix is the T9 capability tail of the /chat/models
+	// entry. The gateway surface (facade) appends the dispatch-decided
+	// capability description; the legacy picker keeps its original five
+	// fields. Empty = the entry must NOT carry the capability fields.
+	modelsCapabilitySuffix string
 }
 
 func setupChatContractLegacy(t *testing.T, up *chatStubUpstream) *chatContractEnv {
@@ -971,6 +981,8 @@ func setupChatContractLegacy(t *testing.T, up *chatStubUpstream) *chatContractEn
 		defaultModelID: "deepseek-v4-flash", // legacy 目录 id 即上游模型名
 		defaultDisplay: "deepseek-v4-flash",
 		wantMaxTokens:  "",
+		// legacy 的 /chat/models picker 保持既有五个字段（不改它的形状）。
+		modelsCapabilitySuffix: "",
 	}
 }
 
@@ -986,6 +998,13 @@ func setupChatContractFacade(t *testing.T, up *chatStubUpstream) *chatContractEn
 		defaultModelID: "deepseek-chat", // facade 公共模型 id（KAYA_CHAT_MODEL 语义）
 		defaultDisplay: "DeepSeek Chat",
 		wantMaxTokens:  `"max_tokens":8192`,
+		// T9：网关面在既有五个字段之后**追加**能力描述（派发判定 + 上下
+		// 文/输出硬上限）。本 fixture 的部署是 openai_chat（适配层承载工具
+		// 与推理）、路由能力清单为空（= 全部能力），模型只声明 text → 图
+		// 片为 false。
+		modelsCapabilitySuffix: `,"supports_images":false,"supports_tools":true,"supports_thinking":true,` +
+			`"context_tokens":128000,"max_output_tokens":8192,` +
+			`"capability_description":"images: no; tools: yes; thinking: yes; context: 128000 tokens; max output: 8192 tokens"`,
 	}
 }
 
@@ -1489,8 +1508,10 @@ func caseChatContractModels(t *testing.T, env *chatContractEnv) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /chat/models = %d: %s", w.Code, w.Body.String())
 	}
-	want := fmt.Sprintf(`{"code":0,"data":{"models":[{"id":%q,"display_name":%q,"provider":"deepseek","default":true,"input_modalities":["text"]}]}}`,
-		env.defaultModelID, env.defaultDisplay)
+	// T9：网关面（facade）在既有五个字段之后**追加**了能力描述；legacy 的
+	// picker 保持原样。两种后端各自的字节精确形状由 env 给出。
+	want := fmt.Sprintf(`{"code":0,"data":{"models":[{"id":%q,"display_name":%q,"provider":"deepseek","default":true,"input_modalities":["text"]%s}]}}`,
+		env.defaultModelID, env.defaultDisplay, env.modelsCapabilitySuffix)
 	if w.Body.String() != want {
 		t.Errorf("/chat/models body = %s, want byte-exact %s", w.Body.String(), want)
 	}
@@ -1636,8 +1657,17 @@ func grantTinyQuotaEntitlement(t *testing.T, db *sqlx.DB, store *postgres.Store,
 }
 
 // TestChatContract_FacadeQuotaExceededIs429 pins the facade-native 429
-// source: 配额耗尽 → ErrChatRateLimited → 与 legacy 上游限流完全相同的
-// client envelope，且预占失败发生在任何上游调用之前（stub 不应被触达）。
+// source: 配额耗尽 → 429，且预占失败发生在任何上游调用之前（stub 不应被
+// 触达）。
+//
+// T6 变更：facade 的**本地**限制（业务速率 / 并发 / 额度 / 余额）与上游
+// 429 必须可区分 —— 请求从未出站，说明不得说成"上游限流"（那会让客户端
+// 去退避重试一个永远不会成功的请求）。因此额度耗尽的 message 改为带业务码
+// 的 `chat request rejected by a usage limit (quota_exceeded)`：
+//   - envelope 形状（{code,data,message}）与状态码 429 不变；
+//   - 上游 429 的文案（`chat upstream rate limit exceeded`）逐字节不变
+//     （caseChatContractUpstreamErrors 的 upstream_rate_limited 行仍然钉住它），
+//     legacy 后端与 facade 后端在同一个上游 429 上仍然逐字节一致。
 func TestChatContract_FacadeQuotaExceededIs429(t *testing.T) {
 	up := newChatStubUpstream(t)
 	env := setupChatContractFacade(t, up)
@@ -1650,9 +1680,9 @@ func TestChatContract_FacadeQuotaExceededIs429(t *testing.T) {
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("quota-exceeded facade /chat = %d, want 429 (%s)", w.Code, w.Body.String())
 	}
-	const wantBody = `{"code":429,"data":null,"message":"chat upstream rate limit exceeded"}`
+	const wantBody = `{"code":429,"data":null,"message":"chat request rejected by a usage limit (quota_exceeded)"}`
 	if w.Body.String() != wantBody {
-		t.Errorf("quota envelope = %s, want byte-exact legacy 429 shape %s", w.Body.String(), wantBody)
+		t.Errorf("quota envelope = %s, want byte-exact local-limit 429 shape %s", w.Body.String(), wantBody)
 	}
 	select {
 	case sent := <-up.lastBody:

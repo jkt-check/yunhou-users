@@ -96,18 +96,18 @@ func TestV1Parse_ThinkingAndPassthroughForwarded(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("thinking_enabled code = %d body = %s", w.Code, w.Body.String())
 	}
-	// 未知 thinking type 按未启用映射（不是错误）。
+	// Unknown thinking types must not silently disable reasoning.
 	w = f.call(t, http.MethodPost, "/v1/chat/completions", f.keyPlain, map[string]any{
 		"model": "glm-4.6", "messages": []map[string]any{{"role": "user", "content": "x"}},
 		"thinking": map[string]any{"type": "sometimes"},
 	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("unknown thinking type code = %d body = %s (按未启用映射)", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown thinking type code = %d body = %s", w.Code, w.Body.String())
 	}
 }
 
 func TestUserAPIKeys_PatchEdges(t *testing.T) {
-	f := newAccessFixture(t, 0)
+	f := newAccessFixture(t)
 	_, token := f.addUser(t)
 	create := func() string {
 		w := f.do(t, http.MethodPost, "/user/api-keys", token, map[string]any{"name": "k1"})

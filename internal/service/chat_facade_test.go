@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yunhou/users/internal/inference/access"
 	"github.com/yunhou/users/internal/inference/catalog"
 	"github.com/yunhou/users/internal/inference/domain"
+	"github.com/yunhou/users/internal/inference/gateway"
 	"github.com/yunhou/users/internal/inference/providers"
 	"github.com/yunhou/users/internal/model"
 )
@@ -367,6 +369,16 @@ func TestMapGatewayError_UnpricedCapabilityIsUpstreamError(t *testing.T) {
 			&providers.DispatchError{StatusCode: 500, Body: `{"error":{"message":"boom"}}`}), ErrChatUpstreamError},
 		{"upstream_transport", domain.WrapError(domain.CodeUpstreamUnavailable, "all compatible upstreams failed",
 			&providers.DispatchError{Err: errors.New("connection refused")}), ErrChatUpstreamError},
+		// T7:服务端**配置**不可用（已发布目录里该模型没有可调度路由、权益
+		// 策略带未实现的超额模式……）→ 明确文案，不是「上游错误」，也不
+		// 承诺重试（配置不会自愈）。
+		{"config_unavailable", &gateway.ErrConfigUnavailable{Err: domain.NewError(domain.CodeUpstreamUnavailable,
+			"model m has no dispatchable route")}, ErrChatConfigUnavailable},
+		// T8:能力不兼容（无部署能承载图片/显式推理档位）→ 明确的能力拒绝
+		// 哨兵（400），**不是**「上游拒绝」（502）：请求从未出站、零预占，
+		// 把责任推给上游并邀请一次注定失败的重试都是错的。
+		{"capability_unsupported", &gateway.ErrCapabilityUnsupported{Err: domain.NewError(domain.CodeInvalidInput,
+			"model m has no deployment that can carry image input")}, ErrChatCapabilityUnsupported},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -698,28 +710,156 @@ func TestChatFacade_RefreshFailureServesLastVerifiedSnapshot(t *testing.T) {
 	}
 }
 
-func TestModalitiesOrDefault(t *testing.T) {
+// T8：透出的 input_modalities = 目录声明 ∩ 派发能力（domain.AdvertisedModalities
+// 是唯一定点，/chat/models 与 legacy picker 共用）。缺省放行口径不变；当已
+// 发布部署不能承载图片时不再 advertise image。
+func TestAdvertisedModalities(t *testing.T) {
 	cases := []struct {
-		name string
-		in   []string
-		want []string
+		name         string
+		in           []string
+		canServeImgs bool
+		want         []string
 	}{
-		{"nil defaults to text+image", nil, []string{"text", "image"}},
-		{"empty defaults to text+image", []string{}, []string{"text", "image"}},
-		{"explicit text-only passthrough", []string{"text"}, []string{"text"}},
-		{"passthrough", []string{"text", "image"}, []string{"text", "image"}},
+		{"nil defaults to text+image", nil, true, []string{"text", "image"}},
+		{"empty defaults to text+image", []string{}, true, []string{"text", "image"}},
+		{"explicit text-only passthrough", []string{"text"}, true, []string{"text"}},
+		{"passthrough", []string{"text", "image"}, true, []string{"text", "image"}},
+		{"declared vision but not servable", []string{"text", "image"}, false, []string{"text"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := modalitiesOrDefault(tc.in)
+			got := domain.AdvertisedModalities(tc.in, tc.canServeImgs)
 			if len(got) != len(tc.want) {
-				t.Fatalf("modalitiesOrDefault(%v) = %v, want %v", tc.in, got, tc.want)
+				t.Fatalf("AdvertisedModalities(%v, %v) = %v, want %v", tc.in, tc.canServeImgs, got, tc.want)
 			}
 			for i := range got {
 				if got[i] != tc.want[i] {
-					t.Fatalf("modalitiesOrDefault(%v) = %v, want %v", tc.in, got, tc.want)
+					t.Fatalf("AdvertisedModalities(%v, %v) = %v, want %v", tc.in, tc.canServeImgs, got, tc.want)
 				}
 			}
 		})
+	}
+}
+
+// T6：/chat 保留既有 envelope，但**本地**限制拒绝（业务速率 / 并发 /
+// 额度 / 余额）必须映射成准确的业务码与说明 —— 不得降级成 generic 502
+// （insufficient_balance 之前就是 502 chat upstream error），文案也不得
+// 把一个从未出站的请求说成"上游限流"。
+//
+// 这一层是 /chat 限制语义的根因：facade 决定了 handler 看到的哨兵，
+// handler 只按哨兵映射状态码与文案。
+func TestMapGatewayError_LocalLimitsAreNotUpstreamErrors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"insufficient_balance", domain.NewError(domain.CodeInsufficientBalance, "wallet balance too low")},
+		{"quota_exceeded", domain.NewError(domain.CodeQuotaExceeded, "plan quota exhausted")},
+		{"quota_exceeded_window", domain.NewQuotaExceeded(
+			[]domain.WindowBlock{{Kind: domain.WindowFiveHour}}, false)},
+		{"rate_limited", domain.NewError(domain.CodeRateLimited, "account rpm exceeded")},
+		{"typed_rate_limited", &domain.RateLimitError{
+			Detail: domain.NewError(domain.CodeRateLimited, "account rpm exceeded"),
+		}},
+		{"insufficient_capacity", domain.NewError(domain.CodeInsufficientCapacity, "concurrency limit reached")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := mapGatewayError(c.err)
+			if errors.Is(got, ErrChatUpstreamError) {
+				t.Errorf("a local usage limit must not be degraded to the generic upstream 502: %v", got)
+			}
+			if !errors.Is(got, ErrChatRateLimited) && !errors.Is(got, ErrChatConcurrencyLimited) {
+				t.Errorf("mapGatewayError = %v, want a 429-class limit error", got)
+			}
+			if !errors.Is(got, ErrChatRequestLimited) {
+				t.Errorf("mapGatewayError = %v, want the local-limit sentinel ErrChatRequestLimited", got)
+			}
+			if strings.Contains(got.Error(), "upstream") {
+				t.Errorf("the message must not blame the upstream for a local limit: %q", got.Error())
+			}
+		})
+	}
+}
+
+func TestMapGatewayError_RetainsKnownRateRecovery(t *testing.T) {
+	for _, seconds := range []int{0, 17} {
+		err := fmt.Errorf("admission: %w", &domain.RateLimitError{
+			Detail:            domain.NewError(domain.CodeRateLimited, "account rpm"),
+			RetryAfterSeconds: seconds,
+		})
+		got := mapGatewayError(err)
+		var lim *ChatLimitError
+		if !errors.As(got, &lim) || !errors.Is(got, ErrChatRequestLimited) {
+			t.Fatalf("want local limit error, got %v", got)
+		}
+		if lim.Code != string(domain.CodeRateLimited) || lim.RetryAfterSeconds != seconds {
+			t.Errorf("mapped limit=%+v, want rate_limited with retry=%d", lim, seconds)
+		}
+	}
+}
+
+// T8: facade 的 AllowedModels 投影（legacy /chat 的模型选择器）与派发能力
+// 一致 —— 只有 openai_responses 部署的模型不得 advertise image（派发会在
+// 准入前 400），有 openai_chat 部署的模型保留 image。
+//
+// 判据与 /chat/models 共用同一个能力判定（routing 的 CompatibleDeployments），
+// 不能另立一条规则。
+func TestChatFacade_AllowedModels_ImageModalitiesFollowDispatchCapability(t *testing.T) {
+	t.Parallel()
+	resolver := access.NewResolver(&facadeKeyStore{
+		account: &domain.BillingAccount{ID: "ba-1", UserID: "u-1", Status: "active"},
+		ents:    []domain.Entitlement{{ID: "e-1", ModelIDs: []string{"glm-v", "glm-c"}}},
+	}, nil)
+	rev := &domain.ConfigRevision{
+		ID: 1, Scope: domain.ScopeCatalog, Revision: 1, IsActive: true,
+		Payload: domain.ExtensionConfig{SchemaVersion: 1, Raw: catalog.BuildCatalogPayload(
+			[]domain.Model{
+				{ID: "glm-v", DisplayName: "GLM V", Lifecycle: domain.LifecycleActive,
+					InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"},
+					ContextTokens: 1000, MaxOutputTokens: 100, Protocols: []domain.Protocol{domain.ProtocolKayaChat}},
+				{ID: "glm-c", DisplayName: "GLM C", Lifecycle: domain.LifecycleActive,
+					InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"},
+					ContextTokens: 1000, MaxOutputTokens: 100, Protocols: []domain.Protocol{domain.ProtocolKayaChat}},
+			},
+			[]domain.Provider{{ID: "prov-1", Code: "zhipu", DisplayName: "Zhipu", AccessType: domain.AccessOfficialAPI, Status: "active"}},
+			[]domain.Deployment{
+				{ID: "dep-v", ProviderID: "prov-1", UpstreamModel: "glm-v",
+					BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIResponses,
+					ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second,
+					Status: domain.DeploymentActive},
+				{ID: "dep-c", ProviderID: "prov-1", UpstreamModel: "glm-c",
+					BaseURL: "https://api.example.com", Protocol: domain.ProtocolOpenAIChat,
+					ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second,
+					Status: domain.DeploymentActive},
+			},
+			[]domain.ModelRoute{
+				{ID: "r-v", ModelID: "glm-v", DeploymentID: "dep-v", Weight: 1, Enabled: true},
+				{ID: "r-c", ModelID: "glm-c", DeploymentID: "dep-c", Weight: 1, Enabled: true},
+			})},
+	}
+	cat := catalog.NewService(&facadeCatalogStore{rev: rev})
+	cat.SetPriceCheck(func(context.Context, string) (bool, error) { return true, nil })
+	snap, err := catalog.ParseSnapshot(rev)
+	if err != nil {
+		t.Fatalf("ParseSnapshot: %v", err)
+	}
+	f := NewChatGatewayFacade(nil, resolver, cat, stubSnapshotSource{snap: snap}, "glm-c")
+
+	models, err := f.AllowedModels(context.Background(), "u-1", "yunhou-website")
+	if err != nil {
+		t.Fatalf("AllowedModels: %v", err)
+	}
+	byID := make(map[string]ChatModelInfo, len(models))
+	for _, m := range models {
+		byID[m.ID] = m
+	}
+	if got := byID["glm-v"].InputModalities; len(got) != 1 || got[0] != "text" {
+		t.Errorf("glm-v InputModalities = %v, want [text] "+
+			"(只有 openai_responses 部署时不得 advertise image)", got)
+	}
+	if got := byID["glm-c"].InputModalities; len(got) != 2 || got[0] != "text" || got[1] != "image" {
+		t.Errorf("glm-c InputModalities = %v, want [text image]", got)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // protocol_error_edges_test.go — Task 16 覆盖率补强：Messages/Responses
@@ -161,5 +162,255 @@ func TestV1Responses_HandlerBranches(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("requests = %d, want 0 (拒绝先于准入)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T6 协议矩阵：三个 /v1 入口 × 五类限制
+//
+// （业务 RPM、业务 TPM、并发、金额额度、永久 Key 预算 + 窗口；外围每 IP
+// 那一格在 internal/router 的装配测试里断言。）
+//
+// 每一格都必须同时满足三件事：
+//  1. 状态码与业务码正确（业务速率 / 金额额度 / 并发三者严格分开）；
+//  2. 错误按**实际入口协议**渲染 —— OpenAI 的 error 对象、Anthropic 的
+//     原生结构 —— 绝不出现管理 envelope（设计 §9.1）；
+//  3. 拒绝发生在任何上游调用之前（零上游触达）。
+//
+// 外围每 IP 429 由通用中间件产生，挂在 /v1 group 外层，形状由
+// router 装配决定 —— 那一格在 internal/router 的装配测试里断言。
+// ---------------------------------------------------------------------------
+
+// protoEntry 是协议矩阵里的一个 /v1 入口。
+type protoEntry struct {
+	name string
+	path string
+	body map[string]any
+	// anthropic = true → 该入口用 Anthropic 原生错误结构
+	// （{"type":"error","error":{"type":…,"message":…}}）。
+	anthropic bool
+}
+
+func protoMatrixEntries() []protoEntry {
+	return []protoEntry{
+		{"chat_completions", "/v1/chat/completions", map[string]any{
+			"model":    "glm-4.6",
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		}, false},
+		{"messages", "/v1/messages", map[string]any{
+			"model":      "glm-4.6",
+			"max_tokens": 64,
+			"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+		}, true},
+		{"responses", "/v1/responses", map[string]any{
+			"model": "glm-4.6",
+			"input": "hi",
+		}, false},
+	}
+}
+
+// assertNativeLimitError 断言一个 429 拒绝按入口协议渲染：状态码、JSON
+// Content-Type、原生错误结构、业务码与业务说明。
+func assertNativeLimitError(t *testing.T, w *httptest.ResponseRecorder, anthropic bool, wantCode, wantMsg string) {
+	t.Helper()
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body = %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("content-type = %q, want application/json", ct)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if _, leaked := doc["code"]; leaked {
+		t.Errorf("management envelope leaked into /v1: %s", w.Body.String())
+	}
+	errObj, ok := doc["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("native error object missing: %s", w.Body.String())
+	}
+	if anthropic {
+		if doc["type"] != "error" {
+			t.Errorf("anthropic envelope = %v, want type=error: %s", doc["type"], w.Body.String())
+		}
+		if errObj["type"] != "rate_limit_error" {
+			t.Errorf("anthropic error.type = %v, want rate_limit_error: %s", errObj["type"], w.Body.String())
+		}
+	} else {
+		if errObj["type"] != "rate_limit_error" {
+			t.Errorf("error.type = %v, want rate_limit_error: %s", errObj["type"], w.Body.String())
+		}
+		if errObj["code"] != wantCode {
+			t.Errorf("error.code = %v, want %s: %s", errObj["code"], wantCode, w.Body.String())
+		}
+	}
+	msg, _ := errObj["message"].(string)
+	if wantMsg != "" && !strings.Contains(msg, wantMsg) {
+		t.Errorf("error.message = %q, want it to name %q", msg, wantMsg)
+	}
+}
+
+// drainUpstream 清空已记录的上游请求体,返回清掉的条数。
+func drainUpstream(f *protoFixture) int {
+	n := 0
+	for {
+		select {
+		case <-f.lastBodies:
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+// TestV1ProtocolMatrix_BusinessRateLimit 业务速率限制（Key RPM）：第一个
+// 请求放行并计入滚动窗口，第二个必须被拒 —— 429 rate_limited，零上游触达。
+func TestV1ProtocolMatrix_BusinessRateLimit(t *testing.T) {
+	for _, e := range protoMatrixEntries() {
+		t.Run(e.name, func(t *testing.T) {
+			f := newProtoFixture(t)
+			// Key 级 RPM = 1：第二个请求必然超限。
+			if _, err := f.db.Exec(`UPDATE inference_api_keys SET rpm_limit = 1 WHERE id = $1`, f.keyID); err != nil {
+				t.Fatal(err)
+			}
+			// 第一个请求放行（计入滚动窗口）。
+			w := f.call(t, http.MethodPost, e.path, f.keyPlain, e.body)
+			if w.Code != http.StatusOK {
+				t.Fatalf("first request = %d, want 200; body = %s", w.Code, w.Body.String())
+			}
+			if n := drainUpstream(f); n != 1 {
+				t.Fatalf("upstream calls = %d, want 1", n)
+			}
+			// 第二个请求：被业务速率闸门拒绝，零上游触达。
+			w = f.call(t, http.MethodPost, e.path, f.keyPlain, e.body)
+			assertNativeLimitError(t, w, e.anthropic, "rate_limited", "rate limit exceeded")
+			if n := drainUpstream(f); n != 0 {
+				t.Errorf("upstream calls after the rejection = %d, want 0", n)
+			}
+			// RPM 的恢复时刻可确定（最旧计数行滚出 60 秒窗口）→ 带 Retry-After。
+			if retry := w.Header().Get("Retry-After"); retry == "" {
+				t.Error("Retry-After must be present when every blocker has a determinable recovery instant")
+			}
+		})
+	}
+}
+
+// TestV1ProtocolMatrix_BusinessTokenLimit 账户级 TPM：策略 TPM 上限被击穿
+// 时是独立的 429 rate_limited；在途/未知用量无法确定恢复时刻时**不得**
+// 编造 Retry-After。
+func TestV1ProtocolMatrix_BusinessTokenLimit(t *testing.T) {
+	for _, e := range protoMatrixEntries() {
+		t.Run(e.name, func(t *testing.T) {
+			f := newProtoFixture(t)
+			if _, err := f.db.Exec(`UPDATE inference_policy_versions SET tpm_limit = 1 WHERE id = $1`, f.policyID); err != nil {
+				t.Fatal(err)
+			}
+			w := f.call(t, http.MethodPost, e.path, f.keyPlain, e.body)
+			assertNativeLimitError(t, w, e.anthropic, "rate_limited", "policy_tpm")
+			if n := drainUpstream(f); n != 0 {
+				t.Errorf("upstream calls = %d, want 0 (拒绝先于准入)", n)
+			}
+			// 恢复时刻不可确定（没有任何已结算行可滚出窗口）→ 不编造倒计时。
+			if retry := w.Header().Get("Retry-After"); retry != "" {
+				t.Errorf("Retry-After = %q, want none (恢复时刻不可确定时不得编造)", retry)
+			}
+		})
+	}
+}
+
+// TestV1ProtocolMatrix_ConcurrencyLimit 并发上限（Key 级）：第一个请求在途
+// 占住槽位，第二个必须被拒 —— 429 insufficient_capacity，零上游触达。
+func TestV1ProtocolMatrix_ConcurrencyLimit(t *testing.T) {
+	for _, e := range protoMatrixEntries() {
+		t.Run(e.name, func(t *testing.T) {
+			f := newProtoFixture(t)
+			if _, err := f.db.Exec(`UPDATE inference_api_keys SET concurrency_limit = 1 WHERE id = $1`, f.keyID); err != nil {
+				t.Fatal(err)
+			}
+			// 上游阻塞：让第一个请求一直占着 Key 槽位。
+			release := make(chan struct{})
+			arrived := make(chan struct{}, 4)
+			orig := f.upstream.Config.Handler
+			f.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case arrived <- struct{}{}:
+				default:
+				}
+				<-release
+				orig.ServeHTTP(w, r)
+			})
+			defer func() { f.upstream.Config.Handler = orig }()
+
+			first := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				first <- f.call(t, http.MethodPost, e.path, f.keyPlain, e.body)
+			}()
+			select {
+			case <-arrived:
+			case <-time.After(10 * time.Second):
+				close(release)
+				t.Fatal("the first request never reached the upstream")
+			}
+			// 槽位已占：第二个请求必须在准入阶段被拒。
+			w := f.call(t, http.MethodPost, e.path, f.keyPlain, e.body)
+			close(release)
+			<-first
+			assertNativeLimitError(t, w, e.anthropic, "insufficient_capacity", "concurrency limit")
+			if n := drainUpstream(f); n != 1 {
+				t.Errorf("upstream calls = %d, want 1 (只有第一个请求出站)", n)
+			}
+		})
+	}
+}
+
+// TestV1ProtocolMatrix_MoneyQuota 金额额度耗尽：429 quota_exceeded，与业务
+// 速率限制严格分开；窗口重置时刻可确定 → 带 Retry-After。
+func TestV1ProtocolMatrix_MoneyQuota(t *testing.T) {
+	for _, e := range protoMatrixEntries() {
+		t.Run(e.name, func(t *testing.T) {
+			f := newProtoFixture(t)
+			if _, err := f.db.Exec(`UPDATE inference_policy_versions SET five_hour_limit_micros = 1 WHERE id = $1`, f.policyID); err != nil {
+				t.Fatal(err)
+			}
+			w := f.call(t, http.MethodPost, e.path, f.keyPlain, e.body)
+			assertNativeLimitError(t, w, e.anthropic, "quota_exceeded", "quota exceeded")
+			if n := drainUpstream(f); n != 0 {
+				t.Errorf("upstream calls = %d, want 0 (拒绝先于准入)", n)
+			}
+			if retry := w.Header().Get("Retry-After"); retry == "" {
+				t.Error("Retry-After must be present when every blocking window has a determinable reset")
+			}
+		})
+	}
+}
+
+// TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown Key 的累计预算
+// （永久阻断项）与窗口同时阻断时：不得给出编造的倒计时，且必须点名
+// key budget —— 窗口重置永远解不开一个耗尽的 Key 预算。
+func TestV1ProtocolMatrix_PermanentKeyBudgetCarriesNoCountdown(t *testing.T) {
+	for _, e := range protoMatrixEntries() {
+		t.Run(e.name, func(t *testing.T) {
+			f := newProtoFixture(t)
+			// Key 累计预算耗尽（不按周期清零 → 永久）。
+			if _, err := f.db.Exec(`UPDATE inference_api_keys SET budget_limit_micros = 1 WHERE id = $1`, f.keyID); err != nil {
+				t.Fatal(err)
+			}
+			// 同时五小时窗口也阻断。
+			if _, err := f.db.Exec(`UPDATE inference_policy_versions SET five_hour_limit_micros = 1 WHERE id = $1`, f.policyID); err != nil {
+				t.Fatal(err)
+			}
+			w := f.call(t, http.MethodPost, e.path, f.keyPlain, e.body)
+			assertNativeLimitError(t, w, e.anthropic, "quota_exceeded", "quota exceeded")
+			if !strings.Contains(w.Body.String(), "key budget exhausted") {
+				t.Errorf("the permanent blocker must be named: %s", w.Body.String())
+			}
+			if retry := w.Header().Get("Retry-After"); retry != "" {
+				t.Errorf("Retry-After = %q, want none (Key 预算耗尽是永久阻断项)", retry)
+			}
+			if n := drainUpstream(f); n != 0 {
+				t.Errorf("upstream calls = %d, want 0 (拒绝先于准入)", n)
+			}
+		})
 	}
 }

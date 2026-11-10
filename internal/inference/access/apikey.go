@@ -105,7 +105,13 @@ type CreateParams struct {
 	// it never adds to the account's total (设计 §4.2, Task 5 控制者决定).
 	BudgetMicros *int64
 	RPMLimit     *int
-	ExpiresAt    *time.Time
+	// ConcurrencyLimit is the optional per-Key concurrency cap (Task 5).
+	// nil = this key adds NO Key-level limit (the account-level policy
+	// limit still applies); a positive value caps how many requests THIS
+	// key may have in flight at once. It only narrows the shared account
+	// entitlement — it never relaxes the account's own cap.
+	ConcurrencyLimit *int
+	ExpiresAt        *time.Time
 }
 
 // CreatedKey is the one-time creation result: Plaintext leaves the server
@@ -161,6 +167,9 @@ func (s *KeyService) CreateKey(ctx context.Context, userID string, p CreateParam
 	if p.RPMLimit != nil && *p.RPMLimit <= 0 {
 		return nil, domain.NewError(domain.CodeInvalidInput, "rpm_limit must be > 0")
 	}
+	if p.ConcurrencyLimit != nil && *p.ConcurrencyLimit <= 0 {
+		return nil, domain.NewError(domain.CodeInvalidInput, "concurrency_limit must be > 0")
+	}
 	if p.ExpiresAt != nil && !p.ExpiresAt.After(s.now()) {
 		return nil, domain.NewError(domain.CodeInvalidInput, "expires_at must be in the future")
 	}
@@ -190,6 +199,7 @@ func (s *KeyService) CreateKey(ctx context.Context, userID string, p CreateParam
 			Prefix:           prefix,
 			ModelAllow:       allow,
 			RPMLimit:         p.RPMLimit,
+			ConcurrencyLimit: p.ConcurrencyLimit,
 			Status:           domain.APIKeyActive,
 			ExpiresAt:        p.ExpiresAt,
 		}
@@ -234,8 +244,9 @@ func (s *KeyService) GetKey(ctx context.Context, userID, keyID string) (*domain.
 
 // KeyPatch describes a permission/budget update. A nil pointer keeps the
 // current value; the Clear* flags remove an optional constraint
-// (budget / rpm / expiry). ModelAllow uses a pointer-to-slice: nil keeps,
-// &[]string{} clears the narrowing, &[]string{...} replaces.
+// (budget / rpm / concurrency / expiry). ModelAllow uses a
+// pointer-to-slice: nil keeps, &[]string{} clears the narrowing,
+// &[]string{...} replaces.
 type KeyPatch struct {
 	Name         *string
 	ModelAllow   *[]string
@@ -243,8 +254,12 @@ type KeyPatch struct {
 	ClearBudget  bool
 	RPMLimit     *int
 	ClearRPM     bool
-	ExpiresAt    *time.Time
-	ClearExpires bool
+	// ConcurrencyLimit sets the per-Key concurrency cap (Task 5); nil
+	// keeps the current value, ClearConcurrency removes it.
+	ConcurrencyLimit *int
+	ClearConcurrency bool
+	ExpiresAt        *time.Time
+	ClearExpires     bool
 }
 
 // UpdateKey applies a patch after the same ownership and scope checks as
@@ -289,6 +304,14 @@ func (s *KeyService) UpdateKey(ctx context.Context, userID, keyID string, patch 
 			return nil, domain.NewError(domain.CodeInvalidInput, "rpm_limit must be > 0")
 		}
 		key.RPMLimit = patch.RPMLimit
+	}
+	if patch.ClearConcurrency {
+		key.ConcurrencyLimit = nil
+	} else if patch.ConcurrencyLimit != nil {
+		if *patch.ConcurrencyLimit <= 0 {
+			return nil, domain.NewError(domain.CodeInvalidInput, "concurrency_limit must be > 0")
+		}
+		key.ConcurrencyLimit = patch.ConcurrencyLimit
 	}
 	if patch.ClearExpires {
 		key.ExpiresAt = nil

@@ -106,7 +106,7 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 
 	var input, output, cacheRead, cacheWrite *int64
 	flushUsage := func() {
-		// message_start already reported input/cache; message_delta carries
+		// message_start reports initial counters; message_delta carries
 		// cumulative output. The tap always holds the latest merged view.
 		if input != nil || output != nil || cacheRead != nil || cacheWrite != nil {
 			tap.recordUsage(input, output, cacheRead, cacheWrite,
@@ -114,24 +114,50 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 		}
 	}
 	stopSeen := false
+	failed := false
 	for scanner.Scan() {
-		data, ok := strings.CutPrefix(scanner.Text(), "data: ")
+		data, ok := strings.CutPrefix(scanner.Text(), "data:")
 		if !ok {
 			continue // event:/comment/blank lines
 		}
 		var ev anthropicEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
 			continue // unknown/malformed event — keep the stream alive
 		}
-		var err error
+		// Meter even after failure: later cumulative counters remain useful
+		// for settlement, but cannot turn the stream back into a success.
 		switch ev.Type {
 		case "message_start":
 			if ev.Message != nil && ev.Message.Usage != nil {
 				input = ev.Message.Usage.InputTokens
+				output = ev.Message.Usage.OutputTokens
 				cacheRead = ev.Message.Usage.CacheReadTokens
 				cacheWrite = ev.Message.Usage.CacheCreationTokens
 				flushUsage()
 			}
+		case "content_block_delta":
+			if ev.Delta != nil {
+				switch ev.Delta.Type {
+				case "text_delta":
+					tap.addContent(len(ev.Delta.Text))
+				case "thinking_delta":
+					tap.addContent(len(ev.Delta.Thinking))
+				case "input_json_delta":
+					tap.addContent(len(ev.Delta.PartialJSON))
+				}
+			}
+		case "message_delta":
+			if ev.Usage != nil && ev.Usage.OutputTokens != nil {
+				output = ev.Usage.OutputTokens // cumulative — latest wins
+				flushUsage()
+			}
+		}
+		if failed {
+			continue
+		}
+		var err error
+		switch ev.Type {
+		case "message_start":
 			err = writeOpenAIChunk(w, map[string]any{"role": "assistant"}, "")
 		case "content_block_start":
 			if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
@@ -148,10 +174,8 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 			}
 			switch ev.Delta.Type {
 			case "text_delta":
-				tap.addContent(len(ev.Delta.Text))
 				err = writeOpenAIChunk(w, map[string]any{"content": ev.Delta.Text}, "")
 			case "thinking_delta":
-				tap.addContent(len(ev.Delta.Thinking))
 				err = writeOpenAIChunk(w, map[string]any{"reasoning_content": ev.Delta.Thinking}, "")
 			case "input_json_delta":
 				err = writeOpenAIChunk(w, map[string]any{"tool_calls": []any{map[string]any{
@@ -160,10 +184,6 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 				}}}, "")
 			}
 		case "message_delta":
-			if ev.Usage != nil && ev.Usage.OutputTokens != nil {
-				output = ev.Usage.OutputTokens // cumulative — latest wins
-				flushUsage()
-			}
 			if ev.Delta != nil && ev.Delta.StopReason != "" {
 				err = writeOpenAIChunk(w, map[string]any{}, mapAnthropicStopReason(ev.Delta.StopReason))
 			}
@@ -173,11 +193,13 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 			// 评审轮2 M5：上游从未报 usage 时只发 [DONE]——缺失 usage 绝不
 			// 渲染为 {"total_tokens":0}（与下方 !stopSeen 分支同一纪律）。
 			if res := tap.Result(); res.SawUsage {
-				err = writeOpenAIUsageAndDone(w, res.Buckets)
+				err = writeOpenAIUsageAndDone(w, res.Buckets, nil)
 			} else {
 				_, err = io.WriteString(w, "data: [DONE]\n\n")
 			}
 		case "error":
+			failed = true
+			tap.markFailed()
 			// kaya/OpenAI clients parse the {"error":...} chunk convention
 			// (the same shape the gateway injects on upstream breaks).
 			err = writeRawSSE(w, map[string]any{"error": map[string]any{"message": "upstream anthropic error"}})
@@ -194,9 +216,9 @@ func translateAnthropicEvents(body io.Reader, w io.Writer, tap *anthropicTap) er
 	// partial answer as complete — and on the upstream-error path the
 	// gateway's upstream-broke error event must be the last thing the client
 	// sees.
-	if !stopSeen {
+	if !stopSeen || failed {
 		if b := tap.Result(); b.SawUsage {
-			if err := writeOpenAIUsage(w, b.Buckets); err != nil {
+			if err := writeOpenAIUsage(w, b.Buckets, nil); err != nil {
 				return err
 			}
 		}
@@ -220,8 +242,8 @@ func writeOpenAIChunk(w io.Writer, delta map[string]any, finish string) error {
 // writeOpenAIUsageAndDone emits the terminal usage chunk followed by [DONE] —
 // the clean message_stop ending. [DONE] marks the answer COMPLETE, so the
 // abnormal-termination flush (no message_stop) uses writeOpenAIUsage instead.
-func writeOpenAIUsageAndDone(w io.Writer, b domain.UsageBuckets) error {
-	if err := writeOpenAIUsage(w, b); err != nil {
+func writeOpenAIUsageAndDone(w io.Writer, b domain.UsageBuckets, reportedTotal *int64) error {
+	if err := writeOpenAIUsage(w, b, reportedTotal); err != nil {
 		return err
 	}
 	_, err := io.WriteString(w, "data: [DONE]\n\n")
@@ -231,41 +253,11 @@ func writeOpenAIUsageAndDone(w io.Writer, b domain.UsageBuckets) error {
 // writeOpenAIUsage emits just the usage chunk (the shape an OpenAI
 // UsageTracker looks for) — no [DONE]. Nil buckets render as absent keys;
 // a bucket the upstream never reported is never written as 0.
-func writeOpenAIUsage(w io.Writer, b domain.UsageBuckets) error {
-	usage := map[string]any{}
-	var total int64
-	if b.InputTokens != nil {
-		usage["prompt_tokens"] = *b.InputTokens
-		total += *b.InputTokens
-	}
-	if b.OutputTokens != nil {
-		usage["completion_tokens"] = *b.OutputTokens
-		total += *b.OutputTokens
-	}
-	if b.CacheReadTokens != nil || b.CacheWriteTokens != nil {
-		details := map[string]any{}
-		if b.CacheReadTokens != nil {
-			details["cached_tokens"] = *b.CacheReadTokens
-		}
-		usage["prompt_tokens_details"] = details
-	}
-	if b.ReasoningTokens != nil {
-		// Responses-origin reasoning detail rides the wire so the client
-		// surfaces can render it natively (Anthropic never sets the bucket —
-		// its reasoning is inseparable from output).
-		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": *b.ReasoningTokens}
-	}
-	if b.CacheWriteTokens != nil {
-		// Anthropic-origin cache creation has no chat-completions home; the
-		// extension key keeps it on the wire for the Messages surface (Task
-		// 13) and is ignored by OpenAI-shape consumers.
-		usage["cache_creation_input_tokens"] = *b.CacheWriteTokens
-	}
-	usage["total_tokens"] = total
+func writeOpenAIUsage(w io.Writer, b domain.UsageBuckets, reportedTotal *int64) error {
 	return writeRawSSE(w, map[string]any{
 		"object":  "chat.completion.chunk",
 		"choices": []any{},
-		"usage":   usage,
+		"usage":   openAIUsageShape(b, reportedTotal),
 	})
 }
 

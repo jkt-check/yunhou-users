@@ -138,6 +138,37 @@ func TestOpenAIResponsesPayload_ThinkingDisabled(t *testing.T) {
 	}
 }
 
+func TestOpenAIAdapters_ExplicitReasoningEffortPrecedesToggle(t *testing.T) {
+	on, off := true, false
+	for _, effort := range domain.SupportedReasoningEfforts() {
+		for _, toggle := range []struct {
+			name string
+			on   *bool
+		}{{"unset", nil}, {"enabled", &on}, {"disabled", &off}} {
+			t.Run(effort+"/"+toggle.name, func(t *testing.T) {
+				call := testCall("m", false, 2048,
+					[]model.ChatMessage{{Role: "user", Content: "x"}}, nil, toggle.on)
+				call.Request.ReasoningEffort = effort
+				for _, adapter := range []Adapter{NewOpenAIChat(), NewOpenAIResponses()} {
+					body, err := adapter.BuildPayload(call)
+					if err != nil {
+						t.Fatal(err)
+					}
+					payload := decode(t, body)
+					got := payload["reasoning_effort"]
+					if adapter.Protocol() == domain.ProtocolOpenAIResponses {
+						got = payload["reasoning"].(map[string]any)["effort"]
+					}
+					if got != effort {
+						t.Errorf("%s: effort=%v, want %s with toggle %s",
+							adapter.Protocol(), got, effort, toggle.name)
+					}
+				}
+			})
+		}
+	}
+}
+
 // 不支持的采样参数显式 400 —— 不静默丢字段（设计）。
 func TestOpenAIResponsesPayload_RejectsUnsupportedPassthrough(t *testing.T) {
 	for _, key := range []string{"stop", "seed", "presence_penalty", "frequency_penalty", "top_k"} {
@@ -200,8 +231,8 @@ func TestOpenAIResponsesDecodeNonStream_Full(t *testing.T) {
 	if u.ReasoningTokens == nil || *u.ReasoningTokens != 30 {
 		t.Errorf("reasoning = %v, want 30", u.ReasoningTokens)
 	}
-	if res.ContentBytes != int64(len("done")+len("thinking hard")) {
-		t.Errorf("ContentBytes = %d (content + reasoning 口径)", res.ContentBytes)
+	if res.ContentBytes != int64(len("done")+len("thinking hard")+len(`{"cmd":"ls"}`)) {
+		t.Errorf("ContentBytes = %d (text + reasoning + tool arguments)", res.ContentBytes)
 	}
 	// 翻译后的内部 chat.completion：finish_reason=tool_calls，usage 以
 	// OpenAI 形状随线（客户端面渲染 cached/reasoning）。

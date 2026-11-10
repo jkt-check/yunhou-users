@@ -1468,6 +1468,63 @@ production code. No independent Task 31 or whole-branch clean review,
 real-provider/client/cross-host acceptance, push, merge or deployment is
 claimed. Kaya and inherited agents were not operated.
 
+## Task 32: Preserve Partial Public Usage
+
+**Files:** native usage writers and Messages/Responses public renderers in
+`internal/inference/providers`, new presence-aware provider/HTTP tests, API
+guide and verification runbook.
+
+**Interfaces:** keep `domain.UsageBuckets` unchanged. A shared wire renderer
+accepts buckets plus an optional reported total. Responses stream translation
+retains the latest reported total separately from accounting buckets.
+
+- [x] Write provider regressions across all three native/public protocols,
+  streaming and nonstreaming, with input-only, output-only, detail-only,
+  total-only, explicit zeros, complete controls and fragmented SSE.
+- [x] Observe focused RED for fabricated counters and lost reported total.
+- [x] Add authenticated HTTP regressions proving public omission agrees with
+  persisted nullable counters, settlement and TPM. Observe owned-database RED.
+- [ ] Preserve known fields and explicit zeros; derive totals only from two
+  known nonnegative counters with safe arithmetic. Preserve reported totals.
+- [ ] Retain Anthropic cache inclusion conversion without manufacturing a main
+  input from detail-only usage. Omit unrepresentable derived fields rather
+  than overflow or clamp. Leave initial Messages protocol placeholders alone.
+- [ ] Run focused GREEN, complete providers race, then owned build/vet/full
+  race coverage and separate E2E; record evidence and commit locally.
+
+Ruling: missing usage counters stay absent on public output, not zero.
+Inclusive Chat/Responses totals retain the upstream report; totals derived
+from Anthropic-origin exclusive input are recomputed after cache inclusion.
+Cache adjustments require a known main input, and arithmetic that cannot
+produce a nonnegative int64 leaves the derived field unknown.
+Cost: clients assuming every optional counter exists must handle omission.
+Accounting validation and initial Messages stream placeholder usage do not
+change; a reported total alone never invents billable input/output buckets.
+
+Local commit checkpoint (2026-11-10): the latest request is commit only.
+This checkpoint contains the plan and two regression test files, not a
+production fix. HTTP usage comparison accepts nested detail objects so
+unexpected details are reported as field mismatches without preventing
+the subsequent persisted metering and resource-release assertions.
+
+Fresh focused race command:
+`env GOMAXPROCS=2 zsh /private/tmp/yunhou-review-20261109.3NuMWy/run.zsh ./internal/inference/providers ./internal/inference/httpapi -run '^(TestPartialUsage_|TestV1PartialUsage_)' -timeout=5m`
+exited 1. Providers recorded 64 passing and 153 failing tests/subtests
+(2.461s); HTTP recorded four passing and 33 failing tests/subtests
+(54.393s, including 32 failing leaf cases). Neither package skipped tests.
+All HTTP failures are public usage mismatches; persisted nullable counters,
+settlement, TPM and resource-release assertions reported no failures.
+Evidence is in
+`/private/tmp/yunhou-review-20261109.3NuMWy/run.kKwTKl/focused.jsonl`.
+The runner used independently created disposable databases with explicit
+DSNs; cleanup confirmed its PostgreSQL stopped and `postmaster.pid` is
+absent.
+
+This is a verified RED checkpoint, not a fix or convergence claim.
+Full race, E2E and coverage were not rerun; prior coverage belongs to
+Task 31, not this tree. Production implementation and GREEN gates remain
+open. No push, merge, deployment, kaya or inherited-agent operation.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

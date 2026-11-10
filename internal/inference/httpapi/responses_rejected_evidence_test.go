@@ -206,7 +206,7 @@ func TestV1Responses_InterruptedRefusalWithoutUsageKeepsHold(t *testing.T) {
 				{`SELECT COUNT(*) FROM inference_usage_records`, 0},
 				{`SELECT COUNT(*) FROM inference_ledger_entries WHERE entry_type='charge'`, 0},
 				{`SELECT COUNT(*) FROM inference_response_chains`, 0},
-				{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='active'`, 0},
+				{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='held'`, 0},
 			} {
 				var n int
 				if err := f.db.QueryRow(check.sql).Scan(&n); err != nil {
@@ -217,5 +217,86 @@ func TestV1Responses_InterruptedRefusalWithoutUsageKeepsHold(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestV1Responses_RealFailureAfterRejectionWithoutUsageKeepsHold(t *testing.T) {
+	for _, surface := range []string{"chat/completions", "messages", "responses"} {
+		for _, rejected := range []string{"incomplete", "refusal"} {
+			for _, failure := range []string{"error", "failed", "failed_object", "read_error"} {
+				t.Run(surface+"/"+rejected+"/"+failure, func(t *testing.T) {
+					f := newMatrixFixture(t, domain.ProtocolOpenAIResponses)
+					terminal := "data: " + `{"type":"response.incomplete","response":{"status":"incomplete"}}` + "\n\n"
+					wire := terminal
+					if rejected == "refusal" {
+						terminal = "data: " + `{"type":"response.completed","response":{"status":"completed"}}` + "\n\n"
+						wire = "data: " + `{"type":"response.refusal.delta","delta":"no"}` + "\n\n" + terminal
+					}
+					switch failure {
+					case "error":
+						wire += "data: " + `{"type":"error","message":"broken"}` + "\n\n"
+					case "failed":
+						wire += "data: " + `{"type":"response.failed","response":{"status":"failed"}}` + "\n\n"
+					case "failed_object":
+						wire += "data: " + `{"type":"response.completed","response":{"status":"failed"}}` + "\n\n"
+					}
+					wire += terminal
+					f.upstreamHandler.Store(func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+						w.Header().Set("Content-Type", "text/event-stream")
+						if failure == "read_error" {
+							w.Header().Set("Content-Length", fmt.Sprint(len(wire)+10))
+						}
+						_, _ = io.WriteString(w, wire)
+					})
+					body := map[string]any{"model": "glm-4.6", "stream": true}
+					if surface == "responses" {
+						body["input"], body["max_output_tokens"], body["store"] = "hello", 32, true
+					} else {
+						body["messages"] = []map[string]any{{"role": "user", "content": "hello"}}
+						body["max_tokens"] = 32
+					}
+					w := f.call(t, http.MethodPost, "/v1/"+surface, body)
+					if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"error"`) {
+						t.Errorf("rejection status=%d body=%s", w.Code, w.Body.String())
+					}
+					for _, terminal := range []string{"[DONE]", "event: message_stop\n", "event: response.completed\n", "event: response.incomplete\n"} {
+						if strings.Contains(w.Body.String(), terminal) {
+							t.Errorf("failed execution emitted %q: %s", terminal, w.Body.String())
+						}
+					}
+					var status, usage, attempt string
+					if err := f.db.QueryRow(`SELECT r.status, r.usage_status, a.status
+						FROM inference_requests r JOIN inference_attempts a ON a.request_id=r.id`).
+						Scan(&status, &usage, &attempt); err != nil {
+						t.Fatal(err)
+					}
+					if status != "reconciliation_required" || usage != "unknown" || attempt != "failed" ||
+						f.upCalls.Load() != 1 {
+						t.Errorf("execution=%s/%s attempt=%s upstream calls=%d", status, usage, attempt, f.upCalls.Load())
+					}
+					for _, check := range []struct {
+						sql  string
+						want int
+					}{
+						{`SELECT COUNT(*) FROM inference_attempts`, 1},
+						{`SELECT COUNT(*) FROM inference_reservations WHERE state='held'`, 4},
+						{`SELECT COUNT(*) FROM inference_reconciliation_jobs WHERE status='pending'`, 1},
+						{`SELECT COUNT(*) FROM inference_usage_records`, 0},
+						{`SELECT COUNT(*) FROM inference_ledger_entries WHERE entry_type='charge'`, 0},
+						{`SELECT COUNT(*) FROM inference_response_chains`, 0},
+						{`SELECT COUNT(*) FROM inference_concurrency_leases WHERE state='held'`, 0},
+						{`SELECT COUNT(*) FROM inference_rate_reservations WHERE scope='account' AND state='reserved'`, 1},
+					} {
+						var n int
+						if err := f.db.QueryRow(check.sql).Scan(&n); err != nil {
+							t.Fatal(err)
+						}
+						if n != check.want {
+							t.Errorf("%s = %d, want %d", check.sql, n, check.want)
+						}
+					}
+				})
+			}
+		}
 	}
 }

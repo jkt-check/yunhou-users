@@ -142,3 +142,45 @@ func TestResponsesIncomplete_ActualFailureDominatesCompleteRejection(t *testing.
 		}
 	}
 }
+
+func TestResponsesIncomplete_TerminalStatusMustAgree(t *testing.T) {
+	for _, tc := range []struct {
+		event, status, reason, finish string
+	}{
+		{"completed", "incomplete", "max_output_tokens", ""},
+		{"completed", "incomplete", "content_filter", ""},
+		{"incomplete", "completed", "max_output_tokens", ""},
+		{"incomplete", "completed", "content_filter", ""},
+		{"incomplete", "incomplete", "max_output_tokens", "length"},
+		{"incomplete", "", "content_filter", "content_filter"},
+		{"completed", "completed", "", "stop"},
+		{"completed", "", "", "stop"},
+	} {
+		for _, size := range []int{1, 4096} {
+			t.Run(fmt.Sprintf("%s/%s/%s/chunk=%d", tc.event, tc.status, tc.reason, size), func(t *testing.T) {
+				wire := fmt.Sprintf("data: "+`{"type":"response.%s","response":{"status":%q,"incomplete_details":{"reason":%q},"usage":{"input_tokens":10,"output_tokens":3}}}`+"\n\n",
+					tc.event, tc.status, tc.reason)
+				st := TranslateResponsesStream(io.NopCloser(boundedChunkReader{strings.NewReader(wire), size}))
+				defer st.Body.Close()
+				body, err := io.ReadAll(st.TeeBody())
+				if err != nil {
+					t.Fatal(err)
+				}
+				tap := st.Tap.Result()
+				if !tap.SawUsage || tap.Buckets.InputTokens == nil || *tap.Buckets.InputTokens != 10 ||
+					tap.Buckets.OutputTokens == nil || *tap.Buckets.OutputTokens != 3 {
+					t.Fatalf("terminal lost usage: %+v", tap)
+				}
+				if tc.finish == "" {
+					if strings.Count(string(body), `"error"`) != 1 || strings.Contains(string(body), "[DONE]") ||
+						strings.Contains(string(body), `"finish_reason"`) || tap.Terminal || !tap.RejectedComplete {
+						t.Errorf("conflicting terminal accepted: body=%s tap=%+v", body, tap)
+					}
+				} else if !strings.Contains(string(body), `"finish_reason":"`+tc.finish+`"`) ||
+					!strings.Contains(string(body), "[DONE]") || !tap.Terminal || tap.RejectedComplete {
+					t.Errorf("supported terminal rejected: body=%s tap=%+v", body, tap)
+				}
+			})
+		}
+	}
+}

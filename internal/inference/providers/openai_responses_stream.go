@@ -32,6 +32,7 @@ package providers
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -100,6 +101,7 @@ func (t *responsesTap) markTerminal() {
 func (t *responsesTap) markFailed() {
 	t.mu.Lock()
 	t.res.Terminal = false
+	t.res.RejectedComplete = false
 	t.mu.Unlock()
 }
 
@@ -150,7 +152,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 	toolCalls := map[int]struct{}{}
 	terminalSeen := false
 	failed := false
-	refusalRejected := false
+	translationRejected := false
 	// Deltas add bytes; later part/item/response snapshots repeat that same
 	// content, so only their previously unseen suffix contributes.
 	type contentKey struct {
@@ -248,20 +250,68 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 		case "response.output_item.added", "response.output_item.done":
 			refused = recordItem(ev.OutputIndex, ev.Item)
 		}
-		if (refused || refusalRejected) && ev.Response != nil &&
-			(ev.Type == "response.completed" || ev.Type == "response.incomplete") {
-			tap.markRejectedComplete()
-		}
-		if failed {
+		terminal := ev.Type == "response.completed" || ev.Type == "response.incomplete"
+		// Real upstream failure dominates translation rejection, including
+		// failures received after a rejected terminal and before late usage.
+		if ev.Type == "error" || ev.Type == "response.failed" ||
+			(terminal && ev.Response != nil && ev.Response.Status == "failed") {
+			alreadyFailed := failed
+			failed = true
+			translationRejected = false
+			tap.markFailed()
+			if !alreadyFailed {
+				msg := ev.Message
+				if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {
+					msg = ev.Response.Error.Message
+				}
+				if msg == "" {
+					msg = "upstream responses error"
+				}
+				if err := writeRawSSE(w, map[string]any{"error": map[string]any{"message": msg}}); err != nil {
+					return err
+				}
+			}
 			continue
 		}
+		if failed {
+			if translationRejected && terminal && ev.Response != nil {
+				tap.markRejectedComplete()
+			}
+			continue
+		}
+		var translationErr error
+		finishReason := ""
 		if refused {
+			translationErr = fmt.Errorf("providers: Responses refusal cannot be translated faithfully")
+		} else if terminal {
+			status := strings.TrimPrefix(ev.Type, "response.")
+			incompleteReason := ""
+			hasTools := len(toolCalls) > 0
+			if ev.Response != nil {
+				if ev.Response.Status != "" && ev.Response.Status != status {
+					translationErr = fmt.Errorf("providers: Responses terminal event %q conflicts with status %q", ev.Type, ev.Response.Status)
+				}
+				if ev.Response.IncompleteDetails != nil {
+					incompleteReason = ev.Response.IncompleteDetails.Reason
+				}
+				for _, it := range ev.Response.Output {
+					if it.Type == "function_call" {
+						hasTools = true
+					}
+				}
+			}
+			if translationErr == nil {
+				finishReason, translationErr = responsesFinishReason(status, incompleteReason, hasTools)
+			}
+		}
+		if translationErr != nil {
 			failed = true
-			refusalRejected = true
+			translationRejected = true
 			tap.markFailed()
-			if err := writeRawSSE(w, map[string]any{"error": map[string]any{
-				"message": "providers: Responses refusal cannot be translated faithfully",
-			}}); err != nil {
+			if terminal && ev.Response != nil {
+				tap.markRejectedComplete()
+			}
+			if err := writeRawSSE(w, map[string]any{"error": map[string]any{"message": translationErr.Error()}}); err != nil {
 				return err
 			}
 			continue
@@ -298,26 +348,7 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 		case "response.completed", "response.incomplete":
 			terminalSeen = true
 			tap.markTerminal()
-			hasTools := len(toolCalls) > 0
-			incompleteReason := ""
-			// status 以帧内对象为准，缺省时以事件类型兜底——兼容端点省略
-			// status 时，incomplete 绝不得被渲染成 stop（截断被伪装成完整）。
-			status := strings.TrimPrefix(ev.Type, "response.")
-			if ev.Response != nil {
-				if ev.Response.Status != "" {
-					status = ev.Response.Status
-				}
-				if ev.Response.IncompleteDetails != nil {
-					incompleteReason = ev.Response.IncompleteDetails.Reason
-				}
-				for _, it := range ev.Response.Output {
-					if it.Type == "function_call" {
-						hasTools = true
-					}
-				}
-			}
-			err = writeOpenAIChunk(w, map[string]any{},
-				responsesFinishReason(status, incompleteReason, hasTools))
+			err = writeOpenAIChunk(w, map[string]any{}, finishReason)
 			if err == nil {
 				// 上游从未报 usage 时只发 [DONE]——缺失 usage 绝不渲染为
 				// {"total_tokens":0}（与 anthropic 路径同一纪律）。
@@ -327,31 +358,16 @@ func translateResponsesEvents(body io.Reader, w io.Writer, tap *responsesTap) er
 					_, err = io.WriteString(w, "data: [DONE]\n\n")
 				}
 			}
-		case "response.failed":
-			failed = true
-			tap.markFailed()
-			msg := "upstream responses error"
-			if ev.Response != nil {
-				if ev.Response.Error != nil && ev.Response.Error.Message != "" {
-					msg = ev.Response.Error.Message
-				}
-			}
-			// 非干净结束：错误块后无 [DONE]——半截答案绝不当成完整答案渲染。
-			err = writeRawSSE(w, map[string]any{"error": map[string]any{"message": msg}})
-		case "error":
-			failed = true
-			tap.markFailed()
-			msg := ev.Message
-			if msg == "" {
-				msg = "upstream responses error"
-			}
-			err = writeRawSSE(w, map[string]any{"error": map[string]any{"message": msg}})
 		}
 		if err != nil {
 			return err // client (pipe reader) is gone
 		}
 	}
-	// The stream ended without response.completed/incomplete. Usage seen so
+	if scanner.Err() != nil {
+		failed = true
+		tap.markFailed()
+	}
+	// The stream ended without a supported response.completed/incomplete. Usage seen so
 	// far flushes WITHOUT [DONE] so downstream metering keeps the tokens but
 	// no client renders the partial answer as complete (同 anthropic 路径).
 	if !terminalSeen || failed {

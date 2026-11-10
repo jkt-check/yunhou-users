@@ -1415,6 +1415,27 @@ for this intentionally RED checkpoint; the previous 80.8% coverage belongs
 to Task 30, not this tree. No push, merge, deployment or kaya process
 operation.
 
+Implementation checkpoint (2026-11-10): the latest request is local commit
+only. This checkpoint includes the nonstream/stream rejection implementation,
+terminal-status consistency controls and authenticated HTTP regressions for
+real failures after a translation rejection. It also corrects the interrupted
+refusal test's lease assertion to the actual `held` state.
+
+Fresh commit-time verification:
+`env GOPROXY=off GOFLAGS=-mod=readonly GOMAXPROCS=2 go test -race -count=1 -json ./internal/inference/providers -timeout=5m`
+exited 1 in 10.653s. It recorded 996 passing tests/subtests and 61 failures
+(60 leaf cases plus their parent), all under
+`TestResponsesIncomplete_StreamRejectsWithoutFalseTerminal`. Structured
+evidence is
+`.superpowers/sdd/2026-11-09-model-gateway-review-convergence/task-31-commit-providers.jsonl`.
+`git diff --check` passed before this documentation update.
+
+This is an unfinished implementation checkpoint, not a GREEN or review
+convergence claim. Authenticated HTTP GREEN, full race, E2E and coverage have
+not been rerun for this checkpoint. The prior 80.8% coverage remains Task 30
+evidence only. Task 31 implementation/verification checklist items remain
+open. No push, merge, deployment or kaya process operation.
+
 ## Pending Review Findings (2026-11-10)
 
 This list tracks findings and verified closures; unfinished items are

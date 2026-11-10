@@ -428,21 +428,21 @@ func marshalResponsesRawUsage(u *responsesUsage) json.RawMessage {
 // surfaces render it back as response.incomplete); content_filter passes
 // through under its chat.completions name (审核拦截绝不像正常结束); a
 // completed turn that emitted function calls → tool_calls.
-func responsesFinishReason(status, incompleteReason string, hasToolCalls bool) string {
+func responsesFinishReason(status, incompleteReason string, hasToolCalls bool) (string, error) {
 	if status == "incomplete" {
 		switch incompleteReason {
 		case "max_output_tokens":
-			return "length"
+			return "length", nil
 		case "content_filter":
-			return "content_filter"
+			return "content_filter", nil
 		default:
-			return "stop"
+			return "", fmt.Errorf("providers: Responses incomplete reason %q cannot be translated faithfully", incompleteReason)
 		}
 	}
 	if hasToolCalls {
-		return "tool_calls"
+		return "tool_calls", nil
 	}
-	return "stop"
+	return "stop", nil
 }
 
 // collectResponseOutput folds the output items of a completed response into
@@ -502,6 +502,7 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 	if resp.IncompleteDetails != nil {
 		incompleteReason = resp.IncompleteDetails.Reason
 	}
+	finishReason, finishErr := responsesFinishReason(resp.Status, incompleteReason, len(toolCalls) > 0)
 	message := map[string]any{"role": "assistant", "content": text}
 	if reasoning != "" {
 		message["reasoning_content"] = reasoning
@@ -516,7 +517,7 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 		"choices": []any{map[string]any{
 			"index":         0,
 			"message":       message,
-			"finish_reason": responsesFinishReason(resp.Status, incompleteReason, len(toolCalls) > 0),
+			"finish_reason": finishReason,
 		}},
 	}
 	result := &NonStreamResult{UpstreamRequestID: resp.ID}
@@ -550,6 +551,9 @@ func (a *OpenAIResponses) DecodeNonStream(body []byte) (*NonStreamResult, error)
 	}
 	if translationErr != nil {
 		return result, translationErr
+	}
+	if finishErr != nil {
+		return result, finishErr
 	}
 	payload, err := json.Marshal(out)
 	if err != nil {

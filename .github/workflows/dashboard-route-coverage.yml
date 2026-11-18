@@ -1,0 +1,87 @@
+name: dashboard-route-coverage
+
+# 端点清单漂移门禁：yunhou-users 的权威路由（Gin engine.Routes() 自省）
+# 与 yunhou-deploy 的声明式端点清单必须逐条对齐。新增 / 删除 / 改方法
+# 都会让本 workflow 失败并打印可读的未覆盖 / 陈旧清单。
+#
+# 只读：不部署、不写生产数据、不触碰任何线上服务。
+
+on:
+  pull_request:
+    paths:
+      - 'internal/router/**'
+      - 'internal/handler/**'
+      - 'internal/inference/**'
+      - '.github/workflows/dashboard-route-coverage.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'internal/router/**'
+      - 'internal/handler/**'
+      - 'internal/inference/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dashboard-route-coverage
+  cancel-in-progress: true
+
+jobs:
+  route-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # yunhou-deploy 是**私有仓**：默认 GITHUB_TOKEN 读不到它。沿用本仓
+      # 既有 deploy workflow 的模式 —— 有 App 用 App token，没有就退回
+      # DEPLOY_BOT_PAT；两者都没有时明确失败，而不是悄悄读到空仓。
+      HAS_APP: ${{ secrets.BUMP_APP_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: fail-fast on missing deploy checkout credentials
+        env:
+          HAS_APP: ${{ env.HAS_APP }}
+          DEPLOY_BOT_PAT: ${{ secrets.DEPLOY_BOT_PAT }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_APP" != "true" ] && [ -z "$DEPLOY_BOT_PAT" ]; then
+            echo "::error::Neither a GitHub App (BUMP_APP_ID / BUMP_APP_PRIVATE_KEY) nor DEPLOY_BOT_PAT is configured; cannot read the private yunhou-deploy repo."
+            exit 1
+          fi
+      - id: app-token
+        if: ${{ env.HAS_APP == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BUMP_APP_ID }}
+          private-key: ${{ secrets.BUMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: yunhou-deploy
+      - name: checkout deploy repo (endpoint catalog)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/yunhou-deploy
+          # 私有仓：默认 GITHUB_TOKEN 没有读权限，必须用 App token 或 PAT。
+          token: ${{ steps.app-token.outputs.token || secrets.DEPLOY_BOT_PAT }}
+          # yunhou-deploy 的默认分支是 main（没有 master 分支）。
+          ref: main
+          path: _deploy
+      - name: route inventory vs endpoint catalog
+        env:
+          DASHBOARD_ROUTE_CATALOG: ${{ github.workspace }}/_deploy/dashboard/config/endpoint-catalog.json
+        run: go test ./internal/router -run 'TestRouteInventory' -v
+      - name: emit route snapshot
+        env:
+          ROUTE_INVENTORY_OUT: ${{ github.workspace }}/users-routes.json
+        run: go test ./internal/router -run 'TestRouteInventory_Emit' -v
+      - name: snapshot drift vs committed snapshot
+        # 提交的快照（dashboard/config/users-routes.json）必须与真实路由一致，
+        # 否则 dashboard 侧的漂移比较会基于过期基准，漏掉新路由。
+        run: |
+          set -euo pipefail
+          if ! diff -u _deploy/dashboard/config/users-routes.json users-routes.json; then
+            echo "::error::Users 路由快照已过期：重新生成 dashboard/config/users-routes.json（ROUTE_INVENTORY_OUT）"
+            exit 1
+          fi
